@@ -14,7 +14,7 @@ locally computed Dropbox hash (sha256 of per-4MiB sha256 digests). Exit 0 only
 when every local file is verified remotely (and, with --delete, no remote
 extras remain). Prints one JSON summary line at the end.
 """
-import argparse, concurrent.futures as cf, hashlib, json, os, subprocess, sys, time
+import argparse, concurrent.futures as cf, hashlib, http.client, json, os, subprocess, sys, time
 import urllib.error, urllib.parse, urllib.request
 
 DBX = os.path.expanduser("~/.local/bin/dbxcli")
@@ -72,7 +72,10 @@ class Api:
                 if e.code in (429, 500, 502, 503, 504):
                     time.sleep(2 ** attempt); continue
                 raise RuntimeError(f"{ep} HTTP {e.code}: {msg[:300]}")
-            except (urllib.error.URLError, TimeoutError):
+            except (urllib.error.URLError, TimeoutError, ConnectionError,
+                    http.client.HTTPException, json.JSONDecodeError):
+                # A dropped or truncated response (IncompleteRead, reset) is transient:
+                # these calls are reads or idempotent batch checks, so retry them.
                 time.sleep(2 ** attempt)
         raise RuntimeError(f"{ep}: retries exhausted")
 

@@ -217,6 +217,8 @@ it.effect(
         ProjectionStore.ProjectionStoreV2,
         ProjectionStore.ProjectionStoreV2.of({
           apply: () => Effect.void,
+          listCutoverCandidates: () => Effect.die("unused listCutoverCandidates"),
+          getLiveSharedProviderSessions: () => Effect.die("unused getLiveSharedProviderSessions"),
           getLimitRecoveryCandidates: () => Effect.die("unused getLimitRecoveryCandidates"),
           getShellSnapshot: () => Effect.die("unused getShellSnapshot"),
           readShellSnapshot: () => Effect.die("unused readShellSnapshot"),
@@ -229,6 +231,7 @@ it.effect(
           getTurnStartContext: () => Effect.die("unused"),
           getTurnStartHistory: () => Effect.die("unused"),
           getRuntimeRecoveryProjection: () => Effect.die("unused getRuntimeRecoveryProjection"),
+          getRunControlState: () => Effect.die("unused getRunControlState"),
           getPlan: () => Effect.die("unused"),
           hasUnpairedRunInterruptRequest: () => Effect.die("unused interrupt read"),
           getThreadAttachmentIds: () => Effect.die("Unused attachment lookup"),
@@ -275,6 +278,7 @@ it.effect(
         ProviderSessionManager.ProviderSessionManagerV2,
         ProviderSessionManager.ProviderSessionManagerV2.of({
           shutdown: Effect.void,
+          sweepOrphanedThreads: () => Effect.void,
           observeThreadSessionUpdates: () => Effect.void,
           refreshThreadSessionUpdates: () => Effect.void,
           open: () => Effect.die("unused open"),

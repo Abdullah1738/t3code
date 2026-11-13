@@ -41,9 +41,13 @@ function invalidOptions(
       continue;
     }
     seen.add(option.id);
+    // Legacy selections retain this enforced marker after fast mode leaves the catalog.
+    if (option.id === "fastMode" && option.value === false) continue;
     if (descriptors === undefined) continue;
     const descriptor = descriptors.find((candidate) => candidate.id === option.id);
     if (descriptor === undefined) {
+      // Saved standard-mode selections can outlive a provider's fast-mode toggle.
+      if (option.id === "fastMode" && option.value === false) continue;
       const known = descriptors.map((candidate) => candidate.id).join(", ");
       problems.push(`Unknown option ${option.id}; supported options: ${known || "none"}.`);
       continue;

@@ -79,6 +79,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   readonly authorizeBearer?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeBearer"];
   readonly authorizeDpop?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeDpop"];
   readonly primaryBearerToken?: string;
+  readonly onDescriptorRequest?: () => void;
   readonly prepareSsh?: ClientCapabilities.SshEnvironmentGateway["Service"]["prepare"];
   readonly descriptorProtocolVersion?: number | null | undefined;
 }) => {
@@ -149,7 +150,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
     RpcHttp.layerRemoteHttpClient((() =>
       Promise.resolve(
         Response.json({
-          environmentId: ENVIRONMENT_ID,
+          environmentId: (options?.onDescriptorRequest?.(), ENVIRONMENT_ID),
           label: "Compatible environment",
           platform: { os: "linux", arch: "x64" },
           serverVersion: "0.0.0-test",
@@ -186,6 +187,89 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
 });
 
 describe("ConnectionResolver", () => {
+  it.effect("does not refetch an endpoint descriptor already verified by authorization", () =>
+    Effect.gen(function* () {
+      let requests = 0;
+      const layerBroker = yield* makeDependencies({
+        primaryBearerToken: "bearer-token",
+        onDescriptorRequest: () => {
+          requests += 1;
+        },
+        authorizeBearer: (input) =>
+          Effect.succeed({
+            environmentId: input.expectedEnvironmentId,
+            label: "Verified",
+            httpBaseUrl: input.httpBaseUrl,
+            socketUrl: "wss://environment.example.test/ws",
+            httpAuthorization: { _tag: "Bearer" as const, token: input.bearerToken },
+            verifiedDescriptor: {
+              httpBaseUrl: input.httpBaseUrl,
+              descriptor: {
+                environmentId: input.expectedEnvironmentId,
+                label: "Verified",
+                platform: { os: "linux", arch: "x64" },
+                serverVersion: "0.0.0-test",
+                orchestrationProtocolVersion: ORCHESTRATION_PROTOCOL_VERSION,
+                capabilities: { repositoryIdentity: true },
+              },
+            },
+          }),
+      });
+      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(layerBroker));
+      yield* broker.prepare(
+        catalogEntry(
+          new PrimaryConnectionTarget({
+            environmentId: ENVIRONMENT_ID,
+            label: "Primary",
+            ...ENDPOINT,
+          }),
+        ),
+      );
+      expect(requests).toBe(0);
+    }),
+  );
+
+  it.effect("revalidates a carried descriptor when its endpoint differs", () =>
+    Effect.gen(function* () {
+      let requests = 0;
+      const layerBroker = yield* makeDependencies({
+        primaryBearerToken: "bearer-token",
+        onDescriptorRequest: () => {
+          requests += 1;
+        },
+        authorizeBearer: (input) =>
+          Effect.succeed({
+            environmentId: input.expectedEnvironmentId,
+            label: "Verified",
+            httpBaseUrl: input.httpBaseUrl,
+            socketUrl: "wss://environment.example.test/ws",
+            httpAuthorization: { _tag: "Bearer" as const, token: input.bearerToken },
+            verifiedDescriptor: {
+              httpBaseUrl: "https://old.example.test",
+              descriptor: {
+                environmentId: input.expectedEnvironmentId,
+                label: "Old endpoint",
+                platform: { os: "linux", arch: "x64" },
+                serverVersion: "0.0.0-test",
+                orchestrationProtocolVersion: ORCHESTRATION_PROTOCOL_VERSION,
+                capabilities: { repositoryIdentity: true },
+              },
+            },
+          }),
+      });
+      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(layerBroker));
+      yield* broker.prepare(
+        catalogEntry(
+          new PrimaryConnectionTarget({
+            environmentId: ENVIRONMENT_ID,
+            label: "Primary",
+            ...ENDPOINT,
+          }),
+        ),
+      );
+      expect(requests).toBe(1);
+    }),
+  );
   it.effect("blocks an old host during discovery before opening orchestration RPC", () =>
     Effect.gen(function* () {
       const layerBroker = yield* makeDependencies({ descriptorProtocolVersion: null });

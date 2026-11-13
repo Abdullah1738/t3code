@@ -47,6 +47,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import closing
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backend  # noqa: E402
@@ -81,7 +82,10 @@ def log(msg):
 
 
 def ro(path):
-    c = sqlite3.connect("file:{}?mode=ro".format(path), uri=True, timeout=60)
+    if path == OC_DB:
+        c = backend.robob_readonly.native_ro(path, timeout=60, require_destructive=True)
+    else:
+        c = backend.robob_readonly.connect_ro(path, timeout=60)
     c.execute("PRAGMA busy_timeout=60000")
     return c
 
@@ -351,6 +355,7 @@ FROM session_v2 s
 
 
 def load_sessions(oc):
+    backend.robob_readonly.refresh_native(oc, require_destructive=True)
     out = {}
     for r in oc.execute(SESS_SQL):
         sid, parent, title, d, tu, susp, src, imp, last_msg, n = r
@@ -408,6 +413,7 @@ class Verifier:
         self.mem = ro(MEM_DB)
         self.rmem = ro(os.path.join(REPLICA, "memory.db"))
         self.rraw = ro(os.path.join(REPLICA, "opencode_raw.db"))
+        self.verified_fences = {}
 
     def ledger(self, db, sid):
         r = db.execute("SELECT native, time_updated FROM opencode_sync_sessions WHERE session_id=?", (sid,)).fetchone()
@@ -415,13 +421,21 @@ class Verifier:
         return r
 
     def check(self, s):
+        backend.robob_readonly.refresh_native(self.oc, require_destructive=True)
         sid = s["id"]
+        self.verified_fences.pop(sid, None)
+        try:
+            fence = backend.robob_readonly.native_capture_generation(self.oc, sid)
+        except backend.robob_readonly.UnsafeStateDatabase:
+            return "native_session_incomplete"
+        if self.oc.execute("SELECT 1 FROM session_inbox WHERE session_id=? UNION ALL "
+                           "SELECT 1 FROM session_pending WHERE session_id=? LIMIT 1", (sid, sid)).fetchone():
+            return "native_session_busy"
         if s["migrated"]:
             if s["n"] and s["imported"]:
                 post = self.oc.execute(
                     "SELECT count(*) FROM session_message WHERE session_id=? AND time_created>?",
                     (sid, s["imported"] - IMPORT_SLACK_MS)).fetchone()[0]
-                self.oc.commit()
                 if post:
                     return f"migrated_continued:{post} messages after import are not in memory"
             if not self.ledger(self.rmem, sid):
@@ -433,6 +447,7 @@ class Verifier:
                 self.rmem.commit()
                 if not hit:
                     return "memory_missing_original"
+            self.verified_fences[sid] = fence
             return None
         for name, db in (("live", self.mem), ("replica", self.rmem)):
             led = self.ledger(db, sid)
@@ -446,10 +461,10 @@ class Verifier:
         self.rraw.commit()
         last, seen = -1, 0
         while True:
+            backend.robob_readonly.native_generation(self.oc, require_destructive=True)
             rows = self.oc.execute(
                 "SELECT id, seq, time_updated, data FROM session_message WHERE session_id=? AND seq>? ORDER BY seq LIMIT 300",
                 (sid, last)).fetchall()
-            self.oc.commit()
             if not rows:
                 break
             for mid, seq, tu, data in rows:
@@ -460,6 +475,7 @@ class Verifier:
             last = rows[-1][1]
         if seen != s["n"]:
             return "message_count_changed"
+        self.verified_fences[sid] = fence
         return None
 
 
@@ -537,19 +553,25 @@ def main():
                     os.path.getmtime(os.path.join(REPLICA, "memory.db")) > ev["backup_ts"] + 5:
                 st["stopped"] = "memory backup started; replica evidence no longer final"
                 break
-            live_now = running_ids() | backlog_ids()
+            live_now = running_ids() | protected_ids()
             if any(s["id"] in live_now for s in nodes):
                 st["skipped"]["protected_before_delete"] = st["skipped"].get("protected_before_delete", 0) + 1
                 continue
             changed = False
+            backend.robob_readonly.refresh_native(oc, require_destructive=True)
             for s in nodes:
-                r = oc.execute("SELECT time_updated, (SELECT count(*) FROM session_message WHERE session_id=?) FROM session_v2 WHERE id=?",
-                               (s["id"], s["id"])).fetchone()
-                if not r or r[0] != s["tu"] or r[1] != s["n"]:
+                r = oc.execute(
+                    "SELECT s.time_updated,(SELECT count(*) FROM session_message WHERE session_id=s.id),"
+                    "e.applied_seq,e.dirty,s.time_suspended,"
+                    "EXISTS(SELECT 1 FROM session_inbox WHERE session_id=s.id) OR "
+                    "EXISTS(SELECT 1 FROM session_pending WHERE session_id=s.id) "
+                    "FROM session_v2 s LEFT JOIN ardud_native_sessions e ON e.id=s.id WHERE s.id=?",
+                    (s["id"],)).fetchone()
+                if (not r or r[0] != s["tu"] or r[1] != s["n"] or r[2] is None
+                        or r[2] != ver.verified_fences.get(s["id"]) or r[3] != 0 or r[4] or r[5]):
                     changed = True
                     break
             kids_now = oc.execute("SELECT count(*) FROM session_v2 WHERE parent_id IN (%s)" % ",".join("?" * len(tree)), tree).fetchone()[0]
-            oc.commit()
             if changed or kids_now != len(tree) - 1:
                 st["skipped"]["changed_before_delete"] = st["skipped"].get("changed_before_delete", 0) + 1
                 continue
@@ -559,6 +581,16 @@ def main():
             if any(s["id"] in rollback_now for s in nodes):
                 st["skipped"]["protected_before_delete"] = st["skipped"].get("protected_before_delete", 0) + 1
                 continue
+            # Verification can take minutes; ask the native service again at
+            # the mutation boundary, not only before reading message hashes.
+            if any(s["id"] in running_ids() for s in nodes):
+                st["skipped"]["protected_before_delete"] = st["skipped"].get("protected_before_delete", 0) + 1
+                continue
+            # Validate the evidence snapshot itself, not only a newer export.
+            generation = backend.robob_readonly.native_generation(oc, require_destructive=True)
+            with closing(backend.robob_readonly.native_ro(OC_DB, require_destructive=True)) as current:
+                if backend.robob_readonly.native_generation(current, require_destructive=True) != generation:
+                    raise Gate("native export changed during deletion checks; retry next run")
             try:
                 t1 = time.time()
                 code, body = http("DELETE", "/api/session/" + urllib.parse.quote(root["id"]))
@@ -567,6 +599,7 @@ def main():
                 st["stopped"] = f"delete request failed/timed out ({e!r}); stopping to protect live sessions"
                 time.sleep(10)
             dt = time.time() - t1
+            backend.robob_readonly.refresh_native(oc, require_destructive=True)
             gone = oc.execute("SELECT count(*) FROM session_v2 WHERE id IN (%s)" % ",".join("?" * len(tree)), tree).fetchone()[0] == 0
             oc.commit()
             if code is None and gone:

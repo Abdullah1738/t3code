@@ -1,0 +1,961 @@
+import { assert, it, vi } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
+import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
+import * as Cause from "effect/Cause";
+import * as Semaphore from "effect/Semaphore";
+import * as TestClock from "effect/testing/TestClock";
+
+import * as BoardLocks from "./boardLocks.ts";
+import * as SavedReply from "../tools/savedReply.ts";
+import { McpSchema } from "effect/ai";
+
+it.effect("#566 a committed re-acquire timeout never advertises a safe retry", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const finishCall = yield* Deferred.make<void>();
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const first = yield* Effect.forkChild(
+      locks
+        .board(
+          "a",
+          locks.outside(
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finishCall))),
+          ),
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(entered);
+    const writer = yield* Effect.forkChild(
+      locks.board(
+        "a",
+        Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      ),
+    );
+    yield* Deferred.await(held);
+    yield* Deferred.succeed(finishCall, undefined);
+    yield* TestClock.adjust(BoardLocks.WRITE_WAIT_MS + 1);
+    const result = yield* Fiber.join(first);
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result)) {
+      const message = String(Cause.squash(result.cause));
+      assert.include(message, "may have been applied");
+      assert.notInclude(message, "Safe to retry");
+    }
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(writer);
+  }),
+);
+
+it.effect("#566 reconciliation still fences a migration during the external call", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const first = yield* Effect.forkChild(
+      locks
+        .board(
+          "a",
+          locks.outside(
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+            undefined,
+            false,
+            Effect.succeed(true),
+          ),
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(entered);
+    yield* locks.exclusive(Effect.void);
+    yield* Deferred.succeed(release, undefined);
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(first)));
+  }),
+);
+
+it.effect("unrelated boards and single-card writes do not share a permit", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const first = yield* Effect.forkChild(
+      locks.run(
+        locks.access(
+          "a",
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        ),
+        "card-a",
+      ),
+    );
+    yield* Deferred.await(entered);
+    yield* locks.board("b", Effect.void);
+    yield* locks.run(locks.access("a", Effect.void, true), "card-b");
+    const waiting = yield* Effect.forkChild(locks.run(locks.access("a", Effect.void), "card-a"));
+    const broad = yield* Effect.forkChild(locks.board("a", Effect.void));
+    yield* Effect.yieldNow;
+    assert.isUndefined(waiting.pollUnsafe());
+    assert.isUndefined(broad.pollUnsafe());
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(first);
+    yield* Fiber.join(waiting);
+    yield* Fiber.join(broad);
+  }),
+);
+
+it.effect("external I/O releases the permit and fences a stale completion even when caught", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let committed = false;
+    let abandoned = false;
+    let attempted = false;
+    const first = yield* Effect.forkChild(
+      locks
+        .board(
+          "a",
+          Effect.gen(function* () {
+            yield* locks
+              .outside(
+                Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+                () =>
+                  Effect.sync(() => {
+                    abandoned = true;
+                  }),
+              )
+              .pipe(Effect.catchCause(() => Effect.void));
+            attempted = true;
+            yield* locks.access(
+              "a",
+              Effect.sync(() => {
+                committed = true;
+              }),
+              true,
+            );
+          }),
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(entered);
+    yield* locks.board("a", locks.access("a", Effect.void, true));
+    yield* Deferred.succeed(release, undefined);
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(first)));
+    assert.isFalse(committed);
+    assert.isTrue(attempted);
+    assert.isTrue(abandoned);
+    yield* locks.board("a", Effect.void);
+  }),
+);
+
+it.effect("an expired waiter never writes later and returns its migration permit", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const first = yield* Effect.forkChild(
+      locks.board(
+        "a",
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      ),
+    );
+    yield* Deferred.await(entered);
+    let written = false;
+    const waiter = yield* Effect.forkChild(
+      locks
+        .board(
+          "a",
+          Effect.sync(() => {
+            written = true;
+          }),
+        )
+        .pipe(Effect.exit),
+    );
+    yield* TestClock.adjust(BoardLocks.WRITE_WAIT_MS + 1);
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(waiter)));
+    assert.isFalse(written);
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(first);
+    yield* locks.exclusive(Effect.void);
+    assert.isFalse(written);
+  }),
+);
+
+it.effect.each([1, 2, 3])(
+  "cancellation at permit transfer %i returns migration, board, and card permits",
+  (transfer) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const prototype = Object.getPrototypeOf(Semaphore.makeUnsafe(1)) as Semaphore.Semaphore;
+      const originalTake = prototype.take;
+      const originalAvailable = prototype.takeIfAvailable;
+      let victim: Fiber.Fiber<unknown, unknown> | undefined;
+      let transfers = 0;
+      let interrupted = false;
+      const afterTransfer = (acquired: boolean) =>
+        Effect.sync(() => {
+          if (!acquired || interrupted || ++transfers !== transfer) return;
+          interrupted = true;
+          victim!.interruptUnsafe();
+        });
+      // Inject the interrupt after the semaphore owns the permit, before the
+      // caller can record ownership. Cover both the old and current take paths.
+      const take = vi.spyOn(prototype, "take").mockImplementation(function (
+        this: Semaphore.Semaphore,
+        permits,
+      ) {
+        return originalTake.call(this, permits).pipe(Effect.tap(() => afterTransfer(true)));
+      });
+      const available = vi.spyOn(prototype, "takeIfAvailable").mockImplementation(function (
+        this: Semaphore.Semaphore,
+        permits,
+      ) {
+        return originalAvailable.call(this, permits).pipe(Effect.tap(afterTransfer));
+      });
+      yield* Effect.gen(function* () {
+        const cancelled = yield* Effect.forkChild(
+          Effect.withFiber((fiber) => {
+            victim = fiber;
+            return locks.run(locks.access("a", Effect.void), "card-a");
+          }),
+        );
+        assert.isTrue(Exit.isFailure(yield* Fiber.await(cancelled)));
+        assert.isTrue(interrupted);
+        const reuse = yield* Effect.forkChild(
+          Effect.gen(function* () {
+            yield* locks.run(locks.access("a", Effect.void), "card-a");
+            yield* locks.board("a", Effect.void);
+            yield* locks.exclusive(Effect.void);
+          }).pipe(Effect.timeout(BoardLocks.WRITE_WAIT_MS)),
+        );
+        yield* TestClock.adjust(BoardLocks.WRITE_WAIT_MS + 1);
+        yield* Fiber.join(reuse);
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            take.mockRestore();
+            available.mockRestore();
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect(
+  "migration fences in-flight I/O, while a different card does not invalidate a card write",
+  () =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const first = yield* Effect.forkChild(
+        locks.run(
+          Effect.gen(function* () {
+            yield* locks.access("a", Effect.void);
+            yield* locks.outside(
+              Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+            );
+            yield* locks.access("a", Effect.void, true);
+          }),
+          "card-a",
+        ),
+      );
+      yield* Deferred.await(entered);
+      yield* locks.run(locks.access("a", Effect.void, true), "card-b");
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(first);
+
+      const enteredAgain = yield* Deferred.make<void>();
+      const releaseAgain = yield* Deferred.make<void>();
+      let committed = false;
+      const stale = yield* Effect.forkChild(
+        locks
+          .board(
+            "a",
+            Effect.gen(function* () {
+              yield* locks.outside(
+                Deferred.succeed(enteredAgain, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseAgain)),
+                ),
+              );
+              yield* locks.access(
+                "a",
+                Effect.sync(() => {
+                  committed = true;
+                }),
+                true,
+              );
+            }),
+          )
+          .pipe(Effect.exit),
+      );
+      yield* Deferred.await(enteredAgain);
+      yield* locks.exclusive(Effect.void);
+      yield* Deferred.succeed(releaseAgain, undefined);
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(stale)));
+      assert.isFalse(committed);
+    }),
+);
+
+it.effect(
+  "a launch is cleaned up if a later association fails, but an attached launch is kept",
+  () =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const cleaned: Array<string> = [];
+      yield* locks
+        .board(
+          "a",
+          Effect.gen(function* () {
+            yield* locks.launched(
+              "orphan",
+              Effect.sync(() => {
+                cleaned.push("orphan");
+              }),
+            );
+            yield* locks.launched(
+              "attached",
+              Effect.sync(() => {
+                cleaned.push("attached");
+              }),
+            );
+            yield* locks.attached("attached");
+            return yield* Effect.fail("association failed");
+          }),
+        )
+        .pipe(Effect.ignore);
+      assert.deepStrictEqual(cleaned, ["orphan"]);
+      yield* locks.board("a", Effect.void);
+    }),
+);
+
+it.effect("#638 retries an uncommitted stale snapshot with new versions", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    yield* locks.board("a", Effect.void);
+    let attempts = 0;
+    const result = yield* locks.run(
+      Effect.gen(function* () {
+        attempts++;
+        yield* locks.observe(Effect.void);
+        if (attempts === 1) yield* locks.exclusive(Effect.void);
+        return yield* locks.access("a", Effect.succeed("saved"), true);
+      }),
+      undefined,
+    );
+    assert.strictEqual(result, "saved");
+    assert.strictEqual(attempts, 2);
+    attempts = 0;
+    const failed = yield* Effect.exit(
+      locks.run(
+        Effect.gen(function* () {
+          attempts++;
+          yield* locks.observe(Effect.void);
+          yield* locks.exclusive(Effect.void);
+          yield* locks.access("a", Effect.void, true);
+        }),
+        undefined,
+      ),
+    );
+    assert.isTrue(Exit.isFailure(failed));
+    assert.strictEqual(attempts, 9);
+  }),
+);
+
+it.effect.each(["saved", "external"] as const)(
+  "#638 never retries after %s work and a stale permit",
+  (kind) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      let attempts = 0;
+      const result = yield* Effect.exit(
+        locks.run(
+          Effect.gen(function* () {
+            attempts++;
+            if (kind === "saved") yield* locks.access("a", Effect.void, true);
+            else yield* locks.outside(Effect.void);
+            // Even an incorrectly classified later defect cannot override the operation's commit state.
+            return yield* Effect.die(new BoardLocks.BoardStateChanged(false));
+          }),
+          undefined,
+        ),
+      );
+      assert.isTrue(Exit.isFailure(result));
+      assert.strictEqual(attempts, 1);
+      attempts = 0;
+      yield* Effect.exit(
+        locks.run(
+          Effect.sync(() => {
+            attempts++;
+          }).pipe(Effect.andThen(Effect.die(new BoardLocks.BoardStateChanged(true)))),
+          undefined,
+        ),
+      );
+      assert.strictEqual(attempts, 1);
+    }),
+);
+
+it.effect(
+  "busy board stress: row-scoped requests and saved answers survive unrelated writers",
+  () =>
+    Effect.gen(function* () {
+      const measure = (scoped: boolean) =>
+        Effect.gen(function* () {
+          const locks = yield* BoardLocks.make();
+          const release = yield* Deferred.make<void>();
+          const entered = Array.from({ length: 40 }, () => Deferred.makeUnsafe<void>());
+          let conflicts = 0;
+          let answers = 0;
+          const requests = yield* Effect.forEach(entered, (ready, index) =>
+            Effect.forkChild(
+              locks
+                .run(
+                  Effect.gen(function* () {
+                    yield* locks.access(
+                      "busy",
+                      Effect.void,
+                      index >= 20,
+                      scoped ? `discussion:${index}` : undefined,
+                    );
+                    yield* locks.outside(
+                      Deferred.succeed(ready, undefined).pipe(
+                        Effect.andThen(Deferred.await(release)),
+                      ),
+                    );
+                    if (index >= 20) answers += 1;
+                  }),
+                )
+                .pipe(
+                  Effect.catchCause(() =>
+                    Effect.sync(() => {
+                      conflicts += 1;
+                    }),
+                  ),
+                ),
+            ),
+          );
+          yield* Effect.forEach(entered, Deferred.await);
+          yield* Effect.forEach(
+            Array.from({ length: 32 }, (_, i) => i),
+            (i) =>
+              locks.run(
+                locks.access("busy", Effect.void, true, scoped ? `card:${i}` : undefined),
+                `card:${i}`,
+              ),
+            { concurrency: "unbounded" },
+          );
+          yield* Deferred.succeed(release, undefined);
+          yield* Effect.forEach(requests, Fiber.join);
+          return { conflicts, lostAnswers: 20 - answers };
+        });
+      const before = yield* measure(false);
+      const after = yield* measure(true);
+      assert.deepEqual(before, { conflicts: 40, lostAnswers: 20 });
+      assert.deepEqual(after, { conflicts: 0, lostAnswers: 0 });
+      yield* Effect.log("kanban stress (32 writers, 20 requests, 20 answers)", { before, after });
+    }),
+);
+
+it.effect("row dependency still fences a same-row update during external I/O", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = Deferred.makeUnsafe<void>();
+    const release = Deferred.makeUnsafe<void>();
+    let overwritten = false;
+    const reader = yield* Effect.forkChild(
+      locks
+        .run(
+          Effect.gen(function* () {
+            yield* locks.access("a", Effect.void, false, "discussion:1");
+            yield* locks.outside(
+              Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+            );
+            yield* locks.access(
+              "a",
+              Effect.sync(() => {
+                overwritten = true;
+              }),
+              true,
+              "discussion:1",
+            );
+          }),
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(entered);
+    yield* locks.run(locks.access("a", Effect.void, true, "discussion:1"));
+    yield* Deferred.succeed(release, undefined);
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(reader)));
+    assert.isFalse(overwritten);
+  }),
+);
+
+it.effect("a collection read after a row read restores broad conflict tracking", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = Deferred.makeUnsafe<void>();
+    const release = Deferred.makeUnsafe<void>();
+    const reader = yield* Effect.forkChild(
+      locks
+        .run(
+          Effect.gen(function* () {
+            yield* locks.access("a", Effect.void, false, "board");
+            yield* locks.access("a", Effect.void);
+            yield* locks.outside(
+              Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+            );
+          }),
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(entered);
+    yield* locks.run(locks.access("a", Effect.void, true, "card:other"), "other");
+    yield* Deferred.succeed(release, undefined);
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(reader)));
+  }),
+);
+
+it.effect("a stale read-only operation reruns before any write or external side effect", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    let reads = 0;
+    let sent = 0;
+    yield* locks.run(
+      Effect.gen(function* () {
+        yield* locks.access("a", Effect.void);
+        yield* locks.outside(
+          Effect.gen(function* () {
+            reads += 1;
+            if (reads === 1)
+              yield* Effect.forkChild(
+                locks.run(locks.access("a", Effect.void, true), "other"),
+              ).pipe(Effect.flatMap(Fiber.join));
+          }),
+          undefined,
+          true,
+        );
+        yield* locks.outside(
+          Effect.sync(() => {
+            sent += 1;
+          }),
+        );
+      }),
+    );
+    assert.strictEqual(reads, 2);
+    assert.strictEqual(sent, 1);
+  }),
+);
+
+it.effect.each(["unrelated", "card", "slot", "migration"] as const)(
+  "dispatch dependencies retain only their card and slot across %s changes",
+  (change) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      let free = true;
+      let abandoned = false;
+      const dispatch = yield* Effect.forkChild(
+        locks
+          .board(
+            "a",
+            Effect.gen(function* () {
+              yield* locks.scopeDispatch(
+                "a",
+                ["card:target"],
+                Effect.sync(() => free),
+              );
+              // Dispatch's collection reads cannot reintroduce the board generation or epoch.
+              yield* locks.access("a", Effect.void);
+              yield* locks.outside(
+                Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume))),
+                () =>
+                  Effect.sync(() => {
+                    abandoned = true;
+                  }),
+              );
+            }),
+          )
+          .pipe(Effect.exit),
+      );
+      yield* Deferred.await(entered);
+      if (change === "migration") yield* locks.exclusive(Effect.void);
+      else if (change === "slot") free = false;
+      else
+        yield* locks.run(
+          locks.access("a", Effect.void, true, change === "card" ? "card:target" : undefined),
+        );
+      yield* Deferred.succeed(resume, undefined);
+      assert.strictEqual(Exit.isSuccess(yield* Fiber.join(dispatch)), change === "unrelated");
+      assert.strictEqual(abandoned, change !== "unrelated");
+    }),
+);
+
+it.effect.each([
+  "refresh",
+  "content",
+  "links",
+  "refresh-after-content",
+  "refresh-after-migration",
+] as const)("only dispatch ignores link metadata during %s", (change) =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    const scoped = yield* Effect.forkChild(
+      locks
+        .board(
+          "a",
+          Effect.gen(function* () {
+            yield* locks.scopeDispatch("a", ["card:target"], Effect.succeed(true));
+            yield* locks.outside(
+              Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume))),
+            );
+          }),
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(entered);
+    const defaultEntered = yield* Deferred.make<void>();
+    const ordinary = yield* Effect.forkChild(
+      locks
+        .run(
+          Effect.gen(function* () {
+            yield* locks.access("a", Effect.void, false, "card:target");
+            yield* locks.outside(
+              Deferred.succeed(defaultEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(resume)),
+              ),
+            );
+          }),
+          "target",
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(defaultEntered);
+    const write = locks.run(locks.access("a", Effect.void, true, "card:target"));
+    if (change === "refresh-after-content") yield* write;
+    if (change === "refresh-after-migration") yield* locks.exclusive(Effect.void);
+    yield* change.startsWith("refresh") ? locks.dispatchMetadata(write) : write;
+    yield* Deferred.succeed(resume, undefined);
+    assert.strictEqual(Exit.isSuccess(yield* Fiber.join(scoped)), change === "refresh");
+    assert.isFalse(Exit.isSuccess(yield* Fiber.join(ordinary)));
+  }),
+);
+
+it.effect.each([false, true])(
+  "compensation releases permits even with a stale snapshot: %s",
+  (stale) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      let compensated = false;
+      const writer = locks.run(locks.access("board", Effect.void, true));
+      const result = yield* Effect.exit(
+        locks.run(
+          Effect.gen(function* () {
+            yield* locks.access("board", Effect.void);
+            if (stale)
+              yield* locks.outside(Effect.forkChild(writer).pipe(Effect.flatMap(Fiber.join)));
+          }).pipe(
+            Effect.ensuring(
+              locks.unlock.pipe(
+                Effect.andThen(
+                  Effect.forkChild(
+                    locks.run(
+                      locks.access(
+                        "board",
+                        Effect.sync(() => {
+                          compensated = true;
+                        }),
+                        true,
+                      ),
+                    ),
+                  ).pipe(Effect.flatMap(Fiber.join)),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      assert.isTrue(compensated);
+      assert.strictEqual(Exit.isFailure(result), stale);
+    }),
+);
+
+/**
+ * A board-wide operation that reads outside the gate, once a card write
+ * lands during its first read. `fence` is what the read describes.
+ */
+const staleOnce = (bumpFenceDuringRead: boolean) =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    let fence = 0;
+    let reads = 0;
+    let attempts = 0;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const read = locks.outsideRead(
+      "view:thread-1",
+      () => fence,
+      Effect.gen(function* () {
+        reads += 1;
+        if (reads === 1) {
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(release);
+        }
+        return `state-${reads}`;
+      }),
+    );
+    const op = yield* Effect.forkChild(
+      locks.board(
+        "a",
+        Effect.gen(function* () {
+          attempts += 1;
+          const seen = yield* read;
+          yield* locks.access("a", Effect.void, true);
+          return seen;
+        }),
+      ),
+    );
+    yield* Deferred.await(entered);
+    // Another writer on the board while the read is out: the operation is stale.
+    yield* locks.run(locks.access("a", Effect.void, true), "card-b");
+    if (bumpFenceDuringRead) fence += 1;
+    yield* Deferred.succeed(release, undefined);
+    const seen = yield* Fiber.join(op);
+    return { seen, reads, attempts };
+  });
+
+it.effect("a stale rerun replays its earlier read instead of queueing for it again", () =>
+  Effect.gen(function* () {
+    const { seen, reads, attempts } = yield* staleOnce(false);
+    assert.strictEqual(attempts, 2);
+    assert.strictEqual(reads, 1);
+    assert.strictEqual(seen, "state-1");
+  }),
+);
+
+it.effect("a rerun reads again when the fence moved during the earlier read", () =>
+  Effect.gen(function* () {
+    const { seen, reads, attempts } = yield* staleOnce(true);
+    assert.strictEqual(attempts, 2);
+    assert.strictEqual(reads, 2);
+    assert.strictEqual(seen, "state-2");
+  }),
+);
+
+it.effect("reads within one attempt and in separate operations are never replayed", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    let reads = 0;
+    const read = locks.outsideRead(
+      "view:thread-1",
+      () => 0,
+      Effect.sync(() => (reads += 1)),
+    );
+    const both = yield* locks.board(
+      "a",
+      Effect.gen(function* () {
+        return [yield* read, yield* read] as const;
+      }),
+    );
+    assert.deepStrictEqual(both, [1, 2]);
+    assert.strictEqual(yield* locks.board("a", read), 3);
+    // Outside any operation it is a plain read.
+    assert.strictEqual(yield* read, 4);
+    // One constructed operation run twice, and twice at once: each run reads for itself.
+    const op = locks.board("a", read);
+    assert.strictEqual(yield* op, 5);
+    assert.strictEqual(yield* op, 6);
+    const pair = yield* Effect.all([op, op], { concurrency: 2 });
+    assert.deepStrictEqual([...pair].sort(), [7, 8]);
+  }),
+);
+
+it.effect(
+  "a tick step backs off twice, releases its gate, and never retries a saved or sent action",
+  () =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      let attempts = 0;
+      const conflict = locks
+        .step(
+          Effect.gen(function* () {
+            attempts += 1;
+            yield* locks.access("a", Effect.void);
+            yield* locks.outside(
+              Effect.forkChild(locks.run(locks.access("a", Effect.void, true), "x")).pipe(
+                Effect.flatMap(Fiber.join),
+              ),
+              undefined,
+              true,
+            );
+          }),
+          "x",
+        )
+        .pipe(Effect.exit);
+      const fiber = yield* Effect.forkChild(conflict);
+      yield* TestClock.adjust(10);
+      assert.strictEqual(attempts, 2);
+      yield* locks.board("a", Effect.void);
+      yield* TestClock.adjust(20);
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(fiber)));
+      assert.strictEqual(attempts, 3);
+      for (const committed of [true, false]) {
+        let calls = 0;
+        const exit = yield* locks
+          .step(
+            Effect.gen(function* () {
+              calls += 1;
+              yield* locks.access("a", Effect.void, committed);
+              yield* locks.outside(
+                Effect.forkChild(locks.run(locks.access("a", Effect.void, true), "x")).pipe(
+                  Effect.flatMap(Fiber.join),
+                ),
+                undefined,
+                committed,
+              );
+            }),
+            "x",
+          )
+          .pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(exit));
+        assert.strictEqual(calls, 1);
+      }
+    }),
+);
+
+it.effect("#882 detached follow-ons own cleanup after their original operation returns", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const start = yield* Deferred.make<void>();
+    const cleaned: string[] = [];
+    const background = yield* locks.board(
+      "a",
+      Effect.forkChild(
+        locks
+          .independent(
+            locks.board(
+              "a",
+              Effect.gen(function* () {
+                yield* Deferred.await(start);
+                yield* locks.launched(
+                  "orphan",
+                  Effect.sync(() => {
+                    cleaned.push("orphan");
+                  }),
+                );
+                return yield* Effect.fail("association failed");
+              }),
+            ),
+          )
+          .pipe(Effect.exit),
+      ),
+    );
+    yield* Deferred.succeed(start, undefined);
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(background)));
+    assert.deepStrictEqual(cleaned, ["orphan"]);
+    yield* locks.board("a", Effect.void);
+  }),
+);
+
+it.effect("saved-reply admission expires before the reply budget and never writes later", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const holder = yield* Effect.forkChild(
+      locks.board(
+        "a",
+        Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      ),
+    );
+    yield* Deferred.await(held);
+    let written = false;
+    const waiter = yield* Effect.forkChild(
+      SavedReply.protect(
+        locks
+          .board(
+            "a",
+            locks.access(
+              "a",
+              Effect.sync(() => {
+                written = true;
+              }),
+              true,
+            ),
+          )
+          .pipe(Effect.as(new McpSchema.CallToolResult({ content: [] }))),
+        "card_update",
+      ).pipe(Effect.exit),
+    );
+    yield* TestClock.adjust(SavedReply.ADMISSION_BUDGET_MS - 1);
+    assert.isUndefined(waiter.pollUnsafe());
+    yield* TestClock.adjust(1);
+    const result = yield* Fiber.join(waiter);
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result)) {
+      assert.include(
+        String(Cause.squash(result.cause)),
+        "Board busy: not written. Safe to retry once.",
+      );
+    }
+    assert.isFalse(written);
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(holder);
+    yield* TestClock.adjust(BoardLocks.WRITE_WAIT_MS);
+    yield* locks.exclusive(Effect.void);
+    assert.isFalse(written);
+  }),
+);
+
+it.effect.each([
+  "unrelated",
+  "card",
+  "stop",
+  "migration",
+  "refresh",
+  "refresh-after-content",
+] as const)("a startup reconciliation cannot forgive a dispatch dependency after %s", (change) =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let abandoned = false;
+    const dispatch = yield* Effect.forkChild(
+      locks
+        .run(
+          Effect.gen(function* () {
+            yield* locks.scopeDispatch("a", ["card:target", "stops:worker"], Effect.succeed(true));
+            yield* locks.outside(
+              Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume))),
+              () =>
+                Effect.sync(() => {
+                  abandoned = true;
+                }),
+              false,
+              Effect.succeed(true),
+            );
+          }),
+          "target",
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(entered);
+    const write = (resource?: string) => locks.run(locks.access("a", Effect.void, true, resource));
+    if (change === "migration") yield* locks.exclusive(Effect.void);
+    else if (change === "unrelated") yield* write();
+    else if (change === "stop") yield* write("stops:worker");
+    else {
+      if (change === "refresh-after-content") yield* write("card:target");
+      yield* change.startsWith("refresh")
+        ? locks.dispatchMetadata(write("card:target"))
+        : write("card:target");
+    }
+    yield* Deferred.succeed(resume, undefined);
+    const valid = change === "unrelated" || change === "refresh";
+    assert.strictEqual(Exit.isSuccess(yield* Fiber.join(dispatch)), valid);
+    assert.strictEqual(abandoned, !valid);
+  }),
+);

@@ -12,6 +12,8 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
+
 export class ControlStoreError extends Schema.TaggedError<ControlStoreError>()(
   "ControlStoreError",
   { operation: Schema.String, cause: Schema.Defect() },
@@ -67,6 +69,26 @@ export interface ControlStoreShape {
   readonly liveThreadIds: () => Effect.Effect<ReadonlyArray<string>, ControlStoreError>;
   /** Threads with a pending runtime request (approval or user input). */
   readonly pendingRequestThreadIds: () => Effect.Effect<ReadonlyArray<string>, ControlStoreError>;
+  /**
+   * Undeleted threads whose updated_at sorts after `sinceIso`, newest first (ties by thread id, as the full listing orders them), with the fields
+   * listings filter on, from ardud_v2_threads_updated_idx: no shell is built. A string range,
+   * so callers widen it and compare `updatedAt` exactly.
+   */
+  readonly threadsUpdatedSince: (
+    /** `null` lists every live thread's light row (no time filter). */
+    sinceIso: string | null,
+  ) => Effect.Effect<ReadonlyArray<ControlThreadRow>, ControlStoreError>;
+}
+
+export interface ControlThreadRow {
+  readonly threadId: string;
+  readonly projectId: string;
+  readonly updatedAt: string;
+  readonly archived: boolean;
+  readonly relationshipToParent: string | null;
+  readonly parentThreadId: string | null;
+  readonly rootThreadId: string | null;
+  readonly creationSource: string | null;
 }
 
 export class ControlStore extends Context.Service<ControlStore, ControlStoreShape>()(
@@ -85,30 +107,35 @@ const chunks = <A>(values: ReadonlyArray<A>): ReadonlyArray<ReadonlyArray<A>> =>
 
 export const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const controlSql = yield* BoardsDatabase.client;
   const fail = (operation: string) => (cause: unknown) =>
     new ControlStoreError({ operation, cause });
 
-  yield* sql`
+  yield* BoardsDatabase.initialize(
+    Effect.gen(function* () {
+      yield* controlSql`
     CREATE TABLE IF NOT EXISTS ardud_thread_origin (
       thread_id   TEXT PRIMARY KEY,
       origin      TEXT NOT NULL,
       created_at  TEXT NOT NULL
     )
   `.pipe(Effect.mapError(fail("ensure-thread-origin")));
-  yield* sql`
+      yield* controlSql`
     CREATE TABLE IF NOT EXISTS ardud_opencode_import (
       native_session_id TEXT PRIMARY KEY,
       thread_id         TEXT NOT NULL UNIQUE,
       imported_at       TEXT NOT NULL
     )
   `.pipe(Effect.mapError(fail("ensure-opencode-import")));
+    }),
+  );
 
   const getOrigins: ControlStoreShape["getOrigins"] = (threadIds) =>
     Effect.forEach(
       chunks([...new Set(threadIds)]),
       (ids) =>
-        sql<{ readonly thread_id: string; readonly origin: string }>`
-          SELECT thread_id, origin FROM ardud_thread_origin WHERE thread_id IN ${sql.in(ids)}
+        controlSql<{ readonly thread_id: string; readonly origin: string }>`
+          SELECT thread_id, origin FROM ardud_thread_origin WHERE thread_id IN ${controlSql.in(ids)}
         `,
       { concurrency: 1 },
     ).pipe(
@@ -120,19 +147,21 @@ export const make = Effect.gen(function* () {
   const getOrigin: ControlStoreShape["getOrigin"] = (threadId) =>
     getOrigins([threadId]).pipe(Effect.map((origins) => origins.get(threadId) ?? null));
 
-  const setOrigin: ControlStoreShape["setOrigin"] = (threadId, origin) =>
-    Effect.gen(function* () {
+  const setOrigin: ControlStoreShape["setOrigin"] = Effect.fn("ControlStore.setOrigin")(
+    function* (threadId, origin) {
       if (origin === null) {
-        yield* sql`DELETE FROM ardud_thread_origin WHERE thread_id = ${threadId}`;
+        yield* controlSql`DELETE FROM ardud_thread_origin WHERE thread_id = ${threadId}`;
         return;
       }
       const now = DateTime.formatIso(yield* DateTime.now);
-      yield* sql`
+      yield* controlSql`
         INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
         VALUES (${threadId}, ${origin}, ${now})
         ON CONFLICT(thread_id) DO UPDATE SET origin = excluded.origin
       `;
-    }).pipe(Effect.mapError(fail("write-origin")));
+    },
+    Effect.mapError(fail("write-origin")),
+  );
 
   const threadIdForNativeSession: ControlStoreShape["threadIdForNativeSession"] = Effect.fn(
     "ControlStore.threadIdForNativeSession",
@@ -140,7 +169,7 @@ export const make = Effect.gen(function* () {
     function* (nativeId, driver) {
       const imported =
         driver === undefined || driver === "opencode"
-          ? yield* sql<{ readonly thread_id: string }>`
+          ? yield* controlSql<{ readonly thread_id: string }>`
               SELECT thread_id FROM ardud_opencode_import WHERE native_session_id = ${nativeId}
             `
           : [];
@@ -245,7 +274,45 @@ export const make = Effect.gen(function* () {
       Effect.mapError(fail("read-pending-request-threads")),
     );
 
+  const threadsUpdatedSince: ControlStoreShape["threadsUpdatedSince"] = (sinceIso) =>
+    sql<{
+      readonly thread_id: string;
+      readonly project_id: string;
+      readonly updated_at: string;
+      readonly archived: number;
+      readonly relationship_to_parent: string | null;
+      readonly parent_thread_id: string | null;
+      readonly root_thread_id: string | null;
+      readonly creation_source: string | null;
+    }>`
+      SELECT thread_id, project_id, updated_at,
+        json_extract(payload_json, '$.archivedAt') IS NOT NULL AS archived,
+        json_extract(payload_json, '$.lineage.relationshipToParent') AS relationship_to_parent,
+        json_extract(payload_json, '$.lineage.parentThreadId') AS parent_thread_id,
+        json_extract(payload_json, '$.lineage.rootThreadId') AS root_thread_id,
+        json_extract(payload_json, '$.creationSource') AS creation_source
+      FROM orchestration_v2_projection_threads
+      WHERE deleted_at IS NULL${sinceIso === null ? sql`` : sql` AND updated_at > ${sinceIso}`}
+      ORDER BY updated_at DESC, thread_id ASC
+    `.pipe(
+      NodeSqliteClient.readOnly,
+      Effect.map((rows) =>
+        rows.map((row): ControlThreadRow => ({
+          threadId: row.thread_id,
+          projectId: row.project_id,
+          updatedAt: row.updated_at,
+          archived: Boolean(row.archived),
+          relationshipToParent: row.relationship_to_parent,
+          parentThreadId: row.parent_thread_id,
+          rootThreadId: row.root_thread_id,
+          creationSource: row.creation_source,
+        })),
+      ),
+      Effect.mapError(fail("read-updated-threads")),
+    );
+
   return ControlStore.of({
+    threadsUpdatedSince,
     getOrigin,
     getOrigins,
     setOrigin,

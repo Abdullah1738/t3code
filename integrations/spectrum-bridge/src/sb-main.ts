@@ -1,3 +1,4 @@
+import { acknowledgeReceived, notifyFailedInbound } from "./inbound-failure.ts";
 /**
  * Sendblue serve loop. Kept apart from main.ts so the Photon path stays exactly as it was:
  * main.ts hands over before it constructs Photon.
@@ -172,7 +173,8 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     } finally { clearTimeout(timer); }
   };
   const shares = new Shares({ store: ownerStore, appsRoot: config.appsRoot, startTunnel: cloudflaredTunnel(), log,
-    origin: config.shareOrigin });
+    origin: config.shareOrigin,
+    secrets: token => registry?.all().find(chat => getSecretRequest(chat.store, token))?.secretDeps });
   process.once("exit", () => shares.killAll());
   void shares.restore().catch(() => log("share-sweep-failed"));
   const post = socketPost(telegramBridgeSocket);
@@ -188,13 +190,14 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     const isOwner = chat.info.kind === "owner";
     const chatBackend = !isOwner && backend instanceof RobobBackend
       ? backend.forChat(`chats/${chat.info.slug}`, chat.info.title) : backend;
-    const liveCards = (config.liveCardChats ?? ["owner"]).includes(chat.info.slug);
+    if (chatBackend instanceof RobobBackend) chatBackend.trackFirstTurns(chat.store);
+    const liveCards = (config.liveCardChats ?? []).includes(chat.info.slug);
     const transport = sbTransport(observed, chat.info.key, chat.store, undefined,
-      liveCards ? {} : { static: true, previewImage: cardPreviewImage() });
+      liveCards ? {} : { static: true, previewImage: cardPreviewImage(file => observed.upload(file)) });
     // getMessage may resolve undefined for an unknown handle; the router's reply lookup already treats a throw there as unavailable.
     const router = new Router(chat.store, chatBackend, transport as unknown as ConstructorParameters<typeof Router>[2], {
       ...config, chatGuid: chat.info.key, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
-      transcribe: input => transcribe(input), log, context: chat.context,
+      transcribe: input => transcribe(input), notifyFailure: notifyFailedInbound, log, context: chat.context,
       ...(chat.info.kind === "group" ? { groupJudge } : {}),
       swipes: { find: swipes, line: config.sendblueNumber ?? "" },
     });
@@ -211,7 +214,8 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       store: chat.store,
       photon: { react: (_chat, target, reaction) => line.react(target, reaction) } satisfies Pick<Photon, "react">,
       router: () => router, chatGuid: () => chat.info.key,
-      ...(apps ? { secrets: { stateRoot: chat.stateRoot, publishApps } } : {}),
+      ...(apps ? { secrets: { stateRoot: chat.stateRoot, publicForm: !isOwner,
+        publishApps: isOwner ? publishApps : async () => shares.secretBase() } } : {}),
       enabled: ready, health: () => ({}),
       replyCheck: text => checkReply(chat.info, text, readReplyRules(join(stateRoot, "reply-rules.json"))),
       log,
@@ -266,7 +270,8 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const abort = new AbortController();
   const ingress = runIngress({
     line: observed, owner: config.owner, ownerStore, access: async () => access,
-    sink: chats.sink(note, () => config.enabled, message => guestDesk.unknown(message)), log,
+    sink: chats.sink(note, () => config.enabled, message => guestDesk.unknown(message),
+      (chat, input) => { void acknowledgeReceived(chat.store, chat.context, input).catch(() => log("receipt-ack-failed")); }), log,
   }, abort.signal);
 
   async function tick(): Promise<void> {
@@ -316,7 +321,10 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     }
   }
   const timer = setInterval(() => {
-    for (const chat of chats.all()) void chat.parts.delivery.tick().catch(() => log("sender-failed"));
+    for (const chat of chats.all()) {
+      void chat.parts.delivery.tick().catch(() => log("sender-failed"));
+      if (ready()) void chat.parts.router.checkFailedInbound().catch(() => log("failed-inbound-check-failed"));
+    }
   }, 1_000);
   const stop = async () => {
     if (stopping) return;

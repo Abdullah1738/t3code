@@ -3,14 +3,15 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { afterEach, describe, expect, it } from "@effect/vitest";
-import { NodeHttpServer } from "@effect/platform-node";
+import { NodeHttpServer, NodeHttpPlatform } from "@effect/platform-node";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/ai";
-import { HttpBody, HttpClient, HttpRouter } from "effect/http";
+import { HttpBody, HttpClient, HttpRouter, HttpServerResponse } from "effect/http";
 
 import * as LargeReplyLog from "./LargeReplyLog.ts";
+import { layerHttpCompression } from "../http.ts";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as McpToolAccess from "../mcp/McpToolAccess.ts";
@@ -74,6 +75,43 @@ describe("LargeReplyLog", () => {
       LargeReplyLog.make("\0").record({ kind: "ws", name: "Exit", bytes: 2e6 }),
     ).not.toThrow();
   });
+
+  it.effect("logs HTTP sizes at 1 MiB with route templates and no request or body text", () =>
+    Effect.gen(function* () {
+      const filePath = temporaryPath();
+      const payload = "private-body".padEnd(LargeReplyLog.LARGE_REPLY_BYTES, "x");
+      const routes = HttpRouter.addAll([
+        HttpRouter.route("GET", "/probe/:id", Effect.succeed(HttpServerResponse.text(payload))),
+        HttpRouter.route(
+          "GET",
+          "/small/:id",
+          Effect.succeed(HttpServerResponse.text(payload.slice(1))),
+        ),
+      ]);
+      yield* Layer.build(
+        HttpRouter.serve(Layer.merge(routes, layerHttpCompression), {
+          disableListenLog: true,
+          disableLogger: true,
+        }).pipe(
+          Layer.provide(NodeHttpPlatform.layer),
+          Layer.provide(Layer.succeed(LargeReplyLog.LargeReplyLog, LargeReplyLog.make(filePath))),
+        ),
+      );
+      const http = yield* HttpClient.HttpClient;
+      const small = yield* http.get("/small/private-id?secret=private-query");
+      expect(yield* small.text).toBe(payload.slice(1));
+      expect(NodeFS.existsSync(filePath)).toBe(false);
+      const response = yield* http.get("/probe/private-id?secret=private-query", {
+        headers: { "x-private-header": "private-header" },
+      });
+      expect(yield* response.text).toBe(payload);
+      const lines = NodeFS.readFileSync(filePath, "utf8").trim().split("\n");
+      expect(lines.map((line) => JSON.parse(line))).toEqual([
+        { at: expect.any(String), kind: "http", name: "GET /probe/:id", bytes: payload.length },
+      ]);
+      expect(lines.join("\n")).not.toContain("private");
+    }).pipe(Effect.scoped, Effect.provide(NodeHttpServer.layerTest)),
+  );
 
   it.effect("records the real serialized MCP response under the tool's name", () =>
     Effect.scoped(

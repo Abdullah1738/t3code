@@ -3,8 +3,11 @@ import type { ModelSelection } from "@t3tools/contracts";
 
 import {
   HARNESS_MAP,
+  HARNESS_MAP_VERSION,
   effortOptionId,
   mergeSelection,
+  openCodeModelFamily,
+  postCutoverSelectionProblem,
   resolveSelection,
   selectionEffort,
   splitLegacySuffix,
@@ -85,6 +88,62 @@ describe("harness map", () => {
       expect(resolveSelection(selection)).toEqual({ kind: "unchanged", selection });
     }
   });
+
+  it.each([
+    ["opus/claude-future", "claudeAgent"],
+    ["opus/cc/claude-future#max", "claudeAgent"],
+    ["or/anthropic/claude-future", "claudeAgent"],
+    ["anthropic/unknown-model", "claudeAgent"],
+    ["claude-future", "claudeAgent"],
+    ["opus/cx/gpt-future", "codex"],
+    ["layso/gpt-future#xhigh", "codex"],
+    ["or/openai/gpt-future", "codex"],
+    ["openai/unknown-model", "codex"],
+    ["openai/o3", "codex"],
+    ["gpt-future", "codex"],
+  ])("refuses unmapped family model %s instead of retaining OpenCode", (model, target) => {
+    expect(resolveSelection(sel("opencode", model))).toEqual({
+      kind: "conflict",
+      reason: expect.stringContaining(`select a model on ${target}`),
+    });
+  });
+
+  it("does not use a family match to guess an alias or change native selections", () => {
+    for (const instanceId of ["claudeAgent", "codex", "codex-cu", "custom"]) {
+      const selection = sel(instanceId, "gpt-future");
+      expect(resolveSelection(selection)).toEqual({ kind: "unchanged", selection });
+    }
+    expect(HARNESS_MAP_VERSION).toBe(2);
+  });
+
+  it("recognizes families without substring matches against unrelated model names", () => {
+    expect(openCodeModelFamily("opus/cc/claude-haiku-5-5#xhigh")).toBe("claude");
+    expect(openCodeModelFamily("opus/cx/gpt-6.1-terra#max")).toBe("openai");
+    for (const model of ["surplus/glm", "or/someone/not-gpt-model", "muse/claudette", "kimi/k2"]) {
+      expect(openCodeModelFamily(model)).toBeNull();
+    }
+  });
+});
+
+describe("post-cutover explicit selections", () => {
+  it.each([
+    ["opus/claude-opus-5-5", "claudeAgent/claude-opus-5-5"],
+    ["opus/cx/gpt-6.1-sol", "codex/gpt-6.1-sol"],
+    ["opus/cx/gpt-6.1-terra#max", "codex-cu/gpt-6.1-terra"],
+  ])("names the verified native target for %s", (model, target) => {
+    expect(postCutoverSelectionProblem(sel("opencode", model))).toContain(`use ${target} instead`);
+  });
+
+  it("refuses unknown family models without guessing a model", () => {
+    expect(postCutoverSelectionProblem(sel("opencode", "opus/claude-future"))).toContain(
+      "No verified native harness mapping",
+    );
+  });
+
+  it("allows native selections and unrelated OpenCode models", () => {
+    expect(postCutoverSelectionProblem(sel("codex-cu", "gpt-6.1-terra"))).toBeNull();
+    expect(postCutoverSelectionProblem(sel("opencode", "surplus/glm"))).toBeNull();
+  });
 });
 
 describe("legacy suffix", () => {
@@ -132,6 +191,35 @@ describe("legacy suffix", () => {
 });
 
 describe("carried options", () => {
+  it.each([
+    ["opus/claude-opus-5-5", "effort"],
+    ["opus/cx/gpt-6.1-sol", "reasoningEffort"],
+    ["opus/cx/gpt-6.1-terra", "reasoningEffort"],
+  ])("preserves an already-native effort option on %s", (model, id) => {
+    expect(resolveSelection(sel("opencode", model, [{ id, value: "xhigh" }]))).toMatchObject({
+      kind: "mapped",
+      effort: "xhigh",
+      selection: { options: [{ id, value: "xhigh" }] },
+    });
+  });
+
+  it("refuses disagreement between compatibility and native effort names", () => {
+    expect(
+      resolveSelection(
+        sel("opencode", "opus/cx/gpt-6.1-sol", [
+          { id: "variant", value: "high" },
+          { id: "reasoningEffort", value: "max" },
+        ]),
+      ).kind,
+    ).toBe("conflict");
+    expect(
+      mergeSelection(
+        sel("opencode", "opus/claude-opus-5-5#high", [{ id: "effort", value: "max" }]),
+        {},
+      ).kind,
+    ).toBe("conflict");
+  });
+
   it("keeps fastMode for Claude and drops OpenCode-only options", () => {
     const result = resolveSelection(
       sel("opencode", "opus/claude-opus-5-5", [

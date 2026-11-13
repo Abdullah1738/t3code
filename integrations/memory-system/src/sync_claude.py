@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import sqlite3
+import redact_guard
 import stat
 import sys
 import time
@@ -27,6 +28,7 @@ import schema_migrations  # noqa: E402
 import transcript_capture as tc  # noqa: E402
 import transcript_roots  # noqa: E402
 from sync_opencode_v2 import with_retry  # noqa: E402
+from capture_budget import Budget, Exhausted, checkpoint, setup_writer  # noqa: E402
 
 HOME = os.path.expanduser("~")
 MEM_DB = os.environ.get("MEMORY_DB", os.path.join(HOME, ".local/share/memory-system/data/memory.db"))
@@ -183,7 +185,7 @@ def project(rec, path, line_no):
     key = session_key(sid, agent)
     ts = parse_ts(rec.get("timestamp"))
     base = {"file": os.path.basename(path), "line": line_no, "cwd": rec.get("cwd"), "parent_session": sid,
-            "agent_id": agent, "sidechain": bool(rec.get("isSidechain"))}
+            "agent_id": agent, "sidechain": bool(rec.get("isSidechain")), "uuid": uuid}
     model = msg.get("model") if isinstance(msg.get("model"), str) else None
     rows = []
     for i, b in enumerate(_blocks(msg)):
@@ -231,13 +233,12 @@ def is_seeded(seeded, file_ident, line_no, key):
 class ClaudeSync:
     def __init__(self, args, roots=None):
         self.args = args
+        self.budget = Budget(args.deadline)
         self.roots = roots if roots is not None else transcript_roots.existing(
             [e for e in transcript_roots.load() if e["driver"] == DRIVER])
         self.all_roots = [r for r in transcript_roots.resolve() if r["driver"] == DRIVER]
-        self.mem = sqlite3.connect(MEM_DB, timeout=600)
-        self.mem.execute("PRAGMA wal_autocheckpoint=0")
-        self.mem.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
-        self.mem.execute("PRAGMA busy_timeout=600000")
+        self.mem = setup_writer(sqlite3.connect(MEM_DB, timeout=0.1), self.budget)
+        self.redactor = redact_guard.CaptureGuard(self.mem)
         schema_migrations.migrate(self.mem)
         tc.ensure_schema(self.mem)
         self.seed_roots = list(self.roots) + list(self.all_roots)
@@ -292,10 +293,10 @@ class ClaudeSync:
         key = self.key_of(path)
         instance = self._root_of(path)["instance"]
         if tc.quarantined(self.mem, key):
-            with_retry(self.mem, lambda: tc.follow_quarantined_move(self.mem, path, key, instance))
+            with_retry(self.mem, lambda: tc.follow_quarantined_move(self.mem, path, key, instance), budget=self.budget)
             self.stats["quarantined"] += 1
             return
-        rep = with_retry(self.mem, lambda: tc.open_representation(self.mem, path, st, key=key, instance=instance))
+        rep = with_retry(self.mem, lambda: tc.open_representation(self.mem, path, st, key=key, instance=instance), budget=self.budget)
         if rep["quarantined_until"] > time.time():
             self.stats["quarantined"] += 1
             return
@@ -312,6 +313,7 @@ class ClaudeSync:
         pos = rep["offset"]
         line_no = rep["lines"]  # lines already journaled for this representation
         for line, end in tc.read_complete_lines(path, pos, max_bytes=tc.BATCH_BYTES):
+            self.budget.check()
             line_no += 1
             pos = end
             try:
@@ -332,6 +334,7 @@ class ClaudeSync:
     def _key_from_raw(self, path, rep_id):
         key = None
         for (line,) in self.mem.execute("SELECT raw FROM native_capture_raw WHERE rep_id=? ORDER BY line_no", (rep_id,)):
+            self.budget.check()
             try:
                 key = tc.merge_session_key(key, self._key_of_line(path, json.loads(line)))
             except (ValueError, UnicodeDecodeError):
@@ -343,28 +346,31 @@ class ClaudeSync:
         if key is not None:
             with_retry(self.mem, lambda: self.mem.execute(
                 "UPDATE native_capture_files SET session_key=? WHERE rep_id=? AND session_key IS NULL",
-                (key, rep["rep_id"])))
+                (key, rep["rep_id"])), budget=self.budget)
 
     def _write(self, path, rep, pos, st, events, raw, lines_total, session_key):
         def txn():
             if raw:
                 self.mem.executemany(
                     "INSERT INTO native_capture_raw(source, path, rep_id, line_no, sha1, raw) VALUES(?,?,?,?,?,?)",
-                    [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(line), sqlite3.Binary(line)) for line, ln in raw],
+                    [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(safe_line), sqlite3.Binary(safe_line))
+                     for line, ln in raw for safe_line in [self.redactor.raw(line, session=session_key, capture_id=(SOURCE,tc.raw_sha1(line)))]],
                 )
             if events:
                 self.mem.executemany(
                     "INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,"
                     "content_type,model,tokens_used,metadata_json) VALUES (?,?,?,?,?,?,?,?,NULL,?)"
                     " ON CONFLICT(source,session_id,turn_id) DO NOTHING",
-                    [(SOURCE, key, tid, ts, spk, content, ctype, model, json.dumps(m, ensure_ascii=False))
-                     for tid, ts, spk, ctype, content, model, m, key in events],
+                    [(SOURCE, key, tid, ts, spk, safe_content, ctype, model, safe_meta)
+                     for tid, ts, spk, ctype, content, model, m, key in events
+                     for safe_content, safe_meta in [self.redactor.event(
+                         SOURCE, key, tid, content, json.dumps(m, ensure_ascii=False))]],
                 )
             tc.record_ok(self.mem, rep["rep_id"], pos, st.st_size, st.st_mtime, lines_total,
                          tail=tc.tail_sha1(path, pos) if pos else None,
                          instance=self._root_of(path)["instance"], session_key=session_key)
 
-        with_retry(self.mem, txn)
+        with_retry(self.mem, txn, budget=self.budget)
         self.stats["rows"] += len(events)
         self.stats["raw"] += len(raw)
 
@@ -395,12 +401,19 @@ class ClaudeSync:
                     (path, key, st.st_ino, st.st_size, st.st_mtime, self._root_of(path)["instance"],
                      str(msg)[:500], now, now + tc.QUARANTINE_SECS))
                 return cur.lastrowid
-            with_retry(self.mem, ins)
+            with_retry(self.mem, ins, budget=self.budget)
             return
         if row:
-            with_retry(self.mem, lambda: tc.record_error(self.mem, row[0], msg))
+            with_retry(self.mem, lambda: tc.record_error(self.mem, row[0], msg), budget=self.budget)
 
     def run(self):
+        try:
+            return self._run()
+        finally:
+            checkpoint(self.mem)
+            self.mem.close()
+
+    def _run(self):
         t0 = time.time()
         for r in self.all_roots:
             if not r["exists"]:
@@ -408,34 +421,43 @@ class ClaudeSync:
         for r in self.roots:
             if not os.path.isdir(r["path"]):
                 continue
-            if self.args.deadline and time.time() - t0 > self.args.deadline:
+            if self.budget.expired() or (self.args.deadline and time.time() - t0 > self.args.deadline):
+                self.stats["partial"] = True
                 break
             files_before, errors_before = self.stats["files"], self.stats["errors"]
             finished = True
             for path in session_files(r["path"]):
-                if self.args.deadline and time.time() - t0 > self.args.deadline:
+                if self.budget.expired() or (self.args.deadline and time.time() - t0 > self.args.deadline):
                     print("soft deadline reached; rest next run", flush=True)
                     finished = False
+                    self.stats["partial"] = True
                     break
                 self.stats["files"] += 1
                 try:
                     st = os.stat(path)
                     self.sync_file(path, st)
+                except Exhausted:
+                    finished = False
+                    self.stats["partial"] = True
+                    break
                 except FileNotFoundError:
                     continue
                 except sqlite3.OperationalError as e:
+                    if self.budget.expired():
+                        finished = False
+                        self.stats["partial"] = True
+                        break
                     if "locked" in str(e) or "busy" in str(e):
                         raise
                     self._fail(path, str(e))
                 except Exception as e:  # noqa: BLE001 - one bad file must not block the others
                     self._fail(path, f"{type(e).__name__}: {str(e)[:200]}")
-            if (finished and os.path.isdir(r["path"]) and
+            if (finished and not self.budget.expired() and os.path.isdir(r["path"]) and
                     (not self.args.deadline or time.time() - t0 <= self.args.deadline)):
                 with_retry(self.mem, lambda: tc.record_root_pass(
                     self.mem, r["instance"], r["path"], self.stats["files"] - files_before,
-                    self.stats["errors"] - errors_before))
+                    self.stats["errors"] - errors_before), budget=self.budget)
         self.stats["secs"] = round(time.time() - t0, 2)
-        self.mem.close()
         print("DONE", json.dumps(self.stats), flush=True)
         return self.stats
 

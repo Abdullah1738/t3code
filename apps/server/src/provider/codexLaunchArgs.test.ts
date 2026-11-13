@@ -71,3 +71,17 @@ describe("codexExecLaunchArgs", () => {
     ]);
   });
 });
+
+it("replaces fast service tiers in every supported launch argument form", () => {
+  for (const raw of [
+    '--config service_tier="priority"',
+    '-c service_tier="fast"',
+    '--config=service_tier="priority"',
+    '-c=service_tier="ultrafast"',
+  ]) {
+    for (const args of [codexAppServerArgs(raw), codexExecLaunchArgs(raw)]) {
+      NodeAssert.ok(args.some((arg) => arg.includes('service_tier="default"')));
+      NodeAssert.ok(args.every((arg) => !arg.includes("priority") && !arg.includes("ultrafast")));
+    }
+  }
+});

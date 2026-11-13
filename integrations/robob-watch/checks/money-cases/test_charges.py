@@ -2,10 +2,12 @@
 import datetime as dt
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -15,6 +17,12 @@ ch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ch)
 
 TZ = ch.TZ
+
+
+def replica_meta(db):
+    db.execute('CREATE TABLE ardud_readonly_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    db.executemany('INSERT INTO ardud_readonly_meta VALUES (?,?)',
+                   [('ready', '1'), ('updated_at', dt.datetime.now(dt.timezone.utc).isoformat()), ('schema_version', '1')])
 
 
 def at(text):
@@ -70,6 +78,40 @@ class Parse(unittest.TestCase):
             with self.subTest(text=text[:40]):
                 self.assertIsNone(ch.parse(text, sender))
         self.assertIsNotNone(ch.parse('Purchase of AED 12.00 with Credit Card ending 1111 at ACME, Dubai. Avl'))
+
+
+class AlertText(unittest.TestCase):
+    def test_selected_body_continuations_stop_at_next_context_header(self):
+        bodies = [
+            'Purchase of USD 100 with your Credit Card ending 2342 at Acme.',
+            'Purchase of USD 100\nwith your Credit Card ending 2342 at Acme.',
+            'Purchase of USD 100\n\n  with your Credit Card ending 2342 at Acme.',
+            'Purchase of USD 100\r\nwith your Credit Card ending 2342 at Acme.',
+            'Purchase of USD 100\nwith your Credit Card ending 2342 at Acme.\n> continuation',
+        ]
+        for body in bodies:
+            for following in (False, True):
+                with self.subTest(body=body, following=following):
+                    shown = ('imessage: EmiratesNBD\n\n'
+                             '         9 2026-11-15 11:59 EmiratesNBD: USD 100 has been refunded.\n'
+                             '>       10 2026-11-15 12:00 EmiratesNBD: ' + body)
+                    if following:
+                        shown += '\n        11 2026-11-15 12:01 EmiratesNBD: Payment of USD 100 towards your Credit Card.'
+                    selected = ch.alert_text(shown)
+                    self.assertEqual(selected, body.replace('\r\n', '\n'))
+                    self.assertEqual(ch.parse(selected, 'EmiratesNBD')['merchant'], 'Acme')
+
+    def test_unknown_timestamp_header_still_bounds_selected_body(self):
+        shown = ('imessage: EmiratesNBD\n\n'
+                 '>       10 ????-??-?? ??:?? EmiratesNBD: Selected\ncontinuation\n'
+                 '        11 ????-??-?? ??:?? EmiratesNBD: Neighbor')
+        self.assertEqual(ch.alert_text(shown), 'Selected\ncontinuation')
+
+    def test_unframed_messages_and_email_quotes_are_unchanged(self):
+        for shown in ('Purchase of USD 100\nwith your Credit Card ending 2342 at Acme.',
+                      'Subject: Bank alert\n\nPurchase of USD 100\n> quoted text'):
+            with self.subTest(shown=shown):
+                self.assertEqual(ch.alert_text(shown), shown)
 
 
 class Finder:
@@ -209,6 +251,7 @@ class Explain(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'state.sqlite'
             db = sqlite3.connect(path)
+            replica_meta(db)
             db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT, title TEXT, updated_at TEXT)')
             db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id TEXT, role TEXT, created_at TEXT, '
                        'payload_json TEXT)')
@@ -491,12 +534,12 @@ class Explain(unittest.TestCase):
                        find=Finder([{'id': 1, 'ts': ts('2026-10-23T23:50'), 'sender': 'acme', 'subject': 'acme 5.00'}]))
         self.assertEqual(r['verdict'], 'ask')
 
-    def test_lookups_that_fail_are_reported_and_it_asks(self):
+    def test_lookups_that_fail_are_reported_and_block_asking(self):
         def broken(*a, **k):
             raise ch.Lookup('msgs exit 1')
         r = ch.explain(CHARGE, at('2026-10-23T23:47'), at('2026-10-24T00:37'), find=broken, said=broken)
-        self.assertEqual(r['verdict'], 'ask')
-        self.assertEqual(len(r['errors']), 3)
+        self.assertEqual(r['verdict'], 'unverified')
+        self.assertEqual(len(r['errors']), 2)
         with self.assertRaises(ch.Lookup):
             ch.left(0, 5)
 
@@ -511,10 +554,44 @@ def relayed(text, inbound='BCA7F873-4770-43DB-8E0E-7E3294F6C71A', **extra):
 
 
 class OwnerTexts(unittest.TestCase):
+    def test_default_state_is_the_read_replica(self):
+        with patch.dict(os.environ, {}, clear=True):
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        self.assertTrue(str(module.STATE_DB).endswith('/readonly/state.sqlite'))
+
+    def test_progress_handler_bounds_a_slow_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'owner.sqlite'
+            with sqlite3.connect(path) as db:
+                replica_meta(db)
+                db.execute('CREATE TABLE threads (thread_id, title, updated_at)')
+                db.execute('CREATE VIEW orchestration_v2_projection_threads AS '
+                           'SELECT thread_id, title, slow(updated_at) AS updated_at FROM threads')
+                db.execute('CREATE TABLE orchestration_v2_projection_messages '
+                           '(thread_id, role, created_at, payload_json)')
+                db.executemany('INSERT INTO threads VALUES (?, ?, ?)',
+                               [(str(n), 'app', '2000-01-01') for n in range(20000)])
+            connect = sqlite3.connect
+            def slow(value):
+                time.sleep(0.0002)
+                return value
+            def connection(*args, **kw):
+                db = connect(*args, **kw)
+                db.create_function('slow', 1, slow)
+                return db
+            started = time.time()
+            remaining = 1.5
+            with patch.object(ch, 'STATE_DB', path), patch.object(ch.sqlite3, 'connect', connection):
+                with self.assertRaisesRegex(ch.Lookup, 'query over time'):
+                    ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'), started + remaining)
+            self.assertLess(time.time() - started, remaining + 1)
+
     def test_only_what_he_typed_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'state.sqlite'
             db = sqlite3.connect(path)
+            replica_meta(db)
             db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT, title TEXT, updated_at TEXT)')
             db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id TEXT, role TEXT, created_at TEXT, '
                        'payload_json TEXT)')
@@ -578,6 +655,7 @@ class OwnerTexts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'state.sqlite'
             db = sqlite3.connect(path)
+            replica_meta(db)
             db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT, title TEXT, updated_at TEXT)')
             db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id TEXT, role TEXT, created_at TEXT, '
                        'payload_json TEXT)')
@@ -602,6 +680,14 @@ class OwnerTexts(unittest.TestCase):
 
 
 class SearchOutput(unittest.TestCase):
+    def test_msgs_never_inherits_interactive_stdin(self):
+        done = ch.subprocess.CompletedProcess([], 0, '', '')
+        with patch.object(ch.subprocess, 'run', return_value=done) as run:
+            ch.search('Acme', '2026-11-01')
+            ch.show({'id': 1})
+        self.assertEqual(len(run.call_args_list), 2)
+        self.assertTrue(all(call.kwargs['stdin'] == ch.subprocess.DEVNULL for call in run.call_args_list))
+
     def test_snippets_with_unicode_line_separators_stay_one_row(self):
         rows = [{'id': 1, 'snip': 'Sincerely,\u2028Apple\x85end\x1cx'}, {'id': 2, 'snip': 'ok'}]
         out = ''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in rows)

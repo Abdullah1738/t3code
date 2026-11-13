@@ -1,5 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -33,6 +35,8 @@ import {
 } from "@t3tools/contracts";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
+import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
+import { kanbanDDL } from "../../persistence/kanbanSchema.ts";
 import { summaries, tallyBoards } from "../engine/summaries.ts";
 import * as KanbanStore from "./KanbanStore.ts";
 
@@ -113,6 +117,105 @@ const withFileStore = <A, E>(
     return yield* effect.pipe(Effect.timeout("15 seconds"), Effect.provide(layer));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
+it.effect("compact pages read the split boards database, not orchestration storage", () =>
+  Effect.gen(function* () {
+    const main = yield* SqlClient.SqlClient;
+    const context = yield* Layer.build(NodeSqliteClient.layer({ filename: ":memory:" }));
+    const sql = Context.get(context, SqlClient.SqlClient);
+    yield* Effect.forEach(kanbanDDL, (ddl) => sql.unsafe(ddl), { discard: true });
+    const split = BoardsDatabase.BoardsDatabase.of({ sql, ready: Effect.void, path: ":memory:" });
+    yield* Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const detail = "private detail".repeat(1_000);
+      yield* store.putBoard(board);
+      yield* Effect.forEach([1, 3, 8], (number) =>
+        store.putCard({
+          ...card(number, "todo"),
+          description: detail,
+          prompt: detail,
+          wakeNote: detail,
+        }),
+      );
+      yield* store.putGoal({
+        id: KanbanGoalId.make("split-goal"),
+        boardId,
+        name: "Split goal",
+        status: "active",
+        now: null,
+        story: [{ at, text: detail }],
+        createdAt: at,
+      });
+      const first = yield* store.feedCards(boardId, { after: 0, limit: 2 });
+      const next = yield* store.feedCards(boardId, { after: first.at(-1)!.number, limit: 2 });
+      assert.deepStrictEqual(
+        first.map((row) => row.number),
+        [1, 3],
+      );
+      assert.deepStrictEqual(
+        next.map((row) => row.number),
+        [8],
+      );
+      assert.isTrue(
+        first.every(
+          (row) => row.prompt === "" && row.description === "" && row.wakeNote === "pending",
+        ),
+      );
+      assert.strictEqual((yield* store.feedGoals(boardId))[0]!.story[0]!.text.length, 512);
+      assert.strictEqual((yield* store.card(first[0]!.id))!.prompt, detail);
+    }).pipe(
+      Effect.provide(
+        KanbanStore.layer.pipe(Layer.provide(Layer.succeed(BoardsDatabase.BoardsDatabase, split))),
+      ),
+    );
+    assert.deepStrictEqual(
+      yield* main`SELECT name FROM sqlite_schema WHERE name GLOB 'ardud_kanban_*'`,
+      [],
+    );
+  }).pipe(Effect.scoped, Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect("pages big boards without loading card detail or goal histories", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const large = "detail".repeat(200_000);
+    for (let number = 1; number <= 24; number++) {
+      yield* store.putCard({
+        ...card(number, "todo"),
+        description: large,
+        prompt: large,
+        wakeNote: large,
+      });
+    }
+    yield* store.putGoal({
+      id: KanbanGoalId.make("goal-big"),
+      boardId,
+      name: "Big",
+      status: "active",
+      now: null,
+      story: [{ at, text: large }],
+      createdAt: at,
+    });
+    const first = yield* store.feedCards(boardId, { after: 0, limit: 10 });
+    const next = yield* store.feedCards(boardId, { after: first.at(-1)!.number, limit: 10 });
+    assert.deepEqual(
+      first.map((row) => row.number),
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    );
+    assert.strictEqual(next[0]!.number, 11);
+    assert.isBelow(Buffer.byteLength(JSON.stringify(first)), 30_000);
+    assert.isTrue(
+      first.every(
+        (row) => row.prompt === "" && row.description === "" && row.wakeNote === "pending",
+      ),
+    );
+    assert.isNull(first[0]!.stalled);
+    assert.lengthOf((yield* store.feedGoals(boardId))[0]!.story, 1);
+    assert.strictEqual((yield* store.feedGoals(boardId))[0]!.story[0]!.text.length, 512);
+    assert.strictEqual((yield* store.card(first[0]!.id))!.prompt, large);
+    assert.lengthOf((yield* store.goals(boardId))[0]!.story, 1);
+  }).pipe(Effect.provide(TestLayer)),
+);
+
 it.live(
   "reads every routed store query while a file database writer is held",
   () =>
@@ -124,6 +227,7 @@ it.live(
         const working = card(2, "working");
         const otherBoard = { ...board, id: KanbanBoardId.make("board-2"), slug: "other" };
         const discussionId = KanbanDiscussionId.make("discussion-1");
+        const noOwnerDiscussionId = KanbanDiscussionId.make("discussion-no-owner");
         const scriptId = KanbanScriptId.make("script-1");
         const goal = {
           id: KanbanGoalId.make("goal-1"),
@@ -170,6 +274,25 @@ it.live(
             answers: [],
             createdAt: at,
           }) satisfies KanbanMessage;
+        const ownerMessage = message(1);
+        const evaluatorMessage = {
+          ...message(2),
+          author: { _tag: "evaluator", threadId: ThreadId.make("evaluator-1") },
+          authorName: "Evaluator",
+          createdAt: "2026-10-25T13:01:00.000Z",
+        } satisfies KanbanMessage;
+        const noOwnerDiscussion = {
+          ...discussion,
+          id: noOwnerDiscussionId,
+          cardId: null,
+          evaluatorThreadId: null,
+          lastSeq: 1,
+        } satisfies KanbanDiscussion;
+        const noOwnerMessage = {
+          ...evaluatorMessage,
+          discussionId: noOwnerDiscussionId,
+          seq: 1,
+        } satisfies KanbanMessage;
         const script = {
           id: scriptId,
           boardId,
@@ -251,8 +374,10 @@ it.live(
         yield* store.putPool(boardId, pool);
         yield* store.putGroups(boardId, [group]);
         yield* store.putDiscussion(discussion);
-        yield* store.putMessage(message(1));
-        yield* store.putMessage(message(2));
+        yield* store.putDiscussion(noOwnerDiscussion);
+        yield* store.putMessage(ownerMessage);
+        yield* store.putMessage(evaluatorMessage);
+        yield* store.putMessage(noOwnerMessage);
         yield* store.putScript(script);
         yield* store.putScript(otherScript);
         const run = yield* store.addScriptRun({
@@ -294,6 +419,12 @@ it.live(
 
         yield* Effect.gen(function* () {
           yield* Deferred.await(held);
+          assert.deepStrictEqual(yield* store.ownerWait(discussionId), {
+            seq: ownerMessage.seq,
+            createdAt: ownerMessage.createdAt,
+            answered: true,
+          });
+          assert.isNull(yield* store.ownerWait(noOwnerDiscussionId));
           assert.deepStrictEqual(yield* store.boards, [board, otherBoard]);
           assert.deepStrictEqual(yield* store.cards(boardId), [todo, working]);
           assert.deepStrictEqual(yield* store.summaryCards(boardId), [
@@ -314,12 +445,23 @@ it.live(
           assert.deepStrictEqual(yield* store.goals(boardId), [goal]);
           assert.deepStrictEqual(yield* store.pools(boardId), [pool]);
           assert.deepStrictEqual(yield* store.groups(boardId), [group]);
-          assert.deepStrictEqual(yield* store.discussions(boardId), [discussion]);
+          assert.deepStrictEqual(yield* store.discussions(boardId), [
+            discussion,
+            noOwnerDiscussion,
+          ]);
           assert.deepStrictEqual(yield* store.discussion(discussionId), discussion);
           assert.deepStrictEqual(yield* store.discussionByEvaluator("evaluator-1"), discussion);
-          assert.deepStrictEqual(yield* store.messages(discussionId, { limit: 1 }), [message(2)]);
-          assert.deepStrictEqual(yield* store.allMessages(discussionId), [message(1), message(2)]);
-          assert.deepStrictEqual(yield* store.message(discussionId, 1), message(1));
+          assert.deepStrictEqual(yield* store.discussionBoardIdsByEvaluator("evaluator-1"), [
+            boardId,
+          ]);
+          assert.deepStrictEqual(yield* store.messages(discussionId, { limit: 1 }), [
+            evaluatorMessage,
+          ]);
+          assert.deepStrictEqual(yield* store.allMessages(discussionId), [
+            ownerMessage,
+            evaluatorMessage,
+          ]);
+          assert.deepStrictEqual(yield* store.message(discussionId, 1), ownerMessage);
           assert.deepStrictEqual(yield* store.scripts(boardId), [script]);
           assert.deepStrictEqual(yield* store.allScripts, [script, otherScript]);
           assert.deepStrictEqual(yield* store.script(scriptId), script);
@@ -558,6 +700,13 @@ it.layer(TestLayer)("kanban store: summary cards", (it) => {
         packet(4, "working", { asks: [openAsk] }),
         packet(5, "working", { asks: [closedAsk] }),
         packet(6, "needs_owner", { settledAt: at }),
+        packet(7, "needs_owner", { asks: [{ ...openAsk, blocking: true, handedAt: at }] }),
+        packet(8, "todo", { activeThreadId: null, asks: [{ ...openAsk, clarifyAskedAt: at }] }),
+        packet(9, "todo", { activeThreadId: null, asks: [{ ...openAsk, expiresAt: at }] }),
+        packet(10, "todo", {
+          activeThreadId: null,
+          asks: [{ ...openAsk, snoozedUntil: "2999-01-01T00:00:00.000Z" }],
+        }),
       ];
       for (const entry of cards) yield* store.putCard(entry);
 
@@ -570,19 +719,30 @@ it.layer(TestLayer)("kanban store: summary cards", (it) => {
           stage,
           settledAt,
           activeThreadId,
-          asks: asks.map(({ closedAt }) => ({ closedAt })),
+          // Whose turn it is travels with each ask; the keys stay absent when unset.
+          asks: asks.map(({ closedAt, clarifyAskedAt, handedAt, expiresAt, snoozedUntil }) => ({
+            closedAt,
+            ...(clarifyAskedAt === undefined ? {} : { clarifyAskedAt }),
+            ...(handedAt === undefined ? {} : { handedAt }),
+            ...(expiresAt === undefined ? {} : { expiresAt }),
+            ...(snoozedUntil === undefined ? {} : { snoozedUntil }),
+          })),
         })),
       );
-      assert.isBelow(JSON.stringify(summary).length, 2_000);
+      assert.isBelow(JSON.stringify(summary).length, 3_000);
       assert.isAbove(JSON.stringify(full).length, 600_000);
 
+      const nowMs = Date.parse(at) + 1;
       const fromFull = summaries(
         tallyBoards([{ board, cards: full, discussions: [], threadIds: [] }]),
+        nowMs,
       );
       const fromSummary = summaries(
         tallyBoards([{ board, cards: summary, discussions: [], threadIds: [] }]),
+        nowMs,
       );
       assert.deepStrictEqual(fromSummary, fromFull);
+      // Cards 3 and 4; the handed, waiting-on-asker, expired and snoozed asks (7 to 10) don't count.
       assert.equal(fromSummary[0]?.needsOwner, 2);
       assert.equal(fromSummary[0]?.running, 2);
 
@@ -656,3 +816,100 @@ it.layer(TestLayer)("kanban store: board and pools in one write", (it) => {
     }),
   );
 });
+
+it.effect(
+  "discussion board candidates include every distinct board and follow evaluator ownership",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const evaluator = ThreadId.make("evaluator");
+      const otherBoard = { ...board, id: KanbanBoardId.make("board-2"), slug: "other" };
+      yield* store.putBoard(board);
+      yield* store.putBoard(otherBoard);
+      const first = {
+        id: KanbanDiscussionId.make("disc-1"),
+        boardId,
+        cardId: null,
+        title: "First",
+        evaluatorThreadId: evaluator,
+        participants: [],
+        lastSeq: 0,
+        lastMessageAt: null,
+        createdBy: { _tag: "owner" },
+        createdAt: at,
+        archivedAt: null,
+        titleEditedAt: null,
+        settledAt: null,
+        snoozedUntil: null,
+        pinnedAt: null,
+        reopenedAt: null,
+      } satisfies KanbanDiscussion;
+      const other = { ...first, id: KanbanDiscussionId.make("disc-3"), boardId: otherBoard.id };
+      yield* store.putDiscussion(first);
+      yield* store.putDiscussion({ ...first, id: KanbanDiscussionId.make("disc-2") });
+      yield* store.putDiscussion(other);
+      assert.deepStrictEqual(yield* store.discussionBoardIdsByEvaluator(evaluator), [
+        boardId,
+        otherBoard.id,
+      ]);
+      assert.deepStrictEqual(yield* store.discussionBoardIdsByEvaluator("absent"), []);
+      yield* store.putDiscussion({ ...other, evaluatorThreadId: ThreadId.make("replacement") });
+      assert.deepStrictEqual(yield* store.discussionBoardIdsByEvaluator(evaluator), [boardId]);
+    }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect("releases the reader every 64 summary rows on a 3,000-card board", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const sql = yield* SqlClient.SqlClient;
+    const expected = Array.from({ length: 3_000 }, (_, i) => ({
+      ...card((i + 1) * 2, i % 2 === 0 ? "needs_owner" : "working"),
+      settledAt: i % 7 === 0 ? at : null,
+      asks: [
+        {
+          id: "q1",
+          text: "Go?",
+          blocking: false,
+          by: { _tag: "owner" as const },
+          at,
+          seq: null,
+          closedAt: i % 3 === 0 ? at : null,
+        },
+      ],
+    }));
+    yield* sql.withTransaction(Effect.forEach(expected, store.putCard, { discard: true }));
+    const batches: Array<number> = [];
+    const observe: Statement.Transformer = (statement) => {
+      const [query, params] = statement.compile();
+      if (!query.includes("json_object(") || !query.includes("'settledAt'"))
+        return Effect.succeed(statement);
+      return sql.unsafe<{ count: number }>(`SELECT COUNT(*) AS count FROM (${query})`, params).pipe(
+        Effect.provideService(Statement.CurrentTransformer, undefined),
+        Effect.tap((rows) => Effect.sync(() => batches.push(rows[0]!.count))),
+        Effect.as(statement),
+        Effect.orDie,
+      );
+    };
+    const summary = yield* store
+      .summaryCards(boardId)
+      .pipe(Effect.provideService(Statement.CurrentTransformer, observe));
+    assert.deepStrictEqual(
+      summary,
+      expected.map(({ id, stage, settledAt, activeThreadId, asks }) => ({
+        id,
+        stage,
+        settledAt,
+        activeThreadId,
+        asks: asks.map(({ closedAt }) => ({ closedAt })),
+      })),
+    );
+    assert.strictEqual(
+      batches.reduce((a, b) => a + b, 0),
+      3_000,
+    );
+    assert.isAtMost(Math.max(...batches), 64);
+    // A write between reads must be visible: batching adds no cached result.
+    yield* store.putCard({ ...expected[0]!, stage: "verified", settledAt: at });
+    assert.strictEqual((yield* store.summaryCards(boardId))[0]!.stage, "verified");
+  }).pipe(Effect.provide(TestLayer)),
+);

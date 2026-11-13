@@ -5,10 +5,14 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { assertRecoveryActive, loadControl, recoveryElapsed } from './pause.mjs';
+import { isOpenCodeSessionId, parseCutoverStatus } from './harness.mjs';
+import { assertReplicaPath, guardReplica, registerReplica, replicaPath } from './readonly-db.mjs';
+export { assertReplicaFresh, assertThreadInReplica } from './readonly-db.mjs';
 
 const HOME = process.env.HOME || homedir();
 export const PATHS = {
-  db: process.env.STREAM_RECOVERY_DB || join(HOME, ".robob/userdata/statev2.sqlite"),
+  db: replicaPath(),
   ocPassword: join(HOME, ".config/opencode-service/password"),
   dataDir: process.env.STREAM_RECOVERY_DATA || join(HOME, ".local/share/stream-recovery/data"),
   bun: join(HOME, ".bun/bin/bun"),
@@ -27,7 +31,17 @@ const parse = (text) => {
 // ---------- Robob state DB (read-only, indexed lookups only) ----------
 
 export function openDb(path = PATHS.db) {
-  return new DatabaseSync(path, { readOnly: true });
+  const safePath = assertReplicaPath(path);
+  const db = new DatabaseSync(safePath, { readOnly: true });
+  try {
+    // Pin readiness and all dependent rows to one complete export.
+    db.exec('BEGIN');
+    registerReplica(db, safePath);
+    return guardReplica(db);
+  } catch (e) {
+    db.close();
+    throw e;
+  }
 }
 
 export function failedRunsSince(db, sinceIso) {
@@ -166,7 +180,7 @@ export function childNativeSession(db, childThreadId) {
     `select provider_thread_id from orchestration_v2_projection_runs
       where thread_id=? and provider_thread_id is not null order by ordinal desc limit 1`,
   ).get(childThreadId)?.provider_thread_id;
-  return /native-thread:(ses_[A-Za-z0-9]+)/.exec(providerThread ?? '')?.[1] ?? null;
+  return /^provider-thread:provider:opencode:.*:native-thread:(ses_[A-Za-z0-9]+)$/.exec(providerThread ?? '')?.[1] ?? null;
 }
 
 // A user_message turn item materializes when a queued turn starts, before
@@ -176,6 +190,7 @@ export function childNativeSession(db, childThreadId) {
 export function restartRunsSince(db, sinceIso) {
   return db.prepare(
     `select r.run_id, r.thread_id, r.ordinal, r.status, r.requested_at, r.completed_at,
+            json_extract(r.payload_json,'$.modelSelection.instanceId') instance_id,
             json_extract(r.payload_json,'$.startedAt') started_at,
             exists(select 1 from orchestration_v2_projection_turn_items i
               where i.run_id=r.run_id and i.type='user_message') dispatched,
@@ -374,8 +389,13 @@ export async function ctl(method, path, body) {
   return api(method, `/api/ardud/control${path}`, body);
 }
 
+export async function harnessCutoverStatus() {
+  return parseCutoverStatus(await ctl('GET', '/harness-cutover/status'));
+}
+
 async function api(method, path, body) {
   const { url, token } = control();
+  if (method !== "GET") assertRecoveryActive({ readControl });
   const res = await fetch(`${url}${path}`, {
     method,
     headers: { authorization: `Bearer ${token}`, ...(body ? { "content-type": "application/json" } : {}) },
@@ -457,6 +477,7 @@ export function installerResumePendingMs() {
 }
 
 export async function sendToThread(threadId, text, { clientRequestId, mode = "auto" } = {}) {
+  assertRecoveryActive({ readControl });
   return ctl("POST", `/threads/${encodeURIComponent(threadId)}/send`, { text, mode, clientRequestId });
 }
 
@@ -469,8 +490,9 @@ export async function threadByNative(ses) {
   }
 }
 
-export async function interruptThread(threadId, { clientRequestId, reason } = {}) {
-  return ctl("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, { clientRequestId, reason });
+export async function interruptThread(threadId, { clientRequestId, reason, expectedRunId } = {}) {
+  assertRecoveryActive({ readControl });
+  return ctl("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, { clientRequestId, reason, expectedRunId });
 }
 
 // Live top-level threads (running, waiting, queued, needs-input).
@@ -480,6 +502,7 @@ export async function activeThreads() {
 
 // Orchestration command over the Robob WebSocket RPC (same path the web app uses).
 export function dispatchCommand(command, { timeoutMs = 20_000 } = {}) {
+  assertRecoveryActive({ readControl });
   const { url, token } = control();
   const wsUrl = `${url.replace(/^http/, "ws")}/ws?orchestrationProtocol=2`;
   return new Promise((resolve, reject) => {
@@ -496,9 +519,12 @@ export function dispatchCommand(command, { timeoutMs = 20_000 } = {}) {
       fn(v);
     };
     const timer = setTimeout(() => finish(reject, new Error(`ws ${command.type}: timeout`)), timeoutMs);
-    ws.addEventListener("open", () =>
-      ws.send(JSON.stringify({ _tag: "Request", id: "1", tag: "orchestration.dispatchCommand", payload: command, headers: [] })),
-    );
+    ws.addEventListener("open", () => {
+      try {
+        assertRecoveryActive({ readControl });
+        ws.send(JSON.stringify({ _tag: "Request", id: "1", tag: "orchestration.dispatchCommand", payload: command, headers: [] }));
+      } catch (err) { finish(reject, err); }
+    });
     ws.addEventListener("message", (ev) => {
       const raw = typeof ev.data === "string" ? ev.data : Buffer.from(ev.data).toString("utf8");
       const parsed = parse(raw);
@@ -519,7 +545,12 @@ export function dispatchCommand(command, { timeoutMs = 20_000 } = {}) {
 
 let ocAuth;
 async function oc(path, init = {}) {
+  const session = /^\/api\/session\/([^/?]+)/.exec(path)?.[1];
+  if (session && session !== 'active' && !isOpenCodeSessionId(session)) {
+    throw new Error('refusing OpenCode request for a non-OpenCode session ID');
+  }
   ocAuth ??= "Basic " + Buffer.from(`opencode:${readFileSync(PATHS.ocPassword, "utf8").trim()}`).toString("base64");
+  if (init.method && init.method !== "GET") assertRecoveryActive({ readControl });
   const res = await fetch(`${OC_URL}${path}`, {
     ...init,
     headers: { authorization: ocAuth, ...(init.headers || {}) },
@@ -531,7 +562,7 @@ async function oc(path, init = {}) {
 }
 
 export async function activeSessions() {
-  return new Set(Object.keys((await oc("/api/session/active"))?.data ?? {}));
+  return new Set(Object.keys((await oc("/api/session/active"))?.data ?? {}).filter(isOpenCodeSessionId));
 }
 
 export async function ocSession(ses) {
@@ -571,11 +602,13 @@ export async function ocTail(ses, limit = 2) {
 }
 
 export async function ocChildren(ses) {
+  if (!isOpenCodeSessionId(ses)) throw new Error('refusing OpenCode request for a non-OpenCode session ID');
   return ((await oc(`/api/session?parentID=${encodeURIComponent(ses)}&limit=200`))?.data ?? []).map((s) => s.id);
 }
 
 // Returns true when OpenCode stopped an active execution, false when idle.
 export async function ocInterrupt(ses) {
+  assertRecoveryActive({ readControl });
   const res = await oc(`/api/session/${ses}/interrupt`, { method: "POST" });
   return Boolean(res?.interrupted ?? res?.data?.interrupted);
 }
@@ -583,6 +616,7 @@ export async function ocInterrupt(ses) {
 // ---------- Telegram ----------
 
 export function telegram({ text, severity = "info", key }) {
+  assertRecoveryActive({ readControl });
   const env = { ...process.env };
   delete env.BUN_INSPECT;
   const r = spawnSync(
@@ -594,6 +628,8 @@ export function telegram({ text, severity = "info", key }) {
 }
 
 // ---------- State + lock ----------
+
+export const readControl = () => loadControl(PATHS.dataDir);
 
 const statePath = () => join(PATHS.dataDir, "state.json");
 
@@ -610,7 +646,7 @@ export function saveState(state, now = Date.now()) {
   mkdirSync(PATHS.dataDir, { recursive: true });
   for (const key of ["handled", "stalls"]) {
     for (const [id, v] of Object.entries(state[key] ?? {})) {
-      if (now - Date.parse(v.at) > 14 * 86_400_000) delete state[key][id];
+      if (v.done && recoveryElapsed({ readControl }, Date.parse(v.at), now) > 14 * 86_400_000) delete state[key][id];
     }
   }
   const tmp = `${statePath()}.tmp`;

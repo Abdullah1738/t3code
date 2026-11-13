@@ -1,17 +1,27 @@
-import { ArchiveIcon, ChevronDownIcon, PlusIcon, SearchIcon, XIcon } from "lucide-react";
-import { KANBAN_WS_METHODS } from "@t3tools/contracts";
+import { useNavigate } from "@tanstack/react-router";
+import {
+  ArchiveIcon,
+  ChevronDownIcon,
+  LayersIcon,
+  PlusIcon,
+  SearchIcon,
+  XIcon,
+} from "lucide-react";
+import { KANBAN_WS_METHODS, type KanbanBoard } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { useState } from "react";
 
 import {
   boardFilter,
-  cardSteps,
+  boardSteps,
   clearFilters,
   EMPTY_FILTER_PREFS,
-  pauseBanner,
   sanitizeBoardFilterPrefs,
   type BoardFilter,
   type BoardFilterPrefs,
+  type BoardGroupState,
+  type BoardLens,
+  type BoardModel,
   type GroupBy,
   type KanbanBoardState,
   type SettledFilter,
@@ -26,6 +36,7 @@ import {
   MenuRadioItem,
   MenuTrigger,
 } from "../../components/ui/menu";
+import { requestConfirmDialog } from "../../confirmDialog";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { BoardFilterMenu } from "./BoardFilterMenu";
 import { SidebarInset } from "../../components/ui/sidebar";
@@ -38,9 +49,11 @@ import {
 import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
+import { observeResize } from "../../lib/observeResize";
 import { cn } from "../../lib/utils";
 import { useNowMs } from "./useNowMs";
-import { BoardColumns } from "./BoardColumns";
+import { boardViewFor, useBoardClock } from "./useBoardClock";
+import { BoardColumns, BoardLoading } from "./BoardColumns";
 import { BoardColumnsMenu } from "./BoardColumnsMenu";
 import { BoardIcon } from "./boardIcon";
 import { CardDrawer, noteDrawerOpener } from "./CardDrawer";
@@ -48,8 +61,10 @@ import { DiscussionsView, NEW_DISCUSSION } from "./DiscussionsView";
 import { GoalsList, GoalView } from "./GoalsView";
 import {
   kanban,
+  kanbanErrorCode,
   kanbanErrorMessage,
   runAction,
+  useBoards,
   useBoardState,
   useFeed,
   useKanbanPermission,
@@ -96,6 +111,8 @@ export function BoardPage(props: {
   const canLiftPause = useKanbanPermission(KANBAN_WS_METHODS.boardPause);
   const view = search.view ?? "board";
   const nowMs = useNowMs();
+  // The columns run on a coarser shared clock than the page: a tick that changes no card costs nothing.
+  const boardClock = useBoardClock();
   const [query, setQuery] = useState("");
   const [storedPrefs, setPrefs] = useLocalStorage(
     filterStorageKey(boardId),
@@ -121,12 +138,56 @@ export function BoardPage(props: {
   // a stale ?card= for a card this board doesn't have leaves the page usable.
   const drawerOpen = search.card !== undefined && state?.cards.has(search.card) === true;
   const setup = state ? setupBanner(state.board) : null;
-  const pause = state ? pauseBanner(state.board, state.cards) : null;
+  const pause = state?.board.pause ?? null;
   const stepCard = (card: string) => go({ card }, { replace: true });
-  const steps =
-    view === "board" && state && filter && drawerOpen && search.card
-      ? cardSteps(state, nowMs, filter, search.group ?? "stage", search.card)
+  const group = search.group ?? "stage";
+  const lens: BoardLens = group === "stage" && search.lens === "stuck" ? "stuck" : "all";
+  // Which state groups the reader opened, folded or expanded; the rest keep their default.
+  const [groups, setGroups] = useState<Readonly<Record<string, BoardGroupState>>>({});
+  const setGroup = (id: string, next: BoardGroupState) =>
+    setGroups((current) => ({ ...current, [id]: next }));
+  // Derived once per board state by the board's own cache; an unchanged board gives the same object.
+  const model =
+    view === "board" && state && filter
+      ? boardViewFor(boardId).model(state, boardClock, { filter, group, lens, groups })
       : null;
+  const steps = model && drawerOpen && search.card ? boardSteps(model, group, search.card) : null;
+  const setLens = (next: BoardLens) => go({ lens: next === "stuck" ? "stuck" : undefined });
+  const [lifting, setLifting] = useState(false);
+  const liftPause = () => {
+    // One question and one call, however fast the button is pressed twice.
+    if (lifting) return;
+    setLifting(true);
+    // What the pause holds, as the strip counts it; cards with a thread on them run anyway.
+    const held = model ? model.summary.blocked : 0;
+    const message =
+      held > 0
+        ? `Lift the pause? ${held.toLocaleString("en-US")} held ${held === 1 ? "card" : "cards"} can start again.`
+        : "Lift the pause? Held cards can start again.";
+    // No dialog host answers undefined: the browser's own confirm stands in.
+    void Promise.resolve(requestConfirmDialog(message))
+      .then((answer) => answer ?? window.confirm(message))
+      .then((confirmed) =>
+        confirmed ? runAction("Couldn't lift the pause", () => kanban.liftPause(boardId)) : false,
+      )
+      .finally(() => setLifting(false));
+  };
+
+  const narrow = useMediaQuery("max-md");
+  const controls: ControlsProps | null = state
+    ? { boardId, state, search, go, prefs, onPrefs: setFilters }
+    : null;
+  // The board view places the banner itself: above its numbers, scrolling away on a phone.
+  const pauseBanner = pause ? (
+    <PauseBanner
+      at={pause.at}
+      by={pause.by}
+      reason={pause.reason}
+      flow={model?.summary.paused ? model.summary : null}
+      canLift={canLiftPause}
+      onLift={liftPause}
+    />
+  ) : null;
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
@@ -137,18 +198,13 @@ export function BoardPage(props: {
           inert={drawerOpen}
           className="relative gap-4 bg-(--m-surface)"
         >
-          <WorkspaceBreadcrumb ariaLabel="Board" className="min-w-0 shrink overflow-hidden">
+          {/* The padding keeps the board name's outdented hover fill and focus ring inside the clip. */}
+          <WorkspaceBreadcrumb
+            ariaLabel="Board"
+            className="-mx-1.5 min-w-0 shrink overflow-hidden px-1.5"
+          >
             <WorkspaceBreadcrumbItem className="min-w-0 shrink">
-              <button
-                type="button"
-                onClick={() => onSearch({})}
-                className="max-w-full min-w-0 rounded font-semibold text-(--m-text) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
-              >
-                <span className="flex min-w-0 items-center gap-2">
-                  {state ? <BoardIcon board={state.board} className="text-(--m-muted)" /> : null}
-                  <WorkspaceBreadcrumbText>{state?.board.name ?? "Board"}</WorkspaceBreadcrumbText>
-                </span>
-              </button>
+              <BoardSwitcher boardId={boardId} board={state?.board} onHome={() => onSearch({})} />
             </WorkspaceBreadcrumbItem>
             <WorkspaceBreadcrumbSeparator className="max-md:hidden" />
             <WorkspaceBreadcrumbItem current className="max-md:hidden">
@@ -159,17 +215,15 @@ export function BoardPage(props: {
               </WorkspaceBreadcrumbText>
             </WorkspaceBreadcrumbItem>
           </WorkspaceBreadcrumb>
-          {view === "board" && state ? (
-            <BoardControls
-              boardId={boardId}
-              state={state}
-              search={search}
-              go={go}
-              query={query}
-              onQuery={setQuery}
-              prefs={prefs}
-              onPrefs={setFilters}
-            />
+          {view === "board" && state && controls ? (
+            narrow ? (
+              // A phone's header holds the board, search and New; the rest sits above the cards.
+              <div className="flex min-w-0 flex-1 items-center justify-end">
+                <QueryField value={query} onChange={setQuery} />
+              </div>
+            ) : (
+              <BoardHeaderControls {...controls} query={query} onQuery={setQuery} />
+            )
           ) : (
             <span className="flex-1" />
           )}
@@ -186,11 +240,17 @@ export function BoardPage(props: {
           <KanbanLinksProvider boardId={boardId}>
             {state === undefined ? (
               feed.failure ? (
-                <div className="flex flex-col items-start gap-3 pe-5">
-                  <p className="font-medium">Couldn't load the board.</p>
-                  <p className="text-sm text-(--m-muted)">
-                    {kanbanErrorMessage(feed.failure.error)}
-                  </p>
+                <div role="alert" className="flex flex-col items-start gap-3 pe-5">
+                  {kanbanErrorCode(feed.failure.error) === "not-found" ? (
+                    <p className="font-medium">This board doesn't exist.</p>
+                  ) : (
+                    <>
+                      <p className="font-medium">Couldn't load the board.</p>
+                      <p className="text-sm text-(--m-muted)">
+                        {kanbanErrorMessage(feed.failure.error)}
+                      </p>
+                    </>
+                  )}
                   <button
                     type="button"
                     onClick={feed.retry}
@@ -199,6 +259,8 @@ export function BoardPage(props: {
                     Retry
                   </button>
                 </div>
+              ) : view === "board" ? (
+                <BoardLoading />
               ) : null
             ) : (
               <div inert={drawerOpen} className="flex min-h-0 flex-1 flex-col">
@@ -217,14 +279,8 @@ export function BoardPage(props: {
                     }
                   />
                 ) : null}
-                {pause ? (
-                  <PauseBanner
-                    label={pause.label}
-                    canLift={canLiftPause}
-                    onLift={() =>
-                      void runAction("Couldn't lift the pause", () => kanban.liftPause(boardId))
-                    }
-                  />
+                {pauseBanner && view !== "board" ? (
+                  <div className="me-5 mb-3 flex flex-col max-sm:me-4">{pauseBanner}</div>
                 ) : null}
                 {feed.failure ? (
                   <div
@@ -251,6 +307,16 @@ export function BoardPage(props: {
                   prefs={prefs}
                   onPrefs={setFilters}
                   nowMs={nowMs}
+                  model={model}
+                  lens={lens}
+                  onLens={setLens}
+                  lead={pauseBanner}
+                  controls={
+                    narrow && controls
+                      ? (phone) => <BoardViewControls {...controls} size="icons" columns={!phone} />
+                      : null
+                  }
+                  onGroup={setGroup}
                   go={go}
                   openCard={openCard}
                   openGoal={openGoal}
@@ -284,6 +350,12 @@ function BoardBody(props: {
   prefs: BoardFilterPrefs;
   onPrefs: (prefs: BoardFilterPrefs) => void;
   nowMs: number;
+  model: BoardModel | null;
+  lens: BoardLens;
+  onLens: (lens: BoardLens) => void;
+  lead: React.ReactNode;
+  controls: ((phone: boolean) => React.ReactNode) | null;
+  onGroup: (id: string, state: BoardGroupState) => void;
   go: (patch: SearchPatch) => void;
   openCard: (cardId: string) => void;
   openGoal: (goalId: string) => void;
@@ -291,13 +363,19 @@ function BoardBody(props: {
   const { state, search, nowMs, go, filter } = props;
   switch (search.view ?? "board") {
     case "board":
+      if (props.model === null) return null;
       return (
         <div className="flex min-h-0 flex-1 flex-col gap-3">
           <BoardColumns
             boardId={props.boardId}
-            state={state}
-            nowMs={nowMs}
+            model={props.model}
             group={search.group ?? "stage"}
+            lens={props.lens}
+            onLens={props.onLens}
+            lead={props.lead}
+            empty={state.cards.size === 0}
+            controls={props.controls}
+            onGroup={props.onGroup}
             filter={filter}
             onClearFilters={() => props.onPrefs(clearFilters(props.prefs))}
             selectedCardId={search.card}
@@ -365,38 +443,104 @@ function BoardBody(props: {
   }
 }
 
-function BoardControls(props: {
+type ControlsProps = {
   boardId: string;
   state: KanbanBoardState;
   search: BoardSearch;
   go: (patch: SearchPatch) => void;
-  query: string;
-  onQuery: (query: string) => void;
   prefs: BoardFilterPrefs;
   onPrefs: (prefs: BoardFilterPrefs) => void;
-}) {
-  const narrow = useMediaQuery("max-md");
+};
+
+/**
+ * How much the board's controls spell out. `full`: Group by as a five-way switch and
+ * every control with its word. `menu`: Group by folds into a menu. `tight`: the other
+ * controls drop their words too. `icons`: the phone's row above the cards.
+ */
+type ControlsSize = "full" | "menu" | "tight" | "icons";
+
+// The room the header's controls need, search included, for a mouse and for touch.
+const FULL_CONTROLS_MIN_WIDTH = { fine: 700, coarse: 860 } as const;
+const MENU_CONTROLS_MIN_WIDTH = { fine: 470, coarse: 590 } as const;
+
+/** The header's controls on a tablet or desktop, sized to the room the header has left. */
+function BoardHeaderControls(
+  props: ControlsProps & { query: string; onQuery: (query: string) => void },
+) {
+  const [width, setWidth] = useState<number | null>(null);
+  const coarse = useMediaQuery({ pointer: "coarse" });
+  const measure = (element: HTMLDivElement) =>
+    observeResize(element, ([entry]) => {
+      if (entry) setWidth(entry.contentRect.width);
+    });
+  const pointer = coarse ? "coarse" : "fine";
+  const size: ControlsSize =
+    width === null
+      ? "tight"
+      : width >= FULL_CONTROLS_MIN_WIDTH[pointer]
+        ? "full"
+        : width >= MENU_CONTROLS_MIN_WIDTH[pointer]
+          ? "menu"
+          : "tight";
+  return (
+    <div ref={measure} className="flex min-w-0 flex-1 items-center gap-2">
+      <BoardViewControls {...props} size={size} columns />
+      <span className="flex-1" />
+      <QueryField value={props.query} onChange={props.onQuery} />
+    </div>
+  );
+}
+
+const CONTROL_BUTTON =
+  "inline-flex h-8 shrink-0 items-center rounded-full text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base";
+const CONTROL_ON = "bg-(--m-text) text-(--m-ground)";
+const CONTROL_OFF = "bg-(--m-chip) text-(--m-text) hover:bg-(--m-active)";
+
+/** Group by, Columns, Filter and Settled. */
+function BoardViewControls(
+  props: ControlsProps & {
+    size: ControlsSize;
+    /** The column menu only means something where columns sit side by side. */
+    columns: boolean;
+  },
+) {
+  const icons = props.size === "icons";
+  const worded = props.size === "full" || props.size === "menu";
   const group = props.search.group ?? "stage";
   const settled = props.prefs.settled;
   const setSettled = (next: SettledFilter) => props.onPrefs({ ...props.prefs, settled: next });
   const setGroup = (next: GroupBy) => props.go({ group: next === "stage" ? undefined : next });
+  const groupLabel = GROUP_OPTIONS.find((option) => option.value === group)?.label ?? "";
   return (
-    <div className="flex min-w-0 flex-1 items-center gap-2">
-      {narrow ? (
+    <>
+      {props.size === "full" ? (
+        <Seg label="Group by" value={group} options={GROUP_OPTIONS} onChange={setGroup} />
+      ) : (
         <Menu>
           <MenuTrigger
             render={
               <button
                 type="button"
-                aria-label="Group by"
-                className="inline-flex h-8 shrink-0 items-center gap-1 rounded-full bg-(--m-chip) ps-3 pe-2 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base"
+                aria-label={`Group by: ${groupLabel}`}
+                className={cn(
+                  CONTROL_BUTTON,
+                  icons ? "px-3" : "gap-1 ps-3 pe-2",
+                  // On the phone's icon the grouping in force shows only when it isn't the usual one.
+                  icons && group !== "stage" ? CONTROL_ON : CONTROL_OFF,
+                )}
               />
             }
           >
-            {GROUP_OPTIONS.find((option) => option.value === group)?.label}
-            <ChevronDownIcon className="size-3.5 text-(--m-muted)" aria-hidden />
+            {icons ? (
+              <LayersIcon className="size-4 shrink-0" aria-hidden />
+            ) : (
+              <>
+                {groupLabel}
+                <ChevronDownIcon className="size-3.5 text-(--m-muted)" aria-hidden />
+              </>
+            )}
           </MenuTrigger>
-          <MenuPopup align="start" side="bottom">
+          <MenuPopup align={icons ? "end" : "start"} side="bottom">
             <MenuRadioGroup value={group} onValueChange={(value) => setGroup(value as GroupBy)}>
               {GROUP_OPTIONS.map((option) => (
                 <MenuRadioItem key={option.value} value={option.value}>
@@ -406,14 +550,14 @@ function BoardControls(props: {
             </MenuRadioGroup>
           </MenuPopup>
         </Menu>
-      ) : (
-        <Seg label="Group by" value={group} options={GROUP_OPTIONS} onChange={setGroup} />
       )}
-      {group === "stage" ? <BoardColumnsMenu boardId={props.boardId} /> : null}
+      {props.columns && group === "stage" ? (
+        <BoardColumnsMenu boardId={props.boardId} compact={!worded} />
+      ) : null}
       <BoardFilterMenu
         state={props.state}
         prefs={props.prefs}
-        narrow={narrow}
+        narrow={!worded}
         onChange={props.onPrefs}
       />
       <Menu>
@@ -423,18 +567,17 @@ function BoardControls(props: {
               type="button"
               aria-label="Settled cards"
               className={cn(
-                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base",
-                settled !== "hide"
-                  ? "bg-(--m-text) text-(--m-ground)"
-                  : "bg-(--m-chip) text-(--m-text) hover:bg-(--m-active)",
+                CONTROL_BUTTON,
+                "gap-1.5 px-3",
+                settled !== "hide" ? CONTROL_ON : CONTROL_OFF,
               )}
             />
           }
         >
           <ArchiveIcon className="size-3.5 shrink-0" aria-hidden />
-          <span className="max-md:sr-only">{settled === "only" ? "Settled only" : "Settled"}</span>
+          {worded ? <span>{settled === "only" ? "Settled only" : "Settled"}</span> : null}
         </MenuTrigger>
-        <MenuPopup align="start" side="bottom">
+        <MenuPopup align={icons ? "end" : "start"} side="bottom">
           <MenuRadioGroup
             value={settled}
             onValueChange={(value) => setSettled(value as SettledFilter)}
@@ -445,9 +588,88 @@ function BoardControls(props: {
           </MenuRadioGroup>
         </MenuPopup>
       </Menu>
-      <span className="flex-1" />
-      <QueryField value={props.query} onChange={props.onQuery} />
-    </div>
+    </>
+  );
+}
+
+// No max-width here or on the button: with the outdent, a cap of "100%" is 12 px short of
+// the name. Both shrink through min-w-0 when the header runs out of room.
+const BOARD_HEADING = "flex min-w-0";
+const BOARD_NAME =
+  "-mx-1.5 inline-flex min-h-7 min-w-0 items-center rounded-lg px-1.5 font-semibold text-(--m-text) outline-none hover:bg-(--m-chip) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11";
+
+/**
+ * The board's name in the header. With more than one board it opens the list of
+ * them: the open board goes back to its columns, another opens on All.
+ */
+function BoardSwitcher(props: {
+  boardId: string;
+  board: KanbanBoard | undefined;
+  onHome: () => void;
+}) {
+  const navigate = useNavigate();
+  const boards = (useBoards() ?? []).filter(
+    (entry) => entry.board.archivedAt === null || entry.board.id === props.boardId,
+  );
+  const name = (
+    <span className="flex min-w-0 items-center gap-2">
+      {props.board ? <BoardIcon board={props.board} className="text-(--m-muted)" /> : null}
+      <WorkspaceBreadcrumbText>{props.board?.name ?? "Board"}</WorkspaceBreadcrumbText>
+    </span>
+  );
+  // The board's name is the screen's title: the heading holds the control, as a disclosure's does.
+  if (boards.length < 2) {
+    return (
+      <h1 className={BOARD_HEADING}>
+        <button type="button" onClick={props.onHome} className={BOARD_NAME}>
+          {name}
+        </button>
+      </h1>
+    );
+  }
+  const open = (boardId: string) => {
+    if (boardId === props.boardId) props.onHome();
+    else void navigate({ to: "/boards/$boardId", params: { boardId }, search: {} });
+  };
+  return (
+    <Menu>
+      <h1 className={BOARD_HEADING}>
+        <MenuTrigger
+          render={
+            <button
+              type="button"
+              aria-label={`${props.board?.name ?? "Board"}, switch board`}
+              className={BOARD_NAME}
+            />
+          }
+        >
+          <span className="flex min-w-0 items-center gap-1">
+            {name}
+            <ChevronDownIcon className="size-3.5 shrink-0 text-(--m-muted)" aria-hidden />
+          </span>
+        </MenuTrigger>
+      </h1>
+      <MenuPopup align="start" side="bottom">
+        <MenuRadioGroup value={props.boardId} onValueChange={(value) => open(String(value))}>
+          {boards.map((entry) => (
+            <MenuRadioItem key={entry.board.id} value={entry.board.id}>
+              <span className="flex min-w-0 flex-1 items-center gap-2">
+                <BoardIcon board={entry.board} className="text-(--m-muted)" />
+                <span className="min-w-0 truncate">{entry.board.name}</span>
+                {entry.needsOwner > 0 ? (
+                  <span
+                    className="ms-auto ps-3 text-xs text-(--m-warning) tabular-nums"
+                    aria-label={`${entry.needsOwner} need you`}
+                  >
+                    {entry.needsOwner.toLocaleString("en-US")}
+                  </span>
+                ) : null}
+              </span>
+            </MenuRadioItem>
+          ))}
+        </MenuRadioGroup>
+      </MenuPopup>
+    </Menu>
   );
 }
 
@@ -466,7 +688,7 @@ function QueryField(props: { value: string; onChange: (value: string) => void })
     );
   }
   return (
-    <div className="flex h-8 w-56 min-w-0 shrink items-center gap-2 rounded-full bg-(--m-chip) ps-3 pe-1 pointer-coarse:h-11 pointer-coarse:w-64">
+    <div className="flex h-8 w-56 min-w-0 shrink items-center gap-2 rounded-full bg-(--m-chip) ps-3 pe-1 focus-within:ring-2 focus-within:ring-(--m-accent) focus-within:ring-inset pointer-coarse:h-11 pointer-coarse:w-64">
       <SearchIcon className="size-4 shrink-0 text-(--m-muted)" aria-hidden />
       <input
         autoFocus

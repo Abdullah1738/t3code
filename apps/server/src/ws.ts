@@ -18,6 +18,8 @@ import * as Schema from "effect/Schema";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import { rpcInitialItems } from "./rpcInitialItems.ts";
+import * as ReplyBuilders from "./ardud/http/ReplyBuilders.ts";
+import { withReplyBudget } from "./ardud/http/ReplyProtocol.ts";
 import { subscribeChatGptHandoff } from "./provider/CodexChatGptHandoff.ts";
 import { subscribeCodexAuthCallback } from "./provider/CodexAuthCallback.ts";
 import {
@@ -87,6 +89,7 @@ import {
   PersistChatAttachmentsError,
   RpcClientId,
   EnvironmentAuthorizationError,
+  type OrchestrationV2ThreadShell,
   type ProjectId,
   type ProviderDriverKind,
   type ProviderInstanceId,
@@ -129,6 +132,7 @@ import { ownerAppProvenance, sessionActor } from "./ardud/auth/provenance.ts";
 import { KanbanService, type KanbanServiceShape } from "./ardud/kanban/engine/KanbanService.ts";
 import { KanbanScripts } from "./ardud/kanban/engine/ScriptService.ts";
 import { makeKanbanWsHandlers } from "./ardud/kanban/ws.ts";
+import { answerAskSecrets } from "./ardud/kanban/askSecrets.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
 import {
   archivedShellStreamItemFromThreadShell,
@@ -140,9 +144,11 @@ import {
   loadShellSnapshotParts,
   shellStreamItemFromEnrichmentRefresh,
   shellStreamItemFromThreadShell,
+  withSubagentRequestAncestors,
   shellStreamItemsFromInitialSnapshot,
   shellStreamItemsFromResumeSnapshot,
   skipUnchangedThreadShells,
+  shellChangeEvents,
   toShellApplicationEvent,
   type ShellApplicationEvent,
 } from "./orchestration-v2/ShellStream.ts";
@@ -168,6 +174,10 @@ import {
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
 import * as OrchestrationEventStore from "./persistence/OrchestrationEventStore.ts";
+import type { OrchestrationEventStoreError } from "./persistence/Errors.ts";
+import { readThreadShellsShared } from "./ardud/perf/sharedThreadShellReads.ts";
+import { ShellResumeLimits, Switches } from "./ardud/perf/speedups.ts";
+import { shellPageNextAfter, shellPageRead, shellPageSize } from "./ardud/perf/shellPages.ts";
 import { userFacingDispatchErrorMessage } from "./orchestration-v2/UserFacingErrors.ts";
 import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
 import * as ProviderInstanceRegistry from "./provider/ProviderInstanceRegistry.ts";
@@ -555,9 +565,10 @@ const ServerWsRpcGroup = WsRpcGroup.middleware(RpcInstrumentation);
 const ServerWsCoreRpcGroup = WsCoreRpcGroup.middleware(RpcInstrumentation);
 // ardud: missions board
 const ServerWsKanbanRpcGroup = WsKanbanRpcGroup.middleware(RpcInstrumentation);
-// Replaying each intervening event costs a shell refetch; past this gap a
-// single O(active-threads) snapshot is cheaper and bounded.
-const SHELL_RESUME_MAX_GAP = 1_000;
+// Replaying each intervening event reads and decodes its body; past
+// ShellResumeLimits.replayMaxGap the resume reads only which threads changed
+// (getShellChanges), and past changesMaxGap a single O(active-threads) snapshot
+// is cheaper.
 // Row count alone does not bound replay memory: a few events with large tool
 // payloads can decode to gigabytes. Before replaying, sum the serialized
 // payload bytes of the range in SQL and reset with a snapshot past this budget.
@@ -688,6 +699,11 @@ function readClientAnalyticsProps(request: HttpServerRequest.HttpServerRequest) 
     ...(isClientConnectionMethod(connectionMethod) ? { connectionMethod } : {}),
   };
 }
+
+// ardud: a shell stream batch with at least this many changed threads reads their shells
+// together; a single thread keeps its one-row read. Chunked like the control live lists.
+const SHELL_STREAM_BATCH_READ_MIN_THREADS = 2;
+const SHELL_STREAM_BATCH_READ_CHUNK = 400;
 
 const canReplayPersistedRange = Effect.fnUntraced(function* (
   afterSequence: number,
@@ -840,6 +856,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
             })
           : threadManagement.getThreadSnapshot(input.threadId)
       ).pipe(
+        ReplyBuilders.interactive,
         Effect.mapError(
           (cause) =>
             new OrchestrationV2GetThreadProjectionError({
@@ -969,6 +986,9 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
   function* (input: {
     readonly afterSequence?: number;
     readonly requestCompletionMarker?: boolean;
+    readonly acceptShellPages?: boolean;
+    readonly omitIdleSubagents?: boolean;
+    readonly recentFirst?: boolean;
   }) {
     const sql = yield* SqlClient.SqlClient;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
@@ -993,18 +1013,45 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         };
       },
     );
-    const loadSnapshot = Effect.fn("ws.orchestrationV2.loadShellSnapshot")(function* () {
+    const recentFirst = input.recentFirst === true && (yield* Switches).shellRecentFirst;
+    const loadSnapshot = Effect.fn("ws.orchestrationV2.loadShellSnapshot")(function* (
+      after?: string,
+    ) {
+      const read =
+        input.acceptShellPages === true
+          ? shellPageRead(after, recentFirst)
+          : after === undefined
+            ? {}
+            : { afterThreadId: after };
       const base = buildActiveShellSnapshot(
         yield* loadShellSnapshotParts({
           sql,
-          readThreads: threadManagement.readShellSnapshot({ location: "active" }),
+          readThreads: threadManagement.readShellSnapshot({
+            location: "active",
+            ...(input.omitIdleSubagents === true ? { omitIdleSubagents: true } : {}),
+            ...(input.acceptShellPages === true ? { limit: shellPageSize(read) + 1 } : {}),
+            ...read,
+          }),
           listProjects: projects.listShells(),
           latestSequence: applicationEvents.latestApplicationSequence,
         }),
       );
       const enriched = yield* enrichProjectShells(base.projects);
+      if (input.acceptShellPages !== true)
+        return {
+          snapshot: { ...base, projects: enriched.projects },
+          resolvedRepositoryIdentityRoots: enriched.resolvedRepositoryIdentityRoots,
+        };
       return {
-        snapshot: { ...base, projects: enriched.projects } as OrchestrationV2ShellSnapshot,
+        snapshot: {
+          ...base,
+          projects: enriched.projects,
+          threads: base.threads.slice(0, shellPageSize(read)),
+          page: {
+            after: after ?? null,
+            nextAfter: shellPageNextAfter(read, base.threads),
+          },
+        } as OrchestrationV2ShellSnapshot,
         resolvedRepositoryIdentityRoots: enriched.resolvedRepositoryIdentityRoots,
       };
     });
@@ -1033,21 +1080,58 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       });
     });
 
+    /** Shells of these threads, archived ones included, from one read per chunk of ids. */
+    const readThreadShells = Effect.fn("ws.orchestrationV2.readThreadShells")(function* (
+      threadIds: ReadonlyArray<ThreadId>,
+    ) {
+      const shells = new Map<ThreadId, OrchestrationV2ThreadShell>();
+      for (let start = 0; start < threadIds.length; start += SHELL_STREAM_BATCH_READ_CHUNK) {
+        const snapshot = yield* threadManagement.getShellSnapshot({
+          threadIds: threadIds.slice(start, start + SHELL_STREAM_BATCH_READ_CHUNK),
+        });
+        for (const shell of snapshot.threads) shells.set(shell.id, shell);
+        for (const shell of snapshot.archivedThreads) shells.set(shell.id, shell);
+      }
+      return shells;
+    });
+
     const projectShellItems = Effect.fn("ws.orchestrationV2.projectShellItems")(function* (
       events: ReadonlyArray<ShellApplicationEvent>,
     ) {
-      return yield* Effect.forEach(
-        coalesceShellApplicationEvents(events),
+      const coalesced = coalesceShellApplicationEvents(events);
+      // ardud: one read for the batch's changed threads instead of a reader transaction
+      // per thread. A resume replays hundreds of threads; on a busy server each
+      // transaction queued for a reader slot (a 125-thread catch-up took 16.7 s and a
+      // 450-event foreground resume 12-28 s under a loaded reader pool, 10 Nov 2026).
+      // ardud: every shell subscriber projects the same events; share one read per
+      // (thread, sequence) across them (sharedThreadShellReads.ts).
+      const shells = yield* readThreadShellsShared({
+        owner: threadManagement,
+        wanted: coalesced.flatMap((stored) =>
+          "aggregateKind" in stored
+            ? []
+            : [{ threadId: stored.event.threadId, sequence: stored.sequence }],
+        ),
+        readMany: readThreadShells,
+        readOne: threadManagement.getThreadShell,
+        batch: (yield* Switches).shellBatchedStreamReads,
+        batchMinThreads: SHELL_STREAM_BATCH_READ_MIN_THREADS,
+      });
+      const items = yield* Effect.forEach(
+        coalesced,
         (stored) =>
           Effect.gen(function* () {
             if ("aggregateKind" in stored) {
               return yield* projectItem(stored);
             }
-            const shell = yield* threadManagement.getThreadShell(stored.event.threadId);
+            const shell = shells.get(stored.event.threadId) ?? null;
             return shellStreamItemFromThreadShell({ stored, shell });
           }),
         { concurrency: 8 },
       );
+      return input.omitIdleSubagents === true
+        ? yield* withSubagentRequestAncestors(items, threadManagement.getThreadShell)
+        : items;
     });
 
     const toShellStream = <E, R>(stream: Stream.Stream<ShellApplicationEvent, E, R>) =>
@@ -1108,16 +1192,6 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       input.requestCompletionMarker === true
         ? Stream.make({ kind: "synchronized" as const })
         : Stream.empty;
-    const initialSnapshotItems = (loaded: {
-      readonly snapshot: OrchestrationV2ShellSnapshot;
-      readonly resolvedRepositoryIdentityRoots: ReadonlyArray<string>;
-    }) =>
-      rpcInitialItems(
-        shellStreamItemsFromInitialSnapshot({
-          snapshot: loaded.snapshot,
-          resolvedRepositoryIdentityRoots: loaded.resolvedRepositoryIdentityRoots,
-        }),
-      );
     const initialEnrichmentItems = (loaded: {
       readonly snapshot: OrchestrationV2ShellSnapshot;
       readonly resolvedRepositoryIdentityRoots: ReadonlyArray<string>;
@@ -1133,38 +1207,104 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     // refresh cannot interleave before the authoritative initial frame.
     const completionThenLive = (afterSequence: number) =>
       Stream.concat(completionMarker, liveFrom(afterSequence));
+    const snapshotThenLive = Effect.fn("ws.orchestrationV2.pagedShellSnapshot")(function* () {
+      const loaded = yield* ReplyBuilders.interactive(loadSnapshot());
+      // Subsequent pages are built only when the consumer asks for them.
+      const remaining = Stream.unfold(loaded.snapshot.page?.nextAfter ?? null, (after) =>
+        after === null
+          ? Effect.succeed(undefined)
+          : ReplyBuilders.interactive(loadSnapshot(after)).pipe(
+              Effect.map(
+                (next) =>
+                  [
+                    shellStreamItemsFromInitialSnapshot(next),
+                    next.snapshot.page?.nextAfter ?? null,
+                  ] as const,
+              ),
+            ),
+      );
+      return composeShellStreamWithEnrichment({
+        initial: Stream.concat(
+          rpcInitialItems(shellStreamItemsFromInitialSnapshot(loaded)),
+          remaining.pipe(Stream.flatMap(Stream.fromIterable)),
+        ),
+        tail: completionThenLive(loaded.snapshot.snapshotSequence),
+        enrichment: enrichmentRefreshes,
+      });
+    });
 
     const stream = yield* Effect.gen(function* () {
       if (input.afterSequence === undefined) {
-        const loaded = yield* loadSnapshot();
-        return composeShellStreamWithEnrichment({
-          initial: initialSnapshotItems(loaded),
-          tail: completionThenLive(loaded.snapshot.snapshotSequence),
-          enrichment: enrichmentRefreshes,
-        });
+        return yield* snapshotThenLive();
       }
 
       const highWater = yield* applicationEvents.latestApplicationSequence;
-      if (!(yield* canReplayPersistedRange(input.afterSequence, highWater, SHELL_RESUME_MAX_GAP))) {
-        const loaded = yield* loadSnapshot();
-        return composeShellStreamWithEnrichment({
-          initial: initialSnapshotItems(loaded),
-          tail: completionThenLive(loaded.snapshot.snapshotSequence),
-          enrichment: enrichmentRefreshes,
+      // Opted-in clients also get the cursor event again: ancestor rows sent right after an
+      // asking subagent's update share its sequence, so a drop between the two would otherwise
+      // never resend them. The client takes only rows it lacks at that sequence. The budget
+      // covers exactly what is replayed; a cursor past the head still means a fresh snapshot.
+      const replayAfter =
+        input.omitIdleSubagents === true && input.afterSequence > 0
+          ? input.afterSequence - 1
+          : input.afterSequence;
+      if (input.afterSequence > highWater) {
+        return yield* snapshotThenLive();
+      }
+      const cursorRepeat = input.afterSequence - replayAfter;
+      const limits = yield* ShellResumeLimits;
+      // ardud: a busy server passes the replay gap in under a minute (about 18 event
+      // batches a second on 10 Nov 2026), so a client that had just spent minutes
+      // loading every shell page was sent every page again. The shell stream refetches
+      // each changed aggregate anyway; it only needs to know which ones changed.
+      // At the legacy limit the switch is off: every range replay refuses gets a snapshot.
+      const changesAllowed =
+        limits.changesMaxGap > limits.replayMaxGap &&
+        highWater - replayAfter <= limits.changesMaxGap + cursorRepeat;
+      const readChanges = applicationEvents.getShellChanges({
+        afterSequence: replayAfter,
+        throughSequence: highWater,
+        maxThreads: limits.maxThreads,
+      });
+      // The list of changed threads is one indexed read. A range replay is a stats read
+      // plus the event bodies in pages, and each page became its own batch of thread
+      // reads: under a loaded reader pool a resume 450 events behind took 5-10 s that
+      // way (10 Nov 2026). So the list comes first for every gap it covers; the replay
+      // stays for an incomplete list and for ROBOB_SHELL_RESUME_CHANGES_FIRST=0.
+      let changes =
+        changesAllowed && (yield* Switches).shellResumeChangesFirst
+          ? yield* readChanges
+          : undefined;
+      let replayEvents: Stream.Stream<ShellApplicationEvent, OrchestrationEventStoreError>;
+      if (
+        changes?.complete !== true &&
+        (yield* canReplayPersistedRange(replayAfter, highWater, limits.replayMaxGap + cursorRepeat))
+      ) {
+        replayEvents = applicationEvents
+          .readApplicationEvents({
+            afterSequence: replayAfter,
+            throughSequence: highWater,
+            // A row a newer build wrote (e.g. after a downgrade) must not fail
+            // every shell resubscribe. The live tail below resumes from
+            // highWater, so a dropped row never hides later events.
+            skipUnknownEventTypes: true,
+          })
+          .pipe(Stream.map(toShellApplicationEvent));
+      } else {
+        if (changes === undefined && changesAllowed) changes = yield* readChanges;
+        if (changes === undefined || !changes.complete) {
+          return yield* snapshotThenLive();
+        }
+        yield* Effect.annotateCurrentSpan({
+          "shell.resume": "changes",
+          "shell.resume.gap": highWater - replayAfter,
+          "shell.resume.threads": changes.threads.length,
+          "shell.resume.projects": changes.projects.length,
         });
+        replayEvents = Stream.fromIterable(shellChangeEvents(changes));
       }
 
       const loaded = yield* loadProjectMetadataSnapshot(highWater);
-      const replay = toShellStream(
-        applicationEvents.readApplicationEvents({
-          afterSequence: input.afterSequence,
-          throughSequence: highWater,
-          // A row a newer build wrote (e.g. after a downgrade) must not fail
-          // every shell resubscribe. The live tail below resumes from
-          // highWater, so a dropped row never hides later events.
-          skipUnknownEventTypes: true,
-        }),
-      );
+      const replay = toShellStream(replayEvents);
       return composeShellStreamWithEnrichment({
         initial: initialEnrichmentItems(loaded),
         tail: Stream.concat(Stream.concat(replay, completionMarker), liveFrom(highWater)),
@@ -1194,13 +1334,14 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
 );
 
 // ardud: missions board
-const layerWsKanbanRpc = ServerWsKanbanRpcGroup.toLayer(
-  Effect.gen(function* () {
-    const service = yield* KanbanService;
-    const scripts = yield* KanbanScripts;
-    return ServerWsKanbanRpcGroup.of(makeKanbanWsHandlers(service, scripts));
-  }),
-);
+const layerWsKanbanRpc = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
+  ServerWsKanbanRpcGroup.toLayer(
+    Effect.gen(function* () {
+      const service = yield* KanbanService;
+      const scripts = yield* KanbanScripts;
+      return ServerWsKanbanRpcGroup.of(makeKanbanWsHandlers(service, scripts, currentSession));
+    }),
+  );
 
 // ardud: board-run threads are read-only to the owner; the board drives them through
 // KanbanThreads.send, which bypasses this owner RPC entry, so steering keeps working.
@@ -1732,6 +1873,19 @@ export const layerWsRpc = (
       const loadServerConfig = Effect.fn("ws.loadServerConfig")(function* (options: {
         readonly usageLimitsCommand: boolean;
       }) {
+        // ardud: the three host discoveries each have a 5 s budget and used to run one
+        // after another, inside the client's 15 s connection-setup budget. Start them
+        // together, before the other reads.
+        const discovery = yield* Effect.all(
+          {
+            availableEditors: resolveAvailableEditorsForConfig(
+              externalLauncher.resolveAvailableEditors(),
+            ),
+            remoteOpenTargets: resolveAvailableEditorsForConfig(remoteOpenTargets.resolveTargets()),
+            directEndpoints: resolveAvailableEditorsForConfig(directEndpoints.resolve()),
+          },
+          { concurrency: "unbounded" },
+        ).pipe(Effect.forkChild);
         const keybindingsConfig = yield* keybindings.loadConfigState;
         const currentProviders = yield* providerRegistry.getProviders;
         const providers = options.usageLimitsCommand
@@ -1743,8 +1897,9 @@ export const layerWsRpc = (
         const environment = yield* serverEnvironment.getDescriptor;
         const auth = yield* serverAuth.getDescriptor();
         const scratchWorkspaceRoot = yield* managedFolders.scratchRoot;
+        const discovered = yield* Fiber.join(discovery);
         const editorConfig = yield* resolveEditorConfig(
-          yield* resolveAvailableEditorsForConfig(externalLauncher.resolveAvailableEditors()),
+          discovered.availableEditors,
           resolveFileManagerRevealKindForConfig(externalLauncher.resolveFileManagerRevealKind()),
         );
 
@@ -1757,10 +1912,8 @@ export const layerWsRpc = (
           issues: keybindingsConfig.issues,
           providers,
           ...editorConfig,
-          remoteOpenTargets: yield* resolveAvailableEditorsForConfig(
-            remoteOpenTargets.resolveTargets(),
-          ),
-          directEndpoints: yield* resolveAvailableEditorsForConfig(directEndpoints.resolve()),
+          remoteOpenTargets: discovered.remoteOpenTargets,
+          directEndpoints: discovered.directEndpoints,
           observability: {
             logsDirectoryPath: config.logsDir,
             localTracingEnabled: true,
@@ -1775,6 +1928,10 @@ export const layerWsRpc = (
           },
           settings,
           shellResumeCompletionMarker: true,
+          shellSnapshotPagination: true,
+          ...((yield* Switches).shellResumeAcrossSessions
+            ? { shellResumeAcrossSessions: true }
+            : {}),
           threadResumeCompletionMarker: true,
           threadSnapshotPagination: true,
           threadFind: true,
@@ -1806,6 +1963,7 @@ export const layerWsRpc = (
           threads: threads.archivedThreads,
         } as const;
       }).pipe(
+        ReplyBuilders.interactive,
         Effect.flatMap((snapshot) =>
           enrichProjectShells(snapshot.projects).pipe(
             Effect.map(({ projects }) => ({ ...snapshot, projects })),
@@ -1867,55 +2025,55 @@ export const layerWsRpc = (
         [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command) =>
           refuseBoardRunDispatch(kanban, command).pipe(
             Effect.andThen(
-          Effect.annotateCurrentSpan({
-            "orchestration_v2.command_id": command.commandId,
-            "orchestration_v2.command_type": command.type,
-            "orchestration_v2.thread_id":
-              command.type === "thread.fork" || command.type === "thread.merge_back"
-                ? command.targetThreadId
-                : command.type === "delegated_task.request" ||
-                    command.type === "delegated_task.wake-policy" ||
-                    command.type === "delegated_task.completion-delivery.acknowledge" ||
-                    command.type === "delegated_task.completion-delivery.dispose" ||
-                    command.type === "thread.created.record"
-                  ? command.parentThreadId
-                  : command.threadId,
-            ...(command.type === "thread.fork" || command.type === "thread.merge_back"
-              ? { "orchestration_v2.source_thread_id": command.sourceThreadId }
-              : {}),
-          }).pipe(
-            Effect.andThen(
-              startup
-                .enqueueCommand(
-                  // A retry also restarts the preparation work the launch owns.
-                  (command.type === "prepared-run.retry"
-                    ? threadLaunch.retryPreparation(command)
-                    : ThreadMessageIntake.dispatchCommand(
-                        ThreadManagementService.withCreationProvenance(command, {
-                          // ardud: owner provenance
-                          createdBy: sessionCreatedBy,
-                          creationSource:
-                            "creationSource" in command ? command.creationSource : "web",
-                        }),
-                      )
-                  ).pipe(Effect.provide(intakeContext)),
-                )
-                .pipe(
-                  Effect.tap(() => recordClientCommandAnalytics(command)),
-                  Effect.map((result) => ({ sequence: result.sequence })),
-                  Effect.mapError((cause) => {
-                    const detail = userFacingDispatchErrorMessage(cause);
-                    return new OrchestrationV2DispatchCommandError({
-                      commandId: command.commandId,
-                      commandType: command.type,
-                      message: detail ?? "Failed to dispatch orchestration V2 command",
-                      ...(detail === undefined ? {} : { detail }),
-                      cause,
-                    });
-                  }),
+              Effect.annotateCurrentSpan({
+                "orchestration_v2.command_id": command.commandId,
+                "orchestration_v2.command_type": command.type,
+                "orchestration_v2.thread_id":
+                  command.type === "thread.fork" || command.type === "thread.merge_back"
+                    ? command.targetThreadId
+                    : command.type === "delegated_task.request" ||
+                        command.type === "delegated_task.wake-policy" ||
+                        command.type === "delegated_task.completion-delivery.acknowledge" ||
+                        command.type === "delegated_task.completion-delivery.dispose" ||
+                        command.type === "thread.created.record"
+                      ? command.parentThreadId
+                      : command.threadId,
+                ...(command.type === "thread.fork" || command.type === "thread.merge_back"
+                  ? { "orchestration_v2.source_thread_id": command.sourceThreadId }
+                  : {}),
+              }).pipe(
+                Effect.andThen(
+                  startup
+                    .enqueueCommand(
+                      // A retry also restarts the preparation work the launch owns.
+                      (command.type === "prepared-run.retry"
+                        ? threadLaunch.retryPreparation(command)
+                        : ThreadMessageIntake.dispatchCommand(
+                            ThreadManagementService.withCreationProvenance(command, {
+                              // ardud: owner provenance
+                              createdBy: sessionCreatedBy,
+                              creationSource:
+                                "creationSource" in command ? command.creationSource : "web",
+                            }),
+                          )
+                      ).pipe(Effect.provide(intakeContext)),
+                    )
+                    .pipe(
+                      Effect.tap(() => recordClientCommandAnalytics(command)),
+                      Effect.map((result) => ({ sequence: result.sequence })),
+                      Effect.mapError((cause) => {
+                        const detail = userFacingDispatchErrorMessage(cause);
+                        return new OrchestrationV2DispatchCommandError({
+                          commandId: command.commandId,
+                          commandType: command.type,
+                          message: detail ?? "Failed to dispatch orchestration V2 command",
+                          ...(detail === undefined ? {} : { detail }),
+                          cause,
+                        });
+                      }),
+                    ),
                 ),
-            ),
-          ),
+              ),
             ),
           ),
         [ORCHESTRATION_V2_WS_METHODS.stopWorkflow]: (input) => threadManagement.stopWorkflow(input),
@@ -2136,6 +2294,16 @@ export const layerWsRpc = (
           Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
             // ardud: only the paired owner answers a secret card.
             Effect.andThen(secretRequests.answer(input, ownerApp)),
+          ),
+        // ardud: an ask's secret fields, under the same owner proof.
+        [WS_METHODS.secretsAnswerAsk]: (input) =>
+          Effect.annotateCurrentSpan({
+            "kanban.card_id": input.cardId,
+            "kanban.ask_id": input.askId,
+          }).pipe(
+            Effect.andThen(
+              answerAskSecrets(kanban, secretRequests)(input, ownerApp, currentSession),
+            ),
           ),
         [WS_METHODS.scheduledTasksListWebhookDeliveries]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
@@ -3222,12 +3390,20 @@ export const layer = Layer.unwrap(
         );
         const clientOrigin = readClientConnectionOrigin(request);
         const clientAnalyticsProps = readClientAnalyticsProps(request);
-        yield* sessions.recordClientConnection(session.sessionId, clientOrigin);
+        // ardud: this metadata UPDATE waits for the state writer, which was held for
+        // up to 267 s on 11 Nov. Awaiting it here held the upgrade, so phone and web
+        // clients timed out and reconnected in a loop. Record it off the upgrade path.
+        yield* Effect.forkDetach(sessions.recordClientConnection(session.sessionId, clientOrigin));
         yield* analytics.record("client.connected", clientAnalyticsProps);
         const rpcWebSocketHttpEffect = yield* Effect.gen(function* () {
           const { protocol, httpEffect } = yield* RpcServer.makeProtocolWithHttpEffectWebsocket;
           yield* RpcServer.make(ServerWsRpcGroup, WS_RPC_SERVER_OPTIONS).pipe(
-            Effect.provideService(RpcServer.Protocol, withTerminalOutputWindow(protocol)),
+            Effect.provideService(
+              RpcServer.Protocol,
+              withTerminalOutputWindow(
+                withReplyBudget(protocol, largeReplyLog, new Set(ServerWsRpcGroup.requests.keys())),
+              ),
+            ),
             Effect.provide(
               Layer.merge(
                 RpcAuthorization.layer(session.scopes, (method, payload) => {
@@ -3263,7 +3439,7 @@ export const layer = Layer.unwrap(
                 serverBrowser,
               ),
               // ardud: missions board
-              layerWsKanbanRpc,
+              layerWsKanbanRpc(session),
             ).pipe(
               Layer.provideMerge(
                 Layer.succeed(
@@ -3309,7 +3485,10 @@ export const layer = Layer.unwrap(
           ),
         );
         return yield* Effect.acquireUseRelease(
-          sessions.markConnected(session.sessionId),
+          // ardud: markConnected writes lastConnectedAt on the state writer when the
+          // session was idle. Run it beside the upgrade; the release waits for it so
+          // the connected count still goes up before it goes down.
+          Effect.forkDetach(sessions.markConnected(session.sessionId)),
           () =>
             Effect.raceFirst(
               rpcWebSocketHttpEffect,
@@ -3321,7 +3500,10 @@ export const layer = Layer.unwrap(
                 }),
               ),
             ),
-          () => sessions.markDisconnected(session.sessionId),
+          (connected) =>
+            Fiber.await(connected).pipe(
+              Effect.andThen(sessions.markDisconnected(session.sessionId)),
+            ),
         );
       }).pipe(
         Effect.catchTags({

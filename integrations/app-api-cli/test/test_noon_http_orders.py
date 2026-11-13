@@ -134,7 +134,7 @@ class NoonHttpTest(unittest.TestCase):
         self.assertEqual({s['shipment_id']: s['status'] for s in result['shipments']},
                          {sid: 'out for delivery', SHIPMENT_ID: 'delivered'})
         self.assertEqual(len(result['items']), 2)
-        self.assertEqual(result['status'], 'unknown')
+        self.assertEqual(result['status'], 'out for delivery')
         self.assertFalse(result['whole_order_complete'])
 
     def test_minutes_eta_timeout_preserves_completed_primary(self):

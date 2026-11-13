@@ -1,14 +1,14 @@
 import { ThreadId, TurnItemId } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
-import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Tracer from "effect/Tracer";
 
-import { runMigrations } from "../persistence/Migrations.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as McpAppModelContext from "./McpAppModelContext.ts";
 
-const database = NodeSqliteClient.layer({ filename: ":memory:" });
+const database = SqlitePersistence.layerMemory;
 const layer = it.layer(
   Layer.merge(database, McpAppModelContext.layer.pipe(Layer.provide(database))),
 );
@@ -34,7 +34,6 @@ const insertAppItem = (itemId: string, runId: string, runStatus: string) =>
 layer("McpAppModelContext", (it) => {
   it.effect("sends only apps still in the thread's history, including a fork's", () =>
     Effect.gen(function* () {
-      yield* runMigrations();
       const store = yield* McpAppModelContext.McpAppModelContext;
       yield* insertAppItem("item-kept", "run-a", "completed");
       yield* insertAppItem("item-rolled-back", "run-bb", "rolled_back");
@@ -60,6 +59,42 @@ layer("McpAppModelContext", (it) => {
 
       yield* set(threadId, "item-kept", "");
       assert.deepEqual(yield* texts(threadId), []);
+    }),
+  );
+
+  it.effect("looks up app items by id in every history store instead of scanning them", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* McpAppModelContext.McpAppModelContext;
+      const statements: Array<string> = [];
+      const tracer = Tracer.make({
+        span(options) {
+          const span = new Tracer.NativeSpan(options);
+          const end = span.end.bind(span);
+          span.end = (endTime, exit) => {
+            end(endTime, exit);
+            const query = span.attributes.get("db.query.text");
+            if (typeof query === "string") statements.push(query);
+          };
+          return span;
+        },
+      });
+      yield* store.forThread(threadId).pipe(Effect.withTracer(tracer));
+      const statement = statements.find((text) => text.includes("ardud_history_turn_items"));
+      assert.isDefined(statement);
+      const plan = (yield* sql.unsafe<{ readonly detail: string }>(
+        `EXPLAIN QUERY PLAN ${statement}`,
+      ))
+        .map((row) => row.detail)
+        .join("\n");
+      // Each store is searched by turn_item_id; a co-routine or scan of the
+      // history view walks the whole base archive.
+      assert.notMatch(
+        plan,
+        /CO-ROUTINE ardud_history_turn_items|SCAN (?:main\.)?orchestration_v2_projection_turn_items|SCAN cold|SCAN base/,
+      );
+      assert.match(plan, /SEARCH cold USING .*\(turn_item_id=\?\)/);
+      assert.match(plan, /SEARCH base USING .*\(turn_item_id=\?\)/);
     }),
   );
 });

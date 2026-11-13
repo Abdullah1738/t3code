@@ -10,8 +10,11 @@ from common import item_matches, money
 def run(app, section, terms, limit=10, open_only=False, timeout=30):
     if len(terms) < 2 or any(not t.strip() for t in terms):
         raise ValueError('USAGE: provide at least two nonempty item terms')
-    valid = {'noon': ['main', 'minutes', 'nownow'], 'talabat': ['mart', 'groceries', 'pharmacies', 'flowers'],
-             'careem': ['quik', 'shops', 'electronics']}
+    if app == 'talabat':
+        # Retired by the owner 2026-11-07; see talabat_retired.py.
+        import talabat_retired
+        raise ValueError(f'{talabat_retired.CODE}: {talabat_retired.MESSAGE}')
+    valid = {'noon': ['main', 'minutes', 'nownow'], 'careem': ['quik', 'shops', 'electronics']}
     if section not in valid.get(app, []) or not 1 <= limit <= 100:
         raise ValueError('USAGE: unsupported app/section')
     if open_only and section in ('main', 'minutes', 'quik'):

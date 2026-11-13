@@ -6,11 +6,12 @@ import type {
   TurnItemId,
 } from "@t3tools/contracts";
 // ardud: control turns
+import { projectThreadProjectionForWire } from "./WireProjection.ts";
+import { jsonExceedsBudget, MAX_REPLY_BYTES } from "../ardud/http/replyBudget.ts";
 import { countsAsUserTurn } from "../ardud/control/turns.ts";
 
 /**
- * Item/byte budgets only apply to histories without turn starts; tool activity
- * must not split an ordinary conversation turn.
+ * Turn boundaries are preferred, but item and byte budgets always bound a page.
  */
 export const THREAD_HISTORY_PAGE_POLICY = {
   maxUserTurns: 10,
@@ -124,6 +125,48 @@ export function projectedRowBoundedSnapshotEncodedBytes(
   return rowBytes;
 }
 
+export function boundHistoryRowForTransport(
+  row: OrchestrationV2ProjectedTurnItem,
+): OrchestrationV2ProjectedTurnItem {
+  if (!jsonExceedsBudget(row, THREAD_HISTORY_PAGE_POLICY.maxEncodedBytes / 2)) return row;
+  const trim = (value: unknown): unknown => {
+    if (typeof value === "string" && value.length > 16_384)
+      return `${value.slice(0, 16_384)}\n… truncated for transport`;
+    if (Array.isArray(value)) return value.map(trim);
+    if (
+      value !== null &&
+      typeof value === "object" &&
+      Object.getPrototypeOf(value) === Object.prototype
+    ) {
+      return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, trim(item)]));
+    }
+    return value;
+  };
+  const compact = { ...row, item: trim(row.item) as OrchestrationV2TurnItem };
+  if (!jsonExceedsBudget(compact, THREAD_HISTORY_PAGE_POLICY.maxEncodedBytes / 2)) return compact;
+  const item: OrchestrationV2TurnItem = {
+    id: row.item.id,
+    threadId: row.item.threadId,
+    runId: row.item.runId,
+    nodeId: row.item.nodeId,
+    providerThreadId: row.item.providerThreadId ?? null,
+    providerTurnId: row.item.providerTurnId ?? null,
+    nativeItemRef: row.item.nativeItemRef ?? null,
+    parentItemId: row.item.parentItemId ?? null,
+    ordinal: row.item.ordinal,
+    status: row.item.status,
+    title: row.item.title,
+    startedAt: row.item.startedAt,
+    completedAt: row.item.completedAt,
+    updatedAt: row.item.updatedAt,
+    type: "notification",
+    source: { kind: "monitor" },
+    outcome: "completed",
+    summary: "This history item is too large to display in this page. Open its detail to read it.",
+  };
+  return { ...row, item };
+}
+
 function renumberPositions<Row extends HistoryRow>(items: ReadonlyArray<Row>): Row[] {
   return items.map((row, position) => (row.position === position ? row : { ...row, position }));
 }
@@ -215,7 +258,7 @@ export function isThreadHistoryUserTurn(item: HistoryRow["item"]): boolean {
 }
 
 /**
- * Histories without turn starts use row budgets and always admit at least one
+ * All histories use row budgets and always admit at least one
  * row so oversized items cannot deadlock paging.
  */
 function selectOlderTimelinePage<Row extends HistoryRow>(input: {
@@ -243,12 +286,13 @@ function selectOlderTimelinePage<Row extends HistoryRow>(input: {
     : undefined;
   for (let index = end - 1; index >= 0; index -= 1) {
     const row = input.items[index]!;
-    const rowBytes = turnLimit === undefined ? rowCost(row) : 0;
+    const rowBytes = rowCost(row);
     if (
       selected.length > 0 &&
-      (turnLimit === undefined
-        ? selected.length >= policy.maxItems || encodedBytes + rowBytes > policy.maxEncodedBytes
-        : userTurns >= turnLimit || rawTurns >= THREAD_HISTORY_MAX_RAW_TURNS)
+      (selected.length >= policy.maxItems ||
+        encodedBytes + rowBytes > policy.maxEncodedBytes ||
+        (turnLimit !== undefined &&
+          (userTurns >= turnLimit || rawTurns >= THREAD_HISTORY_MAX_RAW_TURNS)))
     ) {
       break;
     }
@@ -480,11 +524,14 @@ export function boundedTimelineEncodedBytes(input: {
   return total;
 }
 
-export function buildBoundedThreadProjection(input: {
-  readonly projection: OrchestrationV2ThreadProjection;
-  readonly snapshotSequence: number;
-  readonly policy?: ThreadHistoryPagePolicy | undefined;
-}): BoundedProjectionResult {
+export function buildBoundedThreadProjection(
+  input: {
+    readonly projection: OrchestrationV2ThreadProjection;
+    readonly snapshotSequence: number;
+    readonly policy?: ThreadHistoryPagePolicy | undefined;
+  },
+  allowEmergency = true,
+): BoundedProjectionResult {
   const policy = input.policy ?? THREAD_HISTORY_PAGE_POLICY;
   const threadId = input.projection.thread.id;
   const controlProjection = {
@@ -582,6 +629,107 @@ export function buildBoundedThreadProjection(input: {
     turnItems,
     visibleTurnItems,
   };
+  // A single row or retained control state can exceed the policy even after paging.
+  // Compact transport detail and control arrays, then rebuild without turn anchors.
+  // The emergency path favors recent state so even oversized control metadata can sync.
+  if (allowEmergency && jsonExceedsBudget(projection, MAX_REPLY_BYTES / 2)) {
+    const compact = projectThreadProjectionForWire(projection);
+    const trim = (value: unknown): unknown => {
+      if (typeof value === "string" && value.length > 16_384) {
+        return `${value.slice(0, 16_384)}\n… truncated for transport`;
+      }
+      if (Array.isArray(value)) {
+        const retained: unknown[] = [];
+        let bytes = 0;
+        for (let index = value.length - 1; index >= 0; index -= 1) {
+          const item = trim(value[index]);
+          const cost = bytesOfJson(item);
+          if (retained.length > 0 && bytes + cost > 32_768) break;
+          retained.push(item);
+          bytes += cost;
+        }
+        return retained.toReversed();
+      }
+      if (
+        value !== null &&
+        typeof value === "object" &&
+        Object.getPrototypeOf(value) === Object.prototype
+      ) {
+        return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, trim(item)]));
+      }
+      return value;
+    };
+    let fallback = buildBoundedThreadProjection(
+      {
+        ...input,
+        projection: {
+          ...(trim(compact) as OrchestrationV2ThreadProjection),
+          turnItems: compact.turnItems.map((item) => trim(item) as OrchestrationV2TurnItem),
+          visibleTurnItems: compact.visibleTurnItems.map((row) => ({
+            ...row,
+            item: trim(row.item) as OrchestrationV2TurnItem,
+          })),
+        },
+        policy: { ...policy, maxUserTurns: undefined, maxItems: 1 },
+      },
+      false,
+    );
+    // Dictionaries can outgrow the budget without containing any large string.
+    // If control state still cannot travel, keep the newest timeline row and
+    // omit the control collections rather than making the thread impossible to sync.
+    if (jsonExceedsBudget(fallback.projection, MAX_REPLY_BYTES / 2)) {
+      fallback = {
+        ...fallback,
+        projection: Object.fromEntries(
+          Object.entries(fallback.projection).map(([key, value]) => [
+            key,
+            Array.isArray(value) && key !== "turnItems" && key !== "visibleTurnItems" ? [] : value,
+          ]),
+        ) as OrchestrationV2ThreadProjection,
+        payloadBudgetExceeded: true,
+      };
+    }
+    if (jsonExceedsBudget(fallback.projection, MAX_REPLY_BYTES / 2)) {
+      const newest = fallback.projection.visibleTurnItems.at(-1);
+      if (newest !== undefined) {
+        const { item } = boundHistoryRowForTransport(newest);
+        fallback = {
+          ...fallback,
+          projection: {
+            ...fallback.projection,
+            turnItems: isLocalProjectedRow(fallback.projection, newest) ? [item] : [],
+            visibleTurnItems: [{ ...newest, item }],
+          },
+          payloadBudgetExceeded: true,
+        };
+      }
+    }
+    const oldest = fallback.projection.visibleTurnItems[0];
+    const original =
+      oldest === undefined
+        ? undefined
+        : input.projection.visibleTurnItems.find(
+            (row) =>
+              row.sourceThreadId === oldest.sourceThreadId &&
+              row.sourceItemId === oldest.sourceItemId,
+          );
+    const hasMoreHistory = fallback.hasMoreHistory || window.hasMoreHistory;
+    const historyCursor =
+      hasMoreHistory && original !== undefined
+        ? encodeThreadHistoryCursor({
+            snapshotSequence: input.snapshotSequence,
+            sourceThreadId: original.sourceThreadId,
+            sourceItemId: original.sourceItemId,
+            position: original.position,
+          })
+        : (fallback.historyCursor ?? window.nextCursor);
+    return {
+      ...fallback,
+      historyCursor,
+      hasMoreHistory,
+      latestLocalTurnOrdinal,
+    };
+  }
   return {
     projection,
     historyCursor: window.nextCursor,

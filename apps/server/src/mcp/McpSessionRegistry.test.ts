@@ -1,7 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import * as Fs from "node:fs";
-import * as Os from "node:os";
-import * as Path from "node:path";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { expect, it } from "@effect/vitest";
@@ -9,6 +9,7 @@ import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts"
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Deferred from "effect/Deferred";
+import * as Context from "effect/Context";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Scope from "effect/Scope";
@@ -20,6 +21,7 @@ import * as NetAddress from "effect/net/NetAddress";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import * as CredentialStore from "../ardud/mcp/CredentialStore.ts";
+import * as BoardsDatabase from "../ardud/persistence/BoardsDatabase.ts";
 
 const environmentId = EnvironmentId.make("environment-1");
 const makeFakeHttpServer = (hostname: string, port = 43123) =>
@@ -80,6 +82,65 @@ const makeRegistry = (now: () => number, httpServer = fakeHttpServer) => {
       Effect.provide(NodeServices.layer),
     );
 };
+
+it.effect(
+  "constructs before the boards copy finishes and loads credentials once before serving",
+  () =>
+    Effect.gen(function* () {
+      const ready = yield* Deferred.make<void>();
+      const issued = yield* Deferred.make<void>();
+      let loads = 0;
+      const context = yield* Layer.build(NodeSqliteClient.layer({ filename: ":memory:" }));
+      yield* Effect.gen(function* () {
+        const registry = yield* McpSessionRegistry.__testing.make({ now: () => 1_000 });
+        expect(loads).toBe(0);
+        const issuing = yield* registry
+          .issue({
+            threadId: ThreadId.make("post-migration"),
+            providerInstanceId: ProviderInstanceId.make("codex"),
+          })
+          .pipe(Effect.andThen(Deferred.succeed(issued, undefined)), Effect.forkScoped);
+        yield* Effect.yieldNow;
+        expect(yield* Deferred.isDone(issued)).toBe(false);
+        yield* Deferred.succeed(ready, undefined);
+        yield* Fiber.join(issuing);
+        yield* registry.resolve("unknown");
+        expect(loads).toBe(1);
+      }).pipe(
+        Effect.provideService(
+          BoardsDatabase.BoardsDatabase,
+          BoardsDatabase.BoardsDatabase.of({
+            sql: Context.get(context, SqlClient.SqlClient),
+            ready: Deferred.await(ready),
+            path: ":memory:",
+          }),
+        ),
+        Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+        Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+        Effect.provide(NodeServices.layer),
+        Effect.provideService(
+          CredentialStore.CredentialStore,
+          CredentialStore.CredentialStore.of({
+            load: () =>
+              Deferred.await(ready).pipe(
+                Effect.andThen(
+                  Effect.sync(() => {
+                    loads++;
+                    return [];
+                  }),
+                ),
+              ),
+            insert: () => Effect.void,
+            updateLiveness: () => Effect.void,
+            touchThread: () => Effect.void,
+            revokeThread: () => Effect.void,
+            revokeProviderSession: () => Effect.void,
+            revokeAll: () => Effect.void,
+          }),
+        ),
+      );
+    }),
+);
 
 it.effect("stores only a token hash, resolves the bearer token, and revokes by thread", () =>
   Effect.gen(function* () {
@@ -293,8 +354,8 @@ it.effect.each(["provider-session", "thread", "all"] as const)(
 it.effect(
   "restores the same scope across separate registry and database lifetimes, preserving expiry and revocation",
   () => {
-    const dir = Fs.mkdtempSync(Path.join(Os.tmpdir(), "mcp-registry-restart-"));
-    const dbPath = Path.join(dir, "state.sqlite");
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "mcp-registry-restart-"));
+    const dbPath = NodePath.join(dir, "state.sqlite");
     let now = 1_000;
     const run = <A, E>(
       body: (registry: McpSessionRegistry.McpSessionRegistryShape) => Effect.Effect<A, E>,
@@ -359,7 +420,9 @@ it.effect(
       yield* run((registry) => registry.revokeThread(issued.config.threadId));
       yield* run((registry) => registry.touch(issued.config.threadId));
       expect(yield* run((registry) => registry.resolve(token))).toBeUndefined();
-    }).pipe(Effect.ensuring(Effect.sync(() => Fs.rmSync(dir, { recursive: true, force: true }))));
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(dir, { recursive: true, force: true }))),
+    );
   },
 );
 

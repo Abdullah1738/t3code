@@ -57,7 +57,7 @@ RETIRE_AFTER_S = 30 * 60
 RECEIPT_ACCOUNTS = ('gmail',)
 RECEIPT_POLL_S = 45
 RECEIPT_SUBJECT = re.compile(r'\bservice charges receipt\b', re.I)
-RANK = {'unknown': -1, 'pending confirmation': 0, 'placed': 0, 'preparing': 1, 'picked up': 2,
+RANK = {'unknown': -1, 'pending confirmation': 0, 'placed': 0, 'preparing': 1, 'packed':1, 'picked up': 2,
         'out for delivery': 3, 'nearby': 4, 'delivered': 5, 'cancelled': 5}
 TRACKING_PROBLEM_REPEAT_S = 86400
 # Bridge chat slug rule; group slugs carry "_" (group-sb_gro). Env is read at call time.
@@ -632,7 +632,14 @@ def fetch(cfg, state, now):
     if cfg['app'] != 'amazon':
         from native_orders import track, OrderError
         try:
+            merchandise=None
             native = track(cfg['app'], cfg['order'], timeout=8)
+            if cfg['app']=='noon':
+                from noon_order_details import details
+                try:
+                    merchandise=details(cfg['order'], cfg.get('vertical') or delivery_cards.lane(cfg,{}), timeout=8)
+                except Exception:
+                    native_details['item_details_unavailable']=True
             if cfg['app'] == 'talabat' and native.get('raw_status') == 'order_confirmingdelayed':
                 from talabat_http_orders import CONFIRMATION_DELAY_S, confirmation_problem
                 first_seen = state.setdefault('talabat_confirmation_delayed_since', now)
@@ -656,17 +663,25 @@ def fetch(cfg, state, now):
             elif cfg['app'] == 'talabat':
                 state.pop('talabat_confirmation_delayed_since', None)
             native_details.update({k: native[k] for k in (
-                'shipments', 'items', 'vendor_name', 'scope', 'whole_order_complete', 'truncated',
-                'warnings', 'partial', 'read_coverage', 'eta_window', 'eta_relative_minutes', 'status_text', 'status_source',
+                'shipments', 'items', 'vendor_name', 'scope', 'whole_order_complete', 'truncated','terminal_evidence',
+                'warnings', 'partial', 'read_coverage', 'eta_window', 'eta_relative_minutes', 'eta_observed_at', 'status_text', 'status_source',
                 'status_text_source', 'raw_status', 'manifest_complete', 'manifest_source',
                 'manifest_item_count', 'observed_item_count', 'manifest_items',
                 'merchant_acceptance', 'confirmation_pending_seconds', 'confirmation_age_source',
                 'profile_verified', 'account_verified', 'order_id_verified', 'order_account_verified',
                 'order_list_present', 'order_list_verification', 'order_list_error',
                 'purchase_confirmed', 'payment_capture_verified') if k in native})
+            if merchandise:
+                native_details.update({k:merchandise[k] for k in ('vendor_name','items','total','price_breakdown','items_complete',
+                    'eta_text','eta_observed_at','status_text','declared_item_units','observed_item_units','account_verified') if k in merchandise})
+                if merchandise.get('items_complete'):
+                    native_details['manifest_items']=merchandise['items']
             if cfg['app'] == 'talabat' and native.get('problem'):
                 native_details['problem'] = native['problem']
             native_details['native_coverage'] = native['coverage']
+            parts=native.get('shipments') or []
+            native_details['status_evidence_available']=(native['status'] in RANK and native['status']!='unknown') or (
+                native.get('account_verified') is True and bool(parts) and all(p.get('status') in RANK and p['status']!='unknown' for p in parts))
             for part in native.get('shipments', []):
                 if part.get('status') not in TERMINAL or part.get('scope') not in {'item', 'shipment'}:
                     continue
@@ -680,13 +695,15 @@ def fetch(cfg, state, now):
                                  'evidence_key': 'native:' + part['scope'] + ':' + identity,
                                  'observed_at': stamp(now),
                                  'evidence': 'Authenticated native response; exact order and part ID verified.'})
-            if native['status'] in RANK and native['status'] != 'unknown':
+            if (native['status'] in RANK and native['status'] != 'unknown') or (
+                    cfg['app']=='noon' and native.get('account_verified') is True):
                 return {**native_details, 'app': cfg['app'], 'order': cfg['order'], 'status': native['status'],
                         'partial_evidence': evidence,
                         'eta': native.get('eta') or cfg.get('eta'),
                         'eta_source': (native.get('eta_source') or 'native_order_api') if native.get('eta') else
                                       ('checkout_supplied' if cfg.get('eta') else None),
-                         'eta_text': native.get('eta_text'), 'eta_text_source': native.get('eta_source'),
+                         'eta_text': merchandise.get('eta_text') if merchandise and 'eta_text' in merchandise else native.get('eta_text'),
+                         'eta_text_source': native.get('eta_source'),
                          'rider': native.get('rider'),
                         'checked_at': stamp(now), 'errors': [], 'coverage': native['coverage'],
                         'evidence': [{'stage': native['status'], 'source': 'native_order_api',
@@ -831,7 +848,7 @@ def transition(result, state, cfg, now):
         state['delay_sent'] = True
         if not arrival_only(cfg):
             events.append({'kind': 'eta_elapsed', 'message': 'Checkout ETA passed by 5 minutes; delivery is not confirmed. This is not proof the order is still undelivered.'})
-    failing = bool(result.get('errors') or (current == 'unknown' and not result.get('candidate')
+    failing = bool(result.get('errors') or (current == 'unknown' and not result.get('status_evidence_available') and not result.get('candidate')
                                              and not result.get('aftercare_evidence')))
     if result.get('eta') and result.get('eta_source') not in (None, 'checkout_supplied'):
         # Failing ticks only carry the checkout ETA; remember the app's own.

@@ -6,6 +6,7 @@ import {
 import * as Effect from "effect/Effect";
 import { Tool, Toolkit } from "effect/ai";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 
 import * as McpInvocationContext from "../../mcp/McpInvocationContext.ts";
 import * as McpToolAccess from "../../mcp/McpToolAccess.ts";
@@ -41,7 +42,7 @@ const handlers = {
     Effect.gen(function* () {
       const { threads, limits } = yield* loadCaller();
       const schedules = yield* ScheduledTaskService.ScheduledTaskService;
-      const sql = yield* SqlClient.SqlClient;
+      const sql = yield* BoardsDatabase.client;
       const { tasks } = yield* schedules.list().pipe(Effect.mapError(unavailable));
       const task = tasks.find((candidate) => candidate.id === input.scheduledTaskId);
       if (task === undefined) {

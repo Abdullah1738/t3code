@@ -8,6 +8,7 @@ import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import {
   annotateEnvironmentRequest,
@@ -33,6 +34,9 @@ import * as ProjectStore from "./ProjectStore.ts";
 import { buildActiveShellSnapshot, loadShellSnapshotParts } from "./ShellStream.ts";
 import { boundedSnapshotResponseFields } from "./ThreadStream.ts";
 import { projectThreadProjectionForWire } from "./WireProjection.ts";
+import { checkJsonReply } from "../ardud/http/jsonReply.ts";
+import { shellPageNextAfter, shellPageRead, shellPageSize } from "../ardud/perf/shellPages.ts";
+import { Switches } from "../ardud/perf/speedups.ts";
 
 const isThreadTranscriptTooLargeError = Schema.is(
   ThreadManagementService.ThreadTranscriptTooLargeError,
@@ -75,17 +79,41 @@ export const layer = HttpApiBuilder.group(
         ),
     );
 
-    const loadShellSnapshot = Effect.fn("http.orchestration.loadShellSnapshot")(function* () {
+    const loadShellSnapshot = Effect.fn("http.orchestration.loadShellSnapshot")(function* (
+      after?: string,
+      paged = false,
+      omitIdleSubagents = false,
+      recentFirst = false,
+    ) {
+      const read = paged
+        ? shellPageRead(after, recentFirst && (yield* Switches).shellRecentFirst)
+        : after === undefined
+          ? {}
+          : { afterThreadId: after };
       const base = buildActiveShellSnapshot(
         yield* loadShellSnapshotParts({
           sql,
-          readThreads: threadManagement.readShellSnapshot({ location: "active" }),
+          readThreads: threadManagement.readShellSnapshot({
+            location: "active",
+            ...(omitIdleSubagents ? { omitIdleSubagents: true } : {}),
+            ...(paged ? { limit: shellPageSize(read) + 1 } : {}),
+            ...read,
+          }),
           listProjects: projectStore.listShells(),
           latestSequence: applicationEvents.latestApplicationSequence,
         }),
       );
       const projects = yield* enrichProjectShells(base.projects);
-      return { ...base, projects };
+      if (!paged) return { ...base, projects };
+      return {
+        ...base,
+        projects,
+        threads: base.threads.slice(0, shellPageSize(read)),
+        page: {
+          after: after ?? null,
+          nextAfter: shellPageNextAfter(read, base.threads),
+        },
+      };
     });
 
     const loadThreadSnapshot = Effect.fn("http.orchestration.loadThreadSnapshot")(function* (
@@ -108,6 +136,7 @@ export const layer = HttpApiBuilder.group(
             return yield* failEnvironmentInternal(failureReason, error);
           }),
         ),
+        checkJsonReply,
       );
     });
 
@@ -154,13 +183,19 @@ export const layer = HttpApiBuilder.group(
         Effect.fn("environment.orchestration.shellSnapshot")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthOrchestrationReadScope);
-          return yield* loadShellSnapshot().pipe(
+          return yield* loadShellSnapshot(
+            args.query.after,
+            args.query.paged === "true",
+            args.query.omitIdleSubagents === "true",
+            args.query.recentFirst === "true",
+          ).pipe(
+            checkJsonReply,
             traceLocalHandlerWork,
             Effect.catch((cause) =>
               failEnvironmentInternal("orchestration_snapshot_failed", cause),
             ),
           );
-        }),
+        }, NodeSqliteClient.foregroundReads),
       )
       .handle(
         "threadSnapshot",
@@ -171,11 +206,13 @@ export const layer = HttpApiBuilder.group(
             args.params.threadId,
             "orchestration_thread_snapshot_failed",
           ).pipe(traceLocalHandlerWork);
-          return {
-            snapshotSequence: snapshot.snapshotSequence,
-            projection: snapshot.projection,
-          };
-        }),
+          return yield* checkJsonReply(
+            Effect.succeed({
+              snapshotSequence: snapshot.snapshotSequence,
+              projection: snapshot.projection,
+            }),
+          );
+        }, NodeSqliteClient.foregroundReads),
       )
       .handle(
         "threadTranscript",
@@ -199,8 +236,9 @@ export const layer = HttpApiBuilder.group(
                 );
               }),
             ),
+            checkJsonReply,
           );
-        }),
+        }, NodeSqliteClient.foregroundReads),
       )
       .handle(
         "threadBoundedSnapshot",
@@ -214,14 +252,16 @@ export const layer = HttpApiBuilder.group(
             projection: snapshot.projection,
             snapshotSequence: snapshot.snapshotSequence,
           });
-          return {
-            snapshotSequence: snapshot.snapshotSequence,
-            ...boundedSnapshotResponseFields({
-              bounded,
-              compactTurnItems: args.query.compactTurnItems === "1",
+          return yield* checkJsonReply(
+            Effect.succeed({
+              snapshotSequence: snapshot.snapshotSequence,
+              ...boundedSnapshotResponseFields({
+                bounded,
+                compactTurnItems: args.query.compactTurnItems === "1",
+              }),
             }),
-          };
-        }),
+          );
+        }, NodeSqliteClient.foregroundReads),
       )
       .handle(
         "threadHistoryPage",
@@ -254,8 +294,9 @@ export const layer = HttpApiBuilder.group(
                   );
                 }),
               ),
+              checkJsonReply,
             );
-        }),
+        }, NodeSqliteClient.foregroundReads),
       );
   }),
 );

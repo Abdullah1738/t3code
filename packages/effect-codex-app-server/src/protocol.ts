@@ -54,6 +54,9 @@ export interface CodexAppServerPatchedProtocolOptions {
 }
 
 export interface CodexAppServerPatchedProtocol {
+  readonly awaitInputEnd: Effect.Effect<void>;
+  /** Completes with the classified error once the transport has terminated. */
+  readonly termination: Effect.Effect<CodexError.CodexAppServerError>;
   readonly incomingNotifications: Stream.Stream<CodexAppServerIncomingNotification>;
   readonly incomingRequests: Stream.Stream<CodexAppServerIncomingRequest>;
   readonly request: (
@@ -174,6 +177,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     const terminationHandled = yield* Ref.make(false);
     const terminationFailure = yield* Ref.make(Option.none<CodexError.CodexAppServerError>());
     const terminationSignal = yield* Deferred.make<void>();
+    const inputEnded = yield* Deferred.make<void>();
     const activeRequestHandlers = yield* Ref.make(0);
 
     const logProtocol = (event: CodexAppServerProtocolLogEvent) => {
@@ -453,6 +457,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
             }),
           ),
       }),
+      Effect.ensuring(Deferred.succeed(inputEnded, undefined)),
       Effect.forkScoped,
     );
 
@@ -487,6 +492,16 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       });
 
     return {
+      awaitInputEnd: Deferred.await(inputEnded),
+      termination: Deferred.await(terminationSignal).pipe(
+        Effect.andThen(Ref.get(terminationFailure)),
+        Effect.map(
+          Option.getOrElse(
+            (): CodexError.CodexAppServerError =>
+              new CodexError.CodexAppServerInputStreamEndedError({}),
+          ),
+        ),
+      ),
       incomingNotifications: Stream.fromQueue(incomingNotifications),
       incomingRequests: Stream.fromQueue(incomingRequests),
       request,

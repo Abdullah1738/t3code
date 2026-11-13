@@ -38,6 +38,15 @@ describe("harness migration settings", () => {
     expect(() => decodeServerSettings(input)).toThrow();
     expect(() => decodeServerSettingsPatch(input)).toThrow();
   });
+
+  it.each([true, false])(
+    "round-trips cutoverComplete %s in snapshots and patches",
+    (cutoverComplete) => {
+      const input = { ardudHarnessMigration: { cutoverComplete } };
+      expect(encodeServerSettings(decodeServerSettings(input))).toMatchObject(input);
+      expect(decodeServerSettingsPatch(input)).toEqual(input);
+    },
+  );
 });
 
 describe("ServerSettings response streaming", () => {
@@ -1267,5 +1276,21 @@ describe("server model preferences", () => {
     expect(decodeServerSettingsPatch({ migrateModelPreferences: input })).toEqual({
       migrateModelPreferences: input,
     });
+  });
+});
+
+describe("restart pacing settings", () => {
+  it("defaults old settings and accepts partial environment patches", () => {
+    expect(decodeServerSettings({}).restartPacing).toEqual({
+      maxActive: 4,
+      spacingMs: 20_000,
+      loadHigh: 1.5,
+    });
+    expect(decodeServerSettingsPatch({ restartPacing: { maxActive: 3 } })).toEqual({
+      restartPacing: { maxActive: 3 },
+    });
+    for (const restartPacing of [{ maxActive: 0 }, { spacingMs: -1 }, { loadHigh: 0 }]) {
+      expect(() => decodeServerSettingsPatch({ restartPacing })).toThrow();
+    }
   });
 });

@@ -14,4 +14,22 @@ Runtime state (`watchers/`, `archive/`, `runner.log`, `runner.pid`, `wa.lock`) i
 
 Versioned check packages live under `checks/`. The [inbox triage installer](checks/inbox-triage/README.md) deploys its five-minute check and definition separately, preserving the live watcher's cursors and private preferences. The [money cases installer](checks/money-cases/README.md) does the same for the open-money-case deadline check and its `money-cases` CLI.
 
+Robob projection reads use the server-owned `~/.robob/userdata/readonly/state.sqlite`
+snapshot, with `ROBOB_READONLY_DB` or the component override (`MONEY_CASES_STATE_DB`,
+`SEND_APPROVAL_STATE_DB`). Live-writer paths, symlink and hardlink aliases are
+refused before connecting. Missing/not-ready snapshots and exports older than
+120 seconds fail closed; key/value metadata must include `ready='1'` and
+`schema_version='1'`. Each request opens a read transaction before checking
+metadata, so projection rows cannot come from a partial generation. There is no
+live-database fallback.
+Protected writers include both `state.sqlite` and `statev2.sqlite` under
+`~/.robob`, `~/.t3`, and configured `ROBOB_HOME`/`T3CODE_HOME`, plus native
+OpenCode's default/XDG path. Watcher check children inherit those configured
+homes so explicit overrides cannot bypass the same protections.
+`send-approval --app` uses current control-API messages by default so a later veto is not hidden by
+replication lag; explicit snapshot overrides select offline inspection instead.
+Approval against an explicit snapshot still revalidates current owner messages
+through the control API before succeeding.
+The money-cases installer also copies `helpers/robob_readonly.py` beside its check.
+
 Install/sync: copy `src test helpers package.json tsconfig.json` to `~/.local/share/robob-watch`, the wrapper to `~/.local/bin/robob-watch`, the plist to `~/Library/LaunchAgents/`, the skill to `~/.config/opencode/skills/robob-watchers/`, then `launchctl kickstart -k gui/$(id -u)/com.ardud.robob-watch`.

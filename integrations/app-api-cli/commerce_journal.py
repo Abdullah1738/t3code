@@ -24,7 +24,7 @@ CAMPAIGN = 'commerce-unrestricted-v1'
 TOTAL_LIMIT_MINOR = None
 ORDER_LIMIT_MINOR = None
 MAX_SQLITE_INTEGER = (1 << 63) - 1
-VERTICALS = {'noon': {'nownow', 'main', 'minutes', 'supermall'},
+VERTICALS = {'noon': {'nownow', 'main', 'minutes', 'supermall', 'food'},
              'talabat': {'shops', 'restaurants', 'mart'}}
 OUTCOMES = frozenset({'RESPONSE_RECEIVED', 'UNKNOWN', 'CHALLENGE_REQUIRED', 'PAYMENT_FAILED',
                        'ORDER_ID_RECEIVED', 'PAYMENT_REPORTED_SUCCESS',
@@ -125,17 +125,17 @@ def payment_details(*, flow_id, order, amount_minor, outcome):
         steps = ['nothing to reconcile; a new order is a new purchase and needs its own go']
     elif outcome == 'waiting':
         tell = f'The payment for {amount} is still waiting on the bank. {unknown}.'
-        steps = ['check ENBD X for a pending approval or a charge SMS', status, reconcile]
+        steps = [f'check {order_card.BANK_APP} for a pending approval or a charge SMS', status, reconcile]
     elif outcome == 'unconfirmed':
         tell = f'The payment for {amount} went out but I lost its status before it confirmed. {unknown}.'
-        steps = ['check ENBD X for a pending approval or a charge SMS', status, reconcile]
+        steps = [f'check {order_card.BANK_APP} for a pending approval or a charge SMS', status, reconcile]
     elif outcome == 'confirming':
         tell = (f'The bank approved the payment for {amount}, but the store hasn\'t confirmed the order yet. '
                 'Treat the card as charged until the order shows up or is refunded.')
         steps = ['check the store\'s Orders page for this order', status, reconcile]
     else:
         tell = f'The payment for {amount} didn\'t go through. {unknown}; checking.'
-        steps = ['check ENBD X / the bank SMS for a charge or a hold', reconcile]
+        steps = [f'check {order_card.BANK_APP} / the bank SMS for a charge or a hold', reconcile]
     return {'flow_id': flow_id, 'order': order, 'amount_minor': amount_minor,
             'charge': 'not_charged' if outcome == 'not_charged' else 'unknown', 'tell': tell,
             'next': steps + ['never re-place or resend this payment']}
@@ -339,6 +339,17 @@ def consume(flow_id, operation, *, kind, request_hash, cart_hash=None,
     with _db() as db:
         flow = _get(db, flow_id)
         _active(flow)
+        if financial:
+            pause = Path(os.environ.get('ORDERING_PAUSE_FILE') or Path.home() / '.local/state/ordering-paused')
+            if pause.exists():
+                fail('ORDERING_PAUSED')
+            if flow['app'] == 'noon':
+                if flow['vertical'] == 'nownow' and kind == 'place' and order_card.LAST4 == '9546':
+                    fail('NOWNOW_9546_PAID_CONTRACT_UNPROVEN')
+                try:
+                    order_card.require_purchase_fallback()
+                except RuntimeError as exc:
+                    fail(str(exc))
         policy = db.execute('SELECT * FROM campaigns WHERE name=?', (flow['campaign'],)).fetchone()
         if policy is None:
             fail('JOURNAL_CAMPAIGN_METADATA_INVALID')
@@ -485,11 +496,94 @@ def reconcile_fenced_payment(flow_id, *, evidence_hash):
 
 def reconcile_marketplace_paid(flow_id, *, evidence_hash):
     """Lift only financial fences superseded by exact marketplace paid evidence."""
+    return _reconcile_noon_paid(flow_id,evidence_hash=evidence_hash,verticals=('main','supermall'))
+
+
+def reconcile_minutes_challenge(flow_id, *, evidence_hash):
+    """Exact capture supersedes an observed bank challenge, never an unknown send."""
+    return _reconcile_noon_paid(flow_id, evidence_hash=evidence_hash, verticals=('minutes',))
+
+
+def retract_food_capture_claim(flow_id, *, evidence_hash):
+    """Append a correction when merchant processing was mistaken for capture.
+
+    This only increases restrictions. It neither erases history nor permits sends.
+    """
+    if not _hash(evidence_hash):fail('JOURNAL_OBSERVATION_INVALID')
+    with _db() as db:
+        flow=_get(db,flow_id)
+        if flow['app']!='noon' or flow['vertical']!='food' or flow['state']!='COMPLETE' or not flow['order_id']:
+            fail('JOURNAL_FOOD_CORRECTION_INVALID')
+        op=db.execute("SELECT name FROM operations WHERE flow_id=? AND kind='place'",(flow_id,)).fetchone()
+        if not op:fail('JOURNAL_FOOD_CORRECTION_INVALID')
+        db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,order_id,observed_at) VALUES (?,?,?,?,?,?)',
+                   (flow_id,op['name'],'UNKNOWN',evidence_hash,flow['order_id'],time.time()))
+        db.execute("UPDATE flows SET state='FENCED' WHERE id=?",(flow_id,))
+
+
+def require_nownow_card_selection(flow_id, request_hash):
+    with _db() as db:
+        flow = _get(db, flow_id)
+        op = db.execute("SELECT * FROM operations WHERE flow_id=? AND name='payment'", (flow_id,)).fetchone()
+        if (flow['vertical'] != 'nownow' or not op or op['kind'] != 'selection'
+                or op['state'] != 'OBSERVED' or op['request_hash'] != request_hash):
+            fail('NOWNOW_DURABLE_CARD_SELECTION_MISMATCH')
+
+
+def claim_food_bank_purchase(flow_id, bank):
+    """One purchase notification can support only one journalled order."""
+    with _db() as db:
+        flow=_get(db,flow_id)
+        if flow['app']!='noon' or flow['vertical'] not in ('food', 'nownow') or not flow['order_id']:
+            fail('FOOD_BANK_ORDER_REQUIRED')
+        receipt_hash=digest({'source':'msgs','source_id':bank['source_id']})
+        previous=db.execute("SELECT flow_id FROM observations WHERE outcome='FOOD_BANK_PURCHASE_CLAIMED' AND evidence_hash=?",
+                            (receipt_hash,)).fetchone()
+        if previous and previous['flow_id']!=flow_id:
+            fail('FOOD_BANK_PURCHASE_ALREADY_CLAIMED')
+        for audit in db.execute('SELECT flow_id,provider_evidence FROM owner_attestations WHERE flow_id!=?',(flow_id,)):
+            prior=json.loads(audit['provider_evidence'])
+            if prior.get('kind')=='food_automatic_captured' and prior.get('bank',{}).get('source_id')==bank['source_id']:
+                fail('FOOD_BANK_PURCHASE_ALREADY_CLAIMED')
+        if not previous:
+            db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,order_id,observed_at) VALUES (?,?,?,?,?,?)',
+                       (flow_id,'place','FOOD_BANK_PURCHASE_CLAIMED',receipt_hash,flow['order_id'],time.time()))
+
+
+def reconcile_food_paid(flow_id, *, evidence_hash):
+    """Food adapter has independently bound session, order, intent and capture."""
+    return _reconcile_noon_paid(flow_id,evidence_hash=evidence_hash,verticals=('food',))
+
+
+def reconcile_nownow_preorder(flow_id):
+    """Only an observed challenged verification followed by exact status success."""
+    with _db() as db:
+        flow = _get(db, flow_id)
+        if flow['state'] == 'ACTIVE':
+            return
+        ops = list(db.execute('SELECT * FROM operations WHERE flow_id=?', (flow_id,)))
+        success = db.execute("SELECT MAX(sequence) AS s FROM observations WHERE flow_id=? AND outcome='PREORDER_PAYMENT_CONFIRMED'", (flow_id,)).fetchone()['s']
+        fences = list(db.execute("SELECT o.sequence,o.outcome,p.kind FROM observations o JOIN operations p ON p.flow_id=o.flow_id AND p.name=o.operation WHERE o.flow_id=? AND o.outcome IN ('UNKNOWN','CHALLENGE_REQUIRED','PAYMENT_FAILED')", (flow_id,)))
+        if (flow['app'] != 'noon' or flow['vertical'] != 'nownow' or flow['state'] != 'FENCED'
+                or flow['order_id'] or not success or not fences
+                or any(o['state'] != 'OBSERVED' or o['kind'] in ('place','payment') for o in ops)
+                or any(r['kind'] != 'prepay' or r['outcome'] != 'CHALLENGE_REQUIRED' or r['sequence'] >= success for r in fences)):
+            fail('NOWNOW_PREORDER_RECONCILIATION_UNPROVEN')
+        db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,order_id,observed_at) VALUES (?,?,?,?,?,?)',
+                   (flow_id, 'payment_complete', 'NOWNOW_PREORDER_RECONCILED', digest({'confirmed_sequence': success}), None, time.time()))
+        db.execute("UPDATE flows SET state='ACTIVE' WHERE id=?", (flow_id,))
+
+
+def reconcile_nownow_paid(flow_id, *, evidence_hash):
+    return _reconcile_noon_paid(flow_id, evidence_hash=evidence_hash, verticals=('nownow',))
+
+
+def _reconcile_noon_paid(flow_id, *, evidence_hash, verticals):
     if not _hash(evidence_hash):
         fail('JOURNAL_OBSERVATION_INVALID')
     with _db() as db:
         flow = _get(db, flow_id)
-        if (flow['app'] != 'noon' or flow['vertical'] not in ('main', 'supermall')
+        if (flow['app'] != 'noon' or flow['vertical'] not in verticals
                 or flow['state'] != 'FENCED' or not flow['order_id']):
             fail('JOURNAL_MARKETPLACE_RECONCILIATION_INVALID')
         ops = list(db.execute('SELECT * FROM operations WHERE flow_id=?', (flow_id,)))
@@ -500,9 +594,16 @@ def reconcile_marketplace_paid(flow_id, *, evidence_hash):
         success = db.execute("SELECT MAX(sequence) AS s FROM observations WHERE flow_id=? "
             "AND operation=? AND outcome='PAYMENT_REPORTED_SUCCESS' AND order_id=?",
             (flow_id, financial['name'], flow['order_id'])).fetchone()['s']
-        fences = list(db.execute("SELECT o.sequence,p.kind FROM observations o JOIN operations p "
+        fences = list(db.execute("SELECT o.sequence,o.outcome,p.kind FROM observations o JOIN operations p "
             "ON p.flow_id=o.flow_id AND p.name=o.operation WHERE o.flow_id=? "
             "AND o.outcome IN ('UNKNOWN','CHALLENGE_REQUIRED','PAYMENT_FAILED')", (flow_id,)))
+        if flow['vertical'] == 'minutes' and any(
+                r['kind'] != 'payment' or r['outcome'] != 'CHALLENGE_REQUIRED' for r in fences):
+            fail('MINUTES_CHALLENGE_RECONCILIATION_UNPROVEN')
+        if flow['vertical'] == 'nownow':
+            reconciled = db.execute("SELECT MAX(sequence) AS s FROM observations WHERE flow_id=? AND outcome='NOWNOW_PREORDER_RECONCILED'", (flow_id,)).fetchone()['s']
+            if reconciled:
+                fences = [r for r in fences if r['sequence'] > reconciled]
         if (not success or not fences or any(r['kind'] not in ('place', 'payment')
                                             or r['sequence'] >= success for r in fences)):
             fail('JOURNAL_RECONCILIATION_EVIDENCE_CHAIN_INVALID')
@@ -694,6 +795,10 @@ def complete(flow_id):
         if preorder is not None:
             successes=list(db.execute("SELECT sequence FROM observations WHERE flow_id=? AND operation=? AND outcome='PREORDER_PAYMENT_CONFIRMED' ORDER BY sequence",
                 (flow_id,preorder['name'])))
+            captured = db.execute("SELECT 1 FROM observations WHERE flow_id=? AND operation='place' AND order_id=? AND outcome='PAYMENT_REPORTED_SUCCESS'",
+                                  (flow_id, flow['order_id'])).fetchone()
+            if not captured:
+                fail('NOWNOW_FULL_ORDER_CAPTURE_REQUIRED')
         observations = list(db.execute('SELECT sequence,outcome FROM observations WHERE flow_id=? AND order_id=?',
                                        (flow_id, flow['order_id'])))
         if (not successes or not any(row['outcome'] == 'EXACT_ORDER_CONFIRMED'
@@ -786,6 +891,32 @@ def release(flow_id, *, evidence_hash):
                    (flow_id, next(row['name'] for row in db.execute(
                        "SELECT name FROM operations WHERE flow_id=? AND kind='place'", (flow_id,))),
                     'FLOW_RELEASED_NO_PAYMENT_SENT', evidence_hash, time.time()))
+    return {'state': 'RELEASED', 'reservation_minor_retained': True, 'retry_allowed': False}
+
+
+def release_failed_preorder(flow_id, *, evidence_hash, intent_hash):
+    """Close a verified failed subscription; never make its sends reusable."""
+    if not _hash(evidence_hash) or not _hash(intent_hash):
+        fail('JOURNAL_RELEASE_INVALID')
+    with _db() as db:
+        flow = _get(db, flow_id)
+        ops = list(db.execute('SELECT * FROM operations WHERE flow_id=?', (flow_id,)))
+        if (flow['app'] != 'noon' or flow['vertical'] != 'nownow'
+                or flow['state'] != 'FENCED' or flow['order_id'] is not None
+                or any(o['state'] != 'OBSERVED' or o['kind'] in ('place', 'payment') for o in ops)
+                or sum(o['kind'] == 'preauthorize' for o in ops) != 1
+                or sum(o['kind'] == 'prepay' for o in ops) != 1):
+            fail('JOURNAL_RELEASE_PREORDER_HISTORY_INVALID')
+        observations = list(db.execute('SELECT * FROM observations WHERE flow_id=?', (flow_id,)))
+        intents = [o['evidence_hash'] for o in observations if o['outcome'] == 'PREORDER_INTENT_RECEIVED']
+        if (not intents or any(i != intent_hash for i in intents)
+                or any(o['order_id'] is not None or o['outcome'] in
+                       ('PREORDER_PAYMENT_CONFIRMED', 'PAYMENT_REPORTED_SUCCESS', 'EXACT_ORDER_CONFIRMED')
+                       for o in observations)):
+            fail('JOURNAL_RELEASE_PREORDER_EVIDENCE_CONFLICT')
+        db.execute("UPDATE flows SET state='RELEASED' WHERE id=?", (flow_id,))
+        db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,observed_at) VALUES (?,?,?,?,?)',
+                   (flow_id, 'flow', 'FLOW_RELEASED_FAILED_PREORDER', evidence_hash, time.time()))
     return {'state': 'RELEASED', 'reservation_minor_retained': True, 'retry_allowed': False}
 
 
@@ -883,6 +1014,120 @@ def validate_owner_attestation(*, evidence, attested_by):
         fail('OWNER_ATTESTATION_EVIDENCE_REQUIRED')
 
 
+def food_capture_placed_at(flow_id):
+    with _db() as db:
+        _get(db, flow_id)
+        places = list(db.execute("SELECT created_at FROM operations WHERE flow_id=? AND kind='place'", (flow_id,)))
+        if len(places) != 1:
+            fail('FOOD_CAPTURE_CLOSE_PLACE_HISTORY_INVALID')
+        return places[0]['created_at']
+
+
+def _food_capture_close(db, flow_id, *, order_id, reserved_minor, bank_evidence, tracking_evidence, attested_by):
+    from commerce_food_capture import require, validate_bank, valid_processed_at, TRACKING_FIELDS, AUTOMATIC_FIELDS
+    flow = _get(db, flow_id)
+    require(flow['app'] == 'noon' and flow['vertical'] == 'food', 'FOOD_FLOW_REQUIRED')
+    require(_order(order_id) and flow['order_id'] == order_id, 'ORDER_MISMATCH')
+    require(type(reserved_minor) is int and reserved_minor > 0 and flow['reserved_minor'] == reserved_minor,
+            'AMOUNT_MISMATCH')
+    require(attested_by in (None, 'owner'), 'ATTESTER_INVALID')
+    ops = list(db.execute('SELECT * FROM operations WHERE flow_id=?', (flow_id,)))
+    require(not any(o['kind'] in ('payment', 'prepay', 'preauthorize')
+                    or o['name'] in ('complete', 'completion', 'complete_payment', 'payment_complete') for o in ops),
+            'PAYMENT_ALREADY_SENT')
+    places = [o for o in ops if o['kind'] == 'place']
+    require(len(places) == 1 and places[0]['name'] == 'place'
+            and all(o['state'] == 'OBSERVED' for o in ops), 'PLACE_HISTORY_INVALID')
+    prepared=json.loads((ROOT/'food'/(flow_id+'.json')).read_text())
+    validate_bank(bank_evidence, reserved_minor, places[0]['created_at'], prepared['review']['card_last4'])
+    receipt_hash=digest({'source':'msgs','source_id':bank_evidence['source_id']})
+    require(not db.execute("SELECT 1 FROM observations WHERE outcome='FOOD_BANK_PURCHASE_CLAIMED' AND evidence_hash=? AND flow_id!=?",
+                           (receipt_hash,flow_id)).fetchone(), 'BANK_PURCHASE_ALREADY_CLAIMED')
+    for audit in db.execute('SELECT provider_evidence FROM owner_attestations WHERE flow_id!=?',(flow_id,)):
+        prior=json.loads(audit['provider_evidence'])
+        require(not (prior.get('kind')=='food_automatic_captured' and prior.get('bank',{}).get('source_id')==bank_evidence['source_id']),
+                'BANK_PURCHASE_ALREADY_CLAIMED')
+    require(type(tracking_evidence) is dict and tracking_evidence.keys() == TRACKING_FIELDS, 'TRACKING_SCHEMA_INVALID')
+    require(tracking_evidence.get('ok') is True
+            and tracking_evidence.get('app') == 'noon' and tracking_evidence.get('service') == 'food'
+            and tracking_evidence.get('order') == order_id and tracking_evidence.get('scope') == 'order'
+            and tracking_evidence.get('source') == 'native_order_api'
+            and tracking_evidence.get('identity_verified') is True
+            and tracking_evidence.get('account_verified') is True
+            and tracking_evidence.get('saved_home_verified') is True
+            and tracking_evidence.get('raw_status') == tracking_evidence.get('status') == 'delivered',
+            'DELIVERY_UNVERIFIED')
+    try:
+        path = ROOT/'food-financial'/(flow_id+'.json')
+        _stat(path.parent, True)
+        _stat(path)
+        state = json.loads(path.read_text())
+    except (OSError, ValueError, JournalError):
+        fail('FOOD_CAPTURE_CLOSE_PLACEMENT_RECORD_INVALID')
+    require(type(state) is dict and 'intent_hash' not in state
+            and state.get('review_hash') == flow['review_hash']
+            and state.get('amount_minor') == reserved_minor
+            and state.get('cart_hash') == flow['place_cart_hash']
+            and state.get('cart_hash') == digest(state.get('session_id'))
+            and places[0]['request_hash'] == digest({'sessionCode': state.get('session_id'),
+                'orderTotal': reserved_minor/100, 'orderPaymentAmount': reserved_minor/100})
+            and _hash(state.get('card_hash')), 'AUTOMATIC_PATH_REQUIRED')
+    # The coordinator records intent_hash only for a non-null intent. Its
+    # absence alone is insufficient: exact native detail must explicitly prove
+    # null client secret and automatic processing, bound to the retained review.
+    automatic = tracking_evidence.get('automatic_payment')
+    require(type(automatic) is dict and automatic.keys() == AUTOMATIC_FIELDS, 'AUTOMATIC_SCHEMA_INVALID')
+    require(automatic.get('order') == order_id
+            and automatic.get('account_hash') == flow['account_hash']
+            and automatic.get('scope_hash') == flow['scope_hash']
+            and automatic.get('amount_minor') == reserved_minor
+            and automatic.get('card_hash') == state['card_hash']
+            and automatic.get('payment_client_secret_null') is True
+            and automatic.get('automatic_capture') is True
+            and valid_processed_at(automatic.get('processed_at')),
+            'AUTOMATIC_PATH_REQUIRED')
+    provider = {'kind': 'food_automatic_captured', 'bank': bank_evidence, 'tracking': tracking_evidence}
+    audit_input = {'flow_id': flow_id, 'order_id': order_id, 'reserved_minor': reserved_minor,
+                   'attested_by': attested_by or 'bank_evidence', 'provider_evidence': provider}
+    audit_hash = digest(audit_input)
+    previous = db.execute('SELECT * FROM owner_attestations WHERE flow_id=?', (flow_id,)).fetchone()
+    if previous is not None:
+        require(flow['state'] == 'COMPLETE' and previous['evidence_hash'] == audit_hash,
+                'EVIDENCE_CONFLICT')
+    else:
+        require(flow['state'] in ('ACTIVE','FENCED'), 'FENCED_FLOW_REQUIRED')
+    return flow, provider, audit_hash, previous
+
+
+def preview_food_automatic_captured(flow_id, **kwargs):
+    with _db() as db:
+        flow, _, audit_hash, previous = _food_capture_close(db, flow_id, **kwargs)
+        return {'flow_id': flow_id, 'order_id': flow['order_id'], 'from_state': flow['state'],
+                'to_state': 'COMPLETE', 'reserved_minor_retained': flow['reserved_minor'],
+                'charge': 'captured', 'evidence_hash': audit_hash, 'already_closed': previous is not None,
+                'retry_allowed': False}
+
+
+def close_food_automatic_captured(flow_id, *, order_id, reserved_minor, bank_evidence,
+                                 tracking_evidence, attested_by):
+    """Bank-evidenced charged close; every send and ownership identity stays consumed."""
+    with _db() as db:
+        flow, provider, audit_hash, previous = _food_capture_close(db, flow_id, order_id=order_id,
+            reserved_minor=reserved_minor, bank_evidence=bank_evidence,
+            tracking_evidence=tracking_evidence, attested_by=attested_by)
+        now = previous['attested_at'] if previous else time.time()
+        if previous is None:
+            db.execute('INSERT INTO owner_attestations VALUES (?,?,?,?,?,?,?,?)',
+                (flow_id, order_id, reserved_minor, attested_by or 'bank_evidence', bank_evidence['evidence'],
+                 now, json.dumps(provider, sort_keys=True, separators=(',', ':'), allow_nan=False), audit_hash))
+            db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,order_id,observed_at) '
+                       'VALUES (?,?,?,?,?,?)', (flow_id, 'place', 'FOOD_CAPTURE_EVIDENCED', audit_hash, order_id, now))
+            db.execute("UPDATE flows SET state='COMPLETE' WHERE id=?", (flow_id,))
+    return {'state': 'COMPLETE', 'charge': 'captured', 'account_fence_lifted': True,
+            'attested_at': now, 'evidence_hash': audit_hash, 'already_closed': previous is not None,
+            'reservation_minor_retained': reserved_minor, 'retry_allowed': False}
+
+
 def close_owner_attested_uncharged(flow_id, *, order_id, reserved_minor,
                                   evidence, attested_by, provider_evidence):
     """Trusted exact-provider review plus owner evidence, committed atomically.
@@ -960,6 +1205,13 @@ def binding(flow_id):
                 'account_hash': row['account_hash'], 'scope_hash': row['scope_hash']}
 
 
+def financial_binding(flow_id):
+    """Private immutable quote/cart reservation for exact financial recovery."""
+    with _db() as db:
+        row = _get(db, flow_id)
+        return {key: row[key] for key in ('review_hash', 'place_cart_hash', 'reserved_minor')}
+
+
 def completed_order_binding(*, app, vertical, account_hash, order_id):
     """Attribute an exact account/order to its completed flow; no state changes.
 
@@ -1010,9 +1262,11 @@ def _snapshot(path, tries=20):
 
 
 def open_payments(*, since_seconds=1800, now=None):
-    """Flows with a payment send in the window that haven't closed, newest first. Read only.
+    """All account-blocking flows, including ACTIVE preparations. Read only.
 
-    A bank prompt (ENBD X 3DS) that shows up while one of these is listed is ours."""
+    since_seconds is retained for CLI compatibility; unresolved fences do not
+    disappear with age, and a preparation never authorizes a bank prompt.
+    """
     now = time.time() if now is None else now
     path = ROOT / 'journal.sqlite'
     if not path.is_file():
@@ -1029,17 +1283,18 @@ def open_payments(*, since_seconds=1800, now=None):
             fail('JOURNAL_SCHEMA_UNSUPPORTED')
         rows = db.execute(
             "SELECT f.id, f.app, f.vertical, f.state, f.order_id, f.reserved_minor, "
-            "MAX(o.created_at) AS sent_at FROM flows f JOIN operations o ON o.flow_id=f.id "
-            "WHERE o.kind IN ('place','payment','preauthorize','prepay') "
-            "AND f.state NOT IN ('COMPLETE','RELEASED','OWNER_ATTESTED_UNCHARGED','REJECTED_DUPLICATE') "
-            "GROUP BY f.id HAVING sent_at >= ? ORDER BY sent_at DESC", (now - since_seconds,)).fetchall()
+            "MAX(CASE WHEN o.kind IN ('place','payment','preauthorize','prepay') THEN o.created_at END) AS sent_at "
+            "FROM flows f LEFT JOIN operations o ON o.flow_id=f.id "
+            "WHERE f.state NOT IN ('COMPLETE','RELEASED','OWNER_ATTESTED_UNCHARGED','REJECTED_DUPLICATE') "
+            "GROUP BY f.id ORDER BY f.created_at DESC").fetchall()
     except sqlite3.Error:
         fail('JOURNAL_BUSY_OR_UNAVAILABLE')
     finally:
         db.close()
     return [{'flow_id': r['id'], 'app': r['app'], 'vertical': r['vertical'], 'state': r['state'],
              'order_id': r['order_id'], 'amount_minor': r['reserved_minor'],
-             'sent_seconds_ago': round(now - r['sent_at'])} for r in rows]
+             'financial_send': r['sent_at'] is not None,
+             'sent_seconds_ago': round(now - r['sent_at']) if r['sent_at'] is not None else None} for r in rows]
 
 
 def flow_created_at(flow_id):
@@ -1091,6 +1346,11 @@ def abandon(flow_id):
         flow = _get(db, flow_id)
         if flow['state'] not in ('ACTIVE', 'FENCED'):
             fail('JOURNAL_ABANDON_ACTIVE_ONLY')
+        # A delete acknowledgement alone does not establish an empty cart.
+        if db.execute("SELECT 1 FROM operations WHERE flow_id=? AND name='cart_delete'", (flow_id,)).fetchone():
+            if not db.execute("SELECT 1 FROM observations WHERE flow_id=? AND operation='cart_delete' "
+                              "AND outcome='CART_READBACK'", (flow_id,)).fetchone():
+                fail('JOURNAL_CLEAR_EMPTY_READBACK_REQUIRED')
         rows = list(db.execute("SELECT kind,state FROM operations WHERE flow_id=?", (flow_id,)))
         if (any(r['state'] != 'OBSERVED' for r in rows)
                 or any(r['kind'] in ('place', 'payment', 'preauthorize', 'prepay') for r in rows)

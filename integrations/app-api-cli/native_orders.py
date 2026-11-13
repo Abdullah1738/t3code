@@ -183,12 +183,13 @@ def track(app, order, timeout=10):
 
 def _noon_manifest_conflict(scoped, manifest):
     """Every observed identity and explicit current state must agree."""
+    from noon_http_orders import marketplace_stage
     item_shipments = {item['item_id']: item['shipment_id'] for item in manifest['items']}
     shipment_ids = set(item_shipments.values())
     records = [scoped, *scoped.get('items', []), *scoped.get('shipments', [])]
     for part in records:
         if (part.get('status') not in (None, 'unknown', 'delivered')
-                or part.get('raw_status') not in (None, 'delivered')
+                or (part.get('raw_status') is not None and marketplace_stage(part['raw_status'])!='delivered')
                 or {'card_status_conflict', 'timeline_status_conflict'}.intersection(part.get('warnings', []))):
             return True
         observed_items = set(part.get('item_ids') or [])
@@ -239,6 +240,28 @@ def noon_marketplace_track(order, timeout):
                 parts.append(item)
                 known.add(key)
         out['shipments'] = parts
+        out['status']=core.marketplace_active_stage(p.get('status','unknown') for p in parts)
+        raw_states={p.get('raw_status') for p in parts}
+        out['raw_status']=next(iter(raw_states)) if len(raw_states)==1 else None
+        active=[p for p in parts if p.get('status') not in ('delivered','cancelled')]
+        estimates=[]
+        for part in active:
+            candidates=[p['eta'] for p in parts if p.get('eta') and (
+                p is part or part.get('item_id') and p.get('item_id')==part['item_id']
+                or part.get('shipment_id') and p.get('shipment_id')==part['shipment_id'])]
+            if not candidates:break
+            estimates.append(max(candidates))
+        if not active or len(estimates)!=len(active):
+            out.update(eta=None,eta_text=None,eta_source=None)
+            out.pop('eta_relative_minutes',None)
+        else:
+            out['eta']=max(estimates)
+        if (manifest.get('manifest_complete') is True and manifest.get('whole_order_complete') is True
+                and manifest.get('status')=='cancelled'):
+            # Full exact cancellation is authoritative over cached processing cards.
+            out.update(status='cancelled',raw_status='cancelled',whole_order_complete=True,scope='order',
+                       eta=None,eta_text=None,eta_source=None,rider=None,coverage=manifest['coverage'],
+                       terminal_evidence=manifest['terminal_evidence'])
         if (manifest.get('manifest_complete') is True and manifest.get('whole_order_complete') is True
                 and manifest.get('status') == 'delivered'):
             if _noon_manifest_conflict(scoped or {}, manifest):

@@ -1,16 +1,16 @@
-"""Billing-period spend from one account meter request, $100 alerts and the $500 cap."""
+"""Billing-period spend from one account meter request, $100 alerts and the $1200 cap."""
 
 from __future__ import annotations
 
 import json
 import datetime as dt
 
-from . import api
+from . import api, capacity
 from .common import (CAP_PATH, OffboxError, atomic_write_json, db, event, file_lock, kv_get, kv_set, month_key, month_start_utc,
                      now, read_json, say)
 from .identity import telegram
 
-CAP_DOLLARS = 500.0
+CAP_DOLLARS = 1200.0
 STEP_DOLLARS = 100.0
 
 
@@ -36,6 +36,11 @@ def compute() -> dict:
 
 
 def _compute(con) -> dict:
+    if api.BACKEND != "boat":
+        # The home server has no meter. Reading its /limits here would look like a new, empty billing period
+        # and clear a real cap.
+        raise OffboxError("spend is boat.dev's meter; `offbox spend` reads it (this process is on the home server)",
+                          code=2)
     L = api.limits()
     if L.get('creditUsedSeconds') is None or not L.get('subscriptionCurrentPeriodEnd'):
         raise OffboxError('boat /limits missing spend meter or billing period; keeping previous cap state')
@@ -70,6 +75,12 @@ def _compute(con) -> dict:
            'spend': round(seconds/sps, 4), 'per_box_sum': None, 'limits': lim,
            'cap': CAP_DOLLARS, 'cap_state': read_json(CAP_PATH, {}), 'boxes': []}
     kv_set(con, 'spend_last', {k: out[k] for k in ('month','billing_month','period_end','spend','per_box_sum')})
+    # What the plan allows, for the start windows and sizes (capacity.windows, capacity.plan_allows): a smaller
+    # plan (Boat as the standby of the home server) is then respected without a code change.
+    kv_set(con, capacity.PLAN_KEY, {
+        'key': L.get('sandboxPlanKey'), 'dollars': L.get('sandboxPlanDollars'), 'starts': L.get('startLimits') or {},
+        'max_active': L.get('maxActiveSandboxes'),
+        'types': {m.get('type'): bool(m.get('available')) for m in (L.get('machineTypes') or []) if m.get('type')}})
     return out
 
 
@@ -128,14 +139,27 @@ def _check(con, quiet: bool) -> dict:
             kv_set(con, f"sent:{key}", now())
     if spend >= CAP_DOLLARS:
         was = read_json(CAP_PATH, {})
-        atomic_write_json(CAP_PATH, {"capped": True, "month": month, 'period_end': period, "spend": spend, "at": now()})
+        atomic_write_json(CAP_PATH, {"capped": True, "month": month, 'period_end': period, "spend": spend, "at": now(),
+                                     "cap": CAP_DOLLARS})
         if not (was.get("capped") and was.get("month") == month):
             event(con, None, "cap_hit", f"${spend:.2f}")
+            key = f"offbox-cap-{out['billing_month']}-{CAP_DOLLARS:.0f}"
+            if not kv_get(con, f"sent:{key}") and telegram(
+                    f"offbox: spend cap ${CAP_DOLLARS:.0f} hit (now ${spend:.2f}): new leases refused, all boxes stopped.",
+                    key, severity="attention"):
+                kv_set(con, f"sent:{key}", now())
         n = stop_all("spend cap")
         out["stopped"] = n
     else:
-        still_capped = bool(cap.get('capped') and cap.get('period_end', period) == period)
-        atomic_write_json(CAP_PATH, {"capped": still_capped, "month": month, 'period_end': period, "spend": spend})
+        # A cap tripped in this period stays tripped unless the cap has since been raised above spend.
+        # Records written before the cap was stored were all set at $500.
+        same_period = cap.get('period_end', period) == period
+        raised = float(cap.get('cap', 500.0)) < CAP_DOLLARS
+        still_capped = bool(cap.get('capped') and same_period and not raised)
+        if cap.get('capped') and same_period and raised:
+            event(con, None, "cap_cleared", f"cap raised to ${CAP_DOLLARS:.0f} at ${spend:.2f}")
+        atomic_write_json(CAP_PATH, {"capped": still_capped, "month": month, 'period_end': period, "spend": spend,
+                                     "cap": float(cap.get('cap', 500.0)) if still_capped else CAP_DOLLARS})
     out["cap_state"] = read_json(CAP_PATH, {})
     return out
 

@@ -1,0 +1,10 @@
+{
+  "id": "noon-order-discovery",
+  "title": "Discover noon orders placed in the app",
+  "check": "$HOME/.local/share/uv/tools/mitmproxy/bin/python $HOME/.local/share/app-api-cli/noon_order_discovery.py",
+  "interval_s": 120,
+  "mode": "wake",
+  "max_fires": 0,
+  "expires_at": "365d",
+  "context": "Owner authorized automatic noon account-order discovery and tracking on 7 Nov 2026. Load noon and delivery-cards. For each newly discovered exact order ID, verify read-only with commerce track-exact noon SERVICE ID and commerce order-details noon SERVICE ID. Shared marketplace history uses the neutral marketplace vertical; do not guess main/supermall. Register order-watch add --app noon --order ID --for owner --vertical LANE with native placement time/store/items/total when available. Verify watcher_registered:true and delivery_card.status:sent; retry failed card publishing with its retained key. Never release an existing payment hold without exact payment evidence. Never purchase, cancel, modify orders, or call Talabat. Registration and per-order watchers handle the card and arrival; no duplicate placement or progress text. Baseline history is bounded; failures retain pending orders. Log routine success and end NO_REPLY. Report persistent discovery or registration failure."
+}

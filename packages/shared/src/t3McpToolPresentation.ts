@@ -41,6 +41,7 @@ export type T3McpToolSummaryAction =
   | "question-respond"
   | "secret-request"
   | "context-reset"
+  | "imessage-send"
   | "worktree-handoff"
   | "worktree-list"
   | "worktree-status"
@@ -148,6 +149,10 @@ const T3_MCP_TOOLS: Readonly<Record<string, T3McpToolDefinition>> = {
   create_threads: tool(["Create", "Creating", "Created", "T3 threads"], "thread-create"),
   t3_thread_start: tool(["Start", "Starting", "Started", "a T3 thread"], "thread-create"),
   t3_thread_list: tool(["List", "Listing", "Listed", "T3 threads"], "thread-list"),
+  t3_thread_redact_item: tool(
+    ["Redact", "Redacting", "Redacted", "a thread item"],
+    "thread-update",
+  ),
   t3_thread_read: tool(["Read", "Reading", "Read", "a T3 thread"], "thread-read"),
   t3_thread_send: tool(["Send", "Sending", "Sent", "to a T3 thread"], "thread-send"),
   t3_thread_wait: tool(["Wait", "Waiting", "Waited", "for a T3 thread"], "thread-wait"),
@@ -166,6 +171,7 @@ const T3_MCP_TOOLS: Readonly<Record<string, T3McpToolDefinition>> = {
   t3_worktree_status: tool(["Get", "Getting", "Got", "thread worktree status"], "worktree-status"),
   // ardud fork
   t3_context_reset: tool(["Reset", "Resetting", "Reset", "this thread's context"], "context-reset"),
+  imessage_send: tool(["Send", "Sending", "Sent", "an iMessage"], "imessage-send"),
   t3_scheduled_task_block_retry: tool(
     ["Set", "Setting", "Set", "a scheduled task's blocked-run retry"],
     "schedule-update",

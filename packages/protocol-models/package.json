@@ -1,0 +1,20 @@
+{
+  "name": "@t3tools/protocol-models",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "node scripts/check.mjs typecheck",
+    "simulate": "node scripts/check.mjs run",
+    "verify": "node scripts/check.mjs verify",
+    "conformance": "tsx conformance/outbox.ts"
+  },
+  "devDependencies": {
+    "@informalsystems/quint": "0.33.1",
+    "fast-check": "4.10.2",
+    "tsx": "4.23.15",
+    "effect": "catalog:",
+    "@effect/platform-node": "catalog:",
+    "@t3tools/contracts": "workspace:*",
+    "@t3tools/shared": "workspace:*"
+  }
+}

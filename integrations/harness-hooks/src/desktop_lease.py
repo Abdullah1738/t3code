@@ -1,6 +1,10 @@
 """Fail-closed admission for desktop calls and best-effort completion."""
+import hashlib
 import json
+import os
+from pathlib import Path
 import re
+import tempfile
 import threading
 import urllib.error
 import urllib.request
@@ -18,6 +22,9 @@ CUA_NAME = re.compile(r"^mcp__(?:cua-driver|cua_driver)__(.+)$")
 DESKTOP_JS = re.compile(r"@oai/sky|\bsky\b|SkyComputerUse|computeruse\.sock|nativePipe|launchServices")
 NODE_REPL = "mcp__node_repl__js"
 UNAVAILABLE = "Desktop lease check unavailable; the desktop action was blocked."
+# The hook process has 10 s. The server can stall for several seconds under load (12:53 6 Nov:
+# ~5-10 s SQLite waits), and 3 s denied a held lease; 8 s keeps a 2 s margin.
+DEADLINE = 8
 NO_LEASE = ("No desktop lease for this thread. Run the lease steps in the mac-computer-use-routing "
             "skill (t3ctl desktop-lease acquire) and wait until it says held. Server: ")
 
@@ -66,7 +73,7 @@ def post(control, path, payload):
                                              json.dumps(payload).encode(), headers, method="POST")
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
             try:
-                response = opener.open(request, timeout=3)
+                response = opener.open(request, timeout=DEADLINE)
             except urllib.error.HTTPError as error:
                 response = error
             with response:
@@ -87,7 +94,7 @@ def post(control, path, payload):
             done.set()
 
     threading.Thread(target=send, daemon=True).start()
-    if not done.wait(3):
+    if not done.wait(DEADLINE):
         raise TimeoutError("control-deadline")
     if isinstance(result[0], Exception):
         raise result[0]
@@ -98,7 +105,72 @@ def valid_id(value):
     return isinstance(value, str) and bool(value) and value == value.strip()
 
 
-def admit(event, harness, control):
+# Codex sends no PostToolUse for an MCP call that fails, so its admitted call row would stay open and the
+# lease would stick in `stopping` (then quarantine). Admitted calls are tracked per native caller and any
+# still open when the turn ends (Stop/SubagentStop/SessionEnd) are closed as failed.
+TURN_END = frozenset({"Stop", "SubagentStop", "SessionEnd"})
+
+
+def _pending_file(state_dir, native):
+    key = hashlib.sha256(native.encode("utf-8")).hexdigest()[:32]
+    return Path(state_dir) / "desktop-pending" / (key + ".json")
+
+
+def _pending_update(state_dir, native, add=None, remove=None):
+    """Best effort; a lost entry only means the server's own age limit applies, as before."""
+    if state_dir is None or not native:
+        return []
+    path = _pending_file(state_dir, native)
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            with open(path, encoding="utf-8") as f:
+                calls = [c for c in json.load(f) if isinstance(c, str)]
+        except (FileNotFoundError, ValueError):
+            calls = []
+        if add and add not in calls:
+            calls.append(add)
+        if remove is not None:
+            calls = [c for c in calls if c not in remove]
+        fd, tmp = tempfile.mkstemp(prefix="pending-", dir=path.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(calls[-64:], f)
+        os.replace(tmp, path)
+        return calls
+    except OSError:
+        return []
+
+
+def _native_key(event, harness):
+    session, agent = event.get("session_id"), event.get("agent_id")
+    if harness == "codex":
+        return agent if valid_id(agent) else session if valid_id(session) else None
+    if not valid_id(session):
+        return None
+    return session + ("\x00" + agent if valid_id(agent) else "")
+
+
+def flush(event, harness, control, state_dir):
+    """Close this caller's still-open desktop calls as failed at turn end. Never raises."""
+    try:
+        native = _native_key(event, harness)
+        pending = _pending_update(state_dir, native)
+        closed = []
+        for call_id in pending:
+            try:
+                status, _ = post(control, "call-end", {"toolUseId": call_id, "outcome": "failed"})
+            except Exception:  # noqa: BLE001 - keep it for the next turn end
+                continue
+            if status in (200, 404):
+                closed.append(call_id)
+        if closed:
+            _pending_update(state_dir, native, remove=closed)
+        return ("desktop-flush" if closed else "desktop-flush-none"), None
+    except Exception as error:  # noqa: BLE001
+        return "desktop-end-error", type(error).__name__
+
+
+def admit(event, harness, control, state_dir=None):
     if not needs_lease(event):
         return "allow", "", "desktop-read-only", None
     try:
@@ -112,6 +184,7 @@ def admit(event, harness, control):
             payload["agentId"] = agent
         status, data = post(control, "call-start", payload)
         if status == 200 and data.get("ok") is not False:
+            _pending_update(state_dir, _native_key(event, harness), add=call_id)
             return "allow", "", "desktop-admitted", None
         if status == 409:
             error = data.get("error")
@@ -123,13 +196,14 @@ def admit(event, harness, control):
         return "deny", UNAVAILABLE, "desktop-unavailable", type(error).__name__
 
 
-def finish(event, harness, control):
+def finish(event, harness, control, state_dir=None):
     try:
         if not needs_lease(event):
             return "desktop-read-only", None
         call_id = event.get("tool_use_id")
         if not valid_id(call_id):
             raise ValueError("missing-desktop-call")
+        _pending_update(state_dir, _native_key(event, harness), remove=[call_id])
         response = event.get("tool_response")
         failed = event.get("hook_event_name") == "PostToolUseFailure" or (
             harness == "codex" and isinstance(response, dict) and

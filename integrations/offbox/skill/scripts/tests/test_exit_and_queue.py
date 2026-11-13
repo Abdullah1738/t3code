@@ -173,13 +173,14 @@ class RemoteWrapperTests(unittest.TestCase):
             cases = [(['false'], 1), (['exit 3'], 3), (['true'], 0), (['sh', '-c', 'kill -KILL $$'], 137)]
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
                     patch.object(runs, 'LDCACHE_REPAIR', ':'):
-                for argv, code in cases:
+                for i, (argv, code) in enumerate(cases):
+                    run_id = f"run-test-{i}"
                     with self.subTest(argv=argv):
-                        script = runs.remote_script('w/repo', 'sub', argv, None, 'run-test')
-                        cmd = runs.exit_recording_command(script, 'run-test')
+                        script = runs.remote_script('w/repo', 'sub', argv, None, run_id)
+                        cmd = runs.exit_recording_command(script, run_id)
                         p = subprocess.run(cmd, shell=True, env=env, capture_output=True, text=True, timeout=10)
                         self.assertEqual(p.returncode, code)
-                        rc_file = Path(home) / '.offbox/exit/run-test.rc'
+                        rc_file = Path(home) / f'.offbox/exit/{run_id}.rc'
                         self.assertEqual(rc_file.read_text().strip(), str(code))
                 steps_script = runs.remote_script('w/repo', 'sub', ['true; false; exit 4'], None, 'run-test',
                                                   steps=['true', 'false', 'exit 4'])
@@ -262,13 +263,14 @@ class PoolQueueTests(Isolated):
             with self.assertRaises(pool.PoolBusyError) as caught:
                 pool.acquire(self.me, run_id='mine')
         lines = err.getvalue().splitlines()
-        self.assertIn('queued for a repo pool box: 2/2 busy, 1 other caller(s) waiting; will wait up to 130s', lines[0])
+        self.assertIn('queued for a repo pool box: 2/2 busy, 0 held by checkout cleanup, '
+                      '1 other caller(s) waiting; will wait up to 130s', lines[0])
         self.assertIn('tool timeout above 130s', lines[0])
         self.assertIn('background', lines[0])
         progress = [ln for ln in lines if 'still queued' in ln]
         self.assertEqual(len(progress), 2)
         self.assertIn('waited 60s of 130s', progress[0])
-        self.assertIn('stayed busy for 130s', str(caught.exception))
+        self.assertIn('2/2 busy, 0 held by checkout cleanup for 130s', str(caught.exception))
 
     def test_box_freed_while_queued_is_taken(self):
         self.full_pool()

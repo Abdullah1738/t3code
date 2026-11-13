@@ -20,7 +20,7 @@ export const incidentId = (startMs) =>
   "sr-" + new Date(startMs).toISOString().replace(/[-:]/g, "").slice(0, 15) + "Z";
 
 export const sessionFromProviderThread = (value) => {
-  const match = /native-thread:(ses_[A-Za-z0-9]+)/.exec(value ?? "");
+  const match = /^(?:provider-thread|thread):provider:opencode:.*:native-thread:(ses_[A-Za-z0-9]+)$/.exec(value ?? "");
   return match ? match[1] : null;
 };
 
@@ -303,6 +303,9 @@ export function trackServer(servers, current, now, { keep = 20 } = {}) {
 // one thread tree alone is a Stop (or task_cancel), not a restart.
 export function findRestartIncidents(subs, { runs = [], serverStarts = [], gapMs = 10_000, minBurst = 3, minThreads = 2 } = {}) {
   const windows = serverStarts.map((s) => serverStartWindow(s)).filter(Boolean);
+  const inWindow = (row, window, ms) => ms >= window.from && ms <= window.to
+    && (window.start.service !== 'opencode' || row.instance_id === 'opencode'
+      || sessionFromProviderThread(row.provider_thread_id) !== null);
   const rows = subs
     // App-owned tasks can retain partial assistant text even when interrupted.
     .filter((s) => s.kind === 'delegated' || s.result == null)
@@ -319,7 +322,7 @@ export function findRestartIncidents(subs, { runs = [], serverStarts = [], gapMs
     .map((cluster) => {
       const roots = new Set(cluster.map((s) => s.rootThreadId ?? s.parentThreadId ?? s.thread_id));
       const burst = cluster.length >= minBurst && roots.size >= minThreads;
-      const win = windows.find((w) => cluster.some((s) => s.ms >= w.from && s.ms <= w.to));
+      const win = windows.find((w) => cluster.some((s) => inWindow(s, w, s.ms)));
       if (!burst && !win) return null;
       return {
         kind: "restart",
@@ -332,7 +335,8 @@ export function findRestartIncidents(subs, { runs = [], serverStarts = [], gapMs
         windowFrom: win?.from ?? cluster[0].ms - 60_000,
         windowTo: win?.to ?? cluster.at(-1).ms + 60_000,
         runs: [],
-        subagents: cluster.map(({ ms, ...s }) => ({ ...s, parentThreadId: s.parentThreadId ?? s.thread_id })),
+        subagents: cluster.filter((s) => !win || inWindow(s, win, s.ms))
+          .map(({ ms, ...s }) => ({ ...s, parentThreadId: s.parentThreadId ?? s.thread_id })),
       };
     })
     .filter(Boolean);
@@ -356,10 +360,11 @@ export function findRestartIncidents(subs, { runs = [], serverStarts = [], gapMs
     if (run.status === 'interrupted' && run.stop_requested !== 0) continue;
     const ms = toMs(run.completed_at);
     // A burst of cancelled subagents alone doesn't prove the turn was cut by a restart.
-    if (run.status === 'interrupted' && !windows.some((w) => ms >= w.from && ms <= w.to)) continue;
-    let incident = merged.find((i) => ms >= i.windowFrom && ms <= i.windowTo);
+    if (run.status === 'interrupted' && !windows.some((w) => inWindow(run, w, ms))) continue;
+    let incident = merged.find((i) => ms >= i.windowFrom && ms <= i.windowTo
+      && (!i.serverStart || inWindow(run, { from: i.windowFrom, to: i.windowTo, start: i.serverStart }, ms)));
     if (!incident) {
-      const win = windows.find((w) => ms >= w.from && ms <= w.to);
+      const win = windows.find((w) => inWindow(run, w, ms));
       if (!win) continue;
       incident = {
         kind: 'restart', id: win.start.incidentId ?? restartIncidentId(win.start.readyMs), startMs: ms, endMs: ms,
@@ -430,7 +435,7 @@ export const resultInHistory = (messages, ses) =>
 export const RESTART_STALE_REASON = "only stale subagents (idle for hours before the restart)";
 export const RESTART_BUSY_REASON = "fresh turn is running";
 export const RESTART_RESUMED_REASON = "resumed by itself";
-const NEEDS = new Set(["cut", "running", "finished"]);
+const NEEDS = new Set(["cut", "running", "finished", "unknown"]);
 const HANDLED = new Set(["redispatched", "delivered"]);
 
 // lost: [{status: cut | running | finished | stale | redispatched | delivered, ...}]
@@ -486,6 +491,7 @@ export function buildRestartNote({ incident, lost = [], turnCut = false, held = 
       (turnCut ? ` Your own turn was cut off by the same restart; carry on from where you were.` : ""),
     `On every macOS boot, dirhelper -machineBoot fully wipes $TMPDIR. Scratch files under $TMPDIR/opencode are gone after a Mac reboot; reconstruct missing briefs and reports from durable files or session history before resuming work.`,
   ];
+  if (lost.some((l) => l.status === 'unknown')) parts.push('Native task liveness is not proven here. A cancelled projection alone does not prove the native task stopped or that its completion was lost; reconcile through Robob before resuming it.');
   let budget = PROMPTS_TOTAL;
   const lines = needs.map((l, i) => {
     if (l.kind === 'delegated' && l.status === 'finished') {
@@ -496,6 +502,7 @@ export function buildRestartNote({ incident, lost = [], turnCut = false, held = 
       return `${i + 1}. delegated task "${truncate(l.title ?? 'task', 100)}"${l.model ? ` (${l.model})` : ''}, child thread ${l.childThreadId ?? 'unknown'}: a continuation is running or queued. Check it with task_status ${l.taskRef}; don't relaunch while it is active.`;
     }
     const head = `${i + 1}. "${truncate(l.title ?? "subagent", 100)}"${l.model ? ` (${l.model})` : ""}, session ${l.sessionId ?? "unknown"}, started ${l.startedAt ? hhmm(l.startedAt) : "?"}${l.nestedUnder ? `, launched by ${l.nestedUnder}` : ""}: `;
+    if (l.status === 'unknown') return `${i + 1}. native task "${truncate(l.title ?? 'subagent', 100)}", task ${l.subagentId}${l.childThreadId ? `, child thread ${l.childThreadId}` : ''}: outcome unknown. Read its thread with t3_thread_read and check task status before doing anything; don't relaunch based only on the restart.`;
     if (l.status === "running") return `${head}still running in OpenCode, but its wake-up won't reach you through Robob. Don't relaunch it; check its output before you finish your turn.`;
     if (l.status === "finished") {
       const quote = l.excerpt ? `:\n   > ${fence(l.excerpt).replace(/\n/g, "\n   > ")}` : ".";
@@ -528,7 +535,7 @@ export function buildRestartNote({ incident, lost = [], turnCut = false, held = 
         ".",
     );
   }
-  if (needs.some((l) => l.status === "cut" && l.kind !== 'delegated')) {
+  if (needs.some((l) => l.status === "cut" && l.kind !== 'delegated' && l.sessionId)) {
     parts.push(
       `For each cut-off subagent you still need, resume it with your subagent tool: pass its session id as the session to continue, with a short prompt such as "Robob restarted and cut you off. Carry on from where you stopped and finish the task." It keeps its context. Re-dispatch from the original prompt only if the resume fails. Skip any you no longer need or already relaunched.`,
     );
@@ -537,7 +544,7 @@ export function buildRestartNote({ incident, lost = [], turnCut = false, held = 
     `- ${r.run_id}, queued ${hhmm(r.requested_at)}: ${fence(truncate(r.text ?? '', 240))}`).join('\n'));
   if (held.length) parts.push(`Robob had held ${held.length} queued message(s). Recovery is releasing the queue; these reach you as separate turns.`);
   parts.push(
-    (lost.some((l) => l.kind !== 'delegated') ? `Read a subagent's output with: curl -s ${auth} "${ocUrl}/api/session/<ses>/message?limit=5" (newest first). ` : '') +
+    (lost.some((l) => l.kind !== 'delegated' && l.sessionId) ? `Read an OpenCode subagent's output with: curl -s ${auth} "${ocUrl}/api/session/<ses>/message?limit=5" (newest first). ` : '') +
     `Then post a one-line status and carry on. If you already handed this lane to a newer thread, pass this recovery note, including every listed child session${delegated.length ? ', delegated task' : ''} and result, to it and stop.`,
   );
   return parts.join("\n\n");

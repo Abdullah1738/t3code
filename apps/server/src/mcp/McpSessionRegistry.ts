@@ -11,6 +11,7 @@ import * as NetAddress from "effect/net/NetAddress";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as CredentialStore from "../ardud/mcp/CredentialStore.ts";
+import * as BoardsDatabase from "../ardud/persistence/BoardsDatabase.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 
@@ -87,20 +88,30 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   const environmentId = yield* environment.getEnvironmentId;
   const store = yield* CredentialStore.CredentialStore;
   const httpServer = yield* HttpServer.HttpServer;
-  const loaded = yield* store.load(environmentId).pipe(Effect.orDie);
   const state = yield* SynchronizedRef.make<RegistryState>({
-    records: new Map(
-      loaded.map((record) => [
-        record.tokenHash,
-        {
-          ...record,
-          persistedAliveAt: record.lastAliveAt,
-          dirty: false,
-          livenessWrites: Semaphore.makeUnsafe(1),
-        },
-      ]),
-    ),
+    records: new Map(),
   });
+  const ensureLoaded = yield* Effect.cached(
+    store.load(environmentId).pipe(
+      Effect.orDie,
+      Effect.flatMap((loaded) =>
+        SynchronizedRef.set(state, {
+          records: new Map(
+            loaded.map((record) => [
+              record.tokenHash,
+              {
+                ...record,
+                persistedAliveAt: record.lastAliveAt,
+                dirty: false,
+                livenessWrites: Semaphore.makeUnsafe(1),
+              },
+            ]),
+          ),
+        }),
+      ),
+    ),
+  );
+  yield* BoardsDatabase.onReady(ensureLoaded);
   const durableWrites = yield* Semaphore.make(1);
   const currentTimeMillis = options.now ? Effect.sync(options.now) : Clock.currentTimeMillis;
   const livenessWindowMs = options.livenessWindowMs ?? DEFAULT_LIVENESS_WINDOW_MS;
@@ -149,6 +160,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
 
   const issue: McpSessionRegistryShape["issue"] = Effect.fn("McpSessionRegistry.issue")(
     function* (request) {
+      yield* ensureLoaded;
       const issuedAt = yield* currentTimeMillis;
       const providerSessionId = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
       const rawToken = yield* crypto.randomBytes(32).pipe(Effect.map(tokenFromBytes), Effect.orDie);
@@ -210,6 +222,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
 
   const resolve: McpSessionRegistryShape["resolve"] = Effect.fn("McpSessionRegistry.resolve")(
     function* (rawToken) {
+      yield* ensureLoaded;
       if (rawToken.length === 0) return undefined;
       const tokenHash = yield* hashToken(rawToken);
       const timestamp = yield* currentTimeMillis;
@@ -232,6 +245,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
 
   const touch: McpSessionRegistryShape["touch"] = Effect.fn("McpSessionRegistry.touch")(
     function* (threadId) {
+      yield* ensureLoaded;
       yield* Effect.gen(function* () {
         const timestamp = yield* currentTimeMillis;
         const matching = yield* SynchronizedRef.modify(state, ({ records }) => {
@@ -278,7 +292,8 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   ) =>
     durableWrites
       .withPermits(1)(
-        persist.pipe(
+        ensureLoaded.pipe(
+          Effect.andThen(persist),
           Effect.orDie,
           Effect.andThen(
             SynchronizedRef.update(state, ({ records }) => ({

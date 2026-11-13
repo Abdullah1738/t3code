@@ -123,18 +123,15 @@ class BasketCLITests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertEqual(result['error'], 'BASKET_FILE_AND_SINGLE_ITEM_FLAGS_CONFLICT')
 
-    def test_talabat_alias_and_canonical_share_parser(self):
+    def test_talabat_alias_and_canonical_refuse_retired(self):
+        # Talabat retired by owner 2026-11-07: both spellings refuse before the lane runs.
         for prefix in (['test-talabat-shops'], ['order', 'talabat']):
             with self.subTest(prefix=prefix), patch.object(cli, 'purchase_talabat',
-                    return_value={'ok': True}) as purchase:
+                    side_effect=AssertionError('must not run')) as purchase:
                 code, _ = self.run_cli([*prefix, '--branch', '123', '--vertical', 'restaurants',
                     '--items-file', str(self.path), '--prepare-only'])
-            self.assertEqual(code, 0)
-            args = purchase.call_args.args[0]
-            self.assertEqual(args.items_file, str(self.path))
-            self.assertIsNone(args.item)
-            self.assertIsNone(args.quantity)
-            self.assertTrue(args.prepare_only)
+            self.assertEqual(code, 5)
+            purchase.assert_not_called()
 
     def test_prepare_only_does_not_recover_already_ordered_supermall(self):
         with patch.object(cli, 'CommerceAuth'), \

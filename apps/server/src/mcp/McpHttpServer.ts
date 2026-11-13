@@ -1,3 +1,5 @@
+import * as RedactionTools from "../ardud/redaction/tools.ts";
+import * as SavedBoardReply from "../ardud/kanban/tools/savedReply.ts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -29,6 +31,15 @@ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementSe
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as LargeReplyLog from "../observability/LargeReplyLog.ts";
 import * as McpReplySize from "../observability/McpReplySize.ts";
+import {
+  jsonExceedsBudget,
+  MAX_REPLY_BYTES,
+  REPLY_TOO_LARGE,
+  ReplyTooLarge,
+} from "../ardud/http/replyBudget.ts";
+import * as ReplyBuilders from "../ardud/http/ReplyBuilders.ts";
+import * as ReplyReadiness from "../ardud/http/replyReadiness.ts";
+import { ReplyRejection } from "../ardud/http/ReplyRejection.ts";
 import * as AnalyticsService from "../telemetry/AnalyticsService.ts";
 import {
   type AgentThread,
@@ -68,6 +79,11 @@ import * as WorktreeMcpService from "./WorktreeMcpService.ts";
 import * as ContextResetHandlers from "../ardud/context-reset/handlers.ts";
 import * as ContextResetService from "../ardud/context-reset/ContextResetService.ts";
 import { ContextResetToolkit } from "../ardud/context-reset/tools.ts";
+import * as ImessageSendHandlers from "../ardud/imessage/handlers.ts";
+import * as ImessageBridgeCli from "../ardud/imessage/ImessageBridgeCli.ts";
+import * as ImessageSendService from "../ardud/imessage/ImessageSendService.ts";
+import { ImessageSendToolkit } from "../ardud/imessage/tools.ts";
+import * as ControlStore from "../ardud/control/ControlStore.ts";
 // ardud schedules: retry a scheduled task's blocked runs.
 import * as ScheduledTaskBlockRetry from "../ardud/schedules/blockRetryTools.ts";
 import * as KanbanHandlers from "../ardud/kanban/tools/handlers.ts";
@@ -170,6 +186,23 @@ export const normalizeMcpHttpResponse = (
 
 // Session tokens are `<payload>.<signature>`; registry tokens are a bare base64url secret.
 const looksLikeProviderToken = (token: string) => token.length > 0 && !token.includes(".");
+const LARGE_READ_TOOLS = new Set([
+  "board_get",
+  "card_get",
+  "wiki_read",
+  "discussion_read",
+  "card_search",
+  "t3_thread_read",
+  "t3_thread_list",
+  "list_scheduled_tasks",
+]);
+const BOARD_READ_TOOLS = new Set([
+  "board_get",
+  "card_get",
+  "wiki_read",
+  "discussion_read",
+  "card_search",
+]);
 
 const makeMcpAuthMiddleware = Effect.gen(function* () {
   const registry = yield* McpSessionRegistry.McpSessionRegistry;
@@ -527,7 +560,7 @@ const registerPreviewSnapshot = Effect.fn("McpHttpServer.registerPreviewSnapshot
             Effect.gen(function* () {
               const snapshot = encodedResult as SnapshotMetadata & {
                 readonly url: string;
-                readonly screenshot: {
+                readonly screenshot?: {
                   readonly mimeType: "image/png";
                   readonly data: string;
                   readonly width: number;
@@ -535,7 +568,7 @@ const registerPreviewSnapshot = Effect.fn("McpHttpServer.registerPreviewSnapshot
                 };
               };
               const { screenshot, ...page } = snapshot;
-              const png = new Uint8Array(Buffer.from(screenshot.data, "base64"));
+              const png = new Uint8Array(Buffer.from(screenshot?.data ?? "", "base64"));
               const screenshotPath =
                 payload?.save === true ? yield* saveScreenshot(snapshot.url, png) : undefined;
               // Images stay out of tool history unless asked for: providers replay them on every
@@ -554,11 +587,15 @@ const registerPreviewSnapshot = Effect.fn("McpHttpServer.registerPreviewSnapshot
               }
               const metadata = {
                 ...page,
-                screenshot: {
-                  mimeType: screenshot.mimeType,
-                  width: screenshot.width,
-                  height: screenshot.height,
-                },
+                ...(screenshot === undefined
+                  ? {}
+                  : {
+                      screenshot: {
+                        mimeType: screenshot.mimeType,
+                        width: screenshot.width,
+                        height: screenshot.height,
+                      },
+                    }),
                 ...(screenshotPath === undefined ? {} : { screenshotPath }),
               };
               const bounded = boundSnapshotMetadata(metadata);
@@ -584,7 +621,7 @@ const registerPreviewSnapshot = Effect.fn("McpHttpServer.registerPreviewSnapshot
                           text: `Snapshot text was bounded. Omitted: ${bounded.omitted.join("; ")}.`,
                         },
                       ]),
-                  ...(includeImage
+                  ...(includeImage && screenshot !== undefined
                     ? [{ type: "image" as const, data: png, mimeType: screenshot.mimeType }]
                     : []),
                 ],
@@ -858,6 +895,9 @@ const withToolAnalytics =
   Effect.fnUntraced(function* <A, E, R>(registration: Effect.Effect<A, E, R>) {
     const server = yield* McpServer.McpServer;
     const analytics = yield* Effect.serviceOption(AnalyticsService.AnalyticsService);
+    const largeRepliesForTools = yield* Effect.serviceOption(LargeReplyLog.LargeReplyLog);
+    const boardReplyReady = yield* ReplyReadiness.boardReadiness;
+    const controlReplyReady = yield* ReplyReadiness.controlReadiness;
     const registry = yield* Effect.serviceOption(ProviderRegistry.ProviderRegistry);
     const threads = yield* Effect.serviceOption(ThreadManagementService.ThreadManagementService);
     const shellOf = (threadId: string) =>
@@ -968,8 +1008,70 @@ const withToolAnalytics =
             Effect.fnUntraced(function* (payload) {
               const capture = yield* Effect.serviceOption(McpReplyCapture);
               if (Option.isSome(capture)) capture.value.name = options.tool.name;
+              const invocation = Option.getOrUndefined(
+                yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext),
+              );
+              // The shared tools/call span otherwise cannot be matched to a
+              // reporter after concurrent requests enter different service fibers.
+              yield* Effect.annotateCurrentSpan({
+                "mcp.tool.name": options.tool.name,
+                "mcp.caller.thread_id": invocation?.thread?.threadId ?? null,
+                "mcp.request.namespace": invocation?.requestNamespace ?? null,
+              });
               const startedAt = yield* Clock.currentTimeMillis;
-              return yield* options.handle(payload).pipe(
+              const rejection = { exceeded: false };
+              if (BOARD_READ_TOOLS.has(options.tool.name)) yield* boardReplyReady;
+              else if (options.tool.name === "list_scheduled_tasks") yield* controlReplyReady;
+              const result = options
+                .handle(payload)
+                .pipe(Effect.provideService(ReplyRejection, rejection));
+              // Large reads run on their own "mcp" lane (whole call, so at most
+              // PERMITS.mcp large results are built at once). They queue only behind
+              // each other, never behind control polls, lists or snapshots (10 Nov
+              // 2026: t3_thread_read held the shared agent lane up to 153 s).
+              const check = <A>(built: A): A | McpSchema.CallToolResult => {
+                // MCP repeats the result as text and structuredContent; leave envelope headroom.
+                if (!rejection.exceeded && !jsonExceedsBudget(built, MAX_REPLY_BYTES - 4096))
+                  return built;
+                if (Option.isSome(largeRepliesForTools))
+                  largeRepliesForTools.value.record({
+                    kind: "mcp",
+                    name: options.tool.name,
+                    bytes: MAX_REPLY_BYTES + 1,
+                    rejected: true,
+                  });
+                return new McpSchema.CallToolResult({
+                  isError: true,
+                  content: [{ type: "text", text: REPLY_TOO_LARGE }],
+                });
+              };
+              const completed = result.pipe(
+                (call) =>
+                  LARGE_READ_TOOLS.has(options.tool.name)
+                    ? ReplyBuilders.bounded(Effect.map(call, check), "mcp")
+                    : Effect.map(call, check),
+                Effect.catchCauseIf(
+                  (cause) =>
+                    cause.reasons.some(
+                      (reason) =>
+                        Cause.isDieReason(reason) && reason.defect instanceof ReplyTooLarge,
+                    ),
+                  () => {
+                    if (Option.isSome(largeRepliesForTools))
+                      largeRepliesForTools.value.record({
+                        kind: "mcp",
+                        name: options.tool.name,
+                        bytes: MAX_REPLY_BYTES + 1,
+                        rejected: true,
+                      });
+                    return Effect.succeed(
+                      new McpSchema.CallToolResult({
+                        isError: true,
+                        content: [{ type: "text", text: REPLY_TOO_LARGE }],
+                      }),
+                    );
+                  },
+                ),
                 Effect.onExit((exit) => {
                   const result = exit._tag === "Success" ? exit.value : undefined;
                   // A call that asks for input is retried with it, and that call is the one counted.
@@ -984,6 +1086,9 @@ const withToolAnalytics =
                   );
                 }),
               );
+              return yield* SavedBoardReply.TOOLS.has(options.tool.name)
+                ? SavedBoardReply.protect(completed, options.tool.name)
+                : completed;
             }),
         }),
     });
@@ -1057,6 +1162,16 @@ const layerContextResetToolkitRegistration = toolkitRegistration(
   ContextResetToolkit,
   ContextResetHandlers.layer,
 ).pipe(Layer.provide(ContextResetService.layer));
+const layerImessageSendToolkitRegistration = toolkitRegistration(
+  ImessageSendToolkit,
+  ImessageSendHandlers.layer,
+).pipe(
+  Layer.provide(
+    ImessageSendService.layer.pipe(
+      Layer.provide(Layer.mergeAll(ControlStore.layer, ImessageBridgeCli.layer)),
+    ),
+  ),
+);
 const layerScheduledTaskBlockRetryRegistration = toolkitRegistration(
   ScheduledTaskBlockRetry.ScheduledTaskBlockRetryToolkit,
   ScheduledTaskBlockRetry.layer,
@@ -1117,6 +1232,7 @@ export const layer = Layer.mergeAll(
   layerPreviewControlsRegistration,
   layerWorktreeToolkitRegistration,
   layerContextResetToolkitRegistration,
+  layerImessageSendToolkitRegistration,
   layerScheduledTaskBlockRetryRegistration,
   // ardud: missions board
   layerKanbanToolkitRegistration,
@@ -1124,3 +1240,8 @@ export const layer = Layer.mergeAll(
   layerDeviceToolkit,
   layerHtmlToolkit,
 ).pipe(Layer.provideMerge(layerMcpTransport));
+
+export const layerRedactionToolkit = toolkitRegistration(
+  RedactionTools.ThreadRedactionToolkit,
+  RedactionTools.layer,
+);

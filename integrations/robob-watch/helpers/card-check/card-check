@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/zsh -f
 # Compact-bubble acceptance checks for ride, delivery and quick cards. See cli.mjs --help.
 emulate -L zsh
 here=${0:A:h}

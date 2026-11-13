@@ -1,0 +1,8 @@
+[Unit]
+Description=offbox: join the tailnet (retried until it works)
+After=network.target tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/offbox-tailscale-join
+TimeoutStartSec=3min

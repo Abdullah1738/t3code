@@ -28,6 +28,8 @@ ORDER_CARD_LAST4=order_card.LAST4
 # Owner pause on all ordering: while this file exists, money commands refuse (exit 4).
 PAUSE_FILE=Path(os.environ.get('ORDERING_PAUSE_FILE') or Path.home()/'.local/state/ordering-paused')
 PAUSED_COMMANDS=frozenset({'order','test-talabat-shops','await-payment','marketplace-cart','cart','recover-payment'})
+# close-food-captured is excluded: it reads bank/order evidence and closes local
+# ownership only; it has no place, completion, payment or other remote send.
 EXIT_PAUSED=4
 # Only outcomes that clearly mean the card itself was refused.
 CARD_DECLINE_REASONS=frozenset({'PAYMENT_DECLINED_INSUFFICIENT_FUNDS_NO_RETRY',
@@ -155,6 +157,11 @@ def purchase_talabat(args):
     return result
 
 
+def talabat_retired_note():
+    import talabat_retired
+    return talabat_retired.MESSAGE
+
+
 def talabat_discovery(args):
     """Authenticated menu/choice reads, without opening or modifying a cart."""
     from dataclasses import asdict
@@ -194,7 +201,15 @@ def talabat_discovery(args):
 
 def capabilities():
     return {'ok':True,'currency':'AED','order_cap_minor':journal.ORDER_LIMIT_MINOR,
-        'campaign_cap_minor':journal.TOTAL_LIMIT_MINOR,'verticals':{
+        'campaign_cap_minor':journal.TOTAL_LIMIT_MINOR,
+        'selected_card':{'last4':order_card.LAST4,'network':order_card.NETWORK,'bank_app':order_card.BANK_APP},
+        'live_paid_proof_card':'2342',
+        'nownow_selected_card_purchase_enabled':order_card.LAST4 == '2342',
+        'nownow_9546_paid_live_proof':False,
+        'marketplace_card_selection':'requires matching default card in noon app',
+        'verticals':{
+        'noon.food':{'purchase_enabled':True,'payment':'automatic_saved_card_native_and_bank',
+            'cards':['9546','2342'],'explicit_payment_requirements':'needs_app','financial_retry':False},
         'noon.minutes':{'auth':'verified_cookie_revalidation','cart':'journalled_native',
             'place':'live_order_created','payment':'live_confirmed_e2e_paid_order_2026_10_10',
             'tracking':'exact_native','rejected_auth_renewal_proven':False,
@@ -211,7 +226,8 @@ def capabilities():
             'tracking':'exact_shipment_manifest_rocket_unit_binding','multi_item_baskets':True,
             'multi_item_cart_live_verified':True,'multi_item_purchase_live_verified':True},
         'noon.nownow':{'auth':'verified_cookie_revalidation','cart':'journalled_native',
-            'place':'live_order_created','payment':'saved_card_session_token_live_paid_2026_10_10',
+            'place':'journalled_single_send','payment':'exact_native_order_and_unique_bank_purchase',
+            'cvv':'journalled_preorder_verification','device_verification':'fail_closed',
             'tracking':'exact_native','multi_item_baskets':True,
             'multi_item_cart_live_verified':True,'multi_item_purchase_live_verified':True,
             'quiet_driver_note_live_verified':True},
@@ -231,7 +247,8 @@ def capabilities():
             'nested_subchoices_cart_live_verified':True,
             'nested_subchoices_purchase_live_verified':False,'multi_item_baskets':True,
             'multi_item_cart_live_verified':True,'multi_item_purchase_live_verified':True}},
-        'talabat_order_scope':'arbitrary_catalog_items_and_multiple_lines',
+        'talabat_order_scope':'retired_by_owner_2026_11_07',
+        'talabat_retired':talabat_retired_note(),
         'spending_policy':'caller_managed_no_cli_order_or_campaign_cap',
         'basket_input':'items_file_json_array_or_items_object_with_legacy_single_item_flags',
         'noon_session_recovery':'bounded_same_account_revalidation_and_peer_cookie_adoption',
@@ -242,7 +259,7 @@ def capabilities():
 
 def cvv_from_keychain():
     """Saved-card CVV from Keychain into RAM; never an argument, file or log line."""
-    command=['security','find-generic-password','-s','robob-card','-a','Marriott.card_cvc','-w']
+    command=['security','find-generic-password','-s','robob-card','-a',order_card.CVV_ACCOUNT,'-w']
     try:
         result=subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=15)
     except (OSError,subprocess.TimeoutExpired):
@@ -327,7 +344,7 @@ def order_minutes(args):
             journal.fail('MINUTES_AUTH_EXPIRED_NEEDS_APP_REBIND')
         raise
     with minutes_after_send(flow):
-        if payment['payment_status']=='payment_pending':
+        if payment['payment_status'] in ('payment_pending', 'payment_ready_to_redirect'):
             notify=telegram_3ds_notify(placed['order'],review['payable_minor'])
         elif payment['payment_status']=='payment_confirmed':
             # Captured flow always challenges, but a confirmed direct return is paid,
@@ -338,13 +355,15 @@ def order_minutes(args):
             journal.payment_fail('MINUTES_PAYMENT_NOT_PENDING',flow_id=flow.flow_id,order=flow.review.get('order'),
                                  amount_minor=flow.review.get('amount'))
         print(json.dumps({'flow_id':flow.flow_id,'phase':'owner_3ds_notified','notify':notify}),flush=True)
-        paid=flow.await_payment(wait_seconds=600,stall=telegram_stall_notify)
+        paid=flow.await_payment(wait_seconds=600,stall=telegram_stall_notify,open_redirect=True)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'payment_awaited','paid':paid['paid'],
             'payment_status':paid['payment_status'],'transaction_status':paid['transaction_status'],
             'authorized_minor':paid.get('authorized_minor'),'polls':paid['polls'],
             'timed_out':paid['timed_out']}),flush=True)
         if not paid['paid']:
             minutes_payment_fail(flow,paid)
+        if journal.inspect(flow.flow_id)['state'] == 'FENCED':
+            journal.reconcile_minutes_challenge(flow.flow_id, evidence_hash=journal.digest(paid))
     tracking=flow.verify_tracking()
     registration=flow.register_tracker(args.label,recipient=args.recipient)
     journal.complete(flow.flow_id)
@@ -363,6 +382,8 @@ def order_minutes(args):
 
 
 def order_nownow(args):
+    if not args.prepare_only and order_card.LAST4 == '9546':
+        journal.fail('NOWNOW_9546_PAID_CONTRACT_UNPROVEN')
     """Paid NowNow E2E replay of the captured contract (NNGAANNWEFJMZW8A).
 
     session/create -> edit-product -> validate guard -> edit-payment (saved
@@ -375,6 +396,9 @@ def order_nownow(args):
     items=input_items(args,id_argument='product_code',id_key='product_code')
     auth=CommerceAuth().noon
     if args.resume_flow:
+        if args.prepare_only and journal.inspect(args.resume_flow)['state'] == 'RELEASED':
+            from commerce_preorder_release import prepare_released
+            return prepare_released(args.resume_flow, store_code=args.store_code, items=items, auth=auth)
         flow=NowNowOrderFlow.resume_active(args.resume_flow,store_code=args.store_code,
             items=items,auth=auth)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'resumed'}),flush=True)
@@ -388,14 +412,32 @@ def order_nownow(args):
     if args.prepare_only:
         return verified
     try:
+        flow.prepare_payment(cvv_loader=cvv_from_keychain if args.cvv_from_keychain else None)
+    except journal.PaymentError as exc:
+        if str(exc) != 'NOWNOW_BANK_APPROVAL_OR_PAYMENT_PENDING':
+            raise
+        from commerce_preorder import await_payment
+        paid = await_payment(flow.flow_id, open_redirect=True)
+        if not paid['verification_confirmed']:
+            raise
+        # Bank approval may take minutes. Re-read the same reviewed basket
+        # before the one placement; no CVV/verification operation is replayed.
+        flow = NowNowOrderFlow.resume_active(flow.flow_id, store_code=args.store_code,
+            items=items, auth=auth)
+        flow.prepare_only()
+    try:
         placed=flow.place()
     except nownow_transport.NowNowError as exc:
         if exc.code in ('AUTH_EXPIRED','AUTH_FORBIDDEN'):
             journal.fail('NOWNOW_AUTH_EXPIRED_NEEDS_APP_REBIND')
         raise
     print(json.dumps({'flow_id':flow.flow_id,'phase':'placed','order':placed['order']}),flush=True)
-    tracking=flow.poll_tracking()
-    paid=flow.confirm_paid(tracking)
+    try:
+        tracking=flow.poll_tracking()
+        paid=flow.confirm_paid(tracking)
+    except Exception:
+        flow.register_tracker(args.label, recipient=args.recipient, paid=False)
+        raise
     registration=flow.register_tracker(args.label,eta=tracking.get('estimate'),recipient=args.recipient)
     journal.complete(flow.flow_id)
     return {'ok':True,'flow_id':flow.flow_id,'order':flow.order,
@@ -539,12 +581,17 @@ def await_payment_flow(args):
     tracking, watcher registration and journal completion.
     """
     binding = journal.binding(args.flow_id)
+    if binding['app'] == 'noon' and binding['vertical'] == 'nownow':
+        from commerce_preorder import await_payment
+        return await_payment(args.flow_id, open_redirect=args.open_redirect,
+                             notify=not args.no_notify, wait_seconds=args.minutes*60)
     if binding['app'] == 'noon' and binding['vertical'] in ('main', 'supermall'):
         from commerce_main_order import MainOrderFlow
         from commerce_supermall_order import SupermallOrderFlow
         from commerce_marketplace_payment import telegram_3ds_notify
         cls = MainOrderFlow if binding['vertical'] == 'main' else SupermallOrderFlow
         flow = cls.resume_payment(args.flow_id)
+        flow.open_redirect = args.open_redirect
         if journal.payment_reported(args.flow_id):
             if journal.inspect(args.flow_id)['state'] == 'FENCED':
                 journal.reconcile_marketplace_paid(args.flow_id,
@@ -572,13 +619,16 @@ def await_payment_flow(args):
         notify=None if args.no_notify else (lambda order,total:telegram_3ds_notify(order,total))
         stall=None if args.no_notify else telegram_stall_notify
         with minutes_after_send(flow):
-            paid=flow.await_payment(notify=notify,wait_seconds=args.minutes*60,stall=stall)
+            paid=flow.await_payment(notify=notify,wait_seconds=args.minutes*60,stall=stall,
+                                   open_redirect=args.open_redirect)
     with minutes_after_send(flow):
         print(json.dumps({'flow_id':args.flow_id,'phase':'payment_awaited','paid':paid['paid'],
             'payment_status':paid['payment_status'],'transaction_status':paid['transaction_status'],
             'polls':paid['polls'],'timed_out':paid['timed_out']}),flush=True)
         if not paid['paid']:
             minutes_payment_fail(flow,paid)
+        if journal.inspect(flow.flow_id)['state'] == 'FENCED':
+            journal.reconcile_minutes_challenge(flow.flow_id, evidence_hash=journal.digest(paid))
     tracking=flow.verify_tracking()
     if not flow.review.get('eta') and tracking.get('eta'):
         flow.review['eta']=tracking['eta']
@@ -601,6 +651,12 @@ def release_flow(args):
     from commerce_minutes import exact_failed_evidence
     binding=journal.binding(args.flow_id)
     local=journal.inspect(args.flow_id)
+    if binding['app']=='noon' and binding['vertical']=='nownow':
+        from commerce_preorder_release import release
+        return release(args.flow_id)
+    if binding['app']=='noon' and binding['vertical'] in ('food','main','supermall'):
+        # These lanes place before paying; no pre-order intent contract exists.
+        journal.fail('RELEASE_EXACT_ORDER_RECONCILIATION_REQUIRED')
     if binding['app']=='noon' and binding['vertical']=='minutes':
         if local['state']!='FENCED':
             journal.fail('RELEASE_FENCED_ONLY')
@@ -659,6 +715,12 @@ def track_exact(app, vertical, order):
     if vertical=='nownow':
         from commerce_nownow import reader
         return reader().track(order)
+    if vertical=='food':
+        from noon_vertical_reads import track
+        return track(order, 'food')
+    if vertical=='marketplace':
+        from native_orders import noon_marketplace_track
+        return noon_marketplace_track(order,15)
     journal.fail('INVALID_COMMERCE_VERTICAL')
 
 
@@ -693,6 +755,14 @@ def checkout_check(vertical):
 
 def review_contract(vertical):
     """Machine-readable native contract gaps, not synthetic financial approval."""
+    if vertical=='food':
+        from noon_food_financial import contract
+        return {'ok':True,'vertical':'food','review_engine':'commerce_food.FoodFlow.review',
+            'prepare_only':True,'purchase_enabled':True,'financial_send':False,
+            'binding':['account','Banyantree Hillside Flat 2104','address version','outlet','item quantities','modifier quantities','item notes',order_card.LAST4],
+            'quiet':['leavedoor','dontring','avoidcalling','driverNotes'],
+            'journal':'consume before each mutation; no resend of consumed operations; retained exact session readback',
+            'financial_contract':contract()}
     if vertical in ('main','supermall'):
         from noon_marketplace_native_shape import NATIVE_SHAPE,UNRESOLVED
         from noon_marketplace_invoice import NATIVE_ROLE_CONTRACT
@@ -822,7 +892,13 @@ def recover_talabat(flow_id, *, max_reads=90, recipient='owner'):
 
 def recover_payment(flow_id, *, max_reads=90, recipient='owner'):
     binding=journal.binding(flow_id)
+    if binding['app']=='noon' and binding['vertical']=='food':
+        from commerce_food import recover
+        return recover(flow_id)
     if binding['app']=='talabat':return recover_talabat(flow_id,max_reads=max_reads,recipient=recipient)
+    if binding['vertical']=='nownow' and journal.inspect(flow_id)['order_id']:
+        from commerce_nownow_capture import recover
+        return recover(flow_id, recipient=recipient)
     if binding['vertical']=='nownow' and journal.preorder_status(flow_id)['operations']:
         from commerce_preorder import recover
         return recover(flow_id)
@@ -877,6 +953,7 @@ def card_preflight(args):
             if journal.inspect(args.resume_flow)['order_id']:return None
         except Exception:
             pass
+    order_card.require_purchase_fallback()
     status=card_status.check(ORDER_CARD_LAST4)
     return status if status['blocked'] else None
 
@@ -946,7 +1023,7 @@ def main(argv=None):
     cart.add_argument('--expect-hash',dest='expect_hash',default=None,metavar='HASH',
         help='set: cart_hash from the last cart minutes show; refused if the cart changed since')
     clear=commands.add_parser('clear-cart',help='Clear an unchanged cart owned by a closed, cart-only noon flow')
-    clear.add_argument('vertical',choices=('minutes','main','supermall'))
+    clear.add_argument('vertical',choices=('minutes','main','supermall','nownow'))
     clear.add_argument('--flow',dest='flow_id',required=True)
     for name in ('menu','choices'):
         discovery=commands.add_parser(name,help='Read Talabat menu items or item choices; never changes a cart')
@@ -955,14 +1032,22 @@ def main(argv=None):
         if name=='choices':discovery.add_argument('--item',type=int,required=True)
     inspect=commands.add_parser('inspect');inspect.add_argument('flow_id')
     open_flows=commands.add_parser('open-flows',
-        help='Read-only: unsettled payments sent recently. A bank/3DS prompt while one is listed is ours')
-    open_flows.add_argument('--minutes',type=float,default=30.0)
+        help='Read-only: all unresolved account flows, including ACTIVE reviewed preparations')
+    open_flows.add_argument('--minutes',type=float,default=30.0,
+        help='legacy option; unresolved flows are shown regardless of age')
     recover=commands.add_parser('recover-payment');recover.add_argument('flow_id')
     recover.add_argument('--max-reads',type=int,default=90)
     recipient_argument(recover)
+    captured=commands.add_parser('close-food-captured', help='Close a delivered automatic Food capture from bank SMS evidence; never sends money')
+    captured.add_argument('flow_id')
+    captured.add_argument('--bank-msg-id', type=int, required=True)
+    captured.add_argument('--attested-by', choices=('owner',))
+    captured.add_argument('--confirm', action='store_true', help='Commit the evidenced close; omitted means validated dry run')
     track=commands.add_parser('track');track.add_argument('flow_id')
     exact=commands.add_parser('track-exact');exact.add_argument('app',choices=('noon','talabat'))
     exact.add_argument('vertical');exact.add_argument('order')
+    detail=commands.add_parser('order-details',help='Read exact noon merchandise, choices, notes and totals')
+    detail.add_argument('app',choices=('noon',));detail.add_argument('vertical');detail.add_argument('order')
     status=commands.add_parser('order-status');status.add_argument('flow_id')
     disposition=commands.add_parser('reconcile-order');disposition.add_argument('flow_id')
     disposition.add_argument('--close-duplicate',action='store_true',
@@ -984,7 +1069,7 @@ def main(argv=None):
     disposition.add_argument('--attested-by',choices=('owner',))
     cart=commands.add_parser('marketplace-cart');cart.add_argument('service',choices=('main','supermall'))
     preflight=commands.add_parser('checkout-check');preflight.add_argument('vertical',choices=('main','supermall','nownow','minutes'))
-    contract=commands.add_parser('review-contract');contract.add_argument('vertical',choices=('main','supermall','nownow'))
+    contract=commands.add_parser('review-contract');contract.add_argument('vertical',choices=('main','supermall','nownow','food'))
     auth=commands.add_parser('auth');auth.add_argument('app',choices=('noon','talabat'))
     auth.add_argument('vertical');maintenance=auth.add_mutually_exclusive_group()
     maintenance.add_argument('--recover',action='store_true');maintenance.add_argument('--reconcile',action='store_true')
@@ -993,6 +1078,11 @@ def main(argv=None):
     talabat_arguments(buy)
     order=commands.add_parser('order')
     order_commands=order.add_subparsers(dest='order_command',required=True)
+    food_order=order_commands.add_parser('food', help='Journalled Food automatic saved-card order; explicit payment requirements need app')
+    food_order.add_argument('--outlet-code',required=True)
+    food_order.add_argument('--items-file',required=True)
+    food_order.add_argument('--prepare-only',action='store_true')
+    food_order.add_argument('--resume-flow')
     talabat_order=order_commands.add_parser('talabat',
         help='Caller-authorized Talabat basket with per-item notes and menu choices')
     talabat_arguments(talabat_order)
@@ -1012,6 +1102,7 @@ def main(argv=None):
         help='Authorized NowNow paid order E2E: guard, session, validate, saved-card, quiet, place, tracking')
     basket_arguments(nownow_order,'--product-code')
     nownow_order.add_argument('--store-code',required=True)
+    nownow_order.add_argument('--cvv-from-keychain',action='store_true')
     nownow_order.add_argument('--label',default='Noon NowNow order')
     nownow_order.add_argument('--resume-flow',default=None,metavar='FLOW_UUID',
         help='continue an ACTIVE pre-place flow (24h window; exact session readback)')
@@ -1033,11 +1124,13 @@ def main(argv=None):
         help='continue an ACTIVE flow (pre-place basket readback within 24h, or read-only paid completion)')
     supermall_order.add_argument('--eta',default=None,metavar='ISO_DATE',
         help='absolute promise deliveryDate (with offset) for the watcher; paid resume only')
-    await_cmd=commands.add_parser('await-payment',help='Status-only payment/3DS continuation for Minutes, Main and Supermall')
+    await_cmd=commands.add_parser('await-payment',help='Payment status continuation, including NowNow verification')
     await_cmd.add_argument('flow_id')
     await_cmd.add_argument('--minutes',type=float,default=10.0)
     await_cmd.add_argument('--label',default='Noon order (payment resumed)')
     await_cmd.add_argument('--no-notify',action='store_true')
+    await_cmd.add_argument('--open-redirect',action='store_true',
+        help='authorize opening the retained NowNow bank challenge once in Dia Personal')
     recipient_argument(await_cmd)
     release=commands.add_parser('release-flow',
         help='Evidence-reviewed local release: failed Talabat quote with no financial send, or verified never-paid order')
@@ -1046,6 +1139,9 @@ def main(argv=None):
         help='Local close of eligible preparation with all sends observed, no financial ops and zero reserved')
     abandon.add_argument('flow_id')
     args=parser.parse_args(argv)
+    # Talabat retired by the owner (2026-11-07): refuse before pause, auth or network.
+    import talabat_retired
+    if talabat_retired.requested(args):return talabat_retired.refuse()
     # Owner pause first: nothing below (chat lookup, auth, network) runs while it holds.
     if args.command in PAUSED_COMMANDS and PAUSE_FILE.exists():
         print(json.dumps({'ok':False,'error':'ORDERING_PAUSED',
@@ -1091,7 +1187,10 @@ def main(argv=None):
                 result=cart_set(read_items(args.items_file),expect_hash=args.expect_hash,auth=CommerceAuth().noon,
                                 items_file=args.items_file)
         elif args.command=='clear-cart':
-            if args.vertical=='minutes':
+            if args.vertical=='nownow':
+                from commerce_nownow_cleanup import clear_cart
+                result=clear_cart(args.flow_id)
+            elif args.vertical=='minutes':
                 from commerce_minutes_cleanup import clear_cart
                 result=clear_cart(args.flow_id)
             else:
@@ -1104,6 +1203,9 @@ def main(argv=None):
         elif args.command=='test-talabat-shops':result=purchase_talabat(args)
         elif args.command=='order' and args.order_command=='talabat':result=purchase_talabat(args)
         elif args.command=='order' and args.order_command=='minutes':result=order_minutes(args)
+        elif args.command=='order' and args.order_command=='food':
+            from commerce_food import prepare
+            result=prepare(args)
         elif args.command=='order' and args.order_command=='nownow':result=order_nownow(args)
         elif args.command=='order' and args.order_command=='main':result=order_main(args)
         elif args.command=='order' and args.order_command=='supermall':result=order_supermall(args)
@@ -1114,7 +1216,7 @@ def main(argv=None):
         elif args.command=='open-flows':
             flows=journal.open_payments(since_seconds=max(0.0,args.minutes)*60)
             result={'ok':True,'open':flows,'financial_send':False,
-                    'bank_prompt':'ours: approve it' if flows else 'no open payment from us in this window'}
+                    'bank_prompt':'Check exact lane/card/amount; an open preparation is not a payment approval request.'}
         elif args.command=='recover-payment':
             result=recover_payment(args.flow_id,max_reads=args.max_reads,recipient=args.recipient)
             if isinstance(result,dict) and result.get('reason') in CARD_DECLINE_REASONS:
@@ -1127,6 +1229,9 @@ def main(argv=None):
                 # No decline row (receipt parked before it was journaled): treat it as now.
                 noted=note_card_decline(result,app='talabat',not_before=started,occurred_at=occurred)
                 if noted:result={**result,'card_status':noted}
+        elif args.command=='close-food-captured':
+            from commerce_food_capture import close
+            result=close(args, track_exact)
         elif args.command=='order-status':
             from commerce_order_status import status
             result=status(args.flow_id)
@@ -1165,6 +1270,9 @@ def main(argv=None):
         elif args.command=='checkout-check':result=checkout_check(args.vertical)
         elif args.command=='review-contract':result=review_contract(args.vertical)
         elif args.command=='track-exact':result=track_exact(args.app,args.vertical,args.order)
+        elif args.command=='order-details':
+            from noon_order_details import details
+            result=details(args.order,args.vertical)
         elif args.command=='auth':
             manager=CommerceAuth()
             if args.diagnose_readonly:
@@ -1187,7 +1295,8 @@ def main(argv=None):
                               'financial_send':False,'financial_retry':False}))
             return 1
         from commerce_minutes_cart import OutcomeUnverified
-        if isinstance(exc,OutcomeUnverified):
+        from commerce_nownow_cleanup import CleanupUnverified
+        if isinstance(exc,(OutcomeUnverified,CleanupUnverified)):
             print(json.dumps({'ok':False,'error':exc.code,**exc.details,'financial_retry':False}))
             return 1
         code=str(exc)
@@ -1199,6 +1308,17 @@ def main(argv=None):
         if not re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}',code):code='COMMERCE_OPERATION_FAILED'
         # A sent payment that didn't confirm: say whether a no-charge is proven, never assume it.
         details=exc.details if isinstance(exc,journal.PaymentError) else {}
+        if code == 'COMMERCE_OPERATION_FAILED':
+            # Exception messages may contain credentials or raw provider responses.
+            cause = exc.__cause__ or exc
+            tb = cause.__traceback__
+            while tb and tb.tb_next:
+                tb = tb.tb_next
+            details = {**details, 'cause': type(cause).__name__}
+            if tb:
+                details['location'] = {'file': Path(tb.tb_frame.f_code.co_filename).name,
+                                       'function': tb.tb_frame.f_code.co_name,
+                                       'line': tb.tb_lineno}
         print(json.dumps({'ok':False,'error':code,**details,'financial_retry':False}))
         return 1
 

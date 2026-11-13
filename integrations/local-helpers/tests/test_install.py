@@ -92,6 +92,18 @@ exit 0
         r = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=120)
         return r.returncode, r.stdout, r.stderr
 
+    def test_dry_run_with_node_hook_and_no_uber_or_lock(self):
+        helper = os.path.join(self.pkg, "libexec/repo-node-pin")
+        with open(os.path.join(self.home, ".zshenv"), "w") as fh:
+            fh.write('. "$ROBOB_REPO_NODE_HELPER/init.sh"\n')
+        argv, env = self.argv_env(["--dry-run"])
+        env["ROBOB_REPO_NODE_HELPER"] = helper
+        result = subprocess.run(argv, cwd=self.home, env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("update ", result.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local/bin/qcard")))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local/state/local-helpers")))
+
     def start_install(self, *args, **opts):
         argv, env = self.argv_env(args, **opts)
         return subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -126,12 +138,22 @@ exit 0
         self.assertEqual(rc, 0, err)
         for rel in (".local/libexec/mail/mail_oauth.py", ".local/libexec/mail/kc-read",
                     ".local/libexec/card-preview/cardpreview.py", ".local/libexec/qcard/render.py",
-                    ".local/bin/qcard", ".local/bin/himalaya-heal", ".local/bin/mailsearch",
-                    "Library/LaunchAgents/local.ardud.otp-idle.plist"):
+                    ".local/bin/qcard", ".local/bin/quint", ".local/bin/himalaya-heal", ".local/bin/mailsearch",
+                    "Library/LaunchAgents/local.ardud.otp-idle.plist",
+                    ".local/bin/robob-read-watchdog",
+                    "Library/LaunchAgents/com.ardud.robob-read-watchdog.plist",
+                    ".local/bin/mirage-beacon-keepalive", ".local/libexec/mirage/clients.py",
+                    ".local/libexec/mirage/restart.sh",
+                    "Library/LaunchAgents/com.ardud.mirage-beacon-keepalive.plist"):
             self.assertTrue(os.path.isfile(self.live(rel)), rel)
         self.assertTrue(os.access(self.live(".local/bin/qcard"), os.X_OK))
+        self.assertTrue(os.access(self.live(".local/bin/quint"), os.X_OK))
         loads = [c for c in self.calls_log() if c.startswith("bootstrap")]
-        self.assertEqual(len(loads), 11, self.calls_log())
+        self.assertEqual(len(loads), 13, self.calls_log())
+        self.assertTrue(os.access(self.live(".local/bin/mirage-beacon-keepalive"), os.X_OK))
+        self.assertFalse(os.path.exists(self.live(".local/state/mirage-beacon-keepalive")))
+        self.assertTrue(os.access(self.live(".local/bin/robob-read-watchdog"), os.X_OK))
+        self.assertTrue(os.path.isdir(self.live(".local/state/robob-read-watchdog")))
         for rel in (".local/share/juno-proxy/juno_proxy.py", ".local/bin/power-unplug-telegram.sh",
                     ".local/bin/battery-low-telegram.sh", ".local/share/lydia-ticks/server.ts",
                     ".local/share/lydia-ticks/tunnel.sh"):
@@ -350,8 +372,8 @@ exit 0
         self.assertEqual(sorted(os.listdir(self.loaded)),
                          ["com.abdullah.juno-proxy", "com.ardud.battery-low-telegram", "com.ardud.cards-health",
                           "com.ardud.cards-tunnel", "com.ardud.lydia-ticks-server",
-                          "com.ardud.lydia-ticks-tunnel", "com.ardud.opencode-web",
-                          "com.ardud.power-unplug-telegram",
+                          "com.ardud.lydia-ticks-tunnel", "com.ardud.mirage-beacon-keepalive", "com.ardud.opencode-web",
+                          "com.ardud.power-unplug-telegram", "com.ardud.robob-read-watchdog",
                           "local.ardud.mail-token-refresh", "local.ardud.otp-idle", "local.ardud.otp-watch"])
 
     def test_modes_are_checked_and_repaired_on_their_own(self):

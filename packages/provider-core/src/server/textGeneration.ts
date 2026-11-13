@@ -100,6 +100,11 @@ export interface JsonGenerationInput<S extends Schema.Top> {
   prompt: string;
   outputSchema: S;
   modelSelection: ModelSelection;
+  /**
+   * Wall-clock limit for the provider CLI run, in milliseconds. Left out, the driver's own
+   * default applies. `null` sets no limit; the run still ends when its fiber is interrupted.
+   */
+  timeoutMs?: number | null | undefined;
 }
 
 export interface ProviderTextGeneration {

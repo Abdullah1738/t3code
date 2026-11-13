@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
+import sys
+from time import monotonic, sleep
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .common import HOME, OffboxError, db, kv_get, kv_set, log, now
+from . import common
+from .common import HOME, OffboxError, db, kv_get, kv_set, log, now, say
 
 # offbox's own component credential first, the old shared file last.
 CTL_CFGS = (HOME / ".robob/components/offbox.json", HOME / ".robob/ardud-control.json")
@@ -23,7 +28,53 @@ BUN = str(HOME / ".bun/bin/bun")
 TG_CLI = str(HOME / ".local/share/telegram-bridge/src/cli.ts")
 
 
-def ctl(method: str, path: str, body: dict | None = None, timeout: int = 10):
+_CONTROL_GET = """
+import json, sys, urllib.request, urllib.error
+config = json.load(sys.stdin)
+request = urllib.request.Request(config["url"], headers={
+    "Authorization": "Bearer " + config["token"], "Content-Type": "application/json"})
+def reply(status, body):
+    print(json.dumps([status, body]), flush=True)
+try:
+    with urllib.request.urlopen(request, timeout=config["timeout"]) as response:
+        reply(response.status, json.load(response))
+except urllib.error.HTTPError as error:
+    if 400 <= error.code < 500:
+        reply(error.code, {})
+    else:
+        try:
+            body = json.load(error)
+        except Exception:
+            body = {}
+        reply(error.code, body)
+    error.close()
+except Exception:
+    reply(0, {"error": "control request failed"})
+"""
+
+
+def _bounded_control_get(url: str, token: str, timeout: float):
+    # Bound the entire request, including DNS and a trickling body, without leaving a reader thread.
+    # Credentials travel on stdin; 4xx status is reported before reading an optional error body.
+    try:
+        response = subprocess.run([sys.executable, "-I", "-c", _CONTROL_GET],
+                                  input=json.dumps({"url": url, "token": token, "timeout": timeout}),
+                                  capture_output=True, text=True, timeout=timeout)
+        return json.loads(response.stdout)
+    except subprocess.TimeoutExpired as error:
+        # A complete refusal remains authoritative if the worker was interrupted while closing it.
+        try:
+            status, body = json.loads(error.output or "")
+            if isinstance(status, int) and 400 <= status < 500:
+                return status, body
+        except (ValueError, TypeError):
+            pass
+        return 0, {"error": "control request exceeded its deadline"}
+    except Exception:  # noqa: BLE001
+        return 0, {"error": "control request failed"}
+
+
+def ctl(method: str, path: str, body: dict | None = None, timeout: float = 10, *, whole_response: bool = False):
     """Robob control API. Returns (http_status, json); status 0 = unreachable."""
     cfg_file = next((p for p in CTL_CFGS if p.exists()), CTL_CFGS[0])
     try:
@@ -33,6 +84,10 @@ def ctl(method: str, path: str, body: dict | None = None, timeout: int = 10):
     except Exception as e:  # noqa: BLE001
         return 0, {"error": f"control config unreadable: {e}"}
     url = cfg["url"].rstrip("/") + "/api/ardud/control" + path
+    if whole_response:
+        if method != "GET" or body is not None:
+            return 0, {"error": "bounded control lookup requires GET without a body"}
+        return _bounded_control_get(url, cfg["token"], timeout)
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers={
         "Authorization": "Bearer " + cfg["token"], "Content-Type": "application/json"})
@@ -78,12 +133,13 @@ def opencode_session(ses: str) -> dict | None:
         return None
 
 
-def telegram(text: str, key: str, severity: str = "info") -> bool:
+def telegram(text: str, key: str, severity: str = "info", burst_key: str | None = None) -> bool:
     env = dict(os.environ)
     env.pop("BUN_INSPECT", None)
     try:
         p = subprocess.run([BUN, TG_CLI, "notify", "--source", "offbox", "--severity", severity,
-                            "--text", text[:4000], "--key", key[:200]],
+                            "--text", text[:4000], "--key", key[:200],
+                            *(["--burst-key", burst_key] if burst_key else [])],
                            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=40)
         ok = p.returncode == 0
     except Exception:  # noqa: BLE001
@@ -99,11 +155,12 @@ ENV_DRIVERS = (
     ("CODEX_THREAD_ID", "codex"),  # the concrete thread; CODEX_SESSION_ID is shared by children
     ("OPENCODE_SESSION_ID", "opencode"),
 )
-# A resolved answer is stable for an hour. An unresolved one (a new provider thread still pending its
-# native id, or a control outage) is held only for a short burst, so the next attempt asks C1 again
-# and picks the mapping up as soon as it lands (well inside the 60 s the card requires).
+# Keep confirmed mappings warm; pending mappings must be checked again within this invocation.
 RESOLVED_TTL = 3600
+STALE_RESOLVED_MAX = 86400
 UNRESOLVED_TTL = 5
+IDENTITY_WAIT = 60
+IDENTITY_POLL = 2.5
 
 
 def caller_native() -> tuple[str | None, str | None]:
@@ -120,14 +177,53 @@ def caller_native() -> tuple[str | None, str | None]:
     return None, None
 
 
+def _resolve_identity(path: str, on_pending: Callable[[dict], None]) -> tuple[int, dict]:
+    # A reader restart can fail even an established mapping. Retry that transport failure separately
+    # from pending proof; a successful unknown/ambiguous answer must still refuse immediately.
+    deadline = monotonic() + IDENTITY_WAIT
+    timeout = min(10, IDENTITY_WAIT)
+    transport_retried = False
+    last_pending = None
+    while True:
+        status, body = ctl("GET", path, timeout=timeout, whole_response=True)
+        if not isinstance(body, dict):
+            body = {}
+        answer = body.get("identity")
+        pending = status == 200 and isinstance(answer, dict) and answer.get("resolution") == "pending"
+        if pending:
+            if last_pending is None:
+                on_pending(answer)
+            last_pending = body
+        if pending:
+            pause, next_timeout = IDENTITY_POLL, 10
+        elif (status == 0 or status >= 500) and not transport_retried:
+            # Keep #626's single transport retry; pending polling shares its overall deadline.
+            transport_retried = True
+            pause, next_timeout = 1.5, 20
+        else:
+            return (200, last_pending) if last_pending is not None and (status == 0 or status >= 500) else (status, body)
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        sleep(min(pause, remaining))
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        timeout = min(next_timeout, remaining)
+    # Pending invalidates an older proof. A later outage must not restore that cached owner.
+    return (200, last_pending) if last_pending is not None else (status, body)
+
+
 def identity_for(native: str, driver: str) -> dict:
-    """C1's resolution for one native id. Resolved answers last an hour; anything else, a minute.
+    """C1's resolution for one native id, with a last resolved answer during control outages.
 
     A pending or unavailable answer is never reported as unowned: callers treat it as "not yet".
     """
     con = db()
     key = f"identity:{driver}:{native}"
     row = con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()
+    cached = None
+    age = 0
     if row:
         try:
             cached = json.loads(row["v"])
@@ -137,16 +233,71 @@ def identity_for(native: str, driver: str) -> dict:
         if isinstance(cached, dict):
             if cached.get("resolution") == "resolved" and age <= RESOLVED_TTL:
                 return cached
-            if cached.get("resolution") != "resolved" and age <= UNRESOLVED_TTL:
+            if cached.get("resolution") not in ("resolved", "pending") and age <= UNRESOLVED_TTL:
                 return cached
-    st, d = ctl("GET", f"/identity/resolve?nativeId={q(native)}&driver={q(driver)}")
+    path = f"/identity/resolve?nativeId={q(native)}&driver={q(driver)}"
+
+    def invalidate_proof(answer):
+        nonlocal cached
+        cached = {**answer, "driver": driver, "nativeId": native}
+        kv_set(con, key, cached)
+
+    st, d = _resolve_identity(path, invalidate_proof)
+    had_resolved = isinstance(cached, dict) and cached.get("resolution") == "resolved"
     if st == 200 and isinstance(d.get("identity"), dict):
         ident = dict(d["identity"])
     else:
+        # Only short reason fields belong in diagnostics, never the response body or headers.
+        error = d.get("error")
+        reason = error.get("message") or error.get("reason") if isinstance(error, dict) else error
+        err = next((v for v in (d.get("errorDetail"), reason, d.get("message"), d.get("reason"))
+                    if isinstance(v, str) and v), "no error detail")
+        detail = f"status={st} {' '.join(err.split())[:120]}"
+        if row:
+            age = now() - (row["ts"] or 0)
+        if (st == 0 or st >= 500) and had_resolved and age <= STALE_RESOLVED_MAX:
+            log(f"identity resolve failed for {driver} {native[:8]} ({detail}); "
+                f"using last resolved identity from {age:.0f}s ago")
+            return cached
+        log(f"identity resolve failed for {driver} {native[:8]}: {detail}")
         ident = {"resolution": "unavailable", "robobThreadId": None, "parentThreadId": None,
                  "executionKind": None, "acceptsMessages": False, "candidates": []}
+        if st != 200:
+            ident["lookupError"] = detail
     ident.update(driver=driver, nativeId=native)
-    kv_set(con, key, ident)
+    # A failed lookup must not erase a confirmed mapping or refresh its timestamp.
+    if st == 200 or not had_resolved:
+        kv_set(con, key, ident)
+    return ident
+
+
+HOOKS_SRC = HOME / ".local/share/harness-hooks/src"
+
+
+def claude_command_identity() -> dict | None:
+    """The exact execution behind this Claude shell, from the harness hook's signed per-command context.
+
+    The PreToolUse hook signs {session, agent_id} into HARNESS_HOOKS_COMMAND_IDENTITY for every Bash call it
+    rewrites, so a native child (agent_id set) is told apart from its parent (no agent_id) even though they share
+    CLAUDE_CODE_SESSION_ID. A missing, damaged or foreign token gives None, and the caller stays unresolved.
+    """
+    if not os.environ.get("HARNESS_HOOKS_COMMAND_IDENTITY"):
+        return None
+    import sys
+    src = os.environ.get("HARNESS_HOOKS_SRC") or str(HOOKS_SRC)
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        import engine  # type: ignore[import-not-found]
+        parsed = engine.command_identity_from_env()
+        if not parsed or parsed[0] != "claude":
+            return None
+        ident = engine.resolve_identity(parsed[1], "claude")
+    except Exception as error:  # noqa: BLE001
+        log(f"claude command identity unavailable: {type(error).__name__}")
+        return None
+    if not isinstance(ident, dict) or ident.get("resolution") != "resolved" or not ident.get("robobThreadId"):
+        return None
     return ident
 
 
@@ -191,19 +342,71 @@ def repo_root(cwd: str | None = None) -> Path:
     return Path(cwd).resolve()
 
 
+def normalize_repo_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:40] or "repo"
+
+
+def repo_key_db():
+    """Checkout identity belongs to the Mac, so a home/Boat failover must share its cache."""
+    common.ensure_dirs()
+    con = sqlite3.connect(common.STATE / "repo-keys.db", timeout=5)
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT, ts REAL)")
+        return con
+    except BaseException:
+        con.close()
+        raise
+
+
 def repo_key(root: Path) -> str:
-    """Stable short name for a repo: basename of the origin URL (or dir) + 6-char hash of the path."""
-    name = root.name
+    """Remember the last successful origin lookup per resolved checkout, without caching a guessed name."""
+    root = root.resolve()
+    cache_key = "repo_key:" + str(root)
+    con, remembered = None, None
+    name, reason = None, None
     try:
         p = subprocess.run(["git", "config", "--get", "remote.origin.url"], cwd=root, capture_output=True,
                            text=True, timeout=5)
         url = p.stdout.strip()
-        if url:
-            name = re.sub(r"\.git$", "", url.rstrip("/").split("/")[-1].split(":")[-1]) or name
+        if p.returncode != 0:
+            reason = "error"
+        elif url:
+            name = re.sub(r"\.git$", "", url.rstrip("/").split("/")[-1].split(":")[-1])
+            if not name:
+                reason = "empty"
+        else:
+            reason = "empty"
+    except subprocess.TimeoutExpired:
+        reason = "timeout"
     except Exception:  # noqa: BLE001
-        pass
-    name = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:40] or "repo"
-    return name
+        reason = "error"
+    try:
+        # Another lookup can commit the origin key while this one waits on git.
+        try:
+            con = repo_key_db()
+            remembered = kv_get(con, cache_key)
+            if not isinstance(remembered, str) or not remembered:
+                remembered = None
+        except (OSError, sqlite3.Error) as error:
+            log(f"repo_key_cache_error {root} operation=read error={type(error).__name__}")
+        if reason:
+            used = remembered or normalize_repo_name(root.name)
+            log(f"repo_key_fallback {root} reason={reason} used={used}")
+            if remembered is None:
+                say(f"warning: origin lookup failed ({reason}) for {root}; no remembered pool key, using {used}")
+            return used
+        key = normalize_repo_name(name)
+        if con is not None and key != remembered:
+            try:
+                kv_set(con, cache_key, key)
+            except (OSError, sqlite3.Error) as error:
+                log(f"repo_key_cache_error {root} operation=write error={type(error).__name__}")
+        return key
+    finally:
+        if con is not None:
+            con.close()
 
 
 def _ancestors(thread_id: str) -> set[str]:
@@ -229,9 +432,21 @@ def _ancestors(thread_id: str) -> set[str]:
 PERSON_OWNER_PREFIX = "person:"
 
 
-def _explicit_thread(resolved_thread: str | None) -> str | None:
+CLAUDE_NATIVE_CHILD = "provider-native-child"
+
+
+def claude_native_child(me: dict) -> bool:
+    """A Claude in-process child: it shares its parent's session id and its whole process env."""
+    return me.get("driver") == "claudeAgent" and me.get("executionKind") == CLAUDE_NATIVE_CHILD
+
+
+def _explicit_thread(resolved_thread: str | None, driver: str | None = None,
+                     execution_kind: str | None = None) -> str | None:
     """OFFBOX_THREAD is an inherited shell value, so it only counts when it names the caller's
-    own execution or one of its ancestors. An unrelated parent's value is ignored and logged."""
+    own execution or one of its ancestors. An unrelated parent's value is ignored and logged.
+
+    A Claude in-process child shares the parent's process env, so an ancestor's OFFBOX_THREAD reaches it by
+    inheritance, not as its own choice. Such a child accepts the value only when it names the child itself."""
     explicit = os.environ.get("OFFBOX_THREAD") or None
     if explicit is None:
         return None
@@ -240,7 +455,12 @@ def _explicit_thread(resolved_thread: str | None) -> str | None:
     if resolved_thread is None:
         log("OFFBOX_THREAD ignored: the caller has no resolved Robob thread")
         return None
-    if explicit == resolved_thread or explicit in _ancestors(resolved_thread):
+    if explicit == resolved_thread:
+        return explicit
+    if driver == "claudeAgent" and execution_kind == CLAUDE_NATIVE_CHILD:
+        log(f"OFFBOX_THREAD ignored: {explicit} is not this Claude native child's own thread")
+        return None
+    if explicit in _ancestors(resolved_thread):
         return explicit
     log(f"OFFBOX_THREAD ignored: {explicit} is not this execution or an ancestor")
     return None
@@ -266,22 +486,33 @@ def whoami(cwd: str | None = None) -> dict:
         me["session"] = native
         ident = identity_for(native, driver)
         me["resolution"] = ident.get("resolution")
+        me["lookupError"] = ident.get("lookupError")
         me["executionKind"] = ident.get("executionKind")
         me["acceptsMessages"] = ident.get("acceptsMessages")
         # A Claude shell carries only its session id, which a native child shares with its parent. C1 answers a
         # bare Claude id with the parent's identity, so taking that answer would let a child own the parent's
         # leases. Claude callers therefore never take a resolved owner; they keep their own unresolved owner.
         if driver == "claudeAgent":
-            log(f"claude caller {native[:8]}: no per-agent id in the shell, so no resolved owner is taken")
-            me["resolution"] = "unresolved"
+            exact = claude_command_identity()
+            if exact is not None:
+                me["resolution"] = "resolved"
+                me["executionKind"] = exact.get("executionKind")
+                me["acceptsMessages"] = exact.get("acceptsMessages")
+                me["thread"] = exact.get("robobThreadId")
+                me["manager"] = exact.get("parentThreadId")
+                me["parent"] = exact.get("parentThreadId")
+            else:
+                log(f"claude caller {native[:8]}: no signed per-command identity, so no resolved owner is taken")
+                me["resolution"] = "unresolved"
         elif ident.get("resolution") == "resolved":
             me["thread"] = ident.get("robobThreadId")
             me["manager"] = ident.get("parentThreadId")
             me["parent"] = ident.get("parentThreadId")
         else:
             # Not yet (pending), ambiguous or unavailable: never the unowned local owner.
-            log(f"caller {driver} {native[:8]} unresolved: {ident.get('resolution')}")
-        explicit = _explicit_thread(me["thread"])
+            detail = f" ({me['lookupError']})" if me.get("lookupError") else ""
+            log(f"caller {driver} {native[:8]} unresolved: {ident.get('resolution')}{detail}")
+        explicit = _explicit_thread(me["thread"], driver, me["executionKind"])
         if explicit is not None:
             me["thread"] = explicit
     me["owner"] = me["thread"] or f"local:{root}"
@@ -306,10 +537,19 @@ def require_proven(me: dict, action: str) -> None:
     must never reach a selector, where it would silently match nothing or the wrong caller's rows.
     """
     if not me.get("proven", True):
+        if me.get("resolution") == "unavailable" and me.get("lookupError"):
+            raise OffboxError(
+                f"{action} refused: this {me.get('driver')} caller can't be proven to be one Robob execution. "
+                f"Robob's control API didn't answer the caller lookup ({me['lookupError']}). "
+                f"Robob may be busy or restarting. Retry in ~30 s. Nothing was changed.", code=2)
+        if me.get("driver") == "claudeAgent":
+            raise OffboxError(
+                f"{action} refused: Claude identity can't be proven because the hook couldn't reach the Robob control API to sign this command. "
+                "Retry in a moment. Nothing was changed.", code=2)
         raise OffboxError(
             f"{action} refused: this caller ({me.get('driver')}) can't be proven to be one Robob execution yet "
-            f"(resolution={me.get('resolution') or 'none'}). A Claude shell shares its session id with its native "
-            f"children, and a pending thread isn't mapped yet. Use a resolved Codex or OpenCode thread, or retry in "
+            f"(resolution={me.get('resolution') or 'none'}). A Claude shell without the hook's signed per-command "
+            f"identity can't be told apart from its native children, and a pending thread isn't mapped yet. Use a resolved Codex or OpenCode thread, or retry in "
             f"a few seconds. Nothing was changed.", code=2)
 
 

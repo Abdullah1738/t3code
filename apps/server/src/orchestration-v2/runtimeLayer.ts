@@ -1,3 +1,4 @@
+import * as DelegatedTaskProgressGuard from "./DelegatedTaskProgressGuard.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Layer from "effect/Layer";
@@ -42,6 +43,10 @@ import * as CommandOutputHub from "./CommandOutputHub.ts";
 import * as ProviderRuntimeRecoveryService from "./ProviderRuntimeRecoveryService.ts";
 import * as ProviderSwitchService from "./ProviderSwitchService.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
+import * as RestartPacing from "../ardud/restart-pacing/RestartPacing.ts";
+import * as RestartPacingState from "../ardud/restart-pacing/RestartPacingState.ts";
+import * as ControlStore from "../ardud/control/ControlStore.ts";
+import * as KanbanStore from "../ardud/kanban/store/KanbanStore.ts";
 import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
@@ -320,9 +325,28 @@ const layerThreadTitleRegenerationProvided = ThreadTitleRegenerationService.laye
     Layer.mergeAll(layerThreadManagementProvided, ProjectStore.layer, TextGeneration.layer),
   ),
 );
+const layerRestartPacingProvided = RestartPacing.layer.pipe(
+  Layer.provide(
+    RestartPacingState.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ProjectionStore.layer,
+          ProjectStore.layer,
+          layerEventSinkProvided,
+          IdAllocator.layer,
+          EffectOutbox.layer,
+          ThreadCommandExecutor.layer,
+          ControlStore.layer,
+          KanbanStore.layer,
+        ),
+      ),
+    ),
+  ),
+);
 const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
   Layer.provide(
     Layer.mergeAll(
+      layerRestartPacingProvided,
       layerRunFinalizationServiceProvided,
       layerCheckpointRollbackServiceProvided,
       layerProviderSessionManagerProvided,
@@ -346,6 +370,7 @@ const layerProviderRuntimeRecoveryProvided = ProviderRuntimeRecoveryService.laye
       IdAllocator.layer,
       ProjectionStore.layer,
       StaleRuns.layer,
+      layerRestartPacingProvided,
     ),
   ),
 );
@@ -366,6 +391,9 @@ export const layer = Layer.mergeAll(
   layerOrchestratorProvided,
   layerMcpAppRequestsProvided,
   layerThreadManagementProvided,
+  DelegatedTaskProgressGuard.layer.pipe(
+    Layer.provide(Layer.mergeAll(layerOrchestratorProvided, layerThreadManagementProvided)),
+  ),
   layerEffectWorkerProvided,
   layerProviderSessionManagerProvided,
   layerProviderAuthServiceProvided,

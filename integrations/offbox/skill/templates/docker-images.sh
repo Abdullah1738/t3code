@@ -6,7 +6,7 @@
 #
 # Boot-time race: a unit enabled on a box only takes effect on its NEXT boot. A fork boots straight from the
 # snapshot, so the unit must already be enabled in that snapshot (it is: this script enables it before the fork).
-# offbox-wait-images also does the load itself if the unit didn't run, so a run never sees missing images.
+# The run preamble can load missing images itself if the unit didn't finish; its wait is bounded.
 set -euo pipefail
 A=/home/user/.offbox/images/saved.tar.zst
 command -v docker >/dev/null || exit 0

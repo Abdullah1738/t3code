@@ -40,6 +40,7 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as BoardsDatabase from "../ardud/persistence/BoardsDatabase.ts";
 
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
@@ -47,12 +48,12 @@ import * as Metrics from "../observability/Metrics.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
+import { isSameSchedule, nextScheduledRunAt } from "./Schedule.ts";
 import {
-  isExpiredOnceRun,
-  isMissedFixedTimeRun,
-  isSameSchedule,
-  nextScheduledRunAt,
-} from "./Schedule.ts";
+  allowsLateRun,
+  lateRunDeadline,
+  missedSlotGraceMs,
+} from "../ardud/schedules/scheduleMath.ts";
 import { ONCE_IN_PAST_MESSAGE, onceRunInPast } from "../ardud/schedules/onceTasks.ts";
 // ardud schedules: run status follows the work a run started.
 import {
@@ -74,6 +75,7 @@ const WEBHOOK_DELIVERY_RETENTION = 50;
 const WEBHOOK_DELIVERY_LOG_BODY_LIMIT = 64 * 1024;
 const WEBHOOK_DELIVERY_LOG_PROMPT_LIMIT = 64 * 1024;
 const WEBHOOK_MAX_QUEUED_PER_TASK = 20;
+const MISSED_SLOT_REASON = "Robob unavailable at the scheduled slot.";
 /** Accepted deliveries per task per minute, enforced here as well as on the relay because the tunnel hostname is public too. */
 const WEBHOOK_RATE_LIMIT_PER_MINUTE = 60;
 
@@ -151,6 +153,9 @@ const decodeTaskId = Schema.decodeUnknownOption(ScheduledTaskId);
 const decodeScheduleJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ScheduledTask.fields.schedule),
 );
+const encodeScheduleJson = Schema.encodeEffect(
+  Schema.fromJsonString(ScheduledTask.fields.schedule),
+);
 const decodeWorkspaceStrategyJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ScheduledTask.fields.workspaceStrategy),
 );
@@ -187,6 +192,16 @@ interface ScheduledTaskRow {
   readonly run_count: number;
   readonly webhook_token: string | null;
   readonly webhook_secret: string | null;
+}
+
+interface UnsentSlot {
+  readonly task: Pick<ScheduledTask, "id" | "createdAt" | "lastRunAt" | "schedule" | "runCount">;
+  readonly startedAtIso: string;
+  readonly slotAt: string;
+}
+
+function unsentSlotKey(taskId: string, createdAt: string, startedAtIso: string) {
+  return `${taskId}:${createdAt}:${startedAtIso}`;
 }
 
 interface WebhookDeliveryRow {
@@ -277,7 +292,10 @@ function nextRunAt(
   // A stored interval can decode yet overflow the representable DateTime
   // range; an unrepresentable occurrence means the task has no next run.
   try {
-    const next = nextScheduledRunAt(task.schedule, from);
+    const next = nextScheduledRunAt(
+      task.schedule,
+      DateTime.setZone(from, DateTime.zoneMakeLocal()),
+    );
     return next !== null && Number.isFinite(DateTime.toEpochMillis(next)) ? iso(next) : null;
   } catch {
     return null;
@@ -353,7 +371,7 @@ const decodeRow = Effect.fnUntraced(
 export const listDueTasks = Effect.fn("ScheduledTaskService.listDueTasks")(function* (
   now: DateTime.DateTime,
 ) {
-  const sql = yield* SqlClient.SqlClient;
+  const sql = yield* BoardsDatabase.client;
   // ardud schedules: a dispatched run that is only being followed doesn't
   // block the next occurrence, same as upstream's dispatch-time success.
   yield* ensureRunFollowTables(sql);
@@ -395,7 +413,7 @@ export const listDueTasks = Effect.fn("ScheduledTaskService.listDueTasks")(funct
 export const layer = Layer.effect(
   ScheduledTaskService,
   Effect.gen(function* () {
-    const sql = yield* SqlClient.SqlClient;
+    const sql = yield* BoardsDatabase.client;
     const crypto = yield* Crypto.Crypto;
     const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
@@ -410,6 +428,58 @@ export const layer = Layer.effect(
     // finish late release their own count, never a recreated task's.
     const webhookQueued = yield* Ref.make<ReadonlyMap<string, number>>(new Map());
     const webhookRateWindows = yield* Ref.make<ReadonlyMap<ScheduledTaskId, RateWindow>>(new Map());
+    const caughtUpThisBoot = new Set<string>();
+    let nextCatchUpAt = 0;
+    yield* sql`CREATE TABLE IF NOT EXISTS ardud_scheduled_task_missed_slots (
+      task_id TEXT NOT NULL, created_at TEXT NOT NULL, slot_at TEXT NOT NULL,
+      recorded_at TEXT NOT NULL, reason TEXT NOT NULL, schedule_json TEXT NOT NULL, catch_up_at TEXT,
+      PRIMARY KEY (task_id, created_at, slot_at)
+    )`;
+    yield* sql`CREATE TABLE IF NOT EXISTS ardud_scheduled_task_unsent_slots (
+      task_id TEXT NOT NULL, task_created_at TEXT NOT NULL, started_at TEXT NOT NULL,
+      slot_at TEXT NOT NULL, previous_last_run_at TEXT, previous_run_count INTEGER NOT NULL, schedule_json TEXT NOT NULL, fire_key TEXT NOT NULL,
+      PRIMARY KEY (task_id, task_created_at, started_at)
+    )`;
+    yield* sql`CREATE INDEX IF NOT EXISTS ardud_scheduled_task_missed_by_catch_up
+      ON ardud_scheduled_task_missed_slots(catch_up_at)`;
+    const recentCatchUp = yield* sql<{
+      at: string | null;
+    }>`SELECT MAX(catch_up_at) AS at FROM ardud_scheduled_task_missed_slots`;
+    // A claim can precede dispatch while SQLite waits. After reboot, a full
+    // spacing interval also covers a dispatch whose timestamp never committed.
+    nextCatchUpAt = recentCatchUp[0]?.at
+      ? Math.max(
+          Date.parse(recentCatchUp[0].at) + 30_000,
+          DateTime.toEpochMillis(yield* localNow) + 30_000,
+        )
+      : 0;
+    const missedHistory = Effect.fn("ScheduledTaskService.missedHistory")(function* (
+      task: ScheduledTask,
+    ) {
+      const rows = yield* sql<{
+        slot_at: string;
+        recorded_at: string;
+        reason: string;
+        catch_up_at: string | null;
+      }>`
+        SELECT slot_at, recorded_at, reason, catch_up_at FROM ardud_scheduled_task_missed_slots
+        WHERE task_id = ${task.id} AND created_at = ${task.createdAt}
+        ORDER BY slot_at DESC LIMIT 20
+      `.pipe(
+        Effect.mapError((cause) =>
+          taskError("Could not load missed schedule slots.", { taskId: task.id, cause }),
+        ),
+      );
+      return {
+        ...task,
+        missedRuns: rows.map((row) => ({
+          slotAt: row.slot_at,
+          recordedAt: row.recorded_at,
+          reason: row.reason,
+          catchUpAt: row.catch_up_at,
+        })),
+      };
+    });
     const activeRuns = yield* Ref.make<ReadonlySet<ScheduledTaskId>>(new Set());
     // Sliding(1) coalesces the dirty-signal: every notification triggers a
     // full list() re-emit anyway, so a slow subscriber only ever needs the
@@ -448,7 +518,11 @@ export const layer = Layer.effect(
     const listRows = Effect.fn("ScheduledTaskService.listRows")(function* () {
       const rows = yield* selectAllRows();
       const origin = yield* readWebhookOrigin;
-      return yield* Effect.forEach(rows, (row) => decodeRow(row, origin), { concurrency: 1 });
+      return yield* Effect.forEach(
+        rows,
+        (row) => decodeRow(row, origin).pipe(Effect.flatMap(missedHistory)),
+        { concurrency: 1 },
+      );
     });
 
     const getRows = (id: ScheduledTaskId) => sql<ScheduledTaskRow>`
@@ -487,7 +561,7 @@ export const layer = Layer.effect(
       );
       const row = rows[0];
       if (row === undefined) return null;
-      return yield* decodeRow(row, yield* readWebhookOrigin);
+      return yield* decodeRow(row, yield* readWebhookOrigin).pipe(Effect.flatMap(missedHistory));
     });
 
     const findWebhookCredentials = (id: ScheduledTaskId) =>
@@ -620,6 +694,9 @@ export const layer = Layer.effect(
       sql
         .withTransaction(
           sql`DELETE FROM scheduled_task_webhook_deliveries WHERE task_id = ${id}`.pipe(
+            Effect.andThen(
+              sql`DELETE FROM ardud_scheduled_task_missed_slots WHERE task_id = ${id}`,
+            ),
             Effect.andThen(sql`DELETE FROM scheduled_tasks WHERE task_id = ${id}`),
           ),
         )
@@ -698,23 +775,40 @@ export const layer = Layer.effect(
     // immediately: the dispatch may already have gone out, so next_run_at must
     // advance and run_count must count the attempt.
     const releaseStuckRun = Effect.fn("ScheduledTaskService.releaseStuckRun")(
-      function* (task: ScheduledTask, message: string) {
+      function* (
+        task: ScheduledTask,
+        message: string,
+        trigger: "scheduled" | "manual" | "webhook",
+      ) {
         const now = yield* localNow;
         const reread = yield* Effect.result(findTask(task.id));
         if (Result.isSuccess(reread) && reread.success === null) return;
         const source = Result.isSuccess(reread) && reread.success !== null ? reread.success : task;
-        yield* sql`
+        const spentOnceAt =
+          trigger === "scheduled" && task.schedule.type === "once" ? task.schedule.at : null;
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
           UPDATE scheduled_tasks
           SET last_run_status = 'failed',
               last_run_error = ${message},
-              next_run_at = ${nextRunAt(source, now)},
+              next_run_at = ${trigger === "scheduled" ? source.nextRunAt : nextRunAt(source, now)},
+              enabled = CASE WHEN ${spentOnceAt} IS NOT NULL AND next_run_at IS NULL
+                AND json_extract(schedule_json, '$.type') = 'once'
+                AND json_extract(schedule_json, '$.at') = ${spentOnceAt}
+                THEN 0 ELSE enabled END,
               updated_at = ${iso(now)},
               run_count = run_count + 1
-          WHERE task_id = ${task.id} AND last_run_status = 'running'
+          WHERE task_id = ${task.id} AND created_at = ${task.createdAt} AND last_run_status = 'running'
         `;
+            if (trigger === "scheduled")
+              yield* sql`DELETE FROM ardud_scheduled_task_unsent_slots
+            WHERE task_id = ${task.id} AND task_created_at = ${source.createdAt} AND started_at = ${source.lastRunAt}`;
+          }),
+        );
         yield* notifyChanged;
       },
-      (effect, task, _message) =>
+      (effect, task, _message, _trigger) =>
         effect.pipe(
           Effect.catch((cause) =>
             Effect.logWarning("Could not release stuck schedule task run", {
@@ -725,10 +819,138 @@ export const layer = Layer.effect(
         ),
     );
 
+    const missUnsentSlot = Effect.fn("ScheduledTaskService.missUnsentSlot")(function* (
+      task: UnsentSlot["task"],
+      startedAtIso: string,
+      slotAt: string,
+      now: DateTime.DateTime,
+    ) {
+      const scheduleJson = yield* encodeScheduleJson(task.schedule).pipe(
+        Effect.mapError((cause) =>
+          taskError("Could not encode missed schedule slot.", { taskId: task.id, cause }),
+        ),
+      );
+      const onceAt = task.schedule.type === "once" ? task.schedule.at : null;
+      const expiredOnce =
+        task.schedule.type === "once" &&
+        DateTime.toEpochMillis(now) > lateRunDeadline(task.schedule, DateTime.makeUnsafe(slotAt));
+      yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* sql`UPDATE scheduled_tasks
+          SET last_run_status = 'missed', last_run_error = ${MISSED_SLOT_REASON},
+            last_run_at = ${task.lastRunAt}, updated_at = ${iso(now)},
+            enabled = CASE WHEN ${expiredOnce ? 1 : 0} = 1
+              AND json_extract(schedule_json, '$.type') = 'once'
+              AND json_extract(schedule_json, '$.at') = ${onceAt}
+              THEN 0 ELSE enabled END
+          WHERE task_id = ${task.id} AND created_at = ${task.createdAt}
+            AND last_run_status = 'running' AND last_run_at = ${startedAtIso}
+            AND run_count = ${task.runCount}`;
+            yield* sql`INSERT OR IGNORE INTO ardud_scheduled_task_missed_slots
+          (task_id, created_at, slot_at, recorded_at, reason, schedule_json)
+          SELECT ${task.id}, ${task.createdAt}, ${slotAt}, ${iso(now)}, ${MISSED_SLOT_REASON}, ${scheduleJson}
+          FROM scheduled_tasks WHERE task_id = ${task.id} AND created_at = ${task.createdAt}`;
+            yield* sql`UPDATE ardud_scheduled_task_missed_slots SET catch_up_at = NULL
+          WHERE task_id = ${task.id} AND created_at = ${task.createdAt}
+            AND slot_at = ${slotAt} AND catch_up_at = ${startedAtIso}`;
+            yield* sql`DELETE FROM ardud_scheduled_task_unsent_slots
+              WHERE task_id = ${task.id} AND task_created_at = ${task.createdAt} AND started_at = ${startedAtIso}`;
+          }),
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            taskError("Could not record unsent schedule slot.", { taskId: task.id, cause }),
+          ),
+        );
+      yield* notifyChanged;
+    });
+
+    const recordInterruptedDispatch = Effect.fn("ScheduledTaskService.recordInterruptedDispatch")(
+      function* (task: UnsentSlot["task"], startedAtIso: string, now: DateTime.DateTime) {
+        const onceAt = task.schedule.type === "once" ? task.schedule.at : null;
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`UPDATE scheduled_tasks
+          SET last_run_status = 'failed', last_run_error = 'Run was interrupted by a server restart.',
+            updated_at = ${iso(now)}, run_count = run_count + 1,
+            enabled = CASE WHEN ${onceAt} IS NOT NULL AND next_run_at IS NULL
+              AND json_extract(schedule_json, '$.type') = 'once' AND json_extract(schedule_json, '$.at') = ${onceAt}
+              THEN 0 ELSE enabled END
+          WHERE task_id = ${task.id} AND created_at = ${task.createdAt}
+            AND last_run_status = 'running' AND last_run_at = ${startedAtIso} AND run_count = ${task.runCount}`;
+              yield* sql`DELETE FROM ardud_scheduled_task_unsent_slots
+          WHERE task_id = ${task.id} AND task_created_at = ${task.createdAt} AND started_at = ${startedAtIso}`;
+            }),
+          )
+          .pipe(
+            Effect.mapError((cause) =>
+              taskError("Could not recover interrupted schedule dispatch.", {
+                taskId: task.id,
+                cause,
+              }),
+            ),
+          );
+        yield* notifyChanged;
+      },
+    );
+
+    const recoverUnsentSlots = Effect.fn("ScheduledTaskService.recoverUnsentSlots")(function* () {
+      const rows = yield* sql<{
+        task_id: ScheduledTaskId;
+        task_created_at: string;
+        started_at: string;
+        slot_at: string;
+        previous_last_run_at: string | null;
+        previous_run_count: number;
+        schedule_json: string;
+        fire_key: string;
+      }>`SELECT * FROM ardud_scheduled_task_unsent_slots`.pipe(
+        Effect.mapError((cause) =>
+          taskError("Could not load pending schedule dispatches.", { cause }),
+        ),
+      );
+      const blocked = new Set(
+        rows.map((row) => unsentSlotKey(row.task_id, row.task_created_at, row.started_at)),
+      );
+      for (const row of rows) {
+        if ((yield* Ref.get(activeRuns)).has(row.task_id)) continue;
+        yield* Effect.gen(function* () {
+          const schedule = yield* decodeScheduleJson(row.schedule_json);
+          const task = {
+            id: row.task_id,
+            createdAt: row.task_created_at,
+            lastRunAt: row.previous_last_run_at,
+            runCount: row.previous_run_count,
+            schedule,
+          };
+          // A missing receipt is meaningful only when the read succeeds. The
+          // tolerant hasReceipt helper would hide a read failure as absence.
+          const receipt = yield* threadManagement.getCommandReceipt(
+            CommandId.make(`scheduled-task:${row.fire_key}`),
+          );
+          const now = yield* localNow;
+          yield* Option.isSome(receipt)
+            ? recordInterruptedDispatch(task, row.started_at, now)
+            : missUnsentSlot(task, row.started_at, row.slot_at, now);
+        }).pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("Could not recover pending schedule dispatch", {
+              taskId: row.task_id,
+              cause,
+            }),
+          ),
+        );
+      }
+      return blocked;
+    });
+
     const runTask = Effect.fn("ScheduledTaskService.runTask")(function* (
       task: ScheduledTask,
       trigger: "scheduled" | "manual" | "webhook",
       webhook?: { readonly deliveryId: string; readonly prompt: string },
+      lateSlot?: string,
     ) {
       const reserved = yield* Ref.modify(activeRuns, (active) => {
         if (active.has(task.id)) return [false, active] as const;
@@ -743,10 +965,9 @@ export const layer = Layer.effect(
         return task;
       }
 
+      let claimed = false;
+      let dispatched = false;
       return yield* Effect.gen(function* () {
-        const startedAt = yield* localNow;
-        const startedAtIso = iso(startedAt);
-
         // The in-memory snapshot may be stale: re-read before touching run
         // state. The task may have been deleted, paused, or postponed since
         // the poll loaded it — none of those may fire.
@@ -762,13 +983,17 @@ export const layer = Layer.effect(
           }
           return task;
         }
+        const startedAt = yield* localNow;
+        const startedAtIso = iso(startedAt);
         const parsedNextRunAt =
           active.nextRunAt === null ? Option.none() : DateTime.make(active.nextRunAt);
         if (
           trigger === "scheduled" &&
           (!active.enabled ||
-            Option.isNone(parsedNextRunAt) ||
-            DateTime.toEpochMillis(parsedNextRunAt.value) > DateTime.toEpochMillis(startedAt))
+            (lateSlot === undefined &&
+              (Option.isNone(parsedNextRunAt) ||
+                active.nextRunAt !== task.nextRunAt ||
+                DateTime.toEpochMillis(parsedNextRunAt.value) > DateTime.toEpochMillis(startedAt))))
         ) {
           return active;
         }
@@ -787,21 +1012,93 @@ export const layer = Layer.effect(
           if (reason !== null) return yield* new WebhookDeliverySkipped({ reason });
         }
 
-        yield* markRunning(active.id, startedAtIso);
-        yield* notifyChanged;
-
+        if (
+          lateSlot !== undefined &&
+          (active.createdAt !== task.createdAt ||
+            !isSameSchedule(active.schedule, task.schedule) ||
+            !allowsLateRun(active.schedule))
+        )
+          return active;
         const fireKey =
           webhook === undefined
-            ? `${active.id}:${DateTime.toEpochMillis(startedAt)}:${trigger}`
+            ? lateSlot === undefined
+              ? `${active.id}:${DateTime.toEpochMillis(startedAt)}:${trigger}`
+              : `${active.id}:${active.createdAt}:late:${lateSlot}`
             : `${active.id}:webhook:${webhook.deliveryId}`;
         const commandId = CommandId.make(`scheduled-task:${fireKey}`);
         const messageId = MessageId.make(`scheduled-task-message:${fireKey}`);
         // A webhook prompt was rendered from the row when the request arrived.
-        const prompt = webhook?.prompt ?? active.prompt;
+        const prompt =
+          lateSlot === undefined
+            ? (webhook?.prompt ?? active.prompt)
+            : `Late run: the ${lateSlot} slot was missed (Robob unavailable). ${active.prompt}`;
+
+        const slotAt = lateSlot ?? active.nextRunAt;
+        const scheduleJson =
+          trigger === "scheduled"
+            ? yield* encodeScheduleJson(active.schedule).pipe(
+                Effect.mapError((cause) =>
+                  taskError("Could not encode schedule claim.", { taskId: task.id, cause }),
+                ),
+              )
+            : null;
+        claimed = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              if (lateSlot !== undefined) {
+                const claimed = yield* sql<{ slot_at: string }>`
+              UPDATE ardud_scheduled_task_missed_slots SET catch_up_at = ${startedAtIso}
+              WHERE task_id = ${active.id} AND created_at = ${active.createdAt}
+                AND slot_at = ${lateSlot} AND catch_up_at IS NULL RETURNING slot_at
+            `;
+                if (claimed.length === 0) return false;
+              }
+              if (trigger === "scheduled" && slotAt !== null) {
+                yield* sql`INSERT INTO ardud_scheduled_task_unsent_slots
+                  (task_id, task_created_at, started_at, slot_at, previous_last_run_at, previous_run_count, schedule_json, fire_key)
+                  VALUES (${active.id}, ${active.createdAt}, ${startedAtIso}, ${slotAt}, ${active.lastRunAt}, ${active.runCount}, ${scheduleJson}, ${fireKey})`;
+              }
+              yield* markRunning(active.id, startedAtIso);
+              if (trigger === "scheduled" && lateSlot === undefined && active.nextRunAt !== null) {
+                yield* sql`UPDATE scheduled_tasks
+              SET next_run_at = ${nextRunAt(active, DateTime.makeUnsafe(active.nextRunAt))}
+              WHERE task_id = ${active.id}`;
+              }
+              return true;
+            }),
+          )
+          .pipe(
+            Effect.mapError((cause) =>
+              taskError("Could not claim schedule slot.", { taskId: task.id, cause }),
+            ),
+          );
+        if (!claimed) return active;
+        yield* notifyChanged;
+
+        // Claiming and notifying can wait on I/O. Recheck at the provider
+        // boundary so a stalled claim cannot turn an old slot into a normal run.
+        const dispatchAt = yield* localNow;
+        if (trigger === "scheduled" && slotAt !== null) {
+          const dueAt = DateTime.makeUnsafe(slotAt);
+          const overdue =
+            lateSlot === undefined
+              ? DateTime.toEpochMillis(dispatchAt) - DateTime.toEpochMillis(dueAt) >
+                missedSlotGraceMs(active.schedule, dueAt)
+              : DateTime.toEpochMillis(dispatchAt) > lateRunDeadline(active.schedule, dueAt);
+          if (overdue) {
+            yield* missUnsentSlot(active, startedAtIso, slotAt, dispatchAt);
+            return (yield* findTask(task.id)) ?? active;
+          }
+        }
 
         // Effect.exit (not Effect.result) so defects and interruptions in the
         // dispatch are also captured and recorded as a failed run instead of
         // aborting before markCompleted.
+        if (lateSlot !== undefined) {
+          caughtUpThisBoot.add(`${active.id}:${active.createdAt}`);
+          nextCatchUpAt = DateTime.toEpochMillis(dispatchAt) + 30_000;
+        }
+        dispatched = true;
         const result =
           active.threadId === null
             ? yield* Effect.exit(
@@ -866,7 +1163,10 @@ export const layer = Layer.effect(
           ...scheduleSource,
           updatedAt: iso(completedAt),
           lastRunAt: startedAtIso,
-          nextRunAt: nextRunAt(scheduleSource, completedAt),
+          nextRunAt:
+            trigger === "scheduled"
+              ? scheduleSource.nextRunAt
+              : nextRunAt(scheduleSource, completedAt),
           lastRunStatus,
           lastRunError,
           runCount: scheduleSource.runCount + 1,
@@ -891,38 +1191,38 @@ export const layer = Layer.effect(
           });
           // ardud schedules: one transaction, so a crash can't leave a
           // dispatched run that is neither followed nor recorded.
-          yield* followTarget === null
-            ? recordRun
-            : sql
-                .withTransaction(
-                  recordRun.pipe(
-                    Effect.andThen(
-                      runFollower.record({
-                        task: active,
-                        startedAtIso,
-                        fireKey,
-                        prompt,
-                        target: followTarget,
-                      }),
-                    ),
-                  ),
-                )
-                .pipe(
-                  Effect.mapError((cause) =>
-                    cause._tag === "ScheduledTaskError"
-                      ? cause
-                      : taskError("Could not record schedule task run.", {
-                          taskId: task.id,
-                          cause,
-                        }),
-                  ),
-                );
-          if (onceSpent) yield* disableTask(task.id, completed.updatedAt);
+          yield* sql
+            .withTransaction(
+              Effect.gen(function* () {
+                yield* recordRun;
+                if (followTarget !== null)
+                  yield* runFollower.record({
+                    task: active,
+                    startedAtIso,
+                    fireKey,
+                    prompt,
+                    target: followTarget,
+                  });
+                if (onceSpent) yield* disableTask(task.id, completed.updatedAt);
+                if (trigger === "scheduled")
+                  yield* sql`DELETE FROM ardud_scheduled_task_unsent_slots
+              WHERE task_id = ${active.id} AND task_created_at = ${active.createdAt} AND started_at = ${startedAtIso}`;
+              }),
+            )
+            .pipe(
+              Effect.mapError((cause) =>
+                cause._tag === "ScheduledTaskError"
+                  ? cause
+                  : taskError("Could not record schedule task run.", { taskId: task.id, cause }),
+              ),
+            );
           yield* notifyChanged;
         }
         return onceSpent ? { ...completed, enabled: false } : completed;
       }).pipe(
-        Effect.onError((cause) => releaseStuckRun(task, errorMessage(cause))),
+        Effect.onError((cause) =>
+          claimed && dispatched ? releaseStuckRun(task, errorMessage(cause), trigger) : Effect.void,
+        ),
         Effect.ensuring(
           Ref.update(activeRuns, (active) => {
             const next = new Set(active);
@@ -933,120 +1233,183 @@ export const layer = Layer.effect(
       );
     });
 
-    const rescheduleMissedRun = Effect.fn("ScheduledTaskService.rescheduleMissedRun")(function* (
+    // Persist history and advance the cursor together. Batches bound recovery work
+    // after long outages without dropping slots from high-frequency schedules.
+    const recordMissedSlots = Effect.fn("ScheduledTaskService.recordMissedSlots")(function* (
       task: ScheduledTask,
       now: DateTime.DateTime,
     ) {
-      const next = nextRunAt(task, now);
-      yield* Effect.logInfo("Skipping missed schedule task run", {
-        taskId: task.id,
-        missedRunAt: task.nextRunAt,
-        rescheduledTo: next,
-      });
-      yield* sql`
-        UPDATE scheduled_tasks
-        SET next_run_at = ${next},
-            updated_at = ${iso(now)}
-        WHERE task_id = ${task.id}
-      `.pipe(
-        Effect.mapError((cause) =>
-          taskError("Could not reschedule missed schedule task run.", { taskId: task.id, cause }),
-        ),
-      );
-      yield* notifyChanged;
-    });
-
-    // A one-time run that passed while the server was down for more than the
-    // grace window is not fired late: record it as missed and switch it off.
-    const markOnceMissed = Effect.fn("ScheduledTaskService.markOnceMissed")(function* (
-      task: ScheduledTask,
-      now: DateTime.DateTime,
-    ) {
-      yield* Effect.logInfo("Marking missed one-time schedule task", {
-        taskId: task.id,
-        missedRunAt: task.nextRunAt,
-      });
-      yield* sql`
-        UPDATE scheduled_tasks
-        SET enabled = 0,
-            next_run_at = NULL,
-            last_run_status = 'failed',
-            last_run_error = ${`Missed: the server was not running at ${task.nextRunAt}.`},
-            updated_at = ${iso(now)}
-        WHERE task_id = ${task.id} AND last_run_status <> 'running'
-      `.pipe(
-        Effect.mapError((cause) =>
-          taskError("Could not mark one-time schedule task as missed.", {
-            taskId: task.id,
-            cause,
+      const at = DateTime.toEpochMillis(now);
+      let cursor = task.nextRunAt;
+      const slots: string[] = [];
+      for (let count = 0; cursor !== null && count < 256; count++) {
+        const due = DateTime.makeUnsafe(cursor);
+        const grace = missedSlotGraceMs(task.schedule, due);
+        if (at - DateTime.toEpochMillis(due) <= grace) break;
+        slots.push(cursor);
+        cursor = nextRunAt(task, due);
+      }
+      if (slots.length === 0) return;
+      const reason = MISSED_SLOT_REASON;
+      const scheduleJson = yield* encodeScheduleJson(task.schedule);
+      yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const fresh = yield* findTask(task.id);
+            if (fresh === null || !isSameSchedule(task.schedule, fresh.schedule)) return;
+            const updated = yield* sql<{ task_id: string }>`UPDATE scheduled_tasks
+          SET next_run_at = ${cursor}, updated_at = ${iso(now)},
+            last_run_status = 'missed', last_run_error = ${reason},
+            enabled = ${task.schedule.type === "once" && at > lateRunDeadline(task.schedule, DateTime.makeUnsafe(slots[0]!)) ? 0 : 1}
+          WHERE task_id = ${task.id} AND created_at = ${task.createdAt}
+            AND enabled = 1 AND next_run_at = ${task.nextRunAt}
+          RETURNING task_id`;
+            if (updated.length === 0) return;
+            for (const slot of slots) {
+              yield* sql`INSERT OR IGNORE INTO ardud_scheduled_task_missed_slots
+            (task_id, created_at, slot_at, recorded_at, reason, schedule_json)
+            VALUES (${task.id}, ${task.createdAt}, ${slot}, ${iso(now)}, ${reason}, ${scheduleJson})`;
+            }
           }),
-        ),
-      );
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            taskError("Could not record missed schedule slots.", { taskId: task.id, cause }),
+          ),
+        );
       yield* notifyChanged;
     });
 
     const runDueTasks = Effect.fn("ScheduledTaskService.runDueTasks")(function* () {
+      yield* recoverUnsentSlots();
       const now = yield* localNow;
       const tasks = yield* listDueTasks(now).pipe(
         Effect.mapError((cause) => taskError("Could not list schedule tasks.", { cause })),
       );
-      const due = tasks.flatMap((task) =>
-        task.nextRunAt === null ? [] : [{ task, dueAt: DateTime.makeUnsafe(task.nextRunAt) }],
-      );
-      yield* Effect.forEach(
-        due,
-        ({ task, dueAt }) =>
-          Effect.suspend(() =>
-            isExpiredOnceRun(task.schedule, dueAt, now)
-              ? markOnceMissed(task, now)
-              : isMissedFixedTimeRun(task.schedule, dueAt, now)
-                ? rescheduleMissedRun(task, now)
-                : runTask(task, "scheduled"),
-          ).pipe(
-            Effect.catch((cause) =>
-              Effect.logWarning("Scheduled task run failed", { taskId: task.id, cause }),
-            ),
+      for (const task of tasks) {
+        yield* recordMissedSlots(task, now).pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("Could not recover schedule slots", { taskId: task.id, cause }),
           ),
-        { concurrency: 1, discard: true },
+        );
+      }
+      // Re-read the advanced cursors; only current slots can dispatch normally.
+      const due = yield* listDueTasks(now).pipe(
+        Effect.mapError((cause) => taskError("Could not list schedule tasks.", { cause })),
       );
+      for (const task of due) {
+        if (task.nextRunAt === null) continue;
+        yield* runTask(task, "scheduled").pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("Scheduled task run failed", { taskId: task.id, cause }),
+          ),
+        );
+      }
+      const at = DateTime.toEpochMillis(yield* localNow);
+      if (at < nextCatchUpAt) return;
+      const pending = yield* sql<{
+        task_id: string;
+        created_at: string;
+        slot_at: string;
+        schedule_json: string;
+      }>`
+        SELECT m.task_id, m.created_at, m.slot_at, m.schedule_json
+        FROM scheduled_tasks t JOIN ardud_scheduled_task_missed_slots m
+          ON m.task_id = t.task_id AND m.created_at = t.created_at
+          AND m.slot_at = (SELECT MAX(latest.slot_at) FROM ardud_scheduled_task_missed_slots latest
+            WHERE latest.task_id = t.task_id AND latest.created_at = t.created_at)
+        WHERE t.enabled = 1 AND m.catch_up_at IS NULL
+        ORDER BY slot_at ASC, m.task_id ASC
+      `.pipe(
+        Effect.mapError((cause) => taskError("Could not list late schedule slots.", { cause })),
+      );
+      for (const slot of pending) {
+        const key = `${slot.task_id}:${slot.created_at}`;
+        const loaded = yield* Effect.result(findTask(ScheduledTaskId.make(slot.task_id)));
+        if (Result.isFailure(loaded)) {
+          yield* Effect.logWarning("Could not load late schedule task", {
+            taskId: slot.task_id,
+            cause: loaded.failure,
+          });
+          continue;
+        }
+        const task = loaded.success;
+        if (
+          task === null ||
+          !isSameSchedule(task.schedule, yield* decodeScheduleJson(slot.schedule_json))
+        )
+          continue;
+        if (
+          task.schedule.type === "once" &&
+          at > lateRunDeadline(task.schedule, DateTime.makeUnsafe(slot.slot_at))
+        ) {
+          yield* disableTask(task.id, iso(yield* localNow));
+          yield* notifyChanged;
+          continue;
+        }
+        if (
+          task === null ||
+          !allowsLateRun(task.schedule) ||
+          (task.nextRunAt !== null && Date.parse(task.nextRunAt) <= at) ||
+          (task.lastRunAt !== null && Date.parse(task.lastRunAt) >= Date.parse(slot.slot_at)) ||
+          at > lateRunDeadline(task.schedule, DateTime.makeUnsafe(slot.slot_at))
+        )
+          continue;
+        if (caughtUpThisBoot.has(key)) continue;
+        yield* runTask(task, "scheduled", undefined, slot.slot_at).pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("Late schedule task run failed", { taskId: task.id, cause }),
+          ),
+        );
+        break;
+      }
     });
 
     // Recover from a crash or hard shutdown mid-run: rows stuck in 'running'
     // would otherwise be skipped by the due-task filter forever.
-    yield* Effect.gen(function* () {
-      const rows = yield* selectAllRows();
-      // ardud schedules: a dispatched run that is being followed survives the
-      // restart; the follower settles it.
-      const followed = yield* runFollower.followedKeys;
-      const stuck = rows.filter(
-        (row) =>
-          row.last_run_status === "running" &&
-          !followed.has(followKey(row.task_id, row.last_run_at)),
-      );
-      if (stuck.length === 0) return;
-      const now = yield* localNow;
-      yield* Effect.forEach(
-        stuck,
-        (row) =>
-          Effect.gen(function* () {
-            const decoded = yield* Effect.result(decodeRow(row));
-            if (Result.isSuccess(decoded)) {
-              yield* sql`
+    const recovery = yield* Effect.cached(
+      Effect.gen(function* () {
+        const unsent = yield* recoverUnsentSlots();
+        const rows = yield* selectAllRows();
+        // ardud schedules: a dispatched run that is being followed survives the
+        // restart; the follower settles it.
+        const followed = yield* runFollower.followedKeys;
+        const stuck = rows.filter(
+          (row) =>
+            row.last_run_status === "running" &&
+            !followed.has(followKey(row.task_id, row.last_run_at)) &&
+            !unsent.has(unsentSlotKey(row.task_id, row.created_at, row.last_run_at ?? "")),
+        );
+        if (stuck.length === 0) return;
+        const now = yield* localNow;
+        yield* Effect.forEach(
+          stuck,
+          (row) =>
+            Effect.gen(function* () {
+              const decoded = yield* Effect.result(decodeRow(row));
+              if (Result.isSuccess(decoded)) {
+                yield* sql`
                 UPDATE scheduled_tasks
                 SET last_run_status = 'failed',
+                    enabled = ${decoded.success.schedule.type === "once" && decoded.success.nextRunAt === null ? 0 : row.enabled},
                     last_run_error = 'Run was interrupted by a server restart.',
-                    next_run_at = ${nextRunAt(decoded.success, now)},
+                    next_run_at = ${
+                      decoded.success.nextRunAt !== null &&
+                      decoded.success.nextRunAt <= (row.last_run_at ?? iso(now))
+                        ? nextRunAt(decoded.success, DateTime.makeUnsafe(decoded.success.nextRunAt))
+                        : decoded.success.nextRunAt
+                    },
                     updated_at = ${iso(now)},
                     run_count = run_count + 1
                 WHERE task_id IS ${row.task_id} AND last_run_status = 'running'
               `;
-              return;
-            }
-            yield* Effect.logWarning(
-              "Recovering undecodable schedule task row without rescheduling",
-              { taskId: row.task_id, cause: decoded.failure },
-            );
-            yield* sql`
+                return;
+              }
+              yield* Effect.logWarning(
+                "Recovering undecodable schedule task row without rescheduling",
+                { taskId: row.task_id, cause: decoded.failure },
+              );
+              yield* sql`
               UPDATE scheduled_tasks
               SET last_run_status = 'failed',
                   last_run_error = 'Run was interrupted by a server restart.',
@@ -1054,19 +1417,24 @@ export const layer = Layer.effect(
                   run_count = run_count + 1
               WHERE task_id IS ${row.task_id} AND last_run_status = 'running'
             `;
-          }),
-        { concurrency: 1, discard: true },
-      );
-      yield* notifyChanged;
-    }).pipe(
-      Effect.catch((cause) =>
-        Effect.logWarning("Could not reset interrupted schedule task runs", { cause }),
+            }),
+          { concurrency: 1, discard: true },
+        );
+        yield* notifyChanged;
+      }).pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("Could not reset interrupted schedule task runs", { cause }),
+        ),
       ),
     );
+    yield* BoardsDatabase.onReady(recovery);
 
-    yield* scheduler.register("scheduled-tasks", runDueTasks());
+    yield* scheduler.register("scheduled-tasks", recovery.pipe(Effect.andThen(runDueTasks())));
     // ardud schedules: settle followed runs once their work is done.
-    yield* scheduler.register("scheduled-task-follows", runFollower.sweep);
+    yield* scheduler.register(
+      "scheduled-task-follows",
+      recovery.pipe(Effect.andThen(runFollower.sweep)),
+    );
 
     const list: ScheduledTaskService["Service"]["list"] = () =>
       listRows().pipe(
@@ -1819,18 +2187,18 @@ export const layer = Layer.effect(
     });
 
     return ScheduledTaskService.of({
-      list,
-      subscribeList,
-      upsert,
-      setEnabled,
-      migrateModelSelection,
-      delete: deleteTask,
-      deleteForThread,
-      runNow,
-      rotateWebhookToken,
-      listWebhookDeliveries,
-      getWebhookDelivery,
-      triggerWebhook,
+      list: () => recovery.pipe(Effect.andThen(list())),
+      subscribeList: () => Stream.unwrap(recovery.pipe(Effect.as(subscribeList()))),
+      upsert: (input) => recovery.pipe(Effect.andThen(upsert(input))),
+      setEnabled: (input) => recovery.pipe(Effect.andThen(setEnabled(input))),
+      migrateModelSelection: (input) => recovery.pipe(Effect.andThen(migrateModelSelection(input))),
+      delete: (input) => recovery.pipe(Effect.andThen(deleteTask(input))),
+      deleteForThread: (threadId) => recovery.pipe(Effect.andThen(deleteForThread(threadId))),
+      runNow: (input) => recovery.pipe(Effect.andThen(runNow(input))),
+      rotateWebhookToken: (input) => recovery.pipe(Effect.andThen(rotateWebhookToken(input))),
+      listWebhookDeliveries: (input) => recovery.pipe(Effect.andThen(listWebhookDeliveries(input))),
+      getWebhookDelivery: (input) => recovery.pipe(Effect.andThen(getWebhookDelivery(input))),
+      triggerWebhook: (input) => recovery.pipe(Effect.andThen(triggerWebhook(input))),
     });
   }),
 );

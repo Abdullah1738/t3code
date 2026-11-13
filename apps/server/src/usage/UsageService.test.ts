@@ -38,6 +38,7 @@ import { HttpClient, HttpClientError, HttpClientRequest, HttpClientResponse } fr
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as Sqlite from "../persistence/Sqlite.ts";
+import { liveColumns } from "../ardud/persistence/historyArchiveSql.ts";
 import * as CodexUsageHistory from "./CodexUsageHistory.ts";
 import * as CursorAccountReader from "@t3tools/provider-cursor/server/CursorAccountReader";
 import * as CursorKeychain from "@t3tools/provider-cursor/server/CursorKeychain";
@@ -383,6 +384,21 @@ describe("Codex usage history", () => {
     }).pipe(Effect.provide(historyLayer)),
   );
 
+  it.effect("keeps the first running selection authoritative when it is archived", () =>
+    Effect.gen(function* () {
+      yield* seedCodexHistory({ id: "cold-first" });
+      const sql = yield* SqlClient.SqlClient;
+      const columns = liveColumns("orchestration_events");
+      yield* sql.unsafe(`INSERT INTO ardud_archive.ardud_events (${columns})
+        SELECT ${columns} FROM main.orchestration_events WHERE event_id = 'event-cold-first-2'`);
+      yield* sql`DELETE FROM main.orchestration_events WHERE event_id = 'event-cold-first-2'`;
+      assert.lengthOf(yield* sql`SELECT sequence FROM ardud_archive.ardud_events`, 1);
+      const input = request("cold-first");
+      const history = yield* CodexUsageHistory.CodexUsageHistory;
+      assert.strictEqual((yield* history.resolve([input])).get(input), "fast");
+    }).pipe(Effect.provide(historyLayer)),
+  );
+
   it.effect("leaves ambiguous, mismatched, and missing V2 evidence unresolved", () =>
     Effect.gen(function* () {
       for (const id of [
@@ -446,10 +462,13 @@ describe("Codex usage history", () => {
         const history = yield* CodexUsageHistory.CodexUsageHistory;
         const sql = yield* SqlClient.SqlClient;
         const input = request("retry");
-        yield* sql`ALTER TABLE orchestration_events RENAME TO unavailable_events`;
+        const views = yield* sql<{ sql: string }>`
+          SELECT sql FROM sqlite_temp_schema WHERE type = 'view' AND name = 'ardud_history_events'
+        `;
+        yield* sql`DROP VIEW ardud_history_events`;
         const error = yield* Effect.flip(history.resolve([input]));
         assert.instanceOf(error, CodexUsageHistory.CodexUsageHistoryReadError);
-        yield* sql`ALTER TABLE unavailable_events RENAME TO orchestration_events`;
+        yield* sql.unsafe(views[0]!.sql.replace(/^CREATE VIEW/i, "CREATE TEMP VIEW"));
         assert.strictEqual((yield* history.resolve([input])).get(input), "fast");
       }).pipe(Effect.provide(historyLayer)),
   );
@@ -1631,7 +1650,7 @@ describe("UsageService", () => {
       }).pipe(Effect.scoped),
   );
 
-  it.live.skipIf(HostProcess.Platform.defaultValue() === "win32" || process.getuid?.() === 0)(
+  it.live(
     "reports unreadable transcripts as partial and recovers once they can be read",
     () =>
       Effect.gen(function* () {
@@ -1640,15 +1659,21 @@ describe("UsageService", () => {
         yield* Effect.promise(async () => {
           await NodeFSP.writeFile(transcript, claudeLine(1, 5));
           await NodeFSP.writeFile(unreadable, claudeLine(2, 7));
-          await NodeFSP.chmod(unreadable, 0);
         });
         yield* Effect.gen(function* () {
+          const realFS = yield* Effect.promise(() => vi.importActual<typeof NodeFSP>("node:fs/promises"));
+          const denied = vi.spyOn(NodeFSP, "open").mockImplementation((...args) =>
+            args[0] === unreadable
+              ? Promise.reject(Object.assign(new Error("Permission denied"), { code: "EACCES" }))
+              : realFS.open(...args),
+          );
+          yield* Effect.addFinalizer(() => Effect.sync(() => denied.mockRestore()));
           const service = yield* UsageService.make;
           const partial = yield* service.readSummary(WINDOW);
           assert.strictEqual(totalOutputTokens(partial), 5);
           assert.strictEqual(partial.sources[0]?.status, "partial");
 
-          yield* Effect.promise(() => NodeFSP.chmod(unreadable, 0o600));
+          denied.mockRestore();
           const healthy = yield* service.readSummary(WINDOW);
           assert.strictEqual(totalOutputTokens(healthy), 12);
           assert.strictEqual(healthy.sources[0]?.status, "ok");
@@ -2261,6 +2286,7 @@ describe("UsageService", () => {
 
   it.live("reports saved usage of a removed directory only for windows it reaches", () =>
     Effect.gen(function* () {
+      yield* TestClock.setTime(CURSOR_NOW);
       const { transcript, settings, home } = yield* setup;
       yield* Effect.promise(async () => {
         await NodeFSP.writeFile(transcript, claudeLine(1, 5));
@@ -2287,7 +2313,7 @@ describe("UsageService", () => {
       assert.deepStrictEqual(later.buckets, []);
       assert.strictEqual(later.sources[0]?.status, "missing");
       assert.strictEqual(later.sources[0]?.scannedFiles, 0);
-    }).pipe(Effect.scoped),
+    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
   );
 
   it.live("does not share an in-flight scan after custom prices change", () =>

@@ -7,6 +7,7 @@ Only the pre-start path uses this: nothing has started, so waiting is safe. Runs
 from __future__ import annotations
 
 import time
+import contextlib
 
 from . import api, capacity
 from .common import EXIT_INFRA, OffboxError, db, iso, kv_get, kv_set, log, now, say
@@ -15,8 +16,37 @@ WAIT_DEFAULT_S = 600
 WAIT_MAX_S = 1800
 PROBE_EVERY_S = 15
 PROGRESS_EVERY_S = 60
+CAPACITY_RETRY_S = 30
 KEY = "boat_outage"
 SAME_OUTAGE_S = 300   # a "seen" older than this means the outage is over (or nobody has looked since)
+_ROUND_DEADLINE: float | None = None
+
+
+@contextlib.contextmanager
+def allocation_budget(seconds: float):
+    """Bound the next allocation round without restricting SSH/bring-up after a start was accepted."""
+    global _ROUND_DEADLINE
+    previous = _ROUND_DEADLINE
+    _ROUND_DEADLINE = time.monotonic() + max(0, seconds)
+    try:
+        yield
+    finally:
+        _ROUND_DEADLINE = previous
+
+
+def allocation_left() -> float | None:
+    return None if _ROUND_DEADLINE is None else max(0, _ROUND_DEADLINE - time.monotonic())
+
+
+@contextlib.contextmanager
+def accepted_machine():
+    global _ROUND_DEADLINE
+    previous = _ROUND_DEADLINE
+    _ROUND_DEADLINE = None
+    try:
+        yield
+    finally:
+        _ROUND_DEADLINE = previous
 
 
 def window_seconds() -> int:
@@ -64,7 +94,10 @@ def wait_until_up(reason: str, budget_s: float) -> bool:
         if left <= 0:
             return False
         time.sleep(min(PROBE_EVERY_S, left))
-        why = api.probe()
+        left = budget_s - (time.monotonic() - start)
+        if left <= 0:
+            return False
+        why = api.probe(timeout=min(PROBE_EVERY_S, left))
         if why is None:
             note_up()
             say(f"boat.dev is back after {int(now() - since)}s; retrying")
@@ -82,3 +115,16 @@ def down_error(e, waited_s: float) -> OffboxError:
     return OffboxError(f"boat.dev is down ({reason} since {iso(since)[-5:]}, waited {int(waited_s)}s); nothing ran. "
                        f"Retry once it is back (offbox status shows it). Last error: {e}",
                        code=EXIT_INFRA, outage=True)
+
+
+def wait_for_capacity(start: float, since: float, last_say: float | None, budget_s: float):
+    """The API answers during a machine outage, so retry acquisition rather than probing /limits."""
+    t = time.monotonic()
+    if last_say is None or t - last_say >= PROGRESS_EVERY_S:
+        last_say = t
+        say(f"boat is out of machine capacity (since {iso(since)[-5:]}, waited {int(t - start)}s); retrying")
+    left = budget_s - (time.monotonic() - start)
+    if left <= 0:
+        return False, last_say
+    time.sleep(min(CAPACITY_RETRY_S, left))
+    return time.monotonic() - start < budget_s, last_say

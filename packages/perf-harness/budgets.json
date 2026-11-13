@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 1,
+  "source": "ARCH-PROGRAM-PLAN.md section 4 (2026-11-08)",
+  "metrics": {
+    "messagePost.response.ms.p95": {
+      "max": 500
+    },
+    "answer.response.ms.p95": {
+      "max": 500
+    },
+    "optimisticPaint.p95.ms": {
+      "max": 16
+    },
+    "durableAck.p95.ms": {
+      "max": 150
+    },
+    "board.cachedPaint.p95.ms": {
+      "max": 50
+    },
+    "board.authoritative.p95.ms": {
+      "max": 500
+    },
+    "discussion.cachedPaint.p95.ms": {
+      "max": 50
+    },
+    "discussion.authoritative.p95.ms": {
+      "max": 300
+    },
+    "auth.verify.p95.ms": {
+      "max": 25
+    },
+    "mobile.resume.p95.ms": {
+      "max": 2000
+    },
+    "mobile.coldFirstPage.p95.ms": {
+      "max": 2000
+    },
+    "mobile.coldFirstPage.bytes": {
+      "max": 262144
+    },
+    "mobile.unchangedResume.bytes": {
+      "max": 4096
+    },
+    "eventLoop.p99.ms": {
+      "max": 50
+    },
+    "scale.deltaBytes.ratio": {
+      "max": 1.2
+    },
+    "scale.rowsVisited.ratio": {
+      "max": 1.2
+    },
+    "mcp.rss.bytes": {
+      "max": 1500000000
+    },
+    "install.downtime.ms": {
+      "max": 90000
+    },
+    "install.hardLimit.ms": {
+      "max": 180000
+    }
+  },
+  "conditions": {
+    "mobile": {
+      "mbps": 10,
+      "rttMs": 100,
+      "resumeMaxChangeBytes": 131072
+    },
+    "scale": {
+      "growth": 5,
+      "sameChangedSet": true
+    },
+    "mcp": {
+      "loadedThreads": 100
+    }
+  },
+  "correctness": {
+    "deadMcpTurnSucceeds": true,
+    "deadMcpMarkedUnavailable": true,
+    "installLostTurns": 0,
+    "installLostMessages": 0
+  },
+  "regressionLimitPct": 10
+}

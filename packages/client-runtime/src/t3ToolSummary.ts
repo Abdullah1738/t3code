@@ -295,6 +295,9 @@ export function summarizeT3ToolCalls(
     case "context-reset":
       label = phrase("Reset", "reset", `thread context ${times}`);
       break;
+    case "imessage-send":
+      label = phrase("Sent", "send", quantity(selected.length, "iMessage"));
+      break;
     case "worktree-handoff":
       label = phrase(
         "Handed off to",

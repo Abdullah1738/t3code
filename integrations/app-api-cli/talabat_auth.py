@@ -442,6 +442,9 @@ def refresh(force=False, rejected_token=None, timeout=25, deadline=None):
 
 
 def main(argv=None):
+    # Talabat retired by the owner 2026-11-07: no logins, refreshes or SMS.
+    import talabat_retired
+    return talabat_retired.refuse()
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('status')

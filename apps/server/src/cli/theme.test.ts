@@ -8,22 +8,30 @@ import * as ConfigProvider from "effect/ConfigProvider";
 import * as NetService from "@t3tools/shared/Net";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as PlatformError from "effect/PlatformError";
 import * as TestConsole from "effect/testing/TestConsole";
 import { Command } from "effect/cli";
+import { vi } from "vite-plus/test";
 
 import { cli } from "../binCli.ts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
-// These force a failure with chmod, which Windows ignores for directories and
-// cannot use to make a file unreadable, so the failure never happens there.
+// These force a write failure with chmod, which Windows ignores for directories.
 const windowsHost = HostProcess.Platform.defaultValue() === "win32";
 
-const runCli = (args: ReadonlyArray<string>) =>
-  Command.runWith(cli, { version: "0.0.0" })(args).pipe(
+const runCli = (args: ReadonlyArray<string>, fileSystem?: FileSystem.FileSystem) => {
+  const command = Command.runWith(cli, { version: "0.0.0" })(args);
+  return (
+    fileSystem === undefined
+      ? command
+      : command.pipe(Effect.provideService(FileSystem.FileSystem, fileSystem))
+  ).pipe(
     Effect.provide(Layer.mergeAll(NodeServices.layer, NetService.layer, TestConsole.layer)),
   );
+};
 
 const makeBaseDir = () => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3code-theme-cli-"));
 
@@ -332,21 +340,45 @@ describe("t3 theme", () => {
     }),
   );
 
-  it.effect.skipIf(windowsHost)("refuses to write when the settings file cannot be read", () =>
+  it.effect("refuses to write when the settings file cannot be read", () =>
     Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
       const baseDir = makeBaseDir();
       writeSettings(baseDir, { enableProviderUpdateChecks: false });
-      NodeFS.chmodSync(settingsPathFor(baseDir), 0o000);
+      const settingsPath = settingsPathFor(baseDir);
+      const previous = NodeFS.readFileSync(settingsPath, "utf8");
+      const readFailure = PlatformError.systemError({
+        _tag: "PermissionDenied",
+        module: "FileSystem",
+        method: "readFileString",
+        pathOrDescriptor: settingsPath,
+      });
+      const fileSystem = FileSystem.FileSystem.of({ ...fs });
+      const readSpy = vi
+        .spyOn(fileSystem, "readFileString")
+        .mockImplementation((filePath, encoding) =>
+          filePath === settingsPath
+            ? Effect.fail(readFailure)
+            : fs.readFileString(filePath, encoding),
+        );
+      yield* Effect.addFinalizer(() => Effect.sync(() => readSpy.mockRestore()));
 
-      const failure = yield* runCli(["theme", "set", "ocean", "--base-dir", baseDir]).pipe(
-        Effect.flip,
-      );
+      const failure = yield* runCli(
+        ["theme", "set", "ocean", "--base-dir", baseDir],
+        fileSystem,
+      ).pipe(Effect.flip);
 
-      NodeFS.chmodSync(settingsPathFor(baseDir), 0o644);
       assert.include(String(failure), "Could not read");
+      assert.deepInclude(failure, { _tag: "ThemeSettingsUnreadableError", cause: readFailure });
+      assert.equal(NodeFS.readFileSync(settingsPath, "utf8"), previous);
       assert.equal(readSettings(baseDir).enableProviderUpdateChecks, false);
       assert.equal(Object.hasOwn(readSettings(baseDir), "defaultTheme"), false);
-    }),
+
+      readSpy.mockRestore();
+      yield* runCli(["theme", "set", "ocean", "--base-dir", baseDir], fileSystem);
+      assert.equal(readSettings(baseDir).defaultTheme, "ocean");
+      assert.equal(readSettings(baseDir).enableProviderUpdateChecks, false);
+    }).pipe(Effect.provide(NodeServices.layer)),
   );
 
   it.effect("rejects an id that names no theme", () =>

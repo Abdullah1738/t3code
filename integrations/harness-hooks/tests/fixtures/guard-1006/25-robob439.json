@@ -1,0 +1,30 @@
+{
+  "case_number": 25,
+  "reporter_id": "robob439",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Ft3code-fork:08a0e4fc-8a18-4f09-aef2-a017544ab710",
+  "provenance": {
+    "recovery": "verbatim",
+    "harness": "codex",
+    "tool_name": "exec",
+    "nested_tool": "exec_command",
+    "card_comment_event_id": 134302,
+    "sources": [
+      {
+        "denial_index": 225,
+        "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/12/rollout-2026-11-12T10-06-40-01a1ce5d-9081-7f02-896c-c87ae79fc8fe.jsonl",
+        "timestamp": "2026-11-12T06:17:58.745Z",
+        "call_id": "call_c3cf1ebf899d4320a4881d4413cfd449",
+        "command_index": 0
+      }
+    ]
+  },
+  "commands": [
+    {
+      "cmd": "python3 - <<'PY'\nimport glob\npatterns = [\n    '/opt/homebrew/lib/python*/site-packages/pytest/__init__.py',\n    '/Users/ardud/Library/Python/*/lib/python/site-packages/pytest/__init__.py',\n    '/Users/ardud/.local/share/uv/tools/*/lib/python*/site-packages/pytest/__init__.py',\n    '/Users/ardud/.local/share/uv/python/*/lib/python*/site-packages/pytest/__init__.py',\n]\nfor pattern in patterns:\n    for path in glob.glob(pattern):\n        print(path)\nPY",
+      "workdir": "/Users/ardud/checkouts/offbox-sshkey-timeout",
+      "sha256": "c24cc932b44fb233be2556fa46f325a79828c848ba0ab5607cf53156332dc324"
+    }
+  ],
+  "session_cwd": "/Volumes/ExternalSSD/t3code-fork",
+  "original_refusal": "statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard.."
+}

@@ -34,10 +34,25 @@ export interface Config {
   guestEffort?: "minimal" | "low" | "medium" | "high";
   /** iMessage app that renders Sendblue app cards; loadConfig fills in the Spectrum identity. */
   cardApp?: CardApp;
-  /** Chat slugs whose cards render live in the bubble; every other chat gets static cards. Default ["owner"]. */
+  /** Chat slugs opting into live extension bubbles; static image cards are the default for every chat. */
   liveCardChats?: string[];
   /** Stable public origin for shares (a named Cloudflare tunnel to 127.0.0.1:port); unset = quick tunnels. */
   shareOrigin?: { url: string; port: number };
+  /**
+   * How the agent's words reach the chat. "final" (default): the bridge forwards each turn's final
+   * assistant text. "tool": nothing is forwarded; the agent texts the chat itself with the
+   * `imessage_send` MCP tool (or `cli.ts send`), and its final message stays internal.
+   */
+  replyMode?: ReplyMode;
+}
+
+export type ReplyMode = "final" | "tool";
+
+/** `replyMode`: "final" when unset, else exactly "final" or "tool". */
+export function replyModeConfig(raw: unknown): ReplyMode {
+  if (raw === undefined) return "final";
+  if (raw === "final" || raw === "tool") return raw;
+  throw new Error("Invalid bridge configuration");
 }
 
 /** `shareOrigin`: an https origin with no path, and a loopback port its tunnel forwards to. */
@@ -54,7 +69,7 @@ export function shareOriginConfig(raw: unknown): { url: string; port: number } |
 }
 
 export function liveCardChatsConfig(raw: unknown): string[] {
-  if (raw === undefined) return ["owner"];
+  if (raw === undefined) return [];
   if (!Array.isArray(raw) || raw.length > 50 || !raw.every(slug => typeof slug === "string" && /^[a-z0-9][a-z0-9._-]{0,99}$/.test(slug))) {
     throw new Error("Invalid bridge configuration");
   }
@@ -134,7 +149,8 @@ export async function loadConfig(): Promise<Config> {
     || typeof config.timezone !== "string") throw new Error("Invalid bridge configuration");
   new Intl.DateTimeFormat("en-US", { timeZone: config.timezone });
   return { ...config, ...appsConfig(config), cardApp: cardAppConfig(config.cardApp),
-    liveCardChats: liveCardChatsConfig(config.liveCardChats), shareOrigin: shareOriginConfig(config.shareOrigin) };
+    liveCardChats: liveCardChatsConfig(config.liveCardChats), shareOrigin: shareOriginConfig(config.shareOrigin),
+    replyMode: replyModeConfig(config.replyMode) };
 }
 
 export async function backendConnection(): Promise<{ baseUrl: string; headers: Record<string, string> }> {

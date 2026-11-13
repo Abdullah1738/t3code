@@ -9,6 +9,7 @@ import tempfile
 import time
 import types
 import unittest
+from unittest.mock import patch
 
 SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.insert(0, SRC)
@@ -75,6 +76,27 @@ class ClaudeSyncTest(unittest.TestCase):
         out = con.execute(q + " ORDER BY id", args).fetchall()
         con.close()
         return out
+
+    def test_expiry_during_file_does_not_stamp_root_or_commit_partial_batch(self):
+        from capture_budget import Budget
+        write_lines(self.top, [rec("u1", "user", "first"), rec("a1", "assistant", "second")])
+        worker = self.sc.ClaudeSync(types.SimpleNamespace(deadline=0), roots=self.roots)
+        clock = [0]
+        worker.budget = Budget(1, clock=lambda: clock[0])
+        original = self.sc.project
+        def expire(*args):
+            result = original(*args)
+            clock[0] = 2
+            return result
+        with patch.object(self.sc, "project", side_effect=expire):
+            stats = worker.run()
+        self.assertTrue(stats["partial"])
+        with sqlite3.connect(self.db) as con:
+            self.assertEqual(con.execute("SELECT offset FROM native_capture_files").fetchone(), (0,))
+            self.assertEqual(con.execute("SELECT count(*) FROM native_capture_roots").fetchone(), (0,))
+            self.assertEqual(con.execute("SELECT count(*) FROM native_capture_raw").fetchone(), (0,))
+        self.sync()
+        self.assertEqual(len(self.rows()), 2)
 
     def test_children_keyed_by_agent_no_duplicates_on_rerun(self):
         write_lines(self.top, [rec("u1", "user", "top prompt"), rec("a1", "assistant", "top answer")])

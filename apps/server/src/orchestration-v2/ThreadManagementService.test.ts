@@ -311,20 +311,32 @@ const layerThreadManagementTest = (settingsLayer: ReturnType<typeof ServerSettin
   );
 
 // ardud: an accepted steer/restart can be retried after the run or thread changes state.
-it.effect.each(["steer", "restart"] as const)(
-  "replays an accepted %s after its run completes or its thread is archived",
-  (mode) => {
+it.effect.each([
+  ["steer", true, true, true, false],
+  ["steer", true, true, true, true],
+  ["restart", true, true, true, false],
+  ["restart", false, true, true, false],
+  ["restart", false, false, true, false],
+  ["restart", false, true, false, false],
+] as const)(
+  "replays the capability-selected send after completion or archive (%j)",
+  ([mode, native, interrupt, queue, activeTurnOnly]) => {
     const projectId = ProjectId.make(`project:receipt:${mode}`);
     const threadId = ThreadId.make(`thread:receipt:${mode}`);
     const runId = RunId.make(`run:receipt:${mode}`);
     const attemptId = RunAttemptId.make(`attempt:receipt:${mode}`);
     const messageId = MessageId.make(`message:receipt:${mode}`);
     const commandId = CommandId.make(`command:receipt:${mode}`);
+    const fallback = mode === "restart" && !native && interrupt && queue;
+    const providerThreadId = ProviderThreadId.make("provider-thread:restart");
+    const sessionId = ProviderSessionId.make("session:restart");
     const commands: OrchestrationV2ServerCommand[] = [];
+    const freshCommands: OrchestrationV2ServerCommand[] = [];
     const messages: Array<{ id: MessageId; runId: RunId }> = [];
     let completed = false;
     let archived = false;
     let accepted = false;
+    let partialRestart = false;
     const now = DateTime.makeUnsafe("2026-11-03T00:00:00.000Z");
     const layerTest = ThreadManagementService.layer.pipe(
       Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
@@ -347,6 +359,7 @@ it.effect.each(["steer", "restart"] as const)(
                       ordinal: 1,
                       status: completed ? "completed" : "running",
                       activeAttemptId: attemptId,
+                      providerThreadId,
                     },
                   ],
                   providerTurns: [
@@ -356,17 +369,31 @@ it.effect.each(["steer", "restart"] as const)(
                       status: "running",
                     },
                   ],
+                  providerThreads: [{ id: providerThreadId, providerSessionId: sessionId }],
+                  providerSessions: [
+                    {
+                      id: sessionId,
+                      capabilities: {
+                        turns: {
+                          supportsSteeringByInterruptRestart: native,
+                          supportsInterrupt: interrupt,
+                          supportsQueuedMessages: queue,
+                        },
+                      },
+                    },
+                  ],
                   messages,
                   turnItems: messages.map((message) => ({
                     type: "user_message",
                     messageId: message.id,
-                    inputIntent: "steering",
+                    inputIntent: fallback ? "queued_turn" : "steer",
                   })),
                 }) as unknown as OrchestrationV2ThreadProjection,
             ),
           dispatch: (command) =>
             Effect.sync(() => {
               commands.push(command);
+              if (!accepted) freshCommands.push(command);
               if (!accepted && command.type === "message.dispatch") {
                 accepted = true;
                 messages.push({ id: command.messageId, runId });
@@ -379,17 +406,27 @@ it.effect.each(["steer", "restart"] as const)(
         Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
           getByCommandId: (id) =>
             Effect.succeed(
-              accepted && id === commandId
+              partialRestart && id === `${commandId}:restart-interrupt`
                 ? Option.some({
-                    commandId,
+                    commandId: id,
                     threadId,
-                    commandType: "message.dispatch",
+                    commandType: "run.interrupt",
                     status: "accepted",
                     acceptedAt: now,
                     resultSequence: 1,
                     error: null,
                   })
-                : Option.none(),
+                : accepted && id === commandId
+                  ? Option.some({
+                      commandId,
+                      threadId,
+                      commandType: "message.dispatch",
+                      status: "accepted",
+                      acceptedAt: now,
+                      resultSequence: 1,
+                      error: null,
+                    })
+                  : Option.none(),
             ),
         }),
       ),
@@ -404,17 +441,44 @@ it.effect.each(["steer", "restart"] as const)(
         messageId,
         commandId,
         mode,
+        activeTurnOnly,
         text: "steer",
         attachments: [],
         createdBy: "user" as const,
         creationSource: "web" as const,
       };
       const first = yield* service.sendToThread(input);
+      expect(first.delivery).toBe(mode === "restart" ? "restarted" : "steered");
+      expect(freshCommands.map((command) => command.type)).toEqual(
+        fallback ? ["run.interrupt", "message.dispatch"] : ["message.dispatch"],
+      );
+      if (fallback)
+        expect(freshCommands[0]).toMatchObject({
+          commandId: CommandId.make(`${commandId}:restart-interrupt`),
+          threadId,
+          runId,
+          fenced: true,
+          expectedAttemptId: attemptId,
+        });
+      expect(freshCommands.at(-1)).toMatchObject({
+        commandId,
+        messageId,
+        dispatchMode: fallback
+          ? { type: "queue_after_active" }
+          : {
+              type: mode === "restart" ? "restart_active" : "steer_active",
+              targetRunId: runId,
+              ...(activeTurnOnly ? { activeTurnOnly: true } : {}),
+            },
+      });
+      yield* service.sendToThread(input);
+      expect(freshCommands).toHaveLength(fallback ? 2 : 1);
       completed = true;
       const retry = yield* service.sendToThread(input);
       expect(retry.message).toEqual(first.message);
       expect(messages).toHaveLength(1);
       expect(retry.run.id).toBe(runId);
+      expect(retry.delivery).toBe(first.delivery);
       expect(commands.at(-1)).toMatchObject({
         commandId,
         dispatchMode: { type: "start_immediately" },
@@ -433,6 +497,23 @@ it.effect.each(["steer", "restart"] as const)(
       expect(archivedFresh).toBeInstanceOf(
         ThreadManagementService.ThreadManagementThreadArchivedError,
       );
+      if (fallback) {
+        // The interrupt committed, but the message did not, and the run has since settled.
+        archived = false;
+        accepted = false;
+        messages.length = 0;
+        partialRestart = true;
+        const start = commands.length;
+        expect((yield* service.sendToThread(input)).delivery).toBe("restarted");
+        expect(commands.slice(start)).toMatchObject([
+          {
+            type: "message.dispatch",
+            commandId,
+            messageId,
+            dispatchMode: { type: "queue_after_active" },
+          },
+        ]);
+      }
     }).pipe(Effect.provide(layerTest));
   },
 );
@@ -777,6 +858,8 @@ const migrationMessage = (
 // actual flag, receipt store, resolver and management dispatch remain real.
 const migrationHarness = (input: {
   readonly mode?: "off" | "dryrun" | "apply";
+  readonly cutoverComplete?: boolean;
+  readonly threadIds?: ReadonlyArray<ThreadId>;
   readonly allowConflicts?: boolean;
   readonly stored?: ModelSelection;
   readonly targetEnabled?: boolean;
@@ -784,11 +867,23 @@ const migrationHarness = (input: {
   readonly runs?: ReadonlyArray<{ readonly status: OrchestrationV2Run["status"] }>;
   readonly failSelection?: boolean;
   readonly failMessageOnce?: boolean;
+  readonly pendingRequest?: boolean;
+  readonly backgroundTask?: boolean;
 }) => {
   const calls: Array<OrchestrationV2ServerCommand> = [];
+  const transcriptCalls: Array<ThreadId> = [];
   let stored = input.stored ?? legacySelection;
   let failMessageOnce = input.failMessageOnce ?? false;
-  const layerTest = ThreadManagementService.layer.pipe(
+  const layerTest = ThreadManagementService.layerWithLegacyImporter.pipe(
+    Layer.provide(
+      Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({
+        ensureTranscript: (threadId) =>
+          Effect.sync(() => {
+            transcriptCalls.push(threadId);
+            return { importedThreadCount: 0, importedMessageCount: 0 };
+          }),
+      }),
+    ),
     Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
     Layer.provide(
       Layer.mock(Orchestrator.OrchestratorV2)({
@@ -804,8 +899,19 @@ const migrationHarness = (input: {
                   lineage: { relationshipToParent: "root" },
                   creationSource: "web",
                   modelSelection: stored,
+                  activeProviderThreadId: input.backgroundTask ? "active" : null,
                 },
                 runs: input.runs ?? [],
+                runtimeRequests: input.pendingRequest ? [{ status: "pending" }] : [],
+                providerThreads: input.backgroundTask
+                  ? [
+                      {
+                        id: "active",
+                        pendingBackgroundTasks: [{ taskId: "task:live", kind: "subagent" }],
+                      },
+                    ]
+                  : [],
+                subagents: [],
               }) as unknown as OrchestrationV2ThreadProjection,
           ),
         dispatch: (command) =>
@@ -838,11 +944,17 @@ const migrationHarness = (input: {
     ),
     Layer.provide(
       ServerSettings.layerTest({
-        ...(input.mode === undefined
+        ...(input.mode === undefined &&
+        input.threadIds === undefined &&
+        input.cutoverComplete === undefined
           ? {}
           : {
               ardudHarnessMigration: {
-                selections: input.mode,
+                ...(input.mode === undefined ? {} : { selections: input.mode }),
+                ...(input.cutoverComplete === undefined
+                  ? {}
+                  : { cutoverComplete: input.cutoverComplete }),
+                ...(input.threadIds === undefined ? {} : { threadIds: input.threadIds }),
                 ...(input.allowConflicts === undefined
                   ? {}
                   : { allowConflicts: input.allowConflicts }),
@@ -862,7 +974,7 @@ const migrationHarness = (input: {
     ),
     Layer.provideMerge(layerReceiptsTest),
   );
-  return { layerTest, calls, getStored: () => stored };
+  return { layerTest, calls, transcriptCalls, getStored: () => stored };
 };
 
 it.effect("migrates a dormant stored selection once before multiple inherited sends", () => {
@@ -879,6 +991,79 @@ it.effect("migrates a dormant stored selection once before multiple inherited se
     expect(harness.calls[0]).toMatchObject({ modelSelection: mappedSelection });
     expect(harness.calls[1]).not.toHaveProperty("modelSelection");
     expect(harness.getStored()).toEqual(mappedSelection);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
+it.effect.each(["apply", "off"] as const)(
+  "rejects explicit legacy sends before canonicalization after cutover with migration %s",
+  (mode) => {
+    const harness = migrationHarness({ mode, cutoverComplete: true, stored: mappedSelection });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const error = yield* Effect.flip(
+        threads.dispatch(migrationMessage(`legacy-${mode}`, legacySelection)),
+      );
+      expect(error._tag).toBe("OrchestratorCommandRejectedError");
+      expect(harness.calls).toEqual([]);
+      yield* threads.dispatch(migrationMessage(`native-${mode}`, mappedSelection));
+      yield* threads.dispatch(migrationMessage(`inherited-${mode}`));
+      expect(harness.calls.map((command) => command.type)).toEqual([
+        "message.dispatch",
+        "message.dispatch",
+      ]);
+      expect(harness.getStored()).toEqual(mappedSelection);
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
+it.effect(
+  "after cutover, an idle thread still on its legacy selection migrates when the composer resends that selection",
+  () => {
+    const harness = migrationHarness({ mode: "apply", cutoverComplete: true });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      yield* threads.dispatch(migrationMessage("composer-own", legacySelection));
+      expect(harness.calls.map((command) => command.type)).toEqual([
+        "thread.model-selection.set",
+        "message.dispatch",
+      ]);
+      expect(harness.calls[0]).toMatchObject({ modelSelection: mappedSelection });
+      expect(harness.calls[1]).toMatchObject({ modelSelection: mappedSelection });
+      expect(harness.getStored()).toEqual(mappedSelection);
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
+it.effect("after cutover, a legacy selection that is not the thread's own is still refused", () => {
+  const other: ModelSelection = {
+    instanceId: ProviderInstanceId.make("opencode"),
+    model: "opus/cc/claude-haiku-5-5",
+  };
+  const harness = migrationHarness({ mode: "apply", cutoverComplete: true });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    const error = yield* Effect.flip(threads.dispatch(migrationMessage("composer-other", other)));
+    expect(error._tag).toBe("OrchestratorCommandRejectedError");
+    expect(harness.calls).toEqual([]);
+    expect(harness.getStored()).toEqual(legacySelection);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
+it.effect("routes only allowlisted threads while global selection routing stays off", () => {
+  const harness = migrationHarness({ mode: "off", threadIds: [migrationThreadId] });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    yield* threads.dispatch(migrationMessage("allowlisted"));
+    expect(harness.getStored()).toEqual(mappedSelection);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
+it.effect("does not route a different thread on the allowlist", () => {
+  const harness = migrationHarness({ threadIds: [ThreadId.make("thread:someone-else")] });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    yield* threads.dispatch(migrationMessage("not-allowlisted"));
+    expect(harness.getStored()).toEqual(legacySelection);
   }).pipe(Effect.provide(harness.layerTest));
 });
 
@@ -1057,6 +1242,38 @@ it.effect.each(["running", "queued"] as const)(
   },
 );
 
+it.effect.each(["running", "queued"] as const)(
+  "after cutover, a %s thread keeps its harness for this send and moves on a later idle turn",
+  (status) => {
+    const harness = migrationHarness({
+      mode: "apply",
+      cutoverComplete: true,
+      runs: [{ status }],
+    });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      yield* threads.dispatch(migrationMessage(`busy-${status}`, legacySelection));
+      expect(harness.calls.map((command) => command.type)).toEqual(["message.dispatch"]);
+      expect(harness.calls[0]).toMatchObject({ modelSelection: legacySelection });
+      expect(harness.getStored()).toEqual(legacySelection);
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
+it.effect.each(["pendingRequest", "backgroundTask"] as const)(
+  "does not detach a provider with $0",
+  (blocker) => {
+    const harness = migrationHarness({ threadIds: [migrationThreadId], [blocker]: true });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const error = yield* Effect.flip(threads.dispatch(migrationMessage(blocker)));
+      expect(error).toMatchObject({ _tag: "OrchestratorCommandRejectedError" });
+      expect(harness.calls).toEqual([]);
+      expect(harness.getStored()).toEqual(legacySelection);
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
 it.effect("propagates a failed selection update without dispatching the message", () => {
   const harness = migrationHarness({ mode: "apply", failSelection: true });
   return Effect.gen(function* () {
@@ -1086,10 +1303,14 @@ it.effect("does not repeat a successful selection update if the send fails and i
 });
 
 it.effect.each(["accepted", "rejected", "other-thread", "project"] as const)(
-  "leaves %s receipt replay and conflicts to the orchestrator without migrating",
+  "leaves %s receipt replay and conflicts to the orchestrator without hydrating or migrating",
   (kind) => {
-    const harness = migrationHarness({ mode: "apply", targetEnabled: false });
-    const message = migrationMessage(`receipt-${kind}`);
+    const harness = migrationHarness({
+      mode: "apply",
+      cutoverComplete: true,
+      targetEnabled: false,
+    });
+    const message = migrationMessage(`receipt-${kind}`, legacySelection);
     return Effect.gen(function* () {
       const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
       yield* receipts.insertIfAbsent({
@@ -1108,6 +1329,7 @@ it.effect.each(["accepted", "rejected", "other-thread", "project"] as const)(
       const threads = yield* ThreadManagementService.ThreadManagementService;
       yield* threads.dispatch(message);
       expect(harness.calls).toEqual([message]);
+      expect(harness.transcriptCalls).toEqual([]);
       expect(harness.getStored()).toEqual(legacySelection);
     }).pipe(Effect.provide(harness.layerTest));
   },

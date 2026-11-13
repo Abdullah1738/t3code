@@ -16,6 +16,7 @@ import {
   ProviderInstanceId,
   ProviderReplayTranscript,
   ProviderThreadId,
+  ProviderTurnId,
   RunAttemptId,
   RunId,
   ThreadId,
@@ -33,6 +34,8 @@ import {
   OrchestrationV2ProviderCapabilities,
   OrchestrationV2ProviderThread,
   OrchestrationV2ProviderThreadJson,
+  OrchestrationV2ProviderTurn,
+  OrchestrationV2ProviderTurnJson,
   OrchestrationV2RpcSchemas,
   OrchestrationV2ShellSnapshot,
   OrchestrationV2SubscribeThreadInput,
@@ -115,6 +118,16 @@ const decodeOrchestrationV2DomainEvent = Schema.decodeUnknownSync(OrchestrationV
 const decodeProviderReplayTranscript = Schema.decodeUnknownSync(ProviderReplayTranscript);
 const decodeOrchestrationV2Subagent = Schema.decodeUnknownSync(OrchestrationV2Subagent);
 const encodeOrchestrationV2SubagentJson = Schema.encodeSync(OrchestrationV2SubagentJson);
+const decodeProviderTurn = Schema.decodeUnknownSync(OrchestrationV2ProviderTurn);
+const providerTurnCodecs = [
+  OrchestrationV2ProviderTurnJson,
+  Schema.toCodecJson(OrchestrationV2ProviderTurn),
+].map((codec) => ({
+  encode: Schema.encodeSync(codec),
+  decode: Schema.decodeUnknownSync(codec),
+}));
+const encodeDomainEventJson = Schema.encodeSync(OrchestrationV2DomainEventJson);
+const decodeDomainEventJson = Schema.decodeUnknownSync(OrchestrationV2DomainEventJson);
 const decodeOrchestrationV2ThreadProjection = Schema.decodeUnknownSync(
   OrchestrationV2ThreadProjection,
 );
@@ -1568,6 +1581,37 @@ describe("latestProviderTurnForAttempt", () => {
     expect(latestProviderTurnForAttempt(turns, RunAttemptId.make("goal-attempt"))?.id).toBe("last");
     expect(latestProviderTurnForAttempt(turns, null)).toBeUndefined();
   });
+});
+
+it("round-trips native prompt acceptance through provider-turn JSON and domain events without requiring it on old records", () => {
+  const base = {
+    id: ProviderTurnId.make("turn:accepted"),
+    providerThreadId: ProviderThreadId.make("provider-thread:accepted"),
+    nodeId: NodeId.make("node:accepted"),
+    runAttemptId: RunAttemptId.make("attempt:accepted"),
+    nativeTurnRef: null,
+    ordinal: 1,
+    status: "completed",
+    startedAt: now,
+    completedAt: now,
+  } as const;
+  for (const turn of [base, { ...base, promptAcceptedAt: now }]) {
+    const runtime = decodeProviderTurn(turn);
+    for (const codec of providerTurnCodecs) {
+      const json = JSON.stringify(codec.encode(runtime));
+      expect(codec.decode(JSON.parse(json))).toEqual(runtime);
+    }
+    const event = {
+      id: EventId.make("event:accepted"),
+      type: "provider-turn.updated",
+      threadId: ThreadId.make("thread:accepted"),
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      occurredAt: now,
+      payload: runtime,
+    } as const;
+    const json = JSON.stringify(encodeDomainEventJson(event));
+    expect(decodeDomainEventJson(JSON.parse(json))).toEqual(event);
+  }
 });
 
 describe("restart-cancelled background work", () => {

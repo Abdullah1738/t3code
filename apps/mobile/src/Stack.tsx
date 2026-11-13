@@ -132,6 +132,12 @@ import { UsageRouteScreen } from "./features/usage/UsageRouteScreen";
 import { KanbanBoardRouteScreen } from "./ardud/kanban/KanbanBoardRouteScreen";
 import { NewBoardRouteScreen } from "./ardud/kanban/NewBoardRouteScreen";
 import { KanbanRecordRouteScreen } from "./ardud/kanban/KanbanRecordRouteScreen";
+import { AskDiscussionRouteScreen } from "./ardud/kanban/needsYou/AskDiscussionRouteScreen";
+import { AskRouteScreen } from "./ardud/kanban/needsYou/AskRouteScreen";
+import { BatchRouteScreen } from "./ardud/kanban/needsYou/BatchRouteScreen";
+import { HistoryRouteScreen } from "./ardud/kanban/needsYou/HistoryRouteScreen";
+import { NeedsYouRouteScreen } from "./ardud/kanban/needsYou/NeedsYouRouteScreen";
+import { ReferenceRouteScreen } from "./ardud/kanban/needsYou/ReferenceRouteScreen";
 // end ardud kanban: ui-mobile
 // ardud imessage: mobile
 import { IMessageChatRouteScreen } from "./ardud/imessage/IMessageChatRouteScreen";
@@ -799,6 +805,36 @@ const RootStackConfig = createWorkspaceStackNavigator({
       screen: KanbanRecordRouteScreen,
       linking: "boards/:boardId/:kind/:id?",
       options: { ...SOLID_HEADER_OPTIONS, title: "Board" },
+    }),
+    NeedsYou: createNativeStackScreen({
+      screen: NeedsYouRouteScreen,
+      linking: "needs-you",
+      options: { ...SOLID_HEADER_OPTIONS, title: "Needs you" },
+    }),
+    NeedsYouAsk: createNativeStackScreen({
+      screen: AskRouteScreen,
+      linking: "needs-you/ask/:cardId/:askId",
+      options: { ...SOLID_HEADER_OPTIONS, title: "Ask" },
+    }),
+    NeedsYouBatch: createNativeStackScreen({
+      screen: BatchRouteScreen,
+      linking: "needs-you/batch/:boardId/:batchKey",
+      options: { ...SOLID_HEADER_OPTIONS, title: "Batch" },
+    }),
+    NeedsYouDiscussion: createNativeStackScreen({
+      screen: AskDiscussionRouteScreen,
+      linking: "needs-you/ask/:cardId/:askId/discussion",
+      options: { ...SOLID_HEADER_OPTIONS, title: "Discussion" },
+    }),
+    NeedsYouHistory: createNativeStackScreen({
+      screen: HistoryRouteScreen,
+      linking: "needs-you/history",
+      options: { ...SOLID_HEADER_OPTIONS, title: "History" },
+    }),
+    NeedsYouReference: createNativeStackScreen({
+      screen: ReferenceRouteScreen,
+      linking: "needs-you/reference",
+      options: { ...SOLID_HEADER_OPTIONS, title: "What an ask can be" },
     }),
     // end ardud kanban: ui-mobile
     // ardud imessage: mobile

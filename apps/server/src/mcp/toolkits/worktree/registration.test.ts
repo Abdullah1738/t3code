@@ -35,6 +35,7 @@ import * as McpSessionRegistry from "../../McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "../../PreviewAutomationBroker.ts";
 import * as PreviewBrowser from "../../../preview/PreviewBrowser.ts";
 import { KanbanService } from "../../../ardud/kanban/engine/KanbanService.ts";
+import { KanbanToolkit } from "../../../ardud/kanban/tools/tools.ts";
 // ardud schedules: blocked-run retry tool
 import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
 import * as CredentialStore from "../../../ardud/mcp/CredentialStore.ts";
@@ -88,94 +89,103 @@ const ToolsListPayload = Schema.fromJsonString(
 );
 const decodeToolsListPayload = Schema.decodeUnknownEffect(ToolsListPayload);
 
-it.effect("production mcp layer lists worktree tools over http", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const layerRoutes = McpHttpServer.layer.pipe(
-        Layer.provide(McpSessionRegistry.layer.pipe(Layer.provide(CredentialStore.layer))),
-      );
-      yield* HttpRouter.serve(layerRoutes, {
-        disableListenLog: true,
-        disableLogger: true,
-      }).pipe(
-        Layer.provide(
-          Layer.mock(ServerEnvironment.ServerEnvironment)({
-            getEnvironmentId: Effect.succeed("environment-scratch" as never),
-          }),
+it.effect.each(["claudeAgent", "codex", "codex-cu"])(
+  "production MCP exposes history, delegation and board tools to %s over HTTP",
+  (instanceId) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const layerRoutes = McpHttpServer.layer.pipe(
+          Layer.provide(McpSessionRegistry.layer.pipe(Layer.provide(CredentialStore.layer))),
+        );
+        yield* HttpRouter.serve(layerRoutes, {
+          disableListenLog: true,
+          disableLogger: true,
+        }).pipe(
+          Layer.provide(
+            Layer.mock(ServerEnvironment.ServerEnvironment)({
+              getEnvironmentId: Effect.succeed("environment-scratch" as never),
+            }),
+          ),
+          Layer.provide(PreviewAutomationBroker.layer),
+          Layer.provide(PreviewBrowser.layer),
+          Layer.provide(layerStubServices),
+          Layer.build,
+        );
+
+        const registry = McpSessionRegistry.issueActiveMcpCredential({
+          threadId: ThreadId.make("thread-scratch"),
+          providerInstanceId: ProviderInstanceId.make(instanceId),
+        });
+        const credential = yield* registry;
+        expect(credential).toBeDefined();
+
+        const httpClient = yield* HttpClient.HttpClient;
+        const auth = credential!.config.authorizationHeader;
+        const initResponse = yield* httpClient.post("/mcp", {
+          headers: {
+            accept: "application/json, text/event-stream",
+            authorization: auth,
+          },
+          body: HttpBody.text(
+            `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"scratch","version":"1.0.0"}}}`,
+            "application/json",
+          ),
+        });
+        expect(initResponse.status).toBe(200);
+        const sessionId = initResponse.headers["mcp-session-id"];
+
+        const listResponse = yield* httpClient.post("/mcp", {
+          headers: {
+            accept: "application/json, text/event-stream",
+            authorization: auth,
+            "mcp-protocol-version": "2025-06-18",
+            ...(sessionId ? { "mcp-session-id": sessionId } : {}),
+          },
+          body: HttpBody.text(
+            `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`,
+            "application/json",
+          ),
+        });
+        const bodyText = yield* listResponse.text;
+        const payload = yield* decodeToolsListPayload(bodyText.match(/\{.*\}/s)![0]);
+        const tools = payload.result.tools;
+        const toolNames = tools.map((tool) => tool.name);
+        expect(toolNames).toContain("t3_worktree_handoff");
+        expect(toolNames).toContain("t3_worktree_status");
+        expect(toolNames).toContain("preview_status");
+        expect(toolNames).toContain("delegate_task");
+        expect(toolNames).toContain("t3_thread_read");
+        expect(toolNames).toContain("evaluator_start");
+        const cardTools = Object.keys(KanbanToolkit.tools).filter((name) =>
+          name.startsWith("card_"),
+        );
+        expect(cardTools.length).toBeGreaterThan(0);
+        for (const name of cardTools) expect(toolNames).toContain(name);
+
+        const handoff = tools.find((tool) => tool.name === "t3_worktree_handoff");
+        expect(handoff?.annotations?.readOnlyHint).toBe(false);
+        expect(handoff?.annotations?.destructiveHint).toBe(true);
+        expect(handoff?.annotations?.openWorldHint).toBe(true);
+        const status = tools.find((tool) => tool.name === "t3_worktree_status");
+        expect(status?.annotations?.readOnlyHint).toBe(true);
+        expect(status?.annotations?.destructiveHint).toBe(false);
+
+        // MCP requires every tool input schema to be a top-level object schema.
+        // A non-object schema (e.g. the anyOf produced by an empty
+        // Schema.Struct({})) makes clients reject the entire server.
+        for (const tool of tools) {
+          expect(tool.inputSchema.type, `inputSchema.type of ${tool.name}`).toBe("object");
+        }
+      }),
+    ).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NodeHttpServer.layerTest,
+          ServerConfig.layerTest(process.cwd(), { prefix: "t3-worktree-mcp-" }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+          NodeServices.layer,
         ),
-        Layer.provide(PreviewAutomationBroker.layer),
-        Layer.provide(PreviewBrowser.layer),
-        Layer.provide(layerStubServices),
-        Layer.build,
-      );
-
-      const registry = McpSessionRegistry.issueActiveMcpCredential({
-        threadId: ThreadId.make("thread-scratch"),
-        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
-      });
-      const credential = yield* registry;
-      expect(credential).toBeDefined();
-
-      const httpClient = yield* HttpClient.HttpClient;
-      const auth = credential!.config.authorizationHeader;
-      const initResponse = yield* httpClient.post("/mcp", {
-        headers: {
-          accept: "application/json, text/event-stream",
-          authorization: auth,
-        },
-        body: HttpBody.text(
-          `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"scratch","version":"1.0.0"}}}`,
-          "application/json",
-        ),
-      });
-      expect(initResponse.status).toBe(200);
-      const sessionId = initResponse.headers["mcp-session-id"];
-
-      const listResponse = yield* httpClient.post("/mcp", {
-        headers: {
-          accept: "application/json, text/event-stream",
-          authorization: auth,
-          "mcp-protocol-version": "2025-06-18",
-          ...(sessionId ? { "mcp-session-id": sessionId } : {}),
-        },
-        body: HttpBody.text(
-          `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`,
-          "application/json",
-        ),
-      });
-      const bodyText = yield* listResponse.text;
-      const payload = yield* decodeToolsListPayload(bodyText.match(/\{.*\}/s)![0]);
-      const tools = payload.result.tools;
-      const toolNames = tools.map((tool) => tool.name);
-      expect(toolNames).toContain("t3_worktree_handoff");
-      expect(toolNames).toContain("t3_worktree_status");
-      expect(toolNames).toContain("preview_status");
-      expect(toolNames).toContain("delegate_task");
-
-      const handoff = tools.find((tool) => tool.name === "t3_worktree_handoff");
-      expect(handoff?.annotations?.readOnlyHint).toBe(false);
-      expect(handoff?.annotations?.destructiveHint).toBe(true);
-      expect(handoff?.annotations?.openWorldHint).toBe(true);
-      const status = tools.find((tool) => tool.name === "t3_worktree_status");
-      expect(status?.annotations?.readOnlyHint).toBe(true);
-      expect(status?.annotations?.destructiveHint).toBe(false);
-
-      // MCP requires every tool input schema to be a top-level object schema.
-      // A non-object schema (e.g. the anyOf produced by an empty
-      // Schema.Struct({})) makes clients reject the entire server.
-      for (const tool of tools) {
-        expect(tool.inputSchema.type, `inputSchema.type of ${tool.name}`).toBe("object");
-      }
-    }),
-  ).pipe(
-    Effect.provide(
-      Layer.mergeAll(
-        NodeHttpServer.layerTest,
-        ServerConfig.layerTest(process.cwd(), { prefix: "t3-worktree-mcp-" }).pipe(
-          Layer.provide(NodeServices.layer),
-        ),
-        NodeServices.layer,
       ),
     ),
-  ),
 );

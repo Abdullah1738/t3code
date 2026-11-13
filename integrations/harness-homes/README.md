@@ -8,27 +8,131 @@ Claude Code and Codex agents Robob runs do not use the personal `~/.claude` or
 - Codex home: `~/.robob/harness-homes/codex` (`CODEX_HOME`)
 - Codex Terra home: `~/.robob/harness-homes/codex-cu` (`CODEX_HOME`)
 
-Stdlib Python only. Auth is never written here: credentials come from each
+The generator uses only Python's stdlib; shared servers reuse their installed
+MCP SDK venvs. Auth is never written here: credentials come from each
 instance's environment, and OAuth state stays in the home it was created in.
 
 ## Files
 
 - `manifest.json`: the single source. Homes, skill roots, canonical AGENTS.md,
-  the seven MCP servers, PATH, hooks, Codex model extension, Claude knobs.
+  shared MCP servers (including recall's canonical `http://127.0.0.1:18765/mcp`
+  service), PATH, hooks, Codex model extension, Claude knobs.
 - `generate_homes.py`: `generate [--home-root DIR] [--dry-run]` writes all homes
   idempotently (atomic writes, one line per changed file). `check [--home-root DIR]`
-  compares their owned contents with the manifest and catalog.
+  compares their owned contents with the manifest and catalog. `mcp-diff`
+  compares the manifest's MCPs with OpenCode's (see "MCP parity with OpenCode").
 - `vendor/codex-models-0.166.0.json`: Codex's model catalog at rust-v0.166.0
   (Apache-2.0). `vendor/README.md` has the URL and sha256.
 - `overlays/claude.md`, `overlays/codex.md`, `overlays/codex-cu.md`:
   per-harness instructions. `codex-cu` gets the shared Codex overlay first,
   then its own draft overlay; generation fails if the latter is missing or empty.
   Its deployment still requires owner approval.
-- `install.zsh`: copies the package to `~/.local/share/harness-homes`, generates,
-  checks. `--check` only checks. `--with-agent` also loads the LaunchAgent.
+- `install.zsh`: copies the package, starts the shared Flighty/InBody servers,
+  checks their MCP endpoints, migrates those two OpenCode entries, then generates
+  and checks the native homes. Failed installs restore the previous package,
+  OpenCode config and loaded jobs. `--check` checks homes, endpoints and jobs
+  without writing. `--with-agent` also reloads the five-minute generator.
 - `launchd/com.ardud.harness-homes.plist`: runs `generate` every 5 minutes so
   new skills and AGENTS.md edits reach the homes.
 - `tests/test_generate_homes.py`: temp-dir tests only.
+
+Flighty uses a private copy of its venv's base Python at
+`~/.local/share/shared-mcp-flighty/python`, with packages from the existing venv.
+InBody keeps its existing venv. They serve `127.0.0.1:18766/mcp` and
+`127.0.0.1:18767/mcp`. Their LaunchAgents restart failed servers; `install.zsh
+--check` also calls Flighty's `search_airports` to catch database access errors.
+cua-driver retains a separate MCP connection per client because its transport
+owns private session state.
+After owner-approved installation, new native sessions pick up the URLs;
+existing stdio clients finish naturally. No Robob restart is needed.
+
+### Flighty Full Disk Access
+
+Run these steps in order from `integrations/harness-homes`:
+
+1. `/bin/zsh -f install.zsh --flighty-python` prepares only the dedicated
+   interpreter and prints `FULL_DISK_ACCESS_PATH=/Users/ardud/.local/share/shared-mcp-flighty/python/bin/python3.12`.
+   It reads the base installation from the venv's `pyvenv.cfg`; an unchanged
+   copy is left untouched. It does not load jobs or change harness config.
+2. Add the printed binary in **System Settings > Privacy & Security > Full Disk
+   Access**. Grant access to this copy only; the shared uv interpreter is used
+   by other projects.
+3. `/bin/zsh -f install.zsh` syncs the copy before loading the services, then
+   checks them before switching config. A failed install restores the previous
+   package/config/jobs and leaves the dedicated copy in place.
+4. `install.zsh --check` verifies the installed homes, plists, jobs and endpoints.
+
+Repeat this order if an interpreter update changes the binary and macOS requires
+a new grant. InBody's check lists tools without calling its authenticated API.
+The temporary servers started by `shared/smoke.py` use the same interpreters as
+the LaunchAgents, but inherit the caller's access. Only the installed service's
+health check proves Flighty's database is readable under launchd.
+
+## Source parity checks
+
+`generate` also writes `parity-manifest.json` in each home. This is metadata,
+not another copy of the skills or guards. Skills remain symlinks into every
+`skillRoots` entry; hook implementations remain in the shared integrations.
+The native harnesses discover skill metadata themselves, so the OpenCode-only
+compact-skill-catalog plugin does not need a native port. No skill count is pinned.
+
+`check --json [--home-root DIR]` runs the same read-only check as `check` and
+returns `{schemaVersion: 1, ok: boolean, failures: string[], homes: [...]}`.
+Each home entry is `{harness, home, parityManifestPath}`. Exit 0 means all
+owned files, skill links, and parity metadata match current sources; exit 1
+means drift or an unreadable required source. Check never refreshes metadata.
+
+Each parity manifest has schema version 1 and these fields:
+
+- `harness`, `manifestSha256`, `generator: {path, sha256}`.
+- `artifacts: [{path, sha256}]`: absolute paths and SHA-256 of expected bytes
+  for every owned generated file except this parity manifest. Claude covers
+  `settings.json`, `.claude.json`, `CLAUDE.md`, `overlay.md`; each Codex home
+  covers `config.toml`, `hooks.json`, `AGENTS.md`, `models.json`. Hashes come
+  from the generator's plan, never from potentially edited output files.
+  Only `.claude.json` has `format: "claude-owned-json"`: hash the projection
+  `{mcpServers, hasCompletedOnboarding}` as recursively key-sorted compact JSON
+  (`separators=(",", ":")`, UTF-8, `ensure_ascii=False`, no trailing newline).
+  CLI-managed projects/counters remain preserved and do not invalidate parity.
+  All other artifacts omit `format` and retain raw-byte SHA-256.
+- `skills: [{name, source, sha256}]`, hashing the source `SKILL.md`.
+- `mcpServers`: the manifest's shared non-secret server specifications.
+- `runtimeMcpServers: ["t3-code"]`: injected per thread, not proven by home generation.
+- `guards: [{id, sources: [{path, sha256}]}]` and harness-filtered `hooks`.
+- `instructions: {canonical: {path, sha256}, overlays: [{path, sha256}]}`.
+- `compactSkillCatalog: {required: false, reason}`.
+
+## MCP parity with OpenCode
+
+OpenCode keeps its MCPs in `~/.config/opencode/opencode.jsonc` (top-level
+`mcp`); the native homes get theirs from `mcpServers` here. The manifest's
+`mcpParity` block (`{"opencodeConfig": "...", "ignore": []}`) makes `check`
+and `check --json` fail until both sides list the same servers, so an MCP
+added in one place cannot quietly miss the other harnesses.
+
+- Ids are compared as sets. An OpenCode entry with `"enabled": false` counts
+  as absent (a missing `enabled` means enabled). Ids in `ignore` are skipped on
+  both sides; use it only for servers meant to live in one place.
+- For shared ids it also compares transport (`url` vs `command`), the url or
+  command path, args, and env key names (never values).
+- A missing or unparseable OpenCode config is a check failure (fail closed).
+  `generate` never fails on parity; it prints `warning: mcp parity: ...` on stderr.
+- `mcp-diff [--json] [--opencode-config PATH]` prints both sides per id with a
+  status (`ok`, `mismatch`, `opencode-only`, `native-only`, `ignored`,
+  `disabled`); exit 1 on drift. It is read-only.
+- Parity follows the configured homes. A `--home-root` run (tests, the
+  harness-cli canary) skips it unless `--opencode-config PATH` is given.
+- The JSONC reader is stdlib-only: it strips `//` and `/* */` comments outside
+  strings and trailing commas, then uses `json`.
+
+To fix drift, add the server to whichever side lacks it (or to `ignore`), then
+run `generate` so the homes pick it up.
+
+Readiness consumers should run the existing generator check, not trust a
+standalone `ok` flag in an old artifact. These checks prove config/source
+parity only; they do not prove hook trust, MCP authentication, injected T3
+tools, or a native turn's runtime behavior. Recall can be overridden with
+thread-scoped headers by the provider adapter.
 
 ## Run
 

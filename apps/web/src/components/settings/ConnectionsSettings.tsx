@@ -41,6 +41,7 @@ import {
   type DesktopServerExposureState,
   type DesktopWslState,
   type EnvironmentId,
+  isDeviceNotPairedAsOwner,
   resolveEnvironmentMachineKind,
 } from "@t3tools/contracts";
 import {
@@ -930,6 +931,8 @@ type ConnectedClientListRowProps = {
   revokingClientSessionId: string | null;
   onRevokeSession: (sessionId: ServerClientSessionRecord["sessionId"]) => void;
   canRevoke: boolean;
+  /** This screen is open on an owner device, so a link made here pairs an owner device. */
+  canPairAsOwnerHere: boolean;
 };
 
 const ConnectedClientListRow = memo(function ConnectedClientListRow({
@@ -938,6 +941,7 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
   revokingClientSessionId,
   onRevokeSession,
   canRevoke,
+  canPairAsOwnerHere,
 }: ConnectedClientListRowProps) {
   const nowMs = useRelativeTimeTick(1_000);
   const isLive = clientSession.current || clientSession.connected;
@@ -961,6 +965,8 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
     clientSession.client.label ??
     ([clientSession.client.os, clientSession.client.browser].filter(Boolean).join(" · ") ||
       clientSession.subject);
+  // ardud: a paired device that is not the owner's is refused on the board's owner actions.
+  const notPairedAsOwner = isDeviceNotPairedAsOwner(clientSession);
 
   return (
     <div className={accessRowClassName(presentation)}>
@@ -978,6 +984,11 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
                 This device
               </span>
             ) : null}
+            {notPairedAsOwner ? (
+              <span className="text-3xs text-warning shrink-0 rounded-md border border-border/50 bg-muted/50 px-1 py-0.5">
+                Not paired as yours
+              </span>
+            ) : null}
           </div>
           <p className="text-xs text-muted-foreground">
             {deviceInfoBits.length > 0 ? (
@@ -988,6 +999,14 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
             ) : null}
             <AccessScopeSummary scopes={clientSession.scopes} label="Client scopes" />
           </p>
+          {notPairedAsOwner ? (
+            <p className="text-xs text-muted-foreground">
+              Board answers and private fields are refused from this device.{" "}
+              {canPairAsOwnerHere && !clientSession.current
+                ? "Pair it again from here, then revoke this one."
+                : "Pair it again from the Robob desktop app."}
+            </p>
+          ) : null}
         </div>
         <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
           {!clientSession.current ? (
@@ -1246,6 +1265,10 @@ const PairingClientsList = memo(function PairingClientsList({
   onRevokeClientSession,
   canRevoke,
 }: PairingClientsListProps) {
+  // ardud: only an owner session makes links that pair an owner device.
+  const canPairAsOwnerHere = clientSessions.some(
+    (clientSession) => clientSession.current && clientSession.owner === true,
+  );
   return (
     <>
       {pairingLinks.map((pairingLink) => (
@@ -1271,6 +1294,7 @@ const PairingClientsList = memo(function PairingClientsList({
           revokingClientSessionId={revokingClientSessionId}
           onRevokeSession={onRevokeClientSession}
           canRevoke={canRevoke}
+          canPairAsOwnerHere={canPairAsOwnerHere}
         />
       ))}
 

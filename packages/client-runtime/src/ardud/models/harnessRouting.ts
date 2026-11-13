@@ -12,8 +12,8 @@ import type {
   ProviderOptionSelection,
 } from "@t3tools/contracts";
 
-/** Version of HARNESS_MAP. Bump it when a row changes, so stored mappings can be traced. */
-export const HARNESS_MAP_VERSION = 1;
+/** Version of the mapping policy, so stored mappings can be traced. */
+export const HARNESS_MAP_VERSION = 2;
 
 export type EffortOptionId = "effort" | "reasoningEffort" | "variant";
 
@@ -33,7 +33,7 @@ const CLAUDE = "claudeAgent";
 const CODEX = "codex";
 const CODEX_CU = "codex-cu";
 
-/** The legacy OpenCode ids and the route each one moves to. Any other selection stays as it is. */
+/** Verified legacy routes. An unlisted Claude/OpenAI id is a conflict, not a fallback. */
 export const HARNESS_MAP: ReadonlyArray<HarnessMapRow> = [
   {
     from: { instanceId: OPENCODE, model: "opus/claude-opus-5-5" },
@@ -98,6 +98,18 @@ function effortIds(instanceId: string): ReadonlyArray<string> {
 
 /** Every option id that carries an effort, on any instance. */
 const EFFORT_IDS: ReadonlyArray<string> = ["variant", "effort", "reasoningEffort"];
+
+/** Family recognition is deliberately broader than the verified mapping table. */
+export function openCodeModelFamily(model: string): "claude" | "openai" | null {
+  const parts = splitLegacySuffix(model).model.split("/");
+  if (parts.some((part) => /^(?:anthropic|cc)$|^claude(?:$|[-_.])/i.test(part))) return "claude";
+  if (
+    parts.some((part) => /^(?:openai|cx)$|^(?:gpt|chatgpt)(?:$|[-_.])|^o\d(?:$|[-_.])/i.test(part))
+  ) {
+    return "openai";
+  }
+  return null;
+}
 
 /**
  * An effort option (variant, effort, reasoningEffort) must hold a string. A boolean or other
@@ -181,11 +193,19 @@ export function resolveSelection(selection: ModelSelection): SelectionResolution
   if (invalid !== null) return { kind: "conflict", reason: `${selection.model}: ${invalid}` };
   const split = splitRouteSuffix(selection.instanceId, selection.model);
   const row = ROWS_BY_SOURCE.get(rowKey(selection.instanceId, split.model));
-  if (row === undefined) return { kind: "unchanged", selection };
+  if (row === undefined) {
+    const family = selection.instanceId === OPENCODE ? openCodeModelFamily(selection.model) : null;
+    return family === null
+      ? { kind: "unchanged", selection }
+      : {
+          kind: "conflict",
+          reason: `No verified native harness mapping for OpenCode model ${selection.model}; select a model on ${family === "claude" ? CLAUDE : CODEX}.`,
+        };
+  }
 
   const efforts = unique([
     ...(split.effort === null ? [] : [split.effort]),
-    ...valuesOf(selection.options, ["variant"]),
+    ...valuesOf(selection.options, EFFORT_IDS),
   ]);
   if (efforts.length > 1) {
     return {
@@ -211,6 +231,18 @@ export function resolveSelection(selection: ModelSelection): SelectionResolution
     from: { instanceId: row.from.instanceId, model: row.from.model },
     effort,
   };
+}
+
+/** For explicit requests only; inherited selections must still be routed lazily. */
+export function postCutoverSelectionProblem(
+  selection: Pick<ModelSelection, "instanceId" | "model">,
+): string | null {
+  if (selection.instanceId !== OPENCODE || openCodeModelFamily(selection.model) === null)
+    return null;
+  const resolved = resolveSelection(selection);
+  if (resolved.kind === "conflict") return resolved.reason;
+  if (resolved.kind === "unchanged") return null;
+  return `OpenCode model ${selection.model} is unavailable after harness cutover; use ${resolved.selection.instanceId}/${resolved.selection.model} instead.`;
 }
 
 export type MergeResult =
@@ -239,13 +271,12 @@ function foldSuffix(selection: ModelSelection): MergeResult {
   if (invalid !== null) return conflict(`${selection.model}: ${invalid}`);
   const split = splitRouteSuffix(selection.instanceId, selection.model);
   if (split.effort === null) return { kind: "selection", selection };
-  const ids = effortIds(selection.instanceId);
-  const efforts = unique([split.effort, ...valuesOf(selection.options, ids)]);
+  const efforts = unique([split.effort, ...valuesOf(selection.options, EFFORT_IDS)]);
   if (efforts.length > 1) {
     return conflict(`${selection.model} conflicts with its effort option: ${efforts.join(", ")}`);
   }
   const options: Array<ProviderOptionSelection> = [
-    ...(selection.options ?? []).filter((option) => !ids.includes(option.id)),
+    ...(selection.options ?? []).filter((option) => !EFFORT_IDS.includes(option.id)),
     { id: effortOptionId(selection.instanceId), value: split.effort },
   ];
   return {

@@ -1,4 +1,4 @@
-import type { KanbanAnswer, KanbanBlock } from "@t3tools/contracts";
+import type { KanbanAnswer, KanbanBlock, KanbanMessage } from "@t3tools/contracts";
 import type { BoardColumnPrefs, StageBoard } from "@t3tools/client-runtime/ardud/kanban";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -18,7 +18,9 @@ import {
   parseFilterAction,
   priorityFill,
   firstSendText,
+  blockReadsWhole,
   groupBlockRuns,
+  messageReadWhole,
   requestTitle,
   sendBlocks,
   toggleChoice,
@@ -383,6 +385,56 @@ describe("firstSendText", () => {
 
   it("is empty when there is neither text nor a file", () => {
     expect(firstSendText("  ", [])).toBe("");
+  });
+});
+
+describe("a message cut short by the feed", () => {
+  const cut: KanbanBlock = {
+    _tag: "md",
+    text: "The first lines…",
+    truncated: true,
+    fullBytes: 90_000,
+  };
+  const message = (blocks: ReadonlyArray<KanbanBlock>, seq = 4, discussionId = "d1") =>
+    ({
+      seq,
+      discussionId,
+      author: { _tag: "owner" },
+      authorName: "You",
+      createdAt: "2026-11-11T08:00:00.000Z",
+      blocks,
+      answers: [{ blockId: "c1", by: { _tag: "owner" }, at: "2026-11-11T09:00:00.000Z" }],
+    }) as unknown as KanbanMessage;
+
+  it("offers the whole of a big text, fold or page wherever there is a way to read it", () => {
+    expect(blockReadsWhole(cut, true)).toBe(true);
+    expect(
+      blockReadsWhole(
+        { _tag: "html", html: "", title: "Chart", height: 240, truncated: true },
+        true,
+      ),
+    ).toBe(true);
+    expect(
+      blockReadsWhole({ _tag: "collapse", title: "Log", text: "…", truncated: true }, true),
+    ).toBe(true);
+    // No feed and no loader: nothing to offer. Whole already: nothing to load.
+    expect(blockReadsWhole(cut, false)).toBe(false);
+    expect(blockReadsWhole({ _tag: "md", text: "All of it" }, true)).toBe(false);
+    expect(blockReadsWhole({ _tag: "image", url: "https://x.test/a.png", alt: null }, true)).toBe(
+      false,
+    );
+  });
+
+  it("shows the blocks read whole and keeps the rest as the feed has it", () => {
+    const fed = message([cut]);
+    const whole = message([{ _tag: "md", text: "All ninety thousand bytes" }]);
+    const shown = messageReadWhole(fed, { ...whole, answers: [] });
+    expect(shown.blocks).toEqual([{ _tag: "md", text: "All ninety thousand bytes" }]);
+    expect(shown.answers).toBe(fed.answers);
+    // Nothing read yet, or a read of another message: the feed's own.
+    expect(messageReadWhole(fed, undefined)).toBe(fed);
+    expect(messageReadWhole(fed, message([], 5))).toBe(fed);
+    expect(messageReadWhole(fed, message([], 4, "d2"))).toBe(fed);
   });
 });
 

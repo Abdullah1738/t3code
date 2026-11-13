@@ -36,6 +36,16 @@ export interface CompactionResult {
   readonly deletedTextPayloadBytes: number;
 }
 
+interface CompactionOptions {
+  readonly minPageIntervalMs: number;
+  readonly minDeleteIntervalMs?: number;
+  readonly maxDeletePayloadBytes?: number;
+  /** Per table, starting at its newest row. Omit only for explicit offline maintenance. */
+  readonly maxPagesPerScan?: number;
+  /** Checked between statements; an in-flight SQLite statement is not interrupted. */
+  readonly maxDurationMs?: number;
+}
+
 export class ProjectionMaintenanceError extends Schema.TaggedError<ProjectionMaintenanceError>()(
   "ProjectionMaintenanceError",
   {
@@ -48,9 +58,9 @@ export interface ProjectionMaintenanceV2Shape {
   readonly verify: Effect.Effect<ProjectionVerificationV2, ProjectionMaintenanceError>;
   readonly rebuild: Effect.Effect<ProjectionVerificationV2, ProjectionMaintenanceError>;
   readonly compactEventStore: Effect.Effect<CompactionResult, ProjectionMaintenanceError>;
-  readonly compactEventStoreWith: (options: {
-    readonly minPageIntervalMs: number;
-  }) => Effect.Effect<CompactionResult, ProjectionMaintenanceError>;
+  readonly compactEventStoreWith: (
+    options: CompactionOptions,
+  ) => Effect.Effect<CompactionResult, ProjectionMaintenanceError>;
 }
 
 export class ProjectionMaintenanceV2 extends Context.Service<
@@ -136,6 +146,8 @@ export const layer: Layer.Layer<
           yield* sql`DELETE FROM orchestration_v2_projection_checkpoints`;
           yield* sql`DELETE FROM orchestration_v2_projection_checkpoint_scopes`;
           yield* sql`DELETE FROM orchestration_v2_projection_turn_items`;
+          // Cold rows stay as rollback copies. Replayed main identities shadow
+          // them; deleting both WAL stores in one transaction is not crash-atomic.
           yield* sql`DELETE FROM orchestration_v2_projection_plans`;
           yield* sql`DELETE FROM orchestration_v2_projection_messages`;
           yield* sql`DELETE FROM orchestration_v2_projection_runtime_requests`;
@@ -254,7 +266,13 @@ export const layer: Layer.Layer<
      * still scan the entire history when superseded events are sparse.
      * Text turn items follow the same rule because replay assigns positions on first write.
      */
-    const compactEventStoreWith = ({ minPageIntervalMs }: { readonly minPageIntervalMs: number }) =>
+    const compactEventStoreWith = ({
+      minPageIntervalMs,
+      minDeleteIntervalMs = 0,
+      maxDeletePayloadBytes = Number.POSITIVE_INFINITY,
+      maxPagesPerScan = Number.POSITIVE_INFINITY,
+      maxDurationMs = Number.POSITIVE_INFINITY,
+    }: CompactionOptions) =>
       Effect.suspend(() => {
         const intervalNanos = BigInt(Math.max(0, Math.ceil(minPageIntervalMs * 1_000_000)));
         let lastPageStart: bigint | undefined;
@@ -293,6 +311,10 @@ export const layer: Layer.Layer<
         });
 
         const scan = Effect.gen(function* () {
+          const started = yield* Clock.monotonicTimeNanos;
+          const withinBudget = Clock.monotonicTimeNanos.pipe(
+            Effect.map((now) => Number(now - started) / 1_000_000 < maxDurationMs),
+          );
           const bounds = yield* sql<{
             readonly event_sequence: number;
             readonly receipt_row_id: number;
@@ -309,10 +331,20 @@ export const layer: Layer.Layer<
           // deleted once an even older event turns up and kept otherwise.
           const oldestCandidateByEntityKey = new Map<
             string,
-            { readonly sequence: number; readonly textPayloadBytes: number | null } | null
+            {
+              readonly sequence: number;
+              readonly textPayloadBytes: number | null;
+              readonly payloadBytes: number;
+            } | null
           >();
-          while (throughSequence > 0) {
+          // Never resume a sequence cursor without these sets and pending oldest
+          // candidates. A bounded pass leaves its oldest observed event intact;
+          // restarting from the newest row can only remove proven middle events.
+          let eventPages = 0;
+          while (throughSequence > 0 && eventPages < maxPagesPerScan && (yield* withinBudget)) {
             yield* startPage;
+            if (!(yield* withinBudget)) break;
+            eventPages++;
             const rows = yield* sql<{
               readonly sequence: number;
               readonly application_event_version: number;
@@ -320,6 +352,7 @@ export const layer: Layer.Layer<
               readonly stream_id: string;
               readonly event_type: string;
               readonly entity_id: string | null;
+              readonly payload_bytes: number;
               readonly text_item_payload_json: string | null;
               readonly imported_legacy_thread: number;
             }>`
@@ -329,7 +362,9 @@ export const layer: Layer.Layer<
             event.aggregate_kind,
             event.stream_id,
             event.event_type,
+            octet_length(event.payload_json) AS payload_bytes,
             CASE
+              WHEN octet_length(event.payload_json) > ${maxDeletePayloadBytes} THEN NULL
               WHEN event.application_event_version = 2
                 AND event.event_type IN ('message.updated', 'node.updated')
               THEN json_extract(event.payload_json, '$.id')
@@ -341,6 +376,7 @@ export const layer: Layer.Layer<
               ELSE NULL
             END AS entity_id,
             CASE
+              WHEN octet_length(event.payload_json) > ${maxDeletePayloadBytes} THEN NULL
               WHEN event.application_event_version = 2
                 AND event.aggregate_kind = 'thread'
                 AND event.event_type = 'turn-item.updated'
@@ -368,18 +404,32 @@ export const layer: Layer.Layer<
           LIMIT ${COMPACTION_PAGE_SIZE}
         `.pipe(NodeSqliteClient.readOnly);
             rowsScanned += rows.length;
-            const obsolete: number[] = [];
-            let pageDeletedTextEventCount = 0;
-            let pageDeletedTextPayloadBytes = 0;
+            const obsolete: Array<{
+              readonly sequence: number;
+              readonly textPayloadBytes: number | null;
+              readonly payloadBytes: number;
+            }> = [];
             for (const row of rows) {
+              // Oversized payloads are offline work. Ignoring them also keeps
+              // them out of per-key tracking, which can only retain extra rows.
+              if (row.payload_bytes > maxDeletePayloadBytes) continue;
               if (row.imported_legacy_thread === 1) {
-                obsolete.push(row.sequence);
+                obsolete.push({
+                  sequence: row.sequence,
+                  textPayloadBytes: null,
+                  payloadBytes: row.payload_bytes,
+                });
               } else if (row.application_event_version === 2) {
                 if (
                   row.aggregate_kind === "thread" &&
                   supersedableThreadEventTypes.has(row.event_type)
                 ) {
-                  if (retainedThreadIds.has(row.stream_id)) obsolete.push(row.sequence);
+                  if (retainedThreadIds.has(row.stream_id))
+                    obsolete.push({
+                      sequence: row.sequence,
+                      textPayloadBytes: null,
+                      payloadBytes: row.payload_bytes,
+                    });
                   else retainedThreadIds.add(row.stream_id);
                 } else if (
                   row.aggregate_kind === "thread" &&
@@ -389,14 +439,22 @@ export const layer: Layer.Layer<
                     retainedThreadIds.has(row.stream_id) ||
                     retainedReadStateThreadIds.has(row.stream_id)
                   ) {
-                    obsolete.push(row.sequence);
+                    obsolete.push({
+                      sequence: row.sequence,
+                      textPayloadBytes: null,
+                      payloadBytes: row.payload_bytes,
+                    });
                   } else retainedReadStateThreadIds.add(row.stream_id);
                 } else if (
                   row.event_type === "thread.pull-request-link-updated" &&
                   retainedThreadIds.has(row.stream_id)
                 ) {
                   // A newer whole-thread payload already carries this link's state.
-                  obsolete.push(row.sequence);
+                  obsolete.push({
+                    sequence: row.sequence,
+                    textPayloadBytes: null,
+                    payloadBytes: row.payload_bytes,
+                  });
                 } else if (
                   row.event_type === "thread.pull-request-link-updated" ||
                   row.event_type === "message.updated" ||
@@ -423,15 +481,12 @@ export const layer: Layer.Layer<
                   if (candidate === undefined) oldestCandidateByEntityKey.set(key, null);
                   else {
                     if (candidate !== null) {
-                      obsolete.push(candidate.sequence);
-                      if (candidate.textPayloadBytes !== null) {
-                        pageDeletedTextEventCount++;
-                        pageDeletedTextPayloadBytes += candidate.textPayloadBytes;
-                      }
+                      obsolete.push(candidate);
                     }
                     oldestCandidateByEntityKey.set(key, {
                       sequence: row.sequence,
                       textPayloadBytes,
+                      payloadBytes: row.payload_bytes,
                     });
                   }
                 }
@@ -439,19 +494,34 @@ export const layer: Layer.Layer<
             }
             // Yield even without deletions for clients using the synchronous fallback.
             yield* Effect.yieldNow;
-            if (obsolete.length > 0) {
-              yield* sql`DELETE FROM orchestration_events WHERE sequence IN ${sql.in(obsolete)}`;
-              deletedEventCount += obsolete.length;
-              deletedTextEventCount += pageDeletedTextEventCount;
-              deletedTextPayloadBytes += pageDeletedTextPayloadBytes;
+            // A single large payload can own many overflow pages and index entries.
+            // Never bundle their deletion into one writer-held statement.
+            for (const candidate of obsolete) {
+              if (!(yield* withinBudget)) break;
+              if (candidate.payloadBytes > maxDeletePayloadBytes) continue;
+              yield* sql`DELETE FROM orchestration_events WHERE sequence IN ${sql.in([candidate.sequence])}`;
+              deletedEventCount++;
+              if (candidate.textPayloadBytes !== null) {
+                deletedTextEventCount++;
+                deletedTextPayloadBytes += candidate.textPayloadBytes;
+              }
               yield* Effect.yieldNow;
+              if (minDeleteIntervalMs > 0)
+                yield* Effect.sleep(Duration.millis(minDeleteIntervalMs));
             }
             throughSequence = (rows.at(-1)?.sequence ?? 1) - 1;
             if (rows.length < COMPACTION_PAGE_SIZE) break;
           }
 
-          while (throughReceiptRowId > 0) {
+          let receiptPages = 0;
+          while (
+            throughReceiptRowId > 0 &&
+            receiptPages < maxPagesPerScan &&
+            (yield* withinBudget)
+          ) {
             yield* startPage;
+            if (!(yield* withinBudget)) break;
+            receiptPages++;
             const rows = yield* sql<{
               readonly row_id: number;
               readonly command_id: string;
@@ -479,10 +549,13 @@ export const layer: Layer.Layer<
               .filter((row) => row.imported_legacy_thread === 1)
               .map((row) => row.command_id);
             yield* Effect.yieldNow;
-            if (obsolete.length > 0) {
-              yield* sql`DELETE FROM orchestration_command_receipts WHERE command_id IN ${sql.in(obsolete)}`;
-              deletedReceiptCount += obsolete.length;
+            for (const commandId of obsolete) {
+              if (!(yield* withinBudget)) break;
+              yield* sql`DELETE FROM orchestration_command_receipts WHERE command_id = ${commandId}`;
+              deletedReceiptCount++;
               yield* Effect.yieldNow;
+              if (minDeleteIntervalMs > 0)
+                yield* Effect.sleep(Duration.millis(minDeleteIntervalMs));
             }
             throughReceiptRowId = (rows.at(-1)?.row_id ?? 1) - 1;
             if (rows.length < COMPACTION_PAGE_SIZE) break;

@@ -97,6 +97,7 @@ it.effect.each(["sqlite", "memory"] as const)(
         nodeId: null,
         role: "user" as const,
         text: "Continue",
+        phase: "unknown" as const,
         attachments: [],
         streaming: false,
         createdBy: "agent" as const,

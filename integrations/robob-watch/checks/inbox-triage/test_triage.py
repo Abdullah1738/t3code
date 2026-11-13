@@ -317,6 +317,7 @@ class ChargeTests(unittest.TestCase):
             return [r for r in self.rows if (source is None or r['source'] == source)
                     and all(any(w in r['text'].lower() for w in g) for g in groups)]
         self.patches = [patch.object(self.mc, 'DATA', self.tmp / 'money'),
+                        patch.object(t, 'chat_down', return_value=(False, '')),
                         patch.object(self.mc.charges, 'search', search),
                         patch.object(self.mc.charges, 'show', lambda row, deadline=None: row['text']),
                         patch.object(self.mc.charges, 'owner_texts', lambda since, until, deadline=None: []),
@@ -348,6 +349,291 @@ class ChargeTests(unittest.TestCase):
     def questions(self):
         # Test runs aren't the live watcher, so they keep a copy of the money books in their folder.
         return {q['amount']: q for q in self.mc.load_questions(self.tmp / 'wd' / 'scratch-money')['questions']}
+
+    def renewal(self, last4='5542', source='email'):
+        return {'id': 'mail:renewal:1' if source == 'email' else 'imsg:123', 'source': source,
+                'sender': 'ElevenLabs <billing@elevenlabs.io>', 'subject': 'Subscription renewal',
+                'preview': 'Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 '
+                           f'using card ending in {last4}', 'ts': self.now - 60, 'list_unsubscribe': True}
+
+    def check_dead_renewal(self, source):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        item = self.renewal(source=source)
+        model, state, runs = self.run_triage([item])
+        cases = self.mc.load(self.tmp / 'wd' / 'scratch-money')['cases']
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0]['id'], 'renewal-elevenlabs-2026-11-11')
+        self.assertEqual(cases[0]['history'][0]['source'], item['id'])
+        model.assert_not_called()
+        self.assertEqual(state['queue'], [])
+        self.assertEqual(runs[-1]['dropped']['renewal_case'], 1)
+        self.assertEqual(self.mc.load(self.mc.DATA)['cases'], [])
+
+    def test_dead_card_renewal_mail_is_a_case_and_dropped_before_classifier(self):
+        self.check_dead_renewal('email')
+
+    def test_dead_card_renewal_sms_is_a_case_and_dropped_before_classifier(self):
+        self.check_dead_renewal('imessage')
+
+    def test_duplicate_renewals_are_handled_in_batch_on_replay_and_after_closure(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        items = [self.renewal(source='email'), self.renewal(source='imessage')]
+        model, state, runs = self.run_triage(items)
+        model.assert_not_called()
+        self.assertEqual(state['queue'], [])
+        self.assertEqual(runs[-1]['dropped']['renewal_case'], 2)
+        data = self.tmp / 'wd' / 'scratch-money'
+        self.assertEqual(len(self.mc.load(data)['cases']), 1)
+        for closed in (False, True):
+            with self.subTest(closed=closed):
+                if closed:
+                    self.mc.close(data, 'renewal-elevenlabs-2026-11-11', 'moved card')
+                model, _, runs = self.run_triage(items)
+                model.assert_not_called()
+                self.assertEqual(runs[-1]['dropped']['renewal_case'], 2)
+                self.assertEqual(len(self.mc.load(data)['cases']), 1)
+        self.assertEqual(self.mc.load(data)['cases'][0]['status'], 'closed')
+
+    def test_live_card_renewal_passes_through_without_a_case(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        item = self.renewal('2342')
+        model, _, runs = self.run_triage([item])
+        self.assertEqual(model.call_args[0][0][0]['id'], item['id'])
+        self.assertNotIn('renewal_case', runs[-1]['dropped'])
+        self.assertEqual(self.mc.load(self.tmp / 'wd' / 'scratch-money')['cases'], [])
+        rows = self.mc.load_subscriptions(self.tmp / 'wd' / 'scratch-money')['subscriptions']
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['last4'], '2342')
+
+    def test_registered_charge_is_explained_and_rolls_only_scratch_books(self):
+        due = t.dt.datetime.fromtimestamp(self.now, self.mc.TZ).date().isoformat()
+        self.mc.sub_change(self.mc.DATA, 'acme', dict(merchant='Acme', last4='1111', amount='100',
+                           currency='EUR', cadence='monthly', next_renewal=due), 'add')
+        item = self.alert(90, '100', 'Acme', 600)
+        reasons, held, error = t.charge_checks([item], self.now, False, wd=self.tmp / 'subs')
+        self.assertIsNone(error)
+        self.assertEqual(reasons, {item['id']: 'charge_explained'})
+        self.assertFalse(held)
+        self.assertEqual(self.mc.load_subscriptions(self.mc.DATA)['subscriptions'][0]['next_renewal'], due)
+        row = self.mc.load_subscriptions(self.tmp / 'subs' / 'scratch-money')['subscriptions'][0]
+        self.assertEqual(row['next_renewal'], self.mc.sub_next(due, 'monthly'))
+
+    def test_registered_merchant_with_wrong_amount_still_reaches_classifier(self):
+        due = t.dt.datetime.fromtimestamp(self.now, self.mc.TZ).date().isoformat()
+        self.mc.sub_change(self.mc.DATA, 'acme', dict(merchant='Acme', last4='1111', amount='100',
+                           currency='EUR', cadence='monthly', next_renewal=due), 'add')
+        item = self.alert(91, '200', 'Acme', 600)
+        model, _, runs = self.run_triage([item])
+        self.assertEqual(model.call_args[0][0][0]['id'], item['id'])
+        self.assertNotIn('charge_explained', runs[-1]['dropped'])
+
+    def test_dry_charge_matching_does_not_roll_live_register(self):
+        due = t.dt.datetime.fromtimestamp(self.now, self.mc.TZ).date().isoformat()
+        self.mc.sub_change(self.mc.DATA, 'acme', dict(merchant='Acme', last4='1111', amount='100',
+                           currency='EUR', cadence='monthly', next_renewal=due), 'add')
+        before = (self.mc.DATA / 'subscriptions.json').read_bytes()
+        reasons, _, error = t.charge_checks([self.alert(92, '100', 'Acme', 600)], self.now, True, wd=self.tmp / 'dry-subs')
+        self.assertIsNone(error)
+        self.assertEqual(reasons, {'imsg:92': 'charge_explained'})
+        self.assertEqual((self.mc.DATA / 'subscriptions.json').read_bytes(), before)
+
+    def test_generic_renewals_from_different_sender_domains_create_separate_cases(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        items = []
+        for vendor in ('elevenlabs', 'acme'):
+            item = self.renewal()
+            item.update(id='mail:' + vendor, sender=f'"Notifications@Work" <billing@notifications.{vendor}.example>',
+                        preview='Your monthly subscription will renew on 11 Nov 2026 for USD 118.80 '
+                                'using card ending in 5542')
+            items.append(item)
+        model, _, runs = self.run_triage(items)
+        model.assert_not_called()
+        self.assertEqual(runs[-1]['dropped']['renewal_case'], 2)
+        cases = self.mc.load(self.tmp / 'wd' / 'scratch-money')['cases']
+        self.assertEqual({c['merchant'] for c in cases},
+                         {'notifications.elevenlabs.example', 'notifications.acme.example'})
+
+    def test_sender_wording_changes_and_domain_punctuation_do_not_reopen_or_merge_cases(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        model, _, _ = self.run_triage([self.renewal()])
+        model.assert_not_called()
+        data = self.tmp / 'wd' / 'scratch-money'
+        self.mc.close(data, 'renewal-elevenlabs-2026-11-11', 'cancelled')
+        item = self.renewal()
+        item.update(id='mail:generic', preview=item['preview'].replace('ElevenLabs Pro plan', 'subscription'))
+        model, _, runs = self.run_triage([item])
+        model.assert_not_called()
+        self.assertEqual(runs[-1]['dropped']['renewal_case'], 1)
+        self.assertEqual(len(self.mc.load(data)['cases']), 1)
+        for n, domain in enumerate(('notifications.elevenlabs.io', 'notifications-elevenlabs.io')):
+            item = self.renewal()
+            item.update(id=f'mail:domain-{n}', sender=f'billing@{domain}',
+                        preview=item['preview'].replace('ElevenLabs Pro plan', 'subscription'))
+            model, _, runs = self.run_triage([item])
+            model.assert_not_called()
+            self.assertEqual(runs[-1]['dropped']['renewal_case'], 1)
+            newest = self.mc.load(data)['cases'][-1]
+            self.assertEqual(newest['renewal_identity'], domain)
+            self.assertEqual(newest['status'], 'open')
+            self.mc.close(data, newest['id'], 'cancelled')
+        self.assertEqual(len(self.mc.load(data)['cases']), 3)
+
+    def test_generic_email_and_named_sms_reuse_closed_case_in_either_arrival_order(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        for email_first in (False, True):
+            with self.subTest(email_first=email_first):
+                root = self.tmp / ('email-first' if email_first else 'sms-first')
+                root.mkdir()
+                email, sms = self.renewal(), self.renewal(source='imessage')
+                email['preview'] = email['preview'].replace('ElevenLabs Pro plan', 'subscription')
+                sms['sender'] = 'ElevenLabs'
+                items = (email, sms) if email_first else (sms, email)
+                with patch.object(self, 'tmp', root):
+                    model, _, _ = self.run_triage([items[0]])
+                    model.assert_not_called()
+                    data = root / 'wd' / 'scratch-money'
+                    case = self.mc.load(data)['cases'][0]
+                    self.mc.close(data, case['id'], 'cancelled')
+                    model, _, runs = self.run_triage([items[1]])
+                    model.assert_not_called()
+                    self.assertEqual(runs[-1]['dropped']['renewal_case'], 1)
+                    self.assertEqual(len(self.mc.load(data)['cases']), 1)
+                    self.assertEqual(self.mc.load(data)['cases'][0]['status'], 'closed')
+
+    def test_sms_first_cannot_absorb_multiple_email_domains(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        sms = self.renewal(source='imessage')
+        sms['sender'] = 'ElevenLabs'
+        self.run_triage([sms])
+        data = self.tmp / 'wd' / 'scratch-money'
+        self.mc.close(data, 'renewal-elevenlabs-2026-11-11', 'cancelled')
+        for n, domain in enumerate(('elevenlabs.io', 'alerts.elevenlabs.example')):
+            item = self.renewal()
+            item.update(id=f'mail:identity-{n}', sender='billing@' + domain,
+                        preview=item['preview'].replace('ElevenLabs Pro plan', 'subscription'))
+            model, _, runs = self.run_triage([item])
+            model.assert_not_called()
+            self.assertEqual(runs[-1]['dropped']['renewal_case'], 1)
+        cases = self.mc.load(data)['cases']
+        self.assertEqual({c['renewal_identity']: c['status'] for c in cases},
+                         {'elevenlabs.io': 'closed', 'alerts.elevenlabs.example': 'open'})
+
+    def test_dotted_sms_merchant_binds_its_email_and_stays_closed_after_other_domain(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        sms = self.renewal(source='imessage')
+        sms.update(sender='Boat.dev', preview=sms['preview'].replace('ElevenLabs Pro', 'Boat.dev Pro'))
+        self.run_triage([sms])
+        data = self.tmp / 'wd' / 'scratch-money'
+        self.mc.close(data, 'renewal-boat-dev-2026-11-11', 'cancelled')
+        for n, domain in enumerate(('boat.dev', 'boatdev.com', 'boat.dev')):
+            item = self.renewal()
+            item.update(id=f'mail:dotted-{n}', sender='billing@' + domain,
+                        preview=item['preview'].replace('ElevenLabs Pro plan', 'subscription'))
+            model, _, runs = self.run_triage([item])
+            model.assert_not_called()
+            self.assertEqual(runs[-1]['dropped']['renewal_case'], 1)
+        cases = self.mc.load(data)['cases']
+        self.assertEqual({c['renewal_identity']: c['status'] for c in cases},
+                         {'boat.dev': 'closed', 'boatdev.com': 'open'})
+
+    def test_one_off_notices_stay_unhandled_with_billing_subject_markers(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        for subject in ('Next billing date', 'Next billing date: 11 Nov 2026'):
+            for purpose in ('hotel reservation', 'flight booking', 'payment plan', 'installment'):
+                with self.subTest(subject=subject, purpose=purpose):
+                    item = self.renewal()
+                    item.update(subject=subject, list_unsubscribe=False, preview='You will be charged USD 118.80 on 11 Nov 2026 '
+                                f'for your {purpose} using card ending in 5542.')
+                    model, _, runs = self.run_triage([item])
+                    self.assertEqual(model.call_args[0][0][0]['id'], item['id'])
+                    self.assertNotIn('renewal_case', runs[-1]['dropped'])
+        self.assertEqual(self.mc.load(self.tmp / 'wd' / 'scratch-money')['cases'], [])
+
+    def test_cancelled_renewals_and_one_off_charges_pass_through_without_cases(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        texts = [
+            'Your subscription renewal on 11 Nov 2026 for USD 118.80 using card ending in 5542 has been cancelled.',
+            'You will be charged USD 118.80 on 11 Nov 2026 for your hotel reservation using card ending in 5542.',
+            "Your ElevenLabs Pro plan doesn't auto-renew on 11 Nov 2026 for USD 118.80 using card ending in 5542.",
+            'Your ElevenLabs Pro plan doesn’t auto-renew on 11 Nov 2026 for USD 118.80 using card ending in 5542.',
+            'Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 using card ending in 5542. Auto-renewal is currently off.',
+            'Your ElevenLabs Pro subscription will not be charged USD 118.80 on 11 Nov 2026 using card ending in 5542.',
+        ]
+        for text in texts:
+            with self.subTest(text=text):
+                item = self.renewal()
+                item.update(subject='Next billing date: 11 Nov 2026', list_unsubscribe=False, preview=text)
+                model, _, runs = self.run_triage([item])
+                self.assertEqual(model.call_args[0][0][0]['id'], item['id'])
+                self.assertNotIn('renewal_case', runs[-1]['dropped'])
+                self.assertEqual(self.mc.load(self.tmp / 'wd' / 'scratch-money')['cases'], [])
+
+    def test_full_message_rejection_survives_queueing_for_email_and_sms(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        for source in ('email', 'imessage'):
+            with self.subTest(source=source):
+                item = self.renewal(source=source)
+                item.update(subject='Confirmation', list_unsubscribe=False, renewal_notice=None)
+                model, _, runs = self.run_triage([item])
+                self.assertEqual(model.call_args[0][0][0]['id'], item['id'])
+                self.assertNotIn('renewal_case', runs[-1]['dropped'])
+                self.assertEqual(self.mc.load(self.tmp / 'wd' / 'scratch-money')['cases'], [])
+
+    def test_dry_renewal_tracking_uses_its_own_scratch_books_even_at_live_path(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        before = (self.mc.DATA / 'cards.json').read_bytes()
+        wd = self.tmp / 'dry'
+        with patch.object(t, 'LIVE', wd):
+            reasons, error = t.renewal_checks([self.renewal()], self.now, True, wd=wd)
+        self.assertIsNone(error)
+        self.assertEqual(reasons, {'mail:renewal:1': 'renewal_case'})
+        self.assertEqual(self.mc.load(self.mc.DATA)['cases'], [])
+        self.assertEqual((self.mc.DATA / 'cards.json').read_bytes(), before)
+        self.assertEqual(len(self.mc.load(wd / 'scratch-renewals')['cases']), 1)
+
+    def test_dry_runs_track_renewals_after_fast_or_slow_collection(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        for delay in (0, 25, 100):
+            with self.subTest(delay=delay):
+                wd = self.tmp / f'dry-{delay}'
+                clock = [self.now]
+                def collect(*args):
+                    clock[0] += delay
+                    return {'mail': {'cursor': {}, 'items': [self.renewal()], 'drops': {}, 'scanned': 1}}, {}
+                args = types.SimpleNamespace(dry_run_hours=2, report=str(wd / 'report.json'))
+                with patch.dict(t.os.environ, {'WATCH_DIR': str(wd)}), \
+                     patch.object(t.time, 'time', side_effect=lambda: clock[0]), \
+                     patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
+                     patch.object(t, 'collect', side_effect=collect), patch.object(t, 'build_context', return_value={}), \
+                     patch.object(t, 'handled', return_value=({}, {})), \
+                     patch.object(t, 'classify') as model, patch('builtins.print'):
+                    self.assertEqual(t.run(args), 0)
+                model.assert_not_called()
+                report = t.read_json(wd / 'report.json')
+                self.assertEqual(report['dropped']['renewal_case'], 1)
+                self.assertNotIn('charge_check_errors', report)
+                self.assertEqual(len(self.mc.load(wd / 'scratch-renewals')['cases']), 1)
+        self.assertEqual(self.mc.load(self.mc.DATA)['cases'], [])
+
+    def test_renewal_tracking_stops_when_budget_is_spent(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        reasons, error = t.renewal_checks([self.renewal()], self.now, False,
+                                        deadline=time.time() - 1, wd=self.tmp / 'expired')
+        self.assertEqual(reasons, {})
+        self.assertIn('out of time', error)
+        self.assertEqual(self.mc.load(self.tmp / 'expired' / 'scratch-money')['cases'], [])
+
+    def test_failed_renewal_write_keeps_the_item_queued_for_the_next_tick(self):
+        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+        with patch.object(self.mc, 'renewal_case', side_effect=self.mc.CheckTimeout('renewal tracking out of time')):
+            model, state, runs = self.run_triage([self.renewal()])
+        model.assert_not_called()
+        self.assertEqual([i['id'] for i in state['queue']], ['mail:renewal:1'])
+        self.assertIn('renewal tracking out of time', runs[-1]['charge_check_errors'])
+        model, state, runs = self.run_triage([])
+        model.assert_not_called()
+        self.assertEqual(state['queue'], [])
+        self.assertEqual(runs[-1]['dropped']['renewal_case'], 1)
 
     def test_explained_waiting_held_and_unexplained_alerts(self):
         self.rows = [{'id': 1, 'source': 'email', 'from_me': 0, 'ts': self.now - 30, 'sender': 'Globex <r@globex.example>',
@@ -1025,6 +1311,329 @@ class ActivityLogBytes(unittest.TestCase):
                     patch.object(t, 'live_work', return_value={}):
                 ctx = t.build_context([{'sender': 'hookah', 'subject': 'bowl', 'preview': 'hookah bowl'}], [], time.time())
         self.assertIn('hookah bowl', ctx['recent_activity_newest_first'])
+
+
+
+
+class PaymentNotices(unittest.TestCase):
+    def setUp(self):
+        self.mc = t.load_module('triage_money_cases', t.MONEY_CASES)
+        self.when = t.dt.datetime(2026, 11, 7, 21, 5, tzinfo=t.DUBAI)
+
+    def test_bank_deadline_wording_and_dates(self):
+        rows = [
+            ('Wio', 'Your autopay of AED 3,532.73 failed; repay before midnight', '2026-11-07T23:59:00+04:00'),
+            ('EmiratesNBD', 'Payment due by 08/11/2026 at 9 PM: AED 3,532.73', '2026-11-08T21:00:00+04:00'),
+            ('Mashreq', 'Pay by 8 November 2026 at 21:00 to avoid interest. AED 3,532.73', '2026-11-08T21:00:00+04:00'),
+            ('ADCB', 'Pay by 2026-11-08 at 9:30 pm to avoid a late fee. AED 3,532.73', '2026-11-08T21:30:00+04:00'),
+            ('FAB', 'Payment due by tomorrow 22:00. AED 3,532.73', '2026-11-08T22:00:00+04:00'),
+            ('American Express', 'Pay by Friday to avoid interest. USD 3,532.73', '2026-11-13T23:59:00+04:00'),
+        ]
+        for sender, text, due in rows:
+            with self.subTest(sender=sender):
+                n = self.mc.payments.parse(text, sender, self.when)
+                self.assertEqual(n['kind'], 'payment_deadline')
+                self.assertEqual(n['deadline'], due)
+                self.assertEqual(n['amount'], '3532.73')
+
+    def test_promos_declines_negation_and_ambiguous_amounts(self):
+        rows = [
+            ('Shop', 'Pay before Friday to get 20% off; Wio AED 100.00'),
+            ('Wio', 'Pay before Friday to get 20% off; AED 100.00'),
+            ('Wio', 'Payment not received AED 100.00'),
+            ('Wio', 'Autopay of AED 100.00 failed'),
+            ('Wio', 'Payment received AED 100.00 for your savings account'),
+            ('Wio', 'Payment received AED 100.00 for your current account'),
+            ('Wio', 'Autopay was not successful AED 100.00'),
+            ('Wio', 'Payment failed for purchase at SHOP AED 100.00'),
+            ('Wio', 'Payment due by tonight: balance AED 200.00, minimum AED 100.00'),
+            ('Wio', 'Autopay scheduled at some point: AED 100.00'),
+        ]
+        for sender, text in rows:
+            with self.subTest(text=text):
+                self.assertIsNone(self.mc.payments.parse(text, sender, self.when))
+
+    def test_wio_is_tracked_before_classifier_and_dry_run_writes_nothing(self):
+        item = {'id': 'mail:wio:1', 'source': 'email', 'sender': 'Wio', 'subject': 'Autopay failed',
+                'preview': 'Your autopay of AED 3,532.73 failed; repay before midnight',
+                'ts': self.when.timestamp(), 'list_unsubscribe': True}
+        self.assertIsNone(t.prefilter(item, self.when.timestamp(), []))
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            with patch.object(self.mc, 'DATA', wd / 'no-live-book'), patch.object(t, 'load_module', return_value=self.mc):
+                reasons, error = t.payment_checks([item], self.when.timestamp(), True, wd=wd)
+                self.assertEqual(reasons, {})
+                self.assertIsNone(error)
+                self.assertFalse((wd / 'scratch-money').exists())
+                for source in ('mail:wio:1', 'imsg:2'):
+                    reasons, error = t.payment_checks([{**item, 'id': source}], self.when.timestamp(), False,
+                                                      deadline=time.time() + 3, wd=wd)
+                    self.assertEqual(reasons[source], 'payment_deadline_tracked')
+                    self.assertIsNone(error)
+                self.assertEqual(len(self.mc.load(wd / 'scratch-money')['cases']), 1)
+
+    def test_success_notice_closes_both_cases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            with patch.object(self.mc, 'DATA', wd / 'no-live-book'), patch.object(t, 'load_module', return_value=self.mc):
+                items = [{'id': str(i), 'source': 'email', 'sender': 'Wio', 'subject': '', 'preview': text,
+                          'ts': self.when.timestamp() + i * 60} for i, text in enumerate((
+                              'Autopay of AED 3,532.73 due tonight at 21:00',
+                              'Autopay of AED 3,532.73 failed; repay before midnight',
+                              'Autopay successful AED 3,532.73'))]
+                reasons, error = t.payment_checks(items, self.when.timestamp() + 180, False, time.time() + 3, wd)
+                self.assertEqual(len(reasons), 3)
+                self.assertIsNone(error)
+                self.assertEqual({c['status'] for c in self.mc.load(wd / 'scratch-money')['cases']}, {'closed'})
+
+    def test_full_mail_deadline_survives_long_preview_and_bulk_header(self):
+        raw = ('From: Wio <alerts@wio.io>\r\nSubject: Account notice\r\n'
+               'List-Unsubscribe: <mailto:leave@wio.io>\r\nContent-Type: text/plain\r\n\r\n' +
+               'Important account information. ' * 20 +
+               'Your autopay of AED 3,532.73 failed; repay before midnight').encode()
+        record = (1, '07-Nov-2026 21:05:00 +0400', raw.split(b'\r\n\r\n')[0])
+        with patch.object(t, 'fetch_verified', return_value=[(1, '', raw)]):
+            item, reason = t.mail_record(None, None, 'icloud', 1, record, 0, self.when.timestamp(), {'seen': [], 'rules': []})
+        self.assertIsNone(reason)
+        self.assertNotIn('midnight', item['preview'])
+        self.assertEqual(item['payment_notice']['deadline'], '2026-11-07T23:59:00+04:00')
+
+    def test_full_mail_renewal_survives_long_preview_and_bulk_header(self):
+        raw = ('From: ElevenLabs <billing@elevenlabs.io>\r\nSubject: Your subscription\r\n'
+               'List-Unsubscribe: <mailto:leave@elevenlabs.io>\r\nContent-Type: text/plain\r\n\r\n' +
+               'Important account information. ' * 20 +
+               'Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 using card ending in 5542').encode()
+        record = (1, '07-Nov-2026 21:05:00 +0400', raw.split(b'\r\n\r\n')[0])
+        with patch.object(t, 'fetch_verified', return_value=[(1, '', raw)]):
+            item, reason = t.mail_record(None, None, 'icloud', 1, record, 0, self.when.timestamp(), {'seen': [], 'rules': []})
+        self.assertIsNone(reason)
+        self.assertNotIn('5542', item['preview'])
+        self.assertEqual(item['renewal_notice']['last4'], '5542')
+        self.assertEqual(item['renewal_notice']['merchant'], 'ElevenLabs')
+
+    def renewal_mail(self, body, subject='Confirmation', header=''):
+        raw = (f'From: ElevenLabs <billing@elevenlabs.io>\r\nSubject: {subject}\r\n' + header +
+               'Content-Type: text/plain\r\n\r\n' + body).encode()
+        record = (1, '07-Nov-2026 21:05:00 +0400', raw.split(b'\r\n\r\n')[0])
+        with patch.object(t, 'fetch_verified', return_value=[(1, '', raw)]) as fetch:
+            result = t.mail_record(None, None, 'icloud', 1, record, 0, self.when.timestamp(), {'seen': [], 'rules': []})
+        fetch.assert_called_once()
+        return result
+
+    def test_bulk_and_promo_headers_cannot_hide_a_renewal_in_the_body(self):
+        body = ('Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 '
+                'using card ending in 5542')
+        rows = [
+            ('Update your payment method', 'List-Unsubscribe: <mailto:leave@elevenlabs.io>\r\n'),
+            ('Account notice', 'Precedence: bulk\r\n'),
+            ('Account notice', 'Precedence: list\r\n'),
+            ('Account notice', 'Precedence: junk\r\n'),
+            ('Special offer', ''),
+        ]
+        for subject, header in rows:
+            with self.subTest(subject=subject, header=header):
+                item, reason = self.renewal_mail(body, subject, header)
+                self.assertIsNone(reason)
+                self.assertEqual(item['renewal_notice']['date'], '2026-11-11')
+        item, reason = self.renewal_mail('Here is our weekly newsletter.', 'Account notice', 'Precedence: bulk\r\n')
+        self.assertEqual(reason, 'bulk')
+        self.assertIsNone(item['renewal_notice'])
+
+    def test_bulk_renewals_with_instructions_conditions_and_cancelled_cards_still_open_cases(self):
+        first = ('Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 '
+                 'using card ending in 5542. ')
+        rows = [
+            ('Auto-renew can be disabled in Settings', True),
+            ('To cancel, ensure auto-renewal is disabled in Settings', True),
+            ('Please ensure auto-renewal is disabled in Settings to cancel', True),
+            ('Please make sure your subscription is cancelled to stop billing', True),
+            ('Please ensure your subscription is cancelled and auto-renewal is disabled in Settings to stop billing', True),
+            ('Please make sure your subscription is cancelled and auto-renewal is disabled', True),
+            ('Please ensure your subscription is cancelled, and auto-renewal is disabled in Settings', True),
+            ('You can turn off auto-renewal in Settings', True),
+            ('If the renewal payment fails, your subscription will be cancelled', True),
+            ('Your subscription will be cancelled if the renewal payment fails', True),
+            ('Your subscription is disabled if the renewal payment fails', True),
+            ('If the renewal payment fails, your subscription is disabled', True),
+            ('Your subscription is disabled automatically, if the renewal payment fails', True),
+            ('Your subscription is disabled temporarily, if payment fails', True),
+            ('Your card is cancelled; update your payment method before renewal', True),
+            ('Your card has been deactivated; update it before your subscription renews', True),
+            ('Your subscription is cancelled', False),
+            ('Auto-renewal has been disabled', False),
+            ('Auto-renewal is currently off', False),
+            ('Your subscription has been cancelled, contact support if this was a mistake', False),
+            ('Your subscription has been cancelled, and contact support if this was a mistake', False),
+            ('Your subscription has been cancelled, please contact support if this was a mistake', False),
+            ('Your subscription has been cancelled; contact support if this was a mistake', False),
+            ('Your subscription has been cancelled, email us if you need help', False),
+            ('Your subscription has been cancelled, reach out if this was a mistake', False),
+            ('Please note: your subscription is cancelled', False),
+            ('Please be advised: auto-renewal is disabled', False),
+            ('We have cancelled your subscription', False),
+            ('They have deactivated your membership', False),
+            ('We have not cancelled your subscription', True),
+            ('You will not be charged', False),
+            ('You will not be charged if payment fails', True),
+            ('Your card is cancelled, and your subscription has been cancelled', False),
+            ('Your card is cancelled and your subscription is disabled', False),
+            ('Your card is cancelled, and your subscription is active', True),
+            ('You can contact support because your subscription has been cancelled', False),
+            ('You may visit Settings because auto-renewal is disabled', False),
+            ('If you need help, you can contact support because your subscription has been cancelled', False),
+            ('Unless you can log in, contact support because auto-renewal has been disabled', False),
+        ]
+        for suffix, active in rows:
+            for padding in ('', 'Additional account information. ' * 20):
+                with self.subTest(suffix=suffix, long_body=bool(padding)), tempfile.TemporaryDirectory() as tmp:
+                    item, reason = self.renewal_mail(first + padding + suffix, 'Account notice',
+                                                   'List-Unsubscribe: <mailto:leave@elevenlabs.io>\r\n')
+                    self.assertEqual(reason, None if active else 'bulk')
+                    wd = Path(tmp)
+                    with patch.object(self.mc, 'DATA', wd / 'money'), patch.object(t, 'load_module', return_value=self.mc):
+                        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+                        reasons, error = t.renewal_checks([item] if reason is None else [], self.when.timestamp(), False, wd=wd)
+                        self.assertIsNone(error)
+                        self.assertEqual(reasons, {item['id']: 'renewal_case'} if active else {})
+                        self.assertEqual(len(self.mc.load(wd / 'scratch-money')['cases']), int(active))
+                        self.assertEqual(self.mc.load(self.mc.DATA)['cases'], [])
+
+    def test_timed_no_charge_bulk_mail_tracks_renewals_but_unqualified_negation_does_not(self):
+        first = ('Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 '
+                 'using card ending in 5542. ')
+        rows = [
+            ('You will not be charged until your renewal date', True),
+            ('You will not be charged before this date', True),
+            ('You will not be billed again until then', True),
+            ("You won't be charged until then", True),
+            ('You won’t be charged before your renewal date', True),
+            ('You will not be debited again before this date', True),
+            ('You will not be charged USD 118.80 before your renewal date', True),
+            ('You will not be billed prior to your renewal date', True),
+            ('Until then, you will not be charged', True),
+            ('Until your renewal date, you will not be charged', True),
+            ('Before contacting support, please note that you will not be charged again', False),
+            ('Before updating your card, please note that you will not be billed again', False),
+            ('Until you contact support, please note that you will not be charged again', False),
+            ('Before the renewal date, contact support, please note that you will not be charged again', False),
+            ('You will not be charged again, before contacting support please read our help page', False),
+            ('You will not be billed again, before updating your card read our instructions', False),
+            ('You will not be debited, until you contact support please read the FAQ', False),
+            ('You will not be charged before contacting support please read the FAQ', False),
+            ('You will not be charged again, before tomorrow please read our help page', False),
+            ('You will not be billed again, until next month please contact support', False),
+            ('You will not be debited, before your renewal date update your card', False),
+            ('You will not be charged again, before tomorrow', True),
+            ('You will not be charged until your renewal date, please read our help page', True),
+            ('You will not be charged until your next billing cycle', True),
+            ('You will not be billed before the next renewal date', True),
+            ('You will not be billed again until next month', True),
+            ('You will not be charged', False),
+            ('You will not be billed again', False),
+            ('Your subscription is cancelled before this date', False),
+            ('Auto-renewal is disabled until then', False),
+            ('You will not be charged and your subscription is cancelled before this date', False),
+        ]
+        for suffix, active in rows:
+            for padding in ('', 'Additional account information. ' * 20):
+                with self.subTest(suffix=suffix, long_body=bool(padding)), tempfile.TemporaryDirectory() as tmp:
+                    item, reason = self.renewal_mail(first + padding + suffix, 'Account notice',
+                                                   'List-Unsubscribe: <mailto:leave@elevenlabs.io>\r\n')
+                    self.assertEqual(reason, None if active else 'bulk')
+                    wd = Path(tmp)
+                    with patch.object(self.mc, 'DATA', wd / 'money'), patch.object(t, 'load_module', return_value=self.mc):
+                        self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+                        reasons, error = t.renewal_checks([item] if reason is None else [], self.when.timestamp(), False, wd=wd)
+                        self.assertIsNone(error)
+                        self.assertEqual(reasons, {item['id']: 'renewal_case'} if active else {})
+                        cases = self.mc.load(wd / 'scratch-money')['cases']
+                        self.assertEqual(len(cases), int(active))
+                        if active:
+                            self.assertEqual(cases[0]['deadline'], '2026-11-11')
+                        self.assertEqual(self.mc.load(self.mc.DATA)['cases'], [])
+
+    def test_full_body_cancellation_or_ambiguity_cannot_be_overruled_by_preview(self):
+        first = ('Your ElevenLabs Pro plan will renew on 11 Nov 2026 for USD 118.80 '
+                 'using card ending in 5542. ')
+        tails = ['Your subscription is cancelled.', 'The other amount is USD 100.00.',
+                 'The other card is ending in 2342.']
+        for tail in tails:
+            with self.subTest(tail=tail), tempfile.TemporaryDirectory() as tmp:
+                item, reason = self.renewal_mail(first + 'Additional account details. ' * 20 + tail)
+                self.assertIsNone(reason)
+                self.assertIsNone(item['renewal_notice'])
+                self.assertNotIn(tail, item['preview'])
+                self.assertIsNotNone(self.mc.renewal(item['preview'], item['sender']))
+                wd = Path(tmp)
+                with patch.object(self.mc, 'DATA', wd / 'money'), patch.object(t, 'load_module', return_value=self.mc):
+                    self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
+                    reasons, error = t.renewal_checks([item], self.when.timestamp(), False, wd=wd)
+                    self.assertIsNone(error)
+                    self.assertEqual(reasons, {})
+                    self.assertEqual(self.mc.load(wd / 'scratch-money')['cases'], [])
+
+    def test_failure_cause_never_replaces_repayment_clause(self):
+        for cause in ('due to insufficient funds', 'due to account restrictions', 'because the account is blocked'):
+            for separator in ('; ', '. ', ' '):
+                text = f'Autopay of AED 3,532.73 failed {cause}{separator}Please repay before midnight'
+                with self.subTest(cause=cause, separator=separator):
+                    notice = self.mc.payments.parse(text, 'Wio', self.when)
+                    self.assertEqual(notice['deadline'], '2026-11-07T23:59:00+04:00')
+
+    def test_success_and_future_wording_matrix(self):
+        rows = [
+            ('Autopay of AED 100.00 will be debited on 8 November 2026 at 18:00.', 'autopay_expected', '2026-11-08T18:00:00+04:00'),
+            ('Autopay of AED 100.00 will be processed on Friday at 18:00.', 'autopay_expected', '2026-11-13T18:00:00+04:00'),
+            ('Your payment of AED 100.00 is due on 8 November 2026 at 18:00.', 'payment_deadline', '2026-11-08T18:00:00+04:00'),
+            ('Autopay of AED 100.00 has been successfully completed.', 'payment_success', None),
+            ('Payment of AED 100.00 has been successfully received.', 'payment_success', None),
+            ('Autopay of AED 100.00 was successfully debited.', 'payment_success', None),
+            ('Autopay of AED 100.00 is scheduled today at 21:00. We will notify you if payment is successful.', 'autopay_expected', '2026-11-07T21:00:00+04:00'),
+        ]
+        for text, kind, deadline in rows:
+            with self.subTest(text=text):
+                notice = self.mc.payments.parse(text, 'Wio', self.when)
+                self.assertIsNotNone(notice)
+                self.assertEqual((notice['kind'], notice['deadline']), (kind, deadline))
+
+    def test_decline_and_nonconfirmation_wording_matrix(self):
+        rows = [
+            'Payment of AED 100 at X with your Wio debit card ending with 1234 was declined',
+            'Your card payment of AED 100.00 to Netflix failed.',
+            'Payment of AED 100.00 at Netflix failed; pay by midnight',
+            'Check whether payment is successful in the app AED 100.00',
+            'We will notify you if payment is successful AED 100.00',
+            'Payment received AED 100.00 has been reversed.',
+            'Payment received AED 100.00 has been returned.',
+            'Payment received AED 100.00 has been cancelled.',
+            'Payment has not been received AED 100.00',
+        ]
+        for text in rows:
+            with self.subTest(text=text):
+                self.assertIsNone(self.mc.payments.parse(text, 'Wio', self.when))
+
+    def test_failure_timestamps_are_not_repayment_deadlines(self):
+        for when in ('today at 20:00', 'tonight at 20:00', 'on 7 November 2026 at 20:00'):
+            for suffix, expected in (('', None), (' Your payment is due by midnight.', '2026-11-07T23:59:00+04:00'),
+                                     (' Please repay before midnight.', '2026-11-07T23:59:00+04:00')):
+                text = f'Autopay of AED 100.00 failed {when} due to insufficient funds.' + suffix
+                with self.subTest(when=when, suffix=suffix):
+                    result = self.mc.payments.parse(text, 'Wio', self.when)
+                    self.assertEqual(result['deadline'] if result else None, expected)
+
+    def test_all_autopay_aliases_share_conditional_guard(self):
+        aliases = ('autopay', 'auto-pay', 'auto pay', 'autodebit', 'auto-debit', 'auto debit',
+                   'automaticdebit', 'automatic-debit', 'automatic debit', 'automatic payment')
+        for alias in aliases:
+            with self.subTest(alias=alias, conditional=False):
+                confirmed = self.mc.payments.parse(f'Your {alias} of AED 100.00 was successful.', 'Wio', self.when)
+                self.assertEqual(confirmed['kind'], 'payment_success')
+            for condition in ('if', 'whether', 'when', 'once', 'until', 'hope'):
+                with self.subTest(alias=alias, conditional=condition):
+                    text = f'We will notify you {condition} your {alias} of AED 100.00 is successful.'
+                    self.assertIsNone(self.mc.payments.parse(text, 'Wio', self.when))
+                    scheduled = f'Your {alias} of AED 100.00 is scheduled today at 21:00. ' + text
+                    self.assertEqual(self.mc.payments.parse(scheduled, 'Wio', self.when)['kind'], 'autopay_expected')
 
 
 if __name__ == '__main__':

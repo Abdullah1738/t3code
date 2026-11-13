@@ -12,7 +12,7 @@ import tempfile
 SOURCE = Path(__file__).resolve().parent
 LIVE = Path.home() / '.local/share/robob-watch/watchers/inbox-triage'
 DATA = Path.home() / 'Documents/assistant/inbox-triage'
-SOURCE_FILES = ('triage.py', 'check.sh', 'install.py', 'test_triage.py', 'test_mail_retry.py', 'test_install.py', 'test_lock.py', 'README.md', 'settings.template.json', 'noise.template.json', 'prefs.template.md')
+SOURCE_FILES = ('triage.py', 'check.sh', 'install.py', 'test_triage.py', 'test_urgent.py', 'test_mail_retry.py', 'test_install.py', 'test_lock.py', 'README.md', 'settings.template.json', 'noise.template.json', 'prefs.template.md')
 
 
 def atomic_copy(source, destination, executable=False):

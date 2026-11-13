@@ -152,7 +152,7 @@ under `~/.config/spectrum-bridge/`.
   robob-watch runner (`~/.local/share/robob-watch`) is the intended caller.
 - Synthetic rows (wakes and secure-form notices) never get an owner-facing
   "mind sending it again?" notice: nobody typed them. A turn for one that is
-  never accepted, or is interrupted before it starts, goes back to `pending`
+  interrupted before it starts goes back to `pending`
   with a backoff (30 s, then 60 s; the state is in kv `synthetic-retry:<id>`).
   A turn that was accepted and then failed while running is not retried, since
   its work may be partly done. The owner gets one notice naming the watcher. Owner texts queued behind it are not held up. Before
@@ -165,21 +165,20 @@ under `~/.config/spectrum-bridge/`.
   carrying it is accepted. A row going back to `pending` does not re-arm
   robob-watch's heads-up: the runner stops tracking a wake once it sees any
   state other than `pending`.
-- Owner texts whose prompt OpenCode never confirms (for example while it is
-  briefly unresponsive) are sent again before the owner is asked to resend:
-  3 attempts, re-sent after 1 and then 2 more minutes, with the "didn't catch
-  that" notice 2 minutes after the third (`OWNER_RESEND_MS`). Each attempt has
-  its own record id, and before every POST all earlier attempts are checked
-  with `promptAccepted`; one that landed late becomes the turn's prompt instead
-  of being duplicated. A failed read is never treated as absence: nothing is
-  re-sent until a read confirms none landed. A text still unconfirmed 10
-  minutes after it was first sent is given up on instead of being delivered
-  late (`OWNER_GIVE_UP_MS`). The exact prompt (text, guidance, files, model)
-  is kept in kv `resendBody` only while delivery is uncertain. Logged as
-  `owner-text-resent`, `owner-text-adopted` and `owner-text-undelivered`.
-- `batched` is a terminal inbound state: a non-leader member of a batch whose
-  text travelled inside the leader's prompt. The batch outcome is on the
-  leader row; the aggregate is kept in kv `batch:<leaderId>`.
+- A sealed batch with no prompt acceptance gets one retry after 60 seconds,
+  using the same prompt ID. Acceptance is reconciled before retrying; a failed
+  read holds the batch. After another minute without acceptance, each chat
+  gets one technical-problem notice for that outage. The original batch stays
+  held ahead of later messages, including across a bridge restart. A healthy
+  backend probe replays it with its original ID and a note giving the sent time;
+  a late acceptance instead adopts it without another send. Failed recovery sends are retried at most once a minute under the same ID
+  until acceptance, including across another bridge restart.
+  The exact body, files and model remain in kv `resendBody` until acceptance.
+  `delivery-watchdog` logs JSON decisions `retry`, `notice` and `replay` with
+  chat, batch and prompt IDs, never message text.
+- Prompt acceptance marks every batch member `done`, repairing any earlier
+  `failed` status. `batched` identifies members only while acceptance is pending;
+  the aggregate remains in kv `batch:<leaderId>` for reply targets.
 
 ## Group chats (Sendblue mode)
 

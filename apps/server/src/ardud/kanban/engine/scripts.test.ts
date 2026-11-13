@@ -10,6 +10,7 @@ import {
   isScriptDiscussion,
   listensTo,
   nextRunAt,
+  checkRunProblem,
   parseOutput,
   tail,
 } from "./scripts.ts";
@@ -82,6 +83,117 @@ describe("board scripts", () => {
     expect(parsed.commands.map((command) => command.kanban)).toEqual(["card", "post", "pool"]);
     expect(parsed.errors).toHaveLength(3);
     expect(parsed.text).toBe('checked 3 repos\n{"other": 1}');
+  });
+
+  it("reads wait answers, pushed wakes and parks, and keeps the older commands as they were", () => {
+    const parsed = parseOutput(
+      [
+        '{"kanban":{"wait":{"card":"#12","result":"wake","to":"review","note":"ENG-123 is Done"}}}',
+        '{"kanban":{"wait":{"card":13,"result":"hold","status":"CI 3 of 5 passed"}}}',
+        '{"kanban":{"wait":{"card":"#14","result":"fail","reason":"Linear said 401"}}}',
+        '{"kanban":{"wake":{"card":"#15","to":"work","note":"v2.4.1 is live"}}}',
+        '{"kanban":{"wake":{"card":16,"note":"deployed","wait":"2026-11-10T11:00:00.000Z"}}}',
+        '{"kanban":{"wait":{"card":"#17","on":"merge","pr":"#544","note":"release PR","wakeRole":"evaluator"}}}',
+        '{"kanban":{"wait":{"card":"#18","on":"card","waitsOn":"#12","note":"after the parent"}}}',
+        '{"kanban":{"wait":{"card":"#19","on":"script","script":"deploy-landed","args":{"env":"prod"},"note":"prod deploy"}}}',
+        '{"kanban":"post","card":12,"text":"still here"}',
+        "checked 8 cards",
+      ].join("\n"),
+    );
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.commands.map((command) => command.kanban)).toEqual(["post"]);
+    expect(parsed.text).toBe("checked 8 cards");
+    expect(parsed.waits).toEqual([
+      {
+        _tag: "answer",
+        card: 12,
+        answer: { result: "wake", to: "review", note: "ENG-123 is Done" },
+      },
+      { _tag: "answer", card: 13, answer: { result: "hold", status: "CI 3 of 5 passed" } },
+      { _tag: "answer", card: 14, answer: { result: "fail", reason: "Linear said 401" } },
+      {
+        _tag: "wake",
+        card: 15,
+        // Names no wait: it ends whatever wait the card has.
+        wait: null,
+        answer: { result: "wake", to: "work", note: "v2.4.1 is live" },
+      },
+      {
+        _tag: "wake",
+        card: 16,
+        wait: "2026-11-10T11:00:00.000Z",
+        answer: { result: "wake", note: "deployed" },
+      },
+      {
+        _tag: "park",
+        card: 17,
+        waitsOn: null,
+        request: { on: "merge", pr: "#544", note: "release PR", wakeRole: "evaluator" },
+      },
+      { _tag: "park", card: 18, waitsOn: 12, request: { on: "card", note: "after the parent" } },
+      {
+        _tag: "park",
+        card: 19,
+        waitsOn: null,
+        request: {
+          on: "script",
+          script: "deploy-landed",
+          args: { env: "prod" },
+          note: "prod deploy",
+        },
+      },
+    ]);
+  });
+
+  it("turns an answer it can't read into a failed check, and reports lines that name no card", () => {
+    const parsed = parseOutput(
+      [
+        // Readable enough to know the card: it holds, with the problem on it.
+        '{"kanban":{"wait":{"card":"#12","result":"maybe"}}}',
+        '{"kanban":{"wait":{"card":"#13","result":"wake"}}}',
+        // No card, no known key, bad values: reported, nothing applied.
+        '{"kanban":{"wait":{"result":"wake","note":"x"}}}',
+        '{"kanban":{"wake":{"card":"twelve","note":"x"}}}',
+        '{"kanban":{"wake":{"card":"#12"}}}',
+        '{"kanban":{"wait":{"card":"#12","on":"deploy","note":"x"}}}',
+        '{"kanban":{"wait":{"card":"#12","on":"card","waitsOn":"soon","note":"x"}}}',
+        '{"kanban":{"nudge":{"card":"#12"}}}',
+        '{"kanban":{"wait":{"card":"#12","result":',
+      ].join("\n"),
+    );
+    const unreadable = { result: "fail", reason: "The check's answer could not be read" };
+    expect(parsed.waits).toEqual([
+      { _tag: "answer", card: 12, answer: unreadable },
+      { _tag: "answer", card: 13, answer: unreadable },
+    ]);
+    expect(parsed.errors.map((error) => error.slice(0, 7))).toEqual([
+      "Line 3:",
+      "Line 4:",
+      "Line 5:",
+      "Line 6:",
+      "Line 7:",
+      "Line 8:",
+      "Line 9 ",
+    ]);
+    expect(parsed.errors[0]).toContain("names its card");
+    expect(parsed.errors[1]).toContain('"twelve" is not a card number');
+  });
+
+  it("says why a run can't count as a wait check", () => {
+    const ran = { exitCode: 0, timedOut: false, overflow: false, spawnError: null };
+    expect(checkRunProblem("linear-state", ran, 600_000)).toBeNull();
+    expect(checkRunProblem("linear-state", { ...ran, exitCode: 2 }, 600_000)).toBe(
+      "The linear-state script exited with code 2",
+    );
+    expect(
+      checkRunProblem("linear-state", { ...ran, exitCode: null, timedOut: true }, 600_000),
+    ).toBe("The linear-state script timed out after 10 minutes");
+    expect(
+      checkRunProblem("linear-state", { ...ran, exitCode: null, overflow: true }, 600_000),
+    ).toBe("The linear-state script printed too much and was stopped");
+    expect(
+      checkRunProblem("linear-state", { ...ran, exitCode: null, spawnError: "ENOENT" }, 600_000),
+    ).toBe("The linear-state script didn't start: ENOENT");
   });
 
   it("takes a pool command of any size", () => {

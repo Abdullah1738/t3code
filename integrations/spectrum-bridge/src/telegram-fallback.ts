@@ -65,6 +65,10 @@ const outcome = (status: number | undefined): "sent" | "skip" | "retry" =>
 const text = (...parts: Array<string | undefined>) =>
   parts.map(part => part === undefined ? "" : stripInternalText(part).trim()).filter(Boolean).join("\n").slice(0, MAX_TEXT);
 
+export const firstTurnAlert = (post: Post) => async (threadId: string, message: string): Promise<boolean> =>
+  [200, 202].includes(await post("/notify", { source: SOURCE, severity: "attention", text: message,
+    dedupeKey: `${threadId}:first-turn-failed` }) ?? 0);
+
 /** Owner alerts and the Telegram copy of images and cards iMessage would not take. */
 export function telegramOutlet(outlet: Outlet) {
   const notify = async (severity: "attention" | "info", message: string, key: string): Promise<boolean> =>

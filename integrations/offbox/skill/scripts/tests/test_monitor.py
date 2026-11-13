@@ -561,6 +561,49 @@ class SamplerToLadderTests(unittest.TestCase):
             self.assertTrue(support.live_exemption(self.CODEX, driver="codex"))
             self.assertFalse(support.live_exemption(self.CODEX, driver="claudeAgent"))
 
+    def write_claude_entries(self, *entries):
+        exemptions = Path(self.cfg_home) / "exemptions.json"
+        exemptions.write_text(json.dumps([dict(session_id=self.CLAUDE, driver="claudeAgent", expires_at=9999999999,
+                                               **e) for e in entries]))
+
+    def test_a_claude_child_exemption_does_not_exempt_the_whole_session(self):
+        # One in-process child logged an exemption. The session it shares with its parent is still warned.
+        self.write_claude_entries({"thread_id": "thread-child", "execution_kind": "provider-native-child"})
+        con = monitor.connect(":memory:")
+        _, actions = self._tick_pair(con, start=1000, drivers_and_pids=[(10001, "claudeAgent", self.CLAUDE)])
+        self.assertEqual([a["action"] for a in actions], ["steer"])
+        con.close()
+        self.assertFalse(support.live_exemption(self.CLAUDE, driver="claudeAgent"))
+        self.assertFalse(support.live_exemption(self.CLAUDE, driver="claudeAgent", thread="thread-sibling"))
+        self.assertTrue(support.live_exemption(self.CLAUDE, driver="claudeAgent", thread="thread-child"))
+
+    def test_a_claude_parent_exemption_still_covers_its_session(self):
+        self.write_claude_entries({"thread_id": "thread-claude", "execution_kind": "top-level"})
+        self.assertTrue(support.live_exemption(self.CLAUDE, driver="claudeAgent"))
+
+    def test_older_claude_entries_without_a_kind_are_read_by_their_thread(self):
+        # Written before the kind was recorded. The session's own thread (C1's answer for the bare id) keeps its
+        # session-wide meaning; any other thread is a child's and covers that child only.
+        self.write_claude_entries({"thread_id": "thread-child"})
+        self.assertFalse(support.live_exemption(self.CLAUDE, driver="claudeAgent"))
+        self.assertTrue(support.live_exemption(self.CLAUDE, driver="claudeAgent", thread="thread-child"))
+        self.write_claude_entries({"thread_id": "thread-claude"})
+        self.assertTrue(support.live_exemption(self.CLAUDE, driver="claudeAgent"))
+        # No thread at all: an exemption from before Claude callers resolved, still session-wide.
+        self.write_claude_entries({"thread_id": None})
+        self.assertTrue(support.live_exemption(self.CLAUDE, driver="claudeAgent"))
+
+    def test_older_claude_child_entry_is_not_session_wide_during_a_control_outage(self):
+        self.write_claude_entries({"thread_id": "thread-claude"})
+        with patch.object(support, "ctl", return_value=(0, {})):
+            self.assertFalse(support.live_exemption(self.CLAUDE, driver="claudeAgent"))
+
+    def test_a_codex_exemption_with_a_thread_keeps_its_session_match(self):
+        exemptions = Path(self.cfg_home) / "exemptions.json"
+        exemptions.write_text(json.dumps([{"session_id": self.CODEX, "driver": "codex", "thread_id": "thread-codex",
+                                           "execution_kind": "provider-native-child", "expires_at": 9999999999}]))
+        self.assertTrue(support.live_exemption(self.CODEX, driver="codex"))
+
     def test_an_exemption_recorded_without_a_driver_is_read_as_opencode_only(self):
         # Entries written before native drivers have no driver field. They must not silence a native process.
         con = monitor.connect(":memory:")

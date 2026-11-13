@@ -4,6 +4,7 @@ Food and NowNow tracking are exact-order. Marketplace completion requires the
 exact full-detail inventory to reconcile with its independent invoice count.
 """
 import http.client
+import datetime as dt
 import json
 import re
 import urllib.error
@@ -57,6 +58,9 @@ def _read(route, headers, deadline, order=None):
         host, path = 'api-app.noon.com', '/_svc/order-v2/order/' + order
     elif route == 'food_track' and isinstance(order, str) and FOOD_ORDER.fullmatch(order):
         host, path = 'api-app-fd.noon.com', '/_svc/mp-food-api-mpnoon/order/tracking/' + order + '/info'
+    elif route == 'food_detail' and isinstance(order, str) and FOOD_ORDER.fullmatch(order):
+        host, path = 'api-app-fd.noon.com', '/_svc/mp-food-api-mpnoon/order/details'
+        body = json.dumps({'orderNr': order}).encode()
     elif route == 'food_orders' and order is None:
         host, path = 'api-app-fd.noon.com', '/_svc/mp-food-api-mpnoon/order/orders'
         body = b'{}'
@@ -127,9 +131,30 @@ def food_projection(data, order):
     if row.get('orderNr') != order or not isinstance(raw, str) or not re.fullmatch(r'[a-z_]{1,64}', raw):
         raise NoonError('ORDER_MISMATCH_OR_SCHEMA_CHANGED')
     out = core.base(order, 'food')
-    out.update(raw_status=raw, status='delivered' if raw == 'delivered' else 'unknown',
+    out.update(raw_status=raw, status={'preparing': 'preparing', 'delivered': 'delivered', 'delivering': 'out for delivery',
+                                     'picked_up': 'picked up'}.get(raw, 'unknown'),
                scope='order', status_text=core.text(row.get('statusLabel')),
-               coverage='exact_native_food_order; delivered_only_live_verified')
+               coverage='exact_native_food_order; delivered_delivering_picked_up_verified')
+    estimate = row.get('estimate')
+    if isinstance(estimate, dict):
+        window = estimate.get('time')
+        timestamp = estimate.get('timestamp')
+        if isinstance(window, str) and isinstance(timestamp, str):
+            match = re.fullmatch(r'(\d{2}:\d{2} [AP]M) - (\d{2}:\d{2} [AP]M)', window)
+            if match:
+                try:
+                    anchor = dt.datetime.fromisoformat(timestamp)
+                    anchor = anchor.replace(tzinfo=core.DUBAI) if anchor.tzinfo is None else anchor.astimezone(core.DUBAI)
+                    start = dt.datetime.combine(anchor.date(), dt.datetime.strptime(match[1], '%I:%M %p').time(), core.DUBAI)
+                    end = dt.datetime.combine(anchor.date(), dt.datetime.strptime(match[2], '%I:%M %p').time(), core.DUBAI)
+                    if end < start:
+                        end += dt.timedelta(days=1)
+                    if start == anchor and dt.timedelta(0) <= end-start <= dt.timedelta(hours=4):
+                        out.update(eta=end.isoformat(), eta_text=window,
+                                   eta_window={'start': start.isoformat(), 'end': end.isoformat()},
+                                   eta_source='native_food_tracking_estimate')
+                except ValueError:
+                    pass
     # Delivered responses still include driver contact and coordinates. No
     # display-consent gate or active ETA contract has been verified: omit both.
     return out
@@ -152,7 +177,7 @@ def manifest_projection(data, order):
         if not isinstance(rows, list) or not rows or not isinstance(status, dict):
             raise NoonError('INCOMPLETE_MANIFEST')
         raw = status.get('highStatusCode')
-        if not isinstance(raw, str) or not re.fullmatch(r'[a-z_]{1,64}', raw):
+        if not isinstance(raw, str) or not re.fullmatch(r'[A-Za-z_ -]{1,64}', raw):
             raise NoonError('SCHEMA_CHANGED')
         for row in rows:
             if not isinstance(row, dict):
@@ -187,22 +212,28 @@ def manifest_projection(data, order):
                     raise NoonError('CONFLICTING_ITEM_STATUS')
             seen.add(item)
             items.append({'item_id': item, 'shipment_id': shipment, 'quantity': qty,
-                          'raw_status': raw, 'status': core.MARKETPLACE_STAGES.get(raw, 'unknown'), 'scope': 'item'})
+                          'raw_status': raw, 'status': core.marketplace_stage(raw), 'scope': 'item'})
     count = _invoice_count(data.get('invoice'))
-    # Quantity >1 and bundles have not been live-verified: require both unit and
-    # line counts to reconcile, rather than choosing an unverified interpretation.
-    complete = (count is not None and count == len(items) == sum(i['quantity'] for i in items)
+    # Native NAEIB0035436624: one quantity-2 line, invoice "Subtotal (2 items)".
+    # Count units, while retaining unique item identities and rejecting bundles.
+    complete = (count is not None and count == sum(i['quantity'] for i in items)
                 and _full_detail_shape(data)
-                and all(i['shipment_id'] for i in items if i['raw_status'] == 'delivered')
+                and all(i['shipment_id'] for i in items if i['status'] == 'delivered')
                 and not any(row.get('virtualBundleCode') for g in groups for row in g['items']))
     delivered = complete and all(i['status'] == 'delivered' for i in items)
+    cancelled = complete and all(i['status']=='cancelled' for i in items)
     out = core.base(order, 'marketplace')
     out.update(items=items, manifest_source='native_order_detail_item_groups',
-               manifest_complete=bool(complete), whole_order_complete=bool(delivered),
-               status='delivered' if delivered else 'unknown', scope='order',
+               manifest_complete=bool(complete), whole_order_complete=bool(delivered or cancelled),
+               status='delivered' if delivered else 'cancelled' if cancelled else core.marketplace_active_stage(i['status'] for i in items), scope='order',
                manifest_item_count=count, observed_item_count=len(items),
                coverage='exact_order_detail_inventory; invoice_count_reconciled' if complete
                         else 'exact_order_detail_inventory; incomplete_or_unverified_count_contract')
+    if cancelled:
+        out['terminal_evidence']={'source':'native_order_detail_item_groups','order':order,
+            'raw_status':'cancelled','item_ids':sorted(seen),'invoice_item_count':count,
+            'observed_at':out['checked_at'],
+            'provider_text':[core.text(g.get('text')) for g in groups]}
     return out
 
 

@@ -16,6 +16,7 @@ import * as NodeOS from "node:os";
 
 import { isPrivateNetworkHost, isTailnetHost } from "@t3tools/shared/hostClassification";
 
+import { makeStaleWhileRevalidate } from "../ardud/perf/staleWhileRevalidate.ts";
 import * as ServerConfig from "../config.ts";
 import { formatHostForUrl, isLoopbackHost, isWildcardHost } from "../startupAccess.ts";
 
@@ -26,6 +27,7 @@ type NetworkInterfacesMap = ReturnType<typeof NodeOS.networkInterfaces>;
  * CLI drops only the tailnet name and never the LAN addresses.
  */
 const TAILSCALE_ENDPOINT_TIMEOUT = Duration.seconds(3);
+const DISCOVERY_CACHE_TTL_MS = 60_000;
 
 export class DirectEndpoints extends Context.Service<
   DirectEndpoints,
@@ -138,7 +140,11 @@ export const make = Effect.gen(function* () {
     return endpoints;
   });
 
-  return DirectEndpoints.of({ resolve: () => resolve });
+  // ardud: every WebSocket connect resolved this, spawning `tailscale status`
+  // and probing Serve (1.5-2.9 s each on 11 Nov 2026). Serve and the tailnet
+  // name change rarely, so serve the last answer and refresh it in the background.
+  const cachedResolve = makeStaleWhileRevalidate(resolve, DISCOVERY_CACHE_TTL_MS);
+  return DirectEndpoints.of({ resolve: () => cachedResolve });
 });
 
 export const layer = Layer.effect(DirectEndpoints, make);

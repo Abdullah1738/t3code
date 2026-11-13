@@ -91,6 +91,33 @@ export class OrchestrationEventStore extends Context.Service<
       OrchestrationEventStoreError
     >;
 
+    /**
+     * ardud: what a shell stream needs to catch up over a range, without reading
+     * event bodies: each thread with an event in the range once (at its latest
+     * sequence) and every project event. `complete` is false when more than
+     * `maxThreads` threads changed; the caller then sends a snapshot instead.
+     */
+    readonly getShellChanges: (input: {
+      readonly afterSequence: number;
+      readonly throughSequence: number;
+      readonly maxThreads: number;
+    }) => Effect.Effect<
+      {
+        readonly complete: boolean;
+        readonly threads: ReadonlyArray<{
+          readonly threadId: ThreadId;
+          readonly sequence: number;
+          readonly redactionSequence?: number;
+        }>;
+        readonly projects: ReadonlyArray<{
+          readonly projectId: ProjectId;
+          readonly sequence: number;
+          readonly type: ApplicationProjectEvent["type"];
+        }>;
+      },
+      OrchestrationEventStoreError
+    >;
+
     readonly latestAgentSequence: (
       threadId?: ThreadId,
     ) => Effect.Effect<number, OrchestrationEventStoreError>;
@@ -299,9 +326,19 @@ const makeEventStore = Effect.gen(function* () {
     THEN json_set(
       json_remove(orchestration_events.payload_json, '$.promptSequence'),
       '$.prompt',
-      (SELECT json_extract(anchor.payload_json, '$.prompt')
-       FROM orchestration_events AS anchor
-       WHERE anchor.sequence = json_extract(orchestration_events.payload_json, '$.promptSequence'))
+      -- Probe each store by key. Correlating against the history view makes
+      -- SQLite materialise the whole union (90s+ per replay on a split DB).
+      COALESCE(
+        (SELECT json_extract(anchor.payload_json, '$.prompt')
+         FROM main.orchestration_events AS anchor
+         WHERE anchor.sequence = json_extract(orchestration_events.payload_json, '$.promptSequence')),
+        (SELECT json_extract(anchor.payload_json, '$.prompt')
+         FROM ardud_archive.ardud_events AS anchor INDEXED BY ardud_events_sequence_idx
+         WHERE anchor.sequence = json_extract(orchestration_events.payload_json, '$.promptSequence')),
+        (SELECT json_extract(anchor.payload_json, '$.prompt')
+         FROM ardud_base.orchestration_events AS anchor
+         WHERE anchor.sequence = json_extract(orchestration_events.payload_json, '$.promptSequence'))
+      )
     )
     ELSE orchestration_events.payload_json
   END`;
@@ -414,16 +451,15 @@ const makeEventStore = Effect.gen(function* () {
         application_event_version,
         causation_event_id,
         correlation_id
-      FROM orchestration_events
-      ${
-        // The sequence range otherwise wins and a command lookup scans every
-        // V2 event, which blocks the server for seconds on large histories.
+      FROM ${sql(
         input.commandId !== undefined
-          ? sql`INDEXED BY idx_orch_events_command_id`
+          ? "ardud_command_history_events"
           : input.onlyAgentEvents === true
-            ? sql``
-            : sql`INDEXED BY idx_orchestration_events_application_high_water`
-      }
+            ? input.threadId === undefined
+              ? "ardud_history_events"
+              : "ardud_thread_history_events"
+            : "ardud_application_history_events",
+      )} AS orchestration_events
       WHERE sequence > ${input.afterSequence}
         AND sequence <= ${input.throughSequence ?? Number.MAX_SAFE_INTEGER}
         AND (
@@ -464,7 +500,7 @@ const makeEventStore = Effect.gen(function* () {
           const storedPayload =
             hint !== undefined && subagent !== undefined
               ? sql`CASE WHEN EXISTS (
-                  SELECT 1 FROM orchestration_events
+                  SELECT 1 FROM ardud_history_events AS orchestration_events
                   WHERE sequence = ${hint}
                     AND json_type(payload_json, '$.promptSequence') IS NULL
                     AND json_extract(payload_json, '$.prompt') = ${subagent.prompt}
@@ -607,7 +643,7 @@ const makeEventStore = Effect.gen(function* () {
         COALESCE(MAX(event_type = 'thread.created'), 0) AS "hasCreateEvent"
       FROM (
         SELECT ${restoredPayloadJson} AS payload_json, event_type
-        FROM orchestration_events
+        FROM ardud_thread_history_events AS orchestration_events
         WHERE aggregate_kind = 'thread'
           AND stream_id = ${input.threadId}
           AND application_event_version = 2
@@ -631,7 +667,7 @@ const makeEventStore = Effect.gen(function* () {
       SELECT
         COUNT(*) AS "eventCount",
         COALESCE(SUM(octet_length(${restoredPayloadJson})), 0) AS "rawPayloadBytes"
-      FROM orchestration_events INDEXED BY idx_orchestration_events_application_high_water
+      FROM ardud_application_history_events AS orchestration_events
       WHERE sequence > ${input.afterSequence}
         AND sequence <= ${input.throughSequence}
         AND (
@@ -646,6 +682,83 @@ const makeEventStore = Effect.gen(function* () {
         rawPayloadBytes: rows[0]?.rawPayloadBytes ?? 0,
       })),
     );
+
+  // Thread rows use stream_id as the thread id (appendAgentEvents). The view reads the hot
+  // table through the partial application index, so each statement repeats that index's
+  // predicate word for word. The narrowing term carries a unary plus: pushed into the
+  // view as a plain column test it lets SQLite simplify the predicate away, after which
+  // it cannot prove the partial index applies ("no query solution").
+  const applicationRows = sql`(
+    aggregate_kind = 'project'
+    OR (application_event_version = 2 AND aggregate_kind = 'thread')
+  )`;
+  const getShellChanges: OrchestrationEventStore["Service"]["getShellChanges"] = Effect.fn(
+    "OrchestrationEventStore.getShellChanges",
+  )(
+    function* (input) {
+      const maxThreads = Math.max(0, Math.floor(input.maxThreads));
+      const threads = yield* sql<{
+        readonly streamId: string;
+        readonly sequence: number;
+        readonly redactionSequence: number | null;
+      }>`
+        SELECT stream_id AS "streamId", MAX(sequence) AS sequence,
+          MAX(CASE WHEN event_type = 'thread.item-redacted' THEN sequence END) AS "redactionSequence"
+        FROM ardud_application_history_events AS orchestration_events
+        WHERE sequence > ${input.afterSequence}
+          AND sequence <= ${input.throughSequence}
+          AND ${applicationRows}
+          AND +aggregate_kind = 'thread'
+        GROUP BY stream_id
+        ORDER BY MAX(sequence) ASC
+        LIMIT ${maxThreads + 1}
+      `;
+      if (threads.length > maxThreads) {
+        return { complete: false, threads: [], projects: [] };
+      }
+      const projects = yield* sql<{
+        readonly streamId: string;
+        readonly sequence: number;
+        readonly eventType: string;
+      }>`
+        SELECT stream_id AS "streamId", sequence, event_type AS "eventType"
+        FROM ardud_application_history_events AS orchestration_events
+        WHERE sequence > ${input.afterSequence}
+          AND sequence <= ${input.throughSequence}
+          AND ${applicationRows}
+          AND +aggregate_kind = 'project'
+        ORDER BY sequence ASC
+        LIMIT ${maxThreads + 1}
+      `;
+      if (projects.length > maxThreads) {
+        return { complete: false, threads: [], projects: [] };
+      }
+      return {
+        complete: true,
+        threads: threads.map((row) => ({
+          threadId: ThreadId.make(row.streamId),
+          sequence: row.sequence,
+          ...(row.redactionSequence === null ? {} : { redactionSequence: row.redactionSequence }),
+        })),
+        // Same rule as replay with skipUnknownEventTypes: a row a newer build wrote is dropped.
+        projects: projects.flatMap((row) =>
+          isKnownProjectEventType(row.eventType)
+            ? [
+                {
+                  projectId: ProjectId.make(row.streamId),
+                  sequence: row.sequence,
+                  type: row.eventType,
+                },
+              ]
+            : [],
+        ),
+      };
+    },
+    // One snapshot for both statements.
+    sql.withTransaction,
+    NodeSqliteClient.readOnly,
+    Effect.mapError(toPersistenceSqlError("OrchestrationEventStore.getShellChanges:query")),
+  );
 
   const latestAgentSequence: OrchestrationEventStore["Service"]["latestAgentSequence"] = (
     threadId,
@@ -749,6 +862,7 @@ const makeEventStore = Effect.gen(function* () {
     readAgentEvents,
     getAgentReplayStats,
     getReplayStats,
+    getShellChanges,
     latestAgentSequence,
     latestApplicationSequence,
     readApplicationEvents: catchUpApplicationEvents,

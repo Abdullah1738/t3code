@@ -92,6 +92,32 @@ class HealthIncidents(unittest.TestCase):
         self.assertEqual(self.notices[1][1], "Memory system recovered: muse_lag.")
         self.assertNotIn("muse_lag", self.state()["failing"])
 
+    def test_backup_send_interruption_preserves_both_incident_reservations(self):
+        self.ok = False
+        backup_attempts = []
+
+        def backup_send(name, text, incident, recovered=False):
+            saved = self.state()["failing"]
+            self.assertEqual(saved[name]["since"], incident)
+            self.assertIn("incident_id", saved["muse_lag"])
+            backup_attempts.append(incident)
+            if len(backup_attempts) == 1:
+                raise SystemExit("interrupted after backup enqueue")
+            return True
+
+        with mock.patch.object(hc, "CHECKS", [("backup", lambda: (False, "backup stopped")),
+                                            ("muse_lag", self.muse)]), \
+                mock.patch.object(hc, "notify_backup", side_effect=backup_send):
+            with self.assertRaises(SystemExit):
+                self.run_check()
+            muse_id = self.state()["failing"]["muse_lag"]["incident_id"]
+            self.assertEqual(self.notices, [])
+            self.run_check()
+            self.run_check()
+        self.assertEqual(backup_attempts[0], backup_attempts[1])
+        self.assertEqual(len(backup_attempts), 2)
+        self.assertEqual([n[2] for n in self.notices], [f"memory-health:muse_lag:{muse_id}"])
+
     def test_single_failure_recovers_silently_then_new_incident(self):
         self.ok = False
         self.run_check()

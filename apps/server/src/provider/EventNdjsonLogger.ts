@@ -7,7 +7,7 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
 import type { ThreadId } from "@t3tools/contracts";
-import type * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
+import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import { makeAsyncRotatingFileSink } from "@t3tools/shared/logging";
 import { errorTag } from "@t3tools/shared/observability";
 import * as Clock from "effect/Clock";
@@ -19,6 +19,7 @@ import * as Result from "effect/Result";
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import { toSafeThreadAttachmentSegment } from "../attachmentStore.ts";
@@ -66,6 +67,7 @@ const transientAcpUpdates = new Set(["agent_message_chunk", "agent_thought_chunk
 export type EventNdjsonStream = "native" | "canonical" | "orchestration";
 
 export interface EventNdjsonLogStore {
+  readonly withMaintenance: ProviderEventLoggers.ProviderLogMaintenance;
   readonly filePath: string;
   readonly logger: (stream: EventNdjsonStream) => ProviderEventLoggers.EventNdjsonLogger;
   readonly close: () => Effect.Effect<void>;
@@ -692,8 +694,10 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
     lastRetentionAt: initializedAt,
   });
   const timerScope = yield* Scope.make();
+  const maintenanceLock = yield* Semaphore.make(1);
+  const maintenanceEpochs = new Map<string, number>();
 
-  const flush = Effect.fnUntraced(function* (timerFired: boolean, close: boolean) {
+  const flushUnlocked = Effect.fnUntraced(function* (timerFired: boolean, close: boolean) {
     const startedAt = yield* Clock.currentTimeMillis;
     const result = yield* SynchronizedRef.modifyEffect(stateRef, (state) =>
       drainPending({
@@ -738,7 +742,43 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
         { discard: true },
       );
     }
+    return result.failures.length === 0;
   }, Effect.uninterruptible);
+
+  const flush = (timerFired: boolean, close: boolean) =>
+    maintenanceLock.withPermit(flushUnlocked(timerFired, close)).pipe(Effect.asVoid);
+  const withMaintenance: ProviderEventLoggers.ProviderLogMaintenance = (
+    threadId,
+    effect,
+    maintenance = {},
+  ) =>
+    maintenanceLock.withPermit(
+      Effect.gen(function* () {
+        const segment = resolveThreadSegment(threadId);
+        const epoch = maintenanceEpochs.get(segment) ?? 0;
+        return yield* Effect.gen(function* () {
+          if (!(yield* flushUnlocked(false, false)))
+            return yield* new ProviderEventLoggers.ProviderLogMaintenanceError({});
+          return yield* effect;
+        }).pipe(
+          Effect.ensuring(
+            Effect.gen(function* () {
+              if (maintenance.shouldInvalidate?.() ?? true) {
+                maintenanceEpochs.set(segment, epoch + 1);
+                // Fork dependencies are discovered under the writer lease while this barrier is held.
+                for (const id of maintenance.relatedThreadIds ?? []) {
+                  const related = resolveThreadSegment(id);
+                  if (related !== segment)
+                    maintenanceEpochs.set(related, (maintenanceEpochs.get(related) ?? 0) + 1);
+                }
+              }
+              // Atomic replacement changes sizes; reopen sinks on the next append.
+              yield* SynchronizedRef.update(stateRef, (state) => ({ ...state, sinks: new Map() }));
+            }),
+          ),
+        );
+      }),
+    );
 
   const scheduleFlush = Effect.fnUntraced(function* () {
     yield* Effect.forkIn(
@@ -760,43 +800,50 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
 
     const write = Effect.fnUntraced(function* (event: unknown, threadId: ThreadId | null) {
       if (!shouldPersistProviderEvent(stream, event)) return;
-      let payload = yield* serializeEvent(boundProviderEventForLogging(event));
-      if (payload === undefined) return;
-      // Escaping can expand strings beyond their input size.
-      if (Buffer.byteLength(payload) > MAX_RECORD_CHARACTERS) {
-        payload = yield* serializeEvent(summarizeProviderEvent(event));
-        if (payload === undefined) return;
-      }
+      const segment = resolveThreadSegment(threadId);
+      const epoch = maintenanceEpochs.get(segment) ?? 0;
+      return yield* maintenanceLock.withPermit(
+        Effect.gen(function* () {
+          if (epoch !== (maintenanceEpochs.get(segment) ?? 0)) return;
+          let payload = yield* serializeEvent(boundProviderEventForLogging(event));
+          if (payload === undefined) return;
+          // Escaping can expand strings beyond their input size.
+          if (Buffer.byteLength(payload) > MAX_RECORD_CHARACTERS) {
+            payload = yield* serializeEvent(summarizeProviderEvent(event));
+            if (payload === undefined) return;
+          }
 
-      const observedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
-      const line = `[${observedAt}] ${resolveStreamLabel(stream)}: ${payload}\n`;
-      const bytes = Buffer.byteLength(line);
-      const action = yield* SynchronizedRef.modifyEffect(stateRef, (state) => {
-        if (state.closed) {
-          return Effect.succeed([{ flush: false }, state] as const);
-        }
-        const pending = state.pending;
-        pending.push({ stream, threadSegment: resolveThreadSegment(threadId), line, bytes });
-        const pendingBytes = state.pendingBytes + bytes;
-        const flush =
-          resolved.batchWindowMs === 0 ||
-          pending.length >= resolved.maxBufferedRecords ||
-          pendingBytes >= resolved.maxBufferedBytes;
-        const schedule = !flush && !state.flushScheduled;
-        const nextState = {
-          ...state,
-          pending,
-          pendingBytes,
-          flushScheduled: state.flushScheduled || schedule,
-        };
-        return (schedule ? scheduleFlush() : Effect.void).pipe(
-          Effect.as([{ flush }, nextState] as const),
-        );
-      }).pipe(Effect.uninterruptible);
+          const observedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+          const line = `[${observedAt}] ${resolveStreamLabel(stream)}: ${payload}\n`;
+          const bytes = Buffer.byteLength(line);
+          const action = yield* SynchronizedRef.modifyEffect(stateRef, (state) => {
+            if (state.closed) {
+              return Effect.succeed([{ flush: false }, state] as const);
+            }
+            const pending = state.pending;
+            pending.push({ stream, threadSegment: resolveThreadSegment(threadId), line, bytes });
+            const pendingBytes = state.pendingBytes + bytes;
+            const flush =
+              resolved.batchWindowMs === 0 ||
+              pending.length >= resolved.maxBufferedRecords ||
+              pendingBytes >= resolved.maxBufferedBytes;
+            const schedule = !flush && !state.flushScheduled;
+            const nextState = {
+              ...state,
+              pending,
+              pendingBytes,
+              flushScheduled: state.flushScheduled || schedule,
+            };
+            return (schedule ? scheduleFlush() : Effect.void).pipe(
+              Effect.as([{ flush }, nextState] as const),
+            );
+          }).pipe(Effect.uninterruptible);
 
-      if (action.flush) {
-        yield* flush(false, false);
-      }
+          if (action.flush) {
+            yield* flushUnlocked(false, false);
+          }
+        }),
+      );
     });
 
     const view = {
@@ -808,7 +855,7 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
     return view;
   };
 
-  return { filePath, logger, close } satisfies EventNdjsonLogStore;
+  return { filePath, logger, close, withMaintenance } satisfies EventNdjsonLogStore;
 });
 
 export const makeEventNdjsonLogger = Effect.fnUntraced(function* (

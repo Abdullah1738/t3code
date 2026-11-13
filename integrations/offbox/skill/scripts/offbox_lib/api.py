@@ -1,8 +1,11 @@
-"""boat.dev HTTP API client (stdlib). The key is read from Keychain at runtime and never printed or stored."""
+"""HTTP API client (stdlib) for boat.dev and for our own offbox server (boatd answers the same calls).
+The key is read from Keychain at runtime and never printed or stored."""
 
 from __future__ import annotations
 
 import contextlib
+import contextvars
+import http.client
 import json
 import re
 import os
@@ -13,26 +16,45 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import weakref
 
-from .common import OffboxError, EXIT_INFRA, iso_ts, log
+from .common import (OffboxError, EXIT_INFRA, SERVER_CFG, backend, db, iso_ts, log, owner_scoped, require_mine,
+                     token_owner)
 from . import capacity
 
-API = os.environ.get("OFFBOX_BOAT_API", "https://boat.dev/api/v1")
+BACKEND = backend()
+NAME = "offbox server" if BACKEND == "server" else "boat"
+
+
+def _server_url() -> str:
+    try:
+        return json.loads(SERVER_CFG.read_text())["url"].rstrip("/")
+    except (OSError, ValueError, KeyError):
+        return "http://offbox-server:8443/api/v1"
+
+
+# Our own server (boatd) answers the same REST calls as boat.dev; see integrations/offbox/server/boatd.py.
+API = os.environ.get("OFFBOX_BOAT_API") or (_server_url() if BACKEND == "server" else "https://boat.dev/api/v1")
+KEY_SERVICE = "offbox-server-api" if BACKEND == "server" else "boat-api"
+# On our server every owner has their own token (Keychain account = owner): person-box work uses that person's,
+# everything else ours. A token only opens its owner's boxes there. boat.dev has the one account.
+KEY_ACCOUNT = token_owner() if BACKEND == "server" else "ardud"
 _KEY: str | None = None
 LIVE_STATES = ("ready", "idle", "running")
-STARTING_STATES = ("init", "provisioning", "provisioned", "cloning")
+STARTING_STATES = ("init", "provisioning", "provisioned", "cloning", "starting", "resuming")
 STOPPED_STATES = ("archived",)
+STOPPING_STATES = ("stopping",)
 REDACT_KEYS = ("url", "desktopUrl", "viewerUrl", "signedUrl")
 
 
 def _key() -> str:
     global _KEY
     if _KEY is None:
-        p = subprocess.run(["security", "find-generic-password", "-s", "boat-api", "-a", "ardud", "-w"],
+        p = subprocess.run(["security", "find-generic-password", "-s", KEY_SERVICE, "-a", KEY_ACCOUNT, "-w"],
                            capture_output=True, text=True)
         k = p.stdout.strip()
         if p.returncode != 0 or not k:
-            raise OffboxError("boat API key missing from Keychain (boat-api/ardud)")
+            raise OffboxError(f"API key missing from Keychain ({KEY_SERVICE}/{KEY_ACCOUNT})")
         _KEY = k
     return _KEY
 
@@ -57,8 +79,36 @@ class ApiError(OffboxError):
     def __init__(self, status: int, code: str, message: str, retryable: bool = False):
         if status in CF_OUTAGE and not message:
             message = f"Cloudflare could not reach boat.dev ({CF_OUTAGE[status]})"
-        super().__init__(f"boat API {status} {code}: {message}", EXIT_INFRA, outage=status in CF_OUTAGE)
+        # server_not_ready: our server is up but still importing its pool or reconciling after a restart.
+        super().__init__(f"{NAME} API {status} {code}: {message}", EXIT_INFRA,
+                         outage=status in CF_OUTAGE or code == "server_not_ready")
         self.status, self.api_code, self.retryable = status, code, retryable
+        self.message = message
+
+
+def gateway_timeout(e: OffboxError) -> bool:
+    return isinstance(e, ApiError) and e.status in (500, 504) and (
+        e.api_code.startswith("Request timeout after") or e.message.startswith("Request timeout after"))
+
+
+class NetworkError(OffboxError):
+    """The API did not answer; a non-idempotent request may still have reached boat."""
+
+    def __init__(self, message: str):
+        super().__init__(message, outage=True)
+
+
+class BoatAtCapacity(capacity.CapacityError):
+    """boat cannot start a machine yet; no command has run."""
+
+    def __init__(self):
+        super().__init__("boat out of machine capacity; nothing ran. Retry in a few minutes.")
+
+
+def is_capacity_outage(status: int, code: str, message: str) -> bool:
+    return (status == 503 and code == "out_of_capacity") or (
+        status == 409 and code in ("resume_failed", "deploy_failed") and
+        bool(re.search(r"\bat capacity\b", message, re.I)))
 
 
 SUPPLY_OUT = re.compile(r"supply for size (\w+) is over", re.I)
@@ -80,6 +130,9 @@ def _refused(e: "ApiError", box_id: str | None):
     msg = str(e)
     m = SUPPLY_OUT.search(msg)
     if not m:
+        if 500 <= e.status < 600:
+            from . import home
+            e.outage = e.outage or home.may_fail_over()
         return None
     size = m.group(1).lower()
     capacity.supply_out(size, box_id, msg)
@@ -99,6 +152,127 @@ def _never_delivered(status: int, code: str, msg: str) -> bool:
 # A time budget for a bounded maintenance pass (the reaper's upkeep). While set, every request's timeout is capped
 # to the time left and retries stop once it is spent, so the pass cannot outrun its caller's limit.
 _DEADLINE: float | None = None
+_REQUEST_SCOPE = contextvars.ContextVar('boat_request_scope', default=None)
+
+
+class RequestScope:
+    """Cancel a worker's requests without changing another thread's API budget."""
+
+    def __init__(self, seconds: float, parent=None):
+        self.seconds = seconds
+        self.end = time.time() + seconds
+        self.parent = parent
+        self.stopped = threading.Event()
+        self.lock = threading.Lock()
+        self.sockets = weakref.WeakSet()
+        self.mutation_body = None
+        self.pending = set()
+        self.settled = threading.Event()
+        self.settled.set()
+
+    def check(self):
+        if self.parent is not None:
+            self.parent.check()
+        if self.stopped.is_set():
+            raise OffboxError('boat API worker cancelled')
+
+    def attach(self, sock):
+        if self.parent is not None:
+            self.parent.attach(sock)
+        with self.lock:
+            self.check()
+            self.sockets.add(sock)
+
+    def sending(self, data):
+        owner = self.parent or self
+        with owner.lock:
+            self.check()
+            if self.mutation_body is not None and data == self.mutation_body:
+                # Mark before sendall: cancellation may race its return after the server received every byte.
+                owner.pending.add(self)
+                owner.settled.clear()
+
+    def reading(self):
+        owner = self.parent or self
+        with owner.lock:
+            if self in owner.pending:
+                return  # A stopped sender may still confirm its delivered mutation during the drain grace.
+        self.check()
+
+    def acknowledge(self):
+        owner = self.parent or self
+        with owner.lock:
+            owner.pending.discard(self)
+            if not owner.pending:
+                owner.settled.set()
+
+    def cancel(self, preserve_mutations=False):
+        with self.lock:
+            self.stopped.set()
+            protected = {sock for request in self.pending for sock in request.sockets} if preserve_mutations else set()
+            sockets = [sock for sock in self.sockets if sock not in protected]
+        for sock in sockets:
+            _shutdown(sock)
+
+    @contextlib.contextmanager
+    def active(self):
+        token = _REQUEST_SCOPE.set(self)
+        try:
+            yield
+        finally:
+            _REQUEST_SCOPE.reset(token)
+
+    @contextlib.contextmanager
+    def request(self):
+        request = RequestScope(self.seconds, parent=self)
+        timer = threading.Timer(self.seconds, request.cancel)
+        timer.daemon = True
+        timer.start()
+        try:
+            with request.active():
+                yield
+        finally:
+            timer.cancel()
+
+
+class _CancellableConnection:
+    def send(self, data):
+        scope = _REQUEST_SCOPE.get()
+        scope.check()
+        if self.sock is None:
+            self.connect()
+        # A connect/DNS/TLS operation may finish after cancellation. Never send on that late connection.
+        try:
+            scope.attach(self.sock)
+            scope.sending(data)
+            super().send(data)
+        except BaseException:
+            self.close()
+            raise
+
+
+class _HTTPConnection(_CancellableConnection, http.client.HTTPConnection):
+    pass
+
+
+class _HTTPSConnection(_CancellableConnection, http.client.HTTPSConnection):
+    pass
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_HTTPConnection, req)
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_HTTPSConnection, req, context=self._context)
+
+
+def _open(req, timeout):
+    if _REQUEST_SCOPE.get() is None:
+        return urllib.request.urlopen(req, timeout=timeout)
+    return urllib.request.build_opener(_HTTPHandler(), _HTTPSHandler()).open(req, timeout=timeout)
 
 
 @contextlib.contextmanager
@@ -133,13 +307,113 @@ def _check_deadline(deadline: float, method: str, path: str) -> None:
         raise OffboxError(f"deadline passed before {method} {path}")
 
 
+def _read_response(response, deadline):
+    scope = _REQUEST_SCOPE.get()
+    if scope is not None:
+        scope.reading()
+        sock = _response_socket(response)
+        if sock is not None and sock not in scope.sockets:
+            scope.attach(sock)
+    fired = threading.Event()
+    dog = _shut_at(response, deadline, fired) if deadline is not None else None
+    try:
+        try:
+            raw = response.read()
+        except Exception as e:  # urllib/http.client use different errors for a socket shut mid-body
+            if deadline is not None and (fired.is_set() or time.time() >= deadline):
+                raise TimeoutError("deadline passed while reading boat response") from e
+            raise
+        if deadline is not None and (fired.is_set() or time.time() > deadline):
+            raise TimeoutError("deadline passed while reading boat response")
+        if scope is not None:
+            scope.reading()
+        return raw
+    finally:
+        if dog:
+            dog.cancel()
+
+
 def call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
          retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
+    from . import allocation, pool
+    if method != "POST" or not (path == "/sandboxes" or path.endswith("/fork")):
+        return _call(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
+    box_id = path.split("/")[2] if path != "/sandboxes" else None
+    with allocation.guard(box_id, recover_create=True):
+        key = "create_unanswered:" + allocation.key_for(box_id)
+        with contextlib.closing(db()) as con:
+            pending = con.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+            if pending:
+                original = json.loads(pending[0])
+                prior_body = {k: v for k, v in (original['body'] or {}).items() if k != 'name'}
+                next_body = {k: v for k, v in (body or {}).items() if k != 'name'}
+                if original['path'] != path or prior_body != next_body:
+                    raise allocation.Unresolved("a previous create/fork is unanswered; retry its original "
+                                                "source and size before allocating another machine; nothing ran")
+                body, headers = original['body'], original['headers']
+            con.execute("INSERT OR REPLACE INTO kv VALUES (?,?,?)",
+                        (key, json.dumps({"path": path, "body": body, "headers": headers}), time.time()))
+            con.commit()
+        try:
+            result = _call(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
+        except (ApiError, BoatAtCapacity, capacity.CapacityError) as e:
+            # _call wraps any refusal preceded by an uncertain send as a plain OffboxError.
+            if pending and not isinstance(e, pool.PoolBusyError):
+                raise allocation.Unresolved("the retained create/fork is still unresolved; nothing ran. "
+                                            "Retry its original source and size later") from e
+            if not pending:
+                with contextlib.closing(db()) as con:
+                    con.execute("DELETE FROM kv WHERE k=?", (key,))
+                    con.commit()
+            raise
+        except OffboxError as e:
+            raise allocation.Unresolved(str(e)) from e
+        with contextlib.closing(db()) as con:
+            con.execute("DELETE FROM kv WHERE k=?", (key,))
+            con.commit()
+        return result
+
+
+_OWN_BOXES: set[tuple[str, str]] = set()   # (token owner, box) pairs already checked in this process
+
+
+def _own_box(path: str) -> None:
+    """Last line of defence on the home server: no request is sent for a box our records give to another owner.
+    Her box answers 404 to our token, and callers read a 404 as "the box is gone" (common.require_mine). Selection
+    already leaves such leases out; this covers a box id that reaches the API some other way."""
+    if not owner_scoped() or not path.startswith("/sandboxes/"):
+        return
+    box_id = path.split("/")[2].split("?")[0]
+    seen = (token_owner(), box_id)
+    if not box_id or seen in _OWN_BOXES:
+        return
+    with contextlib.closing(db()) as con:
+        require_mine(con, box_id)
+    _OWN_BOXES.add(seen)
+
+
+def _call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
+         retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
+    _own_box(path)
+    scope = _REQUEST_SCOPE.get()
+    with scope.request() if scope is not None else contextlib.nullcontext():
+        return _request(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
+
+
+def _request(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
+             retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
     """JSON request. Retries only idempotent-safe failures (network, 5xx on GET/DELETE, explicit retryable).
     `deadline` (time.time()-style) caps every attempt, the retry pauses and the connect retries; past it the call
     raises OffboxError without sending. `connect_retries=0` disables the not-delivered connect retries."""
+    scope = _REQUEST_SCOPE.get()
+    if scope is not None:
+        scope.check()
+        end = scope.end
+        deadline = end if deadline is None else min(end, deadline)
+        retries = connect_retries = 0
     if _DEADLINE is not None:
         retries = 0
+        deadline = _DEADLINE if deadline is None else min(deadline, _DEADLINE)
     if deadline is not None:
         _check_deadline(deadline, method, path)
     max_connect = CONNECT_RETRIES if connect_retries is None else connect_retries
@@ -149,9 +423,35 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
     data = json.dumps(body).encode() if body is not None else None
     is_start = method == "POST" and (path == "/sandboxes" or path.endswith(("/fork", "/resume")))
     attempt = 0
+    uncertain_start = False
+
+    def check_start_queue(request_id=None):
+        if not is_start:
+            return
+        from . import allocation
+        try:
+            allocation.check_queue()
+        except capacity.CapacityError as error:
+            if request_id:
+                capacity.complete(request_id, "not_sent")
+            if uncertain_start:
+                raise allocation.Unresolved("a previous machine start was unanswered before queue expiry; "
+                                            "its retained request still needs reconciliation; nothing ran") from error
+            raise
+
     while True:
+        check_start_queue()
         attempt += 1
         req_timeout = timeout
+        # During an outage allocation retry, bound network calls only until a machine is accepted. Bring-up
+        # and command execution have their own deadlines and must not be cut off by the acquisition window.
+        from . import allocation, outage
+        allocation_left = outage.allocation_left() if allocation.in_scope() else None
+        allocation_call = is_start or (method == "GET" and path.startswith("/sandboxes/"))
+        if allocation_left is not None and allocation_call:
+            round_deadline = time.time() + allocation_left
+            deadline = round_deadline if deadline is None else min(deadline, round_deadline)
+            _check_deadline(deadline, method, path)
         if _DEADLINE is not None:
             # Recomputed on every attempt: a slow failure plus the retry pause has used part of the budget.
             room = _DEADLINE - time.time()
@@ -160,10 +460,19 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
             req_timeout = min(timeout, max(1.0, room))
         if deadline is not None:
             _check_deadline(deadline, method, path)
-            req_timeout = min(req_timeout, max(1.0, deadline - time.time()))
+            req_timeout = min(req_timeout, max(0.001, deadline - time.time()))
         req = urllib.request.Request(url, data=data, method=method, headers=h)
-        request_id = capacity.reserve(path.rsplit("/", 1)[-1],
-                                      path.split("/")[2] if path != "/sandboxes" else None) if is_start else None
+        if scope is not None and method == 'PATCH' and isinstance(body, dict) and 'ttlSeconds' in body:
+            scope.mutation_body = data
+        try:
+            request_id = capacity.reserve(path.rsplit("/", 1)[-1],
+                                          path.split("/")[2] if path != "/sandboxes" else None) if is_start else None
+        except capacity.CapacityError as e:
+            if uncertain_start:
+                raise OffboxError("a previous create/fork was unanswered before the local start limit; "
+                                  "nothing ran. Retry its retained key later") from e
+            raise
+        check_start_queue(request_id)
         if _DEADLINE is not None:
             # capacity.reserve may wait on SQLite (BEGIN IMMEDIATE, 30 s busy timeout): recompute what is left now,
             # and never send a request whose budget is already gone.
@@ -173,17 +482,33 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
                     capacity.complete(request_id, "not_sent")
                 raise OffboxError(f"boat API budget spent before sending {method} {path}")
             req_timeout = min(timeout, max(1.0, room))
+        if deadline is not None:
+            room = deadline - time.time()
+            if room <= 0:
+                if request_id:
+                    capacity.complete(request_id, "not_sent")
+                raise OffboxError(f"deadline passed before sending {method} {path}")
+            req_timeout = min(req_timeout, max(0.001, room))
         try:
-            with urllib.request.urlopen(req, timeout=req_timeout) as r:
-                raw = r.read()
+            if scope is not None:
+                scope.check()
+            check_start_queue(request_id)
+            with _open(req, timeout=req_timeout) as r:
+                raw = _read_response(r, deadline)
                 result = json.loads(raw) if raw.strip() else {}
+                if scope is not None:
+                    scope.acknowledge()
                 if request_id:
                     capacity.complete(request_id, "accepted", (result.get("sandbox") or {}).get("id"))
                 return result
         except urllib.error.HTTPError as e:
             try:
-                d = json.load(e)
+                d = json.loads(_read_response(e, deadline))
             except Exception:  # noqa: BLE001
+                if deadline is not None and time.time() >= deadline:
+                    if request_id:
+                        capacity.complete(request_id, "uncertain")
+                    raise NetworkError(f"deadline passed reading {method} {path}")
                 d = {}
             err = d.get("error") if isinstance(d.get("error"), dict) else {}
             code = d.get("code") or err.get("code") or f"http_{e.code}"
@@ -192,7 +517,28 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
                 capacity.complete(request_id, f"http_{e.code}")
             if e.code == 429 and is_start:
                 # A start-limit denial is never retried by this process or its siblings.
-                raise capacity.cooldown(e.headers, d)
+                denial = capacity.cooldown(e.headers, d)
+                if uncertain_start:
+                    raise OffboxError("a previous create/fork was unanswered before the start-limit refusal; "
+                                      "nothing ran. Check boat before retrying") from denial
+                raise denial
+            ambiguous_http = is_start and e.code in (502, 504, 520, 524) \
+                and not is_capacity_outage(e.code, code, msg) and not _never_delivered(e.code, code, msg)
+            if ambiguous_http:
+                uncertain_start = True
+            if is_start and is_capacity_outage(e.code, code, msg):
+                # This is an explicit refusal, not an ambiguous create. Retry only after the outer wait.
+                log(f"api {method} {path} -> {e.code} {code} {msg[:200]}")
+                if uncertain_start:
+                    raise OffboxError("a previous create/fork was unanswered; boat's later capacity refusal "
+                                      "does not prove it failed. Nothing ran; check boat before retrying")
+                raise BoatAtCapacity()
+            if is_start and uncertain_start and e.code in (520, 524) and "Idempotency-Key" in h:
+                raise OffboxError("create/fork was unanswered and may have been accepted; "
+                                  "nothing ran. Check boat before retrying")
+            if is_start and uncertain_start and "Idempotency-Key" in h and not ambiguous_http:
+                raise OffboxError("a previous create/fork was unanswered before a subsequent refusal; "
+                                  "nothing ran. Check boat before retrying")
             retryable = bool((err.get("details") or {}).get("retryable")) or code in (
                 "sandbox_starting", "boat_starting", "idempotency_in_progress", "ssh_host_key_unavailable",
                 "rate_limited") or msg == "sandbox_restoring"
@@ -216,26 +562,33 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
                 time.sleep(min(2.0 * attempt, 8))
                 continue
             log(f"api {method} {path} -> {e.code} {code} {msg[:200]}")
+            if is_start and uncertain_start and "Idempotency-Key" in h:
+                raise OffboxError("create/fork was unanswered and may have been accepted; "
+                                  "nothing ran. Check boat before retrying")
             raise ApiError(e.code, code, msg, retryable)
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError, OSError) as e:
             if request_id:
                 capacity.complete(request_id, "uncertain")
+                uncertain_start = True
             safe_method = method in ("GET", "DELETE", "PATCH") or "Idempotency-Key" in h
             if attempt <= retries and safe_method and _room(1.5 * attempt) and _in_deadline(deadline, 1.5 * attempt):
                 time.sleep(1.5 * attempt)
                 continue
+            if uncertain_start and is_start and "Idempotency-Key" in h:
+                raise OffboxError("create/fork was unanswered and may have been accepted; "
+                                  "nothing ran. Check boat before retrying") from e
             if deadline is not None and time.time() >= deadline:
                 # Still a network failure (boat silent): keep the outage classification the caller's clock needs.
-                raise OffboxError(f"deadline passed during {method} {path}: {e}", outage=True)
+                raise NetworkError(f"deadline passed during {method} {path}: {e}")
             log(f"api {method} {path} -> network {e}")
-            raise OffboxError(f"boat API unreachable ({method} {path}): {e}", outage=True)
+            raise NetworkError(f"{NAME} API unreachable ({method} {path}): {e}")
 
 
 def probe(timeout: float = 15) -> str | None:
     """One cheap GET to see whether boat answers. None = it answers; else why not. No connect retries: each
     would add sends and sleeps, so a probe would outrun its interval."""
     try:
-        call("GET", "/limits", timeout=timeout, retries=0, connect_retries=0)
+        call("GET", "/limits", timeout=timeout, retries=0, connect_retries=0, deadline=time.time() + timeout)
         return None
     except ApiError as e:
         return None if not e.outage else f"HTTP {e.status}"
@@ -247,21 +600,31 @@ class StreamDeadline(OffboxError):
     """The caller's absolute deadline passed while reading a stream (possibly during silence or keepalives)."""
 
 
+def _response_socket(r):
+    # HTTPError wraps HTTPResponse, adding one fp layer compared with a successful urlopen response.
+    response = r.fp if isinstance(r, urllib.error.HTTPError) else r
+    return getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+
+
+def _shutdown(sock):
+    try:
+        # The base method: SSLSocket.shutdown would also drop the SSL object under the blocked reader.
+        socket.socket.shutdown(sock, socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
 def _shut_at(r, deadline: float, fired: threading.Event) -> threading.Timer | None:
     """Shut the stream's socket down at `deadline`. A read blocked in recv (silence, or a partial line trickling in a
     byte at a time) wakes at once; the socket's own timeout restarts on every byte, so it cannot bound a read.
     shutdown, not close: closing a socket does not wake a recv already blocked on it."""
-    sock = getattr(getattr(getattr(r, "fp", None), "raw", None), "_sock", None)
+    sock = _response_socket(r)
     if sock is None:
         return None
 
     def fire():
         fired.set()
-        try:
-            # The base method: SSLSocket.shutdown would also drop the SSL object under the blocked reader.
-            socket.socket.shutdown(sock, socket.SHUT_RDWR)
-        except OSError:
-            pass
+        _shutdown(sock)
     t = threading.Timer(max(0.0, deadline - time.time()), fire)
     t.daemon = True
     t.start()
@@ -272,6 +635,7 @@ def stream(path: str, timeout: float = 120, deadline: float | None = None):
     """Open an ndjson stream; yields dicts. Caller handles reconnects. `deadline` is absolute (time.time()): the
     socket is shut at that moment (see _shut_at) and every line is checked against it, so no read, keepalive or
     partial line outlives it; the stream then raises StreamDeadline."""
+    _own_box(path)
     req = urllib.request.Request(API + path, headers={"Authorization": "Bearer " + _key(),
                                                       "Accept": "application/x-ndjson"})
     if deadline is not None:
@@ -321,8 +685,11 @@ def stream(path: str, timeout: float = 120, deadline: float | None = None):
 
 # ---------------------------------------------------------------- sandboxes
 
-def get(box_id: str) -> dict | None:
-    d = call("GET", f"/sandboxes/{box_id}", ok404=True)
+def get(box_id: str, *, deadline: float | None = None) -> dict | None:
+    if deadline is None:
+        d = call("GET", f"/sandboxes/{box_id}", ok404=True)
+    else:
+        d = call("GET", f"/sandboxes/{box_id}", ok404=True, retries=0, connect_retries=0, deadline=deadline)
     return None if d is None else d.get("sandbox")
 
 
@@ -456,8 +823,9 @@ def _supply_refusal(s: dict, st: str | None, since: float | None, stale_error: s
 
 
 def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7, since: float | None = None,
-               stale_error: str | None = None) -> dict:
+               stale_error: str | None = None, on_state=None) -> dict:
     """since: when this attempt started (a resume). stale_error: the box's error read just before it."""
+    from . import home
     if _DEADLINE is not None:
         timeout = max(0.0, min(timeout, _DEADLINE - time.time()))
     deadline = time.time() + timeout
@@ -472,8 +840,21 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
         if m and _supply_refusal(s, st, since, stale_error):
             capacity.supply_out(m.group(1).lower(), box_id, s["error"])
             raise SupplyOut(m.group(1).lower(), box_id, s["error"])
-        if st in ("error", "cancelled"):
-            raise OffboxError(f"box {box_id} went to {st}: {s.get('error')}")
+        http_error = re.match(r"^([45]\d{2})\b", s.get("error") or "")
+        status = int(http_error[1]) if http_error else None
+        server_error = status is not None and status >= 500
+        # Home clears the error before acknowledging a resume. A newer stopped error belongs to this attempt;
+        # updatedAt is truncated to milliseconds by the server.
+        failed_resume = (home.may_fail_over() and st in STOPPED_STATES and server_error and since is not None
+                         and (iso_ts(s.get("updatedAt")) or 0) >= since - .001)
+        if st in ("error", "cancelled") or failed_resume:
+            failed_start = server_error and (st == "error" or failed_resume)
+            error = OffboxError(f"box {box_id} went to {st}: {s.get('error')}",
+                                outage=failed_start and home.may_fail_over())
+            error.status = status
+            raise error
+        if on_state is not None:
+            on_state(s)
         if time.time() > deadline:
             raise OffboxError(f"box {box_id} stuck in {st} after {int(timeout)}s")
         time.sleep(poll)
@@ -488,11 +869,19 @@ def cmd_sync(box_id: str, command: str, timeout: int = 60, cwd: str | None = Non
     return call("POST", f"/sandboxes/{box_id}/commands", body, timeout=timeout + 30, retries=0)
 
 
-def cmd_start(box_id: str, command: str, cwd: str | None = None) -> dict:
+def cmd_start(box_id: str, command: str, cwd: str | None = None, meta: dict | None = None,
+              retry_interrupted: bool = False) -> dict:
+    """meta (repo, kind, run_id) lets the server group per-run resource numbers. retry_interrupted: if our
+    server loses power under the run, it queues the run again once by itself. Neither is sent to boat.dev."""
     body = {"command": command, "detached": True}
     if cwd:
         body["cwd"] = cwd
-    return call("POST", f"/sandboxes/{box_id}/commands", body, retries=0)
+    if BACKEND == "server":
+        if meta:
+            body["meta"] = meta
+        body["retry_interrupted"] = bool(retry_interrupted)
+    # Every run ID is submitted once; ambiguous proxy errors are settled by the wrapper claim over SSH.
+    return call("POST", f"/sandboxes/{box_id}/commands", body, retries=0, connect_retries=0)
 
 
 def cmd_status(box_id: str, pid: int, timeout: float = 60, retries: int = 2,
@@ -513,9 +902,10 @@ def cmd_attach(box_id: str, pid: int, out_off: int = 0, err_off: int = 0, timeou
                   timeout=timeout, deadline=deadline)
 
 
-def history_logs(box_id: str, command_id: str, which: str, offset: int = 0) -> dict:
+def history_logs(box_id: str, command_id: str, which: str, offset: int = 0,
+                 *, deadline: float | None = None) -> dict:
     qs = urllib.parse.urlencode({"stream": which, "offset": offset})
-    return call("GET", f"/sandboxes/{box_id}/command-history/{command_id}/logs?{qs}")
+    return call("GET", f"/sandboxes/{box_id}/command-history/{command_id}/logs?{qs}", deadline=deadline)
 
 
 def history_get(box_id: str, command_id: str) -> dict:

@@ -8,10 +8,11 @@ import type {
 
 type ModelFavorite = typeof ModelFavoriteSchema.Type;
 
-import { planSelection, type SelectionPlan } from "./selectionPlan.ts";
+import { planSelection } from "./selectionPlan.ts";
 
 const OVERRIDE_FIELDS = [
   "defaultModelSelection",
+  "textGenerationModelSelection",
   "sourceControlWriterModelSelection",
   "reviewGuideModelSelection",
 ] as const;
@@ -20,10 +21,18 @@ type OverrideField = (typeof OVERRIDE_FIELDS)[number];
 export const projectOverrideRef = (projectId: string, field: OverrideField): string =>
   `projectSettingsOverrides:${encodeURIComponent(projectId)}:${field}`;
 
-export const parseProjectOverrideRef = (ref: string): { projectId: string; field: OverrideField } | null => {
+export const parseProjectOverrideRef = (
+  ref: string,
+): { projectId: string; field: OverrideField } | null => {
   const [prefix, id, field, ...extra] = ref.split(":");
-  if (prefix !== "projectSettingsOverrides" || !id || !field || extra.length !== 0 ||
-      !OVERRIDE_FIELDS.some((candidate) => candidate === field)) return null;
+  if (
+    prefix !== "projectSettingsOverrides" ||
+    !id ||
+    !field ||
+    extra.length !== 0 ||
+    !OVERRIDE_FIELDS.some((candidate) => candidate === field)
+  )
+    return null;
   try {
     return { projectId: decodeURIComponent(id), field: field as OverrideField };
   } catch {
@@ -71,8 +80,8 @@ const withSelection = (
 /**
  * Plans the settings rewrite. The card's list: default model, favorites (the field is
  * `provider`), provider model preferences (hidden models move only for mapped slugs),
- * source-control writer, review guide, and per-project overrides. `textGenerationModelSelection`
- * is never touched, since GLM stays on OpenCode.
+ * source-control writer, review guide, text generation, and per-project overrides.
+ * Each selection is routed by family; GLM and other unrelated models stay on OpenCode.
  */
 export const planSettings = (settings: ServerSettings): SettingsPlan => {
   const changes: Array<SettingsChange> = [];
@@ -89,6 +98,20 @@ export const planSettings = (settings: ServerSettings): SettingsPlan => {
   );
   if (defaultSelection !== settings.defaultModelSelection) {
     patch.defaultModelSelection = defaultSelection ?? null;
+  }
+
+  const textGeneration = withSelection(
+    changes,
+    conflicts,
+    "textGenerationModelSelection",
+    settings.textGenerationModelSelection,
+  );
+  if (
+    textGeneration !== null &&
+    textGeneration !== undefined &&
+    textGeneration !== settings.textGenerationModelSelection
+  ) {
+    patch.textGenerationModelSelection = textGeneration;
   }
 
   const writer = withSelection(
@@ -169,7 +192,6 @@ export const planSettings = (settings: ServerSettings): SettingsPlan => {
   }
 
   // Per-project overrides: one ledger field per project and selection, holding that selection only.
-  // textGenerationModelSelection stays.
   const overrides = settings.projectSettingsOverrides;
   const nextOverrides: Record<string, Record<string, unknown>> = {};
   let overridesChanged = false;

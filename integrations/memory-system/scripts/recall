@@ -1,0 +1,3 @@
+#!/bin/zsh
+# recall: search and ask across every past agent session (memory-system/recall_cli.py)
+exec /opt/homebrew/bin/python3 "$HOME/.local/share/memory-system/src/recall_cli.py" "$@"

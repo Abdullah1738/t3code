@@ -14,6 +14,7 @@ const tail = [{ type: 'assistant', time: { created: T0 - 2 * HOUR }, content: []
 const freshState = () => ({ handled: {}, watch: {}, stalls: {}, ghosts: {}, servers: [] });
 const thread = (id, ses, extra = {}) => ({
   threadId: id, nativeSessionId: ses, activeRunId: `run:${ses}`, title: id,
+  model: { instanceId: 'opencode' },
   parentThreadId: null, relationshipToParent: null, pendingRequests: [],
   archived: false, origin: null, ...extra,
 });
@@ -28,6 +29,7 @@ function harness({ active = [], threads = {}, mappings = {}, sessions = {}, live
   const calls = { interrupt: [], oc: [], note: [], telegram: [], order: [] };
   let failures = 0;
   const io = {
+    harnessCutoverStatus: async () => ({ active: false, completed: false, claimedThreadIds: [], claimedRunIds: [] }),
     activeSessions: async () => new Set(active),
     activeThreads: async () => live,
     ocTail: async () => tail,
@@ -62,6 +64,49 @@ const watch = (state, ses, since = T0 - 30 * MIN) => {
   return stallId(ses, since);
 };
 
+test('a recovery paused at its final interrupt gate does not count toward a second stall', async () => {
+  const a = thread('thread:A', 'ses_a');
+  const fake = harness({ active: ['ses_a'], threads: { 'thread:A': a } });
+  const state = freshState();
+  const id = watch(state, 'ses_a');
+  let paused = false;
+  fake.io.now = () => T0;
+  fake.io.readControl = () => {
+    if (state.stalls[id]) paused = true;
+    return { intervals: paused ? [{ start: T0, end: null }] : [] };
+  };
+  await assert.rejects(scan(state, fake, T0), { code: 'RECOVERY_PAUSED' });
+  assert.deepEqual(state.stalls, {});
+  assert.deepEqual(fake.calls.interrupt, []);
+  assert.deepEqual(fake.calls.telegram, []);
+  fake.io.readControl = () => ({ intervals: [] });
+  await scan(state, fake, T0);
+  fake.active([]);
+  a.activeRunId = null;
+  await scan(state, fake, T0 + MIN);
+  assert.equal(state.stalls[id].alertEligible, false);
+  assert.deepEqual(fake.calls.telegram, []);
+});
+
+test('a second-stall notice held at the final Telegram gate survives resume without consuming retries', async () => {
+  const a = thread('thread:A', 'ses_b');
+  const fake = harness({ threads: { 'thread:A': a } });
+  const state = freshState();
+  state.stalls.first = record('ses_a', a.threadId, T0 - MIN, { alertOwnerId: a.threadId });
+  state.stalls.second = record('ses_b', a.threadId, T0, { alertOwnerId: a.threadId, alertPending: true });
+  const send = fake.io.telegram;
+  fake.io.telegram = () => { throw Object.assign(new Error('paused at transport'), { code: 'RECOVERY_PAUSED' }); };
+  await assert.rejects(scan(state, fake, T0), { code: 'RECOVERY_PAUSED' });
+  assert.equal(state.stalls.second.alertPending, true);
+  assert.equal(state.stalls.second.telegramTries, 0);
+  assert.deepEqual(fake.calls.telegram, []);
+  fake.io.telegram = send;
+  await scan(state, fake, T0 + MIN);
+  await scan(state, fake, T0 + 2 * MIN);
+  assert.equal(fake.calls.telegram.length, 1);
+  assert.equal(fake.calls.telegram[0].key, 'stream-recovery:second');
+});
+
 test('first stall is recovered and persisted silently; a distinct later stall of the same thread alerts', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'stall-gate-'));
   const previousDir = PATHS.dataDir;
@@ -72,7 +117,7 @@ test('first stall is recovered and persisted silently; a distinct later stall of
     let state = freshState();
     const first = watch(state, 'ses_a');
     await scan(state, fake, T0);
-    assert.deepEqual(fake.calls.interrupt, [{ id: 'thread:A', clientRequestId: first, reason: 'stall watch: waiting on the model' }]);
+    assert.deepEqual(fake.calls.interrupt, [{ id: 'thread:A', clientRequestId: first, reason: 'stall watch: waiting on the model', expectedRunId: 'run:ses_a' }]);
     fake.active([]);
     a.activeRunId = null;
     await scan(state, fake, T0 + MIN);

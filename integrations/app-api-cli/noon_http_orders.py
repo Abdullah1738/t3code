@@ -36,7 +36,42 @@ MINUTES_STAGES = {'confirmed': 'placed', 'preparing': 'preparing',
                   'ready_for_pickup': 'preparing',
                   'picked_up': 'out for delivery',
                   'arrived_at_delivery': 'nearby', 'delivered': 'delivered'}
-MARKETPLACE_STAGES = {'out_for_delivery': 'out for delivery', 'delivered': 'delivered'}
+MARKETPLACE_STAGES = {'processing':'pending confirmation', 'confirmed':'placed',
+                      'packed':'packed', 'shipped':'picked up', 'out_for_delivery':'out for delivery',
+                      'delivered':'delivered', 'cancelled':'cancelled'}
+
+
+def marketplace_stage(raw):
+    # Formatting variants of the same provider enum, never substring matches.
+    if not isinstance(raw,str) or not re.fullmatch(r'[A-Za-z_ -]{1,64}',raw):
+        return 'unknown'
+    return MARKETPLACE_STAGES.get(re.sub(r'[ -]+','_',raw.strip().lower()),'unknown')
+
+
+def marketplace_active_stage(states):
+    active=set(states)-{'delivered','cancelled'}
+    if not active or 'unknown' in active:return 'unknown'
+    ranks={'pending confirmation':0,'placed':1,'preparing':2,'packed':3,'picked up':4,'out for delivery':5}
+    return min(active,key=lambda value:ranks.get(value,-1))
+
+
+def marketplace_eta_minutes(text_value):
+    match=re.fullmatch(r'Arriving (?:(\d+) Hr[s]?\s*)?(?:(\d+) Min[s]?)?',text_value or '',re.I)
+    if match and any(match.groups()):
+        minutes=int(match[1] or 0)*60+int(match[2] or 0)
+        if 0<=minutes<2880:return minutes
+    return None
+
+
+def marketplace_eta(out):
+    minutes=marketplace_eta_minutes(out.get('eta_text'))
+    if minutes is not None:
+        observed=dt.datetime.fromisoformat(out['checked_at'])
+        if observed.tzinfo:
+            out.update(eta=(observed+dt.timedelta(minutes=minutes)).isoformat(),
+                       eta_relative_minutes=minutes,eta_observed_at=out['checked_at'],
+                       eta_source='native_marketplace_countdown')
+    return out
 ORDER = re.compile(r'[A-Z0-9]{1,64}')
 # Live-verified 2026-10-11: marketplace shipments are -S<digits> (packed+) and
 # rocket orders bind a -U<digits> fulfillment unit until packing rebinds -S.
@@ -273,7 +308,7 @@ def marketplace_cards(data):
         if not isinstance(status, dict):
             raise NoonError('SCHEMA_CHANGED')
         raw = status.get('highStatusCode')
-        if not isinstance(raw, str) or not re.fullmatch(r'[a-z_]{1,64}', raw):
+        if not isinstance(raw, str) or not re.fullmatch(r'[A-Za-z_ -]{1,64}', raw):
             raise NoonError('SCHEMA_CHANGED')
         shipment = row.get('shipmentNr')
         if shipment is not None and (not isinstance(shipment, str) or not SHIPMENT.fullmatch(shipment)
@@ -289,8 +324,8 @@ def marketplace_cards(data):
         if any(not isinstance(i, str) or not ITEM.fullmatch(i) or ITEM.fullmatch(i)[1] != order for i in item_ids):
             raise NoonError('ORDER_MISMATCH_OR_SCHEMA_CHANGED')
         item = base(order, 'marketplace')
-        item.update(status=MARKETPLACE_STAGES.get(raw, 'unknown') if isinstance(raw, str) else 'unknown',
-                    raw_status=raw if isinstance(raw, str) and re.fullmatch(r'[a-z_]{1,64}', raw) else None, shipment_id=shipment,
+        item.update(status=marketplace_stage(raw),
+                    raw_status=raw, shipment_id=shipment,
                     item_ids=item_ids, item_id=row.get('itemNr'),
                     scope='item' if row.get('itemNr') else 'shipment',
                     eta_text=text(delivery.get('message')),
@@ -312,11 +347,11 @@ def shipment_track(data, order, shipment):
     raw = next(iter(raws)) if len(raws) == 1 else None
     out = base(order, 'marketplace')
     out.update(shipment_id=shipment, scope='shipment', raw_status=raw,
-                status=MARKETPLACE_STAGES.get(raw, 'unknown'),
+                status=marketplace_stage(raw),
                 eta_text=text(data.get('deliveryMessage')), coverage='exact_native_shipment; whole_order_completion_unverified')
     if len(raws) > 1:
         out['warnings'] = ['timeline_status_conflict']
-    return out
+    return marketplace_eta(out)
 
 
 def item_track(data, order, item):
@@ -336,11 +371,11 @@ def item_track(data, order, item):
         raise NoonError('ORDER_MISMATCH_OR_SCHEMA_CHANGED')
     out = base(order, 'marketplace')
     out.update(item_id=item, shipment_id=sid, scope='item', raw_status=raw,
-                status=MARKETPLACE_STAGES.get(raw, 'unknown'), eta_text=text(data.get('deliveryMessage')),
+                status=marketplace_stage(raw), eta_text=text(data.get('deliveryMessage')),
                 coverage='exact_native_item; whole_order_completion_unverified')
     if len(raws) > 1:
         out['warnings'] = ['timeline_status_conflict']
-    return out
+    return marketplace_eta(out)
 
 
 class _Reads:
@@ -480,14 +515,20 @@ def track(order, timeout=10, *, deadline=None):
             shipments.append(evidence)
         out = base(order, 'marketplace', True)
         states = {s['status'] for s in shipments}
+        raws = {s.get('raw_status') for s in shipments}
+        out['raw_status'] = next(iter(raws)) if len(raws)==1 else None
         # Can confirm an active stage exists, but cannot certify order terminality
         # from a bounded set of shipments. Parent retains shipment evidence.
-        state = next(iter(states)) if len(states) == 1 else 'unknown'
+        state = marketplace_active_stage(states)
         out.update(status=state if state not in {'delivered', 'cancelled'} else 'unknown',
                    shipments=shipments, items=matches, whole_order_complete=False,
                    eta_text=shipments[0]['eta_text'] if len(shipments) == 1 else None,
                    truncated=any(code == 'DETAIL_LIMIT' for code in reads.coverage['skipped'].values()),
                    coverage='bounded_marketplace_shipments; whole_order_completion_unverified')
+        active=[s for s in shipments if s['status'] not in ('delivered','cancelled')]
+        if active and all(s.get('eta') for s in active):
+            out.update(eta=max(s['eta'] for s in active),eta_source='native_marketplace_countdown',
+                       eta_observed_at=out['checked_at'])
     else:
         raise NoonError('UNSUPPORTED_NOON_VERTICAL')
     return reads.finish(out)

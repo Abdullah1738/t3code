@@ -7,6 +7,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import { initializeHistoryArchive } from "../../ardud/persistence/HistoryArchive.ts";
 import * as EventStore from "../../orchestration-v2/EventStore.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectionMaintenance from "../../orchestration-v2/ProjectionMaintenance.ts";
@@ -128,6 +129,7 @@ layer("064_CanonicalizeThreadPullRequestLinks", (it) => {
         [65, "CodexUsageNativeTurnIndex"],
       ]);
       assert.deepEqual(yield* runMigrations(), []);
+      yield* initializeHistoryArchive();
       const rows = yield* sql<{ readonly thread_id: string; readonly payload_json: string }>`
         SELECT thread_id, payload_json FROM orchestration_v2_projection_threads
       `;

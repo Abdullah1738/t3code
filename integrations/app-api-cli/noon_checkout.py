@@ -292,7 +292,7 @@ def validate_quote(quote, home, expected_items, *, now, max_age=60):
              == quote.total_minor, 'FINAL_TOTAL_MISMATCH')
     pay = quote.payment
     _require(type(pay) is Payment and pay.method == 'saved_card' and pay.last4 == order_card.LAST4
-             and pay.network == 'mastercard' and _hash(pay.selected_card_ref), 'CARD_MISMATCH')
+             and pay.network == order_card.NETWORK and _hash(pay.selected_card_ref), 'CARD_MISMATCH')
     _require(type(pay.credits_minor) is int and pay.credits_minor == 0
              and _integer(pay.card_charge_minor) and pay.card_charge_minor == quote.total_minor,
              'PAYMENT_ALLOCATION_MISMATCH')

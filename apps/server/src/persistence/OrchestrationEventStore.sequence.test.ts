@@ -20,8 +20,6 @@ import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
 import * as SqlClient from "effect/sql/SqlClient";
 
-import { runMigrations } from "./Migrations.ts";
-import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as OrchestrationEventStore from "./OrchestrationEventStore.ts";
 import * as SqlitePersistence from "./Sqlite.ts";
 
@@ -491,7 +489,6 @@ it.effect("uses indexed high-water lookups for populated history without OR scan
   Effect.gen(function* () {
     const store = yield* OrchestrationEventStore.OrchestrationEventStore;
     const sql = yield* SqlClient.SqlClient;
-    yield* runMigrations();
     yield* sql`
       WITH RECURSIVE history(n) AS (
         SELECT 1 UNION ALL SELECT n + 1 FROM history WHERE n < 25000
@@ -543,20 +540,13 @@ it.effect("uses indexed high-water lookups for populated history without OR scan
     for (const row of [...applicationPlan, ...agentPlan]) {
       assert.notMatch(row.detail, /MULTI-INDEX OR|TEMP B-TREE/);
     }
-  }).pipe(
-    Effect.provide(
-      OrchestrationEventStore.layer.pipe(
-        Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
-      ),
-    ),
-  ),
+  }).pipe(Effect.provide(Layer.fresh(layerEventStore))),
 );
 
 it.effect("replays a command's events through the command index, not the sequence range", () =>
   Effect.gen(function* () {
     const store = yield* OrchestrationEventStore.OrchestrationEventStore;
     const sql = yield* SqlClient.SqlClient;
-    yield* runMigrations();
     yield* sql`
       WITH RECURSIVE history(n) AS (
         SELECT 1 UNION ALL SELECT n + 1 FROM history WHERE n < 25000
@@ -597,15 +587,22 @@ it.effect("replays a command's events through the command index, not the sequenc
       `EXPLAIN QUERY PLAN ${statements[0]}`,
       [0, Number.MAX_SAFE_INTEGER, "retried-command", 500],
     );
-    assert.match(
-      plan.map((row) => row.detail).join("\n"),
-      /SEARCH orchestration_events USING INDEX idx_orch_events_command_id \(command_id=\?/,
+    const commandLookups = plan.filter((row) =>
+      /USING INDEX (?:idx_orch_events_command_id|ardud_events_command_idx) /.test(row.detail),
     );
-  }).pipe(
-    Effect.provide(
-      OrchestrationEventStore.layer.pipe(
-        Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
-      ),
-    ),
-  ),
+    assert.lengthOf(commandLookups, 3);
+    for (const [index, expected] of [
+      /^SEARCH (?:main\.)?orchestration_events USING INDEX idx_orch_events_command_id \(command_id=\?/,
+      /^SEARCH cold USING INDEX ardud_events_command_idx \(command_id=\?/,
+      /^SEARCH base USING INDEX idx_orch_events_command_id \(command_id=\?/,
+    ].entries()) {
+      assert.match(commandLookups[index]!.detail, expected);
+    }
+    for (const row of plan) {
+      assert.notMatch(
+        row.detail,
+        /^SCAN (?:main\.orchestration_events|orchestration_events|cold|base)(?:$| )/,
+      );
+    }
+  }).pipe(Effect.provide(Layer.fresh(layerEventStore))),
 );

@@ -4,7 +4,7 @@ import {
   type ControlConfigOptions, type ControlMessage, type RunSummary, type ThreadDetail, type ThreadSummary,
 } from "./control.ts";
 import { nativeMessageId, opencodeFinishes, opencodeRunEvidence, type RunEvidence, type StepFinishes } from "./opencode-steps.ts";
-import { imessagePreferences, type PreferredModel } from "./preferred-model.ts";
+import { controlModelFields, imessagePreferences, type PreferredModel } from "./preferred-model.ts";
 import type { Store } from "./store.ts";
 
 /**
@@ -27,6 +27,15 @@ const outcome = (status: string): "succeeded" | "failed" | "interrupted" =>
 /** States that mean the conversation is still busy. `waiting` is not: the reply is out, only background work drains. */
 const BUSY = new Set(["running", "needs-input", "queued"]);
 
+/** Some providers return the selected-model complaint as a completed assistant message. */
+export const SELECTED_MODEL_ISSUE = /^\s*(?:there['’]s|there is) an issue with the selected model\s*\([^\r\n)]+\)(?:[.!:]|$)/i;
+
+function runFailure(thread: Pick<ThreadDetail, "lastError">, run: RunSummary, messages: ControlMessage[], latest: boolean): string | undefined {
+  if (!TERMINAL.has(run.status)) return;
+  const complaint = messages.find(message => message.runId === run.runId && message.role === "assistant" && SELECTED_MODEL_ISSUE.test(message.text))?.text;
+  return (latest && thread.lastError) || complaint || (run.status === "failed" ? "Run failed without error details" : undefined);
+}
+
 /** The send route derives the message id from `clientRequestId`; this maps it back to the bridge's prompt id. */
 export const sentMessagePrefix = (threadId: string) => `ardud-control:send:${threadId}:`;
 
@@ -38,6 +47,7 @@ function promptId(threadId: string, message: ControlMessage): string {
 
 /** The router's prompt ids (`msg_` plus a sha256), which it sends as `clientRequestId`. */
 const BRIDGE_PROMPT = /^msg_[0-9a-f]{64}$/;
+const runOrdinal = (runId: string) => Number(/:ordinal:(\d+)$/.exec(runId)?.[1] ?? 0);
 
 /**
  * Rebuilds OpenCode-2-style session records from Robob runs and messages, the
@@ -51,7 +61,7 @@ const BRIDGE_PROMPT = /^msg_[0-9a-f]{64}$/;
 export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recentRuns" | "run" | "lastError">, messages: ControlMessage[]): MessageRecord[] {
   const runs = new Map<string, RunSummary>();
   for (const run of [...thread.recentRuns ?? [], ...(thread.run ? [thread.run] : [])]) runs.set(run.runId, run);
-  const ordinal = (runId: string) => runs.get(runId)?.ordinal ?? Number(/:ordinal:(\d+)$/.exec(runId)?.[1] ?? 0);
+  const ordinal = (runId: string) => runs.get(runId)?.ordinal ?? runOrdinal(runId);
   const byRun = new Map<string, ControlMessage[]>();
   for (const message of messages) {
     if (message.runId === null || message.role === "system") continue;
@@ -61,9 +71,8 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
   const records: MessageRecord[] = [];
   for (const [runId, group] of [...byRun].sort((a, b) => ordinal(a[0]) - ordinal(b[0]))) {
     group.sort((a, b) => epoch(a.createdAt) - epoch(b.createdAt) || a.messageId.localeCompare(b.messageId));
-    // Runs older than the detail's recent window settled long ago.
-    const status = runs.get(runId)?.status ?? "completed";
-    const settled = TERMINAL.has(status);
+    const run = runs.get(runId);
+    const settled = run !== undefined && TERMINAL.has(run.status);
     let last: Extract<MessageRecord, { type: "assistant" }> | undefined;
     for (const message of group) {
       const created = epoch(message.createdAt);
@@ -84,15 +93,19 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
       };
       records.push(last);
     }
-    if (!settled) continue;
-    const result = outcome(status);
-    if (result === "failed" && runId === latest && thread.lastError) {
+    if (!settled || !run) continue;
+    const failure = runFailure(thread, run, group, runId === latest);
+    const result = failure ? "failed" : outcome(run.status);
+    if (failure) {
       // Carries the provider's error text, which is how a refusal is recognised.
-      const error = { type: "provider", message: thread.lastError };
+      const error = { type: "provider", message: failure };
       if (last) last.error = error;
       else records.push({ id: `${runId}:error`, type: "assistant", content: [], runId, finish: "error", error, time: { created: epoch(group.at(-1)?.updatedAt ?? null), completed: epoch(group.at(-1)?.updatedAt ?? null) } });
     }
-    records.push({ id: `idle:${runId}`, type: "idle", outcome: result, time: { created: epoch(group.at(-1)?.updatedAt ?? null) } });
+    records.push({ id: `idle:${runId}`, type: "idle", outcome: result,
+      ...(failure && run.ordinal === 1 ? { firstTurnFailure: true } : {}),
+      ...(group.some(message => message.role === "assistant" && SELECTED_MODEL_ISSUE.test(message.text)) ? { modelError: true } : {}),
+      time: { created: epoch(group.at(-1)?.updatedAt ?? null) } });
   }
   return records;
 }
@@ -124,6 +137,11 @@ export interface RobobBackendOptions extends ControlConfigOptions {
   finishes?: StepFinishes;
   /** Whether a native run called tools (see opencode-steps.ts opencodeRunEvidence). */
   runEvidence?: RunEvidence;
+  /**
+   * Raises one alert when a thread this backend created fails its first turn (see `checkFirstTurn`).
+   * Unset means no alerts; only the running bridge wires it to Telegram.
+   */
+  alert?: (threadId: string, text: string) => Promise<boolean>;
 }
 
 const CHATS_DIR = "chats";
@@ -144,6 +162,25 @@ export class RobobBackend implements ChatBackend {
    * an `unknown` can still resolve, so it is always asked again. A settled run's proof never changes.
    */
   private readonly settledEvidence = new Map<string, "ran" | "none">();
+  private readonly historicalRuns = new Map<string, RunSummary>();
+  /** Threads createChat made whose first turn has not been judged yet. */
+  private readonly firstTurns = new Map<string, string | null>();
+  private readonly checkingFirstTurns = new Set<string>();
+  private firstTurnStore?: Pick<Store, "get" | "set">;
+
+  /** Each chat's store keeps pending first-turn checks across a bridge restart. */
+  trackFirstTurns(store: Pick<Store, "get" | "set">): void {
+    this.firstTurnStore = store;
+    const pending = store.get<unknown>("firstTurns");
+    if (Array.isArray(pending)) for (const entry of pending as unknown[]) {
+      if (!entry || typeof entry !== "object" || !("id" in entry) || !("alert" in entry)) continue;
+      if (typeof entry.id === "string" && (entry.alert === null || typeof entry.alert === "string")) this.firstTurns.set(entry.id, entry.alert);
+    }
+  }
+
+  private saveFirstTurns(): void {
+    this.firstTurnStore?.set("firstTurns", [...this.firstTurns].map(([id, alert]) => ({ id, alert })));
+  }
 
   constructor(private readonly options: RobobBackendOptions) {
     if (!options.chatRoot.startsWith("/") || options.chatRoot.includes("\0")) throw new Error("Invalid iMessage chat root");
@@ -214,10 +251,59 @@ export class RobobBackend implements ChatBackend {
     const created = await this.client.request<{ threadId: string; directory: string | null }>("POST", "/threads", {
       directory, origin: IMESSAGE_ORIGIN, runtimeMode: "full-access",
       title: title ?? this.options.title ?? `iMessage ${date} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`,
-      ...(model ? { model: `${model.providerID}/${model.modelID}`, ...(model.variant ? { variant: model.variant } : {}) } : {}),
+      ...(model ? controlModelFields(model) : {}),
     });
     if (typeof created.threadId !== "string" || !created.threadId) throw new Error("Invalid Robob thread response");
+    if (this.options.alert) {
+      this.firstTurns.set(created.threadId, null);
+      this.saveFirstTurns();
+    }
     return { id: created.threadId, directory: created.directory ?? directory };
+  }
+
+  /**
+   * A new chat whose first turn fails usually fails every turn after it (a model its provider
+   * instance can't run), and the owner only sees "something went wrong". So once the first run
+   * settles, a failure, a lastError or the selected-model complaint raises one alert. Each
+   * thread is judged once: a good first turn, or any later turn, never alerts.
+   */
+  private async checkFirstTurn(thread: ThreadDetail, messages: ControlMessage[]): Promise<void> {
+    if (!this.firstTurns.has(thread.threadId) || !this.options.alert || this.checkingFirstTurns.has(thread.threadId)) return;
+    let alert = this.firstTurns.get(thread.threadId);
+    if (!alert) {
+      const runs = [...thread.recentRuns, ...(thread.run ? [thread.run] : [])];
+      const first = runs.find(run => run.ordinal === 1);
+      if (!first || !TERMINAL.has(first.status)) return;
+      const error = runFailure(thread, first, messages, !runs.some(run => run.ordinal > first.ordinal));
+      if (!error) {
+        this.firstTurns.delete(thread.threadId);
+        this.saveFirstTurns();
+        return;
+      }
+      const selection = first.model ?? thread.model;
+      const model = selection ? `model=${selection.model}, instanceId=${selection.instanceId}` : "model and instanceId unknown";
+      const detail = error.replace(/\s+/g, " ").trim().slice(0, 500);
+      alert = `New iMessage thread "${thread.title}" (${thread.threadId}) failed its first turn: ${model}. Error: ${detail}`;
+      // Keep the verdict before sending: a later run may clear lastError while Telegram is down.
+      this.firstTurns.set(thread.threadId, alert);
+      this.saveFirstTurns();
+    }
+  }
+
+  /** A route can rotate while Telegram is down; already-recorded alerts belong to the chat, not its current route. */
+  private async flushFirstTurnAlert(): Promise<void> {
+    if (!this.options.alert) return;
+    const pending = [...this.firstTurns].find(([id, text]) => text !== null && !this.checkingFirstTurns.has(id));
+    if (!pending || pending[1] === null) return;
+    const [id, text] = pending;
+    this.checkingFirstTurns.add(id);
+    try {
+      if (await this.options.alert(id, text)) {
+        this.firstTurns.delete(id);
+        this.saveFirstTurns();
+      }
+    } catch { /* The durable payload is attempted on the next read. */ }
+    finally { this.checkingFirstTurns.delete(id); }
   }
 
   /** Backend for one non-owner Sendblue chat: same server and client, its own folder and thread title. */
@@ -290,7 +376,13 @@ export class RobobBackend implements ChatBackend {
   async messages(id: string, _directory?: string, { until, limit = 100 }: { until?: string; since?: number; limit?: number } = {}): Promise<MessageRecord[]> {
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid message limit");
     const threadId = await this.resolve(id);
-    const [{ thread }, { messages }] = await Promise.all([this.client.thread(threadId), this.client.messages(threadId)]);
+    // Read messages after the run state: an earlier page must not make a just-completed
+    // first turn look successful before its selected-model error text has arrived.
+    let { thread } = await this.client.thread(threadId);
+    const { messages } = await this.client.messages(threadId);
+    thread = await this.restoreRunStatuses(thread, messages, until, limit);
+    await this.checkFirstTurn(thread, messages);
+    await this.flushFirstTurnAlert();
     const records = recordsFromThread(thread, messages);
     const found = until === undefined ? -1 : records.findIndex(record => record.id === until);
     // Like the OpenChamber pager: the newest page, extended back to `until` when it is present.
@@ -300,6 +392,53 @@ export class RobobBackend implements ChatBackend {
     await this.markRunEvidence(thread, page);
     // OpenCode's own step rows are a fallback for OpenCode threads only; every other driver is judged by Robob.
     return this.isOpenCodeThread(thread) ? this.markAnswers(page) : page;
+  }
+
+  /** The detail keeps five runs, not five outcomes. Read missing page outcomes before forwarding any partial text. */
+  private async restoreRunStatuses(thread: ThreadDetail, messages: ControlMessage[], until: string | undefined, limit: number): Promise<ThreadDetail> {
+    const records = recordsFromThread(thread, messages);
+    const found = until === undefined ? -1 : records.findIndex(record => record.id === until);
+    const start = found >= 0 ? Math.min(found, Math.max(0, records.length - limit)) : Math.max(0, records.length - limit);
+    const messageRuns = new Map(messages.filter(message => message.runId !== null).map(message => [
+      message.role === "user" ? promptId(thread.threadId, message) : message.messageId, message.runId!,
+    ]));
+    // A historical idle marker is absent until its status is restored; still honour an idle watermark.
+    const watermarkRun = until?.startsWith("idle:") ? until.slice("idle:".length) : undefined;
+    const watermarkOrdinal = watermarkRun === undefined ? 0 : runOrdinal(watermarkRun);
+    const needed = new Set(records.slice(start).flatMap(record => {
+      const runId = record.type === "assistant" ? record.runId : messageRuns.get(record.id);
+      return runId ? [runId] : [];
+    }));
+    if (watermarkRun) for (const message of messages) {
+      if (message.runId !== null && runOrdinal(message.runId) >= watermarkOrdinal) needed.add(message.runId);
+    }
+    if (this.firstTurns.get(thread.threadId) === null) {
+      const firstId = messages.find(message => message.runId !== null && runOrdinal(message.runId) === 1)?.runId;
+      if (firstId) needed.add(firstId);
+    }
+    const known = new Set([...thread.recentRuns, ...(thread.run ? [thread.run] : [])].map(run => run.runId));
+    const restored: RunSummary[] = [];
+    for (const runId of needed) {
+      if (known.has(runId)) continue;
+      const key = `${thread.threadId}\u0000${runId}`;
+      let run = this.historicalRuns.get(key);
+      if (!run) {
+        const evidence = await this.client.runEvidence(thread.threadId, runId);
+        if (evidence.runId !== runId || !TERMINAL.has(evidence.status)) throw new Error("Robob run outcome is not yet known");
+        run = { runId, ordinal: runOrdinal(runId), status: evidence.status };
+        // Waiting means a reply is available, not that recovery can no longer change the outcome.
+        if (evidence.status !== "waiting") {
+          if (this.historicalRuns.size > 5_000) this.historicalRuns.clear();
+          this.historicalRuns.set(key, run);
+          if (evidence.toolEvidence !== "unknown") {
+            if (this.settledEvidence.size > 5_000) this.settledEvidence.clear();
+            this.settledEvidence.set(key, evidence.toolEvidence);
+          }
+        }
+      }
+      restored.push(run);
+    }
+    return restored.length ? { ...thread, recentRuns: [...thread.recentRuns, ...restored] } : thread;
   }
 
   /**
@@ -377,6 +516,7 @@ export class RobobBackend implements ChatBackend {
     if (missing.length) for (const [id, finish] of this.finishes(missing)) this.finished.set(id, finish);
     for (const step of steps) {
       const finish = this.finished.get(step.id);
+      if (finish === "tool-calls") step.continued = true;
       // A step's own finish can prove that tools ran (`tool-calls`), but it can't prove that none did:
       // an unresolved step (the synthetic error record) or an `error` finish says nothing. So only
       // `ran` is merged here. The run-level answer from markRunEvidence stays authoritative otherwise.
@@ -405,7 +545,7 @@ export class RobobBackend implements ChatBackend {
    * exactly, and `inboundId` lets Robob check them against this store.
    */
   async prompt(id: string, _directory: string, messageId: string, text: string, system = "", files: readonly FilePart[] = [],
-    model?: { providerID: string; modelID: string; variant?: string }, owner?: OwnerWords): Promise<void> {
+    model?: PreferredModel, owner?: OwnerWords): Promise<void> {
     const threadId = await this.resolve(id);
     const attachments = [];
     for (const [index, file] of files.entries()) {
@@ -419,7 +559,7 @@ export class RobobBackend implements ChatBackend {
       text: words ? words.text : text, mode: "auto", clientRequestId: messageId,
       ...(guidance ? { guidance } : {}),
       ...(words ? { inboundId: words.inboundId } : {}),
-      ...(model ? { model: `${model.providerID}/${model.modelID}`, ...(model.variant ? { variant: model.variant } : {}) } : {}),
+      ...(model ? controlModelFields(model) : {}),
       ...(attachments.length ? { attachments } : {}),
     }, { timeoutMs: 60_000 });
   }

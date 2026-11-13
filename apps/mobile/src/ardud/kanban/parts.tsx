@@ -87,7 +87,10 @@ export function KChip(props: {
       {props.glyph ? <Glyph kind={props.glyph} /> : null}
       <Text
         numberOfLines={1}
-        className={cn("shrink font-t3-medium text-foreground", large ? "text-[13px]" : "text-[12px]")}
+        className={cn(
+          "shrink font-t3-medium text-foreground",
+          large ? "text-[13px]" : "text-[12px]",
+        )}
       >
         {props.label}
       </Text>

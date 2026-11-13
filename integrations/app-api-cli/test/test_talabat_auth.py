@@ -338,10 +338,11 @@ class MaintenanceTest(unittest.TestCase):
             with self.assertRaisesRegex(auth.TalabatError, 'NO_FRESH'):
                 auth.fresh_sms(started - 601)
 
-    def test_cli_suppresses_unexpected_exception_secrets(self):
-        with patch.object(auth, 'status', side_effect=RuntimeError('sensitive')), patch('sys.stdout', new_callable=io.StringIO) as out:
-            self.assertEqual(auth.main(['status']), 1)
-        self.assertNotIn('sensitive', out.getvalue())
+    def test_cli_refuses_retired_talabat(self):
+        # Talabat retired by owner 2026-11-07: the CLI never reaches status/refresh/login.
+        with patch.object(auth, 'status', side_effect=AssertionError('must not run')), patch('sys.stdout', new_callable=io.StringIO) as out:
+            self.assertEqual(auth.main(['status']), 5)
+        self.assertIn('TALABAT_RETIRED', out.getvalue())
 
     def test_wire_denies_arbitrary_host_and_never_authenticates_mutation(self):
         for url, body in [('https://example.invalid', None), (auth.HOST + '/logout', {}), (auth.AAA, {})]:

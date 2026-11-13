@@ -213,7 +213,8 @@ class RecoveryTests(unittest.TestCase):
         self.assertTrue(food['multi_item_purchase_live_verified'])
         for vertical in ('mart','shops'):
             self.assertFalse(data['verticals']['talabat.'+vertical]['multi_item_purchase_live_verified'])
-        self.assertEqual(data['talabat_order_scope'],'arbitrary_catalog_items_and_multiple_lines')
+        self.assertEqual(data['talabat_order_scope'],'retired_by_owner_2026_11_07')
+        self.assertIn('Talabat retired by owner 2026-11-07',data['talabat_retired'])
         self.assertEqual(data['spending_policy'],'caller_managed_no_cli_order_or_campaign_cap')
         for vertical in ('minutes','nownow','main','supermall'):
             self.assertTrue(data['verticals']['noon.'+vertical]['multi_item_baskets'])
@@ -615,14 +616,15 @@ class OrderChatTests(unittest.TestCase):
         store=self.root/'chats'/slug/'state.sqlite'
         store.parent.mkdir(parents=True,exist_ok=True);store.touch()
 
-    def run_talabat(self,argv):
+    def run_lane(self,argv):
+        # Generic order-chat plumbing, exercised on the Minutes lane (Talabat retired 2026-11-07).
         seen={}
         def lane(args):
             import os as _os
             seen['chat']=_os.environ.get('ORDER_WATCH_CHAT')
             return {'ok':True}
         out=io.StringIO()
-        with patch.object(c,'purchase_talabat',side_effect=lane), \
+        with patch.object(c,'order_minutes',side_effect=lane), \
                 patch.object(c,'card_preflight',return_value=None), \
                 contextlib.redirect_stdout(out):
             code=c.main(argv)
@@ -630,9 +632,9 @@ class OrderChatTests(unittest.TestCase):
 
     def test_unknown_chat_refused_before_any_money_step(self):
         boom=lambda *a,**k: (_ for _ in ()).throw(AssertionError('must not run'))
-        with patch.object(c,'card_preflight',side_effect=boom), patch.object(c,'purchase_talabat',side_effect=boom), \
+        with patch.object(c,'card_preflight',side_effect=boom), patch.object(c,'order_minutes',side_effect=boom), \
                 patch.object(c,'require_moni_go',side_effect=boom), contextlib.redirect_stdout(io.StringIO()) as out:
-            code=c.main(['order','talabat','--branch','1','--item','1','--chat','nope'])
+            code=c.main(['order','minutes','--sku','SKU1','--chat','nope'])
         row=json.loads(out.getvalue().strip().splitlines()[-1])
         self.assertEqual(code,2)
         self.assertEqual((row['error'],row['chat'],row['financial_send'],row['financial_retry']),
@@ -640,23 +642,23 @@ class OrderChatTests(unittest.TestCase):
 
     def test_chat_flag_exports_order_watch_chat_into_the_lane(self):
         self.make_chat('group-sb_gro')
-        code,seen,_=self.run_talabat(['order','talabat','--branch','1','--item','1','--chat','group-sb_gro'])
+        code,seen,_=self.run_lane(['order','minutes','--sku','SKU1','--chat','group-sb_gro'])
         self.assertEqual((code,seen['chat']),(0,'group-sb_gro'))
 
     def test_moni_chat_is_the_order_chat_for_a_moni_order(self):
         self.make_chat('group-sb_gro')
         with patch.object(c,'require_moni_go',return_value=None):
-            code,seen,_=self.run_talabat(['order','talabat','--branch','1','--item','1','--for','moni',
+            code,seen,_=self.run_lane(['order','minutes','--sku','SKU1','--for','moni',
                                          '--moni-go','ok','--moni-chat','group-sb_gro'])
         self.assertEqual((code,seen['chat']),(0,'group-sb_gro'))
 
     def test_explicit_chat_wins_over_moni_chat(self):
         self.make_chat('group-sb_gro');self.make_chat('moni')
         with patch.object(c,'require_moni_go',return_value=None):
-            code,seen,_=self.run_talabat(['order','talabat','--branch','1','--item','1','--for','moni',
+            code,seen,_=self.run_lane(['order','minutes','--sku','SKU1','--for','moni',
                                          '--moni-go','ok','--moni-chat','group-sb_gro','--chat','moni'])
         self.assertEqual((code,seen['chat']),(0,'moni'))
 
     def test_owner_order_without_chat_leaves_env_unset(self):
-        code,seen,_=self.run_talabat(['order','talabat','--branch','1','--item','1','--for','owner'])
+        code,seen,_=self.run_lane(['order','minutes','--sku','SKU1','--for','owner'])
         self.assertEqual((code,seen['chat']),(0,None))

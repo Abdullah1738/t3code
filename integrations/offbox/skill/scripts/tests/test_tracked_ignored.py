@@ -45,6 +45,9 @@ class TrackedIgnoredTests(unittest.TestCase):
         self.rsyncs = []
         self.real_run = subprocess.run
         stack.enter_context(patch.object(ssh_sync, "log"))
+        stack.enter_context(patch.object(ssh_sync, "_watch_rsync", side_effect=self.watch_local))
+        stack.enter_context(patch.object(ssh_sync, "_progress_args", return_value=()))
+
         stack.enter_context(patch.object(ssh_sync.subprocess, "run", side_effect=self.run_local))
         stack.enter_context(patch.object(ssh_sync, "ssh", side_effect=AssertionError("no ssh expected")))
 
@@ -55,6 +58,10 @@ class TrackedIgnoredTests(unittest.TestCase):
 
     def git(self, *args):
         subprocess.run(["git", "-C", str(self.src), *args], check=True, capture_output=True)
+
+    def watch_local(self, cmd, timeout, input=None, **kwargs):
+        return subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape",
+                              timeout=timeout, input=input)
 
     def run_local(self, cmd, **kwargs):
         if cmd[0] == ssh_sync.RSYNC:
@@ -191,7 +198,10 @@ class TrackedIgnoredTests(unittest.TestCase):
             if cmd[0] == ssh_sync.RSYNC and "--files-from=-" in cmd:
                 return subprocess.CompletedProcess(cmd, 12, "", "rsync: connection unexpectedly closed")
             return self.run_local(cmd, **kw)
-        with patch.object(ssh_sync.subprocess, "run", side_effect=fail_second):
+        with patch.object(ssh_sync.subprocess, "run", side_effect=fail_second), \
+                patch.object(ssh_sync, "RETRY_PAUSES", (0, 0, 0)), \
+                patch.object(ssh_sync, "close_master"), patch.object(ssh_sync, "setup"), \
+                patch.object(ssh_sync.api, "get", return_value={"state": "ready"}):
             with self.assertRaises(OffboxError) as cm:
                 self.push()
         self.assertEqual(cm.exception.code, 90)

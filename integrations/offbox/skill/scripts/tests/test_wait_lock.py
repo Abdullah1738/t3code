@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import api, cli, common, misc, runs  # noqa: E402
+from offbox_lib import api, cli, common, lease, misc, runs  # noqa: E402
 from offbox_lib.common import OffboxError, db  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
 
@@ -54,6 +54,7 @@ class WaitLockTests(Isolated):
         self.stack.enter_context(patch.object(runs, 'LOGS_DIR', common.LOGS_DIR))
         self.stack.enter_context(patch.object(runs.lease, 'touch'))
         self.stack.enter_context(patch.object(runs.lease, 'idle_ttl'))
+        self.stack.enter_context(patch.object(misc, '_refresh_running_ttl'))
         # The wait polls boat's status for a lock-held run. Offline: the default answer is "still running"; a test that
         # needs boat to say the process ended sets its own `_ended`. Any real request is a failure.
         self.ended = self.stack.enter_context(patch.object(runs, '_ended', return_value=None))
@@ -206,6 +207,32 @@ class WaitLockTests(Isolated):
         self.assertEqual(self.con.execute("SELECT status, exit_code FROM runs WHERE run_id='run-x'").fetchone()[:],
                          ('running', None))
         self.assertFalse((common.LOGS_DIR / 'run-x.log.takeover').exists())
+
+    def test_history_recovery_error_at_wait_deadline_is_124_with_real_command_id(self):
+        self.con.execute("UPDATE runs SET command_id='c' WHERE run_id='run-x'")
+        self.con.commit()
+        clock = Clock()
+        def exhausted(box, run, timeout=20):
+            clock.t += timeout
+            return None
+        with patch.object(runs, 'time', clock.time), patch.object(api, 'time', clock.time), \
+             patch.object(api, '_key', return_value='offline'), patch.object(runs, 'follow', return_value=None), \
+             patch.object(runs, 'recorded_exit', side_effect=exhausted):
+            rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '1'], clock)
+        self.assertEqual(rc, 124, err)
+        self.assertIn('--timeout reached', err)
+        self.assertEqual(self.con.execute("SELECT status FROM runs WHERE run_id='run-x'").fetchone()[0], 'running')
+
+    def test_history_error_before_wait_deadline_stays_infra(self):
+        self.con.execute("UPDATE runs SET command_id='c' WHERE run_id='run-x'")
+        self.con.commit()
+        clock = Clock()
+        with patch.object(runs, 'follow', return_value=None), patch.object(runs, 'recorded_exit', return_value=None), \
+             patch.object(api, 'history_get', side_effect=OffboxError('history unavailable')):
+            rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '1'], clock)
+        self.assertEqual(rc, 90, err)
+        self.assertIn('history unavailable', err)
+        self.assertNotIn('--timeout reached', err)
 
     def test_status_answer_after_the_deadline_is_not_accepted(self):
         # boat answers "ended" only after --timeout: the wait ends with 124 and does not return boat's code.
@@ -582,19 +609,21 @@ class NoBoxYetTests(WaitLockTests):
         self.assertEqual(rc, 124)
         self.assertEqual(self.row(), ('starting', None, None, None))
 
-    def test_nobox_dead_client_with_a_box_is_left_to_the_reaper(self):
-        # It had a box, so the start may have reached boat: wait must not mark it, only say so.
+    def test_nobox_dead_client_with_a_box_is_settled_unknown(self):
+        # With no box evidence, settle infra and retain the box reservation.
         self.con.execute("UPDATE runs SET client_pid=4242, box_id='bx_a' WHERE run_id='run-x'")
         self.con.commit()
         with patch.object(misc.os, 'kill', side_effect=ProcessLookupError):
             rc, out, err = self.cli_wait(['wait', 'run-x'], Clock())
         self.assertEqual(rc, 90)
         self.assertIn('offbox reap', err)
-        self.assertEqual(self.row(), ('starting', 'bx_a', None, None))
+        self.assertEqual(self.row(), ('infra', 'bx_a', None, None))
+        self.assertIn('offbox ssh bx_a', err)
+        self.assertGreater(lease.active_runs(self.con, 'bx_a'), 0)
         self.assert_no_crash()
 
-    def test_nobox_wait_on_a_local_first_run_waits_for_its_end(self):
-        # Local-first runs never have a box: wait polls the row and returns the recorded code.
+    def test_nobox_wait_on_a_local_run_waits_for_its_end(self):
+        # Local (fallback) runs never have a box: wait polls the row and returns the recorded code.
         self.con.execute("UPDATE runs SET mode='local', status='running', process_id=55 WHERE run_id='run-x'")
         self.con.commit()
         with patch.object(runs, 'follow', side_effect=AssertionError('local runs have no box')):
@@ -846,7 +875,7 @@ class TakeoverPublishTests(unittest.TestCase):
         frames = [{'type': 'stdout', 'data': 'o2\n', 'nextOffset': 6}, {'type': 'exit', 'exitCode': 0}]
         seen = {}
 
-        def pause_at_finish(run_id, code, status=None):
+        def pause_at_finish(run_id, code, status=None, *, until=None):
             # Runs after the replacement log is published and before the row is marked settled. The second waiter
             # runs now: it must see the replacement, because the row is not settled yet.
             seen['log_at_finish'] = log.read_bytes()

@@ -544,6 +544,8 @@ const resolvePrimaryStartConfig = Effect.fn("desktop.backendConfiguration.resolv
       // so the setting does not leak into the provider and terminal processes
       // the backend starts.
       args: [
+        // Headroom for the live projection while replies remain independently bounded.
+        "--max-old-space-size=6144",
         ...(environment.isPackaged ? ["--require", environment.compileCachePath] : []),
         environment.backendEntryPath,
         "--bootstrap-fd",

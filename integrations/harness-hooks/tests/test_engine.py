@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -28,6 +29,7 @@ class State:
         self.fail = False
         self.identities = {}
         self.threads = {}
+        self.delays = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -35,6 +37,8 @@ class Handler(BaseHTTPRequestHandler):
         state = self.server.state
         parsed = urlsplit(self.path)
         state.calls.append(self.path)
+        if state.delays:
+            threading.Event().wait(state.delays.pop(0))
         if state.fail:
             self.send_error(503)
             return
@@ -54,7 +58,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def log_message(self, *_args):
         pass
@@ -83,6 +90,7 @@ class EngineTests(unittest.TestCase):
         self.state.fail = False
         self.state.identities.clear()
         self.state.threads.clear()
+        self.state.delays.clear()
         self.classifier = self.root / "classifier.py"
         self.classifier.write_text('''import json,sys\nx=json.loads(sys.stdin.readline())\nc=x["cmd"]\nif "npm ci" in c or "docker run" in c:\n print(json.dumps({"heavy":True,"rule":"pkg-install","why":"installation","rewrite":"offbox run -- "+c}))\nelse:\n print(json.dumps({"heavy":False}))\n''')
         self.offbox = self.root / "offbox"
@@ -106,6 +114,9 @@ class EngineTests(unittest.TestCase):
             "HARNESS_HOOKS_COORD_ALLOW": str(self.allow),
             "OFFBOX_STATE_DIR": str(self.root / "offbox-state"),
             "OFFBOX_GATE_MODE": "enforce",
+            engine.COMMAND_IDENTITY_ENV: "",
+            "AGENT_GUARD_APPROVED": "",
+            "HARNESS_COORD_APPROVED": "",
         }
         self.env = patch.dict(os.environ, env)
         self.env.start()
@@ -273,7 +284,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.resolve_identity(unknown, "claude")["robobThreadId"], "later-thread")
         for file in (self.root / "hook-state/identity").glob("*.json"):
             cached = json.loads(file.read_text())
-            cached["at"] = time.time() - 61
+            cached["at"] = time.time() - 1801
             file.write_text(json.dumps(cached))
         count = len(self.state.calls)
         engine.resolve_identity(one, "claude")
@@ -286,6 +297,190 @@ class EngineTests(unittest.TestCase):
         engine.resolve_identity(event, "claude", fresh=True)
         cached = engine.resolve_identity(event, "claude")
         self.assertEqual(cached["model"]["model"], "claude-opus-5-5")
+
+    def command_token(self, result, session="session"):
+        command = result["context"].get("updatedInput", {}).get("command", "")
+        # Read the token through the shell exactly as offbox does, including the
+        # wrapper's per-command export and restoration of inherited context.
+        env = {**os.environ, "CLAUDE_CODE_SESSION_ID": session}
+        run = subprocess.run(["/bin/bash", "-c", command], env=env, text=True, capture_output=True, check=True)
+        return run.stdout.strip()
+
+    def token_identity(self, result, session="session"):
+        token = self.command_token(result, session)
+        with patch.dict(os.environ, {engine.COMMAND_IDENTITY_ENV: token, "CLAUDE_CODE_SESSION_ID": session}):
+            parsed = engine.command_identity_from_env()
+            self.assertIsNotNone(parsed)
+            self.assertEqual(parsed[0], "claude")
+            return engine.resolve_identity(parsed[1], "claude")
+
+    def identity_probe(self, **kwargs):
+        return self.event('printf "%s" "$HARNESS_HOOKS_COMMAND_IDENTITY"', **kwargs)
+
+    def age_identity_cache(self, age):
+        for file in (self.root / "hook-state/identity").glob("*.json"):
+            cached = json.loads(file.read_text())
+            cached["at"] = time.time() - age
+            file.write_text(json.dumps(cached))
+
+    def test_claude_cached_command_is_signed_without_waiting_on_control(self):
+        event = self.identity_probe()
+        engine.decide(event, "claude")
+        files = list((self.root / "hook-state/identity").glob("*.json"))
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0].stat().st_mode & 0o777, 0o600)
+        with patch.object(engine, "_get", side_effect=TimeoutError("stalled")) as get:
+            result = engine.decide(event, "claude")
+            self.assertEqual(self.token_identity(result)["robobThreadId"], "child")
+            get.assert_not_called()
+        row = json.loads((self.root / "hook-state/decisions.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(row["identity_source"], "cache")
+
+    def test_claude_old_binding_survives_transport_outage_but_not_model_policy(self):
+        event = self.identity_probe()
+        engine.decide(event, "claude")
+        self.age_identity_cache(3600)
+        for error in (TimeoutError("stalled"), ConnectionRefusedError("offline"),
+                      engine.urllib.error.URLError("offline"),
+                      engine.urllib.error.HTTPError("http://test", 503, "unavailable", {}, None)):
+            with self.subTest(error=type(error).__name__), patch.object(engine, "_get", side_effect=error):
+                result = engine.decide(event, "claude")
+                identity = self.token_identity(result)
+                self.assertEqual(identity["robobThreadId"], "child")
+                self.assertNotIn("model", identity)
+        row = json.loads((self.root / "hook-state/decisions.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(row["identity_source"], "cache")
+
+    def test_cached_hook_token_proves_offbox_child_owner_during_stall(self):
+        sys.path.insert(0, str(SRC.parents[1] / "offbox/skill/scripts"))
+        from offbox_lib import identity as offbox_identity
+        engine.decide(self.identity_probe(), "claude")
+        self.age_identity_cache(3600)
+        with patch.object(engine, "_get", side_effect=TimeoutError("stalled")):
+            token = self.command_token(engine.decide(self.identity_probe(), "claude"))
+            env = {engine.COMMAND_IDENTITY_ENV: token, "CLAUDE_CODE_SESSION_ID": "session",
+                   "CODEX_THREAD_ID": "", "CODEX_SESSION_ID": "", "OPENCODE_SESSION_ID": "", "OFFBOX_THREAD": ""}
+            with patch.dict(os.environ, env), \
+                 patch.object(offbox_identity, "identity_for", return_value={"resolution": "unavailable"}), \
+                 patch.object(offbox_identity, "repo_root", return_value=self.root), \
+                 patch.object(offbox_identity, "repo_key", return_value="repo"):
+                me = offbox_identity.whoami(str(self.root))
+                self.assertEqual(me["resolution"], "resolved")
+                self.assertEqual(me["owner"], "child")
+                self.assertTrue(me["proven"])
+                offbox_identity.require_proven(me, "run")
+
+    def test_native_child_never_uses_parent_or_sibling_cache(self):
+        self.add_identity("session", "parent", model="claude-opus-5-5")
+        engine.decide(self.identity_probe(agent=None), "claude")
+        engine.decide(self.identity_probe(agent="agent-sibling"), "claude")
+        with patch.object(engine, "_get", side_effect=TimeoutError("stalled")):
+            result = engine.decide(self.identity_probe(), "claude")
+            wrapped = result["context"].get("updatedInput", {}).get("command", "")
+            self.assertNotIn(engine.COMMAND_IDENTITY_ENV + "=", wrapped)
+        engine.decide(self.identity_probe(), "claude")
+        self.age_identity_cache(3600)
+        with patch.object(engine, "_get", side_effect=TimeoutError("stalled")):
+            self.assertEqual(self.token_identity(engine.decide(self.identity_probe(), "claude"))["robobThreadId"], "child")
+
+    def test_authoritative_miss_invalidates_cache_including_next_call(self):
+        for resolution in ("none", "pending", "ambiguous", "unavailable"):
+            with self.subTest(resolution=resolution):
+                engine.decide(self.identity_probe(), "claude")
+                self.age_identity_cache(1801)
+                with patch.object(engine, "_get", return_value={"identity": {"resolution": resolution}}):
+                    result = engine.decide(self.identity_probe(), "claude")
+                    self.assertNotIn(engine.COMMAND_IDENTITY_ENV + "=", result["context"].get("updatedInput", {}).get("command", ""))
+                with patch.object(engine, "_get", side_effect=TimeoutError("stalled")):
+                    self.assertEqual(engine.resolve_identity(self.identity_probe(), "claude")["resolution"], "unavailable")
+
+    def test_claude_cache_expired_or_invalid_is_not_used(self):
+        for age in (engine._CLAUDE_IDENTITY_TTL + 1, -60):
+            with self.subTest(age=age):
+                engine.decide(self.identity_probe(), "claude")
+                self.age_identity_cache(age)
+                with patch.object(engine, "_get", side_effect=TimeoutError("stalled")):
+                    result = engine.decide(self.identity_probe(), "claude")
+                    self.assertNotIn(engine.COMMAND_IDENTITY_ENV + "=", result["context"].get("updatedInput", {}).get("command", ""))
+
+    def test_claude_bad_response_or_auth_error_does_not_use_old_cache(self):
+        engine.decide(self.identity_probe(), "claude")
+        self.age_identity_cache(1801)
+        for error in (ValueError("bad response"), PermissionError("private credential"),
+                      engine.urllib.error.HTTPError("http://test", 403, "forbidden", {}, None)):
+            with self.subTest(error=type(error).__name__), patch.object(engine, "_get", side_effect=error):
+                self.assertEqual(engine.resolve_identity(self.identity_probe(), "claude")["resolution"], "unavailable")
+
+    def test_cached_binding_does_not_mint_token_for_denied_heavy_command(self):
+        engine.decide(self.identity_probe(), "claude")
+        result = engine.decide(self.event("npm ci"), "claude")
+        self.assertEqual(result["decision"], "deny")
+        self.assertNotIn("updatedInput", result["context"])
+
+    def test_fresh_t3_delegated_claude_child_resolves_first_slow_command(self):
+        # A T3 child has its own session, unlike a native child sharing one.
+        self.add_identity("t3-delegated-session", "t3-delegated-child", parent="parent", model="claude-opus-5-5")
+        self.state.delays = [1.35]
+        output = self.run_adapter("claude", self.identity_probe(session="t3-delegated-session", agent=None))["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "allow")
+        result = {"context": {"updatedInput": output["updatedInput"]}}
+        identity = self.token_identity(result, session="t3-delegated-session")
+        self.assertEqual(identity["robobThreadId"], "t3-delegated-child")
+        self.assertIsNone(identity["nativeAgentId"])
+
+    def test_claude_binding_expiring_during_lookup_is_not_used(self):
+        engine.decide(self.identity_probe(), "claude")
+        self.age_identity_cache(engine._CLAUDE_IDENTITY_TTL - 1)
+        now = time.time()
+        with patch.object(engine.time, "time", side_effect=[now, now + 5]), \
+             patch.object(engine, "_lookup_identity", side_effect=TimeoutError("stalled")):
+            self.assertEqual(engine.resolve_identity(self.identity_probe(), "claude")["resolution"], "unavailable")
+
+    def test_claude_cache_separates_provider_instances_and_rejects_foreign_agent(self):
+        engine.decide(self.identity_probe(), "claude")
+        with patch.dict(os.environ, {"HARNESS_HOOKS_PROVIDER_INSTANCE": "another-claude"}), \
+             patch.object(engine, "_get", side_effect=TimeoutError("stalled")):
+            self.assertEqual(engine.resolve_identity(self.identity_probe(), "claude")["resolution"], "unavailable")
+        for file in (self.root / "hook-state/identity").glob("*.json"):
+            cached = json.loads(file.read_text())
+            cached["identity"]["nativeAgentId"] = "agent-sibling"
+            file.write_text(json.dumps(cached))
+        with patch.object(engine, "_get", side_effect=TimeoutError("stalled")):
+            self.assertEqual(engine.resolve_identity(self.identity_probe(), "claude")["resolution"], "unavailable")
+
+    def test_claude_lookup_retries_transport_failure_with_shared_budget(self):
+        clock = [100.0]
+        deadlines = []
+        def stalled(path, *, deadline, timeout):
+            deadlines.append(deadline)
+            self.assertEqual(timeout, 3)
+            clock[0] = deadline
+            raise TimeoutError("stalled")
+        with patch.object(engine.time, "monotonic", side_effect=lambda: clock[0]), patch.object(engine, "_get", side_effect=stalled):
+            self.assertEqual(engine.resolve_identity(self.identity_probe(), "claude")["resolution"], "unavailable")
+        self.assertEqual(deadlines, [103.0, 104.5])
+        identity = self.state.identities[("session", "agent-child")]
+        with patch.object(engine, "_get", side_effect=[ConnectionRefusedError("retry"), {"identity": identity}]) as get:
+            result = engine.decide(self.identity_probe(), "claude")
+            self.assertEqual(get.call_count, 2)
+            self.assertEqual(self.token_identity(result)["robobThreadId"], "child")
+
+    def test_binding_cache_avoids_control_for_30_minutes_without_stale_model(self):
+        for harness in ("claude", "codex"):
+            event = self.identity_probe()
+            if harness == "codex":
+                self.add_identity("agent-child", "codex-thread", model="gpt-6-astra")
+            engine.resolve_identity(event, harness)
+            self.age_identity_cache(1799)
+            with patch.object(engine, "_get", side_effect=AssertionError("control called")):
+                result = engine.resolve_identity(event, harness)
+                self.assertEqual(result["resolution"], "resolved")
+                self.assertNotIn("model", result)
+
+    def test_codex_identity_has_longer_budget_without_changing_other_calls(self):
+        with patch.object(engine, "_get", return_value={"identity": {"resolution": "unavailable"}}) as get:
+            engine.resolve_identity(self.identity_probe(), "codex")
+            self.assertEqual(get.call_args.kwargs["timeout"], 3.0)
 
     def test_codex_child_uses_agent_id_as_concrete_native(self):
         self.add_identity("codex-child", "child", parent="parent", model="gpt-6-astra")
@@ -476,6 +671,23 @@ class EngineTests(unittest.TestCase):
         event["tool_name"] = "mcp__test_server__apply_patch"
         self.assertEqual(engine.decide(event, "claude")["decision"], "allow")
 
+    def test_native_and_mcp_shell_aliases_enforce_offbox_and_coord(self):
+        self.actor()
+        self.add_identity("codex-child", "child", parent="parent", model="claude-haiku-5-5")
+        tools = ("Bash", "bash", "shell", "exec_command", "shell_command", "mcp__test__shell", "mcp__test__bash")
+        for harness in ("claude", "codex"):
+            for tool in tools:
+                for field in ("command", "cmd"):
+                    for command, reason in (("npm ci", "offbox gate:"), ("psql", engine.COORD_REASON)):
+                        with self.subTest(harness=harness, tool=tool, field=field, command=command):
+                            event = self.event(command, tool_name=tool, tool_input={field: command})
+                            if harness == "codex":
+                                event.update(session_id="codex-child")
+                                event.pop("agent_id", None)
+                            response = self.run_adapter(harness, event)["hookSpecificOutput"]
+                            self.assertEqual(response["permissionDecision"], "deny")
+                            self.assertIn(reason, response["permissionDecisionReason"])
+
     def test_mcp_shell_rewrites_original_field_and_propagates_child_to_shim(self):
         self.actor()
         self.add_identity("session", "parent", model="claude-opus-5-5")
@@ -506,7 +718,7 @@ class EngineTests(unittest.TestCase):
         self.assertNotIn("updatedInput", engine.decide(event, "claude")["context"])
 
     def test_mcp_rewrite_activates_raw_send_shims_without_native_env(self):
-        offbox = SRC.parents[1] / "offbox/skill/scripts/blockers"
+        offbox = self.offbox_fixture() / "scripts/blockers"
         self.add_identity("agent-child", "child", parent="parent", model="gpt-6-astra")
         real = self.root / "mcp-bin"
         real.mkdir()
@@ -622,14 +834,14 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(line["rule"], "native-check-unavailable")
         self.assertEqual(line["error"], "ValueError")
 
-    def test_heavy_identity_outage_allows_even_with_cached_identity_and_no_exemption(self):
+    def test_heavy_identity_outage_denies_with_cached_identity_and_no_exemption(self):
         event = self.event("npm ci")
         self.assertEqual(engine.resolve_identity(event, "claude")["resolution"], "resolved")
         self.state.fail = True
-        self.assertEqual(engine.decide(event, "claude")["decision"], "allow")
+        self.assertEqual(engine.decide(event, "claude")["decision"], "deny")
         records = (self.root / "hook-state/decisions.jsonl").read_text().splitlines()
         self.assertEqual(len(records), 1)
-        self.assertIsNotNone(json.loads(records[0])["error"])
+        self.assertEqual(json.loads(records[0])["identity_source"], "cache")
 
     def test_nearest_nested_coord_actor_does_not_inherit_other_actor_exclusion(self):
         self.actor("parent")
@@ -685,9 +897,30 @@ class EngineTests(unittest.TestCase):
         for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ROBOB_HARNESS", "AGENT_GUARD_SESSION",
                      "AGENT_GUARD_APPROVED", "HARNESS_COORD_APPROVED", engine.COMMAND_IDENTITY_ENV):
             env.pop(name, None)
-        env.update({"PATH": os.pathsep.join([str(SRC.parent / "coord-blockers"), str(bin_dir), "/usr/bin", "/bin"]),
+        blockers = self.root / "harness-hooks/coord-blockers"
+        if not blockers.exists():
+            shutil.copytree(SRC.parent / "coord-blockers", blockers)
+            source = blockers.parent / "src"
+            source.mkdir()
+            shutil.copy2(SRC / "coord_shim.py", source / "coord_shim.py")
+            for shim in blockers.iterdir():
+                shim.write_text(shim.read_text().replace("/opt/homebrew/bin/python3", shlex.quote(sys.executable)))
+        env.update({"PATH": os.pathsep.join([str(blockers), str(bin_dir), "/usr/bin", "/bin"]),
                     "HARNESS_HOOKS_SRC": str(SRC), **values})
         return env
+
+    def offbox_fixture(self):
+        source = SRC.parents[1] / "offbox/skill"
+        fixture = self.root / "offbox-skill"
+        if not fixture.exists():
+            shutil.copytree(source / "scripts/blockers", fixture / "scripts/blockers")
+            shutil.copy2(source / "heavy-rules.json", fixture / "heavy-rules.json")
+            for name in ("classify.py", "monitor_support.py"):
+                shutil.copy2(source / "scripts" / name, fixture / "scripts" / name)
+            for shim in (fixture / "scripts/blockers").iterdir():
+                if shim.is_file():
+                    shim.write_text(shim.read_text().replace("/opt/homebrew/bin/python3", shlex.quote(sys.executable)))
+        return fixture
 
     def run_shell(self, command, env, shell="/bin/bash"):
         return subprocess.run([shell, "-c", command], cwd=self.root, env=env,
@@ -1103,7 +1336,7 @@ printf done | cat"""
     def test_approved_script_rewrite_carries_identity_and_approval_once(self):
         self.actor()
         self.add_identity("session", "parent", model="claude-opus-5-5")
-        script, sql = self.root / "scripts/deploy-health.sh", self.root / "replica-health.sql"
+        script, sql = self.root / "scripts/check-health.sh", self.root / "replica-health.sql"
         script.parent.mkdir()
         script.write_text("#!/bin/sh\n/bin/sh -c 'psql'\n")
         script.chmod(0o755)
@@ -1112,7 +1345,7 @@ printf done | cat"""
         self.allow.write_text(json.dumps({"scripts": [{"path": str(script), "sha256": digest(script),
             "inputs": [{"path": str(sql), "sha256": digest(sql)}]}]}))
         env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude")
-        response = self.run_adapter("claude", self.event("scripts/deploy-health.sh replica-health.sql"))["hookSpecificOutput"]
+        response = self.run_adapter("claude", self.event("scripts/check-health.sh replica-health.sql"))["hookSpecificOutput"]
         rewritten = response["updatedInput"]["command"]
         self.assertEqual(sum(line.startswith("export HARNESS_HOOKS_COMMAND_IDENTITY=") for line in rewritten.splitlines()), 1)
         self.assertEqual(sum(line.startswith("export AGENT_GUARD_APPROVED=") for line in rewritten.splitlines()), 1)
@@ -1125,7 +1358,7 @@ printf done | cat"""
     def test_docker_wrapper_uses_command_child_and_not_exempt_parent(self):
         self.actor()
         self.add_identity("session", "parent", model="claude-opus-5-5")
-        offbox = SRC.parents[1] / "offbox/skill"
+        offbox = self.offbox_fixture()
         blocker = offbox / "scripts/blockers"
         env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude",
                                      OFFBOX_RULES=str(offbox / "heavy-rules.json"))

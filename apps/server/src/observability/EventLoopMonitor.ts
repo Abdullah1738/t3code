@@ -22,8 +22,9 @@ const RESOLUTION_MS = 1000;
 const STALL_THRESHOLD_MS = 2000;
 const SAMPLE_INTERVAL = "30 seconds";
 const STALL_LOG_MAX_BYTES = 256 * 1024;
-// Heap space stats are logged past this share of V8's limit, so an OOM
-// leaves a record of which space was filling.
+// Encoding bursts have exhausted the heap below 75% of V8's limit. Capture
+// space statistics before those bursts, while respecting smaller heap limits.
+const HIGH_HEAP_BYTES = 1.5 * 1024 ** 3;
 const HIGH_HEAP_RATIO = 0.75;
 
 /** Delay in ns, active time in ms, CPU in µs. */
@@ -147,7 +148,10 @@ export const layerWith = (
       const tick = Effect.gen(function* () {
         const readings = yield* sample;
         yield* recordGauges(readings);
-        if (readings.heapUsedBytes > heapLimitBytes * HIGH_HEAP_RATIO && stallSink !== undefined) {
+        if (
+          readings.heapUsedBytes > Math.min(HIGH_HEAP_BYTES, heapLimitBytes * HIGH_HEAP_RATIO) &&
+          stallSink !== undefined
+        ) {
           const at = DateTime.formatIso(yield* DateTime.now);
           yield* Effect.try(() => {
             return {

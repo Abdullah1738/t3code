@@ -1,4 +1,7 @@
-"""Shared, fail-open Claude/Codex hook policy.  No harness SDK is required."""
+"""Shared Claude/Codex policy. Offbox/coord errors fail open; desktop admission
+fails closed and local live-DB denials need no control service or identity.
+No harness SDK is required.
+"""
 from __future__ import annotations
 
 import datetime
@@ -24,6 +27,8 @@ import urllib.error
 import urllib.request
 
 import desktop_lease
+import statev2_guard
+import rootwide_search_guard
 
 
 HOME = Path.home()
@@ -49,8 +54,8 @@ def _state():
 
 # The JSONL file is an audit trail, not a transcript. Untrusted event, tool,
 # identity and classifier fields can themselves contain an entire command.
-_LOG_EVENTS = {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart", "shim"}
-_LOG_TOOLS = {"Bash", "shell", "apply_patch", "aws", "psql", "fdbcli", "clickhouse-client", "terraform", "docker", "desktop-cua", "desktop-node-repl"}
+_LOG_EVENTS = {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart", "shim", "Stop", "SubagentStop", "SessionEnd"}
+_LOG_TOOLS = {"Bash", "shell", "apply_patch", "aws", "psql", "fdbcli", "clickhouse-client", "terraform", "docker", "desktop-cua", "desktop-node-repl", "desktop-flush"}
 _LOG_RULES = {
     "go-test", "go-build", "tsc-project", "eslint-repo", "pkg-run-check", "pkg-check-bare",
     "pytest", "js-test", "vp-test", "bun-test", "pkg-test", "pkg-run-test", "pkg-install", "yarn-bare",
@@ -61,7 +66,9 @@ _LOG_RULES = {
     "aws-mutation", "clickhouse-http-write", "terraform-mutation", "coord-control", "github-write", "deploy-script",
     "force-push", "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
     "native-check-unavailable", "desktop-read-only", "desktop-admitted", "desktop-denied",
-    "desktop-unavailable", "desktop-end", "desktop-end-error",
+    "desktop-unavailable", "desktop-end", "desktop-end-error", "desktop-flush", "desktop-flush-none",
+    "live-database-read", "live-database-script", "live-database-script-unresolved", "live-database-unavailable",
+    "rootwide-search",
 }
 _LOG_ERRORS = {
     "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
@@ -103,6 +110,8 @@ def _log(**record):
             "cmd": None,
             "ms": record.get("ms") if type(record.get("ms")) in (int, float) else 0,
             "error": _log_enum(record.get("error"), _LOG_ERRORS),
+            "identity_source": _log_enum(record.get("identity_source"), {"cache", "control"}),
+            "cause": record.get("cause")[:240] if record.get("rule") == "live-database-script-unresolved" and isinstance(record.get("cause"), str) else None,
             "audit_error": audit_error,
         }
         fd = os.open(path / "decisions.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -157,16 +166,16 @@ def _control():
     return base, credentials.get("token")
 
 
-def _get(path, *, deadline=None):
+def _get(path, *, deadline=None, timeout=1.2):
     # urlopen's timeout bounds each socket read, not the total response; a
     # slow streaming control response could otherwise exhaust the hook's 10s.
-    deadline = deadline if deadline is not None else time.monotonic() + 1.2
+    deadline = deadline if deadline is not None else time.monotonic() + timeout
     done = threading.Event()
     result = []
 
     def request():
         try:
-            result.append((True, _get_unbounded(path, deadline)))
+            result.append((True, _get_unbounded(path, deadline, timeout=timeout)))
         except Exception as error:
             result.append((False, error))
         finally:
@@ -184,14 +193,14 @@ def _get(path, *, deadline=None):
     return value
 
 
-def _get_unbounded(path, deadline):
+def _get_unbounded(path, deadline, *, timeout=1.2):
     base, token = _control()
     headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request(base + path, headers=headers)
     try:
-        timeout = 1.2 if deadline is None else min(1.2, deadline - time.monotonic())
+        timeout = timeout if deadline is None else min(timeout, deadline - time.monotonic())
         if timeout <= 0:
             raise TimeoutError("control-deadline")
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -428,11 +437,37 @@ def _command_with_context(command, identity, pin):
             "\nunset " + " ".join(scratch) + "\neval 'unset " + status + "; (exit '" + '"$' + status + '"' + "')' && :\n}")
 
 
+_IDENTITY_BINDING_TTL = 30 * 60
+_CLAUDE_IDENTITY_TTL = 12 * 60 * 60
+_IDENTITY_LOOKUP_BUDGET = 4.5
+_IDENTITY_CALL_TIMEOUT = 3.0
+
+
+def _identity_transport_error(error):
+    if isinstance(error, urllib.error.HTTPError):
+        return 500 <= error.code < 600
+    return isinstance(error, (TimeoutError, ConnectionError, urllib.error.URLError))
+
+
+def _lookup_identity(path, harness):
+    # Leave room for the 3s classifier and 1.5s lineage walk in the 10s hook.
+    deadline = time.monotonic() + _IDENTITY_LOOKUP_BUDGET
+    for attempt in range(2):
+        try:
+            return _get(path, deadline=min(deadline, time.monotonic() + _IDENTITY_CALL_TIMEOUT),
+                        timeout=_IDENTITY_CALL_TIMEOUT)
+        except Exception as error:
+            if attempt or not _identity_transport_error(error) or time.monotonic() >= deadline:
+                raise
+
+
 def resolve_identity(event, harness, *, fresh=False):
-    """Resolve exact hook identity; cache only resolved answers, at most 60 seconds.
+    """Resolve exact hook identity; cache binding-only lookups for 30 minutes.
 
     Claude children need the hook's agent_id. A shell with only the session id
     identifies the parent, not necessarily the shell's executing child.
+    During transport outages Claude can reuse a binding for 12h, but never its
+    model for a fresh policy check. Authoritative misses invalidate the binding.
     """
     native, agent, driver = _native(event, harness)
     if not isinstance(native, str) or not native or (agent is not None and not isinstance(agent, str)):
@@ -443,22 +478,41 @@ def resolve_identity(event, harness, *, fresh=False):
         key = hashlib.sha256(json.dumps([base, driver, instance, native, agent], separators=(",", ":")).encode()).hexdigest()
         cache_file = _state() / "identity" / (key + ".json")
         cached = _read_json(cache_file, {})
-        age = time.time() - cached.get("at", 0)
-        identity = cached.get("identity")
-        if not fresh and 0 <= age < 60 and isinstance(identity, dict) and identity.get("resolution") == "resolved" and identity.get("robobThreadId"):
-            return identity
+        at = cached.get("at") if isinstance(cached, dict) else None
+        age = time.time() - at if type(at) in (int, float) else float("inf")
+        identity = cached.get("identity") if isinstance(cached, dict) else None
+        valid_cache = (isinstance(identity, dict) and identity.get("resolution") == "resolved" and
+                       bool(identity.get("robobThreadId")) and identity.get("nativeSessionId") == native and
+                       identity.get("nativeAgentId") == agent and identity.get("driver") in (None, driver) and
+                       (not instance or identity.get("providerInstanceId") in (None, instance)))
+        if not fresh and 0 <= age < _IDENTITY_BINDING_TTL and valid_cache:
+            binding = {**identity, "identity_source": "cache"}
+            # Binding stability does not imply model-policy stability.
+            if age >= 60:
+                binding.pop("model", None)
+            return binding
         params = {"nativeId": native, "driver": driver}
         if agent:
             params["agentId"] = agent
         if instance:
             params["instance"] = instance
-        resolved = _get("/identity/resolve?" + urllib.parse.urlencode(params)).get("identity")
+        try:
+            resolved = _lookup_identity("/identity/resolve?" + urllib.parse.urlencode(params), harness).get("identity")
+        except Exception as error:
+            fallback_age = time.time() - at if type(at) in (int, float) else float("inf")
+            if harness == "claude" and _identity_transport_error(error) and valid_cache and 0 <= fallback_age < _CLAUDE_IDENTITY_TTL:
+                binding = {**identity, "identity_source": "cache"}
+                binding.pop("model", None)
+                return binding
+            raise
         if not isinstance(resolved, dict):
             raise ValueError("identity-response")
         identity = dict(resolved)
         if identity.get("resolution") == "resolved":
             identity.setdefault("nativeSessionId", native)
             identity.setdefault("nativeAgentId", agent)
+            if identity["nativeSessionId"] != native or identity["nativeAgentId"] != agent:
+                raise ValueError("identity-native-mismatch")
         if identity.get("resolution") == "resolved" and identity.get("driver") not in (None, driver):
             raise ValueError("identity-driver-mismatch")
         if identity.get("resolution") == "resolved" and instance and identity.get("providerInstanceId") not in (None, instance):
@@ -476,7 +530,9 @@ def resolve_identity(event, harness, *, fresh=False):
                         os.unlink(tmp)
             except OSError:
                 pass
-        return identity
+        else:
+            cache_file.unlink(missing_ok=True)
+        return {**identity, "identity_source": "control"}
     except Exception:
         return {"resolution": "unavailable"}
 
@@ -991,11 +1047,9 @@ def _command(event):
     value = event.get("tool_input")
     if not isinstance(tool, str) or not isinstance(value, dict):
         return None
-    if tool == "Bash":
-        command = value.get("command")
-    elif tool == "shell" and isinstance(value.get("command"), str):
-        command = value["command"]
-    elif re.fullmatch(r"mcp__.+?__(?:exec_command|shell_command)", tool):
+    if tool in {"Bash", "bash", "shell", "exec_command", "shell_command"}:
+        command = value.get("command") or value.get("cmd")
+    elif re.fullmatch(r"mcp__.+?__(?:exec_command|shell_command|shell|bash)", tool):
         command = value.get("command") or value.get("cmd")
     else:
         return None
@@ -1007,9 +1061,7 @@ def _shell_input_field(event, harness):
     tool, value = event.get("tool_name", ""), event.get("tool_input")
     if not isinstance(tool, str) or not isinstance(value, dict):
         return None
-    if tool == "Bash" or (harness == "codex" and tool == "shell"):
-        return "command" if isinstance(value.get("command"), str) else None
-    if re.fullmatch(r"mcp__.+?__(?:exec_command|shell_command)", tool):
+    if tool in {"Bash", "bash", "shell", "exec_command", "shell_command"} or re.fullmatch(r"mcp__.+?__(?:exec_command|shell_command|shell|bash)", tool):
         fields = [field for field in ("command", "cmd") if field in value]
         if len(fields) == 1 and isinstance(value[fields[0]], str):
             return fields[0]
@@ -1024,6 +1076,7 @@ def decide(event, harness):
     identity = {}
     error_type = None
     log_tool = None
+    binding_only = False
     result = {"decision": "allow", "reason": "", "context": {"rule": "no-policy"}}
     lineage_nodes = None
     lineage_deadline = None
@@ -1046,9 +1099,9 @@ def decide(event, harness):
             # This policy must not enter the general engine's fail-open identity path.
             try:
                 if kind == "PreToolUse":
-                    decision, reason, rule, error_type = desktop_lease.admit(event, harness, _control)
+                    decision, reason, rule, error_type = desktop_lease.admit(event, harness, _control, _state())
                 else:
-                    rule, error_type = desktop_lease.finish(event, harness, _control)
+                    rule, error_type = desktop_lease.finish(event, harness, _control, _state())
                     decision, reason = "allow", ""
                 result = {"decision": decision, "reason": reason, "context": {"rule": rule}}
             except Exception as error:
@@ -1057,11 +1110,55 @@ def decide(event, harness):
                           "reason": desktop_lease.UNAVAILABLE if kind == "PreToolUse" else "",
                           "context": {"rule": "desktop-unavailable"}}
             return result
+        if kind in desktop_lease.TURN_END:
+            log_tool = "desktop-flush"
+            rule, error_type = desktop_lease.flush(event, harness, _control, _state())
+            result = {"decision": "allow", "reason": "", "context": {"rule": rule}}
+            return result
+        command = _command(event) if kind == "PreToolUse" else None
+        if command:
+            inp = event.get("tool_input", {})
+            command_cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
+            try:
+                root = rootwide_search_guard.classify(command, command_cwd)
+            except Exception as error:
+                # A search-parser failure must not disable the independent DB,
+                # offbox or coord policies later in this hook.
+                error_type = type(error).__name__
+                root = None
+            if root:
+                result = {"decision": "deny", "reason": rootwide_search_guard.reason(root, command_cwd),
+                          "context": {"rule": "rootwide-search"}}
+                return result
+            # The live DB rule is independent of native identity and offbox/coord
+            # availability, so a service outage cannot disable this local check.
+            try:
+                hit, cause = statev2_guard.classify_detail(command, command_cwd)
+            except Exception as error:
+                error_type = type(error).__name__
+                result = {"decision": "deny", "reason": "Live database guard unavailable; this shell command was NOT run. Retry after the guard is available; do not bypass it.",
+                          "context": {"rule": "live-database-unavailable"}}
+                return result
+            if hit:
+                reason = statev2_guard.refusal_reason(hit, cause, command_cwd)
+                context = {"rule": hit}
+                if cause:
+                    context["cause"] = cause
+                result = {"decision": "deny", "reason": reason, "context": context}
+                return result
         native, _, _ = _native(event, harness)
         if native:
-            # Do not mistake an unexpired binding cache for a healthy identity
-            # service during an outage: the policy is explicitly fail-open.
-            identity = resolve_identity(event, harness, fresh=True)
+            # Ordinary Claude shell calls only need a binding to sign. Model
+            # policy and shims still refresh rather than trusting a cached model.
+            shell_command = _command(event)
+            binding_only = (harness == "claude" and kind == "PreToolUse" and
+                            _shell_input_field(event, harness) and shell_command and
+                            not classify_coord(shell_command))
+            if binding_only and not tool.startswith("mcp__"):
+                inp = event["tool_input"]
+                shell_cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
+                binding_only = not approval(shell_command, shell_cwd)
+            identity = resolve_identity(event, harness, fresh=not binding_only)
             if identity.get("resolution") != "resolved":
                 error_type = "identity-" + str(identity.get("resolution", "unavailable"))
         if event.get("hook_event_name") != "PreToolUse":
@@ -1097,7 +1194,8 @@ def decide(event, harness):
                 if result["decision"] != "deny":
                     # The model was refreshed with this event's identity and
                     # is never taken from stdin or an older cached binding.
-                    coord = decide_coord(command, identity, cwd, approval_allowed=approval_allowed, lineage=lineage)
+                    coord = (decide_coord(command, identity, cwd, approval_allowed=approval_allowed, lineage=lineage)
+                             if not binding_only else {"decision": "allow", "reason": "", "context": {"rule": "no-policy"}})
                     if coord["context"].get("rule") == "coord-unresolved" and not error_type:
                         error_type = "coord-unresolved"
                     if coord["decision"] == "deny":
@@ -1131,6 +1229,7 @@ def decide(event, harness):
         _log(harness=harness, event=event.get("hook_event_name") if isinstance(event, dict) else None,
              tool=log_tool or (event.get("tool_name") if isinstance(event, dict) else None),
              robobThreadId=identity.get("robobThreadId"), decision=result["decision"], rule=result["context"].get("rule"),
+             identity_source=identity.get("identity_source"), cause=result["context"].get("cause"),
              command=command, ms=round((time.monotonic() - start) * 1000, 3), error=error_type)
     return result
 

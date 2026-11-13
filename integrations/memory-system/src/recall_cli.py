@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -160,11 +161,67 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--full", action="store_true")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("remember", help="save an explicit owner instruction for later pre-action checks")
+    p.add_argument("text")
+    p.add_argument("--scope", default="")
+    p.add_argument("--action", default="")
+    p.add_argument("--recipient", default="")
+    p.add_argument("--source-session", default="")
+    p.add_argument("--rules-db", default=os.environ.get("RECALL_RULES_DB", str(rc.DATA / "recall_rules.db")))
+
+    for command in ('redact', 'redact-backups'):
+        p = sub.add_parser(command, help='count-only redaction; requires approved --yes to write')
+        p.add_argument('--needle-file', required=command == 'redact-backups')
+        p.add_argument('--root', default=os.environ.get('MEMORY_ROOT', str(rc.ROOT)))
+        p.add_argument('--dry-run', action='store_true')
+        p.add_argument('--yes', action='store_true')
+        if command == 'redact':
+            p.add_argument('--session')
+            p.add_argument('--item')
+            p.add_argument('--reason', required=True, help='incident identifier; no secret text')
+        else:
+            backup_root = '/Volumes/ExternalSSD/memory-system-backup'
+            p.add_argument('--repository', default=backup_root+'/restic/live')
+            p.add_argument('--stage', default=backup_root+'/replica')
+            p.add_argument('--paths-from')
+            p.add_argument('--cold-repository', default=backup_root+'/restic/cold-archive')
+            p.add_argument('--dropbox-destination', default='/Backups/memory-system/live')
+            p.add_argument('--cold-destination', default='/Backups/memory-system/cold-archive')
+            p.add_argument('--local-only', action='store_true', help='fixtures/local repo only; excludes Dropbox and cold archive')
+
     a = ap.parse_args(argv)
+    if a.cmd in ('redact', 'redact-backups'):
+        try:
+            if a.cmd == 'redact':
+                from redact import run
+            else:
+                from redact_backups import run
+            result = run(a)
+            print(json.dumps(result))
+            return 0 if result['verify'] or a.dry_run else 1
+        except Exception:
+            # Even a SQLite/path/JSON error can contain the needle. No traceback,
+            # payload, reason, hash, length or subprocess output may escape.
+            print(json.dumps({'verify': False, 'errors': 1}), file=sys.stderr)
+            return 2
+
     out = lambda obj, text: print(json.dumps(obj, indent=1, default=str) if a.json else text)  # noqa: E731
 
+    from redact_lock import fence
+    lease = fence(rc.ROOT)
+    lease.__enter__()
     try:
-        if a.cmd == "list":
+        if a.cmd == "remember":
+            from recall_rules import RuleIndex
+            index = RuleIndex(a.rules_db)
+            try:
+                print(json.dumps(index.remember(a.text, scope=a.scope, actions=[a.action] if a.action else None,
+                                                 recipient=a.recipient, source_session=a.source_session)))
+            finally:
+                close = getattr(index, "close", None)
+                if close:
+                    close()
+        elif a.cmd == "list":
             rows = rc.list_sessions(
                 text=" ".join(a.words) or None,
                 source=a.source,
@@ -187,11 +244,14 @@ def main(argv: list[str] | None = None) -> int:
                 limit_sessions=a.n,
                 exact=a.exact,
             )
+            for warning in dict.fromkeys(q["warning"] for q in res["queries"] if q.get("warning")):
+                print(f"recall: {warning}", file=sys.stderr)
             out(res, format_search(res))
         elif a.cmd == "search":
             import recall_ask as ra
 
-            res = ra.ask(" ".join(a.question), cwd=a.cwd, cwd_only=bool(a.cwd), since=a.since, until=a.until, source=a.source, timeout=a.timeout)
+            res = ra.ask(" ".join(a.question), cwd=a.cwd, cwd_only=bool(a.cwd), since=a.since, until=a.until, source=a.source, timeout=a.timeout,
+                         here=os.environ.get("PWD") or None)
             text = res["answer"]
             if res["sources"]:
                 text += "\n\n" + ra.format_sources(res["sources"])
@@ -215,6 +275,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except BrokenPipeError:
         return 0
+    finally:
+        lease.__exit__(None, None, None)
     return 0
 
 

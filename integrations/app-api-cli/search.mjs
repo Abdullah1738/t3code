@@ -9,29 +9,20 @@ const execFileAsync = promisify(execFile);
 const HOME = Object.freeze({ name: 'Banyan Tree Residences Hillside, Flat 2104, JLT', latitude: 25.0778251, longitude: 55.1569039, area_id: 1308, source: 'saved_home_pin_from_noon_account', saved_address_verified: false });
 const ORIGINS = { noon: 'https://www.noon.com', minutes: 'https://minutes.noon.com', talabat: 'https://www.talabat.com' };
 const HELP = `Read-only UAE shopping search. noon/Minutes: authenticated native API.
-Talabat: native Android catalog (guest context); Dia Personal web fallback.
+Talabat: retired by owner 2026-11-07 (every talabat-search call refuses).
 
   noon-search "marvis" [--rocket]             supermall/marketplace (+ETA, Rocket ~1h)
   noon-search --minutes "smetana"              noon Minutes
   noon-search food "sushi" [--open]            noon Food restaurants + dishes
   noon-search food-menu OUTLETCODE [--query x] noon Food menu
   noon-search food-match "sushi" "seaweed salad" [--open]
-  talabat-search "sushi" [--open] [--exact]    ranked, deduped, live status
-  talabat-search menu 717327 [--query pizza] [--synonyms]
-  talabat-search menu-match "sushi" "seaweed salad" --open
-  talabat-search hours 717327
-  talabat-search --mart "milk"
-  talabat-search pharmacies "panadol" [--open] [--stores 12]
-  talabat-search groceries "smetana" [--open]   (also: flowers)
   shop-search doctor
   noon-search orders [--minutes] --json
   noon-search track ORDER_ID --json
-  talabat-search orders [--with-addresses --limit 3] | order ORDER_ID | track ORDER_ID
-  talabat-search order-items ORDER_ID [--json]  (ordered lines + choices/notes, resolved to menu description and published macros)
   shop-search match APP SECTION "milk" "eggs" [--open]
 
 Options: --limit 1..100 (menu default 1000), --page N (1-based), --timeout 5..60
-         --open (live open-now filter), --raw (unranked Talabat search page)
+         --open (live open-now filter), --raw (unranked search page)
          --web (force web), --native (never fall back)
          --require-account (fail unless account verified), --json, --help
          --images-dir DIR (download returned images for visual inspection)
@@ -164,9 +155,16 @@ let transport;
 const started = performance.now();
 const rawArgs = process.argv.slice(2);
 let json = rawArgs.includes('--json');
+// Talabat retired by the owner (2026-11-07); see talabat_retired.py.
+const TALABAT_RETIRED = 'Talabat retired by owner 2026-11-07: never use Talabat again (no search, ordering, menus or app fallback). Use noon or Careem.';
+const TALABAT_MODES = ['talabat', 'menu', 'hours', 'mart', 'menu-match', 'groceries', 'pharmacies', 'flowers'];
+if (TALABAT_MODES.includes(rawArgs[0])) {
+  const data = { ok: false, error: { code: 'TALABAT_RETIRED', message: TALABAT_RETIRED } };
+  console.log(json ? JSON.stringify(data, null, 2) : TALABAT_RETIRED);
+  process.exit(5);
+}
 try {
-  if (rawArgs[0] === 'talabat' && rawArgs[1] === 'order') rawArgs[1] = 'track';
-  if (['noon', 'talabat'].includes(rawArgs[0]) && ['orders', 'track'].includes(rawArgs[1])) {
+  if (rawArgs[0] === 'noon' && ['orders', 'track'].includes(rawArgs[1])) {
     const child = spawn(`${homedir()}/.local/share/uv/tools/mitmproxy/bin/python`,
       [fileURLToPath(new URL('./native_orders.py', import.meta.url)), ...rawArgs], { stdio: 'inherit' });
     child.on('error', () => process.exit(1));

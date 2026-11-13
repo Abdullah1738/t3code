@@ -1,6 +1,8 @@
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import type * as Exit from "effect/Exit";
 import * as ExitRuntime from "effect/Exit";
 import * as Option from "effect/Option";
@@ -142,9 +144,30 @@ export interface TraceSinkFlushStats {
   readonly durationMs: number;
 }
 
+export class TraceMaintenanceError extends Schema.TaggedError<TraceMaintenanceError>()(
+  "TraceMaintenanceError",
+  {},
+) {
+  override get message() {
+    return "Trace storage could not be drained for maintenance.";
+  }
+}
+export type TraceMaintenance = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+) => Effect.Effect<A, E | TraceMaintenanceError, R>;
+export class TraceStorageMaintenance extends Context.Service<
+  TraceStorageMaintenance,
+  { readonly withMaintenance: TraceMaintenance }
+>()("@t3tools/shared/observability/TraceStorageMaintenance") {}
+export const NoOpTraceStorageMaintenance: TraceStorageMaintenance["Service"] = {
+  withMaintenance: (effect) => effect,
+};
+
 export interface TraceSink {
   readonly filePath: string;
   push: (record: TraceRecord) => void;
+  readonly capture?: () => (record: TraceRecord) => void;
+  readonly withMaintenance?: TraceMaintenance;
   flush: Effect.Effect<void>;
   close: () => Effect.Effect<void>;
 }
@@ -354,12 +377,16 @@ function spanToTraceRecord(span: SerializableSpan): EffectTraceRecord {
 }
 
 export const makeTraceSink = Effect.fn("makeTraceSink")(function* (options: TraceSinkOptions) {
-  const sink = yield* makeAsyncRotatingFileSink({
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  let sink = yield* makeAsyncRotatingFileSink({
     filePath: options.filePath,
     maxBytes: options.maxBytes,
     maxFiles: options.maxFiles,
   }).pipe(Effect.orDie);
 
+  let paused = false;
+  let epoch = 0;
   let buffer: Array<{ readonly text: string; readonly bytes: number }> = [];
   let bufferBytes = 0;
   const maxBufferBytes = Math.max(options.maxBytes, 4 * 1024 * 1024);
@@ -419,38 +446,37 @@ export const makeTraceSink = Effect.fn("makeTraceSink")(function* (options: Trac
     }
   });
 
+  const drain = Effect.gen(function* () {
+    const droppedAtStart = droppedCount;
+    yield* flushBuffered;
+    const stats = pendingFlushStats;
+    pendingFlushStats = {
+      logicalWriteBytes: 0,
+      count: 0,
+      durationMs: 0,
+    };
+    if (stats.count > 0 && options.onFlush) {
+      yield* options.onFlush(stats).pipe(Effect.ignore);
+    }
+    if (droppedCount > 0 && !failureReported) {
+      failureReported = true;
+      yield* Effect.logWarning(
+        "Trace writer could not keep up, dropping records until it recovers",
+        {
+          filePath: options.filePath,
+        },
+      );
+    } else if (failureReported && !writeFailing && droppedCount === droppedAtStart) {
+      yield* Effect.logInfo("Trace writes recovered", {
+        filePath: options.filePath,
+        droppedCount,
+      });
+      failureReported = false;
+      droppedCount = 0;
+    }
+  });
   const flush = flushSemaphore
-    .withPermits(1)(
-      Effect.gen(function* () {
-        const droppedAtStart = droppedCount;
-        yield* flushBuffered;
-        const stats = pendingFlushStats;
-        pendingFlushStats = {
-          logicalWriteBytes: 0,
-          count: 0,
-          durationMs: 0,
-        };
-        if (stats.count > 0 && options.onFlush) {
-          yield* options.onFlush(stats).pipe(Effect.ignore);
-        }
-        if (droppedCount > 0 && !failureReported) {
-          failureReported = true;
-          yield* Effect.logWarning(
-            "Trace writer could not keep up, dropping records until it recovers",
-            {
-              filePath: options.filePath,
-            },
-          );
-        } else if (failureReported && !writeFailing && droppedCount === droppedAtStart) {
-          yield* Effect.logInfo("Trace writes recovered", {
-            filePath: options.filePath,
-            droppedCount,
-          });
-          failureReported = false;
-          droppedCount = 0;
-        }
-      }),
-    )
+    .withPermits(1)(drain)
     .pipe(
       // A cancelled write still completes in the OS. Finish it before another
       // flush rotates the file or the scope's finalizer drains the remaining records.
@@ -470,26 +496,68 @@ export const makeTraceSink = Effect.fn("makeTraceSink")(function* (options: Trac
     ),
   );
 
-  return {
-    filePath: options.filePath,
-    push(record) {
-      try {
-        const text = `${JSON.stringify(record)}\n`;
-        const bytes = Buffer.byteLength(text);
-        if (bytes > options.maxBytes) return;
-        if (bufferBytes + bytes > maxBufferBytes) {
-          droppedCount++;
-          return;
-        }
-        buffer.push({ text, bytes });
-        bufferBytes += bytes;
-        if (buffer.length >= FLUSH_BUFFER_THRESHOLD) {
-          Queue.offerUnsafe(flushRequests, undefined);
-        }
-      } catch {
+  const push = (record: TraceRecord) => {
+    if (paused) return;
+    try {
+      const text = `${JSON.stringify(record)}\n`;
+      const bytes = Buffer.byteLength(text);
+      if (bytes > options.maxBytes) return;
+      if (bufferBytes + bytes > maxBufferBytes) {
+        droppedCount++;
         return;
       }
+      buffer.push({ text, bytes });
+      bufferBytes += bytes;
+      if (buffer.length >= FLUSH_BUFFER_THRESHOLD) {
+        Queue.offerUnsafe(flushRequests, undefined);
+      }
+    } catch {
+      return;
+    }
+  };
+  const withMaintenance: TraceMaintenance = (effect) =>
+    flushSemaphore
+      .withPermit(
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            paused = true;
+            epoch++;
+            const drained = yield* drain.pipe(Effect.exit);
+            if (ExitRuntime.isFailure(drained) || writeFailing) {
+              epoch++;
+              paused = false;
+              return yield* new TraceMaintenanceError({});
+            }
+            const result = yield* restore(effect).pipe(Effect.exit);
+            const reopened = yield* makeAsyncRotatingFileSink({
+              filePath: options.filePath,
+              maxBytes: options.maxBytes,
+              maxFiles: options.maxFiles,
+            }).pipe(
+              Effect.provideService(FileSystem.FileSystem, fs),
+              Effect.provideService(Path.Path, path),
+              Effect.result,
+            );
+            if (Result.isFailure(reopened)) return yield* new TraceMaintenanceError({});
+            sink = reopened.success;
+            epoch++;
+            paused = false;
+            if (ExitRuntime.isFailure(result)) return yield* Effect.failCause(result.cause);
+            return result.value;
+          }),
+        ),
+      )
+      .pipe(Effect.withTracerEnabled(false));
+  return {
+    filePath: options.filePath,
+    push,
+    capture: () => {
+      const captured = epoch;
+      return (record: TraceRecord) => {
+        if (captured === epoch) push(record);
+      };
     },
+    withMaintenance,
     flush,
     close: () => flush,
   } satisfies TraceSink;
@@ -589,7 +657,11 @@ export const makeLocalFileTracer = Effect.fn("makeLocalFileTracer")(function* (
 
   return Tracer.make({
     span(spanOptions) {
-      return new LocalFileSpan(spanOptions, delegate.span(spanOptions), sink.push);
+      return new LocalFileSpan(
+        spanOptions,
+        delegate.span(spanOptions),
+        sink.capture?.() ?? sink.push,
+      );
     },
     ...(delegate.context ? { context: delegate.context } : {}),
   });

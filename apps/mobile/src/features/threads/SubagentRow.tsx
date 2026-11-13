@@ -34,7 +34,11 @@ export function SubagentRow(props: {
   readonly elapsed: ReactNode;
 }) {
   const presentation = resolveSubagentRowPresentation(props.subagent);
-  const detail = subagentCardDetail(presentation.detail);
+  const providerManaged = props.subagent.childThreadId === null;
+  const detail = subagentCardDetail(
+    providerManaged ? (props.subagent.result ?? presentation.detail) : presentation.detail,
+    providerManaged,
+  );
   return (
     <View className="flex-row gap-3">
       <View className="h-5 justify-center">
@@ -70,10 +74,13 @@ export function SubagentRow(props: {
             <SymbolView name="chevron.right" size={12} tintColorClassName="accent-icon-subtle" />
           ) : null}
         </View>
+        {providerManaged ? (
+          <Text className="text-xs text-foreground-muted">Provider-managed</Text>
+        ) : null}
         <SubagentMetadata environmentId={props.environmentId} subagent={props.subagent} />
         {detail ? (
           <Text
-            numberOfLines={3}
+            numberOfLines={providerManaged ? undefined : 3}
             className={cn(
               "text-xs text-foreground-muted",
               presentation.tone === "failed" && SUBAGENT_TONE_TEXT_CLASS.failed,

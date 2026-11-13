@@ -69,10 +69,22 @@ export const layer = Layer.effect(
       // The item can live in a thread this one was forked from, so it is
       // matched by id alone; that thread rolling the run back later leaves the
       // fork's copy in place.
+      //
+      // The history lookup stays in an inner-join CTE. Under the outer LEFT JOIN
+      // SQLite cannot flatten the history UNION view, so it ran as a co-routine
+      // that scanned every live, archived and base turn item for each context
+      // row: hours on the base archive, with the reader blocked for everyone.
       return yield* sql<McpAppModelContextEntry>`
+        WITH item AS MATERIALIZED (
+          SELECT history.turn_item_id, history.run_id
+          FROM mcp_app_model_context AS wanted
+          JOIN ardud_history_turn_items AS history
+            ON history.turn_item_id = wanted.item_id
+          WHERE wanted.thread_id = ${threadId}
+        )
         SELECT context.item_id AS "itemId", context.server, context.tool, context.text
         FROM mcp_app_model_context AS context
-        JOIN orchestration_v2_projection_turn_items AS item
+        JOIN item
           ON item.turn_item_id = context.item_id
         LEFT JOIN orchestration_v2_projection_runs AS run
           ON run.run_id = item.run_id

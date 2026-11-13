@@ -1,3 +1,9 @@
+import {
+  bootId,
+  recordContinuationDecision,
+  finishContinuationReport,
+} from "../ardud/fast-install/report.ts";
+import * as RestartPacing from "../ardud/restart-pacing/RestartPacing.ts";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
@@ -47,6 +53,18 @@ import {
   mergeRestartCancelledBackgroundWork,
   neverStarted,
 } from "./RestartBackgroundNote.ts";
+
+// Recovery generations scope queue wake identities; original-run admission is
+// still deduplicated by the dispatcher, including overlapping boot effects.
+export class RestartRecoveryBootId extends Context.Reference<string>("t3/RestartRecoveryBootId", {
+  defaultValue: () => bootId,
+}) {}
+
+// Only startup continuation work may bypass global command readiness. The callback
+// runs after the thread's reconciliation transaction commits, never inside it.
+export class ReconciledThreadContinuation extends Context.Reference<
+  (threadId: ThreadId) => Effect.Effect<void>
+>("t3/ReconciledThreadContinuation", { defaultValue: () => () => Effect.void }) {}
 
 export class ProviderRuntimeRecoveryError extends Schema.TaggedError<ProviderRuntimeRecoveryError>()(
   "ProviderRuntimeRecoveryError",
@@ -190,13 +208,13 @@ export const make = Effect.gen(function* () {
   const eventSink = yield* EventSink.EventSinkV2;
   const ids = yield* IdAllocator.IdAllocatorV2;
   const outbox = yield* EffectOutbox.EffectOutboxV2;
+  const pacing = yield* Effect.serviceOption(RestartPacing.RestartPacing);
   // ardud: old test and standalone layers need not provide the optional service.
   const staleOpenCode = yield* Effect.serviceOption(StaleOpenCodeSessions);
   type RecoverySession = ProjectionStore.ProjectionRuntimeRecoveryState["providerSessions"][number];
   /**
-   * A session shared by several threads (one Codex app server) is stopped by the
-   * first thread recovery reaches. It was live when the server went down, so a
-   * later thread still decides its wake as if it were.
+   * Shared sessions are stopped once before thread recovery. Restore their live
+   * status when deciding whether each running thread should continue.
    */
   const sessionsLiveAtStart = (
     projection: ProjectionStore.ProjectionRuntimeRecoveryState,
@@ -222,6 +240,7 @@ export const make = Effect.gen(function* () {
       stoppedThisPass: ReadonlyMap<string, RecoverySession> = new Map(),
     ) {
       const now = yield* DateTime.now;
+      const recoveryBootId = yield* RestartRecoveryBootId;
       const runs = [] as Array<OrchestrationV2ThreadProjection["runs"][number]>;
       for (const run of nonterminalRuns(projection)) {
         if (run.status === "waiting") {
@@ -316,42 +335,54 @@ export const make = Effect.gen(function* () {
           cancelledBackgroundNativeIds.add(item.nativeItemRef.nativeId);
         }
       };
+      // Queued messages are durable work, including provider notifications. Keep
+      // their identities, delivery order and explicit user holds across restarts.
       const queuedRuns = projection.runs.filter((run) => run.status === "queued");
-      const queuedMessages =
-        queuedRuns.length === 0
-          ? []
-          : (yield* projections
-              .getThreadRecords(projection.thread.id, ["messages"], {
-                messageIds: queuedRuns.map((run) => run.userMessageId),
-              })
-              .pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new ProviderRuntimeRecoveryError({
-                      operation: "read-projections",
-                      threadId: projection.thread.id,
-                      cause,
-                    }),
-                ),
-              )).messages;
-      const bufferedMessageIds = new Set(
-        queuedMessages.filter(isBufferedProviderNotification).map((message) => message.id),
-      );
-      for (const run of queuedRuns) {
-        if (bufferedMessageIds.has(run.userMessageId)) {
-          runs.push(run);
-          continue;
+      if (trigger === "startup" && continuationSetting !== "enabled") {
+        for (const run of queuedRuns.filter((candidate) => candidate.queueHeld !== true))
+          events.push({
+            id: yield* allocateEventId(),
+            type: "run.updated",
+            threadId: projection.thread.id,
+            runId: run.id,
+            providerInstanceId: run.providerInstanceId,
+            occurredAt: now,
+            payload: { ...run, queueHeld: true },
+          });
+      }
+      if (queuedRuns.length > 0) {
+        const queued = yield* projections
+          .getThreadRecords(projection.thread.id, ["messages"], {
+            messageIds: queuedRuns.map((run) => run.userMessageId),
+          })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderRuntimeRecoveryError({
+                  operation: "read-projections",
+                  threadId: projection.thread.id,
+                  cause,
+                }),
+            ),
+          );
+        for (const message of queued.messages.filter(isBufferedProviderNotification)) {
+          // The provider's in-memory output buffer died with the process. Replaying
+          // a provider-created wake would complete an empty turn (Claude) instead
+          // of sending a prompt. Keep its identity/order and send its durable text.
+          events.push({
+            id: yield* allocateEventId(),
+            type: "message.updated",
+            threadId: projection.thread.id,
+            ...(message.runId === null ? {} : { runId: message.runId }),
+            occurredAt: now,
+            payload: {
+              ...message,
+              creationSource: "server",
+              text: `${message.text}\n\nContinue where you left off.`,
+              updatedAt: now,
+            },
+          });
         }
-        if (run.queueHeld === true) continue;
-        events.push({
-          id: yield* allocateEventId(),
-          type: "run.updated",
-          threadId: projection.thread.id,
-          runId: run.id,
-          providerInstanceId: run.providerInstanceId,
-          occurredAt: now,
-          payload: { ...run, queueHeld: true },
-        });
       }
       for (const request of requests) {
         events.push({
@@ -626,7 +657,10 @@ export const make = Effect.gen(function* () {
         });
       }
       for (const session of projection.providerSessions.filter(
-        (candidate) => candidate.status !== "stopped" && candidate.status !== "error",
+        (candidate) =>
+          !stoppedThisPass.has(candidate.id) &&
+          candidate.status !== "stopped" &&
+          candidate.status !== "error",
       )) {
         events.push({
           id: yield* allocateEventId(),
@@ -679,15 +713,63 @@ export const make = Effect.gen(function* () {
       const effects: Array<EffectOutbox.PendingOrchestrationEffectV2> = continuationRun
         ? [
             {
-              id: `effect:restart-continuation:${continuationRun.id}`,
+              id: `effect:restart-${continuationRun.status === "queued" ? `queue:${recoveryBootId}` : "continuation"}:${continuationRun.id}`,
               commandId,
               threadId: projection.thread.id,
-              request: { type: "provider-runtime.continue", sourceRunId: continuationRun.id },
+              request: {
+                type: "provider-runtime.continue",
+                sourceRunId: continuationRun.id,
+                ...(continuationRun.status === "queued" ? { queued: true } : {}),
+              },
             },
           ]
         : [];
+      // A source continuation can legitimately decline (for example a stale
+      // native turn). Its follow-up queue still needs its own durable wake.
+      if (
+        trigger === "startup" &&
+        continuationSetting === "enabled" &&
+        continuationRun?.status !== "queued"
+      ) {
+        const queued = restartContinuationRun(
+          { ...projection, runs: projection.runs.filter((run) => run.status === "queued") },
+          now,
+        );
+        if (queued)
+          effects.push({
+            id: `effect:restart-queue:${recoveryBootId}:${queued.id}`,
+            commandId,
+            threadId: projection.thread.id,
+            request: { type: "provider-runtime.continue", sourceRunId: queued.id, queued: true },
+          });
+      }
+      // EventSink requires an event-bearing commit. This also makes an otherwise
+      // idle queue's durable wake-up atomic with its recovery decision.
+      if (events.length === 0 && !continuationRun && effects.length > 0) {
+        events.push({
+          id: yield* allocateEventId(),
+          type: "thread.metadata-updated",
+          threadId: projection.thread.id,
+          occurredAt: now,
+          payload: projection.thread,
+        });
+      }
+      if (events.length === 0 && continuationRun) {
+        events.push({
+          id: yield* allocateEventId(),
+          type: "run.updated",
+          threadId: projection.thread.id,
+          runId: continuationRun.id,
+          providerInstanceId: continuationRun.providerInstanceId,
+          occurredAt: now,
+          payload: continuationRun,
+        });
+      }
       const stoppedSessions = projection.providerSessions.filter(
-        (candidate) => candidate.status !== "stopped" && candidate.status !== "error",
+        (candidate) =>
+          !stoppedThisPass.has(candidate.id) &&
+          candidate.status !== "stopped" &&
+          candidate.status !== "error",
       ).length;
       let retiredEffects: number;
       // ardud: count only continuation effects submitted with a committed reconciliation.
@@ -703,7 +785,7 @@ export const make = Effect.gen(function* () {
               ),
             )
           : { aborted: 0, failed: 0 };
-      if (events.length === 0) {
+      if (events.length === 0 && effects.length === 0) {
         const retiredEffectIds = yield* outbox
           .cancelUnsettled({
             threadId: projection.thread.id,
@@ -761,7 +843,7 @@ export const make = Effect.gen(function* () {
           continuationDecision && "skip" in continuationDecision
             ? continuationDecision.skip
             : continuationRun && continuationsQueued === 0
-              ? ("other" as const)
+              ? ("already_reconciled" as const)
               : undefined,
       };
     },
@@ -775,6 +857,16 @@ export const make = Effect.gen(function* () {
       trigger === "startup"
         ? yield* settings.getSettingsWithTrust.pipe(Effect.orElseSucceed(() => null))
         : null;
+    const onReconciled = yield* ReconciledThreadContinuation;
+    const reconciled: ThreadId[] = [];
+    const activity = new Map<ThreadId, number>();
+    // Reset old leases before any new worker starts. Resetting them at the end
+    // would steal claims from continuations already running in this process.
+    const outboxReconciliation = yield* outbox.reconcileAfterProcessLoss.pipe(
+      Effect.mapError(
+        (cause) => new ProviderRuntimeRecoveryError({ operation: "drain-outbox", cause }),
+      ),
+    );
     const threadIds = yield* projections
       .getRecoveryThreadIds("runtime")
       .pipe(
@@ -802,10 +894,69 @@ export const make = Effect.gen(function* () {
       no_session: 0,
       session_stopped_or_error: 0,
       no_running_turn: 0,
-      other: 0,
+      no_candidate: 0,
+      run_not_resumable: 0,
+      provider_changed: 0,
+      invalid_provider_thread: 0,
+      no_awaited_work: 0,
+      already_reconciled: 0,
     };
     const stoppedThisPass = new Map<string, RecoverySession>();
-    for (const threadId of threadIds) {
+    const sharedSessions = yield* projections
+      .getLiveSharedProviderSessions()
+      .pipe(
+        Effect.mapError(
+          (cause) => new ProviderRuntimeRecoveryError({ operation: "read-projections", cause }),
+        ),
+      );
+    // Preserve live status for continuation decisions before stopping global rows.
+    for (const { threadId, session } of sharedSessions) {
+      stoppedThisPass.set(session.id, session);
+      const now = yield* DateTime.now;
+      const commandId = CommandId.make(
+        `command:runtime-reconcile:${trigger}:session:${session.id}:${DateTime.formatIso(now)}`,
+      );
+      yield* Effect.gen(function* () {
+        yield* eventSink.commitCommand({
+          commandId,
+          threadId,
+          commandType: "provider-runtime.reconcile",
+          acceptedAt: now,
+          events: [
+            {
+              id: yield* ids.allocate.event({ threadId, commandId }),
+              type: "provider-session.updated",
+              threadId,
+              driver: session.driver,
+              providerInstanceId: session.providerInstanceId,
+              occurredAt: now,
+              payload: { ...session, status: "stopped", updatedAt: now, lastError: null },
+            },
+          ],
+          effects: [],
+        });
+      }).pipe(
+        Effect.mapError(
+          (cause) => new ProviderRuntimeRecoveryError({ operation: "reconcile", threadId, cause }),
+        ),
+      );
+      stoppedSessions++;
+    }
+
+    const priority =
+      trigger === "startup"
+        ? yield* projections
+            .getRecoveryThreadIds("interrupted-runs")
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderRuntimeRecoveryError({ operation: "read-projections", cause }),
+              ),
+            )
+        : [];
+    const recoverThread = Effect.fn("ProviderRuntimeRecoveryService.recoverThread")(function* (
+      threadId: ThreadId,
+    ) {
       const projection = yield* projections.getRuntimeRecoveryProjection(threadId).pipe(
         Effect.mapError(
           (cause) =>
@@ -831,7 +982,11 @@ export const make = Effect.gen(function* () {
         stoppedThisPass,
       );
       for (const session of projection.providerSessions) {
-        if (session.status !== "stopped" && session.status !== "error") {
+        if (
+          !stoppedThisPass.has(session.id) &&
+          session.status !== "stopped" &&
+          session.status !== "error"
+        ) {
           stoppedThisPass.set(session.id, session);
         }
       }
@@ -843,14 +998,87 @@ export const make = Effect.gen(function* () {
       staleOpenCodeAborted += result.staleOpenCodeAborted;
       staleOpenCodeAbortFailed += result.staleOpenCodeAbortFailed;
       if (result.continuationSkip !== undefined) skipped[result.continuationSkip]++;
-    }
-    const outboxReconciliation = yield* outbox.reconcileAfterProcessLoss.pipe(
-      Effect.mapError(
-        (cause) => new ProviderRuntimeRecoveryError({ operation: "drain-outbox", cause }),
-      ),
+      if (trigger === "startup") {
+        const lastRun =
+          result.continuationsQueued > 0 || Option.isNone(pacing)
+            ? undefined
+            : projection.runs.reduce<OrchestrationV2ThreadProjection["runs"][number] | undefined>(
+                (latest, run) =>
+                  latest === undefined || run.ordinal > latest.ordinal ? run : latest,
+                undefined,
+              );
+        const lastMessage =
+          lastRun === undefined
+            ? undefined
+            : (yield* projections
+                .getThreadRecords(threadId, ["messages"], { messageIds: [lastRun.userMessageId] })
+                .pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProviderRuntimeRecoveryError({
+                        operation: "read-projections",
+                        threadId,
+                        cause,
+                      }),
+                  ),
+                )).messages[0]?.text.slice(0, 2000);
+        recordContinuationDecision({
+          threadId,
+          continued: result.continuationsQueued > 0,
+          ...(result.continuationsQueued > 0
+            ? {}
+            : {
+                reason: result.continuationSkip ?? "no_candidate",
+                ...(lastMessage === undefined ? {} : { lastMessage }),
+              }),
+        });
+      }
+      if (trigger === "startup") {
+        if (Option.isSome(pacing))
+          activity.set(threadId, DateTime.toEpochMillis(projection.thread.updatedAt));
+        reconciled.push(threadId);
+      }
+    });
+    yield* Effect.forEach(priority, recoverThread, { concurrency: 4, discard: true });
+    const priorityIds = new Set(priority);
+    yield* Effect.forEach(
+      threadIds.filter((id) => !priorityIds.has(id)),
+      recoverThread,
+      { concurrency: 4, discard: true },
     );
     // ardud: one startup log, including zero-candidate starts, for post-restart diagnosis.
     if (trigger === "startup") {
+      if (Option.isSome(pacing)) {
+        const retained = yield* outbox.listRestartContinuations.pipe(
+          Effect.mapError(
+            (cause) => new ProviderRuntimeRecoveryError({ operation: "read-projections", cause }),
+          ),
+        );
+        for (const effect of retained) {
+          if (effect.request.type === "provider-runtime.continue")
+            yield* pacing.value
+              .register({
+                threadId: effect.threadId,
+                sourceRunId: effect.request.sourceRunId,
+                effectId: effect.id,
+                activityAt: activity.get(effect.threadId),
+              })
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderRuntimeRecoveryError({
+                      operation: "reconcile",
+                      threadId: effect.threadId,
+                      cause,
+                    }),
+                ),
+              );
+        }
+      }
+      // All candidates must be registered before an eager callback can admit a
+      // lower-priority thread ahead of an owner thread not yet reconciled.
+      for (const threadId of reconciled) yield* onReconciled(threadId);
+      finishContinuationReport();
       yield* Effect.logInfo("orchestration-v2.restart-continuation.summary", {
         threadsRead: threadIds.length,
         runsCancelled: terminalizedRuns,
@@ -883,6 +1111,7 @@ export const make = Effect.gen(function* () {
   };
 
   const prepareForShutdown = Effect.gen(function* () {
+    const recoveryBootId = yield* RestartRecoveryBootId;
     const enabled = yield* settings.getSettings.pipe(Effect.orElseSucceed(() => null));
     if (!enabled) return;
     const threadIds = yield* projections.getRecoveryThreadIds("runtime");
@@ -902,10 +1131,14 @@ export const make = Effect.gen(function* () {
           events: [],
           effects: [
             {
-              id: `effect:restart-continuation:${run.id}`,
+              id: `effect:restart-${run.status === "queued" ? `queue:${recoveryBootId}` : "continuation"}:${run.id}`,
               commandId,
               threadId,
-              request: { type: "provider-runtime.continue", sourceRunId: run.id },
+              request: {
+                type: "provider-runtime.continue",
+                sourceRunId: run.id,
+                ...(run.status === "queued" ? { queued: true } : {}),
+              },
             },
           ],
         });

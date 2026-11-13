@@ -10,7 +10,7 @@ Before any GUI step through native computer use or the `cua-driver` fallback, ac
 /opt/homebrew/bin/node /Users/ardud/.local/bin/t3ctl desktop-lease release --ticket "<ticket>"
 ```
 
-Use `--mode cua-driver` when acquiring for that route. Heartbeat at least every 60 seconds while held. Bind every action to the requested app/window and keep the same lease during any permitted fallback. Release as soon as the GUI part is done. If stopped or the user takes over, stop issuing actions. Never release while unsure whether an action finished: say so and leave the lease held. Never assert a timeout proves an action stopped.
+Use `--mode cua-driver` when acquiring for that route. Heartbeat at least every 60 seconds while held. Bind every action to the requested app/window and keep the same lease during any permitted fallback. Release as soon as the GUI part is done. A release that returns `stopping` is normal when a native call ended without a result (Codex reports no completion for failed calls); the lease finishes when your turn ends, so report it as released-pending, not as a failure. If stopped or the user takes over, stop issuing actions. Never release while unsure whether an action finished: say so and leave the lease held. Never assert a timeout proves an action stopped.
 
 Use the installed Node REPL and `@oai/sky` native Computer Use first. Observe fresh state and the exact target, do one action or a small safe batch, and read back the effect from fresh state. Do not use native Computer Use for TCC/privacy controls, administrator-authentication prompts, or changing grants. Follow the existing authorized helper or ask the owner where applicable; do not evade a denial.
 

@@ -740,9 +740,6 @@ it.layer(
       fs.makeDirectory(filePath, { recursive: true }),
     );
 
-  const chmod = (filePath: string, mode: number) =>
-    Effect.flatMap(Effect.service(FileSystem.FileSystem), (fs) => fs.chmod(filePath, mode));
-
   const pathExists = (filePath: string) =>
     Effect.flatMap(Effect.service(FileSystem.FileSystem), (fs) => fs.exists(filePath));
 
@@ -789,27 +786,43 @@ it.layer(
 
   it.effect("preserves non-notFound cwd stat failures", () =>
     Effect.gen(function* () {
-      if ((yield* HostProcess.Platform) === "win32") return;
-
+      const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
-
-      const { manager, baseDir } = yield* createManager();
-      const blockedRoot = path.join(baseDir, "blocked-root");
+      const blockedRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-terminal-cwd-" });
       const blockedCwd = path.join(blockedRoot, "cwd");
       yield* makeDirectory(blockedCwd);
-      yield* chmod(blockedRoot, 0o000);
+      const statFailure = PlatformError.systemError({
+        _tag: "PermissionDenied",
+        module: "FileSystem",
+        method: "stat",
+        pathOrDescriptor: blockedCwd,
+      });
+      const fileSystem = FileSystem.FileSystem.of({ ...fs });
+      const statSpy = vi
+        .spyOn(fileSystem, "stat")
+        .mockImplementation((filePath) =>
+          filePath === blockedCwd ? Effect.fail(statFailure) : fs.stat(filePath),
+        );
+      yield* Effect.addFinalizer(() => Effect.sync(() => statSpy.mockRestore()));
 
-      const error = yield* Effect.flip(manager.open(openInput({ cwd: blockedCwd }))).pipe(
-        Effect.ensuring(chmod(blockedRoot, 0o755).pipe(Effect.ignore)),
+      const { manager, ptyAdapter, getEvents } = yield* createManager().pipe(
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
       );
+      const error = yield* Effect.flip(manager.open(openInput({ cwd: blockedCwd })));
 
       expect(error).toMatchObject({
         _tag: "TerminalCwdStatError",
         cwd: blockedCwd,
-        cause: {
-          _tag: "PlatformError",
-        },
+        cause: statFailure,
       });
+      expect(ptyAdapter.spawnInputs).toHaveLength(0);
+      expect(yield* getEvents).toEqual([]);
+
+      statSpy.mockRestore();
+      const snapshot = yield* manager.open(openInput({ cwd: blockedCwd }));
+      expect(snapshot.status).toBe("running");
+      expect(snapshot.cwd).toBe(blockedCwd);
+      expect(ptyAdapter.spawnInputs).toHaveLength(1);
     }),
   );
 

@@ -1,20 +1,9 @@
 import { RpcSerialization } from "effect/rpc";
 
 import { LARGE_REPLY_BYTES, type LargeReplyRecorder, utf8BytesIfLarge } from "./LargeReplyLog.ts";
+import { jsonExceedsBudget, MAX_REPLY_BYTES, REPLY_TOO_LARGE } from "../ardud/http/replyBudget.ts";
 
 const protocolTags = new Set(["Exit", "Chunk", "Defect", "Request", "Pong", "ClientEnd"]);
-
-interface PendingRequest {
-  readonly method: string;
-  readonly threadId: string | undefined;
-  readonly discussionId: string | undefined;
-}
-
-const idField = (payload: unknown, key: "threadId" | "discussionId"): string | undefined => {
-  if (typeof payload !== "object" || payload === null || !(key in payload)) return undefined;
-  const value = (payload as Record<string, unknown>)[key];
-  return typeof value === "string" && value.length <= 200 ? value : undefined;
-};
 
 export const wrap = (
   serialization: RpcSerialization.RpcSerialization["Service"],
@@ -25,7 +14,8 @@ export const wrap = (
     ...serialization,
     makeUnsafe: () => {
       const parser = serialization.makeUnsafe();
-      const pending = new Map<string | number, PendingRequest>();
+      const pending = new Map<string | number, string>();
+      const threadIds = new Map<string | number, string>();
       return {
         decode: (data) => {
           const messages = parser.decode(data);
@@ -40,18 +30,25 @@ export const wrap = (
                 typeof message.tag === "string" &&
                 allowedMethods.has(message.tag)
               ) {
-                const payload = "payload" in message ? message.payload : undefined;
-                pending.set(message.id, {
-                  method: message.tag,
-                  threadId: idField(payload, "threadId"),
-                  discussionId: idField(payload, "discussionId"),
-                });
+                pending.set(message.id, message.tag);
+                if (
+                  (message.tag === "orchestration.subscribeThread" ||
+                    message.tag === "orchestration.getThreadProjection") &&
+                  "payload" in message &&
+                  typeof message.payload === "object" &&
+                  message.payload !== null &&
+                  "threadId" in message.payload &&
+                  typeof message.payload.threadId === "string"
+                ) {
+                  threadIds.set(message.id, message.payload.threadId);
+                }
               } else if (
                 message._tag === "Interrupt" &&
                 "requestId" in message &&
                 (typeof message.requestId === "string" || typeof message.requestId === "number")
               ) {
                 pending.delete(message.requestId);
+                threadIds.delete(message.requestId);
               }
             }
           } catch {
@@ -60,6 +57,37 @@ export const wrap = (
           return messages;
         },
         encode: (response) => {
+          if (jsonExceedsBudget(response)) {
+            const requestId =
+              typeof response === "object" && response !== null && "requestId" in response
+                ? response.requestId
+                : undefined;
+            try {
+              log.record({
+                kind: "ws",
+                name:
+                  requestId === undefined
+                    ? "unknown"
+                    : (pending.get(requestId as string | number) ?? "unknown"),
+                ...(threadIds.has(requestId as string | number)
+                  ? { threadId: threadIds.get(requestId as string | number) }
+                  : {}),
+                bytes: MAX_REPLY_BYTES + 1,
+                rejected: true,
+              });
+            } catch {
+              /* Diagnostics cannot bypass the cap. */
+            }
+            if (requestId !== undefined) {
+              pending.delete(requestId as string | number);
+              threadIds.delete(requestId as string | number);
+              throw new Error(REPLY_TOO_LARGE);
+            }
+            return parser.encode({
+              _tag: "Defect",
+              defect: { _tag: "ReplyTooLarge", message: REPLY_TOO_LARGE },
+            });
+          }
           const encoded = parser.encode(response);
           try {
             const envelope =
@@ -71,8 +99,12 @@ export const wrap = (
               (typeof envelope.requestId === "string" || typeof envelope.requestId === "number")
                 ? envelope.requestId
                 : undefined;
-            const request = requestId === undefined ? undefined : pending.get(requestId);
-            if (tag === "Exit" && requestId !== undefined) pending.delete(requestId);
+            const method = requestId === undefined ? undefined : pending.get(requestId);
+            const threadId = requestId === undefined ? undefined : threadIds.get(requestId);
+            if (tag === "Exit" && requestId !== undefined) {
+              pending.delete(requestId);
+              threadIds.delete(requestId);
+            }
             // Size the string the transport is about to send; never re-serialize.
             const bytes =
               typeof encoded === "string"
@@ -84,11 +116,9 @@ export const wrap = (
               log.record({
                 kind: "ws",
                 name:
-                  request?.method ??
-                  (typeof tag === "string" && protocolTags.has(tag) ? tag : "unknown"),
+                  method ?? (typeof tag === "string" && protocolTags.has(tag) ? tag : "unknown"),
+                ...(threadId === undefined ? {} : { threadId }),
                 bytes,
-                threadId: request?.threadId,
-                discussionId: request?.discussionId,
               });
             }
           } catch {

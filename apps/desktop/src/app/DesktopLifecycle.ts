@@ -8,6 +8,7 @@ import * as Scope from "effect/Scope";
 import type * as Electron from "electron";
 
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import * as DesktopQuit from "./DesktopQuit.ts";
 import { makeComponentLogger } from "./DesktopObservability.ts";
 import * as DesktopShutdown from "./DesktopShutdown.ts";
 import * as ElectronApp from "../electron/ElectronApp.ts";
@@ -140,7 +141,7 @@ function handleBeforeQuit(
 }
 
 function quitFromSignal(
-  signal: "SIGINT" | "SIGTERM",
+  signal: "SIGINT" | "SIGTERM" | "SIGHUP",
   runEffect: <A, E>(
     effect: Effect.Effect<A, E, DesktopLifecycleRegistrationServices>,
   ) => Promise<A>,
@@ -151,6 +152,7 @@ function quitFromSignal(
       const electronApp = yield* ElectronApp.ElectronApp;
       const state = yield* DesktopState.DesktopState;
       const wasQuitting = yield* Ref.getAndSet(state.quitting, true);
+      yield* DesktopQuit.record({ trigger: "signal", signal });
       if (wasQuitting) return;
       yield* logLifecycleInfo("process signal received", { signal });
       yield* requestDesktopShutdownAndWait();
@@ -166,6 +168,7 @@ export const make = DesktopLifecycle.of({
     const environment = yield* DesktopEnvironment.DesktopEnvironment;
     const state = yield* DesktopState.DesktopState;
     yield* logLifecycleInfo("desktop relaunch requested", { reason });
+    yield* DesktopQuit.record({ trigger: "ipc-relaunch", reason });
     yield* Effect.gen(function* () {
       yield* Effect.yieldNow;
       yield* Ref.set(state.quitting, true);
@@ -213,7 +216,8 @@ export const make = DesktopLifecycle.of({
       // and windows could still be open when the process exits (visible on
       // macOS). Destroy them inline.
       Effect.runSyncWith(context)(
-        electronWindow.destroyAll.pipe(
+        DesktopQuit.record({ trigger: "quitAndInstall" }).pipe(
+          Effect.andThen(electronWindow.destroyAll),
           Effect.andThen(logLifecycleInfo("allowing updater-controlled quit")),
           Effect.catchCause((cause) =>
             logLifecycleError("failed to destroy windows before updater quit", { cause }),
@@ -223,6 +227,7 @@ export const make = DesktopLifecycle.of({
       );
     });
     yield* electronApp.on("before-quit", (event: Electron.Event) => {
+      Effect.runSyncWith(context)(DesktopQuit.record({ trigger: "before-quit" }));
       handleBeforeQuit(
         event,
         runEffect,
@@ -231,6 +236,9 @@ export const make = DesktopLifecycle.of({
           quitAllowed = true;
         },
       );
+    });
+    yield* electronApp.on("will-quit", () => {
+      Effect.runSyncWith(context)(DesktopQuit.record({ trigger: "will-quit" }));
     });
     yield* electronApp.on("activate", () => {
       void runEffect(
@@ -247,6 +255,7 @@ export const make = DesktopLifecycle.of({
           const app = yield* ElectronApp.ElectronApp;
           const state = yield* DesktopState.DesktopState;
           if (environment.platform !== "darwin" && !(yield* Ref.get(state.quitting))) {
+            yield* DesktopQuit.record({ trigger: "windowAllClosed" });
             yield* app.quit;
           }
         }).pipe(Effect.withSpan("desktop.lifecycle.windowAllClosed")),
@@ -259,6 +268,9 @@ export const make = DesktopLifecycle.of({
       });
       yield* addScopedListener(process, "SIGTERM", () => {
         quitFromSignal("SIGTERM", runEffect);
+      });
+      yield* addScopedListener(process, "SIGHUP", () => {
+        quitFromSignal("SIGHUP", runEffect);
       });
     }
   }).pipe(Effect.withSpan("desktop.lifecycle.register")),

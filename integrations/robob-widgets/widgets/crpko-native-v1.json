@@ -1,0 +1,24 @@
+{
+  "id": "crpko-native-v1",
+  "title": "Crpko native v1 rebuild",
+  "families": [
+    "systemSmall",
+    "systemMedium",
+    "systemLarge",
+    "accessoryCircular",
+    "accessoryRectangular",
+    "accessoryInline"
+  ],
+  "refreshMinutes": 15,
+  "source": {
+    "command": [
+      "/usr/bin/python3",
+      "/Users/ardud/.local/share/robob-widgets/sources/board_progress.py",
+      "board-crpko",
+      "--goal",
+      "goal-579c2439-725c-4a9f-9c23-b8419324c414"
+    ],
+    "timeoutSec": 20
+  },
+  "actions": [{"id": "refresh", "label": "Refresh", "symbol": "arrow.clockwise"}]
+}

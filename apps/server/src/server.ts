@@ -1,3 +1,8 @@
+import * as ThreadRedaction from "./ardud/redaction/ThreadRedaction.ts";
+import * as ThreadCommandExecutor from "./orchestration-v2/ThreadCommandExecutor.ts";
+import { redactionRouteLayer } from "./ardud/redaction/http.ts";
+import * as DelegatedTaskProgressGuard from "./orchestration-v2/DelegatedTaskProgressGuard.ts";
+import { canServeBeforeRecovery } from "./ardud/fast-install/readiness.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import type { RelayManagedEndpointRuntimeConfig } from "@t3tools/contracts/relay";
 import * as Random from "effect/Random";
@@ -20,7 +25,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
-import { FetchHttpClient, HttpRouter, HttpServer } from "effect/http";
+import { FetchHttpClient, HttpRouter, HttpServer, HttpServerRequest } from "effect/http";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
@@ -40,6 +45,7 @@ import * as NodePtyAdapter from "./terminal/NodePtyAdapter.ts";
 import * as PullRequestHttp from "./pullRequest/http.ts";
 import * as PullRequestProviderRegistry from "./pullRequest/PullRequestProviderRegistry.ts";
 import * as PullRequestService from "./pullRequest/PullRequestService.ts";
+import * as DatabaseDiagnostics from "./persistence/DatabaseDiagnostics.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
 import * as PullRequestFilesViewed from "./persistence/PullRequestFilesViewed.ts";
 import * as PullRequestReviewGuides from "./persistence/PullRequestReviewGuides.ts";
@@ -67,6 +73,7 @@ import * as TerminalManager from "./terminal/Manager.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as CredentialStore from "./ardud/mcp/CredentialStore.ts";
+import * as BoardsDatabase from "./ardud/persistence/BoardsDatabase.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as DeviceService from "./device/DeviceService.ts";
 import * as DeviceHubProxy from "./device/DeviceHubProxy.ts";
@@ -120,6 +127,7 @@ import * as Observability from "./observability/Observability.ts";
 import * as HeapSnapshot from "./observability/HeapSnapshot.ts";
 import * as EventLoopMonitor from "./observability/EventLoopMonitor.ts";
 import * as LargeReplyLog from "./observability/LargeReplyLog.ts";
+import * as ReplyBuilders from "./ardud/http/ReplyBuilders.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as DirectEndpoints from "./environment/DirectEndpoints.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
@@ -188,12 +196,15 @@ import * as OrchestrationHttp from "./orchestration-v2/http.ts";
 import * as ProjectHttp from "./project/http.ts";
 import { controlRouteLayer } from "./ardud/control/http.ts";
 import { desktopLeaseRouteLayer } from "./ardud/desktop-lease/http.ts";
+import { harnessCutoverRouteLayer } from "./ardud/harness-migrate/http.ts";
 import { deferIdleSocketClose } from "./ardud/http/deferIdleSocketClose.ts";
 // ardud fork: OpenCode session import
 import { ArdudOpenCodeImportLive } from "./ardud/opencode-import/layer.ts";
 import { openCodeImportRouteLayer } from "./ardud/opencode-import/http.ts";
 // ardud: missions board
 import { ArdudKanbanLive } from "./ardud/kanban/layer.ts";
+import { layer as KanbanWaitPrsLayer } from "./ardud/kanban/engine/waitPrs.ts";
+import * as ReadonlyReplica from "./ardud/persistence/ReadonlyReplica.ts";
 import { kanbanRouteLayer } from "./ardud/kanban/http.ts";
 import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
@@ -236,15 +247,27 @@ const layerProviderEventLoggers = Layer.effect(
     );
     if (!store) return ProviderEventLoggers.NoOpProviderEventLoggers;
     yield* Effect.addFinalizer(() => store.close());
-    return { native: store.logger("native"), canonical: store.logger("canonical") };
+    return {
+      native: store.logger("native"),
+      canonical: store.logger("canonical"),
+      withMaintenance: store.withMaintenance,
+    };
   }),
 );
 
 const layerPtyAdapter = NodePtyAdapter.layer;
+const layerSecrets = ServerSecretStore.layer.pipe(
+  StartupPhaseLog.withStartupLayer("server.secrets"),
+);
+
+const layerSqlitePersistence = SqlitePersistence.layerConfig.pipe(
+  Layer.provideMerge(DatabaseDiagnostics.layer),
+);
 
 const layerServerSettings = ServerSettings.layer.pipe(
-  Layer.provide(ServerSecretStore.layer),
-  Layer.provideMerge(SqlitePersistence.layerConfig),
+  Layer.provide(layerSecrets),
+  Layer.provideMerge(layerSqlitePersistence),
+  StartupPhaseLog.withStartupLayer("server.settings"),
 );
 
 const layerNativeTelemetry = NativeTelemetryClient.layer.pipe(
@@ -272,6 +295,7 @@ const layerDesktopAppUpdate = DesktopAppUpdate.layer.pipe(
 const layerBackground = BackgroundPolicy.layer.pipe(
   Layer.provide(layerHostPowerMonitor),
   Layer.provideMerge(layerServerSettings),
+  StartupPhaseLog.withStartupLayer("server.background"),
 );
 
 const layerUsage = UsageService.layer.pipe(
@@ -281,9 +305,10 @@ const layerUsage = UsageService.layer.pipe(
       CursorUsageAccounts.layer.pipe(
         Layer.provide(CursorAccountReader.layer.pipe(Layer.provide(CursorKeychain.layer))),
       ),
-    ).pipe(Layer.provide(ProviderHostLive.layer.pipe(Layer.provide(ServerSecretStore.layer)))),
+    ).pipe(Layer.provide(ProviderHostLive.layer.pipe(Layer.provide(layerSecrets)))),
   ),
   Layer.provide(layerServerSettings),
+  StartupPhaseLog.withStartupLayer("server.usage"),
 );
 
 const layerResourceDiagnostics = Layer.mergeAll(
@@ -292,7 +317,7 @@ const layerResourceDiagnostics = Layer.mergeAll(
   ProcessDiagnostics.layer.pipe(Layer.provide(layerResourceTelemetry)),
   ProcessResourceMonitor.layer.pipe(Layer.provide(layerResourceTelemetry)),
   ProcessGroupMetrics.layer.pipe(Layer.provide(layerResourceTelemetry)),
-);
+).pipe(StartupPhaseLog.withStartupLayer("server.diagnostics"));
 
 const layerRelayClient = Layer.unwrap(
   Effect.gen(function* () {
@@ -321,11 +346,13 @@ const layerHttpServer = Layer.unwrap(
       },
     );
   }),
-);
+).pipe(StartupPhaseLog.withStartupLayer("http.listen"));
 
 const layerPlatformServices = NodeServices.layer;
 
-const layerPersistence = Layer.empty.pipe(Layer.provideMerge(SqlitePersistence.layerConfig));
+const layerPersistence = BoardsDatabase.layerConfig.pipe(
+  Layer.provideMerge(layerSqlitePersistence),
+);
 
 const layerVcsDriverRegistry = VcsDriverRegistry.layer.pipe(Layer.provide(VcsProjectConfig.layer));
 
@@ -426,6 +453,7 @@ const layerVcs = Layer.empty.pipe(
       ),
     ),
   ),
+  StartupPhaseLog.withStartupLayer("server.vcs"),
 );
 
 const layerCheckpointStore = CheckpointStore.layer.pipe(Layer.provide(layerVcsDriverRegistry));
@@ -461,25 +489,29 @@ const layerWorkspace = Layer.mergeAll(
   WorkspacePaths.layer,
   layerWorkspaceEntries,
   layerWorkspaceFileSystem,
-);
+).pipe(StartupPhaseLog.withStartupLayer("server.workspace"));
 
 const layerProjectFaviconResolver = ProjectFaviconResolver.layer.pipe(
   Layer.provide(WorkspacePaths.layer),
   Layer.provide(T3ProjectFileLoader.layer),
 );
 
-const layerServerEnvironment = ServerEnvironment.layer.pipe(Layer.provide(ServerSecretStore.layer));
+const layerServerEnvironment = ServerEnvironment.layer.pipe(
+  Layer.provide(layerSecrets),
+  StartupPhaseLog.withStartupLayer("server.environment"),
+);
 
 const layerAuth = EnvironmentAuth.layer.pipe(
   Layer.provideMerge(layerPersistence),
   Layer.provide(layerServerEnvironment),
-  Layer.provide(ServerSecretStore.layer),
+  Layer.provide(layerSecrets),
+  StartupPhaseLog.withStartupLayer("server.auth"),
 );
 
 const layerCloudManagedEndpointRuntime = Layer.mergeAll(
   layerRelayClient,
   CloudManagedEndpointRuntime.layer.pipe(
-    Layer.provide(ServerSecretStore.layer),
+    Layer.provide(layerSecrets),
     Layer.provide(layerRelayClient),
   ),
 );
@@ -519,11 +551,13 @@ const layerOrchestrationV2Runtime = RuntimeLayer.layerProduction.pipe(
       Layer.provide(RuntimeLayer.layerProjectService),
     ),
   ),
+  StartupPhaseLog.withStartupLayer("server.orchestration"),
 );
 
 const layerOrchestrationApplication = CheckpointDiffQuery.layer.pipe(
   Layer.provideMerge(layerCheckpointStore),
   Layer.provideMerge(layerOrchestrationV2Runtime),
+  StartupPhaseLog.withStartupLayer("server.application"),
 );
 
 const layerThreadSettlementWorker = Layer.effectDiscard(
@@ -580,6 +614,11 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   layerThreadPullRequestWorker,
   DelegatedTaskAnalytics.layer,
   Layer.effectDiscard(
+    Effect.flatMap(DelegatedTaskProgressGuard.DelegatedTaskProgressGuard, (service) =>
+      service.start(),
+    ),
+  ),
+  Layer.effectDiscard(
     Effect.gen(function* () {
       const service = yield* PullRequestSyncReactor.PullRequestSyncReactor;
       yield* service.start();
@@ -608,10 +647,17 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ProviderUsageLimitsIngestion.layer,
   layerProviderInstallationRefresh,
   ReplayMarkers.layer,
-  ArdudOpenCodeImportLive,
+  ArdudOpenCodeImportLive.pipe(StartupPhaseLog.withStartupLayer("server.opencode-import")),
   // ardud: missions board
-  ArdudKanbanLive,
-  Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep),
+  ArdudKanbanLive.pipe(
+    // Reads the pull requests board waits point at; the board picks it up when present.
+    Layer.provide(KanbanWaitPrsLayer.pipe(Layer.provide(layerPullRequestService))),
+    StartupPhaseLog.withStartupLayer("server.kanban"),
+  ),
+  ReadonlyReplica.layer.pipe(StartupPhaseLog.withStartupLayer("server.readonly-replica")),
+  Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep).pipe(
+    StartupPhaseLog.withStartupLayer("server.project-settings-sweep"),
+  ),
 ).pipe(
   Layer.provideMerge(layerOrchestrationApplication),
   Layer.provideMerge(RuntimeLayer.layerEventInfrastructure),
@@ -625,14 +671,21 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   Layer.provideMerge(
     Layer.mergeAll(Keybindings.layer, EnvironmentTheme.layer, UsageLimitSources.layer),
   ),
-  Layer.provideMerge(ProviderRegistry.layer),
-  Layer.provideMerge(ProviderInstanceRegistryHydration.layer),
+  Layer.provideMerge(
+    ProviderRegistry.layer.pipe(StartupPhaseLog.withStartupLayer("server.providers")),
+  ),
+  Layer.provideMerge(
+    ProviderInstanceRegistryHydration.layer.pipe(
+      StartupPhaseLog.withStartupLayer("server.provider-hydration"),
+    ),
+  ),
   Layer.provideMerge(
     Layer.mergeAll(
       AntigravityInstallation.AntigravityInstallation.layer,
       CodexInstallation.CodexInstallation.layer,
     ),
   ),
+  StartupPhaseLog.withStartupLayer("server.runtime-core-base"),
 );
 
 const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
@@ -665,16 +718,17 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
   Layer.provideMerge(layerRepositoryIdentityResolver),
   Layer.provideMerge(layerServerEnvironment),
   Layer.provideMerge(layerAuth),
-  Layer.provideMerge(ServerSecretStore.layer),
+  Layer.provideMerge(layerSecrets),
   Layer.provideMerge(
     Layer.mergeAll(
       CloudCliTokenManager.layer.pipe(
-        Layer.provide(ServerSecretStore.layer),
+        Layer.provide(layerSecrets),
         Layer.provide(ExternalLauncher.layer),
       ),
       layerCloudManagedEndpointRuntime,
     ),
   ),
+  StartupPhaseLog.withStartupLayer("server.runtime-core"),
 );
 
 const layerRuntimeDependencies = layerRuntimeCoreDependencies.pipe(
@@ -688,12 +742,17 @@ const layerRuntimeDependencies = layerRuntimeCoreDependencies.pipe(
   Layer.provideMerge(DirectEndpoints.layer),
   Layer.provideMerge(ServerLifecycleEvents.layer),
   Layer.provide(NetService.layer),
+  StartupPhaseLog.withStartupLayer("server.dependencies"),
 );
 
 const layerCommandReadiness = HttpRouter.middleware(
   (httpEffect) =>
     Effect.flatMap(ServerRuntimeStartup.ServerRuntimeStartup, (startup) =>
-      startup.awaitCommandReady.pipe(Effect.orDie, Effect.andThen(httpEffect)),
+      Effect.flatMap(HttpServerRequest.HttpServerRequest, (request) =>
+        canServeBeforeRecovery(request.method, request.headers.upgrade)
+          ? httpEffect
+          : startup.awaitCommandReady.pipe(Effect.orDie, Effect.andThen(httpEffect)),
+      ),
     ),
   { global: true },
 );
@@ -718,7 +777,10 @@ const layerMakeRoutes = Layer.mergeAll(
     ServerBrowserStream.routeLayer,
     // ardud fork: local control API for bridges, crw and CLIs.
     controlRouteLayer,
+    redactionRouteLayer,
+    McpHttpServer.layerRedactionToolkit,
     desktopLeaseRouteLayer,
+    harnessCutoverRouteLayer,
     openCodeImportRouteLayer,
     // ardud: missions board
     kanbanRouteLayer,
@@ -730,6 +792,17 @@ const layerMakeRoutes = Layer.mergeAll(
     Layer.provide(McpOAuth.layerMcpClientAuthenticator),
   ),
 ).pipe(
+  Layer.provide(
+    ThreadRedaction.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ThreadCommandExecutor.layer,
+          EventStoreV2.layerFromOrchestrationEventStore,
+          RuntimeLayer.layerEventSink,
+        ),
+      ),
+    ),
+  ),
   Layer.provide(
     PullRequestReviewGuideService.layer.pipe(Layer.provide(PullRequestReviewGuides.layer)),
   ),
@@ -1056,6 +1129,7 @@ const layerMakeServer = Layer.unwrap(
       disableLogger: !config.logWebSocketEvents,
       routerConfig: HTTP_ROUTER_CONFIG,
     }).pipe(
+      StartupPhaseLog.withStartupLayer("http.routes"),
       withUntracedRequests,
       Layer.tap(() => Deferred.succeed(routesReady, undefined).pipe(Effect.orDie)),
     );
@@ -1073,8 +1147,9 @@ const layerMakeServer = Layer.unwrap(
       Layer.provideMerge(layerRuntimeServices),
       Layer.provideMerge(
         McpSessionRegistry.layer.pipe(
-          Layer.provide(CredentialStore.layer.pipe(Layer.provide(layerPersistence))),
-          Layer.provide(ServerEnvironment.layer.pipe(Layer.provide(ServerSecretStore.layer))),
+          Layer.provide(CredentialStore.layer),
+          Layer.provide(layerPersistence),
+          Layer.provide(ServerEnvironment.layer.pipe(Layer.provide(layerSecrets))),
         ),
       ),
       Layer.provide(layerActivation),
@@ -1082,10 +1157,12 @@ const layerMakeServer = Layer.unwrap(
       Layer.provideMerge(layerHttpServer),
       Layer.provide(layerApplicationObservability),
       Layer.provide(LargeReplyLog.layer),
+      Layer.provide(ReplyBuilders.layer),
       Layer.provideMerge(FetchHttpClient.layer),
       Layer.provide(VcsProcess.layer),
       Layer.provideMerge(AgentScopeLive.layer),
       Layer.provideMerge(layerPlatformServices),
+      StartupPhaseLog.withStartupLayer("boot"),
       Layer.provide(StartupPhaseLog.layer(config.logsDir)),
     );
   }),

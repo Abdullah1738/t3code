@@ -39,6 +39,7 @@ export type OutboxRecord = OutboxOperation & {
 };
 
 export type InboundRecord = { id: string; payload: unknown; state: string };
+export type InboundFailure = { stage: string; message: string; threadId: string | null; at: number };
 
 type OutboxRow = {
   payload: string;
@@ -90,6 +91,9 @@ export class Store {
         CREATE TABLE IF NOT EXISTS session_notices (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS session_notices_state ON session_notices(state);
       `);
+      const columns = this.db.query<{ name: string }, []>("PRAGMA table_info(inbound)").all();
+      if (!columns.some(column => column.name === "failure")) this.db.exec("ALTER TABLE inbound ADD COLUMN failure TEXT");
+      this.db.exec("CREATE INDEX IF NOT EXISTS inbound_failed ON inbound(state) WHERE state = 'failed'");
       // A provider may have accepted these sends before the process stopped.
       this.db.query("UPDATE outbox SET state = 'uncertain' WHERE state = 'sending'").run();
     } catch (error) {
@@ -132,10 +136,26 @@ export class Store {
     ).all().map(row => ({ ...row, payload: JSON.parse(row.payload) }));
   }
 
-  updateInbound(id: string, state: string, payload?: unknown): void {
-    const result = this.db.query(`UPDATE inbound SET state = ?, payload = COALESCE(?, payload)
-      WHERE id = ?`).run(state, payload === undefined ? null : json(payload), id);
+  updateInbound(id: string, state: string, payload?: unknown, failure?: InboundFailure): void {
+    const detail = failure ?? (state === "failed" ? { stage: "state-transition", message: "No failure detail supplied", threadId: null, at: Date.now() } : undefined);
+    const result = this.db.query(`UPDATE inbound SET state = ?, payload = COALESCE(?, payload), failure = COALESCE(?, failure)
+      WHERE id = ?`).run(state, payload === undefined ? null : json(payload), detail ? json(detail) : null, id);
     if (!result.changes) throw new Error(`Unknown inbound: ${id}`);
+  }
+
+  inboundFailure(id: string): InboundFailure | undefined {
+    const row = this.db.query<{ failure: string | null }, [string]>("SELECT failure FROM inbound WHERE id = ?").get(id);
+    return row?.failure ? JSON.parse(row.failure) : undefined;
+  }
+
+  recordInboundFailure(id: string, failure: InboundFailure): void {
+    this.db.query("UPDATE inbound SET failure = ? WHERE id = ?").run(json(failure), id);
+  }
+
+  failedInbound(): InboundRecord[] {
+    return this.db.query<{ id: string; payload: string; state: string }, []>(
+      "SELECT id, payload, state FROM inbound WHERE state = 'failed' ORDER BY rowid",
+    ).all().map(row => ({ ...row, payload: JSON.parse(row.payload) }));
   }
 
   enqueue(op: OutboxOperation): boolean {
@@ -166,6 +186,16 @@ export class Store {
     return this.db.query<OutboxRow, []>(
       "SELECT payload, state, attempts, providerId FROM outbox WHERE state = 'pending' ORDER BY rowid",
     ).all().map(outboxRecord);
+  }
+
+  queuedSends(sessionId: string, generation: number, since: number): Pick<OutboxOperation, "id" | "text">[] {
+    return this.db.query<{ id: string; text: string }, [string, number, number]>(`
+      SELECT o.id, json_extract(o.payload, '$.text') AS text FROM outbox o
+      JOIN kv ON kv.key = 'api:send:' || o.id
+      WHERE o.id GLOB 'send:*' AND json_extract(o.payload, '$.sessionId') = ?
+        AND json_extract(o.payload, '$.generation') = ?
+        AND json_extract(kv.value, '$.queuedAt') >= ?
+    `).all(sessionId, generation, since);
   }
 
   putBlob(data: Uint8Array): string {

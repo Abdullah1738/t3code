@@ -1,3 +1,4 @@
+import { decryptForm, formScript, type FormKeys } from "./secret-crypto.ts";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
@@ -10,6 +11,7 @@ export type SecretFieldType = typeof SECRET_FIELD_TYPES[number];
 export type SecretField = { name: string; label: string; type: SecretFieldType };
 export type SecretState = "open" | "submitted" | "expired" | "forgotten";
 export type SecretRequest = {
+  encryption?: FormKeys;
   sessionId: string;
   generation: number;
   purpose: string;
@@ -192,7 +194,7 @@ export async function submitSecret(deps: SecretDeps, token: string, form: URLSea
     accepted = deps.store.db.transaction(() => {
       const current = getSecretRequest(deps.store, token);
       if (!isOpen(current, now)) return false;
-      putSecretRequest(deps.store, token, { ...current, state: "submitted", submittedAt: now, valuesExpireAt: now + SECRET_VALUE_TTL_MS });
+      putSecretRequest(deps.store, token, { ...current, encryption: undefined, state: "submitted", submittedAt: now, valuesExpireAt: now + SECRET_VALUE_TTL_MS });
       const names = current.fields.map(field => field.name).join(", ");
       deps.store.acceptInbound(`secret:${tokenHash(token)}`, {
         id: `secret:${tokenHash(token)}`,
@@ -238,7 +240,7 @@ async function settle(deps: SecretDeps, token: string, now: number): Promise<Sec
   // Re-read: a submission may have been recorded during the unlink above.
   const latest = getSecretRequest(deps.store, token);
   if (!latest || latest.state !== request.state) return latest;
-  const expired: SecretRequest = { ...latest, state: "expired" };
+  const expired: SecretRequest = { ...latest, encryption: undefined, state: "expired" };
   putSecretRequest(deps.store, token, expired);
   return expired;
 }
@@ -260,7 +262,7 @@ export async function forgetSecret(deps: SecretDeps, token: string): Promise<voi
   const request = getSecretRequest(deps.store, token);
   if (!request) throw new SecretError(404);
   await removeValues(deps.stateRoot, token);
-  if (request.state === "open" || request.state === "submitted") putSecretRequest(deps.store, token, { ...request, state: "forgotten" });
+  if (request.state === "open" || request.state === "submitted") putSecretRequest(deps.store, token, { ...request, encryption: undefined, state: "forgotten" });
 }
 
 /** Expires stale requests, deletes their values, drops old records, and removes orphaned value files. */
@@ -297,6 +299,7 @@ export const SECRET_PAGE_HEADERS = {
   "Content-Type": "text/html; charset=utf-8",
   "Cache-Control": "no-store",
   "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+  "X-Robots-Tag": "noindex, nofollow, noarchive",
   "Referrer-Policy": "no-referrer",
   "X-Frame-Options": "DENY",
   "X-Content-Type-Options": "nosniff",
@@ -410,14 +413,27 @@ export function createSecretHandler(deps: SecretDeps): (request: Request, token:
       void request.body?.cancel().catch(() => {});
       return gone(head);
     }
-    if (request.method !== "POST") return html(renderSecretForm(current), 200, head);
-    const form = await readForm(request);
+    if (request.method !== "POST") {
+      if (!current.encryption) return html(renderSecretForm(current), 200, head);
+      const { script, hash } = formScript(current.encryption.publicKey);
+      // No native plaintext fallback if JavaScript or WebCrypto is unavailable.
+      const body = renderSecretForm(current).replace('<form method="post"', '<form method="dialog"')
+        .replace('</body>', `<script>${script}</script></body>`);
+      return new Response(head ? null : body, { headers: { ...SECRET_PAGE_HEADERS,
+        "Content-Security-Policy": SECRET_PAGE_HEADERS["Content-Security-Policy"].replace("form-action 'self'", "form-action 'none'") + `; script-src 'sha256-${hash}'; connect-src 'self'` } });
+    }
+    let form = await readForm(request);
     if (typeof form === "number") {
       return html(renderSecretMessage("Could not send", "Please try again."), form);
     }
+    if (current.encryption) {
+      try { form = await decryptForm(current.encryption, form); }
+      catch { return html(renderSecretMessage("Could not send", "Please try again."), 400); }
+    }
     const result = await submitSecret(deps, token, form);
     if (result.status === "gone") return gone();
-    if (result.status === "invalid") return html(renderSecretForm(result.request, result.message), 400);
+    if (result.status === "invalid") return html(current.encryption
+      ? renderSecretMessage("Could not send", result.message) : renderSecretForm(result.request, result.message), 400);
     return html(renderSecretMessage("Sent", "Sent. You can close this."));
   };
 }

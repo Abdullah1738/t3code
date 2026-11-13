@@ -44,6 +44,22 @@ test("a wake carries the start of its context, and the whole context only on the
   expect(escalation.length).toBeLessThan(1_500);
 });
 
+test("watcher check children inherit replica overrides", async () => {
+  const names = ["ROBOB_READONLY_DB", "MONEY_CASES_STATE_DB", "SEND_APPROVAL_STATE_DB", "ROBOB_HOME", "T3CODE_HOME", "XDG_DATA_HOME"];
+  const before = names.map(name => process.env[name]);
+  for (const name of names) process.env[name] = `/replica/${name}`;
+  try {
+    const result = await runCheck(watcher('print -r -- "$ROBOB_READONLY_DB|$MONEY_CASES_STATE_DB|$SEND_APPROVAL_STATE_DB|$ROBOB_HOME|$T3CODE_HOME|$XDG_DATA_HOME"'), dir);
+    expect(result.code).toBe(0);
+    expect(result.stdout.trim()).toBe(names.map(name => `/replica/${name}`).join("|"));
+  } finally {
+    for (const [i, name] of names.entries()) {
+      if (before[i] === undefined) delete process.env[name];
+      else process.env[name] = before[i];
+    }
+  }
+});
+
 test("quiet hours are validated and wrap past midnight", () => {
   const base = { id: "q", title: "q", check: "true", mode: "notify" as const };
   expect(normalize({ ...base, quiet: { start: 23, end: 8, time_zone: "Asia/Dubai" } }).quiet).toEqual({ start: 23, end: 8, time_zone: "Asia/Dubai" });

@@ -75,6 +75,34 @@ describe("state mapping", () => {
 });
 
 describe("model selection", () => {
+  it.each([
+    undefined,
+    {},
+    { ardudHarnessMigration: { selections: "off" as const } },
+    { ardudHarnessMigration: { selections: "dryrun" as const } },
+  ])("infers OpenCode only for an explicit provider/model without an instance (%j)", (settings) => {
+    const base = {
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+      model: "claude-opus-5-5",
+      options: [{ id: "effort", value: "max" }],
+    } satisfies ModelSelection;
+    for (const [model, instanceId, expected] of [
+      ["opus/claude-opus-5-5", undefined, "opencode"],
+      ["opus/cx/gpt-6.1-sol", undefined, "opencode"],
+      ["opus/claude-opus-5-5", "claudeAgent", "claudeAgent"],
+      ["claude-sonnet-5-5", undefined, "claudeAgent"],
+    ] as const) {
+      expect(
+        selectionOf(modelSelectionFrom({ base, model, instanceId, variant: "high", settings })),
+      ).toEqual({
+        instanceId: expected,
+        model,
+        options: [{ id: "variant", value: "high" }],
+      });
+    }
+    expect(selectionOf(modelSelectionFrom({ base, settings }))).toEqual(base);
+  });
+
   it("parses provider/model with a variant", () => {
     expect(
       selectionOf(
@@ -297,6 +325,35 @@ describe("effort compatibility", () => {
     expect(result.kind).toBe("conflict");
   });
 
+  it("routes a provider/model id to OpenCode on the old path when the default is native (#586)", () => {
+    const nativeDefault: ModelSelection = {
+      instanceId: "claudeAgent",
+      model: "claude-opus-5-5",
+    } as ModelSelection;
+    expect(
+      selectionOf(
+        modelSelectionFrom({ base: nativeDefault, model: "opus/claude-opus-5-5", variant: "high" }),
+      ),
+    ).toEqual({
+      instanceId: "opencode",
+      model: "opus/claude-opus-5-5",
+      options: [{ id: "variant", value: "high" }],
+    });
+    expect(
+      selectionOf(
+        modelSelectionFrom({
+          base: nativeDefault,
+          model: "opus/claude-opus-5-5",
+          instanceId: "claudeAgent",
+        }),
+      ).instanceId,
+    ).toBe("claudeAgent");
+    expect(
+      selectionOf(modelSelectionFrom({ base: nativeDefault, model: "claude-sonnet-5-5" }))
+        .instanceId,
+    ).toBe("claudeAgent");
+  });
+
   it("uses the typed flag, keeping absent, off and dryrun on the old path", () => {
     for (const legacySettings of [
       undefined,
@@ -456,11 +513,136 @@ describe("effort compatibility", () => {
   it("lets a new effort replace conflicting stored native efforts", () => {
     const base = {
       ...claude,
-      options: [{ id: "variant", value: "high" }, { id: "effort", value: "max" }, { id: "fastMode", value: true }],
+      options: [
+        { id: "variant", value: "high" },
+        { id: "effort", value: "max" },
+        { id: "fastMode", value: true },
+      ],
     } as ModelSelection;
     expect(selectionOf(modelSelectionFrom({ base, variant: "low", settings }))).toEqual({
-      instanceId: "claudeAgent", model: "claude-opus-5-5",
-      options: [{ id: "fastMode", value: true }, { id: "effort", value: "low" }],
+      instanceId: "claudeAgent",
+      model: "claude-opus-5-5",
+      options: [
+        { id: "fastMode", value: true },
+        { id: "effort", value: "low" },
+      ],
     });
+  });
+});
+
+describe("post-cutover resolver", () => {
+  const settings = { ardudHarnessMigration: { cutoverComplete: true } };
+
+  it.each([
+    ["opus/claude-opus-5-5#max", "claudeAgent/claude-opus-5-5"],
+    ["opus/cc/claude-haiku-5-5", "claudeAgent/claude-haiku-5-5"],
+    ["opus/cx/gpt-6.1-sol", "codex/gpt-6.1-sol"],
+    ["layso/gpt-6-astra", "codex/gpt-6-astra"],
+    ["opus/cx/gpt-6.1-terra#xhigh", "codex-cu/gpt-6.1-terra"],
+  ])("refuses explicit OpenCode selection %s and names %s", (model, target) => {
+    for (const instanceId of [undefined, "opencode"]) {
+      expect(modelSelectionFrom({ base: selection(), model, instanceId, settings })).toEqual({
+        kind: "conflict",
+        reason: expect.stringContaining(`use ${target} instead`),
+      });
+    }
+  });
+
+  it("refuses an instance-only request to keep a legacy Claude selection on OpenCode", () => {
+    expect(modelSelectionFrom({ base: selection(), instanceId: "opencode", settings })).toEqual({
+      kind: "conflict",
+      reason: expect.stringContaining("claudeAgent/claude-opus-5-5"),
+    });
+  });
+
+  it("maps inherited archived selections lazily, including option-only patches", () => {
+    const base = selection([{ id: "variant", value: "max" }]);
+    expect(selectionMigrationApplies(settings)).toBe(true);
+    expect(selectionOf(modelSelectionFrom({ base, settings }))).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-5-5",
+      options: [{ id: "effort", value: "max" }],
+    });
+    expect(selectionOf(modelSelectionFrom({ base, variant: "high", settings }))).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-5-5",
+      options: [{ id: "effort", value: "high" }],
+    });
+  });
+
+  it("does not let an off migration mode bypass the completed cutover", () => {
+    const off = { ardudHarnessMigration: { selections: "off" as const, cutoverComplete: true } };
+    expect(
+      modelSelectionFrom({ base: selection(), model: "opus/claude-opus-5-5", settings: off }).kind,
+    ).toBe("conflict");
+    expect(selectionOf(modelSelectionFrom({ base: selection(), settings: off })).instanceId).toBe(
+      "claudeAgent",
+    );
+  });
+
+  it("allows native targets and unrelated OpenCode selections", () => {
+    expect(
+      selectionOf(
+        modelSelectionFrom({
+          base: selection(),
+          instanceId: "claudeAgent",
+          model: "claude-opus-5-5",
+          settings,
+          options: [{ id: "effort", value: "xhigh" }],
+        }),
+      ),
+    ).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-5-5",
+      options: [{ id: "effort", value: "xhigh" }],
+    });
+    expect(
+      selectionOf(modelSelectionFrom({ base: selection(), model: "surplus/glm", settings })),
+    ).toEqual({
+      instanceId: "opencode",
+      model: "surplus/glm",
+    });
+  });
+
+  it("refuses unknown family models both explicit and inherited", () => {
+    for (const model of ["opus/claude-future", "openai/gpt-future"]) {
+      expect(modelSelectionFrom({ base: selection(), model, settings }).kind).toBe("conflict");
+      expect(modelSelectionFrom({ base: { ...selection(), model }, settings }).kind).toBe(
+        "conflict",
+      );
+    }
+  });
+
+  it("lets an explicit native target repair an unmapped inherited selection", () => {
+    expect(
+      selectionOf(
+        modelSelectionFrom({
+          base: { ...selection(), model: "opus/claude-future" },
+          instanceId: "codex",
+          model: "gpt-6.1-sol",
+          settings,
+        }),
+      ),
+    ).toEqual({ instanceId: "codex", model: "gpt-6.1-sol" });
+  });
+
+  it("preserves pre-cutover compatibility for an absent or false guard", () => {
+    for (const cutoverComplete of [undefined, false]) {
+      const before = {
+        ardudHarnessMigration: {
+          selections: "apply" as const,
+          ...(cutoverComplete === undefined ? {} : { cutoverComplete }),
+        },
+      };
+      expect(
+        selectionOf(
+          modelSelectionFrom({
+            base: selection(),
+            model: "opus/claude-opus-5-5",
+            settings: before,
+          }),
+        ).instanceId,
+      ).toBe("claudeAgent");
+    }
   });
 });

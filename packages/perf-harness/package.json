@@ -1,0 +1,16 @@
+{
+  "name": "@t3tools/perf-harness",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test src/*.test.ts",
+    "fixture": "node src/fixture.ts",
+    "compare": "node src/compare.ts"
+  },
+  "dependencies": {
+    "@effect/platform-node": "catalog:",
+    "@t3tools/contracts": "workspace:*",
+    "@t3tools/shared": "workspace:*",
+    "effect": "catalog:"
+  }
+}

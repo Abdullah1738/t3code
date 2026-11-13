@@ -12,12 +12,14 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as Tracer from "effect/Tracer";
 import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 import {
   HttpBody,
@@ -41,6 +43,8 @@ import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
+import * as ReplyBuilders from "../ardud/http/ReplyBuilders.ts";
+import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
@@ -180,6 +184,64 @@ const layerRecordingTools = (calls: Array<unknown>) => {
   );
 };
 
+it.effect("correlates tool calls with their caller without recording arguments", () =>
+  Effect.gen(function* () {
+    const spans: Array<Tracer.NativeSpan> = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      for (const suffix of ["first", "second", "client"]) {
+        yield* server
+          .callTool({
+            name: "delegate_task",
+            arguments: {
+              task: "private task text",
+              clientRequestId: "private request text",
+              mode: "async",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, {
+              ...invocation,
+              requestNamespace: `session-${suffix}`,
+              thread:
+                suffix === "client"
+                  ? undefined
+                  : { ...invocation.thread, threadId: ThreadId.make(`thread-${suffix}`) },
+            }),
+            Effect.provideService(McpSchema.McpServerClient, client),
+            Effect.withSpan("incoming-tool-call"),
+          );
+      }
+    }).pipe(Effect.provide(layerRecordingTools([])), Effect.withTracer(tracer));
+
+    const calls = spans.filter((span) => span.attributes.has("mcp.tool.name"));
+    expect(calls).toHaveLength(3);
+    expect(
+      calls.map((span) => ({
+        tool: span.attributes.get("mcp.tool.name"),
+        caller: span.attributes.get("mcp.caller.thread_id"),
+        namespace: span.attributes.get("mcp.request.namespace"),
+      })),
+    ).toEqual([
+      { tool: "delegate_task", caller: "thread-first", namespace: "session-first" },
+      { tool: "delegate_task", caller: "thread-second", namespace: "session-second" },
+      { tool: "delegate_task", caller: null, namespace: "session-client" },
+    ]);
+    const correlation = calls.map((span) =>
+      Object.fromEntries([...span.attributes].filter(([key]) => key.startsWith("mcp."))),
+    );
+    expect(correlation.every((attributes) => Object.keys(attributes).length === 3)).toBe(true);
+    expect(JSON.stringify(correlation)).not.toContain("private");
+  }),
+);
+
 it("normalizes empty successful notification responses to accepted", () => {
   const notificationResponse = McpHttpServer.normalizeMcpHttpResponse(
     HttpServerResponse.text("", { status: 200, contentType: "application/json" }),
@@ -191,6 +253,131 @@ it("normalizes empty successful notification responses to accepted", () => {
   );
   expect(resultResponse.status).toBe(200);
 });
+
+it.effect("returns a clear bounded tool error before serializing a giant result", () => {
+  const BigToolkit = Toolkit.make(
+    Tool.make("big_board", {
+      description: "Synthetic board.",
+      success: Schema.Struct({
+        cards: Schema.Array(Schema.Struct({ description: Schema.String })),
+      }),
+      failure: OrchestratorMcpFailure,
+      failureMode: "return",
+    }),
+  );
+  const layer = McpHttpServer.toolkitRegistration(
+    BigToolkit,
+    McpToolAccess.toLayer(BigToolkit, {
+      big_board: McpToolAccess.reads(() =>
+        Effect.succeed({ cards: Array(40).fill({ description: "x".repeat(1024 * 1024) }) }),
+      ),
+    }),
+  ).pipe(Layer.provideMerge(McpServer.McpServer.layer));
+  return callTool("big_board", {}).pipe(
+    Effect.tap((result) =>
+      Effect.sync(() => {
+        expect(result.isError).toBe(true);
+        expect(JSON.stringify(result)).toContain("16 MiB limit");
+        expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(1024);
+      }),
+    ),
+    Effect.provide(layer),
+  );
+});
+
+it.effect("a large-read tool that waits holds only its own mcp lane", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let calls = 0;
+    const ReadToolkit = Toolkit.make(
+      Tool.make("t3_thread_read", {
+        description: "Read a synthetic thread.",
+        success: Schema.Struct({ ready: Schema.Boolean }),
+        failure: OrchestratorMcpFailure,
+        failureMode: "return",
+      }),
+    );
+    const layer = McpHttpServer.toolkitRegistration(
+      ReadToolkit,
+      McpToolAccess.toLayer(ReadToolkit, {
+        // 10 Nov 2026: t3_thread_read held a permit up to 153 s while it waited for
+        // reader slots and acknowledged task results.
+        t3_thread_read: McpToolAccess.reads(() =>
+          Effect.suspend(() => {
+            calls++;
+            return (calls === 2 ? Deferred.succeed(entered, undefined) : Effect.void).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.as({ ready: true }),
+            );
+          }),
+        ),
+      }),
+    ).pipe(Layer.provideMerge(McpServer.McpServer.layer), Layer.provideMerge(ReplyBuilders.layer));
+    yield* Effect.gen(function* () {
+      const requests = yield* Effect.forEach([1, 2], () =>
+        callTool("t3_thread_read", {}).pipe(Effect.forkScoped),
+      );
+      yield* Deferred.await(entered);
+      const builders = yield* ReplyBuilders.ReplyBuilders;
+      // Control, snapshot and poll lanes stay free while large reads wait.
+      for (const lane of ["agent", "snapshot", "poll", "interactive"] as const) {
+        expect(yield* builders[lane].takeIfAvailable(ReplyBuilders.PERMITS[lane])).toBe(true);
+        yield* builders[lane].release(ReplyBuilders.PERMITS[lane]);
+      }
+      // The two waiting reads hold two mcp permits: large results stay bounded.
+      expect(yield* builders.mcp.takeIfAvailable(ReplyBuilders.PERMITS.mcp - 1)).toBe(false);
+      expect(yield* builders.mcp.takeIfAvailable(ReplyBuilders.PERMITS.mcp - 2)).toBe(true);
+      yield* builders.mcp.release(ReplyBuilders.PERMITS.mcp - 2);
+      yield* Deferred.succeed(release, undefined);
+      for (const request of requests) expect((yield* Fiber.join(request)).isError).not.toBe(true);
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.scoped),
+);
+
+it.effect("board tool readiness waits leave the shared reply builders available", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let waiting = 0;
+    const ready = Effect.suspend(() => {
+      waiting++;
+      return (waiting === 2 ? Deferred.succeed(entered, undefined) : Effect.void).pipe(
+        Effect.andThen(Deferred.await(release)),
+      );
+    });
+    const ReadToolkit = Toolkit.make(
+      Tool.make("board_get", {
+        description: "Read a synthetic board.",
+        success: Schema.Struct({ ready: Schema.Boolean }),
+        failure: OrchestratorMcpFailure,
+        failureMode: "return",
+      }),
+    );
+    const layer = McpHttpServer.toolkitRegistration(
+      ReadToolkit,
+      McpToolAccess.toLayer(ReadToolkit, {
+        board_get: McpToolAccess.reads(() => Effect.succeed({ ready: true })),
+      }),
+    ).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provideMerge(ReplyBuilders.layer),
+      Layer.provide(Layer.mock(KanbanService)({ ready, attachmentPath: () => null })),
+    );
+    yield* Effect.gen(function* () {
+      const requests = yield* Effect.forEach([1, 2], () =>
+        callTool("board_get", {}).pipe(Effect.forkScoped),
+      );
+      yield* Deferred.await(entered);
+      const builders = yield* ReplyBuilders.ReplyBuilders;
+      expect(yield* builders.agent.takeIfAvailable(2)).toBe(true);
+      yield* builders.agent.release(2);
+      yield* ReplyBuilders.bounded(Effect.void);
+      yield* Deferred.succeed(release, undefined);
+      for (const request of requests) expect((yield* Fiber.join(request)).isError).not.toBe(true);
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.scoped),
+);
 
 it.effect.each([{}, { includeImage: false }])(
   "returns bounded structural preview snapshot failures %#",
@@ -338,7 +525,7 @@ it.effect.each([
           tabId: alternateTabId,
           threadId,
         });
-        expect(event.request.input).toEqual({});
+        expect(event.request.input).toEqual({ captureImage: requests <= 6 ? images : false });
         return broker.respond({
           clientId: "mcp-image-option-client",
           connectionId: event.connectionId,
@@ -464,7 +651,7 @@ it.effect("saves the snapshot PNG on request and reports its path", () =>
       const snapshot = yield* callSnapshot({ save: true, includeImage: true });
 
       expect(snapshot.isError).toBe(false);
-      expect(inputs).toEqual([{}]);
+      expect(inputs).toEqual([{ captureImage: true }]);
       expect(snapshot.content.map((content) => content.type)).toContain("image");
       const structured = snapshot.structuredContent as { readonly screenshotPath?: string };
       const screenshotPath = structured.screenshotPath;
@@ -500,7 +687,7 @@ it.effect("treats null snapshot options like omitted ones", () =>
       const nulls = yield* callSnapshot({ tabId: null, includeImage: null, save: null });
 
       expect(nulls).toEqual(omitted);
-      expect(inputs).toEqual([{}, {}]);
+      expect(inputs).toEqual([{ captureImage: false }, { captureImage: false }]);
     }),
   ).pipe(Effect.provide(layerTest)),
 );
@@ -1331,4 +1518,18 @@ it.effect("preserves missing and OAuth-shaped token responses when OAuth is unav
       });
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("returns a text-only snapshot without requiring screenshot bytes", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { screenshot: _screenshot, ...text } = snapshotResult;
+      const inputs = yield* serveSnapshots("mcp-text-only", text);
+      const result = yield* callSnapshot({ includeImage: false });
+      expect(result.isError).toBe(false);
+      expect(inputs).toEqual([{ captureImage: false }]);
+      expect(result.structuredContent).not.toHaveProperty("screenshot");
+      expect(result.content.some((entry) => entry.type === "image")).toBe(false);
+    }),
+  ).pipe(Effect.provide(layerTest)),
 );

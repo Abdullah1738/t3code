@@ -16,7 +16,9 @@ from pathlib import Path
 import re
 import sqlite3
 import subprocess
+import tempfile
 import time
+import traceback
 from urllib.parse import urlparse
 
 APPS = Path.home() / '.local/share/imessage-apps'
@@ -28,11 +30,12 @@ BRIDGE = str(Path.home() / '.local/share/spectrum-bridge/src/cli.ts')
 DUBAI = dt.timezone(dt.timedelta(hours=4))
 THEMES = {'noon': ('#feee00', '#16160f'), 'talabat': ('#ff5a00', '#201006'),
           'careem': ('#00df72', '#062c1b'), 'amazon': ('#ffb347', '#202326')}
-LANES = {'noon': ('minutes', 'nownow', 'supermall', 'main', 'food'),
+LANES = {'noon': ('minutes', 'nownow', 'supermall', 'main', 'food', 'marketplace'),
          'talabat': ('restaurants', 'mart', 'shops'), 'careem': ('food', 'quik', 'shops', 'box'),
          'amazon': ('same-day',)}
 NAMES = {'noon': 'noon', 'talabat': 'Talabat', 'careem': 'Careem', 'amazon': 'Amazon'}
 LABELS = {'minutes': 'Minutes', 'nownow': 'NowNow', 'supermall': 'Supermall', 'main': 'Main',
+          'marketplace': 'Marketplace',
           'restaurants': 'Food', 'mart': 'Mart', 'shops': 'Shops', 'food': 'Food',
           'quik': 'Quik', 'box': 'Box', 'same-day': 'Same-day'}
 
@@ -95,7 +98,7 @@ def image_url(value):
     return None
 
 
-def items(rows):
+def items(rows, *, private_notes=False):
     out = []
     for row in (rows or [])[:150]:
         if not isinstance(row, dict):
@@ -110,12 +113,13 @@ def items(rows):
         if price is None and row.get('price_minor') is not None:
             price = number(row['price_minor'])
             price = price / 100 if price is not None else None
-        # Choices are the server's own label (size, sauce, sides). Notes and
-        # special requests are the customer's free text and never reach a card.
+        # Free-text notes are opt-in for the owner's private card only.
         # Talabat allows 600 characters; keep them all so two long labels that differ only
         # at the end stay different. The bubble trims at display time.
         detail = next((text(row[k], 600) for k in ('detail', 'choices_text', 'choicesString', 'choices')
                        if isinstance(row.get(k), str) and row[k].strip()), None)
+        if private_notes and isinstance(row.get('notes'),str) and row['notes'].strip():
+            detail=(detail+'; ' if detail else '')+'Note: '+text(row['notes'],500)
         out.append({'name': name or (f'Item {ident}' if ident else 'Item details pending'),
                     'unresolved': bool(row.get('unresolved') or not name), 'detail': detail,
                     'qty': int(qty), 'price': price, 'line_total': amount(row.get('line_total')),
@@ -315,7 +319,7 @@ def lane(cfg, meta):
             return v
     if app == 'noon':
         order = cfg['order'].upper()
-        return 'nownow' if order.startswith('NN') else 'food' if order.startswith('F') else 'main' if order.startswith('N') else 'minutes'
+        return 'nownow' if order.startswith('NN') else 'food' if order.startswith('F') else 'marketplace' if order.startswith('N') else 'minutes'
     # Unknown Careem/Talabat vertical must not invent a food/grocery stage.
     return 'same-day' if app == 'amazon' else ''
 
@@ -330,13 +334,18 @@ def stage(data, food=False):
         current = 'unknown'
     if current == 'unknown':
         previous = data.get('last_confirmed_status', 'unknown')
-        if previous not in ('delivered', 'cancelled') or data.get('whole_order_complete') is not False:
+        if previous not in ('delivered', 'cancelled'):
             current = previous
     mapping = {'placed': 0, 'confirmed': 0, 'preparing': 1, 'packed': 1,
                'picked up': 2, 'out for delivery': 3 if food else 2,
                'nearby': 3 if food else 2, 'delivered': len(steps)-1}
     idx = mapping.get(current, -1)
     label = 'Cancelled' if current == 'cancelled' else 'Awaiting confirmation' if current == 'pending confirmation' else steps[idx] if idx >= 0 else 'Tracking pending'
+    if idx < 0 and current=='unknown':
+        if data.get('raw_status')=='processing':
+            label='Processing'
+        elif data.get('status_text') and not re.search(r'cancel|deliver|complet',data['status_text'],re.I):
+            label=text(data['status_text'],120)
     if current == 'preparing' and not food:
         # Preparing is not proof that packing has finished.
         steps[1] = label = 'Packing'
@@ -347,13 +356,17 @@ def stage(data, food=False):
 
 
 def eta(data, cfg):
-    checked = instant(data.get('checked_at'))
+    checked = instant(data.get('eta_observed_at') or data.get('checked_at'))
     # Resolve relative estimates against the observation, not render time.
     raw = text(data.get('eta_text'), 80)
     minutes = data.get('eta_relative_minutes')
+    marketplace=cfg.get('app')=='noon' and lane(cfg,{}) in ('main','supermall','marketplace')
+    if marketplace:
+        from noon_http_orders import marketplace_eta_minutes
+        minutes=marketplace_eta_minutes(raw)
     if type(minutes) not in (int, float) or not math.isfinite(minutes):
         minutes = None
-    if minutes is None and raw:
+    if minutes is None and raw and not marketplace:
         hours = re.search(r'(\d+)\s*(?:hr|hour)', raw, re.I)
         mins = re.search(r'(\d+)(?:\s*[-–]\s*(\d+))?\s*min', raw, re.I)
         if hours or mins:
@@ -380,14 +393,25 @@ def view(cfg, data, meta):
     store = text(meta.get('store') or cfg.get('store') or data.get('vendor_name'))
     if not store and ':' in cfg.get('label', ''):
         store = text(cfg['label'].split(':', 1)[0])
-    rows = items(meta.get('items'))
-    observed = items(data.get('manifest_items') or data.get('items'))
+    private_notes=cfg.get('for','owner')=='owner' and cfg.get('chat','owner')=='owner' and not meta.get('public')
+    rows = items(meta.get('items'),private_notes=private_notes)
+    observed = items(data.get('items') if data.get('items_complete') else data.get('manifest_items') or data.get('items'),private_notes=private_notes)
     if not rows or (observed and any(not i['unresolved'] for i in observed) and all(i['unresolved'] for i in rows)):
         rows = observed or rows
     else:
         rows = fill_details(rows, observed)
+    if private_notes and data.get('items_complete') and observed:
+        for row in rows:
+            matches=[i for i in observed if not i['unresolved'] and i['name']==row['name'] and i['qty']==row['qty']]
+            peers=[i for i in rows if i['name']==row['name'] and i['qty']==row['qty']]
+            if len(matches)==len(peers)==1:
+                detail=matches[0].get('detail') or ''
+                if '; Note: ' in detail and row.get('detail')==detail.split('; Note: ',1)[0]:
+                    row['detail']=detail
     rows = picks(rows)
     total = amount(meta.get('total') if meta.get('total') is not None else cfg.get('total'))
+    if total is None:
+        total = amount(data.get('total'))
     partial = bool(data.get('whole_order_complete') is False and (
         any(p.get('stage') == 'delivered' for p in data.get('partial_evidence', [])) or
         any(p.get('status') == 'delivered' for p in data.get('shipments', []))))
@@ -444,23 +468,28 @@ def markup(v):
 <footer><p id="freshness">{'Sample order' if v['sample'] else 'Latest tracking check'}<time datetime="{e(v['checked_at'])}"></time></p><button type="button" id="refresh">Refresh</button></footer>'''
 
 
-def page(v, url=None):
+def page(v, url=None, *, with_preview=True):
     title = v['brand'] + ' · ' + v['stage']
     preview = (url.rstrip('/') + '/' if url else '') + 'preview.png'
     css, js = (ASSETS / 'card.css').read_text(), (ASSETS / 'card.js').read_text()
     boot = json.dumps(v, ensure_ascii=False).replace('<', '\\u003c')
+    image_meta = (f'<meta property="og:image" content="{html.escape(preview, quote=True)}">'
+                  '<meta property="og:image:width" content="1200"><meta property="og:image:height" content="630">') if with_preview else ''
     return f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark"><meta name="robots" content="noindex,nofollow">
 <title>{html.escape(title)}</title><meta property="og:title" content="{html.escape(title, quote=True)}">
 <meta property="og:description" content="{html.escape(description(v), quote=True)}">
-<meta property="og:image" content="{html.escape(preview, quote=True)}"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630">
+{image_meta}
 <style>{css}</style></head><body style="--field:{v['theme'][0]};--field-ink:{v['theme'][1]}">
 <main aria-label="Delivery tracking">{markup(v)}</main><script id="initial" type="application/json">{boot}</script><script>{js}</script></body></html>'''
 
 
 def preview(path, v):
-    from PIL import Image, ImageDraw, ImageFont
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return preview_chrome(path)
     im = Image.new('RGB', (1200, 630), v['theme'][0])
     draw = ImageDraw.Draw(im)
     def font(size):
@@ -487,21 +516,47 @@ def preview(path, v):
     tmp = path.with_name('preview.tmp.png')
     im.save(tmp)
     tmp.replace(path)
+    return True
+
+
+def preview_chrome(path):
+    # The local page is already built. Do not fetch product images over the network.
+    shells = sorted((Path.home() / '.robob/tools/chrome-headless-shell').glob('*/*/chrome-headless-shell'), reverse=True)
+    for shell in shells:
+        try:
+            with tempfile.TemporaryDirectory(prefix='delivery-preview-') as tmp:
+                image = Path(tmp) / 'preview.png'
+                result = subprocess.run([str(shell), '--headless', '--disable-gpu', '--hide-scrollbars',
+                                         '--disable-background-networking', '--host-resolver-rules=MAP * ~NOTFOUND',
+                                         '--window-size=1200,630', f'--screenshot={image}',
+                                         (path.parent / 'index.html').resolve().as_uri()],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                if result.returncode == 0 and image.is_file() and image.stat().st_size:
+                    image.replace(path)
+                    return True
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return False
 
 
 def build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
     folder = Path(outdir) if outdir else APPS / slug(cfg['app'], cfg['order'])
     folder.mkdir(parents=True, exist_ok=True)
     metadata = {**({} if public else read(folder / 'items.json')), **cfg.get('card_meta', {}), **(meta or {})}
-    v = view(cfg, data, metadata)
+    v = view(cfg, data, {**metadata, 'public':public})
     # JSON refresh and static fallback use the same projection.
     atomic(folder / 'status.json', v)
-    atomic(folder / 'index.html', page(v, url))
     fingerprint = hashlib.sha256(json.dumps({k: v[k] for k in ('brand', 'store', 'big', 'sub', 'stage', 'count', 'total', 'sample', 'summary')}, sort_keys=True).encode()).hexdigest()
-    if read(folder / 'preview-state.json').get('hash') != fingerprint or not (folder / 'preview.png').exists():
-        preview(folder / 'preview.png', v)
-        atomic(folder / 'preview-state.json', {'hash': fingerprint})
-    return {'slug': folder.name, 'dir': str(folder), 'stage': v['stage'], 'items': v['count']}
+    preview_path = folder / 'preview.png'
+    current = read(folder / 'preview-state.json').get('hash') == fingerprint and preview_path.exists()
+    atomic(folder / 'index.html', page(v, url, with_preview=current))
+    if not current:
+        current = preview(preview_path, v)
+        if current:
+            atomic(folder / 'preview-state.json', {'hash': fingerprint})
+            atomic(folder / 'index.html', page(v, url))
+    return {'slug': folder.name, 'dir': str(folder), 'stage': v['stage'], 'items': v['count'],
+            'has_preview': bool(current)}
 
 
 def route():
@@ -754,14 +809,14 @@ def prune_completed_shares():
 
 
 def share_days(cfg):
-    days = 7 if cfg.get('app') == 'amazon' or cfg.get('vertical') in ('main', 'supermall') else 2
+    days = 7 if cfg.get('app') == 'amazon' or cfg.get('vertical') in ('main', 'supermall', 'marketplace') else 2
     promised = instant(cfg.get('eta'))
     if promised:
         days = max(days, math.ceil((promised.timestamp()-time.time())/86400)+2)
     return min(30, max(1, days))
 
 
-def sync(cfg, data, *, send=False):
+def sync(cfg, data, *, send=False, recover=False):
     settings = cfg.get('delivery_card')
     if not isinstance(settings, dict):
         return {'status': 'legacy_not_enrolled'}
@@ -801,13 +856,13 @@ def sync(cfg, data, *, send=False):
                     state['status'] = 'failed:dropped_by_bridge'
             except (OSError, ValueError, sqlite3.Error):
                 pass  # unreadable: keep what the ack said
-        if not send or settings.get('held') or settings.get('skip_send'):
+        if not send or settings.get('held') or (settings.get('skip_send') and not recover):
             if state.get('status') != 'sent':
                 state['status'] = 'held:payment_unconfirmed' if settings.get('held') else 'skipped' if settings.get('skip_send') else state.get('status', 'not_sent')
         elif state.get('status') != 'sent':
             # Never deliver a forgotten placement days later after a restart.
             registered = instant(cfg.get('registered_at'))
-            if not registered or time.time() - registered.timestamp() > 6*3600:
+            if not recover and (not registered or time.time() - registered.timestamp() > 6*3600):
                 state['status'] = 'expired:send_manually'
             else:
                 try:
@@ -820,7 +875,9 @@ def sync(cfg, data, *, send=False):
                         published = bridge(['publish' if recipient == 'owner' else 'share', '--app', rendered['slug'],
                                             *(['--days', str(share_days(cfg))] if recipient != 'owner' else [])],
                                            timeout=65 if recipient != 'owner' else 12)
-                        if published.get('metadataWarnings'):
+                        warnings = published.get('metadataWarnings') or []
+                        # Missing imagery is expected only when both renderers failed.
+                        if any(w != 'missing og:image' or rendered['has_preview'] for w in warnings):
                             raise ValueError('card_metadata_incomplete')
                         url = published.get('url')
                         if not isinstance(url, str) or not url.startswith('https://'):
@@ -841,6 +898,8 @@ def sync(cfg, data, *, send=False):
                             # A public rich link also works for recipients who
                             # have not installed Robob Cards.
                             state['send_args'] = ['send', '--to', recipient, '--text=' + state['url'], '--session', session, '--key', dedupe]
+                        if recover:
+                            final, state['send_args'] = reconcile(state['send_args'], state)
                     else:
                         # A retry: the bridge outbox says whether the last attempt got through.
                         final, state['send_args'] = reconcile(state['send_args'], state)
@@ -915,12 +974,13 @@ def repair_link(cfg, data):
         return {'status':'sent','url':state['url']}
 
 
-def safe_sync(cfg, data, *, send=False):
+def safe_sync(cfg, data, *, send=False, recover=False):
     try:
-        return sync(cfg, data, send=send)
+        return sync(cfg, data, send=send, recover=recover)
     except Exception as exc:
         # Card failures must not suppress tracker evidence or financial receipts.
-        return {'status': 'failed:' + type(exc).__name__}
+        traceback.print_exc()
+        return {'status': 'failed:' + type(exc).__name__ + ':' + str(exc)}
 
 
 def main(argv=None):
@@ -932,6 +992,7 @@ def main(argv=None):
     ap.add_argument('--data-file', help='fixture/status JSON; never contacts a provider')
     ap.add_argument('--vertical')
     ap.add_argument('--send', action='store_true', help='retry an enrolled card with its retained idempotency key')
+    ap.add_argument('--recover-send', action='store_true', help='explicitly recover a suppressed or expired enrolled placement card')
     ap.add_argument('--repair-link', action='store_true', help='explicitly send a replacement for a changed public URL')
     ap.add_argument('--loop', type=int, default=0, help='legacy compatibility; watcher hooks are preferred')
     ap.add_argument('--hours', type=float, default=4)
@@ -940,8 +1001,10 @@ def main(argv=None):
         ap.error('Invalid order ID')
     cfg = read(ROOT / 'orders' / f'order-{a.app}-{a.order.lower()}.json')
     cfg.update(app=a.app, order=a.order)
-    if (a.send or a.repair_link) and (a.data_file or a.dir or not cfg.get('delivery_card')):
+    if (a.send or a.recover_send or a.repair_link) and (a.data_file or a.dir or not cfg.get('delivery_card')):
         ap.error('--send requires a registered, enrolled order; no fixture or custom directory')
+    if sum((a.send, a.recover_send, a.repair_link)) > 1:
+        ap.error('choose only one send or repair action')
     if a.vertical:
         cfg['vertical'] = a.vertical
     meta = read(a.items_file) if a.items_file else {}
@@ -957,8 +1020,8 @@ def main(argv=None):
                 raise SystemExit('order-watch status failed')
             data = json.loads(p.stdout)
         result = build(cfg, data, meta, a.dir)
-        if a.send:
-            result['delivery_card'] = safe_sync(cfg, data, send=True)
+        if a.send or a.recover_send:
+            result['delivery_card'] = safe_sync(cfg, data, send=True, recover=a.recover_send)
         if a.repair_link:
             result['repair'] = repair_link(cfg,data)
         print(json.dumps(result), flush=True)

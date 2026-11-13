@@ -295,13 +295,29 @@ const ChatRow = memo(
 
 function sameRow(left: IMessageChatRow, right: IMessageChatRow): boolean {
   if (left === right) return true;
+  if (left.kind === "reply" && right.kind === "reply") {
+    const { send: leftSend, ...leftRest } = left;
+    const { send: rightSend, ...rightRest } = right;
+    return sameFields(leftRest, rightRest) && sameFields(leftSend, rightSend);
+  }
   if (left.kind !== "agent" || right.kind !== "agent") return sameFields(left, right);
-  const { steps: leftSteps, ...leftRest } = left;
-  const { steps: rightSteps, ...rightRest } = right;
+  const { steps: leftSteps, ...leftRest } = left.turn;
+  const { steps: rightSteps, ...rightRest } = right.turn;
   return (
+    left.id === right.id &&
     sameFields(leftRest, rightRest) &&
     leftSteps.length === rightSteps.length &&
-    leftSteps.every((step, index) => sameFields(step, rightSteps[index]!))
+    leftSteps.every((step, index) => sameStep(step, rightSteps[index]!))
+  );
+}
+
+function sameStep(left: IMessageAgentStep, right: IMessageAgentStep): boolean {
+  const { send: leftSend, ...leftRest } = left;
+  const { send: rightSend, ...rightRest } = right;
+  return (
+    sameFields(leftRest, rightRest) &&
+    (leftSend === rightSend ||
+      (leftSend !== undefined && rightSend !== undefined && sameFields(leftSend, rightSend)))
   );
 }
 
@@ -344,16 +360,55 @@ function ChatRowContent(props: ChatRowProps) {
           caption={row.voice && row.text !== "" ? "Voice message" : null}
         />
       );
-    case "reply":
+    case "reply": {
+      const { send } = row;
+      const text = [send.file, send.text].filter((part) => part !== null && part !== "").join("\n");
       return (
         <Bubble
           side="reply"
           palette={palette}
-          text={row.text}
-          sender={null}
+          text={text}
+          sender={send.to === null ? null : `To ${send.to}`}
           quote={null}
-          caption={null}
+          caption={
+            send.state === "failed" ? "Send failed" : send.state === "sending" ? "Sending…" : null
+          }
         />
+      );
+    }
+    case "injected":
+      return (
+        <View
+          className="my-2 w-[86%] self-center rounded-xl px-3.5 py-2.5"
+          style={{ backgroundColor: palette.agent }}
+        >
+          <Text className="text-xs font-t3-semibold" style={{ color: palette.agentInk }}>
+            From another agent
+          </Text>
+          <Text
+            selectable
+            numberOfLines={4}
+            className="mt-0.5 text-[13px] leading-[18px]"
+            style={{ color: palette.agentInk }}
+          >
+            {row.text}
+          </Text>
+        </View>
+      );
+    case "note":
+      return (
+        <View
+          className="mb-1 mt-1.5 max-w-[78%] self-end rounded-xl px-3 py-2"
+          style={{ backgroundColor: palette.note }}
+        >
+          <Text
+            selectable
+            className="text-[13px] leading-[18px]"
+            style={{ color: palette.noteInk }}
+          >
+            {row.text}
+          </Text>
+        </View>
       );
     case "event":
       return (
@@ -414,7 +469,8 @@ function AgentRow(props: {
   readonly onOpenThread: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const summary = imessageAgentSummary(props.row);
+  const { turn } = props.row;
+  const summary = imessageAgentSummary(turn);
   return (
     <View className="self-end">
       <Pressable
@@ -440,9 +496,9 @@ function AgentRow(props: {
           className="mb-1.5 mt-1 w-[92%] self-end rounded-xl px-4 py-3.5"
           style={{ backgroundColor: props.palette.raised }}
         >
-          {props.row.steps.length > 0 ? (
+          {turn.steps.length > 0 ? (
             <View className="gap-2">
-              {props.row.steps.map((step) => (
+              {turn.steps.map((step) => (
                 <AgentStep key={step.id} step={step} />
               ))}
             </View>
@@ -453,7 +509,7 @@ function AgentRow(props: {
             onPress={props.onOpenThread}
             className={cn(
               "flex-row items-center gap-1 self-start",
-              props.row.steps.length > 0 && "mt-3",
+              turn.steps.length > 0 && "mt-3",
             )}
           >
             <Text className="text-[13px] font-t3-medium" style={{ color: props.palette.link }}>

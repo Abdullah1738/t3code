@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as Struct from "effect/Struct";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import {
@@ -19,6 +20,7 @@ import {
   TurnItemId,
 } from "./baseSchemas.ts";
 import {
+  ScheduledTask,
   ScheduledTaskRunStatus,
   ScheduledTaskSchedule,
   ScheduledTaskUpsertSchedule,
@@ -43,6 +45,7 @@ import {
   ProviderOptionSelectionValue,
 } from "./model.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
+import { ModelSelectionRouting } from "./modelSelection.ts";
 
 const OrchestratorMcpPrompt = TrimmedNonEmptyString.check(Schema.isMaxLength(120_000)).annotate({
   description: "Complete task or message text for the target agent.",
@@ -116,7 +119,7 @@ export const OrchestratorMcpTarget = Schema.Struct({
   options: Schema.optional(
     OrchestratorMcpTargetOptions.annotate({
       description:
-        "Model options from orchestrator_capabilities. For the same provider instance and model, overrides individual inherited values; [] or {} clears them. Claude: {effort: 'max', fastMode: true}; Codex: {reasoningEffort: 'max', serviceTier: 'priority'}. Only use options advertised by the selected model.",
+        "Model options from orchestrator_capabilities. For the same provider instance and model, overrides individual inherited values; [] or {} clears them. Standard mode only: Claude {effort: 'max'}; Codex {reasoningEffort: 'max', serviceTier: 'default'}; never fast mode. Only use options advertised by the selected model.",
     }),
   ),
 });
@@ -184,6 +187,10 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
     description:
       "Wait budget for mode=wait only. Default 10 minutes. Elapsing it returns waitTimedOut=true on that call and does not cancel the child.",
   }),
+  idleTimeoutMs: Schema.optional(Schema.Finite).annotate({
+    description:
+      "No-progress limit for the child, including follow-ups. 0 or omitted uses 15 minutes; other values clamp to 1 minute–2 hours. Thinking and provider retries do not count as progress.",
+  }),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
   runtimeMode: Schema.optional(
     OrchestratorMcpRuntimeMode.annotate({
@@ -200,7 +207,30 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   childThreadId: ThreadId,
   childRunId: Schema.NullOr(RunId),
   childNodeId: NodeId,
+  partial: Schema.optional(Schema.Literal(false)),
+  currentRunId: Schema.optional(Schema.NullOr(RunId)),
+  currentRunStatus: Schema.optional(Schema.NullOr(OrchestrationV2RunStatus)),
   status: OrchestratorMcpDelegatedTaskStatus,
+  startedAt: Schema.optional(Schema.NullOr(Schema.String)).annotate({
+    description:
+      "The original child run's start time in ISO format, or null if it has not started.",
+  }),
+  retry: Schema.optional(
+    Schema.NullOr(
+      Schema.Struct({
+        state: Schema.Literals(["retrying", "resuming", "failed_transient"]),
+        lastError: Schema.String,
+        since: IsoDateTime,
+        attempt: Schema.Number,
+        delayMs: Schema.Number,
+        filesMayBePartlyWritten: Schema.Boolean,
+      }),
+    ),
+  ),
+  startPending: Schema.optional(Schema.Boolean).annotate({
+    description:
+      "True means the child's provider turn has not started yet (waiting for a server worker); it is not executing.",
+  }),
   workState: Schema.Literals(["working", "waiting_for_children", "result_available"]),
   hasPendingChildRuns: Schema.Boolean,
   latestTerminalRunId: Schema.NullOr(RunId),
@@ -209,13 +239,20 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   latestTerminalResultContextTransferId: Schema.NullOr(ContextTransferId),
   providerInstanceId: ProviderInstanceId,
   model: Schema.NullOr(Schema.String),
+  selectionRouting: Schema.optional(Schema.NullOr(ModelSelectionRouting)),
   options: Schema.optional(
     Schema.Array(ProviderOptionSelection).annotate({
       description:
         "Stored model option selections for the child run, or its thread before a run starts. Omitted selections use provider defaults.",
     }),
   ),
+  failureReason: Schema.optional(Schema.Literal("stalled")),
+  lastProgressAt: Schema.optional(Schema.NullOr(Schema.String)),
+  lastProgressKind: Schema.optional(Schema.NullOr(Schema.String)),
+  thinkingSince: Schema.optional(Schema.NullOr(Schema.String)),
   summary: Schema.NullOr(Schema.String),
+  resultLooksIncomplete: Schema.optional(Schema.Boolean),
+  incompleteReason: Schema.optional(Schema.String),
   resultContextTransferId: Schema.NullOr(ContextTransferId),
   hasPendingQuestion: Schema.Boolean.annotate({
     description:
@@ -233,6 +270,16 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   }),
 });
 export type OrchestratorMcpDelegateTaskResult = typeof OrchestratorMcpDelegateTaskResult.Type;
+
+export const OrchestratorMcpTaskStatusResult = Schema.Union([
+  OrchestratorMcpDelegateTaskResult,
+  OrchestratorMcpDelegateTaskResult.mapFields((fields) => ({
+    ...Struct.map(fields, Schema.optionalKey),
+    taskId: NodeId,
+    partial: Schema.Literal(true),
+  })),
+]);
+export type OrchestratorMcpTaskStatusResult = typeof OrchestratorMcpTaskStatusResult.Type;
 
 export const OrchestratorMcpTaskStatusInput = Schema.Struct({
   taskId: NodeId,
@@ -368,7 +415,8 @@ export const OrchestratorMcpThreadListResult = Schema.Struct({
 export type OrchestratorMcpThreadListResult = typeof OrchestratorMcpThreadListResult.Type;
 
 export const OrchestratorMcpThreadReadInput = Schema.Struct({
-  threadId: ThreadId,
+  /** Omit to read the calling thread (native harnesses don't know their own thread id). */
+  threadId: Schema.optional(ThreadId),
   itemId: Schema.optional(TurnItemId),
   textOffset: Schema.optional(NonNegativeInt),
   view: Schema.optional(Schema.Literals(["messages", "activity"])),
@@ -458,7 +506,10 @@ export type OrchestratorMcpThreadReadResult = typeof OrchestratorMcpThreadReadRe
 export const OrchestratorMcpThreadSendInput = Schema.Struct({
   threadId: ThreadId,
   message: OrchestratorMcpPrompt,
-  mode: Schema.optional(Schema.Literals(["auto", "queue", "steer", "restart"])),
+  mode: Schema.optional(Schema.Literals(["auto", "queue", "steer", "restart"])).annotate({
+    description:
+      "auto starts an idle thread, steers a fully active turn, or queues behind a turn that is not yet steerable. queue adds a separate turn; steer updates a running turn. restart requires a running provider turn and interrupts it before delivering the message as the next turn, including on Claude. Providers without native restart must support interrupt and queued messages; otherwise use t3_thread_interrupt, then send with auto after the run stops.",
+  }),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
 });
 export type OrchestratorMcpThreadSendInput = typeof OrchestratorMcpThreadSendInput.Type;
@@ -576,6 +627,8 @@ export const OrchestratorMcpScheduledTask = Schema.Struct({
   schedule: ScheduledTaskSchedule,
   nextRunAt: Schema.NullOr(IsoDateTime),
   lastRunStatus: ScheduledTaskRunStatus,
+  lastRunError: Schema.optional(ScheduledTask.fields.lastRunError),
+  missedRuns: ScheduledTask.fields.missedRuns,
   webhookUrl: Schema.optional(Schema.String).annotate({
     description:
       "Public URL to give the sender. Absent when this environment has no T3 Connect managed tunnel; the user must enable T3 Connect remote access first.",
@@ -674,6 +727,8 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
     code: Schema.Literals([
       "capability_denied",
       "parent_not_active",
+      "caller_unresolved",
+      "delegation_timeout",
       "provider_unavailable",
       "model_unavailable",
       "runtime_mode_escalation_denied",

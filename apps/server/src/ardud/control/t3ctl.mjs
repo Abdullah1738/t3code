@@ -1,13 +1,34 @@
 #!/usr/bin/env node
 // t3ctl: shell access to the ardud control API. Prints JSON unless --text.
-import { randomUUID } from "node:crypto";
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
+import * as NodeNet from "node:net";
 import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeURL from "node:url";
 import * as NodeUtil from "node:util";
 
 import { ControlClient, SHARED_TOKEN_FILE, componentTokenFile } from "./client.mjs";
+
+// Like outboundHttp.ts, ignore macOS peer-reset EINVAL for undici's optional QoS hint.
+export function ignoreMacosTypeOfServiceEinval(
+  // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone Node CLI; no Effect runtime.
+  platform = process.platform,
+  socketPrototype = NodeNet.Socket.prototype,
+) {
+  if (platform !== "darwin") return;
+  const setTypeOfService = socketPrototype.setTypeOfService;
+  if (typeof setTypeOfService !== "function") return;
+  socketPrototype.setTypeOfService = function (...args) {
+    try {
+      return setTypeOfService.apply(this, args);
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "EINVAL") return this;
+      throw error;
+    }
+  };
+}
+ignoreMacosTypeOfServiceEinval();
 
 const TOKEN_FILE = componentTokenFile("t3ctl");
 const DEFAULT_REPO = "/Volumes/ExternalSSD/t3code-fork";
@@ -39,6 +60,7 @@ const HELP = `t3ctl <command> [options]
   archive-if-idle THREAD [--session NATIVE_SESSION_ID]   exits 3 when refused (thread left alone)
   events [--thread ID] [--origin O] [--types a,b] [--after SEQ]
   desktop-lease status
+  harness-cutover plan|run|status       plan, start/resume the paced job, or inspect cutover
   desktop-lease acquire --task ID --scope TARGET --mode native|cua-driver [--driver D --native-id ID --agent-id ID]
   desktop-lease heartbeat|release --ticket TICKET [--driver D --native-id ID --agent-id ID]
   desktop-lease reconcile --ticket TICKET --evidence TEXT   requires environment:maintain
@@ -65,7 +87,10 @@ export async function checkLive(commit, { health, repo = DEFAULT_REPO }) {
   } catch {
     return { commit, buildCommit: null, live: null, reason: "health unavailable" };
   }
-  if (response?.ok !== true || response?.status !== "healthy") {
+  if (
+    response?.ok !== true ||
+    !["healthy", "degraded", "recovered-unverified"].includes(response?.status)
+  ) {
     return { commit, buildCommit: null, live: null, reason: "invalid health response" };
   }
   const buildCommit = response.buildCommit;
@@ -367,6 +392,19 @@ async function main() {
         page = await client.usage({ ...filters, cursor });
       }
     }
+    case "harness-cutover": {
+      const action = need(args[0], "harness-cutover action");
+      if (!["plan", "run", "status"].includes(action))
+        throw new Error(`unknown harness-cutover action ${action}`);
+      const result = await client.request(
+        action === "run" ? "POST" : "GET",
+        `/harness-cutover/${action}`,
+        action === "run" ? {} : undefined,
+      );
+      print(result);
+      if (action === "run" && result?.cutover?.refusals?.length > 0) process.exitCode = 3;
+      return;
+    }
     case "desktop-lease": {
       const action = need(args[0], "desktop-lease action");
       const path = "/desktop-lease";
@@ -480,7 +518,7 @@ async function main() {
       const text = need(args.slice(1).join(" "), "TEXT");
       const requestId =
         flags["request-id"] === undefined
-          ? randomUUID()
+          ? NodeCrypto.randomUUID()
           : need(flags["request-id"], "--request-id");
       const controller = new AbortController();
       const abort = () => controller.abort();

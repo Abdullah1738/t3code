@@ -11,6 +11,7 @@ export type ThreadRelationshipKind = "parent" | "fork" | "subagent" | "transfer"
 export interface ThreadRelationshipNode {
   readonly threadId: ThreadId;
   readonly thread: OrchestrationV2ThreadShell | null;
+  /** Confirmed deletion, never absence from a partial shell collection. */
   readonly missing: boolean;
 }
 
@@ -61,12 +62,15 @@ export function deriveThreadRelationshipGraph(input: {
   }
   const threads = [...threadsById.values()];
   const nodes = new Map<ThreadId, ThreadRelationshipNode>(
-    threads.map((thread) => [thread.id, { threadId: thread.id, thread, missing: false }]),
+    threads.map((thread) => [
+      thread.id,
+      { threadId: thread.id, thread, missing: thread.deletedAt != null },
+    ]),
   );
   const edgesByKey = new Map<string, ThreadRelationshipEdge>();
   const ensureNode = (threadId: ThreadId) => {
     if (!nodes.has(threadId)) {
-      nodes.set(threadId, { threadId, thread: null, missing: true });
+      nodes.set(threadId, { threadId, thread: null, missing: false });
     }
   };
   const addEdge = (edge: ThreadRelationshipEdge) => {

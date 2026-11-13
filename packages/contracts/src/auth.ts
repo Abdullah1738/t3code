@@ -285,6 +285,12 @@ export const AuthClientSession = Schema.Struct({
   lastConnectedAt: Schema.NullOr(Schema.DateTimeUtc),
   connected: Schema.Boolean,
   current: Schema.Boolean,
+  // ardud:
+  /**
+   * Whether the session carries the owner claim (see `ardud/ownerStanding.ts`).
+   * Absent when the server does not say: an older server, or a change event.
+   */
+  owner: Schema.optionalKey(Schema.Boolean),
 });
 export type AuthClientSession = typeof AuthClientSession.Type;
 
@@ -388,6 +394,12 @@ export const AuthSessionState = Schema.Struct({
   permissions: authScopeResponseFields.permissions,
   sessionMethod: Schema.optionalKey(ServerAuthSessionMethod),
   expiresAt: Schema.optionalKey(Schema.DateTimeUtc),
+  // ardud:
+  /**
+   * Whether this session carries the owner claim: what the board's owner
+   * actions check. Absent when signed out, or from a server that does not say.
+   */
+  owner: Schema.optionalKey(Schema.Boolean),
 });
 export type AuthSessionState = typeof AuthSessionState.Type;
 

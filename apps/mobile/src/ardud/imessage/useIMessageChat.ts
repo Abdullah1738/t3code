@@ -1,6 +1,7 @@
 import { useAtomMount } from "@effect/atom-react";
 import {
   buildIMessageChatRows,
+  imessageRowsAtLevel,
   groupIMessageThreads,
   imessageThreadInput,
   sortIMessageChats,
@@ -107,13 +108,18 @@ export function useIMessageThreadRows(
     ? (thread.runtime?.activeRunId ?? null)
     : null;
   const { previousDayKey, namedSenders } = options;
+  // The phone shows the conversation plus system lines and other agents' prompts; each
+  // turn's notes and steps open in place under its chip.
   const rows = useMemo(
     () =>
-      buildIMessageChatRows(imessageTimelineEntries(visibleTurnItems), {
-        previousDayKey,
-        namedSenders,
-        activeRunId,
-      }),
+      imessageRowsAtLevel(
+        buildIMessageChatRows(imessageTimelineEntries(visibleTurnItems), {
+          previousDayKey,
+          namedSenders,
+          activeRunId,
+        }).rows,
+        "system",
+      ),
     [visibleTurnItems, previousDayKey, namedSenders, activeRunId],
   );
   return { rows, status, error };

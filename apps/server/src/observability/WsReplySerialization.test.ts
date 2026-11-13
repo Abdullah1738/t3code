@@ -1,9 +1,53 @@
+// @effect-diagnostics nodeBuiltinImport:off - verify the bytes persisted to the log.
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import { describe, expect, it } from "@effect/vitest";
 import { RpcSerialization } from "effect/rpc";
 
+import * as LargeReplyLog from "./LargeReplyLog.ts";
 import * as WsReplySerialization from "./WsReplySerialization.ts";
 
 describe("WebSocket reply serialization", () => {
+  it("refuses encoding a giant snapshot as a final transport backstop", () => {
+    const entries: unknown[] = [];
+    const parser = WsReplySerialization.wrap(
+      RpcSerialization.json,
+      { record: (entry) => entries.push(entry) },
+      new Set(["kanban.subscribe"]),
+    ).makeUnsafe();
+    parser.decode(
+      JSON.stringify({ _tag: "Request", id: "big", tag: "kanban.subscribe", payload: {} }),
+    );
+    expect(() =>
+      parser.encode({
+        _tag: "Chunk",
+        requestId: "big",
+        values: [{ cards: Array(20).fill({ description: "x".repeat(1024 * 1024) }) }],
+      }),
+    ).toThrow("16 MiB limit");
+    expect(entries).toMatchObject([{ kind: "ws", name: "kanban.subscribe", rejected: true }]);
+  });
+  it("includes the thread id for rejected thread subscription snapshots", () => {
+    const entries: unknown[] = [];
+    const parser = WsReplySerialization.wrap(
+      RpcSerialization.json,
+      { record: (entry) => entries.push(entry) },
+      new Set(["orchestration.subscribeThread"]),
+    ).makeUnsafe();
+    parser.decode(
+      JSON.stringify({
+        _tag: "Request",
+        id: "thread",
+        tag: "orchestration.subscribeThread",
+        payload: { threadId: "thread:long" },
+      }),
+    );
+    expect(() =>
+      parser.encode({ _tag: "Chunk", requestId: "thread", values: ["x".repeat(17 * 1024 * 1024)] }),
+    ).toThrow("16 MiB limit");
+    expect(entries).toMatchObject([{ threadId: "thread:long", rejected: true }]);
+  });
   it("records UTF-8 bytes without encoding a response twice", () => {
     const payload = { _tag: "Exit", body: "🔒".repeat(300_000), token: "private" };
     const original = RpcSerialization.json.makeUnsafe().encode(payload)!;
@@ -70,32 +114,59 @@ describe("WebSocket reply serialization", () => {
     ]);
   });
 
-  it("carries the request's thread and discussion ids, not its payload", () => {
-    const entries: unknown[] = [];
-    const parser = WsReplySerialization.wrap(
-      RpcSerialization.json,
-      { record: (entry) => entries.push(entry) },
-      new Set(["discussion.get"]),
-    ).makeUnsafe();
-    parser.decode(
-      JSON.stringify({
-        _tag: "Request",
-        id: "7",
-        tag: "discussion.get",
-        payload: { threadId: "thread-1", discussionId: "disc-1", body: "private" },
-      }),
-    );
-    const small = parser.encode({ _tag: "Chunk", requestId: "7", values: ["small"] });
-    const exit = parser.encode({ _tag: "Exit", requestId: "7", exit: "y".repeat(1024 * 1024) });
-    expect(small).toBeDefined();
-    expect(entries).toEqual([
-      {
-        kind: "ws",
-        name: "discussion.get",
-        bytes: Buffer.byteLength(exit!),
-        threadId: "thread-1",
-        discussionId: "disc-1",
-      },
-    ]);
+  it("never writes unvalidated ID fields or other request and response text to disk", () => {
+    const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "ws-reply-"));
+    const filePath = NodePath.join(directory, "large-replies.ndjson");
+    try {
+      const parser = WsReplySerialization.wrap(
+        RpcSerialization.json,
+        LargeReplyLog.make(filePath),
+        new Set(["kanban.wiki", "discussion.get"]),
+      ).makeUnsafe();
+      const payloads = [
+        {
+          threadId: "secret-thread-argument",
+          discussionId: "secret-discussion-argument",
+          token: "secret-token",
+        },
+        { threadId: { value: "secret-nested-thread" }, discussionId: ["secret-nested-discussion"] },
+        { threadId: "thread-1", discussionId: "disc-1", body: "secret-body" },
+      ];
+      const lengths = payloads.map((payload, index) => {
+        parser.decode(
+          JSON.stringify({
+            _tag: "Request",
+            id: String(index),
+            tag: index === 2 ? "discussion.get" : "kanban.wiki",
+            payload,
+          }),
+        );
+        const encoded = parser.encode({
+          _tag: "Exit",
+          requestId: String(index),
+          exit: `secret-response-${"y".repeat(1024 * 1024)}`,
+        });
+        return Buffer.byteLength(encoded!);
+      });
+      const text = NodeFS.readFileSync(filePath, "utf8");
+      expect(text).not.toContain("secret");
+      expect(text).not.toContain("thread-1");
+      expect(text).not.toContain("disc-1");
+      expect(
+        text
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line)),
+      ).toEqual(
+        lengths.map((bytes, index) => ({
+          at: expect.any(String),
+          kind: "ws",
+          name: index === 2 ? "discussion.get" : "kanban.wiki",
+          bytes,
+        })),
+      );
+    } finally {
+      NodeFS.rmSync(directory, { recursive: true });
+    }
   });
 });

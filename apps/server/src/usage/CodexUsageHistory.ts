@@ -1,4 +1,4 @@
-import { ModelSelection } from "@t3tools/contracts";
+import { RecordedModelSelection } from "@t3tools/contracts";
 import type { UsageSpeed } from "@t3tools/provider-core/server/usage";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
@@ -8,6 +8,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import { firstRunningSelectionSql } from "../ardud/persistence/historyArchiveSql.ts";
 import { getCodexServiceTierOptionValue } from "../codexModelOptions.ts";
 
 export class CodexUsageHistoryReadError extends Schema.TaggedError<CodexUsageHistoryReadError>()(
@@ -19,7 +20,7 @@ export class CodexUsageHistoryReadError extends Schema.TaggedError<CodexUsageHis
   }
 }
 
-const decodeSelection = Schema.decodeUnknownOption(Schema.fromJsonString(ModelSelection));
+const decodeSelection = Schema.decodeUnknownOption(Schema.fromJsonString(RecordedModelSelection));
 const encodeTurnIds = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)));
 
 export interface CodexUsageHistoryRequest {
@@ -60,19 +61,7 @@ const make = Effect.gen(function* () {
     }>`
       SELECT json_extract(attempt.payload_json, '$.nativeThreadId') AS native_thread_id,
         json_extract(turn.payload_json, '$.nativeTurnRef.nativeId') AS native_turn_id,
-        (
-          SELECT json_extract(event.payload_json, '$.modelSelection')
-          FROM orchestration_events AS event
-          WHERE event.aggregate_kind = 'thread'
-            AND event.application_event_version = 2
-            AND event.stream_id = attempt.thread_id
-            AND event.event_type = 'run.updated'
-            AND json_extract(event.payload_json, '$.id') = attempt.run_id
-            AND json_extract(event.payload_json, '$.activeAttemptId') = attempt.attempt_id
-            AND json_extract(event.payload_json, '$.status') = 'running'
-          ORDER BY event.sequence
-          LIMIT 1
-        ) AS selection_json
+        ${sql.literal(firstRunningSelectionSql("attempt"))} AS selection_json
       FROM orchestration_v2_projection_provider_turns AS turn
       LEFT JOIN orchestration_v2_projection_run_attempts AS attempt
         ON attempt.attempt_id = turn.run_attempt_id

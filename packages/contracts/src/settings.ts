@@ -1,5 +1,10 @@
 import { SshDeviceHostConfigs } from "./device.ts";
 import {
+  HarnessCutoverComplete,
+  HarnessSwitchTranscript,
+  HarnessSwitchThreadIds,
+} from "./ardud/harnessSwitch.ts";
+import {
   AuthOrchestrationOperateScope,
   AuthSettingsWriteScope,
   AuthProvidersManageScope,
@@ -14,6 +19,8 @@ import {
   ForwardCompatibleOptional,
   OmittedWhenNull,
   ProjectId,
+  PositiveInt,
+  NonNegativeInt,
   ThreadId,
   TrimmedNonEmptyString,
   TrimmedString,
@@ -1094,6 +1101,9 @@ export type StorageCleanupSettings = typeof StorageCleanupSettings.Type;
 export const ArdudHarnessMigrationSettings = Schema.Struct({
   selections: Schema.optionalKey(Schema.Literals(["off", "dryrun", "apply"])),
   allowConflicts: Schema.optionalKey(Schema.Boolean),
+  transcript: Schema.optionalKey(HarnessSwitchTranscript),
+  threadIds: Schema.optionalKey(HarnessSwitchThreadIds),
+  cutoverComplete: Schema.optionalKey(HarnessCutoverComplete),
 });
 export type ArdudHarnessMigrationSettings = typeof ArdudHarnessMigrationSettings.Type;
 
@@ -1128,6 +1138,16 @@ export const ServerSettings = Schema.Struct({
   // interrupted; recovery stops after three automatic continuations in a row.
   continueThreadsAfterServerUpdate: Schema.Boolean.pipe(
     Schema.withDecodingDefault(Effect.succeed(true)),
+  ),
+
+  restartPacing: Schema.Struct({
+    maxActive: PositiveInt.pipe(Schema.withDecodingDefault(Effect.succeed(4))),
+    spacingMs: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(20_000))),
+    loadHigh: Schema.Number.check(Schema.isGreaterThan(0)).pipe(
+      Schema.withDecodingDefault(Effect.succeed(1.5)),
+    ),
+  }).pipe(
+    Schema.withDecodingDefault(Effect.succeed({ maxActive: 4, spacingMs: 20_000, loadHigh: 1.5 })),
   ),
 
   enableAgentBrowserAccess: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
@@ -1447,6 +1467,13 @@ export const ServerSettingsPatch = Schema.Struct({
   responseStreamingMode: Schema.optionalKey(ResponseStreamingMode),
   enableProviderUpdateChecks: Schema.optionalKey(Schema.Boolean),
   continueThreadsAfterServerUpdate: Schema.optionalKey(Schema.Boolean),
+  restartPacing: Schema.optionalKey(
+    Schema.Struct({
+      maxActive: Schema.optionalKey(PositiveInt),
+      spacingMs: Schema.optionalKey(NonNegativeInt),
+      loadHigh: Schema.optionalKey(Schema.Number.check(Schema.isGreaterThan(0))),
+    }),
+  ),
   enableAgentBrowserAccess: Schema.optionalKey(Schema.Boolean),
   projectAgentBrowserAccessOverrides: Schema.optionalKey(
     Schema.Record(ProjectId, Schema.NullOr(Schema.Boolean)),

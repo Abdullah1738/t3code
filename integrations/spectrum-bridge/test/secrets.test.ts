@@ -263,7 +263,7 @@ describe("secret API routes", () => {
     const operations = store.pendingOutbox();
     expect(operations).toHaveLength(1);
     expect(operations[0]).toMatchObject({ kind: "conversation", text: "", sessionId: "current", generation: 5,
-      app: { url: result.url, caption: "Secure form", subcaption: request.purpose } });
+      app: { url: result.url, caption: "Secure form" } });
     const again = await h.call("/secret-request", request);
     expect(again.status).toBe(200);
     expect(await again.json()).toEqual(result);

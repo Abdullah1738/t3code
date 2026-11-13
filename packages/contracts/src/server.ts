@@ -604,6 +604,12 @@ export const ServerConfig = Schema.Struct({
   observability: ServerObservability,
   settings: ServerSettings,
   shellResumeCompletionMarker: Schema.optionalKey(Schema.Boolean),
+  shellSnapshotPagination: Schema.optionalKey(Schema.Boolean),
+  /**
+   * The client may keep a complete thread list resumable across sessions and resubscribes
+   * (same server version) instead of loading every page again.
+   */
+  shellResumeAcrossSessions: Schema.optionalKey(Schema.Boolean),
   shellRevealInFileManager: Schema.optionalKey(Schema.Boolean),
   shellRevealInFileManagerKind: Schema.optionalKey(FileManagerRevealKind),
   threadResumeCompletionMarker: Schema.optionalKey(Schema.Boolean),

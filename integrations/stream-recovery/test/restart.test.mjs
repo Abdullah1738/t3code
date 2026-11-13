@@ -153,7 +153,10 @@ test('buildRestartNote lists each lost subagent with model, session, start and p
 function fakeIo({ subs = [], delegated = [], runs = [], threads, later = {}, oc = {}, delivered = new Set(), installerMs = null, runAfter = [], held = {}, messages = {}, active = [] }) {
   const calls = { send: [], telegram: [], commands: [], saves: [] };
   const io = {
+    harnessCutoverStatus: async () => ({ active: false, completed: false, claimedThreadIds: [], claimedRunIds: [] }),
     OC_URL: 'http://oc',
+    assertReplicaFresh: () => {},
+    assertThreadInReplica: () => {},
     serverRuntime: () => ({ pid: 81615, procStartMs: Date.parse('2026-10-15T18:16:17Z'), readyMs: Date.parse('2026-10-15T18:17:53.316Z') }),
     openCodeRuntime: () => null,
     restartRunsSince: () => runs,
@@ -340,7 +343,7 @@ test('mixed native and delegated tasks share the prompt budget and use separate 
     assert.match(note, /delegated task "Task mixed".*task_status node:delegated-task:mixed/);
     assert.match(note, /pass its session id as the session to continue/);
     assert.match(note, /Robob will not deliver the native subagents' results, so nothing will wake you for them/);
-    assert.match(note, /Read a subagent's output with: curl/);
+    assert.match(note, /Read an OpenCode subagent's output with: curl/);
     assert.equal((note.match(/Original prompt \(start\)/g) ?? []).length, 2);
     assert.doesNotMatch(note, /n{1201}|d{1201}/);
     assert.match(calls.telegram[0].text, /1 background subagent\(s\) and 1 delegated task\(s\) interrupted/);
@@ -454,6 +457,7 @@ const threads = {
   pbdraft: { threadId: 'pbdraft', title: 'Crpko pbdraft cell', origin: null, archived: false },
   tc3: { threadId: 'tc3', title: 'Crpko tc3 cell', origin: 'imessage', archived: false },
 };
+for (const thread of Object.values(threads)) thread.model = { instanceId: 'opencode' };
 
 const scanArgs = (state, over = {}) => ({
   db: null, state, now: T0 + 10 * 60_000, sinceIso: iso(T0 - 3_600_000), floorMs: T0 - 6 * 3_600_000, log: () => {}, ...over,
@@ -490,6 +494,33 @@ test('restartScan sends one note per affected thread and one summary, then never
   assert.equal(calls.telegram.length, 1);
 });
 
+test('an unavailable or expired replica never causes recovery or consumes retries', async () => {
+  const fake = fakeIo({ subs: restartBurst(), threads });
+  const state = { handled: {}, servers: [] };
+  const unavailable = () => { throw Object.assign(new Error('replica stale'), { code: 'REPLICA_UNAVAILABLE' }); };
+  fake.io.assertReplicaFresh = unavailable;
+  await assert.rejects(restartScan(scanArgs(state), fake.io), /replica stale/);
+  assert.deepEqual(state.handled, {});
+  assert.equal(fake.calls.send.length + fake.calls.commands.length, 0);
+
+  let checks = 0;
+  fake.io.assertReplicaFresh = () => { if (++checks > 1) unavailable(); };
+  await assert.rejects(restartScan(scanArgs(state), fake.io), /replica stale/);
+  assert.equal(fake.calls.send.length + fake.calls.commands.length, 0);
+  assert.equal(Object.values(state.handled).some((h) => h.done), false);
+});
+
+test('a newer control thread defers recovery without sending or consuming failure retries', async () => {
+  const fake = fakeIo({ subs: restartBurst(), threads });
+  fake.io.assertThreadInReplica = () => {
+    throw Object.assign(new Error('thread newer than replica'), { code: 'REPLICA_UNAVAILABLE' });
+  };
+  const state = { handled: {}, servers: [] };
+  await assert.rejects(restartScan(scanArgs(state), fake.io), /thread newer than replica/);
+  assert.equal(fake.calls.send.length + fake.calls.commands.length, 0);
+  assert.equal(Object.values(state.handled).some((entry) => entry.done || entry.failures), false);
+});
+
 test('restartScan waits only briefly to settle, never for the installer, and never acts on a dry run or seed', async () => {
   assert.ok(RESTART_SETTLE_MS <= 30_000, 'resumes must be fast');
   const fresh = fakeIo({ subs: restartBurst(), threads });
@@ -513,6 +544,79 @@ test('restartScan waits only briefly to settle, never for the installer, and nev
   await restartScan(scanArgs(state, { seed: true }), seed.io);
   assert.equal(seed.calls.send.length + seed.calls.telegram.length, 0);
   assert.equal(state.handled['rs-20261015T181745Z'].summary, 'seeded');
+});
+
+test('cutover claims suppress restart notes, held queue release and late delegated notes after a watcher restart', async () => {
+  for (const cutover of [
+    { active: true, completed: false, claimedThreadIds: ['batch'], claimedRunIds: [] },
+    { active: false, completed: true, claimedThreadIds: ['batch'], claimedRunIds: [run('batch').run_id] },
+  ]) {
+    const fake = fakeIo({ runs: [run('batch')], threads, held: { batch: [{ held: true, run_id: 'held' }] },
+      delegated: [sub('late', 'batch', 0, { kind: 'delegated', childThreadId: 'child', taskRef: 'node:late' })] });
+    fake.io.harnessCutoverStatus = async () => cutover;
+    fake.io.activeSessions = async () => { throw new Error('must not query OpenCode for a claimed cut'); };
+    const state = { handled: {}, servers: [] };
+    await restartScan(scanArgs(state), fake.io);
+    await restartScan(scanArgs(JSON.parse(JSON.stringify(state))), fake.io);
+    assert.deepEqual(fake.calls.send, []);
+    assert.deepEqual(fake.calls.commands, []);
+  }
+});
+
+test('claim established while gathering prevents a restart send and queue release', async () => {
+  const fake = fakeIo({ runs: [run('batch')], threads, held: { batch: [{ held: true, run_id: 'held' }] } });
+  let reads = 0;
+  fake.io.harnessCutoverStatus = async () => ({ active: ++reads >= 3, completed: false, claimedThreadIds: ['batch'] });
+  await restartScan(scanArgs({ handled: {}, servers: [] }), fake.io);
+  assert.ok(reads >= 3);
+  assert.deepEqual(fake.calls.send, []);
+  assert.deepEqual(fake.calls.commands, []);
+});
+
+test('unavailable cutover status holds recovery without any side effect or handled receipt', async () => {
+  const fake = fakeIo({ runs: [run('batch')], threads });
+  fake.io.harnessCutoverStatus = async () => { throw new Error('status unavailable'); };
+  const state = { handled: {}, servers: [] };
+  await assert.rejects(() => restartScan(scanArgs(state), fake.io), /status unavailable/);
+  assert.deepEqual(fake.calls.send, []);
+  assert.deepEqual(fake.calls.commands, []);
+  assert.deepEqual(fake.calls.telegram, []);
+  assert.deepEqual(state.handled, {});
+});
+
+test('native-only Robob restart recovers without any OpenCode API and labels native child outcomes unknown', async () => {
+  const fake = fakeIo({ runs: [run('native', { instance_id: 'codex' })], threads: { native: {
+    threadId: 'native', title: 'Native', model: { instanceId: 'codex' }, nativeSessionId: 'native-uuid',
+  } }, subs: [sub('child', 'native', 0, { provider_thread_id: 'provider-thread:provider:codex:provider-instance:codex:native-thread:child-uuid', child_thread_id: 'native-child' })] });
+  for (const name of ['activeSessions', 'ocMessages', 'ocSession']) fake.io[name] = async () => { throw new Error(`unexpected ${name}`); };
+  const [report] = await restartScan(scanArgs({ handled: {}, servers: [] }), fake.io);
+  assert.equal(fake.calls.send.length, 1);
+  assert.equal(report.results[0].lostSubs[0].status, 'unknown');
+  assert.match(fake.calls.send[0].text, /outcome unknown.*t3_thread_read/);
+  assert.doesNotMatch(fake.calls.send[0].text, /api\/session|pass its session id/);
+});
+
+test('completed cutover claims do not suppress a later unrelated restart of the same thread', async () => {
+  const fake = fakeIo({ runs: [run('batch', { run_id: 'new-run' })], threads });
+  fake.io.harnessCutoverStatus = async () => ({ active: false, completed: true, claimedThreadIds: ['batch'], claimedRunIds: ['old-run'] });
+  await restartScan(scanArgs({ handled: {}, servers: [] }), fake.io);
+  assert.equal(fake.calls.send.length, 1);
+});
+
+test('a completed claim covers only its cut when a newer cut shares the same incident window', async () => {
+  const fake = fakeIo({ runs: [run('batch', { run_id: 'old-run' }), run('batch', { run_id: 'new-run', completed_at: iso(T0 + 20_000) })], threads });
+  fake.io.harnessCutoverStatus = async () => ({ active: false, completed: true, claimedThreadIds: ['batch'],
+    claimedRuns: [{ threadId: 'batch', runId: 'old-run' }] });
+  await restartScan(scanArgs({ handled: {}, servers: [] }), fake.io);
+  assert.equal(fake.calls.send.length, 1);
+});
+
+test('OpenCode-only restart does not classify native or unknown provider failures', () => {
+  const server = { service: 'opencode', pid: 2, readyMs: T0 + 10_000, procStartMs: T0 - 60_000 };
+  const [incident] = findRestartIncidents([], { serverStarts: [server], runs: [
+    run('oc'), run('claude', { instance_id: 'claudeAgent' }), run('codex', { instance_id: 'codex' }), run('unknown', { instance_id: null }),
+  ] });
+  assert.deepEqual(incident.runs.map((r) => r.thread_id), ['oc']);
 });
 
 test('restartScan reports delivered children for handoffs but skips stale children', async () => {
@@ -573,6 +677,7 @@ test('cancels from the stall watch interrupting a session are not a restart', as
 });
 
 const run = (threadId, over = {}) => ({
+  instance_id: 'opencode',
   run_id: `run:thread:${encodeURIComponent(threadId)}:ordinal:19`, thread_id: threadId, ordinal: 19,
   status: 'cancelled', requested_at: iso(T0 - 6 * 3_600_000), started_at: iso(T0 - 6 * 3_600_000 + 60_000),
   completed_at: iso(T0 + 7_000), ...over,
@@ -901,7 +1006,7 @@ test('durable message receipt covers a crash between send and state save', async
 
 test('fresh running turns and OpenCode-active parents get no note or queue changes', async () => {
   for (const over of [{ activeRunId: 'fresh', status: 'running' }, { nativeSessionId: 'ses_busy' }, { pendingRequest: { kind: 'question' } }]) {
-    const { io, calls } = fakeIo({ runs: [run('arch')], threads: { arch: { title: 'Arch', ...over } }, active: ['ses_busy'],
+    const { io, calls } = fakeIo({ runs: [run('arch')], threads: { arch: { title: 'Arch', model: { instanceId: 'opencode' }, ...over } }, active: ['ses_busy'],
       held: { arch: [{ held: true }] },
     });
     await restartScan(scanArgs({ handled: {}, servers: [] }), io);

@@ -1,3 +1,5 @@
+import * as NodeBuffer from "node:buffer";
+
 import {
   IsoDateTime,
   OrchestrationThreadSearchSource,
@@ -6,6 +8,7 @@ import {
   ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -26,13 +29,24 @@ export class ThreadSearchError extends Schema.TaggedError<ThreadSearchError>()(
   }
 }
 
-const SearchRequest = Schema.Struct({ pattern: Schema.String, limit: Schema.Int });
+const SEARCH_BUDGET_MS = 5_000;
+// 512 rows took 11–102 ms on first-pass ranges of the isolated 11 Nov backup.
+const SEARCH_SLICE_SIZE = 512;
+
+const SearchRequest = Schema.Struct({
+  pattern: Schema.String,
+  first: Schema.Int,
+  last: Schema.Int,
+  projectId: Schema.UndefinedOr(ProjectId),
+});
 const SearchRow = Schema.Struct({
   threadId: ThreadId,
   projectId: ProjectId,
   source: OrchestrationThreadSearchSource,
   matchText: Schema.String,
-  messageCreatedAt: Schema.NullOr(IsoDateTime),
+  messageCreatedAt: IsoDateTime,
+  messageId: Schema.String,
+  threadUpdatedAt: IsoDateTime,
 });
 
 function escapeLikePattern(value: string): string {
@@ -69,86 +83,118 @@ export class ThreadSearch extends Context.Service<
 >()("t3/orchestration-v2/ThreadSearch") {}
 
 /** @public Service construction is part of the canonical Effect module API. */
-export const make = Effect.gen(function* () {
+export const make = Effect.fn("ThreadSearch.make")(function* (
+  options: { readonly sliceSize?: number; readonly budgetMs?: number } = {},
+) {
   const sql = yield* SqlClient.SqlClient;
-
+  const sliceSize = Math.max(1, Math.floor(options.sliceSize ?? SEARCH_SLICE_SIZE));
+  const budgetNanos = BigInt(options.budgetMs ?? SEARCH_BUDGET_MS) * 1_000_000n;
   const searchRows = SqlSchema.findAll({
     Request: SearchRequest,
     Result: SearchRow,
-    execute: ({ pattern, limit }) => sql`
-      WITH candidate AS (
+    // CROSS JOIN keeps the bounded rowid range outermost even with project filters.
+    execute: ({ pattern, first, last, projectId }) => sql`
         SELECT
-          threads.thread_id,
-          threads.project_id,
-          messages.role,
-          json_extract(messages.payload_json, '$.text') AS match_text,
-          messages.created_at AS message_created_at,
-          messages.message_id,
-          threads.updated_at AS thread_updated_at
-        FROM orchestration_v2_projection_messages AS messages
-        INNER JOIN orchestration_v2_projection_threads AS threads
+          threads.thread_id AS "threadId",
+          threads.project_id AS "projectId",
+          messages.role AS source,
+          json_extract(messages.payload_json, '$.text') AS "matchText",
+          messages.created_at AS "messageCreatedAt",
+          messages.message_id AS "messageId",
+          threads.updated_at AS "threadUpdatedAt"
+        FROM orchestration_v2_projection_messages AS messages NOT INDEXED
+        CROSS JOIN orchestration_v2_projection_threads AS threads
           ON threads.thread_id = messages.thread_id
-        INNER JOIN projection_projects AS projects
+        CROSS JOIN projection_projects AS projects
           ON projects.project_id = threads.project_id
-        WHERE threads.deleted_at IS NULL
+        WHERE messages.rowid BETWEEN ${last} AND ${first}
+          AND threads.deleted_at IS NULL
           AND threads.archived_at IS NULL
           AND projects.deleted_at IS NULL
+          AND ${projectId === undefined ? sql`1` : sql`threads.project_id = ${projectId}`}
           AND messages.streaming = 0
           AND messages.role IN ('user', 'assistant')
           AND json_extract(messages.payload_json, '$.text') LIKE ${pattern} ESCAPE '!'
-      ),
-      ranked AS (
-        SELECT
-          thread_id,
-          project_id,
-          role AS source,
-          match_text,
-          message_created_at,
-          CASE role WHEN 'user' THEN 0 ELSE 1 END AS match_rank,
-          thread_updated_at,
-          ROW_NUMBER() OVER (
-            PARTITION BY thread_id
-            ORDER BY
-              CASE role WHEN 'user' THEN 0 ELSE 1 END ASC,
-              message_created_at DESC,
-              message_id ASC
-          ) AS thread_match_rank
-        FROM candidate
-      )
-      SELECT
-        thread_id AS "threadId",
-        project_id AS "projectId",
-        source,
-        match_text AS "matchText",
-        message_created_at AS "messageCreatedAt"
-      FROM ranked
-      WHERE thread_match_rank = 1
-      ORDER BY match_rank ASC, thread_updated_at DESC, thread_id ASC
-      LIMIT ${limit}
-    `,
+      `,
   });
 
   const search: ThreadSearch["Service"]["search"] = Effect.fn("ThreadSearch.search")(
     function* (input) {
-      // The scan reads every message, so run it on the reader worker rather
-      // than the event loop.
-      const rows = yield* sql
-        .withTransaction(
-          searchRows({
-            pattern: `%${escapeLikePattern(input.query)}%`,
-            limit: input.limit ?? 50,
-          }),
+      const started = yield* Clock.monotonicTimeNanos;
+      const matches = new Map<ThreadId, typeof SearchRow.Type>();
+      let cursor: number | undefined;
+      let searchedBackTo: typeof IsoDateTime.Type | undefined;
+      let complete = false;
+      do {
+        const slice = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              // Bound the rows before applying LIKE or project/thread filters. LIMIT on
+              // matching rows alone can still scan the entire table without yielding.
+              const scanned = yield* sql<{ rowid: number; createdAt: typeof IsoDateTime.Type }>`
+              SELECT rowid, created_at AS "createdAt"
+              FROM orchestration_v2_projection_messages
+              WHERE ${cursor === undefined ? sql`1` : sql`rowid < ${cursor}`}
+              ORDER BY rowid DESC LIMIT ${sliceSize}
+            `;
+              const first = scanned[0];
+              const last = scanned[scanned.length - 1];
+              const rows =
+                first === undefined || last === undefined
+                  ? []
+                  : yield* searchRows({
+                      pattern: `%${escapeLikePattern(input.query)}%`,
+                      first: first.rowid,
+                      last: last.rowid,
+                      projectId: input.projectId,
+                    });
+              return { scanned, rows };
+            }),
+          )
+          .pipe(
+            NodeSqliteClient.readOnly,
+            NodeSqliteClient.backgroundReads,
+            Effect.mapError(
+              (cause) =>
+                new ThreadSearchError({
+                  operation: Schema.isSchemaError(cause) ? "decode" : "query",
+                  cause,
+                }),
+            ),
+          );
+        for (const row of slice.scanned) {
+          if (searchedBackTo === undefined || row.createdAt < searchedBackTo)
+            searchedBackTo = row.createdAt;
+        }
+        for (const row of slice.rows) {
+          const previous = matches.get(row.threadId);
+          if (
+            previous === undefined ||
+            (row.source === "user" && previous.source !== "user") ||
+            (row.source === previous.source &&
+              (row.messageCreatedAt > previous.messageCreatedAt ||
+                (row.messageCreatedAt === previous.messageCreatedAt &&
+                  compareText(row.messageId, previous.messageId) < 0)))
+          ) {
+            matches.set(row.threadId, row);
+          }
+        }
+        cursor = slice.scanned[slice.scanned.length - 1]?.rowid;
+        complete = slice.scanned.length < sliceSize;
+        if (complete) break;
+        // A recent matching message does not settle the global order: another
+        // thread can have an older user match but a newer thread updated_at.
+        if ((yield* Clock.monotonicTimeNanos) - started >= budgetNanos) break;
+        yield* Effect.yieldNow;
+      } while (cursor !== undefined);
+      const rows = [...matches.values()]
+        .sort(
+          (a, b) =>
+            (a.source === b.source ? 0 : a.source === "user" ? -1 : 1) ||
+            compareText(b.threadUpdatedAt, a.threadUpdatedAt) ||
+            compareText(a.threadId, b.threadId),
         )
-        .pipe(
-          NodeSqliteClient.readOnly,
-          Effect.mapError(
-            (cause) =>
-              new ThreadSearchError({
-                operation: Schema.isSchemaError(cause) ? "decode" : "query",
-                cause,
-              }),
-          ),
-        );
+        .slice(0, input.limit ?? 50);
       return {
         matches: rows.map((row) => ({
           threadId: row.threadId,
@@ -157,11 +203,17 @@ export const make = Effect.gen(function* () {
           snippet: buildSearchSnippet(row.matchText, input.query),
           messageCreatedAt: row.messageCreatedAt,
         })),
+        complete,
+        ...(!complete && searchedBackTo !== undefined ? { searchedBackTo } : {}),
       };
     },
   );
-
   return ThreadSearch.of({ search });
 });
 
-export const layer = Layer.effect(ThreadSearch, make);
+function compareText(a: string, b: string): number {
+  // Match SQLite BINARY ordering, including IDs outside the BMP.
+  return NodeBuffer.Buffer.compare(NodeBuffer.Buffer.from(a), NodeBuffer.Buffer.from(b));
+}
+
+export const layer = Layer.effect(ThreadSearch, make());

@@ -33,6 +33,8 @@ export type MessageRecord =
       type: "assistant";
       content: AssistantContent[];
       finish?: string;
+      /** A native step continued into tools; separate from a text-only record's execution finish. */
+      continued?: boolean;
       /**
        * Whether this step called tools, when the backend can tell (Robob reads it from
        * OpenCode's step finish). `unknown` means the backend can't prove either way.
@@ -45,7 +47,7 @@ export type MessageRecord =
       time: { created: number; completed?: number };
       [key: string]: unknown;
     }
-  | { id: string; type: "idle"; outcome: "succeeded" | "failed" | "interrupted"; time: { created: number }; [key: string]: unknown }
+  | { id: string; type: "idle"; outcome: "succeeded" | "failed" | "interrupted"; firstTurnFailure?: boolean; modelError?: boolean; time: { created: number }; [key: string]: unknown }
   | { id: string; type: "agent-switched" | "model-switched" | "location-switched" | "synthetic" | "system" | "skill" | "shell" | "compaction"; time: { created: number }; [key: string]: unknown };
 
 /** A native attachment the router prepared; sent as an OpenCode 2 prompt file (`uri` data URL). */
@@ -295,7 +297,7 @@ export interface ChatBackend {
    * words alone, with the inbound id, and everything else as guidance.
    */
   prompt(id: string, directory: string, messageId: string, text: string, system?: string, files?: readonly FilePart[],
-    model?: { providerID: string; modelID: string; variant?: string }, owner?: OwnerWords): Promise<void>;
+    model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }, owner?: OwnerWords): Promise<void>;
   /**
    * Adds text to the session's running turn, never queueing behind it. Backends
    * without it (OpenChamber) keep follow-ups as their own turns.
@@ -617,10 +619,11 @@ export class OpenChamber implements ChatBackend {
     text: string,
     system = DEFAULT_CHANNEL_SYSTEM,
     files: readonly FilePart[] = [],
-    model?: { providerID: string; modelID: string; variant?: string },
+    model?: { providerID: string; modelID: string; variant?: string; instanceId?: string },
   ): Promise<void> {
     const session = `/api/session/${encodeURIComponent(id)}`;
-    if (model) {
+    // OpenCode takes `provider/model` only; another Robob instance's slashless id means nothing here.
+    if (model && model.providerID) {
       await this.request(`${session}/model`, {
         method: "POST", directory,
         body: { model: { providerID: model.providerID, id: model.modelID, ...(model.variant ? { variant: model.variant } : {}) } },

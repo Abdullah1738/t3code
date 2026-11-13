@@ -12,3 +12,9 @@ export function getCodexServiceTierOptionValue(
     (getModelSelectionBooleanOptionValue(modelSelection, "fastMode") === true ? "fast" : undefined)
   );
 }
+
+export function getCodexExecutionServiceTier(
+  _selection: ModelSelection | null | undefined,
+): string {
+  return "default";
+}

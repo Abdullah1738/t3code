@@ -13,8 +13,8 @@ SOURCE = Path(__file__).resolve().parent
 LIVE = Path.home() / '.local/share/robob-watch/watchers/money-cases'
 DATA = Path.home() / 'Documents/assistant/money-cases'
 BIN = Path.home() / '.local/bin/money-cases'
-SOURCE_FILES = ('cases.py', 'charges.py', 'check.sh', 'install.py', 'test_cases.py', 'test_charges.py',
-                'test_install.py', 'README.md')
+SOURCE_FILES = ('payments.py', 'cases.py', 'charges.py', 'check.sh', 'install.py', 'test_cases.py', 'test_charges.py',
+                'test_install.py', 'test_subscriptions.py', 'README.md', 'settings.json', 'order_lookup.py', 'test_accuracy.py')
 EXECUTABLE = ('cases.py', 'check.sh', 'install.py')
 
 
@@ -85,6 +85,10 @@ def install(source=SOURCE, live=LIVE, data=DATA, link=BIN, cli='robob-watch'):
             take_lock(lock, 'check still running after 65s; deployment not started')
             for name in SOURCE_FILES:
                 atomic_copy(source / name, live / name, name in EXECUTABLE)
+            helper = source / 'robob_readonly.py'
+            if not helper.exists():
+                helper = source.parents[1] / 'helpers/robob_readonly.py'
+            atomic_copy(helper, live / 'robob_readonly.py')
             link_cli(live / 'cases.py', link)
             definition = json.loads((source / 'watcher.json').read_text())
             existing = live / 'watcher.json'

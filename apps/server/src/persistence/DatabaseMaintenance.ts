@@ -11,6 +11,8 @@ import { isSqlError } from "effect/sql/SqlError";
 import * as EventStore from "../orchestration-v2/EventStore.ts";
 import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import { initializeHistoryArchive } from "../ardud/persistence/HistoryArchive.ts";
+import { baseArchiveFilename } from "../ardud/persistence/historyArchiveSql.ts";
 
 export class DatabaseMissingError extends Schema.TaggedError<DatabaseMissingError>()(
   "DatabaseMissingError",
@@ -182,6 +184,17 @@ const make = Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         // Held through compaction and VACUUM.
         yield* lockExclusively(databasePath);
+        const marker =
+          yield* sql`SELECT 1 FROM sqlite_schema WHERE name = 'ardud_history_base_archive'`;
+        const base =
+          marker.length === 0
+            ? []
+            : yield* sql<{
+                filename: string;
+              }>`SELECT filename FROM ardud_history_base_archive LIMIT 1`;
+        yield* initializeHistoryArchive(
+          base[0] === undefined ? undefined : baseArchiveFilename(databasePath, base[0].filename),
+        );
         const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
         if (!(yield* maintenance.verify).valid) {
           return yield* new DatabaseProjectionsInvalidError({ path: databasePath });

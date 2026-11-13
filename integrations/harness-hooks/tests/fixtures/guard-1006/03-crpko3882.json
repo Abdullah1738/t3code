@@ -1,0 +1,30 @@
+{
+  "case_number": 3,
+  "reporter_id": "crpko3882",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Fcrpko-devops:20772d74-27f0-4726-9dbe-db5793a42d08",
+  "provenance": {
+    "recovery": "verbatim",
+    "source_kind": "retained_codex_custom_tool_call",
+    "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/11/rollout-2026-11-11T20-41-18-01a1cb7c-37a9-76c0-bd75-f56a0334b61d.jsonl",
+    "source_call_line_0": 176,
+    "timestamp": "2026-11-11T16:46:36.239Z",
+    "call_id": "call_757b9573020e4dd6bf86127f79dbdbcb",
+    "command_index_0": 0,
+    "cell_command_count": 1,
+    "decoder": "integrations/harness-hooks/tests/code_mode_fixture.py:commands (static decoding; no execution)",
+    "explicit_workdir_present": true,
+    "sha256_scope": "UTF-8 bytes of cmd only; workdir preserved separately",
+    "thread_mapping": "Robob #1006 reporter link and reporter activity title confirmed",
+    "raw_denials_file": "/tmp/guard1006-denials.json",
+    "raw_denial_index_0": 162
+  },
+  "session_cwd": "/Volumes/ExternalSSD/crpko-devops",
+  "commands": [
+    {
+      "cmd": "python3 - <<'PY'\nfrom pathlib import Path\np=Path('tmp/card-3882/runner-probes.py')\ns=p.read_text().replace('Open Saved Session And Login If Needed\\n    No Operation','Bind QA Read Only Trading Context\\n    Evaluate    __import__(\\'libraries.qa_trading_data\\', fromlist=[\\'QATradingData\\']).QATradingData().bind_read_only_context()\\nGet Test Id Selector\\n    [Arguments]    ${id}\\n    RETURN    css=[data-testid=\"${id}\"]\\nOpen Saved Session And Login If Needed\\n    No Operation')\np.write_text(s)\nPY\noffbox run --remote --include tmp/card-3882 --step 'cd web/robot-framework && /tmp/qa22-3882-venv/bin/python ../../tmp/card-3882/runner-probes.py' --step 'cd web/robot-framework && /tmp/qa22-3882-venv/bin/python -m robot --dryrun --output NONE --report NONE --log NONE --console dotted --test \"tc_74_*\" --test \"tc_76_*\" --test \"tc_88_*\" --test \"tc_159_*\" --test \"tc_360_*\" --test \"tc_478_*\" --test \"tc_693_*\" tests' > /Volumes/ExternalSSD/crpko-devops/tmp/card-3882/probes-final.txt 2>&1",
+      "workdir": "/Users/ardud/checkouts/qa22-6582",
+      "sha256": "e16460d8c42c3d843cc41a3ed608ff39979fd9b3d9fcd797be6786da89106240"
+    }
+  ],
+  "original_refusal": "Command blocked by PreToolUse hook: statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard."
+}

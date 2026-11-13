@@ -8,6 +8,9 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
@@ -344,4 +347,21 @@ it.effect("refuses a change when the calling thread cannot be read", () =>
       ),
     ),
   ),
+);
+
+it.effect("actsAsCaller returns caller_unresolved when the caller shell read stalls", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
+      getThreadShell: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+    });
+    const result = yield* call("acts_as_caller", fullAccess).pipe(
+      Effect.provide(probeServer(threads)),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust("10 seconds");
+    expect(result.pollUnsafe()).toBeDefined();
+    expect(yield* Fiber.join(result)).toBe("caller_unresolved");
+  }),
 );

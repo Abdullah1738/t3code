@@ -32,13 +32,17 @@ setup() { # fake-or-real sqlite3_rsync
   echo x > "$T/repo/live/config"
   cp "$HERE/scripts/memory_backup.sh" "$R/scripts/"
   # the live install ships src/ (incl. the transcript manifest tool) next to the script
-  cp "$HERE/src/transcript_backup_manifest.py" "$HERE/src/transcript_roots.py" "$HERE/src/run_limited.py" "$R/src/"
+  cp "$HERE/src/transcript_backup_manifest.py" "$HERE/src/transcript_roots.py" "$HERE/src/run_limited.py" "$HERE/src/robob_readonly.py" "$HERE/src/backup_control.py" "$HERE/src/backup_replica.py" "$HERE/src/redact_lock.py" "$R/src/"
   # Never invoke the Dropbox API in this test, even when restic succeeds.
   printf 'print("{\\"test\\": true}")\n' > "$R/src/dropbox_mirror.py"
   old=$(( $(date +%s) - 3 * 86400 ))
-  "$SQLITE" "$R/data/memory.db" "PRAGMA journal_mode=wal;
+  "$SQLITE" -safe -noinit -- "$R/data/memory.db" "PRAGMA journal_mode=wal;
     CREATE TABLE episodic_events(id INTEGER PRIMARY KEY, timestamp INTEGER);
     INSERT INTO episodic_events VALUES (1,$old),(2,$old);" >/dev/null
+  mkdir -p "$T/.robob/userdata/readonly"
+  "$SQLITE" "$T/.robob/userdata/readonly/state.sqlite" "CREATE TABLE scheduled_tasks(task_id TEXT);"
+  "$SQLITE" "$T/.robob/userdata/readonly/state.sqlite" "CREATE TABLE ardud_readonly_meta(key TEXT PRIMARY KEY,value TEXT);
+    INSERT INTO ardud_readonly_meta VALUES ('ready','1'),('updated_at',strftime('%Y-%m-%dT%H:%M:%fZ','now'));"
   if [ "$1" = fake ]; then
     # silent no-op on later runs: exit 0 and leave the replica untouched
     printf '#!/bin/bash\n[ -f "${@: -1}" ] || cp "${@: -2:1}" "${@: -1}"\nexit 0\n' > "$R/bin/sqlite3_rsync"
@@ -49,12 +53,12 @@ setup() { # fake-or-real sqlite3_rsync
 }
 run() {
   env -i PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin HOME="$T" XDG_DATA_HOME="$T/.local/share" \
-    ROBOB_STATE_DB="${1:-$T/no-robob.sqlite}" \
+    ROBOB_STATE_DB="${1:-$T/.robob/userdata/readonly/state.sqlite}" \
     ROBOB_HARNESS_HOMES="$T/.robob/harness-homes" \
     MEMORY_BACKUP_STAGE="$T/stage" MEMORY_BACKUP_REPO_ROOT="$T/repo" \
     MEMORY_BACKUP_REPLICA_TIMEOUT_S="${MEMORY_BACKUP_REPLICA_TIMEOUT_S:-5400}" \
     MEMORY_BACKUP_PASSWORD_COMMAND='printf fixture-password' MEMORY_BACKUP_CACHE_DIR="$T/cache" \
-    MEMORY_BACKUP_MIN_FREE_GB=0 /bin/bash "$R/scripts/memory_backup.sh" >/dev/null 2>&1
+    MEMORY_BACKUP_LOAD_OVERRIDE=0.1 MEMORY_BACKUP_UPTIME_OVERRIDE=86400 MEMORY_BACKUP_MIN_FREE_GB=0 /bin/bash "$R/scripts/memory_backup.sh" >/dev/null 2>&1
 }
 st() { /opt/homebrew/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["stage"], d["ok"])' "$R/logs/backup_last.json"; }
 
@@ -88,6 +92,24 @@ if [ -s "$T/sync-pid" ] && ! kill -0 "$(cat "$T/sync-pid")" 2>/dev/null; then
 else
   fail "stalled sync process still alive or did not start"
 fi
+rm -rf "$T"
+
+# A failed kill must be distinguishable from an ordinary timeout, and cannot retry.
+setup fake
+cp "$R/src/run_limited.py" "$R/src/fixture_run_limited.py"
+cat > "$R/src/run_limited.py" <<'PYCODE'
+from fixture_run_limited import *
+import sys
+if __name__ == '__main__':
+    print("run_limited: survivors after SIGKILL: 999999 fixture", file=sys.stderr)
+    raise SystemExit(125)
+PYCODE
+run
+[ "$(st)" = "replica False" ] && grep -q 'replica memory.db: child survived kill:.*survivors after SIGKILL' "$R/logs/backup_last.json" \
+  && pass "surviving child fails replica with diagnostic" || fail "survivor status: $(cat "$R/logs/backup_last.json")"
+grep -q 'replica memory.db: child survived kill:' "$R"/logs/backup-*.log \
+  && pass "surviving child is logged" || fail "survivor diagnostic missing from log"
+[ ! -e "$R/logs/backup.lock" ] && pass "surviving child releases backup lock" || fail "survivor left lock"
 rm -rf "$T"
 
 # 2. SQLite backup stand-in -> replica stage passes (then fake repo fails).
@@ -134,21 +156,46 @@ if [ -x "$REAL_RSYNC" ]; then
     CREATE TABLE ardud_board_rows(id TEXT); INSERT INTO ardud_board_rows VALUES ('b');
     CREATE TABLE ardud_mission_events(id TEXT); INSERT INTO ardud_mission_events VALUES ('m');
     CREATE TABLE orchestration_v2_events(x); INSERT INTO orchestration_v2_events VALUES ('big');" >/dev/null
+  "$SQLITE" "$T/robob.sqlite" "CREATE TABLE ardud_readonly_meta(key TEXT PRIMARY KEY,value TEXT);
+    INSERT INTO ardud_readonly_meta VALUES ('ready','1'),('updated_at',strftime('%Y-%m-%dT%H:%M:%fZ','now'));"
   echo old > "$T/stage/robob-state.sqlite"; echo old > "$T/stage/robob-state.sqlite-wal"
   run "$T/robob.sqlite"
   [ "$(st)" = "restic False" ] && pass "robob state dump passes" || fail "robob gave: $(st) $(cat "$R/logs/backup_last.json")"
-  [ "$("$SQLITE" :memory: ".read $T/stage/robob-state.sql" 'SELECT name FROM scheduled_tasks')" = "it's 7" ] \
+  # Safe mode keeps generated dump contents from opening files or launching helpers.
+  [ "$("$SQLITE" -safe -noinit -- :memory: "$(cat "$T/stage/robob-state.sql")" 'SELECT name FROM scheduled_tasks')" = "it's 7" ] \
     && pass "robob state dump restores" || fail "robob state dump missing or unreadable"
   grep -q orchestration_v2_events "$T/stage/robob-state.sql" \
     && fail "robob dump includes the event log" || pass "robob dump skips the event log"
   ls "$T"/stage/robob-state.sqlite* >/dev/null 2>&1 \
     && fail "old full robob replica kept" || pass "old full robob replica removed"
-  [ "$("$SQLITE" :memory: ".read $T/stage/robob-state.sql" 'SELECT id FROM ardud_mission_events')" = "m" ] \
+  [ "$("$SQLITE" -safe -noinit -- :memory: "$(cat "$T/stage/robob-state.sql")" 'SELECT id FROM ardud_mission_events')" = "m" ] \
     && pass "retired mission tables backed up" || fail "ardud_mission_events not in the robob dump"
   grep -q "robob-state.sql: 3 tables.*missing:.* projection_projects" "$R"/logs/backup-*.log \
     && pass "missing robob tables logged" || fail "robob log: $(grep robob "$R"/logs/backup-*.log)"
   rm -rf "$T"
 fi
+
+# All Robob dump inputs must be completed exports, never live paths or aliases.
+for kind in missing not-ready stale live symlink hardlink; do
+  setup real
+  source="$T/.robob/userdata/readonly/state.sqlite"
+  case "$kind" in
+    missing) rm "$source" ;;
+    not-ready) "$SQLITE" "$source" "UPDATE ardud_readonly_meta SET value='0' WHERE key='ready'" ;;
+    stale) "$SQLITE" "$source" "UPDATE ardud_readonly_meta SET value='2000-01-01T00:00:00Z' WHERE key='updated_at'" ;;
+    *)
+      cp "$source" "$T/.robob/userdata/statev2.sqlite"
+      source="$T/.robob/userdata/statev2.sqlite"
+      case "$kind" in
+        symlink) ln -s "$source" "$T/alias.sqlite"; source="$T/alias.sqlite" ;;
+        hardlink) ln "$source" "$T/alias.sqlite"; source="$T/alias.sqlite" ;;
+      esac ;;
+  esac
+  run "$source"
+  [ "$(st)" = "replica False" ] && [ ! -e "$T/stage/robob-state.sql.tmp" ] \
+    && pass "$kind Robob source rejected before dump" || fail "$kind source allowed: $(st)"
+  rm -rf "$T"
+done
 
 # 5. a lock left by a dead run is removed (and logged); a live run's lock is kept
 setup fake

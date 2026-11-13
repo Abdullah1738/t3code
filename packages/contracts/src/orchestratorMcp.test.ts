@@ -5,6 +5,7 @@ import {
   OrchestratorMcpCreateThreadsInput,
   OrchestratorMcpDelegateTaskInput,
   OrchestratorMcpDelegateTaskResult,
+  OrchestratorMcpTaskStatusResult,
   OrchestratorMcpThreadInterruptInput,
   OrchestratorMcpThreadListInput,
   OrchestratorMcpThreadReadInput,
@@ -22,6 +23,35 @@ const decodeThreadSendInput = Schema.decodeUnknownSync(OrchestratorMcpThreadSend
 const decodeThreadWaitInput = Schema.decodeUnknownSync(OrchestratorMcpThreadWaitInput);
 
 describe("orchestrator MCP contracts", () => {
+  it("accepts finite idle timeout overrides independently of the wait budget", () => {
+    for (const idleTimeoutMs of [0, 1, 60_000, 120_000, 8_000_000]) {
+      expect(
+        decodeDelegateTaskInput({ task: "Review", idleTimeoutMs, timeoutMs: 10 }).idleTimeoutMs,
+      ).toBe(idleTimeoutMs);
+    }
+    expect(() => decodeDelegateTaskInput({ task: "Review", idleTimeoutMs: Number.NaN })).toThrow();
+  });
+
+  it("preserves known fields in partial task status and rejects an unmarked incomplete result", () => {
+    const decode = Schema.decodeUnknownSync(OrchestratorMcpTaskStatusResult);
+    const partial = {
+      taskId: "node:task",
+      partial: true,
+      childThreadId: "thread:child",
+      currentRunId: "run:resumed",
+      currentRunStatus: "starting",
+      latestTerminalRunId: "run:original",
+      latestTerminalStatus: "cancelled",
+    };
+    expect(decode(partial)).toEqual(partial);
+    expect(decode({ taskId: "node:task", partial: true })).toEqual({
+      taskId: "node:task",
+      partial: true,
+    });
+    expect(() => decode({ ...partial, partial: false })).toThrow();
+    expect(() => decode({ taskId: "node:task" })).toThrow();
+  });
+
   it("accepts explicit worktree isolation and keeps shared delegation as the default", () => {
     expect(decodeDelegateTaskInput({ task: "Review changes" }).isolation).toBeUndefined();
     expect(
@@ -67,6 +97,23 @@ describe("orchestrator MCP contracts", () => {
     expect(result.status).toBe("completed");
     expect(result.summary).toBe("Workspace inspected.");
     expect(result.pendingApproval).toBeNull();
+    expect(result.startedAt).toBeUndefined();
+    expect(result.startPending).toBeUndefined();
+    expect(
+      decodeDelegateTaskResult({ ...result, startedAt: null, startPending: true }),
+    ).toMatchObject({
+      startedAt: null,
+      startPending: true,
+    });
+    expect(
+      decodeDelegateTaskResult({
+        ...result,
+        startedAt: "2026-11-04T12:00:00.000Z",
+        startPending: false,
+      }),
+    ).toMatchObject({ startedAt: "2026-11-04T12:00:00.000Z", startPending: false });
+    expect(() => decodeDelegateTaskResult({ ...result, startedAt: 123 })).toThrow();
+    expect(() => decodeDelegateTaskResult({ ...result, startPending: "true" })).toThrow();
     const pendingApproval = {
       requestId: "request-approval-1",
       kind: "command",

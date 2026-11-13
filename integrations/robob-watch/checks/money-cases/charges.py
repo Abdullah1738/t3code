@@ -13,12 +13,19 @@ from pathlib import Path
 import re
 import sqlite3
 import subprocess
+import sys
 import time
 from zoneinfo import ZoneInfo
+import order_lookup
 
 TZ = ZoneInfo('Asia/Dubai')
 MSGS = os.environ.get('MONEY_CASES_MSGS', str(Path('~/.local/bin/msgs').expanduser()))
-STATE_DB = Path(os.environ.get('MONEY_CASES_STATE_DB', '~/.robob/userdata/statev2.sqlite')).expanduser()
+# The installer puts the helper beside this check; the source tree shares helpers/.
+if not Path(__file__).with_name('robob_readonly.py').exists():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'helpers'))
+from robob_readonly import connect_replica, replica_path
+
+STATE_DB = replica_path('MONEY_CASES_STATE_DB')
 RECEIPT_BEFORE = dt.timedelta(hours=2)
 # Hits asked for per receipt search, and mails read from them: a receipt buried under usage notices
 # with the same amount is still found, without an unbounded number of reads.
@@ -103,6 +110,52 @@ class Lookup(Exception):
     """A source couldn't be read; the charge is then not explained by it."""
 
 
+def card_owner(charge):
+    path = Path(os.environ.get('MONEY_CASES_SETTINGS', Path(__file__).with_name('settings.json')))
+    try:
+        owners = json.loads(path.read_text())['card_owners']
+        if not isinstance(owners, dict) or any(value not in ('abdullah', 'moni') for value in owners.values()):
+            raise ValueError('invalid card owners')
+        return owners.get(charge['card'], owners.get('Wio', 'abdullah'))
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise Lookup('card owners: settings unreadable') from e
+
+
+def order_receipt(charge, at, now, deadline=None, lookup=None):
+    merchant = charge['merchant'].lower()
+    app = 'careem' if 'careem' in merchant else 'noon' if 'noon' in merchant else None
+    if not app:
+        return None
+    try:
+        result = (lookup or order_lookup.read)(app, deadline=deadline)
+        complete = result.get('complete') is True if isinstance(result, dict) else True
+        rows = result.get('orders') if isinstance(result, dict) else result
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError('invalid order list')
+        matches = {}
+        for row in rows:
+            placed = dt.datetime.fromisoformat(str(row.get('placed_at')).replace('Z', '+00:00'))
+            if placed.tzinfo is None:
+                raise ValueError('order time missing zone')
+            total = Decimal(str(row.get('total')))
+            if not total.is_finite() or not row.get('currency') or not row.get('order'):
+                raise ValueError('order amount missing')
+            if row.get('status') in ('cancelled', 'canceled', 'failed') or row.get('raw_status') in ('cancelled', 'canceled', 'failed'):
+                continue
+            if (total == Decimal(charge['amount']) and row['currency'] == charge['currency']
+                    and abs(placed - at) <= SAME_TIME and placed <= now):
+                matches[row['order']] = row
+        if len(matches) == 1:
+            return {'verdict': 'receipt', 'why': f'{app} order {next(iter(matches))}: amount and time match', 'errors': []}
+        if len(matches) > 1:
+            raise ValueError('ambiguous orders')
+        if not complete:
+            raise ValueError('incomplete history cannot authorize an ask')
+    except (ValueError, TypeError, KeyError, InvalidOperation, OSError) as e:
+        raise Lookup(f'{app} orders: lookup unavailable or incomplete') from e
+    return None
+
+
 def parse(text, sender=''):
     """The charge in a bank alert, or None when the text isn't a card charge or decline we read."""
     if sender and not BANKS.search(sender):
@@ -152,26 +205,51 @@ def left(deadline, cap):
     return min(cap, remaining)
 
 
+def msgs(argv, deadline, cap, memo=None, stats=None):
+    key = tuple(argv)
+    if memo is not None and key in memo:
+        result = memo[key]
+        if isinstance(result, Lookup):
+            raise result
+        return result
+    timeout = left(deadline, cap)
+    if stats is not None:
+        stats['msgs_calls'] += 1
+    try:
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        if done.returncode:
+            raise Lookup(f'msgs exit {done.returncode}: {done.stderr.strip()[:200]}')
+    except (OSError, subprocess.TimeoutExpired, Lookup) as e:
+        error = e if isinstance(e, Lookup) else Lookup(f'msgs: {e}')
+        if memo is not None:
+            memo[key] = error
+        raise error from e
+    if memo is not None:
+        memo[key] = done
+    return done
+
+
 def day(t):
     return t.astimezone(TZ).date().isoformat()
 
 
-def search(query, since, until=None, source=None, n=20, deadline=None):
+def search(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None):
     """Rows from the message archive (the msgs CLI), newest first, without bodies."""
     cmd = [MSGS, 'search', query, '--json', '-n', str(n), '--date', '--since', since]
     if until:
         cmd += ['--until', until]
     if source:
         cmd += ['--in', source]
-    try:
-        done = subprocess.run(cmd, capture_output=True, text=True, timeout=left(deadline, 15))
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise Lookup(f'msgs: {e}') from e
-    if done.returncode:
-        raise Lookup(f'msgs exit {done.returncode}: {done.stderr.strip()[:200]}')
+    done = msgs(cmd, deadline, 15, memo, stats)
     # split on '\n' only: msgs prints ensure_ascii=False JSON, so a snippet can hold
     # U+2028, \x85 or \x1c-\x1e, which str.splitlines() would treat as line breaks.
-    return [json.loads(line) for line in done.stdout.split('\n') if line.strip()]
+    try:
+        rows = [json.loads(line) for line in done.stdout.split('\n') if line.strip()]
+        if any(not isinstance(row, dict) for row in rows):
+            raise ValueError('invalid search row')
+        return rows
+    except ValueError as e:
+        raise Lookup('msgs: unreadable search output') from e
 
 
 def iso(t):
@@ -222,12 +300,16 @@ def owner_turn(payload, title=''):
     return bool(iid) and not iid.startswith(SYNTHETIC_IDS) and not str(payload.get('text') or '').lstrip().startswith('[')
 
 
-def owner_texts(since, until, deadline=None):
+def owner_texts(since, until, deadline=None, stats=None):
     """What the owner typed in his own Robob threads (app or iMessage) between two times."""
-    left(deadline, 5)
+    left(deadline, 4)
+    stop = time.time() + (4 if deadline is None else min(4, deadline - time.time() - 0.5))
     try:
-        db = sqlite3.connect(f'file:{STATE_DB}?mode=ro', uri=True, timeout=2)
+        db = connect_replica(STATE_DB, timeout=1)
         try:
+            db.set_progress_handler(lambda: int(time.time() >= stop), 10000)
+            if stats is not None:
+                stats['owner_queries'] += 1
             rows = db.execute(
                 'SELECT m.created_at, m.payload_json, t.title FROM orchestration_v2_projection_threads t '
                 'CROSS JOIN orchestration_v2_projection_messages m ON m.thread_id = t.thread_id '
@@ -235,7 +317,9 @@ def owner_texts(since, until, deadline=None):
                 (iso(since), iso(until), iso(since), 'user')).fetchall()
         finally:
             db.close()
-    except sqlite3.Error as e:
+    except (sqlite3.Error, OSError, ValueError) as e:
+        if isinstance(e, sqlite3.OperationalError) and 'interrupted' in str(e):
+            raise Lookup('Robob state: query over time') from e
         raise Lookup(f'Robob state: {e}') from e
     out = []
     for created, payload, title in rows:
@@ -252,16 +336,12 @@ def owner_texts(since, until, deadline=None):
     return out
 
 
-def show(row, deadline=None):
+def show(row, deadline=None, memo=None, stats=None):
     """The whole mail for a search row (msgs show)."""
     try:
-        done = subprocess.run([MSGS, 'show', str(row['id'])], capture_output=True, text=True,
-                              timeout=left(deadline, 10))
-    except (OSError, subprocess.TimeoutExpired, KeyError) as e:
+        return msgs([MSGS, 'show', str(row['id'])], deadline, 10, memo, stats).stdout
+    except KeyError as e:
         raise Lookup(f'msgs show: {e}') from e
-    if done.returncode:
-        raise Lookup(f'msgs show exit {done.returncode}: {done.stderr.strip()[:200]}')
-    return done.stdout
 
 
 def amount_pattern(charge):
@@ -284,11 +364,22 @@ def last_four(charge):
     return re.compile(rf'(?<!\d){charge["card"]}(?!\d)')
 
 
+CHAT_LINE = re.compile(r'^(?P<mark>[ >]) +\d+ [\d?]{4}-[\d?]{2}-[\d?]{2} [\d?]{2}:[\d?]{2} [^:]*: ')
+
+
 def alert_text(shown):
-    """The message itself from msgs show: a chat is shown with its neighbours, its own line marked >."""
+    """Selected msgs-show body, including continuations but excluding neighboring messages."""
+    body = None
     for line in shown.splitlines():
-        if line.startswith('>'):
-            return re.sub(r'^>\s*\d+ \S+ \S+ [^:]*: ', '', line)
+        header = CHAT_LINE.match(line)
+        if body is not None:
+            if header:
+                break
+            body.append(line)
+        elif header and header['mark'] == '>':
+            body = [line[header.end():]]
+    if body is not None:
+        return '\n'.join(body)
     return shown
 
 
@@ -301,12 +392,14 @@ def body_key(text):
     return ' '.join(' '.join(lines).split())
 
 
-def receipt(charge, at, now, find=None, deadline=None, read=None):
+def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, stats=None):
     """The receipt or order mail for a charge. It shows the amount as money in the charge's currency
     and reads as a receipt, and either names the merchant (from two hours before the charge on) or,
     under another name, shows the card's last four digits within 15 minutes of it. Search hits are
     checked against the mail itself."""
-    find, read = find or search, read or show
+    options = {'memo': memo, 'stats': stats} if memo is not None else {}
+    find = find or (lambda *a, **kw: search(*a, **kw, **options))
+    read = read or (lambda row, deadline: show(row, deadline, **options))
     amount = ' OR '.join(f'"{v}"' for v in amounts(charge))
     money, card = amount_pattern(charge), last_four(charge)
     names = words(charge['merchant'])
@@ -462,17 +555,30 @@ def known(charge, at, find=None, deadline=None, read=None):
     return None
 
 
-def found(charge, at, now, deadline=None, find=None, said=None, errors=None):
+def found(charge, at, now, deadline=None, find=None, said=None, errors=None, memo=None, stats=None):
     """A receipt or his own words that explain the charge, or None."""
     errors = [] if errors is None else errors
     try:
-        row = receipt(charge, at, now, find, deadline)
+        row = receipt(charge, at, now, find, deadline, memo=memo, stats=stats)
         if row:
             when = dt.datetime.fromtimestamp(row['ts'], TZ).strftime('%a %d %b %H:%M')
             return {'verdict': 'receipt', 'why': f"receipt {when}: {row.get('sender', '')} - {row.get('subject', '')}"[:200],
                     'msgs': row.get('id'), 'errors': errors}
     except Lookup as e:
         errors.append(f'receipt: {e}')
+    try:
+        hit = order_receipt(charge, at, now, deadline)
+        if hit:
+            return {**hit, 'errors': errors}
+    except Lookup as e:
+        errors.append(f'orders: {e}')
+    if card_owner(charge) == 'moni':
+        return None
+    return owner_found(charge, at, now, deadline, said, errors)
+
+
+def owner_found(charge, at, now, deadline=None, said=None, errors=None):
+    errors = [] if errors is None else errors
     try:
         hit = owner_said(charge, at, now, said, deadline)
         if hit:
@@ -487,11 +593,18 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None):
 def explain(charge, at, now, deadline=None, find=None, said=None):
     """verdict receipt | owner | wait | ask, with why and any lookup errors."""
     errors = []
+    owner = card_owner(charge)
+    if charge['kind'] != 'charge' and owner == 'moni':
+        return {'verdict': 'held', 'why': 'held for Moni', 'errors': []}
     if charge['kind'] != 'charge':
         return {'verdict': 'ask', 'why': 'a declined payment goes to him', 'errors': errors}
     hit = found(charge, at, now, deadline, find, said, errors)
     if hit:
         return hit
+    if errors:
+        return {'verdict': 'unverified', 'why': 'sources unreadable; do not ask', 'errors': errors}
+    if owner == 'moni':
+        return {'verdict': 'held', 'why': 'held for Moni', 'errors': []}
     if now < at + WAIT:
         try:
             how = known(charge, at, find, deadline)
@@ -504,4 +617,6 @@ def explain(charge, at, now, deadline=None, find=None, said=None):
                         'until': until.isoformat(timespec='seconds'), 'errors': errors}
         except Lookup as e:
             errors.append(f'merchant history: {e}')
-    return {'verdict': 'ask', 'why': 'no receipt, nothing he wrote, and nothing to wait for', 'errors': errors}
+    return {'verdict': 'unverified' if errors else 'ask',
+            'why': 'sources unreadable; do not ask' if errors else 'no receipt, nothing he wrote, and nothing to wait for',
+            'errors': errors}

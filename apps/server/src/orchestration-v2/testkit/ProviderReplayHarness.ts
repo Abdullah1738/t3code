@@ -1,3 +1,4 @@
+import * as RestartPacingTestkit from "../../ardud/restart-pacing/RestartPacing.testkit.ts";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import { DEFAULT_SIGNAL_EXPORT } from "@t3tools/shared/observability";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -271,6 +272,7 @@ export function layerWithRegistry<Error>(
     readonly runContinuationWorker?: boolean;
     readonly recoverOnStartup?: boolean;
     readonly continueThreadsAfterServerUpdate?: boolean;
+    readonly ardudHarnessMigration?: import("@t3tools/contracts").ArdudHarnessMigrationSettings;
   } = {},
 ): Layer.Layer<
   | Orchestrator.OrchestratorV2
@@ -300,6 +302,9 @@ export function layerWithRegistry<Error>(
   );
   const layerServerSettings = ServerSettings.layerTest({
     responseStreamingMode: "turn",
+    ...(options.ardudHarnessMigration === undefined
+      ? {}
+      : { ardudHarnessMigration: options.ardudHarnessMigration }),
     ...(options.continueThreadsAfterServerUpdate === undefined
       ? {}
       : { continueThreadsAfterServerUpdate: options.continueThreadsAfterServerUpdate }),
@@ -464,6 +469,7 @@ export function layerWithRegistry<Error>(
         layerRunExecutionServiceProvided,
         layerServerSettings,
         layerDatabase,
+        layerServerConfig,
         ThreadForkService.layer,
       ),
     ),
@@ -493,6 +499,7 @@ export function layerWithRegistry<Error>(
         )
       : Layer.empty;
   const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
+    Layer.provide(RestartPacingTestkit.layer),
     Layer.provide(
       Layer.mergeAll(
         layerRunFinalizationServiceProvided,

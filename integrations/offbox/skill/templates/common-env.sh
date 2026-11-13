@@ -5,6 +5,7 @@ set -euo pipefail
 H=/home/user
 BEGIN="# >>> offbox cache env >>>"
 END="# <<< offbox cache env <<<"
+# The uv cache and workdirs can be on different filesystems; hardlinks can fail with EXDEV.
 read -r -d '' VARS <<EOF || true
 XDG_CACHE_HOME=$H/.xcache
 GOCACHE=$H/.xcache/go-build
@@ -19,6 +20,7 @@ PNPM_HOME=$H/.local/share/pnpm
 YARN_CACHE_FOLDER=$H/.xcache/yarn
 PIP_CACHE_DIR=$H/.xcache/pip
 UV_CACHE_DIR=$H/.xcache/uv
+UV_LINK_MODE=copy
 PLAYWRIGHT_BROWSERS_PATH=$H/.local/share/ms-playwright
 CYPRESS_CACHE_FOLDER=$H/.xcache/cypress
 DOCKER_BUILDKIT=1

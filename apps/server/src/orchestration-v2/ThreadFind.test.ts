@@ -27,7 +27,11 @@ import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as EventStore from "./EventStore.ts";
-import { encodeThreadHistoryCursor, selectHistoryPageFromCursor } from "./threadHistoryPaging.ts";
+import {
+  boundHistoryRowForTransport,
+  encodeThreadHistoryCursor,
+  selectHistoryPageFromCursor,
+} from "./threadHistoryPaging.ts";
 import { projectTurnItemForWire } from "./WireProjection.ts";
 
 const layerTest = Layer.mergeAll(EventStore.layer, ProjectionStore.layer, ProjectStore.layer).pipe(
@@ -934,7 +938,68 @@ describe("V2 history materialization", () => {
       }).pipe(Effect.provide(layerTest)),
   );
 
-  it.effect("pages complete turns without duplicating or skipping messages", () =>
+  it.effect.each(["items", "bytes"] as const)(
+    "resumes find across a turn split by %s without gaps or duplicates",
+    (budget) =>
+      Effect.gen(function* () {
+        const projection = yield* setup;
+        const items = [
+          item("user:split", 0, "start", "user_message"),
+          ...Array.from({ length: 180 }, (_, index) => ({
+            ...item(
+              `answer:split:${index}`,
+              index + 1,
+              budget === "bytes" ? "x".repeat(20_000) : `answer ${index}`,
+            ),
+            messageId: MessageId.make(`message:split:${index}`),
+          })),
+        ];
+        yield* putItems(items);
+        const snapshot = yield* projection.getThreadSnapshot(threadId);
+        let cursor: string | null = encodeThreadHistoryCursor({
+          snapshotSequence: snapshot.snapshotSequence,
+          sourceThreadId: threadId,
+          sourceItemId: "absent",
+          position: items.length,
+        });
+        const collected: string[] = [];
+        let pages = 0;
+        let reachedMatch = false;
+        while (cursor !== null) {
+          const page: OrchestrationV2ThreadHistoryPage = yield* projection.getThreadHistoryPage(
+            threadId,
+            cursor,
+            "message:split:10",
+          );
+          assert.isAbove(page.items.length, 0);
+          assert.isAtMost(page.items.length, 150);
+          assert.isBelow(Buffer.byteLength(JSON.stringify(page)), 16 * 1024 * 1024);
+          const expectedEnd = items.length - collected.length;
+          assert.deepEqual(
+            page.items.map((row) => String(row.sourceItemId)),
+            items
+              .slice(expectedEnd - page.items.length, expectedEnd)
+              .map((entry) => String(entry.id)),
+          );
+          reachedMatch ||= page.items.some(
+            (row) => "messageId" in row.item && row.item.messageId === "message:split:10",
+          );
+          collected.unshift(...page.items.map((row) => String(row.sourceItemId)));
+          assert.notEqual(page.nextCursor, cursor);
+          cursor = page.nextCursor;
+          pages += 1;
+          assert.isBelow(pages, items.length);
+        }
+        assert.isAbove(pages, 1);
+        assert.isTrue(reachedMatch);
+        assert.deepEqual(
+          collected,
+          items.map((entry) => String(entry.id)),
+        );
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("pages bounded turns without duplicating or skipping messages", () =>
     Effect.gen(function* () {
       const projection = yield* setup;
       const items = Array.from({ length: 45 }, (_, turn) => [
@@ -951,10 +1016,12 @@ describe("V2 history materialization", () => {
       ]).flat();
       yield* putItems(items);
       const snapshot = yield* projection.getThreadSnapshot(threadId);
-      const rows = snapshot.projection.visibleTurnItems.map((row) => ({
-        ...row,
-        item: projectTurnItemForWire(row.item),
-      }));
+      const rows = snapshot.projection.visibleTurnItems.map((row) =>
+        boundHistoryRowForTransport({
+          ...row,
+          item: projectTurnItemForWire(row.item),
+        }),
+      );
       let cursor: string | null = encodeThreadHistoryCursor({
         snapshotSequence: snapshot.snapshotSequence,
         sourceThreadId: threadId,
@@ -975,7 +1042,6 @@ describe("V2 history materialization", () => {
             snapshotSequence: snapshot.snapshotSequence,
           }),
         });
-        assert.equal(page.items[0]?.item.type, "user_message");
         collected.unshift(...page.items.map((row) => String(row.sourceItemId)));
         cursor = page.nextCursor;
       }
@@ -995,10 +1061,12 @@ describe("V2 history materialization", () => {
         ),
       );
       const snapshot = yield* projection.getThreadSnapshot(threadId);
-      const rows = snapshot.projection.visibleTurnItems.map((row) => ({
-        ...row,
-        item: projectTurnItemForWire(row.item),
-      }));
+      const rows = snapshot.projection.visibleTurnItems.map((row) =>
+        boundHistoryRowForTransport({
+          ...row,
+          item: projectTurnItemForWire(row.item),
+        }),
+      );
       let cursor: string | null = encodeThreadHistoryCursor({
         snapshotSequence: snapshot.snapshotSequence,
         sourceThreadId: threadId,
@@ -1022,7 +1090,7 @@ describe("V2 history materialization", () => {
         sizes.push(page.items.length);
         cursor = page.nextCursor;
       }
-      assert.deepEqual(sizes, [1, 1, 75, 3]);
+      assert.deepEqual(sizes, [75, 5]);
     }).pipe(Effect.provide(layerTest)),
   );
 });

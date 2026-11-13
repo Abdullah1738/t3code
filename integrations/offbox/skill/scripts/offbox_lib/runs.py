@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import re
@@ -14,12 +15,15 @@ import threading
 import time
 from pathlib import Path
 
-from . import api, lease, node_version, pool, ssh_sync
-from . import prune
-from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
-                     atomic_write_json, db, event, new_id, now, offsets_path, read_json, say, silence)
+from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pool, ssh_sync
+from . import containers, prune, prepare
+from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
+                     RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, event, log, new_id, now,
+                     offsets_path, person, read_json, say, silence)
 
-BG_TTL_S = 6 * 3600
+BG_TTL_S = ORPHAN_RUN_MAX_S
+RESTART_MARKER = Path(os.environ.get('T3CODE_HOME') or Path.home() / '.robob') / 'userdata/restarting'
+RESTART_MARKER_MAX_S = 300
 # cmd_start answers that prove boat refused the command (nothing ran). Other 4xx and network errors stay ambiguous.
 REFUSED_STATUSES = (400, 401, 403, 404, 409, 413, 422, 429)
 ENV_ALLOW = ("TZ", "LANG", "LC_ALL", "GOFLAGS", "GOPROXY", "GONOSUMDB", "GOPRIVATE", "GOTOOLCHAIN", "CGO_ENABLED",
@@ -29,6 +33,242 @@ ENV_DENY_HINTS = ("AWS_", "TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "S
 # Read from this checkout's skill root, not common.TEMPLATES_DIR: the live copy lacks the file until install.zsh runs.
 DOCKER_HOOK_B64 = base64.b64encode(
     (Path(__file__).resolve().parents[2] / "templates" / "boat-sync-docker-firewall").read_bytes()).decode()
+
+# Recipes travel with this runner so an uninstalled checkout can prove the exact change.
+REPO_RECIPES_DIR = Path(__file__).resolve().parents[2] / "templates" / "repos"
+REPO_SETUP_FAILED_MARKER = "offbox-repo-setup-failed"
+EXIT_REPO_SETUP = 98
+
+REPO_SETUP = r'''# offbox-repo-setup
+(
+  set -euo pipefail
+  mkdir -p "$HOME/.offbox/repo-env"
+  exec 9>"$HOME/.offbox/repo-setup-@KEY@.lock"
+  flock -x -w 1800 9
+  export OFFBOX_REPO_ROOT="$HOME"/@ROOT@
+  _offbox_base="$HOME/.offbox/repo-setup-@KEY@"
+  _offbox_stamp=$(python3 - "$OFFBOX_REPO_ROOT" <<'OFFBOX_REPO_STAMP'
+import base64, hashlib, re, sys
+from pathlib import Path
+recipe = base64.b64decode('@RECIPE@')
+mod = Path(sys.argv[1]) / 'core/go.mod'
+match = re.search(r'^\s*(?:require\s+)?golang\.org/x/mobile\s+(v[^\s]+)', mod.read_text(), re.M) if mod.exists() else None
+version = match[1] if match else ''
+print(hashlib.sha256(recipe + b'\0' + version.encode()).hexdigest())
+OFFBOX_REPO_STAMP
+  )
+  python3 - "$_offbox_base.sh" <<'OFFBOX_REPO_RECIPE'
+import base64, sys
+from pathlib import Path
+Path(sys.argv[1]).write_bytes(base64.b64decode('@RECIPE@'))
+OFFBOX_REPO_RECIPE
+  _offbox_needs_setup=false
+  @CHECK@
+  if $_offbox_needs_setup || [ "$(cat "$_offbox_base.stamp" 2>/dev/null || true)" != "$_offbox_stamp" ] ||
+     [ ! -f "$HOME/.offbox/repo-env/@KEY@.sh" ]; then
+    echo 'offbox: setting up @KEY@ toolchain on this box (first run here, a few minutes)' >&3
+    rm -f "$_offbox_base.stamp"
+    _offbox_t0=$SECONDS
+    bash "$_offbox_base.sh"
+    # A successful recipe must publish the environment before we trust its stamp.
+    test -f "$HOME/.offbox/repo-env/@KEY@.sh"
+    printf '%s\n' "$_offbox_stamp" > "$_offbox_base.stamp.tmp"
+    mv -f "$_offbox_base.stamp.tmp" "$_offbox_base.stamp"
+    echo "offbox: @KEY@ toolchain ready ($((SECONDS - _offbox_t0))s)" >&3
+  fi
+) 3>&2 >>"$HOME/.offbox/repo-setup-@KEY@.log" 2>&1
+_offbox_repo_rc=$?
+if [ "$_offbox_repo_rc" -ne 0 ]; then
+  tail -n 20 "$HOME/.offbox/repo-setup-@KEY@.log" >&2
+  echo 'offbox: @KEY@ toolchain setup failed on this box; nothing ran' >&2
+  echo offbox-repo-setup-failed >&2
+  exit 98
+fi
+. "$HOME/.offbox/repo-env/@KEY@.sh" || {
+  tail -n 20 "$HOME/.offbox/repo-setup-@KEY@.log" >&2
+  echo 'offbox: @KEY@ toolchain setup failed on this box; nothing ran' >&2
+  echo offbox-repo-setup-failed >&2
+  exit 98
+}
+'''
+
+
+def repo_setup_block(repo_key: str, rdir: str) -> str:
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", repo_key):
+        return ""
+    recipe = REPO_RECIPES_DIR / f"{repo_key}.sh"
+    if not recipe.is_file():
+        return ""
+    body = recipe.read_bytes()
+    if repo_key == "crpko-devops":
+        body = (REPO_RECIPES_DIR.parent / "tools/crpko.sh").read_bytes() + b"\n" + body
+    body = (REPO_RECIPES_DIR.parent / "tools/fetch.sh").read_bytes() + b"\n" + body
+    check = 'bash "$_offbox_base.sh" --check || _offbox_needs_setup=true' if repo_key == "crpko-devops" else ':'
+    # The log redirection opens before the subshell can create its directories.
+    return ('mkdir -p "$HOME/.offbox" || { '
+            f'echo "offbox: {repo_key} toolchain setup failed on this box; nothing ran" >&2; '
+            'echo offbox-repo-setup-failed >&2; exit 98; }\n'
+            + REPO_SETUP.replace('@KEY@', repo_key).replace('@ROOT@', shlex.quote(rdir))
+            .replace('@CHECK@', check)
+            .replace('@RECIPE@', base64.b64encode(body).decode()))
+
+# Shared by pre-command probes: neither root ownership nor uninterruptible I/O can extend the deadline.
+BOUNDED_PROCESS = r'''
+import os, selectors, signal, subprocess, sys, time
+def bounded(args, seconds, relay=False, capture=False):
+    try:
+        child = subprocess.Popen(args, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE if relay or capture else subprocess.DEVNULL,
+                                 stderr=subprocess.STDOUT, start_new_session=True)
+    except OSError:
+        return 1, b''
+    selector = selectors.DefaultSelector()
+    if child.stdout:
+        selector.register(child.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + seconds
+    output = bytearray()
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                # No wait/communicate: even SIGKILL cannot reap a process blocked in kernel I/O.
+                return 124, bytes(output)
+            for key, _ in selector.select(min(left, 0.1)):
+                data = os.read(key.fd, 65536)
+                if data:
+                    if relay:
+                        os.write(2, data)
+                    if capture:
+                        output.extend(data)
+                else:
+                    selector.unregister(key.fileobj)
+            rc = child.poll()
+            if rc is not None and not selector.get_map():
+                return (rc if rc >= 0 else 128 - rc), bytes(output)
+    finally:
+        if child.stdout:
+            child.stdout.close()
+        selector.close()
+'''
+
+# The old helper installed on a box may wait forever behind the boot-time restore. Keep this in the run
+# itself so even boxes made before the fix use the bound.
+IMAGE_WAIT = r'''# offbox-wait-images: bounded even on boxes with an old restore helper
+(
+  _offbox_seconds=${OFFBOX_IMAGE_WAIT_SECONDS:-180}
+  [[ $_offbox_seconds =~ ^[1-9][0-9]{0,3}$ ]] || _offbox_seconds=180
+  echo 'offbox: waiting for kept docker images' >&2
+  python3 - "$_offbox_seconds" <<'OFFBOX_IMAGE_WAIT'
+''' + BOUNDED_PROCESS + r'''
+seconds = int(sys.argv[1])
+script = r"""
+set -u -o pipefail
+archive=/home/user/.offbox/images/saved.tar.zst
+[ -e /run/offbox-images-ready ] && exit 0
+[ -s "$archive" ] || exit 0
+exec 9>/run/offbox-image-restore.lock || exit 1
+flock -w "$1" 9 || exit 124
+[ -e /run/offbox-images-ready ] && exit 0
+[ -s "$archive" ] || exit 0
+until docker info >/dev/null 2>&1; do sleep 1; done
+missing=0
+if [ -s "$archive.tags" ]; then
+  while read -r tag; do
+    [ -n "$tag" ] || continue
+    docker image inspect "$tag" >/dev/null 2>&1 || { missing=1; break; }
+  done < "$archive.tags"
+else
+  missing=1
+fi
+if [ "$missing" = 1 ]; then
+  size=$(du -h "$archive" 2>/dev/null | cut -f1)
+  echo "offbox: loading kept docker images (${size:-unknown size})..." >&2
+  zstd -dc "$archive" | docker load > /var/tmp/offbox-image-restore.log 2>&1 || exit 1
+fi
+touch /run/offbox-images-ready
+"""
+rc, _ = bounded(['sudo', '-n', 'timeout', '-k', '2s', f'{seconds}s', 'bash', '-c', script,
+                 'offbox-image-restore', str(seconds)], seconds, relay=True)
+if rc:
+    # timeout itself may wait forever on a D-state docker child; supervise that probe too.
+    docker_rc, _ = bounded(['timeout', '-k', '1s', '10s', 'docker', 'info'], 11)
+    if docker_rc:
+        ps_rc, output = bounded(['ps', '-eo', 'stat=,comm='], 2, capture=True)
+        names = [parts[1] for line in output.decode(errors='replace').splitlines()
+                 if len(parts := line.split(None, 1)) == 2 and parts[0].startswith('D')]
+        state = f"{len(names)} ({', '.join(names[:5])})" if ps_rc == 0 else 'unknown (ps did not answer)'
+        lock_rc, output = bounded(['sudo', '-n', 'lslocks', '--json', '-o', 'PID,COMMAND,MODE,PATH'], 2, capture=True)
+        holder = 'unknown'
+        try:
+            import json
+            for lock in json.loads(output)['locks'] if lock_rc == 0 else []:
+                # A mode ending in '*' is a waiter, not the process holding the lock.
+                if (lock.get('path') == '/run/offbox-image-restore.lock'
+                        and not lock.get('mode', '').endswith('*') and (lock.get('pid') or 0) > 0):
+                    comm = ' '.join((lock.get('command') or 'unknown').split())
+                    holder = f"{lock['pid']} {comm}"
+                    break
+        except (ValueError, KeyError, TypeError, AttributeError):
+            pass
+        print(f'offbox-box-wedged: kept image restore did not finish in {seconds}s and docker does not answer; '
+              f'D-state: {state}; lock holder: {holder}', file=sys.stderr)
+        sys.exit(97)
+sys.exit(1 if rc == 97 else rc)
+OFFBOX_IMAGE_WAIT
+  _offbox_rc=$?
+  case $_offbox_rc in
+    0) ;;
+    97) exit 97 ;;
+    124|137) echo "offbox: kept docker images still loading after ${_offbox_seconds}s; continuing without waiting" >&2 ;;
+    *) echo 'offbox: could not restore kept docker images; continuing without waiting' >&2 ;;
+  esac
+  exit 0
+) || exit $?'''
+
+
+def needs_image_wait(cmd: str, repo_root: str) -> bool:
+    """Skip only simple read-only commands which cannot start a container themselves.
+
+    Scripts, make targets, tests and unknown commands can invoke Docker without naming it in argv.
+    """
+    if re.search(r"[;&|<>$`\n(){}*?\[\]\\]", cmd) or re.search(r"(^|\s)#", cmd):
+        return True
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        return True
+    if not words:
+        return True
+    if words[0] in ("true", "false", ":", "pwd"):
+        return len(words) != 1
+    if lease.uses_docker(cmd, repo_root):
+        return True
+    # Go commands can execute a GOFLAGS -toolexec/-exec from the box's persistent Go env. Version is safe.
+    if words == ["go", "version"]:
+        return False
+    return True
+
+
+def image_wait_seconds() -> int:
+    """The client sets the remote bound; it is not implicitly forwarded as command environment."""
+    value = os.environ.get("OFFBOX_IMAGE_WAIT_SECONDS") or "180"
+    return int(value) if re.fullmatch(r"[1-9][0-9]{0,3}", value) else 180
+
+
+def clickhouse_suite_warning(repo_key: str, size: str, cmd: str) -> str | None:
+    if repo_key != 'crpko-devops' or size not in ('large', 'xlarge'):
+        return None
+    words = [word.rsplit('/', 1)[-1] for word in re.findall(r'[A-Za-z0-9_./:+-]+', cmd)]
+    runner = any(re.fullmatch(r'python(?:[23](?:\.\d+)?)?|pytest|npm|pnpm|npx|node', word) for word in words)
+    suite = any(re.fullmatch(r'unittest|pytest|test(?:[-_:].*|\.py)?|run-static-test-shard\.mjs', word) for word in words)
+    if runner and suite:
+        return ('ClickHouse 24.8 alert fixtures can exhaust threads on large/xlarge boxes; '
+                'use fixture max_threads=8 (raising PID limits alone does not fix it; #915)')
+    return None
 
 
 GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can overlap pooled runs.
@@ -231,7 +471,63 @@ LDCACHE_REPAIR = r'''(
   fi
 ) || true'''
 
+# Warm boxes retain watchman roots across runs; exhaustion poisons the server until it restarts.
+WATCH_REPAIR = r'''(
+  _offbox_proc=${OFFBOX_INOTIFY_PROC_DIR:-/proc/sys/fs/inotify}
+  _offbox_config=
+  _offbox_failed=0
+  for _offbox_limit in max_user_watches:524288 max_user_instances:1024; do
+    _offbox_name=${_offbox_limit%:*}
+    _offbox_floor=${_offbox_limit#*:}
+    _offbox_value=$(cat "$_offbox_proc/$_offbox_name" 2>/dev/null) || continue
+    case $_offbox_value in ''|*[!0-9]*) continue;; esac
+    if [ "$_offbox_value" -lt "$_offbox_floor" ]; then
+      _offbox_value=$_offbox_floor
+      sudo -n sysctl -q -w "fs.inotify.$_offbox_name=$_offbox_value" >/dev/null 2>&1 || _offbox_failed=1
+    fi
+    _offbox_config="${_offbox_config}fs.inotify.$_offbox_name=$_offbox_value
+"
+  done
+  if [ -n "$_offbox_config" ] &&
+     [ "$(cat /etc/sysctl.d/90-offbox-inotify.conf 2>/dev/null)" != "${_offbox_config%$'\n'}" ]; then
+    printf '%s' "$_offbox_config" | sudo -n tee /etc/sysctl.d/90-offbox-inotify.conf >/dev/null 2>&1 || _offbox_failed=1
+  fi
+  if [ "$_offbox_failed" -ne 0 ]; then
+    echo 'offbox: inotify limit repair failed (sudo -n); continuing' >&2
+  fi
+  if command -v watchman >/dev/null 2>&1; then
+    _offbox_watch=$(timeout 10 watchman watch-list 2>&1) || true
+    case $_offbox_watch in
+      *'Watchman needs your help'*|*poison*)
+        # A healthy root path can contain these words. Keep JSON errors and surrounding diagnostics only.
+        _offbox_watch=$(printf '%s' "$_offbox_watch" | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+for i, char in enumerate(raw):
+    if char != "{":
+        continue
+    try:
+        response, end = json.JSONDecoder().raw_decode(raw, i)
+    except ValueError:
+        continue
+    if "roots" in response or "error" in response:
+        raw = raw[:i] + str(response.get("error", "")) + raw[end:]
+        break
+print(raw)
+' 2>/dev/null) || _offbox_watch=
+        case $_offbox_watch in
+          *'Watchman needs your help'*|*poison*)
+            if timeout 10 watchman shutdown-server >/dev/null 2>&1; then
+              echo 'offbox: watchman was poisoned (inotify limit); restarted it' >&2
+            fi;;
+        esac;;
+    esac
+  fi
+) || true'''
+
 SETUP_FAILED_MARKER = "offbox-setup-failed"
+BOX_WEDGED_MARKER = "offbox-box-wedged"
+COMMAND_STARTED_MARKER = "offbox-command-started:"
 # boat's agent could not start the command's systemd scope: the box's systemd is broken and our script never ran.
 # A stop + resume fixes it (bx_azff4qna 21 Oct, bx_z9u6f9c8 30 Oct).
 SCOPE_FAILED = re.compile(r"^Failed to start transient scope unit: ")
@@ -383,6 +679,96 @@ def setup_failed(log_path: Path | None) -> bool:
     return bool(log_path) and Path(log_path).exists() and SETUP_FAILED_MARKER in Path(log_path).read_text(errors="replace")
 
 
+NO_NODE_MODULES_MARKER = "OFFBOX_NO_NODE_MODULES"
+
+
+def missing_deps_hint(root: Path) -> str:
+    install = package_manager.install_command(root)
+    node = node_version.want(root, root)
+    requirement = (f" Use Node matching {node[1]}." if node else "") + package_manager.version_note(root)
+    return ("no node_modules on this box yet (fresh or pruned box). Install deps and run the command in the same call: "
+            f"offbox run -- '{install} && <command>'; offbox save --default afterwards keeps them."
+            + requirement + " Check the repo's CI install flags and manager version before running.")
+
+
+def box_deps_hint(root: Path, log_path: Path | None) -> str:
+    # Only the remote marker proves absence: the Mac's node_modules is never synced.
+    try:
+        marked = bool(log_path) and NO_NODE_MODULES_MARKER in log_path.read_text(errors="replace").splitlines()
+    except OSError:
+        marked = False
+    if not marked:
+        return ""
+    return missing_deps_hint(root)
+
+
+def repo_setup_failed(code: int | None, log_path: Path | None) -> bool:
+    return (code == EXIT_REPO_SETUP and bool(log_path) and Path(log_path).exists()
+            and REPO_SETUP_FAILED_MARKER in Path(log_path).read_text(errors="replace").splitlines())
+
+
+def _wedged_line(text: str) -> str | None:
+    lines = text.splitlines()
+    if COMMAND_STARTED_MARKER in text:
+        return None
+    return next((line for line in lines if line.startswith(BOX_WEDGED_MARKER + ': ')), None)
+
+
+def box_wedged(log_path: Path | None) -> str | None:
+    """Diagnostic only: a merged display log is not sufficient to authorize retry."""
+    if log_path and Path(log_path).exists():
+        return _wedged_line(Path(log_path).read_text(errors="replace"))
+    return None
+
+
+def settle_box_wedged(con, run, code):
+    """Only a confirmed pre-command marker plus exit 97 permits moving off a box. Caller holds its box lock."""
+    if code != 97 or not run:
+        return None
+    # A local start fence rules out retry even when command history is unavailable.
+    try:
+        if run['log_path'] and COMMAND_STARTED_MARKER in Path(run['log_path']).read_text(errors='replace'):
+            return None
+    except OSError:
+        pass
+    # Display logs interleave streams and may split/glue a marker around stdout chunks. Only complete stderr
+    # from offset zero authorizes retry; neither a merged log nor a status tail can prove the command never ran.
+    if not run['command_id']:
+        return None
+    text, offset = '', 0
+    # Errors leave the active row intact so a later refresh can still quarantine the box.
+    for _ in range(8):
+        page = api.history_logs(run['box_id'], run['command_id'], 'stderr', offset)
+        text += page.get('data') or ''
+        if COMMAND_STARTED_MARKER in text:
+            return None
+        if page.get('done'):
+            evidence = _wedged_line(text)
+            break
+        nxt = page.get('nextOffset')
+        if not nxt or nxt <= offset:
+            raise OffboxError(f"{run['run_id']}: exit 97 needs complete stderr before settlement; retry")
+        offset = nxt
+    else:
+        raise OffboxError(f"{run['run_id']}: exit 97 stderr exceeded the settlement page limit; retry")
+    if not evidence:
+        return None
+    stopped = lease.set_aside(con, run['box_id'], 'box-wedged', evidence, run_id=run['run_id'])
+    return evidence, stopped
+
+
+def wedged_message(box, evidence, stopped, retry=False):
+    after = 'stopped and set aside' if stopped else 'set aside (stop could not be confirmed)'
+    return (f"{box} is wedged ({evidence}); {after} (offbox list --all shows it). "
+            + ('Nothing ran there; running on another box' if retry else 'Nothing ran: retry'))
+
+
+class BoxWedged(OffboxError):
+    def __init__(self, box, evidence, stopped):
+        super().__init__(wedged_message(box, evidence, stopped), code=EXIT_INFRA)
+        self.box, self.evidence, self.stopped = box, evidence, stopped
+
+
 def scope_failed(log_path: Path | None) -> bool:
     """True when the run's only output is boat's scope error: nothing of ours ran."""
     if not log_path or not Path(log_path).exists():
@@ -395,29 +781,232 @@ def exit_recording_command(script: str, run_id: str) -> str:
     """Run the remote script under a parent shell that writes its exit code to ~/.offbox/exit/<run>.rc,
     so a run boat later reports as lost still has its real status on the box."""
     f = f'"$HOME/.offbox/exit/{run_id}.rc"'
+    dk = f'"$HOME/.offbox/exit/{run_id}.dk"'
+    persist = '\n'.join([
+        'mkdir -p "$HOME/.offbox/exit" || exit 1',
+        f'printf "%s\\n" "$1" > {f}.tmp && mv -f {f}.tmp {f}',
+        'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" -o -name "*.pid" '
+        '-o -name "*.containers.json" -o -name "*.containers.tmp" \\) -mtime +2 -delete',
+    ])
+    # Filesystem calls after the preamble are just as capable of wedging as restore's flock/load. The helper
+    # owns no run output descriptors and is abandoned at its deadline even if its children cannot be killed.
+    persist_block = ('python3 - "$__offbox_rc" <<\'OFFBOX_EXIT_RECORD\'\n' + BOUNDED_PROCESS
+                     + f"\nbounded(['bash', '-c', {persist!r}, 'offbox-exit-record', sys.argv[1]], 2)\n"
+                     + 'OFFBOX_EXIT_RECORD')
+    marker = ('mkdir -p "$HOME/.offbox/claim" || exit 97; '
+              f'mkdir "$HOME/.offbox/claim/{run_id}" 2>/dev/null || exit 98; '
+              f'printf "%s\\n" "$1" > "$HOME/.offbox/claim/{run_id}/pid" || exit 97; '
+              f'date +%s > "$HOME/.offbox/claim/{run_id}/epoch" || exit 97; '
+              'mkdir -p "$HOME/.offbox/exit" && '
+              f'printf "%s\\n" "$1" > "$HOME/.offbox/exit/{run_id}.pid"')
+    # Pass the wrapper's PID: the supervised writer has a different PID and may outlive its deadline.
+    marker_block = ('python3 - "$$" <<\'OFFBOX_PID_RECORD\'\n' + BOUNDED_PROCESS
+                    + f"\nrc, _ = bounded(['bash', '-c', {marker!r}, 'offbox-pid-record', sys.argv[1]], 2)\n"
+                    + 'sys.exit(rc)\nOFFBOX_PID_RECORD')
     outer = "\n".join([
-        'mkdir -p "$HOME/.offbox/exit" 2>/dev/null',
-        'find "$HOME/.offbox/exit" -name "*.rc" -mtime +2 -delete 2>/dev/null',
+        marker_block,
+        '__offbox_rc=$?',
+        'if [ "$__offbox_rc" = 98 ]; then',
+        f'  rm -f "$HOME/.offbox/env/{run_id}.env"; echo offbox-claim-refused >&2; exit 98',
+        'fi',
+        'if [ "$__offbox_rc" -ne 0 ]; then',
+        '  echo "offbox-box-wedged: run marker setup failed or did not finish in 2s (exit directory/PID write)" >&2',
+        '  __offbox_rc=97',
+        'else',
+        '__offbox_t0=$(date +%s)',
         'bash -lc "$0"',
         '__offbox_rc=$?',
-        f'{{ echo "$__offbox_rc" > {f}.tmp && mv -f {f}.tmp {f}; }} 2>/dev/null',
+        'fi',
+        persist_block,
+        # Whether a container started during the run (events, since testcontainers removes its own): only then
+        # does the box get the longer Docker idle window. <run>.dk holds "1" (a container started) or "0" (the query
+        # answered, or dockerd is plainly inactive: none did). No file = unknown (failed/odd dockerd state, timeout,
+        # error): offbox keeps the Docker window.
+        # dockerd is only asked while it runs: the docker CLI would socket-activate it on every run otherwise.
+        # Exit 97 may be a pre-command wedged-Docker failure. Keep usage unknown, without another Docker call.
+        'if [ "$__offbox_rc" != 97 ]; then',
+        'if systemctl is-active --quiet docker 2>/dev/null; then',
+        '  __offbox_ev=$(timeout 5 docker events --since "$__offbox_t0" --until "$(( $(date +%s) + 1 ))" '
+        '--filter type=container --filter event=start --format x 2>/dev/null) && '
+        f'{{ [ -n "$__offbox_ev" ] && echo 1 || echo 0; }} > {dk} 2>/dev/null',
+        'elif [ "$(systemctl is-active docker 2>/dev/null)" = inactive ]; then',
+        f'  echo 0 > {dk} 2>/dev/null',
+        'fi',
+        'fi',
         'exit "$__offbox_rc"',
     ])
     return "bash -c " + shlex.quote(outer) + " " + shlex.quote(script)
 
 
 def recorded_exit(box_id: str, run_id: str, timeout: float = 20) -> int | None:
-    """The exit code the run's wrapper left on the box, or None if the file is missing or unreadable."""
+    """None means no file. Failed SSH or an unreadable exit is unknown and must not free the box."""
     try:
-        p = ssh_sync.ssh(box_id, f'cat "$HOME/.offbox/exit/{run_id}.rc"', timeout=timeout)
+        p = ssh_sync.ssh(box_id, f'if test -e "$HOME/.offbox/exit/{run_id}.rc"; then '
+                        f'cat "$HOME/.offbox/exit/{run_id}.rc"; else exit 44; fi', timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired, OffboxError) as e:
+        raise OffboxError(f"exit file unreadable on {box_id}: {e}", started=True) from e
+    if p.returncode == 44:
+        return None
+    if p.returncode == 0:
+        try:
+            return int(p.stdout.decode(errors="replace").strip())
+        except ValueError:
+            pass
+    raise OffboxError(f"exit file unreadable on {box_id} (ssh exit {p.returncode})", started=True)
+
+
+def remote_alive(box_id: str, run_id: str, timeout: float = 20) -> str | None:
+    """One bounded SSH read; missing legacy markers and failed SSH remain unknown."""
+    base = f'"$HOME/.offbox/exit/{run_id}'
+    cmd = (f'if test -f {base}.rc"; then echo ended; '
+           f'elif p=$(cat {base}.pid" 2>/dev/null); then '
+           'case "$p" in ""|*[!0-9]*|0|1) echo unknown;; *) '
+           'if kill -0 "$p" 2>/dev/null; then echo alive; else echo gone; fi;; esac; '
+           'else echo unknown; fi')
+    try:
+        p = ssh_sync.ssh(box_id, cmd, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired, OffboxError):
         return None
-    if p.returncode != 0:
-        return None
+    result = p.stdout.decode(errors="replace").strip()
+    return result if p.returncode == 0 and result in ("ended", "alive", "gone") else None
+
+
+def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: bool = True,
+                   check_box: bool = False) -> dict | None:
+    """Check retained history, then .rc, then liveness. None keeps the run reserved (alive or unknown)."""
+    deadline = now() + timeout
+
+    def left():
+        remaining = deadline - now()
+        if remaining <= 0:
+            raise OffboxError(f"lost confirmation timed out on {box_id}", started=True)
+        return remaining
+
+    con = db()
     try:
-        return int(p.stdout.decode(errors="replace").strip())
-    except ValueError:
+        if record:
+            con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', (f'lost_checked:{run_id}', '1'))
+            con.commit()
+        row = con.execute('SELECT command_id FROM runs WHERE run_id=?', (run_id,)).fetchone()
+        history_unknown = False
+        if row and row['command_id']:
+            try:
+                # Leave time for the independent SSH evidence even if the tracker hangs.
+                with api.budget(min(5, left() / 2)):
+                    code = (api.history_get(box_id, row['command_id']) or {}).get('exitCode')
+            except OffboxError as e:
+                history_unknown = not (isinstance(e, api.ApiError) and e.status == 404)
+                code = None
+            left()
+            if code is not None:
+                return dict(status='exited', running=False, exitCode=code)
+        if check_box:
+            # A follower owns the box lock, so it must detect a stopped/deleted box without the reaper.
+            try:
+                with api.budget(min(5, left() / 2)):
+                    box = api.get(box_id, deadline=now() + min(5, left() / 2))
+                left()
+            except OffboxError:
+                box = {'state': 'unknown'}
+            if box is None or box.get('state') in (*api.STOPPED_STATES, 'error', 'cancelled'):
+                if history_unknown:
+                    return None
+                if record:
+                    con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{run_id}', 'box'))
+                    con.commit()
+                return dict(status='lost', running=False, exitCode=None)
+        code = recorded_exit(box_id, run_id, timeout=left())
+        left()
+        if code is not None:
+            return dict(status='exited', running=False, exitCode=code)
+        alive = remote_alive(box_id, run_id, timeout=left())
+        left()
+        if alive in ('gone', 'ended'):
+            # The wrapper can publish .rc and exit between remote_alive's first file test and kill -0.
+            code = recorded_exit(box_id, run_id, timeout=left())
+            left()
+            if code is not None:
+                return dict(status='exited', running=False, exitCode=code)
+        if alive == 'gone':
+            if history_unknown:
+                return None
+            if record:
+                con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{run_id}', '1'))
+                con.commit()
+            return dict(status='lost', running=False, exitCode=None)
+        if alive == 'alive' and record:
+            cur = con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', (f'lost_spurious:{run_id}', '1'))
+            con.commit()
+            if cur.rowcount:
+                event(con, box_id, 'run_lost_spurious', run_id)
+        # 'ended' can race the first read: leave it active and read .rc on the next probe.
         return None
+    finally:
+        con.close()
+
+
+def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = None,
+                   until: float | None = None) -> None:
+    """Under box-<id>: repair old lost rows before following or handing their box to another run."""
+    rows = con.execute("SELECT * FROM runs WHERE box_id=? AND status='lost' AND exit_code IS NULL "
+                       "AND NOT EXISTS (SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)",
+                       (box_id,)).fetchall()
+    if not rows:
+        return
+    deadline = now() + timeout
+    if state is None:
+        try:
+            with api.budget(timeout):
+                box = api.get(box_id)
+            state = box.get('state') if box else None
+        except OffboxError:
+            state = 'unknown'
+    if state == 'unknown':
+        # A formerly lost row must reserve the lease while its box cannot be checked.
+        con.execute("UPDATE runs SET status='running',end_at=NULL WHERE box_id=? AND status='lost' "
+                    "AND NOT EXISTS (SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)", (box_id,))
+        con.commit()
+        return
+    if state in (*api.STOPPED_STATES, 'error', 'cancelled') or state is None:
+        con.executemany('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)',
+                        [(f"lost_confirmed:{r['run_id']}", '1') for r in rows])
+        con.commit()
+        return
+    if state not in api.LIVE_STATES:
+        return
+    for row in rows:
+        try:
+            st = confirmed_lost(box_id, row['run_id'], max(0, deadline - now()))
+        except OffboxError:
+            st = None
+        if st and st['status'] == 'lost':
+            con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', (f"lost_confirmed:{row['run_id']}", '1'))
+        else:
+            code = st['exitCode'] if st else None
+            status = ('done' if code == 0 else 'failed') if st else 'running'
+            if code == 97:
+                # The quarantine service only settles active rows, so restore its reservation first.
+                con.execute("UPDATE runs SET status='running',end_at=NULL WHERE run_id=? AND status='lost'",
+                            (row['run_id'],))
+                con.commit()
+                with api.budget(max(0, deadline-now())):
+                    wedged = settle_box_wedged(con, row, code)
+                if wedged:
+                    say(wedged_message(box_id, *wedged))
+                    continue
+            if st and row['pulls']:
+                do_pulls(box_id, dict(row), json.loads(row['pulls']), until=until)
+            if until is not None and now() >= until:
+                raise OffboxError(f"lost reconciliation timed out on {box_id}", code=EXIT_WAIT_TIMEOUT, started=True)
+            con.execute("UPDATE runs SET status=?,exit_code=?,end_at=?,error=NULL WHERE run_id=? "
+                        "AND status IN ('lost','running')",
+                        (status, code, now() if st else None, row['run_id']))
+            event(con, box_id, 'run_reattached', f"{row['run_id']} {status} exit={code}")
+        con.commit()
+        if st and st.get('exitCode') is not None:
+            settle_docker(con, row, status, timeout=10 if until is None else max(0, until-now()))
+            from .misc import _catch_up_finished
+            _catch_up_finished(con, row['run_id'], budget=10 if until is None else max(0, until-now()))
 
 
 def steps_exit(log_path: Path | None, planned: int) -> int | None:
@@ -430,21 +1019,62 @@ def steps_exit(log_path: Path | None, planned: int) -> int | None:
     return next((res[n] for n in range(1, planned + 1) if res[n] != 0), 0)
 
 
+def containers_seen(box_id: str, run_id: str, timeout: float = 10) -> bool:
+    """False only when the run's wrapper got an answer from dockerd and no container started during the run."""
+    try:
+        p = ssh_sync.ssh(box_id, f'cat "$HOME/.offbox/exit/{run_id}.dk" 2>/dev/null || echo unknown', timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired, OffboxError):
+        return True
+    return not (p.returncode == 0 and p.stdout.decode(errors="replace").strip() == "0")
+
+
+def settle_docker(con, run, status: str, timeout: float = 10) -> None:
+    """A run that only mentioned Docker (command or manifest) and started no container loses runs.docker, so its
+    box gets the ordinary idle window. Runs that didn't end normally keep it."""
+    started = time.monotonic()
+    if status in ('done', 'failed', 'killed', 'lost', 'interrupted', 'infra'):
+        containers.record(con, run, BOUNDED_PROCESS, timeout=timeout)
+    timeout = max(0, timeout - (time.monotonic() - started))
+    if timeout > 0 and run["docker"] and run["box_id"] and status in ("done", "failed") and not containers_seen(
+            run["box_id"], run["run_id"], timeout=min(10, timeout)):
+        con.execute("UPDATE runs SET docker=0 WHERE run_id=?", (run["run_id"],))
+        con.commit()
+
+
 def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: int,
                       timeout: float = 20) -> tuple[int | None, str]:
-    """A run boat reports as lost may still have ended: take its real code from the box, else the step lines.
-    `timeout` bounds the box read (a caller with a deadline passes what is left of it)."""
-    code = recorded_exit(box_id, run_id, timeout=timeout)
+    """A lost process can still have its exit on disk, in step results or in retained command history.
+    Failure to read history propagates, keeping the active row available for later reconciliation."""
+    deadline = time.monotonic() + timeout
+    con = db()
+    try:
+        row = con.execute('SELECT command_id FROM runs WHERE run_id=?', (run_id,)).fetchone()
+        confirmed = con.execute('SELECT v FROM kv WHERE k=?', (f'lost_confirmed:{run_id}',)).fetchone()
+    finally:
+        con.close()
+    # Only box-state confirmation rules out SSH: a dead PID's saved exit can still be read on a live box.
+    stopped = confirmed and confirmed['v'] == 'box'
+    code = None if stopped else recorded_exit(box_id, run_id, timeout=timeout)
     if code is not None:
         return code, "the box's exit file"
     code = steps_exit(log_path, planned)
     if code is not None:
         return code, "the step results"
+    if row and row['command_id']:
+        try:
+            with api.budget(max(0, deadline - time.monotonic())):
+                code = (api.history_get(box_id, row['command_id']) or {}).get('exitCode')
+        except api.ApiError as e:
+            if not (stopped and e.status == 404):
+                raise
+            code = None
+        if code is not None:
+            return code, 'retained command history'
     return None, ""
 
 
 def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | None = None, planned: int = 0,
-                where: str = "remote") -> None:
+                where: str = "remote", deps_hint: str = "", box_id: str | None = None) -> None:
     """Always the last offbox line, so a caller's own `| tail` / `; echo` can't be mistaken for it."""
     if step_res is not None:
         say(steps_summary(step_res, planned))
@@ -452,8 +1082,11 @@ def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | No
         say("exit 1 may be from the trailing grep (no match) or an earlier stage. Use --step for each command.")
     if code == 137 or any(rc == 137 for _, rc in (step_res or [])):
         say("exit 137 = the box killed the command for memory. Rerun with --size xlarge.")
+    if where == "remote" and deps_hint and (code not in (0, None) or any(rc != 0 for _, rc in (step_res or []))):
+        say(deps_hint)
     if code is None:
-        say("remote exit unknown (process lost); offbox exits 90")
+        hint = f"; inspect with offbox ssh {box_id}" if box_id else ""
+        say("remote exit unknown (process lost); offbox exits 90" + hint)
     else:
         say(f"{where} exit {code}" + (masked_status_hint(cmd) if code == 0 else ""))
 
@@ -479,19 +1112,40 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
 
 
 def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, run_id: str,
-                  steps: list[str] | None = None, node: str = "") -> str:
+                  steps: list[str] | None = None, node: str = "", wait_images: bool = False,
+                  image_wait: int = 180, repo_key: str = "", repo_root: Path | None = None,
+                  preserve_containers: str = 'private lease') -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
+    root = '"$HOME"/' + shlex.quote(rdir)
+    deps_check = (f'__offbox_exit=$?; if [ "$__offbox_exit" -ne 0 ] && [ -f {root}/package.json ] '
+                  f'&& [ ! -e {root}/node_modules ]; then printf "\\n%s\\n" {NO_NODE_MODULES_MARKER} >&2; fi; '
+                  'if [ -n "${__offbox_bash_env:-}" ]; then rm -f -- "$__offbox_bash_env"; fi; exit "$__offbox_exit"')
     lines = ["set -a", f'[ -f "{env_file}" ] && . "{env_file}"; rm -f "{env_file}"' if env_file else ":", "set +a",
              f'export OFFBOX_RUN_ID={run_id}',
+              'trap ' + shlex.quote(deps_check) + ' EXIT',
               DOCKER_REPAIR,
               LDCACHE_REPAIR,
-              '[ -x /usr/local/bin/offbox-wait-images ] && /usr/local/bin/offbox-wait-images',
+              WATCH_REPAIR,
+              (f'OFFBOX_IMAGE_WAIT_SECONDS={image_wait}\n{IMAGE_WAIT}\nunset OFFBOX_IMAGE_WAIT_SECONDS'
+               if wait_images else ':'),
+              containers.script(run_id, BOUNDED_PROCESS, preserve=preserve_containers),
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
+              repo_setup_block(repo_key, rdir),
               GO_REPAIR,
               node,
-              cmd]
+              node_tools.block(rdir, repo_root),
+              ('''for _offbox_tool in terraform aws ruby vector; do
+  command -v "$_offbox_tool" >/dev/null || {
+    echo "offbox: required tool missing on command PATH: $_offbox_tool" >&2
+    echo offbox-repo-setup-failed >&2
+    exit 98
+  }
+done''' if repo_key == "crpko-devops" else ':'),
+              f'echo "{COMMAND_STARTED_MARKER} {run_id}" >&2',
+              # Keep caller cd/exit/traps inside a subshell so the root check always runs.
+              "(\n" + cmd + "\n)"]
     return "\n".join(lines)
 
 
@@ -508,8 +1162,13 @@ class Runner:
         self.box = None
         self.pid = None
         self.started = False
+        self.recovered_code = None
         self.killed = False
         self.lease_row = None
+        self.cold_boxes: set[str] = set()
+        self.cold_moved = False
+        self.push_resumed = False
+        self.wait_images = False
         self.log_path = LOGS_DIR / f"{self.run_id}.log"
 
     def record(self, **kw):
@@ -523,16 +1182,24 @@ class Runner:
         con = db()
         steps = getattr(a, "steps", None) or []
         if steps:
-            cmd_text = " ; ".join(steps)[:4000]
+            cmd_text = " ; ".join(steps)
         else:
             cmd_text = " ".join(shlex.quote(x) for x in a.cmd) if len(a.cmd) > 1 else a.cmd[0]
+        wait_images = needs_image_wait(cmd_text, me["repo_root"])
+        self.wait_images = wait_images
         # client_pid: `offbox wait` on a run still queued for a box can tell a live client from one that died.
         con.execute("""INSERT INTO runs (run_id, owner, session_id, thread_id, repo_root, cwd, cmd, mode, status, start_at,
                        log_path, pulls, rel_cwd, local_cwd, client_pid) VALUES (?,?,?,?,?,?,?,?, 'starting', ?,?,?,?,?,?)""",
                     (self.run_id, me["owner"], me.get("session"), me.get("thread"), me["repo_root"], str(self.cwd),
                      cmd_text[:4000], "bg" if a.bg else "fg", now(), str(self.log_path),
                      json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid()))
+        con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_claim:{self.run_id}', '1'))
         con.commit()
+        if a.bg:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.log_path.touch()
+        say(f"pending run {self.run_id}; wait: offbox wait {self.run_id}; kill: offbox kill {self.run_id}")
+        event(con, None, "run_pending", self.run_id)
         t0 = now()
         size, why = lease.auto_size(con, cmd_text, me, a.size)
         if why:
@@ -540,43 +1207,85 @@ class Runner:
         env, explicit = build_env(a.env or [])
         env_file = f"/home/user/.offbox/env/{self.run_id}.env"
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()
-        for attempt in (1, 2):
-            row = pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh, run_id=self.run_id)
+        dead_attempts = 0
+        replacement = None
+        while True:
+            options = {'exclude': self.cold_boxes} if self.cold_boxes else {}
+            row = replacement or pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh,
+                                              run_id=self.run_id, **options)
+            replacement = None
             self.lease_row = row
             self.box = row["box_id"]
             rdir = row["remote_dir"]
             self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
                         docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
+            keeper_scope = None
+            if row.get('_prepare_end') is None:
+                row['_prepare_end'] = prepare.Budget(self.box).end
             try:
-                self._prepare_box(con, a, rdir, env_file, body)
+                with _keep_ttl(self.box, row['_prepare_end']) as keeper_scope:
+                    replacement = self._prepare_box(con, a, rdir, env_file, body)
+                if replacement is not None:
+                    pool.release_guard(row)
+                    self.lease_row, self.box = replacement, replacement['box_id']
+                    continue
                 break
-            except lease.DeadMount as e:
-                dead = self.box
-                self.record(box_id=None)  # our run row must not point at the box we stop
-                lease.set_aside_dead_mount(con, dead, e.reason)
+            except (prepare.Stalled, TtlUnconfirmed) as e:
+                self.record(box_id=None)
+                self.cold_boxes.add(self.box)
                 pool.release_guard(row)
                 self.lease_row = self.box = None
-                if attempt == 2:
+                if replacement is None:
+                    prepare.move_once(e)
+                say(f"{e}; trying another box")
+            except lease.DeadMount as e:
+                replacement = None
+                dead_attempts += 1
+                dead = self.box
+                self.record(box_id=None)  # our run row must not point at the box we stop
+                ttl_confirmed = keeper_scope is None or keeper_scope.settled.is_set()
+                if ttl_confirmed:
+                    lease.set_aside_dead_mount(con, dead, e.reason)
+                pool.release_guard(row)
+                self.lease_row = self.box = None
+                if dead_attempts == 2:
                     raise OffboxError(f"{dead} has a dead filesystem ({e.reason}), and so did the box before it; "
                                       "both are set aside. Nothing ran: retry", code=EXIT_INFRA) from e
-                say(f"{dead} has a dead filesystem ({e.reason}): stopped and set aside (offbox list --all shows it). "
+                prepare.move_once(e)
+                action = 'stopped and set aside' if ttl_confirmed else 'set aside'
+                say(f"{dead} has a dead filesystem ({e.reason}): {action} (offbox list --all shows it). "
                     "Trying another box")
+            except BaseException:
+                if keeper_scope is not None and not keeper_scope.settled.is_set():
+                    self.record(box_id=None)  # finish must not assign an idle TTL to a fenced box
+                raise
         try:
             w = node_version.want(self.root, self.cwd)
             node_block = node_version.block(w) if w else ""
         except Exception:
             node_block = ""
+        new_checkout_hint(row, self.root)
+        warning = clickhouse_suite_warning(me['repo_key'], row['size'], cmd_text)
+        if warning:
+            say(warning)
         script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
-                               node=node_block)
+                               node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
+                               repo_key=me["repo_key"], repo_root=self.root,
+                               preserve_containers=containers.preserve_reason(con, row))
+        con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', ('containers_expected:' + self.run_id, '1'))
+        con.commit()
+        from . import start_check
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:
-            r = api.cmd_start(self.box, exit_recording_command(script, self.run_id))
-        except api.ApiError as e:
+            r = api.cmd_start(self.box, exit_recording_command(script, self.run_id),
+                              meta={"repo": me.get("repo_key"), "kind": run_kind(cmd_text), "run_id": self.run_id},
+                              retry_interrupted=retry_interrupted(a))
+        except (api.ApiError, api.NetworkError) as e:
             # A 4xx answer (400 E2BIG, 409 not ready, 429 rate limit) means boat refused it: nothing ran.
             # Without this the run sat "starting" for an hour and held the box until it stopped.
             # Cloudflare 521-526 except 524 never reached boat, so nothing ran; 520, 524 and network errors stay started.
-            if (e.status or 0) in REFUSED_STATUSES or (e.status or 0) in api.CF_NOT_DELIVERED:
+            if getattr(e, "status", None) in (*REFUSED_STATUSES, *api.CF_NOT_DELIVERED):
                 self.started = False
                 if e.api_code in ("sandbox_not_ready", "machine_not_running"):
                     # boat says the box is stopped: let offbox's next run resume it (lease._reuse) instead of a
@@ -591,6 +1300,26 @@ class Runner:
                     # Usage error, not infra: no infra alert, no retry, no fallback.
                     raise OffboxError(f"{e}: the command is too long for one exec; put it in a script file "
                                       "in the repo and run that", code=2) from e
+            elif isinstance(e, api.NetworkError) or 500 <= (e.status or 0) < 600:
+                time.sleep(start_check.GRACE_S)
+                result = start_check.check(self.box, self.run_id)
+                if result.code is not None:
+                    self.pid, self.recovered_code = result.pid, result.code
+                    self.record(process_id=self.pid, status='running')
+                    say(f"{self.run_id} on {self.box}: ran, exit {result.code}; live output unavailable; "
+                        + start_check.hint(self.box, self.run_id))
+                    return row
+                current = con.execute('SELECT * FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
+                start_check.settle(con, current, result, f'{e} on start')
+                if result.verdict == 'fenced':
+                    self.started = False
+                    event(con, self.box, 'cmd_start_lost', f'{self.run_id}: {e}; fenced')
+                    raise OffboxError(f'{self.run_id} on {self.box}: never got the command ({e}). Nothing ran',
+                                      outage=True, run_id=self.run_id, box=self.box) from e
+                raise OffboxError(f'{self.run_id} on {self.box}: start unknown: {e}; '
+                                  f'ssh check failed or command may still be running; '
+                                  + start_check.hint(self.box, self.run_id),
+                                  started=True, run_id=self.run_id, box=self.box) from e
             raise
         self.pid = r["processId"]
         self.started = True
@@ -600,21 +1329,90 @@ class Runner:
                                           f"cmd={cmd_text[:200]}")
         return row
 
-    def _prepare_box(self, con, a, rdir, env_file, body) -> None:
+    def _prepare_box(self, con, a, rdir, env_file, body) -> dict | None:
         """Everything before the command starts. Raises lease.DeadMount when the box's filesystem is dead."""
+        with prepare.guard(self.box, self.lease_row.get('_prepare_end')):
+            replacement = self._check_box(con, a, rdir)
+        if replacement is not None:
+            return replacement
+        # A healthy first push can take 10–25 minutes. Bound source reads too, using push's existing hour allowance.
+        with prepare.guard(self.box, seconds=3600), prepare.phase('push', self.box):
+            while True:
+                try:
+                    self._sync_box(con, a, rdir, env_file, body)
+                    break
+                except ssh_sync.BoxStoppedDuringPush:
+                    if self.push_resumed:
+                        raise
+                    self.push_resumed = True
+                    # The pool guard is still held. Bypass _reuse's cached running/master fast path.
+                    row = dict(self.lease_row, state='stopped')
+                    try:
+                        resumed = lease._reuse(con, row, row['size'])
+                        if resumed is None:
+                            raise OffboxError(f"lease {self.box} is no longer available")
+                    except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
+                        raise OffboxError(f"{e}; box stopped during push: {self.box}") from e
+                    log(f"push_box_stopped_resumed {self.box}")
+        return None
+
+    def _check_box(self, con, a, rdir) -> dict | None:
         # The probe goes before prune: prune's ssh hangs on a dead filesystem.
-        reason = ssh_sync.probe_home(self.box)
+        forced_cold = self.lease_row.get('_cold_resume')
+        reason, home_s = ssh_sync.probe_home(self.box, measure_write=not forced_cold)
         if reason:
             raise lease.DeadMount(self.box, reason)
-        prune.run(con, self.box, rdir)
+        docker_s = ssh_sync.probe_docker_root(self.box) if self.wait_images and not forced_cold else None
+        pruned = prune.run(con, self.box, rdir)
+        threshold = capacity.setting('OFFBOX_COLD_HOME_SECONDS', 5)
+        if forced_cold or pruned.timed_out or any(s is not None and s > threshold for s in (home_s, docker_s)):
+            self.cold_boxes.add(self.box)
+            resumed = self.lease_row.get('_resumed_at')
+            if resumed is None:
+                last = con.execute("SELECT MAX(ts) FROM events WHERE box_id=? AND kind='lease_resume'",
+                                   (self.box,)).fetchone()
+                resumed = last[0]
+            since = f'{max(0, now() - resumed):.1f}s after resume' if resumed is not None else 'resume time unknown'
+            home = f'{home_s:.3f}s' if home_s is not None else 'unknown'
+            docker = f'{docker_s:.3f}s' if docker_s is not None else 'unknown'
+            event(con, self.box, 'cold_home', f'home {home}, docker {docker}, {since}; '
+                  f'prune_timeout={int(pruned.timed_out)} resume={forced_cold or "ordinary"}')
+            # A failed existence check proves nothing; only exit 1 means a first push is safe to move.
+            missing = False
+            if not self.cold_moved and not a.no_sync:
+                try:
+                    exists = ssh_sync.ssh(self.box, 'test -d "$HOME"/' + shlex.quote(rdir), timeout=10)
+                    missing = exists.returncode == 1
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+            if missing and prepare.can_move():
+                replacement = pool.try_warm(self.me, self.lease_row['size'], self.lease_row.get('source'),
+                                            self.cold_boxes, self.run_id)
+                if replacement is not None:
+                    prepare.move_once(OffboxError(f'{self.box} has a cold disk; using a warm box'))
+                    self.cold_moved = True
+                    say(f'{self.box} was just resumed and its disk is still loading; '
+                        f'using running box {replacement["box_id"]} instead')
+                    return replacement
+            say(f'{self.box} was just resumed and its disk is still loading; the first sync, installs and Docker '
+                'databases on it can be slow for 5-25 min. For long runs use --bg + offbox wait.')
+        return None
+
+    def _sync_box(self, con, a, rdir, env_file, body):
         # Env values go through a 0600 file (never the command text, which boat keeps 90 days in history).
         err: list = []
-        tw = threading.Thread(target=lambda: _safe(err, ssh_sync.put_file, self.box, env_file, body))
+        left = api.left()
+        upload_timeout = 120 if left is None else max(.001, min(120, left))
+        tw = threading.Thread(target=_safe,
+                              args=(err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout), daemon=True)
         tw.start()
         push_exc = None
         try:
             if not a.no_sync:
-                st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None))
+                with prepare.phase("push", self.box):
+                    candidates = _seed_candidates(con, self.box, rdir, self.me["repo_key"])
+                    st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None),
+                                       seed_candidates=candidates, run_id=self.run_id)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
                     f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
@@ -628,16 +1426,27 @@ class Runner:
         except Exception as e:  # noqa: BLE001 - held until the env upload has finished, then re-raised
             push_exc = e
         finally:
-            tw.join()
+            left = api.left()
+            tw.join(timeout=max(0, left) if left is not None else None)
+        if not a.no_sync and push_exc is None and err and not ssh_sync.dead_mount(str(err[0])):
+            # Resetting SSH can interrupt the parallel upload even when the file push recovers.
+            err.clear()
+            left = api.left()
+            upload_timeout = 120 if left is None else max(.001, min(120, left))
+            _safe(err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout)
         # A dead mount may have failed either transfer; prefer that over an ordinary error from the other.
         for e in (push_exc, err[0] if err else None):
             reason = ssh_sync.dead_mount(str(e)) if e is not None else None
             if reason:
                 raise lease.DeadMount(self.box, reason) from e
-        if push_exc is not None:
-            raise push_exc
-        if err:
-            raise err[0]
+        sync_exc = push_exc if push_exc is not None else err[0] if err else None
+        if sync_exc is not None:
+            if re.search(r"Broken pipe|code 255|\(255\)", str(sync_exc)):
+                state = _boat_state(self.box)
+                if state and state not in api.LIVE_STATES:
+                    raise OffboxError(f"box {self.box} was stopped by boat during the sync ({state}); nothing ran",
+                                      code=EXIT_INFRA) from sync_exc
+            raise sync_exc
 
     # ------------------------------------------------------------ streaming
     def stream(self, echo: bool = True) -> int | None:
@@ -654,11 +1463,43 @@ class Runner:
                 say(f"could not kill remote process: {e}")
 
 
+def _seed_candidates(con, box_id: str, current: str, repo_key: str) -> list[str]:
+    """Recent checkouts on this box whose local roots still identify as this repository."""
+    rows = con.execute("""SELECT r.remote_dir, r.repo_root, MAX(COALESCE(r.start_at, 0)) AS last,
+                                 EXISTS (SELECT 1 FROM pool_callers c JOIN pool_members p USING(box_id)
+                                         WHERE c.box_id=r.box_id AND c.repo_root=r.repo_root
+                                           AND c.remote_dir=r.remote_dir AND p.pool_key=?) AS mapped
+                          FROM runs r WHERE r.box_id=? AND r.remote_dir IS NOT NULL AND r.remote_dir<>?
+                          GROUP BY r.remote_dir, r.repo_root ORDER BY last DESC""",
+                       (repo_key, box_id, current)).fetchall()
+    out, checked = [], {}
+    for row in rows:
+        remote, root = row["remote_dir"], row["repo_root"]
+        if not root or not prune.DIR_RE.fullmatch(remote) or remote in out:
+            continue
+        if row["mapped"]:
+            out.append(remote)
+            continue
+        if root not in checked:
+            path = Path(root)
+            checked[root] = path.is_dir() and identity.repo_key(path) == repo_key
+        if checked[root]:
+            out.append(remote)
+    return out
+
+
 def _safe(err: list, fn, *args):
     try:
         fn(*args)
     except Exception as e:  # noqa: BLE001
         err.append(e if isinstance(e, OffboxError) else OffboxError(f"{type(e).__name__}: {e}"))
+
+
+def _boat_state(box_id: str) -> str | None:
+    try:
+        return (api.get(box_id) or {}).get("state")
+    except OffboxError:
+        return None
 
 
 def _ttl_keeper(box_id: str, stop_evt: threading.Event):
@@ -671,6 +1512,47 @@ def _ttl_keeper(box_id: str, stop_evt: threading.Event):
             ok = False
         if stop_evt.wait(TTL_REFRESH_S if ok else TTL_RETRY_S):
             return
+
+
+class TtlUnconfirmed(OffboxError):
+    def __init__(self, box_id):
+        super().__init__(f'{box_id} has an unconfirmed auto-stop update; set aside; nothing ran')
+
+
+@contextlib.contextmanager
+def _keep_ttl(box_id: str, prepare_end=None):
+    stop_evt = threading.Event()
+    requests = api.RequestScope(5)
+    end = prepare_end if prepare_end is not None else prepare.Budget(box_id).end
+
+    def refresh():
+        with requests.active():
+            _ttl_keeper(box_id, stop_evt)
+
+    keeper = threading.Thread(target=refresh, daemon=True)
+    keeper.start()
+    failed = False
+    try:
+        yield requests
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        stop_evt.set()
+        requests.cancel(preserve_mutations=True)
+        requests.settled.wait(max(0, min(1, end - time.monotonic())))
+        requests.cancel()
+        # Socket reads wake on cancel. A stuck DNS/Keychain lookup may remain, but cannot send a late PATCH.
+        keeper.join(1)
+        if not requests.settled.is_set():
+            # Reuse the existing persistent selection fence; keep the disk and let normal idle stopping handle it.
+            with contextlib.closing(db()) as con:
+                con.execute('UPDATE leases SET note=? WHERE box_id=?',
+                            (BOX_WEDGED_NOTE + ' unconfirmed keeper TTL PATCH', box_id))
+                con.commit()
+                event(con, box_id, 'ttl_unconfirmed', 'keeper PATCH sent without acknowledgement; box set aside')
+            if not failed:
+                raise TtlUnconfirmed(box_id)
 
 
 def _echo(stream, b: bytes) -> bool:
@@ -696,6 +1578,10 @@ def _close(frames) -> None:
 _KEEPER_JOIN_S = 65
 
 
+class _ClientSignal(KeyboardInterrupt):
+    """Unwind to stop/detach without waiting on a network-bound TTL keeper."""
+
+
 def _commit(log_path: Path, out_off: int, err_off: int, log_bytes: int) -> None:
     """Commit a checkpoint after a chunk is flushed to the local log: the remote offsets and the log length they match.
     A holder that dies before this write leaves the chunk past logBytes, so a takeover trusts only logBytes."""
@@ -716,7 +1602,7 @@ def _status_code(st: dict) -> int | None:
     return 128 + 15 if st.get("signal") else None
 
 
-def _ended(box_id: str, pid: int, until: float | None) -> dict | None:
+def _ended(box_id: str, pid: int, until: float | None, run_id: str | None = None) -> dict | None:
     """boat's status for the process when it says the process has ended (exited or lost), else None. One bounded
     request, no retries, never past the caller's deadline; any error counts as not ended."""
     try:
@@ -724,9 +1610,40 @@ def _ended(box_id: str, pid: int, until: float | None) -> dict | None:
         st = api.cmd_status(box_id, pid, timeout=left, retries=0, deadline=until)
     except OffboxError:
         return None
-    if st and not st.get("running") and st.get("status") in ("exited", "lost"):
+    if st and not st.get("running") and st.get("status") in ("exited", "lost", "interrupted"):
+        if st.get('status') == 'lost' and run_id:
+            try:
+                return confirmed_lost(box_id, run_id, 20 if until is None else min(20, max(0, until - now())),
+                                      check_box=True)
+            except OffboxError:
+                return None
         return st
     return None
+
+
+class Interrupted(OffboxError):
+    """Our server lost power (or was restarted hard) under the run, and the run is not being run again: it was
+    started with retry off, or it had already been retried once. Its own exit code does not exist."""
+
+    def __init__(self, what: str):
+        super().__init__(f"the offbox server restarted while {what} was running, and the run was not run again. "
+                         f"It did not finish; its output up to the restart is kept (offbox logs). "
+                         f"Run it again if that is safe (exit {EXIT_INTERRUPTED})", code=EXIT_INTERRUPTED,
+                         started=True)
+
+
+def retry_interrupted(a) -> bool:
+    """May the server run this command again by itself after a power cut? Yes for an ordinary `offbox run` (a
+    synced repo plus a test or build command: running it twice is harmless). No for person-box work (her
+    accounts, messages, logins: never twice without someone deciding), and no with --no-retry."""
+    if api.BACKEND != "server" or getattr(a, "no_retry", False):
+        return False
+    return person() is None
+
+
+# A cold boot of the home server can take this long (it trains memory): after a dropped stream the client keeps
+# reconnecting for 15 minutes, from the byte it had reached, before it gives up on a run the server accepted.
+HOME_RECONNECT_S = 900
 
 
 # follow() asks boat's status at most this often while a stream sends only heartbeats.
@@ -736,6 +1653,21 @@ _RUNNING = object()
 
 # Matches outage.WAIT_MAX_S: the auto-stop now holds ~25 min, so a run can ride out an outage that long.
 OUTAGE_FOLLOW_S = 1800
+
+
+def run_kind(cmd_text: str) -> str:
+    """A short label grouping runs for right-sizing on the server: the tool and its subcommand, e.g. `go test`,
+    `make test-int`, `pnpm vitest`. Flags, paths and arguments after the second word are dropped."""
+    try:
+        toks = shlex.split(cmd_text or "", posix=True)
+    except ValueError:
+        toks = (cmd_text or "").split()
+    if len(toks) >= 3 and toks[0].rsplit("/", 1)[-1] in ("bash", "sh", "zsh") and toks[1].startswith("-") \
+            and "c" in toks[1]:
+        return run_kind(toks[2])
+    words = [w for w in toks[:6] if not w.startswith("-") and "=" not in w]
+    words = [w.rsplit("/", 1)[-1] for w in words]
+    return " ".join(words[:2])[:60] or "?"
 
 
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
@@ -775,6 +1707,31 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
             # original right away sees a valid committed length rather than none.
             _commit(mirror_path, out_off, err_off, mf.tell())
     failures = 0
+    # Our own server restarts (no UPS): the window for reconnecting to a run it accepted, and what the stream said
+    # about the server and the attempt last time, to tell a restart and a retry from a network blip.
+    home_run = api.BACKEND == "server"
+    window = HOME_RECONNECT_S if home_run else OUTAGE_FOLLOW_S
+    what = run_id or f"{box_id}:{pid}"
+    seen = {"boot": None, "started": None, "attempt": None, "lost": False}
+
+    def hello(fr) -> None:
+        """First frame of every attach on our server: boot id, boatd start time, the run's attempt."""
+        boot, started, attempt = fr.get("bootId"), fr.get("serverStartedAt"), fr.get("attempt")
+        if seen["boot"] is not None and (boot != seen["boot"] or started != seen["started"]):
+            how = "the machine restarted" if boot != seen["boot"] else "its service restarted"
+            say(f"the offbox server restarted while this run was going ({how}); reconnected")
+        elif seen["lost"]:
+            say("reconnected to the offbox server")
+        seen.update(boot=boot, started=started, lost=False)
+        new_attempt(attempt)
+
+    def new_attempt(attempt) -> None:
+        if attempt and seen["attempt"] is not None and attempt != seen["attempt"]:
+            say(f"the restart cut the run off; the server is running it again from the start (attempt {attempt}). "
+                "Output continues below")
+        if attempt:
+            seen["attempt"] = attempt
+
     # How often boat's status has said the process ended with no output delivered in between. Unlike `failures`, a
     # frame does not reset it, only progress does: a failure that recurs after the first frame of every attach (31 Oct,
     # run-1031-140118-88ca: each reattach replayed one chunk, its echo raised EIO, `attached` cleared `failures`) still
@@ -791,6 +1748,25 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
         ended["n"] += 1
         return ended["n"]
 
+    def follow_lost():
+        if not run_id:
+            return None
+        while not stop_evt.is_set():
+            if until is not None and now() >= until:
+                raise timed_out()
+            budget = 20 if until is None else min(20, max(0, left()))
+            try:
+                st = confirmed_lost(box_id, run_id, budget, check_box=True)
+            except OffboxError:
+                st = None
+            if until is not None and now() >= until:
+                raise timed_out()
+            if st is not None:
+                return _status_code(st)
+            pause = QUIET_PROBE_S if until is None else min(QUIET_PROBE_S, max(0, left()))
+            stop_evt.wait(pause)
+        return None
+
     def probe_end():
         """On a reconnect or a long run of heartbeats: boat's exit code once its status has said the process ended
         twice with no output in between (None when boat lost it), else _RUNNING."""
@@ -799,8 +1775,12 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
         # An answer that arrives past the caller's deadline is not accepted: the wait ends with --timeout (124).
         if until is not None and now() >= until:
             raise timed_out()
+        if st is not None and st.get("status") == "interrupted":
+            raise Interrupted(what)
         if st is None or ended_again() < 2:
             return _RUNNING
+        if st.get('status') == 'lost':
+            return follow_lost()
         return _status_code(st)
 
     def timed_out() -> OffboxError:
@@ -824,7 +1804,7 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                 read_s = 90 if until is None else max(1.0, min(90.0, left()))
                 if down_from is not None:
                     # Inside an outage the attach may not outrun the outage window either.
-                    read_s = max(1.0, min(read_s, OUTAGE_FOLLOW_S - (now() - down_from)))
+                    read_s = max(1.0, min(read_s, window - (now() - down_from)))
                 frames = api.cmd_attach(box_id, pid, out_off, err_off, timeout=read_s, deadline=until)
                 for fr in frames:
                     if stop_evt.is_set():
@@ -868,7 +1848,15 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                         code = probe_end()
                         if code is not _RUNNING:
                             return code
+                    elif t == "hello":
+                        hello(fr)
+                    elif t == "attempt":
+                        new_attempt(fr.get("attempt"))
                     elif t == "exit":
+                        if fr.get("status") == "interrupted":
+                            raise Interrupted(what)
+                        if fr.get('exitCode') is None and not fr.get('signal'):
+                            return follow_lost()
                         return fr.get("exitCode") if fr.get("exitCode") is not None else (
                             128 + 15 if fr.get("signal") else None)
                     elif t == "error":
@@ -884,6 +1872,8 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
             except api.StreamDeadline:
                 # api.stream shut the socket at `until`: the deadline, not a broken stream to retry.
                 raise timed_out()
+            except Interrupted:
+                raise
             except (OffboxError, OSError, TimeoutError) as e:
                 if stop_evt.is_set():
                     return None
@@ -895,22 +1885,22 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                 boat_down = False
                 # The outage window runs on the wall clock: attach and status requests that hang count against it
                 # too, so the limit cannot slip by failure count alone.
-                if down_from is not None and now() - down_from >= OUTAGE_FOLLOW_S:
-                    raise OffboxError(f"lost the output stream of {box_id}:{pid}: boat's API was down for "
-                                      f"{int(OUTAGE_FOLLOW_S)}s: {e}", started=True)
+                if down_from is not None and now() - down_from >= window:
+                    raise OffboxError(f"lost the output stream of {box_id}:{pid}: {api.NAME}'s API was down for "
+                                      f"{int(window)}s: {e}", started=True)
                 try:
                     # Status and the retry pause share the deadline: a blocked status request must not outrun it.
                     # During an outage it is also capped to the outage window left, so one call cannot outrun it.
                     status_s = max(1.0, min(60.0, left() if until is not None else 60.0))
                     if down_from is not None:
-                        status_s = max(1.0, min(status_s, OUTAGE_FOLLOW_S - (now() - down_from)))
+                        status_s = max(1.0, min(status_s, window - (now() - down_from)))
                     # An absolute end (the caller's until, the outage window) is what makes api.cmd_status skip the
                     # connect retries: without it a not-delivered 52x would be sent six times, outside the window.
                     ends = [now() + status_s]
                     if until is not None:
                         ends.append(until)
                     if down_from is not None:
-                        ends.append(down_from + OUTAGE_FOLLOW_S)
+                        ends.append(down_from + window)
                     try:
                         st = api.cmd_status(box_id, pid, timeout=status_s, retries=0, deadline=min(ends))
                     except OffboxError as se:
@@ -920,17 +1910,25 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                 if until is not None and now() >= until:
                     raise timed_out()
                 down_from = (down_from or failed_at) if boat_down else None
+                if home_run and boat_down and not seen["lost"]:
+                    # The run was accepted, so it is never sent anywhere else (it would run twice): wait for the
+                    # server and pick the output up where it stopped.
+                    seen["lost"] = True
+                    say(f"lost the connection to the offbox server; the run stays there. Reconnecting for up to "
+                        f"{int(window // 60)} min")
+                if st and st.get("status") == "interrupted":
+                    raise Interrupted(what)
                 if st and not st.get("running") and st.get("status") in ("exited", "lost"):
                     if st.get("status") == "lost":
-                        return None
+                        return follow_lost()
                     if ended_again() > 3:
                         return _status_code(st)
-                if failures > 20 and (down_from is None or now() - down_from >= OUTAGE_FOLLOW_S):
+                if failures > 20 and (down_from is None or now() - down_from >= window):
                     raise OffboxError(f"lost the output stream of {box_id}:{pid}: {e}", started=True)
                 pause = min(10, 1 + failures)
                 if down_from is not None:
                     # boat's API is down, not the run: keep reattaching, but never pause past the outage window.
-                    pause = min(pause, max(0.0, OUTAGE_FOLLOW_S - (now() - down_from)))
+                    pause = min(pause, max(0.0, window - (now() - down_from)))
                 if until is not None:
                     pause = max(0.0, min(pause, left()))
                 if stop_evt.wait(pause):
@@ -941,17 +1939,41 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
         stop_evt.set()
         _close(frames)  # closes the HTTP response (api.stream reads it inside `with`)
         # The keeper's ensure_ttl can sit in a 60 s request; a waiter past its deadline must not wait on it.
-        keeper.join(_KEEPER_JOIN_S if until is None else max(0.0, min(_KEEPER_JOIN_S, left() or 0.0)))
+        join_s = 0 if isinstance(sys.exc_info()[1], _ClientSignal) else (
+            _KEEPER_JOIN_S if until is None else max(0.0, min(_KEEPER_JOIN_S, left() or 0.0)))
+        keeper.join(join_s)
         if lf:
             lf.close()
         if mf:
             mf.close()
 
 
-def do_pulls(box_id: str, row: dict, pulls: list[str]) -> None:
+def new_checkout_hint(row: dict, root: Path) -> None:
+    if not row.get("_new_checkout") or not (root / "package.json").exists():
+        return
+    install = package_manager.install_command(root)
+    say(f"node_modules missing on new box {row['box_id']}; prefix your command with {install} &&" + package_manager.version_note(root))
+
+
+def do_pulls(box_id: str, row: dict, pulls: list[str], *, until: float | None = None) -> None:
     for p in pulls:
-        st = ssh_sync.pull(box_id, row["remote_dir"], row["rel_cwd"] or ".", p, Path(row["local_cwd"]))
-        if st.get("ok"):
+        opts = {}
+        if until is not None:
+            remaining = until - now()
+            if remaining <= 0:
+                raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True)
+            opts['timeout'] = min(1800, remaining)
+        try:
+            st = ssh_sync.pull(box_id, row["remote_dir"], row["rel_cwd"] or ".", p, Path(row["local_cwd"]), **opts)
+        except subprocess.TimeoutExpired:
+            if until is None:
+                raise
+            raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True) from None
+        if until is not None and now() >= until:
+            raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True)
+        if st.get("missing"):
+            say(f"pull {p}: not created on the box")
+        elif st.get("ok"):
             say(f"pulled {p} ({st.get('files', 0)} files)")
         else:
             say(f"pull {p} failed: {st.get('error')}")
@@ -976,7 +1998,8 @@ def go_std_glitch(box: str | None, run_id: str, log_path: Path | None, code: int
     return True
 
 
-def finish(run_id: str, code: int | None, status: str | None = None) -> None:
+def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up: bool = True,
+           until: float | None = None) -> None:
     con = db()
     r = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
     if not r:
@@ -986,19 +2009,51 @@ def finish(run_id: str, code: int | None, status: str | None = None) -> None:
                 (st, code, now(), run_id))
     con.commit()
     if r["box_id"]:
+        if catch_up and (r['mode'] == 'bg' or con.execute(
+                'SELECT 1 FROM kv WHERE k=?', (f'lost_checked:{run_id}',)).fetchone()):
+            from .misc import _catch_up_finished
+            _catch_up_finished(con, run_id, budget=10 if until is None else max(0, until-now()))
+        settle_docker(con, r, st, timeout=10 if until is None else max(0, until-now()))
         # Extend auto-stop as well as the reaper threshold when the start budget is tight.
         lease.touch(r["box_id"])
-        lease.idle_ttl(r['box_id'])
+        if until is None:
+            lease.idle_ttl(r['box_id'])
+        elif now() < until:
+            with api.budget(until-now()):
+                lease.idle_ttl(r['box_id'])
         event(con, r["box_id"], "run_end", f"{run_id} status={st} exit={code} {round(now() - (r['start_at'] or now()))}s")
 
 
 def run_remote(a, me: dict) -> int:
+    with prepare.attempts():
+        return _run_prepared(a, me)
+
+
+def _run_prepared(a, me: dict) -> int:
     """Foreground or --bg remote run. Raises OffboxError(code 90/91/92) before the command starts."""
+    # Refuse unsafe includes before allocating or preparing a box; sync validates again before transfer.
+    if not a.no_sync and getattr(a, "include", None):
+        ssh_sync.push_filters(Path(me["repo_root"]), a.git, a.include)
+    wedged = []
+    for attempt in (1, 2):
+        try:
+            return _run_attempt(a, me)
+        except BoxWedged as e:
+            wedged.append(e.box)
+            if attempt == 2:
+                raise OffboxError(f"{wedged[0]} and {wedged[1]} were both wedged before the command; "
+                                  "both set aside. Nothing ran: retry", code=EXIT_INFRA) from e
+            prepare.move_once(e)
+            say(wedged_message(e.box, e.evidence, e.stopped, retry=True))
+
+
+def _run_attempt(a, me: dict) -> int:
     rn = Runner(a, me)
     try:
         return _run_remote(a, rn)
     except OffboxError as e:
         e.started = e.started or rn.started
+        e.run_id, e.box = rn.run_id, rn.box
         raise
     except KeyboardInterrupt:
         if not rn.started:
@@ -1008,18 +2063,57 @@ def run_remote(a, me: dict) -> int:
         if not rn.started:
             finish(rn.run_id, None, 'infra')
         rn.record(error=str(e)[:500])
-        raise OffboxError(f"remote run error: {type(e).__name__}: {e}", started=rn.started) from e
+        raise OffboxError(f"remote run error: {type(e).__name__}: {e}", started=rn.started,
+                          run_id=rn.run_id, box=rn.box) from e
     finally:
         pool.release_guard(rn.lease_row)
+
+
+def _host_restarting(signum) -> bool:
+    if signum not in (signal.SIGTERM, signal.SIGHUP):
+        return False
+    try:
+        marker = json.loads(RESTART_MARKER.read_text())
+        return (isinstance(marker, dict) and type(marker.get('pid')) is int and marker['pid'] > 0
+                and type(marker.get('at')) in (int, float) and 0 <= now() - marker['at'] < RESTART_MARKER_MAX_S)
+    except (OSError, ValueError):
+        return False
+
+
+def _detach(rn, signum) -> int:
+    # Keep start_at: detaching must not restart #866's orphan age allowance.
+    rn.record(mode='bg')
+    message = (f"client lost ({signal.Signals(signum).name}); run {rn.run_id} keeps going on {rn.box}. "
+               f"Re-attach: offbox wait {rn.run_id}")
+    rn.log_path.parent.mkdir(parents=True, exist_ok=True)
+    ck = read_json(offsets_path(rn.log_path), {})
+    with open(rn.log_path, 'ab') as f:
+        # A signal may have interrupted the write-to-checkpoint gap. Only the committed prefix has offsets.
+        if ck:
+            f.truncate(ck['logBytes'])
+            f.seek(0, os.SEEK_END)
+        f.write(f"\noffbox: {message}\n".encode())
+        length = f.tell()
+    _commit(rn.log_path, ck.get('stdoutOffset', 0), ck.get('stderrOffset', 0), length)
+    say(message)
+    log(message)
+    try:
+        row = db().execute('SELECT start_at FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+        remaining = max(0, int(ORPHAN_RUN_MAX_S - (now() - (row['start_at'] or 0)))) if row else 0
+        if remaining:
+            lease.ensure_ttl(rn.box, min(BG_TTL_S, remaining), api.get(rn.box))
+    except OffboxError as e:
+        say(f"could not extend {rn.box}'s deadline: {e}; the reaper will retry")
+    return EXIT_DETACHED
 
 
 def _run_remote(a, rn) -> int:
     interrupted = {"sig": None}
 
     def on_sig(signum, _frame):
-        interrupted["sig"] = signum
-        rn.kill()
-        raise KeyboardInterrupt
+        if interrupted['sig'] is None:
+            interrupted["sig"] = signum
+            raise _ClientSignal
 
     # Installed before rn.start(): a tool-call timeout's SIGTERM during the pool wait or the lease must reach
     # run_remote's not-started finish ('killed'). With the default handler Python died there and the row stayed
@@ -1033,6 +2127,15 @@ def _run_remote(a, rn) -> int:
                 finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
             rn.record(error=str(e)[:500])
             raise
+        if a.bg and rn.recovered_code is not None:
+            from . import start_check
+            con = db()
+            row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+            start_check.settle(con, row, start_check.Result('started', rn.recovered_code, rn.pid),
+                               'start receipt recovered')
+            finish(rn.run_id, rn.recovered_code)
+            print(rn.run_id)
+            return 0
         if a.bg:
             # Nobody stays attached to refresh the deadline: give the box a long one. The reaper stops it
             # IDLE_STOP_S after the process ends (it checks process status itself).
@@ -1042,11 +2145,19 @@ def _run_remote(a, rn) -> int:
             return 0
         code = None
         try:
-            code = rn.stream()
-        except KeyboardInterrupt:
-            # Kill delivery may be uncertain. Keep the slot reserved until status proves exit.
-            rn.record(error='interrupted; awaiting confirmed remote termination')
-            return 130
+            code = rn.recovered_code if rn.recovered_code is not None else rn.stream()
+        except Interrupted:
+            finish(rn.run_id, EXIT_INTERRUPTED, "interrupted")
+            raise
+    except KeyboardInterrupt:
+        if rn.started and rn.box and _host_restarting(interrupted['sig']):
+            return _detach(rn, interrupted['sig'])
+        rn.kill()
+        if not rn.started:
+            raise
+        # Kill delivery may be uncertain. Keep the slot reserved until status proves exit.
+        rn.record(error='interrupted; awaiting confirmed remote termination')
+        return 130
     finally:
         for s, h in old.items():
             signal.signal(s, h)
@@ -1068,6 +2179,27 @@ def _run_remote(a, rn) -> int:
             after = f"offbox could not stop it ({e}); run: offbox release {rn.box}"
         raise OffboxError(f"{rn.box} could not start the command (systemd: transient scope failed); "
                           f"nothing ran. {after}. Retry.", code=EXIT_INFRA)
+    if code == 98 and rn.log_path.exists() and 'offbox-claim-refused' in rn.log_path.read_text(errors='replace'):
+        from . import start_check
+        con = db()
+        row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+        if row:
+            start_check.settle(con, row, start_check.Result(), 'duplicate start claim refused (exit 98)')
+        finish(rn.run_id, None, 'infra')
+        raise OffboxError(f'{rn.run_id} on {rn.box}: start claim refused (exit 98); nothing ran',
+                          started=True, run_id=rn.run_id, box=rn.box)
+    if repo_setup_failed(code, rn.log_path):
+        rn.started = False
+        rn.record(error="repo toolchain setup failed (exit 98)")
+        finish(rn.run_id, None, "infra")
+        raise OffboxError("repo toolchain setup failed (exit 98), not your command", code=EXIT_INFRA)
+    if code == 97:
+        con = db()
+        row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+        wedged = settle_box_wedged(con, row, code)
+        if wedged:
+            rn.started = False
+            raise BoxWedged(rn.box, *wedged)
     if code == 97 and setup_failed(rn.log_path):
         # The preamble failed before the user command was reached, so nothing ran and fallback is allowed.
         rn.started = False
@@ -1082,10 +2214,11 @@ def _run_remote(a, rn) -> int:
     if code is None:
         say("remote process was lost (box restarted?); treating as infra failure")
     steps = getattr(a, "steps", None) or []
+    deps_hint = box_deps_hint(rn.root, rn.log_path)
     if steps:
         res = step_results(rn.log_path)
         failed = next((n for n, rc in res if rc != 0), None)
-        report_exit(steps[failed - 1] if failed else "", code, res, len(steps))
+        report_exit(steps[failed - 1] if failed else "", code, res, len(steps), deps_hint=deps_hint, box_id=rn.box)
     else:
-        report_exit(a.cmd[0] if len(a.cmd) == 1 else shlex.join(a.cmd), code)
+        report_exit(a.cmd[0] if len(a.cmd) == 1 else shlex.join(a.cmd), code, deps_hint=deps_hint, box_id=rn.box)
     return 90 if code is None else code
