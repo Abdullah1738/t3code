@@ -82,6 +82,7 @@ typeset -A live=(
 typeset -A private=(kc-read 1 kc-write 1 otp-watch.py 1 tunnel.sh 1)
 # ~/.local/bin entries that point into other deployed integrations.
 links=(
+  "$HOME/.local/share/quint-guard/bin/quint:$HOME/.local/bin/quint"
   "$HOME/.config/opencode/skills/image-generation/scripts/genimg.py:$HOME/.local/libexec/image-generation/genimg.py"
   "$HOME/.bun/bin/hcloud:$HOME/.local/bin/hcloud"
   "$HOME/.local/bin/wa:$HOME/.local/share/robob-watch/helpers/wa"

@@ -2873,6 +2873,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
             Layer.mergeAll(
               NodeServices.layer,
               Layer.mock(PullRequestService.PullRequestService)({
+                watchFingerprint: () => Effect.succeed(null),
                 detail: () =>
                   Effect.suspend(() => {
                     reads += 1;
@@ -2914,8 +2915,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
             (thread) => thread?.pullRequests?.[0]?.watch !== undefined,
           );
 
-        for (let pass = 0; pass < 20; pass += 1) yield* reactor.sweep;
-        assert.equal(reads, 20);
+        // The eighth consecutive unsuccessful read ends a watch; recover just before it.
+        for (let pass = 0; pass < 7; pass += 1) yield* reactor.sweep;
+        assert.equal(reads, 7);
         for (const threadId of threadIds) {
           assert.isTrue(yield* watching(threadId));
           assert.deepEqual(yield* summaries(threadId), []);
@@ -2923,16 +2925,22 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
 
         host = "open";
         yield* reactor.sweep;
-        assert.equal(reads, 21);
+        assert.equal(reads, 8);
         for (const threadId of threadIds) {
           assert.deepEqual(yield* summaries(threadId), []);
         }
 
+        // Ungated green checks need a second read before the watcher can become quiet.
         yield* reactor.sweep;
-        assert.equal(reads, 21);
+        assert.equal(reads, 9);
+        for (const threadId of threadIds) {
+          assert.deepEqual(yield* summaries(threadId), ["#9: checks passed"]);
+        }
+        yield* reactor.sweep;
+        assert.equal(reads, 9);
         yield* TestClock.adjust("10 minutes");
         yield* reactor.sweep;
-        assert.equal(reads, 22);
+        assert.equal(reads, 10);
         for (const threadId of threadIds) {
           assert.deepEqual(yield* summaries(threadId), ["#9: checks passed"]);
         }
@@ -2940,11 +2948,16 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         const late = ThreadId.make("runtime-pull-request-watch-shared-late");
         yield* watchFrom(late);
         yield* reactor.sweep;
-        assert.equal(reads, 23);
+        assert.equal(reads, 11);
         assert.deepEqual(yield* summaries(late), []);
+        yield* reactor.sweep;
+        assert.equal(reads, 12);
+        assert.deepEqual(yield* summaries(late), ["#9: checks passed"]);
+        yield* reactor.sweep;
+        assert.equal(reads, 12);
         yield* TestClock.adjust("10 minutes");
         yield* reactor.sweep;
-        assert.equal(reads, 24);
+        assert.equal(reads, 13);
         assert.deepEqual(yield* summaries(late), ["#9: checks passed"]);
         for (const threadId of threadIds) {
           assert.deepEqual(yield* summaries(threadId), ["#9: checks passed"]);
@@ -2954,7 +2967,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         host = "closed";
         yield* TestClock.adjust("10 minutes");
         yield* reactor.sweep;
-        assert.equal(reads, 25);
+        assert.equal(reads, 14);
         for (const threadId of threadIds) {
           assert.isFalse(yield* watching(threadId));
           assert.deepEqual(yield* summaries(threadId), [
@@ -3740,8 +3753,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         const projections = yield* ProjectionStore.ProjectionStoreV2;
         const projectId = ProjectId.make(`pr-watch-tail-project-${mode}`);
         const threadId = ThreadId.make(`runtime-pr-watch-tail-${mode}`);
-        const startedAt = "2026-10-02T12:00:00.000Z";
-        yield* TestClock.setTime(Date.parse(startedAt));
+        // Keep the existing clock: jumping decades replays every background sampler tick.
+        const now = yield* DateTime.now;
+        const startedAt = DateTime.formatIso(now);
         yield* seedProject({
           projectId,
           title: "Watch edited replies",
@@ -3778,7 +3792,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           kind: "review-comment",
           author: { login: "reviewer", name: null, avatarUrl: null },
           body: "Original feedback.",
-          createdAt: "2026-10-02T11:00:00.000Z",
+          createdAt: DateTime.formatIso(DateTime.add(now, { hours: -1 })),
           url: null,
           path: "src/index.ts",
           reviewState: null,
@@ -3876,7 +3890,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         replies = replies.map((reply) => ({
           ...reply,
           body: "Edited feedback.",
-          editedAt: "2026-10-02T12:00:01.000Z",
+          editedAt: DateTime.formatIso(DateTime.add(now, { seconds: 1 })),
         }));
 
         if (mode === "mixed-age remarks") {
@@ -3884,7 +3898,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           const visibleReply = {
             ...thread.comments[0]!,
             body: "Edited visible feedback.",
-            editedAt: "2026-10-02T12:02:00.000Z",
+            editedAt: DateTime.formatIso(DateTime.add(now, { minutes: 2 })),
           };
           thread.comments[0] = visibleReply;
           yield* TestClock.adjust("5 minutes");
@@ -3931,7 +3945,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           replies = replies.map((reply, index) => ({
             ...reply,
             body: `Latest feedback ${index + 1}.`,
-            editedAt: `2026-10-02T12:01:0${index + 1}.000Z`,
+            editedAt: DateTime.formatIso(DateTime.add(now, { minutes: 1, seconds: index + 1 })),
           }));
           failPage = false;
         } else {

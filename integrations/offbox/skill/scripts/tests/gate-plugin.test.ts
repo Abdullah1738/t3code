@@ -4,6 +4,7 @@
 import { afterAll, expect, mock, test } from "bun:test"
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
+import { homedir } from "node:os"
 import { spawnSync } from "node:child_process"
 import { join } from "node:path"
 
@@ -37,6 +38,26 @@ async function registeredHooks() {
 }
 
 async function shellHook() { return (await registeredHooks())["shell:create.before"] }
+
+for (const mode of ["observe", "enforce", "off"]) {
+  test(`quint guard follows blockers before nvm, idempotently (gate ${mode})`, async () => {
+    process.env.OFFBOX_GATE_MODE = mode
+    try {
+      const hook = await shellHook()
+      const prefix = [join(homedir(), ".config/opencode/skills/remote-compute/scripts/blockers"),
+        join(homedir(), ".local/share/harness-hooks/coord-blockers"), join(homedir(), ".local/share/quint-guard/bin")]
+      for (const version of ["v26.2.0", "v26.13.1", "v99.0.0"]) {
+        const nvm = join(homedir(), `.nvm/versions/node/${version}/bin`)
+        const rest = [nvm, join(homedir(), ".local/bin"), "/usr/bin", "/bin"]
+        const e = { cwd: root, env: { PATH: [...rest, ...prefix].join(":") } }
+        hook(e)
+        expect(e.env.PATH.split(":")).toEqual([...prefix, ...rest])
+        hook(e)
+        expect(e.env.PATH.split(":")).toEqual([...prefix, ...rest])
+      }
+    } finally { delete process.env.OFFBOX_GATE_MODE }
+  })
+}
 
 for (const mode of ["observe", "enforce", "off"]) {
   test(`shells get bun's inspector turned off (gate ${mode})`, async () => {

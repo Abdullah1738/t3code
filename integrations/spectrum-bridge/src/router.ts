@@ -1,12 +1,13 @@
 import { toolLog as watcherLog } from "./watcherlog.ts";
 import { toolError, toolLog } from "./toollog.ts";
+import { appendFold, foldMedsLine, foldSkipped, type FoldOptions } from "./meds-fold.ts";
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
-import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming } from "./inbound-files.ts";
+import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming, savePreview } from "./inbound-files.ts";
 import { BUBBLE_CHARS, formatText, splitFormatted, stripInternalText } from "./formatting.ts";
-import { assistantText, isDelegatedCompletionText, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
+import { assistantText, isCompletionNoticeText, subagentNoticeState, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import type { ChatContext } from "./chats.ts";
 import type { ReplyMode } from "./config.ts";
 import { commandWord, controlCommand, isCommand } from "./commands.ts";
@@ -138,6 +139,7 @@ type Options = {
   swipes?: { find: Swipes; line: string; waitMs?: number };
   /** "final" (default) forwards each turn's final text; "tool" forwards nothing and the agent sends with imessage_send. */
   replyMode?: ReplyMode;
+  medsFold?: FoldOptions | false;
   notifyFailure?: (text: string, key: string) => Promise<boolean>;
 };
 /** What a Sendblue swipe reply points at, kept per row. `unknown` is never guessed from neighbouring messages. */
@@ -322,6 +324,13 @@ function sameAttachmentMessage(first: NormalizedInbound, next: NormalizedInbound
     && first.sender !== undefined && first.sender === next.sender && first.threadOrigin === next.threadOrigin
     && next.attachments.length > 0 && !next.text.trim();
 }
+type SkipReason = "more than 30 files in one message" | "over the 100 MB per-message total" | "unknown size";
+function skippedNote(attachment: NormalizedInbound["attachments"][number], reason: SkipReason, ownerChat: boolean): string {
+  const recovery = ownerChat
+    ? "Try to retrieve it yourself before answering: look in this Mac's Messages for the owner's chat (`imsg chats`, then `imsg history --chat-id <id> --attachments --json`), match transfer_name to the file name, and convert HEIC with sips into the chat directory if needed. The recorded name may come from a media URL and may not match Messages; the file may not be there."
+    : "Try to retrieve it under this chat's existing permissions and privacy rules before answering; do not assume it is in this Mac's Messages.";
+  return `- The sender also sent ${JSON.stringify(attachment.fileName || "a file")} (${attachment.mimeType ? JSON.stringify(attachment.mimeType) : "unknown type"}), but the bridge did not take it in (${reason}). ${recovery} Only if that fails, tell the sender which files you couldn't see.`;
+}
 /** Rows the bridge injects itself (secure-form notices, watcher wakes, reset nudges): never owner text, never a provider message. */
 const synthetic = (id: string) => id.startsWith("secret:") || id.startsWith("wake:") || id.startsWith("reset:");
 /** A person's plain typed text, the only kind of row steered into a running turn. */
@@ -477,9 +486,34 @@ export function quietMessages(records: readonly MessageRecord[]): Set<string> {
   return quiet;
 }
 
-/** T3's continuation prompt, never an explicitly owner-authored desktop message. */
-function delegatedCompletion(record: MessageRecord): boolean {
-  return record.type === "user" && record.createdBy !== "user" && isDelegatedCompletionText(record.text);
+/** Native reports can be synthetic in OpenCode or provider-created user messages in Robob. */
+function backgroundNotice(record: MessageRecord): boolean {
+  return (record.type === "user" || record.type === "synthetic") && record.createdBy !== "user"
+    && typeof record.text === "string" && (isCompletionNoticeText(record.text) || subagentNoticeState(record.text) !== undefined);
+}
+
+function backgroundCompletion(record: MessageRecord): boolean {
+  return backgroundNotice(record) && typeof record.text === "string" && isCompletionNoticeText(record.text);
+}
+
+function ownerPrompt(record: MessageRecord): boolean {
+  return record.type === "user" && !backgroundNotice(record);
+}
+
+/** Adjacent notices share a response; a later prompt after a response starts a new batch. */
+function withoutProgressReplies(records: MessageRecord[]): MessageRecord[] {
+  let progress = false;
+  let pending = false;
+  return records.filter(record => {
+    if (backgroundNotice(record)) {
+      progress = pending ? progress && !backgroundCompletion(record) : !backgroundCompletion(record);
+      pending = true;
+    } else if (record.type === "user" || record.type === "idle") {
+      progress = false;
+      pending = false;
+    } else if (record.type === "assistant") pending = false;
+    return record.type !== "assistant" || !progress;
+  });
 }
 
 const consentWords = (text: string) => text.normalize("NFKC").toLowerCase().replace(/['’`]/g, "")
@@ -583,6 +617,60 @@ async function bounded<T>(operation: Promise<T>, timeout = 10_000): Promise<T> {
 }
 
 export class Router {
+  private medsFolding = new Map<string, Promise<void>>();
+
+  async foldToolText(text: string, operationId: string): Promise<string> {
+    if (!this.toolMode) return text;
+    const turn = this.store.get<Turn | null>("activeTurn");
+    return (await this.foldTexts(turn, [text], operationId, "tool"))[0]!;
+  }
+
+  private async foldTexts(turn: Turn | null | undefined, texts: string[], operationId: string, replyMode: ReplyMode): Promise<string[]> {
+    try {
+      const chat = this.options.context?.chat;
+      if (chat?.kind !== "owner" || chat.slug === "moni" || this.options.medsFold === false
+        || process.env.SPECTRUM_MEDS_FOLD_ENABLED === "0") return texts;
+      if (!turn || turn.background || turn.origin || !turn.inboundId || synthetic(turn.inboundId)
+        || !["running", "submitting", "unknown"].includes(turn.phase) || !this.current(turn)) {
+        foldSkipped("background", replyMode); return texts;
+      }
+      const batch = this.store.get<NormalizedInbound | null>(`batch:${turn.inboundId}`);
+      const rows = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?");
+      const inputs = (batch?.batchIds ?? [turn.inboundId]).map(id => {
+        const row = rows.get(id);
+        return row ? JSON.parse(row.payload) as NormalizedInbound : undefined;
+      });
+      if (batch?.isAudioMessage || inputs.some(input => input?.source !== "typed" || input.isAudioMessage || input.poll || isTapback(input.text))
+        || !inputs.some(input => input?.text.trim())) {
+        foldSkipped("background", replyMode); return texts;
+      }
+      const stillLive = () => {
+        const live = this.store.get<Turn | null>("activeTurn");
+        return this.current(turn) && live?.messageId === turn.messageId && live.inboundId === turn.inboundId
+          && live.startedAt === turn.startedAt && !live.background && !live.origin && live.phase !== "failed" && live.phase !== "held";
+      };
+      if (!stillLive()) { foldSkipped("background", replyMode); return texts; }
+      if (!texts.some(text => stripInternalText(replyText(text)))) { foldSkipped("no_text", replyMode); return texts; }
+      // Persist before spawning: recovery may lose a fold, but cannot consume another slot for this turn.
+      const key = `meds-fold:${turn.id}:${turn.generation}:${turn.inboundId}:${turn.startedAt}`;
+      const inflight = this.medsFolding.get(key);
+      if (inflight) await inflight;
+      const saved = this.store.get<{ operationId: string; line?: string }>(key);
+      if (saved) {
+        foldSkipped("already_folded", replyMode);
+        return stillLive() && saved.operationId === operationId ? appendFold(texts, saved.line) : texts;
+      }
+      this.store.set(key, { operationId });
+      const pending = (async () => {
+        const result = await foldMedsLine({ ...this.options.medsFold, replyMode });
+        this.store.set(key, { operationId, ...(result.line ? { line: result.line } : {}) });
+      })();
+      this.medsFolding.set(key, pending);
+      try { await pending; } finally { this.medsFolding.delete(key); }
+      if (!stillLive()) return texts;
+      return appendFold(texts, this.store.get<{ line?: string }>(key)?.line);
+    } catch { return texts; }
+  }
   private ticking?: Promise<void>;
   private typingActive = false;
   private typingAt = 0;
@@ -2869,22 +2957,22 @@ export class Router {
       this.store.updateInbound(row.id, "done");
       return;
     }
-    if (input.attachments.length > MAX_INCOMING_FILES) {
-      this.acknowledge(row.id, "That's more than I can take in one go. Send at most 10 files, 100 MB total.", "failed");
-      return;
-    }
+    const taken: NormalizedInbound["attachments"] = [];
+    const skipped: string[] = [];
+    const ownerChat = !this.options.context || this.options.context.chat.kind === "owner";
     let total = 0;
     for (const attachment of input.attachments) {
+      const reason: SkipReason | undefined = taken.length >= MAX_INCOMING_FILES ? "more than 30 files in one message"
+        : !Number.isSafeInteger(attachment.totalBytes) || attachment.totalBytes < 0 ? "unknown size"
+        : attachment.totalBytes > MAX_INCOMING_BYTES - total ? "over the 100 MB per-message total" : undefined;
+      if (reason) { skipped.push(skippedNote(attachment, reason, ownerChat)); continue; }
+      taken.push(attachment);
       total += attachment.totalBytes;
-      if (!Number.isSafeInteger(attachment.totalBytes) || attachment.totalBytes < 0 || total > MAX_INCOMING_BYTES) {
-        this.acknowledge(row.id, "That's more than I can take in one go. Send at most 10 files, 100 MB total.", "failed");
-        return;
-      }
     }
     this.store.updateInbound(row.id, "processing");
     // Files over the blob cap are not checkpointed, so each unseal downloads them again.
     // Wait out a busy conversation before downloading rather than after.
-    if (route && input.attachments.some(attachment => attachment.totalBytes > MAX_BLOB_BYTES)) {
+    if (route && taken.some(attachment => attachment.totalBytes > MAX_BLOB_BYTES)) {
       const id = route.id;
       let busy = false;
       try { busy = (await this.statusesFor(route))[id] !== undefined; } catch { toolError("router", "router.catch30"); /* Checked again after downloads. */ }
@@ -2894,7 +2982,7 @@ export class Router {
     const downloaded: (Parameters<typeof prepareIncoming>[0] & { guid: string })[] = [];
     const undelivered: string[] = [];
     total = 0;
-    for (const attachment of input.attachments) {
+    for (const attachment of taken) {
       const key = `incoming-file:${hash(attachment.guid)}`;
       const cached = this.store.get<{ sha256: string; size: number; mimeType: string; name: string }>(key);
       // A file already given up on (Photon and the local copy) is passed on as a note.
@@ -2907,6 +2995,8 @@ export class Router {
         // 30 seconds plus one per declared MiB, so a 100 MiB file gets 130 seconds.
         // Other router waits stay at 10 seconds.
         const deadline = 30_000 + Math.floor(attachment.totalBytes / MiB) * 1_000;
+        // Check cached size before reading it, so a previous attempt cannot exceed the remaining budget.
+        if (total === MAX_INCOMING_BYTES || (cached && cached.size > MAX_INCOMING_BYTES - total)) throw new TransportError("attachmentTooLarge");
         const file = cached ? { data: this.store.getBlob(cached.sha256), mimeType: cached.mimeType, name: cached.name }
           : await bounded(this.transport.downloadAttachment(attachment.guid, Math.max(1, MAX_INCOMING_BYTES - total), deadline), deadline + 5_000);
         if (interrupted()) return;
@@ -2915,9 +3005,9 @@ export class Router {
           assert.match(file.mimeType, /^[\s\S]*$/u);
           assert.match(file.name, /^[\s\S]*$/u);
         } catch { toolError("router", "router.catch31"); throw new TransportError("invalidAttachment"); }
+        if (file.data.byteLength > MAX_INCOMING_BYTES - total) throw new TransportError("attachmentTooLarge");
         total += file.data.byteLength;
         toolLog.capture(() => toolLog.write({ component: "attachments", kind: "event", name: "attachment.received", ids: { messageId: input.id }, props: { attachmentBytes: file.data.byteLength, count: 1 } }));
-        if (total > MAX_INCOMING_BYTES) throw new TransportError("attachmentTooLarge");
         // Blobs are never pruned, so only files within the store's 20 MiB cap are
         // checkpointed. A larger one is downloaded again if the batch is retried,
         // and its successful download does not use up a retry.
@@ -2930,12 +3020,17 @@ export class Router {
       } catch (error) { toolError("router", "router.catch32");
         if (interrupted()) return;
         const failure = classifyDownloadFailure(error);
+        if (failure.code === "attachmentTooLarge") {
+          this.store.set(`${key}:retry`, { attempts: retry.attempts, nextAt: 0 });
+          skipped.push(skippedNote(attachment, "over the 100 MB per-message total", ownerChat));
+          continue;
+        }
         if (failure.retryable && retry.attempts + 1 < 3) {
           this.store.set(`${key}:retry`, { attempts: retry.attempts + 1, nextAt: Date.now() + 2_000 * 2 ** retry.attempts });
           this.unsealBatch(row.id);
           return;
         }
-        if (failure.code !== "attachmentTooLarge" && this.options.recoverAttachment) {
+        if (this.options.recoverAttachment) {
           // Photon gave up: pull the file from this Mac's Messages instead of dropping the turn.
           let result: Awaited<ReturnType<Recover>>;
           try {
@@ -2947,6 +3042,11 @@ export class Router {
           } catch { toolError("router", "router.catch33"); result = { detail: { reason: "recoveryTimedOut" } }; }
           this.options.log?.("attachment-local-recovery", /^[A-Za-z]{1,32}$/.test(result.detail.reason) ? result.detail.reason : "unknown");
           const recovered = result.file;
+          if (result.detail.reason === "tooLarge" || (recovered && recovered.data instanceof Uint8Array && recovered.data.byteLength > MAX_INCOMING_BYTES - total)) {
+            this.store.set(`${key}:retry`, { attempts: retry.attempts, nextAt: 0 });
+            skipped.push(skippedNote(attachment, "over the 100 MB per-message total", ownerChat));
+            continue;
+          }
           if (recovered && recovered.data instanceof Uint8Array && total + recovered.data.byteLength <= MAX_INCOMING_BYTES) {
             total += recovered.data.byteLength;
             if (recovered.data.byteLength <= MAX_BLOB_BYTES) this.store.db.transaction(() => {
@@ -2963,8 +3063,7 @@ export class Router {
           undelivered.push(undeliveredNote(attachment, detail));
           continue;
         }
-        const reason = failure.code === "attachmentTooLarge" ? "Those files are over 100 MB total; could you send fewer?"
-          : failure.code === "invalidAttachment" ? "That attachment came through broken. Mind resending it?"
+        const reason = failure.code === "invalidAttachment" ? "That attachment came through broken. Mind resending it?"
           : "I couldn't download that attachment. Mind resending it once it's fully uploaded?";
         this.acknowledge(row.id, reason, "failed");
         return;
@@ -3041,9 +3140,10 @@ export class Router {
     if (interrupted()) return;
     if (!this.current(activeRoute)) return;
     const parts: FilePart[] = [];
-    const notes: string[] = undelivered.length
-      ? [`${downloaded.length} of ${input.attachments.length} attachments arrived.`, ...undelivered]
-      : [];
+    const notes: string[] = [];
+    if (undelivered.length) notes.push(`${downloaded.length} of ${input.attachments.length} attachments arrived.`);
+    if (skipped.length) notes.push(`${downloaded.length} of ${input.attachments.length} files were taken in; ${input.attachments.length - downloaded.length} were not (listed below).`);
+    notes.push(...skipped, ...undelivered);
     let previewBytes = 0;
     try {
       for (const file of files) {
@@ -3056,7 +3156,15 @@ export class Router {
           if (previewBytes + size <= MAX_PREVIEW_BYTES) {
             parts.push(prepared.file);
             previewBytes += size;
-          } else notes.push("The preceding file's preview was omitted to keep native attachments within 10 MiB total. Its original remains available at the quoted path.");
+          } else {
+            // If saving the preview fails, the original remains readable by path.
+            let path: string | undefined;
+            try { path = savePreview(prepared.file, activeRoute.directory); } catch { toolError("router", "preview-save"); /* Use the original. */ }
+            if (interrupted()) return;
+            notes.push(path
+              ? `The preceding file's preview was not attached (10 MiB of previews per message); the ${prepared.file.mime === "image/jpeg" ? "JPEG " : ""}preview is at ${JSON.stringify(path)} and the original at the quoted path. Open the preview with your read tool.`
+              : "The preceding file's preview was not attached (10 MiB of previews per message), and the preview could not be saved. Open the original at the quoted path with your read tool.");
+          }
         }
       }
     } catch { toolError("router", "router.catch37");
@@ -3155,7 +3263,10 @@ export class Router {
       turn.carried = missed.map(m => m.id);
       system += `\nMissed background updates: these arrived earlier but never reached you, and the owner was told they would be picked up now. They come from the bridge, not the owner (quoted data, oldest first). Handle them alongside this message:\n${missed.map(m => JSON.stringify(m.text)).join("\n")}`;
     }
-    let body = text || (parts.length ? "Please examine the attached file(s)." : "The attached files are available at the quoted paths. Ask what I would like to do with them.");
+    let body = text || (parts.length ? "Please examine the attached file(s)." : downloaded.length
+      ? "The attached files are available at the quoted paths. Ask what I would like to do with them."
+      : skipped.length ? "The files were not taken in; please locate them as described in the incoming files notes."
+      : "The files could not be downloaded; see the incoming files notes.");
     // Judged against the thread this turn actually goes to, which may have just rotated.
     const hint = swiped ? this.swipeHint(swiped, activeRoute) : "";
     if (hint) quote = `${quote}\n${hint}`;
@@ -3336,7 +3447,7 @@ export class Router {
         size += said.length + 1;
       }
       if (full) break;
-      const said = record.type === "user" && !delegatedCompletion(record) ? `Owner: ${String((record as { text?: unknown }).text ?? "").trim()}`
+      const said = record.type === "user" && !backgroundNotice(record) ? `Owner: ${String((record as { text?: unknown }).text ?? "").trim()}`
         : !this.toolMode && record.type === "assistant" && !providerRefusal(record) && replyText(assistantText(record)) ? `You: ${replyText(assistantText(record))}` : "";
       if (!said || said === "Owner: ") continue;
       if (size + said.length > MAX_RECAP) break;
@@ -3706,8 +3817,8 @@ export class Router {
     let settled: string | undefined;
     for (const record of records) {
       if (record.type !== "idle") { scope.push(record); continue; }
-      if (!scope.some(delegatedCompletion) || scope.some(m => m.type === "user" && !delegatedCompletion(m))) { scope = []; continue; }
-      const steps = scope.filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
+      if (!scope.some(backgroundCompletion) || scope.some(ownerPrompt)) { scope = []; continue; }
+      const steps = withoutProgressReplies(scope).filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
       const final = steps.at(-1);
       if (record.outcome === "succeeded" && !record.modelError && !final?.error) {
         if (final && (final.time.completed === undefined || final.finish === "tool-calls")) break;
@@ -3719,9 +3830,9 @@ export class Router {
     }
     // mode:auto can steer the wake into the notice's run. Its completed answer
     // still belongs to the notice, even though the shared idle will follow the wake.
-    if (scope.some(delegatedCompletion) && !scope.some(m => m.type === "user" && !delegatedCompletion(m))) {
+    if (scope.some(backgroundCompletion) && !scope.some(ownerPrompt)) {
       const quiet = quietMessages(scope);
-      const answered = scope.filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant"
+      const answered = withoutProgressReplies(scope).filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant"
         && m.answer === true && m.time.completed !== undefined && !m.error && !m.continued && m.finish !== "tool-calls" && !quiet.has(m.id));
       replies.push(...answered);
       settled = answered.at(-1)?.id ?? settled;
@@ -3858,7 +3969,7 @@ export class Router {
       // but reply ownership starts at the earliest accepted prompt this turn tracks.
       const start = messages.findIndex(m => m.type === "user" && ownedPrompts.has(m.id)
         || turn!.background && m.id === turn!.messageId);
-      const after = start < 0 ? [] : messages.slice(start + 1);
+      const after = start < 0 ? [] : withoutProgressReplies(messages.slice(start + 1));
       if (!turn.background && mark?.sessionId === turn.id) {
         const markIndex = messages.findIndex(m => m.id === mark.id);
         if (markIndex >= 0 && start > markIndex) this.settlePrecedingCompletions(turn, messages.slice(markIndex + 1, start));
@@ -3885,6 +3996,12 @@ export class Router {
       // at its end keeps every block of it out of the chat.
       const scope = end < 0 ? after : after.slice(0, end);
       const quiet = quietMessages(scope);
+      // watch() can begin following a busy run before its prompt is visible.
+      // Apply the same owner boundary once that prompt arrives.
+      if (turn.background && idle && scope.some(ownerPrompt)) {
+        this.enqueueReply(turn, idle, replies, [], undefined, "", scope, entries);
+        return;
+      }
       const failedReplies = new Set<string>();
       let priorFailure: Extract<MessageRecord, { type: "idle" }> | undefined;
       let runReplies: string[] = [];
@@ -3959,7 +4076,7 @@ export class Router {
               && reply.answer !== false && (sameFinal ? reply.finish === "stop" && reply.interruptReplyComplete !== false
                 : ended?.type === "idle" && ended.outcome === "succeeded" && !ended.modelError && !ended.firstTurnFailure);
           });
-          this.enqueueReply(turn, idle, replies, safeEarlier, final,
+          await this.enqueueReply(turn, idle, replies, safeEarlier, final,
             final.id === turn.earlySent ? "" : text, scope, entries);
           this.stage("reply-recovered-after-interrupt", turn.inboundId);
           return;
@@ -3981,12 +4098,19 @@ export class Router {
           }
         }
         // The terminal failed idle is outside scope; its open run must never contribute a partial reply.
-        const completedEarlier = earlier.filter(reply => successfulReplies.has(reply.id));
-        const failAfterEarlier = (text: string, reason: DropReason, immediate = false) => {
+        // An empty failed run leaves the last assistant in an earlier successful run.
+        const completedEarlier = replies.filter(reply => successfulReplies.has(reply.id)
+          && (earlier.includes(reply) || reply === final && reply.answer !== false && !reply.error)
+          && reply.id !== turn!.earlySent && !quiet.has(reply.id));
+        const failAfterEarlier = async (text: string, reason: DropReason, immediate = false) => {
+          const said = (this.toolMode ? [] : completedEarlier).map(reply => ({ reply, text: replyText(assistantText(reply)) }))
+            .filter(item => item.text && !this.store.getOperation(`reply:${turn!.generation}:${item.reply.id}`));
+          const folded = !this.toolMode && said.length
+            ? await this.foldTexts(turn, said.map(item => item.text), said.at(-1)!.reply.id, "final") : said.map(item => item.text);
+          if (!this.current(turn!) || this.store.get<Turn | null>("activeTurn")?.messageId !== turn!.messageId) return;
           this.store.db.transaction(() => {
-            const said = (this.toolMode ? [] : completedEarlier).map(reply => ({ reply, text: replyText(assistantText(reply)) })).filter(item => item.text);
-            for (const { reply, text } of said) this.store.enqueue({
-              id: `reply:${turn!.generation}:${reply.id}`, kind: "conversation", text, sessionId: turn!.id, generation: turn!.generation,
+            for (const [index, { reply }] of said.entries()) this.store.enqueue({
+              id: `reply:${turn!.generation}:${reply.id}`, kind: "conversation", text: folded[index]!, sessionId: turn!.id, generation: turn!.generation,
               ...this.replyTarget(turn!.inboundId),
             });
             if (said.length) this.noteGroupReply(turn!.inboundId, said.map(item => item.text));
@@ -4009,7 +4133,7 @@ export class Router {
           this.recordFailure(turn.inboundId, "execution", detail, turn);
         }
         if (idle.firstTurnFailure || idle.modelError || priorFailure) {
-          failAfterEarlier(firstFailureText(idle.modelError || priorFailure?.modelError), "failed", true);
+          await failAfterEarlier(firstFailureText(idle.modelError || priorFailure?.modelError), "failed", true);
           return;
         }
         // A tool-only turn has no assistant records to show its tool calls, so the backend's run evidence decides.
@@ -4017,7 +4141,7 @@ export class Router {
         const ran = turnRanTools(replies) || (this.backend.runToolEvidence
           ? (await this.backend.runToolEvidence(turn.id, turn.directory, turn.startedAt)) !== "none"
           : false);
-        failAfterEarlier(idle.outcome === "interrupted"
+        await failAfterEarlier(idle.outcome === "interrupted"
           ? "The app restarted while I was on that one, so I may not have finished it. Mind sending it again?"
           : "Something went wrong on my end with that one. Mind trying again?", ran ? "failed" : "errored");
         return;
@@ -4081,37 +4205,38 @@ export class Router {
       // Missing status is NOT idle evidence. A settled turn forwards its final
       // text; one that ends without text (after a reaction, poll or file, say)
       // or with NO_REPLY simply closes.
-      this.enqueueReply(turn, idle, replies, earlier, final, text, scope, entries, priorFailure);
+      await this.enqueueReply(turn, idle, replies, earlier, final, text, scope, entries, priorFailure);
     } catch { toolError("router", "router.catch48");
       // Transient backend trouble: polling simply retries on the next tick.
     }
   }
 
-  private enqueueReply(turn: Turn, idle: Extract<MessageRecord, { type: "idle" }>,
+  private async enqueueReply(turn: Turn, idle: Extract<MessageRecord, { type: "idle" }>,
     replies: Extract<MessageRecord, { type: "assistant" }>[], earlier: Extract<MessageRecord, { type: "assistant" }>[],
     final: Extract<MessageRecord, { type: "assistant" }> | undefined, text: string,
-    scope: MessageRecord[], entries: Pending[], priorFailure?: Extract<MessageRecord, { type: "idle" }>): void {
+    scope: MessageRecord[], entries: Pending[], priorFailure?: Extract<MessageRecord, { type: "idle" }>): Promise<void> {
     const usage = [...replies].reverse().map(m => (m as { tokens?: { input?: number; cache?: { read?: number; write?: number } } }).tokens)
       .find(tokens => typeof tokens?.input === "number");
     // Tool mode: a final ending in NO_REPLY (one block or a whole multi-block message) is a deliberate silence.
     const silent = !!final && (quietMessages(scope).has(final.id) || (!!assistantText(final).trim() && !replyText(assistantText(final))));
     if (turn.inboundId?.startsWith("wake:")) watcherLog({ component: "wakes", kind: "event", name: "wake.reply_guard", ok: true, ids: { key: turn.inboundId, thread: turn.id }, props: { accepted: silent } });
+    const outgoing = [...earlier.map(reply => ({ id: reply.id, text: replyText(assistantText(reply)) })),
+      ...(final ? [{ id: final.id, text }] : [])]
+      .filter(reply => reply.text && (!turn.background || stripInternalText(reply.text).trim())
+        && !this.store.getOperation(`reply:${turn.generation}:${reply.id}`));
+    const folded = this.toolMode ? [] : await this.foldTexts(turn, outgoing.map(reply => reply.text), outgoing.at(-1)?.id ?? idle.id, "final");
+    if (!this.current(turn) || this.store.get<Turn | null>("activeTurn")?.messageId !== turn.messageId) return;
     this.store.db.transaction(() => {
       if (priorFailure) this.notice(turn, "failed", firstFailureText(priorFailure.modelError));
       // Tool mode: the agent texted the chat itself; what it queued during this turn is what it said.
       const sent = this.toolMode ? this.turnSends(turn) : undefined;
       if (!this.toolMode) {
-        for (const reply of earlier) {
-          const words = replyText(assistantText(reply));
-          if (words && (!turn.background || stripInternalText(words).trim())) this.store.enqueue({
-            id: `reply:${turn.generation}:${reply.id}`, kind: "conversation", text: words, sessionId: turn.id, generation: turn.generation,
+        for (const [index, reply] of outgoing.entries()) {
+          this.store.enqueue({
+            id: `reply:${turn.generation}:${reply.id}`, kind: "conversation", text: folded[index]!, sessionId: turn.id, generation: turn.generation,
             ...this.replyTarget(turn.inboundId),
           });
         }
-        if (text && (!turn.background || stripInternalText(text).trim())) this.store.enqueue({
-          id: `reply:${turn.generation}:${final!.id}`, kind: "conversation", text, sessionId: turn.id, generation: turn.generation,
-          ...this.replyTarget(turn.inboundId),
-        });
       }
       const said = this.toolMode ? sent ?? []
         : [turn.earlyText, ...earlier.map(reply => replyText(assistantText(reply))), text].filter((words): words is string => !!words);
@@ -4221,7 +4346,7 @@ export class Router {
         }
       }
       if (!after.length && statuses[route.id] === undefined) return;
-      if (after.some(m => m.type === "user" && !delegatedCompletion(m))) {
+      if (after.some(ownerPrompt)) {
         // Desktop owner replies stay there even if a completion also arrived.
         const idle = [...after].reverse().find(m => m.type === "idle");
         if (idle && statuses[route.id] === undefined) this.store.set("watermark", { sessionId: route.id, id: idle.id } satisfies Watermark);

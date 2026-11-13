@@ -1,0 +1,19 @@
+Port 2222
+AddressFamily inet
+ListenAddress 127.0.0.1
+PidFile /run/offbox-mgmt-sshd.pid
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_rsa_key
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers user
+AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2
+UsePAM yes
+AllowTcpForwarding yes
+StreamLocalBindUnlink yes
+ClientAliveInterval 30
+MaxSessions 64
+MaxStartups 64:30:128
+Subsystem sftp /usr/lib/openssh/sftp-server

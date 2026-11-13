@@ -19,6 +19,7 @@ import * as SqlitePersistence from "./Sqlite.ts";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as StartupPhaseLog from "../ardud/observability/StartupPhaseLog.ts";
+import { ServerActivation } from "../serverActivation.ts";
 
 const lockHolderSource = `
 const { DatabaseSync } = require("node:sqlite");
@@ -121,6 +122,85 @@ it.effect("logs the actual SQLite open, setup, migration, index and archive boun
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true }))),
   );
 });
+
+it.effect(
+  "boots existing shell counts with inherited WAL and a held write lock before activation",
+  () => {
+    const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-startup-wal-"));
+    const filename = NodePath.join(directory, "state.sqlite");
+    const persistence = SqlitePersistence.layerFromPath(filename).pipe(
+      Layer.provide(NodeServices.layer),
+    );
+    return Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        yield* SqlClient.SqlClient;
+      }).pipe(Effect.provide(persistence));
+      const seed = NodeChildProcess.spawnSync(
+        process.execPath,
+        [
+          "-e",
+          `const { DatabaseSync } = require('node:sqlite');
+         const db = new DatabaseSync(process.argv[1]);
+         db.exec('PRAGMA wal_autocheckpoint=0; CREATE TABLE startup_pages(payload BLOB)');
+         db.exec('WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1200) INSERT INTO startup_pages SELECT randomblob(4000) FROM n');
+         process.exit(0);`,
+          filename,
+        ],
+        { encoding: "utf8" },
+      );
+      assert.equal(seed.status, 0, seed.stderr);
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const holder = yield* Effect.acquireRelease(
+            Effect.sync(() => new NodeSqlite.DatabaseSync(filename)),
+            (db) => Effect.sync(() => db.close()),
+          );
+          const pending = holder.prepare("PRAGMA wal_checkpoint(NOOP)").get();
+          assert.isAbove(Number(pending?.log) - Number(pending?.checkpointed), 1000);
+          const log = StartupPhaseLog.makeStartupPhaseLog(directory);
+          const startupLog = {
+            ...log,
+            start: (...args: Parameters<typeof log.start>) => {
+              if (args[0] === "sqlite.archive-shell-counts") holder.exec("BEGIN IMMEDIATE");
+              return log.start(...args);
+            },
+          };
+          yield* Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            assert.isTrue(holder.isTransaction);
+            assert.deepEqual(yield* sql`SELECT ready FROM ardud_shell_item_count_state`, [
+              { ready: 1 },
+            ]);
+            assert.deepEqual(yield* sql`SELECT COUNT(*) AS count FROM startup_pages`, [
+              { count: 1200 },
+            ]);
+            assert.deepEqual((yield* sql`PRAGMA wal_checkpoint(NOOP)`)[0], pending);
+            holder.exec("ROLLBACK");
+            yield* sql`INSERT INTO orchestration_v2_projection_turn_items
+            (turn_item_id,thread_id,ordinal,type,status,updated_at,payload_json)
+            VALUES ('startup-item','startup-thread',0,'text','completed','now','{}')`;
+            assert.deepEqual(
+              yield* sql`SELECT thread_id, run_key, item_count FROM ardud_shell_item_counts`,
+              [{ thread_id: "startup-thread", run_key: "", item_count: 1 }],
+            );
+          }).pipe(
+            Effect.provide(
+              SqlitePersistence.layerFromPath(filename).pipe(
+                Layer.provide(NodeServices.layer),
+                Layer.provide(Layer.succeed(ServerActivation, Effect.never)),
+                Layer.provide(Layer.succeed(StartupPhaseLog.StartupPhaseLog, startupLog)),
+              ),
+            ),
+          );
+        }),
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+      ),
+    );
+  },
+);
 
 const spawnWriteLockHolder = (dbPath: string, holdMs: number) =>
   Effect.promise(

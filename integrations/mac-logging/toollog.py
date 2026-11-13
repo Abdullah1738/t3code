@@ -15,7 +15,8 @@ CAP_BYTES = 50 * 1024 * 1024
 NUMBERS = set('internalFreeGb externalFreeGb baseline count bytes files snapshotAgeS resticExitCode exitCode found killed ageS autoFixed needsOwner critical high moderate medium low unknown skipped sourceErrors reports inventoryAgeS'.split())
 NUMBERS.update('diskCount storagekitdPid storagekitdUptimeS diskarbitrationdPid diskarbitrationdUptimeS hdiutilMs'.split())
 NUMBERS.update('elapsedMs deniedCount inventorySourceErrors'.split())
-NUMBERS.update(('lockAgeS', 'lockPid'))
+NUMBERS.update(('lockAgeS', 'lockPid', 'completedCount', 'failedCount',
+                'windowStart', 'windowEnd', 'windowS', 'skippedS'))
 for prefix in ('internal', 'external'):
     NUMBERS.update(prefix+field for field in ('FreeGbDelta', 'PurgeableGb', 'LocalSnapshotCount'))
 SKIP_REASONS = {'lock_held', 'no_repo_access', 'password_unavailable', 'source_missing', 'dry_run', 'other'}

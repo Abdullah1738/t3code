@@ -451,7 +451,7 @@ class IdentityTests(unittest.TestCase):
 
     def test_cwd_outside_every_project_cannot_change_native_proof(self):
         self.stub.identities[(CODEX_UUID, "codex")] = resolved(OTHER, driver="codex")
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as outside, patch.object(
+        with tempfile.TemporaryDirectory(dir="/tmp") as outside, patch.object(
             identity, "repo_root", REAL_REPO_ROOT
         ):
             for native, expected in ((CODEX_UUID, "resolved"), (PENDING_UUID, "unavailable")):

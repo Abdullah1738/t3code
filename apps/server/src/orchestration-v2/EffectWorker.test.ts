@@ -26,6 +26,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+import * as Orchestrator from "./Orchestrator.ts";
 import * as RestartPacingTestkit from "../ardud/restart-pacing/RestartPacing.testkit.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as EventSink from "./EventSink.ts";
@@ -89,6 +90,8 @@ function restartEffect(
 function layerExecutorFor(input: {
   readonly events: Ref.Ref<ReadonlyArray<string>>;
   readonly failFirstStart?: Ref.Ref<boolean>;
+  readonly stopBackgroundWork?: ProviderSessionManager.ProviderSessionManagerV2Shape["stopBackgroundWork"];
+  readonly isSessionLive?: ProviderSessionManager.ProviderSessionManagerV2Shape["isLive"];
   readonly threads?: Partial<ThreadManagementService.ThreadManagementService["Service"]>;
   readonly continueAfterRestart?: boolean;
   readonly interrupt?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"];
@@ -113,13 +116,14 @@ function layerExecutorFor(input: {
     Layer.succeed(
       ProviderSessionManager.ProviderSessionManagerV2,
       ProviderSessionManager.ProviderSessionManagerV2.of({
+        stopBackgroundWork: input.stopBackgroundWork ?? (() => Effect.succeed([])),
         shutdown: Effect.void,
         sweepOrphanedThreads: () => Effect.void,
         observeThreadSessionUpdates: () => Effect.void,
         refreshThreadSessionUpdates: () => Effect.void,
         open: () => Effect.die("unused open"),
         get: () => Effect.succeed(Option.none()),
-        isLive: () => Effect.succeed(false),
+        isLive: input.isSessionLive ?? (() => Effect.succeed(false)),
         close: () => Effect.void,
         closeInstance: () => Effect.void,
         release: () => record("release"),
@@ -1057,4 +1061,52 @@ it.effect.each(["confirmed", "unconfirmed", "failed"] as const)(
         outcome === "confirmed" ? ["stop-child", "settle-child"] : ["stop-child"],
       );
     }),
+);
+
+it.effect("retries native settlement after cancellation already released its session", () =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const live = yield* Ref.make(true);
+    const failSettlement = yield* Ref.make(true);
+    let settlements = 0;
+    const layer = layerExecutorFor({
+      events,
+      isSessionLive: () => Ref.get(live),
+      stopBackgroundWork: () =>
+        Ref.getAndSet(live, false).pipe(Effect.map((wasLive) => (wasLive ? [oldSessionId] : []))),
+      threads: {
+        dispatch: (command) =>
+          Effect.gen(function* () {
+            settlements++;
+            if (yield* Ref.getAndSet(failSettlement, false))
+              return yield* new Orchestrator.OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause: "transient write failure",
+              });
+            return { sequence: 1, storedEvents: [] };
+          }),
+      },
+    });
+    yield* Effect.gen(function* () {
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+      const effect = {
+        ...restartEffect(now, { type: "detach" }),
+        request: {
+          type: "provider-session.stop-background-work",
+          throughRunOrdinal: 1,
+          runAttempts: [],
+          onlyIfCancelled: true,
+          backgroundThreads: [
+            { providerSessionId: oldSessionId, providerThreadId, providerTurnId },
+          ],
+        },
+      } satisfies EffectOutbox.OrchestrationEffectV2;
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(executor.execute(effect))));
+      assert.isFalse(yield* Ref.get(live));
+      yield* executor.execute(effect);
+      assert.equal(settlements, 2);
+    }).pipe(Effect.provide(layer));
+  }),
 );

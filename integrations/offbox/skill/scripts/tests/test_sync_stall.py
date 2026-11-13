@@ -349,8 +349,10 @@ class StallDiagnosisTests(unittest.TestCase):
     def test_sample_and_remote_probe_use_run_id_and_bounded_budgets(self):
         import tempfile
         from offbox_lib import common
+        real_exists = Path.exists
         with tempfile.TemporaryDirectory() as tmp, patch.object(common, 'LOGS_DIR', Path(tmp)), \
                 patch.object(ssh_sync.sys, 'platform', 'darwin'), \
+                patch.object(Path, 'exists', lambda path: str(path) == '/usr/bin/sample' or real_exists(path)), \
                 patch.object(ssh_sync, '_source_fs', return_value='apfs'), \
                 patch.object(ssh_sync, '_remote_stall', return_value=('remote_rsync_stat=S', None)) as probe, \
                 patch.object(ssh_sync, '_bounded_command') as run, patch.object(ssh_sync, 'log') as log:

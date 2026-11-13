@@ -281,6 +281,8 @@ A saved base retains its checkout path in project build state. When offbox reloc
 
 ## Home server, Boat standby
 
+On home boxes the stock ssh.service on port 22 is yours (stop, mask or replace it); offbox manages the box through its own `offbox-mgmt-ssh` service on port 2222, which you must leave alone.
+
 Once `bootstrap.zsh client` has written `server.json`, runs go to Abdullah's own server at home (boatd; same
 commands, same box model, no hourly price, no start limits, no spend cap). Boat stays as the standby. Each
 `offbox run` picks its backend once, when it starts:
@@ -296,8 +298,10 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
   command **again from the start, once**, and you get one line saying so (`... running it again from the start
   (attempt 2)`). Runs the server had queued start after it. `--no-retry` turns the second run off; the run then
   ends with **94**.
-- Each backend has its own boxes, saved states and templates (`offbox list`, `bases` show the backend in use;
-  `logs`, `wait`, `kill`, `release`, `ssh` find the right one from the run or box id). A saved state or template
+- Each backend has its own boxes, saved states and templates. `offbox bases` lists both backends; expired bases
+  are hidden unless `--all`. An unpinned run naming a base that exists only on Boat uses Boat and says so.
+  `offbox list` shows the selected backend; `logs`, `wait`, `kill`, `release`, `ssh` find the right one from the
+  run or box id. A saved state or template
   that exists only at home is not on Boat: a standby run says so in one line and uses a plain Boat box, so the
   first standby run of a repo is a cold one.
 - Person work (`offbox-person`, Moni's box) never goes to Boat. Server down = exit **93**, nothing ran; it waits.
@@ -393,6 +397,12 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   for a dead client's unrecorded start. Claims remain for the box's lifetime.
 
 - Three ordinary infra failures within an hour send one Telegram; start-limit alerts use the six-hour cooldown.
+
+## Logs
+
+Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UTC). Run events are `run.request`, `run.queue`, `run.lease`, `run.sync`, `run.command`, `run.pull`, `run.end`, `run.invocation` and `run.error`. Other events include `backend.failover`, `home.probe`, `pool.snapshot`, `gate.decision`, `local.override`, `ssh.setup`, `ssh.readiness`, `ssh.drop`, `ssh.put_file`, `mullvad.check`, `reaper.action`, `reaper.pass` and `cli.<command>`. Logs contain ids, counts, sizes, durations and stable error tags; command output stays in the existing per-run logs.
+
+`offbox log-rollup --day YYYY-MM-DD` writes `rollup-YYYY-MM-DD.json` beside the day file; omit `--day` for today. Monitor/reaper ticks roll up yesterday after 00:05 UTC. Logs keep 30 days; after 50 MB in a day, only errors continue. Home-server services write their own local file at the same path.
 
 ## Troubleshooting
 

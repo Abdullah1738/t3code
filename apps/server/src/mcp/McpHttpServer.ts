@@ -196,6 +196,7 @@ export const normalizeMcpHttpResponse = (
 const looksLikeProviderToken = (token: string) => token.length > 0 && !token.includes(".");
 const LARGE_READ_TOOLS = new Set([
   "board_get",
+  "board_activity",
   "card_get",
   "wiki_read",
   "discussion_read",
@@ -206,6 +207,7 @@ const LARGE_READ_TOOLS = new Set([
 ]);
 const BOARD_READ_TOOLS = new Set([
   "board_get",
+  "board_activity",
   "card_get",
   "wiki_read",
   "discussion_read",

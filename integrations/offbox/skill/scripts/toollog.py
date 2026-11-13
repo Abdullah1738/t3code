@@ -19,7 +19,7 @@ NUMBERS = set("bytes files skipped exitCode waitMs position ttlSeconds reasonLen
 BOOLEANS = set("queued fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
 ENUMS = {
     "backend": {"home", "boat"}, "from": {"home", "boat"}, "to": {"home", "boat"},
-    "reason": {"pinned", "home_up", "home_down", "unreachable", "boat_only", "infra", "cap", "busy", "person_home_down"},
+    "reason": {"pinned", "home_up", "home_down", "unreachable", "boat_only", "boat_only_base", "infra", "cap", "busy", "person_home_down"},
     "leaseKind": {"fresh", "reused", "saved-base"},
     "decision": {"allowed", "denied", "local-override"},
     "harness": {"opencode", "codex", "claudeAgent", "codex-cu"},

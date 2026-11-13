@@ -270,6 +270,55 @@ class DiskSwingTests(unittest.TestCase):
         self.assertNotIn(str(root), jobs.read_state('disk-inventory')['sizes'])
         self.assertEqual(jobs.read_state('disk-inventory')['sourceErrors'], 1)
 
+    def test_previous_partial_state_keys_suppress_growers_and_movers(self):
+        for key in ('partials', 'inventoryPartials'):
+            with self.subTest(key=key):
+                path = str(self.paths[0])
+                jobs.save_state('disk', dict(sizes={path: GB}, inventoryAt=self.at,
+                    free={'internalFreeGb': 737, 'externalFreeGb': 737},
+                    ts='2026-11-13T12:00:00.000Z', **{key: {path: dict(partial=True)}}))
+                self.inventory([95])
+                after = self.sample(642)
+                self.assertNotIn('grower1Path', after['props'])
+                self.assertNotIn('topMover1Path', after['props'])
+                self.assertNotIn('topMover1Path', self.rows('disk.swing')[-1]['props'])
+                recovered = self.sample(642)
+                self.assertNotIn('grower1Path', recovered['props'])
+                self.assertNotIn('topMover1Path', recovered['props'])
+
+    def test_big_root_partial_scan_recovery_and_deletion(self):
+        root = self.root/'big-root'; root.mkdir()
+        fast, slow = root/'fast', root/'slow'
+        fast.mkdir(); slow.mkdir()
+        mode = ['complete']
+        def run(command, **kwargs):
+            if Path(command[-1]) == slow and mode[0] == 'partial':
+                raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+            size = 95*GB if mode[0] == 'complete' else GB
+            return SimpleNamespace(returncode=0, stdout=str(size//1024)+'\t'+command[-1], stderr='')
+        with patch.object(jobs, 'DIRECTORY_ROOTS', [root]), patch.object(jobs, 'BIG_ROOTS', {root}):
+            jobs.directory_inventory([root], run)
+            self.sample(642)
+            mode[0] = 'partial'
+            jobs.directory_inventory([root], run)
+            inventory = jobs.read_state('disk-inventory')
+            self.assertEqual(inventory['children'][str(root)], {str(fast): GB})
+            self.assertTrue(inventory['partials'][str(root)]['partial'])
+            after = self.sample(737)
+            self.assertNotIn('topMover1Path', after['props'])
+            self.assertNotIn('grower1Path', after['props'])
+            mode[0] = 'low'
+            jobs.directory_inventory([root], run)
+            recovered = self.sample(737)
+            self.assertNotIn('topMover1Path', recovered['props'])
+            self.assertNotIn('grower1Path', recovered['props'])
+            fast.rmdir(); slow.rmdir(); root.rmdir()
+            jobs.directory_inventory([root], run)
+            deleted = self.sample(763)
+            self.assertEqual(deleted['props']['topMover1Path'], str(root))
+            self.assertEqual(deleted['props']['topMover1GbDelta'], -2)
+            self.assertEqual(self.rows('disk.swing')[-1]['props']['topMover1GbDelta'], -2)
+
     def test_private_output_and_untracked_movers_cannot_enter_log(self):
         self.inventory([100, 20, 10])
         self.sample()

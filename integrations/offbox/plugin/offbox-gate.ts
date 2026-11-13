@@ -22,6 +22,8 @@ const HOME = homedir()
 const SKILL = join(HOME, ".config/opencode/skills/remote-compute")
 const RULES = join(SKILL, "heavy-rules.json")
 const BLOCKERS = join(SKILL, "scripts/blockers")
+const COORD_BLOCKERS = join(HOME, ".local/share/harness-hooks/coord-blockers")
+const QUINT_GUARD = join(HOME, ".local/share/quint-guard/bin")
 const GATE_CFG = process.env.OFFBOX_GATE_CONFIG ?? join(HOME, ".config/opencode/offbox-gate.json")
 const STATE = process.env.OFFBOX_STATE_DIR ?? join(HOME, ".local/share/offbox")
 const LOG = join(STATE, "gate.jsonl")
@@ -191,12 +193,13 @@ export default {
         // every bun script an agent starts would fail to bind it (EADDRINUSE).
         // Empty means off to bun. Done in every gate mode.
         if (process.env.BUN_INSPECT) env.BUN_INSPECT = ""
+        const path = env.PATH ?? process.env.PATH ?? "/usr/bin:/bin"
+        const prefix = [BLOCKERS, COORD_BLOCKERS, QUINT_GUARD]
+        env.PATH = [...prefix, ...path.split(":").filter((p: string) => !prefix.includes(p))].join(":")
         if (mode() === "off") return
         // OPENCODE_SESSION_ID is set by the shell tool after this hook runs, so it
         // can't be checked here; the shim itself passes through without it.
         if (process.env.OFFBOX_GATE_DEBUG || shellHookSeen++ < 3) log({ event: "shell-hook", cwd: e.cwd, has_env: !!e.env, keys: Object.keys(e) })
-        const path = env.PATH ?? process.env.PATH ?? "/usr/bin:/bin"
-        if (!path.split(":").includes(BLOCKERS)) env.PATH = `${BLOCKERS}:${path}`
         env.OFFBOX_GATE = "1"
       } catch (err) {
         log({ event: "shell-hook-error", errorTag: "hook_failed" })

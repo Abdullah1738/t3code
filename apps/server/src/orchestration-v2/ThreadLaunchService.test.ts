@@ -1527,6 +1527,7 @@ it.effect.each(
         }),
       );
       const renameFiber = yield* Deferred.await(branchNameStarted);
+      const snapshotReads = vi.spyOn(threads, "getShellSnapshot");
       assert.equal(harness.createWorktree.mock.calls[0]?.[0]?.newRefName, "t3/abcd1234");
       yield* waitUntil(() =>
         threads
@@ -1562,9 +1563,11 @@ it.effect.each(
 
       const otherThreadId = ThreadId.make("thread:launch:other-branch");
       const otherPathThreadId = ThreadId.make("thread:launch:other-worktree");
+      const deletedThreadId = ThreadId.make("thread:launch:deleted-shared-worktree");
       for (const [threadId, branch, otherWorktreePath] of [
         [otherThreadId, "other-feature", worktreePath],
         [otherPathThreadId, "t3/abcd1234", "/repo-worktrees/other"],
+        [deletedThreadId, "t3/abcd1234", worktreePath],
       ] as const) {
         yield* threads.dispatch({
           type: "thread.create",
@@ -1581,6 +1584,11 @@ it.effect.each(
           creationSource: "web",
         });
       }
+      yield* threads.dispatch({
+        type: "thread.delete",
+        commandId: CommandId.make("command:launch:delete-shared-thread"),
+        threadId: deletedThreadId,
+      });
       if (archived) {
         for (const threadId of [childThreadId, otherThreadId, otherPathThreadId]) {
           yield* threads.dispatch({
@@ -1592,6 +1600,7 @@ it.effect.each(
       }
       const unrelatedBeforeRename = yield* threads.getThreadProjection(otherThreadId);
       const otherPathBeforeRename = yield* threads.getThreadProjection(otherPathThreadId);
+      const deletedBeforeRename = yield* threads.getThreadProjection(deletedThreadId);
       if (parentMoved) {
         yield* threads.dispatch({
           type: "thread.metadata.update",
@@ -1601,6 +1610,42 @@ it.effect.each(
           worktreePath: movedPath,
         });
       }
+      const lateThreadId = ThreadId.make("thread:launch:late-shared-worktree");
+      const getThreadIdsForWorktree = threads.getThreadIdsForWorktree;
+      let sharingQueries = 0;
+      vi.spyOn(threads, "getThreadIdsForWorktree").mockImplementation((input) =>
+        Effect.gen(function* () {
+          const ids = yield* getThreadIdsForWorktree(input);
+          if (sharingQueries++ === 0) {
+            yield* threads
+              .dispatch({
+                type: "thread.create",
+                commandId: CommandId.make("command:launch:late-shared-thread"),
+                threadId: lateThreadId,
+                projectId,
+                title: "Late sharing thread",
+                modelSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: "t3/abcd1234",
+                worktreePath,
+                createdBy: "user",
+                creationSource: "web",
+              })
+              .pipe(Effect.orDie);
+            if (archived) {
+              yield* threads
+                .dispatch({
+                  type: "thread.archive",
+                  commandId: CommandId.make("command:launch:archive-late-shared-thread"),
+                  threadId: lateThreadId,
+                })
+                .pipe(Effect.orDie);
+            }
+          }
+          return ids;
+        }),
+      );
       yield* Deferred.succeed(allowBranchName, undefined);
       yield* Fiber.await(renameFiber);
       assert.equal(yield* git.resolveBranchName(worktreePath, "HEAD"), "generated-branch");
@@ -1616,6 +1661,10 @@ it.effect.each(
         (yield* threads.getThreadProjection(childThreadId)).thread.branch,
         "generated-branch",
       );
+      assert.equal(
+        (yield* threads.getThreadProjection(lateThreadId)).thread.branch,
+        "generated-branch",
+      );
       assert.deepEqual(
         (yield* threads.getThreadProjection(otherThreadId)).thread,
         unrelatedBeforeRename.thread,
@@ -1623,6 +1672,10 @@ it.effect.each(
       assert.deepEqual(
         (yield* threads.getThreadProjection(otherPathThreadId)).thread,
         otherPathBeforeRename.thread,
+      );
+      assert.deepEqual(
+        (yield* threads.getThreadProjection(deletedThreadId)).thread,
+        deletedBeforeRename.thread,
       );
       const staleUpdate = yield* threads
         .dispatch({
@@ -1644,6 +1697,7 @@ it.effect.each(
         oldBranch: "t3/abcd1234",
         newBranch: "generated-branch",
       });
+      assert.equal(snapshotReads.mock.calls.length, 0);
     }).pipe(Effect.provide(harness.layer));
   }).pipe(
     Effect.provide(

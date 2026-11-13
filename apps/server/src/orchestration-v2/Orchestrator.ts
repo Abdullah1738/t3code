@@ -438,6 +438,9 @@ export interface OrchestratorV2Shape {
   readonly getThreadShell: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2ThreadShell | null, OrchestratorV2Error>;
+  readonly getThreadIdsForWorktree: (
+    input: Parameters<ProjectionStoreV2["Service"]["getThreadIdsForWorktree"]>[0],
+  ) => Effect.Effect<ReadonlyArray<ThreadId>, OrchestratorV2Error>;
   readonly getThreadEventSequence: (
     threadId: ThreadId,
   ) => Effect.Effect<number, OrchestratorV2Error>;
@@ -9858,7 +9861,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     readonly now: DateTime.Utc;
   }) {
     const { command, events, thread, run, now } = input;
-    if (run.rootNodeId === null || run.providerThreadId === null) return;
     const pendingItems = (yield* Ref.get(events)).flatMap((event) =>
       event.type === "turn-item.updated" ? [event.payload] : [],
     );
@@ -9875,7 +9877,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       type: "turn-item.updated",
       threadId: thread.id,
       runId: run.id,
-      nodeId: run.rootNodeId,
+      ...(run.rootNodeId === null ? {} : { nodeId: run.rootNodeId }),
       providerInstanceId: run.providerInstanceId,
       occurredAt: now,
       payload: {
@@ -10171,7 +10173,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           (run) =>
             run.id !== stoppedRun.id &&
             (run.status === "preparing" || run.status === "starting" || run.status === "running"),
-        )
+        ) &&
+        (stopped.providerThread?.driver !== "claudeAgent" ||
+          stopped.providerThread.providerSessionId == null ||
+          (yield* providerSessions.isLive(stopped.providerThread.providerSessionId)))
       ) {
         return;
       }
@@ -12480,9 +12485,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ]);
         }
         break;
-      case "thread.stop":
-        cancelUnsettledEffects = yield* dispatchThreadStop(command, events, effects);
+      case "thread.stop": {
+        const interrupted = yield* dispatchThreadStop(command, events, effects);
+        // A restart continuation can be waiting in pacing with no live child run.
+        // Cancel it in the same transaction as the Stop fence.
+        cancelUnsettledEffects = {
+          effectTypes: [...(interrupted?.effectTypes ?? []), "provider-runtime.continue"],
+          reason: interrupted?.reason ?? command.reason ?? "Thread stopped.",
+        };
         break;
+      }
       case "queued-message.promote-to-steer":
         yield* dispatchQueuedMessagePromoteToSteer(command, events, effects);
         break;
@@ -12601,6 +12613,77 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       default:
         return yield* dispatchUnsupported(command);
+    }
+    if (
+      command.type === "thread.stop" ||
+      (command.type === "run.interrupt" && command.holdQueue === true) ||
+      command.type === "queued-run.cancel"
+    ) {
+      const projection = yield* projectionStore
+        .getThreadRecords(command.threadId, ["runs", "providerThreads", "providerTurns"])
+        .pipe(mapDispatchError(command));
+      const throughRunOrdinal = Math.max(
+        0,
+        ...projection.runs.map((run) => run.ordinal),
+        ...(yield* Ref.get(events)).flatMap((event) =>
+          event.type === "run.created" || event.type === "run.updated"
+            ? [event.payload.ordinal]
+            : [],
+        ),
+      );
+      const runAttempts = projection.runs
+        .filter((run) => run.status !== "queued")
+        .map((run) => ({ runId: run.id, attemptId: run.activeAttemptId }));
+      const planned = yield* Ref.get(effects);
+      const hasInterrupt = planned.some(
+        (effect) => effect.request.type === "provider-turn.interrupt",
+      );
+      yield* Ref.set(
+        effects,
+        planned.map((effect) =>
+          effect.request.type === "provider-turn.interrupt" && effect.request.subagent === undefined
+            ? {
+                ...effect,
+                request: {
+                  ...effect.request,
+                  stopThroughRunOrdinal: throughRunOrdinal,
+                  stopRunAttempts: runAttempts,
+                },
+              }
+            : effect,
+        ),
+      );
+      if (!hasInterrupt)
+        yield* Ref.update(effects, (existing) => [
+          ...existing,
+          {
+            id: `effect:${command.commandId}:provider-session.stop-background-work`,
+            commandId: command.commandId,
+            threadId: command.threadId,
+            request: {
+              type: "provider-session.stop-background-work",
+              throughRunOrdinal,
+              runAttempts,
+              backgroundThreads: projection.providerThreads.flatMap((thread) => {
+                const turn = projection.providerTurns.findLast(
+                  (turn) => turn.providerThreadId === thread.id,
+                );
+                return thread.driver === "claudeAgent" &&
+                  thread.providerSessionId !== null &&
+                  turn !== undefined
+                  ? [
+                      {
+                        providerSessionId: thread.providerSessionId,
+                        providerThreadId: thread.id,
+                        providerTurnId: turn.id,
+                      },
+                    ]
+                  : [];
+              }),
+              onlyIfCancelled: command.type === "queued-run.cancel",
+            },
+          } satisfies PendingOrchestrationEffectV2,
+        ]);
     }
     return {
       events: yield* Ref.get(events),
@@ -13012,11 +13095,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   });
 
   // dispatchWithReceiptEffect owns the dispatch span; this wrapper selects the thread locks.
-  const dispatchWithReceipt = Effect.fnUntraced(function* (command: OrchestrationV2ServerCommand) {
+  const dispatchWithReceipt = Effect.fnUntraced(function* (
+    command: OrchestrationV2ServerCommand,
+  ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
     const dispatch = threadDispatch.withLock(
       commandThreadId(command),
       dispatchWithReceiptEffect(command),
     );
+    if (command.type === "thread.stop") {
+      const result = yield* dispatch;
+      const parentThreadId = yield* appOwnedSubagentParentThreadId(command.threadId).pipe(
+        mapDispatchError(command),
+      );
+      if (parentThreadId !== undefined) {
+        // Stop may only change a continuation effect, so no run.updated event
+        // will arrive to finalize the task. Take the parent lock after the child.
+        yield* threadDispatch.withLock(
+          parentThreadId,
+          finalizeAppOwnedSubagent(command.threadId).pipe(mapDispatchError(command)),
+        );
+      }
+      return result;
+    }
     if (
       command.type !== "message.dispatch" ||
       (command.createdBy !== "user" && command.creationSource !== "mcp")
@@ -13427,6 +13527,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         NodeSqliteClient.readOnly,
         Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
       ),
+    getThreadIdsForWorktree: (input) =>
+      projectionStore
+        .getThreadIdsForWorktree(input)
+        .pipe(NodeSqliteClient.readOnly, Effect.mapError(shellProjectionError)),
     getThreadEventSequence: (threadId) =>
       eventSink
         .latestSequence({ threadId })
@@ -13581,6 +13685,13 @@ const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
       Effect.fail(
         new OrchestratorProjectionError({
           threadId,
+          cause: "Orchestration V2 live runtime is not configured.",
+        }),
+      ),
+    getThreadIdsForWorktree: () =>
+      Effect.fail(
+        new OrchestratorProjectionError({
+          threadId: ThreadId.make("thread:shell"),
           cause: "Orchestration V2 live runtime is not configured.",
         }),
       ),

@@ -240,6 +240,7 @@ export class OrchestratorMcpService extends Context.Service<
 type CallerParent = { readonly thread: CallerRow };
 
 const isThreadManagementError = Schema.is(ThreadManagementService.ThreadManagementError);
+const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
 
 function failure(code: OrchestratorMcpFailure["code"], message: string): OrchestratorMcpFailure {
   return new OrchestratorMcpFailure({ code, message });
@@ -269,6 +270,7 @@ export const isLiveCallerShell = (
       false));
 
 function threadManagementFailure(error: unknown): OrchestratorMcpFailure {
+  if (isOrchestratorMcpFailure(error)) return error;
   if (!isThreadManagementError(error)) return failure("orchestration_error", errorMessage(error));
   switch (error._tag) {
     case "ThreadManagementThreadNotFoundError":
@@ -3181,19 +3183,10 @@ const make = Effect.gen(function* () {
           status: current.status,
         } satisfies OrchestratorMcpTaskCancelResult;
       }
-      const child = yield* loadProjection(current.childThreadId, ["runs"]);
-      if (
-        current.workState !== "waiting_for_children" &&
-        ThreadManagementService.latestActiveRun(child) === undefined &&
-        !child.runs.some(
-          (run) =>
-            run.status === "queued" &&
-            (run.delegatedTaskId === input.taskId || run.id === current.childRunId),
-        )
-      ) {
+      if (current.childRunId === null && current.workState !== "waiting_for_children") {
         return yield* failure(
           "task_not_cancellable",
-          `Delegated task ${input.taskId} has no interruptible child run.`,
+          `Delegated task ${input.taskId} has no recorded child run to settle.`,
         );
       }
       yield* stopWithinLimit;
@@ -3205,9 +3198,10 @@ const make = Effect.gen(function* () {
           }),
         ),
       );
+      const stopped = yield* readTask(scope, input.taskId);
       return {
         taskId: input.taskId,
-        status: "cancel_requested",
+        status: isTerminalTaskStatus(stopped.status) ? stopped.status : "cancel_requested",
       };
     }),
     createThreads: Effect.fn("OrchestratorMcpService.createThreads")(

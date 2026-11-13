@@ -129,7 +129,12 @@ export const planCutoverCardRestore = (input: {
   };
   const nextCard = sameValue(restored, card)
     ? card
-    : { ...restored, movedAt: input.at, updatedAt: input.at };
+    : {
+        ...restored,
+        ...(restored.wait === undefined ? {} : { wait: { ...restored.wait, at: input.at } }),
+        movedAt: input.at,
+        updatedAt: input.at,
+      };
   const restoredLink: KanbanThreadLink = { ...link, model, endedAt: null, paused: null };
   const nextLink = sameValue(restoredLink, link) ? link : restoredLink;
   return {

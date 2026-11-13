@@ -489,6 +489,26 @@ exit 0
         with open(uber) as fh:
             self.assertEqual(fh.read(), "#!/bin/sh\necho mine\n")
 
+    def test_quint_guard_link_is_idempotent_and_check_reports_drift(self):
+        self.ready()
+        guard = self.live(".local/share/quint-guard/bin/quint")
+        target = self.live(".local/bin/quint")
+        self.assertEqual(self.run_install("--dry-run")[0], 0)
+        self.assertFalse(os.path.lexists(guard))
+        rc, _, err = self.run_install()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(os.readlink(guard), target)
+        self.assertEqual(os.listdir(os.path.dirname(guard)), ["quint"])
+        self.assertEqual(self.run_install("--check")[0], 0)
+        self.assertEqual(self.run_install()[0], 0)
+        os.unlink(guard)
+        os.symlink("/missing/quint", guard)
+        rc, _, err = self.run_install("--check")
+        self.assertEqual(rc, 1)
+        self.assertIn("is not a link to " + target, err)
+        self.assertEqual(self.run_install()[0], 0)
+        self.assertEqual(os.readlink(guard), target)
+
     def test_links_point_at_deployed_helpers_but_never_replace_a_real_file(self):
         helpers = self.live(".local/share/robob-watch/helpers")
         os.makedirs(helpers)

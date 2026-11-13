@@ -1,11 +1,35 @@
 import { assert, it } from "@effect/vitest";
-import { ThreadId } from "@t3tools/contracts";
+import { OrchestratorMcpFailure, ThreadId } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Logger from "effect/Logger";
 import * as TestClock from "effect/testing/TestClock";
 import * as McpDeadline from "./McpDeadline.ts";
+
+it.effect("a fail-fast caller error retains the same-key retry instruction", () =>
+  Effect.gen(function* () {
+    const error = yield* McpDeadline.withDeadline(
+      Effect.fail(
+        new OrchestratorMcpFailure({
+          code: "caller_unresolved",
+          message: "Reader unavailable. Nothing was saved; retry the same call.",
+        }),
+      ),
+      {
+        code: "caller_unresolved",
+        threadId: ThreadId.make("caller"),
+        stage: "caller",
+        requestKey: "same-key",
+      },
+    ).pipe(Effect.flip);
+    assert.equal(error.code, "caller_unresolved");
+    assert.equal(
+      error.message,
+      "Reader unavailable. Nothing was saved; retry the same call. Retry only with the same clientRequestId: same-key.",
+    );
+  }),
+);
 
 it.effect("an outer deadline reports the nested caller read that is still pending", () =>
   Effect.gen(function* () {

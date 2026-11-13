@@ -87,16 +87,17 @@ if (( command_index )) && [[ "${argv[command_index]}" == verify ]]; then
     port="$(python3 -c 'import socket
 with socket.socket() as s:
     s.bind(("127.0.0.1", 0))
-    print(s.getsockname()[1])')" || die "Could not choose a free localhost port; pass --server-endpoint localhost:<port>."
+    print(s.getsockname()[1])')" || die "Could not choose a free loopback port; pass --server-endpoint 127.0.0.1:<port>."
     # Insert before any -- delimiter so yargs still sees the option.
-    set -- "${@:1:$command_index}" --server-endpoint "localhost:$port" "${@:$((command_index+1))}"
+    set -- "${@:1:$((command_index-1))}" --server-endpoint "127.0.0.1:$port" "${@:$command_index}"
+    (( command_index += 2 ))
   fi
 fi
 if (( command_index )) && [[ "${argv[command_index]}" == verify ]]; then
   if [[ "${QUINT_ALLOW_VULNERABLE_APALACHE:-}" == 1 ]]; then
     print -u2 -r -- "quint wrapper: QUINT_ALLOW_VULNERABLE_APALACHE=1: bypassing the patched backend guard; Quint may launch/download stock Apalache."
   else
-    exec python3 - "$quint_bin" "$@" <<'PYTHON_GUARD'
+    exec python3 - "$quint_bin" "$command_index" "$@" <<'PYTHON_GUARD'
 import hashlib
 import os
 from pathlib import Path
@@ -112,8 +113,8 @@ import tarfile
 import tempfile
 import time
 
-ARCHIVE_SHA = 'b4fc81998dd20d0b55a48c16d1caed1045e324bbbfe45ee7f625f6aaf70caf6f'
-JAR_SHA = 'cb6a7d689b2937b00be5e7e30e9bb1925cde7c8ce47aaafddb1cf21c8c167593'
+ARCHIVE_SHA = '51e0e9832eb589d346370b54377850697a597e3dfc23dd49246a02df421c9174'
+JAR_SHA = 'a90f5802b6cfdb59c548513f0be2725ebd7c53a79cb96277cb349e48ea0b8f66'
 PROPERTY = '-Dcom.google.protobuf.error_on_unsafe_pre22_gencode=true'
 FALLBACK = re.compile(rb'Downloading Apalache|Launching Apalache server|Started Apalache server on pid=|No running Apalache server found, launching|QUINT_BACKEND_LAUNCH_BLOCKED', re.I)
 
@@ -140,7 +141,7 @@ def stop(process):
             process.wait()
 
 
-def guarded(cli, args):
+def guarded(cli, command_index, args):
     # QUINT_HOME only changes the cache root; the sentinel also blocks fallback
     # after a reflection rejection, even when Quint suppresses its own logging.
     with tempfile.TemporaryDirectory(prefix='quint-guard-') as temp:
@@ -208,6 +209,7 @@ def guarded(cli, args):
         before, after = args[:split], args[split:]
         endpoint = None
         version_indices = set()
+        endpoint_indices = set()
         for i, arg in enumerate(before):
             key, equal, value = arg.partition('=')
             if key in ('--no-server-endpoint', '--no-serverEndpoint', '--no-apalache-version', '--no-apalacheVersion'):
@@ -215,23 +217,42 @@ def guarded(cli, args):
             if key in ('--server-endpoint', '--serverEndpoint', '--apalache-version', '--apalacheVersion'):
                 value = value if equal else (before[i+1] if i+1 < len(before) else '')
                 if key in ('--apalache-version', '--apalacheVersion'):
+                    if version_indices:
+                        fail('repeated --apalache-version; pass this option only once (including aliases)')
                     if value != '0.62.4':
                         fail('guarded verify requires --apalache-version 0.62.4')
                     version_indices.add(i)
                     if not equal:
                         version_indices.add(i + 1)
                 else:
+                    if endpoint_indices:
+                        fail('repeated --server-endpoint; pass this option only once (including aliases)')
                     match = re.fullmatch(r'(localhost|127\.0\.0\.1):([0-9]+)', value)
                     if not match or not 0 < int(match[2]) < 65536:
                         fail('guarded --server-endpoint must be localhost:<port> or 127.0.0.1:<port> with a free port')
                     endpoint = int(match[2])
+                    endpoint_indices.add(i)
+                    if not equal:
+                        endpoint_indices.add(i + 1)
         with socket.socket() as reservation:
             reservation.bind(('127.0.0.1', endpoint or 0))
             port = reservation.getsockname()[1]
-        # Yargs combines duplicate string options into arrays, including aliases.
-        # Remove accepted user spellings before adding one pinned version.
-        before = [arg for i, arg in enumerate(before) if i not in version_indices]
-        args = before + ['--apalache-version=0.62.4'] + after
+        normalized = []
+        first_endpoint = min(endpoint_indices) if endpoint_indices else None
+        first_version = min(version_indices) if version_indices else None
+        for i, arg in enumerate(before):
+            if i == command_index - 1:
+                if first_endpoint is None:
+                    normalized.extend(['--server-endpoint', f'127.0.0.1:{port}'])
+                if first_version is None:
+                    normalized.append('--apalache-version=0.62.4')
+            if i == first_endpoint:
+                normalized.extend(['--server-endpoint', f'127.0.0.1:{port}'])
+            if i == first_version:
+                normalized.append('--apalache-version=0.62.4')
+            if i not in endpoint_indices and i not in version_indices:
+                normalized.append(arg)
+        args = normalized + after
         server = client = None
         interrupted = []
         def interrupt(signum, frame):
@@ -252,8 +273,9 @@ def guarded(cli, args):
                     fail('patched Apalache exited before listening')
                 # A successful TCP connect alone could belong to a competing
                 # process that won the port race. Require our exact PID to own it.
-                listening = subprocess.run(['lsof', '-nP', '-a', '-p', str(server.pid), f'-iTCP:{port}', '-sTCP:LISTEN', '-t'], capture_output=True, text=True)
-                if str(server.pid) in listening.stdout.split():
+                listening = subprocess.run(['lsof', '-nP', '-a', '-p', str(server.pid), f'-iTCP:{port}', '-sTCP:LISTEN', '-Fpn'], capture_output=True, text=True)
+                fields = listening.stdout.splitlines()
+                if f'p{server.pid}' in fields and f'n127.0.0.1:{port}' in fields:
                     break
                 if time.monotonic() >= deadline:
                     fail('patched Apalache did not listen within 30s')
@@ -299,7 +321,7 @@ def guarded(cli, args):
 
 
 try:
-    sys.exit(guarded(sys.argv[1], sys.argv[2:]))
+    sys.exit(guarded(sys.argv[1], int(sys.argv[2]), sys.argv[3:]))
 except (RuntimeError, OSError, tarfile.TarError) as error:
     print(f'quint wrapper: {error}', file=sys.stderr)
     sys.exit(1)

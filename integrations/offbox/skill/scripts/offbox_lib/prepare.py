@@ -8,7 +8,7 @@ import threading
 import time
 
 from . import api, capacity
-from .common import OffboxError, log, say
+from .common import OffboxError, SshHostKeyMismatch, log, say
 
 _ACTIVE = contextvars.ContextVar('prepare', default=None)
 _MOVES = contextvars.ContextVar('prepare_moves', default=None)
@@ -107,6 +107,8 @@ def guard(box, end=None, seconds=None):
             with phase('bring_up', box):
                 yield budget
             budget.check()
+    except SshHostKeyMismatch:
+        raise
     except (Exception, _Expired) as error:
         if not isinstance(error, _Expired) and time.monotonic() < budget.end:
             raise
