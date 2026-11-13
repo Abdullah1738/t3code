@@ -349,6 +349,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   `offbox run --step 'go vet ./...' --step 'go test -count=1 ./pkg/...'`
   Each step runs in its own subshell with pipefail and does not stop the next. You get `offbox step N rc=X: ...`
   per step, then `offbox steps: K ok, M failed (step N rc=X)`, then `offbox: remote exit <first nonzero rc>`.
+  A run missing any planned step result exits 90 (`steps incomplete`); rerun the checks before treating them as passed.
   `--step` plus a trailing `-- cmd` is a usage error (2). Exit 1 whose last pipeline stage is grep gets a hint line:
   it may mean "no match" or an earlier stage failed.
 - **99** = the repo-pinned Node or pnpm could not be provided or activated. The command never started; fix the pin or retry after the download failure. Offbox does not run on the box default instead.

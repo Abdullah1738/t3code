@@ -485,10 +485,10 @@ class HintAndPullTests(Isolated):
         root = Path(self.tmp.name)
         (root/'package.json').write_text('{}')
         row = {'box_id': 'B', '_new_checkout': True}
-        for lock, install in (('pnpm-lock.yaml','corepack pnpm install --frozen-lockfile'),
+        for lock, install in (('pnpm-lock.yaml','corepack pnpm@10 install --frozen-lockfile'),
                               ('yarn.lock','corepack yarn install --frozen-lockfile'), ('package-lock.json','npm ci')):
             with self.subTest(lock=lock):
-                (root/lock).touch()
+                (root/lock).write_text("lockfileVersion: '9.0'\n" if lock == 'pnpm-lock.yaml' else '')
                 err=io.StringIO()
                 with contextlib.redirect_stderr(err):
                     runs.new_checkout_hint(row, root)
@@ -514,7 +514,7 @@ class HintAndPullTests(Isolated):
     def test_switched_pnpm_run_hints_before_command_even_when_exit_is_one(self):
         root = Path(self.tmp.name)
         (root/'package.json').write_text('{}')
-        (root/'pnpm-lock.yaml').touch()
+        (root/'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
         me = dict(self.me, repo_root=str(root))
         self.box('A', state='deleted', member=True)
         self.box('B', member=True)
@@ -525,7 +525,7 @@ class HintAndPullTests(Isolated):
         runner = runs.Runner(args, me)
         err = io.StringIO()
         def start(*a, **_kw):
-            self.assertIn('prefix your command with corepack pnpm install --frozen-lockfile &&', err.getvalue())
+            self.assertIn('prefix your command with corepack pnpm@10 install --frozen-lockfile &&', err.getvalue())
             return {'processId': 7}
         with patch.object(lease, '_reuse', side_effect=lambda c,r,s,**kw: dict(r)), \
                 patch.object(runs, '_ttl_keeper'), patch.object(lease, 'idle_ttl'), \
