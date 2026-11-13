@@ -425,6 +425,7 @@ const handlers = {
               id: board.id,
               name: board.name,
               window,
+              legend: Activity.COMPACT_LEGEND,
               activeCards: rows.length,
               pools: read.pools.map((pool) => ({ key: pool.key, slots: pool.slots })),
               cards: page.rows,
