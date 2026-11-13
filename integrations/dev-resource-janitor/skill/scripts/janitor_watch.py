@@ -70,6 +70,10 @@ def check():
 def worker(lock_fd):
     # The parent acquired this lock before spawning us; keep its inherited file descriptor open until exit.
     os.fstat(lock_fd)
+    started = time.monotonic()
+    stats = {"found": 0, "killed": 0}
+    ok = False
+    dev_janitor = None
     try:
         import dev_janitor
 
@@ -77,18 +81,23 @@ def worker(lock_fd):
         os.makedirs(dev_janitor.LOG_DIR, exist_ok=True)
         with open(dev_janitor.LAST, "w") as f:
             json.dump(scan, f, indent=1)
+        stats["found"] = len(scan["resources"])
         candidates = scan["candidates"]
         if candidates:
             # apply() re-scans immediately before *each* action; do not act on the initial snapshot alone.
-            results = dev_janitor.apply(",".join(candidates))
+            results = dev_janitor.apply(",".join(candidates), stats)
             failures = [f"{r['id']} ({r.get('msg') or r.get('action')})"
                         for r in results if not r.get("ok") and r.get("action") != "skipped"]
             if failures:
                 raise RuntimeError("apply failed: " + "; ".join(failures))
+        ok = True
         write_state({"status": "ok", "finished_at": time.time()})
     except Exception as e:  # noqa: BLE001
         write_state({"status": "failed", "error": str(e)[:500], "finished_at": time.time()})
         return 1
+    finally:
+        if dev_janitor is not None:
+            dev_janitor.log_run(started, stats["found"], stats["killed"], ok)
     return 0
 
 
