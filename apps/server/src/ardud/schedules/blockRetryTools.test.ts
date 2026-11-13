@@ -78,6 +78,10 @@ const layer = McpHttpServer.toolkitRegistration(
   Layer.provideMerge(McpServer.McpServer.layer),
   Layer.provideMerge(
     Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getCallerRow: (threadId) =>
+        Effect.succeed(
+          liveThreadShell(threadId, { runtimeMode: modesOf[threadId] ?? "full-access" }),
+        ),
       getThreadShell: (threadId) =>
         Effect.succeed(
           liveThreadShell(threadId, { runtimeMode: modesOf[threadId] ?? "full-access" }),

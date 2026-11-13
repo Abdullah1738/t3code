@@ -97,6 +97,7 @@ const layerFor = (harness: Harness) =>
     Layer.provideMerge(McpServer.McpServer.layer),
     Layer.provideMerge(
       Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getCallerRow: (threadId) => Effect.succeed(shells(harness)[threadId] ?? null),
         getThreadShell: (threadId) => Effect.succeed(shells(harness)[threadId] ?? null),
       }),
     ),

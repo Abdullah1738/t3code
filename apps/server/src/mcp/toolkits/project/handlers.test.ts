@@ -63,6 +63,7 @@ it.effect("attributes a launched thread's first message to the calling thread", 
         capabilities: new Set(["orchestration" as const]),
       }),
       Layer.mock(ThreadManagement.ThreadManagementService)({
+        getCallerRow: () => Effect.succeed(caller),
         getThreadShell: () => Effect.succeed(caller),
       }),
       Layer.mock(ThreadLaunch.ThreadLaunchService)({
@@ -135,6 +136,7 @@ it.effect("launches a scratch thread into the Scratch project", () =>
         capabilities: new Set(["orchestration" as const]),
       }),
       Layer.mock(ThreadManagement.ThreadManagementService)({
+        getCallerRow: () => Effect.succeed(caller),
         getThreadShell: () => Effect.succeed(caller),
       }),
       Layer.mock(ThreadLaunch.ThreadLaunchService)({
@@ -233,6 +235,7 @@ it.effect("starts a project from just a title when workspaceRoot is omitted", ()
         capabilities: new Set(["orchestration" as const]),
       }),
       Layer.mock(ThreadManagement.ThreadManagementService)({
+        getCallerRow: () => Effect.succeed(caller),
         getThreadShell: () => Effect.succeed(caller),
       }),
       Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
