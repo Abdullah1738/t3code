@@ -1936,9 +1936,9 @@ const make = Effect.gen(function* () {
     if (task === undefined || task.childThreadId === null) {
       return yield* failure(
         "task_not_found",
-        `Delegated task ${taskId} does not belong to thread ${scope.thread.threadId}.` +
+        `Delegated task ${taskId} was not found for thread ${scope.thread.threadId}.` +
           (taskId.startsWith("node:delegated-task:")
-            ? " Creation may still be in flight; retry task_status with this task id, or retry delegate_task only with the same clientRequestId."
+            ? " Creation may still be in flight; retry task_status with this task id. If it is still not found about 30 seconds after the timeout, retry delegate_task with the same clientRequestId; this safely returns the same task."
             : ""),
       );
     }
@@ -2796,6 +2796,7 @@ const make = Effect.gen(function* () {
                   : stage,
           ...(retryKey === undefined ? {} : { requestKey: retryKey }),
           ...(taskId === undefined ? {} : { taskId }),
+          ...(stage === "dispatch" ? { onTimeout: "detach" as const } : {}),
         }).pipe((bounded) => McpTaskTrace.stage(bounded, stage));
       const { scope, parent } = yield* bounded(
         "caller",
@@ -2911,7 +2912,7 @@ const make = Effect.gen(function* () {
       // ThreadManagementService.dispatch is the chokepoint for this command
       // type's own enablement check, using the same command id and its
       // receipt-replay exemption, so no separate assert runs here.
-      const result = yield* threadManagement
+      const { result, preparation } = yield* threadManagement
         .dispatch({
           type: "delegated_task.request",
           createdBy: "agent",
@@ -2950,6 +2951,29 @@ const make = Effect.gen(function* () {
                   `Unable to create delegated task: ${errorMessage(error)}`,
                 ),
           ),
+          (dispatch) =>
+            Effect.uninterruptibleMask((restore) =>
+              Effect.gen(function* () {
+                const result = yield* restore(dispatch);
+                const createdRun = result.storedEvents.find(
+                  (stored) =>
+                    stored.event.type === "run.created" &&
+                    stored.event.payload.workspacePreparation !== undefined,
+                );
+                // A late commit must schedule preparation before its bounded waiter can leave.
+                const preparation =
+                  createdRun?.event.type === "run.created"
+                    ? yield* threadLaunch
+                        .prepareRun({
+                          commandId,
+                          threadId: createdRun.event.threadId,
+                          runId: createdRun.event.payload.id,
+                        })
+                        .pipe(Effect.forkIn(serviceScope, { uninterruptible: false }))
+                    : undefined;
+                return { result, preparation };
+              }),
+            ),
           (effect) => bounded("dispatch", effect, expectedTaskId),
         );
       const taskEvent = result.storedEvents.find(
@@ -3003,20 +3027,6 @@ const make = Effect.gen(function* () {
         pendingApproval: null,
         waitTimedOut: input.mode === "wait",
       });
-      // Preparation belongs to the service, not the transport request. A timed
-      // out caller must not cancel work whose command already committed.
-      const preparation =
-        childThreadId !== null &&
-        childRunEvent?.event.type === "run.created" &&
-        childRunEvent.event.payload.workspacePreparation !== undefined
-          ? yield* threadLaunch
-              .prepareRun({
-                commandId,
-                threadId: childThreadId,
-                runId: childRunEvent.event.payload.id,
-              })
-              .pipe(Effect.forkIn(serviceScope))
-          : undefined;
       const observe = (value: OrchestratorMcpDelegateTaskResult) => Ref.set(snapshot, value);
       const continuation = yield* Effect.gen(function* () {
         if (preparation !== undefined) yield* Fiber.join(preparation);
