@@ -1,4 +1,19 @@
 export const kanbanDDL = [
+  `CREATE TABLE IF NOT EXISTS ardud_kanban_evaluator_spawns (
+    launch_key TEXT PRIMARY KEY, board_id TEXT NOT NULL, card_id TEXT, at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_evaluator_spawns_window
+    ON ardud_kanban_evaluator_spawns (board_id, at)`,
+  `CREATE TABLE IF NOT EXISTS ardud_kanban_evaluator_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, job_key TEXT NOT NULL UNIQUE,
+    board_id TEXT NOT NULL, card_id TEXT, json TEXT NOT NULL,
+    created_at TEXT NOT NULL, started_at TEXT, thread_id TEXT, done_at TEXT
+  )`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_evaluator_queue_started
+    ON ardud_kanban_evaluator_queue (board_id, started_at)`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_evaluator_queue_pending
+    ON ardud_kanban_evaluator_queue (board_id, id) WHERE done_at IS NULL`,
+
   `CREATE TABLE IF NOT EXISTS ardud_kanban_boards (
     id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, json TEXT NOT NULL
   )`,

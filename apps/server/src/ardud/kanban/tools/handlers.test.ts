@@ -2891,7 +2891,10 @@ it.effect.each(["card_move", "card_review_result"] as const)(
     Effect.gen(function* () {
       const held = yield* Deferred.make<void>();
       const resume = yield* Deferred.make<void>();
-      const fake = fakeThreads();
+      const fake = fakeThreads(undefined, undefined, undefined, undefined, undefined, {
+        findExisting: true,
+        send: () => Effect.void,
+      });
       const warnings: unknown[] = [];
       const logger = Logger.make(({ message }) => {
         warnings.push(message);

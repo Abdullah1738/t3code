@@ -1215,13 +1215,12 @@ const handlers = {
         }
         // A sweep's text is added to its brief; setup/request already carry it in purpose.
         const sweepText = purpose.kind === "setup" || purpose.kind === "request" ? undefined : text;
-        return {
-          threadId: yield* service.startEvaluator(
-            KanbanBoardId.make(board.id),
-            purpose,
-            sweepText || undefined,
-          ),
-        };
+        return yield* service.submitEvaluator(KanbanBoardId.make(board.id), purpose, {
+          ...(sweepText ? { text: sweepText } : {}),
+          matchText: text,
+          callerThreadId: caller.threadId,
+          ...(input.forceNew === undefined ? {} : { forceNew: input.forceNew }),
+        });
       }),
     ),
   ),
