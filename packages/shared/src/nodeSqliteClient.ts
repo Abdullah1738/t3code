@@ -2033,11 +2033,13 @@ const make = Effect.fn("makeWithDatabase")(function* (
       const start = clock.monotonicTimeNanosUnsafe();
       return Effect.flatMap(route(span?._tag === "Span" ? span : undefined), (target) =>
         Effect.withFiber<A, E | SqlError, R>((fiber) => {
+          let started = false;
+          const traced =
+            fiber.getRef(References.TracerEnabled) &&
+            fiber.getRef(Statement.SpanPropagationEnabled);
           const useConnection = Effect.suspend(() => {
+            started = true;
             const grant = acquired(target, clock, start);
-            const traced =
-              fiber.getRef(References.TracerEnabled) &&
-              fiber.getRef(Statement.SpanPropagationEnabled);
             if (traced) annotateAcquired(fiber, grant);
             if (target.name !== "reader") return use(target.connection);
             const granted = clock.monotonicTimeNanosUnsafe();
@@ -2054,9 +2056,6 @@ const make = Effect.fn("makeWithDatabase")(function* (
               ),
             );
           });
-          if (!options.checkpointWorker || target.name !== "writer") {
-            return target.lock.withPermits(1)(useConnection);
-          }
           const writerUse = Effect.onExit(useConnection, (exit) =>
             Effect.sync(() => {
               writerBorrowsSinceYield = Exit.hasInterrupts(exit)
@@ -2064,23 +2063,39 @@ const make = Effect.fn("makeWithDatabase")(function* (
                 : Math.min(writerBorrowsSinceYield + 1, writerBorrowBatchSize);
             }),
           );
-          return Effect.flatMap(target.lock.withPermitsIfAvailable(1)(writerUse), (result) =>
-            Option.isSome(result)
-              ? Effect.succeed(result.value)
-              : target.lock.withPermits(1)(
-                  Effect.andThen(
-                    // Failed SQL also consumes the batch; cancellation hands off immediately.
-                    Effect.suspend(() => {
-                      if (writerBorrowsSinceYield < writerBorrowBatchSize) return Effect.void;
-                      writerBorrowsSinceYield = 0;
-                      return Effect.callback<void>((resume) => {
-                        const immediate = setImmediate(() => resume(Effect.void));
-                        return Effect.sync(() => clearImmediate(immediate));
-                      });
-                    }),
-                    writerUse,
-                  ),
-                ),
+          const acquire =
+            !options.checkpointWorker || target.name !== "writer"
+              ? target.lock.withPermits(1)(useConnection)
+              : Effect.flatMap(target.lock.withPermitsIfAvailable(1)(writerUse), (result) =>
+                  Option.isSome(result)
+                    ? Effect.succeed(result.value)
+                    : target.lock.withPermits(1)(
+                        Effect.andThen(
+                          // Failed SQL also consumes the batch; cancellation hands off immediately.
+                          Effect.suspend(() => {
+                            if (writerBorrowsSinceYield < writerBorrowBatchSize) return Effect.void;
+                            writerBorrowsSinceYield = 0;
+                            return Effect.callback<void>((resume) => {
+                              const immediate = setImmediate(() => resume(Effect.void));
+                              return Effect.sync(() => clearImmediate(immediate));
+                            });
+                          }),
+                          writerUse,
+                        ),
+                      ),
+                );
+          return Effect.onExit(acquire, (exit) =>
+            Effect.sync(() => {
+              if (started || !traced || span?._tag !== "Span") return;
+              const wait = acquired(target, clock, start);
+              span.attribute("db.connection", wait.connection);
+              if (wait.lane !== undefined) span.attribute("db.reader.lane", wait.lane);
+              if (wait.slot !== undefined) span.attribute("db.reader.slot", wait.slot);
+              span.attribute("db.reader.waiting", true);
+              span.attribute("db.reader.wait_interrupted", Exit.hasInterrupts(exit));
+              span.attribute("db.lock_wait_ms", wait.lockWaitMs);
+              span.attribute("db.reader.acquire_wait_ms", wait.lockWaitMs);
+            }),
           );
         }),
       );
