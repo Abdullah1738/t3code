@@ -49,6 +49,14 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
   const wrap = async <T>(work: () => Promise<T>): Promise<T> => {
     try { return await work(); } catch (error) { toolError("sb-transport", "sb-transport.catch1", error); throw classifyLineFailure(error); }
   };
+  const sendAtLine = async <T>(send: () => Promise<T>): Promise<T> => {
+    const revision = store.get<number>("optInRevision") ?? 0;
+    try { return await send(); } catch (error) {
+      const failure = classifyLineFailure(error);
+      failure.optInRevision = revision;
+      throw failure;
+    }
+  };
   const sentKey = (id: string) => `sent:${id}`;
   const attemptKey = (id: string) => `sent-attempt:${id}`;
   const attempts = (id: string): Attempts | undefined => {
@@ -90,14 +98,15 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
     store.set(attemptKey(id), { first: own?.first ?? start, last: start } satisfies Attempts);
     let sent: { handle: string };
     try {
-      sent = await wrap(send);
+      sent = await send();
     } catch (error) { toolError("sb-transport", "sb-transport.catch2", error);
+      const failure = error instanceof TransportError ? error : classifyLineFailure(error);
       // Nothing went out, so the next try need not wait for a copy that will never show up.
-      if (error instanceof TransportError && !error.ambiguous) {
+      if (!failure.ambiguous) {
         if (own) store.set(attemptKey(id), own);
         else store.db.query("DELETE FROM kv WHERE key = ?").run(attemptKey(id));
       }
-      throw error;
+      throw failure;
     }
     store.set(sentKey(id), { handle: sent.handle });
     rearm();
@@ -152,7 +161,7 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
       Promise<{ providerId?: string; duplicate?: boolean; original?: boolean }> {
       const text = sameText(input.text);
       return once(input.id, input.retryOf, message => !message.mediaUrl && !message.card && sameText(message.text) === text,
-        () => line.sendText(chat, input.text, input.replyTo ? { replyTo: input.replyTo } : undefined));
+        () => sendAtLine(() => line.sendText(chat, input.text, input.replyTo ? { replyTo: input.replyTo } : undefined)));
     },
     async uploadAttachment(input: { id: string; data: Uint8Array; name: string; mimeType: string }): Promise<{ guid: string }> {
       return { guid: await wrap(() => line.upload({ data: input.data, name: input.name, mimeType: input.mimeType })) };
@@ -160,7 +169,7 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
     async sendAttachment(input: { id: string; chatGuid: string; attachmentGuid: string; replyTo?: string }): Promise<{ providerId?: string; duplicate?: boolean }> {
       // Sendblue keeps the uploaded file's URL as the message's media_url.
       return once(input.id, undefined, message => message.mediaUrl === input.attachmentGuid,
-        () => line.sendText(chat, "", { mediaUrl: input.attachmentGuid, ...(input.replyTo ? { replyTo: input.replyTo } : {}) }));
+        () => sendAtLine(() => line.sendText(chat, "", { mediaUrl: input.attachmentGuid, ...(input.replyTo ? { replyTo: input.replyTo } : {}) })));
     },
     /** All reads/uploads finish before Delivery's final guards; the returned function only sends. */
     async prepareApp(input: { id: string; chatGuid: string; updateOf?: string; previewPage?: string } & LineAppCard): Promise<() => Promise<Receipt>> {
@@ -199,7 +208,7 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
         }
       }
       const updateKey = createHash("sha256").update(id).digest("hex");
-      return () => dispatch(id, () => originalHandle ? line.updateApp!(originalHandle, card, updateKey) : line.sendApp(chat, card));
+      return () => dispatch(id, () => sendAtLine(() => originalHandle ? line.updateApp!(originalHandle, card, updateKey) : line.sendApp(chat, card)));
     },
     async sendApp(input: { id: string; chatGuid: string; updateOf?: string; previewPage?: string } & LineAppCard): Promise<Receipt> {
       return (await this.prepareApp(input))();

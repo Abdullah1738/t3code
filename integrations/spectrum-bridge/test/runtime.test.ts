@@ -3,9 +3,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApi } from "../src/api.ts";
+import { Delivery } from "../src/delivery.ts";
 import type { Access } from "../src/chats.ts";
-import { chatKey, GROUP_APP_REFUSAL, type Line, type LineInbound } from "../src/line.ts";
-import { ChatRegistry, createSbApi, type ChatCore } from "../src/runtime.ts";
+import { chatKey, GROUP_APP_REFUSAL, LineError, type Line, type LineInbound } from "../src/line.ts";
+import { TransportError } from "../src/photon.ts";
+import { ChatRegistry, createSbApi, optOutHealth, type ChatCore } from "../src/runtime.ts";
 import { handleInbound, runIngress, type IngressDeps } from "../src/sb-ingress.ts";
 import { Shares } from "../src/share.ts";
 import { Store } from "../src/store.ts";
@@ -20,9 +22,10 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function fakeLine(): Line & { reactions: [string, string][]; locationRequests: string[] } {
+function fakeLine(): Line & { reactions: [string, string][]; locationRequests: string[]; optOuts: [string, boolean][] } {
   const reactions: [string, string][] = [];
   const locationRequests: string[] = [];
+  const optOuts: [string, boolean][] = [];
   const line: Line = {
     number: "+19362300565",
     events: async function* () {},
@@ -37,9 +40,10 @@ function fakeLine(): Line & { reactions: [string, string][]; locationRequests: s
     read: async () => {},
     requestLocation: async chat => { locationRequests.push(chat); },
     location: async () => undefined,
+    setOptOut: async (address, optedOut) => { optOuts.push([address, optedOut]); },
     download: async () => ({ data: new Uint8Array([1]), name: "a.jpg", mimeType: "image/jpeg" }),
   };
-  return Object.assign(line, { reactions, locationRequests });
+  return Object.assign(line, { reactions, locationRequests, optOuts });
 }
 
 type Parts = { api: (request: Request) => Promise<Response>; forwarded: unknown[] };
@@ -80,6 +84,155 @@ function setup(realApi = false) {
 const message = (overrides: Partial<LineInbound>): LineInbound => ({
   handle: "h-1", chat: chatKey.dm(owner), from: owner, text: "hi", kind: "message", service: "iMessage",
   participants: [], sentAt: 1_000, ...overrides,
+});
+
+describe("opt-in and health", () => {
+  test("only the owner or local CLI can opt a known direct chat in", async () => {
+    const env = setup();
+    const chats = env.registry();
+    const dm = chats.open(chatKey.dm(moni));
+    const group = chats.open(chatKey.group("GRP-Allowed-123"), "Family Trip");
+    chats.owner.store.set("route", { id: "ses_owner", generation: 1 });
+    dm.store.set("route", { id: "ses_moni", generation: 2 });
+    dm.store.set("optedOut", { since: 100, failures: 2, alerted: true });
+    let enabled = true;
+    const handler = createSbApi({ registry: chats, line: env.line, accessPath: join(env.stateRoot, "access.json"),
+      enabled: () => enabled, health: () => optOutHealth(chats.all(), true) });
+    const post = async (body: Record<string, unknown>) => {
+      const response = await handler(new Request("http://bridge/opt-in", { method: "POST", body: JSON.stringify(body) }));
+      return { status: response.status, body: await response.json() };
+    };
+    const getHealth = async () => (await handler(new Request("http://bridge/health"))).json();
+    expect(await getHealth()).toEqual({ status: "degraded", optedOut: ["moni"] });
+    expect((await post({ chat: "moni", sessionId: "ses_moni@2" })).status).toBe(403);
+    expect((await post({ chat: "moni", sessionId: "ses_owner@0" })).status).toBe(409);
+    expect((await post({ chat: group.info.slug, sessionId: "ses_owner@1" }))).toEqual({ status: 422, body: { error: "Groups can't be opted in" } });
+    expect((await post({ chat: "missing", sessionId: "ses_owner@1" }))).toEqual({ status: 404, body: { error: "Unknown chat" } });
+    expect((await post({ chat: "moni", sessionId: null })).status).toBe(400);
+    expect((await post({ chat: "moni", extra: true })).status).toBe(400);
+    enabled = false;
+    expect((await post({ chat: "moni" })).status).toBe(503);
+    enabled = true;
+    const setOptOut = env.line.setOptOut;
+    env.line.setOptOut = async () => { throw new LineError("private", "http_400", false, false); };
+    expect(await post({ chat: "moni", sessionId: "ses_owner@1" })).toEqual({ status: 502, body: { error: "Sendblue request failed" } });
+    expect(dm.store.get("optedOut")).toBeDefined();
+    env.line.setOptOut = setOptOut;
+    expect(await post({ chat: "moni", sessionId: "ses_owner@1" })).toEqual({ status: 200, body: { optedIn: true } });
+    expect(env.line.optOuts).toEqual([[moni, false]]);
+    expect(dm.store.get("optedOut")).toBeUndefined();
+    expect(dm.store.get<unknown>("optOutAwaitingSend")).toEqual([{ since: 100, failures: 2, alerted: true }]);
+    expect(await getHealth()).toEqual({ status: "healthy", optedOut: [] });
+    expect(optOutHealth(chats.all(), false)).toEqual({ status: "degraded", optedOut: [] });
+    expect((await post({ chat: "moni" })).status).toBe(200);
+    expect(env.line.optOuts).toEqual([[moni, false], [moni, false]]);
+    chats.owner.store.set("optedOut", { since: 200, failures: 1 });
+    expect(await getHealth()).toEqual({ status: "degraded", optedOut: ["owner"] });
+    expect((await post({ chat: "owner", sessionId: "ses_owner@1" })).status).toBe(200);
+    expect(env.line.optOuts.at(-1)).toEqual([owner, false]);
+    expect(await getHealth()).toEqual({ status: "healthy", optedOut: [] });
+  });
+
+  test("a send failure while opt-in is pending is not erased", async () => {
+    const env = setup();
+    const chats = env.registry();
+    const dm = chats.open(chatKey.dm(moni));
+    dm.store.set("optedOut", { since: 100, failures: 1 });
+    env.line.setOptOut = async () => { dm.store.set("optedOut", { since: 100, failures: 2 }); };
+    const handler = createSbApi({ registry: chats, line: env.line, accessPath: join(env.stateRoot, "access.json"),
+      enabled: () => true, health: () => ({}) });
+    const response = await handler(new Request("http://bridge/opt-in", { method: "POST", body: JSON.stringify({ chat: "moni" }) }));
+    expect(response.status).toBe(200);
+    expect(dm.store.get<unknown>("optedOut")).toEqual({ since: 100, failures: 2 });
+    expect(optOutHealth(chats.all(), true)).toEqual({ status: "degraded", optedOut: ["moni"] });
+  });
+
+  test("an old rejection after opt-in cannot recreate the opted-out episode", async () => {
+    const env = setup();
+    const chats = env.registry();
+    const dm = chats.open(chatKey.dm(moni));
+    dm.store.set("optedOut", { since: 100, failures: 1, alerted: true });
+    let rejectSend!: (error: Error) => void;
+    let started!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const alerts: string[] = [];
+    const delivery = new Delivery(dm.store, { sendText: () => {
+      started();
+      return new Promise((_resolve, reject) => { rejectSend = reject; });
+    } }, { projectScope: "test", chatGuid: () => dm.info.key, enabled: () => true, sleep: async () => {},
+      optOut: { title: "Moni", slug: "moni", notify: async severity => { alerts.push(severity); return true; } } });
+    dm.store.enqueue({ id: "old-send", kind: "conversation", text: "test" });
+    const tick = delivery.tick();
+    await entered;
+    const handler = createSbApi({ registry: chats, line: env.line, accessPath: join(env.stateRoot, "access.json"),
+      enabled: () => true, health: () => optOutHealth(chats.all(), true) });
+    const response = await handler(new Request("http://bridge/opt-in", { method: "POST", body: JSON.stringify({ chat: "moni" }) }));
+    expect(response.status).toBe(200);
+    expect(dm.store.get<number>("optInRevision")).toBe(1);
+    rejectSend(new TransportError("http_400:opted_out", false, false));
+    await tick;
+    expect(dm.store.getOperation("old-send")?.state).toBe("failed");
+    expect(dm.store.get("optedOut")).toBeUndefined();
+    expect(dm.store.get<unknown>("optOutAwaitingSend")).toEqual([{ since: 100, failures: 1, alerted: true }]);
+    expect(optOutHealth(chats.all(), true)).toEqual({ status: "healthy", optedOut: [] });
+    expect(alerts).toEqual([]);
+    const afterOptIn = new Delivery(dm.store, { sendText: async () => {
+      throw new TransportError("http_400:opted_out", false, false);
+    } }, { projectScope: "test", chatGuid: () => dm.info.key, enabled: () => true, sleep: async () => {} });
+    dm.store.enqueue({ id: "new-send", kind: "conversation", text: "test" });
+    await afterOptIn.tick();
+    expect(dm.store.get<unknown>("optedOut")).toMatchObject({ failures: 1 });
+    expect(optOutHealth(chats.all(), true)).toEqual({ status: "degraded", optedOut: ["moni"] });
+  });
+
+  test("failed opt-in does not fence an in-flight rejection", async () => {
+    const env = setup();
+    const chats = env.registry();
+    const dm = chats.open(chatKey.dm(moni));
+    let rejectSend!: (error: Error) => void;
+    let started!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const delivery = new Delivery(dm.store, { sendText: () => {
+      started();
+      return new Promise((_resolve, reject) => { rejectSend = reject; });
+    } }, { projectScope: "test", chatGuid: () => dm.info.key, enabled: () => true, sleep: async () => {} });
+    dm.store.enqueue({ id: "old-send", kind: "conversation", text: "test" });
+    const tick = delivery.tick();
+    await entered;
+    env.line.setOptOut = async () => { throw new LineError("private", "http_400", false, false); };
+    const handler = createSbApi({ registry: chats, line: env.line, accessPath: join(env.stateRoot, "access.json"),
+      enabled: () => true, health: () => optOutHealth(chats.all(), true) });
+    const response = await handler(new Request("http://bridge/opt-in", { method: "POST", body: JSON.stringify({ chat: "moni" }) }));
+    expect(response.status).toBe(502);
+    expect(dm.store.get("optInRevision")).toBeUndefined();
+    rejectSend(new TransportError("http_400:opted_out", false, false));
+    await tick;
+    expect(dm.store.get<unknown>("optedOut")).toMatchObject({ failures: 1 });
+    expect(optOutHealth(chats.all(), true)).toEqual({ status: "degraded", optedOut: ["moni"] });
+  });
+
+  test("overlapping opt-ins for one chat cannot complete out of order", async () => {
+    const env = setup();
+    const chats = env.registry();
+    const dm = chats.open(chatKey.dm(moni));
+    let release!: () => void;
+    let started!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    let calls = 0;
+    env.line.setOptOut = async () => { calls++; started(); await new Promise<void>(resolve => { release = resolve; }); };
+    const handler = createSbApi({ registry: chats, line: env.line, accessPath: join(env.stateRoot, "access.json"),
+      enabled: () => true, health: () => ({}) });
+    const post = () => handler(new Request("http://bridge/opt-in", { method: "POST", body: JSON.stringify({ chat: "moni" }) }));
+    const first = post();
+    await entered;
+    const second = await post();
+    expect(second.status).toBe(409);
+    expect(await second.json()).toEqual({ error: "Opt-in already in progress" });
+    expect(calls).toBe(1);
+    release();
+    expect((await first).status).toBe(200);
+    expect(dm.store.get<number>("optInRevision")).toBe(1);
+  });
 });
 
 describe("recipient app cards", () => {
@@ -597,18 +750,21 @@ test("accepted live and backfill ingress logs canonical chat ids and failure tag
   expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
 });
 
-test("late Sendblue failures retain the status code but never the provider's error text", async () => {
+test.each([
+  ["STOP", "sendblue.stop_opt_out"],
+  ["OPTED_OUT", "sendblue.opted_out"],
+])("late Sendblue failure %s retains the safe code without provider text", async (errorCode, expectedTag) => {
   const { observedLine } = await import("../src/sb-main.ts");
   const { captureLogs } = await import("./log-fixture.ts");
   const logs = await captureLogs(async () => {
     const line = fakeLine();
     line.events = async function* () {
-      yield { type: "status", id: "status-failed", handle: "sent-fixture", status: "failed", errorCode: "STOP", errorMessage: "PRIVATE_PROVIDER_MESSAGE", at: Date.now() };
+      yield { type: "status", id: "status-failed", handle: "sent-fixture", status: "failed", errorCode, errorMessage: "PRIVATE_PROVIDER_MESSAGE", at: Date.now() };
       yield { type: "status", id: "status-delivered", handle: "sent-ok", status: "delivered", at: Date.now() };
     };
     for await (const _event of observedLine(line, { synchronized: true, lastEventAt: 0 }, () => ({ chat: "moni", operationId: "operation-fixture", inboundId: "inbound-fixture", threadId: "thread-fixture" })).events(new AbortController().signal)) { /* drain fixture */ }
   });
-  expect(logs.find(l => l.name === "reply.failed")?.error?.tag).toBe("sendblue.stop_opt_out");
+  expect(logs.find(l => l.name === "reply.failed")?.error?.tag).toBe(expectedTag);
   expect(logs.find(l => l.name === "reply.failed")?.ids).toMatchObject({ chat: "moni", operationId: "operation-fixture", inboundId: "inbound-fixture", threadId: "thread-fixture" });
   expect(logs.filter(l => l.name === "reply.failed")).toHaveLength(1);
   expect(JSON.stringify(logs)).not.toContain("PRIVATE_PROVIDER_MESSAGE");

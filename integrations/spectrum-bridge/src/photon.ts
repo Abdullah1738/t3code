@@ -31,6 +31,8 @@ export const isEffect = (value: unknown): value is EffectName =>
   typeof value === "string" && Object.hasOwn(MessageEffect, value);
 
 export class TransportError extends Error {
+  /** Sendblue opt-in revision at the instant the line request was issued. */
+  optInRevision?: number;
   constructor(
     public readonly code: string,
     public readonly retryable = false,

@@ -2,7 +2,8 @@ import { cardKind, toolError, toolLog } from "./toollog.ts";
 import { createHash } from "node:crypto";
 import { IMessageError } from "@photon-ai/advanced-imessage/grpc";
 import { BUBBLE_CHARS, formatText, isSingleUrl, splitFormatted, stripInternalText } from "./formatting.ts";
-import { classifySendFailure, isEffect, type Photon, type PollResult, type SendResult } from "./photon.ts";
+import { isOptedOut } from "./line.ts";
+import { classifySendFailure, isEffect, TransportError, type Photon, type PollResult, type SendResult } from "./photon.ts";
 import { rememberUnmatchedPoll } from "./poll-match.ts";
 import type { OutboxRecord, PollRecord, Store } from "./store.ts";
 
@@ -18,6 +19,7 @@ type Options = {
   sleep?: (ms: number) => Promise<void>;
   /** Owner alert for a delivery outage; resolves true once the alert channel took it. */
   notify?: (severity: "attention" | "info", text: string, key: string) => Promise<boolean>;
+  optOut?: { notify: (severity: "attention" | "info", text: string, key: string) => Promise<boolean>; title: string; slug: string; timezone?: string };
   /** Hands an image or card that iMessage keeps refusing to another channel. */
   fallback?: (item: OutboxRecord) => Promise<"sent" | "skip" | "retry">;
   /** Sendblue's status by handle for this chat's sends updated since sinceMs; lets a late failure be caught. */
@@ -26,6 +28,7 @@ type Options = {
 type Checkpoint = { accepted: boolean; providerId?: string };
 type UploadCheckpoint = { guid: string; sha256: string };
 type Health = { since: number; last: number; code: string; failures: number; alerted?: boolean; recovered?: boolean };
+type OptedOut = { since: number; failures: number; alerted?: boolean; alertFailures?: number };
 export const RETRY_WINDOW = 24 * 60 * 60 * 1_000;
 // The 24-hour window is the real stop: at the 5-minute backoff ceiling a day is under 300
 // attempts. The cap only ends a runaway loop.
@@ -151,8 +154,40 @@ export class Delivery {
     this.options.log?.("outbound-failed", code);
   }
 
-  private failed(item: OutboxRecord, state: string, wasAmbiguous: boolean, failure: ReturnType<typeof classifySendFailure>, cause?: unknown): void {
-    if (!this.current(item, state)) return;
+  private recordOptOut(now: number): boolean {
+    const optOut = this.store.get<OptedOut>("optedOut");
+    if (optOut) {
+      this.store.set("optedOut", { ...optOut, failures: optOut.failures + 1 });
+      return false;
+    }
+    // A rapid second episode needs a new dedupe key even if the clock has not advanced.
+    const since = Math.max(now, (this.store.get<number>("optOutLastSince") ?? 0) + 1);
+    this.store.set("optOutLastSince", since);
+    this.store.set("optedOut", { since, failures: 1 } satisfies OptedOut);
+    return true;
+  }
+
+  private supersedeOptOutRecoveries(): void {
+    this.store.db.query("DELETE FROM kv WHERE key GLOB 'optOutRecovery:*'").run();
+  }
+
+  private failed(item: OutboxRecord, state: string, wasAmbiguous: boolean, failure: ReturnType<typeof classifySendFailure>,
+    cause?: unknown, optInRevision?: number): void {
+    const currentOptInRevision = this.store.get<number>("optInRevision") ?? 0;
+    // A rejection from an older RPC cannot undo a completed opt-in.
+    const markOptOut = isOptedOut(failure.code) && (optInRevision === undefined || currentOptInRevision === optInRevision);
+    if (!this.current(item, state)) {
+      if (markOptOut) {
+        const created = this.store.db.transaction(() => {
+          this.supersedeOptOutRecoveries();
+          return this.recordOptOut(Date.now());
+        }).immediate();
+        this.error(failure.code, item);
+        if (created) this.options.log?.("chat-opted-out");
+      }
+      return;
+    }
+    let newOptOut = false;
     this.store.db.transaction(() => {
       const ambiguous = wasAmbiguous || failure.uncertain;
       this.store.set(`sendAmbiguous:${item.id}`, ambiguous);
@@ -171,11 +206,16 @@ export class Delivery {
       this.store.set("deliveryHealth", !health || health.recovered || (!health.alerted && now - health.last > OUTAGE_AFTER)
         ? { since: now, last: now, code: failure.code, failures: 1 }
         : { ...health, last: now, code: failure.code, failures: health.failures + 1 } satisfies Health);
+      if (markOptOut) {
+        this.supersedeOptOutRecoveries();
+        newOptOut = this.recordOptOut(now);
+      }
     }).immediate();
     toolLog.capture(() => toolLog.write({ component: "delivery", kind: "error", name: "reply.failed", ok: false,
       ids: this.logIds(item.id, item), error: { tag: failure.code, cause } }));
     this.lastError = failure.code;
     this.options.log?.("outbound-failed", failure.code);
+    if (newOptOut) this.options.log?.("chat-opted-out");
   }
 
   /** An accepted send ends an outage only once nothing is still waiting on a retry. */
@@ -189,9 +229,21 @@ export class Delivery {
     else this.store.db.query("DELETE FROM kv WHERE key = 'deliveryHealth'").run();
   }
 
+  private recordOptOutRecovery(awaitingAtDispatch: Set<number>): void {
+    const active = this.store.get<OptedOut>("optedOut");
+    const awaiting = this.store.get<OptedOut[]>("optOutAwaitingSend") ?? [];
+    for (const episode of [...awaiting.filter(episode => awaitingAtDispatch.has(episode.since)), ...(active ? [active] : [])]) {
+      this.store.set(`optOutRecovery:${episode.since}`, episode);
+    }
+    const remaining = awaiting.filter(episode => !awaitingAtDispatch.has(episode.since));
+    if (remaining.length) this.store.set("optOutAwaitingSend", remaining);
+    else this.store.db.query("DELETE FROM kv WHERE key = 'optOutAwaitingSend'").run();
+    this.store.db.query("DELETE FROM kv WHERE key = 'optedOut'").run();
+  }
+
   /** Runs inside the tick, after sending, so it never races a send of the same operation. */
   private async housekeeping(): Promise<void> {
-    if ((!this.options.notify && !this.options.fallback) || Date.now() < this.nextHousekeeping) return;
+    if ((!this.options.notify && !this.options.fallback && !this.options.optOut) || Date.now() < this.nextHousekeeping) return;
     this.nextHousekeeping = Date.now() + HOUSEKEEPING_EVERY;
     try {
       await this.alert();
@@ -199,9 +251,61 @@ export class Delivery {
       this.options.log?.("outage-alert-failed");
     }
     try {
+      await this.alertOptOut();
+    } catch { toolError("delivery", "delivery.optout_alert");
+      this.options.log?.("optout-alert-failed");
+    }
+    try {
+      await this.recoverOptOut();
+    } catch { toolError("delivery", "delivery.optout_recovery");
+      this.options.log?.("optout-recovery-failed");
+    }
+    try {
       await this.fallBack();
     } catch (caughtError) { toolError("delivery", "delivery.catch2", caughtError);
       this.options.log?.("outbound-fallback-failed");
+    }
+  }
+
+  private async alertOptOut(): Promise<void> {
+    const option = this.options.optOut;
+    const optOut = this.store.get<OptedOut>("optedOut");
+    if (!option || !optOut || optOut.alerted) return;
+    const alertFailures = optOut.alertFailures ?? optOut.failures;
+    if (optOut.alertFailures === undefined) this.store.set("optedOut", { ...optOut, alertFailures });
+    const since = new Date(optOut.since).toLocaleTimeString("en-GB", {
+      hour: "2-digit", minute: "2-digit", ...(option.timezone ? { timeZone: option.timezone } : {}),
+    });
+    const text = `${option.title} can't get iMessages from the Robob line: they texted STOP, so Sendblue blocks every text to them `
+      + `(${alertFailures} failed since ${since}). Reactions still go through. They can text START to turn it back on, `
+      + `or with your OK: cli.ts opt-in --chat ${option.slug}.`;
+    if (!await option.notify("attention", text, `spectrum-optout:${optOut.since}`)) return;
+    const current = this.store.get<OptedOut>("optedOut");
+    if (current?.since === optOut.since) this.store.set("optedOut", { ...current, alerted: true });
+    else {
+      const awaiting = this.store.get<OptedOut[]>("optOutAwaitingSend") ?? [];
+      if (awaiting.some(episode => episode.since === optOut.since)) {
+        this.store.set("optOutAwaitingSend", awaiting.map(episode => episode.since === optOut.since ? { ...episode, alerted: true } : episode));
+      } else {
+        const key = `optOutRecovery:${optOut.since}`;
+        const recovery = this.store.get<OptedOut>(key);
+        if (recovery) this.store.set(key, { ...recovery, alerted: true });
+      }
+    }
+  }
+
+  private async recoverOptOut(): Promise<void> {
+    const option = this.options.optOut;
+    if (!option) return;
+    const rows = this.store.db.query<{ key: string }, []>("SELECT key FROM kv WHERE key GLOB 'optOutRecovery:*'").all();
+    if (this.store.get<OptedOut>("optedOut")) return;
+    for (const { key } of rows) {
+      const episode = this.store.get<OptedOut>(key);
+      if (!episode) continue;
+      // A lost acknowledgement may still have queued the attention alert.
+      if ((episode.alerted || episode.alertFailures !== undefined)
+        && !await option.notify("info", `${option.title} is getting iMessages again.`, `spectrum-optout:${episode.since}:recovered`)) return;
+      this.store.db.query("DELETE FROM kv WHERE key = ?").run(key);
     }
   }
 
@@ -505,6 +609,9 @@ export class Delivery {
           this.error("retryWindowExpired", item);
           continue operations;
         }
+        const optOutAtDispatch = this.store.get<OptedOut>("optedOut")?.since;
+        let optInRevision = this.store.get<number>("optInRevision") ?? 0;
+        const awaitingAtDispatch = new Set((this.store.get<OptedOut[]>("optOutAwaitingSend") ?? []).map(episode => episode.since));
         this.store.db.transaction(() => {
           if (this.store.get(`firstAttempt:${item.id}`) === undefined) this.store.set(`firstAttempt:${item.id}`, Date.now());
           this.store.set(destinationKey, chatGuid);
@@ -558,11 +665,13 @@ export class Delivery {
               if (!this.current(item, state) || !this.options.enabled() || this.options.chatGuid() !== chatGuid) throw error;
               this.options.log?.("outbound-plain-fallback", classifySendFailure(error).code);
               this.store.set(fallbackKey, true);
+              optInRevision = this.store.get<number>("optInRevision") ?? 0;
               result = await sendChunk(true);
             }
           }
         } catch (error) { toolError("delivery", "delivery.catch9", error);
           const failure = classifySendFailure(error);
+          const failedRevision = error instanceof TransportError ? error.optInRevision ?? optInRevision : optInRevision;
           // SMS refuses threaded replies (the owner's number dropped off iMessage on 20 Oct), so a
           // text reply that fails goes again shortly without its thread target, under its own id,
           // and stays that way. If the threaded copy did land he sees it twice; a reply that never
@@ -571,15 +680,20 @@ export class Delivery {
             && this.current(item, state)) {
             this.store.set(`unthreaded:${item.id}`, true);
             this.options.log?.("outbound-unthreaded", failure.code);
-            this.failed(item, state, wasAmbiguous, { ...failure, retryable: true }, error);
+            this.failed(item, state, wasAmbiguous, { ...failure, retryable: true }, error, failedRevision);
             if (this.store.getOperation(item.id)?.state === "pending") this.store.set(`retry:${item.id}`, Date.now() + 5_000);
             continue operations;
           }
-          this.failed(item, state, wasAmbiguous, failure, error);
+          this.failed(item, state, wasAmbiguous, failure, error, failedRevision);
           continue operations;
         }
         // Provider acceptance is durable even if cancellation raced with this RPC.
         // Keep every GUID alias and its checkpoint in the same SQLite transaction.
+        // A reconciled old copy is not evidence that a later STOP was reversed.
+        const currentOptOut = this.store.get<OptedOut>("optedOut");
+        const awaiting = this.store.get<OptedOut[]>("optOutAwaitingSend") ?? [];
+        const confirmsOptOutRecovery = !result.duplicate && (currentOptOut === undefined || currentOptOut.since === optOutAtDispatch)
+          && (currentOptOut !== undefined || awaiting.some(episode => awaitingAtDispatch.has(episode.since)));
         this.store.db.transaction(() => {
           this.store.set(chunkKey, { accepted: true, providerId: result.providerId } satisfies Checkpoint);
           // A recovered threaded original keeps its thread target, so a late failure of it still gets a resend.
@@ -610,6 +724,7 @@ export class Delivery {
             }
           }
           this.store.set(ambiguityKey, false);
+          if (confirmsOptOutRecovery) this.recordOptOutRecovery(awaitingAtDispatch);
         }).immediate();
         firstId ??= result.providerId;
         this.accepted();
@@ -617,6 +732,10 @@ export class Delivery {
         if (active && index === steps - 1) {
           this.markSent(item.id, firstId);
           this.options.log?.("outbound-accepted");
+        }
+        if (confirmsOptOutRecovery) {
+          try { await this.recoverOptOut(); }
+          catch { toolError("delivery", "delivery.optout_recovery"); this.options.log?.("optout-recovery-failed"); }
         }
         await this.sleep(800);
         if (!active || index === steps - 1) continue operations;
