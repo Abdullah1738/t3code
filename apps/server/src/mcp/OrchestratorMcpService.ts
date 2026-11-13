@@ -1994,10 +1994,22 @@ const make = Effect.gen(function* () {
             .filter((run) => run.delegatedTaskId === task.id)
             .toSorted((a, b) => b.ordinal - a.ordinal)[0]
         : progress.resultRun;
+    const resultRunAncestors = new Set<RunId>();
+    let resultSource = taskResultRun;
+    while (resultSource !== undefined && !resultRunAncestors.has(resultSource.id)) {
+      resultRunAncestors.add(resultSource.id);
+      const previous: RunId | undefined = resultSource.restartContinuationOfRunId;
+      resultSource =
+        previous === undefined ? undefined : childControls.runs.find((run) => run.id === previous);
+    }
     const taskWorkState =
       childRun?.delegatedTaskId === task.id
         ? isTerminalTaskStatus(taskStatusForRun(taskResultRun))
-          ? "result_available"
+          ? progress.state === "waiting_for_children" &&
+            progress.resultRun !== undefined &&
+            resultRunAncestors.has(progress.resultRun.id)
+            ? "waiting_for_children"
+            : "result_available"
           : "working"
         : progress.state;
     const resultTransfer = taskResultTransfer(parentProjection, childControls, task) ?? null;
@@ -3194,7 +3206,7 @@ const make = Effect.gen(function* () {
               );
       const stopChild = Effect.gen(function* () {
         const commandId = stableCommandId({ scope, requestKey: key, operation: "cancel-task" });
-        const reason = input.reason;
+        const reason = input.reason ?? "Cancellation requested by parent task";
         yield* threadManagement
           .dispatch({
             type: "thread.stop",

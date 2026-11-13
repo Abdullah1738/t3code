@@ -5011,6 +5011,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
   ) {
     let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+    if (
+      command.restartContinuationOfRunId !== undefined &&
+      projection.thread.lineage.relationshipToParent === "subagent" &&
+      projection.thread.lineage.parentThreadId !== null
+    ) {
+      let source = projection.runs.find((run) => run.id === command.restartContinuationOfRunId);
+      const taskRun = source;
+      const seen = new Set<RunId>();
+      while (source?.restartContinuationOfRunId !== undefined && !seen.has(source.id)) {
+        seen.add(source.id);
+        source = projection.runs.find((run) => run.id === source!.restartContinuationOfRunId);
+      }
+      const taskId =
+        taskRun?.delegatedTaskId ??
+        (source?.ordinal === 1 && projection.thread.forkedFrom?.type === "node"
+          ? projection.thread.forkedFrom.nodeId
+          : undefined);
+      const parent = yield* projectionStore
+        .getThreadRecords(projection.thread.lineage.parentThreadId, ["subagents"])
+        .pipe(mapDispatchError(command));
+      if (parent.subagents.some((task) => task.id === taskId && task.result !== null)) return;
+    }
     // A concurrent restart can attach a task after intake's unlocked preflight read.
     yield* SendAcknowledgement.captureRuns(command.commandId, projection.runs);
     let restartPacingBypassed = false;
@@ -9795,6 +9817,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     }
     if (providerThread !== undefined) {
+      const recorded =
+        input.command.type === "thread.background-work.settle"
+          ? yield* projectionStore
+              .getThreadRecords(run.threadId, ["turnItems"], {
+                turnItemRunIds: [run.id],
+                turnItemTypes: ["run_interrupt_request"],
+              })
+              .pipe(mapDispatchError(input.command))
+          : undefined;
+      const reason =
+        input.command.type === "run.interrupt"
+          ? input.command.reason
+          : recorded?.turnItems.find((item) => item.type === "run_interrupt_request")?.message;
       yield* emitEvent({
         ...base,
         type: "turn-item.updated",
@@ -9804,6 +9839,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           rootNode,
           providerThread,
           completedAt: input.now,
+          reason: reason === "Interrupt requested" ? undefined : reason,
         }),
       });
     }
@@ -11402,19 +11438,49 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     }
   });
 
-  const childAwaitsRestartContinuation = (
-    runs: ReadonlyArray<OrchestrationV2Run>,
-    resultRun: OrchestrationV2Run,
-    settledContinuationOf?: RunId,
-  ) =>
-    Effect.forEach(
-      runs.filter(
-        (run) =>
-          run.id !== settledContinuationOf &&
-          (run.id === resultRun.id || runRanAfter(run, resultRun)),
-      ),
-      awaitsRestartContinuation,
-    ).pipe(Effect.map((pending) => pending.includes(true)));
+  const childAwaitsRestartContinuation = Effect.fn("Orchestrator.childAwaitsRestartContinuation")(
+    function* (
+      runs: ReadonlyArray<OrchestrationV2Run>,
+      resultRun: OrchestrationV2Run,
+      settledContinuationOf?: RunId,
+    ) {
+      const pending = yield* Effect.forEach(
+        runs.filter(
+          (run) =>
+            run.id !== settledContinuationOf &&
+            (run.id === resultRun.id || runRanAfter(run, resultRun)),
+        ),
+        awaitsRestartContinuation,
+      );
+      if (!pending.includes(true)) return false;
+      if (resultRun.status !== "interrupted" && resultRun.status !== "cancelled") return true;
+      const resultChain: Array<OrchestrationV2Run> = [];
+      const seen = new Set<RunId>();
+      let source: OrchestrationV2Run | undefined = resultRun;
+      while (source !== undefined && !seen.has(source.id)) {
+        resultChain.push(source);
+        seen.add(source.id);
+        const previous: RunId | undefined = source.restartContinuationOfRunId;
+        source = previous === undefined ? undefined : runs.find((run) => run.id === previous);
+      }
+      const child = yield* projectionStore.getThreadRecords(
+        resultRun.threadId,
+        ["messages", "turnItems", "subagents", "providerThreads", "providerTurns"],
+        {
+          messageRunIds: resultChain.map((run) => run.id),
+          turnItemRunIds: resultChain.map((run) => run.id),
+          turnItemTypes: ["assistant_message", "error"],
+        },
+      );
+      if (delegatedTaskProgress({ ...child, runs }).hasPendingWork) return true;
+      // A queued recovery effect alone is not work or a result. In particular,
+      // restart teardown can leave that effect pending after cancelling the turn.
+      return resultChain.some((run) => {
+        const result = subagentResultForRun(child, run);
+        return result.messageId !== null || result.turnItemId !== null;
+      });
+    },
+  );
 
   const planDelegatedCompletionDelivery = Effect.fn(
     "orchestrationV2.planDelegatedCompletionDelivery",
@@ -12875,7 +12941,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         planned.events.length > 0 ||
         command.type === "thread.background-work.settle" ||
         command.type === "thread.stop" ||
-        command.type === "subagent.stop"
+        command.type === "subagent.stop" ||
+        (command.type === "message.dispatch" && command.restartContinuationOfRunId !== undefined)
           ? Effect.succeed(planned)
           : Effect.fail(
               new OrchestratorDispatchError({
@@ -13124,7 +13191,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     }
     if (
       command.type !== "message.dispatch" ||
-      (command.createdBy !== "user" && command.creationSource !== "mcp")
+      (command.createdBy !== "user" &&
+        command.creationSource !== "mcp" &&
+        command.restartContinuationOfRunId === undefined)
     )
       return yield* dispatch;
     const parentThreadId = yield* appOwnedSubagentParentThreadId(command.threadId).pipe(
@@ -13132,10 +13201,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
       ),
     );
-    // Follow-up intake and Stop serialize on the parent before taking the child lock.
+    // Restart admission and terminal publication share the same parent fence.
+    // Finalize before intake so a terminal status exposed before recovery cannot
+    // be followed by a delayed restart of that task.
     return yield* parentThreadId === undefined
       ? dispatch
-      : threadDispatch.withLock(parentThreadId, dispatch);
+      : threadDispatch.withLock(
+          parentThreadId,
+          Effect.gen(function* () {
+            if (command.restartContinuationOfRunId !== undefined) {
+              yield* finalizeAppOwnedSubagent(command.threadId).pipe(mapDispatchError(command));
+            }
+            return yield* dispatch;
+          }),
+        );
   });
 
   const handleRunUpdate = Effect.fn("Orchestrator.handleRunUpdate")(
