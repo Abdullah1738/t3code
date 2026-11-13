@@ -175,7 +175,7 @@ it.effect.each([
                 (["child_records", "result"].includes(stage)
                   ? ", or read childThreadId with t3_thread_read."
                   : "."),
-              ...(stage !== "caller" ? { callerResolved: true } : {}),
+              ...(stage !== "caller" ? { callerResolved: true as const } : {}),
               ...(["child_records", "result"].includes(stage)
                 ? { childThreadId: child, childNodeId: taskId }
                 : {}),
