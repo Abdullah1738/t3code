@@ -23,6 +23,7 @@ EXTRA = r'''
 point=os.environ.get('FAIL_POINT','')
 if name=='restic':
  with open(os.environ['RESTIC_CALLS'],'a') as f: f.write(json.dumps(args)+'\n')
+ if point=='remove_restic_after_start': Path(sys.argv[0]).unlink()
  if 'snapshots' in args:
   assert '--no-lock' in args and '--tag' in args and '--host' in args
   assert not os.environ.get('RESTIC_PASSWORD_COMMAND')
@@ -34,6 +35,7 @@ if name=='restic':
  if point in ('password','repo_access','restic','timeout'):
   print('password command failed: private-password private-repo-path private-file-name' if point=='password' else 'private-repo-path private-file-name')
   sys.exit({'password':1,'repo_access':10,'restic':3,'timeout':124}[point])
+ if point=='repo_open': print(os.environ['REPO_ERROR']);sys.exit(1)
  if point=='no_summary': print('private-file-name');sys.exit(0)
  if point=='check' and args[0]=='check': sys.exit(1)
 if name=='python3' and args:
@@ -53,6 +55,8 @@ if name=='python3' and args:
   if point=='generation' or (point=='generation_after' and n==2): sys.exit(1)
   if point=='generation_changed': print(n);sys.exit(0)
  if script=='backup_replica.py': sys.exit(1 if point=='replica_step' else 0)
+ if script=='run_limited.py' and point=='runner_validation':
+  os.execv(sys.executable,[sys.executable]+args)
  if script=='snapshot_extra.py' and point=='snapshot': sys.exit(1)
  if script=='snapshot_extra.py' and point=='snapshot_empty': print('0');sys.exit(0)
  if script=='dropbox_mirror.py' and point=='dropbox': sys.exit(1)
@@ -198,6 +202,78 @@ class BackupSkipTests(unittest.TestCase):
             self.assertIn('init',calls)
             self.assertEqual(row['props']['skipReason'],reason)
             self.assertIn('resticExitCode',row['props'])
+
+    def test_restic_launch_failure_forms_do_not_claim_a_restic_exit(self):
+        for target, operation in [('memory','backup'),('health','backup'),('health','init')]:
+            for form in ('missing','not_executable','directory','dangling_symlink','missing_interpreter'):
+                with self.subTest(target=target,operation=operation,form=form):
+                    fixture=self.setup_run(target)
+                    root,home,logs,env,run,calls=fixture
+                    restic=Path(env['MAC_LOG_RESTIC'])
+                    if operation=='init': (home/'.local/share/health-backup/restic/config').unlink()
+                    if form=='not_executable': restic.chmod(0o644)
+                    elif form=='missing_interpreter': restic.write_text('#!/nonexistent-restic-interpreter\n')
+                    else:
+                        restic.unlink()
+                        if form=='directory': restic.mkdir()
+                        elif form=='dangling_symlink': restic.symlink_to(root/'absent-executable')
+                    row,calls=self.execute(fixture,1)
+                    self.assertEqual(calls,'')
+                    self.assertNotIn('resticExitCode',row['props'])
+                    self.assertFalse(row['ok'])
+                    reason='no_repo_access' if operation=='init' else 'other'
+                    self.assertEqual(row['props']['skipReason'],reason)
+                    self.assertEqual(row['error']['tag'],'backup.skipped_'+reason)
+
+    def test_repository_open_failure_forms_keep_the_actual_restic_exit(self):
+        messages = [
+            'Fatal: unable to open config file: private-repo-path/config: permission denied',
+            'Fatal: unable to open config file: "private-repo-path/with spaces/config": Permission denied',
+            'FATAL: CANNOT READ THE CONFIGURATION FILE: private-repo-path: access denied',
+            'Fatal: failed to load repository: private-repo-path: permission denied',
+            'Fatal: unable to open repository: private-repo-path: input/output error',
+        ]
+        for target,operation in [('memory','backup'),('health','backup'),('health','init')]:
+            for message in messages:
+                with self.subTest(target=target,operation=operation,message=message):
+                    fixture=self.setup_run(target,'repo_open')
+                    root,home,logs,env,run,calls=fixture
+                    env['REPO_ERROR']=message
+                    if operation=='init': (home/'.local/share/health-backup/restic/config').unlink()
+                    row,calls=self.execute(fixture,1)
+                    self.assertIn(operation,calls)
+                    self.assertEqual(row['props']['resticExitCode'],1)
+                    self.assertEqual(row['props']['skipReason'],'no_repo_access')
+                    self.assertEqual(row['error']['tag'],'backup.skipped_no_repo_access')
+                    self.assertFalse(row['ok'])
+
+    def test_real_runner_validation_never_claims_a_restic_exit(self):
+        cases=[(key,value) for key in ('MEMORY_BACKUP_RESTIC_TIMEOUT_S',
+                                      'MEMORY_BACKUP_MAX_SECONDS_UNDER_LOAD')
+               for value in ('0','-1','nan','NaN','inf','-inf','1e309','invalid')]
+        cases += [('MEMORY_BACKUP_LOAD_LOW','2'), ('MEMORY_BACKUP_LOAD_HIGH','0'),
+                  ('MEMORY_BACKUP_LOAD_INTERVAL_S','0'), ('MEMORY_BACKUP_LOAD_HIGH','invalid')]
+        for key,value in cases:
+            with self.subTest(key=key,value=value):
+                fixture=self.setup_run('memory','runner_validation')
+                fixture[3][key]=value
+                row,calls=self.execute(fixture,1)
+                self.assertEqual(calls,'')
+                self.assertNotIn('resticExitCode',row['props'])
+                self.assertEqual(row['props']['skipReason'],'other')
+                self.assertEqual(row['error']['tag'],'backup.skipped_other')
+                self.assertFalse(row['ok'])
+
+    def test_success_stays_success_if_restic_is_removed_after_it_started(self):
+        for target in ('health','memory'):
+            fixture=self.setup_run(target,'remove_restic_after_start')
+            stamp='.local/share/health-backup/prune.stamp' if target=='health' else '.local/share/memory-system/logs/backup_prune.stamp'
+            (fixture[1]/stamp).touch()
+            row,calls=self.execute(fixture,0)
+            self.assertIn('backup',calls)
+            self.assertEqual(row['props']['resticExitCode'],0)
+            self.assertNotIn('skipReason',row['props'])
+            self.assertTrue(row['ok'])
 
     def test_required_source_missing_is_distinct_from_copy_failure(self):
         for target in ('health','memory'):

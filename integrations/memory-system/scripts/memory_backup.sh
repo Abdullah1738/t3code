@@ -264,7 +264,7 @@ done
 out=$(run_bg_limited "$RESTIC_TIMEOUT_S" nice -n 10 "$RESTIC" backup --host ardud-mac --tag memory-live --json --quiet \
   --pack-size 64 "${excl[@]}" "$STAGE" 2>&1)
 rc=$?
-TL_RESTIC_RC=$rc
+TL_RESTIC_RC=$(printf '%s' "$out" | mac_log backup-restic-exit "$RESTIC" "$rc")
 TL_SKIP_REASON=""
 if [ "$rc" -eq 124 ]; then
   [ -z "$out" ] || log "restic timeout output: $(printf '%s' "$out" | tail -c 600)"

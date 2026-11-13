@@ -177,11 +177,28 @@ def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/
     save_state('disk', dict(sizes=sizes))
 
 
+def backup_restic_exit(executable, exit_code, output):
+    # nice and the timeout wrapper can fail before restic starts. Their status
+    # still controls the job, but is not evidence of a restic exit.
+    if int(exit_code) == 0:
+        return '0'
+    if not Path(executable).is_file() or not os.access(executable, os.X_OK):
+        return ''
+    if int(exit_code) in (126, 127) or re.search(
+            r'(?m)^(?:[^\n]*[/])?nice:|^(?:FileNotFoundError|PermissionError|OSError):'
+            r'|^Traceback \(most recent call last\):'
+            r'|^(?:usage: )?(?:[^\n]*[/])?run_limited\.py(?:\s|: error:)', output):
+        return ''
+    return str(int(exit_code))
+
+
 def backup_reason(stage, restic_rc, output):
     # Inspect errors locally; only a fixed enum crosses into the log.
     if str(restic_rc) == '12' or re.search(r'password command failed|unable to (?:read|get) (?:the )?password|wrong password|no key found', output, re.I):
         return 'password_unavailable'
-    if stage == 'repo' or str(restic_rc) == '10':
+    if stage == 'repo' or str(restic_rc) == '10' or (stage == 'restic' and re.search(
+            r'\b(?:unable to|failed to|cannot) (?:open|read|load) (?:the )?(?:config(?:uration)? file|repository)\b',
+            output, re.I)):
         return 'no_repo_access'
     if stage == 'vault':
         return 'source_missing'
@@ -273,6 +290,8 @@ def main(argv):
             backup_run(*argv[1:6], sys.stdin.read(16384), *argv[6:8])
         elif argv[0] == 'backup-reason':
             print(backup_reason(*argv[1:3], sys.stdin.read(16384)))
+        elif argv[0] == 'backup-restic-exit':
+            print(backup_restic_exit(*argv[1:3], sys.stdin.read(16384)))
     except Exception:
         pass
 

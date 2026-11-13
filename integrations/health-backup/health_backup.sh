@@ -95,9 +95,10 @@ done
 [ -d "$VAULT" ] || fail vault "vault missing: $VAULT"
 if [ ! -f "$RESTIC_REPOSITORY/config" ]; then
   out=$("$RESTIC" init 2>&1)
-  TL_RESTIC_RC=$?
+  rc=$?
+  TL_RESTIC_RC=$(printf '%s' "$out" | mac_log backup-restic-exit "$RESTIC" "$rc")
   printf '%s\n' "$out" >>"$LOG"
-  if [ "$TL_RESTIC_RC" != 0 ]; then
+  if [ "$rc" != 0 ]; then
     TL_SKIP_REASON=$(printf '%s' "$out" | mac_log backup-reason repo "$TL_RESTIC_RC")
     fail repo "restic init failed"
   fi
@@ -157,7 +158,7 @@ done
 # 3. snapshot
 out=$(nice -n 10 "$RESTIC" backup --host ardud-mac --tag health-data --json --quiet "$STAGE" 2>&1)
 rc=$?
-TL_RESTIC_RC=$rc
+TL_RESTIC_RC=$(printf '%s' "$out" | mac_log backup-restic-exit "$RESTIC" "$rc")
 TL_SKIP_REASON=""
 summary=$(printf '%s\n' "$out" | grep '"message_type":"summary"' | tail -1)
 [ $rc -eq 0 ] && [ -n "$summary" ] || fail restic "rc=$rc $(printf '%s' "$out" | tail -c 400)"
