@@ -237,8 +237,9 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
             cursor = end
             state['unified'] = cursor
             window['chunksDone'] += 1
-            # Only the unfinished suffix survives a timeout or process restart.
-            state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'], skippedS=0)
+            # The gap remains pending until the source result reports it.
+            state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
+                                         skippedS=window['skippedS'])
             save_state('crashes', state)
         state['unified'] = window['windowEnd']
         state.pop('unifiedRetry', None)
@@ -247,8 +248,9 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
     except Exception as exc:
         errors += 1
         state['unifiedRetry'] = dict(windowStart=cursor, windowEnd=window['windowEnd'],
-                                     skippedS=window['skippedS'] if not window['chunksDone'] else 0)
+                                     skippedS=window['skippedS'])
         source_error('crashes', 'crash.source', 'unified', source_started, exc, window)
+        state['unifiedRetry']['skippedS'] = 0
     emit('crashes', 'error' if errors else 'perf', 'crash.collect', ok=not errors,
          duration_ms=(time.monotonic()-started)*1000,
          props={'count': sum(counts.values()), 'sourceErrors': errors, **window},

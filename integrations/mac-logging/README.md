@@ -89,7 +89,10 @@ when log's second rounding/end padding returns overlapping rows. Missing or inva
 event timestamps fail the chunk rather than risk attributing events twice.
 On failure, `unifiedRetry` retains the exact unfinished suffix until it succeeds;
 completed chunks are not queried again. An old one-hour retry is split the same
-way. After a delayed retry completes, the next run applies the recent-hour cap
+way. Chunk checkpoints retain unreported `skippedS`, including after the final
+chunk, so interruption before the source result cannot hide a coverage gap.
+Once the source result reports the gap, a retained suffix clears that metadata.
+After a delayed retry completes, the next run applies the recent-hour cap
 again and reports any omitted older time in `skippedS`.
 
 Report sources have independent checkpoints. Each attempt allows up to 10 s per

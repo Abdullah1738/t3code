@@ -94,6 +94,50 @@ class UnifiedChunkTests(unittest.TestCase):
         self.log_command = checkpoint
         self.assertTrue(self.collect())
 
+    def test_interrupted_chunk_checkpoints_preserve_unreported_coverage_gap(self):
+        for completed_chunks in (1,2,3,4):
+            with self.subTest(completed_chunks=completed_chunks), \
+                 patch.dict(os.environ, TOOLLOG_DIR=str(self.logs/str(completed_chunks))):
+                self.clock, self.calls = 0, []
+                jobs.save_state('crashes', {'unified':10000-86400, 'rollupDay':'1969-12-31'})
+                save = collector.save_state
+                cursor = 6400+completed_chunks*900
+                def interrupt(name, state):
+                    save(name, state)
+                    if state.get('unifiedRetry') and state['unified'] == cursor:
+                        raise SystemExit('interrupted after durable chunk checkpoint')
+                with patch.object(collector, 'save_state', side_effect=interrupt), \
+                     self.assertRaises(SystemExit):
+                    self.collect()
+                state = jobs.read_state('crashes')
+                self.assertEqual(state['unified'], cursor)
+                self.assertEqual(state['unifiedRetry']['skippedS'], 82800)
+                self.assertTrue(self.collect(17200))
+                self.assertEqual(jobs.read_state('crashes')['unified'], 10000)
+                self.assertNotIn('unifiedRetry', jobs.read_state('crashes'))
+                rows = [r for p in (self.logs/str(completed_chunks)).glob('*.ndjson')
+                        for r in map(json.loads, p.read_text().splitlines())]
+                sources = [r for r in rows if r['name'] == 'crash.source']
+                summaries = [r for r in rows if r['name'] == 'crash.collect']
+                self.assertEqual(len(sources), 1)
+                self.assertEqual(sources[0]['props']['skippedS'], 82800)
+                self.assertEqual(summaries[0]['props']['skippedS'], 82800)
+                observed = [r['props']['observedAt'] for r in rows if r['name'] == 'crash.observed']
+                self.assertEqual(observed, list(self.boots))
+                self.assertEqual([(a,b) for a,b,_ in self.calls],
+                                 [(6400,7300),(7300,8200),(8200,9100),(9100,10000)])
+
+    def test_reported_coverage_gap_is_cleared_before_normal_suffix_retry(self):
+        jobs.save_state('crashes', {'unified':10000-86400, 'rollupDay':'1969-12-31'})
+        self.cost = 28
+        self.assertFalse(self.collect())
+        self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'], 82800)
+        self.assertEqual(self.rows('crash.collect')[-1]['props']['skippedS'], 82800)
+        self.assertEqual(jobs.read_state('crashes')['unifiedRetry']['skippedS'], 0)
+        self.cost = 12
+        self.assertTrue(self.collect(17200))
+        self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'], 0)
+
     def test_absolute_deadline_shortens_shared_budget_and_keeps_suffix(self):
         self.cost = 28
         self.assertFalse(self.collect(deadline=43))
