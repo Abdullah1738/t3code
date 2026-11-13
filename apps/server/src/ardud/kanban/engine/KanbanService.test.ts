@@ -12,9 +12,12 @@ import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
+import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as References from "effect/References";
 import * as Schema from "effect/Schema";
+import * as Scheduler from "effect/Scheduler";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import * as ReplyBuilders from "../../http/ReplyBuilders.ts";
@@ -4472,6 +4475,11 @@ it.effect("repeating the same post returns the first message", () =>
 it.effect("a started write finishes after the start deadline", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
+    const warnings: Array<{ message: unknown; annotations: Readonly<Record<string, unknown>> }> =
+      [];
+    const logger = Logger.make(({ fiber, message }) => {
+      warnings.push({ message, annotations: fiber.getRef(References.CurrentLogAnnotations) });
+    });
     const started = yield* Deferred.make<void>();
     const finish = yield* Deferred.make<void>();
     let target: KanbanCardId | null = null;
@@ -4539,7 +4547,41 @@ it.effect("a started write finishes after the start deadline", () =>
       );
       yield* TestClock.adjust(KanbanService.BOARD_WRITE_START_DEADLINE_MS + 1);
       const busyError = yield* Fiber.join(queued);
-      assert.include(busyError.message, "Board busy: not written");
+      assert.strictEqual(
+        busyError.detail,
+        "Board busy: not written (held 2m0s by card.update). Safe to retry once.",
+      );
+      const refusals = warnings.filter((entry) =>
+        String(entry.message).includes('"event":"kanban board write refused"'),
+      );
+      assert.lengthOf(refusals, 1);
+      const refusal = refusals[0]!.annotations;
+      const blockers = refusal["board.blockers"] as Array<{
+        label: string;
+        boardId: string;
+        cardId: string;
+        heldForMs: number;
+      }>;
+      assert.lengthOf(blockers, 1);
+      const holder = blockers[0]!;
+      assert.strictEqual(refusal["board.waiter"], "card.update");
+      assert.strictEqual(refusal["board.id"], board.id);
+      assert.strictEqual(holder.label, "card.update");
+      assert.strictEqual(holder.boardId, board.id);
+      assert.strictEqual(holder.cardId, card.id);
+      assert.isAtLeast(holder.heldForMs, KanbanService.BOARD_WRITE_START_DEADLINE_MS);
+      assert.isAtLeast(
+        refusal["board.waited_ms"] as number,
+        KanbanService.BOARD_WRITE_START_DEADLINE_MS,
+      );
+      assert.isAtLeast(refusal["board.waiters"] as number, 1);
+      const busyCounter = (yield* Metric.snapshot).find(
+        (snapshot): snapshot is Extract<Metric.Metric.Snapshot, { readonly type: "Counter" }> =>
+          snapshot.type === "Counter" &&
+          snapshot.id === "kanban_board_busy_refused_total" &&
+          snapshot.attributes?.["refused"] === "card.update",
+      );
+      assert.strictEqual(busyCounter?.state.count, 1);
       assert.strictEqual(busyError.saved, false);
       assert.isUndefined(write.pollUnsafe());
       yield* Deferred.succeed(finish, undefined);
@@ -4547,7 +4589,201 @@ it.effect("a started write finishes after the start deadline", () =>
       assert.strictEqual((yield* kanban.card(card.id)).card.description, "Started");
       assert.strictEqual((yield* kanban.card(sibling.id)).card.description, "Sibling progresses");
       assert.strictEqual((yield* kanban.card(other.id)).card.description, "Other board progresses");
-    }).pipe(Effect.provide(layer));
+    }).pipe(
+      Effect.provide(Layer.merge(layer, Logger.layer([logger], { mergeWithExisting: false }))),
+      Effect.provideService(Metric.MetricRegistry, new Map()),
+    );
+  }),
+);
+
+it.effect("logs only board lock holds of at least five seconds", () =>
+  Effect.gen(function* () {
+    const warnings: unknown[] = [];
+    const logger = Logger.make(({ message }) => {
+      warnings.push(message);
+    });
+    yield* Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      for (const heldMs of [4_999, 5_000]) {
+        const entered = yield* Deferred.make<void>();
+        const finish = yield* Deferred.make<void>();
+        const name = `hold.${heldMs}`;
+        const holder = yield* Effect.forkChild(
+          locks
+            .board(
+              "timed-board",
+              Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finish))),
+            )
+            .pipe(Effect.provideService(BoardLocks.operationName, name)),
+        );
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust(heldMs);
+        yield* Deferred.succeed(finish, undefined);
+        yield* Fiber.join(holder);
+      }
+      const snapshots = yield* Metric.snapshot;
+      const long = snapshots.find(
+        (snapshot): snapshot is Extract<Metric.Metric.Snapshot, { readonly type: "Counter" }> =>
+          snapshot.type === "Counter" &&
+          snapshot.id === "kanban_board_lock_long_hold_total" &&
+          snapshot.attributes?.["name"] === "hold.5000",
+      );
+      assert.strictEqual(long?.state.count, 1);
+      assert.isFalse(
+        snapshots.some(
+          (snapshot) =>
+            snapshot.id === "kanban_board_lock_long_hold_total" &&
+            snapshot.attributes?.["name"] === "hold.4999",
+        ),
+      );
+      for (const name of ["hold.4999", "hold.5000"]) {
+        const duration = snapshots.find(
+          (snapshot): snapshot is Extract<Metric.Metric.Snapshot, { readonly type: "Histogram" }> =>
+            snapshot.type === "Histogram" &&
+            snapshot.id === "kanban_board_lock_hold_duration" &&
+            snapshot.attributes?.["name"] === name,
+        );
+        assert.strictEqual(duration?.state.count, 1);
+      }
+      const holds = warnings.filter(
+        (entry) => Array.isArray(entry) && entry[0] === "kanban board lock long hold",
+      );
+      assert.deepStrictEqual(holds, [
+        [
+          "kanban board lock long hold",
+          {
+            name: "hold.5000",
+            boardId: "timed-board",
+            cardId: null,
+            heldMs: 5_000,
+            waiters: 0,
+          },
+        ],
+      ]);
+    }).pipe(
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      Effect.provideService(Metric.MetricRegistry, new Map()),
+    );
+  }),
+);
+
+it.effect("clears failed and interrupted lock holders and cancelled waiters", () =>
+  Effect.gen(function* () {
+    const warnings: Array<{ message: unknown; annotations: Readonly<Record<string, unknown>> }> =
+      [];
+    const logger = Logger.make(({ fiber, message }) => {
+      warnings.push({ message, annotations: fiber.getRef(References.CurrentLogAnnotations) });
+    });
+    yield* Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      for (const ending of ["failure", "interrupt"] as const) {
+        const entered = yield* Deferred.make<void>();
+        const finish = yield* Deferred.make<void>();
+        const holder = yield* Effect.forkChild(
+          locks
+            .board(
+              "cleanup",
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(finish)),
+                Effect.andThen(Effect.fail("failed")),
+              ),
+            )
+            .pipe(Effect.provideService(BoardLocks.operationName, `old.${ending}`), Effect.exit),
+        );
+        yield* Deferred.await(entered);
+        if (ending === "failure") {
+          yield* Deferred.succeed(finish, undefined);
+          yield* Fiber.join(holder);
+        } else yield* Fiber.interrupt(holder);
+      }
+      const entered = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const holder = yield* Effect.forkChild(
+        locks
+          .board(
+            "cleanup",
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finish))),
+          )
+          .pipe(Effect.provideService(BoardLocks.operationName, "current")),
+      );
+      yield* Deferred.await(entered);
+      const cancelled = yield* Effect.forkChild(locks.board("cleanup", Effect.void));
+      yield* TestClock.adjust(0);
+      yield* Fiber.interrupt(cancelled);
+      const refused = yield* Effect.forkChild(
+        locks.board("cleanup", Effect.void).pipe(Effect.exit),
+      );
+      yield* TestClock.adjust(BoardLocks.WRITE_WAIT_MS);
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(refused)));
+      yield* Deferred.succeed(finish, undefined);
+      yield* Fiber.join(holder);
+      const refusal = warnings.find((entry) =>
+        String(entry.message).includes('"event":"kanban board write refused"'),
+      );
+      assert.isDefined(refusal);
+      assert.strictEqual(refusal!.annotations["board.waiters"], 1);
+      const blockers = refusal!.annotations["board.blockers"] as Array<Record<string, unknown>>;
+      assert.lengthOf(blockers, 1);
+      assert.strictEqual(blockers[0]!.label, "current");
+      const hold = warnings.find(
+        (entry) =>
+          Array.isArray(entry.message) && entry.message[0] === "kanban board lock long hold",
+      );
+      assert.deepInclude((hold!.message as [string, object])[1], { name: "current", waiters: 0 });
+    }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+  }),
+);
+
+it.effect("migration holder registration is cleaned up at cancellation boundaries", () =>
+  Effect.gen(function* () {
+    const warnings: Array<{ message: unknown; annotations: Readonly<Record<string, unknown>> }> =
+      [];
+    const logger = Logger.make(({ fiber, message }) => {
+      warnings.push({ message, annotations: fiber.getRef(References.CurrentLogAnnotations) });
+    });
+    yield* Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      // Sweep cooperative-yield boundaries across permit acquisition, registration,
+      // finalizer installation and body entry without adding production test hooks.
+      for (let budget = 8; budget <= 128; budget += 1) {
+        const interrupted = yield* Effect.forkChild(
+          locks
+            .exclusive(Effect.never)
+            .pipe(
+              Effect.provideService(BoardLocks.operationName, `migration.interrupted.${budget}`),
+              Effect.provideService(Scheduler.MaxOpsBeforeYield, budget),
+            ),
+        );
+        yield* Effect.yieldNow;
+        yield* Fiber.interrupt(interrupted);
+      }
+      const entered = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const holder = yield* Effect.forkChild(
+        locks
+          .exclusive(
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finish))),
+          )
+          .pipe(Effect.provideService(BoardLocks.operationName, "migration.current")),
+      );
+      yield* Deferred.await(entered);
+      const refused = yield* Effect.forkChild(
+        locks.board("blocked-by-migration", Effect.void).pipe(Effect.exit),
+      );
+      yield* TestClock.adjust(BoardLocks.WRITE_WAIT_MS);
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(refused)));
+      yield* Deferred.succeed(finish, undefined);
+      yield* Fiber.join(holder);
+      const refusals = warnings.filter((entry) =>
+        String(entry.message).includes('"event":"kanban board write refused"'),
+      );
+      assert.lengthOf(refusals, 1);
+      assert.strictEqual(refusals[0]!.annotations["board.waiters"], 1);
+      const blockers = refusals[0]!.annotations["board.blockers"] as Array<Record<string, unknown>>;
+      assert.lengthOf(blockers, 1);
+      assert.strictEqual(blockers[0]!.label, "migration.current");
+      assert.deepStrictEqual(yield* locks.holders, []);
+    }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
   }),
 );
 
@@ -9792,7 +10028,11 @@ it.effect.each(["needs_owner", "todo"] as const)(
         const edited = yield* kanban.editAsk(
           created.id,
           "q1",
-          { question: "Which updated fee?", options: ["2%", "3%", "4%"], revisionNote: "New choices" },
+          {
+            question: "Which updated fee?",
+            options: ["2%", "3%", "4%"],
+            revisionNote: "New choices",
+          },
           worker,
           "cardThread",
         );
@@ -9802,11 +10042,10 @@ it.effect.each(["needs_owner", "todo"] as const)(
         assert.isNull(edited.activePool);
         assert.strictEqual(edited.workThreadId, running.workThreadId);
         assert.strictEqual(edited.asks[0]!.text, "Which updated fee?");
-        assert.deepStrictEqual(edited.asks[0]!.options?.map((option) => option.label), [
-          "2%",
-          "3%",
-          "4%",
-        ]);
+        assert.deepStrictEqual(
+          edited.asks[0]!.options?.map((option) => option.label),
+          ["2%", "3%", "4%"],
+        );
         assert.isNull(edited.asks[0]!.closedAt);
         assert.strictEqual(edited.asks[0]!.blocking, blocking);
         if (blocking) assert.strictEqual(edited.question, "Which updated fee?");
@@ -9827,11 +10066,10 @@ it.effect.each(["needs_owner", "todo"] as const)(
         assert.isNull(after.activePool);
         assert.strictEqual(after.workThreadId, running.workThreadId);
         assert.strictEqual(after.asks[0]!.text, "Which updated fee?");
-        assert.deepStrictEqual(after.asks[0]!.options?.map((option) => option.label), [
-          "2%",
-          "3%",
-          "4%",
-        ]);
+        assert.deepStrictEqual(
+          after.asks[0]!.options?.map((option) => option.label),
+          ["2%", "3%", "4%"],
+        );
         assert.isNull(after.asks[0]!.closedAt);
         assert.strictEqual(after.asks[0]!.blocking, blocking);
       }).pipe(Effect.provide(testLayer(fake.layer)));

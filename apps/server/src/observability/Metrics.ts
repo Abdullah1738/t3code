@@ -27,6 +27,18 @@ export const orchestrationEffectQueueWait = Metric.timer("t3_orchestration_effec
     "Time from an orchestration effect's temporal availability until claim, including same-thread blocking.",
 });
 
+export const kanbanBoardBusyRefusedTotal = Metric.counter("kanban_board_busy_refused_total", {
+  description: "Board lock admission timeouts by refused operation.",
+});
+
+export const kanbanBoardLockLongHoldTotal = Metric.counter("kanban_board_lock_long_hold_total", {
+  description: "Board lock holds of at least five seconds by operation.",
+});
+
+export const kanbanBoardLockHoldDuration = Metric.timer("kanban_board_lock_hold_duration", {
+  description: "Time holding board state permits by operation.",
+});
+
 export const providerSessionsTotal = Metric.counter("t3_provider_sessions_total", {
   description: "Total provider session lifecycle operations.",
 });

@@ -1020,6 +1020,7 @@ it.effect.each(["migration", "gate", "card"] as const)(
         "board.card_id": "907",
         "board.waiting_on": lock,
         "board.waited_ms": 134_000,
+        "board.waiters": 1,
       });
       const blockers = refusals[0]!.annotations["board.blockers"] as Array<Record<string, unknown>>;
       assert.lengthOf(blockers, 1);
