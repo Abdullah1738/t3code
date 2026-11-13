@@ -5,15 +5,18 @@
     ride-card send --trip UUID --session S   share the card once per recipient (idempotent, frozen payload)
          [--chat SLUG]... [--dry-run]     S = the CURRENT session id of the chat you are in
     ride-card meta --trip UUID --rider WHO [--rider-name NAME] [--booker WHO] [--booker-name NAME]
-         [--recipient SLUG]...   WHO = abdullah (owner chat), moni, or another bridge chat slug
+         [--recipient SLUG]... [--rider-off-bridge]
+         WHO = abdullah (owner chat), moni, or an existing bridge chat slug;
+         --rider-off-bridge requires --rider-name and names a rider to share the link with by hand
     ride-card show --trip UUID               card data + share journal (no side effects)
     ride-card sample --out DIR               render every state for a sample trip (tests, contact sheet)
 
 Card folder (public, sanitized only): ~/.local/share/imessage-apps/ride-<uuid>/
   data.json, index.html, preview.png. The page re-reads data.json every 20s.
 Private (never served): ~/.local/state/ride-card/<uuid>.json (share journal) and <uuid>.meta.json
-  (rider, booker, extra recipients by bridge chat slug, display names).
-Recipients: abdullah + moni + rider + booker + extras, deduped. Abdullah (owner chat) gets the tailnet
+  (rider, booker, extra recipients by bridge chat slug, display names, rider_off_bridge).
+Recipients: abdullah + moni + bridge-backed rider + booker + extras, deduped. Non-base slugs without
+a bridge chat and the off-bridge rider are excluded, including from old metadata. Abdullah gets the tailnet
 URL; everyone else gets the public share URL (group chats always get it as a link: the bridge has no
 app cards in groups). The caller's chat comes from the bridge's own route for --session, never from a
 flag. From the owner session every recipient is reachable (--to SLUG), and --chat SLUG sends only to
@@ -213,6 +216,9 @@ def recipients_for(uuid):
     rider, _ = rider_for(uuid)
     out = []
     for r in (*BASE_RECIPIENTS, rider, booker_for(uuid), *(m.get("extras") or [])):
+        if r not in BASE_RECIPIENTS:
+            if (m.get("rider_off_bridge") and r == rider) or not r or not known_chat(r):
+                continue
         if r and r not in out:
             out.append(r)
     return out
@@ -1353,12 +1359,21 @@ def _save_journal(uuid, j):
     os.chmod(p, 0o600)
 
 
-def set_meta(uuid, rider, booker=None, rider_name=None, booker_name=None, extras=()):
+def set_meta(uuid, rider, booker=None, rider_name=None, booker_name=None, extras=(), rider_off_bridge=False):
     """Private ride metadata. Adding extras later keeps the earlier ones; names must look like names."""
     uuid = check_uuid(uuid)
     rider = person(rider)
     booker = person(booker) if booker else None
     extras = [person(x) for x in extras]
+    if rider_off_bridge:
+        if rider in BASE_RECIPIENTS:
+            raise SystemExit("ride-card: --rider-off-bridge cannot name abdullah or moni")
+        if not rider_name:
+            raise SystemExit("ride-card: --rider-off-bridge requires --rider-name")
+    for who in (None if rider_off_bridge else rider, booker, *extras):
+        if who and who not in BASE_RECIPIENTS and not known_chat(who):
+            raise SystemExit(f"ride-card: no bridge chat {who!r} (list them with `cli.ts chats`); "
+                             "for a rider who isn't on the bridge use --rider-off-bridge with --rider-name")
     with trip_lock(uuid):
         m = load_meta(uuid)
         booker = booker or m.get("booker") or "abdullah"
@@ -1374,7 +1389,8 @@ def set_meta(uuid, rider, booker=None, rider_name=None, booker_name=None, extras
         for x in extras:
             if x not in ex:
                 ex.append(x)
-        m.update(trip=uuid, rider=rider, booker=booker, names=names, extras=ex)
+        m.update(trip=uuid, rider=rider, booker=booker, names=names, extras=ex,
+                 rider_off_bridge=rider_off_bridge)
         p = meta_path(uuid)
         atomic_write(p, json.dumps(m, indent=1))
         os.chmod(p, 0o600)
@@ -1466,6 +1482,7 @@ def main(argv=None):
     a = sp.add_parser("meta"); a.add_argument("--trip", required=True)
     a.add_argument("--rider", required=True); a.add_argument("--booker")
     a.add_argument("--rider-name"); a.add_argument("--booker-name")
+    a.add_argument("--rider-off-bridge", action="store_true", help="name-only rider; requires --rider-name; share the link by hand")
     a.add_argument("--recipient", action="append", default=[], help="extra bridge chat slug (repeatable)")
     a = sp.add_parser("show"); a.add_argument("--trip", required=True)
     a = sp.add_parser("sample"); a.add_argument("--out", required=True); a.add_argument("--rider", default="moni")
@@ -1480,8 +1497,9 @@ def main(argv=None):
         print(json.dumps(res))
         return 1 if failed else 0
     elif a.cmd == "meta":
-        m = set_meta(a.trip, a.rider, a.booker, a.rider_name, a.booker_name, a.recipient)
-        print(json.dumps({"recipients": recipients_for(a.trip), "rider": m["rider"], "booker": m["booker"]}))
+        m = set_meta(a.trip, a.rider, a.booker, a.rider_name, a.booker_name, a.recipient, a.rider_off_bridge)
+        print(json.dumps({"recipients": recipients_for(a.trip), "rider": m["rider"], "booker": m["booker"],
+                          "off_bridge": [m["rider"]] if m.get("rider_off_bridge") else []}))
     elif a.cmd == "show":
         print(json.dumps({"card": read_json(card_dir(a.trip) / "data.json"), "recipients": recipients_for(a.trip),
                           "journal": read_json(journal_path(a.trip))}, indent=1))
