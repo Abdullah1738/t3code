@@ -88,7 +88,7 @@ import * as Stream from "effect/Stream";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
-import { actorKey, KanbanStore, type KanbanStoreError } from "../store/KanbanStore.ts";
+import { actorKey, KanbanStore, KanbanStoreError } from "../store/KanbanStore.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import * as AskFeed from "./askFeed.ts";
 import * as Asks from "./asks.ts";
@@ -6759,7 +6759,7 @@ const make = Effect.gen(function* () {
     const random = yield* Random.Random;
     const pick = (count: number) => Math.floor(random.nextDoubleUnsafe() * count);
     yield* seedDown;
-    yield* locks.outside(
+    const results = yield* locks.outside(
       Effect.forEach(
         boardId === undefined
           ? yield* store.boards
@@ -7000,20 +7000,33 @@ const make = Effect.gen(function* () {
                       Effect.logWarning("kanban dispatch failed", {
                         cardId: dispatch.cardId,
                         cause,
-                      }),
+                      }).pipe(
+                        Effect.andThen(
+                          cause.reasons.some((reason) =>
+                            reason._tag === "Fail"
+                              ? Schema.is(KanbanStoreError)(reason.error)
+                              : reason._tag === "Die" && Schema.is(KanbanStoreError)(reason.defect),
+                          )
+                            ? Effect.failCause(cause)
+                            : Effect.void,
+                        ),
+                      ),
                     ),
                   );
               }
             }),
             false,
           ).pipe(
-            Effect.catchCause((cause) =>
+            Effect.tapCause((cause) =>
               Effect.logWarning("kanban board dispatch failed", { boardId: candidate.id, cause }),
             ),
+            Effect.exit,
           ),
-        { concurrency: 8, discard: true },
+        { concurrency: 8, discard: false },
       ),
     );
+    for (const result of results)
+      if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause);
   });
 
   /** The outage key of the model a board thread runs on: per model, whatever its level. */
@@ -8326,7 +8339,18 @@ const make = Effect.gen(function* () {
       return board;
     });
     const now = yield* nowMillis;
-    yield* serial(evaluating, boardId, drainEvaluatorQueue(KanbanBoardId.make(boardId))).pipe(
+    // A launch already owns this drain; maintenance must still see its persisted
+    // deciding hold while provider I/O is pending.
+    let evaluatorMutex = evaluating.get(boardId);
+    if (!evaluatorMutex) {
+      evaluatorMutex = Semaphore.makeUnsafe(1);
+      evaluating.set(boardId, evaluatorMutex);
+    }
+    yield* locks.outside(
+      evaluatorMutex.withPermitsIfAvailable(1)(
+        locks.fresh(locks.run(drainEvaluatorQueue(KanbanBoardId.make(boardId)))),
+      ),
+    ).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("kanban evaluator queue delivery pending", { boardId, cause }),
       ),
@@ -11036,17 +11060,15 @@ const make = Effect.gen(function* () {
           }
         }
         if (to === "verified" && role !== "owner") {
-          for (const subtask of card.subtasks) {
-            const missing = Subtasks.approvalProblem(card, subtask);
-            if (missing) return yield* failWith("denied", missing);
-          }
           const open = card.subtasks.filter((subtask) => subtask.state === "open");
+          const missing = card.subtasks
+            .map((subtask) => Subtasks.approvalProblem(card, subtask))
+            .find((problem) => problem !== null);
           if (open.length > 0) {
-            return yield* failWith(
-              "denied",
-              `card #${card.number} still has ${Subtasks.subtaskIds(open)} open: mark each done or skipped first`,
-            );
+            const reason = `card #${card.number} still has ${Subtasks.subtaskIds(open)} open: mark each done or skipped first`;
+            return yield* failWith("denied", missing ? `${reason}; ${missing}` : reason);
           }
+          if (missing) return yield* failWith("denied", missing);
         }
         if ((to === "completed" || to === "deployed") && role !== "owner") {
           const board = yield* boardOf(card.boardId);

@@ -103,17 +103,17 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     count: 0,
   };
   /**
-   * Runs before the tick's closing dispatch reads the boards (its first read), so a
-   * test can fail or hold that dispatch after the tick's steps are done.
+   * Fails or holds a selected closing-dispatch read after the tick's steps are done.
    */
-  const closing: { before: Effect.Effect<void, KanbanStore.KanbanStoreError> | null } = {
-    before: null,
-  };
+  const closing: {
+    before: Effect.Effect<void, KanbanStore.KanbanStoreError> | null;
+    read: "candidate" | "planning" | "confirmation";
+  } = { before: null, read: "confirmation" };
   const storeLayer = Layer.effect(
     KanbanStore.KanbanStore,
     Effect.gen(function* () {
       const store = yield* KanbanStore.KanbanStore;
-      const inClosingDispatch = Effect.map(
+      const closingRead = Effect.map(
         Effect.currentSpan.pipe(Effect.orElseSucceed(() => null)),
         (span) => {
           const names: Array<string> = [];
@@ -122,24 +122,30 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
             names.push(at.name);
             at = Option.getOrUndefined(at.parent);
           }
-          return (
-            names.includes("KanbanService.dispatchUnlocked") &&
-            names.includes("KanbanService.tickUnlocked")
-          );
+          if (
+            !names.includes("KanbanService.dispatchUnlocked") ||
+            !names.includes("KanbanService.tickUnlocked")
+          )
+            return null;
+          return names.includes("KanbanService.boardOf") ? "planning" : "candidate";
         },
       );
+      const beforeRead = (all: boolean) =>
+        Effect.suspend(() =>
+          closing.before === null
+            ? Effect.void
+            : closingRead.pipe(
+                Effect.flatMap((point) =>
+                  point !== null && closing.read === (all ? "confirmation" : point)
+                    ? (closing.before ?? Effect.void)
+                    : Effect.void,
+                ),
+              ),
+        );
       return KanbanStore.KanbanStore.of({
         ...store,
-        boards: Effect.suspend(() =>
-          closing.before === null
-            ? store.boards
-            : inClosingDispatch.pipe(
-                Effect.flatMap((inside) =>
-                  inside ? (closing.before ?? Effect.void) : Effect.void,
-                ),
-                Effect.andThen(store.boards),
-              ),
-        ),
+        boards: beforeRead(true).pipe(Effect.andThen(store.boards)),
+        board: (id) => beforeRead(false).pipe(Effect.andThen(store.board(id))),
       });
     }),
   ).pipe(Layer.provide(KanbanStore.layer));
@@ -1930,31 +1936,36 @@ const wakingTick = Effect.gen(function* () {
   return { kanban, parked, worker, started: turns(5_000, startedOf(parked.id)) };
 });
 
-it.effect("a tick whose closing dispatch fails still gets the dispatch its steps asked for", () =>
-  inWorld((world) =>
-    Effect.gen(function* () {
-      const { kanban, parked, worker, started } = yield* wakingTick;
-      // The steps end the wait and note a kick; then the dispatch that was to stand
-      // in for that kick fails on its first read, once.
-      let failed = 0;
-      world.closing.before = Effect.suspend(() => {
-        world.closing.before = null;
-        failed += 1;
-        return Effect.fail(
-          new KanbanStore.KanbanStoreError({ operation: "boards", cause: "disk busy (test)" }),
-        );
-      });
-      const ticked = yield* Effect.exit(kanban.tick);
-      assert.strictEqual(failed, 1, "the closing dispatch failed");
-      assert.isTrue(Exit.isFailure(ticked), "the tick reports the failure");
-      assert.isUndefined((yield* cardOf(parked.id)).wait, "the tick's steps ended the wait");
-      // No second tick: the kick is queued and the worker dispatches.
-      assert.isTrue(yield* started, "the woken card was started without another tick");
-      assert.strictEqual((yield* cardOf(parked.id)).activeRole, "work");
-      yield* Fiber.interrupt(worker);
-    }),
-  ),
-);
+for (const read of ["candidate", "planning", "confirmation"] as const) {
+  it.effect(
+    `a tick whose closing dispatch fails still gets the dispatch its steps asked for (${read})`,
+    () =>
+      inWorld((world) =>
+        Effect.gen(function* () {
+          const { kanban, parked, worker, started } = yield* wakingTick;
+          world.closing.read = read;
+          // The steps end the wait and note a kick; the closing dispatch fails once
+          // at the selected read, including confirmation after planning.
+          let failed = 0;
+          world.closing.before = Effect.suspend(() => {
+            world.closing.before = null;
+            failed += 1;
+            return Effect.fail(
+              new KanbanStore.KanbanStoreError({ operation: "boards", cause: "disk busy (test)" }),
+            );
+          });
+          const ticked = yield* Effect.exit(kanban.tick);
+          assert.strictEqual(failed, 1, "the closing dispatch failed");
+          assert.isTrue(Exit.isFailure(ticked), "the tick reports the failure");
+          assert.isUndefined((yield* cardOf(parked.id)).wait, "the tick's steps ended the wait");
+          // No second tick: the kick is queued and the worker dispatches.
+          assert.isTrue(yield* started, "the woken card was started without another tick");
+          assert.strictEqual((yield* cardOf(parked.id)).activeRole, "work");
+          yield* Fiber.interrupt(worker);
+        }),
+      ),
+  );
+}
 
 it.effect(
   "a tick interrupted in its closing dispatch still gets the dispatch its steps asked for",
