@@ -111,6 +111,12 @@ REFUND_DONE = re.compile(
     r'|\b(?P<before>processed|issued|initiated)\s+(?:(?:the|your)\s+)?refund\b'
     r'|\b(?P<credit>credited)\s+back to your (?:card|account)\b', re.I)
 REFUND_NEGATION = re.compile(r"\b(?:not|can't|cannot|unable|won't|isn't|hasn't|wasn't|haven't|never)\b", re.I)
+REFUND_ABBREVIATION = re.compile(
+    r'\b(?:(?:[a-z]\.)+|(?:inc|ltd|corp|co|plc|llc|llp|pvt|dr|mr|mrs|ms|mx|prof|jr|sr|dept|ref|no|approx|est|etc|vs)\.)$', re.I)
+REFUND_SENTENCE_START = re.compile(
+    r'(?:Your|Our|The|This|That|We|I|It|They)\b'
+    r'|(?:Have|Has|Had|Did|Do|Does|Can|Could|Will|Would|Should|Is|Are|Was|Were)\b'
+    r'|(?:What|When|Where|Why|How)\b')
 QUOTED_REPLY = re.compile(r'^\s*>|^.*Original Message.*$|^.*\bOn\b.+\bwrote:.*$', re.I | re.M)
 CARD = re.compile(r'(?<!\d)[2-6](?:[ -]?\d){12,18}(?!\d)')
 # A secret is a labelled value: a code of 3-12 digits (grouped or not) a few words after the label, a token
@@ -2838,6 +2844,18 @@ def refund_text(shown):
     return QUOTED_REPLY.split(text, maxsplit=1)[0].replace('’', "'")
 
 
+def refund_sentences(text):
+    start = 0
+    for boundary in re.finditer(r'(?<=[.!?;])\s+', text):
+        # An abbreviation keeps the negation unless a new statement or question follows it.
+        if (text[boundary.start() - 1] == '.' and REFUND_ABBREVIATION.search(text[:boundary.start()])
+                and not REFUND_SENTENCE_START.match(text, boundary.end())):
+            continue
+        yield text[start:boundary.start()]
+        start = boundary.end()
+    yield text[start:]
+
+
 def refund_mails(data, now, deadline, find=None, read=None):
     find, read = find or charges.search, read or charges.show
     errors = []
@@ -2863,8 +2881,7 @@ def refund_mails(data, now, deadline, find=None, read=None):
                         continue
                     text = refund_text(read(row, deadline))
                     done = False
-                    # A decimal point inside an amount cannot end the scope of a negation.
-                    for sentence in re.split(r'(?<=[.!?;])\s+', text):
+                    for sentence in refund_sentences(text):
                         if sentence.rstrip().endswith('?'):
                             continue
                         for match in REFUND_DONE.finditer(sentence):

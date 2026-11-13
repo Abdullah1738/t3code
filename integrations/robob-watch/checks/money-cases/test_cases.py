@@ -1382,6 +1382,76 @@ class Questions(Base):
                 mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
                 self.assertIn('refund_mail', mc.load(self.data)['cases'][0])
 
+    def test_refund_negation_survives_abbreviations(self):
+        actors = (
+            ('company', 'Example Inc.'), ('company-lower', 'Example inc.'),
+            ('company-upper', 'EXAMPLE INC.'), ('limited', 'Example Ltd.'),
+            ('corporation', 'Example Corp.'), ('company-short', 'Example Co.'),
+            ('dotted-company', 'Example L.L.C.'),
+            ('country', 'its U.S. team'), ('country-lower', 'its u.s. team'),
+            ('country-upper-next', 'its U.S. Operations team'), ('country-uk', 'its U.K. team'),
+            ('country-it', 'its U.S. IT team'), ('country-it-operations', 'its U.S. IT Operations team'),
+            ('country-uae', 'its U.A.E. team'), ('spaced-initials', 'its U. S. team'),
+            ('title', 'Dr. Example'), ('title-mr', 'Mr. Example'), ('title-ms', 'Ms. Example'),
+            ('initial', 'J. Example'), ('initials', 'J. R. Example'),
+            ('dotted-initials', 'J.R. Example'), ('department', 'its billing dept.'),
+            ('example', 'its agent, e.g. Example'), ('clarification', 'its agent, i.e. Example'),
+            ('reference', 'the team named in ref. 301'), ('number', 'the team on invoice no. 301'),
+            ('wrapped-company', 'Example Inc.\n'),
+        )
+        for label, actor in actors:
+            with self.subTest(label=label):
+                self.data = self.tmp / ('abbreviation-' + label)
+                self.refund_case()
+                before = mc.load(self.data)
+                row = dict(REFUND, body=f'We cannot confirm that {actor} processed the refund.')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertEqual(mc.load(self.data), before)
+
+    def test_affirmative_refund_statements_with_abbreviations_still_match(self):
+        for label, actor in (('company', 'Example Inc.'), ('country', 'Our U.S. team'),
+                             ('initials', 'J. R. Example'), ('department', 'Our billing dept.')):
+            with self.subTest(label=label):
+                self.data = self.tmp / ('affirmative-abbreviation-' + label)
+                self.refund_case()
+                row = dict(REFUND, body=f'{actor} processed the refund.')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertEqual(mc.load(self.data)['cases'][0]['refund_mail']['id'], REFUND['id'])
+
+    def test_refund_abbreviation_can_also_end_a_statement(self):
+        tails = ('Have you received it?', 'Did you receive it?', 'Can you check your card?',
+                 'When did you last check?', 'Is there anything else we can help with?',
+                 'Are there any other questions?', 'Can I help with anything else?',
+                 'Is this resolved?', 'Is that clear?', 'Did the bank confirm receipt?')
+        for i, suffix in enumerate(('Inc.', 'Ltd.', 'Co.', 'U.S.')):
+            for j, tail in enumerate(tails):
+                with self.subTest(suffix=suffix, tail=tail):
+                    self.data = self.tmp / f'ending-abbreviation-{i}-{j}'
+                    self.refund_case()
+                    row = dict(REFUND, body=f'Your refund was processed by Example {suffix} {tail}')
+                    mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                    self.assertIn('refund_mail', mc.load(self.data)['cases'][0])
+
+    def test_independent_refund_statement_after_abbreviation_ends_negation(self):
+        for i, statement in enumerate(('Your refund was processed.', 'The refund was issued.',
+                                        'We processed the refund.', 'Our refund was initiated.')):
+            with self.subTest(statement=statement):
+                self.data = self.tmp / f'new-statement-abbreviation-{i}'
+                self.refund_case()
+                row = dict(REFUND, body=f'We cannot give an arrival date for Example Inc. {statement}')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertIn('refund_mail', mc.load(self.data)['cases'][0])
+
+    def test_embedded_questions_after_abbreviations_keep_negation(self):
+        for i, clause in enumerate(('when we', 'how our team', 'why our team', 'where our team', 'what team')):
+            with self.subTest(clause=clause):
+                self.data = self.tmp / f'embedded-question-{i}'
+                self.refund_case()
+                before = mc.load(self.data)
+                row = dict(REFUND, body=f'We cannot confirm, e.g. {clause} processed the refund.')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertEqual(mc.load(self.data), before)
+
     def test_refund_lookup_cannot_overwrite_concurrent_case_edit(self):
         self.refund_case()
         def edited(row, deadline):
