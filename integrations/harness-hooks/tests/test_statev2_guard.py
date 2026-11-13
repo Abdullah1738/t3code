@@ -1158,6 +1158,10 @@ class GuardTests(unittest.TestCase):
             ('fixture-exported-cdpath', original.replace('set -u\n', 'set -u\nexport CDPATH=' + str(self.root / 'elsewhere') + '\n', 1), {}, SCRIPT),
             ('fixture-argv0', original.replace('set -u\n', 'set -u\nBASH_ARGV0=' + str(self.root / 'nested/nested/tests/x.sh') + '\n', 1), {}, SCRIPT),
         ]
+        # Every other cd form, wherever it sits, and every CDPATH mention.
+        for statement in ('cd -', 'f() { cd "$(dirname "$0")/.."; }; f', '( cd "$(dirname "$0")/.." )',
+                          'declare CDPATH=' + str(self.root / 'elsewhere'), 'read -r CDPATH < /dev/null'):
+            rows.append(('fixture-' + statement, original.replace('set -u\n', 'set -u\n' + statement + '\n', 1), {}, SCRIPT))
         # Logical cd joins $PWD; physical mode and cdable_vars change targets.
         for statement in ('PWD=' + str(self.root / 'elsewhere'), 'export PWD=' + str(self.root / 'elsewhere'),
                           'OLDPWD=/tmp', 'unset PWD', 'read -r PWD < /dev/null', 'shopt -s cdable_vars',
