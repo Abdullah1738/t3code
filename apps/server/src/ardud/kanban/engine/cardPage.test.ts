@@ -50,6 +50,7 @@ const board: KanbanBoard = {
   createdAt: at,
   setup: null,
   pause: null,
+  nightlyReview: null,
   archivedAt: null,
 };
 

@@ -6,6 +6,8 @@
 import {
   CARD_ASK_TOOL_DESCRIPTION,
   KanbanBlockInput,
+  KanbanNightlyReviewTime,
+  KanbanNightlyReviewTimeZone,
   KanbanBoardIcon,
   KanbanPriority,
   KanbanStage,
@@ -902,10 +904,18 @@ const ReportBug = tool(
 const EvaluatorStart = tool(
   "evaluator_start",
   "Start an evaluator",
-  "Start an evaluator thread on a board for a job: setup or request (text required), or a sweep: stalled, completed, deployed, check (optional text is added to its brief). A board runs one sweep of each kind at a time; starting another while one runs fails and names it. For requests, one matching open card with a live or recently ended evaluator receives a sighting instead of a new thread. Pass forceNew:true to skip matching; spawn caps still apply. Excess launches queue durably in board order. Card threads may start only kind request (for example to hand a broken tool to the Robob board); their text is stamped with their board, card and thread.",
+  "Start an evaluator thread on a board for a job: setup or request (text required), or a sweep: stalled, completed, deployed, check, nightly (optional text is added to its brief). A board runs one sweep of each kind at a time; starting another while one runs fails and names it. For requests, one matching open card with a live or recently ended evaluator receives a sighting instead of a new thread. Pass forceNew:true to skip matching; spawn caps still apply. Excess launches queue durably in board order. Card threads may start only kind request (for example to hand a broken tool to the Robob board); their text is stamped with their board, card and thread.",
   {
     boardId: BoardRef,
-    kind: Schema.Literals(["setup", "request", "stalled", "completed", "deployed", "check"]),
+    kind: Schema.Literals([
+      "setup",
+      "request",
+      "stalled",
+      "completed",
+      "deployed",
+      "check",
+      "nightly",
+    ]),
     text: Schema.optional(Schema.String),
     forceNew: Schema.optional(Schema.Boolean),
     /** For setup: an existing discussion on this board to use as the Setup discussion. */
@@ -945,7 +955,22 @@ const BoardPause = tool(
   { readonly: false },
 );
 
+const BoardNightlyReview = tool(
+  "board_nightly_review",
+  "Set nightly review",
+  "Evaluators: enable or disable this board's daily review. Defaults to midnight Asia/Dubai with Sonnet 5.5 medium. Omitted time and zone keep the saved values.",
+  {
+    boardId: BoardRef,
+    enabled: Schema.Boolean,
+    timeOfDay: Schema.optional(KanbanNightlyReviewTime),
+    timeZone: Schema.optional(KanbanNightlyReviewTimeZone),
+  },
+  { board: Record },
+  { readonly: false },
+);
+
 export const KanbanToolkit = Toolkit.make(
+  BoardNightlyReview,
   SetupDone,
   BoardPause,
   BoardGet,

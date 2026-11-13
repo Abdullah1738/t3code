@@ -53,6 +53,8 @@ import {
   type KanbanThreadRow,
   type KanbanThreadState,
   type KanbanWikiPage,
+  KanbanNightlyReviewSettings,
+  type KanbanNightlyReview,
   type ModelSelection,
   type ProviderOptionSelection,
   type ProjectId,
@@ -69,6 +71,7 @@ import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Schedule from "effect/Schedule";
+import { nightlyLocalTime } from "./nightly.ts";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -137,6 +140,9 @@ function sameOptions(
   });
 }
 const OWNER_NAME = "You";
+const DEFAULT_NIGHTLY_REVIEW = Schema.decodeUnknownSync(KanbanNightlyReviewSettings)({
+  enabled: false,
+});
 
 type EvaluatorLaunch =
   | { readonly threadId: ThreadId }
@@ -240,7 +246,9 @@ export interface GoalInput {
   readonly story?: string | undefined;
 }
 
-export type BoardPatch = Partial<
+export type BoardPatch = {
+  readonly nightlyReview?: KanbanNightlyReviewSettings | null | undefined;
+} & Partial<
   Pick<
     KanbanBoard,
     | "name"
@@ -349,6 +357,15 @@ export interface KanbanServiceShape {
     boardId: KanbanBoard["id"],
     patch: BoardPatch,
   ) => Effect.Effect<KanbanBoard, KanbanError>;
+  readonly setNightlyReview: (
+    boardId: KanbanBoard["id"],
+    input: {
+      readonly enabled: boolean;
+      readonly timeOfDay?: string | undefined;
+      readonly timeZone?: string | undefined;
+    },
+  ) => Effect.Effect<KanbanBoard, KanbanError>;
+  readonly nightlyTick: Effect.Effect<void, KanbanError>;
   readonly snapshot: (
     boardId: KanbanBoard["id"],
   ) => Effect.Effect<KanbanBoardSnapshot, KanbanError>;
@@ -3193,13 +3210,13 @@ const make = Effect.gen(function* () {
       Effect.asVoid,
     );
 
-  const newDiscussion = Effect.fn("KanbanService.newDiscussion")(function* (
+  const makeDiscussion = (
     boardId: KanbanBoard["id"],
     title: string,
     cardId: KanbanCard["id"] | null,
     actor: KanbanActor,
-  ) {
-    const at = yield* nowIso;
+    at: string,
+  ): KanbanDiscussion => {
     const opened: KanbanDiscussion = {
       id: KanbanDiscussionId.make(`disc-${uuid()}`),
       boardId,
@@ -3227,9 +3244,16 @@ const make = Effect.gen(function* () {
       reopenedAt: null,
     };
     // The evaluator that opens a discussion is the one the owner's replies go to.
-    const discussion = actor._tag === "evaluator" ? adoptEvaluator(opened, actor) : opened;
-    yield* saveDiscussion(discussion);
-    return discussion;
+    return actor._tag === "evaluator" ? adoptEvaluator(opened, actor) : opened;
+  };
+
+  const newDiscussion = Effect.fn("KanbanService.newDiscussion")(function* (
+    boardId: KanbanBoard["id"],
+    title: string,
+    cardId: KanbanCard["id"] | null,
+    actor: KanbanActor,
+  ) {
+    return yield* saveDiscussion(makeDiscussion(boardId, title, cardId, actor, yield* nowIso));
   });
 
   const cardDiscussionUnlocked = Effect.fn("KanbanService.cardDiscussionUnlocked")(function* (
@@ -3329,13 +3353,21 @@ const make = Effect.gen(function* () {
         });
       }
     }
+    const nightlyDiscussion =
+      purpose.kind === "nightly" && purpose.discussionId
+        ? yield* discussionOf(KanbanDiscussionId.make(purpose.discussionId))
+        : null;
+    const evaluatorModel =
+      purpose.kind === "nightly"
+        ? (board.nightlyReview?.model ?? DEFAULT_NIGHTLY_REVIEW.model)
+        : board.evaluatorModel;
     const brief = Briefs.evaluatorBrief(board, purpose);
     const title = Briefs.evaluatorTitle(purpose);
     const launchInput = (key: string) => ({
       key: `${board.id}:eval:${Briefs.purposeKey(purpose)}:${key}`,
       projectId: board.defaultProjectId!,
       title,
-      model: board.evaluatorModel,
+      model: evaluatorModel,
       text: extra.text ? `${brief}\n\n${extra.text}` : brief,
     });
     const inheritedReconcile = yield* launchReconcile;
@@ -3419,14 +3451,24 @@ const make = Effect.gen(function* () {
         discussionId:
           purpose.kind === "discussion"
             ? KanbanDiscussionId.make(purpose.discussionId)
-            : (setupDiscussion?.id ?? null),
-        model: board.evaluatorModel,
+            : (setupDiscussion?.id ?? nightlyDiscussion?.id ?? null),
+        model: evaluatorModel,
         startedAt: at,
         endedAt: null,
         paused: null,
       },
       title,
     );
+    if (nightlyDiscussion) {
+      yield* saveDiscussion(
+        withParticipant(
+          { ...nightlyDiscussion, evaluatorThreadId: threadId },
+          { _tag: "evaluator", threadId },
+          "Evaluator",
+          {},
+        ),
+      );
+    }
     if (setupDiscussion) {
       // The setup evaluator owns the Setup discussion even when an older evaluator
       // already had it: owner replies and setup_done must reach this thread.
@@ -3649,18 +3691,85 @@ const make = Effect.gen(function* () {
       }
     }
     const at = yield* nowIso;
+    let nightly: { readonly board: KanbanBoard; readonly discussion: KanbanDiscussion } | null =
+      null;
+    if (purpose.kind === "nightly" && !purpose.discussionId) {
+      const review = board.nightlyReview ?? {
+        ...DEFAULT_NIGHTLY_REVIEW,
+        lastRunAt: null,
+        lastRunDay: null,
+        lastDiscussionId: null,
+      };
+      const { day } = nightlyLocalTime(Date.parse(at), review.timeZone);
+      const discussion = makeDiscussion(
+        board.id,
+        `Nightly review, ${day}`,
+        null,
+        {
+          _tag: "system",
+          component: "nightly-review",
+        },
+        at,
+      );
+      purpose = { ...purpose, discussionId: discussion.id, day };
+      const since = Date.parse(at) - 24 * 60 * 60 * 1000;
+      const sources = (yield* store.discussions(board.id))
+        .filter(
+          (source) =>
+            source.id !== discussion.id &&
+            Date.parse(source.lastMessageAt ?? source.createdAt) >= since,
+        )
+        .map((source) => ({
+          id: source.id,
+          title: source.title,
+          lastMessageAt: source.lastMessageAt,
+        }));
+      const sourceText = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(
+        sources,
+      ).pipe(Effect.orDie);
+      extra.text = [
+        extra.text,
+        `Discussions active in the last 24 hours (read with discussion_read):\n${sourceText}`,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      const next = {
+        ...board,
+        nightlyReview: {
+          ...review,
+          lastRunAt: at,
+          lastRunDay: day,
+          lastDiscussionId: discussion.id,
+        },
+      };
+      nightly = { board: next, discussion };
+    }
     // @effect-diagnostics-next-line preferSchemaOverJson:off -- internal durable job, same shape as its caller.
     const json = JSON.stringify({ purpose, extra });
-    yield* locks.access(
-      board.id,
-      boardSql`
+    const enqueue = boardSql`
       INSERT INTO ardud_kanban_evaluator_queue (job_key, board_id, card_id, json, created_at)
       VALUES (${key}, ${board.id}, ${extra.cardId ?? null}, ${json}, ${at})
       ON CONFLICT (job_key) DO NOTHING
-    `,
-      true,
-      "evaluator-queue",
-    );
+    `;
+    if (nightly) {
+      const saved = nightly;
+      // The daily marker must never outlive a failed admission without its recoverable job.
+      yield* locks.access(
+        board.id,
+        boardSql.withTransaction(
+          Effect.gen(function* () {
+            yield* rawStore.putDiscussion(saved.discussion);
+            yield* rawStore.putBoard(saved.board);
+            yield* enqueue;
+          }),
+        ),
+        true,
+      );
+      yield* publish(board.id, { _tag: "discussion", discussion: saved.discussion });
+      yield* publish(board.id, { _tag: "board", board: saved.board });
+    } else {
+      yield* locks.access(board.id, enqueue, true, "evaluator-queue");
+    }
     return yield* drainEvaluatorQueue(board.id, key);
   });
 
@@ -3736,7 +3845,23 @@ const make = Effect.gen(function* () {
         }
       }
       const currentBoard = yield* boardOf(boardId);
-      const existingSweep = ["stalled", "completed", "deployed", "check"].includes(job.purpose.kind)
+      if (
+        job.purpose.kind === "nightly" &&
+        job.purpose.scheduled &&
+        (!currentBoard.nightlyReview?.enabled || currentBoard.archivedAt !== null)
+      ) {
+        const at = yield* nowIso;
+        yield* locks.access(
+          boardId,
+          boardSql`UPDATE ardud_kanban_evaluator_queue SET done_at = ${at} WHERE id = ${row.id}`,
+          true,
+          "evaluator-queue",
+        );
+        continue;
+      }
+      const existingSweep = ["stalled", "completed", "deployed", "check", "nightly"].includes(
+        job.purpose.kind,
+      )
         ? yield* runningSweep(boardId, job.purpose.kind)
         : job.purpose.kind === "setup" && currentBoard.setup?.status === "running"
           ? currentBoard.setup.threadId
@@ -3892,7 +4017,7 @@ const make = Effect.gen(function* () {
       board.id,
       Effect.gen(function* () {
         const current = yield* boardOf(board.id);
-        if (["stalled", "completed", "deployed", "check"].includes(purpose.kind)) {
+        if (["stalled", "completed", "deployed", "check", "nightly"].includes(purpose.kind)) {
           const running = yield* runningSweep(board.id, purpose.kind);
           if (running)
             return yield* failWith(
@@ -4045,7 +4170,11 @@ const make = Effect.gen(function* () {
   ) {
     const open = yield* store.threadLinks({ boardId, open: true });
     for (const link of open.toReversed()) {
-      if (link.role !== "evaluator" || link.purpose !== kind || link.discussionId !== null)
+      if (
+        link.role !== "evaluator" ||
+        link.purpose !== kind ||
+        (kind !== "nightly" && link.discussionId !== null)
+      )
         continue;
       const view = yield* threads.view(link.threadId);
       if (view && view.state !== "idle") return link.threadId;
@@ -10013,6 +10142,7 @@ const make = Effect.gen(function* () {
       instructions: Defaults.DEFAULT_INSTRUCTIONS,
       setup: null,
       pause: null,
+      nightlyReview: null,
       createdAt: yield* nowIso,
       archivedAt: null,
     };
@@ -10063,9 +10193,37 @@ const make = Effect.gen(function* () {
               steps,
             })),
           );
+    let nightlyReview: KanbanNightlyReview | null = board.nightlyReview;
+    if (patch.nightlyReview !== undefined) {
+      if (patch.nightlyReview === null) {
+        nightlyReview = nightlyReview ? { ...nightlyReview, enabled: false } : null;
+      } else {
+        const settings = yield* Schema.decodeUnknownEffect(KanbanNightlyReviewSettings)(
+          patch.nightlyReview,
+        ).pipe(
+          Effect.mapError(
+            () =>
+              new KanbanError({
+                code: "invalid",
+                detail: "Invalid nightly review time or time zone",
+              }),
+          ),
+        );
+        const model = yield* canonicalModel(settings.model);
+        if (settings.enabled) yield* checkModel(model);
+        nightlyReview = {
+          ...settings,
+          model,
+          lastRunAt: board.nightlyReview?.lastRunAt ?? null,
+          lastRunDay: board.nightlyReview?.lastRunDay ?? null,
+          lastDiscussionId: board.nightlyReview?.lastDiscussionId ?? null,
+        };
+      }
+    }
     const next: KanbanBoard = {
       ...board,
       ...patch,
+      nightlyReview,
       managerModel,
       evaluatorModel,
       defaultCardModel,
@@ -13389,7 +13547,8 @@ const make = Effect.gen(function* () {
             purpose.kind === "stalled" ||
             purpose.kind === "completed" ||
             purpose.kind === "deployed" ||
-            purpose.kind === "check"
+            purpose.kind === "check" ||
+            purpose.kind === "nightly"
           ) {
             const running = yield* runningSweep(board.id, purpose.kind);
             if (running) {
@@ -13536,6 +13695,58 @@ const make = Effect.gen(function* () {
     openBoard,
     createBoard,
     updateBoard,
+    setNightlyReview: Effect.fn("KanbanService.setNightlyReview")(function* (boardId, input) {
+      return yield* guard(
+        Effect.gen(function* () {
+          const board = yield* boardOf(boardId);
+          const settings = yield* Schema.decodeUnknownEffect(KanbanNightlyReviewSettings)({
+            ...board.nightlyReview,
+            enabled: input.enabled,
+            ...(input.timeOfDay === undefined ? {} : { timeOfDay: input.timeOfDay }),
+            ...(input.timeZone === undefined ? {} : { timeZone: input.timeZone }),
+          }).pipe(
+            Effect.mapError(
+              () =>
+                new KanbanError({
+                  code: "invalid",
+                  detail: "Invalid nightly review time or time zone",
+                }),
+            ),
+          );
+          return yield* updateBoardUnlocked(boardId, { nightlyReview: settings });
+        }),
+      );
+    }),
+    nightlyTick: Effect.gen(function* () {
+      for (const candidate of yield* readDb(store.boards)) {
+        if (candidate.archivedAt !== null || !candidate.nightlyReview?.enabled) continue;
+        yield* guard(
+          serial(
+            evaluating,
+            candidate.id,
+            Effect.gen(function* () {
+              const board = yield* boardOf(candidate.id);
+              const review = board.nightlyReview;
+              if (board.archivedAt !== null || !review?.enabled) return;
+              const { day, time } = nightlyLocalTime(yield* nowMillis, review.timeZone);
+              if (time < review.timeOfDay || review.lastRunDay === day) return;
+              if (yield* runningSweep(board.id, "nightly")) return;
+              yield* admitEvaluator(
+                board,
+                { kind: "nightly", scheduled: true },
+                { key: `${board.id}:nightly:${day}` },
+              );
+            }),
+          ),
+          undefined,
+          candidate.id,
+        ).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("nightly board review failed", { boardId: candidate.id, cause }),
+          ),
+        );
+      }
+    }),
     snapshot: (boardId) => readDb(snapshotOf(boardId)),
     replySnapshot: (boardId, page) => readDb(snapshotOf(boardId, true, page)),
     cardPage: Effect.fn("KanbanService.cardPage")(function* (input) {
@@ -13742,7 +13953,7 @@ const make = Effect.gen(function* () {
               ],
             ]);
             const board = yield* boardOf(boardId);
-            if (["stalled", "completed", "deployed", "check"].includes(purpose.kind)) {
+            if (["stalled", "completed", "deployed", "check", "nightly"].includes(purpose.kind)) {
               const running = yield* runningSweep(board.id, purpose.kind);
               if (running)
                 return yield* failWith(

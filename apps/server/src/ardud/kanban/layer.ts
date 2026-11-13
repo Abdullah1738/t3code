@@ -155,6 +155,13 @@ export const ArdudKanbanLive = Layer.effectDiscard(
         Effect.asVoid,
       ),
     );
+    yield* forkParked(
+      service.nightlyTick.pipe(
+        Effect.catchCause(warnUnlessInterrupted("nightly board review tick failed")),
+        Effect.repeat(Schedule.spaced("1 minute")),
+        Effect.asVoid,
+      ),
+    );
     // Its own fiber: a probe can take a minute and must not delay the tick.
     yield* forkParked(
       service.probeOutages.pipe(

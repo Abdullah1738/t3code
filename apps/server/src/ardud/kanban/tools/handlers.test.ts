@@ -264,6 +264,16 @@ const fakeThreads = (
     Layer.provideMerge(McpServer.McpServer.layer),
     Layer.provideMerge(
       Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getCallerRow: (threadId) => {
+          if (unreadable.has(threadId))
+            return Effect.fail(new OrchestratorProjectionError({ threadId }));
+          if (missing.has(threadId)) return Effect.succeed(null);
+          const shell = liveThreadShell(threadId);
+          return Effect.succeed({
+            ...shell,
+            deletedAt: deleted.has(threadId) ? shell.updatedAt : null,
+          });
+        },
         getThreadShell: (threadId) => {
           if (unreadable.has(threadId)) {
             return Effect.fail(new OrchestratorProjectionError({ threadId }));
@@ -3834,3 +3844,45 @@ it.effect("report_bug reconciles a request evaluator after launch starts without
     }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)), Effect.provide(fake.layer));
   }),
 );
+
+it.effect("board_nightly_review toggles on and off with read-back and rejects card workers", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "nightly",
+      name: "Nightly",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const evaluator = ThreadId.make("thread-evaluator");
+    const on = yield* call(evaluator, "board_nightly_review", {
+      boardId: board.slug,
+      enabled: true,
+      timeOfDay: "01:15",
+    });
+    assert.isFalse(on.isError, on.text);
+    assert.strictEqual((yield* kanban.snapshot(board.id)).board.nightlyReview?.enabled, true);
+    const off = yield* call(evaluator, "board_nightly_review", {
+      boardId: board.slug,
+      enabled: false,
+    });
+    assert.isFalse(off.isError, off.text);
+    const read = yield* call(evaluator, "board_get", { boardId: board.slug });
+    assert.isFalse(read.isError, read.text);
+    const returned = read.structured.board as {
+      board: { nightlyReview: { enabled: boolean; timeOfDay: string } };
+    };
+    assert.strictEqual(returned.board.nightlyReview.enabled, false);
+    assert.strictEqual(returned.board.nightlyReview.timeOfDay, "01:15");
+    const saved = (yield* kanban.snapshot(board.id)).board.nightlyReview!;
+    assert.strictEqual(saved.enabled, false);
+    assert.strictEqual(saved.timeOfDay, "01:15");
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const card = yield* kanban.createCard(board.id, { prompt: "Worker" }, owner);
+    yield* kanban.dispatchNow;
+    const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
+    const denied = yield* call(worker, "board_nightly_review", { enabled: true });
+    assert.isTrue(denied.isError);
+    assert.include(denied.text, "Only evaluators");
+  }).pipe(Effect.provide(layer));
+});
