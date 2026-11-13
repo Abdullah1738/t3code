@@ -163,10 +163,12 @@ const make = Effect.gen(function* () {
     const project = yield* loadProject(scope, projection.thread.projectId);
     const projectCwd = project.workspaceRoot;
 
-    const localStatus = yield* gitWorkflow
-      .localStatus({ cwd: projectCwd })
-      .pipe(asOperationFailed("Unable to read git status"));
-    if (!localStatus.isRepo) {
+    // The shared index can be locked by another agent; handoff only needs refs
+    // and creates a separate index in the new worktree.
+    const isRepository = yield* gitWorkflow
+      .isRepository(projectCwd)
+      .pipe(asOperationFailed("Unable to detect git repository"));
+    if (!isRepository) {
       return yield* failure(
         "invalid_request",
         `Project workspace '${projectCwd}' is not a git repository.`,
@@ -198,13 +200,16 @@ const make = Effect.gen(function* () {
 
     let baseRef = input.baseRef;
     if (baseRef === undefined) {
-      if (localStatus.refName === null) {
+      const currentBranch = yield* gitWorkflow
+        .readCurrentBranch(projectCwd)
+        .pipe(asOperationFailed("Unable to read current git branch"));
+      if (currentBranch === null) {
         return yield* failure(
           "invalid_request",
           "Could not determine the current branch of the project workspace (detached HEAD?). Pass baseRef explicitly.",
         );
       }
-      baseRef = localStatus.refName;
+      baseRef = currentBranch;
     }
 
     const startFromOrigin = input.startFromOrigin ?? (yield* readDefaultStartFromOrigin);

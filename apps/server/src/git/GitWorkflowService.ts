@@ -36,6 +36,7 @@ export class GitWorkflowService extends Context.Service<
   GitWorkflowService,
   {
     readonly isRepository: (cwd: string) => Effect.Effect<boolean, GitManagerServiceError>;
+    readonly readCurrentBranch: (cwd: string) => Effect.Effect<string | null, GitCommandError>;
     readonly hasCommit: (input: {
       readonly cwd: string;
       readonly refName: string;
@@ -300,6 +301,16 @@ export const make = Effect.gen(function* () {
             }),
         ),
       ),
+    readCurrentBranch: Effect.fn("GitWorkflowService.readCurrentBranch")(function* (cwd) {
+      yield* ensureGitCommand("GitWorkflowService.readCurrentBranch", cwd);
+      const result = yield* git.execute({
+        operation: "GitWorkflowService.readCurrentBranch",
+        cwd,
+        args: ["symbolic-ref", "--short", "--quiet", "HEAD"],
+        allowNonZeroExit: true,
+      });
+      return result.exitCode === 0 ? result.stdout.trim() || null : null;
+    }),
     hasCommit: (input) =>
       ensureGitCommand("GitWorkflowService.hasCommit", input.cwd).pipe(
         Effect.andThen(

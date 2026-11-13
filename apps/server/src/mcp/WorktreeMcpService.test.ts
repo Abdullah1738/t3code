@@ -22,6 +22,9 @@ import * as Schema from "effect/Schema";
 
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import * as GitManager from "../git/GitManager.ts";
+import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
+import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as ServerConfig from "../config.ts";
 import {
   OrchestratorDispatchError,
@@ -88,6 +91,7 @@ const project: Project = {
 } as Project;
 
 interface HarnessOptions {
+  readonly workspaceRoot?: string;
   readonly git?: Partial<GitWorkflowService.GitWorkflowService["Service"]>;
   readonly thread?: ThreadFixture | null;
   readonly threadReadError?: "projection" | "dispatch";
@@ -196,7 +200,7 @@ const makeHarness = (options: HarnessOptions = {}) => {
       ? (Effect.fail("simulated project read failure") as never)
       : Effect.succeed(
           id === projectId && options.projectMissing !== true
-            ? Option.some(project)
+            ? Option.some({ ...project, workspaceRoot: options.workspaceRoot ?? workspaceRoot })
             : Option.none(),
         ),
   );
@@ -251,15 +255,9 @@ const makeHarness = (options: HarnessOptions = {}) => {
       totalCount: options.existingBranchWorktreePath === undefined ? 0 : 1,
     }),
   );
-  const localStatus = vi.fn((_: unknown) =>
-    Effect.succeed({
-      isRepo: options.notARepo !== true,
-      hasPrimaryRemote: true,
-      isDefaultRef: false,
-      refName: options.currentBranch === undefined ? "dev" : options.currentBranch,
-      hasWorkingTreeChanges: false,
-      workingTree: { files: [], insertions: 0, deletions: 0 },
-    }),
+  const isRepository = vi.fn((_: string) => Effect.succeed(options.notARepo !== true));
+  const readCurrentBranch = vi.fn((_: string) =>
+    Effect.succeed(options.currentBranch === undefined ? "dev" : options.currentBranch),
   );
   const refreshStatus = vi.fn((_: string) => Effect.die("refreshStatus stub"));
   const runForThread = vi.fn((input: { readonly worktreePath: string }) => {
@@ -305,7 +303,8 @@ const makeHarness = (options: HarnessOptions = {}) => {
         Layer.mock(GitWorkflowService.GitWorkflowService)({
           listRefs,
           listLocalBranchNames,
-          localStatus,
+          isRepository,
+          readCurrentBranch,
           fetchWorktreeBaseCommit,
           createWorktree,
           removeWorktree,
@@ -332,7 +331,8 @@ const makeHarness = (options: HarnessOptions = {}) => {
     createWorktree,
     removeWorktree,
     deleteLocalBranch,
-    localStatus,
+    isRepository,
+    readCurrentBranch,
     runForThread,
   };
 };
@@ -374,7 +374,114 @@ const runStatus = (harness: ReturnType<typeof makeHarness>) =>
 // Decodes tool arguments the way the MCP tool does before calling the service.
 const decodeHandoffInput = Schema.decodeUnknownEffect(WorktreeMcpHandoffInput);
 
+const realGitWorkflowLayer = GitWorkflowService.layer.pipe(
+  Layer.provide(Layer.mock(GitManager.GitManager)({})),
+  Layer.provideMerge(VcsDriverRegistry.layer),
+  Layer.provideMerge(GitVcsDriver.layer),
+  Layer.provide(VcsProcess.layer),
+  Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "handoff-index-lock-" })),
+  Layer.provideMerge(NodeServices.layer),
+);
+
 describe("t3_worktree_handoff", () => {
+  it.effect.each([
+    { baseRef: "main", detached: false, startFromOrigin: false },
+    { baseRef: undefined, detached: false, startFromOrigin: false },
+    { baseRef: "main", detached: false, startFromOrigin: true },
+    { baseRef: undefined, detached: false, startFromOrigin: true },
+    { baseRef: "HEAD", detached: true, startFromOrigin: false },
+    { baseRef: undefined, detached: true, startFromOrigin: false },
+  ])("handles a locked source index with %j", ({ baseRef, detached, startFromOrigin }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const git = yield* GitVcsDriver.GitVcsDriver;
+      const workflow = yield* GitWorkflowService.GitWorkflowService;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "handoff-index-lock-" });
+      const cwd = `${directory}/repo`;
+      const worktreePath = `${directory}/worktree`;
+      yield* fs.makeDirectory(cwd);
+      const command = (at: string, args: string[]) =>
+        git.execute({ operation: "handoff-test", cwd: at, args });
+      yield* command(cwd, ["init", "-b", "main"]);
+      yield* command(cwd, [
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.test",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "base",
+      ]);
+      const baseCommit = (yield* command(cwd, ["rev-parse", "HEAD"])).stdout.trim();
+      if (startFromOrigin) {
+        const remote = `${directory}/remote.git`;
+        yield* command(cwd, ["init", "--bare", remote]);
+        yield* command(cwd, ["remote", "add", "origin", remote]);
+        yield* command(cwd, ["push", "-u", "origin", "main"]);
+      }
+      if (detached) yield* command(cwd, ["checkout", "--detach"]);
+      const indexLock = `${cwd}/.git/index.lock`;
+      yield* fs.writeFileString(indexLock, "held by another process");
+
+      const statusExit = yield* Effect.exit(git.statusDetailsLocal(cwd));
+      expectTypedFailure(statusExit, {
+        _tag: "GitCommandError",
+        detail: expect.stringContaining("Git index is locked"),
+      });
+      const harness = makeHarness({
+        workspaceRoot: cwd,
+        git: {
+          ...workflow,
+          createWorktree: (input) => git.createWorktree({ ...input, path: worktreePath }),
+        },
+      });
+      const exit = yield* Effect.exit(
+        runHandoff(harness, {
+          branch: "feature/locked-index",
+          baseRef,
+          startFromOrigin,
+          runSetupScript: false,
+        }),
+      );
+      if (detached && baseRef === undefined) {
+        expectTypedFailure(exit, {
+          code: "invalid_request",
+          message: expect.stringContaining("Pass baseRef explicitly"),
+        });
+        expect(harness.dispatch).not.toHaveBeenCalled();
+        expect(yield* fs.exists(worktreePath)).toBe(false);
+      } else {
+        if (Exit.isFailure(exit)) return yield* Effect.failCause(exit.cause);
+        expect(exit.value).toMatchObject({
+          worktreePath,
+          baseRef: baseRef ?? "main",
+          startedFromOrigin: startFromOrigin,
+        });
+        expect((yield* command(worktreePath, ["rev-parse", "HEAD"])).stdout.trim()).toBe(
+          baseCommit,
+        );
+        expect(harness.dispatch).toHaveBeenCalledWith(expect.objectContaining({ worktreePath }));
+      }
+      expect(yield* fs.readFileString(indexLock)).toBe("held by another process");
+    }).pipe(Effect.provide(realGitWorkflowLayer)),
+  );
+
+  it.effect.each([undefined, "main"])("rejects a real non-repository with baseRef %s", (baseRef) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const workflow = yield* GitWorkflowService.GitWorkflowService;
+      const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "handoff-non-repo-" });
+      const harness = makeHarness({ workspaceRoot: cwd, git: workflow });
+      const exit = yield* Effect.exit(runHandoff(harness, { branch: "feature/no-repo", baseRef }));
+      expectTypedFailure(exit, {
+        code: "invalid_request",
+        message: `Project workspace '${cwd}' is not a git repository.`,
+      });
+      expect(harness.dispatch).not.toHaveBeenCalled();
+    }).pipe(Effect.provide(realGitWorkflowLayer)),
+  );
+
   it.effect("creates a worktree from the current branch and re-points the thread", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
