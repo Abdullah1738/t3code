@@ -66,7 +66,8 @@ export const isPass = (event: KanbanCardEvent) =>
 /**
  * A run that failed, by what the board did next: stalled the card (a "Run failed"
  * flag), sent it back for its one retry, moved it to a fresh thread because the
- * thread got too long, or restarted a reviewer that stopped without a verdict.
+ * thread got too long, or restarted a reviewer that stopped without a verdict
+ * (no_verdict also covers the second time, when the board stalls the card).
  * A fresh start someone asked for is not a failure.
  */
 export type FailureKind = "stalled" | "retried" | "fresh_thread" | "no_verdict";
@@ -77,7 +78,12 @@ const FAILURE_PREFIXES: ReadonlyArray<readonly [FailureKind, string]> = [
 ];
 export const failureKind = (event: KanbanCardEvent): FailureKind | null => {
   const body = event.body ?? "";
-  if (event.kind === "flagged") return body.startsWith("Run failed") ? "stalled" : null;
+  if (event.kind === "flagged") {
+    if (body.startsWith("Run failed")) return "stalled";
+    return event.actor._tag === "system" && body === Retries.NO_VERDICT_REASON
+      ? "no_verdict"
+      : null;
+  }
   if (event.kind !== "moved" || event.actor._tag !== "system") return null;
   return FAILURE_PREFIXES.find(([, prefix]) => body.startsWith(prefix))?.[0] ?? null;
 };
@@ -672,7 +678,7 @@ export const rollup = (input: RollupInput) => {
       stallItems.push({
         card: card.number,
         at: stamp(event.at),
-        kind: failureKind(event) === "stalled" ? "run_failed" : "flagged",
+        kind: isFailure(event) ? "run_failed" : "flagged",
         ...(end !== undefined
           ? { until: stamp(end.at), minutes: minutesBetween(event.at, end.at) }
           : ongoing

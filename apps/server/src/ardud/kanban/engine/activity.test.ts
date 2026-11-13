@@ -574,6 +574,60 @@ describe("rollup", () => {
     expect(row).toMatchObject({ failures: 5, lastFailure: "provider boom" });
   });
 
+  it("counts both no-verdict events: the restart and the stall that follows the second", () => {
+    const review = card("n", { number: 31, stage: "needs_review", stalled: null });
+    const events = [
+      event(
+        "n",
+        t("01:00"),
+        "moved",
+        "in_review",
+        "needs_review",
+        "Reviewer stopped without a verdict, retrying once",
+      ),
+      event("n", t("01:01"), "moved", "needs_review", "in_review"),
+      event(
+        "n",
+        t("02:00"),
+        "flagged",
+        "in_review",
+        "needs_review",
+        "Reviewer stopped without a verdict",
+      ),
+      event("n", t("03:00"), "moved", "needs_review", "in_review"),
+      // The same words flagged by a person are a flag, not a failure.
+      {
+        ...event(
+          "n",
+          t("06:00"),
+          "flagged",
+          "in_review",
+          "needs_review",
+          "Reviewer stopped without a verdict",
+        ),
+        actor: { _tag: "owner" as const },
+      },
+    ];
+    const run = Activity.rollup({ window, cards: [review], events, threads: [], pools });
+    expect(run.failures.count).toBe(2);
+    expect(run.failures.byKind).toEqual({ no_verdict: 2 });
+    expect(run.failures.byPool).toEqual({
+      "review (model unknown)": {
+        count: 2,
+        reasons: [
+          "Reviewer stopped without a verdict, retrying once",
+          "Reviewer stopped without a verdict",
+        ],
+      },
+    });
+    expect(run.stalls.items.map((item) => [item.at, item.kind, item.minutes])).toEqual([
+      ["2026-11-12T02:00Z", "run_failed", 60],
+      ["2026-11-12T06:00Z", "flagged", undefined],
+    ]);
+    const row = Activity.compactRow(review, Activity.groupEvents(events).get("n") ?? [], window);
+    expect(row).toMatchObject({ failures: 2, lastFailure: "Reviewer stopped without a verdict" });
+  });
+
   it("ends a stall at whatever cleared it: a move, a verdict, a wait, a new flag", () => {
     const at = (cardId: string, list: Array<KanbanCardEvent>, patch: Partial<KanbanCard> = {}) =>
       Activity.rollup({
@@ -600,14 +654,7 @@ describe("rollup", () => {
     ]);
     expect(
       at("r", [
-        event(
-          "r",
-          t("01:00"),
-          "flagged",
-          "in_review",
-          "in_review",
-          "Reviewer stopped without a verdict",
-        ),
+        event("r", t("01:00"), "flagged", "in_review", "in_review", "Blocked on a decision"),
         event("r", t("02:00"), "review", "in_review", "todo", "- [P2] x"),
       ])[0],
     ).toMatchObject({ kind: "flagged", until: "2026-11-12T02:00Z", minutes: 60 });
