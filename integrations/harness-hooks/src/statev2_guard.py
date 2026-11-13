@@ -1639,7 +1639,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     retained = True
                     opaque = invocation_written.get((directory, args[0]))
                     if opaque is not None and args[0] in invocation_quoted and not unsafe_bindings:
-                        return not all(heredoc_preserves_sources(source, directory, True) for source in opaque)
+                        return not all(heredoc_preserves_sources(source, directory, True, args[1:]) for source in opaque)
                     for candidate in script_variants(args[0]):
                         path = _literal_path(candidate, directory)
                         if path not in written or path in invalidated_written or LIVE.search(str(path)):
@@ -1662,7 +1662,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         except OSError:
                             return True
                 if sources and all(python_preserves_sources(source, directory) or
-                                   retained and heredoc_preserves_sources(source, directory, True) for source in sources):
+                                   retained and heredoc_preserves_sources(source, directory, True,
+                                                                         args[1:] if args and not args[0].startswith('-') else None)
+                                   for source in sources):
                     return False
             elif binary in {'node', 'bun'}:
                 args = _interpreter_args(binary, words[1:])
@@ -1694,7 +1696,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             return False
         return binary not in {'cat', 'tee', 'mkdir', 'chmod', 'set', 'head', 'tail', 'echo', 'printf', 'true', 'false', ':', 'test', '[', 'ls', 'stat', 'wc', 'pwd'}
 
-    def heredoc_preserves_sources(source, directory, python):
+    def heredoc_preserves_sources(source, directory, python, script_args=None):
         # This proof is only for bodies retained from this batch. Arbitrary
         # on-disk programs still invalidate every source, even if DB-safe.
         if not python:
@@ -1779,6 +1781,13 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 return False
             if isinstance(node, ast.Call) and any(k.arg not in {'encoding', 'errors', 'indent', 'sort_keys'} for k in node.keywords):
                 return False
+            if isinstance(node, ast.Call) and qualified(node.func) == 'unittest.main':
+                # TestProgram can import a selected module, loader, or tests
+                # selected by CLI discovery. Only a plain current-module call
+                # with no script arguments preserves the checked source.
+                if (script_args is None or script_args or node.keywords or len(node.args) > 1 or
+                        node.args and (not isinstance(node.args[0], ast.Constant) or node.args[0].value != '__main__')):
+                    return False
             if isinstance(node, ast.Call) and qualified(node.func) == 'urllib.request.urlopen':
                 # A caller-supplied Request or URL can invoke arbitrary handlers.
                 # A literal HTTP(S) GET leaves file destinations out of the API.

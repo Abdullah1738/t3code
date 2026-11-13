@@ -105,6 +105,47 @@ class GuardTests(unittest.TestCase):
                     self.assertIn('intervening command', reason)
                     self.assertNotIn('literal absolute', reason)
 
+    def test_same_call_unittest_main_module_selection(self):
+        # Source bytes only: neither the proposed runner nor this import-time
+        # writer is executed by the classifier/adapter checks.
+        self.write('updater.py', self.reporter_body('unittest-updater.py'))
+        target = str(self.root / 'x.py')
+        imports = [
+            ('import unittest', 'unittest.main'),
+            ('import unittest as tests', 'tests.main'),
+            ('from unittest import main as run', 'run'),
+        ]
+        arguments = [
+            ('', None),
+            ("'__main__'", None),
+            ("'updater'", UNRESOLVED),
+            ("module='updater'", UNRESOLVED),
+            ("module='__main__'", UNRESOLVED),
+            ('None', UNRESOLVED),
+            ('__name__', UNRESOLVED),
+            ("*['updater']", UNRESOLVED),
+            ("**{'module': 'updater'}", UNRESOLVED),
+            ("'__main__', 'updater'", UNRESOLVED),
+            ("'__main__', argv=['x.py', 'discover']", UNRESOLVED),
+            ("'__main__', testLoader=unittest.defaultTestLoader", UNRESOLVED),
+        ]
+        for source_import, function in imports:
+            for args, expected in arguments:
+                body = source_import + '\n' + function + '(' + args + ')'
+                for interpreter in ['python3', 'python3 -I']:
+                    for setup, script in [('', target), ('d=$(mktemp -d)\n', '"$d/x.py"')]:
+                        command = setup + self.heredoc(script, body) + interpreter + ' ' + script + '\n' + interpreter + ' ' + script
+                        with self.subTest(function=function, args=args, interpreter=interpreter, script=script):
+                            self.assertEqual(self.classify(command), expected)
+                            self.adapters(command, expected)
+            for options in ['discover', 'updater', '-v']:
+                body = source_import + '\n' + function + '()'
+                run = 'python3 -I ' + target
+                command = self.heredoc(target, body) + run + ' ' + options + '\n' + run
+                with self.subTest(function=function, options=options):
+                    self.assertEqual(self.classify(command), UNRESOLVED)
+                    self.adapters(command, UNRESOLVED)
+
     def test_same_call_copy_replaces_opaque_source(self):
         seed = self.write('source/readback.ndjson', 'print(2)')
         for write_root in ['$d', '${d}']:
