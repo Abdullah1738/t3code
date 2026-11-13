@@ -11,6 +11,7 @@ import {
   AuthSessionId,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
+  ProjectId,
   RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -1023,8 +1024,8 @@ describe("control listings", () => {
       return run(
         ({ get }) =>
           Effect.gen(function* () {
-            const page = (limit: number) =>
-              get(`/threads?updatedSince=${since}&limit=${limit}`).pipe(
+            const page = (limit: number, suffix = "") =>
+              get(`/threads?updatedSince=${since}&limit=${limit}${suffix}`).pipe(
                 Effect.map((response) => ({
                   total: response.body.total as number,
                   ids: (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
@@ -1036,6 +1037,11 @@ describe("control listings", () => {
             // the range read, so tie-b fills its place and total drops it.
             assert.deepStrictEqual(yield* page(1), { total: 2, ids: ["tie-b"] });
             assert.deepStrictEqual(yield* page(5), { total: 2, ids: ["tie-b", "tie-c"] });
+            assert.deepStrictEqual(yield* page(1, "&origin=none"), { total: 2, ids: ["tie-b"] });
+            assert.deepStrictEqual(yield* page(5, "&origin=none"), {
+              total: 2,
+              ids: ["tie-b", "tie-c"],
+            });
           }),
         undefined,
         [tied("tie-c"), tied("tie-a"), tied("tie-b")],
@@ -1043,6 +1049,136 @@ describe("control listings", () => {
       );
     },
   );
+
+  const staleAt = DateTime.makeUnsafe("2026-03-01T00:00:01.000Z");
+  const staleSince = Date.parse("2026-03-01T00:00:00.000Z");
+  const unavailableCandidates: ReadonlyArray<{
+    name: string;
+    changed: Partial<OrchestrationV2ThreadShell>;
+    query: string;
+  }> = [
+    { name: "missing", changed: {}, query: "" },
+    { name: "archived", changed: { archivedAt: staleAt }, query: "" },
+    { name: "deleted", changed: { deletedAt: staleAt }, query: "" },
+    {
+      name: "older date",
+      changed: { updatedAt: DateTime.subtract(staleAt, { seconds: 2 }) },
+      query: "",
+    },
+    {
+      name: "other project",
+      changed: { projectId: ProjectId.make("moved") },
+      query: "&projectId=project:mcp-test",
+    },
+    { name: "other source", changed: { creationSource: "provider" }, query: "&creationSource=web" },
+    {
+      name: "other parent",
+      changed: {
+        lineage: {
+          rootThreadId: ThreadId.make("tie-a"),
+          parentThreadId: ThreadId.make("moved"),
+          relationshipToParent: null,
+        },
+      },
+      query: "&parentThreadId=original-parent",
+    },
+    {
+      name: "subagent",
+      changed: {
+        lineage: {
+          rootThreadId: ThreadId.make("tie-a"),
+          parentThreadId: ThreadId.make("original-parent"),
+          relationshipToParent: "subagent",
+        },
+      },
+      query: "",
+    },
+  ];
+  for (const row of unavailableCandidates) {
+    for (const origin of ["none", "direct", "inherited"] as const) {
+      it.effect(`refills ${origin} origin results after a candidate is ${row.name}`, () => {
+        const candidates = ["tie-a", "tie-b", "tie-c"].map((id) => {
+          const candidate = shell(id, {
+            ...idle,
+            updatedAt: staleAt,
+            lineage: {
+              rootThreadId: ThreadId.make(id),
+              parentThreadId: ThreadId.make("original-parent"),
+              relationshipToParent: null,
+            },
+            ...(id === "tie-a" ? row.changed : {}),
+          });
+          return origin === "inherited"
+            ? {
+                ...candidate,
+                lineage: { ...candidate.lineage, rootThreadId: ThreadId.make("origin-root") },
+              }
+            : candidate;
+        });
+        return run(
+          ({ get, sql }) =>
+            Effect.gen(function* () {
+              // Candidate metadata is the earlier version; the shell read observes the change.
+              yield* sql`UPDATE orchestration_v2_projection_threads
+            SET deleted_at = NULL, project_id = 'project:mcp-test', updated_at = ${DateTime.formatIso(staleAt)},
+              payload_json = json_set(payload_json, '$.archivedAt', NULL,
+                '$.lineage.relationshipToParent', NULL, '$.lineage.parentThreadId', 'original-parent', '$.creationSource', 'web')
+            WHERE thread_id = 'tie-a'`;
+              if (origin !== "none") {
+                for (const id of origin === "inherited"
+                  ? ["origin-root"]
+                  : ["tie-a", "tie-b", "tie-c"]) {
+                  yield* sql`INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
+                VALUES (${id}, 'imessage', '2026-03-01T00:00:00.000Z')`;
+                }
+              }
+              for (const limit of [1, 2, 5]) {
+                const response = yield* get(
+                  `/threads?updatedSince=${staleSince}&origin=${origin === "none" ? "none" : "imessage"}&limit=${limit}${row.query}`,
+                );
+                assert.equal(response.status, 200);
+                assert.equal(response.body.total, 2);
+                assert.deepEqual(
+                  (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
+                    (thread) => thread.threadId,
+                  ),
+                  ["tie-b", "tie-c"].slice(0, limit),
+                );
+              }
+            }),
+          undefined,
+          candidates,
+          row.name === "missing" ? new Set(["tie-a"]) : new Set(),
+        );
+      });
+    }
+  }
+
+  it.effect("refills across a whole unavailable origin-filtered candidate page", () => {
+    const ids = Array.from({ length: 130 }, (_, i) => `refill-${String(i).padStart(3, "0")}`);
+    const candidates = ids.map((id) => shell(id, { ...idle, updatedAt: staleAt }));
+    return run(
+      ({ get }) =>
+        Effect.gen(function* () {
+          for (const limit of [1, 2]) {
+            const response = yield* get(
+              `/threads?updatedSince=${staleSince}&origin=none&limit=${limit}`,
+            );
+            assert.equal(response.status, 200);
+            assert.equal(response.body.total, 2);
+            assert.deepEqual(
+              (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
+                (thread) => thread.threadId,
+              ),
+              ids.slice(128, 128 + limit),
+            );
+          }
+        }),
+      undefined,
+      candidates,
+      new Set(ids.slice(0, 128)),
+    );
+  });
 
   it.effect("orders /threads?updatedSince ties by thread id like the full listing", () => {
     const at = DateTime.makeUnsafe("2026-03-01T00:00:01.000Z");

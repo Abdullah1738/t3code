@@ -997,7 +997,6 @@ const makeRoutes = Effect.gen(function* () {
         .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
       const last = page.at(-1);
       if (last === undefined) break;
-      after = { updatedAt: last.updatedAt, threadId: last.threadId };
       let matched = page;
       if (origin !== null) {
         const origins = yield* store
@@ -1010,33 +1009,43 @@ const makeRoutes = Effect.gen(function* () {
         });
       }
       if (!needsState && origin !== null) total += matched.length;
-      const batch = needsState ? matched : matched.slice(0, limit - shells.length);
-      const loaded = (yield* shellsFor(
-        batch.map((row) => row.threadId),
-        location,
-      )).filter(
-        (shell) =>
-          (since === null || DateTime.toEpochMillis(shell.updatedAt) > since) &&
-          (input.includeSubagents ||
-            parentThreadId !== null ||
-            shell.lineage.relationshipToParent !== "subagent") &&
-          (parentThreadId === null || shell.lineage.parentThreadId === parentThreadId) &&
-          (projectId === null || shell.projectId === projectId) &&
-          (input.creationSources === undefined ||
-            input.creationSources.includes(shell.creationSource)),
-      );
-      if (needsState) {
-        const filtered = loaded.filter(
-          (shell) =>
-            (active === undefined || (stateFromShell(shell) !== "idle") === active) &&
-            (states === undefined || states.includes(stateFromShell(shell))),
+      let consumed = 0;
+      // A shell can disappear after candidate selection; refill from this page
+      // before moving its cursor past eligible rows we have not tried.
+      while (consumed < matched.length && (needsState || shells.length < limit)) {
+        const batch = matched.slice(
+          consumed,
+          needsState ? matched.length : consumed + limit - shells.length,
         );
-        total += filtered.length;
-        shells.push(...filtered.slice(0, limit - shells.length));
-      } else {
-        total -= batch.length - loaded.length;
-        shells.push(...loaded);
+        consumed += batch.length;
+        const loaded = (yield* shellsFor(
+          batch.map((row) => row.threadId),
+          location,
+        )).filter(
+          (shell) =>
+            (since === null || DateTime.toEpochMillis(shell.updatedAt) > since) &&
+            (input.includeSubagents ||
+              parentThreadId !== null ||
+              shell.lineage.relationshipToParent !== "subagent") &&
+            (parentThreadId === null || shell.lineage.parentThreadId === parentThreadId) &&
+            (projectId === null || shell.projectId === projectId) &&
+            (input.creationSources === undefined ||
+              input.creationSources.includes(shell.creationSource)),
+        );
+        if (needsState) {
+          const filtered = loaded.filter(
+            (shell) =>
+              (active === undefined || (stateFromShell(shell) !== "idle") === active) &&
+              (states === undefined || states.includes(stateFromShell(shell))),
+          );
+          total += filtered.length;
+          shells.push(...filtered.slice(0, limit - shells.length));
+        } else {
+          total -= batch.length - loaded.length;
+          shells.push(...loaded);
+        }
       }
+      after = { updatedAt: last.updatedAt, threadId: last.threadId };
       if (page.length < pageLimit) break;
     }
     const summaries = yield* summarize(
