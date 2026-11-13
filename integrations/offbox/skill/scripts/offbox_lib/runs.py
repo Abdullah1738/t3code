@@ -2323,7 +2323,7 @@ def emit_terminal(row):
                      ids={'run': run_id, 'box': row['box_id']}, props={'exitCode': code, 'fallback': row['mode'] == 'local'},
                      tag='run_failed' if code != 0 else None)
         if row['process_id'] or row['wrapper_pid']:
-            command_ms = max(0, ended-row['command_at'])*1000 if row['command_at'] is not None else None
+            command_ms = api.command_execution_ms(row['box_id'], row['process_id'], row['command_id'])
             toollog.emit('run', 'run.command', kind='perf' if code == 0 else 'error', ok=code == 0,
                          duration_ms=command_ms, ids={'run': run_id, 'box': row['box_id']},
                          props={'exitCode': code, 'timeoutHit': code == 124}, tag='command_failed' if code != 0 else None)

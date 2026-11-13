@@ -425,6 +425,7 @@ def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, e
             raise
         data["ids"] = {"run": run_id, "box": row["box_id"]}
         data["props"]["leaseKind"] = row.pop("_log_lease_kind", "reused")
+        data["props"]["size"] = row.get("size")
         return row
 
 

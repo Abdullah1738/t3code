@@ -260,7 +260,7 @@ class Instrumentation(Isolated):
             self.assertEqual(runs.finish(rid,code,bookkeeping=False),code)
         self.outcomes('run.command'); self.outcomes('run.end')
         self.assertEqual(len(self.rows('run.end')),2)
-        self.assertLess(self.rows('run.command')[0]['durationMs'],1500)
+        self.assertNotIn('durationMs',self.rows('run.command')[0])
 
     def test_recovered_start_logs_once_even_when_settlement_already_committed(self):
         from offbox_lib import start_check

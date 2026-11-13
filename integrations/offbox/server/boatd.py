@@ -1829,7 +1829,7 @@ class Handler(BaseHTTPRequestHandler):
                             sent = True
                 if sent:
                     continue
-                r = con.execute("SELECT status, exit_code, signal, attempt FROM commands WHERE box_id=? AND pid=?",
+                r = con.execute("SELECT status, exit_code, signal, attempt, command_id, started_at, ended_at FROM commands WHERE box_id=? AND pid=?",
                                 (bid, pid)).fetchone()
                 if (r["attempt"] or 1) != attempt:
                     attempt = r["attempt"] or 1
@@ -1845,7 +1845,8 @@ class Handler(BaseHTTPRequestHandler):
                             emit({"type": typ, "data": rest.decode(errors="replace"), "nextOffset": offs[which]})
                     if all(offs[w] >= sizes[w] for w in sizes):
                         emit({"type": "exit", "exitCode": r["exit_code"], "signal": r["signal"],
-                              "status": r["status"], "attempt": attempt})
+                              "status": r["status"], "attempt": attempt, "commandId": r["command_id"],
+                              "startedAt": iso(r["started_at"]), "endedAt": iso(r["ended_at"])})
                         break
                     continue
                 if now() - started > 600:

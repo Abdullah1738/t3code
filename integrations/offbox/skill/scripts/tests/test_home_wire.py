@@ -3,6 +3,7 @@ server restarted under. boatd's host side (Incus, systemd, ZFS) is test_boatd's 
 client are real."""
 import contextlib
 import io
+import json
 from pathlib import Path
 import sys
 import threading
@@ -31,6 +32,7 @@ class Wire(Isolated):
             self.stack.enter_context(patch.object(api, name, value))
         self.as_owner("ardud")
         self.stack.enter_context(patch.object(runs, "_ttl_keeper"))
+        self.stack.enter_context(patch.object(api, "_COMMAND_DURATIONS", {}))
         self.log = Path(self.tmp.name) / "run.log"
 
     def as_owner(self, who):
@@ -102,6 +104,40 @@ class Wire(Isolated):
         self.assertEqual(e.code, common.EXIT_INTERRUPTED)
         self.assertIn("half", self.log.read_text())
         self.assertEqual(api.cmd_status(box, pid)["status"], "interrupted")
+
+    def test_restart_settlement_does_not_count_downtime_as_execution(self):
+        cases=[('interrupted',None,None),('lost','lost',None),('killed','kill',None),('recovered',None,10000)]
+        for index,(name,marker,duration) in enumerate(cases):
+            with self.subTest(name=name):
+                box=self.srv.box(bid=f'bx_timing{index:04d}')
+                pid=self.srv.cmd(box)
+                self.srv.con.execute('UPDATE commands SET started_at=100 WHERE box_id=? AND pid=?',(box,pid))
+                if marker:
+                    (boatd.cmd_dir(box)/f'{pid}.kill').write_text(marker)
+                if name=='recovered':
+                    boatd.write_json(boatd.result_path(box,pid),{'attempt':1,'status':'exited','exit_code':7,
+                                                              'started_at':100,'ended_at':110})
+                with patch.object(boatd,'now',return_value=3710):
+                    boatd.reconcile(self.srv.con)
+                status=api.cmd_status(box,pid)
+                if name!='recovered':
+                    self.assertIsNone(status['metrics'])
+                    self.assertEqual(status['endedAt'],boatd.iso(3710))
+                # Both existing response paths must retain only an observed execution duration.
+                self.assertEqual(api.command_execution_ms(box,pid,f'cmd_{pid}'),duration)
+                list(api.cmd_attach(box,pid))
+                self.assertEqual(api.command_execution_ms(box,pid,f'cmd_{pid}'),duration)
+                rid='run-restart-'+name
+                self.con.execute("INSERT INTO runs(run_id,box_id,command_id,process_id,status,mode,start_at) "
+                                 "VALUES (?,?,?,?,'running','bg',100)",(rid,box,f'cmd_{pid}',pid))
+                self.con.commit()
+                runs.finish(rid,status['exitCode'] if status['exitCode'] is not None else common.EXIT_INTERRUPTED,
+                            bookkeeping=False)
+                records=[json.loads(line) for p in (self.srv.tmp/'shared-logs').glob('*.ndjson')
+                         for line in p.read_text().splitlines()]
+                command=[r for r in records if r['name']=='run.command' and r['ids']['run']==rid]
+                self.assertEqual(len(command),1)
+                self.assertEqual(command[0].get('durationMs'),duration)
 
     def test_step_results_belong_to_the_final_home_attempt(self):
         first = 'offbox step 1 rc=5: a\noffbox step 2 rc=0: b\n'
