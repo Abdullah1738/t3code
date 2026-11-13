@@ -21,6 +21,7 @@ import recall_messages
 from recall_engine import CheckEngine
 from recall_local import preflight
 from recall_rules import RuleIndex
+from recall_rules import _RuleConnection
 
 CARD = "Card limit (owner): the ENBD Marriott cards 2342 and 2792 share one limit, and it can go to about AED -9,400. Never tell Abdullah the card is over its limit, maxed, needs paying down, or will or might be declined, and never move a payment to another card for that reason, unless ENBD has sent a real decline SMS; then quote it."
 MONI = 'Moni\'s chat (owner): plain text only, no ** or * for emphasis (iMessage shows the asterisks). At most two short paragraphs under 600 characters, then offer "want the details?".'
@@ -52,6 +53,93 @@ class SendRulesTests(unittest.TestCase):
 
     def call(self, arguments, cwd=None, tool='mcp__t3_code__imessage_send'):
         return preflight(tool, arguments, str(cwd or self.root / 'imessage'), self.index.path)
+
+    def populate_index(self):
+        self.index = RuleIndex(self.root / 'populated.db')
+        with closing(self.index._connect()) as con, con:
+            for number in range(4318):
+                self.index._put(con, f'Archived fixture{number} service setting.', '', [], '',
+                                dict(key=f'fixture{number}', citation=f'fixture#e{number}', provenance='skill', priority=50))
+        self.card = self.index.remember(CARD, actions=['message'], source_session='owner')['id']
+        self.moni = self.index.remember(MONI, actions=['message'], recipient='moni', source_session='owner')['id']
+        self.assertGreater(self.card, 4000)
+
+    def test_populated_index_search_interrupt_preserves_approved_checks(self):
+        self.populate_index()
+        class InterruptedSearch(_RuleConnection):
+            def set_progress_handler(self, callback, n):
+                # Exercise SQLite's real interrupted-query exception, without
+                # depending on how quickly this machine scans 4,320 rules.
+                return super().set_progress_handler(lambda: 1, 1)
+        for name, to, text, expected in FIXTURES:
+            score = .9 if expected == 'deny' or name == 'moni_bold' else .6 if name == 'moni_long' else .05
+            def decide(messages, facts):
+                self.assertEqual(messages, [text])
+                self.assertEqual([f['id'] for f in facts], [self.moni if to else self.card])
+                return {str(f['id']): score for f in facts}, 0
+            with self.subTest(fixture=name), patch('recall_rules._RuleConnection', InterruptedSearch), \
+                 patch.object(recall_messages, 'contradiction', side_effect=decide) as model:
+                selected, result = self.call({'text': text, **({'to': to} if to else {})})
+                if name == 'order_update':
+                    model.assert_not_called()
+                else:
+                    model.assert_called_once()
+                self.assertEqual((result or {}).get('decision', 'allow'), 'deny' if score >= .7 else 'allow')
+                self.assertEqual(bool((result or {}).get('note')), score == .6)
+                if not to:
+                    self.assertNotIn(self.moni, [f['id'] for f in selected])
+
+    def test_approved_checks_are_independent_of_broad_search_row_limit(self):
+        self.populate_index()
+        with patch.object(recall_messages, 'contradiction',
+                          side_effect=lambda m, f: ({str(r['id']): .9 for r in f}, 0)) as model:
+            selected, result = self.call({'text': FIXTURES[0][2]})
+            self.assertEqual([r['id'] for r in selected], [self.card])
+            self.assertEqual(result['decision'], 'deny')
+            model.assert_called_once()
+
+    def test_search_error_and_classifier_failure_preserve_cited_note(self):
+        self.populate_index()
+        for search_error in (sqlite3.OperationalError('interrupted'), sqlite3.OperationalError('database is locked'), TimeoutError()):
+            for to, text, saved in (('', FIXTURES[0][2], CARD), ('moni', '**Roses**', MONI)):
+                with self.subTest(error=search_error, to=to), \
+                     patch.object(RuleIndex, 'search_facts', side_effect=search_error), \
+                     patch.object(recall_messages, 'contradiction', side_effect=TimeoutError()):
+                    _, result = self.call({'text': text, **({'to': to} if to else {})})
+                    self.assertEqual(result['decision'], 'allow')
+                    self.assertIn(saved, result['note'])
+                    self.assertTrue(result['sources'])
+
+    def test_populated_search_failure_survives_engine_and_native_hooks(self):
+        self.populate_index()
+        spec = importlib.util.spec_from_file_location('populated_hook', ROOT / 'hooks/recall_hook.py')
+        hook = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hook)
+        for to, text, rule in (('', FIXTURES[0][2], self.card), ('moni', '**Roses**', self.moni)):
+            for score in (.9, None):
+                def decide(*_):
+                    if score is None: raise TimeoutError()
+                    return {str(rule): score}, 0
+                args = {'text': text, **({'to': to} if to else {})}
+                with self.subTest(to=to, score=score), patch.dict(os.environ, RECALL_RULES_DB=str(self.index.path),
+                        RECALL_DECISION_LOG=str(self.root / 'decisions.jsonl')), \
+                     patch.object(RuleIndex, 'search_facts', side_effect=sqlite3.OperationalError('interrupted')), \
+                     patch.object(recall_messages, 'contradiction', side_effect=decide):
+                    result = CheckEngine(rules_path=self.index.path).preflight(dict(trigger='tool', tool='imessage_send',
+                        arguments=args, cwd=str(self.root / 'imessage')))[2]
+                    self.assertEqual(result['decision'], 'deny' if score else 'allow')
+                    self.assertTrue(result['sources'])
+                    for harness in ('claude', 'codex'):
+                        output = io.StringIO()
+                        with redirect_stdout(output), patch.object(hook, 'config', return_value={'mode': 'on'}), \
+                             patch.object(hook, 'log'):
+                            hook.handle(harness, dict(hook_event_name='PreToolUse', session_id='fixture',
+                                tool_name='imessage_send', tool_input=args, cwd=str(self.root / 'imessage')))
+                        value = json.loads(output.getvalue())['hookSpecificOutput']
+                        if score:
+                            self.assertEqual(value['permissionDecision'], 'deny')
+                        else:
+                            self.assertIn('Rule ' + str(rule), value['additionalContext'])
 
     def test_corpus_selection_and_decision(self):
         for name, to, text, expected in FIXTURES:

@@ -4,9 +4,10 @@ No corpus, identity resolution or model imports are allowed on this path.
 """
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
-from recall_rules import RuleIndex, evaluate_conflict, filter_facts, dedupe_facts, message_recipients, _tool_name, _SHELL_TOOLS
+from recall_rules import RuleIndex, evaluate_conflict, filter_facts, dedupe_facts, message_recipients, fact_terms, _tool_name, _SHELL_TOOLS
 from recall_classifier import deterministic
 
 
@@ -82,11 +83,18 @@ def preflight(tool, arguments, cwd, path=None, session_id=None, *, _deadline=Non
         conflict = evaluate_conflict(rules, tool, arguments, cwd)
         if conflict:
             return rules, {**conflict, 'sources': conflict.get('citations', []), 'note': None}
-        facts = [r for r in index.search_facts(messages, cwd, session_id=session_id)
-                 if not r.get('recipient') or any(rule['id'] == r['id'] for rule in rules)]
-        # Recipient-scoped message instructions apply to every body, including
-        # formatting violations with no words in common with the instruction.
-        facts = dedupe_facts(facts + [r for r in rules if r.get('recipient') and r.get('specific_matched')])
+        # Explicit message rules are independent of the optional broad search's
+        # deadline and row cap. Recipient rules also cover zero-overlap bodies.
+        terms = fact_terms(' '.join(messages))
+        facts = [r for r in rules if r.get('provenance') == 'explicit' and
+                 (r.get('specific_matched') or
+                  'message' in r['actions'] and terms & fact_terms(r['text']))]
+        try:
+            discovered = index.search_facts(messages, cwd, session_id=session_id)
+        except (sqlite3.Error, TimeoutError):
+            discovered = []
+        facts = dedupe_facts(facts + [r for r in discovered
+                                    if not r.get('recipient') or any(rule['id'] == r['id'] for rule in rules)])
         if facts:
             result = check(messages, facts, timeout=max(0, deadline - time.monotonic()))
             if result['decision'] == 'allow' and not result.get('note'):
