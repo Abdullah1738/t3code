@@ -883,7 +883,7 @@ const BoardOpen = tool(
 const ReportBug = tool(
   "report_bug",
   "Report a bug",
-  "Report a tooling bug from any thread. Pass cardHint (e.g. #722) when you already know its open card. A hint or strong title match appends a sighting without starting an evaluator; weak matches start a request evaluator, or queue it when the board's spawn limit is full. Identical evidence from this thread on the same card is deduped for 30 minutes. Search matches return up to three candidates, best first.",
+  "Report a tooling bug from any thread. Pass cardHint (e.g. #722) when you already know its card (any stage until it is settled). A hint or strong title match appends a sighting without starting an evaluator; weak matches start a request evaluator, or queue it when the board's spawn limit is full. Identical evidence from this thread on the same card is deduped for 30 minutes. Search matches return up to three candidates, best first.",
   {
     boardId: describe(TrimmedNonEmptyString, "Destination board id or slug."),
     title: describe(TrimmedNonEmptyString, "Short bug title to search for."),

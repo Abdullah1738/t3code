@@ -13876,18 +13876,23 @@ const make = Effect.gen(function* () {
           candidates?: Array<{ id: KanbanCardId; number: number; title: string; score: number }>;
         }
       | undefined;
+    let missedHint: number | undefined;
     const result = yield* SavedWrite.recover(
       guard(
         "bug.report",
         Effect.gen(function* () {
-          const open = (yield* store.cards(board.id)).filter(
-            (card) => card.settledAt === null && !KANBAN_DONE_STAGES.has(card.stage),
+          const unsettled = (yield* store.cards(board.id)).filter(
+            (card) => card.settledAt === null,
           );
+          const open = unsettled.filter((card) => !KANBAN_DONE_STAGES.has(card.stage));
           const hint = input.cardHint?.trim();
+          const hintNumber =
+            hint && /^#?\d+$/.test(hint) ? Number(hint.replace(/^#/, "")) : undefined;
           const hinted =
-            hint && /^#?\d+$/.test(hint)
-              ? open.find((card) => card.number === Number(hint.replace(/^#/, "")))
-              : undefined;
+            hintNumber === undefined
+              ? undefined
+              : unsettled.find((card) => card.number === hintNumber);
+          if (hintNumber !== undefined && !hinted) missedHint = hintNumber;
           const matches = hinted ? [] : bugMatches(open, title);
           const best = matches[0];
           const ambiguous = best && !best.exact && matches[1]?.score === best.score;
@@ -13940,6 +13945,8 @@ const make = Effect.gen(function* () {
     } else {
       text = `Reported by thread [${input.threadId}](t3-thread://v1/${input.threadId}).\n\n${text}`;
     }
+    if (missedHint !== undefined)
+      text = `cardHint #${missedHint} matched no unsettled card on this board.\n\n${text}`;
     const key = uuid();
     // reportBug has already resolved its matches. Caller provenance in the
     // stamped text must not associate a novel report with the caller's own card.

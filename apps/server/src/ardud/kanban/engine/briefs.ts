@@ -44,7 +44,7 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     "",
     "How the board works:",
     '- Your card tools: card_get, card_search, card_update, card_move, card_ask, card_flag, subtask_done, discussion_post, wiki_read, report_bug, evaluator_start (kind "request" only).',
-    '- If a tool, CLI or Robob itself fails you, use a workaround and keep going, then call report_bug with boardId "robob", a short title, and evidence (error text, run ids, log paths). Pass cardHint (for example "#722") when you know its open card. It appends a sighting to a known or strong match and starts a request evaluator for uncertain or new bugs.',
+    '- If a tool, CLI or Robob itself fails you, use a workaround and keep going, then call report_bug with boardId "robob", a short title, and evidence (error text, run ids, log paths). Pass cardHint (for example "#722") when you know its card (any stage until it is settled). It appends a sighting to a known or strong match and starts a request evaluator for uncertain or new bugs.',
     card.subtasks.length > 0
       ? "- Subtasks are the card's plan. Do the worker's subtasks of the step the card is on, and mark each with subtask_done (done with a short note, or skipped with why). The card can't go to needs_review while one is open. Later steps come back to you after the review if they are yours; the evaluator's and the reviewer's aren't yours to do."
       : null,

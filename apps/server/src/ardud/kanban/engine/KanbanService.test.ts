@@ -26994,6 +26994,92 @@ it.effect("reportBug appends a hinted sighting as the reporter without an evalua
   }),
 );
 
+it.effect.each(["completed", "deployed", "verified"] as const)(
+  "reportBug appends a hint to an unsettled %s card without an evaluator",
+  (stage) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(
+          board.id,
+          { title: "Known tool failure", prompt: "Fix tool" },
+          owner,
+        );
+        const store = yield* KanbanStore.KanbanStore;
+        yield* store.putCard({ ...card, stage });
+        const threadId = ThreadId.make("reporter");
+        const result = yield* kanban.reportBug({
+          boardId: board.slug,
+          threadId,
+          title: "Different wording",
+          evidence: "run-1 failed",
+          cardHint: `#${card.number}`,
+        });
+        assert.deepStrictEqual(result, { appendedTo: `#${card.number}` });
+        const current = yield* kanban.card(card.id);
+        const comments = current.events.filter((event) => event.kind === "comment");
+        assert.lengthOf(comments, 1);
+        assert.deepStrictEqual(comments[0]?.actor, { _tag: "thread", threadId });
+        assert.strictEqual(comments[0]?.body, "sighting\n\nrun-1 failed");
+        assert.strictEqual(current.card.stage, stage);
+        assert.isNull(current.card.settledAt);
+        assert.strictEqual((yield* Ref.get(fake.threads)).size, 0);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["settled", "missing", "other board"] as const)(
+  "reportBug explains a hint to a %s card in exactly one request evaluator",
+  (target) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const elsewhere = yield* kanban.ensureBoard({
+          slug: "elsewhere",
+          name: "Elsewhere",
+          defaultProjectId: ProjectId.make("project-1"),
+        });
+        const card = yield* kanban.createCard(
+          target === "other board" ? elsewhere.id : board.id,
+          { title: "Known tool failure", prompt: "Fix tool" },
+          owner,
+        );
+        const store = yield* KanbanStore.KanbanStore;
+        if (target === "settled")
+          yield* store.putCard({
+            ...card,
+            stage: "completed",
+            settledAt: "2026-11-01T00:00:00.000Z",
+          });
+        const number = target === "missing" ? card.number + 1 : card.number;
+        const result = yield* kanban.reportBug({
+          boardId: board.id,
+          threadId: ThreadId.make("reporter"),
+          title: "Different wording",
+          evidence: "new failure",
+          cardHint: `#${number}`,
+        });
+        assert.isString(result.threadId);
+        assert.isUndefined(result.appendedTo);
+        const launched = yield* Ref.get(fake.threads);
+        assert.strictEqual(launched.size, 1);
+        const thread = [...launched.values()][0]!;
+        assert.strictEqual((yield* store.threadLink(result.threadId!))?.purpose, "request");
+        assert.include(
+          thread.messages[0]!,
+          `Owner request:\ncardHint #${number} matched no unsettled card on this board.\n\nReported by thread`,
+        );
+        assert.include(thread.messages[0]!, "Different wording\n\nnew failure");
+        assert.lengthOf(
+          (yield* kanban.card(card.id)).events.filter((event) => event.kind === "comment"),
+          0,
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect("reportBug strong title matches append and return the next two candidates", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -27169,7 +27255,7 @@ it.effect(
     }),
 );
 
-it.effect("reportBug ignores closed hints, settled cards and cards on another board", () =>
+it.effect("reportBug title matching ignores completed, settled and other-board cards", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -27202,10 +27288,15 @@ it.effect("reportBug ignores closed hints, settled cards and cards on another bo
         threadId: ThreadId.make("reporter"),
         title: "Kafka broker certificate expiry",
         evidence: "new failure",
-        cardHint: `#${closed.number}`,
       });
       assert.isString(result.threadId);
+      assert.isUndefined(result.appendedTo);
       assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+      for (const card of [closed, settled])
+        assert.lengthOf(
+          (yield* kanban.card(card.id)).events.filter((event) => event.kind === "comment"),
+          0,
+        );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
