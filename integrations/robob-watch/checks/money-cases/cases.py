@@ -45,6 +45,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -329,14 +330,19 @@ def moment(text):
 
 
 def answered_at(case):
-    """When he last answered: a close, a reopen, or an update with --reply (his reply id). Else when it opened.
+    """Start the reminder clock at his last answer or the latest returning merchant risk.
 
     A --because reason is recorded but is not an answer: it can come from a process, not from him."""
     owned = [m for m in (moment(h.get('at')) for h in case.get('history', []) if h.get('owner')) if m]
+    cycle_started = moment(case.get('merchant_card_cycle_started'))
+    if cycle_started:
+        owned.append(cycle_started)
     return max(owned) if owned else moment(case['opened'])
 
 
 def money(case):
+    if case.get('kind') == 'merchant_card':
+        return 'saved card'
     return f"{case['currency']} {Decimal(case['amount']):,}"
 
 
@@ -867,6 +873,83 @@ def renewal_case(data, notice, source, now=None, end=None, include_existing=Fals
     return case
 
 
+def merchant_dead():
+    """Read the shared registry; a failed/old CLI must never resolve existing cases."""
+    try:
+        result = subprocess.run([os.environ.get('CARD_STATUS_CLI', 'card-status'), 'merchant', 'dead', '--json'],
+                                capture_output=True, text=True, timeout=4, check=True)
+        rows = json.loads(result.stdout)
+        if not isinstance(rows, list):
+            raise ValueError()
+        keys = set()
+        for row in rows:
+            key = check_text('merchant key', row['key'])
+            check_text('merchant', row['merchant'])
+            if key in keys or key != key.casefold() or not row['dead_cards']:
+                raise ValueError()
+            keys.add(key)
+            if row.get('next_charge') is not None:
+                if not re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', row['next_charge']):
+                    raise ValueError()
+                check_charged(row['next_charge'])
+            for card in row['dead_cards']:
+                last4_arg('saved card', card['last4'])
+                if card['state'] not in ('cancelled', 'declined'):
+                    raise ValueError()
+        return rows
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, CaseError):
+        raise CaseError('card-status merchant dead unavailable or invalid; merchant cases unchanged')
+
+
+def reconcile_merchants(data=None, now=None, end=None):
+    rows = merchant_dead()
+    now = now or now_dubai()
+    active = {row['key']: row for row in rows}
+    if not rows and not any(c.get('merchant_card_key') and not c.get('merchant_card_resolved')
+                            for c in load(data)['cases']):
+        return
+    with Locked(data or DATA, wait=lock_wait(end)) as book:
+        for row in rows:
+            key = row['key']
+            cards = sorted({(c['last4'], c['state']) for c in row['dead_cards']})
+            fingerprint = json.dumps([cards, row.get('next_charge')], separators=(',', ':'))
+            state = row['merchant'] + ' still holds ' + ', '.join(f'{state} card ••{last4}' for last4, state in cards)
+            if row.get('next_charge'):
+                state += '; next charge ' + row['next_charge']
+            existing = next((c for c in book['cases'] if c.get('merchant_card_key') == key), None)
+            if not existing:
+                cid = 'merchant-card-' + hashlib.sha256(key.encode()).hexdigest()[:24]
+                if any(c['id'] == cid for c in book['cases']):
+                    raise CaseError('merchant case id already used; review by hand')
+                existing = {'id': cid, 'kind': 'merchant_card', 'merchant_card_key': key,
+                            'merchant': row['merchant'], 'merchant_card_fingerprint': fingerprint,
+                            'amount': None, 'currency': None,
+                            'reference': 'card-status merchant dead', 'owner': 'abdullah',
+                            'next': 'update the saved payment method, then record it with card-status merchant set',
+                            'deadline': row.get('next_charge') or now.date().isoformat(),
+                            'who': 'Abdullah', 'why': '', 'watchers': [], 'status': 'open', 'rev': 0, 'cycle': 0,
+                            'opened': stamp(now), 'updated': stamp(now), 'closed': None, 'outcome': None,
+                            'state': state, 'history': [{'at': stamp(now), 'text': 'opened from saved merchant cards'}]}
+                book['cases'].append(existing)
+            elif existing.get('merchant_card_fingerprint') != fingerprint or existing.get('merchant_card_resolved'):
+                if existing['status'] == 'closed':
+                    existing.update(status='open', closed=None, outcome=None, cycle=existing.get('cycle', 0) + 1,
+                                    rev=existing.get('rev', 0) + 1, merchant_card_cycle_started=stamp(now))
+                if row.get('next_charge') and row['next_charge'] != existing['deadline']:
+                    existing.update(deadline=row['next_charge'], rev=existing.get('rev', 0) + 1)
+                existing.update(state=state, updated=stamp(now), merchant_card_resolved=False,
+                                merchant_card_fingerprint=fingerprint)
+                existing['history'].append({'at': stamp(now), 'text': 'saved merchant cards changed'})
+        for case in book['cases']:
+            if (case.get('merchant_card_key') and case['merchant_card_key'] not in active
+                    and not case.get('merchant_card_resolved')):
+                if case['status'] == 'open':
+                    payment_close(case, 'merchant no longer holds a cancelled or declined card', now)
+                else:
+                    case['history'].append({'at': stamp(now), 'text': 'dead saved card no longer present'})
+                case['merchant_card_resolved'] = True
+
+
 def payment_matches(case, notice):
     return (case.get('kind') in ('payment_deadline', 'autopay_expected') and
             case.get('merchant') == notice['institution'] and case['amount'] == notice['amount'] and
@@ -1350,6 +1433,8 @@ def repeat_bill(data, q, now, end=None):
         return
     with Locked(data, wait=lock_wait(end)) as book:
         for case in reversed(book['cases']):
+            if case.get('kind') == 'merchant_card' or case.get('merchant_card_key'):
+                continue
             outcome = case.get('outcome') or ''
             if case.get('status') != 'closed' or not re.search(
                     r'\b(?:card (?:changed|dead|cancelled|canceled|replaced)|(?:changed|dead|cancelled|canceled|replaced) card)\b',
@@ -1781,7 +1866,14 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
             retained_outbox = state.get('outbox')
             phases[phase] = time.time() - phase_at
             phase, phase_at = 'follow', time.time()
-            errors = follow_payments(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
+            errors = []
+            try:
+                reconcile_merchants(data, now, end=work_end)
+            except CheckTimeout:
+                raise
+            except CaseError as exc:
+                errors.append(str(exc))
+            errors += follow_payments(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
             errors += follow(data or DATA, now, root, min(end - 8, time.time() + FOLLOW_BUDGET), find, said,
                             end=work_end, stats=stats)
             phases[phase] = time.time() - phase_at
@@ -1912,7 +2004,9 @@ def brief(cases, now=None):
     far = dt.datetime.max.replace(tzinfo=TZ)
     for case in sorted(open_cases, key=lambda c: (c.get('kind') != 'payment_deadline', deadline_of(c) or far)):
         deadline = deadline_of(case)
-        if deadline is None:
+        if case.get('kind') == 'merchant_card':
+            due.append(case['state'])
+        elif deadline is None:
             due.append(f"{case['merchant']} {money(case)} (no valid deadline)")
         elif case.get('kind') == 'payment_deadline' or deadline <= now + BRIEF_DUE:
             late = 'overdue since ' if deadline <= now else ''

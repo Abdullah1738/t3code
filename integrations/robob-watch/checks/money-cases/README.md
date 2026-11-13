@@ -44,6 +44,16 @@ Rules added 2026-10-30 (money-cases fixes, card #10):
 - **Holds.** A pre-auth hold (`--kind hold`) that drops off is closed as `released`, not `refunded`.
 - **No guesses.** A charge whose merchant or order can't be matched is `unmatched`, never named by a guess.
 
+## Saved merchant cards
+
+The scheduled check reads `card-status merchant dead --json` (requires the matching app-api-cli
+install). It keeps one saved-card case per merchant, closes it once no cancelled/declined card is
+saved, and reopens it if a dead card returns. Manually closed unchanged cases stay closed. An
+unavailable or invalid registry leaves existing cases unchanged and records a check error. These
+cases have no amount or currency: no charge has happened. The brief includes the saved-card reason
+and a known next charge date. Unknown dates use the observation day's action deadline; they never
+invent a renewal date. The existing watcher handles reminders; no new notifier is installed.
+
 ## Renewals on dead cards
 
 `card-dead LAST4 --note "..."` records a cancelled card in `cards.json` next to the case book; `cards` lists it. Non-dry `card-swap --old OLD --new NEW [--also STALE]` also marks the old and stale cards dead, even without `--case`. Case text still changes only for explicit `--case` picks. `--dry-run` writes neither book.

@@ -38,6 +38,9 @@ class Base(unittest.TestCase):
         self.tmp = Path(tmp.name)
         self.data, self.root, self.wd = self.tmp / 'data', self.tmp / 'watch', self.tmp / 'wd'
         self.wd.mkdir()
+        registry = patch.object(mc, 'merchant_dead', return_value=[])
+        registry.start()
+        self.addCleanup(registry.stop)
 
     def case(self, case_id='acme', deadline='2026-10-25', when=at('2026-10-24T09:00'), **extra):
         fields = dict(merchant='Acme', amount='120.50', currency='aed', state='refund asked',
