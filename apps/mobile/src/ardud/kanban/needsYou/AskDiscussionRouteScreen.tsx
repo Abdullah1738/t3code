@@ -6,7 +6,7 @@ import {
   askRepliedOnCard,
   askThread,
 } from "@t3tools/client-runtime/ardud/kanban";
-import type { KanbanAskFeedItem, KanbanMessage } from "@t3tools/contracts";
+import { kanbanAskRevision, type KanbanAskFeedItem, type KanbanMessage } from "@t3tools/contracts";
 import { type ComponentRef, useRef, useState } from "react";
 import { Pressable, ScrollView, View } from "react-native";
 
@@ -36,8 +36,7 @@ import { OwnerBand, OfflineBand } from "./ui";
 import { useQueue } from "./useQueue";
 
 /**
- * The talk under one ask, in the board's own message and composer parts. A
- * reply does not answer the ask: it hands the turn to its agent.
+ * The talk under one ask, using the board's message and composer parts.
  */
 export function AskDiscussionRouteScreen({
   route,
@@ -171,8 +170,13 @@ export function AskTalk(props: {
               <MessageView
                 key={message.seq}
                 boardId={entry.boardId}
-                // No discussion feed behind it here: a pick in it is read, not answered.
-                discussionId={null}
+                discussionId={
+                  entry.ask.closedAt === null &&
+                  entry.ask.confirmation?.seq === message.seq &&
+                  entry.ask.confirmation.revision === kanbanAskRevision(entry.ask)
+                    ? message.discussionId
+                    : null
+                }
                 message={messageReadWhole(message, whole[message.seq])}
                 nowMs={props.nowMs}
                 onOpenCard={props.onOpenCard}
@@ -200,11 +204,7 @@ export function AskTalk(props: {
             <Text accessibilityRole="alert" className="px-4 pt-2 text-sm text-danger-foreground">
               {problem}
             </Text>
-          ) : (
-            <Text className="px-4 pt-2 text-2xs text-foreground-muted">
-              Replying doesn't answer the ask.
-            </Text>
-          )}
+          ) : null}
           <Composer
             boardId={entry.boardId}
             discussionId={null}

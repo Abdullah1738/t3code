@@ -1334,8 +1334,7 @@ export function createAskStore(host: AskStoreHost) {
   }
 
   /**
-   * Replies in the ask's discussion. It does not answer the ask: the ask then
-   * waits on its agent, who may reply or rewrite it.
+   * Sends owner words with the revision they were written against.
    */
   async function replyOnAsk(
     entry: KanbanAskFeedItem,
@@ -1345,13 +1344,13 @@ export function createAskStore(host: AskStoreHost) {
     const problem = askReplyProblem(blocks);
     if (problem !== null) throw new Error(problem);
     try {
-      await askApi.reply(entry.cardRef, entry.ask.id, blocks);
+      await askApi.reply(entry.cardRef, entry.ask.id, blocks, kanbanAskRevision(entry.ask));
     } catch (error) {
       noteRefusal(error);
       throw new Error(askFailureText(error), { cause: error });
     }
     showAskToast({
-      text: `Reply sent to ${askAsker(entry)}. ${entry.boardName} #${entry.cardNumber} waits until it answers.`,
+      text: "Sent",
     });
     await refreshAsks();
   }

@@ -8942,6 +8942,13 @@ it.effect("a card follows its subtasks: work, review, the evaluator's step, then
         .pipe(Effect.flip);
       assert.include(verified.detail, "s3");
 
+      yield* kanban.askOwner(
+        card.id,
+        { question: "Deploy?", blocking: false, action: { summary: "Deploy" } },
+        evaluator,
+        "evaluator",
+      );
+      yield* kanban.answerAsk(card.id, "q1", { verdict: "approved", revision: 0 }, owner);
       yield* kanban.markSubtask(card.id, "s3", "done", "deployed", evaluator, "evaluator");
       yield* kanban.markSubtask(card.id, "s4", "skipped", "no reporter", evaluator, "evaluator");
       yield* kanban.dispatchNow;
@@ -10114,7 +10121,7 @@ it.effect("a multi ask posts a tick-several pick and wakes the card with every p
   }),
 );
 
-it.effect("his own words on a blocked pick keep it open, and a pick then wakes the card", () =>
+it.effect("his own words on a blocked pick close it and wake the card", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -10141,13 +10148,12 @@ it.effect("his own words on a blocked pick keep it open, and a pick then wakes t
         owner,
         "Wait for Monday",
       );
-      assert.deepStrictEqual(shown.answers, []);
+      assert.strictEqual(shown.answers[0]?.text, "Wait for Monday");
       const held = (yield* kanban.card(card.id)).card;
-      assert.strictEqual(held.stage, "needs_owner");
-      assert.isNull(held.asks[0]!.closedAt);
-      assert.isDefined(held.asks[0]!.clarifyAskedAt);
+      assert.strictEqual(held.stage, "todo");
+      assert.isNotNull(held.asks[0]!.closedAt);
+      assert.strictEqual(held.asks[0]!.answer?.verdict, "text");
 
-      yield* kanban.answer(talk.id, asked.asks[0]!.seq!, "q1", ["o2"], owner, "Wait for Monday");
       const woken = (yield* kanban.card(card.id)).card;
       assert.strictEqual(woken.stage, "todo");
       assert.include(woken.wakeNote ?? "", "Wait for Monday");
@@ -10178,12 +10184,12 @@ it.effect("his own words on an async pick reach the working thread as a reply", 
       yield* kanban.answer(talk.id, asked.asks[0]!.seq!, "q1", [], owner, "Use 2%");
       const after = (yield* kanban.card(card.id)).card;
       assert.strictEqual(after.stage, "working");
-      assert.isNull(after.asks[0]!.closedAt);
+      assert.isNotNull(after.asks[0]!.closedAt);
+      assert.strictEqual(after.asks[0]!.answer?.verdict, "text");
       const sent = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
       const heard = sent.filter((message) => message.includes("Use 2%"));
       assert.strictEqual(heard.length, 1);
-      assert.include(heard[0]!, "without answering it");
-      assert.include(heard[0]!, "It is not a pick.");
+      assert.notInclude(heard[0]!, "without answering it");
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -10266,7 +10272,7 @@ it.effect("a dropped ask tells its asker; an evaluator's blocking ask goes back 
       assert.isNotNull(dropped.asks[0]!.closedAt);
       assert.strictEqual(dropped.stage, "working");
       const messages = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
-      assert.isTrue(messages.some((text) => text.includes("was dropped by the owner")));
+      assert.isTrue(messages.some((text) => text.includes("Abdullah dropped q1")));
       const gone = yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner").pipe(Effect.flip);
       assert.strictEqual(gone.code, "not-found");
 

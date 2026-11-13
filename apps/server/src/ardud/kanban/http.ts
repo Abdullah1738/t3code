@@ -132,6 +132,7 @@ const CreateCardBody = Schema.Struct({
 const MoveBody = Schema.Struct({ to: KanbanStage, note: Text, question: Text });
 
 const PostBody = Schema.Struct({
+  revision: Schema.optional(Schema.Number),
   text: Text,
   blocks: Schema.optional(Schema.Array(KanbanBlockInput)),
 });
@@ -717,7 +718,9 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           ...(input.blocks ?? []),
         ];
         if (blocks.length === 0) return yield* fail("invalid", "Nothing to post.");
-        return stubMessage(yield* service.replyOnAsk(card.id, askId, OWNER, blocks, "owner"));
+        return stubMessage(
+          yield* service.replyOnAsk(card.id, askId, OWNER, blocks, "owner", input.revision),
+        );
       }),
     );
 

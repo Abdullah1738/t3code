@@ -10,6 +10,134 @@ import {
   type KanbanSubtask,
 } from "@t3tools/contracts";
 
+export const inferGate = (text: string): KanbanSubtask["gate"] => {
+  if (/\b(deploy\w*|install\w*|restart\w*|launchagents?|releases?)\b/i.test(text)) return "deploy";
+  if (
+    /\b(pay(?:ment|ments)?|purchase\w*|charg(?:e|es|ed|ing)|refund\w*|money transfer)\b/i.test(text)
+  )
+    return "money";
+  if (/\b(secrets?|tokens?|keys?)\b/i.test(text)) return "secret";
+  return undefined;
+};
+
+export const isNegativeOption = (label: string): boolean =>
+  /(?:^(?:no\b|not\b|don[’']?t\b|do\s+not\b|reject\b|drop\b|skip\b|leave\b|hold\b|cancel\b|wait\b|stop\b)|\b(?:later|tomorrow|not yet|next week|next month)\b)/i.test(
+    label.trim(),
+  );
+
+const approvalAction = (text: string): string =>
+  text
+    .toLowerCase()
+    .replace(/\b(?:the|a|an)\b/g, "")
+    .trim()
+    .replace(/[.!]+$/, "")
+    .trim()
+    .replace(/^deployment\b/, "deploy")
+    .replace(/^installation\b/, "install")
+    .replace(/^payment\b/, "pay")
+    .replace(/^buy\b/, "purchase")
+    .replace(/^sharing\b/, "share")
+    .replace(/\s+/g, " ");
+
+const harmlessFollowup = (task: string, target: string): boolean => {
+  const text = task
+    .trim()
+    .replace(/[.!]+$/, "")
+    .trim();
+  const suffix =
+    /(?:\s+(?:(?:and(?:\s+then)?|then)\s+)?|\s*,\s*(?:then\s+)?)(?:read back|read-back|verify|check|confirm|test|report back)(?:\s+(?:its version|it|the result))?$/i.exec(
+      text,
+    );
+  if (!suffix) return false;
+  const action = text.slice(0, suffix.index).trimEnd();
+  // Keep the suffix raw: removing articles could turn an extra object ("the test") into a verb.
+  return !/(?:[.!]|\b(?:a|an|the))$/i.test(action) && approvalAction(action) === target;
+};
+
+const approvesGate = (
+  label: string,
+  gate: NonNullable<KanbanSubtask["gate"]>,
+  task: string,
+): boolean => {
+  const words = label
+    .trim()
+    .replace(/[.!]+$/, "")
+    .trim();
+  if (
+    isNegativeOption(words) ||
+    /\b(?:if|unless|after|before|once|when|pending|first|then)\b/i.test(words)
+  )
+    return false;
+  const command = words
+    .replace(/^(?:yes|ok|okay)(?:\s*[,.:;–—-]\s*|\s+)/i, "")
+    .replace(/^(?:(?:please|go ahead and)\s+)+/i, "");
+  if (/^(?:yes|approve|approved|go|go ahead|go for it|ok|okay|do it|proceed)$/i.test(command))
+    return true;
+  const action = command.replace(/^(?:approve|approved|authorize)\s+/i, "");
+  const normalized = approvalAction(action);
+  const target = normalized.replace(/\s+now$/, "");
+  const taskAction = approvalAction(task);
+  if (target === taskAction.replace(/\s+now$/, "")) return true;
+  let verb: RegExp;
+  switch (gate) {
+    case "deploy":
+      verb = /^(?:deploy|install|restart|release)\b/i;
+      break;
+    case "money":
+      verb = /^(?:pay|purchase|buy|charge|refund|transfer)\b/i;
+      break;
+    case "secret":
+      verb = /^(?:share|provide|use|enter|set|rotate|reveal|send|show)\b/i;
+      break;
+  }
+  const operation = action !== command ? normalized : action;
+  const matched = verb.exec(operation)?.[0];
+  if (!matched) return false;
+  const suffix = taskAction.startsWith(target) ? taskAction.slice(target.length) : null;
+  if (suffix !== null && action === command && normalized === target)
+    return harmlessFollowup(task, target);
+  return (
+    /^(?:\s+(?:it|this|that|these|those))?(?:\s+now)?$/i.test(operation.slice(matched.length)) ||
+    (suffix !== null && harmlessFollowup(task, target))
+  );
+};
+
+/** Legacy plans have no timestamps: their card's creation is the earliest safe bound. */
+export const approvalProblem = (
+  card: Pick<KanbanCard, "number" | "asks" | "createdAt">,
+  subtask: KanbanSubtask,
+): string | null => {
+  const gate = subtask.gate ?? inferGate(subtask.text);
+  if (gate === undefined) return null;
+  const since = subtask.createdAt ?? card.createdAt;
+  const decisions = card.asks
+    .filter((ask) => {
+      const answer = ask.answer;
+      if (!ask.closedAt || !answer || answer.at < since) return false;
+      if (answer.verdict === "dropped") return true;
+      if (answer.by._tag !== "owner" || (ask.revisedAt ?? ask.at) < since) return false;
+      if (ask.draft) return false;
+      return (
+        inferGate(`${ask.text} ${ask.title ?? ""} ${ask.action?.summary ?? ""}`) === gate ||
+        (ask.text.match(/\bs\d+\b/g) ?? []).some((id) => id === subtask.id)
+      );
+    })
+    .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at));
+  const latest = decisions.at(-1);
+  const answer = latest?.answer;
+  const approved =
+    answer?.verdict === "approved" ||
+    (answer?.verdict === "picked" &&
+      Boolean(answer.optionIds?.length) &&
+      answer.optionIds!.every((id) => {
+        const option = latest?.options?.find((entry) => entry.id === id);
+        return option !== undefined && approvesGate(option.label, gate, subtask.text);
+      }));
+  return approved
+    ? null
+    : `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's approval after it was created; a dropped ask is not approval`;
+};
+
 export const MAX_SUBTASKS = 30;
 export const MAX_TEXT = 500;
 
@@ -20,6 +148,7 @@ export interface SubtaskInput {
   readonly step?: number | undefined;
   readonly text: string;
   readonly owner: KanbanSubtask["owner"];
+  readonly gate?: KanbanSubtask["gate"];
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   readonly script?: string | undefined;
 }
@@ -70,6 +199,7 @@ export function planSubtasks(
   existing: ReadonlyArray<KanbanSubtask>,
   inputs: ReadonlyArray<SubtaskInput>,
   seq = 0,
+  at?: string,
 ): SubtaskPlan {
   const byId = new Map(existing.map((subtask) => [subtask.id, subtask]));
   // Cards saved before the counter existed start from the highest id still on them.
@@ -105,14 +235,32 @@ export function planSubtasks(
       if (listed.has(id)) return { ok: false, reason: `subtask ${id} is listed twice` };
       listed.add(id);
       const { script: _old, ...rest } = known;
-      planned.push({ ...rest, step, text, owner: input.owner, ...(script ? { script } : {}) });
+      const gate = known.gate ?? inferGate(known.text) ?? input.gate ?? inferGate(text);
+      planned.push({
+        ...rest,
+        step,
+        text,
+        owner: input.owner,
+        ...(gate === undefined ? {} : { gate }),
+        ...((text !== known.text ||
+          script !== known.script ||
+          !(known.gate ?? inferGate(known.text))) &&
+        (input.gate ?? inferGate(text) ?? known.gate ?? inferGate(known.text)) &&
+        at
+          ? { createdAt: at }
+          : {}),
+        ...(script ? { script } : {}),
+      });
     } else {
       nextId += 1;
+      const gate = input.gate ?? inferGate(text);
       planned.push({
         id: `s${nextId}`,
         step,
         text,
         owner: input.owner,
+        ...(gate === undefined ? {} : { gate }),
+        ...(at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),
         state: "open",
         note: null,

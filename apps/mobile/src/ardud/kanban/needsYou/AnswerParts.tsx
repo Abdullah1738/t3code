@@ -2,12 +2,7 @@
  * The parts of an answer, drawn from what the ask takes back
  * (`kanbanAskResponse`), never from its kind.
  */
-import {
-  askRefusal,
-  askWordsForReply,
-  type AskForm,
-  type AskProblemKey,
-} from "@t3tools/client-runtime/ardud/kanban";
+import { askRefusal, type AskForm, type AskProblemKey } from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanAskFeedItem, KanbanAskResponse, KanbanAskTaskStep } from "@t3tools/contracts";
 import { type ReactNode, useState } from "react";
 import { Pressable, View } from "react-native";
@@ -188,12 +183,6 @@ export function OptionList(props: {
                   onChangeText={(ownWords) => asks.patchAskForm(entry, { ownWords })}
                   className="bg-screen"
                 />
-                {askWordsForReply(entry.ask, form) !== null ? (
-                  <Text className="text-2xs text-foreground-muted">
-                    Words alone don't answer this one. They go to the agent as a reply and the ask
-                    stays open.
-                  </Text>
-                ) : null}
               </View>
             ) : null}
           </OptionRow>

@@ -1,3 +1,4 @@
+import { classifyReply } from "./ownerReplies.ts";
 import { EVALUATOR_LIMITS, matchingCards, requestThreadIds } from "./evaluatorAdmission.ts";
 import * as NodeUtil from "node:util";
 // @effect-diagnostics nodeBuiltinImport:off - record ids only need a random UUID.
@@ -13,7 +14,6 @@ import {
   kanbanAskExpired,
   kanbanAskIsFreeText,
   kanbanAskRevision,
-  kanbanAskTakesWords,
   kanbanNeedsOwner,
   kanbanOpenAsks,
   kanbanStepSubtasks,
@@ -530,9 +530,8 @@ export interface KanbanServiceShape {
     KanbanError
   >;
   /**
-   * A message in one ask's discussion. From the owner it does not answer the
-   * ask: the ask waits on its asker, who is woken to reply or fix the ask.
-   * From an agent it gives the owner the turn back. The ask stays open.
+   * Owner words answer this ask; ambiguous choices wait for confirmation.
+   * An agent reply gives the owner the turn back without closing the ask.
    */
   readonly replyOnAsk: (
     cardId: KanbanCard["id"],
@@ -540,6 +539,7 @@ export interface KanbanServiceShape {
     actor: KanbanActor,
     blocks: ReadonlyArray<KanbanBlock>,
     role: Rules.MoveRole,
+    revision?: number,
   ) => Effect.Effect<KanbanMessage, KanbanError>;
   /**
    * The owner hands one ask to the evaluator or takes it back; an evaluator
@@ -1340,6 +1340,9 @@ const tickKicks = Context.Reference<TickKicks | undefined>("KanbanTickKicks", {
  * The asks a durable owner route answers, fixed by its first attempt. Routing
  * closes only these, so a retry never answers an ask opened after the message.
  */
+const ownerAnswerAt = Context.Reference<string | undefined>("KanbanOwnerAnswerAt", {
+  defaultValue: () => undefined,
+});
 const ownerRouteAsks = Context.Reference<ReadonlySet<string> | undefined>("KanbanOwnerRouteAsks", {
   defaultValue: () => undefined,
 });
@@ -4538,8 +4541,19 @@ const make = Effect.gen(function* () {
           card,
           Rules.chainFor(yield* boardOf(card.boardId), card)?.steps.length ?? 1,
         );
+      const gated = next.subtasks.some(
+        (subtask) =>
+          (subtask.gate ?? Subtasks.inferGate(subtask.text)) !== undefined &&
+          (subtask.state === "open" || Subtasks.approvalProblem(next, subtask) !== null),
+      );
       const stage =
-        back === "working" ? "todo" : back === "in_review" && !reviewed ? "needs_review" : back;
+        back === "verified" && gated
+          ? "completed"
+          : back === "working"
+            ? "todo"
+            : back === "in_review" && !reviewed
+              ? "needs_review"
+              : back;
       const workThread = card.workThreadId;
       const wake =
         workThread !== null &&
@@ -4690,6 +4704,120 @@ const make = Effect.gen(function* () {
    * asks are answered, and the live thread hears it only when nobody did. A
    * script post never sends a waiting card back to work.
    */
+  const recordOwnerReply: (
+    card: KanbanCard,
+    ask: KanbanOwnerAsk,
+    words: string,
+    source?: {
+      readonly at: string;
+      readonly seq: number;
+      readonly revision?: number | undefined;
+      readonly input?: Asks.AskAnswerInput;
+    },
+  ) => ReturnType<KanbanServiceShape["answerAsk"]> = Effect.fn("KanbanService.recordOwnerReply")(
+    function* (
+      card: KanbanCard,
+      ask: KanbanOwnerAsk,
+      words: string,
+      source?: {
+        readonly at: string;
+        readonly seq: number;
+        readonly revision?: number | undefined;
+        readonly input?: Asks.AskAnswerInput;
+      },
+    ) {
+      if (source && ask.revisedAt && source.at < ask.revisedAt)
+        return yield* failWith(
+          "conflict",
+          `${ask.id} changed after this reply was written; answer its current revision`,
+        );
+      const valid = Asks.answerFor(
+        card,
+        ask,
+        {
+          ...source?.input,
+          verdict: "text",
+          text: words,
+          revision: source?.revision ?? (kanbanAskRevision(ask) === 0 ? 0 : undefined),
+        },
+        { _tag: "owner" },
+        yield* nowIso,
+      );
+      if (Asks.isAskProblem(valid)) return yield* failAnswer(valid);
+      const classification = classifyReply(ask, words);
+      if ("candidates" in classification) {
+        const discussion = yield* cardDiscussionUnlocked(card.id);
+        if (
+          source &&
+          ask.confirmation !== undefined &&
+          ask.confirmation.revision === kanbanAskRevision(ask) &&
+          ask.confirmation.note === valid.note &&
+          NodeUtil.isDeepStrictEqual(ask.confirmation.values, valid.values) &&
+          ask.confirmation.finalDraft === valid.finalDraft
+        ) {
+          const shown = yield* store.message(discussion.id, ask.confirmation.seq);
+          if (
+            shown?.blocks.some(
+              (block) =>
+                block._tag === "choice" && block.question === `“${words}” — which did you mean?`,
+            )
+          )
+            return { card, heard: false };
+        }
+        const confirmation = yield* postUnlocked(
+          discussion.id,
+          ask.by,
+          [
+            {
+              _tag: "choice",
+              id: ask.id,
+              style: "pick",
+              multi: false,
+              question: `“${words}” — which did you mean?`,
+              options: classification.candidates.map(({ id, label }) => ({ id, label })),
+            },
+          ],
+          false,
+          false,
+          false,
+          ask.id,
+        );
+        const fresh = yield* cardOf(card.id);
+        const next = {
+          ...Asks.clearClarify(
+            Asks.updateAsk(fresh, ask.id, {
+              confirmation: {
+                seq: confirmation.seq,
+                revision: kanbanAskRevision(ask),
+                sourceSeq: source?.seq ?? confirmation.seq,
+                text: words,
+                ...(valid.note ? { note: valid.note } : {}),
+                ...(valid.values ? { values: valid.values } : {}),
+                ...(valid.finalDraft ? { finalDraft: valid.finalDraft } : {}),
+              },
+            }),
+            ask.id,
+          ),
+          updatedAt: confirmation.createdAt,
+        };
+        yield* saveCard(next);
+        return { card: next, heard: false };
+      }
+      // A reply may decide the question while leaving required structured fields unfilled.
+      // Keep those words as text; only a complete checked answer can authorize a gate.
+      const input = { ...source?.input, ...classification.answer };
+      const checked = Asks.answerFor(card, ask, input, { _tag: "owner" }, yield* nowIso);
+      const answer =
+        Asks.isAskProblem(checked) && checked.code === "invalid"
+          ? { ...input, verdict: "text" }
+          : input;
+      return yield* answerAskUnlocked(card.id, ask.id, answer, { _tag: "owner" }).pipe(
+        Effect.provideService(ownerAnswerAt, source?.at),
+      );
+    },
+    Effect.mapError(toKanbanError),
+  );
+
   const routeToOwnerAgent = Effect.fn("KanbanService.routeToOwnerAgent")(function* (
     discussion: KanbanDiscussion,
     text: string,
@@ -4697,6 +4825,8 @@ const make = Effect.gen(function* () {
     pick?: (ask: KanbanOwnerAsk) => boolean,
     /** When the owner wrote it: asks raised later are not what he replied to. */
     asOf?: string,
+    words?: string,
+    sourceSeq?: number,
   ) {
     let current = discussion;
     if (current.cardId !== null) {
@@ -4705,67 +4835,30 @@ const make = Effect.gen(function* () {
       if (from === "owner" && kanbanNeedsOwner(card)) {
         const frozen = yield* ownerRouteAsks;
         const nowMs = yield* nowMillis;
-        // Words answer only asks that take words alone. One with a verdict, a pick,
-        // fields, a draft or a task is answered through the ask, where it is checked.
-        const which = (ask: KanbanOwnerAsk) =>
-          (pick === undefined || pick(ask)) &&
-          (frozen === undefined || frozen.has(ask.id)) &&
-          Asks.takesReply(ask, nowMs);
-        const left = kanbanOpenAsks(card).filter(
+        const eligible = kanbanOpenAsks(card).filter(
           (ask) =>
             (pick === undefined || pick(ask)) &&
-            !Asks.takesReply(ask, nowMs) &&
-            // One asked after he wrote this was never what he replied to.
-            (asOf === undefined || ask.at <= asOf),
+            (frozen === undefined || frozen.has(ask.id)) &&
+            (asOf === undefined || ask.at <= asOf) &&
+            !kanbanAskExpired(ask, nowMs),
         );
-        // Whoever hears his words is told they did not answer those asks.
-        if (left.length > 0) text = `${text}\n\n${Asks.wordsOnlyNote(card, left, nowMs)}`;
-        const result = yield* answerAsks(current, card, text, which).pipe(
-          Effect.provideService(collapseEvaluatorReplies, pick === undefined),
-        );
+        if (words !== undefined && eligible.length === 1 && !kanbanAskIsFreeText(eligible[0]!)) {
+          yield* recordOwnerReply(card, eligible[0]!, words, {
+            at: asOf ?? (yield* nowIso),
+            seq: sourceSeq ?? 1,
+            revision: kanbanAskRevision(eligible[0]!),
+          }).pipe(Effect.provideService(collapseEvaluatorReplies, pick === undefined));
+          return;
+        }
+        // Unscoped discussion text cannot choose between several independent asks.
+        const result = yield* answerAsks(
+          current,
+          card,
+          text,
+          (ask) => eligible.some((entry) => entry.id === ask.id) && Asks.takesReply(ask, nowMs),
+        ).pipe(Effect.provideService(collapseEvaluatorReplies, pick === undefined));
         ({ told, discussion: current } = result);
-        // Delivery releases the gate: another answer or edit can have changed this card.
         card = yield* cardOf(card.id);
-        const remaining = kanbanOpenAsks(card).filter(
-          (ask) => left.some((before) => before.id === ask.id) && !Asks.takesReply(ask, nowMs),
-        );
-        // They stay open and wait on their askers, as after a reply on the ask itself.
-        const at = yield* nowIso;
-        const waiting = remaining
-          .filter((ask) => !kanbanAskExpired(ask, nowMs))
-          .reduce((next, ask) => Asks.markClarify(next, ask.id, at), card);
-        if (waiting !== card) {
-          card = { ...waiting, updatedAt: at };
-          yield* saveCard(card);
-        }
-        // Each one's asker hears it: itself when live, else the discussion's evaluator.
-        const evaluatorOwner = pick === undefined ? yield* reusableEvaluator(card) : null;
-        for (const ask of remaining) {
-          if (pick === undefined && ask.by._tag === "evaluator" && !evaluatorOwner) {
-            if (current.evaluatorThreadId !== null && told.has(current.evaluatorThreadId)) continue;
-            current = yield* toEvaluator(current, text);
-            if (current.evaluatorThreadId !== null) told.add(current.evaluatorThreadId);
-            continue;
-          }
-          const by =
-            ask.by._tag === "evaluator" && evaluatorOwner
-              ? { _tag: "evaluator" as const, threadId: evaluatorOwner }
-              : ask.by;
-          const live =
-            by._tag === "thread"
-              ? by.threadId === card.activeThreadId
-              : by._tag === "evaluator" && (yield* liveEvaluator(by.threadId));
-          if (live && (by._tag === "thread" || by._tag === "evaluator")) {
-            if (told.has(by.threadId)) continue;
-            const name =
-              by._tag === "evaluator" ? "Evaluator" : roleName(card.activeRole ?? "work");
-            current = yield* deliver(current, by, name, by.threadId, text);
-            told.add(by.threadId);
-          } else if (current.evaluatorThreadId === null || !told.has(current.evaluatorThreadId)) {
-            current = yield* toEvaluator(current, text);
-            if (current.evaluatorThreadId !== null) told.add(current.evaluatorThreadId);
-          }
-        }
       }
       if (pick && told.size > 0) return;
       if (card.activeThreadId !== null && card.activeRole !== null) {
@@ -4955,8 +5048,7 @@ const make = Effect.gen(function* () {
           ? [specific]
           : []
         : card
-          ? // A reply in words answers only the asks that take words alone.
-            kanbanOpenAsks(card).filter((ask) => Asks.takesReply(ask, nowMs))
+          ? kanbanOpenAsks(card).filter((ask) => !kanbanAskExpired(ask, nowMs))
           : [];
     const needsOwner = recorded ? recorded.needsOwner : card?.stage === "needs_owner";
     if (row !== undefined && recorded === null) {
@@ -5039,6 +5131,8 @@ const make = Effect.gen(function* () {
             "owner",
             undefined,
             message.createdAt,
+            blocksText(message.blocks, attachments.pathOf),
+            message.seq,
           );
         }),
         undefined,
@@ -5789,7 +5883,14 @@ const make = Effect.gen(function* () {
       return message;
     }
     if (author._tag === "owner") {
-      yield* routeToOwnerAgent(posted, Briefs.ownerMessageText(posted.title, posted.id, text));
+      yield* routeToOwnerAgent(
+        posted,
+        Briefs.ownerMessageText(posted.title, posted.id, text),
+        "owner",
+        undefined,
+        message.createdAt,
+        text,
+      );
     } else if (author._tag === "script") {
       yield* routeToOwnerAgent(
         posted,
@@ -10041,7 +10142,7 @@ const make = Effect.gen(function* () {
     const at = yield* nowIso;
     const stage = input.stage ?? "todo";
     const models = input.models ? yield* cardModels(boardId, input.models) : [];
-    const plan = Subtasks.planSubtasks([], input.subtasks ?? []);
+    const plan = Subtasks.planSubtasks([], input.subtasks ?? [], 0, at);
     if (!plan.ok) return yield* failWith("invalid", plan.reason);
     yield* checkScriptNames(boardId, plan.subtasks);
     return {
@@ -10508,10 +10609,18 @@ const make = Effect.gen(function* () {
             ? yield* poolModel(card.boardId, patch.model)
             : card.model;
         const plan = patch.subtasks
-          ? Subtasks.planSubtasks(card.subtasks, patch.subtasks, card.subtaskSeq)
+          ? Subtasks.planSubtasks(card.subtasks, patch.subtasks, card.subtaskSeq, at)
           : null;
         if (plan && !plan.ok) return yield* failWith("invalid", plan.reason);
-        if (plan?.ok) yield* checkScriptNames(card.boardId, plan.subtasks);
+        if (plan?.ok) {
+          for (const subtask of card.subtasks) {
+            if (subtask.state !== "open" || plan.subtasks.some((entry) => entry.id === subtask.id))
+              continue;
+            const missing = Subtasks.approvalProblem(card, subtask);
+            if (actor._tag !== "owner" && missing) return yield* failWith("denied", missing);
+          }
+          yield* checkScriptNames(card.boardId, plan.subtasks);
+        }
         const removeUrls = (patch.removeLinks ?? []).map((url) => url.trim());
         for (const url of removeUrls) {
           if (!card.links.some((link) => link.url === url))
@@ -10727,6 +10836,10 @@ const make = Effect.gen(function* () {
           }
         }
         if (to === "verified" && role !== "owner") {
+          for (const subtask of card.subtasks) {
+            const missing = Subtasks.approvalProblem(card, subtask);
+            if (missing) return yield* failWith("denied", missing);
+          }
           const open = card.subtasks.filter((subtask) => subtask.state === "open");
           if (open.length > 0) {
             return yield* failWith(
@@ -11130,7 +11243,7 @@ const make = Effect.gen(function* () {
   /** The one place an ask is answered: by the answer route, a tool, or a pick on its message. */
   const answerAskUnlocked = (
     ...[cardId, askId, input, actor, secrets]: Parameters<KanbanServiceShape["answerAsk"]>
-  ) =>
+  ): ReturnType<KanbanServiceShape["answerAsk"]> =>
     // Suspended only to keep the body where it was: it is `answerAsk` as before.
     Effect.suspend(() =>
       Effect.gen(function* () {
@@ -11139,6 +11252,29 @@ const make = Effect.gen(function* () {
         const ask = card.asks.find((entry) => entry.id === askId);
         if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
         const byOwner = actor._tag === "owner";
+        if (
+          byOwner &&
+          input.verdict === "answered" &&
+          input.text?.trim() &&
+          Asks.pickOptions(ask).length > 0 &&
+          Object.keys(secrets ?? {}).length === 0
+        ) {
+          // Check the revision and expiry before classifying words against today's options.
+          const checked = Asks.answerFor(
+            card,
+            ask,
+            { ...input, verdict: "text" },
+            actor,
+            yield* nowIso,
+          );
+          if (Asks.isAskProblem(checked)) return yield* failAnswer(checked);
+          return yield* recordOwnerReply(card, ask, input.text, {
+            at: yield* nowIso,
+            seq: 1,
+            revision: input.revision,
+            input,
+          });
+        }
         if (!byOwner && ask.handedAt === undefined) {
           return yield* failWith(
             "denied",
@@ -11157,6 +11293,9 @@ const make = Effect.gen(function* () {
         if (Asks.isAskProblem(checked)) return yield* failAnswer(checked);
         // The files he gave are kept before the card changes: one that can't be refuses the answer.
         let answer = checked;
+        const originalAt = yield* ownerAnswerAt;
+        if (originalAt !== undefined)
+          answer = { ...answer, at: originalAt as KanbanAskAnswer["at"] };
         const given = Asks.answerFiles(ask, checked);
         if (given.length > 0) {
           const claim = yield* attachments.claim(
@@ -11177,9 +11316,28 @@ const make = Effect.gen(function* () {
           answer = { ...checked, values: values as NonNullable<KanbanAskAnswer["values"]> };
         }
         const discussion = yield* cardDiscussionUnlocked(card.id);
-        // The ask's pick block shows the answer to clients that only read the discussion.
-        const asked = ask.seq === null ? null : yield* store.message(discussion.id, ask.seq);
-        if (asked?.blocks.some((block) => block._tag === "choice" && block.id === ask.id)) {
+        // Both the ask and its current confirmation show the same recorded decision.
+        const answerSeqs = new Set([
+          ask.seq,
+          ask.confirmation?.revision === kanbanAskRevision(ask) ? ask.confirmation.seq : null,
+        ]);
+        for (const seq of answerSeqs) {
+          if (seq === null || seq === undefined) continue;
+          const asked = yield* store.message(discussion.id, seq);
+          const block = asked?.blocks.find(
+            (entry): entry is Extract<KanbanBlock, { _tag: "choice" }> =>
+              entry._tag === "choice" && entry.id === ask.id,
+          );
+          if (!asked || !block) continue;
+          let display = Asks.blockAnswer(ask, answer);
+          if (display.choice.some((id) => !block.options.some((option) => option.id === id))) {
+            // The form can choose outside the confirmation's candidates; keep that decision visible.
+            const labels = Asks.pickOptions(ask)
+              .filter((option) => display.choice.includes(option.id))
+              .map((option) => option.label)
+              .join(", ");
+            display = { ...display, text: [labels, display.text].filter(Boolean).join("\n\n") };
+          }
           const key = actorKey(actor);
           const shown: KanbanMessage = {
             ...asked,
@@ -11187,7 +11345,7 @@ const make = Effect.gen(function* () {
               ...asked.answers.filter(
                 (entry) => !(entry.blockId === ask.id && actorKey(entry.by) === key),
               ),
-              { blockId: ask.id, by: actor, ...Asks.blockAnswer(ask, answer), at: answer.at },
+              { blockId: ask.id, by: actor, ...display, at: answer.at },
             ],
           };
           yield* store.putMessage(shown);
@@ -11223,13 +11381,19 @@ const make = Effect.gen(function* () {
             [...result.told].some((threadId) => threadId !== self),
         };
       }),
-    );
+    ).pipe(Effect.mapError(toKanbanError));
 
-  const replyOnAsk: KanbanServiceShape["replyOnAsk"] = (cardId, askId, actor, blocks, role) =>
-    guardDeferred(replyOnAskUnlocked(cardId, askId, actor, blocks, role));
+  const replyOnAsk: KanbanServiceShape["replyOnAsk"] = (
+    cardId,
+    askId,
+    actor,
+    blocks,
+    role,
+    revision,
+  ) => guardDeferred(replyOnAskUnlocked(cardId, askId, actor, blocks, role, revision));
   /** A reply on an ask: from its route or tool, or his words typed on its pick block. */
   const replyOnAskUnlocked = (
-    ...[cardId, askId, actor, blocks, role]: Parameters<KanbanServiceShape["replyOnAsk"]>
+    ...[cardId, askId, actor, blocks, role, revision]: Parameters<KanbanServiceShape["replyOnAsk"]>
   ) =>
     // Suspended only to keep the body where it was: it is `replyOnAsk` as before.
     Effect.suspend(() =>
@@ -11262,53 +11426,12 @@ const make = Effect.gen(function* () {
           if (next !== fresh) yield* saveCard({ ...next, updatedAt: message.createdAt });
           return message;
         }
-        const next: KanbanCard = {
-          ...Asks.markClarify(fresh, ask.id, message.createdAt),
-          updatedAt: message.createdAt,
-        };
-        yield* saveCard(next);
         const said = blocksText(message.blocks, attachments.pathOf);
-        const current = yield* discussionOf(discussion.id);
-        const by = ask.by;
-        const live =
-          by._tag === "thread"
-            ? by.threadId === next.activeThreadId
-            : by._tag === "evaluator" && (yield* liveEvaluator(by.threadId));
-        // A live asker hears it itself; a parked or ended one is the evaluator's to handle.
-        // Either way the send is a follow-on of this write (see `later`), never made under it.
-        if (live && (by._tag === "thread" || by._tag === "evaluator")) {
-          const name = by._tag === "evaluator" ? "Evaluator" : roleName(next.activeRole ?? "work");
-          const text = Asks.clarifyText(next, ask, said, false);
-          const sink = yield* effectSink;
-          if (sink === undefined || sink.closed) {
-            yield* deliver(current, by, name, by.threadId, text);
-          } else {
-            // What `deliver` records about the asker is board state, so it is written here.
-            yield* saveDiscussion(
-              withParticipant(current, by, name, {
-                lastReadSeq: current.lastSeq,
-                typingUntil: yield* typingUntil,
-                owes: "asked",
-              }),
-            );
-            yield* later(
-              next.boardId,
-              current.id,
-              by._tag === "evaluator"
-                ? { kind: "tellEvaluator", threadId: by.threadId, text }
-                : { kind: "send", threadId: by.threadId, text },
-              Effect.void,
-            );
-          }
-        } else {
-          const text = Asks.clarifyText(next, ask, said, true);
-          yield* later(
-            next.boardId,
-            current.id,
-            { kind: "toEvaluator", discussionId: current.id, text, note: false },
-            toEvaluator(current, text),
-          );
-        }
+        yield* recordOwnerReply(fresh, ask, said, {
+          at: message.createdAt,
+          seq: message.seq,
+          revision,
+        });
         return message;
       }),
     );
@@ -11811,6 +11934,9 @@ const make = Effect.gen(function* () {
         const scriptName = role === "script" ? (yield* scriptFor(card, actor)).name : null;
         const check = Subtasks.checkMark(card, subtaskId, state, role, note, scriptName);
         if (!check.ok) return yield* failWith("denied", check.reason);
+        const gated = card.subtasks.find((subtask) => subtask.id === subtaskId);
+        const missing = gated && state !== "open" ? Subtasks.approvalProblem(card, gated) : null;
+        if (actor._tag !== "owner" && missing) return yield* failWith("denied", missing);
         const at = yield* nowIso;
         const subtasks = Subtasks.markSubtask(card.subtasks, subtaskId, state, note, actor, at);
         const marked = (yield* upgradeFindings([
@@ -12050,6 +12176,12 @@ const make = Effect.gen(function* () {
           // The last review step passing ticks off the step's review subtasks. If
           // the plan then has more work, the card goes back to its worker.
           const passed = verdict === "clear" && !outcome.continueReview;
+          if (passed) {
+            for (const subtask of kanbanStepSubtasks(card, "review")) {
+              const missing = Subtasks.approvalProblem(card, subtask);
+              if (missing) return yield* failWith("denied", missing);
+            }
+          }
           const subtasks = passed
             ? Subtasks.passReview(card, { _tag: "thread", threadId }, at)
             : card.subtasks;
@@ -12781,7 +12913,16 @@ const make = Effect.gen(function* () {
     const message = yield* store.message(discussionId, seq);
     // An ask's messages carry its id; the first of one asked before that is known by its seq.
     const own = message?.askId === ask.id || ask.seq === seq || ask.firstSeq === seq;
-    return own ? { card, ask, stale: ask.seq !== seq } : null;
+    const confirmation = ask.confirmation?.seq === seq;
+    return own
+      ? {
+          card,
+          ask,
+          stale: confirmation
+            ? ask.confirmation?.revision !== kanbanAskRevision(ask)
+            : ask.seq !== seq,
+        }
+      : null;
   });
 
   const answer: KanbanServiceShape["answer"] = (discussionId, seq, blockId, choice, by, text) =>
@@ -12799,7 +12940,14 @@ const make = Effect.gen(function* () {
                 revision: kanbanAskRevision(pick.ask),
               });
             }
-            // A closed ask's late pick, and an ask that takes words alone, go the way a reply does.
+            if (pick.ask.closedAt !== null && pick.ask.confirmation !== undefined) {
+              return failAnswer({
+                code: "conflict",
+                detail: `${ref} is closed. Its recorded answer cannot be changed by another pick.`,
+                revision: kanbanAskRevision(pick.ask),
+              });
+            }
+            // Older asks without confirmations retain their late discussion-reply route.
             if (pick.ask.closedAt !== null || kanbanAskIsFreeText(pick.ask)) {
               return answerChoice(discussionId, seq, blockId, choice, by, text);
             }
@@ -12811,9 +12959,8 @@ const make = Effect.gen(function* () {
                   found ? Effect.succeed(found) : failWith("not-found", `message ${seq}`),
                 ),
               );
-            // Words with no pick, on an ask that needs a verdict or a pick: they are a reply
-            // on the ask. It stays open and its asker is told they decided nothing.
-            if (choice.length === 0 && words !== "" && !kanbanAskTakesWords(pick.ask)) {
+            // Typed replies share the classifier used by the reply route.
+            if (choice.length === 0 && words !== "") {
               return guardDeferred(
                 replyOnAskUnlocked(
                   pick.card.id,
@@ -12821,6 +12968,7 @@ const make = Effect.gen(function* () {
                   by,
                   [{ _tag: "md", text: words }],
                   "owner",
+                  kanbanAskRevision(pick.ask),
                 ).pipe(Effect.andThen(message)),
               );
             }
@@ -12829,7 +12977,17 @@ const make = Effect.gen(function* () {
               answerAskUnlocked(
                 pick.card.id,
                 pick.ask.id,
-                Asks.pickAnswer(pick.ask, choice, words),
+                {
+                  ...(pick.ask.confirmation?.seq === seq
+                    ? {
+                        text: pick.ask.confirmation.text,
+                        note: pick.ask.confirmation.note,
+                        values: pick.ask.confirmation.values,
+                        finalDraft: pick.ask.confirmation.finalDraft,
+                      }
+                    : {}),
+                  ...Asks.pickAnswer(pick.ask, choice, words),
+                },
                 by,
               ).pipe(Effect.andThen(message)),
             );

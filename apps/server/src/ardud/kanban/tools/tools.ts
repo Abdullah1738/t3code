@@ -116,6 +116,7 @@ const SubtasksInput = describe(
         Schema.Literals(["work", "review", "evaluator", "script"]),
         "Who does it: the worker, the reviewer (ticked when the review passes), an evaluator, or a board script (the script ticks it from its output; the evaluator hears about it only if the script hands it back).",
       ),
+      gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
       script: Schema.optional(
         describe(
           TrimmedNonEmptyString,

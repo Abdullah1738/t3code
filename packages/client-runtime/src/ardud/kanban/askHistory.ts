@@ -19,11 +19,20 @@ type Talk = Pick<KanbanAskFeedItem, "ask" | "messages">;
  * something said about it. The server marks these with the revision they show;
  * messages stored before it did are told by their place and their pick block.
  */
-const isAskVersion = (ask: KanbanOwnerAsk, message: KanbanMessage): boolean =>
-  message.askRevision !== undefined ||
-  message.seq === ask.seq ||
-  message.seq === ask.firstSeq ||
-  message.blocks.some((block) => block._tag === "choice" && block.id === ask.id);
+const isAskVersion = (ask: KanbanOwnerAsk, message: KanbanMessage): boolean => {
+  if (
+    ask.closedAt === null &&
+    ask.confirmation?.seq === message.seq &&
+    ask.confirmation.revision === kanbanAskRevision(ask)
+  )
+    return false;
+  return (
+    message.askRevision !== undefined ||
+    message.seq === ask.seq ||
+    message.seq === ask.firstSeq ||
+    message.blocks.some((block) => block._tag === "choice" && block.id === ask.id)
+  );
+};
 
 /** The messages posted on an ask, without the message that asked it or its rewrites. */
 export function askDiscussion(entry: Talk): ReadonlyArray<KanbanMessage> {
@@ -144,6 +153,7 @@ const VERDICT_LABELS: Readonly<Record<string, string>> = {
   rejected: "Rejected",
   picked: "Picked",
   answered: "Answer sent",
+  text: "Answer sent",
   done: "Done",
   cant: "Couldn't",
   acknowledged: "Seen",
