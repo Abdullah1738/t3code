@@ -347,14 +347,14 @@ function steering(backend: Backend, behavior?: (call: Steer) => Promise<SteerDel
   return steers;
 }
 
-test("a text sent mid-turn is steered into the running turn, never re-sent, and the turn still replies", async () => {
+test.each(["Also check the weather", "/ defrosted", "/frobnicate", "/Users/ardud/x.txt"])("a text sent mid-turn is steered once and the turn still replies: %s", async text => {
   const h = setup();
   const steers = steering(h.backend);
   h.input("in_1", "First question");
   await h.router.tick();
-  h.input("in_2", "Also check the weather");
+  h.input("in_2", text);
   await h.router.tick();
-  expect(steers).toEqual([{ id: "ses_1", messageId: messageId("in_2"), text: "Also check the weather", guidance: expect.stringContaining("\"in_2\"") }]);
+  expect(steers).toEqual([{ id: "ses_1", messageId: messageId("in_2"), text, guidance: expect.stringContaining("\"in_2\"") }]);
   expect(h.store.pendingInbound().map(row => row.id)).toEqual([]);
   expect(h.store.get<{ steered?: string[] }>("activeTurn")!.steered).toEqual([messageId("in_2")]);
   const final = h.backend.final("Both answered");
@@ -1227,13 +1227,13 @@ test("/new retires in-flight work, cancels only preceding queue entries, and pre
   expect(h.conversations().map(op => [op.text, op.generation])).toEqual([["New answer", 2]]);
 });
 
-test("/new does not submit preceding pending questions or abort an idle chat", async () => {
+test.each(["/new", "/New"])("%s does not submit preceding pending questions or abort an idle chat", async command => {
   const h = setup();
   h.input("before", "Do not submit");
-  h.input("new", "/new");
+  h.input("new", command);
   await h.router.tick();
   expect(h.backend.prompts).toEqual([]);
-  h.input("new2", "/new");
+  h.input("new2", command);
   await h.router.tick();
   expect(h.backend.creates).toHaveLength(2);
   expect(h.backend.aborts).toEqual([]);
@@ -1731,6 +1731,8 @@ test.each([
   { text: "b", overrides: { custom: false }, answer: "B" },
   { text: "2", overrides: { custom: false }, answer: "B" },
   { text: "My own answer", overrides: { custom: true }, answer: "My own answer" },
+  { text: "/ defrosted", overrides: { custom: true }, answer: "/ defrosted" },
+  { text: "/Users/ardud/x.txt", overrides: { custom: true }, answer: "/Users/ardud/x.txt" },
   { text: "Default custom", overrides: {}, answer: "Default custom" },
   { text: "42", overrides: { options: [] }, answer: "42" },
   { text: "A", overrides: { multiple: true, custom: false }, answer: "A" },
@@ -2599,7 +2601,11 @@ const preparationArrivals: { text: string; interrupts: boolean; poll?: Normalize
   { text: "/status", interrupts: true },
   { text: "/approve missing yes", interrupts: true },
   { text: "/answer missing [[]]", interrupts: true },
-  { text: "/unknown", interrupts: true },
+  { text: "/new extra words", interrupts: true },
+  { text: "/status x", interrupts: true },
+  { text: "/unknown", interrupts: false },
+  { text: "/ defrosted", interrupts: false },
+  { text: "/Users/ardud/x.txt", interrupts: false },
   { text: "", interrupts: true, poll: { guid: "poll", optionIdentifier: "a", optionText: "A", vote: "voted", operationId: "request:retired" } },
   { text: "/notification missing Explain", interrupts: false },
   { text: "/context missing Explain", interrupts: false },
@@ -2813,13 +2819,42 @@ test("reminder commands redirect to the telegram bridge without prompting or mut
   h.input("snooze", "/snooze R1 1h");
   h.input("cancel", "/cancel R2");
   h.input("unknown", "/frobnicate");
+  h.backend.final("Ready");
   await h.router.tick();
-  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(2);
+  expect(h.backend.prompts[1]!.text).toBe("/frobnicate");
   expect(h.store.getOperation("notification")!.state).toBe("pending");
   const redirect = "Just text me normally. /new starts fresh, /status shows what I'm up to.";
-  expect(h.controls().map(op => [op.replyTo, op.text])).toEqual(["list", "snooze", "cancel", "unknown"].map(id => [id, redirect]));
+  expect(h.controls().map(op => [op.replyTo, op.text])).toEqual(["list", "snooze", "cancel"].map(id => [id, redirect]));
   expect(inbounds(h.store).slice(1).map(row => row.state)).toEqual(["done", "done", "done", "done"]);
   expect(h.backend.creates).toHaveLength(1);
+});
+
+test.each(["/ defrosted", "/frobnicate", "/Users/ardud/x.txt", "/contextual thing", "/notificationish thing"])("a leading slash that isn't a command reaches the agent: %s", async text => {
+  const h = setup();
+  h.input("slash", text);
+  await h.router.tick();
+  expect(h.backend.prompts.map(prompt => prompt.text)).toEqual([text]);
+  expect(h.controls().some(op => op.replyTo === "slash")).toBe(false);
+});
+
+test("slash text joins ordinary batch members in receipt order", async () => {
+  const h = setup();
+  const texts = ["Fresh", "/ defrosted", "/frobnicate", "/Users/ardud/x.txt", "Thanks"];
+  for (const [index, text] of texts.entries()) h.input(`m${index}`, text);
+  await h.router.tick();
+  expect(h.backend.prompts.map(prompt => prompt.text)).toEqual([texts.join("\n")]);
+  expect(h.store.get<NormalizedInbound>("batch:m0")!.batchIds).toEqual(texts.map((_, index) => `m${index}`));
+  expect(h.controls()).toEqual([]);
+});
+
+test.each(["/status", "/Status", "/new extra words", "/status x", "/approve", "/answer", "/notification", "/context", "/reminders", "/snooze R1 1h", "/cancel R2"])("a known command is handled without prompting: %s", async text => {
+  const h = setup();
+  h.input("command", text);
+  await h.router.tick();
+  expect(h.backend.prompts).toEqual([]);
+  expect(h.controls().filter(op => op.replyTo === "command")).toHaveLength(1);
+  expect(inbounds(h.store)[0]!.state).toBe("done");
 });
 
 test.each(["busy", "retry", "tool"])("long %s work never sends a progress notice and still delivers the final reply", async kind => {
@@ -7446,7 +7481,7 @@ test("failed-inbound scan I/O never blocks a fresh control", async () => {
   let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
   h.backend.promptAccepted = async () => { entered(); await gate; return false; };
   setSystemTime(start + 121_000); const scan = h.router.checkFailedInbound(); await enteredRead;
-  h.input("stop", "/stop");
+  h.input("stop", "/status");
   try {
     await h.router.tick();
     expect(inbounds(h.store).find(row => row.id === "stop")?.state).toBe("done");
