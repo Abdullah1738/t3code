@@ -7,6 +7,7 @@ import contextvars
 from functools import partial, wraps
 import importlib
 import os
+import site
 import subprocess
 import sys
 from pathlib import Path
@@ -54,6 +55,10 @@ def main():
         parser.error("port must be between 1 and 65535")
     if args.server == "flighty":
         source = Path.home() / ".local/share/flighty-mcp"
+        site_dirs = sorted(path for path in source.glob(".venv/lib/python3.*/site-packages") if path.is_dir())
+        if len(site_dirs) != 1:
+            raise SystemExit(f"flighty: expected exactly one venv site-packages directory under {source / '.venv/lib'}; found {len(site_dirs)}")
+        site.addsitedir(str(site_dirs[0]))
         sys.path.insert(0, str(source))
         mcp = importlib.import_module("main").mcp
     else:
