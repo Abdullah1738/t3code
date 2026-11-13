@@ -573,6 +573,24 @@ export function createReadonlyReplica(
         return changes;
       }
     };
+    // Match recall_core.py's cached state snapshot, including row existence.
+    // Subagent edges are read directly during traversal, not cached here.
+    const lineageStatements = new Map([
+      [
+        "orchestration_v2_projection_threads",
+        out.prepare(
+          "SELECT json_array(thread_id,json_extract(payload_json,'$.lineage.parentThreadId'),json_extract(payload_json,'$.lineage.rootThreadId')) AS identity FROM orchestration_v2_projection_threads WHERE thread_id=?",
+        ),
+      ],
+      [
+        "orchestration_v2_projection_provider_threads",
+        out.prepare(
+          "SELECT json_array(provider_thread_id,thread_id,json_extract(payload_json,'$.nativeThreadRef.nativeId')) AS identity FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id=?",
+        ),
+      ],
+    ]);
+    const lineageIdentity = (name: string, id: NodeSqlite.SQLInputValue) =>
+      lineageStatements.get(name)?.get(id)?.identity;
     const selectColumns = (name: string) =>
       tables
         .get(name)!
@@ -826,6 +844,16 @@ export function createReadonlyReplica(
           let oldestCreated: number | undefined;
           transaction(() => {
             let changes = 0;
+            let lineageRepaired = false;
+            const copyIdentityRow = (
+              name: string,
+              row: Record<string, NodeSqlite.SQLOutputValue>,
+            ) => {
+              const id = row[tables.get(name)!.primary]!;
+              const before = lineageIdentity(name, id);
+              changes += Number(copyRow(name, row));
+              if (before !== lineageIdentity(name, id)) lineageRepaired = true;
+            };
             const copyIdentity = (name: string, row: Record<string, NodeSqlite.SQLOutputValue>) => {
               // A provider/subagent page may outrun the thread page. Resolve its
               // lineage by indexed primary key in this same source snapshot.
@@ -834,9 +862,9 @@ export function createReadonlyReplica(
                 const thread = source
                   .prepare(`SELECT * FROM ${q(identityNames[0]!)} WHERE thread_id=?`)
                   .get(row[key]!);
-                if (thread) changes += Number(copyRow(identityNames[0]!, thread));
+                if (thread) copyIdentityRow(identityNames[0]!, thread);
               }
-              changes += Number(copyRow(name, row));
+              copyIdentityRow(name, row);
             };
             for (const { name, rows } of pages) {
               for (const row of rows) {
@@ -870,14 +898,14 @@ export function createReadonlyReplica(
             // provider binding and subagent lineage. Do not advance the full-cycle
             // sequence/ready/updated_at markers. Fence cached lineage overlays since
             // these rows are visible before their corresponding exported events.
-            if (changes) {
+            if (lineageRepaired) {
               meta(
                 "lineage_repair_revision",
                 String(Number(getMeta("lineage_repair_revision") ?? 0) + 1),
               );
               meta("lineage_repair_watermark", getMeta("updated_at")!);
-              metrics = { ...metrics, identityRows: metrics.identityRows + changes };
             }
+            metrics = { ...metrics, identityRows: metrics.identityRows + changes };
             meta("identity_sequence", String(Number(events.at(-1)?.sequence ?? identitySequence)));
           });
           // Measure at COMMIT, and only newly inserted rows. A later status
@@ -1246,13 +1274,9 @@ export function createReadonlyReplica(
           measure("auxiliaryCommit", applyAuxiliary);
           let lineageRepaired = false;
           for (const row of rows) {
-            const changed = refresh(name, row.id!);
-            if (
-              changed &&
-              (name === "orchestration_v2_projection_threads" ||
-                name === "orchestration_v2_projection_provider_threads")
-            )
-              lineageRepaired = true;
+            const before = lineageIdentity(name, row.id!);
+            refresh(name, row.id!);
+            if (before !== lineageIdentity(name, row.id!)) lineageRepaired = true;
           }
           // Eventless repairs cannot be replayed from orchestration_events.
           // Readers invalidate only for those repairs, not ordinary publishes.
