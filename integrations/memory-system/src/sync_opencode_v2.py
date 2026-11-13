@@ -4,9 +4,9 @@
 Reads session_v2 / session_message from an OpenCode-owned export and
 keeps two things current:
 
-1. data/opencode_raw.db  - exact copy of every native session_message.data and
+1. data/opencode_raw.db  - card-redacted copy of every native session_message.data and
    session_v2 row (zlib), upserted whenever the source row changes. This is the
-   lossless archive; migrated (codex/hermes) sessions are skipped because their
+   archive; migrated (codex/hermes) sessions are skipped because their
    canonical copies live in codex_raw.db / the hermes import.
 2. memory.db episodic_events - searchable projection, source='opencode'.
    Per message: main row turn_id=<msg_id>; extra rows <msg_id>.r (reasoning),
@@ -41,11 +41,13 @@ import hashlib
 import json
 import os
 import sqlite3
+import redact_guard
 import sys
 import time
 import traceback
 import zlib
 
+from card_mask import mask_json_bytes, mask_json_text, mask_recall_value, mask_text
 import robob_readonly
 from capture_budget import Budget, Exhausted, checkpoint, setup_writer, with_retry
 
@@ -127,6 +129,7 @@ def text_of(items):
 
 
 def clean_text(s):
+    s = mask_text(s)
     # json.loads turns a lone \udXXX escape into a lone surrogate, which sqlite
     # can't encode; re-pair valid halves and replace lone ones with U+FFFD
     try:
@@ -180,7 +183,7 @@ def project(msg_id, mtype, data, sess, att):
             elif t == "reasoning" and it.get("text"):
                 reasons.append(it["text"])
             elif t == "tool":
-                st = it.get("state") or {}
+                st, _ = mask_recall_value(it.get("state") or {})
                 name = it.get("name") or ""
                 inp = st.get("input")
                 call = name + "\n" + (json.dumps(inp, ensure_ascii=False)
@@ -244,6 +247,7 @@ class Sync:
               id TEXT PRIMARY KEY, time_updated INTEGER, row_json_zlib BLOB);
         """)
         self.mem = setup_writer(sqlite3.connect(MEM_DB, timeout=0.1), self.budget)
+        self.redactor = redact_guard.CaptureGuard(self.mem)
         self.mem.executescript("""
             CREATE TABLE IF NOT EXISTS opencode_sync_messages(
               msg_id TEXT PRIMARY KEY, session_id TEXT, time_updated INTEGER,
@@ -358,10 +362,10 @@ class Sync:
                 "SELECT id,type,seq,time_created,time_updated FROM session_message"
                 " WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?", (sid, last, MESSAGE_PAGE)).fetchall()
             if not msgs:
-                srow = json.dumps({k: v for k, v in sess.items() if not k.startswith("_")},
-                                 ensure_ascii=False).encode("utf-8")
+                srow = mask_json_text(json.dumps({k: v for k, v in sess.items() if not k.startswith("_")},
+                                 ensure_ascii=False)).encode("utf-8")
                 with_retry(self.raw, lambda: self.raw.execute("INSERT OR REPLACE INTO raw_sessions VALUES (?,?,?)",
-                           (sid, sess["time_updated"], zlib.compress(srow, 6))), budget=self.budget)
+                           (sid, sess["time_updated"], zlib.compress(self.redactor.raw(srow, sid, sid), 6))), budget=self.budget)
                 def finish():
                     self._stamp(sid, 1, -1 if unsettled_seen else sess["time_updated"], (max(last, 0), count), export_seq)
                     self.mem.execute("DELETE FROM opencode_capture_scan WHERE session_id=?", (sid,))
@@ -388,9 +392,10 @@ class Sync:
                     data, tu = row
                     b = data.encode("utf-8")
                     consumed_bytes += len(b)
-                    digest = hashlib.sha256(b).hexdigest()
+                    safe_raw = mask_json_bytes(self.redactor.raw(b, mid, sid))
+                    digest = hashlib.sha256(safe_raw).hexdigest()
                     if have != (tu, digest):
-                        raw_row = (mid, sid, mtype, seq, tc, tu, digest, len(b), zlib.compress(b, 6))
+                        raw_row = (mid, sid, mtype, seq, tc, tu, digest, len(safe_raw), zlib.compress(safe_raw, 6))
                         with_retry(self.raw, lambda: self.raw.execute("INSERT OR REPLACE INTO raw_messages VALUES (?,?,?,?,?,?,?,?,?)",
                                    raw_row), budget=self.budget)
                         self.stats["raw_upserts"] += 1
@@ -459,12 +464,13 @@ class Sync:
             ts = tc // 1000
             for turn_id, speaker, ctype, content, model, tokens, meta in rows:
                 meta = dict(meta, seq=seq)
+                content, metadata = self.redactor.event(SOURCE, sid, turn_id, content, json.dumps(meta, ensure_ascii=False))
                 m.execute(
                     "INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,"
                     "content,content_type,model,tokens_used,metadata_json)"
                     " VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (SOURCE, sid, turn_id, ts, speaker, clean_text(content or ""), ctype,
-                     model, tokens, clean_text(json.dumps(meta, ensure_ascii=False))))
+                     model, tokens, clean_text(metadata)))
                 self.stats["rows"] += 1
             m.execute("INSERT OR REPLACE INTO opencode_sync_messages VALUES (?,?,?,?,?,?)",
                       (mid, sid, tu, 1, 0, int(time.time())))

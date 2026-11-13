@@ -1,6 +1,8 @@
+import { threadCacheRedactions } from "./threadCacheRedactions.ts";
 import {
   ORCHESTRATION_V2_WS_METHODS,
   type EnvironmentId as EnvironmentIdType,
+  type ScopedThreadRef,
   type OrchestrationV2ThreadDetailSnapshot,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadStreamItem,
@@ -8,6 +10,7 @@ import {
 } from "@t3tools/contracts";
 import { boundedSnapshotProjection } from "@t3tools/shared/orchestrationV2BoundedSnapshot";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Scope from "effect/Scope";
@@ -19,7 +22,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { HttpClient } from "effect/http";
-import { Atom } from "effect/reactivity";
+import { Atom, type AtomRegistry } from "effect/reactivity";
 
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
 import * as EnvironmentRegistry from "../connection/registry.ts";
@@ -32,7 +35,11 @@ import * as ManagedRelay from "../relay/managedRelay.ts";
 import { subscribeDynamic } from "../rpc/client.ts";
 import { parseThreadKey, threadKey } from "./entities.ts";
 import { applyOrchestrationV2ProjectionEvent } from "./orchestrationV2Projection.ts";
-import { THREAD_SNAPSHOT_IDLE_TTL_MS } from "./threadRetention.ts";
+import {
+  THREAD_NOT_FOUND_GRACE_MS,
+  THREAD_SNAPSHOT_IDLE_TTL_MS,
+  threadNotFoundRetryDelayMs,
+} from "./threadRetention.ts";
 import { followStreamInEnvironment } from "./runtime.ts";
 import * as ThreadHistoryController from "./threadHistoryController.ts";
 import { fetchEnvironmentThreadHistoryPage } from "./threadHistoryHttp.ts";
@@ -50,6 +57,11 @@ import {
   type EnvironmentThreadState,
   type EnvironmentThreadStatus,
 } from "./threadState.ts";
+
+/** Terminal "no thread" outcomes that connection-phase updates must not overwrite. */
+function isAbsentStatus(status: EnvironmentThreadStatus): boolean {
+  return status === "deleted" || status === "not-found";
+}
 
 function statusWithoutLiveData(
   data: Option.Option<OrchestrationV2ThreadProjection>,
@@ -149,6 +161,8 @@ function matchesThreadSnapshot(
   );
 }
 
+// Only a delete event is kept. "not-found" (an HTTP miss) falls back to
+// empty/cached, so reopening the thread loads it again.
 function cachedThreadState(value: EnvironmentThreadState): EnvironmentThreadState {
   return {
     ...value,
@@ -161,9 +175,18 @@ function cachedThreadState(value: EnvironmentThreadState): EnvironmentThreadStat
   };
 }
 
+export interface EnvironmentThreadStateOptions {
+  /**
+   * Whether the environment shell lists this thread. A thread that was not
+   * found is loaded again when this turns true.
+   */
+  readonly presence?: Stream.Stream<boolean>;
+}
+
 export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make")(function* (
   threadId: ThreadIdType,
   resumeCache?: ThreadResumeCache,
+  options?: EnvironmentThreadStateOptions,
 ) {
   const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
   const cache = yield* Persistence.EnvironmentCacheStore;
@@ -178,10 +201,12 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   );
   const wakeups = yield* Effect.serviceOption(ConnectionWakeups.ConnectionWakeups);
   const environmentId = supervisor.target.environmentId;
+  const redactions = threadCacheRedactions(cache, environmentId, threadId);
+  if (resumeCache) redactions.retain(resumeCache);
   const retained = resumeCache?.snapshot;
   const owner = {};
   if (resumeCache) resumeCache.owner = owner;
-  const cached =
+  const loadedCache =
     retained === undefined
       ? yield* cache.loadThread(environmentId, threadId).pipe(
           Effect.catch((error) =>
@@ -196,6 +221,10 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           ),
         )
       : Option.none<OrchestrationV2ThreadDetailSnapshot>();
+  const cached = Option.filter(
+    loadedCache,
+    (snapshot) => snapshot.snapshotSequence >= redactions.sequence,
+  );
   const cachedThread = Option.map(cached, (snapshot) => snapshot.projection);
   const initialState: EnvironmentThreadState = retained
     ? cachedThreadState(retained.state)
@@ -223,7 +252,8 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     persisted: retained?.persisted ?? Option.isSome(cached),
     acceptsBoundedSnapshots: canLoadHistory,
   };
-  if (resumeCache?.owner === owner) resumeCache.snapshot = committed;
+  if (resumeCache?.owner === owner)
+    resumeCache.snapshot = committed.sequence < redactions.sequence ? undefined : committed;
   const awaitingCompletion = yield* Ref.make(false);
   const applyLock = yield* Semaphore.make(1);
   // Save only completed data/cursor updates. A canceled scope must not cache
@@ -239,15 +269,39 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         committed.persisted &&
         matchesThreadSnapshot(committed, Option.getOrNull(current.data), sequence, current.history),
     };
-    if (resumeCache?.owner === owner) resumeCache.snapshot = committed;
+    if (resumeCache?.owner === owner)
+      resumeCache.snapshot = committed.sequence < redactions.sequence ? undefined : committed;
   });
   const persistence = yield* Queue.sliding<OrchestrationV2ThreadDetailSnapshot>(1);
+  const persistenceLock = yield* Semaphore.make(1);
+  let redactionSequence = 0;
+  const redactionResubscriptions = yield* Queue.sliding<void>(1);
+  const minimumSequence = () => Math.max(redactionSequence, redactions.sequence);
+  const invalidateFromShell = () =>
+    applyLock.withPermit(
+      Effect.gen(function* () {
+        redactionSequence = minimumSequence();
+        if ((yield* SubscriptionRef.get(lastSequence)) >= redactionSequence) return;
+        yield* Queue.poll(persistence);
+        yield* SubscriptionRef.update(state, (current) => ({
+          ...current,
+          data: Option.none(),
+          status: "synchronizing" as const,
+          history: EMPTY_THREAD_HISTORY_META,
+        }));
+        yield* remember;
+        yield* Queue.offer(redactionResubscriptions, undefined);
+      }),
+    );
+  yield* redactions.listen(invalidateFromShell);
+  yield* invalidateFromShell();
 
   const persist = Effect.fn("EnvironmentThreadState.persist")(function* (
     snapshot: OrchestrationV2ThreadDetailSnapshot,
   ) {
     if (resumeCache !== undefined && resumeCache.owner !== owner) return;
-    if (committed.state.status === "deleted") return;
+    if (committed.state.status === "deleted" || snapshot.snapshotSequence < minimumSequence())
+      return;
     if (
       committed.persisted &&
       matchesThreadSnapshot(
@@ -258,32 +312,44 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       )
     )
       return;
-    yield* cache.saveThread(environmentId, snapshot).pipe(
-      Effect.tap(() =>
-        Effect.sync(() => {
-          if (
-            !matchesThreadSnapshot(
-              committed,
-              snapshot.projection,
-              snapshot.snapshotSequence,
-              historyMetaFromCachedSnapshot(snapshot),
+    yield* persistenceLock
+      .withPermits(1)(
+        redactions.withPermit(
+          Effect.suspend(() =>
+            snapshot.snapshotSequence < minimumSequence()
+              ? Effect.void
+              : cache.saveThread(environmentId, snapshot),
+          ),
+        ),
+      )
+      .pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            if (
+              !matchesThreadSnapshot(
+                committed,
+                snapshot.projection,
+                snapshot.snapshotSequence,
+                historyMetaFromCachedSnapshot(snapshot),
+              )
             )
-          )
-            return;
-          committed = { ...committed, persisted: true };
-          if (resumeCache?.owner === owner) resumeCache.snapshot = committed;
-        }),
-      ),
-      Effect.catch((error) =>
-        Effect.logWarning("Could not persist the thread cache.").pipe(
-          Effect.annotateLogs({
-            environmentId,
-            threadId,
-            error: error.message,
+              return;
+            committed = { ...committed, persisted: true };
+            if (resumeCache?.owner === owner)
+              resumeCache.snapshot =
+                committed.sequence < redactions.sequence ? undefined : committed;
           }),
         ),
-      ),
-    );
+        Effect.catch((error) =>
+          Effect.logWarning("Could not persist the thread cache.").pipe(
+            Effect.annotateLogs({
+              environmentId,
+              threadId,
+              error: error.message,
+            }),
+          ),
+        ),
+      );
   });
 
   yield* Effect.addFinalizer(() =>
@@ -309,7 +375,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   yield* runCachePersistence(persistence, persist).pipe(Effect.forkScoped);
 
   const setConnecting = SubscriptionRef.update(state, (current) =>
-    current.status === "deleted" || Option.isSome(current.error)
+    isAbsentStatus(current.status) || Option.isSome(current.error)
       ? current
       : {
           ...current,
@@ -318,7 +384,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         },
   );
   const setReady = SubscriptionRef.update(state, (current) =>
-    current.status === "live" || current.status === "deleted" || Option.isSome(current.error)
+    current.status === "live" || isAbsentStatus(current.status) || Option.isSome(current.error)
       ? current
       : {
           ...current,
@@ -330,17 +396,24 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     yield* Ref.set(awaitingCompletion, false);
     yield* SubscriptionRef.update(state, (current) => ({
       ...current,
-      status: current.status === "deleted" ? current.status : statusWithoutLiveData(current.data),
+      status: isAbsentStatus(current.status) ? current.status : statusWithoutLiveData(current.data),
     }));
   });
+  let consecutiveSyncFailures = 0;
   const setStreamError = (message: string) =>
-    Ref.set(awaitingCompletion, false).pipe(
+    Effect.sync(() => {
+      consecutiveSyncFailures += 1;
+    }).pipe(
+      Effect.andThen(Ref.set(awaitingCompletion, false)),
       Effect.andThen(
         SubscriptionRef.update(state, (current) => ({
           ...current,
-          status:
-            current.status === "deleted" ? current.status : statusWithoutLiveData(current.data),
-          error: Option.some(message),
+          status: isAbsentStatus(current.status)
+            ? current.status
+            : statusWithoutLiveData(current.data),
+          error: Option.some(
+            `Could not synchronize the thread. Showing saved history; retrying. ${message}`,
+          ),
         })),
       ),
     );
@@ -352,6 +425,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       readonly history?: ThreadHistoryMeta;
     },
   ) {
+    if ((yield* SubscriptionRef.get(lastSequence)) < minimumSequence()) return;
     const waiting = yield* Ref.get(awaitingCompletion);
     // Atomic with concurrent history meta updates: never get-then-set the whole
     // state when only the projection changes. Bounded installs pass history so
@@ -366,12 +440,8 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       return {
         ...previous,
         data: Option.some(thread),
-        status: Option.isSome(previous.error)
-          ? ("cached" as const)
-          : waiting
-            ? ("synchronizing" as const)
-            : ("live" as const),
-        error: previous.error,
+        status: waiting ? ("synchronizing" as const) : ("live" as const),
+        error: Option.none(),
         history,
       };
     });
@@ -421,6 +491,91 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     );
   });
 
+  // An HTTP miss is not a delete: the thread may not be committed yet (draft
+  // promotion, a queued creation) or the read raced. Retry with backoff for a
+  // grace window, then show "not-found" until the shell lists the thread (a new
+  // presence generation) or the user retries. Nothing is removed from the disk cache and the state is never
+  // retained as deleted.
+  let missSince: number | undefined;
+  let missAttempts = 0;
+  // Presence is observed from the start, not only after the final miss: the
+  // last HTTP read can miss, creation commit, and the shell list the thread
+  // before a late subscriber would see it (11 Nov 2026 review). Each
+  // absent -> present transition (an initial "present" counts) is one
+  // generation, consumed by at most one retry, so a shell that keeps listing a
+  // thread the server can't find causes one retry, not a loop.
+  const presenceGeneration = yield* SubscriptionRef.make(0);
+  let consumedPresenceGeneration = 0;
+  if (options?.presence !== undefined) {
+    yield* Effect.forkScoped(
+      options.presence.pipe(
+        Stream.changes,
+        Stream.runForEach((present) =>
+          present ? SubscriptionRef.update(presenceGeneration, (value) => value + 1) : Effect.void,
+        ),
+      ),
+    );
+  }
+  /** Consumes a presence generation not yet retried, if there is one. */
+  const takePresenceAdvance = Effect.gen(function* () {
+    const generation = yield* SubscriptionRef.get(presenceGeneration);
+    if (generation <= consumedPresenceGeneration) return false;
+    consumedPresenceGeneration = generation;
+    return true;
+  });
+  const awaitPresenceAdvance = Effect.gen(function* () {
+    const seen = consumedPresenceGeneration;
+    const generation = yield* SubscriptionRef.changes(presenceGeneration).pipe(
+      Stream.filter((value) => value > seen),
+      Stream.runHead,
+      Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed })),
+    );
+    consumedPresenceGeneration = Math.max(consumedPresenceGeneration, generation);
+  });
+  const clearMiss = Effect.sync(() => {
+    missSince = undefined;
+    missAttempts = 0;
+  });
+  const waitAfterMiss = Effect.fn("EnvironmentThreadState.waitAfterMiss")(function* () {
+    const now = yield* Clock.currentTimeMillis;
+    if (missSince === undefined) missSince = now;
+    missAttempts += 1;
+    if (now - missSince < THREAD_NOT_FOUND_GRACE_MS) {
+      yield* Effect.logDebug("Thread not found yet; retrying.").pipe(
+        Effect.annotateLogs({ environmentId, threadId, attempt: missAttempts }),
+      );
+      yield* Effect.sleep(threadNotFoundRetryDelayMs(missAttempts));
+      return;
+    }
+    // The shell listed the thread during the last read (or already lists it):
+    // read once more before parking.
+    if (yield* takePresenceAdvance) {
+      yield* Effect.logDebug("Thread not found, but the shell lists it; retrying once.").pipe(
+        Effect.annotateLogs({ environmentId, threadId, attempt: missAttempts }),
+      );
+      return;
+    }
+    yield* Ref.set(awaitingCompletion, false);
+    yield* SubscriptionRef.update(state, (current) =>
+      current.status === "deleted"
+        ? current
+        : {
+            data: Option.none(),
+            status: "not-found" as const,
+            error: Option.none(),
+            history: EMPTY_THREAD_HISTORY_META,
+          },
+    );
+    yield* remember;
+    yield* awaitPresenceAdvance;
+    yield* clearMiss;
+    yield* SubscriptionRef.update(state, (current) =>
+      current.status === "not-found"
+        ? { ...current, status: "synchronizing" as const, error: Option.none() }
+        : current,
+    );
+  });
+
   type EventItem = Extract<OrchestrationV2ThreadStreamItem, { kind: "event" }>;
   type SequencedItem = Extract<
     OrchestrationV2ThreadStreamItem,
@@ -451,6 +606,52 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     if (sequence === appliedSequence) return;
     yield* SubscriptionRef.set(lastSequence, sequence);
     if (fresh.length === 0) return;
+    const redaction = fresh.findLast((item) => item.event.type === "thread.item-redacted");
+    if (redaction !== undefined) {
+      // A needle sweep can affect any field. Drop the whole snapshot, including
+      // queued saves, before refetching so no client-specific disk cache retains it.
+      redactionSequence = redaction.sequence;
+      yield* Queue.poll(persistence);
+      yield* SubscriptionRef.update(state, (current) => ({
+        ...current,
+        data: Option.none(),
+        status: "synchronizing" as const,
+      }));
+      yield* remember;
+      yield* persistenceLock.withPermits(1)(cache.removeThread(environmentId, threadId));
+      const prepared = yield* SubscriptionRef.get(supervisor.prepared);
+      if (Option.isNone(prepared)) {
+        yield* Queue.offer(redactionResubscriptions, undefined);
+        return;
+      }
+      const refreshed = yield* snapshotLoader.load(prepared.value, threadId);
+      if (refreshed._tag === "present") {
+        yield* clearMiss;
+        if (canLoadHistory && refreshed.history !== undefined)
+          yield* Ref.set(acceptsBoundedSocketSnapshots, true);
+        yield* SubscriptionRef.set(lastSequence, refreshed.snapshot.snapshotSequence);
+        const history = historyMetaFromCachedSnapshot({
+          ...refreshed.snapshot,
+          ...refreshed.history,
+        });
+        yield* setThread(refreshed.snapshot.projection, { history });
+        yield* remember;
+      } else if (refreshed._tag === "denied") {
+        yield* SubscriptionRef.set(state, {
+          data: Option.none(),
+          status: "no-access",
+          error: Option.none(),
+          history: EMPTY_THREAD_HISTORY_META,
+        });
+        yield* remember;
+        yield* Queue.offer(redactionResubscriptions, undefined);
+      } else {
+        // Reopen without a resume cursor so the normal HTTP/WS snapshot path
+        // recovers even if this socket itself stayed healthy.
+        yield* Queue.offer(redactionResubscriptions, undefined);
+      }
+      return;
+    }
 
     const waiting = yield* Ref.get(awaitingCompletion);
     // Apply against the latest projection/history in one update so a concurrent
@@ -553,7 +754,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     if (item.kind === "synchronized") {
       yield* Ref.set(awaitingCompletion, false);
       yield* SubscriptionRef.update(state, (current) =>
-        Option.isSome(current.data) && current.status !== "deleted" && Option.isNone(current.error)
+        Option.isSome(current.data) && current.status !== "deleted"
           ? { ...current, status: "live" as const, error: Option.none() }
           : current,
       );
@@ -561,6 +762,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     }
 
     if (item.kind === "snapshot") {
+      if (item.snapshotSequence < minimumSequence()) return;
       yield* SubscriptionRef.set(lastSequence, item.snapshotSequence);
       const hasProgressiveHistory =
         item.historyCursor !== undefined ||
@@ -606,6 +808,8 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           yield* applyItemLocked(item);
         }
         yield* applyEventsLocked(events);
+        if (items.some((item) => item.kind === "snapshot" || item.kind === "synchronized"))
+          consecutiveSyncFailures = 0;
         yield* remember;
       }),
     );
@@ -757,7 +961,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const markSynchronizing = Effect.gen(function* () {
     if (yield* Ref.get(resumingLive)) return;
     yield* SubscriptionRef.update(state, (current) =>
-      current.status === "deleted"
+      isAbsentStatus(current.status) || Option.isSome(current.error)
         ? current
         : { ...current, status: "synchronizing" as const, error: Option.none() },
     );
@@ -768,10 +972,15 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     subscribeDynamic(
       ORCHESTRATION_V2_WS_METHODS.subscribeThread,
       Effect.fn("EnvironmentThreadState.makeSubscribeInput")(function* (session) {
+        if (consecutiveSyncFailures > 0) {
+          yield* Effect.sleep(
+            Math.min(1_000 * 2 ** Math.min(consecutiveSyncFailures - 1, 5), 30_000),
+          );
+        }
         let current = yield* SubscriptionRef.get(state);
-        // A prior definitive miss (or delete event) already cleared this thread.
-        // Park the subscription attempt without opening the socket so we do not
-        // retry forever against a known-missing id.
+        // A delete event already cleared this thread. Park the subscription
+        // attempt without opening the socket. An HTTP miss never lands here: it
+        // is "not-found" and retried below.
         if (current.status === "deleted") {
           return yield* Effect.never;
         }
@@ -784,7 +993,14 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         yield* markSynchronizing;
         yield* Ref.set(resumingLive, false);
 
-        if (Option.isNone(current.data)) {
+        let loading = Option.isNone(current.data);
+        if (loading && current.status === "not-found") {
+          // A new session or retry is loading again; show progress, not the old miss.
+          yield* SubscriptionRef.update(state, (value) =>
+            value.status === "not-found" ? { ...value, status: "synchronizing" as const } : value,
+          );
+        }
+        while (loading) {
           const prepared = yield* SubscriptionRef.get(supervisor.prepared).pipe(
             Effect.flatMap(
               Option.match({
@@ -802,7 +1018,18 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           const httpResult: ThreadSnapshotLoader.ThreadSnapshotLoadResult =
             yield* snapshotLoader.load(prepared, threadId);
           switch (httpResult._tag) {
+            case "denied": {
+              yield* SubscriptionRef.set(state, {
+                data: Option.none(),
+                status: "no-access",
+                error: Option.none(),
+                history: EMPTY_THREAD_HISTORY_META,
+              });
+              return yield* Effect.never;
+            }
             case "present": {
+              yield* clearMiss;
+              loading = false;
               if (canLoadHistory && httpResult.history !== undefined) {
                 yield* Ref.set(acceptsBoundedSocketSnapshots, true);
               }
@@ -811,6 +1038,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
               // snapshots still go through applyItem (resetHistory).
               yield* applyLock.withPermits(1)(
                 Effect.gen(function* () {
+                  if (httpResult.snapshot.snapshotSequence < minimumSequence()) return;
                   yield* SubscriptionRef.set(lastSequence, httpResult.snapshot.snapshotSequence);
                   const history: ThreadHistoryMeta =
                     httpResult.history !== undefined
@@ -831,10 +1059,13 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
               break;
             }
             case "missing": {
-              yield* setDeleted();
-              return yield* Effect.never;
+              yield* waitAfterMiss();
+              current = yield* SubscriptionRef.get(state);
+              if (current.status === "deleted") return yield* Effect.never;
+              break;
             }
             case "unavailable": {
+              loading = false;
               break;
             }
           }
@@ -843,7 +1074,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         const sequence = yield* SubscriptionRef.get(lastSequence);
         const canResume = Option.isSome(current.data);
         const acceptBoundedSnapshot = yield* Ref.get(acceptsBoundedSocketSnapshots);
-        if (!supportsCompletionMarker && canResume) {
+        if (!supportsCompletionMarker && canResume && consecutiveSyncFailures === 0) {
           yield* SubscriptionRef.update(state, (value) => ({
             ...value,
             status: value.status === "deleted" ? value.status : ("live" as const),
@@ -862,9 +1093,29 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       }),
       {
         onDefect: () => setStreamError("Could not synchronize the thread."),
-        onExpectedFailure: (cause) => setStreamError(formatThreadError(cause)),
+        onExpectedFailure: (cause) => {
+          const error = Cause.squash(cause);
+          if (
+            typeof error === "object" &&
+            error !== null &&
+            "_tag" in error &&
+            error._tag === "EnvironmentAuthorizationError"
+          ) {
+            return SubscriptionRef.set(state, {
+              data: Option.none(),
+              status: "no-access",
+              error: Option.none(),
+              history: EMPTY_THREAD_HISTORY_META,
+            });
+          }
+          return setStreamError(formatThreadError(cause));
+        },
         retryExpectedFailureAfter: "250 millis",
-        resubscribe: foregroundResubscriptions,
+        retryDefects: true,
+        resubscribe: Stream.merge(
+          foregroundResubscriptions,
+          Stream.fromQueue(redactionResubscriptions),
+        ),
       },
     ).pipe(Stream.runForEachArray(applyItems)),
   );
@@ -876,13 +1127,24 @@ function threadStateChanges(
   environmentId: EnvironmentIdType,
   threadId: ThreadIdType,
   resumeCache?: ThreadResumeCache,
+  options?: EnvironmentThreadStateOptions,
 ) {
   return followStreamInEnvironment(
     environmentId,
     Stream.unwrap(
-      makeEnvironmentThreadState(threadId, resumeCache).pipe(Effect.map(SubscriptionRef.changes)),
+      makeEnvironmentThreadState(threadId, resumeCache, options).pipe(
+        Effect.map(SubscriptionRef.changes),
+      ),
     ),
   );
+}
+
+export interface EnvironmentThreadStateAtomsOptions {
+  /**
+   * True while the environment shell lists the thread. Lets a thread that was
+   * not found (e.g. opened before the server created it) load once it exists.
+   */
+  readonly threadPresenceAtom?: (ref: ScopedThreadRef) => Atom.Atom<boolean>;
 }
 
 export function createEnvironmentThreadStateAtoms<R, E>(
@@ -893,6 +1155,7 @@ export function createEnvironmentThreadStateAtoms<R, E>(
     | R,
     E
   >,
+  atomsOptions?: EnvironmentThreadStateAtomsOptions,
 ) {
   // Cache definitions must outlive collectible live-atom definitions. The
   // registry retains these nodes without retaining environment or RPC scopes.
@@ -913,7 +1176,15 @@ export function createEnvironmentThreadStateAtoms<R, E>(
         (get) => {
           get.mount(resumeAtom);
           const resume = get.once(resumeAtom);
-          const live = threadStateChanges(environmentId, threadId, resume);
+          // `stream` subscribes without making the shell a dependency, so shell
+          // updates never restart this thread's stream.
+          const presenceAtom = atomsOptions?.threadPresenceAtom?.({ environmentId, threadId });
+          const live = threadStateChanges(
+            environmentId,
+            threadId,
+            resume,
+            presenceAtom === undefined ? undefined : { presence: get.stream(presenceAtom) },
+          );
           return resume.snapshot === undefined
             ? live
             : Stream.concat(Stream.succeed(cachedThreadState(resume.snapshot.state)), live);
@@ -928,6 +1199,22 @@ export function createEnvironmentThreadStateAtoms<R, E>(
   return {
     stateAtom: (environmentId: EnvironmentIdType, threadId: ThreadIdType) =>
       family(threadKey({ environmentId, threadId })),
+    /**
+     * Loads the thread again from the server, dropping the retained in-memory
+     * state first. Use this for Retry: refreshing the state atom alone would
+     * resume a retained "deleted" state and park again.
+     */
+    reload: (
+      registry: AtomRegistry.AtomRegistry,
+      environmentId: EnvironmentIdType,
+      threadId: ThreadIdType,
+    ) => {
+      const key = threadKey({ environmentId, threadId });
+      const resume = registry.get(resumeFamily(key));
+      resume.snapshot = undefined;
+      resume.owner = undefined;
+      registry.refresh(family(key));
+    },
   };
 }
 
@@ -944,3 +1231,5 @@ export * from "./threadFeedback.ts";
 export * from "./threadDetail.ts";
 export * from "./threadShell.ts";
 export * from "./threadState.ts";
+
+export { threadDetailToShell } from "./threadDetailShell.ts";

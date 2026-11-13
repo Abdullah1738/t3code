@@ -1,13 +1,35 @@
 #!/usr/bin/env node
 // t3ctl: shell access to the ardud control API. Prints JSON unless --text.
-import { randomUUID } from "node:crypto";
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
+import * as NodeNet from "node:net";
 import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeURL from "node:url";
 import * as NodeUtil from "node:util";
 
 import { ControlClient, SHARED_TOKEN_FILE, componentTokenFile } from "./client.mjs";
+import { deepHealth } from "./deep-health.mjs";
+
+// Like outboundHttp.ts, ignore macOS peer-reset EINVAL for undici's optional QoS hint.
+export function ignoreMacosTypeOfServiceEinval(
+  // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone Node CLI; no Effect runtime.
+  platform = process.platform,
+  socketPrototype = NodeNet.Socket.prototype,
+) {
+  if (platform !== "darwin") return;
+  const setTypeOfService = socketPrototype.setTypeOfService;
+  if (typeof setTypeOfService !== "function") return;
+  socketPrototype.setTypeOfService = function (...args) {
+    try {
+      return setTypeOfService.apply(this, args);
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "EINVAL") return this;
+      throw error;
+    }
+  };
+}
+ignoreMacosTypeOfServiceEinval();
 
 const TOKEN_FILE = componentTokenFile("t3ctl");
 const DEFAULT_REPO = "/Volumes/ExternalSSD/t3code-fork";
@@ -15,7 +37,7 @@ const DEFAULT_REPO = "/Volumes/ExternalSSD/t3code-fork";
 const HELP = `t3ctl <command> [options]
 
   login --url URL --token TOKEN        save to ~/.robob/components/t3ctl.json (chmod 600)
-  health                               check the connection and token
+  health [--deep] [--json]              connection/token; deep: lag + real state read (10s bound)
   live SHA-OR-REF [--repo PATH]        check whether a commit is in the running build
   requests [--origin O]                pending approvals and questions everywhere
   projects                             list projects
@@ -66,7 +88,10 @@ export async function checkLive(commit, { health, repo = DEFAULT_REPO }) {
   } catch {
     return { commit, buildCommit: null, live: null, reason: "health unavailable" };
   }
-  if (response?.ok !== true || response?.status !== "healthy") {
+  if (
+    response?.ok !== true ||
+    !["healthy", "degraded", "recovered-unverified"].includes(response?.status)
+  ) {
     return { commit, buildCommit: null, live: null, reason: "invalid health response" };
   }
   const buildCommit = response.buildCommit;
@@ -255,6 +280,8 @@ async function main() {
       types: { type: "string" },
       after: { type: "string" },
       text: { type: "boolean" },
+      deep: { type: "boolean" },
+      json: { type: "boolean" },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -332,8 +359,14 @@ async function main() {
       request(method, path, body, { ...options, timeoutMs: requestTimeoutMs });
   }
   switch (command) {
-    case "health":
-      return print(await client.health());
+    case "health": {
+      if (!flags.deep) return print(await client.health());
+      const report = await deepHealth({ client, timeoutMs: requestTimeoutMs });
+      if (!flags.json) console.log(report.summary);
+      print(report);
+      process.exitCode = report.exitCode;
+      return;
+    }
     case "requests":
       return print(await client.pendingRequests({ origin: flags.origin }));
     case "projects":
@@ -494,7 +527,7 @@ async function main() {
       const text = need(args.slice(1).join(" "), "TEXT");
       const requestId =
         flags["request-id"] === undefined
-          ? randomUUID()
+          ? NodeCrypto.randomUUID()
           : need(flags["request-id"], "--request-id");
       const controller = new AbortController();
       const abort = () => controller.abort();

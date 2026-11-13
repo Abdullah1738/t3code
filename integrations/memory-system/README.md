@@ -110,7 +110,7 @@ Safe post-deploy push acceptance is prepared with
 checkout and bare push target per harness, replaces both origin URLs with the
 local path, and prints fresh-session prompts. After the three sessions,
 `python3 scripts/acceptance_push.py verify --root PRINTED_ROOT` requires cited
-main-dev denials in the decision log and no `main` refs in any bare target.
+main-dev denials in the decision log and no `main ` refs in any bare target.
 
 Corpus-derived denial currently recognizes explicit branch constraints and literal
 git push destinations. Other standing rules are supplied as context; ambiguous
@@ -151,11 +151,11 @@ CPU niceness is fine to keep in the scripts (`nice -n 10`).
   Reference copy: `scripts/com.abdullah.recall.plist`.
 - `com.abdullah.memory-health` - health check every 15 min (capture, recall,
   backups, disk; also the health and Moni backups going stale after 13 h), Telegram on failure
-- `com.abdullah.memory-backup` - restic every 4 h, mirrored to Dropbox.
+- `com.abdullah.memory-backup` - restic every 4 h, mirrored to Dropbox. `deploy.zsh memory-system` installs its HOME-templated plist (refuses to interrupt a running backup). Memory-health alerts once per unloaded/stale incident and once on recovery; memory is stale after 9 h, health/Moni after 13 h. Deferral status explains a stale memory backup without extending the deadline. `MEMORY_BACKUP_NOTIFY_CMD` overrides the notifier command prefix for tests; severity, key and text flags are appended.
   Snapshots hold replicas of memory.db and opencode_raw.db, plus
   `robob-state.sql`, a `.dump` of Robob's small state tables (schedules,
   projects, board, import map, thread index). The full Robob DB is not backed up.
-  Replicas and restic run at nice 10 with normal I/O priority (darwin-background I/O stalls on the USB SSD; see `src/run_limited.py`); limits for replicas and restic backup are `MEMORY_BACKUP_REPLICA_TIMEOUT_S` (10800 s) and `MEMORY_BACKUP_RESTIC_TIMEOUT_S` (7200 s).
+  Replicas and restic run at utility QoS and nice 10, demoting I/O above 1.5 load/core and restoring it below 0.8. Runs defer above 1.0 load/core or within one hour of boot, unless waiting for the next four-hour launch would put the last success over 24 h old. The cadence is unchanged. Replica/restic caps are `MEMORY_BACKUP_REPLICA_TIMEOUT_S` (10800 s) and `MEMORY_BACKUP_RESTIC_TIMEOUT_S` (7200 s), extended by time demoted up to `MEMORY_BACKUP_MAX_SECONDS_UNDER_LOAD` (10800 s). Replicas with a WAL over 2 GiB, a catch-up marker, or an age over 48 h are reseeded through a checked replacement; a live holder blocks recovery.
 - `com.abdullah.session-reaper` (30 min) and `com.abdullah.location-reaper` (5 min)
 
 ## Backend (OpenChamber or Robob)
@@ -246,12 +246,16 @@ Producer source configuration: `OPENCODE_EXPORT_SOURCE_DB` (default
 producer-only; `OPENCODE_DB` remains a guarded legacy reader override. Python 3.11+
 is required for incremental blob I/O; the plist uses Homebrew Python.
 
-For first deployment, sync this integration, create its log directory, install
-`scripts/com.abdullah.opencode-readonly.plist` in `~/Library/LaunchAgents/`, and
-bootstrap that agent. Wait for `ready=1` and fresh `updated_at` in the **export**
+`zsh -f integrations/deploy.zsh memory-system` installs the exporter plist in
+`~/Library/LaunchAgents/` and creates its log directory. Bootstrap the exporter
+separately with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.abdullah.opencode-readonly.plist`.
+Wait for `ready=1` and fresh `updated_at` in the **export**
 before restarting the recall/capture readers. After an OpenCode schema change or
 source-file replacement, rebuild this disposable export (never alter live state).
-The producer refuses overlapping instances and source/target aliases.
+The producer refuses overlapping instances and source/target aliases. It exits
+after five minutes without progress so launchd can recover from a lost volume.
+Memory health flags publications older than 30 minutes; a first bootstrap may
+take longer while its progress heartbeat stays within five minutes.
 
 Tests: `python3 -m unittest discover -s tests -p 'test_*.py'` and
 `bash tests/test_stages.sh`.
@@ -262,3 +266,119 @@ MCP/Starlette dependencies.
 
 Deploy: `integrations/deploy.zsh memory-system`, then
 `launchctl kickstart -k gui/$(id -u)/com.abdullah.recall`.
+The deploy installs `~/.local/bin/recall` from `scripts/recall`, so cutovers must not leave a hand-edited stub; redeploy instead.
+
+## Redacting a secret
+
+Run only after approval to destroy the affected recall data and backup history.
+First rewrite the provider/Robob source transcripts (the thread-item redaction
+workflow). Recall does not rewrite those sources or previously injected notes
+in other applications. Revoke the credential separately.
+
+Supply the literal in an **owned 0600 file**, with no trailing newline. Never
+put it in shell arguments, environment variables, a reason, a search or a log.
+Use an incident identifier for the reason. Preview and save count-only results:
+
+```sh
+recall redact --session SESSION --item CALL_ID --needle-file /private/path/needle --reason INCIDENT --dry-run
+recall redact --session SESSION --item CALL_ID --needle-file /private/path/needle --reason INCIDENT --yes > /private/path/result.json
+recall redact-backups --needle-file /private/path/needle --paths-from /private/path/result.json --dry-run
+recall redact-backups --needle-file /private/path/needle --paths-from /private/path/result.json --yes
+```
+
+Either the session/item pair or the needle is sufficient for `redact`; use both
+for a secret incident. Only the needle sweeps uncited copies in logs and other
+sessions. Every store reports `matchedBefore`, `replaced`, `remainingAfter`;
+`verify` covers the selected stores, not copies outside recall or Dropbox
+version history. A dry run never verifies a purge. Errors return a count without
+child output or a traceback; rerun a dry run to inspect remaining counts.
+
+The sweep covers SQLite files and flat logs under the integration's `data/` and
+`logs/`: memory events, both FTS indexes, lossless native journals, compressed
+OpenCode raw payloads, catalog first prompts/titles, hot search excerpts, rules
+and inject/plugin/capture logs. Matching log lines are replaced atomically with
+the same permissions. Database writes use secure deletion, FTS deletion using
+old content, optimization, VACUUM and truncating WAL checkpoints. Cold event IDs
+also select hot-index rows whose stored excerpt omits the secret; verification
+queries both FTS indexes. A busy reader
+fails verification instead of leaving an unchecked WAL. This needs free space
+for VACUUM and can take a long time on the full memory store.
+
+Capture, backup, cold finalization and recall server requests share a maintenance
+fence. Active work prevents redaction; retry when it finishes. The server rejects
+new requests during maintenance and invalidates cached notes afterwards.
+Deploy and restart the updated recall server **before** applying these commands;
+old running server code does not participate in the fence. Sync cursors reset
+for replay rather than jumping to EOF, preserving uncaptured records after a
+source rewrite. Identifier tombstones, including existing native capture identities for records
+without JSON IDs, suppress known items in raw capture and projection; no needle or needle digest is retained. Source-file matches make
+verification fail. New copies with different identities still require a fresh
+needle sweep; source cleanup must precede resumed capture and backups.
+
+`redact-backups` scrubs the replica stage, enumerates every restic snapshot,
+rewrites affected file paths with `--forget`, prunes with `--max-unused 0`, and
+rebuilds the transcript manifests and backs up the sanitized stage. Historical SQLite and compressed transcript
+containers are inspected semantically: SQLite rows (including zlib payloads and
+FTS5's physical prefix-compressed terms, including deleted postings), recoverable deleted payloads, decoded zstd/gzip streams, ZIP members,
+and archive metadata. Only files with matches are
+excluded; clean historical files remain byte-for-byte intact. Path hints never
+count as evidence of a match. Removal still affects whole matched historical
+files, followed by a sanitized stage backup.
+
+Literal, Unicode-escaped and nested JSON selectors share the same encoding
+choices across row, log, archive and physical-FTS inspection. Deleted FTS terms
+that could represent an encoded selector block verification when their original
+boundaries cannot be recovered. Rewritten and replacement snapshots must pass
+inspection before `prune` runs.
+
+Inspection stays diskless. Concatenated compression frames, trailing data and
+unclassified SQLite pages are rejected rather than skipped. SQLite snapshots
+larger than 128 MiB are read through a read-only APSW VFS backed by the existing
+encrypted restic blobs. The reader loads the repository index once, verifies
+blobs with restic's reader, and keeps a 32 MiB plaintext blob cache in RAM; it
+never restores a plaintext file. SQLite uses an 8 MiB page cache, and free-page
+accounting takes one byte per database page (about 26 MiB for 100 GiB with 4 KiB pages).
+Whole SQLite snapshot size is not capped; individual SQLite values and nested
+seekable ZIP/SQLite containers retain a 128 MiB limit. Finding uncertain SQLite free/reserved space, unsupported virtual tables/custom tokenizers,
+or a deleted multi-token FTS phrase whose adjacency cannot be established, or encountering a nonempty
+transactional WAL/journal (including inside an archive) stops before any
+snapshot rewrite or prune in that repository. It does not delete an uninspected container or report
+a successful purge. The replica stage or earlier repositories may already have
+been sanitized when historical inspection fails. Dirty gzip/ZIP stage copies
+must be cleaned at their source; zstd transcript rewriting is supported.
+The cold archive is also a restic repo. If its local copy was finalized away,
+the command downloads and verifies the encrypted Dropbox copy to temporary
+storage, rewrites/prunes it, then mirrors both repos with remote deletion.
+Old cold files have no replacement when their original source no longer exists.
+Restic passwords use the existing `RESTIC_PASSWORD_COMMAND`/`RESTIC_PASSWORD`
+configuration (production Keychain service `restic-memory-backup`).
+
+The large-snapshot path requires the pinned Go helper in `bin/recall-restic-reader`
+and APSW 3.54.1.0 in the integration's `venv/redact-reader` for the CLI's Python version.
+Build `restic-reader/` offbox (cross-compile with `GOOS=darwin GOARCH=arm64`
+for this Mac) and download the matching APSW wheel there. During the separately
+approved deployment, install those prebuilt artifacts with
+`python3 scripts/install_redact_reader.py --root <integration-root> --binary <helper> --wheel <apsw-wheel>`,
+then read back with the same script and `--root <integration-root> --check`.
+Both runtime directories are already excluded by `deploy.zsh`; missing dependencies
+fail closed. Reader fixtures require`RECALL_RESTIC_READER=<helper>` and APSW.
+
+Dropbox's mirror uses `files/delete_batch`, not permanent deletion. Its personal
+OAuth client cannot use the team-only `files/permanently_delete` endpoint.
+Deleted packs remain **restic encrypted** in Dropbox recovery/version history.
+The account's exact retention/add-ons are not established by this tool;
+`dropboxRetentionDays` is therefore null and `dropboxHistoryPurged` is false.
+[Dropbox's documented windows](https://help.dropbox.com/delete-restore/version-history-overview)
+are 30 days for Basic/Plus/Family, 180 for Professional/Essentials/Business/Standard,
+and 365 for Business Plus/Advanced/Enterprise, with possible extensions.
+[Dropbox also says](https://help.dropbox.com/delete-restore/deleted-files)
+normal storage removal can take up to 90 days after the recovery window.
+[The API restriction](https://github.com/dropbox/dropbox-sdk-python/blob/main/dropbox/base.py)
+means mirror success is not proof that Dropbox history was purged.
+
+For fixtures, both commands accept `--root`; backup also accepts `--repository`,
+`--stage`, `--cold-repository` and Dropbox destination overrides. `--local-only`
+explicitly limits backup verification to the local replica/repo and skips cold
+archive/Dropbox. Never use that flag to claim a production incident is removed
+from every store. Python 3.11+ with SQLite 3.47+, restic with `rewrite`, and zstd for compressed
+transcripts are required. Fixture tests: `python3 -m pytest tests/test_redact.py`.

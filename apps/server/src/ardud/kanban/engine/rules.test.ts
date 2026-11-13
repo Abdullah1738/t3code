@@ -1,17 +1,20 @@
 import {
   KANBAN_BACKLOG,
+  KANBAN_RETRY_BACKOFF_MS,
   KanbanBoardId,
   KanbanCardId,
   KanbanDiscussionId,
   ThreadId,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanCardRetry,
   type KanbanDiscussion,
   type KanbanPool,
   type ModelSelection,
   ProviderInstanceId,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
 
 import {
   applyReviewResult,
@@ -37,10 +40,17 @@ import {
   relatedCandidates,
   reviewGate,
   workerQuietDue,
+  runSilentDue,
   reviewerQuietDue,
   waitingOnBackground,
   BACKGROUND_GRACE_MS,
+  AGING_STEP_MS,
+  cardFlow,
+  schedule,
+  PR_WATCH_GRACE_MS,
 } from "./rules.ts";
+
+const iso = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
 
 const model = (name: string): ModelSelection => ({
   instanceId: ProviderInstanceId.make("opencode"),
@@ -112,7 +122,10 @@ const card = (patch: Partial<KanbanCard> = {}): KanbanCard => {
     createdBy: { _tag: "owner" },
     createdAt: "2026-10-25T00:00:00Z",
     updatedAt: "2026-10-25T00:00:00Z",
-    movedAt: `2026-10-25T00:00:${String(n).padStart(2, "0")}Z`,
+    // One second apart, and still a real time past the 99th card.
+    movedAt: `2026-10-25T${[Math.floor(n / 3600), Math.floor(n / 60) % 60, n % 60]
+      .map((part) => String(part).padStart(2, "0"))
+      .join(":")}Z`,
     ...patch,
   };
 };
@@ -129,11 +142,17 @@ describe("checkMove", () => {
     expect(checkMove("dispatcher", card({ stage: "completed" }), "working").ok).toBe(false);
   });
 
-  it("lets a card thread hand off only from working", () => {
+  it("lets a card thread hand off from working or unattached todo", () => {
     expect(checkMove("cardThread", card({ stage: "working" }), "needs_review").ok).toBe(true);
     expect(checkMove("cardThread", card({ stage: "working" }), "needs_owner").ok).toBe(true);
     expect(checkMove("cardThread", card({ stage: "working" }), "completed").ok).toBe(false);
     expect(checkMove("cardThread", card({ stage: "in_review" }), "todo").ok).toBe(false);
+    expect(checkMove("cardThread", card(), "needs_review").ok).toBe(true);
+    expect(
+      checkMove("cardThread", card({ activeThreadId: ThreadId.make("other") }), "needs_review").ok,
+    ).toBe(false);
+    expect(checkMove("cardThread", card(), "needs_owner").ok).toBe(false);
+    expect(checkMove("cardThread", card({ stage: "needs_owner" }), "needs_review").ok).toBe(false);
   });
 
   it("lets evaluators and the owner move freely outside thread stages, not settled cards", () => {
@@ -259,6 +278,7 @@ describe("planDispatch", () => {
         pools([[opus, 1]]),
         new Map(),
         () => 0,
+        undefined,
         attempted,
       ),
     ).toMatchObject([{ cardId: next.id }]);
@@ -276,6 +296,7 @@ describe("planDispatch", () => {
         pools([[opus, 1]]),
         new Map(),
         () => 0,
+        undefined,
         attempted,
       ),
     ).toEqual([]);
@@ -312,9 +333,9 @@ describe("planDispatch", () => {
       pause: { reason: "Ship the fix", keep: [kept.id], at: "2026-10-28T00:00:00Z", by: "owner" },
     };
     const available = pools([[opus, 3]]);
-    expect(planDispatch(paused, cards, available).map((entry) => [entry.cardId, entry.role])).toEqual(
-      [[kept.id, "work"]],
-    );
+    expect(
+      planDispatch(paused, cards, available).map((entry) => [entry.cardId, entry.role]),
+    ).toEqual([[kept.id, "work"]]);
     const ctx = {
       threadId: "t1",
       pool: poolKey(opus),
@@ -360,15 +381,144 @@ describe("planDispatch", () => {
     expect(planDispatch(board, [scriptStep], pools([[opus, 2]]))).toEqual([]);
   });
 
-  it("takes reviews before work and todo by priority", () => {
+  it("interleaves reviews and todos by priority", () => {
     const low = card({ priority: 3 });
     const high = card({ priority: 1 });
     const review = card({ stage: "needs_review" });
     const plan = planDispatch(board, [low, high, review], pools([[opus, 2]]));
     expect(plan.map((d) => [d.cardId, d.role])).toEqual([
-      [review.id, "review"],
       [high.id, "work"],
+      [review.id, "review"],
     ]);
+  });
+
+  it.each([
+    { todoPriority: 1, reviewPriority: 3, winner: "work" },
+    { todoPriority: 2, reviewPriority: 2, winner: "review" },
+    { todoPriority: 3, reviewPriority: 1, winner: "review" },
+  ])(
+    "$winner wins a single slot (todo P$todoPriority, review P$reviewPriority)",
+    ({ todoPriority, reviewPriority, winner }) => {
+      const todo = card({ priority: todoPriority, movedAt: "2026-10-25T00:00:00Z" });
+      const review = card({
+        stage: "needs_review",
+        priority: reviewPriority,
+        movedAt: "2026-10-25T01:00:00Z",
+      });
+      expect(planDispatch(board, [todo, review], pools([[opus, 1]]))).toMatchObject([
+        { cardId: winner === "work" ? todo.id : review.id, role: winner },
+      ]);
+    },
+  );
+
+  it.each([
+    {
+      reason: "own urgency",
+      olderPriority: 3,
+      newerPriority: 1,
+      olderHolds: 0,
+      newerHolds: 0,
+      waiterPriority: 1,
+      winner: "newer",
+    },
+    {
+      reason: "older review inherits P1 urgency",
+      olderPriority: 3,
+      newerPriority: 1,
+      olderHolds: 1,
+      newerHolds: 0,
+      waiterPriority: 1,
+      winner: "older",
+    },
+    {
+      reason: "newer review inherits P1 urgency",
+      olderPriority: 1,
+      newerPriority: 3,
+      olderHolds: 0,
+      newerHolds: 1,
+      waiterPriority: 1,
+      winner: "newer",
+    },
+    {
+      reason: "holds break equal urgency",
+      olderPriority: 2,
+      newerPriority: 2,
+      olderHolds: 1,
+      newerHolds: 2,
+      waiterPriority: 4,
+      winner: "newer",
+    },
+    {
+      reason: "age breaks equal urgency and holds",
+      olderPriority: 2,
+      newerPriority: 2,
+      olderHolds: 1,
+      newerHolds: 1,
+      waiterPriority: 4,
+      winner: "older",
+    },
+    {
+      reason: "urgency beats holds",
+      olderPriority: 3,
+      newerPriority: 1,
+      olderHolds: 2,
+      newerHolds: 0,
+      waiterPriority: 4,
+      winner: "newer",
+    },
+  ])(
+    "picks the $winner review for one Astra slot: $reason",
+    ({ olderPriority, newerPriority, olderHolds, newerHolds, waiterPriority, winner }) => {
+      const older = card({
+        stage: "needs_review",
+        reviewChain: "Critical",
+        reviewStep: 1,
+        priority: olderPriority,
+        movedAt: "2026-11-08T21:40:00Z",
+      });
+      const newer = card({
+        stage: "needs_review",
+        reviewChain: "Critical",
+        reviewStep: 1,
+        priority: newerPriority,
+        movedAt: "2026-11-08T22:11:00Z",
+      });
+      const waiters = [
+        ...Array.from({ length: olderHolds }, () =>
+          card({ priority: waiterPriority, blockedBy: [older.id] }),
+        ),
+        ...Array.from({ length: newerHolds }, () =>
+          card({ priority: waiterPriority, blockedBy: [newer.id] }),
+        ),
+      ];
+      expect(planDispatch(board, [newer, older, ...waiters], pools([[astra, 1]]))).toMatchObject([
+        { cardId: winner === "older" ? older.id : newer.id, role: "review", pool: poolKey(astra) },
+      ]);
+    },
+  );
+
+  it("prefers a review over a todo at equal inherited urgency", () => {
+    const review = card({ stage: "needs_review", priority: 3, movedAt: "2026-11-09T02:00:00Z" });
+    const reviewWaiter = card({ priority: 1, blockedBy: [review.id] });
+    const todo = card({ priority: 1, movedAt: "2026-11-08T21:00:00Z" });
+    const todoWaiters = Array.from({ length: 2 }, () =>
+      card({ priority: 4, blockedBy: [todo.id] }),
+    );
+    expect(
+      planDispatch(board, [todo, review, reviewWaiter, ...todoWaiters], pools([[opus, 1]])),
+    ).toMatchObject([{ cardId: review.id, role: "review" }]);
+  });
+
+  it("keeps todo urgency and pick order when competing with reviews", () => {
+    const review = card({ stage: "needs_review", priority: 2 });
+    const blocker = card({ priority: 4 });
+    const urgent = card({ priority: 1, blockedBy: [blocker.id] });
+    const routine = card({ priority: 2 });
+    expect(
+      planDispatch(board, [review, routine, blocker, urgent], pools([[opus, 3]])).map(
+        (d) => d.cardId,
+      ),
+    ).toEqual([blocker.id, review.id, routine.id]);
   });
 
   it("at the same priority takes the card holding up the most work first", () => {
@@ -393,6 +543,330 @@ describe("planDispatch", () => {
     const urgent = card({ priority: 1, blockedBy: [blocker.id] });
     const plan = planDispatch(board, [routine, blocker, urgent], pools([[opus, 1]]));
     expect(plan.map((d) => d.cardId)).toEqual([blocker.id]);
+  });
+
+  it("ranks a P3 card that unblocks a P1 card, even through a chain, as P1", () => {
+    const routine = card({ priority: 2 });
+    const root = card({ priority: 3 });
+    const middle = card({ priority: 4, blockedBy: [root.id] });
+    const urgent = card({ priority: 1, blockedBy: [middle.id] });
+    const cards = [routine, root, middle, urgent];
+    expect(schedule(cards).get(root.id)).toMatchObject({ urgency: 1, rank: 1, holds: 2 });
+    const plan = planDispatch(board, cards, pools([[opus, 1]]));
+    expect(plan.map((d) => d.cardId)).toEqual([root.id]);
+  });
+
+  it("lifts a low card that unblocks many: one step at 10 cards, two at 100, never to P1", () => {
+    const fan = (count: number, priority: number) => {
+      const root = card({ priority });
+      return [
+        root,
+        ...Array.from({ length: count }, () => card({ priority: 4, blockedBy: [root.id] })),
+      ];
+    };
+    const [hundred, ...hundredWaiters] = fan(100, 4);
+    const [ten, ...tenWaiters] = fan(10, 4);
+    const [nine, ...nineWaiters] = fan(9, 4);
+    const p1 = card({ priority: 1 });
+    const p2 = card({ priority: 2 });
+    const p3 = card({ priority: 3 });
+    const cards = [
+      nine!,
+      ten!,
+      hundred!,
+      p3,
+      p2,
+      p1,
+      ...hundredWaiters,
+      ...tenWaiters,
+      ...nineWaiters,
+    ];
+    const ranks = schedule(cards);
+    expect(ranks.get(hundred!.id)).toMatchObject({ holds: 100, rank: 2 });
+    expect(ranks.get(ten!.id)).toMatchObject({ holds: 10, rank: 3 });
+    expect(ranks.get(nine!.id)).toMatchObject({ holds: 9, rank: 4 });
+    const plan = planDispatch(board, cards, pools([[opus, 6]]));
+    // P1 stays first; at P2 and P3 the card that unblocks more goes before the plain one.
+    expect(plan.map((d) => d.cardId)).toEqual([
+      p1.id,
+      hundred!.id,
+      p2.id,
+      ten!.id,
+      p3.id,
+      nine!.id,
+    ]);
+  });
+
+  it("ages a waiting card one step per 3 days so it cannot starve, but never past P1 work", () => {
+    const start = Date.parse("2026-10-25T00:00:00Z");
+    const at = (ms: number) => iso(start + ms);
+    const old = card({ priority: 4, movedAt: at(0) });
+    // The others arrive after every check below, so only `old` ages.
+    const p3 = card({ priority: 3, movedAt: at(30 * AGING_STEP_MS) });
+    const p2 = card({ priority: 2, movedAt: at(30 * AGING_STEP_MS) });
+    const p1 = card({ priority: 1, movedAt: at(30 * AGING_STEP_MS) });
+    const cards = [old, p3, p2, p1];
+    const first = (nowMs: number) =>
+      planDispatch(board, cards, pools([[opus, 4]]), new Map(), () => 0, nowMs).map(
+        (d) => d.cardId,
+      );
+    expect(first(start + AGING_STEP_MS - 1)).toEqual([p1.id, p2.id, p3.id, old.id]);
+    // One step: it ties with the P3 card and is older.
+    expect(first(start + AGING_STEP_MS)).toEqual([p1.id, p2.id, old.id, p3.id]);
+    // Two steps: it ties with the P2 card and is older. It never passes P1.
+    expect(first(start + 2 * AGING_STEP_MS)).toEqual([p1.id, old.id, p2.id, p3.id]);
+    expect(first(start + 20 * AGING_STEP_MS)).toEqual([p1.id, old.id, p2.id, p3.id]);
+  });
+
+  it("with no clock ages against the board's newest card stamp", () => {
+    const start = Date.parse("2026-10-25T00:00:00Z");
+    const old = card({ priority: 4, movedAt: iso(start) });
+    const p3 = card({ priority: 3, movedAt: iso(start + 1) });
+    const busy = card({
+      stage: "completed",
+      updatedAt: iso(start + AGING_STEP_MS),
+    });
+    const order = (cards: ReadonlyArray<KanbanCard>) =>
+      planDispatch(board, cards, pools([[opus, 1]])).map((d) => d.cardId);
+    expect(order([old, p3])).toEqual([p3.id]);
+    expect(order([old, p3, busy])).toEqual([old.id]);
+  });
+
+  it("at the same rank and unblock count takes the card waiting longest, then the lowest number", () => {
+    const late = card({ movedAt: "2026-10-25T03:00:00Z" });
+    const early = card({ movedAt: "2026-10-25T01:00:00Z" });
+    const twin = card({ movedAt: "2026-10-25T01:00:00Z" });
+    const plan = planDispatch(board, [late, twin, early], pools([[opus, 3]]));
+    expect(plan.map((d) => d.cardId)).toEqual([early.id, twin.id, late.id]);
+  });
+
+  it("ranks through a loop of blocks without looping, and starts none of its cards", () => {
+    const head = card({ priority: 3 });
+    const x: KanbanCard = card({ priority: 4, blockedBy: [head.id] });
+    const y = card({ priority: 4, blockedBy: [x.id] });
+    const z = card({ priority: 1, blockedBy: [y.id] });
+    const loopX = { ...x, blockedBy: [head.id, z.id] };
+    const self: KanbanCard = card({ priority: 2 });
+    const selfBlocked = { ...self, blockedBy: [self.id] };
+    const cards = [head, loopX, y, z, selfBlocked];
+    const ranks = schedule(cards);
+    // The head unblocks the whole loop and takes its most urgent card's priority.
+    expect(ranks.get(head.id)).toMatchObject({ holds: 3, rank: 1 });
+    expect(ranks.get(y.id)).toMatchObject({ holds: 2, urgency: 1 });
+    expect(ranks.get(selfBlocked.id)).toMatchObject({ holds: 0 });
+    const plan = planDispatch(board, cards, pools([[opus, 5]]));
+    expect(plan.map((d) => d.cardId)).toEqual([head.id]);
+  });
+
+  it("gives a board the numbers to show: what a card unblocks, if it is ready, what it waits on", () => {
+    const root = card();
+    const waiter = card({ blockedBy: [root.id] });
+    const cards = [root, waiter];
+    const byId = new Map(cards.map((c) => [c.id as string, c]));
+    const ranks = schedule(cards);
+    expect(cardFlow(root, byId, ranks)).toMatchObject({ unblocks: 1, ready: true, waitsOn: [] });
+    expect(cardFlow(waiter, byId, ranks)).toMatchObject({
+      unblocks: 0,
+      ready: false,
+      waitsOn: [root],
+      heldUpBy: root,
+    });
+  });
+
+  describe("a failed run waiting for its one retry", () => {
+    const failedAt = Date.parse("2026-10-25T12:00:00Z");
+    const due = failedAt + KANBAN_RETRY_BACKOFF_MS;
+    const retry = (role: "work" | "review" = "work"): KanbanCardRetry => ({
+      kind: "run_failed",
+      role,
+      runId: "run-1",
+      reason: "upstream closed the stream",
+      at: iso(failedAt),
+      state: "waiting",
+    });
+    const failed = (patch: Partial<KanbanCard> = {}) =>
+      card({
+        workThreadId: ThreadId.make("t-failed"),
+        retries: [retry()],
+        updatedAt: iso(failedAt),
+        ...patch,
+      });
+    const planAt = (
+      cards: ReadonlyArray<KanbanCard>,
+      available: ReadonlyArray<KanbanPool>,
+      nowMs: number,
+    ) => planDispatch(board, cards, available, new Map(), () => 0, nowMs).map((e) => e.cardId);
+
+    it("is not started before its backoff is over, and holds no slot meanwhile", () => {
+      const waiting = failed({ priority: 1 });
+      const other = card({ priority: 4 });
+      const one = pools([[opus, 1]]);
+      // The slot it gave up goes to another card, however low its priority.
+      expect(planAt([waiting, other], one, failedAt)).toEqual([other.id]);
+      expect(planAt([waiting, other], one, due - 1)).toEqual([other.id]);
+      // Due: a card like any other, started again on its own thread.
+      const plan = planDispatch(board, [waiting, other], one, new Map(), () => 0, due);
+      expect(plan.map((entry) => entry.cardId)).toEqual([waiting.id]);
+      expect(plan[0]).toMatchObject({ role: "work", joins: false, fresh: false });
+    });
+
+    it("competes at its own priority once due: no jump ahead, and its age still counts", () => {
+      const waiting = failed({ priority: 3 });
+      const urgent = card({ priority: 1 });
+      const younger = card({ priority: 3 });
+      const cards = [younger, urgent, waiting];
+      expect(planAt(cards, pools([[opus, 1]]), due)).toEqual([urgent.id]);
+      // Among equals the older card goes first, and the retry is the older one here.
+      expect(planAt(cards, pools([[opus, 2]]), due)).toEqual([urgent.id, waiting.id]);
+      expect(planAt(cards, pools([[opus, 3]]), due)).toEqual([urgent.id, waiting.id, younger.id]);
+      // With every slot taken it waits like any other card, for as long as it takes.
+      expect(planAt(cards, pools([[opus, 0]]), due + 24 * 60 * 60_000)).toEqual([]);
+    });
+
+    it("measures the backoff and the aging of waiting cards against the one clock it is given", () => {
+      const waiting = failed({ priority: 4 });
+      // Startable for six days by the clock passed in: two aging steps, P4 to P2.
+      const old = card({ priority: 4, movedAt: iso(due - 6 * 24 * 60 * 60_000) });
+      const fresh = card({ priority: 3, movedAt: iso(due - 60_000) });
+      const cards = [fresh, old, waiting];
+      const three = pools([[opus, 3]]);
+      expect(planAt(cards, three, due - 1)).toEqual([old.id, fresh.id]);
+      expect(planAt(cards, three, due)).toEqual([old.id, fresh.id, waiting.id]);
+      // Held slots are only slots: they carry no clock.
+      expect(
+        planDispatch(
+          board,
+          [waiting],
+          pools([[opus, 1]]),
+          new Map([["t-held", poolKey(opus)]]),
+          () => 0,
+          due,
+        ),
+      ).toEqual([]);
+    });
+
+    it("with no clock at all, measures against the board's newest card stamp", () => {
+      const waiting = failed();
+      const one = pools([[opus, 1]]);
+      expect(planDispatch(board, [waiting], one)).toEqual([]);
+      const touched = card({ stage: "verified", updatedAt: iso(due) });
+      expect(planDispatch(board, [waiting, touched], one).map((e) => e.cardId)).toEqual([
+        waiting.id,
+      ]);
+    });
+
+    it("holds a failed review back the same way", () => {
+      const review = card({
+        stage: "needs_review",
+        retries: [retry("review")],
+        updatedAt: iso(failedAt),
+      });
+      const todo = card();
+      const two = pools([[opus, 2]]);
+      expect(planAt([review, todo], two, due - 1)).toEqual([todo.id]);
+      expect(planAt([review, todo], two, due)).toEqual([review.id, todo.id]);
+    });
+
+    it("holds nothing back for a review started again at once, or a stamp that does not parse", () => {
+      const noVerdict = card({
+        stage: "needs_review",
+        retries: [{ ...retry("review"), kind: "no_verdict", runId: null, state: "restarted" }],
+      });
+      const broken = failed({ retries: [{ ...retry(), at: "not a time" }] });
+      expect(planAt([noVerdict, broken], pools([[opus, 2]]), failedAt)).toEqual([
+        noVerdict.id,
+        broken.id,
+      ]);
+    });
+  });
+
+  it("plans a 4,000-card board with a dense blocker graph in well under a tick", () => {
+    // The shape of the biggest real board, denser: 2,400 done cards, 1,100 To-Do of
+    // which about three in four wait on others, 400 in flight, and 12 blockers per
+    // waiting card drawn from every open card before it (so chains run hundreds deep).
+    let seed = 20261110;
+    const random = () => {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return seed / 2 ** 32;
+    };
+    const big: Array<KanbanCard> = [];
+    const openIds: Array<KanbanCard["id"]> = [];
+    for (let i = 0; i < 4000; i += 1) {
+      const done = i < 2400;
+      const flight = !done && i < 2800;
+      const blockedBy =
+        !done && openIds.length > 0 && random() < 0.75
+          ? Array.from({ length: 12 }, () => openIds[Math.floor(random() * openIds.length)]!)
+          : [];
+      const next = card({
+        stage: done ? "verified" : flight ? (i % 3 === 0 ? "in_review" : "working") : "todo",
+        priority: 1 + Math.floor(random() * 4),
+        blockedBy,
+        ...(flight
+          ? {
+              activeThreadId: ThreadId.make(`t-big-${i}`),
+              activeRole: i % 3 === 0 ? ("review" as const) : ("work" as const),
+              activePool: poolKey(opus),
+            }
+          : {}),
+      });
+      big.push(next);
+      if (!done) openIds.push(next.id);
+    }
+    const run = () => planDispatch(board, big, pools([[opus, 440]]));
+    const plan = run();
+    expect(plan.length).toBeGreaterThan(0);
+    expect(plan.length).toBeLessThanOrEqual(40);
+    const byId = new Map(big.map((c) => [c.id as string, c]));
+    for (const dispatch of plan) expect(isBlocked(byId.get(dispatch.cardId)!, byId)).toBe(false);
+
+    // The rule this replaced: one walk over the waiters per open card.
+    const walkPerCard = () => {
+      const waiters = new Map<string, Array<string>>();
+      for (const c of big) {
+        if (c.stage === "verified") continue;
+        for (const id of c.blockedBy) {
+          const list = waiters.get(id) ?? [];
+          list.push(c.id);
+          waiters.set(id, list);
+        }
+      }
+      let total = 0;
+      for (const c of big) {
+        if (c.stage === "verified") continue;
+        const seen = new Set<string>([c.id]);
+        const queue: Array<string> = [c.id];
+        for (let i = 0; i < queue.length; i += 1) {
+          for (const id of waiters.get(queue[i]!) ?? []) {
+            if (seen.has(id)) continue;
+            seen.add(id);
+            queue.push(id);
+          }
+        }
+        total += seen.size - 1;
+      }
+      return total;
+    };
+    const ranks = schedule(big);
+    let held = 0;
+    for (const entry of ranks.values()) held += entry.holds;
+    expect(held).toBe(walkPerCard());
+
+    const median = (work: () => unknown) => {
+      const times: Array<number> = [];
+      for (let i = 0; i < 5; i += 1) {
+        const from = performance.now();
+        work();
+        times.push(performance.now() - from);
+      }
+      return times.toSorted((a, b) => a - b)[2]!;
+    };
+    const planMs = median(run);
+    const walkMs = median(walkPerCard);
+    // Measured on an M4: the whole plan about 5 ms, the walk per card alone about
+    // 95 ms. The ratio holds on a slow or busy machine where a fixed number would not.
+    expect(planMs * 4).toBeLessThan(walkMs);
+    expect(planMs).toBeLessThan(250);
   });
 
   it("doesn't count done or settled cards as held up, and survives a loop of blocks", () => {
@@ -603,9 +1077,9 @@ describe("thread batching", () => {
       pause: { reason: "Hold", keep: [back.id], at: "2026-10-28T00:00:00Z", by: "owner" },
     };
     expect(planDispatch(paused, [held, back], pools([[opus, 1]]))).toEqual([]);
-    expect(planDispatch({ ...paused, pause: null }, [held, back], pools([[opus, 1]]))).toMatchObject([
-      { cardId: back.id, joins: true },
-    ]);
+    expect(
+      planDispatch({ ...paused, pause: null }, [held, back], pools([[opus, 1]])),
+    ).toMatchObject([{ cardId: back.id, joins: true }]);
   });
 
   it("keeps a held slot for a thread between cards", () => {
@@ -690,9 +1164,16 @@ describe("thread batching", () => {
       ...board,
       pause: { reason: "Hold", keep: [back.id], at: "2026-10-28T00:00:00Z", by: "owner" },
     };
-    expect(planDispatch(paused, [held, back], pools([[opus, 1], [haiku, 1]]))).toMatchObject([
-      { cardId: back.id, joins: false, fresh: true },
-    ]);
+    expect(
+      planDispatch(
+        paused,
+        [held, back],
+        pools([
+          [opus, 1],
+          [haiku, 1],
+        ]),
+      ),
+    ).toMatchObject([{ cardId: back.id, joins: false, fresh: true }]);
   });
 
   it("never picks up a backlog card, not even back to its own thread", () => {
@@ -1090,18 +1571,37 @@ describe("waitingOnBackground and reviewerQuietDue", () => {
   const START = Date.parse("2026-10-25T00:00:00Z");
   const START_ISO = "2026-10-25T00:00:00.000Z";
   const at = (minutes: number) => START + minutes * 60 * 1000;
-  const bg = (state: string, background: number) => ({
+  const bg = (state: string, background: number, prWatches = 0) => ({
     state,
     quietSince: START_ISO,
     backgroundWork: background,
+    prWatches,
   });
 
   it("holds an idle thread with background work for the grace only", () => {
     expect(BACKGROUND_GRACE_MS).toBe(60 * 60 * 1000);
     expect(waitingOnBackground(bg("idle", 1), at(59))).toBe(true);
+    expect(waitingOnBackground(bg("idle", 1), at(60))).toBe(false);
     expect(waitingOnBackground(bg("idle", 1), at(61))).toBe(false);
     expect(waitingOnBackground(bg("idle", 0), at(59))).toBe(false);
     expect(waitingOnBackground(bg("running", 1), at(59))).toBe(false);
+  });
+
+  it("holds an idle thread with a PR watch for six hours only", () => {
+    expect(PR_WATCH_GRACE_MS).toBe(6 * 60 * 60 * 1000);
+    expect(waitingOnBackground(bg("idle", 0, 1), at(359))).toBe(true);
+    expect(waitingOnBackground(bg("idle", 0, 1), at(360))).toBe(false);
+    expect(waitingOnBackground(bg("idle", 0, 1), at(361))).toBe(false);
+    expect(waitingOnBackground(bg("running", 0, 1), at(359))).toBe(false);
+    expect(waitingOnBackground(bg("needs-input", 0, 1), at(359))).toBe(false);
+    expect(waitingOnBackground(bg("idle", 0), at(359))).toBe(false);
+    expect(waitingOnBackground(bg("idle", 1, 1), at(61))).toBe(true);
+    expect(waitingOnBackground(bg("idle", 1, 1), at(361))).toBe(false);
+  });
+
+  it("restarts the PR-watch grace when a new run finishes", () => {
+    const view = { ...bg("idle", 0, 1), quietSince: "2026-10-25T06:00:00.000Z" };
+    expect(waitingOnBackground(view, at(361))).toBe(true);
   });
 
   const reviewing = card({
@@ -1479,5 +1979,51 @@ describe("claude effort pools", () => {
       model: "opus/cc/claude-haiku-5-5",
     };
     expect(poolFor(all, bare)?.key).toBe(poolKey(opencodeHigh));
+  });
+});
+
+describe("runSilentDue", () => {
+  const start = "2026-10-25T00:00:00.000Z";
+  const running = { state: "running", lastActivityAt: start, backgroundWork: 0 };
+  const working = card({
+    stage: "working",
+    activeRole: "work",
+    activeThreadId: ThreadId.make("t1"),
+  });
+  const at = (minutes: number) => Date.parse(start) + minutes * 60000;
+  it("waits thirty minutes and respects recent nudges, activity and background work", () => {
+    expect(runSilentDue(working, running, at(30))).toBe(true);
+    expect(runSilentDue(working, running, at(29))).toBe(false);
+    expect(runSilentDue(working, { ...running, backgroundWork: 1 }, at(31))).toBe(false);
+    expect(runSilentDue(working, { ...running, lastActivityAt: null }, at(31))).toBe(false);
+    expect(runSilentDue(working, { ...running, state: "idle" }, at(31))).toBe(false);
+    expect(
+      runSilentDue(
+        { ...working, stalled: { reason: "hold", by: { _tag: "owner" }, at: start } },
+        running,
+        at(31),
+      ),
+    ).toBe(false);
+    expect(
+      runSilentDue({ ...working, nudgedAt: "2026-10-25T00:20:00.000Z" }, running, at(31)),
+    ).toBe(false);
+    expect(
+      runSilentDue({ ...working, nudgedAt: "2026-10-25T00:20:00.000Z" }, running, at(50)),
+    ).toBe(true);
+  });
+  it.each(["todo", "needs_review", "working", "in_review"] as const)("covers %s", (stage) => {
+    const active = stage === "working" || stage === "in_review";
+    expect(
+      runSilentDue(
+        {
+          ...working,
+          stage,
+          activeThreadId: active ? working.activeThreadId : null,
+          activeRole: stage === "in_review" ? "review" : active ? "work" : null,
+        },
+        running,
+        at(31),
+      ),
+    ).toBe(true);
   });
 });

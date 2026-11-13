@@ -11,6 +11,7 @@ import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import {
+  buildServerProvider,
   isCommandMissingCause,
   parseGenericCliVersion,
   providerModelsFromSettings,
@@ -198,4 +199,41 @@ describe("ProviderCommandNotFoundError", () => {
       expect(error.message).not.toContain("secret-token-value");
     });
   });
+});
+
+it("does not advertise fast options, including on custom models", () => {
+  const snapshot = buildServerProvider({
+    presentation: { displayName: "Test" },
+    enabled: true,
+    checkedAt: "2026-11-08T00:00:00Z",
+    probe: { installed: true, version: null, status: "ready", auth: { status: "unknown" } },
+    models: [
+      {
+        slug: "custom",
+        name: "Custom",
+        isCustom: true,
+        capabilities: createModelCapabilities({
+          optionDescriptors: [
+            { id: "fastMode", label: "Fast", type: "boolean", currentValue: true },
+            {
+              id: "serviceTier",
+              label: "Tier",
+              type: "select",
+              options: [{ id: "priority", label: "Fast", isDefault: true }],
+              currentValue: "priority",
+            },
+          ],
+        }),
+      },
+    ],
+  });
+  expect(snapshot.models[0]?.capabilities?.optionDescriptors).toEqual([
+    {
+      id: "serviceTier",
+      label: "Tier",
+      type: "select",
+      currentValue: "default",
+      options: [{ id: "default", label: "Standard", isDefault: true }],
+    },
+  ]);
 });

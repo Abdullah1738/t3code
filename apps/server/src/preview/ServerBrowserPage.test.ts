@@ -5,7 +5,16 @@ import {
   type CDPSession,
   type Page,
 } from "playwright-core";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vite-plus/test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vite-plus/test";
 
 import { presentAsChrome } from "./ServerBrowserContexts.ts";
 import * as ServerBrowserPage from "./ServerBrowserPage.ts";
@@ -56,6 +65,56 @@ describe("server browser element refs", () => {
     return locator!;
   };
   const repeatedRows = `<ul>${Array.from({ length: 5 }, (_, i) => `<li>row ${i + 1}<button data-testid="delete-row" onclick="this.parentElement.remove()">delete</button></li>`).join("")}</ul>`;
+
+  it("reads a document.write page at about:blank without waiting for URL or load", async () => {
+    await page.evaluate(
+      "document.open(); document.write('<button>inline document</button>'); document.close()",
+    );
+    const result = await takeSnapshot();
+    expect(result.url).toBe("about:blank");
+    expect(result.accessibilityTree).toContain("inline document");
+    expect(result.screenshot?.data).toBeTruthy();
+  });
+
+  it("returns text and refs even when screenshots cannot answer", async () => {
+    await page.setContent("<button>loaded local content</button>");
+    const send = vi.spyOn(cdp, "send");
+    const result = await ServerBrowserPage.snapshot({
+      page,
+      cdp,
+      renderScale: 1,
+      captureImage: false,
+      consoleEntries: [],
+      networkEntries: [],
+      actionTimeline: [],
+    });
+    expect(result.accessibilityTree).toContain("loaded local content");
+    expect(result.screenshot).toBeUndefined();
+    expect(send.mock.calls.some(([method]) => method === "Page.captureScreenshot")).toBe(false);
+  });
+
+  it("captures the new responsive layout immediately after resize and a DOM change", async () => {
+    await page.setContent(
+      `<style>body {margin:0;background:rgb(255,0,0)} @media(max-width:400px){body{background:rgb(0,0,255)}}</style><button>before</button>`,
+    );
+    await takeSnapshot();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.evaluate("document.querySelector('button').textContent = 'after'");
+    const result = await takeSnapshot();
+    expect(result.accessibilityTree).toContain("after");
+    expect(result.screenshot).toMatchObject({ width: 390, height: 844 });
+    const pixels = await page.evaluate(`(async () => {
+      const image = await createImageBitmap(await (await fetch('data:image/png;base64,${result.screenshot!.data}')).blob());
+      const canvas = document.createElement('canvas'); canvas.width = image.width; canvas.height = image.height;
+      const ctx = canvas.getContext('2d'); ctx.drawImage(image,0,0);
+      return [10,200,380].map(x => Array.from(ctx.getImageData(x,400,1,1).data));
+    })()`);
+    expect(pixels).toEqual([
+      [0, 0, 255, 255],
+      [0, 0, 255, 255],
+      [0, 0, 255, 255],
+    ]);
+  });
 
   it("clicks the fifth repeated delete control without touching row one", async () => {
     await page.setContent(repeatedRows);
@@ -384,7 +443,7 @@ describe("server browser snapshot screenshot", () => {
       [0.85, 0.75],
     ];
     const pixels = (await page.evaluate(`(async () => {
-      const bytes = Uint8Array.from(atob(${JSON.stringify(screenshot.data)}), (char) => char.charCodeAt(0));
+      const bytes = Uint8Array.from(atob(${JSON.stringify(screenshot!.data)}), (char) => char.charCodeAt(0));
       const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/png" }));
       const canvas = document.createElement("canvas");
       canvas.width = bitmap.width;
@@ -404,7 +463,7 @@ describe("server browser snapshot screenshot", () => {
     const { screenshot, pixels } = await screenshotOf(halves("backdrop-filter: blur(4px);"));
 
     expect({
-      size: [screenshot.width, screenshot.height],
+      size: [screenshot!.width, screenshot!.height],
       colors: pixels.map(colorOf),
     }).toEqual({ size: [1280, 800], colors: ["blue", "red", "red"] });
   });
@@ -413,7 +472,7 @@ describe("server browser snapshot screenshot", () => {
     const { screenshot, pixels } = await screenshotOf(halves(""));
 
     expect({
-      size: [screenshot.width, screenshot.height],
+      size: [screenshot!.width, screenshot!.height],
       colors: pixels.map(colorOf),
     }).toEqual({ size: [1280, 800], colors: ["blue", "red", "red"] });
   });
@@ -430,7 +489,7 @@ describe("server browser snapshot screenshot", () => {
       actionTimeline: [],
     });
 
-    expect([screenshot.width, screenshot.height]).toEqual([1280, 800]);
+    expect([screenshot!.width, screenshot!.height]).toEqual([1280, 800]);
   });
 });
 
@@ -498,7 +557,7 @@ it("captures the native display viewport after page script reassigns the globals
         networkEntries: [],
         actionTimeline: [],
       });
-      const png = Buffer.from(screenshot.data, "base64");
+      const png = Buffer.from(screenshot!.data, "base64");
       const size = { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
       expect(screenshot).toMatchObject(size);
       return size;
@@ -524,5 +583,275 @@ it("captures the native display viewport after page script reassigns the globals
     expect(await snapshotSize()).toEqual({ width: 585, height: 1266 });
   } finally {
     await browser.close();
+  }
+});
+
+describe("snapshot stage deadlines", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("names a stalled renderer metrics read at its real cutoff", async () => {
+    vi.useFakeTimers();
+    const cdp = { send: () => new Promise(() => {}) } as unknown as CDPSession;
+    const pending = ServerBrowserPage.snapshot({
+      page: {} as Page,
+      cdp,
+      renderScale: "display",
+      consoleEntries: [],
+      networkEntries: [],
+      actionTimeline: [],
+    }).catch((error) => error);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(await pending).toMatchObject({
+      tag: "PreviewAutomationTimeoutError",
+      detail: { timeoutMs: 2_000 },
+    });
+    expect((await pending).message).toContain("viewport metrics");
+  });
+
+  it.each([false, true])(
+    "names a stalled accessibility tree on the no-image path (native timeout=%s)",
+    async (nativeTimeout) => {
+      vi.useFakeTimers();
+      const page = {
+        on: () => {},
+        frames: () => [page],
+        mainFrame: () => page,
+        evaluate: async () => ({
+          url: "http://local.test/",
+          title: "loaded",
+          loading: false,
+          visibleText: "loaded",
+          interactiveElements: [],
+        }),
+        ariaSnapshot: () =>
+          nativeTimeout
+            ? Promise.reject(
+                Object.assign(new Error("page.ariaSnapshot: Timeout 8000ms exceeded"), {
+                  name: "TimeoutError",
+                }),
+              )
+            : new Promise(() => {}),
+      } as unknown as Page;
+      const cdp = {
+        send: async (method: string) => {
+          if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
+          if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+          return { result: { value: [] } };
+        },
+      } as unknown as CDPSession;
+      const pending = ServerBrowserPage.snapshot({
+        page,
+        cdp,
+        captureImage: false,
+        renderScale: 1,
+        consoleEntries: [],
+        networkEntries: [],
+        actionTimeline: [],
+      }).catch((error) => error);
+      await vi.advanceTimersByTimeAsync(8_000);
+      expect((await pending).message).toContain("accessibility tree did not answer");
+      expect((await pending).detail).toEqual({ timeoutMs: 8_000 });
+    },
+  );
+
+  it("names the absence of a fresh background paint without issuing a screenshot", async () => {
+    vi.useFakeTimers();
+    const sent: string[] = [];
+    const cdp = {
+      send: async (method: string) => {
+        sent.push(method);
+        if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
+        if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+        return new Promise(() => {});
+      },
+    } as unknown as CDPSession;
+    const pending = ServerBrowserPage.captureViewport(cdp, { format: "png" }).catch(
+      (error) => error,
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect((await pending).message).toContain("No fresh paint");
+    expect((await pending).detail).toEqual({ timeoutMs: 2_000 });
+    expect(sent).not.toContain("Page.captureScreenshot");
+  });
+});
+
+it.each([1, 1.5, 0.8])("waits for the renderer's applied CSS viewport at zoom %s", async (zoom) => {
+  vi.useFakeTimers();
+  let width = 1280;
+  let settled = false;
+  const cdp = {
+    send: async (method: string, params?: { expression?: string }) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+      if (method === "Page.getLayoutMetrics") return { cssVisualViewport: { zoom } };
+      return {
+        result: {
+          value: params?.expression?.startsWith("new Promise")
+            ? true
+            : { ratio: 1, width, height: 844 },
+        },
+      };
+    },
+  } as unknown as CDPSession;
+  try {
+    const pending = ServerBrowserPage.waitForViewport(cdp, { width: 390, height: 844 }).then(
+      (value) => {
+        settled = true;
+        return value;
+      },
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(false);
+    width = 390;
+    await vi.advanceTimersByTimeAsync(25);
+    expect(await pending).toEqual({ width: 390, height: 844 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("rereads fill dimensions after the paint boundary", async () => {
+  let width = 1280;
+  const cdp = {
+    send: async (method: string, params?: { expression?: string }) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+      if (method === "Page.getLayoutMetrics") return { cssVisualViewport: { zoom: 1.5 } };
+      if (params?.expression?.startsWith("new Promise")) {
+        width = 390;
+        return { result: { value: true } };
+      }
+      return { result: { value: { ratio: 1.5, width, height: 844 } } };
+    },
+  } as unknown as CDPSession;
+  expect(await ServerBrowserPage.waitForViewport(cdp, null)).toEqual({ width: 390, height: 844 });
+});
+
+it("does not issue a late screenshot after a timed-out paint setup answers", async () => {
+  vi.useFakeTimers();
+  const lateTree = Promise.withResolvers<{ frameTree: { frame: { id: string } } }>();
+  const sent: string[] = [];
+  let frameTrees = 0;
+  const page = {
+    viewportSize: () => ({ width: 1280, height: 800 }),
+    on: () => {},
+    frames: () => [page],
+    mainFrame: () => page,
+    evaluate: async () => ({
+      url: "about:blank",
+      title: "inline",
+      loading: false,
+      visibleText: "inline",
+      interactiveElements: [],
+    }),
+    ariaSnapshot: async () => '- button "inline" [ref=e1]',
+  } as unknown as Page;
+  const cdp = {
+    send: async (method: string) => {
+      sent.push(method);
+      if (method === "Page.getFrameTree") {
+        if (++frameTrees === 2) return lateTree.promise;
+        return { frameTree: { frame: { id: "main" } } };
+      }
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+      return { result: { value: [] } };
+    },
+  } as unknown as CDPSession;
+  try {
+    const pending = ServerBrowserPage.snapshot({
+      page,
+      cdp,
+      renderScale: 1,
+      consoleEntries: [],
+      networkEntries: [],
+      actionTimeline: [],
+    }).catch((error) => error);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect((await pending).message).toContain("No fresh paint");
+    lateTree.resolve({ frameTree: { frame: { id: "main" } } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).not.toContain("Page.captureScreenshot");
+    expect(sent.filter((method) => method === "Page.createIsolatedWorld")).toHaveLength(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it.each(["Page.getFrameTree", "Page.createIsolatedWorld"])(
+  "bounds the whole paint setup when %s does not answer",
+  async (stuck) => {
+    vi.useFakeTimers();
+    const cdp = {
+      send: async (method: string) => {
+        if (method === stuck) return new Promise(() => {});
+        return { frameTree: { frame: { id: "main" } } };
+      },
+    } as unknown as CDPSession;
+    try {
+      const pending = ServerBrowserPage.waitForPaint(cdp).catch((error) => error);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect((await pending).message).toContain("No fresh paint");
+      expect((await pending).detail).toEqual({ timeoutMs: 2_000 });
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+it("waits for the desktop to acknowledge fill and the guest to reach its target dimensions", async () => {
+  vi.useFakeTimers();
+  let mode = "freeform";
+  let width = 1280;
+  let settled = false;
+  const cdp = {
+    send: async (method: string, params?: { expression?: string }) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+      if (method === "Page.getLayoutMetrics")
+        return { cssVisualViewport: { zoom: 1 }, t3Viewport: { mode, width: 390, height: 844 } };
+      return {
+        result: {
+          value: params?.expression?.startsWith("new Promise")
+            ? true
+            : { ratio: 1, width, height: 844 },
+        },
+      };
+    },
+  } as unknown as CDPSession;
+  try {
+    const pending = ServerBrowserPage.waitForViewport(cdp, null, true).then((value) => {
+      settled = true;
+      return value;
+    });
+    await vi.advanceTimersByTimeAsync(75);
+    expect(settled).toBe(false);
+    mode = "fill";
+    await vi.advanceTimersByTimeAsync(25);
+    expect(settled).toBe(false);
+    width = 390;
+    await vi.advanceTimersByTimeAsync(25);
+    expect(await pending).toEqual({ width: 390, height: 844 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("names a missing desktop fill acknowledgment instead of accepting the previous dimensions", async () => {
+  vi.useFakeTimers();
+  const cdp = {
+    send: async (method: string) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+      if (method === "Page.getLayoutMetrics") return { cssVisualViewport: { zoom: 1 } };
+      return { result: { value: { ratio: 1, width: 1280, height: 800 } } };
+    },
+  } as unknown as CDPSession;
+  try {
+    const pending = ServerBrowserPage.waitForViewport(cdp, null, true).catch((error) => error);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect((await pending).message).toContain("waiting for desktop layout acknowledgment");
+    expect((await pending).detail).toEqual({ timeoutMs: 2_000 });
+  } finally {
+    vi.useRealTimers();
   }
 });

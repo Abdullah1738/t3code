@@ -6,7 +6,7 @@ Layout per root (transcript_roots.json, driver claudeAgent):
 
 Every child record carries the PARENT sessionId and its own agentId, so a child
 is keyed by "<sessionId>:agent:<agentId>" from its file, never by the bare
-sessionId. Each line is also kept verbatim in native_capture_raw.
+sessionId. Each line is also kept in native_capture_raw with card data masked.
 
 Projection: user/assistant text -> 'text'; thinking -> 'text' (metadata kind
 "thinking"); tool_use -> 'tool_call'; tool_result -> 'tool_result' ('error' when
@@ -18,11 +18,13 @@ import argparse
 import json
 import os
 import sqlite3
+import redact_guard
 import stat
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from card_mask import mask_json_bytes, mask_json_text, mask_recall_value, mask_text  # noqa: E402
 import schema_migrations  # noqa: E402
 import transcript_capture as tc  # noqa: E402
 import transcript_roots  # noqa: E402
@@ -184,7 +186,7 @@ def project(rec, path, line_no):
     key = session_key(sid, agent)
     ts = parse_ts(rec.get("timestamp"))
     base = {"file": os.path.basename(path), "line": line_no, "cwd": rec.get("cwd"), "parent_session": sid,
-            "agent_id": agent, "sidechain": bool(rec.get("isSidechain"))}
+            "agent_id": agent, "sidechain": bool(rec.get("isSidechain")), "uuid": uuid}
     model = msg.get("model") if isinstance(msg.get("model"), str) else None
     rows = []
     for i, b in enumerate(_blocks(msg)):
@@ -199,11 +201,13 @@ def project(rec, path, line_no):
             rows.append((tid, ts or int(time.time()), "assistant", "text", clip(b["thinking"]), model,
                          dict(base, kind="thinking"), key))
         elif t == "tool_use":
+            b, _ = mask_recall_value(b)
             name = b.get("name") if isinstance(b.get("name"), str) else ""
             args = json.dumps(b.get("input"), ensure_ascii=False) if b.get("input") is not None else ""
             rows.append((tid, ts or int(time.time()), "assistant", "tool_call", clip(name + "\n" + args), model,
                          dict(base, kind="tool_call", tool=name, call_id=b.get("id")), key))
         elif t == "tool_result":
+            b, _ = mask_recall_value(b)
             text = _tool_result_text(b)
             if not text:
                 continue
@@ -237,6 +241,7 @@ class ClaudeSync:
             [e for e in transcript_roots.load() if e["driver"] == DRIVER])
         self.all_roots = [r for r in transcript_roots.resolve() if r["driver"] == DRIVER]
         self.mem = setup_writer(sqlite3.connect(MEM_DB, timeout=0.1), self.budget)
+        self.redactor = redact_guard.CaptureGuard(self.mem)
         schema_migrations.migrate(self.mem)
         tc.ensure_schema(self.mem)
         self.seed_roots = list(self.roots) + list(self.all_roots)
@@ -349,17 +354,24 @@ class ClaudeSync:
     def _write(self, path, rep, pos, st, events, raw, lines_total, session_key):
         def txn():
             if raw:
+                # A native tombstone identifies the source line, independently
+                # of masking or the marker bytes eventually stored in raw.
                 self.mem.executemany(
                     "INSERT INTO native_capture_raw(source, path, rep_id, line_no, sha1, raw) VALUES(?,?,?,?,?,?)",
-                    [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(line), sqlite3.Binary(line)) for line, ln in raw],
+                    [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(line), sqlite3.Binary(safe_line))
+                     for line, ln in raw for safe_line in [mask_json_bytes(self.redactor.raw(
+                         line, session=session_key, capture_id=(SOURCE,tc.raw_sha1(line)),
+                         capture_alias=tc.raw_sha1(mask_json_bytes(line))))]],
                 )
             if events:
                 self.mem.executemany(
                     "INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,"
                     "content_type,model,tokens_used,metadata_json) VALUES (?,?,?,?,?,?,?,?,NULL,?)"
                     " ON CONFLICT(source,session_id,turn_id) DO NOTHING",
-                    [(SOURCE, key, tid, ts, spk, content, ctype, model, json.dumps(m, ensure_ascii=False))
-                     for tid, ts, spk, ctype, content, model, m, key in events],
+                    [(SOURCE, key, tid, ts, spk, mask_text(safe_content), ctype, model, mask_json_text(safe_meta))
+                     for tid, ts, spk, ctype, content, model, m, key in events
+                     for safe_content, safe_meta in [self.redactor.event(
+                         SOURCE, key, tid, content, json.dumps(m, ensure_ascii=False))]],
                 )
             tc.record_ok(self.mem, rep["rep_id"], pos, st.st_size, st.st_mtime, lines_total,
                          tail=tc.tail_sha1(path, pos) if pos else None,

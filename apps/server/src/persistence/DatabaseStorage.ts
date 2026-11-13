@@ -13,7 +13,11 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { resolveHostCliCommand } from "../cli/invocation.ts";
-import { archiveHistoryPass } from "../ardud/persistence/HistoryArchive.ts";
+import {
+  archiveHistoryPass,
+  historyArchivePacing,
+  nextHistoryArchiveDelayMs,
+} from "../ardud/persistence/HistoryArchive.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
 import { forkParked } from "../serverActivation.ts";
@@ -155,16 +159,33 @@ const make = Effect.gen(function* () {
       ),
     ),
   );
-  yield* forkParked(
-    Effect.sleep("1 minute").pipe(
-      Effect.andThen(
-        archiveHistoryPass().pipe(
-          Effect.catch((cause) => Effect.logWarning("History archive pass failed", { cause })),
-          Effect.repeat(Schedule.spaced("25 millis")),
-        ),
-      ),
-    ),
-  );
+  // ardud: archive passes are paced and back off under contention (HistoryArchive.ts,
+  // historyArchivePacing). On 11 Nov 2026 back-to-back passes (25 ms apart) sat in the
+  // single background reader queue and the writer queue for 60-140 s each.
+  const archivePacing = historyArchivePacing();
+  if (archivePacing.paused) {
+    yield* Effect.logInfo("History archive paused by ROBOB_HISTORY_ARCHIVE_PAUSED");
+  } else {
+    const archiveLoop = Effect.gen(function* () {
+      let contendedStreak = 0;
+      while (true) {
+        const passStarted = yield* Clock.currentTimeMillis;
+        const pass = yield* archiveHistoryPass(archivePacing).pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("History archive pass failed", { cause }).pipe(Effect.as(undefined)),
+          ),
+        );
+        const durationMs = (yield* Clock.currentTimeMillis) - passStarted;
+        contendedStreak = pass?.contended === true ? contendedStreak + 1 : 0;
+        yield* Effect.sleep(
+          Duration.millis(
+            nextHistoryArchiveDelayMs(archivePacing, { durationMs, contendedStreak }),
+          ),
+        );
+      }
+    });
+    yield* forkParked(Effect.sleep("1 minute").pipe(Effect.andThen(archiveLoop)));
+  }
   yield* forkParked(
     publishStatus.pipe(
       Effect.andThen(Effect.sleep("1 minute")),

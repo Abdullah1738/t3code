@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import engine
 import statev2_guard as guard
 import code_mode_fixture
+import isolated_source_cases
 
 LIVE = "/Users/x/.robob/userdata/statev2.sqlite"
 READ = "live-database-read"
@@ -21,6 +22,9 @@ UNRESOLVED = "live-database-script-unresolved"
 
 class GuardTests(unittest.TestCase):
     def setUp(self):
+        clean = patch.dict(os.environ, isolated_source_cases.fixture_environment())
+        clean.start()
+        self.addCleanup(clean.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -55,6 +59,136 @@ class GuardTests(unittest.TestCase):
         for command, expected in rows:
             with self.subTest(command=command):
                 self.assertEqual(self.classify(command), expected)
+
+    def test_isolated_migrate_source_and_note_case_matrix(self):
+        source = Path(__file__).resolve().parents[3] / 'apps/server/scripts/migrate-dev-db.ts'
+        self.write('apps/server/scripts/migrate-dev-db.ts', source.read_text())
+        self.write('package.json', json.dumps({'scripts': {'migrate-dev-db': 'node apps/server/scripts/migrate-dev-db.ts'}}))
+        (self.root / 'link.sqlite').symlink_to(Path.home() / '.robob/userdata/statev2.sqlite')
+        for label, command, expected in isolated_source_cases.cases(self.root):
+            with self.subTest(case=label, command=command):
+                self.assertEqual(guard.classify_detail(command, str(self.root))[0], expected)
+
+    def test_migration_exemption_checks_source_and_plain_node_invocation(self):
+        source = Path(__file__).resolve().parents[3] / 'apps/server/scripts/migrate-dev-db.ts'
+        original = source.read_text()
+        self.write('apps/server/scripts/migrate-dev-db.ts', original)
+        self.write('package.json', json.dumps({'scripts': {'migrate-dev-db': 'node apps/server/scripts/migrate-dev-db.ts'}}))
+        invocation = 'node apps/server/scripts/migrate-dev-db.ts --source /tmp/copy.sqlite --base-dir /tmp/dev-home'
+        self.assertIsNone(self.classify(invocation))
+        self.assertEqual(self.classify('node --test apps/server/scripts/migrate-dev-db.ts --source /tmp/copy.sqlite'), SCRIPT)
+        self.write('apps/server/scripts/migrate-dev-db.ts', original + '\nrequire("fs").readFileSync(' + repr(LIVE) + ');\n')
+        self.assertEqual(self.classify(invocation), SCRIPT)
+        self.assertEqual(self.classify('vp run migrate-dev-db --source /tmp/copy.sqlite --base-dir /tmp/dev-home'), SCRIPT)
+        self.write('package.json', json.dumps({'scripts': {'migrate-dev-db': 'node other.ts'}}))
+        self.assertEqual(self.classify('vp run migrate-dev-db --source /tmp/copy.sqlite'), UNRESOLVED)
+
+    def test_exact_isolated_source_reporters_are_data(self):
+        fixture_dir = Path(__file__).with_name('fixtures') / 'isolated-source'
+        fixtures = sorted(fixture_dir.glob('*.json'))
+        # Freeze all historical roots; stat/open behavior is exercised above
+        # against the real migration source and controlled temporary scripts.
+        with patch.object(os.path, 'realpath', side_effect=lambda p, *a, **kw: os.path.abspath(p)), patch.object(Path, 'stat', side_effect=FileNotFoundError):
+            for fixture in fixtures:
+                row = json.loads(fixture.read_text())
+                for call in row['commands']:
+                    with self.subTest(case=row['case'], fixture=fixture.name):
+                        self.assertEqual(guard.classify_detail(call['cmd'], call['workdir'] or row['session_cwd']), (None, None))
+
+    def test_mktemp_fixture_rooted_shell_source_and_near_misses(self):
+        source = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        self.write('integrations/memory-system/tests/test_backup_replica.sh', source.read_text())
+        for command in ('bash integrations/memory-system/tests/test_backup_replica.sh',
+                        '/bin/bash ' + str(self.root / 'integrations/memory-system/tests/test_backup_replica.sh')):
+            with self.subTest(case='w', command=command):
+                self.assertIsNone(self.classify(command))
+        self.assertEqual(self.classify('sed -i "s/mktemp/echo/g" integrations/memory-system/tests/test_backup_replica.sh; bash integrations/memory-system/tests/test_backup_replica.sh'), SCRIPT)
+        self.assertEqual(self.classify('BASH_ENV=/tmp/preload.sh bash integrations/memory-system/tests/test_backup_replica.sh'), SCRIPT)
+        self.write('tmp/fixtu\nre.sh', source.read_text())
+        self.assertEqual(self.classify('bash tmp/fixtu\\\nre.sh'), SCRIPT)
+        with patch.dict(os.environ, {'BASH_FUNC_mktemp%%': '() { echo "$HOME"; }'}):
+            self.assertEqual(self.classify('bash integrations/memory-system/tests/test_backup_replica.sh'), SCRIPT)
+        self.write('integrations/memory-system/tests/test_backup_replica.sh', source.read_text() + '\n# changed body\n')
+        self.assertIsNone(self.classify('bash integrations/memory-system/tests/test_backup_replica.sh'))
+        for source, expected in isolated_source_cases.mktemp_scripts():
+            self.write('tmp/fixture.sh', source)
+            with self.subTest(source=source):
+                self.assertEqual(self.classify('bash tmp/fixture.sh'), expected)
+
+    def test_mktemp_fixture_tool_identity(self):
+        backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        self.write('tmp/backup.sh', backup.read_text())
+        for label, source, search_path, expected, shell in isolated_source_cases.fixture_tool_cases(self.root):
+            self.write('tmp/fixture.sh', source)
+            with self.subTest(case=label, path=search_path), patch.dict(os.environ, {'PATH':search_path}):
+                self.assertEqual(guard.classify_detail(shell + ' tmp/fixture.sh', str(self.root)), (expected, None))
+                if label.startswith('path-'):
+                    self.assertEqual(guard.classify_detail(shell + ' tmp/backup.sh', str(self.root)), (expected, None))
+
+    def test_backup_command_shapes_and_edited_copies(self):
+        backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        commands, variants = isolated_source_cases.backup_cases(self.root, backup.read_text())
+        self.write('sibling.sh', 'cat ~/.t3/userdata/statev2.sqlite')
+        for variant, source, expected in variants:
+            self.write('integrations/memory-system/tests/test_backup_replica.sh', source)
+            for shape, command, cwd in commands:
+                with self.subTest(variant=variant, shape=shape):
+                    self.assertEqual(guard.classify(command, str(cwd)), expected)
+
+    def test_fixture_review_control_corpus(self):
+        backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        for label, source, expected in isolated_source_cases.setup_control_cases(backup.read_text()):
+            self.write('tmp/fixture.sh', source)
+            for prefix in ('bash ', 'offbox run -- bash ', 'offbox run --remote --no-fallback -- bash '):
+                with self.subTest(case=label, source=source, prefix=prefix):
+                    self.assertEqual(self.classify(prefix + 'tmp/fixture.sh'), expected)
+
+    @unittest.skipUnless(Path('/opt/homebrew/opt/sqlite/bin/sqlite3').is_file(), 'requires fixture SQLite CLI')
+    def test_safe_sqlite_dump_restore(self):
+        command = ['/opt/homebrew/opt/sqlite/bin/sqlite3', '-safe', '-noinit', '--', ':memory:']
+        dump = "CREATE TABLE scheduled_tasks(name); INSERT INTO scheduled_tasks VALUES ('it''s 7');\nCREATE TABLE ardud_mission_events(id); INSERT INTO ardud_mission_events VALUES ('m');"
+        result = subprocess.run(command + [dump, 'SELECT name FROM scheduled_tasks', 'SELECT id FROM ardud_mission_events'], capture_output=True, text=True)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "it's 7\nm\n", ''))
+        fixture = self.write('fixture.sql', 'SELECT 1;')
+        for sql in ('.read ' + str(fixture), "SELECT readfile('" + str(fixture) + "');"):
+            with self.subTest(sql=sql):
+                result = subprocess.run(command + [sql], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertRegex(result.stderr.lower(), 'safe|no such function')
+
+    def test_backup_live_output_redirects(self):
+        backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        self.write('tmp/fixture.sh', backup.read_text())
+        alias = self.root / 'output-alias.sqlite'
+        alias.symlink_to(Path.home() / '.robob/userdata/statev2.sqlite')
+        for suffix in ('-wal', '-shm'):
+            Path(str(alias) + suffix).symlink_to(Path.home() / ('.robob/userdata/statev2.sqlite' + suffix))
+        for destination in (str(Path.home() / '.robob/userdata/statev2.sqlite'), '~/.t3/userdata/statev2.sqlite', '$HOME/.robob/userdata/statev2.sqlite', str(alias)):
+            for suffix in ('', '-wal', '-shm'):
+                for quote in ('', '"', "'"):
+                    with self.subTest(destination=destination, suffix=suffix, quote=quote):
+                        self.assertIsNotNone(self.classify('bash tmp/fixture.sh > ' + quote + destination + suffix + quote + ' 2>&1'))
+
+    def test_backup_setup_tool_identity(self):
+        backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        self.write('tmp/fixture.sh', backup.read_text())
+        for tool in ('ln', 'cp', 'mkdir', 'rm', 'chmod', 'touch', 'mkfifo'):
+            folder = self.root / (tool + '-shadow')
+            folder.mkdir()
+            helper = self.write(str(folder / tool), '#!/bin/sh\nexit 1\n')
+            helper.chmod(0o755)
+            with self.subTest(tool=tool), patch.dict(os.environ, {'PATH': str(folder) + ':/usr/bin:/bin'}):
+                self.assertEqual(self.classify('bash tmp/fixture.sh'), SCRIPT)
+        for name in ('BASH_ENV', 'ENV', 'BASHOPTS', 'SHELLOPTS', 'PYTHONPATH', 'PYTHONHOME', 'PYTHONWARNINGS', 'LD_PRELOAD', 'DYLD_INSERT_LIBRARIES'):
+            with self.subTest(startup=name), patch.dict(os.environ, {name: '/tmp/unproved-helper'}):
+                self.assertEqual(self.classify('bash tmp/fixture.sh'), SCRIPT)
+
+    def test_migration_source_propagation_corpus(self):
+        migrate = Path(__file__).resolve().parents[3] / 'apps/server/scripts/migrate-dev-db.ts'
+        for label, source, expected in isolated_source_cases.migration_mutations(migrate.read_text()):
+            self.write('apps/server/scripts/migrate-dev-db.ts', source)
+            with self.subTest(case=label):
+                self.assertEqual(self.classify('node apps/server/scripts/migrate-dev-db.ts --source /tmp/copy.sqlite --base-dir /tmp/dev-home'), expected)
 
     def test_heredoc_data_and_execution(self):
         body = "import hashlib, pathlib, subprocess\n# it's a diff check\nprint('ok')\n"
@@ -180,6 +314,8 @@ class GuardTests(unittest.TestCase):
             "git ls-files -x '*statev2.sqlite*'",
             "rg --files --iglob='*statev2.sqlite*' . | cat",
             "rg --files --glob '*opencode.db*' .",
+            "rg --files ~/.robob/userdata/statev2.sqlite",
+            "fd -g '*.md' ~/.robob/userdata/statev2.sqlite",
             "find . ! -iname 'statev2.sqlite*' -exec cat {} +",
             "grep foo --exclude-dir='statev2.sqlite*' .",
             "rg foo -g '*statev2.sqlite*' ./fixtures",
@@ -187,10 +323,8 @@ class GuardTests(unittest.TestCase):
             "rg foo -g '*statev2.sqlite*' ~/.robob/userdata",
             "grep -r foo --include='*statev2*' ~/.robob",
             "find ~/.robob/userdata -name 'statev2.sqlite' -exec cat {} +",
-            "rg --files ~/.robob/userdata/statev2.sqlite",
             "diff a.txt b.txt; sqlite3 ~/.robob/userdata/statev2.sqlite .tables",
             "grep x ~/.robob/userdata/statev2.sqlite",
-            "fd -g '*.md' ~/.robob/userdata/statev2.sqlite",
             "rg foo -g statev2.sqlite ~/.robob/userdata",
             "fd -g '*statev2.sqlite*' ~/.robob -x cat",
             "fd '*statev2.sqlite*' ~/.robob --exec cat",

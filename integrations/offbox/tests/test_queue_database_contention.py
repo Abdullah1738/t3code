@@ -57,7 +57,7 @@ class QueueDatabaseContention(Isolated):
         self.assertEqual(row['box_id'], 'busy')
         self.assertFalse(self.con.execute("SELECT 1 FROM pool_pending WHERE token='stale'").fetchone())
 
-    def test_persistent_queue_lock_returns_93_cleans_rows_and_logs_traceback(self):
+    def test_persistent_queue_lock_returns_96_cleans_rows_and_logs_traceback(self):
         self.con.execute('INSERT INTO pool_pending VALUES (?,?,?,?,?)',
                          ('mine', 'repo', os.getpid(), common.now(), 'base:repo:base'))
         self.con.execute('INSERT INTO pool_callers VALUES (?,?,?,?)',
@@ -81,7 +81,7 @@ class QueueDatabaseContention(Isolated):
                 patch.object(runs.Runner, 'start', start), patch.object(lease, '_reuse') as reuse, \
                 patch.object(lease, 'acquire_private') as create, patch.object(fallback, 'run_local') as local, \
                 patch.object(fallback, 'note_infra_failure') as infra, contextlib.redirect_stderr(io.StringIO()) as err:
-            self.assertEqual(cli.cmd_run(args,self.me),93)
+            self.assertEqual(cli.cmd_run(args,self.me),96)
         self.con.rollback()
         self.assertEqual(len(polls), 2)
         self.assertIn('nothing ran, safe to retry', err.getvalue())

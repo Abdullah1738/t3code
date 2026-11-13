@@ -2,20 +2,26 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   ORCHESTRATION_PROTOCOL_VERSION,
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
   AuthSessionId,
   CommandId,
   EnvironmentId,
   EventId,
   MessageId,
+  NodeId,
   OrchestrationV2GetThreadProjectionError,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
   RunId,
+  SecretRef,
   ThreadId,
   WS_METHODS,
+  WsRpcGroup,
   WsSubscribeServerConfigRpc,
+  type KanbanAskSecretAnswerInput,
   type OrchestrationV2StoredEvent,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ProviderSession,
@@ -28,19 +34,25 @@ import {
 } from "@t3tools/contracts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { makeLocalFileTracer, type TraceRecord } from "@t3tools/shared/observability";
+import * as Cause from "effect/Cause";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import type * as Tracer from "effect/Tracer";
+import * as Statement from "effect/sql/Statement";
 import * as TestClock from "effect/testing/TestClock";
 import { Headers } from "effect/http";
 import { RpcGroup, RpcMessage, RpcServer } from "effect/rpc";
@@ -106,6 +118,12 @@ import * as TerminalManager from "./terminal/Manager.ts";
 import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
 import { KanbanService } from "./ardud/kanban/engine/KanbanService.ts";
+import * as AskTestkit from "./ardud/kanban/engine/askFlows.testkit.ts";
+import { SecretRedeemer } from "./ardud/auth/heldSecrets.ts";
+import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
+import { RpcInstrumentation, rpcInstrumentationLayer } from "./observability/RpcInstrumentation.ts";
+import { SHELL_RECENT_PAGE_SIZE } from "./ardud/perf/shellPages.ts";
+import { readSpeedups, ShellResumeLimits, Switches } from "./ardud/perf/speedups.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import * as UsageService from "./usage/UsageService.ts";
 import * as VcsProvisioningService from "./vcs/VcsProvisioningService.ts";
@@ -494,6 +512,7 @@ const fileReplayFixture = Effect.gen(function* () {
       ensureLegacyTranscript: (id) => importer.ensureTranscript(id).pipe(Effect.asVoid),
       streamStoredEventsFrom: orchestrator.streamStoredEventsFrom,
       getThreadShell: orchestrator.getThreadShell,
+      getShellSnapshot: orchestrator.getShellSnapshot,
       getThreadSnapshot: orchestrator.getThreadSnapshot,
       getThreadSnapshotWindow: orchestrator.getThreadSnapshotWindow,
       readShellSnapshot: orchestrator.readShellSnapshot,
@@ -537,6 +556,114 @@ const fileReplayFixture = Effect.gen(function* () {
   };
 });
 
+it.live(
+  "a shell resume reads its changed threads in one batch, with the items one read per thread gives",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "ws-shell-batch-" });
+      yield* Effect.gen(function* () {
+        const fixture = yield* fileReplayFixture;
+        // After the cursor: the reader thread changed (fixture), a new thread appears and
+        // the archived thread changes too (the stream reports it as removed from the list).
+        const addedId = ThreadId.make("thread:ws-reader-added");
+        yield* fixture.orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`create:${addedId}`),
+          threadId: addedId,
+          projectId: fixture.projectId,
+          title: "Added thread",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.1-codex" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const archivedThread = (yield* fixture.orchestrator.getThreadRecords(
+          fixture.archivedId,
+          [],
+        )).thread;
+        yield* fixture.sink.write({
+          events: [
+            {
+              id: EventId.make("ws-reader:archive-again"),
+              type: "thread.archived",
+              threadId: fixture.archivedId,
+              occurredAt: fixture.now,
+              payload: { ...archivedThread, archivedAt: fixture.now },
+            },
+          ],
+        });
+        const reads = { perThread: 0, batches: [] as Array<number> };
+        const makeCounted = () => Layer.mock(ThreadManagement.ThreadManagementService)({
+          streamStoredEventsFrom: fixture.orchestrator.streamStoredEventsFrom,
+          readShellSnapshot: fixture.orchestrator.readShellSnapshot,
+          getThreadShell: (threadId) =>
+            Effect.suspend(() => {
+              reads.perThread++;
+              return fixture.orchestrator.getThreadShell(threadId);
+            }),
+          getShellSnapshot: (options) =>
+            Effect.suspend(() => {
+              reads.batches.push(options?.threadIds?.length ?? -1);
+              return fixture.orchestrator.getShellSnapshot(options);
+            }),
+        });
+        let counted = makeCounted();
+        const resume = (batched: boolean) =>
+          subscribeOrchestrationV2Shell({
+            afterSequence: fixture.cursor,
+            requestCompletionMarker: true,
+          }).pipe(
+            Effect.flatMap((stream) =>
+              stream.pipe(
+                Stream.takeUntil((item) => item.kind === "synchronized"),
+                Stream.runCollect,
+              ),
+            ),
+            Effect.map((items) => Array.from(items)),
+            Effect.scoped,
+            Effect.provide(Layer.mergeAll(fixture.services, counted)),
+            Effect.provideService(Switches, {
+              ...readSpeedups({}),
+              shellBatchedStreamReads: batched,
+            }),
+          );
+        const batched = yield* resume(true);
+        assert.deepEqual(reads, { perThread: 0, batches: [3] });
+        assert.deepEqual(
+          batched.map((item) => [
+            item.kind,
+            item.kind === "thread.updated"
+              ? item.thread.id
+              : item.kind === "thread.removed"
+                ? item.threadId
+                : null,
+          ]),
+          [
+            ["thread.updated", fixture.threadId],
+            ["project.updated", null],
+            ["thread.updated", addedId],
+            ["thread.removed", fixture.archivedId],
+            ["synchronized", null],
+          ],
+        );
+        reads.batches = [];
+        // ardud: another subscriber resuming over the same events shares those reads.
+        assert.deepEqual(yield* resume(true), batched);
+        assert.deepEqual(reads, { perThread: 0, batches: [] });
+        // ROBOB_SHELL_STREAM_BATCH_READS=0: one reader transaction per thread, same items
+        // (a fresh service, so nothing is shared yet).
+        counted = makeCounted();
+        assert.deepEqual(yield* resume(false), batched);
+        assert.deepEqual(reads, { perThread: 3, batches: [] });
+      }).pipe(Effect.provide(fileReplayLayer(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.live("streams a synthetic large shell as bounded pages before synchronizing", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -545,11 +672,24 @@ it.live("streams a synthetic large shell as bounded pages before synchronizing",
     yield* Effect.gen(function* () {
       const fixture = yield* fileReplayFixture;
       const base = (yield* fixture.orchestrator.getThreadShell(fixture.threadId))!;
+      // Row 500, the last of page one, is named like the walk cursor's earlier spelling
+      // ("!recent-first", a legal thread id): its cursor must continue the walk, not
+      // restart it. Ids stay in id order.
       const rows = Array.from({ length: 1101 }, (_, index) => ({
         ...base,
-        id: ThreadId.make(`thread:${String(index).padStart(5, "0")}`),
+        id: ThreadId.make(
+          index < 499
+            ? `!a:${String(index).padStart(5, "0")}`
+            : index === 499
+              ? "!recent-first"
+              : `thread:${String(index).padStart(5, "0")}`,
+        ),
         lastError: "x".repeat(16_000),
       }));
+      assert.deepEqual(
+        rows.map((row) => row.id),
+        rows.map((row) => row.id).toSorted(),
+      );
       const cursors: Array<string | undefined> = [];
       yield* Effect.gen(function* () {
         const threads = yield* ThreadManagement.ThreadManagementService;
@@ -599,6 +739,85 @@ it.live("streams a synthetic large shell as bounded pages before synchronizing",
           pages.every((item) => Buffer.byteLength(JSON.stringify(item)) < 2 * 1024 * 1024),
         );
         assert.deepEqual(cursors, [undefined, rows[499]!.id, rows[999]!.id]);
+
+        // ardud: asked for recent rows first, the socket sends them as page one and then
+        // the same walk; with the switch off it pages by id from the start.
+        const recentReads: Array<{ recent: boolean; after: string | undefined }> = [];
+        const recentRows = rows.toReversed();
+        const pagesFor = (switches: { readonly shellRecentFirst: boolean }) =>
+          subscribeOrchestrationV2Shell({
+            requestCompletionMarker: true,
+            acceptShellPages: true,
+            recentFirst: true,
+          }).pipe(
+            Effect.flatMap((stream) =>
+              stream.pipe(
+                Stream.takeUntil((item) => item.kind === "synchronized"),
+                Stream.runCollect,
+              ),
+            ),
+            Effect.provideService(ThreadManagement.ThreadManagementService, {
+              ...threads,
+              readShellSnapshot: (options) => {
+                recentReads.push({
+                  recent: options?.recentFirst === true,
+                  after: options?.afterThreadId,
+                });
+                const selected = (options?.recentFirst === true ? recentRows : rows)
+                  .filter(
+                    (row) => options?.afterThreadId === undefined || row.id > options.afterThreadId,
+                  )
+                  .slice(0, options?.limit);
+                return Effect.succeed(
+                  Effect.succeed({
+                    schemaVersion: 1,
+                    snapshotSequence: 0,
+                    threads: selected,
+                    archivedThreads: [],
+                  }),
+                );
+              },
+            }),
+            Effect.provideService(Switches, { ...readSpeedups({}), ...switches }),
+            Effect.map((items) =>
+              Array.from(items).filter(
+                (item): item is Extract<OrchestrationV2ShellStreamItem, { kind: "snapshot" }> =>
+                  item.kind === "snapshot" && item.resolvedRepositoryIdentityRoots === undefined,
+              ),
+            ),
+          );
+        const recentPages = yield* pagesFor({ shellRecentFirst: true });
+        assert.deepEqual(
+          recentPages.map((item) => item.snapshot.threads.length),
+          [SHELL_RECENT_PAGE_SIZE, 500, 500, 101],
+        );
+        assert.deepEqual(
+          recentPages[0]!.snapshot.threads.map((thread) => thread.id),
+          recentRows.slice(0, SHELL_RECENT_PAGE_SIZE).map((row) => row.id),
+        );
+        assert.deepEqual(
+          recentPages.slice(1).flatMap((item) => item.snapshot.threads.map((thread) => thread.id)),
+          rows.map((row) => row.id),
+        );
+        // Page one starts a load for the client's reducer; every later page continues it.
+        assert.deepEqual(
+          recentPages.map((item) => item.snapshot.page?.after == null),
+          [true, false, false, false],
+        );
+        assert.isNull(recentPages.at(-1)!.snapshot.page?.nextAfter);
+        assert.deepEqual(recentReads, [
+          { recent: true, after: undefined },
+          { recent: false, after: undefined },
+          { recent: false, after: rows[499]!.id },
+          { recent: false, after: rows[999]!.id },
+        ]);
+        recentReads.length = 0;
+        const switchedOff = yield* pagesFor({ shellRecentFirst: false });
+        assert.deepEqual(
+          switchedOff.flatMap((item) => item.snapshot.threads.map((thread) => thread.id)),
+          rows.map((row) => row.id),
+        );
+        assert.isFalse(recentReads.some((read) => read.recent));
       }).pipe(Effect.provide(fixture.services));
     }).pipe(Effect.provide(fileReplayLayer(path.join(dir, "state.sqlite"))));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
@@ -684,6 +903,126 @@ it.live.each([false, true])(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
+it.live("background sweep scans stay off a held writer unless switched back", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "ws-sweep-reader-" });
+    yield* Effect.gen(function* () {
+      const fixture = yield* fileReplayFixture;
+      const sweeps = Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        return {
+          pullRequests: yield* store.getThreadsWithPullRequests(),
+          limits: yield* store.getLimitRecoveryCandidates({
+            now: fixture.now,
+            autoResume: true,
+            snooze: false,
+          }),
+        };
+      });
+      // A store built with ROBOB_SWEEP_READS_ON_WRITER=1, on the same database.
+      const onWriter = sweeps.pipe(
+        Effect.provide(
+          // Fresh: the fixture already built this layer with the default switches.
+          Layer.fresh(ProjectionStore.layer).pipe(
+            Layer.provide(
+              Layer.succeed(Switches, {
+                ...readSpeedups({}),
+                sweepReadsOffWriter: false,
+              }),
+            ),
+          ),
+        ),
+      );
+      const baseline = yield* sweeps;
+      assert.deepEqual(yield* onWriter, baseline);
+
+      // Where each read runs, from its statement span.
+      const routes = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        Effect.gen(function* () {
+          const spans: Array<Tracer.Span> = [];
+          const observe: Statement.Transformer = (statement, _sql, _fiber, span) => {
+            spans.push(span);
+            return Effect.succeed(statement);
+          };
+          yield* effect.pipe(
+            Effect.provideService(Statement.CurrentTransformer, observe),
+            Effect.provideService(Statement.SpanPropagationEnabled, true),
+          );
+          return [
+            ...new Set(
+              spans.map((span) => {
+                const connection = String(span.attributes.get("db.connection"));
+                return connection === "reader"
+                  ? `reader:${String(span.attributes.get("db.reader.lane"))}`
+                  : connection;
+              }),
+            ),
+          ];
+        });
+      const nodeId = NodeId.make("node:ws-sweep-reader");
+      const dedupe = Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        return yield* store.isNodeStored({
+          id: nodeId,
+          threadId: fixture.threadId,
+          runId: null,
+          parentNodeId: null,
+          rootNodeId: nodeId,
+          kind: "approval_request",
+          status: "waiting",
+          countsForRun: false,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          runtimeRequestId: null,
+          checkpointScopeId: null,
+          startedAt: fixture.now,
+          completedAt: null,
+        });
+      });
+      assert.deepEqual(yield* routes(sweeps), ["reader:background"]);
+      assert.deepEqual(yield* routes(dedupe), ["reader:foreground"]);
+      const switchedBack = ProjectionStore.layer.pipe(
+        Layer.fresh,
+        Layer.provide(
+          Layer.succeed(Switches, {
+            ...readSpeedups({}),
+            sweepReadsOffWriter: false,
+            ingestDedupeForeground: false,
+          }),
+        ),
+      );
+      assert.deepEqual(yield* routes(sweeps.pipe(Effect.provide(switchedBack))), ["writer"]);
+      assert.deepEqual(yield* routes(dedupe.pipe(Effect.provide(switchedBack))), [
+        "reader:background",
+      ]);
+
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const writer = yield* fixture.sql
+        .withTransaction(
+          Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(held);
+      const offWriter = yield* sweeps.pipe(
+        Effect.timeout("10 seconds"),
+        Effect.onError(() => Deferred.succeed(release, undefined)),
+      );
+      assert.deepEqual(offWriter, baseline);
+      // The old placement queues behind the writer's transaction.
+      const blocked = yield* onWriter.pipe(Effect.forkScoped);
+      yield* Effect.sleep("300 millis");
+      assert.isUndefined(blocked.pollUnsafe());
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(writer);
+      assert.deepEqual(yield* Fiber.join(blocked), baseline);
+    }).pipe(Effect.provide(fileReplayLayer(path.join(dir, "state.sqlite"))));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.live(
   "replays shell changes and reads initial, archive and enrichment while a writer is held",
   () =>
@@ -717,6 +1056,114 @@ it.live(
           baseline[1]?.kind === "project.updated" ? baseline[1].sequence : 0,
           fixture.projectEvent.sequence,
         );
+        // Clients that omit idle subagents resume from the cursor event itself, so ancestor rows
+        // sent at an already-applied sequence come again; everything after it is unchanged.
+        const optedIn = Array.from(
+          yield* subscribeOrchestrationV2Shell({ ...input, omitIdleSubagents: true }).pipe(
+            Effect.flatMap((stream) =>
+              stream.pipe(
+                Stream.takeUntil((item) => item.kind === "synchronized"),
+                Stream.runCollect,
+              ),
+            ),
+            Effect.scoped,
+            Effect.provide(fixture.services),
+          ),
+        );
+        assert.equal(
+          optedIn[0] !== undefined && "sequence" in optedIn[0] ? optedIn[0].sequence : -1,
+          fixture.cursor,
+        );
+        assert.deepEqual(optedIn.slice(1), baseline);
+        // The replay budget covers the cursor event too: when it alone is over budget the
+        // opted-in client gets a snapshot, not a replay.
+        const overBudgetAtCursor = Layer.succeed(OrchestrationEventStore.OrchestrationEventStore, {
+          ...fixture.application,
+          getReplayStats: (range) =>
+            fixture.application
+              .getReplayStats(range)
+              .pipe(
+                Effect.map((stats) =>
+                  range.afterSequence < fixture.cursor
+                    ? { ...stats, rawPayloadBytes: Number.MAX_SAFE_INTEGER }
+                    : stats,
+                ),
+              ),
+        });
+        const legacyLimits = { replayMaxGap: 1_000, changesMaxGap: 1_000, maxThreads: 2_000 };
+        const [firstOverBudget] = yield* subscribeOrchestrationV2Shell({
+          ...input,
+          omitIdleSubagents: true,
+        }).pipe(
+          Effect.flatMap((stream) => stream.pipe(Stream.take(1), Stream.runCollect)),
+          Effect.scoped,
+          Effect.provide(Layer.mergeAll(fixture.services, overBudgetAtCursor)),
+          Effect.provideService(ShellResumeLimits, legacyLimits),
+        );
+        assert.equal(firstOverBudget?.kind, "snapshot");
+        // ardud: a range replay refuses (too many events, or bodies over budget) catches up
+        // from the list of changed threads and project events: the same rows, no bodies read.
+        const resume = (
+          resumeInput: Parameters<typeof subscribeOrchestrationV2Shell>[0],
+          limits: typeof legacyLimits,
+          store?: Layer.Layer<OrchestrationEventStore.OrchestrationEventStore>,
+        ) =>
+          subscribeOrchestrationV2Shell(resumeInput).pipe(
+            Effect.flatMap((stream) =>
+              stream.pipe(
+                Stream.takeUntil((item) => item.kind === "synchronized"),
+                Stream.runCollect,
+              ),
+            ),
+            Effect.map((items) => Array.from(items)),
+            Effect.scoped,
+            Effect.provide(
+              store === undefined ? fixture.services : Layer.mergeAll(fixture.services, store),
+            ),
+            Effect.provideService(ShellResumeLimits, limits),
+          );
+        const noBodies = Layer.succeed(OrchestrationEventStore.OrchestrationEventStore, {
+          ...fixture.application,
+          readApplicationEvents: () => Stream.die("a changes resume must not read event bodies"),
+        });
+        const changeLimits = { replayMaxGap: 0, changesMaxGap: 20_000, maxThreads: 2_000 };
+        assert.deepEqual(yield* resume(input, changeLimits, noBodies), baseline);
+        // The list serves every gap it covers, a replayable one included: with the default
+        // limits a resume reads no event bodies. ROBOB_SHELL_RESUME_CHANGES_FIRST=0 replays
+        // such a range as before and never asks for the list.
+        const defaultLimits = { replayMaxGap: 1_000, changesMaxGap: 100_000, maxThreads: 2_000 };
+        assert.deepEqual(yield* resume(input, defaultLimits, noBodies), baseline);
+        const noChangeList = Layer.succeed(OrchestrationEventStore.OrchestrationEventStore, {
+          ...fixture.application,
+          getShellChanges: () => Effect.die("a range replay must not list changes"),
+        });
+        assert.deepEqual(
+          yield* resume(input, defaultLimits, noChangeList).pipe(
+            Effect.provideService(Switches, {
+              ...readSpeedups({}),
+              shellResumeChangesFirst: false,
+            }),
+          ),
+          baseline,
+        );
+        assert.deepEqual(
+          yield* resume({ ...input, omitIdleSubagents: true }, changeLimits, noBodies),
+          optedIn,
+        );
+        assert.deepEqual(
+          yield* resume({ ...input, omitIdleSubagents: true }, changeLimits, overBudgetAtCursor),
+          optedIn,
+        );
+        // Past the changes gap, over the thread cap, or with the switch at the legacy limit,
+        // the client still gets the whole list.
+        for (const limits of [
+          { replayMaxGap: 0, changesMaxGap: 1, maxThreads: 2_000 },
+          { replayMaxGap: 0, changesMaxGap: 20_000, maxThreads: 0 },
+          { replayMaxGap: 0, changesMaxGap: 0, maxThreads: 2_000 },
+        ]) {
+          const [first] = yield* resume(input, limits);
+          assert.equal(first?.kind, "snapshot");
+        }
         const held = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         const writer = yield* fixture.sql
@@ -2123,4 +2570,307 @@ it.effect("thread resume across compacted history keeps message order and final 
       ),
     ),
   ),
+);
+
+// ardud: a board ask's secret fields. The same production handler layer, behind the same
+// authorization and instrumentation middleware a real connection gets.
+it.effect(
+  "secrets.answerAsk takes a value only from the owner's app, hands the asker a ref, and shows the value nowhere",
+  () =>
+    Effect.gen(function* () {
+      const SECRET = "whsec_W5-rpc-V4lue+71c2e5d09a";
+      const dump = (value: unknown) =>
+        JSON.stringify(value, (_key, entry: unknown) =>
+          typeof entry === "bigint" ? entry.toString() : entry,
+        ) ?? "";
+      const VALUE = "staging-eu-7";
+      const fake = yield* AskTestkit.makeFake;
+      const logs: Array<string> = [];
+      const logger = Logger.make<unknown, void>((entry) => {
+        logs.push(`${dump(entry.message)} ${Cause.pretty(entry.cause)}`);
+      });
+      // The server's own tracer, writing to memory what it would write to the trace file.
+      const traced: Array<TraceRecord> = [];
+      const tracer = yield* makeLocalFileTracer({
+        filePath: "unused",
+        maxBytes: 1_000_000,
+        maxFiles: 1,
+        batchWindowMs: 0,
+        sink: {
+          filePath: "unused",
+          push: (record) => void traced.push(record),
+          flush: Effect.void,
+          close: () => Effect.void,
+        },
+      }).pipe(Effect.provide(NodeServices.layer));
+      yield* Effect.gen(function* () {
+        const { card, worker, threadId } = yield* AskTestkit.workingCard("Hook");
+        const kanban = yield* KanbanService;
+        const realSecrets = yield* SecretRequests.SecretRequests;
+        // Every value kept and not yet used or forgotten.
+        const held = new Set<string>();
+        const secrets = SecretRequests.SecretRequests.of({
+          ...realSecrets,
+          hold: (input, by) =>
+            realSecrets
+              .hold(input, by)
+              .pipe(Effect.tap((kept) => Effect.sync(() => held.add(kept.ref)))),
+          discard: (ref) =>
+            realSecrets.discard(ref).pipe(Effect.tap(() => Effect.sync(() => held.delete(ref)))),
+        });
+        yield* kanban.askOwner(
+          card.id,
+          {
+            question: "What is the webhook signing secret?",
+            blocking: true,
+            respond: {
+              fields: [
+                { id: "token", label: "Signing secret", type: "secret", required: true },
+                { id: "env", label: "Environment", type: "text" },
+              ],
+            },
+          },
+          worker,
+          "cardThread",
+        );
+
+        const group = WsRpcGroup.omit(
+          ...[...WsRpcGroup.requests.keys()].filter(
+            (
+              tag,
+            ): tag is Exclude<
+              keyof typeof RpcAuthorization.RPC_REQUIRED_SCOPES,
+              typeof WS_METHODS.secretsAnswerAsk
+            > => tag !== WS_METHODS.secretsAnswerAsk,
+          ),
+        ).middleware(RpcInstrumentation);
+        const services = Layer.mergeAll(
+          Layer.succeed(KanbanService, kanban),
+          Layer.succeed(SecretRequests.SecretRequests, secrets),
+          Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+          Layer.mock(UsageLimitSources.UsageLimitSources)({}),
+          Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({}),
+          Layer.mock(DirectEndpoints.DirectEndpoints)({}),
+          Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+            namedProjectsRoot: process.cwd(),
+          }),
+          Layer.mock(ServerEnvironment.ServerEnvironment)({}),
+          Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+          Layer.mock(Keybindings.Keybindings)({}),
+        );
+        const broker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
+        const browser = yield* ServerBrowser.ServerBrowser;
+        let requests = 0;
+        /** One call on a connection of this session, from this kind of client. */
+        const call = (
+          session: EnvironmentAuth.AuthenticatedSession,
+          surface: "web" | "cli" | undefined,
+          payload: KanbanAskSecretAnswerInput,
+        ) =>
+          Effect.gen(function* () {
+            const done = yield* Deferred.make<Exit.Exit<unknown, unknown>>();
+            const server = yield* RpcServer.makeNoSerialization(group, {
+              ...WS_RPC_SERVER_OPTIONS,
+              onFromServer: (response) =>
+                response._tag === "Exit"
+                  ? Deferred.succeed(done, response.exit as Exit.Exit<unknown, unknown>)
+                  : Effect.void,
+            }).pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  layerWsRpc(
+                    session,
+                    surface === undefined ? {} : { surface },
+                    {},
+                    broker,
+                    browser,
+                  ).pipe(Layer.provide(services), Layer.provide(layerUnusedConfigRpcServices)),
+                  RpcAuthorization.layer(session.scopes),
+                  rpcInstrumentationLayer,
+                ),
+              ),
+            );
+            yield* server.write(0, {
+              _tag: "Request",
+              id: RpcMessage.RequestId(`ask-secret-${++requests}`),
+              tag: WS_METHODS.secretsAnswerAsk,
+              payload,
+              headers: Headers.empty,
+            });
+            return yield* Deferred.await(done);
+          }).pipe(Effect.scoped);
+
+        const scopes = [AuthOrchestrationReadScope, AuthOrchestrationOperateScope];
+        const session = (
+          origin: EnvironmentAuth.AuthenticatedSession["origin"],
+          granted: EnvironmentAuth.AuthenticatedSession["scopes"] = scopes,
+        ): EnvironmentAuth.AuthenticatedSession => ({
+          sessionId: AuthSessionId.make("ask-secret-test"),
+          subject: "ask-secret-test",
+          method: "browser-session-cookie",
+          scopes: granted,
+          ...(origin === undefined ? {} : { origin }),
+        });
+        const ownerOrigin = { _tag: "owner", source: "paired-client" } as const;
+        const owner = session(ownerOrigin);
+        const input = (
+          patch: Partial<KanbanAskSecretAnswerInput["answer"]> = {},
+          given: Record<string, string> = { token: SECRET },
+        ): KanbanAskSecretAnswerInput => ({
+          cardId: card.id,
+          askId: "q1",
+          answer: { verdict: "answered", values: { env: VALUE }, revision: 0, ...patch },
+          secrets: given,
+        });
+        /** Every reply and refusal, as a client or a log would see it. */
+        const seen: Array<readonly [string, string]> = [];
+        const refusedWith = (name: string, exit: Exit.Exit<unknown, unknown>) => {
+          assert.isTrue(Exit.isFailure(exit), name);
+          const error = Exit.isFailure(exit)
+            ? (Cause.squash(exit.cause) as { _tag?: string; message?: string; code?: string })
+            : {};
+          seen.push([name, `${error.message} ${dump(error)} ${dump(exit)}`]);
+          // Whatever happened inside, no value is left behind.
+          assert.strictEqual(held.size, 0, `a value is still held after: ${name}`);
+          return error;
+        };
+        const stillOpen = Effect.gen(function* () {
+          const ask = AskTestkit.askOf((yield* kanban.card(card.id)).card);
+          assert.isNull(ask.closedAt);
+          assert.isUndefined(ask.answer);
+        });
+
+        // Without the owner's app proof: refused before anything is read or kept.
+        for (const [name, who, surface] of [
+          ["a session the owner did not pair", session(undefined), "web"],
+          ["a component's session", session({ _tag: "component", component: "telegram" }), "web"],
+          ["the owner's token from the CLI", owner, "cli"],
+          ["the owner's session saying no surface", owner, undefined],
+          [
+            "an owner session without the operate scope",
+            session(ownerOrigin, [AuthOrchestrationReadScope]),
+            "web",
+          ],
+        ] as const) {
+          const error = refusedWith(name, yield* call(who, surface, input()));
+          assert.strictEqual(error._tag, "EnvironmentAuthorizationError", name);
+          yield* stillOpen;
+        }
+
+        // The owner's app, with an answer the ask can't take.
+        const wrongField = refusedWith(
+          "a field that is not a secret",
+          yield* call(owner, "web", input({}, { env: SECRET })),
+        );
+        assert.deepStrictEqual([wrongField._tag, wrongField.code], ["KanbanError", "invalid"]);
+        const unknownField = refusedWith(
+          "a field the ask doesn't have",
+          yield* call(owner, "web", input({}, { nope: SECRET })),
+        );
+        assert.deepStrictEqual([unknownField._tag, unknownField.code], ["KanbanError", "invalid"]);
+        const stale = refusedWith(
+          "a stale revision",
+          yield* call(owner, "web", input({ revision: 9 })),
+        );
+        assert.deepStrictEqual([stale._tag, stale.code], ["KanbanError", "conflict"]);
+        // No revision at all: refused with the one to send, and the value is not kept.
+        const blind = refusedWith(
+          "no revision",
+          yield* call(owner, "web", input({ revision: undefined })),
+        );
+        assert.deepStrictEqual([blind._tag, blind.code], ["KanbanError", "invalid"]);
+        assert.include(blind.message ?? "", "It is at revision 0");
+        yield* stillOpen;
+
+        // The owner's app, answering it.
+        const before = (yield* fake.heard(threadId)).length;
+        const answered = yield* call(owner, "web", input());
+        assert.isTrue(Exit.isSuccess(answered));
+        seen.push(["the reply", dump(answered)]);
+        const stored = (yield* kanban.card(card.id)).card;
+        assert.deepStrictEqual(AskTestkit.askOf(stored).answer?.values, {
+          token: { secret: true },
+          env: VALUE,
+        });
+        assert.strictEqual(held.size, 1);
+        const wake = [...(yield* fake.heard(threadId)).slice(before), stored.wakeNote ?? ""].join(
+          "\n",
+        );
+        const ref = /secret-ref:[0-9a-f]{32}/.exec(wake)?.[0];
+        assert.isDefined(ref);
+        assert.isTrue(held.has(ref!));
+
+        // A closed ask takes no second value.
+        const closed = refusedWith.bind(null, "a closed ask");
+        held.clear();
+        const again = closed(yield* call(owner, "web", input()));
+        assert.deepStrictEqual([again._tag, again.code], ["KanbanError", "conflict"]);
+
+        // The agent that asked redeems the ref, as its own thread, once.
+        const redeem = (as: string) =>
+          realSecrets
+            .consume({ ref: SecretRef.make(ref!), projectId: ProjectId.make("project-1") })
+            .pipe(Effect.provideService(SecretRedeemer, ThreadId.make(as)));
+        assert.strictEqual(
+          (yield* redeem("thread-someone-else").pipe(Effect.flip)).reason,
+          "ref_other_thread",
+        );
+        assert.strictEqual(yield* redeem(threadId), SECRET);
+        assert.strictEqual((yield* redeem(threadId).pipe(Effect.flip)).reason, "ref_unavailable");
+
+        // The instrumentation saw every call, and recorded what was called, never what was sent.
+        const rpcSpans = traced.filter((record) => record.name === "ws.rpc.secrets.answerAsk");
+        assert.strictEqual(rpcSpans.length, requests);
+        assert.deepStrictEqual(rpcSpans.at(-1)!.attributes, {
+          "rpc.transport": "websocket",
+          "rpc.system": "effect-rpc",
+          "rpc.method": "secrets.answerAsk",
+          "rpc.aggregate": "secrets",
+          "kanban.card_id": card.id,
+          "kanban.ask_id": "q1",
+        });
+        // Every span of the path is here, the ones that kept, answered and handed out the value too.
+        const names = new Set(traced.map((record) => record.name));
+        for (const name of [
+          "KanbanAskSecrets.answer",
+          "HeldSecrets.hold",
+          "KanbanService.answerAsks",
+          "HeldSecrets.take",
+          "SecretRequests.consume",
+        ]) {
+          assert.isTrue(names.has(name), `no span recorded for ${name}`);
+        }
+        seen.push(["trace records", traced.map(dump).join("\n")]);
+        seen.push(["logs", logs.join("\n")]);
+        assert.isAbove(traced.length, requests);
+        for (const [where, output] of seen) {
+          assert.isFalse(output.includes(SECRET), `the value shows in: ${where}`);
+          assert.isFalse(
+            output.includes(SECRET.slice(6, 20)),
+            `part of the value shows in: ${where}`,
+          );
+        }
+        // What he typed into the plain field is not in the telemetry either.
+        for (const where of ["trace records", "logs"]) {
+          const output = seen.find(([name]) => name === where)![1];
+          assert.isFalse(output.includes(VALUE), `answer.values shows in: ${where}`);
+        }
+      }).pipe(
+        Effect.withTracer(tracer),
+        Effect.provide(
+          Layer.mergeAll(
+            SecretRequests.layer.pipe(
+              Layer.provide(Layer.mock(ThreadManagement.ThreadManagementService)({})),
+              Layer.provideMerge(ServerSecretStore.layer),
+              Layer.provideMerge(AskTestkit.testLayer(fake.layer)),
+            ),
+            Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
+            Layer.mock(ServerBrowser.ServerBrowser)({}),
+            Logger.layer([logger], { mergeWithExisting: false }),
+          ),
+        ),
+        Effect.scoped,
+      );
+    }),
 );

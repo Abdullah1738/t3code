@@ -1,0 +1,10 @@
+[Unit]
+Description=offbox: keep trying to join the tailnet
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=2min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

@@ -1,10 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import {
-  boardFilterFor,
-  publishBoardFilter,
-  subscribeBoardFilters,
-} from "./boardFilterStore";
+import { boardFilterFor, publishBoardFilter, subscribeBoardFilters } from "./boardFilterStore";
 
 describe("boardFilterStore", () => {
   it("defaults to hiding settled cards", () => {

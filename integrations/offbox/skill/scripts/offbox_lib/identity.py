@@ -10,6 +10,7 @@ import json
 import sqlite3
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from time import monotonic, sleep
@@ -18,7 +19,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .common import HOME, OffboxError, db, kv_get, kv_set, log, now
+from . import common
+from .common import HOME, OffboxError, db, kv_get, kv_set, log, now, say
 
 # offbox's own component credential first, the old shared file last.
 CTL_CFGS = (HOME / ".robob/components/offbox.json", HOME / ".robob/ardud-control.json")
@@ -133,12 +135,13 @@ def opencode_session(ses: str) -> dict | None:
         return None
 
 
-def telegram(text: str, key: str, severity: str = "info") -> bool:
+def telegram(text: str, key: str, severity: str = "info", burst_key: str | None = None) -> bool:
     env = dict(os.environ)
     env.pop("BUN_INSPECT", None)
     try:
         p = subprocess.run([BUN, TG_CLI, "notify", "--source", "offbox", "--severity", severity,
-                            "--text", text[:4000], "--key", key[:200]],
+                            "--text", text[:4000], "--key", key[:200],
+                            *(["--burst-key", burst_key] if burst_key else [])],
                            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=40)
         ok = p.returncode == 0
     except Exception:  # noqa: BLE001
@@ -372,19 +375,71 @@ def repo_root(cwd: str | None = None) -> Path:
     return Path(cwd).resolve()
 
 
+def normalize_repo_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:40] or "repo"
+
+
+def repo_key_db():
+    """Checkout identity belongs to the Mac, so a home/Boat failover must share its cache."""
+    common.ensure_dirs()
+    con = sqlite3.connect(common.STATE / "repo-keys.db", timeout=5)
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT, ts REAL)")
+        return con
+    except BaseException:
+        con.close()
+        raise
+
+
 def repo_key(root: Path) -> str:
-    """Stable short name for a repo: basename of the origin URL (or dir) + 6-char hash of the path."""
-    name = root.name
+    """Remember the last successful origin lookup per resolved checkout, without caching a guessed name."""
+    root = root.resolve()
+    cache_key = "repo_key:" + str(root)
+    con, remembered = None, None
+    name, reason = None, None
     try:
         p = subprocess.run(["git", "config", "--get", "remote.origin.url"], cwd=root, capture_output=True,
                            text=True, timeout=5)
         url = p.stdout.strip()
-        if url:
-            name = re.sub(r"\.git$", "", url.rstrip("/").split("/")[-1].split(":")[-1]) or name
+        if p.returncode != 0:
+            reason = "error"
+        elif url:
+            name = re.sub(r"\.git$", "", url.rstrip("/").split("/")[-1].split(":")[-1])
+            if not name:
+                reason = "empty"
+        else:
+            reason = "empty"
+    except subprocess.TimeoutExpired:
+        reason = "timeout"
     except Exception:  # noqa: BLE001
-        pass
-    name = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:40] or "repo"
-    return name
+        reason = "error"
+    try:
+        # Another lookup can commit the origin key while this one waits on git.
+        try:
+            con = repo_key_db()
+            remembered = kv_get(con, cache_key)
+            if not isinstance(remembered, str) or not remembered:
+                remembered = None
+        except (OSError, sqlite3.Error) as error:
+            log(f"repo_key_cache_error {root} operation=read error={type(error).__name__}")
+        if reason:
+            used = remembered or normalize_repo_name(root.name)
+            log(f"repo_key_fallback {root} reason={reason} used={used}")
+            if remembered is None:
+                say(f"warning: origin lookup failed ({reason}) for {root}; no remembered pool key, using {used}")
+            return used
+        key = normalize_repo_name(name)
+        if con is not None and key != remembered:
+            try:
+                kv_set(con, cache_key, key)
+            except (OSError, sqlite3.Error) as error:
+                log(f"repo_key_cache_error {root} operation=write error={type(error).__name__}")
+        return key
+    finally:
+        if con is not None:
+            con.close()
 
 
 def _ancestors(thread_id: str) -> set[str]:

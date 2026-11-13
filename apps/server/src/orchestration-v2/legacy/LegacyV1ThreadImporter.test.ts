@@ -4,6 +4,8 @@ import {
   ComposerContextId,
   EventId,
   type OrchestrationMessageContext,
+  type OrchestrationV2AppThread,
+  type OrchestrationV2DomainEvent,
   ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -60,6 +62,24 @@ function fileImporterLayer(filename: string) {
   return Layer.mergeAll(stores, sink, importer);
 }
 
+function nativeCreationEvent(
+  template: OrchestrationV2AppThread,
+  threadId: ThreadId,
+): OrchestrationV2DomainEvent {
+  return {
+    id: EventId.make(`native:${threadId}:created`),
+    type: "thread.created",
+    threadId,
+    occurredAt: template.createdAt,
+    payload: {
+      ...template,
+      id: threadId,
+      historyOrigin: "native",
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+    },
+  };
+}
+
 const seedPendingTranscripts = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
@@ -97,7 +117,7 @@ const seedPendingTranscripts = Effect.gen(function* () {
 });
 
 it.live(
-  "probes imported and missing transcripts while a writer is held without caching a miss",
+  "probes imported, native and missing transcripts while a writer is held without caching a miss",
   () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -107,9 +127,19 @@ it.live(
         const sql = yield* SqlClient.SqlClient;
         const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
         const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const eventSink = yield* EventSink.EventSinkV2;
         const importedId = ThreadId.make("thread:first");
         const futureId = ThreadId.make("thread:future");
+        const nativeId = ThreadId.make("thread:native");
         yield* seedPendingTranscripts;
+        yield* eventSink.write({
+          events: [
+            nativeCreationEvent(
+              (yield* projections.getThreadProjection(importedId)).thread,
+              nativeId,
+            ),
+          ],
+        });
         // Mark it without invoking ensureTranscript, so its first probe is not cached.
         yield* sql`UPDATE orchestration_v2_legacy_imports
         SET transcript_imported_at = '2026-01-03T00:00:00.000Z'
@@ -125,22 +155,26 @@ it.live(
           yield* Deferred.await(held);
           const results = yield* Effect.all([
             importer.ensureTranscript(importedId),
+            importer.ensureTranscript(nativeId),
             importer.ensureTranscript(futureId),
           ]);
           assert.deepEqual(results, [
             { importedThreadCount: 0, importedMessageCount: 0 },
             { importedThreadCount: 0, importedMessageCount: 0 },
-          ]);
-          assert.deepEqual(
-            yield* importer
-              .ensureTranscript(importedId)
-              .pipe(
-                Effect.provideService(Statement.CurrentTransformer, () =>
-                  Effect.die("A confirmed transcript should not query SQLite again"),
-                ),
-              ),
             { importedThreadCount: 0, importedMessageCount: 0 },
-          );
+          ]);
+          for (const confirmedId of [importedId, nativeId]) {
+            assert.deepEqual(
+              yield* importer
+                .ensureTranscript(confirmedId)
+                .pipe(
+                  Effect.provideService(Statement.CurrentTransformer, () =>
+                    Effect.die("A confirmed transcript should not query SQLite again"),
+                  ),
+                ),
+              { importedThreadCount: 0, importedMessageCount: 0 },
+            );
+          }
         }).pipe(
           Effect.timeout("15 seconds"),
           Effect.ensuring(Deferred.succeed(release, undefined)),
@@ -186,6 +220,121 @@ it.live(
         });
       }).pipe(Effect.provide(fileImporterLayer(path.join(directory, "state.sqlite"))));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("rediscovers native completion from indexed durable events with a fresh importer", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const nativeId = ThreadId.make("thread:native-restart");
+    yield* seedPendingTranscripts;
+    yield* eventSink.write({
+      events: [
+        nativeCreationEvent(
+          (yield* projections.getThreadProjection(ThreadId.make("thread:first"))).thread,
+          nativeId,
+        ),
+      ],
+    });
+    const ensure = importer.ensureTranscript(nativeId);
+    assert.deepEqual(yield* ensure, { importedThreadCount: 0, importedMessageCount: 0 });
+    assert.deepEqual(
+      yield* ensure.pipe(
+        Effect.provideService(Statement.CurrentTransformer, () =>
+          Effect.die("Native completion was already confirmed"),
+        ),
+      ),
+      { importedThreadCount: 0, importedMessageCount: 0 },
+    );
+
+    const statements: Array<ReturnType<Statement.Statement<Record<string, unknown>>["compile"]>> =
+      [];
+    assert.deepEqual(
+      yield* Effect.gen(function* () {
+        const restarted = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
+        return yield* restarted.ensureTranscript(nativeId);
+      }).pipe(
+        Effect.provide(Layer.fresh(LegacyV1ThreadImporter.layer)),
+        Effect.provideService(Statement.CurrentTransformer, (statement) => {
+          statements.push(statement.compile());
+          return Effect.succeed(statement);
+        }),
+      ),
+      { importedThreadCount: 0, importedMessageCount: 0 },
+    );
+    assert.lengthOf(statements, 1);
+    const [query, params] = statements[0]!;
+    const plan = yield* sql.unsafe<{ readonly detail: string }>(
+      `EXPLAIN QUERY PLAN ${query}`,
+      params,
+    );
+    const details = plan.map((row) => row.detail).join("\n");
+    assert.match(details, /SEARCH orchestration_v2_legacy_imports USING INDEX .* \(thread_id=\?\)/);
+    assert.match(
+      details,
+      /SEARCH event USING INDEX orchestration_events_v2_created_threads_idx \(stream_id=\?\)/,
+    );
+    assert.notMatch(details, /SCAN (?:orchestration_v2_legacy_imports|event)\b/);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("does not cache native creation observed inside a transaction that rolls back", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const nativeId = ThreadId.make("thread:native-rollback");
+    yield* seedPendingTranscripts;
+    const template = (yield* projections.getThreadProjection(ThreadId.make("thread:first"))).thread;
+    yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          yield* eventSink.write({ events: [nativeCreationEvent(template, nativeId)] });
+          yield* importer.ensureTranscript(nativeId);
+          return yield* Effect.fail("rollback");
+        }),
+      )
+      .pipe(Effect.flip);
+    let reads = 0;
+    yield* importer.ensureTranscript(nativeId).pipe(
+      Effect.provideService(Statement.CurrentTransformer, (statement) => {
+        reads += 1;
+        return Effect.succeed(statement);
+      }),
+    );
+    assert.equal(reads, 1);
+    assert.deepEqual(
+      yield* sql`SELECT event_id FROM orchestration_events WHERE stream_id = ${nativeId}`,
+      [],
+    );
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("retries legacy hydration after its completion transaction rolls back", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
+    const threadId = ThreadId.make("thread:first");
+    yield* seedPendingTranscripts;
+    yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          assert.deepEqual(yield* importer.ensureTranscript(threadId), {
+            importedThreadCount: 1,
+            importedMessageCount: 1,
+          });
+          return yield* Effect.fail("rollback");
+        }),
+      )
+      .pipe(Effect.flip);
+    assert.deepEqual(yield* importer.ensureTranscript(threadId), {
+      importedThreadCount: 1,
+      importedMessageCount: 1,
+    });
+  }).pipe(Effect.provide(layerTest)),
 );
 
 it.live("serializes concurrent hydration after both callers probe an unimported transcript", () =>

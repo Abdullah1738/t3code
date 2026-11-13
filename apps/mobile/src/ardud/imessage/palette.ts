@@ -9,6 +9,10 @@ const LIGHT = {
   raised: "#f4f4f5",
   dot: "#007aff",
   link: "#1b4ed8",
+  agent: "#eaf1fb",
+  agentInk: "#1d3f73",
+  note: "#fbf3df",
+  noteInk: "#5c4400",
 } as const;
 
 const DARK = {
@@ -18,6 +22,10 @@ const DARK = {
   raised: "#1c1c1e",
   dot: "#0a84ff",
   link: "#8db4ff",
+  agent: "#16233a",
+  agentInk: "#b4cdf5",
+  note: "#2a2410",
+  noteInk: "#ecd38f",
 } as const;
 
 export type IMessagePalette = typeof LIGHT | typeof DARK;

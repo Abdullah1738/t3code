@@ -513,14 +513,15 @@ describe("transport shim", () => {
     expect(live).toEqual([{ url: "https://example.com/a", caption: "A" }]);
   });
 
-  test("a static card still goes out when the preview lookup fails", async () => {
+  test("a failed static preview stays unsent and retryable", async () => {
     const cards: unknown[] = [];
     const line = fakeLine({ sendApp: async (_chat, card) => { cards.push(card); return { handle: "app-f" }; } });
     const transport = sbTransport(line, chatKey.dm(moni), store(), undefined, {
-      static: true, previewImage: async () => { throw new Error("offline"); },
+      static: true, previewImage: async () => { throw new LineError("offline", "card_preview_unavailable", true, false); },
     });
-    await transport.sendApp({ id: "f1", chatGuid: "x", url: "https://example.com/x", caption: "X" });
-    expect(cards).toEqual([{ url: "https://example.com/x", caption: "X", interactive: false }]);
+    await expect(transport.sendApp({ id: "f1", chatGuid: "x", url: "https://example.com/x", caption: "X" }))
+      .rejects.toMatchObject({ code: "card_preview_unavailable", retryable: true, ambiguous: false });
+    expect(cards).toEqual([]);
   });
 
   test("typing failures surface as transport errors with the line code", async () => {
@@ -706,4 +707,22 @@ test("review: a recovered late unthreaded copy must not loop back to pending whe
     expect(copies).toHaveLength(2);
     expect(events.filter(event => event === "outbound-async-unthreaded")).toHaveLength(1);
   } finally { setSystemTime(); }
+});
+
+test("fresh text reserves and dispatches before queued cancellation; concurrent identical ids do not dispatch twice", async () => {
+  const events: string[] = [];
+  const accepted = Promise.withResolvers<{ handle: string }>();
+  const line = fakeLine({ sendText: () => { events.push("send"); return accepted.promise; } });
+  const transport = sbTransport(line, chatKey.dm(owner), store());
+  queueMicrotask(() => events.push("cancel"));
+  const input = { id: "same", chatGuid: "x", text: "All set" };
+  const first = transport.sendText(input);
+  expect(events).toEqual(["send"]);
+  const second = transport.sendText(input);
+  await expect(second).rejects.toMatchObject({code:"sendUnconfirmed",ambiguous:true});
+  expect(events).toEqual(["send","cancel"]);
+  accepted.resolve({handle:"accepted"});
+  expect(await first).toMatchObject({providerId:"accepted"});
+  expect(await transport.sendText(input)).toMatchObject({providerId:"accepted",duplicate:true});
+  expect(events).toEqual(["send","cancel"]);
 });

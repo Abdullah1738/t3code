@@ -503,6 +503,7 @@ describe("pull request detail decoding", () => {
             headRefName: "feat/detail",
             baseRefName: "main",
             headRefOid: "abc123",
+            baseRefOid: "base123",
             isCrossRepository: false,
             headRepositoryOwner: null,
             headRepository: null,
@@ -519,6 +520,7 @@ describe("pull request detail decoding", () => {
               nodes: [
                 {
                   commit: {
+                    oid: "abc123",
                     statusCheckRollup: {
                       contexts: { nodes: rollup, pageInfo: { hasNextPage: false } },
                     },
@@ -615,6 +617,27 @@ describe("pull request detail decoding", () => {
       ),
       commits: page.commits ?? [],
     }));
+
+  it.each([
+    [{ id: "REF", target: { __typename: "Commit", oid: "branch-tip" } }, "branch-tip"],
+    [null, null],
+    [{ id: "REF", target: null }, null],
+  ])("maps the source branch tip independently of the PR record: %j", (headRef, expected) => {
+    const result = detailOf([], { headRef });
+    expect(result.headSha).toBe("abc123");
+    expect(result.headBranchSha).toBe(expected);
+    expect(result.checksHeadSha).toBe("abc123");
+  });
+
+  it("keeps an absent checks commit unknown", () => {
+    expect(detailOf([], { commits: { nodes: [] } }).checksHeadSha).toBeNull();
+  });
+
+  it("keeps the base SHA reported by the existing core read", () => {
+    const result = decodePullRequestCoreJson(coreJson([], { baseRefOid: "f77c1992e5e9" }));
+    expect(Result.isSuccess(result)).toBe(true);
+    if (Result.isSuccess(result)) expect(result.success.baseSha).toBe("f77c1992e5e9");
+  });
 
   it("maps check-run status and commit-status state onto one vocabulary", () => {
     const detail = detailOf([

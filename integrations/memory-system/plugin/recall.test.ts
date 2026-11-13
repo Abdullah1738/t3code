@@ -66,9 +66,10 @@ describe("recall V2 thin adapter", () => {
     await h.hooks.get("execute.before")!(h.tool("git push origin HEAD:main"))
   })
 
-  test("source-derived rules flow through shared engine to real OpenCode pre-tool adapter", async () => {
+  async function acceptanceEngine(rulePreflight: boolean) {
+    const env: Record<string, string | undefined> = { ...process.env, RECALL_RULE_PREFLIGHT: rulePreflight ? "1" : "" }
     const engine = Bun.spawn(["python3", fileURLToPath(new URL("../tests/acceptance_engine.py", import.meta.url)), "--serve"],
-      { stdin: "ignore", stdout: "pipe", stderr: "pipe" })
+      { stdin: "ignore", stdout: "pipe", stderr: "pipe", env })
     cleanups.push(async () => { engine.kill(); await engine.exited })
     const reader = engine.stdout.getReader()
     let line = ""
@@ -77,7 +78,18 @@ describe("recall V2 thin adapter", () => {
       if (chunk.done) throw new Error(await new Response(engine.stderr).text())
       line += new TextDecoder().decode(chunk.value)
     }
-    const h = harness({ engineURL: JSON.parse(line).url }); await h.setup()
+    return JSON.parse(line).url as string
+  }
+
+  test("by default the shared engine never blocks or adds rule notes (rule index off)", async () => {
+    const h = harness({ engineURL: await acceptanceEngine(false) }); await h.setup()
+    await h.hooks.get("execute.before")!(h.tool("git push origin HEAD:main"))
+    expect(h.engineResults[0].decision).toBe("allow")
+    expect(h.engineResults[0].note).toBeNull()
+  })
+
+  test("source-derived rules flow through shared engine to real OpenCode pre-tool adapter (RECALL_RULE_PREFLIGHT=1)", async () => {
+    const h = harness({ engineURL: await acceptanceEngine(true) }); await h.setup()
     const before = h.hooks.get("execute.before")!
     await expect(before(h.tool("git push origin HEAD:main"))).rejects.toThrow("push to main-dev")
     expect(h.engineResults[0].sources.length).toBeGreaterThan(0)

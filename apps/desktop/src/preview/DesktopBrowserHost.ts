@@ -244,7 +244,10 @@ export const make = Effect.gen(function* () {
     work: () => Promise<A>,
   ) => {
     const pending = {};
-    tab.focusPending.set(pending, { owner, paints: method === "Page.captureScreenshot" });
+    tab.focusPending.set(pending, {
+      owner,
+      paints: /^(?:Page\.captureScreenshot|Runtime\.(?:evaluate|callFunctionOn))$/.test(method),
+    });
     tab.focusUses += 1;
     setFocusEmulation(tab, true);
     releaseFocusWhenIdle(tab);
@@ -365,6 +368,18 @@ export const make = Effect.gen(function* () {
             .then((result: { targetInfo: { targetId: string } }) => result.targetInfo.targetId),
         url: () => webContents.getURL(),
         title: () => webContents.getTitle(),
+        viewport: async () => {
+          const host = webContents.hostWebContents;
+          if (!host || host.isDestroyed()) return null;
+          return host.executeJavaScript(`(() => {
+            const view = [...document.querySelectorAll("webview[data-preview-server-tab]")].find(view => {
+              try { return view.getWebContentsId() === ${webContents.id}; } catch { return false; }
+            });
+            if (!view) return null;
+            return { mode: view.dataset.previewViewportMode,
+              width: Number(view.dataset.previewCssWidth), height: Number(view.dataset.previewCssHeight) };
+          })()`);
+        },
         userAgent: () => webContents.getUserAgent(),
         setDownloadDirectory: (directory) => {
           tab.downloadDirectory = directory;

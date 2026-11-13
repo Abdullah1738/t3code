@@ -1,3 +1,4 @@
+import { allocateAction, bindActionValue, markAction } from "../actionTelemetry.ts";
 import { KANBAN_WS_METHODS, type EnvironmentId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
@@ -17,6 +18,7 @@ import {
   squashAtomCommandFailure,
 } from "../../state/runtime.ts";
 import type { Unsubscribe } from "../common/store.ts";
+import type { PermissionStatus } from "../../state/commandPermissions.ts";
 
 type KanbanMethod = (typeof KANBAN_WS_METHODS)[keyof typeof KANBAN_WS_METHODS];
 export type KanbanStreamTag = typeof KANBAN_WS_METHODS.subscribe | typeof KANBAN_WS_METHODS.boards;
@@ -43,6 +45,7 @@ export interface KanbanTransport {
   ): Promise<EnvironmentRpcSuccess<TTag>>;
   /** Whether this connection's grants allow `tag`, for disabling its control. */
   permission(tag: KanbanRequestTag): Atom.Atom<boolean>;
+  permissionStatus(tag: KanbanRequestTag): Atom.Atom<PermissionStatus>;
 }
 
 /** No server is connected yet. Reads wait and retry on it instead of failing. */
@@ -85,11 +88,27 @@ function sessionStream(tag: KanbanStreamTag, input: unknown) {
             onSome: (session) => {
               const method = session.client[tag] as unknown as (
                 payload: unknown,
+                options?: { headers: Record<string, string> },
               ) => Stream.Stream<unknown, unknown>;
-              return method(input).pipe(
-                Stream.catchCause((cause) =>
-                  isTransportFailure(cause) ? Stream.empty : Stream.failCause(cause),
-                ),
+              return Stream.unwrap(
+                Effect.gen(function* () {
+                  const action = yield* allocateAction(tag);
+                  let ready = false;
+                  return method(input, { headers: { "x-robob-action-id": action.id } }).pipe(
+                    Stream.tap((value) =>
+                      Effect.sync(() => {
+                        if (!ready) {
+                          bindActionValue(value, action);
+                          ready = true;
+                          markAction(action, "state-ready");
+                        }
+                      }),
+                    ),
+                    Stream.catchCause((cause) =>
+                      isTransportFailure(cause) ? Stream.empty : Stream.failCause(cause),
+                    ),
+                  );
+                }),
               );
             },
           }),
@@ -103,6 +122,9 @@ function sessionStream(tag: KanbanStreamTag, input: unknown) {
 type KanbanRpcCommand = {
   readonly run: (...args: never[]) => unknown;
   readonly permissionAtom: (environmentId: EnvironmentId | null) => Atom.Atom<boolean>;
+  readonly permissionStatusAtom: (
+    environmentId: EnvironmentId | null,
+  ) => Atom.Atom<PermissionStatus>;
 };
 
 export function createAtomKanbanTransport<R, ER>(
@@ -119,6 +141,12 @@ export function createAtomKanbanTransport<R, ER>(
   };
 
   return {
+    permissionStatus(tag) {
+      const { permissionStatusAtom } = commandFor(tag);
+      return Atom.make((get) => get(permissionStatusAtom(get(environmentId)))).pipe(
+        Atom.withLabel(`kanban-permission-status:${tag}`),
+      );
+    },
     permission(tag) {
       const { permissionAtom } = commandFor(tag);
       // The primary environment changes with the connection, so the grant is read per target.

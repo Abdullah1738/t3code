@@ -23,12 +23,13 @@ const HeadSchema = Schema.Struct({
 });
 const decodeHead = Schema.decodeUnknownEffect(Schema.fromJsonString(HeadSchema));
 
-const WorkflowRunSchema = Schema.Struct({
+export const WorkflowRunSchema = Schema.Struct({
   id: Schema.Int,
   name: Schema.optional(Schema.NullOr(Schema.String)),
   html_url: Schema.optional(Schema.NullOr(Schema.String)),
   status: Schema.optional(Schema.NullOr(Schema.String)),
   conclusion: Schema.optional(Schema.NullOr(Schema.String)),
+  event: Schema.optional(Schema.NullOr(Schema.String)),
   head_branch: Schema.optional(Schema.NullOr(Schema.String)),
 });
 const decodeWorkflowRuns = Schema.decodeUnknownOption(
@@ -37,9 +38,14 @@ const decodeWorkflowRuns = Schema.decodeUnknownOption(
 
 export type KnownWorkflowRun = typeof WorkflowRunSchema.Type;
 
+export const isActiveWorkflowRun = (run: KnownWorkflowRun): boolean =>
+  ["queued", "in_progress", "waiting", "requested", "pending"].includes(run.status ?? "");
+
 export const KnownWorkflowRuns = Context.Reference<{
   readonly headSha: string;
   readonly runs: ReadonlyArray<KnownWorkflowRun>;
+  /** A partial list cannot establish that no workflows need approval. */
+  readonly complete: boolean;
 } | null>("@t3tools/source-control-github/server/gitHubConditionalChecks/KnownWorkflowRuns", {
   defaultValue: () => null,
 });
@@ -139,14 +145,12 @@ export const makeChecksRevalidator = Effect.gen(function* () {
           if ((yield* get(`${root}/pulls/${input.number}`, true)) === null) return yield* read;
           const head = entry.head;
           if (head === null) return yield* fail(200);
-          const runsEndpoint =
-            head.head.repo?.id !== head.base.repo.id
-              ? `${root}/actions/runs?head_sha=${head.head.sha}&event=pull_request`
-              : null;
+          const fork = head.head.repo?.id !== head.base.repo.id;
+          const runsEndpoint = `${root}/actions/runs?head_sha=${head.head.sha}`;
           const endpoints = [
             `${root}/commits/${head.head.sha}/check-runs?filter=all`,
             `${root}/commits/${head.head.sha}/status`,
-            ...(runsEndpoint === null ? [] : [runsEndpoint]),
+            runsEndpoint,
           ];
           const runPages: Array<string> = [];
           for (const endpoint of endpoints) {
@@ -156,23 +160,31 @@ export const makeChecksRevalidator = Effect.gen(function* () {
               const next = yield* get(paged);
               if (next === null) return yield* read;
               if (endpoint === runsEndpoint) runPages.push(paged);
-              if (!next) break;
+              if (!next || (endpoint === runsEndpoint && !fork)) break;
             }
           }
           const now = yield* Clock.currentTimeMillis;
-          if (entry.value !== null && now - entry.readAt < 5 * 60_000) return entry.value;
           const pages = runPages.map((endpoint) =>
             decodeWorkflowRuns(entry.validators.get(endpoint)?.body ?? ""),
           );
-          const known =
-            runsEndpoint !== null && pages.every(Option.isSome)
-              ? {
-                  headSha: head.head.sha,
-                  runs: pages.flatMap((page) =>
-                    Option.isSome(page) ? page.value.workflow_runs : [],
-                  ),
-                }
-              : null;
+          const known = pages.every(Option.isSome)
+            ? {
+                headSha: head.head.sha,
+                complete: entry.validators.get(runPages[runPages.length - 1]!)?.next === false,
+                runs: pages.flatMap((page) =>
+                  Option.isSome(page) ? page.value.workflow_runs : [],
+                ),
+              }
+            : null;
+          // A workflow can be active before its jobs reach the rollup. A 304 must not
+          // extend an all-green snapshot through that gap (or a delayed GraphQL update).
+          const active = known?.runs.some(isActiveWorkflowRun) === true;
+          if (
+            entry.value !== null &&
+            now - entry.readAt < 5 * 60_000 &&
+            !(active && !entry.value.checks.some((check) => check.status === "pending"))
+          )
+            return entry.value;
           const fresh = yield* read.pipe(Effect.provideService(KnownWorkflowRuns, known));
           const value = {
             state: fresh.state,

@@ -18,6 +18,12 @@ import {
   makeStoredShellSnapshotEncoder,
 } from "@t3tools/client-runtime/platform";
 import { TokenStore } from "@t3tools/client-runtime/authorization";
+// ardud: a paged shell load's pages, so a renderer that died mid-load resumes.
+import {
+  ShellLoadJournal,
+  makeKeyValueShellLoadJournal,
+  shellLoadKeyPrefix,
+} from "@t3tools/client-runtime/ardud/shellLoadJournal";
 import {
   ConnectionTransientError,
   ConnectionBlockedError,
@@ -238,6 +244,29 @@ function readDatabaseValueOnConnection(database: IDBDatabase, storeName: string,
   }).pipe(Effect.withSpan("web.connectionStorage.readDatabaseValue"));
 }
 
+function readDatabaseKeysOnConnection(
+  database: IDBDatabase,
+  storeName: string,
+  range: IDBKeyRange,
+) {
+  return Effect.callback<ReadonlyArray<IDBValidKey>, ConnectionTransientError>((resume) => {
+    try {
+      const request = database
+        .transaction(storeName, "readonly")
+        .objectStore(storeName)
+        .getAllKeys(range);
+      request.addEventListener("error", () => {
+        resume(Effect.fail(catalogError("read", request.error ?? "Unknown IndexedDB read error")));
+      });
+      request.addEventListener("success", () => {
+        resume(Effect.succeed(request.result));
+      });
+    } catch (cause) {
+      resume(Effect.fail(catalogError("read", cause)));
+    }
+  }).pipe(Effect.withSpan("web.connectionStorage.readDatabaseKeys"));
+}
+
 function writeDatabaseValueOnConnection(
   database: IDBDatabase,
   storeName: string,
@@ -333,6 +362,10 @@ function removeDatabaseValuesInRangeOnConnection(
 
 function readDatabaseValue(database: DatabaseHandle, storeName: string, key: IDBValidKey) {
   return withDatabase(database, (opened) => readDatabaseValueOnConnection(opened, storeName, key));
+}
+
+function readDatabaseKeys(database: DatabaseHandle, storeName: string, range: IDBKeyRange) {
+  return withDatabase(database, (opened) => readDatabaseKeysOnConnection(opened, storeName, range));
 }
 
 function writeDatabaseValue(
@@ -915,6 +948,14 @@ export const layer = Layer.effectContext(
             removeDatabaseValue(database, SHELL_STORE_NAME, environmentId),
             removeDatabaseValuesInRange(
               database,
+              SHELL_STORE_NAME,
+              IDBKeyRange.bound(
+                shellLoadKeyPrefix(environmentId),
+                `${shellLoadKeyPrefix(environmentId)}\uffff`,
+              ),
+            ),
+            removeDatabaseValuesInRange(
+              database,
               THREAD_STORE_NAME,
               IDBKeyRange.bound(`${environmentId}:`, `${environmentId}:\uffff`),
             ),
@@ -929,7 +970,22 @@ export const layer = Layer.effectContext(
         ).pipe(Effect.mapError((cause) => persistenceError("clear-environment", cause))),
     });
 
+    // ardud: journal records sit in the shell store under keys no environment id can take
+    // (`<environment>\0shell-load\0...`), so builds without the journal never see them and no
+    // database version change is needed.
+    const shellLoadJournal = makeKeyValueShellLoadJournal({
+      get: (key) => readDatabaseValue(database, SHELL_STORE_NAME, key),
+      put: (key, value) => writeDatabaseValue(database, SHELL_STORE_NAME, key, value),
+      keys: (from, to) =>
+        readDatabaseKeys(database, SHELL_STORE_NAME, IDBKeyRange.bound(from, to)).pipe(
+          Effect.map((keys) => keys.filter((key): key is string => typeof key === "string")),
+        ),
+      removeRange: (from, to) =>
+        removeDatabaseValuesInRange(database, SHELL_STORE_NAME, IDBKeyRange.bound(from, to)),
+    });
+
     return Context.make(Persistence.ConnectionTargetStore, targetStore).pipe(
+      Context.add(ShellLoadJournal, shellLoadJournal),
       Context.add(GitHubRoutingPermissions, githubRoutingPermissions),
       Context.add(Persistence.ConnectionRegistrationStore, registrationStore),
       Context.add(ProfileStore.ConnectionProfileStore, profileStore),

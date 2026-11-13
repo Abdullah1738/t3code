@@ -27,6 +27,7 @@ export interface McpThreadCaller {
 }
 
 export interface McpClientCaller {
+  readonly maintenanceAuthorized?: boolean;
   readonly sessionId: string;
   readonly label: string;
   readonly access: AuthMcpClientAccess;

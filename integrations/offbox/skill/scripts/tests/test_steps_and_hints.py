@@ -1,6 +1,7 @@
 """Offline tests: --step runs, step summary, trailing-grep hint, box setup failure (exit 97) mapped to infra 90."""
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -9,11 +10,10 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
-from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import cli, lease, runs  # noqa: E402
+from offbox_lib import cli, lease, misc, runs  # noqa: E402
 from offbox_lib.common import EXIT_INFRA, OffboxError  # noqa: E402
 from offbox_lib.runs import GO_STD_GLITCH  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
@@ -44,7 +44,7 @@ class StepScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             (Path(home) / 'w/repo/sub').mkdir(parents=True)
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                patch.object(runs, 'LDCACHE_REPAIR', ':'):
+                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('w/repo', 'sub', [], None, 'run-test', steps=steps)
             env = {'HOME': home, 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
             p = subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True)
@@ -52,7 +52,7 @@ class StepScriptTests(unittest.TestCase):
 
     def test_script_has_one_marker_per_step_and_pipefail(self):
         with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                patch.object(runs, 'LDCACHE_REPAIR', ':'):
+                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
             script = runs.remote_script('w/repo', '.', [], None, 'r', steps=['true', 'false | cat'])
         self.assertEqual(script.count('offbox step '), 2)
         self.assertEqual(script.count('set -o pipefail'), 2)
@@ -80,6 +80,748 @@ class StepScriptTests(unittest.TestCase):
         rc, _, err = self.run_steps(['exit 2', 'echo still-running'])
         self.assertEqual(rc, 2)
         self.assertIn('offbox step 2 rc=0', err)
+
+
+class MissingDepsTests(unittest.TestCase):
+
+    def test_install_selection(self):
+        cases = [
+            ({'pnpm-lock.yaml'}, 'pnpm@11.7.0', 'corepack pnpm@11.7.0 install --frozen-lockfile'),
+            ({'yarn.lock'}, 'pnpm@10.18.0', 'corepack pnpm@10.18.0 install --frozen-lockfile'),
+            ({'pnpm-lock.yaml'}, 'yarn@1.22.22', 'corepack yarn@1.22.22 install --frozen-lockfile'),
+            ({'pnpm-lock.yaml'}, 'yarn@4.9.2', 'corepack yarn@4.9.2 install --immutable'),
+            ({'pnpm-lock.yaml'}, 'bun@1.3.0', 'bun install --frozen-lockfile'),
+            ({'pnpm-lock.yaml', 'package-lock.json'}, 'npm@11.0.0', 'npm ci'),
+            ({'pnpm-lock.yaml'}, 'npm@11.0.0', 'npm ci'),
+            ({'pnpm-lock.yaml', 'bun.lock', 'yarn.lock', 'package-lock.json'}, None, 'corepack pnpm install --frozen-lockfile'),
+            ({'bun.lock', 'yarn.lock', 'package-lock.json'}, None, 'corepack yarn install --frozen-lockfile'),
+            ({'bun.lockb'}, None, 'bun install --frozen-lockfile'),
+            ({'bun.lock'}, None, 'bun install --frozen-lockfile'),
+            ({'yarn.lock', 'package-lock.json'}, None, 'corepack yarn install --frozen-lockfile'),
+            ({'package-lock.json'}, None, 'npm ci'),
+            ({'npm-shrinkwrap.json'}, None, 'npm ci'),
+            (set(), None, 'npm install'),
+            ({'pnpm-lock.yaml'}, 'unknown@1', 'corepack pnpm install --frozen-lockfile'),
+            ({'package-lock.json'}, '', 'npm ci'),
+        ]
+        for files, manager, install in cases:
+            with self.subTest(files=files, manager=manager), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / 'package.json').write_text(json.dumps({'packageManager': manager}))
+                for name in files:
+                    (root / name).touch()
+                hint = runs.missing_deps_hint(root)
+                self.assertIn(f"offbox run -- '{install} && <command>'", hint)
+                self.assertIn('offbox save --default', hint)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                self.assertIn(f'with {install} &&', err.getvalue())
+
+    def test_package_manager_pin_suffixes_keep_precedence(self):
+        for suffix in ('', '-rc.53', '+sha224.abcdef', '-rc.53+sha224.abcdef'):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                pin = 'yarn@4.0.0' + suffix
+                (root / 'package.json').write_text(json.dumps({'packageManager': pin}))
+                (root / 'pnpm-lock.yaml').touch()
+                expected = f'corepack {pin} install --immutable'
+                self.assertIn(expected, runs.missing_deps_hint(root))
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                self.assertIn(expected, err.getvalue())
+
+    def test_ci_action_mapping_order_and_quotes(self):
+        for quote in ('', "'", '"'):
+            for with_first in (False, True):
+                for named in (False, True):
+                    with self.subTest(quote=quote, with_first=with_first, named=named), tempfile.TemporaryDirectory() as d:
+                        root = Path(d)
+                        (root / '.github/workflows').mkdir(parents=True)
+                        uses = f'    uses: {quote}pnpm/action-setup@v4{quote} # setup\n'
+                        settings = '    with:\n      version: "10.18.0" # pin\n'
+                        block = settings + uses if with_first else uses + settings
+                        if named:
+                            block = '  - name: Setup pnpm\n' + block
+                        else:
+                            block = '  - ' + block.lstrip()
+                        (root / '.github/workflows/ci.yml').write_text('steps:\n' + block)
+                        (root / 'pnpm-lock.yaml').touch()
+                        self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
+
+    def test_ci_action_with_nonstandard_child_indent(self):
+        for spaces in (6, 8):
+            with self.subTest(spaces=spaces), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yml').write_text(
+                    'steps:\n  - uses: pnpm/action-setup@v4\n    with:\n' + ' ' * spaces + 'version: 10.18.0\n')
+                (root / 'pnpm-lock.yaml').touch()
+                self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
+
+    def test_block_scalar_text_cannot_invent_ci_pins(self):
+        for style in ('|', '>', '|-', '>+', '|2'):
+            for fake in ("PNPM_VERSION: '26'", "- uses: pnpm/action-setup@v4\n    with:\n      version: 26"):
+                with self.subTest(style=style, fake=fake), tempfile.TemporaryDirectory() as d:
+                    root = Path(d)
+                    (root / '.github/workflows').mkdir(parents=True)
+                    body = '\n'.join('      ' + line for line in fake.splitlines())
+                    workflow = 'steps:\n  - run: ' + style + '\n' + body + '\n  - uses: pnpm/action-setup@v4\n    with:\n      version: 10\n'
+                    (root / '.github/workflows/ci.yml').write_text(workflow)
+                    (root / 'pnpm-lock.yaml').touch()
+                    self.assertIn('corepack pnpm@10 install', runs.missing_deps_hint(root))
+
+    def test_npm_and_bun_pins_are_printed_in_both_hints(self):
+        for pin in ('npm@10.8.2', 'bun@1.3.0'):
+            with self.subTest(pin=pin), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / 'package.json').write_text(json.dumps({'packageManager': pin}))
+                manager, version = pin.split('@')
+                self.assertIn(f'Use {manager} {version} from package.json', runs.missing_deps_hint(root))
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                self.assertIn(f'Use {manager} {version} from package.json', err.getvalue())
+
+    def test_ci_inline_mapping_and_step_spacing(self):
+        for spacing in (1, 3):
+            for inline in (False, True):
+                for quote in ('', "'", '"'):
+                    with self.subTest(spacing=spacing, inline=inline, quote=quote), tempfile.TemporaryDirectory() as d:
+                        root = Path(d)
+                        (root / '.github/workflows').mkdir(parents=True)
+                        indent = ' ' * (3 + spacing)
+                        uses = '  -' + ' ' * spacing + f'uses: {quote}pnpm/action-setup@v4{quote}\n'
+                        settings = (indent + 'with: { version: "10.18.0" }\n' if inline else
+                                    indent + 'with:\n' + indent + '  version: 10.18.0\n')
+                        (root / '.github/workflows/ci.yml').write_text('steps:\n' + uses + settings)
+                        (root / 'pnpm-lock.yaml').touch()
+                        self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
+
+    def test_explicit_url_descriptor_keeps_manager_and_requests_inspection(self):
+        for manager in ('yarn', 'pnpm', 'npm', 'bun'):
+            with self.subTest(manager=manager), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / 'package.json').write_text(json.dumps({
+                    'packageManager': manager + '@https://example.invalid/manager.js#sha224.abcdef'}))
+                (root / ('yarn.lock' if manager == 'pnpm' else 'pnpm-lock.yaml')).touch()
+                hint = runs.missing_deps_hint(root)
+                self.assertIn(f'packageManager declares {manager} with a non-numeric descriptor', hint)
+                self.assertIn(f"{'corepack ' if manager in ('yarn', 'pnpm') else ''}{manager} ", hint)
+                self.assertNotIn('https://', hint)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                self.assertIn(f'packageManager declares {manager} with a non-numeric descriptor', err.getvalue())
+
+    def test_multiline_quoted_shell_content_is_not_config(self):
+        for quote in ("'", '"'):
+            for real in (False, True):
+                with self.subTest(quote=quote, real=real), tempfile.TemporaryDirectory() as d:
+                    root = Path(d)
+                    (root / '.github/workflows').mkdir(parents=True)
+                    workflow = 'steps:\n  - run: ' + quote + 'echo\n      PNPM_VERSION: 26\n      - uses: pnpm/action-setup@v4\n        with: {version: 26}\n      echo done' + quote + '\n'
+                    if real:
+                        workflow += '  - uses: pnpm/action-setup@v4\n    with: {version: 10.18.0}\n'
+                    (root / '.github/workflows/ci.yml').write_text(workflow)
+                    (root / 'pnpm-lock.yaml').touch()
+                    hint = runs.missing_deps_hint(root)
+                    self.assertNotIn('pnpm@26', hint)
+                    self.assertIn('corepack pnpm@10.18.0 install' if real else 'corepack pnpm install', hint)
+
+    def test_flow_mapping_version_with_other_keys_and_nested_values(self):
+        for fields in ('version: 10.18.0, run_install: false',
+                       'run_install: false, version: "10.18.0"',
+                       '"version": 10.18.0, options: {fake: 1, version: 26}',
+                       "options: {fake: 1, version: 26}, version: '10.18.0'",
+                       'options: "fake, version: 26", version: 10.18.0'):
+            with self.subTest(fields=fields), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yml').write_text(
+                    'steps:\n  - uses: pnpm/action-setup@v4\n    with: {' + fields + '}\n')
+                (root / 'pnpm-lock.yaml').touch()
+                self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
+
+    def test_scalar_name_with_variable_dash_spacing_preserves_sibling_keys(self):
+        for spacing in (1, 3):
+            for style in ('|', '>-'):
+                with self.subTest(spacing=spacing, style=style), tempfile.TemporaryDirectory() as d:
+                    root = Path(d)
+                    (root / '.github/workflows').mkdir(parents=True)
+                    indent = ' ' * (3 + spacing)
+                    workflow = ('steps:\n  -' + ' ' * spacing + 'name: ' + style + '\n' + indent + '  Setup pnpm\n' +
+                                indent + 'uses: pnpm/action-setup@v4\n' + indent + 'with: {version: 10.18.0}\n')
+                    (root / '.github/workflows/ci.yml').write_text(workflow)
+                    (root / 'pnpm-lock.yaml').touch()
+                    self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
+
+    def test_all_scalar_key_styles_and_plain_continuations_are_opaque(self):
+        for key in ('run', "'run'", '"run"'):
+            for value in ('|', 'echo first', '"echo first', '{command: "echo first'):
+                with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as d:
+                    root = Path(d)
+                    (root / '.github/workflows').mkdir(parents=True)
+                    close = '      end"}\n' if value.startswith('{') else '      end"\n' if value.startswith('"') else ''
+                    workflow = ('steps:\n  - ' + key + ': ' + value + '\n      PNPM_VERSION: 26\n' + close +
+                                '  - uses: pnpm/action-setup@v4\n    with: {version: 10.18.0}\n')
+                    (root / '.github/workflows/ci.yml').write_text(workflow)
+                    (root / 'pnpm-lock.yaml').touch()
+                    self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
+
+    def test_flow_trailing_comment_does_not_change_fields(self):
+        for comment in ('# ${{ env.PNPM_VERSION }}', '# {version: 26}', '# }}}', '# "{quoted}"'):
+            with self.subTest(comment=comment), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yml').write_text(
+                    'steps:\n  - uses: pnpm/action-setup@v4\n    with: {version: 10.18.0} ' + comment + '\n')
+                (root / 'pnpm-lock.yaml').touch()
+                self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
+
+    def test_literal_config_keys_can_be_quoted(self):
+        for quote in ("'", '"'):
+            with self.subTest(quote=quote), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / 'pnpm-lock.yaml').touch()
+                workflow = ('steps:\n  - ' + quote + 'uses' + quote + ': pnpm/action-setup@v4\n    ' +
+                            quote + 'with' + quote + ':\n      ' + quote + 'version' + quote + ': 10.18.0\n')
+                (root / '.github/workflows/ci.yml').write_text(workflow)
+                self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
+                (root / '.github/workflows/ci.yml').write_text('env:\n  ' + quote + 'PNPM_VERSION' + quote + ': 10.18.0\n')
+                self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
+
+    def test_multiline_flow_comments_remain_outside_values(self):
+        for contents in ('version: 10.18.0 # literal CI pin',
+                         'version: 10.18.0 # } fake close',
+                         'version: 10.18.0, # {, version: 26',
+                         'options: "# quoted,version: 26",\n      version: 10.18.0 # pin'):
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yml').write_text(
+                    'steps:\n  - uses: pnpm/action-setup@v4\n    with: {\n      ' + contents + '\n    }\n')
+                (root / 'pnpm-lock.yaml').touch()
+                self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
+
+    def test_scalar_body_can_start_after_the_key_line(self):
+        for value in ('|\n        PNPM_VERSION: 26',
+                      '>-\n        PNPM_VERSION: 26',
+                      'echo first\n        PNPM_VERSION: 26',
+                      '"echo first\n        PNPM_VERSION: 26\n        done"',
+                      "'echo first\n        PNPM_VERSION: 26\n        done'",
+                      '{command: "echo first\n        PNPM_VERSION: 26\n        done"}'):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yml').write_text(
+                    'steps:\n  - run:\n      ' + value + '\n  - uses: pnpm/action-setup@v4\n    with: {version: 10.18.0}\n')
+                (root / 'pnpm-lock.yaml').touch()
+                self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
+
+    def test_quotes_in_plain_scalars_cannot_keep_comment_pins(self):
+        for quote in ("'", '"'):
+            for real_pin in (False, True):
+                with self.subTest(quote=quote, real_pin=real_pin), tempfile.TemporaryDirectory() as d:
+                    root = Path(d)
+                    (root / '.github/workflows').mkdir(parents=True)
+                    value = f'pnpm{quote}s-home'
+                    comment = f'# user{quote}s cache, version: 26,'
+                    fields = '      dest: ' + value + (',' if real_pin else '') + ' ' + comment + '\n'
+                    if real_pin:
+                        fields += '      version: 10.18.0\n'
+                    (root / '.github/workflows/ci.yml').write_text(
+                        'steps:\n  - uses: pnpm/action-setup@v4\n    with: {\n' + fields + '    }\n')
+                    (root / 'pnpm-lock.yaml').touch()
+                    hint = runs.missing_deps_hint(root)
+                    self.assertNotIn('pnpm@26', hint)
+                    self.assertIn('corepack pnpm@10.18.0 install' if real_pin else 'corepack pnpm install', hint)
+
+    def test_colon_in_plain_scalar_is_not_a_quote_boundary(self):
+        for quote in ("'", '"'):
+            for real_pin in (False, True):
+                with self.subTest(quote=quote, real_pin=real_pin), tempfile.TemporaryDirectory() as d:
+                    root = Path(d)
+                    (root / '.github/workflows').mkdir(parents=True)
+                    field = f'      dest: pnpm:{quote}s-home' + (',' if real_pin else '') + f' # user{quote}s cache, version: 26,\n'
+                    if real_pin:
+                        field += '      version: 10.18.0\n'
+                    (root / '.github/workflows/ci.yml').write_text(
+                        'steps:\n  - uses: pnpm/action-setup@v4\n    with: {\n' + field + '    }\n')
+                    (root / 'pnpm-lock.yaml').touch()
+                    hint = runs.missing_deps_hint(root)
+                    self.assertNotIn('pnpm@26', hint)
+                    self.assertIn('corepack pnpm@10.18.0 install' if real_pin else 'corepack pnpm install', hint)
+
+    def test_compact_quoted_key_value_mapping_retains_version(self):
+        for quote in ("'", '"'):
+            with self.subTest(quote=quote), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yml').write_text(
+                    'steps:\n  - uses: pnpm/action-setup@v4\n    with: {' + quote + 'version' + quote + ':' + quote + '10.18.0' + quote + '}\n')
+                (root / 'pnpm-lock.yaml').touch()
+                self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
+
+    def test_vite_plus_repo_installs_with_its_manager_not_vp(self):
+        for pin, command in ((None, 'npm install'), ('pnpm@11.7.0', 'corepack pnpm@11.7.0 install --frozen-lockfile'),
+                             ('yarn@4.9.2', 'corepack yarn@4.9.2 install --immutable')):
+            with self.subTest(pin=pin), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / 'package.json').write_text(json.dumps({
+                    'packageManager': pin, 'devDependencies': {'vite-plus': '1.0.0'}}))
+                self.assertIn(f"offbox run -- '{command} &&", runs.missing_deps_hint(root))
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                self.assertIn(f'with {command} &&', err.getvalue())
+                self.assertNotIn('vp i &&', err.getvalue())
+
+    def test_ci_pnpm_pin_and_node_engine_in_both_hints(self):
+        workflows = [
+            "env:\n  PNPM_VERSION: '10'\n",
+            'env:\n  PNPM_VERSION: "10" # CI pin\n',
+            "steps:\n  - uses: pnpm/action-setup@v4\n    with:\n      version: 10.18.0\n",
+            "steps:\n  - name: Setup pnpm\n    uses: pnpm/action-setup@v4\n    with:\n      version: 10.18.0\n",
+        ]
+        for workflow in workflows:
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yaml').write_text(workflow)
+                (root / 'package.json').write_text(json.dumps({'engines': {'node': '^20.19.0 || >=22.12.0 <23'}}))
+                (root / 'pnpm-lock.yaml').touch()
+                hint = runs.missing_deps_hint(root)
+                pin = '10.18.0' if '10.18.0' in workflow else '10'
+                self.assertIn(f'corepack pnpm@{pin} install --frozen-lockfile', hint)
+                self.assertIn('Use Node matching package.json engines', hint)
+                ranges, _ = runs.node_version.want(root, root)
+                installed = [20000000, 22023002, 26002000]
+                selected = max(v for v in installed if any(lo <= v < hi for lo, hi in ranges))
+                self.assertEqual(selected, 22023002)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                self.assertIn(f'corepack pnpm@{pin} install --frozen-lockfile', err.getvalue())
+                (root / 'package.json').write_text('{"packageManager":"pnpm@11.7.0"}')
+                self.assertIn('corepack pnpm@11.7.0 ', runs.missing_deps_hint(root))
+
+    def test_ci_setup_expressions_defer_both_hints(self):
+        expressions = ('matrix.pnpm', 'env.PNPM_VERSION', 'env.OTHER_VERSION',
+                       'inputs.pnpm', 'needs.setup.outputs.pnpm')
+        for expression in expressions:
+            for layout in ('block', 'flow', 'quoted-flow'):
+                with self.subTest(expression=expression, layout=layout), tempfile.TemporaryDirectory() as d:
+                    root = Path(d)
+                    (root / '.github/workflows').mkdir(parents=True)
+                    value = '${{ ' + expression + ' }}'
+                    settings = {
+                        'block': f'    with:\n      version: {value}\n',
+                        'flow': f'    with: {{version: "{value}", run_install: false}}\n',
+                        'quoted-flow': f'    "with": {{run_install: false, \'version\': \'{value}\'}}\n',
+                    }[layout]
+                    workflow = ("env:\n  PNPM_VERSION: '10'\njobs:\n  checks:\n    strategy:\n      matrix:\n        pnpm: [11]\n"
+                                '    steps:\n      - uses: pnpm/action-setup@v4\n' +
+                                ''.join('    ' + line for line in settings.splitlines(keepends=True)))
+                    (root / '.github/workflows/ci.yml').write_text(workflow)
+                    (root / 'package.json').write_text('{}')
+                    (root / 'pnpm-lock.yaml').touch()
+                    log = root / 'run.log'
+                    log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
+                        self.assertIn('<repo-install>', hint)
+                        self.assertIn('CI pnpm version is ambiguous', hint)
+                        self.assertIn('inspect', hint)
+                        self.assertNotIn('corepack pnpm', hint)
+                    # A repository-owned pin still outranks dynamic CI configuration.
+                    (root / 'package.json').write_text('{"packageManager":"pnpm@10.18.0"}')
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
+                        self.assertIn('corepack pnpm@10.18.0 install', hint)
+                        self.assertNotIn('CI pnpm version is ambiguous', hint)
+
+    def test_ci_expressions_and_conflicting_versions_need_inspection(self):
+        for workflow, inspect in (
+            ("env:\n  PNPM_VERSION: '${{ matrix.pnpm }}'\n", True),
+            ("steps:\n  # uses: pnpm/action-setup@v4\n  - uses: other/action@v1\n    with:\n      version: 26\n", False),
+            ("steps:\n  - run: echo uses: pnpm/action-setup@v4\n    with:\n      version: 26\n", False),
+            ("env:\n  PNPM_VERSION: '10'\njobs:\n  checks:\n    env:\n      PNPM_VERSION: '11'\n", True),
+            ("steps:\n  - uses: pnpm/action-setup@v4\n    with:\n      version: ${{ env.PNPM_VERSION }}\n  - uses: actions/setup-node@v4\n    with:\n      version: 26\n", True),
+        ):
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yml').write_text(workflow)
+                (root / 'package.json').write_text('{}')
+                (root / 'pnpm-lock.yaml').touch()
+                log = root / 'run.log'
+                log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
+                    self.assertIn('<repo-install>' if inspect else 'corepack pnpm install', hint)
+                    self.assertEqual('CI pnpm version is ambiguous' in hint, inspect)
+                    self.assertNotIn('pnpm@', hint)
+
+    def test_ci_expression_in_another_workflow_blocks_literal_selection(self):
+        for dynamic in ("version: ${{ matrix.pnpm }}", "version: nightly", "version:"):
+            with self.subTest(dynamic=dynamic), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yml').write_text("env:\n  PNPM_VERSION: '10'\n")
+                (root / '.github/workflows/check.yaml').write_text(
+                    'steps:\n  - uses: pnpm/action-setup@v4\n    with:\n      ' + dynamic + '\n')
+                (root / 'package.json').write_text('{}')
+                (root / 'pnpm-lock.yaml').touch()
+                log = root / 'run.log'
+                log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
+                    self.assertIn('CI pnpm version is ambiguous', hint)
+                    self.assertIn('<repo-install>', hint)
+                    self.assertNotIn('corepack pnpm', hint)
+                # The repo bootstrap cannot hide an unresolved version requirement.
+                (root / 'package.json').write_text('{"devDependencies":{"vite-plus":"1.0.0"}}')
+                self.assertIn('<repo-install>', runs.box_deps_hint(root, log))
+
+    def test_flow_setup_steps_and_inline_env_keep_unresolved_candidates(self):
+        cases = (
+            "  - {uses: pnpm/action-setup@v4, with: {version: '${{ matrix.pnpm }}'}}\n",
+            "  - {\n      uses: pnpm/action-setup@v4, # setup\n      with: {version: '${{ matrix.pnpm }}'}\n    }\n",
+            "  - {'with': {run_install: false, version: '${{ inputs.pnpm }}'}, \"uses\": 'pnpm/action-setup@v4'}\n",
+            "  - env: {PNPM_VERSION: '${{ matrix.pnpm }}', OTHER: ignored}\n    uses: pnpm/action-setup@v4\n    with: {version: '${{ env.PNPM_VERSION }}'}\n",
+            "  - {env: {PNPM_VERSION: '${{ matrix.pnpm }}'}, uses: pnpm/action-setup@v4, with: {version: '10'}}\n",
+            "  - {uses: pnpm/action-setup@v4, env: {'PNPM_VERSION': '${{ matrix.pnpm }}'}, with: {version: '10'}}\n",
+        )
+        for steps in cases:
+            with self.subTest(steps=steps), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yml').write_text(
+                    "env:\n  PNPM_VERSION: '10'\nsteps:\n" + steps)
+                (root / 'package.json').write_text('{}')
+                (root / 'pnpm-lock.yaml').touch()
+                log = root / 'run.log'
+                log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
+                    self.assertIn('<repo-install>', hint)
+                    self.assertIn('CI pnpm version is ambiguous', hint)
+                    self.assertNotIn('corepack pnpm', hint)
+                # The same flow shape must preserve literal pins when no candidate is dynamic.
+                workflow = (root / '.github/workflows/ci.yml').read_text()
+                workflow = workflow.replace('${{ matrix.pnpm }}', '10').replace('${{ inputs.pnpm }}', '10')
+                workflow = workflow.replace('${{ env.PNPM_VERSION }}', '10')
+                (root / '.github/workflows/ci.yml').write_text(workflow)
+                self.assertIn('corepack pnpm@10 install', runs.box_deps_hint(root, log))
+
+    def test_dynamic_env_and_setup_mapping_require_inspection(self):
+        for settings in ('env: ${{ matrix.env }}', 'with: ${{ inputs.setup }}'):
+            for quote in ('', "'", '"'):
+                with self.subTest(settings=settings, quote=quote), tempfile.TemporaryDirectory() as d:
+                    root = Path(d)
+                    (root / '.github/workflows').mkdir(parents=True)
+                    key, value = settings.split(': ', 1)
+                    (root / '.github/workflows/ci.yml').write_text(
+                        "env:\n  PNPM_VERSION: '10'\nsteps:\n  - uses: pnpm/action-setup@v4\n    " +
+                        key + ': ' + quote + value + quote + '\n')
+                    (root / 'package.json').write_text('{}')
+                    (root / 'pnpm-lock.yaml').touch()
+                    log = root / 'run.log'
+                    log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
+                        self.assertIn('<repo-install>', hint)
+                        self.assertIn('CI pnpm version is ambiguous', hint)
+                        self.assertNotIn('corepack pnpm', hint)
+
+    def test_inline_job_env_override_defers_both_hints(self):
+        for key in ('env', "'env'", '"env"'):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yml').write_text(
+                    "env:\n  PNPM_VERSION: '10'\njobs:\n  checks:\n    " + key +
+                    ": {PNPM_VERSION: '${{ matrix.pnpm }}'}\n    strategy:\n      matrix:\n        pnpm: [11]\n"
+                    "    steps:\n      - run: corepack pnpm@${{ env.PNPM_VERSION }} install --frozen-lockfile\n")
+                (root / 'package.json').write_text('{}')
+                (root / 'pnpm-lock.yaml').touch()
+                log = root / 'run.log'
+                log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
+                    self.assertIn('<repo-install>', hint)
+                    self.assertIn('CI pnpm version is ambiguous', hint)
+                    self.assertNotIn('corepack pnpm', hint)
+
+    def test_unresolved_mapping_containers_do_not_hide_candidates(self):
+        cases = (
+            "  -\n    uses: pnpm/action-setup@v4\n    with:\n      version: ${{ matrix.pnpm }}\n",
+            "  - # separate dash\n    # action\n    uses: pnpm/action-setup@v4\n    with: {version: '${{ matrix.pnpm }}'}\n",
+            "  - uses: pnpm/action-setup@v4\n    with:\n      ${{ inputs.setup }}\n",
+            "  - uses: pnpm/action-setup@v4\n    env:\n      ${{ matrix.env }}\n    with: {version: '10'}\n",
+            "  - uses: pnpm/action-setup@v4\n    with: &setup\n      version: ${{ matrix.pnpm }}\n",
+            "  - uses: pnpm/action-setup@v4\n    env: &local-env\n      PNPM_VERSION: ${{ matrix.pnpm }}\n    with: {version: '10'}\n",
+            "  - uses: pnpm/action-setup@v4\n    with: *setup\n",
+            "  - uses: pnpm/action-setup@v4\n    env: *local-env\n    with: {version: '10'}\n",
+            "  - uses: pnpm/action-setup@v4\n    with:\n      *setup\n",
+            "  - uses: pnpm/action-setup@v4\n    env:\n      *local-env\n    with: {version: '10'}\n",
+            "  - uses: pnpm/action-setup@v4\n    with:\n      &setup\n      version: ${{ matrix.pnpm }}\n",
+            "  - uses: pnpm/action-setup@v4\n    env:\n      &local-env\n      PNPM_VERSION: ${{ matrix.pnpm }}\n    with: {version: '10'}\n",
+            "  - uses: pnpm/action-setup@v4\n    with: &setup {version: '${{ matrix.pnpm }}'}\n",
+            "  - uses: pnpm/action-setup@v4\n    env: &local-env {PNPM_VERSION: '${{ matrix.pnpm }}'}\n",
+        )
+        for steps in cases:
+            with self.subTest(steps=steps), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yml').write_text(
+                    "env:\n  PNPM_VERSION: '10'\nsteps:\n" + steps)
+                (root / 'package.json').write_text('{}')
+                (root / 'pnpm-lock.yaml').touch()
+                log = root / 'run.log'
+                log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
+                    self.assertIn('<repo-install>', hint)
+                    self.assertIn('CI pnpm version is ambiguous', hint)
+                    self.assertNotIn('corepack pnpm', hint)
+
+    def test_standalone_dash_keeps_literal_setup_version(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / '.github/workflows').mkdir(parents=True)
+            (root / '.github/workflows/ci.yml').write_text(
+                'steps:\n  -\n    uses: pnpm/action-setup@v4\n    with: {version: 10.18.0}\n')
+            (root / 'pnpm-lock.yaml').touch()
+            self.assertIn('corepack pnpm@10.18.0 install', runs.missing_deps_hint(root))
+
+    def test_complex_step_containers_require_inspection(self):
+        containers = (
+            "steps: [{uses: pnpm/action-setup@v4, with: {version: '${{ matrix.pnpm }}'}}]\n",
+            "steps:\n  - &setup {uses: pnpm/action-setup@v4, with: {version: '${{ matrix.pnpm }}'}}\n",
+            "steps: [\n  {uses: pnpm/action-setup@v4, with: {version: '${{ matrix.pnpm }}'}}\n]\n",
+            "steps:\n  - *setup\n",
+            "steps: ${{ inputs.steps }}\n",
+            "jobs: {checks: {steps: [{uses: pnpm/action-setup@v4, with: {version: '${{ matrix.pnpm }}'}}]}}\n",
+        )
+        for container in containers:
+            with self.subTest(container=container), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yml').write_text("env:\n  PNPM_VERSION: '10'\n" + container)
+                (root / 'package.json').write_text('{}')
+                (root / 'pnpm-lock.yaml').touch()
+                log = root / 'run.log'
+                log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
+                    self.assertIn('<repo-install>', hint)
+                    self.assertIn('CI pnpm version is ambiguous', hint)
+                    self.assertNotIn('corepack pnpm', hint)
+
+    def test_next_line_scalar_mapping_headers_require_inspection(self):
+        for key in ('env', 'with'):
+            for value in ('|\n        ${{ inputs.setup }}', '>\n        ${{ inputs.setup }}',
+                          '>-\n        ${{ inputs.setup }}', "'${{ inputs.setup }}'", 'null'):
+                with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as d:
+                    root = Path(d)
+                    (root / '.github/workflows').mkdir(parents=True)
+                    (root / '.github/workflows/ci.yml').write_text(
+                        "env:\n  PNPM_VERSION: '10'\nsteps:\n  - uses: pnpm/action-setup@v4\n    " +
+                        key + ':\n      ' + value + '\n')
+                    (root / 'package.json').write_text('{}')
+                    (root / 'pnpm-lock.yaml').touch()
+                    log = root / 'run.log'
+                    log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
+                        self.assertIn('<repo-install>', hint)
+                        self.assertIn('CI pnpm version is ambiguous', hint)
+                        self.assertNotIn('corepack pnpm', hint)
+
+    def test_nested_flow_jobs_and_decorated_actions_require_inspection(self):
+        cases = (
+            "jobs: {checks: {env: {PNPM_VERSION: '11'}, steps: [{run: pnpm install}]}}\n",
+            "jobs:\n  checks: &job {env: {PNPM_VERSION: '11'}, steps: [{run: pnpm install}]}\n",
+            "jobs: {checks: {steps: '${{ inputs.steps }}'}}\n",
+            "jobs:\n  checks: &job {steps: '${{ inputs.steps }}'}\n",
+            "steps:\n  - uses: &setup pnpm/action-setup@v4\n    with: {version: '${{ matrix.pnpm }}'}\n",
+            "steps:\n  - uses: >-\n      pnpm/action-setup@v4\n    with: {version: '${{ matrix.pnpm }}'}\n",
+            "steps:\n  - uses:\n      >-\n        pnpm/action-setup@v4\n    with: {version: '${{ matrix.pnpm }}'}\n",
+            "steps:\n  - uses: *setup\n    with: {version: '${{ matrix.pnpm }}'}\n",
+            'steps:\n  - uses: "pnpm/action-setup@\\\n      v4"\n    with: {version: \'${{ matrix.pnpm }}\'}\n',
+            'steps:\n  - uses: "pnpm\\/action-setup@v4"\n    with: {version: \'${{ matrix.pnpm }}\'}\n',
+            'steps:\n  - uses: "pnpm/action-setup\\u0040v4"\n    with: {version: \'${{ matrix.pnpm }}\'}\n',
+            "steps:\n  -\n      run: echo ok\n  - uses: pnpm/action-setup@v4\n    with: {version: '${{ matrix.pnpm }}'}\n",
+            'steps:\n  - uses: pnpm/action-setup@v4\n    with: {"versi\\u006fn": "${{ matrix.pnpm }}"}\n',
+            'jobs: {checks: {"e\\u006ev": {PNPM_VERSION: 11}, steps: [{run: echo ok}]}}\n',
+            'jobs: {checks: {"ste\\u0070s": [{uses: pnpm/action-setup@v4, with: {version: "${{ matrix.pnpm }}"}}]}}\n',
+            'jobs: {checks: {steps: [{"u\\u0073es": pnpm/action-setup@v4, with: {version: "${{ matrix.pnpm }}"}}]}}\n',
+            'jobs: {checks: {steps: [{env: {"PNPM_VER\\u0053ION": 11}, run: "corepack pnpm@${{ env.PNPM_VERSION }} install"}]}}\n',
+            'jobs: {checks: {steps: [{env: {PNPM_VERSION: 11}, run: "corepack pnpm@${{ env.PNPM_VERSION }} install"}]}}\n',
+            'jobs: {checks: {steps: [{env: "${{ inputs.env }}", run: "corepack pnpm@${{ env.PNPM_VERSION }} install"}]}}\n',
+            'jobs: {checks: {steps: [{env: {? "PNPM_VER\\u0053ION": 11}, run: echo ok}]}}\n',
+            'jobs: {checks: {? env: {PNPM_VERSION: 11}, steps: [{run: echo ok}]}}\n',
+            'steps:\n  - uses: pnpm/action-setup@v4\n    with: {? version: "${{ matrix.pnpm }}"}\n',
+            'steps:\n  - env: {? PNPM_VERSION: 11}\n    run: echo ok\n',
+            'steps:\n  - {? uses: pnpm/action-setup@v4, with: {version: "${{ matrix.pnpm }}"}}\n',
+        )
+        for config in cases:
+            with self.subTest(config=config), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yml').write_text("env:\n  PNPM_VERSION: '10'\n" + config)
+                (root / 'package.json').write_text('{}')
+                (root / 'pnpm-lock.yaml').touch()
+                log = root / 'run.log'
+                log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
+                    self.assertIn('<repo-install>', hint)
+                    self.assertIn('CI pnpm version is ambiguous', hint)
+                    self.assertNotIn('corepack pnpm', hint)
+
+    def test_comments_shell_text_and_matrix_anchors_do_not_create_ambiguity(self):
+        cases = (
+            "# example {uses: pnpm/action-setup@v4}\n",
+            "steps:\n  - run: echo 'pnpm/action-setup@v4 {version=11}'\n",
+            "jobs:\n  checks:\n    strategy:\n      matrix:\n        include:\n          - &linux {os: ubuntu-latest}\n    steps:\n      - run: echo ok\n",
+            "jobs:\n  checks:\n    steps:\n      - uses: pnpm/action-setup@v4\n        with: {version: '10'}\n    strategy:\n      matrix:\n        include:\n          - &linux {os: ubuntu-latest}\n",
+            'jobs:\n  checks:\n    outputs: {example: "pnpm/action-setup@v4"}\n    steps:\n      - run: echo ok\n',
+            'jobs: {checks: {outputs: {example: "pnpm/action-setup@v4"}, steps: [{run: echo ok}]}}\n',
+            'jobs: {checks: {steps: [{env: {OTHER: "PNPM_VERSION"}, run: echo ok}]}}\n',
+            "jobs:\n  checks:\n    strategy:\n      matrix:\n        steps:\n          - &linux {os: ubuntu-latest}\n    steps:\n      - run: echo ok\n",
+            "jobs:\n  checks:\n    steps:\n      - run: echo ok\n    strategy:\n      matrix:\n        steps:\n          - &linux {os: ubuntu-latest}\n",
+            "jobs:\n  checks:\n    strategy:\n      matrix:\n        env: [development, production]\n    steps:\n      - run: echo ok\n",
+            "jobs:\n  checks:\n    steps:\n      - run: echo ok\n    strategy:\n      matrix:\n        env: [development, production]\n",
+        )
+        for config in cases:
+            with self.subTest(config=config), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / '.github/workflows').mkdir(parents=True)
+                (root / '.github/workflows/ci.yml').write_text("env:\n  PNPM_VERSION: '10'\n" + config)
+                (root / 'package.json').write_text('{}')
+                (root / 'pnpm-lock.yaml').touch()
+                log = root / 'run.log'
+                log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
+                    self.assertIn('corepack pnpm@10 install', hint)
+                    self.assertNotIn('CI pnpm version is ambiguous', hint)
+
+    def test_modern_yarn_lock_without_package_manager(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'yarn.lock').write_text('__metadata:\n  version: 8\n')
+            self.assertIn('corepack yarn install --immutable', runs.missing_deps_hint(root))
+
+    def test_marker_is_required_even_when_local_deps_are_absent(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'package.json').write_text('{"packageManager":"bun@1.3.0"}')
+            log = root / 'run.log'
+            for text in ('FAIL\n', 'echo OFFBOX_NO_NODE_MODULES\n', 'OFFBOX_NO_NODE_MODULES extra\n'):
+                log.write_text(text)
+                self.assertEqual(runs.box_deps_hint(root, log), '')
+            self.assertEqual(runs.box_deps_hint(root, None), '')
+            self.assertEqual(runs.box_deps_hint(root, root / 'missing.log'), '')
+            (root / 'node_modules').mkdir()
+            log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
+            self.assertIn('bun install', runs.box_deps_hint(root, log))
+
+    def test_bad_manifest_does_not_hide_remote_exit(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            log = root / 'run.log'
+            log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
+            (root / 'package-lock.json').touch()
+            for manifest in ('{', '[]', '{"packageManager":42}'):
+                (root / 'package.json').write_text(manifest)
+                self.assertIn('npm ci', runs.box_deps_hint(root, log))
+
+    def test_box_marker_uses_repo_root_and_preserves_exit(self):
+        for code in (0, 1, 127, 254):
+            for state in ('absent', 'present', 'no-package', 'nested-only', 'symlink'):
+                with self.subTest(code=code, state=state), tempfile.TemporaryDirectory() as home:
+                    root = Path(home) / 'w/repo'
+                    (root / 'sub').mkdir(parents=True)
+                    if state != 'no-package':
+                        (root / 'package.json').write_text('{}')
+                    if state == 'present':
+                        (root / 'node_modules').mkdir()
+                    elif state == 'nested-only':
+                        (root / 'sub/node_modules').mkdir()
+                    elif state == 'symlink':
+                        (root / 'node_modules').symlink_to(root / 'sub', target_is_directory=True)
+                    with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
+                            patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
+                        script = runs.remote_script('w/repo', 'sub', [f'cd /; printf partial >&2; exit {code}'], None, 'r')
+                    p = subprocess.run(['bash', '-c', script], env=dict(os.environ, HOME=home),
+                                       capture_output=True, text=True, timeout=10)
+                    self.assertEqual(p.returncode, code)
+                    self.assertEqual(p.stderr.splitlines().count(runs.NO_NODE_MODULES_MARKER),
+                                     int(code != 0 and state in ('absent', 'nested-only')))
+
+    def test_steps_print_one_marker_even_if_last_step_passes(self):
+        with tempfile.TemporaryDirectory() as home:
+            root = Path(home) / 'w/repo'
+            root.mkdir(parents=True)
+            (root / 'package.json').write_text('{}')
+            with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
+                    patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
+                script = runs.remote_script('w/repo', '.', [], None, 'r', steps=['exit 127', 'true'])
+            p = subprocess.run(['bash', '-c', script], env=dict(os.environ, HOME=home),
+                               capture_output=True, text=True, timeout=10)
+            self.assertEqual(p.returncode, 127)
+            self.assertEqual(p.stderr.splitlines().count(runs.NO_NODE_MODULES_MARKER), 1)
+
+    def test_report_exit_hint_and_silent_cases(self):
+        with tempfile.TemporaryDirectory() as d:
+            hint = runs.missing_deps_hint(Path(d))
+        for code, steps, marker, where, expected in (
+                (1, None, True, 'remote', True), (127, None, True, 'remote', True),
+                (254, None, True, 'remote', True), (2, None, True, 'remote', True),
+                (0, [(1, 127)], True, 'remote', True), (None, [(1, 127)], True, 'remote', True),
+                (0, None, True, 'remote', False), (None, None, True, 'remote', False),
+                (127, None, False, 'remote', False), (1, None, True, 'local', False)):
+            with self.subTest(code=code, steps=steps, marker=marker, where=where):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.report_exit('vitest', code, steps, len(steps or []), where=where,
+                                     deps_hint=hint if marker else '')
+                lines = err.getvalue().splitlines()
+                self.assertEqual(sum(hint in line for line in lines), int(expected))
+                if expected:
+                    self.assertEqual(lines[-2], 'offbox: ' + hint)
+                if code is not None:
+                    self.assertEqual(lines[-1], f'offbox: {where} exit {code}')
 
 
 class SummaryAndHintTests(unittest.TestCase):
@@ -156,6 +898,60 @@ class CliStepTests(Isolated):
         self.assertEqual(rc, 1)
         self.assertEqual(lines[-2], 'offbox: offbox steps: 1 ok, 1 failed (step 2 rc=1)')
         self.assertEqual(lines[-1], 'offbox: remote exit 1')
+
+    def test_missing_deps_hint_from_probes_log(self):
+        # Crpko #3816: probes.log, cf1569-a3 on bx_yy9mjenc after an install on another box.
+        log = ('offbox: reusing repository pool box bx_yy9mjenc (xlarge)\n'
+               'bash: line 1: ./node_modules/.bin/vitest: No such file or directory\n')
+        root = Path(self.tmp.name)
+        self.me['repo_root'] = str(root)
+        (root / 'package.json').write_text('{"packageManager":"pnpm@11.10.0"}')
+        (root / 'node_modules').mkdir()  # Local deps must not suppress box evidence.
+        for code in (1, 127, 254):
+            with self.subTest(code=code):
+                rc, lines = self.run_cli(['./node_modules/.bin/vitest'], code,
+                                         log + runs.NO_NODE_MODULES_MARKER + '\n')
+                self.assertEqual(rc, code)
+                self.assertIn("corepack pnpm@11.10.0 install --frozen-lockfile && <command>", lines[-2])
+                self.assertEqual(lines[-1], f'offbox: remote exit {code}')
+        rc, lines = self.run_cli(['./node_modules/.bin/vitest'], 127, log)
+        self.assertEqual(lines, ['offbox: remote exit 127'])
+
+    def test_background_completion_and_settled_wait_show_hint(self):
+        root = Path(self.tmp.name)
+        (root / 'package.json').write_text('{"packageManager":"bun@1.3.0"}')
+        log = runs.LOGS_DIR / 'bg.log'
+        row = dict(run_id='bg', mode='bg', box_id='B', repo_root=str(root), pulls='[]', exit_code=127,
+                   status='failed', error=None)
+        cases = [(1, '', True), (127, '', True), (254, '', True), (0, '', False),
+                 (None, '', False), (None, 'offbox step 1 rc=0: vitest\n', False),
+                 (None, 'offbox step 1 rc=127: vitest\n', True),
+                 (0, 'offbox step 1 rc=1: pnpm test\n', True)]
+        for code, steps, failed in cases:
+            row['exit_code'] = code
+            for marked in (True, False):
+                log.write_text(steps + (runs.NO_NODE_MODULES_MARKER + '\n' if marked else 'vitest: not found\n'))
+                for settled in (True, False):
+                    with self.subTest(code=code, steps=steps, marked=marked, settled=settled):
+                        err, out = io.StringIO(), io.StringIO()
+                        with patch.object(misc, '_catch_up_log'), patch.object(misc, '_incomplete_log'), \
+                                patch.object(runs, 'finish'), patch.object(runs, 'go_std_glitch'), \
+                                patch.object(runs, 'settle_box_wedged', return_value=None), \
+                                contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                            rc = misc._settled(row) if settled else misc._finalize(row, code, log)
+                        self.assertEqual(rc, 90 if code is None else code)
+                        self.assertEqual('bun install' in err.getvalue(), marked and failed)
+                        self.assertIn(f'exit={code}', out.getvalue())
+
+    def test_background_legacy_run_without_repo_and_marker_keeps_exit(self):
+        row = dict(run_id='legacy', mode='bg', box_id='B', repo_root=None, pulls='[]', exit_code=127,
+                   status='failed', error=None)
+        err, out = io.StringIO(), io.StringIO()
+        with patch.object(misc, '_catch_up_log'), patch.object(misc, '_incomplete_log'), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            self.assertEqual(misc._settled(row), 127)
+        self.assertEqual(err.getvalue(), 'offbox: legacy settled with no output on record\n')
+        self.assertIn('exit=127', out.getvalue())
 
     def glitch_events(self):
         return self.con.execute("SELECT box_id, detail FROM events WHERE kind='go_std_glitch'").fetchall()

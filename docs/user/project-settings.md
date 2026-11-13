@@ -69,8 +69,11 @@ using its project, model, and workspace settings. Fixed-time schedules use that
 environment's time zone, which may differ from your phone's, unless the task names
 a time zone. Cron schedules take a five-field expression and a time zone. A
 one-time ("Once") task runs at the chosen time and then turns itself off; if the
-server was down at that time, it still runs when the server comes back within an
-hour, and is marked missed after that.
+server was unavailable, it runs once late within 24 hours and otherwise stays
+missed and turns off. Missed slots are recorded. Daily and less frequent tasks
+can run their latest missed slot once late, within 12 hours or until 06:00 in
+the schedule's time zone the next day, whichever comes first. Catch-up runs
+start 30 seconds apart. Sub-daily tasks record missed slots without catching up.
 
 Deleting a thread also deletes tasks that post into that thread. Tasks that start
 a new thread on each run survive deletion of their previous threads.

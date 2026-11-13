@@ -321,6 +321,7 @@ def claude_settings_owned(manifest: dict, existing: dict | None = None) -> dict:
     # Keep user-supplied deny rules while explicitly disabling the CU tool names.
     deny = list(dict.fromkeys([*deny, "Computer", "mcp__node_repl"]))
     return {
+        "fastMode": False,
         "autoMemoryEnabled": False,
         "autoDreamEnabled": False,
         "cleanupPeriodDays": c["cleanupPeriodDays"],
@@ -419,6 +420,7 @@ def codex_config(manifest: dict, codex_home: str, existing_state: dict | None,
                  harness: str = "codex") -> dict:
     path_value = ":".join(list(manifest["shellPathPrefix"]) + list(manifest["shellPath"]))
     config = {
+        "service_tier": "default",
         "model": "gpt-6-astra",
         "model_provider": "ninerouter",
         "model_catalog_json": os.path.join(codex_home, "models.json"),
@@ -519,6 +521,8 @@ def models_json(vendor_path: Path, manifest: dict, *, cu: bool = False) -> bytes
     cu_spec = manifest["codexCu"]
     upstream_terra = None
     for model in data["models"]:
+        model["default_service_tier"] = "default"
+        model["service_tiers"] = []
         if model.get("slug") == cu_spec["model"]:
             upstream_terra = dict(model)
         if model.get("slug") in extended:

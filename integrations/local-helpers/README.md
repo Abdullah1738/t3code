@@ -52,6 +52,41 @@ Tokens, passwords, cached IPs, OTP state and generated pages stay outside the
 repo: Keychain, `~/.local/state/{mail-oauth,otp-watch}`, `~/.cache`,
 `~/.local/share/imessage-apps`.
 
+The Mirage watchdog runs every minute as `com.ardud.mirage-beacon-keepalive`.
+Its helper is `bin/mirage-beacon-keepalive`, with client detection and restart
+functions in `libexec/mirage/`. Three failed health checks allow a restart only
+when every Mirage process has no established remote TCP or connected UDP flow.
+`lsof` and `nettop` are combined because Network.framework UDP flows may only
+appear in nettop. Duplicate descriptors/rows count once by transport 5-tuple;
+idle connections still block a restart, as do unavailable or malformed samples.
+There are no force-failure switches. State stays in
+`~/.local/state/mirage-beacon-keepalive`, logs in
+`~/Library/Logs/mirage-beacon-keepalive.log`.
+
+Before installation, while a client is streaming, run this from the checkout
+for a read-only detector check (no probes, state writes, quit or launch):
+
+```bash
+./integrations/local-helpers/bin/mirage-beacon-keepalive --detect-clients
+```
+
+It prints JSON: `streaming` with at least one flow and the client's peer is
+the expected result (exit 10). `clear` exits 0; `unknown` exits 20 and blocks
+restarts. A real-stream check must be repeated after installation with
+`~/.local/bin/mirage-beacon-keepalive --detect-clients`. Fixture tests and a
+dummy listener do not establish that the live iPad stream is detected.
+
+After approval, from the merged checkout: `./integrations/local-helpers/install.zsh`
+then `./integrations/local-helpers/install.zsh --check`. This installs all
+managed local helpers and loads/reloads their plists, so inspect `--dry-run`
+before approving. The Mirage agent is a short run and picks up code on its
+next tick; it needs no forced kickstart.
+
+Focused watchdog tests: from this directory,
+`/usr/bin/python3 -B -m unittest discover -s tests -p test_mirage.py -v`.
+They use normalized socket captures and a disposable loopback listener with
+stubbed application commands, never the installed watchdog or Mirage app.
+
 The delivery card builder that used to live in `~/.local/libexec/delivery-card`
 is retired; delivery cards come from `app-api-cli/delivery_cards.py`.
 
@@ -76,22 +111,28 @@ Install a missing JDK with `brew install openjdk`. It finds the real CLI via
 `~/.nvm/versions/node/v26.2.0/bin/quint`; the CLI's directory supplies node
 on short agent PATHs. Missing CLI: `npm i -g @informalsystems/quint@0.33.1`.
 
-Verify without `--server-endpoint` gets a free localhost port, so concurrent
-cards avoid the shared 8822 default, including with options before `verify`.
-Both `--server-endpoint host:port` and `--server-endpoint=host:port` (also
-the camel-case `--serverEndpoint` alias) are preserved. Other commands pass through.
-The wrapper execs Quint: 0.33.1 already terminates its own Apalache child on
-exit/signals, and leaves an existing server alone. Port allocation releases
-the socket before Quint binds it; a competing process can still win that race.
+Verify without `--server-endpoint` gets a free local port. Explicit endpoints
+must name a free `localhost:<port>` or `127.0.0.1:<port>`; the wrapper starts its
+own server there and never attaches to an existing server. Other commands pass
+through. `QUINT_APALACHE_ARCHIVE` selects the reviewed archive (default
+`~/.local/share/apalache-patched/apalache-0.62.4-grpc-1.75.0.tgz`); a missing or
+mismatched archive/JAR fails before starting Java. Each verify uses a private
+temporary distribution and `QUINT_HOME`, with a refusing fallback launcher and
+the pinned JAR available to TLC. Quint-side launch/download attempts fail even
+if Quint exits zero. The wrapper stops only its own server and CLI PIDs on
+completion or signals. Port ownership is checked with `lsof` before Quint runs.
 
-Use `command -v quint` to confirm the wrapper is selected: some agent PATHs
-put nvm before `~/.local/bin`, which bypasses it. Until PATH precedence is
-changed with owner approval, call `~/.local/bin/quint` explicitly (or this
-checkout's `bin/quint` before installation). Installation and any agent
-configuration changes need approval. This wrapper leaves the Apalache cache
-and JVM options intact. The shared 0.62.4 launcher currently refuses vulnerable
-protobuf reflection code; real verification waits for #787's patched backend
-and #675's pin/guard. Do not disable that guard or replace the shared cache.
+CVE-2022-3171 affects stock grpc-services 1.41.0's pre-22 reflection gencode, despite its protobuf-java 3.25.8 runtime; #787 aligns gRPC to 1.75.0 and regenerates with 3.25.8.
+The guard pins archive SHA256 `b4fc81998dd20d0b55a48c16d1caed1045e324bbbfe45ee7f625f6aaf70caf6f` and JAR `cb6a7d689b2937b00be5e7e30e9bb1925cde7c8ce47aaafddb1cf21c8c167593`, always setting `error_on_unsafe_pre22_gencode=true`; unsafe JVM overrides, Java option-file loaders (`@argfile`, `-XX:VMOptionsFile`, `-XX:Flags`), and ambiguous backslash/whitespace spellings are refused. Expand file options explicitly for guarded verify.
+Apalache still binds IPv6 `*:<port>` with reflection registered: LAN/tailnet peers can reach it for the run's duration. The Mac firewall was disabled (block-all disabled, stealth off) on 12 Nov; a loopback source patch is a separate follow-up.
+`QUINT_ALLOW_VULNERABLE_APALACHE=1` explicitly bypasses this guard with a visible warning, permitting Quint's original cache/download/launch behavior; it never silences the protobuf warning.
+Upstream Apalache 0.63.0 still has no dependency fix (#787's 11 Nov check); issue filing and all installations remain owner-approved evaluator actions.
+
+Use `command -v quint` to confirm the wrapper is selected: harness PATHs put
+nvm before `~/.local/bin`. Until approved PATH changes and installation, call
+the checkout's `integrations/local-helpers/bin/quint` explicitly. The shared
+`~/.quint` cache is untouched. Offbox has no installed wrapper or pinned
+archive from this change; shipping both and fixing PATH is a separate task.
 
 Offbox investigation (9 Nov 2026, crpko-devops pool `bx_2vtg2veh`, three
 remote calls including one pre-command failure): Quint 0.33.1 downloads
@@ -151,3 +192,27 @@ Output: `tmp/apalache-patched-0.62.4/apalache-0.62.4-grpc-1.75.0.tgz`; SHA256 `b
 The recipe checks resolved dependencies and reflection bytecode, records the JAR hash, and retains v1alpha reflection for quint 0.33.1; installation and wrapper selection are separate.
 Launch with `JVM_ARGS=-Dcom.google.protobuf.error_on_unsafe_pre22_gencode=true apalache/bin/apalache-mc server --port=<n>`; this version binds `*:<n>` and has no checker `--hostname` option.
 As of 9 Nov 2026, upstream main has no dependency fix after 0.62.4; the upstream issue draft is on Robob card #787 and has not been filed.
+
+## Repo Node and pnpm selection
+
+`python3 integrations/local-helpers/install-node-pin.py` prints the exact proposed
+shell-file and helper diffs without writing. After approval, run the same command
+with `--install` from a clean revision on `origin/main`; `--check` reports drift.
+The installer preserves existing shell-file contents and keeps backups.
+
+The helper selects the highest installed nvm Node satisfying the nearest
+`.nvmrc` or `.node-version` and `engines.node`, falling back to engines when the
+file pin is unavailable. pnpm uses the `packageManager` major, or the lockfile
+format (v9 prefers pnpm 10, then 9). It reads installed package metadata and the
+Corepack cache, runs the selected cached CLI directly, and never installs a
+runtime or downloads a package manager. Missing versions produce an explicit
+install hint. The safe-chain pnpm function remains in place.
+
+zsh uses chpwd/preexec hooks and a DEBUG trap for noninteractive snapshot PATH
+restoration; Bash wraps cd/pushd/popd (preserving existing functions) and passes BASH_ENV to its children. Start a fresh shell
+after changing a pin in the current directory. Unpinned directories retain
+the incoming PATH. `zsh -f` and fresh `bash --noprofile --norc` without BASH_ENV
+explicitly bypass shell setup; they need the helper sourced by their caller.
+
+Focused verification:
+`PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s integrations/local-helpers/tests -p test_repo_node_pin.py`.

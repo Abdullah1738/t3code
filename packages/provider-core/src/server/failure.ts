@@ -71,6 +71,9 @@ function causeMessage(cause: unknown): string | undefined {
   const seen = new Set<unknown>();
   let category: (typeof PROVIDER_FAILURE_CATEGORIES)[string];
   let reason: string | undefined;
+  // A dead provider process names its exit code and last stderr line, which
+  // is the only clue to why every request on its session failed.
+  let processExit: string | undefined;
   for (let depth = 0; depth < 16 && cause != null && !seen.has(cause); depth++) {
     seen.add(cause);
     try {
@@ -90,6 +93,9 @@ function causeMessage(cause: unknown): string | undefined {
           return stringField(cause, "message");
         case "ContextHandoffDeliveryUncertainError":
           return "T3 could not confirm whether conversation history reached the provider. Retry the turn to recover the session.";
+        case "CodexAppServerProcessExitedError":
+          processExit ??= stringField(cause, "message");
+          break;
         case "ProviderAdapterProtocolError": {
           const typedReason = (cause as Record<string, unknown>).reason;
           if (
@@ -111,10 +117,36 @@ function causeMessage(cause: unknown): string | undefined {
       break;
     }
   }
-  if (category === undefined) return undefined;
+  reason ??= processExit;
+  if (category === undefined) return processExit;
   return reason
     ? `${category.summary}: ${reason}. ${category.guidance}`
     : `${category.summary}. ${category.guidance}`;
+}
+
+// Errors expose `providerUsageLimit` when they reliably identify a provider
+// usage limit (e.g. Codex exiting with its limit notice), whatever wraps them.
+function usageLimitInCause(cause: unknown): { readonly resetAt: string | null } | undefined {
+  const seen = new Set<unknown>();
+  for (let depth = 0; depth < 16 && cause != null && !seen.has(cause); depth++) {
+    seen.add(cause);
+    try {
+      if (Cause.isCause(cause)) {
+        cause = Cause.squash(cause);
+        continue;
+      }
+      if (typeof cause !== "object") return undefined;
+      const usageLimit = (cause as Record<string, unknown>).providerUsageLimit;
+      if (typeof usageLimit === "object" && usageLimit !== null) {
+        const resetAt = (usageLimit as Record<string, unknown>).resetAt;
+        return { resetAt: typeof resetAt === "string" ? resetAt : null };
+      }
+      cause = (cause as Record<string, unknown>).cause;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
 }
 
 function stringField(value: unknown, key: "message" | "code"): string | undefined {
@@ -158,16 +190,78 @@ function replaceUnsafeControlCharacters(value: string): string {
   return sanitized.join("");
 }
 
-function redactProviderFailureText(value: string): string {
-  return replaceUnsafeControlCharacters(value)
+const sensitiveJsonKey =
+  /(?:authorization|cookie|cookies|token|apikey|password|secret|credential)$/iu;
+
+function redactJsonValue(value: unknown, depth: number): unknown {
+  if (depth >= 8) return "[REDACTED]";
+  if (typeof value === "string") return redactProviderFailureText(value, depth + 1);
+  if (Array.isArray(value)) return value.map((item) => redactJsonValue(item, depth + 1));
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        sensitiveJsonKey.test(key.replace(/[^a-z0-9]/giu, ""))
+          ? "[REDACTED]"
+          : redactJsonValue(item, depth + 1),
+      ]),
+    );
+  }
+  return value;
+}
+
+// Parse JSON fragments before matching plain text, preserving escaped quotes
+// inside values and decoding nested string-valued bodies without losing boundaries.
+function redactJsonFragments(value: string, depth: number): string {
+  const parts: string[] = [];
+  let start = 0;
+  for (let index = 0; index < value.length; index++) {
+    if (value[index] !== "{" && value[index] !== "[") continue;
+    parts.push(value.slice(start, index));
+    const fragmentStart = index;
+    let nesting = 0;
+    let quoted = false;
+    let escaped = false;
+    for (; index < value.length; index++) {
+      const character = value[index];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === '"') quoted = false;
+      } else if (character === '"') quoted = true;
+      else if (character === "{" || character === "[") nesting++;
+      else if ((character === "}" || character === "]") && --nesting === 0) break;
+    }
+    const fragment = value.slice(fragmentStart, index + 1);
+    try {
+      parts.push(JSON.stringify(redactJsonValue(JSON.parse(fragment), depth)));
+    } catch {
+      parts.push(
+        /cookie|token|password|secret|authorization|credential|api[_-]?key/iu.test(fragment)
+          ? "[REDACTED_JSON]"
+          : fragment,
+      );
+    }
+    start = index + 1;
+  }
+  parts.push(value.slice(start));
+  return parts.join("");
+}
+
+function redactProviderFailureText(value: string, depth = 0): string {
+  return redactJsonFragments(replaceUnsafeControlCharacters(value), depth)
     .replace(/\bhttps?:\/\/[^\s<>"']+/giu, redactUrl)
+    .replace(
+      /((?:["']?(?:set[_-]?cookie|cookie)["']?)\s*:\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n]*)/giu,
+      "$1[REDACTED]",
+    )
     .replace(/\b(Bearer|Basic)\s+[^\s,;]+/giu, "$1 [REDACTED]")
     .replace(
-      /(["'](?:access[_-]?token|api[_-]?key|authorization|credential|password|secret|token)["']\s*:\s*["'])[^"']*(["'])/giu,
+      /(["'](?:(?:access|refresh|id|auth|session)[_-]?token|api[_-]?key|(?:proxy[_-]?)?authorization|credential|password|(?:client[_-]?)?secret|token)["']\s*:\s*["'])[^"']*(["'])/giu,
       "$1[REDACTED]$2",
     )
     .replace(
-      /(\b(?:access[_-]?token|api[_-]?key|authorization|credential|password|secret|token)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
+      /(\b(?:(?:access|refresh|id|auth|session)[_-]?token|api[_-]?key|(?:proxy[_-]?)?authorization|credential|password|(?:client[_-]?)?secret|token)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
       "$1[REDACTED]",
     )
     .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/gu, "[REDACTED]")
@@ -196,22 +290,23 @@ export function makeProviderFailure(input: {
 }): OrchestrationV2ProviderFailure {
   const rawMessage = input.message ?? causeMessage(input.cause) ?? DEFAULT_PROVIDER_FAILURE_MESSAGE;
   const message = boundedText(rawMessage, MAX_PROVIDER_FAILURE_MESSAGE_LENGTH);
+  const usageLimit = usageLimitInCause(input.cause);
+  const failureClass = usageLimit === undefined ? (input.class ?? "unknown") : "usage_limit";
+  const resetAt = input.resetAt ?? usageLimit?.resetAt;
   const rawCode = input.code ?? stringField(input.cause, "code") ?? null;
   const code =
     rawCode === null ? null : boundedText(rawCode, MAX_PROVIDER_FAILURE_CODE_LENGTH) || null;
 
   return {
-    class: input.class ?? "unknown",
+    class: failureClass,
     message: message || DEFAULT_PROVIDER_FAILURE_MESSAGE,
     code,
     retryable: input.retryable ?? null,
     // Only producers that classify a category set it. Others keep the record shape they
     // always had, so OpenCode and Pi failures serialize exactly as before.
     ...(input.category === undefined ? {} : { category: input.category }),
-    ...(input.class === "usage_limit" &&
-    input.resetAt != null &&
-    Number.isFinite(Date.parse(input.resetAt))
-      ? { resetAt: DateTime.formatIso(DateTime.makeUnsafe(input.resetAt)) }
+    ...(failureClass === "usage_limit" && resetAt != null && Number.isFinite(Date.parse(resetAt))
+      ? { resetAt: DateTime.formatIso(DateTime.makeUnsafe(resetAt)) }
       : {}),
   };
 }

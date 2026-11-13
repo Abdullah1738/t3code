@@ -739,6 +739,79 @@ it.effect("keeps delegated child pull-request links independent of the parent", 
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect("persists delegated selection routing across receipt replay and task updates", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const parentThreadId = ThreadId.make("thread:routing-parent");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create-routing-parent"),
+      threadId: parentThreadId,
+      projectId: ProjectId.make("project:routing"),
+      title: "Routing parent",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make("start-routing-parent"),
+      threadId: parentThreadId,
+      messageId: MessageId.make("message:routing-parent"),
+      text: "Delegate a review",
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const parent = yield* projections.getThreadProjection(parentThreadId);
+    const parentRun = parent.runs[0]!;
+    const selectionRouting = {
+      requested: {
+        providerInstanceId: ProviderInstanceId.make("opencode"),
+        model: "opus/cx/gpt-5.1-codex",
+      },
+      reason: "harness-migration" as const,
+      message:
+        "Routed opencode/opus/cx/gpt-5.1-codex → codex/gpt-5.1-codex by harness migration; this is the same route as codex/gpt-5.1-codex, not a separate fallback.",
+    };
+    const command = {
+      type: "delegated_task.request" as const,
+      commandId: CommandId.make("delegate-routing"),
+      parentThreadId,
+      parentRunId: parentRun.id,
+      parentNodeId: parentRun.rootNodeId!,
+      task: "Review the changes",
+      modelSelection,
+      selectionRouting,
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      createdBy: "agent" as const,
+      creationSource: "mcp" as const,
+    };
+    yield* orchestrator.dispatch(command);
+    const saved = yield* projections.getThreadRecords(parentThreadId, ["subagents"]);
+    assert.deepEqual(saved.subagents[0]?.selectionRouting, selectionRouting);
+    // A retry must report the accepted request even if the new caller target differs.
+    yield* orchestrator.dispatch({ ...command, selectionRouting: undefined });
+    yield* orchestrator.dispatch({
+      type: "delegated_task.wake-policy",
+      commandId: CommandId.make("routing-wake-policy"),
+      parentThreadId,
+      taskId: saved.subagents[0]!.id,
+      completionWake: "always",
+    });
+    const updated = yield* projections.getThreadRecords(parentThreadId, ["subagents"]);
+    assert.lengthOf(updated.subagents, 1);
+    assert.deepEqual(updated.subagents[0]?.selectionRouting, selectionRouting);
+  }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect("wakes the parent once when its delegated task asks a question", () =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;

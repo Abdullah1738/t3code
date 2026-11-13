@@ -42,6 +42,7 @@ def food(row, order):
                       'image_url':'https://f.nooncdn.com/food_production/'+image if isinstance(image,str) and image.startswith('food/') else None})
     return {'ok':True,'app':'noon','order':order,'vertical':'food',
             'vendor_name':core.text((row.get('outletInfo') or {}).get('name')),
+            'placed_at':row.get('createdAt') or row.get('placedAt'),
             'items':lines,'total':number(row.get('orderTotal')),'currency':'AED',
             'notes':row.get('notes') if isinstance(row.get('notes'),str) else None,
             'price_breakdown':{k:number(row.get(k)) for k in ('orderSubtotal','orderSubtotalDiscounted','orderDiscount',
@@ -108,6 +109,7 @@ def details(order, service, timeout=12):
                       'detail':detail,'options':None,'image_url':image,
                       'options_coverage':'native_display_label' if choices else 'not_exposed'})
     return {'ok':True,'app':'noon','order':order,'vertical':service,'vendor_name':store,
+            'placed_at':row.get('createdAt') or row.get('placedAt'),
             'items':lines,'total':number(row.get('orderTotal')),'currency':'AED',
             'items_complete':not extra or extra['declared_item_units']==extra['observed_item_units'],
             'source':'exact_native_order_detail','account_verified':True,**extra}

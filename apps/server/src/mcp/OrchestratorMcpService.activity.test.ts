@@ -13,6 +13,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { expect, it } from "vite-plus/test";
 
@@ -21,6 +22,7 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { SecretRedeemer } from "../ardud/auth/heldSecrets.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -258,177 +260,222 @@ it("readThread prefers waiting activity status over a newer cancelled queued run
   }).pipe(Effect.provide(layer), Effect.runPromise);
 });
 
-it.each(["working", "retrying", "resuming", "cancelled", "interrupted"])(
-  "taskStatus exposes live child state: %s",
-  async (state) => {
-    const parentProjection = {
-      thread: baseThread({
+it.each([
+  "working",
+  "retrying",
+  "resuming",
+  "cancelled",
+  "interrupted",
+  "fallback",
+  "fallback-resumed",
+])("taskStatus exposes live child state: %s", async (state) => {
+  const parentProjection = {
+    thread: baseThread({
+      threadId: parentThreadId,
+      title: "Parent",
+      instanceId: parentInstanceId,
+      model: "gpt-5.4",
+    }),
+    runs: [makeRun({ id: activeRunId, ordinal: 1, status: "running" })],
+    turnItems:
+      state === "retrying"
+        ? [
+            {
+              type: "error",
+              status: "running",
+              runId: childRunId,
+              ordinal: 1,
+              failure: { message: "Claude API no HTTP response: unknown." },
+              retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 500 },
+              startedAt: now,
+              updatedAt: now,
+            },
+          ]
+        : [],
+    visibleTurnItems: [],
+    runtimeRequests: [],
+    messages: [],
+    contextTransfers: [],
+    subagents: [
+      {
+        id: taskId,
         threadId: parentThreadId,
-        title: "Parent",
-        instanceId: parentInstanceId,
+        runId: activeRunId,
+        parentNodeId: NodeId.make("node-parent"),
+        origin: "app_owned",
+        completionDelivery: { state: "acknowledged" },
+        createdBy: "agent",
+        driver: codexDriver,
+        providerInstanceId: customCodexInstanceId,
+        providerThreadId: null,
+        childThreadId,
+        nativeTaskRef: null,
+        prompt: "Inspect the custom instance.",
+        title: null,
+        model: "gpt-5.4",
+        status: "running",
+        result: null,
+        startedAt: now,
+        completedAt: null,
+        updatedAt: now,
+      },
+    ],
+    updatedAt: now,
+  } as unknown as OrchestrationV2ThreadProjection;
+
+  const childProjection = {
+    thread: {
+      ...baseThread({
+        threadId: childThreadId,
+        title: "Child",
+        instanceId: customCodexInstanceId,
         model: "gpt-5.4",
       }),
-      runs: [makeRun({ id: activeRunId, ordinal: 1, status: "running" })],
-      turnItems:
-        state === "retrying"
-          ? [
-              {
-                type: "error",
-                status: "running",
-                runId: childRunId,
-                ordinal: 1,
-                failure: { message: "Claude API no HTTP response: unknown." },
-                retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 500 },
-                startedAt: now,
-                updatedAt: now,
-              },
-            ]
-          : [],
-      visibleTurnItems: [],
-      runtimeRequests: [],
-      messages: [],
-      contextTransfers: [],
-      subagents: [
-        {
-          id: taskId,
-          threadId: parentThreadId,
-          runId: activeRunId,
-          parentNodeId: NodeId.make("node-parent"),
-          origin: "app_owned",
-          completionDelivery: { state: "acknowledged" },
-          createdBy: "agent",
-          driver: codexDriver,
-          providerInstanceId: customCodexInstanceId,
-          providerThreadId: null,
-          childThreadId,
-          nativeTaskRef: null,
-          prompt: "Inspect the custom instance.",
-          title: null,
-          model: "gpt-5.4",
-          status: "running",
-          result: null,
-          startedAt: now,
-          completedAt: null,
-          updatedAt: now,
-        },
-      ],
-      updatedAt: now,
-    } as unknown as OrchestrationV2ThreadProjection;
-
-    const childProjection = {
-      thread: {
-        ...baseThread({
-          threadId: childThreadId,
-          title: "Child",
-          instanceId: customCodexInstanceId,
-          model: "gpt-5.4",
-        }),
-        lineage: {
-          parentThreadId,
-          relationshipToParent: "subagent",
-          rootThreadId: parentThreadId,
-        },
-        createdBy: "agent",
+      lineage: {
+        parentThreadId,
+        relationshipToParent: "subagent",
+        rootThreadId: parentThreadId,
       },
-      runs: [
-        {
-          ...makeRun({
-            id: childRunId,
-            ordinal: 1,
-            status: state === "cancelled" || state === "interrupted" ? state : "running",
-            instanceId: customCodexInstanceId,
-          }),
-          ...(["resuming", "cancelled", "interrupted"].includes(state)
-            ? {
-                transientRecovery: {
-                  firstError: { message: "502 connection reset" },
-                  since: DateTime.formatIso(now),
-                },
-              }
-            : {}),
-        },
-      ],
-      turnItems:
-        state === "retrying"
-          ? [
-              {
-                type: "error",
-                status: "running",
-                runId: childRunId,
+      createdBy: "agent",
+    },
+    runs: [
+      ...(state === "fallback-resumed"
+        ? [
+            {
+              ...makeRun({
+                id: childRunId,
                 ordinal: 1,
-                failure: { message: "Claude API no HTTP response: unknown." },
-                retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 500 },
-                startedAt: now,
-                updatedAt: now,
-              },
-            ]
-          : [],
-      visibleTurnItems: [],
-      runtimeRequests: [],
-      messages: [],
-      contextTransfers: [
-        {
-          type: "subagent_spawn",
-          sourceThreadId: parentThreadId,
-          targetThreadId: childThreadId,
-          targetRunId: childRunId,
-        },
-      ],
-      subagents: [],
-      providerThreads: [],
-      updatedAt: now,
-    } as unknown as OrchestrationV2ThreadProjection;
-
-    const layer = layerOrchestratorService.pipe(
-      Layer.provide(
-        Layer.mergeAll(
-          Layer.mock(ThreadManagementService.ThreadManagementService)({
-            delegatedTaskResultPending: () => Effect.succeed(false),
-            getTimelinePage: () => Effect.succeed({ items: [], totalItems: 0, hasMore: false }),
-            getThreadRecords: (threadId) => {
-              if (threadId === parentThreadId) return Effect.succeed(parentProjection);
-              if (threadId === childThreadId) return Effect.succeed(childProjection);
-              return Effect.die(`unexpected thread ${threadId}`);
+                status: "cancelled",
+                instanceId: customCodexInstanceId,
+              }),
+              delegatedTaskId: taskId,
+              modelSelection: { instanceId: customCodexInstanceId, model: "claude-haiku-5-5" },
             },
-          } satisfies Partial<ThreadManagementService.ThreadManagementService["Service"]>),
-          ServerSettings.layerTest(),
-          Layer.mock(ProviderRegistry.ProviderRegistry)({
-            getProviders: Effect.succeed([]),
-          } satisfies Partial<ProviderRegistry.ProviderRegistry["Service"]>),
-          Layer.mock(ProjectService.ProjectService)({}),
-          Layer.mock(SecretRequests.SecretRequests)({}),
-          Layer.mock(ScheduledTaskService.ScheduledTaskService)({
-            list: () => Effect.succeed({ tasks: [] }),
-          } satisfies Partial<ScheduledTaskService.ScheduledTaskService["Service"]>),
-          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
-            list: () => Effect.succeed([]),
-          } satisfies Partial<ProviderAdapterRegistry.ProviderAdapterRegistryV2["Service"]>),
-          NodeCrypto.layer,
-        ),
-      ),
-    );
+          ]
+        : []),
+      {
+        ...makeRun({
+          id: state === "fallback-resumed" ? RunId.make("run-mcp-resumed") : childRunId,
+          ordinal: state === "fallback-resumed" ? 2 : 1,
+          status: ["fallback", "fallback-resumed"].includes(state)
+            ? "completed"
+            : state === "cancelled" || state === "interrupted"
+              ? state
+              : "running",
+          instanceId: customCodexInstanceId,
+        }),
+        ...(state === "fallback-resumed"
+          ? { delegatedTaskId: taskId, restartContinuationOfRunId: childRunId }
+          : {}),
+        ...(["fallback", "fallback-resumed"].includes(state)
+          ? {
+              modelSelection: { instanceId: customCodexInstanceId, model: "claude-sonnet-5-5" },
+              launchRecovery: {
+                kind: "model_access",
+                retriesOnModel: 0,
+                attempt: 2,
+                delayMs: 20_000,
+                since: DateTime.formatIso(now),
+              },
+            }
+          : {}),
+        ...(["resuming", "cancelled", "interrupted"].includes(state)
+          ? {
+              transientRecovery: {
+                firstError: { message: "502 connection reset" },
+                since: DateTime.formatIso(now),
+              },
+            }
+          : {}),
+      },
+    ],
+    turnItems:
+      state === "retrying"
+        ? [
+            {
+              type: "error",
+              status: "running",
+              runId: childRunId,
+              ordinal: 1,
+              failure: { message: "Claude API no HTTP response: unknown." },
+              retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 500 },
+              startedAt: now,
+              updatedAt: now,
+            },
+          ]
+        : [],
+    visibleTurnItems: [],
+    runtimeRequests: [],
+    messages: [],
+    contextTransfers: [
+      {
+        type: "subagent_spawn",
+        sourceThreadId: parentThreadId,
+        targetThreadId: childThreadId,
+        targetRunId: childRunId,
+      },
+    ],
+    subagents: [],
+    providerThreads: [],
+    updatedAt: now,
+  } as unknown as OrchestrationV2ThreadProjection;
 
-    await Effect.gen(function* () {
-      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
-      const result = yield* service.taskStatus(makeScope(), taskId);
-      expect(result.providerInstanceId).toBe(customCodexInstanceId);
-      expect(result.providerInstanceId).not.toBe(ProviderInstanceId.make(String(codexDriver)));
-      expect(result.status).toBe(
-        state === "cancelled" || state === "interrupted" ? state : "running",
-      );
-      expect(result.taskId).toBe(taskId);
-      expect(result.childThreadId).toBe(childThreadId);
-      if (["working", "cancelled", "interrupted"].includes(state)) expect(result.retry).toBeNull();
-      else {
-        expect(result.retry?.state).toBe(state);
-        expect(result.retry?.lastError).toContain(
-          state === "retrying" ? "no HTTP response" : "502",
-        );
-        expect(result.retry?.since).toBe("2026-08-04T12:00:00.000Z");
-      }
-    }).pipe(Effect.provide(layer), Effect.runPromise);
-  },
-);
+  const layer = layerOrchestratorService.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+          delegatedTaskResultPending: () => Effect.succeed(false),
+          getTimelinePage: () => Effect.succeed({ items: [], totalItems: 0, hasMore: false }),
+          getThreadRecords: (threadId) => {
+            if (threadId === parentThreadId) return Effect.succeed(parentProjection);
+            if (threadId === childThreadId) return Effect.succeed(childProjection);
+            return Effect.die(`unexpected thread ${threadId}`);
+          },
+        } satisfies Partial<ThreadManagementService.ThreadManagementService["Service"]>),
+        ServerSettings.layerTest(),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({
+          getProviders: Effect.succeed([]),
+        } satisfies Partial<ProviderRegistry.ProviderRegistry["Service"]>),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({
+          list: () => Effect.succeed({ tasks: [] }),
+        } satisfies Partial<ScheduledTaskService.ScheduledTaskService["Service"]>),
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+          list: () => Effect.succeed([]),
+        } satisfies Partial<ProviderAdapterRegistry.ProviderAdapterRegistryV2["Service"]>),
+        NodeCrypto.layer,
+      ),
+    ),
+  );
+
+  await Effect.gen(function* () {
+    const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+    const result = yield* service.taskStatus(makeScope(), taskId);
+    expect(result.providerInstanceId).toBe(customCodexInstanceId);
+    expect(result.providerInstanceId).not.toBe(ProviderInstanceId.make(String(codexDriver)));
+    expect(result.status).toBe(
+      ["fallback", "fallback-resumed"].includes(state)
+        ? "completed"
+        : state === "cancelled" || state === "interrupted"
+          ? state
+          : "running",
+    );
+    expect(result.taskId).toBe(taskId);
+    expect(result.childThreadId).toBe(childThreadId);
+    expect(result.finishedOn).toBe(
+      ["fallback", "fallback-resumed"].includes(state) ? "claude-sonnet-5-5" : undefined,
+    );
+    if (["working", "cancelled", "interrupted", "fallback", "fallback-resumed"].includes(state))
+      expect(result.retry).toBeNull();
+    else {
+      expect(result.retry?.state).toBe(state);
+      expect(result.retry?.lastError).toContain(state === "retrying" ? "no HTTP response" : "502");
+      expect(result.retry?.since).toBe("2026-08-04T12:00:00.000Z");
+    }
+  }).pipe(Effect.provide(layer), Effect.runPromise);
+});
 
 it("readThread and sendToThread reach threads in other projects", async () => {
   let parentShell: OrchestrationV2ThreadShell | null = null;
@@ -454,6 +501,7 @@ it("readThread and sendToThread reach threads in other projects", async () => {
     subagents: [],
     updatedAt: now,
   } as unknown as OrchestrationV2ThreadProjection;
+  const redeemers: Array<ThreadId | null> = [];
   const foreignProjection = (threadId: ThreadId) =>
     ({
       thread: {
@@ -503,9 +551,17 @@ it("readThread and sendToThread reach threads in other projects", async () => {
           getThreadShell: (threadId) =>
             Effect.succeed(
               threadId === foreignThreadId
-                ? (foreignProjection(threadId).thread as unknown as OrchestrationV2ThreadShell)
+                ? ({
+                    ...liveThreadShell(threadId),
+                    ...foreignProjection(threadId).thread,
+                  } as OrchestrationV2ThreadShell)
                 : threadId === parentThreadId
-                  ? parentShell
+                  ? (parentShell ?? {
+                      ...liveThreadShell(parentThreadId, {
+                        activeRunId: parentRuns.length > 0 ? RunId.make("run-parent-live") : null,
+                      }),
+                      ...parentProjection.thread,
+                    })
                   : null,
             ),
           getTimelinePage: (threadId) =>
@@ -533,9 +589,17 @@ it("readThread and sendToThread reach threads in other projects", async () => {
         Layer.mock(ProviderRegistry.ProviderRegistry)({
           getProviders: Effect.succeed([]),
         } satisfies Partial<ProviderRegistry.ProviderRegistry["Service"]>),
-        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(ProjectService.ProjectService)({
+          getById: () => Effect.succeed(Option.some({ workspaceRoot: "/work" } as never)),
+        }),
         Layer.mock(SecretRequests.SecretRequests)({}),
         Layer.mock(ScheduledTaskService.ScheduledTaskService)({
+          // ardud: records which thread a save would redeem a secretRef as.
+          upsert: () =>
+            SecretRedeemer.pipe(
+              Effect.tap((redeemer) => Effect.sync(() => redeemers.push(redeemer))),
+              Effect.andThen(Effect.die("saved far enough for this test")),
+            ),
           list: () =>
             Effect.succeed({
               tasks: [
@@ -568,6 +632,16 @@ it("readThread and sendToThread reach threads in other projects", async () => {
       message: "hi",
     });
     expect(sent.threadId).toBe(foreignThreadId);
+
+    // ardud: a secretRef from a board ask is redeemed as the calling thread, taken
+    // from the session, so a ref given to another thread is refused.
+    yield* service
+      .scheduleTask(makeScope(), {
+        prompt: "check in later",
+        schedule: { type: "interval", everyMs: 3_600_000 },
+      })
+      .pipe(Effect.exit);
+    expect(redeemers).toEqual([parentThreadId]);
 
     parentRuns = [];
     yield* service.readThread(makeScope(), { threadId: foreignThreadId });

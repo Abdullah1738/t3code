@@ -26,15 +26,15 @@ describe("compileClaudeModelSelection", () => {
     ).toMatchObject({
       apiModelId: "claude-opus-4-6[1m]",
       effort: "max",
-      settings: { fastMode: true },
+      settings: { fastMode: false },
     });
   });
 
-  it("compiles fast mode only for models that expose it", () => {
+  it("forces standard mode even when fast mode is requested", () => {
     expect(
       compileClaudeModelSelection(selection("claude-opus-4-6", [{ id: "fastMode", value: true }]))
         .settings,
-    ).toEqual({ fastMode: true });
+    ).toEqual({ fastMode: false });
     expect(
       compileClaudeModelSelection(selection("claude-opus-4-6", [{ id: "fastMode", value: false }]))
         .settings,
@@ -72,6 +72,6 @@ describe("compileClaudeModelSelection", () => {
     expect(
       compileClaudeModelSelection(selection("claude-haiku-4-5", [{ id: "thinking", value: false }]))
         .settings,
-    ).toEqual({ alwaysThinkingEnabled: false });
+    ).toEqual({ alwaysThinkingEnabled: false, fastMode: false });
   });
 });

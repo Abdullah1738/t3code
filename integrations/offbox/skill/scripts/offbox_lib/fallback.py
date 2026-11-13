@@ -2,20 +2,18 @@
 
 from __future__ import annotations
 
-import datetime as dt
 import fcntl
 import os
 import shlex
 import sqlite3
 import subprocess
 import time
+import uuid
 
-from .common import LOCAL_SEM, LOCKS_DIR, TZ, db, db_retry, ensure_dirs, event, kv_get, kv_set, log, now, say, warn_loud
+from .common import LOCAL_SEM, LOCKS_DIR, db, db_retry, ensure_dirs, event, log, now, say, warn_loud
 from .identity import telegram
 
 SLOTS = 2
-INFRA_WINDOW_S = 3600
-INFRA_ALERT_AT = 3
 
 
 def allowed(argv: list[str], error, cwd: str) -> bool:
@@ -42,8 +40,7 @@ def allowed(argv: list[str], error, cwd: str) -> bool:
         exe = os.path.basename(words[0])
         if exe in ('echo','true','false','pwd','ls','cat','head','tail','wc','printf','date','uname','git'):
             return True
-        # Go checks run on the Mac only through local-first's sandbox (localfirst.py), never through this
-        # unsandboxed fallback: a check local-first refused (OS-specific code, .env reads) must stay remote.
+        # Go checks never run through this unsandboxed fallback (OS-specific code, .env reads): they stay remote.
         if exe in ('pytest','py.test','jest','vitest','mocha'):
             return True
         if exe.startswith('python') and words[1:3] == ['-m','pytest']:
@@ -54,20 +51,11 @@ def allowed(argv: list[str], error, cwd: str) -> bool:
 
 
 def note_infra_failure(msg: str) -> None:
-    """Count infra failures; on the 3rd within an hour send one Telegram alert per clock hour."""
+    """Record every failure; the bridge sends the first and summarizes the rest hourly."""
     con = db()
-    hist = [t for t in (kv_get(con, "infra_failures") or []) if now() - t < INFRA_WINDOW_S]
-    hist.append(now())
-    kv_set(con, "infra_failures", hist)
     event(con, None, "infra_failure", msg[:500])
-    if len(hist) >= INFRA_ALERT_AT:
-        hour = dt.datetime.now(TZ).strftime("%Y%m%d-%H")
-        key = f"offbox-infra-{hour}"
-        if not kv_get(con, f"sent:{key}"):
-            ok = telegram(f"offbox: {len(hist)} boat infra failures in the last hour; heavy runs remain remote-only. "
-                          f"Last error: {msg[:300]}", key, severity="attention")
-            if ok:
-                kv_set(con, f"sent:{key}", True)
+    telegram(f"offbox: boat infra failure; heavy runs remain remote-only. Latest: {msg[:300]}",
+             f"offbox-infra-{uuid.uuid4()}", severity="attention", burst_key="infra")
 
 
 class Semaphore:

@@ -8,6 +8,8 @@ import engine
 
 def response(event, result):
     kind = event.get("hook_event_name")
+    if kind == "PostToolUse" and "updatedToolOutput" in result["context"] and str(event.get("tool_name", "")).startswith("mcp__"):
+        return {"hookSpecificOutput": {"hookEventName": kind, "updatedMCPToolOutput": result["context"]["updatedToolOutput"]}}
     if kind != "PreToolUse" or (result["decision"] != "deny" and "updatedInput" not in result["context"]):
         return None
     specific = {"hookEventName": kind}
@@ -26,6 +28,9 @@ def main():
         if not isinstance(event, dict):
             raise ValueError("invalid-event")
         if sys.argv[1:] == ["--shell-mcp"] and engine.desktop_lease.matches(event.get("tool_name")):
+            return
+        # The desktop-specific registration already masks and ends its lease.
+        if sys.argv[1:] == ["--card-mask"] and engine.desktop_lease.matches(event.get("tool_name")):
             return
         output = response(event, engine.decide(event, "codex"))
         if output is not None:

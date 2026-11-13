@@ -324,18 +324,96 @@ def handled(items, deadline=None):
     return reasons, errors
 
 
-def money_books(wd, mc):
+def money_books(wd, mc, dry=False):
     """Where charge questions are kept: the real books for the live watcher, a copy for robob-watch
     test and other scratch runs."""
-    if wd.resolve() == LIVE.resolve():
+    if not dry and wd.resolve() == LIVE.resolve():
         return None
-    data = wd / 'scratch-money'
+    data = wd / ('scratch-renewals' if dry else 'scratch-money')
     if not data.exists():
         data.mkdir(mode=0o700, parents=True)
-        for name in ('cases.json', 'questions.json'):
+        for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json'):
             if (mc.DATA / name).exists():
                 shutil.copy2(mc.DATA / name, data / name)
     return data
+
+
+def payment_notice(item, text):
+    try:
+        parser = load_module('triage_payments', MONEY_CASES.with_name('payments.py'))
+        return parser.parse(text, item.get('sender', ''), dt.datetime.fromtimestamp(item['ts'], DUBAI))
+    except (OSError, ImportError, ValueError, KeyError):
+        return None
+
+
+def payment_checks(items, now, dry, deadline=None, wd=None):
+    reasons, errors = {}, []
+    try:
+        mc = load_module('triage_money_cases', MONEY_CASES)
+        # Dry runs exercise detection only and never mutate the live books.
+        data = None if dry else money_books(wd, mc)
+        for item in sorted(items, key=lambda i: i.get('ts', 0)):
+            if item.get('source') not in ('imessage', 'email') or not isinstance(item.get('ts'), (float, int)):
+                continue
+            text = f"{item.get('subject', '')} {item.get('preview', '')}"
+            notice = item.get('payment_notice') or mc.payments.parse(text, item.get('sender', ''), dt.datetime.fromtimestamp(item['ts'], mc.TZ))
+            if not notice:
+                continue
+            item['payment_notice'] = notice
+            if dry:
+                continue
+            if late(deadline):
+                errors.append('payment tracking out of time; retry next check')
+                continue
+            try:
+                with mc.within(deadline, mc.CheckTimeout('payment tracking out of time')):
+                    mc.record_payment(data, notice, item['id'], dt.datetime.fromtimestamp(now, mc.TZ), end=deadline)
+                reasons[item['id']] = notice['kind'] + '_tracked'
+            except Exception as e:
+                errors.append(f'{type(e).__name__}: {str(e)[:100]}')
+    except Exception as e:
+        errors.append(f'{type(e).__name__}: {str(e)[:100]}')
+    return reasons, '; '.join(dict.fromkeys(errors))[:300] or None
+
+
+def renewal_notice(item, text):
+    if not re.search(r'renew|billing date|will be charged', item.get('subject', '') + ' ' + text, re.I):
+        return None
+    try:
+        mc = load_module('triage_money_cases', MONEY_CASES)
+        return mc.renewal(text, item.get('sender', ''), subject=item.get('subject', ''))
+    except (OSError, ImportError, ValueError):
+        return None
+
+
+def renewal_checks(items, now, dry, deadline=None, wd=None):
+    reasons, errors = {}, []
+    try:
+        mc = load_module('triage_money_cases', MONEY_CASES)
+        with mc.within(deadline, mc.CheckTimeout('renewal tracking out of time')):
+            data = money_books(wd, mc, dry=dry)
+        for item in items:
+            if item.get('source') not in ('imessage', 'email'):
+                continue
+            if late(deadline):
+                errors.append('renewal tracking out of time; retry next check')
+                break
+            try:
+                with mc.within(deadline, mc.CheckTimeout('renewal tracking out of time')):
+                    notice = (item['renewal_notice'] if 'renewal_notice' in item else
+                              mc.renewal(item.get('preview', ''), item.get('sender', ''), subject=item.get('subject', '')))
+                    if not notice:
+                        continue
+                    item['renewal_notice'] = notice
+                    case = mc.renewal_case(data, notice, item['id'], dt.datetime.fromtimestamp(now, mc.TZ),
+                                           end=deadline, include_existing=True)
+                if case:
+                    reasons[item['id']] = 'renewal_case'
+            except Exception as e:
+                errors.append(f'{type(e).__name__}: {str(e)[:100]}')
+    except Exception as e:
+        errors.append(f'{type(e).__name__}: {str(e)[:100]}')
+    return reasons, '; '.join(dict.fromkeys(errors))[:300] or None
 
 
 def charge_checks(items, now, dry, deadline=None, wd=None):
@@ -430,6 +508,17 @@ def prefilter(item, now, rules):
             return 'learned_noise'
     if OTP.search(subject + ' ' + preview) and now - item['ts'] > 300:
         return 'stale_otp'
+    if item['source'] in ('email', 'imessage'):
+        renewal = item['renewal_notice'] if 'renewal_notice' in item else renewal_notice(item, preview)
+        if renewal:
+            item['renewal_notice'] = renewal
+            return None
+    if item['source'] in ('email', 'imessage') and (item.get('payment_notice') or re.search(r'auto[ -]?pay|payment|repay|late fee|interest', subject + ' ' + preview, re.I)):
+        try:
+            if item.get('payment_notice') or payment_notice(item, subject + ' ' + preview):
+                return None
+        except Exception:
+            pass  # Tracking errors are reported by payment_checks; preserve normal filtering here.
     if item['source'] == 'email':
         if 'talabat.com' in sender.lower() and re.fullmatch(r'your service charges receipt', subject, re.I):
             return 'routine_receipt'
@@ -505,7 +594,9 @@ def mail_record(M, mail, account, validity, record, cutoff, now, request):
             'preview': '', 'list_unsubscribe': bool(msg.get('List-Unsubscribe')),
             'precedence': str(msg.get('Precedence', '')).lower()}
     reason = prefilter(item, now, request['rules'])
-    if reason:
+    # A subject or bulk header can't establish whether the body holds a renewal.
+    # Existing account/worker budgets still bound these reads and retain partial prefixes.
+    if reason and reason not in ('bulk', 'promotion'):
         return None, reason
     fetched = fetch_verified(M, [uid], '(UID BODY.PEEK[]<0.32768>)')
     if not fetched:
@@ -526,6 +617,11 @@ def mail_record(M, mail, account, validity, record, cutoff, now, request):
         except (ValueError, LookupError, UnicodeError):
             pass
     text = '\n'.join(plain) or mail.html_to_text('\n'.join(html))
+    notice = payment_notice(item, str(msg.get('Subject', '')) + ' ' + text)
+    if notice:
+        item['payment_notice'] = notice
+    # Persist a rejection too: a preview must not override the full-message decision.
+    item['renewal_notice'] = renewal_notice(item, text)
     item['preview'] = clean(text)
     item['attachments'] = [clean(a, 100) for a in attachments[:5]]
     redact_item(item, ' '.join([str(msg.get('Subject', '')), text, *attachments]))
@@ -755,9 +851,14 @@ def collect_imessage(cursor, now, initialized_at=None, since=None):
             text = r['text'] or attributed(r['attributedBody'])
             if r['cache_has_attachments']:
                 text += ' [attachment]'
-            items.append({'id': f'imsg:{r["ROWID"]}', 'source': 'imessage', 'ts': ts,
+            item = {'id': f'imsg:{r["ROWID"]}', 'source': 'imessage', 'ts': ts,
                           'chat_id': chats[0]['ROWID'] if chats else None, 'guid': r['guid'],
-                          'sender': clean(r['sender'], 150), 'subject': clean(r['subject'], 150), 'preview': clean(text)})
+                          'sender': clean(r['sender'], 150), 'subject': clean(r['subject'], 150), 'preview': clean(text)}
+            notice = payment_notice(item, str(r['subject'] or '') + ' ' + text)
+            if notice:
+                item['payment_notice'] = notice
+            item['renewal_notice'] = renewal_notice(item, text)
+            items.append(item)
         return {'items': items, 'cursor': rows[-1]['ROWID'] if rows else cursor,
                 'drops': dict(drops), 'dropped': dropped, 'scanned': len(rows)}
 
@@ -792,6 +893,19 @@ def live_work(now):
     return work
 
 
+def open_money_questions():
+    try:
+        result = subprocess.run([str(HOME / '.local/bin/owner-go'), 'list', '--open', '--json'],
+                                capture_output=True, text=True, timeout=3)
+        rows = json.loads(result.stdout) if result.returncode == 0 else None
+        if not isinstance(rows, list) or any(not isinstance(r, dict) or r.get('kind') != 'ask' for r in rows):
+            return {'available': False}
+        return {'available': True, 'questions': rows}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        # Missing/corrupt ledger is unknown, never evidence of no pending choice.
+        return {'available': False}
+
+
 def build_context(items, watchers, now):
     tokens = set(re.findall(r'[a-z]{4,}', ' '.join(str(i.get(k, '')) for i in items for k in ('sender', 'subject', 'preview')).lower()))
     def relevance(text):
@@ -813,7 +927,8 @@ def build_context(items, watchers, now):
     if len(prefs) > PREFS_LIMIT:
         prefs = prefs[:2000] + '\n[... older rules trimmed ...]\n' + prefs[-(PREFS_LIMIT - 2100):]
     return {'preferences': clean_lines(prefs, PREFS_LIMIT), 'active_watchers': '\n'.join(descriptions)[:1100],
-            'recent_activity_newest_first': '\n'.join(recent)[:1100], 'live_work': live_work(now)}
+            'recent_activity_newest_first': '\n'.join(recent)[:1100], 'live_work': live_work(now),
+            'owner_go': open_money_questions()}
 
 
 def classify(items, context):
@@ -1355,7 +1470,16 @@ def run(args):
             dropped.append([item['id'], reason])
         else:
             kept.append(item)
-    charged, held, charge_error = charge_checks(kept, now, dry, None if dry else now + CHARGE_BY, wd)
+    paid, payment_error = payment_checks(kept, now, dry, None if dry else now + CHARGE_BY, wd)
+    renewed, renewal_error = renewal_checks([i for i in kept if i['id'] not in paid], now, dry,
+                                          None if dry else now + CHARGE_BY, wd)
+    paid = {**paid, **renewed}
+    charged, held, charge_error = charge_checks([i for i in kept if i['id'] not in paid], now, dry, None if dry else now + CHARGE_BY, wd)
+    charged = {**paid, **charged}
+    held |= {i['id'] for i in kept if i.get('payment_notice') and i['id'] not in paid} if not dry else set()
+    if renewal_error and not dry:
+        held |= {i['id'] for i in kept if i.get('renewal_notice') and i['id'] not in renewed}
+    charge_error = '; '.join(filter(None, [payment_error, renewal_error, charge_error])) or None
     done, answer_errors = handled([i for i in kept if i['id'] not in charged], None if dry else now + EARLY_BY)
     done = {**charged, **done}
     for i, reason in sorted(done.items()):

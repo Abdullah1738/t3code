@@ -44,6 +44,11 @@ export function useKanbanPermission(tag: KanbanRequestTag): boolean {
   return useAtomValue(permission);
 }
 
+export function useKanbanPermissionStatus(tag: KanbanRequestTag) {
+  const status = useMemo(() => kanbanClient().permissionStatus(tag), [tag]);
+  return useAtomValue(status);
+}
+
 const NONE: SnapshotStore<never> = {
   get: () => undefined,
   subscribe: () => () => {},
@@ -70,9 +75,7 @@ export function useKanbanBoards(): ReadonlyArray<KanbanBoardSummary> | undefined
 }
 
 /** Every thread a board started, cards and evaluators alike, kept current by the list. */
-export function useKanbanBoardThreads(
-  boardId: string,
-): ReadonlyArray<KanbanThreadRow> | undefined {
+export function useKanbanBoardThreads(boardId: string): ReadonlyArray<KanbanThreadRow> | undefined {
   return useStore(kanbanClient().threads(boardId));
 }
 

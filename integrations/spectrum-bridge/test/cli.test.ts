@@ -54,7 +54,7 @@ describe("parseCommand", () => {
 
   test("one-time notification sends moved to the telegram bridge; send-file requires --session", () => {
     for (const command of ["notify", "remind", "reminders", "notifications", "cancel", "snooze"]) {
-      expect(() => parseCommand([command])).toThrow("Expected health, send, send-file, poll, app, react, wake, secret-request, secret, publish, or unpublish");
+      expect(() => parseCommand([command])).toThrow("Expected health, send, cancel-send, send-file");
       expect(() => parseCommand([command])).toThrow("telegram bridge CLI");
     }
     expect(() => parseCommand(["send-file", "--file", "/nonexistent/report.pdf", "--key", "file-1"]))

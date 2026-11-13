@@ -1,0 +1,35 @@
+{
+  "case_number": 9,
+  "reporter_id": "crpko976",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Fcrpko-devops:fcc7ba89-b070-4e65-abb2-3868ff2e916c",
+  "provenance": {
+    "recovery": "verbatim",
+    "source_kind": "retained_codex_custom_tool_call",
+    "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/12/rollout-2026-11-12T01-58-04-01a1cc9e-3c3c-72f3-8929-19941f8ebdc8.jsonl",
+    "source_call_line_0": 736,
+    "timestamp": "2026-11-11T22:31:06.735Z",
+    "call_id": "call_04c1062cd30b4b699225081997a14581",
+    "command_index_0": 0,
+    "cell_command_count": 1,
+    "decoder": "integrations/harness-hooks/tests/code_mode_fixture.py:commands (static decoding; no execution)",
+    "explicit_workdir_present": true,
+    "sha256_scope": "UTF-8 bytes of cmd only; workdir preserved separately",
+    "thread_mapping": "Robob #1006 reporter link and reporter activity title confirmed",
+    "raw_denials_file": "/tmp/guard1006-denials.json",
+    "raw_denial_index_0": 271,
+    "intentionally_absent_from_setup_files": [
+      "tmp/run-csv-mutants.sh",
+      "tmp/mutate-csv-rules.py"
+    ],
+    "additional_matching_refusal": "Raw denial index 272, command index 0, repeats the same inline edit without the follow-on offbox invocation; omitted as redundant. Its command index 1 is not included."
+  },
+  "session_cwd": "/Volumes/ExternalSSD/crpko-devops",
+  "commands": [
+    {
+      "cmd": "python3 - <<'PY'\nfrom pathlib import Path\np=Path('tests/worker/test_asset_csv_import.py');s=p.read_text().replace('evidence_object_storage=objects,','evidence_object_storage=cast(Any, objects),').replace('clock=s.clock','clock=cast(Any, s.clock)').replace('def unavailable(**_: object)', 'def unavailable(_store: object, **_: object)')\ns=s.replace('s.objects.writes[s.progress.results_csv_s3_key]', 's.objects.writes[cast(str, s.progress.results_csv_s3_key)]')\ns=s.replace('s.resource.tables_by_name[ASSETS].item_by_instrument_id[\"BTC\"][\"version\"]', 'cast(Mapping[str, object], s.resource.tables_by_name[ASSETS].item_by_instrument_id[\"BTC\"])[\"version\"]')\ns=s.replace('    assert old_receipt[\"state\"] == \"ABANDONED\"', '    assert old_receipt is not None\\n    assert old_receipt[\"state\"] == \"ABANDONED\"');p.write_text(s)\np=Path('tmp/run-csv-mutants.sh');s=Path('tmp/test-row-postgres.sh').read_text().replace('timeout 600 uv run pytest tests/data/aurora/test_asset_csv_rows_postgres.py -q -x','timeout 1200 uv run python tmp/mutate-csv-rules.py');p.write_text(s)\np=Path('tmp/mutate-csv-rules.py');s=p.read_text();needle=\"cases = [\\n\";s=s.replace(needle,needle+''' ('fence_enclosing_operation', [(registry, '        # SDK retries are disabled by _default_botocore_config_factory.', '        request = json.loads(request_bytes)\\\\n        if len(request[\"TransactItems\"]) == 1:\\\\n            self._dynamodb_client_resource(timeout_ms=timeout_ms).put_item(**request[\"TransactItems\"][0][\"Put\"])\\\\n            return\\\\n        # SDK retries are disabled by _default_botocore_config_factory.')], worker_test+'test_third_unknown_send_fences_and_delayed_commit_has_no_effect'),\n''');p.write_text(s)\nPY\nuv run --no-sync ruff format tests/worker/test_asset_csv_import.py\noffbox run --bg --remote --include tmp/run-csv-mutants.sh --include tmp/mutate-csv-rules.py --pull tmp/mutations -- timeout 1500 bash tmp/run-csv-mutants.sh",
+      "workdir": "/Users/ardud/checkouts/asset-csv-import-worker",
+      "sha256": "7ad334c9f6d016e9961ad34b9f771620ea6ee7fb1e4780d33b420ca5efa7ebda"
+    }
+  ],
+  "original_refusal": "Command blocked by PreToolUse hook: statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard."
+}

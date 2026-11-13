@@ -11,12 +11,13 @@ from offbox_lib import api, common, lease, misc, reap, runs
 from test_capacity import Isolated
 
 
-RESULTS = [('done', 0), ('failed', 17), ('local_error', 93), ('killed', 130), ('infra', 90), ('busy', 92)]
+RESULTS = [('done', 0), ('failed', 17), ('local_error', 96), ('killed', 130), ('infra', 90), ('busy', 92)]
 
 
 class ReaperRecovery(Isolated):
     def setUp(self):
         super().setUp()
+        self.stack.enter_context(patch.object(misc, '_catch_up_log', return_value='complete'))
         for module, name in ((api, 'call'), (api, 'stream'), (lease.ssh_sync, 'ssh')):
             transport = self.stack.enter_context(patch.object(
                 module, name, side_effect=AssertionError(f'unexpected external transport: {name}')))
@@ -35,6 +36,7 @@ class ReaperRecovery(Isolated):
             self.con.rollback()
         self.assertEqual(self.result(rid), ('starting', None))
         self.assertTrue((runs.LOGS_DIR / f'{rid}.state.json').exists())
+        (runs.LOGS_DIR / f'{rid}.log').write_text('fixture output\n')
 
     def result(self, rid):
         return tuple(self.con.execute('SELECT status,exit_code FROM runs WHERE run_id=?', (rid,)).fetchone())
@@ -139,7 +141,7 @@ class ReaperRecovery(Isolated):
                 self.assertEqual(lease.active_runs(self.con, 'kill-race'), 0)
 
     def test_top_level_recovery_dry_run_does_not_write(self):
-        self.pending_result('dry-result', 'local_error', 93, age=3 * 3600)
+        self.pending_result('dry-result', 'local_error', 96, age=3 * 3600)
         with patch.object(api, 'list_boxes', return_value=[]):
             actions = reap._reap(self.con, True, [])
         self.assertEqual(self.result('dry-result'), ('starting', None))

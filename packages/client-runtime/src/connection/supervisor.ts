@@ -47,6 +47,11 @@ const establishmentTimeout = Duration.fromInputUnsafe(CONNECTION_ESTABLISHMENT_T
 const synchronizationTimeout = Duration.fromInputUnsafe("75 seconds");
 const CONNECTION_PROBE_TIMEOUT = "15 seconds";
 const QUICK_CONNECTION_PROBE_TIMEOUT = "3 seconds";
+// ardud: a mobile return from a short inactive spell (Control Centre, Face ID)
+// probes a socket that is almost always still up. Under server load the probe
+// reply took over 3 s, so a healthy session was torn down and replaced in a
+// loop (11 Nov 2026). The 15 s ping timeout still catches a dead socket.
+const FOREGROUND_PROBE_TIMEOUT = "8 seconds";
 const BACKOFF_RESET_AFTER_MS = 30_000;
 // Mobile JS resumes shortly before the app reports that it is active, so an
 // overdue retry can start an attempt just before a long-resume wakeup arrives.
@@ -588,9 +593,8 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         if (next.reason === "application-active") {
           return CONNECTION_PROBE_TIMEOUT;
         }
-        return next.reason === "application-active-probe" || next.reason === "network-changed"
-          ? QUICK_CONNECTION_PROBE_TIMEOUT
-          : undefined;
+        if (next.reason === "application-active-probe") return FOREGROUND_PROBE_TIMEOUT;
+        return next.reason === "network-changed" ? QUICK_CONNECTION_PROBE_TIMEOUT : undefined;
       case "ConnectRequested":
       case "DisconnectRequested":
       case "BetterRouteAvailable":
@@ -888,6 +892,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
 
   const run = Effect.fnUntraced(function* () {
     let failureCount = 0;
+    let consecutiveFailedProbes = 0;
     let generation = 0;
     let latestFailure: ConnectionAttemptError | null = null;
     let pendingRetry = Option.none<PendingRetryTrace>();
@@ -951,6 +956,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         latestFailure = null;
         if (outcome.stable) {
           resetRetryLadder();
+          consecutiveFailedProbes = 0;
         }
       }
       if (outcome._tag === "Interrupted") {
@@ -985,7 +991,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         continue;
       }
 
-      if (failedProbe) {
+      // ardud: the first missed health check reconnects at once. A replacement that
+      // also misses one before it was stable means a slow server, not a dead socket:
+      // back off like any other failure instead of reconnecting in a tight loop.
+      if (failedProbe && ++consecutiveFailedProbes === 1) {
         resetRetryLadder();
         yield* setState(connectingState(yield* Ref.get(intent), generation, 1, latestFailure));
         continue;

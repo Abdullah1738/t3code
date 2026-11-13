@@ -1,4 +1,4 @@
-import { ModelSelection } from "@t3tools/contracts";
+import { RecordedModelSelection } from "@t3tools/contracts";
 import type { UsageSpeed } from "@t3tools/provider-core/server/usage";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
@@ -20,7 +20,7 @@ export class CodexUsageHistoryReadError extends Schema.TaggedError<CodexUsageHis
   }
 }
 
-const decodeSelection = Schema.decodeUnknownOption(Schema.fromJsonString(ModelSelection));
+const decodeSelection = Schema.decodeUnknownOption(Schema.fromJsonString(RecordedModelSelection));
 const encodeTurnIds = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)));
 
 export interface CodexUsageHistoryRequest {

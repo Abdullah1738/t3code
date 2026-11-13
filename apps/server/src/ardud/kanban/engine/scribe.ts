@@ -9,6 +9,13 @@ import {
 import * as Schema from "effect/Schema";
 
 export const SCRIBE_EVERY_MS = 10 * 60_000;
+/**
+ * Hang guard for the board's background model calls (scribe groups and goals, goal ideas,
+ * card title writer). It is not a thinking limit: the owner wants the board's own model and
+ * effort to take as long as they need (runs of 47-100 s and more were cut at the drivers'
+ * default 3 minutes). It only stops a CLI child that is truly stuck from living forever.
+ */
+export const BOARD_TEXT_HANG_GUARD_MS = 30 * 60_000;
 const MAX_CARDS = 400;
 const MAX_GROUPS = 20;
 const MAX_GOAL_CARDS = 40;

@@ -247,7 +247,7 @@ The model selection applies to this message's run. Use `PATCH` to change the
 thread's default. Response: `messageId`,
 `runId`, `status`, `delivery` (`started`, `queued`, `steered`, `restarted`).
 
-For example, `t3ctl send THREAD 'hello' --instance claudeAgent --model claude-opus-5-5 --option effort=max --option fastMode=true`.
+For example, `t3ctl send THREAD 'hello' --instance claudeAgent --model claude-opus-5-5 --option effort=max`.
 The `create` and `set` commands accept the same repeatable `--option K=V` and
 `--instance` flags. `true` and `false` become booleans; other values remain
 strings. To clear all options, send `"options": []` in the HTTP API or client.
@@ -396,7 +396,7 @@ Agents inside t3 threads already get the T3 MCP server. Equivalents:
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | `projects.list`                                | `t3_project_list`                                                                                                               |                                                                                       |
 | `models.list`                                  | `orchestrator_capabilities`                                                                                                     | Lists providers, models and options. No favourites or recents.                        |
-| `session.list`                                 | `t3_thread_list`                                                                                                                | Calling project only. `t3_thread_search` searches titles and content.                 |
+| `session.list`                                 | `t3_thread_list`                                                                                                                | Calling project only. `t3_thread_search` searches finished messages (5 s budget; `complete: false` means partial, `searchedBackTo` is the oldest timestamp examined). Narrow the query or pass `projectId`.                 |
 | `session.create`                               | `t3_thread_launch` (`message` optional, `scratch`, `workspaceStrategy`) or `create_threads`                                     |                                                                                       |
 | `session.dispatch`                             | `t3_thread_launch` with `message`, or `create_threads` with `prompt`                                                            | Both return without waiting.                                                          |
 | `session.send`                                 | `t3_thread_send`                                                                                                                | `mode` auto, queue, steer, restart                                                    |
@@ -427,3 +427,7 @@ favourites and recents, `session.send` to a thread in another project, and
   branch). Before that, `by-native` resolves only sessions t3 itself created.
 - Tokens come from `t3 auth session issue` with administrative scopes. There is
   no read-only option in the CLI.
+
+Thread message search is exposed through MCP `t3_thread_search` and WebSocket
+`orchestration.searchThreads`; there is no control HTTP search route or t3ctl
+search command. Both return optional `complete` and `searchedBackTo` fields.

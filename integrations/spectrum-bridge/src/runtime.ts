@@ -110,7 +110,7 @@ export class ChatRegistry<P> {
   }
 
   /** Ingress target: opens chats lazily and records typing per chat. */
-  sink(note: IngressSink["note"], enabled: () => boolean = () => true, guest?: IngressSink["guest"]): IngressSink {
+  sink(note: IngressSink["note"], enabled: () => boolean = () => true, guest?: IngressSink["guest"], received?: (chat: Chat<P>, input: unknown) => void): IngressSink {
     return {
       ...(guest ? { guest: async (message: Parameters<NonNullable<IngressSink["guest"]>>[0]) => enabled() ? guest(message) : false } : {}),
       acceptInto: (key, groupName) => {
@@ -122,7 +122,7 @@ export class ChatRegistry<P> {
             if (typeof id !== "string") return false;
             // Same as Photon ingest: the router's quiet window counts from arrival, not from the sender's clock.
             const created = chat.store.acceptInbound(id, { ...(input as object), receivedAt: this.now() });
-            if (created) this.touch(chat);
+            if (created) { this.touch(chat); received?.(chat, input); }
             return created;
           },
         };
@@ -209,7 +209,7 @@ export type SbApiOptions<P extends { api: Handler }> = {
 };
 
 /** Session-bound routes the per-chat Photon-era API already implements. */
-const FORWARDED = ["/files", "/poll", "/secret-request"];
+const FORWARDED = ["/files", "/poll", "/secret-request", "/cancel-send"];
 const TAPBACKS = ["like", "love", "dislike", "laugh", "emphasize", "question"];
 const RESERVED_TARGET = /^(?:secret|wake|reset):/;
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });

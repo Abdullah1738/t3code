@@ -50,6 +50,11 @@ def network_holder(path, entered, release, queue):
 
 
 class DatabaseContention(Isolated):
+    def setUp(self):
+        super().setUp()
+        self.stack.enter_context(patch.object(misc, '_catch_up_log', return_value='complete'))
+        self.stack.enter_context(patch.object(api, '_request', side_effect=AssertionError('unexpected API transport')))
+
     def test_parallel_cold_start_registrations(self):
         ctx = multiprocessing.get_context('spawn')
         path = str(Path(self.tmp.name) / 'cold.sqlite')
@@ -121,15 +126,14 @@ class DatabaseContention(Isolated):
         return cli.build_parser().parse_args(['run', *extra, '--', 'echo', 'ok'])
 
     def test_prestart_lock_foreground_and_background_never_fallback(self):
-        from offbox_lib import fallback, localfirst
+        from offbox_lib import fallback
         for extra in ([], ['--bg'], ['--remote']):
             with self.subTest(extra=extra), patch.object(runs.Runner, 'start',
                     side_effect=sqlite3.OperationalError('database is locked')), \
-                    patch.object(localfirst, 'decide', return_value='remote'), \
                     patch.object(fallback, 'run_local') as local, \
                     patch.object(fallback, 'note_infra_failure') as infra, \
                     contextlib.redirect_stderr(io.StringIO()) as stderr:
-                self.assertEqual(cli.cmd_run(self.args(*extra), self.me), 93)
+                self.assertEqual(cli.cmd_run(self.args(*extra), self.me), 96)
                 self.assertIn('nothing ran, safe to retry', stderr.getvalue())
                 self.assertNotIn('remote run error', stderr.getvalue())
                 local.assert_not_called()
@@ -142,7 +146,7 @@ class DatabaseContention(Isolated):
         with patch.object(runs.Runner, 'start', failed), self.assertRaises(common.OffboxError) as error:
             runs.run_remote(self.args('--bg'), self.me)
         self.assertIn('run-', str(error.exception))
-        self.assertEqual(error.exception.code, 93)
+        self.assertEqual(error.exception.code, 96)
 
     def test_poststart_lock_says_command_may_have_run_and_wait(self):
         def failed(a, runner):
@@ -150,7 +154,7 @@ class DatabaseContention(Isolated):
             raise sqlite3.OperationalError('database is locked')
         with patch.object(runs, '_run_remote', failed), self.assertRaises(common.OffboxError) as error:
             runs.run_remote(self.args(), self.me)
-        self.assertEqual(error.exception.code, 93)
+        self.assertEqual(error.exception.code, 96)
         self.assertTrue(error.exception.started)
         self.assertIn('offbox wait run-', str(error.exception))
         self.assertNotIn('nothing ran', str(error.exception))
@@ -259,7 +263,7 @@ class DatabaseContention(Isolated):
 
     def test_local_failure_is_never_eligible_for_small_command_fallback(self):
         from offbox_lib import fallback
-        self.assertFalse(fallback.allowed(['echo','ok'], common.OffboxError('DB busy',code=93), '/repo'))
+        self.assertFalse(fallback.allowed(['echo','ok'], common.OffboxError('DB busy',code=96), '/repo'))
 
     def test_authoritative_identity_updates_survive_busy_cache_and_outage(self):
         import json
@@ -297,6 +301,7 @@ class DatabaseContention(Isolated):
                     runs.save_run_state(rid, status='done' if code == 0 else 'failed',exit_code=code)
                 with patch.object(api, 'cmd_status', return_value={'status':remote,'exitCode':254}) as status, \
                         patch.object(runs, 'recover_lost_exit', return_value=(code, 'exit file')), \
+                        patch.object(runs, 'confirmed_lost', return_value={'running':False, 'status':'exited', 'exitCode':code}), \
                         patch.object(lease, 'touch'), patch.object(lease, 'idle_ttl'):
                     pool._refresh_background(self.con, 'repo')
                     if source == 'saved':
@@ -314,6 +319,7 @@ class DatabaseContention(Isolated):
                 self.con.execute('BEGIN IMMEDIATE')
                 try:
                     with patch.object(identity, 'whoami', return_value=self.me), \
+                            patch.object(api, 'get', return_value=None), \
                             patch.object(common, 'DB_TIMEOUT', .005), patch.object(runs, 'follow', return_value=code), \
                             contextlib.redirect_stderr(io.StringIO()) as stderr, contextlib.redirect_stdout(io.StringIO()):
                         self.assertEqual(cli.main(['wait', rid]), code)
@@ -322,13 +328,12 @@ class DatabaseContention(Isolated):
                     self.con.rollback()
 
     def test_local_fallback_keeps_executed_result_when_bookkeeping_locks(self):
-        from offbox_lib import fallback, localfirst
+        from offbox_lib import fallback
         from types import SimpleNamespace
         for stage in ('connect','update','event'):
             for code in (0,17):
                 with self.subTest(stage=stage, code=code), contextlib.ExitStack() as stack:
                     stack.enter_context(patch.object(identity, 'whoami', return_value=self.me))
-                    stack.enter_context(patch.object(localfirst, 'decide', return_value='remote'))
                     stack.enter_context(patch.object(runs, 'run_remote', side_effect=capacity.CapacityError('limit')))
                     stack.enter_context(patch.object(fallback, 'Semaphore'))
                     command = stack.enter_context(patch.object(fallback.subprocess, 'run', return_value=SimpleNamespace(returncode=code)))
@@ -370,7 +375,7 @@ class DatabaseContention(Isolated):
 
     def test_every_terminal_sidecar_repairs_database_and_releases_pool_slot(self):
         self.box('box', member=True)
-        for status, code in [('done',0),('failed',17),('local_error',93),('killed',130),('infra',90),('busy',92)]:
+        for status, code in [('done',0),('failed',17),('local_error',96),('killed',130),('infra',90),('busy',92)]:
             for reader in ('wait','pool','reap'):
                 with self.subTest(status=status, reader=reader):
                     rid = f'terminal-{status}-{reader}'

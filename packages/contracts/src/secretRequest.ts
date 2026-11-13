@@ -29,6 +29,9 @@ const SECRET_REQUEST_FAILURE_MESSAGES = {
     "That secretRef was already used or does not exist. Ask the user again with request_secret.",
   ref_expired: "That secretRef expired. Ask the user again with request_secret.",
   consume_failed: "Could not use that secretRef. Try again.",
+  // ardud: a value the owner gave on a board ask is for one thread.
+  ref_other_thread:
+    "That secretRef was given to another thread, and only that thread can use it. If you need the value, ask the owner for it yourself.",
 } as const;
 
 export const SecretRequestFailureReason = Schema.Literals(

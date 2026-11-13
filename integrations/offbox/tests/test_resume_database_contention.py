@@ -13,7 +13,7 @@ from test_capacity import Isolated
 
 
 class ResumeDatabaseContention(Isolated):
-    def test_stopped_resume_database_failures_are_93_before_command_start(self):
+    def test_stopped_resume_database_failures_are_96_before_command_start(self):
         # Both writes after SSH readiness can be the first failing statement. A local API
         # bookkeeping error is also pre-command even though the machine may have resumed.
         for phase in ('resume_call', 'resume_event', 'lease_state'):
@@ -75,7 +75,7 @@ class ResumeDatabaseContention(Isolated):
                 local = stack.enter_context(patch.object(fallback, 'run_local'))
                 infra = stack.enter_context(patch.object(fallback, 'note_infra_failure'))
                 stderr = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
-                self.assertEqual(cli.main(['run','--remote','--no-fallback','--','echo','ok']), 93)
+                self.assertEqual(cli.main(['run','--remote','--no-fallback','--','echo','ok']), 96)
                 self.assertIn('nothing ran, safe to retry', stderr.getvalue())
                 self.assertNotIn('remote run error', stderr.getvalue())
                 self.assertTrue(injected)
@@ -93,4 +93,4 @@ class ResumeDatabaseContention(Isolated):
                     pass
                 saved = self.con.execute('SELECT status,exit_code,process_id FROM runs WHERE repo_root=?',
                                          (str(root),)).fetchone()
-                self.assertEqual(tuple(saved), ('local_error',93,None))
+                self.assertEqual(tuple(saved), ('local_error',96,None))

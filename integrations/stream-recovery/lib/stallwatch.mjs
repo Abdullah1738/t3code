@@ -1,8 +1,9 @@
 // Stall watch: one pass over OpenCode's active sessions per scan. Spots
 // sessions that stay "running" with nothing changing, interrupts them, follows
 // up until they are clear, then reports once. The caller loads and saves state.
+import { assertRecoveryActive, guardRecoveryIo, isRecoveryPaused, recoveryElapsed } from './pause.mjs';
 import * as realIo from "./io.mjs";
-import { truncate } from "./detect.mjs";
+import { isNestedThreadId, truncate } from "./detect.mjs";
 import { cutoverOwns, isOpenCodeSessionId, openCodeSession, recoveryOwned } from './harness.mjs';
 import {
   FALLBACK_MS, GHOST_LABEL, GHOST_RUN_MS, GIVE_UP_MS, buildStallNote, buildStallSummary, fingerprint,
@@ -11,7 +12,29 @@ import {
 } from "./stall.mjs";
 
 const DAY_MS = 86_400_000;
+const HOUR_MS = 3_600_000;
 const MAX_TRIES = 3;
+const IDENTITY_BUDGET_MS = 1_000;
+const IDENTITY_DEFER_MS = 5 * 60_000;
+
+const childThread = (id) => isNestedThreadId(id) || (typeof id === "string" && id.startsWith("thread:delegated-task:"));
+
+// A fork is a separate thread; a subagent belongs to its nearest non-subagent owner.
+function directOwner(thread) {
+  if (!thread?.threadId || thread.relationshipToParent === "subagent") return null;
+  if (thread.relationshipToParent === "fork") return thread.threadId;
+  if (thread.relationshipToParent !== null || thread.parentThreadId !== null || childThread(thread.threadId)) return null;
+  return thread.threadId;
+}
+
+function sameStall(a, b) {
+  if (!a.ses || a.ses !== b.ses) return false;
+  const aRun = a.alertRunId ?? a.runId;
+  const bRun = b.alertRunId ?? b.runId;
+  if (aRun && bRun) return aRun === bRun;
+  return Number.isFinite(a.quietSince) && Number.isFinite(b.quietSince)
+    && Math.floor(a.quietSince / 1000) === Math.floor(b.quietSince / 1000);
+}
 
 async function mapLimit(items, limit, fn) {
   let next = 0;
@@ -24,6 +47,8 @@ async function mapLimit(items, limit, fn) {
 const errText = (err) => String(err?.message || err).slice(0, 300);
 
 export async function stallScan({ state, now, dryRun = false, verbose = false, log }, io = realIo) {
+  assertRecoveryActive(io);
+  io = guardRecoveryIo(io);
   const iso = new Date(now).toISOString();
   const cutover = await io.harnessCutoverStatus();
   const active = new Set([...(await io.activeSessions())].filter(isOpenCodeSessionId));
@@ -33,6 +58,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       const messages = await io.ocTail(ses, 2);
       if (messages) tails.set(ses, messages);
     } catch (err) {
+      if (isRecoveryPaused(err)) throw err;
       if (verbose) log(`stall: ${ses} tail failed: ${errText(err)}`);
     }
   });
@@ -50,23 +76,37 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
   }
 
   const report = [];
+  const notifications = [];
+  const identityHints = new Map();
   const notify = (id, stall) => {
     const summary = buildStallSummary(stall);
     if (dryRun) return log(`summary (${summary.severity}):\n${summary.text}`);
-    stall.telegramTries = (stall.telegramTries ?? 0) + 1;
+    const tries = stall.telegramTries ?? 0;
     try {
+      assertRecoveryActive(io);
+      stall.telegramTries = (stall.telegramTries ?? 0) + 1;
       io.telegram({ text: summary.text, severity: summary.severity, key: `stream-recovery:${id}` });
       stall.telegram = true;
+      stall.alertPending = false;
     } catch (err) {
+      if (isRecoveryPaused(err)) {
+        stall.telegramTries = tries;
+        stall.alertPending = true;
+        throw err;
+      }
       stall.telegram = false;
       log(`telegram failed (${stall.telegramTries}/${MAX_TRIES}): ${errText(err)}`);
     }
   };
   const finish = (id, stall, outcome, detail) => {
-    Object.assign(stall, { outcome, detail: detail ?? null, done: true, doneAt: iso });
-    stall.summary = buildStallSummary(stall).text.split("\n")[0];
+    assertRecoveryActive(io);
+    // A dry run may report what would happen but must not finish a stored stall.
+    const completed = dryRun ? { ...stall } : stall;
+    Object.assign(completed, { outcome, detail: detail ?? null, done: true, doneAt: iso });
+    completed.summary = buildStallSummary(completed).text.split("\n")[0];
+    if (!dryRun) completed.alertPending = true;
     log(`stall ${id}: ${outcome}${detail ? ` (${detail})` : ""} | ${truncate(stall.title, 60)}`);
-    notify(id, stall);
+    notifications.push([id, completed]);
   };
   // The OpenCode interrupt is retried on later scans when the call itself fails.
   const ocStop = async (stall) => {
@@ -74,34 +114,36 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       Object.assign(stall, { done: true, note: false, outcome: 'superseded', summary: 'harness cutover owns continuation; no recovery action' });
       return;
     }
+    assertRecoveryActive(io);
     stall.ocTries = (stall.ocTries ?? 0) + 1;
     try {
       stall.ocInterrupted = await io.ocInterrupt(stall.ses);
       stall.ocTried = now;
     } catch (err) {
+      if (isRecoveryPaused(err)) {
+        stall.ocTries--;
+        throw err;
+      }
       stall.errors.push(`opencode interrupt: ${errText(err)}`);
       if (stall.ocTries >= MAX_TRIES) stall.ocTried = now;
     }
   };
 
-  // Summaries whose Telegram send failed get a few more tries.
-  for (const [id, stall] of Object.entries(state.stalls)) {
-    if (stall.done && stall.telegram === false && (stall.telegramTries ?? 1) < MAX_TRIES) notify(id, stall);
-  }
-
   // Follow up on stalls interrupted by earlier scans.
   for (const [id, stall] of open) {
+    assertRecoveryActive(io);
     if (!isOpenCodeSessionId(stall.ses) || cutoverOwns(cutover, stall.threadId, [stall.runId])) {
       Object.assign(stall, { done: true, note: false, outcome: 'superseded', summary: 'harness cutover or native session; no recovery action' });
       continue;
     }
-    const age = now - stall.interruptedAt;
+    const age = recoveryElapsed(io, stall.interruptedAt, now);
     const ocDone = sessionLetGo({ stall, active: active.has(stall.ses), fp: fps.get(stall.ses) ?? null });
     let thread = null;
     if (stall.threadId) {
       try {
         thread = await io.getThread(stall.threadId);
       } catch (err) {
+        if (isRecoveryPaused(err)) throw err;
         // Robob can't be read, but the OpenCode fallback doesn't need it.
         if (verbose) log(`stall ${id}: thread read failed: ${errText(err)}`);
         if (age >= GIVE_UP_MS) finish(id, stall, "failed", `could not read the Robob thread: ${errText(err)}`);
@@ -122,6 +164,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
           await io.sendToThread(stall.threadId, buildStallNote(stall), { clientRequestId: `${id}:note`, mode: "queue" });
           stall.noted = true;
         } catch (err) {
+          if (isRecoveryPaused(err)) throw err;
           stall.errors.push(`note: ${errText(err)}`);
           if (age >= GIVE_UP_MS) finish(id, stall, "failed", "interrupted, but the carry-on note was not sent");
           continue;
@@ -163,6 +206,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       if (activity.kind === "subagent") childActive = (await io.ocChildren(ses)).some((c) => active.has(c));
       if (info?.parentID) parentTitle = (await io.ocSession(info.parentID).catch(() => null))?.title ?? null;
     } catch (err) {
+      if (isRecoveryPaused(err)) throw err;
       log(`stall: ${ses} gather failed: ${errText(err)}`);
       continue;
     }
@@ -184,16 +228,24 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       origin: thread?.origin ?? null, parentTitle, kind: activity.kind, label: activity.label,
       quietSince: since, quietMs, fp: fps.get(ses), action: plan.action, note: plan.note ?? false,
       reason: plan.reason, interruptedAt: now, errors: [],
+      alertSourceThreadId: thread?.threadId ?? null, alertParentSessionId: info?.parentID ?? null,
+      alertRunId: thread?.nativeSessionId === ses ? thread.activeRunId ?? null : null,
     };
     log(`stall ${id}: ${plan.action} | ${truncate(title, 60)} | quiet ${Math.round(quietMs / 60_000)}m | ${activity.label} | ${plan.reason}${dryRun ? " (dry run)" : ""}`);
     report.push({ id, ...stall });
     if (dryRun) continue;
     if (thread && await recoveryOwned(io, thread.threadId, [thread.activeRunId])) continue;
+    assertRecoveryActive(io);
     state.stalls[id] = stall;
+    identityHints.set(stall, { thread, info });
     if (plan.action === "report") {
       finish(id, stall, "report");
     } else if (plan.action === "opencode") {
-      await ocStop(stall);
+      try { await ocStop(stall); }
+      catch (err) {
+        if (isRecoveryPaused(err) && !stall.ocTries) delete state.stalls[id];
+        throw err;
+      }
     } else {
       try {
         const res = await io.interruptThread(stall.threadId, { clientRequestId: id, reason: `stall watch: ${activity.label}`, expectedRunId: stall.runId ?? undefined });
@@ -207,6 +259,10 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
           await ocStop(stall);
         }
       } catch (err) {
+        if (isRecoveryPaused(err)) {
+          if (stall.robobResult === undefined) delete state.stalls[id];
+          throw err;
+        }
         stall.errors.push(`robob interrupt: ${errText(err)}`);
       }
     }
@@ -218,6 +274,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
   try {
     live = await io.activeThreads();
   } catch (err) {
+    if (isRecoveryPaused(err)) throw err;
     if (verbose) log(`stall: thread list failed: ${errText(err)}`);
   }
   if (live) {
@@ -234,6 +291,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
           && cur.activeRunId === g.runId && cur.nativeSessionId === g.ses
           && !(await recoveryOwned(io, t.threadId, [g.runId]));
       } catch (err) {
+        if (isRecoveryPaused(err)) throw err;
         if (verbose) log(`stall: ghost re-check failed: ${errText(err)}`);
         return false;
       }
@@ -248,6 +306,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       try {
         lastMs = tailActivity((await io.ocTail(g.ses, 2)) ?? []).lastMs;
       } catch (err) {
+        if (isRecoveryPaused(err)) throw err;
         if (verbose) log(`stall: ${g.ses} tail failed: ${errText(err)}`);
         continue;
       }
@@ -266,12 +325,14 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
         at: iso, ses: g.ses, threadId: t.threadId, runId: t.activeRunId, title: t.title || g.ses,
         origin: t.origin ?? null, parentTitle: null, kind: "ghost", label: GHOST_LABEL,
         quietSince: g.since, quietMs, fp: null, action: plan.action, note: plan.note,
-        reason: plan.reason, interruptedAt: now, errors: [],
+        reason: plan.reason, interruptedAt: now, errors: [], alertRunId: t.activeRunId,
       };
       log(`stall ${id}: ${plan.action} | ${truncate(stall.title, 60)} | ghost run ${Math.round(quietMs / 60_000)}m | ${plan.reason}${dryRun ? " (dry run)" : ""}`);
       report.push({ id, ...stall });
       if (dryRun) continue;
+      assertRecoveryActive(io);
       state.stalls[id] = stall;
+      identityHints.set(stall, { thread: t });
       if (plan.action === "report") {
         finish(id, stall, "report");
         continue;
@@ -287,9 +348,124 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
           Object.assign(stall, { runId: null, note: false });
         }
       } catch (err) {
+        if (isRecoveryPaused(err)) {
+          if (stall.robobResult === undefined) delete state.stalls[id];
+          throw err;
+        }
         stall.errors.push(`robob interrupt: ${errText(err)}`);
       }
     }
   }
+  // Identity work and Telegram are deliberately after every recovery action.
+  // All extra reads share a deadline, including parent traversal and migration.
+  const deadline = Date.now() + IDENTITY_BUDGET_MS;
+  const ownerCache = new Map();
+  let lookups = 0;
+  const bounded = async (fn) => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0 || lookups++ >= 32) return null;
+    let timer;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(fn).catch(() => null),
+        new Promise((resolve) => { timer = setTimeout(() => resolve(null), remaining); }),
+      ]);
+    } finally { clearTimeout(timer); }
+  };
+  const owner = async (stall) => {
+    if (stall.alertOwnerId) return stall.alertOwnerId;
+    if (ownerCache.has(stall)) return ownerCache.get(stall);
+    const hints = identityHints.get(stall);
+    let ses = stall.ses;
+    let info = hints?.info;
+    let thread = hints?.thread;
+    if (!thread && (stall.alertSourceThreadId || stall.threadId)) {
+      const id = stall.alertSourceThreadId || stall.threadId;
+      thread = await bounded(() => io.getThread(id));
+    }
+    const seenSessions = new Set();
+    let found = null;
+    while (ses && !seenSessions.has(ses) && seenSessions.size < 16) {
+      seenSessions.add(ses);
+      if (!thread) thread = await bounded(() => io.threadByNative(ses));
+      const seenThreads = new Set();
+      while (thread?.threadId && !seenThreads.has(thread.threadId)) {
+        seenThreads.add(thread.threadId);
+        found = directOwner(thread);
+        if (found || !thread.parentThreadId) break;
+        const parent = thread.parentThreadId;
+        thread = await bounded(() => io.getThread(parent));
+      }
+      if (found) break;
+      if (info === undefined) info = await bounded(() => io.ocSession(ses));
+      ses = info?.parentID || (seenSessions.size === 1 ? stall.alertParentSessionId : null);
+      info = undefined;
+      thread = null;
+    }
+    ownerCache.set(stall, found);
+    if (found && !dryRun) stall.alertOwnerId = found;
+    return found;
+  };
+
+  // Capture already-read mappings first, so simultaneous active and ghost
+  // detections can correlate without waiting on unrelated historical lookups.
+  for (const [stall, hint] of identityHints) {
+    const id = directOwner(hint.thread);
+    if (id) {
+      ownerCache.set(stall, id);
+      stall.alertOwnerId = id;
+    }
+  }
+
+  const entries = Object.entries(state.stalls);
+  const eligible = async (id, stall) => {
+    if (typeof stall.alertEligible === "boolean") return stall.alertEligible;
+    const at = Date.parse(stall.at);
+    if (!Number.isFinite(at)) return null;
+    const index = entries.findIndex(([key]) => key === id);
+    const prior = entries.filter(([otherId, other], otherIndex) => {
+      if (otherId === id || other.excluded || other.outcome === 'superseded' || sameStall(other, stall)) return false;
+      const age = at - Date.parse(other.at);
+      return age >= 0 && age <= HOUR_MS && (age > 0 || otherIndex < index);
+    }).map(([, other]) => other);
+    if (!prior.length) return false;
+    const currentOwner = await owner(stall);
+    if (!currentOwner) return null;
+    // Check known matches before spending the scan budget on unknown owners.
+    if (prior.some((other) => (other.alertOwnerId || ownerCache.get(other)) === currentOwner)) return true;
+    let unresolved = false;
+    for (const other of prior) {
+      const priorOwner = await owner(other);
+      if (priorOwner === currentOwner) return true;
+      if (!priorOwner) unresolved = true;
+    }
+    return unresolved ? null : false;
+  };
+
+  for (const [id, stall] of entries) {
+    if (stall.done && (stall.alertPending || stall.telegram === false)
+      && (stall.telegramTries ?? 0) < MAX_TRIES) notifications.push([id, stall]);
+  }
+  const seen = new Set();
+  for (const [id, stall] of notifications) {
+    assertRecoveryActive(io);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    let send = await eligible(id, stall);
+    if (send === null && now - Date.parse(stall.doneAt || stall.at) >= IDENTITY_DEFER_MS) {
+      send = false;
+      if (!dryRun) stall.alertSuppressed = "owner_unresolved";
+    }
+    assertRecoveryActive(io);
+    if (!dryRun) {
+      stall.alertPending = send === null;
+      if (send !== null) stall.alertEligible = send;
+    }
+    if (send === true) notify(id, stall);
+    else log(`stall ${id}: Telegram ${send === null ? "deferred (owner unavailable)" : "suppressed (no confirmed repeat)"}`);
+  }
+  // Resolve new unmapped children even before they finish: their records are
+  // prior evidence if another stall is detected before the next scan.
+  for (const stall of identityHints.keys()) await owner(stall);
   return report;
 }

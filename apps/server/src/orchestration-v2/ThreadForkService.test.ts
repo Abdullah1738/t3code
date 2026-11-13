@@ -192,9 +192,12 @@ it.effect("preserves pull request context without inheriting any watches", () =>
       failedChecks: ["lint"],
       passed: false,
       passedChecks: [],
+      passedPending: [],
       remarksThrough: DateTime.formatIso(snoozedAt),
       remarkIds: ["review-1"],
       conflicting: true,
+      conflictHead: null,
+      conflictWokeFor: null,
       wakes: 2,
     };
     const links = (["agent", "stack", "manual", "stack-dismissed"] as const).map(

@@ -1,8 +1,9 @@
-import { Link, useParams, useSearch } from "@tanstack/react-router";
+import { Link, useMatchRoute, useParams, useSearch } from "@tanstack/react-router";
 import * as Schema from "effect/Schema";
-import { CircleHelpIcon, MessageCircleIcon } from "lucide-react";
-import { memo, type ReactNode, useState } from "react";
+import { CircleHelpIcon, InboxIcon, MessageCircleIcon } from "lucide-react";
+import { memo, type ReactNode, useEffect, useState } from "react";
 
+import { askQueueFigures, askRowFigure } from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanBoardSummary } from "@t3tools/contracts";
 
 import { CollapsibleSectionHeader } from "../../components/ui/collapsible-section-header";
@@ -12,8 +13,10 @@ import { cn } from "../../lib/utils";
 import { BoardIcon } from "./boardIcon";
 import { NewBoardDialog } from "./NewBoardDialog";
 import { useBoards } from "./kanbanStore";
+import { askKey, useAskStore, watchAsks } from "./needsYou/askStore";
 import { Count } from "./parts";
 import { BOARD_VIEW_LABELS, BOARD_VIEWS, type BoardView } from "./search";
+import { useNowMs } from "./useNowMs";
 import "./tokens.css";
 import "./kanban.css";
 
@@ -66,6 +69,7 @@ export function BoardsSidebarGroup() {
         </button>
         <NewBoardDialog open={creating} onOpenChange={setCreating} />
       </div>
+      {live.length > 0 ? <NeedsYouRow onNavigate={onNavigate} /> : null}
       {expanded && live.length > 0 ? (
         <ul className="flex flex-col gap-0.5 pb-3.5">
           {live.map((summary) => (
@@ -82,13 +86,59 @@ export function BoardsSidebarGroup() {
   );
 }
 
+/** Every ask that waits on him, across boards, with how many there are. */
+function NeedsYouRow(props: { onNavigate: () => void }) {
+  const active = useMatchRoute()({ to: "/needs-you" }) !== false;
+  const count = useAskStore((state) => {
+    let owed = 0;
+    for (const entry of state.feed?.open ?? []) {
+      if (
+        entry.waitsOn === "owner" &&
+        !entry.expired &&
+        !entry.snoozed &&
+        entry.ask.respond?.ack !== true &&
+        state.hidden[askKey(entry)] === undefined
+      ) {
+        owed += 1;
+      }
+    }
+    return owed;
+  });
+  useEffect(() => watchAsks(false), []);
+  // No badge means "nothing to answer": only for a read that said so (`askRowFigure`).
+  // Each part is selected by itself so the selectors stay stable.
+  const feed = useAskStore((state) => state.feed);
+  const status = useAskStore((state) => state.status);
+  const error = useAskStore((state) => state.error);
+  const nowMs = useNowMs();
+  const shown = askRowFigure(askQueueFigures({ feed, status, error }), count, nowMs);
+  return (
+    <Link
+      to="/needs-you"
+      search={{}}
+      onClick={props.onNavigate}
+      aria-current={active ? "page" : undefined}
+      className={cn(rowClassName, "mb-0.5", rowState(active))}
+    >
+      <InboxIcon aria-hidden className="size-4 shrink-0 text-sidebar-muted-foreground" />
+      <span className="min-w-0 flex-1 truncate">Needs you</span>
+      {shown.note !== null ? (
+        <span
+          className="shrink-0 text-xs text-sidebar-muted-foreground"
+          // With a badge beside it, the badge's label says all of it.
+          aria-label={shown.count === null ? shown.label : undefined}
+          aria-hidden={shown.count === null ? undefined : true}
+        >
+          {shown.note}
+        </span>
+      ) : null}
+      <Count count={shown.count ?? 0} tone="warn" label={shown.label} />
+    </Link>
+  );
+}
+
 /** Icon and count for one pending kind; zero renders nothing. */
-function BoardBadge(props: {
-  icon: ReactNode;
-  count: number;
-  label: string;
-  tone?: "warn";
-}) {
+function BoardBadge(props: { icon: ReactNode; count: number; label: string; tone?: "warn" }) {
   if (props.count <= 0) return null;
   return (
     <span

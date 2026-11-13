@@ -7,7 +7,8 @@ set -eu
 name="${1:-}"
 shift || true
 case "$name" in
-  agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|message-archive) ;;
+  agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|robob-guard|message-archive) ;;
+  ovnfs-recovery) exec "${0:A:h}/ovnfs-recovery/install.zsh" "$@" ;;
   offbox) exec "${0:A:h}/offbox/install.zsh" "$@" ;;  # several live targets, see offbox/README.md
   local-helpers) exec "${0:A:h}/local-helpers/install.zsh" "$@" ;;  # files under ~/.local, see local-helpers/README.md
   harness-homes) exec "${0:A:h}/harness-homes/install.zsh" "$@" ;;  # Robob's Claude/Codex homes, see harness-homes/README.md
@@ -15,13 +16,15 @@ case "$name" in
   tail-gateway) exec "${0:A:h}/tail-gateway/install.zsh" "$@" ;;  # https://<name>.tail gateway, see tail-gateway/README.md
   robob-widgets) exec "${0:A:h}/robob-widgets/install.zsh" "$@" ;;
   harness-hooks) exec "${0:A:h}/harness-hooks/install.zsh" "$@" ;;
-  *) print -u2 "usage: deploy.zsh <agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|message-archive|offbox|local-helpers|harness-homes|harness-cli|tail-gateway|robob-widgets|harness-hooks> [--dry-run]"; exit 2 ;;
+  *) print -u2 "usage: deploy.zsh <agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|robob-guard|message-archive|offbox|local-helpers|harness-homes|harness-cli|tail-gateway|robob-widgets|harness-hooks|ovnfs-recovery> [--dry-run]"; exit 2 ;;
 esac
 
 src="${0:A:h}/$name/"
 dst="$HOME/.local/share/$name/"
 flags=(-a --itemize-changes)
-[[ "${1:-}" == "--dry-run" ]] && flags+=(--dry-run)
+if [[ "${1:-}" == "--dry-run" ]]; then
+  flags+=(--dry-run)
+fi
 
 rsync "${flags[@]}" \
   --exclude node_modules --exclude data --exclude logs --exclude .venv --exclude venv \
@@ -30,3 +33,48 @@ rsync "${flags[@]}" \
   --exclude '*.sock' --exclude archive --exclude watchers --exclude HANDOFF.md --exclude tmp \
   --exclude 'verification*' --exclude bin --exclude .gitignore --exclude README.md --exclude docs \
   "$src" "$dst"
+
+if [[ "$name" == memory-system ]]; then
+  export_plist="com.abdullah.opencode-readonly.plist"
+  export_src="${src}scripts/$export_plist"
+  export_dst="$HOME/Library/LaunchAgents/$export_plist"
+  if ! cmp -s "$export_src" "$export_dst"; then
+    print "memory-system: $export_dst missing or differs from scripts/$export_plist"
+  fi
+  if [[ "${1:-}" == "--dry-run" ]]; then
+    print "memory-system: would install -m 644 $export_src $export_dst (bootstrap separately)"
+  else
+    mkdir -p "${export_dst:h}" "${dst}logs"
+    install -m 644 "$export_src" "$export_dst"
+    print "memory-system: installed $export_dst; bootstrap/reload requires a separate launchctl command"
+  fi
+  recall_src="${src}scripts/recall"
+  recall_dst="$HOME/.local/bin/recall"
+  if [[ -e "$recall_dst" ]] && ! cmp -s "$recall_src" "$recall_dst"; then
+    print "memory-system: ~/.local/bin/recall differs from scripts/recall"
+  fi
+  if [[ "${1:-}" == "--dry-run" ]]; then
+    print "memory-system: would install -m 755 $recall_src $recall_dst"
+  else
+    mkdir -p "${recall_dst:h}"
+    install -m 755 "$recall_src" "$recall_dst"
+  fi
+  /bin/bash "${src}scripts/install_launchagent.sh" "$@"
+fi
+
+if [[ "$name" == robob-guard ]]; then
+  if [[ "${1:-}" == "--dry-run" ]]; then
+    print "robob-guard: would copy bin/robob-install-hold, symlink ~/.local/bin/robob-install-hold and install LaunchAgent (not load it)"
+  else
+    mkdir -p "$dst/bin" "$HOME/.local/bin" "$HOME/Library/LaunchAgents" "$HOME/.local/state/robob-guard"
+    install -m 755 "${src}bin/robob-install-hold" "${dst}bin/robob-install-hold"
+    ln -sfn "${dst}bin/robob-install-hold" "$HOME/.local/bin/robob-install-hold"
+    install -m 644 "${src}scripts/com.ardud.robob-guard.plist" "$HOME/Library/LaunchAgents/com.ardud.robob-guard.plist"
+  fi
+fi
+
+if [[ "${1:-}" == "--dry-run" ]]; then
+  print -r -- "dry run: $name"
+else
+  print -r -- "deployed $name to $dst"
+fi

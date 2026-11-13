@@ -315,7 +315,7 @@ export const make = Effect.gen(function* () {
           revoked_at AS "revokedAt"
         FROM auth_sessions
         WHERE revoked_at IS NULL
-          AND (expires_at > ${now} OR ${sql.in("session_id", connectedSessionIds)})
+          AND (expires_at > ${now} OR session_id IN (SELECT value FROM json_each(${JSON.stringify(connectedSessionIds)})))
         ORDER BY issued_at DESC, session_id DESC
       `,
   });

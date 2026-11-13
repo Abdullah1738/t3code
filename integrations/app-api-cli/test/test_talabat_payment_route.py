@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 import talabat_payment_route as route
-from test import test_talabat_place_contract as fixtures
+import test_talabat_place_contract as fixtures
 
 
 def inputs():

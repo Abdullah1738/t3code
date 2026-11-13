@@ -32,6 +32,26 @@ block every later queued message.
 3. Sends one Telegram summary per incident (`stream-recovery:<incident id>`).
 
 Handled incidents are recorded in `~/.local/share/stream-recovery/data/state.json`.
+
+Pause automatic recovery without restarting the watcher:
+
+```sh
+node cli.mjs pause --for 30m --reason "maintenance"
+node cli.mjs pause                         # until explicitly resumed
+node cli.mjs status --json
+node cli.mjs resume
+```
+
+Durations require a positive number and a unit (`ms`, `s`, `m`, `h`, `d`).
+Pause stops scans and recovery sends, queue changes, interrupts and summaries.
+A request already sent can still complete; the watcher records its result and
+stops further sends. Resume or expiry keeps pending work eligible and retains
+successful sends so they are not repeated. `status --json` reports pause state,
+pending incident/thread counts and the last successful scan, without message bodies.
+Control lives in `data/control.json`, separately from the scan ledger. Both use
+`STREAM_RECOVERY_DATA` when set. Resume clears the active pause and retains its
+time interval so the pause cannot use up recovery deadlines.
+
 An incident that hit errors is retried on later scans, up to 3 attempts.
 
 `STREAM_RECOVERY_DB` overrides the shared `ROBOB_READONLY_DB`; otherwise the
@@ -147,10 +167,14 @@ model stream that died mid tool call and left the session "running" for hours.
 - Once Robob's run and OpenCode's session have both let go, a thread whose run
   was interrupted gets a note telling it to carry on. crw, iMessage and
   archived threads get none (crw nudges its own jobs once they are idle).
-- One Telegram summary per stall (`stream-recovery:st-<ses>-<quiet start>`):
-  info when cleared, error when it is still stuck 10 min after the interrupt.
+- Telegram summarizes a stall only when a distinct earlier stall has been
+  detected for the same known owning thread within one hour, inclusive. Active
+  sessions and ghosts count together; the first stall is still recovered and
+  recorded. Missing ownership defers notification briefly, then suppresses it
+  rather than guessing. Eligible summaries use `stream-recovery:st-<ses>-<quiet
+  start>` and keep the normal send retries. Restart summaries are unaffected.
   After 3 interrupts of one session in 24h it only reports.
-- A Robob thread that shows a run as running for 15 min while its OpenCode session is not active and has no message from the last 15 min (the turn never reached OpenCode, as on #433 after the 29 Oct restart) is interrupted through Robob, gets the carry-on note (not crw/iMessage) and one Telegram summary. It waits while the installer's resume is pending and only reports after 3 interrupts of a session in 24h. Ghost candidates are kept under `ghosts` in the state file.
+- A Robob thread that shows a run as running for 15 min while its OpenCode session is not active and has no message from the last 15 min (the turn never reached OpenCode, as on #433 after the 29 Oct restart) is interrupted through Robob and gets the carry-on note (not crw/iMessage). It waits while the installer's resume is pending and only reports after 3 interrupts of a session in 24h. Ghost candidates are kept under `ghosts` in the state file.
 
 Stalls are kept in the same state file (`watch`, `stalls`, `servers`, `ghosts`).
 
