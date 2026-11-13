@@ -14,6 +14,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
 
+import * as KanbanStore from "../store/KanbanStore.ts";
 import {
   askOf,
   makeFake,
@@ -174,7 +175,13 @@ it.effect("an edit by its asker brings it back at once, with a new revision", ()
       yield* kanban.replyOnAsk(card.id, "q1", owner, [{ _tag: "md", text: "Which CI?" }], "owner");
       const after = askOf((yield* kanban.card(card.id)).card);
       assert.isUndefined(after.backFromSnoozeAt);
-      assert.strictEqual(kanbanAskWaitsOn(after), "agent");
+      // #1158 / PR #49: his reply clears the mark by answering and closing the ask.
+      assert.isNotNull(after.closedAt);
+      assert.strictEqual(kanbanAskWaitsOn(after), null);
+      assert.deepStrictEqual(
+        [after.answer?.verdict, after.answer?.by, after.answer?.text],
+        ["text", owner, "Which CI?"],
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -273,11 +280,22 @@ it.effect("only the owner snoozes, only an ask that is his turn, and only to a l
         );
         assert.strictEqual((yield* http.post(url, {})).status, 400);
 
-        // Not while it waits on its asker, nor while the evaluator has it.
-        yield* kanban.replyOnAsk(card.id, "q1", owner, [{ _tag: "md", text: "Meaning?" }], "owner");
+        // A legacy reply could leave the ask waiting on its asker.
+        const store = yield* KanbanStore.KanbanStore;
+        const legacy = (yield* kanban.card(card.id)).card;
+        yield* store.putCard({
+          ...legacy,
+          asks: legacy.asks.map((ask) => ({ ...ask, clarifyAskedAt: ask.at })),
+        });
         assert.include(
           (yield* http.post(url, { until: IN_A_DAY })).body.error.message,
           "waits on its asker",
+        );
+        // #1158 / PR #49: a new owner reply closes it, which also refuses snooze.
+        yield* kanban.replyOnAsk(card.id, "q1", owner, [{ _tag: "md", text: "Meaning?" }], "owner");
+        assert.include(
+          (yield* http.post(url, { until: IN_A_DAY })).body.error.message,
+          "already closed",
         );
         yield* kanban.askOwner(
           card.id,
