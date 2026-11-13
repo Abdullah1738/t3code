@@ -49,6 +49,7 @@ class ReportBudgetTests(unittest.TestCase):
         unified = collector.unified
         collect = collector.collect
         with patch.object(collector.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(collector, 'disk_wait'), \
              patch.object(collector, 'disk_tooling_probe', side_effect=probe), \
              patch.object(collector, 'directory_inventory', side_effect=inventory), \
              patch.object(collector, 'reports', side_effect=reports), \
