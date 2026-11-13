@@ -485,8 +485,8 @@ class HintAndPullTests(Isolated):
         root = Path(self.tmp.name)
         (root/'package.json').write_text('{}')
         row = {'box_id': 'B', '_new_checkout': True}
-        for lock, install in (('pnpm-lock.yaml','pnpm install --frozen-lockfile'),
-                              ('yarn.lock','yarn install --frozen-lockfile'), ('package-lock.json','npm ci')):
+        for lock, install in (('pnpm-lock.yaml','corepack pnpm install --frozen-lockfile'),
+                              ('yarn.lock','corepack yarn install --frozen-lockfile'), ('package-lock.json','npm ci')):
             with self.subTest(lock=lock):
                 (root/lock).touch()
                 err=io.StringIO()
@@ -498,7 +498,7 @@ class HintAndPullTests(Isolated):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             runs.new_checkout_hint(row, root)
-        self.assertIn('with pnpm install --frozen-lockfile &&', err.getvalue())
+        self.assertIn('with corepack pnpm@11.10.0 install --frozen-lockfile &&', err.getvalue())
         self.assertNotIn('vp i &&', err.getvalue())
         (root / 'package.json').write_text('{}')
         (root / 'vite.config.ts').touch()
@@ -525,7 +525,7 @@ class HintAndPullTests(Isolated):
         runner = runs.Runner(args, me)
         err = io.StringIO()
         def start(*a, **_kw):
-            self.assertIn('prefix your command with pnpm install --frozen-lockfile &&', err.getvalue())
+            self.assertIn('prefix your command with corepack pnpm install --frozen-lockfile &&', err.getvalue())
             return {'processId': 7}
         with patch.object(lease, '_reuse', side_effect=lambda c,r,s,**kw: dict(r)), \
                 patch.object(runs, '_ttl_keeper'), \

@@ -150,7 +150,16 @@ interface EvaluatorJob {
     readonly key?: string;
     readonly note?: boolean;
     readonly seq?: number;
+    readonly answer?: EvaluatorAnswer;
   };
+}
+interface EvaluatorAnswer {
+  readonly discussionId: KanbanDiscussionId;
+  readonly seq: number;
+  readonly blockId: string;
+  readonly at: string;
+  readonly choice: ReadonlyArray<string>;
+  readonly text: string | null;
 }
 interface EvaluatorQueueRow {
   readonly id: number;
@@ -1104,6 +1113,9 @@ const collapseEvaluatorReplies = Context.Reference<boolean>("KanbanCollapseEvalu
 const ownerDeliveryKey = Context.Reference<string | undefined>("KanbanOwnerDeliveryKey", {
   defaultValue: () => undefined,
 });
+const evaluatorAnswer = Context.Reference<EvaluatorAnswer | undefined>("KanbanEvaluatorAnswer", {
+  defaultValue: () => undefined,
+});
 
 const ownerDelivered = Context.Reference<Set<string> | undefined>("KanbanOwnerDelivered", {
   defaultValue: () => undefined,
@@ -1213,6 +1225,7 @@ type BoardEffect =
       readonly discussionId: string;
       readonly text: string;
       readonly note: boolean;
+      readonly authorThreadId?: string;
       /** The card is held for this evaluator's decision (`deciding`): delivery marks it told. */
       readonly decides?: boolean;
     }
@@ -1776,7 +1789,9 @@ const make = Effect.gen(function* () {
   // Serialize dispatch and evaluator routing, not state writes. These may wait on a launch.
   const dispatching = new Map<string, Semaphore.Semaphore>();
   const evaluating = new Map<string, Semaphore.Semaphore>();
+  // This per-discussion permit also marks an in-flight launch; later posts wait for its save.
   const routing = new Map<string, Semaphore.Semaphore>();
+  const handedOff = new Set<string>();
   const ticking = new Map<string, Semaphore.Semaphore>();
   const turnEnding = new Map<string, Semaphore.Semaphore>();
   const starting = new Map<
@@ -2055,14 +2070,24 @@ const make = Effect.gen(function* () {
         `no pool runs ${joined}; pools: ${pools.map((pool) => pool.model.model).join(", ") || "none"}`,
       );
     }
+    const options = new Map(
+      (match.model.options ?? model.options ?? []).map((option) => [option.id, option]),
+    );
+    if (match.model.options !== undefined) {
+      // Pool effort wins, but replacing the entire list loses carried caller options.
+      for (const option of model.options ?? []) {
+        if (
+          option.id !== effortOptionId(model.instanceId) &&
+          option.id !== "variant" &&
+          !options.has(option.id)
+        )
+          options.set(option.id, option);
+      }
+    }
     const selected = {
       instanceId: match.model.instanceId,
       model: match.model.model,
-      ...(match.model.options
-        ? { options: match.model.options }
-        : model.options
-          ? { options: model.options }
-          : {}),
+      ...(options.size > 0 ? { options: [...options.values()] } : {}),
     } satisfies ModelSelection;
     yield* checkModel(selected);
     return selected;
@@ -3197,6 +3222,24 @@ const make = Effect.gen(function* () {
       }
     }
     if (threadId === undefined) return yield* failWith("failed", "evaluator launch gave no thread");
+    if (purpose.kind === "discussion") {
+      const discussionId = KanbanDiscussionId.make(purpose.discussionId);
+      const current = yield* discussionOf(discussionId);
+      if (current.evaluatorThreadId !== null && current.evaluatorThreadId !== threadId) {
+        yield* locks.outside(
+          abandonLaunch(launchInput(launchKey), threadId),
+          undefined,
+          false,
+          Effect.succeed(true),
+        );
+        yield* locks.attached(threadId);
+        const saved = yield* discussionOf(discussionId);
+        if (saved.evaluatorThreadId === null || saved.evaluatorThreadId === threadId) {
+          return yield* failWith("conflict", "Discussion evaluator changed during launch cleanup");
+        }
+        return threadId;
+      }
+    }
     yield* linkThread(
       {
         threadId,
@@ -3375,8 +3418,9 @@ const make = Effect.gen(function* () {
   const admitEvaluator = Effect.fn("KanbanService.admitEvaluator")(function* (
     board: KanbanBoard,
     purpose: Briefs.EvaluatorPurpose,
-    extra: EvaluatorJob["extra"],
+    input: EvaluatorJob["extra"],
   ) {
+    const extra = { ...input, answer: input.answer ?? (yield* evaluatorAnswer) };
     if (board.defaultProjectId === null)
       return yield* failWith("invalid", `board ${board.slug} has no default project`);
     if (purpose.kind === "setup" && board.setup?.status === "running")
@@ -3387,12 +3431,12 @@ const make = Effect.gen(function* () {
         return yield* failWith("invalid", "the evaluator discussion must be on this board");
     }
     const key = extra.key ?? (yield* ownerDeliveryKey) ?? uuid();
-    if (purpose.kind === "discussion") {
+    if (purpose.kind === "discussion" && extra.answer === undefined) {
       const pending =
         (yield* boardSql<EvaluatorQueueRow>`SELECT * FROM ardud_kanban_evaluator_queue WHERE board_id = ${board.id}
           AND ((${extra.cardId ?? null} IS NOT NULL AND card_id = ${extra.cardId ?? null}) OR
             (json_extract(json, '$.purpose.kind') = 'discussion' AND json_extract(json, '$.purpose.discussionId') = ${purpose.discussionId}))
-          AND done_at IS NULL AND started_at IS NULL ORDER BY id LIMIT 1`)[0];
+          AND done_at IS NULL AND started_at IS NULL AND json_extract(json, '$.extra.answer') IS NULL ORDER BY id LIMIT 1`)[0];
       if (pending && pending.job_key !== key) {
         // @effect-diagnostics-next-line preferSchemaOverJson:off -- queue rows are written by this method.
         const job = JSON.parse(pending.json) as EvaluatorJob;
@@ -3451,7 +3495,31 @@ const make = Effect.gen(function* () {
       // Deliver its retained text there before considering another spawn.
       // @effect-diagnostics-next-line preferSchemaOverJson:off -- only written by admitEvaluator.
       const job = JSON.parse(row.json) as EvaluatorJob;
-      if (job.purpose.kind === "discussion") {
+      if (job.extra.answer) {
+        const expected = job.extra.answer;
+        const message = yield* store.message(expected.discussionId, expected.seq);
+        const current = message?.answers.find(
+          (answer) => answer.blockId === expected.blockId && answer.by._tag === "owner",
+        );
+        if (
+          !current ||
+          current.at !== expected.at ||
+          current.text !== expected.text ||
+          !NodeUtil.isDeepStrictEqual(current.choice, expected.choice)
+        ) {
+          const at = yield* nowIso;
+          yield* locks.access(
+            boardId,
+            boardSql`UPDATE ardud_kanban_evaluator_queue SET done_at = ${at} WHERE id = ${row.id}`,
+            true,
+            "evaluator-queue",
+          );
+          continue;
+        }
+      }
+      // A started job may already have delivered its initial message. Recover
+      // its stable launch before treating an attached evaluator as another owner.
+      if (job.purpose.kind === "discussion" && row.started_at === null) {
         let discussion = yield* discussionOf(KanbanDiscussionId.make(job.purpose.discussionId));
         const owner = row.card_id
           ? yield* reusableEvaluator(yield* cardOf(KanbanCardId.make(row.card_id)))
@@ -3534,7 +3602,7 @@ const make = Effect.gen(function* () {
         true,
         "evaluator-queue",
       );
-      const threadId = yield* launchEvaluator(board, job.purpose, {
+      let threadId = yield* launchEvaluator(board, job.purpose, {
         ...job.extra,
         key: row.job_key,
       }).pipe(
@@ -3550,6 +3618,26 @@ const make = Effect.gen(function* () {
         }),
       );
       if (threadId === null) break;
+      if (job.purpose.kind === "discussion") {
+        const discussion = yield* discussionOf(KanbanDiscussionId.make(job.purpose.discussionId));
+        const winner = discussion.evaluatorThreadId;
+        if (winner !== null && winner !== threadId) {
+          if (!(yield* eligibleDiscussionEvaluator(winner)))
+            return yield* failWith("conflict", "Queued discussion evaluator changed during launch");
+          yield* deliver(
+            discussion,
+            { _tag: "evaluator", threadId: winner },
+            "Evaluator",
+            winner,
+            job.extra.text ?? "Discussion follow-up",
+            job.extra.note,
+            `${row.job_key}:retained`,
+          ).pipe(Effect.provideService(ownerDeliveryKey, undefined));
+          threadId = winner;
+        }
+        if ((yield* rawStore.threadLink(threadId))?.endedAt != null)
+          return yield* failWith("conflict", "Queued discussion evaluator ended during launch");
+      }
       const discussionId =
         job.purpose.kind === "discussion"
           ? KanbanDiscussionId.make(job.purpose.discussionId)
@@ -3583,6 +3671,7 @@ const make = Effect.gen(function* () {
           yield* publish(boardId, { _tag: "board", board: next });
         }
         yield* locks.attached(threadId);
+        yield* resumeDiscussionHandoffs(discussionId, threadId);
       }
       yield* locks.access(
         boardId,
@@ -3804,6 +3893,70 @@ const make = Effect.gen(function* () {
     return !!view && !view.archived;
   });
 
+  // An attached evaluator's notices are resumed on route replay; durable send
+  // keys distinguish notices already accepted before a service restart.
+  const resumeDiscussionHandoffs = Effect.fn("KanbanService.resumeDiscussionHandoffs")(function* (
+    discussionId: KanbanDiscussionId,
+    threadId: ThreadId,
+  ) {
+    const discussion = yield* discussionOf(discussionId);
+    if (discussion.evaluatorThreadId !== threadId || discussion.cardId === null) return;
+    const card = yield* store.card(discussion.cardId);
+    if (card === null) return;
+    const handoffPriors = [
+      ...new Set(
+        card.asks.flatMap((ask) =>
+          ask.by._tag === "evaluator" && ask.by.threadId !== threadId ? [ask.by.threadId] : [],
+        ),
+      ),
+    ];
+    for (const priorId of handoffPriors) {
+      if (priorId === threadId) continue;
+      const key = `discussion-handoff:${discussionId}:${priorId}`;
+      if (handedOff.has(key)) continue;
+      if ((yield* Ref.get(evaluatorFailures)).get(priorId)?.state === "gone") continue;
+      const prior = yield* locks.outside(
+        threadIo.view(priorId),
+        undefined,
+        true,
+        Effect.succeed(true),
+      );
+      if (
+        !prior ||
+        prior.archived ||
+        (prior.state === "idle" &&
+          (yield* nowMillis) - Date.parse(prior.quietSince) >= EVALUATOR_LIMITS.reuseMs)
+      )
+        continue;
+      if ((yield* discussionOf(discussionId)).evaluatorThreadId !== threadId) break;
+      // Save first: a response to this notice must reach the attached evaluator.
+      // The durable send key prevents repeat notices after a service restart too.
+      yield* locks
+        .outside(
+          threads
+            .send({
+              threadId: priorId,
+              key,
+              text: Briefs.cardHandoffText(card.number, discussionId, threadId),
+            })
+            // The key must survive route retries and evaluator replacements in
+            // this discussion, independently of the post that triggered the launch.
+            .pipe(Effect.provideService(ownerDeliveryKey, undefined)),
+          undefined,
+          false,
+          Effect.succeed(true),
+        )
+        .pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              handedOff.add(key);
+            }),
+          ),
+          Effect.ignore,
+        );
+    }
+  });
+
   /**
    * The discussion's evaluator gets the text: an existing one is steered,
    * otherwise one starts. A `note` owes no reply in the discussion.
@@ -3814,12 +3967,64 @@ const make = Effect.gen(function* () {
     note = false,
   ) {
     const actorOf = (threadId: ThreadId): KanbanActor => ({ _tag: "evaluator", threadId });
+    const deliverSaved = Effect.fn("KanbanService.deliverDiscussionEvaluator")(function* (
+      current: KanbanDiscussion,
+      resumeHandoffs = true,
+    ) {
+      const threadId = current.evaluatorThreadId!;
+      const seq = (yield* ownerPostSeq) ?? current.lastSeq;
+      yield* locks.outside(
+        threads.send({ threadId, text }),
+        undefined,
+        false,
+        Effect.map(
+          rawStore.discussion(current.id),
+          (saved) => saved?.evaluatorThreadId === threadId,
+        ),
+      );
+      const saved = yield* discussionOf(current.id);
+      const progressed = saved.participants.some(
+        (p) => actorKey(p.actor) === actorKey(actorOf(threadId)) && p.lastReadSeq > seq,
+      );
+      // A reply posted while delivery was outside the permit already answered this text.
+      yield* saveDiscussion(
+        withParticipant(
+          saved,
+          actorOf(threadId),
+          "Evaluator",
+          note || progressed
+            ? {}
+            : {
+                lastReadSeq: seq,
+                typingUntil: yield* typingUntil,
+                owes: "asked",
+              },
+        ),
+      );
+      if (resumeHandoffs) yield* resumeDiscussionHandoffs(current.id, threadId);
+      return yield* discussionOf(current.id);
+    });
+    const originalOwner = discussion.evaluatorThreadId;
+    if (originalOwner !== null) {
+      const prior = yield* threads.find(originalOwner);
+      if (prior?.archived) {
+        yield* threads.interrupt(originalOwner, `Replaced as evaluator of "${discussion.title}"`);
+        discussion = yield* discussionOf(discussion.id);
+      }
+    }
     const owningCard = discussion.cardId ? yield* store.card(discussion.cardId) : null;
-    const ownerId = owningCard
-      ? yield* reusableEvaluator(owningCard)
-      : discussion.evaluatorThreadId;
+    const ownerId = owningCard ? yield* reusableEvaluator(owningCard) : originalOwner;
     if (ownerId !== null) {
-      const view = yield* threads.find(ownerId);
+      const view = yield* locks.outside(
+        threadIo.find(ownerId),
+        undefined,
+        true,
+        Effect.map(
+          rawStore.discussion(discussion.id),
+          (saved) => saved?.evaluatorThreadId === originalOwner,
+        ),
+      );
+      discussion = yield* discussionOf(discussion.id);
       const now = yield* nowMillis;
       if (
         view &&
@@ -3830,11 +4035,22 @@ const make = Effect.gen(function* () {
       ) {
         if (discussion.evaluatorThreadId !== ownerId)
           discussion = yield* saveDiscussion({ ...discussion, evaluatorThreadId: ownerId });
-        return yield* deliver(discussion, actorOf(ownerId), "Evaluator", ownerId, text, note);
+        const ownerLink = yield* rawStore.threadLink(ownerId);
+        return yield* deliverSaved(
+          discussion,
+          ownerLink?.purpose === `discussion:${discussion.id}`,
+        );
       }
-      if (view) {
-        yield* threads.interrupt(ownerId, `Replaced as evaluator of "${discussion.title}"`);
-      }
+      if (view) yield* threads.interrupt(ownerId, `Replaced as evaluator of "${discussion.title}"`);
+    }
+    discussion = yield* discussionOf(discussion.id);
+    if (discussion.evaluatorThreadId !== null) {
+      if (
+        discussion.evaluatorThreadId !== originalOwner &&
+        (yield* eligibleDiscussionEvaluator(discussion.evaluatorThreadId))
+      )
+        return yield* deliverSaved(discussion, false);
+      discussion = yield* saveDiscussion({ ...discussion, evaluatorThreadId: null });
     }
     const board = yield* boardOf(discussion.boardId);
     const card = discussion.cardId ? yield* store.card(discussion.cardId) : null;
@@ -3842,34 +4058,37 @@ const make = Effect.gen(function* () {
     // hear it is handed over, and stop typing there.
     const priors = card ? yield* liveEvaluatorAskers(card) : [];
     const seq = (yield* ownerPostSeq) ?? discussion.lastSeq;
-    const threadId = yield* startEvaluatorUnlocked(
-      board,
-      {
-        kind: "discussion",
-        discussionId: discussion.id,
-        title: discussion.title,
-        cardNumber: card?.number ?? null,
-      },
-      {
-        text: priors.length > 0 ? `${text}\n\n${Briefs.priorAskerText(priors)}` : text,
-        cardId: discussion.cardId,
-        note,
-        seq,
-      },
-    )
-      .pipe(
-        Effect.provideService(launchReconcile, (id) =>
-          Effect.gen(function* () {
-            const current = yield* rawStore.discussion(discussion.id);
-            const currentBoard = (yield* rawStore.boards).find((row) => row.id === board.id);
-            return (
-              current !== null &&
-              (current.evaluatorThreadId === discussion.evaluatorThreadId ||
-                current.evaluatorThreadId === id) &&
-              NodeUtil.isDeepStrictEqual(currentBoard, board)
-            );
-          }),
+    // The launch serializer owns a fresh operation; reload this caller's snapshot
+    // after it returns so posts made during the launch survive the attachment.
+    const threadId = yield* locks
+      .outside(
+        startEvaluatorUnlocked(
+          board,
+          {
+            kind: "discussion",
+            discussionId: discussion.id,
+            title: discussion.title,
+            cardNumber: card?.number ?? null,
+          },
+          {
+            text: priors.length > 0 ? `${text}\n\n${Briefs.priorAskerText(priors)}` : text,
+            cardId: discussion.cardId,
+            note,
+            seq,
+          },
+        ).pipe(
+          Effect.provideService(launchReconcile, () =>
+            Effect.gen(function* () {
+              const current = yield* rawStore.discussion(discussion.id);
+              // Only discussion ownership decides this launch; unrelated board
+              // metadata must not abandon a thread that already has its brief.
+              return current !== null;
+            }).pipe(Effect.orDie),
+          ),
         ),
+        undefined,
+        false,
+        Effect.succeed(true),
       )
       .pipe(
         Effect.catchTags({
@@ -3880,24 +4099,22 @@ const make = Effect.gen(function* () {
         }),
       );
     if (threadId === null) return yield* discussionOf(discussion.id);
-    if (card) {
-      for (const priorId of priors) {
-        const handoff = Briefs.cardHandoffText(card.number, discussion.id, threadId);
-        yield* locks
-          .outside(
-            threads.send({
-              threadId: priorId,
-              text: handoff,
-              key: `handoff:${threadId}:${priorId}`,
-            }),
-            undefined,
-            false,
-            Effect.succeed(true),
-          )
-          .pipe(Effect.ignore);
-      }
-    }
+
     const current = yield* discussionOf(discussion.id);
+    if (current.evaluatorThreadId !== null && current.evaluatorThreadId !== threadId) {
+      return yield* deliverSaved(current, false);
+    }
+    if ((yield* rawStore.threadLink(threadId))?.endedAt != null) {
+      return yield* failWith("conflict", "Discussion evaluator changed after launch cleanup");
+    }
+    const latestCard = card ? yield* store.card(card.id) : null;
+    const handoffPriors = [
+      ...new Set(
+        latestCard?.asks.flatMap((ask) =>
+          ask.by._tag === "evaluator" && ask.by.threadId !== threadId ? [ask.by.threadId] : [],
+        ) ?? [],
+      ),
+    ];
     const progressed = current.participants.some(
       (p) => actorKey(p.actor) === actorKey(actorOf(threadId)) && p.lastReadSeq > seq,
     );
@@ -3911,16 +4128,15 @@ const make = Effect.gen(function* () {
           ? { lastReadSeq: seq }
           : { lastReadSeq: seq, typingUntil: yield* typingUntil, owes: "asked" },
     );
-    if (card) {
-      for (const priorId of priors) {
-        const prior = actorOf(priorId);
-        if (next.participants.some((p) => actorKey(p.actor) === actorKey(prior))) {
-          next = withParticipant(next, prior, "Evaluator", { typingUntil: null, owes: null });
-        }
+    for (const priorId of handoffPriors) {
+      const prior = actorOf(priorId);
+      if (next.participants.some((p) => actorKey(p.actor) === actorKey(prior))) {
+        next = withParticipant(next, prior, "Evaluator", { typingUntil: null, owes: null });
       }
     }
     yield* saveDiscussion(next);
     yield* locks.attached(threadId);
+    yield* resumeDiscussionHandoffs(discussion.id, threadId);
     // A replaced setup evaluator hands the running setup to its successor, or setup_done is denied.
     const setupBoard = yield* boardOf(discussion.boardId);
     if (
@@ -3935,15 +4151,22 @@ const make = Effect.gen(function* () {
       yield* store.putBoard(running);
       yield* publish(running.id, { _tag: "board", board: running });
     }
-    return next;
+    return yield* discussionOf(discussion.id);
   });
 
-  const toEvaluator = (discussion: KanbanDiscussion, text: string, note = false) =>
+  const toEvaluator = (
+    discussion: KanbanDiscussion,
+    text: string,
+    note = false,
+    authorThreadId?: ThreadId,
+  ) =>
     serial(
       routing,
       discussion.id,
       Effect.gen(function* () {
         let current = yield* discussionOf(discussion.id);
+        if (authorThreadId !== undefined && current.evaluatorThreadId === authorThreadId)
+          return current;
         if (
           current.evaluatorThreadId !== null &&
           (yield* Ref.get(evaluatorFailures)).get(current.evaluatorThreadId)?.state === "gone"
@@ -4630,15 +4853,18 @@ const make = Effect.gen(function* () {
     `owner-post:${message.discussionId}:${message.seq}:${message.createdAt}`;
 
   /** Choice answers follow the current evaluator or active worker, except open asks. */
-  const ownerAnswerRoute = (
+  const ownerAnswerRoute = Effect.fn("KanbanService.ownerAnswerRoute")(function* (
     discussionId: KanbanDiscussion["id"],
     seq: number,
     blockId: string,
     note: string,
     key: string,
     row?: SavedOwnerRow,
-  ) =>
-    routeRetainingAskers(
+  ) {
+    const answered = (yield* store.message(discussionId, seq))?.answers.find(
+      (answer) => answer.blockId === blockId && answer.by._tag === "owner",
+    );
+    yield* routeRetainingAskers(
       discussionId,
       key,
       note,
@@ -4689,7 +4915,13 @@ const make = Effect.gen(function* () {
       }),
       blockId,
       row,
+    ).pipe(
+      Effect.provideService(
+        evaluatorAnswer,
+        answered ? { discussionId, seq, ...answered } : undefined,
+      ),
     );
+  }, Effect.mapError(toKanbanError));
 
   /**
    * One saved owner route: its message must still be the one it was saved
@@ -4731,7 +4963,12 @@ const make = Effect.gen(function* () {
       case "toEvaluator":
         return Effect.gen(function* () {
           const discussion = yield* discussionOf(KanbanDiscussionId.make(effect.discussionId));
-          yield* toEvaluator(discussion, effect.text, effect.note);
+          yield* toEvaluator(
+            discussion,
+            effect.text,
+            effect.note,
+            effect.authorThreadId === undefined ? undefined : ThreadId.make(effect.authorThreadId),
+          );
           // Delivered: the card it is about is let go when this evaluator's turn ends.
           if (effect.decides === true) yield* decidingTold(discussion.cardId);
         });
@@ -5368,6 +5605,32 @@ const make = Effect.gen(function* () {
           ),
         ),
       );
+    }
+    if (posted.cardId !== null && author._tag !== "owner" && author._tag !== "script") {
+      const current = yield* discussionOf(posted.id);
+      const isDiscussionEvaluator =
+        author._tag === "evaluator" && current.evaluatorThreadId === author.threadId;
+      // Worker questions above already route with their specific brief.
+      if (
+        !isDiscussionEvaluator &&
+        !(author._tag === "thread" && asksSomething(storedBlocks, text))
+      ) {
+        const textToEvaluator = `${authorName} posted in "${posted.title}" (discussion ${posted.id}):\n\n${text}`;
+        const authorThreadId =
+          author._tag === "thread" || author._tag === "evaluator" ? author.threadId : undefined;
+        yield* later(
+          posted.boardId,
+          posted.id,
+          {
+            kind: "toEvaluator",
+            discussionId: posted.id,
+            text: textToEvaluator,
+            note: true,
+            ...(authorThreadId === undefined ? {} : { authorThreadId }),
+          },
+          toEvaluator(current, textToEvaluator, true, authorThreadId),
+        );
+      }
     }
     // A title write must not invalidate this post while routing releases the board lock.
     if (writeTitle) yield* forkDiscussionTitle(discussion.id, text);

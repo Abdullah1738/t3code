@@ -3,6 +3,7 @@ reconnect after it was accepted, person-box work that never goes to Boat, and th
 
 The first class is the hard requirement: with no home server configured the client is exactly the Boat client."""
 import contextlib
+import datetime as dt
 import io
 import json
 import os
@@ -18,7 +19,7 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS / "tests"))
-from offbox_lib import api, capacity, cli, common, home, lease, runs, spend  # noqa: E402
+from offbox_lib import api, capacity, cli, common, home, lease, pool, prepare, runs, spend  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
 from test_wait_lock import Clock  # noqa: E402
 
@@ -322,6 +323,319 @@ class Failover(HomeFiles):
         self.assertIn("no answer for 2 checks", err)
 
 
+class BoxReadinessFailover(Isolated):
+    Exec = Failover.Exec
+    run_cmd = Failover.run_cmd
+    failures = Failover.failures
+
+    def setUp(self):
+        super().setUp()
+        self.dir = Path(self.tmp.name)
+        for name, f in (("SERVER_CFG", "server.json"), ("BACKEND_STATE", "backend-state.json"),
+                        ("BACKEND_PATH", "backend"), ("HOME_FAILURES", "home-failures.jsonl")):
+            self.stack.enter_context(patch.object(common, name, self.dir / f))
+        (self.dir / "server.json").write_text(json.dumps({"url": "http://100.64.0.9:8443/api/v1"}))
+        self.stack.enter_context(patch.dict(os.environ, {k: v for k, v in os.environ.items()
+                                                        if k not in ("OFFBOX_BACKEND", "OFFBOX_THREAD")}, clear=True))
+        self.execs = []
+        self.clock = Clock()
+        for mod in (pool, prepare, api):
+            self.stack.enter_context(patch.object(mod, "time", self.clock.time))
+        self.stack.enter_context(patch.object(common, "_BACKEND", "server"))
+        self.stack.enter_context(patch.object(home, "probe", return_value=None))
+        self.stack.enter_context(patch.object(lease, "cap_check"))
+        self.stack.enter_context(patch.object(pool, "_refresh_background"))
+        self.stack.enter_context(patch.object(lease, "_new_box", return_value=({"id": "new"}, "fresh", None, "large")))
+        self.stack.enter_context(patch.object(api, "get", return_value={"state": "error", "error": "500 incus_failed: incus start failed"}))
+        self.start_command = api.cmd_start
+        self.command = self.stack.enter_context(patch.object(api, "cmd_start", side_effect=AssertionError("no command before readiness")))
+        self.stack.enter_context(patch("offbox_lib.fallback.note_infra_failure"))
+        self.stack.enter_context(patch.object(runs, "run_remote", side_effect=lambda *a: pool.acquire(self.me)))
+
+        def execve(path, argv, env):
+            self.execs.append((argv, env))
+            raise self.Exec()
+        self.stack.enter_context(patch.object(os, "execve", execve))
+
+    def stall(self, *args, **kwargs):
+        self.clock.sleep(301)
+        prepare.check()
+
+    def assert_failover(self, replacement=False):
+        rc, err = self.run_cmd("--remote", "--", "make", "test")
+        self.assertEqual(rc, "exec", err)
+        self.assertEqual(self.execs[0][1]["OFFBOX_BACKEND"], "boat")
+        self.assertEqual(len(self.failures()), 1)
+        self.assertIn("500 incus_failed", self.failures()[0]["reason"])
+        self.assertEqual(self.con.execute("SELECT count(*) FROM pool_pending").fetchone()[0], 0)
+        self.command.assert_not_called()
+        if replacement:
+            self.assertIn("stuck in bring_up on old", err)
+            self.assertIn("Replacement allocation failed", self.failures()[0]["reason"])
+
+    def test_stuck_resume_then_replacement_box_500_moves_to_boat(self):
+        self.box("old", "stopped", member=True)
+        with patch.object(lease, "_reuse", side_effect=self.stall):
+            self.assert_failover(replacement=True)
+        self.assertEqual(self.con.execute("SELECT state FROM leases WHERE box_id='old'").fetchone()[0], "resume_stalled")
+
+    def test_fresh_box_500_moves_to_boat(self):
+        self.assert_failover()
+
+    def test_boat_box_500_still_exits_90(self):
+        with patch.object(common, "_BACKEND", "boat"):
+            rc, _ = self.run_cmd("--remote", "--", "make", "test")
+        self.assertEqual(rc, 90)
+        self.assertEqual((self.execs, self.failures()), ([], []))
+        self.command.assert_not_called()
+
+    def test_pinned_and_person_box_failures_keep_their_existing_exit(self):
+        for env in ({"OFFBOX_BACKEND": "server"}, {"OFFBOX_THREAD": "person:moni"}):
+            for failure in ("box", "stall"):
+                with self.subTest(env=env, failure=failure), patch.dict(os.environ, env):
+                    # Use the real readiness errors without retaining failed pool members between rows.
+                    def ready(*args):
+                        if failure == "stall":
+                            raise prepare.Stalled("new", "bring_up", 300)
+                        lease._bring_up("new")
+                    with patch.object(runs, "run_remote", side_effect=ready):
+                        self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], 90)
+        self.assertEqual((self.execs, self.failures()), ([], []))
+
+    def test_boat_pinned_and_person_wrapped_network_errors_keep_existing_policy(self):
+        self.box("old", "stopped", member=True)
+        for backend, env in (("boat", {}), ("server", {"OFFBOX_BACKEND": "server"}),
+                             ("server", {"OFFBOX_THREAD": "person:moni"})):
+            self.con.execute("UPDATE leases SET state='stopped', token_owner=? WHERE box_id='old'",
+                             ("moni" if env.get("OFFBOX_THREAD") else "ardud",))
+            self.con.commit()
+            with self.subTest(backend=backend, env=env), patch.object(common, "_BACKEND", backend), \
+                    patch.dict(os.environ, env), patch.object(lease, "_reuse", side_effect=self.stall), \
+                    patch.object(lease, "acquire_private", side_effect=api.NetworkError("replacement timed out")):
+                self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], 90)
+                with prepare.attempts():
+                    prepare.move_once(prepare.Stalled("old", "bring_up", 300))
+                    with self.assertRaises(common.OffboxError) as caught:
+                        prepare.move_once(api.NetworkError("replacement timed out"))
+                self.assertFalse(caught.exception.outage)
+        self.assertEqual((self.execs, self.failures()), ([], []))
+
+    def test_refusals_and_non_infra_replacement_preserve_exit_codes(self):
+        for message in ("400 bad_request", "409 conflict", "422 invalid_size", "not an HTTP failure"):
+            with self.subTest(message=message), patch.object(api, "get", return_value={"state": "error", "error": message}), \
+                    patch.object(runs, "run_remote", side_effect=lambda *a: lease._bring_up("new")):
+                self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], 90)
+        self.box("old", "stopped", member=True)
+        with patch.object(lease, "_reuse", side_effect=self.stall), \
+                patch.object(lease, "acquire_private", side_effect=common.OffboxError("bad input", code=2)):
+            self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], 2)
+        self.assertEqual((self.execs, self.failures()), ([], []))
+
+    def test_replacement_4xx_refusals_override_the_previous_stall(self):
+        self.box("old", "stopped", member=True)
+        for status in (400, 401, 403, 404, 408, 409, 422, 429, 499):
+            for form in ("api", "box", "wrapped", "ssh_setup", "ssh_wait", "ssh_setup_retries"):
+                with self.subTest(status=status, form=form):
+                    self.con.execute("UPDATE leases SET state='stopped' WHERE box_id='old'")
+                    self.con.commit()
+                    def refuse(*args, **kwargs):
+                        if form == "wrapped":
+                            prepare.move_once(api.ApiError(status, "refused", "replacement refused"))
+                        if form == "api":
+                            raise api.ApiError(status, "refused", "replacement refused")
+                        if form.startswith("ssh_"):
+                            error = api.ApiError(status, "refused", "replacement refused")
+                            with patch.object(api, "get", return_value={"state": "running"}):
+                                if form == "ssh_setup_retries":
+                                    with patch.object(api, "sshkey", side_effect=error), \
+                                            patch.object(lease.ssh_sync, "pubkey", return_value="fake"), \
+                                            patch.object(lease.ssh_sync, "time", self.clock.time):
+                                        lease._bring_up("new")
+                                else:
+                                    with patch.object(lease.ssh_sync, "setup", side_effect=error if form == "ssh_setup" else None), \
+                                            patch.object(lease.ssh_sync, "wait_ssh", side_effect=error if form == "ssh_wait" else None):
+                                        lease._bring_up("new")
+                        with patch.object(api, "get", return_value={"state": "error", "error": f"{status} refused: replacement refused"}):
+                            lease._bring_up("new")
+                    with patch.object(lease, "_reuse", side_effect=self.stall), \
+                            patch.object(lease, "acquire_private", side_effect=refuse):
+                        rc, _ = self.run_cmd("--remote", "--", "make", "test")
+                        self.assertEqual(rc, 90)
+                        self.assertEqual((self.execs, self.failures()), ([], []))
+                    with prepare.attempts():
+                        prepare.move_once(prepare.Stalled("old", "bring_up", 300))
+                        with self.assertRaises(common.OffboxError) as caught:
+                            try:
+                                refuse()
+                            except common.OffboxError as e:
+                                prepare.move_once(e)
+                        self.assertFalse(caught.exception.outage)
+                        self.assertEqual(caught.exception.code, 90)
+
+
+    def test_slow_answering_box_finishes_before_deadline(self):
+        self.box("slow", member=True)
+        states = iter([{"state": "starting"}] * 4 + [{"state": "running"}])
+        def answer(*args, **kwargs):
+            self.clock.sleep(30)
+            return next(states)
+        def reuse(*args, **kwargs):
+            lease._bring_up("slow")
+            return dict(self.con.execute("SELECT * FROM leases WHERE box_id='slow'").fetchone())
+        with patch.object(api, "get", side_effect=answer), patch.object(lease.ssh_sync, "setup"), \
+                patch.object(lease.ssh_sync, "wait_ssh"), patch.object(lease, "_reuse", side_effect=reuse), \
+                patch.object(lease, "acquire_private") as create, contextlib.redirect_stderr(io.StringIO()):
+            got = pool.acquire(self.me)
+        pool.release_guard(got)
+        self.assertEqual(got["box_id"], "slow")
+        self.assertEqual((self.execs, self.failures()), ([], []))
+        self.command.assert_not_called()
+        create.assert_not_called()
+
+    def test_two_fresh_bring_up_stalls_move_to_boat(self):
+        with patch.object(lease, "_bring_up", side_effect=self.stall) as ready:
+            self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], "exec")
+        self.assertEqual(ready.call_count, 2)
+        self.assertEqual(len(self.failures()), 1)
+        self.assertIn("Replacement failed after", self.failures()[0]["reason"])
+        self.command.assert_not_called()
+
+    def test_stalled_resume_keeps_outage_when_replacement_is_unclassified(self):
+        self.box("old", "stopped", member=True)
+        with patch.object(lease, "_reuse", side_effect=lease.ResumeProvisionStalled("old provisioning stalled")), \
+                patch.object(lease, "acquire_private", side_effect=common.OffboxError("replacement unavailable")):
+            self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], "exec")
+        self.assertEqual(len(self.failures()), 1)
+        self.command.assert_not_called()
+
+    def test_replacement_network_outage_survives_an_unclassified_stall(self):
+        self.box("old", "stopped", member=True)
+        with patch.object(lease, "_reuse", side_effect=prepare.Stalled("old", "ssh", 300)), \
+                patch.object(lease, "acquire_private", side_effect=api.NetworkError("replacement timed out")):
+            self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], "exec")
+        self.assertEqual(len(self.failures()), 1)
+        self.command.assert_not_called()
+
+    def test_potentially_started_replacement_never_moves(self):
+        self.box("old", "stopped", member=True)
+        error = common.OffboxError("may have started", started=True, outage=True)
+        with patch.object(lease, "_reuse", side_effect=self.stall), \
+                patch.object(lease, "acquire_private", side_effect=error):
+            self.assertEqual(self.run_cmd("--remote", "--", "make", "test")[0], 90)
+        self.assertEqual((self.execs, self.failures()), ([], []))
+
+    def test_only_automatic_home_box_starts_classify_new_5xx(self):
+        operations = (lambda: api.create("large", 600, "new", "idem"),
+                      lambda: api.fork("old", 600, "idem"), lambda: api.resume("old", 600))
+        for backend, env in (("server", {}), ("boat", {}),
+                             ("server", {"OFFBOX_BACKEND": "server"}), ("server", {"OFFBOX_THREAD": "person:moni"})):
+            for status in (400, 409, 422, 500, 502, 503, 504, 599):
+                for op in operations:
+                    with self.subTest(backend=backend, env=env, status=status, op=op), \
+                            patch.object(common, "_BACKEND", backend), patch.dict(os.environ, env), \
+                            patch.object(api, "call", side_effect=api.ApiError(status, "incus_failed", "start failed")):
+                        with self.assertRaises(common.OffboxError) as caught:
+                            op()
+                        self.assertEqual(caught.exception.code, 90)
+                        self.assertFalse(caught.exception.started)
+                        self.assertEqual(caught.exception.outage, backend == "server" and not env and status >= 500)
+
+    def test_command_start_500_is_not_reclassified(self):
+        with patch.object(api, "call", side_effect=api.ApiError(500, "internal", "start failed")):
+            with self.assertRaises(common.OffboxError) as caught:
+                self.start_command("new", "make test")
+        self.assertFalse(caught.exception.outage)
+
+    def test_box_state_5xx_and_stall_classification_are_limited_to_readiness(self):
+        for state, message in (("error", "500 incus_failed"), ("error", "599 internal"),
+                               ("cancelled", "500 incus_failed"), ("error", "5000 not a status"),
+                               ("error", "400 bad_request"), ("error", None)):
+            with self.subTest(state=state, message=message), \
+                    patch.object(api, "get", return_value={"state": state, "error": message}):
+                with self.assertRaises(common.OffboxError) as caught:
+                    api.wait_state("new", api.LIVE_STATES)
+                self.assertEqual(caught.exception.outage, state == "error" and message in ("500 incus_failed", "599 internal"))
+        for phase in ("lock_wait", "push", "ssh", "resume_request", "bring_up"):
+            self.assertEqual(prepare.Stalled("new", phase, 300).outage, phase == "bring_up", phase)
+
+    def test_full_home_pool_failed_resume_archived_500_moves_to_boat(self):
+        self.box("old", "stopped", member=True)
+        self.box("busy", member=True)
+        self.busy("busy")
+        resumed = False
+        def resume(*args, **kwargs):
+            nonlocal resumed
+            resumed = True
+            self.clock.sleep(.1)
+            return {}
+        def state(*args, **kwargs):
+            return {"state": "archived", "type": "large",
+                    "error": "500 incus_failed: incus start failed" if resumed else None,
+                    "updatedAt": dt.datetime.fromtimestamp(self.clock.t, dt.timezone.utc).isoformat()}
+        with patch.object(lease, "now", self.clock.now), patch.object(api, "get", side_effect=state), \
+                patch.object(api, "resume", side_effect=resume) as start, \
+                patch.object(lease, "acquire_private", side_effect=AssertionError("pool is full")):
+            self.assert_failover()
+        start.assert_called_once()
+        self.assertLess(self.clock.t, 1100, "failed resume must not turn into a pool wait")
+
+    def test_archived_error_freshness_matrix(self):
+        error = "500 incus_failed: start failed"
+        stamp = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat()
+        rows = (
+            ("new failure", "archived", error, 1001, 1000, None, api.LIVE_STATES, True),
+            ("repeated failure", "archived", error, 1001, 1000, error, api.LIVE_STATES, True),
+            ("millisecond truncation", "archived", error, 1000, 1000.0005, error, api.LIVE_STATES, True),
+            ("stale failure", "archived", error, 999, 1000, error, api.LIVE_STATES, False),
+            ("missing timestamp", "archived", error, None, 1000, error, api.LIVE_STATES, False),
+            ("missing attempt", "archived", error, 1001, None, error, api.LIVE_STATES, False),
+            ("still resuming", "resuming", error, 1001, 1000, error, api.LIVE_STATES, False),
+            ("unsupported state", "stopped", error, 1001, 1000, error, api.LIVE_STATES, False),
+            ("refusal", "archived", "409 conflict", 1001, 1000, None, api.LIVE_STATES, False),
+            ("stop completed", "archived", error, 1001, 1000, error, api.STOPPED_STATES, False),
+        )
+        for name, state, message, updated, since, stale, want, failover in rows:
+            observed = {"state": state, "error": message, "updatedAt": stamp(updated) if updated is not None else None}
+            with self.subTest(name=name), patch.object(api, "get", side_effect=[observed, {"state": "running"}]):
+                if failover:
+                    with self.assertRaises(common.OffboxError) as caught:
+                        api.wait_state("old", want, since=since, stale_error=stale)
+                    self.assertTrue(caught.exception.outage)
+                    self.assertFalse(caught.exception.started)
+                else:
+                    self.assertIn(api.wait_state("old", want, since=since, stale_error=stale)["state"], want)
+
+    def test_archived_errors_do_not_change_other_backend_policies(self):
+        for backend, env in (("boat", {}), ("server", {"OFFBOX_BACKEND": "server"}),
+                             ("server", {"OFFBOX_THREAD": "person:moni"})):
+            with self.subTest(backend=backend, env=env), patch.object(common, "_BACKEND", backend), \
+                    patch.dict(os.environ, env), patch.object(api, "get", side_effect=[
+                        {"state": "archived", "error": "500 incus_failed", "updatedAt": "1970-01-01T00:16:41Z"},
+                        {"state": "running"}]):
+                self.assertEqual(api.wait_state("old", api.LIVE_STATES, since=1000)["state"], "running")
+
+    def test_full_home_pool_waits_past_preparation_deadline_then_gets_a_slot(self):
+        self.box("busy", member=True)
+        self.busy("busy")
+        self.box("busy2", member=True)
+        self.busy("busy2")
+        def free_after_wait(t):
+            if t >= 1400:
+                self.con.execute("UPDATE runs SET status='done'")
+                self.con.commit()
+        self.clock.on_sleep = free_after_wait
+        with patch.dict(os.environ, {"OFFBOX_POOL_WAIT_SECONDS": "1000"}), \
+                patch.object(lease, "_reuse", side_effect=lambda con, row, *a, **k: dict(row)), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            got = pool.acquire(self.me)
+        pool.release_guard(got)
+        self.assertGreaterEqual(self.clock.t, 1400)
+        self.assertIn("still queued", err.getvalue())
+        self.assertNotIn("retry offbox later", err.getvalue())
+        self.assertEqual((self.execs, self.failures()), ([], []))
+        self.command.assert_not_called()
+
+
 class PersonNeverOnBoat(HomeFiles):
     def setUp(self):
         super().setUp()
@@ -465,6 +779,18 @@ class Reconnect(unittest.TestCase):
         self.assertEqual(err.count("running it again from the start (attempt 2)"), 1)
         self.assertEqual(err.count("lost the connection to the offbox server"), 1)
 
+    def test_server_queued_command_waits_past_box_deadline_without_failover(self):
+        t0 = self.clock.t
+        def frames(o, e):
+            yield {"type": "hello", "status": "queued", "attempt": 1}
+            self.clock.t += 400
+            yield {"type": "exit", "exitCode": 0, "status": "exited"}
+        with patch.object(home, "fail_over", side_effect=AssertionError("accepted command stays home")), \
+                patch.object(home, "record_failure", side_effect=AssertionError("memory queue is not an outage")):
+            rc, _ = self.follow(frames, lambda *a, **k: {"running": True, "status": "queued"})
+        self.assertEqual(rc, 0)
+        self.assertGreater(self.clock.t - t0, 300)
+
     def test_boatd_restart_alone_is_said_differently_and_nothing_is_retried(self):
         script = [[{"type": "hello", "attempt": 1, "bootId": "b", "serverStartedAt": "t1"},
                    {"type": "stdout", "data": "abc", "nextOffset": 3}, OSError("reset")],
@@ -523,6 +849,85 @@ class Reconnect(unittest.TestCase):
         e, err = self.follow(frames, self.down)
         self.assertGreaterEqual(self.clock.t - t0, runs.OUTAGE_FOLLOW_S - 15)
         self.assertNotIn("offbox server", err)
+
+
+class MissingTemplates(Isolated):
+    def setUp(self):
+        super().setUp()
+        self.root = Path(self.tmp.name) / "repo"
+        self.root.mkdir()
+        (self.root / "go.mod").write_text("module example\n\ngo 1.24\n")
+        self.me.update(repo_root=str(self.root), repo_key="example")
+        self.stack.enter_context(patch.object(common, "_BACKEND", "server"))
+        self.stack.enter_context(patch.object(api, "BACKEND", "server"))
+        self.stack.enter_context(patch.object(home, "only_on_home", return_value=False))
+        self.stack.enter_context(patch.object(lease, "_fit_new", side_effect=lambda sz, size: sz))
+        self.stack.enter_context(patch.object(lease, "new_id", return_value="lease-test"))
+        self.create = self.stack.enter_context(patch.object(api, "create", return_value={"id": "bx_recipe"}))
+        self.fork = self.stack.enter_context(patch.object(api, "fork", return_value={"id": "bx_template"}))
+        self.err = self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+
+    def template(self, name):
+        self.con.execute("INSERT INTO templates (name, box_id, size, token_owner) VALUES (?,?,?,?)",
+                         (name, "bx_" + name, lease.DEFAULT_SIZE[name], common.token_owner()))
+        self.con.commit()
+
+    def new_box(self, **kw):
+        return lease._new_box(self.con, self.me, kw.get("size"), kw.get("template"), None, kw.get("fresh", False))
+
+    def test_missing_template_uses_its_recipe_and_says_so_once_on_each_backend(self):
+        for backend, label in (("server", "home server"), ("boat", "boat.dev")):
+            with self.subTest(backend=backend), patch.object(api, "BACKEND", backend):
+                self.err.seek(0)
+                self.err.truncate()
+                self.assertEqual(self.new_box(), ({"id": "bx_recipe"}, "recipe:crpko-go", None, "large"))
+                self.create.assert_called_with("large", common.RUN_TTL_S, lease.box_name(self.me, "example"),
+                                               "lease-test-recipe")
+                self.assertEqual(self.err.getvalue(), f"offbox: template crpko-go not built on the {label}; "
+                                 "building this box from its recipe (a few minutes). "
+                                 "offbox template build crpko-go makes the next one fast.\n")
+        self.fork.assert_not_called()
+
+    def test_generic_template_does_not_replace_a_missing_go_template(self):
+        self.template("generic")
+        self.assertEqual(self.new_box()[1], "recipe:crpko-go")
+        self.fork.assert_not_called()
+
+    def test_generic_repository_keeps_using_its_generic_template(self):
+        (self.root / "go.mod").unlink()
+        self.template("generic")
+        self.assertEqual(self.new_box()[1:], ("template:generic", None, "default"))
+        self.create.assert_not_called()
+        self.assertEqual(self.fork.call_args.args[0], "bx_generic")
+
+    def test_fresh_is_bare_even_when_a_template_is_explicit(self):
+        self.template("crpko-go")
+        self.assertEqual(self.new_box(fresh=True, template="crpko-go")[1], "fresh")
+        self.fork.assert_not_called()
+        self.assertEqual(self.create.call_args.args[-1], "lease-test")
+
+    def test_matching_template_is_used(self):
+        self.template("crpko-go")
+        self.assertEqual(self.new_box()[1:], ("template:crpko-go", None, "large"))
+        self.create.assert_not_called()
+        self.assertEqual(self.fork.call_args.args[0], "bx_crpko-go")
+
+    def test_missing_generic_and_explicit_templates_use_the_recipe_with_requested_size(self):
+        for template in common.TEMPLATES:
+            with self.subTest(template=template):
+                self.assertEqual(self.new_box(template=template, size="xlarge")[1:],
+                                 ("recipe:" + template, None, "xlarge"))
+        self.fork.assert_not_called()
+
+    def test_missing_template_uses_the_existing_locked_bring_up_and_owner_stamp(self):
+        with patch.object(lease, "_bring_up") as up, patch.object(api, "rename"):
+            row = lease.acquire_private(dict(self.me, owner="pool:example"))
+        self.addCleanup(row["_guard"].__exit__, None, None, None)
+        self.assertEqual((row["source"], row["state"], row["token_owner"]),
+                         ("recipe:crpko-go", "running", common.token_owner()))
+        self.assertEqual(up.call_args.kwargs["recipe"], "crpko-go")
+        self.assertTrue(up.call_args.kwargs["box_held"])
+        self.assertFalse(up.call_args.kwargs["fresh"])
 
 
 class BoatPlan(Isolated):

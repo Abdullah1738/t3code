@@ -364,11 +364,22 @@ def last_four(charge):
     return re.compile(rf'(?<!\d){charge["card"]}(?!\d)')
 
 
+CHAT_LINE = re.compile(r'^(?P<mark>[ >]) +\d+ [\d?]{4}-[\d?]{2}-[\d?]{2} [\d?]{2}:[\d?]{2} [^:]*: ')
+
+
 def alert_text(shown):
-    """The message itself from msgs show: a chat is shown with its neighbours, its own line marked >."""
+    """Selected msgs-show body, including continuations but excluding neighboring messages."""
+    body = None
     for line in shown.splitlines():
-        if line.startswith('>'):
-            return re.sub(r'^>\s*\d+ \S+ \S+ [^:]*: ', '', line)
+        header = CHAT_LINE.match(line)
+        if body is not None:
+            if header:
+                break
+            body.append(line)
+        elif header and header['mark'] == '>':
+            body = [line[header.end():]]
+    if body is not None:
+        return '\n'.join(body)
     return shown
 
 

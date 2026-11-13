@@ -17,7 +17,7 @@ and up, else on a boat.dev VM.
   offbox run [opts] -- <cmd...>     sync repo, run in the same relative dir, stream, exit with its code
   offbox run [opts] --step 'CMD' [--step 'CMD' ...]   each step runs with pipefail; per-step rc; first nonzero rc wins
   offbox logs <run> [--follow] | wait <run> [--timeout S]     for --bg runs; also a run another shell follows
-  offbox kill <run>                 stop a hung starting/running box run (confirmed on boat), then release works
+  offbox kill <run>                 stop your box run, or cancel it while queued or still syncing/starting
   offbox save [--name N] [--default] [--note ..] | bases | base rm N | keep [--days N]
   offbox local --reason ".." [--ttl 2h] | --list | --clear
   offbox list [--all] | release [<id>|--mine] [--delete] | ssh [<id>] [-- cmd] | ports <port> [--local N] [--reverse]
@@ -74,7 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
     li = sp.add_parser("list")
     li.add_argument("--all", action="store_true")
     li.add_argument("--json", action="store_true")
-    kl = sp.add_parser("kill", help="stop a hung box run by run id")
+    kl = sp.add_parser("kill", help="stop your box run, including while queued or still syncing/starting",
+                       description="Stop your box run, or cancel it before its command starts while queued for "
+                                   "a box or still syncing/starting on one.")
     kl.add_argument("run_id")
     rl = sp.add_parser("release")
     rl.add_argument("box_id", nargs="?")

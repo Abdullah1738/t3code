@@ -80,6 +80,40 @@ class Parse(unittest.TestCase):
         self.assertIsNotNone(ch.parse('Purchase of AED 12.00 with Credit Card ending 1111 at ACME, Dubai. Avl'))
 
 
+class AlertText(unittest.TestCase):
+    def test_selected_body_continuations_stop_at_next_context_header(self):
+        bodies = [
+            'Purchase of USD 100 with your Credit Card ending 2342 at Acme.',
+            'Purchase of USD 100\nwith your Credit Card ending 2342 at Acme.',
+            'Purchase of USD 100\n\n  with your Credit Card ending 2342 at Acme.',
+            'Purchase of USD 100\r\nwith your Credit Card ending 2342 at Acme.',
+            'Purchase of USD 100\nwith your Credit Card ending 2342 at Acme.\n> continuation',
+        ]
+        for body in bodies:
+            for following in (False, True):
+                with self.subTest(body=body, following=following):
+                    shown = ('imessage: EmiratesNBD\n\n'
+                             '         9 2026-11-15 11:59 EmiratesNBD: USD 100 has been refunded.\n'
+                             '>       10 2026-11-15 12:00 EmiratesNBD: ' + body)
+                    if following:
+                        shown += '\n        11 2026-11-15 12:01 EmiratesNBD: Payment of USD 100 towards your Credit Card.'
+                    selected = ch.alert_text(shown)
+                    self.assertEqual(selected, body.replace('\r\n', '\n'))
+                    self.assertEqual(ch.parse(selected, 'EmiratesNBD')['merchant'], 'Acme')
+
+    def test_unknown_timestamp_header_still_bounds_selected_body(self):
+        shown = ('imessage: EmiratesNBD\n\n'
+                 '>       10 ????-??-?? ??:?? EmiratesNBD: Selected\ncontinuation\n'
+                 '        11 ????-??-?? ??:?? EmiratesNBD: Neighbor')
+        self.assertEqual(ch.alert_text(shown), 'Selected\ncontinuation')
+
+    def test_unframed_messages_and_email_quotes_are_unchanged(self):
+        for shown in ('Purchase of USD 100\nwith your Credit Card ending 2342 at Acme.',
+                      'Subject: Bank alert\n\nPurchase of USD 100\n> quoted text'):
+            with self.subTest(shown=shown):
+                self.assertEqual(ch.alert_text(shown), shown)
+
+
 class Finder:
     """A fake msgs search: rows matching every AND'ed group of quoted words, inside the dates."""
 
