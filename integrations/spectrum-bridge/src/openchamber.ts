@@ -34,26 +34,24 @@ const DELEGATED_BATCH = new RegExp(`^Delegated tasks ${DELEGATED_ID}(?:, ${DELEG
 const DELEGATED_RESULT = new RegExp(`^Delegated task ${DELEGATED_ID}(?: \\([\\s\\S]*?\\))? \\[(?:completed|failed|cancelled|interrupted)\\](?::\\n|\\. Use task_status with taskId )`);
 export const isDelegatedCompletionText = (text: string): boolean => DELEGATED_SINGLE.test(text) || DELEGATED_BATCH.test(text) || DELEGATED_RESULT.test(text);
 
-/** Native descriptions and results are interpolated without XML escaping. */
-export function subagentNoticeStates(text: string): string[] {
-  const states: string[] = [];
-  for (const report of text.trim().split(/(?<=<\/subagent>)\s*(?=<subagent\b)/)) {
-    if (!report.endsWith("</subagent>")) return [];
-    // Read ordinary headers first. The native producer puts description last,
-    // so an unescaped quote there must not hide its preceding state attribute.
-    const header = /^<subagent((?:\s+[\w:-]+="[^"]*")+)\s*>/.exec(report)?.[1]
-      ?? /^<subagent((?:\s+[\w:-]+="[^"]*")*)\s+description="/.exec(report)?.[1];
-    if (!header) return [];
-    const attributes = [...header.matchAll(/([\w:-]+)="([^"]*)"/g)].filter(attribute => attribute[1] === "state");
-    if (attributes.length !== 1) return [];
-    states.push(attributes[0]![2]!);
-  }
-  return states;
+/** Native payloads are unescaped, so only the leading report's header is authoritative. */
+export function subagentNoticeState(text: string): string | undefined {
+  const source = text.trim();
+  if (!source.endsWith("</subagent>")) return;
+  // The native notifier drops running reports before onWake joins reports.
+  // Real joined notices are terminal; scanning their payload can only invent
+  // boundaries from quoted or incomplete report examples.
+  const native = /^<subagent\s+sessionID="[^"]+"\s+state="([^"]*)"\s+description="/.exec(source);
+  if (native) return native[1];
+  const header = /^<subagent((?:\s+[\w:-]+="[^"]*")+)\s*>/.exec(source)?.[1];
+  if (!header) return;
+  const attributes = [...header.matchAll(/([\w:-]+)="([^"]*)"/g)].filter(attribute => attribute[1] === "state");
+  return attributes.length === 1 ? attributes[0]![2] : undefined;
 }
 
 export const isCompletionNoticeText = (text: string): boolean => isDelegatedCompletionText(text)
   // OpenCode calls a failed native report "error" (reportOutcome in its provider adapter).
-  || subagentNoticeStates(text).some(state => ["completed", "failed", "error", "cancelled"].includes(state));
+  || ["completed", "failed", "error", "cancelled"].includes(subagentNoticeState(text) ?? "");
 
 export type MessageRecord =
   | { id: string; type: "user"; text: string; time: { created: number }; createdBy?: string; [key: string]: unknown }

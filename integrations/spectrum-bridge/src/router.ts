@@ -6,7 +6,7 @@ import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming } from "./inbound-files.ts";
 import { BUBBLE_CHARS, formatText, splitFormatted, stripInternalText } from "./formatting.ts";
-import { assistantText, isCompletionNoticeText, subagentNoticeStates, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
+import { assistantText, isCompletionNoticeText, subagentNoticeState, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import type { ChatContext } from "./chats.ts";
 import type { ReplyMode } from "./config.ts";
 import { commandWord, controlCommand, isCommand } from "./commands.ts";
@@ -480,7 +480,7 @@ export function quietMessages(records: readonly MessageRecord[]): Set<string> {
 /** Native reports can be synthetic in OpenCode or provider-created user messages in Robob. */
 function backgroundNotice(record: MessageRecord): boolean {
   return (record.type === "user" || record.type === "synthetic") && record.createdBy !== "user"
-    && typeof record.text === "string" && (isCompletionNoticeText(record.text) || subagentNoticeStates(record.text).length > 0);
+    && typeof record.text === "string" && (isCompletionNoticeText(record.text) || subagentNoticeState(record.text) !== undefined);
 }
 
 function backgroundCompletion(record: MessageRecord): boolean {
