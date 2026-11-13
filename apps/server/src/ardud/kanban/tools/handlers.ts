@@ -16,6 +16,7 @@ import {
   type KanbanThreadLink,
   type ModelSelection,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
@@ -37,6 +38,7 @@ import {
 import { selectionRoutingEnabled } from "../engine/selectionSettings.ts";
 import { KanbanToolkit, type ModelInput } from "./tools.ts";
 import * as BoardReplies from "../engine/boardReplies.ts";
+import * as Activity from "../engine/activity.ts";
 
 const toolFailure = (error: KanbanError) =>
   new OrchestratorMcpFailure({
@@ -409,6 +411,28 @@ const handlers = {
           input.limit ?? BoardReplies.BOARD_PAGE_LIMIT,
           BoardReplies.BOARD_PAGE_MAX,
         );
+        if (input.since !== undefined) {
+          const window = Activity.parseWindow(input.since, undefined, yield* Clock.currentTimeMillis);
+          if (typeof window === "string") return yield* invalid(window);
+          const read = yield* service.activity(board.id, window);
+          const byCard = Activity.groupEvents(read.events);
+          const rows = Activity.activeCards(read.cards, byCard, window).map((card) =>
+            Activity.compactRow(card, byCard.get(card.id) ?? [], window),
+          );
+          const page = Activity.pageRows(rows, input.after ?? 0, limit);
+          return {
+            board: {
+              id: board.id,
+              name: board.name,
+              window,
+              activeCards: rows.length,
+              pools: read.pools.map((pool) => ({ key: pool.key, slots: pool.slots })),
+              cards: page.rows,
+              page: { limit, hasMore: page.hasMore, nextAfter: page.nextAfter },
+            },
+            prompts: "omitted; card_get returns a card's prompt",
+          };
+        }
         const snapshot = yield* service.replySnapshot(board.id, {
           after: input.after ?? 0,
           limit: limit + 1,
@@ -422,6 +446,22 @@ const handlers = {
           },
           prompts: "omitted; card_get returns a card's prompt",
         };
+      }),
+    ),
+  ),
+
+  board_activity: McpToolAccess.readsAsCaller((input) =>
+    withCaller((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller, input.boardId, true);
+        const window = Activity.parseWindow(
+          input.since,
+          input.until,
+          yield* Clock.currentTimeMillis,
+        );
+        if (typeof window === "string") return yield* invalid(window);
+        const read = yield* service.activity(board.id, window);
+        return { activity: { boardId: board.id, ...Activity.rollup({ window, ...read }) } };
       }),
     ),
   ),
@@ -465,7 +505,18 @@ const handlers = {
       Effect.gen(function* () {
         const card = yield* cardFor(service, caller, input.card, input.boardId, true);
         const detail = yield* service.card(card.id);
-        return { card: detail.card, events: detail.events, threads: detail.threads };
+        if (
+          input.compact !== true &&
+          input.eventsLimit === undefined &&
+          input.eventsBefore === undefined
+        )
+          return { card: detail.card, events: detail.events, threads: detail.threads };
+        const bounded = Activity.boundedEvents(
+          detail.events,
+          Math.min(input.eventsLimit ?? Activity.CARD_EVENTS_DEFAULT, Activity.CARD_EVENTS_MAX),
+          input.eventsBefore,
+        );
+        return { card: Activity.compactAsks(detail.card), threads: detail.threads, ...bounded };
       }),
     ),
   ),
@@ -776,19 +827,21 @@ const handlers = {
         );
         let messages: ReadonlyArray<KanbanMessage>;
         let note: string | undefined;
+        const readBytes =
+          input.limit === undefined ? AGENT_READ_BYTES : Activity.COMPACT_READ_CHARS;
         if (input.seq !== undefined) {
           messages = [yield* service.message(discussion.id, input.seq)];
         } else {
           messages = yield* service.messages(discussion.id, {
             ...(input.afterSeq === undefined ? {} : { afterSeq: input.afterSeq }),
             ...(input.beforeSeq === undefined ? {} : { beforeSeq: input.beforeSeq }),
-            limit: MESSAGE_PAGE_MAX,
+            limit: Math.min(input.limit ?? MESSAGE_PAGE_MAX, MESSAGE_PAGE_MAX),
             full: true,
-            maxBytes: AGENT_READ_BYTES,
+            maxBytes: readBytes,
           });
           // One message alone past the cap comes as a stub; seq reads it whole.
           const only = messages.length === 1 ? messages[0]! : undefined;
-          if (only !== undefined && messageBytes(only) > AGENT_READ_BYTES) {
+          if (only !== undefined && messageBytes(only) > readBytes) {
             messages = [stubMessage(only)];
             note = `Message ${only.seq} is too big for a list read; read it alone with seq: ${only.seq}.`;
           }

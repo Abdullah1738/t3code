@@ -176,15 +176,34 @@ const tool = <
 const BoardGet = tool(
   "board_get",
   "Read the board",
-  "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500; follow board.page.nextAfter with after while hasMore. boardId defaults to the board identified by this thread; when ambiguous, pass one of the candidate board ids in the error.",
+  "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500; follow board.page.nextAfter with after while hasMore. With since, only cards active since then (an event, or an open or touched ask), one short row each: stage changes, review verdicts, run failures, stall, asks with asked/answered times; no settings, groups or unread; each page stays under 50,000 characters. boardId defaults to the board identified by this thread; when ambiguous, pass one of the candidate board ids in the error.",
   {
     boardId: BoardRef,
     after: Schema.optional(
       describe(NonNegativeInt, "Cards numbered after this cursor (default 0)."),
     ),
     limit: Schema.optional(describe(PositiveInt, "Page size, default 200, capped at 500.")),
+    since: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        "ISO time, at most 72 hours ago: only cards active since then, as short rows.",
+      ),
+    ),
   },
   { board: Record, prompts: Schema.String },
+  { readonly: true },
+);
+
+const BoardActivity = tool(
+  "board_activity",
+  "Board activity rollup",
+  "A board's activity in a window (default the last 24 hours, at most 72): each ask with asked/answered times and minutes to answer (p50/p90/max), review rounds and verdicts per card, hours in each stage and the longest spans, stalls and how long they lasted, run failures by model, threads started and restarts, and pool slots held per hour per model next to each pool's slots. Read from the cards' stored history; lists past 150 rows say how many more.",
+  {
+    boardId: BoardRef,
+    since: Schema.optional(describe(TrimmedNonEmptyString, "ISO start; default 24 hours before until.")),
+    until: Schema.optional(describe(TrimmedNonEmptyString, "ISO end; default now.")),
+  },
+  { activity: Record },
   { readonly: true },
 );
 
@@ -206,9 +225,26 @@ const CardSearch = tool(
 const CardGet = tool(
   "card_get",
   "Read a card",
-  "One card with its history (moves, edits, comments, review verdicts) and every thread it has had.",
-  { card: Schema.optional(CardRef), boardId: BoardRef },
-  { card: Record, events: Records, threads: Records },
+  "One card with its history (moves, edits, comments, review verdicts) and every thread it has had. compact (or eventsLimit/eventsBefore) bounds it: the newest events (default 40), bodies over 2,000 characters cut (bodyChars gives the length), closed asks without their blocks, and eventsMore.before to page older events.",
+  {
+    card: Schema.optional(CardRef),
+    boardId: BoardRef,
+    compact: Schema.optional(Schema.Boolean),
+    eventsLimit: Schema.optional(
+      describe(PositiveInt, "Newest events to return (default 40, max 200). Implies compact."),
+    ),
+    eventsBefore: Schema.optional(
+      describe(PositiveInt, "Only events with a smaller id: eventsMore.before from the last read. Implies compact."),
+    ),
+  },
+  {
+    card: Record,
+    events: Records,
+    threads: Records,
+    eventsMore: Schema.optional(
+      Schema.Struct({ before: NonNegativeInt, older: NonNegativeInt }),
+    ),
+  },
   { readonly: true },
 );
 
@@ -617,13 +653,16 @@ const DiscussionPost = tool(
 const DiscussionRead = tool(
   "discussion_read",
   "Read a discussion",
-  "Messages of a discussion, newest last, with answers to polls and picks: the latest ones (after afterSeq / before beforeSeq when given), up to 200 and about 1 MB. When older ones were left out, earlierBefore is set: read again with beforeSeq. seq reads one message in full. Defaults like discussion_post.",
+  "Messages of a discussion, newest last, with answers to polls and picks: the latest ones (after afterSeq / before beforeSeq when given), up to 200 and about 1 MB, or with limit up to that many and about 50,000 characters. When older ones were left out, earlierBefore is set: read again with beforeSeq. seq reads one message in full. Defaults like discussion_post.",
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
     boardId: BoardRef,
     card: Schema.optional(CardRef),
     afterSeq: Schema.optional(NonNegativeInt),
     beforeSeq: Schema.optional(NonNegativeInt),
+    limit: Schema.optional(
+      describe(PositiveInt, "At most this many messages (max 200), within about 50,000 characters."),
+    ),
     seq: Schema.optional(describe(PositiveInt, "Read only this message, in full.")),
   },
   {
@@ -974,6 +1013,7 @@ export const KanbanToolkit = Toolkit.make(
   SetupDone,
   BoardPause,
   BoardGet,
+  BoardActivity,
   CardSearch,
   CardGet,
   CardUpdate,

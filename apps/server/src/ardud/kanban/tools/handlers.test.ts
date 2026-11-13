@@ -985,6 +985,130 @@ it.effect(
   },
 );
 
+it.effect("compact reads: board_get since, bounded card_get and discussion_read, board_activity", () => {
+  const { running, layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "toy",
+      name: "Toy",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const quiet = yield* kanban.createCard(
+      board.id,
+      { prompt: "Q", title: "Quiet", priority: 4 },
+      owner,
+    );
+    yield* TestClock.adjust(Duration.hours(30));
+    const busy = yield* kanban.createCard(
+      board.id,
+      { prompt: "P".repeat(5_000), title: "Busy", priority: 1 },
+      owner,
+    );
+    yield* kanban.dispatchNow;
+    const thread = (yield* kanban.card(busy.id)).card.activeThreadId!;
+    running.add(thread);
+    const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("evaluator-1") };
+    yield* kanban.askOwner(
+      busy.id,
+      { question: "Ship it?", blocking: false, options: ["Yes", "No"] },
+      evaluator,
+      "evaluator",
+    );
+    yield* TestClock.adjust(Duration.minutes(20));
+    yield* kanban.answerAsk(busy.id, "q1", { verdict: "picked", optionIds: ["o1"], revision: 0 }, owner);
+    for (let index = 0; index < 60; index++) {
+      yield* kanban.editCard(busy.id, { comment: `${index} ${"c".repeat(3_000)}` }, owner);
+      yield* kanban.postToCard(busy.id, owner, [{ _tag: "md", text: `${index} ${"m".repeat(2_000)}` }]);
+    }
+    yield* TestClock.adjust(Duration.minutes(5));
+    const now = yield* Clock.currentTimeMillis;
+    const since = DateTime.formatIso(DateTime.makeUnsafe(now - 24 * 60 * 60 * 1000));
+
+    const full = yield* call(thread, "board_get", {});
+    assert.isFalse(full.isError, full.text);
+    assert.lengthOf((full.structured.board as { cards: Array<unknown> }).cards, 2);
+
+    const compact = yield* call(thread, "board_get", { since });
+    assert.isFalse(compact.isError, compact.text);
+    assert.isBelow(compact.text.length, 60_000);
+    const view = compact.structured.board as {
+      activeCards: number;
+      cards: Array<{
+        number: number;
+        prompt?: string;
+        asks?: Array<{ id: string; minutes?: number; answeredAt?: string }>;
+        comments?: number;
+      }>;
+      page: { hasMore: boolean };
+    };
+    assert.strictEqual(view.activeCards, 1);
+    assert.deepStrictEqual(
+      view.cards.map((card) => card.number),
+      [busy.number],
+    );
+    assert.notInclude(compact.text, `"number":${quiet.number},`);
+    assert.isUndefined(view.cards[0]!.prompt);
+    assert.strictEqual(view.cards[0]!.asks?.[0]?.minutes, 20);
+    // The 60 comments plus the ask and its answer.
+    assert.isAtLeast(view.cards[0]!.comments ?? 0, 60);
+    assert.isFalse(view.page.hasMore);
+    const tooOld = yield* call(thread, "board_get", {
+      since: DateTime.formatIso(DateTime.makeUnsafe(now - 80 * 60 * 60 * 1000)),
+    });
+    assert.isTrue(tooOld.isError);
+    assert.include(tooOld.text, "at most 72 hours");
+
+    const whole = yield* call(thread, "card_get", { card: `#${busy.number}` });
+    assert.isAbove(whole.text.length, 150_000);
+    const bounded = yield* call(thread, "card_get", { card: `#${busy.number}`, compact: true });
+    assert.isFalse(bounded.isError, bounded.text);
+    assert.isBelow(bounded.text.length, 60_000);
+    const events = bounded.structured.events as Array<{ id: number }>;
+    assert.isAtMost(events.length, 40);
+    const more = bounded.structured.eventsMore as { before: number; older: number };
+    assert.isAbove(more.older, 0);
+    assert.strictEqual(more.before, events[0]!.id);
+    assert.strictEqual((bounded.structured.card as { prompt: string }).prompt.length, 5_000);
+    const older = yield* call(thread, "card_get", {
+      card: `#${busy.number}`,
+      eventsBefore: more.before,
+      eventsLimit: 5,
+    });
+    const olderEvents = older.structured.events as Array<{ id: number }>;
+    assert.lengthOf(olderEvents, 5);
+    assert.isBelow(olderEvents.at(-1)!.id, more.before);
+
+    const allMessages = yield* call(thread, "discussion_read", { card: `#${busy.number}` });
+    assert.isAbove(allMessages.text.length, 120_000);
+    const page = yield* call(thread, "discussion_read", { card: `#${busy.number}`, limit: 40 });
+    assert.isFalse(page.isError, page.text);
+    assert.isBelow(page.text.length, 60_000);
+    const messages = page.structured.messages as Array<{ seq: number }>;
+    assert.isAtMost(messages.length, 40);
+    assert.strictEqual(page.structured.earlierBefore, messages[0]!.seq);
+
+    const rollup = yield* call(thread, "board_activity", {});
+    assert.isFalse(rollup.isError, rollup.text);
+    assert.isBelow(rollup.text.length, 60_000);
+    const activity = rollup.structured.activity as {
+      boardId: string;
+      asks: { answered: number; items: Array<{ card: number; id: string; minutes?: number }> };
+      cards: { active: number };
+    };
+    assert.strictEqual(activity.boardId, board.id);
+    assert.strictEqual(activity.cards.active, 1);
+    assert.strictEqual(activity.asks.answered, 1);
+    assert.deepStrictEqual(activity.asks.items[0], {
+      ...activity.asks.items[0],
+      card: busy.number,
+      id: "q1",
+      minutes: 20,
+    });
+  }).pipe(Effect.provide(layer));
+});
+
 it.live("card and discussion tools answer while the SQLite writer is held", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;

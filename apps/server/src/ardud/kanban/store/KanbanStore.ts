@@ -131,6 +131,12 @@ export interface KanbanStoreShape {
   readonly cardEvents: (
     cardId: KanbanCardId,
   ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
+  /** Every event on a board's cards with `since <= at < until`, oldest first. */
+  readonly boardEvents: (
+    boardId: KanbanBoardId,
+    since: string,
+    until: string,
+  ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
 
   readonly goals: (
     boardId: KanbanBoardId,
@@ -559,6 +565,27 @@ const make = Effect.gen(function* () {
       "read card events",
       Effect.flatMap(
         sql<IdJsonRow>`SELECT id, json FROM ardud_kanban_card_events WHERE card_id = ${cardId} ORDER BY id`,
+        (rows) =>
+          Effect.forEach(rows, (row) =>
+            Effect.map(
+              CardEvent.decode(row.json),
+              (event) => ({ ...event, id: Number(row.id) }) as KanbanCardEvent,
+            ),
+          ),
+      ),
+    );
+
+  const boardEvents = (boardId: KanbanBoardId, since: string, until: string) =>
+    runRead(
+      "read board events",
+      Effect.flatMap(
+        sql<IdJsonRow>`
+          SELECT e.id, e.json FROM ardud_kanban_card_events e INDEXED BY ardud_kanban_card_events_at
+          JOIN ardud_kanban_cards c ON c.id = e.card_id
+          WHERE json_extract(e.json, '$.at') >= ${since} AND json_extract(e.json, '$.at') < ${until}
+            AND c.board_id = ${boardId}
+          ORDER BY e.id
+        `,
         (rows) =>
           Effect.forEach(rows, (row) =>
             Effect.map(
@@ -1057,6 +1084,7 @@ const make = Effect.gen(function* () {
     putCard,
     addCardEvent,
     cardEvents,
+    boardEvents,
     goals,
     putGoal,
     pools,

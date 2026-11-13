@@ -27,6 +27,9 @@ export const kanbanDDL = [
     id INTEGER PRIMARY KEY AUTOINCREMENT, card_id TEXT NOT NULL, json TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_card_events_card ON ardud_kanban_card_events (card_id, id)`,
+  // Board activity reads a time window of events (board_get since, board_activity).
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_card_events_at
+    ON ardud_kanban_card_events (json_extract(json, '$.at'))`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_goals (
     id TEXT PRIMARY KEY, board_id TEXT NOT NULL, json TEXT NOT NULL
   )`,

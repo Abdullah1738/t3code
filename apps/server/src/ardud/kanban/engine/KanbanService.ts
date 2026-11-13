@@ -403,6 +403,19 @@ export interface KanbanServiceShape {
   >;
 
   readonly card: (cardId: KanbanCard["id"]) => Effect.Effect<CardDetail, KanbanError>;
+  /** What board activity reads for a window: every card, the window's events, the board's threads and pools. */
+  readonly activity: (
+    boardId: KanbanBoard["id"],
+    window: { readonly since: string; readonly until: string },
+  ) => Effect.Effect<
+    {
+      readonly cards: ReadonlyArray<KanbanCard>;
+      readonly events: ReadonlyArray<KanbanCardEvent>;
+      readonly threads: ReadonlyArray<KanbanThreadLink>;
+      readonly pools: ReadonlyArray<KanbanPool>;
+    },
+    KanbanError
+  >;
   readonly cardByNumber: (
     boardId: KanbanBoard["id"],
     number: number,
@@ -14108,6 +14121,15 @@ const make = Effect.gen(function* () {
             events: yield* store.cardEvents(cardId),
             threads: yield* store.threadLinks({ cardId }),
           } satisfies CardDetail;
+        }),
+      ),
+    activity: (boardId, window) =>
+      readDb(
+        Effect.all({
+          cards: store.cards(boardId),
+          events: store.boardEvents(boardId, window.since, window.until),
+          threads: store.threadLinks({ boardId, open: false }),
+          pools: store.pools(boardId),
         }),
       ),
     cardByNumber: (boardId, number) => readDb(store.cardByNumber(boardId, number)),
