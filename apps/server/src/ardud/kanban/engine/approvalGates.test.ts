@@ -240,7 +240,7 @@ it.effect.each(
         yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner");
         yield* kanban.askOwner(
           card.id,
-          { question: `${task}?`, blocking: false, options: [label, "No"] },
+          { question: `${task} (s1)?`, blocking: false, options: [label, "No"] },
           evaluator,
           "evaluator",
         );
@@ -504,7 +504,7 @@ it.effect("a missing decision names the gate and the subtask's time bound", () =
         .pipe(Effect.flip);
       assert.strictEqual(
         refused.detail,
-        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: no owner answer on a deploy ask since ${card.subtasks[0]!.createdAt}`,
+        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: no owner answer on a deploy ask since ${card.subtasks[0]!.createdAt}; name the subtask id (e.g. s7) in the ask`,
       );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),

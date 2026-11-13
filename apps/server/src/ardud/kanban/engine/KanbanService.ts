@@ -11251,8 +11251,9 @@ const make = Effect.gen(function* () {
         if (plan && !plan.ok) return yield* failWith("invalid", plan.reason);
         if (plan?.ok) {
           for (const subtask of card.subtasks) {
-            if (subtask.state !== "open" || plan.subtasks.some((entry) => entry.id === subtask.id))
-              continue;
+            if (subtask.state !== "open") continue;
+            const replacement = plan.subtasks.find((entry) => entry.id === subtask.id);
+            if (replacement && Subtasks.gateOf(replacement) !== undefined) continue;
             const missing = Subtasks.approvalProblem(card, subtask);
             if (actor._tag !== "owner" && missing) return yield* failWith("denied", missing);
           }
