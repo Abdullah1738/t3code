@@ -14,6 +14,7 @@ import { assert, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as TestClock from "effect/testing/TestClock";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
@@ -415,6 +416,99 @@ const rateLimit = () =>
       detail: "Rate limited",
     }),
   });
+
+it.effect.each(["fingerprint", "detail", "activity"] as const)(
+  "recovers from isolated %s rate limits with unchanged fingerprints and still wakes on new failures",
+  (failureAt) =>
+    Effect.gen(function* () {
+      let limited = false;
+      let failedCheck = false;
+      let revision = 0;
+      const harness = yield* makeHarness({
+        watchFingerprint: () =>
+          limited && failureAt === "fingerprint"
+            ? Effect.fail(rateLimit())
+            : Effect.succeed({
+                status: failedCheck ? "failed" : `head-${revision}`,
+                remarks: failureAt === "activity" ? `remarks-${revision}` : "unchanged",
+              }),
+        invalidate: () => Effect.void,
+        detail: () =>
+          limited && failureAt === "detail"
+            ? Effect.fail(rateLimit())
+            : Effect.succeed({
+                ...greenDetail(),
+                headBranchSha: OLD_HEAD,
+                checks: greenDetail().checks.map((check) => ({
+                  ...check,
+                  status: failedCheck ? "failure" : check.status,
+                })),
+              }),
+        activity: () =>
+          limited && failureAt === "activity"
+            ? Effect.fail(rateLimit())
+            : Effect.succeed({
+                comments: [],
+                reviewThreads: [],
+                commentsTruncated: false,
+                commentCount: 0,
+                commits: [],
+              }),
+      });
+      yield* harness.reactor.sweep;
+      assert.isDefined(harness.watch());
+      for (let attempt = 0; attempt < 8; attempt++) {
+        yield* TestClock.adjust("2 minutes");
+        if (failureAt !== "fingerprint") revision++;
+        limited = true;
+        yield* harness.reactor.sweep;
+        assert.isDefined(harness.watch(), `watch stopped after isolated rate limit ${attempt + 1}`);
+        yield* TestClock.adjust("2 minutes");
+        limited = false;
+        yield* harness.reactor.sweep;
+      }
+      failedCheck = true;
+      yield* harness.reactor.sweep;
+      const wakes = harness.commands.filter((command) => command.wake);
+      assert.strictEqual(wakes.length, 2);
+      assert.include(wakes[1]!.wake!.text, "Checks failed");
+      assert.isDefined(harness.watch());
+    }),
+);
+
+it.effect.each(["detail", "activity"] as const)(
+  "does not let successful fingerprints mask eight consecutive %s failures",
+  (failureAt) =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        watchFingerprint: () => Effect.succeed({ status: "head", remarks: "unchanged" }),
+        invalidate: () => Effect.void,
+        detail: () =>
+          failureAt === "detail"
+            ? Effect.fail(rateLimit())
+            : Effect.succeed({ ...greenDetail(), headBranchSha: OLD_HEAD }),
+        activity: () =>
+          failureAt === "activity"
+            ? Effect.fail(rateLimit())
+            : Effect.succeed({
+                comments: [],
+                reviewThreads: [],
+                commentsTruncated: false,
+                commentCount: 0,
+                commits: [],
+              }),
+      });
+      for (let attempt = 0; attempt < 7; attempt++) {
+        yield* TestClock.adjust("2 minutes");
+        yield* harness.reactor.sweep;
+        assert.isDefined(harness.watch());
+      }
+      yield* TestClock.adjust("2 minutes");
+      yield* harness.reactor.sweep;
+      assert.isUndefined(harness.watch());
+      assert.include(harness.commands[0]!.wake?.text ?? "", "Rate limited");
+    }),
+);
 
 it.effect("delays on short rate limits, then ends visibly after eight unsuccessful reads", () =>
   Effect.gen(function* () {

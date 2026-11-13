@@ -697,13 +697,20 @@ export const make = Effect.gen(function* () {
       groups,
       (group, index) => {
         const fingerprint = fingerprints[index]!;
-        return fingerprint === "paused"
-          ? unsuccessfulRead(group, Option.none(), "A host rate limit prevented reading checks.")
-          : readGroup(group, fingerprint).pipe(
-              Effect.catchCause(
-                logFailure("pull request watch check failed", { pullRequest: group.key }),
-              ),
-            );
+        if (fingerprint === "paused") {
+          // Recovery must read detail before its cached plan can skip clearing the failure streak.
+          lastReads.delete(group.key);
+          return unsuccessfulRead(
+            group,
+            Option.none(),
+            "A host rate limit prevented reading checks.",
+          );
+        }
+        return readGroup(group, fingerprint).pipe(
+          Effect.catchCause(
+            logFailure("pull request watch check failed", { pullRequest: group.key }),
+          ),
+        );
       },
       { concurrency: 4, discard: true },
     );
