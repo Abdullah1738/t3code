@@ -9858,7 +9858,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     readonly now: DateTime.Utc;
   }) {
     const { command, events, thread, run, now } = input;
-    if (run.rootNodeId === null || run.providerThreadId === null) return;
     const pendingItems = (yield* Ref.get(events)).flatMap((event) =>
       event.type === "turn-item.updated" ? [event.payload] : [],
     );
@@ -9875,7 +9874,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       type: "turn-item.updated",
       threadId: thread.id,
       runId: run.id,
-      nodeId: run.rootNodeId,
+      ...(run.rootNodeId === null ? {} : { nodeId: run.rootNodeId }),
       providerInstanceId: run.providerInstanceId,
       occurredAt: now,
       payload: {
@@ -12480,9 +12479,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ]);
         }
         break;
-      case "thread.stop":
-        cancelUnsettledEffects = yield* dispatchThreadStop(command, events, effects);
+      case "thread.stop": {
+        const interrupted = yield* dispatchThreadStop(command, events, effects);
+        // A restart continuation can be waiting in pacing with no live child run.
+        // Cancel it in the same transaction as the Stop fence.
+        cancelUnsettledEffects = {
+          effectTypes: [...(interrupted?.effectTypes ?? []), "provider-runtime.continue"],
+          reason: interrupted?.reason ?? command.reason ?? "Thread stopped.",
+        };
         break;
+      }
       case "queued-message.promote-to-steer":
         yield* dispatchQueuedMessagePromoteToSteer(command, events, effects);
         break;
@@ -13012,11 +13018,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   });
 
   // dispatchWithReceiptEffect owns the dispatch span; this wrapper selects the thread locks.
-  const dispatchWithReceipt = Effect.fnUntraced(function* (command: OrchestrationV2ServerCommand) {
+  const dispatchWithReceipt = Effect.fnUntraced(function* (
+    command: OrchestrationV2ServerCommand,
+  ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
     const dispatch = threadDispatch.withLock(
       commandThreadId(command),
       dispatchWithReceiptEffect(command),
     );
+    if (command.type === "thread.stop") {
+      const result = yield* dispatch;
+      const parentThreadId = yield* appOwnedSubagentParentThreadId(command.threadId).pipe(
+        mapDispatchError(command),
+      );
+      if (parentThreadId !== undefined) {
+        // Stop may only change a continuation effect, so no run.updated event
+        // will arrive to finalize the task. Take the parent lock after the child.
+        yield* threadDispatch.withLock(
+          parentThreadId,
+          finalizeAppOwnedSubagent(command.threadId).pipe(mapDispatchError(command)),
+        );
+      }
+      return result;
+    }
     if (
       command.type !== "message.dispatch" ||
       (command.createdBy !== "user" && command.creationSource !== "mcp")

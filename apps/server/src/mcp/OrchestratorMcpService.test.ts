@@ -782,7 +782,105 @@ describe("OrchestratorMcpService", () => {
     }),
   );
 
-  it.effect("does not dispose delivery when a nonterminal task has no active child run", () =>
+  it.effect.each([false, true])(
+    "settles a run-less restart task with continuation pending=%s",
+    (continuationPending) =>
+      Effect.gen(function* () {
+        const parentThreadId = ThreadId.make("thread:mcp-restart-parent");
+        const childThreadId = ThreadId.make("thread:mcp-restart-child");
+        const taskId = NodeId.make("node:mcp-restart-task");
+        let awaitsRestart = continuationPending;
+        const parentProjection = {
+          thread: { id: parentThreadId },
+          runs: [],
+          contextTransfers: [],
+          subagents: [
+            {
+              id: taskId,
+              threadId: parentThreadId,
+              origin: "app_owned",
+              childThreadId,
+              driver: "codex",
+              model: "gpt-5.6-terra",
+              status: "running",
+              result: null,
+              completionDelivery: { state: "pending" },
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const childProjection = {
+          thread: { id: childThreadId },
+          runs: [
+            {
+              id: RunId.make("run:mcp-restart-child"),
+              ordinal: 1,
+              status: "cancelled",
+              delegatedTaskId: taskId,
+            },
+          ],
+          contextTransfers: [],
+          messages: [],
+          subagents: [],
+          providerThreads: [],
+          runtimeRequests: [],
+          turnItems: [],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const layerDependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getCallerRow: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+            getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+            getThreadRecords: (threadId) =>
+              Effect.succeed(threadId === parentThreadId ? parentProjection : childProjection),
+            delegatedTaskResultPending: () => Effect.succeed(awaitsRestart),
+            dispatch: (command) => {
+              if (command.type === "thread.stop") awaitsRestart = false;
+              return Effect.succeed({} as never);
+            },
+            stopDelegatedTasks: () => Effect.void,
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        const scope: McpInvocationScope = {
+          environmentId: EnvironmentId.make("environment:mcp-restart"),
+          requestNamespace: "provider-session:mcp-restart",
+          thread: {
+            threadId: parentThreadId,
+            providerSessionId: "provider-session:mcp-restart",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+          },
+          client: undefined,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        };
+
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const held = yield* service.taskStatus(scope, taskId);
+          assert.equal(held.status, continuationPending ? "running" : "cancelled");
+          assert.equal(held.workState, continuationPending ? "working" : "result_available");
+          assert.isNull(held.currentRunId);
+          assert.isFalse(held.hasPendingChildRuns);
+          const cancelled = yield* service.cancelTask(scope, {
+            taskId,
+            clientRequestId: "cancel-restart-held-task",
+          });
+          assert.equal(cancelled.status, "cancelled");
+          const settled = yield* service.taskStatus(scope, taskId);
+          assert.equal(settled.status, "cancelled");
+          assert.equal(settled.workState, "result_available");
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
+      }),
+  );
+
+  it.effect("does not dispose delivery when a task has no recorded child run", () =>
     Effect.gen(function* () {
       const parentThreadId = ThreadId.make("thread:mcp-cancel-parent");
       const childThreadId = ThreadId.make("thread:mcp-cancel-child");
