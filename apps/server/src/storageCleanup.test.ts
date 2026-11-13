@@ -283,6 +283,8 @@ const cleanupFixture = (
     let sessionLive = true;
     let fullStatusCalls = 0;
     let snapshotReads = 0;
+    let worktreeSweeps = 0;
+    const shellReads: ThreadId[] = [];
     let events: Stream.Stream<OrchestrationV2DomainEvent> = Stream.empty;
     const activated = yield* Deferred.make<void>();
     const context = yield* Layer.build(StorageCleanup.layer).pipe(
@@ -340,7 +342,12 @@ const cleanupFixture = (
             ),
           ),
         getThreadShell: (threadId: ThreadId) =>
-          Effect.sync(() => threads.find((thread) => thread.id === threadId) ?? null),
+          Effect.sync(() => {
+            shellReads.push(threadId);
+            return (
+              threads.find((thread) => thread.id === threadId && thread.deletedAt === null) ?? null
+            );
+          }),
       } as unknown as ProjectionStore.ProjectionStoreV2["Service"]),
       Effect.provideService(ProviderSessionManager.ProviderSessionManagerV2, {
         isLive: () => Effect.sync(() => sessionLive),
@@ -349,8 +356,10 @@ const cleanupFixture = (
         streamDomainEvents: Stream.suspend(() => events),
       } as unknown as Orchestrator.OrchestratorV2["Service"]),
       Effect.provideService(SqlClient.SqlClient, ((strings: TemplateStringsArray) =>
-        Effect.sync(() =>
-          openSessionCwd !== null && strings.join("").includes("projection_provider_sessions")
+        Effect.sync(() => {
+          if (strings.join("").includes("WHERE t.deleted_at IS NOT NULL")) worktreeSweeps++;
+          return openSessionCwd !== null &&
+            strings.join("").includes("projection_provider_sessions")
             ? [
                 {
                   payload_json: JSON.stringify({
@@ -372,8 +381,8 @@ const cleanupFixture = (
                   ...threads.flatMap((thread) => thread.worktreePath ?? []),
                   ...storedWorktreePaths,
                 ].map((worktreePath) => ({ worktreePath }))
-              : [],
-        )) as unknown as SqlClient.SqlClient),
+              : [];
+        })) as unknown as SqlClient.SqlClient),
       Effect.provideService(GitManager.GitManager, {
         invalidateStatus: () => Effect.void,
       } as unknown as GitManager.GitManager["Service"]),
@@ -438,6 +447,8 @@ const cleanupFixture = (
       },
       fullStatusCalls: () => fullStatusCalls,
       snapshotReads: () => snapshotReads,
+      worktreeSweeps: () => worktreeSweeps,
+      shellReads: () => shellReads,
       activate: (domainEvents: Stream.Stream<OrchestrationV2DomainEvent>) => {
         events = domainEvents;
         return Deferred.succeed(activated, undefined);
@@ -994,9 +1005,21 @@ describe("orphan worktree reports", () => {
           const measuring = yield* Deferred.make<void>();
           let orphan = "";
           let walks = 0;
+          // Cache behavior must not depend on delayed block allocation on the host filesystem.
+          const measuredFs = {
+            ...fs,
+            stat: (file: string) =>
+              fs
+                .stat(file)
+                .pipe(
+                  Effect.map((stat) =>
+                    file === `${orphan}/file` ? { ...stat, blocks: Option.none() } : stat,
+                  ),
+                ),
+          };
           const fixture = yield* cleanupFixture().pipe(
             Effect.provideService(FileSystem.FileSystem, {
-              ...fs,
+              ...measuredFs,
               readDirectory: (directory, options) =>
                 Effect.gen(function* () {
                   if (directory.endsWith("/repository") && walks === 0)
@@ -1016,7 +1039,7 @@ describe("orphan worktree reports", () => {
           orphan = `${fixture.config.worktreesDir}/repository/orphan`;
           yield* fs.makeDirectory(orphan, { recursive: true });
           yield* fs.writeFileString(`${orphan}/file`, "x");
-          const bytes = yield* allocatedBytes(fs, `${orphan}/file`);
+          const bytes = yield* allocatedBytes(measuredFs, `${orphan}/file`);
           yield* fs.utimes(orphan, 1, 1);
           const later = `${fixture.config.worktreesDir}/repository/z-later`;
           yield* fs.makeDirectory(later);
@@ -1038,7 +1061,7 @@ describe("orphan worktree reports", () => {
           expect(orphanEntry(nextReport)?.bytes).toBe(limit === "walk-timeout" ? null : bytes);
           expect(nextReport.entries.find((entry) => entry.path === later)?.bytes).toBe(0);
           yield* fs.writeFileString(`${orphan}/file`, "changed".repeat(10_000));
-          const changedBytes = yield* allocatedBytes(fs, `${orphan}/file`);
+          const changedBytes = yield* allocatedBytes(measuredFs, `${orphan}/file`);
           expect(changedBytes).not.toBe(bytes);
           expect(orphanEntry(yield* fixture.service.runNow)?.bytes).toBe(
             limit === "walk-timeout" ? null : bytes,
@@ -1586,14 +1609,30 @@ describe("storage cleanup reports and local file policies", () => {
       }),
     ),
   );
-  it.live("reads the thread snapshot once per sweep, not per worktree", () =>
-    runCleanupTest(
-      Effect.gen(function* () {
-        const { service, snapshotReads } = yield* cleanupFixture();
-        expect((yield* service.runNow).entries[0]).toMatchObject({ outcome: "removed" });
-        expect(snapshotReads()).toBe(1);
-      }),
-    ),
+  it.live.each([false, true])(
+    "reads only worktree thread shells without a snapshot (archived: %s)",
+    (archived) =>
+      runCleanupTest(
+        Effect.gen(function* () {
+          const fixture = yield* cleanupFixture();
+          const candidate = shell({
+            branch: "feature",
+            worktreePath: fixture.worktree,
+            archivedAt: archived ? at(-DAY_MS) : null,
+          });
+          fixture.setThreads([
+            ...Array.from({ length: 128 }, (_, index) =>
+              shell({ id: ThreadId.make(`local-${index}`) }),
+            ),
+            shell({ ...candidate, id: ThreadId.make("deleted"), deletedAt: at(-DAY_MS) }),
+            candidate,
+          ]);
+          expect((yield* fixture.service.runNow).entries[0]).toMatchObject({ outcome: "removed" });
+          expect(fixture.snapshotReads()).toBe(0);
+          expect(new Set(fixture.shellReads())).toEqual(new Set([candidate.id]));
+          expect(fixture.worktreeSweeps()).toBe(1);
+        }),
+      ),
   );
   it.live.each([
     ["running", "ready", 1],
@@ -1617,7 +1656,8 @@ describe("storage cleanup reports and local file policies", () => {
           yield* Deferred.await(handled);
           yield* Deferred.succeed(fixture.resume, undefined);
           yield* fixture.service.drain;
-          expect(fixture.snapshotReads()).toBe(sweeps);
+          expect(fixture.worktreeSweeps()).toBe(sweeps);
+          expect(fixture.snapshotReads()).toBe(0);
         }),
       ),
   );
@@ -2215,7 +2255,8 @@ it.live.each(["thread.settled", "stopped", "ready"] as const)(
         yield* Deferred.await(handled);
         yield* Deferred.succeed(fixture.resume, undefined);
         yield* fixture.service.drain;
-        expect(fixture.snapshotReads()).toBe(1);
+        expect(fixture.worktreeSweeps()).toBe(1);
+        expect(fixture.snapshotReads()).toBe(0);
       }),
     ),
 );
