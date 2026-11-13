@@ -342,6 +342,7 @@ def rollup(board, day, top_n=20):
     from collections import Counter, defaultdict
     counts_name, counts_kind, tags = Counter(), Counter(), Counter()
     samples, references, durations = {}, {}, defaultdict(list)
+    order_errors, order_polls = {}, defaultdict(list)
     threads_by_rule, attempts = defaultdict(Counter), defaultdict(list)
     caps = []
     recorded = 0
@@ -375,6 +376,21 @@ def rollup(board, day, top_n=20):
         duration = row.get('durationMs')
         if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
             durations[name].append((duration, weight))
+        if board == 'orders':
+            merchant = (row.get('props') or {}).get('merchant')
+            if merchant not in {'noon', 'careem', 'amazon', 'uber', 'other'}:
+                merchant = 'unknown'
+            if name == 'track.poll' and type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
+                order_polls[merchant].append((duration, weight))
+            if kind == 'error':
+                error = row.get('error') or {}
+                status = (error.get('cause') or {}).get('httpStatus')
+                status = status if type(status) is int and 100 <= status <= 599 else None
+                code = error.get('tag') or 'OPERATION_FAILED'
+                item = order_errors.setdefault((code, status, merchant), {
+                    'tag': code, 'httpStatus': status, 'merchant': merchant, 'count': 0,
+                    'sampleId': {'file': day + '.ndjson', 'line': line_number}})
+                item['count'] += weight
         tag = (row.get('error') or {}).get('tag')
         if isinstance(tag, str):
             tags[tag] += weight
@@ -416,7 +432,7 @@ def rollup(board, day, top_n=20):
                 peak = max(peak, window_count)
         if peak > 20:
             loops.append({'threadId': thread, 'rule': rule, 'maxCountInHour': peak, 'repeatLoop': True})
-    return {'schemaVersion': 1, 'tool': board, 'day': day, 'total': total,
+    result = {'schemaVersion': 1, 'tool': board, 'day': day, 'total': total,
             'recordedRows': recorded, 'sampled': sampled, 'logCaps': caps,
             'countsByName': dict(counts_name), 'countsByKind': dict(counts_kind),
             'okCount': oks, 'failedCount': failed, 'okRate': oks / observed if observed else None,
@@ -428,6 +444,15 @@ def rollup(board, day, top_n=20):
             'repeatLoops': loops,
             'topErrorTags': [{'tag': tag, 'count': count, 'sampleId': samples.get(tag, references[tag])}
                              for tag, count in sorted(tags.items(), key=lambda x: (-x[1], x[0]))[:20]]}
+    if board == 'orders':
+        result['durationsMs'] = {name: dict(values) for name, values in result['durationMsByName'].items()}
+        if order_polls:
+            result['durationsMs']['track.poll']['byMerchant'] = {
+                merchant: {**percentiles(values), 'count': sum(weight for _, weight in values)}
+                for merchant, values in sorted(order_polls.items())}
+        result['topErrors'] = sorted(order_errors.values(), key=lambda x: (
+            -x['count'], x['tag'], x['httpStatus'] or 0, x['merchant']))[:20]
+    return result
 
 
 def main(argv=None):

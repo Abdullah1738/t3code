@@ -6,6 +6,7 @@ before_send and receipt hooks, including session/get. Response cookies go only
 to the caller's RAM callback, after the outcome receipt attempt. There are no
 implicit cart edits, auth refreshes, retries, or automatic payment continuations.
 """
+import toollog
 import order_card
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -186,26 +187,32 @@ def native_request(route, headers, deadline, payload, *, response_observer, quer
     req = urllib.request.Request('https://' + host + path, headers=_headers(headers),
                                  method=method, data=encoded)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), tracking.NoRedirect())
-    try:
-        with tracking.read_deadline(deadline) as left:
-            with opener.open(req, timeout=left) as response:
-                _observe_response(response, response_observer)
-                data = decode_response(response.read(MAX_BYTES + 1))
-        return data
-    except urllib.error.HTTPError as exc:
+    with toollog.request(path):
         try:
-            _observe_response(exc, response_observer)
-            code = exc.code
-        finally:
-            exc.close()
-        raise MinutesError({401: 'AUTH_EXPIRED', 403: 'AUTH_FORBIDDEN', 429: 'RATE_LIMITED',
-                            404: 'NOT_FOUND'}.get(code, 'HTTP_' + str(code))) from None
-    except tracking.NoonError:
-        raise MinutesError('REQUEST_TIMEOUT') from None
-    except MinutesError:
-        raise
-    except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException, zlib.error):
-        raise MinutesError('REQUEST_FAILED') from None
+            with tracking.read_deadline(deadline) as left:
+                with toollog.phase('fetch'):
+                    with opener.open(req, timeout=left) as response:
+                        _observe_response(response, response_observer)
+                        raw = response.read(MAX_BYTES + 1)
+                toollog.response(getattr(response, 'code', None), None)
+                with toollog.phase('parse'):
+                    data = decode_response(raw)
+            toollog.response(getattr(response, 'code', None), data)
+            return data
+        except urllib.error.HTTPError as exc:
+            try:
+                _observe_response(exc, response_observer)
+                code = exc.code
+            finally:
+                exc.close()
+            raise MinutesError({401: 'AUTH_EXPIRED', 403: 'AUTH_FORBIDDEN', 429: 'RATE_LIMITED',
+                                404: 'NOT_FOUND'}.get(code, 'HTTP_' + str(code))) from None
+        except tracking.NoonError:
+            raise MinutesError('REQUEST_TIMEOUT') from None
+        except MinutesError:
+            raise
+        except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException, zlib.error):
+            raise MinutesError('REQUEST_FAILED') from None
 
 
 def _application_ok(data):
