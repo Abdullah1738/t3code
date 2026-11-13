@@ -1,19 +1,28 @@
-// @effect-diagnostics nodeBuiltinImport:off globalDateInEffect:off preferSchemaOverJson:off - The restart marker crosses the process boundary before application services are available.
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
-import * as NodeFSP from "node:fs/promises";
-import * as NodePath from "node:path";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
+
+export const RestartMarkerJson = Schema.fromJsonString(
+  Schema.Struct({ pid: Schema.Number, at: Schema.Number }),
+);
+const encodeRestartMarker = Schema.encodeEffect(RestartMarkerJson);
 
 export const restartMarker = Effect.fn("serverRuntimeStartup.restartMarker")(function* (
   stateDir: string,
 ) {
-  const marker = NodePath.join(stateDir, "restarting");
-  yield* Effect.tryPromise(() => NodeFSP.rm(marker, { force: true })).pipe(
-    Effect.ignoreCause({ log: true }),
-  );
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const marker = path.join(stateDir, "restarting");
+  yield* fs.remove(marker, { force: true }).pipe(Effect.ignoreCause({ log: true }));
   // Provider teardown and Stop both send TERM. Offbox needs this fact before any children are stopped.
-  return Effect.tryPromise(() =>
-    NodeFSP.writeFile(marker, JSON.stringify({ pid: process.pid, at: Date.now() / 1000 })),
-  ).pipe(Effect.ignoreCause({ log: true }));
+  const mark = Effect.gen(function* () {
+    const now = yield* Clock.currentTimeMillis;
+    const json = yield* encodeRestartMarker({ pid: process.pid, at: now / 1000 });
+    yield* fs.writeFileString(marker, json);
+  }).pipe(Effect.ignoreCause({ log: true }));
+  return mark;
 });
 
 export const shutdownWithinBudget = Effect.fn("serverRuntimeStartup.shutdownWithinBudget")(
