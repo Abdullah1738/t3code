@@ -73,18 +73,26 @@ def _atomic_write_text(path: Path, text: str) -> None:
 @toollog.observed("ssh", "ssh.setup", "ssh_setup")
 def setup(box_id: str) -> Path:
     """Authorize our key on the box's current machine and pin its host key. Needed after every create/resume/fork."""
+    from . import prepare
     ensure_dirs()
     last = None
     for attempt in range(8):
         try:
             r = api.sshkey(box_id, pubkey())
+            prepare.observe_outage()
             break
         except api.ApiError as e:
+            prepare.observe_outage(e)
             if not (e.api_code in ("machine_not_running", "sandbox_starting", "boat_starting", "ssh_host_key_unavailable")
                     or e.status in (409, 502, 503) or api.gateway_timeout(e)):
                 raise
             last = e
+        except api.BudgetExpired as error:
+            if last is not None and last.outage:
+                raise last from error
+            raise
         except OffboxError as e:
+            prepare.observe_outage(e)
             if not e.outage:
                 raise
             last = e
@@ -201,7 +209,9 @@ def ssh(box_id: str, command: str, input: bytes | None = None, timeout: float = 
 @toollog.observed("ssh", "ssh.readiness", "readiness")
 def wait_ssh(box_id: str, timeout: float = 90) -> None:
     left = api.left()
-    deadline = time.time() + (timeout if left is None else max(0, min(timeout, left)))
+    window = timeout if left is None else max(0, min(timeout, left))
+    client_limited = left is not None and left < timeout
+    deadline = time.time() + window
     err = ""
     while time.time() < deadline:
         try:
@@ -215,7 +225,15 @@ def wait_ssh(box_id: str, timeout: float = 90) -> None:
                 setup(box_id)
         except subprocess.TimeoutExpired:
             err = "timeout"
+        except common.SshHostKeyMismatch:
+            raise
+        except OffboxError as error:
+            if error.outage or not client_limited or time.time() < deadline:
+                raise
+            err = str(error)
         time.sleep(max(0, min(1, deadline - time.time())))
+    if client_limited:
+        raise api.BudgetExpired(f"ssh to {box_id} not ready within {window:g}s client budget: {err}")
     raise OffboxError(f"ssh to {box_id} not ready after {int(timeout)}s: {err}")
 
 

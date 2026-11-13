@@ -128,6 +128,23 @@ class NetworkError(OffboxError):
         super().__init__(message, outage=True)
 
 
+class BudgetExpired(OffboxError):
+    """A local readiness or request budget expired."""
+
+
+def client_budget_expired(error: OffboxError) -> bool:
+    # A wrapper may carry a real outage from an earlier attempt as well as the latest client timeout.
+    if error.outage:
+        return False
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, BudgetExpired):
+            return True
+        error = error.__cause__
+    return False
+
+
 class BoatAtCapacity(capacity.CapacityError):
     """boat cannot start a machine yet; no command has run."""
 
@@ -340,7 +357,7 @@ def _in_deadline(deadline: float | None, pause: float) -> bool:
 
 def _check_deadline(deadline: float, method: str, path: str) -> None:
     if time.time() >= deadline:
-        raise OffboxError(f"deadline passed before {method} {path}")
+        raise BudgetExpired(f"client deadline passed before {method} {path}")
 
 
 def _read_response(response, deadline):
@@ -492,7 +509,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             # Recomputed on every attempt: a slow failure plus the retry pause has used part of the budget.
             room = _DEADLINE - time.time()
             if room <= 0:
-                raise OffboxError(f"boat API budget spent before {method} {path}")
+                raise BudgetExpired(f"boat API budget spent before {method} {path}")
             req_timeout = min(timeout, max(1.0, room))
         if deadline is not None:
             _check_deadline(deadline, method, path)
@@ -516,14 +533,14 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             if room <= 0:
                 if request_id:
                     capacity.complete(request_id, "not_sent")
-                raise OffboxError(f"boat API budget spent before sending {method} {path}")
+                raise BudgetExpired(f"boat API budget spent before sending {method} {path}")
             req_timeout = min(timeout, max(1.0, room))
         if deadline is not None:
             room = deadline - time.time()
             if room <= 0:
                 if request_id:
                     capacity.complete(request_id, "not_sent")
-                raise OffboxError(f"deadline passed before sending {method} {path}")
+                raise BudgetExpired(f"deadline passed before sending {method} {path}")
             req_timeout = min(req_timeout, max(0.001, room))
         try:
             if scope is not None:
@@ -731,11 +748,21 @@ def get(box_id: str, *, deadline: float | None = None) -> dict | None:
 
 def readiness_get(box_id: str, *, deadline: float | None = None) -> dict | None:
     from . import home
+    caller_ends = [end for end in (_DEADLINE, deadline) if end is not None]
+    caller_end = min(caller_ends, default=None)
+    caller_left = None if caller_end is None else caller_end - time.time()
     if home.may_fail_over():
         end = time.time() + HOME_START_TIMEOUT_S
         deadline = end if deadline is None else min(end, deadline)
-        with RequestScope(max(.001, deadline - time.time()), parent=_REQUEST_SCOPE.get(), network_timeout=True).active():
-            return get(box_id, deadline=deadline)
+        client_limited = caller_end is not None and caller_end < end
+        try:
+            with RequestScope(max(.001, deadline - time.time()), parent=_REQUEST_SCOPE.get(), network_timeout=True).active():
+                return get(box_id, deadline=deadline)
+        except NetworkError as error:
+            if client_limited and time.time() >= caller_end:
+                raise BudgetExpired(f"{box_id} readiness check exhausted its client budget "
+                                    f"({caller_left:g}s remaining); nothing ran") from error
+            raise
     return get(box_id) if deadline is None else get(box_id, deadline=deadline)
 
 
@@ -849,7 +876,16 @@ def limits() -> dict:
 
 
 def sshkey(box_id: str, pubkey: str) -> dict:
-    return call("POST", f"/sandboxes/{box_id}/sshkey", {"key": pubkey}, retries=6)
+    timeout = 60
+    caller_end = _DEADLINE
+    client_limited = caller_end is not None and caller_end - time.time() < timeout
+    try:
+        return call("POST", f"/sandboxes/{box_id}/sshkey", {"key": pubkey}, timeout=timeout, retries=6)
+    except NetworkError as error:
+        # Re-authorizing the same key is repeatable, so a shorter caller cap is not outage evidence.
+        if client_limited and time.time() >= caller_end:
+            raise BudgetExpired(f"SSH key authorization for {box_id} exhausted its client budget") from error
+        raise
 
 
 def latest_snapshot(box_id: str) -> dict | None:
@@ -882,6 +918,8 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
     deadline = time.time() + timeout
     network_failures = 0
     while True:
+        if time.time() >= deadline:
+            raise BudgetExpired(f"box {box_id} did not become ready within {timeout:g}s; nothing ran")
         try:
             s = readiness_get(box_id)
         except NetworkError:
@@ -916,8 +954,9 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
         if on_state is not None:
             on_state(s)
         if time.time() > deadline:
-            raise OffboxError(f"box {box_id} stuck in {st} after {int(timeout)}s")
-        time.sleep(poll)
+            raise BudgetExpired(f"box {box_id} did not become ready within {timeout:g}s "
+                                f"(last state {st}); nothing ran")
+        time.sleep(min(poll, max(0, deadline - time.time())))
 
 
 # ---------------------------------------------------------------- commands

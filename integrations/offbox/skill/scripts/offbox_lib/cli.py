@@ -283,7 +283,7 @@ def _run_with_retries(a, me) -> int:
         if e.code not in (EXIT_INFRA, EXIT_CAP, EXIT_BUSY):
             say(str(e))
             return e.code
-        if e.code == EXIT_INFRA and not isinstance(e, capacity.CapacityError):
+        if e.code == EXIT_INFRA and not isinstance(e, capacity.CapacityError) and not api.client_budget_expired(e):
             fallback.note_infra_failure(str(e))
         if e.started:
             from .start_check import hint
