@@ -3,6 +3,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import {
@@ -111,6 +112,12 @@ export interface KanbanStoreShape {
   ) => Effect.Effect<void, KanbanStoreError>;
 
   readonly cards: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
+  readonly watchCardWrites: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<Set<KanbanCardId>, never, Scope.Scope>;
+  readonly dispatchCards: (
     boardId: KanbanBoardId,
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
   readonly openCards: (
@@ -335,6 +342,30 @@ const make = Effect.gen(function* () {
     defaultValue: () => ({}),
   });
 
+  // Observers exist only while a dispatch pass is alive; no card data or
+  // change history is retained between passes. Track raw store writers too.
+  const cardWatches = new Map<string, Set<Set<KanbanCardId>>>();
+  const watchCardWrites = Effect.fn("KanbanStore.watchCardWrites")((boardId: KanbanBoardId) =>
+    Effect.acquireRelease(
+      Effect.sync(() => {
+        const changed = new Set<KanbanCardId>();
+        let watches = cardWatches.get(boardId);
+        if (!watches) cardWatches.set(boardId, (watches = new Set()));
+        watches.add(changed);
+        return changed;
+      }),
+      (changed) =>
+        Effect.sync(() => {
+          const watches = cardWatches.get(boardId);
+          watches?.delete(changed);
+          if (watches?.size === 0) cardWatches.delete(boardId);
+        }),
+    ),
+  );
+  const cardWritten = (card: KanbanCard) => {
+    for (const changed of cardWatches.get(card.boardId) ?? []) changed.add(card.id);
+  };
+
   // One version per row, with JSON validity even across rollbacks/other writers.
   // Full collection reads reconcile deletions; subset reads never prune siblings.
   const cached = <R extends JsonRow, A, E>(
@@ -558,6 +589,22 @@ const make = Effect.gen(function* () {
         (rows) => decodeAll(rows, decoders.card),
       ),
     );
+  const dispatchCards = (boardId: KanbanBoardId) =>
+    runRead(
+      "read dispatch cards",
+      Effect.flatMap(
+        sql<KeyedJsonRow>`
+          SELECT id, board_id, json FROM ardud_kanban_cards
+          WHERE board_id = ${boardId} AND json_extract(json, '$.settledAt') IS NULL
+            AND (stage IN ('todo', 'working', 'needs_review', 'in_review')
+              OR json_extract(json, '$.wait') IS NOT NULL
+              OR json_extract(json, '$.deciding') IS NOT NULL
+              OR active_thread_id IS NOT NULL)
+          ORDER BY number
+        `,
+        (rows) => decodeAll(rows, decoders.card),
+      ),
+    );
   const feedCards: KanbanStoreShape["feedCards"] = (boardId, page) =>
     runRead(
       "read feed cards",
@@ -703,6 +750,7 @@ const make = Effect.gen(function* () {
             active_thread_id = excluded.active_thread_id,
             json = excluded.json
         `;
+        cardWritten(value);
       }),
     );
   const addCardEvent = (event: NewCardEvent) =>
@@ -842,6 +890,7 @@ const make = Effect.gen(function* () {
           for (const card of cards) {
             const json = yield* Card.encode(card);
             yield* sql`UPDATE ardud_kanban_cards SET json = ${json} WHERE id = ${card.id}`;
+            cardWritten(card);
           }
         }),
       ),
@@ -893,6 +942,7 @@ const make = Effect.gen(function* () {
               UPDATE ardud_kanban_cards SET json = ${json}, active_thread_id = ${card.activeThreadId}, stage = ${card.stage}
               WHERE id = ${card.id}
             `;
+            cardWritten(card);
           }
           for (const link of input.threadLinks) {
             const json = yield* ThreadLink.encode(link);
@@ -1279,6 +1329,8 @@ const make = Effect.gen(function* () {
     putBoardWithPools,
     cards,
     openCards,
+    dispatchCards,
+    watchCardWrites,
     summaryCards,
     feedCards,
     cardPage,

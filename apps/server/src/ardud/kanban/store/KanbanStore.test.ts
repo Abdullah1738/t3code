@@ -1326,3 +1326,111 @@ it.live(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   30_000,
 );
+
+it.effect(
+  "dispatch candidates use a partial index and retain waits, deciding and thread holders",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const wait = {
+        on: "time" as const,
+        pr: null,
+        card: null,
+        ask: null,
+        until: at,
+        sinceHead: null,
+        script: null,
+        args: null,
+        note: "Later",
+        by: { _tag: "owner" as const },
+        at,
+        wakeRole: null,
+        expiredAt: null,
+        status: null,
+        lastCheckedAt: null,
+        failures: 0,
+        problem: null,
+      };
+      const rows = [
+        card(1, "todo"),
+        card(2, "working"),
+        card(3, "needs_review"),
+        card(4, "in_review"),
+        { ...card(5, "completed"), wait },
+        { ...card(6, "deployed"), deciding: { since: at, why: "Wait ended", toldAt: null } },
+        { ...card(7, "needs_owner"), activeThreadId: ThreadId.make("still-held") },
+        card(8, "completed"),
+        card(9, "deployed"),
+        card(10, "verified"),
+        card(11, "needs_owner"),
+        { ...card(12, "todo"), settledAt: at },
+      ];
+      yield* Effect.forEach(rows, (row) => store.putCard(row), { discard: true });
+      const queries: string[] = [];
+      const observe: Statement.Transformer = (statement) => {
+        queries.push(statement.compile()[0]);
+        return Effect.succeed(statement);
+      };
+      assert.deepStrictEqual(
+        yield* store
+          .dispatchCards(boardId)
+          .pipe(Effect.provideService(Statement.CurrentTransformer, observe)),
+        rows.slice(0, 7),
+      );
+      const plan = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${queries[0]}`, [
+        boardId,
+      ]);
+      assert.isTrue(plan.some((row) => row.detail.includes("ardud_kanban_cards_dispatch")));
+      yield* store.putCard({ ...rows[7]!, stage: "todo" });
+      yield* store.putCard({ ...rows[0]!, stage: "verified" });
+      assert.deepStrictEqual(
+        (yield* store.dispatchCards(boardId)).map((row) => row.number),
+        [2, 3, 4, 5, 6, 7, 8],
+      );
+    }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect("card write watches cover raw and bulk writers and end with their pass", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const row = card(1, "todo");
+    const closed = yield* Effect.scoped(
+      Effect.gen(function* () {
+        const changed = yield* store.watchCardWrites(boardId);
+        yield* store.putCard(row);
+        assert.deepStrictEqual([...changed], [row.id]);
+        changed.clear();
+        yield* store.rekeyBoard(boardId, [], [{ ...row, title: "Rekeyed" }]);
+        assert.deepStrictEqual([...changed], [row.id]);
+        changed.clear();
+        yield* store.migrateBoardSelections({
+          board,
+          pools: [],
+          oldPoolKeys: [],
+          cards: [{ ...row, title: "Migrated" }],
+          threadLinks: [],
+        });
+        assert.deepStrictEqual([...changed], [row.id]);
+        changed.clear();
+        return changed;
+      }),
+    );
+    yield* store.putCard(row);
+    assert.strictEqual(closed.size, 0);
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const fresh = yield* store.watchCardWrites(boardId);
+        assert.strictEqual(fresh.size, 0);
+        yield* store.putCard({
+          ...row,
+          boardId: KanbanBoardId.make("another-board"),
+          id: KanbanCardId.make("another"),
+        });
+        assert.strictEqual(fresh.size, 0);
+        yield* store.putCard(row);
+        assert.deepStrictEqual([...fresh], [row.id]);
+      }),
+    );
+  }).pipe(Effect.provide(TestLayer)),
+);
