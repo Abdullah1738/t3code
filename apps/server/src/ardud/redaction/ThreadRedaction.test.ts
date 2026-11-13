@@ -35,6 +35,7 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as EventStore from "../../orchestration-v2/EventStore.ts";
 import * as Executor from "../../orchestration-v2/ThreadCommandExecutor.ts";
+import * as LegacyV1ThreadImporter from "../../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
 import * as ThreadRedaction from "./ThreadRedaction.ts";
 
 const filesystemFault = vi.hoisted(() => ({
@@ -157,6 +158,55 @@ it.effect(
         expect(other[0]!.text).toBe("untouched");
       }),
     ),
+);
+
+it.effect("scrubs retained V1 transcript rows and their imported V2 copies", () =>
+  run(
+    Effect.gen(function* () {
+      yield* seed;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id, project_id, title, model_selection_json, runtime_mode,
+          interaction_mode, created_at, updated_at
+        ) VALUES (
+          ${threadId}, 'fixture', 'Legacy thread',
+          '{"instanceId":"codex","model":"gpt-6.1-sol"}', 'full-access', 'default',
+          '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+        )
+      `;
+      const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter.pipe(
+        Effect.provide(LegacyV1ThreadImporter.layer),
+      );
+      yield* importer.reconcileShells;
+      yield* importer.ensureTranscript(threadId);
+      const copies = () =>
+        Effect.all([
+          sql`SELECT text FROM projection_thread_messages WHERE message_id = 'quote'`,
+          sql`SELECT payload_json FROM orchestration_v2_projection_messages WHERE message_id = 'quote'`,
+          sql`SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE turn_item_id = 'migration:v1:turn-item:quote'`,
+          sql`SELECT payload_json FROM orchestration_events WHERE event_id = 'migration:v1:message:quote'`,
+        ]);
+      const before = yield* copies();
+      for (const rows of before) {
+        expect(rows).toHaveLength(1);
+        expect(JSON.stringify(rows)).toContain(fake);
+      }
+      const service = yield* ThreadRedaction.ThreadRedaction;
+      const result = yield* service.redactItem({
+        threadId,
+        itemId: "call-fixture",
+        reason: "fixture",
+        compact: true,
+      });
+      expect(result.stores.every((store) => store.remainingAfter === 0)).toBe(true);
+      for (const rows of yield* copies()) {
+        expect(rows).toHaveLength(1);
+        expect(JSON.stringify(rows)).not.toContain(fake);
+        expect(JSON.stringify(rows)).toContain("[redacted ");
+      }
+    }),
+  ),
 );
 
 it.effect.each(["missing", "ambiguous", "running"])("refuses %s before any rewrite", (kind) =>
