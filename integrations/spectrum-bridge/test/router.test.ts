@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { MAX_INCOMING_BYTES, MAX_PREVIEW_BYTES } from "../src/inbound-files.ts";
 import { createApi } from "../src/api.ts";
 import type { ChatContext } from "../src/chats.ts";
-import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type RequestOptions, type SessionRecord, type SessionStatus, type SteerDelivery } from "../src/openchamber.ts";
+import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type RequestOptions, type SessionRecord, type SessionStatus, type SteerDelivery, type SteerGuard } from "../src/openchamber.ts";
 
 type Assistant = Extract<MessageRecord, { type: "assistant" }>;
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
@@ -332,13 +332,13 @@ test("creates only for a question, reuses a chat serially, and emits only final 
   expect(h.backend.reads).toContainEqual(["questions", "ses_1", "/Chats/ses_1"]);
 });
 
-type Steer = { id: string; messageId: string; text: string; guidance?: string };
+type Steer = { id: string; messageId: string; text: string; guidance?: string; files?: readonly FilePart[] };
 /** Gives the fake backend Robob's steer; `behavior` stands in for the server's answer. */
 function steering(backend: Backend, behavior?: (call: Steer) => Promise<SteerDelivery>) {
   const steers: Steer[] = [];
   Object.assign(backend, {
-    async steer(id: string, _directory: string, messageId: string, text: string, guidance?: string) {
-      const call = { id, messageId, text, guidance };
+    async steer(id: string, _directory: string, messageId: string, text: string, guidance?: string, files: readonly FilePart[] = []) {
+      const call = { id, messageId, text, guidance, ...(files.length ? { files } : {}) };
       steers.push(call);
       if (behavior) return behavior(call);
       if (!backend.records.some(m => m.id === messageId)) backend.records.push({ id: messageId, type: "user", text, time: { created: Date.now() } });
@@ -6601,7 +6601,8 @@ test.each(["running", "completed", "multi", "failed-foreground", "legacy-route-o
     ["Original answer", "first", original.id, 1], ["Follow-up answer", "followup", original.id, 1],
   ]);
   expect(h.backend.prompts).toHaveLength(1);
-  expect(steers).toHaveLength(1);
+  expect(new Set(steers.map(call => call.messageId))).toEqual(new Set([messageId("followup")]));
+  expect(h.backend.records.filter(record => record.type === "user" && record.id === messageId("followup"))).toHaveLength(1);
   if (kind === "multi") expect(inbounds(h.store).filter(row => ["followup", "member"].includes(row.id)).map(row => row.state)).toEqual(["done", "done"]);
 });
 
@@ -6636,7 +6637,8 @@ test("late accepted steer reply ownership survives closing and reopening the bri
     ["Original answer", "first"], ["Follow-up answer", "followup"],
   ]);
   expect(h.backend.prompts).toHaveLength(1);
-  expect(steers).toHaveLength(1);
+  expect(new Set(steers.map(call => call.messageId))).toEqual(new Set([messageId("followup")]));
+  expect(h.backend.records.filter(record => record.type === "user" && record.id === messageId("followup"))).toHaveLength(1);
 });
 
 
@@ -8862,4 +8864,367 @@ test.each((["succeeded", "failed", "interrupted"] as const).flatMap(previousOutc
   await h.router.tick();
   expect(h.controls().map(op => op.text)).toEqual(["The app restarted while I was on that one, so I may not have finished it. Mind sending it again?"]);
   expect(stages).not.toContain("reply-recovered-after-interrupt");
+});
+
+
+test("steering: a photo caption arriving during wake retry reaches that running turn with the photo", async () => {
+  setSystemTime(1_000_000);
+  const h = toolSetup();
+  const directory = mkdtempSync(join(tmpdir(), "bridge-steer-photo-"));
+  directories.push(directory);
+  h.backend.createBehavior = async () => ({ id: "ses_1", directory });
+  h.transport.downloadAttachment = async () => ({ data: tinyPng, mimeType: "image/png", name: "flights.png" });
+  const steers = steering(h.backend);
+  h.backend.promptBehavior = async call => {
+    if (h.backend.prompts.length === 1) throw new Error("unavailable");
+    h.input("photo", "Add these flights", { source: "typed", attachments: [attachment("image/png", tinyPng.length)] });
+    h.backend.accept(call);
+  };
+  h.input("wake:retry", wakeBody());
+  await h.router.tick();
+  setSystemTime(1_000_000 + ACCEPT_WAIT_MS);
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ inboundId: "wake:retry", phase: "running", attempt: 2 });
+  h.backend.states.ses_1 = { type: "busy" };
+  h.input("following", "Also check this", { source: "typed" });
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  expect(steers[0]).toMatchObject({ messageId: messageId("photo"), text: "Add these flights\nAlso check this", files: [{ type: "file", mime: "image/png" }] });
+  expect(steers[0]!.guidance).toContain("Incoming files:");
+  expect(h.backend.records.filter(r => r.id === messageId("photo"))).toHaveLength(1);
+  expect(inbounds(h.store).filter(r => ["photo", "following"].includes(r.id)).map(r => r.state)).toEqual(["done", "done"]);
+  expect(h.backend.prompts).toHaveLength(2);
+});
+
+test.each([false, true])("steering: uncertain acceptance is read before a blocked poll, landed=%s", async landed => {
+  setSystemTime(1_000_000);
+  const h = setup();
+  const steers = steering(h.backend, async call => {
+    if (landed || steers.length > 1) h.backend.accept({ ...call, directory: "/Chats/ses_1", files: [] });
+    if (steers.length === 1) throw new Error("lost response");
+    return "steered";
+  });
+  h.input("first", "Work"); await h.router.tick();
+  h.input("followup", "Also this"); await h.router.tick();
+  h.backend.singleReads = [];
+  const entered = Promise.withResolvers<void>();
+  const poll = Promise.withResolvers<MessageRecord[]>();
+  h.backend.messagesBehavior = async () => { entered.resolve(); return poll.promise; };
+  const ticking = h.router.tick();
+  await entered.promise;
+  const readBeforePoll = h.backend.singleReads.some(call => call[2] === messageId("followup"));
+  poll.resolve(h.backend.records);
+  await ticking;
+  expect(readBeforePoll).toBe(true);
+  expect(steers.map(s => s.messageId)).toEqual(Array(landed ? 1 : 2).fill(messageId("followup")));
+  expect(h.backend.records.filter(r => r.id === messageId("followup"))).toHaveLength(1);
+  expect(inbounds(h.store).find(r => r.id === "followup")?.state).toBe("done");
+});
+
+
+test.each([
+  { reason: "backend", patch: {} },
+  { reason: "phase-unknown", patch: { phase: "unknown" } },
+  { reason: "background", patch: { background: true } },
+  { reason: "request-turn", patch: { origin: "request" } },
+  { reason: "missing-inbound", patch: { inboundId: undefined } },
+  { reason: "synthetic", patch: { inboundId: "reset:1" } },
+  { reason: "final-mode-wake", patch: { inboundId: "wake:test" } },
+  { reason: "pending-question", patch: {} },
+])("steering: a blocked row logs $reason once across ticks", async ({ reason, patch }) => {
+  setSystemTime(1_000_000);
+  const logs: string[] = [];
+  const h = setup(":memory:", { log: (event, code) => logs.push(`${event} ${code}`) });
+  if (reason !== "backend") steering(h.backend);
+  h.input("first", "Work"); await h.router.tick();
+  h.store.set("activeTurn", { ...h.store.get<object>("activeTurn"), ...patch });
+  if (reason === "pending-question") h.store.set("pendingApprovals", [{ sessionId: "ses_1", generation: 1, state: "pending" }]);
+  if (reason === "phase-unknown") h.backend.single = false;
+  // An unavailable poll must not hide why this already-known turn cannot take the row.
+  h.backend.messagesBehavior = async () => { throw new Error("read unavailable"); };
+  h.input("blocked", "Follow up");
+  await h.router.tick(); await h.router.tick();
+  expect(logs.filter(line => line.startsWith("steer-skip"))).toEqual([`steer-skip id=blocked reason=${reason}`]);
+  expect(inbounds(h.store).find(row => row.id === "blocked")?.state).toBe("pending");
+});
+
+test("steering: an unavailable acceptance read never permits a resend", async () => {
+  const logs: string[] = [];
+  const h = setup(":memory:", { log: (event, code) => logs.push(`${event} ${code}`) });
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Work"); await h.router.tick();
+  h.input("followup", "Also this"); await h.router.tick();
+  h.backend.promptAccepted = async () => { throw new Error("unknown acceptance"); };
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("processing");
+  expect(logs).toContain("steer-readback-unknown id=followup");
+});
+
+
+test.each(["refusal-backoff", "group-wake", "detached"])("steering: logs %s once without changing its queue", async reason => {
+  setSystemTime(1_000_000);
+  const logs: string[] = [];
+  const h = toolSetup({ log: (event, code) => logs.push(`${event} ${code}`) });
+  const steers = steering(h.backend, async () => "refused");
+  h.input("first", "Work"); await h.router.tick();
+  if (reason === "refusal-backoff") {
+    h.input("refused", "Follow up"); await h.router.tick();
+    await h.router.tick(); await h.router.tick();
+    expect(steers).toHaveLength(1);
+    expect(logs.filter(l => l.startsWith("steer-skip"))).toEqual(["steer-skip id=refused reason=refusal-backoff"]);
+    return;
+  }
+  if (reason === "group-wake") {
+    const context: ChatContext = {
+      chat: { key: "group:test", slug: "group", kind: "group", title: "Group" },
+      typing: () => false, react: async () => {}, roleOf: () => ({ role: "admin", name: "Owner" }),
+    };
+    h.routerOptions.context = context;
+    h.routerOptions.chatGuid = context.chat.key;
+    h.store.set("activeTurn", { ...h.store.get<object>("activeTurn"), inboundId: "wake:test" });
+    h.store.set("group-gate:blocked", "explicit");
+  }
+  h.input("blocked", "Follow up");
+  if (reason === "detached") {
+    const row = h.store.pendingInbound().find(r => r.id === "blocked")!;
+    h.store.updateInbound(row.id, "pending", { ...row.payload as object, detached: true });
+  }
+  const router = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  h.backend.messagesBehavior = async () => { throw new Error("unavailable"); };
+  await router.tick(); await router.tick();
+  expect(logs.filter(l => l.startsWith("steer-skip"))).toEqual([`steer-skip id=blocked reason=${reason}`]);
+  expect(inbounds(h.store).find(r => r.id === "blocked")?.state).toBe("pending");
+});
+
+
+test.each([false, true])("steering: photo uncertainty survives router restart with the same sealed image, landed=%s", async landed => {
+  const h = toolSetup();
+  const directory = mkdtempSync(join(tmpdir(), "bridge-steer-retry-")); directories.push(directory);
+  h.backend.createBehavior = async () => ({ id: "ses_1", directory });
+  h.transport.downloadAttachment = async () => ({ data: tinyPng, mimeType: "image/png", name: "flights.png" });
+  const steers = steering(h.backend, async call => {
+    if (landed || steers.length > 1) h.backend.accept({ ...call, directory, files: call.files ?? [] });
+    if (steers.length === 1) throw new Error("lost response");
+    return "steered";
+  });
+  h.input("first", "Work"); await h.router.tick();
+  h.input("photo", "These flights", { attachments: [attachment("image/png", tinyPng.length)] });
+  await h.router.tick();
+  h.transport.downloadAttachment = async () => { throw new Error("must use sealed files"); };
+  const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  await restarted.tick();
+  expect(steers).toHaveLength(landed ? 1 : 2);
+  expect(steers[0]!.files).toHaveLength(1);
+  if (!landed) expect(steers[1]).toEqual(steers[0]);
+  expect(h.backend.records.filter(r => r.id === messageId("photo"))).toHaveLength(1);
+  expect(inbounds(h.store).find(r => r.id === "photo")?.state).toBe("done");
+});
+
+
+test.each([
+  { shape: "text", text: "Follow up", file: false, caption: true },
+  { shape: "photo caption", text: "These flights", file: true, caption: true },
+  { shape: "photo only", text: "", file: true, caption: false },
+])("steering: new $shape reaches the active backend before a blocked poll", async ({ text, file, caption }) => {
+  const h = toolSetup();
+  const directory = mkdtempSync(join(tmpdir(), "bridge-steer-before-poll-")); directories.push(directory);
+  h.backend.createBehavior = async () => ({ id: "ses_1", directory });
+  h.transport.downloadAttachment = async () => ({ data: tinyPng, mimeType: "image/png", name: "flight.png" });
+  const steers = steering(h.backend);
+  h.input("first", "Work"); await h.router.tick();
+  h.backend.states.ses_1 = { type: "busy" };
+  h.input("followup", text, { attachments: file ? [attachment("image/png", tinyPng.length)] : [] });
+  const entered = Promise.withResolvers<void>(), poll = Promise.withResolvers<MessageRecord[]>();
+  h.backend.messagesBehavior = async () => { entered.resolve(); return poll.promise; };
+  const ticking = h.router.tick(); await entered.promise;
+  const admitted = steers.slice();
+  poll.resolve(h.backend.records); await ticking;
+  expect(admitted).toHaveLength(1);
+  if (caption) expect(admitted[0]!.text).toBe(text);
+  expect(admitted[0]!.files?.length ?? 0).toBe(file ? 1 : 0);
+  expect(inbounds(h.store).find(r => r.id === "followup")?.state).toBe("done");
+});
+
+test("steering: a newly opened question blocks pre-poll dispatch", async () => {
+  const logs: string[] = [];
+  const h = setup(":memory:", { log: (event, code) => logs.push(`${event} ${code}`) });
+  const steers = steering(h.backend);
+  h.input("first", "Work"); await h.router.tick();
+  h.backend.states.ses_1 = { type: "busy" };
+  h.backend.questionRequests = [question()];
+  h.input("followup", "Another task");
+  h.backend.messagesBehavior = async () => { throw new Error("history unavailable"); };
+  await h.router.tick();
+  expect(steers).toHaveLength(0);
+  expect(asked(h.store)).toHaveLength(1);
+  expect(h.backend.questionReplies).toHaveLength(0);
+  expect(inbounds(h.store).find(r => r.id === "followup")?.state).toBe("pending");
+  expect(logs).toContain("steer-skip id=followup reason=pending-question");
+});
+
+test("steering: terminal file preparation failure never tracks a nonexistent prompt", async () => {
+  const h = setup(); const steers = steering(h.backend);
+  h.input("first", "Work"); await h.router.tick();
+  h.transport.downloadAttachment = async () => { throw new TransportError("invalidAttachment"); };
+  h.input("photo", "These flights", { attachments: [attachment()] });
+  await h.router.tick();
+  expect(steers).toHaveLength(0);
+  expect(h.store.get<{ steered?: string[] }>("activeTurn")?.steered ?? []).toEqual([]);
+  expect(h.store.get("steer-attempt:photo")).toBeUndefined();
+  h.backend.final("Original answer"); await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Original answer"]);
+});
+
+test("steering: fallback reuses a sealed large file without a second download", async () => {
+  const h = setup();
+  const directory = mkdtempSync(join(tmpdir(), "bridge-steer-large-fallback-")); directories.push(directory);
+  h.backend.createBehavior = async () => ({ id: "ses_1", directory });
+  let downloads = 0;
+  const bytes = new Uint8Array(20 * 1024 * 1024 + 1);
+  h.transport.downloadAttachment = async () => {
+    if (++downloads > 1) throw new TransportError("invalidAttachment");
+    return { data: bytes, mimeType: "application/octet-stream", name: "large.bin" };
+  };
+  const steers = steering(h.backend, async () => { if (steers.length === 1) throw new Error("lost response"); return "refused"; });
+  h.input("first", "Work"); await h.router.tick();
+  h.input("file", "Use this file", { attachments: [attachment("application/octet-stream", bytes.length)] });
+  await h.router.tick();
+  h.backend.final("Original answer");
+  await h.router.tick(); await h.router.tick();
+  const fallback = h.backend.prompts.find(p => p.messageId === messageId("file"));
+  expect(fallback?.text).toBe("Use this file");
+  expect(fallback?.system).toContain("Incoming files:");
+  expect(fallback?.system).toContain("large.bin");
+  expect(downloads).toBe(1);
+  expect(h.backend.records.filter(r => r.id === messageId("file"))).toHaveLength(1);
+});
+
+
+test.each(["root", "child"].flatMap(who => ["download", "transcription"].map(stage => ({ who, stage }))))("steering: a $who question opened during $stage blocks file admission", async ({ who, stage }) => {
+  const entered = Promise.withResolvers<void>();
+  const downloaded = Promise.withResolvers<{ data: Uint8Array; mimeType: string; name: string }>();
+  const transcript = Promise.withResolvers<string>();
+  const h = setup(":memory:", { transcribe: async () => { entered.resolve(); return transcript.promise; } });
+  const directory = mkdtempSync(join(tmpdir(), "bridge-steer-file-question-")); directories.push(directory);
+  h.backend.createBehavior = async () => ({ id: "ses_1", directory });
+  h.backend.childSessions = [{ id: "ses_child", directory, parentID: "ses_1", time: { created: Date.now(), updated: Date.now() } }];
+  const steers = steering(h.backend);
+  h.input("first", "Work"); await h.router.tick();
+  h.backend.states = { ses_1: { type: "busy" }, ses_child: { type: "busy", root: "ses_1" } };
+  h.transport.downloadAttachment = async () => {
+    if (stage === "download") { entered.resolve(); return downloaded.promise; }
+    return { data: new Uint8Array([1, 2, 3]), mimeType: "audio/mp4", name: "voice.m4a" };
+  };
+  h.input("file", "Follow up", { isAudioMessage: stage === "transcription", attachments: [attachment(stage === "download" ? "image/png" : "audio/mp4")] });
+  const ticking = h.router.tick(); await entered.promise;
+  h.backend.questionRequests = [{ ...question(), sessionID: who === "root" ? "ses_1" : "ses_child" }];
+  downloaded.resolve({ data: tinyPng, mimeType: "image/png", name: "flight.png" });
+  transcript.resolve("Follow up by voice");
+  await ticking;
+  expect(steers).toHaveLength(0);
+  expect(h.backend.questionReplies).toHaveLength(0);
+  expect(asked(h.store)).toHaveLength(1);
+  expect(inbounds(h.store).find(row => row.id === "file")?.state).toBe("pending");
+  expect(h.store.get("steer-attempt:file")).toBeUndefined();
+});
+
+
+test("steering: a retained poll scan cannot hide a question opened during file preparation", async () => {
+  const h = setup();
+  const directory = mkdtempSync(join(tmpdir(), "bridge-steer-stale-scan-")); directories.push(directory);
+  h.backend.createBehavior = async () => ({ id: "ses_1", directory });
+  h.backend.childSessions = [{ id: "ses_child", directory, parentID: "ses_1", time: { created: Date.now(), updated: Date.now() } }];
+  const steers = steering(h.backend);
+  h.input("first", "Work"); await h.router.tick();
+  h.backend.states = { ses_1: { type: "busy" }, ses_child: { type: "busy", root: "ses_1" } };
+  const children = Promise.withResolvers<SessionRecord[]>();
+  h.backend.children = async () => children.promise;
+  await h.router.tick();
+  const entered = Promise.withResolvers<void>();
+  const downloaded = Promise.withResolvers<{ data: Uint8Array; mimeType: string; name: string }>();
+  h.transport.downloadAttachment = async () => { entered.resolve(); return downloaded.promise; };
+  h.input("photo", "Follow up", { attachments: [attachment()] });
+  const ticking = h.router.tick(); await entered.promise;
+  h.backend.questionRequests = [question()];
+  children.resolve(h.backend.childSessions);
+  downloaded.resolve({ data: tinyPng, mimeType: "image/png", name: "flight.png" });
+  await ticking;
+  expect(steers).toHaveLength(0);
+  expect(asked(h.store)).toHaveLength(1);
+  expect(inbounds(h.store).find(row => row.id === "photo")?.state).toBe("pending");
+});
+
+
+test("steering: upload admission deferral does not spend the backend refusal cooldown", async () => {
+  const h = setup(); let posts = 0, calls = 0;
+  Object.assign(h.backend, { async steer(_id: string, _directory: string, id: string, text: string, _guidance: string, _files: readonly FilePart[], guard: SteerGuard) {
+    if (++calls === 1) h.backend.questionRequests = [question()];
+    if (!await guard.beforeSend()) return "refused";
+    posts++;
+    h.backend.records.push({ id, type: "user", text, time: { created: Date.now() } });
+    return "steered";
+  } });
+  h.input("first", "Work"); await h.router.tick();
+  h.input("followup", "Follow up"); await h.router.tick();
+  expect(posts).toBe(0);
+  h.backend.questionRequests = [];
+  await h.router.tick();
+  expect(posts).toBe(1);
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("done");
+});
+
+
+test("steering: Sendblue admission discovers a child created during upload despite the poll cache", async () => {
+  const context: ChatContext = { chat: { key: "dm:+15555550123", slug: "owner", kind: "owner", title: "Owner" },
+    typing: () => false, react: async () => {}, roleOf: () => ({ role: "admin", name: "Owner" }) };
+  const h = setup(":memory:", { context, chatGuid: context.chat.key });
+  const directory = mkdtempSync(join(tmpdir(), "bridge-steer-cached-family-")); directories.push(directory);
+  h.backend.createBehavior = async () => ({ id: "ses_1", directory });
+  h.transport.downloadAttachment = async () => ({ data: tinyPng, mimeType: "image/png", name: "flight.png" });
+  Object.assign(h.backend, { sessionBusy: async () => true });
+  let posts = 0;
+  Object.assign(h.backend, { async steer(_id: string, _dir: string, _prompt: string, _text: string, _guidance: string, files: readonly FilePart[], guard: SteerGuard) {
+    expect(files).toHaveLength(1);
+    h.backend.childSessions = [{ id: "ses_child", directory, parentID: "ses_1", time: { created: Date.now(), updated: Date.now() } }];
+    h.backend.states = { ses_1: { type: "busy" }, ses_child: { type: "busy", root: "ses_1" } };
+    h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
+    if (!await guard.beforeSend()) return "refused";
+    posts++; return "steered";
+  } });
+  h.input("first", "Work"); await h.router.tick();
+  h.backend.states = { ses_1: { type: "busy" } };
+  await h.router.tick();
+  h.input("photo", "Follow up", { attachments: [attachment()] });
+  await h.router.tick();
+  expect(posts).toBe(0);
+  expect(asked(h.store)).toHaveLength(1);
+  expect(inbounds(h.store).find(row => row.id === "photo")?.state).toBe("pending");
+});
+
+
+test.each(["permissions", "questions"])("steering: unknown child %s prevents admission", async missing => {
+  const h = setup(); const steers = steering(h.backend);
+  h.input("first", "Work"); await h.router.tick();
+  h.backend.states = { ses_1: { type: "busy" }, ses_child: { type: "busy", root: "ses_1" } };
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
+  Object.assign(h.backend, { [missing]: async (id: string) => id === "ses_child" ? undefined : [] });
+  h.input("followup", "Follow up"); await h.router.tick();
+  expect(steers).toHaveLength(0);
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("pending");
+});
+
+
+test.each(["expired", "answered"])("steering: a live backend question overrides cached %s state for admission", async state => {
+  const h = setup(); const steers = steering(h.backend);
+  h.input("first", "Work"); await h.router.tick();
+  h.backend.questionRequests = [question()];
+  await h.router.tick();
+  const pending = h.store.get<Array<{ state: string }>>("pendingApprovals")!;
+  h.store.set("pendingApprovals", pending.map(entry => ({ ...entry, state })));
+  h.backend.messagesBehavior = async () => { throw new Error("history unavailable"); };
+  h.input("followup", "Follow up"); await h.router.tick();
+  expect(steers).toHaveLength(0);
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("pending");
 });

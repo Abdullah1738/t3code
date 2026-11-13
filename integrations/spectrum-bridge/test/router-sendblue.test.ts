@@ -1607,7 +1607,8 @@ test.each(["dm", "group"] as const)("late accepted steer in %s forwards its own 
   expect(h.store.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([
     ["Original answer", "first"], ["Follow-up answer", "followup"],
   ]);
-  expect(steers).toHaveLength(1);
+  expect(new Set(steers.map(call => call.messageId))).toEqual(new Set([original.messageId]));
+  expect(h.backend.records.filter(record => record.type === "user" && record.id === original.messageId)).toHaveLength(1);
   expect(h.backend.prompts).toHaveLength(1);
 });
 
