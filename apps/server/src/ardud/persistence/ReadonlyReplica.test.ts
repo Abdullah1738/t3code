@@ -1,3 +1,4 @@
+import { ErrorObserver, sqliteErrorDetails } from "@t3tools/shared/nodeSqliteErrors";
 // @effect-diagnostics nodeBuiltinImport:off globalDate:off - fixtures drive real worker threads and native SQLite.
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -275,4 +276,26 @@ it.live("the packaged worker advances a replica stranded by a volume remount", (
       Date.parse(String(first.updated_at)),
     );
   }).pipe(Effect.scoped),
+);
+
+it.live.each(["primary", "replica"] as const)(
+  "forwards raw %s exporter errors through supervision",
+  (role) => {
+    const observations: unknown[] = [];
+    const factory = `() => { throw Object.assign(new Error("bad database"), {errcode:26, errstr:"file is not a database", sqliteFile:"/isolated/${role}.sqlite", sqliteRole:"${role}", sqliteOperation:"prepare"}); }`;
+    return Effect.exit(
+      superviseExportWorker(() => evalWorker(exportWorkerSource(factory)).worker, fast),
+    ).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          assert.equal(observations.length, 1);
+          const details = sqliteErrorDetails(observations[0]);
+          assert.equal(details?.errcode, 26);
+          assert.equal(details?.context?.role, role);
+          assert.equal(details?.context?.file, `/isolated/${role}.sqlite`);
+        }),
+      ),
+      Effect.provideService(ErrorObserver, (cause) => observations.push(cause)),
+    );
+  },
 );

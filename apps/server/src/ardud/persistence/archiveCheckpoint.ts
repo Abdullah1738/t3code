@@ -1,3 +1,4 @@
+import { annotateSqliteError, ErrorObserver } from "@t3tools/shared/nodeSqliteErrors";
 // Worker lifecycle is the native boundary; SQL work stays off the event loop.
 // @effect-diagnostics nodeBuiltinImport:off
 import * as Context from "effect/Context";
@@ -36,6 +37,7 @@ let archive;
 parentPort.on('message', ({ id, operation }) => {
   let main;
   let ok = false;
+  let failure;
   try {
     const db = operation === 'flush-main'
       ? (main = new DatabaseSync(workerData.filename))
@@ -43,12 +45,13 @@ parentPort.on('message', ({ id, operation }) => {
     db.exec('PRAGMA busy_timeout=0; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON;');
     const result = db.prepare('PRAGMA main.wal_checkpoint(PASSIVE)').get();
     ok = result.busy === 0 && result.log >= 0 && result.checkpointed === result.log;
-  } catch {
+  } catch (error) {
+    failure = { errcode: error && error.errcode, errstr: error && error.errstr, code: error && error.code };
     ok = false;
   } finally {
     try { main?.close(); } catch { ok = false; }
   }
-  parentPort.postMessage({ id, ok });
+  parentPort.postMessage({ id, ok, failure, file: operation === "flush-main" ? workerData.filename : workerData.archiveFilename });
 });`;
 
 /** A reader holding an older archive snapshot only blocks the barrier briefly. */
@@ -62,6 +65,7 @@ export const archiveCheckpointLayer = (filename: string) =>
   Layer.effect(
     HistoryArchiveDurability,
     Effect.gen(function* () {
+      const observer = yield* ErrorObserver;
       const clock = yield* Clock.Clock;
       const now = () => clock.currentTimeMillisUnsafe();
       // One operation at a time; a barrier waits for an in-flight periodic checkpoint
@@ -114,14 +118,34 @@ export const archiveCheckpointLayer = (filename: string) =>
                   waiting?.complete(false);
                   instance.unref();
                 };
-                instance.on("message", (result: { readonly id: number; readonly ok: boolean }) => {
-                  if (worker !== instance || pending?.id !== result.id) return;
-                  const waiting = pending;
-                  pending = undefined;
-                  retryDelay = 1000;
-                  instance.unref();
-                  waiting.complete(result.ok === true);
-                });
+                instance.on(
+                  "message",
+                  (result: {
+                    readonly id: number;
+                    readonly ok: boolean;
+                    readonly failure?: unknown;
+                    readonly file: string;
+                  }) => {
+                    if (worker !== instance || pending?.id !== result.id) return;
+                    if (result.failure)
+                      annotateSqliteError(
+                        result.failure,
+                        {
+                          file: result.file,
+                          role: "primary",
+                          connection: "archive-checkpoint",
+                          operation: "checkpoint",
+                          span: "HistoryArchiveDurability.checkpoint",
+                        },
+                        observer,
+                      );
+                    const waiting = pending;
+                    pending = undefined;
+                    retryDelay = 1000;
+                    instance.unref();
+                    waiting.complete(result.ok === true);
+                  },
+                );
                 instance.on("error", failed);
                 instance.on("exit", failed);
                 instance.unref();

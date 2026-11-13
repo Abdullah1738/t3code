@@ -87,7 +87,10 @@ export async function checkLive(commit, { health, repo = DEFAULT_REPO }) {
   } catch {
     return { commit, buildCommit: null, live: null, reason: "health unavailable" };
   }
-  if (response?.ok !== true || response?.status !== "healthy") {
+  if (
+    response?.ok !== true ||
+    !["healthy", "degraded", "recovered-unverified"].includes(response?.status)
+  ) {
     return { commit, buildCommit: null, live: null, reason: "invalid health response" };
   }
   const buildCommit = response.buildCommit;

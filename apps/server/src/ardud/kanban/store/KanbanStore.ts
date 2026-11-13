@@ -1,3 +1,4 @@
+import { reportSqliteError } from "@t3tools/shared/nodeSqliteErrors";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -276,8 +277,10 @@ export const actorKey = (actor: KanbanActor): string => {
 
 const make = Effect.gen(function* () {
   const sql = yield* BoardsDatabase.client;
-  const fail = (operation: string) => (cause: unknown) =>
-    new KanbanStoreError({ operation, cause });
+  const fail = (operation: string) => (cause: unknown) => {
+    reportSqliteError(cause, `KanbanStore.${operation}`);
+    return new KanbanStoreError({ operation, cause });
+  };
 
   yield* BoardsDatabase.initialize(
     Effect.forEach(kanbanDDL, (statement) => sql.unsafe(statement), { discard: true }),
