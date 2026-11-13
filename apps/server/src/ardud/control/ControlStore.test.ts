@@ -237,7 +237,17 @@ describe("ControlStore native ids", () => {
           status: "pending",
           created_at: "2026-01-01T00:00:00.000Z",
           resolved_at: null,
-          payload_json: "{}",
+          payload_json: JSON.stringify({
+            id: "request-reader",
+            nodeId: "node",
+            providerTurnId: null,
+            nativeRequestRef: null,
+            kind: "user_input",
+            status: "pending",
+            responseCapability: { type: "message" },
+            createdAt: "2026-01-01T00:00:00.000Z",
+            resolvedAt: null,
+          }),
         })}`;
 
         const held = yield* Deferred.make<void>();
@@ -257,6 +267,7 @@ describe("ControlStore native ids", () => {
           active: store.threadIdForNativeSession("claude-moved-uuid", "claudeAgent"),
           live: store.liveThreadIds(),
           pending: store.pendingRequestThreadIds(),
+          records: store.pendingRequestRecords(["t-detached"]),
         }).pipe(Effect.timeout("5 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
         yield* Fiber.join(writer);
         assert.strictEqual(result.origin, "imessage");
@@ -271,6 +282,9 @@ describe("ControlStore native ids", () => {
         assert.strictEqual(result.active, "t-moved");
         assert.deepStrictEqual([...result.live].sort(), ["t-detached", "t-moved"]);
         assert.deepStrictEqual(result.pending, ["t-detached"]);
+        assert.lengthOf(result.records, 1);
+        assert.strictEqual(result.records[0]?.request.id, "request-reader");
+        assert.isNull(result.records[0]?.item);
 
         yield* sql.withTransaction(
           Effect.gen(function* () {

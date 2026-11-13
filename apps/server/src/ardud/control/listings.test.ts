@@ -134,7 +134,17 @@ const seedRows = Effect.gen(function* () {
         status,
         created_at: "2026-01-01T00:05:00.000Z",
         resolved_at: null,
-        payload_json: "{}",
+        payload_json: JSON.stringify({
+          id: requestId,
+          nodeId: "node",
+          providerTurnId: null,
+          nativeRequestRef: null,
+          kind: "user_input",
+          status,
+          responseCapability: { type: "message" },
+          createdAt: "2026-01-01T00:05:00.000Z",
+          resolvedAt: null,
+        }),
       })}
     `;
   yield* run("live-running", 1, "completed");
@@ -255,6 +265,7 @@ const makeHarness = (
     // Targeted (threadIds) shell reads and one-thread shell reads, counted apart.
     const targetedReads = yield* Ref.make<Array<ReadonlyArray<string>>>([]);
     const shellReads = yield* Ref.make(0);
+    const recordReads = yield* Ref.make(0);
     const config = yield* ServerConfig.ServerConfig.pipe(
       Effect.provide(
         ServerConfig.layerTest(process.cwd(), { prefix: "t3-control-listings" }).pipe(
@@ -284,15 +295,20 @@ const makeHarness = (
         );
       },
       getThreadShell: (threadId) =>
-        Ref.update(shellReads, (count) => count + 1).pipe(
-          Effect.as(
-            vanished.has(threadId)
-              ? null
-              : ([...shells, ...extraShells].find((candidate) => candidate.id === threadId) ??
-                  null),
+        sql
+          .withTransaction(sql`SELECT 1`)
+          .pipe(
+            Effect.orDie,
+            Effect.andThen(Ref.update(shellReads, (count) => count + 1)),
+            Effect.as(
+              vanished.has(threadId)
+                ? null
+                : ([...shells, ...extraShells].find((candidate) => candidate.id === threadId) ??
+                    null),
+            ),
           ),
-        ),
-      getThreadRecords: (threadId) => Effect.succeed(projectionFor(threadId)),
+      getThreadRecords: (threadId) =>
+        Ref.update(recordReads, (n) => n + 1).pipe(Effect.as(projectionFor(threadId))),
     });
     const diagnostics = yield* Effect.serviceOption(DatabaseDiagnostics.DatabaseDiagnostics);
     const web = yield* Effect.acquireRelease(
@@ -396,7 +412,16 @@ const makeHarness = (
             .toSorted();
         }),
       );
-    return { get, threadIds, snapshotReads, targetedReads, shellReads, startupLog, sql };
+    return {
+      get,
+      threadIds,
+      snapshotReads,
+      targetedReads,
+      shellReads,
+      recordReads,
+      startupLog,
+      sql,
+    };
   });
 
 type Harness = Effect.Success<ReturnType<typeof makeHarness>>;
@@ -503,7 +528,7 @@ describe("control listings", () => {
       }
     }),
   );
-  it.live("lists projects from the reader while the writer is held", () =>
+  it.live("lists projects and pending requests from the reader while the writer is held", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -525,11 +550,17 @@ describe("control listings", () => {
           ),
         );
         yield* Deferred.await(held);
-        const response = yield* harness
-          .get("/projects")
-          .pipe(Effect.timeout("5 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
+        const [response, requests] = yield* Effect.all([
+          harness.get("/projects"),
+          harness.get("/requests"),
+        ]).pipe(Effect.timeout("5 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
         yield* Fiber.join(writer);
         assert.strictEqual(response.status, 200);
+        assert.strictEqual(requests.status, 200);
+        assert.deepEqual(
+          requests.body.requests.map((row: { requestId: string }) => row.requestId),
+          ["request-waiting"],
+        );
         assert.deepStrictEqual(response.body.projects, [
           {
             projectId: "reader-project",
@@ -928,6 +959,171 @@ describe("control listings", () => {
         assert.strictEqual(yield* Ref.get(snapshotReads), 0);
       }),
     ),
+  );
+
+  it.effect(
+    "keeps pending request details, order and inherited origin without reading history",
+    () =>
+      run(
+        ({ get, sql, recordReads }) =>
+          Effect.gen(function* () {
+            const at = "2026-01-01T00:01:00.000Z";
+            for (const [threadId, id, kind, status] of [
+              ["asks-second", "approval", "command", "pending"],
+              ["asks-second", "question", "user_input", "pending"],
+              ["asks-child", "child", "user_input", "pending"],
+              ["asks-second", "answered", "user_input", "resolved"],
+              ["asks-deleted", "deleted", "user_input", "pending"],
+              ["asks-vanished", "vanished", "user_input", "pending"],
+              ["quiet", "stale", "user_input", "pending"],
+            ]) {
+              yield* sql`INSERT INTO orchestration_v2_projection_runtime_requests ${sql.insert({
+                runtime_request_id: id,
+                thread_id: threadId,
+                node_id: `node:${id}`,
+                provider_turn_id: null,
+                kind,
+                status,
+                created_at: at,
+                resolved_at: null,
+                payload_json: JSON.stringify({
+                  id,
+                  nodeId: `node:${id}`,
+                  providerTurnId: null,
+                  nativeRequestRef: null,
+                  kind,
+                  status,
+                  createdAt: at,
+                  resolvedAt: null,
+                  responseCapability: { type: "message" },
+                }),
+              })}`;
+            }
+            yield* sql`INSERT INTO ardud_thread_origin VALUES ('asks-second', 'imessage', ${at})`;
+            for (const [threadId, requestId, type, ordinal, title] of [
+              ["asks-second", "approval", "approval_request", 4, "Allow command"],
+              ["asks-second", "approval", "approval_request", 8, "Later duplicate"],
+              ["asks-second", "question", "user_input_request", 5, "Choose"],
+              ["asks-second", "answered", "user_input_request", 1, "Answered"],
+            ] as const) {
+              const id = `item:${requestId}:${ordinal}`;
+              yield* sql`INSERT INTO orchestration_v2_projection_turn_items ${sql.insert({
+                turn_item_id: id,
+                thread_id: threadId,
+                node_id: `node:${requestId}`,
+                ordinal,
+                type,
+                status: "pending",
+                updated_at: at,
+                payload_json: JSON.stringify({
+                  id,
+                  threadId,
+                  nodeId: `node:${requestId}`,
+                  runId: null,
+                  providerThreadId: null,
+                  providerTurnId: null,
+                  nativeItemRef: null,
+                  parentItemId: null,
+                  ordinal,
+                  type,
+                  status: "pending",
+                  title,
+                  startedAt: null,
+                  completedAt: null,
+                  updatedAt: at,
+                  requestId,
+                  ...(type === "approval_request"
+                    ? { requestKind: "command", prompt: "pwd" }
+                    : { questions: [] }),
+                }),
+              })}`;
+            }
+            // Pending details can still be in the cold store after an offline split.
+            yield* sql`INSERT INTO ardud_archive.ardud_turn_items
+        (turn_item_id, thread_id, run_id, node_id, provider_thread_id,
+         provider_turn_id, parent_item_id, ordinal, type, status, updated_at, payload_json)
+        SELECT turn_item_id, thread_id, run_id, node_id, provider_thread_id,
+          provider_turn_id, parent_item_id, ordinal, type, status, updated_at, payload_json
+        FROM orchestration_v2_projection_turn_items
+        WHERE turn_item_id = 'item:question:5'`;
+            yield* sql`DELETE FROM orchestration_v2_projection_turn_items WHERE turn_item_id = 'item:question:5'`;
+            const early = { status: "pending", createdAt: at, canRespond: true };
+            const named = [
+              {
+                threadId: "asks-child",
+                title: "asks-child",
+                origin: "imessage",
+                rootThreadId: "asks-second",
+                requestId: "child",
+                kind: "question",
+                requestKind: "user_input",
+                ...early,
+              },
+              {
+                threadId: "asks-second",
+                title: "Allow command",
+                origin: "imessage",
+                rootThreadId: "asks-second",
+                requestId: "approval",
+                kind: "approval",
+                requestKind: "command",
+                ...early,
+                prompt: "pwd",
+                options: null,
+              },
+              {
+                threadId: "asks-second",
+                title: "Choose",
+                origin: "imessage",
+                rootThreadId: "asks-second",
+                requestId: "question",
+                kind: "question",
+                requestKind: "user_input",
+                ...early,
+                questions: [],
+              },
+            ];
+            const none = [
+              {
+                threadId: "asks-waiting",
+                title: "asks-waiting",
+                origin: null,
+                rootThreadId: "asks-waiting",
+                requestId: "request-waiting",
+                kind: "question",
+                requestKind: "user_input",
+                status: "pending",
+                createdAt: "2026-01-01T00:05:00.000Z",
+                canRespond: true,
+              },
+            ];
+            for (const [suffix, expected] of [
+              ["", [...named, ...none]],
+              ["?origin=none", none],
+              ["?origin=imessage", named],
+              ["?origin=watcher", []],
+            ] as const) {
+              const response = yield* get(`/requests${suffix}`);
+              assert.equal(response.status, 200);
+              assert.deepEqual(response.body, { ok: true, requests: expected });
+            }
+            assert.equal(yield* Ref.get(recordReads), 0);
+          }),
+        undefined,
+        [
+          shell("asks-second", { ...idle, ...waiting("approval") }),
+          shell("asks-child", {
+            ...idle,
+            ...waiting("child"),
+            lineage: {
+              parentThreadId: ThreadId.make("asks-second"),
+              rootThreadId: ThreadId.make("asks-second"),
+              relationshipToParent: "subagent",
+            },
+          }),
+          shell("asks-deleted", { ...idle, ...waiting("deleted"), deletedAt: askedAt }),
+        ],
+      ),
   );
 
   it.effect("lists a migrated thread under its current native id, not the old ses_", () =>
