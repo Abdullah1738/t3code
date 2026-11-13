@@ -1662,7 +1662,7 @@ describe("OrchestratorMcpService provider resolution", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.effect.each(["none", "rejected"] as const)(
+  it.effect.each(["none", "rejected", "read_error"] as const)(
     "a %s receipt does not report a rejected delegation as saved",
     (receipt) =>
       Effect.gen(function* () {
@@ -1680,6 +1680,22 @@ describe("OrchestratorMcpService provider resolution", () => {
               Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
             getThreadRecords: () => Effect.succeed(parentProjection([])),
             hasReceipt: () => Effect.succeed(receipt === "rejected"),
+            getCommandReceipt: (commandId) =>
+              receipt === "read_error"
+                ? Effect.fail(new CommandReceiptStore.CommandReceiptStoreReadError({ commandId }))
+                : Effect.succeed(
+                    receipt === "none"
+                      ? Option.none()
+                      : Option.some({
+                          commandId,
+                          threadId: parentThreadId,
+                          commandType: "delegated_task.request",
+                          acceptedAt: DateTime.makeUnsafe("2026-11-13T00:00:00.000Z"),
+                          resultSequence: 1,
+                          status: "rejected" as const,
+                          error: "Rejected",
+                        }),
+                  ),
             dispatch: (command) =>
               Effect.fail(
                 receipt === "rejected"
@@ -1718,6 +1734,11 @@ describe("OrchestratorMcpService provider resolution", () => {
             .pipe(Effect.flip);
           assert.equal(error.code, "orchestration_error");
           assert.isFalse(state.saved);
+          assert.isDefined(state.delegation);
+          assert.equal(
+            yield* state.delegation!.readCommitted,
+            receipt === "read_error" ? "unknown" : receipt === "rejected",
+          );
         }).pipe(
           Effect.provideService(McpCall, state),
           Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))),
