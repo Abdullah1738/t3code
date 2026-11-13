@@ -573,8 +573,8 @@ export function createReadonlyReplica(
         return changes;
       }
     };
-    // Match recall_core.py's cached state snapshot, including row existence.
-    // Subagent edges are read directly during traversal, not cached here.
+    // Match recall_core.py's cached identities and live subagent traversal.
+    // Early publications must fence final verification even before events export.
     const lineageStatements = new Map([
       [
         "orchestration_v2_projection_threads",
@@ -586,6 +586,12 @@ export function createReadonlyReplica(
         "orchestration_v2_projection_provider_threads",
         out.prepare(
           "SELECT json_array(provider_thread_id,thread_id,json_extract(payload_json,'$.nativeThreadRef.nativeId')) AS identity FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id=?",
+        ),
+      ],
+      [
+        "orchestration_v2_projection_subagents",
+        out.prepare(
+          "SELECT json_array(subagent_id,thread_id,child_thread_id,json_extract(payload_json,'$.nativeTaskRef.nativeId')) AS identity FROM orchestration_v2_projection_subagents WHERE subagent_id=?",
         ),
       ],
     ]);

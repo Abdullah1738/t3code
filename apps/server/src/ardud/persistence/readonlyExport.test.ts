@@ -26,7 +26,7 @@ function fixture(batchSize = 2) {
     CREATE TABLE orchestration_v2_projection_run_attempts (attempt_id TEXT PRIMARY KEY, payload_json TEXT);
     CREATE TABLE orchestration_v2_projection_provider_threads (provider_thread_id TEXT PRIMARY KEY, payload_json TEXT, thread_id TEXT);
     CREATE TABLE orchestration_v2_projection_provider_turns (provider_turn_id TEXT PRIMARY KEY, payload_json TEXT);
-    CREATE TABLE orchestration_v2_projection_subagents (subagent_id TEXT PRIMARY KEY, payload_json TEXT);
+    CREATE TABLE orchestration_v2_projection_subagents (subagent_id TEXT PRIMARY KEY, payload_json TEXT, thread_id TEXT, child_thread_id TEXT);
     CREATE TABLE orchestration_v2_projection_messages (message_id TEXT PRIMARY KEY, payload_json TEXT);
     CREATE TABLE orchestration_v2_projection_turn_items (turn_item_id TEXT PRIMARY KEY, type TEXT, payload_json TEXT, thread_id TEXT DEFAULT 'a', ordinal INTEGER DEFAULT 0);
     CREATE INDEX items_thread ON orchestration_v2_projection_turn_items(thread_id,ordinal,turn_item_id);
@@ -1224,7 +1224,7 @@ test.each(["reconcile", "identity"] as const)(
     let now = Date.parse("2026-11-13T12:00:00Z");
     vi.spyOn(Date, "now").mockImplementation(() => now);
     f.source.exec(`INSERT INTO orchestration_v2_projection_provider_threads VALUES ('pt','{}','a');
-      INSERT INTO orchestration_v2_projection_subagents VALUES ('sa','{}');`);
+      INSERT INTO orchestration_v2_projection_subagents(subagent_id,payload_json) VALUES ('sa','{}');`);
     f.finish();
     const out = f.connect();
     const revision = metaValue(out, "lineage_repair_revision");
@@ -1240,6 +1240,7 @@ test.each(["reconcile", "identity"] as const)(
         {
           lineage: { parentThreadId: null, rootThreadId: null },
           nativeThreadRef: { nativeId: null },
+          nativeTaskRef: { nativeId: null },
         },
       ]) {
         const json = JSON.stringify(payload);
@@ -1402,6 +1403,7 @@ test.each(lineageRepairs)(
 test.each([
   { table: "threads", key: "thread_id" },
   { table: "provider_threads", key: "provider_thread_id" },
+  { table: "subagents", key: "subagent_id" },
 ])("$table insertion, key replacement and deletion invalidate lineage", ({ table, key }) => {
   const f = fixture(100);
   let now = Date.parse("2026-11-13T12:00:00Z");
@@ -1424,7 +1426,11 @@ test.each([
   f.source
     .prepare("INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES (?,?,?)")
     .run(
-      table === "threads" ? "thread.created" : "provider-thread.updated",
+      table === "threads"
+        ? "thread.created"
+        : table === "subagents"
+          ? "subagent.updated"
+          : "provider-thread.updated",
       "replacement",
       '{"id":"replacement"}',
     );
@@ -1442,13 +1448,129 @@ test.each([
   expect(metaValue(out, "lineage_repair_watermark")).toBe(metaValue(out, "updated_at"));
 });
 
+const subagentRepairs = [
+  { name: "parent added", before: "thread_id=NULL", after: "thread_id='c'" },
+  { name: "parent changed", before: "thread_id='a'", after: "thread_id='c'" },
+  { name: "parent removed", before: "thread_id='a'", after: "thread_id=NULL" },
+  { name: "child added", before: "child_thread_id=NULL", after: "child_thread_id='c'" },
+  { name: "child changed", before: "child_thread_id='b'", after: "child_thread_id='c'" },
+  { name: "child removed", before: "child_thread_id='b'", after: "child_thread_id=NULL" },
+  {
+    name: "native task added",
+    before: `payload_json='{}'`,
+    after: `payload_json='{"nativeTaskRef":{"nativeId":"new-task"}}'`,
+  },
+  {
+    name: "native task changed",
+    before: `payload_json='{"nativeTaskRef":{"nativeId":"old-task"}}'`,
+    after: `payload_json='{"nativeTaskRef":{"nativeId":"new-task"}}'`,
+  },
+  {
+    name: "native task removed",
+    before: `payload_json='{"nativeTaskRef":{"nativeId":"old-task"}}'`,
+    after: `payload_json='{"nativeTaskRef":{"nativeId":null}}'`,
+  },
+];
+
+test.each(subagentRepairs)(
+  "subagent $name fences lineage on both publication paths",
+  ({ before, after }) => {
+    for (const path of ["reconcile", "identity"]) {
+      const f = fixture(100);
+      let now = Date.parse("2026-11-13T12:00:00Z");
+      vi.spyOn(Date, "now").mockImplementation(() => now);
+      f.source.exec(`INSERT INTO orchestration_v2_projection_subagents VALUES ('sa','{}','a','b');
+      UPDATE orchestration_v2_projection_subagents SET ${before} WHERE subagent_id='sa'`);
+      f.finish();
+      const out = f.connect();
+      const revision = Number(metaValue(out, "lineage_repair_revision"));
+      const sequence = metaValue(out, "sequence");
+      f.source.exec(
+        `UPDATE orchestration_v2_projection_subagents SET ${after} WHERE subagent_id='sa'`,
+      );
+      if (path === "identity") {
+        f.source.exec(
+          `INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('subagent.updated','a','{"id":"sa"}')`,
+        );
+        now += 1_000;
+        f.exporter.pollIdentities();
+        expect(metaValue(out, "sequence")).toBe(sequence);
+      } else {
+        for (let i = 0; i < 18; i++) f.finish();
+      }
+      expect(
+        out
+          .prepare(
+            "SELECT subagent_id,thread_id,child_thread_id,payload_json FROM orchestration_v2_projection_subagents WHERE subagent_id='sa'",
+          )
+          .get(),
+      ).toEqual(
+        f.source
+          .prepare(
+            "SELECT subagent_id,thread_id,child_thread_id,payload_json FROM orchestration_v2_projection_subagents WHERE subagent_id='sa'",
+          )
+          .get(),
+      );
+      expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + 1);
+      expect(metaValue(out, "lineage_repair_watermark")).toBe(metaValue(out, "updated_at"));
+      for (let i = 0; i < 18; i++) f.finish();
+      expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + 1);
+    }
+  },
+);
+
+test("a subagent publication between traversal and verification fences stale native aliases", () => {
+  const f = fixture(100);
+  let now = Date.parse("2026-11-13T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.source.exec(
+    `INSERT INTO orchestration_v2_projection_subagents VALUES ('sa','{"nativeTaskRef":{"nativeId":"old-task"}}','a','b')`,
+  );
+  f.finish();
+  const traversal = f.connect();
+  const verification = f.connect();
+  const task = (db: NodeSqlite.DatabaseSync) =>
+    db
+      .prepare(
+        "SELECT json_extract(payload_json,'$.nativeTaskRef.nativeId') AS task FROM orchestration_v2_projection_subagents WHERE thread_id='a'",
+      )
+      .get()?.task;
+  traversal.exec("BEGIN");
+  const revision = Number(metaValue(traversal, "lineage_repair_revision"));
+  const sequence = metaValue(traversal, "sequence");
+  const watermark = metaValue(traversal, "updated_at");
+  expect(task(traversal)).toBe("old-task");
+  f.source
+    .exec(`UPDATE orchestration_v2_projection_subagents SET payload_json='{"nativeTaskRef":{"nativeId":"new-task"}}' WHERE subagent_id='sa';
+    INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('subagent.updated','a','{"id":"sa","threadId":"a","childThreadId":"b","nativeTaskRef":{"nativeId":"new-task"}}')`);
+  now += 1_000;
+  f.exporter.pollIdentities();
+  // Final verification uses a fresh snapshot, while traversal still sees old aliases.
+  expect(task(traversal)).toBe("old-task");
+  expect(task(verification)).toBe("new-task");
+  expect(metaValue(verification, "sequence")).toBe(sequence);
+  expect(metaValue(verification, "updated_at")).toBe(watermark);
+  expect(Number(metaValue(verification, "lineage_repair_revision"))).toBe(revision + 1);
+  expect(metaValue(verification, "lineage_repair_watermark")).toBe(watermark);
+  traversal.exec("ROLLBACK");
+  expect(task(traversal)).toBe("new-task");
+
+  // Copying a status update with the same identity must not invalidate the retry.
+  f.source
+    .exec(`UPDATE orchestration_v2_projection_subagents SET payload_json='{"nativeTaskRef":{"nativeId":"new-task"},"status":"completed","updatedAt":"2026-11-13T12:00:02Z"}' WHERE subagent_id='sa';
+    INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('subagent.updated','a','{"id":"sa"}')`);
+  now += 1_000;
+  f.exporter.pollIdentities();
+  expect(Number(metaValue(verification, "lineage_repair_revision"))).toBe(revision + 1);
+  expect(task(verification)).toBe("new-task");
+  expect(metaValue(verification, "sequence")).toBe(sequence);
+});
+
 test("identity hydration fences repaired thread lineage but ignores thread and subagent status", () => {
   const f = fixture(100);
   let now = Date.parse("2026-11-13T12:00:00Z");
   vi.spyOn(Date, "now").mockImplementation(() => now);
-  f.source.exec(`ALTER TABLE orchestration_v2_projection_subagents ADD COLUMN thread_id TEXT;
-    ALTER TABLE orchestration_v2_projection_subagents ADD COLUMN child_thread_id TEXT;
-    INSERT INTO orchestration_v2_projection_subagents VALUES ('sa','{}','a','b');`);
+  f.source.exec("INSERT INTO orchestration_v2_projection_subagents VALUES ('sa','{}','a','b')");
   f.restart();
   f.finish();
   const out = f.connect();
@@ -1494,7 +1616,7 @@ test("identity publishes within one second during a long auxiliary sweep without
   f.exporter.step();
   f.source.exec(`INSERT INTO orchestration_v2_projection_threads VALUES ('child','{}');
     INSERT INTO orchestration_v2_projection_provider_threads(provider_thread_id,payload_json) VALUES ('binding','{}');
-    INSERT INTO orchestration_v2_projection_subagents VALUES ('delegate','{}');`);
+    INSERT INTO orchestration_v2_projection_subagents(subagent_id,payload_json) VALUES ('delegate','{}');`);
   now += 1_000;
   expect(f.exporter.step()).toBe(true);
   for (const [table, key, id] of [
@@ -1650,9 +1772,7 @@ test("a binding page resolves child lineage by primary key ahead of a full threa
   const f = fixture(1);
   let now = Date.parse("2026-11-13T12:00:00Z");
   vi.spyOn(Date, "now").mockImplementation(() => now);
-  f.source.exec(`ALTER TABLE orchestration_v2_projection_threads ADD COLUMN created_at TEXT;
-    ALTER TABLE orchestration_v2_projection_subagents ADD COLUMN thread_id TEXT;
-    ALTER TABLE orchestration_v2_projection_subagents ADD COLUMN child_thread_id TEXT;`);
+  f.source.exec("ALTER TABLE orchestration_v2_projection_threads ADD COLUMN created_at TEXT");
   f.restart();
   f.finish();
   f.exporter.pollIdentities();
@@ -1841,7 +1961,7 @@ test("upgrading a published replica catches identities committed before the new 
   writer.close();
   f.source.exec(`INSERT INTO orchestration_v2_projection_threads VALUES ('child','{}');
     INSERT INTO orchestration_v2_projection_provider_threads(provider_thread_id,payload_json) VALUES ('binding','{}');
-    INSERT INTO orchestration_v2_projection_subagents VALUES ('delegate','{}');
+    INSERT INTO orchestration_v2_projection_subagents(subagent_id,payload_json) VALUES ('delegate','{}');
     INSERT INTO orchestration_events VALUES (2,'thread.created','child','{"id":"child"}');
     INSERT INTO orchestration_events VALUES (3,'provider-thread.updated','child','{"id":"binding"}');
     INSERT INTO orchestration_events VALUES (4,'subagent.updated','a','{"id":"delegate"}');`);
