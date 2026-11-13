@@ -1,11 +1,35 @@
 /**
- * Preview image for a static app card: the page's own og:image. Sendblue only takes a public
- * https image that answers directly (no redirects), so anything else is left out and the card
- * keeps just its captions.
+ * Sendblue fetches a static card's image outside the tailnet. Read it here and use the existing
+ * media upload, so the page can stay private and the provider never receives an unreachable image URL.
  */
+import { LineError, type LineFile } from "./line.ts";
+
 const TIMEOUT_MS = 5_000;
 const MAX_HTML = 512 * 1024;
-const IMAGE_TYPES = /^image\/(?:jpeg|png|heic|heif|webp)\b/i;
+const MAX_IMAGE = 10 * 1024 * 1024;
+const IMAGE_EXTENSIONS: Record<string, string> = {
+  "image/jpeg": "jpg", "image/png": "png", "image/heic": "heic", "image/heif": "heif", "image/webp": "webp",
+};
+
+async function boundedBody(response: Response, limit: number): Promise<Uint8Array | undefined> {
+  if (!response.body) return undefined;
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) return undefined;
+      chunks.push(value);
+    }
+    return size ? new Uint8Array(Buffer.concat(chunks)) : undefined;
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
 
 function httpsUrl(value: string, base?: string): URL | undefined {
   try {
@@ -28,19 +52,31 @@ export function ogImageOf(html: string, pageUrl: string): string | undefined {
   return undefined;
 }
 
-export function cardPreviewImage(fetchFn: typeof fetch = fetch) {
+export function cardPreviewImage(upload: (file: LineFile) => Promise<string>, fetchFn: typeof fetch = fetch) {
   return async (pageUrl: string): Promise<string | undefined> => {
-    if (!httpsUrl(pageUrl)) return undefined;
+    if (!httpsUrl(pageUrl)) throw new LineError("Card preview is unavailable", "card_preview_unavailable", true, false);
     try {
       const page = await fetchFn(pageUrl, { redirect: "follow", signal: AbortSignal.timeout(TIMEOUT_MS) });
-      if (!page.ok || !/text\/html/i.test(page.headers.get("content-type") ?? "")) return undefined;
-      const html = (await page.text()).slice(0, MAX_HTML);
-      const image = ogImageOf(html, page.url || pageUrl);
+      if (!page.ok || !/text\/html/i.test(page.headers.get("content-type") ?? "")) {
+        await page.body?.cancel();
+        throw new Error("invalid preview page");
+      }
+      const html = await boundedBody(page, MAX_HTML);
+      if (!html) throw new Error("invalid preview page");
+      const image = ogImageOf(new TextDecoder().decode(html), page.url || pageUrl);
       if (!image) return undefined;
-      const head = await fetchFn(image, { method: "HEAD", redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
-      return head.status === 200 && IMAGE_TYPES.test(head.headers.get("content-type") ?? "") ? image : undefined;
+      const response = await fetchFn(image, { redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
+      const mimeType = (response.headers.get("content-type") ?? "").split(";", 1)[0]!.trim().toLowerCase();
+      const extension = Object.hasOwn(IMAGE_EXTENSIONS, mimeType) ? IMAGE_EXTENSIONS[mimeType] : undefined;
+      if (response.status !== 200 || !extension) { await response.body?.cancel(); throw new Error("invalid preview image"); }
+      const data = await boundedBody(response, MAX_IMAGE);
+      if (!data) throw new Error("invalid preview image");
+      const uploaded = await upload({ data, name: `preview.${extension}`, mimeType });
+      const result = httpsUrl(uploaded);
+      if (!result) throw new Error("invalid preview upload");
+      return result.href;
     } catch {
-      return undefined;
+      throw new LineError("Card preview is unavailable", "card_preview_unavailable", true, false);
     }
   };
 }

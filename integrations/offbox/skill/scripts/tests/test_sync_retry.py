@@ -38,6 +38,9 @@ class SyncRetryTests(unittest.TestCase):
         self.setup = self.stack.enter_context(patch.object(ssh_sync, 'setup'))
         self.state = self.stack.enter_context(patch.object(api, 'get', return_value={'state': 'ready'}))
         self.log = self.stack.enter_context(patch.object(ssh_sync, 'log'))
+        self.stack.enter_context(patch.object(ssh_sync, "_watch_rsync", side_effect=self.watch_local))
+        self.stack.enter_context(patch.object(ssh_sync, "_progress_args", return_value=()))
+
         clock = self.stack.enter_context(patch.object(ssh_sync, 'time', wraps=ssh_sync.time))
         self.sleep = clock.sleep
         self.sleep.return_value = None
@@ -50,6 +53,10 @@ class SyncRetryTests(unittest.TestCase):
 
     def write_endpoint(self, host, port):
         self.config.write_text(f'Host testbox\n  HostName {host}\n  Port {port}\n')
+
+    def watch_local(self, cmd, timeout, input=None, **kwargs):
+        return subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape",
+                              timeout=timeout, input=input)
 
     def run_local(self, cmd, **kwargs):
         if cmd[0] == ssh_sync.RSYNC:

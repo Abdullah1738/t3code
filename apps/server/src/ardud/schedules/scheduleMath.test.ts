@@ -1,3 +1,4 @@
+import { allowsLateRun, lateRunDeadline } from "./scheduleMath.ts";
 import { describe, expect, it } from "@effect/vitest";
 import type { ScheduledTaskSchedule } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -96,10 +97,10 @@ describe("one-time schedules", () => {
     expect(next(once, "2026-10-06T00:00:00.000Z")).toBeNull();
   });
 
-  it("fires a late run within an hour, but expires after that", () => {
+  it("fires a late run within 24 hours, but expires after that", () => {
     const due = at("2026-10-05T08:55:00.000Z");
     expect(isExpiredOnceRun(once, due, at("2026-10-05T09:50:00.000Z"))).toBe(false);
-    expect(isExpiredOnceRun(once, due, at("2026-10-05T09:56:00.000Z"))).toBe(true);
+    expect(isExpiredOnceRun(once, due, at("2026-10-06T08:56:00.000Z"))).toBe(true);
     expect(isMissedFixedTimeRun(once, due, at("2026-10-05T09:56:00.000Z"))).toBe(false);
   });
 
@@ -130,5 +131,37 @@ describe("fixed-time schedules with a time zone", () => {
   it("treats a zone change as a schedule change", () => {
     const base = { type: "fixed_time", timeOfDay: "09:00" } as const;
     expect(isSameSchedule(base, { ...base, timeZone: "UTC" })).toBe(false);
+  });
+});
+
+describe("late run policy", () => {
+  it.each([
+    [{ type: "interval", everyMs: 3_600_000 }, false],
+    [{ type: "interval", everyMs: 86_400_000 }, true],
+    [{ type: "fixed_time", timeOfDay: "00:00" }, true],
+    [{ type: "cron", expression: "0 * * * *", timeZone: "UTC" }, false],
+    [{ type: "cron", expression: "0 0,12 * * *", timeZone: "UTC" }, false],
+    [{ type: "cron", expression: "0 0 * * *", timeZone: "UTC" }, true],
+    [{ type: "cron", expression: "0 0 * * 1", timeZone: "UTC" }, true],
+    [{ type: "once", at: "2026-11-09T20:00:00Z" }, true],
+    [{ type: "webhook", signature: null }, false],
+  ] as const)("classifies %j", (schedule, expected) =>
+    expect(allowsLateRun(schedule)).toBe(expected),
+  );
+
+  it.each([
+    ["2026-11-09T20:00:00Z", "2026-11-10T08:00:00.000Z"],
+    ["2026-11-09T19:00:00Z", "2026-11-10T02:00:00.000Z"],
+  ])("uses the earlier of twelve hours and next-day 06:00 for %s", (slot, expected) => {
+    expect(
+      DateTime.formatIso(
+        DateTime.makeUnsafe(
+          lateRunDeadline(
+            { type: "fixed_time", timeOfDay: "00:00", timeZone: "Asia/Dubai" },
+            at(slot),
+          ),
+        ),
+      ),
+    ).toBe(expected);
   });
 });

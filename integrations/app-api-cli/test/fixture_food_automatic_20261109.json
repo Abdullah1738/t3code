@@ -1,0 +1,14 @@
+{
+  "orderStatusCode": "accepted",
+  "outletStatusCode": "accepted",
+  "orderTotal": 172.8,
+  "orderPaymentAmount": 172.8,
+  "orderWalletAmount": 0.0,
+  "paymentProcessedAt": "2026-11-09T17:48:56",
+  "paymentRequireCvv": null,
+  "paymentRequireCompletion": null,
+  "prepaidPaymentMethodCode": "cc_noonpay",
+  "payment_client_secret_present": false,
+  "automatic_capture": true,
+  "card_last4": "9546"
+}

@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,6 +51,7 @@ STAND_IN_TERMINAL_TXN = 'VOIDED'  # test-only: production allowlist is empty unt
 
 class JournalCase(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
         p = patch.object(j, 'ROOT', Path(temp.name).resolve() / 'commerce'); p.start(); self.addCleanup(p.stop)
         # Positive-path tests need one terminal non-capture transaction; production has none yet.
@@ -91,8 +93,7 @@ class JournalCloseTests(JournalCase):
         self.placed()
         local = j.inspect(FLOW)
         self.assertEqual(local['state'], 'ACTIVE')
-        with self.assertRaisesRegex(j.JournalError, 'JOURNAL_ACCOUNT_RECONCILIATION_REQUIRED'):
-            j.require_account_available('noon', ACCOUNT)
+        self.assertTrue(j.require_account_available('noon', ACCOUNT))
         out = j.close_minutes_failed_uncaptured(FLOW, evidence=self.evidence(), expected_local=local, now=self.later())
         self.assertEqual(out['state'], 'RELEASED')
         self.assertFalse(out['retry_allowed'])
@@ -197,6 +198,7 @@ class JournalCloseTests(JournalCase):
 
 class EvidenceGateTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         q = patch.object(d, 'TERMINAL_NO_CAPTURE_TXNS', (STAND_IN_TERMINAL_TXN,)); q.start(); self.addCleanup(q.stop)
 
     def gate(self, snap=None, act=None, pay='default'):

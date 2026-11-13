@@ -44,6 +44,11 @@ export function useKanbanPermission(tag: KanbanRequestTag): boolean {
   return useAtomValue(permission);
 }
 
+export function useKanbanPermissionStatus(tag: KanbanRequestTag) {
+  const status = useMemo(() => kanbanClient().permissionStatus(tag), [tag]);
+  return useAtomValue(status);
+}
+
 const NONE: SnapshotStore<never> = {
   get: () => undefined,
   subscribe: () => () => {},

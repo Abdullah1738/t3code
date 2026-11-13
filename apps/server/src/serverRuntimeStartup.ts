@@ -1,5 +1,5 @@
 import { captureOwnedTree, cleanupOwnedTree } from "@t3tools/shared/ownedProcessTree";
-import { shutdownWithinBudget } from "./ardud/fast-install/shutdown.ts";
+import { restartMarker, shutdownWithinBudget } from "./ardud/fast-install/shutdown.ts";
 import { markInstallLifecycle } from "./ardud/fast-install/report.ts";
 import {
   CommandId,
@@ -483,9 +483,11 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
   const earlyWorker = yield* EffectWorker.OrchestrationEffectWorkerV2;
   const startupScope = yield* Effect.scope;
   const effectWorkerFiber = yield* Ref.make<Fiber.Fiber<void, never> | null>(null);
+  const markRestarting = yield* restartMarker(serverConfig.stateDir);
 
   yield* Effect.addFinalizer(() =>
     Effect.gen(function* () {
+      yield* markRestarting;
       yield* commandGate.failCommandReady(
         new ServerRuntimeStartupError({
           mode: serverConfig.mode,

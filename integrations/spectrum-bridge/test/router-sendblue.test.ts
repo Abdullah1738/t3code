@@ -57,7 +57,7 @@ function context(kind: ChatInfo["kind"], over: Partial<ChatContext> = {}) {
   return ctx;
 }
 
-function setup(ctx: ReturnType<typeof context>, overrides: { quietMs?: number; getMessage?: (guid: string) => Promise<unknown>; groupJudge?: GroupJudge; log?: (event: string, code?: string) => void; swipes?: { find: Swipes; line: string; waitMs?: number }; rotateAfterMs?: number } = {}) {
+function setup(ctx: ReturnType<typeof context>, overrides: { quietMs?: number; getMessage?: (guid: string) => Promise<unknown>; groupJudge?: GroupJudge; log?: (event: string, code?: string) => void; swipes?: { find: Swipes; line: string; waitMs?: number }; rotateAfterMs?: number; notifyFailure?: (text: string, key: string) => Promise<boolean> } = {}) {
   const store = new Store(":memory:");
   stores.push(store);
   const backend = new Recorder();
@@ -350,7 +350,8 @@ test("typing starts when a batch is taken, before the prompt, refreshes every 20
 });
 
 test("a slow thread list never sits between a text and its prompt or a finished run and its reply", async () => {
-  setSystemTime(Date.parse("2026-10-21T12:00:00Z"));
+  const start = Date.parse("2026-10-21T12:00:00Z");
+  setSystemTime(start);
   const h = live(context("owner"));
   let lists = 0;
   let release!: (statuses: Record<string, never>) => void;
@@ -371,8 +372,10 @@ test("a slow thread list never sits between a text and its prompt or a finished 
   expect(h.backend.prompts).toHaveLength(2);
   expect(lists).toBe(1);
   expect(h.logs.filter(([event]) => !event.startsWith("typing"))).toEqual([
-    ["batch-sealed", "owner a"], ["prompt-accepted", "owner a"], ["run-completed-seen", "owner a"], ["reply-enqueued", "owner a"],
-    ["batch-sealed", "owner b"], ["prompt-accepted", "owner b"],
+    ["batch-sealed", "owner a"],
+    ["inbound-latency", `id=a receivedAt=${new Date(start).toISOString()} deliveredAt=${new Date(start).toISOString()} ms=0`], ["prompt-accepted", "owner a"], ["run-completed-seen", "owner a"], ["reply-enqueued", "owner a"],
+    ["batch-sealed", "owner b"],
+    ["inbound-latency", `id=b receivedAt=${new Date(start).toISOString()} deliveredAt=${new Date(start).toISOString()} ms=0`], ["prompt-accepted", "owner b"],
   ]);
   release({});
   await list;
@@ -1587,4 +1590,51 @@ test.each(["dm", "group"].flatMap(kind => [false, true].map(modelError => ({ kin
   expect(h.store.db.query<{ state: string }, []>("SELECT state FROM inbound WHERE id IN ('second', 'second-member')").all().map(row => row.state)).toEqual(["done", "done"]);
   expect(h.backend.prompts).toHaveLength(1);
   expect(new Set(steers.map(call => call.messageId)).size).toBe(2);
+});
+
+test.each([
+  ["owner", "owner", "typed", "person", true], ["dm", "moni", "typed", "person", true],
+  ["dm", "guest", "typed", "person", false], ["group", "home", "typed", "person", false],
+  ["owner", "owner", undefined, "wake:normal", false], ["owner", "owner", "composed", "system:normal", false],
+] as const)("failed-inbound pages only owner/Moni typed rows (%s, %s, %s)", async (kind, slug, source, id, expected) => {
+  const ctx = context(kind); ctx.chat.slug = slug;
+  const alerts: string[] = [];
+  const h = setup(ctx, { notifyFailure: async text => { alerts.push(text); return true; } });
+  const start = Date.parse("2026-11-10T06:05:18Z"); setSystemTime(start);
+  h.input(id, "Please stop", "+15555550123", { source }); h.store.updateInbound(id, "failed");
+  setSystemTime(start + 119_000); await h.router.checkFailedInbound(); await h.router.tick(); expect(alerts).toEqual([]);
+  setSystemTime(start + 150_000); await h.router.checkFailedInbound(); await h.router.tick();
+  setSystemTime(start + 180_000); await h.router.checkFailedInbound(); await h.router.tick();
+  expect(alerts).toHaveLength(expected ? 1 : 0);
+  if (expected) expect(alerts[0]).toContain(slug === "moni" ? "Moni" : "Abdullah");
+});
+
+test("failed money/security wake escalates its actual first two lines without replaying side effects", async () => {
+  const alerts: string[] = [];
+  const h = setup(context("owner"), { notifyFailure: async text => { alerts.push(text); return true; } });
+  const start = Date.parse("2026-11-10T06:05:18Z"); setSystemTime(start);
+  h.input("wake:critical", "[Watcher event from robob-watch inbox-triage, not typed by the owner.]\nInbox triage: relevant email\nRelay to owner only\n\nEvent:\n[urgent] Mashreq AED 1,169.97\nWithdrawal received\nThird line\n\nContext saved when this watcher was set up:\nPrivate context", "+15555550123");
+  h.store.updateInbound("wake:critical", "failed");
+  setSystemTime(start + 121_000); await h.router.checkFailedInbound(); await h.router.tick();
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0]).toContain("[urgent] Mashreq AED 1,169.97\nWithdrawal received");
+  expect(alerts[0]).not.toContain("Third line");
+  expect(h.backend.prompts).toHaveLength(0);
+});
+
+test.each(["owner", "moni", "critical"])("failed-inbound stale %s rows never alert or replay", async kind => {
+  const alerts: string[] = [];
+  const events: string[] = [];
+  const ctx = context(kind === "moni" ? "dm" : "owner");
+  if (kind === "moni") ctx.chat.slug = "moni";
+  const h = setup(ctx, { notifyFailure: async text => { alerts.push(text); return true; }, log: event => { events.push(event); } });
+  const now = Date.parse("2026-11-13T10:00:00Z"); setSystemTime(now);
+  const id = kind === "critical" ? "wake:expired-money" : "expired-person";
+  h.input(id, kind === "critical" ? "[Watcher event from robob-watch money-cases]\nBill overdue" : "Old instruction", "+15555550123",
+    { source: kind === "critical" ? undefined : "typed", receivedAt: now - 72 * 3600_000 });
+  h.store.updateInbound(id, "failed");
+  await h.router.checkFailedInbound(); await h.router.tick();
+  setSystemTime(now + 60_000); await h.router.checkFailedInbound(); await h.router.tick();
+  expect(alerts).toEqual([]); expect(h.backend.prompts).toEqual([]);
+  expect(events.filter(event => event === "failed-inbound-skipped-stale")).toHaveLength(1);
 });

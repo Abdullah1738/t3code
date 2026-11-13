@@ -71,12 +71,79 @@ def person() -> str | None:
     """The person this process works for (her own box, her own token), or None for ordinary work."""
     t = os.environ.get("OFFBOX_THREAD") or ""
     name = t[len(PERSON_PREFIX):] if t.startswith(PERSON_PREFIX) else ""
-    return name if name and name.replace("-", "").replace("_", "").isalnum() else None
+    return name if _owner_name(name) else None
+
+
+def _owner_name(name: str) -> bool:
+    return bool(name) and name.replace("-", "").replace("_", "").isalnum()
 
 
 def token_owner() -> str:
     """Whose token this process uses on the home server: the person's for person-box work, else ours."""
     return person() or DEFAULT_OWNER
+
+
+def owner_scoped() -> bool:
+    """True on the home server, where a token only opens its owner's boxes and every owner's leases share one
+    database. boat.dev has the one account: there every lease is this process's, exactly as before."""
+    return backend() == "server"
+
+
+def mine(alias: str = "") -> str:
+    """SQL condition for leases, bases and templates: the rows whose boxes this process's token can open.
+    On Boat it is always true. A row with no token owner recorded belongs to the default owner."""
+    if not owner_scoped():
+        return "1=1"
+    col = f"{alias}.token_owner" if alias else "token_owner"
+    who = token_owner().replace("'", "''")
+    return f"COALESCE({col},'{DEFAULT_OWNER}')='{who}'"
+
+
+def box_owner(con, box_id: str | None) -> str | None:
+    """Whose token opens this box, from the lease, base or template that names it; None for a box we have no
+    record of."""
+    if not box_id:
+        return None
+    for table in ("leases", "bases", "templates"):
+        r = con.execute(f"SELECT token_owner FROM {table} WHERE box_id=?", (box_id,)).fetchone()
+        if r:
+            return r[0] or DEFAULT_OWNER
+    return None
+
+
+def require_mine(con, box_id: str | None) -> None:
+    """Refuse to touch another owner's box. To this process's token such a box answers 404, which reads as
+    "deleted": acting on that would retire a lease whose box is alive (12 Nov: the reaper, running with our token,
+    forgot Moni's box that way and her next call made a second, empty one)."""
+    if not owner_scoped():
+        return
+    who, me = box_owner(con, box_id), token_owner()
+    if who is None or who == me:
+        return
+    hint = f" Use offbox-person for {who}'s boxes." if who != DEFAULT_OWNER else ""
+    raise NotYours(f"{box_id} belongs to {who} on the offbox server; this call uses {me}'s token, which cannot "
+                   f"see it. Nothing was changed.{hint}", code=2)
+
+
+PERSON_ROOT_RESERVED = ("state", "stage", "restic", "bin")   # offbox-person's own folders next to the people's
+
+
+def person_root() -> Path:
+    return Path(os.environ.get("OFFBOX_PERSON_ROOT") or HOME / ".local/share/offbox-person")
+
+
+def owner_of_root(repo_root: str | None) -> str:
+    """Whose token a lease made from this directory uses: <name> for <offbox-person root>/<name> (offbox-person
+    always runs from there), ours for everything else. Only for rows written before leases recorded it."""
+    if not repo_root:
+        return DEFAULT_OWNER
+    here = os.path.normpath(repo_root)
+    for root in {os.path.normpath(person_root()), os.path.realpath(person_root())}:
+        if here.startswith(root + os.sep):
+            name = here[len(root) + 1:].split(os.sep)[0]
+            if _owner_name(name) and name not in PERSON_ROOT_RESERVED:
+                return name
+    return DEFAULT_OWNER
 
 
 def backend_pinned() -> str | None:
@@ -142,9 +209,19 @@ def entry_backend(argv: list[str]) -> str:
     if sub == "stats":
         return "server"
     first = default_backend()
-    if sub in ("logs", "wait", "kill", "release", "ssh", "ports"):
+    if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep"):
         named = [x for x in argv if x.startswith(("run-", "bx_")) or (sub in ("logs", "wait", "kill") and x != sub
                                                                       and not x.startswith("-"))]
+        if sub == 'keep':
+            # Match argparse's equals, abbreviation and last-option-wins forms before importing backend-bound code.
+            import argparse
+            selector = argparse.ArgumentParser(add_help=False, exit_on_error=False)
+            selector.add_argument('--box')
+            try:
+                selected, _ = selector.parse_known_args(argv)
+            except argparse.ArgumentError:
+                return first  # The full command parser reports malformed input.
+            named = [selected.box] if selected.box else []
         for name in (first, "boat" if first == "server" else "server"):
             if any(_known(name, x) for x in named):
                 return name
@@ -181,6 +258,7 @@ EXIT_CAP = 91
 EXIT_BUSY = 92                 # every pool box stayed busy for the whole queue wait; nothing ran, retry
 EXIT_HOME_DOWN = 93            # person-box work while the home server is down: it waits, it never goes to Boat
 EXIT_INTERRUPTED = 94          # the home server restarted under the run and the run was not run again
+EXIT_DETACHED = 95             # the Robob client went away; the remote run is still running
 EXIT_WAIT_TIMEOUT = 124        # `offbox wait --timeout` ran out; the run keeps going on its box
 
 IDLE_STOP_S = 20 * 60          # a lease with no run for this long is stopped (boat ttl + reaper)
@@ -310,6 +388,10 @@ class OffboxError(Exception):
         self.outage = outage     # boat.dev's own API was unreachable (Cloudflare 52x or no answer)
 
 
+class NotYours(OffboxError):
+    """The box belongs to another owner on the home server (see require_mine)."""
+
+
 def die(msg: str, code: int = 2):
     print(f"offbox: {msg}", file=sys.stderr)
     sys.exit(code)
@@ -329,13 +411,14 @@ CREATE TABLE IF NOT EXISTS leases (
   state TEXT NOT NULL DEFAULT 'running',   -- running | stopped | deleted | released
   created_at REAL, last_used_at REAL, archive_after REAL,
   pinned_until REAL, thread_gone_since REAL,
-  ssh_ready_at REAL, deleted_at REAL, note TEXT
+  ssh_ready_at REAL, deleted_at REAL, note TEXT,
+  token_owner TEXT                -- whose API token opens the box on the home server (NULL = the default owner)
 );
 CREATE INDEX IF NOT EXISTS leases_owner ON leases(owner, repo_root, state);
 CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY, box_id TEXT, owner TEXT, session_id TEXT, thread_id TEXT,
   repo_root TEXT, cwd TEXT, cmd TEXT, size TEXT, mode TEXT,   -- fg | bg | local
-  process_id INTEGER, command_id TEXT,
+  process_id INTEGER, command_id TEXT, wrapper_pid INTEGER,
   status TEXT,                     -- starting | running | done | failed | killed | lost | infra
   exit_code INTEGER, start_at REAL, end_at REAL,
   sync_s REAL, setup_s REAL, sent_bytes INTEGER, log_path TEXT, error TEXT,
@@ -367,16 +450,63 @@ def db() -> sqlite3.Connection:
     con.executescript(SCHEMA)
     have = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
     for col in ("pulls TEXT", "rel_cwd TEXT", "remote_dir TEXT", "local_cwd TEXT", "docker INTEGER",
-                "client_pid INTEGER"):
+                "client_pid INTEGER", "wrapper_pid INTEGER"):
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE runs ADD COLUMN {col}")
+    if 'wrapper_pid' not in have:
+        # Recovery used to copy the wrapper's OS PID into the API ID column. A command_id proves API provenance.
+        con.execute("UPDATE runs SET wrapper_pid=process_id,process_id=NULL WHERE process_id IS NOT NULL "
+                    "AND command_id IS NULL AND EXISTS (SELECT 1 FROM kv WHERE k IN "
+                    "('start_unattached:' || runs.run_id, 'start_unknown:' || runs.run_id))")
+        con.commit()
     # saved: boat saved-snapshot name (kept for good); expired_at: boat deleted the stopped box's data.
     for table in ("templates", "bases"):
         have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
         for col in ("saved TEXT", "expired_at REAL"):
             if col.split()[0] not in have:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+    _owner_columns(con)
     return con
+
+
+def _owner_columns(con) -> None:
+    """leases, bases and templates record whose token opens their box. Both databases get the column; only the
+    home server's is ever filtered by it (mine()), so on Boat it changes nothing.
+
+    Rows from before the column, and rows a still-running older client writes without it, are filled in on the home
+    database each time it is opened: a lease made from <offbox-person root>/<name> and a base saved by person:<name>
+    are <name>'s, everything else the default owner's. Same input, same answer, and a filled row is never touched
+    again."""
+    for table in ("leases", "bases", "templates"):
+        if "token_owner" in {r[1] for r in con.execute(f"PRAGMA table_info({table})")}:
+            continue
+        try:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN token_owner TEXT")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e):   # another process added it between the check and the ALTER
+                raise
+    if not owner_scoped():
+        return
+    try:
+        leases = con.execute("SELECT box_id, repo_root FROM leases WHERE token_owner IS NULL").fetchall()
+        bases = con.execute("SELECT name, created_by FROM bases WHERE token_owner IS NULL").fetchall()
+        blank = con.execute("SELECT 1 FROM templates WHERE token_owner IS NULL LIMIT 1").fetchone()
+        if not (leases or bases or blank):
+            return
+        con.executemany("UPDATE leases SET token_owner=? WHERE box_id=? AND token_owner IS NULL",
+                        [(owner_of_root(r["repo_root"]), r["box_id"]) for r in leases])
+        for r in bases:
+            by = r["created_by"] or ""
+            name = by[len(PERSON_PREFIX):] if by.startswith(PERSON_PREFIX) else ""
+            con.execute("UPDATE bases SET token_owner=? WHERE name=? AND token_owner IS NULL",
+                        (name if _owner_name(name) else DEFAULT_OWNER, r["name"]))
+        con.execute("UPDATE templates SET token_owner=? WHERE token_owner IS NULL", (DEFAULT_OWNER,))
+        con.commit()
+    except sqlite3.OperationalError as e:
+        # A busy database must not fail the command: unfilled rows read as the default owner's, and the next open
+        # fills them in.
+        con.rollback()
+        log(f"token owner backfill skipped: {e}")
 
 
 def event(con, box_id: str | None, kind: str, detail: str = "") -> None:

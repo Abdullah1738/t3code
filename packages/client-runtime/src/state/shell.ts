@@ -1,3 +1,4 @@
+import { threadCacheRedactions } from "./threadCacheRedactions.ts";
 import {
   ORCHESTRATION_V2_WS_METHODS,
   type EnvironmentId,
@@ -197,6 +198,16 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
     let snapshotSession: RpcSession | null = null;
     for (const [session, item] of items) {
       if (session !== activeSession) continue;
+      if (
+        (item.kind === "thread.updated" || item.kind === "thread.removed") &&
+        item.redactionSequence !== undefined
+      ) {
+        const threadId = item.kind === "thread.updated" ? item.thread.id : item.threadId;
+        yield* threadCacheRedactions(cache, environmentId, threadId).invalidate(
+          item.redactionSequence,
+          cache.removeThread(environmentId, threadId),
+        );
+      }
       if (item.kind === "synchronized") {
         waiting = false;
         if (Option.isSome(next.snapshot) && next.snapshot.value.page?.nextAfter == null) {
@@ -206,7 +217,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
           );
           yield* Ref.set(synchronizedServerVersion, serverVersion);
           yield* Ref.set(synchronizedSnapshot, true);
-          next = { ...next, status: "live", error: Option.none() };
+          next = { snapshot: next.snapshot, status: "live", error: Option.none() };
         }
         continue;
       }

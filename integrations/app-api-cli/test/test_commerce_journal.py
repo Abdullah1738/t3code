@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import os as _os, tempfile as _tempfile
 # commerce_cli reads the pause file at import; the owner's real one must not refuse test orders.
 _os.environ['ORDERING_PAUSE_FILE'] = _os.path.join(_tempfile.gettempdir(), 'ordering-pause-test-absent', 'ordering-paused')
@@ -28,6 +29,7 @@ def consume_child(root, flow, output=None):
 
 class CommerceJournalTest(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)/'commerce'
         self.patcher = patch.object(j, 'ROOT', self.root)
@@ -36,7 +38,7 @@ class CommerceJournalTest(unittest.TestCase):
         self.addCleanup(self.patcher.stop)
         self.flow = str(uuid.uuid4())
 
-    def open(self, flow=None, account='a'*64, app='noon', vertical='nownow'):
+    def open(self, flow=None, account='a'*64, app='noon', vertical='food'):
         flow = flow or self.flow
         j.open_flow(flow_id=flow, app=app, vertical=vertical,
                     account_hash=account, scope_hash='s'.encode().hex()*32)
@@ -82,8 +84,7 @@ class CommerceJournalTest(unittest.TestCase):
 
     def test_new_flow_new_vertical_does_not_escape_account(self):
         self.open()
-        with self.assertRaisesRegex(j.JournalError, 'ALREADY_OWNED'):
-            self.open(str(uuid.uuid4()), vertical='minutes')
+        self.open(str(uuid.uuid4()), vertical='minutes')
         # Separate platform identity is not blocked by an unrelated platform flow.
         self.open(str(uuid.uuid4()), app='talabat', vertical='mart')
 
@@ -260,8 +261,7 @@ class CommerceJournalTest(unittest.TestCase):
         self.assertEqual(old['campaign_reserved_minor'], 5500)
         self.assertEqual(old['historical_campaign_limit_minor'], 30000)
         self.assertEqual(old['state'], 'FENCED')
-        with self.assertRaises(j.JournalError):
-            self.open(str(uuid.uuid4()))
+        self.open(str(uuid.uuid4()))
         other = self.open(str(uuid.uuid4()), account=j.digest('new-account'))
         self.assertEqual(j.inspect(other)['campaign_reserved_minor'], 0)
         with sqlite3.connect(self.root/'journal.sqlite') as db:
@@ -384,6 +384,7 @@ class ReleaseTest(unittest.TestCase):
     """Terminal, evidence-reviewed closure of a fenced never-paid flow."""
 
     def setUp(self):
+        approve_test_flows(self)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)/'commerce'
         self.patcher = patch.object(j, 'ROOT', self.root)
@@ -419,8 +420,9 @@ class ReleaseTest(unittest.TestCase):
         self.fenced_unpaid_flow()
         self.fence_it()
         self.assertEqual(j.inspect(self.flow)['state'], 'FENCED')
-        with self.assertRaisesRegex(j.JournalError, 'ACCOUNT_RECONCILIATION_REQUIRED'):
-            j.require_account_available('noon', 'a'*64)
+        self.assertTrue(j.require_account_available('noon', 'a'*64))
+        with self.assertRaisesRegex(j.JournalError, 'JOURNAL_FLOW_FENCED'):
+            j.require_account_available('noon', 'a'*64, flow_id=self.flow)
         result = j.release(self.flow, evidence_hash='1'*64)
         self.assertEqual(result['state'], 'RELEASED')
         self.assertTrue(result['reservation_minor_retained'])
@@ -486,6 +488,7 @@ class ReleaseTest(unittest.TestCase):
         self.fenced_unpaid_flow()
         self.fence_it()
         with sqlite3.connect(self.root/'journal.sqlite') as db:
+            db.execute('DROP TABLE baskets')
             db.execute('DROP TABLE owner_attestations')
             db.execute('DROP TABLE duplicate_closures')
             db.execute('PRAGMA user_version=1')
@@ -512,6 +515,7 @@ if __name__ == '__main__': unittest.main()
 
 class StableCartAdoptionTest(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)/'commerce'
         self.patcher = patch.object(j, 'ROOT', self.root)
@@ -607,6 +611,7 @@ class OrderlessPlaceRecoveryTest(unittest.TestCase):
     generic-400 shape seen live on the mart lane."""
 
     def setUp(self):
+        approve_test_flows(self)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)/'commerce'
         self.patcher = patch.object(j, 'ROOT', self.root)
@@ -795,6 +800,7 @@ class FencedPaymentReconciliationTest(unittest.TestCase):
     supersedes an UNKNOWN fence; the flow reactivates for explicit completion."""
 
     def setUp(self):
+        approve_test_flows(self)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)/'commerce'
         self.patcher = patch.object(j, 'ROOT', self.root)

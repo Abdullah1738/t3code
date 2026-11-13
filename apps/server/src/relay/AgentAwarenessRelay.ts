@@ -86,6 +86,7 @@ export function shouldPublishAgentAwarenessEvent(
     return false;
   }
   switch (event.type) {
+    case "thread.item-redacted":
     case "thread.created":
     case "thread.archived":
     case "thread.unarchived":

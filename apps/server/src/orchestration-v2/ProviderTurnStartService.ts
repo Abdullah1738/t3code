@@ -1,3 +1,4 @@
+import { isAutomaticClaudeRecovery } from "./launchRecovery.ts";
 import { isRecoveredQueueRun, markInstallLifecycle } from "../ardud/fast-install/report.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import {
@@ -76,10 +77,22 @@ export class ProviderTurnStartError extends Schema.TaggedError<ProviderTurnStart
 
 const isProviderTurnStartError = Schema.is(ProviderTurnStartError);
 
-/** Claude refuses to replace a process running background work before it reads the prompt. */
+/** These refusals leave inline context handoffs unsent and safe to restore. */
 const refusedBeforePrompt = (error: unknown): boolean =>
   Predicate.isTagged(error, "ClaudeBackgroundWorkBlocksQueryReplacementError") ||
+  Predicate.isTagged(error, "ProviderAdapterRecoveryRefusedError") ||
   (Predicate.hasProperty(error, "cause") && refusedBeforePrompt(error.cause));
+
+const isProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
+
+const activeTurnRefusal = (
+  error: unknown,
+): ProviderAdapter.ProviderAdapterProtocolError | undefined =>
+  isProtocolError(error) && error.reason === "previous_turn_active"
+    ? error
+    : Predicate.hasProperty(error, "cause")
+      ? activeTurnRefusal(error.cause)
+      : undefined;
 
 const codexHistoryNotSent = (error: unknown): boolean =>
   error instanceof CodexHistoryNotSentError ||
@@ -159,6 +172,40 @@ export const layer: Layer.Layer<
           );
       return {
         isCurrentAttemptInStatus,
+        loadRecoveryAdmission: (expected: OrchestrationV2ProviderThread) =>
+          projectionStore
+            .getThreadRecords(input.threadId, ["runs", "providerThreads"], {
+              runIds: [input.runId],
+            })
+            .pipe(
+              Effect.map((records) => {
+                const run = records.runs.find((row) => row.id === input.runId);
+                const providerThread = records.providerThreads.find(
+                  (row) => row.id === expected.id,
+                );
+                // Both decisions come from one transaction, for the native identity being offered.
+                return {
+                  current:
+                    run?.activeAttemptId === input.attemptId &&
+                    run.status === "running" &&
+                    run.providerThreadId === expected.id &&
+                    providerThread?.driver === expected.driver &&
+                    providerThread.providerInstanceId === expected.providerInstanceId &&
+                    providerThread.nativeThreadRef?.nativeId === expected.nativeThreadRef?.nativeId,
+                  refused: providerThread?.nativeMetadata?.claudeRefusalObserved === true,
+                };
+              }),
+            ),
+        loadClaudeRefusal: () =>
+          projectionStore
+            .getThreadRecords(input.threadId, ["providerThreads"])
+            .pipe(
+              Effect.map(
+                (records) =>
+                  records.providerThreads.find((row) => row.id === input.providerThreadId)
+                    ?.nativeMetadata?.claudeRefusalObserved === true,
+              ),
+            ),
         loadDelegatedTask: () =>
           input.parentThreadId === null
             ? Effect.succeed(undefined)
@@ -207,6 +254,80 @@ export const layer: Layer.Layer<
               }),
             )
             .pipe(Effect.catchCause(() => Effect.succeed(false))),
+      };
+    };
+
+    const makeRecoverySession = (
+      liveSession: ProviderAdapter.ProviderAdapterV2SessionRuntime,
+      isIncomingRunCurrent: () => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>,
+      loadRecoveryAdmission?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["loadRecoveryAdmission"],
+    ) => {
+      const startWithRecovery = Effect.fn("ProviderTurnStartService.startWithRecovery")(function* (
+        turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+        compact = false,
+      ) {
+        const start = compact ? liveSession.compactThread! : liveSession.startTurn;
+        const readFailure = (cause: unknown) =>
+          new ProviderAdapter.ProviderAdapterTurnStartError({
+            driver: liveSession.driver,
+            threadId: turnInput.threadId,
+            providerThreadId: turnInput.providerThread.id,
+            runId: turnInput.runId,
+            ...(refusedBeforePrompt(cause) ? { code: "provider_prompt_not_sent" as const } : {}),
+            cause,
+          });
+        const incomingIsCurrent = Effect.suspend(() =>
+          loadRecoveryAdmission === undefined
+            ? isIncomingRunCurrent()
+            : loadRecoveryAdmission(turnInput.providerThread).pipe(
+                Effect.flatMap((admission) =>
+                  !admission.current
+                    ? Effect.succeed(false)
+                    : admission.refused
+                      ? Effect.fail(new ProviderAdapter.ProviderAdapterRecoveryRefusedError())
+                      : Effect.succeed(true),
+                ),
+              ),
+        ).pipe(Effect.mapError(readFailure));
+        // Handoff delivery and stale-turn Stop can await after outer admission.
+        // Guard the first native offer and the one native retry at this boundary.
+        if (loadRecoveryAdmission !== undefined && !(yield* incomingIsCurrent)) return;
+        const result = yield* Effect.result(start(turnInput));
+        if (result._tag === "Success") return;
+        const stale = activeTurnRefusal(result.failure)?.activeTurn;
+        if (stale === undefined || stale.providerThreadId !== turnInput.providerThread.id) {
+          return yield* result.failure;
+        }
+        const owner = yield* projectionStore
+          .getRunControlState(turnInput.threadId, stale.runId)
+          .pipe(Effect.mapError(readFailure));
+        // A different incoming run is not proof that the old turn lost ownership.
+        // Missing projection state is also inconclusive; leave that turn alone.
+        const terminal =
+          owner !== null &&
+          ["completed", "failed", "interrupted", "cancelled", "rolled_back"].includes(owner.status);
+        if (owner === null || (!terminal && owner.activeAttemptId === stale.attemptId)) {
+          return yield* result.failure;
+        }
+        if (!(yield* incomingIsCurrent)) return;
+        yield* liveSession.interruptTurn({
+          providerThread: turnInput.providerThread,
+          providerTurnId: stale.providerTurnId,
+        });
+        if (!(yield* incomingIsCurrent)) return;
+        // Exactly one retry: another refusal belongs to normal start-failure handling.
+        yield* start(turnInput);
+      });
+      return {
+        ...liveSession,
+        startTurn: (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+          startWithRecovery(turnInput),
+        ...(liveSession.compactThread === undefined
+          ? {}
+          : {
+              compactThread: (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+                startWithRecovery(turnInput, true),
+            }),
       };
     };
 
@@ -411,6 +532,29 @@ export const layer: Layer.Layer<
           });
         },
       );
+      if (
+        isAutomaticClaudeRecovery(providerThread.driver, run) &&
+        providerThread.nativeMetadata?.claudeRefusalObserved === true
+      ) {
+        yield* settleRunBeforeStart({
+          signal: "claude-recovery-refused",
+          status: "failed",
+          now: yield* DateTime.now,
+          providerInstanceId: run.providerInstanceId,
+          itemProviderThreadId: providerThread.id,
+          item: {
+            type: "error",
+            title: "Automatic recovery refused",
+            failure: makeProviderFailure({
+              class: "provider_error",
+              category: "content_filter",
+              code: "model_refusal",
+              message: "Automatic recovery excluded after a native session refusal.",
+            }),
+          },
+        });
+        return;
+      }
       const providerText = yield* Effect.result(providerUserMessageText(message));
       if (providerText._tag === "Failure") {
         yield* settleRunBeforeStart({
@@ -644,7 +788,13 @@ export const layer: Layer.Layer<
         });
         return;
       }
-      const session = sessionResult.success;
+      const session = makeRecoverySession(
+        sessionResult.success,
+        () => isCurrentAttemptInStatus("running"),
+        isAutomaticClaudeRecovery(sessionResult.success.driver, run)
+          ? runControls.loadRecoveryAdmission
+          : undefined,
+      );
       if (!(yield* isCurrentAttemptInStatus("starting"))) return;
       const loadFromProvider = Effect.fn("ProviderTurnStartService.loadFromProvider")(function* (
         load: Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapter.ProviderAdapterV2Error>,
@@ -1604,6 +1754,8 @@ export const layer: Layer.Layer<
             sameNativeThread &&
             !acceptedAttempts.some((source) => source.nativeThreadId !== undefined)),
         shouldStartProviderTurn: runControls.shouldStartProviderTurn,
+        loadClaudeRefusal: runControls.loadClaudeRefusal,
+        loadRecoveryAdmission: runControls.loadRecoveryAdmission,
         shouldFinalizeRun: runControls.shouldFinalizeRun,
         hasUnpairedRunInterruptRequest: runControls.hasUnpairedRunInterruptRequest,
         message: {
@@ -1611,7 +1763,9 @@ export const layer: Layer.Layer<
           text:
             run.transientRecovery !== undefined && attempt.reason === "retry"
               ? "Continue where you left off after the transient API failure. Check work already completed and any partly written files before continuing; do not repeat completed actions."
-              : userText,
+              : run.launchRecovery?.kind === "model_access"
+                ? `${userText}\n\nA previous launch failed before responding. This checkout may have partial edits from earlier work; inspect them and preserve completed work before continuing.`
+                : userText,
           attachments:
             run.transientRecovery !== undefined && attempt.reason === "retry"
               ? []

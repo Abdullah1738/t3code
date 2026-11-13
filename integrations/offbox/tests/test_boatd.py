@@ -669,6 +669,27 @@ unused devices: <none>
         h = boatd.health(fresh=True)
         self.assertEqual((h["ok"], h["reasons"]), (False, ["incus is not answering"]))
 
+    def test_vpn_tunnel_down_past_the_grace_means_runs_cannot_be_accepted(self):
+        import tempfile
+        self.f.sh[("zpool", "list")] = (0, "ONLINE")
+        boatd.READY.set()
+        flag, old_flag, old_now = Path(tempfile.mkdtemp()) / "vpn-enabled", boatd.VPN_FLAG, boatd.now
+        t = [1000.0]
+        boatd.VPN_FLAG, boatd.now, boatd._VPN["down_since"] = flag, (lambda: t[0]), None
+        try:
+            self.f.sh[("mullvad", "status")] = (0, "Connecting\n    Relay: de-fra-wg-001\n")
+            self.assertTrue(boatd.health(fresh=True)["ok"], "no flag file: this host has no VPN, mullvad is never asked")
+            self.assertNotIn(("mullvad", "status"), self.f.sh_calls)
+            flag.write_text("")
+            self.assertTrue(boatd.health(fresh=True)["ok"], "a short gap (relay change) is not an outage")
+            t[0] += boatd.VPN_GRACE_S + 1
+            h = boatd.health(fresh=True)
+            self.assertEqual((h["ok"], h["reasons"]), (False, ["vpn tunnel is down (Connecting); boxes have no internet"]))
+            self.f.sh[("mullvad", "status")] = (0, "Connected\n    Relay: de-fra-wg-001\n")
+            self.assertEqual((boatd.health(fresh=True)["ok"], boatd._VPN["down_since"]), (True, None))
+        finally:
+            boatd.VPN_FLAG, boatd.now, boatd._VPN["down_since"] = old_flag, old_now, None
+
     def test_startup_waits_for_the_pool_then_reconciles_then_opens(self):
         boatd.CFG["state_dataset"] = "offbox/boatd"
         answers = [(1, ""), (0, "yes\t" + str(boatd.VAR))]

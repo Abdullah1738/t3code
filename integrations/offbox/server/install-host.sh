@@ -70,6 +70,12 @@ net.ipv6.conf.all.forwarding = 1
 kernel.dmesg_restrict = 1
 vm.swappiness = 10
 EOF
+# Incus already allows userns in its outer profile. Ubuntu's restriction still transitions unconfined
+# processes inside the nested AppArmor namespace to unprivileged_userns, denying their uid_map write.
+# This dedicated box host keeps AppArmor confinement; only that extra userns restriction is disabled.
+cat > /etc/sysctl.d/90-offbox-userns.conf <<'EOF'
+kernel.apparmor_restrict_unprivileged_userns = 0
+EOF
 sysctl -q --system
 cat > /etc/security/limits.d/90-offbox.conf <<'EOF'
 * soft nofile 1048576
@@ -237,7 +243,9 @@ incus profile set offbox security.nesting=true security.syscalls.intercept.mknod
 # ---- firewall: boxes reach the internet, never the host's services or the tailnet. Public side: ssh only.
 cat > /etc/nftables.conf <<'EOF'
 #!/usr/sbin/nft -f
-flush ruleset
+# No "flush ruleset": that would also drop Incus NAT and, on the home server, the Mullvad kill switch.
+table inet offbox
+delete table inet offbox
 table inet offbox {
   chain input {
     type filter hook input priority 0; policy drop;
@@ -247,6 +255,7 @@ table inet offbox {
     iifname "incusbr0" udp dport { 53, 67 } accept
     iifname "incusbr0" tcp dport 53 accept
     iifname "incusbr0" icmp type echo-request accept
+    iifname "incusbr0" tcp dport 12380 accept comment "box web traffic redirected to the exit proxy (home/exit-proxy.sh)"
     iifname "incusbr0" drop
     udp dport 41641 accept
     tcp dport 22 accept
@@ -262,7 +271,9 @@ table inet offbox {
     iifname "incusbr0" oifname "tailscale0" drop
   }
 }
+include "/etc/nftables.d/*.nft"
 EOF
+mkdir -p /etc/nftables.d
 systemctl enable --now nftables >/dev/null
 nft -f /etc/nftables.conf
 systemctl restart incus  # re-adds its own NAT/DHCP rules after the flush

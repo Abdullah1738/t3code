@@ -16,9 +16,69 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import api, cli, common, lease, misc, runs  # noqa: E402
+from offbox_lib import api, cli, common, lease, misc, pool, runs  # noqa: E402
 from offbox_lib.common import OffboxError, db  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
+
+
+class PoolTakeDeadlineTests(Isolated):
+    def test_brief_final_lock_hold_reports_boxes_stayed_busy(self):
+        from test_exit_and_queue import FakeClock
+        self.box('full', member=True)
+        self.busy('full')
+        clock = FakeClock()
+        real_lock = common.file_lock
+        takes = []
+        @contextlib.contextmanager
+        def lock(name, timeout=600):
+            if name == pool.lock_name('repo'):
+                takes.append(timeout)
+                if len(takes) == 2:
+                    clock.t += timeout
+                    raise OffboxError('timed out waiting for lock ' + name)
+            with real_lock(name, timeout=timeout):
+                yield
+        def sleep(seconds):
+            clock.t = 1599.5
+        clock.time.sleep = sleep
+        with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '600', 'OFFBOX_POOL_SIZE': '1'}), \
+                patch.object(pool, 'time', clock.time), patch.object(pool, 'file_lock', lock), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(pool.PoolBusyError) as caught:
+                pool.acquire(self.me)
+        self.assertEqual(takes, [30, .5])
+        self.assertEqual(caught.exception.code, 92)
+        self.assertIn('boxes stayed busy', str(caught.exception))
+        self.assertIn('1 busy', str(caught.exception))
+        self.assertNotIn('kept its pool lock', str(caught.exception))
+
+    def test_short_takes_retry_while_queue_has_time(self):
+        from test_exit_and_queue import FakeClock
+        clock, takes = FakeClock(), []
+        @contextlib.contextmanager
+        def lock(name, timeout=600):
+            takes.append(timeout)
+            if len(takes) < 3:
+                clock.t += timeout
+                raise OffboxError('timed out waiting for lock ' + name)
+            yield
+        with patch.object(pool, 'time', clock.time), patch.object(pool, 'file_lock', lock):
+            with pool._pool_lock('repo', 1120, 120):
+                self.assertEqual(clock.t, 1060)
+        self.assertEqual(takes, [30, 30, 30])
+
+    def test_lock_message_requires_a_full_short_take(self):
+        from test_exit_and_queue import FakeClock
+        clock = FakeClock()
+        @contextlib.contextmanager
+        def lock(name, timeout=600):
+            clock.t += timeout
+            raise OffboxError('timed out waiting for lock ' + name)
+            yield
+        with patch.object(pool, 'time', clock.time), patch.object(pool, 'file_lock', lock):
+            with self.assertRaisesRegex(pool.PoolBusyError, 'kept its pool lock for 30s'):
+                with pool._pool_lock('repo', 1030, 30):
+                    self.fail('lock was not acquired')
 
 
 class FastEvent(threading.Event):
@@ -79,6 +139,40 @@ class WaitLockTests(Isolated):
                 patch.object(runs, 'now', clock.now), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = cli.main(argv)
         return rc, out.getvalue(), err.getvalue()
+
+    def test_live_follower_excludes_settled_catchup(self):
+        log = common.LOGS_DIR / 'run-x.log'
+        held, release = threading.Event(), threading.Event()
+        errors = []
+        def frames(*args, **kwargs):
+            yield dict(type='stdout', data='last output\n', nextOffset=12)
+            held.set()
+            if not release.wait(2):
+                raise AssertionError('reader did not try catchup')
+            yield dict(type='exit', exitCode=0)
+        def follower():
+            try:
+                runs.follow('bx_a', 7, log, echo=False, run_id='run-x')
+            except BaseException as e:
+                errors.append(e)
+        with patch.object(runs, '_ttl_keeper'), patch.object(api, 'cmd_attach', side_effect=frames), \
+                patch.object(api, 'history_logs', side_effect=AssertionError('follower owns log')):
+            worker = threading.Thread(target=follower)
+            worker.start()
+            try:
+                self.assertTrue(held.wait(2))
+                self.con.execute("UPDATE runs SET status='done',exit_code=0,command_id='cmd_a' WHERE run_id='run-x'")
+                self.con.commit()
+                row = self.con.execute("SELECT * FROM runs WHERE run_id='run-x'").fetchone()
+                before = common.offsets_path(log).read_bytes()
+                self.assertEqual(misc._catch_up_log(row, locked=True), 'n/a')
+                self.assertEqual(common.offsets_path(log).read_bytes(), before)
+                self.assertEqual(log.read_bytes(), b'last output\n')
+            finally:
+                release.set()
+                worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
 
     def test_wait_waits_for_the_lock_holder_to_record_the_end(self):
         self.hold_box()
@@ -622,8 +716,8 @@ class NoBoxYetTests(WaitLockTests):
         self.assertGreater(lease.active_runs(self.con, 'bx_a'), 0)
         self.assert_no_crash()
 
-    def test_nobox_wait_on_a_local_first_run_waits_for_its_end(self):
-        # Local-first runs never have a box: wait polls the row and returns the recorded code.
+    def test_nobox_wait_on_a_local_run_waits_for_its_end(self):
+        # Local (fallback) runs never have a box: wait polls the row and returns the recorded code.
         self.con.execute("UPDATE runs SET mode='local', status='running', process_id=55 WHERE run_id='run-x'")
         self.con.commit()
         with patch.object(runs, 'follow', side_effect=AssertionError('local runs have no box')):
@@ -664,6 +758,13 @@ class EarlySignalTests(Isolated):
 
 
 class FollowUntilTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        guard = patch.object(common, 'LOCKS_DIR', Path(tmp.name) / 'locks')
+        guard.start()
+        self.addCleanup(guard.stop)
+
     def test_follow_stops_at_until_without_killing(self):
         clock = Clock()
         frames = iter([{'type': 'stdout', 'data': 'hello\n', 'nextOffset': 6}])
@@ -812,6 +913,7 @@ class TakeoverPublishTests(unittest.TestCase):
         self.logs = Path(self._tmp.name)
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(common, 'LOCKS_DIR', self.logs / 'locks'))
         self.stack.enter_context(patch.object(misc, 'LOGS_DIR', self.logs))
         self.stack.enter_context(patch.object(runs, 'LOGS_DIR', self.logs))
         self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
@@ -898,6 +1000,7 @@ class LiveAndEchoTests(unittest.TestCase):
         self.logs = Path(self._tmp.name)
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(common, 'LOCKS_DIR', self.logs / 'locks'))
         self.stack.enter_context(patch.object(misc, 'LOGS_DIR', self.logs))
         self.stack.enter_context(patch.object(runs, 'LOGS_DIR', self.logs))
         self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
@@ -974,12 +1077,16 @@ class LockBlockedFollowerTests(Isolated):
         super().setUp()
         self.logs = common.LOGS_DIR
         # misc and runs import LOGS_DIR by name, so the isolated directory must be patched there too.
+        self.stack.enter_context(patch.object(common, 'LOCKS_DIR', self.logs / 'locks'))
         self.stack.enter_context(patch.object(misc, 'LOGS_DIR', self.logs))
         self.stack.enter_context(patch.object(runs, 'LOGS_DIR', self.logs))
         self.stack.enter_context(patch.object(misc, 'WAIT_POLL_S', 0))
+        self.stack.enter_context(patch.object(misc, '_refresh_running_ttl'))
         self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
         self.stack.enter_context(patch.object(runs.api, 'cmd_status', return_value=None))
         self.stack.enter_context(patch.object(runs, 'finish'))
+        # logs --follow refreshes TTL even when a peer holds the lock; keep that API call offline too.
+        self.stack.enter_context(patch.object(api, 'set_ttl'))
         self.stack.enter_context(patch.object(runs, 'go_std_glitch'))
         # logs --follow only enters the lock-blocked path for a live box.
         self.stack.enter_context(patch.object(runs.api, 'get', return_value={'state': 'running'}))
@@ -1151,6 +1258,9 @@ class StreamDeadlineTests(unittest.TestCase):
         self.addCleanup(stack.close)
         stack.enter_context(patch.object(api, 'API', f'http://127.0.0.1:{self.srv.server_address[1]}'))
         stack.enter_context(patch.object(api, '_key', return_value='k'))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        stack.enter_context(patch.object(common, 'LOCKS_DIR', Path(tmp.name) / 'locks'))
 
     def read_until(self, path, deadline_in):
         t0 = time.time()

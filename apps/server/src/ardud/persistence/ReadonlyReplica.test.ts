@@ -1,3 +1,6 @@
+import * as NodeEvents from "node:events";
+import * as Fiber from "effect/Fiber";
+import { ErrorObserver, sqliteErrorDetails } from "@t3tools/shared/nodeSqliteErrors";
 // @effect-diagnostics nodeBuiltinImport:off globalDate:off - fixtures drive real worker threads and native SQLite.
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -15,6 +18,7 @@ import {
   exportWorkerSource,
   superviseExportWorker,
   superviseReadonlyExport,
+  makeCoordinatedReplica,
 } from "./ReadonlyReplica.ts";
 import { createReadonlyReplica } from "./readonlyExport.ts";
 
@@ -275,4 +279,125 @@ it.live("the packaged worker advances a replica stranded by a volume remount", (
       Date.parse(String(first.updated_at)),
     );
   }).pipe(Effect.scoped),
+);
+
+it.live("maintenance waits for worker exit and prevents respawn until released", () =>
+  Effect.gen(function* () {
+    let spawned = 0;
+    let first!: () => void;
+    let second!: () => void;
+    const started = new Promise<void>((resolve) => {
+      first = resolve;
+    });
+    const resumed = new Promise<void>((resolve) => {
+      second = resolve;
+    });
+    const coordinator = yield* makeCoordinatedReplica(() => {
+      const n = ++spawned;
+      const { worker } = evalWorker(
+        "const {parentPort}=require('node:worker_threads'); parentPort.postMessage({type:'opened'}); setInterval(()=>{},1000)",
+      );
+      worker.on("message", () => {
+        if (n === 1) first();
+        else second();
+      });
+      return worker;
+    }, fast);
+    const supervisor = yield* Effect.forkScoped(coordinator.run, { startImmediately: true });
+    yield* Effect.promise(() => started);
+    yield* coordinator.withMaintenance(
+      Effect.gen(function* () {
+        assert.equal(spawned, 1);
+        yield* Effect.yieldNow;
+        assert.equal(spawned, 1);
+      }),
+    );
+    yield* Effect.promise(() => resumed);
+    assert.equal(spawned, 2);
+    yield* Fiber.interrupt(supervisor);
+  }).pipe(Effect.scoped),
+);
+
+it.live("maintenance taken before startup fences the first export worker", () =>
+  Effect.gen(function* () {
+    let spawned = 0;
+    let opened!: () => void;
+    const started = new Promise<void>((resolve) => {
+      opened = resolve;
+    });
+    const coordinator = yield* makeCoordinatedReplica(() => {
+      spawned++;
+      const { worker } = evalWorker(
+        "const {parentPort}=require('node:worker_threads'); parentPort.postMessage({type:'opened'}); setInterval(()=>{},1000)",
+      );
+      worker.on("message", opened);
+      return worker;
+    }, fast);
+    const supervisor = yield* coordinator.withMaintenance(
+      Effect.gen(function* () {
+        const fiber = yield* Effect.forkScoped(coordinator.run, { startImmediately: true });
+        assert.equal(spawned, 0);
+        yield* Effect.yieldNow;
+        assert.equal(spawned, 0);
+        return fiber;
+      }),
+    );
+    yield* Effect.promise(() => started);
+    assert.equal(spawned, 1);
+    yield* Fiber.interrupt(supervisor);
+  }).pipe(Effect.scoped),
+);
+
+it.live("maintenance refuses when a worker termination cannot be confirmed", () =>
+  Effect.gen(function* () {
+    let started!: () => void;
+    const startup = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const coordinator = yield* makeCoordinatedReplica(
+      () => {
+        const worker = Object.assign(new NodeEvents.EventEmitter(), {
+          terminate: () => new Promise<number>(() => {}),
+        });
+        started();
+        return worker as unknown as ExportWorker;
+      },
+      { ...fast, terminateTimeout: "20 millis" },
+    );
+    const supervisor = yield* Effect.forkScoped(coordinator.run, { startImmediately: true });
+    yield* Effect.promise(() => startup);
+    let mutated = false;
+    const refused = yield* coordinator
+      .withMaintenance(
+        Effect.sync(() => {
+          mutated = true;
+        }),
+      )
+      .pipe(Effect.result);
+    assert.equal(refused._tag, "Failure");
+    assert.equal(mutated, false);
+    yield* Fiber.interrupt(supervisor);
+  }).pipe(Effect.scoped),
+);
+
+it.live.each(["primary", "replica"] as const)(
+  "forwards raw %s exporter errors through supervision",
+  (role) => {
+    const observations: unknown[] = [];
+    const factory = `() => { throw Object.assign(new Error("bad database"), {errcode:26, errstr:"file is not a database", sqliteFile:"/isolated/${role}.sqlite", sqliteRole:"${role}", sqliteOperation:"prepare"}); }`;
+    return Effect.exit(
+      superviseExportWorker(() => evalWorker(exportWorkerSource(factory)).worker, fast),
+    ).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          assert.equal(observations.length, 1);
+          const details = sqliteErrorDetails(observations[0]);
+          assert.equal(details?.errcode, 26);
+          assert.equal(details?.context?.role, role);
+          assert.equal(details?.context?.file, `/isolated/${role}.sqlite`);
+        }),
+      ),
+      Effect.provideService(ErrorObserver, (cause) => observations.push(cause)),
+    );
+  },
 );

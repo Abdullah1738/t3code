@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/zsh -f
 # wa — WhatsApp CLI for agents, backed by wacli (durable SQLite store kept live by LaunchAgent com.ardud.wacli-sync).
 # Same interface as the old whatscli/tmux wrapper (retired; it sent without approval, so `wa tui` is gone).
 # Usage:

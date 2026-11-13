@@ -1,5 +1,6 @@
 import { carryActionValue } from "../actionTelemetry.ts";
 import { Atom } from "effect/reactivity";
+import type { PermissionStatus } from "../../state/commandPermissions.ts";
 import {
   KANBAN_WS_METHODS as M,
   type KanbanBlock,
@@ -13,6 +14,7 @@ import {
   type KanbanMessage,
   type KanbanScript,
   type KanbanScriptRun,
+  type KanbanScriptAcknowledgeInput,
   type KanbanThreadLink,
   type KanbanThreadRow,
   type KanbanWatchEvent,
@@ -85,6 +87,7 @@ export interface KanbanClient {
   scriptRuns(boardId: string, scriptId: string): SnapshotStore<ReadonlyArray<KanbanScriptRun>>;
   /** Whether the connection's grants allow a kanban write, read as an atom to gate its control. */
   permission(tag: KanbanRequestTag): Atom.Atom<boolean>;
+  permissionStatus(tag: KanbanRequestTag): Atom.Atom<PermissionStatus>;
 
   patchCard(input: KanbanCardPatchInput): Promise<void>;
   settleCard(cardId: string): Promise<void>;
@@ -143,6 +146,7 @@ export interface KanbanClient {
   setScriptEnabled(scriptId: string, enabled: boolean): Promise<void>;
   /** Starts a run now; it shows up in the runs store as it opens and ends. */
   runScript(scriptId: string): Promise<void>;
+  acknowledgeScript(input: KanbanScriptAcknowledgeInput): Promise<void>;
   /**
    * While watched, the newest message of recent discussions is read whenever
    * a preview falls behind. Screens that list discussions watch; the board
@@ -902,6 +906,7 @@ export function createKanbanClient(
     scripts,
     scriptRuns: (boardId, scriptId) => scriptRuns(`${boardId}\n${scriptId}`),
     permission: (tag) => transport.permission(tag),
+    permissionStatus: (tag) => transport.permissionStatus(tag),
 
     async patchCard(input) {
       await transport.request(M.cardPatch, input);
@@ -1003,6 +1008,9 @@ export function createKanbanClient(
     },
     async setScriptEnabled(scriptId, enabled) {
       await transport.request(M.scriptEnable, { scriptId: scriptId as never, enabled });
+    },
+    async acknowledgeScript(input) {
+      await transport.request(M.scriptAcknowledge, input);
     },
     async runScript(scriptId) {
       await transport.request(M.scriptRun, { scriptId: scriptId as never });

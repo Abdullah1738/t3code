@@ -1,5 +1,6 @@
 """Narrow offline checks for filtering and no-loss cursor/outbox behavior."""
 import copy
+import datetime as dt
 import importlib.util
 import json
 import os
@@ -401,6 +402,41 @@ class ChargeTests(unittest.TestCase):
         self.assertEqual(model.call_args[0][0][0]['id'], item['id'])
         self.assertNotIn('renewal_case', runs[-1]['dropped'])
         self.assertEqual(self.mc.load(self.tmp / 'wd' / 'scratch-money')['cases'], [])
+        rows = self.mc.load_subscriptions(self.tmp / 'wd' / 'scratch-money')['subscriptions']
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['last4'], '2342')
+
+    def test_registered_charge_is_explained_and_rolls_only_scratch_books(self):
+        due = t.dt.datetime.fromtimestamp(self.now, self.mc.TZ).date().isoformat()
+        self.mc.sub_change(self.mc.DATA, 'acme', dict(merchant='Acme', last4='1111', amount='100',
+                           currency='EUR', cadence='monthly', next_renewal=due), 'add')
+        item = self.alert(90, '100', 'Acme', 600)
+        reasons, held, error = t.charge_checks([item], self.now, False, wd=self.tmp / 'subs')
+        self.assertIsNone(error)
+        self.assertEqual(reasons, {item['id']: 'charge_explained'})
+        self.assertFalse(held)
+        self.assertEqual(self.mc.load_subscriptions(self.mc.DATA)['subscriptions'][0]['next_renewal'], due)
+        row = self.mc.load_subscriptions(self.tmp / 'subs' / 'scratch-money')['subscriptions'][0]
+        self.assertEqual(row['next_renewal'], self.mc.sub_next(due, 'monthly'))
+
+    def test_registered_merchant_with_wrong_amount_still_reaches_classifier(self):
+        due = t.dt.datetime.fromtimestamp(self.now, self.mc.TZ).date().isoformat()
+        self.mc.sub_change(self.mc.DATA, 'acme', dict(merchant='Acme', last4='1111', amount='100',
+                           currency='EUR', cadence='monthly', next_renewal=due), 'add')
+        item = self.alert(91, '200', 'Acme', 600)
+        model, _, runs = self.run_triage([item])
+        self.assertEqual(model.call_args[0][0][0]['id'], item['id'])
+        self.assertNotIn('charge_explained', runs[-1]['dropped'])
+
+    def test_dry_charge_matching_does_not_roll_live_register(self):
+        due = t.dt.datetime.fromtimestamp(self.now, self.mc.TZ).date().isoformat()
+        self.mc.sub_change(self.mc.DATA, 'acme', dict(merchant='Acme', last4='1111', amount='100',
+                           currency='EUR', cadence='monthly', next_renewal=due), 'add')
+        before = (self.mc.DATA / 'subscriptions.json').read_bytes()
+        reasons, _, error = t.charge_checks([self.alert(92, '100', 'Acme', 600)], self.now, True, wd=self.tmp / 'dry-subs')
+        self.assertIsNone(error)
+        self.assertEqual(reasons, {'imsg:92': 'charge_explained'})
+        self.assertEqual((self.mc.DATA / 'subscriptions.json').read_bytes(), before)
 
     def test_generic_renewals_from_different_sender_domains_create_separate_cases(self):
         self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
@@ -619,6 +655,15 @@ class ChargeTests(unittest.TestCase):
         self.assertEqual((qs['20.00']['status'], qs['30.00']['wait_until'] is not None, qs['50.00']['passed'],
                           qs['40.00']['passed']), ('closed', True, True, False))
         self.assertEqual(self.mc.load_questions()['questions'], [])
+
+    def test_delegated_purchase_is_explained_before_the_classifier(self):
+        self.mc.note_purchase(self.mc.DATA, 'CHATGPT', '1920', 'EUR', '1111', 'owner', 'thread:purchase',
+                              'invoice-4', now=dt.datetime.fromtimestamp(self.now - 660, self.mc.TZ))
+        item = self.alert(77, '1920.00', 'CHATGPT', 600)
+        model, state, runs = self.run_triage([item])
+        model.assert_not_called()
+        self.assertEqual(state['queue'], [])
+        self.assertEqual(runs[-1]['dropped']['charge_explained'], 1)
 
     def test_an_unexplained_charge_goes_on_even_when_the_classifier_skips_it(self):
         model, state, runs = self.run_triage([self.alert(4, '50.00', 'UMBRELLA', 600)])

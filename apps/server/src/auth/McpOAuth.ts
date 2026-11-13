@@ -10,6 +10,7 @@ import {
   type AuthMcpTokenRequest,
   type AuthMcpTokenResult,
   type AuthMcpClientAccess,
+  type AuthSessionId,
   type AuthEnvironmentScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -177,6 +178,7 @@ export interface AuthorizationRequest {
 }
 
 interface PendingCode {
+  readonly ownerApprovalSessionId?: AuthSessionId;
   readonly clientId: string;
   readonly clientName: string;
   readonly redirectUri: string;
@@ -203,7 +205,11 @@ export class McpOAuth extends Context.Service<
       request: HttpServerRequest.HttpServerRequest,
       authorization: AuthorizationRequest,
     ) => Effect.Effect<
-      | { readonly csrfToken: string; readonly scopes: ReadonlyArray<AuthEnvironmentScope> }
+      | {
+          readonly csrfToken: string;
+          readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
+          readonly sessionId: AuthSessionId;
+        }
       | undefined
     >;
     readonly approve: (input: {
@@ -376,7 +382,11 @@ const make = Effect.gen(function* () {
         // Approving manages access, and a session may only hand out scopes it holds.
         session.scopes.includes(AuthAccessWriteScope) &&
         session.scopes.includes(AuthOrchestrationReadScope)
-          ? { csrfToken: csrfToken(session.sessionId, authorization), scopes: session.scopes }
+          ? {
+              csrfToken: csrfToken(session.sessionId, authorization),
+              scopes: session.scopes,
+              sessionId: session.sessionId,
+            }
           : undefined,
       ),
       Effect.orElseSucceed(() => undefined),
@@ -385,6 +395,7 @@ const make = Effect.gen(function* () {
   const mintCode = Effect.fn("McpOAuth.mintCode")(function* (
     authorization: AuthorizationRequest,
     access: AuthMcpClientAccess,
+    ownerApprovalSessionId?: AuthSessionId,
   ) {
     const now = yield* Clock.currentTimeMillis;
     const code = Buffer.from(yield* crypto.randomBytes(32).pipe(Effect.orDie)).toString(
@@ -399,6 +410,7 @@ const make = Effect.gen(function* () {
         codeChallenge: authorization.codeChallenge,
         resource: authorization.resource,
         access,
+        ...(ownerApprovalSessionId === undefined ? {} : { ownerApprovalSessionId }),
         expiresAtMs: now + AUTHORIZATION_CODE_TTL_MS,
       });
       return next;
@@ -408,6 +420,7 @@ const make = Effect.gen(function* () {
 
   const approve: McpOAuth["Service"]["approve"] = Effect.fn("McpOAuth.approve")(function* (input) {
     const { decision } = input;
+    let ownerApprovalSessionId: AuthSessionId | undefined;
     if (decision._tag === "pairing-code") {
       yield* environmentAuth.consumeMcpApprovalCode(decision.code, decision.access).pipe(
         Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (cause) =>
@@ -435,8 +448,9 @@ const make = Effect.gen(function* () {
           description: "Your session cannot approve this request. Enter a pairing code instead.",
         });
       }
+      ownerApprovalSessionId = session.sessionId;
     }
-    const code = yield* mintCode(input.authorization, decision.access);
+    const code = yield* mintCode(input.authorization, decision.access, ownerApprovalSessionId);
     yield* Effect.logInfo("Approved an MCP client sign-in.", {
       client: input.authorization.client.name,
       access: decision.access,
@@ -498,6 +512,9 @@ const make = Effect.gen(function* () {
         .issueMcpClientSession({
           label: pending.clientName,
           access: pending.access,
+          ...(pending.ownerApprovalSessionId === undefined
+            ? {}
+            : { ownerApprovalSessionId: pending.ownerApprovalSessionId }),
           client: deriveAuthClientMetadata({ request }),
         })
         .pipe(
@@ -513,7 +530,7 @@ const make = Effect.gen(function* () {
         access_token: issued.token,
         token_type: "Bearer",
         expires_in: Math.max(0, Math.floor((issued.expiresAt.epochMilliseconds - now) / 1000)),
-        scope: encodeOAuthScope(EnvironmentAuth.mcpClientScopes(pending.access)),
+        scope: encodeOAuthScope(issued.scopes),
       };
     },
   );
@@ -549,6 +566,7 @@ export const layerMcpClientAuthenticator = Layer.effect(
                   sessionId: client.sessionId,
                   label: client.label,
                   access: client.access,
+                  maintenanceAuthorized: client.maintenanceAuthorized ?? false,
                 },
                 capabilities: new Set<McpInvocationContext.McpCapability>([
                   "orchestration",

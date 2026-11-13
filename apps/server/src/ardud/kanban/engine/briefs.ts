@@ -11,7 +11,7 @@ import {
 import { reviewRetryNote } from "./retries.ts";
 import { MAX_BATCH } from "./rules.ts";
 import { REVIEW_DELEGATION_GUIDANCE } from "./reviewerRouting.ts";
-import { subtaskIds, subtaskLines } from "./subtasks.ts";
+import { pendingWakeNote, subtaskIds, subtaskLines, wakeLead } from "./subtasks.ts";
 
 const lines = (...parts: ReadonlyArray<string | null | false | undefined>) =>
   parts.filter((part): part is string => typeof part === "string").join("\n");
@@ -40,7 +40,7 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     "",
     "Task:",
     card.prompt.trim() || card.description.trim() || card.title,
-    card.wakeNote?.trim() ? `\nWaiting for this card:\n${card.wakeNote.trim()}` : null,
+    pendingWakeNote(card) ? `\nWaiting for this card:\n${pendingWakeNote(card)}` : null,
     "",
     "How the board works:",
     '- Your card tools: card_get, card_search, card_update, card_move, card_ask, card_flag, subtask_done, discussion_post, wiki_read, evaluator_start (kind "request" only).',
@@ -77,7 +77,9 @@ export const claimBrief = (card: KanbanCard, goal: KanbanGoal | null, note: stri
     "",
     "Task:",
     card.prompt.trim() || card.description.trim() || card.title,
-    note?.trim() ? `\nWaiting for this card:\n${note.trim()}` : null,
+    pendingWakeNote({ ...card, wakeNote: note })
+      ? `\nWaiting for this card:\n${pendingWakeNote({ ...card, wakeNote: note })}`
+      : null,
     "",
     `Pass card "#${card.number}" to card_update, card_move, card_flag and subtask_done for this card. Attach its PRs yourself with card_update (links) before moving it to needs_review: with several cards on this thread the board can't tell which PR is whose.`,
   );
@@ -156,9 +158,13 @@ export const handBackText = (
 
 /** Sent when the dispatcher wakes an existing work thread. */
 export const wakeText = (card: KanbanCard) =>
-  card.wakeNote?.trim()
-    ? lines(`Card #${card.number} is back with you.`, "", card.wakeNote.trim())
-    : `Card #${card.number} is back with you. Continue the work, then card_move to needs_review when done.`;
+  lines(
+    `Card #${card.number} is back with you.`,
+    "",
+    pendingWakeNote(card),
+    subtaskLines(card),
+    "Continue the work, then card_move to needs_review when done.",
+  );
 
 /** Given to the fresh thread that takes over a card whose thread got too long. */
 export const FRESH_THREAD_NOTE = lines(
@@ -192,7 +198,7 @@ export const reviewBrief = (
     continuing ? null : "What the card asked for:",
     continuing ? null : card.prompt.trim() || card.description.trim() || card.title,
     // A reviewer woken on its own thread (a wait that ended, new commits) needs the note too.
-    card.wakeNote?.trim() ? `\nNote for this review:\n${card.wakeNote.trim()}` : null,
+    wakeLead(card.wakeNote) ? `\nNote for this review:\n${wakeLead(card.wakeNote)}` : null,
     priorFindings.length > 0 && !continuing
       ? `\nEarlier review findings (check they are fixed):\n${priorFindings.join("\n")}`
       : null,
@@ -201,7 +207,7 @@ export const reviewBrief = (
     card.subtasks.length > 0
       ? "Check the subtasks the worker marked done really are; a clear verdict ticks off the review's own."
       : null,
-    "Finish by calling card_review_result once, with head set to the commit you reviewed (the PR's head sha, or `git rev-parse HEAD` on the card's branch). If the call fails with a connection error or timeout, card_get the card: if no review event from you at that head is there, call it again with the same verdict, findings and head (an exact repeat is ignored, so retrying is safe):",
+    "Finish by calling card_review_result once, with head set to the commit you reviewed (the PR's head sha, or `git rev-parse HEAD` on the card's branch). If the call fails with a connection error or timeout, card_get the card: if no review event from you at that head is there, call it again with the same verdict, findings and head (an exact repeat within 10 minutes, if the card has not moved since, is acknowledged with a replay note; later calls are refused unless this thread is assigned to the review step):",
     '- verdict "findings" with each finding as one actionable line. The card goes back to the worker.',
     '- verdict "clear" when nothing must change.',
     'After that call, end your final message with one line: "Verdict: clear" or "Verdict: changes needed: <top finding>".',
@@ -339,7 +345,7 @@ export const workerQuestionText = (
 
 /** Handed to an evaluator that asked on a card before the card discussion got its own evaluator. */
 export const cardHandoffText = (cardNumber: number, discussionId: string, threadId: string) =>
-  `The owner followed up in the discussion of card #${cardNumber} (${discussionId}), and it now has its own evaluator (${threadId}), which owns #${cardNumber} from here. Don't change #${cardNumber} on your earlier ask; if you know something it needs, post it in that discussion.`;
+  `The discussion of card #${cardNumber} (${discussionId}) now has its own evaluator (${threadId}), which owns #${cardNumber} from here. Don't change #${cardNumber} on your earlier ask; only post if you have information the new evaluator doesn't already have on the card or in the discussion.`;
 
 /** Start text for a new card evaluator: the evaluators that asked there first may have acted already. */
 export const priorAskerText = (threadIds: ReadonlyArray<string>) =>
@@ -352,7 +358,13 @@ export const priorAskerText = (threadIds: ReadonlyArray<string>) =>
 
 export const nudgeWorkText = (cards: ReadonlyArray<KanbanCard>) => {
   const names = cards.map((card) => `#${card.number}`).join(", ");
-  return `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working and your turn ended. A card can't stay in Working while you are stopped, so do one of these now for each: if it is done, card_move to needs_review; if you need the owner's answer to go on, card_ask with blocking true (the card waits in Needs Owner); if you can't go on, card_flag with the reason (it goes back to To Do and the evaluator is told); otherwise keep working on it now. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. For a deploy or anything else, wait inside your turn.`;
+  const instruction = `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working and your turn ended. A card can't stay in Working while you are stopped, so do one of these now for each: if it is done, card_move to needs_review; if you need the owner's answer to go on, card_ask with blocking true (the card waits in Needs Owner); if you can't go on, card_flag with the reason (it goes back to To Do and the evaluator is told); otherwise keep working on it now. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. For a deploy or anything else, wait inside your turn.`;
+  return lines(
+    instruction,
+    ...cards.map((card) =>
+      lines(`Card #${card.number}:`, pendingWakeNote(card), subtaskLines(card)),
+    ),
+  );
 };
 
 export const runFailedText = (
@@ -412,3 +424,6 @@ export const writerPrompt = (card: Pick<KanbanCard, "prompt" | "title" | "descri
     "Task:",
     card.prompt || card.description || card.title,
   );
+
+export const threadModelDiffersText = (card: KanbanCard, reason: string) =>
+  `Card #${card.number} was not started: ${reason}. It is flagged stalled. Fix the thread's model or card_edit the card's model, then clear the flag with card_flag stalled false and say in the card's discussion what you changed.`;

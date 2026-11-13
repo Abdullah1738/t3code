@@ -313,6 +313,22 @@ export function applyOrchestrationV2ProjectionEvent(
       return { ...base, messages: upsertEntity(base.messages, event.payload) };
     case "plan.updated":
       return { ...base, plans: upsertEntity(base.plans, event.payload) };
+    case "thread.item-redacted": {
+      // The state owner invalidates disk caches and reloads the complete thread;
+      // direct reducer consumers must also stop displaying the affected item.
+      const marker = `[redacted ${event.payload.at}: ${event.payload.reason}]`;
+      const redact = (item: OrchestrationV2TurnItem): OrchestrationV2TurnItem => {
+        if (item.id !== event.payload.itemId) return item;
+        if (item.type === "command_execution" || item.type === "dynamic_tool")
+          return { ...item, output: marker };
+        return item;
+      };
+      return {
+        ...base,
+        turnItems: base.turnItems.map(redact),
+        visibleTurnItems: base.visibleTurnItems.map((row) => ({ ...row, item: redact(row.item) })),
+      };
+    }
     case "turn-item.updated": {
       // Streamed updates land on the newest items, so search from the end.
       let itemIndex = projection.turnItems.length - 1;

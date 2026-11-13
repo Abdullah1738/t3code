@@ -325,6 +325,28 @@ def state_problem() -> str | None:
     return None
 
 
+VPN_FLAG = Path("/etc/offbox/vpn-enabled")   # written by home/mullvad.sh: this host's boxes only get out through Mullvad
+VPN_GRACE_S = 120                            # the daemon changes relay by itself; shorter gaps are not an outage
+_VPN = {"down_since": None}
+
+
+def vpn_problem() -> str | None:
+    """Why boxes have no internet right now, or None. Only on a host where the VPN is meant to be on: lockdown
+    keeps everything in while the tunnel is down, so runs would be accepted here and then fail on every download."""
+    if not VPN_FLAG.exists():
+        return None
+    rc, out = _sh(["mullvad", "status"], timeout=10)
+    state = (out.strip().splitlines() or ["no answer"])[0].strip()
+    if rc == 0 and state.startswith("Connected"):
+        _VPN["down_since"] = None
+        return None
+    if _VPN["down_since"] is None:
+        _VPN["down_since"] = now()
+    if now() - _VPN["down_since"] < VPN_GRACE_S:
+        return None
+    return f"vpn tunnel is down ({state[:60]}); boxes have no internet"
+
+
 READY = threading.Event()          # set once the state is there and the start-up reconcile has finished
 STATE = {"problem": "starting", "reconcile": None}
 _HEALTH = {"ts": 0.0, "v": None}
@@ -350,6 +372,10 @@ def health(fresh: bool = False) -> dict:
         if rc != 0:
             ok = False
             reasons.append("incus is not answering")
+        vpn = vpn_problem()
+        if vpn:
+            ok = False
+            reasons.append(vpn)
         queue = running = None
         if READY.is_set():
             try:

@@ -1,7 +1,7 @@
 """Is a card alert already explained, before anyone asks the owner about it?
 
 Owner rule (nightly 2026-10-24): before asking about a charge, look for its receipt or order mail
-(same amount and merchant, from two hours before the charge on), look at what he typed in his own
+(same amount and merchant, from two hours before to 36 hours after the charge), look at what he typed in his own
 threads around the charge, and when it's a merchant he already pays, wait for the receipt ("Wait for
 the email", 24 Oct). Only a charge none of these explain goes to him.
 """
@@ -364,11 +364,22 @@ def last_four(charge):
     return re.compile(rf'(?<!\d){charge["card"]}(?!\d)')
 
 
+CHAT_LINE = re.compile(r'^(?P<mark>[ >]) +\d+ [\d?]{4}-[\d?]{2}-[\d?]{2} [\d?]{2}:[\d?]{2} [^:]*: ')
+
+
 def alert_text(shown):
-    """The message itself from msgs show: a chat is shown with its neighbours, its own line marked >."""
+    """Selected msgs-show body, including continuations but excluding neighboring messages."""
+    body = None
     for line in shown.splitlines():
-        if line.startswith('>'):
-            return re.sub(r'^>\s*\d+ \S+ \S+ [^:]*: ', '', line)
+        header = CHAT_LINE.match(line)
+        if body is not None:
+            if header:
+                break
+            body.append(line)
+        elif header and header['mark'] == '>':
+            body = [line[header.end():]]
+    if body is not None:
+        return '\n'.join(body)
     return shown
 
 
@@ -381,9 +392,16 @@ def body_key(text):
     return ' '.join(' '.join(lines).split())
 
 
-def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, stats=None):
+def receipt_window(at, now, named):
+    before, after = (RECEIPT_BEFORE, WAIT) if named else (SAME_TIME, SAME_TIME)
+    # Bank alert times may be quoted only to the minute. Keep that allowance identical
+    # for candidate matching, archive bounds and checks for competing charges.
+    return at - before, min(min(now, at + after) + dt.timedelta(minutes=1), at + WAIT)
+
+
+def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, stats=None, receipt_ok=None):
     """The receipt or order mail for a charge. It shows the amount as money in the charge's currency
-    and reads as a receipt, and either names the merchant (from two hours before the charge on) or,
+    and reads as a receipt, and either names the merchant (from two hours before to 36 hours after) or,
     under another name, shows the card's last four digits within 15 minutes of it. Search hits are
     checked against the mail itself."""
     options = {'memo': memo, 'stats': stats} if memo is not None else {}
@@ -395,18 +413,23 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
     named = re.compile(r'\b(?:' + '|'.join(map(re.escape, names)) + r')\b', re.I) if names else None
     tries = []
     if names:
-        tries.append((amount + ' ' + ' OR '.join(f'"{w}"' for w in names), at - RECEIPT_BEFORE, now,
+        # Questions can remain unanswered indefinitely; a later recurring purchase's receipt
+        # must not explain them merely because its merchant and amount happen to repeat.
+        tries.append((amount + ' ' + ' OR '.join(f'"{w}"' for w in names), *receipt_window(at, now, True),
                       lambda text: named.search(text) and RECEIPT_WORDS.search(text)))
-    tries.append((amount, at - SAME_TIME, min(now, at + SAME_TIME),
+    tries.append((amount, *receipt_window(at, now, False),
                   lambda text: card.search(text) and RECEIPT_WORDS.search(text)))
     reads, seen_bodies = 0, set()
     for query, start, end, proves in tries:
         # Usage notices with the same amount and merchant can fill a page of hits, so the search goes
         # wider than one page. Reads are capped, and a body already read counts for nothing new: a
         # run of identical notices must not use up the reads before the receipt.
-        for row in find(query, day(start), source='email', n=RECEIPT_HITS, deadline=deadline):
+        # msgs accepts date bounds, with an exclusive until. Include the final day;
+        # the exact shared timestamp window below filters the remaining partial day.
+        until = day(end + dt.timedelta(days=1))
+        for row in find(query, day(start), until=until, source='email', n=RECEIPT_HITS, deadline=deadline):
             ts = row.get('ts') or 0
-            if not (start.timestamp() <= ts <= end.timestamp() + 60) or row.get('from_me') \
+            if not (start.timestamp() <= ts <= end.timestamp()) or row.get('from_me') \
                     or BANKS.search(str(row.get('sender') or '')):
                 continue
             text = read(row, deadline)
@@ -418,7 +441,11 @@ def receipt(charge, at, now, find=None, deadline=None, read=None, memo=None, sta
             reads += 1
             seen_bodies.add(key)
             if money.search(text) and proves(text):
-                return row
+                if receipt_ok is None or receipt_ok(row, text):
+                    return row
+                # Identical receipt bodies can be sent for separate transactions. A rejected
+                # ambiguous copy must not hide an older, uniquely correlated receipt.
+                seen_bodies.discard(key)
     return None
 
 
@@ -544,11 +571,11 @@ def known(charge, at, find=None, deadline=None, read=None):
     return None
 
 
-def found(charge, at, now, deadline=None, find=None, said=None, errors=None, memo=None, stats=None):
+def found(charge, at, now, deadline=None, find=None, said=None, errors=None, memo=None, stats=None, receipt_ok=None):
     """A receipt or his own words that explain the charge, or None."""
     errors = [] if errors is None else errors
     try:
-        row = receipt(charge, at, now, find, deadline, memo=memo, stats=stats)
+        row = receipt(charge, at, now, find, deadline, memo=memo, stats=stats, receipt_ok=receipt_ok)
         if row:
             when = dt.datetime.fromtimestamp(row['ts'], TZ).strftime('%a %d %b %H:%M')
             return {'verdict': 'receipt', 'why': f"receipt {when}: {row.get('sender', '')} - {row.get('subject', '')}"[:200],
@@ -579,7 +606,7 @@ def owner_found(charge, at, now, deadline=None, said=None, errors=None):
     return None
 
 
-def explain(charge, at, now, deadline=None, find=None, said=None):
+def explain(charge, at, now, deadline=None, find=None, said=None, receipt_ok=None):
     """verdict receipt | owner | wait | ask, with why and any lookup errors."""
     errors = []
     owner = card_owner(charge)
@@ -587,7 +614,7 @@ def explain(charge, at, now, deadline=None, find=None, said=None):
         return {'verdict': 'held', 'why': 'held for Moni', 'errors': []}
     if charge['kind'] != 'charge':
         return {'verdict': 'ask', 'why': 'a declined payment goes to him', 'errors': errors}
-    hit = found(charge, at, now, deadline, find, said, errors)
+    hit = found(charge, at, now, deadline, find, said, errors, receipt_ok=receipt_ok)
     if hit:
         return hit
     if errors:

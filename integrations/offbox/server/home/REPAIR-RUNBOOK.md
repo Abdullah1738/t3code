@@ -41,11 +41,12 @@ Each shell call starts fresh, so begin every batch with this:
 STATE=~/.local/share/offbox
 IP=$(/usr/bin/python3 -c 'import json,sys,urllib.parse; print(urllib.parse.urlsplit(json.load(open(sys.argv[1]))["url"]).hostname)' $STATE/server.json)
 TS=$(command -v tailscale || echo /Applications/Tailscale.app/Contents/MacOS/Tailscale)
-# box 'command': root on the server over the tailnet. Another address: HOST=offbox-server.local box 'command'.
+# box 'command': root on the server over the tailnet. Another address: BOX_ADDR=offbox-server.local box 'command'.
+# (Not HOST: zsh sets HOST to this Mac's name, and the ssh would go to the Mac. Seen 2026-11-12.)
 # There is no ssh config file for the server: it is always this explicit command. The host key was pinned
 # under the tailnet IP by bootstrap.zsh, hence HostKeyAlias.
 box() { ssh -i ~/.ssh/offbox_server -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=8 \
-      -o UserKnownHostsFile=$STATE/server_known_hosts -o HostKeyAlias=$IP root@${HOST:-$IP} "$@"; }
+      -o UserKnownHostsFile=$STATE/server_known_hosts -o HostKeyAlias=$IP root@${BOX_ADDR:-$IP} "$@"; }
 ```
 
 What the monitor wrote: `$STATE/backend-state.json` (what offbox believes), `$STATE/home-monitor.log` (every
@@ -78,7 +79,7 @@ $TS ping -c 3 --timeout 5s offbox-server
 - Listed but **offline**: the box is off, hung, restarting, without internet, or its tailscaled is down.
   Step 3 if the Mac is at home, otherwise step 5.
 - Not listed, or only `offbox-server-1`: the box rejoined as a new node (after an OS reinstall) and has a new
-  address. If `HOST=<new-ip> box offbox-status` works, `integrations/offbox/server/bootstrap.zsh <new-ip> client`
+  address. If `BOX_ADDR=<new-ip> box offbox-status` works, `integrations/offbox/server/bootstrap.zsh <new-ip> client`
   writes the new address into `server.json`. Report that the stale node should be deleted in the Tailscale
   admin console.
 - Listed as expired or needing login: should not happen (the node is tagged). Rejoining needs a new auth key:
@@ -88,12 +89,12 @@ $TS ping -c 3 --timeout 5s offbox-server
 
 ```bash
 dscacheutil -q host -a name offbox-server.local      # an ip_address line = the Mac is on the box's LAN
-HOST=offbox-server.local box 'offbox-status'
+BOX_ADDR=offbox-server.local box 'offbox-status'
 ```
 
 - No `ip_address`: the Mac is not on that LAN (or the box is off). Nothing more to learn here: step 5.
 - SSH works over the LAN but not over the tailnet: the box is up and off the tailnet.
-  `HOST=offbox-server.local box 'tailscale status | head -3; journalctl -u tailscaled -u offbox-tailscale-join -n 40 --no-pager; ping -c2 1.1.1.1'`.
+  `BOX_ADDR=offbox-server.local box 'tailscale status | head -3; journalctl -u tailscaled -u offbox-tailscale-join -n 40 --no-pager; ping -c2 1.1.1.1'`.
   No internet on the box = the home router or ISP: nothing to fix on the box, say so. tailscaled stopped:
   `systemctl restart tailscaled`. Logged out: a new auth key is needed (Abdullah).
 
@@ -127,6 +128,10 @@ owners), `boatd token list`. While it is degraded, `journalctl -u boatd` has one
 | `incus` failed with its state mounted | boxes cannot start | `journalctl -u incus -n 60`; `systemctl restart incus`, then `systemctl restart boatd` |
 | root file system full (`df -h /`) | units fail | delete old logs: `journalctl --vacuum-size=500M`. Nothing under `/var/lib/boatd` or `/var/lib/incus` |
 | SSH answers and `systemctl is-active emergency.target` = `active` | emergency mode; it restarts by itself in 10 min | `touch /run/offbox/hold` keeps it up; `systemctl --failed`, fix the failed mount or unit, `reboot` |
+| nothing answers on the tailnet, but `BOX_ADDR=offbox-server.local box 'mullvad status'` works from the LAN | the VPN's tailnet exemption is broken (FAILURE-MODES 3.30, 3.31) | from the LAN: `box 'offbox-mullvad install; systemctl restart tailscaled; offbox-mullvad check'` |
+| tailnet and LAN both dead, console at the login prompt, `nft list tables` there shows `inet mullvad` with `mullvad status` = Disconnected | Mullvad's early-boot blocker ran (FAILURE-MODES 3.29) | on the console: `nft delete table inet mullvad`, then `offbox-mullvad install` (masks that unit) |
+| `/health` says "vpn tunnel is down", or runs fail on downloads and `box 'mullvad status'` is not `Connected` | the VPN tunnel is down; lockdown keeps everything in (FAILURE-MODES 3.34) | `box 'mullvad status -v; mullvad account get \| sed 1d'`; try `box 'mullvad relay set location fr mrs'`. Do NOT run `offbox-mullvad off` without Abdullah's OK |
+| boxes do not start, `incus info --show-log <box>` says "unsupported cgroup layout" | Mullvad's cgroup v1 mount is back under `/sys/fs/cgroup` (FAILURE-MODES 3.32) | the fix in that row |
 | SSH works but `offbox-status` is missing | a half-finished install (FAILURE-MODES 2.13a) | stop; that fix is a reinstall, which needs Abdullah's OK |
 
 A restart is safe at any time and is the box's own remedy: `box reboot`. `poweroff` and `halt` also end in a
@@ -135,7 +140,9 @@ restart. Wait 10 minutes after it (see the waiting times in step 5) before decid
 ## 5. The KVM (eyes and hands when nothing answers)
 
 A GL.iNet Comet sits on the box's HDMI and USB ports with its board on the power and reset pins. Its address is
-in the environment as `OFFBOX_KVM_URL` (the same variable `home/watch-install.zsh` reads). It is a web page:
+in the environment as `OFFBOX_KVM_URL` (the same variable `home/watch-install.zsh` reads). When that is empty,
+it is the tailnet node `glkvm` (`https://glkvm`, or its address from `$TS status | grep glkvm`; self-signed
+certificate; login `admin`, password in Keychain `comet-kvm-admin`). It is a web page:
 open it in your own Dia window. Nothing in this repo drives it. If the variable is empty or the page does not
 load, the KVM is not available (FAILURE-MODES 1.14): go to "When only a person can help".
 

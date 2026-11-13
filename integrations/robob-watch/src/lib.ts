@@ -76,6 +76,7 @@ export type Watcher = {
   title: string;
   check: string;
   interval_s: number;
+  timeout_s?: number;
   mode: Mode;
   context: string;
   expires_at: string | null;
@@ -118,6 +119,8 @@ export type State = {
   next_at?: number;
   consecutive_failures: number;
   failure_alerted: boolean;
+  load_timeouts?: number;
+  load_timeout_since?: string;
   failure_paused_at?: string;
   last_error?: string;
   /** When the current run of consecutive failures started. */
@@ -224,6 +227,8 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (typeof input.check !== "string" || !input.check.trim()) errors.push("check command is required");
   const interval = input.interval_s === undefined ? DEFAULT_INTERVAL : Number(input.interval_s);
   if (!Number.isInteger(interval) || interval < MIN_INTERVAL) errors.push(`interval_s must be an integer >= ${MIN_INTERVAL}`);
+  const timeout = input.timeout_s;
+  if (timeout !== undefined && (!Number.isInteger(timeout) || timeout < 1 || timeout > 600)) errors.push("timeout_s must be an integer from 1 to 600");
   const mode = input.mode ?? "wake";
   if (mode !== "wake" && mode !== "notify") errors.push("mode must be wake or notify");
   let triggers = input.triggers === undefined ? [] : input.triggers;
@@ -264,6 +269,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     // Only checks that drive the old whatscli TUI need the shared lock; whatsapp-new-message reads a DB now.
     max_fires: maxFires, serial: input.serial === true || /(^|[\s;|&(`$])wa\s+(tui|screen)\b/.test(input.check!),
     paused: input.paused === true,
+    ...(timeout !== undefined ? { timeout_s: timeout } : {}),
     ...(maxFailures !== undefined ? { max_consecutive_failures: maxFailures } : {}),
     ...(depends !== undefined ? { depends: [...new Set(depends)] } : {}),
     ...(triggers.length ? { triggers: (triggers as string[]).map(t => t.trim().replace(/^~(?=\/)/, HOME)) } : {}),
@@ -321,7 +327,7 @@ export type CheckResult = { code: number | null; stdout: string; stderr: string;
  * than KILL_GRACE_MS past the timeout: a SIGKILLed process that the scheduler has not reaped yet must not keep
  * its watcher blocked (3 Oct 2026: killed checks lingered 9+ minutes and their watchers never re-ran).
  */
-export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = CHECK_TIMEOUT_MS): Promise<CheckResult> {
+export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000): Promise<CheckResult> {
   const shell = watcher.serial ? ["/usr/bin/lockf", "-k", "-t", "120", WA_LOCK, "/bin/zsh", "-c", watcher.check] : ["/bin/zsh", "-c", watcher.check];
   const started = now();
   return new Promise(resolve => {
@@ -348,7 +354,7 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
       try { process.kill(-child.pid!, "SIGKILL"); } catch { /* already gone */ }
       grace = setTimeout(() => {
         try { child.stdout!.destroy(); child.stderr!.destroy(); child.unref(); } catch { /* ignore */ }
-        finish(null, `\n[robob-watch] process group ${child.pid} not reaped ${KILL_GRACE_MS / 1000}s after SIGKILL`);
+        finish(child.exitCode, `\n[robob-watch] process group ${child.pid} not reaped ${KILL_GRACE_MS / 1000}s after SIGKILL`);
       }, KILL_GRACE_MS);
     }, timeoutMs);
     child.on("close", code => finish(code));
@@ -429,9 +435,9 @@ export async function imessage(text: string, key: string): Promise<{ ok: boolean
   return run([BUN, cli, "send", "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
 }
 
-export function telegram(source: string, text: string, key: string, severity = "info"): Promise<{ ok: boolean; out: string }> {
+export function telegram(source: string, text: string, key: string, severity = "info", burstKey?: string): Promise<{ ok: boolean; out: string }> {
   if (underTest() && !process.env.ROBOB_WATCH_TELEGRAM_CLI) return Promise.resolve(refused("telegram notify"));
-  return run([BUN, telegramCli(), "notify", "--source", telegramSource(source), "--severity", severity, "--text", clip(text, MAX_WAKE), "--key", key]);
+  return run([BUN, telegramCli(), "notify", "--source", telegramSource(source), "--severity", severity, "--text", clip(text, MAX_WAKE), "--key", key, ...(burstKey ? ["--burst-key", burstKey] : [])]);
 }
 
 /** Env a check child gets: its own inputs plus, under a test run, the test markers and every stub override,
@@ -645,7 +651,8 @@ export async function deliver(watcher: Watcher, event: string, key: string, stat
 
 /** Housekeeping notices (failures, expiry) go to the alert channel first, iMessage second. */
 export async function alert(watcher: Watcher, text: string, key: string, severity = "attention"): Promise<Delivery> {
-  const notified = await telegram(`Watcher ${watcher.id}`, text, key, severity);
+  const notified = await telegram(`Watcher ${watcher.id}`, text, key, severity,
+    severity === "error" ? `watcher-failure:${watcher.id}` : undefined);
   if (notified.ok) return { ok: true, via: "telegram", detail: notified.out };
   const sent = await imessage(`${watcher.title}: ${text}`, key);
   return sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${notified.out} | ${sent.out}` };
@@ -655,16 +662,6 @@ export function shouldPause(watcher: Watcher, state: State, timedOut: boolean, t
   const threshold = watcher.max_consecutive_failures ?? FAILURE_ALERT_AFTER;
   return threshold > 0 && state.consecutive_failures >= threshold
     && (!timedOut || t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS);
-}
-
-/**
- * A real error alerts after FAILURE_ALERT_AFTER failures in a row. Timeouts are transient (a stalled CLI or a
- * load spike), so a run of them alerts only once it has also lasted TIMEOUT_ALERT_AFTER_MS.
- */
-export function shouldAlert(state: State, timedOut: boolean, t = now()): boolean {
-  if (state.failure_alerted || state.consecutive_failures < FAILURE_ALERT_AFTER) return false;
-  if (!timedOut) return true;
-  return t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS;
 }
 
 /**

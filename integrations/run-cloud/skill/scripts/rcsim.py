@@ -411,20 +411,6 @@ def register(con, sess: dict, platform: str, me: dict, purpose: str | None, sour
     event(con, sess["id"], "register", f"source={source} owner={me.get('thread')} manager={me.get('manager')}")
 
 
-def announce(sess: dict, platform: str, me: dict, purpose: str | None) -> bool:
-    url = sess.get("url")
-    lines = [f"Run Cloud {'iOS simulator' if platform == 'ios' else 'Android emulator'} up: {sess.get('displayName') or sess['id'][:8]}"]
-    if me.get("title"):
-        lines.append(f"Thread: {me['title']}")
-    if purpose:
-        lines.append(f"Purpose: {purpose}")
-    lines.append(f"Id: {sess['id']}")
-    lines.append(f"Hard stop: {hhmm(iso_ts(sess.get('expiresAt')))} (Dubai)")
-    if url:
-        lines.append(url)
-    return telegram("\n".join(lines), f"rcsim:{sess['id']}:up")
-
-
 def label_args(me: dict, purpose: str | None) -> list[str]:
     out = ["--label", "rcsim=1"]
     if me.get("thread"):
@@ -464,7 +450,7 @@ def print_created(sess: dict, platform: str, me: dict, notified: bool, as_json: 
     print(f"owner thread: {me.get('thread') or '(none: not running in a Robob thread)'}")
     if me.get("manager"):
         print(f"manager thread: {me['manager']}")
-    print(f"hard stop: {hhmm(exp)} Dubai ({sess.get('expiresAt')})  telegram link sent: {'yes' if notified else 'NO'}")
+    print(f"hard stop: {hhmm(exp)} Dubai ({sess.get('expiresAt')})")
     print(f"next heartbeat due by {hhmm(now() + HEARTBEAT_S)}: rcsim heartbeat {sess['id']}")
     print(f"release when done: rcsim release {sess['id']}")
 
@@ -489,7 +475,7 @@ def cmd_create(a) -> None:
         print(json.dumps(redact(data)) if data else (out + err).strip(), file=sys.stderr)
         die("runcloud create failed", 1)
     register(con, data, a.platform, me, a.purpose, "rcsim")
-    notified = False if a.no_notify else announce(data, a.platform, me, a.purpose)
+    notified = False
     print_created(data, a.platform, me, notified, a.json)
 
 
@@ -515,7 +501,7 @@ def cmd_launch(a) -> None:
         print(json.dumps(redact(data)) if data else (out + err).strip(), file=sys.stderr)
         die("runcloud mobile launch failed", 1)
     register(con, sess, a.platform, me, a.purpose, "rcsim", launch_id=data.get("id"))
-    notified = False if a.no_notify else announce(sess, a.platform, me, a.purpose)
+    notified = False
     print_created(sess, a.platform, me, notified, a.json)
 
 
@@ -836,8 +822,6 @@ def monitor(dry: bool = False) -> None:
                      f"Deleting it at {hhmm(t + ORPHAN_GRACE_S)} unless an agent runs `rcsim claim {sid}`."
                      + (f"\n{s['url']}" if s.get("url") else ""),
                      f"rcsim:{sid}:orphan", "info")
-        else:
-            announce(s, s["platform"], me, tags.get("purpose"))
 
     # 3. enforce ownership + heartbeats
     for row in con.execute("SELECT * FROM sims WHERE state='active'").fetchall():
@@ -955,7 +939,7 @@ def main() -> None:
                         help="viewer-enforced idle timeout (default none; heartbeats + hard timeout protect cost)")
         sp.add_argument("--thread", help="owner Robob thread id (default: this session's thread)")
         sp.add_argument("--manager", help="manager thread id (default: parent thread for subagents; 'none' to disable)")
-        sp.add_argument("--no-notify", action="store_true", help="skip the Telegram link (rare)")
+        sp.add_argument("--no-notify", action="store_true", help="deprecated; session creation no longer sends Telegram notices")
         sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("create", help="create a simulator/emulator session")

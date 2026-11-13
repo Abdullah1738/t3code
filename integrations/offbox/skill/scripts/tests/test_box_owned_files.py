@@ -39,8 +39,15 @@ class BoxOwnedFilesTests(unittest.TestCase):
         self.real_run = subprocess.run
         self.denials = 0
         stack.enter_context(patch.object(ssh_sync, "log"))
+        stack.enter_context(patch.object(ssh_sync, "_watch_rsync", side_effect=self.watch_local))
+        stack.enter_context(patch.object(ssh_sync, "_progress_args", return_value=()))
+
         stack.enter_context(patch.object(ssh_sync.subprocess, "run", side_effect=self.run_local))
         self.ssh = stack.enter_context(patch.object(ssh_sync, "ssh", side_effect=AssertionError("no ssh expected")))
+
+    def watch_local(self, cmd, timeout, input=None, **kwargs):
+        return subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape",
+                              timeout=timeout, input=input)
 
     def run_local(self, cmd, **kwargs):
         if cmd[0] == ssh_sync.RSYNC and self.denials:

@@ -1,3 +1,4 @@
+import { sqliteErrorDetails } from "./nodeSqliteErrors.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
@@ -665,4 +666,62 @@ it.live(
       { readerStatementLimit: "8 seconds", readerWedgeLimit: "60 seconds" },
     ),
   30_000,
+);
+
+it.live.each([779, 26, 10])(
+  "records late primary storage error %i after the caller abandoned its read",
+  (errcode) => {
+    const started = Promise.withResolvers<void>();
+    const observations: unknown[] = [];
+    let deliver: ((reply: unknown) => void) | undefined;
+    let queryId: unknown;
+    const start = ReaderProcess.startReaderProcess;
+    const spy = vi.spyOn(ReaderProcess, "startReaderProcess").mockImplementation((...args) => {
+      const runtime = start(...args);
+      const on = runtime.on;
+      runtime.on = (event, listener) => {
+        if (event === "message") deliver = listener;
+        return on(event, listener);
+      };
+      const post = runtime.postMessage;
+      runtime.postMessage = (input) => {
+        if (
+          typeof input === "object" &&
+          input !== null &&
+          "sql" in input &&
+          String(input.sql).includes("late_fault") &&
+          "id" in input
+        ) {
+          queryId = input.id;
+          started.resolve();
+        } else post(input);
+      };
+      return runtime;
+    });
+    return withLaneClient(
+      (sql) =>
+        Effect.gen(function* () {
+          yield* sql`SELECT 1`.pipe(SqliteClient.authReadOnly);
+          const read = yield* sql`SELECT 1 AS late_fault`.pipe(
+            SqliteClient.authReadOnly,
+            Effect.forkChild,
+          );
+          yield* Effect.promise(() => started.promise);
+          yield* Fiber.interrupt(read);
+          deliver!({
+            id: queryId,
+            error: {
+              operation: "execute",
+              message: "malformed",
+              errcode,
+              errstr: "database disk image is malformed",
+            },
+          });
+          assert.equal(observations.length, 1);
+          assert.equal(sqliteErrorDetails(observations[0])?.errcode, errcode);
+          assert.equal(sqliteErrorDetails(observations[0])?.context?.role, "primary");
+        }),
+      { errorObserver: (cause) => observations.push(cause) },
+    ).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+  },
 );

@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ FLOW='10000000-0000-4000-8000-000000000001'
 
 class PreorderTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         p=patch.object(j,'ROOT',Path(temp.name).resolve()/'commerce');p.start();self.addCleanup(p.stop)
         j.open_flow(flow_id=FLOW,app='noon',vertical='nownow',account_hash='1'*64,scope_hash='2'*64)
@@ -28,6 +30,9 @@ class PreorderTests(unittest.TestCase):
         j.observe(FLOW,'place',outcome='ORDER_ID_RECEIVED',evidence_hash='8'*64,order_id='NNEXACT')
         j.observe(FLOW,'place',outcome='EXACT_ORDER_CONFIRMED',evidence_hash='9'*64,order_id='NNEXACT')
         j.observe(FLOW,'place',outcome='TRACKER_REGISTERED',evidence_hash='a'*64,order_id='NNEXACT')
+        with self.assertRaisesRegex(j.JournalError, 'FULL_ORDER_CAPTURE_REQUIRED'):
+            j.complete(FLOW)
+        j.observe(FLOW,'place',outcome='PAYMENT_REPORTED_SUCCESS',evidence_hash='b'*64,order_id='NNEXACT')
         self.assertEqual(j.complete(FLOW)['state'],'COMPLETE')
         self.assertEqual(j.inspect(FLOW)['campaign_reserved_minor'],2500)
 

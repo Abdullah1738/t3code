@@ -59,6 +59,78 @@ function host(
 
 const iso = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
 
+it.effect(
+  "CI reads active runs despite newer green thread snapshots, retaining the read cadence",
+  () => {
+    const { asked, live } = host(() =>
+      Effect.succeed(
+        detail({
+          checks: [
+            { name: "Build", status: "success", required: true, description: null, url: null },
+            {
+              name: "CI workflow run 43042659234",
+              status: "pending",
+              description: null,
+              url: null,
+            },
+          ],
+        }),
+      ),
+    );
+    return Effect.gen(function* () {
+      const reader = yield* KanbanWaitPrs;
+      const snapshot = (at: number): WaitPrFacts => ({
+        url: pr(512),
+        state: "open",
+        at: iso(at),
+        head: "a1b2c3d4e5f6",
+        checks: "passing",
+      });
+      const first = yield* reader.read([
+        request(512, { live: snapshot(0) }),
+        request(512, { needsChecks: true, live: snapshot(0) }),
+      ]);
+      assert.strictEqual(asked.length, 1);
+      assert.strictEqual(first.readings[0]?.checks, "pending");
+      assert.deepStrictEqual(first.readings[0]?.failedChecks, []);
+      yield* TestClock.adjust(30_000);
+      const second = yield* reader.read([
+        request(512, { needsChecks: true, live: snapshot(30_000) }),
+      ]);
+      assert.strictEqual(asked.length, 1);
+      assert.strictEqual(second.readings[0]?.checks, "pending");
+      const full = first.readings[0]!;
+      const covered = yield* reader.read([
+        request(513, { needsChecks: true, live: { ...full, url: pr(513), at: iso(30_000) } }),
+      ]);
+      assert.strictEqual(asked.length, 1);
+      assert.strictEqual(covered.readings[0]?.checks, "pending");
+      yield* TestClock.adjust(WAIT_PR_READ_MIN_MS);
+      yield* reader.read([
+        request(512, { needsChecks: true, live: snapshot(30_000 + WAIT_PR_READ_MIN_MS) }),
+      ]);
+      assert.strictEqual(asked.length, 2);
+    }).pipe(Effect.provide(live));
+  },
+);
+
+it.effect("CI cannot use a green snapshot when the detailed check read fails", () => {
+  const { live } = host(() =>
+    Effect.fail(new PullRequestOperationError({ operation: "detail", detail: "unavailable" })),
+  );
+  return Effect.gen(function* () {
+    const reader = yield* KanbanWaitPrs;
+    const pass = yield* reader.read([
+      request(512, {
+        needsChecks: true,
+        live: { url: pr(512), state: "open", checks: "passing", at: iso(0) },
+      }),
+    ]);
+    assert.deepStrictEqual(pass.readings, []);
+    assert.deepStrictEqual(pass.failed, [pr(512)]);
+  }).pipe(Effect.provide(live));
+});
+
 it.effect("reads each pull request once per pass, however many requests name it", () => {
   const { asked, live } = host();
   return Effect.gen(function* () {
@@ -81,8 +153,22 @@ it.effect("reads each pull request once per pass, however many requests name it"
       allowStale: false,
     });
     assert.deepStrictEqual(pass.readings, [
-      { url: pr(512), state: "open", at: iso(0), head: "a1b2c3d4e5f6", checks: "passing" },
-      { url: pr(513), state: "open", at: iso(0), head: "a1b2c3d4e5f6", checks: "passing" },
+      {
+        url: pr(512),
+        state: "open",
+        at: iso(0),
+        head: "a1b2c3d4e5f6",
+        checks: "passing",
+        failedChecks: [],
+      },
+      {
+        url: pr(513),
+        state: "open",
+        at: iso(0),
+        head: "a1b2c3d4e5f6",
+        checks: "passing",
+        failedChecks: [],
+      },
     ]);
     assert.deepStrictEqual(pass.read, [pr(512), pr(513)]);
     assert.deepStrictEqual([pass.failed, pass.carried], [[], []]);
@@ -225,7 +311,14 @@ it.effect(
       const third = yield* reader.read([request(514, { live: stale })]);
       assert.strictEqual(asked.length, 2);
       assert.deepStrictEqual(third.readings, [
-        { url: pr(514), state: "open", at: iso(now), head: "ffee00112233", checks: "passing" },
+        {
+          url: pr(514),
+          state: "open",
+          at: iso(now),
+          head: "ffee00112233",
+          checks: "passing",
+          failedChecks: [],
+        },
       ]);
       // A thread that already saw the merge needs no second opinion, however old its reading.
       const merged = liveReading(0, { url: pr(515), state: "merged" });

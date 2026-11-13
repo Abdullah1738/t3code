@@ -26,6 +26,7 @@ import urllib.parse
 import urllib.error
 import urllib.request
 
+import card_mask
 import desktop_lease
 import statev2_guard
 import rootwide_search_guard
@@ -68,7 +69,7 @@ _LOG_RULES = {
     "native-check-unavailable", "desktop-read-only", "desktop-admitted", "desktop-denied",
     "desktop-unavailable", "desktop-end", "desktop-end-error", "desktop-flush", "desktop-flush-none",
     "live-database-read", "live-database-script", "live-database-script-unresolved", "live-database-unavailable",
-    "rootwide-search",
+    "rootwide-search", "card-mask",
 }
 _LOG_ERRORS = {
     "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
@@ -1140,15 +1141,15 @@ def decide(event, harness):
                           "context": {"rule": "live-database-unavailable"}}
                 return result
             if hit:
-                reason = statev2_guard.UNRESOLVED_REASON if hit == "live-database-script-unresolved" else statev2_guard.REASON
+                reason = statev2_guard.refusal_reason(hit, cause, command_cwd)
                 context = {"rule": hit}
-                if hit == "live-database-script-unresolved" and cause:
-                    reason = ("statev2 guard: this command was NOT run. Could not check an explicit script invocation: "
-                              f"{cause}. Resolved workdir: {command_cwd}. Run the script by a literal path, write scripts "
-                              "with apply_patch rather than a heredoc in the same command, or split the steps; do not bypass the guard.")
+                if cause:
                     context["cause"] = cause
                 result = {"decision": "deny", "reason": reason, "context": context}
                 return result
+        if kind == "PostToolUse":
+            result["context"]["rule"] = "non-pre-tool"
+            return result
         native, _, _ = _native(event, harness)
         if native:
             # Ordinary Claude shell calls only need a binding to sign. Model
@@ -1229,6 +1230,16 @@ def decide(event, harness):
         error_type = type(error).__name__
         result = {"decision": "allow", "reason": "", "context": {"rule": "hook-error"}}
     finally:
+        if (isinstance(event, dict) and event.get("hook_event_name") == "PostToolUse"
+                and (harness == "claude" or str(event.get("tool_name", "")).startswith("mcp__"))):
+            try:
+                masked, changed = card_mask.mask_value(event.get("tool_response"))
+                if changed:
+                    result["context"]["updatedToolOutput"] = masked
+                    _log(harness=harness, event="PostToolUse", rule="card-mask")
+            except Exception as error:
+                # Fail open: retain the original result and never log its contents.
+                log_event_error(harness, "PostToolUse", "card-mask", type(error).__name__)
         _log(harness=harness, event=event.get("hook_event_name") if isinstance(event, dict) else None,
              tool=log_tool or (event.get("tool_name") if isinstance(event, dict) else None),
              robobThreadId=identity.get("robobThreadId"), decision=result["decision"], rule=result["context"].get("rule"),

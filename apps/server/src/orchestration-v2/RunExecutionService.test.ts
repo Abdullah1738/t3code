@@ -18,6 +18,7 @@ import {
   type OrchestrationV2Run,
   type OrchestrationV2RunAttempt,
   type OrchestrationV2Subagent,
+  type OrchestrationV2StoredEvent,
   type OrchestrationV2TurnItem,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -4205,6 +4206,50 @@ it.effect("stops the provider turn when ingestion fails the run before a termina
   }),
 );
 
+it.effect("stops a Claude query before publishing ingestion failure as a terminal run", () =>
+  Effect.gen(function* () {
+    const order: Array<string> = [];
+    const interruptEntered = yield* Deferred.make<void>();
+    const allowClose = yield* Deferred.make<void>();
+    const result = yield* captureRootRunTermination({
+      key: "claude-stop-before-terminal",
+      providerDriver: ProviderDriverKind.make("claudeAgent"),
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) =>
+        Stream.make({
+          type: "node.updated",
+          driver: ProviderDriverKind.make("claudeAgent"),
+          node: { id: ids.rootNodeId, threadId: ids.threadId, runId: ids.runId },
+        } as unknown as ProviderAdapter.ProviderAdapterV2Event),
+      ingestNormalized: (ingest) =>
+        Effect.fail(
+          new ProviderEventIngestor.ProviderEventNormalizeError({
+            providerSessionId: ingest.providerSessionId,
+            threadId: ingest.threadId,
+            providerEvent: ingest.event,
+            cause: "projection failure",
+          }),
+        ),
+      interruptTurn: () =>
+        Effect.gen(function* () {
+          order.push("query.interrupt");
+          yield* Deferred.succeed(interruptEntered, undefined);
+          yield* Deferred.await(allowClose);
+          order.push("query.close");
+        }),
+      onTerminalRun: Effect.sync(() => {
+        order.push("run:failed");
+      }),
+      afterStart: () =>
+        Deferred.await(interruptEntered).pipe(
+          Effect.andThen(Deferred.succeed(allowClose, undefined)),
+        ),
+    });
+    assert.deepEqual(order, ["query.interrupt", "query.close", "run:failed"]);
+    assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+  }),
+);
+
 it.effect("interrupts both live turns before failing runs after a shared ingestion error", () =>
   Effect.gen(function* () {
     const requested = yield* Ref.make(0);
@@ -4848,6 +4893,162 @@ it.effect("does not start a turn whose run settled during the app context read",
   }),
 );
 
+it.effect.each(["failure", "interruption"] as const)(
+  "stops the exact attached Claude attempt before startup %s closes ingestion",
+  (mode) =>
+    Effect.gen(function* () {
+      const order: Array<string> = [];
+      const ingestionStarted = yield* Deferred.make<void>();
+      const result = yield* captureRootRunTermination({
+        key: `claude-startup-${mode}`,
+        providerDriver: ProviderDriverKind.make("claudeAgent"),
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: () =>
+          Stream.unwrap(
+            Deferred.succeed(ingestionStarted, undefined).pipe(Effect.as(Stream.never)),
+          ),
+        startTurn: (input) =>
+          Deferred.await(ingestionStarted).pipe(
+            Effect.andThen(
+              mode === "interruption"
+                ? Effect.interrupt
+                : Effect.fail(
+                    new ProviderAdapter.ProviderAdapterTurnStartError({
+                      driver: ProviderDriverKind.make("claudeAgent"),
+                      threadId: input.threadId,
+                      providerThreadId: input.providerThread.id,
+                      runId: input.runId,
+                      cause: "offer failed after attachment",
+                    }),
+                  ),
+            ),
+          ),
+        interruptStartingRun: ({ runId, attemptId }) =>
+          Effect.sync(() => {
+            assert.equal(runId, RunId.make(`run:claude-startup-${mode}`));
+            assert.equal(attemptId, RunAttemptId.make(`attempt:claude-startup-${mode}`));
+            order.push("query.stopped");
+          }),
+        onSubscriptionClose: Effect.sync(() => {
+          order.push("ingestion.closed");
+        }),
+        onTerminalRun: Effect.sync(() => {
+          order.push("run:failed");
+        }),
+      }).pipe(Effect.exit);
+      assert.deepEqual(
+        order,
+        mode === "failure"
+          ? ["query.stopped", "ingestion.closed", "run:failed"]
+          : ["query.stopped", "ingestion.closed"],
+      );
+      assert.equal(result._tag, mode === "failure" ? "Success" : "Failure");
+    }),
+);
+
+it.effect.each(["terminal", "ingest_error", "stop_error"] as const)(
+  "preserves the startup failure when Claude cleanup emits a terminal before returning: %s",
+  (mode) =>
+    Effect.gen(function* () {
+      const key = `claude-startup-terminal-${mode}`;
+      const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      const ingestionStarted = yield* Deferred.make<void>();
+      const ingestionClosed = yield* Deferred.make<void>();
+      const outcome = yield* captureRootRunTermination({
+        key,
+        providerDriver: ProviderDriverKind.make("claudeAgent"),
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: () =>
+          Stream.unwrap(
+            Deferred.succeed(ingestionStarted, undefined).pipe(Effect.as(Stream.fromQueue(events))),
+          ),
+        startTurn: (input) =>
+          Deferred.await(ingestionStarted).pipe(
+            Effect.andThen(
+              Effect.fail(
+                new ProviderAdapter.ProviderAdapterTurnStartError({
+                  driver: ProviderDriverKind.make("claudeAgent"),
+                  threadId: input.threadId,
+                  providerThreadId: input.providerThread.id,
+                  runId: input.runId,
+                  cause: "offer failed after attachment",
+                }),
+              ),
+            ),
+          ),
+        interruptStartingRun: () =>
+          Queue.offer(events, rootTerminalEvent(backgroundScenarioIds(key), "interrupted")).pipe(
+            Effect.andThen(Deferred.await(ingestionClosed)),
+            Effect.andThen(mode === "stop_error" ? Effect.die("late Stop error") : Effect.void),
+          ),
+        ingestNormalized: () =>
+          mode !== "ingest_error"
+            ? Effect.succeed([])
+            : Effect.die("cleanup terminal persistence failed"),
+        onSubscriptionClose: Deferred.succeed(ingestionClosed, undefined),
+      }).pipe(Effect.exit);
+      assert.isTrue(Exit.isSuccess(outcome));
+      if (Exit.isFailure(outcome)) throw new Error("Startup cleanup failed to settle");
+      const result = outcome.value;
+      const terminals = result.finalEvents.flatMap((event) =>
+        event.type === "run.updated" ? [event.payload.status] : [],
+      );
+      assert.deepEqual(terminals, ["failed"]);
+      const error = result.written.find((item) => item.type === "error");
+      assert.include(error?.failure.message ?? "", "provider could not start this turn");
+      assert.notInclude(error?.failure.message ?? "", "cleanup terminal persistence failed");
+    }),
+);
+
+it.effect("retries a failed Claude startup cleanup before settling the original failure", () =>
+  Effect.gen(function* () {
+    const firstStopFailed = yield* Deferred.make<void>();
+    const ingestionStarted = yield* Deferred.make<void>();
+    let stops = 0;
+    const run = yield* captureRootRunTermination({
+      key: "claude-startup-cleanup-retry",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: () =>
+        Stream.unwrap(Deferred.succeed(ingestionStarted, undefined).pipe(Effect.as(Stream.never))),
+      startTurn: (input) =>
+        Deferred.await(ingestionStarted).pipe(
+          Effect.andThen(
+            Effect.fail(
+              new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver: ProviderDriverKind.make("claudeAgent"),
+                threadId: input.threadId,
+                providerThreadId: input.providerThread.id,
+                runId: input.runId,
+                cause: "offer failed after attachment",
+              }),
+            ),
+          ),
+        ),
+      interruptStartingRun: () =>
+        Effect.suspend(() =>
+          ++stops === 1
+            ? Deferred.succeed(firstStopFailed, undefined).pipe(
+                Effect.andThen(Effect.die("transient Stop failure")),
+              )
+            : Effect.void,
+        ),
+    }).pipe(Effect.exit, Effect.forkScoped);
+    yield* Deferred.await(firstStopFailed);
+    yield* TestClock.adjust("1 second");
+    const outcome = yield* Fiber.join(run);
+    assert.isTrue(Exit.isSuccess(outcome));
+    if (Exit.isFailure(outcome)) throw new Error("Startup cleanup failed to settle");
+    const result = outcome.value;
+    assert.equal(stops, 2);
+    assert.deepEqual(
+      result.finalEvents.flatMap((event) =>
+        event.type === "run.updated" ? [event.payload.status] : [],
+      ),
+      ["failed"],
+    );
+  }).pipe(Effect.scoped),
+);
+
 it.effect("refreshes pull requests only once when startup failure closes its event stream", () =>
   Effect.gen(function* () {
     const ingestionStarted = yield* Deferred.make<void>();
@@ -4892,6 +5093,8 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
 
 function captureRootRunTermination(input: {
   readonly key: string;
+  readonly providerDriver?: ProviderDriverKind;
+  readonly onTerminalRun?: Effect.Effect<void>;
   readonly delegated?: boolean;
   readonly legacyOwnership?:
     | "app_owned"
@@ -4901,6 +5104,15 @@ function captureRootRunTermination(input: {
     | "other_task"
     | "read_error";
   readonly recoveryRun?: OrchestrationV2Run["transientRecovery"];
+  readonly launchRecovery?: OrchestrationV2Run["launchRecovery"];
+  readonly model?: string;
+  readonly relayText?: string;
+  readonly sessionRefused?: boolean;
+  readonly durableRefusal?: boolean | "read_error";
+  readonly refusalRead?: () => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
+  readonly admissionRead?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["loadRecoveryAdmission"];
+  readonly captureActivity?: (active: Effect.Effect<boolean>) => Effect.Effect<void>;
+  readonly rejectRecoveryWrite?: boolean;
   readonly shouldFinalizeRun: () => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
   readonly rejectTerminalWrite?: boolean;
   readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
@@ -4916,6 +5128,7 @@ function captureRootRunTermination(input: {
     ids: BackgroundScenarioIds,
   ) => Effect.Effect<ProviderAdapter.ProviderAdapterV2EventSubscription>;
   readonly startTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"];
+  readonly interruptStartingRun?: ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptStartingRun"];
   readonly interruptTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"];
   readonly awaitSessionExit?: ProviderAdapter.ProviderAdapterV2SessionRuntime["awaitSessionExit"];
   readonly unsafeProcessStop?: Effect.Effect<void>;
@@ -4931,7 +5144,19 @@ function captureRootRunTermination(input: {
 }) {
   return Effect.gen(function* () {
     const ids = backgroundScenarioIds(input.key);
-    const providerInstanceId = ProviderInstanceId.make("codex");
+    const driver = input.providerDriver ?? ProviderDriverKind.make("codex");
+    const readRefusal =
+      input.refusalRead ??
+      (() =>
+        input.durableRefusal === "read_error"
+          ? Effect.fail(
+              new ProjectionStore.ProjectionStoreReadError({
+                threadId: ids.threadId,
+                cause: "refusal history unavailable",
+              }),
+            )
+          : Effect.succeed(input.durableRefusal ?? false));
+    const providerInstanceId = ProviderInstanceId.make(driver);
     const runningSubagent = makeRunOwnedSubagentFixture({
       ids,
       providerInstanceId,
@@ -4955,6 +5180,7 @@ function captureRootRunTermination(input: {
             yield* captureTurnItem(event.payload);
           }
           if (event.type === "run.updated") {
+            yield* input.onTerminalRun ?? Effect.void;
             yield* Ref.update(observed, (current) => [...current, `run:${event.payload.status}`]);
           }
         }
@@ -4991,6 +5217,8 @@ function captureRootRunTermination(input: {
                 if (input.rejectTerminalWrite === true) {
                   return { committed: false, storedEvents: [] };
                 }
+                if (input.rejectRecoveryWrite && payload.unlessClaudeRefused !== undefined)
+                  return { committed: false, storedEvents: [] };
                 yield* Ref.update(committedEffects, (current) => [...current, ...effects]);
                 yield* captureFinalEvents(payload.events);
                 return { committed: true, storedEvents: [] };
@@ -5015,6 +5243,8 @@ function captureRootRunTermination(input: {
 
     const previewActivityEnded = yield* Effect.gen(function* () {
       const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+      const previewActivity = yield* PreviewAgentActivity.PreviewAgentActivity;
+      yield* input.captureActivity?.(previewActivity.active(ids.threadId)) ?? Effect.void;
       yield* runExecution.startRootRun({
         commandId: CommandId.make(`command:${input.key}`),
         appThread: {
@@ -5069,6 +5299,9 @@ function captureRootRunTermination(input: {
             })),
           ),
           startTurn: input.startTurn ?? (() => Effect.void),
+          ...(input.interruptStartingRun === undefined
+            ? {}
+            : { interruptStartingRun: input.interruptStartingRun }),
           interruptTurn: input.interruptTurn ?? (() => Effect.void),
           ...(input.awaitSessionExit === undefined
             ? {}
@@ -5084,6 +5317,8 @@ function captureRootRunTermination(input: {
           ordinal: 1,
           providerInstanceId,
           transientRecovery: input.recoveryRun,
+          launchRecovery: input.launchRecovery,
+          modelSelection: { instanceId: providerInstanceId, model: input.model ?? "gpt-5.4" },
           ...(input.delegated && input.legacyOwnership === undefined
             ? { delegatedTaskId: ids.subagentNodeId }
             : {}),
@@ -5098,6 +5333,9 @@ function captureRootRunTermination(input: {
         providerThread: {
           id: ids.providerThreadId,
           driver,
+          ...(input.sessionRefused === undefined
+            ? {}
+            : { nativeMetadata: { claudeRefusalObserved: input.sessionRefused } }),
         } as OrchestrationV2ProviderThread,
         attempt: {
           id: ids.attemptId,
@@ -5137,6 +5375,17 @@ function captureRootRunTermination(input: {
             }),
         providerTurnOrdinal: 1,
         shouldFinalizeRun: input.shouldFinalizeRun,
+        ...(input.durableRefusal === undefined && input.refusalRead === undefined
+          ? {}
+          : { loadClaudeRefusal: readRefusal }),
+        loadRecoveryAdmission:
+          input.admissionRead ??
+          (() =>
+            Effect.gen(function* () {
+              const current = yield* input.shouldStartProviderTurn?.() ?? Effect.succeed(true);
+              const refused = yield* readRefusal();
+              return { current, refused };
+            })),
         ...(input.shouldStartProviderTurn === undefined
           ? {}
           : { shouldStartProviderTurn: input.shouldStartProviderTurn }),
@@ -5147,9 +5396,9 @@ function captureRootRunTermination(input: {
             }),
         message: {
           messageId: MessageId.make(`message:${input.key}`),
-          text: "interrupt projection",
+          text: input.relayText ?? "interrupt projection",
           attachments: [],
-          createdBy: "user",
+          createdBy: input.relayText === undefined ? "user" : "system",
           creationSource: "web",
         },
         modelSelection: { instanceId: providerInstanceId, model: "gpt-5.4" },
@@ -6106,4 +6355,595 @@ it.effect.each([
         : { id: "fastMode", value: false },
     ]);
   }).pipe(Effect.provide(layerRunExecutionTest)),
+);
+
+it.effect.each([
+  { model: "claude-haiku-5-5", prior: 0, expected: "claude-haiku-5-5" },
+  { model: "claude-haiku-5-5", prior: 1, expected: "claude-sonnet-5-5" },
+  { model: "claude-sonnet-5-5", prior: 1, expected: "claude-opus-5-5" },
+  { model: "claude-opus-5-5", prior: 1, expected: undefined },
+])(
+  "recovers a first-turn model access failure: $model retry=$prior",
+  ({ model, prior, expected }) =>
+    Effect.gen(function* () {
+      const result = yield* captureRootRunTermination({
+        key: `access-${model}-${prior}`,
+        delegated: true,
+        providerDriver: ProviderDriverKind.make("claudeAgent"),
+        model,
+        ...(prior === 0
+          ? {}
+          : {
+              launchRecovery: {
+                kind: "model_access" as const,
+                retriesOnModel: prior,
+                attempt: 1,
+                delayMs: 20_000,
+                since: "2026-11-13T00:00:00Z",
+              },
+            }),
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: (ids) =>
+          Stream.make({
+            ...rootTerminalEvent(ids, "failed"),
+            status: "failed" as const,
+            failureItemOrdinal: 101,
+            failure: {
+              class: "provider_error" as const,
+              code: "model_not_found",
+              category: "model_invalid" as const,
+              retryable: null,
+              message: "There's an issue with the selected model.",
+              claudeAccess: {
+                status: 401,
+                beforeResponse: true,
+                refusalFree: true,
+                refused: false,
+              },
+            },
+            threadDisposition: "reusable" as const,
+          }),
+      });
+      const retries = result.committedEffects.filter((effect) =>
+        effect.id.startsWith("effect:launch-recovery:"),
+      );
+      assert.lengthOf(retries, expected === undefined ? 0 : 1);
+      if (expected !== undefined) {
+        const event = result.finalEvents.findLast((event) => event.type === "run.updated");
+        assert.equal(event?.payload.status, "starting");
+        if (event?.type === "run.updated")
+          assert.equal(event.payload.modelSelection.model, expected);
+        const request = retries[0]?.request;
+        if (request?.type === "provider-turn.start")
+          assert.isAtLeast(request.retryDelayMs ?? 0, 20_000);
+      }
+    }),
+);
+
+it.effect.each([false, true])("retries an unsent relay once, refusal=%s", (refused) =>
+  Effect.gen(function* () {
+    for (const alreadyRetried of [false, true]) {
+      const result = yield* captureRootRunTermination({
+        key: `relay-${refused}-${alreadyRetried}`,
+        relayText: "Please relay: iPhone is ready",
+        providerDriver: ProviderDriverKind.make("claudeAgent"),
+        ...(alreadyRetried
+          ? {
+              launchRecovery: {
+                kind: "relay" as const,
+                retriesOnModel: 1,
+                attempt: 1,
+                delayMs: 20_000,
+                since: "2026-11-13T00:00:00Z",
+              },
+            }
+          : {}),
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: (ids) =>
+          Stream.make({
+            ...rootTerminalEvent(ids, "failed"),
+            status: "failed" as const,
+            failureItemOrdinal: 101,
+            failure: {
+              class: "provider_error" as const,
+              code: "api_error_401",
+              category: "auth_expired" as const,
+              retryable: null,
+              message: "selected model (claude-opus-4-8)",
+              claudeAccess: { status: 401, beforeResponse: true, refusalFree: !refused, refused },
+            },
+            threadDisposition: "reusable" as const,
+          }),
+      });
+      assert.lengthOf(
+        result.committedEffects.filter((effect) => effect.id.startsWith("effect:launch-recovery:")),
+        !refused && !alreadyRetried ? 1 : 0,
+      );
+    }
+  }),
+);
+
+it.effect.each([500, 502, null])("does not send a third delegated relay after %s", (status) =>
+  Effect.gen(function* () {
+    for (const alreadyRetried of [false, true]) {
+      const result = yield* captureRootRunTermination({
+        key: `relay-cap-${status}-${alreadyRetried}`,
+        delegated: true,
+        relayText: "[Watcher event from build] Please relay: ready",
+        providerDriver: ProviderDriverKind.make("claudeAgent"),
+        ...(alreadyRetried
+          ? {
+              launchRecovery: {
+                kind: "relay" as const,
+                retriesOnModel: 1,
+                attempt: 1,
+                delayMs: 30_000,
+                since: "2026-11-13T00:00:00Z",
+              },
+            }
+          : {}),
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: (ids) =>
+          Stream.make({
+            ...rootTerminalEvent(ids, "failed"),
+            status: "failed" as const,
+            failureItemOrdinal: 101,
+            failure: {
+              class: "provider_error" as const,
+              category: "transient" as const,
+              code: "api_error_500",
+              retryable: true,
+              message: "Claude gave up after repeated API errors. Last error: 500",
+              claudeAccess: { status, beforeResponse: true, refusalFree: true, refused: false },
+            },
+            threadDisposition: "reusable" as const,
+          }),
+      });
+      const starts = result.committedEffects.filter(
+        (effect) => effect.request.type === "provider-turn.start",
+      );
+      assert.lengthOf(starts, alreadyRetried ? 0 : 1);
+      if (alreadyRetried)
+        assert.equal(
+          result.finalEvents.findLast((event) => event.type === "run.updated")?.payload.status,
+          "failed",
+        );
+    }
+  }),
+);
+
+it.effect.each([401, 403, 404, 429])(
+  "caps an access-failing delegated relay at one retry: %s",
+  (status) =>
+    Effect.gen(function* () {
+      for (const alreadyRetried of [false, true]) {
+        const result = yield* captureRootRunTermination({
+          key: `relay-access-cap-${status}-${alreadyRetried}`,
+          delegated: true,
+          model: "claude-haiku-5-5",
+          relayText: "[Watcher event from build] Please relay: ready",
+          providerDriver: ProviderDriverKind.make("claudeAgent"),
+          ...(alreadyRetried
+            ? {
+                launchRecovery: {
+                  kind: "relay" as const,
+                  replayAllowed: true,
+                  retriesOnModel: 1,
+                  attempt: 1,
+                  delayMs: 30_000,
+                  since: "2026-11-13T00:00:00Z",
+                },
+              }
+            : {}),
+          shouldFinalizeRun: () => Effect.succeed(true),
+          events: (ids) =>
+            Stream.make({
+              ...rootTerminalEvent(ids, "failed"),
+              status: "failed" as const,
+              failureItemOrdinal: 101,
+              failure: {
+                class: "provider_error" as const,
+                category: "transient" as const,
+                code: "api_error_401",
+                retryable: true,
+                message: "Claude gave up after repeated API errors.",
+                claudeAccess: { status, beforeResponse: true, refusalFree: true, refused: false },
+              },
+              threadDisposition: "reusable" as const,
+            }),
+        });
+        const starts = result.committedEffects.filter(
+          (effect) => effect.request.type === "provider-turn.start",
+        );
+        assert.lengthOf(starts, alreadyRetried ? 0 : 1);
+        const event = result.finalEvents.findLast((event) => event.type === "run.updated");
+        if (!alreadyRetried && event?.type === "run.updated") {
+          assert.equal(event.payload.launchRecovery?.kind, "relay");
+          assert.equal(event.payload.modelSelection.model, "claude-haiku-5-5");
+        }
+      }
+    }),
+);
+
+it.effect.each([false, true])(
+  "keeps session refusal exclusion if terminal evidence is lost: %s",
+  (sessionRefused) =>
+    Effect.gen(function* () {
+      const result = yield* captureRootRunTermination({
+        key: `session-refusal-${sessionRefused}`,
+        delegated: true,
+        sessionRefused,
+        providerDriver: ProviderDriverKind.make("claudeAgent"),
+        model: "claude-haiku-5-5",
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: (ids) =>
+          Stream.make({
+            ...rootTerminalEvent(ids, "failed"),
+            status: "failed" as const,
+            failureItemOrdinal: 101,
+            failure: {
+              class: "provider_error" as const,
+              category: "transient" as const,
+              code: "api_error_502",
+              retryable: true,
+              message: "Claude gave up after repeated API errors. Last error: 502",
+            },
+            threadDisposition: "reusable" as const,
+          }),
+      });
+      assert.lengthOf(
+        result.committedEffects.filter((effect) => effect.request.type === "provider-turn.start"),
+        sessionRefused ? 0 : 1,
+      );
+    }),
+);
+
+it.effect.each([500, 502, null])(
+  "preserves ordinary mid-task resume after first-turn recovery: %s",
+  (status) =>
+    Effect.gen(function* () {
+      for (const phase of [
+        "none",
+        "pending",
+        "responded",
+        "continued",
+        "relay",
+        "already_resumed",
+      ] as const) {
+        const beforeResponse = phase !== "responded" && phase !== "already_resumed";
+        const replayAllowed = phase !== "continued";
+        const result = yield* captureRootRunTermination({
+          key: `existing-resume-${status}-${phase}`,
+          delegated: true,
+          model: "claude-sonnet-5-5",
+          providerDriver: ProviderDriverKind.make("claudeAgent"),
+          ...(phase === "none"
+            ? {}
+            : {
+                launchRecovery: {
+                  kind: phase === "relay" ? ("relay" as const) : ("model_access" as const),
+                  replayAllowed,
+                  retriesOnModel: 1,
+                  attempt: 3,
+                  delayMs: 30_000,
+                  since: "2026-11-13T00:00:00Z",
+                },
+              }),
+          ...(phase === "already_resumed"
+            ? {
+                recoveryRun: {
+                  firstError: {
+                    class: "provider_error" as const,
+                    category: "transient" as const,
+                    code: "api_error_transport",
+                    retryable: true,
+                    message: "First transient failure",
+                  },
+                  since: "2026-11-13T00:00:00Z",
+                },
+              }
+            : {}),
+          shouldFinalizeRun: () => Effect.succeed(true),
+          events: (ids) =>
+            Stream.make({
+              ...rootTerminalEvent(ids, "failed"),
+              status: "failed" as const,
+              failureItemOrdinal: 101,
+              failure: {
+                class: "provider_error" as const,
+                category: "transient" as const,
+                code: "api_error_transport",
+                retryable: true,
+                message: "Claude gave up after repeated API errors. Last error: transport",
+                claudeAccess: { status, beforeResponse, refusalFree: true, refused: false },
+              },
+              threadDisposition: "reusable" as const,
+            }),
+        });
+        const starts = result.committedEffects.filter(
+          (effect) => effect.request.type === "provider-turn.start",
+        );
+        const expected = phase === "none" || phase === "responded" || phase === "continued";
+        assert.lengthOf(starts, expected ? 1 : 0);
+        if (expected) assert.isTrue(starts[0]!.id.startsWith("effect:delegated-transient-resume:"));
+      }
+    }),
+);
+
+it.effect.each(["decision", "commit", "dispatch", "read_error"] as const)(
+  "excludes a durable refusal at recovery %s",
+  (stage) =>
+    Effect.gen(function* () {
+      const starts = yield* Ref.make(0);
+      const silent = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      const result = yield* captureRootRunTermination({
+        key: `durable-refusal-${stage}`,
+        delegated: true,
+        sessionRefused: false,
+        providerDriver: ProviderDriverKind.make("claudeAgent"),
+        model: "claude-haiku-5-5",
+        durableRefusal: stage === "read_error" ? "read_error" : stage !== "commit",
+        rejectRecoveryWrite: stage === "commit",
+        ...(stage === "dispatch" || stage === "read_error"
+          ? {
+              launchRecovery: {
+                kind: "relay" as const,
+                replayAllowed: true,
+                retriesOnModel: 1,
+                attempt: 1,
+                delayMs: 30000,
+                since: "2026-11-12T12:00:00Z",
+              },
+            }
+          : {}),
+        shouldFinalizeRun: () => Effect.succeed(true),
+        startTurn: () => Ref.update(starts, (n) => n + 1),
+        events: (ids) =>
+          stage === "dispatch" || stage === "read_error"
+            ? Stream.fromQueue(silent)
+            : Stream.make({
+                ...rootTerminalEvent(ids, "failed"),
+                status: "failed" as const,
+                failureItemOrdinal: 101,
+                failure: {
+                  class: "provider_error" as const,
+                  category: "auth_expired" as const,
+                  code: "api_error_401",
+                  retryable: false,
+                  message: "Access failed",
+                  claudeAccess: {
+                    status: 401,
+                    beforeResponse: true,
+                    refusalFree: true,
+                    refused: false,
+                  },
+                },
+                threadDisposition: "reusable" as const,
+              }),
+      });
+      assert.lengthOf(
+        result.committedEffects.filter((effect) => effect.request.type === "provider-turn.start"),
+        0,
+      );
+      assert.isTrue(
+        result.finalEvents.some(
+          (event) => event.type === "run.updated" && event.payload.status === "failed",
+        ),
+      );
+      if (stage === "dispatch" || stage === "read_error") assert.equal(yield* Ref.get(starts), 0);
+    }),
+);
+
+it.effect.each(["refusal", "ownership"] as const)(
+  "closes recovery ingestion when cancellation interrupts the %s read",
+  (phase) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const closed = yield* Deferred.make<void>();
+      const activity = yield* Deferred.make<Effect.Effect<boolean>>();
+      const closes = yield* Ref.make(0);
+      const ownershipReads = yield* Ref.make(0);
+      const silent = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>();
+      const startup = yield* captureRootRunTermination({
+        key: `recovery-cancellation-${phase}`,
+        providerDriver: ProviderDriverKind.make("claudeAgent"),
+        launchRecovery: {
+          kind: "relay",
+          replayAllowed: true,
+          retriesOnModel: 1,
+          attempt: 1,
+          delayMs: 30000,
+          since: "2026-11-13T00:00:00Z",
+        },
+        captureActivity: (active) => Deferred.succeed(activity, active).pipe(Effect.asVoid),
+        shouldFinalizeRun: () => Effect.succeed(true),
+        shouldStartProviderTurn: () =>
+          Effect.gen(function* () {
+            const n = yield* Ref.updateAndGet(ownershipReads, (n) => n + 1);
+            if (phase === "ownership" && n > 1) {
+              yield* Deferred.succeed(entered, undefined);
+              return yield* Effect.never;
+            }
+            return true;
+          }),
+        refusalRead: () =>
+          phase === "ownership"
+            ? Effect.succeed(false)
+            : Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        onSubscriptionClose: Ref.update(closes, (n) => n + 1).pipe(
+          Effect.andThen(Deferred.succeed(closed, undefined)),
+        ),
+        events: () => Stream.fromQueue(silent),
+      }).pipe(Effect.forkScoped);
+      yield* Deferred.await(entered);
+      yield* Fiber.interrupt(startup);
+      const closedOnCancel = yield* Ref.get(closes);
+      const activeAfterCancel = yield* yield* Deferred.await(activity);
+      // End the isolated source even if the cleanup assertion fails.
+      yield* Queue.end(silent);
+      yield* Deferred.await(closed);
+      assert.equal(closedOnCancel, 1);
+      assert.isFalse(activeAfterCancel);
+    }),
+);
+
+it.effect.each(["failed", "interrupted"] as const)(
+  "rechecks recovery ownership after ingestion becomes %s during the refusal read",
+  (status) =>
+    Effect.gen(function* () {
+      const refusalReadStarted = yield* Deferred.make<void>();
+      const runFinalized = yield* Deferred.make<void>();
+      const current = yield* Ref.make(true);
+      const starts = yield* Ref.make(0);
+      const result = yield* captureRootRunTermination({
+        key: `recovery-ownership-during-refusal-${status}`,
+        providerDriver: ProviderDriverKind.make("claudeAgent"),
+        launchRecovery: {
+          kind: "relay",
+          replayAllowed: true,
+          retriesOnModel: 1,
+          attempt: 1,
+          delayMs: 30000,
+          since: "2026-11-13T00:00:00Z",
+        },
+        shouldFinalizeRun: () => Ref.get(current),
+        shouldStartProviderTurn: () => Ref.get(current),
+        admissionRead: () =>
+          Deferred.succeed(refusalReadStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(runFinalized)),
+            Effect.andThen(Ref.get(current)),
+            Effect.map((current) => ({ current, refused: false })),
+          ),
+        refreshAfterTurn: Ref.set(current, false).pipe(
+          Effect.andThen(Deferred.succeed(runFinalized, undefined)),
+        ),
+        startTurn: () => Ref.update(starts, (n) => n + 1),
+        events: (ids) =>
+          Stream.unwrap(
+            Deferred.await(refusalReadStarted).pipe(
+              Effect.as(
+                status === "failed" ? Stream.empty : Stream.make(rootTerminalEvent(ids, status)),
+              ),
+            ),
+          ),
+      });
+      assert.deepEqual(result.observed, [`run:${status}`, "pull-requests-refreshed"]);
+      assert.equal(yield* Ref.get(starts), 0);
+    }),
+);
+
+it.effect.each(
+  (["relay", "model_access", "transient"] as const).flatMap((kind) =>
+    [false, true].map((refused) => ({ kind, refused })),
+  ),
+)("excludes a refusal observed during recovery admission: $kind/$refused", ({ kind, refused }) =>
+  Effect.gen(function* () {
+    const key = `r9-refusal-during-ownership-${kind}-${refused}`;
+    const ids = backgroundScenarioIds(key);
+    const driver = ProviderDriverKind.make("claudeAgent");
+    const durableMarker = yield* Ref.make(false);
+    const ownershipReads = yield* Ref.make(0);
+    const markerIngestions = yield* Ref.make(0);
+    const markerIngested = yield* Deferred.make<void>();
+    const sends = yield* Ref.make<ReadonlyArray<{ refused: boolean }>>([]);
+    const source = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>();
+    const marker = {
+      type: "provider_thread.updated",
+      driver,
+      providerThread: {
+        id: ids.providerThreadId,
+        appThreadId: ids.threadId,
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        driver,
+        status: "idle",
+        nativeThreadRef: { driver, nativeId: "r9-current-native", strength: "strong" },
+        nativeMetadata: { claudeRefusalObserved: refused },
+      } as OrchestrationV2ProviderThread,
+    } as const;
+    const result = yield* captureRootRunTermination({
+      key,
+      providerDriver: driver,
+      sessionRefused: false,
+      ...(kind === "transient"
+        ? {
+            recoveryRun: {
+              firstError: {
+                class: "provider_error",
+                category: "transient",
+                code: "api_error_502",
+                retryable: true,
+                message: "502",
+              },
+              since: "2026-11-13T00:00:00Z",
+            },
+          }
+        : {
+            launchRecovery: {
+              kind,
+              replayAllowed: true,
+              retriesOnModel: 1,
+              attempt: 1,
+              delayMs: 30000,
+              since: "2026-11-13T00:00:00Z",
+            },
+          }),
+      shouldFinalizeRun: () => Effect.succeed(true),
+      refusalRead: () => Ref.get(durableMarker),
+      shouldStartProviderTurn: () =>
+        Effect.gen(function* () {
+          const n = yield* Ref.updateAndGet(ownershipReads, (n) => n + 1);
+          if (n === 2) {
+            // Hold the final run-control read while native-session history is persisted.
+            // The second receipt proves the first event also refreshed ingestion's local snapshot.
+            yield* Queue.offer(source, marker);
+            yield* Queue.offer(source, marker);
+            yield* Deferred.await(markerIngested);
+          }
+          return true;
+        }),
+      ingestNormalized: ({ event }) =>
+        Effect.gen(function* () {
+          if (event.type === "provider_thread.updated") {
+            yield* Ref.set(
+              durableMarker,
+              event.providerThread.nativeMetadata?.claudeRefusalObserved === true,
+            );
+            const n = yield* Ref.updateAndGet(markerIngestions, (n) => n + 1);
+            if (n === 2) yield* Deferred.succeed(markerIngested, undefined);
+            return [
+              {
+                sequence: n,
+                commandId: null,
+                event: {
+                  id: EventId.make(`event:${key}:marker:${n}`),
+                  type: "provider-thread.updated",
+                  threadId: ids.threadId,
+                  driver,
+                  providerInstanceId: event.providerThread.providerInstanceId,
+                  occurredAt: yield* DateTime.now,
+                  payload: event.providerThread,
+                },
+              },
+            ] satisfies ReadonlyArray<OrchestrationV2StoredEvent>;
+          }
+          return [];
+        }),
+      startTurn: () =>
+        Effect.gen(function* () {
+          const atSend = yield* Ref.get(durableMarker);
+          yield* Ref.update(sends, (current) => [...current, { refused: atSend }]);
+        }),
+      events: () => Stream.fromQueue(source),
+      afterStart: () =>
+        Queue.offer(source, rootTerminalEvent(ids, "completed")).pipe(Effect.asVoid),
+    });
+    yield* Queue.end(source);
+    const actual = yield* Ref.get(sends);
+    assert.equal(
+      actual.length,
+      refused ? 0 : 1,
+      "a durable native refusal observed before dispatch must exclude an automatic resend",
+    );
+    if (refused) assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+  }),
 );

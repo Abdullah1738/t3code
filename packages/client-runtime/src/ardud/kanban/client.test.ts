@@ -34,6 +34,7 @@ function fakeTransport(denied: ReadonlySet<string> = new Set()) {
   const listFailures: Array<(error: unknown) => void> = [];
   const transport: KanbanTransport = {
     permission: (tag) => Atom.make(() => !denied.has(tag)),
+    permissionStatus: (tag) => Atom.make(() => (denied.has(tag) ? "denied" : "granted")),
     stream(tag, _input, onValue, onError) {
       streams += 1;
       if (tag === "kanban.boards") {
@@ -190,11 +191,12 @@ describe("createKanbanClient", () => {
   });
 
   it("reports a denied grant as false, so its control is disabled", () => {
-    const fake = fakeTransport(new Set(["kanban.pool.set"]));
+    const fake = fakeTransport(new Set(["kanban.pool.set", "kanban.script.acknowledge"]));
     const client = createKanbanClient(fake.transport);
     const registry = AtomRegistry.make();
     const read = (tag: KanbanRequestTag) => registry.get(client.permission(tag));
     expect(read("kanban.pool.set")).toBe(false);
+    expect(read("kanban.script.acknowledge")).toBe(false);
     expect(read("kanban.board.update")).toBe(true);
   });
 
@@ -832,6 +834,7 @@ describe("discussion preview loader", () => {
     const pending: Pending[] = [];
     const transport: KanbanTransport = {
       permission: () => Atom.make(() => true),
+      permissionStatus: () => Atom.make(() => "granted" as const),
       stream(tag, input, onValue) {
         if (tag === "kanban.boards") return () => {};
         const boardId = (input as { boardId: string }).boardId;
