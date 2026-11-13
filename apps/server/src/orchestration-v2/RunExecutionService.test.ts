@@ -9,6 +9,7 @@ import {
   EventId,
   MessageId,
   NodeId,
+  type AnalyticsEvent,
   type OrchestrationV2AppThread,
   type OrchestrationV2CheckpointScope,
   type OrchestrationV2DomainEvent,
@@ -61,6 +62,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
 import * as PreviewAgentActivity from "../preview/PreviewAgentActivity.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
@@ -5137,6 +5139,15 @@ function captureRootRunTermination(input: {
   readonly refreshAfterTurn?: Effect.Effect<void>;
   readonly onSubscriptionClose?: Effect.Effect<void>;
   readonly shouldStartProviderTurn?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["shouldStartProviderTurn"];
+  readonly captureBaseline?: CheckpointService.CheckpointServiceV2["Service"]["captureBaseline"];
+  readonly afterRetryCommit?: Effect.Effect<void>;
+  readonly runUpdates?: Stream.Stream<OrchestrationV2StoredEvent>;
+  readonly afterIngestion?: (
+    execution: RunExecutionService.RunExecutionServiceV2["Service"],
+    ids: BackgroundScenarioIds,
+    controls: RunExecutionService.RunExecutionServiceV2StartRootRunInput,
+  ) => Effect.Effect<void>;
+  readonly recordUsage?: Analytics.Analytics["Service"]["record"];
   readonly appContext?: ReturnType<McpAppModelContext.McpAppModelContext["Service"]["forThread"]>;
   readonly afterStart?: (
     closed: Deferred.Deferred<void>,
@@ -5191,9 +5202,13 @@ function captureRootRunTermination(input: {
           Layer.mock(McpAppModelContext.McpAppModelContext)({
             forThread: () => input.appContext ?? Effect.succeed([]),
           }),
-          Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
+          Layer.mock(CheckpointService.CheckpointServiceV2)({
+            captureBaseline: input.captureBaseline ?? (() => Effect.void),
+          }),
           layerTurnItemPositionsTest,
           Layer.mock(EventSink.EventSinkV2)({
+            stream: () => input.runUpdates ?? Stream.never,
+            latestSequence: () => Effect.succeed(0),
             write: (payload) =>
               Effect.gen(function* () {
                 for (const event of payload.events) {
@@ -5221,6 +5236,8 @@ function captureRootRunTermination(input: {
                   return { committed: false, storedEvents: [] };
                 yield* Ref.update(committedEffects, (current) => [...current, ...effects]);
                 yield* captureFinalEvents(payload.events);
+                if (effects.some((effect) => effect.request.type === "provider-turn.start"))
+                  yield* input.afterRetryCommit ?? Effect.void;
                 return { committed: true, storedEvents: [] };
               }),
           }),
@@ -5229,6 +5246,9 @@ function captureRootRunTermination(input: {
             ingestNormalized: input.ingestNormalized ?? (() => Effect.succeed([])),
           }),
           ServerSettings.layerTest(),
+          input.recordUsage
+            ? Layer.mock(Analytics.Analytics)({ record: input.recordUsage })
+            : Layer.empty,
           Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
             refresh: () => Effect.void,
             refreshAfterTurn: () =>
@@ -5245,7 +5265,7 @@ function captureRootRunTermination(input: {
       const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
       const previewActivity = yield* PreviewAgentActivity.PreviewAgentActivity;
       yield* input.captureActivity?.(previewActivity.active(ids.threadId)) ?? Effect.void;
-      yield* runExecution.startRootRun({
+      const controls = {
         commandId: CommandId.make(`command:${input.key}`),
         appThread: {
           id: ids.threadId,
@@ -5315,6 +5335,7 @@ function captureRootRunTermination(input: {
           id: ids.runId,
           threadId: ids.threadId,
           ordinal: 1,
+          startedAt: input.recordUsage ? DateTime.makeUnsafe("2026-11-13T00:00:00.000Z") : null,
           providerInstanceId,
           transientRecovery: input.recoveryRun,
           launchRecovery: input.launchRecovery,
@@ -5413,9 +5434,11 @@ function captureRootRunTermination(input: {
             networkAccess: false,
           },
         },
-      });
+      } satisfies RunExecutionService.RunExecutionServiceV2StartRootRunInput;
+      yield* runExecution.startRootRun(controls);
       yield* input.afterStart?.(ingestionDone) ?? Effect.void;
       yield* Deferred.await(ingestionDone);
+      yield* input.afterIngestion?.(runExecution, ids, controls) ?? Effect.void;
       const activity = yield* PreviewAgentActivity.PreviewAgentActivity;
       return !(yield* activity.active(ids.threadId));
     }).pipe(Effect.provide(layerTest));
@@ -6946,4 +6969,191 @@ it.effect.each(
     );
     if (refused) assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
   }),
+);
+
+it.effect.each(["completed", "failed", "interrupted", "cancelled"] as const)(
+  "writes run.usage through run execution when a run ends %s",
+  (status) =>
+    Effect.gen(function* () {
+      const events: AnalyticsEvent[] = [];
+      yield* captureRootRunTermination({
+        key: `usage:${status}`,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        recordUsage: (event) =>
+          Effect.sync(() => {
+            events.push(event);
+          }),
+        events: (ids) => Stream.fromIterable([rootTerminalEvent(ids, status)]),
+      });
+      assert.equal(events.length, 1);
+      const row = events[0]!;
+      if (!("runId" in row)) return assert.fail("missing run usage");
+      assert.equal(row.endReason, status);
+      assert.equal(row.inputTokens, null);
+      assert.equal(row.reasoningTokens, null);
+    }),
+);
+
+it.effect.each([
+  ["failed", "after"],
+  ["interrupted", "after"],
+  ["cancelled", "after"],
+  ["interrupted", "commit"],
+  ["cancelled", "commit"],
+  ["interrupted", "baseline"],
+  ["interrupted", "admission"],
+  ["interrupted", "inner-admission"],
+] as const)(
+  "flushes retry usage when the next attempt ends %s before startup (%s)",
+  ([status, phase]) =>
+    Effect.gen(function* () {
+      const rows: AnalyticsEvent[] = [];
+      const updates = yield* Queue.unbounded<OrchestrationV2StoredEvent>();
+      const recorded = yield* Deferred.make<void>();
+      const emitStopDuringRetry = (ids: BackgroundScenarioIds) =>
+        Queue.offer(updates, {
+          sequence: 1,
+          commandId: null,
+          event: {
+            id: EventId.make("event:stop-retry"),
+            type: "run.updated" as const,
+            threadId: ids.threadId,
+            occurredAt: DateTime.makeUnsafe("2026-11-13T00:00:00.000Z"),
+            payload: { id: ids.runId, status } as OrchestrationV2Run,
+          },
+        }).pipe(Effect.asVoid);
+      const stopDuringRetry = (ids: BackgroundScenarioIds) =>
+        emitStopDuringRetry(ids).pipe(Effect.andThen(Deferred.await(recorded)));
+      const startupBlocked = yield* Deferred.make<void>();
+      let baselineCalls = 0;
+      const result = yield* captureRootRunTermination({
+        key: "usage:retry-before-start",
+        ...(phase === "commit"
+          ? { afterRetryCommit: stopDuringRetry(backgroundScenarioIds("usage:retry-before-start")) }
+          : {}),
+        captureBaseline: () =>
+          ++baselineCalls === 2 && phase === "baseline"
+            ? Deferred.succeed(startupBlocked, undefined).pipe(Effect.andThen(Effect.never))
+            : Effect.void,
+        delegated: true,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        runUpdates: Stream.fromQueue(updates),
+        recordUsage: (event) =>
+          Effect.sync(() => {
+            rows.push(event);
+          }).pipe(Effect.andThen(Deferred.succeed(recorded, undefined)), Effect.asVoid),
+        events: (ids) =>
+          Stream.make(
+            {
+              type: "provider_turn.updated" as const,
+              driver,
+              providerTurn: {
+                id: ids.rootProviderTurnId,
+                providerThreadId: ids.providerThreadId,
+                nodeId: ids.rootNodeId,
+                runAttemptId: ids.attemptId,
+                nativeTurnRef: null,
+                ordinal: 1,
+                status: "failed" as const,
+                startedAt: null,
+                completedAt: null,
+                finish: null,
+                turnTokenUsage: {
+                  usageScope: "main_agent" as const,
+                  usageStatus: "partial" as const,
+                  inputTokens: 123,
+                  outputTokens: 45,
+                  hasSubagents: false,
+                },
+              },
+            },
+            {
+              ...rootTerminalEvent(ids, "failed"),
+              status: "failed" as const,
+              failureItemOrdinal: 101,
+              failure: {
+                class: "provider_error" as const,
+                category: "transient" as const,
+                code: "api_error_529",
+                retryable: true,
+                message: "Claude gave up after repeated API errors. Last error: 529 overloaded.",
+              },
+            },
+          ),
+        afterIngestion: (execution, ids, controls) =>
+          phase === "baseline" || phase === "admission" || phase === "inner-admission"
+            ? Effect.gen(function* () {
+                const startup = yield* execution
+                  .startRootRun({
+                    ...controls,
+                    run: { ...controls.run, startedAt: yield* DateTime.now },
+                    attempt: { ...controls.attempt, id: RunAttemptId.make("attempt:second") },
+                    attemptId: RunAttemptId.make("attempt:second"),
+                    ...(phase === "admission"
+                      ? {
+                          shouldStartProviderTurn: () =>
+                            Deferred.succeed(startupBlocked, undefined).pipe(
+                              Effect.andThen(Effect.never),
+                            ),
+                        }
+                      : {}),
+                    session: {
+                      ...controls.session,
+                      subscribeEvents: Effect.succeed({ events: Stream.never, close: Effect.void }),
+                      ...(phase === "inner-admission"
+                        ? {
+                            startTurn: () =>
+                              Deferred.succeed(startupBlocked, undefined).pipe(
+                                Effect.andThen(Effect.never),
+                              ),
+                            interruptStartingRun: () => Effect.void,
+                          }
+                        : {}),
+                    },
+                  })
+                  .pipe(Effect.forkChild);
+                yield* Deferred.await(startupBlocked);
+                yield* emitStopDuringRetry(ids);
+                yield* Fiber.interrupt(startup);
+                yield* Deferred.await(recorded);
+              })
+            : status !== "failed"
+              ? phase === "commit"
+                ? Effect.void
+                : stopDuringRetry(ids)
+              : execution.finishUsageBeforeStart({
+                  run: {
+                    id: ids.runId,
+                    threadId: ids.threadId,
+                    startedAt: null,
+                    providerInstanceId: ProviderInstanceId.make("codex"),
+                  },
+                  attempt: { id: RunAttemptId.make("attempt:next") },
+                  providerThread: { id: ids.providerThreadId },
+                  appThread: {
+                    lineage: {
+                      rootThreadId: ids.threadId,
+                      parentThreadId: null,
+                      relationshipToParent: null,
+                    },
+                  },
+                  modelSelection: {
+                    instanceId: ProviderInstanceId.make("codex"),
+                    model: "gpt-5.4",
+                  },
+                  status: "failed",
+                }),
+      });
+      assert.isTrue(
+        result.committedEffects.some((effect) =>
+          effect.id.startsWith("effect:delegated-transient-resume:"),
+        ),
+      );
+      assert.equal(rows.length, 1);
+      const row = rows[0]!;
+      if (!("runId" in row)) return assert.fail("missing usage");
+      assert.equal(row.inputTokens, 123);
+      assert.equal(row.outputTokens, 45);
+      assert.equal(row.endReason, status);
+    }),
 );

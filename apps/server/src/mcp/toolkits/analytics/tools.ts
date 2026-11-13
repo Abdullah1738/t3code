@@ -8,7 +8,7 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
 const AnalyticsRead = Tool.make("analytics_read", {
   description:
-    "Read local owner-action, performance and error analytics for a UTC day (YYYY-MM-DD). Returns the daily rollup plus up to 500 recent samples, optionally filtered by kind or boardId. No prompts, messages or search text are recorded.",
+    "Read local owner-action, performance, run usage and error analytics for a UTC day (YYYY-MM-DD). Returns the daily rollup plus up to 500 recent samples, optionally filtered by kind, boardId or cardId. No prompts, messages or search text are recorded.",
   parameters: AnalyticsReadInput,
   success: AnalyticsReadResult,
   failure: OrchestratorMcpFailure,

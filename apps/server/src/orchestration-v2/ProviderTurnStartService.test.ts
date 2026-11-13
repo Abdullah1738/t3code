@@ -144,6 +144,7 @@ function startWithMissingWorktree(
     Effect.succeed({ committed: true, storedEvents: [] } as never),
   );
   const startRootRun = vi.fn(() => Effect.void);
+  const finishUsageBeforeStart = vi.fn(() => Effect.void);
   const pruneWorktrees = vi.fn(() => Effect.void);
   const createWorktree = vi.fn(() => Effect.succeed({} as never));
   const layer = ProviderTurnStart.layer.pipe(
@@ -214,7 +215,10 @@ function startWithMissingWorktree(
         Layer.mock(ProviderAuthService.ProviderAuthService)({
           tryHandlePromptCommand: () => Effect.succeed(false),
         }),
-        Layer.mock(RunExecutionService.RunExecutionServiceV2)({ startRootRun }),
+        Layer.mock(RunExecutionService.RunExecutionServiceV2)({
+          startRootRun,
+          finishUsageBeforeStart,
+        }),
         Layer.mock(RuntimePolicy.RuntimePolicyV2)({}),
       ),
     ),
@@ -652,6 +656,9 @@ function makeLocalCommandHarness(input: {
                 } as never)
               : Effect.die("A local command must not open a native session."),
   );
+  const finishUsageBeforeStart = vi.fn<
+    RunExecutionService.RunExecutionServiceV2["Service"]["finishUsageBeforeStart"]
+  >(() => Effect.void);
   const startRootRun = vi.fn<
     (input: RunExecutionService.RunExecutionServiceV2StartRootRunInput) => Effect.Effect<void>
   >(() =>
@@ -807,7 +814,10 @@ function makeLocalCommandHarness(input: {
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ open }),
         Layer.mock(ProviderAuthService.ProviderAuthService)({ tryHandlePromptCommand }),
-        Layer.mock(RunExecutionService.RunExecutionServiceV2)({ startRootRun }),
+        Layer.mock(RunExecutionService.RunExecutionServiceV2)({
+          startRootRun,
+          finishUsageBeforeStart,
+        }),
         Layer.mock(RuntimePolicy.RuntimePolicyV2)({
           resolve: resolveRuntimePolicy,
         }),
@@ -832,6 +842,7 @@ function makeLocalCommandHarness(input: {
     nativeInterruptTurn,
     injectHistory,
     startRootRun,
+    finishUsageBeforeStart,
     tryHandlePromptCommand,
     events,
     oldInstanceId,
@@ -2801,4 +2812,20 @@ effectIt.effect.each(
       if (refused)
         expect(harness.projection().contextHandoffs.at(-1)?.delivery?.status).not.toBe("pending");
     }),
+);
+
+effectIt.effect("records usage when provider setup fails before run execution starts", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      openFailure: new Error("setup failed"),
+    });
+    yield* harness.start;
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    expect(harness.finishUsageBeforeStart).toHaveBeenCalledTimes(1);
+    expect(harness.finishUsageBeforeStart.mock.calls[0]?.[0]).toMatchObject({
+      status: "failed",
+      run: { id: harness.projection().runs.at(-1)!.id },
+    });
+  }),
 );

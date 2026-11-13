@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
-import { AnalyticsIngestInput, AnalyticsReadInput } from "./analytics.ts";
+import {
+  AnalyticsEvent,
+  RunUsageEvent,
+  AnalyticsIngestInput,
+  AnalyticsReadInput,
+} from "./analytics.ts";
 import { clientRpcRequiredScopes } from "../clientRpcPermissions.ts";
 import { AuthOrchestrationOperateScope } from "../auth.ts";
 import { WS_METHODS } from "../rpc.ts";
@@ -55,4 +60,57 @@ describe("analytics ingest contract", () => {
     ])
       expect(() => read(input)).toThrow();
   });
+});
+
+const usage = {
+  ts: event.ts,
+  kind: "run.usage",
+  surface: "server",
+  route: "provider",
+  runId: "run:one",
+  threadId: "thread:one",
+  role: "chat",
+  providerInstance: "codex",
+  model: "gpt-6.1-sol",
+  effort: "max",
+  inputTokens: null,
+  outputTokens: null,
+  cachedInputTokens: null,
+  reasoningTokens: null,
+  wallMs: null,
+  turnCount: 0,
+  endReason: "failed",
+  usageStatus: "unavailable",
+  reviewRound: null,
+};
+it("requires the metadata-only usage schema and preserves null measurements", () => {
+  const decodeUsage = Schema.decodeUnknownSync(RunUsageEvent, { onExcessProperty: "error" });
+  expect(decodeUsage(usage)).toEqual(usage);
+  for (const key of ["prompt", "message", "text", "toolArgs", "toolOutput", "output"]) {
+    expect(() => decodeUsage({ ...usage, [key]: "private" })).toThrow();
+  }
+  const decodeEvent = Schema.decodeUnknownSync(AnalyticsEvent, { onExcessProperty: "error" });
+  expect(() =>
+    decodeEvent({ ts: event.ts, kind: "run.usage", surface: "server", route: "provider" }),
+  ).toThrow();
+  expect(() => decode({ events: [{ ...usage, surface: "web" }] })).toThrow();
+  expect(() => decodeUsage({ ...usage, inputTokens: -1 })).toThrow();
+  expect(
+    Schema.decodeUnknownSync(AnalyticsReadInput)({
+      day: "2026-11-13",
+      kind: "run.usage",
+      cardId: "card:one",
+    }).cardId,
+  ).toBe("card:one");
+});
+
+it.each([
+  "claude-opus-5[1m]",
+  "Claude Opus 5.5",
+  "vendor/model:variant@2026-11-13",
+  "vendor/model|route?hint=value",
+  "m".repeat(161),
+  "m".repeat(4096),
+])("accepts provider-owned model identifiers: %s", (model) => {
+  expect(Schema.decodeUnknownSync(RunUsageEvent)({ ...usage, model }).model).toBe(model);
 });

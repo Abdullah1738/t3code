@@ -386,3 +386,50 @@ describe("Analytics", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
+
+it.effect("reads run usage by card and kind with capped samples and persists the full rollup", () =>
+  Effect.gen(function* () {
+    const setup = yield* fixture;
+    const analytics = yield* open(setup);
+    for (let i = 0; i < 4; i++)
+      yield* analytics.record({
+        ts,
+        kind: "run.usage",
+        surface: "server",
+        route: "provider",
+        runId: `run:${i}`,
+        threadId: "thread:one",
+        boardId: "robob",
+        cardId: i < 3 ? "card:one" : "card:two",
+        role: "work",
+        providerInstance: "codex",
+        model: "Claude Opus 5[1m]",
+        effort: null,
+        inputTokens: null,
+        outputTokens: null,
+        cachedInputTokens: null,
+        reasoningTokens: null,
+        wallMs: 50,
+        turnCount: 1,
+        endReason: "interrupted",
+        usageStatus: "unavailable",
+        reviewRound: null,
+      });
+    yield* analytics.record(event({ cardId: "card:one" }));
+    const result = yield* analytics.read({ day, kind: "run.usage", cardId: "card:one", limit: 2 });
+    assert.lengthOf(result.samples, 2);
+    assert.equal(result.rollup.usage.totals.runs, 3);
+    assert.equal(result.rollup.usage.totals.inputTokens, null);
+    assert.isTrue(
+      result.samples.every((row) => row.kind === "run.usage" && row.cardId === "card:one"),
+    );
+    const persisted = JSON.parse(
+      yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
+    );
+    assert.equal(persisted.usage.totals.runs, 4);
+    const lines = (yield* setup.fs.readFileString(`${setup.directory}/${day}.ndjson`))
+      .trim()
+      .split("\n");
+    assert.equal(lines.filter((line) => JSON.parse(line).kind === "run.usage").length, 4);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);

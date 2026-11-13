@@ -21,9 +21,9 @@ const Id = Schema.String.check(
 const Measurement = Schema.Number.check(
   Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
 );
-export const AnalyticsEvent = Schema.Struct({
+const GeneralEvent = Schema.Struct({
   ts: Timestamp,
-  kind: Label,
+  kind: Label.check(Schema.makeFilter((kind) => kind !== "run.usage")),
   surface: Schema.Literals(["web", "desktop", "mobile", "server"]),
   route: Label,
   boardId: Schema.optionalKey(Id),
@@ -55,11 +55,37 @@ export const AnalyticsEvent = Schema.Struct({
     }),
   ),
 });
+const ModelId = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4096));
+const TokenCount = Schema.NullOr(
+  Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
+);
+export const RunUsageEvent = Schema.Struct({
+  ...GeneralEvent.fields,
+  kind: Schema.Literal("run.usage"),
+  surface: Schema.Literal("server"),
+  runId: Id,
+  threadId: Id,
+  role: Schema.Literals(["work", "review", "evaluator", "discussion", "delegated", "chat"]),
+  providerInstance: Label,
+  model: ModelId,
+  effort: Schema.NullOr(Label),
+  inputTokens: TokenCount,
+  outputTokens: TokenCount,
+  cachedInputTokens: TokenCount,
+  reasoningTokens: TokenCount,
+  wallMs: Schema.NullOr(Measurement),
+  turnCount: Measurement,
+  endReason: Schema.Literals(["completed", "failed", "interrupted", "cancelled"]),
+  usageStatus: Schema.Literals(["complete", "partial", "unavailable"]),
+  reviewRound: TokenCount,
+});
+export type RunUsageEvent = typeof RunUsageEvent.Type;
+export const AnalyticsEvent = Schema.Union([GeneralEvent, RunUsageEvent]);
 export type AnalyticsEvent = typeof AnalyticsEvent.Type;
 export const AnalyticsIngestInput = Schema.Struct({
   events: Schema.Array(
     Schema.Struct({
-      ...AnalyticsEvent.fields,
+      ...GeneralEvent.fields,
       surface: Schema.Literals(["web", "desktop", "mobile"]),
     }),
   ).check(Schema.isMinLength(1), Schema.isMaxLength(100)),
@@ -77,6 +103,7 @@ export const AnalyticsReadInput = Schema.Struct({
   day: Schema.String.check(Schema.isPattern(/^\d{4}-\d{2}-\d{2}$/)),
   kind: Schema.optionalKey(Label),
   boardId: Schema.optionalKey(Id),
+  cardId: Schema.optionalKey(Id),
   limit: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 500 }))),
 });
 export type AnalyticsReadInput = typeof AnalyticsReadInput.Type;
@@ -87,6 +114,25 @@ const LatencyFields = {
   maxMs: Schema.NullOr(Measurement),
   approximate: Schema.Boolean,
 };
+const UsageTotals = Schema.Struct({
+  runs: Measurement,
+  inputTokens: TokenCount,
+  outputTokens: TokenCount,
+  cachedInputTokens: TokenCount,
+  reasoningTokens: TokenCount,
+  wallMs: Schema.NullOr(Measurement),
+  turnCount: Measurement,
+  completeRuns: Measurement,
+  partialRuns: Measurement,
+  unavailableRuns: Measurement,
+});
+const CardUsage = Schema.Struct({
+  ...UsageTotals.fields,
+  boardId: Id,
+  cardId: Id,
+  evaluatorWakes: Measurement,
+  reviewRounds: Measurement,
+});
 export const AnalyticsRollup = Schema.Struct({
   day: AnalyticsReadInput.fields.day,
   generatedAt: Timestamp,
@@ -97,6 +143,19 @@ export const AnalyticsRollup = Schema.Struct({
   errorCounts: Schema.Record(Label, Measurement),
   topSlowRpcs: Schema.Array(Schema.Struct({ method: Label, ...LatencyFields })),
   askAnswerLatency: Schema.Struct(LatencyFields),
+  usage: Schema.Struct({
+    totals: UsageTotals,
+    perModel: Schema.Array(
+      Schema.Struct({ providerInstance: Label, model: ModelId, ...UsageTotals.fields }),
+    ),
+    perRole: Schema.Array(
+      Schema.Struct({ role: RunUsageEvent.fields.role, ...UsageTotals.fields }),
+    ),
+    perBoard: Schema.Array(Schema.Struct({ boardId: Id, ...UsageTotals.fields })),
+    cards: Schema.Array(CardUsage),
+    topCardsByTokens: Schema.Array(CardUsage),
+    topCardsByWallMs: Schema.Array(CardUsage),
+  }),
 });
 export type AnalyticsRollup = typeof AnalyticsRollup.Type;
 export const AnalyticsReadResult = Schema.Struct({

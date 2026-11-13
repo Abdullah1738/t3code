@@ -523,13 +523,22 @@ export const layer: Layer.Layer<
               } satisfies OrchestrationV2DomainEvent;
             }),
           );
-          yield* eventSink.writeIfRunCurrent({
+          const settled = yield* eventSink.writeIfRunCurrent({
             threadId: projection.thread.id,
             runId,
             activeAttemptId: attempt.id,
             expectedStatus: "starting",
             events,
           });
+          if (settled.committed)
+            yield* runExecution.finishUsageBeforeStart({
+              appThread: projection.thread,
+              run,
+              attempt,
+              providerThread,
+              modelSelection: run.modelSelection,
+              status,
+            });
         },
       );
       if (
