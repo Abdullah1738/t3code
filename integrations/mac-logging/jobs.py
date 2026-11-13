@@ -153,10 +153,11 @@ def child_inventory(root, previous, deadline, run):
                      props=dict(source=str(root), child=path.name, partial=True,
                                 bytes=size, deniedCount=denied, exitCode=code,
                                 elapsedMs=(time.monotonic()-started)*1000))
-        except FileNotFoundError:
-            # A child removed since listdir is absent, not a failed measurement.
-            continue
         except Exception as exc:
+            # Only ENOENT for the child proves removal. A missing du executable
+            # is a failed measurement and must retain the last good child size.
+            if isinstance(exc, FileNotFoundError) and exc.filename is not None and str(exc.filename) == str(path):
+                continue
             children[path.name] = {**old, 'attemptedAt': now if attempted else attempt_time(mapping(previous.get(path.name)).get('attemptedAt'))}
             failure = source_error('disk', 'disk.inventory.source', root, started, exc,
                                    child=path.name, cached=bool(old), **({'ageS': old['ageS']} if old else {}))

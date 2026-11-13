@@ -1,4 +1,5 @@
 import datetime as dt
+import errno
 import json
 import os
 from pathlib import Path
@@ -161,6 +162,48 @@ class CollectorBudgetTests(unittest.TestCase):
         with patch.object(jobs.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(jobs.time, 'time', return_value=3700):
             jobs.directory_inventory(roots, run, split_roots=[big])
         self.assertEqual(jobs.read_state('disk-inventory')['children'][str(big)]['cached']['ageS'], 3600)
+
+    def test_missing_child_and_command_failure_origins(self):
+        cases = [
+            ('child-str', 'stat', FileNotFoundError, 'child-str', True, None),
+            ('child-path', 'stat', FileNotFoundError, 'child-path', True, None),
+            ('missing-du', 'run', FileNotFoundError, '/usr/bin/du', False, 'exit'),
+            ('no-filename', 'run', FileNotFoundError, None, False, 'exit'),
+            ('permission', 'run', PermissionError, '/usr/bin/du', False, 'permission'),
+            ('timeout', 'run', subprocess.TimeoutExpired, None, False, 'timeout'),
+        ]
+        for label, origin, error_type, filename, removed, failure in cases:
+            with self.subTest(case=label):
+                root = self.root/label; root.mkdir(); child = root/'child'; child.mkdir()
+                def good(command, **kwargs):
+                    return SimpleNamespace(returncode=0, stdout='10\t'+command[-1], stderr='')
+                with patch.object(jobs.time, 'time', return_value=100):
+                    jobs.directory_inventory([root], good, split_roots=[root])
+                target = str(child) if filename == 'child-str' else child if filename == 'child-path' else filename
+                exc = (subprocess.TimeoutExpired('du', 20) if error_type is subprocess.TimeoutExpired else
+                       error_type(errno.EACCES if error_type is PermissionError else errno.ENOENT, 'fixture', target))
+                original = Path.lstat
+                def lstat(path, *args, **kwargs):
+                    if path == child and origin == 'stat': raise exc
+                    return original(path, *args, **kwargs)
+                def run(command, **kwargs):
+                    if origin == 'run': raise exc
+                    return good(command, **kwargs)
+                with patch.object(jobs.time, 'time', return_value=3700), patch.object(Path, 'lstat', lstat):
+                    jobs.directory_inventory([root], run, split_roots=[root])
+                state = jobs.read_state('disk-inventory')
+                self.assertEqual(state['sizes'][str(root)], 0 if removed else 10*1024)
+                self.assertEqual(state['sourceErrors'], 0 if removed else 1)
+                if removed:
+                    self.assertNotIn('child', state['children'][str(root)])
+                    self.assertNotIn(str(root), state['partials'])
+                else:
+                    self.assertEqual(state['children'][str(root)]['child']['at'], 100)
+                    self.assertIn(str(root), state['partials'])
+                    source = self.rows('disk.inventory.source')[-1]['props']
+                    self.assertEqual(source['failure'], failure)
+                    self.assertTrue(source['cached'])
+                    self.assertEqual(source['ageS'], 3600)
 
     def test_unified_first_failure_retries_same_start_and_logs_window(self):
         calls = []
