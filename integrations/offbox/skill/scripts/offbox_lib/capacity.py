@@ -98,6 +98,19 @@ def schema(con):
         CREATE TABLE IF NOT EXISTS pool_pending (
           token TEXT PRIMARY KEY, pool_key TEXT NOT NULL, pid INTEGER, created_at REAL NOT NULL, source TEXT
         );
+        CREATE TABLE IF NOT EXISTS pool_waiters (
+          pool_key TEXT NOT NULL, token TEXT PRIMARY KEY, pid INTEGER, run_id TEXT,
+          queued_at REAL NOT NULL, source TEXT, size TEXT, reserved INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS pool_waiters_order ON pool_waiters(pool_key,queued_at);
+        CREATE TABLE IF NOT EXISTS pool_cap_callers (
+          token TEXT PRIMARY KEY, pool_key TEXT NOT NULL, pid INTEGER, run_id TEXT, cap INTEGER NOT NULL,
+          granted INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS pool_cap_callers_key ON pool_cap_callers(pool_key);
+        CREATE TABLE IF NOT EXISTS pool_caps (
+          pool_key TEXT PRIMARY KEY, cap INTEGER NOT NULL, set_by_pid INTEGER, set_at REAL NOT NULL
+        );
         -- A box with a prune worker that is not confirmed finished must not be handed to anyone: it can still
         -- rename a checkout a later run has reused. Cleared only when the worker is confirmed gone.
         CREATE TABLE IF NOT EXISTS prune_holds (
