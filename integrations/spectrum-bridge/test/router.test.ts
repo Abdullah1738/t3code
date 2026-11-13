@@ -4761,6 +4761,92 @@ test.each([
   expect(h.store.getOperation(`reply:1:${replyId}`)).toMatchObject({ state: "sent", text: "Done: order #2635" });
 });
 
+test.each([
+  { arrival: "first", phase: "unknown", restart: false, unavailable: false },
+  { arrival: "retry", phase: "unknown", restart: false, unavailable: false },
+  { arrival: "deadline", phase: "unknown", restart: true, unavailable: false },
+  { arrival: "first", phase: "submitting", restart: true, unavailable: false },
+  { arrival: "first", phase: "held", restart: true, unavailable: false },
+  { arrival: "first", phase: "unknown", restart: true, unavailable: true },
+])("a delegated reply survives a sealed wake that never gains admission (%j)", async ({ arrival, phase, restart, unavailable }) => {
+  const start = 10_000;
+  setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "delegated-first", "Place the order", "On it");
+  let replyId = "";
+  h.backend.promptBehavior = async () => {
+    const due = arrival === "first" || arrival === "retry" && h.backend.prompts.length === 3;
+    if (!replyId && due) replyId = delegatedNoticeReply(h);
+    throw new Error("Wake not accepted");
+  };
+  const wake = "wake:delegated-rejected";
+  h.input(wake, "Another update");
+  await h.router.tick();
+  h.store.set("activeTurn", { ...h.store.get<object>("activeTurn"), phase });
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  if (unavailable) h.backend.messagesBehavior = async () => { throw new Error("Record read unavailable"); };
+  for (const offset of [ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS + 1]) {
+    if (arrival === "deadline" && offset > ACCEPT_WAIT_MS) replyId = delegatedNoticeReply(h);
+    setSystemTime(start + offset);
+    await router.tick();
+  }
+  h.backend.messagesBehavior = undefined;
+  for (let i = 0; i < 4; i++) await router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([[`reply:1:${replyId}`, "Done: order #2635"]]);
+  expect(h.backend.prompts).toHaveLength(3);
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).not.toBe("done");
+  h.store.outboxState(`reply:1:${replyId}`, "sent", "provider-delegated");
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.getOperation(`reply:1:${replyId}`)).toMatchObject({ state: "sent", text: "Done: order #2635" });
+});
+
+test.each(["NO_REPLY", "owner", "tool"])("a rejected wake keeps delegated reply silence for %s", async mode => {
+  const start = 10_000;
+  setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0, ...(mode === "tool" ? { replyMode: "tool" as const } : {}) });
+  await exchange(h, "delegated-first", "Check the order", "NO_REPLY");
+  let inserted = false;
+  h.backend.promptBehavior = async () => {
+    if (!inserted) {
+      delegatedNoticeReply(h, mode === "NO_REPLY" ? "Logged.\nNO_REPLY" : "Desktop note", mode === "owner" ? "user" : "agent");
+      inserted = true;
+    }
+    throw new Error("Wake not accepted");
+  };
+  h.input("wake:delegated-rejected", "Another update");
+  await h.router.tick();
+  for (const offset of [ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS + 1]) {
+    setSystemTime(start + offset);
+    await h.router.tick();
+  }
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.get("watermark")).toMatchObject({ id: h.backend.records.at(-1)!.id });
+});
+
+test("a typed message queued during rejected-wake admission cannot overtake its notice reply", async () => {
+  const start = 10_000;
+  setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "delegated-first", "Check the order", "On it");
+  let replyId = "";
+  h.backend.promptBehavior = async () => {
+    if (!replyId) replyId = delegatedNoticeReply(h);
+    throw new Error("Wake not accepted");
+  };
+  h.input("wake:delegated-rejected", "Another update");
+  await h.router.tick();
+  h.input("delegated-next", "Are you there?", { source: "typed" });
+  h.backend.promptBehavior = undefined;
+  setSystemTime(start + 2 * ACCEPT_WAIT_MS + 1);
+  await h.router.tick();
+  h.backend.final("Yes");
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toContain("Done: order #2635");
+  expect(h.store.getOperation(`reply:1:${replyId}`)).toBeDefined();
+});
+
 test.each([...delegatedNotices, "From the desktop"])("a real owner user record after the watermark keeps its reply in the desktop (%s)", async notice => {
   setSystemTime(10_000);
   const h = setup(":memory:", { watchMs: 0 });

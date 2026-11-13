@@ -3740,7 +3740,7 @@ export class Router {
     if (!turn || !this.current(turn) || turn.phase === "failed") return;
     // Work has no deadline: a turn runs for as long as the agent needs.
     try {
-      const mark = this.syntheticBatch(turn.inboundId) ? this.store.get<Watermark | null>("watermark") : null;
+      const mark = this.store.get<Watermark | null>("watermark");
       let messages = await this.reading(this.backend.messages(turn.id, turn.directory, turn.background
         ? { until: turn.messageId, limit: 20 }
         : mark?.sessionId === turn.id ? { until: mark.id }
@@ -4256,7 +4256,9 @@ export class Router {
       this.setTurn(turn.background ? null : { ...turn, phase: "failed" });
       this.store.set("resendBody", null);
       this.store.set("pendingApprovals", null);
-      this.store.set("watermark", watermark ? { sessionId: turn.id, id: watermark } satisfies Watermark : null);
+      // An unadmitted wake has no run outcome: retain the last delivered record
+      // so watch() can still find independent completions that arrived during its POST.
+      if (watermark || reason !== "undelivered") this.store.set("watermark", watermark ? { sessionId: turn.id, id: watermark } satisfies Watermark : null);
       this.store.set("settledAt", Date.now());
     }).immediate();
   }
