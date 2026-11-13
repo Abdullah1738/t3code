@@ -1930,6 +1930,95 @@ it.effect("ingests the trailing subagent item completion after the subagent row 
   }),
 );
 
+it.effect.each(["completed", "interrupted"] as const)(
+  "drains a queued %s child follow-up before accepting the adapter's live idle state",
+  (status) =>
+    Effect.gen(function* () {
+      const followUps = yield* Ref.make<ReadonlyArray<string>>([]);
+      const result = yield* captureRootRunTermination({
+        key: `queued-follow-up:${status}`,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        hasPendingBackgroundWorkForThread: () => Effect.succeed(false),
+        events: (ids) => {
+          const pending = (
+            pendingBackgroundWork: boolean,
+          ): ProviderAdapter.ProviderAdapterV2Event => ({
+            type: "provider_thread.updated",
+            driver,
+            providerThread: {
+              id: ids.providerThreadId,
+              pendingBackgroundWork,
+            } as OrchestrationV2ProviderThread,
+          });
+          const childTurn = (
+            status: "running" | "completed" | "interrupted",
+          ): ProviderAdapter.ProviderAdapterV2Event => ({
+            type: "provider_turn.updated",
+            driver,
+            threadId: ids.childThreadId,
+            providerTurn: {
+              id: ProviderTurnId.make(`${ids.childThreadId}:follow-up`),
+              providerThreadId: ProviderThreadId.make(`${ids.childThreadId}:provider`),
+              runAttemptId: null,
+              status,
+            } as OrchestrationV2ProviderTurn,
+          });
+          return Stream.make(
+            pending(true),
+            childThreadCreatedEvent(ids),
+            rootTerminalEvent(ids, "completed"),
+            childTurn("running"),
+            {
+              type: "message.updated",
+              driver,
+              message: {
+                id: MessageId.make(`${ids.childThreadId}:follow-up`),
+                threadId: ids.childThreadId,
+                runId: null,
+                role: "assistant",
+                text: status === "completed" ? "GRANDCHILD_OK" : "Grandchild interrupted",
+                streaming: false,
+              },
+            } as ProviderAdapter.ProviderAdapterV2Event,
+            childTurn(status),
+            pending(false),
+          );
+        },
+        ingestNormalized: ({ event, threadId, providerInstanceId }) =>
+          Effect.gen(function* () {
+            if (event.type === "message.updated") {
+              yield* Ref.update(followUps, (texts) => [...texts, event.message.text]);
+            }
+            yield* Effect.yieldNow;
+            if (event.type === "provider_thread.updated") {
+              return [
+                {
+                  sequence: event.providerThread.pendingBackgroundWork ? 1 : 2,
+                  commandId: null,
+                  event: {
+                    id: EventId.make(
+                      `event:${event.providerThread.id}:${event.providerThread.pendingBackgroundWork}`,
+                    ),
+                    type: "provider-thread.updated",
+                    threadId,
+                    driver,
+                    providerInstanceId,
+                    occurredAt: yield* DateTime.now,
+                    payload: event.providerThread,
+                  },
+                },
+              ] satisfies ReadonlyArray<OrchestrationV2StoredEvent>;
+            }
+            return [];
+          }),
+      });
+      assert.deepEqual(yield* Ref.get(followUps), [
+        status === "completed" ? "GRANDCHILD_OK" : "Grandchild interrupted",
+      ]);
+      assert.deepEqual(result.observed, ["run:waiting", "pull-requests-refreshed"]);
+    }),
+);
+
 it.effect("keeps ingesting a child thread's late background item completion", () =>
   Effect.gen(function* () {
     const observed = yield* runBackgroundItemScenario("bg-child-item", (ids) => [
@@ -4379,6 +4468,49 @@ it.effect.each(["rejected", "timeout", "exit-observation-retry"] as const)(
       assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
       assert.equal(yield* Ref.get(shutdownAttempts), scenario === "exit-observation-retry" ? 2 : 1);
     }),
+);
+
+it.effect("interrupts a blocked event write at the confirmed shutdown cleanup deadline", () =>
+  Effect.gen(function* () {
+    const blocked = yield* Deferred.make<void>();
+    const stopped = yield* Deferred.make<void>();
+    const writes = yield* Ref.make(0);
+    const sourceClosed = yield* Ref.make(false);
+    const result = yield* captureRootRunTermination({
+      key: "blocked-shutdown-cleanup",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) =>
+        Stream.make(
+          backgroundTurnItemEvent(ids, "command_execution", "running", 1),
+          backgroundTurnItemEvent(ids, "command_execution", "completed", 1),
+        ).pipe(Stream.ensuring(Ref.set(sourceClosed, true))),
+      ingestNormalized: (input) =>
+        Effect.gen(function* () {
+          if ((yield* Ref.updateAndGet(writes, (count) => count + 1)) === 1) {
+            return yield* new ProviderEventIngestor.ProviderEventNormalizeError({
+              providerSessionId: input.providerSessionId,
+              threadId: input.threadId,
+              providerEvent: input.event,
+              cause: "first projection failure",
+            });
+          }
+          yield* Deferred.succeed(blocked, undefined);
+          return yield* Effect.never;
+        }),
+      interruptTurn: () => Deferred.succeed(stopped, undefined).pipe(Effect.asVoid),
+      afterStart: (closed) =>
+        Effect.gen(function* () {
+          yield* Deferred.await(stopped);
+          yield* Deferred.await(blocked);
+          yield* TestClock.adjust("9 seconds");
+          assert.isFalse(yield* Deferred.isDone(closed));
+          yield* TestClock.adjust("1 second");
+          yield* Deferred.await(closed);
+        }),
+    });
+    assert.isTrue(yield* Ref.get(sourceClosed));
+    assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+  }),
 );
 
 it.effect.each(["delivered", "terminated"] as const)(

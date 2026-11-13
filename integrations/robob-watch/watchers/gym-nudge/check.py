@@ -9,7 +9,7 @@ try:
 except Exception:
     _tl = None
 with (_tl.run('gym-nudge', _log_sys.argv[1:], name='watcher.run')
-      if _tl is not None and __name__ == '__main__' else _log_context.nullcontext()):
+      if _tl is not None and __name__ == '__main__' else _log_context.nullcontext()) as _watch_log:
     # Big gym nudge: Mon-Fri 19:30, Sat/Sun 19:00 Dubai (gym closes 22:30 weekdays / 22:00 weekends;
     # full session needs 2h + 30m travel + 30m getting ready). Skips if a Forge workout is already logged today.
     import json, os, datetime as dt
@@ -37,4 +37,4 @@ with (_tl.run('gym-nudge', _log_sys.argv[1:], name='watcher.run')
     except Exception: pass  # can't read Forge: nudge anyway
     open(lf, "w").write(today)
     print(f"Gym nudge {today} {now:%a %H:%M}: no workout logged today; gym closes {close}, leave by ~{'20:00' if wkend else '20:30'} at the latest for a full session.")
-    if _tl is not None: _tl.emit('gym-nudge', 'nag.sent', props={'count': 1})
+    if _tl is not None: _tl.emit('gym-nudge', 'nag.sent', props={'count': 1}, run_id=getattr(_watch_log, 'run_id', None))

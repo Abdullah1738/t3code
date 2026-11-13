@@ -95,6 +95,7 @@ export class Analytics extends Context.Service<
   Analytics,
   {
     readonly record: (event: AnalyticsEvent) => Effect.Effect<void>;
+    readonly flush: Effect.Effect<void, AnalyticsError>;
     readonly ingest: (input: {
       readonly events: readonly AnalyticsEvent[];
     }) => Effect.Effect<void, AnalyticsError>;
@@ -547,7 +548,10 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     }),
   );
 
-  return Analytics.of({ record, ingest, read });
+  const flush = disk
+    .withPermit(drain(true))
+    .pipe(Effect.mapError((cause) => new AnalyticsError({ operation: "write", cause })));
+  return Analytics.of({ record, flush, ingest, read });
 });
 
 export const layerWith = (options: Partial<AnalyticsOptions>) =>

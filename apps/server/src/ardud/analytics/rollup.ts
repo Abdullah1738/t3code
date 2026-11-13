@@ -27,6 +27,7 @@ interface McpGroup {
   tool: string;
   hour: string;
   build: string;
+  bootId: string;
   durations: Durations;
   failures: number;
   outcomes: Map<string, number>;
@@ -153,7 +154,8 @@ export function accumulate(
   if (event.kind === "mcp.call" && event.tool && event.outcome) {
     const hour = `${event.ts.slice(0, 13)}:00:00.000Z`;
     const build = event.build ?? "unknown";
-    const key = JSON.stringify([event.tool, hour, build]);
+    const bootId = event.bootId ?? "unknown";
+    const key = JSON.stringify([event.tool, hour, build, bootId]);
     let group = target.mcp.get(key);
     if (!group) {
       // Bound both high-cardinality build groups and retry identities on damaged/untrusted logs.
@@ -165,6 +167,7 @@ export function accumulate(
         tool: event.tool,
         hour,
         build,
+        bootId,
         durations: durations(),
         failures: 0,
         outcomes: new Map(),
@@ -275,6 +278,7 @@ export function finishRollup(
         tool: group.tool,
         hour: group.hour,
         build: group.build,
+        bootId: group.bootId,
         ...summarize(group.durations),
         failures: group.failures,
         failureRate: group.failures / group.durations.count,
@@ -287,7 +291,8 @@ export function finishRollup(
         (a, b) =>
           a.hour.localeCompare(b.hour) ||
           a.tool.localeCompare(b.tool) ||
-          a.build.localeCompare(b.build),
+          a.build.localeCompare(b.build) ||
+          a.bootId.localeCompare(b.bootId),
       ),
     mcpOverflow: { ...target.mcpOverflow },
   };

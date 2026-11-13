@@ -580,7 +580,9 @@ const handlers = {
             ? {
                 message:
                   input.to === moved.stage
-                    ? `already in ${moved.stage}; nothing changed`
+                    ? moved.stage === "needs_review" && caller.link?.role === "work"
+                      ? "already queued for review; note added"
+                      : `already in ${moved.stage}; nothing changed`
                     : `already moved to ${input.to}; now ${moved.stage}, nothing changed`,
               }
             : {}),

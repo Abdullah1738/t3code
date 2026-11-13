@@ -16,7 +16,7 @@ try:
 except Exception:
     _tl = None
 with _fold_errors(), (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
-      if _tl is not None and __name__ == '__main__' else _log_context.nullcontext()):
+      if _tl is not None and __name__ == '__main__' else _log_context.nullcontext()) as _watch_log:
     # Nags owner hourly (09:00-23:45 Dubai) about meds due today until confirmed.
     # Confirm with: ./took.py [YYYY-MM-DD] all|name...   (state in taken.json)
     import json, os, datetime as dt
@@ -178,5 +178,5 @@ with _fold_errors(), (_tl.run('meds-nag', _log_sys.argv[1:], name='watcher.run')
           return " (pin %s %s, last was %s on %s)" % ({"L": "left", "R": "right"}[nxt], where, {"L": "left", "R": "right"}[last[1]], last[0])
       left = [i + site_hint() if i.lower().startswith("test") else i for i in left]
       print("💊 Meds check: still need to take " + ", ".join(left) + ". Text me when done and I'll stop.")
-      if _tl is not None: _tl.emit('meds-nag', 'nag.sent', props={'count': len(left)})
+      if _tl is not None: _tl.emit('meds-nag', 'nag.sent', props={'count': len(left)}, run_id=getattr(_watch_log, 'run_id', None))
     if __name__ == "__main__": main(_FOLD)

@@ -1756,9 +1756,10 @@ class Handler(BaseHTTPRequestHandler):
                 with open(p, "rb") as f:
                     f.seek(off)
                     data = f.read(1 << 20)
+                    size = os.fstat(f.fileno()).st_size
                 data, nxt = _utf8_cut(data, off)
-                return {"ok": True, "data": data, "nextOffset": nxt,
-                        "done": r["status"] not in ("queued", "running") and nxt >= p.stat().st_size}
+                return {"ok": True, "data": data, "nextOffset": nxt, "size": size,
+                        "done": r["status"] not in ("queued", "running") and nxt >= size}
             return {"ok": True, "command": cmd_status_json(con, bid, r["pid"], 0)}
         raise Fail(404, "not_found", path)
 

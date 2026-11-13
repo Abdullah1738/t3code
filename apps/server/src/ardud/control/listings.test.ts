@@ -573,6 +573,84 @@ describe("control listings", () => {
       }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
+  const requestHoldCases = (["background reader", "writer"] as const).flatMap((heldConnection) =>
+    ["", "?origin=none", "?origin=automation", "?origin=missing"].map((suffix) => ({
+      heldConnection,
+      suffix,
+    })),
+  );
+  it.live.each(requestHoldCases)(
+    "GET requests$suffix completes while the $heldConnection is held",
+    ({ heldConnection, suffix }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "control-requests-latency-" });
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const inherited = shell("asks-inherited", {
+            ...idle,
+            ...waiting("request-inherited"),
+            lineage: {
+              rootThreadId: ThreadId.make("live-running"),
+              parentThreadId: ThreadId.make("live-running"),
+              relationshipToParent: "subagent",
+            },
+          });
+          const harness = yield* makeHarness(undefined, [inherited]);
+          assert.equal((yield* harness.get("/requests")).status, 200);
+          yield* sql`INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
+            VALUES ('live-running', 'automation', '2026-01-01T00:00:00.000Z')`;
+          yield* sql`INSERT INTO orchestration_v2_projection_runtime_requests
+            (runtime_request_id, thread_id, node_id, provider_turn_id, kind, status,
+              created_at, resolved_at, payload_json)
+            SELECT 'request-inherited', 'asks-inherited', node_id, provider_turn_id, kind,
+              status, '2026-01-01T00:06:00.000Z', resolved_at,
+              json_set(payload_json, '$.id', 'request-inherited',
+                '$.createdAt', '2026-01-01T00:06:00.000Z')
+            FROM orchestration_v2_projection_runtime_requests
+            WHERE runtime_request_id = 'request-waiting'`;
+          const expected = yield* harness.get(`/requests${suffix}`);
+          assert.equal(expected.status, 200);
+          assert.deepEqual(
+            expected.body.requests.map((row: { requestId: string }) => row.requestId),
+            suffix === "?origin=missing"
+              ? []
+              : suffix === "?origin=automation"
+                ? ["request-inherited"]
+                : suffix === "?origin=none"
+                  ? ["request-waiting"]
+                  : ["request-waiting", "request-inherited"],
+          );
+          const held = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const hold = sql.withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          );
+          const holder = yield* (
+            heldConnection === "background reader"
+              ? hold.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads)
+              : hold
+          ).pipe(Effect.forkChild);
+          yield* Deferred.await(held);
+          yield* Effect.gen(function* () {
+            for (let index = 0; index < 2; index += 1) {
+              const response = yield* harness.get(`/requests${suffix}`);
+              assert.equal(response.status, 200);
+              assert.deepEqual(response.body, expected.body);
+            }
+            assert.isUndefined(holder.pollUnsafe());
+            assert.equal(yield* Ref.get(harness.recordReads), 0);
+            assert.equal(yield* Ref.get(harness.snapshotReads), 0);
+          }).pipe(
+            Effect.timeout("500 millis"),
+            Effect.ensuring(Deferred.succeed(release, undefined)),
+          );
+          yield* Fiber.join(holder);
+        }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   // All listing forms must keep candidate reads AND summary enrichment on the request lane.
   for (const query of [
     "limit=1",

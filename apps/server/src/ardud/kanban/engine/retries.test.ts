@@ -1,9 +1,17 @@
-import { KanbanBoardId, KanbanCardId, type KanbanCardRetry } from "@t3tools/contracts";
+import {
+  KanbanBoardId,
+  KanbanCardId,
+  ThreadId,
+  type KanbanCardEvent,
+  type KanbanCardRetry,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 
 import {
   decideRetry,
+  refusedVerdict,
+  REFUSED_VERDICT_PREFIX,
   heldByPause,
   noRetryReason,
   NO_VERDICT_REASON,
@@ -301,5 +309,55 @@ describe("retry records and notes", () => {
         ],
       }),
     ).toMatch(/ended without a verdict/);
+  });
+});
+
+describe("refusedVerdict", () => {
+  const card = { id: KanbanCardId.make("card"), movedAt: iso(start) };
+  const threadId = ThreadId.make("reviewer");
+  const refused: KanbanCardEvent = {
+    id: 1,
+    cardId: card.id,
+    at: iso(start),
+    actor: { _tag: "thread", threadId },
+    kind: "comment",
+    fromStage: null,
+    toStage: null,
+    head: "abcdef1234",
+    body: `${REFUSED_VERDICT_PREFIX}clear at abcdef12: Needs approval: s3`,
+  };
+  it("reads a refusal at the review start and picks the latest reason including newlines", () => {
+    expect(refusedVerdict(card, [refused], threadId)).toBe("Needs approval: s3");
+    expect(
+      refusedVerdict(
+        card,
+        [
+          refused,
+          {
+            ...refused,
+            id: 2,
+            body: `${REFUSED_VERDICT_PREFIX}findings at unknown head: Conflict\nRead again`,
+          },
+        ],
+        threadId,
+      ),
+    ).toBe("Conflict\nRead again");
+  });
+  it.each([
+    { at: iso(start - 1) },
+    { cardId: KanbanCardId.make("another-card") },
+    { actor: { _tag: "thread", threadId: ThreadId.make("other") } },
+    { actor: { _tag: "system", component: "dispatcher" } },
+    { kind: "flagged" },
+    { body: "Review verdict refused: clear" },
+    { body: null },
+  ] satisfies Array<Partial<KanbanCardEvent>>)(
+    "ignores unrelated or malformed events %j",
+    (patch) => {
+      expect(refusedVerdict(card, [{ ...refused, ...patch }], threadId)).toBeNull();
+    },
+  );
+  it("ignores a previous run's refusal from a reused reviewer", () => {
+    expect(refusedVerdict({ ...card, movedAt: iso(start + 1) }, [refused], threadId)).toBeNull();
   });
 });
