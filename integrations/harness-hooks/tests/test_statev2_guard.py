@@ -703,6 +703,165 @@ class GuardTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.classify('bash tmp/fixture.sh'), expected)
 
+    def test_mktemp_fixture_plain_subpaths(self):
+        backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        original = backup.read_text()
+        path = 'tmp/fixture.sh'
+        commands = ('bash ' + path, '/bin/bash ' + str(self.root / path),
+                    'offbox run --bg -- bash ' + path)
+        for directory in ('fixture-live/userdata', 'fixture', 'fixture_2/a.b-c_0/7'):
+            for database in ('statev2', 'statev2.sqlite', 'statev2.sqlite-wal',
+                             'statev2.sqlite-shm', 'statev2.sqlite-journal', 'statev2-wal'):
+                source = original.replace('/.robob/userdata/statev2.sqlite', '/' + directory + '/' + database)
+                self.write(path, source)
+                for command in commands:
+                    with self.subTest(directory=directory, database=database, command=command):
+                        self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+
+    def test_mktemp_fixture_plain_subpath_near_misses(self):
+        backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        original = backup.read_text().replace('/.robob/userdata/statev2.sqlite', '/fixture-live/userdata/statev2.sqlite')
+        path = 'tmp/fixture.sh'
+        variants = [(assignment, original.replace('T=$(mktemp -d "$TOP/case.XXXXXX")', assignment))
+                    for assignment in ('T=tmp', 'T=$HOME', 'T="$ROBOB_HOME"')]
+        for suffix in ('../../.robob/userdata/statev2.sqlite', './fixture/statev2.sqlite',
+                       'fixture/../userdata/statev2.sqlite', '$X/statev2.sqlite',
+                       'fixture*/statev2.sqlite', 'fixture?/statev2.sqlite',
+                       'fixture[ab]/statev2.sqlite', r'fixt\ure/statev2.sqlite',
+                       'fixt"ure"/statev2.sqlite', "fixt'ure'/statev2.sqlite",
+                       'fixture/statev2.sqlite/../../real', 'fixture/statev2.sqlite$X',
+                       'fixture/statev2.sqlite*', 'fixture/statev2.sqlite.backup'):
+            variants.append((suffix, original.replace('fixture-live/userdata/statev2.sqlite', suffix)))
+        for statement in ('cat ~/.robob/userdata/statev2.sqlite',
+                          'cat "$HOME/.ro""bob/userdata/state""v2.sqlite"',
+                          'grep needle "$HOME/robob-""data/userdata/state""v2.sqlite"',
+                          'cat "$HOME/.local/share/open""code/open""code.db"',
+                          'sqlite3 "$HOME/.robob/userdata/statev2.sqlite"',
+                          'cat "$T/fixture-live/userdata/statev2.sqlite"'):
+            variants.append(('after-reset-lifetime:' + statement, original + '\n' + statement + '\n'))
+        live = '"$HOME/.ro""bob/userdata/state""v2.sqlite"'
+        for statement in ('cat "$(cat ' + live + ')"',
+                          'cat `cat ' + live + '`',
+                          'cat "${UNSET:-$(cat ' + live + ')}"',
+                          'cat "${UNSET:-$HOME/.ro""bob/userdata/state""v2.sqlite}"',
+                          'cat harmless#suffix ' + live,
+                          'cat harmless\\#suffix ' + live,
+                          'cat harmless\\ #suffix "$(cat ' + live + ')"'):
+            variants.append(('split-live-expression:' + statement, original + '\n' + statement + '\n'))
+        for statement in ('X=\ncat "$HOME/.ro${X}bob/userdata/state""v2.sqlite"',
+                          'X=\ngrep needle "$HOME/.ro${X}bob/userdata/state""v2.sqlite"',
+                          'X="$HOME/.ro""bob"\ncat "${X}/userdata/state""v2.sqlite"',
+                          'cat "$(printf \'%b\' \'\\057Users\\057x\\057.ro\\142ob\\057userdata\\057statev2.sqli\\164e\')"',
+                          '"$PYTHON" -c \'import sys; open(sys.argv[1]).read()\' ' + live,
+                          'X=\n"$PYTHON" - "$HOME/.ro${X}bob/userdata/state""v2.sqlite" <<\'PY\'\nimport sys\nopen(sys.argv[1]).read()\nPY'):
+            variants.append(('unproved-reader:' + statement, original + '\n' + statement + '\n'))
+        for statement in ('cat "$HOME/.ro""bob/userdata/state\\\nv2.sqlite"',
+                          'cat "$HOME/.ro""bob/userdata/"$\'statev2.sqli\\x74e\'',
+                          'cat "$HOME/.ro""bob/userdata/"$"statev2.sqlite"'):
+            variants.append(('bash-quoting:' + statement, original + '\n' + statement + '\n'))
+        for program in ('open("/Users/x/.ro" + "bob/userdata/state" + "v2.sqlite").read()',
+                        'open(b"/Users/x/.ro" + b"bob/userdata/state" + b"v2.sqlite").read()',
+                        'open(f"/Users/x/.{\"ro\"}{\"bob\"}/user{\"data\"}/state{\"v2\"}.sqli{\"te\"}").read()',
+                        'open("".join(["/Users/x/.", "ro", "bob/user", "data/state", "v2.sqli", "te"])).read()'):
+            for statement in ('"$PYTHON" -c ' + shlex.quote(program),
+                              '"$PYTHON" - <<\'PY\'\n' + program + '\nPY'):
+                variants.append(('python-built-target:' + statement, original + '\n' + statement + '\n'))
+        for update in ('p += segment', 'p = p + segment'):
+            program = ('p = ""\nfor segment in ["/Users/synthetic/.", "ro", "bob/user", "data/state", "v2.sqli", "te"]:\n'
+                       '    ' + update + '\nopen(p).read()')
+            for statement in ('"$PYTHON" -c ' + shlex.quote(program),
+                              '"$PYTHON" - <<\'PY\'\n' + program + '\nPY'):
+                variants.append(('python-accumulated-target:' + update, original + '\n' + statement + '\n'))
+            if update == 'p = p + segment':
+                statement = ('"$PYTHON" - "$HERE/src" <<\'PY\'\nimport sys\nsys.path.insert(0, sys.argv[1])\n'
+                             'import transcript_backup_manifest as tbm\n' + program + '\nPY')
+                variants.append(('manifest-string-accumulation', original + '\n' + statement + '\n'))
+                spoofed = ('for directory, p, segment in os.walk(sys.argv[2]):\n    pass\n' + program)
+                statement = ('"$PYTHON" - "$HERE/src" "$T" <<\'PY\'\nimport os, sys\nsys.path.insert(0, sys.argv[1])\n'
+                             'import transcript_backup_manifest as tbm\n' + spoofed + '\nPY')
+                variants.append(('manifest-list-binding-reassigned', original + '\n' + statement + '\n'))
+        for program in ('p = "etilqs.2vetats/atadresu/bobor./citehtnys/sresU/"[::-1]\nopen(p).read()',
+                        'p = sys.argv[2][::-1]\nopen(p).read()',
+                        'p = os.path.join(sys.argv[2], "etilqs.2vetats/atadresu/bobor./citehtnys/sresU/"[::-1])\nopen(p).read()',
+                        'p = json.loads(' + repr('"' + ''.join('\\u%04x' % ord(char) for char in '/Users/synthetic/.robob/userdata/statev2.sqlite') + '"') + ')\nopen(p).read()'):
+            statement = ('"$PYTHON" - "$HERE/src" "$T" <<\'PY\'\nimport os, sys, json\nsys.path.insert(0, sys.argv[1])\n'
+                         'import transcript_backup_manifest as tbm\n' + program + '\nPY')
+            variants.append(('manifest-unproved-read-target', original + '\n' + statement + '\n'))
+        for value in ('$HOME', '$T/restore$HOME/stage', '$T/restore$T/../../stage'):
+            variants.append(('snapshot-root:' + value, original.replace('SNAPROOT="$T/restore$T/stage"', 'SNAPROOT="' + value + '"')))
+        # A heredoc body run as a child script has no mktemp root: an empty $T
+        # turns a plain subpath into an absolute one.
+        for target in ('$T/Volumes/ExternalSSD/robob-data/userdata/statev2.sqlite',
+                       '${T}/Volumes/ExternalSSD/robob-data/userdata/statev2.sqlite',
+                       '$T/Users/synthetic/robob-data/userdata/statev2.sqlite-wal'):
+            body = '/bin/cat "' + target + '" > "$HOME/leak"\n'
+            variants.append(('heredoc-quoted-body:' + target, original.replace(
+                'echo "$$" > "$HOME/sync-pid"\n', 'echo "$$" > "$HOME/sync-pid"\n' + body, 1)))
+            variants.append(('heredoc-unquoted-body:' + target, original.replace(
+                '"$REAL_RSYNC" "\\$@" || exit \\$?\n', '"$REAL_RSYNC" "\\$@" || exit \\$?\n' + body.replace('$T', '\\$T'), 1)))
+            variants.append(('heredoc-tab-body:' + target, original + "\ncat > \"$R/bin/extra\" <<-'SH'\n\t#!/bin/bash\n\t" + body + "\tSH\n"))
+        variants.append(('before-setup', original.replace('# 1. sync', 'cat "$T/fixture-live/userdata/statev2.sqlite"\n# 1. sync')))
+        variants.append(('quote-concatenated-tail', original.replace(
+            '"$T/fixture-live/userdata/statev2.sqlite"', '"$T/fixture-live/userdata/statev2.sqlite"/../../real')))
+        variants.append(('string-built-home', original + "\n/opt/homebrew/bin/python3 - <<'PY'\nimport os\nroot = os.path.join(os.environ['HOME'], '.ro' + 'bob', 'userdata', 'statev2.sqlite')\nopen(root).read()\nPY\n"))
+        for label, source in variants:
+            self.write(path, source)
+            for command in ('bash ' + path, '/bin/bash ' + str(self.root / path),
+                            'offbox run --bg -- bash ' + path):
+                with self.subTest(case=label, command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+        self.write(path, original)
+        for command in ('sed -i "s/mktemp/echo/g" ' + path + '; bash ' + path,
+                        'BASH_ENV=/tmp/preload.sh bash ' + path,
+                        'BASH_ENV=/tmp/preload.sh offbox run --bg -- bash ' + path):
+            with self.subTest(command=command):
+                self.assertEqual(self.classify(command), SCRIPT)
+        with patch.dict(os.environ, {'BASH_FUNC_mktemp%%': '() { echo "$HOME"; }'}):
+            self.assertEqual(self.classify('bash ' + path), SCRIPT)
+            self.assertEqual(self.classify('offbox run --bg -- bash ' + path), SCRIPT)
+        # The snapshot root repeats $T, so an inherited temp prefix with parent
+        # segments (or one the script reassigns) must void the fixture proof.
+        commands = ('bash ' + path, '/bin/bash ' + str(self.root / path), 'offbox run --bg -- bash ' + path)
+        for prefix in ('relative/tmp', '/tmp/../..', '/tmp/x/../../Users'):
+            with patch.dict(os.environ, {'TMPDIR': prefix}):
+                for command in commands:
+                    with self.subTest(tmpdir=prefix, command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+        self.write(path, 'TMPDIR=/tmp/../..\n' + original)
+        for command in commands:
+            with self.subTest(case='script-assigns-tmpdir', command=command):
+                self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_mktemp_fixture_plain_subpath_straight_line(self):
+        for root in ('$T', '${T}'):
+            # Keep a live-root marker so both cases exercise the source fallback.
+            source = '# .robob\nT=$(mktemp -d)\ncat "' + root + '/fixture-live/userdata/statev2.sqlite"\n'
+            self.write('tmp/fixture.sh', source)
+            self.assertIsNone(self.classify('bash tmp/fixture.sh'))
+            self.write('tmp/fixture.sh', 'cat "' + root + '/fixture-live/userdata/statev2.sqlite"\n' + source)
+            self.assertEqual(self.classify('bash tmp/fixture.sh'), SCRIPT)
+            self.write('tmp/fixture.sh', source.replace('"' + root + '/fixture-live/userdata/statev2.sqlite"',
+                                                       "'" + root + "/fixture-live/userdata/statev2.sqlite'"))
+            for command in ('bash tmp/fixture.sh', '/bin/bash ' + str(self.root / 'tmp/fixture.sh'),
+                            'offbox run --bg -- bash tmp/fixture.sh'):
+                with self.subTest(root=root, command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_mktemp_fixture_quoted_traversal_tails(self):
+        rows = [('"', separator) for separator in (')', '(', ' ', '\t', '\n', '\r', '\v', '\f', ';', '&', '|', '<', '>')]
+        rows += [('', separator) for separator in ('\r', '\v', '\f', '\u00a0', '\u2028')]
+        for quote, separator in rows:
+            source = ('TOP=$(mktemp -d "${TMPDIR:-/tmp}/fixture.XXXXXX") || exit 1\n'
+                      'setup() {\n  T=$(mktemp -d "$TOP/case.XXXXXX")\n'
+                      '  mkdir -p "$T/.robob" ' + quote + '$T/fixture/statev2.sqlite' + separator + quote + '\n}\n'
+                      'setup fake\ncat ' + quote + '$T/fixture/statev2.sqlite' + separator + '/'
+                      + '../' * 32 + '$HOME/.ro""bob/userdata/state""v2.sqlite' + quote + '\n')
+            self.write('tmp/fixture.sh', source)
+            for command in ('bash tmp/fixture.sh', '/bin/bash ' + str(self.root / 'tmp/fixture.sh'),
+                            'offbox run --bg -- bash tmp/fixture.sh'):
+                with self.subTest(quote=quote, separator=separator, command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
     def test_mktemp_fixture_tool_identity(self):
         backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
         self.write('tmp/backup.sh', backup.read_text())
