@@ -2705,6 +2705,14 @@ const make = Effect.gen(function* () {
           code: stage === "caller" ? "caller_unresolved" : "delegation_timeout",
           threadId: callerScope.thread?.threadId,
           stage,
+          wait:
+            stage === "dispatch"
+              ? "threadManagement.dispatch"
+              : stage === "receipt"
+                ? "threadManagement.hasReceipt"
+                : stage === "caller"
+                  ? "caller identity or active-run records"
+                  : stage,
           ...(retryKey === undefined ? {} : { requestKey: retryKey }),
           ...(taskId === undefined ? {} : { taskId }),
         });
