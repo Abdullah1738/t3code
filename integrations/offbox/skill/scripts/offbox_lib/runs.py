@@ -17,7 +17,7 @@ import traceback
 import time
 from pathlib import Path
 
-from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync
+from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
 from . import command_usage, common, containers, prune, prepare, userns
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
@@ -701,13 +701,18 @@ def last_stage_is_grep(cmd: str) -> bool:
 
 def steps_block(steps: list[str]) -> str:
     """Each step runs in its own subshell with pipefail; a failing step does not stop the next one."""
-    lines = ["__offbox_first=0", "__offbox_completed=0",
+    lines = [run_evidence.shell(BOUNDED_PROCESS),
+             f'__offbox_evidence begin pid=$$ planned={len(steps)}',
+             "__offbox_first=0", "__offbox_completed=0", "__offbox_current=0",
              # A graceful early exit must not look like a fully completed step run.
              "trap '[ \"$__offbox_completed\" -eq " + str(len(steps)) + " ] || exit 90' EXIT",
-             "trap 'exit 90' HUP INT TERM"]
+             *[f"trap '__offbox_evidence signal={name} step=$__offbox_current; exit 90' {name}"
+               for name in ("HUP", "INT", "TERM")]]
     for n, step in enumerate(steps, 1):
         label = " ".join(step.split())[:60]
-        lines += ["(", "set -o pipefail", step, ")", "__offbox_rc=$?",
+        lines += [f'__offbox_current={n}', f'__offbox_evidence start step={n}',
+                  "(", "set -o pipefail", step, ")", "__offbox_rc=$?",
+                  f'__offbox_evidence end step={n} rc=$__offbox_rc',
                   f'echo "offbox step {n} rc=$__offbox_rc: "{shlex.quote(label)} >&2 || exit 90',
                   f'__offbox_completed={n}',
                   '[ "$__offbox_rc" -eq 0 ] || [ "$__offbox_first" -ne 0 ] || __offbox_first=$__offbox_rc']
@@ -928,7 +933,7 @@ def exit_recording_command(script: str, run_id: str) -> str:
         'mkdir -p "$HOME/.offbox/exit" || exit 1',
         f'printf "%s\\n" "$1" > {f}.tmp && mv -f {f}.tmp {f}',
         'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" -o -name "*.pid" '
-        '-o -name "*.containers.json" -o -name "*.containers.tmp" \\) -mtime +2 -delete',
+        '-o -name "*.trace" -o -name "*.containers.json" -o -name "*.containers.tmp" \\) -mtime +2 -delete',
     ])
     # Filesystem calls after the preamble are just as capable of wedging as restore's flock/load. The helper
     # owns no run output descriptors and is abandoned at its deadline even if its children cannot be killed.
@@ -946,6 +951,14 @@ def exit_recording_command(script: str, run_id: str) -> str:
                     + f"\nrc, _ = bounded(['bash', '-c', {marker!r}, 'offbox-pid-record', sys.argv[1]], 2)\n"
                     + 'sys.exit(rc)\nOFFBOX_PID_RECORD')
     outer = "\n".join([
+        f'export OFFBOX_RUN_ID={shlex.quote(run_id)}',
+        run_evidence.shell(BOUNDED_PROCESS),
+        "__offbox_signal() {",
+        '__offbox_evidence "signal=$1"',
+        '__offbox_rc=$2',
+        persist_block,
+        'exit "$__offbox_rc"',
+        "}",
         marker_block,
         '__offbox_rc=$?',
         'if [ "$__offbox_rc" = 98 ]; then',
@@ -955,7 +968,11 @@ def exit_recording_command(script: str, run_id: str) -> str:
         '  echo "offbox-box-wedged: run marker setup failed or did not finish in 2s (exit directory/PID write)" >&2',
         '  __offbox_rc=97',
         'else',
+        # A duplicate/unconfirmed claimant must never write the owner's receipt from a signal handler.
+        *[f"trap '__offbox_signal {name} {code}' {name}"
+          for name, code in (("HUP", 129), ("INT", 130), ("TERM", 143))],
         '__offbox_t0=$(date +%s)',
+        '__offbox_evidence wrapper pid=$$',
         'bash -lc "$0"',
         '__offbox_rc=$?',
         'fi',
