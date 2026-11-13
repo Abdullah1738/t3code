@@ -1,3 +1,4 @@
+import { reportSqliteError } from "@t3tools/shared/nodeSqliteErrors";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -66,6 +67,11 @@ const Automation = codec(KanbanAutomation);
 const Wiki = codec(KanbanWikiPage);
 const ThreadLink = codec(KanbanThreadLink);
 
+const decodeTurn = Effect.callback<void>((resume) => {
+  const immediate = setImmediate(() => resume(Effect.void));
+  return Effect.sync(() => clearImmediate(immediate));
+});
+
 interface JsonRow {
   readonly json: string;
 }
@@ -91,6 +97,10 @@ export interface KanbanStoreShape {
   readonly feedCards: (
     boardId: KanbanBoardId,
     page?: { readonly after: number; readonly limit: number },
+  ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
+  readonly cardPage: (
+    boardId: KanbanBoardId,
+    page: { readonly after: number; readonly limit: number; readonly open: boolean },
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
   /** Only the fields the board list's badges read, for every card on the board, in number order. */
   readonly summaryCards: (
@@ -173,6 +183,9 @@ export interface KanbanStoreShape {
   readonly discussionByEvaluator: (
     threadId: string,
   ) => Effect.Effect<KanbanDiscussion | null, KanbanStoreError>;
+  readonly discussionBoardIdsByEvaluator: (
+    threadId: string,
+  ) => Effect.Effect<ReadonlyArray<KanbanBoardId>, KanbanStoreError>;
   readonly putDiscussion: (discussion: KanbanDiscussion) => Effect.Effect<void, KanbanStoreError>;
   /** The newest `limit` (default 200) after `afterSeq` and before `beforeSeq`, oldest first. */
   readonly messages: (
@@ -264,17 +277,26 @@ export const actorKey = (actor: KanbanActor): string => {
 
 const make = Effect.gen(function* () {
   const sql = yield* BoardsDatabase.client;
-  const fail = (operation: string) => (cause: unknown) =>
-    new KanbanStoreError({ operation, cause });
+  const fail = (operation: string) => (cause: unknown) => {
+    reportSqliteError(cause, `KanbanStore.${operation}`);
+    return new KanbanStoreError({ operation, cause });
+  };
 
   yield* BoardsDatabase.initialize(
     Effect.forEach(kanbanDDL, (statement) => sql.unsafe(statement), { discard: true }),
   ).pipe(Effect.mapError(fail("create tables")));
 
+  // Decoding runs after the reader released its slot. Yield every 32 rows so
+  // simultaneous board snapshots do not starve timers (M1a 9411874c11).
   const decodeAll = <A, E>(
     rows: ReadonlyArray<JsonRow>,
     decode: (json: string) => Effect.Effect<A, E>,
-  ) => Effect.forEach(rows, (row) => decode(row.json));
+  ) =>
+    Effect.forEach(rows, (row, index) =>
+      index > 0 && index % 32 === 0
+        ? decodeTurn.pipe(Effect.andThen(decode(row.json)))
+        : decode(row.json),
+    );
 
   const first = <A>(items: ReadonlyArray<A>): A | null => items[0] ?? null;
 
@@ -360,27 +382,58 @@ const make = Effect.gen(function* () {
         (rows) => decodeAll(rows, Card.decode),
       ),
     );
+  const cardPage: KanbanStoreShape["cardPage"] = (boardId, page) =>
+    runRead(
+      "read card page",
+      Effect.flatMap(
+        sql<JsonRow>`
+          SELECT number, json FROM ardud_kanban_cards
+          WHERE board_id = ${boardId} AND number > ${page.after}
+            ${page.open ? sql`AND json_extract(json, '$.settledAt') IS NULL` : sql``}
+          ORDER BY number LIMIT ${page.limit}
+        `,
+        (rows) => decodeAll(rows, Card.decode),
+      ),
+    );
   const summaryCards = (boardId: KanbanBoardId) =>
     runRead(
       "read summary cards",
-      Effect.flatMap(
-        sql<JsonRow>`
-          SELECT json_object(
-            'id', id,
-            'stage', stage,
-            'settledAt', json_extract(json, '$.settledAt'),
-            'activeThreadId', active_thread_id,
-            'asks', json(COALESCE((
-              SELECT json_group_array(json_object('closedAt', json_extract(ask.value, '$.closedAt')))
-              FROM json_each(ardud_kanban_cards.json, '$.asks') AS ask
-            ), '[]'))
-          ) AS json
-          FROM ardud_kanban_cards
-          WHERE board_id = ${boardId}
-          ORDER BY number
-        `,
-        (rows) => decodeAll(rows, Summary.decode),
-      ),
+      Effect.gen(function* () {
+        const cards: Array<SummaryCard> = [];
+        let after = 0;
+        // Release the reader between batches; a board list must not monopolize
+        // the boards lane while SQLite parses every card's asks.
+        while (true) {
+          const rows = yield* sql<JsonRow & { number: number }>`
+            SELECT number, json_object(
+              'id', id,
+              'stage', stage,
+              'settledAt', json_extract(json, '$.settledAt'),
+              'activeThreadId', active_thread_id,
+              'asks', json(COALESCE((
+                SELECT json_group_array(json_patch(
+                  json_object('closedAt', json_extract(ask.value, '$.closedAt')),
+                  json_object(
+                    'clarifyAskedAt', json_extract(ask.value, '$.clarifyAskedAt'),
+                    'handedAt', json_extract(ask.value, '$.handedAt'),
+                    'expiresAt', json_extract(ask.value, '$.expiresAt'),
+                    'snoozedUntil', json_extract(ask.value, '$.snoozedUntil'),
+                    'respond', CASE WHEN json_extract(ask.value, '$.respond.ack') = 1
+                      THEN json_object('ack', json('true')) END
+                  )
+                ))
+                FROM json_each(ardud_kanban_cards.json, '$.asks') AS ask
+              ), '[]'))
+            ) AS json
+            FROM ardud_kanban_cards
+            WHERE board_id = ${boardId} AND number > ${after}
+            ORDER BY number LIMIT 64
+          `;
+          cards.push(...(yield* decodeAll(rows, Summary.decode)));
+          if (rows.length < 64) return cards;
+          after = rows.at(-1)!.number;
+        }
+      }),
     );
   const card = (cardId: KanbanCardId) =>
     runRead(
@@ -635,6 +688,17 @@ const make = Effect.gen(function* () {
           SELECT json FROM ardud_kanban_discussions WHERE evaluator_thread_id = ${threadId} LIMIT 1
         `,
         (rows) => Effect.map(decodeAll(rows, Discussion.decode), first),
+      ),
+    );
+  const discussionBoardIdsByEvaluator = (threadId: string) =>
+    runRead(
+      "read discussion boards by evaluator",
+      Effect.map(
+        sql<{ readonly board_id: KanbanBoardId }>`
+          SELECT DISTINCT board_id FROM ardud_kanban_discussions
+          WHERE evaluator_thread_id = ${threadId} ORDER BY board_id
+        `,
+        (rows) => rows.map((row) => row.board_id),
       ),
     );
   const putDiscussion = (value: KanbanDiscussion) =>
@@ -909,6 +973,7 @@ const make = Effect.gen(function* () {
     cards,
     summaryCards,
     feedCards,
+    cardPage,
     feedGoals: (boardId) =>
       runRead(
         "read feed goals",
@@ -943,6 +1008,7 @@ const make = Effect.gen(function* () {
     discussions,
     discussion,
     discussionByEvaluator,
+    discussionBoardIdsByEvaluator,
     putDiscussion,
     messages,
     ownerWait,

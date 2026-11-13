@@ -1,0 +1,9 @@
+[Unit]
+Description=offbox: judge this boot four minutes after it started
+
+[Timer]
+OnBootSec=4min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

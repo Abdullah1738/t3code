@@ -1,0 +1,31 @@
+{
+  "file": "rollout-2026-11-11T15-58-36-01a1ca79-65f5-7772-8d85-420d5eb2af51.jsonl",
+  "timestamp": "2026-11-11T14:39:21.169Z",
+  "session_cwd": "/Volumes/ExternalSSD/crpko-devops",
+  "payload": {
+    "type": "custom_tool_call",
+    "id": "ctc_016221a2eb2898d2016af47e0dae8087d0a63f1e1ab3a73371",
+    "status": "completed",
+    "call_id": "call_b120c9cc3ba549d19532be8ab4e0845a",
+    "name": "exec",
+    "input": "text(await tools.exec_command({cmd:\"tail -12 tmp/quint/3790/shared-stale-check.log\\ngit diff --stat\\ngit log -2 --oneline\",workdir:\"/Users/ardud/checkouts/bo-revoke-refresh-p2\",yield_time_ms:1000,max_output_tokens:1200}));\ntext(await tools.exec_command({cmd:\"cat > tmp/quint/3790/clean-full.sh <<'SH'\\n#!/usr/bin/env bash\\nset -euo pipefail\\ntask_repo_root=$PWD\\ntask_clean_checkout=$(mktemp -d /tmp/bo-refresh-ci.XXXXXXXX)\\ngit clone --quiet --no-hardlinks \\\"$task_repo_root\\\" \\\"$task_clean_checkout\\\"\\nexport UV_PROJECT_ENVIRONMENT=\\\"$task_repo_root/.venv\\\"\\nexport UV_NO_SYNC=1\\ncd \\\"$task_clean_checkout\\\"\\ngit rev-parse HEAD\\nset +e\\nbash \\\"$task_repo_root/tmp/quint/3790/clean-ci.sh\\\"\\ntask_check_rc=$?\\nset -e\\nif [ \\\"$task_check_rc\\\" -eq 0 ]; then\\n  rm -rf \\\"$task_clean_checkout\\\"\\nelse\\n  printf 'Retained check directory: %s\\\\n' \\\"$task_clean_checkout\\\"\\nfi\\nexit \\\"$task_check_rc\\\"\\nSH\\npython3 - <<'PY'\\nfrom pathlib import Path\\ns=Path('tmp/quint/3790/check-all.sh').read_text().replace(\\\"PYTEST_XDIST_ARGS='-n 4'\\\", \\\"PYTEST_XDIST_ARGS='-n 12'\\\")\\nPath('tmp/quint/3790/clean-ci.sh').write_text(s)\\nPY\",workdir:\"/Users/ardud/checkouts/bo-revoke-refresh-p2\",yield_time_ms:1000,max_output_tokens:500}));\n",
+    "internal_chat_message_metadata_passthrough": {
+      "turn_id": "01a1ca79-67c1-76b2-9519-c3dcb4a7e72d",
+      "create_time": 1794407949.685345
+    }
+  },
+  "commands": [
+    {
+      "cmd": "tail -12 tmp/quint/3790/shared-stale-check.log\ngit diff --stat\ngit log -2 --oneline",
+      "workdir": "/Users/ardud/checkouts/bo-revoke-refresh-p2",
+      "sha256": "b82e3a1e8b0fb261dc7db16171a869118cc0210f44f41199b095966bb9f64fa7"
+    },
+    {
+      "cmd": "cat > tmp/quint/3790/clean-full.sh <<'SH'\n#!/usr/bin/env bash\nset -euo pipefail\ntask_repo_root=$PWD\ntask_clean_checkout=$(mktemp -d /tmp/bo-refresh-ci.XXXXXXXX)\ngit clone --quiet --no-hardlinks \"$task_repo_root\" \"$task_clean_checkout\"\nexport UV_PROJECT_ENVIRONMENT=\"$task_repo_root/.venv\"\nexport UV_NO_SYNC=1\ncd \"$task_clean_checkout\"\ngit rev-parse HEAD\nset +e\nbash \"$task_repo_root/tmp/quint/3790/clean-ci.sh\"\ntask_check_rc=$?\nset -e\nif [ \"$task_check_rc\" -eq 0 ]; then\n  rm -rf \"$task_clean_checkout\"\nelse\n  printf 'Retained check directory: %s\\n' \"$task_clean_checkout\"\nfi\nexit \"$task_check_rc\"\nSH\npython3 - <<'PY'\nfrom pathlib import Path\ns=Path('tmp/quint/3790/check-all.sh').read_text().replace(\"PYTEST_XDIST_ARGS='-n 4'\", \"PYTEST_XDIST_ARGS='-n 12'\")\nPath('tmp/quint/3790/clean-ci.sh').write_text(s)\nPY",
+      "workdir": "/Users/ardud/checkouts/bo-revoke-refresh-p2",
+      "sha256": "840e0e242b9ce81dfd3f7a3616d19dd3c998fe6758dd431757ed34980cb9706b"
+    }
+  ],
+  "case": "t",
+  "hook_provenance": "Reconstructed native Bash.command + cwd; raw hook stdin was not retained."
+}

@@ -20,6 +20,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -420,12 +421,15 @@ export const make = Effect.gen(function* () {
     for (const [reason, { count, key }] of skips) {
       yield* Effect.logWarning("pull request sync skipped", { count, key, reason });
     }
-  });
+  }, NodeSqliteClient.backgroundReads);
 
   const worker = yield* makeDrainableWorker((scope: "all" | "requested") =>
     Effect.suspend(() => {
       if (scope === "requested") requestedSweepQueued = false;
-      return sweep(scope);
+      // A fresh memo per sweep: each project's shell is read once per sweep, never reused after.
+      return sweep(scope).pipe(
+        Effect.provideService(PullRequestService.SweepProjectShells, new Map()),
+      );
     }).pipe(Effect.catchCause(logSkipped("pull request sync sweep failed", {}))),
   );
 

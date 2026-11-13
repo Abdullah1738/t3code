@@ -151,6 +151,14 @@ export function useThreadProjection(ref: ScopedThreadRef | null): EnvironmentThr
   );
 }
 
+const EMPTY_THREAD_ERROR_ATOM = Atom.make<string | null>(null);
+
+export function useThreadSyncError(ref: ScopedThreadRef | null): string | null {
+  return useAtomValue(
+    ref === null ? EMPTY_THREAD_ERROR_ATOM : environmentThreadDetails.errorAtom(ref),
+  );
+}
+
 export function useThreadStatus(ref: ScopedThreadRef | null): EnvironmentThreadStatus {
   return useAtomValue(
     ref === null ? EMPTY_THREAD_STATUS_ATOM : environmentThreadDetails.statusAtom(ref),

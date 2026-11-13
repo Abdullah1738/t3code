@@ -2,6 +2,7 @@ import {
   AuthAccessTokenType,
   AuthAccessWriteScope,
   AuthAdministrativeScopes,
+  AuthEnvironmentMaintainScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   AuthSettingsWriteScope,
@@ -96,6 +97,7 @@ export const mcpClientScopes = (
       : [AuthOrchestrationReadScope, AuthOrchestrationOperateScope];
 
 export interface McpClientSession {
+  readonly maintenanceAuthorized?: boolean;
   readonly sessionId: AuthSessionId;
   readonly label: string;
   readonly access: AuthMcpClientAccess;
@@ -573,8 +575,13 @@ export class EnvironmentAuth extends Context.Service<
       readonly label: string;
       readonly access: AuthMcpClientAccess;
       readonly client: AuthClientMetadata;
+      readonly ownerApprovalSessionId?: AuthSessionId;
     }) => Effect.Effect<
-      { readonly token: string; readonly expiresAt: DateTime.DateTime },
+      {
+        readonly token: string;
+        readonly expiresAt: DateTime.DateTime;
+        readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
+      },
       ServerAuthInternalError
     >;
     /**
@@ -924,6 +931,8 @@ export const make = Effect.gen(function* () {
             ...authScopeResponse(session.scopes),
             sessionMethod: session.method,
             ...(session.expiresAt ? { expiresAt: DateTime.toUtc(session.expiresAt) } : {}),
+            // ardud: the same reading of the session the board's owner check makes.
+            owner: session.origin?._tag === "owner",
           }) satisfies AuthSessionState,
       ),
       Effect.catchIf(isServerAuthCredentialError, () =>
@@ -1308,14 +1317,27 @@ export const make = Effect.gen(function* () {
       );
     };
 
+  // ardud:
+  // Whether a listed session is the owner's. A failed lookup leaves it unsaid
+  // instead of calling an owner device a stranger.
+  const ownerStanding = (sessionId: AuthSessionId) =>
+    isOwnerSession(sessionId).pipe(
+      Effect.map((owner) => ({ owner })),
+      Effect.catch(() => Effect.succeed({})),
+    );
   const listClientSessions: EnvironmentAuth["Service"]["listClientSessions"] = (currentSessionId) =>
     listSessions().pipe(
-      Effect.map((clientSessions) =>
-        clientSessions.map((clientSession): AuthClientSession => ({
-          ...clientSession,
-          ...authScopeResponse(clientSession.scopes),
-          current: clientSession.sessionId === currentSessionId,
-        })),
+      Effect.flatMap((clientSessions) =>
+        Effect.forEach(clientSessions, (clientSession) =>
+          ownerStanding(clientSession.sessionId).pipe(
+            Effect.map((standing): AuthClientSession => ({
+              ...clientSession,
+              ...authScopeResponse(clientSession.scopes),
+              current: clientSession.sessionId === currentSessionId,
+              ...standing,
+            })),
+          ),
+        ),
       ),
       Effect.withSpan("EnvironmentAuth.listClientSessions"),
     );
@@ -1424,6 +1446,7 @@ export const make = Effect.gen(function* () {
           ? Effect.succeed({
               sessionId: session.sessionId,
               label: session.client.label ?? "MCP client",
+              maintenanceAuthorized: session.scopes.includes(AuthEnvironmentMaintainScope),
               access: session.scopes.includes(AuthOrchestrationOperateScope)
                 ? (session.runtimeModeCeiling ?? "approval-required")
                 : "read-only",
@@ -1438,21 +1461,39 @@ export const make = Effect.gen(function* () {
     );
   };
 
-  const issueMcpClientSession: EnvironmentAuth["Service"]["issueMcpClientSession"] = (input) =>
-    sessions
-      .issue({
+  const issueMcpClientSession: EnvironmentAuth["Service"]["issueMcpClientSession"] = Effect.fn(
+    "EnvironmentAuth.issueMcpClientSession",
+  )(
+    function* (input) {
+      // Only a currently active owner browser can delegate maintenance. Ordinary
+      // MCP approvals, pairing codes and existing tokens keep their old ceiling.
+      const approver =
+        input.ownerApprovalSessionId === undefined
+          ? undefined
+          : (yield* sessions.listActive()).find(
+              (session) => session.sessionId === input.ownerApprovalSessionId,
+            );
+      const maintenanceAuthorized =
+        input.access === "full-access" &&
+        approver?.method === "browser-session-cookie" &&
+        (approver.permissions ?? approver.scopes).includes(AuthEnvironmentMaintainScope) &&
+        (yield* isOwnerSession(approver.sessionId));
+      const scopes = [
+        ...mcpClientScopes(input.access),
+        ...(maintenanceAuthorized ? [AuthEnvironmentMaintainScope] : []),
+      ];
+      const issued = yield* sessions.issue({
         subject: MCP_CLIENT_SUBJECT,
         method: "bearer-access-token",
-        scopes: mcpClientScopes(input.access),
+        scopes,
         ttl: MCP_CLIENT_SESSION_TTL,
         ...(input.access === "read-only" ? {} : { runtimeModeCeiling: input.access }),
         client: { ...input.client, label: input.label, deviceType: "bot" },
-      })
-      .pipe(
-        Effect.map((issued) => ({ token: issued.token, expiresAt: issued.expiresAt })),
-        Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })),
-        Effect.withSpan("EnvironmentAuth.issueMcpClientSession"),
-      );
+      });
+      return { token: issued.token, expiresAt: issued.expiresAt, scopes };
+    },
+    Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })),
+  );
 
   const authenticateBrowserSession: EnvironmentAuth["Service"]["authenticateBrowserSession"] = (
     request,

@@ -2,7 +2,9 @@ import { assert, describe, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
+import { vi } from "vite-plus/test";
 
 import type * as Electron from "electron";
 
@@ -14,6 +16,28 @@ import * as DesktopLifecycle from "./DesktopLifecycle.ts";
 import * as DesktopShutdown from "./DesktopShutdown.ts";
 import * as DesktopState from "./DesktopState.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
+
+const files = vi.hoisted(() => ({
+  existsSync: vi.fn(() => false),
+  appendFileSync: vi.fn(),
+}));
+vi.mock("node:fs", async (original) => ({ ...(await original()), ...files }));
+
+function makeLayerEnvironment(platform: NodeJS.Platform) {
+  return Layer.effect(
+    DesktopEnvironment.DesktopEnvironment,
+    Effect.map(
+      Path.Path,
+      (path) =>
+        ({
+          platform,
+          isDevelopment: false,
+          logDir: "/logs",
+          path,
+        }) as DesktopEnvironment.DesktopEnvironment["Service"],
+    ),
+  ).pipe(Layer.provide(Path.layer));
+}
 
 function layerElectronApp(
   appListeners: Map<string, (...args: readonly unknown[]) => void>,
@@ -108,10 +132,7 @@ describe("DesktopLifecycle", () => {
     (platform) => {
       const appListeners = new Map<string, (...args: readonly unknown[]) => void>();
       let windowsDestroyed = false;
-      const layerEnvironment = Layer.succeed(DesktopEnvironment.DesktopEnvironment, {
-        platform,
-        isDevelopment: false,
-      } as DesktopEnvironment.DesktopEnvironment["Service"]);
+      const layerEnvironment = makeLayerEnvironment(platform);
 
       const layer = DesktopLifecycle.layer.pipe(
         Layer.provideMerge(layerElectronApp(appListeners)),
@@ -186,10 +207,7 @@ describe("DesktopLifecycle", () => {
         isComplete: Deferred.isDone(allowShutdown),
       });
 
-      const layerEnvironment = Layer.succeed(DesktopEnvironment.DesktopEnvironment, {
-        platform: "darwin",
-        isDevelopment: false,
-      } as DesktopEnvironment.DesktopEnvironment["Service"]);
+      const layerEnvironment = makeLayerEnvironment("darwin");
 
       const layer = DesktopLifecycle.layer.pipe(
         Layer.provideMerge(layerElectronApp(appListeners, quit)),
@@ -228,10 +246,7 @@ describe("DesktopLifecycle", () => {
       const activate = Effect.sync(() => {
         activationCount += 1;
       });
-      const layerEnvironment = Layer.succeed(DesktopEnvironment.DesktopEnvironment, {
-        platform: "darwin",
-        isDevelopment: false,
-      } as DesktopEnvironment.DesktopEnvironment["Service"]);
+      const layerEnvironment = makeLayerEnvironment("darwin");
       const layer = DesktopLifecycle.layer.pipe(
         Layer.provideMerge(layerElectronApp(appListeners)),
         Layer.provideMerge(layerElectronTheme),
@@ -255,5 +270,48 @@ describe("DesktopLifecycle", () => {
         }),
       ).pipe(Effect.provide(layer));
     }),
+  );
+
+  it.effect.each(["SIGINT", "SIGTERM", "SIGHUP"] as const)(
+    "records %s while an update is preparing to quit without relying on Electron events",
+    (signal) =>
+      Effect.gen(function* () {
+        const recorded = yield* Deferred.make<void>();
+        const updatePreparation = yield* Deferred.make<void>();
+        const priorHandlers = new Set(process.listeners(signal));
+        const appListeners = new Map<string, (...args: readonly unknown[]) => void>();
+        const layerEnvironment = makeLayerEnvironment("darwin");
+        const layer = DesktopLifecycle.layer.pipe(
+          Layer.provideMerge(layerElectronApp(appListeners)),
+          Layer.provideMerge(layerElectronTheme),
+          Layer.provideMerge(layerElectronWindow()),
+          Layer.provideMerge(layerDesktopWindow()),
+          Layer.provideMerge(layerEnvironment),
+          Layer.provideMerge(DesktopShutdown.layer),
+          Layer.provideMerge(DesktopState.layer),
+        );
+
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
+            const state = yield* DesktopState.DesktopState;
+            yield* lifecycle.register;
+            // Update preparation marks quitting before its asynchronous backend stops finish.
+            yield* Ref.set(state.quitting, true);
+            yield* Effect.forkScoped(Deferred.await(updatePreparation));
+            files.appendFileSync.mockImplementationOnce((_file, line) => {
+              assert.equal(JSON.parse(line).signal, signal);
+              Deferred.doneUnsafe(recorded, Effect.void);
+            });
+            const handler = process.listeners(signal).find((entry) => !priorHandlers.has(entry));
+            assert.isDefined(handler);
+            // Call only our listener: emitting a real process signal also invokes NodeRuntime's exit handler.
+            handler!(signal);
+            yield* Deferred.await(recorded);
+            assert.isTrue(yield* Ref.get(state.quitRecorded));
+            yield* Deferred.succeed(updatePreparation, undefined);
+          }),
+        ).pipe(Effect.provide(layer));
+      }),
   );
 });

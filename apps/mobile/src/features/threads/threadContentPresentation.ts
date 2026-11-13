@@ -13,6 +13,8 @@ export function projectThreadContentPresentation(input: {
   readonly hasDetail: boolean;
   readonly detailError: string | null;
   readonly detailDeleted: boolean;
+  /** The server did not find the thread (not a confirmed delete). */
+  readonly detailNotFound?: boolean;
   readonly connectionState: EnvironmentConnectionPhase;
 }): ThreadContentPresentation {
   if (input.hasDetail) {
@@ -23,6 +25,13 @@ export function projectThreadContentPresentation(input: {
       kind: "unavailable",
       title: "Thread unavailable",
       detail: "This thread was deleted or is no longer available.",
+    };
+  }
+  if (input.detailNotFound === true) {
+    return {
+      kind: "unavailable",
+      title: "Thread not found",
+      detail: "It may still be starting. It opens here as soon as it appears.",
     };
   }
   if (input.detailError !== null) {

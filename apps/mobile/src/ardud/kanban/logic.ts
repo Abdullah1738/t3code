@@ -4,6 +4,7 @@ import type {
   KanbanAnswer,
   KanbanBlock,
   KanbanLink,
+  KanbanMessage,
   KanbanParticipant,
   KanbanStage,
 } from "@t3tools/contracts";
@@ -376,6 +377,32 @@ export type BlockRun =
       readonly index: number;
       readonly attachments: ReadonlyArray<StoredAttachment>;
     };
+
+/**
+ * Whether a block was sent as a preview that can be read whole: a big text,
+ * fold or page cut short by the feed, where there is a way to read the
+ * message in full (a discussion's own feed, or a loader the screen gives).
+ */
+export function blockReadsWhole(block: KanbanBlock, canLoad: boolean): boolean {
+  return (
+    canLoad &&
+    (block._tag === "md" || block._tag === "collapse" || block._tag === "html") &&
+    block.truncated === true
+  );
+}
+
+/**
+ * A message as the feed sent it, with the blocks of the same message read
+ * whole when there are any. Everything else stays the feed's: who answered,
+ * and when. A whole read of another message is not used.
+ */
+export function messageReadWhole(message: KanbanMessage, whole: KanbanMessage | undefined) {
+  return whole !== undefined &&
+    whole.seq === message.seq &&
+    whole.discussionId === message.discussionId
+    ? { ...message, blocks: whole.blocks }
+    : message;
+}
 
 /** Consecutive attachment blocks share one wrapping row; every other block stands alone. */
 export function groupBlockRuns(blocks: ReadonlyArray<KanbanBlock>): BlockRun[] {

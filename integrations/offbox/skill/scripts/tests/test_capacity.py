@@ -265,6 +265,8 @@ class PoolTests(Isolated):
             row = pool.acquire(self.me)
             pool.release_guard(row)
             self.assertEqual(reuse.call_args.args[1]['box_id'],'cold')
+            self.con.execute("UPDATE pool_callers SET box_id='mine' WHERE owner='worker'")
+            self.con.commit()
             row = pool.acquire(self.me, size='xlarge')
             pool.release_guard(row)
         self.assertEqual(reuse.call_args.args[1]['box_id'],'mine')  # a run that needs xlarge still gets it
@@ -586,7 +588,7 @@ class FallbackTests(Isolated):
             self.assertFalse(fallback.allowed(argv,e,'/repo'),argv)
         self.assertFalse(fallback.allowed(['echo','ok'],common.OffboxError('uncertain',started=True),'/repo'))
         self.assertFalse(fallback.allowed(['./scripts/full-suite.sh'],e,'/repo'))
-        # Go checks reach the Mac only through local-first's sandbox, never through the plain fallback.
+        # Go checks never reach the Mac through the plain fallback.
         self.assertFalse(fallback.allowed(['go','test','-run','TestOne','./pkg'],e,'/repo'))
 
     def test_cli_returns_90_for_full_suite(self):
@@ -629,27 +631,34 @@ class SpendTests(Isolated):
             self.assertEqual(spend.compute()['spend'],0.05)
 
     def test_cap_trips_and_keeps_alert_key_shape(self):
-        with patch.object(api,'limits',return_value=self.limits(75100000,remaining=0)), patch.object(spend,'stop_all',return_value=2):
+        with patch.object(api,'limits',return_value=self.limits(120100000,remaining=0)), patch.object(spend,'stop_all',return_value=2):
             out=spend.check()
             self.assertTrue(out['cap_state']['capped'])
             self.assertEqual(out['stopped'],2)
             self.assertTrue(any(c.args[1]=='offbox-spend-2026-10-500' for c in self.tg.call_args_list))
 
-    def test_cap_is_750_and_a_500_trip_clears_after_the_raise(self):
-        self.assertEqual(spend.CAP_DOLLARS,750.0)
+    def test_cap_is_1200_and_a_500_trip_clears_after_the_raise(self):
+        self.assertEqual(spend.CAP_DOLLARS,1200.0)
         common.atomic_write_json(spend.CAP_PATH,{'capped':True,'month':'2026-10','period_end':'2026-11-13T19:02:12Z','spend':500.25})
         with patch.object(api,'limits',return_value=self.limits(50025000,remaining=0)), patch.object(spend,'stop_all') as stop:
             out=spend.check()
             self.assertFalse(out['cap_state']['capped'])
             stop.assert_not_called()
 
-    def test_trip_at_the_current_cap_stays_until_the_period_ends(self):
-        with patch.object(api,'limits',return_value=self.limits(75100000,remaining=0)), patch.object(spend,'stop_all',return_value=0):
-            self.assertTrue(spend.check()['cap_state']['capped'])
-        with patch.object(api,'limits',return_value=self.limits(75100000,remaining=0)), patch.object(spend,'stop_all',return_value=0):
-            self.assertTrue(spend.check()['cap_state']['capped'])
-            self.assertTrue(any(c.args[1]=='offbox-cap-2026-10-750' for c in self.tg.call_args_list))
+    def test_a_900_trip_clears_after_the_raise_to_1200(self):
+        common.atomic_write_json(spend.CAP_PATH,{'capped':True,'month':'2026-10','period_end':'2026-11-13T19:02:12Z','spend':900.10,'cap':900.0})
+        with patch.object(api,'limits',return_value=self.limits(90010000,remaining=0)), patch.object(spend,'stop_all') as stop:
+            out=spend.check()
+            self.assertFalse(out['cap_state']['capped'])
+            self.assertEqual(out['cap_state']['cap'],1200.0)
+            stop.assert_not_called()
 
+    def test_trip_at_the_current_cap_stays_until_the_period_ends(self):
+        with patch.object(api,'limits',return_value=self.limits(120100000,remaining=0)), patch.object(spend,'stop_all',return_value=0):
+            self.assertTrue(spend.check()['cap_state']['capped'])
+        with patch.object(api,'limits',return_value=self.limits(120100000,remaining=0)), patch.object(spend,'stop_all',return_value=0):
+            self.assertTrue(spend.check()['cap_state']['capped'])
+            self.assertTrue(any(c.args[1]=='offbox-cap-2026-10-1200' for c in self.tg.call_args_list))
 
 if __name__ == '__main__':
     unittest.main()

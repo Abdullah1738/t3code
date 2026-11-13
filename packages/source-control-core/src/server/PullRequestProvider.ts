@@ -179,7 +179,10 @@ export interface ProviderChangeRequestStat {
 }
 
 export interface ProviderChangeRequestDetail extends ProviderChangeRequest {
+  readonly headBranchSha?: string | null;
+  readonly checksHeadSha?: string | null;
   readonly headSha?: string | null;
+  readonly baseSha?: string | null;
   readonly body: string;
   readonly changedFiles: number;
   readonly mergedAt: string | null;

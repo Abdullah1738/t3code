@@ -32,11 +32,11 @@ setup() { # fake-or-real sqlite3_rsync
   echo x > "$T/repo/live/config"
   cp "$HERE/scripts/memory_backup.sh" "$R/scripts/"
   # the live install ships src/ (incl. the transcript manifest tool) next to the script
-  cp "$HERE/src/transcript_backup_manifest.py" "$HERE/src/transcript_roots.py" "$HERE/src/run_limited.py" "$HERE/src/robob_readonly.py" "$R/src/"
+  cp "$HERE/src/transcript_backup_manifest.py" "$HERE/src/transcript_roots.py" "$HERE/src/run_limited.py" "$HERE/src/robob_readonly.py" "$HERE/src/backup_control.py" "$HERE/src/backup_replica.py" "$HERE/src/redact_lock.py" "$R/src/"
   # Never invoke the Dropbox API in this test, even when restic succeeds.
   printf 'print("{\\"test\\": true}")\n' > "$R/src/dropbox_mirror.py"
   old=$(( $(date +%s) - 3 * 86400 ))
-  "$SQLITE" "$R/data/memory.db" "PRAGMA journal_mode=wal;
+  "$SQLITE" -safe -noinit -- "$R/data/memory.db" "PRAGMA journal_mode=wal;
     CREATE TABLE episodic_events(id INTEGER PRIMARY KEY, timestamp INTEGER);
     INSERT INTO episodic_events VALUES (1,$old),(2,$old);" >/dev/null
   mkdir -p "$T/.robob/userdata/readonly"
@@ -58,7 +58,7 @@ run() {
     MEMORY_BACKUP_STAGE="$T/stage" MEMORY_BACKUP_REPO_ROOT="$T/repo" \
     MEMORY_BACKUP_REPLICA_TIMEOUT_S="${MEMORY_BACKUP_REPLICA_TIMEOUT_S:-5400}" \
     MEMORY_BACKUP_PASSWORD_COMMAND='printf fixture-password' MEMORY_BACKUP_CACHE_DIR="$T/cache" \
-    MEMORY_BACKUP_MIN_FREE_GB=0 /bin/bash "$R/scripts/memory_backup.sh" >/dev/null 2>&1
+    MEMORY_BACKUP_LOAD_OVERRIDE=0.1 MEMORY_BACKUP_UPTIME_OVERRIDE=86400 MEMORY_BACKUP_MIN_FREE_GB=0 /bin/bash "$R/scripts/memory_backup.sh" >/dev/null 2>&1
 }
 st() { /opt/homebrew/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["stage"], d["ok"])' "$R/logs/backup_last.json"; }
 
@@ -92,6 +92,24 @@ if [ -s "$T/sync-pid" ] && ! kill -0 "$(cat "$T/sync-pid")" 2>/dev/null; then
 else
   fail "stalled sync process still alive or did not start"
 fi
+rm -rf "$T"
+
+# A failed kill must be distinguishable from an ordinary timeout, and cannot retry.
+setup fake
+cp "$R/src/run_limited.py" "$R/src/fixture_run_limited.py"
+cat > "$R/src/run_limited.py" <<'PYCODE'
+from fixture_run_limited import *
+import sys
+if __name__ == '__main__':
+    print("run_limited: survivors after SIGKILL: 999999 fixture", file=sys.stderr)
+    raise SystemExit(125)
+PYCODE
+run
+[ "$(st)" = "replica False" ] && grep -q 'replica memory.db: child survived kill:.*survivors after SIGKILL' "$R/logs/backup_last.json" \
+  && pass "surviving child fails replica with diagnostic" || fail "survivor status: $(cat "$R/logs/backup_last.json")"
+grep -q 'replica memory.db: child survived kill:' "$R"/logs/backup-*.log \
+  && pass "surviving child is logged" || fail "survivor diagnostic missing from log"
+[ ! -e "$R/logs/backup.lock" ] && pass "surviving child releases backup lock" || fail "survivor left lock"
 rm -rf "$T"
 
 # 2. SQLite backup stand-in -> replica stage passes (then fake repo fails).
@@ -143,13 +161,14 @@ if [ -x "$REAL_RSYNC" ]; then
   echo old > "$T/stage/robob-state.sqlite"; echo old > "$T/stage/robob-state.sqlite-wal"
   run "$T/robob.sqlite"
   [ "$(st)" = "restic False" ] && pass "robob state dump passes" || fail "robob gave: $(st) $(cat "$R/logs/backup_last.json")"
-  [ "$("$SQLITE" :memory: ".read $T/stage/robob-state.sql" 'SELECT name FROM scheduled_tasks')" = "it's 7" ] \
+  # Safe mode keeps generated dump contents from opening files or launching helpers.
+  [ "$("$SQLITE" -safe -noinit -- :memory: "$(cat "$T/stage/robob-state.sql")" 'SELECT name FROM scheduled_tasks')" = "it's 7" ] \
     && pass "robob state dump restores" || fail "robob state dump missing or unreadable"
   grep -q orchestration_v2_events "$T/stage/robob-state.sql" \
     && fail "robob dump includes the event log" || pass "robob dump skips the event log"
   ls "$T"/stage/robob-state.sqlite* >/dev/null 2>&1 \
     && fail "old full robob replica kept" || pass "old full robob replica removed"
-  [ "$("$SQLITE" :memory: ".read $T/stage/robob-state.sql" 'SELECT id FROM ardud_mission_events')" = "m" ] \
+  [ "$("$SQLITE" -safe -noinit -- :memory: "$(cat "$T/stage/robob-state.sql")" 'SELECT id FROM ardud_mission_events')" = "m" ] \
     && pass "retired mission tables backed up" || fail "ardud_mission_events not in the robob dump"
   grep -q "robob-state.sql: 3 tables.*missing:.* projection_projects" "$R"/logs/backup-*.log \
     && pass "missing robob tables logged" || fail "robob log: $(grep robob "$R"/logs/backup-*.log)"

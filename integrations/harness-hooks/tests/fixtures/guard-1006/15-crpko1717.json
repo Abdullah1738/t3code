@@ -1,0 +1,30 @@
+{
+  "case_number": 15,
+  "reporter_id": "crpko1717",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Fcrpko-devops:a84d7935-1f12-4f8f-82ea-1a601e369ef5",
+  "provenance": {
+    "recovery": "verbatim",
+    "harness": "codex",
+    "tool_name": "exec",
+    "nested_tool": "exec_command",
+    "card_comment_event_id": 131299,
+    "sources": [
+      {
+        "denial_index": 73,
+        "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/11/rollout-2026-11-11T02-21-23-01a1c78d-3765-7592-a23c-b7b0931416f8.jsonl",
+        "timestamp": "2026-11-12T02:10:09.631Z",
+        "call_id": "call_f8d40b094b38490db32268eabf49c9a1",
+        "command_index": 0
+      }
+    ]
+  },
+  "commands": [
+    {
+      "cmd": "python3 - <<'PY'\nfrom pathlib import Path\nimport subprocess,re,json\nroot=Path.cwd();ev=root/'tmp/principals-evidence/s8-catchup/w3-window';pins=subprocess.check_output(['node','scripts/lib/new-secret-seed-contract.mjs'],text=True)\np=root/'scripts/lib/new-secret-seed-contract.mjs';s=p.read_text()\nfor name,value in re.findall(r'(\\w+_DIGEST) = \"([a-f0-9]{64})\"',pins):s=s.replace(f'{name} = \"RECOMPUTE\"',f'{name} = \"{value}\"')\nassert 'RECOMPUTE' not in s;p.write_text(s);(ev/'seed-digests.txt').write_text(pins)\n# Non-test script additions must survive native package replacement.\nr=json.loads((ev/'merge-inputs.json').read_text());base,old,new=[json.loads(subprocess.check_output(['git','show',r[k]+':package.json']))['scripts'] for k in ('base','before','native')]\nextra={k:v for k,v in old.items() if base.get(k)!=v and not k.startswith(('test:','pretest','test','posttest'))}\nassert all(new.get(k)==v for k,v in extra.items()),extra\n(ev/'package-proof.json').write_text(json.dumps({'nonTestChanges':extra,'packageExactNative':Path('package.json').read_bytes()==subprocess.check_output(['git','show',r['native']+':package.json'])},indent=2)+'\\n')\nPY\nnode scripts/lib/new-secret-seed-contract.mjs --check\nnode scripts/run-test-manifest.mjs test --list > tmp/principals-evidence/s8-catchup/w3-window/manifest-test-list.json\nnode scripts/run-test-manifest.mjs pretest --list > tmp/principals-evidence/s8-catchup/w3-window/manifest-pretest-list.json\nrg -n 'scram_write_only|terraform test' scripts/test-kafka-user-data-size.mjs scripts/test-kafka-history-archiver-terraform.mjs .github/workflows/terraform-dev.yml | head -35\nsed -n '1,145p' scripts/test-clickhouse-edge-reader.mjs\nsed -n '1,45p' scripts/test-check-kafka-principal-plan-role-deny.mjs",
+      "workdir": "/Volumes/ExternalSSD/board-wt/crpko-devops-backoffice-kafbat-principals",
+      "sha256": "5d5133ecb917f483ae109447d9e7858f0b3333054f15e09e9b29fd29e5e7776c"
+    }
+  ],
+  "session_cwd": "/Volumes/ExternalSSD/crpko-devops",
+  "original_refusal": "statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard.."
+}

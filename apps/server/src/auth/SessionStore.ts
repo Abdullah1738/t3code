@@ -604,26 +604,41 @@ export const make = Effect.gen(function* () {
       Effect.withSpan("SessionStore.markConnected"),
     );
 
+  // ardud: every remote reconnect used to queue an identical UPDATE on the state
+  // writer. Remember what this server process already wrote (or is writing) per
+  // session and skip repeats, so a reconnect loop cannot pile writes on the writer.
+  const recordedClientConnections = new Map<AuthSessionId, string>();
   const recordClientConnection: SessionStore["Service"]["recordClientConnection"] = (
     sessionId,
     client,
   ) =>
-    client.surface === undefined && client.appVersion === undefined
-      ? Effect.void
-      : authSessions
-          .setClientConnection({
-            sessionId,
-            surface: client.surface ?? null,
-            appVersion: client.appVersion ?? null,
-          })
-          .pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("Failed to record session client connection metadata.").pipe(
-                Effect.annotateLogs({ sessionId, cause }),
-              ),
+    Effect.suspend(() => {
+      if (client.surface === undefined && client.appVersion === undefined) return Effect.void;
+      const key = `${client.surface ?? ""}\u0000${client.appVersion ?? ""}`;
+      if (recordedClientConnections.get(sessionId) === key) return Effect.void;
+      recordedClientConnections.set(sessionId, key);
+      return authSessions
+        .setClientConnection({
+          sessionId,
+          surface: client.surface ?? null,
+          appVersion: client.appVersion ?? null,
+        })
+        .pipe(
+          Effect.onExit((exit) =>
+            Effect.sync(() => {
+              if (exit._tag === "Failure" && recordedClientConnections.get(sessionId) === key) {
+                recordedClientConnections.delete(sessionId);
+              }
+            }),
+          ),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Failed to record session client connection metadata.").pipe(
+              Effect.annotateLogs({ sessionId, cause }),
             ),
-            Effect.withSpan("SessionStore.recordClientConnection"),
-          );
+          ),
+          Effect.withSpan("SessionStore.recordClientConnection"),
+        );
+    });
 
   const markDisconnected: SessionStore["Service"]["markDisconnected"] = (sessionId) =>
     Ref.update(connectedSessionsRef, (current) => {
@@ -762,7 +777,7 @@ export const make = Effect.gen(function* () {
     function* (token) {
       if (devAuth?.matches(token)) {
         const row = yield* authSessions.getById({ sessionId: devAuth.sessionId }).pipe(
-          NodeSqliteClient.readOnly,
+          NodeSqliteClient.authReadOnly,
           Effect.mapError(
             (cause) =>
               new SessionCredentialVerificationError({ sessionId: devAuth.sessionId, cause }),
@@ -826,13 +841,22 @@ export const make = Effect.gen(function* () {
       }
 
       const row = yield* authSessions.getById({ sessionId: claims.sid }).pipe(
-        NodeSqliteClient.readOnly,
+        NodeSqliteClient.authReadOnly,
         Effect.mapError(
           (cause) => new SessionCredentialVerificationError({ sessionId: claims.sid, cause }),
         ),
       );
       if (Option.isNone(row)) {
         return yield* new UnknownSessionTokenError({ sessionId: claims.sid });
+      }
+      // Queueing must not extend a credential's lifetime.
+      const verifiedAt = yield* DateTime.now;
+      if (claims.exp <= verifiedAt.epochMilliseconds) {
+        return yield* new SessionTokenExpiredError({
+          sessionId: claims.sid,
+          expiresAt: expiresAt.value,
+          observedAt: verifiedAt,
+        });
       }
       if (row.value.revokedAt !== null) {
         return yield* new SessionTokenRevokedError({
@@ -928,7 +952,7 @@ export const make = Effect.gen(function* () {
     }
 
     const row = yield* authSessions.getById({ sessionId: claims.sid }).pipe(
-      NodeSqliteClient.readOnly,
+      NodeSqliteClient.authReadOnly,
       Effect.mapError(
         (cause) => new WebSocketTokenVerificationError({ sessionId: claims.sid, cause }),
       ),
@@ -936,11 +960,19 @@ export const make = Effect.gen(function* () {
     if (Option.isNone(row)) {
       return yield* new UnknownWebSocketSessionError({ sessionId: claims.sid });
     }
-    if (row.value.expiresAt.epochMilliseconds <= observedAt.epochMilliseconds) {
+    const verifiedAt = yield* DateTime.now;
+    if (claims.exp <= verifiedAt.epochMilliseconds) {
+      return yield* new WebSocketTokenExpiredError({
+        sessionId: claims.sid,
+        expiresAt: expiresAt.value,
+        observedAt: verifiedAt,
+      });
+    }
+    if (row.value.expiresAt.epochMilliseconds <= verifiedAt.epochMilliseconds) {
       return yield* new WebSocketSessionExpiredError({
         sessionId: claims.sid,
         expiresAt: row.value.expiresAt,
-        observedAt,
+        observedAt: verifiedAt,
       });
     }
     if (row.value.revokedAt !== null) {

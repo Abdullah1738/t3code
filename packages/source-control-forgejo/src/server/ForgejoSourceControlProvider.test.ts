@@ -226,6 +226,111 @@ const requiredChecksLayer = (
     },
   });
 
+it.effect("keeps an empty Forgejo status list as no checks without decoding combined state", () => {
+  const paths: string[] = [];
+  return Effect.gen(function* () {
+    const provider = yield* ForgejoPullRequestProvider.make;
+    const summary = yield* provider.getChangeRequestChecks!(requiredChecksInput);
+    const detail = yield* provider.getChangeRequest(requiredChecksInput);
+    assert.deepStrictEqual(summary.checks, []);
+    assert.deepStrictEqual(detail.checks, []);
+    assert.strictEqual(detail.headSha, "head");
+    assert.notInclude(paths, "repos/acme/web/commits/head/status");
+  }).pipe(
+    Effect.provide(
+      Layer.mock(ForgejoCli.ForgejoCli)({
+        api: (input) => {
+          const path = input.path.split("?")[0];
+          paths.push(path!);
+          const respond = (value: unknown) => Effect.succeed(processOutput(encodeJson(value)));
+          switch (path) {
+            case "repos/acme/web/pulls/7":
+              return respond(requiredChecksPullRequest);
+            case "repos/acme/web/statuses/head":
+              return respond([]);
+            // fj pr status decodes this endpoint and crashes on state="". Robob must use the list.
+            case "repos/acme/web/commits/head/status":
+              return respond({ state: "", total_count: 0, statuses: [] });
+            case "repos/acme/web/branches/release/1.x":
+              return respond({});
+            case "repos/acme/web":
+              return respond({ full_name: "acme/web", permissions: { push: true, admin: false } });
+            case "user":
+              return respond({ login: "maria" });
+            default:
+              return Effect.die(`Unexpected Forgejo request: ${input.path}`);
+          }
+        },
+      }),
+    ),
+  );
+});
+
+it.effect("discovers a self-hosted SSH alias only when fj maps it to the HTTPS host", () => {
+  let aliasConfigured = false;
+  return Effect.gen(function* () {
+    const cli = yield* ForgejoCli.make;
+    const discovery = yield* ForgejoSourceControlProvider.makeDiscovery.pipe(
+      Effect.provideService(ForgejoCli.ForgejoCli, cli),
+    );
+    assert.strictEqual(discovery.type, "managed-cli");
+    if (discovery.type !== "managed-cli") return yield* Effect.die("managed discovery missing");
+    const input = {
+      cwd: "/torssh",
+      context: {
+        provider: {
+          kind: SourceControlProviderKind.make("unknown"),
+          name: "Unknown",
+          baseUrl: "https://jingmi-torssh",
+        },
+        remoteName: "origin",
+        remoteUrl: "ssh://git@jingmi-torssh/abdullah/torssh.git",
+        requestedHost: "forgejo.internal.jingmi.com.tw",
+      },
+    };
+    assert.isNull(yield* discovery.refineUnknownRemote!(input));
+    aliasConfigured = true;
+    assert.deepStrictEqual(yield* discovery.refineUnknownRemote!(input), {
+      kind: "forgejo",
+      name: "Forgejo / Gitea",
+      baseUrl: "https://forgejo.internal.jingmi.com.tw",
+    });
+  }).pipe(
+    Effect.provideService(
+      FileSystem.FileSystem,
+      FileSystem.makeNoop({
+        exists: () => Effect.succeed(true),
+        readFileString: () =>
+          Effect.succeed(
+            encodeJson({
+              hosts: {
+                "forgejo.internal.jingmi.com.tw": { type: "Application", token: "test-token" },
+              },
+              aliases: {
+                "172.28.1.39": "forgejo.internal.jingmi.com.tw",
+                ...(aliasConfigured ? { "jingmi-torssh": "forgejo.internal.jingmi.com.tw" } : {}),
+              },
+            }),
+          ),
+      }),
+    ),
+    Effect.provideService(
+      HttpClient.HttpClient,
+      HttpClient.make(() => Effect.die("discovery must not call the API")),
+    ),
+    Effect.provide(
+      TestSourceControlHost.layer({
+        process: {
+          run: (input) => {
+            assert.strictEqual(input.command, "tea");
+            return Effect.succeed(processOutput("[]"));
+          },
+        },
+      }),
+    ),
+  );
+});
+
 it.effect.each([
   ["ci/required-deploy", true],
   ["test-*", true],

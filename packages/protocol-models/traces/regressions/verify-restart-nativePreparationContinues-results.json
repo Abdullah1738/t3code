@@ -1,0 +1,10 @@
+[
+  {
+    "spec": "restart",
+    "step": "step",
+    "invariant": "nativePreparationContinues",
+    "expectedFailure": true,
+    "status": 1,
+    "ok": true
+  }
+]

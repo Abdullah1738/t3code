@@ -676,13 +676,12 @@ const make = Effect.gen(function* () {
     ),
   );
 
-  // `transcript_imported_at` is never reset to NULL, so a positive answer
-  // stays valid for the process lifetime; ensureTranscript runs on most
-  // thread reads and command dispatches, so skipping the lock + lookup here
-  // keeps that path off the database entirely after first confirmation.
+  // Only committed completion markers or native creation events are cached.
+  // Reconciliation skips threads with a V2 creation event, so native threads
+  // cannot acquire a pending import later. A missing import row proves nothing.
   const confirmedTranscriptThreadIds = new Set<ThreadId>();
 
-  const ensureTranscriptBase = (threadId: ThreadId) =>
+  const ensureTranscriptBase = (threadId: ThreadId, cacheConfirmation: boolean) =>
     transcriptImports.withLock(
       threadId,
       Effect.gen(function* () {
@@ -694,7 +693,7 @@ const make = Effect.gen(function* () {
         `;
         const imported = imports[0];
         if (imported === undefined || imported.transcript_imported_at !== null) {
-          if (imported !== undefined) {
+          if (imported !== undefined && cacheConfirmation) {
             confirmedTranscriptThreadIds.add(threadId);
           }
           return { importedThreadCount: 0, importedMessageCount: 0 };
@@ -743,7 +742,7 @@ const make = Effect.gen(function* () {
             last_error = NULL
           WHERE thread_id = ${threadId}
         `;
-        confirmedTranscriptThreadIds.add(threadId);
+        if (cacheConfirmation) confirmedTranscriptThreadIds.add(threadId);
         return {
           importedThreadCount: 1,
           importedMessageCount: missing.length,
@@ -751,35 +750,49 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const ensureTranscript = (threadId: ThreadId) =>
-    confirmedTranscriptThreadIds.has(threadId)
-      ? Effect.succeed({ importedThreadCount: 0, importedMessageCount: 0 })
-      : Effect.gen(function* () {
-          const imports = yield* sql<LegacyImportRow>`
-            SELECT thread_id, transcript_imported_at
-            FROM orchestration_v2_legacy_imports
-            WHERE thread_id = ${threadId}
-            LIMIT 1
-          `.pipe(NodeSqliteClient.readOnly);
-          const imported = imports[0];
-          if (imported === undefined) {
-            return { importedThreadCount: 0, importedMessageCount: 0 };
-          }
-          if (imported.transcript_imported_at !== null) {
-            confirmedTranscriptThreadIds.add(threadId);
-            return { importedThreadCount: 0, importedMessageCount: 0 };
-          }
-          return yield* ensureTranscriptBase(threadId);
-        }).pipe(
-          Effect.mapError(
-            (cause) =>
-              new LegacyV1ThreadImportError({
-                operation: "hydrate transcript for",
-                threadId,
-                cause,
-              }),
-          ),
-        );
+  // Thread management already traces this preflight on reads and dispatches.
+  const ensureTranscript = Effect.fnUntraced(
+    function* (threadId: ThreadId) {
+      const cacheConfirmation = Option.isNone(yield* Effect.serviceOption(sql.transactionService));
+      if (cacheConfirmation && confirmedTranscriptThreadIds.has(threadId)) {
+        return { importedThreadCount: 0, importedMessageCount: 0 };
+      }
+      const imports = yield* sql<LegacyImportRow & { readonly is_native: number }>`
+        SELECT thread_id, transcript_imported_at, 0 AS is_native
+        FROM orchestration_v2_legacy_imports
+        WHERE thread_id = ${threadId}
+        UNION ALL
+        SELECT event.stream_id AS thread_id, NULL AS transcript_imported_at, 1 AS is_native
+        FROM orchestration_events AS event INDEXED BY orchestration_events_v2_created_threads_idx
+        WHERE event.application_event_version = 2
+          AND event.aggregate_kind = 'thread'
+          AND event.stream_id = ${threadId}
+          AND event.event_type = 'thread.created'
+          AND event.event_id NOT LIKE ${`${IMPORT_EVENT_PREFIX}:%`}
+        LIMIT 1
+      `.pipe(NodeSqliteClient.readOnly);
+      const imported = imports[0];
+      if (imported === undefined) {
+        return { importedThreadCount: 0, importedMessageCount: 0 };
+      }
+      if (imported.is_native === 1 || imported.transcript_imported_at !== null) {
+        if (cacheConfirmation) confirmedTranscriptThreadIds.add(threadId);
+        return { importedThreadCount: 0, importedMessageCount: 0 };
+      }
+      return yield* ensureTranscriptBase(threadId, cacheConfirmation);
+    },
+    (effect, threadId) =>
+      effect.pipe(
+        Effect.mapError(
+          (cause) =>
+            new LegacyV1ThreadImportError({
+              operation: "hydrate transcript for",
+              threadId,
+              cause,
+            }),
+        ),
+      ),
+  );
 
   const importPendingTranscripts = Effect.gen(function* () {
     const rows = yield* sql<LegacyImportRow>`

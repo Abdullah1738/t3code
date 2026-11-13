@@ -48,4 +48,14 @@ export const kanbanDDL = [
     thread_id TEXT NOT NULL, card_id TEXT NOT NULL, joined_at TEXT NOT NULL, PRIMARY KEY (thread_id, card_id)
   )`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_thread_cards_card ON ardud_kanban_thread_cards (card_id)`,
+  // Owner answers and posts commit with their routing obligation; delivery runs
+  // after the reply and replays from here after a restart. `launched` lists
+  // evaluator threads whose first message already carried the owner's text.
+  `CREATE TABLE IF NOT EXISTS ardud_kanban_owner_routes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, route_key TEXT NOT NULL UNIQUE, board_id TEXT NOT NULL,
+    discussion_id TEXT NOT NULL, json TEXT NOT NULL, created_at TEXT NOT NULL,
+    launched TEXT NOT NULL DEFAULT '[]', noticed INTEGER NOT NULL DEFAULT 0, done_at TEXT
+  )`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_owner_routes_pending
+    ON ardud_kanban_owner_routes (discussion_id, id) WHERE done_at IS NULL`,
 ];

@@ -15,6 +15,7 @@ export const wrap = (
     makeUnsafe: () => {
       const parser = serialization.makeUnsafe();
       const pending = new Map<string | number, string>();
+      const threadIds = new Map<string | number, string>();
       return {
         decode: (data) => {
           const messages = parser.decode(data);
@@ -30,12 +31,24 @@ export const wrap = (
                 allowedMethods.has(message.tag)
               ) {
                 pending.set(message.id, message.tag);
+                if (
+                  (message.tag === "orchestration.subscribeThread" ||
+                    message.tag === "orchestration.getThreadProjection") &&
+                  "payload" in message &&
+                  typeof message.payload === "object" &&
+                  message.payload !== null &&
+                  "threadId" in message.payload &&
+                  typeof message.payload.threadId === "string"
+                ) {
+                  threadIds.set(message.id, message.payload.threadId);
+                }
               } else if (
                 message._tag === "Interrupt" &&
                 "requestId" in message &&
                 (typeof message.requestId === "string" || typeof message.requestId === "number")
               ) {
                 pending.delete(message.requestId);
+                threadIds.delete(message.requestId);
               }
             }
           } catch {
@@ -56,6 +69,9 @@ export const wrap = (
                   requestId === undefined
                     ? "unknown"
                     : (pending.get(requestId as string | number) ?? "unknown"),
+                ...(threadIds.has(requestId as string | number)
+                  ? { threadId: threadIds.get(requestId as string | number) }
+                  : {}),
                 bytes: MAX_REPLY_BYTES + 1,
                 rejected: true,
               });
@@ -64,6 +80,7 @@ export const wrap = (
             }
             if (requestId !== undefined) {
               pending.delete(requestId as string | number);
+              threadIds.delete(requestId as string | number);
               throw new Error(REPLY_TOO_LARGE);
             }
             return parser.encode({
@@ -83,7 +100,11 @@ export const wrap = (
                 ? envelope.requestId
                 : undefined;
             const method = requestId === undefined ? undefined : pending.get(requestId);
-            if (tag === "Exit" && requestId !== undefined) pending.delete(requestId);
+            const threadId = requestId === undefined ? undefined : threadIds.get(requestId);
+            if (tag === "Exit" && requestId !== undefined) {
+              pending.delete(requestId);
+              threadIds.delete(requestId);
+            }
             // Size the string the transport is about to send; never re-serialize.
             const bytes =
               typeof encoded === "string"
@@ -96,6 +117,7 @@ export const wrap = (
                 kind: "ws",
                 name:
                   method ?? (typeof tag === "string" && protocolTags.has(tag) ? tag : "unknown"),
+                ...(threadId === undefined ? {} : { threadId }),
                 bytes,
               });
             }

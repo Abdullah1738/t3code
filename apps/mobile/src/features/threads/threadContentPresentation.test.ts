@@ -25,6 +25,22 @@ describe("thread content presentation", () => {
     ).toEqual({ kind: "loading" });
   });
 
+  it("says not found, not deleted, when the server could not find the thread", () => {
+    expect(
+      projectThreadContentPresentation({
+        hasDetail: false,
+        detailError: null,
+        detailDeleted: false,
+        detailNotFound: true,
+        connectionState: "connected",
+      }),
+    ).toEqual({
+      kind: "unavailable",
+      title: "Thread not found",
+      detail: "It may still be starting. It opens here as soon as it appears.",
+    });
+  });
+
   it("explains uncached detail while disconnected instead of loading forever", () => {
     expect(
       projectThreadContentPresentation({

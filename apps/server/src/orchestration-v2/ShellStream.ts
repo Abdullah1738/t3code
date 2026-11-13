@@ -74,6 +74,7 @@ export type ShellApplicationEvent =
   | {
       readonly sequence: number;
       readonly event: Pick<OrchestrationV2StoredEvent["event"], "threadId">;
+      readonly redactionSequence?: number;
     };
 
 /** Shell updates refetch an aggregate; drop transcript bodies before retaining an event. */
@@ -85,7 +86,51 @@ export function toShellApplicationEvent(stored: ApplicationStoredEvent): ShellAp
         type: stored.type,
         sequence: stored.sequence,
       }
-    : { sequence: stored.sequence, event: { threadId: stored.event.threadId } };
+    : {
+        sequence: stored.sequence,
+        event: { threadId: stored.event.threadId },
+        ...(stored.event.type === "thread.item-redacted"
+          ? { redactionSequence: stored.sequence }
+          : {}),
+      };
+}
+
+/**
+ * ardud: the events a shell stream replays for a range it only knows by its changed
+ * aggregates (OrchestrationEventStore.getShellChanges): one per changed thread at its
+ * latest sequence plus every project event, in sequence order, as replay delivers them.
+ */
+export function shellChangeEvents(changes: {
+  readonly threads: ReadonlyArray<{
+    readonly threadId: OrchestrationV2StoredEvent["event"]["threadId"];
+    readonly sequence: number;
+    readonly redactionSequence?: number;
+  }>;
+  readonly projects: ReadonlyArray<{
+    readonly projectId: Extract<
+      ApplicationStoredEvent,
+      { readonly aggregateKind: "project" }
+    >["aggregateId"];
+    readonly sequence: number;
+    readonly type: Extract<ApplicationStoredEvent, { readonly aggregateKind: "project" }>["type"];
+  }>;
+}): ReadonlyArray<ShellApplicationEvent> {
+  const events: Array<ShellApplicationEvent> = [
+    ...changes.threads.map((thread) => ({
+      sequence: thread.sequence,
+      event: { threadId: thread.threadId },
+      ...(thread.redactionSequence === undefined
+        ? {}
+        : { redactionSequence: thread.redactionSequence }),
+    })),
+    ...changes.projects.map((project) => ({
+      aggregateKind: "project" as const,
+      aggregateId: project.projectId,
+      type: project.type,
+      sequence: project.sequence,
+    })),
+  ];
+  return events.sort((left, right) => left.sequence - right.sequence);
 }
 
 export function coalesceShellApplicationEvents<A extends ShellApplicationEvent>(
@@ -97,7 +142,19 @@ export function coalesceShellApplicationEvents<A extends ShellApplicationEvent>(
       "aggregateKind" in stored
         ? `project:${stored.aggregateId}`
         : `thread:${stored.event.threadId}`;
-    latestByAggregate.set(key, stored);
+    const previous = latestByAggregate.get(key);
+    latestByAggregate.set(
+      key,
+      "event" in stored &&
+        previous &&
+        "event" in previous &&
+        previous.redactionSequence !== undefined
+        ? {
+            ...stored,
+            redactionSequence: Math.max(stored.redactionSequence ?? 0, previous.redactionSequence),
+          }
+        : stored,
+    );
   }
   return Array.from(latestByAggregate.values()).sort(
     (left, right) => left.sequence - right.sequence,
@@ -241,7 +298,7 @@ export function skipUnchangedThreadShells<A extends OrchestrationV2ShellStreamIt
             lastSent.delete(item.threadId);
             return true;
           }
-          if (item.kind !== "thread.updated") return true;
+          if (item.kind !== "thread.updated" || item.redactionSequence !== undefined) return true;
           const previous = lastSent.get(item.thread.id);
           if (
             previous !== undefined &&
@@ -282,6 +339,9 @@ export function shellStreamItemFromThreadShell(input: {
       return {
         kind: "thread.removed",
         sequence: input.stored.sequence,
+        ...(input.stored.redactionSequence === undefined
+          ? {}
+          : { redactionSequence: input.stored.redactionSequence }),
         location: "active",
         threadId: input.shell.id,
       };
@@ -289,6 +349,9 @@ export function shellStreamItemFromThreadShell(input: {
     return {
       kind: "thread.updated",
       sequence: input.stored.sequence,
+      ...(input.stored.redactionSequence === undefined
+        ? {}
+        : { redactionSequence: input.stored.redactionSequence }),
       location: "active",
       thread: compactShell(input.shell),
     };
@@ -297,6 +360,9 @@ export function shellStreamItemFromThreadShell(input: {
   return {
     kind: "thread.removed",
     sequence: input.stored.sequence,
+    ...(input.stored.redactionSequence === undefined
+      ? {}
+      : { redactionSequence: input.stored.redactionSequence }),
     location: "active",
     threadId: input.stored.event.threadId,
   };
@@ -325,3 +391,83 @@ export function archivedShellStreamItemFromThreadShell(input: {
   }
   return null;
 }
+
+const SUBAGENT_ANCESTOR_DEPTH_LIMIT = 16;
+
+/**
+ * Client shells omit idle subagents, but a pending request on a nested subagent is carried to
+ * its root row through the subagent ancestors between them (pendingSubagentRequestsByThread,
+ * child inputs). The initial snapshot keeps that chain; a live update of the asking subagent
+ * would not, so its missing subagent ancestors are sent with it. Only updates that carry a
+ * pending request walk the chain, so streaming updates add no reads.
+ *
+ * Ancestors follow their triggering update and reuse its sequence: the client applies the
+ * update first, then takes an equal-sequence update only for a thread it does not have
+ * (applyShellStreamEvent), so no update in the batch is skipped. Only for subscriptions that
+ * asked for omitIdleSubagents.
+ */
+export const withSubagentRequestAncestors = Effect.fn("ShellStream.withSubagentRequestAncestors")(
+  function* <E>(
+    items: ReadonlyArray<Exclude<OrchestrationV2ShellStreamItem, { readonly kind: "snapshot" }>>,
+    getThreadShell: (
+      threadId: OrchestrationV2ThreadShell["id"],
+    ) => Effect.Effect<OrchestrationV2ThreadShell | null, E>,
+  ) {
+    // Rows the batch already carries are not resent, but the walk continues through them.
+    const inBatch = new Map<string, OrchestrationV2ThreadShell | null>();
+    for (const item of items) {
+      if (item.kind === "thread.updated")
+        inBatch.set(item.thread.id, item.location === "active" ? item.thread : null);
+      else if (item.kind === "thread.removed") inBatch.set(item.threadId, null);
+    }
+    const read = new Map<string, OrchestrationV2ThreadShell | null>();
+    const emitted = new Set<string>();
+    const out: Array<Exclude<OrchestrationV2ShellStreamItem, { readonly kind: "snapshot" }>> = [];
+    let added = false;
+    for (const item of items) {
+      out.push(item);
+      if (
+        item.kind !== "thread.updated" ||
+        item.thread.lineage.relationshipToParent !== "subagent" ||
+        item.thread.pendingRuntimeRequest == null
+      ) {
+        continue;
+      }
+      const visited = new Set<string>([item.thread.id]);
+      let parentId = item.thread.lineage.parentThreadId;
+      for (
+        let depth = 0;
+        parentId !== null && !visited.has(parentId) && depth < SUBAGENT_ANCESTOR_DEPTH_LIMIT;
+        depth++
+      ) {
+        visited.add(parentId);
+        const batched = inBatch.has(parentId);
+        let shell = batched ? inBatch.get(parentId)! : read.get(parentId);
+        if (shell === undefined) {
+          shell = yield* getThreadShell(parentId);
+          read.set(parentId, shell);
+        }
+        // A top-level parent is always in the client shell; only subagents can be missing.
+        if (
+          shell === null ||
+          shell.archivedAt !== null ||
+          shell.lineage.relationshipToParent !== "subagent"
+        ) {
+          break;
+        }
+        if (!batched && !emitted.has(parentId)) {
+          emitted.add(parentId);
+          added = true;
+          out.push({
+            kind: "thread.updated",
+            sequence: item.sequence,
+            location: "active",
+            thread: compactShell(shell),
+          });
+        }
+        parentId = shell.lineage.parentThreadId;
+      }
+    }
+    return added ? out : items;
+  },
+);

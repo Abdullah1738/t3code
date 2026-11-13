@@ -1,14 +1,23 @@
-import type { KanbanCard, ThreadId } from "@t3tools/contracts";
+import type { KanbanCard, KanbanMessage, ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 
 export type Saved =
   | { readonly kind: "card"; readonly card: KanbanCard }
+  | { readonly kind: "message"; readonly message: KanbanMessage }
   | { readonly kind: "evaluator"; readonly threadId: ThreadId };
 
 export const observer = Context.Reference<(saved: Saved) => void>("KanbanSavedWrite", {
   defaultValue: () => () => {},
 });
+
+// Separate from receipts: recovery filters receipts by their target entity.
+export const commitObserver = Context.Reference<() => void>("KanbanSavedWriteCommitting", {
+  defaultValue: () => () => {},
+});
+
+// Runs at every store write; the enclosing lock operation already supplies its span.
+export const committing = Effect.flatMap(commitObserver, (observe) => Effect.sync(observe));
 
 export const record = Effect.fn("KanbanSavedWrite.record")(function* (saved: Saved) {
   (yield* observer)(saved);

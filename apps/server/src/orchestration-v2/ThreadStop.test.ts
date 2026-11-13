@@ -1512,3 +1512,116 @@ it.effect.each(["missing session", "completed", "failed", "cancelled"] as const)
       );
     }).pipe(Effect.provide(layerTest)),
 );
+
+it.effect.each(["root", "provider", "attempt", "all"] as const)(
+  "interrupt clears an active run with missing %s and no provider turn",
+  (missing) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = ThreadId.make("thread:orphan-notification");
+      yield* createWatchingThread(threadId, 811);
+      yield* send(threadId, "active notification", "start_immediately");
+      const before = yield* orchestrator.getThreadProjection(threadId);
+      const run = before.runs[0]!;
+      const now = yield* DateTime.now;
+      yield* projections.apply({
+        id: EventId.make("event:notification-without-provider"),
+        type: "run.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: {
+          ...run,
+          status: "running",
+          rootNodeId: missing === "root" || missing === "all" ? null : run.rootNodeId,
+          providerThreadId:
+            missing === "provider" || missing === "all" ? null : run.providerThreadId,
+          activeAttemptId: missing === "attempt" || missing === "all" ? null : run.activeAttemptId,
+        },
+      });
+      assert.equal((yield* orchestrator.getThreadShell(threadId))?.activeRunId, run.id);
+      yield* orchestrator.dispatch({
+        type: "run.interrupt",
+        commandId: CommandId.make("clear-notification"),
+        threadId,
+        runId: run.id,
+      });
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(after.runs[0]!.status, "interrupted");
+      assert.equal((yield* orchestrator.getThreadShell(threadId))?.activeRunId, null);
+      assert.isTrue(
+        after.turnItems.some(
+          (item) =>
+            item.type === "run_interrupt_result" &&
+            item.message === "Run had no provider turn; cleared",
+        ),
+      );
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect.each(["pointers", "indirect ownership"])(
+  "an incomplete binding cannot bypass a live provider turn: %s",
+  (ownership) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = ThreadId.make("thread:live-provider-binding");
+      yield* createWatchingThread(threadId, 812);
+      yield* send(threadId, "active", "start_immediately");
+      const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+      const now = yield* DateTime.now;
+      yield* projections.apply({
+        id: EventId.make("live-provider-turn"),
+        type: "provider-turn.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: {
+          id: ProviderTurnId.make("turn:live"),
+          providerThreadId: run.providerThreadId!,
+          nodeId: run.rootNodeId!,
+          runAttemptId: run.activeAttemptId,
+          nativeTurnRef: null,
+          ordinal: 1,
+          status: "running",
+          startedAt: now,
+          completedAt: null,
+          finish: null,
+        },
+      });
+      yield* projections.apply({
+        id: EventId.make("incomplete-binding"),
+        type: "run.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: {
+          ...run,
+          status: "running",
+          providerThreadId: null,
+          ...(ownership === "indirect ownership"
+            ? { rootNodeId: null, activeAttemptId: null }
+            : {}),
+        },
+      });
+      const fixture = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(fixture.providerTurns.length, 1);
+      assert.equal(fixture.providerTurns[0]!.status, "running");
+      assert.equal(fixture.runs[0]!.providerThreadId, null);
+      assert.isNotNull(run.rootNodeId);
+      assert.isNotNull(run.activeAttemptId);
+      const result = yield* orchestrator
+        .dispatch({
+          type: "run.interrupt",
+          commandId: CommandId.make("dont-bypass-live"),
+          threadId,
+          runId: run.id,
+        })
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(result));
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(after.runs[0]!.status, "running");
+      assert.equal(after.providerTurns[0]!.status, "running");
+    }).pipe(Effect.provide(layerTest)),
+);

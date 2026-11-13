@@ -1,4 +1,11 @@
-import type { KanbanBoardSnapshot, KanbanCard, KanbanGoal } from "@t3tools/contracts";
+import {
+  kanbanWaiting,
+  type KanbanBoardSnapshot,
+  type KanbanCard,
+  type KanbanGoal,
+} from "@t3tools/contracts";
+
+import { waitSetBody } from "./waits.ts";
 
 export const BOARD_PAGE_LIMIT = 200;
 export const BOARD_PAGE_MAX = 500;
@@ -31,7 +38,33 @@ export const feedCard = (card: KanbanCard): KanbanCard => ({
   })),
 });
 
-export const compactBoard = (snapshot: KanbanBoardSnapshot) => ({
+/**
+ * A parked card's wait for the compact board: its line ("Waiting for app#12 to
+ * merge: note") and its fields. A wait not in force (a thread has the card, or
+ * it was moved since) is left out.
+ */
+const compactWait = (card: KanbanCard, byId: ReadonlyMap<string, KanbanCard>) => {
+  const wait = kanbanWaiting(card) ? (card.wait ?? null) : null;
+  if (wait === null) return { line: null, wait: null };
+  return {
+    line: waitSetBody(wait, byId),
+    wait: {
+      on: wait.on,
+      pr: wait.pr,
+      card: wait.card,
+      script: wait.script,
+      note: short(wait.note),
+      status: wait.status,
+      failures: wait.failures,
+      at: wait.at,
+    },
+  };
+};
+
+export const compactBoard = (
+  snapshot: KanbanBoardSnapshot,
+  byId = new Map(snapshot.cards.map((card) => [card.id as string, card])),
+) => ({
   ...snapshot,
   cards: snapshot.cards.map((card) => ({
     id: card.id,
@@ -50,7 +83,11 @@ export const compactBoard = (snapshot: KanbanBoardSnapshot) => ({
     blockedBy: card.blockedBy,
     settledAt: card.settledAt,
     updatedAt: card.updatedAt,
-    status: short(card.stalled?.reason ?? card.question ?? card.stage),
+    // A parked card says what it waits for, ahead of an open question and the bare stage.
+    status: short(
+      card.stalled?.reason ?? compactWait(card, byId).line ?? card.question ?? card.stage,
+    ),
+    wait: compactWait(card, byId).wait,
     stalled: card.stalled,
     question: card.question,
     asks: card.asks,

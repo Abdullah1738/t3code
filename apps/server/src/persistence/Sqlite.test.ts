@@ -1,3 +1,4 @@
+import { ErrorObserver, sqliteErrorDetails } from "@t3tools/shared/nodeSqliteErrors";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
@@ -32,7 +33,7 @@ setTimeout(() => {
 it.effect("logs migration before a blocked shell-index phase", () => {
   const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-sqlite-phases-"));
   const read = () =>
-    NodeFS.readFileSync(NodePath.join(tempDir, "startup-phases.ndjson"), "utf8")
+    NodeFS.readFileSync(NodePath.join(tempDir, "boot.ndjson"), "utf8")
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as { phase: string; outcome: string });
@@ -74,24 +75,46 @@ it.effect("logs the actual SQLite open, setup, migration, index and archive boun
         ),
       ),
     );
-    const records = NodeFS.readFileSync(NodePath.join(tempDir, "startup-phases.ndjson"), "utf8")
+    const records = NodeFS.readFileSync(NodePath.join(tempDir, "boot.ndjson"), "utf8")
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as { phase: string; outcome: string });
     assert.deepEqual(
-      records.map(({ phase, outcome }) => [phase, outcome]),
+      records
+        .filter(({ phase }) => !/^sqlite\.migration\.\d+$/.test(phase))
+        .map(({ phase, outcome }) => [phase, outcome]),
       [
+        ["sqlite.marker", "start"],
+        ["sqlite.marker", "success"],
         ["sqlite.open", "start"],
         ["sqlite.open", "success"],
         ["sqlite.setup", "start"],
+        ["sqlite.pragmas", "start"],
+        ["sqlite.pragmas", "success"],
         ["sqlite.migrations", "start"],
         ["sqlite.migrations", "success"],
         ["sqlite.shell-indexes", "start"],
         ["sqlite.shell-indexes", "success"],
+        ["sqlite.archive-marker", "start"],
+        ["sqlite.archive-marker", "success"],
         ["sqlite.history-archive", "start"],
+        ["sqlite.archive-events", "start"],
+        ["sqlite.archive-events", "success"],
+        ["sqlite.archive-turn-items", "start"],
+        ["sqlite.archive-turn-items", "success"],
+        ["sqlite.archive-shell-counts", "start"],
+        ["sqlite.archive-shell-counts", "success"],
         ["sqlite.history-archive", "success"],
+        ["sqlite.planner-statistics", "start"],
+        ["sqlite.planner-statistics", "success"],
         ["sqlite.setup", "success"],
       ],
+    );
+    assert.equal(
+      records.filter(
+        ({ phase, outcome }) => /^sqlite\.migration\.\d+$/.test(phase) && outcome === "success",
+      ).length,
+      65,
     );
   }).pipe(
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true }))),
@@ -280,3 +303,23 @@ it.effect("enables checkpoint_fullfsync in the shared persistence setup", () =>
     assert.equal(rows[0]?.checkpoint_fullfsync, 1);
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
+
+it.effect("records a raw startup marker failure before the routed client opens", () => {
+  const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "sqlite-marker-"));
+  const filename = NodePath.join(directory, "state.sqlite");
+  NodeFS.writeFileSync(filename, "bad database".repeat(1024));
+  const observations: unknown[] = [];
+  return Effect.exit(Layer.build(SqlitePersistence.layerFromPath(filename))).pipe(
+    Effect.tap(() =>
+      Effect.sync(() => {
+        assert.equal(observations.length, 1);
+        assert.equal(sqliteErrorDetails(observations[0])?.errcode, 26);
+        assert.equal(sqliteErrorDetails(observations[0])?.context?.connection, "startup-marker");
+      }),
+    ),
+    Effect.provideService(ErrorObserver, (cause) => observations.push(cause)),
+    Effect.scoped,
+    Effect.provide(NodeServices.layer),
+    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true }))),
+  );
+});

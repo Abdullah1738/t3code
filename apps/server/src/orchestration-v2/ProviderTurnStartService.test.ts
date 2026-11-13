@@ -1,3 +1,4 @@
+import { continuationReport, markQueuedRunRecovered } from "../ardud/fast-install/report.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it, vi } from "vite-plus/test";
 import { it as effectIt } from "@effect/vitest";
@@ -193,6 +194,15 @@ function startWithMissingWorktree(
               new ProjectionStore.ProjectionStoreReadError({
                 threadId,
                 cause: "simulated inherited-background projection failure",
+              }),
+            );
+          },
+          getRunControlState: () => {
+            projectionReadCount += 1;
+            return Effect.fail(
+              new ProjectionStore.ProjectionStoreReadError({
+                threadId,
+                cause: "simulated run-control read failure",
               }),
             );
           },
@@ -586,6 +596,9 @@ function makeLocalCommandHarness(input: {
   const nativeStartTurn = vi.fn<ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"]>(
     () => Effect.void,
   );
+  const nativeInterruptTurn = vi.fn<
+    ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"]
+  >(() => Effect.void);
   const injectHistory = vi.fn<
     NonNullable<ProviderAdapter.ProviderAdapterV2SessionRuntime["injectHistory"]>
   >(() => Effect.succeed(true));
@@ -629,6 +642,7 @@ function makeLocalCommandHarness(input: {
                   resumeThread,
                   startTurn: nativeStartTurn,
                   compactThread: nativeStartTurn,
+                  interruptTurn: nativeInterruptTurn,
                   injectHistory,
                 } as never)
               : Effect.die("A local command must not open a native session."),
@@ -766,6 +780,16 @@ function makeLocalCommandHarness(input: {
                   (m.text.trim().toLowerCase() !== "/compact" || m.attachments.length > 0),
               ),
             }),
+          getRunControlState: (_threadId, wantedRunId) =>
+            Effect.as(
+              failReadIfRunning,
+              (() => {
+                const run = projection.runs.find((candidate) => candidate.id === wantedRunId);
+                return run === undefined
+                  ? null
+                  : { activeAttemptId: run.activeAttemptId, status: run.status };
+              })(),
+            ),
           getTurnStartHistory: () =>
             input.nativeDelivery === true
               ? Effect.succeed(projection.turnItems)
@@ -800,6 +824,7 @@ function makeLocalCommandHarness(input: {
     writeIfProviderThreadUnchanged,
     retryableEnsureThread,
     nativeStartTurn,
+    nativeInterruptTurn,
     injectHistory,
     startRootRun,
     tryHandlePromptCommand,
@@ -842,6 +867,113 @@ const startPreparedTurn = (controls: RunExecutionService.RunExecutionServiceV2St
     modelSelection: controls.modelSelection,
     runtimePolicy: controls.runtimePolicy,
   });
+
+effectIt.effect.each([
+  "failed",
+  "cancelled",
+  "interrupted",
+  "completed",
+  "replaced_attempt",
+  "live",
+  "missing",
+  "no_identity",
+  "retry_refused",
+] as const)("recovers previous_turn_active only with stale ownership proof: %s", (state) =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "Continue", nativeDelivery: true });
+    yield* harness.start;
+    const controls = harness.startRootRun.mock.calls[0]![0];
+    const oldRunId = RunId.make("stale-claude-run");
+    const oldAttempt = RunAttemptId.make("stale-claude-attempt");
+    const staleTurn = ProviderTurnId.make("stale-claude-turn");
+    if (state !== "missing") {
+      const projection = harness.projection();
+      harness.setProjection({
+        ...projection,
+        runs: [
+          ...projection.runs,
+          {
+            ...controls.run,
+            id: oldRunId,
+            ordinal: 1,
+            activeAttemptId:
+              state === "replaced_attempt" ? RunAttemptId.make("replacement-attempt") : oldAttempt,
+            status:
+              state === "live" ||
+              state === "replaced_attempt" ||
+              state === "no_identity" ||
+              state === "retry_refused"
+                ? "running"
+                : state,
+          },
+        ],
+      });
+    }
+    const refusal = new ProviderAdapter.ProviderAdapterTurnStartError({
+      driver: controls.session.driver,
+      threadId: controls.run.threadId,
+      providerThreadId: controls.providerThread.id,
+      runId: controls.run.id,
+      cause: new ProviderAdapter.ProviderAdapterProtocolError({
+        driver: controls.session.driver,
+        reason: "previous_turn_active",
+        detail: "still active",
+        ...(state === "no_identity"
+          ? {}
+          : {
+              activeTurn: {
+                runId: oldRunId,
+                attemptId: oldAttempt,
+                providerThreadId: controls.providerThread.id,
+                providerTurnId: staleTurn,
+              },
+            }),
+      }),
+    });
+    harness.nativeStartTurn.mockImplementationOnce(() => Effect.fail(refusal));
+    if (state === "retry_refused") {
+      const projection = harness.projection();
+      harness.setProjection({
+        ...projection,
+        runs: projection.runs.map((run) =>
+          run.id === oldRunId ? { ...run, status: "failed" } : run,
+        ),
+      });
+      harness.nativeStartTurn.mockImplementationOnce(() => Effect.fail(refusal));
+    }
+    const outcome = yield* startPreparedTurn(controls).pipe(Effect.result);
+    const healed = !["live", "missing", "no_identity"].includes(state);
+    expect(harness.nativeInterruptTurn).toHaveBeenCalledTimes(healed ? 1 : 0);
+    expect(harness.nativeStartTurn).toHaveBeenCalledTimes(healed ? 2 : 1);
+    expect(outcome._tag).toBe(healed && state !== "retry_refused" ? "Success" : "Failure");
+    if (healed)
+      expect(harness.nativeInterruptTurn).toHaveBeenCalledWith({
+        providerThread: controls.providerThread,
+        providerTurnId: staleTurn,
+      });
+  }),
+);
+
+effectIt.effect(
+  "attributes a recovered original queue run only at its actual provider request",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue queued work",
+        nativeDelivery: true,
+      });
+      const run = harness.projection().runs.at(-1)!;
+      expect(run.restartContinuationOfRunId).toBeUndefined();
+      const before = continuationReport().firstResumedProviderRequestAt;
+      markQueuedRunRecovered(run.id);
+      yield* harness.start;
+      expect(continuationReport().firstResumedProviderRequestAt).toBe(before);
+      expect(harness.nativeStartTurn).not.toHaveBeenCalled();
+      yield* startPreparedTurn(harness.startRootRun.mock.calls[0]![0]);
+      expect(harness.nativeStartTurn).toHaveBeenCalledOnce();
+      expect(continuationReport().firstResumedProviderRequestAt).not.toBeNull();
+    }),
+);
 
 effectIt.effect(
   "delivers the normal native switch history once and resumes it on the second turn",
@@ -2205,5 +2337,41 @@ effectIt.effect("fails a run whose expanded assistant quotes exceed the provider
         failure: { class: "validation_error" },
       },
     ]);
+  }),
+);
+
+effectIt.effect("fails an automatic recovery instead of replacing its native session", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      historyReadFailureAfterFallback: new Error("must not replace"),
+    });
+    const projection = harness.projection();
+    harness.setProjection({
+      ...projection,
+      runs: projection.runs.map((run) => ({
+        ...run,
+        transientRecovery: {
+          firstError: {
+            class: "provider_error",
+            category: "transient",
+            code: "api_error_529",
+            retryable: true,
+            message: "529 overloaded",
+          },
+          since: "2026-11-08T10:00:00.000Z",
+        },
+      })),
+    });
+    yield* harness.start;
+    expect(harness.resumeThread).toHaveBeenCalledOnce();
+    expect(harness.resumeFallbackEnsure).not.toHaveBeenCalled();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    const failed = harness.projection().turnItems.findLast((item) => item.type === "error");
+    expect(failed?.type === "error" ? failed.failure.message : "").toContain("529 overloaded");
+    expect(failed?.type === "error" ? failed.failure.message : "").toContain("Resume error:");
+    expect(failed?.type === "error" ? failed.failure.message : "").toContain(
+      "native thread is gone",
+    );
   }),
 );

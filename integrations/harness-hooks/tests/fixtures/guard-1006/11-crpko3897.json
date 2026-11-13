@@ -1,0 +1,32 @@
+{
+  "case_number": 11,
+  "reporter_id": "crpko3897",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Fcrpko-devops:6a64d132-2073-4712-a6b4-dc66756e6b7d",
+  "provenance": {
+    "recovery": "verbatim",
+    "source_kind": "retained_codex_custom_tool_call",
+    "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/11/rollout-2026-11-11T23-38-53-01a1cc1e-ce58-7951-a142-99f7b1a423c9.jsonl",
+    "source_call_line_0": 2717,
+    "timestamp": "2026-11-11T22:48:20.255Z",
+    "call_id": "call_c789081fba40444da077d3fcddd3fc82",
+    "command_index_0": 1,
+    "cell_command_count": 2,
+    "decoder": "integrations/harness-hooks/tests/code_mode_fixture.py:commands (static decoding; no execution)",
+    "explicit_workdir_present": false,
+    "sha256_scope": "UTF-8 bytes of cmd only; workdir preserved separately",
+    "thread_mapping": "Robob #1006 reporter link and reporter activity title confirmed",
+    "raw_denials_file": "/tmp/guard1006-denials.json",
+    "raw_denial_index_0": 31,
+    "missing_explicit_workdir_note": "Original exec_command omitted workdir/cwd. commands[0].workdir is null; session_cwd is retained separately and is not an explicit tool argument.",
+    "per_command_result": "Only result i=1 is rejected. Result i=0 is fulfilled and excluded."
+  },
+  "session_cwd": "/Volumes/ExternalSSD/crpko-devops",
+  "commands": [
+    {
+      "cmd": "rg --files /Users/ardud/.config /Users/ardud/.local/share -g '*1112-021743-0b6f*' -g '*offbox*' -g '!node_modules' -g '!*.map' -g '!*.sqlite*' -g '!statev2*' -g '!opencode.db*' | head -n 40",
+      "workdir": null,
+      "sha256": "2152c078e2a21391d43beb1a7f9a3a4c637436b86125b859f5e1701be6bdeaa6"
+    }
+  ],
+  "original_refusal": "Command blocked by PreToolUse hook: statev2 guard: this command was NOT run (owner incident 2026-11-05).\nShell reads of Robob's live statev2.sqlite and OpenCode's live opencode.db are blocked, including sqlite3/python/node scripts and read-only SQL. They contend with the live writers.\nUse Robob tools/APIs (board_*/card_*, t3ctl, /api/ardud/control/*), recall for past sessions, or server traces instead. Work on an existing isolated copy. Creating a copy or VACUUM INTO also reads the live file and needs Abdullah's approval first.\nIf only the database can answer, report the exact queries and stop."
+}

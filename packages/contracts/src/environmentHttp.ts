@@ -74,11 +74,13 @@ import {
 } from "./relay.ts";
 
 const OptionalBearerHeaders = Schema.Struct({
+  "x-robob-action-id": Schema.optionalKey(Schema.String),
   authorization: Schema.optionalKey(Schema.String),
   dpop: Schema.optionalKey(Schema.String),
 });
 
 const OrchestrationProtocolHeaders = Schema.Struct({
+  "x-robob-action-id": Schema.optionalKey(Schema.String),
   authorization: Schema.optionalKey(Schema.String),
   dpop: Schema.optionalKey(Schema.String),
   [ORCHESTRATION_PROTOCOL_HEADER]: Schema.Literal(ORCHESTRATION_PROTOCOL_VERSION_TEXT),
@@ -598,6 +600,10 @@ class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestration")
       query: Schema.Struct({
         after: Schema.optionalKey(Schema.String),
         paged: Schema.optionalKey(Schema.String),
+        /** "true" leaves out long-idle subagents, as OrchestrationV2SubscribeShellInput. */
+        omitIdleSubagents: Schema.optionalKey(Schema.String),
+        /** "true" asks for the most recently updated threads as the first page. */
+        recentFirst: Schema.optionalKey(Schema.String),
       }),
       headers: OrchestrationProtocolHeaders,
       success: OrchestrationV2ShellSnapshot,

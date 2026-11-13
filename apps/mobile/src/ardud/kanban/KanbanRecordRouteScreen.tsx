@@ -404,33 +404,32 @@ function DiscussionsScreen(props: {
         {wide ? (
           <View className="flex-1">
             {selected ? (
-              <Chat
-                key={selected.key}
-                boardId={props.boardId}
-                state={props.state}
-                discussionId={selected.id}
-                header={
-                  splitDiscussion ? (
-                    <View className="flex-row justify-end px-4 pt-2">
-                      <IconButton
-                        {...copyLinkAction(
-                          "kanban-discussion",
-                          splitDiscussion.id,
-                          splitDiscussion.title,
-                        )}
-                      />
-                    </View>
-                  ) : undefined
-                }
-                ensureDiscussion={async (firstText) => {
-                  const id = await createDiscussion(props.boardId, firstText);
-                  setSelected((current) => (current ? { ...current, id } : current));
-                  return id;
-                }}
-                nowMs={props.nowMs}
-                bottomInset={props.bottomInset}
-                onOpenCard={nav.openCard}
-              />
+              <View key={selected.key} className="flex-1">
+                {splitDiscussion ? (
+                  <View className="flex-row justify-end px-4 pt-2">
+                    <IconButton
+                      {...copyLinkAction(
+                        "kanban-discussion",
+                        splitDiscussion.id,
+                        splitDiscussion.title,
+                      )}
+                    />
+                  </View>
+                ) : null}
+                <Chat
+                  boardId={props.boardId}
+                  state={props.state}
+                  discussionId={selected.id}
+                  ensureDiscussion={async (firstText) => {
+                    const id = await createDiscussion(props.boardId, firstText);
+                    setSelected((current) => (current ? { ...current, id } : current));
+                    return id;
+                  }}
+                  nowMs={props.nowMs}
+                  bottomInset={props.bottomInset}
+                  onOpenCard={nav.openCard}
+                />
+              </View>
             ) : (
               <EmptyLine label="No discussion open" />
             )}

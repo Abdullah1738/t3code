@@ -179,7 +179,7 @@ class ResumeAndCreate(Isolated):
         ok = {"box_id": "bx_b", "remote_dir": "w/x", "size": "large", "state": "running", "repo_key": "repo",
               "repo_root": "/checkout/repo"}
 
-        def fake_reuse(con, row, size, skip_archiving=False):
+        def fake_reuse(con, row, size, skip_archiving=False, before_grow=None):
             if row["box_id"] == "bx_a":
                 raise api.SupplyOut("large", "bx_a", SUPPLY_MSG, tried=True)
             return dict(ok)

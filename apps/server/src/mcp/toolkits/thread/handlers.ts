@@ -92,6 +92,8 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
         taskId: task.id,
         threadId: task.threadId,
         lastRunStatus: task.lastRunStatus,
+        lastRunError: task.lastRunError,
+        missedRuns: task.missedRuns,
         runCount: task.runCount,
         nextRunAt: task.nextRunAt,
       };
@@ -103,13 +105,9 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
       const { projectId: requested, ...query } = input;
       const projectId = requested ?? caller?.projectId;
       const threadSearch = yield* ThreadSearch.ThreadSearch;
-      const result = yield* threadSearch.search(query).pipe(Effect.mapError(unavailable));
-      return {
-        matches:
-          projectId === undefined
-            ? result.matches
-            : result.matches.filter((match) => match.projectId === projectId),
-      };
+      return yield* threadSearch
+        .search({ ...query, ...(projectId === undefined ? {} : { projectId }) })
+        .pipe(Effect.mapError(unavailable));
     }),
   ),
   t3_thread_fork: writesThread((input) =>

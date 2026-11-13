@@ -53,7 +53,7 @@ function rowsOf(items: ReadonlyArray<OrchestrationV2TurnItem>, activeRunId: stri
     previousDayKey: null,
     namedSenders: false,
     activeRunId,
-  });
+  }).rows;
 }
 
 const userText = {
@@ -137,12 +137,13 @@ describe("imessageTimelineEntries", () => {
 
     expect(rows.map((row) => row.kind)).toEqual(["divider", "time", "incoming", "agent", "reply"]);
     expect(rows[2]).toMatchObject({ text: "Add these to food db" });
-    expect(rows[4]).toMatchObject({ text: "Saved all three." });
+    expect(rows[4]).toMatchObject({ send: { text: "Saved all three.", via: "final" } });
     const agent = rows[3];
-    expect(agent?.kind === "agent" ? agent.steps : []).toMatchObject([
+    expect(agent?.kind === "agent" ? agent.turn.steps : []).toMatchObject([
       { label: "Ran", text: "food.py add eggs", code: true, seconds: 12 },
       { label: "Plan", text: "Save three items" },
       { label: "Event", text: "run interrupt result" },
+      { label: "Sent", text: "Saved all three." },
     ]);
   });
 
@@ -151,8 +152,8 @@ describe("imessageTimelineEntries", () => {
 
     expect(rows.map((row) => row.kind)).toEqual(["divider", "time", "incoming", "agent"]);
     const agent = rows[3];
-    expect(agent).toMatchObject({ kind: "agent", outcome: "no-reply" });
-    expect(agent?.kind === "agent" ? agent.steps[0] : null).toMatchObject({
+    expect(agent).toMatchObject({ kind: "agent", turn: { outcome: "no-reply" } });
+    expect(agent?.kind === "agent" ? agent.turn.steps[0] : null).toMatchObject({
       label: "Text not sent",
       text: "Saved all three.",
     });
@@ -162,8 +163,9 @@ describe("imessageTimelineEntries", () => {
     const rows = rowsOf([userText, interruptRequest, reply]);
 
     const agent = rows[3];
-    expect(agent?.kind === "agent" ? agent.steps : []).toMatchObject([
+    expect(agent?.kind === "agent" ? agent.turn.steps : []).toMatchObject([
       { label: "Event", text: "run interrupt request" },
+      { label: "Sent", text: "Saved all three." },
     ]);
   });
 
@@ -188,7 +190,28 @@ describe("imessageTimelineEntries", () => {
   it("marks the live run as working until its reply lands", () => {
     expect(rowsOf([userText, command], runId).at(-1)).toMatchObject({
       kind: "agent",
-      outcome: "working",
+      turn: { outcome: "working" },
     });
+  });
+
+  it("reads a send tool call as a text and keeps the final message as a note", () => {
+    const send = {
+      ...base("item-send", 1, "2026-10-20T09:00:05.000Z", "2026-10-20T09:00:06.000Z"),
+      type: "dynamic_tool",
+      toolName: "mcp__t3-code__imessage_send",
+      input: { text: "On it." },
+    } satisfies OrchestrationV2TurnItem;
+    const rows = rowsOf([userText, send, reply]);
+
+    expect(rows.map((row) => row.kind)).toEqual([
+      "divider",
+      "time",
+      "incoming",
+      "agent",
+      "reply",
+      "note",
+    ]);
+    expect(rows[4]).toMatchObject({ send: { text: "On it.", via: "tool", state: "sent" } });
+    expect(rows[5]).toMatchObject({ text: "Saved all three." });
   });
 });

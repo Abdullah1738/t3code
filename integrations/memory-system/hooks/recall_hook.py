@@ -198,7 +198,8 @@ def handle(harness, event):
         from recall_local import preflight, local_note
         tool = str(event.get("tool_name") or "")
         try:
-            rules, conflict = preflight(tool, event.get("tool_input"), cwd)
+            rules, conflict = preflight(tool, event.get("tool_input"), cwd,
+                                        session_id=event.get("agent_id") or event.get("session_id"))
         except Exception:
             rules, conflict = [], None
         note = local_note(rules)

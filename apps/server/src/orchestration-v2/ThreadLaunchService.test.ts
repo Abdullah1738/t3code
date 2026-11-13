@@ -2266,6 +2266,10 @@ it.effect("a retry reuses a recorded worktree without undoing its branch rename"
     assert.equal(harness.renameBranch.mock.calls.length, 1);
     assert.equal(retried.thread.branch, "generated-branch");
     assert.equal(retried.thread.worktreePath, "/repo-worktrees/feature");
+    // The tracker settles in its own fiber after the release effect is queued.
+    yield* waitUntil(() =>
+      tracker.get(launched.threadId).pipe(Effect.map((current) => current?.phase === "done")),
+    );
     const snapshot = yield* tracker.get(launched.threadId);
     assert.equal(snapshot?.phase, "done");
     assert.deepEqual(

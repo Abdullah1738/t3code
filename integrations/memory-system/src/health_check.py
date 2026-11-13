@@ -4,9 +4,10 @@
 Checks that the whole pipeline is flowing, not just that processes exist:
   sync      raw capture stage (com.abdullah.memory-sync) succeeded recently
   lag       native OpenCode sessions older than 30 min are in memory.db
+  opencode_export  native export is loaded and publishes fresh generations
   muse_lag  Muse capture ran cleanly; logs quiet for 10 min are fully captured
   recall    recall server answers on :18765 and its session catalog keeps up
-  backup    last memory backup succeeded recently
+  backup    memory backup job loaded and last success within 9 h (includes deferrals)
   backup_lock  no backup run is hung (>4 h) or died holding logs/backup.lock
   health_backup  health backup had a successful run in the last 13 h
   person_backup  every offbox-person (Moni) backup had a successful run in the last 13 h
@@ -17,8 +18,8 @@ Checks that the whole pipeline is flowing, not just that processes exist:
   msgs      message archive (com.ardud.message-archive) still reads chat.db
 
 Writes logs/health_last.json and logs/memory_check.log. Sends a Telegram
-alert when a check starts failing (once per check per day while it keeps
-failing) and an all-clear when it recovers. --dry-run prints and never
+alert when a check starts failing (once per backup incident, daily for other
+checks) and an all-clear when it recovers. --dry-run prints and never
 notifies.
 """
 import argparse
@@ -27,6 +28,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -53,6 +55,8 @@ TG_CLI = os.path.join(HOME, ".local/share/telegram-bridge/src/cli.ts")
 SYNC_MAX_AGE = 15 * 60          # tick every 120 s
 LAG_GRACE_MS = 30 * 60 * 1000   # settle window is 10 min
 LAG_MAX = 3
+EXPORT_MAX_AGE = 30 * 60
+EXPORT_PROGRESS_MAX_AGE = 5 * 60
 MUSE_LAG_GRACE = 10 * 60        # a log may run ahead of memory.db this long
 RECALL_URL = "http://127.0.0.1:18765/api/health"
 RECALL_MAX_LAG = 20000          # events the session catalog may trail by
@@ -78,11 +82,12 @@ def ro(path):
 
 
 def launchd_exit(label):
-    out = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"],
-                         capture_output=True, text=True).stdout
+    result = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                            capture_output=True, text=True, timeout=10)
+    out = result.stdout
     m = re.search(r"last exit code = (\d+|\(never exited\))", out)
     runs = re.search(r"\bruns = (\d+)", out)
-    return (m.group(1) if m else None), (int(runs.group(1)) if runs else 0), bool(out)
+    return (m.group(1) if m else None), (int(runs.group(1)) if runs else 0), result.returncode == 0 and bool(out)
 
 
 def stage_status(name):
@@ -108,6 +113,37 @@ def check_sync():
             else f"; last run {st.get('state')} rc={st.get('rc')}"
         return False, f"last successful capture {int(age/60)} min ago{cur}"
     return True, f"last capture ok {int(age)} s ago"
+
+
+def check_opencode_export():
+    _, _, loaded = launchd_exit("com.abdullah.opencode-readonly")
+    if not loaded:
+        return False, "opencode-readonly launch agent not loaded"
+    # Read readiness itself: native_ro correctly refuses unready bootstraps.
+    with closing(robob_readonly.connect_ro(OC_DB, timeout=0.1)) as con:
+        meta = dict(con.execute("SELECT key,value FROM ardud_readonly_meta WHERE key IN "
+                                "('ready','history_ready','updated_at','progress_at','generation')"))
+    now = time.time()
+    generation = meta.get("generation", "unknown")
+    if meta.get("ready") == "0":
+        try:
+            age = now - float(meta.get("progress_at", "nan"))
+        except ValueError:
+            age = float("nan")
+        if meta.get("history_ready") in (None, "0") and -30 <= age <= EXPORT_PROGRESS_MAX_AGE:
+            return True, f"bootstrap progressing (generation {generation}, heartbeat {int(age)} s ago)"
+    try:
+        at = datetime.fromisoformat(meta["updated_at"].replace("Z", "+00:00"))
+        if at.tzinfo is None:
+            raise ValueError("timestamp has no timezone")
+        age = now - at.timestamp()
+        if meta.get("ready") not in ("0", "1") or not -30 <= age <= EXPORT_MAX_AGE:
+            raise ValueError("not ready or stale")
+    except (KeyError, ValueError):
+        return False, f"OpenCode export ready={meta.get('ready', 'missing')}, missing timestamp or stale (>30 min; generation {generation})"
+    if meta["ready"] == "0":
+        return True, f"OpenCode export in progress; last publication {int(age)} s ago (generation {generation})"
+    return True, f"OpenCode export generation {generation}, published {int(age)} s ago"
 
 
 def check_lag():
@@ -564,17 +600,33 @@ def check_recall():
 
 
 def check_backup():
+    _, _, loaded = launchd_exit("com.abdullah.memory-backup")
+    problems = [] if loaded else ["com.abdullah.memory-backup not loaded"]
     p = os.path.join(LOGS, "backup_last.json")
     try:
-        st = json.load(open(p))
+        with open(p) as f:
+            st = json.load(f)
+        if not isinstance(st, dict):
+            raise ValueError("invalid backup status")
     except Exception:
-        return False, "no backup status (logs/backup_last.json)"
-    last_ok = st.get("last_success_ts") or 0
+        return False, "; ".join(problems + ["no backup status (logs/backup_last.json)"])
+    now = time.time()
+    last_ok = _native_epoch(st.get("last_success_ts"), now) or 0
+    age = now - last_ok
     if not st.get("ok"):
-        return False, f"last backup failed at {st.get('stage')}: {st.get('message', '')[:200]}"
-    if time.time() - last_ok > BACKUP_MAX_AGE:
-        return False, f"last successful backup {int((time.time()-last_ok)/3600)} h ago"
-    return True, f"snapshot {st.get('last_snapshot')} {int((time.time()-last_ok)/60)} min ago"
+        problems.append(f"last backup failed at {st.get('stage')}: {str(st.get('message', ''))[:200]}")
+    if not last_ok or age > BACKUP_MAX_AGE:
+        problems.append(f"last successful memory backup {int(age/3600)} h ago" if last_ok
+                        else "no successful memory backup recorded")
+        deferred = _native_epoch(st.get("last_deferred_ts"), now) or 0
+        if deferred and deferred > last_ok:
+            reason = st.get("deferred_reason") or st.get("last_deferred_reason") or st.get("message") or "reason not recorded"
+            problems.append(f"deferred {st.get('deferred_count', '?')} time(s): {str(reason)[:200]}")
+        elif st.get("message"):
+            problems.append(f"last: {st.get('stage')}: {str(st['message'])[:200]}")
+    if problems:
+        return False, "; ".join(problems)
+    return True, f"snapshot {st.get('last_snapshot')} {int(age/60)} min ago"
 
 
 def _backup_age(path, label):
@@ -593,10 +645,14 @@ def _backup_age(path, label):
 
 
 def check_health_backup():
+    if not launchd_exit("com.abdullah.health-backup")[2]:
+        return False, "com.abdullah.health-backup not loaded"
     return _backup_age(HEALTH_BACKUP_STATUS, "health")
 
 
 def check_person_backups():
+    if not launchd_exit("com.abdullah.offbox-person-backup")[2]:
+        return False, "com.abdullah.offbox-person-backup not loaded"
     if not os.path.isdir(PERSON_BACKUP_DIR):
         return True, "no offbox-person backups"
     paths = sorted(glob.glob(os.path.join(PERSON_BACKUP_DIR, "*-backup.json")))
@@ -763,7 +819,9 @@ def _boot_id():
 def _msgs_failing():
     try:
         with open(STATE) as f:
-            return "msgs" in json.load(f).get("failing", {})
+            failing = json.load(f).get("failing", {})
+        # A queued all-clear must not latch an already recovered archive.
+        return "msgs" in failing and not failing["msgs"].get("recovery_pending")
     except (OSError, ValueError, AttributeError):
         return False
 
@@ -907,7 +965,8 @@ def check_msgs():
     return False, msg
 
 
-CHECKS = [("sync", check_sync), ("lag", check_lag), ("muse_lag", check_muse_lag), ("native_capture", check_native_capture),
+CHECKS = [("opencode_export", check_opencode_export), ("sync", check_sync), ("lag", check_lag),
+          ("muse_lag", check_muse_lag), ("native_capture", check_native_capture),
           ("claude_retention", check_claude_retention), ("recall", check_recall),
           ("backup", check_backup),
           ("backup_lock", check_backup_lock),
@@ -918,9 +977,42 @@ CHECKS = [("sync", check_sync), ("lag", check_lag), ("muse_lag", check_muse_lag)
 
 
 def notify(severity, text, key):
-    r = subprocess.run([BUN, TG_CLI, "notify", "--source", "Memory health", "--severity", severity,
-                        "--text", text, "--key", key], capture_output=True, text=True, timeout=60)
-    return r.returncode == 0
+    env = os.environ.copy()
+    env.pop("BUN_INSPECT", None)
+    try:
+        r = subprocess.run([BUN, TG_CLI, "notify", "--source", "Memory health", "--severity", severity,
+                            "--text", text, "--key", key], capture_output=True, text=True, timeout=60, env=env)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+BACKUP_INCIDENTS = {"backup": "memory-backup", "health_backup": "health-backup", "person_backup": "offbox-person-backup"}
+
+
+def notify_backup(name, text, incident, recovered=False):
+    # Telegram keys are permanent: include the persisted incident id so a later
+    # outage is not deduplicated against the first one for the lifetime of the job.
+    label = BACKUP_INCIDENTS[name]
+    key = f"{label}:{'recovered' if recovered else 'stale'}:{incident}"
+    override = os.environ.get("MEMORY_BACKUP_NOTIFY_CMD")
+    env = os.environ.copy()
+    env.pop("BUN_INSPECT", None)
+    try:
+        cmd = shlex.split(override) if override else [BUN, TG_CLI, "notify", "--source", "Memory backup"]
+        return subprocess.run(cmd + ["--severity", "info" if recovered else "attention", "--key", key,
+                                     "--text", text], capture_output=True, text=True, timeout=60, env=env).returncode == 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def main():
@@ -938,16 +1030,44 @@ def main():
             ok, msg = False, f"check crashed: {type(e).__name__}: {e}"
         results[name] = {"ok": ok, "msg": msg}
 
+    state_read_error = None
     try:
-        state = json.load(open(STATE))
-    except Exception:
+        with open(STATE) as f:
+            state = json.load(f)
+    except FileNotFoundError:
         state = {}
+    except (OSError, ValueError) as error:
+        state = {}
+        state_read_error = error
     failing = state.get("failing", {})
+    previous_failing = failing.copy()
+    backup_recoveries = state.get("backup_recoveries", [])
     today = time.strftime("%Y%m%d")
-    new_fail, recovered = [], []
+    new_fail, recovered, backup_alerts = [], [], []
     for name, r in results.items():
+        if name in BACKUP_INCIDENTS:
+            prev = failing.get(name, {})
+            if not r["ok"]:
+                incident = prev.get("since", time.time_ns())
+                sent = prev.get("incident_notified", bool(prev.get("notified_day")))
+                failing[name] = {"since": incident, "msg": r["msg"], "incident_notified": sent,
+                                 "alert_text": prev.get("alert_text", prev.get("msg", r["msg"]))}
+                if not sent:
+                    backup_alerts.append(name)
+            elif prev:
+                # A reserved alert may have reached Telegram before its local
+                # acknowledgement was saved, so recovery also covers that case.
+                backup_recoveries.append({"name": name, "incident": prev["since"],
+                                          "text": f"{BACKUP_INCIDENTS[name]} recovered at "
+                                                  f"{time.strftime('%Y-%m-%d %H:%M')}: {r['msg']}"})
+                # Recovery happened even if its notice can't be delivered yet.
+                # A later outage must start a new incident with a new alert.
+                failing.pop(name)
+            continue
         if not r["ok"]:
             prev = failing.get(name)
+            if prev and prev.get("recovery_pending"):
+                prev = None
             if not prev or prev.get("notified_day") != today:
                 new_fail.append(name)
             failing[name] = {"since": (prev or {}).get("since", int(time.time())),
@@ -961,6 +1081,23 @@ def main():
         print(json.dumps(summary, indent=1))
         return
 
+    if (backup_alerts or backup_recoveries) and state_read_error is None:
+        # Reserve keys and payloads before backup sends, keeping ordinary
+        # all-clears pending in case a backup notification interrupts this run.
+        state["failing"] = {**failing, **{name: {**previous_failing[name], "recovery_pending": True}
+                                        for name in recovered}}
+        state["backup_recoveries"] = backup_recoveries
+        try:
+            write_json(STATE, state)
+        except OSError:
+            # A full disk must not suppress the ordinary disk/sync alerts below.
+            pass
+        else:
+            for name in backup_alerts:
+                incident = failing[name]
+                incident["incident_notified"] = notify_backup(name, incident["alert_text"], incident["since"])
+            backup_recoveries = [rec for rec in backup_recoveries
+                                 if not notify_backup(rec["name"], rec["text"], rec["incident"], recovered=True)]
     if new_fail:
         lines = [f"- {n}: {results[n]['msg']}" for n in new_fail]
         text = "Memory system problem:\n" + "\n".join(lines)
@@ -970,13 +1107,15 @@ def main():
                 failing[n]["notified_day"] = today
     if recovered:
         text = "Memory system recovered: " + ", ".join(recovered) + "."
-        notify("info", text, f"memory-health:recovered:{int(time.time())}:{','.join(recovered)}")
+        if not notify("info", text, f"memory-health:recovered:{int(time.time())}:{','.join(recovered)}"):
+            failing.update({name: {**previous_failing[name], "recovery_pending": True} for name in recovered})
 
+    if state_read_error is not None:
+        raise state_read_error
     state["failing"] = failing
+    state["backup_recoveries"] = backup_recoveries
     for path, obj in ((STATE, state), (LAST, summary)):
-        tmp = path + ".tmp"
-        json.dump(obj, open(tmp, "w"), indent=1)
-        os.replace(tmp, path)
+        write_json(path, obj)
     with open(os.path.join(LOGS, "memory_check.log"), "w") as f:
         f.write("ok\n" if summary["ok"] else
                 "".join(f"FAIL {n}: {r['msg']}\n" for n, r in results.items() if not r["ok"]))

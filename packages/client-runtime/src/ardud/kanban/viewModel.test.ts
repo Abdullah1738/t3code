@@ -17,6 +17,7 @@ import {
   withOwnerRead,
 } from "./boardState.ts";
 import {
+  activeGoals,
   askViews,
   blockText,
   canSendChoice,
@@ -246,11 +247,82 @@ describe("stageBoard", () => {
   it("a card whose thread waits on its own question shows needsInput, not running", () => {
     const state = boardStateFromSnapshot({
       ...snapshot([card(1, { stage: "working", activeThreadId: ThreadId.make("t1") })]),
-      threads: [{ threadId: ThreadId.make("t1"), title: "w", running: false, needsInput: true, lastActivityAt: null }],
+      threads: [
+        {
+          threadId: ThreadId.make("t1"),
+          title: "w",
+          running: false,
+          needsInput: true,
+          lastActivityAt: null,
+        },
+      ],
     } as never);
-    const view = stageBoard(state, NOW).active.find((column) => column.stage === "working")!.cards[0]!;
+    const view = stageBoard(state, NOW).active.find((column) => column.stage === "working")!
+      .cards[0]!;
     expect(view.needsInput).toBe(true);
     expect(view.running).toBe(false);
+  });
+
+  it("does not keep stale thread states while a reopened feed's thread state is pending", () => {
+    const t1 = {
+      threadId: ThreadId.make("t1"),
+      title: "w",
+      running: true,
+      needsInput: false,
+      lastActivityAt: null,
+    };
+    const base = snapshot([card(1, { stage: "working", activeThreadId: ThreadId.make("t1") })]);
+    const previous = boardStateFromSnapshot({ ...base, threads: [t1] } as never);
+    const pending = boardStateFromSnapshot(
+      { ...base, threads: [], threadsPending: true } as never,
+      previous,
+    );
+    // Unknown until the thread change arrives: a thread that ended while disconnected must
+    // not stay "running" if its fill read fails.
+    expect(pending.threads.size).toBe(0);
+    const working = stageBoard(pending, NOW).active.find((column) => column.stage === "working")!;
+    expect(working.cards[0]!.running).toBe(false);
+  });
+
+  it("counts for the owner only cards with an ask he can answer now", () => {
+    const ask = (id: string, patch: Record<string, unknown> = {}) =>
+      ({
+        id,
+        text: id,
+        blocking: false,
+        by: { _tag: "thread", threadId: "t1" },
+        at: "2026-10-25T10:00:00.000Z",
+        seq: 1,
+        closedAt: null,
+        ...patch,
+      }) as never;
+    const earlier = "2026-10-25T11:00:00.000Z";
+    const goalId = "goal-a" as never;
+    const state = boardStateFromSnapshot(
+      snapshot([
+        card(1, { stage: "working", goalId, asks: [ask("q1")] }),
+        // Held by a blocking ask he handed over: listed in the column, not counted.
+        card(2, {
+          stage: "needs_owner",
+          goalId,
+          asks: [ask("q1", { blocking: true, handedAt: earlier })],
+        }),
+        // He replied on it: it waits on its asker and leaves the column.
+        card(3, { stage: "working", goalId, asks: [ask("q1", { clarifyAskedAt: earlier })] }),
+        card(4, { stage: "todo", goalId, asks: [ask("q1", { expiresAt: earlier })] }),
+        // Held by hand with no ask: his.
+        card(5, { stage: "needs_owner", goalId }),
+        card(6, { stage: "todo", goalId, asks: [ask("q1", { handedAt: earlier }), ask("q2")] }),
+      ]),
+    );
+    const view = stageBoard(state, NOW);
+    expect(view.owner.cards.map((c) => c.number).sort()).toEqual([1, 2, 5, 6]);
+    expect(view.owner.count).toBe(3);
+    expect(activeGoals(state, NOW)[0]!.needsOwner).toBe(3);
+    // Before the expiry, card 4's ask is his too.
+    const before = Date.parse(earlier) - 1;
+    expect(stageBoard(state, before).owner.count).toBe(4);
+    expect(activeGoals(state)[0]!.needsOwner).toBe(4);
   });
 
   it("lists cards with open async asks under Needs Owner too, after the waiting ones", () => {
@@ -709,12 +781,9 @@ describe("discussions", () => {
     expect(ids(groups.active)).toEqual(["card-chat", "channel", "plain"]);
 
     const hidden = discussionRows(state, NOW, { hideCards: true });
-    const visible = [
-      ...hidden.pinned,
-      ...hidden.active,
-      ...hidden.snoozed,
-      ...hidden.settled,
-    ].map((row) => row.id);
+    const visible = [...hidden.pinned, ...hidden.active, ...hidden.snoozed, ...hidden.settled].map(
+      (row) => row.id,
+    );
     expect(visible).not.toContain("card-chat");
     expect(visible).toContain("channel");
     expect(ids(hidden.active)).toEqual(["channel", "plain"]);
@@ -891,56 +960,56 @@ describe("discussions", () => {
     expect(presence.typing.map((p) => p.letter)).toEqual(["E"]);
   });
 
-describe("own answers on a choice block", () => {
-  type Choice = Extract<KanbanBlock, { _tag: "choice" }>;
-  const choice = (style: "poll" | "pick", multi: boolean): Choice => ({
-    _tag: "choice",
-    id: "q1",
-    style,
-    question: "Ship?",
-    options: [
-      { id: "yes", label: "Yes" },
-      { id: "no", label: "No" },
-    ],
-    multi,
+  describe("own answers on a choice block", () => {
+    type Choice = Extract<KanbanBlock, { _tag: "choice" }>;
+    const choice = (style: "poll" | "pick", multi: boolean): Choice => ({
+      _tag: "choice",
+      id: "q1",
+      style,
+      question: "Ship?",
+      options: [
+        { id: "yes", label: "Yes" },
+        { id: "no", label: "No" },
+      ],
+      multi,
+    });
+
+    it("allows a poll only with options, a single pick with one of the two, a multi pick with either", () => {
+      const poll = choice("poll", false);
+      expect(canSendChoice(poll, ["yes"], "")).toBe(true);
+      expect(canSendChoice(poll, ["yes"], "maybe")).toBe(false);
+      expect(canSendChoice(poll, [], "maybe")).toBe(false);
+
+      const single = choice("pick", false);
+      expect(canSendChoice(single, ["yes"], "")).toBe(true);
+      expect(canSendChoice(single, [], "Wait")).toBe(true);
+      expect(canSendChoice(single, ["yes"], "Wait")).toBe(false);
+      expect(canSendChoice(single, [], "   ")).toBe(false);
+      expect(canSendChoice(single, [], "")).toBe(false);
+
+      const multi = choice("pick", true);
+      expect(canSendChoice(multi, ["yes", "no"], "")).toBe(true);
+      expect(canSendChoice(multi, ["yes"], "and more")).toBe(true);
+      expect(canSendChoice(multi, [], "only words")).toBe(true);
+      expect(canSendChoice(multi, [], "  ")).toBe(false);
+    });
+
+    it("finds only the owner's answer on this block", () => {
+      const block = choice("pick", false);
+      const at = "2026-10-27T10:00:00.000Z";
+      const answers = [
+        { blockId: "other", by: { _tag: "owner" as const }, choice: ["yes"], text: null, at },
+        {
+          blockId: "q1",
+          by: { _tag: "evaluator" as const, threadId: ThreadId.make("t1") },
+          choice: ["no"],
+          text: null,
+          at,
+        },
+        { blockId: "q1", by: { _tag: "owner" as const }, choice: [], text: "Wait", at },
+      ];
+      expect(ownerChoiceAnswer(block, answers)?.text).toBe("Wait");
+      expect(ownerChoiceAnswer(block, answers.slice(0, 2))).toBeNull();
+    });
   });
-
-  it("allows a poll only with options, a single pick with one of the two, a multi pick with either", () => {
-    const poll = choice("poll", false);
-    expect(canSendChoice(poll, ["yes"], "")).toBe(true);
-    expect(canSendChoice(poll, ["yes"], "maybe")).toBe(false);
-    expect(canSendChoice(poll, [], "maybe")).toBe(false);
-
-    const single = choice("pick", false);
-    expect(canSendChoice(single, ["yes"], "")).toBe(true);
-    expect(canSendChoice(single, [], "Wait")).toBe(true);
-    expect(canSendChoice(single, ["yes"], "Wait")).toBe(false);
-    expect(canSendChoice(single, [], "   ")).toBe(false);
-    expect(canSendChoice(single, [], "")).toBe(false);
-
-    const multi = choice("pick", true);
-    expect(canSendChoice(multi, ["yes", "no"], "")).toBe(true);
-    expect(canSendChoice(multi, ["yes"], "and more")).toBe(true);
-    expect(canSendChoice(multi, [], "only words")).toBe(true);
-    expect(canSendChoice(multi, [], "  ")).toBe(false);
-  });
-
-  it("finds only the owner's answer on this block", () => {
-    const block = choice("pick", false);
-    const at = "2026-10-27T10:00:00.000Z";
-    const answers = [
-      { blockId: "other", by: { _tag: "owner" as const }, choice: ["yes"], text: null, at },
-      {
-        blockId: "q1",
-        by: { _tag: "evaluator" as const, threadId: ThreadId.make("t1") },
-        choice: ["no"],
-        text: null,
-        at,
-      },
-      { blockId: "q1", by: { _tag: "owner" as const }, choice: [], text: "Wait", at },
-    ];
-    expect(ownerChoiceAnswer(block, answers)?.text).toBe("Wait");
-    expect(ownerChoiceAnswer(block, answers.slice(0, 2))).toBeNull();
-  });
-});
 });

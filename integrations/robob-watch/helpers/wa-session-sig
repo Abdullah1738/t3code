@@ -1,8 +1,9 @@
-#!/bin/zsh
+#!/bin/zsh -f
 # wa-session-sig JID   prints a hash of the Signal session rows for that contact (phone JID and its LID), or for a
 # group (...@g.us) of its sender-key rows. An incoming message advances the ratchet, so the hash changes; a local
 # sqlite read, no TUI. Prints nothing (exit 1) if the store can't be read.
 set -u
+setopt extended_glob
 jid=${1:?usage: wa-session-sig JID}; id=${jid%%@*}
 DB="$HOME/Library/Application Support/whatscli/session.db"
 if [[ $jid == *@g.us ]]; then

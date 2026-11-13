@@ -45,6 +45,10 @@ import {
 } from "../connection/model.ts";
 
 export interface AuthorizedRemoteEnvironment {
+  readonly verifiedDescriptor?: {
+    readonly httpBaseUrl: string;
+    readonly descriptor: import("@t3tools/contracts").ExecutionEnvironmentDescriptor;
+  };
   readonly environmentId: EnvironmentId;
   readonly label: string;
   readonly httpBaseUrl: string;
@@ -200,6 +204,7 @@ export const make = Effect.gen(function* () {
         Effect.provideService(HttpClient.HttpClient, httpClient),
       );
       return {
+        verifiedDescriptor: { httpBaseUrl: input.httpBaseUrl, descriptor },
         environmentId: descriptor.environmentId,
         label: descriptor.label,
         httpBaseUrl: input.httpBaseUrl,

@@ -1,3 +1,5 @@
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import { vi } from "vite-plus/test";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { AuthStandardClientScopes, EnvironmentId } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
@@ -984,3 +986,26 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
     }).pipe(Effect.provide(Layer.mergeAll(layerSessionStore(), SqlitePersistence.layerMemory))),
   );
 });
+
+it.effect("does not let reader queue time extend session or websocket expiry", () =>
+  Effect.gen(function* () {
+    const sessions = yield* SessionStore.SessionStore;
+    const original = NodeSqliteClient.authReadOnly;
+    const spy = vi
+      .spyOn(NodeSqliteClient, "authReadOnly")
+      .mockImplementation(<A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        original(effect).pipe(Effect.tap(() => TestClock.adjust(Duration.seconds(2)))),
+      );
+    yield* Effect.gen(function* () {
+      const issued = yield* sessions.issue({ ttl: Duration.seconds(1) });
+      const error = yield* sessions.verify(issued.token).pipe(Effect.flip);
+      expect(error._tag).toBe("SessionTokenExpiredError");
+      const parent = yield* sessions.issue({ ttl: Duration.hours(1) });
+      const ws = yield* sessions.issueWebSocketToken(parent.sessionId, {
+        ttl: Duration.seconds(1),
+      });
+      const wsError = yield* sessions.verifyWebSocketToken(ws.token).pipe(Effect.flip);
+      expect(wsError._tag).toBe("WebSocketTokenExpiredError");
+    }).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+  }).pipe(Effect.provide(layerSessionStore().pipe(Layer.provideMerge(NodeServices.layer))), Effect.scoped),
+);

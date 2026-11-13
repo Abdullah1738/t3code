@@ -1,0 +1,76 @@
+{
+  "sourceBase": "d069f2795d",
+  "quint": "0.33.1",
+  "apalache": "0.62.4",
+  "fastCheck": "4.10.2",
+  "node": "24.22.1",
+  "java": "21.0.12.1",
+  "maxSteps": 10,
+  "simulationSamples": 10000,
+  "seed": 20261108,
+  "conformanceRuns": 100,
+  "modelChecks": [
+    {
+      "spec": "restart",
+      "step": "step",
+      "invariant": "invariant",
+      "expectedFailure": false,
+      "status": 0,
+      "ok": true
+    },
+    {
+      "spec": "commands",
+      "step": "step",
+      "invariant": "invariant",
+      "expectedFailure": false,
+      "status": 0,
+      "ok": true
+    },
+    {
+      "spec": "boards",
+      "step": "step",
+      "invariant": "invariant",
+      "expectedFailure": false,
+      "status": 0,
+      "ok": true
+    },
+    {
+      "spec": "restart",
+      "step": "step",
+      "invariant": "preparationContinues",
+      "expectedFailure": true,
+      "status": 1,
+      "ok": true
+    },
+    {
+      "spec": "commands",
+      "step": "stepCurrent",
+      "invariant": "currentRecoverable",
+      "expectedFailure": true,
+      "status": 1,
+      "ok": true
+    },
+    {
+      "spec": "sync",
+      "step": "step",
+      "invariant": "invariant",
+      "expectedFailure": false,
+      "status": 0,
+      "ok": true
+    },
+    {
+      "spec": "restart",
+      "step": "step",
+      "invariant": "nativePreparationContinues",
+      "expectedFailure": true,
+      "status": 1,
+      "ok": true
+    }
+  ],
+  "specSha256": {
+    "commands.qnt": "5d8aaeb507fbf3a26e802c9c91ce8e655bf723e76b2f2d4355a0459f32cd09bf",
+    "sync.qnt": "c53cee311c7054811783a60a382b59ba34623dca4f858f2121a637c5b7f54aee",
+    "boards.qnt": "3cdd59749205c5af43bf4fcae40a1471017244ae20cc9d26b28757f3dbbe9f5e",
+    "restart.qnt": "192c254638096be3fed3267e0c47e5f57c1646617da8953790a1aa93311f4a00"
+  }
+}

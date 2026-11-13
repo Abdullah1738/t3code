@@ -1,3 +1,4 @@
+import type { DeferredShellSnapshot } from "./shellPullRequests.ts";
 import { describe, expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
@@ -36,6 +37,7 @@ import * as RpcHttp from "../rpc/http.ts";
 import * as PullRequestDiffLoader from "./pullRequestDiffHttp.ts";
 import { withOrchestrationProtocolHeader } from "./environmentHttpAuth.ts";
 import { fetchEnvironmentSessionState } from "./session.ts";
+import * as ShellSnapshotHttp from "./shellSnapshotHttp.ts";
 import { fetchEnvironmentShellSnapshot } from "./shellSnapshotHttp.ts";
 import * as ThreadSnapshotLoader from "./threadSnapshotHttp.ts";
 import { fetchEnvironmentThreadTranscript } from "./threadTranscriptHttp.ts";
@@ -304,15 +306,187 @@ describe("authenticated environment HTTP requests", () => {
             },
           }),
         );
-        const snapshot = yield* fetchEnvironmentShellSnapshot(harness.input).pipe(
-          Effect.provide(harness.httpLayer),
-        );
+        const published: Array<DeferredShellSnapshot> = [];
+        const snapshot = yield* fetchEnvironmentShellSnapshot({
+          ...harness.input,
+          onPage: (page) =>
+            Effect.sync(() => {
+              // Publishing precedes even the second HTTP request.
+              expect(harness.calls).toHaveLength(1);
+              published.push(page);
+            }),
+        }).pipe(Effect.provide(harness.httpLayer));
+        expect(published).toHaveLength(1);
+        expect(published[0]?.page?.nextAfter).toBe("thread:a");
         expect(snapshot.snapshotSequence).toBe(4);
-        expect("page" in snapshot).toBe(false);
+        expect(snapshot.page?.nextAfter).toBeNull();
         expect(harness.calls).toHaveLength(2);
         expect(new URL(harness.calls[1]!.url).searchParams.get("after")).toBe("thread:a");
         expect(harness.proofs[1]!.url).toBe(harness.calls[1]!.url);
       }),
+  );
+
+  const shellPage = (sequence: number, after: string | null, nextAfter: string | null) =>
+    Response.json({ ...SHELL, snapshotSequence: sequence, page: { after, nextAfter } });
+
+  it.effect("asks again for a timed-out shell page instead of dropping the load", () =>
+    Effect.gen(function* () {
+      const secondAsked = Promise.withResolvers<void>();
+      const harness = makeHarness((number) => {
+        if (number === 1) return shellPage(4, null, "thread:a");
+        if (number === 2) {
+          secondAsked.resolve();
+          return new Promise<Response>(() => {});
+        }
+        return shellPage(5, "thread:a", null);
+      });
+      const pending = yield* fetchEnvironmentShellSnapshot({
+        ...harness.input,
+        timeoutMs: 100,
+      }).pipe(Effect.provide(harness.httpLayer), Effect.forkChild);
+      yield* Effect.promise(() => secondAsked.promise);
+      yield* TestClock.adjust(100);
+      const snapshot = yield* Fiber.join(pending);
+      expect(snapshot.page?.nextAfter).toBeNull();
+      expect(snapshot.snapshotSequence).toBe(4);
+      expect(harness.calls.map((call) => new URL(call.url).searchParams.get("after"))).toEqual([
+        null,
+        "thread:a",
+        "thread:a",
+      ]);
+    }),
+  );
+
+  it.effect("does not repeat a shell page that failed for a reason other than time", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness((number) =>
+        number === 1
+          ? shellPage(4, null, "thread:a")
+          : Response.json({ error: "bad_gateway" }, { status: 502 }),
+      );
+      const error = yield* fetchEnvironmentShellSnapshot(harness.input).pipe(
+        Effect.provide(harness.httpLayer),
+        Effect.flip,
+      );
+      expect(error).toMatchObject({ _tag: "RemoteEnvironmentAuthUndeclaredStatusError" });
+      expect(harness.calls).toHaveLength(2);
+    }),
+  );
+
+  it.effect("continues a shell load from its last delivered cursor", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness(() => shellPage(9, "thread:a", null));
+      const first = {
+        ...SHELL,
+        snapshotSequence: 2,
+        page: { after: null, nextAfter: "thread:a" },
+      } as DeferredShellSnapshot;
+      const snapshot = yield* fetchEnvironmentShellSnapshot({
+        ...harness.input,
+        resume: { pages: [first], nextAfter: "thread:a", updatedAt: 0 },
+      }).pipe(Effect.provide(harness.httpLayer));
+      expect(harness.calls).toHaveLength(1);
+      expect(new URL(harness.calls[0]!.url).searchParams.get("after")).toBe("thread:a");
+      // The replay boundary stays the first page's.
+      expect(snapshot.snapshotSequence).toBe(2);
+      expect(snapshot.page).toEqual({ after: null, nextAfter: null });
+    }),
+  );
+
+  it.effect("keeps an interrupted shell load's progress for the next load while fresh", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness((number) => {
+        switch (number) {
+          case 1:
+            return shellPage(4, null, "thread:a");
+          case 2:
+            return Response.json({ error: "bad_gateway" }, { status: 502 });
+          case 3:
+            return shellPage(6, "thread:a", null);
+          case 4:
+            return shellPage(7, null, "thread:b");
+          case 5:
+            return Response.json({ error: "bad_gateway" }, { status: 502 });
+          default:
+            return shellPage(8, null, null);
+        }
+      });
+      const signer = Option.getOrThrow(harness.input.signer);
+      const loader = yield* ShellSnapshotHttp.ShellSnapshotLoader.pipe(
+        Effect.provide(
+          ShellSnapshotHttp.layer.pipe(
+            Layer.provide(harness.httpLayer),
+            Layer.provide(Layer.succeed(ManagedRelay.ManagedRelayDpopSigner, signer)),
+            Layer.provide(
+              Layer.succeed(
+                RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization,
+                harness.remoteAuthorization,
+              ),
+            ),
+          ),
+        ),
+      );
+      const afters = () => harness.calls.map((call) => new URL(call.url).searchParams.get("after"));
+
+      expect(Option.isNone(yield* loader.load(PREPARED))).toBe(true);
+      const resumed = yield* loader.load(PREPARED);
+      expect(afters()).toEqual([null, "thread:a", "thread:a"]);
+      expect(Option.getOrThrow(resumed).snapshotSequence).toBe(4);
+
+      // A completed load leaves nothing to resume; stale progress is not reused.
+      expect(Option.isNone(yield* loader.load(PREPARED))).toBe(true);
+      expect(afters().slice(3)).toEqual([null, "thread:b"]);
+      yield* TestClock.adjust(ShellSnapshotHttp.SHELL_LOAD_RESUME_MAX_AGE_MS + 1);
+      yield* loader.load(PREPARED);
+      expect(afters().slice(5)).toEqual([null]);
+    }),
+  );
+
+  it.effect("keeps saved shell progress when a resumed load fails before its next page", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness((number) =>
+        number === 1
+          ? shellPage(4, null, "thread:a")
+          : number >= 4
+            ? shellPage(6, number === 4 ? "thread:a" : null, null)
+            : Response.json({ error: "bad_gateway" }, { status: 502 }),
+      );
+      const signer = Option.getOrThrow(harness.input.signer);
+      const loaderLayer = ShellSnapshotHttp.layer.pipe(
+        Layer.provide(harness.httpLayer),
+        Layer.provide(Layer.succeed(ManagedRelay.ManagedRelayDpopSigner, signer)),
+        Layer.provide(
+          Layer.succeed(
+            RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization,
+            harness.remoteAuthorization,
+          ),
+        ),
+      );
+      const loader = yield* ShellSnapshotHttp.ShellSnapshotLoader.pipe(Effect.provide(loaderLayer));
+      const calls = () =>
+        harness.calls.map((call) => {
+          const params = new URL(call.url).searchParams;
+          return [params.get("after"), params.get("omitIdleSubagents")];
+        });
+
+      expect(Option.isNone(yield* loader.load(PREPARED))).toBe(true);
+      // The resumed request fails too; the cursor must survive it.
+      expect(Option.isNone(yield* loader.load(PREPARED))).toBe(true);
+      expect(Option.isSome(yield* loader.load(PREPARED))).toBe(true);
+      // The web client opts in to leaving out long-idle subagents; mobile sends nothing.
+      const resumed = yield* loader
+        .load(PREPARED)
+        .pipe(Effect.provideService(ShellSnapshotHttp.OmitIdleSubagents, true));
+      expect(Option.isNone(resumed)).toBe(false);
+      expect(calls()).toEqual([
+        [null, null],
+        ["thread:a", null],
+        ["thread:a", null],
+        ["thread:a", null],
+        // Opted-in loads keep their own progress: a different row set restarts from page one.
+        [null, "true"],
+      ]);
+    }),
   );
 
   it.effect.each(LOADERS)("uses current relay authorization and endpoint for $name", (loader) =>

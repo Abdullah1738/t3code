@@ -374,6 +374,14 @@ export class ProviderAdapterProtocolError extends Schema.TaggedError<ProviderAda
     driver: ProviderDriverKind,
     detail: Schema.String,
     reason: Schema.optional(ProviderAdapterFailureReason),
+    activeTurn: Schema.optional(
+      Schema.Struct({
+        runId: RunId,
+        attemptId: RunAttemptId,
+        providerThreadId: ProviderThreadId,
+        providerTurnId: ProviderTurnId,
+      }),
+    ),
     cause: Schema.optional(Schema.Defect()),
     payload: Schema.optional(Schema.Unknown),
   },
@@ -591,6 +599,8 @@ export interface ProviderAdapterV2SessionRuntime {
    * thread keeps showing Waiting.
    */
   readonly backgroundTasksEndWithProcess?: true;
+  /** Observes process exit without stopping it; shared sessions may have unrelated live owners. */
+  readonly awaitSessionExit?: Effect.Effect<void, ProviderAdapterV2Error>;
   readonly getModelContextWindow?: (
     modelSelection: ModelSelection,
     cwd?: string | null,
@@ -624,6 +634,11 @@ export interface ProviderAdapterV2SessionRuntime {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly taskId: string;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;
+  readonly interruptStartingRun?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+    readonly runId: RunId;
+    readonly attemptId: RunAttemptId;
+  }) => Effect.Effect<void, ProviderAdapterV2Error>;
   readonly interruptTurn: (
     input: ProviderAdapterV2InterruptInput,
   ) => Effect.Effect<void, ProviderAdapterV2Error>;
@@ -633,6 +648,10 @@ export interface ProviderAdapterV2SessionRuntime {
     /** A delayed Stop must not interrupt a task resumed after this request. */
     readonly requestedAt?: NonNullable<OrchestrationV2Subagent["startedAt"]>;
   }) => Effect.Effect<void | ProviderAdapterV2SubagentOutcome, ProviderAdapterV2Error>;
+  readonly listLoadedNativeThreads?: () => Effect.Effect<
+    ReadonlyArray<string>,
+    ProviderAdapterV2Error
+  >;
   readonly unloadThread?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;

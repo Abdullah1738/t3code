@@ -55,7 +55,7 @@ export const toOperationError = (
   if (cause instanceof Error && cause.name === "TimeoutError") {
     return new ServerBrowserOperationError(
       "PreviewAutomationTimeoutError",
-      firstLine,
+      message.slice(0, 500),
       timeoutMs === undefined ? undefined : { timeoutMs },
     );
   }
@@ -190,8 +190,78 @@ const pageChanged = () =>
 const tooBusy = () =>
   new ServerBrowserOperationError(
     "PreviewAutomationTimeoutError",
-    "The page was too busy to capture a snapshot in time. Wait for it to settle and take another snapshot.",
+    "Snapshot could not read every frame safely within 10000ms. The renderer or a child frame did not answer.",
+    { timeoutMs: SNAPSHOT_TIMEOUT_MS },
   );
+
+/** Bounds one browser stage without letting a late reply start the next stage. */
+export const within = async <A>(
+  work: Promise<A>,
+  timeoutMs: number,
+  reason: string,
+): Promise<A> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new ServerBrowserOperationError(
+            "PreviewAutomationTimeoutError",
+            `${reason} (cutoff ${timeoutMs}ms).`,
+            { timeoutMs },
+          ),
+        ),
+      timeoutMs,
+    );
+  });
+  return Promise.race([work, expired])
+    .catch((cause: unknown) => {
+      if (cause instanceof Error && cause.name === "TimeoutError")
+        throw new ServerBrowserOperationError(
+          "PreviewAutomationTimeoutError",
+          `${reason} (cutoff ${timeoutMs}ms). ${cause.message.split("\n")[0]}`,
+          { timeoutMs },
+        );
+      throw cause;
+    })
+    .finally(() => clearTimeout(timer));
+};
+
+/** Two animation frames let the layout change reach the compositor before copying pixels. */
+export const waitForPaint = async (cdp: CDPSession, signal?: AbortSignal) => {
+  const controller = new AbortController();
+  const check = () => {
+    controller.signal.throwIfAborted();
+    signal?.throwIfAborted();
+  };
+  const paint = async () => {
+    check();
+    const { frameTree } = await cdp.send("Page.getFrameTree");
+    check();
+    const { executionContextId } = await cdp.send("Page.createIsolatedWorld", {
+      frameId: frameTree.frame.id,
+      worldName: "t3-preview-paint",
+    });
+    check();
+    const { result, exceptionDetails } = await cdp.send("Runtime.evaluate", {
+      expression:
+        "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))",
+      contextId: executionContextId,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    if (exceptionDetails || result.value !== true) throw pageChanged();
+  };
+  try {
+    await within(
+      paint(),
+      2_000,
+      "No fresh paint from the preview tab; its background surface or renderer did not answer",
+    );
+  } finally {
+    controller.abort();
+  }
+};
 
 const VALUE_TOO_LONG = "A password field holds a value too long to hide, so no snapshot was taken.";
 
@@ -386,6 +456,22 @@ const pngSize = (base64: string) => {
   return { width: header.readUInt32BE(16), height: header.readUInt32BE(20) };
 };
 
+const desktopViewportOf = (value: unknown) => {
+  if (typeof value !== "object" || value === null) return undefined;
+  const viewport = (value as { t3Viewport?: unknown }).t3Viewport;
+  if (typeof viewport !== "object" || viewport === null) return undefined;
+  const fields = viewport as { mode?: unknown; width?: unknown; height?: unknown };
+  return typeof fields.mode === "string" &&
+    typeof fields.width === "number" &&
+    Number.isFinite(fields.width) &&
+    fields.width > 0 &&
+    typeof fields.height === "number" &&
+    Number.isFinite(fields.height) &&
+    fields.height > 0
+    ? { mode: fields.mode, width: fields.width, height: fields.height }
+    : undefined;
+};
+
 /**
  * A page's display ratio and CSS viewport, read in an isolated world since page script can
  * reassign `devicePixelRatio`, `innerWidth`, and `innerHeight` in its own, and its page zoom.
@@ -396,7 +482,8 @@ export const readPageMetrics = async (cdp: CDPSession) => {
     frameId: frameTree.frame.id,
     worldName: "t3-preview-metrics",
   });
-  let { cssVisualViewport } = await cdp.send("Page.getLayoutMetrics");
+  let layout = await cdp.send("Page.getLayoutMetrics");
+  let { cssVisualViewport } = layout;
   // Desktop zoom applies asynchronously; bracket the CSS metrics to reject a torn read.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const zoom = cssVisualViewport.zoom ?? 1;
@@ -405,14 +492,22 @@ export const readPageMetrics = async (cdp: CDPSession) => {
       contextId: executionContextId,
       returnByValue: true,
     });
-    ({ cssVisualViewport } = await cdp.send("Page.getLayoutMetrics"));
+    layout = await cdp.send("Page.getLayoutMetrics");
+    ({ cssVisualViewport } = layout);
     if ((cssVisualViewport.zoom ?? 1) === zoom) {
       const { ratio, width, height } = result.value as {
         readonly ratio: number;
         readonly width: number;
         readonly height: number;
       };
-      return { ratio, width, height, zoom };
+      const desktopViewport = desktopViewportOf(layout);
+      return {
+        ratio,
+        width,
+        height,
+        zoom,
+        ...(desktopViewport === undefined ? {} : { desktopViewport }),
+      };
     }
   }
   throw new Error(
@@ -420,12 +515,64 @@ export const readPageMetrics = async (cdp: CDPSession) => {
   );
 };
 
+/** Desktop bounds are published before its guest receives the resize. */
+export const waitForViewport = async (
+  cdp: CDPSession,
+  expected: { readonly width: number; readonly height: number } | null,
+  requireFill = false,
+) => {
+  const deadline = Date.now() + 2_000;
+  for (;;) {
+    const remaining = Math.max(1, deadline - Date.now());
+    const metrics = await within(
+      readPageMetrics(cdp),
+      remaining,
+      "Preview resize did not apply in the renderer",
+    );
+    const viewport = {
+      width: metrics.width,
+      height: metrics.height,
+    };
+    const desired = expected ?? (requireFill ? metrics.desktopViewport : undefined);
+    const acknowledged = !requireFill || metrics.desktopViewport?.mode === "fill";
+    if (
+      acknowledged &&
+      (!desired || (viewport.width === desired.width && viewport.height === desired.height))
+    ) {
+      await waitForPaint(cdp);
+      const applied = await within(
+        readPageMetrics(cdp),
+        Math.max(1, deadline - Date.now()),
+        "Preview resize metrics did not answer after paint",
+      );
+      const appliedDesired = expected ?? (requireFill ? applied.desktopViewport : undefined);
+      if (
+        (requireFill && applied.desktopViewport?.mode !== "fill") ||
+        (appliedDesired &&
+          (applied.width !== appliedDesired.width || applied.height !== appliedDesired.height))
+      )
+        continue;
+      return { width: applied.width, height: applied.height };
+    }
+    if (Date.now() >= deadline)
+      throw new ServerBrowserOperationError(
+        "PreviewAutomationTimeoutError",
+        `Preview resize did not apply within 2000ms: requested ${expected ? `${expected.width}x${expected.height}` : "fill (waiting for desktop layout acknowledgment)"}, renderer is ${viewport.width}x${viewport.height}.`,
+        { timeoutMs: 2_000 },
+      );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+};
+
 // Never pass a clip scale: Chromium mirrors the top-left of the page into a `backdrop-filter`
 // in any capture it shrinks.
 export const captureViewport = async (
   cdp: CDPSession,
   options: { readonly format: "png" | "jpeg"; readonly quality?: number },
+  signal?: AbortSignal,
 ) => {
+  await waitForPaint(cdp, signal);
+  signal?.throwIfAborted();
   const { data } = await cdp.send("Page.captureScreenshot", {
     format: options.format,
     ...(options.quality === undefined ? {} : { quality: options.quality }),
@@ -475,6 +622,8 @@ type SnapshotInput = {
   readonly cdp: CDPSession;
   /** Headless pages render at the scale the server set; a desktop page at its display's. */
   readonly renderScale: number | "display";
+  readonly captureImage?: boolean;
+  readonly signal?: AbortSignal;
   readonly consoleEntries: ReadonlyArray<PreviewAutomationConsoleEntry>;
   readonly networkEntries: ReadonlyArray<PreviewAutomationNetworkEntry>;
   readonly actionTimeline: PreviewAutomationSnapshot["actionTimeline"];
@@ -501,36 +650,73 @@ const capture = async (
   input: SnapshotInput,
   deadline: number,
 ): Promise<PreviewAutomationSnapshot> => {
-  const { renderScale, viewport } = await renderingOf(input);
+  const { renderScale, viewport } =
+    input.captureImage === false
+      ? { renderScale: 1, viewport: { width: 0, height: 0 } }
+      : await within(
+          renderingOf(input),
+          2_000,
+          "Snapshot viewport metrics did not answer; renderer may be busy",
+        );
   // A late metrics reply must not begin a capture after viewers have resumed.
   if (Date.now() >= deadline) throw tooBusy();
   const scale = Math.min(1, MAX_SCREENSHOT_WIDTH / (viewport.width * renderScale));
   const state = refsFor(input.page);
   invalidateRefs(input.page);
   const generation = state.generation;
-  const { readers, read } = await openReaders(input.page, input.cdp);
-  const before = await read();
+  const { readers, read } = await within(
+    openReaders(input.page, input.cdp),
+    2_000,
+    "Snapshot could not attach to page frames",
+  );
+  const before = await within(
+    read(),
+    2_000,
+    "Snapshot document safety read did not answer; renderer may be busy",
+  );
   // Taken between the reads, so a value that changes during either fails the comparison.
-  // Awaited after the tree: a capture that fails has finished its tree before a retry starts.
+  // Observe both branches immediately so a failed pixel read is not hidden by a stuck tree.
   const pageAndScreenshot = Promise.all([
-    input.page.evaluate(SNAPSHOT_SCRIPT) as Promise<
-      Pick<
-        PreviewAutomationSnapshot,
-        "url" | "title" | "loading" | "visibleText" | "interactiveElements"
-      >
-    >,
-    captureViewport(input.cdp, { format: "png" }).then((png) =>
-      scale < 1 ? shrinkPng(input.cdp, png, scale) : png,
+    within(
+      input.page.evaluate(SNAPSHOT_SCRIPT) as Promise<
+        Pick<
+          PreviewAutomationSnapshot,
+          "url" | "title" | "loading" | "visibleText" | "interactiveElements"
+        >
+      >,
+      2_000,
+      "Snapshot document state did not answer; renderer may be busy",
     ),
+    input.captureImage === false
+      ? Promise.resolve(undefined)
+      : within(
+          captureViewport(input.cdp, { format: "png" }, input.signal).then((png) => {
+            input.signal?.throwIfAborted();
+            return scale < 1 ? shrinkPng(input.cdp, png, scale) : png;
+          }),
+          4_000,
+          "Snapshot pixels did not arrive; background paint or the screenshot queue is stalled",
+        ),
   ]);
   void pageAndScreenshot.catch(constVoid);
   // Leaves time for the second read; a frame that never loads holds the tree until then.
-  const tree = await input.page.ariaSnapshot({
-    mode: "ai",
-    boxes: true,
-    timeout: Math.max(1, deadline - Date.now() - 2_000),
-  });
-  const after = await read(before);
+  const [tree, [page, data]] = await Promise.all([
+    within(
+      input.page.ariaSnapshot({
+        mode: "ai",
+        boxes: true,
+        timeout: Math.max(1, deadline - Date.now() - 2_000),
+      }),
+      Math.max(1, deadline - Date.now() - 2_000),
+      "Snapshot accessibility tree did not answer; document or child frame is still loading or busy",
+    ),
+    pageAndScreenshot,
+  ]);
+  const after = await within(
+    read(before),
+    2_000,
+    "Snapshot final document safety read did not answer",
+  );
   // A value that changed meanwhile may be in the tree under neither reading.
   if (after.some((values, i) => values && JSON.stringify(values) !== JSON.stringify(before[i])))
     throw pageChanged();
@@ -546,7 +732,7 @@ const capture = async (
     void iframe.dispose().catch(constVoid);
     if (frame && unread.includes(frame)) throw tooBusy();
   }
-  const [page, data] = await pageAndScreenshot;
+  if (Date.now() >= deadline) throw tooBusy();
   if (state.generation !== generation) throw pageChanged();
   const mask = (text: string) => (dotted ? text.replace(dotted, MASKED_VALUE) : text);
   const accessibilityTree = (dotted ? maskTree(tree, dotted) : tree)
@@ -565,11 +751,15 @@ const capture = async (
     consoleEntries: [...input.consoleEntries],
     networkEntries: [...input.networkEntries],
     actionTimeline: [...input.actionTimeline],
-    screenshot: {
-      mimeType: "image/png",
-      data,
-      ...pngSize(data),
-    },
+    ...(data === undefined
+      ? {}
+      : {
+          screenshot: {
+            mimeType: "image/png" as const,
+            data,
+            ...pngSize(data),
+          },
+        }),
   };
 };
 
@@ -578,6 +768,8 @@ const snapshotTurns = new WeakMap<Page, number>();
 
 export const snapshot = async (input: SnapshotInput): Promise<PreviewAutomationSnapshot> => {
   const deadline = Date.now() + SNAPSHOT_TIMEOUT_MS;
+  const controller = new AbortController();
+  const captureInput = { ...input, signal: controller.signal };
   let timer: ReturnType<typeof setTimeout> | undefined;
   const expired = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(tooBusy()), SNAPSHOT_TIMEOUT_MS);
@@ -587,11 +779,12 @@ export const snapshot = async (input: SnapshotInput): Promise<PreviewAutomationS
   // A page that changed mid-capture, like one rotating ads, has usually settled by a second
   // try. None starts late or after another snapshot began, since it would revoke the refs of
   // whichever snapshot came next.
-  const captured = capture(input, deadline).catch((cause: unknown) =>
+  const captured = capture(captureInput, deadline).catch((cause: unknown) =>
     Date.now() < deadline &&
     snapshotTurns.get(input.page) === turn &&
-    !(cause instanceof Error && cause.message === VALUE_TOO_LONG)
-      ? capture(input, deadline)
+    cause instanceof ServerBrowserOperationError &&
+    cause.message === pageChanged().message
+      ? capture(captureInput, deadline)
       : Promise.reject(cause),
   );
   try {
@@ -599,6 +792,7 @@ export const snapshot = async (input: SnapshotInput): Promise<PreviewAutomationS
   } catch (cause) {
     throw cause instanceof Error && cause.name === "TimeoutError" ? tooBusy() : cause;
   } finally {
+    controller.abort();
     clearTimeout(timer);
   }
 };

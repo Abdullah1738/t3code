@@ -156,7 +156,8 @@ class RecurringFailureTests(FollowFixture):
     def test_lost_status_still_returns_none_for_recovery(self):
         def attach(box, pid, o, e, **kw):
             raise OSError("connection reset")
-        self.assertIsNone(self.follow(attach, ended(None, status="lost")))
+        with patch.object(runs, 'confirmed_lost', return_value=ended(None, status='lost')):
+            self.assertIsNone(self.follow(attach, ended(None, status="lost")))
 
 
 class ReconnectAndHeartbeatTests(FollowFixture):

@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1342,6 +1343,77 @@ test("a background run's answer before two steered texts reaches the chat along 
 });
 
 
+test.each([0, 94, 95, 99, 100, 101, 250].flatMap(count =>
+  ["available", "unavailable", "question", "permission"].map(child => ({ count, child })),
+))("owned late-steer replies cross the real backend page boundary ($count narration records, child $child)", async ({ count, child }) => {
+  const start = Date.now();
+  setSystemTime(start);
+  const control = fakeControl();
+  const backend = control.backend();
+  const chat = await backend.createChat();
+  const promptId = (id: string) => `msg_${createHash("sha256").update(id).digest("hex")}`;
+  await backend.prompt(chat.id, chat.directory, promptId("third"), "Third question");
+  control.reply(chat.id, "Third answer", "completed");
+  await backend.prompt(chat.id, chat.directory, promptId("second"), "Second question");
+  const thread = control.threads.get(chat.id)!;
+  thread.driver = { instanceId: "codex", model: "test" };
+  for (let i = 0; i < count; i++) thread.messages.push({
+    messageId: `narration-${i}`, runId: thread.runs.at(-1)!.runId, role: "assistant", phase: "narration", text: "Working", streaming: false,
+    createdAt: new Date(start + 1_000 + i).toISOString(), updatedAt: new Date(start + 1_000 + i).toISOString(),
+  });
+  setSystemTime(start + 2_000);
+  control.reply(chat.id, "Second answer", "completed");
+  const asking = child === "question" || child === "permission";
+  const delegated: Thread = { ...thread, threadId: "page-child", parentThreadId: chat.id, runtimeMode: "approval-required",
+    runs: [{ runId: "child-run", ordinal: 1, status: "running" }], messages: [], pending: child === "question" ? [{
+      requestId: "page-question", kind: "question", requestKind: "user_input", canRespond: true,
+      questions: [{ id: "choice", header: "Pick", question: "Which option?", options: [{ label: "A" }, { label: "B" }] }],
+    }] : child === "permission" ? [{
+      requestId: "page-permission", kind: "approval", requestKind: "command", title: "bash", prompt: "git status", canRespond: true,
+    }] : [] };
+  control.threads.set(delegated.threadId, delegated);
+  if (child === "unavailable") backend.children = async () => { throw new Error("child listing unavailable"); };
+  if (asking) {
+    const messages = backend.messages.bind(backend);
+    let firstPage = true;
+    backend.messages = async (id, directory, options) => {
+      const records = await messages(id, directory, options);
+      if (firstPage && options?.until === promptId("second")) {
+        firstPage = false;
+        return records.filter(record => record.id === promptId("second"));
+      }
+      return records;
+    };
+  }
+  const store = new Store(":memory:");
+  stores.push(store);
+  for (const id of ["second", "third"]) {
+    store.acceptInbound(id, { id, text: `${id} question`, attachments: [], isAudioMessage: false, receivedAt: start });
+    store.updateInbound(id, "done");
+  }
+  store.set("route", { ...chat, generation: 1 });
+  store.set("batch:second", { id: "second", text: "Second question", batchIds: ["second"], attachments: [], isAudioMessage: false, receivedAt: start });
+  store.set("activeTurn", { ...chat, generation: 1, inboundId: "second", messageId: promptId("second"), startedAt: start, phase: "running", steered: [promptId("third")], steeredAt: start });
+  const router = new Router(store, backend, { async typing() {}, async read() {}, async downloadAttachment() { throw new Error("Unexpected file"); } }, {
+    owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/imessage", alertSkillPath: "/test/telegram", alertSocketPath: "/test/telegram.sock", openCodeConfigRoot: "/nonexistent/opencode-config",
+  });
+  setSystemTime(start + 120_000);
+  await router.tick();
+  if (asking) {
+    const requests = store.pendingOutbox().filter(op => op.id.startsWith("request:"));
+    expect(requests).toHaveLength(1);
+    expect(await router.beforeSend(requests[0]!)).toBe("send");
+  }
+  await router.tick();
+  expect(store.pendingOutbox().filter(op => op.kind === "conversation").map(op => op.text)).toEqual(["Third answer", "Second answer"]);
+  if (asking) {
+    expect(store.get<object | null>("activeTurn")).toMatchObject({ background: true, origin: "request" });
+    expect(store.pendingOutbox().filter(op => op.id.startsWith("request:"))).toHaveLength(1);
+  } else expect(store.get<object | null>("activeTurn")).toBeNull();
+  expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(2);
+});
+
+
 function delegatedRouter() {
   const control = fakeControl();
   const backend = control.backend();
@@ -1499,5 +1571,5 @@ test.each([false, true])("an older busy run finishing without a later wake frees
   store.acceptInbound("next", { id: "next", text: "Next question", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() } satisfies NormalizedInbound);
   await router.tick();
   expect(control.calls.filter(call => call.path.endsWith("/send")).map(call => call.body.text)).toEqual(["Did it go through?", "Next question"]);
-  expect(inbounds(store)).toContainEqual({ id: "next", state: "processing" });
+  expect(inbounds(store)).toContainEqual({ id: "next", state: "done" });
 });

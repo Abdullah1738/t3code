@@ -145,6 +145,7 @@ export interface ThreadManagementSendInput {
   readonly attachments: ReadonlyArray<ChatAttachment>;
   readonly modelSelection?: ModelSelection;
   readonly mode: ThreadManagementSendMode;
+  readonly activeTurnOnly?: boolean;
   readonly createdBy: OrchestrationV2Actor;
   readonly creationSource: OrchestrationV2CreationSource;
   /** ardud: start the message on a fresh provider thread (context reset). */
@@ -184,6 +185,7 @@ export interface ThreadManagementInterruptInput {
   readonly threadId: ThreadId;
   readonly runId?: RunId;
   readonly attemptId?: RunAttemptId;
+  readonly delegatedTaskStall?: NonNullable<OrchestrationV2Run["delegatedTaskStall"]>;
   readonly reason?: string;
 }
 
@@ -354,7 +356,12 @@ export interface ThreadManagementServiceShape {
     readonly threadId: ThreadId;
     readonly itemId: TurnItemId;
   }) => Effect.Effect<OrchestrationV2GetTurnItemResult, Orchestrator.OrchestratorV2Error>;
-  readonly getThreadRecords: Orchestrator.OrchestratorV2["Service"]["getThreadRecords"];
+  readonly getThreadRecords: <K extends ProjectionRecordField>(
+    threadId: ThreadId,
+    fields: ReadonlyArray<K>,
+    filter?: ProjectionRecordFilter,
+    options?: { readonly projectionOnly: boolean },
+  ) => Effect.Effect<ProjectionRecords<K>, Orchestrator.OrchestratorV2Error>;
   readonly getThreadProjection: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2ThreadProjection, Orchestrator.OrchestratorV2Error>;
@@ -382,11 +389,15 @@ export interface ThreadManagementServiceShape {
   }) => Effect.Effect<OrchestrationV2ThreadProjection, ThreadManagementError>;
   readonly getShellSnapshot: (options?: {
     readonly location?: "active" | "archive";
+    /** Only these threads, read with one indexed IN list (control live lists). */
+    readonly threadIds?: ReadonlyArray<string>;
   }) => Effect.Effect<OrchestrationV2ThreadShellSnapshot, Orchestrator.OrchestratorV2Error>;
   readonly readShellSnapshot: (options?: {
     readonly location?: "active" | "archive";
     readonly afterThreadId?: string;
+    readonly recentFirst?: boolean;
     readonly limit?: number;
+    readonly omitIdleSubagents?: boolean;
   }) => Effect.Effect<
     Effect.Effect<OrchestrationV2ThreadShellSnapshot, Orchestrator.OrchestratorV2Error>,
     Orchestrator.OrchestratorV2Error
@@ -415,6 +426,7 @@ export interface ThreadManagementServiceShape {
    * just refuse a retry the project's settings no longer allow fresh.
    */
   readonly hasReceipt: (commandId: CommandId) => Effect.Effect<boolean>;
+  readonly getCommandReceipt: CommandReceiptStore.CommandReceiptStoreV2["Service"]["getByCommandId"];
   readonly waitForThread: (
     input: ThreadManagementWaitInput,
   ) => Effect.Effect<ThreadManagementWaitResult, ThreadManagementError>;
@@ -707,8 +719,6 @@ const make = Effect.gen(function* () {
     command: Extract<OrchestrationV2ServerCommand, { readonly type: "message.dispatch" }>,
     options: { readonly migrate: boolean; readonly cutoverComplete: boolean },
   ) {
-    yield* ensureCommandTranscripts(command);
-
     // Neither an accepted nor a rejected command may acquire new side effects
     // on replay, including when its id belongs to a different aggregate.
     const readReceipt = <A>(
@@ -728,6 +738,8 @@ const make = Effect.gen(function* () {
     if (Option.isSome(receipt)) return yield* orchestrator.dispatch(command);
     const projectReceipt = yield* readReceipt(receipts.getProjectByCommandId(command.commandId));
     if (Option.isSome(projectReceipt)) return yield* orchestrator.dispatch(command);
+
+    yield* ensureCommandTranscripts(command);
 
     if (options.cutoverComplete && command.modelSelection !== undefined) {
       const reason = postCutoverSelectionProblem(command.modelSelection);
@@ -1067,6 +1079,7 @@ const make = Effect.gen(function* () {
         dispatchMode = {
           type: input.mode === "steer" ? "steer_active" : "restart_active",
           targetRunId: steerableRun.id,
+          ...(input.mode === "steer" && input.activeTurnOnly ? { activeTurnOnly: true } : {}),
         };
       }
     } else if (input.mode === "auto" && steerableRun !== undefined) {
@@ -1303,6 +1316,9 @@ const make = Effect.gen(function* () {
         commandId: input.commandId,
         threadId: input.threadId,
         runId: interruptibleRun.id,
+        ...(input.delegatedTaskStall === undefined
+          ? {}
+          : { delegatedTaskStall: input.delegatedTaskStall }),
         ...(input.reason === undefined ? {} : { reason: input.reason }),
         ...(input.runId === undefined
           ? {}
@@ -1479,8 +1495,8 @@ const make = Effect.gen(function* () {
         Effect.andThen(orchestrator.getTurnItem(input)),
         Effect.map((item) => ({ item: item === null ? null : projectTurnItemForDetail(item) })),
       ),
-    getThreadRecords: (threadId, fields, filter) =>
-      ensureProjectionTranscript(threadId).pipe(
+    getThreadRecords: (threadId, fields, filter, options) =>
+      (options?.projectionOnly ? Effect.void : ensureProjectionTranscript(threadId)).pipe(
         Effect.andThen(orchestrator.getThreadRecords(threadId, fields, filter)),
       ),
     getThreadProjection,
@@ -1498,6 +1514,9 @@ const make = Effect.gen(function* () {
     assertProviderInstanceEnabled,
     isProviderInstanceEnabledForProject,
     hasReceipt,
+    getCommandReceipt: Effect.fn("ThreadManagementService.getCommandReceipt")(
+      receipts.getByCommandId,
+    ),
     waitForThread,
     settleAfterRun,
     settleThread,

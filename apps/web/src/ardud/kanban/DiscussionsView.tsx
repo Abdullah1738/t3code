@@ -122,8 +122,10 @@ function DraftRoom(props: {
           onSend={async (blocks) => {
             const text = blocks.find((block) => block._tag === "md")?.text ?? "";
             const firstFile = blocks.find((block) => block._tag === "attachment");
-            created.current ??= (
-              await kanban.createDiscussion(
+            // A failed post leaves the room it made here, so a retry posts into it, not a second one.
+            let discussionId = created.current;
+            if (discussionId === null) {
+              const room = await kanban.createDiscussion(
                 props.boardId,
                 requestTitle(
                   composerTitleSource(
@@ -131,9 +133,10 @@ function DraftRoom(props: {
                     firstFile?._tag === "attachment" ? [firstFile.attachment.name] : [],
                   ),
                 ),
-              )
-            ).id;
-            const discussionId = created.current;
+              );
+              discussionId = room.id;
+              created.current = discussionId;
+            }
             await kanban.post(props.boardId, discussionId, blocks);
             created.current = null;
             props.onOpenDiscussion(discussionId);

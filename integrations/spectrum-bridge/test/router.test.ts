@@ -12,7 +12,8 @@ import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type P
 type Assistant = Extract<MessageRecord, { type: "assistant" }>;
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import type { Message } from "@photon-ai/advanced-imessage/grpc";
-import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, OWNER_GIVE_UP_MS, OWNER_RESEND_MS, replyQuote, replyText, ROTATE_NUDGE, Router, SYNTHETIC_RETRY_MS, syntheticDropped, wakeGuidance } from "../src/router.ts";
+import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance } from "../src/router.ts";
+import { replyModeConfig } from "../src/config.ts";
 import { Store } from "../src/store.ts";
 import { RobobBackend } from "../src/robob.ts";
 import type { ThreadDetail } from "../src/control.ts";
@@ -30,6 +31,8 @@ const messageId = (id: string) => `msg_${createHash("sha256").update(id).digest(
 // Records follow OpenCode 2: one flat session-scoped list with no parent link,
 // where an `idle` marker closes the turn once execution settles.
 class Backend extends OpenChamber {
+  healthy = false;
+  override async health() { return { status: this.healthy ? "ok" : "down", timestamp: "", openchamberVersion: "test" }; }
   autoAccept = false;
   override async isSessionAutoAccepting() { return this.autoAccept; }
   creates: (string | undefined)[] = [];
@@ -350,7 +353,7 @@ test("a text sent mid-turn is steered into the running turn, never re-sent, and 
   h.input("in_2", "Also check the weather");
   await h.router.tick();
   expect(steers).toEqual([{ id: "ses_1", messageId: messageId("in_2"), text: "Also check the weather", guidance: expect.stringContaining("\"in_2\"") }]);
-  expect(h.store.pendingInbound().map(row => row.id)).toEqual(["in_1"]);
+  expect(h.store.pendingInbound().map(row => row.id)).toEqual([]);
   expect(h.store.get<{ steered?: string[] }>("activeTurn")!.steered).toEqual([messageId("in_2")]);
   const final = h.backend.final("Both answered");
   await h.router.tick();
@@ -601,7 +604,7 @@ const nativeContinuationCases = [
   { driver: "opencode", finish: undefined, phase: "unknown", continued: false },
   { driver: "claudeAgent", finish: "tool-calls", phase: "answer", continued: false },
 ] as const;
-test.each(nativeContinuationCases)("RobobBackend $driver step $finish / $phase continuation is $continued", async ({ driver, finish, phase, continued }) => {
+test.each([...nativeContinuationCases])("RobobBackend $driver step $finish / $phase continuation is $continued", async ({ driver, finish, phase, continued }) => {
   setSystemTime(earlyStart);
   const h = setup();
   h.input("in_early", "Check prices");
@@ -1010,6 +1013,41 @@ test("a steer the server refuses goes out once as its own turn after the current
   expect(steers).toHaveLength(1);
 });
 
+test("an uncertain steer is reconciled before another steer or fallback turn", async () => {
+  const h = setup();
+  const steers = steering(h.backend, async call => {
+    h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+    throw new Error("lost response");
+  });
+  h.input("first", "Work");
+  await h.router.tick();
+  h.input("followup", "Also this");
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("done");
+  h.backend.final("Both done");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.conversations().map(op => op.text)).toEqual(["Both done"]);
+});
+
+test("uncertain steer retains its route for reconciliation after the foreground turn closes", async () => {
+  const h = setup();
+  const steers = steering(h.backend, async () => { throw new Error("timeout"); });
+  h.input("first", "Work");
+  await h.router.tick();
+  h.input("followup", "Also this");
+  await h.router.tick();
+  h.store.set("activeTurn", null);
+  h.backend.records.push({ id: messageId("followup"), type: "user", text: "Also this", time: { created: Date.now() } });
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("done");
+});
+
 test("commands and watcher wakes mid-turn are never steered", async () => {
   const h = setup();
   const steers = steering(h.backend);
@@ -1020,7 +1058,7 @@ test("commands and watcher wakes mid-turn are never steered", async () => {
   await h.router.tick();
   await h.router.tick();
   expect(steers).toEqual([]);
-  expect(h.store.pendingInbound().map(row => row.id)).toEqual(["in_1", "wake:w1"]);
+  expect(h.store.pendingInbound().map(row => row.id)).toEqual(["wake:w1"]);
 });
 
 test("new command leaves naming to OpenCode on the next real question", async () => {
@@ -1176,7 +1214,7 @@ test("/new retires in-flight work, cancels only preceding queue entries, and pre
   expect(h.backend.prompts[1]!.id).toBe("ses_2");
   expect(h.store.get<unknown>("route")).toMatchObject({ id: "ses_2", directory: "/Chats/ses_2", generation: 2 });
   expect(h.conversations()).toEqual([]);
-  expect(h.store.pendingInbound().map(r => r.id)).toEqual(["after"]);
+  expect(h.store.pendingInbound().map(r => r.id)).toEqual([]);
   expect(h.store.db.query("SELECT state FROM inbound WHERE id = 'before'").get()).toEqual({ state: "cancelled" });
   expect(h.store.getOperation("notification")!.state).toBe("pending");
   h.input("stale-approval", "/approve perm_1 once");
@@ -1370,7 +1408,7 @@ test("replies to retired or unknown messages queue behind an active turn as ordi
   await h.router.tick();
   expect(h.controls()).toEqual([]);
   expect(h.backend.prompts).toHaveLength(1);
-  expect(h.store.pendingInbound().map(row => row.id)).toEqual(["first", "retired", "unknown"]);
+  expect(h.store.pendingInbound().map(row => row.id)).toEqual(["retired", "unknown"]);
   h.backend.final();
   await h.router.tick();
   expect(h.backend.prompts[1]!.text).toContain('"Retired"');
@@ -1419,6 +1457,23 @@ test("ambiguous submissions silently block later turns across restart, then reco
   expect(h.conversations()[0]!.text).toBe("Recovered");
   expect(h.backend.prompts.map(p => p.text)).toEqual(["Maybe accepted", "Wait for first"]);
 });
+
+test("a prompt POST the backend takes longer than ten seconds to answer is accepted, not treated as an outage", async () => {
+  const events: string[] = [];
+  const h = setup(":memory:", { log: event => { events.push(event); } });
+  h.backend.promptBehavior = async call => {
+    await new Promise(resolve => setTimeout(resolve, 10_500));
+    h.backend.accept(call);
+  };
+  h.input("first", "Question");
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ phase: "running" });
+  expect(inbounds(h.store).find(row => row.id === "first")?.state).toBe("done");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.controls()).toEqual([]);
+  expect(events).not.toContain("delivery-watchdog");
+}, 20_000);
 
 test("a stuck prompt POST has a bounded wait and /new can retire it without a retry", async () => {
   const h = setup();
@@ -1483,7 +1538,8 @@ test("an interrupted preparation or uncertain create never repeats the inbound o
   await new Router(h.store, h.backend, h.transport, options).tick();
   expect(h.backend.creates).toHaveLength(1);
   expect(h.backend.prompts).toEqual([]);
-  expect(h.controls()[1]!.text).toBe("I couldn't get started on that just now. Mind sending it again in a moment?");
+  expect(h.controls()).toHaveLength(1);
+  expect(inbounds(h.store).find(row => row.id === "create")?.state).toBe("processing");
   expect(h.controls().some(c => c.text.includes("SECRET"))).toBe(false);
 });
 
@@ -1580,7 +1636,7 @@ test("an unclear reply leaves the permission open, nudges once and stays queued 
   await h.router.tick();
   await h.router.tick();
   expect(h.backend.permissionReplies).toEqual([]);
-  expect(h.store.pendingInbound().map(row => [row.id, row.state])).toEqual([["question", "processing"], ["aside", "pending"]]);
+  expect(h.store.pendingInbound().map(row => [row.id, row.state])).toEqual([["aside", "pending"]]);
   const nudges = h.controls().filter(c => c.replyTo === "aside");
   expect(nudges).toHaveLength(1);
   expect(nudges[0]!.text).toContain("yes or no");
@@ -1766,7 +1822,7 @@ test.each(["Other", "", "   ", "0", "3", "99999999999999999999999", "A, C", "1, 
   expect(h.backend.questionReplies).toEqual([]);
   expect(h.controls().filter(c => c.replyTo === "answer").map(c => c.text)).toEqual(["I need one of the listed options for that one: 1. A, 2. B"]);
   expect(h.backend.prompts).toHaveLength(1);
-  expect(h.store.pendingInbound().map(row => row.id)).toEqual(["first"]);
+  expect(h.store.pendingInbound().map(row => row.id)).toEqual([]);
   h.input("valid", "b");
   await h.router.tick();
   expect(h.backend.questionReplies).toEqual([["q_1", "/Chats/ses_1", [["B"]]]]);
@@ -1844,7 +1900,7 @@ test("a message queued before an attention prompt was asked is never taken as it
   deliver(h.store);
   await h.router.tick();
   expect(h.backend.permissionReplies).toEqual([]);
-  expect(h.store.pendingInbound().map(row => row.id)).toEqual(["first", "early"]);
+  expect(h.store.pendingInbound().map(row => row.id)).toEqual(["early"]);
   setSystemTime(start + 3_000);
   h.input("late", "yes");
   await h.router.tick();
@@ -1933,34 +1989,45 @@ test("a watcher wake is never taken as an answer", async () => {
   expect(h.controls().some(op => op.id.startsWith("nudge:"))).toBe(false);
 });
 
-test("a watcher wake runs as its own turn and its reply is not a quoted reply", async () => {
+test("a watcher wake runs as its own turn after what the owner typed, and its reply is not a quoted reply", async () => {
   const h = setup();
   const wake = `wake:${"b".repeat(64)}`;
   h.input("owner_1", "Hi");
   h.input(wake, "[Watcher event from watch, not typed by the owner.]\nNik replied");
   h.input("owner_2", "Also this");
   await h.router.tick();
-  expect(h.backend.prompts.map(p => p.text)).toEqual(["Hi"]);
+  // The owner's two texts go first as one batch; the wake queued between them keeps its own turn.
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["Hi\nAlso this"]);
   h.backend.final("First");
   await h.router.tick();
-  expect(h.backend.prompts.map(p => p.text)).toEqual(["Hi", "[Watcher event from watch, not typed by the owner.]\nNik replied"]);
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["Hi\nAlso this", "[Watcher event from watch, not typed by the owner.]\nNik replied"]);
   expect(h.backend.prompts[1]!.system).toContain("Source incoming message IDs (in order, available as reaction targets): []");
   const reply = h.backend.final("Nik says he is ordering today");
   await h.router.tick();
   const forwarded = h.conversations().find(op => op.id === `reply:1:${reply.id}`)!;
   expect(forwarded.text).toBe("Nik says he is ordering today");
   expect("replyTo" in forwarded).toBe(false);
-  expect(h.backend.prompts.map(p => p.text)).toEqual(["Hi", "[Watcher event from watch, not typed by the owner.]\nNik replied", "Also this"]);
-  // Only the wake gets the short guidance; typed turns on either side keep the full text.
-  const [typed, woken, after] = h.backend.prompts.map(p => p.system!);
+  // Only the wake gets the short guidance; the typed turn keeps the full text.
+  const [typed, woken] = h.backend.prompts.map(p => p.system!);
   expect(typed!.startsWith(`${imessageGuidance()}\n`)).toBe(true);
-  expect(after!.startsWith(`${imessageGuidance()}\n`)).toBe(true);
   expect(woken!.startsWith(`${wakeGuidance()}\n`)).toBe(true);
   expect(woken!.length).toBeLessThan(typed!.length / 2);
   for (const rule of ["reply only if the owner needs to know or act now", "~/Documents/assistant/activity-log.md", "end your reply with exactly NO_REPLY",
     "Never use the question tool", "never retry a charge you are unsure about", "Never mention sessions", "send-file --file PATH", "CURRENT_SESSION_ID for bridge commands"]) {
     expect(woken).toContain(rule);
   }
+});
+
+test("a wake queued first never goes ahead of what the owner typed", async () => {
+  const h = setup();
+  const wake = `wake:${"c".repeat(64)}`;
+  h.input(wake, wakeBody());
+  h.input("owner_1", "Where is my order?");
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["Where is my order?"]);
+  h.backend.final("On its way");
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["Where is my order?", wakeBody()]);
 });
 
 test("a configured imessage prompt also replaces the wake guidance", async () => {
@@ -2073,62 +2140,6 @@ test("a watcher turn that failed while running is reported honestly, never retri
   await h.router.tick();
   expect(h.backend.prompts).toHaveLength(1);
   expect(h.store.get("missedSynthetic")).toBeUndefined();
-});
-
-test("a wake whose prompt is never accepted is retried without a resend notice, checking acceptance before every POST", async () => {
-  const h = setup(":memory:", { droppedBatchMs: 0 });
-  const start = Date.parse("2026-09-29T07:00:11Z");
-  setSystemTime(start);
-  h.backend.promptBehavior = async () => { throw new Error("PRIVATE_TIMEOUT"); };
-  const wake = `wake:${"f".repeat(64)}`;
-  h.input(wake, wakeBody());
-  await h.router.tick();
-  expect(h.store.get("activeTurn")).toMatchObject({ phase: "unknown", inboundId: wake });
-  const first = h.backend.prompts[0]!.messageId;
-  expect(first).toBe(messageId(wake));
-  // The incident: two minutes of unknown used to ask the owner to resend.
-  setSystemTime(start + 120_000);
-  await h.router.tick();
-  expect(h.controls()).toEqual([]);
-  expect(h.controls().some(op => op.text.includes("didn't catch"))).toBe(false);
-  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("pending");
-  expect(h.backend.prompts).toHaveLength(1);
-  // The retry looks for the earlier prompt before it POSTs again.
-  h.backend.singleReads = [];
-  setSystemTime(start + 120_000 + SYNTHETIC_RETRY_MS);
-  await h.router.tick();
-  expect(h.backend.singleReads[0]).toEqual(["ses_1", "/Chats/ses_1", first]);
-  expect(h.backend.prompts).toHaveLength(2);
-  expect(h.backend.prompts[1]!.messageId).not.toBe(first);
-  expect(h.backend.prompts[1]!.text).toBe(wakeBody());
-  setSystemTime(Date.now() + 120_000);
-  await h.router.tick();
-  expect(h.controls()).toEqual([]);
-  h.backend.singleReads = [];
-  setSystemTime(Date.now() + 2 * SYNTHETIC_RETRY_MS);
-  await h.router.tick();
-  expect(h.backend.singleReads.slice(0, 2).map(read => read[2])).toEqual([first, h.backend.prompts[1]!.messageId]);
-  expect(h.backend.prompts).toHaveLength(3);
-  setSystemTime(Date.now() + 120_000);
-  await h.router.tick();
-  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
-  expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(wake, wakeBody())]);
-  expect(h.controls()[0]!.text).toMatch(/^A background update \(watcher: Daily board\) didn't reach me/);
-  expect(h.controls()[0]!.text).not.toMatch(RESEND);
-  // Nothing more is posted for it, and the next owner turn carries it as quoted data.
-  h.backend.promptBehavior = undefined;
-  h.input("owner", "Morning");
-  await h.router.tick();
-  expect(h.backend.prompts).toHaveLength(4);
-  expect(h.backend.prompts[3]!.text).toBe("Morning");
-  expect(h.backend.prompts[3]!.system).toContain("Missed background updates");
-  expect(h.backend.prompts[3]!.system).toContain(JSON.stringify(wakeBody()));
-  expect(h.store.get<unknown[]>("missedSynthetic")).toEqual([]);
-  h.backend.final("Here's the board");
-  await h.router.tick();
-  h.input("owner_2", "Thanks");
-  await h.router.tick();
-  expect(h.backend.prompts[4]!.system).not.toContain("Missed background updates");
 });
 
 test("a watcher turn that errored before any tool is retried, then reported once", async () => {
@@ -2256,78 +2267,6 @@ test("dropped notices close together go out as one", async () => {
   expect(h.controls()[0]!.text).toContain("watcher: HW call David");
 });
 
-test("a retried wake whose earlier prompt landed late is adopted, never POSTed twice", async () => {
-  const h = setup();
-  const start = Date.parse("2026-09-29T07:00:11Z");
-  setSystemTime(start);
-  let calls = 0;
-  h.backend.promptBehavior = async () => { calls++; throw new Error("PRIVATE_TIMEOUT"); };
-  const wake = `wake:${"9".repeat(64)}`;
-  h.input(wake, wakeBody());
-  await h.router.tick();
-  setSystemTime(start + 120_000);
-  await h.router.tick();
-  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("pending");
-  // OpenCode admits the first prompt after all.
-  h.backend.accept(h.backend.prompts[0]!);
-  setSystemTime(start + 120_000 + SYNTHETIC_RETRY_MS);
-  await h.router.tick();
-  expect(calls).toBe(1);
-  expect(h.store.get("activeTurn")).toMatchObject({ phase: "running", inboundId: wake, messageId: messageId(wake) });
-  const reply = h.backend.final("Board: 2 waiting on you");
-  await h.router.tick();
-  expect(h.conversations().map(op => op.id)).toEqual([`reply:1:${reply.id}`]);
-  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("done");
-  expect(h.store.get(`synthetic-retry:${wake}`)).toBeNull();
-  expect(h.controls()).toEqual([]);
-});
-
-test("a retried wake never POSTs while the earlier prompt's acceptance cannot be read", async () => {
-  const h = setup();
-  const start = Date.parse("2026-09-29T07:00:11Z");
-  setSystemTime(start);
-  h.backend.promptBehavior = async () => { throw new Error("PRIVATE_TIMEOUT"); };
-  const wake = `wake:${"8".repeat(64)}`;
-  h.input(wake, wakeBody());
-  await h.router.tick();
-  setSystemTime(start + 120_000);
-  await h.router.tick();
-  const accepted = h.backend.promptAccepted.bind(h.backend);
-  h.backend.promptAccepted = async () => { throw new Error("PRIVATE_READ"); };
-  setSystemTime(start + 120_000 + SYNTHETIC_RETRY_MS);
-  await h.router.tick();
-  await h.router.tick();
-  expect(h.backend.prompts).toHaveLength(1);
-  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("pending");
-  expect(h.controls()).toEqual([]);
-  h.backend.promptAccepted = accepted;
-  setSystemTime(Date.now() + 10_000);
-  await h.router.tick();
-  expect(h.backend.prompts).toHaveLength(2);
-});
-
-test("a backing-off wake does not hold up owner texts queued behind it", async () => {
-  const h = setup();
-  const start = Date.parse("2026-09-29T07:00:11Z");
-  setSystemTime(start);
-  const wake = `wake:${"7".repeat(64)}`;
-  h.backend.promptBehavior = async () => { throw new Error("PRIVATE_TIMEOUT"); };
-  h.input(wake, wakeBody());
-  await h.router.tick();
-  setSystemTime(start + 120_000);
-  await h.router.tick();
-  h.backend.promptBehavior = undefined;
-  h.input("owner", "Hi");
-  await h.router.tick();
-  expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), "Hi"]);
-  h.backend.final("Hey");
-  await h.router.tick();
-  setSystemTime(start + 120_000 + SYNTHETIC_RETRY_MS);
-  await h.router.tick();
-  expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), "Hi", wakeBody()]);
-  expect(h.controls()).toEqual([]);
-});
-
 test("synthetic rows never get resend notices from interrupted or failed starts", async () => {
   const h = setup();
   const wake = `wake:${"6".repeat(64)}`;
@@ -2338,142 +2277,379 @@ test("synthetic rows never get resend notices from interrupted or failed starts"
   h.backend.createBehavior = async () => { throw new Error("PRIVATE_CREATE"); };
   await h.router.tick();
   expect(h.controls()).toEqual([]);
-  expect(inbounds(h.store).map(row => row.state)).toEqual(["pending", "pending"]);
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["pending", "processing"]);
   expect(h.store.get<{ attempts: number }>(`synthetic-retry:${wake}`)?.attempts).toBe(1);
-  expect(h.store.get<{ attempts: number }>(`synthetic-retry:${secret}`)?.attempts).toBe(1);
+  expect(h.store.get(`synthetic-retry:${secret}`)).toBeUndefined();
   expect(syntheticDropped(secret, "Filled in the secure form \"Bank\" (fields: password).")).toContain("secure form: Bank");
 });
 
-test("an owner text whose prompt is never accepted is sent 3 times over about 5 minutes before the resend notice", async () => {
-  const h = setup();
-  const start = Date.parse("2026-09-29T07:00:11Z");
+const outageText = "I'm having a technical problem; I'll answer this as soon as I'm back.";
+
+test.each(["final", "tool"] as const)("unaccepted sealed batch retries once, notices once, then replays before newer messages (%s)", async replyMode => {
+  const id = "owner";
+  const events: string[] = [];
+  const h = setup(":memory:", { replyMode, log: (event, code) => { if (event === "delivery-watchdog") events.push(JSON.parse(code!).decision); } });
+  const start = Date.parse("2026-11-07T07:27:00Z");
   setSystemTime(start);
-  h.backend.promptBehavior = async () => { throw new Error("PRIVATE"); };
-  h.input("owner", "Hello?");
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input(id, "First question", { sentAt: start - 1000 });
   await h.router.tick();
-  expect(h.store.get("activeTurn")).toMatchObject({ phase: "unknown", messageId: messageId("owner") });
-  setSystemTime(start + OWNER_RESEND_MS[0] - 1);
+  setSystemTime(start + ACCEPT_WAIT_MS - 1);
   await h.router.tick();
   expect(h.backend.prompts).toHaveLength(1);
-  // Attempt 2: every earlier attempt is looked up first, then the same prompt goes out under a new id.
-  h.backend.singleReads = [];
-  setSystemTime(start + OWNER_RESEND_MS[0]);
+  setSystemTime(start + ACCEPT_WAIT_MS);
   await h.router.tick();
-  expect(h.backend.singleReads.map(read => read[2])).toContain(messageId("owner"));
   expect(h.backend.prompts).toHaveLength(2);
-  expect(h.backend.prompts[1]!.text).toBe("Hello?");
-  expect(h.backend.prompts[1]!.system).toBe(h.backend.prompts[0]!.system);
-  expect(h.backend.prompts[1]!.messageId).not.toBe(messageId("owner"));
-  expect(h.controls()).toEqual([]);
-  // The old two-minute rule no longer fires.
-  setSystemTime(start + 120_000);
+  expect(h.backend.prompts[1]!.messageId).toBe(h.backend.prompts[0]!.messageId);
+  expect(h.backend.singleReads.map(read => read[2])).toContain(messageId(id));
+  setSystemTime(start + 2 * ACCEPT_WAIT_MS);
   await h.router.tick();
-  expect(h.controls()).toEqual([]);
-  expect(h.backend.prompts).toHaveLength(2);
-  // Attempt 3.
-  setSystemTime(start + OWNER_RESEND_MS[0] + OWNER_RESEND_MS[1]);
-  await h.router.tick();
-  expect(h.backend.prompts).toHaveLength(3);
-  expect(new Set(h.backend.prompts.map(p => p.messageId)).size).toBe(3);
-  expect(h.controls()).toEqual([]);
-  // Out of attempts: only now is the owner asked.
-  setSystemTime(start + OWNER_RESEND_MS[0] + OWNER_RESEND_MS[1] + OWNER_RESEND_MS[2] - 1);
-  await h.router.tick();
-  expect(h.controls()).toEqual([]);
-  setSystemTime(start + OWNER_RESEND_MS[0] + OWNER_RESEND_MS[1] + OWNER_RESEND_MS[2]);
-  await h.router.tick();
-  expect(h.controls().map(op => [op.replyTo, op.text])).toEqual([["owner", "I didn't catch that last message. Mind sending it again?"]]);
-  expect(inbounds(h.store).find(row => row.id === "owner")?.state).toBe("failed");
-  expect(h.store.get("resendBody")).toBeNull();
+  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+  expect(h.store.get("activeTurn")).toMatchObject({ phase: "held" });
+  h.input("second", "Second question");
+  h.input("third", "Third question");
+  // The route answers reads, so the held batch is tried again (idempotently) without waiting on the health endpoint.
   setSystemTime(start + 20 * 60_000);
   await h.router.tick();
   expect(h.backend.prompts).toHaveLength(3);
-});
-
-test("an owner text resent after a backend stall is delivered once and answered", async () => {
-  const h = setup();
-  const start = Date.parse("2026-10-02T11:06:11Z");
-  setSystemTime(start);
-  // OpenCode is unresponsive: the POST times out and nothing lands.
-  h.backend.promptBehavior = async () => { throw new Error("PRIVATE_TIMEOUT"); };
-  h.input("owner", "Kk");
+  expect(new Set(h.backend.prompts.map(p => p.messageId)).size).toBe(1);
+  // Tries are a minute apart, and the owner hears about the outage once.
+  setSystemTime(start + 20 * 60_000 + 30_000);
   await h.router.tick();
-  h.backend.promptBehavior = undefined;
-  setSystemTime(start + OWNER_RESEND_MS[0]);
-  await h.router.tick();
-  expect(h.backend.prompts.map(p => p.text)).toEqual(["Kk", "Kk"]);
-  expect(h.store.get("activeTurn")).toMatchObject({ phase: "running", messageId: h.backend.prompts[1]!.messageId, attempt: 2 });
-  expect(h.store.get("resendBody")).toBeNull();
-  const reply = h.backend.final("👍");
-  await h.router.tick();
-  expect(h.conversations().map(op => [op.id, op.text, op.replyTo])).toEqual([[`reply:1:${reply.id}`, "👍", "owner"]]);
-  expect(inbounds(h.store).find(row => row.id === "owner")?.state).toBe("done");
-  expect(h.controls()).toEqual([]);
-});
-
-test("an owner text whose first attempt lands late is adopted, never sent again", async () => {
-  const h = setup();
-  const start = Date.parse("2026-10-02T11:06:11Z");
-  setSystemTime(start);
-  h.backend.promptBehavior = async () => { throw new Error("PRIVATE_TIMEOUT"); };
-  h.input("owner", "Kk");
-  await h.router.tick();
-  // A second attempt goes out and is also unconfirmed.
-  setSystemTime(start + OWNER_RESEND_MS[0]);
-  await h.router.tick();
-  expect(h.backend.prompts).toHaveLength(2);
-  // Then OpenCode catches up and admits the FIRST one.
-  h.backend.accept(h.backend.prompts[0]!);
-  setSystemTime(start + OWNER_RESEND_MS[0] + OWNER_RESEND_MS[1]);
-  await h.router.tick();
-  expect(h.backend.prompts).toHaveLength(2);
-  expect(h.store.get("activeTurn")).toMatchObject({ phase: "running", messageId: messageId("owner") });
-  const reply = h.backend.final("Got it");
-  await h.router.tick();
-  expect(h.conversations().map(op => op.id)).toEqual([`reply:1:${reply.id}`]);
-  expect(h.controls()).toEqual([]);
-});
-
-test("an owner text is never resent while its delivery cannot be read, and is given up on eventually", async () => {
-  const h = setup();
-  const start = Date.parse("2026-10-02T11:06:11Z");
-  setSystemTime(start);
-  h.backend.promptBehavior = async () => { throw new Error("PRIVATE_TIMEOUT"); };
-  h.input("owner", "Kk");
-  await h.router.tick();
-  h.backend.promptAccepted = async () => { throw new Error("PRIVATE_READ"); };
-  for (const at of [OWNER_RESEND_MS[0], 3 * 60_000, OWNER_GIVE_UP_MS - 1]) {
-    setSystemTime(start + at);
-    await h.router.tick();
-  }
-  expect(h.backend.prompts).toHaveLength(1);
-  expect(h.controls()).toEqual([]);
-  setSystemTime(start + OWNER_GIVE_UP_MS);
-  await h.router.tick();
-  expect(h.backend.prompts).toHaveLength(1);
-  expect(h.controls().map(op => op.text)).toEqual(["I didn't catch that last message. Mind sending it again?"]);
-});
-
-test("a resend survives a bridge restart and still checks every earlier attempt first", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "spectrum-router-"));
-  directories.push(directory);
-  const h = setup(join(directory, "state.sqlite"));
-  const start = Date.parse("2026-10-02T11:06:11Z");
-  setSystemTime(start);
-  h.backend.promptBehavior = async () => { throw new Error("PRIVATE_TIMEOUT"); };
-  h.input("owner", "Kk");
-  await h.router.tick();
-  setSystemTime(start + OWNER_RESEND_MS[0]);
-  await h.router.tick();
-  const second = h.backend.prompts[1]!.messageId;
-  // The bridge restarts; then the second attempt turns up.
-  h.backend.accept(h.backend.prompts[1]!);
+  expect(h.backend.prompts).toHaveLength(3);
+  expect(h.controls().map(op => op.text)).toEqual([outageText]);
   const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
   h.backend.promptBehavior = undefined;
-  setSystemTime(start + OWNER_RESEND_MS[0] + OWNER_RESEND_MS[1]);
+  setSystemTime(start + 20 * 60_000 + ACCEPT_WAIT_MS);
   await restarted.tick();
+  expect(h.backend.prompts).toHaveLength(4);
+  expect(h.backend.prompts[3]).toMatchObject({ text: "First question", messageId: messageId(id) });
+  expect(h.backend.prompts[3]!.system).toContain("delayed by a technical outage");
+  expect(h.backend.prompts[3]!.system).toContain(new Date(start - 1000).toISOString());
+  expect(inbounds(h.store).find(row => row.id === id)?.state).toBe("done");
+  if (replyMode === "tool") agentSends(h, "recovered", "First answer");
+  h.backend.final("First answer");
+  await restarted.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["First answer"]);
+  expect(h.backend.prompts[4]!.text).toBe("Second question\nThird question");
+  if (replyMode === "tool") expect(h.conversations().every(op => op.id.startsWith("send:"))).toBe(true);
+  expect(events).toEqual(["retry", "notice", "replay", "replay"]);
+  expect(h.controls().some(op => /didn't catch|resend|sending it again/i.test(op.text))).toBe(false);
+});
+
+test.each(["final", "tool"] as const)("an unaccepted watcher wake goes back to its queue: no outage text, and it never holds what the owner types (%s)", async replyMode => {
+  const events: string[] = [];
+  const h = setup(":memory:", { replyMode, log: (event, code) => { if (event === "delivery-watchdog") events.push(JSON.parse(code!).decision); } });
+  const wake = `wake:${"d".repeat(64)}`;
+  const start = Date.parse("2026-11-12T06:38:42Z");
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  setSystemTime(start + ACCEPT_WAIT_MS);
+  await h.router.tick();
   expect(h.backend.prompts).toHaveLength(2);
-  expect(h.store.get("activeTurn")).toMatchObject({ phase: "running", messageId: second });
+  setSystemTime(start + 2 * ACCEPT_WAIT_MS);
+  await h.router.tick();
+  // Released, not held: nobody typed it, so nobody is told about a technical problem.
+  expect(h.controls()).toEqual([]);
+  expect(h.store.get<{ phase: string } | null>("activeTurn")?.phase).not.toBe("held");
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("pending");
+  expect(events).toEqual(["retry", "release"]);
+  h.backend.promptBehavior = undefined;
+  h.input("typed", "Are you there?");
+  setSystemTime(start + 2 * ACCEPT_WAIT_MS + 1000);
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("Are you there?");
+  expect(inbounds(h.store).find(row => row.id === "typed")?.state).toBe("done");
+});
+
+test("a person waiting behind a wake that provably did not land is not kept waiting for its retry", async () => {
+  const h = setup();
+  const wake = `wake:${"e".repeat(64)}`;
+  const start = Date.parse("2026-11-12T06:38:42Z");
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ inboundId: wake, phase: "unknown" });
+  h.backend.promptBehavior = undefined;
+  h.input("typed", "Quick question");
+  setSystemTime(start + 2000);
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("Quick question");
+  expect(h.controls()).toEqual([]);
+});
+
+test("12 Nov 2026: a held turn with no sealed body left is rebuilt under the same prompt id instead of blocking the chat", async () => {
+  const events: string[] = [];
+  const h = setup(":memory:", { log: (event, code) => { if (event === "delivery-watchdog") events.push(JSON.parse(code!).decision); } });
+  const start = Date.parse("2026-11-12T06:38:42Z");
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "Held question");
+  await h.router.tick();
+  for (const offset of [ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS]) { setSystemTime(start + offset); await h.router.tick(); }
+  expect(h.store.get("activeTurn")).toMatchObject({ phase: "held" });
+  // The state found live: held, row still processing, and the sealed body gone.
+  h.store.set("resendBody", null);
+  h.store.set("deliveryOutage", null);
+  h.input("later", "Newer question");
+  h.backend.promptBehavior = undefined;
+  setSystemTime(start + 2 * 60 * 60_000);
+  await h.router.tick();
+  expect(events).toContain("rebuild");
+  expect(h.backend.prompts.at(-1)).toMatchObject({ text: "Held question", messageId: messageId("first") });
+  expect(h.backend.prompts.at(-1)!.system).toContain("delayed by a technical outage");
+  expect(inbounds(h.store).find(row => row.id === "first")?.state).toBe("done");
+  h.backend.final("Answer");
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("Newer question");
+});
+
+test("a turn that failed before acceptance and has nothing left to replay is closed, so the queue behind it moves", async () => {
+  const h = setup();
+  const start = Date.parse("2026-11-12T06:38:42Z");
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "Lost question");
+  await h.router.tick();
+  // Rows settled as failed and the body dropped, as fail() leaves them, with the batch still marked submitting.
+  h.store.updateInbound("first", "failed");
+  h.store.set("activeTurn", { ...h.store.get<object>("activeTurn"), phase: "failed" });
+  h.store.set("resendBody", null);
+  h.backend.promptBehavior = undefined;
+  h.input("later", "Newer question");
+  for (const offset of [ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS + 1000]) { setSystemTime(start + offset); await h.router.tick(); }
+  expect(h.store.get<{ phase: string } | null>("activeTurn")?.phase).not.toBe("held");
+  expect(h.controls().map(op => op.text)).not.toContain(outageText);
+  expect(h.backend.prompts.at(-1)!.text).toBe("Newer question");
+});
+
+test.each(["final", "tool"] as const)("route creation failure keeps the sealed batch through retry, notice and ordered recovery (%s)", async replyMode => {
+  const h = setup(":memory:", { replyMode });
+  const start = Date.now();
+  setSystemTime(start);
+  h.backend.createBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "Original question");
+  await h.router.tick();
+  expect(h.controls()).toEqual([]);
+  const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  setSystemTime(start + 60_000);
+  await restarted.tick();
+  expect(h.backend.creates).toHaveLength(2);
+  setSystemTime(start + 120_000);
+  await restarted.tick();
+  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+  h.input("later", "Newer question");
+  h.backend.healthy = true;
+  h.backend.createBehavior = undefined;
+  setSystemTime(start + 125_000);
+  await restarted.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["Original question"]);
+  expect(h.backend.prompts[0]!.system).toContain("delayed by a technical outage");
+  if (replyMode === "tool") {
+    const route = h.store.get<{ id: string; generation: number }>("route")!;
+    agentSends(h, "created-recovery", "First answer", route.generation, route.id);
+  }
+  h.backend.final("First answer");
+  await restarted.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["Original question", "Newer question"]);
+});
+
+test.each((["final", "tool"] as const).flatMap(replyMode => ["before-retry", "after-retry", "after-notice", "legacy-failed-turn"].map(when => ({ replyMode, when }))))("late first acceptance $when repairs failed rows without another send ($replyMode)", async ({ replyMode, when }) => {
+  const h = setup(":memory:", { replyMode });
+  const start = Date.parse("2026-11-07T07:27:00Z");
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("timeout"); };
+  h.input("first", "One");
+  h.input("member", "Two");
+  await h.router.tick();
+  if (when !== "before-retry") { setSystemTime(start + ACCEPT_WAIT_MS); await h.router.tick(); }
+  if (when === "after-notice") { setSystemTime(start + 2 * ACCEPT_WAIT_MS); await h.router.tick(); }
+  h.store.updateInbound("first", "failed");
+  h.store.updateInbound("member", "failed");
+  if (when === "legacy-failed-turn") h.store.set("activeTurn", { ...h.store.get<object>("activeTurn"), phase: "failed" });
+  h.backend.accept(h.backend.prompts[0]!);
+  const sends = h.backend.prompts.length;
+  setSystemTime(start + 3 * ACCEPT_WAIT_MS);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(sends);
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "done"]);
+  if (replyMode === "tool") agentSends(h, "late-accepted", "Both answered");
+  h.backend.final("Both answered");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Both answered"]);
+});
+
+test("first attempt landing during the retry POST still admits one prompt and sends one reply", async () => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  const admitted = new Set<string>();
+  const acceptOnce = (call: Prompt) => {
+    if (admitted.has(call.messageId)) return;
+    admitted.add(call.messageId);
+    h.backend.accept(call);
+  };
+  h.backend.promptBehavior = async call => {
+    if (h.backend.prompts.length === 1) throw new Error("lost response");
+    // The original request commits after readback, while the retry reaches the idempotent endpoint.
+    acceptOnce(h.backend.prompts[0]!);
+    acceptOnce(call);
+  };
+  h.input("first", "Question");
+  await h.router.tick();
+  setSystemTime(start + ACCEPT_WAIT_MS);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(2);
+  expect(h.backend.records.filter(row => row.type === "user")).toHaveLength(1);
+  h.backend.final("Answer");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Answer"]);
+  expect(h.controls()).toEqual([]);
+});
+
+test("watchdog notices even when normal poll reads fail, and never retries an unreadable outcome", async () => {
+  const h = setup();
+  const start = Date.now();
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "Question");
+  await h.router.tick();
+  h.backend.promptAccepted = async () => { throw new Error("offline"); };
+  h.backend.messagesBehavior = async () => { throw new Error("offline"); };
+  h.backend.permissionBehavior = async () => { throw new Error("offline"); };
+  for (const offset of [60_000, 120_000, 180_000]) { setSystemTime(start + offset); await h.router.tick(); }
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+  expect(inbounds(h.store)[0]!.state).toBe("processing");
+});
+
+test("another prompt accepted on the route triggers held replay even if health is unavailable", async () => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "Held question");
+  await h.router.tick();
+  for (const offset of [60_000, 120_000]) { setSystemTime(start + offset); await h.router.tick(); }
+  h.backend.records.push({ id: "external-prompt", type: "user", text: "A recovery wake", time: { created: start + 121_000 } });
+  h.backend.promptBehavior = undefined;
+  setSystemTime(start + 125_000);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(3);
+  expect(h.backend.prompts[2]!.messageId).toBe(messageId("first"));
+  expect(h.backend.prompts[2]!.system).toContain("delayed by a technical outage");
+});
+
+test("healthy API keeps replay attempts paced until sends recover without a health transition", async () => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("send unavailable"); };
+  h.input("first", "Question");
+  await h.router.tick();
+  for (const offset of [60_000, 120_000]) { setSystemTime(start + offset); await h.router.tick(); }
+  h.backend.healthy = true;
+  for (const offset of [125_000, 130_000, 135_000]) { setSystemTime(start + offset); await h.router.tick(); }
+  expect(h.backend.prompts).toHaveLength(3);
+  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+  h.backend.promptBehavior = undefined;
+  setSystemTime(start + 185_000);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(4);
+  expect(new Set(h.backend.prompts.map(p => p.messageId)).size).toBe(1);
+});
+
+test.each(["prompt", "preparation"])("failed %s replay survives restart and recovers with health continuously OK", async kind => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  if (kind === "prompt") h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  else h.backend.createBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "First");
+  await h.router.tick();
+  for (const offset of [60_000, 120_000]) { setSystemTime(start + offset); await h.router.tick(); }
+  h.input("later", "Later");
+  h.backend.healthy = true;
+  setSystemTime(start + 125_000);
+  await h.router.tick();
+  const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  h.backend.promptBehavior = undefined;
+  h.backend.createBehavior = undefined;
+  setSystemTime(start + 184_999);
+  await restarted.tick();
+  expect(inbounds(h.store).find(row => row.id === "first")?.state).toBe("processing");
+  setSystemTime(start + 190_000);
+  await restarted.tick();
+  expect(inbounds(h.store).find(row => row.id === "first")?.state).toBe("done");
+  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+  h.backend.final("First answer");
+  await restarted.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("Later");
+});
+
+const preparationArrivals: { text: string; interrupts: boolean; poll?: NormalizedInbound["poll"] }[] = [
+  { text: "/new", interrupts: true },
+  { text: "/status", interrupts: true },
+  { text: "/approve missing yes", interrupts: true },
+  { text: "/answer missing [[]]", interrupts: true },
+  { text: "/unknown", interrupts: true },
+  { text: "", interrupts: true, poll: { guid: "poll", optionIdentifier: "a", optionText: "A", vote: "voted", operationId: "request:retired" } },
+  { text: "/notification missing Explain", interrupts: false },
+  { text: "/context missing Explain", interrupts: false },
+  { text: "Newer ordinary message", interrupts: false },
+];
+for (const phase of ["retry-create", "replay-create"]) test.each(preparationArrivals)(`${phase} preparation arrival $text preserves control priority and batch order`, async ({ text, interrupts, poll }) => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  h.backend.createBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "Held message");
+  await h.router.tick();
+  if (phase.startsWith("replay")) {
+    for (const offset of [60_000, 120_000]) { setSystemTime(start + offset); await h.router.tick(); }
+    h.backend.healthy = true;
+  }
+  h.backend.createBehavior = async () => {
+    h.input("arrival", text, { poll });
+    return { id: "ses_recovered", directory: "/Chats/ses_recovered" };
+  };
+  setSystemTime(start + (phase.startsWith("replay") ? 125_000 : 60_000));
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual(interrupts ? [] : ["Held message"]);
+  if (text === "/new") {
+    await h.router.tick();
+    expect(inbounds(h.store).find(row => row.id === "first")?.state).toBe("cancelled");
+    expect(h.backend.prompts).toEqual([]);
+  }
+});
+
+for (const boundary of ["retry-acceptance", "replay-acceptance"]) test.each(preparationArrivals)(`${boundary} arrival $text preserves control priority`, async ({ text, interrupts, poll }) => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "Held message");
+  await h.router.tick();
+  const replay = boundary.startsWith("replay");
+  if (replay) for (const offset of [60_000, 120_000]) { setSystemTime(start + offset); await h.router.tick(); }
+  const inject = () => h.input("arrival", text, { poll });
+  // The readback is the last await before a retry or replay POST: a control arriving there still goes first.
+  const accepted = h.backend.promptAccepted.bind(h.backend);
+  h.backend.promptAccepted = async (...args) => { inject(); return accepted(...args); };
+  h.backend.promptBehavior = undefined;
+  setSystemTime(start + (replay ? 125_000 : 60_000));
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength((replay ? 2 : 1) + (interrupts ? 0 : 1));
+  if (text === "/new") {
+    await h.router.tick();
+    expect(inbounds(h.store).find(row => row.id === "first")?.state).toBe("cancelled");
+    expect(h.backend.prompts).toHaveLength(replay ? 2 : 1);
+  }
 });
 
 test("/new cancels queued owner text but carries a pending watcher wake into the fresh chat", async () => {
@@ -2564,7 +2740,7 @@ test.each(["removed", "options", "custom", "multiple", "foreign", "refresh-error
     if (native) {
       // A plain text is never an answer to a changed request; it stays queued as conversation.
       expect(h.controls().some(c => c.replyTo === "answer")).toBe(false);
-      expect(h.store.pendingInbound().map(row => row.id)).toEqual(["first", "answer"]);
+      expect(h.store.pendingInbound().map(row => row.id)).toEqual(["answer"]);
       expect(h.router.status().pendingApprovals).toHaveLength(kind === "refresh-error" ? 1 : 0);
       if (kind !== "refresh-error") {
         h.backend.questionRequests = [];
@@ -3224,7 +3400,7 @@ test("storage errors do not create an active turn or send an unpersisted attachm
   expect(readdirSync(h.root)).toEqual(["ses_1"]);
 });
 
-test("downloads use a bounded 35-second wait while other router waits remain 10 seconds", async () => {
+test("downloads use a bounded 35-second wait, backend reads wait 30 seconds and transport calls keep 10", async () => {
   const h = filesSetup();
   h.transport.downloadAttachment = async () => ({ data: Buffer.from("text"), mimeType: "text/plain", name: "text.txt" });
   const timer = spyOn(globalThis, "setTimeout");
@@ -3233,7 +3409,8 @@ test("downloads use a bounded 35-second wait while other router waits remain 10 
     await h.router.tick();
     expect(timer.mock.calls.map(call => call[1])).toContain(35_000);
     expect(timer.mock.calls.filter(call => call[1] === 35_000)).toHaveLength(1);
-    expect(timer.mock.calls.filter(call => call[1] === 10_000).length).toBeGreaterThanOrEqual(3);
+    expect(timer.mock.calls.filter(call => call[1] === 30_000).length).toBeGreaterThanOrEqual(1);
+    expect(timer.mock.calls.filter(call => call[1] === 10_000).length).toBeGreaterThanOrEqual(1);
   } finally {
     timer.mockRestore();
   }
@@ -3362,7 +3539,7 @@ test("default quiet period batches separately received text, image, file, and ca
   expect(h.backend.prompts).toHaveLength(1);
   expect(h.conversations()).toHaveLength(1);
   expect(h.store.pendingInbound()).toEqual([]);
-  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "batched", "batched", "batched"]);
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "done", "done", "done"]);
 });
 
 test.each([false, true])("receipt time survives restart without postponement (legacy=%s)", async legacy => {
@@ -3568,7 +3745,7 @@ test("status, redirect controls, and native approvals stay immediate with the de
   expect(h.backend.questionReplies).toEqual([["q_1", "/Chats/ses_1", [["B"]]]]);
   expect(h.controls().map(op => op.replyTo)).toEqual(["status", "list", "snooze", "cancel"]);
   expect(inbounds(h.store).filter(row => ["approve", "answer"].includes(row.id)).map(row => row.state)).toEqual(["done", "done"]);
-  expect(h.store.pendingInbound().map(row => row.id)).toEqual(["first", "queued"]);
+  expect(h.store.pendingInbound().map(row => row.id)).toEqual(["queued"]);
   expect(h.backend.prompts).toHaveLength(1);
 });
 
@@ -3596,9 +3773,9 @@ test.each(["count", "bytes", "actual-bytes", "download", "create"])("batch %s fa
   await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
   expect(h.backend.prompts).toEqual([]);
   expect(h.backend.creates).toHaveLength(kind === "create" ? 1 : 0);
-  expect(h.store.pendingInbound()).toEqual([]);
+  expect(h.store.pendingInbound().map(row => row.state)).toEqual(kind === "create" ? ["processing"] : []);
   expect(inbounds(h.store).slice(1).every(row => row.state === "batched")).toBe(true);
-  expect(h.controls()).toHaveLength(1);
+  expect(h.controls()).toHaveLength(kind === "create" ? 0 : 1);
   if (kind === "count" || kind === "bytes") {
     expect(h.downloads).toEqual([]);
     expect(h.controls()[0]!.text).toBe("That's more than I can take in one go. Send at most 10 files, 100 MB total.");
@@ -3638,7 +3815,7 @@ test.each(["submitting", "unknown"])("durable batch restart from %s never replay
   // Active-turn acceptance remains authoritative even if a stale preparation marker exists.
   h.store.set("batch-phase:leader", "preparing");
   if (phase === "unknown") h.backend.records = [];
-  expect(inbounds(h.store).map(row => row.state)).toEqual(["processing", "batched"]);
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "done"]);
   h.store.close();
   const reopened = new Store(path);
   stores.push(reopened);
@@ -3647,7 +3824,7 @@ test.each(["submitting", "unknown"])("durable batch restart from %s never replay
   await restarted.tick();
   expect(h.backend.prompts).toHaveLength(1);
   expect(h.backend.creates).toHaveLength(1);
-  expect(inbounds(reopened)[1]!.state).toBe("batched");
+  expect(inbounds(reopened)[1]!.state).toBe("done");
   expect(reopened.get<NormalizedInbound>("batch:leader")!.text).toBe("First\nSecond");
   if (phase === "submitting") {
     expect(reopened.get("activeTurn")).toMatchObject({ inboundId: "leader", phase: "running" });
@@ -3672,7 +3849,7 @@ test.each(["error", "new"])("batch retirement by %s leaves no member to submit l
   if (kind === "error") h.backend.failed();
   if (kind === "new") h.input("new", "/new");
   await h.router.tick();
-  expect(inbounds(h.store).slice(0, 2).map(row => row.state)).toEqual([kind === "new" ? "cancelled" : "failed", "batched"]);
+  expect(inbounds(h.store).slice(0, 2).map(row => row.state)).toEqual([kind === "new" ? "cancelled" : "failed", "done"]);
   if (kind !== "new") {
     h.input("new", "/new");
     await h.router.tick();
@@ -3734,7 +3911,7 @@ test.each(["first", "last", "rejected", "status"])("an arrival during the %s dow
   expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(["First caption\nSecond caption"]);
   expect(h.backend.prompts[0]!.system).toContain('"name":"one.txt"');
   expect(h.backend.prompts[0]!.system).toContain('"name":"two.txt"');
-  expect(h.store.get<string>("batch-phase:leader")).toBe("submitting");
+  expect(h.store.get<string>("batch-phase:leader")).toBe("accepted");
   expect(h.store.pendingInbound().map(row => row.id)).toContain("already-queued");
 });
 
@@ -3947,7 +4124,7 @@ test.each(["ordinary", "new", "none"])("restart safely unseals preparation befor
   expect(h.backend.creates).toHaveLength(1);
 });
 
-test("restart from ambiguous chat creation never unseals or repeats the remote mutation", async () => {
+test("restart from ambiguous chat creation holds the batch for its timed retry", async () => {
   const directory = mkdtempSync(join(tmpdir(), "spectrum-creating-"));
   directories.push(directory);
   const path = join(directory, "store.sqlite");
@@ -3959,12 +4136,7 @@ test("restart from ambiguous chat creation never unseals or repeats the remote m
     expect(h.store.get<NormalizedInbound>("batch:leader")!.batchIds).toEqual(["leader", "member"]);
     throw new Error("Lost create response");
   };
-  const crash = spyOn(h.store, "enqueue").mockImplementation(() => { throw new Error("Crash before acknowledgement"); });
-  try {
-    await expect(h.router.tick()).rejects.toThrow("Crash before acknowledgement");
-  } finally {
-    crash.mockRestore();
-  }
+  await h.router.tick();
   expect(h.store.get<string>("batch-phase:leader")).toBe("creating");
   expect(h.store.get("activeTurn")).toBeUndefined();
   expect(inbounds(h.store).map(row => row.state)).toEqual(["processing", "batched"]);
@@ -3976,9 +4148,8 @@ test("restart from ambiguous chat creation never unseals or repeats the remote m
   await restarted.tick();
   expect(h.backend.creates).toHaveLength(1);
   expect(h.backend.prompts).toEqual([]);
-  expect(inbounds(reopened).map(row => row.state)).toEqual(["unknown", "batched"]);
-  expect(reopened.pendingOutbox()).toHaveLength(1);
-  expect(reopened.pendingOutbox()[0]!.text).toBe("Something interrupted that one before I could get to it. Mind sending it again?");
+  expect(inbounds(reopened).map(row => row.state)).toEqual(["processing", "batched"]);
+  expect(reopened.pendingOutbox()).toEqual([]);
 });
 
 test.each(["leader", "member"])("unsealing refuses a retired %s and never resets unrelated rows", async retired => {
@@ -5305,4 +5476,1901 @@ test("a held failure notice is sent once the grace passes with no recovery", asy
   setSystemTime(new Date("2026-09-10T12:06:00Z"));
   await h.router.tick();
   expect(h.controls().map(c => [c.replyTo, c.text])).toEqual([["in", "Something went wrong on my end with that one. Mind trying again?"]]);
+});
+
+test("review633: a late uncertain steer cannot consume a newer batched message", async () => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response, still in flight"); });
+  h.input("first", "Original work");
+  await h.router.tick();
+  h.input("followup", "Earlier follow-up");
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  h.backend.final("Original answer");
+  h.input("newer", "UNIQUE_NEWER_REQUEST");
+  h.backend.promptBehavior = async call => {
+    if (call.messageId === messageId("followup")) {
+      // The original steer commits after negative readback. The fallback POST
+      // replays that ID, so its newly appended words are not admitted.
+      const old = steers[0]!;
+      h.backend.records.push({ id: old.messageId, type: "user", text: old.text, time: { created: Date.now() } });
+    } else h.backend.accept(call);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  await h.router.tick();
+  const newer = inbounds(h.store).find(row => row.id === "newer")!;
+  const admitted = h.backend.records.filter(m => m.type === "user");
+  expect({ newerState: newer.state, newerAdmitted: admitted.some(m => m.type === "user" && m.text.includes("UNIQUE_NEWER_REQUEST")) })
+    .not.toEqual({ newerState: "done", newerAdmitted: false });
+});
+
+
+test.each(["single", "multi", "restart", "busy", "status", "quoted", "file", "refused", "absent", "rotation", "context"])("sealed steer fallback keeps newer input separate (%s)", async kind => {
+  const h = filesSetup(kind === "rotation" ? { rotateAfterMs: 1 } : {});
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => {
+    if (kind === "refused") return "refused";
+    throw new Error("lost response, still in flight");
+  });
+  if (kind === "quoted") {
+    h.input("target", "Original quoted text");
+    h.store.updateInbound("target", "done");
+  }
+  h.input("first", "Original work");
+  await h.router.tick();
+  const reply = kind === "quoted" ? { replyTo: "target" } : {};
+  h.input("followup", "Earlier follow-up", { ...reply, source: "typed" });
+  if (kind === "multi" || kind === "restart") h.input("member", "Second original line", reply);
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  const sealed = h.store.get<NormalizedInbound>("batch:followup")!;
+  const originalBody = steers[0]!.text;
+  h.backend.final("Original answer");
+  h.input("newer", "UNIQUE_NEWER_REQUEST", { ...reply, attachments: kind === "file" ? [attachment()] : [] });
+  if (kind === "quoted") h.store.updateInbound("target", "done", { ...inbounds(h.store).find(row => row.id === "target")!.payload as NormalizedInbound, text: "Changed quote" });
+  if (kind === "file") h.transport.downloadAttachment = async () => ({ data: tinyPng, mimeType: "image/png", name: "newer.png" });
+  if (kind === "context") h.store.set("missedSynthetic", [{ id: "wake:missed", text: "UNIQUE_MISSED_UPDATE" }]);
+  let armed = true;
+  if (kind === "busy" || kind === "status") h.backend.onStatuses = () => {
+    if (!armed || h.store.get("batch-phase:followup") !== "preparing") return;
+    armed = false;
+    if (kind === "busy") h.backend.states[steers[0]!.id] = { type: "busy" };
+    else h.input("status", "/status");
+  };
+  h.backend.promptBehavior = async call => {
+    if (call.messageId === messageId("followup") && kind !== "absent" && kind !== "refused") {
+      // The original steer commits after negative readback; the idempotent fallback replays it.
+      if (!h.backend.records.some(record => record.id === call.messageId)) h.backend.records.push({ id: call.messageId, type: "user", text: originalBody, time: { created: Date.now() } });
+    } else h.backend.accept(call);
+  };
+  let router = kind === "restart" ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  setSystemTime(start + 120_000);
+  await router.tick();
+  if (kind === "busy" || kind === "status") {
+    expect(h.store.get<NormalizedInbound>("batch:followup")).toEqual(sealed);
+    expect(h.store.get<string>("batch-phase:followup")).toBe("queued-steer");
+    h.backend.states = {};
+    router = new Router(h.store, h.backend, h.transport, h.routerOptions);
+    await router.tick();
+  }
+  const fallback = h.backend.prompts.find(prompt => prompt.messageId === messageId("followup"))!;
+  expect(fallback).toMatchObject({ id: steers[0]!.id, text: originalBody, files: [] });
+  expect(h.store.get<NormalizedInbound>("batch:followup")!.batchIds).toEqual(sealed.batchIds);
+  expect(inbounds(h.store).find(row => row.id === "newer")?.state).toBe("pending");
+  for (const id of sealed.batchIds!) expect(inbounds(h.store).find(row => row.id === id)?.state).toBe("done");
+  if (kind === "context") {
+    expect(fallback.system).not.toContain("UNIQUE_MISSED_UPDATE");
+    expect(h.store.get<unknown[]>("missedSynthetic")).toHaveLength(1);
+  }
+  h.backend.onStatuses = undefined;
+  h.backend.final("Follow-up answer");
+  await router.tick();
+  const newer = h.backend.prompts.find(prompt => prompt.messageId === messageId("newer"))!;
+  expect(newer.text).toContain("UNIQUE_NEWER_REQUEST");
+  expect(newer.messageId).not.toBe(fallback.messageId);
+  expect(newer.files).toHaveLength(kind === "file" ? 1 : 0);
+  if (kind === "context") {
+    expect(newer.system).toContain("UNIQUE_MISSED_UPDATE");
+    expect(h.store.get<unknown[]>("missedSynthetic")).toEqual([]);
+  }
+  expect(inbounds(h.store).find(row => row.id === "newer")?.state).toBe("done");
+  expect(h.backend.records.some(record => record.type === "user" && record.id === messageId("newer") && record.text.includes("UNIQUE_NEWER_REQUEST"))).toBe(true);
+});
+
+
+test("queued steer fallback survives reopening the store with its original members and body", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "spectrum-steer-fallback-"));
+  directories.push(directory);
+  const path = join(directory, "store.sqlite");
+  const h = setup(path);
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original work");
+  await h.router.tick();
+  h.input("followup", "Earlier follow-up");
+  h.input("member", "Another original line");
+  await h.router.tick();
+  const original = steers[0]!;
+  h.backend.final("Original answer");
+  h.input("newer", "UNIQUE_NEWER_REQUEST");
+  h.backend.onStatuses = () => {
+    if (h.store.get("batch-phase:followup") === "preparing") h.backend.states[original.id] = { type: "busy" };
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.store.get<string>("batch-phase:followup")).toBe("queued-steer");
+  h.backend.onStatuses = undefined;
+  h.backend.states = {};
+  h.store.close();
+  const reopened = new Store(path);
+  stores.push(reopened);
+  const restarted = new Router(reopened, h.backend, h.transport, options);
+  h.backend.promptBehavior = async call => {
+    h.backend.records.push({ id: call.messageId, type: "user", text: original.text, time: { created: Date.now() } });
+  };
+  await restarted.tick();
+  expect(h.backend.prompts.at(-1)).toMatchObject({ id: original.id, messageId: original.messageId, text: original.text });
+  expect(reopened.get<NormalizedInbound>("batch:followup")!.batchIds).toEqual(["followup", "member"]);
+  expect(inbounds(reopened).filter(row => ["followup", "member", "newer"].includes(row.id)).map(row => row.state)).toEqual(["done", "done", "pending"]);
+});
+
+// A wake no longer runs ahead of typed text, so only a secure-form notice can intervene here.
+test.each(["secret"])("an intervening %s cannot rotate an unresolved steer into a second execution", async kind => {
+  const h = setup(":memory:", { rotateAfterMs: 1, watchMs: 0 });
+  const start = Date.now();
+  setSystemTime(start);
+  const records = new Map<string, MessageRecord[]>();
+  const admitted = new Set<string>();
+  h.backend.createBehavior = async () => {
+    const id = `ses_${h.backend.creates.length}`;
+    h.backend.records = [];
+    records.set(id, h.backend.records);
+    return { id, directory: `/Chats/${id}` };
+  };
+  h.backend.messages = async id => records.get(id) ?? [];
+  h.backend.promptAccepted = async (id, _directory, messageId) => admitted.has(`${id}:${messageId}`);
+  h.backend.promptBehavior = async call => {
+    const key = `${call.id}:${call.messageId}`;
+    if (admitted.has(key)) return;
+    admitted.add(key);
+    records.get(call.id)!.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+  };
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original work");
+  await h.router.tick();
+  const syntheticBody = "Filled in the secure form callback";
+  h.input(`${kind}:before-steer`, syntheticBody);
+  h.input("followup", "Earlier follow-up");
+  h.input("member", "Another original line");
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  const original = steers[0]!;
+  h.backend.final("NO_REPLY");
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  const watcher = h.backend.prompts.at(-1)!;
+  expect(watcher.text).toBe(syntheticBody);
+  // The old steer commits after its readback, while the intervening watcher runs.
+  admitted.add(`${original.id}:${original.messageId}`);
+  records.get(original.id)!.push({ id: original.messageId, type: "user", text: original.text, time: { created: Date.now() } });
+  h.backend.records = records.get(watcher.id)!;
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  const deliveries = [...records].flatMap(([id, rows]) => rows.filter(row => row.type === "user" && row.id === original.messageId).map(() => id));
+  expect(deliveries).toEqual([original.id]);
+  // The watcher settled this accepted steer too, so its receipt never needs another POST.
+  expect(h.backend.prompts.filter(prompt => prompt.messageId === original.messageId)).toEqual([]);
+  expect(inbounds(h.store).filter(row => ["followup", "member"].includes(row.id)).map(row => row.state)).toEqual(["done", "done"]);
+  // Once the steer is accepted, ordinary future turns may rotate again.
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  h.input("later", "New work");
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.id).not.toBe(original.id);
+});
+
+test("review633r2: late accepted steer after the first turn closes still forwards its answer", async () => {
+  const h = setup(":memory:", { watchMs: 0 });
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Follow-up question");
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  let landed = false;
+  h.backend.promptAccepted = async (id, directory, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && promptId === messageId("followup") && !landed) {
+      // The old turn finishes in poll(); the pending steer commits before
+      // the subsequent acceptance read, starting its own run.
+      landed = true;
+      h.backend.records.push({ id: promptId, type: "user", text: "Follow-up question", time: { created: Date.now() } });
+    }
+    return read(id, directory, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "followup")!.state).toBe("done");
+  expect(h.store.get<object>("activeTurn")).toMatchObject({
+    id: steers[0]!.id, directory: "/Chats/ses_1", generation: 1,
+    inboundId: "followup", messageId: steers[0]!.messageId, phase: "running",
+  });
+  h.backend.final("Follow-up answer");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Original answer", "Follow-up answer"]);
+});
+
+
+test.each(["running", "completed", "multi", "failed-foreground", "legacy-route-only", "reset-during-read"])("accepted steer after foreground settlement retains reply ownership (%s)", async kind => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Follow-up question");
+  if (kind === "multi") h.input("member", "Second original line");
+  await h.router.tick();
+  const original = steers[0]!;
+  const firstAnswer = h.backend.final("Original answer");
+  if (kind === "legacy-route-only") {
+    const kept = h.store.get<{ id: string; directory: string; generation: number }>("steer-attempt:followup")!;
+    h.store.set("steer-attempt:followup", { id: kept.id, directory: kept.directory, generation: kept.generation });
+  }
+  const read = h.backend.promptAccepted.bind(h.backend);
+  h.backend.promptAccepted = async (id, directory, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && promptId === original.messageId && !h.backend.records.some(record => record.id === promptId)) {
+      h.backend.records.push({ id: promptId, type: "user", text: original.text, time: { created: Date.now() } });
+      if (kind === "completed") h.backend.final("Follow-up answer");
+      if (kind === "failed-foreground") h.store.set("activeTurn", { ...h.store.get<object>("route"), messageId: "failed-run", startedAt: start, phase: "failed" });
+      if (kind === "reset-during-read") {
+        const route = h.store.get<{ id: string; directory: string; generation: number }>("route")!;
+        h.store.set("route", { ...route, generation: route.generation + 1 });
+        h.store.set("activeTurn", null);
+        h.store.updateInbound("followup", "cancelled");
+      }
+    }
+    return read(id, directory, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  if (kind === "reset-during-read") {
+    h.backend.final("Old follow-up answer");
+    await h.router.tick();
+    expect(h.store.get<object | null>("activeTurn")).toBeNull();
+    expect(inbounds(h.store).find(row => row.id === "followup")!.state).toBe("cancelled");
+    expect(h.conversations().map(op => op.text)).toEqual(["Original answer"]);
+    return;
+  }
+  expect(h.store.get<object>("activeTurn")).toMatchObject({ id: original.id, messageId: original.messageId, inboundId: "followup", phase: "running" });
+  expect(h.store.get<NormalizedInbound>("batch:followup")!.batchIds).toEqual(kind === "multi" ? ["followup", "member"] : ["followup"]);
+  expect(h.conversations().map(op => op.id)).toEqual([`reply:1:${firstAnswer.id}`]);
+  if (kind !== "completed") h.backend.final("Follow-up answer");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.text, op.replyTo, op.sessionId, op.generation])).toEqual([
+    ["Original answer", "first", original.id, 1], ["Follow-up answer", "followup", original.id, 1],
+  ]);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(steers).toHaveLength(1);
+  if (kind === "multi") expect(inbounds(h.store).filter(row => ["followup", "member"].includes(row.id)).map(row => row.state)).toEqual(["done", "done"]);
+});
+
+test("late accepted steer reply ownership survives closing and reopening the bridge store", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "spectrum-late-steer-"));
+  directories.push(directory);
+  const path = join(directory, "store.sqlite");
+  const h = setup(path);
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Follow-up question");
+  await h.router.tick();
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  h.backend.promptAccepted = async (id, dir, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && promptId === steers[0]!.messageId && !h.backend.records.some(record => record.id === promptId)) h.backend.records.push({ id: promptId, type: "user", text: steers[0]!.text, time: { created: Date.now() } });
+    return read(id, dir, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  h.store.close();
+  const reopened = new Store(path);
+  stores.push(reopened);
+  const restarted = new Router(reopened, h.backend, h.transport, h.routerOptions);
+  h.backend.final("Follow-up answer");
+  await restarted.tick();
+  await restarted.tick();
+  expect(reopened.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([
+    ["Original answer", "first"], ["Follow-up answer", "followup"],
+  ]);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(steers).toHaveLength(1);
+});
+
+
+test("two uncertain steers accepted after settlement keep all replies tracked in order", async () => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Second question");
+  await h.router.tick();
+  h.input("another", "Third question");
+  await h.router.tick();
+  expect(new Set(steers.map(steer => steer.messageId)).size).toBe(2);
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  h.backend.promptAccepted = async (id, dir, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && [messageId("followup"), messageId("another")].includes(promptId) && !h.backend.records.some(record => record.id === promptId)) {
+      const steer = steers.find(steer => steer.messageId === promptId)!;
+      h.backend.records.push({ id: promptId, type: "user", text: steer.text, time: { created: Date.now() } });
+      h.backend.final(promptId === messageId("followup") ? "Second answer" : "Third answer");
+    }
+    return read(id, dir, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.store.get<object>("activeTurn")).toMatchObject({
+    messageId: messageId("followup"), steered: [messageId("another")], phase: "running",
+  });
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Original answer", "Second answer", "Third answer"]);
+  expect(h.backend.prompts).toHaveLength(1);
+});
+
+test.each(["same-run", "own-run", "multi", "quiet"])("a lost-response steer already answered by its foreground is not adopted twice (%s)", async kind => {
+  const h = setup();
+  let finishFirst = false;
+  const steers = steering(h.backend, async call => {
+    if (kind === "own-run" && !finishFirst) {
+      finishFirst = true;
+      h.backend.final("Original answer");
+    }
+    if (!h.backend.records.some(record => record.id === call.messageId)) h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+    throw new Error("lost response");
+  });
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Follow-up question");
+  if (kind === "multi") h.input("member", "Another follow-up line");
+  await h.router.tick();
+  h.backend.final(kind === "quiet" ? "NO_REPLY" : "Both answered");
+  await h.router.tick();
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.conversations().map(op => [op.text, op.replyTo])).toEqual(kind === "quiet" ? []
+    : kind === "own-run" ? [["Original answer", "first"], ["Both answered", "first"]] : [["Both answered", "first"]]);
+  expect(h.store.get<object | null>("activeTurn")).toBeNull();
+  expect(inbounds(h.store).map(row => row.state)).toEqual(kind === "multi" ? ["done", "done", "done"] : ["done", "done"]);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(steers).toHaveLength(1);
+});
+
+test.each(["single", "multi", "own-run"])("a queued steer covered by settlement cannot replay an already-delivered answer (%s)", async kind => {
+  const h = setup();
+  const steers = steering(h.backend, async () => {
+    if (steers.length === 1) throw new Error("lost response");
+    return "refused";
+  });
+  h.backend.promptBehavior = async call => {
+    if (!h.backend.records.some(record => record.id === call.messageId)) h.backend.accept(call);
+  };
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Follow-up question");
+  if (kind === "multi") h.input("member", "Another original line");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.store.get<string>("batch-phase:followup")).toBe("queued-steer");
+  const original = steers[0]!;
+  if (kind === "own-run") h.backend.final("Original answer");
+  h.backend.records.push({ id: original.messageId, type: "user", text: original.text, time: { created: Date.now() } });
+  h.backend.final("Both answered");
+  await h.router.tick();
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.conversations().map(op => [op.text, op.replyTo])).toEqual(kind === "own-run"
+    ? [["Original answer", "first"], ["Both answered", "followup"]] : [["Both answered", "first"]]);
+  expect(h.store.get<object | null>("activeTurn")).toBeNull();
+  expect(inbounds(h.store).map(row => row.state)).toEqual(kind === "multi" ? ["done", "done", "done"] : ["done", "done"]);
+  expect(h.backend.prompts).toHaveLength(kind === "own-run" ? 2 : 1);
+});
+
+test.each(["normal", "reversed"])("late steer replies follow accepted record order (%s)", async order => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("second", "Second question");
+  await h.router.tick();
+  h.input("third", "Third question");
+  await h.router.tick();
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  let exposed = false;
+  h.backend.promptAccepted = async (id, dir, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && !exposed && promptId === messageId("second")) {
+      exposed = true;
+      for (const inbound of order === "normal" ? ["second", "third"] : ["third", "second"]) {
+        const steer = steers.find(call => call.messageId === messageId(inbound))!;
+        h.backend.records.push({ id: steer.messageId, type: "user", text: steer.text, time: { created: Date.now() } });
+        h.backend.final(inbound === "second" ? "Second answer" : "Third answer");
+      }
+    }
+    return read(id, dir, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.store.get<object>("activeTurn")).toMatchObject({ id: steers[0]!.id, messageId: messageId("second"), steered: [messageId("third")] });
+  await h.router.tick();
+  setSystemTime(start + 240_000);
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(order === "normal"
+    ? ["Original answer", "Second answer", "Third answer"] : ["Original answer", "Third answer", "Second answer"]);
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "done", "done"]);
+  expect(h.store.get<object | null>("activeTurn")).toBeNull();
+  expect(h.backend.prompts).toHaveLength(1);
+});
+
+
+const lateSteerOrders = [
+  ["second", "third", "fourth"], ["second", "fourth", "third"],
+  ["third", "second", "fourth"], ["third", "fourth", "second"],
+  ["fourth", "second", "third"], ["fourth", "third", "second"],
+];
+test.each(lateSteerOrders.map(order => ({ order })))("all accepted late-steer run orders retain every reply: $order", async ({ order }) => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  for (const inbound of ["second", "third", "fourth"]) {
+    h.input(inbound, `${inbound} question`);
+    await h.router.tick();
+  }
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  let exposed = false;
+  h.backend.promptAccepted = async (id, dir, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && !exposed && promptId === messageId("second")) {
+      exposed = true;
+      for (const inbound of order) {
+        const steer = steers.find(call => call.messageId === messageId(inbound))!;
+        h.backend.records.push({ id: steer.messageId, type: "user", text: steer.text, time: { created: Date.now() } });
+        h.backend.final(`${inbound} answer`);
+      }
+    }
+    return read(id, dir, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  await h.router.tick();
+  setSystemTime(start + 240_000);
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Original answer", ...order.map(inbound => `${inbound} answer`)]);
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "done", "done", "done"]);
+  expect(h.store.get<object | null>("activeTurn")).toBeNull();
+  expect(h.backend.prompts).toHaveLength(1);
+});
+
+test("an accepted steer with a temporarily unreadable record stays tracked beyond the grace period", async () => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => "queued");
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Follow-up question");
+  await h.router.tick();
+  h.backend.final("Original answer");
+  h.backend.single = true;
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.store.get<object>("activeTurn")).toMatchObject({ messageId: messageId("first"), phase: "running" });
+  expect(h.conversations()).toEqual([]);
+  const original = steers[0]!;
+  h.backend.records.push({ id: original.messageId, type: "user", text: original.text, time: { created: Date.now() } });
+  h.backend.final("Follow-up answer");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Original answer", "Follow-up answer"]);
+  expect(h.store.get<object | null>("activeTurn")).toBeNull();
+});
+
+test.each(["question", "approval"].flatMap(kind => ["missing-record", "page-error", "admission-error"].map(failure => ({ kind, failure }))))("an unreadable accepted steer never holds its foreground's live $kind ($failure)", async ({ kind, failure }) => {
+  const h = setup();
+  const steers = steering(h.backend, async () => "queued");
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Follow-up question");
+  await h.router.tick();
+  h.backend.single = true;
+  if (failure === "page-error") Object.assign(h.backend, {
+    async messages(_id: string, _directory: string, options: { until?: string } = {}) {
+      if (options.until === steers[0]!.messageId) throw new Error("page unavailable");
+      return h.backend.records;
+    },
+  });
+  if (failure === "admission-error") h.backend.promptAccepted = async () => { throw new Error("admission unavailable"); };
+  if (kind === "question") h.backend.questionRequests = [question()];
+  else h.backend.permissionRequests = [permission()];
+  await h.router.tick();
+  await h.router.tick();
+  expect(asked(h.store)).toHaveLength(1);
+  deliver(h.store);
+  h.input("answer", kind === "question" ? "A" : "yes");
+  await h.router.tick();
+  if (kind === "question") expect(h.backend.questionReplies).toHaveLength(1);
+  else expect(h.backend.permissionReplies).toHaveLength(1);
+  h.backend.messages = Backend.prototype.messages.bind(h.backend);
+  const steer = steers[0]!;
+  h.backend.records.push({ id: steer.messageId, type: "user", text: steer.text, time: { created: Date.now() } });
+  h.backend.final("Both answered");
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Both answered"]);
+  expect(h.store.get<object | null>("activeTurn")).toBeNull();
+});
+
+test("review633r3: a failed late steer does not discard an earlier completed reply", async () => {
+  const h = setup(":memory:", { failureNoticeMs: 0, watchMs: 0 });
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  for (const inbound of ["second", "third"]) {
+    h.input(inbound, `${inbound} question`);
+    await h.router.tick();
+  }
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  let exposed = false;
+  h.backend.promptAccepted = async (id, dir, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && !exposed && promptId === messageId("second")) {
+      exposed = true;
+      for (const inbound of ["second", "third"]) {
+        const call = steers.find(call => call.messageId === messageId(inbound))!;
+        h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+        if (inbound === "second") h.backend.final("Second successful answer");
+        else h.backend.failed();
+      }
+    }
+    return read(id, dir, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Original answer", "Second successful answer"]);
+});
+
+test.each((["final", "tool"] as const).flatMap(replyMode => ["generic", "model-error", "first-turn-failure", "atomic-rollback"].map(kind => ({ replyMode, kind }))))("failure settlement preserves earlier replies and completed batch members ($kind, $replyMode)", async ({ replyMode, kind }) => {
+  const h = setup(":memory:", { replyMode, failureNoticeMs: 0, watchMs: 0 });
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("second", "Second question");
+  h.input("second-member", "Another part of the successful question");
+  await h.router.tick();
+  h.input("third", "Third question");
+  await h.router.tick();
+  h.backend.final(replyMode === "tool" ? "NO_REPLY" : "Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  let exposed = false;
+  let lastIdle = "";
+  h.backend.promptAccepted = async (id, dir, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && !exposed && promptId === messageId("second")) {
+      exposed = true;
+      for (const inbound of ["second", "third"]) {
+        const call = steers.find(call => call.messageId === messageId(inbound))!;
+        h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+        if (inbound === "second") h.backend.final("Second successful answer");
+        else {
+          h.backend.step("FAILED_RUN_PARTIAL_ANSWER").answer = true;
+          h.backend.failed();
+          const idle = h.backend.records.at(-1)!;
+          if (idle.type === "idle") {
+            if (kind === "model-error") idle.modelError = true;
+            if (kind === "first-turn-failure") idle.firstTurnFailure = true;
+          }
+          lastIdle = idle.id;
+        }
+      }
+    }
+    return read(id, dir, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  if (kind === "atomic-rollback") {
+    const before = h.store.get<object>("watermark");
+    const set = h.store.set.bind(h.store);
+    const failWatermark = spyOn(h.store, "set").mockImplementation((key, value) => {
+      if (key === "watermark") throw new Error("watermark write failed");
+      set(key, value);
+    });
+    try { await h.router.tick(); } finally { failWatermark.mockRestore(); }
+    expect(h.conversations().map(op => op.text)).toEqual(replyMode === "tool" ? [] : ["Original answer"]);
+    expect(h.store.get<object>("watermark")).toEqual(before);
+    expect(h.store.get<object>("activeTurn")).toMatchObject({ phase: "running" });
+  }
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(replyMode === "tool" ? [] : ["Original answer", "Second successful answer"]);
+  expect(inbounds(h.store).filter(row => ["second", "second-member"].includes(row.id)).map(row => row.state)).toEqual(["done", "done"]);
+  expect(h.store.get<object>("watermark")).toMatchObject({ id: lastIdle });
+  expect(h.controls()).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(new Set(steers.map(call => call.messageId)).size).toBe(2);
+});
+
+test("review633r4: final failed run cannot send its own intermediate answer", async () => {
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  h.input("first", "Do the work");
+  await h.router.tick();
+  const partial = h.backend.step("FAILED_RUN_PARTIAL_ANSWER");
+  partial.answer = true;
+  h.backend.failed("FAILED_RUN_ERROR");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual([]);
+});
+
+
+test.each(["generic", "model-error", "first-turn-failure"])("failure forwarding excludes the final run without an earlier success (%s)", async kind => {
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  h.input("first", "Do the work");
+  await h.router.tick();
+  h.backend.step("FAILED_RUN_PARTIAL_ANSWER").answer = true;
+  h.backend.step("FAILED_RUN_OTHER_PARTIAL_ANSWER").answer = true;
+  h.backend.failed("FAILED_RUN_ERROR");
+  const idle = h.backend.records.at(-1)!;
+  if (idle.type === "idle") {
+    if (kind === "model-error") idle.modelError = true;
+    if (kind === "first-turn-failure") idle.firstTurnFailure = true;
+  }
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.backend.prompts).toHaveLength(1);
+});
+
+// Tool mode (replyMode "tool"): the agent texts the chat itself with imessage_send, which queues
+// session-bound conversation rows through the bridge API; the bridge never forwards assistant text.
+const toolSetup = (overrides: Partial<ConstructorParameters<typeof Router>[3]> = {}) => setup(":memory:", { replyMode: "tool", ...overrides });
+/** What the bridge API queues for `imessage_send` / `cli.ts send` on the live route. */
+function agentSends(h: ReturnType<typeof setup>, key: string, text: string, generation = 1, sessionId = "ses_1") {
+  h.store.enqueue({ id: `send:${key}`, kind: "conversation", text, sessionId, generation });
+}
+const nudgeRows = (store: Store) => inbounds(store).filter(row => row.id.startsWith("wake:reply-nudge:"));
+
+test("replyMode config defaults to final and accepts only final or tool", () => {
+  expect(replyModeConfig(undefined)).toBe("final");
+  expect(replyModeConfig("final")).toBe("final");
+  expect(replyModeConfig("tool")).toBe("tool");
+  for (const bad of ["Tool", "", null, 1, {}]) expect(() => replyModeConfig(bad)).toThrow("Invalid bridge configuration");
+});
+
+test("tool mode: final and earlier assistant text never reach the chat, and the turn still settles", async () => {
+  const events: string[][] = [];
+  const h = toolSetup({ log: (event, code) => events.push([event, code ?? ""]) });
+  h.input("in_1", "What's on today?");
+  await h.router.tick();
+  expect(h.store.get<{ outbox?: number }>("activeTurn")!.outbox).toBe(0);
+  // An answer-phase step the final mode would forward early, then the agent texts the chat itself, then its internal final note.
+  const earlier = h.backend.step("Earlier words");
+  earlier.answer = true;
+  agentSends(h, "today", "Gym at 6, dinner with Moni at 8");
+  const final = h.backend.final("Sent the day's plan.");
+  const idle = h.backend.records.at(-1)!;
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([["send:today", "Gym at 6, dinner with Moni at 8"]]);
+  expect(h.store.pendingOutbox().some(op => op.id.startsWith("reply:"))).toBe(false);
+  expect(h.store.getOperation(`reply:1:${final.id}`)).toBeUndefined();
+  expect(inbounds(h.store).find(row => row.id === "in_1")?.state).toBe("done");
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(h.store.get<unknown>("watermark")).toEqual({ sessionId: "ses_1", id: idle.id });
+  expect(h.store.get<number>("settledAt")).toBeNumber();
+  expect(nudgeRows(h.store)).toEqual([]);
+  expect(events.some(([event]) => event === "reply-enqueued")).toBe(false);
+  // The next text runs as usual.
+  h.input("in_2", "Thanks");
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["What's on today?", "Thanks"]);
+});
+
+test("tool mode: a text typed while a watcher wake runs is steered into it, not queued behind it", async () => {
+  const h = toolSetup();
+  const steers = steering(h.backend);
+  const wake = `wake:${"f".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody()]);
+  h.input("typed", "Are you there?");
+  await h.router.tick();
+  await h.router.tick();
+  // It reached the agent mid-wake, under the id a turn of its own would use, and was never sent again.
+  expect(steers.map(call => [call.text, call.messageId])).toEqual([["Are you there?", messageId("typed")]]);
+  expect(steers[0]!.guidance).toContain("Answer it with imessage_send");
+  expect(inbounds(h.store).find(row => row.id === "typed")?.state).toBe("done");
+  expect(h.store.get("activeTurn")).toMatchObject({ inboundId: wake, typed: true });
+  // The wake ends without a text: because someone typed into it, the agent is asked once whether that was meant.
+  h.backend.final("Logged it.");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), REPLY_NUDGE]);
+  expect(nudgeRows(h.store)).toHaveLength(1);
+});
+
+test("tool mode: a watcher wake nobody typed into ends silently", async () => {
+  const h = toolSetup();
+  const wake = `wake:${"a".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  h.backend.final("Logged it.");
+  await h.router.tick();
+  await h.router.tick();
+  expect(nudgeRows(h.store)).toEqual([]);
+  expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody()]);
+});
+
+test("final mode: a text typed while a watcher wake runs still waits for its own turn", async () => {
+  const h = setup();
+  const steers = steering(h.backend);
+  const wake = `wake:${"9".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  h.input("typed", "Are you there?");
+  await h.router.tick();
+  expect(steers).toEqual([]);
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), "Are you there?"]);
+});
+
+test("tool mode: a typed message whose turn texted nothing gets exactly one reminder", async () => {
+  const h = toolSetup();
+  h.input("in_1", "Did the parcel come?");
+  await h.router.tick();
+  h.backend.final("Checked: it arrived at 10:12.");
+  await h.router.tick();
+  // Queued during the settle, so it is sealed on the next tick like any arrival mid-tick.
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(inbounds(h.store).find(row => row.id === "in_1")?.state).toBe("done");
+  const [nudge] = nudgeRows(h.store);
+  expect(nudge!.payload.text).toBe(REPLY_NUDGE);
+  expect(REPLY_NUDGE).toBe("[Bridge request, not typed by the owner.] You finished without texting anything to the chat. If they need an answer, send it now with imessage_send; otherwise just end the turn.");
+  expect(h.store.get<boolean>("reply-nudged:in_1")).toBe(true);
+  // The reminder runs as its own bridge turn, with the wake guidance and no reaction targets.
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["Did the parcel come?", REPLY_NUDGE]);
+  const system = h.backend.prompts[1]!.system!;
+  expect(system.startsWith(`${wakeGuidance({ replyMode: "tool" })}\n`)).toBe(true);
+  expect(system).toContain("Source incoming message IDs (in order, available as reaction targets): []");
+  // The reminder's own turn ends with nothing texted too: no second reminder, ever.
+  h.backend.final("They don't need anything else.");
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(nudgeRows(h.store)).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(2);
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(h.store.pendingInbound()).toEqual([]);
+  expect(h.conversations()).toEqual([]);
+});
+
+test("tool mode: a reminded turn that then texts the chat settles normally", async () => {
+  const h = toolSetup();
+  h.input("in_1", "Book it");
+  await h.router.tick();
+  h.backend.final("Booked.");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe(REPLY_NUDGE);
+  agentSends(h, "booked", "Booked for 7pm");
+  h.backend.final("Told them.");
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Booked for 7pm"]);
+  expect(nudgeRows(h.store).map(row => row.state)).toEqual(["done"]);
+  expect(h.store.get("activeTurn")).toBeNull();
+});
+
+test("tool mode: no reminder for watcher turns, background follow-ups, turns that sent, or a deliberate NO_REPLY", async () => {
+  const h = toolSetup({ watchMs: 0 });
+  // A watcher wake that logs and stays quiet.
+  h.input(`wake:${"f".repeat(64)}`, "[Watcher event from watch, not typed by the owner.]\nroutine");
+  await h.router.tick();
+  h.backend.final("Logged it.");
+  await h.router.tick();
+  // A typed turn that texted the chat (a file counts, like a send, app card or poll).
+  h.input("in_1", "Send me the chart");
+  await h.router.tick();
+  h.store.enqueue({ id: "file:chart", kind: "conversation", text: "", sessionId: "ses_1", generation: 1 });
+  h.backend.final("Sent the chart.");
+  await h.router.tick();
+  // A typed turn answered with only a tapback, ending in NO_REPLY on purpose.
+  h.input("in_2", "Thanks!");
+  await h.router.tick();
+  h.backend.final("Reacted with a heart.\nNO_REPLY");
+  await h.router.tick();
+  // Background follow-up work the agent resumed on its own.
+  h.backend.step("Background result noted");
+  h.backend.settle();
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(nudgeRows(h.store)).toEqual([]);
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["[Watcher event from watch, not typed by the owner.]\nroutine", "Send me the chart", "Thanks!"]);
+  expect(h.conversations().map(op => op.id)).toEqual(["file:chart"]);
+  expect(h.store.get("activeTurn")).toBeNull();
+});
+
+test("tool mode: /new asks with the tool wording, and a refusal sent with imessage_send defers the reset", async () => {
+  const start = Date.parse("2026-11-09T12:00:00Z");
+  setSystemTime(start);
+  const h = toolSetup({ resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  h.input("first", "Start the audit in the background");
+  await h.router.tick();
+  agentSends(h, "onit", "On it");
+  h.backend.final("Started the audit.");
+  await h.router.tick();
+  for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent", `provider-${op.id}`);
+  h.input("new", "/new");
+  await h.router.tick();
+  expect(h.controls().map(op => op.text)).toEqual(["Fresh start. What's up?"]);
+  await h.router.tick();
+  const nudge = h.backend.prompts.at(-1)!;
+  expect(nudge.text).toBe(newChatNudge("tool"));
+  expect(nudge.text).toContain("send the owner one short line with the imessage_send tool");
+  expect(nudge.text).not.toContain("NO_REPLY");
+  // The agent can't reset yet and texts the owner why; its final note stays internal.
+  agentSends(h, "refused", "Can't start fresh yet, the audit is still running.", 2);
+  h.backend.final("t3_context_reset refused: background work.");
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.text, op.generation])).toEqual([["Can't start fresh yet, the audit is still running.", 2]]);
+  expect(h.store.get<{ generation: number }>("newDeferred")).toMatchObject({ generation: 2 });
+  // A reset nudge is a bridge row: never reminded.
+  expect(nudgeRows(h.store)).toEqual([]);
+  // Once idle for the reset window with nothing said since, the reset is asked for again, once.
+  setSystemTime(start + 11 * 60_000);
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === newChatNudge("tool"))).toHaveLength(2);
+});
+
+test("tool mode: a /new nudge the agent handles silently leaves no deferral", async () => {
+  const h = toolSetup();
+  h.backend.resets = true;
+  h.input("first", "Hi");
+  await h.router.tick();
+  agentSends(h, "hi", "Hey");
+  h.backend.final("Greeted.");
+  await h.router.tick();
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Reset done.");
+  await h.router.tick();
+  expect(h.store.get("newDeferred")).toBeNull();
+  expect(nudgeRows(h.store)).toEqual([]);
+  expect(h.conversations().map(op => op.text)).toEqual(["Hey"]);
+});
+
+test("tool mode: every prompt carries the marker and the imessage_send instructions; final mode keeps the old wording", async () => {
+  const h = toolSetup();
+  const steers = steering(h.backend);
+  h.input("in_1", "Hi");
+  await h.router.tick();
+  h.input("in_2", "And another thing");
+  await h.router.tick();
+  agentSends(h, "both", "Both done");
+  h.backend.final("Answered both.");
+  await h.router.tick();
+  h.input(`wake:${"a".repeat(64)}`, "[Watcher event from watch, not typed by the owner.]\nprice moved");
+  await h.router.tick();
+  const [typed, woken] = h.backend.prompts.map(p => p.system!);
+  for (const system of [typed!, woken!]) {
+    expect(system).toContain(TOOL_MODE_MARKER);
+    expect(system).toContain(toolReplyRules());
+    expect(system).toContain("CURRENT_SESSION_ID for bridge commands: ses_1@1.");
+    expect(system).not.toContain("Your primary response is forwarded automatically");
+    expect(system).not.toContain("end your reply with exactly NO_REPLY");
+  }
+  expect(TOOL_MODE_MARKER).toBe("Your final message is not sent to the chat.");
+  expect(typed!.startsWith(`${imessageGuidance({ replyMode: "tool" })}\n`)).toBe(true);
+  expect(woken!.startsWith(`${wakeGuidance({ replyMode: "tool" })}\n`)).toBe(true);
+  for (const rule of ["`imessage_send` tool (T3 Code MCP)", "`session` set to CURRENT_SESSION_ID", "send --session CURRENT_SESSION_ID --key UNIQUE_KEY --text TEXT",
+    "send each message once", "imessage_send with `file`", "Ending the turn without a send means nothing was texted", "NO_REPLY is no longer needed there, though still accepted"]) {
+    expect(typed).toContain(rule);
+  }
+  expect(steers[0]!.guidance).toContain(TOOL_MODE_MARKER);
+  expect(steers[0]!.guidance).not.toContain("your final reply still goes to the chat");
+  // Final mode is untouched.
+  const f = setup();
+  const finalSteers = steering(f.backend);
+  f.input("in_1", "Hi");
+  await f.router.tick();
+  f.input("in_2", "More");
+  await f.router.tick();
+  expect(f.backend.prompts[0]!.system).toContain("Your primary response is forwarded automatically, unless it ends with NO_REPLY.");
+  expect(f.backend.prompts[0]!.system).not.toContain(TOOL_MODE_MARKER);
+  expect(finalSteers[0]!.guidance).toContain("your final reply still goes to the chat");
+  expect(imessageGuidance()).not.toContain("imessage_send");
+});
+
+test("tool mode: a configured custom prompt still carries the marker", async () => {
+  const configRoot = mkdtempSync(join(tmpdir(), "spectrum-router-config-"));
+  directories.push(configRoot);
+  writeFileSync(join(configRoot, "opencode.jsonc"), `{ "imessage": { "prompt": "Custom texting guidance: KEEP IT SHORT." } }`);
+  const h = toolSetup({ openCodeConfigRoot: configRoot });
+  h.input("in_1", "Hi");
+  await h.router.tick();
+  const system = h.backend.prompts[0]!.system!;
+  expect(system.startsWith("Custom texting guidance: KEEP IT SHORT.\n")).toBe(true);
+  expect(system).toContain(TOOL_MODE_MARKER);
+});
+
+test("tool mode: the Sendblue chat prompt talks about sending, not replies", () => {
+  const ctx = (kind: "owner" | "dm" | "group") => ({
+    chat: kind === "group" ? { key: "group:abc", slug: "group-friends", kind, title: "Friends" }
+      : kind === "owner" ? { key: "dm:+15555550123", slug: "owner", kind, title: "Abdullah" }
+        : { key: "dm:+971585933213", slug: "moni", kind, title: "Moni" },
+    roleOf: () => ({ name: "Moni", role: "admin" as const }), typing: () => false, react: async () => {},
+  }) as unknown as ChatContext;
+  const moni = sendblueContextPrompt(ctx("dm"), false, [], false, "tool");
+  expect(moni).toContain("Who reads your messages: everything you send here goes to Moni");
+  expect(moni).not.toContain("otherwise end with exactly NO_REPLY");
+  expect(moni).toContain("with no message, ending your turn with NO_REPLY");
+  const group = sendblueContextPrompt(ctx("group"), false, [], false, "tool");
+  expect(group).toContain("send nothing, send no tapback, and end your turn with NO_REPLY");
+  const owner = sendblueContextPrompt(ctx("owner"), false, [], false, "tool");
+  expect(owner).toContain("`imessage_send` with `to` set to the slug");
+  expect(sendblueContextPrompt(ctx("dm"), false, [])).toContain("Who reads your replies");
+});
+
+test("tool mode: group follow-up engagement comes from what was texted, not the internal final", async () => {
+  const group = {
+    chat: { key: "group:abc123", slug: "group-friends", kind: "group", title: "Friends" },
+    roleOf: (address: string) => address === "+971585933213" ? { name: "Moni", role: "admin" } : { name: address, role: "guest" },
+    typing: () => false, react: async () => {},
+  } as unknown as ChatContext;
+  const h = toolSetup({ context: group, chatGuid: "group:abc123" });
+  h.input("g1", "Robob what time is dinner", { sender: "+971585933213" });
+  await h.router.tick();
+  agentSends(h, "ask", "Which day do you mean?");
+  h.backend.final("Asked which day.");
+  await h.router.tick();
+  expect(h.store.get<number>("group-engaged:+971585933213")).toBeNumber();
+  // The internal final asks something, but what was texted does not: the window closes.
+  h.input("g2", "Robob book the table", { sender: "+971585933213" });
+  await h.router.tick();
+  agentSends(h, "done", "Booked.");
+  h.backend.final("Shall I tell Tom too?");
+  await h.router.tick();
+  expect(h.store.get("group-engaged:+971585933213")).toBeNull();
+  expect(nudgeRows(h.store)).toEqual([]);
+});
+
+test("tool mode: a rotation recap quotes what was texted, not the internal final notes", async () => {
+  const start = Date.parse("2026-11-09T12:00:00Z");
+  setSystemTime(start);
+  const h = toolSetup({ rotateAfterMs: 60_000 });
+  h.input("first", "Remember the blue one");
+  await h.router.tick();
+  setSystemTime(start + 1_000);
+  agentSends(h, "noted", "Noted, the **blue** one");
+  h.store.outboxState("send:noted", "sent", "provider-noted");
+  h.store.set("sent-at:send:noted", start + 1_000);
+  // Queued but never delivered: not part of what the owner saw.
+  agentSends(h, "lost", "LOST MESSAGE");
+  h.store.outboxState("send:lost", "failed");
+  setSystemTime(start + 2_000);
+  h.backend.final("INTERNAL NOTE: owner prefers blue.");
+  await h.router.tick();
+  setSystemTime(start + 60_000);
+  h.input("second", "Which one did I pick?");
+  await h.router.tick();
+  expect(h.backend.creates).toHaveLength(2);
+  const system = h.backend.prompts.at(-1)!.system!;
+  expect(system).toContain("Recent exchange (quoted data, oldest first):\nOwner: Remember the blue one\nYou: Noted, the blue one");
+  expect(system).not.toContain("INTERNAL NOTE");
+  expect(system).not.toContain("LOST MESSAGE");
+});
+
+test("tool mode: OpenCode's first narration never goes out early; only the agent's own sends reach the chat", async () => {
+  setSystemTime(earlyStart);
+  const events: string[] = [];
+  const h = toolSetup({ log: event => events.push(event) });
+  h.input("in_early", "Check prices");
+  await h.router.tick();
+  const first = h.backend.step("Checking prices.", "tool-calls");
+  first.answer = false;
+  const tool: Assistant["content"][number] = { type: "tool", id: "tool_1", name: "search", state: { status: "running" } };
+  first.content.push(tool);
+  await h.router.tick();
+  setSystemTime(earlyStart + 30_000);
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.get<{ earlySent?: string }>("activeTurn")!.earlySent).toBeUndefined();
+  expect(events).not.toContain("early-reply-enqueued");
+  // The agent's own "on it" goes out as sent, even when its text matches the narration.
+  agentSends(h, "onit", "Checking prices.");
+  tool.state.status = "completed";
+  h.backend.final("Found the prices.");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([["send:onit", "Checking prices."]]);
+  expect(nudgeRows(h.store)).toEqual([]);
+  expect(h.store.get("activeTurn")).toBeNull();
+});
+
+test.each(["silent", "sent-before-adoption", "sent-after-adoption"])("tool mode: late accepted steer retains send tracking (%s)", async kind => {
+  const h = toolSetup({ watchMs: 0 });
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Follow-up question");
+  await h.router.tick();
+  const original = h.store.get<{ outbox: number }>("steer-attempt:followup")!;
+  h.backend.final("NO_REPLY");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  h.backend.promptAccepted = async (id, directory, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first"
+      && promptId === messageId("followup") && !h.backend.records.some(record => record.id === promptId)) {
+      h.backend.records.push({ id: promptId, type: "user", text: "Follow-up question", time: { created: Date.now() } });
+      if (kind === "sent-before-adoption") agentSends(h, "late-followup", "Follow-up answer");
+    }
+    return read(id, directory, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.store.get<object>("activeTurn")).toMatchObject({
+    id: steers[0]!.id, messageId: messageId("followup"), inboundId: "followup", outbox: original.outbox,
+  });
+  if (kind === "sent-after-adoption") agentSends(h, "late-followup", "Follow-up answer");
+  h.backend.final("Internal follow-up note");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual(kind === "silent" ? [] : [["send:late-followup", "Follow-up answer"]]);
+  expect(nudgeRows(h.store)).toHaveLength(kind === "silent" ? 1 : 0);
+  expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(kind === "silent" ? ["Original question", REPLY_NUDGE] : ["Original question"]);
+  h.backend.final("NO_REPLY");
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(nudgeRows(h.store)).toHaveLength(kind === "silent" ? 1 : 0);
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("done");
+});
+
+test.each(["pending", "sent", "uncertain"] as const)("sealed steer fallback retains the original early-send dedupe window (%s)", async state => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  setSystemTime(start + 1_000);
+  h.input("followup", "Follow-up question");
+  await h.router.tick();
+  const original = h.store.get<{ startedAt: number }>("steer-attempt:followup")!;
+  setSystemTime(start + 2_000);
+  const response = await createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) })(new Request("http://bridge/send", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "Checking.", dedupeKey: "before-fallback", sessionId: "ses_1@1" }),
+    }));
+  expect(response.status).toBe(202);
+  const { id: sentId } = await response.json() as { id: string };
+  h.store.outboxState(sentId, state);
+  h.backend.final("NO_REPLY");
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)?.messageId).toBe(messageId("followup"));
+  const continued = h.backend.step("Checking.", "tool-calls");
+  await h.router.tick();
+  expect(h.store.get<object>("activeTurn")).toMatchObject({
+    messageId: messageId("followup"), startedAt: original.startedAt, earlyOutbox: sentId,
+  });
+  expect(h.store.getOperation(`reply:1:${continued.id}`)).toBeUndefined();
+  h.backend.settle();
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.store.db.query("SELECT count(*) AS n FROM outbox WHERE json_extract(payload, '$.kind') = 'conversation'").get()).toEqual({ n: 1 });
+});
+
+test.each(["creation", "prompt"])("tool mode: an undelivered reply reminder drops quietly (%s)", async failure => {
+  const h = toolSetup();
+  h.input("first", "Question");
+  await h.router.tick();
+  h.backend.final("Internal note");
+  await h.router.tick();
+  expect(nudgeRows(h.store)).toHaveLength(1);
+  if (failure === "creation") {
+    h.store.set("route", null);
+    h.backend.createBehavior = async () => { throw new Error("offline"); };
+  } else h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  const start = Date.now();
+  await h.router.tick();
+  for (const elapsed of [60_000, 120_000, 180_000]) {
+    setSystemTime(start + elapsed);
+    await h.router.tick();
+  }
+  expect(nudgeRows(h.store).map(row => row.state)).toEqual(["failed"]);
+  expect(h.controls()).toEqual([]);
+  expect(h.store.get("deliveryOutage")).toBeNull();
+  expect(h.store.pendingInbound()).toEqual([]);
+});
+
+test("a /new reset whose send did not land is not dropped for a text typed after it", async () => {
+  const events: string[] = [];
+  const h = setup(":memory:", { log: (event, code) => { if (event === "delivery-watchdog") events.push(JSON.parse(code!).decision); } });
+  const start = Date.parse("2026-11-12T08:00:00Z");
+  setSystemTime(start);
+  await exchange(h, "first", "Hello", "Hi");
+  const reset = `reset:${"a".repeat(64)}`;
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input(reset, NEW_CHAT_NUDGE);
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ inboundId: reset, phase: "unknown" });
+  h.input("typed", "Next question");
+  setSystemTime(start + 2000);
+  await h.router.tick();
+  await h.router.tick();
+  // Unlike a watcher wake, the reset keeps its place: the text never goes into the context it was meant to clear.
+  expect(events).not.toContain("release");
+  expect(inbounds(h.store).find(row => row.id === reset)?.state).toBe("processing");
+  expect(h.backend.prompts.some(p => p.text === "Next question")).toBe(false);
+  h.backend.promptBehavior = undefined;
+  setSystemTime(start + ACCEPT_WAIT_MS);
+  await h.router.tick();
+  expect(events).toEqual(["retry"]);
+  expect(h.backend.prompts.at(-1)!.text).toBe(NEW_CHAT_NUDGE);
+});
+
+test("a watcher wake that never reached its POST is released from preparation: no outage text, nothing held", async () => {
+  const events: string[] = [];
+  const h = setup(":memory:", { log: (event, code) => { if (event === "delivery-watchdog") events.push(JSON.parse(code!).decision); } });
+  const wake = `wake:${"b".repeat(64)}`;
+  const start = Date.parse("2026-11-12T08:00:00Z");
+  setSystemTime(start);
+  h.backend.createBehavior = async () => { throw new Error("offline"); };
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  for (const offset of [ACCEPT_WAIT_MS, 2 * ACCEPT_WAIT_MS]) { setSystemTime(start + offset); await h.router.tick(); }
+  expect(h.backend.prompts).toEqual([]);
+  expect(h.controls()).toEqual([]);
+  expect(h.store.get("preparingDelivery")).toBeNull();
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("pending");
+  expect(events.at(-1)).toBe("release");
+  // The owner's text goes straight through once the backend answers.
+  h.backend.createBehavior = undefined;
+  h.input("typed", "Are you there?");
+  setSystemTime(start + 2 * ACCEPT_WAIT_MS + 1000);
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["Are you there?"]);
+});
+
+test("a person's text does not wait for a watcher wake stuck in preparation", async () => {
+  const h = setup();
+  const wake = `wake:${"c".repeat(64)}`;
+  const start = Date.parse("2026-11-12T08:00:00Z");
+  setSystemTime(start);
+  h.backend.createBehavior = async () => { throw new Error("offline"); };
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  h.backend.createBehavior = undefined;
+  h.input("typed", "Quick question");
+  setSystemTime(start + 2000);
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["Quick question"]);
+  expect(h.controls()).toEqual([]);
+});
+
+test("tool mode: a text steered into a watcher wake that then fails gets the usual failure notice", async () => {
+  const h = toolSetup({ failureNoticeMs: 0, droppedBatchMs: 0 });
+  steering(h.backend);
+  const wake = `wake:${"d".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  h.input("typed", "Are you there?");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ inboundId: wake, typed: true });
+  h.backend.step("checking", "tool-calls");
+  h.backend.failed();
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.controls().map(op => op.text)).toContain("Something went wrong on my end with that one. Mind trying again?");
+});
+
+test("tool mode: a steer the backend refused leaves the watcher wake a plain wake", async () => {
+  const h = toolSetup();
+  steering(h.backend, async () => "refused");
+  const wake = `wake:${"e".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  h.input("typed", "Are you there?");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.store.get<{ typed?: boolean }>("activeTurn")?.typed).toBeUndefined();
+  // The wake ends quietly, as wakes do: no reminder for a text it never took.
+  h.backend.final("Logged it.");
+  await h.router.tick();
+  expect(nudgeRows(h.store)).toEqual([]);
+  // The text then runs as its own turn.
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), "Are you there?"]);
+});
+
+test("tool mode: a reply reminder overtaken by a new text is dropped instead of running after its answer", async () => {
+  const h = toolSetup();
+  h.input("in_1", "Did the parcel come?");
+  await h.router.tick();
+  h.backend.final("Checked: it arrived at 10:12.");
+  h.input("in_2", "And the other one?");
+  await h.router.tick();
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["Did the parcel come?", "And the other one?"]);
+  expect(nudgeRows(h.store).map(row => row.state)).toEqual(["failed"]);
+});
+
+test("tool mode: a text steered into a watcher wake whose model call errors is told at once, before the wake's retry", async () => {
+  const h = toolSetup();
+  steering(h.backend);
+  const wake = `wake:${"1".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  h.input("typed", "Are you there?");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  // The wake itself is retried later; the person is not left waiting for that.
+  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("pending");
+  expect(h.controls().map(op => op.text)).toEqual(["Something went wrong on my end with that one. Mind trying again?"]);
+});
+
+async function failedTick(router: Router): Promise<void> {
+  await router.checkFailedInbound();
+  await router.tick();
+}
+
+test.each([
+  [3, true, true], [6, true, true], [6 + 1 / 3600_000, true, false],
+  [10, true, false], [24, true, false], [48, true, false], [48 + 1 / 3600_000, false, false], [72, false, false],
+] as const)("failed-inbound received age %s hours limits alerts and replay", async (hours, alert, replay) => {
+  const keys: string[] = [];
+  const decisions: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return true; },
+    log: (event, code) => { if (event === "delivery-watchdog") decisions.push(JSON.parse(code!).decision); } });
+  const now = Date.parse("2026-11-13T10:00:00Z"); setSystemTime(now);
+  h.input("aged", "Please pause", { source: "typed", receivedAt: now - hours * 3600_000 });
+  // A recent failure must not refresh an old inbound's eligibility.
+  h.store.updateInbound("aged", "failed", undefined, { stage: "dispatch", message: "offline", threadId: "ses_1", at: now - 121_000 });
+  const route = { id: "ses_1", directory: "/Chats/old", generation: 1 };
+  h.store.set("route", route);
+  h.store.set("failed-delivery:aged", { ...route, inboundId: "aged", messageId: messageId("aged"), phase: "failed", startedAt: now - hours * 3600_000 });
+  await Promise.all([h.router.checkFailedInbound(), h.router.checkFailedInbound()]);
+  await h.router.tick();
+  setSystemTime(now + 60_000); await failedTick(h.router);
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(keys).toEqual(alert ? ["bridge-failed:aged"] : []);
+  expect(h.backend.prompts).toHaveLength(replay ? 1 : 0);
+  expect(decisions.filter(decision => decision === "replay")).toHaveLength(replay ? 1 : 0);
+});
+
+test.each(["receivedAt", "sentAt"] as const)("failed-inbound legacy cutoffs use %s despite reason backfill", async timestamp => {
+  const keys: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return true; } });
+  const now = Date.parse("2026-11-13T10:00:00Z"); setSystemTime(now);
+  h.store.set("route", { id: "ses_1", directory: "/Chats/old", generation: 1 });
+  for (const hours of [3, 10, 72]) {
+    const id = `legacy-${hours}`;
+    h.input(id, "Please pause", { source: "typed", receivedAt: undefined, [timestamp]: now - hours * 3600_000 });
+    h.store.db.query("UPDATE inbound SET state = 'failed', failure = NULL WHERE id = ?").run(id);
+    h.store.set(`failed-delivery:${id}`, { id: "ses_1", directory: "/Chats/old", generation: 1,
+      inboundId: id, messageId: messageId(id), phase: "failed", startedAt: now - hours * 3600_000 });
+  }
+  await failedTick(h.router);
+  setSystemTime(now + 60_000); await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(keys.sort()).toEqual(["bridge-failed:legacy-10", "bridge-failed:legacy-3"]);
+  expect(h.backend.prompts.map(prompt => prompt.messageId)).toEqual([messageId("legacy-3")]);
+  expect(h.store.inboundFailure("legacy-10")?.stage).toBe("legacy");
+});
+
+test("failed-inbound concurrent health scans and ticks submit a held replay once", async () => {
+  const decisions: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async () => true,
+    log: (event, code) => { if (event === "delivery-watchdog") decisions.push(JSON.parse(code!).decision); } });
+  const now = Date.parse("2026-11-13T10:00:00Z"); setSystemTime(now);
+  h.input("replay-once", "Please pause", { source: "typed", receivedAt: now - 3 * 3600_000 });
+  h.store.updateInbound("replay-once", "failed", undefined, { stage: "dispatch", message: "offline", threadId: "ses_1", at: now - 121_000 });
+  const route = { id: "ses_1", directory: "/Chats/old", generation: 1 }; h.store.set("route", route);
+  h.store.set("failed-delivery:replay-once", { ...route, inboundId: "replay-once", messageId: messageId("replay-once"), phase: "failed", startedAt: now - 3 * 3600_000 });
+  let entered!: () => void; const posting = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+  h.backend.promptBehavior = async call => { entered(); await gate; h.backend.accept(call); };
+  await Promise.all([h.router.checkFailedInbound(), h.router.checkFailedInbound()]);
+  expect(h.backend.prompts).toEqual([]);
+  const tick = h.router.tick(); await posting;
+  const overlapping = [h.router.tick(), h.router.tick()];
+  try {
+    await h.router.checkFailedInbound();
+    expect(h.backend.prompts).toHaveLength(1);
+  } finally { release(); await Promise.all([tick, ...overlapping]); }
+  setSystemTime(now + 60_000); await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(h.backend.prompts).toHaveLength(1); expect(decisions).toEqual(["replay"]);
+  expect(h.store.get<string>("batch-phase:replay-once")).toBe("accepted");
+});
+
+test.each(["queued", "queued-stale", "preparing", "retry", "late-accepted"])("failed-inbound replay expiry survives restart (%s)", async stage => {
+  const keys: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return true; } });
+  const receivedAt = Date.parse("2026-11-13T00:00:00Z");
+  setSystemTime(receivedAt + 6 * 3600_000 - 1000);
+  h.input("expiring-replay", "Please pause", { source: "typed", receivedAt });
+  h.store.updateInbound("expiring-replay", "failed", undefined, { stage: "dispatch", message: "offline", threadId: "ses_1", at: receivedAt });
+  const route = { id: "ses_1", directory: "/Chats/old", generation: 1 }; h.store.set("route", route);
+  h.store.set("failed-delivery:expiring-replay", { ...route, inboundId: "expiring-replay", messageId: messageId("expiring-replay"), phase: "failed", startedAt: receivedAt });
+  await h.router.checkFailedInbound();
+  const posted = stage === "retry" || stage === "late-accepted";
+  if (posted) {
+    h.backend.promptBehavior = async () => { throw new Error("still offline"); };
+    await h.router.tick();
+    expect(h.backend.prompts).toHaveLength(1);
+    if (stage === "late-accepted") h.backend.accept(h.backend.prompts[0]!);
+    h.backend.promptBehavior = undefined;
+  }
+  if (stage === "preparing") {
+    h.backend.onStatuses = () => { setSystemTime(receivedAt + 10 * 3600_000); };
+    await h.router.tick();
+    h.backend.onStatuses = undefined;
+  }
+  setSystemTime(receivedAt + (stage === "queued-stale" ? 49 : 10) * 3600_000);
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(h.backend.prompts).toHaveLength(posted ? 1 : 0);
+  expect(inbounds(h.store).find(row => row.id === "expiring-replay")?.state).toBe(stage === "late-accepted" ? "done" : "failed");
+  setSystemTime(receivedAt + 49 * 3600_000);
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(h.backend.prompts).toHaveLength(posted ? 1 : 0);
+  expect(keys).toEqual(["bridge-failed:expiring-replay"]);
+  // Expiry releases the chat for a new message.
+  if (stage !== "late-accepted") {
+    h.input("fresh-after-expiry", "New instruction", { source: "typed" });
+    await h.router.tick();
+    expect(h.backend.prompts.at(-1)!.text).toContain("New instruction");
+  }
+});
+
+test.each(["none", "completed", "running"])("failed-inbound adopts acceptance after expiry without another POST (newer turn: %s)", async newer => {
+  const h = setup(":memory:", { notifyFailure: async () => true });
+  const receivedAt = Date.parse("2026-11-13T00:00:00Z"); setSystemTime(receivedAt + 6 * 3600_000 - 1000);
+  h.input("late-expired", "Please pause", { source: "typed", receivedAt });
+  h.store.updateInbound("late-expired", "failed", undefined, { stage: "dispatch", message: "offline", threadId: "ses_1", at: receivedAt });
+  const route = { id: "ses_1", directory: "/Chats/old", generation: 1 }; h.store.set("route", route);
+  h.store.set("failed-delivery:late-expired", { ...route, inboundId: "late-expired", messageId: messageId("late-expired"), phase: "failed", startedAt: receivedAt });
+  await h.router.checkFailedInbound();
+  h.backend.promptBehavior = async () => { throw new Error("ambiguous network error"); }; await h.router.tick();
+  const original = h.backend.prompts[0]!; h.backend.promptBehavior = undefined;
+  setSystemTime(receivedAt + 6 * 3600_000 + 1000);
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(h.backend.prompts).toHaveLength(1);
+  if (newer !== "none") {
+    h.input("newer", "Fresh message", { source: "typed" }); await h.router.tick();
+    if (newer === "running") {
+      // Robob can admit a queued prompt before its user record becomes readable.
+      h.backend.single = true;
+      setSystemTime(receivedAt + 6 * 3600_000 + 61_000);
+      await new Router(h.store, h.backend, h.transport, h.routerOptions).checkFailedInbound();
+      expect(h.store.get<{ messageId: string }>("activeTurn")?.messageId).toBe(messageId("newer"));
+    }
+    h.backend.final("Fresh answer"); await h.router.tick();
+    h.backend.single = undefined;
+    expect(h.backend.prompts).toHaveLength(2);
+  }
+  h.backend.accept(original);
+  h.backend.final("Recovered answer", original);
+  setSystemTime(receivedAt + 7 * 3600_000);
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(h.backend.prompts).toHaveLength(newer !== "none" ? 2 : 1);
+  expect(h.store.get<string>("batch-phase:late-expired")).toBe("accepted");
+  expect(inbounds(h.store).find(row => row.id === "late-expired")?.state).toBe("done");
+  expect(h.conversations().filter(op => op.text === "Recovered answer")).toHaveLength(1);
+});
+
+test("failed-inbound stale legacy row is logged and handled once across ticks and restart", async () => {
+  const keys: string[] = [];
+  const logs: { event: string; code?: string }[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return true; },
+    log: (event, code) => { logs.push({ event, code }); } });
+  const now = Date.parse("2026-11-13T10:00:00Z"); setSystemTime(now);
+  h.input("legacy-stale", "Old instruction", { source: "typed", receivedAt: now - 72 * 3600_000 });
+  h.store.db.query("UPDATE inbound SET state = 'failed', failure = NULL WHERE id = ?").run("legacy-stale");
+  const reads = spyOn(h.backend, "promptAccepted");
+  await failedTick(h.router);
+  setSystemTime(now + 60_000); await failedTick(h.router);
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(keys).toEqual([]); expect(h.backend.prompts).toEqual([]); expect(reads).not.toHaveBeenCalled();
+  expect(h.store.inboundFailure("legacy-stale")).toBeUndefined();
+  expect(logs.filter(log => log.event === "failed-inbound-skipped-stale")).toEqual([
+    { event: "failed-inbound-skipped-stale", code: JSON.stringify({ id: "legacy-stale", chat: "owner", age: 72 * 3600_000 }) },
+  ]);
+});
+
+test("failed-inbound old store with 20 legacy rows produces no alerts or replays", async () => {
+  const keys: string[] = [];
+  const events: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return true; }, log: event => { events.push(event); } });
+  const now = Date.parse("2026-11-13T10:00:00Z"); setSystemTime(now);
+  for (let i = 0; i < 20; i++) {
+    const id = `legacy-${i}`;
+    h.input(id, "Old instruction", { source: "typed", receivedAt: now - (3 + i * 27 / 19) * 24 * 3600_000 });
+    h.store.db.query("UPDATE inbound SET state = 'failed', failure = NULL WHERE id = ?").run(id);
+  }
+  for (let tick = 0; tick < 5; tick++) {
+    setSystemTime(now + tick * 60_000);
+    await failedTick(tick === 4 ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router);
+  }
+  expect(keys).toEqual([]); expect(h.backend.prompts).toEqual([]);
+  expect(events.filter(event => event === "failed-inbound-skipped-stale")).toHaveLength(20);
+  expect(events).not.toContain("inbound-failed"); expect(events).not.toContain("delivery-watchdog");
+});
+
+test.each(["failed", "done"])("failed-inbound pending alert expires after 48 hours (%s)", async state => {
+  const keys: string[] = [];
+  const events: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return false; }, log: event => { events.push(event); } });
+  const start = Date.parse("2026-11-13T10:00:00Z"); setSystemTime(start);
+  h.input("pending-expiry", "Please pause", { source: "typed" }); h.store.updateInbound("pending-expiry", "failed");
+  setSystemTime(start + 121_000); await h.router.checkFailedInbound();
+  expect(keys).toHaveLength(1);
+  if (state === "done") h.store.updateInbound("pending-expiry", "done");
+  setSystemTime(start + 49 * 3600_000);
+  const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  await failedTick(restarted);
+  setSystemTime(start + 50 * 3600_000); await failedTick(restarted);
+  expect(keys).toHaveLength(1); expect(h.backend.prompts).toEqual([]);
+  expect(h.store.get("failed-alert-pending:pending-expiry")).toBeNull();
+  expect(events.filter(event => event === "failed-inbound-skipped-stale")).toHaveLength(1);
+});
+
+// #932: a failed row outlives activeTurn, so recovery cannot depend on that one pointer.
+test("failed-inbound watcher reply retains reason, alerts once and uses the held replay path after rotation", async () => {
+  const alerts: { text: string; key: string }[] = [];
+  const logs: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (text, key) => { alerts.push({ text, key }); return true; },
+    log: (event, code) => { if (event === "inbound-failed") logs.push(code!); } });
+  const start = Date.parse("2026-11-10T06:05:18Z");
+  setSystemTime(start);
+  h.store.enqueue({ id: "send:watcher", kind: "conversation", text: "Meds nag", sessionId: "ses_1", generation: 1 });
+  h.store.outboxState("send:watcher", "sent", "watcher-provider-id");
+  h.backend.promptBehavior = async () => { throw new Error("Control timeout token=private-secret"); };
+  h.input("failed-owner", "Pause the job for now please", { replyTo: "watcher-provider-id", source: "typed", sender: options.owner });
+  await failedTick(h.router);
+  expect(h.store.inboundFailure("failed-owner")).toMatchObject({ stage: "dispatch", threadId: "ses_1", message: "Control timeout token=[redacted]" });
+  expect(logs.join()).not.toContain("private-secret");
+  expect(h.backend.prompts[0]!.id).toBe("ses_1");
+  // Reproduce the pre-#633 terminal state, followed by another thread taking over.
+  h.store.updateInbound("failed-owner", "failed", undefined, h.store.inboundFailure("failed-owner"));
+  h.store.set("activeTurn", null);
+  h.store.set("resendBody", null);
+  h.store.set("route", { id: "ses_live", directory: "/Chats/live", generation: 2 });
+  h.backend.promptBehavior = undefined;
+  setSystemTime(start + 121_000);
+  await failedTick(h.router);
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0]).toEqual({ text: expect.stringContaining("Pause the job for now please"), key: "bridge-failed:failed-owner" });
+  expect(h.backend.prompts.at(-1)).toMatchObject({ id: "ses_live", messageId: messageId("failed-owner") });
+  expect(h.backend.prompts.at(-1)!.system).toContain("delayed by a technical outage");
+  expect(h.backend.prompts.at(-1)!.text).toContain("Pause the job for now please");
+  expect(inbounds(h.store).find(row => row.id === "failed-owner")?.state).toBe("done");
+  const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  setSystemTime(start + 181_000);
+  await failedTick(restarted);
+  expect(alerts).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(2);
+});
+
+test.each(["late-accepted", "done", "unknown"])("failed-inbound reconciliation handles %s without duplicate POST", async kind => {
+  const alerts: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { alerts.push(key); return true; } });
+  const start = Date.parse("2026-11-10T06:05:18Z");
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input("lost", "Important instruction", { source: "typed" });
+  await failedTick(h.router);
+  h.store.updateInbound("lost", "failed", undefined, h.store.inboundFailure("lost"));
+  h.store.set("activeTurn", null);
+  if (kind === "done") h.store.updateInbound("lost", "done");
+  if (kind === "late-accepted") h.backend.accept(h.backend.prompts[0]!);
+  if (kind === "unknown") h.backend.promptAccepted = async () => { throw new Error("readback down"); };
+  setSystemTime(start + 121_000);
+  await failedTick(h.router);
+  expect(alerts).toHaveLength(kind === "unknown" ? 1 : 0);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(inbounds(h.store).find(row => row.id === "lost")?.state).toBe(kind === "done" ? "done" : "failed");
+});
+
+test("failed-inbound Telegram failure retries the stable key across restart and keeps replay independent", async () => {
+  const keys: string[] = [];
+  let ok = false;
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return ok; } });
+  const start = Date.parse("2026-11-10T06:05:18Z");
+  setSystemTime(start);
+  h.input("old", "Hello?", { source: "typed" });
+  h.store.updateInbound("old", "failed");
+  setSystemTime(start + 121_000);
+  await failedTick(h.router);
+  ok = true;
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  await failedTick(new Router(h.store, h.backend, h.transport, h.routerOptions));
+  expect(keys).toEqual(["bridge-failed:old", "bridge-failed:old"]);
+  expect(h.store.get<boolean>("failed-alert:old")).toBe(true);
+});
+
+test.each(["leader", "member"])("failed-inbound accepted receipt suppresses false alarms even without a surviving turn (%s)", async kind => {
+  const alerts: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { alerts.push(key); return true; } });
+  const start = Date.parse("2026-11-12T17:36:33Z"); setSystemTime(start);
+  const id = "25C628F6-A3BF-4F49-A6DD-680F11CB189E";
+  h.input(id, "Is robob down?", { source: "typed" }); h.store.updateInbound(id, "failed");
+  const leader = kind === "leader" ? id : "batch-leader";
+  h.store.set(`batch:${leader}`, { id: leader, text: "Is robob down?", batchIds: [leader, id] });
+  h.store.set(`batch-phase:${leader}`, "accepted");
+  setSystemTime(start + 121_000); await failedTick(h.router);
+  expect(alerts).toEqual([]);
+  expect(h.backend.prompts).toEqual([]);
+});
+
+test("failed-inbound health scan runs while the router is waiting on a poll", async () => {
+  const alerts: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { alerts.push(key); return true; } });
+  const start = Date.parse("2026-11-12T17:36:33Z"); setSystemTime(start);
+  h.input("working", "Still working", { source: "typed" }); await failedTick(h.router);
+  let entered!: () => void;
+  const reading = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  h.backend.messagesBehavior = async () => { entered(); await blocked; return h.backend.records; };
+  const tick = h.router.tick(); await reading;
+  h.input("lost-during-poll", "Hello?", { source: "typed" }); h.store.updateInbound("lost-during-poll", "failed");
+  setSystemTime(start + 121_000);
+  try { await h.router.checkFailedInbound(); expect(alerts).toEqual(["bridge-failed:lost-during-poll"]); }
+  finally { release(); await tick; }
+});
+
+test.each(["original-read", "live-read", "live-admitted", "alert-return"])("failed-inbound rechecks admission at %s", async boundary => {
+  const alerts: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => {
+    alerts.push(key);
+    if (boundary === "alert-return") {
+      h.store.set("batch-phase:race", "accepted"); h.store.updateInbound("race", "failed");
+    }
+    return true;
+  } });
+  const start = Date.parse("2026-11-12T17:36:33Z"); setSystemTime(start);
+  h.input("race", "Is robob down?", { source: "typed" });
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  await h.router.tick();
+  h.store.updateInbound("race", "failed"); h.store.set("activeTurn", null); h.store.set("resendBody", null);
+  h.store.set("route", { id: "ses_live", directory: "/Chats/live", generation: 2 });
+  h.backend.promptAccepted = async id => {
+    if ((boundary === "original-read" && id === "ses_1") || (boundary === "live-read" && id === "ses_live")) {
+      h.store.set("batch-phase:race", "accepted"); h.store.updateInbound("race", "failed");
+    }
+    return boundary === "live-admitted" && id === "ses_live";
+  };
+  setSystemTime(start + 121_000); await h.router.checkFailedInbound();
+  expect(alerts).toHaveLength(boundary === "alert-return" ? 1 : 0);
+  expect(inbounds(h.store).find(row => row.id === "race")?.state).toBe("failed");
+  expect(h.store.get("preparingDelivery")).toBeNull();
+  expect(h.store.get<string>("batch-phase:race")).toBe(boundary === "live-admitted" ? "submitting" : "accepted");
+});
+
+test("failed-inbound pending alert survives successful recovery and restart", async () => {
+  let ok = false;
+  const keys: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return ok; } });
+  const start = Date.parse("2026-11-12T17:36:33Z"); setSystemTime(start);
+  h.input("recover-alert", "Please pause", { source: "typed" });
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  await h.router.tick();
+  h.store.updateInbound("recover-alert", "failed"); h.store.set("activeTurn", null); h.store.set("resendBody", null);
+  h.backend.promptBehavior = undefined;
+  setSystemTime(start + 121_000); await failedTick(h.router);
+  expect(inbounds(h.store).find(row => row.id === "recover-alert")?.state).toBe("done");
+  expect(h.store.get<string>("failed-alert-pending:recover-alert")).toContain("Please pause");
+  ok = true;
+  const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  await restarted.checkFailedInbound();
+  setSystemTime(start + 181_000); await restarted.checkFailedInbound();
+  expect(keys).toEqual(["bridge-failed:recover-alert", "bridge-failed:recover-alert"]);
+  expect(h.store.get<boolean>("failed-alert:recover-alert")).toBe(true);
+});
+
+test("failed-inbound scan I/O never blocks a fresh control", async () => {
+  const h = setup(":memory:", { notifyFailure: async () => true });
+  const start = Date.parse("2026-11-12T17:36:33Z"); setSystemTime(start);
+  h.input("blocked-old", "Old message", { source: "typed" });
+  h.backend.promptBehavior = async () => { throw new Error("offline"); }; await h.router.tick();
+  h.store.updateInbound("blocked-old", "failed"); h.store.set("activeTurn", null); h.store.set("resendBody", null);
+  let entered!: () => void; const enteredRead = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+  h.backend.promptAccepted = async () => { entered(); await gate; return false; };
+  setSystemTime(start + 121_000); const scan = h.router.checkFailedInbound(); await enteredRead;
+  h.input("stop", "/stop");
+  try {
+    await h.router.tick();
+    expect(inbounds(h.store).find(row => row.id === "stop")?.state).toBe("done");
+  } finally { release(); await scan; }
+});
+
+test("failed-inbound batch members each alert once and replay only their leader", async () => {
+  const keys: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { keys.push(key); return true; } });
+  const start = Date.parse("2026-11-12T17:36:33Z"); setSystemTime(start);
+  h.input("leader", "First", { source: "typed" }); h.input("member", "Second", { source: "typed" });
+  h.backend.promptBehavior = async () => { throw new Error("offline"); }; await h.router.tick();
+  for (const id of ["leader", "member"]) h.store.updateInbound(id, "failed");
+  h.store.set("activeTurn", null); h.store.set("resendBody", null); h.backend.promptBehavior = undefined;
+  setSystemTime(start + 121_000); await failedTick(h.router);
+  expect(keys.sort()).toEqual(["bridge-failed:leader", "bridge-failed:member"]);
+  expect(h.backend.prompts).toHaveLength(2);
+  expect(h.backend.prompts[1]!.text).toBe("First\nSecond");
+  expect(inbounds(h.store).filter(row => row.state === "done")).toHaveLength(2);
+});
+
+test.each(["replace", "clear", "create"])("failed-inbound defers alerts until a changed destination is reconciled (%s)", async mode => {
+  const alerts: string[] = [];
+  const h = setup(":memory:", { notifyFailure: async (_text, key) => { alerts.push(key); return true; } });
+  const start = Date.parse("2026-11-12T17:36:33Z"); setSystemTime(start);
+  h.input("moved", "Is robob down?", { source: "typed" }); h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  await h.router.tick();
+  h.store.updateInbound("moved", "failed"); h.store.set("activeTurn", null); h.store.set("resendBody", null);
+  if (mode === "create") h.store.set("route", null);
+  const reads: string[] = [];
+  h.backend.promptAccepted = async id => {
+    reads.push(id);
+    if (id === "ses_1") h.store.set("route", mode === "clear" ? null : { id: "ses_admitted", directory: "/Chats/admitted", generation: 2 });
+    return id === "ses_admitted";
+  };
+  setSystemTime(start + 121_000); await h.router.checkFailedInbound();
+  expect(alerts).toEqual([]);
+  if (mode !== "clear") {
+    setSystemTime(start + 181_000); await h.router.checkFailedInbound();
+    expect(reads).toContain("ses_admitted"); expect(alerts).toEqual([]);
+  }
+});
+
+
+test("a pending wake and an unfinished child scan cannot hold the next completion poll", async () => {
+  const events: string[] = [];
+  const h = setup(":memory:", { watchMs: Number.MAX_SAFE_INTEGER, log: event => { events.push(event); } });
+  h.input("owner-1037", "Run the audit");
+  await h.router.tick();
+  h.backend.states.ses_child = { type: "busy", root: "ses_1" };
+  h.backend.states.ses_1 = { type: "busy" };
+  h.backend.messagesBehavior = async () => [...h.backend.records];
+  let release!: (children: SessionRecord[]) => void;
+  const children = new Promise<SessionRecord[]>(resolve => { release = resolve; });
+  let entered!: () => void;
+  const scanning = new Promise<void>(resolve => { entered = resolve; });
+  h.backend.children = async () => { entered(); return children; };
+  const timeout = globalThis.setTimeout;
+  let expire: (() => void) | undefined;
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
+    if (ms === 100) { expire = callback; return timeout(() => {}, 60_000); }
+    return timeout(callback, ms, ...args);
+  }) as typeof setTimeout);
+  h.input("wake:75ec", "Child update");
+  const tick = h.router.tick();
+  await scanning;
+  h.backend.final("Audit complete");
+  expire?.();
+  // A router tick must finish even while discovery has not answered. No timeout or sleep drives this proof.
+  let finished = false;
+  void tick.then(() => { finished = true; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  await new Promise<void>(resolve => setImmediate(resolve));
+  try {
+    expect(finished).toBe(true);
+    await h.router.tick();
+    expect(events.filter(event => event === "run-completed-seen")).toHaveLength(1);
+    expect(h.conversations().map(op => op.text)).toContain("Audit complete");
+    expect(h.store.get("watermark")).toMatchObject({ id: h.backend.records.find(record => record.type === "idle")!.id });
+  } finally { timer.mockRestore(); release([]); await tick; }
+});
+
+test.each([false, true])("a busy wake seals once and dispatches once after idle (restart=%s)", async restart => {
+  setSystemTime(10_000);
+  const events: string[] = [];
+  const h = setup(":memory:", { watchMs: Number.MAX_SAFE_INTEGER, log: event => { events.push(event); } });
+  await exchange(h, "first-1037", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  // No records yet for a resumed run: the watch must not invent ownership of its old watermark.
+  h.input("wake:75ec", "Child update");
+  await h.router.tick();
+  let router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  for (let i = 1; i <= 3; i++) {
+    setSystemTime(10_000 + i * 30_000);
+    await router.tick();
+  }
+  expect(events.filter(event => event === "batch-sealed")).toHaveLength(2); // owner + wake
+  expect(events.filter(event => event === "wake-deferred")).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(1);
+  delete h.backend.states.ses_1;
+  await router.tick();
+  expect(h.backend.prompts).toHaveLength(2);
+  expect(h.backend.prompts.at(-1)!.messageId).toBe(messageId("wake:75ec"));
+  h.backend.final("Child done");
+  await router.tick();
+  await router.tick();
+  expect(h.backend.prompts).toHaveLength(2);
+  expect(h.conversations().map(op => op.text)).toEqual(["Child done"]);
+  expect(h.store.get("watermark")).toMatchObject({ id: h.backend.records.at(-1)!.id });
+});
+
+
+test("deferred wakes keep their order and each prompt is admitted once", async () => {
+  const events: string[][] = [];
+  const h = setup(":memory:", { watchMs: Number.MAX_SAFE_INTEGER, log: (event, id) => { events.push([event, id ?? ""]); } });
+  await exchange(h, "owner-order-1037", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  h.input("wake:first-1037", "First result");
+  await h.router.tick();
+  h.input("wake:second-1037", "Second result");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  delete h.backend.states.ses_1;
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("First result");
+  h.backend.final("First delivered");
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("Second result");
+  h.backend.final("Second delivered");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.map(prompt => prompt.messageId)).toEqual([
+    messageId("owner-order-1037"), messageId("wake:first-1037"), messageId("wake:second-1037"),
+  ]);
+  expect(events.filter(([event]) => event === "batch-sealed")).toHaveLength(3);
+  expect(events.filter(([event]) => event === "wake-deferred")).toHaveLength(1);
+  expect(h.conversations().map(op => op.text)).toEqual(["First delivered", "Second delivered"]);
+  expect(h.store.get("watermark")).toMatchObject({ id: h.backend.records.at(-1)!.id });
+});
+
+test("a reset carries a deferred wake into the fresh route exactly once", async () => {
+  const h = setup(":memory:", { watchMs: Number.MAX_SAFE_INTEGER });
+  await exchange(h, "owner-reset-1037", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  h.input("wake:cancel-1037", "Stale result");
+  await h.router.tick();
+  expect(h.store.get<string>("batch-phase:wake:cancel-1037")).toBe("deferred-wake");
+  delete h.backend.states.ses_1;
+  h.input("reset-1037", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "wake:cancel-1037")).toMatchObject({ state: "done" });
+  expect(h.backend.prompts.filter(prompt => prompt.text === "Stale result")).toMatchObject([{ id: "ses_2", messageId: messageId("wake:cancel-1037") }]);
+});
+
+
+test("an arrival during a deferred multi-wake retry preserves its sealed membership", async () => {
+  const events: string[] = [];
+  const h = setup(":memory:", { watchMs: Number.MAX_SAFE_INTEGER, log: event => { events.push(event); } });
+  await exchange(h, "owner-members-1037", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  h.input("wake:member-a", "First result");
+  h.input("wake:member-b", "Second result");
+  await h.router.tick();
+  delete h.backend.states.ses_1;
+  h.backend.onStatuses = () => {
+    h.backend.onStatuses = undefined;
+    h.input("arrival-1037", "One more thing");
+  };
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "wake:member-b")).toMatchObject({ state: "batched" });
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("One more thing");
+  h.backend.final("Noted");
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("First result\nSecond result");
+  h.backend.final("Both handled");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(3);
+  expect(events.filter(event => event === "batch-sealed")).toHaveLength(3);
+  expect(events.filter(event => event === "wake-deferred")).toHaveLength(1);
+});
+
+
+test.each([1, 2, 3])("a wake leaving backoff cannot absorb a deferred batch (%s members)", async count => {
+  setSystemTime(10_000);
+  const events: string[] = [];
+  const h = setup(":memory:", { watchMs: Number.MAX_SAFE_INTEGER, log: event => { events.push(event); } });
+  await exchange(h, "owner-backoff-1037", "Hi", "Ready");
+  h.backend.states.ses_1 = { type: "busy" };
+  h.input("wake:older-1037", "Older result");
+  h.store.set("synthetic-retry:wake:older-1037", { attempts: 0, nextAt: 40_000, prompts: [] });
+  const ids = Array.from({ length: count }, (_, index) => `wake:deferred-${index}`);
+  ids.forEach((id, index) => h.input(id, `Deferred ${index}`));
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  setSystemTime(40_000);
+  delete h.backend.states.ses_1;
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("Older result");
+  h.backend.final("Older handled");
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe(ids.map((_, index) => `Deferred ${index}`).join("\n"));
+  h.backend.final("Deferred handled");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.map(prompt => prompt.messageId)).toEqual([
+    messageId("owner-backoff-1037"), messageId("wake:older-1037"), messageId(ids[0]!),
+  ]);
+  expect(inbounds(h.store).filter(row => ids.includes(row.id)).every(row => row.state === "done")).toBe(true);
+  expect(events.filter(event => event === "batch-sealed")).toHaveLength(3);
+  expect(events.filter(event => event === "wake-deferred")).toHaveLength(1);
+  expect(h.store.get("watermark")).toMatchObject({ id: h.backend.records.at(-1)!.id });
+});
+
+
+test.each(["permission", "question"] as const)("an incomplete child scan cannot retire its request handover (%s)", async kind => {
+  setSystemTime(10_000);
+  const h = setup(":memory:", { watchMs: 0 });
+  await exchange(h, "owner-scan-1037", "Start work", "Started");
+  h.backend.states.ses_child = { type: "busy", root: "ses_1" };
+  const child: SessionRecord = { id: "ses_child", directory: "/Chats/ses_child", parentID: "ses_1", time: { created: 0, updated: 0 } };
+  h.backend.childSessions = [child];
+  if (kind === "permission") h.backend.permissionRequests = [permission("slow-1037", child.id)];
+  else h.backend.questionRequests = [{ ...question({}, "slow-1037"), sessionID: child.id }];
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ origin: "request" });
+  expect(asked(h.store)).toHaveLength(0);
+  h.routerOptions.watchMs = Number.MAX_SAFE_INTEGER;
+  let release!: (children: SessionRecord[]) => void;
+  const children = new Promise<SessionRecord[]>(resolve => { release = resolve; });
+  h.backend.children = async () => children;
+  const timeout = globalThis.setTimeout;
+  let budget!: () => void;
+  let reached = new Promise<void>(resolve => { budget = resolve; });
+  let expire!: () => void;
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
+    if (ms === 100) { expire = callback; budget(); return timeout(() => {}, 60_000); }
+    return timeout(callback, ms, ...args);
+  }) as typeof setTimeout);
+  try {
+    for (const at of [10_000, 30_000, 50_000]) {
+      setSystemTime(at);
+      const tick = h.router.tick();
+      await reached;
+      // Later scans on this same tick must not introduce another clock wait.
+      reached = new Promise<void>(resolve => { budget = resolve; });
+      expire();
+      await tick;
+      expect(h.store.get("activeTurn")).toMatchObject({ origin: "request" });
+    }
+  } finally { timer.mockRestore(); release([child]); await new Promise<void>(resolve => setImmediate(resolve)); }
+  await h.router.tick();
+  expect(asked(h.store)).toHaveLength(1);
+  expect(h.router.routerStatus().pending).toMatchObject([{ id: "slow-1037", kind, sessionId: child.id }]);
+  deliver(h.store);
+  h.input("answer-scan-1037", kind === "permission" ? "yes" : "1");
+  await h.router.tick();
+  expect(kind === "permission" ? h.backend.permissionReplies : h.backend.questionReplies).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(1);
 });
