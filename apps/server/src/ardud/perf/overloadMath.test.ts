@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
   calibrationFailures,
+  gcOverlapMs,
   candidateFailures,
   equivalent,
   slope,
@@ -8,6 +9,20 @@ import {
 } from "./overloadMath.ts";
 
 describe("overload result math", () => {
+  it("clips collections to the measured interval regardless of observer delivery", () => {
+    expect(
+      gcOverlapMs(
+        [
+          { startTime: 50, duration: 100 },
+          { startTime: 200, duration: 30 },
+          { startTime: 290, duration: 40 },
+          { startTime: 400, duration: 20 },
+        ],
+        100,
+        300,
+      ),
+    ).toBe(90);
+  });
   it("uses interval deltas and distinguishes GC wall from busy share", () => {
     expect(utilisation({ active: 200, idle: 800 }, { active: 800, idle: 1200 }, 150)).toEqual({
       activeMs: 600,

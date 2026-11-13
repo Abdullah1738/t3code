@@ -76,7 +76,7 @@ import * as CutoverEngine from "../src/ardud/harness-migrate/CutoverEngine.ts";
 import { summarizeStatus } from "../src/ardud/harness-migrate/http.ts";
 import * as ControlStore from "../src/ardud/control/ControlStore.ts";
 import { boardShapes, syntheticCards } from "../src/ardud/perf/overloadShape.ts";
-import { slope, utilisation } from "../src/ardud/perf/overloadMath.ts";
+import { gcOverlapMs, slope, utilisation } from "../src/ardud/perf/overloadMath.ts";
 import shape from "../../../scripts/overload-harness/shape.json" with { type: "json" };
 import targets from "../../../scripts/overload-harness/targets.json" with { type: "json" };
 
@@ -101,14 +101,42 @@ if (
   throw new Error("Invalid run configuration");
 await NodeFSP.mkdir(out, { recursive: true });
 const home = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "overload-"));
-const logical: Record<string, number> = {};
+const logical: Record<string, number> = Object.fromEntries(
+  [
+    ...[
+      "providerEvent",
+      "rootStart",
+      "pacing",
+      "otherCommand",
+      "providerTurnEnd",
+      "status",
+      "asks",
+      "boardGet",
+      "readOpenCards",
+      "kanbanToolsRead",
+    ].flatMap((kind) => [`offered:${kind}`, `completed:${kind}`]),
+    ...["status", "asks", "boardGet", "readOpenCards", "kanbanToolsRead"].map(
+      (kind) => `served:${kind}`,
+    ),
+    ...Object.keys(targets.eventWriteBatches.all).map((kind) => `persisted:${kind}`),
+    "tickSteps",
+    "dispatchDecisions",
+    "providerLaunches",
+    "providerSends",
+    "receipts",
+    "driverEvents:providerEvent",
+    "driverEvents:rootStart",
+    "driverEvents:command",
+  ].map((key) => [key, 0]),
+);
 const physical: Record<string, number> = {};
 const increment = (counter: Record<string, number>, key: string, n = 1) => {
   counter[key] = (counter[key] ?? 0) + n;
 };
 let measuring = false;
 let pending = 0;
-let gcMs = 0;
+const gcEntries: Array<{ startTime: number; duration: number }> = [];
+let gcWindowStart = Infinity;
 const errors: Record<string, number> = {};
 const backlog: Array<{ seconds: number; pending: number; outbox: number; dispatcher: number }> = [];
 const resultSizes: Record<string, number> = {};
@@ -341,7 +369,9 @@ const layer = KanbanService.layer.pipe(
   Layer.provide(providerLayer([opencodeTestProvider()])),
 );
 const observer = new NodePerfHooks.PerformanceObserver((list) => {
-  if (measuring) for (const entry of list.getEntries()) gcMs += entry.duration;
+  for (const entry of list.getEntries())
+    if (entry.startTime + entry.duration >= gcWindowStart)
+      gcEntries.push({ startTime: entry.startTime, duration: entry.duration });
 });
 observer.observe({ entryTypes: ["gc"] });
 const lag = NodePerfHooks.monitorEventLoopDelay({ resolution: 10 });
@@ -773,6 +803,8 @@ const result = await Effect.runPromise(
       const cacheBefore = yield* store.decodeCacheStats;
       const before = NodePerfHooks.performance.eventLoopUtilization();
       started = NodePerfHooks.performance.now();
+      observer.takeRecords();
+      gcWindowStart = started;
       measuring = true;
       lag.enable();
       lag.reset();
@@ -781,7 +813,8 @@ const result = await Effect.runPromise(
         const current = NodePerfHooks.performance.now();
         const delayMs = current - lastProbe - 100;
         lastProbe = current;
-        if (delayMs >= 1000) stalls.push({ seconds: (current - started) / 1000, delayMs });
+        // A one-second block can start immediately after a probe; include its sampling interval.
+        if (delayMs + 100 >= 1000) stalls.push({ seconds: (current - started) / 1000, delayMs });
       }, 100);
       yield* Effect.addFinalizer(() => Effect.sync(() => clearInterval(timer)));
       const globals = globalThis as typeof globalThis & {
@@ -834,13 +867,19 @@ const result = await Effect.runPromise(
       );
       yield* Effect.sleep(steadySeconds * 1000);
       const after = NodePerfHooks.performance.eventLoopUtilization();
+      const gcWindowEnd = NodePerfHooks.performance.now();
       measuring = false;
       lag.disable();
       clearInterval(timer);
       yield* sample;
       const cacheAfter = yield* store.decodeCacheStats;
+      yield* Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)));
+      for (const entry of observer.takeRecords())
+        gcEntries.push({ startTime: entry.startTime, duration: entry.duration });
+      const gcMs = gcOverlapMs(gcEntries, gcWindowStart, gcWindowEnd);
       const measured = utilisation(before, after, gcMs);
       return {
+        telemetrySchemaVersion: 2,
         revision,
         home,
         startedAt: at,
@@ -859,6 +898,9 @@ const result = await Effect.runPromise(
         memory: process.memoryUsage(),
         dbPath: cfg.dbPath,
         ...measured,
+        gcMs,
+        gcWindowStart,
+        gcWindowEnd,
         delayMs: {
           p50: lag.percentile(50) / 1e6,
           p99: lag.percentile(99) / 1e6,
@@ -882,6 +924,8 @@ const result = await Effect.runPromise(
         limitations: [
           "Status poll uses real HarnessCutover.status and summarizeStatus over a synthetic ledger; HTTP authentication/transport is outside this composition.",
           "rootStart driver currently exercises the real EventSink write path; full RunExecution start composition is pending calibration evidence.",
+          "KanbanThreads is replaced in full: shell reads, failure lookup, receipts and sends are synthetic adapter behavior; timestamps refresh on view. This removes internal product work beyond the external provider boundary.",
+          "Synthetic commitCommand uses effects: []; outbox pressure is not exercised by those commands.",
         ],
         verdict: "NOT_EVALUATED",
       };

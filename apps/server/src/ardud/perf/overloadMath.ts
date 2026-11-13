@@ -18,6 +18,21 @@ export const utilisation = (
   };
 };
 
+export const gcOverlapMs = (
+  entries: ReadonlyArray<{ startTime: number; duration: number }>,
+  start: number,
+  end: number,
+) =>
+  entries.reduce(
+    (sum, entry) =>
+      sum +
+      Math.max(
+        0,
+        Math.min(end, entry.startTime + entry.duration) - Math.max(start, entry.startTime),
+      ),
+    0,
+  );
+
 export const slope = (samples: ReadonlyArray<{ seconds: number; value: number }>) => {
   if (samples.length < 2) throw new Error("Backlog slope needs at least two samples");
   const n = samples.length;

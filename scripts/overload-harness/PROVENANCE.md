@@ -25,6 +25,8 @@ All data inputs are numeric aggregates. This table records inputs; it is not a c
 | Active/detached thread references | .9 per-board missingThread and silentRunBackstop maxima; evaluator-approved relationship |Primary19 active +14 detached=33; secondary13+7=20. Small ranks use their own counts, with detached=max(0,silentRunBackstop-active); when active exceeds silent count the active count takes precedence. Other ToDo cards have no thread.|
 | Thread-card joins and history | Real persistence relationships for linked cards |addThreadCard and putThreadLink for each linked card; inactive links ended, active role from trace. Completed historical cards retain synthetic links.|
 | Review/PR shape | .9 reviewerBackstop and landing counts; synthetic PR metadata |One-step Load review chain; landing cards have reviewStep1 and an open PR link watched by their idle thread. Active reviewers have open PRs. Counts are trace-derived; exact PR/wait-kind census is unavailable. Existing parked-count seed remains time waits; PR checks remain pending.|
+| Adapter boundary | Synthetic full KanbanThreads facade |Replaces internal shell/failure/receipt/send behavior as well as external transport; view timestamps refresh on reads. This omits product work and is a fidelity gap, not a claim of a full real provider composition.|
+| Outbox | Synthetic commands with effects:[] |Queue observed but command-generated outbox pressure is not reproduced.|
 | Statev2 history | Synthetic linked threads +driven events |Historical multi-million-row projection footprint is not seeded by this version|
 | Provider write kinds and rates | .9 exact-minute writer caller counts +event-type spans |284 parentless +200 start writes/min;122 other commands/min;189 pacing calls/min|
 | Provider turn-end notifications | .9 exact-minute KanbanService.turnEndedUnlocked |13/min (replaces unmeasured200/min assumption)|
@@ -57,3 +59,11 @@ All data inputs are numeric aggregates. This table records inputs; it is not a c
 | 17 | 114 | 114 | 118 | 4 | 0 | 0 | 0 | 0 |
 
 Active/discussion trace ranks are sorted by the largest open-card read in complete tickBoard spans. The parked array was independently sorted; assignment to synthetic ranks is an explicit approximation. Backup counts and percentiles predate the live board split and are labelled separately from live overrides.
+
+The first three frozen .9 calibration runs use telemetry schema1 from snapshot4a92a50dd0. Independent audit found GC boundary-delivery and100ms stall-sampling gaps. Their data is retained with those limitations. Schema2 clips GC entries by timestamps, drains pending records, initializes zero counters and treats a probe gap≥1s conservatively; reports additionally reject histogram maxima≥1s. These are measurement corrections, not seed/rate tuning. A new comparison needs all runs on the same corrected instrumentation.
+
+## Separate #1365 latency seed
+
+latency-shape.json adds only aggregate projection-thread counts from the authorized scratch clone:56,543 total;52,918 active;3,621 archived;4 deleted. It uses these counts, the already measured130,622 runs/5,518,254 nodes and per-table JSON byte percentiles. The legacy board-link open count5884 is not the shell archive split. SQL bulk inserts synthetic rows in1024-row quantile buckets after real migrations. Sqlite.layerConfig creates startup indexes on the fresh DB, then ensureShellLookupIndexes runs again after seed. postSeedIndexEnsureMs is an idempotent ensure, not building the index on a populated upgraded DB (#1364 owns the live-size release check). The result records index presence.
+
+Latency transport uses the real control HTTP route, EnvironmentAuth, SessionStore, McpSessionRegistry, MCP middleware/tool transport and ProjectionStore. Unused control services are mocked. The WebSocket adapter is harness-owned; it invokes real loadShellSnapshotParts under a foreground scope, without production WS authentication/RPC decoding. This boundary is in result.json. Reader/writer entry and release use Deferred barriers. After #1365 the archive may queue on the background lane; that behavior is part of the measurement.

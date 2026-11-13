@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "source": "Authorized scratch clone of restart-backup-20261113-103633, read-only aggregate SQL; no row identifiers or text",
+  "threads": {
+    "total": 56543,
+    "active": 52918,
+    "archived": 3621,
+    "deleted": 4
+  }
+}
