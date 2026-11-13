@@ -8,6 +8,7 @@ import {
 } from './lib/detect.mjs';
 import { assertRecoveryActive, guardRecoveryIo, isRecoveryPaused, recoveryElapsed, recoveryFloor, controlStatus, pauseRecovery, resumeRecovery, parseDuration } from './lib/pause.mjs';
 import * as realIo from './lib/io.mjs';
+import { emit, observed, recoveryIo } from './lib/logging.mjs';
 import { pathToFileURL } from 'node:url';
 import { openCodeSession, recoveryOwned } from './lib/harness.mjs';
 import { stallScan } from './lib/stallwatch.mjs';
@@ -165,9 +166,16 @@ export async function gatherThread({ db, incident, threadId, active, now, verbos
   return { thread, sourceRuns, plan, failed, recovered, held, staleHeld, lost, reply, orphans, forms };
 }
 
-export async function act({ db, incident, g, dryRun, progress = {}, save = () => {} }, io = realIo) {
+export async function act(options, io = realIo) {
+  const start = performance.now();
+  const res = await observed('stream-recovery', 'stream.act', () => actImpl(options, io));
+  emit('stream-recovery', 'stream.decision', { durationMs: performance.now() - start, ok: res.ok, ids: { thread: res.plan.threadId }, props: { action: res.plan.action, tag: res.plan.action, dryRun: options.dryRun } });
+  return res;
+}
+
+async function actImpl({ db, incident, g, dryRun, progress = {}, save = () => {} }, io) {
   assertRecoveryActive(io);
-  io = guardRecoveryIo(io);
+  io = recoveryIo(guardRecoveryIo(io));
   const { plan } = g;
   const res = { plan, ok: true, queueOk: progress.queueOk ?? null, lost: g.lost, reply: g.reply, forms: g.forms, error: null };
   if (plan.action === 'skip' || plan.action === 'report') {
@@ -309,7 +317,7 @@ export async function recoveryScan({ opts, state, now }, io = realIo) {
         log(`summary (${summary.severity}):\n${summary.text}`);
       } else {
         let sent = true;
-        try { io.telegram({ text: summary.text, severity: summary.severity, key: `stream-recovery:${incident.id}` }); }
+        try { recoveryIo(io).telegram({ text: summary.text, severity: summary.severity, key: `stream-recovery:${incident.id}` }); }
         catch (err) { if (isRecoveryPaused(err)) throw err; sent = false; log(`telegram failed: ${err?.message || err}`); }
         const errors = results.filter((r) => r.error).length;
         const attempts = (prev?.attempts || 0) + 1;
@@ -330,6 +338,10 @@ export async function recoveryScan({ opts, state, now }, io = realIo) {
 }
 
 export async function scan(opts, io = realIo) {
+  return observed('stream-recovery', 'stream.scan', () => scanImpl(opts, io));
+}
+
+async function scanImpl(opts, io) {
   const now = io.now?.() ?? Date.now();
   const release = opts.dryRun ? () => {} : io.acquireLock(now);
   if (!release) { log('another scan is running, skipping'); return; }

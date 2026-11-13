@@ -1,0 +1,35 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { clean, emit, observed } from '../toollog.mjs';
+
+import {fixture} from './support.mjs';
+test('JS schema, privacy, errors, permissions and fail-open writes', async t => {
+  const {root, rows} = fixture(t);
+  emit('test','fixture.ok',{kind:'perf',ok:true,durationMs:1,ids:{account:'fixture@example.invalid',key:'sk-fixture-do-not-log'},props:{model:'cx/gpt-image-2',prompt:'private prompt',email:'fixture@example.invalid',tag:'sk-fixture-do-not-log'},error:{tag:'http_502',message:'private prompt fixture@example.invalid sk-fixture-do-not-log'}});
+  const serialized = JSON.stringify(rows());
+  for(const secret of ['fixture@example.invalid','sk-fixture-do-not-log','private prompt']) assert.ok(!serialized.includes(secret));
+  assert.equal(rows()[0].tool,'9router');
+  assert.match(rows()[0].ts,/\.\d{3}Z$/);
+  assert.equal(fs.statSync(root).mode & 0o777,0o700);
+  assert.equal(fs.statSync(join(root,fs.readdirSync(root).find(x=>x.endsWith('.ndjson')))).mode & 0o777,0o600);
+  process.env.ROUTER_LOG_DIR = join(root, 'broken'); fs.writeFileSync(process.env.ROUTER_LOG_DIR,'x');
+  assert.doesNotThrow(()=>emit('test','fixture.bad'));
+  assert.equal(await observed('test','fixture.bad',()=>42),42);
+  const error=new Error('private prompt');
+  await assert.rejects(observed('test','fixture.bad',()=>{throw error}), e=>e===error);
+  assert.doesNotThrow(()=>emit('test','fixture.bad',{ids:null}));
+  assert.equal(clean({component:'test',name:'bad email',kind:'event'}),null);
+});
+test('JS cap keeps errors, emits one cap marker, and expires only day files', t=>{
+  const {root}=fixture(t);
+  fs.writeFileSync(join(root,'2000-01-01.ndjson'),'old'); fs.writeFileSync(join(root,'rollup-2000-01-01.json'),'old');fs.writeFileSync(join(root,'keep'),'keep');
+  emit('test','fixture.first');
+  assert.ok(!fs.existsSync(join(root,'2000-01-01.ndjson')));assert.ok(!fs.existsSync(join(root,'rollup-2000-01-01.json')));assert.ok(fs.existsSync(join(root,'keep')));
+  const path=join(root,new Date().toISOString().slice(0,10)+'.ndjson');fs.truncateSync(path,50*1024*1024);
+  emit('test','fixture.drop');emit('test','fixture.drop');emit('test','fixture.error',{kind:'error',error:{tag:'http_502'}});
+  const fd=fs.openSync(path,'r'),buf=Buffer.alloc(4096);const n=fs.readSync(fd,buf,0,4096,50*1024*1024);fs.closeSync(fd);const tail=buf.subarray(0,n).toString();
+  assert.equal(tail.split('log.cap').length-1,1);assert.ok(!tail.includes('fixture.drop'));assert.ok(tail.includes('fixture.error'));
+});

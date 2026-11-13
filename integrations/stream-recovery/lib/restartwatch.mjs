@@ -1,3 +1,4 @@
+import { emit, observed, recoveryIo } from './logging.mjs';
 // Restart watch: spot interrupted native subagents, delegated tasks and turns,
 // tell each parent thread what it lost (once), and send one summary per restart.
 // The caller loads and saves state.
@@ -309,9 +310,13 @@ function stallInterrupted(state, ses, cancelMs, threadId = null) {
   );
 }
 
-export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = false, seed = false, verbose = false, log }, io = realIo) {
+export async function restartScan(options, io = realIo) {
+  return observed('stream-recovery', 'restart.scan', () => restartScanImpl(options, io));
+}
+
+async function restartScanImpl({ db, state, now, sinceIso, floorMs, dryRun = false, seed = false, verbose = false, log }, io = realIo) {
   assertRecoveryActive(io);
-  io = guardRecoveryIo(io);
+  io = recoveryIo(guardRecoveryIo(io));
   io.assertReplicaFresh(db);
   state.servers = trackServer(state.servers, io.serverRuntime(), now);
   state.servers = trackServer(state.servers, io.openCodeRuntime(), now);
@@ -429,7 +434,7 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
         let failedTask = null;
         for (const sub of pendingTasks) {
           try {
-            await handleLateDelegated({ io, db, incident: recoveryIncident, threadId, sub, dryRun, progress, save });
+            await observed('stream-recovery', 'restart.late', () => handleLateDelegated({ io, db, incident: recoveryIncident, threadId, sub, dryRun, progress, save }));
             assertRecoveryActive(io);
             if (!dryRun) progress.lateFailures = 0;
           } catch (err) {
@@ -468,6 +473,7 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
           ?? { plan: { threadId, title: threadId, action: "skip", reason: "handled earlier" }, ok: true, lostSubs: [], error: null });
         continue;
       }
+      const decisionStart = performance.now();
       let res;
       const progress = entry.threads[threadId] ??= {};
       try {
@@ -511,6 +517,7 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
       }
       results.push(res);
       all.push(res);
+      emit('stream-recovery', 'restart.decision', { kind: res.ok ? 'perf' : 'error', ok: res.ok, durationMs: performance.now() - decisionStart, ids: { thread: threadId, incident: incident.id }, props: { action: res.plan.action, tag: res.plan.action, dryRun }, ...(res.ok ? {} : { error: { tag: 'recovery_failed' } }) });
       const p = res.plan;
       log(`  ${p.action.padEnd(7)} ${threadId} | ${truncate(p.title || "", 60)} | ${p.reason} | ${counts(res.lostSubs)}${res.error ? ` | ERROR ${res.error}` : ""}`);
       if (verbose) {
