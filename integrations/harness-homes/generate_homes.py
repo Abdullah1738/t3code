@@ -811,6 +811,7 @@ def build(manifest: dict, homes: dict[str, str]) -> dict:
     for name in ("codex", "codex-cu"):
         home = homes[name]
         existing_state = None
+        prior = {}
         config_path = os.path.join(home, "config.toml")
         if os.path.exists(config_path):
             try:
@@ -818,7 +819,11 @@ def build(manifest: dict, homes: dict[str, str]) -> dict:
             except tomllib.TOMLDecodeError as exc:
                 raise HomeError(f"{config_path} is not valid TOML ({exc}); fix or remove it") from exc
             existing_state = (prior.get("hooks") or {}).get("state")
-        files[config_path] = toml_dump(codex_config(manifest, home, existing_state, name)).encode("utf-8")
+        config = codex_config(manifest, home, existing_state, name)
+        # Codex writes project trust decisions at runtime; regeneration must retain them.
+        if "projects" in prior:
+            config["projects"] = prior["projects"]
+        files[config_path] = toml_dump(config).encode("utf-8")
         instructions = canonical + b"\n\n" + overlays["codex"]
         if name == "codex-cu":
             instructions += b"\n\n" + overlays["codex-cu"]
@@ -853,11 +858,20 @@ def claude_owned_json(content: bytes) -> bytes:
     return json.dumps(owned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+def codex_owned_json(content: bytes) -> bytes:
+    value = tomllib.loads(content.decode("utf-8"))
+    value.pop("projects", None)
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
 def artifact_digest(path: str, content: bytes) -> dict:
     artifact = {"path": os.path.abspath(path)}
     if os.path.basename(path) == ".claude.json":
         content = claude_owned_json(content)
         artifact["format"] = "claude-owned-json"
+    elif os.path.basename(path) == "config.toml":
+        content = codex_owned_json(content)
+        artifact["format"] = "codex-owned-json"
     artifact["sha256"] = hashlib.sha256(content).hexdigest()
     return artifact
 
