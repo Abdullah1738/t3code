@@ -800,9 +800,11 @@ it.effect(
         Array.from(yield* Fiber.join(published), (stored) => stored.sequence),
         Array.from(committed, (stored) => stored.sequence),
       );
-      const transaction = trace.spans.find((span) => span.name === "sql.transaction")!;
-      assert.equal(transaction.attributes.get("db.transaction.control.begin_count"), 1);
-      assert.equal(transaction.attributes.get("db.transaction.control.commit_count"), 1);
+      const batch = trace.spans.find((span) => span.name === "orchestrationV2.EventSink.batch")!;
+      assert.equal(batch.attributes.get("db.transaction.control.begin_count"), 1);
+      assert.equal(batch.attributes.get("db.transaction.control.commit_count"), 1);
+      assert.isAtLeast(Number(batch.attributes.get("db.transaction.control.begin_ms")), 0);
+      assert.isAtLeast(Number(batch.attributes.get("db.transaction.control.commit_ms")), 0);
     }).pipe(Effect.provide(testLayer()));
   },
 );
