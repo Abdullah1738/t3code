@@ -38,6 +38,11 @@ def valid_hold(hold, now, alive):
 
 def decide(previous, *, now, up, boot_time, hold=None, hold_pid_alive=False):
     state = copy.deepcopy(previous)
+    if (boot_time is not None and boot_time <= now and state["last_reopen"] is not None
+            and state["last_reopen"] < boot_time):
+        # A pre-boot attempt cannot still be starting, or delay this boot's launch.
+        state.update(down_count=0, last_reopen=None, failed_reopens=0, backoff_step=0,
+                     awaiting_reopen=False, next_retry=0, failure_episode=None)
     state["history"] = [t for t in state["history"] if 0 <= now - t < 3600]
     if not state["history"]:
         state["crash_episode"] = None

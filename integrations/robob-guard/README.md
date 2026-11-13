@@ -9,6 +9,9 @@ is no stay-quit file or mode switch.
 It compares the full executable path from `ps -axo pid=,comm=`. Two down
 checks trigger `open -g -a`, with only HOME, USER and the system PATH in its
 environment. Within five minutes of boot, the first down check opens it.
+Attempts from before the current boot lose their startup grace and retry delay;
+attempts made on this boot still get the full 90 seconds to start. Install
+heartbeats take precedence over the startup reopen.
 A failed process-list read cannot trigger an open.
 
 After each attempt it allows 90 seconds to start. If still absent, it waits

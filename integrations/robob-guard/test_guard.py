@@ -25,6 +25,80 @@ class DecisionTests(unittest.TestCase):
         for age,expected in [(0,'reopen'),(299,'reopen'),(300,'none'),(-1,'none')]:
             with self.subTest(age=age):
                 self.assertEqual(guard.decide(guard.initial_state(),now=10000,up=False,boot_time=10000-age)[2],expected)
+    def failed_state(self, failures):
+        state = guard.initial_state()
+        for now in [10000, 10030]:
+            state, _, _ = guard.decide(state, now=now, up=False, boot_time=0)
+        for attempt in range(failures):
+            now += 90
+            state, _, _ = guard.decide(state, now=now, up=False, boot_time=0)
+            if attempt < failures - 1:
+                now = state['next_retry']
+                state, _, _ = guard.decide(state, now=now, up=False, boot_time=0)
+        return state, now
+
+    def test_persisted_attempts_from_previous_boot_do_not_delay_startup(self):
+        for failures in [0, 1, 2, 3, 4]:
+            for hold_kind in ['absent', 'fresh', 'stale', 'dead']:
+                with self.subTest(failures=failures, hold=hold_kind), tempfile.TemporaryDirectory() as d:
+                    previous, checked_at = self.failed_state(failures)
+                    boot = checked_at + 30
+                    now = boot + 30
+                    state_file = Path(d) / 'state.json'
+                    guard.atomic_json(state_file, previous)
+                    hold = None if hold_kind == 'absent' else dict(
+                        by='install', pid=2, beatAt=now - (90 if hold_kind == 'stale' else 0))
+                    state, statuses, action = guard.decide(
+                        guard.read_state(state_file), now=now, up=False, boot_time=boot,
+                        hold=hold, hold_pid_alive=hold_kind != 'dead')
+                    self.assertEqual(action, 'none' if hold_kind == 'fresh' else 'reopen')
+                    self.assertEqual(state['failed_reopens'], 0)
+                    self.assertEqual(state['backoff_step'], 0)
+                    self.assertEqual(state['next_retry'], 0)
+                    if hold_kind == 'fresh':
+                        self.assertEqual(statuses, ['hold:install'])
+                        self.assertEqual(state['down_count'], 0)
+                    else:
+                        self.assertEqual(state['last_reopen'], now)
+                        self.assertEqual(state['history'], previous['history'] + [now])
+                        self.assertTrue(state['awaiting_reopen'])
+                        # Persist again so another launchd check on this boot keeps startup grace.
+                        guard.atomic_json(state_file, state)
+                        state, _, action = guard.decide(
+                            guard.read_state(state_file), now=now + 30, up=False, boot_time=boot)
+                        self.assertEqual(action, 'backoff')
+                        self.assertEqual(state['failed_reopens'], 0)
+                        self.assertEqual(state['last_reopen'], now)
+
+    def test_same_boot_retry_delay_and_unknown_boot_are_preserved(self):
+        for boot in [0, None]:
+            with self.subTest(boot=boot):
+                previous, checked_at = self.failed_state(3)
+                state, _, action = guard.decide(previous, now=checked_at + 60, up=False, boot_time=boot)
+                self.assertEqual(action, 'backoff')
+                self.assertEqual(state['next_retry'], previous['next_retry'])
+                self.assertEqual(state['next_retry'] - (checked_at + 60), 540)
+
+    def test_same_boot_startup_grace_then_normal_retry(self):
+        state, _, action = guard.decide(guard.initial_state(), now=10030, up=False, boot_time=10000)
+        self.assertEqual(action, 'reopen')
+        for now in [10060, 10119]:
+            state, _, action = guard.decide(state, now=now, up=False, boot_time=10000)
+            self.assertEqual(action, 'backoff')
+            self.assertEqual(state['failed_reopens'], 0)
+        state, _, action = guard.decide(state, now=10120, up=False, boot_time=10000)
+        self.assertEqual(action, 'backoff')
+        self.assertEqual(state['failed_reopens'], 1)
+        self.assertEqual(state['next_retry'], 10240)
+        self.assertEqual(guard.decide(state, now=10240, up=False, boot_time=10000)[2], 'reopen')
+
+    def test_previous_boot_state_after_startup_window_uses_two_checks(self):
+        previous, checked_at = self.failed_state(3)
+        boot = checked_at + 30
+        state, _, action = guard.decide(previous, now=boot + 300, up=False, boot_time=boot)
+        self.assertEqual(action, 'none')
+        self.assertEqual(state['down_count'], 1)
+        self.assertEqual(guard.decide(state, now=boot + 330, up=False, boot_time=boot)[2], 'reopen')
     def test_hold_corpus(self):
         rows=[(dict(by='install',pid=2,beatAt=10000),True,True),
               (dict(by='install',pid=2,beatAt=9910),True,False),
