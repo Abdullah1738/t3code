@@ -28,6 +28,24 @@ are omitted rather than reported as zero. A restic exit code of -1 means it
 was not reached. Fix versions use the sweep's known version transition or
 local package metadata; unavailable versions are `unknown`.
 
+Samples also include `internalFreeGbDelta`/`externalFreeGbDelta` (null on the
+first measurement), and optional `internal`/`external` `PurgeableGb` and
+`LocalSnapshotCount`. Four read-only diskutil/tmutil calls run concurrently
+under one five-second budget, including cleanup. Missing purgeable keys are
+`PurgeableError=unsupported`, never zero; command failures carry short error
+enums and omit the unavailable number. Snapshot names and volume labels are
+discarded. A timed-out batch emits one `disk.probe_slow`; an already eight-second
+sample skips probing. A lock inherited by probe children prevents accumulating
+processes if a kernel wait survives SIGKILL.
+
+`topMover1Path`/`topMover1GbDelta` show the largest absolute tracked size change,
+including shrinkage. Movers require fresh inventories in both samples and
+exclude partial totals. Changes of at least 20 GB on either volume emit one
+`disk.swing` event with `previousTs`, `sampleTs`, both free-space deltas and up
+to three flattened `topMover` pairs. These events never alert. The inventory is
+hourly and covers selected roots, so movers are evidence of tracked changes,
+not a complete accounting of each free-space delta.
+
 ## Source events
 
 `disk.inventory` and `crash.collect` retain `count` and `sourceErrors` summary
