@@ -50,6 +50,14 @@ export const AnalyticsEvent = Schema.Struct({
       method: Schema.optionalKey(Label),
       span: Schema.optionalKey(Label),
       errorTag: Schema.optionalKey(Label),
+      code: Schema.optionalKey(Label),
+      boardId: Schema.optionalKey(Id),
+      cardNumber: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
+      saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+      cause: Schema.optionalKey(
+        Schema.Literals(["client_disconnect", "shutdown", "deadline", "stop", "unknown"]),
+      ),
+      waitMs: Schema.optionalKey(Measurement),
       originKind: Schema.optionalKey(Label),
       poolKey: Schema.optionalKey(Label),
       key: Schema.optionalKey(Label),
@@ -111,6 +119,25 @@ export const AnalyticsRollup = Schema.Struct({
   invalidLines: Measurement,
   kindCounts: Schema.Record(Label, Measurement),
   errorCounts: Schema.Record(Label, Measurement),
+  errorsByRoute: Schema.Array(
+    Schema.Struct({
+      route: Label,
+      method: Label,
+      status: Schema.NullOr(Measurement),
+      tag: Label,
+      ...LatencyFields,
+    }),
+  ),
+  mcpErrorsByCode: Schema.Array(Schema.Struct({ tool: Label, code: Label, ...LatencyFields })),
+  dbSlowBySpan: Schema.Array(
+    Schema.Struct({
+      span: Label,
+      key: Label,
+      phase: Label,
+      totalWaitMs: Measurement,
+      ...LatencyFields,
+    }),
+  ),
   topSlowRpcs: Schema.Array(Schema.Struct({ method: Label, ...LatencyFields })),
   askAnswerLatency: Schema.Struct(LatencyFields),
   mcpCalls: Schema.Array(

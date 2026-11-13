@@ -1110,6 +1110,11 @@ const withToolAnalytics =
                 Effect.provideService(McpCallAnalytics.McpCall, callState),
                 Effect.provideService(SavedWrite.observer, (receipt) => {
                   callState.saved = true;
+                  if (receipt.kind === "card" && callState.cardId === undefined) {
+                    callState.boardId = receipt.card.boardId;
+                    callState.cardId = receipt.card.id;
+                    callState.cardNumber = receipt.card.number;
+                  }
                   parentSaved(receipt);
                 }),
                 Effect.provideService(SavedWrite.commitObserver, () => {
@@ -1122,6 +1127,12 @@ const withToolAnalytics =
                   return Effect.gen(function* () {
                     const endedAt = yield* Clock.currentTimeMillis;
                     const ended = yield* Clock.monotonicTimeNanos;
+                    const outcome = McpCallAnalytics.callOutcome(exit, callState);
+                    const resolved = {
+                      ...(identifiers.boardId ? { boardId: identifiers.boardId } : {}),
+                      ...(callState.boardId ? { boardId: callState.boardId } : {}),
+                      ...(callState.cardId ? { cardId: callState.cardId } : {}),
+                    };
                     const ledger = {
                       ts: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
                       kind: "mcp.call",
@@ -1130,6 +1141,7 @@ const withToolAnalytics =
                       tool: options.tool.name,
                       build,
                       ...identifiers,
+                      ...resolved,
                       ...(invocation?.thread ? { callerThreadId: invocation.thread.threadId } : {}),
                       callerResolved: callState.callerResolved,
                       callerResolveMs:
@@ -1139,7 +1151,15 @@ const withToolAnalytics =
                           : Math.max(0, Number(ended - callState.callerStarted) / 1e6)),
                       readerLane: callState.readerLane,
                       durationMs: Math.max(0, Number(ended - started) / 1e6),
-                      ...McpCallAnalytics.callOutcome(exit, callState),
+                      ...outcome,
+                      props: {
+                        ...outcome.props,
+                        ...(callState.boardId ? { boardId: callState.boardId } : {}),
+                        ...(callState.cardNumber === undefined
+                          ? {}
+                          : { cardNumber: callState.cardNumber }),
+                        saved: outcome.saved ?? "unknown",
+                      },
                     };
                     yield* Effect.gen(function* () {
                       if (Option.isSome(ownerAnalytics))
@@ -1158,11 +1178,22 @@ const withToolAnalytics =
                           kind: failed ? "server.mcp.error" : "server.mcp",
                           surface: "server",
                           route: "mcp",
+                          ...resolved,
                           ...(invocation?.thread === undefined
                             ? {}
                             : { threadId: invocation.thread.threadId }),
                           durationMs: Math.max(0, endedAt - startedAt),
                           props: {
+                            ...outcome.props,
+                            saved: outcome.saved ?? "unknown",
+                            ...(callState.boardId
+                              ? { boardId: callState.boardId }
+                              : identifiers.boardId
+                                ? { boardId: identifiers.boardId }
+                                : {}),
+                            ...(callState.cardNumber === undefined
+                              ? {}
+                              : { cardNumber: callState.cardNumber }),
                             method: options.tool.name,
                             span: "mcp.tools.call",
                             originKind: invocation?.thread === undefined ? "mcp-client" : "agent",

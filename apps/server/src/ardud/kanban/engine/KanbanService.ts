@@ -125,6 +125,7 @@ import * as BoardLocks from "./boardLocks.ts";
 import * as LockedStore from "./lockedStore.ts";
 import * as SavedWrite from "./savedWrite.ts";
 import * as Analytics from "../../analytics/Analytics.ts";
+import { resolvedContext } from "../../analytics/McpCall.ts";
 import {
   analyticsErrorTag,
   recordServerAnalytics,
@@ -14482,6 +14483,7 @@ const make = Effect.gen(function* () {
       (board) => board.id === input.boardId.trim() || board.slug === input.boardId.trim(),
     );
     if (!board) return yield* failWith("invalid", `No Missions board "${input.boardId}".`);
+    yield* resolvedContext({ boardId: board.id });
     const body = `sighting\n\n${evidence}`;
     const actor: KanbanActor = { _tag: "thread", threadId: input.threadId };
     // Recover a committed append if publishing the card change races another board write.

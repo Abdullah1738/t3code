@@ -1,3 +1,4 @@
+import { interruptionProps } from "../../observability/analyticsInterruption.ts";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Hashing the small retry key synchronously keeps ledger capture independent of runtime crypto services.
 import * as NodeCrypto from "node:crypto";
 import { OrchestratorMcpFailure, type AnalyticsEvent } from "@t3tools/contracts";
@@ -12,6 +13,9 @@ type Phase = NonNullable<AnalyticsEvent["errorPhase"]>;
 export class McpCall extends Context.Service<
   McpCall,
   {
+    boardId?: string;
+    cardId?: string;
+    cardNumber?: number;
     callerResolved: boolean;
     callerResolveMs: number;
     callerStarted?: bigint;
@@ -49,6 +53,8 @@ const TYPED_OUTCOMES = {
 
 function classifyFailure(error: Record<string, unknown>) {
   if (isFailureCode(error.code)) return { tag: error.code };
+  if (error.code === -32602 || error._tag === "InvalidParams" || error._tag === "SchemaError")
+    return { tag: "invalid_request" };
   if (typeof error._tag === "string" && Object.hasOwn(TYPED_OUTCOMES, error._tag))
     return { tag: error._tag, outcome: TYPED_OUTCOMES[error._tag as keyof typeof TYPED_OUTCOMES] };
   if (error._tag === "DeviceBootError" && error.reason === "timeout")
@@ -72,6 +78,19 @@ export function callIdentifiers(payload: unknown, callerIdentity: string | undef
       : {}),
   };
 }
+
+// Resolution already happens in the tool; capture only its canonical metadata without another DB read.
+export const resolvedContext = Effect.fnUntraced(function* (context: {
+  boardId?: string;
+  id?: string;
+  number?: number;
+}) {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "None" || call.value.cardId !== undefined) return;
+  if (context.boardId) call.value.boardId = context.boardId;
+  if (context.id) call.value.cardId = context.id;
+  if (context.number !== undefined) call.value.cardNumber = context.number;
+});
 
 // Every deadline already has a span; this only preserves its phase through MCP error encoding.
 export const failedPhase = Effect.fnUntraced(function* (phase: string) {
@@ -107,7 +126,7 @@ export const handlerFailure = Effect.fnUntraced(function* <E>(cause: Cause.Cause
 export function callOutcome(
   exit: Exit.Exit<McpSchema.CallToolResult | McpSchema.InputRequired, unknown>,
   state: McpCall["Service"],
-): Pick<AnalyticsEvent, "outcome" | "errorTag" | "errorPhase" | "saved"> {
+): Pick<AnalyticsEvent, "outcome" | "errorTag" | "errorPhase" | "saved" | "props"> {
   const output =
     exit._tag === "Success" && !(exit.value instanceof McpSchema.InputRequired)
       ? exit.value
@@ -198,6 +217,26 @@ export function callOutcome(
           : "error"
         : "ok",
     saved,
+    props: {
+      code:
+        state.replyFailure ??
+        (busy
+          ? "board_busy"
+          : inputRequired
+            ? "input_required"
+            : partial
+              ? "partial_result"
+              : waitTimedOut
+                ? "wait_timeout"
+                : requestTimedOut
+                  ? "request_timeout"
+                  : replyTooLarge
+                    ? "reply_too_large"
+                    : code === "Failure" || code === "Defect"
+                      ? "unknown"
+                      : (code ?? "unknown")),
+      ...(exit._tag === "Failure" ? interruptionProps(exit.cause) : {}),
+    },
     ...(failed || timeout || state.replyFailure
       ? {
           errorTag:

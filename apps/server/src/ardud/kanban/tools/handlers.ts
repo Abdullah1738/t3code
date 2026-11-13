@@ -16,6 +16,7 @@ import {
   type KanbanThreadLink,
   type ModelSelection,
 } from "@t3tools/contracts";
+import { resolvedContext } from "../../analytics/McpCall.ts";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 
@@ -76,6 +77,7 @@ const withCaller = Effect.fn("KanbanTools.withCaller")(
       threadId,
       Effect.gen(function* () {
         const link = yield* service.caller(threadId);
+        if (link?.boardId) yield* resolvedContext({ boardId: link.boardId });
         const actor: KanbanActor =
           link !== null && link.role !== "evaluator"
             ? { _tag: "thread", threadId }
@@ -175,14 +177,18 @@ const boardFor = Effect.fn("KanbanTools.boardFor")(function* (
       return undefined;
     }).pipe(Effect.catch(() => Effect.succeed(undefined)));
   }
-  return yield* service.resolveBoard(caller.threadId, { boardId: wanted, card, discussionId }).pipe(
-    Effect.catchTags({
-      KanbanError: (error) =>
-        error.detail.startsWith("Pass boardId:")
-          ? invalid(`${missingBoard} ${error.detail}`)
-          : Effect.fail(error),
-    }),
-  );
+  const resolved = yield* service
+    .resolveBoard(caller.threadId, { boardId: wanted, card, discussionId })
+    .pipe(
+      Effect.catchTags({
+        KanbanError: (error) =>
+          error.detail.startsWith("Pass boardId:")
+            ? invalid(`${missingBoard} ${error.detail}`)
+            : Effect.fail(error),
+      }),
+    );
+  yield* resolvedContext({ boardId: resolved.id });
+  return resolved;
 });
 
 /**
@@ -210,11 +216,18 @@ const defaultCard = Effect.fn("KanbanTools.defaultCard")(function* (
 ) {
   if (caller.link?.role === "work") {
     const cards = yield* workCards(service, caller);
-    if (cards.length === 1 && cards[0]) return cards[0];
+    if (cards.length === 1 && cards[0]) {
+      yield* resolvedContext(cards[0]);
+      return cards[0];
+    }
     if (cards.length > 1) return yield* invalid(`Pass card: this thread has ${numbers(cards)}.`);
     return yield* invalid("Pass card: this thread has no card of its own.");
   }
-  if (caller.link?.cardId) return (yield* service.card(caller.link.cardId)).card;
+  if (caller.link?.cardId) {
+    const card = (yield* service.card(caller.link.cardId)).card;
+    yield* resolvedContext(card);
+    return card;
+  }
   return yield* invalid("Pass card: this thread has no card of its own.");
 });
 
@@ -225,6 +238,7 @@ const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
   ref: string | undefined,
   boardId?: string,
   inheritAncestorBoard = false,
+  captureContext = true,
 ) {
   const trimmed = ref?.trim();
   if (!trimmed) return yield* defaultCard(service, caller);
@@ -242,9 +256,12 @@ const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
     );
     const card = yield* service.cardByNumber(board.id, number);
     if (!card) return yield* invalid(`No card #${number} on ${board.name}.`);
+    if (captureContext) yield* resolvedContext(card);
     return card;
   }
-  return (yield* service.card(KanbanCardId.make(trimmed))).card;
+  const card = (yield* service.card(KanbanCardId.make(trimmed))).card;
+  if (captureContext) yield* resolvedContext(card);
+  return card;
 });
 
 /**
@@ -397,7 +414,7 @@ const cardIds = (
   refs === undefined
     ? Effect.void.pipe(Effect.as(undefined))
     : Effect.forEach(refs, (ref) =>
-        cardFor(service, caller, ref, boardId).pipe(Effect.map((card) => card.id)),
+        cardFor(service, caller, ref, boardId, false, false).pipe(Effect.map((card) => card.id)),
       );
 
 const SEARCH_LIMIT = 20;
@@ -412,7 +429,11 @@ const handlers = {
           BoardReplies.BOARD_PAGE_MAX,
         );
         if (input.since !== undefined) {
-          const window = Activity.parseWindow(input.since, undefined, yield* Clock.currentTimeMillis);
+          const window = Activity.parseWindow(
+            input.since,
+            undefined,
+            yield* Clock.currentTimeMillis,
+          );
           if (typeof window === "string") return yield* invalid(window);
           const read = yield* service.activity(board.id, window);
           const byCard = Activity.groupEvents(read.events);
@@ -741,7 +762,7 @@ const handlers = {
         const pr = input.pr ?? (prs.length === 1 ? prs[0]?.url : undefined);
         const waitsOn =
           on === "card" && input.waitsOn?.trim()
-            ? yield* cardFor(service, caller, input.waitsOn, card.boardId)
+            ? yield* cardFor(service, caller, input.waitsOn, card.boardId, false, false)
             : null;
         const waiting = yield* service.waitCard(
           card.id,
@@ -1247,7 +1268,7 @@ const handlers = {
           return { board: yield* service.pauseBoard(board.id, null, caller.actor, ancestors) };
         }
         const keep = yield* Effect.forEach(input.keep ?? [], (ref) =>
-          cardFor(service, caller, ref, board.id).pipe(Effect.map((card) => card.id)),
+          cardFor(service, caller, ref, board.id, false, false).pipe(Effect.map((card) => card.id)),
         );
         return {
           board: yield* service.pauseBoard(

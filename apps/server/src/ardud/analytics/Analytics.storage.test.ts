@@ -261,6 +261,22 @@ describe("Analytics storage failures", () => {
     Effect.gen(function* () {
       const setup = yield* fixture;
       const failed = yield* Deferred.make<void>();
+      const second = yield* Deferred.make<void>();
+      const exhausted = yield* Deferred.make<void>();
+      const dropped = yield* Deferred.make<void>();
+      const logger = Logger.make(({ message }) => {
+        const values = Array.isArray(message) ? message : [message];
+        if (
+          values.some(
+            (value) =>
+              typeof value === "object" &&
+              value !== null &&
+              "reason" in value &&
+              value.reason === "retry-limit",
+          )
+        )
+          Deferred.doneUnsafe(dropped, Effect.void);
+      });
       let broken = true;
       let attempts = 0;
       const fs = FileSystem.FileSystem.of({
@@ -270,14 +286,22 @@ describe("Analytics storage failures", () => {
             ? Effect.gen(function* () {
                 attempts++;
                 yield* Deferred.succeed(failed, undefined);
+                if (attempts === 2) yield* Deferred.succeed(second, undefined);
+                if (attempts === 3) yield* Deferred.succeed(exhausted, undefined);
                 return yield* failure("stat", file);
               })
             : setup.fs.stat(file),
       });
-      const analytics = yield* open(setup, fs, { queueCapacity: 2 });
+      const analytics = yield* open(setup, fs, { queueCapacity: 2 }).pipe(
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      );
       yield* analytics.ingest({ events: [event("item.0"), event("item.1")] });
       yield* Deferred.await(failed);
-      yield* TestClock.adjust("10 seconds");
+      yield* TestClock.adjust("5 seconds");
+      yield* Deferred.await(second);
+      yield* TestClock.adjust("5 seconds");
+      yield* Deferred.await(exhausted);
+      yield* Deferred.await(dropped);
       assert.equal(attempts, 3);
       assert.equal(yield* counter("t3_analytics_dropped_events_total", "retry-limit"), 2);
       yield* TestClock.adjust("1 minute");

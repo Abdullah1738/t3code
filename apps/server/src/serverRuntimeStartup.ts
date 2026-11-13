@@ -1,3 +1,4 @@
+import { AnalyticsInterruptCause } from "./observability/analyticsInterruption.ts";
 import { captureOwnedTree, cleanupOwnedTree } from "@t3tools/shared/ownedProcessTree";
 import { restartMarker, shutdownWithinBudget } from "./ardud/fast-install/shutdown.ts";
 import { markInstallLifecycle } from "./ardud/fast-install/report.ts";
@@ -498,11 +499,11 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
       );
       const workerFiber = yield* Ref.getAndSet(effectWorkerFiber, null);
       if (workerFiber !== null) {
-        yield* Fiber.interrupt(workerFiber).pipe(
-          Effect.interruptible,
-          Effect.timeoutOption("500 millis"),
-          Effect.ignore,
-        );
+        yield* Fiber.interruptAs(
+          workerFiber,
+          undefined,
+          AnalyticsInterruptCause.context("shutdown"),
+        ).pipe(Effect.interruptible, Effect.timeoutOption("500 millis"), Effect.ignore);
       }
       // Capture identities before provider handles can exit and orphan MCP children.
       const ownedProcesses = yield* Effect.tryPromise((signal) =>

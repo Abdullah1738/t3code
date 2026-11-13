@@ -1,3 +1,5 @@
+import type { AnalyticsEvent } from "@t3tools/contracts";
+import * as Analytics from "../../analytics/Analytics.ts";
 import { vi } from "vite-plus/test";
 import { assert, it } from "@effect/vitest";
 import {
@@ -937,6 +939,14 @@ it.effect(
   "a thread with several cards must pick a discussion and can post only to cards it still works on",
   () => {
     const { running, layer } = fakeThreads();
+    let waiting: Deferred.Deferred<AnalyticsEvent> | undefined;
+    let waitingTool = "card_get";
+    const sink = Layer.mock(Analytics.Analytics)({
+      record: (event) =>
+        event.kind === "mcp.call" && event.tool === waitingTool && waiting
+          ? Deferred.succeed(waiting, event).pipe(Effect.asVoid)
+          : Effect.void,
+    });
     return Effect.gen(function* () {
       const kanban = yield* KanbanService.KanbanService;
       const board = yield* kanban.ensureBoard({
@@ -951,6 +961,15 @@ it.effect(
       const thread = (yield* kanban.card(first.id)).card.activeThreadId!;
       running.add(thread);
       const second = (yield* kanban.createForThread(thread, { prompt: "B", title: "B" })).card;
+
+      for (const ref of [`#${second.number}`, String(second.number), second.id]) {
+        waiting = yield* Deferred.make<AnalyticsEvent>();
+        yield* call(thread, "card_get", { card: ref });
+        const captured = yield* Deferred.await(waiting);
+        assert.equal(captured.boardId, board.id);
+        assert.equal(captured.cardId, second.id);
+        assert.equal(captured.props?.cardNumber, second.number);
+      }
 
       const cardByNumber = yield* call(thread, "card_get", { card: `#${second.number}` });
       assert.isFalse(cardByNumber.isError, cardByNumber.text);
@@ -1011,7 +1030,59 @@ it.effect(
       assert.isTrue(theirs.isError);
       assert.include(theirs.text, `can't change card #${other.number}`);
       assert.include(theirs.text, "card_create");
-    }).pipe(Effect.provide(layer));
+      for (const [index, ref] of [`#${other.number}`, String(other.number), other.id].entries()) {
+        waiting = yield* Deferred.make<AnalyticsEvent>();
+        waitingTool = "card_create";
+        const created = yield* call(thread, "card_create", {
+          title: `Follow-up ${index}`,
+          prompt: `Task ${index}`,
+          blockedBy: [ref],
+        });
+        assert.isFalse(created.isError, created.text);
+        const createdCard = created.structured.card as { id: string; number: number };
+        const createdRow = yield* Deferred.await(waiting);
+        assert.equal(createdRow.cardId, createdCard.id);
+        assert.equal(createdRow.props?.cardNumber, createdCard.number);
+        assert.equal(createdRow.saved, true);
+
+        waiting = yield* Deferred.make<AnalyticsEvent>();
+        waitingTool = "card_edit";
+        const edited = yield* call(ThreadId.make("outside-editor"), "card_edit", {
+          card: second.id,
+          blockedBy: [ref],
+        });
+        assert.isFalse(edited.isError, edited.text);
+        const editRow = yield* Deferred.await(waiting);
+        assert.equal(editRow.cardId, second.id);
+        assert.equal(editRow.props?.cardNumber, second.number);
+        assert.equal(editRow.saved, true);
+
+        waiting = yield* Deferred.make<AnalyticsEvent>();
+        waitingTool = "card_wait";
+        yield* call(thread, "card_wait", {
+          card: second.id,
+          on: "card",
+          waitsOn: ref,
+          note: "Dependency",
+        });
+        const waitRow = yield* Deferred.await(waiting);
+        assert.equal(waitRow.cardId, second.id);
+        assert.equal(waitRow.props?.cardNumber, second.number);
+
+        waiting = yield* Deferred.make<AnalyticsEvent>();
+        waitingTool = "board_pause";
+        const paused = yield* call(ThreadId.make("outside-editor"), "board_pause", {
+          boardId: board.id,
+          reason: "Test pause",
+          keep: [ref],
+        });
+        assert.isFalse(paused.isError, paused.text);
+        const pauseRow = yield* Deferred.await(waiting);
+        assert.equal(pauseRow.boardId, board.id);
+        assert.isUndefined(pauseRow.cardId);
+        assert.isUndefined(pauseRow.props?.cardNumber);
+      }
+    }).pipe(Effect.provide(layer.pipe(Layer.provide(sink))));
   },
 );
 
@@ -5019,3 +5090,84 @@ it.effect("board_get returns the board's persisted gate guessing policy", () => 
     }
   }).pipe(Effect.provide(layer));
 });
+
+it.effect(
+  "report_bug attributes ID/slug targets for worker/outside callers and novel/sighting outcomes",
+  () => {
+    const fake = fakeThreads();
+    let pending:
+      | { ledger: Deferred.Deferred<AnalyticsEvent>; generic: Deferred.Deferred<AnalyticsEvent> }
+      | undefined;
+    const sink = Layer.mock(Analytics.Analytics)({
+      record: (event) => {
+        if (!pending) return Effect.void;
+        if (event.kind === "mcp.call" && event.tool === "report_bug")
+          return Deferred.succeed(pending.ledger, event).pipe(Effect.asVoid);
+        if (
+          (event.kind === "server.mcp" || event.kind === "server.mcp.error") &&
+          event.props?.method === "report_bug"
+        )
+          return Deferred.succeed(pending.generic, event).pipe(Effect.asVoid);
+        return Effect.void;
+      },
+    });
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const source = yield* kanban.ensureBoard({
+        slug: "report-source",
+        name: "Report source",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(source.id, source.defaultCardModel, 1);
+      const work = yield* kanban.createCard(source.id, { title: "Work", prompt: "Work" }, owner);
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(work.id)).card.activeThreadId!;
+      fake.running.add(worker);
+      const other = yield* kanban.ensureBoard({
+        slug: "report-target",
+        name: "Report target",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      let index = 0;
+      for (const target of [source, other]) {
+        const known = yield* kanban.createCard(
+          target.id,
+          { title: "Known storage problem", prompt: "Fix" },
+          owner,
+        );
+        for (const caller of [worker, ThreadId.make("outside-reporter")]) {
+          for (const boardId of [target.id, target.slug]) {
+            for (const outcome of ["novel", "sighting"] as const) {
+              pending = {
+                ledger: yield* Deferred.make<AnalyticsEvent>(),
+                generic: yield* Deferred.make<AnalyticsEvent>(),
+              };
+              const result = yield* call(caller, "report_bug", {
+                boardId,
+                title: outcome === "novel" ? `Novel unrelated failure ${index++}` : known.title,
+                evidence: "private-input",
+                ...(outcome === "sighting" ? { cardHint: `#${known.number}` } : {}),
+              });
+              assert.isFalse(result.isError, result.text);
+              for (const row of [
+                yield* Deferred.await(pending.ledger),
+                yield* Deferred.await(pending.generic),
+              ]) {
+                assert.equal(row.boardId, target.id);
+                assert.equal(row.props?.boardId, target.id);
+                assert.notInclude(JSON.stringify(row), "private-input");
+                if (outcome === "novel") {
+                  assert.isUndefined(row.cardId);
+                  assert.isUndefined(row.props?.cardNumber);
+                } else {
+                  assert.equal(row.cardId, known.id);
+                  assert.equal(row.props?.cardNumber, known.number);
+                }
+              }
+            }
+          }
+        }
+      }
+    }).pipe(Effect.provide(fake.layer.pipe(Layer.provide(sink))));
+  },
+);

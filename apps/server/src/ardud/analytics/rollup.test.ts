@@ -176,3 +176,116 @@ describe("analytics rollups", () => {
     assert.isBelow(timings.p50Ms!, 0.255);
   });
 });
+
+it("groups error routes, MCP codes and DB spans with bounded, lossless overflow", () => {
+  const target = makeAccumulator();
+  for (let i = 0; i < 40; i++) {
+    for (const durationMs of [10, 100]) {
+      accumulate(
+        target,
+        event({
+          kind: "server.http",
+          route: `route.${i}`,
+          durationMs,
+          props: { method: "POST", status: 503, errorTag: "Http5xx" },
+        }),
+      );
+      accumulate(
+        target,
+        event({
+          kind: "mcp.call",
+          tool: `tool.${i}`,
+          durationMs,
+          outcome: "error",
+          props: { code: "caller_unresolved" },
+        }),
+      );
+      accumulate(
+        target,
+        event({
+          kind: "server.mcp.error",
+          durationMs,
+          props: { method: `tool.${i}`, code: "caller_unresolved", errorTag: "McpToolError" },
+        }),
+      );
+      accumulate(
+        target,
+        event({
+          kind: "db.slow",
+          durationMs,
+          props: { span: `Service.${i}`, key: "reader", phase: "read", waitMs: 3 },
+        }),
+      );
+    }
+  }
+  const rollup = finishRollup(target, "2026-11-13", ts);
+  for (const rows of [rollup.errorsByRoute, rollup.mcpErrorsByCode, rollup.dbSlowBySpan]) {
+    assert.lengthOf(rows, 25);
+    assert.isTrue(rows.every((row) => row.p95Ms === 100));
+  }
+  assert.equal(
+    rollup.errorsByRoute.reduce((sum, row) => sum + row.count, 0),
+    160,
+  );
+  assert.equal(
+    rollup.mcpErrorsByCode.reduce((sum, row) => sum + row.count, 0),
+    80,
+  );
+  assert.equal(
+    rollup.dbSlowBySpan.reduce((sum, row) => sum + row.count, 0),
+    80,
+  );
+  assert.deepInclude(
+    rollup.dbSlowBySpan.find((row) => row.span === "other")!,
+    { count: 32, totalWaitMs: 96, maxMs: 100 },
+  );
+  assert.equal(
+    rollup.dbSlowBySpan.reduce((sum, row) => sum + row.totalWaitMs, 0),
+    240,
+  );
+});
+
+it("keeps HTTP method/status/tag and DB connection/phase distinct", () => {
+  const target = makeAccumulator();
+  for (const method of ["GET", "POST"])
+    for (const status of [400, 500])
+      for (const errorTag of ["Interrupted", "Failure"]) {
+        accumulate(
+          target,
+          event({ kind: "server.http", durationMs: 17, props: { method, status, errorTag } }),
+        );
+      }
+  for (const key of ["reader", "writer"])
+    for (const phase of ["read", "write"]) {
+      accumulate(
+        target,
+        event({ kind: "db.slow", durationMs: 500, props: { span: "Service.read", key, phase } }),
+      );
+    }
+  const rollup = finishRollup(target, "2026-11-13", ts);
+  assert.lengthOf(rollup.errorsByRoute, 8);
+  assert.lengthOf(rollup.dbSlowBySpan, 4);
+  assert.isTrue(rollup.dbSlowBySpan.every((row) => row.totalWaitMs === 0));
+});
+
+it("preserves all 25 groups until overflow requires an other row", () => {
+  const target = makeAccumulator();
+  for (let i = 0; i < 25; i++)
+    accumulate(
+      target,
+      event({ kind: "db.slow", durationMs: i, props: { span: `Service.${i}`, waitMs: 2 } }),
+    );
+  const exact = finishRollup(target, "2026-11-13", ts).dbSlowBySpan;
+  assert.lengthOf(exact, 25);
+  assert.isFalse(exact.some((row) => row.span === "other"));
+  accumulate(
+    target,
+    event({ kind: "db.slow", durationMs: 99, props: { span: "Service.25", waitMs: 3 } }),
+  );
+  const overflow = finishRollup(target, "2026-11-13", ts).dbSlowBySpan;
+  assert.lengthOf(overflow, 25);
+  assert.deepInclude(
+    overflow.find((row) => row.span === "other")!,
+    { count: 2, totalWaitMs: 5, p95Ms: 99, maxMs: 99 },
+  );
+});

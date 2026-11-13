@@ -440,3 +440,64 @@ describe("Analytics", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
+
+it.effect(
+  "reads cached rollups for 250k retained events under one second and updates warm filtered views incrementally",
+  () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const row = event({
+        kind: "server.http",
+        surface: "server",
+        route: "api.cards",
+        durationMs: 15,
+        props: { method: "POST", status: 503, errorTag: "Http5xx" },
+      });
+      yield* setup.fs.writeFileString(
+        `${setup.directory}/${day}.ndjson`,
+        `${JSON.stringify(row)}\n`.repeat(250_000),
+      );
+      let scans = 0;
+      const tracked = FileSystem.FileSystem.of({
+        ...setup.fs,
+        stream: (file, options) => {
+          if (file.endsWith(".ndjson")) scans++;
+          return setup.fs.stream(file, options);
+        },
+      });
+      const analytics = yield* open(setup, {}, tracked);
+      // Recovery reads each retained segment once per cold view; repeated reads and writes must not do so.
+      assert.equal((yield* analytics.read({ day })).rollup.total, 250_000);
+      assert.equal((yield* analytics.read({ day, kind: "server.http" })).rollup.total, 250_000);
+      const before = scans;
+      const started = performance.now();
+      const result = yield* analytics.read({ day, limit: 500 });
+      assert.isBelow(performance.now() - started, 1000);
+      assert.equal(result.rollup.errorsByRoute[0]!.count, 250_000);
+      assert.lengthOf(result.samples, 500);
+      yield* analytics.record(row);
+      assert.equal((yield* analytics.read({ day })).rollup.total, 250_001);
+      assert.equal(
+        (yield* analytics.read({ day, kind: "server.http", limit: 1 })).rollup.total,
+        250_001,
+      );
+      assert.equal(scans, before);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  { timeout: 120_000 },
+);
+
+it.effect("invalidates cached views after external replacement", () =>
+  Effect.gen(function* () {
+    const setup = yield* fixture;
+    const analytics = yield* open(setup);
+    yield* analytics.record(event());
+    assert.equal((yield* analytics.read({ day })).rollup.total, 1);
+    yield* setup.fs.writeFileString(
+      `${setup.directory}/${day}.ndjson`,
+      `${JSON.stringify(event({ kind: "replacement.event" }))}\n`.repeat(2),
+    );
+    const result = yield* analytics.read({ day });
+    assert.equal(result.rollup.total, 2);
+    assert.deepEqual(result.rollup.kindCounts, { "replacement.event": 2 });
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
