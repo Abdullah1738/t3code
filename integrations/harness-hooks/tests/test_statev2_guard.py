@@ -1133,6 +1133,43 @@ class GuardTests(unittest.TestCase):
                     with self.subTest(case='listable-alias-clean', command=command):
                         self.assertIsNone(self.classify(command))
 
+    def test_inherited_bash_env_fixture_cwd_changes(self):
+        # Each cd refreshes the selector in its target; only the HERE subshell
+        # from the starting cwd, without CDPATH or a changed $0, is proven.
+        self.write_plain_subpath_fixture()
+        original = (self.root / 'tmp/fixture.sh').read_text()
+        home, helper, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        for directory in ('nested/nested', 'elsewhere/nested'):
+            (self.root / directory).mkdir(parents=True)
+            (self.root / directory / '.nvmrc').symlink_to(marker)
+        commands = ('bash nested/tests/fixture.sh', '/bin/bash ' + str(self.root / 'nested/tests/fixture.sh'),
+                    'offbox run --bg -- bash nested/tests/fixture.sh')
+        here = 'HERE="$(cd "$(dirname "$0")/.." && pwd)"\n'
+        rows = [
+            ('unchanged', original, {}, None),
+            ('unchanged-empty-cdpath', original, {'CDPATH': ''}, None),
+            ('extra-top-level-cd', original.replace('set -u\n', 'set -u\ncd "$(dirname "$0")/.."\n', 1), {}, SCRIPT),
+            ('repeated-here-cd', original.replace(here, here + 'X="$(cd "$(dirname "$0")/.." && pwd)"\n', 1), {}, SCRIPT),
+            ('pushd', original.replace('set -u\n', 'set -u\npushd "$(dirname "$0")/.." >/dev/null\n', 1), {}, SCRIPT),
+            ('heredoc-cd', original.replace('src="${@: -2:1}"', 'cd /tmp\nsrc="${@: -2:1}"', 1), {}, SCRIPT),
+            ('inherited-cdpath', original, {'CDPATH': str(self.root / 'elsewhere')}, SCRIPT),
+            ('fixture-cdpath', original.replace('set -u\n', 'set -u\nCDPATH=' + str(self.root / 'elsewhere') + '\n', 1), {'CDPATH': ''}, SCRIPT),
+            ('fixture-exported-cdpath', original.replace('set -u\n', 'set -u\nexport CDPATH=' + str(self.root / 'elsewhere') + '\n', 1), {}, SCRIPT),
+            ('fixture-argv0', original.replace('set -u\n', 'set -u\nBASH_ARGV0=' + str(self.root / 'nested/nested/tests/x.sh') + '\n', 1), {}, SCRIPT),
+        ]
+        for label, source, extra, expected in rows:
+            self.assertTrue(label.startswith('unchanged') or source != original or extra, label)
+            self.write('nested/tests/fixture.sh', source)
+            with patch.dict(os.environ, {**environment, **extra}):
+                for command in commands:
+                    with self.subTest(case=label, command=command):
+                        self.assertEqual(self.classify(command), expected)
+        with patch.dict(os.environ, environment):
+            for command in ('CDPATH=/tmp bash nested/tests/fixture.sh', 'export CDPATH=/tmp; bash nested/tests/fixture.sh'):
+                with self.subTest(command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
     def test_repo_node_pin_hashes_cover_fork_helpers(self):
         # Editing local-helpers' repo-node-pin turns the fixture proof off
         # until the guard reviews and pins the new bytes.

@@ -276,8 +276,27 @@ REPO_NODE_PIN_MANAGED = ('.config/opencode/skills/remote-compute/scripts/blocker
 REPO_NODE_PIN_INPUTS = ('package.json', '.nvmrc', '.node-version', 'pnpm-lock.yaml')
 REPO_NODE_PIN_COMMAND = re.compile(
     r'ROBOB_REPO_|_repo_node_|NVM_DIR|COREPACK_HOME|repo-node-pin|\.nvm\b|libexec|corepack|'
-    r'package\.json|\.nvmrc|\.node-version|pnpm-lock\.yaml|'
+    r'package\.json|\.nvmrc|\.node-version|pnpm-lock\.yaml|CDPATH|'
     r'(?<![\w$])HOME\+?=|\bunset\b[^;&|\n]*\bHOME\b|-u\s*HOME\b')
+
+
+REPO_NODE_PIN_HERE = re.compile(r'HERE="\$\(cd "\$\(dirname "\$0"\)/\.\." && pwd\)"')
+
+
+def _repo_node_pin_cd_proof(source):
+    """The pinned cd wrapper refreshes after every cd. The startup proof walks
+    only the invocation cwd and $(dirname "$0")/.., so allow at most one cd: the
+    HERE line's subshell, which leaves the script's own cwd unchanged, with no
+    CDPATH search and an unchanged $0."""
+    code = '\n'.join(line for line in source.splitlines() if not line.lstrip().startswith('#'))
+    if re.search(r'CDPATH|BASH_ARGV0', code):
+        return False
+    changes = list(re.finditer(r'(?<![\w.$/-])(?:cd|pushd|popd)(?![\w.-])', code))
+    if not changes:
+        return True
+    lines = re.findall(r'(?m)^.*\bHERE\s*=.*$', code)
+    return (len(changes) == 1 and len(lines) == 1 and REPO_NODE_PIN_HERE.fullmatch(lines[0].strip()) is not None and
+            changes[0].start() == code.index(lines[0]) + lines[0].index('cd'))
 
 
 def _repo_node_pin_input_safe(path):
@@ -360,7 +379,7 @@ def _inherited_startup_safe(name, directory, command=None, bindings=None, writte
         return False
     if any(other != 'BASH_ENV' and setting and STARTUP_ENV.fullmatch(other) for other, setting in os.environ.items()):
         return False
-    if any(other.startswith('BASH_FUNC_') for other in os.environ) or os.environ.get('ZDOTDIR'):
+    if any(other.startswith('BASH_FUNC_') for other in os.environ) or os.environ.get('ZDOTDIR') or os.environ.get('CDPATH'):
         return False
     if bindings is not None and (bindings.get('HOME', home) != home or any(key != 'HOME' and REPO_NODE_PIN_COMMAND.search(key + '=') for key in bindings)):
         return False
@@ -925,8 +944,8 @@ def _fixture_setup(source):
         if binary == 'trap':
             return args == ['rm -rf "$' + parent + '"', 'EXIT']
         if binary == 'cd':
-            # _inherited_startup_safe checks repo-node-pin inputs only in the
-            # invocation cwd and this one; widen both together.
+            # With an inherited BASH_ENV, _repo_node_pin_cd_proof also limits
+            # where and how often this runs; widen both together.
             return args == ['$(dirname "$0")/..']
         return True
 
@@ -1018,6 +1037,8 @@ def _shell_fixture_source(source, directory):
     """Discount only paths rooted in single, literal mktemp assignments."""
     if any(value and STARTUP_ENV.fullmatch(name) and not (name == 'BASH_ENV' and _inherited_startup_safe(name, directory))
            for name, value in os.environ.items()):
+        return source
+    if os.environ.get('BASH_ENV') and not _repo_node_pin_cd_proof(source):
         return source
     try:
         stripped, _ = _heredocs(source)
