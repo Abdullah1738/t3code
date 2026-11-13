@@ -448,25 +448,22 @@ def _fit_new(sz: str, size: str | None) -> str:
 def _new_box(con, me: dict, size: str | None, template: str | None, base: str | None, fresh: bool):
     """-> (sandbox dict, source label, base_remote_dir or None, size).
 
-    Source "recipe:<template>" is a fresh box that _bring_up builds from the template's recipe because boat
-    deleted the template's data."""
+    Source "recipe:<template>" is a box that _bring_up builds when this backend has no usable template."""
     from . import home
     root = Path(me["repo_root"])
     rk = me["repo_key"]
     idem = new_id("lease")
     name = box_name(me, rk)
-    fresh_on_standby = False
     if not fresh:
         brow = None
         if base:
             full = base if ":" in base else f"{rk}:{base}"
             brow = con.execute(f"SELECT * FROM bases WHERE name=? AND {mine()}", (full,)).fetchone()
             if not brow and home.only_on_home("bases", "name=?", (full,)):
-                # Saved on the home server, which is down: Boat never had it. One line, then a plain Boat box.
+                # Saved on the home server, which is down: Boat never had it.
                 say(f"saved base '{full}' exists only on the home offbox server, which is down: "
-                    "using a plain Boat box for this run")
+                    "using the repo template or recipe for this run")
                 base = None
-                fresh_on_standby = True
             elif not brow:
                 raise OffboxError(f"no saved base '{full}'. See `offbox bases`.", code=2)
         elif not template:
@@ -474,7 +471,7 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
                                f"AND (expired_at IS NULL OR saved IS NOT NULL) AND {mine()}", (rk,)).fetchone()
             if not brow and home.only_on_home("bases", "repo_key=? AND is_default=1", (rk,)):
                 say(f"the warm state saved for {rk} exists only on the home offbox server, which is down: "
-                    "using a plain Boat box for this run")
+                    "using the repo template or recipe for this run")
         if brow:
             sz = _fit_new(size or brow["size"] or "large", size)
             s = _start_from(con, "bases", brow, sz, name, idem)
@@ -488,24 +485,21 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
     tname = template or (None if fresh else pick_template(root, rk))
     if tname and not fresh:
         # A template or base is a box (and a saved snapshot) of one owner: another owner's token gets 404 for it,
-        # which would mark it gone. Such a caller starts from a fresh box instead.
+        # which would mark it gone. Such a caller builds its own box from the recipe instead.
         trow = con.execute(f"SELECT * FROM templates WHERE name=? AND {mine()}", (tname,)).fetchone()
-        if not trow and tname != "generic":
-            trow = con.execute(f"SELECT * FROM templates WHERE name='generic' AND {mine()}").fetchone()
-            if home.only_on_home("templates", "name=?", (tname,)) and not fresh_on_standby:
-                say(f"template {tname} exists only on the home offbox server, which is down: "
-                    "using a plain Boat box for this run")
-            elif trow:
-                say(f"template {tname} not built yet; using generic")
+        sz = _fit_new(size or DEFAULT_SIZE.get(tname, "default"), size)
         if trow:
-            sz = _fit_new(size or DEFAULT_SIZE.get(tname, "default"), size)
             s = _start_from(con, "templates", trow, sz, name, idem)
             if s:
                 return s, f"template:{trow['name']}", None, sz
             say(f"template {trow['name']} is gone (boat deleted its data); building this box from its recipe "
                 f"instead, which takes a few minutes. The reaper rebuilds the template.")
-            s = api.create(sz, RUN_TTL_S, name, idem + "-recipe")
-            return s, f"recipe:{trow['name']}", None, sz
+        else:
+            backend = "home server" if api.BACKEND == "server" else "boat.dev"
+            say(f"template {tname} not built on the {backend}; building this box from its recipe (a few minutes). "
+                f"offbox template build {tname} makes the next one fast.")
+        s = api.create(sz, RUN_TTL_S, name, idem + "-recipe")
+        return s, f"recipe:{tname}", None, sz
     sz = _fit_new(size or DEFAULT_SIZE.get(tname or "generic", "default"), size)
     say(f"creating a fresh {sz} box (no template/base available)")
     s = api.create(sz, RUN_TTL_S, name, idem)
