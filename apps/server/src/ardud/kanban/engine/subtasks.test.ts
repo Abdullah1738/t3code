@@ -1453,6 +1453,29 @@ describe("marking subtasks", () => {
     expect(passReview({ subtasks }, owner, at)).toEqual(subtasks);
   });
 
+  it.each(["open", "done", "skipped"] as const)(
+    "a later worker step that is %s bounds which review can pass",
+    (state) => {
+      for (const workStep of [4, 5]) {
+        const plan = planSubtasks(
+          [],
+          [
+            { text: "Earlier evaluator task", owner: "evaluator", step: 3 },
+            { text: "Future work", owner: "work", step: workStep },
+            { text: "Future review", owner: "review", step: 5 },
+          ],
+        );
+        if (!plan.ok) throw new Error(plan.reason);
+        const subtasks =
+          state === "open"
+            ? plan.subtasks
+            : markSubtask(plan.subtasks, "s2", state, "Handled", owner, at);
+        const passed = passReview({ subtasks }, owner, at);
+        expect(passed[2]?.state).toBe(state === "open" ? "open" : "done");
+      }
+    },
+  );
+
   it("lets each role mark only its own kind, in the step the card is on", () => {
     const card = { number: 3, subtasks: planned() };
     expect(checkMark(card, "s1", "done", "work", null)).toEqual({ ok: true });

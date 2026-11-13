@@ -684,10 +684,24 @@ export const markSubtask = (
   );
 
 export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">) {
+  const current = kanbanOpenStep(card);
+  if (current === null) return [];
   const open = card.subtasks.filter(
     (subtask) => subtask.owner === "review" && subtask.state === "open",
   );
   const step = Math.min(...open.map((subtask) => subtask.step));
+  // Unfinished work in the current step can already have been reviewed, but
+  // future work must get its turn before its review can pass.
+  if (
+    card.subtasks.some(
+      (subtask) =>
+        subtask.owner === "work" &&
+        subtask.state === "open" &&
+        subtask.step > current &&
+        subtask.step <= step,
+    )
+  )
+    return [];
   return open.filter((subtask) => subtask.step === step);
 }
 

@@ -2936,7 +2936,10 @@ const make = Effect.gen(function* () {
       movedAt: at,
       updatedAt: at,
       question: to === "needs_owner" ? (asked ?? card.question) : null,
-      reviewStep: card.stage === "working" && to === "needs_review" ? 0 : card.reviewStep,
+      reviewStep:
+        (card.stage === "working" || card.stage === "todo") && to === "needs_review"
+          ? 0
+          : card.reviewStep,
     };
     // The question becomes a blocking ask, unless it is one already (made blocking).
     if (
@@ -12110,10 +12113,7 @@ const make = Effect.gen(function* () {
             `card #${card.number}'s step is yours (${Subtasks.subtaskIds(kanbanStepSubtasks(card))}): do it, or add work subtasks with card_edit, before sending it back to todo`,
           );
         }
-        let source =
-          role === "cardThread" && card.stage === "todo" && isUnattachedOwnThread(card, actor)
-            ? { ...card, reviewStep: 0 }
-            : card;
+        let source = card;
         let moveOptions = options ?? {};
         if (ownReviewHandoff) {
           const reset = Rules.applyReviewResult(card, 1, "findings");
