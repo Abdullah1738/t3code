@@ -7,25 +7,24 @@ the email", 24 Oct). Only a charge none of these explain goes to him.
 """
 import datetime as dt
 from decimal import Decimal, InvalidOperation
+import http.client
 import json
 import os
 from pathlib import Path
 import re
-import sqlite3
+import signal
 import subprocess
-import sys
 import time
+from contextlib import contextmanager
+import urllib.error
+import urllib.parse
+import urllib.request
 from zoneinfo import ZoneInfo
 import order_lookup
 
 TZ = ZoneInfo('Asia/Dubai')
 MSGS = os.environ.get('MONEY_CASES_MSGS', str(Path('~/.local/bin/msgs').expanduser()))
-# The installer puts the helper beside this check; the source tree shares helpers/.
-if not Path(__file__).with_name('robob_readonly.py').exists():
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'helpers'))
-from robob_readonly import connect_replica, replica_path
-
-STATE_DB = replica_path('MONEY_CASES_STATE_DB')
+CONTROL_FILE = Path('~/.robob/ardud-control.json').expanduser()
 RECEIPT_BEFORE = dt.timedelta(hours=2)
 # Hits asked for per receipt search, and mails read from them: a receipt buried under usage notices
 # with the same amount is still found, without an unbounded number of reads.
@@ -256,84 +255,149 @@ def iso(t):
     return t.astimezone(dt.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
 
 
-# Fields only automation puts on a turn: a scheduled run, a notification, a delegated result, a message
-# from another thread. A turn carrying any of them is never his typing, whoever it is stamped as.
-AUTOMATED = ('scheduledTaskId', 'notification', 'delegatedCompletion', 'senderThreadId')
-# Inbound ids the iMessage bridge makes up for its own turns: watcher wakes, context resets, secure forms.
+# Bridge-generated turns are never relayed owner messages.
 SYNTHETIC_IDS = ('wake:', 'reset:', 'secret:')
-INBOUND_ID = re.compile(r'Current incoming message ID: ("(?:[^"\\]|\\.)*")')
-
-
-def inbound_id(payload):
-    """The iMessage the bridge relayed in this turn, from its channel-guidance record, or None."""
-    context = payload.get('context')
-    records = context.get('records') if isinstance(context, dict) else None
-    for record in records if isinstance(records, list) else []:
-        if not isinstance(record, dict) or record.get('kind') != 'ardud-guidance':
-            continue
-        body = record.get('payload')
-        m = INBOUND_ID.search(str(body.get('text') or '') if isinstance(body, dict) else '')
-        if m:
-            try:
-                return str(json.loads(m.group(1)))
-            except ValueError:
-                return None
-    return None
-
-
-# Where the app stamps a turn he typed himself. 'server' 'user' turns are coord, crw and forwards.
 APP_SOURCES = ('web', 'mobile', 'desktop')
 
 
-def owner_turn(payload, title=''):
-    """Whether a Robob user turn is his own typing. A turn automation made (a schedule run under his saved
-    actor, a notification, a delegated result, another thread's message) never is. Otherwise: a 'user'
-    turn typed in the app, or, in his iMessage thread, a turn relaying a real inbound iMessage. Scheduled
-    prompts, kanban and watcher wakes carry no relayed id, or a made-up wake:/reset:/secret: one."""
-    if any(payload.get(k) for k in AUTOMATED):
+@contextmanager
+def within(deadline, error):
+    if deadline is None:
+        yield
+        return
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        raise error
+    previous = signal.getitimer(signal.ITIMER_REAL)
+    # Keep an earlier enclosing deadline and its exception handler.
+    if previous[0] and previous[0] <= remaining:
+        yield
+        return
+    handler = signal.getsignal(signal.SIGALRM)
+    started = time.monotonic()
+
+    def expired(*_):
+        raise error
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, remaining)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, handler)
+        if previous[0]:
+            signal.setitimer(signal.ITIMER_REAL, max(0.000001, previous[0] - (time.monotonic() - started)),
+                             previous[1])
+
+
+def owner_turn(summary, title=''):
+    """Whether a control-API user message is his typing, with complete provenance."""
+    if type(summary.get('automated')) is not bool or 'inboundMessageId' not in summary \
+            or (summary['inboundMessageId'] is not None and not isinstance(summary['inboundMessageId'], str)):
+        raise Lookup('Robob control: message provenance unavailable; server update required')
+    if summary['automated']:
         return False
-    if payload.get('createdBy') == 'user' and payload.get('creationSource') in APP_SOURCES:
+    if summary.get('createdBy') == 'user' and summary.get('creationSource') in APP_SOURCES:
         return True
-    if payload.get('createdBy') not in ('user', 'system') or not str(title or '').startswith('iMessage'):
+    if summary.get('createdBy') not in ('user', 'system') or not title.startswith('iMessage'):
         return False
-    iid = inbound_id(payload)
-    return bool(iid) and not iid.startswith(SYNTHETIC_IDS) and not str(payload.get('text') or '').lstrip().startswith('[')
+    iid = summary['inboundMessageId']
+    return bool(iid) and not iid.startswith(SYNTHETIC_IDS) and not str(summary.get('text') or '').lstrip().startswith('[')
+
+
+def control_config():
+    # Honor the runner's component credential, retaining the shared file for older installs.
+    named = os.environ.get('T3_CONTROL_TOKEN_FILE')
+    component = Path.home() / '.robob/components/watchers.json'
+    path = Path(named).expanduser() if named else component if component.exists() else CONTROL_FILE
+    try:
+        config = json.loads(path.read_text())
+        url, token = config['url'], config['token']
+        if not isinstance(url, str) or not isinstance(token, str) or not token:
+            raise ValueError()
+        url = url.rstrip('/')
+        if not url.endswith('/api/ardud/control'):
+            url += '/api/ardud/control'
+        return url, token
+    except (OSError, ValueError, KeyError, TypeError):
+        raise Lookup('Robob control: credentials unavailable') from None
+
+
+def control_get(config, path, params, deadline, stats=None):
+    url, token = config
+    try:
+        timeout = left(deadline, 3)
+        request = urllib.request.Request(url + path + '?' + urllib.parse.urlencode(params),
+                                         headers={'Authorization': 'Bearer ' + token})
+        if stats is not None:
+            stats['owner_queries'] += 1
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            result = json.load(response)
+        if not isinstance(result, dict) or result.get('ok') is not True:
+            raise Lookup('Robob control: invalid response')
+        return result
+    except urllib.error.HTTPError as e:
+        e.close()
+        raise Lookup(f'Robob control: HTTP {e.code}') from None
+    except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError):
+        # Neither a server error body nor a request/credential repr belongs in pings.json.
+        raise Lookup('Robob control: request failed or timed out') from None
 
 
 def owner_texts(since, until, deadline=None, stats=None):
-    """What the owner typed in his own Robob threads (app or iMessage) between two times."""
-    left(deadline, 4)
-    stop = time.time() + (4 if deadline is None else min(4, deadline - time.time() - 0.5))
-    try:
-        db = connect_replica(STATE_DB, timeout=1)
-        try:
-            db.set_progress_handler(lambda: int(time.time() >= stop), 10000)
-            if stats is not None:
-                stats['owner_queries'] += 1
-            rows = db.execute(
-                'SELECT m.created_at, m.payload_json, t.title FROM orchestration_v2_projection_threads t '
-                'CROSS JOIN orchestration_v2_projection_messages m ON m.thread_id = t.thread_id '
-                'AND m.created_at BETWEEN ? AND ? WHERE t.updated_at >= ? AND m.role = ?',
-                (iso(since), iso(until), iso(since), 'user')).fetchall()
-        finally:
-            db.close()
-    except (sqlite3.Error, OSError, ValueError) as e:
-        if isinstance(e, sqlite3.OperationalError) and 'interrupted' in str(e):
-            raise Lookup('Robob state: query over time') from e
-        raise Lookup(f'Robob state: {e}') from e
-    out = []
-    for created, payload, title in rows:
-        try:
-            p = json.loads(payload)
-        except ValueError:
-            continue
-        text = str(p.get('text') or '') if isinstance(p, dict) else ''
-        # Other people's chats and forwarded turns never count.
-        if not isinstance(p, dict) or not owner_turn(p, title) or text.startswith('[Forwarded by') \
-                or re.match(r'(?:Moni|Group)\b', title or ''):
-            continue
-        out.append((created, text, title or ''))
-    return out
+    """His app/iMessage typing, fetched once per check within a four-second total cap."""
+    stop = time.time() + (4 if deadline is None else min(4, left(deadline, 4) - 0.5))
+    with within(stop, Lookup('Robob control: lookup over time')):
+        config = control_config()
+        # The API's since filter is strict on updatedAt; include messages created exactly at since.
+        start = iso(since - dt.timedelta(milliseconds=1))
+        result = control_get(config, '/threads', {'updatedSince': start, 'limit': 500,
+                             'includeSubagents': 'true'}, stop, stats)
+        threads = result.get('threads')
+        if not isinstance(threads, list):
+            raise Lookup('Robob control: invalid thread list')
+        total = result.get('total')
+        if type(total) is not int or total < 0:
+            raise Lookup('Robob control: invalid thread count')
+        if total != len(threads):
+            raise Lookup('Robob control: incomplete thread list')
+        out = []
+        for thread in threads:
+            if not isinstance(thread, dict):
+                raise Lookup('Robob control: invalid thread')
+            title = str(thread.get('title') or '')
+            if thread.get('archived') or re.match(r'(?:Moni|Group)\b', title):
+                continue
+            tid = thread.get('threadId')
+            if not isinstance(tid, str) or not tid:
+                raise Lookup('Robob control: missing thread id')
+            result = control_get(config, '/threads/' + urllib.parse.quote(tid, safe='') + '/messages',
+                                 {'since': start, 'role': 'user', 'all': 'true'}, stop, stats)
+            messages = result.get('messages')
+            if not isinstance(messages, list):
+                raise Lookup('Robob control: invalid message list')
+            total = result.get('total')
+            if type(total) is not int or total < 0:
+                raise Lookup('Robob control: invalid message count')
+            if total != len(messages):
+                raise Lookup('Robob control: incomplete message list')
+            for message in messages:
+                if not isinstance(message, dict):
+                    raise Lookup('Robob control: invalid message')
+                if message.get('role') != 'user':
+                    continue
+                # Reject old summaries before accepting any rows, including app-typed turns.
+                typed = owner_turn(message, title)
+                try:
+                    created = dt.datetime.fromisoformat(message['createdAt'].replace('Z', '+00:00'))
+                    in_window = since <= created <= until
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    raise Lookup('Robob control: invalid message timestamp') from None
+                text = str(message.get('text') or '')
+                if in_window and typed and not text.startswith('[Forwarded by'):
+                    out.append((iso(created), text, title))
+        return sorted(out, key=lambda row: row[0], reverse=True)
 
 
 def show(row, deadline=None, memo=None, stats=None):

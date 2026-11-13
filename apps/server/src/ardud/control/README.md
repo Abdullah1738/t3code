@@ -226,10 +226,16 @@ planning and commit refuses with `changed`; try again later.
 Query: `limit` (default 50, newest kept), `all=true`, `role=user|assistant|all`,
 `runId`, `since` (ISO/epoch ms on `updatedAt`), `afterMessageId`. System messages
 are left out. Returns `messages[]` (`messageId`, `runId`, `role`, `text`,
-`streaming`, `createdBy`, `creationSource`, `attachments`, timestamps),
+`streaming`, `createdBy`, `creationSource`, `automated`, `inboundMessageId`, `attachments`, timestamps),
 `state`, `status`, `runId`, and `lastAssistant: { text, messageId, runId } | null`.
 `lastAssistant` is the newest non-empty assistant text, scoped to `runId` when
 given. Reasoning and tool output never count.
+
+`automated` is true when any of `scheduledTaskId`, `notification`,
+`delegatedCompletion`, or `senderThreadId` is set. `inboundMessageId` is the
+JSON-quoted incoming message ID in an iMessage channel-guidance context record,
+or null. Synthetic bridge IDs (`wake:`, `reset:`, `secret:`) are preserved so
+callers can distinguish them from relayed owner messages.
 
 ### GET /threads/:id/wait
 

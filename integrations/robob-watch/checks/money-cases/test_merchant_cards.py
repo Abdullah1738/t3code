@@ -58,7 +58,7 @@ class MerchantCases(unittest.TestCase):
         self.assertIn('bill: Wio statement AED 120', event)
         self.assertIn('balance after credits: AED 120.00', event)
         self.assertEqual(event.count('balance after credits:'), 1)
-        self.assertNotIn('balance after credits:', next(line for line in event.splitlines() if saved['id'] in line))
+        self.assertNotIn('balance after credits:', next(line for line in event.splitlines() if saved['state'] in line))
         self.assertEqual(repeat, '')
         self.assertTrue((wd / 'pings.json').exists())
 
