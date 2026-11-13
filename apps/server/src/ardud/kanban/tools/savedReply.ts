@@ -3,6 +3,7 @@ import { McpSchema } from "effect/ai";
 
 import * as BoardLocks from "../engine/boardLocks.ts";
 import * as SavedWrite from "../engine/savedWrite.ts";
+import { McpCall } from "../../analytics/McpCall.ts";
 
 export const REPLY_BUDGET_MS = 25_000;
 export const ADMISSION_BUDGET_MS = REPLY_BUDGET_MS - 5_000;
@@ -27,9 +28,11 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
 ) {
   const parent = yield* SavedWrite.observer;
   const parentCommitting = yield* SavedWrite.commitObserver;
+  const call = yield* Effect.serviceOption(McpCall);
   let commitStarted = false;
   let receipt: SavedWrite.Saved | undefined;
   const fallback = (timedOut = false) => {
+    if (call._tag === "Some") call.value.replyFailure = timedOut ? "reply_timeout" : "reply_error";
     const details =
       receipt?.kind === "card"
         ? {

@@ -1,4 +1,4 @@
-import type { AnalyticsEvent } from "@t3tools/contracts";
+import type { AnalyticsEvent, AnalyticsRollup as ContractRollup } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
 const MAX_GROUPS = 128;
@@ -21,16 +21,25 @@ interface AnalyticsLatency {
   readonly approximate: boolean;
 }
 
-export interface AnalyticsRollup {
-  readonly day: string;
-  readonly generatedAt: string;
-  readonly scope: "retained-events";
-  readonly total: number;
-  readonly invalidLines: number;
-  readonly kindCounts: Readonly<Record<string, number>>;
-  readonly errorCounts: Readonly<Record<string, number>>;
-  readonly topSlowRpcs: ReadonlyArray<AnalyticsLatency & { readonly method: string }>;
-  readonly askAnswerLatency: AnalyticsLatency;
+export type AnalyticsRollup = ContractRollup;
+
+interface McpGroup {
+  tool: string;
+  hour: string;
+  build: string;
+  durations: Durations;
+  failures: number;
+  outcomes: Map<string, number>;
+  savedCounts: Map<string, number>;
+  errors: Map<
+    string,
+    { errorTag: string; errorPhase: NonNullable<AnalyticsEvent["errorPhase"]>; count: number }
+  >;
+}
+interface RetryAttempt {
+  ts: string;
+  group: string;
+  ok: boolean;
 }
 
 const durations = (): Durations => ({ count: 0, max: 0, exact: [], histogram: undefined });
@@ -42,6 +51,10 @@ export const makeAccumulator = () => ({
   errors: new Map<string, number>(),
   rpcs: new Map<string, Durations>(),
   answers: durations(),
+  mcp: new Map<string, McpGroup>(),
+  retries: new Map<string, RetryAttempt[]>(),
+  retryAttempts: 0,
+  mcpOverflow: { groups: 0, retryAttempts: 0 },
 });
 
 function boundedKey<T>(groups: Map<string, T>, key: string): string {
@@ -85,6 +98,7 @@ export function accumulate(
   target.total++;
   increment(target.kinds, event.kind);
   if (event.props?.errorTag) increment(target.errors, event.props.errorTag);
+  else if (event.errorTag) increment(target.errors, event.errorTag);
   else if (/error|fail/i.test(event.kind)) increment(target.errors, event.kind);
   else if ((event.props?.status ?? 0) >= 400)
     increment(target.errors, `status.${event.props!.status}`);
@@ -112,6 +126,61 @@ export function accumulate(
           DateTime.toEpochMillis(DateTime.makeUnsafe(event.props.createdAt))
         : undefined);
     if (duration !== undefined && duration >= 0) addDuration(target.answers, duration);
+  }
+
+  if (event.kind === "mcp.call" && event.tool && event.outcome) {
+    const hour = `${event.ts.slice(0, 13)}:00:00.000Z`;
+    const build = event.build ?? "unknown";
+    const key = JSON.stringify([event.tool, hour, build]);
+    let group = target.mcp.get(key);
+    if (!group) {
+      // Bound both high-cardinality build groups and retry identities on damaged/untrusted logs.
+      if (target.mcp.size >= 16_384) {
+        target.mcpOverflow.groups++;
+        return;
+      }
+      group = {
+        tool: event.tool,
+        hour,
+        build,
+        durations: durations(),
+        failures: 0,
+        outcomes: new Map(),
+        savedCounts: new Map(),
+        errors: new Map(),
+      };
+      target.mcp.set(key, group);
+    }
+    addDuration(group.durations, event.durationMs ?? 0);
+    increment(group.outcomes, event.outcome);
+    increment(group.savedCounts, String(event.saved ?? "unknown"));
+    if (event.outcome !== "ok") {
+      group.failures++;
+      const errorTag = event.errorTag ?? "unknown";
+      const errorPhase = event.errorPhase ?? "handler";
+      const errorKey = boundedKey(group.errors, JSON.stringify([errorTag, errorPhase]));
+      const entry = group.errors.get(errorKey) ?? {
+        errorTag: errorKey === OTHER ? OTHER : errorTag,
+        errorPhase,
+        count: 0,
+      };
+      entry.count++;
+      group.errors.set(errorKey, entry);
+    }
+    if (event.clientRequestId) {
+      if (target.retryAttempts >= 100_000) target.mcpOverflow.retryAttempts++;
+      else {
+        const identity = JSON.stringify([
+          event.tool,
+          event.callerThreadId ?? "",
+          event.clientRequestId,
+        ]);
+        const attempts = target.retries.get(identity) ?? [];
+        attempts.push({ ts: event.ts, group: key, ok: event.outcome === "ok" });
+        target.retries.set(identity, attempts);
+        target.retryAttempts++;
+      }
+    }
   }
 }
 
@@ -146,6 +215,19 @@ export function finishRollup(
   day: string,
   generatedAt: string,
 ): AnalyticsRollup {
+  const retries = new Map<string, { failedThenRetried: number; retrySucceeded: number }>();
+  for (const attempts of target.retries.values()) {
+    // Detached emission and overlapping calls can arrive out of order, including across segments.
+    const ordered = attempts.toSorted((a, b) => a.ts.localeCompare(b.ts));
+    for (let index = 1; index < ordered.length; index++) {
+      const previous = ordered[index - 1]!;
+      if (previous.ok) continue;
+      const count = retries.get(previous.group) ?? { failedThenRetried: 0, retrySucceeded: 0 };
+      count.failedThenRetried++;
+      if (ordered[index]!.ok) count.retrySucceeded++;
+      retries.set(previous.group, count);
+    }
+  }
   return {
     day,
     generatedAt,
@@ -159,6 +241,26 @@ export function finishRollup(
       .sort((a, b) => (b.p95Ms ?? 0) - (a.p95Ms ?? 0) || a.method.localeCompare(b.method))
       .slice(0, 20),
     askAnswerLatency: summarize(target.answers),
+    mcpCalls: [...target.mcp]
+      .map(([key, group]) => ({
+        tool: group.tool,
+        hour: group.hour,
+        build: group.build,
+        ...summarize(group.durations),
+        failures: group.failures,
+        failureRate: group.failures / group.durations.count,
+        outcomes: Object.fromEntries(group.outcomes),
+        savedCounts: Object.fromEntries(group.savedCounts),
+        errors: [...group.errors.values()],
+        ...(retries.get(key) ?? { failedThenRetried: 0, retrySucceeded: 0 }),
+      }))
+      .sort(
+        (a, b) =>
+          a.hour.localeCompare(b.hour) ||
+          a.tool.localeCompare(b.tool) ||
+          a.build.localeCompare(b.build),
+      ),
+    mcpOverflow: { ...target.mcpOverflow },
   };
 }
 

@@ -51,6 +51,60 @@ function open(
 }
 
 describe("Analytics", () => {
+  it.effect(
+    "filters MCP samples and rollups by tool and outcome while persisting the full day",
+    () =>
+      Effect.gen(function* () {
+        const setup = yield* fixture;
+        const analytics = yield* open(setup);
+        yield* analytics.record(
+          event({
+            kind: "mcp.call",
+            surface: "server",
+            tool: "card_update",
+            outcome: "timeout",
+            errorPhase: "caller",
+            durationMs: 10,
+          }),
+        );
+        yield* analytics.record(
+          event({
+            kind: "mcp.call",
+            surface: "server",
+            tool: "card_update",
+            outcome: "ok",
+            durationMs: 1,
+          }),
+        );
+        yield* analytics.record(
+          event({
+            kind: "mcp.call",
+            surface: "server",
+            tool: "card_get",
+            outcome: "timeout",
+            durationMs: 20,
+          }),
+        );
+        const result = yield* analytics.read({
+          day,
+          kind: "mcp.call",
+          tool: "card_update",
+          outcome: "timeout",
+        });
+        assert.equal(result.rollup.total, 1);
+        assert.lengthOf(result.samples, 1);
+        assert.deepInclude(result.rollup.mcpCalls[0], {
+          tool: "card_update",
+          failures: 1,
+          failureRate: 1,
+        });
+        const full = JSON.parse(
+          yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
+        );
+        assert.equal(full.total, 3);
+        assert.lengthOf(full.mcpCalls, 2);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
   it.effect("flushes before reads, filters samples, and atomically saves the full rollup", () =>
     Effect.gen(function* () {
       const setup = yield* fixture;

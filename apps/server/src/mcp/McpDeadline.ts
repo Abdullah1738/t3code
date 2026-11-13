@@ -3,6 +3,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import { failedPhase } from "../ardud/analytics/McpCall.ts";
 
 class PendingWait extends Context.Service<PendingWait, { wait: string; since: bigint }>()(
   "t3/mcp/McpDeadline/PendingWait",
@@ -49,11 +50,13 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
   const pending =
     outer._tag === "Some" ? outer.value : { wait: input.wait ?? input.stage, since: startedAt };
   return yield* effect.pipe(
+    Effect.onError(() => failedPhase(input.stage)),
     Effect.provideService(PendingWait, pending),
     awaitInterruptibly,
     Effect.timeoutOrElse({
       duration: "10 seconds",
       orElse: Effect.fn("McpDeadline.expired")(function* () {
+        yield* failedPhase(input.stage);
         const now = yield* Clock.monotonicTimeNanos;
         yield* Effect.logWarning("MCP operation timed out", {
           code: input.code,

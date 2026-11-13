@@ -1,6 +1,7 @@
 import * as McpDeadline from "./McpDeadline.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { readCallerIdentity } from "./callerIdentity.ts";
+import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
 import type { CallerRow } from "../orchestration-v2/ProjectionStore.ts";
 import { claudeRecoveryResult } from "../orchestration-v2/launchRecovery.ts";
 import { stalledSummary } from "../orchestration-v2/delegatedTaskProgress.ts";
@@ -2832,6 +2833,12 @@ const make = Effect.gen(function* () {
           completionWake: input.mode === "wait" ? "settled_only" : "always",
         })
         .pipe(
+          Effect.tapError((error) =>
+            error._tag === "OrchestratorCommandRejectedError" ||
+            error._tag === "OrchestratorCommandPreviouslyRejectedError"
+              ? McpCallAnalytics.setSaved(false)
+              : Effect.void,
+          ),
           Effect.mapError((error) =>
             error._tag === "ThreadManagementProviderInstanceDisabledError"
               ? threadManagementFailure(error)
@@ -2852,6 +2859,8 @@ const make = Effect.gen(function* () {
           "Delegated task command did not produce a task projection.",
         );
       }
+      // Receipt existence includes rejections; the persisted task proves this delegation was saved.
+      yield* McpCallAnalytics.setSaved(true);
       const taskId = taskEvent.event.payload.id;
       const childThreadId = taskEvent.event.payload.childThreadId;
       const childRunEvent = result.storedEvents.find(
