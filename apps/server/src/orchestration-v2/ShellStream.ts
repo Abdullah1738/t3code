@@ -46,6 +46,8 @@ export const loadShellSnapshotParts = Effect.fn("ShellStream.loadShellSnapshotPa
   E4,
 >(input: {
   readonly sql: SqlClient.SqlClient;
+  /** Only a bounded page may share the interactive readers with point lookups. */
+  readonly bounded?: boolean;
   readonly readThreads: Effect.Effect<Effect.Effect<OrchestrationV2ThreadShellSnapshot, E2>, E1>;
   readonly listProjects: Effect.Effect<ReadonlyArray<OrchestrationProjectShell>, E3>;
   readonly latestSequence: Effect.Effect<number, E4>;
@@ -58,7 +60,10 @@ export const loadShellSnapshotParts = Effect.fn("ShellStream.loadShellSnapshotPa
         snapshotSequence: input.latestSequence,
       }),
     )
-    .pipe(NodeSqliteClient.readOnly);
+    .pipe(
+      NodeSqliteClient.readOnly,
+      input.bounded === true ? (effect) => effect : NodeSqliteClient.backgroundReads,
+    );
   return {
     projects: read.projects,
     threads: yield* read.decodeThreads,

@@ -164,7 +164,14 @@ it.effect(
         {
           // Control /threads?updatedSince: the changed range only, never every shell.
           route: "control.threads-updated-since",
-          run: control.threadsUpdatedSince("2026-01-01T00:00:00.000Z"),
+          run: control.threadCandidatePage({
+            since: Date.parse("2026-01-01T00:00:00.000Z"),
+            location: "active",
+            includeSubagents: false,
+            parentThreadId: null,
+            projectId: null,
+            limit: 50,
+          }),
         },
         {
           route: "board.thread-state",
@@ -222,7 +229,11 @@ it.effect(
               "discussion.messages",
             ].includes(entry.route)
           )
-            assert.isAtMost((statement.match(/\?/g) ?? []).length, 2, `${entry.route} bind count`);
+            assert.isAtMost(
+              (statement.match(/\?/g) ?? []).length,
+              entry.route === "control.threads-updated-since" ? 4 : 2,
+              `${entry.route} bind count`,
+            );
           const plan = yield* sql.unsafe<{ detail: string }>(
             `EXPLAIN QUERY PLAN ${statement}`,
             Array.from({ length: (statement.match(/\?/g) ?? []).length }, () => null),
