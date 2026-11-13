@@ -28,9 +28,24 @@ If calibration fails, the harness is not faithful and cannot issue a candidate P
 
 Run the full candidate only once #1323, #1341, #1342 and #1343 have merged. Until then, measure each landed fix on the base and report its own share removed. Missing calibration, missing work counters, incomplete windows, changed seed/drive rates or fewer than three passing candidate runs cannot produce a PASS.
 
-## Work-equivalence definition pending evaluator clarification
+## Clarification 13 Nov ~17:50Z
 
-The numerical line above is unchanged from the card. #1323 aims to reduce physical writer transactions and #1342 aims to reduce card rows read. Applying ±10% to those physical cost counters would reject their intended improvements. This conflict was raised in the #1352 discussion before implementing the driver or verdict. Until the evaluator defines which counters measure useful work versus cost removed, the harness must not issue a candidate PASS.
+Sanctioned by the packet's Robob evaluator (667f0c44), discussion disc-be4f9fc6-0031-4d7f-b2cf-351ddd71c389. The original thresholds above stand verbatim.
+
+“Work done within ±10% of base” means logical work on the same seed and drive:
+
+- Synthetic provider events and commands offered per minute, by kind.
+- Orchestration events persisted, by type, and commands completed or receipts written.
+- Board tick steps/s and dispatch decisions.
+- Status, asks feed, board_get and read-open-cards poller requests served, each with the same logical result size (card/ask count) as base.
+
+No backlog may build. Pending commands, outbox depth and dispatcher queue at the end of the window must each be ≤ base +10%, with no upward slope across the steady window.
+
+Writer transactions/min, card rows read/s, discussion misses and cache hits are physical costs. Report their reductions per fix; falling costs never fail candidate equivalence. Base calibration still checks physical rates within ±25% of targets.json.
+
+The exact-minute targets replace the packet's estimates: 10.9 tick steps/s, 795 writer transactions/min, 13,253 open-card rows/s and 621 discussion misses/s. Total card/discussion rates use differences between cumulative tickLocalWaits snapshots, separately labelled from per-operation counts.
+
+Seed 17 boards (trace-measured board cache entries): the 4,290/3,900-card board, the 1,320-card board (packet live overrides), and 15 small boards sized from backup statistics. Do not seed 260 for the gate. If calibration falls short on dispatch or tick cost, run a 260-board sensitivity variant; it does not gate the verdict.
 
 ## Data provenance
 

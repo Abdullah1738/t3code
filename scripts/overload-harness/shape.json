@@ -856,7 +856,8 @@
     "privacy": "Aggregate numeric statistics only; no row identifiers, payloads or card text."
   },
   "syntheticLoad": {
-    "boards": 260,
+    "boardCountSource": "Trace-measured .9 cumulative board cache entries=17; sanctioned evaluator clarification 13 Nov ~17:50Z",
+    "boards": 17,
     "largeBoards": [
       {
         "cards": 4290,
@@ -872,7 +873,8 @@
       }
     ],
     "seed": 20261113,
-    "smallBoards": 258,
+    "sensitivityBoards": 260,
+    "smallBoards": 15,
     "source": "Card #1352 live-shape requirements, 2026-11-13; kept separate from measured backup statistics.",
     "unspecifiedCounts": "Scale the measured rank-specific structure and open/settled ratios; do not present these as measured live counts."
   },

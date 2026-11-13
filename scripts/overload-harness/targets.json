@@ -133,6 +133,7 @@
     "tickStepsPerSecond": 10,
     "writerTransactionsPerMinute": 800
   },
+  "evaluatorClarification": "13 Nov ~17:50Z: exact-minute targets accepted; logical work equivalence excludes physical cost reductions. Total cache rates use cumulative snapshots; see PASS-LINE.md.",
   "httpRoutes": [
     {
       "caller": "/api/ardud/control/threads/:threadId",
@@ -192,7 +193,6 @@
   ],
   "limitations": [
     "SQL trace does not record returned rows. Per-operation KanbanStore counters (local, not global deltas) supply open-card rows; operation start and SQL start counts can differ at the window boundaries.",
-    "Physical transaction and card-row read counts are cost metrics expected to fall under #1323/#1342; evaluator must clarify candidate work-equivalence definition before implementing verdict.",
     "Cumulative board cache entries are observed, not a complete board count census. Requested synthetic board cardinality is in shape.json."
   ],
   "openCardSqlReads": {
@@ -398,6 +398,18 @@
     "count": 654,
     "perSecond": 10.9,
     "seconds": 60
+  },
+  "totalCacheRates": {
+    "card": {
+      "evictions": 0.0,
+      "hits": 15145.39806935358,
+      "misses": 0.49915128613696325
+    },
+    "discussion": {
+      "evictions": 694.0698633734473,
+      "hits": 249.85849546395923,
+      "misses": 694.0698633734473
+    }
   },
   "workTargets": {
     "cardRowsPerSecond": 13252.966666666667,
