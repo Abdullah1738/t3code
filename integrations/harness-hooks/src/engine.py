@@ -29,6 +29,7 @@ import urllib.request
 import card_mask
 import desktop_lease
 import statev2_guard
+import quint_verify_guard
 import rootwide_search_guard
 
 
@@ -83,7 +84,7 @@ _LOG_RULES = {
     "native-check-unavailable", "desktop-read-only", "desktop-admitted", "desktop-denied",
     "desktop-unavailable", "desktop-end", "desktop-end-error", "desktop-flush", "desktop-flush-none",
     "live-database-read", "live-database-script", "live-database-script-unresolved", "live-database-unavailable",
-    "rootwide-search", "card-mask",
+    "rootwide-search", "quint-verify", "card-mask",
 }
 _LOG_ERRORS = {
     "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
@@ -101,7 +102,7 @@ def _log(**record):
     try:
         rule = _log_enum(record.get("rule"), _LOG_RULES) or "no-policy"
         guard = ("statev2" if rule.startswith("live-database") else "betterstack-scope" if rule == "betterstack-scope"
-                 else "rootwide-search" if rule == "rootwide-search" else "offbox-gate" if rule.startswith("offbox") or rule in {
+                 else "quint-verify" if rule == "quint-verify" else "rootwide-search" if rule == "rootwide-search" else "offbox-gate" if rule.startswith("offbox") or rule in {
                      "go-test", "go-build", "tsc-project", "eslint-repo", "pkg-run-check", "pkg-check-bare",
                      "pytest", "js-test", "vp-test", "bun-test", "pkg-test", "pkg-run-test", "pkg-install", "yarn-bare",
                      "docker-run", "docker-container-run", "docker-build", "docker-buildx-build", "docker-compose-up", "docker-compose-v1",
@@ -1154,6 +1155,10 @@ def decide(event, harness):
             inp = event.get("tool_input", {})
             command_cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
             cwd = command_cwd
+            if quint_verify_guard.classify(command, command_cwd):
+                result = {"decision": "deny", "reason": quint_verify_guard.REASON,
+                          "context": {"rule": "quint-verify"}}
+                return result
             try:
                 root = rootwide_search_guard.classify(command, command_cwd)
             except Exception as error:
