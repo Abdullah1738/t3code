@@ -26,6 +26,7 @@ import {
   type KanbanAskTaskStep,
   type KanbanBlock,
   type KanbanCard,
+  type KanbanBoard,
   type KanbanError,
   type KanbanOwnerAsk,
 } from "@t3tools/contracts";
@@ -2064,9 +2065,14 @@ export const plainAnswer = (by: KanbanActor, at: string, dropped: boolean): Kanb
 export const passOnText = (card: KanbanCard, ask: KanbanOwnerAsk, answer: string) =>
   `This answers question ${ask.id} on card #${card.number} ("${ask.text}"), asked by a thread that has moved on. Act on it or pass it on (card_edit, card_thread):\n\n${answer}`;
 
-export const droppedText = (card: KanbanCard, ask: KanbanOwnerAsk, byOwner: boolean) => {
+export const droppedText = (
+  card: KanbanCard,
+  ask: KanbanOwnerAsk,
+  byOwner: boolean,
+  guessedGates?: KanbanBoard["guessedGates"],
+) => {
   const gated = card.subtasks.filter(
-    (subtask) => subtask.state === "open" && gateOf(subtask) !== undefined,
+    (subtask) => subtask.state === "open" && gateOf(subtask, guessedGates) !== undefined,
   );
   return `${byOwner ? "Abdullah" : "The evaluator"} dropped ${ask.id}. That is not approval for ${gated.length > 0 ? gated.map((subtask) => `${subtask.id} (${subtask.text})`).join(", ") : "any deploy, money or secret step"}; ask again or skip them only with his answer.\n\nCard #${card.number}: ${ask.text}`;
 };

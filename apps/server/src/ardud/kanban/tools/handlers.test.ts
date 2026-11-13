@@ -4198,3 +4198,28 @@ it.effect.each([true, false])("card_move reports its wait decision (keepWait=%s)
       );
   }).pipe(Effect.provide(layer));
 });
+
+it.effect("board_get returns the board's persisted gate guessing policy", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "gate-policy",
+      name: "Gate policy",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const thread = yield* kanban.startEvaluator(board.id, {
+      kind: "request",
+      text: "Read board policy",
+    });
+    for (const guessedGates of [["money", "secret"], [], ["deploy", "money", "secret"]] as const) {
+      yield* kanban.updateBoard(board.id, { guessedGates });
+      const result = yield* call(thread, "board_get", { boardId: board.id });
+      assert.isFalse(result.isError);
+      const snapshot = result.structured.board as {
+        board: { guessedGates: ReadonlyArray<string> };
+      };
+      assert.deepStrictEqual(snapshot.board.guessedGates, guessedGates);
+    }
+  }).pipe(Effect.provide(layer));
+});
