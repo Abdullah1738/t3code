@@ -37,8 +37,9 @@ def save_state(name, value):
             os.unlink(tmp)
 
 
-DIRECTORY_ROOTS = [Path.home() / 'Library/Caches', Path.home() / '.cache',
-                   Path.home() / '.local/share', Path.home() / '.robob',
+BIG_ROOTS = {Path.home() / '.local/share', Path.home() / '.robob'}
+DIRECTORY_ROOTS = [Path.home() / '.local/share', Path.home() / '.robob',
+                   Path.home() / 'Library/Caches', Path.home() / '.cache',
                    *[Path('/Volumes/ExternalSSD') / name for name in
                      ('wt', 't3code-wt', 'board-wt', 'coord-wt', 'caches', 'crpko-devops/tmp', 'memory-system-backup', 'memory-system-data', 'memory-system-data-v2')]]
 
@@ -62,7 +63,7 @@ def permission_denied(value):
     return bool(re.search(r'operation not permitted|permission denied', value, re.I))
 
 
-def source_error(component, name, source, started, exc):
+def source_error(component, name, source, started, exc, props=None):
     failure, code, message = 'exit', None, 'source read failed (%s)' % type(exc).__name__
     if isinstance(exc, SourceFailure):
         failure, code, message = exc.failure, exc.exit_code, exc.message
@@ -73,15 +74,72 @@ def source_error(component, name, source, started, exc):
         message = str(exc)
     emit(component, 'error', name, ok=False,
          props=dict(source=str(source), failure=failure, exitCode=code,
-                    elapsedMs=max(0, (time.monotonic()-started)*1000)),
+                    elapsedMs=max(0, (time.monotonic()-started)*1000), **(props or {})),
          error_tag=component+'.source_unavailable', error_message=message)
 
 
-def directory_inventory(paths=None, run=subprocess.run):
+def du_total(path, run, timeout):
+    if timeout <= 0:
+        raise SourceFailure('timeout', 'directory inventory overall budget exhausted')
+    result = run(['/usr/bin/du', '-sk', str(path)], capture_output=True, text=True,
+                 timeout=timeout, env={**os.environ, 'LC_ALL': 'C'})
+    stderr = getattr(result, 'stderr', '') or ''
+    denied = sum(permission_denied(line) for line in stderr.splitlines())
+    other_errors = any(line.strip() and not permission_denied(line) for line in stderr.splitlines())
+    message = stderr_line(stderr)
+    if result.returncode and (result.returncode != 1 or not denied or other_errors):
+        failure = 'permission' if not result.stdout.strip() and denied else 'exit'
+        raise SourceFailure(failure, message or 'du exited without a total', result.returncode)
+    # Match the requested root, not an arbitrary number printed by du.
+    for line in result.stdout.splitlines():
+        fields = line.split('\t', 1)
+        if len(fields) == 2 and fields[1] == str(path):
+            if not fields[0].isdigit():
+                raise SourceFailure('parse', message or 'invalid du total', result.returncode)
+            return int(fields[0])*1024, denied, result.returncode
+    failure = 'permission' if denied else 'missing-total' if not result.stdout.strip() or '\t' in result.stdout else 'parse'
+    raise SourceFailure(failure, message or 'du did not print a root total', result.returncode)
+
+
+def big_root_inventory(path, run, deadline):
+    total, completed, failed, denied = 0, 0, 0, 0
+    children = {}
+    # A slow subtree must not discard every other child's completed total.
+    scan_started = time.monotonic()
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                child = Path(entry.path)
+                started = time.monotonic()
+                try:
+                    size, unreadable, code = du_total(child, run, min(15, deadline-started))
+                    total += size
+                    completed += 1
+                    denied += unreadable
+                    children[str(child)] = size
+                    emit('disk', 'event', 'disk.inventory.source', ok=True,
+                         props=dict(source=str(child), bytes=size, partial=bool(unreadable),
+                                    deniedCount=unreadable, exitCode=code,
+                                    elapsedMs=(time.monotonic()-started)*1000))
+                except Exception as exc:
+                    failed += 1
+                    source_error('disk', 'disk.inventory.source', child, started, exc)
+                if time.monotonic() >= deadline:
+                    # Name the root as incomplete without enumerating an unbounded
+                    # remainder. The child error identifies the subtree that stalled.
+                    failed += 1
+                    break
+    except OSError as exc:
+        failed += 1
+        source_error('disk', 'disk.inventory.source', path, scan_started, exc)
+    return total, dict(partial=bool(failed or denied), failedCount=failed,
+                      completedCount=completed, deniedCount=denied), children
+
+
+def directory_inventory(paths=None, run=subprocess.run, deadline=None):
     started = time.monotonic()
-    deadline = started + 300
-    sizes, errors = {}, 0
-    partials = {}
+    deadline = min(started + 210, deadline) if deadline is not None else started + 210
+    sizes, errors, partials, children = {}, 0, {}, {}
     for path in DIRECTORY_ROOTS if paths is None else paths:
         source_started = time.monotonic()
         try:
@@ -89,32 +147,29 @@ def directory_inventory(paths=None, run=subprocess.run):
             remaining = deadline-time.monotonic()
             if remaining <= 0:
                 raise SourceFailure('timeout', 'directory inventory overall budget exhausted')
-            result = run(['/usr/bin/du', '-sk', str(path)], capture_output=True, text=True,
-                         timeout=min(60, remaining), env={**os.environ, 'LC_ALL': 'C'})
-            stderr = getattr(result, 'stderr', '') or ''
-            denied = sum(permission_denied(line) for line in stderr.splitlines())
-            other_errors = any(line.strip() and not permission_denied(line) for line in stderr.splitlines())
-            message = stderr_line(stderr)
-            if result.returncode and (result.returncode != 1 or not denied or other_errors):
-                failure = 'permission' if not result.stdout.strip() and denied else 'exit'
-                raise SourceFailure(failure, message or 'du exited without a total', result.returncode)
-            # Match the requested root, not an arbitrary number printed by du.
-            total = None
-            for line in result.stdout.splitlines():
-                fields = line.split('\t', 1)
-                if len(fields) == 2 and fields[1] == str(path):
-                    if not fields[0].isdigit():
-                        raise SourceFailure('parse', message or 'invalid du total', result.returncode)
-                    total = int(fields[0])*1024
-            if total is None:
-                failure = 'permission' if denied else 'missing-total' if not result.stdout.strip() or '\t' in result.stdout else 'parse'
-                raise SourceFailure(failure, message or 'du did not print a root total', result.returncode)
+            if path in BIG_ROOTS:
+                total, flags, measured = big_root_inventory(path, run, min(deadline, source_started+60))
+                children[str(path)] = measured
+                if flags['completedCount'] or not flags['failedCount']:
+                    sizes[str(path)] = total
+                if flags['partial']:
+                    partials[str(path)] = flags
+                props = dict(bytes=total, **flags)
+                if flags['failedCount']:
+                    errors += 1
+                    source_error('disk', 'disk.inventory.source', path, source_started,
+                                 SourceFailure('partial', 'directory total is incomplete'), props)
+                else:
+                    emit('disk', 'event', 'disk.inventory.source', ok=True,
+                         props=dict(source=str(path), elapsedMs=(time.monotonic()-source_started)*1000, **props))
+                continue
+            total, denied, code = du_total(path, run, min(60, remaining))
             sizes[str(path)] = total
-            if result.returncode:
+            if code:
                 partials[str(path)] = dict(partial=True, deniedCount=denied)
                 emit('disk', 'event', 'disk.inventory.source', ok=True,
                      props=dict(source=str(path), partial=True, deniedCount=denied,
-                                bytes=total, exitCode=result.returncode,
+                                bytes=total, exitCode=code,
                                 elapsedMs=(time.monotonic()-source_started)*1000))
         except FileNotFoundError as exc:
             if exc.filename == str(path):
@@ -124,7 +179,8 @@ def directory_inventory(paths=None, run=subprocess.run):
         except Exception as exc:
             errors += 1
             source_error('disk', 'disk.inventory.source', path, source_started, exc)
-    save_state('disk-inventory', dict(at=time.time(), sizes=sizes, partials=partials, sourceErrors=errors))
+    save_state('disk-inventory', dict(at=time.time(), sizes=sizes, partials=partials,
+                                    children=children, sourceErrors=errors))
     emit('disk', 'error' if errors else 'perf', 'disk.inventory', ok=not errors,
          duration_ms=(time.monotonic()-started)*1000, props={'count': len(sizes), 'sourceErrors': errors},
          error_tag='disk.inventory_failed' if errors else None)
@@ -166,15 +222,17 @@ def disk_sample(watch_dir, temp_dir, volumes=('/System/Volumes/Data', '/Volumes/
         props['inventoryAgeS'] = max(0, time.time()-inventory['at'])
         props['inventoryStale'] = props['inventoryAgeS'] > 7200
         sizes.update(inventory.get('sizes', {}))
-    previous = read_state('disk').get('sizes', {})
-    growers = sorted(((path, size - previous[path]) for path, size in sizes.items() if path in previous and size > previous[path]), key=lambda x: x[1], reverse=True)[:5]
+    previous_state = read_state('disk')
+    previous = previous_state.get('sizes', {})
+    incomplete = set(inventory.get('partials', {})) | set(previous_state.get('partials', {}))
+    growers = sorted(((path, size - previous[path]) for path, size in sizes.items() if path in previous and path not in incomplete and size > previous[path]), key=lambda x: x[1], reverse=True)[:5]
     for i, (path, delta) in enumerate(growers, 1):
         props['grower%dPath' % i] = path
         props['grower%dDeltaGb' % i] = round(delta / 1024**3, 6)
     props.update(count=len(growers), baseline=int(not previous), sourceErrors=errors)
     emit('disk', 'error' if errors else 'perf', 'disk.sample', duration_ms=(time.monotonic()-started)*1000,
          ok=not errors, props=props, error_tag='disk.source_unavailable' if errors else None)
-    save_state('disk', dict(sizes=sizes))
+    save_state('disk', dict(sizes=sizes, partials=inventory.get('partials', {})))
 
 
 def backup_restic_exit(executable, exit_code, output):
