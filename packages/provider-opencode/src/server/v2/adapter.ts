@@ -2514,6 +2514,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           shellWakePending.delete(sessionId);
         } else if (event.type === "unreadable.execution.ended" || executionEnd(event.type)) {
           busy.delete(sessionId);
+          // A shell that exited during this execution has no further wake to wait for.
+          shellWakePending.delete(sessionId);
         }
       }
       if (event.type === "session.created" && event.data.parentID !== undefined) {
@@ -2629,7 +2631,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       if (event.type === "shell.exited" || event.type === "shell.deleted") {
         const owner = shells.get(event.data.id);
         shells.delete(event.data.id);
-        // Exit queues a native wake; deletion does not. Hold the ordered snapshot across that gap.
+        // An idle shell exit needs its next execution; a foreground exit drains in the current one.
         if (owner !== undefined && event.type === "shell.exited") shellWakePending.add(owner);
         const state = owner === undefined ? undefined : ownerOf(owner);
         if (state !== undefined) yield* syncRoster(rootOf(state));

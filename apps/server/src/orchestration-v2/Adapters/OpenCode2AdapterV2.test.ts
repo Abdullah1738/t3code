@@ -109,10 +109,10 @@ const shellCreated = (id: string, sessionID: string) =>
       },
     },
   });
-const shellExited = (id: string) =>
+const shellExited = (id: string, status: "exited" | "timeout" | "killed" = "exited") =>
   rawEvent("shell.exited", {
     location: { directory: WORK },
-    data: { id, exit: 0, status: "exited" },
+    data: { id, ...(status === "exited" ? { exit: 0 } : {}), status },
   });
 
 const mcpRules = [
@@ -2541,6 +2541,89 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }),
     event("session.execution.succeeded", { sessionID: SESSION }),
   ];
+
+  it.effect.each(
+    (["root", "child"] as const).flatMap((owner) =>
+      (["completed", "interrupted", "failed"] as const).flatMap((status) =>
+        (["exited", "timeout", "killed", "deleted"] as const).map((ending) => ({
+          owner,
+          status,
+          ending,
+          label: ending === "exited" ? "foreground shell" : `${ending} shell`,
+        })),
+      ),
+    ),
+  )("clears a $status $label on the $owner session", ({ owner, status, ending }) =>
+    Effect.gen(function* () {
+      const sessionID = owner === "root" ? SESSION : MIDDLE;
+      const { runtime, thread } = yield* resumed([
+        ...(owner === "child"
+          ? middleLaunch
+          : [
+              out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+              promptAccepted,
+              event("session.execution.started", { sessionID: SESSION }),
+            ]),
+        shellCreated("sh_foreground", sessionID),
+        ending === "deleted"
+          ? rawEvent("shell.deleted", {
+              location: { directory: WORK },
+              data: { id: "sh_foreground" },
+            })
+          : shellExited("sh_foreground", ending),
+        event("session.text.ended", {
+          sessionID,
+          assistantMessageID: "msg_foreground_shell_answer",
+          ordinal: 0,
+          text: "FOREGROUND_OK",
+        }),
+        status === "failed"
+          ? event("session.execution.failed", {
+              sessionID,
+              error: { type: "unknown", message: "Foreground execution failed" },
+            })
+          : event(
+              status === "completed"
+                ? "session.execution.succeeded"
+                : "session.execution.interrupted",
+              { sessionID },
+            ),
+        ...(owner === "child"
+          ? [event("session.execution.succeeded", { sessionID: SESSION })]
+          : []),
+        event("session.model.selected", {
+          sessionID: SESSION,
+          model: { providerID: "opencode", id: "big-pickle", variant: "foreground-shell-finished" },
+        }),
+      ]);
+      const delivered = yield* runtime.events.pipe(
+        Stream.tap(() => Effect.yieldNow),
+        Stream.takeUntil(
+          (event) =>
+            event.type === "provider_thread.updated" &&
+            event.providerThread.nativeMetadata?.modelSelection?.options?.[0]?.value ===
+              "foreground-shell-finished",
+        ),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(withLineage(thread));
+      const events = [...(yield* Fiber.join(delivered))];
+      const updates = events.flatMap((event) =>
+        event.type === "provider_thread.updated" && event.providerThread.id === thread.id
+          ? [event.providerThread]
+          : [],
+      );
+      assert.isTrue(updates.some((thread) => thread.pendingBackgroundWork === true));
+      assert.equal(updates.at(-1)?.pendingBackgroundWork, false);
+      assert.isTrue(
+        events.some(
+          (event) => event.type === "message.updated" && event.message.text === "FOREGROUND_OK",
+        ),
+      );
+      assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+    }).pipe(Effect.scoped),
+  );
   const watchNested = (runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime) =>
     Effect.gen(function* () {
       const deep: Array<string> = [];
@@ -2580,15 +2663,18 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     });
 
   it.effect.each([
-    { source: "subagent", status: "completed" },
-    { source: "subagent", status: "interrupted" },
-    { source: "subagent", status: "failed" },
-    { source: "shell", status: "completed" },
-    { source: "shell", status: "interrupted" },
-    { source: "shell", status: "failed" },
+    { source: "subagent", status: "completed", exitBeforeRootEnd: false },
+    { source: "subagent", status: "interrupted", exitBeforeRootEnd: false },
+    { source: "subagent", status: "failed", exitBeforeRootEnd: false },
+    { source: "shell", status: "completed", exitBeforeRootEnd: false },
+    { source: "shell", status: "interrupted", exitBeforeRootEnd: false },
+    { source: "shell", status: "failed", exitBeforeRootEnd: false },
+    { source: "shell", status: "completed", exitBeforeRootEnd: true },
+    { source: "shell", status: "interrupted", exitBeforeRootEnd: true },
+    { source: "shell", status: "failed", exitBeforeRootEnd: true },
   ] as const)(
-    "publishes idle after a nested $source's $status follow-up output",
-    ({ source, status }) =>
+    "publishes idle after a nested $source's $status follow-up output (root still running: $exitBeforeRootEnd)",
+    ({ source, status, exitBeforeRootEnd }) =>
       Effect.gen(function* () {
         const { runtime, thread } = yield* resumed([
           ...(source === "subagent"
@@ -2607,8 +2693,15 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
                   metadata: { sessionID: MIDDLE, status: "completed", truncated: false },
                   executed: false,
                 }),
-                event("session.execution.succeeded", { sessionID: SESSION }),
-                shellExited("sh_nested"),
+                ...(exitBeforeRootEnd
+                  ? [
+                      shellExited("sh_nested"),
+                      event("session.execution.succeeded", { sessionID: SESSION }),
+                    ]
+                  : [
+                      event("session.execution.succeeded", { sessionID: SESSION }),
+                      shellExited("sh_nested"),
+                    ]),
               ]),
           event("session.execution.started", { sessionID: MIDDLE }),
           event("session.text.ended", {
