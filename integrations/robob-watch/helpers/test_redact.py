@@ -23,6 +23,14 @@ CASES = [
 CASES += [('qa@example.com' + sep + quote + 'FakePassword https://example.test/path FakeTail99' + quote, 'FakeTail99')
           for quote in ['"', "'", '`'] for sep in [' / ', ', ', ' | ', '\n']]
 
+BLOCK_HEADERS = ['login details', 'credentials', 'creds']
+BLOCK_WRAPPERS = ['***', '___', '**', '__', '~~', '*', '_', '```', '``', '`', '"', "'"]
+CASES += [(wrapper + header + ':' + wrapper + '\nqa@example.com\nFake#Pass123', 'Fake#Pass123')
+          for header in BLOCK_HEADERS for wrapper in BLOCK_WRAPPERS]
+
+CASES += [(outer + '`' + header + ':`' + outer + '\nadmin\nFake#Pass123', 'Fake#Pass123')
+          for header in BLOCK_HEADERS for outer in ['**', '__', '*', '_', '~~']]
+
 UNCHANGED = [
     'pass the ball', "I'll pass on that", 'pin the message', 'code review tomorrow',
     'token budget is low', 'password reset link sent', 'https://example.com/reset?pass=1',
@@ -78,6 +86,35 @@ class RedactTests(unittest.TestCase):
                             self.assertNotIn('fake pass 99', result)
                             self.assertIn(user, result)
                             self.assertEqual(r.redact(result), result)
+
+    def test_wrapped_block_headers(self):
+        for header in BLOCK_HEADERS:
+            for wrapper in BLOCK_WRAPPERS:
+                for prefix in [wrapper + header + ':' + wrapper, wrapper + header + wrapper + ':', wrapper + header + wrapper]:
+                    for user in ['admin', 'qa@example.com', 'username: admin', 'email: qa@example.com']:
+                        for sep in [' / ', '\n', '\r\n', ' => ']:
+                            for value in ['Fake#Pass123', '"fake pass 99"']:
+                                text = prefix + '\n' + user + sep + value
+                                with self.subTest(text=text):
+                                    result = r.redact(text)
+                                    self.assertEqual(result, prefix + '\n' + user + sep + '[redacted]')
+                                    self.assertEqual(r.redact(result), result)
+
+    def test_nested_wrapped_block_headers(self):
+        for header in BLOCK_HEADERS:
+            for outer in ['**', '__', '*', '_', '~~']:
+                for inner in ['`', '``', '```', '"', "'", '**', '__', '_`']:
+                    closing = inner[::-1]
+                    for prefix in [outer + inner + header + ':' + closing + outer,
+                                   outer + inner + header + closing + ':' + outer,
+                                   outer + inner + header + closing + outer + ':']:
+                        for user in ['admin', 'qa@example.com', 'username: admin']:
+                            for sep in ['\n', ' / ', '\r\n']:
+                                text = prefix + '\n' + user + sep + 'Fake#Pass123'
+                                with self.subTest(text=text):
+                                    result = r.redact(text)
+                                    self.assertEqual(result, prefix + '\n' + user + sep + '[redacted]')
+                                    self.assertEqual(r.redact(result), result)
 
     def test_labelled_values_inside_credential_blocks(self):
         for header in ['login details', 'credentials', 'creds']:

@@ -23,7 +23,9 @@ JWT_RE = re.compile(r'\beyJ[\w-]+\.[\w-]+\.[\w-]+')
 KEY_RE = re.compile(r'\b(?:sk|pk|lin_api|ghp|gho|xox[bp])[-_][A-Za-z0-9_-]{12,}')
 EMAIL = r'[\w.+-]+@[\w-]+\.[\w.]+'
 LOGIN_RE = re.compile('(' + EMAIL + r')([^\S\n]*(?:/|,|\||\n|[^\S\n])[^\S\n]*)(' + VALUE + ')')
-BLOCK_RE = re.compile(r'\b(?:login[^\S\n]+details|credentials|creds)[^\S\n]*:?(?:[^\S\n]*\n){0,2}[^\S\n]*'
+BLOCK_HEADER_RE = re.compile(r'(?<![\w-])(?P<opening>[*_~`"\']*)'
+                             r'(?:login[^\S\n]+details|credentials|creds)(?=[\W_]|$)', re.I)
+BLOCK_RE = re.compile(r'(?:[^\S\n]*\n){0,2}[^\S\n]*'
                       r'(?P<user>(?:(?:user(?:name)?|email)[^\S\n]*[:=][^\S\n]*)?[^\s/:=|,]+)'
                       r'(?P<sep>[^\S\n]*(?:/|,|\||=>|->|=|:|–|—|-|\bis\b)\s*|[^\S\n]*\n\s*)'
                       r'(?P<value>' + VALUE + ')', re.I)
@@ -72,6 +74,39 @@ def _inside(spans, start):
     return any(lo <= start < hi for lo, hi in spans)
 
 
+def _credential_blocks(text):
+    spans = [m.span() for m in URL_RE.finditer(text)]
+    parts, last = [], 0
+    for header in BLOCK_HEADER_RE.finditer(text):
+        if header.start() < last or _inside(spans, header.start()):
+            continue
+        pos, colon, matched = header.end(), False, True
+        # Nested emphasis/code wrappers close in reverse order, with a colon
+        # allowed inside, between or outside their closing delimiters.
+        for closing in [*reversed(header['opening']), None]:
+            while pos < len(text) and text[pos] in ' \t\r\f\v':
+                pos += 1
+            if pos < len(text) and text[pos] == ':' and not colon:
+                colon, pos = True, pos + 1
+                while pos < len(text) and text[pos] in ' \t\r\f\v':
+                    pos += 1
+            if closing is not None:
+                if pos >= len(text) or text[pos] != closing:
+                    matched = False
+                    break
+                pos += 1
+        pair = BLOCK_RE.match(text, pos) if matched else None
+        if not pair or URL_RE.fullmatch(pair['value']):
+            continue
+        labelled = LABEL_RE.match(text, pair.start('value'))
+        if labelled and (labelled['value'] == REDACTED or _label(labelled) != _prefix(labelled) + labelled['value']):
+            continue
+        parts.extend((text[last:pair.start('value')], REDACTED))
+        last = pair.end('value')
+    parts.append(text[last:])
+    return ''.join(parts)
+
+
 def _labelled_values(text):
     spans = [m.span() for m in URL_RE.finditer(text)]
     def phrase(m):
@@ -83,17 +118,7 @@ def _labelled_values(text):
     text = PHRASE_RE.sub(phrase, text)
     spans = [m.span() for m in URL_RE.finditer(text)]
     text = GROUPED_RE.sub(lambda m: m.group() if _inside(spans, m.start()) or _technical_code(m) else _prefix(m) + REDACTED, text)
-    spans = [m.span() for m in URL_RE.finditer(text)]
-    def block(m):
-        if _inside(spans, m.start()):
-            return m.group()
-        labelled = LABEL_RE.match(m.string, m.start('value'))
-        if labelled and (labelled['value'] == REDACTED or _label(labelled) != _prefix(labelled) + labelled['value']):
-            return m.group()
-        if URL_RE.fullmatch(m['value']):
-            return m.group()
-        return m.group()[:m.start('value') - m.start()] + REDACTED
-    text = BLOCK_RE.sub(block, text)
+    text = _credential_blocks(text)
     spans = [m.span() for m in URL_RE.finditer(text)]
     parts, last = [], 0
     for m in LABEL_RE.finditer(text):
