@@ -27,6 +27,7 @@ import { expandHomePath, resolveBaseDir } from "../os-jank.ts";
 import { isProcessAlive, readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
 import {
   boundedTraceRetention,
+  DEFAULT_TRACE_FILE_MIN_DURATION_MS,
   DEFAULT_TRACE_MAX_BYTES,
   DEFAULT_TRACE_MAX_FILES,
 } from "../ardud/observability/traceRetention.ts";
@@ -99,6 +100,9 @@ export const traceMaxFilesConfig = Config.Int("T3CODE_TRACE_MAX_FILES").pipe(
 
 const EnvServerConfig = Config.all({
   logLevel: Config.LogLevel("T3CODE_LOG_LEVEL").pipe(Config.withDefault("Info")),
+  traceFileMinDurationMs: Config.Number("T3CODE_TRACE_FILE_MIN_DURATION_MS").pipe(
+    Config.withDefault(DEFAULT_TRACE_FILE_MIN_DURATION_MS),
+  ),
   traceMinLevel: Config.LogLevel("T3CODE_TRACE_MIN_LEVEL").pipe(Config.withDefault("Info")),
   traceTimingEnabled: Config.Boolean("T3CODE_TRACE_TIMING_ENABLED").pipe(Config.withDefault(true)),
   traceFile: traceFileConfig,
@@ -453,6 +457,7 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
   const config: ServerConfig.ServerConfig["Service"] = {
     logLevel,
     traceMinLevel: env.traceMinLevel,
+    traceFileMinDurationMs: Math.max(0, env.traceFileMinDurationMs),
     traceTimingEnabled: env.traceTimingEnabled,
     traceBatchWindowMs: env.traceBatchWindowMs,
     traceMaxBytes: retention.maxBytes,

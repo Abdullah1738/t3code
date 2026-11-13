@@ -74,7 +74,7 @@ const TraceRecordLine = Schema.Struct({
 
 const decodeTraceRecordLine = Schema.decodeUnknownSync(Schema.fromJsonString(TraceRecordLine));
 
-const makeRecord = (name: string, suffix = ""): TraceRecord => ({
+const makeRecord = (name: string, suffix = ""): EffectTraceRecord => ({
   type: "effect-span",
   name,
   traceId: `trace-${name}-${suffix}`,
@@ -795,4 +795,199 @@ describe("OtlpHeadersFromString", () => {
   ])("$name", ({ input }) => {
     expect(() => decode(input)).toThrow();
   });
+});
+
+nodeServicesIt("local file filtering", (it) => {
+  it.effect(
+    "summarises fast children each minute and at close while preserving protected spans",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const dir = yield* fs.makeTempDirectoryScoped();
+          const filePath = path.join(dir, "trace.ndjson");
+          const sink = yield* makeTraceSink({
+            filePath,
+            maxBytes: 1_000_000,
+            maxFiles: 2,
+            batchWindowMs: 1000,
+            fileFilter: { minDurationMs: 2 },
+          });
+          const child = { ...makeRecord("fast"), parentSpanId: "parent", durationMs: 0.5 };
+          sink.push(child);
+          sink.push(child);
+          sink.push({ ...child, name: "slow", durationMs: 2 });
+          sink.push({ ...child, name: "failed", exit: { _tag: "Failure", cause: "fixture" } });
+          sink.push({
+            ...child,
+            name: "interrupted",
+            exit: { _tag: "Interrupted", cause: "fixture" },
+          });
+          sink.push({ ...makeRecord("root"), durationMs: 0 });
+          for (const level of ["WARN", "WARNING", "ERROR", "FATAL"])
+            sink.push({
+              ...child,
+              name: level,
+              events: [
+                { name: "log", timeUnixNano: "1", attributes: { "effect.logLevel": level } },
+              ],
+            });
+          yield* TestClock.adjust("1 minute");
+          yield* sink.flush;
+          const first: Array<{
+            type: string;
+            name?: string;
+            spans?: Record<string, { count: number; totalMs: number; maxMs: number }>;
+          }> = (yield* fs.readFileString(filePath))
+            .trim()
+            .split("\n")
+            .map((line) => JSON.parse(line));
+          expect(first.filter((r) => r.type === "span-summary")).toHaveLength(1);
+          expect(first.find((r) => r.type === "span-summary")?.spans?.fast).toEqual({
+            count: 2,
+            totalMs: 1,
+            maxMs: 0.5,
+          });
+          expect(first.filter((r) => r.type === "effect-span").map((r) => r.name)).toEqual([
+            "slow",
+            "failed",
+            "interrupted",
+            "root",
+            "WARN",
+            "WARNING",
+            "ERROR",
+            "FATAL",
+          ]);
+          sink.push(child);
+          yield* sink.close();
+          const last = (yield* fs.readFileString(filePath))
+            .trim()
+            .split("\n")
+            .map((line) => JSON.parse(line));
+          expect(last.filter((r) => r.type === "span-summary")).toHaveLength(2);
+          expect(last.at(-1).spans.fast.count).toBe(1);
+        }),
+      ),
+  );
+
+  it.effect("disabling or omitting the filter preserves fast children in full", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const dir = yield* fs.makeTempDirectoryScoped();
+        for (const fileFilter of [undefined, { minDurationMs: 0 }]) {
+          const filePath = `${dir}/trace-${fileFilter ? "zero" : "default"}`;
+          const sink = yield* makeTraceSink({
+            filePath,
+            maxBytes: 1_000_000,
+            maxFiles: 1,
+            batchWindowMs: 1000,
+            ...(fileFilter ? { fileFilter } : {}),
+          });
+          sink.push({ ...makeRecord("fast"), parentSpanId: "parent", durationMs: 0 });
+          yield* sink.close();
+          const rows = yield* readTraceRecords(filePath);
+          expect(rows.map((r) => r.name)).toEqual(["fast"]);
+        }
+      }),
+    ),
+  );
+
+  it.effect("the delegate still receives fast children omitted from the local file", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const dir = yield* fs.makeTempDirectoryScoped();
+        const delegates: Array<Tracer.Span> = [];
+        const filePath = `${dir}/trace`;
+        const sink = yield* makeTraceSink({
+          filePath,
+          maxBytes: 1_000_000,
+          maxFiles: 1,
+          batchWindowMs: 1000,
+          fileFilter: { minDurationMs: 5 },
+        });
+        const tracer = yield* makeLocalFileTracer({
+          filePath,
+          maxBytes: 1_000_000,
+          maxFiles: 1,
+          batchWindowMs: 1000,
+          sink,
+          delegate: Tracer.make({
+            span: (options) => {
+              const span = new Tracer.NativeSpan(options);
+              delegates.push(span);
+              return span;
+            },
+          }),
+        });
+        yield* Effect.void.pipe(
+          Effect.withSpan("fast-child"),
+          Effect.withSpan("root"),
+          Effect.provideService(Tracer.Tracer, tracer),
+        );
+        yield* sink.close();
+        expect(delegates.map((s) => s.name)).toEqual(["root", "fast-child"]);
+        expect(delegates.every((s) => s.status._tag === "Ended")).toBe(true);
+        const lines = (yield* fs.readFileString(filePath))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        expect(lines.filter((r) => r.type === "effect-span").map((r) => r.name)).toEqual(["root"]);
+        expect(lines.find((r) => r.type === "span-summary").spans["fast-child"].count).toBe(1);
+      }),
+    ),
+  );
+});
+
+const severityCases: ReadonlyArray<{ level: unknown; keep: boolean }> = [
+  { level: "WARN", keep: true },
+  { level: "warn", keep: true },
+  { level: "WARNING", keep: true },
+  { level: "warning", keep: true },
+  { level: "ERROR", keep: true },
+  { level: "error", keep: true },
+  { level: "FATAL", keep: true },
+  { level: "fatal", keep: true },
+  { level: "INFO", keep: false },
+  { level: null, keep: false },
+  { level: 13, keep: false },
+  { level: ["WARN"], keep: false },
+  { level: { toString: 0 }, keep: false },
+  { level: {}, keep: false },
+];
+
+nodeServicesIt("event severity input forms", (it) => {
+  it.effect.each(severityCases)(
+    "handles severity $level without coercing unknown annotation values",
+    ({ level, keep }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const dir = yield* fs.makeTempDirectoryScoped();
+          const filePath = `${dir}/trace`;
+          const sink = yield* makeTraceSink({
+            filePath,
+            maxBytes: 1_000_000,
+            maxFiles: 1,
+            batchWindowMs: 1000,
+            fileFilter: { minDurationMs: 2 },
+          });
+          sink.push({
+            ...makeRecord("child"),
+            parentSpanId: "parent",
+            durationMs: 0.1,
+            events: [{ name: "log", timeUnixNano: "1", attributes: { "effect.logLevel": level } }],
+          });
+          yield* sink.close();
+          const rows = (yield* fs.readFileString(filePath))
+            .trim()
+            .split("\n")
+            .map((line) => JSON.parse(line));
+          expect(rows.some((r) => r.type === "effect-span")).toBe(keep);
+          if (!keep) expect(rows.find((r) => r.type === "span-summary").spans.child.count).toBe(1);
+        }),
+      ),
+  );
 });

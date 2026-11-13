@@ -375,7 +375,7 @@ export function boundProviderEventForLogging(event: unknown): unknown {
 }
 
 export const writeBatchedMessages = Effect.fnUntraced(function* (
-  sink: AsyncFileSink,
+  sink: Pick<AsyncFileSink, "write">,
   records: ReadonlyArray<PendingRecord>,
   maxBytes: number,
   onWritten: (records: ReadonlyArray<PendingRecord>) => void,

@@ -13,6 +13,7 @@ import { DEFAULT_SIGNAL_EXPORT, type SignalExport } from "@t3tools/shared/observ
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import packageJson from "../package.json" with { type: "json" };
 import {
+  DEFAULT_TRACE_FILE_MIN_DURATION_MS,
   DEFAULT_TRACE_MAX_BYTES,
   DEFAULT_TRACE_MAX_FILES,
 } from "./ardud/observability/traceRetention.ts";
@@ -54,6 +55,7 @@ export class ServerConfig extends Context.Service<
   ServerConfig,
   ServerDerivedPaths & {
     readonly logLevel: LogLevel.LogLevel;
+    readonly traceFileMinDurationMs: number;
     readonly traceMinLevel: LogLevel.LogLevel;
     readonly traceTimingEnabled: boolean;
     readonly traceBatchWindowMs: number;
@@ -199,6 +201,7 @@ const makeTest = Effect.fn("ServerConfig.makeTest")(function* (
   return ServerConfig.of({
     logLevel: "Error",
     traceMinLevel: "Info",
+    traceFileMinDurationMs: DEFAULT_TRACE_FILE_MIN_DURATION_MS,
     traceTimingEnabled: true,
     traceBatchWindowMs: 200,
     traceMaxBytes: DEFAULT_TRACE_MAX_BYTES,

@@ -1,6 +1,8 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 // @effect-diagnostics nodeBuiltinImport:off - Atomic fsync/rename and byte-preserving fixture verification require native file handles.
+import * as NodeZlib from "node:zlib";
+import * as NodeUtil from "node:util";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeCrypto from "node:crypto";
@@ -22,8 +24,11 @@ const decodeText = (bytes: Uint8Array): string => {
     throw new Error("Redaction requires valid UTF-8 text.");
   }
 };
+const decompress = NodeUtil.promisify(NodeZlib.gunzip);
+const compress = NodeUtil.promisify(NodeZlib.gzip);
 export async function readTextFile(file: string): Promise<string> {
-  return decodeText(await NodeFSP.readFile(file));
+  const bytes = await NodeFSP.readFile(file);
+  return decodeText(file.endsWith(".gz") ? await decompress(bytes) : bytes);
 }
 
 export async function filesBelow(root: string): Promise<string[]> {
@@ -135,7 +140,9 @@ async function rewriteFileNative(
     );
     const handle = await NodeFSP.open(temp, "wx", 0o600);
     try {
-      await handle.writeFile(plan.after);
+      await handle.writeFile(
+        plan.path.endsWith(".gz") ? await compress(plan.after, { level: 6 }) : plan.after,
+      );
       await handle.chmod(plan.mode);
       await handle.sync();
       await handle.close();

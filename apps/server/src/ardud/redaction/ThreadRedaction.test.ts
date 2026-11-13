@@ -6,6 +6,7 @@ import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 // @effect-diagnostics nodeBuiltinImport:off - Atomic fsync/rename and byte-preserving fixture verification require native file handles.
 import { createReadonlyReplica } from "../persistence/readonlyExport.ts";
+import * as NodeZlib from "node:zlib";
 import * as NodeFS from "node:fs";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as Fiber from "effect/Fiber";
@@ -3594,6 +3595,51 @@ it.effect.each(
       const audit =
         yield* sql`SELECT event_id FROM orchestration_events WHERE event_type='thread.item-redacted'`;
       expect(audit.length).toBe(0);
+    }),
+  ),
+);
+
+it.effect("scrubs compressed trace backups without changing other spans or summaries", () =>
+  run(
+    Effect.gen(function* () {
+      yield* extendedStores(false);
+      const config = yield* Config.ServerConfig;
+      const file = NodePath.join(config.logsDir, "server.trace.ndjson.1.gz");
+      const unrelated = JSON.stringify({
+        type: "span-summary",
+        windowStart: 0,
+        windowEnd: 60000,
+        spans: { sqlite: { count: 2, totalMs: 1, maxMs: 0.5 } },
+      });
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(
+          file,
+          NodeZlib.gzipSync(
+            JSON.stringify({ type: "effect-span", attributes: { output: fake } }) +
+              "\n" +
+              unrelated +
+              "\n",
+          ),
+          { mode: 0o640 },
+        ),
+      );
+      const service = yield* ThreadRedaction.ThreadRedaction;
+      const result = yield* service.redactItem({
+        threadId,
+        itemId: "item-fixture",
+        reason: "fixture",
+        compact: true,
+      });
+      expect(result.verify).toBe(true);
+      expect(
+        result.stores.some((s) => s.store === file && s.replaced > 0 && s.remainingAfter === 0),
+      ).toBe(true);
+      const text = NodeZlib.gunzipSync(
+        yield* Effect.promise(() => NodeFSP.readFile(file)),
+      ).toString("utf8");
+      expect(text.includes(fake)).toBe(false);
+      expect(text.split("\n")[1]).toBe(unrelated);
+      expect((yield* Effect.promise(() => NodeFSP.stat(file))).mode & 0o777).toBe(0o640);
     }),
   ),
 );
