@@ -11806,35 +11806,39 @@ const make = Effect.gen(function* () {
           card.settledAt === null &&
           (card.activeThreadId === actor.threadId || card.workThreadId === actor.threadId)
         ) {
-          if (to === card.stage) return card;
-          if (to === "needs_review" && card.stage === "in_review") {
-            const moves = (yield* store.cardEvents(card.id)).filter(
-              (event) => event.fromStage !== null && event.toStage !== null,
-            );
-            for (const event of moves.toReversed()) {
-              if (event.toStage === "needs_review" && event.kind === "moved") {
-                if (event.actor._tag === "thread" && event.actor.threadId === actor.threadId)
-                  return card;
-                break;
-              }
-              if (event.toStage !== "in_review" && event.toStage !== "needs_review") break;
-            }
-          }
+          if (
+            to === card.stage &&
+            to !== "needs_review" &&
+            (card.activeThreadId === actor.threadId || isUnattachedOwnThread(card, actor))
+          )
+            return card;
         }
+        const ownReviewHandoff =
+          role === "cardThread" &&
+          isUnattachedOwnThread(card, actor, ["in_review", "completed", "needs_review"]);
         if (role === "cardThread") {
           if (actor._tag !== "thread" || card.activeThreadId !== actor.threadId) {
-            if (!isUnattachedOwnThread(card, actor) || card.stage !== "todo") {
-              return yield* failWith(
-                "denied",
-                `card #${card.number} is not assigned to this thread`,
-              );
+            if (
+              !ownReviewHandoff &&
+              (!isUnattachedOwnThread(card, actor) || card.stage !== "todo")
+            ) {
+              yield* checkCardThread(card, actor, role, true);
             }
             if (to !== "needs_review") {
+              if (ownReviewHandoff) yield* checkCardThread(card, actor, role, true);
               return yield* failWith(
                 "denied",
                 `card #${card.number} has no thread attached: you can only move it to needs_review; ask without blocking for anything else`,
               );
             }
+          }
+          if (ownReviewHandoff && !options?.note?.trim()) {
+            return yield* failWith("invalid", "needs_review needs a note naming the new head");
+          }
+          if (ownReviewHandoff && card.stage === "needs_review") {
+            yield* logEvent(card, actor, "comment", { body: options!.note!.trim() });
+            yield* saveCard(card, actor);
+            return card;
           }
           if (to === "needs_owner" && !options?.question?.trim()) {
             return yield* failWith("invalid", "needs_owner needs the question for the owner");
@@ -11863,6 +11867,26 @@ const make = Effect.gen(function* () {
           const board = yield* boardOf(card.boardId);
           const blocked = Rules.reviewGate(card, Rules.chainFor(board, card)?.steps.length ?? 1);
           if (blocked !== null) return yield* failWith("denied", blocked);
+          if (role === "evaluator" && card.workThreadId !== null) {
+            const reviewed = (yield* store.cardEvents(card.id)).findLast(
+              (event) => event.kind === "review",
+            )?.head;
+            if (reviewed) {
+              const view = yield* threads.view(card.workThreadId);
+              const changed = view?.prs.find(
+                (pr) =>
+                  pr.observedHead &&
+                  card.links.some((link) => link.kind === "pr" && link.url === pr.url) &&
+                  !pr.observedHead.toLowerCase().startsWith(reviewed.toLowerCase()) &&
+                  !reviewed.toLowerCase().startsWith(pr.observedHead.toLowerCase()),
+              );
+              if (changed?.observedHead)
+                return yield* failWith(
+                  "denied",
+                  `card #${card.number} was cleared at ${reviewed.slice(0, 7)} but its PR is now at ${changed.observedHead.slice(0, 7)}: send it back to needs_review`,
+                );
+            }
+          }
         }
         if (role === "evaluator" && to === "todo" && kanbanEvaluatorStep(card)) {
           return yield* failWith(
@@ -11870,11 +11894,35 @@ const make = Effect.gen(function* () {
             `card #${card.number}'s step is yours (${Subtasks.subtaskIds(kanbanStepSubtasks(card))}): do it, or add work subtasks with card_edit, before sending it back to todo`,
           );
         }
-        const source =
+        let source =
           role === "cardThread" && card.stage === "todo" && isUnattachedOwnThread(card, actor)
             ? { ...card, reviewStep: 0 }
             : card;
-        const moved = yield* moveUnlocked(source, to, role, actor, options ?? {});
+        let moveOptions = options ?? {};
+        if (ownReviewHandoff) {
+          const reset = Rules.applyReviewResult(card, 1, "findings");
+          source = {
+            ...card,
+            subtasks: card.subtasks.map((subtask) =>
+              subtask.owner === "review"
+                ? { ...subtask, state: "open" as const, note: null, doneBy: null, doneAt: null }
+                : subtask,
+            ),
+            reviewStep: reset.reviewStep,
+            reviewRound: reset.reviewRound,
+            reviewFindingsPending: false,
+            wakeNote: null,
+            nudgedAt: null,
+          };
+          const reviewed = (yield* store.cardEvents(card.id)).findLast(
+            (event) => event.kind === "review",
+          )?.head;
+          moveOptions = {
+            ...moveOptions,
+            note: `${options!.note!.trim()}\nThe earlier clear${reviewed ? ` at ${reviewed}` : ""} no longer counts; review restarted.`,
+          };
+        }
+        const moved = yield* moveUnlocked(source, to, role, actor, moveOptions);
         const deferred = yield* effectSink;
         if (deferred === undefined || deferred.closed) {
           yield* forkPostCommit(
@@ -12017,16 +12065,40 @@ const make = Effect.gen(function* () {
     return { ...fields, blocks: Asks.askOnly(claim.blocks) } satisfies Asks.AskFields;
   });
 
-  const isUnattachedOwnThread = (card: KanbanCard, actor: KanbanActor) =>
+  const isUnattachedOwnThread = (
+    card: KanbanCard,
+    actor: KanbanActor,
+    stages: ReadonlyArray<KanbanStage> = ["todo", "needs_owner"],
+  ) =>
     actor._tag === "thread" &&
     card.activeThreadId === null &&
     card.workThreadId === actor.threadId &&
     card.settledAt === null &&
-    (card.stage === "todo" || card.stage === "needs_owner");
+    stages.includes(card.stage);
 
-  const checkCardThread = (card: KanbanCard, actor: KanbanActor, role: Rules.MoveRole) =>
+  const checkCardThread = (
+    card: KanbanCard,
+    actor: KanbanActor,
+    role: Rules.MoveRole,
+    forMove = false,
+  ) =>
     role === "cardThread" && (actor._tag !== "thread" || card.activeThreadId !== actor.threadId)
-      ? failWith("denied", `card #${card.number} is not assigned to this thread`)
+      ? failWith(
+          "denied",
+          forMove &&
+            actor._tag === "thread" &&
+            card.workThreadId === actor.threadId &&
+            card.settledAt === null
+            ? card.activeRole === "review" && card.activeThreadId !== null
+              ? `card #${card.number} is being reviewed by another thread; a clear at an older head is refused at merge, so put the new head in a card_update comment and the reviewer or evaluator will pick it up`
+              : card.activeThreadId === null && card.stage === "needs_review"
+                ? `card #${card.number} is already queued for review with no thread attached; its reviewer will read the PR's current head. Put the new head in a card_update comment`
+                : card.activeThreadId === null &&
+                    (card.stage === "in_review" || card.stage === "completed")
+                  ? `card #${card.number} is in review with no thread; its work thread may only send it back with card_move to needs_review and a note naming the new head`
+                  : `card #${card.number} is not assigned to this thread`
+            : `card #${card.number} is not assigned to this thread`,
+        )
       : Effect.void;
 
   const askOwner: KanbanServiceShape["askOwner"] = (cardId, input, actor, role) =>
