@@ -587,11 +587,12 @@ def rollup(day=None):
         if folder is None:
             return None
         counts, kinds, durations, errors, polls = {}, {}, {}, {}, {}
+        component_totals, component_errors, component_samples, component_durations = {}, {}, {}, {}
         total = oks = failures = error_lines = invalid = source_bytes = 0
         path = folder / (day + '.ndjson')
         if path.exists():
             with path.open() as source:
-                for line in source:
+                for line_number, line in enumerate(source, 1):
                     source_bytes += len(line.encode('utf-8'))
                     try:
                         row = json.loads(line)
@@ -607,14 +608,28 @@ def rollup(day=None):
                     oks += row.get('ok') is True
                     failures += row.get('ok') is False
                     error_lines += kind == 'error'
+                    component = row.get('component')
+                    if not isinstance(component, str) or component not in {
+                            'commerce', 'order-watch', 'card_status', 'noon', 'careem',
+                            'amazon', 'uber', 'toollog', 'money-cases'}:
+                        component = 'unknown'
+                    component_totals[component] = component_totals.get(component, 0) + 1
+                    component_errors.setdefault(component, {})
+                    component_samples.setdefault(component, {})
                     value = row.get('durationMs')
                     merchant = _fields(row.get('props')).get('merchant', 'unknown')
                     if type(value) in (float, int) and math.isfinite(value):
                         durations.setdefault(name, []).append(value)
                         if name == 'track.poll':
                             polls.setdefault(merchant, []).append(value)
+                        if value >= 0:
+                            component_durations.setdefault(f'{component}:{name}', []).append(value)
                     if kind == 'error':
                         code = tag(row.get('error', {}).get('tag'))
+                        by_tag = component_errors[component]
+                        by_tag[code] = by_tag.get(code, 0) + 1
+                        component_samples[component].setdefault(code, {
+                            'file': day + '.ndjson', 'line': line_number})
                         status = (row.get('error', {}).get('cause') or {}).get('httpStatus')
                         status = status if type(status) is int and 100 <= status <= 599 else None
                         item = errors.setdefault((code, status, merchant),
@@ -642,6 +657,24 @@ def rollup(day=None):
                   'errorRate': error_lines / total if total else 0, 'durationsMs': latency,
                   'topErrors': sorted(errors.values(), key=lambda x: (-x['count'], x['tag'], x['httpStatus'] or 0, x['merchant']))[:20],
                   'invalidLines': invalid, 'sourceBytes': source_bytes}
+        for key, values in sorted(component_durations.items()):
+            values.sort()
+            latency[key] = {'p50': values[math.ceil(len(values) * .5) - 1],
+                            'p95': values[math.ceil(len(values) * .95) - 1],
+                            'max': values[-1], 'count': len(values)}
+        result['errorsByComponent'] = {
+            component: dict(sorted(component_errors[component].items()))
+            for component in sorted(component_totals)}
+        result['failureShare'] = {
+            component: sum(component_errors[component].values()) / component_totals[component]
+            for component in sorted(component_totals)}
+        # Match topErrors' frequency ranking, using references rather than raw IDs.
+        result['topErrorSamplesByComponent'] = {
+            component: [{'tag': code, 'count': count,
+                         'sampleId': component_samples[component][code]}
+                        for code, count in sorted(component_errors[component].items(),
+                                                  key=lambda item: (-item[1], item[0]))[:5]]
+            for component in sorted(component_totals)}
         _private_directory(folder)
         target = folder / ('rollup-' + day + '.json')
         fd, temporary = tempfile.mkstemp(prefix='.rollup-', dir=folder)
@@ -672,7 +705,10 @@ def previous_day_rollup():
             previous = {}
         source = folder / (day + '.ndjson')
         size = source.stat().st_size if source.exists() else 0
-        if not isinstance(previous, dict) or previous.get('sourceBytes') != size or previous.get('schemaVersion') != 2:
+        if (not isinstance(previous, dict) or previous.get('sourceBytes') != size
+                or previous.get('schemaVersion') != 2
+                or not all(key in previous for key in (
+                    'errorsByComponent', 'failureShare', 'topErrorSamplesByComponent'))):
             rollup(day)
     except Exception:
         pass
