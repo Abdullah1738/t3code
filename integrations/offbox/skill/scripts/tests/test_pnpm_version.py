@@ -92,7 +92,7 @@ class SelectionTests(unittest.TestCase):
 
 
 class ActivationTests(unittest.TestCase):
-    def run_fixture(self, version='10.26.2', pin=None, failure='once', corrupt=False, warm=False):
+    def run_fixture(self, version='10.26.2', pin=None, failure='once', corrupt=False, warm=False, corepack_cache=True):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bindir = root / 'bin'; bindir.mkdir()
@@ -121,16 +121,31 @@ done
 case "$url" in */pnpm) src=index.json ;; *.tgz) src=pnpm.tgz ;; *) src=meta.json ;; esac
 cp "$HOME/$src" "$out"
 '''); curl.chmod(0o755)
-            if warm:
-                pkg = root / ('corepack/v1/pnpm/' + version if warm == 'corepack' else 'global-pnpm')
-                (pkg / 'bin').mkdir(parents=True)
-                (pkg / 'package.json').write_text(json.dumps({'name':'pnpm','version':version,'bin':{'pnpm':f'bin/pnpm.{suffix}'}}))
-                executable = pkg / f'bin/pnpm.{suffix}'
-                executable.write_text('#!/usr/bin/env node\n' + data.decode()); executable.chmod(0o755)
+            if warm in ('standalone', 'standalone-symlink'):
+                executable = bindir / 'pnpm'
+                if warm == 'standalone-symlink':
+                    executable = root / 'standalone-pnpm'
+                    (bindir / 'pnpm').symlink_to(executable)
+                executable.write_text(f'#!/bin/sh\necho {version}\n'); executable.chmod(0o755)
+            elif warm:
+                corepack = warm in ('corepack', 'corepack-no-manifest')
+                pkg = root / ('corepack/v1/pnpm/' + version if corepack else 'global-pnpm')
+                if corepack_cache or not corepack:
+                    (pkg / 'bin').mkdir(parents=True)
+                    (pkg / 'package.json').write_text(json.dumps({'name':'pnpm','version':version,'bin':{'pnpm':f'bin/pnpm.{suffix}'}}))
+                    executable = pkg / f'bin/pnpm.{suffix}'
+                    executable.write_text('#!/usr/bin/env node\n' + data.decode()); executable.chmod(0o755)
                 pnpm = bindir / 'pnpm'
-                if warm == 'corepack':
-                    pnpm.write_text(f'#!/bin/sh\ncase "$PWD" in */outside) echo 11.7.0 ;; *) echo {version} ;; esac\n')
-                    pnpm.chmod(0o755)
+                if corepack:
+                    dispatcher = root / 'dispatcher/dist/pnpm.js'
+                    (dispatcher.parent / 'lib').mkdir(parents=True)
+                    if warm == 'corepack':
+                        (dispatcher.parent.parent / 'package.json').write_text(json.dumps({'name':'corepack'}))
+                    (dispatcher.parent / 'lib/corepack.cjs').write_text(
+                        f'exports.runMain=()=>console.log(process.cwd().endsWith("/outside")?"11.7.0":"{version}")\n')
+                    dispatcher.write_text('#!/usr/bin/env node\nrequire("./lib/corepack.cjs").runMain(["pnpm", ...process.argv.slice(2)]);\n')
+                    dispatcher.chmod(0o755)
+                    pnpm.symlink_to(dispatcher)
                 else:
                     pnpm.symlink_to(executable)
             repo = root / 'repo'; (repo / 'apps/server/node_modules/.bin').mkdir(parents=True)
@@ -185,14 +200,42 @@ cp "$HOME/$src" "$out"
         self.assertNotIn('COMMAND_MARKER', result.stdout)
 
     def test_warm_corepack_uses_cached_cli_after_leaving_repo(self):
-        result, count = self.run_fixture(warm='corepack', failure='always')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(count, 0)
+        for warm in ('corepack', 'corepack-no-manifest'):
+            with self.subTest(warm=warm):
+                result, count = self.run_fixture(warm=warm, failure='always')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(count, 0)
+
+    def test_corepack_without_resolvable_cli_still_stops_offline(self):
+        for warm in ('corepack', 'corepack-no-manifest'):
+            with self.subTest(warm=warm):
+                result, count = self.run_fixture(warm=warm, corepack_cache=False, failure='always')
+                self.assertEqual(result.returncode, 99, result.stderr)
+                self.assertEqual(count, 3)
+                self.assertNotIn('COMMAND_MARKER', result.stdout)
 
     def test_warm_pin_has_no_network(self):
         result, count = self.run_fixture(warm=True, failure='always')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(count, 0)
+
+    def test_matching_standalone_without_manifest_runs_offline(self):
+        for warm in ('standalone', 'standalone-symlink'):
+            for version, pin in (('10.26.2', '10.26.2'), ('10.26.2', '10'), ('11.7.0', '11.7.0')):
+                with self.subTest(warm=warm, version=version, pin=pin):
+                    result, count = self.run_fixture(version=version, pin=pin, warm=warm, failure='always')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(count, 0)
+                    self.assertIn('COMMAND_MARKER', result.stdout)
+                    self.assertIn(f'offbox: pnpm v{version} (packageManager)', result.stderr)
+
+    def test_mismatching_standalone_still_stops_offline(self):
+        for warm in ('standalone', 'standalone-symlink'):
+            with self.subTest(warm=warm):
+                result, count = self.run_fixture(pin='11.7.0', warm=warm, failure='always')
+                self.assertEqual(result.returncode, 99, result.stderr)
+                self.assertEqual(count, 3)
+                self.assertNotIn('COMMAND_MARKER', result.stdout)
 
 
 if __name__ == '__main__':

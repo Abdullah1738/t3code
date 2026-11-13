@@ -105,7 +105,19 @@ if __offbox_pnpm_matches "$__offbox_pnpm_current" && [ ! -x "$__offbox_pnpm_cach
   __offbox_pnpm_cli=$(node -e '
     const fs=require("fs"),p=require("path"),v=process.argv[2];
     const cli=dir=>{try{const m=JSON.parse(fs.readFileSync(p.join(dir,"package.json"))); if(!["pnpm","@pnpm/exe"].includes(m.name)||m.version!==v)return ""; const b=typeof m.bin==="string"?m.bin:m.bin.pnpm; const f=p.resolve(dir,b); return fs.existsSync(f)?f:""}catch{return ""}};
-    let found=""; try{const f=fs.realpathSync(process.argv[1]); found=cli(p.resolve(p.dirname(f),".."))}catch{}
+    let found="";
+    try {
+      const f=fs.realpathSync(process.argv[1]),dir=p.resolve(p.dirname(f),"..");
+      found=cli(dir);
+      let corepack=false;
+      try{corepack=JSON.parse(fs.readFileSync(p.join(dir,"package.json"))).name==="corepack"}catch{}
+      const fd=fs.openSync(f,"r"),buffer=Buffer.alloc(4096);
+      let header="";
+      try{header=buffer.subarray(0,fs.readSync(fd,buffer,0,buffer.length,0)).toString()}finally{fs.closeSync(fd)}
+      corepack=corepack||(header.includes("corepack.cjs")&&header.includes("runMain"));
+      // Standalone pnpm executables need no package manifest. Only dispatchers must be unwrapped.
+      if(!found&&!corepack)found=f;
+    }catch{}
     const home=process.env.COREPACK_HOME||p.join(process.env.XDG_CACHE_HOME||p.join(process.env.HOME,".cache"),"node/corepack");
     for(const dir of [p.join(home,"v1/pnpm",v),p.join(home,"pnpm",v)])found=found||cli(dir);
     console.log(found);
