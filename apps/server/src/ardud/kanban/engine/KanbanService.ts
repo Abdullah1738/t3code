@@ -9380,6 +9380,23 @@ const make = Effect.gen(function* () {
             }
             // A long evaluator turn gets a status ask at 45 minutes, then hourly, so nobody waits blind.
             for (const initial of yield* store.threadLinks({ boardId: board.id, open: true })) {
+              if (initial.role !== "evaluator") continue;
+              // Most open links are idle reusable evaluators or card workers.
+              // Plan before taking the gate; only an ask or cleanup needs a step
+              // and its fresh link/thread checks. Never cache this across ticks.
+              const planned = yield* planFind(initial.threadId);
+              if (Option.isNone(planned)) continue;
+              const view = planned.value;
+              const asked = (yield* Ref.get(statusAsked)).get(initial.threadId);
+              if (view?.state !== "running" || view.runStartedAt === null) {
+                if (asked === undefined) continue;
+              } else if (
+                asked?.run === view.runStartedAt
+                  ? now - asked.at < STATUS_EVERY_MS
+                  : now - Date.parse(view.runStartedAt) < STATUS_FIRST_MS
+              ) {
+                continue;
+              }
               yield* step(
                 "evaluatorStatus",
                 Effect.gen(function* () {
