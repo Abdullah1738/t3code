@@ -21,7 +21,7 @@ from . import api, capacity, identity, lease, node_tools, node_version, package_
 from . import command_usage, common, containers, prune, prepare, userns
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
-                     offsets_path, person, read_json, record_delivery, say, silence, write)
+                     is_silenced, offsets_path, person, read_json, record_delivery, say, silence, write)
 
 
 def _source_stamp():
@@ -1795,6 +1795,8 @@ def _echo(stream, b: bytes) -> bool:
     """Echo a chunk to the caller. Any failure to write there stops the echo only; the log keeps the output. Not just a
     closed pipe: a redirect to a file on a volume that went away fails with EIO (31 Oct, run-1031-140118-88ca), and
     letting that reach follow()'s stream retry replayed the same chunk forever."""
+    if is_silenced(stream):
+        return False
     try:
         stream.buffer.write(b)
         stream.flush()

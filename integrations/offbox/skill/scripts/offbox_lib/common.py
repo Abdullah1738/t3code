@@ -338,9 +338,18 @@ def log(msg: str) -> None:
         f.write(f"{stamp} [{os.getpid()}] {msg}\n")
 
 
+def is_silenced(stream) -> bool:
+    return bool(getattr(stream, '_offbox_silenced', False))
+
+
 def silence(stream) -> None:
     """Point a dead output descriptor at /dev/null. Bytes a failed flush left in the buffer would otherwise be flushed
     again at interpreter shutdown, where the closed pipe raises and replaces the process's exit code."""
+    # A successful write after dup2 reaches /dev/null, not the caller.
+    try:
+        stream._offbox_silenced = True
+    except (AttributeError, TypeError):
+        pass
     try:
         fd = os.open(os.devnull, os.O_WRONLY)
         try:

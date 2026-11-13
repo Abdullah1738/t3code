@@ -23,7 +23,55 @@ UV_VALUE_OPTIONS = frozenset(('--with', '--with-editable', '--with-requirements'
 INSTALL_VALUE_OPTIONS = frozenset(('--prefix', '-C', '--cwd', '--dir', '--cache', '--registry',
                                    '--userconfig', '--workspace', '-w', '--loglevel', '--location',
                                    '--filter', '-F', '--filter-prod'))
+MANAGER_DIRECTORIES = {'npm': {'--prefix'}, 'pnpm': {'--dir', '-C'},
+                       'yarn': {'--cwd'}, 'bun': {'--cwd'}}
 ASSIGNMENT = re.compile(r'^[A-Za-z_][A-Za-z_0-9]*=')
+
+
+def shell_source(command: str) -> tuple[str, bool]:
+    # shlex treats an unquoted hash inside a word as a comment, unlike Bash. Strip only real comments here,
+    # and remove numeric redirection descriptors while their adjacency is still available.
+    source = []
+    quote = ''
+    word_start = True
+    substitutions = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char == "\\" and quote != "'" and index + 1 < len(command):
+            source.append(command[index:index + 2])
+            if command[index + 1] != "\n":
+                word_start = False
+            index += 2
+            continue
+        if quote != "'" and (char == '`' or (char == '$' and command[index:index + 2] == '$(')):
+            substitutions = True
+        if quote:
+            source.append(char)
+            if char == quote:
+                quote = ''
+        elif char in ("'", '"'):
+            quote = char
+            source.append(char)
+            word_start = False
+        elif char == '#' and word_start:
+            end = command.find('\n', index)
+            index = len(command) if end == -1 else end
+            continue
+        elif char.isdigit() and word_start:
+            end = index
+            while end < len(command) and command[end].isdigit():
+                end += 1
+            if end < len(command) and command[end] in '<>':
+                index = end
+                continue
+            source.append(char)
+            word_start = False
+        else:
+            source.append(char)
+            word_start = char in ' \t\n;|&()<>'
+        index += 1
+    return ''.join(source), substitutions
 
 
 @dataclass(frozen=True)
@@ -60,8 +108,40 @@ def uv_options(words: list[str], cwd: Path) -> tuple[list[str], Path, bool]:
     return words, cwd, uncertain
 
 
-def segments(command: str, cwd: Path) -> tuple[list[Segment], bool]:
+def manager_directory(words: list[str], cwd: Path) -> tuple[Path, bool]:
+    manager = Path(words[0]).name
+    options = MANAGER_DIRECTORIES.get(manager, ())
+    target, uncertain, index, installing = cwd, False, 1, False
+    while options and index < len(words):
+        option = words[index]
+        if option == '--':
+            break
+        if not option.startswith('-'):
+            if manager != 'npm' and not installing and option not in ('install', 'i', 'ci'):
+                break
+            installing = True
+            index += 1
+            continue
+        name, sep, value = option.partition('=')
+        if '-C' in options and option.startswith('-C') and option != '-C':
+            name, sep, value = '-C', '=', option[2:].removeprefix('=')
+        index += 1
+        if name in options:
+            if not sep:
+                value = words[index] if index < len(words) else ''
+                index += 1
+            if value and (sep or not value.startswith('-')) and not re.search(r'[$`~*?]', value):
+                target = (cwd / value).resolve()
+            else:
+                uncertain = True
+        elif name in INSTALL_VALUE_OPTIONS and not sep:
+            index += 1
+    return target, uncertain
+
+
+def segments(command: str, cwd: Path) -> tuple[list[Segment], bool, bool]:
     """Unwrap only understood shell forms; opaque syntax retains conservative advice."""
+    command, substitutions = shell_source(command)
     lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&\n")
     lexer.whitespace = ' \t\r'
     lexer.whitespace_split = True
@@ -69,19 +149,20 @@ def segments(command: str, cwd: Path) -> tuple[list[Segment], bool]:
     try:
         tokens = list(lexer)
     except ValueError:
-        return [], True
+        return [], True, True
     groups: list[list[str]] = [[]]
-    uncertain = bool(re.search(r'\$\(|`', command))
-    comment = False
+    uncertain = substitutions
+    go_uncertain = substitutions
+    redirect = False
     for token in tokens:
-        if '\n' in token and set(token) <= set('\n;&|()'):
-            comment = False
-        elif comment:
+        if redirect:
+            uncertain |= bool(re.search(r'\$\(|`', token))
+            redirect = False
             continue
-        elif token.startswith('#'):
-            # shlex removes quote information, so a quoted hash may be a literal.
-            uncertain = True
-            comment = True
+        if token in ('>', '>>', '<', '<>', '>&', '<&', '>|', '&>', '&>>'):
+            # A redirection target is not an executable. Keep repair conservative without inventing JS usage.
+            go_uncertain = True
+            redirect = True
             continue
         if (token in ('&&', '||', ';', '\n', '|', '|&', '&')
                 or ('\n' in token and set(token) <= set('\n;&|'))):
@@ -91,8 +172,10 @@ def segments(command: str, cwd: Path) -> tuple[list[Segment], bool]:
             groups.append([])
         else:
             groups[-1].append(token)
+    uncertain |= redirect
     result = []
     for words in groups:
+        original_words = words
         effective_cwd = cwd
         while words:
             if ASSIGNMENT.match(words[0]):
@@ -126,6 +209,9 @@ def segments(command: str, cwd: Path) -> tuple[list[Segment], bool]:
                 uncertain |= unknown
             else:
                 break
+        # Wrapper arguments execute in this shell; a shell -c body is inspected recursively below.
+        prefix = original_words[:len(original_words) - len(words)]
+        uncertain |= any(re.search(r'\$\(|`', word) for word in prefix)
         if not words:
             continue
         first = Path(words[0]).name
@@ -142,14 +228,18 @@ def segments(command: str, cwd: Path) -> tuple[list[Segment], bool]:
                 uncertain = True
             continue
         if first in SHELLS and len(words) >= 3 and re.fullmatch(r'-[el]*c[el]*', words[1]):
-            nested, unknown = segments(words[2], effective_cwd)
+            uncertain |= any(re.search(r'\$\(|`', word) for word in (*words[:2], *words[3:]))
+            nested, unknown, nested_go = segments(words[2], effective_cwd)
             result.extend(nested)
             uncertain |= unknown
+            go_uncertain |= nested_go
             continue
-        if re.search(r'[$`]', words[0]):
+        if re.search(r'[$`]', words[0]) or any(re.search(r'\$\(|`', word) for word in words):
             uncertain = True
+        effective_cwd, unknown = manager_directory(words, effective_cwd)
+        uncertain |= unknown
         result.append(Segment(tuple(words), effective_cwd))
-    return result, uncertain
+    return result, uncertain, go_uncertain or uncertain
 
 
 def nearest_package(cwd: Path, root: Path) -> Path | None:
@@ -178,11 +268,13 @@ def inspect(root: Path, rel: str, argv: list[str], steps: list[str] | None = Non
     cwd = (root / rel).resolve()
     parsed = []
     uncertain = False
+    go_uncertain = False
     for command in steps or [argv[0] if len(argv) == 1 else shlex.join(argv)]:
-        found, unknown = segments(command, cwd)
+        found, unknown, unknown_go = segments(command, cwd)
         parsed.extend(found)
         uncertain |= unknown
-    needs_go = uncertain or any((folder / name).exists() for folder in (root, cwd)
+        go_uncertain |= unknown_go
+    needs_go = go_uncertain or any((folder / name).exists() for folder in (root, cwd)
                                 for name in ('go.mod', 'go.work'))
     uses_js = uncertain
     install = ''

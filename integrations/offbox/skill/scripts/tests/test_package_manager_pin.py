@@ -144,7 +144,7 @@ class PackageManagerPinTests(unittest.TestCase):
         ):
             with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                (root / 'package.json').write_text(json.dumps({'packageManager': manager}))
+                (root / 'package.json').write_text(json.dumps({'packageManager': manager, 'devDependencies': {'vitest': '1'}}))
                 (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text(workflow)
@@ -155,7 +155,8 @@ class PackageManagerPinTests(unittest.TestCase):
                 self.assertIn(command, runs.missing_deps_hint(root))
                 hint = io.StringIO()
                 with contextlib.redirect_stderr(hint):
-                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'fixture'}, root)
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'fixture'}, root,
+                                           runs.command_usage.inspect(root, '.', ['pnpm test']))
                 self.assertIn(command, hint.getvalue())
                 bindir = root / 'bin'
                 bindir.mkdir()

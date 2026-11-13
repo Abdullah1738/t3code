@@ -147,6 +147,86 @@ class CommandUsageTests(unittest.TestCase):
                 self.assertTrue(self.inspect(command).needs_go)
         self.assertEqual(self.inspect('node -v # check\nnpm ci').install, 'npm ci')
 
+    def test_comments_and_redirections_do_not_make_non_js_commands_use_js(self):
+        commands = ('python3 -m unittest discover -s x/tests -v',
+                    'X=1 python3 -m pytest x', 'pytest x', 'go test ./pkg', 'bash scripts/x.sh')
+        suffixes = (' # check', ' # check\n', ' >output.log', ' >>output.log', ' 2>errors.log',
+                    ' 2>&1', ' >output.log 2>&1', ' </dev/null', ' &>output.log')
+        for command in commands:
+            for suffix in suffixes:
+                with self.subTest(command=command, suffix=suffix):
+                    result = self.inspect(command + suffix)
+                    self.assertFalse(result.uses_js)
+                    self.assertEqual(result.packages, ())
+                    if command.startswith(('go', 'bash')) or '>' in suffix or '<' in suffix:
+                        self.assertTrue(result.needs_go)
+        for command in ('node x', 'vp test run x', 'unknown-tool x'):
+            for suffix in suffixes:
+                self.assertTrue(self.inspect(command + suffix).uses_js, command + suffix)
+        self.assertTrue(self.inspect('python3 x # comment\nnode x').uses_js)
+        self.assertTrue(self.inspect('echo "#"; node x').uses_js)
+
+    def test_literal_hashes_keep_later_commands_visible(self):
+        for argument in ('https://example.test/#section', 'word#suffix', r'\#literal', "'#literal'", '"#literal"'):
+            for tool, go, js in (('go test ./pkg', True, False), ('node x', False, True)):
+                with self.subTest(argument=argument, tool=tool):
+                    result = self.inspect(f'python3 check.py {argument}; {tool}')
+                    self.assertEqual((result.needs_go, result.uses_js), (go, js))
+
+    def test_redirections_preserve_separate_numeric_arguments(self):
+        for command in ('timeout 30 >output.log python3 -m pytest',
+                        'timeout 30 2>errors.log python3 -m pytest',
+                        'timeout 30 2>&1 python3 -m pytest',
+                        'timeout 30 >>output.log python3 -m pytest',
+                        'timeout 30 <input.log python3 -m pytest',
+                        'timeout 30 >output.log go test ./pkg'):
+            with self.subTest(command=command):
+                result = self.inspect(command)
+                self.assertFalse(result.uses_js)
+                self.assertTrue(result.needs_go)
+
+    def test_comment_bodies_do_not_supply_substitutions_or_commands(self):
+        for comment in ('$(echo ignored)', '`echo ignored`', 'go test ./pkg', 'node x', '"unterminated'):
+            for separator in ('', '\n', '\r\n'):
+                command = f'python3 -m pytest # {comment}{separator}'
+                with self.subTest(command=command):
+                    self.assertFalse(self.inspect(command).uses_js)
+                    self.assertFalse(self.inspect(command).needs_go)
+        self.assertTrue(self.inspect('python3 x # $(ignored)\nnode x').uses_js)
+
+    def test_only_bash_whitespace_starts_comments(self):
+        separators = (' ', '\t', '\n', '\r', '\v', '\f', '\x1c', '\x1d', '\x1e', '\x1f',
+                      '\x85', '\u00a0', '\u1680', '\u2000', '\u2001', '\u2002', '\u2003',
+                      '\u2004', '\u2005', '\u2006', '\u2007', '\u2008', '\u2009', '\u200a',
+                      '\u2028', '\u2029', '\u202f', '\u205f', '\u3000')
+        for separator in separators:
+            for tool in ('go version', 'node x'):
+                with self.subTest(separator=repr(separator), tool=tool):
+                    result = self.inspect(f'echo word{separator}#suffix; {tool}')
+                    literal = separator not in ' \t\n'
+                    self.assertEqual(result.needs_go, literal and tool.startswith('go'))
+                    self.assertEqual(result.uses_js, literal and tool.startswith('node'))
+
+    def test_nested_shell_comments_do_not_create_outer_substitutions(self):
+        for shell in ('bash', 'sh', 'zsh', 'dash'):
+            for option in ('-c', '-lc'):
+                for comment in ('$(echo ignored)', '`echo ignored`'):
+                    with self.subTest(shell=shell, option=option, comment=comment):
+                        command = f"{shell} {option} 'python3 -m pytest # {comment}'"
+                        result = self.inspect(command)
+                        self.assertFalse(result.needs_go)
+                        self.assertFalse(result.uses_js)
+        for command in ('''bash -c 'python3 x' "$(go version)"''',
+                        '''X="$(go version)" bash -c 'python3 x # ignored' ''',
+                        '''uv --env-file "$(go version)" run python3 x''',
+                        '''python3 x >"$(node -p process.version)"''',
+                        '''bash -c "python3 x # $(go version)"''',
+                        '''bash -c "python3 x # `go version`"'''):
+            with self.subTest(command=command):
+                result = self.inspect(command)
+                self.assertTrue(result.needs_go)
+                self.assertTrue(result.uses_js)
+
     def test_comment_uncertainty_keeps_nearest_zero_dependency_package(self):
         sub = self.root / 'sub'
         sub.mkdir()
@@ -190,3 +270,35 @@ class CommandUsageTests(unittest.TestCase):
                 self.assertFalse(result.needs_go)
                 self.assertTrue(result.uses_js)
                 self.assertEqual(result.install, install)
+
+    def test_manager_directory_option_corpus(self):
+        sub = self.root / 'sub dir'
+        sub.mkdir()
+        (sub / 'package.json').write_text('{"devDependencies":{"x":"1"}}')
+        forms = ("pnpm --dir 'sub dir'", "pnpm --dir='sub dir'", "pnpm -C 'sub dir'",
+                 "pnpm -C'sub dir'", "pnpm --filter @app/web --dir 'sub dir'",
+                 "corepack pnpm@11.7.0 --dir 'sub dir'", "yarn --cwd 'sub dir'",
+                 "yarn --cwd='sub dir'", "bun --cwd 'sub dir'", "bun --cwd='sub dir'",
+                 "npm --prefix 'sub dir'", "npm --prefix='sub dir'")
+        for prefix in forms:
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.inspect(prefix + ' test').packages, (sub,))
+                self.assertFalse(self.inspect(prefix + ' test').needs_go)
+                self.assertEqual(self.inspect(prefix + ' test && node x').packages, (sub, self.root))
+                for manifest in ('go.mod', 'go.work'):
+                    (sub / manifest).touch()
+                    self.assertTrue(self.inspect(prefix + ' test').needs_go)
+                    (sub / manifest).unlink()
+                self.assertTrue(self.inspect(prefix + ' install').install.endswith(' install'))
+        for command in ("pnpm install --dir 'sub dir'", "pnpm install -C'sub dir'",
+                        "npm ci --prefix='sub dir'", "yarn install --cwd 'sub dir'",
+                        "bun install --cwd='sub dir'", "npm test --prefix 'sub dir'",
+                        "npm run test --prefix='sub dir'", "npm --silent run test --prefix 'sub dir'"):
+            self.assertEqual(self.inspect(command).packages, (sub,), command)
+            (sub / 'go.mod').touch()
+            self.assertTrue(self.inspect(command).needs_go, command)
+            (sub / 'go.mod').unlink()
+        for command in ("npm test -- --prefix 'sub dir'", "npm run test -- --prefix='sub dir'"):
+            self.assertEqual(self.inspect(command).packages, (self.root,), command)
+        for prefix in ('pnpm --dir "$PACKAGE"', 'pnpm --dir', 'pnpm -C', 'pnpm --dir --offline test'):
+            self.assertTrue(self.inspect(prefix).needs_go, prefix)

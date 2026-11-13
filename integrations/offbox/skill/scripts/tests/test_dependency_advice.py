@@ -84,6 +84,48 @@ class DependencyAdviceTests(unittest.TestCase):
                 self.assert_advice(result, hint)
                 self.assertIn(runs.COMMAND_STARTED_MARKER, result.stderr)
 
+    def test_non_js_failure_comments_and_redirections_keep_real_error(self):
+        for command in ('python3 -m unittest discover -s x/tests -v', 'go test ./pkg', 'bash scripts/x.sh'):
+            for suffix in (' # check', ' >output.log', ' 2>errors.log', ' 2>&1'):
+                with self.subTest(command=command, suffix=suffix):
+                    self.assert_advice(*self.run_command(command + suffix))
+
+    def test_comment_and_redirection_edges_keep_non_js_advice_and_go_fence(self):
+        self.tool('timeout', 'shift; exec "$@"')
+        for command in ('timeout 30 >output.log python3 -m pytest',
+                        'timeout 30 2>errors.log python3 -m pytest',
+                        'python3 -m pytest # $(echo ignored)',
+                        'python3 -m pytest # `echo ignored`'):
+            with self.subTest(command=command):
+                result, hint = self.run_command(command)
+                self.assertEqual(result.returncode, 1)
+                self.assert_advice(result, hint)
+        setup = 'if [ "$_offbox_needs_go" = 1 ]; then echo offbox-setup-failed >&2; exit 97; fi'
+        result, hint = self.run_command('python3 check.py https://example.test/#section; go test ./pkg', setup=setup)
+        self.assertEqual(result.returncode, 97)
+        self.assertNotIn(runs.COMMAND_STARTED_MARKER, result.stderr)
+        self.assert_advice(result, hint)
+
+    def test_nested_comment_and_non_bash_whitespace_repair_decisions(self):
+        setup = 'if [ "$_offbox_needs_go" = 1 ]; then echo offbox-setup-failed >&2; exit 97; fi'
+        for comment in ('$(echo ignored)', '`echo ignored`'):
+            result, hint = self.run_command(f"bash -c 'python3 -m pytest # {comment}'", setup=setup)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(runs.COMMAND_STARTED_MARKER, result.stderr)
+            self.assert_advice(result, hint)
+        for separator in ('\u00a0', '\v', '\f', '\r', '\u2003'):
+            with self.subTest(separator=repr(separator)):
+                result, hint = self.run_command(f'echo word{separator}#suffix; go version', setup=setup)
+                self.assertEqual(result.returncode, 97)
+                self.assertNotIn(runs.COMMAND_STARTED_MARKER, result.stderr)
+                self.assert_advice(result, hint)
+        for command in ('bash -c "python3 -m pytest # $(go version)"',
+                        'bash -c "python3 -m pytest # `go version`"'):
+            result, hint = self.run_command(command, setup=setup)
+            self.assertEqual(result.returncode, 97)
+            self.assertNotIn(runs.COMMAND_STARTED_MARKER, result.stderr)
+            self.assert_advice(result, hint)
+
     def test_subpackage_and_leading_cd_use_own_node_modules(self):
         sub = self.root / 'pkg'
         sub.mkdir()
@@ -113,6 +155,42 @@ class DependencyAdviceTests(unittest.TestCase):
         self.manifest(sub)
         (self.root / 'node_modules').mkdir()
         self.assert_advice(*self.run_command('cd pkg && bun test x'))
+
+    def test_npm_directory_flags_after_subcommand_use_subpackage(self):
+        sub = self.root / 'sub'
+        sub.mkdir()
+        self.manifest(sub)
+        commands = ('npm test --prefix sub', 'npm run test --prefix=sub',
+                    'npm --silent run test --prefix sub')
+        for installed in (True, False):
+            modules = sub / 'node_modules'
+            if installed:
+                modules.mkdir()
+            else:
+                modules.rmdir()
+            for command in commands:
+                with self.subTest(command=command, installed=installed):
+                    self.assert_advice(*self.run_command(command), marker=not installed)
+
+    def test_manager_directory_options_use_subpackage_dependencies(self):
+        sub = self.root / 'sub'
+        sub.mkdir()
+        self.manifest(sub)
+        self.tool('yarn', 'exit 2')
+        forms = ('pnpm --dir sub', 'pnpm --dir=sub', 'pnpm -C sub', 'pnpm -Csub',
+                 'yarn --cwd sub', 'bun --cwd sub', 'npm --prefix sub')
+        for prefix in forms:
+            for installed in (True, False):
+                with self.subTest(prefix=prefix, installed=installed):
+                    modules = sub / 'node_modules'
+                    if installed:
+                        modules.mkdir(exist_ok=True)
+                    elif modules.exists():
+                        modules.rmdir()
+                    self.assert_advice(*self.run_command(prefix + ' test'), marker=not installed)
+        self.manifest(sub, {})
+        for prefix in forms:
+            self.assert_advice(*self.run_command(prefix + ' test'))
 
     def test_own_install_covers_guard_failure_install_failure_and_steps(self):
         self.tool('node', 'echo v24.22.1')
@@ -179,11 +257,11 @@ class DependencyAdviceTests(unittest.TestCase):
         sub = self.root / 'sub'
         sub.mkdir()
         self.manifest(sub)
-        (self.root / 'pnpm-lock.yaml').touch()
+        (self.root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
         (self.root / 'pnpm-workspace.yaml').write_text('packages: [sub]')
         result, hint = self.run_command('bun test x', rel='sub')
         self.assert_advice(result, hint, marker=True)
-        self.assertIn('(cd .. && corepack pnpm install --frozen-lockfile) && <command>', hint)
+        self.assertIn('(cd .. && corepack pnpm@10 install --frozen-lockfile) && <command>', hint)
 
     def test_env_prefixed_python_finished_wait_shows_real_failure(self):
         self.tool('python3', 'echo "ModuleNotFoundError: No module named keychain" >&2; echo "FAILED (errors=2)" >&2; exit 1')
@@ -218,6 +296,39 @@ class DependencyAdviceTests(unittest.TestCase):
                     self.assertEqual(misc.wait('run', 50), code)
                 self.assertEqual('ModuleNotFoundError' in output.getvalue(), code == 1)
                 self.assertLess(len(output.getvalue()), 16500)
+
+    def assert_python_background_failure(self, command, body, failure):
+        self.tool('python3', body)
+        result, hint = self.run_command(command)
+        self.assertEqual(result.returncode, 1)
+        self.assert_advice(result, hint)
+        row = dict(run_id='run', mode='bg', box_id='B', repo_root=str(self.root), pulls='[]',
+                   exit_code=1, status='failed', error=None)
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(misc, 'LOGS_DIR', self.home), patch.object(misc, '_run_row', return_value=row), \
+             patch.object(misc, '_require_my_run'), patch.object(misc, '_catch_up_log', return_value='complete'), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            self.assertEqual(misc.wait('run', 50), 1)
+        text = output.getvalue() + errors.getvalue()
+        self.assertIn(failure, text)
+        self.assertNotIn(runs.NO_NODE_MODULES_MARKER, text)
+        self.assertNotIn('pnpm install', text)
+        self.assertNotIn('Install deps', text)
+
+    def test_agent_tools_65_background_unittest_failure(self):
+        self.assert_python_background_failure(
+            'python3 -m unittest discover -s x/tests -v',
+            'echo "Ran 225 tests in 41.975s" >&2; echo "FAILED (failures=153)" >&2; exit 1',
+            'FAILED (failures=153)')
+
+    def test_mac_upkeep_12_background_venv_pytest_failure(self):
+        self.assert_python_background_failure(
+            'python3 -m venv .venv && .venv/bin/pip install pytest && .venv/bin/python -m pytest x/tests',
+            '''mkdir -p .venv/bin
+printf '#!/bin/bash\\nexit 0\\n' > .venv/bin/pip
+printf '#!/bin/bash\\necho "20 failed, 3 passed, 1 subtests passed in 0.10s"\\nexit 1\\n' > .venv/bin/python
+chmod +x .venv/bin/pip .venv/bin/python''',
+            '20 failed, 3 passed')
 
     def test_active_settlement_keeps_quiet_wait_and_resumes_follow_without_replay(self):
         log = self.home / 'run.log'

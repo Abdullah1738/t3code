@@ -274,12 +274,10 @@ class BackgroundOutputTests(Isolated):
                      contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                     self.assertEqual(misc.logs('run-x', True), 7)
                 self.assertEqual(self.path.read_bytes(), b'hello\nerror\n')
-                if source != 'broken-output':
-                    self.assertIn(b'hello\n', output.getvalue())
-                    self.assertIn(b'error\n', output.getvalue() + errors.getvalue())
+                self.assertIn(b'hello\n', output.getvalue())
+                self.assertIn(b'error\n', output.getvalue() + errors.getvalue())
                 code, text, err = self.invoke(wait=True)
-                expected = 'hello\nerror\n' if source == 'broken-output' else ''
-                self.assertEqual((code, text), (7, expected + 'run-x: failed exit=7\n'))
+                self.assertEqual((code, text), (7, 'run-x: failed exit=7\n'))
                 if source == 'remote':
                     self.assertIn('this output is incomplete', err)
                 else:
@@ -298,6 +296,49 @@ class BackgroundOutputTests(Isolated):
                 self.assertEqual(code, 7 if reader == 'wait' else 0)
                 self.assertIn('hello\nerror\n', output)
                 self.assertEqual(self.invoke(wait=True), (7, 'run-x: failed exit=7\n', ''))
+
+    def test_settlement_catchup_preserves_a_failed_stderr_echo(self):
+        self.con.execute("UPDATE runs SET status='running',exit_code=NULL WHERE run_id='run-x'")
+        self.con.commit()
+        def history(box, cmd, which, offset, **kw):
+            data = 'hello\nlate\n' if which == 'stdout' else 'error\n'
+            return dict(data=data[offset:], nextOffset=len(data), size=len(data), done=True)
+        self.history.side_effect = history
+        frames = [dict(type='stdout', data='hello\n', nextOffset=6),
+                  dict(type='stderr', data='error\n', nextOffset=6), dict(type='exit', exitCode=7)]
+        output, errors = io.BytesIO(), io.BytesIO()
+        stdout = io.TextIOWrapper(output, write_through=True)
+        stderr = io.TextIOWrapper(errors, write_through=True)
+        self.addCleanup(stdout.close)
+        self.addCleanup(stderr.close)
+        echo = runs._echo
+        with patch.object(runs, '_ttl_keeper'), patch.object(misc, '_refresh_running_ttl'), \
+             patch.object(api, 'cmd_attach', return_value=iter(frames)), \
+             patch.object(runs, '_echo', side_effect=lambda stream, data: False if data == b'error\n' else echo(stream, data)), \
+             contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(misc.logs('run-x', True), 7)
+        self.assertEqual(output.getvalue(), b'hello\nerror\nlate\nrun-x: exit=7\n')
+        self.assertEqual(self.invoke(wait=True), (7, 'run-x: failed exit=7\n', ''))
+
+    def test_real_broken_stdout_pipe_leaves_failure_unread_after_settlement(self):
+        self.con.execute("UPDATE runs SET status='running',exit_code=NULL WHERE run_id='run-x'")
+        self.con.commit()
+        def history(box, cmd, which, offset, **kw):
+            data = 'hello\nlate\n' if which == 'stdout' else 'error\n'
+            return dict(data=data[offset:], nextOffset=len(data), size=len(data), done=True)
+        self.history.side_effect = history
+        frames = [dict(type='stdout', data='hello\n', nextOffset=6),
+                  dict(type='stderr', data='error\n', nextOffset=6), dict(type='exit', exitCode=7)]
+        reader, writer = os.pipe()
+        os.close(reader)
+        with os.fdopen(writer, 'wb', buffering=0) as sink:
+            broken = io.TextIOWrapper(sink, write_through=True)
+            with broken, patch.object(runs, '_ttl_keeper'), patch.object(misc, '_refresh_running_ttl'), \
+                 patch.object(api, 'cmd_attach', return_value=iter(frames)), \
+                 contextlib.redirect_stdout(broken), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(misc.logs('run-x', True), 7)
+        self.assertEqual(self.invoke(wait=True), (7, 'hello\nerror\nlate\nrun-x: failed exit=7\n', ''))
+        self.assertEqual(self.invoke(wait=True), (7, 'run-x: failed exit=7\n', ''))
 
     def test_quiet_active_wait_leaves_failure_unread_for_next_wait(self):
         self.con.execute("UPDATE runs SET status='running',exit_code=NULL WHERE run_id='run-x'")
