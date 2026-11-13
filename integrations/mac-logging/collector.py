@@ -11,7 +11,8 @@ from pathlib import Path
 import re
 import subprocess
 import time
-from jobs import read_state, save_state, state_path, directory_inventory
+from jobs import (read_state, save_state, state_path, directory_inventory,
+                  SourceFailure, source_error, stderr_line, permission_denied)
 from rollup import rollup
 from toollog import emit, private_dir
 
@@ -21,7 +22,9 @@ REPORT_DIRS = [Path('/Library/Logs/DiagnosticReports'), Path('/Library/Logs/Diag
 
 def reports(root, since, until):
     counts = Counter()
-    if not root.exists():
+    try:
+        root.stat()
+    except FileNotFoundError:
         return counts
     for path in root.iterdir():
         if path.suffix not in ('.panic', '.ips', '.crash', '.hang', '.spin', '.shutdownStall'):
@@ -65,19 +68,33 @@ def unified(since, until, run=subprocess.run):
     result = run(['/usr/bin/log', 'show', '--style', 'json', '--timezone', 'UTC',
                   '--start', stamp(since), '--end', stamp(until+1), '--predicate',
                   'eventMessage CONTAINS "=== system boot" OR (process == "kernel" AND eventMessage CONTAINS "PMU") OR (process == "watchdogd" AND eventMessage CONTAINS "unresponsive")'],
-                 capture_output=True, text=True, timeout=30)
+                 capture_output=True, text=True, timeout=60,
+                 env={**os.environ, 'LC_ALL': 'C'})
     if result.returncode:
-        raise RuntimeError('unified unavailable')
+        message = stderr_line(getattr(result, 'stderr', ''))
+        raise SourceFailure('permission' if permission_denied(message) else 'exit',
+                            message or 'log show exited unsuccessfully', result.returncode)
     counts = Counter()
-    for row in json.loads(result.stdout or '[]'):
+    try:
+        rows = json.loads(result.stdout or '[]')
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError('invalid log shape')
+    except (TypeError, ValueError):
+        raise SourceFailure('parse', 'invalid unified log data', result.returncode) from None
+    for row in rows:
         timestamp = row.get('timestamp')
         if timestamp:
-            at = dt.datetime.fromisoformat(re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', timestamp.replace('Z', '+00:00')))
+            try:
+                at = dt.datetime.fromisoformat(re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', timestamp.replace('Z', '+00:00')))
+            except (AttributeError, TypeError, ValueError):
+                raise SourceFailure('parse', 'invalid unified log data', result.returncode) from None
             if at.tzinfo is None:
                 at = at.replace(tzinfo=dt.timezone.utc)
             if not since < at.timestamp() <= until:
                 continue
         message = row.get('eventMessage', '')
+        if not isinstance(message, str):
+            raise SourceFailure('parse', 'invalid unified log data', result.returncode)
         if '=== system boot' in message:
             counts['restart', 'kernel'] += 1
         elif 'wdog' in message.lower() or 'unresponsive' in message.lower():
@@ -92,16 +109,20 @@ def collect(now=None, roots=None, log_reader=unified):
     counts, errors = Counter(), 0
     for i, root in enumerate(REPORT_DIRS if roots is None else roots):
         key = 'reports%d' % i
+        source_started = time.monotonic()
         try:
             counts.update(reports(root, state.get(key, now-3600), now))
             state[key] = now
-        except Exception:
+        except Exception as exc:
             errors += 1
+            source_error('crashes', 'crash.source', root, source_started, exc)
+    source_started = time.monotonic()
     try:
         counts.update(log_reader(state.get('unified', now-3600), now))
         state['unified'] = now
-    except Exception:
+    except Exception as exc:
         errors += 1
+        source_error('crashes', 'crash.source', 'unified', source_started, exc)
     for (kind, process), count in counts.items():
         emit('crashes', 'event', 'crash.observed', ok=True,
              props={'resourceKind': kind, 'process': process, 'count': count})

@@ -14,7 +14,11 @@ its own state, day logs, rollups and probe samples, and never changes crash evid
 
 Disk samples use `statvfs`, sizes of the known Robob/OpenCode/recall database
 and WAL files (metadata only), the guard's cached TMPDIR measurement, and an hourly cached directory inventory of worktrees, caches and backup repositories.
-The collector gathers directory sizes with bounded read-only du calls outside the guard; samples expose inventoryAgeS and flag missing/stale measurements. The five largest positive deltas in that tracked set are flattened as
+The collector gathers directory sizes with read-only du calls outside the guard,
+allowing up to 60 s per root under a shared 300 s scan budget. Samples expose
+`inventorySourceErrors`, `inventoryAgeS` (null if absent), and `inventoryStale`
+(absent or older than two hours). These do not affect the sample's own success.
+The five largest positive deltas in that tracked set are flattened as
 `grower1Path`/`grower1DeltaGb` through `grower5…`. `baseline=1` means no prior
 sample; `count=0` means no known positive growth, not a full-disk scan. GB is
 1024³ bytes, matching the guard's existing units. This avoids a recursive scan
@@ -23,6 +27,34 @@ including one whose subsequent Dropbox mirror failed; unknown counters/age
 are omitted rather than reported as zero. A restic exit code of -1 means it
 was not reached. Fix versions use the sweep's known version transition or
 local package metadata; unavailable versions are `unknown`.
+
+## Source events
+
+`disk.inventory` and `crash.collect` retain `count` and `sourceErrors` summary
+counts. Each unavailable source also emits an error-kind `disk.inventory.source`
+or `crash.source` with `source` (root path or `unified`), `failure` (`timeout`,
+`exit`, `permission`, `parse`, or `missing-total`), `exitCode` (null when no
+exit code is available), and `elapsedMs`. Budget-exhausted roots get their own
+timeout line without launching another command. Missing inventory paths are skipped.
+
+Only these source errors accept a diagnostic `error.message`: the first stderr
+or filesystem-error line, trimmed to 300 characters with credential-like text
+redacted. No du stdout, unified log messages, report contents or arbitrary
+exception text is logged. Parse failures use fixed messages. Commands use the
+C locale so permission diagnostics can be identified consistently.
+
+A completed du that exits 1 solely because of unreadable entries still supplies
+a usable root total. That source emits a successful event with `partial=true`
+and `deniedCount` plus the readable `bytes`; the cached inventory retains those flags in `partials`.
+Other exits and timeouts do not supply usable totals. A partial total measures
+only readable entries; permission grants remain an owner action.
+
+`disk.sample` reports success when its own measurements succeed; cached inventory
+errors or staleness are metadata rather than sample failures. Its `sourceErrors`
+still counts failures of its own free-space and existing-file stat measurements.
+Missing optional database/WAL files are skipped. `crash.source` errors
+leave that source's cursor unchanged so the next run retries it. The filtered
+unified log query has a 60 s timeout; readable report sources advance independently.
 
 ## diskutil hangs
 
