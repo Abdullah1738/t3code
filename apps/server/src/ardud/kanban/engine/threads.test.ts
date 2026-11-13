@@ -37,6 +37,7 @@ import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchServ
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import {
   backgroundWorkOf,
+  coalesceTarget,
   KanbanThreadError,
   KanbanThreads,
   layer,
@@ -506,7 +507,7 @@ it.effect("a keyed send passes stable command and message ids to thread manageme
       yield* threads.send({ threadId, text: "Back", key: "wake:abc" });
       yield* threads.send({ threadId, text: "Unkeyed" });
       yield* threads.send({ threadId, text: "Unkeyed" });
-      yield* threads.send({ threadId, text: "Pause this card", mode: "steer" });
+      yield* threads.send({ threadId, text: "Pause this card", mode: "steer", coalesce: "step:A" });
       expect(sent[0]?.commandId).toBe("kanban:send:wake:abc");
       expect(sent[0]?.messageId).toBe("kanban:wake:abc");
       expect(sent[1]?.commandId).toBe(sent[0]?.commandId);
@@ -515,6 +516,7 @@ it.effect("a keyed send passes stable command and message ids to thread manageme
       expect(sent.slice(0, 4).every((input) => input.mode === "auto")).toBe(true);
       expect(sent[4]?.mode).toBe("steer");
       expect(sent[4]?.activeTurnOnly).toBe(true);
+      expect(sent[4]?.messageId.startsWith("kanban:wake:step:A:")).toBe(false);
     }).pipe(
       Effect.provide(
         layer.pipe(
@@ -1265,4 +1267,336 @@ it.effect.each([false, true])(
       }).pipe(Effect.provide(layer));
     }).pipe(Effect.provide(dependencies));
   },
+);
+
+describe("coalesceTarget", () => {
+  const run = (ordinal: number, scope: string, status = "queued") => ({
+    ordinal,
+    status: status as "queued" | "running" | "completed" | "cancelled",
+    userMessageId: MessageId.make(`kanban:wake:${scope}:wake-${ordinal}`),
+  });
+
+  it("picks the oldest queued run without relying on projection order", () => {
+    const oldest = run(2, "step:A");
+    expect(coalesceTarget([run(4, "step:A"), oldest, run(3, "step:A")], "step:A")).toBe(oldest);
+  });
+
+  it.each([
+    run(1, "step:A", "running"),
+    run(1, "step:A", "completed"),
+    run(1, "step:A", "cancelled"),
+    run(1, "step:B"),
+    run(1, "step:AB"),
+    run(1, "plan:A"),
+    { ...run(1, "step:A"), userMessageId: MessageId.make("kanban:step:A:wake-1") },
+    { ...run(1, "step:A"), userMessageId: MessageId.make("owner:step:A:wake-1") },
+    { ...run(1, "step:A"), userMessageId: MessageId.make("pr-watch:step:A:wake-1") },
+    { ...run(1, "step:A"), userMessageId: MessageId.make("delivery:step:A:wake-1") },
+  ])("ignores other messages and nonqueued runs: $userMessageId $status", (candidate) => {
+    expect(coalesceTarget([candidate], "step:A")).toBeUndefined();
+  });
+
+  it("has no target in an empty queue", () => {
+    expect(coalesceTarget([], "step:A")).toBeUndefined();
+  });
+});
+
+it.effect.each([
+  "queued",
+  "started",
+  "race-keyed",
+  "race-unkeyed",
+  "race-after-rejection",
+] as const)("board wake coalescing preserves queue order ($mode)", (mode) => {
+  const db = Sqlite.layerMemory;
+  const instanceId = ProviderInstanceId.make("codex");
+  const projectId = ProjectId.make("project:coalesce");
+  const threadId = ThreadId.make("thread:coalesce");
+  const adapter = {
+    instanceId,
+    driver: ProviderDriverKind.make("codex"),
+    getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+    openSession: () => Effect.die("Provider execution is disabled in this test"),
+  } as ProviderAdapter.ProviderAdapterV2["Service"];
+  const registry = Layer.succeed(
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+      get: () => Effect.succeed(adapter),
+      list: () => Effect.succeed([instanceId]),
+    }),
+  );
+  const receipts = CommandReceiptStore.layer.pipe(Layer.provide(db));
+  const runtime = ProviderReplayHarness.layerWithRegistry({ name: "kanban-coalesce" }, registry, {
+    databaseLayer: db,
+    runEffectWorker: false,
+  });
+  const management = ThreadManagementService.layer.pipe(
+    Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+  );
+  let race = false;
+  const edits: CommandId[] = [];
+  const observed = Layer.effect(
+    ThreadManagementService.ThreadManagementService,
+    Effect.gen(function* () {
+      const real = yield* ThreadManagementService.ThreadManagementService;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      return ThreadManagementService.ThreadManagementService.of({
+        ...real,
+        dispatch: (command) =>
+          Effect.gen(function* () {
+            if (command.type === "queued-run.edit") {
+              edits.push(command.commandId);
+              if (race) {
+                race = false;
+                const target = (yield* real.getThreadRecords(threadId, ["runs"])).runs.find(
+                  (run) => run.id === command.runId,
+                )!;
+                yield* projections
+                  .apply({
+                    id: EventId.make("coalesce:started-during-edit"),
+                    type: "run.updated",
+                    threadId,
+                    runId: target.id,
+                    occurredAt: yield* DateTime.now,
+                    payload: { ...target, status: "starting" },
+                  })
+                  .pipe(Effect.orDie);
+              }
+            }
+            return yield* real.dispatch(command);
+          }),
+      });
+    }),
+  ).pipe(
+    Layer.provideMerge(Layer.mergeAll(management, ProjectionStore.layer.pipe(Layer.provide(db)))),
+  );
+  const dependencies = Layer.mergeAll(
+    observed,
+    receipts,
+    Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+  );
+  return Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const receiptStore = yield* CommandReceiptStore.CommandReceiptStoreV2;
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("coalesce:create"),
+      threadId,
+      projectId,
+      title: "Board wakes",
+      modelSelection: { instanceId, model: "gpt-5.1-codex" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "system",
+      creationSource: "server",
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      yield* threads.send({ threadId, text: "Unstarted active run" });
+      const wake = {
+        threadId,
+        coalesce: "step:A",
+        text: "First snapshot",
+        key: "coalesce:first",
+      };
+      const first = yield* threads.send(wake);
+      yield* threads.send({ threadId, text: "Owner message", key: "owner" });
+      yield* threads.send({ threadId, text: "Other card", coalesce: "step:B", key: "other" });
+      yield* threads.send({ threadId, text: "Plan", coalesce: "plan:A", key: "plan" });
+      let records = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+      const target = records.runs.find((run) => run.id === first)!;
+      expect(target.status).toBe("queued");
+      const positions = records.runs.map((run) => [run.id, run.queuePosition]);
+      const keyed = mode !== "race-unkeyed";
+      if (mode === "started") {
+        yield* projections
+          .apply({
+            id: EventId.make("coalesce:started-before-send"),
+            type: "run.updated",
+            threadId,
+            runId: target.id,
+            occurredAt: yield* DateTime.now,
+            payload: { ...target, status: "starting" },
+          })
+          .pipe(Effect.orDie);
+      }
+      const same = { ...wake, key: "same-text" };
+      if (mode === "queued") expect(yield* threads.send(same)).toBe(first);
+      if (mode === "race-after-rejection") {
+        yield* receiptStore.insertIfAbsent({
+          commandId: CommandId.make("kanban:send:coalesce:latest"),
+          threadId,
+          commandType: "message.dispatch",
+          acceptedAt: yield* DateTime.now,
+          resultSequence: 0,
+          status: "rejected",
+          error: "Provider unavailable",
+        });
+      }
+      race = mode.startsWith("race-");
+      const latest = {
+        threadId,
+        coalesce: wake.coalesce,
+        text: "Newest snapshot",
+        ...(keyed ? { key: "coalesce:latest" } : {}),
+      };
+      const updated = yield* threads.send(latest);
+      records = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+      const texts = records.runs
+        .toSorted((a, b) => a.ordinal - b.ordinal)
+        .map((run) => records.messages.find((message) => message.id === run.userMessageId)!.text);
+      if (mode === "queued") {
+        expect(updated).toBe(first);
+        expect(texts).toEqual([
+          "Unstarted active run",
+          "Newest snapshot",
+          "Owner message",
+          "Other card",
+          "Plan",
+        ]);
+        expect(records.runs.map((run) => [run.id, run.queuePosition])).toEqual(positions);
+        expect(edits).toEqual([
+          CommandId.make("kanban:send:same-text"),
+          CommandId.make("kanban:send:coalesce:latest"),
+        ]);
+        // Retries of older accepted sends must not overwrite a newer snapshot.
+        yield* threads.send(wake);
+        yield* threads.send(latest);
+        yield* threads.send(same);
+        expect(yield* threads.send({ threadId, coalesce: wake.coalesce, text: latest.text })).toBe(
+          first,
+        );
+        expect(edits).toHaveLength(2);
+        expect(
+          (yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages.find(
+            (message) => message.id === target.userMessageId,
+          )?.text,
+        ).toBe(latest.text);
+        yield* threads.send({
+          ...latest,
+          key: "new-model",
+          model: { instanceId, model: "gpt-5.1-codex" },
+        });
+        const modelRun = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.at(-1)!;
+        expect(modelRun.userMessageId).toBe("kanban:new-model");
+        // A rejection other than the start race must never become a new send.
+        const empty = yield* Effect.result(threads.send({ ...latest, text: "", key: "empty" }));
+        expect(Result.isFailure(empty)).toBe(true);
+        expect((yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs).toHaveLength(6);
+        yield* projections
+          .apply({
+            id: EventId.make("coalesce:same-started"),
+            type: "run.updated",
+            threadId,
+            runId: target.id,
+            occurredAt: yield* DateTime.now,
+            payload: { ...target, status: "starting" },
+          })
+          .pipe(Effect.orDie);
+        yield* threads.send(same);
+        expect((yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs).toHaveLength(6);
+      } else {
+        expect(updated).not.toBe(first);
+        expect(texts).toEqual([
+          "Unstarted active run",
+          "First snapshot",
+          "Owner message",
+          "Other card",
+          "Plan",
+          "Newest snapshot",
+        ]);
+        expect(
+          records.runs.slice(0, positions.length).map((run) => [run.id, run.queuePosition]),
+        ).toEqual(positions);
+        if (mode.startsWith("race-")) {
+          expect(edits).toHaveLength(1);
+          expect(records.runs.at(-1)!.userMessageId).toBe(
+            mode === "race-after-rejection"
+              ? "kanban:wake:step:A:coalesce:latest:retry:2"
+              : `kanban:wake:step:A:${edits[0]!.slice("kanban:send:".length)}:retry:1`,
+          );
+          const rejected = yield* receiptStore.getByCommandId(edits[0]!);
+          expect(Option.isSome(rejected) && rejected.value.status).toBe("rejected");
+          if (keyed) {
+            const fallback = records.runs.at(-1)!;
+            yield* projections
+              .apply({
+                id: EventId.make("coalesce:fallback-started"),
+                type: "run.updated",
+                threadId,
+                runId: fallback.id,
+                occurredAt: yield* DateTime.now,
+                payload: { ...fallback, status: "starting" },
+              })
+              .pipe(Effect.orDie);
+            yield* threads.send(latest);
+            expect((yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs).toHaveLength(
+              records.runs.length,
+            );
+          }
+        } else expect(edits).toHaveLength(0);
+      }
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.provide(dependencies));
+});
+
+it.effect.each([
+  { error: "Run X is not queued.", retry: true },
+  { error: "Queued run X has no user message.", retry: false },
+  { error: "Queued run X cannot be edited to an empty message.", retry: false },
+  { error: "Automatic completion deliveries cannot be edited.", retry: false },
+  { error: "Storage failed", retry: false },
+  { error: null, retry: false },
+])("a rejected edit retries only a queue-start race: $error", ({ error, retry }) =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread-edit-rejection");
+    const sent: string[] = [];
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: () =>
+        Effect.succeed({ projectId: ProjectId.make("project-1"), deletedAt: null } as never),
+      getThreadRecords: () => Effect.succeed({ runs: [], messages: [] } as never),
+      sendToThread: (input) =>
+        Effect.sync(() => {
+          sent.push(input.commandId);
+          return { run: { id: "fallback" } } as never;
+        }),
+    });
+    yield* Effect.gen(function* () {
+      const receipts = yield* CommandReceipts.OrchestrationCommandReceiptRepository;
+      yield* receipts.insertIfAbsent({
+        commandId: CommandId.make("kanban:send:rejected-edit"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        commandType: "queued-run.edit",
+        acceptedAt: QUESTION_AT,
+        resultSequence: 1,
+        status: "rejected",
+        error,
+      });
+      const threads = yield* KanbanThreads;
+      const result = yield* Effect.result(
+        threads.send({
+          threadId,
+          text: "Current snapshot",
+          key: "rejected-edit",
+          coalesce: "step:A",
+        }),
+      );
+      expect(Result.isSuccess(result)).toBe(retry);
+      expect(sent).toEqual(retry ? ["kanban:send:rejected-edit:retry:1"] : []);
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provideMerge(CommandReceipts.layer),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  }),
 );
