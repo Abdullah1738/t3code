@@ -29,6 +29,10 @@ class DeployTest(unittest.TestCase):
         self.source = self.pkg / "robob-watch"
         self.source.mkdir()
         (self.source / "worker.py").write_text("payload\n")
+        for relative in ("meds-nag/check.py", "meds-nag/took.py", "forge-workouts/check.py", "gym-nudge/check.py", "activity-digest/check.sh", "activity-digest/summarize.py"):
+            path = self.source / "watchers" / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture\n")
         self.dst = self.home / ".local/share/robob-watch"
         self.dst.mkdir(parents=True)
         self.env = {
@@ -73,6 +77,27 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines()[-1], "dry run: robob-watch")
         self.assertEqual(list(self.dst.iterdir()), [])
 
+    def test_marker_runs_only_after_success_and_never_blocks_deploy(self):
+        bun = self.home / ".bun/bin/bun"
+        bun.parent.mkdir(parents=True)
+        calls = self.root / "marker-calls"
+        bun.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$MARKER_CALLS"\nexit 9\n')
+        bun.chmod(0o755)
+        self.env["MARKER_CALLS"] = str(calls)
+        result = self.run_deploy("robob-watch", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(calls.exists())
+        result = self.run_deploy("robob-watch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("log-marker\n--service\nrobob-watch\n--sha\n", calls.read_text())
+        self.assertIn("--step\ndeploy.complete\n", calls.read_text())
+        count = calls.read_text().count("log-marker")
+        (self.home / ".local/share/coord").write_text("blocked")
+        (self.pkg / "coord").mkdir()
+        result = self.run_deploy("coord")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls.read_text().count("log-marker"), count)
+
     def test_usage_returns_two_for_missing_or_unknown_name(self):
         self.enable_node_hook()
         for args in ((), ("unknown",)):
@@ -108,6 +133,7 @@ class DeployTest(unittest.TestCase):
     def test_memory_system_reports_success_only_after_extra_installs(self):
         scripts = self.pkg / "memory-system/scripts"
         scripts.mkdir(parents=True)
+        (scripts / "com.abdullah.opencode-readonly.plist").write_text("fixture plist\n")
         (scripts / "recall").write_text("#!/bin/sh\necho recall\n")
         installer = scripts / "install_launchagent.sh"
         installer.write_text('echo "launchagent ${1:-install}"\nexit "${FAKE_INSTALL_RC:-0}"\n')
