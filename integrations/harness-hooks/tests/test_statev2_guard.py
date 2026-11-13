@@ -1162,6 +1162,12 @@ class GuardTests(unittest.TestCase):
         for statement in ('cd -', 'f() { cd "$(dirname "$0")/.."; }; f', '( cd "$(dirname "$0")/.." )',
                           'declare CDPATH=' + str(self.root / 'elsewhere'), 'read -r CDPATH < /dev/null'):
             rows.append(('fixture-' + statement, original.replace('set -u\n', 'set -u\n' + statement + '\n', 1), {}, SCRIPT))
+        # Bash drops quotes, escapes and continuations from command words.
+        for statement in ('c""d "$(dirname "$0")/.."', "c'd' \"$(dirname \"$0\")/..\"", "c''d \"$(dirname \"$0\")/..\"",
+                          'c\\d "$(dirname "$0")/.."', 'c\\\nd "$(dirname "$0")/.."', '"cd" "$(dirname "$0")/.."',
+                          'pu""shd "$(dirname "$0")/.." >/dev/null', 'CD""PATH=' + str(self.root / 'elsewhere'),
+                          'P""WD=' + str(self.root / 'elsewhere'), 'sh""opt -s cdable_vars'):
+            rows.append(('fixture-split-' + statement, original.replace('set -u\n', 'set -u\n' + statement + '\n', 1), {}, SCRIPT))
         # Logical cd joins $PWD; physical mode and cdable_vars change targets.
         for statement in ('PWD=' + str(self.root / 'elsewhere'), 'export PWD=' + str(self.root / 'elsewhere'),
                           'OLDPWD=/tmp', 'unset PWD', 'read -r PWD < /dev/null', 'shopt -s cdable_vars',

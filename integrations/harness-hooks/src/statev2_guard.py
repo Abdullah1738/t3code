@@ -289,17 +289,23 @@ def _repo_node_pin_cd_proof(source):
     HERE line's subshell, which leaves the script's own cwd unchanged, with no
     CDPATH search, an unchanged $0 and $PWD, and logical cd."""
     code = '\n'.join(line for line in source.splitlines() if not line.lstrip().startswith('#'))
+    # Bash and the fixture lexer drop quotes, escapes and continuations from
+    # command words (c""d, c\d, c\<newline>d); scan with all of them removed.
+    flat = re.sub(r'[\'"\\]', '', code.replace('\\\n', ''))
     # Logical cd resolves against $PWD; physical mode and cdable_vars change
     # what the one allowed cd reaches.
-    if re.search(r'CDPATH|BASH_ARGV0|cdable_vars|\bshopt\b|(?<![\w$])(?:OLD)?PWD\+?=|'
-                 r'\b(?:export|declare|typeset|local|readonly|unset|read)\b[^\n;]*\b(?:OLD)?PWD\b|'
-                 r'\bset\s+(?:-[A-Za-z]*P|-o\s+physical)', code):
+    redirect = re.compile(r'CDPATH|BASH_ARGV0|cdable_vars|\bshopt\b|(?<![\w$])(?:OLD)?PWD\+?=|'
+                          r'\b(?:export|declare|typeset|local|readonly|unset|read)\b[^\n;]*\b(?:OLD)?PWD\b|'
+                          r'\bset\s+(?:-[A-Za-z]*P|-o\s+physical)')
+    if redirect.search(code) or redirect.search(flat):
         return False
-    changes = list(re.finditer(r'(?<![\w.$/-])(?:cd|pushd|popd)(?![\w.-])', code))
-    if not changes:
+    change = re.compile(r'(?<![\w.$/-])(?:cd|pushd|popd)(?![\w.-])')
+    changes = list(change.finditer(code))
+    if not changes and not change.search(flat):
         return True
     lines = re.findall(r'(?m)^.*\bHERE\s*=.*$', code)
-    return (len(changes) == 1 and len(lines) == 1 and REPO_NODE_PIN_HERE.fullmatch(lines[0].strip()) is not None and
+    return (len(changes) == 1 and len(change.findall(flat)) == 1 and len(lines) == 1 and
+            REPO_NODE_PIN_HERE.fullmatch(lines[0].strip()) is not None and
             changes[0].start() == code.index(lines[0]) + lines[0].index('cd'))
 
 
