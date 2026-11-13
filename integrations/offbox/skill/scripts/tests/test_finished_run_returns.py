@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import api, cli, common, misc, runs  # noqa: E402
+from offbox_lib import api, cli, common, lease, misc, runs  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
 from test_wait_lock import Clock, FastEvent  # noqa: E402
 
@@ -243,6 +243,7 @@ class StuckHolderWaitTests(Isolated):
         super().setUp()
         self.stack.enter_context(patch.object(misc, "LOGS_DIR", common.LOGS_DIR))
         self.stack.enter_context(patch.object(runs, "LOGS_DIR", common.LOGS_DIR))
+        self.stack.enter_context(patch.object(lease, "ensure_ttl", return_value=True))
         self.con.execute("INSERT INTO runs(run_id,box_id,status,process_id,pulls,start_at) "
                          "VALUES ('run-s','bx_a','running',7,'[]',900)")
         self.con.commit()

@@ -23,6 +23,10 @@ class Isolated(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
+        key_lookup = self.stack.enter_context(patch.object(
+            api, '_key', side_effect=AssertionError('real API-key lookup forbidden in unit tests; stub the API boundary')))
+        # Cleanup also catches lookups swallowed by production error handling or background workers.
+        self.addCleanup(key_lookup.assert_not_called)
         root = Path(self.tmp.name)
         for name in ('STATE','LOGS_DIR','LOCKS_DIR','SSH_DIR','CM_DIR'):
             self.stack.enter_context(patch.object(common, name, root/name))
@@ -156,7 +160,9 @@ class PoolTests(Isolated):
         self.busy('bg')
         self.con.execute("UPDATE runs SET mode='bg',process_id=123 WHERE box_id='bg'")
         self.con.commit()
-        with patch.object(api,'cmd_status',return_value={'running':False,'status':'exited','exitCode':0}), patch.object(lease,'idle_ttl'), patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)):
+        with patch.object(api,'cmd_status',return_value={'running':False,'status':'exited','exitCode':0}), \
+                patch.object(misc, '_catch_up_finished'), patch.object(lease,'idle_ttl'), \
+                patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)):
             row=pool.acquire(self.me)
             pool.release_guard(row)
         self.assertEqual(self.con.execute("SELECT status FROM runs WHERE run_id='run-bg'").fetchone()[0],'done')

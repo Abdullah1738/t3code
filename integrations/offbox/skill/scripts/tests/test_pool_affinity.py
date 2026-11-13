@@ -528,7 +528,7 @@ class HintAndPullTests(Isolated):
             self.assertIn('prefix your command with corepack pnpm@10 install --frozen-lockfile &&', err.getvalue())
             return {'processId': 7}
         with patch.object(lease, '_reuse', side_effect=lambda c,r,s,**kw: dict(r)), \
-                patch.object(runs, '_ttl_keeper'), patch.object(lease, 'idle_ttl'), \
+                patch.object(runs, '_ttl_keeper'), patch.object(lease, 'idle_ttl') as idle_ttl, \
                 patch.object(runs.Runner, '_prepare_box', return_value=None), patch.object(api, 'cmd_start', side_effect=start), \
                 patch.object(runs.node_version, 'want', return_value=None), contextlib.redirect_stderr(err):
             try:
@@ -536,6 +536,7 @@ class HintAndPullTests(Isolated):
                 runs.finish(runner.run_id, 1)
             finally:
                 pool.release_guard(runner.lease_row)
+        idle_ttl.assert_called_once_with('B')
         self.assertIn('your last box A is gone; using B', err.getvalue())
         record = self.con.execute('SELECT exit_code FROM runs WHERE run_id=?', (runner.run_id,)).fetchone()
         self.assertEqual(record[0], 1)

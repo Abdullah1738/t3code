@@ -227,6 +227,7 @@ class SpuriousLostTests(Isolated):
             data = 'retained output\n' if which == 'stdout' else ''
             return dict(data=data[offset:], nextOffset=len(data), size=len(data), done=True)
         with patch.object(runs,'recorded_exit',return_value=0), \
+                patch.object(api, 'history_get', return_value=None), \
                 patch.object(misc, '_catch_up_log', CATCH_UP_LOG), \
                 patch.object(misc, '_catch_up_finished', CATCH_UP_FINISHED), \
                 patch.object(api, 'history_logs', side_effect=history):

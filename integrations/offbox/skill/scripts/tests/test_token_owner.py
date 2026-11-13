@@ -73,7 +73,7 @@ class Home(Scoped):
     @contextlib.contextmanager
     def who(self, name):
         env = {"OFFBOX_THREAD": f"person:{name}"} if name != common.DEFAULT_OWNER else {}
-        with patch.dict(os.environ, env), patch.object(api, "_KEY", self.srv.tok[name]):
+        with patch.dict(os.environ, env), patch.object(api, "_key", return_value=self.srv.tok[name]):
             yield
 
     def reap(self, name):

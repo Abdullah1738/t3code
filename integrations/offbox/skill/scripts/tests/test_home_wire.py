@@ -36,7 +36,7 @@ class Wire(Isolated):
         self.log = Path(self.tmp.name) / "run.log"
 
     def as_owner(self, who):
-        self.stack.enter_context(patch.object(api, "_KEY", self.srv.tok[who]))
+        self.stack.enter_context(patch.object(api, "_key", return_value=self.srv.tok[who]))
 
     def follow(self, box, pid, **kw):
         err = io.StringIO()
