@@ -1,5 +1,5 @@
 import { toolError } from "./toollog.ts";
-import { IMESSAGE_ORIGIN, isDelegatedCompletionText, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
+import { IMESSAGE_ORIGIN, isCompletionNoticeText, subagentNoticeState, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
   type ControlConfigOptions, type ControlMessage, type RunSummary, type ThreadDetail, type ThreadSummary,
@@ -54,7 +54,7 @@ const runOrdinal = (runId: string) => Number(/:ordinal:(\d+)$/.exec(runId)?.[1] 
  * Rebuilds OpenCode-2-style session records from Robob runs and messages, the
  * shape the router reads turns from: each run's user prompt, its assistant
  * steps, then an `idle` marker once the run has settled. User messages the
- * agent or server sent to itself are left out, except delegated completions:
+ * agent or server sent to itself are left out, except completion and native progress notices:
  * the router needs their boundaries when a completion races a sealed wake. The bridge's
  * own prompts stay in even when Robob did not record them as the owner's (a
  * relay it could not verify is attributed to the bridge, not to him).
@@ -80,10 +80,10 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
       if (message.role === "user") {
         const id = promptId(thread.threadId, message);
         const bridgeSent = id !== message.messageId && BRIDGE_PROMPT.test(id);
-        const completion = isDelegatedCompletionText(message.text);
-        if (message.createdBy !== undefined && message.createdBy !== "user" && !bridgeSent && !completion) continue;
+        const notice = isCompletionNoticeText(message.text) || subagentNoticeState(message.text) !== undefined;
+        if (message.createdBy !== undefined && message.createdBy !== "user" && !bridgeSent && !notice) continue;
         records.push({ id, type: "user", text: withoutGuidance(message.text), time: { created },
-          ...(completion && message.createdBy !== undefined ? { createdBy: message.createdBy } : {}) });
+          ...(notice && message.createdBy !== undefined ? { createdBy: message.createdBy } : {}) });
         continue;
       }
       const done = settled || !message.streaming;
