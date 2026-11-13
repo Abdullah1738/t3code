@@ -1948,7 +1948,7 @@ it.effect(
         })),
       });
       storeControl.afterBoardWrite = () => {
-        storeControl.afterBoardWrite = undefined;
+        delete storeControl.afterBoardWrite;
         return kanban
           .editCard(card.id, { comment: "Concurrent card update" }, owner)
           .pipe(Effect.orDie, Effect.forkChild, Effect.flatMap(Fiber.join), Effect.asVoid);
@@ -2019,7 +2019,7 @@ it.effect.each([false, true])(
       }
       storeControl.beforeCardEvent = (event) => {
         if (!event.body?.startsWith("Applied ")) return Effect.void;
-        storeControl.beforeCardEvent = undefined;
+        delete storeControl.beforeCardEvent;
         return Effect.fail(
           new KanbanStore.KanbanStoreError({ operation: "audit regression", cause: "unavailable" }),
         );
