@@ -19,6 +19,8 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Result from "effect/Result";
+import * as Option from "effect/Option";
+import * as TestClock from "effect/testing/TestClock";
 import * as Stream from "effect/Stream";
 
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
@@ -78,7 +80,9 @@ const database = SqlitePersistence.layerMemory;
 const stores = Layer.mergeAll(EventStore.layer, ProjectionStore.layer).pipe(
   Layer.provideMerge(database),
 );
-const testLayer = EventSink.layer.pipe(Layer.provideMerge(stores));
+const testLayer = Layer.mergeAll(EventSink.layer, EffectOutbox.layer).pipe(
+  Layer.provideMerge(stores),
+);
 
 const seed = Effect.fn("SteerDeliveryFailureTest.seed")(function* (completion = false) {
   const sink = yield* EventSink.EventSinkV2;
@@ -434,36 +438,139 @@ it.effect("bounds public notice copy even for an oversized message identity", ()
   }).pipe(Effect.provide(testLayer)),
 );
 
-it.effect("scopes provider acceptance to each execution of the steer effect", () =>
-  Effect.gen(function* () {
-    yield* seed();
-    const projections = yield* ProjectionStore.ProjectionStoreV2;
-    let refuse = false;
-    yield* Effect.gen(function* () {
-      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
-      const execution = executor.execute(effect, { willRetry: false }).pipe(Effect.result);
-      assert.isTrue(Result.isFailure(yield* execution));
+it.effect.each([
+  { stage: "projection read", recovery: "normal", eventuallySucceeds: false },
+  { stage: "mailbox acknowledgement", recovery: "normal", eventuallySucceeds: false },
+  { stage: "projection defect", recovery: "normal", eventuallySucceeds: false },
+  { stage: "mailbox defect", recovery: "normal", eventuallySucceeds: false },
+  { stage: "projection read", recovery: "restart", eventuallySucceeds: false },
+  { stage: "mailbox acknowledgement", recovery: "restart", eventuallySucceeds: false },
+  { stage: "projection read", recovery: "reschedule failure", eventuallySucceeds: false },
+  { stage: "mailbox acknowledgement", recovery: "reschedule failure", eventuallySucceeds: false },
+  { stage: "projection read", recovery: "normal", eventuallySucceeds: true },
+  { stage: "mailbox acknowledgement", recovery: "normal", eventuallySucceeds: true },
+] as const)(
+  "keeps acceptance through retries ($stage, $recovery, succeeds=$eventuallySucceeds)",
+  ({ stage, recovery, eventuallySucceeds }) =>
+    Effect.gen(function* () {
+      yield* seed(true);
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const bookkeepingFailure = new Orchestrator.OrchestratorProjectionError({
+        threadId,
+        cause: "bookkeeping failed after acceptance",
+      });
+      let providerCalls = 0;
+      let bookkeepingCalls = 0;
+      let failedReschedule = false;
+      const projectionFails = stage.startsWith("projection");
+      const failure = stage.endsWith("defect")
+        ? Effect.die(bookkeepingFailure)
+        : Effect.fail(bookkeepingFailure);
+      yield* outbox.enqueue([
+        { id: effect.id, commandId: effect.commandId, threadId, request: effect.request },
+      ]);
+      const dependencies = executorLayer(
+        () =>
+          Effect.suspend(() => {
+            providerCalls += 1;
+            return providerCalls === 1 ? Effect.void : Effect.fail(controlFailure);
+          }),
+        {
+          getThreadRecords: (id, fields, filter) =>
+            Effect.suspend(() => {
+              if (projectionFails) {
+                bookkeepingCalls += 1;
+                if (!eventuallySucceeds || bookkeepingCalls < 5) return failure;
+              }
+              return projections
+                .getThreadRecords(id, fields, filter)
+                .pipe(Effect.mapError(() => bookkeepingFailure));
+            }),
+          dispatch: (command) =>
+            Effect.suspend(() => {
+              assert.equal(command.type, "notification.delivery.accept");
+              if (!projectionFails) {
+                bookkeepingCalls += 1;
+                if (!eventuallySucceeds || bookkeepingCalls < 5) return failure;
+              }
+              return Effect.succeed({ sequence: 1, storedEvents: [] });
+            }),
+        },
+      );
+      const executions = recovery === "restart" ? 4 : 5;
+      for (let attempt = 1; attempt <= executions; attempt += 1) {
+        // A fresh executor each attempt excludes process-local acceptance caches.
+        const layer = EffectWorker.layerWithOptions({ workerId: "acceptance-test" }).pipe(
+          Layer.provide(dependencies),
+        );
+        const outcome = yield* Effect.gen(function* () {
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          return yield* worker.runOnce;
+        }).pipe(
+          Effect.provide(layer),
+          Effect.provideService(EffectOutbox.EffectOutboxV2, {
+            ...outbox,
+            retry: (input) =>
+              Effect.suspend(() => {
+                if (recovery === "reschedule failure" && !failedReschedule) {
+                  failedReschedule = true;
+                  return Effect.fail(
+                    new EffectOutbox.EffectOutboxError({
+                      operation: "retry",
+                      effectId: input.effectId,
+                    }),
+                  );
+                }
+                return outbox.retry(input);
+              }),
+          }),
+          Effect.result,
+        );
+        if (recovery === "reschedule failure" && attempt === 1)
+          assert.isTrue(Result.isFailure(outcome));
+        else assert.isTrue(Result.isSuccess(outcome));
+        const persisted = yield* outbox.get(effect.id);
+        assert.isTrue(Option.isSome(persisted));
+        if (Option.isNone(persisted)) return;
+        assert.equal(persisted.value.request.type, "provider-turn.steer");
+        if (attempt < executions) {
+          if (persisted.value.request.type === "provider-turn.steer")
+            assert.isTrue(persisted.value.request.providerAccepted);
+          if (recovery === "restart" && attempt === 1) {
+            yield* outbox.enqueue([
+              {
+                id: "effect:unaccepted",
+                commandId: effect.commandId,
+                threadId,
+                request: effect.request,
+              },
+            ]);
+            yield* TestClock.adjust("30 seconds");
+            const claimed = yield* outbox.claimNext({
+              workerId: "lost-process",
+              leaseDurationMs: 30_000,
+            });
+            assert.isTrue(Option.isSome(claimed));
+            assert.deepEqual(yield* outbox.reconcileAfterProcessLoss, {
+              requeued: 1,
+              cancelled: 1,
+            });
+            // Runtime reconciliation must preserve accepted bookkeeping in both cancellation paths.
+            assert.deepEqual(
+              yield* outbox.cancelUnsettled({
+                threadId,
+                effectTypes: EffectOutbox.PROCESS_BOUND_EFFECT_TYPES,
+                reason: "Lost native session",
+              }),
+              [],
+            );
+          }
+          yield* TestClock.adjust("30 seconds");
+        } else assert.equal(persisted.value.status, eventuallySucceeds ? "succeeded" : "failed");
+      }
+      assert.equal(providerCalls, 1);
+      assert.equal(bookkeepingCalls, executions);
       assert.lengthOf((yield* projections.getThreadProjection(threadId)).visibleTurnItems, 0);
-      refuse = true;
-      const refusal = yield* execution;
-      assert.isTrue(Result.isFailure(refusal));
-      if (Result.isFailure(refusal)) assert.strictEqual(refusal.failure.cause, controlFailure);
-      assert.lengthOf((yield* projections.getThreadProjection(threadId)).visibleTurnItems, 1);
-    }).pipe(
-      Effect.provide(
-        executorLayer(
-          () => Effect.suspend(() => (refuse ? Effect.fail(controlFailure) : Effect.void)),
-          {
-            getThreadRecords: () =>
-              Effect.fail(
-                new Orchestrator.OrchestratorProjectionError({
-                  threadId,
-                  cause: "post-acceptance read failed",
-                }),
-              ),
-          },
-        ),
-      ),
-    );
-  }).pipe(Effect.provide(testLayer)),
+    }).pipe(Effect.provide(testLayer)),
 );
