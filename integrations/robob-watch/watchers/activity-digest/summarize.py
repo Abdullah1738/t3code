@@ -7,6 +7,13 @@ Topic = the field after the first " · " (the log format); lines without it use 
 import re
 import sys
 from collections import Counter, OrderedDict
+from pathlib import Path
+# robob-watch test copies the watcher into scratch, while helpers stay installed.
+REDACT_HELPERS = Path(__file__).resolve().parents[2] / 'helpers'
+if not (REDACT_HELPERS / 'redact.py').is_file():
+    REDACT_HELPERS = Path.home() / '.local/share/robob-watch/helpers'
+sys.path.insert(0, str(REDACT_HELPERS))
+from redact import redact
 
 SHOW = 11  # topic lines; header + path + "By topic:" + 11 + "other topics" = 15 lines max
 
@@ -35,7 +42,7 @@ def topic(line):
 
 
 def main():
-    lines = [l.rstrip("\n") for l in sys.stdin if l.strip()]
+    lines = [l for l in redact(sys.stdin.read()).splitlines() if l.strip()]
     if not lines:
         return
     groups = OrderedDict()
