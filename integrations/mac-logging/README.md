@@ -102,6 +102,7 @@ copies. This avoids deploying unrelated integration changes or skill wording.
 The helper installer writes the proposed
 `com.abdullah.mac-log-collector.plist`; the evaluator must separately load it
 after approval. Existing job schedules and backup LaunchAgents stay in place.
+The collector starts via `/bin/zsh` because launchd attributes Full Disk Access to the job's own program.
 The jobs fail open if the helper is missing.
 
 ## Fixture checks
