@@ -22,6 +22,8 @@ export const kanbanDDL = [
     stage TEXT NOT NULL, active_thread_id TEXT, json TEXT NOT NULL, UNIQUE (board_id, number)
   )`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_cards_board ON ardud_kanban_cards (board_id, stage)`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_cards_open ON ardud_kanban_cards(board_id, number)
+    WHERE json_extract(json, '$.settledAt') IS NULL`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_cards_thread ON ardud_kanban_cards (active_thread_id)`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_card_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, card_id TEXT NOT NULL, json TEXT NOT NULL

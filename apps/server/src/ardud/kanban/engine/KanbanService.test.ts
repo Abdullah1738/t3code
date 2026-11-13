@@ -1285,8 +1285,14 @@ it.effect.each(
       assert.match(after.stalled!.reason, /^Thread model differs from card model/);
       assert.strictEqual(after.discussionId, discussion.id);
       assert.strictEqual((yield* kanban.cardDiscussion(card.id)).id, discussion.id);
-      assert.lengthOf((yield* kanban.discussions(board.id)).filter((d) => d.cardId === card.id), 1);
-      assert.lengthOf(fake.sends.filter((send) => send.threadId === threadId), sent);
+      assert.lengthOf(
+        (yield* kanban.discussions(board.id)).filter((d) => d.cardId === card.id),
+        1,
+      );
+      assert.lengthOf(
+        fake.sends.filter((send) => send.threadId === threadId),
+        sent,
+      );
     }).pipe(Effect.provide(testLayer(delayed)));
   }),
 );
@@ -8064,7 +8070,7 @@ it.effect("status maintenance only locks due evaluators across twenty ticks", ()
       });
       const statements: Statement.Transformer = (statement, _sql, _fiber, span) => {
         const [query] = statement.compile();
-        if (/SELECT json FROM ardud_kanban_threads WHERE thread_id =/.test(query)) {
+        if (/SELECT .+ FROM ardud_kanban_threads WHERE thread_id =/.test(query)) {
           let current: Tracer.AnySpan | undefined = span;
           while (current?._tag === "Span") {
             if (current.attributes.get("kanban.tick_step") === "evaluatorStatus") {
@@ -8537,8 +8543,8 @@ it.effect("a newly flagged card is rechecked before its evaluator is woken", () 
       Effect.map(KanbanStore.KanbanStore, (real) =>
         KanbanStore.KanbanStore.of({
           ...real,
-          cards: (boardId) =>
-            real.cards(boardId).pipe(
+          openCards: (boardId) =>
+            real.openCards(boardId).pipe(
               Effect.tap((cards) => {
                 const card = cards.find((item) => item.id === control.cardId);
                 if (!control.armed || !card) return Effect.void;
@@ -28575,7 +28581,7 @@ it.effect("review878r3: unpause does not undo a completed sibling review", () =>
 );
 
 it.live(
-  "measures decode and statement work over twenty 200-card ticks",
+  "measures decode and statement work over twenty 200-open-card ticks with 5000 settled cards",
   () =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
@@ -28605,6 +28611,18 @@ it.live(
             { discard: true },
           ),
         );
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            for (let i = 0; i < 5000; i++)
+              yield* store.putCard({
+                ...created,
+                id: KanbanCardId.make(`settled-${i}`),
+                number: 201 + i,
+                stage: "verified",
+                settledAt: board.createdAt,
+              });
+          }),
+        );
         // Three boards share the unresolved set; a failed result read keeps one
         // evaluator end pending across all twenty passes without changing cards.
         for (const slug of ["decode-other-a", "decode-other-b"]) {
@@ -28626,6 +28644,13 @@ it.live(
         fake.failFailureReads.left = 1000;
         yield* kanban.turnEnded(threadId);
         yield* kanban.tick;
+        // Cold tick scans only the 200 open cards, so settled rows never enter the decoder.
+        assert.strictEqual((yield* store.decodeCacheStats).card!.entries, 200);
+        const coldCache = yield* store.decodeCacheStats;
+        const waitLogs: unknown[] = [];
+        const logger = Logger.make(({ message }) => {
+          if (JSON.stringify(message).includes("kanban wait pass")) waitLogs.push(message);
+        });
         const counts = {
           boards: 0,
           maintenanceBoards: 0,
@@ -28669,6 +28694,7 @@ it.live(
         try {
           for (let i = 0; i < 20; i++) {
             yield* kanban.tick.pipe(
+              Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
               Effect.provideService(Statement.CurrentTransformer, statements),
               Effect.provideService(Statement.SpanPropagationEnabled, true),
             );
@@ -28676,9 +28702,25 @@ it.live(
         } finally {
           spy.mockRestore();
         }
+        const warmCache = yield* store.decodeCacheStats;
+        assert.strictEqual(warmCache.card!.misses, coldCache.card!.misses);
+        assert.strictEqual(warmCache.card!.entries, 200);
+        assert.strictEqual(waitLogs.length, 60);
+        assert.include(JSON.stringify(waitLogs), '"decodeCache"');
+        assert.include(JSON.stringify(waitLogs), '"hits"');
+        assert.include(JSON.stringify(waitLogs), '"misses"');
+        assert.include(JSON.stringify(waitLogs), '"evictions"');
         yield* Effect.logInfo(
           "KANBAN_DECODE_COUNTS",
-          JSON.stringify({ ticks: 20, boardCount: 3, cards: 200, totals: counts }),
+          JSON.stringify({
+            ticks: 20,
+            boardCount: 3,
+            openCards: 200,
+            settledCards: 5000,
+            totals: counts,
+            coldCache,
+            warmCache,
+          }),
         );
         if (process.env.KANBAN_DECODE_BASELINE !== "1") {
           assert.strictEqual(counts.boardDecodes, 0);
@@ -28686,9 +28728,10 @@ it.live(
           assert.strictEqual(counts.maintenanceBoards, 60);
           assert.strictEqual(counts.threadBatches, 20);
           assert.isAtMost(counts.boards, 200);
-          assert.isAtMost(counts.threads, 160);
+          assert.isAtMost(counts.cards, 180);
+          assert.isAtMost(counts.threads, 120);
         }
-        assert.strictEqual((yield* store.cards(board.id)).length, 200);
+        assert.strictEqual((yield* store.openCards(board.id)).length, 200);
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
   60_000,

@@ -1,3 +1,5 @@
+import * as NodeV8 from "node:v8";
+import * as NodeVM from "node:vm";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -10,7 +12,7 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
-import type * as Tracer from "effect/Tracer";
+import * as Tracer from "effect/Tracer";
 import { vi } from "vite-plus/test";
 
 import {
@@ -987,38 +989,177 @@ it.live(
             }),
           )
           .pipe(Effect.flip);
-        assert.strictEqual(yield* store.board(boardId), before);
-        assert.strictEqual(yield* store.card(KanbanCardId.make("card-1")), beforeCard);
+        assert.deepStrictEqual(yield* store.board(boardId), before);
+        assert.deepStrictEqual(yield* store.card(KanbanCardId.make("card-1")), beforeCard);
       }),
     ),
   30_000,
 );
 
 it.live(
-  "evicts the least recently used card text past the 4096 entry cap",
+  "keeps a 6000-card working set across boards, projections and thread reads",
   () =>
     Effect.gen(function* () {
       const store = yield* KanbanStore.KanbanStore;
       const sql = yield* SqlClient.SqlClient;
+      const smallBoard = KanbanBoardId.make("small-board");
       yield* sql.withTransaction(
-        Effect.forEach(
-          Array.from({ length: 4096 }, (_, i) => card(i + 1, "todo")),
-          store.putCard,
-          { discard: true },
-        ),
+        Effect.gen(function* () {
+          for (let number = 1; number <= 6000; number++) {
+            const row = {
+              ...card(number, "todo"),
+              boardId: number <= 5000 ? boardId : smallBoard,
+              prompt: "Fixture working-set prompt. ".repeat(80),
+            };
+            yield* store.putCard(row);
+            yield* store.putThreadLink({
+              threadId: ThreadId.make(`cache-thread-${number}`),
+              boardId: row.boardId,
+              cardId: row.id,
+              role: "work",
+              purpose: null,
+              discussionId: null,
+              model,
+              startedAt: at,
+              endedAt: null,
+              paused: null,
+            });
+          }
+        }),
       );
-      const rows = yield* store.cards(boardId);
-      const oldest = rows[0]!;
-      const evicted = rows[1]!;
-      assert.strictEqual(yield* store.card(oldest.id), oldest);
-      yield* store.putCard(card(4097, "todo"));
-      yield* store.card(KanbanCardId.make("card-4097"));
-      assert.strictEqual(yield* store.card(oldest.id), oldest);
-      const reread = yield* store.card(evicted.id);
-      assert.notStrictEqual(reread, evicted);
-      assert.deepStrictEqual(reread, evicted);
-    }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
-  30_000,
+      // Isolated synthetic data only. Force GC so this reports retained cache heap,
+      // rather than the transient allocations from writing/decoding the fixture.
+      NodeV8.setFlagsFromString("--expose_gc");
+      const gc = NodeVM.runInNewContext("gc") as () => void;
+      gc();
+      const beforeBytes = process.memoryUsage().heapUsed;
+      for (const id of [smallBoard, boardId]) {
+        assert.strictEqual((yield* store.cards(id)).length, id === boardId ? 5000 : 1000);
+        yield* store.summaryCards(id);
+        yield* store.threadLinks({ boardId: id, open: false });
+      }
+      gc();
+      const retainedBytes = process.memoryUsage().heapUsed - beforeBytes;
+      const cold = yield* store.decodeCacheStats;
+      for (const id of [boardId, smallBoard]) {
+        yield* store.cards(id);
+        yield* store.summaryCards(id);
+        yield* store.threadLinks({ boardId: id, open: false });
+      }
+      const warm = yield* store.decodeCacheStats;
+      const spans: Tracer.Span[] = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          spans.push(span);
+          return span;
+        },
+      });
+      yield* store.summaryCards(boardId).pipe(Effect.withTracer(tracer));
+      const summaryRead = spans.find((span) => span.name === "KanbanStore.read");
+      assert.strictEqual(summaryRead?.attributes.get("kanban.decode.summary.hits"), 5000);
+      assert.strictEqual(summaryRead?.attributes.get("kanban.decode.summary.misses"), 0);
+      for (const name of ["card", "summary", "thread"]) {
+        assert.strictEqual(cold[name]!.entries, 6000);
+        assert.strictEqual(warm[name]!.misses, 6000);
+        assert.strictEqual(warm[name]!.hits - cold[name]!.hits, 6000);
+        assert.strictEqual(warm[name]!.evictions, 0);
+      }
+      const original = yield* store.card(KanbanCardId.make("card-1"));
+      yield* store.feedCards(boardId, { after: 0, limit: 1 });
+      assert.strictEqual(yield* store.card(original!.id), original);
+      yield* Effect.logInfo("KANBAN_WORKING_SET_COUNTS", {
+        cards: 6000,
+        bigBoard: 5000,
+        smallBoard: 1000,
+        retainedBytes,
+        bytesPerCardIncludingSummaryAndThread: Math.round(retainedBytes / 6000),
+        cold,
+        warm,
+      });
+    }).pipe(Effect.provide(TestLayer)),
+  60_000,
+);
+
+it.effect("replaces a row version and drops deleted card and thread entries", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const sql = yield* SqlClient.SqlClient;
+    const row = card(1, "todo");
+    const threadId = ThreadId.make("deleted-thread");
+    yield* store.putCard(row);
+    yield* store.putThreadLink({
+      threadId,
+      boardId,
+      cardId: row.id,
+      role: "work",
+      purpose: null,
+      discussionId: null,
+      model,
+      startedAt: at,
+      endedAt: null,
+      paused: null,
+    });
+    yield* store.cards(boardId);
+    yield* store.summaryCards(boardId);
+    yield* store.feedCards(boardId);
+    yield* store.threadLink(threadId);
+    const cold = yield* store.decodeCacheStats;
+    const changed = { ...row, title: "Changed through SQL", stage: "working" };
+    yield* sql`UPDATE ardud_kanban_cards SET stage = 'working', json = ${JSON.stringify(changed)} WHERE id = ${row.id}`;
+    assert.deepStrictEqual(yield* store.card(row.id), changed);
+    const updated = yield* store.decodeCacheStats;
+    assert.strictEqual(updated.card!.misses - cold.card!.misses, 1);
+    assert.strictEqual(updated.card!.entries, 1);
+    yield* sql`DELETE FROM ardud_kanban_cards WHERE id = ${row.id}`;
+    yield* sql`DELETE FROM ardud_kanban_threads WHERE thread_id = ${threadId}`;
+    yield* store.cards(boardId);
+    yield* store.threadLinks({ boardId, open: false });
+    const deleted = yield* store.decodeCacheStats;
+    for (const name of ["card", "feed", "summary", "thread"]) {
+      assert.strictEqual(deleted[name]!.entries, 0);
+      assert.strictEqual(deleted[name]!.evictions, 1);
+    }
+    assert.isNull(yield* store.card(row.id));
+    assert.isNull(yield* store.threadLink(threadId));
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect("open cards use the partial index and follow settle and reopen writes", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const sql = yield* SqlClient.SqlClient;
+    const open = card(1, "todo");
+    const settled = { ...card(2, "verified"), settledAt: at };
+    yield* store.putCard(open);
+    yield* store.putCard(settled);
+    const plan = yield* sql<{ detail: string }>`EXPLAIN QUERY PLAN
+      SELECT id, board_id, json FROM ardud_kanban_cards
+      WHERE board_id = ${boardId} AND json_extract(json, '$.settledAt') IS NULL
+      ORDER BY number`;
+    assert.isTrue(plan.some((row) => row.detail.includes("ardud_kanban_cards_open")));
+    assert.deepStrictEqual(yield* store.openCards(boardId), [open]);
+    assert.strictEqual((yield* store.decodeCacheStats).card!.misses, 1);
+    yield* store.putCard({ ...open, settledAt: at });
+    yield* store.putCard({ ...settled, settledAt: null });
+    assert.deepStrictEqual(yield* store.openCards(boardId), [{ ...settled, settledAt: null }]);
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect("does not freeze decoded rows outside tests when NODE_ENV is unset", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    yield* store.putCard(card(1, "todo"));
+    vi.stubEnv("VITEST", "");
+    vi.stubEnv("NODE_ENV", undefined);
+    try {
+      const row = yield* store.card(KanbanCardId.make("card-1"));
+      assert.isFalse(Object.isFrozen(row));
+      assert.isFalse(Object.isFrozen(row!.subtasks));
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }).pipe(Effect.provide(TestLayer)),
 );
 
 it.live(
