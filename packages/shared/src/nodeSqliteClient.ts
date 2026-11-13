@@ -2097,6 +2097,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
               span.attribute("db.reader.waiting", true);
               span.attribute("db.reader.wait_interrupted", Exit.hasInterrupts(exit));
               span.attribute("db.lock_wait_ms", wait.lockWaitMs);
+              span.attribute("db.reader.acquired", false);
+              span.attribute("db.reader.wait_ms", wait.lockWaitMs);
               span.attribute("db.reader.acquire_wait_ms", wait.lockWaitMs);
             }),
           );
