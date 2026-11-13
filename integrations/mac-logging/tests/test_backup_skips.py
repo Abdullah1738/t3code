@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -88,7 +89,29 @@ class BackupSkipTests(unittest.TestCase):
     fixture = shell_jobs.ShellJobsTests.fixture
     rows = shell_jobs.ShellJobsTests.rows
 
-    def setup_run(self, target, point=''):
+    def memory_python(self):
+        if sys.version_info >= (3, 10):
+            return sys.executable
+        candidates = ['/opt/homebrew/bin/python3', shutil.which('python3')]
+        for directory in os.get_exec_path():
+            candidates.extend(str(path) for path in Path(directory).glob('python3.*')
+                              if path.name.removeprefix('python3.').isdigit())
+        for candidate in dict.fromkeys(candidates):
+            if not candidate:
+                continue
+            try:
+                result = subprocess.run(
+                    [candidate, '-c', 'import sys; sys.exit(sys.version_info < (3, 10))'],
+                    capture_output=True, timeout=5,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode == 0:
+                return candidate
+        self.skipTest('memory-system runs under Homebrew Python ≥3.10; '
+                      f'no compatible interpreter available (test runner: {sys.version_info.major}.{sys.version_info.minor})')
+
+    def setup_run(self, target, point='', *, python=None):
         root, home, fake, logs, env = self.fixture()
         for name in ('python3', 'restic', 'rsync', 'df', 'stat', 'nice', 'bun', 'sqlite3', 'ps', 'mkdir', 'date'):
             text = FAKE.replace("if name=='python3':", EXTRA + "\nif name=='python3':", 1)
@@ -96,7 +119,7 @@ class BackupSkipTests(unittest.TestCase):
                 text += "\nif name=='mkdir': os.execv('/bin/mkdir',['/bin/mkdir']+args)\n"
             if name == 'date':
                 text += "\nif name=='date': os.execv('/bin/date',['/bin/date']+args)\n"
-            (fake/name).write_text(text.replace('PYTHON', sys.executable))
+            (fake/name).write_text(text.replace('PYTHON', python or sys.executable))
             (fake/name).chmod(0o755)
         vault = home/'health-data/abdullah'
         vault.mkdir(parents=True)
@@ -248,6 +271,7 @@ class BackupSkipTests(unittest.TestCase):
                     self.assertFalse(row['ok'])
 
     def test_real_runner_validation_never_claims_a_restic_exit(self):
+        python = self.memory_python()
         cases=[(key,value) for key in ('MEMORY_BACKUP_RESTIC_TIMEOUT_S',
                                       'MEMORY_BACKUP_MAX_SECONDS_UNDER_LOAD')
                for value in ('0','-1','nan','NaN','inf','-inf','1e309','invalid')]
@@ -255,7 +279,7 @@ class BackupSkipTests(unittest.TestCase):
                   ('MEMORY_BACKUP_LOAD_INTERVAL_S','0'), ('MEMORY_BACKUP_LOAD_HIGH','invalid')]
         for key,value in cases:
             with self.subTest(key=key,value=value):
-                fixture=self.setup_run('memory','runner_validation')
+                fixture=self.setup_run('memory','runner_validation',python=python)
                 fixture[3][key]=value
                 row,calls=self.execute(fixture,1)
                 self.assertEqual(calls,'')
@@ -300,8 +324,9 @@ class BackupSkipTests(unittest.TestCase):
             self.assertEqual(calls,'')
 
     def test_memory_redaction_wrapper_success_and_open_failure(self):
+        python = self.memory_python()
         for failure in (False,True):
-            fixture=self.setup_run('memory')
+            fixture=self.setup_run('memory',python=python)
             root,home,logs,env,run,calls=fixture
             env.pop('MEMORY_BACKUP_GUARDED')
             env.pop('RECALL_FENCED')
