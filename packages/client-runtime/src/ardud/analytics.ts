@@ -22,7 +22,7 @@ const kinds = new Set([
   "screen.open",
   "screen.dwell",
   "owner.action",
-  "ask.answered",
+  "ask.answer_sent",
   "ask.dropped",
   "discussion.post",
   "discussion.read-end",

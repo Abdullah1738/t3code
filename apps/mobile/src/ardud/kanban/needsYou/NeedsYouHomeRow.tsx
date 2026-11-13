@@ -1,3 +1,4 @@
+import { useAskNotifications } from "./useAskTiming";
 import { useNavigation } from "@react-navigation/native";
 import { View } from "react-native";
 
@@ -27,6 +28,7 @@ export function NeedsYouHomeRow() {
   const holding = owed.some((item) => item.blocking);
   // A count is a claim: none is shown until a read said so (`homeRowCount`).
   const shown = homeRowCount(useQueueFigures(), count, holding, nowMs);
+  useAskNotifications(shown.count === null ? [] : owed);
   return (
     <Group>
       <Row
