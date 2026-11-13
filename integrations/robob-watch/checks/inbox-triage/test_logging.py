@@ -201,7 +201,8 @@ class TriageLoggingTests(unittest.TestCase):
                     self.assertEqual(t.run_mail('icloud', payload), good)
         rows = self.rows('helper.run')
         self.assertEqual([row['ok'] for row in rows], [True, False, False])
-        self.assertEqual(rows[-1]['props'], {'outcome': 'timeout'})
+        self.assertEqual(rows[-1]['props'], {'outcome': 'timeout', **t.stderr_cause('private stderr', True)})
+        self.assertEqual(rows[1]['props']['stderrClass'], 'unknown')
         self.assertTrue(any(row.get('error', {}).get('tag') == 'helper.timeout' for row in self.rows()))
         for value in ('private mail payload', 'private response', 'private command', 'private stdout', 'private stderr'):
             self.assertNotIn(value, json.dumps(self.rows()))

@@ -2,6 +2,7 @@ import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, openSync, read
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { constants } from "node:os";
 
 export type LogEntry = {
   component: string; kind: "event" | "perf" | "error"; name: string;
@@ -11,13 +12,17 @@ export type LogEntry = {
 const token = /^[a-zA-Z][a-zA-Z0-9_.-]{0,79}$/;
 const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper"]);
 const numeric = new Set(["exitCode", "attempt", "count", "bytes", "queuedMs"]);
-const boolean = new Set(["deduped", "accepted"]);
+const boolean = new Set(["deduped", "accepted", "timedOut"]);
+const errnoCodes = new Set(Object.keys(constants.errno));
+const signals = new Set(Object.keys(constants.signals));
 const values: Record<string, readonly string[]> = {
   severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout"],
   source: ["mail", "sms", "bank", "charge"], routed: ["board", "chat", "ignored"],
   class: ["urgent", "today", "info", "noise", "candidate", "charge", "bank", "security", "otp", "unknown", "fail_open", "deduped"],
   action: ["create", "queue", "cancel", "snooze", "sent", "retry", "check", "wake", "notify", "send", "coalesce", "conflict", "expire", "pause", "remove", "cap", "resume"],
   state: ["pending", "sending", "sent", "uncertain", "cancelled", "failed", "scheduled", "queued", "done", "expired", "paused", "active"],
+  stderrClass: ["usage_error", "missing_file", "permission", "timeout", "python_traceback", "unknown"],
+  triggerKind: ["file", "wal"],
 };
 export const logDirectory = () => process.env.TOOLLOG_DIR ?? join(homedir(), ".robob/logs/tools/watchers");
 const initialized = new Set<string>();
@@ -35,7 +40,11 @@ function fields(entry: LogEntry, at: Date) {
   }
   const props: Record<string, string | number | boolean | null> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
-    if (key === "exitCode" && value === null) props[key] = null;
+    if ((key === "exitCode" || key === "signal") && value === null) props[key] = null;
+    else if (key === "stderrLines" && typeof value === "number" && Number.isSafeInteger(value) && value >= 0) props[key] = value;
+    else if (key === "stderrHash" && typeof value === "string" && /^[a-f0-9]{16}$/.test(value)) props[key] = value;
+    else if (key === "errnoCode" && typeof value === "string" && (errnoCodes.has(value) || value === "UNKNOWN")) props[key] = value;
+    else if (key === "signal" && typeof value === "string" && signals.has(value)) props[key] = value;
     else if (numeric.has(key) && typeof value === "number" && Number.isFinite(value)) props[key] = value;
     else if (boolean.has(key) && typeof value === "boolean") props[key] = value;
     else if (typeof value === "string" && values[key]?.includes(value)) props[key] = value;
@@ -86,8 +95,8 @@ export function toolLog(entry: LogEntry): void {
   } catch { /* Logging cannot affect the caller. */ }
 }
 
-export function toolError(component: string, tag: string, ids?: Record<string, unknown>): void {
-  toolLog({ component, kind: "error", name: `${component}.error`, ok: false, ids, error: { tag } });
+export function toolError(component: string, tag: string, ids?: Record<string, unknown>, props?: Record<string, unknown>): void {
+  toolLog({ component, kind: "error", name: `${component}.error`, ok: false, ids, props, error: { tag } });
 }
 
 export async function rollup(day: string, dir = logDirectory()) {
