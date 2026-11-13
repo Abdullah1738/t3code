@@ -56,6 +56,8 @@ class QueueDatabaseContention(Isolated):
         create.assert_not_called()
         self.assertEqual(row['box_id'], 'busy')
         self.assertFalse(self.con.execute("SELECT 1 FROM pool_pending WHERE token='stale'").fetchone())
+        self.assertFalse(self.con.execute('SELECT 1 FROM pool_waiters').fetchone())
+        self.assertFalse(self.con.execute('SELECT 1 FROM pool_cap_callers').fetchone())
 
     def test_persistent_queue_lock_returns_96_cleans_rows_and_logs_traceback(self):
         self.con.execute('INSERT INTO pool_pending VALUES (?,?,?,?,?)',
@@ -88,6 +90,8 @@ class QueueDatabaseContention(Isolated):
         self.assertFalse(self.con.execute('SELECT 1 FROM pool_pending WHERE pid=?',(os.getpid(),)).fetchone())
         self.assertFalse(self.con.execute('SELECT 1 FROM pool_callers WHERE owner=? AND repo_root=?',
                                          (self.me['owner'],self.me['repo_root'])).fetchone())
+        self.assertFalse(self.con.execute('SELECT 1 FROM pool_waiters').fetchone())
+        self.assertFalse(self.con.execute('SELECT 1 FROM pool_cap_callers').fetchone())
         diagnostic = common.LOG_PATH.read_text()
         self.assertIn('Traceback (most recent call last)', diagnostic)
         self.assertIn('BEGIN IMMEDIATE', diagnostic)

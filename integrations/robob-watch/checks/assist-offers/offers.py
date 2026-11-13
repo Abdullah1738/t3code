@@ -42,6 +42,13 @@ try:
 except Exception:  # pragma: no cover
     DUBAI = dt.timezone(dt.timedelta(hours=4))
 
+# robob-watch test copies the watcher into scratch, while helpers stay installed.
+REDACT_HELPERS = Path(__file__).resolve().parents[2] / 'helpers'
+if not (REDACT_HELPERS / 'redact.py').is_file():
+    REDACT_HELPERS = Path.home() / '.local/share/robob-watch/helpers'
+sys.path.insert(0, str(REDACT_HELPERS))
+from redact import redact as redact_credentials
+
 HOME = Path.home()
 LIVE = HOME / '.local/share/robob-watch/watchers/assist-offers'
 DATA = Path(os.environ.get('ASSIST_OFFERS_DATA', HOME / 'Documents/assistant/assist-offers'))
@@ -132,6 +139,7 @@ def dubai(ts):
 
 def clean(text, limit=400):
     text = re.sub(r'[\u200b-\u200f\u2060\ufeff\u034f\u00ad\ufffc]', '', str(text or ''))
+    text = redact_credentials(text)
     text = re.sub(r'https?://[^\s\]<>]+', '[link]', text)
     text = re.sub(r'\s+', ' ', text).strip()
     if OTP.search(text):
@@ -228,6 +236,18 @@ def norm_subject(subject):
             break
         s = t
     return s.strip()
+
+
+def conversation_id(value):
+    if not value.startswith('mail:') or re.fullmatch(r'mail:opaque:[0-9a-f]{24}', value):
+        return value
+    # Hash the old account/normalized-subject key so existing dedupe records still match.
+    return 'mail:opaque:' + hashlib.sha256(value.encode()).hexdigest()[:24]
+
+
+def offer_history():
+    history = read_json(DATA / 'offers.json', {'offers': []}).get('offers', [])
+    return [{**h, 'conv': conversation_id(h['conv'])} for h in history]
 
 
 # ---------- contacts ----------
@@ -640,7 +660,7 @@ def collect_email(cursor, floor, now, cfg, probe):
             seen_msgids.add(mid)
     threads = collections.OrderedDict()
     for r in mine:
-        key = f"mail:{r['account']}:{norm_subject(r.get('subject')).lower()[:120]}"
+        key = conversation_id(f"mail:{r['account']}:{norm_subject(r.get('subject')).lower()[:120]}")
         threads.setdefault(key, []).append(r)
     convs = []
     for key, own in threads.items():
@@ -715,7 +735,7 @@ def prefilter(conv):
 
 
 def offer_key(conv, topic):
-    return hashlib.sha256(f"{conv}|{' '.join(sorted(words(topic)))}".encode()).hexdigest()[:16]
+    return hashlib.sha256(f"{conversation_id(conv)}|{' '.join(sorted(words(topic)))}".encode()).hexdigest()[:16]
 
 
 def similar(a, b):
@@ -729,9 +749,10 @@ def already_offered(offer, history, now):
     for h in history:
         if now - h.get('at_ts', 0) > DEDUPE_S:
             continue
-        if h.get('conv') != offer['conv']:
+        if conversation_id(h.get('conv', '')) != conversation_id(offer['conv']):
             continue
-        if h.get('key') == offer_key(offer['conv'], offer['topic']) or similar(h.get('topic', ''), offer['topic']) \
+        previous_key = offer_key(h['conv'], h['topic']) if 'topic' in h else h.get('key')
+        if previous_key == offer_key(offer['conv'], offer['topic']) or similar(h.get('topic', ''), offer['topic']) \
                 or similar(h.get('offer', ''), offer['offer']):
             return True
     return False
@@ -746,6 +767,7 @@ class ClassifierDeadline(BaseException):
 def classify(convs, context, seconds):
     if seconds < 6:
         raise TimeoutError('no time left for the classifier')
+    convs = [{**c, 'conv': conversation_id(c['conv'])} for c in convs]
     payload_convs = []
     for c in convs:
         payload_convs.append({'conv': c['conv'], 'source': c['source'], 'name': c['name'], 'group': c['group'],
@@ -819,9 +841,9 @@ def build_context(convs, watchers, now):
         prefs = (DATA / 'prefs.md').read_text()[:6000]
     except OSError:
         pass
-    history = read_json(DATA / 'offers.json', {'offers': []}).get('offers', [])
-    batch_convs = {c['conv'] for c in convs}
-    previous = [f"{h['conv']}: {h['offer']} ({dubai(h['at_ts']).strftime('%d %b')})" for h in history
+    history = offer_history()
+    batch_convs = {conversation_id(c['conv']) for c in convs}
+    previous = [f"{h['conv']}: {clean(h['offer'], 160)} ({dubai(h['at_ts']).strftime('%d %b')})" for h in history
                 if h.get('conv') in batch_convs and now - h.get('at_ts', 0) <= DEDUPE_S]
     tokens = set()
     for c in convs:
@@ -861,9 +883,9 @@ def event_text(path, offers, errors, manual=False):
         lines.append('Some sources were skipped this run: ' + ', '.join(sorted(errors)))
     for o in offers:
         if manual:
-            lines.append(f"- {o['who']} ({o['conv']})")
+            lines.append(f"- {o['who']} ({conversation_id(o['conv'])})")
         else:
-            lines.append(f"- [{o['confidence']}] {o['who']}: {o['offer']} — {o['why']} ({o['conv']})")
+            lines.append(f"- [{o['confidence']}] {o['who']}: {o['offer']} — {o['why']} ({conversation_id(o['conv'])})")
     return '\n'.join(lines)[:3000]
 
 
@@ -922,7 +944,7 @@ def run(args):
         replay = replay_outbox(state, wd)
         if replay:
             atomic(wd / 'state-offers.json', state)
-            print(replay, flush=True)
+            print(redact_credentials(replay), flush=True)
             return 0
         last = state.get('last_analysis_at', 0)
         due = in_day_window(now) and (args.force or now - last >= CADENCE_S)
@@ -969,7 +991,7 @@ def run(args):
             offers, meta = classify(convs, context, min(25, deadline - time.time() - 4))
         except Exception as e:
             classifier_error = f'{type(e).__name__}: {str(e)[:160]}'
-    history = read_json(DATA / 'offers.json', {'offers': []}).get('offers', [])
+    history = offer_history()
     kept, rejected = [], []
     activity = recent_activity_lines(now)
     cases = [l.lower() for l in (context.get('money_cases') or money_cases_raw()).split('\n') if l.strip()] if offers else []
@@ -1038,7 +1060,7 @@ def run(args):
                  'rejected': len(rejected), 'source_errors': errors, 'classifier_error': classifier_error,
                  'ms': round((time.time() - t0) * 1000), 'stage_s': STAGES, **meta})
     if event:
-        print(event, flush=True)
+        print(redact_credentials(event), flush=True)
     return 0
 
 

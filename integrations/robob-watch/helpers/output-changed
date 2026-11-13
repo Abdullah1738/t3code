@@ -3,6 +3,8 @@
 # Fires when CMD's output (or the URL body) differs from last run. First run records a baseline silently.
 # --show prints the new output (clipped to 3000 chars) instead of a one-line summary. A failing CMD is a check failure.
 set -u
+setopt pipefail
+REDACTOR="${0:A:h}/redact.py"
 show=0; label=""; url=""
 while (( $# )); do
   case $1 in
@@ -25,6 +27,8 @@ fi
 key=$(print -rn -- "${url:-$*}" | shasum -a 256 | cut -c1-16)
 state="$dir/out-$key"
 new=$(print -rn -- "$out" | shasum -a 256 | cut -c1-64)
+out=$(print -rn -- "$out" | /usr/bin/python3 "$REDACTOR") || exit 1
+label=$(print -rn -- "$label" | /usr/bin/python3 "$REDACTOR") || exit 1
 if [[ ! -f $state.sha ]]; then print -r -- "$new" > $state.sha; print -r -- "$out" > $state.last; exit 0; fi
 old=$(<$state.sha)
 [[ $new == "$old" ]] && exit 0
@@ -34,7 +38,8 @@ if (( show )); then
   print -r -- "$out" | head -c 3000
 else
   echo "Changed: $label"
-  diff <(print -r -- "$(<$state.last)") <(print -r -- "$out") | head -40
+  previous=$(cat "$state.last" | /usr/bin/python3 "$REDACTOR") || exit 1
+  diff <(print -r -- "$previous") <(print -r -- "$out") | head -40
 fi
 print -r -- "$out" > $state.last
 exit 0

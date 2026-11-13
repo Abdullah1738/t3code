@@ -56,6 +56,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import charges  # noqa: E402
 import payments  # noqa: E402
 
+# robob-watch test copies the watcher into scratch, while helpers stay installed.
+REDACT_HELPERS = Path(__file__).resolve().parents[2] / 'helpers'
+if not (REDACT_HELPERS / 'redact.py').is_file():
+    REDACT_HELPERS = Path.home() / '.local/share/robob-watch/helpers'
+sys.path.insert(0, str(REDACT_HELPERS))
+from redact import redact as redact_credentials, SEP
+
 TZ = ZoneInfo('Asia/Dubai')
 DATA = Path(os.environ.get('MONEY_CASES_DIR', '~/Documents/assistant/money-cases')).expanduser()
 WATCH_ROOT = Path(os.environ.get('ROBOB_WATCH_ROOT', '~/.local/share/robob-watch')).expanduser()
@@ -118,6 +125,9 @@ def redact(text):
     text = str(text)
     for m in reversed(card_numbers(text)):
         text = text[:m.start()] + '[card number removed]' + text[m.end():]
+    # Generic rules see complete quoted values before the legacy patterns can split them.
+    text = redact_credentials(text)
+    text = re.sub(r'\b' + _LABEL + r'\b(?:' + SEP + r'|[^\S\n]+)\[redacted\]', '[secret removed]', text, flags=re.I)
     return LABELLED.sub('[secret removed]', text)
 
 

@@ -15,6 +15,20 @@ from test_capacity import Isolated
 
 
 class DatabaseMerge(Isolated):
+    def test_version_two_upgrade_adds_fifo_and_preserves_wrapper_namespace(self):
+        path = Path(self.tmp.name) / 'version-two.sqlite'
+        with contextlib.closing(sqlite3.connect(path)) as old:
+            old.executescript(common.SCHEMA.replace(', wrapper_pid INTEGER', ''))
+            old.execute("INSERT INTO runs(run_id,process_id,status) VALUES ('legacy',321,'starting')")
+            old.execute("INSERT INTO kv(k,v) VALUES ('start_unattached:legacy','1')")
+            old.execute('PRAGMA user_version=2')
+            old.commit()
+        with patch.object(common, 'DB_PATH', path), contextlib.closing(common.db()) as upgraded:
+            self.assertEqual(upgraded.execute('PRAGMA user_version').fetchone()[0], 3)
+            self.assertEqual(tuple(upgraded.execute('SELECT process_id,wrapper_pid FROM runs').fetchone()), (None,321))
+            for table in ('pool_waiters', 'pool_cap_callers', 'pool_caps'):
+                self.assertEqual(upgraded.execute(f'SELECT count(*) FROM {table}').fetchone()[0], 0)
+
     def test_quarantine_uses_database_or_sidecar_handles_at_every_entry(self):
         for entry in ('foreground', 'wait', 'lost', 'pool', 'reaper'):
             for source in ('database', 'sidecar'):

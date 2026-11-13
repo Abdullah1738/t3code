@@ -6,6 +6,14 @@ archive). Tokens are read from 9router's DB and never printed."""
 import json, os, sqlite3, subprocess, sys, time, urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 
+from pathlib import Path
+# robob-watch test copies the watcher into scratch, while helpers stay installed.
+REDACT_HELPERS = Path(__file__).resolve().parents[2] / 'helpers'
+if not (REDACT_HELPERS / 'redact.py').is_file():
+    REDACT_HELPERS = Path.home() / '.local/share/robob-watch/helpers'
+sys.path.insert(0, str(REDACT_HELPERS))
+from redact import redact
+
 W = os.environ.get("WATCH_DIR") or os.path.dirname(os.path.abspath(__file__))
 ACC = json.load(open(os.path.join(W, "accounts.json")))
 SP = os.path.join(W, "lift-state.json")
@@ -58,7 +66,7 @@ def mail_hits():
             if "is now ultra" in subj:
                 continue
             if a["email"].lower() in (m.get("recipients") or "").lower():
-                hits.setdefault(a["email"], f'email {m.get("date")}: {m.get("subject")}')
+                hits.setdefault(a["email"], f'email {m.get("date")}: {redact(m.get("subject") or "")}')
     return hits
 
 def main():

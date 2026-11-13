@@ -131,6 +131,10 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   starts; a repo pool has up to 8 boxes (`OFFBOX_POOL_SIZE`, 1-64). On the Boat standby it waits **up to 600 seconds**
   and then returns **92** (nothing ran; retry), with 4 boxes (`OFFBOX_POOL_SIZE` 1-16; raised from 8 for TorSSH by
   Abdullah, 12 Nov 2026) and `OFFBOX_POOL_WAIT_SECONDS` 0-1200. Sizes are minimums on pooled boxes; a larger warm box is reused.
+  Waiters are served in arrival order among callers that can use the same box or create slot; `OFFBOX_POOL_SIZE`
+  raises the cap for the whole pool while that caller is waiting or holds a box. The queue line separates busy
+  boxes, idle boxes that cannot serve this run, and boxes being created, shows source-compatible members for
+  `--template`/`--base` and your place in line, and explains any surplus over the cap.
 - Boxes stop after **5 min idle (xlarge) or 10 min (other sizes)**. 20 min if a run on the box started a container in
   the last 2 h (offbox checks `docker events` at the end of each run; a testcontainers manifest alone no longer
   counts) or half the hourly/daily start allowance is used, 60 min once 75% of the daily allowance is used or during a start
@@ -157,7 +161,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   Templates: `crpko-go` (Go 1.26 + FDB client + warm module cache, large), `crpko-node` (nvm Node 20, 22 (>=22.13) + 24, warm npm cache,
   large), `crpko-harness` (large, Docker images for the harness stack pre-pulled), `generic` (default).
   Auto-pick: crpko-devops / go.mod → crpko-go; package.json → crpko-node; compose file or testcontainers → crpko-harness.
-- On each box, crpko-devops runs check Vector 0.50.0, `/usr/bin/ruby`, AWS CLI v2, GNU time (`/usr/bin/time`) and the Terraform version pinned in the checkout's `terraform-dev.yml`. Missing or wrong versions are installed on the first run there (a few minutes); ready boxes only run a fast check. Binaries are installed on the runner PATH under `/usr/local/bin` (Ruby is installed by apt at `/usr/bin/ruby`). It has no package-lock.json, so run tests directly or use `npm install`, not `npm ci`.
+- On each box, crpko-devops runs check Vector 0.50.0, `/usr/bin/ruby`, AWS CLI v2, GNU time (`/usr/bin/time`), the Terraform version pinned in the checkout's `terraform-dev.yml` and a local Terraform provider mirror pre-filled from the repo's lock files and unpinned fixtures (`TERRAFORM_PROVIDER_MIRROR`). Missing or wrong versions are installed on the first run there (a few minutes); ready boxes only run a fast check. Binaries are installed on the runner PATH under `/usr/local/bin` (Ruby is installed by apt at `/usr/bin/ruby`). It has no package-lock.json, so run tests directly or use `npm install`, not `npm ci`.
 - LocalStack calls must still point `aws` at its endpoint (`--endpoint-url` or `AWS_ENDPOINT_URL`). Box runs get no AWS credentials unless forwarded with `--env`.
 - Type-check runs (tsc, tsc-rs, `vp run typecheck`) in JS/TS repos get xlarge by default; large boxes run out of memory on the Robob server typecheck.
 - Other automatic xlarge (no `--size` given; offbox says why): compose/LocalStack/testcontainers in the command,
