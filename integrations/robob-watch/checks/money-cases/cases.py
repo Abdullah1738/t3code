@@ -611,7 +611,7 @@ def sweep_dead_card(data, last4, now=None, alerts=None, end=None):
         for hit in charges.search(last4, charges.day(start), until=charges.day(now + dt.timedelta(days=1)), n=1000, deadline=end):
             if hit.get('from_me') or not start.timestamp() <= hit.get('ts', 0) <= now.timestamp():
                 continue
-            alerts.append({**hit, 'text': charges.show(hit, end)})
+            alerts.append({**hit, 'text': charges.alert_text(charges.show(hit, end))})
     groups = {}
     for hit in alerts:
         charge = charges.parse(hit.get('text', ''), hit.get('sender', ''))

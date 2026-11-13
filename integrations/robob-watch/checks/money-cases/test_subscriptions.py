@@ -210,6 +210,69 @@ class Subscriptions(Base):
         self.assertIn('amount unknown', mc.table(cases))
         self.assertEqual(next(r for r in self.rows() if r['merchant'] == 'Repeat')['cadence'], '')
 
+    def test_sweep_parses_selected_message_without_msgs_show_neighbors(self):
+        purchase = self.alert('Acme', '2026-11-15')['text']
+        neighbors = {
+            'other_card': self.alert('Other', '2026-11-15', card='3517')['text'],
+            'other_merchant': self.alert('Other', '2026-11-15')['text'],
+            'card_payment': 'Payment of USD 100 towards your Credit Card ending 2342.',
+            'refund': 'USD 100 has been refunded to your Credit Card ending 2342.',
+            'decline': 'Transaction of USD 100 on your Card ending 2342 at Other was declined.',
+        }
+        context_cases = [(name, purchase, neighbor) for name, neighbor in neighbors.items()]
+        context_cases += [(name + '_multiline', purchase.replace(' with ', '\nwith '), neighbor)
+                          for name, neighbor in neighbors.items()]
+        for name, purchase, neighbor in context_cases:
+            for position in ('before', 'after'):
+                with self.subTest(neighbor=name, position=position), \
+                     patch.object(self, 'data', self.tmp / f'{name}-{position}'):
+                    mc.card_dead(self.data, '2342', 'cancelled')
+                    hits, shown = [], {}
+                    for i, day in enumerate(('2026-10-15', '2026-11-15'), start=10):
+                        hit = {**self.alert('Acme', day), 'id': f'imessage:{i}', 'source': 'imessage'}
+                        # A clipped search preview cannot replace reading the selected full message.
+                        hit['text'] = hit['text'][:40]
+                        hits.append(hit)
+                        selected = f'> {i:8d} {day} 12:00 EmiratesNBD: {purchase}'
+                        neighbor_id, clock = (i - 1, '11:59') if position == 'before' else (i + 1, '12:01')
+                        other = f'  {neighbor_id:8d} {day} {clock} EmiratesNBD: {neighbor}'
+                        lines = [other, selected] if position == 'before' else [selected, other]
+                        shown[hit['id']] = 'imessage: EmiratesNBD\n\n' + '\n'.join(lines)
+                    with patch.object(mc.charges, 'search', return_value=hits), \
+                         patch.object(mc.charges, 'show', side_effect=lambda hit, end: shown[hit['id']]):
+                        for _ in range(2):
+                            mc.sweep_dead_card(self.data, '2342', at('2026-11-16T12:00'))
+                    self.assertEqual([(s['merchant'], s['last4'], s['amount']) for s in self.rows()],
+                                     [('Acme', '2342', '100.00')])
+                    cases = mc.load(self.data)['cases']
+                    self.assertEqual([c['merchant'] for c in cases], ['Acme'])
+
+    def test_sweep_does_not_infer_purchases_from_neighbors_of_noncharges(self):
+        selected_messages = {
+            'card_payment': 'Payment of USD 100 towards your Credit Card ending 2342.',
+            'refund': 'USD 100 has been refunded to your Credit Card ending 2342.',
+            'decline': 'Transaction of USD 100 on your Card ending 2342 at Acme was declined.',
+            'other_card': self.alert('Acme', '2026-11-15', card='3517')['text'],
+        }
+        for name, selected in selected_messages.items():
+            with self.subTest(selected=name), patch.object(self, 'data', self.tmp / name):
+                mc.card_dead(self.data, '2342', 'cancelled')
+                hits = [{**self.alert('Acme', day), 'id': f'imessage:{i}', 'source': 'imessage'}
+                        for i, day in enumerate(('2026-10-15', '2026-11-15'), start=10)]
+                def shown(hit, end):
+                    i = int(hit['id'].split(':')[1])
+                    day = mc.charges.day(dt.datetime.fromtimestamp(hit['ts'], mc.TZ))
+                    neighbor = self.alert('Acme', day)['text']
+                    return ('imessage: EmiratesNBD\n\n'
+                            f'  {i - 1:8d} {day} 11:59 EmiratesNBD: {neighbor}\n'
+                            f'> {i:8d} {day} 12:00 EmiratesNBD: {selected}\n'
+                            f'  {i + 1:8d} {day} 12:01 EmiratesNBD: {neighbor}')
+                with patch.object(mc.charges, 'search', return_value=hits), \
+                     patch.object(mc.charges, 'show', side_effect=shown):
+                    mc.sweep_dead_card(self.data, '2342', at('2026-11-16T12:00'))
+                self.assertEqual(self.rows(), [])
+                self.assertEqual(mc.load(self.data)['cases'], [])
+
     def test_dead_card_cli_and_swap_use_archive_and_dry_run_skips(self):
         hit = self.alert('Repeat', '2026-11-15')
         with patch.object(mc, 'DATA', self.data), patch.object(mc, 'now_dubai', return_value=at('2026-11-16T12:00')), \
