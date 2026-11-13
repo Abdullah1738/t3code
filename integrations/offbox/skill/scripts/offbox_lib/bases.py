@@ -360,7 +360,8 @@ def recipe(name: str) -> tuple[str, str]:
     crpko_tools = (TEMPLATES_DIR / "tools/crpko.sh").read_text() + "\n" if name == "crpko-go" else ""
     fdb_tools = ((TEMPLATES_DIR / "tools/foundationdb.sh").read_text() + "\n"
                  if name in ("crpko-go", "crpko-harness") else "")
-    body = ((TEMPLATES_DIR / "common-env.sh").read_text() + "\n# ---- recipe ----\n" + (crpko_tools + fdb_tools + p.read_text()) +
+    body = ((TEMPLATES_DIR / "tools/fetch.sh").read_text() + "\n" +
+            (TEMPLATES_DIR / "common-env.sh").read_text() + "\n# ---- recipe ----\n" + (crpko_tools + fdb_tools + p.read_text()) +
             "\n# ---- keep docker images ----\n(\n" + (TEMPLATES_DIR / "docker-images.sh").read_text() + "\n)\n")
     return body, hashlib.sha256(body.encode()).hexdigest()[:12]
 

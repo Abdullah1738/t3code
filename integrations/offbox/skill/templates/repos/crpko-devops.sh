@@ -50,8 +50,8 @@ if ! terraform_ready; then
   trap 'rm -rf "$stage"' EXIT
   archive="terraform_${terraform_version}_linux_${arch}.zip"
   url="https://releases.hashicorp.com/terraform/$terraform_version"
-  curl -fsSL --retry 5 "$url/$archive" -o "$stage/$archive"
-  curl -fsSL --retry 5 "$url/terraform_${terraform_version}_SHA256SUMS" -o "$stage/SHA256SUMS"
+  offbox_fetch "$url/$archive" "$stage/$archive"
+  offbox_fetch "$url/terraform_${terraform_version}_SHA256SUMS" "$stage/SHA256SUMS"
   (cd "$stage" && python3 - "$archive" <<'PY'
 import hashlib, re, sys
 from pathlib import Path

@@ -139,7 +139,7 @@ class CrpkoSetupTests(unittest.TestCase):
         self.recipes = self.home/'templates/repos'
         self.recipes.mkdir(parents=True)
         (self.recipes.parent/'tools').mkdir()
-        for source in (TEMPLATES/'tools/crpko.sh', TEMPLATES/'repos/crpko-devops.sh'):
+        for source in (TEMPLATES/'tools/fetch.sh', TEMPLATES/'tools/crpko.sh', TEMPLATES/'repos/crpko-devops.sh'):
             target = self.recipes.parent/source.relative_to(TEMPLATES)
             # Keep all fake installs in a temporary tree, including the absolute Ruby check.
             target.write_text(source.read_text().replace('/usr/bin/ruby',str(self.bin/'ruby'))
