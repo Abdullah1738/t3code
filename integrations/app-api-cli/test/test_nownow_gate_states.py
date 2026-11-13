@@ -223,6 +223,228 @@ class StateFixtures(unittest.TestCase):
         self.assertEqual(flow.stop_unsent()['reason'], 'NOWNOW_STOP_RECONCILIATION_REQUIRED')
         self.assertEqual(sum(op == 'cart_delete' for op, _ in harness.calls), 1)
 
+    def test_acknowledged_delete_recovers_after_recent_cart_timeout(self):
+        flow, harness = f.make_flow(f.happy_responses()); flow.prepare_only()
+        original = self.clear_response(harness)
+        fail_recent = True
+        def request(operation, *args, **kwargs):
+            if operation == 'carts_recent' and fail_recent:
+                raise TimeoutError('fixture recent read timeout')
+            return original(operation, *args, **kwargs)
+        flow.client._request = request
+        with self.assertRaises(lane.native.NowNowError):
+            flow.stop_unsent()
+        self.assertEqual(j.inspect(flow.flow_id)['state'], 'ACTIVE')
+        with self.assertRaisesRegex(j.JournalError, 'JOURNAL_CLEAR_EMPTY_READBACK_REQUIRED'):
+            j.abandon(flow.flow_id)
+        with self.assertRaises(j.JournalError):
+            j.require_account_available('noon', flow.account_hash)
+        fail_recent = False
+        for store, session in ((f.STORE, 'OTHER-SESSION'), ('OTHER-STORE', flow.session_code)):
+            with self.subTest(store=store, session=session):
+                harness.responses['carts_recent'] = {'data': {'carts': [f.nn_state(store=store, session=session)['data']]}}
+                with self.assertRaisesRegex(lane.native.NowNowError, 'NOWNOW_STOP_CLEAR_UNVERIFIED'):
+                    flow.stop_unsent()
+                self.assertEqual(j.inspect(flow.flow_id)['state'], 'ACTIVE')
+        harness.responses['carts_recent'] = {'data': {'carts': []}}
+        self.assertTrue(flow.stop_unsent()['cart_empty'])
+        self.assertEqual(j.inspect(flow.flow_id)['state'], 'RELEASED')
+        j.require_account_available('noon', flow.account_hash)
+        self.assertEqual(sum(op == 'cart_delete' for op, _ in harness.calls), 1)
+        with j._db() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM observations WHERE flow_id=? "
+                "AND operation='cart_delete' AND outcome='CART_READBACK'", (flow.flow_id,)).fetchone()[0], 1)
+
+    def test_acknowledged_delete_is_not_resent_when_cart_reappears(self):
+        flow, harness = f.make_flow(f.happy_responses()); flow.prepare_only()
+        owned = copy.deepcopy(harness.responses['cart_get'])
+        original = self.clear_response(harness)
+        def request(operation, *args, **kwargs):
+            if operation == 'carts_recent':
+                raise TimeoutError('fixture recent read timeout')
+            return original(operation, *args, **kwargs)
+        flow.client._request = request
+        with self.assertRaises(lane.native.NowNowError):
+            flow.stop_unsent()
+        harness.responses['cart_get'] = owned
+        with self.assertRaisesRegex(lane.native.NowNowError, 'NOWNOW_STOP_CLEAR_UNVERIFIED'):
+            flow.stop_unsent()
+        self.assertEqual(j.inspect(flow.flow_id)['state'], 'ACTIVE')
+        self.assertEqual(sum(op == 'cart_delete' for op, _ in harness.calls), 1)
+
+    def test_fresh_cli_recovers_stopped_delete_without_resending(self):
+        import commerce_nownow_cleanup as cleanup
+        original_resume = lane.NowNowOrderFlow.resume_active
+        for prepare_only, remaining in ((True, None), (False, None), (True, 'recent'), (True, 'exact'), (True, 'unknown')):
+            with self.subTest(prepare_only=prepare_only, remaining=remaining), tempfile.TemporaryDirectory() as temp, \
+                    patch.object(j,'ROOT',Path(temp).resolve()/'commerce'), \
+                    patch.object(lane.receipts,'ROOT',Path(temp).resolve()/'commerce'):
+                flow, harness = f.make_flow(f.happy_responses()); flow.prepare_only()
+                owned = copy.deepcopy(harness.responses['cart_get'])
+                original_request = self.clear_response(harness)
+                def fail_recent(operation, *args, **kwargs):
+                    if operation == 'carts_recent':
+                        raise TimeoutError('fixture recent read timeout')
+                    return original_request(operation, *args, **kwargs)
+                flow.client._request = fail_recent
+                with self.assertRaises(lane.native.NowNowError):
+                    flow.stop_unsent()
+                self.assertEqual(j.inspect(flow.flow_id)['state'],'ACTIVE')
+                if remaining == 'recent':
+                    harness.responses['carts_recent'] = {'data': {'carts': [owned['data']]}}
+                elif remaining == 'exact':
+                    harness.responses['cart_get'] = owned
+                elif remaining == 'unknown':
+                    j.observe(flow.flow_id,'cart_delete',outcome='UNKNOWN',evidence_hash='a'*64)
+                if not prepare_only:
+                    with j._db() as db:
+                        db.execute("UPDATE observations SET observed_at=? WHERE flow_id=? AND outcome='NOWNOW_PREPARED'",
+                            (time.time()-3601,flow.flow_id))
+                with patch.object(cli,'CommerceAuth',return_value=SimpleNamespace(noon=f.FakeAuth())), \
+                        patch.object(lane.NowNowOrderFlow,'resume_active',side_effect=lambda fid, **kw:
+                            original_resume(fid, request=original_request, **kw)), \
+                        patch.object(cleanup,'NoonAuthLifecycle',return_value=f.FakeAuth()), \
+                        patch.object(cleanup.native,'native_request',side_effect=original_request), \
+                        patch.object(cli,'card_preflight',return_value=None), \
+                        patch.object(cli,'require_moni_go',return_value=None), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    code = cli.main(['order','nownow','--store-code',f.STORE,
+                        '--product-code',f.PRODUCT,'--quantity','1','--resume-flow',flow.flow_id,
+                        *(['--prepare-only'] if prepare_only else [])])
+                result = json.loads(output.getvalue().splitlines()[-1])
+                self.assertEqual(code,1)
+                if remaining is None:
+                    self.assertTrue(result['cleanup'].get('cart_empty'), result['cleanup'])
+                    self.assertEqual(j.inspect(flow.flow_id)['state'],'RELEASED')
+                    j.require_account_available('noon',flow.account_hash)
+                else:
+                    self.assertFalse(result['cleanup'].get('cart_empty'))
+                    self.assertEqual(j.inspect(flow.flow_id)['state'],'FENCED' if remaining == 'unknown' else 'ACTIVE')
+                    with self.assertRaises(j.JournalError):
+                        j.require_account_available('noon',flow.account_hash)
+                self.assertEqual(sum(op == 'cart_delete' for op, _ in harness.calls),1)
+                self.assertFalse(any(op in ('place','payment_subscription','payment_complete') for op, _ in harness.calls))
+
+    def test_freshness_expiring_inside_financial_transport_keeps_cli_guidance(self):
+        original_resume = lane.NowNowOrderFlow.resume_active
+        for boundary in ('place', 'payment_subscription'):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temp, \
+                    patch.object(j, 'ROOT', Path(temp).resolve()/'commerce'), \
+                    patch.object(lane.receipts, 'ROOT', Path(temp).resolve()/'commerce'):
+                responses = f.happy_responses(payment_config={})
+                responses['cart_get']['data']['prepaidPaymentMisc']['isCvvRequired'] = boundary == 'payment_subscription'
+                flow, harness = f.make_flow(responses); flow.prepare_only()
+                auth = f.FakeAuth()
+                original_auth = auth.revalidate
+                def revalidate(service, *, deadline=None, **kw):
+                    # Headers are refreshed inside _call, immediately before the
+                    # journal reservation; CLI entry and review already passed.
+                    if inside[0] == boundary:
+                        with j._db() as db:
+                            db.execute("UPDATE observations SET observed_at=? WHERE flow_id=? AND outcome='NOWNOW_PREPARED'",
+                                (time.time()-3601, flow.flow_id))
+                    return original_auth(service, deadline=deadline, **kw)
+                inside = [None]
+                auth.revalidate = revalidate
+                def resume(fid, **kw):
+                    resumed = original_resume(fid, request=self.clear_response(harness), **kw)
+                    headers = resumed.client._header_provider
+                    def header_provider(operation, deadline):
+                        inside[0] = operation
+                        return headers(operation, deadline)
+                    resumed.client._header_provider = header_provider
+                    return resumed
+                with patch.object(cli,'CommerceAuth',return_value=SimpleNamespace(noon=auth)), \
+                        patch.object(cli,'input_items',return_value=flow.items), \
+                        patch.object(lane.NowNowOrderFlow,'resume_active',side_effect=resume), \
+                        patch('noon_cvv.encrypt',return_value={'encCvv':'fixture','publicKeyName':'fixture'}), \
+                        patch.object(cli,'cvv_from_keychain',return_value=b'123'), \
+                        patch.object(cli,'card_preflight',return_value=None), \
+                        patch.object(cli,'require_moni_go',return_value=None), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    code = cli.main(['order','nownow','--store-code',f.STORE,
+                        '--product-code',f.PRODUCT,'--quantity','1','--resume-flow',flow.flow_id,'--cvv-from-keychain'])
+                result = json.loads(output.getvalue().splitlines()[-1])
+                self.assertEqual(code,1)
+                self.assertEqual(result['error'],'NOWNOW_FRESH_PREPARE_REQUIRED')
+                self.assertIn('re-run --prepare-only',result['next_action'])
+                self.assertFalse(result['financial_send'])
+                self.assertFalse(result['financial_retry'])
+                self.assertFalse(any(op in ('place','payment_subscription','payment_complete') for op, _ in harness.calls))
+                self.assertEqual(j.inspect(flow.flow_id)['reserved_minor'],0)
+
+    def test_early_prepare_failure_can_recover_delete_on_fresh_cli(self):
+        import commerce_nownow_cleanup as cleanup
+        responses = f.happy_responses()
+        responses['cart_get']['data']['checkoutWarningPopup'] = {'title':'Review cart'}
+        flow, harness = f.make_flow(responses)
+        original_request = self.clear_response(harness)
+        def fail_recent(operation, *args, **kwargs):
+            if operation == 'cart_delete':
+                saved = cleanup.stopped_preparation(flow.flow_id)
+                self.assertEqual(saved['session'],flow.session_code)
+                self.assertEqual(saved['binding'],j.binding(flow.flow_id))
+                self.assertEqual((j.ROOT/'nownow-stopped'/(flow.flow_id+'.json')).stat().st_mode & 0o777,0o600)
+                self.assertNotIn('cookie',json.dumps(saved))
+            if operation == 'carts_recent' and any(op == 'cart_delete' for op, _ in harness.calls):
+                raise TimeoutError('fixture recent read timeout')
+            return original_request(operation, *args, **kwargs)
+        flow.client._request = fail_recent
+        command = ['order','nownow','--store-code',f.STORE,
+                   '--product-code',f.PRODUCT,'--quantity','1','--prepare-only']
+        with patch.object(cli,'CommerceAuth',return_value=SimpleNamespace(noon=f.FakeAuth())), \
+                patch.object(lane,'NowNowOrderFlow',return_value=flow), \
+                patch.object(cli,'card_preflight',return_value=None), \
+                patch.object(cli,'require_moni_go',return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()) as first_output:
+            self.assertEqual(cli.main(command),1)
+        first = json.loads(first_output.getvalue().splitlines()[-1])
+        self.assertEqual(first['error'],'NOWNOW_CHECKOUT_WARNING_REQUIRES_REVIEW')
+        self.assertEqual(j.inspect(flow.flow_id)['state'],'ACTIVE')
+        self.assertFalse((j.ROOT/'nownow'/(flow.flow_id+'.json')).exists())
+        original_resume = lane.NowNowOrderFlow.resume_active
+        with patch.object(cli,'CommerceAuth',return_value=SimpleNamespace(noon=f.FakeAuth())), \
+                patch.object(lane.NowNowOrderFlow,'resume_active',side_effect=lambda fid, **kw:
+                    original_resume(fid, request=original_request, **kw)), \
+                patch.object(cleanup,'NoonAuthLifecycle',return_value=f.FakeAuth()), \
+                patch.object(cleanup.native,'native_request',side_effect=original_request), \
+                patch.object(cli,'card_preflight',return_value=None), \
+                patch.object(cli,'require_moni_go',return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()) as second_output:
+            self.assertEqual(cli.main([*command,'--resume-flow',flow.flow_id]),1)
+        second = json.loads(second_output.getvalue().splitlines()[-1])
+        self.assertTrue(second['cleanup'].get('cart_empty'),second['cleanup'])
+        self.assertEqual(j.inspect(flow.flow_id)['state'],'RELEASED')
+        j.require_account_available('noon',flow.account_hash)
+        self.assertEqual(sum(op == 'cart_delete' for op, _ in harness.calls),1)
+        self.assertFalse(any(op in ('place','payment_subscription','payment_complete') for op, _ in harness.calls))
+
+    def test_unexpected_reservation_error_stays_generic_without_private_text(self):
+        flow, harness = f.make_flow(f.happy_responses()); flow.prepare_only()
+        flow.client._request = self.clear_response(harness)
+        original_consume = j.consume
+        def consume(fid, operation, **kw):
+            if kw['kind'] == 'place':
+                raise RuntimeError('private fixture callback text')
+            return original_consume(fid, operation, **kw)
+        original_resume = lane.NowNowOrderFlow.resume_active
+        with patch.object(cli,'CommerceAuth',return_value=SimpleNamespace(noon=f.FakeAuth())), \
+                patch.object(cli,'input_items',return_value=flow.items), \
+                patch.object(lane.NowNowOrderFlow,'resume_active',side_effect=lambda fid, **kw:
+                    original_resume(fid, request=self.clear_response(harness), **kw)), \
+                patch.object(j,'consume',side_effect=consume), \
+                patch.object(cli,'card_preflight',return_value=None), \
+                patch.object(cli,'require_moni_go',return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            code = cli.main(['order','nownow','--store-code',f.STORE,
+                '--product-code',f.PRODUCT,'--quantity','1','--resume-flow',flow.flow_id])
+        self.assertEqual(code,1)
+        result = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual(result['error'],'SEND_RESERVATION_FAILED')
+        self.assertNotIn('next_action',result)
+        self.assertNotIn('private fixture callback text',output.getvalue())
+        self.assertNotIn('place',[op for op, _ in harness.calls])
+
     def test_replacement_sessions_are_never_deleted_on_cli_resume(self):
         import commerce_nownow_cleanup as cleanup
         import commerce_preorder_release as release

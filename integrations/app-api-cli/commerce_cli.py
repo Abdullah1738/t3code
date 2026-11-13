@@ -386,6 +386,11 @@ def order_nownow(args):
     try:
         return _order_nownow(args, flows)
     except BaseException as exc:
+        from noon_nownow_checkout import NowNowError
+        if (isinstance(exc, NowNowError) and exc.code == 'SEND_RESERVATION_FAILED'
+                and not exc.may_have_sent and isinstance(exc.__cause__, journal.PaymentError)
+                and exc.__cause__.code == 'NOWNOW_FRESH_PREPARE_REQUIRED'):
+            exc = exc.__cause__
         try:
             if flows:
                 cleanup = flows[-1].stop_unsent()
@@ -399,7 +404,7 @@ def order_nownow(args):
                        (str(stopped) if re.fullmatch(r'[A-Z][A-Z0-9_]+', str(stopped)) else 'NOWNOW_STOP_CLEAR_UNVERIFIED')}
         if isinstance(exc, journal.PaymentError):
             exc.details['cleanup'] = cleanup
-            raise
+            raise exc
         if isinstance(exc, Exception):
             code = getattr(exc, 'code', None) or str(exc)
             if not re.fullmatch(r'[A-Z][A-Z0-9_]+', code):

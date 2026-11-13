@@ -29,6 +29,38 @@ def _require_source(condition, code):
         j.fail(code)
 
 
+def retain_stopped_preparation(flow):
+    binding = j.binding(flow.flow_id)
+    j.require_nownow_session(flow.flow_id, j.digest({'session': flow.owned_session_code}))
+    state = {'binding': binding, 'session': flow.owned_session_code, 'store': flow.store_code,
+             'items': flow.items, 'address_hash': flow.address_hash}
+    root = j.ROOT / 'nownow-stopped'
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = root / (flow.flow_id + '.json')
+    if path.exists():
+        _require_source(json.loads(path.read_text()) == state, 'NOWNOW_STOP_BINDING_CHANGED')
+        return
+    with path.open('x') as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        json.dump(state, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def stopped_preparation(flow_id):
+    try:
+        state = json.loads((j.ROOT / 'nownow-stopped' / (flow_id + '.json')).read_text())
+    except FileNotFoundError:
+        # Older stopped runs may have a full review but no cleanup record.
+        retained = load(flow_id)
+        p = retained['review']['projection']
+        state = {'binding': retained['binding'], 'session': p['session'], 'store': p['store'],
+                 'items': retained['items'], 'address_hash': retained['address_hash']}
+    _require_source(state['binding'] == j.binding(flow_id), 'NOWNOW_STOP_BINDING_CHANGED')
+    j.require_nownow_session(flow_id, j.digest({'session': state['session']}))
+    return state
+
+
 def stop_retained_preparation(flow_id):
     state = j.inspect(flow_id)
     _require_source(state['app'] == 'noon' and state['vertical'] == 'nownow', 'NOWNOW_FLOW_REQUIRED')
@@ -36,6 +68,28 @@ def stop_retained_preparation(flow_id):
             or any(o['state'] != 'OBSERVED' or o['kind'] in ('place', 'payment', 'preauthorize', 'prepay')
                    for o in state['operations'])):
         return {'cart_checked': False, 'reason': 'NOWNOW_STOP_RECONCILIATION_REQUIRED'}
+    if any(o['name'] == 'cart_delete' for o in state['operations']):
+        # Resume may refuse an already-empty cart. Restore only its original
+        # ownership so stop_unsent can verify the existing deletion's readback.
+        from commerce_nownow_order import NowNowOrderFlow
+        import commerce_receipts as receipts
+        retained = stopped_preparation(flow_id)
+        flow = object.__new__(NowNowOrderFlow)
+        flow.flow_id, flow.auth = flow_id, NoonAuthLifecycle()
+        flow.snapshot = flow._snapshot()
+        flow.account_hash, flow.address_hash = retained['binding']['account_hash'], retained['address_hash']
+        _require_source(flow.snapshot.account_ref == flow.account_hash and flow.snapshot.address_ref == flow.address_hash,
+                        'NOWNOW_CLEAR_ACCOUNT_HOME_CHANGED')
+        flow.store_code, flow.items = retained['store'], retained['items']
+        flow.session_code = flow.owned_session_code = retained['session']
+        flow.cart_hash = j.digest({'flow': flow_id, 'store': flow.store_code})
+        flow.opened, flow.review = True, None
+        flow.expected = flow.operation_name = None
+        flow.receipt_store, flow.pending_cookies = receipts.load(**retained['binding']), []
+        flow.client = native.NowNowCheckout(AccountHome('nownow', flow.account_hash, flow.address_hash, time.time()),
+            header_provider=flow._headers, request=native.native_request, receipt=flow._receipt,
+            response_cookies=flow._cookies)
+        return flow.stop_unsent()
     j.abandon(flow_id)
     return clear_cart(flow_id)
 

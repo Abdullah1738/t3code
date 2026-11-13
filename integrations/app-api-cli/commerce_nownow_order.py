@@ -703,6 +703,8 @@ class NowNowOrderFlow:
         state = journal.inspect(flow_id)
         if binding['app'] != 'noon' or binding['vertical'] != 'nownow':
             _fail('NOWNOW_FLOW_REQUIRED')
+        if any(x['name'] == 'cart_delete' for x in state['operations']):
+            _fail('NOWNOW_STOP_CLEANUP_REQUIRED')
         if state['state'] != 'ACTIVE' or state['order_id'] \
                 or any(x['kind'] == 'place' for x in state['operations']) \
                 or any(x['state'] != 'OBSERVED' for x in state['operations']):
@@ -828,10 +830,12 @@ class NowNowOrderFlow:
         if not getattr(self, 'owned_session_code', None) or self.session_code != self.owned_session_code:
             return {'cart_checked': False, 'reason': 'NOWNOW_STOP_OWNERSHIP_UNPROVEN'}
         journal.require_nownow_session(self.flow_id, journal.digest({'session': self.session_code}))
+        deleted = 'cart_delete' in self.consumed()
         body = {'storeCode': self.store_code}
         self._expect('cart_get', body)
         read = self.client.get_cart(self.store_code, before_send=self._before)
         if read.projection.get('empty') is not True:
+            native.require(not deleted, 'NOWNOW_STOP_CLEAR_UNVERIFIED')
             row = read.wire['data']
             from noon_checkout import fingerprint
             native.require(row.get('checkoutSessionCode') == self.session_code
@@ -843,15 +847,20 @@ class NowNowOrderFlow:
                 and all(not i.get('modifiers') and not i.get('notes') for i in row['products']),
                 'NOWNOW_STOP_CART_CHANGED')
             self.guard_active_orders()
+            from commerce_nownow_cleanup import retain_stopped_preparation
+            retain_stopped_preparation(self)
             self._expect('cart_delete', {'sessionCode': self.session_code})
             self.client.delete_cart(self.session_code, before_send=self._before)
+            deleted = True
             self._expect('cart_get', body)
             read = self.client.get_cart(self.store_code, before_send=self._before)
-            native.require(read.wire.get('data', 'missing') is None and read.projection.get('empty') is True,
-                           'NOWNOW_STOP_CLEAR_UNVERIFIED')
-            recent = self.client.recent_carts().projection['carts']
-            native.require(not any(c.get('store_code') == self.store_code for c in recent),
-                           'NOWNOW_STOP_CLEAR_UNVERIFIED')
+        native.require(read.wire.get('data', 'missing') is None and read.projection.get('empty') is True,
+                       'NOWNOW_STOP_CLEAR_UNVERIFIED')
+        recent = self.client.recent_carts().projection['carts']
+        native.require(not any(c.get('store_code') == self.store_code
+                               or c.get('session_code') == self.owned_session_code for c in recent),
+                       'NOWNOW_STOP_CLEAR_UNVERIFIED')
+        if deleted:
             journal.observe(self.flow_id, 'cart_delete', outcome='CART_READBACK',
                             evidence_hash=journal.digest({'empty': True, 'recent': recent}))
         journal.abandon(self.flow_id)
