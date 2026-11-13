@@ -88,7 +88,12 @@ import * as Stream from "effect/Stream";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
-import { actorKey, KanbanStore, KanbanStoreError } from "../store/KanbanStore.ts";
+import {
+  actorKey,
+  KanbanStore,
+  KanbanStoreError,
+  type SlotEventWhy,
+} from "../store/KanbanStore.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import * as AskFeed from "./askFeed.ts";
 import * as Asks from "./asks.ts";
@@ -1628,6 +1633,11 @@ const make = Effect.gen(function* () {
                       { discard: true },
                     );
               return touching(threadId, run).pipe(
+                Effect.tap(() =>
+                  stop === undefined
+                    ? Effect.void
+                    : dropHold(ThreadId.make(threadId), "thread_stopped"),
+                ),
                 // Closed durably before the lock is released: a restart must not
                 // reload a stop that already ran and cut the run a send starts
                 // next (packages/protocol-models/stops.qnt, `stepVolatile`).
@@ -2050,9 +2060,11 @@ const make = Effect.gen(function* () {
     });
   // Discussions whose owner message was already reminded: discussion id -> its lastSeq then.
   const ownerWaits = yield* Ref.make<ReadonlyMap<KanbanDiscussionId, number>>(new Map());
-  const hold = (threadId: ThreadId, boardId: string, pool: string) =>
+  const hold = (threadId: ThreadId, boardId: string, pool: string, cardId: string) =>
     Effect.flatMap(nowMillis, (at) =>
-      Ref.update(holds, (all) => new Map(all).set(threadId, { boardId, pool, at })),
+      Ref.update(holds, (all) => new Map(all).set(threadId, { boardId, pool, at })).pipe(
+        Effect.andThen(syncSlot(boardId, threadId, "hold", cardId)),
+      ),
     );
   /** One board's held slots, thread id to pool, as the rules take them. `except`: a start's own key. */
   const boardHolds = (boardId: string, except?: string) =>
@@ -2132,13 +2144,20 @@ const make = Effect.gen(function* () {
   };
   type WritersRunning = ReadonlyMap<KanbanCardId, WriterAsk | null>;
   const titlesRunning = yield* Ref.make<WritersRunning>(new Map());
-  const dropHold = (threadId: ThreadId) =>
-    Ref.update(holds, (all) => {
-      if (!all.has(threadId)) return all;
+  const dropHold = Effect.fn("KanbanService.dropHold")(function* (
+    threadId: ThreadId,
+    why: SlotEventWhy = "hold_end",
+    cardId: string | null = null,
+  ) {
+    const held = (yield* Ref.get(holds)).get(threadId);
+    if (held === undefined) return;
+    yield* Ref.update(holds, (all) => {
       const next = new Map(all);
       next.delete(threadId);
       return next;
     });
+    yield* syncSlot(held.boardId, threadId, why, cardId);
+  });
 
   const nowIso = DateTime.now.pipe(Effect.map(DateTime.formatIso));
   const nowMillis = DateTime.now.pipe(Effect.map(DateTime.toEpochMillis));
@@ -2385,6 +2404,85 @@ const make = Effect.gen(function* () {
     } satisfies KanbanBoardSnapshot;
   });
 
+  // Keep each board/thread's persisted pools, including transient multi-pool states.
+  // Only update the cache after its row commits, so a failed append remains retryable.
+  const slotState = new Map<string, Map<string, Set<string>>>();
+  const slotWrites = Semaphore.makeUnsafe(1);
+  const syncSlot = Effect.fn("KanbanService.syncSlot")(function* (
+    boardId: string,
+    threadId: string,
+    why: SlotEventWhy,
+    cardId: string | null,
+  ) {
+    yield* SavedWrite.bestEffort(
+      slotWrites.withPermits(1)(
+        Effect.gen(function* () {
+          const cards = (yield* rawStore.cardsByThread(threadId)).filter(
+            (card) => card.boardId === boardId,
+          );
+          const held = (yield* Ref.get(holds)).get(ThreadId.make(threadId));
+          const current = Rules.poolThreads(
+            cards,
+            new Map(held?.boardId === boardId ? [[threadId, held.pool]] : []),
+          );
+          const board = slotState.get(boardId) ?? new Map<string, Set<string>>();
+          const before = board.get(threadId) ?? new Set<string>();
+          const at = yield* nowIso;
+          for (const kind of ["release", "take"] as const) {
+            for (const poolKey of kind === "release" ? [...before] : current.keys()) {
+              if (kind === "release" ? current.has(poolKey) : before.has(poolKey)) continue;
+              yield* Effect.uninterruptible(
+                Effect.gen(function* () {
+                  yield* rawStore.addSlotEvent({
+                    boardId,
+                    poolKey,
+                    threadId,
+                    cardId,
+                    kind,
+                    at,
+                    why,
+                  });
+                  if (kind === "release") before.delete(poolKey);
+                  else before.add(poolKey);
+                  if (before.size === 0) board.delete(threadId);
+                  else board.set(threadId, before);
+                  slotState.set(boardId, board);
+                }),
+              );
+            }
+          }
+        }),
+      ),
+      undefined,
+    );
+  });
+  const seedSlots = Effect.fn("KanbanService.seedSlots")(function* () {
+    const rows = yield* rawStore.openSlots();
+    slotState.clear();
+    for (const row of rows) {
+      const board = slotState.get(row.boardId) ?? new Map<string, Set<string>>();
+      const pools = board.get(row.threadId) ?? new Set<string>();
+      pools.add(row.poolKey);
+      board.set(row.threadId, pools);
+      slotState.set(row.boardId, board);
+    }
+  });
+  const reconcileSlots = Effect.fn("KanbanService.reconcileSlots")(function* () {
+    const affected = new Map<string, Set<string>>();
+    for (const [boardId, threads] of slotState) affected.set(boardId, new Set(threads.keys()));
+    for (const board of yield* rawStore.boards) {
+      const threads = affected.get(board.id) ?? new Set<string>();
+      for (const card of yield* rawStore.cards(board.id)) {
+        if (card.activeThreadId !== null && card.activePool !== null)
+          threads.add(card.activeThreadId);
+      }
+      affected.set(board.id, threads);
+    }
+    for (const [boardId, threads] of affected) {
+      for (const threadId of threads) yield* syncSlot(boardId, threadId, "restart", null);
+    }
+  });
+
   // Callers hold the lock, and log a card's event before saving it: clients
   // re-read the card's history when its change is published.
 
@@ -2393,7 +2491,9 @@ const make = Effect.gen(function* () {
     card: KanbanCard,
     by?: KanbanActor,
     dispatchMetadata = false,
+    slotWhy?: SlotEventWhy | false,
   ) {
+    const previous = yield* SavedWrite.bestEffort(rawStore.card(card.id), null);
     yield* Effect.uninterruptible(
       Effect.gen(function* () {
         const write = store.putCard(card);
@@ -2402,6 +2502,21 @@ const make = Effect.gen(function* () {
         if (card.stalled?.by._tag === "evaluator") yield* forgetStepWait(card.id);
       }),
     );
+    if (
+      slotWhy !== false &&
+      (previous?.activePool !== card.activePool || previous?.activeThreadId !== card.activeThreadId)
+    ) {
+      const why =
+        slotWhy ??
+        (previous?.activeThreadId === card.activeThreadId &&
+        previous?.activePool !== null &&
+        card.activePool !== null
+          ? "pool_moved"
+          : "card_left");
+      for (const threadId of new Set([previous?.activeThreadId, card.activeThreadId])) {
+        if (threadId != null) yield* syncSlot(card.boardId, threadId, why, card.id);
+      }
+    }
     yield* SavedWrite.bestEffort(
       publish(card.boardId, by === undefined ? { _tag: "card", card } : { _tag: "card", card, by }),
       undefined,
@@ -2613,7 +2728,7 @@ const make = Effect.gen(function* () {
         others.every((other) => delivering.has(other.id)) &&
         card.activePool !== null
       ) {
-        yield* hold(threadId, card.boardId, card.activePool);
+        yield* hold(threadId, card.boardId, card.activePool, card.id);
       }
       return others.length > 0;
     }
@@ -2653,6 +2768,7 @@ const make = Effect.gen(function* () {
     for (const threadId of new Set([card.activeThreadId, card.workThreadId, card.reviewThreadId])) {
       if (threadId === null) continue;
       const shared = yield* letGo(card, false, what, { threadId, cancelQueued: true });
+      if (!shared) yield* dropHold(threadId, "thread_stopped", card.id);
       if (threadId === card.workThreadId && shared) kept = true;
     }
     return kept;
@@ -6379,6 +6495,7 @@ const make = Effect.gen(function* () {
 
   const saveDispatchCard = Effect.fn("KanbanService.saveDispatchCard")(function* (
     card: KanbanCard,
+    slotWhy?: SlotEventWhy,
   ) {
     const current = yield* cardOf(card.id);
     const saved = {
@@ -6387,7 +6504,7 @@ const make = Effect.gen(function* () {
       discussionId: current.discussionId,
       updatedAt: yield* nowIso,
     };
-    yield* saveCard(saved);
+    yield* saveCard(saved, undefined, false, slotWhy);
     return saved;
   });
 
@@ -6651,7 +6768,6 @@ const make = Effect.gen(function* () {
     const priorHold = (yield* Ref.get(holds)).get(threadId);
     if (dispatch.role === "work") {
       yield* store.addThreadCard(threadId, card.id, at);
-      if (reused === null) yield* dropHold(threadId);
     }
     const to: KanbanStage = dispatch.role === "work" ? "working" : "in_review";
     const next: KanbanCard = {
@@ -6753,7 +6869,7 @@ const make = Effect.gen(function* () {
     }
     yield* Effect.gen(function* () {
       yield* logEvent(next, system, "moved", { fromStage: card.stage, toStage: to });
-      destination.expectedCard = yield* saveDispatchCard(next);
+      destination.expectedCard = yield* saveDispatchCard(next, dispatch.joins ? "join" : "start");
       // The saved claim replaces the pending reservation, including its batch count.
       starting.delete(`${board.id}:${card.id}`);
       if (reused !== null) {
@@ -6764,7 +6880,7 @@ const make = Effect.gen(function* () {
       }
       yield* locks.attached(threadId);
       if (adoptRunning) {
-        yield* dropHold(threadId);
+        yield* dropHold(threadId, "join");
         return;
       }
       if (reused !== null && key !== null) {
@@ -6797,6 +6913,7 @@ const make = Effect.gen(function* () {
               next.delete(reused);
               return next;
             });
+            yield* syncSlot(board.id, reused, "join", card.id);
           }),
         );
       }
@@ -8576,15 +8693,17 @@ const make = Effect.gen(function* () {
       evaluatorMutex = Semaphore.makeUnsafe(1);
       evaluating.set(boardId, evaluatorMutex);
     }
-    yield* locks.outside(
-      evaluatorMutex.withPermitsIfAvailable(1)(
-        locks.fresh(locks.run(drainEvaluatorQueue(KanbanBoardId.make(boardId)))),
-      ),
-    ).pipe(
-      Effect.catchCause((cause) =>
-        Effect.logWarning("kanban evaluator queue delivery pending", { boardId, cause }),
-      ),
-    );
+    yield* locks
+      .outside(
+        evaluatorMutex.withPermitsIfAvailable(1)(
+          locks.fresh(locks.run(drainEvaluatorQueue(KanbanBoardId.make(boardId)))),
+        ),
+      )
+      .pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("kanban evaluator queue delivery pending", { boardId, cause }),
+        ),
+      );
     for (const threadId of yield* Ref.get(unresolvedTurnEnds)) {
       const planned = turnEndLinks.get(threadId);
       const link =
@@ -10922,12 +11041,12 @@ const make = Effect.gen(function* () {
     const link = yield* store.threadLink(threadId);
     if (link?.cardId) yield* store.addThreadCard(threadId, link.cardId, link.startedAt);
     yield* store.addThreadCard(threadId, card.id, at);
-    yield* dropHold(threadId);
     if (card.workThreadId !== threadId) {
       yield* logEvent(next, actor, "thread", { body: `work thread ${threadId}` });
     }
     yield* logEvent(next, actor, "moved", { fromStage: card.stage, toStage: "working", body: how });
-    yield* saveCard(next);
+    yield* saveCard(next, undefined, false, "join");
+    yield* dropHold(threadId, "join");
     return {
       card: next,
       brief: Briefs.claimBrief(next, yield* goalOf(next), card.wakeNote),
@@ -11177,7 +11296,7 @@ const make = Effect.gen(function* () {
         // cancellation can run cleanup against a partially updated thread.
         yield* Effect.uninterruptible(
           Effect.gen(function* () {
-            yield* saveCard(saved);
+            yield* saveCard(saved, undefined, false, false);
             if (
               workThread !== null &&
               !modelSelectionsEqual(card.model, saved.model) &&
@@ -11189,7 +11308,12 @@ const make = Effect.gen(function* () {
               const newPool = Rules.poolOf(pools, saved.model);
               for (const other of yield* store.cardsByThread(workThread)) {
                 if (other.id === saved.id) continue;
-                yield* saveCard({ ...other, model: saved.model, activePool: newPool });
+                yield* saveCard(
+                  { ...other, model: saved.model, activePool: newPool },
+                  undefined,
+                  false,
+                  false,
+                );
               }
               const held = (yield* Ref.get(holds)).get(workThread);
               if (held !== undefined && held.boardId === saved.boardId && held.pool !== newPool) {
@@ -11199,7 +11323,28 @@ const make = Effect.gen(function* () {
               }
             }
             yield* releaseModel;
-          }),
+          }).pipe(
+            Effect.ensuring(
+              Effect.gen(function* () {
+                for (const threadId of new Set([
+                  card.activeThreadId,
+                  saved.activeThreadId,
+                  workThread,
+                ])) {
+                  if (threadId !== null)
+                    yield* syncSlot(
+                      saved.boardId,
+                      threadId,
+                      !modelSelectionsEqual(card.model, saved.model) ||
+                        (card.activePool !== saved.activePool && saved.activePool !== null)
+                        ? "pool_moved"
+                        : "card_left",
+                      saved.id,
+                    );
+                }
+              }),
+            ),
+          ),
         );
         yield* laterEvaluatorTurn(card, saved, actor);
         if (patch.prompt?.trim() && patch.prompt.trim() !== card.prompt && !patch.title) {
@@ -11443,7 +11588,11 @@ const make = Effect.gen(function* () {
             return plan.card;
           }),
         );
-        if (restored !== null) yield* publish(restored.boardId, { _tag: "card", card: restored });
+        if (restored !== null) {
+          if (restored.activeThreadId !== null)
+            yield* syncSlot(restored.boardId, restored.activeThreadId, "restore", restored.id);
+          yield* publish(restored.boardId, { _tag: "card", card: restored });
+        }
       }),
       input.cardId,
     );
@@ -12867,7 +13016,7 @@ const make = Effect.gen(function* () {
             toStage: next.stage,
             body: next.stalled?.reason ?? null,
           });
-          yield* saveCard(next);
+          yield* saveCard(next, undefined, false, "thread_stopped");
           return next;
         }
         if (action === "reset") {
@@ -13036,6 +13185,27 @@ const make = Effect.gen(function* () {
       [{ from: from.key, pool: to }],
       moved.map((entry) => entry.card),
     );
+    const movedThreads = new Map<string, string | null>();
+    for (const { card } of moved) {
+      if (card.activeThreadId !== null) movedThreads.set(card.activeThreadId, card.id);
+    }
+    for (const [threadId, held] of yield* Ref.get(holds)) {
+      if (held.boardId === board.id && held.pool === from.key && !movedThreads.has(threadId))
+        movedThreads.set(threadId, null);
+    }
+    yield* Ref.update(
+      holds,
+      (all) =>
+        new Map(
+          [...all].map(([threadId, held]) =>
+            held.boardId === board.id && held.pool === from.key
+              ? [threadId, { ...held, pool: to.key }]
+              : [threadId, held],
+          ),
+        ),
+    );
+    for (const [threadId, cardId] of movedThreads)
+      yield* syncSlot(board.id, threadId, "pool_moved", cardId);
     const actor: KanbanActor = { _tag: "system", component: "pools" };
     const level = Rules.modelLevel(to.model) ?? "default";
     const switched = new Set<string>();
@@ -13061,7 +13231,7 @@ const make = Effect.gen(function* () {
     // name it.
     const held = yield* Ref.get(holds);
     for (const [threadId, hold] of held) {
-      if (hold.boardId !== board.id || hold.pool !== from.key) continue;
+      if (hold.boardId !== board.id || !movedThreads.has(threadId)) continue;
       if (!switched.has(threadId)) {
         switched.add(threadId);
         yield* threads
@@ -13073,17 +13243,6 @@ const make = Effect.gen(function* () {
           );
       }
     }
-    yield* Ref.update(
-      holds,
-      (all) =>
-        new Map(
-          [...all].map(([threadId, hold]) =>
-            hold.boardId === board.id && hold.pool === from.key
-              ? [threadId, { ...hold, pool: to.key }]
-              : [threadId, hold],
-          ),
-        ),
-    );
   });
 
   /** Moves the pool at `replaces` to `model`'s level, keeping its row and, unless given, its slots. */
@@ -13770,6 +13929,17 @@ const make = Effect.gen(function* () {
         .filter((pool) => moves.has(pool.key))
         .map((pool) => ({ from: pool.key, pool: { ...pool, key: moves.get(pool.key)! } }));
       yield* store.rekeyBoard(board.id, rekeyed, cards);
+      for (const card of cards) {
+        if (card.activeThreadId !== null) {
+          const tracked = slotState.get(board.id)?.has(card.activeThreadId) === true;
+          yield* syncSlot(
+            board.id,
+            card.activeThreadId,
+            tracked ? "pool_moved" : "restart",
+            tracked ? card.id : null,
+          );
+        }
+      }
       for (const { from, pool } of rekeyed) {
         yield* Effect.logInfo(`board ${board.slug}: pool ${from} is now ${pool.key}`);
       }
@@ -13784,8 +13954,13 @@ const make = Effect.gen(function* () {
   yield* BoardsDatabase.onReady(
     locks
       .run(
-        Effect.flatMap(store.boards, (boards) =>
-          Effect.forEach(boards, rekeyBoard, { discard: true }),
+        seedSlots().pipe(
+          Effect.andThen(
+            Effect.flatMap(store.boards, (boards) =>
+              Effect.forEach(boards, rekeyBoard, { discard: true }),
+            ),
+          ),
+          Effect.andThen(reconcileSlots()),
         ),
       )
       .pipe(

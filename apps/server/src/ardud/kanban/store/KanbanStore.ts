@@ -88,7 +88,38 @@ interface IdJsonRow extends JsonRow {
 export type NewCardEvent = Omit<KanbanCardEvent, "id">;
 export type NewScriptRun = Omit<KanbanScriptRun, "id">;
 
+export type SlotEventWhy =
+  | "start"
+  | "join"
+  | "hold"
+  | "hold_end"
+  | "card_left"
+  | "thread_stopped"
+  | "pool_moved"
+  | "restart"
+  | "restore";
+
+export interface SlotEvent {
+  readonly id: number;
+  readonly boardId: string;
+  readonly poolKey: string;
+  readonly threadId: string;
+  readonly cardId: string | null;
+  readonly kind: "take" | "release";
+  readonly at: string;
+  readonly why: SlotEventWhy;
+}
+
 export interface KanbanStoreShape {
+  readonly addSlotEvent: (row: Omit<SlotEvent, "id">) => Effect.Effect<void, KanbanStoreError>;
+  readonly slotEvents: (filter: {
+    readonly boardId: string;
+    readonly from: string;
+    readonly to: string;
+  }) => Effect.Effect<ReadonlyArray<SlotEvent>, KanbanStoreError>;
+  readonly openSlots: (
+    boardId?: string,
+  ) => Effect.Effect<ReadonlyArray<SlotEvent>, KanbanStoreError>;
   readonly boards: Effect.Effect<ReadonlyArray<KanbanBoard>, KanbanStoreError>;
   readonly board: (boardId: KanbanBoardId) => Effect.Effect<KanbanBoard | null, KanbanStoreError>;
   readonly putBoard: (board: KanbanBoard) => Effect.Effect<void, KanbanStoreError>;
@@ -542,6 +573,38 @@ const make = Effect.gen(function* () {
         `;
       }),
     );
+  const slotColumns = sql.literal(
+    'id, board_id AS "boardId", pool_key AS "poolKey", thread_id AS "threadId", card_id AS "cardId", kind, at, why',
+  );
+  const addSlotEvent = (row: Omit<SlotEvent, "id">) =>
+    run(
+      "write slot event",
+      sql`
+      INSERT INTO ardud_kanban_slot_events (board_id, pool_key, thread_id, card_id, kind, at, why)
+      VALUES (${row.boardId}, ${row.poolKey}, ${row.threadId}, ${row.cardId}, ${row.kind}, ${row.at}, ${row.why})
+    `.pipe(Effect.asVoid),
+    );
+  const slotEvents: KanbanStoreShape["slotEvents"] = ({ boardId, from, to }) =>
+    runRead(
+      "read slot events",
+      sql<SlotEvent>`
+      SELECT ${slotColumns} FROM ardud_kanban_slot_events
+      WHERE board_id = ${boardId} AND at >= ${from} AND at < ${to} ORDER BY id
+    `,
+    );
+  const openSlots: KanbanStoreShape["openSlots"] = (boardId) =>
+    runRead(
+      "read open slots",
+      sql<SlotEvent>`
+      SELECT ${slotColumns} FROM ardud_kanban_slot_events
+      WHERE id IN (
+        SELECT MAX(id) FROM ardud_kanban_slot_events
+        ${boardId === undefined ? sql.literal("") : sql`WHERE board_id = ${boardId}`}
+        GROUP BY board_id, pool_key, thread_id
+      ) AND kind = 'take' ORDER BY id
+    `,
+    );
+
   const addCardEvent = (event: NewCardEvent) =>
     run(
       "write card event",
@@ -1055,6 +1118,9 @@ const make = Effect.gen(function* () {
     cardsInStage,
     nextCardNumber,
     putCard,
+    addSlotEvent,
+    slotEvents,
+    openSlots,
     addCardEvent,
     cardEvents,
     goals,

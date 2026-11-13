@@ -1074,3 +1074,35 @@ it.live(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   30_000,
 );
+
+it.effect("slot event windows and open slots keep board, pool and thread identities separate", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const base = {
+      boardId: "b",
+      poolKey: "p",
+      threadId: "t",
+      cardId: null,
+      at,
+      why: "start" as const,
+    };
+    yield* store.addSlotEvent({ ...base, kind: "take" });
+    yield* store.addSlotEvent({ ...base, poolKey: "other", kind: "take" });
+    yield* store.addSlotEvent({ ...base, boardId: "other", kind: "take" });
+    yield* store.addSlotEvent({ ...base, kind: "release", why: "card_left" });
+    yield* store.addSlotEvent({ ...base, threadId: "other", kind: "take" });
+    assert.deepStrictEqual(
+      (yield* store.openSlots()).map((row) => row.id),
+      [2, 3, 5],
+    );
+    assert.deepStrictEqual(
+      (yield* store.openSlots("b")).map((row) => row.id),
+      [2, 5],
+    );
+    assert.deepStrictEqual(
+      (yield* store.slotEvents({ boardId: "b", from: at, to: "9999" })).map((row) => row.id),
+      [1, 2, 4, 5],
+    );
+    assert.deepStrictEqual(yield* store.slotEvents({ boardId: "b", from: "", to: at }), []);
+  }).pipe(Effect.provide(TestLayer)),
+);

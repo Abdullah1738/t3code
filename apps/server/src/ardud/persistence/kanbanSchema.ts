@@ -1,4 +1,13 @@
 export const kanbanDDL = [
+  `CREATE TABLE IF NOT EXISTS ardud_kanban_slot_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, board_id TEXT NOT NULL, pool_key TEXT NOT NULL,
+    thread_id TEXT NOT NULL, card_id TEXT,
+    kind TEXT NOT NULL CHECK (kind IN ('take','release')), at TEXT NOT NULL, why TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_slot_events_board_at
+    ON ardud_kanban_slot_events (board_id, at)`,
+  `CREATE INDEX IF NOT EXISTS ardud_kanban_slot_events_slot
+    ON ardud_kanban_slot_events (board_id, pool_key, thread_id, id)`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_evaluator_spawns (
     launch_key TEXT PRIMARY KEY, board_id TEXT NOT NULL, card_id TEXT, at TEXT NOT NULL
   )`,
