@@ -34,7 +34,7 @@ SSH-managed launch persistence stay unchanged either way.
 
 ### Traces
 
-Completed spans are written as NDJSON records to `serverTracePath`. The default depends on how the
+Slow, failed, interrupted, root and warning-bearing spans are written as NDJSON records to `serverTracePath`. The default depends on how the
 server starts: production and explicitly configured homes use
 `<home>/userdata/logs/server.trace.ndjson` (so `~/.t3/userdata/...` by default, or
 `/custom/path/userdata/...` with `--home-dir /custom/path`), a linked worktree dev run uses
@@ -52,6 +52,18 @@ Important fields common to both record types:
 
 `effect-span` records also contain `exit` with `Success`, `Failure`, or `Interrupted`. `otlp-span`
 records instead carry OTLP resource, scope, and optional status fields.
+
+The active file stays plain NDJSON; backups are asynchronously gzip-compressed at level 6
+(`.1.gz`, `.2.gz`, …; `zcat`/`zgrep` read them). Failed compression keeps the plain backup.
+Defaults rotate at 64 MiB with up to 128 backups and prune the oldest archives to stay within
+1,000,000,000 on-disk bytes, including compression scratch. `T3CODE_TRACE_FILE_MIN_DURATION_MS`
+defaults to `2`; `0` restores all spans. Successful child spans below the threshold become one
+`span-summary` record per minute (and at shutdown): Unix-millisecond `windowStart`/`windowEnd`
+and per-name `count`, `totalMs`, `maxMs`. OTLP export retains every span. In two measured busy
+windows the higher compressed rate was 98 MB/hour: six hours plus active/compression reserves
+uses about 790 MB. Actual retention varies with load. Diagnostics include summary counts and
+totals; individual occurrences and log counts cover full records, and CLI percentiles explicitly
+cover full records only.
 
 The `TraceRecord`, `EffectTraceRecord`, and `OtlpTraceRecord` schemas live in
 `packages/shared/src/observability.ts`.
@@ -102,7 +114,7 @@ the loop stalled for more than 2 s since the previous sample, it records a root
 `T3CODE_TRACE_MIN_LEVEL` is `Warn`. The warning shows in Settings > Diagnostics unless OTLP logs are
 on. The span time is when the sample ran, not when the stall happened.
 
-The trace file rotates in well under an hour on a busy server, so each stall is also appended as one
+Each stall is also appended as one
 NDJSON line to `event-loop-stalls.ndjson`, next to the trace file. A line has `time` and the span
 attributes. The file keeps the last 1000 or more stalls, with one rotated backup
 (`event-loop-stalls.ndjson.1`). Use it to see how often a server stalls over days.
@@ -593,8 +605,9 @@ to the backend alone.
 Local trace file:
 
 - `T3CODE_TRACE_FILE`: override trace file path
-- `T3CODE_TRACE_MAX_BYTES`: per-file rotation size, default `10485760`
-- `T3CODE_TRACE_MAX_FILES`: rotated file count, default `10`
+- `T3CODE_TRACE_MAX_BYTES`: raw per-file rotation size, default `67108864`
+- `T3CODE_TRACE_MAX_FILES`: maximum rotated backup count, default `128`
+- `T3CODE_TRACE_FILE_MIN_DURATION_MS`: local-file duration threshold, default `2`; `0` disables filtering
 - `T3CODE_TRACE_BATCH_WINDOW_MS`: flush window, default `1000`
 - `T3CODE_TRACE_MIN_LEVEL`: minimum trace level, default `Info`
 - `T3CODE_TRACE_TIMING_ENABLED`: enable timing metadata, default `true`

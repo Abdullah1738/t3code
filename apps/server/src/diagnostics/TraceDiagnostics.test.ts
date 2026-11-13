@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeZlib from "node:zlib";
 import { assert, describe, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -346,3 +349,37 @@ describe("TraceDiagnostics", () => {
     }),
   );
 });
+
+it.effect("reads gzip backups and includes fast-span summaries without parse errors", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped();
+      const file = `${directory}/trace.ndjson`;
+      const lines = [
+        record({ name: "slow", traceId: "trace", spanId: "span", startMs: 1000, durationMs: 2000 }),
+        JSON.stringify({
+          type: "span-summary",
+          windowStart: 1000,
+          windowEnd: 61000,
+          spans: { fast: { count: 50, totalMs: 25, maxMs: 0.9 } },
+        }),
+      ];
+      yield* fs.writeFile(`${file}.1.gz`, NodeZlib.gzipSync(lines.join("\n") + "\n"));
+      const actual: string[] = [];
+      assert.isTrue(
+        yield* TraceDiagnostics.streamTraceFileLines(fs, `${file}.1`, (s) => actual.push(s)),
+      );
+      assert.deepEqual(actual.filter(Boolean), lines);
+      const result = yield* TraceDiagnostics.readTraceDiagnostics({
+        traceFilePath: file,
+        maxFiles: 1,
+      }).pipe(Effect.provide(TraceDiagnostics.layer));
+      assert.equal(result.parseErrorCount, 0);
+      assert.equal(result.recordCount, 51);
+      assert.equal(result.topSpansByCount[0]?.name, "fast");
+      assert.equal(result.topSpansByCount[0]?.count, 50);
+      assert.equal(result.topSpansByCount[0]?.averageDurationMs, 0.5);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);

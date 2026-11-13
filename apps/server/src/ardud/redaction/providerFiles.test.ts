@@ -7,6 +7,7 @@ import * as Fiber from "effect/Fiber";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeZlib from "node:zlib";
 import { outputs, replaceValue, replaceText, replaceScalarText } from "./content.ts";
 import { planFile, providerOutputs, readNeedle, rewriteFile, countFile } from "./providerFiles.ts";
 
@@ -28,6 +29,46 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 
 const fake = "eyJFAKE.only-fixture.NO-SIGNATURE";
 const marker = "[redacted 2026-11-12T00:00:00.000Z: fixture]";
+
+effectIt.effect.each(
+  ["session.log", "session.jsonl", "server.trace.ndjson.1.gz"].flatMap((name) =>
+    ["contents", "needles", "marker"].map((change) => ({ name, change })),
+  ),
+)("refuses changed $change after preflight for $name", ({ name, change }) =>
+  Effect.gen(function* () {
+    const dir = yield* Effect.promise(() =>
+      NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "redaction-proof-")),
+    );
+    try {
+      const file = NodePath.join(dir, name);
+      const encode = (text: string) =>
+        name.endsWith(".gz") ? NodeZlib.gzipSync(text) : Buffer.from(text);
+      const source = JSON.stringify({ output: fake }) + "\n";
+      const fixedTime = 1_700_000_000;
+      const { plan, before } = yield* Effect.promise(async () => {
+        await NodeFSP.writeFile(file, encode(source));
+        await NodeFSP.utimes(file, fixedTime, fixedTime);
+        const plan = await planFile(file, [fake], marker);
+        if (change === "contents") {
+          await NodeFSP.writeFile(file, encode(source.replace("FAKE", "SAFE")));
+          // Same inode, timestamp and text length: the content proof must detect this edit.
+          await NodeFSP.utimes(file, fixedTime, fixedTime);
+        }
+        return { plan, before: await NodeFSP.readFile(file) };
+      });
+      const result = yield* rewriteFile(
+        plan,
+        change === "needles" ? ["unrelated"] : [fake],
+        change === "marker" ? "[different]" : marker,
+      ).pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      expect(yield* Effect.promise(() => NodeFSP.readFile(file))).toEqual(before);
+      expect(yield* Effect.promise(() => NodeFSP.readdir(dir))).toEqual([name]);
+    } finally {
+      yield* Effect.promise(() => NodeFSP.rm(dir, { recursive: true, force: true }));
+    }
+  }),
+);
 
 it.each(
   ["NTIVE", "CANON", "ORCH"].flatMap((stream) =>
@@ -833,7 +874,7 @@ effectIt.effect("interruption waits for native rename before releasing a writer 
   }).pipe(Effect.scoped),
 );
 
-effectIt.effect("refuses an invalid rewritten JSONL plan before replacing the original", () =>
+effectIt.effect("refuses a changed rewrite proof before replacing the original JSONL", () =>
   Effect.gen(function* () {
     const dir = yield* Effect.promise(() =>
       NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "redaction-invalid-")),
@@ -843,9 +884,11 @@ effectIt.effect("refuses an invalid rewritten JSONL plan before replacing the or
       const original = JSON.stringify({ output: fake }) + "\n";
       yield* Effect.promise(() => NodeFSP.writeFile(file, original));
       const plan = yield* Effect.promise(() => planFile(file, [fake], marker));
-      const failed = yield* rewriteFile({ ...plan, after: '{"broken":' }, [fake], marker).pipe(
-        Effect.flip,
-      );
+      const failed = yield* rewriteFile(
+        { ...plan, afterHash: "invalid-proof" },
+        [fake],
+        marker,
+      ).pipe(Effect.flip);
       expect(failed._tag).toBe("RedactionFileError");
       expect(yield* Effect.promise(() => NodeFSP.readFile(file, "utf8"))).toBe(original);
     } finally {
