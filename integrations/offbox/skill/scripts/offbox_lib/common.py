@@ -28,6 +28,7 @@ CAP_PATH = STATE / "cap.json"
 LOCAL_SEM = STATE / "local.sem"
 SKILL_DIR = HOME / ".config/opencode/skills/remote-compute"
 TEMPLATES_DIR = SKILL_DIR / "templates"
+MGMT_PORT = 2222                     # guest loopback; boatd allocates a separate host proxy port per box
 TZ = ZoneInfo("Asia/Dubai")
 
 # Backend: "boat" = boat.dev, "server" = our own offbox server at home (boatd, integrations/offbox/server).
@@ -418,6 +419,13 @@ class OffboxError(Exception):
         self.run_id, self.box = run_id, box
         self.started = started   # True once the remote command may have started (no local fallback then)
         self.outage = outage     # boat.dev's own API was unreachable (Cloudflare 52x or no answer)
+
+
+class SshHostKeyMismatch(OffboxError):
+    """A terminal SSH identity failure: never replace a box or fall back to local execution."""
+
+    def __init__(self, msg: str):
+        super().__init__(msg, code=2)
 
 
 class NotYours(OffboxError):
