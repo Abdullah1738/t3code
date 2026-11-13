@@ -6,6 +6,9 @@ server (`server/`, once `server/bootstrap.zsh <ip> client` has written
 the standby while home is down) instead of the Mac, and runs light Go checks
 locally in a macOS sandbox.
 
+`offbox exec [box_id] [--timeout N] [--cwd DIR] [--json] -- <cmd...>` uses the authenticated, owner-checked control API on home or Boat when the guest stops, masks or replaces sshd (such as TorSSH testhost); timeout defaults to 60s, clamped to 1..600, and it returns the remote exit code (90 for API/transport failure).
+Never bypass a host-key mismatch by editing known_hosts or disabling strict checking; `boat exec` is Boat-only and returns 404 for home boxes.
+
 | Path here | Live copy |
 | --- | --- |
 | `skill/` | `~/.config/opencode/skills/remote-compute/` (the `remote-compute` skill, `offbox` CLI, classifier, monitor, box templates) |
