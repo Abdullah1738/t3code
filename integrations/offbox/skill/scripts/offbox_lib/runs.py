@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import re
+import select
 import shlex
 import signal
 import sqlite3
@@ -16,6 +17,7 @@ import threading
 import traceback
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
 from . import command_usage, common, containers, prune, prepare, userns
@@ -49,6 +51,10 @@ def _log_source_change(run_id):
 
 
 BG_TTL_S = ORPHAN_RUN_MAX_S
+BACKGROUND_RUN_ENV = 'OFFBOX_BACKGROUND_RUN'
+_background_context = None
+BG_ENTRY = Path(__file__).resolve().parents[1] / 'offbox.py'
+BG_READY_TIMEOUT_S = 20
 RESTART_MARKER = Path(os.environ.get('T3CODE_HOME') or Path.home() / '.robob') / 'userdata/restarting'
 RESTART_MARKER_MAX_S = 300
 # cmd_start answers that prove boat refused the command (nothing ran). Other 4xx and network errors stay ambiguous.
@@ -924,7 +930,7 @@ def scope_failed(log_path: Path | None) -> bool:
     return bool(lines) and all(SCOPE_FAILED.match(ln) for ln in lines)
 
 
-def exit_recording_command(script: str, run_id: str) -> str:
+def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = None) -> str:
     """Run the remote script under a parent shell that writes its exit code to ~/.offbox/exit/<run>.rc,
     so a run boat later reports as lost still has its real status on the box."""
     f = f'"$HOME/.offbox/exit/{run_id}.rc"'
@@ -940,10 +946,11 @@ def exit_recording_command(script: str, run_id: str) -> str:
     persist_block = ('python3 - "$__offbox_rc" <<\'OFFBOX_EXIT_RECORD\'\n' + BOUNDED_PROCESS
                      + f"\nbounded(['bash', '-c', {persist!r}, 'offbox-exit-record', sys.argv[1]], 2)\n"
                      + 'OFFBOX_EXIT_RECORD')
+    claim_id = claim_id or run_id
     marker = ('mkdir -p "$HOME/.offbox/claim" || exit 97; '
-              f'mkdir "$HOME/.offbox/claim/{run_id}" 2>/dev/null || exit 98; '
-              f'printf "%s\\n" "$1" > "$HOME/.offbox/claim/{run_id}/pid" || exit 97; '
-              f'date +%s > "$HOME/.offbox/claim/{run_id}/epoch" || exit 97; '
+              f'mkdir "$HOME/.offbox/claim/{claim_id}" 2>/dev/null || exit 98; '
+              f'printf "%s\\n" "$1" > "$HOME/.offbox/claim/{claim_id}/pid" || exit 97; '
+              f'date +%s > "$HOME/.offbox/claim/{claim_id}/epoch" || exit 97; '
               'mkdir -p "$HOME/.offbox/exit" && '
               f'printf "%s\\n" "$1" > "$HOME/.offbox/exit/{run_id}.pid"')
     # Pass the wrapper's PID: the supervised writer has a different PID and may outlive its deadline.
@@ -962,7 +969,7 @@ def exit_recording_command(script: str, run_id: str) -> str:
         marker_block,
         '__offbox_rc=$?',
         'if [ "$__offbox_rc" = 98 ]; then',
-        f'  rm -f "$HOME/.offbox/env/{run_id}.env"; echo offbox-claim-refused >&2; exit 98',
+        f'  rm -f "$HOME/.offbox/env/{claim_id}.env"; echo offbox-claim-refused >&2; exit 98',
         'fi',
         'if [ "$__offbox_rc" -ne 0 ]; then',
         '  echo "offbox-box-wedged: run marker setup failed or did not finish in 2s (exit directory/PID write)" >&2',
@@ -1351,7 +1358,7 @@ done''' if repo_key == "crpko-devops" else ':'),
 class Runner:
     def __init__(self, a, me: dict):
         self.a, self.me = a, me
-        self.run_id = new_id("run")
+        self.run_id = os.environ.get(BACKGROUND_RUN_ENV) or new_id("run")
         self.root = Path(me["repo_root"])
         self.cwd = Path(os.getcwd()).resolve()
         try:
@@ -1411,17 +1418,23 @@ class Runner:
                 con.close()
         db_retry(update)
 
-    def start(self) -> dict:
+    def register_pending(self) -> None:
+        if self.registered:
+            return
         a, me = self.a, self.me
         con = db()
-        self._log_pool(con)
+        existing = con.execute('SELECT client_pid,mode FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
+        if existing:
+            con.close()
+            if not a.bg or existing['mode'] != 'bg' or existing['client_pid'] != os.getpid():
+                raise OffboxError(f'{self.run_id}: queued run belongs to another client', code=EXIT_LOCAL)
+            self.registered = True
+            return
         steps = getattr(a, "steps", None) or []
         if steps:
             cmd_text = " ; ".join(steps)
         else:
             cmd_text = " ".join(shlex.quote(x) for x in a.cmd) if len(a.cmd) > 1 else a.cmd[0]
-        wait_images = needs_image_wait(cmd_text, me["repo_root"])
-        self.wait_images = wait_images
         # client_pid: `offbox wait` on a run still queued for a box can tell a live client from one that died.
         def register():
             with write(con):
@@ -1431,20 +1444,35 @@ class Runner:
                              cmd_text[:4000], "bg" if a.bg else "fg", now(), str(self.log_path),
                              json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid(), len(steps)))
                 con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_claim:{self.run_id}', '1'))
-        db_retry(register)
-        self.registered = True
-        if a.bg:
-            with log_lock(self.run_id):
-                self.log_path.parent.mkdir(parents=True, exist_ok=True)
-                self.log_path.touch()
-        say(f"pending run {self.run_id}; wait: offbox wait {self.run_id}; kill: offbox kill {self.run_id}")
-        event(con, None, "run_pending", self.run_id)
+        try:
+            db_retry(register)
+            self.registered = True
+            if a.bg:
+                with log_lock(self.run_id):
+                    self.log_path.parent.mkdir(parents=True, exist_ok=True)
+                    self.log_path.touch()
+            say(f"pending run {self.run_id}; wait: offbox wait {self.run_id}; kill: offbox kill {self.run_id}")
+            event(con, None, "run_pending", self.run_id)
+        finally:
+            con.close()
+
+    def start(self) -> dict:
+        self.register_pending()
+        a, me = self.a, self.me
+        con = db()
+        self._log_pool(con)
+        self.require_pending(con)
+        steps = getattr(a, "steps", None) or []
+        cmd_text = " ; ".join(steps) if steps else (shlex.join(a.cmd) if len(a.cmd) > 1 else a.cmd[0])
+        self.wait_images = wait_images = needs_image_wait(cmd_text, me["repo_root"])
         t0 = now()
         size, why = lease.auto_size(con, cmd_text, me, a.size)
         if why:
             say(why)
         env, explicit = build_env(a.env or [])
-        env_file = f"/home/user/.offbox/env/{self.run_id}.env"
+        from . import start_check
+        claim = start_check.claim_id(con, self.run_id)
+        env_file = f"/home/user/.offbox/env/{claim}.env"
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()
         dead_attempts = 0
         replacement = None
@@ -1514,11 +1542,11 @@ class Runner:
                                preserve_containers=containers.preserve_reason(con, row), box_id=self.box, usage=usage)
         con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', ('containers_expected:' + self.run_id, '1'))
         con.commit()
-        from . import start_check
+        self.require_pending(con)
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:
-            r = api.cmd_start(self.box, exit_recording_command(script, self.run_id),
+            r = api.cmd_start(self.box, exit_recording_command(script, self.run_id, claim_id=claim),
                               meta={"repo": me.get("repo_key"), "kind": run_kind(cmd_text), "run_id": self.run_id},
                               retry_interrupted=retry_interrupted(a))
         except (api.ApiError, api.NetworkError) as e:
@@ -1581,6 +1609,11 @@ class Runner:
         except sqlite3.Error as error:
             state_warning(self.run_id, None, error)
         return row
+
+    def require_pending(self, con) -> None:
+        row = con.execute('SELECT status FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
+        if not row or row['status'] != 'starting':
+            raise OffboxError(f'{self.run_id}: settled before the command started; nothing ran', code=130)
 
     def _prepare_box(self, con, a, rdir, env_file, body) -> dict | None:
         """Everything before the command starts. Raises lease.DeadMount when the box's filesystem is dead."""
@@ -2511,8 +2544,185 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
 
 
 def run_remote(a, me: dict) -> int:
+    if a.bg and not os.environ.get(BACKGROUND_RUN_ENV):
+        return _background(a, me)
     with prepare.attempts():
         return _run_prepared(a, me)
+
+
+def _background(a, me: dict) -> int:
+    if not a.no_sync and getattr(a, "include", None):
+        ssh_sync.push_filters(Path(me["repo_root"]), a.git, a.include)
+    rn = Runner(a, me)
+    rn.register_pending()
+    client_log = rn.log_path.with_suffix('.client.log')
+    ready_r = ready_w = accept_r = accept_w = None
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGINT, signal.SIGTERM, signal.SIGHUP))
+    interrupted = False
+    def defer_interrupt(signum, frame):
+        nonlocal interrupted
+        interrupted = True
+    # Other caller threads can still receive SIGINT and schedule its Python handler on main.
+    # Defer that handler too, so caller interruption cannot reject a transferred worker.
+    old_sigint = signal.signal(signal.SIGINT, defer_interrupt)
+    child = None
+    try:
+        ready_r, ready_w = os.pipe()
+        accept_r, accept_w = os.pipe()
+        payload = json.dumps(dict(args=vars(a), me=me, env=dict(os.environ), backend=common.backend(),
+                                  ready_fd=ready_w, accept_fd=accept_r, signal_mask=list(mask))).encode()
+        boot_env = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR')}
+        with open(client_log, 'ab', opener=lambda p, f: os.open(p, f, 0o600)) as dst:
+            # No preexec_fn: Python/CF code in a forked macOS child is unsafe even before urllib sends a request.
+            child = subprocess.Popen([sys.executable, '-u', str(BG_ENTRY), '_bg-queue', rn.run_id],
+                                     start_new_session=True, close_fds=True, pass_fds=(ready_w, accept_r),
+                                     stdin=subprocess.PIPE, stdout=dst, stderr=subprocess.STDOUT, env=boot_env)
+        # Until this publication the original caller remains the provable owner. No payload is sent before it.
+        rn.record(client_pid=child.pid, start_at=now())
+        os.close(ready_w)
+        ready_w = None
+        os.close(accept_r)
+        accept_r = None
+        errors = []
+        def send():
+            try:
+                with child.stdin:
+                    child.stdin.write(payload)
+            except (OSError, ValueError) as error:
+                errors.append(error)
+        # A large command/env must not fill the pipe and block the readiness deadline.
+        sender = threading.Thread(target=send, daemon=True)
+        sender.start()
+        readable, _, _ = select.select([ready_r], [], [], BG_READY_TIMEOUT_S)
+        ready = os.read(ready_r, 1) if readable else b''
+        if ready != b'1' or errors:
+            raise OffboxError(f"{rn.run_id}: background client could not detach; check {client_log}", code=EXIT_LOCAL)
+        os.write(accept_w, b'1')
+    except BaseException as error:
+        if accept_w is not None:
+            try:
+                os.write(accept_w, b'0')
+            except OSError:
+                pass
+        if child is not None and child.poll() is None:
+            # This PID came from our own spawn. Never leave an unacknowledged worker able to start later.
+            child.kill()
+            child.wait()
+        finish(rn.run_id, EXIT_LOCAL, 'local_error')
+        if isinstance(error, OffboxError):
+            raise
+        if isinstance(error, KeyboardInterrupt):
+            raise
+        raise OffboxError(f"{rn.run_id}: background client could not detach; check {client_log}", code=EXIT_LOCAL) from error
+    finally:
+        if ready_r is not None:
+            os.close(ready_r)
+        if ready_w is not None:
+            os.close(ready_w)
+        if accept_r is not None:
+            os.close(accept_r)
+        if accept_w is not None:
+            os.close(accept_w)
+        # Deliver caller interruptions after handoff; they must not cancel the acknowledged detached worker.
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        if interrupted:
+            os.kill(os.getpid(), signal.SIGINT)
+    print(rn.run_id, flush=True)
+    say(f"queued in background. Follow: offbox logs {rn.run_id} --follow ; wait: offbox wait {rn.run_id}; "
+        f"client log: {client_log}")
+    return 0
+
+
+def background_queue(run_id: str, payload: dict) -> int:
+    a, me = SimpleNamespace(**payload['args']), payload['me']
+    con = db()
+    try:
+        with write(con):
+            row = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+            if (not row or row['mode'] != 'bg' or row['status'] != 'starting' or row['box_id'] or row['process_id']
+                    or row['client_pid'] != os.getpid() or row['owner'] != me['owner']
+                    or row['repo_root'] != me['repo_root'] or payload['backend'] != common.backend()):
+                raise OffboxError(f'{run_id}: queued run cannot be adopted', code=EXIT_LOCAL)
+            con.execute('UPDATE runs SET client_pid=?,start_at=? WHERE run_id=?', (os.getpid(), now(), run_id))
+        os.chdir(row['local_cwd'] or row['cwd'])
+    finally:
+        con.close()
+    os.environ[BACKGROUND_RUN_ENV] = run_id
+    return background_client(a, me, ready=payload['ready_fd'], accept=payload['accept_fd'],
+                             signal_mask=payload['signal_mask'])
+
+
+def background_client(a, me: dict, ready=None, accept=None, signal_mask=None) -> int:
+    global _background_context
+    _background_context = (a, me)
+    from . import cli
+    rid = os.environ[BACKGROUND_RUN_ENV]
+    def interrupted(signum, frame):
+        raise _ClientSignal
+    old = {s: signal.signal(s, interrupted) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    code = EXIT_LOCAL
+    try:
+        if ready:
+            fd = ready
+            signal.pthread_sigmask(signal.SIG_SETMASK, signal_mask)
+            try:
+                os.write(fd, b'1')
+            except BrokenPipeError:
+                pass  # The caller can die during handoff; the detached client still owns the queued run.
+            finally:
+                os.close(fd)
+            try:
+                # EOF means the caller died after transferring the payload. An explicit rejection fences a timeout.
+                accepted = os.read(accept, 1)
+            finally:
+                os.close(accept)
+            if accepted not in (b'1', b''):
+                finish(rid, EXIT_LOCAL, 'local_error')
+                return EXIT_LOCAL
+        code = cli._run_with_retries(a, me)
+        return code
+    except KeyboardInterrupt:
+        code = 130
+        return code
+    finally:
+        con = db()
+        try:
+            row = con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
+            if (row and row['client_pid'] == os.getpid() and row['status'] == 'starting'
+                    and not row['box_id'] and not row['process_id']):
+                finish(rid, code, 'killed' if code == 130 else 'infra')
+        finally:
+            con.close()
+            for s, handler in old.items():
+                signal.signal(s, handler)
+
+
+def forward_background(env: dict) -> None:
+    if _background_context is None:
+        raise OffboxError('background failover has no queued run context', code=EXIT_LOCAL)
+    # Reuse the stdin protocol on failover too: an exec of the original argv would expose --env values.
+    common.select_backend('boat')
+    os.environ.clear()
+    os.environ.update(env)
+    raise SystemExit(_background(*_background_context))
+
+
+def retry_background(error) -> None:
+    rid = os.environ.get(BACKGROUND_RUN_ENV)
+    if rid and not error.started:
+        con = db()
+        try:
+            with write(con):
+                fenced = con.execute("SELECT 1 FROM kv WHERE k=? AND v='fenced'", ('lost_confirmed:' + rid,)).fetchone()
+                if fenced:
+                    # Keep the old fence forever: a late delivery must still lose its original claim.
+                    con.execute('UPDATE kv SET v=? WHERE k=?', (new_id('claim'), 'start_claim:' + rid))
+                    con.execute('DELETE FROM kv WHERE k=?', ('lost_confirmed:' + rid,))
+                con.execute("UPDATE runs SET box_id=NULL, error=?, end_at=NULL WHERE run_id=? "
+                            "AND status='starting' AND process_id IS NULL", (str(error)[:500], rid))
+        finally:
+            con.close()
 
 
 def _run_prepared(a, me: dict) -> int:
@@ -2638,7 +2848,7 @@ def _run_remote(a, rn) -> int:
             if not rn.started:
                 if e.code == EXIT_LOCAL:
                     finish(rn.run_id, EXIT_LOCAL, "local_error")
-                else:
+                elif not os.environ.get(BACKGROUND_RUN_ENV):
                     finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
             rn.record(error=str(e)[:500])
             raise

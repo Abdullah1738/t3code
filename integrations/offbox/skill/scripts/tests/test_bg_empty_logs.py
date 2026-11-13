@@ -207,13 +207,14 @@ class BackgroundOutputTests(Isolated):
         self.assertIn('no output on record', err)
         self.assertEqual(self.row()['exit_code'], 7)
 
-    def test_follow_delivers_settlement_output_once_and_wait_stays_quiet(self):
+    def test_follow_and_failed_wait_deliver_settlement_output_once(self):
         for caller in ('follow', 'wait', 'direct_follow'):
             for source, live_prefix in (('history', ''), ('history', 'live\n'), ('remote', ''), ('empty', '')):
                 for exit_code in (0, 7):
                     with self.subTest(caller=caller, source=source, live_prefix=live_prefix, exit_code=exit_code):
                         self.path.unlink(missing_ok=True)
                         common.offsets_path(self.path).unlink(missing_ok=True)
+                        Path(str(self.path) + '.delivered').unlink(missing_ok=True)
                         self.con.execute("UPDATE runs SET status='running',exit_code=NULL WHERE run_id='run-x'")
                         self.con.commit()
                         self.box_get.return_value = dict(state='running')
@@ -240,7 +241,9 @@ class BackgroundOutputTests(Isolated):
                                 code = misc.wait('run-x', None) if caller == 'wait' else misc.logs('run-x', True)
                         self.assertEqual(code, exit_code)
                         self.assertEqual(self.path.read_text(), content)
-                        expected = (content if caller != 'wait' else '') + f'run-x: exit={exit_code}\n'
+                        failed_wait = caller == 'wait' and exit_code != 0
+                        expected = (content if caller != 'wait' or failed_wait else '')
+                        expected += f"run-x: {'failed ' if failed_wait else ''}exit={exit_code}\n"
                         self.assertEqual(out_bytes.getvalue().decode(), expected)
                         if source == 'empty':
                             self.assertIn('no output on record', err.getvalue())
@@ -342,15 +345,78 @@ class BackgroundOutputTests(Isolated):
         self.assertEqual(self.invoke(wait=True), (7, 'hello\nerror\nlate\nrun-x: failed exit=7\n', ''))
         self.assertEqual(self.invoke(wait=True), (7, 'run-x: failed exit=7\n', ''))
 
-    def test_quiet_active_wait_leaves_failure_unread_for_next_wait(self):
+    def test_active_wait_reports_recovered_failure_once(self):
         self.con.execute("UPDATE runs SET status='running',exit_code=NULL WHERE run_id='run-x'")
         self.con.commit()
         self.streams()
         with patch.object(runs, '_ttl_keeper'), patch.object(misc, '_refresh_running_ttl'), \
              patch.object(api, 'cmd_attach', return_value=iter([dict(type='exit', exitCode=7)])):
-            self.assertEqual(self.invoke(wait=True), (7, 'run-x: exit=7\n', ''))
-        self.assertEqual(self.invoke(wait=True), (7, 'hello\nerror\nrun-x: failed exit=7\n', ''))
+            self.assertEqual(self.invoke(wait=True), (7, 'hello\nerror\nrun-x: failed exit=7\n', ''))
         self.assertEqual(self.invoke(wait=True), (7, 'run-x: failed exit=7\n', ''))
+
+    def test_active_wait_failure_tail_is_bounded_and_echoing_follow_does_not_repeat_it(self):
+        content = 'old output\n' * 2000 + 'actual failure\n'
+        for mode, follow, exit_code in (('bg', False, 7), ('bg', False, 0), ('bg', True, 7),
+                                         ('bg', True, 0), ('fg', False, 7)):
+            with self.subTest(mode=mode, follow=follow, exit_code=exit_code):
+                self.con.execute("UPDATE runs SET status='running',exit_code=NULL,mode=? WHERE run_id='run-x'", (mode,))
+                self.con.commit()
+                self.path.write_bytes(b'')
+                common.offsets_path(self.path).unlink(missing_ok=True)
+                Path(str(self.path) + '.delivered').unlink(missing_ok=True)
+                frames = [dict(type='stdout', data=content, nextOffset=len(content)),
+                          dict(type='exit', exitCode=exit_code)]
+                stdout = io.TextIOWrapper(io.BytesIO(), write_through=True)
+                stderr = io.TextIOWrapper(io.BytesIO(), write_through=True)
+                with patch.object(runs, '_ttl_keeper'), patch.object(misc, '_refresh_running_ttl'), \
+                        patch.object(api, 'cmd_attach', return_value=iter(frames)), stdout, stderr, \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    code = misc.logs('run-x', True) if follow else misc.wait('run-x', None)
+                    output, errors = stdout.buffer.getvalue().decode(), stderr.buffer.getvalue().decode()
+                self.assertEqual(code, exit_code)
+                self.assertEqual(errors, '')
+                expected = content if follow else content[-16384:] if mode == 'bg' and exit_code else ''
+                label = 'failed ' if mode == 'bg' and not follow and exit_code else ''
+                self.assertEqual(output, expected + f'run-x: {label}exit={exit_code}\n')
+                if mode == 'bg' and exit_code:
+                    self.assertEqual(self.invoke(wait=True), (7, 'run-x: failed exit=7\n', ''))
+
+    def test_wait_for_holder_reports_failure_tail_once_on_both_exit_paths(self):
+        from test_wait_lock import Clock
+        for stuck in (False, True):
+            with self.subTest(stuck=stuck):
+                self.con.execute("UPDATE runs SET status='running',exit_code=NULL WHERE run_id='run-x'")
+                self.con.commit()
+                self.path.write_bytes(b'hello\nerror\n')
+                common.atomic_write_json(common.offsets_path(self.path),
+                                         dict(stdoutOffset=6, stderrOffset=6, logBytes=12))
+                Path(str(self.path) + '.delivered').unlink(missing_ok=True)
+                self.streams()
+                def settle(_):
+                    if not stuck:
+                        self.con.execute("UPDATE runs SET status='failed',exit_code=7 WHERE run_id='run-x'")
+                        self.con.commit()
+                clock = Clock(on_sleep=settle)
+                ended = dict(running=False, status='exited', exitCode=7) if stuck else None
+                with common.file_lock('box-bx_a', timeout=0), \
+                        patch.object(misc, '_refresh_running_ttl'), patch.object(runs, '_ended', return_value=ended), \
+                        patch.object(misc.time, 'sleep', clock.sleep), patch.object(misc, 'now', clock.now), \
+                        patch.object(runs, 'now', clock.now):
+                    code, output, errors = self.invoke(wait=True)
+                self.assertEqual((code, output), (7, 'hello\nerror\nrun-x: failed exit=7\n'))
+                self.assertEqual('looks stuck' in errors, stuck)
+
+    def test_active_wait_prints_failure_before_dependency_hint(self):
+        self.con.execute("UPDATE runs SET status='running',exit_code=NULL WHERE run_id='run-x'")
+        self.con.commit()
+        frames = [dict(type='stderr', data='actual failure\n', nextOffset=15), dict(type='exit', exitCode=7)]
+        output = io.StringIO()
+        with patch.object(runs, '_ttl_keeper'), patch.object(misc, '_refresh_running_ttl'), \
+                patch.object(api, 'cmd_attach', return_value=iter(frames)), \
+                patch.object(runs, 'box_deps_hint', return_value='dependency hint'), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            self.assertEqual(misc.wait('run-x', None), 7)
+        self.assertEqual(output.getvalue(), 'actual failure\noffbox: dependency hint\nrun-x: failed exit=7\n')
 
     def test_partial_delivery_and_broken_pipe_preserve_unread_failure(self):
         self.path.write_text('hello\nerror\n')

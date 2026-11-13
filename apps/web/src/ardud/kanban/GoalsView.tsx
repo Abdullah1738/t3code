@@ -2,6 +2,8 @@ import { activeGoals, goalPage, type KanbanBoardState } from "@t3tools/client-ru
 import { formatDayLabel } from "@t3tools/client-runtime/ardud/common";
 
 import { Chip, GoalBar, Glyph, stageGlyph } from "./parts";
+import { useAnalyticsCounts } from "../useAnalytics";
+import { usePrimaryEnvironmentId } from "../../state/environments";
 
 export function GoalsList(props: {
   state: KanbanBoardState;
@@ -45,6 +47,11 @@ export function GoalView(props: {
   onOpenCard: (cardId: string) => void;
 }) {
   const page = goalPage(props.state, props.goalId, props.nowMs);
+  useAnalyticsCounts(
+    usePrimaryEnvironmentId(),
+    "board.goals",
+    page?.stages.reduce((sum, stage) => sum + stage.cards.length, 0) ?? 0,
+  );
   if (!page) return <p className="text-(--m-muted)">This goal is gone.</p>;
   const { progress } = page;
   return (

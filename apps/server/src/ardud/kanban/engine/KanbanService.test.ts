@@ -92,6 +92,7 @@ import * as SavedReply from "../tools/savedReply.ts";
 import { McpSchema } from "effect/ai";
 import * as Scribe from "./scribe.ts";
 import * as KanbanService from "./KanbanService.ts";
+import { phases as tickPhases } from "./tickTimings.ts";
 import type { KanbanScriptsShape } from "./ScriptService.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
 import { mapCodexModelCapabilities } from "../../../provider/CodexProvider.ts";
@@ -548,14 +549,152 @@ const observedInlineTestLayer = (...args: Parameters<typeof observedTestLayer>) 
     Layer.provide(Layer.succeed(KanbanService.OwnerRouteMode, "inline")),
   );
 
-const decodeAnalyticsEvent = Schema.decodeUnknownEffect(AnalyticsEvent);
 const owner: KanbanActor = { _tag: "owner" };
+const decodeAnalyticsEvent = Schema.decodeUnknownEffect(AnalyticsEvent, {
+  onExcessProperty: "error",
+});
 /** The session of the owner's own app, for the WS handlers. */
 const OWNER_APP_SESSION = {
   sessionId: "session-owner",
   subject: "one-time-token",
   origin: { _tag: "owner", source: "paired-client" },
 } as const;
+
+it.effect(
+  "records tick queues and phases after empty and failed ticks, releasing the overlap guard",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const events: AnalyticsEvent[] = [];
+      let failLoad = false;
+      const storeLayer = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            board: (id) =>
+              Effect.suspend(() =>
+                failLoad
+                  ? Effect.fail(
+                      new KanbanStore.KanbanStoreError({
+                        operation: "read board",
+                        cause: "unavailable",
+                      }),
+                    )
+                  : real.board(id),
+              ),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban } = yield* toyBoard;
+        yield* kanban.tick;
+        failLoad = true;
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(kanban.tick)));
+        failLoad = false;
+        yield* kanban.tick;
+        const ticks = events.filter((event) => event.kind === "kanban.tick");
+        assert.equal(ticks.length, 3);
+        assert.isDefined(ticks[1]?.props?.errorTag);
+        assert.isFalse(events.some((event) => event.kind === "kanban.tick_overlap"));
+        for (const tick of ticks) {
+          const phases = events.filter(
+            (event) =>
+              event.kind === "kanban.tick_phase" && event.props?.tickId === tick.props?.tickId,
+          );
+          assert.equal(phases.length, tickPhases.length);
+          assert.equal(
+            phases.reduce((sum, event) => sum + event.durationMs!, 0),
+            tick.durationMs,
+          );
+          assert.equal(tick.props?.cardsScanned, 0);
+        }
+      }).pipe(
+        Effect.provide(
+          testLayer(fake.layer, undefined, undefined, storeLayer).pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (event) =>
+                  Effect.sync(() => {
+                    events.push(event);
+                  }),
+              }),
+            ),
+          ),
+        ),
+      );
+    }),
+);
+
+it.effect("records tick queues and phases during overlaps without blocking local waits", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const events: AnalyticsEvent[] = [];
+    let blocked = false;
+    let measuring = false;
+    fake.findControl.beforeRead = () =>
+      Effect.gen(function* () {
+        if (!measuring || blocked) return;
+        blocked = true;
+        yield* Deferred.succeed(entered, undefined);
+        yield* Deferred.await(release);
+      });
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.createCard(board.id, { title: "Work", prompt: "Work" }, owner);
+      yield* kanban.dispatchNow;
+      events.length = 0;
+      measuring = true;
+      const first = yield* Effect.forkChild(kanban.tick);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("200 millis");
+      yield* kanban.tick;
+      const overlap = events.find((event) => event.kind === "kanban.tick_overlap")!;
+      assert.isDefined(overlap);
+      assert.equal(overlap.props?.reason, "local_waits_only");
+      assert.isFalse(events.some((event) => event.kind === "kanban.tick"));
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(first);
+      const tick = events.find((event) => event.kind === "kanban.tick")!;
+      const phases = events.filter((event) => event.kind === "kanban.tick_phase");
+      assert.sameMembers(
+        phases.map((event) => event.props!.phase),
+        [...tickPhases],
+      );
+      assert.equal(phases.length, tickPhases.length);
+      assert.isAtLeast(tick.durationMs!, 200);
+      const sum = phases.reduce((total, event) => total + event.durationMs!, 0);
+      assert.closeTo(sum, tick.durationMs!, tick.durationMs! * 0.05);
+      assert.isAtLeast(
+        phases.find((event) => event.props?.phase === "thread_status")!.durationMs!,
+        200,
+      );
+      assert.equal(tick.props?.tickId, overlap.props?.activeTickId);
+      assert.equal(tick.props?.overlappingTicks, 1);
+      assert.isAtLeast(tick.props!.cardsScanned!, 1);
+      for (const event of [tick, overlap, ...phases]) yield* decodeAnalyticsEvent(event);
+      assert.isTrue(phases.every((event) => event.props?.tickId === tick.props?.tickId));
+      yield* kanban.tick;
+      assert.equal(events.filter((event) => event.kind === "kanban.tick").length, 2);
+      assert.equal(events.filter((event) => event.kind === "kanban.tick_overlap").length, 1);
+    }).pipe(
+      Effect.provide(
+        testLayer(fake.layer).pipe(
+          Layer.provide(
+            Layer.mock(Analytics.Analytics)({
+              record: (event) =>
+                Effect.sync(() => {
+                  events.push(event);
+                }),
+            }),
+          ),
+        ),
+      ),
+    );
+  }),
+);
 
 it.effect(
   "records tick queues, throttles exact pool waits, and times todo dispatch without card text",
@@ -816,6 +955,86 @@ it.effect(
         ),
       );
     }),
+);
+
+it.effect.each(
+  (["todo", "needs_review", "in_review", "completed", "deployed", "verified"] as const).flatMap(
+    (stage) => (["owner", "evaluator", "script"] as const).map((actor) => ({ stage, actor })),
+  ),
+)("records step handoff actors from $stage as $actor", ({ stage, actor: kind }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const events: AnalyticsEvent[] = [];
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const scriptId = KanbanScriptId.make("script-check");
+      if (kind === "script")
+        yield* store.putScript({
+          id: scriptId,
+          boardId: board.id,
+          name: "check",
+          path: "/unused/check.sh",
+          trigger: { _tag: "manual" },
+          enabled: true,
+          createdBy: owner,
+          createdAt: "2026-10-29T00:00:00Z",
+          lastRun: null,
+        });
+      const actor: KanbanActor =
+        kind === "owner"
+          ? owner
+          : kind === "script"
+            ? { _tag: "script", scriptId }
+            : { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Step handoff",
+          prompt: "Work",
+          subtasks: [
+            kind === "script"
+              ? { text: "Check inputs", owner: "script", script: "check", step: 1 }
+              : { text: "Check inputs", owner: "evaluator", step: 1 },
+            { text: "Implement", owner: "work", step: 2 },
+          ],
+        },
+        owner,
+      );
+      yield* store.putCard({ ...card, stage });
+      yield* TestClock.adjust("1 second");
+      yield* kanban.markSubtask(
+        card.id,
+        "s1",
+        "done",
+        "Checked",
+        actor,
+        kind === "owner" ? "evaluator" : kind,
+      );
+      const move = events.find(
+        (event) => event.cardId === card.id && event.kind === "kanban.card_move",
+      );
+      assert.deepInclude(move?.props, {
+        from: stage,
+        to: "todo",
+        actor: kind,
+        msInPrevStage: 1000,
+      });
+    }).pipe(
+      Effect.provide(
+        testLayer(fake.layer).pipe(
+          Layer.provide(
+            Layer.mock(Analytics.Analytics)({
+              record: (event) =>
+                Effect.sync(() => {
+                  events.push(event);
+                }),
+            }),
+          ),
+        ),
+      ),
+    );
+  }),
 );
 
 it.effect("refuses corrupted board text before saving and preserves clean comments", () =>
@@ -10233,7 +10452,7 @@ it.effect.each([
       );
       const patch = { subtasks: [{ id: "s1", text: "Restart Robob", owner: next }] };
       const denied = yield* kanban.editCard(card.id, patch, evaluator).pipe(Effect.flip);
-      assert.include(denied.detail, "needs Abdullah's approval");
+      assert.include(denied.detail, "needs Abdullah's answer before it can be skipped");
       assert.strictEqual((yield* kanban.card(card.id)).card.subtasks[0]?.owner, previous);
       yield* kanban.askOwner(
         card.id,
@@ -30602,4 +30821,119 @@ it.effect("board step wakes share a card scope while owner relays do not coalesc
       ),
     );
   }),
+);
+
+it.effect(
+  "9router #19: Skip deploy permits skipping or removing s6 and then verification, but not doing it",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.updateBoard(board.id, { guessedGates: ["money", "secret"] });
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+        for (const removal of [false, true]) {
+          const card = yield* kanban.createCard(
+            board.id,
+            {
+              prompt: removal ? "Remove test-only deploy" : "Skip test-only deploy",
+              subtasks: [
+                ...Array.from({ length: 5 }, (_, i) => ({
+                  text: `Prepare ${i + 1}`,
+                  owner: "evaluator" as const,
+                  step: 1,
+                })),
+                {
+                  text: "If a code bug was fixed (not just tests): ask Abdullah to deploy",
+                  owner: "evaluator",
+                  step: 2,
+                  gate: "deploy",
+                },
+              ],
+            },
+            owner,
+          );
+          for (const subtask of card.subtasks.slice(0, 5)) {
+            yield* kanban.markSubtask(
+              card.id,
+              subtask.id,
+              "done",
+              "Prepared",
+              evaluator,
+              "evaluator",
+            );
+          }
+          yield* kanban.askOwner(
+            card.id,
+            { question: "Status?", blocking: false },
+            evaluator,
+            "evaluator",
+          );
+          yield* kanban.answerAsk(
+            card.id,
+            "q1",
+            { verdict: "answered", revision: 0, text: "Test-only" },
+            owner,
+          );
+          yield* kanban.askOwner(
+            card.id,
+            {
+              question: "Skip s6 deploy?",
+              blocking: false,
+              options: [
+                { id: "o1", label: "Skip deploy" },
+                { id: "o2", label: "Deploy anyway" },
+              ],
+            },
+            evaluator,
+            "evaluator",
+          );
+          yield* kanban.answerAsk(
+            card.id,
+            "q2",
+            { verdict: "picked", revision: 0, optionIds: ["o1"] },
+            owner,
+          );
+          const denied = yield* kanban
+            .markSubtask(card.id, "s6", "done", "Deployed", evaluator, "evaluator")
+            .pipe(Effect.flip);
+          assert.include(denied.detail, "doesn't read as approving deploy");
+          if (removal) {
+            const edited = yield* kanban.editCard(
+              card.id,
+              { subtasks: card.subtasks.slice(0, 5).map(({ id }) => ({ id })) },
+              evaluator,
+            );
+            assert.isFalse(edited.subtasks.some(({ id }) => id === "s6"));
+          } else {
+            const skipped = yield* kanban.markSubtask(
+              card.id,
+              "s6",
+              "skipped",
+              "Test-only change; owner chose Skip deploy",
+              evaluator,
+              "evaluator",
+            );
+            assert.strictEqual(skipped.subtasks[5]!.state, "skipped");
+          }
+          const verified = yield* kanban.moveCard(card.id, "verified", "evaluator", evaluator);
+          assert.strictEqual(verified.stage, "verified");
+          if (!removal) {
+            yield* kanban.askOwner(
+              card.id,
+              { question: "Follow up status?", blocking: true },
+              evaluator,
+              "evaluator",
+            );
+            const returned = yield* kanban.answerAsk(
+              card.id,
+              "q3",
+              { verdict: "answered", revision: 0, text: "Recorded" },
+              owner,
+            );
+            assert.strictEqual(returned.card.stage, "verified");
+          }
+        }
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );

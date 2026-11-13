@@ -524,6 +524,29 @@ export const KanbanOwnerAsk = Schema.Struct({
   seq: Schema.NullOr(PositiveInt),
   /** Set once answered or dropped. */
   closedAt: Schema.NullOr(IsoDateTime),
+  timing: Schema.optional(
+    Schema.Struct({
+      kind: Schema.optional(
+        Schema.Literals(["approve", "pick", "draft", "action", "input", "notice"]),
+      ),
+      openAsksAtCreation: Schema.optional(NonNegativeInt),
+      notified: Schema.optional(
+        Schema.Struct({
+          in_app: Schema.optional(IsoDateTime),
+          telegram: Schema.optional(IsoDateTime),
+          push: Schema.optional(IsoDateTime),
+        }),
+      ),
+      firstSeen: Schema.optional(
+        Schema.Struct({
+          web: Schema.optional(IsoDateTime),
+          desktop: Schema.optional(IsoDateTime),
+          mobile: Schema.optional(IsoDateTime),
+        }),
+      ),
+      answeredVia: Schema.optional(Schema.Literals(["single", "batch", "free_text"])),
+    }),
+  ),
   /** A label for the layout; absent means "question". Behaviour comes from `kanbanAskResponse`. */
   kind: Schema.optional(KanbanAskKind),
   /** One short line saying what is being asked. */

@@ -16,7 +16,11 @@ def rollup(day, root=None):
     root = Path(root) if root else directory()
     names, kinds, durations, tags, samples = Counter(), Counter(), defaultdict(list), Counter(), {}
     disk = dict(probes=0, timeouts=0, maxDurationMs=None, latestBlockedIn=None)
+    backup = {key: dict.fromkeys(('memory', 'health', 'other'), 0)
+              for key in ('skipped_runs', 'ok_runs')}
     latest_blocked_at = ''
+    waits = dict(runs=0, maxAgeS=None, latestStuckUnmountMountPoint=None)
+    latest_unmount_at = ''
     total = oks = failed = outcomes = malformed = 0
     source = root / (day + '.ndjson')
     if source.exists():
@@ -34,6 +38,14 @@ def rollup(day, root=None):
                         outcomes += 1
                         oks += row['ok']
                         failed += not row['ok']
+                    if name == 'backup.run':
+                        props = row.get('props', {})
+                        target = props.get('target')
+                        if target in ('memory', 'health', 'other'):
+                            if props.get('skipped') == 1:
+                                backup['skipped_runs'][target] += 1
+                            elif props.get('skipped') == 0 and row.get('ok') is True:
+                                backup['ok_runs'][target] += 1
                     value = row.get('durationMs')
                     if type(value) in (int, float) and math.isfinite(value) and value >= 0:
                         durations[name].append(value)
@@ -48,6 +60,17 @@ def rollup(day, root=None):
                         stamp = row.get('ts', '')
                         if blocked in ('SKHelperClient', 'SKManager', 'DiskArbitration', 'DASession', 'unknown') and stamp >= latest_blocked_at:
                             disk['latestBlockedIn'], latest_blocked_at = blocked, stamp
+                    if name == 'proc.disk_wait':
+                        props = safe_fields(row.get('props'), name)
+                        count = props.get('count', 0)
+                        if count > 0:
+                            waits['runs'] += 1
+                        for proc in props.get('procs', []):
+                            waits['maxAgeS'] = max(waits['maxAgeS'] or 0, proc['ageS'])
+                        mount = props.get('mountPoint')
+                        stamp = row.get('ts', '')
+                        if props.get('stuckUnmount') and mount and stamp >= latest_unmount_at:
+                            waits['latestStuckUnmountMountPoint'], latest_unmount_at = mount, stamp
                     tag = row.get('error', {}).get('tag')
                     if tag:
                         tags[tag] += 1
@@ -58,7 +81,7 @@ def rollup(day, root=None):
     for name, values in durations.items():
         values.sort()
         stats[name] = {key: values[max(0, math.ceil(len(values) * pct) - 1)] for key, pct in [('p50', .5), ('p95', .95), ('max', 1)]}
-    result = dict(day=day, tool='mac', diskTooling=disk, total=total, countsByName=dict(names), countsByKind=dict(kinds),
+    result = dict(day=day, tool='mac', backup=backup, diskTooling=disk, diskWait=waits, total=total, countsByName=dict(names), countsByKind=dict(kinds),
                   outcomes=outcomes, okRate=oks / outcomes if outcomes else None,
                   errorRate=kinds['error'] / total if total else None,
                   failedRate=failed / outcomes if outcomes else None, durationMs=stats, malformed=malformed,

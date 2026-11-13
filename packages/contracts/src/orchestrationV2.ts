@@ -962,6 +962,8 @@ export const OrchestrationV2ProviderThread = Schema.Struct({
   pendingBackgroundTasks: Schema.optional(Schema.Array(OrchestrationV2PendingBackgroundTask)).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
+  // An ordered idle update follows the output of native background work, including child follow-ups.
+  pendingBackgroundWork: Schema.optional(Schema.Boolean),
   contextUsage: Schema.optional(Schema.NullOr(ThreadTokenUsageSnapshot)).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),

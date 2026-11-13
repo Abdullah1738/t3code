@@ -27,6 +27,12 @@ const DerivedId = Schema.String.check(
 const Measurement = Schema.Number.check(
   Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
 );
+// Mergeable, bounded duration distribution; bucket upper bounds have at most 2% error.
+export const LONG_TASK_HISTOGRAM_RATIO = 1.02;
+export const LONG_TASK_HISTOGRAM_BUCKETS = 1024;
+const LongTaskHistogram = Schema.Array(
+  Schema.Tuple([Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 1023 })), Measurement]),
+).check(Schema.isMaxLength(LONG_TASK_HISTOGRAM_BUCKETS));
 const McpOutcome = Schema.Literals([
   "ok",
   "error",
@@ -80,7 +86,6 @@ export const AnalyticsEvent = Schema.Struct({
       errorClass: Schema.optionalKey(Label),
       model: Schema.optionalKey(Label),
       kind: Schema.optionalKey(Label),
-      blocking: Schema.optionalKey(Schema.Boolean),
       ageMs: Schema.optionalKey(Measurement),
       used: Schema.optionalKey(Measurement),
       slots: Schema.optionalKey(Measurement),
@@ -93,7 +98,43 @@ export const AnalyticsEvent = Schema.Struct({
       key: Schema.optionalKey(Label),
       reason: Schema.optionalKey(Label),
       phase: Schema.optionalKey(Label),
+      tickId: Schema.optionalKey(Id),
+      activeTickId: Schema.optionalKey(Id),
+      cardsScanned: Schema.optionalKey(Measurement),
+      cardsChanged: Schema.optionalKey(Measurement),
+      dbMs: Schema.optionalKey(Measurement),
+      queueWaitMs: Schema.optionalKey(Measurement),
+      heapMB: Schema.optionalKey(Measurement),
+      overlappingTicks: Schema.optionalKey(Measurement),
       createdAt: Schema.optionalKey(Timestamp),
+      askId: Schema.optionalKey(Id),
+      notifiedAt: Schema.optionalKey(Timestamp),
+      notifiedByChannel: Schema.optionalKey(
+        Schema.Struct({
+          in_app: Schema.optionalKey(Timestamp),
+          telegram: Schema.optionalKey(Timestamp),
+          push: Schema.optionalKey(Timestamp),
+        }),
+      ),
+      notificationChannels: Schema.optionalKey(
+        Schema.Array(Schema.Literals(["in_app", "telegram", "push"])),
+      ),
+      firstSeenAt: Schema.optionalKey(Timestamp),
+      firstSeenBySurface: Schema.optionalKey(
+        Schema.Struct({
+          web: Schema.optionalKey(Timestamp),
+          desktop: Schema.optionalKey(Timestamp),
+          mobile: Schema.optionalKey(Timestamp),
+        }),
+      ),
+      answeredAt: Schema.optionalKey(Timestamp),
+      blocking: Schema.optionalKey(Schema.Boolean),
+      askKind: Schema.optionalKey(
+        Schema.Literals(["approve", "pick", "draft", "action", "input", "notice"]),
+      ),
+      hasBatchKey: Schema.optionalKey(Schema.Boolean),
+      openAsksAtCreation: Schema.optionalKey(Measurement),
+      answeredVia: Schema.optionalKey(Schema.Literals(["single", "batch", "free_text"])),
       status: Schema.optionalKey(Measurement),
       count: Schema.optionalKey(Measurement),
       bytes: Schema.optionalKey(Measurement),
@@ -104,6 +145,18 @@ export const AnalyticsEvent = Schema.Struct({
       depth: Schema.optionalKey(Measurement),
       droppedFrames: Schema.optionalKey(Measurement),
       memoryBytes: Schema.optionalKey(Measurement),
+      screen: Schema.optionalKey(Label),
+      containerType: Schema.optionalKey(Label),
+      containerName: Schema.optionalKey(Label),
+      ownerAction: Schema.optionalKey(Label),
+      visibleCardCount: Schema.optionalKey(Measurement),
+      visibleThreadCount: Schema.optionalKey(Measurement),
+      subscriptionBytes: Schema.optionalKey(Measurement),
+      subscriptionMessages: Schema.optionalKey(Measurement),
+      totalMs: Schema.optionalKey(Measurement),
+      maxMs: Schema.optionalKey(Measurement),
+      wallTimeMs: Schema.optionalKey(Measurement),
+      histogram: Schema.optionalKey(LongTaskHistogram),
     }),
   ),
 });
@@ -141,6 +194,19 @@ const LatencyFields = {
   maxMs: Schema.NullOr(Measurement),
   approximate: Schema.Boolean,
 };
+export const AskLatencySplit = Schema.Struct({
+  sentToSeen: Schema.Struct(LatencyFields),
+  seenToAnswered: Schema.Struct(LatencyFields),
+  createdToAnswered: Schema.Struct(LatencyFields),
+  answeredWithoutSeen: Measurement,
+});
+export const AskLatencyRollup = Schema.Struct({
+  ...AskLatencySplit.fields,
+  source: Schema.Literals(["stored-asks", "unavailable"]),
+  openOver1hAtDayEnd: Schema.NullOr(Measurement),
+  byBlocking: Schema.Record(Label, AskLatencySplit),
+  byKind: Schema.Record(Label, AskLatencySplit),
+});
 export const AnalyticsRollup = Schema.Struct({
   day: AnalyticsReadInput.fields.day,
   generatedAt: Timestamp,
@@ -149,6 +215,19 @@ export const AnalyticsRollup = Schema.Struct({
   invalidLines: Measurement,
   kindCounts: Schema.Record(Label, Measurement),
   errorCounts: Schema.Record(Label, Measurement),
+  longTasksByRoute: Schema.Array(
+    Schema.Struct({
+      route: Label,
+      surface: AnalyticsEvent.fields.surface,
+      count: Measurement,
+      totalMs: Measurement,
+      p95Ms: Schema.NullOr(Measurement),
+      maxMs: Measurement,
+      wallTimeMs: Measurement,
+      wallTimeShare: Schema.NullOr(Measurement),
+      approximate: Schema.Boolean,
+    }),
+  ),
   topSlowRpcs: Schema.Array(Schema.Struct({ method: Label, ...LatencyFields })),
   askAnswerLatency: Schema.Struct(LatencyFields),
   boards: Schema.Array(
@@ -196,6 +275,10 @@ export const AnalyticsRollup = Schema.Struct({
       ),
       overflow: Measurement,
     }),
+  ),
+  askLatency: AskLatencyRollup,
+  tickPhases: Schema.optionalKey(
+    Schema.Array(Schema.Struct({ boardId: Id, phase: Label, ...LatencyFields })),
   ),
   mcpCalls: Schema.Array(
     Schema.Struct({

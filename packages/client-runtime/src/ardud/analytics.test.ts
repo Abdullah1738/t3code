@@ -425,11 +425,11 @@ describe("analytics privacy", () => {
     await value.flush();
     const events = send.mock.calls.flatMap(([batch]) => batch);
     expect(
-      events.filter((event) => event.kind === "ask.answered").map((event) => event.props?.phase),
+      events.filter((event) => event.kind === "ask.answer_sent").map((event) => event.props?.phase),
     ).toEqual(["pick", "poll"]);
     expect(
       events
-        .filter((event) => event.kind === "ask.answered")
+        .filter((event) => event.kind === "ask.answer_sent")
         .every(
           (event) =>
             typeof event.durationMs === "number" &&

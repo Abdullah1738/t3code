@@ -1,6 +1,6 @@
-import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, mkdtempSync, openSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { constants } from "node:os";
 
@@ -11,8 +11,8 @@ export type LogEntry = {
 };
 const token = /^[a-zA-Z][a-zA-Z0-9_.-]{0,79}$/;
 const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper"]);
-const numeric = new Set(["exitCode", "attempt", "count", "bytes", "queuedMs", "failedSources", "totalSources"]);
-const boolean = new Set(["deduped", "accepted", "timedOut"]);
+const numeric = new Set(["exitCode", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources"]);
+const boolean = new Set(["deduped", "accepted", "timedOut", "notified"]);
 const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
 const values: Record<string, readonly string[]> = {
@@ -24,7 +24,16 @@ const values: Record<string, readonly string[]> = {
   stderrClass: ["usage_error", "missing_file", "permission", "timeout", "python_traceback", "auth", "connect", "json", "unknown"],
   triggerKind: ["file", "wal"],
 };
-export const logDirectory = () => process.env.TOOLLOG_DIR ?? join(homedir(), ".robob/logs/tools/watchers");
+let testRoot: string | undefined;
+export const logDirectory = () => {
+  if (process.env.TOOLLOG_DIR) return process.env.TOOLLOG_DIR;
+  const bunTest = process.versions.bun && /(?:\.(?:test|spec)|_(?:test|spec))\.[cm]?[jt]sx?$/.test(process.argv[1] ?? "");
+  if (process.env.ROBOB_TEST || process.env.NODE_ENV === "test" || process.env.PYTEST_CURRENT_TEST || bunTest) {
+    testRoot ??= mkdtempSync(join(tmpdir(), "watchers-test-logs-"));
+    return process.env.TOOLLOG_DIR = testRoot;
+  }
+  return join(homedir(), ".robob/logs/tools/watchers");
+};
 const initialized = new Set<string>();
 const CAP = 50 * 1024 * 1024;
 

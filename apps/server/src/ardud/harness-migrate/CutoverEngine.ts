@@ -292,8 +292,10 @@ const make = Effect.fn("HarnessCutover.make")(function* (
       let processed = 0;
       let light = 0;
       const visited = new Set<string>();
-      const put = (index: number, updated: CutoverStore.CutoverLedgerItem) =>
-        Effect.gen(function* () {
+      const put = Effect.fn("HarnessCutover.put")(function* (
+        index: number,
+        updated: CutoverStore.CutoverLedgerItem,
+      ) {
           const items = snapshot.items.slice();
           items[index] = updated;
           snapshot = { ...snapshot, items };

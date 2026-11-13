@@ -5,6 +5,7 @@ import * as References from "effect/References";
 import * as Option from "effect/Option";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as TickTimings from "./tickTimings.ts";
 import * as Exit from "effect/Exit";
 import * as Semaphore from "effect/Semaphore";
 import { KanbanError } from "@t3tools/contracts";
@@ -316,7 +317,10 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
             // happens masked, so an interrupt cannot land between take and ownership.
             yield* restore(
               Effect.interruptible(
-                wait(op, target, started, semaphore.withPermits(permits)(Effect.void)),
+                TickTimings.measure(
+                  "queue_wait",
+                  wait(op, target, started, semaphore.withPermits(permits)(Effect.void)),
+                ),
               ),
             );
           }

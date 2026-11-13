@@ -1,13 +1,13 @@
 import { continuationReport } from "../report.ts";
-import fs from "node:fs";
-import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+import * as NodeSqlite from "node:sqlite";
 globalThis.__l5InstallReport = continuationReport;
 const home = process.argv[process.argv.indexOf("--base-dir") + 1];
-if (!home || !fs.existsSync(path.join(home, ".crash-sandbox")))
+if (!home || !NodeFS.existsSync(NodePath.join(home, ".crash-sandbox")))
   throw Error("Probe requires marked synthetic home");
 globalThis.__l5Snapshot = () => {
-  const db = new DatabaseSync(path.join(home, "userdata", "statev2.sqlite"), { readOnly: true });
+  const db = new NodeSqlite.DatabaseSync(NodePath.join(home, "userdata", "statev2.sqlite"), { readOnly: true });
   try {
     return Object.fromEntries(
       ["runs", "provider_turns", "provider_threads", "messages", "subagents", "threads"].map(
@@ -34,12 +34,12 @@ EventSinkV2.of = (service) =>
     commitCommand: (input) => {
       if (input.commandType !== "provider-runtime.reconcile") return service.commitCommand(input);
       return Effect.sync(() => {
-        if (!fs.existsSync(path.join(home, ".pause-reconcile"))) return;
-        fs.writeFileSync(
-          path.join(home, ".cut-snapshot"),
+        if (!NodeFS.existsSync(NodePath.join(home, ".pause-reconcile"))) return;
+        NodeFS.writeFileSync(
+          NodePath.join(home, ".cut-snapshot"),
           JSON.stringify(globalThis.__l5Snapshot()),
         );
-        fs.writeFileSync(path.join(home, ".reconcile-boundary"), input.commandId);
+        NodeFS.writeFileSync(NodePath.join(home, ".reconcile-boundary"), input.commandId);
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
       }).pipe(Effect.andThen(service.commitCommand(input)));
     },

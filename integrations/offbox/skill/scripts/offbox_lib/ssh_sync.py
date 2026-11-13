@@ -55,6 +55,21 @@ def cfg_path(box_id: str) -> Path:
     return SSH_DIR / f"config_{box_id}"
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + ".", suffix=".tmp",
+                                         delete=False, mode="w") as f:
+            tmp = Path(f.name)
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
 @toollog.observed("ssh", "ssh.setup", "ssh_setup")
 def setup(box_id: str) -> Path:
     """Authorize our key on the box's current machine and pin its host key. Needed after every create/resume/fork."""
@@ -99,10 +114,9 @@ def setup(box_id: str) -> Path:
         # Both are allocated host proxy ports, not the guest's 2222/22 listeners.
         home_ports = f"# offbox-home-ports {int(mgmt_port)} {int(port)}\n"
     kh = SSH_DIR / f"known_hosts_{box_id}"
-    kh.write_text(f"{box_id} {r['hostKey']}\n")
+    _atomic_write_text(kh, f"{box_id} {r['hostKey']}\n")
     cfg = cfg_path(box_id)
-    tmp = cfg.with_suffix(".tmp")
-    tmp.write_text(f"""Host {box_id}
+    _atomic_write_text(cfg, f"""Host {box_id}
   HostName {host}
   Port {port}
   User {r.get('sshUser') or 'user'}
@@ -120,7 +134,6 @@ def setup(box_id: str) -> Path:
   ControlPersist 600
   LogLevel ERROR
 """ + home_ports)
-    os.replace(tmp, cfg)
     log(f"ssh setup {box_id} endpoint={host}:{port}")
     return cfg
 

@@ -1473,11 +1473,11 @@ def send_urgent(item_id, text, channel, now, seconds=4):
             elif status:
                 raise RuntimeError('iMessage queued or unresolved; awaiting transport confirmation')
         if channel == 'telegram':
-            command = [str(BUN), stub or str(TELEGRAM_CLI), 'notify', '--source', 'Inbox triage',
-                       '--severity', 'attention', '--text', entry[text_key], '--key', key]
+            command = [str(BUN), stub or str(TELEGRAM_CLI), 'notify', '--source=Inbox triage',
+                       '--severity=attention', f'--text={entry[text_key]}', f'--key={key}']
         else:
-            command = [str(BUN), stub or str(SPECTRUM_CLI), 'send', '--text', entry[text_key],
-                       '--session', owner_route(), '--key', key]
+            command = [str(BUN), stub or str(SPECTRUM_CLI), 'send', f'--text={entry[text_key]}',
+                       f'--session={owner_route()}', f'--key={key}']
         out = run_helper('telegram-bridge' if channel == 'telegram' else 'spectrum-bridge', command,
                          capture_output=True, text=True, timeout=seconds,
                          env={k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'})
@@ -1826,8 +1826,8 @@ def send_health(state, due, wd, now):
     failures = state.setdefault('health_delivery_failures', {})
     previous = failures.get('telegram-bridge')
     try:
-        out = run_helper('telegram-bridge', [str(BUN), stub or str(TELEGRAM_CLI), 'notify', '--source', 'Inbox triage', '--severity', 'attention',
-                          '--text=' + pending['text'], '--key', pending['key']], capture_output=True, text=True, timeout=4,
+        out = run_helper('telegram-bridge', [str(BUN), stub or str(TELEGRAM_CLI), 'notify', '--source=Inbox triage', '--severity=attention',
+                          f'--text={pending["text"]}', f'--key={pending["key"]}'], capture_output=True, text=True, timeout=4,
                          failure_state=failures,
                          env={k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'})
         if out.returncode:

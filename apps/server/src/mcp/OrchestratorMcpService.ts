@@ -71,7 +71,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
-import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
+import { latestRootProviderFailure, runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import {
   normalizeThreadPullRequestKey,
   visibleThreadPullRequests,
@@ -1943,6 +1943,7 @@ const make = Effect.gen(function* () {
       );
     }
     onProgress?.({ childThreadId: task.childThreadId, childNodeId: task.id });
+    // Keep failures available if assistant-result hydration exceeds the status deadline.
     const childControls = yield* threadManagement
       .getThreadRecords(
         task.childThreadId,
@@ -1955,8 +1956,9 @@ const make = Effect.gen(function* () {
           "providerTurns",
           "runtimeRequests",
           "nodes",
+          "turnItems",
         ],
-        { messageRoles: ["user"], omitSettledLeafNodes: true },
+        { messageRoles: ["user"], turnItemTypes: ["error"], omitSettledLeafNodes: true },
         { projectionOnly: true },
       )
       .pipe(NodeSqliteClient.foregroundReads, Effect.mapError(threadManagementFailure), (effect) =>
@@ -2012,39 +2014,6 @@ const make = Effect.gen(function* () {
             : "result_available"
           : "working"
         : progress.state;
-    const resultTransfer = taskResultTransfer(parentProjection, childControls, task) ?? null;
-    const summaryRun =
-      task.result === null
-        ? taskResultRun
-        : (childControls.runs.find((run) => run.id === resultTransfer?.sourcePoint.runId) ??
-          childRun);
-    const resultRunIds = [
-      ...new Set(
-        [taskResultRun?.id, terminalRun?.id, childRun?.id, summaryRun?.id].filter(
-          (id): id is RunId => id !== undefined,
-        ),
-      ),
-    ];
-    const resultRecords = yield* threadManagement
-      .getThreadRecords(
-        task.childThreadId,
-        ["messages", "turnItems"],
-        {
-          messageRoles: ["assistant"],
-          messageRunIds: resultRunIds,
-          turnItemRunIds: resultRunIds,
-          turnItemTypes: ["assistant_message", "error"],
-        },
-        { projectionOnly: true },
-      )
-      .pipe(NodeSqliteClient.foregroundReads, Effect.mapError(threadManagementFailure), (effect) =>
-        McpTaskTrace.stage(effect, "result", "t3.task"),
-      );
-    const childProjection = {
-      ...childControls,
-      messages: [...childControls.messages, ...resultRecords.messages],
-      turnItems: resultRecords.turnItems,
-    };
     const heldForRestart =
       task.result === null &&
       taskWorkState === "result_available" &&
@@ -2076,6 +2045,62 @@ const make = Effect.gen(function* () {
     const resultRun = taskResultRun ?? childRun;
     const stall = isTerminalTaskStatus(reportedStatus) ? resultRun?.delegatedTaskStall : undefined;
     const status = stall === undefined ? reportedStatus : "failed";
+    const providerFailure =
+      status === "failed"
+        ? latestRootProviderFailure(resultRun ?? null, childControls.turnItems)
+        : null;
+    const taskFailure =
+      status !== "failed"
+        ? undefined
+        : providerFailure !== null
+          ? {
+              category: providerFailure.category ?? "unknown",
+              code: providerFailure.code,
+              message: providerFailure.message.slice(0, 2_000),
+              retryable: providerFailure.retryable,
+            }
+          : stall === undefined
+            ? undefined
+            : {
+                category: "unknown" as const,
+                code: null,
+                message: stalledSummary(stall, null).slice(0, 2_000),
+                retryable: null,
+              };
+    onProgress?.({ status, ...(taskFailure === undefined ? {} : { failure: taskFailure }) });
+    const resultTransfer = taskResultTransfer(parentProjection, childControls, task) ?? null;
+    const summaryRun =
+      task.result === null
+        ? taskResultRun
+        : (childControls.runs.find((run) => run.id === resultTransfer?.sourcePoint.runId) ??
+          childRun);
+    const resultRunIds = [
+      ...new Set(
+        [taskResultRun?.id, terminalRun?.id, childRun?.id, summaryRun?.id].filter(
+          (id): id is RunId => id !== undefined,
+        ),
+      ),
+    ];
+    const resultRecords = yield* threadManagement
+      .getThreadRecords(
+        task.childThreadId,
+        ["messages", "turnItems"],
+        {
+          messageRoles: ["assistant"],
+          messageRunIds: resultRunIds,
+          turnItemRunIds: resultRunIds,
+          turnItemTypes: ["assistant_message"],
+        },
+        { projectionOnly: true },
+      )
+      .pipe(NodeSqliteClient.foregroundReads, Effect.mapError(threadManagementFailure), (effect) =>
+        McpTaskTrace.stage(effect, "result", "t3.task"),
+      );
+    const childProjection = {
+      ...childControls,
+      messages: [...childControls.messages, ...resultRecords.messages],
+      turnItems: [...childControls.turnItems, ...resultRecords.turnItems],
+    };
     const resultText = (run: OrchestrationV2Run) => {
       const partial = subagentResultForRun(childProjection, run);
       return run.delegatedTaskStall === undefined
@@ -2169,6 +2194,7 @@ const make = Effect.gen(function* () {
       childRunId: childRun?.id ?? null,
       childNodeId: task.id,
       status,
+      ...(taskFailure === undefined ? {} : { failure: taskFailure }),
       startedAt: childRun?.startedAt == null ? null : DateTime.formatIso(childRun.startedAt),
       startPending:
         childRun?.startedAt == null &&

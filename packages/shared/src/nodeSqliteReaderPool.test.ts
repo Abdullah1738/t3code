@@ -172,6 +172,9 @@ for (const lane of ["foreground", "background", "writer", "checkpoint writer"] a
         assert.equal(statement["db.reader.slot"], reader ? 0 : undefined);
         assert.equal(statement["db.reader.waiting"], true);
         assert.equal(statement["db.reader.wait_interrupted"], true);
+        assert.equal(statement["db.reader.acquired"], false);
+        assert.isNumber(statement["db.reader.wait_ms"]);
+        assert.equal(statement["db.reader.wait_ms"], statement["db.lock_wait_ms"]);
         assert.isAbove(Number(statement["db.lock_wait_ms"]), 0);
         assert.equal(statement["db.reader.acquire_wait_ms"], statement["db.lock_wait_ms"]);
         assert.isUndefined(statement["db.reader.hold_ms"]);
@@ -195,6 +198,7 @@ for (const lane of ["foreground", "background", "writer", "checkpoint writer"] a
         assert.equal(statement["db.reader.lane"], reader ? lane : undefined);
         assert.equal(statement["db.reader.slot"], reader ? 0 : undefined);
         assert.equal(statement["db.reader.waiting"], false);
+        assert.equal(statement["db.reader.acquired"], true);
         assert.isUndefined(statement["db.reader.wait_interrupted"]);
         assert.isNumber(statement["db.lock_wait_ms"]);
         assert.equal(

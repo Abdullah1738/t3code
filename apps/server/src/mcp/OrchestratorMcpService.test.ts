@@ -48,7 +48,12 @@ import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/process";
 
-import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
+import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
+import { stalledSummary } from "../orchestration-v2/delegatedTaskProgress.ts";
+import {
+  codexFailureCategory,
+  CodexProviderCapabilitiesV2,
+} from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as LegacyV1ThreadImporter from "../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
@@ -122,6 +127,226 @@ const captureSpans = () => {
 };
 
 describe("OrchestratorMcpService", () => {
+  it.effect.each([
+    { status: "failed", code: "cyberPolicy", category: "content_filter", partial: false },
+    { status: "failed", code: "serverOverloaded", category: "transient", partial: false },
+    { status: "failed", code: "cyberPolicy", category: "content_filter", partial: true },
+    { status: "failed", code: "serverOverloaded", category: "transient", partial: true },
+    { status: "failed", code: null, category: "unknown", partial: false },
+    { status: "completed", code: "cyberPolicy", category: null, partial: false },
+    { status: "running", code: "cyberPolicy", category: null, partial: false },
+    { status: "cancelled", code: "cyberPolicy", category: null, partial: false },
+    { status: "interrupted", code: "cyberPolicy", category: null, partial: false },
+    {
+      status: "failed",
+      code: "serverOverloaded",
+      category: "transient",
+      partial: false,
+      continuation: true,
+    },
+    { status: "running", code: "cyberPolicy", category: null, partial: false, continuation: true },
+    {
+      status: "completed",
+      code: "cyberPolicy",
+      category: null,
+      partial: false,
+      continuation: true,
+    },
+    {
+      status: "failed",
+      code: "cyberPolicy",
+      category: "content_filter",
+      partial: false,
+      stalled: true,
+    },
+  ] as const)(
+    "reports normalized task failure only for failed tasks ($status, $code, partial=$partial)",
+    (testCase) =>
+      Effect.gen(function* () {
+        const { status, code, category, partial } = testCase;
+        const continuation = "continuation" in testCase;
+        const stalled = "stalled" in testCase;
+        const parentThreadId = ThreadId.make("failure-parent");
+        const childThreadId = ThreadId.make("failure-child");
+        const taskId = NodeId.make("failure-task");
+        const runId = RunId.make("failure-run");
+        const rootNodeId = NodeId.make("failure-root");
+        const at = DateTime.makeUnsafe("2026-11-13T00:00:00Z");
+        const blocked = yield* Deferred.make<void>();
+        const never = yield* Deferred.make<never>();
+        const providerFailure = makeProviderFailure({
+          message: `Provider refused Authorization: Bearer test-private-token ${continuation ? "please retry" : "detail ".repeat(400)}`,
+          code,
+          category: codexFailureCategory(code, code),
+          retryable: code === "serverOverloaded",
+        });
+        // Records written before categories existed decode with category unknown.
+        const { category: _category, ...legacyFailure } = providerFailure;
+        const parent = {
+          ...idleThreadProjection(liveThreadShell(parentThreadId)),
+          subagents: [
+            {
+              id: taskId,
+              threadId: parentThreadId,
+              origin: "app_owned",
+              childThreadId,
+              status,
+              result: status === "running" ? null : "Task ended.",
+              completionDelivery: { state: "acknowledged" },
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const errorItem = {
+          id: "error:root",
+          runId,
+          nodeId: rootNodeId,
+          ordinal: 1,
+          type: "error",
+          status: "failed",
+          updatedAt: at,
+          failure: code === null ? legacyFailure : providerFailure,
+        };
+        const child = {
+          ...idleThreadProjection(liveThreadShell(childThreadId)),
+          runs: [
+            ...(continuation
+              ? [
+                  {
+                    id: RunId.make("failure-original"),
+                    delegatedTaskId: taskId,
+                    rootNodeId,
+                    ordinal: 1,
+                    status: "failed",
+                    startedAt: at,
+                    completedAt: at,
+                  },
+                ]
+              : []),
+            {
+              id: runId,
+              delegatedTaskId: taskId,
+              rootNodeId,
+              ordinal: continuation ? 2 : 1,
+              status,
+              startedAt: at,
+              completedAt: status === "running" ? null : at,
+              ...(stalled
+                ? {
+                    delegatedTaskStall: {
+                      idleTimeoutMs: 60_000,
+                      lastProgressAt: at,
+                      lastProgressKind: "assistant_text",
+                    },
+                  }
+                : {}),
+            },
+          ],
+          turnItems: [
+            ...(continuation
+              ? [
+                  {
+                    ...errorItem,
+                    id: "error:original",
+                    runId: "failure-original",
+                    failure: makeProviderFailure({
+                      message: "Original run refused",
+                      category: "content_filter",
+                    }),
+                  },
+                ]
+              : []),
+            errorItem,
+            {
+              ...errorItem,
+              id: "error:nested",
+              ordinal: 2,
+              nodeId: "nested-node",
+              failure: makeProviderFailure({ message: "Nested failure", category: "config" }),
+            },
+            {
+              ...errorItem,
+              id: "error:other",
+              ordinal: 3,
+              runId: "unrelated-run",
+              failure: makeProviderFailure({
+                message: "Other run failed",
+                category: "auth_expired",
+              }),
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
+            getThreadRecords: (id, fields, filter) => {
+              if (id === childThreadId && filter?.messageRoles?.includes("user")) {
+                assert.isTrue(fields?.some((field) => field === "turnItems"));
+                assert.deepEqual(filter.turnItemTypes, ["error"]);
+              }
+              if (partial && id === childThreadId && filter?.messageRoles?.includes("assistant")) {
+                return Deferred.succeed(blocked, undefined).pipe(
+                  Effect.andThen(Deferred.await(never)),
+                );
+              }
+              return Effect.succeed(id === parentThreadId ? parent : child);
+            },
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const read = yield* service
+            .taskStatus(
+              {
+                environmentId: EnvironmentId.make("failure-env"),
+                requestNamespace: "failure",
+                thread: {
+                  threadId: parentThreadId,
+                  providerSessionId: "failure",
+                  providerInstanceId: ProviderInstanceId.make("codex"),
+                },
+                client: undefined,
+                capabilities: new Set(["orchestration"]),
+                issuedAt: 1,
+              },
+              taskId,
+            )
+            .pipe(Effect.forkChild);
+          if (partial) {
+            yield* Deferred.await(blocked);
+            yield* TestClock.adjust("10 seconds");
+          }
+          const result = yield* Fiber.join(read);
+          assert.equal(result.partial, partial);
+          assert.equal(result.status, status);
+          if (category === null) {
+            assert.isUndefined(result.failure);
+          } else {
+            assert.deepEqual(result.failure, {
+              category,
+              code: providerFailure.code,
+              message: providerFailure.message.slice(0, 2_000),
+              retryable: code === "serverOverloaded",
+            });
+            assert.equal(
+              result.failure!.message.length,
+              Math.min(2_000, providerFailure.message.length),
+            );
+            assert.include(result.failure!.message, "[REDACTED]");
+            assert.notInclude(result.failure!.message, "test-private-token");
+          }
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+      }),
+  );
+
   it.effect("a terminal stalled run is reported correctly before parent finalization", () =>
     Effect.gen(function* () {
       const parentThreadId = ThreadId.make("stall-race-parent");
@@ -226,6 +451,12 @@ describe("OrchestratorMcpService", () => {
         );
         assert.equal(result.status, "failed");
         assert.equal(result.failureReason, "stalled");
+        assert.deepEqual(result.failure, {
+          category: "unknown",
+          code: null,
+          message: stalledSummary(child.runs[0]!.delegatedTaskStall!, null),
+          retryable: null,
+        });
         assert.equal(result.latestTerminalStatus, "failed");
         assert.match(result.summary!, /^Stalled:/);
         assert.include(result.summary!, "Partial work");
@@ -740,7 +971,20 @@ describe("OrchestratorMcpService", () => {
                 : "cancelled"
               : undefined,
           );
-          assert.isUndefined(result.status);
+          assert.equal(
+            result.status,
+            blockedStage === "result" ? (stalled ? "failed" : "cancelled") : undefined,
+          );
+          if (blockedStage === "result" && stalled) {
+            assert.deepEqual(result.failure, {
+              category: "unknown",
+              code: null,
+              message: stalledSummary(child.runs[0]!.delegatedTaskStall!, null),
+              retryable: null,
+            });
+          } else {
+            assert.isUndefined(result.failure);
+          }
           assert.isUndefined(result.summary);
         }).pipe(
           Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))),
@@ -1026,6 +1270,7 @@ describe("OrchestratorMcpService", () => {
         messages: [],
         subagents: [],
         providerThreads: [],
+        turnItems: [],
         runtimeRequests: [],
       } as unknown as OrchestrationV2ThreadProjection;
       const layerDependencies = Layer.mergeAll(
@@ -1104,6 +1349,7 @@ describe("OrchestratorMcpService", () => {
         messages: [],
         subagents: [],
         providerThreads: [],
+        turnItems: [],
         runtimeRequests: [],
       } as unknown as OrchestrationV2ThreadProjection;
       const layerDependencies = Layer.mergeAll(
@@ -1185,6 +1431,7 @@ describe("OrchestratorMcpService", () => {
         messages: [],
         subagents: [],
         providerThreads: [],
+        turnItems: [],
         runtimeRequests: [],
       } as unknown as OrchestrationV2ThreadProjection;
       const layerDependencies = Layer.mergeAll(
@@ -1272,6 +1519,7 @@ describe("OrchestratorMcpService", () => {
         messages: [],
         subagents: [],
         providerThreads: [],
+        turnItems: [],
         runtimeRequests: [],
       } as unknown as OrchestrationV2ThreadProjection;
       const layerDependencies = Layer.mergeAll(
@@ -1371,6 +1619,7 @@ describe("OrchestratorMcpService", () => {
             ],
             providerThreads: [],
             runtimeRequests: [],
+            turnItems: [],
           },
         ],
         [
@@ -1383,6 +1632,7 @@ describe("OrchestratorMcpService", () => {
             subagents: [],
             providerThreads: [],
             runtimeRequests: [],
+            turnItems: [],
           },
         ],
       ]) as unknown as ReadonlyMap<ThreadId, OrchestrationV2ThreadProjection>;
