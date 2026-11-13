@@ -99,7 +99,15 @@ export async function rollup(day: string, dir = logDirectory()) {
     const durations: Record<string, number[]> = Object.create(null);
     const errors: Record<string, { count: number; sampleId?: string }> = Object.create(null);
     let total = 0, ok = 0, failed = 0, withOk = 0;
-    const lines = createInterface({ input: createReadStream(join(dir, `${day}.ndjson`)), crlfDelay: Infinity });
+    const source = join(dir, `${day}.ndjson`);
+    let sourceExists = true;
+    try { statSync(source); }
+    catch (error) {
+      if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "ENOENT") throw error;
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      sourceExists = false;
+    }
+    const lines = sourceExists ? createInterface({ input: createReadStream(source), crlfDelay: Infinity }) : [];
     for await (const line of lines) {
       let row; try { row = JSON.parse(line); } catch { continue; }
       if (!row || row.tool !== "watchers" || !token.test(row.name) || !["event", "perf", "error"].includes(row.kind)) continue;
