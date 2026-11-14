@@ -1838,8 +1838,9 @@ parentPort.on("message", (request) => {
     if (!checkpoint && classifications.get(statement)?.journalMode) {
       enableWal();
     }
-    const committed = !db.isTransaction && /^\\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\\b/i.test(sql);
-    parentPort.postMessage({ id, rows, committed, write: observedWrite, elapsedMs, controlMs,
+    const committed = !db.isTransaction && /^\\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\\b/i.test(statement.sourceSQL);
+    const committedTransaction = committed && /^\\s*(?:COMMIT|END)\\s*;?\\s*$/i.test(statement.sourceSQL);
+    parentPort.postMessage({ id, rows, committed, committedTransaction, write: observedWrite, elapsedMs, controlMs,
       inTransaction: db.isTransaction,
       ...priorRecovery, ...recoverySnapshot(classification, sql, params, statement.expandedSQL) });
   } catch (error) {
@@ -1902,6 +1903,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
   type Reply = WriterSetupReply & {
     readonly id: number;
     readonly committed?: boolean;
+    readonly committedTransaction?: boolean;
     readonly elapsedMs?: number;
     readonly controlMs?: number;
     readonly write?: boolean;
@@ -2077,8 +2079,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
             if (input.sql !== undefined) setup.record(reply);
             // Observe after SQLite returns; tracing must never change a commit result.
             try {
-              if (reply.committed && /^\s*(?:COMMIT|END)\s*;?\s*$/i.test(input.sql ?? ""))
-                fiber.getRef(TransactionCommitObserver)?.();
+              if (reply.committedTransaction) fiber.getRef(TransactionCommitObserver)?.();
               const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
               if (
                 statementMetrics &&

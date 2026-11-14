@@ -3149,6 +3149,60 @@ it.effect("retains transaction control timings on the caller span with a worker 
   );
 });
 
+it.effect.each([
+  "COMMIT",
+  "COMMIT;",
+  "  COMMIT  ;  ",
+  "commit;",
+  "\nCoMmIt;\n",
+  "COMMIT; -- done",
+  "COMMIT; /* done */",
+  "COMMIT;\n-- done\n",
+  "COMMIT;; -- done",
+  "COMMIT; SELECT 1",
+  "END",
+  "END; -- done",
+  "end; /* done */",
+  "COMMIT TRANSACTION; -- done",
+  "END TRANSACTION; -- done",
+  "/* leading */ COMMIT;",
+  "-- leading\nCOMMIT;",
+  "COMMIT -- done",
+])("matches native commit-observer eligibility after acknowledgement (%s)", (statement) =>
+  withFileClient((sql, filename) =>
+    Effect.gen(function* () {
+      yield* sql`CREATE TABLE syntax_ack(value INTEGER)`;
+      const native = yield* openDatabase(filename);
+      const source = native.prepare(statement).sourceSQL;
+      const expected = /^\s*(?:COMMIT|END)\s*;?\s*$/i.test(source) ? 1 : 0;
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const connection = yield* sql.reserve;
+          yield* connection.executeUnprepared("BEGIN", [], undefined);
+          yield* connection.executeUnprepared("INSERT INTO syntax_ack VALUES (1)", [], undefined);
+          const held = holdWriterReply(writerWorkers.at(-1)!, /.*/);
+          yield* Effect.addFinalizer(() => Effect.sync(held.deliver));
+          let commits = 0;
+          const commit = yield* connection.executeUnprepared(statement, [], undefined).pipe(
+            Effect.provideService(SqliteClient.TransactionCommitObserver, () => {
+              commits++;
+            }),
+            Effect.forkChild,
+          );
+          yield* Effect.promise(() => held.ready);
+          assert.deepEqual(native.prepare("SELECT value FROM syntax_ack").all(), [{ value: 1 }]);
+          assert.equal(commits, 0);
+          assert.isUndefined(commit.pollUnsafe());
+          held.deliver();
+          yield* Fiber.join(commit);
+          assert.equal(commits, expected);
+        }),
+      );
+      assert.deepEqual(yield* sql`SELECT value FROM syntax_ack`.values, [[1]]);
+    }),
+  ),
+);
+
 it.effect("observes a commit only after the writer acknowledgement is delivered", () =>
   withFileClient((sql, filename) =>
     Effect.gen(function* () {
