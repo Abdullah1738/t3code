@@ -2627,16 +2627,17 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
     stats = stats if stats is not None else {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
     # Count the active input snapshot, including deferred questions. not_checked
     # is a subset of limited; only completed, error-free screens are proven_clean.
-    census = stats['charge_census'] = {app: dict.fromkeys(
-        ('open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked'), 0)
-        for app in ('noon', 'careem')}
-    census_questions = {}
-    for q in questions:
-        app = charges.order_app(charge_of(q)) if q.get('kind') == 'charge' and active(q) else None
-        if app in census:
-            census_questions[q['id']] = app
-            for key in ('open', 'limited', 'not_checked'):
-                census[app][key] += 1
+    with charges.step_timing(stats, 'census'):
+        census = stats['charge_census'] = {app: dict.fromkeys(
+            ('open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked'), 0)
+            for app in ('noon', 'careem')}
+        census_questions = {}
+        for q in questions:
+            app = charges.order_app(charge_of(q)) if q.get('kind') == 'charge' and active(q) else None
+            if app in census:
+                census_questions[q['id']] = app
+                for key in ('open', 'limited', 'not_checked'):
+                    census[app][key] += 1
     census_outcomes = {}
 
     def counted(qid, outcome):
@@ -2664,7 +2665,20 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
         if source_error is not None:
             raise source_error
         try:
-            return owner_source(*args, **kwargs)
+            # Old questions query separate windows; all windows share this cap.
+            remaining = charges.OWNER_BUDGET - stats.get('owner_threads_ms', 0) / 1000
+            if remaining <= 0:
+                raise charges.Lookup('Robob control: lookup over time')
+            stop = time.time() + remaining
+            if kwargs.get('deadline') is not None:
+                stop = min(stop, kwargs['deadline'])
+            kwargs['deadline'] = stop
+            with charges.step_timing(stats, 'owner_threads', stop), within(
+                    stop, charges.Lookup('Robob control: lookup over time')):
+                rows = owner_source(*args, **kwargs)
+                if time.time() >= stop:
+                    raise charges.Lookup('Robob control: lookup over time')
+                return rows
         except charges.Lookup as exc:
             if str(exc) != 'out of time':
                 source_error = exc
@@ -2828,20 +2842,21 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                         errors.append(f"{q['id']}: {e}")
         # Reconcile from a snapshot: updating one alias must not propagate its
         # outcome through another alias to a distinct same-descriptor question.
-        attempted = census_outcomes.copy()
-        for q in book['questions']:
-            if q['id'] not in census_questions:
-                continue
-            if q.get('status') == 'closed' and (q.get('explanation') or {}).get('verdict') in (
-                    'receipt', 'owner', 'subscription'):
-                counted(q['id'], 'matched')
-            elif active(q) and q['id'] in attempted:
-                result = alert_verdict(transactions, q, now)
-                if result and result['verdict'] == 'unverified':
-                    peers = transactions.get(unmatched_id(q), [])
-                    failed_alias = any(attempted.get(source['id']) == 'error' and alert_alias(q, source)
-                                       for source, _ in peers)
-                    counted(q['id'], 'error' if failed_alias else 'limited')
+        with charges.step_timing(stats, 'census', end):
+            attempted = census_outcomes.copy()
+            for q in book['questions']:
+                if q['id'] not in census_questions:
+                    continue
+                if q.get('status') == 'closed' and (q.get('explanation') or {}).get('verdict') in (
+                        'receipt', 'owner', 'subscription'):
+                    counted(q['id'], 'matched')
+                elif active(q) and q['id'] in attempted:
+                    result = alert_verdict(transactions, q, now)
+                    if result and result['verdict'] == 'unverified':
+                        peers = transactions.get(unmatched_id(q), [])
+                        failed_alias = any(attempted.get(source['id']) == 'error' and alert_alias(q, source)
+                                           for source, _ in peers)
+                        counted(q['id'], 'error' if failed_alias else 'limited')
         prune_questions(book, now)
     return errors
 
@@ -2981,8 +2996,9 @@ def direct_refund_statement(evidence, done, merchant):
     return lead in ('', 'your', 'the', 'our', 'this', 'that') or money
 
 
-def refund_mails(data, now, deadline, find=None, read=None):
-    find, read = find or charges.search, read or charges.show
+def refund_mails(data, now, deadline, find=None, read=None, stats=None):
+    find = find or (lambda *a, **kw: charges.search(*a, **kw, stats=stats))
+    read = read or (lambda *a, **kw: charges.show(*a, **kw, stats=stats))
     errors = []
     for case in load(data)['cases']:
         merchant = case['merchant']
@@ -3364,7 +3380,10 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
                                 'sourceLimits': diagnostic.get('sourceLimits', 0),
                                 'limitKinds': diagnostic.get('limitKinds', []),
                                 'orderCoverage': diagnostic.get('order_coverage', {}),
-                                'chargeCensus': diagnostic.get('charge_census', {})})
+                                'chargeCensus': diagnostic.get('charge_census', {}),
+                                **{key: stats.get(key, 0) for key in (
+                                    'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms')},
+                                'starved_by': stats.get('starved_by', diagnostic.get('starved_by', 'none'))})
         except Exception:
             pass
 
@@ -3429,7 +3448,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
             errors += follow_payments(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
             errors += follow(data or DATA, now, root, min(end - 8, time.time() + FOLLOW_BUDGET), find, said,
                             end=work_end, stats=stats)
-            errors += refund_mails(data or DATA, now, time.time() + 8, find)
+            errors += refund_mails(data or DATA, now, time.time() + 8, find, stats=stats)
             phases[phase] = time.time() - phase_at
             phase, phase_at = 'attention', time.time()
             if errors:
@@ -3545,6 +3564,8 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
                                        'clock': starts, 'days': list(dict.fromkeys(days)), 'event': event}
     except CheckTimeout as e:
         diagnostic['budgetHit'] = time.time() >= work_end
+        if diagnostic['budgetHit']:
+            stats['starved_by'] = getattr(e, '_money_cases_step', phase)
         errors = state.setdefault('question_errors', {'at': stamp(now), 'errors': []})['errors']
         errors.append(str(e))
         # A partly built event was never handed to the runner. Keep only a previously owned outbox.
@@ -3562,7 +3583,9 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
         phases['build_write'] = built_s + time.time() - save_at
         return {'at': stamp(now), 'total_s': round(time.time() - started, 3),
                 **{f'{key}_s': round(value, 3) for key, value in phases.items()},
-                **{k: stats[k] for k in ('lookups', 'owner_queries', 'msgs_calls')}, 'slowest': max(phases, key=phases.get)}
+                **{k: stats[k] for k in ('lookups', 'owner_queries', 'msgs_calls')},
+                **{k: stats.get(k, 0) for k in ('owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms')},
+                'starved_by': stats.get('starved_by', 'none'), 'slowest': max(phases, key=phases.get)}
 
     saved = False
     state.pop('timing', None)
@@ -3570,8 +3593,11 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
         with within(end, CheckTimeout('out of time saving pings; the rest next check')):
             write_json(pings, state, timing=timing)
             saved = True
-    except CheckTimeout:
-        diagnostic['budgetHit'] = diagnostic['budgetHit'] or time.time() >= end
+    except CheckTimeout as exc:
+        already_expired = diagnostic['budgetHit']
+        diagnostic['budgetHit'] = already_expired or time.time() >= end
+        if time.time() >= end and (save_at < end or not already_expired):
+            stats['starved_by'] = getattr(exc, '_money_cases_step', 'build_write')
         # The old pings file is intact; never emit an event without its committed outbox.
         event = ''
     result = timing()
