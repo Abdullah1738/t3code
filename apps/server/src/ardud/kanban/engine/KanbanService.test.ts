@@ -12355,15 +12355,6 @@ it.effect("#662 an unattached own worker can ask without blocking and drop the a
         activeRole: null,
         activePool: null,
       });
-      const before = yield* kanban.card(created.id);
-      const blockingMessage = `card #${created.number} has no thread attached; a blocking ask needs the card in Working. Ask without blocking, or wait for the dispatcher to attach you.`;
-      const denied = yield* kanban
-        .askOwner(created.id, { question: "Wait?", blocking: true }, worker, "cardThread")
-        .pipe(Effect.flip);
-      assert.strictEqual(denied.code, "denied");
-      assert.strictEqual(denied.detail, blockingMessage);
-      assert.deepStrictEqual(yield* kanban.card(created.id), before);
-
       const asked = yield* kanban.askOwner(
         created.id,
         { question: "Which fee?", blocking: false },
@@ -12378,12 +12369,6 @@ it.effect("#662 an unattached own worker can ask without blocking and drop the a
       );
       assert.deepStrictEqual(posted?.author, worker);
       assert.include(JSON.stringify(posted?.blocks), "Which fee?");
-      const askedBefore = yield* kanban.card(created.id);
-      const block = yield* kanban
-        .changeAsk(created.id, "q1", "block", worker, "cardThread")
-        .pipe(Effect.flip);
-      assert.strictEqual(block.detail, blockingMessage);
-      assert.deepStrictEqual(yield* kanban.card(created.id), askedBefore);
       const missing = yield* kanban
         .changeAsk(created.id, "missing", "block", worker, "cardThread")
         .pipe(Effect.flip);
@@ -12409,6 +12394,129 @@ it.effect("#662 an unattached own worker can ask without blocking and drop the a
       assert.strictEqual(edit.detail, `open ask q1 on card #${created.number}`);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
+);
+
+it.effect.each(
+  (["ask", "block"] as const).flatMap((path) =>
+    (["answer", "drop"] as const).flatMap((finish) =>
+      ([null, "answer", "drop"] as const).map((previous) => ({ path, finish, previous })),
+    ),
+  ),
+)(
+  "#1414 todo worker blocks via $path and resumes after $finish (pending $previous)",
+  ({ path, finish, previous }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const created = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const running = (yield* kanban.card(created.id)).card;
+        const threadId = running.workThreadId!;
+        const worker: KanbanActor = { _tag: "thread", threadId };
+        const other: KanbanActor = { _tag: "thread", threadId: ThreadId.make("other") };
+        yield* store.putCard({
+          ...running,
+          stage: "todo",
+          activeThreadId: null,
+          activeRole: null,
+          activePool: null,
+        });
+        yield* setRunning(fake, threadId, false);
+        // Approval must be possible even while the worker's pool has no free slot.
+        yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+        const refused = yield* kanban
+          .askOwner(created.id, { question: "Wait?", blocking: true }, other, "cardThread")
+          .pipe(Effect.flip);
+        assert.strictEqual(refused.code, "denied");
+        let previousWakeNote: string | null = null;
+        if (previous !== null) {
+          yield* kanban.askOwner(
+            created.id,
+            { question: "First approval?", blocking: true },
+            worker,
+            "cardThread",
+          );
+          if (previous === "answer") {
+            const talk = yield* kanban.cardDiscussion(created.id);
+            yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "First approval granted" }]);
+          } else {
+            yield* kanban.changeAsk(created.id, "q1", "drop", worker, "cardThread");
+          }
+          const pending = (yield* kanban.card(created.id)).card;
+          assert.strictEqual(pending.stage, "todo");
+          assert.include(
+            pending.wakeNote ?? "",
+            previous === "answer" ? "First approval granted" : "q1",
+          );
+          previousWakeNote = pending.wakeNote;
+          const messages = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
+          assert.strictEqual(messages.filter((text) => text.includes(previousWakeNote!)).length, 0);
+        }
+        const askId = previous === null ? "q1" : "q2";
+        const opened = yield* kanban.askOwner(
+          created.id,
+          { question: "Wait?", blocking: path === "ask" },
+          worker,
+          "cardThread",
+        );
+        if (path === "block") {
+          assert.strictEqual(opened.stage, "todo");
+          const refused = yield* kanban
+            .changeAsk(created.id, askId, "block", other, "cardThread")
+            .pipe(Effect.flip);
+          assert.strictEqual(refused.code, "denied");
+          yield* kanban.changeAsk(created.id, askId, "block", worker, "cardThread");
+        }
+        const waiting = yield* kanban.card(created.id);
+        assert.strictEqual(waiting.card.stage, "needs_owner");
+        assert.isNull(waiting.card.activeThreadId);
+        assert.isNull(waiting.card.activeRole);
+        assert.isNull(waiting.card.activePool);
+        assert.strictEqual(waiting.card.workThreadId, threadId);
+        assert.isTrue(waiting.card.asks.at(-1)!.blocking);
+        assert.isNull(waiting.card.asks.at(-1)!.closedAt);
+        assert.strictEqual(Rules.poolThreads((yield* kanban.snapshot(board.id)).cards).size, 0);
+        const move = waiting.events.findLast((event) => event.kind === "moved");
+        assert.strictEqual(move?.fromStage, "todo");
+        assert.strictEqual(move?.toStage, "needs_owner");
+        assert.deepStrictEqual(move?.actor, worker);
+        const talk = yield* kanban.cardDiscussion(created.id);
+        const posted = (yield* kanban.messages(talk.id)).find(
+          (message) => message.seq === waiting.card.asks.at(-1)!.seq,
+        );
+        assert.deepStrictEqual(posted?.author, worker);
+        assert.include(JSON.stringify(posted?.blocks), "Wait?");
+        if (finish === "answer") {
+          yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Use 2%" }]);
+        } else {
+          yield* kanban.changeAsk(created.id, askId, "drop", worker, "cardThread");
+        }
+        const answered = (yield* kanban.card(created.id)).card;
+        assert.strictEqual(answered.stage, "todo");
+        assert.isNull(answered.activeThreadId);
+        assert.strictEqual(answered.workThreadId, threadId);
+        assert.isNotNull(answered.asks.at(-1)!.closedAt);
+        assert.include(answered.wakeNote ?? "", finish === "answer" ? "Use 2%" : askId);
+        if (previousWakeNote !== null) assert.include(answered.wakeNote ?? "", previousWakeNote);
+        const wakeNote = answered.wakeNote!;
+        const messages = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
+        assert.strictEqual(messages.filter((text) => text.includes(wakeNote)).length, 0);
+        yield* kanban.dispatchNow;
+        assert.strictEqual((yield* kanban.card(created.id)).card.stage, "todo");
+        yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+        yield* kanban.dispatchNow;
+        const resumed = (yield* kanban.card(created.id)).card;
+        assert.strictEqual(resumed.stage, "working");
+        assert.strictEqual(resumed.activeThreadId, threadId);
+        assert.strictEqual(resumed.workThreadId, threadId);
+        assert.isNull(resumed.wakeNote);
+        assert.strictEqual(messages.filter((text) => text.includes(wakeNote)).length, 1);
+        yield* kanban.dispatchNow;
+        assert.strictEqual(messages.filter((text) => text.includes(wakeNote)).length, 1);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect.each(["needs_owner", "todo"] as const)(
@@ -12538,7 +12646,7 @@ it.effect.each([false, true])(
             .pipe(Effect.flip);
           assert.strictEqual(
             denied.detail,
-            `card #${created.number} has no thread attached: you can only move it to needs_review; ask without blocking for anything else`,
+            `card #${created.number} has no thread attached: you can only move it to needs_review; use card_ask for an owner question`,
           );
         }
         assert.deepStrictEqual(yield* kanban.card(created.id), before);

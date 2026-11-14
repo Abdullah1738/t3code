@@ -5260,7 +5260,7 @@ const make = Effect.gen(function* () {
         stage,
         question: null,
         stalled: null,
-        wakeNote: wake ? text : next.wakeNote,
+        wakeNote: wake ? [next.wakeNote, text].filter(Boolean).join("\n\n") : next.wakeNote,
         movedAt: at,
         updatedAt: at,
       };
@@ -12708,7 +12708,7 @@ const make = Effect.gen(function* () {
               if (ownReviewHandoff) yield* checkCardThread(card, actor, role, true);
               return yield* failWith(
                 "denied",
-                `card #${card.number} has no thread attached: you can only move it to needs_review; ask without blocking for anything else`,
+                `card #${card.number} has no thread attached: you can only move it to needs_review; use card_ask for an owner question`,
               );
             }
           }
@@ -13011,17 +13011,6 @@ const make = Effect.gen(function* () {
         ]);
         const card = yield* cardOf(cardId);
         if (!isUnattachedOwnThread(card, actor)) yield* checkCardThread(card, actor, role);
-        if (
-          role === "cardThread" &&
-          isUnattachedOwnThread(card, actor) &&
-          input.blocking &&
-          card.stage === "todo"
-        ) {
-          return yield* failWith(
-            "denied",
-            `card #${card.number} has no thread attached; a blocking ask needs the card in Working. Ask without blocking, or wait for the dispatcher to attach you.`,
-          );
-        }
         const question = input.question.trim();
         if (!question) return yield* failWith("invalid", "an ask needs the question");
         const written = Asks.askFields(input, { blocking: input.blocking });
@@ -13099,12 +13088,6 @@ const make = Effect.gen(function* () {
           return result.card;
         }
         if (ask.blocking) return yield* failWith("invalid", `${ask.id} already blocks the card`);
-        if (role === "cardThread" && isUnattachedOwnThread(card, actor) && card.stage === "todo") {
-          return yield* failWith(
-            "denied",
-            `card #${card.number} has no thread attached; a blocking ask needs the card in Working. Ask without blocking, or wait for the dispatcher to attach you.`,
-          );
-        }
         const blocking = Asks.updateAsk(card, ask.id, { blocking: true });
         if (card.stage === "needs_owner") {
           const question = Asks.openBlockingAsk(blocking)?.text ?? ask.text;
