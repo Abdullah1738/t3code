@@ -33,6 +33,8 @@ BACKUP_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'fil
 FAILURE_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'files',
                   'restic', 'prune', 'dropbox', 'manifest', 'unknown'}
 NUMBERS.update(('durationMs', 'childrenMeasured', 'childrenPartial', 'childrenRemaining', 'bytesMeasured'))
+NUMBERS.update(('timeouts', 'secondsInTimeouts', 'childrenDescended', 'partsMeasured',
+                'childrenWithPartsInProgress', 'partsDone', 'partsTotal', 'partsFreshnessS'))
 NUMBERS.update(('loadPerCore', 'lastSuccessAgeS', 'deferredCount'))
 BACKUP_PROGRAMS = {'bash', 'zsh', 'sh', 'python', 'python3', 'restic', 'launchd',
                    'Robob', 'codex', 'claude', 'opencode', 'node', 'sleep', 'unknown'}
@@ -62,6 +64,7 @@ PROBE_ERRORS = {prefix+field for prefix in ('internal', 'external')
                 for field in ('PurgeableError', 'SnapshotError')}
 TEXT.update('blockedIn samplePath skipped storagekitdStat diskarbitrationdStat'.split())
 TEXT.add('failure')
+TEXT.add('spawnPolicy')
 ATOM = re.compile(r'^[A-Za-z0-9_.:@/+ ()-]{1,180}$')
 SECRET = re.compile(r'(?i)(bearer |password|secret|token[=: ]|cookie|otp[=: ]|sk-[a-z0-9]|\b(?:\d[ -]?){13,19}\b)')
 
