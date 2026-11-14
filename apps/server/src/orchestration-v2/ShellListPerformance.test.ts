@@ -2,6 +2,9 @@
 import { assert, it } from "@effect/vitest";
 import { EventId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
+import { ShellRunLookupMigration } from "../ardud/persistence/shellRunLookupMigration.ts";
+import Migration0068 from "../persistence/Migrations/068_ShellRunLookupIndexes.ts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -17,6 +20,7 @@ it.effect(
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       const projection = yield* Projection.ProjectionStoreV2;
+      const lookupMigration = yield* ShellRunLookupMigration;
       const threadId = ThreadId.make("seed");
       const projectId = ProjectId.make("seed-project");
       const now = DateTime.makeUnsafe("2026-01-01T00:00:00Z");
@@ -76,6 +80,18 @@ it.effect(
         CASE WHEN CAST(substr(thread_id, 6) AS INTEGER) % 6 = 3 THEN NULL
         ELSE '2026-01-01T00:00:00Z' END)
       WHERE ordinal = 100`;
+      const activeBefore = yield* projection.getShellSnapshot({ location: "active" });
+      const archiveBefore = yield* projection.getShellSnapshot({ location: "archive" });
+      const candidatesBefore = yield* projection.getThreadListCandidates(projectId);
+      yield* sql`DROP INDEX ardud_shell_project_threads_idx`;
+      yield* sql`DROP INDEX ardud_shell_activity_run_idx`;
+      yield* sql`DROP INDEX ardud_shell_executed_run_idx`;
+      assert.deepEqual(yield* projection.getShellSnapshot({ location: "active" }), activeBefore);
+      assert.deepEqual(yield* projection.getShellSnapshot({ location: "archive" }), archiveBefore);
+      assert.deepEqual(yield* projection.getThreadListCandidates(projectId), candidatesBefore);
+      yield* sql.withTransaction(Migration0068);
+      yield* Deferred.succeed(lookupMigration!, undefined);
+      assert.deepEqual(yield* projection.getThreadListCandidates(projectId), candidatesBefore);
       const beforeStart = performance.now();
       // The unfiltered route retains the old materialized query: same fixture and wire derivation.
       const baseline = yield* projection.getShellSnapshot();
@@ -172,5 +188,14 @@ it.effect(
           afterSqlMs,
         }),
       );
-    }).pipe(Effect.provide(layer)),
+    }).pipe(
+      Effect.provide(
+        Layer.unwrap(
+          Effect.gen(function* () {
+            const ready = yield* Deferred.make<void>();
+            return layer.pipe(Layer.provideMerge(Layer.succeed(ShellRunLookupMigration, ready)));
+          }),
+        ),
+      ),
+    ),
 );
