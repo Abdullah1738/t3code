@@ -99,6 +99,7 @@ def orders(app, service, timeout, page=1, cursor=None):
     data=json.loads((ROOT/'fixture.json').read_text())
     if threading.current_thread() is not threading.main_thread():raise ValueError('main thread required')
     if service in data.get('list_fail',[]):raise TimeoutError('list timeout')
+    if page in data.get('page_fail',{}).get(service,[]):raise TimeoutError('page timeout')
     rows=data.get(service,{}).get(str(page),[])
     coverage=({'page':page,'total_pages':len(data.get(service,{'1':[]}))} if service=='minutes'
               else {'exhaustive':service not in data})
@@ -185,6 +186,60 @@ def details(oid, service, timeout):
                     with self.assertRaises(charges.Lookup):
                         charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: result)
                     self.assertEqual([r['order'] for r in result['orders']], ['B'])
+
+    def test_persistent_cache_invalidation_survives_next_read_page_timeout(self):
+        cached = {**row('N1'), 'service': 'marketplace', 'total': CHARGE['amount'],
+                  'currency': 'AED', 'whole_order_complete': True}
+        unrelated = {**cached, 'order': 'N2', 'total': '98.00'}
+        for status, raw_status in (
+            ('cancelled', 'cancelled'), ('cancelled', 'canceled'), ('unknown', 'failed'),
+            ('unknown', 'future_status'), ('out for delivery', 'out_for_delivery'),
+            ('delivered', 'cancelled'), ('unknown', 'delivered'), ('delivered', 'delivered'),
+        ):
+            for item in ('N1-1', 'N1-2'):
+                with self.subTest(status=status, raw_status=raw_status, item=item):
+                    self.cache.write_text(json.dumps([cached, unrelated]))
+                    first = {**row('N1'), 'item_id': 'N1-1', 'shipment_id': 'N1-S1', 'total': '99.00'}
+                    second = {**first, 'item_id': item, 'status': status, 'raw_status': raw_status}
+                    self.fixture(marketplace={'1': [first], '2': [second]}, paging=['marketplace'])
+                    observed = lookup.read('noon', cache_path=self.cache)
+                    after_invalidation = lookup.load_cache(self.cache)
+                    self.fixture(marketplace={'1': [first], '2': [first]}, paging=['marketplace'],
+                                 page_fail={'marketplace': [2]})
+                    result = lookup.read('noon', cache_path=self.cache)
+                    if status == raw_status == 'delivered':
+                        self.assertEqual(charges.order_receipt(CHARGE, AT, AT,
+                            lookup=lambda *a, **kw: result)['verdict'], 'receipt')
+                        self.assertEqual(result['lanes']['marketplace']['cached'], 1)
+                    else:
+                        with self.assertRaises(charges.Lookup):
+                            charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: result)
+                        self.assertEqual(observed['orders'], [])
+                        self.assertEqual(observed['invalidated'], [{'service': 'marketplace', 'order': 'N1'}])
+                        self.assertEqual([r['order'] for r in after_invalidation], ['N2'])
+                        self.assertEqual(result['orders'][0]['total'], '99.00')
+                        self.assertEqual(result['lanes']['marketplace']['cached'], 0)
+                    self.assertIn('N2', {r['order'] for r in lookup.load_cache(self.cache)})
+
+    def test_first_page_contradiction_evicts_cache_even_when_detail_fails(self):
+        cached = {**row('N1'), 'service': 'marketplace', 'total': CHARGE['amount'],
+                  'currency': 'AED', 'whole_order_complete': True}
+        for status in ('cancelled', 'failed', 'out for delivery', 'unknown'):
+            with self.subTest(status=status):
+                self.cache.write_text(json.dumps([cached]))
+                self.fixture(marketplace={'1': [row('N1', status=status)]}, fail=['N1'])
+                result = lookup.read('noon', cache_path=self.cache)
+                self.assertEqual(result['invalidated'], [{'service': 'marketplace', 'order': 'N1'}])
+                self.assertEqual(lookup.load_cache(self.cache), [])
+                self.assertEqual(result['orders'], [])
+
+    def test_cache_invalidation_write_failure_is_not_silent(self):
+        self.cache.write_text(json.dumps([{**row('N1'), 'service': 'marketplace',
+            'total': CHARGE['amount'], 'currency': 'AED', 'whole_order_complete': True}]))
+        self.fixture(marketplace={'1': [row('N1', status='cancelled')]})
+        with patch('state_json.write_json', side_effect=OSError('write failed')):
+            with self.assertRaisesRegex(ValueError, 'order lookup unavailable'):
+                lookup.read('noon', cache_path=self.cache)
 
     def test_unverified_reader_retains_page_one_limit(self):
         self.fixture(food={'1': [row('A')], '2': [row('B', -60)]},

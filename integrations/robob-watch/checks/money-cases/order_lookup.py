@@ -94,16 +94,29 @@ def read(app, deadline=None, since=None, cache_path=None):
             raise ValueError('invalid orders')
         if app == 'noon':
             merged = {(r['service'], r['order']): r for r in cache}
+            invalidated = set()
+            invalidations = result.get('invalidated', [])
+            if not isinstance(invalidations, list):
+                raise ValueError('invalid cache invalidations')
+            for entry in invalidations:
+                if (not isinstance(entry, dict) or set(entry) != {'service', 'order'}
+                        or entry['service'] not in LANES or not isinstance(entry['order'], str)
+                        or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', entry['order'])):
+                    raise ValueError('invalid cache invalidation')
+                key = entry['service'], entry['order']
+                invalidated.add(key)
+                merged.pop(key, None)
             for row in result['orders']:
                 row = projection(row)
                 key = row['service'], row['order']
                 merged.pop(key, None)
-                if terminal(row):
+                if terminal(row) and key not in invalidated:
                     merged[key] = {**row, 'cached_at': dt.datetime.now(dt.timezone.utc).isoformat()}
             try:
                 write_json(cache_path, sorted(merged.values(), key=lambda r: moment(r['placed_at']))[-1000:])
             except OSError:
-                pass  # Cache availability never changes the evidence returned by the reader.
+                if invalidated:
+                    raise  # A failed eviction must not be reported as a completed lookup.
         return result
     except SourceLimit:
         raise
@@ -154,11 +167,13 @@ def parallel_lanes(root, deadline, since, cache):
     lanes = {name: {'exhaustive': False, 'covered_from': None, 'limit': None,
                     'fetched': 0, 'cached': 0, 'pages': 0, 'ms': round((time.monotonic() - started) * 1000)}
              for name in LANES}
-    rows = []
+    rows, invalidated = [], []
     for result in results:
         rows.extend(result['orders'])
+        invalidated.extend(result.get('invalidated', []))
         lanes.update(result['lanes'])
-    return {'orders': rows, 'complete': all(l['exhaustive'] for l in lanes.values()), 'lanes': lanes}
+    return {'orders': rows, 'complete': all(l['exhaustive'] for l in lanes.values()), 'lanes': lanes,
+            'invalidated': invalidated}
 
 
 def native(app, root, deadline=None, since=None, cache=None, services=None):
@@ -186,6 +201,7 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                 'fetched': 0, 'cached': 0, 'pages': 0, 'ms': 0}
         previous, seen, page, broken, unordered = None, set(), 1, False, False
         cursor, page_ids, cursors = None, set(), set()
+        invalidated = set()
         try:
             while lane_end - time.monotonic() > 0.05:
                 result = native_orders.orders('noon', service=service, page=page,
@@ -216,6 +232,10 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                                                   for k in ('status', 'raw_status'))}
                 unsettled = {o['order'] for o in listed
                              if o.get('status') != 'delivered' or o.get('raw_status') != 'delivered'}
+                if service == 'marketplace':
+                    # Record the contradiction even if detail retrieval fails or
+                    # the order is omitted from the positive results below.
+                    invalidated.update(unsettled)
                 for order in listed:
                     oid = order['order']
                     if service == 'marketplace' and oid in shipment_cancellations:
@@ -320,12 +340,14 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
         except Exception:
             pass
         lane['ms'] = round((time.monotonic() - start) * 1000)
-        return rows, lane
+        return rows, lane, [{'service': service, 'order': oid} for oid in sorted(invalidated)]
 
     results = [read_lane(service) for service in services]
-    rows = [row for lane_rows, lane in results for row in lane_rows]
-    lanes = {service: lane for service, (lane_rows, lane) in zip(services, results)}
-    return {'orders': rows, 'complete': all(l['exhaustive'] for l in lanes.values()), 'lanes': lanes}
+    rows = [row for lane_rows, lane, invalidated in results for row in lane_rows]
+    lanes = {service: lane for service, (lane_rows, lane, invalidated) in zip(services, results)}
+    invalidated = [key for lane_rows, lane, invalidations in results for key in invalidations]
+    return {'orders': rows, 'complete': all(l['exhaustive'] for l in lanes.values()), 'lanes': lanes,
+            'invalidated': invalidated}
 
 
 if __name__ == '__main__':
