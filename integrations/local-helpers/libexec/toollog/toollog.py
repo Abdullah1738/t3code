@@ -31,7 +31,7 @@ _FIELDS = {'harness', 'guard', 'decision', 'rule', 'firstWord', 'commandLength',
            'exitCode', 'failingStep', 'count', 'dryRun', 'toolCount', 'operation', 'status',
            'cwdClass', 'matchedRoot', 'argv0Class', 'repeatCount', 'threadIdSource',
            'method', 'toolName', 'load1', 'load5', 'load15', 'sampleRate',
-           'httpMethod', 'ttfbMs', 'reason'}
+           'httpMethod', 'ttfbMs', 'reason', 'identity_source'}
 _IDS = {'sessionId', 'threadId', 'nativeAgentId', 'cardNumber', 'serverId', 'home', 'sampleId'}
 _WORDS = set('git rg grep find ls cat cp mv rm python python3 node bun npm pnpm yarn vp go cargo rustc make docker offbox bash sh zsh curl sqlite3 terraform aws rcsim runcloud printf echo env sudo'.split())
 
@@ -281,10 +281,12 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
         pass
 
 
-def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=None, ids=None, *, cwd=None, matched=None):
+def hook(harness, guard, decision, rule, duration_ms, command=None, error_tag=None, ids=None, *, cwd=None, matched=None, identity_source=None):
     try:
         identity, source = hook_ids(harness, ids)
         command_fields = command_props(command)
+        if isinstance(identity_source, str) and identity_source in {'cache', 'control', 'negative-cache'}:
+            command_fields['identity_source'] = identity_source
         emit('hooks', 'error' if decision == 'denied' or error_tag else 'perf', 'hook.decision',
              duration_ms=duration_ms, ok=decision != 'denied' and not error_tag, ids=identity,
              props=hook_props({'harness': harness, 'guard': guard, 'decision': decision, 'rule': rule,

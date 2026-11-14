@@ -100,6 +100,15 @@ class ToolLogTests(unittest.TestCase):
     def rows(self, board='agent-tools'):
         return list(toollog.read(board, self.day))
 
+    def test_hook_identity_source_only_logs_known_values(self):
+        for source in ('cache', 'control', 'negative-cache', 'PRIVATE_FIXTURE', {'secret': 'PRIVATE_FIXTURE'}):
+            toollog.hook('codex', 'shell', 'allowed', 'no-policy', 0.1,
+                         error_tag='identity-unavailable', identity_source=source)
+        rows = self.rows()
+        self.assertEqual([row['props'].get('identity_source') for row in rows],
+                         ['cache', 'control', 'negative-cache', None, None])
+        self.assertNotIn('PRIVATE_FIXTURE', json.dumps(rows))
+
     def test_orders_rollup_preserves_cause_groups_and_merchant_timings(self):
         directory = toollog.board_dir('orders')
         directory.mkdir(parents=True)
