@@ -1010,7 +1010,7 @@ def _wait_unanswered_resume(con, box_id):
             budget_left = api.left()
             if budget_left is not None:
                 if budget_left <= 0.05:
-                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later")
+                    raise api.BudgetExpired(f"client budget expired confirming resume of {box_id}; nothing ran. Retry later")
                 left = min(left, budget_left)
             if left <= 0:
                 con.execute("UPDATE leases SET state='resume_stalled' WHERE box_id=?", (box_id,))
@@ -1019,6 +1019,8 @@ def _wait_unanswered_resume(con, box_id):
                                              "nothing ran; set aside and trying a new box")
             try:
                 state = api.readiness_get(box_id, deadline=time.time() + left)
+            except api.BudgetExpired:
+                raise
             except OffboxError as error:
                 network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
                 from . import home
@@ -1097,12 +1099,14 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
                 if budget_left <= 0.05:
                     from . import prepare
                     prepare.check(reserve=0.05)
-                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later") from unanswered
+                    raise api.BudgetExpired(f"client budget expired confirming resume of {box_id}; nothing ran. Retry later") from unanswered
                 left = min(left, budget_left)
             if left <= 0:
                 break
             try:
                 last = api.readiness_get(box_id, deadline=time.time() + left)
+            except api.BudgetExpired:
+                raise
             except OffboxError as error:
                 network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
                 from . import home
@@ -1143,7 +1147,7 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             budget_left = api.left()
             if budget_left is not None:
                 if budget_left <= 0.05:
-                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later") from unanswered
+                    raise api.BudgetExpired(f"client budget expired confirming resume of {box_id}; nothing ran. Retry later") from unanswered
                 left = min(left, budget_left)
             if remaining is not None and remaining <= 0:
                 raise ResumeUnresolved(f"resume of {box_id} was unanswered; its state could not be confirmed; "

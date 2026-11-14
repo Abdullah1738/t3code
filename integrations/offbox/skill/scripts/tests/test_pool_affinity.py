@@ -211,9 +211,12 @@ class AffinityTests(Isolated):
                     self.clock.t = 1000
                     self.err.seek(0); self.err.truncate()
                     self.growing(live_state=live_state)
+                    readiness_started = []
                     def fail(bid, *args, **kw):
                         if bid == 'A':
                             self.assertEqual(self.resumed, ['A'])
+                            readiness_started.append(self.clock.t)
+                            self.assertEqual(api.left(), pool.AFFINITY_WAIT_S)
                             self.clock.t += max(0, api.left())
                             raise common.OffboxError('SSH readiness timed out after resume')
                     with patch.object(ssh_sync, phase, side_effect=fail), \
@@ -222,7 +225,7 @@ class AffinityTests(Isolated):
                     create.assert_not_called()
                     self.assertEqual(self.stopped, ['A'])
                     self.assertEqual(self.resumed, ['A'])
-                    self.assertEqual(self.clock.t, 1060)
+                    self.assertEqual(self.clock.t, readiness_started[0] + pool.AFFINITY_WAIT_S)
                     old = self.con.execute("SELECT state,size,ssh_ready_at FROM leases WHERE box_id='A'").fetchone()
                     self.assertEqual(tuple(old), ('running', 'xlarge', None))
                     self.assertEqual(self.err.getvalue().count('your last box A is busy; using B'), 1)
@@ -376,8 +379,9 @@ class AffinityTests(Isolated):
         self.own(state='stopped')
         with patch.object(api, 'resume', side_effect=api.NetworkError('read timed out')) as resume, \
                 patch.object(api, 'get', return_value={'state': 'archived', 'type': 'large'}), api.budget(3):
-            with self.assertRaises(lease.ResumeUnresolved):
+            with self.assertRaises(api.BudgetExpired) as caught:
                 lease._resume_confirmed(self.con, 'A', 1800, 'xlarge')
+        self.assertFalse(caught.exception.outage)
         resume.assert_called_once()
         self.assertLessEqual(self.clock.t, 1003)
         self.assertIsNotNone(self.con.execute("SELECT 1 FROM kv WHERE k='resume_unanswered:A'").fetchone())
@@ -387,8 +391,9 @@ class AffinityTests(Isolated):
         self.con.execute("INSERT INTO kv VALUES ('resume_unanswered:A','xlarge',1000)")
         self.con.commit()
         with patch.object(api, 'get', return_value={'state': 'provisioning', 'type': 'xlarge'}), api.budget(3):
-            with self.assertRaises(lease.ResumeUnresolved):
+            with self.assertRaises(api.BudgetExpired) as caught:
                 lease._wait_unanswered_resume(self.con, 'A')
+        self.assertFalse(caught.exception.outage)
         self.assertEqual(self.clock.t, 1003)
         self.assertIsNotNone(self.con.execute("SELECT 1 FROM kv WHERE k='resume_unanswered:A'").fetchone())
         self.assertEqual(self.con.execute("SELECT state FROM leases WHERE box_id='A'").fetchone()[0], 'stopped')
@@ -413,6 +418,41 @@ class AffinityTests(Isolated):
         with patch.object(api, 'cmd_status', side_effect=status), api.budget(3):
             pool._refresh_background(self.con, 'repo', pull_artifacts=False)
         self.assertEqual(self.clock.t, 1003)
+
+    def test_ssh_wait_classifies_only_shorter_client_budgets_as_expired(self):
+        # Caller budget, effective wait, client expiry rather than the normal SSH timeout.
+        rows = ((None, 90, False), (0, 0, True), (3, 3, True), (90, 90, False), (100, 90, False))
+        def ssh(*args, **kwargs):
+            self.clock.t += kwargs['timeout']
+            raise subprocess.TimeoutExpired(args, kwargs['timeout'])
+        for seconds, elapsed, client_expired in rows:
+            self.clock.t = 1000
+            budget = contextlib.nullcontext() if seconds is None else api.budget(seconds)
+            with self.subTest(seconds=seconds), patch.object(ssh_sync, 'time', self.clock.module), \
+                    patch.object(ssh_sync, 'ssh', side_effect=ssh), budget:
+                with self.assertRaises(common.OffboxError) as caught:
+                    ssh_sync.wait_ssh('A')
+                self.assertEqual(isinstance(caught.exception, api.BudgetExpired), client_expired)
+                self.assertFalse(caught.exception.outage)
+                self.assertEqual(self.clock.t, 1000 + elapsed)
+
+    def test_ssh_errors_at_client_deadline_keep_outage_and_host_key_failures(self):
+        rows = ((common.OffboxError('endpoint checks failed'), True),
+                (api.NetworkError('API silent'), False),
+                (common.SshHostKeyMismatch('host key mismatch'), False))
+        for error, client_expired in rows:
+            self.clock.t = 1000
+            def ssh(*args, **kwargs):
+                self.clock.t += kwargs['timeout']
+                raise error
+            with self.subTest(error=type(error).__name__), patch.object(ssh_sync, 'time', self.clock.module), \
+                    patch.object(ssh_sync, 'ssh', side_effect=ssh), api.budget(3):
+                with self.assertRaises(common.OffboxError) as caught:
+                    ssh_sync.wait_ssh('A')
+                self.assertEqual(isinstance(caught.exception, api.BudgetExpired), client_expired)
+                if not client_expired:
+                    self.assertIs(caught.exception, error)
+                self.assertEqual(self.clock.t, 1003)
 
     def test_grow_cleanup_timeout_keeps_stopped_state_and_uses_ready_box(self):
         close = ssh_sync.close_master
