@@ -53,8 +53,8 @@ test("Telegram acknowledgements use id/created for both new and deduplicated que
   for (const created of [true, false]) {
     notify(pending, (_bin, args) => {
       assert.equal(args[1], "notify");
-      assert.equal(args[args.indexOf("--key") + 1], pending.key);
-      assert.equal(args[args.indexOf("--text") + 1], pending.text);
+      assert.equal(args.find(a => a.startsWith("--key=")).slice(6), pending.key);
+      assert.equal(args.find(a => a.startsWith("--text=")).slice(7), pending.text);
       return JSON.stringify({ id: "notify:" + "a".repeat(64), created });
     });
   }

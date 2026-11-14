@@ -42,6 +42,7 @@ import {
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import { kanbanDDL } from "../../persistence/kanbanSchema.ts";
+import { ensureKanbanCacheVersions } from "../../persistence/kanbanCacheVersions.ts";
 import { summaries, tallyBoards } from "../engine/summaries.ts";
 import * as KanbanStore from "./KanbanStore.ts";
 
@@ -176,6 +177,7 @@ it.effect("compact pages read the split boards database, not orchestration stora
     const context = yield* Layer.build(NodeSqliteClient.layer({ filename: ":memory:" }));
     const sql = Context.get(context, SqlClient.SqlClient);
     yield* Effect.forEach(kanbanDDL, (ddl) => sql.unsafe(ddl), { discard: true });
+    yield* ensureKanbanCacheVersions(sql);
     const split = BoardsDatabase.BoardsDatabase.of({ sql, ready: Effect.void, path: ":memory:" });
     yield* Effect.gen(function* () {
       const store = yield* KanbanStore.KanbanStore;
@@ -1596,6 +1598,64 @@ it.effect("invalidates same-length row text with unchanged timestamps", () =>
   }).pipe(Effect.provide(TestLayer)),
 );
 
+it.effect(
+  "invalidates large cards and discussions on rewrites, replacements and rollback revision reuse",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const originalCard = { ...card(1, "todo"), prompt: "a".repeat(8192) };
+      const originalDiscussion = { ...discussion(1), title: "a".repeat(8192) };
+      yield* store.putCard(originalCard);
+      yield* store.putDiscussion(originalDiscussion);
+      const read = Effect.all({
+        card: store.card(originalCard.id),
+        discussion: store.discussion(originalDiscussion.id),
+      });
+      const write = (text: string) =>
+        Effect.all([
+          sql`UPDATE ardud_kanban_cards SET json = ${JSON.stringify({ ...originalCard, prompt: text })} WHERE id = ${originalCard.id}`,
+          sql`UPDATE ardud_kanban_discussions SET json = ${JSON.stringify({ ...originalDiscussion, title: text })} WHERE id = ${originalDiscussion.id}`,
+        ]);
+      const before = yield* read;
+      // Every case keeps serialized length and timestamps, including rewriting old text.
+      for (const text of ["b".repeat(8192), originalCard.prompt]) {
+        yield* write(text);
+        const changed = yield* read;
+        assert.deepStrictEqual(changed.card, { ...originalCard, prompt: text });
+        assert.deepStrictEqual(changed.discussion, { ...originalDiscussion, title: text });
+        const warm = yield* read;
+        assert.strictEqual(warm.card, changed.card);
+        assert.strictEqual(warm.discussion, changed.discussion);
+      }
+      yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* write("c".repeat(8192));
+            assert.strictEqual((yield* read).card!.prompt, "c".repeat(8192));
+            return yield* Effect.fail("rollback");
+          }),
+        )
+        .pipe(Effect.flip);
+      // These writes reuse the rolled-back revisions, with different text.
+      yield* write("d".repeat(8192));
+      assert.strictEqual((yield* read).card!.prompt, "d".repeat(8192));
+      assert.strictEqual((yield* read).discussion!.title, "d".repeat(8192));
+      yield* sql`DELETE FROM ardud_kanban_cards WHERE id = ${originalCard.id}`;
+      yield* sql`DELETE FROM ardud_kanban_discussions WHERE id = ${originalDiscussion.id}`;
+      yield* store.putCard(originalCard);
+      yield* store.putDiscussion(originalDiscussion);
+      const replaced = yield* read;
+      assert.deepStrictEqual(replaced, before);
+      yield* sql`INSERT OR REPLACE INTO ardud_kanban_cards (id, board_id, number, stage, json)
+      VALUES (${originalCard.id}, ${boardId}, 1, 'todo', ${JSON.stringify({ ...originalCard, prompt: "e".repeat(8192) })})`;
+      yield* sql`INSERT OR REPLACE INTO ardud_kanban_discussions (id, board_id, json)
+      VALUES (${originalDiscussion.id}, ${boardId}, ${JSON.stringify({ ...originalDiscussion, title: "e".repeat(8192) })})`;
+      assert.strictEqual((yield* read).card!.prompt, "e".repeat(8192));
+      assert.strictEqual((yield* read).discussion!.title, "e".repeat(8192));
+    }).pipe(Effect.provide(TestLayer)),
+);
+
 it.effect("replaces a row version and drops deleted card and thread entries", () =>
   Effect.gen(function* () {
     const store = yield* KanbanStore.KanbanStore;
@@ -1770,7 +1830,25 @@ it.effect(
         card(11, "needs_owner"),
         { ...card(12, "todo"), settledAt: at },
       ];
-      yield* Effect.forEach(rows, (row) => store.putCard(row), { discard: true });
+      const exceptions = (["completed", "deployed", "verified", "needs_owner"] as const).flatMap(
+        (stage, index) => {
+          const base = 20 + index * 10;
+          return [
+            { ...card(base, stage), wait },
+            { ...card(base + 1, stage), deciding: { since: at, why: "Pending", toldAt: null } },
+            { ...card(base + 2, stage), activeThreadId: ThreadId.make(`held-${stage}`), wait },
+          ];
+        },
+      );
+      const settled = [...rows, ...exceptions].map((row, index) => ({
+        ...row,
+        id: KanbanCardId.make(`settled-${index}`),
+        number: 100 + index,
+        settledAt: at,
+      }));
+      yield* Effect.forEach([...rows, ...exceptions, ...settled], (row) => store.putCard(row), {
+        discard: true,
+      });
       const queries: string[] = [];
       const observe: Statement.Transformer = (statement) => {
         queries.push(statement.compile()[0]);
@@ -1780,17 +1858,20 @@ it.effect(
         yield* store
           .dispatchCards(boardId)
           .pipe(Effect.provideService(Statement.CurrentTransformer, observe)),
-        rows.slice(0, 7),
+        [...rows.slice(0, 7), ...exceptions],
       );
       const plan = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${queries[0]}`, [
         boardId,
+        boardId,
       ]);
       assert.isTrue(plan.some((row) => row.detail.includes("ardud_kanban_cards_dispatch")));
+      assert.isTrue(plan.some((row) => row.detail.includes("ardud_kanban_cards_open")));
+      assert.isFalse(plan.some((row) => /SCAN |TEMP B-TREE/.test(row.detail)));
       yield* store.putCard({ ...rows[7]!, stage: "todo" });
       yield* store.putCard({ ...rows[0]!, stage: "verified" });
       assert.deepStrictEqual(
         (yield* store.dispatchCards(boardId)).map((row) => row.number),
-        [2, 3, 4, 5, 6, 7, 8],
+        [2, 3, 4, 5, 6, 7, 8, ...exceptions.map((row) => row.number)],
       );
     }).pipe(Effect.provide(TestLayer)),
 );

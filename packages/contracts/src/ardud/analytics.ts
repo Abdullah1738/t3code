@@ -70,9 +70,37 @@ const GeneralEvent = Schema.Struct({
   writerWaitMs: Schema.optionalKey(Measurement),
   props: Schema.optionalKey(
     Schema.Struct({
+      number: Schema.optionalKey(Measurement),
+      from: Schema.optionalKey(Label),
+      to: Schema.optionalKey(Label),
+      actor: Schema.optionalKey(
+        Schema.Literals(["owner", "thread", "evaluator", "script", "system"]),
+      ),
+      msInPrevStage: Schema.optionalKey(Measurement),
+      round: Schema.optionalKey(Measurement),
+      chain: Schema.optionalKey(Label),
+      verdict: Schema.optionalKey(Schema.Literals(["clear", "feedback"])),
+      head: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[0-9a-f]{7,40}$/))),
+      action: Schema.optionalKey(Schema.Literals(["set", "clear"])),
+      reasonClass: Schema.optionalKey(Label),
+      errorClass: Schema.optionalKey(Label),
+      model: Schema.optionalKey(Label),
+      kind: Schema.optionalKey(Label),
+      ageMs: Schema.optionalKey(Measurement),
+      used: Schema.optionalKey(Measurement),
+      slots: Schema.optionalKey(Measurement),
+      waiting: Schema.optionalKey(Measurement),
       method: Schema.optionalKey(Label),
       span: Schema.optionalKey(Label),
       errorTag: Schema.optionalKey(Label),
+      code: Schema.optionalKey(Label),
+      boardId: Schema.optionalKey(Id),
+      cardNumber: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
+      saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+      cause: Schema.optionalKey(
+        Schema.Literals(["client_disconnect", "shutdown", "deadline", "stop", "unknown"]),
+      ),
+      waitMs: Schema.optionalKey(Measurement),
       originKind: Schema.optionalKey(Label),
       poolKey: Schema.optionalKey(Label),
       key: Schema.optionalKey(Label),
@@ -241,6 +269,25 @@ export const AnalyticsRollup = Schema.Struct({
   invalidLines: Measurement,
   kindCounts: Schema.Record(Label, Measurement),
   errorCounts: Schema.Record(Label, Measurement),
+  errorsByRoute: Schema.Array(
+    Schema.Struct({
+      route: Label,
+      method: Label,
+      status: Schema.NullOr(Measurement),
+      tag: Label,
+      ...LatencyFields,
+    }),
+  ),
+  mcpErrorsByCode: Schema.Array(Schema.Struct({ tool: Label, code: Label, ...LatencyFields })),
+  dbSlowBySpan: Schema.Array(
+    Schema.Struct({
+      span: Label,
+      key: Label,
+      phase: Label,
+      totalWaitMs: Measurement,
+      ...LatencyFields,
+    }),
+  ),
   longTasksByRoute: Schema.Array(
     Schema.Struct({
       route: Label,
@@ -269,6 +316,52 @@ export const AnalyticsRollup = Schema.Struct({
     topCardsByTokens: Schema.Array(CardUsage),
     topCardsByWallMs: Schema.Array(CardUsage),
   }),
+  boards: Schema.Array(
+    Schema.Struct({
+      boardId: Id,
+      moves: Schema.Array(Schema.Struct({ from: Label, to: Label, count: Measurement })),
+      timeInStage: Schema.Array(Schema.Struct({ stage: Label, ...LatencyFields })),
+      reviewRounds: Schema.Array(
+        Schema.Struct({ cardId: Id, rounds: Measurement, verdicts: Measurement }),
+      ),
+      verdictCounts: Schema.Record(Label, Measurement),
+      reviewDuration: Schema.Struct(LatencyFields),
+      stalls: Schema.Array(
+        Schema.Struct({
+          reasonClass: Label,
+          sets: Measurement,
+          clears: Measurement,
+          ...LatencyFields,
+        }),
+      ),
+      failureCounts: Schema.Record(Label, Measurement),
+      restarts: Measurement,
+      openAsks: Schema.Array(
+        Schema.Struct({
+          cardId: Id,
+          key: Label,
+          kind: Label,
+          blocking: Schema.Boolean,
+          createdAt: Timestamp,
+          ageMs: Measurement,
+        }),
+      ),
+      openAsksAsOf: Schema.NullOr(Timestamp),
+      incompleteAskSnapshots: Measurement,
+      poolUtilisation: Schema.Array(
+        Schema.Struct({
+          hour: Label,
+          poolKey: Label,
+          samples: Measurement,
+          used: Measurement,
+          slots: Measurement,
+          waiting: Measurement,
+          utilisation: Schema.NullOr(Measurement),
+        }),
+      ),
+      overflow: Measurement,
+    }),
+  ),
   askLatency: AskLatencyRollup,
   tickPhases: Schema.optionalKey(
     Schema.Array(Schema.Struct({ boardId: Id, phase: Label, ...LatencyFields })),

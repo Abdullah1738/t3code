@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+import order_card
 from unittest.mock import patch
 
 import commerce_journal as j
@@ -73,7 +74,7 @@ def cart_state(*, empty=False, offer=OFFER, sku=SKU, quantity=1):
 def session_state(*, total=25.49, subtotal=17.0, quantity=1, address=HEADERS['x-addresskey'],
                   silent=True, card_default=True, credits=False, is_rocket=True,
                   delivery_date='2026-10-11T00:37:00', unit_price='17.00'):
-    cards = [{'id': '<secret>', 'type': 'MASTERCARD', 'mask': '52287301xxxx2342',
+    cards = [{'id': '<secret>', 'type': order_card.NETWORK.upper(), 'mask': 'xxxxxxxxxxxx' + order_card.LAST4,
               'isSelected': card_default, 'isDefault': card_default},
              {'id': '<secret>', 'type': 'VISA', 'mask': '419649xxxxxx9963',
               'isSelected': False, 'isDefault': False}]
@@ -370,7 +371,7 @@ class LaneTests(unittest.TestCase):
         state = session_state()
         cards = state['paymentMethods'][1]['cards']
         for card in cards:
-            card['mask'] = card['mask'].replace('2342', '5542')
+            card['mask'] = card['mask'].replace(order_card.LAST4, '5542')
         self.assertTrue(any(card['mask'].endswith('5542') and card['isDefault'] for card in cards))
         responses = happy_responses(session=state)
         with tempfile.TemporaryDirectory() as temp, \

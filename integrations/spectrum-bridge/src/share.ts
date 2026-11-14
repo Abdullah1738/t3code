@@ -48,7 +48,7 @@ export function cloudflaredTunnel(bin = process.env.CLOUDFLARED_BIN ?? DEFAULT_C
     try {
       child = Bun.spawn([bin, "tunnel", "--no-autoupdate", "--metrics", "127.0.0.1:0", "--grace-period", "1s",
         "--url", `http://127.0.0.1:${port}`], { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
-    } catch { toolError("share", "share.catch1");
+    } catch (caughtError) { toolError("share", "share.catch1", caughtError);
       throw new ShareError(502, "cloudflared is unavailable");
     }
     let exited = false;
@@ -82,9 +82,9 @@ export function cloudflaredTunnel(bin = process.env.CLOUDFLARED_BIN ?? DEFAULT_C
             if (url && REGISTERED.test(text)) { settled = true; resolve(tunnel(url)); }
           }
           if (!settled) reject(new ShareError(502, "cloudflared exited before the tunnel was ready"));
-        })().catch(() => { toolError("share", "share.catch2"); return reject(new ShareError(502, "cloudflared output could not be read")); });
+        })().catch((caughtError) => { toolError("share", "share.catch2", caughtError); return reject(new ShareError(502, "cloudflared output could not be read")); });
       });
-    } catch (error) { toolError("share", "share.catch3");
+    } catch (error) { toolError("share", "share.catch3", error);
       kill();
       throw error;
     } finally {
@@ -207,7 +207,7 @@ export class Shares {
     try {
       this.server = Bun.serve({ hostname: "127.0.0.1", port: origin.port, maxRequestBodySize: MAX_SECRET_FORM_BYTES, fetch: request => this.handle(request) });
       return true;
-    } catch { toolError("share", "share.catch4");
+    } catch (caughtError) { toolError("share", "share.catch4", caughtError);
       this.log("share-origin-failed", String(origin.port));
       return false;
     }
@@ -239,7 +239,7 @@ export class Shares {
       this.formRequests.set(token, count);
       if (count > 30) return limited();
       try { return await createSecretHandler(deps)(request, token); }
-      catch { toolError("share", "share.catch5"); return new Response("Could not send", { status: 500, headers: SECRET_PAGE_HEADERS }); }
+      catch (caughtError) { toolError("share", "share.catch5", caughtError); return new Response("Could not send", { status: 500, headers: SECRET_PAGE_HEADERS }); }
     }
     if (Number(request.headers.get("content-length") ?? 0) > 1024) return new Response("Too large", { status: 413 });
     if (!["GET", "HEAD"].includes(request.method)) return new Response("Method not allowed", { status: 405 });
@@ -266,7 +266,7 @@ export class Shares {
     try {
       const current = await realpath(join(this.options.appsRoot, slug));
       if (current !== record.root) return false;
-    } catch { toolError("share", "share.catch6");
+    } catch (caughtError) { toolError("share", "share.catch6", caughtError);
       return false;
     }
     const index = await this.index(slug);
@@ -293,7 +293,7 @@ export class Shares {
     if (!record.root) return false;
     try {
       if (realpathSync(join(this.options.appsRoot, slug)) !== record.root) return false;
-    } catch { toolError("share", "share.catch7");
+    } catch (caughtError) { toolError("share", "share.catch7", caughtError);
       return false;
     }
     return existsSync(join(record.root, "index.html"));
@@ -347,7 +347,7 @@ export class Shares {
             const started = await this.start(slug, dirname(index));
             this.save(slug, { ...record, ...started });
             this.log("share-restarted", `${slug} ${record.url} ${started.url}`);
-          } catch { toolError("share", "share.catch8");
+          } catch (caughtError) { toolError("share", "share.catch8", caughtError);
             this.log("share-restart-failed", slug);
           }
         }
@@ -377,7 +377,7 @@ export class Shares {
       const tunnel = await this.options.startTunnel(port);
       this.live.set(slug, { server, tunnel });
       return { url: tunnel.url, port, pid: tunnel.pid };
-    } catch (error) { toolError("share", "share.catch9");
+    } catch (error) { toolError("share", "share.catch9", error);
       await server.stop(true);
       throw error instanceof ShareError ? error : new ShareError(502, "Tunnel could not be started");
     }
@@ -387,7 +387,7 @@ export class Shares {
     const live = this.live.get(slug);
     if (!live) return;
     this.live.delete(slug);
-    await live.tunnel.stop().catch(() => { toolError("share", "share.catch10"); return live.tunnel.kill(); });
+    await live.tunnel.stop().catch((caughtError) => { toolError("share", "share.catch10", caughtError); return live.tunnel.kill(); });
     await live.server.stop(true);
   }
 
@@ -415,7 +415,7 @@ export class Shares {
 
   private serialized<T>(task: () => Promise<T>): Promise<T> {
     const next = this.queue.then(task, task);
-    this.queue = next.catch(() => { toolError("share", "share.catch11");});
+    this.queue = next.catch((caughtError) => { toolError("share", "share.catch11", caughtError);});
     return next;
   }
 }
@@ -426,7 +426,7 @@ function reapOrphan(pid: number, port: number): void {
   const ps = spawnSync("/bin/ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
   const command = ps.status === 0 ? ps.stdout : "";
   if (!command.includes("cloudflared") || !new RegExp(`--url http://127\\.0\\.0\\.1:${port}(?:\\s|$)`).test(command)) return;
-  try { process.kill(pid, "SIGKILL"); } catch { toolError("share", "share.catch12"); /* already gone */ }
+  try { process.kill(pid, "SIGKILL"); } catch (caughtError) { toolError("share", "share.catch12", caughtError); /* already gone */ }
 }
 
 export const SHARE_ROUTES = ["/share", "/unshare", "/shares"];
@@ -444,7 +444,7 @@ export async function shareRoute(shares: Shares, path: string, body: Record<stri
     if (typeof days !== "number") return { status: 400, body: { error: "Invalid request" } };
     const result = await shares.share(app, days);
     return { status: result.created ? 201 : 200, body: result };
-  } catch (error) { toolError("share", "share.catch13");
+  } catch (error) { toolError("share", "share.catch13", error);
     if (error instanceof ShareError) return { status: error.status, body: { error: error.message } };
     return { status: 502, body: { error: "Share failed" } };
   }

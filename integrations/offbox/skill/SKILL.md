@@ -94,9 +94,9 @@ Record the Node version, manager/version, install command and the files that cho
    (e.g. `vp i` for this fork, once the manager install has put vite-plus in node_modules). An npm pin without its npm lockfile is a repo prerequisite to resolve, not a
    reason to run a different manager. Hints cover common literal pins; inspect expressions/matrices yourself.
 4. Select **versions**, not just a manager name. Node: `.nvmrc` / `.node-version`, then `engines.node`,
-   then CI `setup-node` / `NODE_VERSION`; check the selected version satisfies the engine range too.
+   then CI `setup-node`; offbox follows the CI setup-node version when the repo has no pin.
    Use an installed match on local narrow checks (e.g. put its `~/.nvm/versions/node/<version>/bin` first
-   on PATH); offbox provisions a matching Node or stops before the command. CI-only Node fallback on boxes is #694. Log `node --version`.
+   on PATH); offbox provisions a matching Node or stops before the command. Log `node --version`.
    pnpm: `packageManager`, then CI `PNPM_VERSION` / `pnpm/action-setup` `version`. Run it explicitly pinned
    (`corepack pnpm@10 ...` for CI major 10), never a conflicting global pnpm. Check the selected manager's
    `--version` under that Node before both install and checks; select matching npm/Yarn/Bun versions too.
@@ -152,7 +152,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   A missing node_modules bin (`command not found`, exit 127, or `not found` under npm/pnpm, exit 1/254) can mean
   that box has no deps yet; local `node_modules` is never synced. Once #466's own-box affinity is installed,
   separate runs can reuse deps while no box switch is reported.
-- Node version: offbox selects the newest installed Node satisfying the nearest `.nvmrc`/`.node-version` and `package.json` `engines.node` together. If none matches, it bootstraps nvm and installs the newest published match from official Node binaries, checking SHASUMS256 before temporary extraction and activation. It prints `offbox: node vX (...)`; provisioning or activation failure stops before the command with exit 99. Repos without a usable Node pin keep their existing behaviour.
+- Node version: offbox selects Node from the repo pin (`.nvmrc`/`.node-version`/`engines.node`), then the CI setup-node version, then the nvm default (or newest installed nvm Node, otherwise the box default), and prints its choice, provisioning a missing pinned version or stopping with exit 99.
 - In JS repos, runs put the current directory's and ancestor `node_modules/.bin` directories up to the repo root first on PATH, so repo-pinned `vp`/`tsc-rs` win over global copies, including after `cd apps/server`. On a fresh checkout or box, install with the repo's package manager first (see **Install with the repo's package manager**); `vp i` itself needs vite-plus installed.
 - pnpm: repos with `pnpm-lock.yaml` use `packageManager` (including explicit pnpm 11+) > CI `PNPM_VERSION` / `pnpm/action-setup` version > lockfile compatibility (9.0 → pnpm 10; fallback never 11+). A verified package in the box-local cache supplies a PATH shim, bypassing Corepack defaults. `offbox: pnpm vX (<source>)` records the selection; activation failure exits 99. Matching installed/cached toolchains make no network requests. Downloads retry all errors twice with 20 s connect, <30 KB/s for 60 s stall, and 600 s per attempt limits.
 - Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`. If boat has
@@ -230,6 +230,17 @@ UIs/dashboards on the box: `offbox ports 3000` opens `http://127.0.0.1:3000` on 
 (`--local 13000` to pick the local port). `offbox ports 1055 --local 8080 --reverse` goes the other way: the Mac's
 `127.0.0.1:8080` shows up on the box at `127.0.0.1:1055` (e.g. a Mac-side proxy). Interactive shell or one-off command: `offbox ssh` / `offbox ssh -- 'docker ps'`.
 
+### Control a box without SSH
+
+`offbox exec [box_id] [--timeout N] [--cwd DIR] [--json] -- <command...>` runs through the authenticated
+offbox server API, owner-checked, on home or Boat. With no box ID it uses this caller's current lease.
+Use `offbox exec <box> -- <cmd>` when a guest has stopped, masked or replaced its own sshd (for example
+TorSSH testhost fixtures). Never bypass a host-key mismatch by editing known_hosts or disabling strict
+host-key checking. `boat exec` is Boat-only and returns 404 for home boxes.
+Timeout defaults to 60 seconds and is clamped to 1..600. Output goes to stdout/stderr, or `--json` prints
+the raw result dict; the CLI returns the remote exit code. API/transport failures exit 90. A box ID selects
+its recorded backend; a failed request never retries on the other backend. This command does not sync files.
+
 ## Repo toolchains
 
 The `usdtwallet-android` repo recipe installs JDK 17, Android command-line tools, SDK platforms 37.1 and 36,
@@ -264,7 +275,7 @@ resumes+stops pinned leases and unsaved bases/templates before day 14. Save gene
   14 days (it still stops when idle). Unpinned leases stopped 14 days are gone; the next run starts a new box.
 - Leases are deleted only when their thread has been archived for 7 days, or unused for 30 days and not pinned.
 
-A saved base retains its checkout path in project build state. When offbox relocates that checkout for another local path, it clears project `.gradle` directories before the move, including nested Gradle builds; shared Gradle user-home dependency caches and module build outputs stay warm. For a lease created before this fix, move aside the project's `.gradle` once before rerunning Gradle. CMake and other build systems still need a fresh configure after relocation (for example, `cmake --fresh`).
+A saved base retains its checkout path in project build state. When offbox relocates that checkout for another local path, it clears project `.gradle` directories before the move, including nested Gradle builds; shared Gradle user-home dependency caches and module build outputs stay warm. For a lease created before this fix, move aside the project's `.gradle` once before rerunning Gradle. When a base is restored under a new directory, offbox removes CMake caches that name the old path.
 
 ## Housekeeping
 

@@ -32,6 +32,7 @@ open(os.path.join(out, "x-IMG_" + mid + ".JPEG"), "w").write(photos[mid])
 FAKE_BRIDGE = """#!/usr/bin/python3
 import json, os, sys
 args = sys.argv[1:]
+args = [v for a in args for v in (a.split("=", 1) if a.startswith("--") and "=" in a else [a])]
 with open(os.environ["FAKE_BRIDGE_LOG"], "a") as f:
     f.write(json.dumps(args) + "\\n")
 if args[0] == "share":

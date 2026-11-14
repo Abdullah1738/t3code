@@ -12,8 +12,11 @@ import stat
 import warnings
 
 
+REPLICA = re.compile(r"(?<![\w.-])\.robob/userdata/readonly/state\.sqlite(?:-(?:wal|shm))?(?![\w./-])")
 LIVE = re.compile(
     r"(?:\.robob/userdata/statev2|robob-data/userdata/statev2|\.robob/userdata/\*\.sqlite|"
+    # Legacy names and near-misses remain protected; only the replica is public.
+    rf"(?!{REPLICA.pattern})\.robob/userdata/(?:[\w.-]+/)*state\.sqlite|"
     r"(?:\.local/share/opencode|opencode-data)/opencode\.db|"
     # The legacy home database is protected; workspace .t3 copies stay isolated.
     rf"(?:{re.escape(str(Path.home()))}|~|\$HOME|\$\{{HOME\}})/\.t3/userdata/statev2)"
@@ -153,7 +156,7 @@ def source_touches_live(source: str) -> bool:
         return True
     # Separate fixture names and prose do not make a path. Resolve only paths
     # assembled by one Python expression (including Path.home()/... chains).
-    if "statev2" not in source and "opencode.db" not in source:
+    if "statev2" not in source and "state.sqlite" not in source and "opencode.db" not in source:
         return False
     try:
         tree, aliases, bindings = _python_tree(source)
@@ -176,25 +179,116 @@ def _relative_source_live(source, directory):
     return False
 
 
-def _python_touches_live(source, directory):
-    relative_live = _relative_source_live(source, directory)
-    mentions = source_touches_live(source) or relative_live
-    changed_directory = bool(re.search(r"\bchdir\b", source) and
-                             ("statev2.sqlite" in source or "opencode.db" in source) and
-                             (relative_live or re.search(r"\.robob|robob-data|\.local/share/opencode|opencode-data", source)))
-    if not mentions and not changed_directory and not (directory is not None and any(LIVE.search(str(directory / name)) for name in {"statev2.sqlite", "opencode.db"})):
-        return False
+def _python_touches_live(source, directory, replica=False):
     try:
         tree, aliases, bindings = _python_tree(source)
     except (SyntaxError, ValueError):
-        return True
+        return bool(replica or source_touches_live(source) or _relative_source_live(source, directory) or
+                    directory is not None and any(LIVE.search(str(directory / name))
+                                                  for name in {'statev2.sqlite', 'state.sqlite', 'opencode.db'}))
+
+    definitions, stores = {}, {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            stores[node.id] = stores.get(node.id, 0) + 1
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.arg)):
+            name = node.arg if isinstance(node, ast.arg) else node.name
+            stores[name] = stores.get(name, 0) + 1
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for imported in node.names:
+                name = imported.asname or (imported.name.split('.')[0] if isinstance(node, ast.Import) else imported.name)
+                stores[name] = stores.get(name, 0) + 1
+        if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            stores[node.name] = stores.get(node.name, 0) + 1
+        if isinstance(node, ast.MatchMapping) and node.rest:
+            stores[node.rest] = stores.get(node.rest, 0) + 1
+        if type(node).__name__ in {'TypeVar', 'ParamSpec', 'TypeVarTuple'}:
+            stores[node.name] = stores.get(node.name, 0) + 1
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                if isinstance(target, ast.Name):
+                    definitions[target.id] = node.value
+
+    # A cached path must not retain trust from an import that was rebound.
+    ambiguous = {name for name in aliases if stores.get(name) != 1}
+    ambiguous.update(name for name in {'Path', 'pathlib', 'os'} if name not in aliases)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            root = _name(node).split('.')[0]
+            if root in aliases:
+                ambiguous.add(root)
+    dependents = {}
+    for name, value in definitions.items():
+        for part in ast.walk(value) if value is not None else ():
+            if isinstance(part, ast.Name):
+                dependents.setdefault(part.id, set()).add(name)
+    pending = list(ambiguous)
+    while pending:
+        for name in dependents.get(pending.pop(), ()):
+            if name not in ambiguous:
+                ambiguous.add(name)
+                pending.append(name)
+    bindings = {name: value for name, value in bindings.items() if name not in ambiguous}
+    # Object writes can reach imported readers/builders through aliases whose
+    # identity this path evaluator cannot establish.
+    opaque = any(isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(n.ctx, (ast.Store, ast.Del)) or
+                 isinstance(n, ast.ImportFrom) and any(a.name == '*' for a in n.names) or
+                 _name(n) in {'globals', 'locals', 'vars', 'setattr', 'delattr'} or
+                 aliases.get(_name(n)) == 'sys.modules' or
+                 isinstance(n, ast.Attribute) and (n.attr in {'__dict__', '__globals__', 'f_globals', 'f_locals', '__getattribute__', '__setattr__'} or
+                     n.attr == 'modules' and aliases.get(_name(n.value), _name(n.value)) == 'sys')
+                 for n in ast.walk(tree))
+
+    def uri_value(node, seen=frozenset()):
+        if any(isinstance(n, ast.Name) and n.id in ambiguous for n in ast.walk(node)):
+            return None
+        value = _path_expression(node, bindings, aliases)
+        if value is not None:
+            return value
+        if isinstance(node, ast.Name) and node.id not in seen and stores.get(node.id) == 1 and node.id in definitions:
+            return uri_value(definitions[node.id], seen | {node.id})
+        if isinstance(node, ast.Call) and _name(node.func) == 'str' and 'str' not in stores and 'str' not in aliases and len(node.args) == 1:
+            return uri_value(node.args[0], seen)
+        if isinstance(node, ast.JoinedStr):
+            parts = [uri_value(n.value, seen) if isinstance(n, ast.FormattedValue) and
+                     n.conversion == -1 and n.format_spec is None else uri_value(n, seen) for n in node.values]
+            return ''.join(parts) if all(p is not None for p in parts) else None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = uri_value(node.left, seen), uri_value(node.right, seen)
+            return left + right if left is not None and right is not None else None
+        return None
+
+    replica = replica or any(REPLICA.search(value) for node in ast.walk(tree)
+                             if (value := _path_expression(node, bindings, aliases)) is not None)
+    original_live = source_touches_live(source)
+    replica_calls = set()
+    for node in ast.walk(tree):
+        if not replica or original_live or opaque or not isinstance(node, ast.Call) or not node.args:
+            continue
+        root, *rest = _name(node.func).split('.')
+        if root not in aliases or root in ambiguous or stores.get(root) != 1 or '.'.join([aliases[root], *rest]) != 'sqlite3.connect':
+            continue
+        value = uri_value(node.args[0])
+        if value is None:
+            continue
+        value = re.sub(r'^file:', '', value).split('?', 1)[0]
+        match = REPLICA.search(value)
+        if match and match.end() == len(value) and not _direct_read(['cat', value], directory):
+            replica_calls.update(id(n) for n in ast.walk(node.func))
+    relative_live = _relative_source_live(source, directory)
+    mentions = original_live or relative_live or replica
+    changed_directory = bool(re.search(r"\bchdir\b", source) and
+                             ("statev2.sqlite" in source or "state.sqlite" in source or "opencode.db" in source) and
+                             (relative_live or re.search(r"\.robob|robob-data|\.local/share/opencode|opencode-data", source)))
+    if not mentions and not changed_directory and not (directory is not None and any(LIVE.search(str(directory / name)) for name in {"statev2.sqlite", "state.sqlite", "opencode.db"})):
+        return False
     db = {"sqlite3", "apsw", "sqlalchemy", "duckdb", "peewee"}
-    direct_callables = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    direct_callables = {id(part) for n in ast.walk(tree) if isinstance(n, ast.Call) for part in ast.walk(n.func)}
     for node in ast.walk(tree):
         name = _name(node)
         root, *rest = name.split(".")
         canonical = ".".join([aliases.get(root, root), *rest])
-        if canonical.split(".")[0] in db:
+        if canonical.split(".")[0] in db and id(node) not in replica_calls:
             return True
         if canonical in {"__import__", "builtins", "importlib", "eval", "exec", "getattr", "__builtins__"} or canonical.startswith(("builtins.", "importlib.", "__builtins__.")):
             return True
@@ -208,7 +302,8 @@ def _python_touches_live(source, directory):
             return True
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             modules = [n.name for n in node.names] if isinstance(node, ast.Import) else [node.module or ""]
-            if any(m.split(".")[0] in db | {"builtins", "importlib"} for m in modules):
+            if any(m.split(".")[0] in db | {"builtins", "importlib"} and
+                   not (m == 'sqlite3' and replica_calls) for m in modules):
                 return True
         if not isinstance(node, ast.Call):
             continue
@@ -1008,9 +1103,144 @@ def _fixture_shell_live(text, depth=0):
     return False
 
 
+def _replica_reader_source(source):
+    # A literal is discounted only at a reader, or in an immutable binding whose
+    # every use is a reader argument. Unknown transformations retain the name.
+    identifier = r'[A-Za-z_$][\w$]*'
+    strings = re.compile(r'''//[^\r\n\u2028\u2029]*|/\*[\s\S]*?\*/|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"''')
+    code = strings.sub(lambda m: ' ' * len(m[0]), source)
+    discounted = []
+    for command in re.finditer(r'(?m)^\s*sqlite3\s+-readonly\s+([^\s;|&]+)', source):
+        if (replica := REPLICA.search(command[1])) and replica.end() == len(command[1]):
+            start, end = command.span(1)
+            discounted.append((start, end))
+            code = code[:start] + ' ' * (end - start) + code[end:]
+    # Escaped identifiers, templates and regex literals need lexical parsing to
+    # prove that the textual reference list is complete. Keep them conservative.
+    if any(token in code for token in ('\\', '`', '/')) or re.search(r'\b(?:eval|Function|Reflect|Proxy)\b', code):
+        return source
+
+    def namespace(module, operations):
+        names = []
+        pattern = r'''\bimport\s+\*\s+as\s+(''' + identifier + r''')\s+from\s*(['"])node:''' + module + r'''\2'''
+        for imported in re.finditer(pattern, source):
+            if not code.startswith('import', imported.start()):
+                continue
+            uses = [m for m in re.finditer(r'(?<![\w$])' + re.escape(imported[1]) + r'(?![\w$])', code)
+                    if m.span() != imported.span(1)]
+            if all(re.match(r'\s*\.\s*(?:' + operations + r')\s*\(', code[m.end():]) for m in uses):
+                names.append(re.escape(imported[1]))
+        return '(?:' + '|'.join(names) + ')' if names else r'(?!)'
+
+    paths = namespace('path', 'join|resolve')
+    os_module = namespace('os', 'homedir')
+    util_module = namespace('util', 'parseArgs')
+    constructors = [namespace('sqlite', 'DatabaseSync') + r'\.DatabaseSync']
+    named_reader = r'''\bimport\s*\{\s*(DatabaseSync)(?:\s+as\s+(''' + identifier + r'''))?\s*\}\s*from\s*(['"])node:sqlite\3'''
+    for imported in re.finditer(named_reader, source):
+        if not code.startswith('import', imported.start()):
+            continue
+        group = 2 if imported[2] else 1
+        uses = [m for m in re.finditer(r'(?<![\w$])' + re.escape(imported[group]) + r'(?![\w$])', code)
+                if m.span() != imported.span(group)]
+        if all(re.search(r'\bnew\s*$', code[:m.start()]) and re.match(r'\s*\(', code[m.end():]) for m in uses):
+            constructors.append(re.escape(imported[group]))
+    reader = re.compile(r'\bnew\s+(?:' + '|'.join(constructors) + r')\s*\(\s*$')
+    literal = r'''(?:'[^'\\\n]*\.robob/userdata/readonly/state\.sqlite(?:-(?:wal|shm))?'|"[^"\\\n]*\.robob/userdata/readonly/state\.sqlite(?:-(?:wal|shm))?")'''
+    home = r'(?:process\.env\.HOME|' + os_module + r'\.homedir\(\s*\))'
+    seed = re.compile(paths + r'\.(?:join|resolve)\(\s*' + home + r'\s*,\s*' + literal + r'\s*\)|' + home + r'\s*\+\s*' + literal + '|' + literal)
+
+    def reader_use(start, end):
+        return reader.search(code[:start]) and re.match(r'\s*[,)]', code[end:])
+
+    def binding_reads(name, declaration, text=code):
+        uses = list(re.finditer(r'(?<![\w$])' + re.escape(name) + r'(?![\w$])', text))
+        reads = [m for m in uses if m.span() != declaration]
+        return bool(reads) and all(reader_use(m.start(), m.end()) for m in reads)
+
+    implicit_args = (not re.search(r'\b(?:globalThis|global|require|module|constructor|__proto__)\b|\bimport\s*\(', code) and
+                     all(re.match(r'\s*\.\s*fromEntries\s*\(', code[m.end():])
+                         for m in re.finditer(r'\bObject\b', code)))
+    # Default inference covers the probe's dependencies; other imported code
+    # can mutate arguments without exposing those writes in this source.
+    default_modules = {'node:sqlite', 'node:os', 'node:path', 'node:util',
+                       'node:timers/promises', 'effect/Console', 'effect/Effect'}
+    for token in strings.finditer(source):
+        if token[0][0] in '\'"' and re.search(r'\b(?:from|import)\s*$', code[:token.start()]):
+            module = token[0][1:-1]
+            if module not in default_modules:
+                implicit_args = False
+
+    for match in seed.finditer(source):
+        if not REPLICA.search(match[0]):
+            continue
+        start, end = match.span()
+        # Parentheses around an expression are transparent; call parentheses
+        # must remain so a helper's argument cannot look like a direct read.
+        while (opening := re.search(r'\(\s*$', source[:start])) and re.match(r'\s*\)', source[end:]):
+            before = source[:opening.start()].rstrip()
+            if before and re.search(r'[\w$.)\]]$', before):
+                break
+            start = opening.start()
+            end += re.match(r'\s*\)', source[end:]).end()
+        safe = reader_use(start, end)
+        declaration = re.search(r'\bconst\s+(' + identifier + r')\s*=\s*$', code[:start])
+        if declaration and re.match(r'\s*;', code[end:]):
+            safe = binding_reads(declaration[1], declaration.span(1))
+        option = re.search(r'''\breplica\s*:\s*\{\s*type\s*:\s*(['"])string\1\s*,\s*default\s*:\s*$''', source[:start])
+        parser = re.search(r'\bconst\s*\{\s*(values)\s*\}\s*=\s*' + util_module + r'\.parseArgs\(\s*\{\s*options\s*:\s*\{', code)
+        if option and parser and parser.start() < option.start() and re.match(r'\s*,?\s*}', code[end:]):
+            # The probe's parseArgs option is another immutable binding. Reject
+            # option overrides and unknown uses of the returned values object.
+            depth, close = 1, code.index('(', parser.start()) + 1
+            while close < len(code) and depth:
+                depth += (code[close] == '(') - (code[close] == ')')
+                close += 1
+            options = code[parser.start():close]
+            depth, options_end = 1, parser.end()
+            while options_end < close and depth:
+                depth += (code[options_end] == '{') - (code[options_end] == '}')
+                options_end += 1
+            raw_options = source[parser.end():options_end]
+            # Only the literal options record is covered by this default proof;
+            # root overrides and changes to implicit argv must stay unproven.
+            default_input = (implicit_args and re.fullmatch(r'\s*,?\s*}\s*\)', code[options_end:close]) and
+                             '[' not in options and '\\' not in raw_options and
+                             all(parser.end() <= token.start() < options_end
+                                 for token in strings.finditer(source)
+                                 if token[0][0] in '\'"' and re.match(r'\s*:', code[token.end():])) and
+                             len(re.findall(r'\breplica\b', raw_options)) == 1 and
+                             all(re.match(r'\s*\.\s*(?:exitCode\b|env\s*\.\s*HOME\b)', code[m.end():])
+                                 for m in re.finditer(r'(?<![\w$])process(?![\w$])', code)))
+            uses = code
+            for access in re.finditer(r'''\bvalues\s*\[\s*(['"])([^'"\n]+)\1\s*\]''', source):
+                if access[2] != 'replica' and '\\' not in access[2] and not re.match(r'\s*(?:[+*/%&|?^-]*=(?!=)|\+\+|--)', code[access.end():]):
+                    uses = uses[:access.start()] + ' ' * len(access[0]) + uses[access.end():]
+            for access in re.finditer(r'\bvalues\.replica\b', code):
+                if reader_use(access.start(), access.end()):
+                    uses = uses[:access.start()] + ' ' * len(access[0]) + uses[access.end():]
+            uses = uses[:parser.start(1)] + ' ' * len(parser[1]) + uses[parser.end(1):]
+            # Optional access and destructuring also expose computed keys that
+            # string masking cannot prove safe for implicit parser arguments.
+            safe = (default_input and not re.search(r'[\w$)\]}]\s*(?:\?\.\s*)?\[|\]\s*:', uses) and
+                    end < close and '...' not in options and
+                    len(re.findall(r'\breplica\s*:', options)) == 1 and
+                    len(re.findall(r'\boptions\s*:', options)) == 1 and
+                    not re.search(r'\bvalues\b', uses))
+        if safe:
+            discounted.append((start, end))
+    for start, end in reversed(discounted):
+        source = source[:start] + ' ' * (end - start) + source[end:]
+    return source
+
+
 def _source_hit(source, directory, python=False, shell=False):
+    # Keep the root evidence so the replica cannot hide a second database name.
+    replica = REPLICA.search(source)
     if python:
-        return _python_touches_live(source, directory)
+        return _python_touches_live(source, directory, replica=bool(replica))
+    if replica and not shell:
+        source = _replica_reader_source(source)
     if shell:
         original = source
         source = _shell_fixture_source(source, directory)
@@ -1040,7 +1270,7 @@ def _source_hit(source, directory, python=False, shell=False):
     source = re.sub(r"(['\"])([^'\"\\\n]+)\1", isolated_literal, source)
     # A bundle id such as com.ardud.robob is not a path segment. Keep split
     # live roots conservative, including cwd changes separate from the name.
-    live_root = re.search(r"(?<!\w)\.robob\b|robob-data|\.local/share|opencode-data|[\"']opencode[\"']", source)
+    live_root = replica or re.search(r"(?<!\w)\.robob\b|robob-data|\.local/share|opencode-data|[\"']opencode[\"']", source)
     home_userdata = (not shell and re.search(r"\buserdata\b", source) and
                      re.search(r"\b(?:homedir|HOME|T3CODE_HOME)\b|\bPath\.home\b|['\"`]~(?:/|['\"`])", source))
     # Shell fixture proofs above discharge statev2/opencode paths, not other
@@ -1148,6 +1378,7 @@ def _token(value):
 
 def _database_reference(source):
     # Report the operand, never the surrounding source or JSON payload.
+    source = REPLICA.sub(lambda match: " " * len(match[0]), source)
     protected = LIVE.search(source)
     if protected:
         for match in re.finditer(r"(?:~|\$\{?HOME\}?|/)[^\s'\"\\<>]*?(?:statev2\.sqlite|opencode\.db)(?:-(?:wal|shm|journal))?", source):

@@ -118,7 +118,10 @@ layer("NodeSqliteClient", (it) => {
           yield* sql`SELECT 1 AS result`;
           yield* sql`WITH seed AS (SELECT 'private binding' AS value) INSERT INTO observed_statements SELECT value FROM seed RETURNING secret`;
           yield* sql`INSERT INTO observed_statements VALUES ('private binding')`.pipe(Effect.exit);
-        }).pipe(Effect.provideService(SqliteClient.StatementObserver, observer));
+        }).pipe(
+          Effect.provideService(SqliteClient.StatementObserver, observer),
+          Effect.withSpan("ObservedService.query"),
+        );
         assert.deepEqual(
           observed.map((entry) => [entry.operation, entry.connection, entry.outcome]),
           [
@@ -131,6 +134,8 @@ layer("NodeSqliteClient", (it) => {
         assert.isTrue(
           observed.every((entry) => Number.isFinite(entry.durationMs) && entry.durationMs >= 0),
         );
+        assert.isTrue(observed.every((entry) => entry.span === "ObservedService.query"));
+        assert.isTrue(observed.every((entry) => entry.waitMs === undefined || entry.waitMs >= 0));
         assert.isFalse(JSON.stringify(observed).includes("private"));
         assert.isFalse(JSON.stringify(observed).includes("observed_statements"));
         yield* sql`SELECT 2`.pipe(

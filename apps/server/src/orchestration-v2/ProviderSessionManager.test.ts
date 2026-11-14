@@ -5107,6 +5107,18 @@ it.effect("ProviderSessionManagerV2 releases sessions when provider event stream
       yield* eventSink.write({
         events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
       });
+      // The stream reports failure before releaseEntry persists the error status.
+      const persistedError = yield* eventSink.stream({ threadId }).pipe(
+        Stream.filter(
+          ({ event }) =>
+            event.type === "provider-session.updated" &&
+            event.payload.id === providerSessionId &&
+            event.payload.status === "error",
+        ),
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkScoped,
+      );
       const runtime = yield* manager.open({
         threadId,
         providerSessionId,
@@ -5114,7 +5126,7 @@ it.effect("ProviderSessionManagerV2 releases sessions when provider event stream
         runtimePolicy,
       });
       yield* runtime.events.pipe(Stream.runDrain, Effect.ignore, Effect.forkScoped);
-      yield* Effect.yieldNow;
+      yield* Fiber.join(persistedError);
 
       const liveSession = yield* manager.get(providerSessionId);
       const runtimeState = yield* Ref.get(state);

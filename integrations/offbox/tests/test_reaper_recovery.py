@@ -80,7 +80,8 @@ class ReaperRecovery(Isolated):
                         if reader == 'wait':
                             self.assertEqual(misc.wait(rid, None), code)
                         elif reader == 'logs':
-                            self.assertEqual(misc.logs(rid, False), 0)
+                            # #84 s8: no box/process means killed while queued, even after saved-state repair.
+                            self.assertEqual(misc.logs(rid, False), 130 if status == 'killed' else 0)
                         else:
                             with patch.object(api, 'list_boxes', return_value=[]):
                                 reap._reap(self.con, False, [])

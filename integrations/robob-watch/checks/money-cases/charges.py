@@ -670,7 +670,7 @@ def owner_found(charge, at, now, deadline=None, said=None, errors=None):
     return None
 
 
-def explain(charge, at, now, deadline=None, find=None, said=None, receipt_ok=None):
+def explain(charge, at, now, deadline=None, find=None, said=None, receipt_ok=None, *, memo=None, stats=None):
     """verdict receipt | owner | wait | ask, with why and any lookup errors."""
     errors = []
     owner = card_owner(charge)
@@ -678,7 +678,7 @@ def explain(charge, at, now, deadline=None, find=None, said=None, receipt_ok=Non
         return {'verdict': 'held', 'why': 'held for Moni', 'errors': []}
     if charge['kind'] != 'charge':
         return {'verdict': 'ask', 'why': 'a declined payment goes to him', 'errors': errors}
-    hit = found(charge, at, now, deadline, find, said, errors, receipt_ok=receipt_ok)
+    hit = found(charge, at, now, deadline, find, said, errors, memo, stats, receipt_ok=receipt_ok)
     if hit:
         return hit
     if errors:

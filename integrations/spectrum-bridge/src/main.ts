@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { createApi } from "./api.ts";
 import { startAppsServer } from "./apps.ts";
 import { Delivery } from "./delivery.ts";
+import { ReplyGapMonitor } from "./reply-gap.ts";
 import { alertSkillPath, loadConfig, skillPath, stateRoot, telegramBridgeSocket, transportKind } from "./config.ts";
 import { ingest } from "./ingress.ts";
 import { acquireLock } from "./lock.ts";
@@ -54,7 +55,7 @@ async function cloudRequest(path: string, body?: unknown): Promise<any> {
 }
 
 async function removeStaleSocket(path: string): Promise<void> {
-  const info = await lstat(path).catch((error: NodeJS.ErrnoException) => { toolError("main", "main.catch1");
+  const info = await lstat(path).catch((error: NodeJS.ErrnoException) => { toolError("main", "main.catch1", error);
     if (error.code !== "ENOENT") throw error;
   });
   if (!info) return;
@@ -159,7 +160,7 @@ async function main(): Promise<void> {
     await mkdir(config.appsRoot, { recursive: true, mode: 0o700 });
     apps = startAppsServer(config.appsRoot, config.appsPort, secretDeps);
     log("apps-listening");
-  } catch (error) { toolError("main", "main.catch2");
+  } catch (error) { toolError("main", "main.catch2", error);
     log("apps-unavailable", errorCode(error));
   }
   // The tailscale CLI can hang (e.g. a stuck launch), which would time out every secure form.
@@ -175,18 +176,18 @@ async function main(): Promise<void> {
       return url;
     });
     if (!known) return attempt;
-    attempt.catch(error => { toolError("main", "main.catch3"); return log("apps-publish-failed", errorCode(error)); });
+    attempt.catch(error => { toolError("main", "main.catch3", error); return log("apps-publish-failed", errorCode(error)); });
     let timer: ReturnType<typeof setTimeout> | undefined;
     const fallback = new Promise<string>(resolve => { timer = setTimeout(() => resolve(known), PUBLISH_WAIT_MS); });
     try {
-      appsUrl = await Promise.race([attempt.catch(() => { toolError("main", "main.catch4"); return known; }), fallback]);
+      appsUrl = await Promise.race([attempt.catch((caughtError) => { toolError("main", "main.catch4", caughtError); return known; }), fallback]);
       return appsUrl;
     } finally { clearTimeout(timer); }
   };
   const shares = new Shares({ store, appsRoot: config.appsRoot, startTunnel: cloudflaredTunnel(), log,
     origin: config.shareOrigin });
   process.once("exit", () => shares.killAll());
-  void shares.restore().catch(() => { toolError("main", "main.catch5"); return log("share-sweep-failed"); });
+  void shares.restore().catch((caughtError) => { toolError("main", "main.catch5", caughtError); return log("share-sweep-failed"); });
   api = createApi({ store, photon, router: () => router, chatGuid: () => chatGuid, shares,
     ...(apps ? { secrets: { stateRoot, publishApps } } : {}),
     replyCheck: text => checkReply({ slug: "owner", kind: "owner" }, text, readReplyRules(join(stateRoot, "reply-rules.json"))),
@@ -207,6 +208,7 @@ async function main(): Promise<void> {
     appsUrl: () => store.get<{ port: number; url: string } | null>("appsPublished")?.url,
     blob: sha256 => store.getBlob(sha256),
   });
+  const replyGap = new ReplyGapMonitor(store, { chat: "owner", notify: outlet.notify });
   const delivery = new Delivery(store, photon, { projectScope, chatGuid: () => chatGuid,
     beforeSend: async item => router?.beforeSend(item) ?? "send",
     enabled: () => ready() && !controlsPending && !stopping, log,
@@ -228,7 +230,7 @@ async function main(): Promise<void> {
             router ??= makeRouter();
             if (event.type !== "catchup.complete") {
               const input = normalizeInbound(event, config.owner, chatGuid!);
-              if (input) void acknowledgePhoton(store, photon, chatGuid!, input).catch(() => { toolError("main", "main.catch6"); return log("receipt-ack-failed"); });
+              if (input) void acknowledgePhoton(store, photon, chatGuid!, input).catch((caughtError) => { toolError("main", "main.catch6", caughtError); return log("receipt-ack-failed"); });
             }
           }
           if (event.type === "catchup.complete") { complete = true; break; }
@@ -238,7 +240,7 @@ async function main(): Promise<void> {
         health.photonLastOk = Date.now();
         backoff = 2_000;
         await sleep(2_000);
-      } catch (error) { toolError("main", "main.catch7");
+      } catch (error) { toolError("main", "main.catch7", error);
         synchronized = false;
         controlsPending = true;
         health.lastError = errorCode(error);
@@ -262,23 +264,23 @@ async function main(): Promise<void> {
       void toolLog.tick();
       if (Date.now() - sharesSweptAt >= 30_000) {
         sharesSweptAt = Date.now();
-        void shares.sweep().catch(() => { toolError("main", "main.catch8"); return log("share-sweep-failed"); });
+        void shares.sweep().catch((caughtError) => { toolError("main", "main.catch8", caughtError); return log("share-sweep-failed"); });
       }
       // Runs even when messaging is not ready: submitted values must still expire on time.
       if (Date.now() - secretsSweptAt >= 30_000) {
         secretsSweptAt = Date.now();
-        await sweepSecrets(secretDeps).catch(() => { toolError("main", "main.catch9"); return log("secret-sweep-failed"); });
+        await sweepSecrets(secretDeps).catch((caughtError) => { toolError("main", "main.catch9", caughtError); return log("secret-sweep-failed"); });
       }
       if (!originBackfill.done) void originBackfill.kick();
       if (backend instanceof RobobBackend && ready() && !router?.status().activeTurn && Date.now() - routeCheckedAt >= 30_000) {
         routeCheckedAt = Date.now();
         // A stored ses_ route the OpenCode import never mapped starts a fresh chat instead of stalling.
-        if (await retireUnresolvedRoute(store, backend).catch(() => { toolError("main", "main.catch10"); return false; })) log("route-unresolved-retired");
+        if (await retireUnresolvedRoute(store, backend).catch((caughtError) => { toolError("main", "main.catch10", caughtError); return false; })) log("route-unresolved-retired");
       }
       if (ready()) {
         if (Date.now() - backendCheckedAt >= 30_000) {
           backendCheckedAt = Date.now();
-          await backend.health().then(() => { health.backendLastOk = Date.now(); }, () => { toolError("main", "main.catch11");});
+          await backend.health().then(() => { health.backendLastOk = Date.now(); }, (caughtError) => { toolError("main", "main.catch11", caughtError);});
         }
       }
       await sleep(1_000);
@@ -286,17 +288,18 @@ async function main(): Promise<void> {
   }
   let routerBusy = false;
   const timer = setInterval(() => {
-    void delivery.tick().catch(() => { toolError("main", "main.catch12"); return log("sender-failed"); });
-    if (ready()) void router?.checkInboundLatency().catch(() => { toolError("main", "main.catch13"); return log("inbound-latency-check-failed"); });
+    void delivery.tick().catch((caughtError) => { toolError("main", "main.catch12", caughtError); return log("sender-failed"); });
+    if (ready()) void replyGap.tick().catch((caughtError) => { toolError("main", "reply-gap.check", caughtError); });
+    if (ready()) void router?.checkInboundLatency().catch((caughtError) => { toolError("main", "main.catch13", caughtError); return log("inbound-latency-check-failed"); });
     if (ready() && router && !routerBusy) {
       routerBusy = true;
       const currentRouter = router;
       const revision = ingressRevision;
       void currentRouter.tick().then(() => {
         if (revision === ingressRevision && synchronized) controlsPending = false;
-      }, () => { toolError("main", "main.catch14"); return log("router-tick-failed"); }).finally(() => { routerBusy = false; });
+      }, (caughtError) => { toolError("main", "main.catch14", caughtError); return log("router-tick-failed"); }).finally(() => { routerBusy = false; });
     }
-    if (ready()) void router?.checkFailedInbound().catch(() => { toolError("main", "main.catch15"); return log("failed-inbound-check-failed"); });
+    if (ready()) void router?.checkFailedInbound().catch((caughtError) => { toolError("main", "main.catch15", caughtError); return log("failed-inbound-check-failed"); });
   }, 1_000);
   const stop = async () => {
     if (stopping) return;
@@ -304,9 +307,9 @@ async function main(): Promise<void> {
     toolLog.capture(() => toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }));
     clearInterval(timer);
     await server.stop(true);
-    await apps?.stop().catch(() => { toolError("main", "main.catch16");});
-    await shares.stopAll().catch(() => { toolError("main", "main.catch17");});
-    if (chatGuid) await photon.typing(chatGuid, false).catch(() => { toolError("main", "main.catch18");});
+    await apps?.stop().catch((caughtError) => { toolError("main", "main.catch16", caughtError);});
+    await shares.stopAll().catch((caughtError) => { toolError("main", "main.catch17", caughtError);});
+    if (chatGuid) await photon.typing(chatGuid, false).catch((caughtError) => { toolError("main", "main.catch18", caughtError);});
     await photon.close();
     // In-flight rows are intentionally recovered on the next startup rather than marked successful.
     process.exit(0);
@@ -317,4 +320,4 @@ async function main(): Promise<void> {
   await Promise.all([receive(), tick()]);
 }
 
-if (import.meta.main) main().catch(error => { toolError("main", "main.catch19"); log("bridge-start-failed", errorCode(error)); toolLog.flush(); process.exit(1); });
+if (import.meta.main) main().catch(error => { toolError("main", "main.catch19", error); log("bridge-start-failed", errorCode(error)); toolLog.flush(); process.exit(1); });

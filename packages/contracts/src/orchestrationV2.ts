@@ -1155,6 +1155,7 @@ export type OrchestrationV2NotificationSource = typeof OrchestrationV2Notificati
 
 export const OrchestrationV2Notification = Schema.Struct({
   source: OrchestrationV2NotificationSource,
+  pullRequestWatch: Schema.optional(Schema.Struct({ url: Schema.String, headSha: Schema.String })),
   outcome: Schema.Literals(["completed", "failed", "cancelled", "updated", "unknown"]),
   summary: TrimmedNonEmptyString,
   detail: Schema.optional(Schema.String),
@@ -3248,6 +3249,8 @@ const OrchestrationV2InternalCommand = Schema.Union([
     threadId: ThreadId,
     ...ThreadPullRequestKey.fields,
     startedAt: IsoDateTime,
+    expectedHeadSha: Schema.optional(Schema.NullOr(Schema.String)),
+    expectedObservedHeadSha: Schema.optional(Schema.NullOr(Schema.String)),
     watch: Schema.NullOr(ThreadPullRequestWatch),
     /** With `watch: null`, the state the ended watch keeps instead of its last saved one. */
     endedWatch: Schema.optional(ThreadPullRequestWatch),

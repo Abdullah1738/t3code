@@ -266,8 +266,7 @@ export async function deepHealth({
     }
   };
   // TODO(#1124): use authenticated readiness once it proves state AND board reads.
-  // The since filter uses indexed projection rows and builds at most one shell;
-  // a plain list with limit=1 still builds the entire shell snapshot.
+  // Use an indexed recent range for the authenticated state probe.
   const stateRoute = `/threads?limit=1&updatedSince=${Date.now() - 60_000}`;
   const [connection, roundTrip] = await Promise.all([
     probe("/health", (response) => response?.ok === true),

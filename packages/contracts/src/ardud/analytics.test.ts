@@ -20,7 +20,35 @@ const event = {
 const decode = Schema.decodeUnknownSync(AnalyticsIngestInput);
 const decodeEvent = Schema.decodeUnknownSync(AnalyticsEvent);
 const decodeRead = Schema.decodeUnknownSync(AnalyticsReadInput);
+const decodeRunUsage = Schema.decodeUnknownSync(RunUsageEvent, { onExcessProperty: "error" });
 describe("analytics ingest contract", () => {
+  it("preserves typed board metadata and excludes text", () => {
+    const input = {
+      ...event,
+      kind: "kanban.card_move",
+      surface: "server",
+      cardId: "card-1",
+      props: {
+        number: 1,
+        from: "todo",
+        to: "working",
+        actor: "owner",
+        msInPrevStage: 100,
+        blocking: true,
+        round: 1,
+        verdict: "clear",
+        head: "abcdef1",
+        used: 1,
+        slots: 2,
+        waiting: 0,
+      },
+    };
+    expect(decodeEvent(input)).toEqual(input);
+    expect(() =>
+      decodeEvent({ ...input, props: { ...input.props, actor: "private words" } }),
+    ).toThrow();
+    expect(() => decodeEvent({ ...input, props: { ...input.props, head: "private" } })).toThrow();
+  });
   it("accepts MCP filters and rejects unhashed request ids", () => {
     const call = { ...event, kind: "mcp.call", clientRequestId: "a".repeat(64) };
     expect(decodeEvent(call).clientRequestId).toBe("a".repeat(64));
@@ -128,6 +156,26 @@ it.each(["runId", "threadId"] as const)("accepts bounded derived usage %s values
   for (const value of ["a".repeat(8193), "unencoded space", "unencoded界", "line\nbreak"]) {
     expect(() => decodeUsage({ ...usage, [field]: value })).toThrow();
   }
+});
+
+it.each([
+  ["plain", "review-1338_v1.2"],
+  ["parentheses", "review(1338)"],
+  ["bang", "review!1338"],
+  ["apostrophe", "review'1338"],
+  ["star", "review*1338"],
+  ["tilde", "review~1338"],
+  ["separators", "review:/#@%+1338"],
+  ["whitespace", "review 1338\tunit"],
+  ["unicode", "مراجعة-1338"],
+  ["maximum-key", "界".repeat(256)],
+] as const)("accepts %s allocator keys in both run usage IDs", (_name, key) => {
+  const commandId = `command:mcp:delegate-task:caller:${encodeURIComponent(key)}`;
+  const threadId = `thread:delegated-task:${encodeURIComponent(commandId)}`;
+  const runId = `run:thread:${encodeURIComponent(threadId)}:ordinal:1`;
+  const row = { ...usage, threadId, runId };
+  expect(decodeRunUsage(row)).toEqual(row);
+  expect(decodeEvent(row)).toEqual(row);
 });
 
 it.each([

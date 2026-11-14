@@ -25,6 +25,7 @@ import * as ServerSettings from "../../../serverSettings.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import { kanbanDDL } from "../../persistence/kanbanSchema.ts";
+import { ensureKanbanCacheVersions } from "../../persistence/kanbanCacheVersions.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
 import { KanbanService, layer as kanbanLayer } from "./KanbanService.ts";
 import { planCutoverCardRestore } from "./cutoverCards.ts";
@@ -304,6 +305,7 @@ const separateBoardsLayer = Layer.effect(
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     yield* Effect.forEach(kanbanDDL, (ddl) => sql.unsafe(ddl), { discard: true });
+    yield* ensureKanbanCacheVersions(sql);
     return BoardsDatabase.BoardsDatabase.of({ sql, ready: Effect.void, path: ":memory:boards" });
   }),
 ).pipe(Layer.provide(Layer.fresh(NodeSqliteClient.layer({ filename: ":memory:" }))));

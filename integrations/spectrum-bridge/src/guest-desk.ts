@@ -87,7 +87,7 @@ export class GuestDesk {
     const hour = (ownerStore.get<number[]>("guest-wakes") ?? []).filter(at => this.now() - at < 60 * 60_000);
     if (hour.length >= MAX_WAKES_PER_HOUR) {
       book.audit(address, "wake-throttled");
-      await this.deps.note?.(address, `Unknown sender ${address} texted Robob; held, not answered (too many unknown senders this hour).`).catch(() => { toolError("guest-desk", "guest-desk.catch1");});
+      await this.deps.note?.(address, `Unknown sender ${address} texted Robob; held, not answered (too many unknown senders this hour).`).catch((caughtError) => { toolError("guest-desk", "guest-desk.catch1", caughtError);});
       return true;
     }
     ownerStore.set("guest-wakes", [...hour, this.now()]);
@@ -180,7 +180,7 @@ export class GuestDesk {
     let expiresAt: number;
     try {
       expiresAt = input.expires === undefined && pinnedEnd ? Math.min(pinnedEnd, this.now() + MAX_GRANT_MS) : parseExpiry(input.expires, this.now());
-    } catch { toolError("guest-desk", "guest-desk.catch2"); return { status: 400, body: { error: "Expiry like 48h, 7d or 2w, at most 30 days" } }; }
+    } catch (caughtError) { toolError("guest-desk", "guest-desk.catch2", caughtError); return { status: 400, body: { error: "Expiry like 48h, 7d or 2w, at most 30 days" } }; }
     if (expiresAt <= this.now()) return { status: 409, body: { error: "That flight is already over" } };
     const grant: GuestGrant = {
       address, name: input.name.trim(), purpose: input.purpose.trim(), providers, facts,

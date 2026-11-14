@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { recordHealthDelivery, isHealthNag } from "./healthDelivery.ts";
 import { toolLog, toolError, logDirectory } from "./toollog.ts";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
@@ -343,7 +343,10 @@ export function previousDayRollup(): void {
   const day = new Date(at.getTime() - 86400_000).toISOString().slice(0, 10);
   if (rollingDay === day) return;
   rollingDay = day;
-  if (existsSync(join(logDirectory(), `rollup-${day}.json`))) return;
+  const dayEnd = Date.parse(`${day}T00:00:00Z`) + 86400_000;
+  try {
+    if (statSync(join(logDirectory(), `rollup-${day}.json`)).mtimeMs >= dayEnd) return;
+  } catch { /* Missing or unreadable rollups need another attempt. */ }
   // Parsing a day file runs outside the one-second runner tick.
   try {
     const child = Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "log-rollup", "--day", day], { env: process.env, stdout: "ignore", stderr: "ignore" });

@@ -16,6 +16,66 @@ import toollog
 
 
 class ToolLogTests(unittest.TestCase):
+    def test_imessage_rollup_summary_appended_after_read_is_never_double_counted(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        path = directory / (self.day + '.ndjson')
+        raw = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False, 'durationMs': 1001,
+               'ids': {'callBatchId': 'batch-fixture'}, 'props': {'method': 'GET', 'route': '/threads/:id'}}
+        summary = {**raw, 'name': 'turn.robob_calls', 'calls': {'thread': {
+            'ok': 2, 'failed': 1, 'histogram': [[10, 1], [20, 1], [1001, 1]]}}}
+        path.write_text(json.dumps(raw) + '\n')
+        original = toollog._read_records
+        reads = 0
+        def append_after_read(board, day):
+            nonlocal reads
+            yield from original(board, day)
+            if day == self.day:
+                reads += 1
+                if reads == 1:
+                    with path.open('a') as dest:
+                        dest.write(json.dumps(summary) + '\n')
+        with patch.object(toollog, '_read_records', append_after_read):
+            first = toollog.rollup('imessage', self.day)
+        self.assertEqual((first['total'], first['failedCount']), (1, 1))
+        second = toollog.rollup('imessage', self.day)
+        self.assertEqual((second['total'], second['failedCount']), (3, 1))
+
+    def test_imessage_aggregate_counts_and_percentiles_without_duplicate_slow_rows(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        stats = {'count': 3, 'ok': 2, 'failed': 1, 'p50': 10, 'p95': 1002, 'max': 1002,
+                 'histogram': [[10, 2], [1002, 1]]}
+        call = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False,
+                'durationMs': 1002, 'ids': {'runId': 'run-fixture', 'callBatchId': 'batch-fixture'},
+                'props': {'method': 'GET', 'route': '/threads/:id'}}
+        rows = [{**call, 'name': 'turn.robob_calls', 'calls': {'thread': stats}}, call,
+                {**call, 'durationMs': 2000, 'ids': {'callBatchId': 'orphan'}},
+                {'component': 'router', 'kind': 'perf', 'name': 'turn.end', 'ok': True}]
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        result = toollog.rollup('imessage', self.day)
+        self.assertEqual((result['total'], result['recordedRows'], result['okCount'], result['failedCount']), (5, 4, 3, 2))
+        self.assertEqual(result['countsByName']['turn.robob_call'], 4)
+        self.assertFalse(result['sampled'])
+        self.assertEqual(result['byComponent']['robob']['thread'], {
+            'count': 4, 'ok': 2, 'failed': 2, 'errorRate': .5, 'durationMs': {'p50': 10, 'p95': 2000, 'max': 2000}})
+
+    def test_imessage_aggregate_rejects_private_names_and_invalid_histograms(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        for histogram, expected in [([[5, 1], [971501234567, 1]], 5), ([[5, 2]], None), ([[5, -1]], None)]:
+            stats = {'ok': 1, 'failed': 0, 'histogram': histogram, 'p50': 'PRIVATE_BODY'}
+            row = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_calls',
+                   'calls': {'PRIVATE_TOKEN': stats, 'thread': stats}}
+            (directory / (self.day + '.ndjson')).write_text(json.dumps(row) + '\n')
+            result = toollog.rollup('imessage', self.day)
+            self.assertNotIn('PRIVATE', json.dumps(result))
+            self.assertNotIn('971501234567', json.dumps(result))
+            if expected:
+                self.assertEqual(result['byComponent']['robob']['thread']['durationMs']['p95'], expected)
+            else:
+                self.assertNotIn('thread', result['byComponent']['robob'])
+
     def test_missing_override_uses_private_temp_root(self):
         with patch.dict(os.environ):
             os.environ.pop('TOOLLOG_ROOT', None)
@@ -39,6 +99,61 @@ class ToolLogTests(unittest.TestCase):
 
     def rows(self, board='agent-tools'):
         return list(toollog.read(board, self.day))
+
+    def test_orders_rollup_preserves_cause_groups_and_merchant_timings(self):
+        directory = toollog.board_dir('orders')
+        directory.mkdir(parents=True)
+        records = []
+        for merchant, status, duration in [('noon', 401, 10), ('noon', 401, 20),
+                                           ('noon', 500, 30), ('amazon', 500, 5000),
+                                           (None, None, 40)]:
+            records.append({'ts': self.day + 'T12:00:00Z', 'tool': 'orders', 'component': 'order-watch',
+                'name': 'track.poll', 'kind': 'error', 'durationMs': duration, 'ok': False,
+                'props': {'merchant': merchant},
+                'error': {'tag': 'OPERATION_FAILED', 'cause': {'httpStatus': status}}})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in records))
+        result = toollog.rollup('orders', self.day)
+        self.assertEqual({(row['httpStatus'], row['merchant']): row['count'] for row in result['topErrors']},
+                         {(401, 'noon'): 2, (500, 'noon'): 1, (500, 'amazon'): 1, (None, 'unknown'): 1})
+        self.assertEqual(result['durationsMs']['track.poll']['byMerchant']['noon'],
+                         {'count': 3, 'p50': 20, 'p95': 30, 'max': 30})
+        self.assertEqual(result['durationMsByName']['track.poll'], {'p50': 30, 'p95': 5000, 'max': 5000})
+        self.assertEqual(result['topErrorTags'][0]['count'], 5)
+
+    def test_sampled_orders_rollup_weights_merchant_durations_and_groups_errors(self):
+        directory = toollog.board_dir('orders')
+        directory.mkdir(parents=True)
+        records = []
+        for merchant, kind, duration, rate, status in [
+            ('noon', 'perf', 10, 20, None), ('noon', 'perf', 100, 1, None),
+            ('noon', 'error', 1000, 128, 401), ('noon', 'error', 2000, 32, 401),
+            ('careem', 'perf', 25, 2, None), ('amazon', 'perf', 50, 1, None),
+            ('amazon', 'error', 3000, 64, 500), (None, 'error', 4000, 1, None),
+        ]:
+            records.append({'ts': self.day + 'T12:00:00Z', 'tool': 'orders',
+                'name': 'track.poll', 'kind': kind, 'durationMs': duration, 'ok': kind != 'error',
+                'props': {'merchant': merchant, 'sampleRate': rate},
+                **({'error': {'tag': 'OPERATION_FAILED', 'cause': {'httpStatus': status}}}
+                   if kind == 'error' else {})})
+        records.append({'ts': self.day + 'T12:00:01Z', 'kind': 'error', 'name': 'log.cap',
+            'props': {'component': 'hooks', 'capBytes': 100}, 'error': {'tag': 'LOG_CAP'}})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in records))
+        result = toollog.rollup('orders', self.day)
+        self.assertEqual(result['recordedRows'], 9)
+        self.assertEqual(result['total'], 29)
+        self.assertTrue(result['sampled'])
+        self.assertEqual(result['countsByName'], {'track.poll': 28, 'log.cap': 1})
+        self.assertEqual(result['logCaps'], [{'component': 'hooks', 'capBytes': 100,
+                                              'ts': self.day + 'T12:00:01Z'}])
+        self.assertEqual({(r['tag'], r['httpStatus'], r['merchant']): r['count'] for r in result['topErrors']},
+            {('OPERATION_FAILED', 401, 'noon'): 2, ('OPERATION_FAILED', 500, 'amazon'): 1,
+             ('OPERATION_FAILED', None, 'unknown'): 1, ('LOG_CAP', None, 'unknown'): 1})
+        self.assertEqual(result['durationMsByName']['track.poll'], {'p50': 10, 'p95': 3000, 'max': 4000})
+        self.assertEqual(result['durationsMs']['track.poll']['byMerchant'], {
+            'noon': {'count': 23, 'p50': 10, 'p95': 1000, 'max': 2000},
+            'careem': {'count': 2, 'p50': 25, 'p95': 25, 'max': 25},
+            'amazon': {'count': 2, 'p50': 50, 'p95': 3000, 'max': 3000},
+            'unknown': {'count': 1, 'p50': 4000, 'p95': 4000, 'max': 4000}})
 
     def test_format_privacy_modes_and_fail_open(self):
         os.chmod(self.tmp.name, 0o755)
@@ -198,6 +313,35 @@ class ToolLogTests(unittest.TestCase):
         for board, day in [('../escape', self.day), ('orders', '../../escape'), ('Orders', self.day)]:
             with self.assertRaises(ValueError):
                 list(toollog.read(board, day))
+
+    def test_rollup_groups_error_tag_and_class(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        path = directory / (self.day + '.ndjson')
+        records = [{'kind': 'error', 'name': 'bridge.catch',
+                    'error': {'tag': 'secrets.catch9', **({'name': name} if name else {})}}
+                   for name in ('Error', 'Error', 'TypeError', None)]
+        path.write_text(''.join(json.dumps(row) + '\n' for row in records))
+        result = toollog.rollup('imessage', self.day)['topErrorTags']
+        self.assertEqual([(row['tag'], row['name'], row['count']) for row in result], [
+            ('secrets.catch9', 'Error', 2), ('secrets.catch9', 'TypeError', 1),
+            ('secrets.catch9', 'UnknownError', 1)])
+        self.assertEqual([row['sampleId']['line'] for row in result], [1, 3, 4])
+
+    def test_imessage_rollup_reduces_untrusted_class_name_shapes(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        cases = [('PRIVATE_FORM_VALUE', 'UnknownError'), ('PRIVATEError', 'UnknownError'),
+                 ('PRIVATE_PHONE_971501234567', 'UnknownError'), ('https://private/?token=PRIVATE', 'UnknownError'),
+                 ('/private/attachment.png', 'UnknownError'), (42, 'UnknownError'),
+                 (None, 'UnknownError'), ('TypeError', 'TypeError'), ('ControlError', 'ControlError')]
+        for name, expected in cases:
+            with self.subTest(name=name):
+                (directory / (self.day + '.ndjson')).write_text(json.dumps({
+                    'kind': 'error', 'name': 'bridge.catch', 'error': {'tag': 'fixture.catch1', 'name': name}}) + '\n')
+                result = toollog.rollup('imessage', self.day)['topErrorTags']
+                self.assertEqual(result[0]['name'], expected)
+                self.assertNotIn('PRIVATE', json.dumps(result))
 
     def test_rollup_prefers_available_error_ids(self):
         toollog.emit('fixture', 'error', 'fixture.error', error_tag='fixture.failure')

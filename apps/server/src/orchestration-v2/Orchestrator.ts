@@ -158,6 +158,7 @@ import * as RunExecutionService from "./RunExecutionService.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderSwitchServiceV2 } from "./ProviderSwitchService.ts";
 import { isAutomaticCompletionRun, queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
+import { refreshPullRequestCheckWake } from "./pullRequestWatch.ts";
 import { RuntimePolicyV2 } from "./RuntimePolicy.ts";
 import {
   endOrphanedNativeSubagent,
@@ -1334,6 +1335,44 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
   );
 
+  const refreshQueuedPullRequestChecks = Effect.fn("Orchestrator.refreshQueuedPullRequestChecks")(
+    function* (
+      command: OrchestrationV2ServerCommand,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+      projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages" | "nodes" | "attempts">,
+      links: ReadonlyArray<ThreadPullRequestLink>,
+    ) {
+      if (!links.some((link) => link.watch !== undefined)) return;
+      const queued = projection.runs.filter((run) => run.status === "queued");
+      if (queued.length === 0) return;
+      const messages = new Map(projection.messages.map((message) => [message.id, message]));
+      const now = yield* DateTime.now;
+      for (const run of queued) {
+        const message = messages.get(run.userMessageId);
+        if (message?.creationSource !== "server" || !message.id.startsWith("message:pr-watch:"))
+          continue;
+        const refreshed = refreshPullRequestCheckWake(message, links);
+        if (refreshed === undefined) continue;
+        if (refreshed === null) {
+          yield* emitQueuedRunCancellation({ command, events, projection, run, now });
+        } else {
+          // Mixed reports keep their remarks in the same queued run and delivery position.
+          yield* emit(
+            events,
+            command,
+          )({
+            type: "message.updated",
+            threadId: run.threadId,
+            runId: run.id,
+            providerInstanceId: run.providerInstanceId,
+            occurredAt: now,
+            payload: { ...message, ...refreshed, updatedAt: now },
+          });
+        }
+      }
+    },
+  );
+
   const failQueuedRunStart = Effect.fn("Orchestrator.failQueuedRunStart")(function* (
     threadId: ThreadId,
     cause: unknown,
@@ -1451,7 +1490,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       },
     ) {
       if (!(yield* projectionStore.canStartQueuedRun(threadId))) return;
-      const projection = yield* readCommandProjection(threadId);
+      let projection = yield* readCommandProjection(threadId);
+      const refreshed = yield* Ref.make<Array<OrchestrationV2DomainEvent>>([]);
+      yield* refreshQueuedPullRequestChecks(
+        {
+          type: "queue.resume",
+          commandId: CommandId.make(`server:pr-watch:refresh:${threadId}`),
+          threadId,
+        },
+        refreshed,
+        projection,
+        threadPullRequestsOf(projection.thread),
+      );
+      const refreshedEvents = yield* Ref.get(refreshed);
+      if (refreshedEvents.length > 0) {
+        yield* writeSystemEvents(refreshedEvents);
+        projection = yield* readCommandProjection(threadId);
+      }
       if (
         projection.thread.archivedAt !== null ||
         projection.thread.deletedAt !== null ||
@@ -2720,7 +2775,35 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: "The pull request watch ended or its thread settled while it was read.",
         });
       }
+      // A push recorded while the host was being read must win over the older report.
+      if (
+        (command.expectedHeadSha !== undefined && link.watch.headSha !== command.expectedHeadSha) ||
+        (command.expectedObservedHeadSha !== undefined &&
+          (link.watch.observedHeadSha ?? null) !== command.expectedObservedHeadSha)
+      )
+        return;
       yield* dispatchThreadMutation(command, events, effects);
+      if (
+        command.watch !== null &&
+        (link.watch.observedHeadSha ?? link.watch.headSha) !==
+          (command.watch.observedHeadSha ?? command.watch.headSha)
+      ) {
+        const projection = yield* projectionStore
+          .getThreadRecords(command.threadId, ["runs", "messages", "nodes", "attempts"], {
+            messageRoles: ["user"],
+          })
+          .pipe(mapDispatchError(command));
+        yield* refreshQueuedPullRequestChecks(
+          command,
+          events,
+          projection,
+          threadPullRequestsOf(thread).map((candidate) =>
+            threadPullRequestKeysEqual(candidate, key)
+              ? { ...candidate, watch: command.watch! }
+              : candidate,
+          ),
+        );
+      }
       if (command.wake === undefined) return;
       yield* dispatchMessage(
         {

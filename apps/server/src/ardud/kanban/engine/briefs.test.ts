@@ -240,6 +240,9 @@ it("nightly review puts information gaps before improvements and limits proposal
     discussionId: "disc-nightly",
   });
   expect(brief.indexOf("1. Information gaps first")).toBeLessThan(brief.indexOf("2. Improvements"));
+  expect(brief.indexOf("2. Improvements")).toBeLessThan(brief.indexOf("3. Cross-board routing"));
+  expect(brief.indexOf("3. Cross-board routing")).toBeLessThan(brief.indexOf("4. Proposals"));
+  expect(brief.indexOf("4. Proposals")).toBeLessThan(brief.indexOf("5. Post"));
   for (const text of [
     "last 24 hours",
     "analytics_read",
@@ -254,8 +257,35 @@ it("nightly review puts information gaps before improvements and limits proposal
     "disc-nightly",
     "Do not merge, deploy",
     "board's instructions",
+    "evaluator_start (kind request, your evidence), not as a card here",
+    "Robob scheduling, pools, ticks and the board tools themselves are the robob board",
+    "Apply this to information gaps as well as improvements",
+    "cross-board handoffs",
   ]) {
     expect(brief).toContain(text);
   }
   expect(brief).not.toContain("full authority");
+});
+
+it("nightly review requires complete reads, a fresh cursor and recovery from failed reads", () => {
+  const brief = evaluatorBrief(board, { kind: "nightly" });
+  for (const text of [
+    "Complete the read pass before filing findings",
+    "Start board_get without after (or after: 0)",
+    "Keep since unchanged while paging",
+    "continue until hasMore is false",
+    "Do not choose a starting card number or skip early cards",
+    "Read every supplied active discussion through the window",
+    "skim each active card thread",
+    "read the pages relevant to this review by slug or slugs",
+    "retry the same read once",
+    "continue the other reads either way",
+    "fall back to board_get without since, starting at after: 0",
+    "A failed wiki read must not end the board, discussion or thread reads",
+    "State coverage",
+    "name the exact call and the unread portion",
+  ]) {
+    expect(brief).toContain(text);
+  }
+  expect(brief.indexOf("Complete the read pass")).toBeLessThan(brief.indexOf("1. Information gaps"));
 });

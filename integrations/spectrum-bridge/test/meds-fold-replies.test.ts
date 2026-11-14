@@ -301,3 +301,48 @@ test("empty fold leaves raw internal content unchanged for final/tool mode", asy
     expect((await h.deliver()).map(row => row.text)).toEqual(["Answer."]);
   }
 });
+
+const pendingSendStates = [
+  ...["closed", "background", "replaced"].flatMap(change => [false, true].map(failed => ({ change, failed }))),
+  { change: "generation", failed: false },
+];
+test.each(pendingSendStates)("send attribution survives folding: $change, failed=$failed", async ({ change, failed }) => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const h = setup({ tool: true });
+  const logs = await captureLogs(async () => {
+    await h.start();
+    let begin!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { begin = resolve; });
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+      chatGuid: () => "dm:+15555550123", enabled: () => true, health: () => ({}),
+      foldText: async text => { begin(); await pending; return text; } });
+    const response = api(new Request("http://local/send", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "PRIVATE_REPLY", dedupeKey: "log-send", sessionId: "ses_1" }) }));
+    await started;
+    const turn = h.store.get<Record<string, unknown>>("activeTurn")!;
+    if (change === "closed") h.store.set("activeTurn", null);
+    if (change === "background") h.store.set("activeTurn", { ...turn, background: true });
+    if (change === "replaced") {
+      h.input("replacement-inbound");
+      h.store.set("activeTurn", { ...turn, inboundId: "replacement-inbound", messageId: "replacement", startedAt: Number(turn.startedAt) + 1 });
+    }
+    if (change === "generation") h.store.set("route", { ...h.store.get<Record<string, unknown>>("route"), generation: 2 });
+    release();
+    expect((await response).status).toBe(change === "generation" ? 409 : 202);
+    if (change === "generation") return;
+    const delivery = new Delivery(h.store, { sendText: async () => {
+      if (failed) throw new TransportError("http_400:stop_opt_out", false, false);
+      return { providerId: "delivered-fixture" };
+    } }, { projectScope: "log-fixture", chat: "owner", chatGuid: () => "dm:+15555550123", enabled: () => true, sleep: async () => {} });
+    await delivery.tick();
+  });
+  const replies = logs.filter(line => line.name === "reply.sent" || line.name === "reply.failed");
+  if (change === "generation") expect(replies).toEqual([]);
+  else {
+    expect(replies).toHaveLength(1);
+    expect(replies[0]?.name).toBe(failed ? "reply.failed" : "reply.sent");
+    expect(replies[0]?.ids).toMatchObject({ chat: "owner", inboundId: "typed-1" });
+  }
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
+});

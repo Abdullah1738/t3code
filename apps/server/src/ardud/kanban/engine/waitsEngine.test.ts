@@ -11,6 +11,10 @@ import * as NodePath from "node:path";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
+import * as Context from "effect/Context";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as Analytics from "../../analytics/Analytics.ts";
+import type { AnalyticsEvent } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -79,7 +83,13 @@ interface FakeThread {
 }
 
 /** One test's outside world: its threads, the PRs they track and what the host says about PRs. */
-const makeWorld = (options: { readonly reader?: boolean } = {}) => {
+const makeWorld = (
+  options: {
+    readonly reader?: boolean;
+    readonly failCommit?: { armed: boolean };
+    readonly analytics?: AnalyticsEvent[];
+  } = {},
+) => {
   const threads = new Map<string, FakeThread>();
   const rejectedAssignments = new Set<string>();
   /** The PRs a work thread tracks, as its view reports them. */
@@ -264,6 +274,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
           const thread = threads.get(threadId);
           if (thread) threads.set(threadId, { ...thread, model });
         }),
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
@@ -297,6 +308,37 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
         ),
     }),
   );
+  const depth = Context.Reference<number>("TestWaitTransactionDepth", { defaultValue: () => 0 });
+  const database =
+    options.failCommit === undefined
+      ? Sqlite.layerMemory
+      : Layer.effect(
+          SqlClient.SqlClient,
+          Effect.map(
+            SqlClient.SqlClient,
+            (sql) =>
+              new Proxy(sql, {
+                get(target, property, receiver) {
+                  if (property !== "withTransaction")
+                    return Reflect.get(target, property, receiver);
+                  return <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+                    Effect.gen(function* () {
+                      const nesting = yield* depth;
+                      return yield* sql.withTransaction(
+                        effect.pipe(
+                          Effect.provideService(depth, nesting + 1),
+                          Effect.tap(() =>
+                            nesting === 0 && options.failCommit?.armed
+                              ? Effect.die("injected outer transaction failure")
+                              : Effect.void,
+                          ),
+                        ),
+                      );
+                    });
+                },
+              }),
+          ),
+        ).pipe(Layer.provideMerge(Sqlite.layerMemory));
   const layer = ScriptService.layer.pipe(
     Layer.provideMerge(KanbanService.layer),
     Layer.provideMerge(KanbanModels.layerTest(null)),
@@ -304,7 +346,17 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     // The reader is provided around the board's layers, the way server.ts does it.
     Layer.provideMerge(options.reader === false ? Layer.empty : readerLayer),
     Layer.provideMerge(storeLayer),
-    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(database),
+    Layer.provideMerge(
+      options.analytics === undefined
+        ? Layer.empty
+        : Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              Effect.sync(() => {
+                options.analytics!.push(event);
+              }),
+          }),
+    ),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
     Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
@@ -2599,3 +2651,41 @@ it.effect(
       }),
     ),
 );
+
+it.effect("a rolled-back local wait emits no lifecycle analytics", () => {
+  const failCommit = { armed: false };
+  const events: AnalyticsEvent[] = [];
+  const world = makeWorld({ failCommit, analytics: events });
+  return Effect.gen(function* () {
+    yield* TestClock.setTime(T0);
+    const { kanban, board } = yield* setup;
+    yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+    const card = yield* placed(board, "Wait", { stage: "needs_review" });
+    yield* kanban.waitCard(
+      card.id,
+      { on: "time", until: iso(T0 + MINUTE), wakeRole: "work", note: "Continue" },
+      owner,
+    );
+    events.length = 0;
+    yield* TestClock.setTime(T0 + 2 * MINUTE);
+    failCommit.armed = true;
+    yield* kanban.tick;
+    assert.equal((yield* cardOf(card.id)).stage, "needs_review");
+    assert.isDefined((yield* cardOf(card.id)).wait);
+    assert.isFalse(
+      events.some((event) => event.cardId === card.id && event.kind === "kanban.card_move"),
+    );
+    failCommit.armed = false;
+    yield* kanban.tick;
+    assert.equal((yield* cardOf(card.id)).stage, "todo");
+    assert.lengthOf(
+      events.filter(
+        (event) =>
+          event.cardId === card.id &&
+          event.kind === "kanban.card_move" &&
+          event.props?.to === "todo",
+      ),
+      1,
+    );
+  }).pipe(Effect.provide(world.layer));
+});

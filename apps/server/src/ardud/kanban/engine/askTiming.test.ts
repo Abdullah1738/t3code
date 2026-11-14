@@ -130,3 +130,77 @@ it.effect("records batch and free-text answers through the shared server path", 
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
+
+it.effect.each(["pick", "batch", "free_text", "drop_owner", "drop_worker"] as const)(
+  "preserves move actors while adding ask timing metadata: %s",
+  (route) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const events: AnalyticsEvent[] = [];
+      yield* Effect.gen(function* () {
+        const { kanban, card, worker } = yield* workingCard();
+        yield* kanban.askOwner(
+          card.id,
+          {
+            question: "Continue?",
+            blocking: true,
+            ...(route === "free_text" ? {} : { options: ["Yes", "No"] }),
+          },
+          worker,
+          "cardThread",
+        );
+        const entry = events.find(
+          (event) =>
+            event.kind === "kanban.card_move" &&
+            event.cardId === card.id &&
+            event.props?.to === "needs_owner",
+        );
+        assert.equal(entry?.props?.actor, "thread");
+        if (route === "drop_owner" || route === "drop_worker")
+          yield* kanban.changeAsk(
+            card.id,
+            "q1",
+            "drop",
+            route === "drop_worker" ? worker : owner,
+            route === "drop_worker" ? "cardThread" : "owner",
+          );
+        else {
+          const http = yield* makeHttp;
+          const response = yield* route === "batch"
+            ? http.post("/asks/answer", {
+                verdict: "picked",
+                optionIds: ["o1"],
+                items: [{ card: card.id, askId: "q1", revision: 0 }],
+              })
+            : http.post(`/cards/${card.id}/asks/q1/answer`, {
+                ...(route === "free_text"
+                  ? { verdict: "answered", text: "Continue" }
+                  : { verdict: "picked", optionIds: ["o1"] }),
+                revision: 0,
+              });
+          assert.equal(response.status, 200);
+        }
+        const exit = events.find(
+          (event) =>
+            event.kind === "kanban.card_move" &&
+            event.cardId === card.id &&
+            event.props?.from === "needs_owner",
+        );
+        assert.equal(exit?.props?.actor, route === "drop_worker" ? "thread" : "owner");
+        assert.equal((yield* kanban.card(card.id)).card.stage, "todo");
+      }).pipe(
+        Effect.provide(
+          testLayer(fake.layer).pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (event) =>
+                  Effect.sync(() => {
+                    events.push(event);
+                  }),
+              }),
+            ),
+          ),
+        ),
+      );
+    }),
+);

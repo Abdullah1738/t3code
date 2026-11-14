@@ -4433,6 +4433,116 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
+  it.effect.each([false, true])(
+    "finalizes open thinking before failed-steer query disposal, streamed=%s",
+    (streamed) =>
+      Effect.gen(function* () {
+        const h = yield* makeWakeHarness;
+        const ids = yield* IdAllocator.IdAllocatorV2;
+        const input = makeClaudeTestTurnInput({
+          threadId: h.threadId,
+          providerThread: h.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("failed-steer-thinking"),
+          text: "Check the plan",
+          attachments: [],
+        });
+        yield* h.runtime.startTurn(input);
+        const stream = (event: unknown) =>
+          claudeSdkFrame({
+            type: "stream_event",
+            event,
+            parent_tool_use_id: null,
+            session_id: WAKE_NATIVE_SESSION,
+            uuid: "failed-steer-thinking-frame",
+          });
+        for (const event of [
+          { type: "message_start", message: { id: "failed-steer-thought" } },
+          {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "thinking", thinking: "First thought" },
+          },
+        ])
+          yield* h.offerAndWait(stream(event));
+        if (streamed) yield* TestClock.adjust("50 millis");
+        yield* h.offerAndWait(
+          stream({
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "thinking_delta", thinking: ", buffered tail" },
+          }),
+        );
+        yield* h.runtime.steerTurn({
+          threadId: h.threadId,
+          runId: input.runId,
+          providerThread: h.providerThread,
+          providerTurnId: ids.derive.providerTurn({
+            driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+            nativeTurnId: `turn:${input.attemptId}`,
+          }),
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: MessageId.make("failed-steer-thinking-correction"),
+            text: "Correction",
+            attachments: [],
+          },
+        });
+        yield* h.offerAndWait(
+          makeResultFrame({
+            uuid: "failed-steer-thinking-result",
+            result: "",
+            subtype: "error_during_execution",
+            isError: true,
+            errors: ["Provider failed"],
+          }),
+        );
+        const terminal = yield* Queue.take(h.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        assert.equal(terminal.threadDisposition, "broken");
+        assert.lengthOf(h.terminalEvents(), 1);
+        const reasoning = h.events.filter(
+          (event) => event.type === "turn_item.updated" && event.turnItem.type === "reasoning",
+        );
+        const last = reasoning.at(-1);
+        assert.equal(
+          last?.type === "turn_item.updated" && last.turnItem.type === "reasoning"
+            ? last.turnItem.text
+            : undefined,
+          "First thought, buffered tail",
+        );
+        if (last?.type !== "turn_item.updated" || last.turnItem.type !== "reasoning") return;
+        assert.equal(last.turnItem.streaming, false);
+        assert.equal(last.turnItem.status, "completed");
+        assert.isNotNull(last.turnItem.completedAt);
+        assert.isBelow(h.events.indexOf(last), h.events.indexOf(terminal));
+        if (streamed) {
+          const first = reasoning[0];
+          assert.equal(
+            first?.type === "turn_item.updated" && first.turnItem.type === "reasoning"
+              ? first.turnItem.text
+              : undefined,
+            "First thought",
+          );
+          assert.isTrue(
+            first?.type === "turn_item.updated" &&
+              first.turnItem.type === "reasoning" &&
+              first.turnItem.streaming,
+          );
+          assert.equal(
+            first?.type === "turn_item.updated" ? first.turnItem.id : undefined,
+            last.turnItem.id,
+          );
+        }
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
   const plan = "Planning the check";
   const update = "Found it: the memory file is the cause.";
   it.effect.each([

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { opencodeCompletedSteps } from "../src/opencode-steps.ts";
-import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
+import { afterEach, expect, mock, setSystemTime, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
@@ -14,9 +14,11 @@ import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type P
 type Assistant = Extract<MessageRecord, { type: "assistant" }>;
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import type { Message } from "@photon-ai/advanced-imessage/grpc";
-import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance } from "../src/router.ts";
+import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, pendingOrders, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, rotateNudge, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance } from "../src/router.ts";
 import { replyModeConfig } from "../src/config.ts";
 import { Store } from "../src/store.ts";
+import { Delivery } from "../src/delivery.ts";
+import { ReplyGapMonitor } from "../src/reply-gap.ts";
 import { recordsFromThread, RobobBackend, sentMessagePrefix } from "../src/robob.ts";
 import type { ControlMessage, ThreadDetail } from "../src/control.ts";
 import type { SttInput } from "../src/stt.ts";
@@ -528,12 +530,12 @@ test.each(earlySendCases)("/send reuses the early reply with $state delivery and
   const body = { text, dedupeKey: "manual-ack", sessionId: "ses_1@1" };
   const response = await post(body);
   expect(response.status).toBe(200);
-  expect(await response.json()).toEqual({ id, created: false });
+  expect(await response.json()).toEqual({ id, created: false, chat: "owner" });
   const replay = await post(body);
   expect(replay.status).toBe(200);
-  expect(await replay.json()).toEqual({ id, created: false });
+  expect(await replay.json()).toEqual({ id, created: false, chat: "owner" });
   // Different keys for the same turn still refer to the physical early row.
-  expect(await (await post({ ...body, dedupeKey: "manual-ack-again" })).json()).toEqual({ id, created: false });
+  expect(await (await post({ ...body, dedupeKey: "manual-ack-again" })).json()).toEqual({ id, created: false, chat: "owner" });
   for (const change of [{ text: "Changed." }, { subject: "A new subject" }, { effect: "confetti" }]) {
     expect((await post({ ...body, ...change })).status).toBe(409);
   }
@@ -543,7 +545,7 @@ test.each(earlySendCases)("/send reuses the early reply with $state delivery and
   await h.router.tick();
   expect(h.store.get("activeTurn")).toBeNull();
   // The send-key receipt remains idempotent after the active turn is gone.
-  expect(await (await post(body)).json()).toEqual({ id, created: false });
+  expect(await (await post(body)).json()).toEqual({ id, created: false, chat: "owner" });
   expect(h.store.db.query("SELECT count(*) AS n FROM outbox").get()).toEqual({ n: 1 });
 });
 
@@ -594,7 +596,7 @@ test.each([
   expect(h.conversations()).toHaveLength(2);
   const replay = await post();
   expect(replay.status).toBe(200);
-  expect(await replay.json()).toEqual({ id, created: false });
+  expect(await replay.json()).toEqual({ id, created: false, chat: "owner" });
   expect(h.conversations()).toHaveLength(2);
 });
 
@@ -835,7 +837,7 @@ test.each(["pending", "sent", "uncertain"])("same text queued through /send (%s)
   const repeated = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ text: "Checking.", dedupeKey: "another-send-key", sessionId: "ses_1" }) }));
   expect(repeated.status).toBe(200);
-  expect(await repeated.json()).toEqual({ id, created: false });
+  expect(await repeated.json()).toEqual({ id, created: false, chat: "owner" });
   h.backend.settle();
   await h.router.tick();
   expect(h.store.db.query("SELECT count(*) AS n FROM outbox").get()).toEqual({ n: 1 });
@@ -925,7 +927,7 @@ test("restart persists earlySent and does not resend a changed final record", as
   const response = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ text: " Checking. ", dedupeKey: "after-restart", sessionId: "ses_1@1" }) }));
   expect(response.status).toBe(200);
-  expect(await response.json()).toEqual({ id, created: false });
+  expect(await response.json()).toEqual({ id, created: false, chat: "owner" });
   first.content = [{ type: "text", text: "Checking. More text was appended." }];
   await router.tick();
   expect(restored.pendingOutbox()).toEqual([]);
@@ -6130,6 +6132,162 @@ test("/new moves to a new chat once the thread is 8 hours old, so one thread nev
   expect(h.store.pendingInbound()).toEqual([]);
 });
 
+test.each([
+  { name: "Open section", text: "Rule paragraph\n\n## Open\n- KASTWAVE held\n\n## Placed\n- Already delivered", expected: "## Open\n- KASTWAVE held" },
+  { name: "Open through EOF", text: "Rule\n## Open\n- KASTWAVE held\n", expected: "## Open\n- KASTWAVE held" },
+  { name: "nested heading and CRLF", text: "Rule\r\n## Open\r\n### Cleaning\r\n- KASTWAVE held\r\n## Placed\r\n- Old", expected: "## Open\r\n### Cleaning\r\n- KASTWAVE held" },
+  { name: "top-level end", text: "## Open\n- KASTWAVE held\n# Archive\n- Old", expected: "## Open\n- KASTWAVE held" },
+  { name: "no section", text: "  - KASTWAVE held\n", expected: "- KASTWAVE held" },
+  { name: "20,000 characters", text: "x".repeat(20_000), expected: "x".repeat(6_000) },
+  { name: "UTF-8", text: "م".repeat(20_000), expected: "م".repeat(6_000) },
+  { name: "emoji at cap", text: "x".repeat(5_999) + "🧺", expected: "x".repeat(5_999) },
+  { name: "empty", text: "", expected: null },
+  { name: "whitespace", text: " \n\t", expected: null },
+])("pending orders reader: $name", ({ text, expected }) => {
+  const directory = mkdtempSync(join(tmpdir(), "spectrum-pending-orders-"));
+  directories.push(directory);
+  writeFileSync(join(directory, "pending-orders.md"), text);
+  expect(pendingOrders(directory)).toBe(expected);
+  expect(readFileSync(join(directory, "pending-orders.md"), "utf8")).toBe(text);
+});
+
+test.each(["missing", "directory", "symlink", "broken-symlink"])("pending orders reader ignores %s", kind => {
+  const directory = mkdtempSync(join(tmpdir(), "spectrum-pending-orders-"));
+  directories.push(directory);
+  const path = join(directory, "pending-orders.md");
+  if (kind === "directory") mkdirSync(path);
+  if (kind === "symlink" || kind === "broken-symlink") {
+    const target = join(directory, "target.md");
+    if (kind === "symlink") writeFileSync(target, "## Open\n- KASTWAVE held");
+    symlinkSync(target, path);
+  }
+  expect(pendingOrders(directory)).toBeNull();
+  expect(pendingOrders(join(directory, "missing-chat"))).toBeNull();
+});
+
+const pendingFolderCases = (["route", "robob-owner", "robob-dm", "robob-group", "openchamber"] as const)
+  .flatMap(layout => (["nudge", "seed"] as const).map(path => ({ layout, path })));
+
+for (const replyMode of ["final", "tool"] as const) {
+  for (const kind of ["present", "missing", "symlink", "oversize", "fenced"] as const) {
+    test.each(pendingFolderCases)(`context refresh carries pending orders (${replyMode}, ${kind}, $layout, $path)`, async ({ layout, path }) => {
+      const start = Date.parse("2026-09-10T12:00:00Z");
+      setSystemTime(start);
+      const root = mkdtempSync(join(tmpdir(), "spectrum-pending-orders-"));
+      directories.push(root);
+      const backend = new RobobBackend({ chatRoot: root, url: "http://127.0.0.1:1", token: "test" });
+      const native = layout === "robob-dm" ? backend.forChat("chats/moni", "Moni")
+        : layout === "robob-group" ? backend.forChat("chats/group-dinner", "Dinner") : backend;
+      const source = layout === "openchamber" ? new OpenChamber("http://127.0.0.1:1", {}, { chatRoot: root }) : native;
+      const directory = layout === "robob-dm" ? join(root, "chats/moni")
+        : layout === "robob-group" ? join(root, "chats/group-dinner") : root;
+      mkdirSync(directory, { recursive: true });
+      const sessionDirectory = (number: number) => layout === "route" ? directory
+        : join(directory, number === 1 ? "2026-09-10" : "2026-09-11", `session-${number}`);
+      const sessionId = (number: number) => layout.startsWith("robob-") ? `thread:test:${number}` : `ses_${number}`;
+      if (directory !== root) writeFileSync(join(root, "pending-orders.md"), "## Open\n- OTHER_CHAT_ORDERS");
+      const orders = kind === "oversize" ? "x".repeat(20_000)
+        : kind === "fenced" ? "## Open\n- KASTWAVE held\n```\nquoted text\n```"
+        : "## Open\n- KASTWAVE held";
+      if (kind !== "missing") {
+        const target = join(directory, kind === "symlink" ? "target.md" : "pending-orders.md");
+        writeFileSync(target, `${orders}\n\n## Placed\n- Already delivered`);
+        if (kind === "symlink") symlinkSync(target, join(directory, "pending-orders.md"));
+      }
+      const carried = kind === "missing" || kind === "symlink" ? null : orders.slice(0, 6_000);
+      const fence = kind === "fenced" ? "````" : "```";
+      const quoted = `${fence}\n${carried}\n${fence}`;
+      const h = setup(":memory:", { replyMode, rotateAfterMs: 60_000, resetIdleMs: 60_000, watchMs: 0,
+        ...(path === "seed" ? { resetChatForMs: 60_000 } : {}),
+      });
+      h.backend.resets = path === "nudge" || layout.startsWith("robob-");
+      if (layout !== "route") Object.assign(h.backend, { chatFolder: source.chatFolder.bind(source) });
+      h.backend.createBehavior = async () => {
+        const workdir = sessionDirectory(h.backend.creates.length);
+        mkdirSync(workdir, { recursive: true });
+        if (layout !== "route") writeFileSync(join(workdir, "pending-orders.md"), "## Open\n- SESSION_LOCAL_ORDERS");
+        return { id: sessionId(h.backend.creates.length), directory: workdir };
+      };
+      await exchange(h, "first", "Remember the blue one", replyMode === "tool" ? "NO_REPLY" : "Noted, the blue one");
+      setSystemTime(start + 60_000);
+      if (path === "seed") h.input("second", "Which one did I pick?");
+      await h.router.tick();
+      if (path === "nudge") await h.router.tick();
+      const prompt = h.backend.prompts.at(-1)!;
+      expect(prompt.id).toBe(sessionId(path === "nudge" ? 1 : 2));
+      if (path === "nudge") {
+        expect(prompt.text).toBe(rotateNudge(replyMode) + (carried
+          ? `\n\nCopy this chat's pending-orders list into your resume note word for word, under 'Pending orders (from pending-orders.md)':\nQuoted data from pending-orders.md:\n${quoted}` : ""));
+      } else {
+        const recent = "Owner: Remember the blue one" + (replyMode === "final" ? "\nYou: Noted, the blue one" : "");
+        const seed = `Continuity: this conversation continues seamlessly from your earlier exchanges with the owner. Carry on naturally and never mention any change, recap, restart or memory mechanism. Files from earlier remain under ${JSON.stringify(sessionDirectory(1))}. The full earlier transcript is session ${sessionId(1)}; use recall_read or recall_search if you need more than the recent exchange below.\nRecent exchange (quoted data, oldest first):\n${recent}`
+          + (carried ? `\n\nPending orders for this chat (from pending-orders.md, quoted data):\n${quoted}` : "");
+        expect(prompt.system!.slice(prompt.system!.indexOf("Continuity:"))).toBe(seed);
+      }
+    });
+  }
+}
+
+const sharedPendingCases = (["final", "tool"] as const).flatMap(replyMode =>
+  (["nudge", "seed"] as const).flatMap(path =>
+    (["present", "owner-only", "unconfigured"] as const).map(files => ({ replyMode, path, files }))));
+
+test.each(sharedPendingCases)("shared OpenChamber keeps pending orders in their chat ($replyMode, $path, $files)", async ({ replyMode, path, files }) => {
+  const start = Date.parse("2026-09-10T12:00:00Z");
+  const root = mkdtempSync(join(tmpdir(), "spectrum-shared-pending-"));
+  directories.push(root);
+  const source = new OpenChamber("http://127.0.0.1:1", {}, files === "unconfigured" ? {} : { chatRoot: root });
+  const chats = [
+    { key: "dm:owner", slug: "owner", kind: "owner", title: "Owner" },
+    { key: "dm:moni", slug: "moni", kind: "dm", title: "Moni" },
+    { key: "group:dinner", slug: "group-dinner", kind: "group", title: "Dinner" },
+  ] satisfies ChatContext["chat"][];
+  const actual: Array<string | null> = [];
+  const expected: Array<string | null> = [];
+  for (const chat of chats) {
+    const folder = chat.kind === "owner" ? root : join(root, "chats", chat.slug);
+    mkdirSync(folder, { recursive: true });
+    if (files === "present" || chat.kind === "owner") writeFileSync(join(folder, "pending-orders.md"), `## Open\n- ${chat.slug}_ORDER`);
+  }
+  for (const chat of chats) {
+    setSystemTime(start);
+    const context: ChatContext = { chat, roleOf: () => ({ name: "Member", role: "admin" }), typing: () => false, react: async () => {} };
+    const h = setup(":memory:", { context, chatGuid: chat.key, replyMode, rotateAfterMs: 60_000, resetIdleMs: 60_000, watchMs: 0 });
+    h.backend.resets = path === "nudge";
+    // All routers share the same production legacy backend's folder lookup.
+    Object.assign(h.backend, { chatFolder: source.chatFolder.bind(source) });
+    h.backend.createBehavior = async () => {
+      const workdir = join(root, "2026-09-10", `session-${chat.slug}-${h.backend.creates.length}`);
+      mkdirSync(workdir, { recursive: true });
+      writeFileSync(join(workdir, "pending-orders.md"), "## Open\n- OWNER_SESSION_ORDER");
+      return { id: `ses_${h.backend.creates.length}`, directory: workdir };
+    };
+    h.input("first", "Robob, remember the blue one", { sender: "member" });
+    await h.router.tick();
+    h.backend.final(replyMode === "tool" ? "NO_REPLY" : "Noted, the blue one");
+    await h.router.tick();
+    for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent", `provider-${op.id}`);
+    setSystemTime(start + 60_000);
+    if (path === "seed") h.input("second", "Robob, which one did I pick?", { sender: "member" });
+    await h.router.tick();
+    if (path === "nudge") await h.router.tick();
+    const prompt = h.backend.prompts.at(-1)!;
+    expect(prompt.id).toBe(path === "nudge" ? "ses_1" : "ses_2");
+    const text = path === "nudge" ? prompt.text : prompt.system!;
+    expect(text).toContain(path === "nudge" ? rotateNudge(replyMode) : "Continuity:");
+    const marker = path === "nudge" ? "\n\nCopy this chat's pending-orders list" : "\n\nPending orders for this chat";
+    const at = text.indexOf(marker);
+    actual.push(at < 0 ? null : text.slice(at));
+    const order = files === "unconfigured" ? chat.kind === "owner" ? "OWNER_SESSION_ORDER" : null
+      : files === "present" || chat.kind === "owner" ? `${chat.slug}_ORDER` : null;
+    const quoted = "```\n## Open\n- " + order + "\n```";
+    expected.push(!order ? null : path === "nudge"
+      ? `\n\nCopy this chat's pending-orders list into your resume note word for word, under 'Pending orders (from pending-orders.md)':\nQuoted data from pending-orders.md:\n${quoted}`
+      : `\n\nPending orders for this chat (from pending-orders.md, quoted data):\n${quoted}`);
+  }
+  expect(actual).toEqual(expected);
+});
+
 test("a due context is refreshed by the agent itself once the chat goes quiet", async () => {
   const start = Date.parse("2026-09-10T12:00:00Z");
   setSystemTime(start);
@@ -7050,13 +7208,42 @@ test("tool mode: a text typed while a watcher wake runs is steered into it, not 
   expect(steers.map(call => [call.text, call.messageId])).toEqual([["Are you there?", messageId("typed")]]);
   expect(steers[0]!.guidance).toContain("Answer it with imessage_send");
   expect(inbounds(h.store).find(row => row.id === "typed")?.state).toBe("done");
-  expect(h.store.get("activeTurn")).toMatchObject({ inboundId: wake, typed: true });
+  expect(h.store.get("activeTurn")).toMatchObject({ inboundId: wake, typed: true, replyInboundId: "typed" });
   // The wake ends without a text: because someone typed into it, the agent is asked once whether that was meant.
   h.backend.final("Logged it.");
   await h.router.tick();
   await h.router.tick();
   expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), REPLY_NUDGE]);
   expect(nudgeRows(h.store)).toHaveLength(1);
+});
+
+test("gap monitoring attributes an accepted tool reply to the human steered into its watcher turn", async () => {
+  const h = toolSetup();
+  const at = Date.parse("2026-11-11T12:00:00Z");
+  setSystemTime(at);
+  steering(h.backend);
+  const notify = mock(async () => true);
+  const monitor = new ReplyGapMonitor(h.store, { chat: "owner", notify });
+  h.input(`wake:${"d".repeat(64)}`, wakeBody());
+  await h.router.tick();
+  h.input("human-steer", "Are you there?");
+  await h.router.tick();
+  await h.router.tick();
+  setSystemTime(at + 90_000);
+  const route = h.store.get<{ id: string; generation: number }>("route")!;
+  const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+  const response = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "Yes, here.", dedupeKey: "human-result", sessionId: route.id }) }));
+  expect(response.status).toBe(202);
+  const ack = await response.json() as { id: string };
+  expect(h.store.get<string>(`log-inbound-id:${ack.id}`)).toBe("human-steer");
+  const delivery = new Delivery(h.store, { sendText: async () => ({ providerId: "accepted" }) }, {
+    projectScope: "test", chat: "owner", enabled: () => true, chatGuid: () => options.chatGuid,
+  });
+  await delivery.tick();
+  await monitor.tick();
+  expect(notify).toHaveBeenCalledTimes(1);
 });
 
 test("tool mode: a watcher wake nobody typed into ends silently", async () => {
@@ -9227,4 +9414,151 @@ test.each(["expired", "answered"])("steering: a live backend question overrides 
   h.input("followup", "Follow up"); await h.router.tick();
   expect(steers).toHaveLength(0);
   expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("pending");
+});
+
+test("batched turn logging uses the first inbound row and preserves the backend message id", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const h = setup();
+  const logs = await captureLogs(async () => {
+    h.input("batch-first-log", "PRIVATE_FIRST");
+    h.input("batch-last-log", "PRIVATE_LAST");
+    await h.router.tick();
+    h.backend.final("PRIVATE_REPLY");
+    await h.router.tick();
+  });
+  expect(logs.find(l => l.name === "msg.batched")?.props?.batchSize).toBe(2);
+  for (const name of ["turn.start", "turn.end"]) {
+    expect(logs.find(l => l.name === name)?.ids).toMatchObject({ inboundId: "batch-first-log", messageId: messageId("batch-first-log") });
+  }
+  expect(logs.find(l => l.name === "turn.start")?.props?.batchSize).toBe(2);
+});
+
+test.each(["pending", "sent"])("an uncertain human steer repairs %s replies after confirmed admission, even after health scanned them", async state => {
+  const h = toolSetup();
+  const at = Date.parse("2026-11-11T12:00:00Z");
+  setSystemTime(at);
+  const notify = mock(async () => true);
+  const monitor = new ReplyGapMonitor(h.store, { chat: "owner", notify });
+  const delivery = new Delivery(h.store, { sendText: async () => ({ providerId: "accepted" }) }, {
+    projectScope: "test", chat: "owner", enabled: () => true, chatGuid: () => options.chatGuid,
+  });
+  const wake = `wake:${"b".repeat(64)}`;
+  let replyId = "";
+  steering(h.backend, async call => {
+    h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+    setSystemTime(at + 90_000);
+    const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+      chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+    const response = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "Yes, here.", dedupeKey: "uncertain-steer-reply", sessionId: "ses_1" }) }));
+    expect(response.status).toBe(202);
+    replyId = (await response.json() as { id: string }).id;
+    expect(h.store.get<string>(`log-inbound-id:${replyId}`)).toBe(wake);
+    if (state === "sent") await delivery.tick();
+    await monitor.tick();
+    expect(notify).not.toHaveBeenCalled();
+    throw new Error("lost response after server committed the steer");
+  });
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  h.input("human-uncertain", "Are you there?");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.store.get<string>(`log-inbound-id:${replyId}`)).toBe("human-uncertain");
+  if (state === "pending") await delivery.tick();
+  setSystemTime(at + 120_000);
+  await monitor.tick();
+  expect(notify).toHaveBeenCalledTimes(1);
+  expect(h.store.getOperation(replyId)?.state).toBe("sent");
+  expect(h.store.db.query("SELECT key FROM kv WHERE key GLOB 'reply-gap-recheck:*'").all()).toEqual([]);
+});
+
+test("queued-steer settlement uses its saved admission marker and keeps earlier proactive sends synthetic", async () => {
+  const h = toolSetup();
+  const at = Date.parse("2026-11-11T12:00:00Z");
+  setSystemTime(at);
+  const notify = mock(async () => true);
+  const monitor = new ReplyGapMonitor(h.store, { chat: "owner", notify });
+  const steers = steering(h.backend, async () => {
+    if (steers.length === 1) throw new Error("lost response");
+    return "refused";
+  });
+  h.backend.promptBehavior = async call => {
+    if (!h.backend.records.some(record => record.id === call.messageId)) h.backend.accept(call);
+  };
+  const wake = `wake:${"c".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+  const send = async (text: string, dedupeKey: string) => {
+    const response = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text, dedupeKey, sessionId: "ses_1" }) }));
+    expect(response.status).toBe(202);
+    return (await response.json() as { id: string }).id;
+  };
+  const proactive = await send("Watcher status.", "before-human");
+  h.input("human-queued", "Are you there?");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.store.get<string>("batch-phase:human-queued")).toBe("queued-steer");
+  const committed = steers[0]!;
+  h.backend.records.push({ id: committed.messageId, type: "user", text: committed.text, time: { created: Date.now() } });
+  setSystemTime(at + 90_000);
+  const reply = await send("Yes, here.", "after-human");
+  h.backend.final("Both answered");
+  await h.router.tick();
+  expect(h.store.get<string>(`log-inbound-id:${proactive}`)).toBe(wake);
+  expect(h.store.get<string>(`log-inbound-id:${reply}`)).toBe("human-queued");
+  let accepted = 0;
+  const delivery = new Delivery(h.store, { sendText: async () => ({ providerId: `accepted-${++accepted}` }) }, {
+    projectScope: "test", chat: "owner", enabled: () => true, chatGuid: () => options.chatGuid,
+  });
+  await delivery.tick();
+  await monitor.tick();
+  expect(notify).toHaveBeenCalledTimes(1);
+});
+
+test.each([["wake:intervening", 2], ["secret:intervening", 1]] as const)("a retained steer keeps its source after %s becomes active", async (intervening, attempts) => {
+  const h = toolSetup();
+  const at = Date.parse("2026-11-11T12:00:00Z");
+  setSystemTime(at);
+  const originalRoot = `wake:${"e".repeat(64)}`;
+  const steers = steering(h.backend, async call => {
+    if (steers.length === 1) throw new Error("lost response");
+    h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+    return "steered";
+  });
+  h.input(originalRoot, wakeBody());
+  await h.router.tick();
+  h.input("human-retained", "Are you there?");
+  await h.router.tick();
+  const retained = h.store.get<{ inboundId: string; outbox: number }>("steer-attempt:human-retained")!;
+  expect(retained.inboundId).toBe(originalRoot);
+  // Persisted restart state after another synthetic turn took ownership while admission was unknown.
+  const current = h.store.get<object>("activeTurn")!;
+  h.input(intervening, "Another watcher update");
+  h.store.updateInbound(intervening, "done");
+  h.backend.records.push({ id: messageId(intervening), type: "user", text: "Another watcher update", time: { created: Date.now() } });
+  h.store.set("activeTurn", { ...current, inboundId: intervening, messageId: messageId(intervening), steered: [] });
+  const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+  const response = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "Watcher status.", dedupeKey: "intervening-status", sessionId: "ses_1" }) }));
+  expect(response.status).toBe(202);
+  const proactive = (await response.json() as { id: string }).id;
+  const resumed = new Router(h.store, h.backend, h.transport, { ...options, replyMode: "tool" });
+  await resumed.tick();
+  expect(steers).toHaveLength(attempts);
+  if (attempts === 1) {
+    expect(h.store.get<string>("batch-phase:human-retained")).toBe("queued-steer");
+    const original = steers[0]!;
+    h.backend.records.push({ id: original.messageId, type: "user", text: original.text, time: { created: Date.now() } });
+    h.backend.final("NO_REPLY");
+    await resumed.tick();
+    expect(steers).toHaveLength(1);
+    expect(inbounds(h.store).find(row => row.id === "human-retained")?.state).toBe("done");
+  }
+  expect(h.store.get<string>(`log-inbound-id:${proactive}`)).toBe(intervening);
+  expect(h.store.get(`reply-gap-recheck:${proactive}`)).toBeUndefined();
 });

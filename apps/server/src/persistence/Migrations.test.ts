@@ -3,6 +3,8 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
+import * as Option from "effect/Option";
 
 import { migrationManifest, runMigrations } from "./Migrations.ts";
 
@@ -26,6 +28,43 @@ const v2TableCount = Effect.gen(function* () {
 });
 
 describe("runMigrations", () => {
+  it.effect("prepares 068 pages without a writer transaction or parsing payloads, once", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 67 });
+      yield* sql`INSERT INTO orchestration_v2_projection_threads
+        (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+          created_at, updated_at, payload_json)
+        VALUES ('thread', 'project', 'Thread', 'codex', 'full-access', 'default', '', '', 'invalid JSON')`;
+      yield* sql`INSERT INTO orchestration_v2_projection_runs
+        (run_id, thread_id, ordinal, provider, status, requested_at, payload_json)
+        VALUES ('run', 'thread', 1, 'codex', 'cancelled', '', 'invalid JSON')`;
+      const statements: Array<{ query: string; transaction: boolean }> = [];
+      const observe: Statement.Transformer = (statement) =>
+        Effect.gen(function* () {
+          statements.push({
+            query: statement.compile()[0],
+            transaction: Option.isSome(yield* Effect.serviceOption(sql.transactionService)),
+          });
+          return statement;
+        });
+      const upgrade = runMigrations().pipe(
+        Effect.provideService(Statement.CurrentTransformer, observe),
+      );
+      assert.deepStrictEqual(yield* upgrade, [[68, "ShellRunLookupIndexes"]]);
+      const reads = statements.filter(({ query }) => query.includes("NOT INDEXED"));
+      assert.lengthOf(reads, 2);
+      assert.isTrue(reads.every(({ transaction }) => !transaction));
+      const ddl = statements.filter(({ query }) => query.includes("CREATE INDEX ardud_shell_"));
+      assert.lengthOf(ddl, 3);
+      assert.isTrue(ddl.every(({ transaction }) => transaction));
+      assert.isBelow(statements.indexOf(reads[1]!), statements.indexOf(ddl[0]!));
+      statements.length = 0;
+      assert.deepStrictEqual(yield* upgrade, []);
+      assert.isFalse(statements.some(({ query }) => query.includes("NOT INDEXED")));
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
   it.effect("migrates a fresh database through the whole manifest", () =>
     Effect.gen(function* () {
       yield* runMigrations();
