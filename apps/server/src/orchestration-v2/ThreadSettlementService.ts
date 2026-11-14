@@ -38,6 +38,26 @@ export interface SettlementPullRequest {
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 export const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
+const QUEUED_MESSAGE_MAX_WAIT_MS = 30 * 60 * 1_000;
+
+export const promoteAgedQueuedMessages = Effect.fn(
+  "ThreadSettlementServiceV2.promoteAgedQueuedMessages",
+)(
+  function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    for (const threadId of yield* projections.getRecoveryThreadIds("running-queued-runs")) {
+      yield* orchestrator
+        .promoteQueuedMessages(threadId, "age", QUEUED_MESSAGE_MAX_WAIT_MS)
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("queued-message.age-promotion-failed", { thread: threadId, cause }),
+          ),
+        );
+    }
+  },
+  Effect.catchCause((cause) => Effect.logWarning("queued-message.age-scan-failed", { cause })),
+);
 
 function toMillis(value: DateTime.Utc | null | undefined): number | null {
   return value == null ? null : DateTime.toEpochMillis(value);
@@ -631,6 +651,10 @@ export const make = Effect.gen(function* () {
     let lastSettlementSettings = autoSettlementSettingsKey(initialSettings);
     yield* forkParked(
       Effect.gen(function* () {
+        yield* promoteAgedQueuedMessages().pipe(
+          Effect.provideService(Orchestrator.OrchestratorV2, orchestrator),
+          Effect.provideService(ProjectionStore.ProjectionStoreV2, projections),
+        );
         yield* worker.enqueue(undefined);
         yield* worker.drain;
       }).pipe(Effect.repeat(Schedule.spaced("1 minute")), Effect.asVoid),

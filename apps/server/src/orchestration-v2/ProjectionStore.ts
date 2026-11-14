@@ -183,6 +183,7 @@ export const ProjectionStoreV2Error = Schema.Union([
 export type ProjectionStoreV2Error = typeof ProjectionStoreV2Error.Type;
 
 export type ProjectionRecoveryKind =
+  | "running-queued-runs"
   | "queued-runs"
   | "interrupted-runs"
   | "runtime"
@@ -795,6 +796,12 @@ function needsRecovery(
 ): boolean {
   if (projection.thread.deletedAt !== null) return false;
   switch (kind) {
+    case "running-queued-runs":
+      return (
+        projection.thread.archivedAt === null &&
+        projection.runs.some((run) => run.status === "running") &&
+        projection.runs.some((run) => run.status === "queued")
+      );
     case "interrupted-runs":
       return projection.runs.some((run) =>
         ["preparing", "starting", "running", "waiting"].includes(run.status),
@@ -4276,6 +4283,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       function* (kind: ProjectionRecoveryKind) {
         const candidates = (() => {
           switch (kind) {
+            case "running-queued-runs":
+              return sql`
+                SELECT queued.thread_id FROM orchestration_v2_projection_runs AS queued
+                WHERE queued.status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+                  AND queued.status = 'queued'
+                  AND EXISTS (
+                    SELECT 1 FROM orchestration_v2_projection_runs AS active
+                    WHERE active.status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+                      AND active.status = 'running' AND active.thread_id = queued.thread_id
+                  )
+              `;
             case "interrupted-runs":
               return sql`
                 SELECT thread_id FROM orchestration_v2_projection_runs
@@ -4415,7 +4433,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           SELECT thread_id FROM orchestration_v2_projection_threads
           WHERE deleted_at IS NULL
             AND thread_id IN (${candidates})
-            ${kind === "queued-runs" ? sql`AND archived_at IS NULL` : sql``}
+            ${kind === "queued-runs" || kind === "running-queued-runs" ? sql`AND archived_at IS NULL` : sql``}
           ORDER BY updated_at ASC, thread_id ASC
         `;
         return rows.map((row) => ThreadId.make(row.thread_id));
@@ -4424,7 +4442,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       // These lifetime-table scans run after readiness; a synchronous writer
       // scan would still freeze requests even from a background Effect fiber.
       (effect, kind) =>
-        kind === "subagent-results" || kind === "delegated-completions"
+        kind === "subagent-results" ||
+        kind === "delegated-completions" ||
+        kind === "running-queued-runs"
           ? effect.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads)
           : effect,
     );

@@ -14767,7 +14767,10 @@ const make = Effect.gen(function* () {
                 Effect.andThen(
                   withThreadModel(
                     threadId,
-                    touching(threadId, threadIo.send({ threadId, text, model })),
+                    touching(
+                      threadId,
+                      threadIo.send({ threadId, text, model, flushQueued: "steer" }),
+                    ),
                   ),
                 ),
               ),
@@ -14903,11 +14906,10 @@ const make = Effect.gen(function* () {
         }
         if (card.activeThreadId !== null) {
           const board = yield* boardOf(card.boardId);
-          if (text.trim() && board.pause && !board.pause.keep.includes(card.id)) {
+          if (board.pause && !board.pause.keep.includes(card.id)) {
             return yield* failWith("denied", `the board is paused: ${board.pause.reason}`);
           }
           if (
-            text.trim() &&
             board.pause &&
             (yield* store.cardsByThread(card.activeThreadId)).some(
               (entry) => !board.pause!.keep.includes(entry.id),
@@ -14919,25 +14921,26 @@ const make = Effect.gen(function* () {
             card.activeRole === "review"
               ? Rules.nextModel(yield* boardOf(card.boardId), card)
               : card.model;
-          if (text.trim()) {
-            const threadId = card.activeThreadId;
-            yield* trackSend(
-              threadId,
-              locks.outside(
-                runPendingStops(threadId).pipe(
-                  Effect.andThen(
-                    withThreadModel(
+          const threadId = card.activeThreadId;
+          yield* trackSend(
+            threadId,
+            locks.outside(
+              runPendingStops(threadId).pipe(
+                Effect.andThen(
+                  withThreadModel(
+                    threadId,
+                    touching(
                       threadId,
-                      touching(threadId, threadIo.send({ threadId, text, model })),
+                      threadIo.send({ threadId, text, model, flushQueued: "wake" }),
                     ),
                   ),
                 ),
-                undefined,
-                false,
-                Effect.succeed(true),
               ),
-            );
-          }
+              undefined,
+              false,
+              Effect.succeed(true),
+            ),
+          );
           return yield* cardOf(cardId);
         }
         const next: KanbanCard = {

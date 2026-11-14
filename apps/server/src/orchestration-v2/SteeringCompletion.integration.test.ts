@@ -30,6 +30,11 @@ import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ThreadSettlementService from "./ThreadSettlementService.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
+import * as Sqlite from "../persistence/Sqlite.ts";
+import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 
 const driver = ProviderDriverKind.make("codex");
 const instanceId = ProviderInstanceId.make("codex");
@@ -596,10 +601,14 @@ const nextTurnSelectionHarness = Effect.fn("nextTurnSelectionHarness")(function*
         };
       }),
   };
-  const layer = ProviderReplayHarness.layerWithRegistry(
-    { name },
-    ProviderAdapterRegistry.layerSingle(adapter),
-    { runEffectWorker: false },
+  const db = Sqlite.layerMemory;
+  const layer = Layer.mergeAll(
+    ProviderReplayHarness.layerWithRegistry(
+      { name },
+      ProviderAdapterRegistry.layerSingle(adapter),
+      { runEffectWorker: false, databaseLayer: db },
+    ),
+    ProjectionStore.layer.pipe(Layer.provide(db)),
   );
   const startFirstTurn = Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -902,6 +911,308 @@ it.effect("keeps a held commentary draft before the steer when turn end flushes 
           "message:steer",
           "answer",
         ]);
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect.each(["wake", "steer"] as const)(
+  "#1431 %s flushes queued messages before the board text",
+  (reason) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { started, steered, layer, startFirstTurn } = yield* nextTurnSelectionHarness(
+          `queue-flush-${reason}`,
+        );
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const threadId = yield* startFirstTurn;
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            threadId,
+            commandId: CommandId.make("stale-nudge"),
+            messageId: MessageId.make("kanban:wake:nudge:stale"),
+            text: "old board snapshot",
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "system",
+            creationSource: "server",
+          });
+          for (const text of ["old notice", "new notice"]) {
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              threadId,
+              commandId: CommandId.make(text),
+              messageId: MessageId.make(text),
+              text,
+              attachments: [],
+              dispatchMode: { type: "queue_after_active" },
+              createdBy: "system",
+              creationSource: "server",
+            });
+          }
+          const promotions: unknown[] = [];
+          const logger = Logger.make(({ message }) => {
+            const [label, fields] = Array.isArray(message) ? message : [message];
+            if (label === "queued-message.promoted") promotions.push(fields);
+          });
+          yield* Effect.all(
+            [
+              orchestrator.promoteQueuedMessages(threadId, reason),
+              orchestrator.promoteQueuedMessages(threadId, "age"),
+            ],
+            { concurrency: "unbounded" },
+          ).pipe(Effect.provide(Logger.layer([logger])));
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            threadId,
+            commandId: CommandId.make("board"),
+            messageId: MessageId.make("board"),
+            text: "board text",
+            attachments: [],
+            dispatchMode: { type: "steer_active", targetRunId: started[0]!.runId },
+            createdBy: "system",
+            creationSource: "server",
+          });
+          yield* worker.drain();
+          assert.deepEqual(steered, ["old notice", "new notice", "board text"]);
+          const records = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+          assert.lengthOf(
+            records.runs.filter((run) => run.status === "queued"),
+            0,
+          );
+          assert.lengthOf(
+            records.messages.filter((message) => message.text === "old notice"),
+            1,
+          );
+          assert.deepEqual(
+            promotions,
+            ["old notice", "new notice"].map((text) => ({
+              thread: threadId,
+              queuedRunId: records.runs.find((run) => run.userMessageId === text)!.id,
+              reason,
+              waitedMs: 0,
+            })),
+          );
+          yield* orchestrator.promoteQueuedMessages(threadId, reason);
+          yield* worker.drain();
+          assert.deepEqual(steered, ["old notice", "new notice", "board text"]);
+        }).pipe(Effect.provide(layer));
+      }),
+    ),
+);
+
+it.effect.each([
+  { state: "running", reordered: false, held: false },
+  { state: "starting", reordered: false, held: false },
+  { state: "idle", reordered: false, held: false },
+  { state: "running", reordered: true, held: false },
+  { state: "running", reordered: false, held: true },
+] as const)(
+  "#1431 age bound leaves $state queues safe (reordered=$reordered, held=$held)",
+  ({ state, reordered, held }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { steered, layer, startFirstTurn } = yield* nextTurnSelectionHarness(
+          `queue-age-${state}-${reordered}-${held}`,
+        );
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const threadId = yield* startFirstTurn;
+          for (const minutes of [31, 30, 29]) {
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(`queue-${minutes}`),
+              threadId,
+              messageId: MessageId.make(`queue-${minutes}`),
+              text: `notice ${minutes}`,
+              attachments: [],
+              dispatchMode: { type: "queue_after_active" },
+              createdBy: "system",
+              creationSource: "server",
+            });
+          }
+          if (reordered) {
+            const { runs } = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
+            yield* orchestrator.dispatch({
+              type: "queued-run.reorder",
+              threadId,
+              commandId: CommandId.make("move-young-first"),
+              runId: runs.find((run) => run.userMessageId === "queue-29")!.id,
+              beforeRunId: runs.find((run) => run.userMessageId === "queue-31")!.id,
+            });
+          }
+          const records = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
+          const now = yield* DateTime.now;
+          const sink = yield* EventSink.EventSinkV2;
+          yield* sink.write({
+            events: records.runs.map((run) => ({
+              id: EventId.make(`age:${run.id}`),
+              type: "run.updated" as const,
+              threadId,
+              runId: run.id,
+              occurredAt: now,
+              payload:
+                run.status === "queued"
+                  ? {
+                      ...run,
+                      queueHeld: held,
+                      requestedAt: DateTime.add(now, {
+                        minutes: -Number(String(run.userMessageId).split("-").at(-1)),
+                      }),
+                    }
+                  : { ...run, status: state === "idle" ? ("completed" as const) : state },
+            })),
+          });
+          yield* ThreadSettlementService.promoteAgedQueuedMessages();
+          yield* ThreadSettlementService.promoteAgedQueuedMessages();
+          yield* worker.drain();
+          assert.deepEqual(
+            steered,
+            state === "running" && !held
+              ? reordered
+                ? ["notice 29", "notice 31"]
+                : ["notice 31"]
+              : [],
+          );
+          const after = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
+          if (state === "idle") {
+            assert.isFalse(after.runs.some((run) => run.status === "cancelled"));
+          } else {
+            assert.lengthOf(
+              after.runs.filter((run) => run.status === "queued"),
+              state === "running" && !held ? (reordered ? 1 : 2) : 3,
+            );
+          }
+        }).pipe(Effect.provide(layer));
+      }),
+    ),
+);
+
+it.effect("#1431 concurrent age checks promote a coalesced board wake once", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { steered, layer, startFirstTurn } = yield* nextTurnSelectionHarness("queue-coalesced");
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const threadId = yield* startFirstTurn;
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          threadId,
+          commandId: CommandId.make("wake"),
+          messageId: MessageId.make("kanban:wake:step:A:once"),
+          text: "first snapshot",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "system",
+          creationSource: "server",
+        });
+        const queued = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.find(
+          (run) => run.status === "queued",
+        )!;
+        yield* orchestrator.dispatch({
+          type: "queued-run.edit",
+          threadId,
+          commandId: CommandId.make("merge-wake"),
+          runId: queued.id,
+          text: "latest snapshot",
+        });
+        const now = yield* DateTime.now;
+        yield* (yield* EventSink.EventSinkV2).write({
+          events: [
+            {
+              id: EventId.make("age-merged-wake"),
+              type: "run.updated",
+              threadId,
+              runId: queued.id,
+              occurredAt: now,
+              payload: { ...queued, requestedAt: DateTime.add(now, { minutes: -31 }) },
+            },
+          ],
+        });
+        yield* Effect.all(
+          [
+            orchestrator.promoteQueuedMessages(threadId, "age"),
+            orchestrator.promoteQueuedMessages(threadId, "age"),
+          ],
+          { concurrency: "unbounded" },
+        );
+        yield* orchestrator.promoteQueuedMessages(threadId, "wake");
+        yield* worker.drain();
+        assert.deepEqual(steered, ["latest snapshot"]);
+        assert.lengthOf(
+          (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.filter(
+            (run) => run.status === "queued",
+          ),
+          0,
+        );
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect("#1431 a transient rejected promotion does not poison the next sweep", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { steered, layer, startFirstTurn } =
+        yield* nextTurnSelectionHarness("queue-rejected-retry");
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const threadId = yield* startFirstTurn;
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          threadId,
+          commandId: CommandId.make("notice"),
+          messageId: MessageId.make("notice"),
+          text: "notice",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "system",
+          creationSource: "server",
+        });
+        const turn = (yield* orchestrator.getThreadRecords(threadId, ["providerTurns"]))
+          .providerTurns[0]!;
+        const now = yield* DateTime.now;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("turn-pending"),
+              type: "provider-turn.updated",
+              threadId,
+              occurredAt: now,
+              payload: { ...turn, status: "pending" },
+            },
+          ],
+        });
+        const failed = yield* orchestrator
+          .promoteQueuedMessages(threadId, "wake")
+          .pipe(Effect.result);
+        assert.isTrue(Result.isFailure(failed));
+        assert.lengthOf(
+          (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.filter(
+            (run) => run.status === "queued",
+          ),
+          1,
+        );
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("turn-running"),
+              type: "provider-turn.updated",
+              threadId,
+              occurredAt: now,
+              payload: turn,
+            },
+          ],
+        });
+        assert.equal(yield* orchestrator.promoteQueuedMessages(threadId, "wake"), 1);
+        yield* worker.drain();
+        assert.deepEqual(steered, ["notice"]);
       }).pipe(Effect.provide(layer));
     }),
   ),
