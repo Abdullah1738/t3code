@@ -228,6 +228,116 @@ class GuardTests(unittest.TestCase):
             'const db = new', 'eval(\'values.replica = values.replica.replace("/readonly/", "/")\');\nconst db = new'))
         self.assertEqual(self.classify(f'node {script} --thread-id x'), SCRIPT)
 
+    def test_replica_default_requires_builtin_parser(self):
+        rewrite = 'function parseArgs(input) { return {values: {replica: input.options.replica.default.replace("/readonly/", "/")}}; }\n'
+        self.write('tmp/custom-parser-lib.mjs', 'export ' + rewrite + 'export default {parseArgs};\n')
+        options = '{options: {replica: {type: "string", default: process.env.HOME + "/.robob/userdata/readonly/state.sqlite"}}}'
+        rows = [
+            ('builtin', 'import * as NodeUtil from "node:util";\n', 'NodeUtil.parseArgs', None),
+            ('builtin-alias', 'import * as utility from "node:util";\n', 'utility.parseArgs', None),
+            ('local-function', rewrite, 'parseArgs', SCRIPT),
+            ('local-object', rewrite + 'const NodeUtil = {parseArgs};\n', 'NodeUtil.parseArgs', SCRIPT),
+            ('custom-namespace', 'import * as NodeUtil from "./custom-parser-lib.mjs";\n', 'NodeUtil.parseArgs', SCRIPT),
+            ('custom-default', 'import NodeUtil from "./custom-parser-lib.mjs";\n', 'NodeUtil.parseArgs', SCRIPT),
+            ('custom-named', 'import {parseArgs} from "./custom-parser-lib.mjs";\n', 'parseArgs', SCRIPT),
+            ('comment-import', '// import * as NodeUtil from "node:util";\n' + rewrite + 'const NodeUtil = {parseArgs};\n', 'NodeUtil.parseArgs', SCRIPT),
+            ('string-import', 'const prose = \'import * as NodeUtil from "node:util";\';\n' + rewrite + 'const NodeUtil = {parseArgs};\n', 'NodeUtil.parseArgs', SCRIPT),
+            ('mutated-builtin', 'import * as NodeUtil from "node:util";\n' + rewrite + 'NodeUtil.parseArgs = parseArgs;\n', 'NodeUtil.parseArgs', SCRIPT),
+        ]
+        for name, setup, parser, expected in rows:
+            source = ('import {DatabaseSync} from "node:sqlite";\n' + setup +
+                      f'const {{ values }} = {parser}({options});\n'
+                      'new DatabaseSync(values.replica, {readOnly:true});\n')
+            with self.subTest(parser=name):
+                script = self.write('tmp/parser-probe.mjs', source)
+                self.assertEqual(self.classify(f'node {script}'), expected)
+                self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ if expected else None)
+
+    def test_replica_default_cannot_hide_parser_argument_overrides(self):
+        replica = '{type:"string", default:process.env.HOME + "/.robob/userdata/readonly/state.sqlite"}'
+        options = '{replica:' + replica + '}'
+        live = 'process.env.HOME + "/.robob/userdata/" + ["statev2", "sqlite"].join(".")'
+        prefix = ('import {DatabaseSync} from "node:sqlite";\nimport * as NodeUtil from "node:util";\n'
+                  f'const liveArgs = ["--replica", {live}];\nconst args = liveArgs;\nconst overrides = {{args:liveArgs}};\n')
+        rows = [
+            ('args-after', '', '{options:' + options + ', args:liveArgs}'),
+            ('args-before', '', '{args:liveArgs, options:' + options + '}'),
+            ('quoted', '', '{options:' + options + ', "args":liveArgs}'),
+            ('computed', '', '{options:' + options + ', ["args"]:liveArgs}'),
+            ('escaped', '', '{options:' + options + r', "\u0061rgs":liveArgs}'),
+            ('shorthand', '', '{options:' + options + ', args}'),
+            ('getter', '', '{options:' + options + ', get args() {return liveArgs;}}'),
+            ('prototype', '', '{options:' + options + ', __proto__:{args:liveArgs}}'),
+            ('spread', '', '{options:' + options + ', ...overrides}'),
+            ('extra-argument', '', '{options:' + options + '}, overrides'),
+            ('argv-write', 'process.argv = ["node", "probe", ...liveArgs];\n', '{options:' + options + '}'),
+            ('argv-splice', 'process.argv.splice(2, Infinity, ...liveArgs);\n', '{options:' + options + '}'),
+            ('argv-computed', 'process["argv"] = ["node", "probe", ...liveArgs];\n', '{options:' + options + '}'),
+            ('argv-alias', 'const proc = process; proc.argv = ["node", "probe", ...liveArgs];\n', '{options:' + options + '}'),
+        ]
+        for key in ['replica', '"replica"', '["replica"]', r'"\u0072eplica"']:
+            rows.append(('duplicate-option-' + key, '', '{options:{replica:' + replica + ', ' + key + ':{type:"string", default:' + live + '}}}'))
+        for name, setup, config in rows:
+            source = prefix + setup + f'const {{ values }} = NodeUtil.parseArgs({config});\nnew DatabaseSync(values.replica, {{readOnly:true}});\n'
+            with self.subTest(override=name):
+                script = self.write('tmp/args-probe.mjs', source)
+                self.assertEqual(self.classify(f'node {script}'), SCRIPT)
+                self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+        for module in ['node:process', 'process', r'node:\u0070rocess']:
+            for setup in [
+                f'import {{argv}} from "{module}";\nargv.splice(2, Infinity, ...liveArgs);\n',
+                f'import {{argv as input}} from "{module}";\ninput.splice(2, Infinity, ...liveArgs);\n',
+                f'import runtime from "{module}";\nruntime.argv.splice(2, Infinity, ...liveArgs);\n',
+                f'import * as runtime from "{module}";\nruntime.argv.splice(2, Infinity, ...liveArgs);\n',
+            ]:
+                source = prefix + setup + f'const {{ values }} = NodeUtil.parseArgs({{options:{options}}});\nnew DatabaseSync(values.replica);\n'
+                with self.subTest(module=module, setup=setup):
+                    script = self.write('tmp/imported-argv.mjs', source)
+                    self.assertEqual(self.classify(f'node {script}'), SCRIPT)
+                    self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+        for access in ['globalThis.process', 'globalThis["process"]', 'global.process', 'global["process"]',
+                       '(await import("node:process")).default', 'require("node:process")']:
+            source = prefix + access + '.argv.splice(2, Infinity, ...liveArgs);\n' + f'const {{ values }} = NodeUtil.parseArgs({{options:{options}}});\nnew DatabaseSync(values.replica);\n'
+            with self.subTest(access=access):
+                script = self.write('tmp/global-argv.mjs', source)
+                self.assertEqual(self.classify(f'node {script}'), SCRIPT)
+                self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+        original = (Path(__file__).resolve().parents[3] / 'scripts/probe-readonly-identity.ts').read_text()
+        source = original.replace('  },\n});\nif', '  },\n  args: ["--thread-id", "x", "--replica", ' + live + '],\n});\nif', 1)
+        self.assertNotEqual(source, original)
+        script = self.write('tmp/original-probe-args.ts', source)
+        self.assertEqual(self.classify(f'node {script} --thread-id x'), SCRIPT)
+        self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+
+    def test_replica_default_rejects_untracked_argument_capabilities(self):
+        self.write('tmp/unproven-runtime.mjs', 'export {default as runtime} from "node:process";\n')
+        prefix = ('import {DatabaseSync} from "node:sqlite";\nimport * as NodeUtil from "node:util";\n'
+                  'const liveArgs = ["--replica",process.env.HOME+"/.robob/userdata/"+["statev2","sqlite"].join(".")];\n')
+        rows = [
+            ('computed-constructor', '', '({})["constructor"]["constructor"]("return process")()'),
+            ('optional-computed', '', '({})?.["constructor"]?.["constructor"]("return process")()'),
+            ('optional-first', '', '({})?.["constructor"]["constructor"]("return process")()'),
+            ('optional-last', '', '({})["constructor"]?.["constructor"]("return process")()'),
+            ('optional-spaced', '', '({}) ?. ["constructor"] ?. ["constructor"]("return process")()'),
+            ('optional-aliased', 'const key = ["constr","uctor"].join("");\n', '({})?.[key]?.[key]("return process")()'),
+            ('quoted-destructure', 'const {"constructor": make} = Number;\n', 'make("return process")()'),
+            ('escaped-destructure', 'const {"constr\\u0075ctor": make} = Number;\n', 'make("return process")()'),
+            ('computed-destructure', 'const {["constructor"]: make} = Number;\n', 'make("return process")()'),
+            ('aliased-destructure', 'const key = ["constr","uctor"].join("");\nconst {[key]: make} = Number;\n', 'make("return process")()'),
+            ('computed-alias', 'const key = ["constr","uctor"].join("");\n', '({})[key][key]("return process")()'),
+            ('object-descriptor', 'import * as OtherUtil from "node:util";\n', 'Object.getOwnPropertyDescriptor(Object.getPrototypeOf(OtherUtil.parseArgs),"constructor").value("return process")()'),
+            ('vm', 'import * as VM from "node:vm";\n', 'VM.runInThisContext("process")'),
+            ('custom-import', 'import {runtime as importedRuntime} from "./unproven-runtime.mjs";\n', 'importedRuntime'),
+        ]
+        for name, setup, runtime in rows:
+            source = (prefix + setup + f'const runtime = {runtime};\nruntime.argv.splice(2,Infinity,...liveArgs);\n'
+                      'const { values } = NodeUtil.parseArgs({options:{replica:{type:"string",default:process.env.HOME+"/.robob/userdata/readonly/state.sqlite"}}});\n'
+                      'new DatabaseSync(values.replica);\n')
+            with self.subTest(capability=name):
+                script = self.write('tmp/argument-capability.mjs', source)
+                self.assertEqual(self.classify(f'node {script}'), SCRIPT)
+                self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+
     def test_replica_path_builders_must_be_builtin_imports(self):
         for operation in ['join', 'resolve']:
             for declaration, callee in [

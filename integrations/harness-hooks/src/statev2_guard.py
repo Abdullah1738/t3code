@@ -1134,6 +1134,7 @@ def _replica_reader_source(source):
 
     paths = namespace('path', 'join|resolve')
     os_module = namespace('os', 'homedir')
+    util_module = namespace('util', 'parseArgs')
     constructors = [namespace('sqlite', 'DatabaseSync') + r'\.DatabaseSync']
     named_reader = r'''\bimport\s*\{\s*(DatabaseSync)(?:\s+as\s+(''' + identifier + r'''))?\s*\}\s*from\s*(['"])node:sqlite\3'''
     for imported in re.finditer(named_reader, source):
@@ -1157,6 +1158,19 @@ def _replica_reader_source(source):
         reads = [m for m in uses if m.span() != declaration]
         return bool(reads) and all(reader_use(m.start(), m.end()) for m in reads)
 
+    implicit_args = (not re.search(r'\b(?:globalThis|global|require|module|constructor|__proto__)\b|\bimport\s*\(', code) and
+                     all(re.match(r'\s*\.\s*fromEntries\s*\(', code[m.end():])
+                         for m in re.finditer(r'\bObject\b', code)))
+    # Default inference covers the probe's dependencies; other imported code
+    # can mutate arguments without exposing those writes in this source.
+    default_modules = {'node:sqlite', 'node:os', 'node:path', 'node:util',
+                       'node:timers/promises', 'effect/Console', 'effect/Effect'}
+    for token in strings.finditer(source):
+        if token[0][0] in '\'"' and re.search(r'\b(?:from|import)\s*$', code[:token.start()]):
+            module = token[0][1:-1]
+            if module not in default_modules:
+                implicit_args = False
+
     for match in seed.finditer(source):
         if not REPLICA.search(match[0]):
             continue
@@ -1174,7 +1188,7 @@ def _replica_reader_source(source):
         if declaration and re.match(r'\s*;', code[end:]):
             safe = binding_reads(declaration[1], declaration.span(1))
         option = re.search(r'''\breplica\s*:\s*\{\s*type\s*:\s*(['"])string\1\s*,\s*default\s*:\s*$''', source[:start])
-        parser = re.search(r'\bconst\s*\{\s*(values)\s*\}\s*=\s*(?:' + identifier + r'\.)*parseArgs\(\s*\{\s*options\s*:\s*\{', code)
+        parser = re.search(r'\bconst\s*\{\s*(values)\s*\}\s*=\s*' + util_module + r'\.parseArgs\(\s*\{\s*options\s*:\s*\{', code)
         if option and parser and parser.start() < option.start() and re.match(r'\s*,?\s*}', code[end:]):
             # The probe's parseArgs option is another immutable binding. Reject
             # option overrides and unknown uses of the returned values object.
@@ -1183,6 +1197,21 @@ def _replica_reader_source(source):
                 depth += (code[close] == '(') - (code[close] == ')')
                 close += 1
             options = code[parser.start():close]
+            depth, options_end = 1, parser.end()
+            while options_end < close and depth:
+                depth += (code[options_end] == '{') - (code[options_end] == '}')
+                options_end += 1
+            raw_options = source[parser.end():options_end]
+            # Only the literal options record is covered by this default proof;
+            # root overrides and changes to implicit argv must stay unproven.
+            default_input = (implicit_args and re.fullmatch(r'\s*,?\s*}\s*\)', code[options_end:close]) and
+                             '[' not in options and '\\' not in raw_options and
+                             all(parser.end() <= token.start() < options_end
+                                 for token in strings.finditer(source)
+                                 if token[0][0] in '\'"' and re.match(r'\s*:', code[token.end():])) and
+                             len(re.findall(r'\breplica\b', raw_options)) == 1 and
+                             all(re.match(r'\s*\.\s*(?:exitCode\b|env\s*\.\s*HOME\b)', code[m.end():])
+                                 for m in re.finditer(r'(?<![\w$])process(?![\w$])', code)))
             uses = code
             for access in re.finditer(r'''\bvalues\s*\[\s*(['"])([^'"\n]+)\1\s*\]''', source):
                 if access[2] != 'replica' and '\\' not in access[2] and not re.match(r'\s*(?:[+*/%&|?^-]*=(?!=)|\+\+|--)', code[access.end():]):
@@ -1191,7 +1220,10 @@ def _replica_reader_source(source):
                 if reader_use(access.start(), access.end()):
                     uses = uses[:access.start()] + ' ' * len(access[0]) + uses[access.end():]
             uses = uses[:parser.start(1)] + ' ' * len(parser[1]) + uses[parser.end(1):]
-            safe = (end < close and '...' not in options and
+            # Optional access and destructuring also expose computed keys that
+            # string masking cannot prove safe for implicit parser arguments.
+            safe = (default_input and not re.search(r'[\w$)\]}]\s*(?:\?\.\s*)?\[|\]\s*:', uses) and
+                    end < close and '...' not in options and
                     len(re.findall(r'\breplica\s*:', options)) == 1 and
                     len(re.findall(r'\boptions\s*:', options)) == 1 and
                     not re.search(r'\bvalues\b', uses))
