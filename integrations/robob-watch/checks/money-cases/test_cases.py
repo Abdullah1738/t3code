@@ -2791,6 +2791,56 @@ class CheckBudget(Base):
                 mc.follow(self.data, now, self.root, time.time() + 10, finder(), nobody)
         self.assertNotEqual(visited[0], visited[1])
 
+    def test_slow_external_source_leaves_time_for_order_lanes(self):
+        from threading import Event
+        now = at('2026-11-14T12:00')
+        for source in ('owner', 'mail'):
+            with self.subTest(source=source):
+                self.seed([now - dt.timedelta(hours=1)])
+                with mc.Locked(self.data, 'questions') as book:
+                    book['questions'][0]['merchant'] = 'noon'
+                reads = []
+                def slow(*args, **kwargs):
+                    Event().wait(5)
+                    self.fail('source was not bounded')
+                def orders(app, deadline=None, **kwargs):
+                    reads.append(deadline - time.time())
+                    return {'orders': [], 'complete': False, 'lanes': {
+                        lane: {'covered_from': None, 'stop_reason': 'unproven_paging'}
+                        for lane in mc.charges.order_lookup.LANES}}
+                stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+                with patch.object(mc.charges, 'OWNER_BUDGET', 0.05), \
+                        patch.object(mc.charges, 'MSGS_BUDGET', 0.05), \
+                        patch.object(mc.charges.order_lookup, 'read', orders):
+                    errors = mc.follow(self.data, now, self.root, time.time() + 10,
+                        slow if source == 'mail' else finder(),
+                        slow if source == 'owner' else nobody, stats=stats)
+                self.assertEqual(len(reads), 1)
+                self.assertGreater(reads[0], mc.FOLLOW_EACH - 1)
+                self.assertEqual(set(stats['order_coverage']['noon']), set(mc.charges.order_lookup.LANES))
+                self.assertEqual(stats['starved_by'], 'owner_threads' if source == 'owner' else 'receipt')
+                self.assertTrue(errors)
+                self.assertTrue(self.questions()[0]['unverified'])
+                self.assertEqual(self.questions()[0]['status'], 'open')
+                self.assertFalse(self.questions()[0].get('case_opened'))
+
+    def test_old_owner_windows_share_one_budget(self):
+        now = at('2026-11-14T12:00')
+        self.seed([now - dt.timedelta(days=3, hours=n) for n in range(3)])
+        clock = [1000.0]
+        calls = []
+        def owner(*args, deadline=None):
+            calls.append(deadline - clock[0])
+            clock[0] += 2.5
+            return []
+        stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+        with patch.object(mc.time, 'time', lambda: clock[0]), \
+                patch.object(mc.time, 'monotonic', lambda: clock[0]):
+            mc.follow(self.data, now, self.root, 1020, finder(), owner, stats=stats)
+        self.assertEqual(calls, [4, 1.5])
+        self.assertTrue(self.questions()[0]['unverified'])
+        self.assertEqual(stats['starved_by'], 'owner_threads')
+
     def test_owner_prefetch_leaves_budget_for_questions(self):
         now = at('2026-10-25T12:00')
         self.seed([now - dt.timedelta(hours=n) for n in range(3)])

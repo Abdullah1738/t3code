@@ -115,6 +115,36 @@ class SourceLimit(Lookup):
         super().__init__(message)
 
 
+OWNER_BUDGET = 4
+MSGS_BUDGET = 2
+
+
+@contextmanager
+def step_timing(stats, name, deadline=None):
+    started = time.monotonic()
+    alarm = signal.getitimer(signal.ITIMER_REAL)[0]
+    if alarm:
+        enclosing = time.time() + alarm
+        deadline = min(deadline, enclosing) if deadline is not None else enclosing
+    error = None
+    try:
+        yield
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        if stats is not None:
+            elapsed = round((time.monotonic() - started) * 1000)
+            key = name + '_ms'
+            stats[key] = stats.get(key, 0) + elapsed
+            if name == 'msgs':
+                stats['msgs_max_ms'] = max(stats.get('msgs_max_ms', 0), elapsed)
+            if deadline is not None and time.time() >= deadline:
+                stats['starved_by'] = name
+                if error is not None and not hasattr(error, '_money_cases_step'):
+                    error._money_cases_step = name
+
+
 def order_app(charge):
     merchant = charge['merchant'].lower()
     return 'careem' if 'careem' in merchant else 'noon' if 'noon' in merchant else None
@@ -131,7 +161,7 @@ def card_owner(charge):
         raise Lookup('card owners: settings unreadable') from e
 
 
-def order_receipt(charge, at, now, deadline=None, lookup=None, memo=None):
+def order_receipt(charge, at, now, deadline=None, lookup=None, memo=None, stats=None):
     app = order_app(charge)
     if not app:
         return None
@@ -146,7 +176,8 @@ def order_receipt(charge, at, now, deadline=None, lookup=None, memo=None):
                     options = {'since': (memo or {}).get(('orders_since', app), at - SAME_TIME)}
                     if memo is not None and ('orders_cache',) in memo:
                         options['cache_path'] = memo[('orders_cache',)]
-                result = (lookup or order_lookup.read)(app, deadline=deadline, **options)
+                with step_timing(stats, 'lookups', deadline):
+                    result = (lookup or order_lookup.read)(app, deadline=deadline, **options)
             except (ValueError, OSError) as exc:
                 if isinstance(exc, order_lookup.OutOfTime):
                     raise
@@ -261,11 +292,12 @@ def msgs(argv, deadline, cap, memo=None, stats=None):
         if isinstance(result, Lookup):
             raise result
         return result
-    timeout = left(deadline, cap)
+    timeout = left(deadline, min(cap, MSGS_BUDGET))
     if stats is not None:
         stats['msgs_calls'] += 1
     try:
-        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        with step_timing(stats, 'msgs', time.time() + timeout):
+            done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
         if done.returncode:
             raise Lookup(f'msgs exit {done.returncode}: {done.stderr.strip()[:200]}')
     except (OSError, subprocess.TimeoutExpired, Lookup) as e:
@@ -660,10 +692,12 @@ def owner_said(charge, at, now, said=None, deadline=None):
     return None
 
 
-def known(charge, at, find=None, deadline=None, read=None):
+def known(charge, at, find=None, deadline=None, read=None, stats=None):
     """How he already pays this merchant, from before the last half day: 'receipt' when a mail with
     a receipt from it came, 'bank' when an earlier bank alert was a charge from it, else None."""
-    find, read = find or search, read or show
+    options = {} if stats is None else {'stats': stats}
+    find = find or (lambda *a, **kw: search(*a, **kw, **options))
+    read = read or (lambda *a, **kw: show(*a, **kw, **options))
     names = words(charge['merchant'])
     if not names:
         return None
@@ -699,7 +733,13 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None, mem
     errors = [] if errors is None else errors
     limits = [] if limits is None else limits
     try:
-        row = receipt(charge, at, now, find, deadline, memo=memo, stats=stats, receipt_ok=receipt_ok)
+        # Mail must leave a slice for order history, including when a custom
+        # finder ignores its timeout. The enclosing question alarm stays earlier.
+        mail_end = time.time() + MSGS_BUDGET
+        if deadline is not None:
+            mail_end = min(mail_end, deadline)
+        with step_timing(stats, 'receipt', mail_end), within(mail_end, Lookup('receipt lookup over time')):
+            row = receipt(charge, at, now, find, mail_end, memo=memo, stats=stats, receipt_ok=receipt_ok)
         if row:
             when = dt.datetime.fromtimestamp(row['ts'], TZ).strftime('%a %d %b %H:%M')
             return {'verdict': 'receipt', 'why': f"receipt {when}: {row.get('sender', '')} - {row.get('subject', '')}"[:200],
@@ -707,7 +747,7 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None, mem
     except Lookup as e:
         errors.append(f'receipt: {e}')
     try:
-        hit = order_receipt(charge, at, now, deadline, memo=memo)
+        hit = order_receipt(charge, at, now, deadline, memo=memo, stats=stats)
         if hit:
             return {**hit, 'errors': errors}
     except SourceLimit as e:
@@ -752,7 +792,7 @@ def explain(charge, at, now, deadline=None, find=None, said=None, receipt_ok=Non
         return {'verdict': 'held', 'why': 'held for Moni', 'errors': []}
     if now < at + WAIT:
         try:
-            how = known(charge, at, find, deadline)
+            how = known(charge, at, find, deadline, stats=stats)
             # A merchant that mails receipts gets its receipt waited for ("Wait for the email", 24 Oct);
             # one he only has bank alerts from is waited for when this is a pending hold.
             if how == 'receipt' or (how == 'bank' and charge['pending']):
