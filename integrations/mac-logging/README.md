@@ -279,6 +279,22 @@ storagekitd and `diskutil list` improved from an 8 s timeout to 0.04–0.74 s.
 
 ## Processes stuck in disk wait
 
+`disk.clone_wedge` also records U-state `cp -c`/`clonefile` commands of any
+age, and groups of U processes naming the same absolute path in three
+one-second samples. Both must remain in U in every sample; CPU may advance.
+It records PID, process age, path, CPU delta and wait
+channel (`-` when macOS hides it). The probe uses only `ps`, never pathname
+lookups. Argument parsing is best effort: `ps` does not preserve argv quoting,
+so ambiguous pathname fragments, quotes and escapes do not establish
+shared-path identity. Clone commands with ambiguous operands still qualify
+under their own PID identity.
+Umount is excluded and remains covered by `proc.disk_wait`.
+One Telegram alert per PID/start incident uses the existing notify helper;
+shared-path waiters alert together, and failed sends retry frozen text/key.
+This is an I/O workload signal: CPU or device progress can mean slow APFS
+extent copying, so the alert does not diagnose deadlock or recommend a kill.
+The clone probe shares the disk-wait budget, with its own 20 s ceiling.
+
 Each hourly run selects processes in `U` aged at least ten minutes, then
 samples their state and cumulative CPU time six times, one second apart.
 Only `U` in every sample with no CPU progress counts as stuck. Processes
