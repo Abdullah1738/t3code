@@ -64,7 +64,7 @@ RECEIPT_SUBJECT = re.compile(r'\bservice charges receipt\b', re.I)
 RANK = {'unknown': -1, 'pending confirmation': 0, 'placed': 0, 'ordered': 0, 'shipped': 2, 'preparing': 1, 'packed':1, 'picked up': 2,
         'out for delivery': 3, 'nearby': 4, 'delivered': 5, 'cancelled': 5}
 TRACKING_PROBLEM_REPEAT_S = 86400
-WEB_PROOF_VERSION = 3
+WEB_PROOF_VERSION = 4
 WEB_NUMBER_WORDS = {word: value for value, word in enumerate(
     'zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty'.split())}
 # Bridge chat slug rule; group slugs carry "_" (group-sb_gro). Env is read at call time.
@@ -519,10 +519,16 @@ def web_status_text(text, order):
 def web_mail_scope(subject, body, order=None):
     text = web_status_text(subject.lower(), order)
     body = web_status_text(body, order)
-    # Support instructions describe hypothetical failures, not this delivery.
-    # Normalize the reference-label abbreviation before finding sentence ends.
-    body = re.sub(r'\bno\.', 'no', body, flags=re.I)
-    body = re.sub(r'(?<![\w-])(?:if|when|once|unless|should)(?![\w-])[^.!?;\n]*([.!?;]?)', r'\1', body, flags=re.I)
+    # Exempt only these bounded hypothetical support instructions. Removing an
+    # arbitrary conditional clause can hide a factual remainder beside it.
+    condition = r'(?:if|when|once|unless|should)\s+'
+    hypothetical = (r'(?:(?:your\s+(?:order(?:\s+no\.?\s+<id>)?|delivery)|this)\s+is\s+'
+                    r'(?:a\s+partial\s+delivery|partial(?:ly\s+delivered)?)|'
+                    r'other\s+shipments\s+are\s+pending|one\s+of\s+two\s+shipments\s+has\s+arrived)'
+                    r'\b')
+    support = r'(?:please\s+)?contact\s+(?:support|us)\b'
+    body = re.sub(r'(?:^|(?<=[.!?;\n]))\s*(?:' + condition + hypothetical + r'\s*,\s*' + support + r'|' +
+                  support + r'\s+' + condition + hypothetical + r')', '', body, flags=re.I)
     # An order reference in a package notice does not widen that notice's scope.
     full = r'\b(?:all|both)\s+(?:[0-9]+\s+)?(?:item|package|parcel|shipment)s?\b'
     scoped = re.sub(full, '', text)
@@ -531,6 +537,18 @@ def web_mail_scope(subject, body, order=None):
     if re.search(r'\bitems?\b', scoped):
         return 'item'
     unit = r'(?:item|package|parcel|shipment)s?'
+    number = r'(?:[0-9]+|' + '|'.join(WEB_NUMBER_WORDS) + ')'
+    # Any doubt limits a delivery to one package, regardless of its wording or
+    # field label. Negated/zero pending counts also fail closed; only the bounded
+    # hypothetical support text above is exempt.
+    doubt = text + '\n' + body
+    if re.search(r'\b(?:partial(?:ly)?|pending|remaining|remainder|outstanding|rest\s+of|'
+                 r'still\s+on\s+(?:its|the)\s+way|separately|separate\s+shipments?|backorder(?:ed)?|'
+                 r'split|items?\s+left|not\s+yet)\b', doubt, re.I):
+        return 'shipment'
+    for match in re.finditer(r'\b(' + number + r')\s*(?:out\s+of|of|/)\s*(' + number + r')\b', doubt, re.I):
+        if web_count(match[1]) < web_count(match[2]):
+            return 'shipment'
     if re.search(r'\b(?:this|it|(?:your |the )?(?:delivery|order))\s+(?:is|was|remains)\s+(?:a\s+)?partial\b|'
                  r'\b(?:has been|was|is)\s+partially\s+delivered\b|'
                  r'(?:^|[.!?;\n])\s*(?:partial delivery|partially delivered)\b|'
@@ -545,7 +563,6 @@ def web_mail_scope(subject, body, order=None):
                        re.search(r'\b(?:still|will|pending|remain\w*|in transit|on (?:the|its|their) way)\b', clause, re.I))
             if missing or pending:
                 return 'item' if match[2].lower().startswith('item') else 'shipment'
-    number = r'(?:[0-9]+|' + '|'.join(WEB_NUMBER_WORDS) + ')'
     for match in re.finditer(r'\b(?:(no|' + number + r')[ \t]+)?remaining\s+(' + unit +
                              r')(?:\s*[:=-]\s*(' + number + r'))?', body, re.I):
         count = match[3] if match[3] is not None else match[1]
