@@ -39,6 +39,7 @@ run_shim() {
     human) ident=() ;;
   esac
   env -i HOME="$tmp/home" PATH="$blockers:$tmp/bin:/usr/bin:/bin" \
+    TOOLLOG_ROOT="$tmp/logs" OFFBOX_TOOL_LOG_DIR="$tmp/logs/offbox" \
     OFFBOX_GATE_MODE=enforce OFFBOX_STATE_DIR="$tmp/state" OFFBOX_RULES="${TEST_RULES:-$offbox/heavy-rules.json}" \
     HARNESS_HOOKS_SRC="$tmp/engine" PYTHONDONTWRITEBYTECODE=1 "${ident[@]}" "$blockers/$name" "$@" >"$tmp/out" 2>"$tmp/err"
 }
