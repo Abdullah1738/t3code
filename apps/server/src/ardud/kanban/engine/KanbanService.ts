@@ -518,6 +518,7 @@ export interface KanbanServiceShape {
       };
       /** Each card with an event in the window: its last stage change before it. */
       readonly prior: ReadonlyArray<KanbanCardEvent>;
+      readonly readinessBefore: ReadonlyArray<KanbanCardEvent>;
     },
     KanbanError
   >;
@@ -17086,6 +17087,7 @@ const make = Effect.gen(function* () {
             threads: store.threadLinks({ boardId, open: false }),
             pools: store.pools(boardId),
             slotHistory: store.slotHistory({ boardId, from: window.since, to: window.until }),
+            readinessBefore: store.readinessBefore(boardId, window.since),
           });
           // Event ids grow with time, so the window's first id bounds "before the window".
           const first = read.events[0];

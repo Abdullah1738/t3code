@@ -2119,6 +2119,83 @@ it.effect("slot event windows and open slots keep board, pool and thread identit
   }).pipe(Effect.provide(TestLayer)),
 );
 
+it.effect("readiness carry-in selects the latest wait and stall markers by board and cutoff", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    yield* store.putBoard(board);
+    const cutoff = "2026-11-12T02:00:00.000Z";
+    const cases = [
+      { kind: "edited", body: "Waiting for CI", wait: true, clears: true },
+      { kind: "edited", body: "Wait ended: cleared", wait: true, clears: false },
+      { kind: "edited", body: "Wait expired: CI", wait: true, clears: false },
+      { kind: "wait_set", body: null, wait: true, clears: true },
+      { kind: "wait_cleared", body: null, wait: true, clears: false },
+      { kind: "wait_expired", body: null, wait: true, clears: false },
+      { kind: "flagged", body: "Cleared", wait: false, clears: true },
+      { kind: "moved", body: null, wait: false, clears: true },
+      { kind: "review", body: null, wait: false, clears: true },
+      { kind: "thread", body: null, wait: false, clears: true },
+      { kind: "edited", body: "waiting for CI", wait: false, clears: false },
+      { kind: "edited", body: "Waitingfor CI", wait: false, clears: false },
+    ] as const;
+    const expected: number[] = [];
+    for (const [index, entry] of cases.entries()) {
+      const current = card(index + 1, "todo");
+      yield* store.putCard(current);
+      const base = {
+        cardId: current.id,
+        actor: { _tag: "owner" as const },
+        head: null,
+        fromStage: null,
+        toStage: null,
+      };
+      const flag = yield* store.addCardEvent({
+        ...base,
+        at: "2026-11-12T00:00:00.000Z",
+        kind: "flagged",
+        body: "Run failed: error",
+      });
+      const marker = yield* store.addCardEvent({
+        ...base,
+        at: "2026-11-12T01:00:00.000Z",
+        kind: entry.kind,
+        body: entry.body,
+        ...(entry.kind === "thread"
+          ? { fromStage: "todo" as const, toStage: "working" as const }
+          : {}),
+      });
+      yield* store.addCardEvent({
+        ...base,
+        at: "2026-11-12T01:30:00.000Z",
+        kind: "comment",
+        body: "Unrelated",
+      });
+      yield* store.addCardEvent({ ...base, at: cutoff, kind: "wait_set", body: null });
+      if (!entry.clears) expected.push(flag.id);
+      if (entry.wait || entry.clears) expected.push(marker.id);
+    }
+    const otherBoard = { ...board, id: KanbanBoardId.make("other"), slug: "other" };
+    yield* store.putBoard(otherBoard);
+    const other = { ...card(100, "todo"), boardId: otherBoard.id };
+    yield* store.putCard(other);
+    yield* store.addCardEvent({
+      cardId: other.id,
+      actor: { _tag: "owner" },
+      at: at,
+      kind: "wait_set",
+      body: null,
+      fromStage: null,
+      toStage: null,
+      head: null,
+    });
+    assert.deepStrictEqual(
+      (yield* store.readinessBefore(boardId, cutoff)).map((event) => event.id),
+      expected,
+    );
+    assert.deepStrictEqual(yield* store.readinessBefore(boardId, "1900"), []);
+  }).pipe(Effect.provide(TestLayer)),
+);
+
 it.effect("slot history reads carry-in and the window together, including closed slots", () =>
   Effect.gen(function* () {
     const store = yield* KanbanStore.KanbanStore;

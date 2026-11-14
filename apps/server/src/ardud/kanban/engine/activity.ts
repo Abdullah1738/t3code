@@ -361,17 +361,23 @@ const waitIntervals = (
     const mark = waitEventOf(event);
     return mark === null ? [] : [{ mark, at: time(event.at) }];
   });
-  if (marks.length === 0) {
-    if (card.wait === undefined) return [];
-    const from = Math.max(time(since), time(card.wait.at));
-    const moved = card.movedAt > card.wait.at ? time(card.movedAt) : time(until);
-    const to = Math.min(time(until), moved, time(card.wait.expiredAt ?? until));
-    return from < to ? [[from, to] as const] : [];
+  const wait = card.wait;
+  if (wait !== undefined) {
+    const at = time(wait.at);
+    if (marks.length === 0 || marks.every((mark) => mark.at < at)) marks.push({ mark: "set", at });
+    const end = Math.min(
+      time(wait.expiredAt ?? until),
+      card.movedAt > wait.at ? time(card.movedAt) : time(until),
+    );
+    if (end < time(until)) marks.push({ mark: "end", at: end });
   }
-  const waitingAtStart = marks[0]!.mark === "end";
+  marks.sort((a, b) => a.at - b.at);
+  const prior = marks.findLast((mark) => mark.at < time(since));
+  const inside = marks.filter((mark) => mark.at >= time(since) && mark.at < time(until));
+  const waitingAtStart = prior !== undefined ? prior.mark === "set" : inside[0]?.mark === "end";
   const waits: Array<readonly [number, number]> = [];
   let waitFrom: number | null = waitingAtStart ? time(since) : null;
-  for (const { mark, at } of marks) {
+  for (const { mark, at } of inside) {
     if (mark === "set" && waitFrom === null) waitFrom = at;
     else if (mark === "end" && waitFrom !== null) {
       waits.push([waitFrom, at]);
@@ -402,6 +408,7 @@ export interface RollupInput {
   };
   /** Each active card's last stage change before the window (see stageSpans). */
   readonly prior?: ReadonlyArray<KanbanCardEvent> | undefined;
+  readonly readinessBefore?: ReadonlyArray<KanbanCardEvent>;
 }
 
 /** Replay thread identities, preserving ledger order even when timestamps tie. */
@@ -409,7 +416,6 @@ const ledgerUsage = (
   input: RollupInput,
   hourStarts: ReadonlyArray<number>,
   spans: ReadonlyArray<Span>,
-  byCard: ReadonlyMap<string, ReadonlyArray<KanbanCardEvent>>,
 ) => {
   const { window, pools } = input;
   const since = time(window.since),
@@ -486,11 +492,12 @@ const ledgerUsage = (
       ?.find((span) => time(span.from) <= at && time(span.to ?? window.until) > at)?.stage ??
     card.stage;
   const currentById = new Map(input.cards.map((card) => [card.id as string, card]));
+  const readiness = groupEvents([...(input.readinessBefore ?? []), ...input.events]);
   const todoSpans = spans
     .filter((span) => span.stage === "todo")
     .map((span) => {
       const card = span.card;
-      const ownEvents = byCard.get(card.id) ?? [];
+      const ownEvents = readiness.get(card.id) ?? [];
       const models =
         card.workThreadId === null && card.models.length > 0
           ? [...card.models].sort((a, b) => b.weight - a.weight).map((entry) => entry.model)
@@ -525,10 +532,7 @@ const ledgerUsage = (
         continue;
       const last = flags.findLast((event) => time(event.at) <= from);
       const stalled =
-        last !== undefined
-          ? isStall(last)
-          : (flags[0] !== undefined && isFlagCleared(flags[0])) ||
-            (card.stalled !== null && time(card.stalled.at) <= from);
+        last !== undefined ? isStall(last) : card.stalled !== null && time(card.stalled.at) <= from;
       if (
         stalled ||
         waits.some(([a, b]) => a <= from && b > from) ||
@@ -754,7 +758,7 @@ export const rollup = (input: RollupInput) => {
     if (span.to === null && span.card.activeThreadId === null)
       idle.push({ card: span.card.number, stage: span.stage, since: stamp(span.card.movedAt) });
   }
-  const poolUsage = ledgerUsage(input, hourStarts, spans, byCard);
+  const poolUsage = ledgerUsage(input, hourStarts, spans);
   idle.sort((left, right) => left.since.localeCompare(right.since));
   for (const [stage, entry] of Object.entries(stages)) {
     entry.hours = hours(entry.hours * HOUR);

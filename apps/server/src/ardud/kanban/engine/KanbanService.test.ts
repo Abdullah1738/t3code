@@ -51,6 +51,7 @@ import {
   ThreadId,
   RuntimeRequestId,
   type KanbanActor,
+  type KanbanCardEvent,
   type KanbanError,
   type KanbanScript,
   type ModelSelection,
@@ -33350,6 +33351,56 @@ it.effect("board activity reads committed ledger occupancy rather than thread li
       );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
+);
+
+it.effect(
+  "activity carries prior waits across replacement and ignores a real no-op flag clear",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        yield* kanban.createCard(board.id, { title: "Running", prompt: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const waiting = yield* kanban.createCard(
+          board.id,
+          { title: "Waiting", prompt: "B" },
+          owner,
+        );
+        const ready = yield* kanban.createCard(board.id, { title: "Ready", prompt: "C" }, owner);
+        const mark = (kind: KanbanCardEvent["kind"], body: string) =>
+          Effect.gen(function* () {
+            return yield* store.addCardEvent({
+              cardId: waiting.id,
+              actor: owner,
+              kind,
+              body,
+              at: yield* DateTime.now.pipe(Effect.map(DateTime.formatIso)),
+              fromStage: null,
+              toStage: null,
+              head: null,
+            });
+          });
+        const priorWait = yield* mark("edited", "Waiting for CI");
+        yield* TestClock.adjust("1 day");
+        const since = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+        yield* TestClock.adjust("1 hour");
+        yield* mark("wait_set", "Waiting for new CI");
+        yield* kanban.flagCard(ready.id, null, owner);
+        yield* TestClock.adjust("1 hour");
+        yield* mark("wait_cleared", "Wait ended: cleared");
+        yield* TestClock.adjust("1 hour");
+        const until = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+        const read = yield* kanban.activity(board.id, { since, until });
+        assert.isTrue(read.readinessBefore.some((event) => event.id === priorWait.id));
+        assert.isFalse(read.events.some((event) => event.id === priorWait.id));
+        const result = Activity.rollup({ window: { since, until }, ...read });
+        const pool = Rules.poolKey(board.defaultCardModel);
+        assert.deepStrictEqual(result.pools.used[pool], [1, 1, 1]);
+        assert.deepStrictEqual(result.pools.queueWait[pool], [1, 1, 2]);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 const slotRows = (boardId: string) =>

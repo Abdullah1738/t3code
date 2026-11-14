@@ -1035,8 +1035,153 @@ describe("ledger pool activity", () => {
         event("flag", t("01:00"), "flagged", "todo", "todo", "Cleared"),
       ],
     });
-    expect(result.queueWait[pool]).toEqual([0.5, 1.5, 2]);
+    expect(result.queueWait[pool]).toEqual([1.5, 1.5, 2]);
   });
+
+  const waitStyles = [
+    {
+      name: "legacy clear",
+      set: "edited",
+      endKind: "edited",
+      setBody: "Waiting for CI",
+      endBody: "Wait ended: cleared",
+    },
+    {
+      name: "legacy expiry",
+      set: "edited",
+      endKind: "edited",
+      setBody: "Waiting for CI",
+      endBody: "Wait expired: CI",
+    },
+    { name: "typed clear", set: "wait_set", endKind: "wait_cleared", setBody: null, endBody: null },
+    {
+      name: "typed expiry",
+      set: "wait_set",
+      endKind: "wait_expired",
+      setBody: null,
+      endBody: null,
+    },
+  ] as const;
+  const waitStarts = [
+    { name: "new wait", prior: null, replace: true, end: true, expected: [1, 0, 1] },
+    {
+      name: "replacement of carried wait",
+      prior: "set",
+      replace: true,
+      end: true,
+      expected: [0, 0, 1],
+    },
+    { name: "end carried wait", prior: "set", replace: false, end: true, expected: [0, 0, 1] },
+    {
+      name: "new wait after prior end",
+      prior: "end",
+      replace: true,
+      end: true,
+      expected: [1, 0, 1],
+    },
+    {
+      name: "carried replacement still open",
+      prior: "set",
+      replace: true,
+      end: false,
+      expected: [0, 0, 0],
+    },
+    {
+      name: "redundant end after prior end",
+      prior: "end",
+      replace: false,
+      end: true,
+      expected: [1, 1, 1],
+    },
+  ] as const;
+  it.each(
+    waitStyles.flatMap((style) =>
+      waitStarts.map((initial) => ({
+        ...style,
+        ...initial,
+        name: `${style.name}: ${initial.name}`,
+      })),
+    ),
+  )(
+    "replays wait state across the window: $name",
+    ({ prior, replace, end, expected, set, endKind, setBody, endBody }) => {
+      const marker = (state: "set" | "end", at: string) =>
+        event(
+          "w",
+          at,
+          state === "set" ? set : endKind,
+          null,
+          null,
+          state === "set" ? setBody : endBody,
+        );
+      const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+        cards: [card("w")],
+        readinessBefore: prior === null ? [] : [marker(prior, before)],
+        events: [
+          ...(replace ? [marker("set", t("01:00"))] : []),
+          ...(end ? [marker("end", t("02:00"))] : []),
+        ],
+      });
+      expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(expected);
+    },
+  );
+
+  const flagStarts = [
+    {
+      name: "redundant clear on ready card",
+      prior: null,
+      kind: "flagged",
+      body: "Cleared",
+      expected: [1, 1, 1],
+    },
+    {
+      name: "redundant clear after prior clear",
+      prior: "Cleared",
+      kind: "flagged",
+      body: "Cleared",
+      expected: [1, 1, 1],
+    },
+    {
+      name: "clear carried stall",
+      prior: "Run failed: error",
+      kind: "flagged",
+      body: "Cleared",
+      expected: [0, 1, 1],
+    },
+    {
+      name: "move clears carried stall",
+      prior: "Run failed: error",
+      kind: "moved",
+      body: null,
+      expected: [0, 1, 1],
+    },
+    {
+      name: "review clears carried stall",
+      prior: "Run failed: error",
+      kind: "review",
+      body: null,
+      expected: [0, 1, 1],
+    },
+    {
+      name: "new stall after prior clear",
+      prior: "Cleared",
+      kind: "flagged",
+      body: "Run failed: error",
+      expected: [1, 0, 0],
+    },
+  ] as const;
+  it.each(flagStarts)(
+    "replays flag state across the window: $name",
+    ({ prior, kind, body, expected }) => {
+      const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+        cards: [card("f")],
+        readinessBefore:
+          prior === null ? [] : [event("f", before, "flagged", "todo", "todo", prior)],
+        events: [event("f", t("01:00"), kind, "todo", "todo", body)],
+      });
+      expect(result.queueWait[pool] ?? [0, 0, 0]).toEqual(expected);
+    },
+  );
 
   it("counts weighted alternatives once only when every enabled route is full", () => {
     const other = Rules.poolKey(sonnet);

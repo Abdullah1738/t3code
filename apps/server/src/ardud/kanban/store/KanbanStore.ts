@@ -257,6 +257,10 @@ export interface KanbanStoreShape {
     cardIds: ReadonlyArray<KanbanCardId>,
     beforeId: number,
   ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
+  readonly readinessBefore: (
+    boardId: KanbanBoardId,
+    before: string,
+  ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
   /** Every event on a board's cards with `since <= at < until`, oldest first. */
   readonly boardEvents: (
     boardId: KanbanBoardId,
@@ -1101,6 +1105,44 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const readinessBefore: KanbanStoreShape["readinessBefore"] = (boardId, before) =>
+    runRead(
+      "read readiness before window",
+      Effect.flatMap(
+        sql<IdJsonRow>`
+          WITH history AS (
+            SELECT e.id, e.card_id,
+              json_extract(e.json, '$.kind') AS kind,
+              substr(json_extract(e.json, '$.body'), 1, length('Wait expired: ')) AS body,
+              json_extract(e.json, '$.toStage') AS to_stage,
+              json_extract(e.json, '$.fromStage') AS from_stage
+            FROM ardud_kanban_cards c
+            JOIN ardud_kanban_card_events e INDEXED BY ardud_kanban_card_events_card ON e.card_id = c.id
+            WHERE c.board_id = ${boardId} AND json_extract(e.json, '$.at') < ${before}
+          ), markers AS (
+            SELECT *,
+              (kind IN ('wait_set', 'wait_cleared', 'wait_expired') OR
+                (kind = 'edited' AND (body GLOB 'Waiting *' OR body GLOB 'Wait ended: *' OR body GLOB 'Wait expired: *'))) AS is_wait,
+              (kind IN ('flagged', 'moved', 'review', 'wait_set') OR
+                (to_stage IS NOT NULL AND to_stage IS NOT from_stage) OR
+                (kind = 'edited' AND body GLOB 'Waiting *')) AS is_stall
+            FROM history
+          ), picked AS (
+            SELECT MAX(id) AS id FROM markers WHERE is_wait GROUP BY card_id
+            UNION SELECT MAX(id) AS id FROM markers WHERE is_stall GROUP BY card_id
+          )
+          SELECT id, json FROM ardud_kanban_card_events WHERE id IN (SELECT id FROM picked) ORDER BY id
+        `,
+        (rows) =>
+          Effect.forEach(rows, (row) =>
+            Effect.map(
+              CardEvent.decode(row.json),
+              (event) => ({ ...event, id: Number(row.id) }) as KanbanCardEvent,
+            ),
+          ),
+      ),
+    );
+
   const lastTransitions = (
     _boardId: KanbanBoardId,
     cardIds: ReadonlyArray<KanbanCardId>,
@@ -1706,6 +1748,7 @@ const make = Effect.gen(function* () {
     pendingInstructionApplications,
     cardEvents,
     boardEvents,
+    readinessBefore,
     lastTransitions,
     goals,
     putGoal,

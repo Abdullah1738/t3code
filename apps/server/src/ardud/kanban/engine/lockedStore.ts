@@ -63,6 +63,7 @@ export const wrap = (
       card(cardId, store.pendingInstructionApplications(cardId, boardId, field, askId)),
     cardEvents: (id) => card(id, store.cardEvents(id)),
     boardEvents: (id, since, until) => locks.access(id, store.boardEvents(id, since, until)),
+    readinessBefore: (id, before) => locks.access(id, store.readinessBefore(id, before)),
     slotHistory: (filter) => locks.access(filter.boardId, store.slotHistory(filter)),
     lastTransitions: (id, cardIds, beforeId) =>
       locks.access(id, store.lastTransitions(id, cardIds, beforeId)),
