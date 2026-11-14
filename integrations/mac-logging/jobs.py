@@ -174,6 +174,17 @@ def inventory_listing(path, deadline):
     return entries, listed
 
 
+def inventory_refresh_entries(entries, cache, now):
+    eligible = []
+    for entry in entries:
+        value = cache.get(entry.path, {})
+        if (isinstance(value, dict) and number(value.get('bytes')) and number(value.get('at'))
+                and now-value['at'] >= 3600 and not value.get('limited')):
+            eligible.append(entry)
+    return sorted(eligible, key=lambda entry: (
+        bool(cache[entry.path].get('slow')), cache[entry.path]['at'], entry.path))
+
+
 def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_only=False, refresh_only=False):
     cache = {} if cache is None else cache
     now = time.time()
@@ -209,8 +220,7 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
         return ('bytes' in old, old.get('attemptedAt', 0), kind(entry) is True, entry.path)
     entries = sorted(entries, key=priority)
     pending = [e for e in entries if 'bytes' not in cache.get(e.path, {})]
-    refresh = [e for e in entries if 'bytes' in cache.get(e.path, {})
-               and now-cache[e.path]['at'] >= 3600]
+    refresh = inventory_refresh_entries(entries, cache, now)
     selected = refresh if refresh_only else pending if pending_only else pending+refresh
     selected = [entry for entry in selected if not cache.get(entry.path, {}).get('limited')]
     while selected and time.monotonic() < deadline:
@@ -379,10 +389,21 @@ def directory_inventory(paths=None, run=subprocess.run, deadline=None):
                     if available+0.000001 >= 15:
                         attempts[key] = now
     fill(fill_deadline)
-    for path in sorted(roots,key=lambda p:min((v.get('at',0) for v in child_state[str(p)].values()),default=0)):
-        if time.monotonic() >= deadline:
+    refresh_roots = [(path, inventory_refresh_entries(listings[str(path)][0], child_state[str(path)], now))
+                     for path in roots]
+    refresh_roots = [(path, entries) for path, entries in refresh_roots if entries]
+    refresh_roots.sort(key=lambda item: (
+        bool(child_state[str(item[0])][item[1][0].path].get('slow')),
+        child_state[str(item[0])][item[1][0].path]['at'], len(item[1])))
+    for index, (path, entries) in enumerate(refresh_roots):
+        remaining = deadline-time.monotonic()
+        if remaining <= 0:
             break
-        scan(path,min(deadline,time.monotonic()+61),refresh_only=True)
+        allowance = 60 if child_state[str(path)][entries[0].path].get('slow') else 15
+        # Leave a full command plus setup when it fits; a large warm root
+        # cannot consume every peer's refresh share just because it is older.
+        share = min(61, max(allowance+1, remaining/(len(refresh_roots)-index)))
+        scan(path, min(deadline, time.monotonic()+share), refresh_only=True)
     # Return unused refresh capacity to discovery on cold or cheap roots.
     fill(deadline)
     errors = 0
