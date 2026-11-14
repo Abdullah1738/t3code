@@ -25,7 +25,7 @@ class UnifiedChunkTests(unittest.TestCase):
         fixed = patch.object(collector, 'UNIFIED_FIRST_CHUNK_S', 900)
         fixed.start()
         self.addCleanup(fixed.stop)
-        growth = patch.object(collector, 'next_unified_chunk', side_effect=lambda size, elapsed: 900)
+        growth = patch.object(collector, 'next_unified_chunk', side_effect=lambda size, elapsed, previous=None: 900)
         growth.start()
         self.addCleanup(growth.stop)
         self.clock = 0

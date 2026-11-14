@@ -231,7 +231,7 @@ class CollectorFairnessTests(unittest.TestCase):
                 else:
                     self.assertEqual(state['sizes'][str(root)],6*42*1024)
 
-    def test_thirty_second_chunks_keep_up_for_six_hours(self):
+    def test_thirty_second_calls_keep_up_for_six_hours(self):
         now, clock = 10000, [0]
         jobs.save_state('crashes',{'unified':now-3600,'rollupDay':'1969-12-31'})
         calls = []
@@ -246,9 +246,9 @@ class CollectorFairnessTests(unittest.TestCase):
                 self.assertEqual(jobs.read_state('crashes')['unified'],now)
                 self.assertNotIn('unifiedRetry',jobs.read_state('crashes'))
                 self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'],0)
-                self.assertEqual(clock[0],120)
+                self.assertLessEqual(clock[0],135)
                 now += 3600
-        self.assertEqual(len(calls),24)
+        self.assertEqual(sum(b-a for a,b in calls),6*3600)
 
     def test_all_thirteen_configured_roots_get_measured_within_twelve_runs(self):
         roots = [self.root/str(i) for i in range(len(jobs.DIRECTORY_ROOTS))]

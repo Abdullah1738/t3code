@@ -140,11 +140,22 @@ def unified_command(command, capture_output=True, text=True, timeout=60, env=Non
         raise
 
 
-def next_unified_chunk(size, elapsed):
-    # Grow only after success, at most doubling. Slow successful reads reduce
-    # the next request instead of spending the whole share on another big one.
-    return min(UNIFIED_CHUNK_S, size*2,
-               max(UNIFIED_FIRST_CHUNK_S, size*UNIFIED_TARGET_S/max(.001, elapsed)))
+def next_unified_chunk(size, elapsed, previous=None):
+    # Two successful sizes distinguish fixed log-show startup cost from work
+    # proportional to the window. A fixed cost must not pin every query at 60 s.
+    if previous and abs(size-previous[0]) > .000001:
+        rate = max(0, (elapsed-previous[1])/(size-previous[0]))
+        overhead = max(0, elapsed-rate*size)
+        # Only startup-dominated probes justify going beyond the usual 15 min.
+        # Keep nonlinear window costs from extrapolating a tiny cheap probe
+        # into a large command. Timing noise gets a one-second margin.
+        limit = UNIFIED_WINDOW_S if rate*UNIFIED_WINDOW_S <= max(1, overhead/10) else UNIFIED_CHUNK_S
+        return max(UNIFIED_FIRST_CHUNK_S, min(limit,
+                   UNIFIED_TARGET_S/max(.001, rate)))
+    if previous:
+        return max(UNIFIED_FIRST_CHUNK_S, min(UNIFIED_WINDOW_S,
+                   size*max(UNIFIED_TARGET_S, previous[1])/max(.001, elapsed)))
+    return min(UNIFIED_CHUNK_S, max(UNIFIED_FIRST_CHUNK_S, size*2))
 
 
 def unified(since, until, run=unified_command, timeout=60):
@@ -254,6 +265,7 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
     skipped = 0
     stop_reason = 'done'
     chunk_size = UNIFIED_FIRST_CHUNK_S
+    previous_chunk = None
     def lag():
         return max(0, now+time.monotonic()-started-state.get('unified', since))
 
@@ -291,7 +303,7 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
                 except Exception as exc:
                     timed_out = isinstance(exc, subprocess.TimeoutExpired) or (
                         isinstance(exc, SourceFailure) and exc.failure == 'timeout')
-                    stop_reason = ('deadline' if time.monotonic() >= unified_deadline else 'timeout') if timed_out else (
+                    stop_reason = ('deadline' if remaining < UNIFIED_CALL_S or time.monotonic() >= unified_deadline else 'timeout') if timed_out else (
                         exc.failure if isinstance(exc, SourceFailure) else 'error')
                     emit('crashes', 'error', 'crash.unified.chunk', ok=False,
                          props=dict(chunk, outcome=stop_reason,
@@ -300,7 +312,8 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
                 elapsed = time.monotonic()-chunk_started
                 emit('crashes', 'event', 'crash.unified.chunk', ok=True,
                      props=dict(chunk, outcome='done', elapsedMs=elapsed*1000))
-                chunk_size = next_unified_chunk(end-cursor, elapsed)
+                chunk_size = next_unified_chunk(end-cursor, elapsed, previous_chunk)
+                previous_chunk = (end-cursor, elapsed)
                 counts.update(observed)
                 crash_observations(observed)
                 cursor = end

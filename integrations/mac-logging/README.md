@@ -11,8 +11,10 @@ separate cursor per source so an unavailable source is retried. Its first run
 looks back one hour. Report cursors cover since their last successful read.
 Unified-log windows cover at most the most recent 90 minutes, including retries;
 older time is skipped with exact `skippedS` and reason `lag_ceiling`. Queries start
-with 60 seconds of log and grow after successes, targeting 10 seconds per call
-and at most 15 minutes of log. Each completed chunk checkpoints its cursor. A
+with 60 seconds of log and grow after successes. Two successful sizes estimate
+fixed startup cost separately from window work. Queries target 10 seconds of
+window work and usually cover at most 15 minutes; startup-dominated reads may
+grow to the 90-minute ceiling. Each completed chunk checkpoints its cursor. A
 failed query retains the unfinished suffix, then continues into a fresh window
 when that suffix finishes. Each command has a 60-second cap including bounded
 process-group cleanup; the unified source shares a 135-second budget.

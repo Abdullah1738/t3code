@@ -83,8 +83,38 @@ class UnifiedCatchupTests(unittest.TestCase):
         self.assertEqual(sum(r['props']['skippedS'] for r in skips), 6226)
         self.assertTrue(all(r['props']['reason'] == 'lag_ceiling' for r in skips))
         observed = [r['props']['observedAt'] for r in self.rows('crash.observed')]
+        self.assertEqual(observed, [at for at in self.boots if 4600 < at <= 10000+3*3870])
         self.assertEqual(len(observed), len(set(observed)))
         print('unified catch-up lagS:', lag)
+
+    def test_fixed_overhead_costs_keep_up_without_skipping(self):
+        for cost in (15, 30):
+            with self.subTest(cost=cost), patch.dict(os.environ, TOOLLOG_DIR=str(self.logs/str(cost))), \
+                 patch.object(self, 'logs', self.logs/str(cost)):
+                jobs.save_state('crashes', {'unified': 9100, 'rollupDay': '1969-12-31',
+                    'unifiedRetry': dict(windowStart=9100, windowEnd=10000, skippedS=0)})
+                self.cost = lambda seconds: cost
+                for i in range(12):
+                    before = len(self.calls)
+                    now = 13600+3870*i
+                    self.assertTrue(self.collect(now))
+                    self.assertEqual(jobs.read_state('crashes')['unified'], now)
+                    self.assertLessEqual(self.clock, 135)
+                    summary = self.rows('crash.collect')[-1]['props']
+                    self.assertEqual(summary['skippedS'], 0)
+                    self.assertEqual(summary['chunks'], summary['chunksDone'])
+                    self.assertLessEqual(self.calls[before][1]-self.calls[before][0], 60)
+                observed = [r['props']['observedAt'] for r in self.rows('crash.observed')]
+                self.assertEqual(observed, [at for at in self.boots if 9100 < at <= now])
+                self.assertEqual(len(observed), len(set(observed)))
+
+    def test_nonlinear_window_costs_keep_the_nominal_chunk_cap(self):
+        jobs.save_state('crashes', {'unified': 4600, 'rollupDay': '1969-12-31'})
+        self.cost = lambda seconds: 12*(seconds/900)**2
+        self.assertTrue(self.collect())
+        self.assertTrue(all(c[3] for c in self.calls))
+        self.assertTrue(all(end-start <= 901 for start,end,_,_ in self.calls))
+        self.assertEqual(jobs.read_state('crashes')['unified'], 10000)
 
     def test_large_first_query_would_timeout_but_small_adaptive_chunks_finish(self):
         jobs.save_state('crashes', {'unified': 4600, 'rollupDay': '1969-12-31'})
@@ -134,6 +164,26 @@ class UnifiedCatchupTests(unittest.TestCase):
         props = self.rows('crash.collect')[-1]['props']
         self.assertEqual(props['stopReason'], 'done')
         self.assertEqual(props['chunks'], props['chunksDone'])
+
+    def test_fractional_retry_tail_does_not_make_fresh_queries_tiny(self):
+        jobs.save_state('crashes', {'unified': 9999.875, 'rollupDay': '1969-12-31',
+            'unifiedRetry': dict(windowStart=9999.875, windowEnd=10000, skippedS=0)})
+        self.assertTrue(self.collect(13600))
+        starts = [r['props'] for r in self.rows('crash.unified.chunk') if r['props']['outcome'] == 'start']
+        self.assertEqual(starts[0]['windowS'], .125)
+        self.assertEqual(starts[1]['windowS'], 60)
+        self.assertEqual(jobs.read_state('crashes')['unified'], 13600)
+
+    def test_cleanup_reserve_on_shortened_call_still_reports_deadline(self):
+        jobs.save_state('crashes', {'unified': 6400, 'rollupDay': '1969-12-31'})
+        def early_timeout(command, **kwargs):
+            self.clock += kwargs['timeout']-.5
+            raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+        with patch.object(self, 'command', side_effect=early_timeout):
+            self.assertFalse(self.collect(deadline=10))
+        self.assertLess(self.clock, 10)
+        self.assertEqual(self.rows('crash.collect')[-1]['props']['stopReason'], 'deadline')
+        self.assertEqual(jobs.read_state('crashes')['unified'], 6400)
 
     def test_unlogged_checkpoint_loss_cannot_follow_skip_interruption(self):
         save = collector.save_state
