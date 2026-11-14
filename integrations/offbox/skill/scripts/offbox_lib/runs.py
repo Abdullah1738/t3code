@@ -772,21 +772,41 @@ def planned_steps(run) -> int:
     return int(run['step_count'] or 0) if 'step_count' in run.keys() else 0
 
 
+def argument_list_failure(run, path: Path, *, report: bool) -> bool:
+    try:
+        text = path.read_text(errors='replace')
+    except OSError:
+        return False
+    if (COMMAND_STARTED_MARKER in text or run_evidence.PREFIX in text
+            or not re.search(r'^.*boatd-wrap: line \d+: .*Argument list too long$', text, re.M)
+            or any(STEP_RETRY.fullmatch(line) for line in text.splitlines())
+            or 'Error: Command not executable' not in text):
+        return False
+    if report:
+        size = run['cmd_bytes'] if 'cmd_bytes' in run.keys() else None
+        detail = f', {size} bytes' if size is not None else ', command bytes unavailable'
+        say(f'the box could not start the command (argument list too long{detail}); '
+            'update offbox or run a script file; a single argument over 128 KiB needs its contents '
+            'in a file read by the command')
+    return True
+
+
 def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, planned: int | None = None,
                        locked: bool = False, until: float | None = None, catch_up: bool = True,
-                       report: bool = True, history_result: str | None = None) -> int | None:
+                       report: bool = True, history_result: str | None = None,
+                       report_start_failure: bool = True) -> int | None:
     """Completion requires evidence from every step, even when a process/receipt says zero.
 
     Reuse history catch-up before rejecting a partial follow, including for a process whose
     row is still active. The caller has already established that the process ended.
     """
+    path = log_path or LOGS_DIR / f"{run['run_id']}.log"
     planned = planned_steps(run) if planned is None else planned
     if not planned:
-        return code
+        return 126 if code in (None, 126) and argument_list_failure(run, path, report=report and report_start_failure) else code
     known = run['known_exit_code'] if 'known_exit_code' in run.keys() else None
     if known not in (None, 0) and code in (None, 0):
         code = known
-    path = log_path or LOGS_DIR / f"{run['run_id']}.log"
     result = history_result
     if catch_up and (api.BACKEND == 'server' or missing_step_count(step_results(path), planned)):
         from .misc import _catch_up_log
@@ -797,6 +817,8 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
     # Complete old markers cannot prove the final attempt when the host's appended retry note is unread.
     history_incomplete = (api.BACKEND == 'server' and run['command_id'] and result is not None
                           and result not in ('complete', 'caught_up'))
+    if code in (None, 126) and not history_incomplete and argument_list_failure(run, path, report=report and report_start_failure):
+        return 126
     checked = checked_steps_code(path, planned, code, report=report)
     if history_incomplete:
         if report and checked is not None:
@@ -932,7 +954,27 @@ def scope_failed(log_path: Path | None) -> bool:
     return bool(lines) and all(SCOPE_FAILED.match(ln) for ln in lines)
 
 
-def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = None) -> str:
+# A measured 123,144-byte Crpko script became a 139,882-byte POST after quoting.
+# Old home wrappers exec that whole POST as one argument (Linux limit 131,072,
+# including NUL). Reserve 28 KiB for backend wrapping; measure the final POST.
+COMMAND_INLINE_MAX = 100 * 1024
+
+
+def command_payload(script: str, run_id: str, *, claim_id: str | None = None) -> tuple[str, str | None]:
+    command = exit_recording_command(script, run_id, claim_id=claim_id)
+    path = None
+    if len(command.encode()) > COMMAND_INLINE_MAX:
+        path = f"/home/user/.offbox/cmd/{claim_id or run_id}.sh"
+        command = exit_recording_command(script, run_id, claim_id=claim_id, script_file=path)
+    if len(command.encode()) > COMMAND_INLINE_MAX:
+        raise OffboxError(f"command is {len(command.encode())} bytes, over the box start limit; "
+                          "put the steps in a script file and run it; a single argument over 128 KiB needs its contents "
+                          "in a file read by the command", code=2)
+    return command, path
+
+
+def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = None,
+                           script_file: str | None = None) -> str:
     """Run the remote script under a parent shell that writes its exit code to ~/.offbox/exit/<run>.rc,
     so a run boat later reports as lost still has its real status on the box."""
     f = f'"$HOME/.offbox/exit/{run_id}.rc"'
@@ -940,6 +982,8 @@ def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = N
     persist = '\n'.join([
         'mkdir -p "$HOME/.offbox/exit" || exit 1',
         f'printf "%s\\n" "$1" > {f}.tmp && mv -f {f}.tmp {f}',
+        *(["rm -f -- " + shlex.quote(script_file),
+           'find "$HOME/.offbox/cmd" -name "*.sh" -mtime +2 -delete'] if script_file else []),
         'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" -o -name "*.pid" '
         '-o -name "*.trace" -o -name "*.containers.json" -o -name "*.containers.tmp" \\) -mtime +2 -delete',
     ])
@@ -982,7 +1026,7 @@ def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = N
           for name, code in (("HUP", 129), ("INT", 130), ("TERM", 143))],
         '__offbox_t0=$(date +%s)',
         '__offbox_evidence wrapper pid=$$',
-        'bash -lc "$0"',
+        'bash -l ' + shlex.quote(script_file) if script_file else 'bash -lc "$0"',
         '__offbox_rc=$?',
         'fi',
         persist_block,
@@ -1003,6 +1047,8 @@ def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = N
         'fi',
         'exit "$__offbox_rc"',
     ])
+    if script_file:
+        return "bash -c " + shlex.quote(outer)
     return "bash -c " + shlex.quote(outer) + " " + shlex.quote(script)
 
 
@@ -1532,6 +1578,23 @@ class Runner:
         claim = start_check.claim_id(con, self.run_id)
         env_file = f"/home/user/.offbox/env/{claim}.env"
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()
+        w = node_version.want(self.root, self.cwd)
+        node_block = node_version.block(w)
+        pm = pnpm_version.want(self.root, self.cwd)
+        if pm:
+            node_block += "\n" + pnpm_version.block(pm)
+        usage = command_usage.inspect(self.root, self.rel, a.cmd, steps)
+
+        def build_command(rdir, box, preserve):
+            script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
+                                   node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
+                                   repo_key=me["repo_key"], repo_root=self.root,
+                                   preserve_containers=preserve, box_id=box, usage=usage)
+            command, path = command_payload(script, self.run_id, claim_id=claim)
+            return command, path, script.encode()
+
+        # Validate the same transport before acquiring anything; final box-specific values are checked again.
+        build_command(identity.remote_dir_for(self.root), "<box>", "private lease")
         dead_attempts = 0
         replacement = None
         while True:
@@ -1550,6 +1613,9 @@ class Runner:
             rdir = row["remote_dir"]
             self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
                         docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
+            command, self.command_file, self.command_body = build_command(
+                rdir, self.box, containers.preserve_reason(con, row))
+            self.record(cmd_bytes=len(command.encode()), cmd_via='file' if self.command_file else 'argv')
             keeper_scope = None
             if row.get('_prepare_end') is None:
                 row['_prepare_end'] = prepare.Budget(self.box).end
@@ -1590,20 +1656,10 @@ class Runner:
                 if keeper_scope is not None and not keeper_scope.settled.is_set():
                     self.record(box_id=None)  # finish must not assign an idle TTL to a fenced box
                 raise
-        w = node_version.want(self.root, self.cwd)
-        node_block = node_version.block(w)
-        pm = pnpm_version.want(self.root, self.cwd)
-        if pm:
-            node_block += "\n" + pnpm_version.block(pm)
-        usage = command_usage.inspect(self.root, self.rel, a.cmd, steps)
         new_checkout_hint(row, self.root, usage)
         warning = clickhouse_suite_warning(me['repo_key'], row['size'], cmd_text)
         if warning:
             say(warning)
-        script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
-                               node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
-                               repo_key=me["repo_key"], repo_root=self.root,
-                               preserve_containers=containers.preserve_reason(con, row), box_id=self.box, usage=usage)
         con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', ('containers_expected:' + self.run_id, '1'))
         con.commit()
         self.require_pending(con)
@@ -1616,7 +1672,11 @@ class Runner:
         except Exception:
             pass
         try:
-            r = api.cmd_start(self.box, exit_recording_command(script, self.run_id, claim_id=claim),
+            import toollog
+            toollog.emit('run', 'run.start', ids={'run': self.run_id, 'box': self.box},
+                         props={'cmd_bytes': len(command.encode()),
+                                'cmd_via': 'file' if self.command_file else 'argv', 'step_count': len(steps)})
+            r = api.cmd_start(self.box, command,
                               meta={"repo": me.get("repo_key"), "kind": run_kind(cmd_text), "run_id": self.run_id},
                               retry_interrupted=retry_interrupted(a))
         except (api.ApiError, api.NetworkError) as e:
@@ -1675,7 +1735,8 @@ class Runner:
             self.record(process_id=self.pid, command_id=r.get("commandId"), status="running", command_at=now())
             lease.touch(self.box)
             event(con, self.box, "run_start", f"{self.run_id} pid={self.pid} env={','.join(explicit) or '-'} "
-                                              f"cmd={cmd_text[:200]}")
+                                              f"cmd_bytes={len(command.encode())} cmd_via={'file' if self.command_file else 'argv'} "
+                                              f"steps={len(steps)} cmd={cmd_text[:200]}")
         except sqlite3.Error as error:
             state_warning(self.run_id, None, error)
         return row
@@ -1762,7 +1823,11 @@ class Runner:
         err: list = []
         left = api.left()
         upload_timeout = 120 if left is None else max(.001, min(120, left))
-        upload = (err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout)
+        def upload_files():
+            ssh_sync.put_file(self.box, env_file, body, '600', upload_timeout)
+            if getattr(self, 'command_file', None):
+                ssh_sync.put_file(self.box, self.command_file, self.command_body, '600', upload_timeout)
+        upload = (err, upload_files)
         tw = None
         home = api.BACKEND == "server"
         if home:
@@ -1811,7 +1876,7 @@ class Runner:
             err.clear()
             left = api.left()
             upload_timeout = 120 if left is None else max(.001, min(120, left))
-            _safe(err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout, terminal_identity=home)
+            _safe(err, upload_files, terminal_identity=home)
             if err and isinstance(err[0], common.SshHostKeyMismatch):
                 raise err[0]
         self.check_source('push')
@@ -2534,7 +2599,9 @@ def emit_terminal(row):
             command_ms = api.command_execution_ms(row['box_id'], row['process_id'], row['command_id'])
             toollog.emit('run', 'run.command', kind='perf' if code == 0 else 'error', ok=code == 0,
                          duration_ms=command_ms, ids={'run': run_id, 'box': row['box_id']},
-                         props={'exitCode': code, 'timeoutHit': code == 124}, tag='command_failed' if code != 0 else None)
+                         props={'exitCode': code, 'timeoutHit': code == 124,
+                                'cmd_bytes': row['cmd_bytes'], 'cmd_via': row['cmd_via'],
+                                'step_count': planned_steps(row)}, tag='command_failed' if code != 0 else None)
     except Exception:
         pass
 
@@ -3067,7 +3134,8 @@ def _run_remote(a, rn) -> int:
             con.close()
         step_run = row if row is not None else dict(run_id=rn.run_id, box_id=rn.box, command_id=None, mode='fg')
         rn.remote_code = None
-        code = settled_steps_code(step_run, code, log_path=rn.log_path, planned=len(steps), locked=True)
+        code = settled_steps_code(step_run, code, log_path=rn.log_path, planned=len(steps), locked=True,
+                                  report_start_failure=False)
         rn.remote_code = code
     code = finish(rn.run_id, code, report=True)
     rn.remote_code = code
