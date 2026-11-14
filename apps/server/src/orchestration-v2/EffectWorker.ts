@@ -121,7 +121,13 @@ export const layerExecutor: Layer.Layer<
         switch (effect.request.type) {
           case "provider-runtime.continue": {
             const { sourceRunId, queued } = effect.request;
-            const source = { threadId: effect.threadId, sourceRunId, effectId: effect.id };
+            const source = {
+              threadId: effect.threadId,
+              sourceRunId,
+              effectId: effect.id,
+              classification: queued ? ("recovered-queue" as const) : ("continuation" as const),
+            };
+            let admitted = false;
             const finishDispatch = pacing.dispatched(source).pipe(
               Effect.catch(() =>
                 Effect.logWarning("restart-pacing.settlement-read-failed", {
@@ -130,7 +136,7 @@ export const layerExecutor: Layer.Layer<
                 }),
               ),
             );
-            return Effect.gen(function* () {
+            const beforeDispatch = Effect.gen(function* () {
               const deferMs = yield* pacing.acquire(source);
               if (deferMs > 0)
                 return yield* new OrchestrationEffectExecutionError({
@@ -138,8 +144,10 @@ export const layerExecutor: Layer.Layer<
                   effectType: effect.request.type,
                   deferMs,
                 });
-              yield* continueRestartedRun({ ...source, queued });
-            }).pipe(
+              admitted = true;
+            });
+            return continueRestartedRun({ ...source, queued, beforeDispatch }).pipe(
+              Effect.tap(() => (admitted ? Effect.void : pacing.dispatched(source, true))),
               Effect.catchTags({
                 RestartAdmissionTimeoutError: (error) =>
                   queued === true
@@ -167,7 +175,10 @@ export const layerExecutor: Layer.Layer<
                 Exit.isFailure(exit) ? pacing.release(source) : finishDispatch,
               ),
               Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
-              Effect.provideService(ServerSettings.ServerSettingsService, settings),
+              Effect.provideService(ServerSettings.ServerSettingsService, {
+                ...settings,
+                getSettings: pacing.settingsSnapshot,
+              }),
               Effect.tapError((cause) =>
                 willRetry ||
                 (isOrchestrationEffectExecutionError(cause) && cause.deferMs !== undefined)

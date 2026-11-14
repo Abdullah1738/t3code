@@ -274,10 +274,11 @@ export function restartContinuationRun(
 }
 
 export const continueRestartedRun = Effect.fn("RestartContinuation.continueRestartedRun")(
-  function* (input: {
+  function* <AdmissionError = never>(input: {
     readonly threadId: ThreadId;
     readonly sourceRunId: RunId;
     readonly queued?: boolean | undefined;
+    readonly beforeDispatch?: Effect.Effect<void, AdmissionError>;
   }) {
     const config = yield* Effect.serviceOption(ServerConfig.ServerConfig);
     const fs = yield* Effect.serviceOption(FileSystem.FileSystem);
@@ -294,8 +295,7 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
     )
       return;
     const settings = yield* ServerSettings.ServerSettingsService;
-    const enabled = yield* settings.getSettings.pipe(Effect.orElseSucceed(() => null));
-    if (!enabled) return;
+    const enabled = yield* settings.getSettings;
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const messageId = MessageId.make(`message:restart-continuation:${input.sourceRunId}`);
     const projection = yield* threads.getThreadRecords(
@@ -327,6 +327,7 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
     if (source?.status === "queued") {
       if (source.queueHeld === true) return;
       if (restartContinuationBlocked(projection, source, yield* DateTime.now, true)) return;
+      if (input.beforeDispatch !== undefined) yield* input.beforeDispatch;
       // Register before dispatch: a worker may reach the actual provider call
       // immediately after the queue promotion transaction commits.
       yield* Effect.sync(() => markQueuedRunRecovered(source.id));
@@ -438,6 +439,8 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
     // ardud: a settled parent whose only cut work is a confirmed-running child has no
     // note to give. Dispatching would start a turn and claim the work stopped.
     if (note.settled && noteText === undefined && note.work.length > 0) return;
+    // Declined continuations must settle even when the admission queue is full.
+    if (input.beforeDispatch !== undefined) yield* input.beforeDispatch;
     // ardud: the headline claims "stopped" only when the note kept cancelled work.
     const noteSaysCancelled = summary?.claimsCancelled === true;
     const text =
