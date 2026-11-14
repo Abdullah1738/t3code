@@ -700,14 +700,16 @@ const handlers = {
         if (caller.link?.role === "review") {
           return yield* refuse("Review threads put questions in their findings.");
         }
-        const board = (yield* service.boards).find((entry) => entry.id === card.boardId);
+        const board = yield* service.resolveBoard(caller.threadId, { boardId: card.boardId });
         const asked = yield* service.askOwner(
           card.id,
           { ...askFieldsOf(input), question: input.question, blocking: input.blocking ?? false },
           caller.actor,
           isCardThread(caller) ? "cardThread" : "evaluator",
         );
+        // The newest ask is the one just added.
         const ask = asked.asks.at(-1);
+        const warning = ask ? Asks.approvalWarning(asked, ask, board.guessedGates) : undefined;
         const note = ask
           ? [
               askGateWarning(asked, ask, board?.guessedGates),
@@ -718,6 +720,7 @@ const handlers = {
           : "";
         return {
           card: Asks.askSummary(asked, ask?.id ?? ""),
+          ...(warning === undefined ? {} : { warning }),
           ...(note ? { note } : {}),
         };
       }),
@@ -767,6 +770,9 @@ const handlers = {
         if (!edits && action === undefined && blocking === undefined) {
           return yield* invalid("Pass the fields to change, or an action.");
         }
+        const board = edits
+          ? yield* service.resolveBoard(caller.threadId, { boardId: card.boardId })
+          : undefined;
         let changed = card;
         if (edits) changed = yield* service.editAsk(card.id, askId, edit, caller.actor, role);
         const open = changed.asks.find((entry) => entry.id === askId && entry.closedAt === null);
@@ -779,7 +785,15 @@ const handlers = {
           }
           changed = yield* service.changeAsk(card.id, askId, "block", caller.actor, role);
         }
-        return { card: Asks.askSummary(changed, askId) };
+        const revised = changed.asks.find((entry) => entry.id === askId);
+        const warning =
+          edits && revised
+            ? Asks.approvalWarning(changed, revised, board?.guessedGates)
+            : undefined;
+        return {
+          card: Asks.askSummary(changed, askId),
+          ...(warning === undefined ? {} : { warning }),
+        };
       }),
     ),
   ),

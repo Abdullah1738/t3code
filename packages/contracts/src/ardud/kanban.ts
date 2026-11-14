@@ -349,6 +349,8 @@ export const KanbanAskOption = Schema.Struct({
   /** What the option is. */
   detail: Schema.optional(Schema.String),
   recommended: Schema.optional(Schema.Boolean),
+  /** Subtask ids this option approves when the owner picks it alone (deploy, money or secret steps). */
+  approves: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
   /** What happens once it is picked, when the label doesn't say. */
   consequence: Schema.optional(Schema.String),
   /** Index into the ask's `blocks`: the picture or page that shows this option. */

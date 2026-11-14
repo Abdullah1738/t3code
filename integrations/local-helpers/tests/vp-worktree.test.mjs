@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 
 const shim = fileURLToPath(new URL("../bin/vp", import.meta.url));
+const maintenance = fileURLToPath(new URL("../libexec/vp/toolchain", import.meta.url));
 const binding = `@oxfmt/binding-${os.platform()}-${os.arch()}`;
 function fixtureLock() {
   return {
@@ -623,6 +624,8 @@ test("unsafe or ambiguous argument forms refuse with an offbox hint", (t) => {
   const f = fixture(t);
   fs.symlinkSync(f.main, path.join(f.wt, "outside"));
   for (const args of [
+    ["--candidate=toolchain copy", f.main, "fmt"],
+    ["--candidate=main checkout", f.main, "fmt"],
     ["test", "a.test.ts"],
     ["check", "a.ts"],
     ["i"],
@@ -676,4 +679,259 @@ test("runs with only a minimal PATH and HOME", (t) => {
     env: { HOME: path.dirname(f.main), PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin` },
   });
   assert.equal(r.status, 0, r.stderr);
+});
+
+function fixtureGit(dir, ...args) {
+  const result = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.trim();
+}
+
+function toolchainFixture(t) {
+  const f = fixture(t);
+  const copy = path.join(path.dirname(f.main), "toolchain copy");
+  fixtureGit(f.main, "update-ref", "refs/remotes/origin/main", "HEAD");
+  fixtureGit(f.main, "worktree", "add", "-q", "--detach", copy, "origin/main");
+  fs.cpSync(path.join(f.main, "node_modules"), path.join(copy, "node_modules"), {
+    recursive: true,
+  });
+  fixtureGit(f.main, "config", "vp.toolchain", copy);
+  const lock = path.join(fixtureGit(copy, "rev-parse", "--absolute-git-dir"), "vp-sync.lock");
+  const cli = (...args) =>
+    spawnSync(maintenance, args, { cwd: f.wt, encoding: "utf8", timeout: 10000 });
+  return { ...f, copy, lock, cli };
+}
+
+function newerConfig(f) {
+  const original = fs.readFileSync(path.join(f.wt, "vite.config.ts"));
+  fs.writeFileSync(path.join(f.copy, "vite.config.ts"), "old config\n");
+  fixtureGit(f.copy, "add", "vite.config.ts");
+  fixtureGit(
+    f.copy,
+    "-c",
+    "user.name=Test",
+    "-c",
+    "user.email=test@example.invalid",
+    "commit",
+    "-qm",
+    "old config",
+  );
+  const old = fixtureGit(f.copy, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(f.copy, "vite.config.ts"), original);
+  fixtureGit(f.copy, "add", "vite.config.ts");
+  fixtureGit(
+    f.copy,
+    "-c",
+    "user.name=Test",
+    "-c",
+    "user.email=test@example.invalid",
+    "commit",
+    "-qm",
+    "fixed config",
+  );
+  const target = fixtureGit(f.copy, "rev-parse", "HEAD");
+  fixtureGit(f.main, "update-ref", "refs/remotes/origin/main", target);
+  fixtureGit(f.copy, "checkout", "-q", "--detach", old);
+  return { old, target };
+}
+
+test("matching toolchain copy wins over drifted main for fmt and lint", (t) => {
+  const f = toolchainFixture(t);
+  fs.appendFileSync(path.join(f.main, "vite.config.ts"), "drift\n");
+  for (const command of ["fmt", "lint"]) {
+    const r = f.run([command, "a.ts"]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stderr.includes(f.copy), r.stderr);
+    assert.equal(JSON.parse(r.stdout).cwd, command === "fmt" ? f.wt : f.copy);
+  }
+  assert.match(fs.readFileSync(path.join(f.main, "vite.config.ts"), "utf8"), /drift/);
+});
+
+test("shim syncs stale toolchain to local origin/main without touching dependencies or main", (t) => {
+  const f = toolchainFixture(t);
+  const { target } = newerConfig(f);
+  const mainHead = fixtureGit(f.main, "rev-parse", "HEAD");
+  fs.appendFileSync(path.join(f.main, "vite.config.ts"), "owner drift\n");
+  const vpBefore = fs.readFileSync(path.join(f.copy, "node_modules/.bin/vp"));
+  const r = f.run(["fmt", "a.ts"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(r.stderr.includes(f.copy));
+  assert.equal(fixtureGit(f.copy, "rev-parse", "HEAD"), target);
+  assert.equal(fixtureGit(f.main, "rev-parse", "HEAD"), mainHead);
+  assert.match(fs.readFileSync(path.join(f.main, "vite.config.ts"), "utf8"), /owner drift/);
+  assert.deepEqual(fs.readFileSync(path.join(f.copy, "node_modules/.bin/vp")), vpBefore);
+  assert.equal(fs.existsSync(f.lock), false);
+});
+
+for (const mainDrift of [false, true]) {
+  test(`held sync lock never waits; main drift=${mainDrift}`, (t) => {
+    const f = toolchainFixture(t);
+    const { old } = newerConfig(f);
+    fs.mkdirSync(f.lock);
+    if (mainDrift) fs.appendFileSync(path.join(f.main, "vite.config.ts"), "drift\n");
+    const r = f.run(["fmt", "a.ts"]);
+    assert.equal(r.status, mainDrift ? 127 : 0, r.stderr);
+    assert.equal(fixtureGit(f.copy, "rev-parse", "HEAD"), old);
+    assert.equal(fs.existsSync(f.lock), true);
+    if (mainDrift)
+      assert.match(r.stderr, /toolchain copy.*config drift.*main checkout.*config drift/);
+    else assert.equal(JSON.parse(r.stdout).cwd, f.wt);
+  });
+}
+
+test("sync reclaims an empty lock older than 60 seconds", (t) => {
+  const f = toolchainFixture(t);
+  const { target } = newerConfig(f);
+  fs.mkdirSync(f.lock);
+  const old = new Date(Date.now() - 61000);
+  fs.utimesSync(f.lock, old, old);
+  const r = f.run(["lint", "a.ts"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fixtureGit(f.copy, "rev-parse", "HEAD"), target);
+  assert.equal(fs.existsSync(f.lock), false);
+});
+
+test("stale versions and main drift report both reasons and maintenance hint", (t) => {
+  const f = toolchainFixture(t);
+  const lock = fixtureLock();
+  lock.importers["."].devDependencies["vite-plus"].version = "2.0.0";
+  fs.writeFileSync(path.join(f.wt, "pnpm-lock.yaml"), JSON.stringify(lock));
+  fs.appendFileSync(path.join(f.main, "vite.config.ts"), "drift\n");
+  const r = f.run(["fmt", "a.ts"]);
+  assert.equal(r.status, 127);
+  assert.match(
+    r.stderr,
+    /toolchain copy.*vite-plus.*2.0.0 vs 1.0.0.*main checkout.*vite.config.ts/,
+  );
+  assert.match(r.stderr, /toolchain sync --install/);
+  assert.match(r.stderr, /offbox local.*vp toolchain copy.*30m/);
+  assert.match(r.stderr, /offbox run -- vp fmt/);
+});
+
+for (const kind of ["unset", "missing", "no vp", "self", "self symlink"]) {
+  test(`candidate ${kind} preserves main fallback`, (t) => {
+    const f = fixture(t);
+    let candidate = path.join(path.dirname(f.main), "missing");
+    if (kind === "no vp") fs.mkdirSync(candidate);
+    if (kind === "self") candidate = f.wt;
+    if (kind === "self symlink") fs.symlinkSync(f.wt, candidate);
+    if (kind !== "unset") fixtureGit(f.main, "config", "vp.toolchain", candidate);
+    f.routed(["fmt", "a.ts"]);
+    f.routed(["lint", "a.ts"]);
+  });
+}
+
+test("a rejected toolchain config dependency falls through to main", (t) => {
+  const f = toolchainFixture(t);
+  fs.mkdirSync(path.join(f.copy, "oxlint-local"));
+  fs.writeFileSync(path.join(f.copy, "oxlint-local/helper.ts"), "different");
+  const r = f.run(["lint", "a.ts"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(JSON.parse(r.stdout).cwd, f.main);
+});
+
+test("config pointing at main never syncs or changes its branch or files", (t) => {
+  const f = toolchainFixture(t);
+  const { target } = newerConfig(f);
+  fixtureGit(f.main, "config", "vp.toolchain", f.main);
+  const head = fixtureGit(f.main, "rev-parse", "HEAD");
+  assert.notEqual(head, target);
+  f.routed(["fmt", "a.ts"]);
+  assert.equal(fixtureGit(f.main, "rev-parse", "HEAD"), head);
+  assert.notEqual(fixtureGit(f.main, "symbolic-ref", "HEAD"), "");
+});
+
+test("status reports HEAD, local ref, version match and dependency size", (t) => {
+  const f = toolchainFixture(t);
+  let r = f.cli("status");
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(r.stdout.includes(`path: ${f.copy}`));
+  assert.match(r.stdout, /current: yes/);
+  assert.match(r.stdout, /toolchain match: yes/);
+  assert.match(r.stdout, /node_modules/);
+  fs.rmSync(path.join(f.copy, "node_modules"), { recursive: true });
+  r = f.cli("status");
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /toolchain match: no/);
+  assert.match(r.stdout, /node_modules: missing/);
+});
+
+test("explicit sync fetches and checks out without installing missing dependencies", (t) => {
+  const f = toolchainFixture(t);
+  const { target } = newerConfig(f);
+  const bare = path.join(path.dirname(f.main), "origin.git");
+  fixtureGit(f.main, "init", "-q", "--bare", bare);
+  fixtureGit(f.main, "remote", "add", "origin", bare);
+  fixtureGit(f.main, "push", "-q", "origin", `${target}:refs/heads/main`);
+  fs.rmSync(path.join(f.copy, "node_modules"), { recursive: true });
+  const r = f.cli("sync");
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fixtureGit(f.copy, "rev-parse", "HEAD"), target);
+  assert.equal(fs.existsSync(path.join(f.copy, "node_modules")), false);
+  assert.match(r.stdout, /synced/);
+});
+
+test("maintenance command rejects unset config and invalid arguments", (t) => {
+  const f = fixture(t);
+  for (const args of [["status"], ["sync"], ["sync", "--bad"], ["status", "extra"]]) {
+    const r = spawnSync(maintenance, args, { cwd: f.wt, encoding: "utf8" });
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /unset|usage:/);
+  }
+});
+
+for (const state of ["matching", "missing", "wrong version"]) {
+  test(`local JS plugin runtime dependencies: ${state}`, (t) => {
+    const f = toolchainFixture(t);
+    const lock = fixtureLock();
+    lock.importers["oxlint-local"] = { dependencies: { "fixture-runtime": { version: "1.0.0" } } };
+    lock.snapshots["fixture-runtime@1.0.0"] = {};
+    for (const dir of [f.wt, f.main, f.copy]) {
+      fs.mkdirSync(path.join(dir, "oxlint-local"));
+      fs.writeFileSync(path.join(dir, "oxlint-local/package.json"), "{}");
+      fs.writeFileSync(path.join(dir, "oxlint-local/index.ts"), "export {};\n");
+      fs.writeFileSync(path.join(dir, "pnpm-lock.yaml"), JSON.stringify(lock));
+    }
+    for (const dir of [f.main, f.copy]) {
+      const loader = path.join(dir, "node_modules/vite-plus/index.js");
+      fs.writeFileSync(
+        loader,
+        fs
+          .readFileSync(loader, "utf8")
+          .replace('jsPlugins: ["@fixture/lint/rules"]', 'jsPlugins: ["./oxlint-local/index.ts"]'),
+      );
+      const pkg = path.join(dir, "node_modules/fixture-runtime");
+      if (dir === f.copy && state === "missing") continue;
+      fs.mkdirSync(pkg);
+      fs.writeFileSync(
+        path.join(pkg, "package.json"),
+        JSON.stringify({
+          name: "fixture-runtime",
+          version: dir === f.copy && state === "wrong version" ? "2.0.0" : "1.0.0",
+        }),
+      );
+    }
+    fs.appendFileSync(path.join(f.main, "vite.config.ts"), "drift\n");
+    const r = f.run(["lint", "a.ts"]);
+    assert.equal(r.status, state === "matching" ? 0 : 127, r.stderr);
+    if (state !== "matching") {
+      assert.match(r.stderr, /fixture-runtime.*toolchain sync --install/);
+      assert.match(r.stderr, /main checkout.*vite.config.ts/);
+    }
+  });
+}
+
+
+test("automatic sync never runs checkout hooks", (t) => {
+  const f = toolchainFixture(t);
+  const { target } = newerConfig(f);
+  const hooks = path.join(path.dirname(f.main), "hooks");
+  const marker = path.join(hooks, "called");
+  fs.mkdirSync(hooks);
+  fs.writeFileSync(path.join(hooks, "post-checkout"), `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+  fixtureGit(f.main, "config", "core.hooksPath", hooks);
+  const r = f.run(["fmt", "a.ts"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fixtureGit(f.copy, "rev-parse", "HEAD"), target);
+  assert.equal(fs.existsSync(marker), false);
 });
