@@ -318,7 +318,7 @@ export class RobobBackend implements ChatBackend {
     return new RobobBackend({ ...this.options, client: this.client, finishes: this.finishes, completedSteps: this.completedSteps, subdir, title });
   }
 
-  private chatFolder(): string {
+  chatFolder(): string {
     return this.options.subdir ? `${this.chatRoot}/${this.options.subdir}` : this.chatRoot;
   }
 

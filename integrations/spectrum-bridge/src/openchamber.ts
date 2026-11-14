@@ -305,6 +305,8 @@ export type SteerGuard = { signal: AbortSignal; beforeSend: () => Promise<boolea
 export interface ChatBackend {
   /** How owner-facing text names the app. Defaults to OpenChamber. */
   readonly brand?: { app: string };
+  /** Persistent chat files live outside the dated session directories. */
+  chatFolder?(): string | undefined;
   health(): Promise<{ status: string; openchamberVersion?: string; [key: string]: unknown } | undefined>;
   createChat(title?: string): Promise<{ id: string; directory: string }>;
   markImessageOrigin(id: string, directory?: string): Promise<"marked" | "already" | "missing">;
@@ -492,6 +494,10 @@ export class OpenChamber implements ChatBackend {
         id = session.parentID;
       }
     } catch (caughtError) { toolError("openchamber", "openchamber.catch6", caughtError); /* Keep pending permissions visible when the policy owner is unavailable. */ }
+  }
+
+  chatFolder(): string | undefined {
+    return this.chatRoot;
   }
 
   async createChat(title?: string): Promise<{ id: string; directory: string }> {

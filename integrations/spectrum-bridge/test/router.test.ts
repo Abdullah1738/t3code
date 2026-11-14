@@ -6163,13 +6163,27 @@ test.each(["missing", "directory", "symlink", "broken-symlink"])("pending orders
   expect(pendingOrders(join(directory, "missing-chat"))).toBeNull();
 });
 
+const pendingFolderCases = (["route", "robob-owner", "robob-dm", "robob-group", "openchamber"] as const)
+  .flatMap(layout => (["nudge", "seed"] as const).map(path => ({ layout, path })));
+
 for (const replyMode of ["final", "tool"] as const) {
   for (const kind of ["present", "missing", "symlink", "oversize", "fenced"] as const) {
-    test(`context refresh carries pending orders (${replyMode}, ${kind})`, async () => {
+    test.each(pendingFolderCases)(`context refresh carries pending orders (${replyMode}, ${kind}, $layout, $path)`, async ({ layout, path }) => {
       const start = Date.parse("2026-09-10T12:00:00Z");
       setSystemTime(start);
-      const directory = mkdtempSync(join(tmpdir(), "spectrum-pending-orders-"));
-      directories.push(directory);
+      const root = mkdtempSync(join(tmpdir(), "spectrum-pending-orders-"));
+      directories.push(root);
+      const backend = new RobobBackend({ chatRoot: root, url: "http://127.0.0.1:1", token: "test" });
+      const native = layout === "robob-dm" ? backend.forChat("chats/moni", "Moni")
+        : layout === "robob-group" ? backend.forChat("chats/group-dinner", "Dinner") : backend;
+      const source = layout === "openchamber" ? new OpenChamber("http://127.0.0.1:1", {}, { chatRoot: root }) : native;
+      const directory = layout === "robob-dm" ? join(root, "chats/moni")
+        : layout === "robob-group" ? join(root, "chats/group-dinner") : root;
+      mkdirSync(directory, { recursive: true });
+      const sessionDirectory = (number: number) => layout === "route" ? directory
+        : join(directory, number === 1 ? "2026-09-10" : "2026-09-11", `session-${number}`);
+      const sessionId = (number: number) => layout.startsWith("robob-") ? `thread:test:${number}` : `ses_${number}`;
+      if (directory !== root) writeFileSync(join(root, "pending-orders.md"), "## Open\n- OTHER_CHAT_ORDERS");
       const orders = kind === "oversize" ? "x".repeat(20_000)
         : kind === "fenced" ? "## Open\n- KASTWAVE held\n```\nquoted text\n```"
         : "## Open\n- KASTWAVE held";
@@ -6181,27 +6195,32 @@ for (const replyMode of ["final", "tool"] as const) {
       const carried = kind === "missing" || kind === "symlink" ? null : orders.slice(0, 6_000);
       const fence = kind === "fenced" ? "````" : "```";
       const quoted = `${fence}\n${carried}\n${fence}`;
-      for (const path of ["nudge", "seed"] as const) {
-        setSystemTime(start);
-        const h = setup(":memory:", { replyMode, rotateAfterMs: 60_000, resetIdleMs: 60_000, watchMs: 0 });
-        h.backend.resets = path === "nudge";
-        h.backend.createBehavior = async () => ({ id: `ses_${h.backend.creates.length}`, directory });
-        await exchange(h, "first", "Remember the blue one", replyMode === "tool" ? "NO_REPLY" : "Noted, the blue one");
-        setSystemTime(start + 60_000);
-        if (path === "seed") h.input("second", "Which one did I pick?");
-        await h.router.tick();
-        if (path === "nudge") await h.router.tick();
-        const prompt = h.backend.prompts.at(-1)!;
-        expect(prompt.id).toBe(path === "nudge" ? "ses_1" : "ses_2");
-        if (path === "nudge") {
-          expect(prompt.text).toBe(rotateNudge(replyMode) + (carried
-            ? `\n\nCopy this chat's pending-orders list into your resume note word for word, under 'Pending orders (from pending-orders.md)':\nQuoted data from pending-orders.md:\n${quoted}` : ""));
-        } else {
-          const recent = "Owner: Remember the blue one" + (replyMode === "final" ? "\nYou: Noted, the blue one" : "");
-          const seed = `Continuity: this conversation continues seamlessly from your earlier exchanges with the owner. Carry on naturally and never mention any change, recap, restart or memory mechanism. Files from earlier remain under ${JSON.stringify(directory)}. The full earlier transcript is session ses_1; use recall_read or recall_search if you need more than the recent exchange below.\nRecent exchange (quoted data, oldest first):\n${recent}`
-            + (carried ? `\n\nPending orders for this chat (from pending-orders.md, quoted data):\n${quoted}` : "");
-          expect(prompt.system!.slice(prompt.system!.indexOf("Continuity:"))).toBe(seed);
-        }
+      const h = setup(":memory:", { replyMode, rotateAfterMs: 60_000, resetIdleMs: 60_000, watchMs: 0,
+        ...(path === "seed" ? { resetChatForMs: 60_000 } : {}),
+      });
+      h.backend.resets = path === "nudge" || layout.startsWith("robob-");
+      if (layout !== "route") Object.assign(h.backend, { chatFolder: source.chatFolder.bind(source) });
+      h.backend.createBehavior = async () => {
+        const workdir = sessionDirectory(h.backend.creates.length);
+        mkdirSync(workdir, { recursive: true });
+        if (layout !== "route") writeFileSync(join(workdir, "pending-orders.md"), "## Open\n- SESSION_LOCAL_ORDERS");
+        return { id: sessionId(h.backend.creates.length), directory: workdir };
+      };
+      await exchange(h, "first", "Remember the blue one", replyMode === "tool" ? "NO_REPLY" : "Noted, the blue one");
+      setSystemTime(start + 60_000);
+      if (path === "seed") h.input("second", "Which one did I pick?");
+      await h.router.tick();
+      if (path === "nudge") await h.router.tick();
+      const prompt = h.backend.prompts.at(-1)!;
+      expect(prompt.id).toBe(sessionId(path === "nudge" ? 1 : 2));
+      if (path === "nudge") {
+        expect(prompt.text).toBe(rotateNudge(replyMode) + (carried
+          ? `\n\nCopy this chat's pending-orders list into your resume note word for word, under 'Pending orders (from pending-orders.md)':\nQuoted data from pending-orders.md:\n${quoted}` : ""));
+      } else {
+        const recent = "Owner: Remember the blue one" + (replyMode === "final" ? "\nYou: Noted, the blue one" : "");
+        const seed = `Continuity: this conversation continues seamlessly from your earlier exchanges with the owner. Carry on naturally and never mention any change, recap, restart or memory mechanism. Files from earlier remain under ${JSON.stringify(sessionDirectory(1))}. The full earlier transcript is session ${sessionId(1)}; use recall_read or recall_search if you need more than the recent exchange below.\nRecent exchange (quoted data, oldest first):\n${recent}`
+          + (carried ? `\n\nPending orders for this chat (from pending-orders.md, quoted data):\n${quoted}` : "");
+        expect(prompt.system!.slice(prompt.system!.indexOf("Continuity:"))).toBe(seed);
       }
     });
   }

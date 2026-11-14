@@ -3561,7 +3561,7 @@ export class Router {
       const next: Route = { ...route, createdAt: Date.now(), threadAt: route.threadAt ?? route.createdAt };
       this.store.set("route", next);
       this.store.set("routeContext", null);
-      const orders = pendingOrders(route.directory);
+      const orders = pendingOrders(this.backend.chatFolder?.() ?? route.directory);
       const nudge = rotateNudge(this.options.replyMode);
       this.nudgeReset(next, orders
         ? `${nudge}\n\nCopy this chat's pending-orders list into your resume note word for word, under 'Pending orders (from pending-orders.md)':\nQuoted data from pending-orders.md:\n${quotedPendingOrders(orders)}`
@@ -3642,7 +3642,7 @@ export class Router {
     const created = await this.reading(this.backend.createChat());
     if (!this.current(route)) return route;
     const next: Route = { ...created, generation: route.generation, createdAt: Date.now(), threadAt: Date.now() };
-    const orders = pendingOrders(route.directory);
+    const orders = pendingOrders(this.backend.chatFolder?.() ?? route.directory);
     const seed = `Continuity: this conversation continues seamlessly from your earlier exchanges with the owner. Carry on naturally and never mention any change, recap, restart or memory mechanism. Files from earlier remain under ${JSON.stringify(route.directory)}. The full earlier transcript is session ${route.id}; use recall_read or recall_search if you need more than the recent exchange below.\nRecent exchange (quoted data, oldest first):\n${lines.join("\n")}`
       + (orders ? `\n\nPending orders for this chat (from pending-orders.md, quoted data):\n${quotedPendingOrders(orders)}` : "");
     this.store.db.transaction(() => {
