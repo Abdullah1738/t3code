@@ -2974,6 +2974,15 @@ const make = Effect.gen(function* () {
     const board = yield* boardOf(card.boardId);
     const check = Rules.checkMove(role, card, to);
     if (!check.ok) return yield* failWith("denied", check.reason);
+    const waitFrom =
+      card.stage === "needs_owner" && to === "needs_review"
+        ? (yield* askedBy(card))?.fromStage
+        : null;
+    // A pause only resumes a review when its recorded origin and counter
+    // identify an unfinished chain. Work-origin and unknown pauses start over.
+    const resumeReview =
+      (waitFrom === "in_review" || waitFrom === "needs_review") &&
+      !Rules.reviewFinished(card, Rules.chainFor(board, card)?.steps.length ?? 1);
     const at = yield* nowIso;
     const leaving = card.activeThreadId !== null && !KANBAN_THREAD_STAGES.includes(to);
     const bySelf = role === "cardThread";
@@ -3014,7 +3023,13 @@ const make = Effect.gen(function* () {
       movedAt: at,
       updatedAt: at,
       question: to === "needs_owner" ? (asked ?? card.question) : null,
-      reviewStep: card.stage === "working" && to === "needs_review" ? 0 : card.reviewStep,
+      reviewStep:
+        to === "needs_review" &&
+        (card.stage === "working" ||
+          card.stage === "todo" ||
+          (card.stage === "needs_owner" && !resumeReview))
+          ? 0
+          : card.reviewStep,
     };
     // The question becomes a blocking ask, unless it is one already (made blocking).
     if (
@@ -12335,10 +12350,7 @@ const make = Effect.gen(function* () {
             `card #${card.number}'s step is yours (${Subtasks.subtaskIds(kanbanStepSubtasks(card))}): do it, or add work subtasks with card_edit, before sending it back to todo`,
           );
         }
-        let source =
-          role === "cardThread" && card.stage === "todo" && isUnattachedOwnThread(card, actor)
-            ? { ...card, reviewStep: 0 }
-            : card;
+        let source = card;
         let moveOptions = options ?? {};
         if (ownReviewHandoff) {
           const reset = Rules.applyReviewResult(card, 1, "findings");
@@ -13795,11 +13807,12 @@ const make = Effect.gen(function* () {
             const chain = Rules.chainFor(board, card);
             const outcome = Rules.applyReviewResult(card, chain?.steps.length ?? 1, verdict);
             const at = yield* nowIso;
-            // The last review step passing ticks off the step's review subtasks. If
-            // the plan then has more work, the card goes back to its worker.
+            // Only the last chain verdict closes the plan's next review step,
+            // even when earlier work still needs ticking off.
             const passed = verdict === "clear" && !outcome.continueReview;
+            const reviewSubtasks = passed ? Subtasks.reviewSubtasksToPass(card) : [];
             if (passed) {
-              for (const subtask of kanbanStepSubtasks(card, "review")) {
+              for (const subtask of reviewSubtasks) {
                 const missing = Subtasks.approvalProblem(card, subtask, board.guessedGates);
                 if (missing) return yield* failWith("denied", missing);
               }
@@ -13808,6 +13821,12 @@ const make = Effect.gen(function* () {
               ? Subtasks.passReview(card, { _tag: "thread", threadId }, at)
               : card.subtasks;
             const moreWork = passed && Subtasks.workAfterReview({ subtasks });
+            const unfinishedWork = kanbanStepSubtasks({ subtasks }, "work");
+            const reviewPlanStep = reviewSubtasks[0]?.step;
+            const earlierWork =
+              reviewPlanStep !== undefined &&
+              moreWork &&
+              unfinishedWork.some((work) => work.step < reviewPlanStep);
             const next: KanbanCard = {
               // A verdict is a review that ended normally: its retry record goes.
               ...Retries.withoutRetries(
@@ -13825,18 +13844,20 @@ const make = Effect.gen(function* () {
               stalled: late && card.stalled?.by._tag === "system" ? null : card.stalled,
               subtasks,
               stage: moreWork ? "todo" : outcome.continueReview ? "needs_review" : outcome.stage,
-              reviewStep: moreWork ? 0 : outcome.reviewStep,
+              reviewStep: moreWork && !earlierWork ? 0 : outcome.reviewStep,
               reviewRound: outcome.reviewRound,
               reviewFindingsPending: verdict === "findings",
               wakeNote:
                 verdict === "findings"
                   ? `Review findings (round ${card.reviewRound + 1}):\n${body}\n\nFix them, then card_move to needs_review.`
-                  : moreWork
-                    ? Subtasks.nextStepNote("The review passed. ")
-                    : // A review start keeps the card's wake note so the reviewer reads it
-                      // (startCard). The verdict is where it has been read: without this it
-                      // came back in every later review brief.
-                      null,
+                  : earlierWork
+                    ? `The review${sha ? ` at ${sha}` : ""} passed. Tick your open subtasks (${Subtasks.subtaskIds(unfinishedWork)}) with subtask_done, then card_move to needs_review. Don't change code.`
+                    : moreWork
+                      ? Subtasks.nextStepNote("The review passed. ")
+                      : // A review start keeps the card's wake note so the reviewer reads it
+                        // (startCard). The verdict is where it has been read: without this it
+                        // came back in every later review brief.
+                        null,
               nudgedAt: null,
               movedAt: at,
               updatedAt: at,
