@@ -6226,6 +6226,66 @@ for (const replyMode of ["final", "tool"] as const) {
   }
 }
 
+const sharedPendingCases = (["final", "tool"] as const).flatMap(replyMode =>
+  (["nudge", "seed"] as const).flatMap(path =>
+    (["present", "owner-only", "unconfigured"] as const).map(files => ({ replyMode, path, files }))));
+
+test.each(sharedPendingCases)("shared OpenChamber keeps pending orders in their chat ($replyMode, $path, $files)", async ({ replyMode, path, files }) => {
+  const start = Date.parse("2026-09-10T12:00:00Z");
+  const root = mkdtempSync(join(tmpdir(), "spectrum-shared-pending-"));
+  directories.push(root);
+  const source = new OpenChamber("http://127.0.0.1:1", {}, files === "unconfigured" ? {} : { chatRoot: root });
+  const chats = [
+    { key: "dm:owner", slug: "owner", kind: "owner", title: "Owner" },
+    { key: "dm:moni", slug: "moni", kind: "dm", title: "Moni" },
+    { key: "group:dinner", slug: "group-dinner", kind: "group", title: "Dinner" },
+  ] satisfies ChatContext["chat"][];
+  const actual: Array<string | null> = [];
+  const expected: Array<string | null> = [];
+  for (const chat of chats) {
+    const folder = chat.kind === "owner" ? root : join(root, "chats", chat.slug);
+    mkdirSync(folder, { recursive: true });
+    if (files === "present" || chat.kind === "owner") writeFileSync(join(folder, "pending-orders.md"), `## Open\n- ${chat.slug}_ORDER`);
+  }
+  for (const chat of chats) {
+    setSystemTime(start);
+    const context: ChatContext = { chat, roleOf: () => ({ name: "Member", role: "admin" }), typing: () => false, react: async () => {} };
+    const h = setup(":memory:", { context, chatGuid: chat.key, replyMode, rotateAfterMs: 60_000, resetIdleMs: 60_000, watchMs: 0 });
+    h.backend.resets = path === "nudge";
+    // All routers share the same production legacy backend's folder lookup.
+    Object.assign(h.backend, { chatFolder: source.chatFolder.bind(source) });
+    h.backend.createBehavior = async () => {
+      const workdir = join(root, "2026-09-10", `session-${chat.slug}-${h.backend.creates.length}`);
+      mkdirSync(workdir, { recursive: true });
+      writeFileSync(join(workdir, "pending-orders.md"), "## Open\n- OWNER_SESSION_ORDER");
+      return { id: `ses_${h.backend.creates.length}`, directory: workdir };
+    };
+    h.input("first", "Robob, remember the blue one", { sender: "member" });
+    await h.router.tick();
+    h.backend.final(replyMode === "tool" ? "NO_REPLY" : "Noted, the blue one");
+    await h.router.tick();
+    for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent", `provider-${op.id}`);
+    setSystemTime(start + 60_000);
+    if (path === "seed") h.input("second", "Robob, which one did I pick?", { sender: "member" });
+    await h.router.tick();
+    if (path === "nudge") await h.router.tick();
+    const prompt = h.backend.prompts.at(-1)!;
+    expect(prompt.id).toBe(path === "nudge" ? "ses_1" : "ses_2");
+    const text = path === "nudge" ? prompt.text : prompt.system!;
+    expect(text).toContain(path === "nudge" ? rotateNudge(replyMode) : "Continuity:");
+    const marker = path === "nudge" ? "\n\nCopy this chat's pending-orders list" : "\n\nPending orders for this chat";
+    const at = text.indexOf(marker);
+    actual.push(at < 0 ? null : text.slice(at));
+    const order = files === "unconfigured" ? chat.kind === "owner" ? "OWNER_SESSION_ORDER" : null
+      : files === "present" || chat.kind === "owner" ? `${chat.slug}_ORDER` : null;
+    const quoted = "```\n## Open\n- " + order + "\n```";
+    expected.push(!order ? null : path === "nudge"
+      ? `\n\nCopy this chat's pending-orders list into your resume note word for word, under 'Pending orders (from pending-orders.md)':\nQuoted data from pending-orders.md:\n${quoted}`
+      : `\n\nPending orders for this chat (from pending-orders.md, quoted data):\n${quoted}`);
+  }
+  expect(actual).toEqual(expected);
+});
+
 test("a due context is refreshed by the agent itself once the chat goes quiet", async () => {
   const start = Date.parse("2026-09-10T12:00:00Z");
   setSystemTime(start);
