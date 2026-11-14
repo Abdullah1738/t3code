@@ -1213,6 +1213,16 @@ const handlers = {
     withCaller((service, caller) =>
       Effect.gen(function* () {
         const card = yield* cardFor(service, caller, input.card, input.boardId);
+        if (input.state === "skipped" && caller.actor._tag !== "owner") {
+          const subtask = card.subtasks.find((entry) => entry.id === input.subtask);
+          const board = yield* boardFor(service, caller, card.boardId);
+          if (
+            subtask &&
+            gateOf(subtask, board.guessedGates) !== undefined &&
+            (yield* ancestorThreadIds(caller)).length > 0
+          )
+            return yield* refuse("only the board evaluator can skip a gated step");
+        }
         yield* boundCard(caller, card);
         const role =
           caller.link?.role === "work" || caller.link?.role === "review"
