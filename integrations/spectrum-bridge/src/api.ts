@@ -313,7 +313,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const attachment = { sha256: createHash("sha256").update(data).digest("hex"), name, mimeType, size: data.length };
         const { id, created } = queueSession(store, "file", dedupeKey, sessionId, { text, attachment }, () => store.putBlob(data));
         // Durable queue acceptance only; upload and delivery happen outside this handler.
-        return json({ id, created }, created ? 202 : 200);
+        return json({ id, created, chat: "owner" }, created ? 202 : 200);
       }
 
       if (path === "/send") {
@@ -329,11 +329,11 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         // stale or conflicting request, keep their existing answer and never touch bounce state.
         const route = liveSendRoute(store, sessionId);
         const existing = sendReplay(store, dedupeKey, route, content);
-        if (existing) return json({ id: existing, created: false }, 200);
+        if (existing) return json({ id: existing, created: false, chat: "owner" }, 200);
         // A stored key with different content is a conflict, reported before any rule is applied.
         if (sendConflict(store, dedupeKey, route, content)) throw new ApiError(409);
         const early = reuseEarlyReply(store, dedupeKey, route, content);
-        if (early) return json({ id: early, created: false }, 200);
+        if (early) return json({ id: early, created: false, chat: "owner" }, 200);
         const hit = replyCheck?.(text);
         if (hit && mayBounce(store, turnKey)) {
           noteBounce(store, turnKey);
@@ -343,15 +343,15 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const operationId = `send:${hash(dedupeKey)}`;
         if (store.get<boolean>(`cancelledSend:${operationId}`)) throw new ApiError(409);
         // Folding can outlive this turn or overlap its replacement in the same session.
-        const turn = store.get<{ id: string; generation: number; inboundId?: string } | null>("activeTurn");
-        const attribution = { inboundId: turn?.id === route.id && turn.generation === route.generation ? turn.inboundId : undefined };
+        const turn = store.get<{ id: string; generation: number; inboundId?: string; replyInboundId?: string } | null>("activeTurn");
+        const attribution = { inboundId: turn?.id === route.id && turn.generation === route.generation ? turn.replyInboundId ?? turn.inboundId : undefined };
         let folded = text;
         try { folded = await foldText?.(text, operationId) ?? text; } catch { /* Optional folds never block a send. */ }
         const { id, created } = queueSession(store, "send", dedupeKey, sessionId, content, () => {
           if (liveSendRoute(store, sessionId).generation !== route.generation) throw new ApiError(409);
         }, { ...content, text: folded }, attribution);
         if (created) noteSent(store, turnKey, text);
-        return json({ id, created }, created ? 202 : 200);
+        return json({ id, created, chat: "owner" }, created ? 202 : 200);
       }
 
       if (path === "/wake") {

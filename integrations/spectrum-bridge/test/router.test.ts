@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { opencodeCompletedSteps } from "../src/opencode-steps.ts";
-import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
+import { afterEach, expect, mock, setSystemTime, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
@@ -17,6 +17,8 @@ import type { Message } from "@photon-ai/advanced-imessage/grpc";
 import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, pendingOrders, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, rotateNudge, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance } from "../src/router.ts";
 import { replyModeConfig } from "../src/config.ts";
 import { Store } from "../src/store.ts";
+import { Delivery } from "../src/delivery.ts";
+import { ReplyGapMonitor } from "../src/reply-gap.ts";
 import { recordsFromThread, RobobBackend, sentMessagePrefix } from "../src/robob.ts";
 import type { ControlMessage, ThreadDetail } from "../src/control.ts";
 import type { SttInput } from "../src/stt.ts";
@@ -528,12 +530,12 @@ test.each(earlySendCases)("/send reuses the early reply with $state delivery and
   const body = { text, dedupeKey: "manual-ack", sessionId: "ses_1@1" };
   const response = await post(body);
   expect(response.status).toBe(200);
-  expect(await response.json()).toEqual({ id, created: false });
+  expect(await response.json()).toEqual({ id, created: false, chat: "owner" });
   const replay = await post(body);
   expect(replay.status).toBe(200);
-  expect(await replay.json()).toEqual({ id, created: false });
+  expect(await replay.json()).toEqual({ id, created: false, chat: "owner" });
   // Different keys for the same turn still refer to the physical early row.
-  expect(await (await post({ ...body, dedupeKey: "manual-ack-again" })).json()).toEqual({ id, created: false });
+  expect(await (await post({ ...body, dedupeKey: "manual-ack-again" })).json()).toEqual({ id, created: false, chat: "owner" });
   for (const change of [{ text: "Changed." }, { subject: "A new subject" }, { effect: "confetti" }]) {
     expect((await post({ ...body, ...change })).status).toBe(409);
   }
@@ -543,7 +545,7 @@ test.each(earlySendCases)("/send reuses the early reply with $state delivery and
   await h.router.tick();
   expect(h.store.get("activeTurn")).toBeNull();
   // The send-key receipt remains idempotent after the active turn is gone.
-  expect(await (await post(body)).json()).toEqual({ id, created: false });
+  expect(await (await post(body)).json()).toEqual({ id, created: false, chat: "owner" });
   expect(h.store.db.query("SELECT count(*) AS n FROM outbox").get()).toEqual({ n: 1 });
 });
 
@@ -594,7 +596,7 @@ test.each([
   expect(h.conversations()).toHaveLength(2);
   const replay = await post();
   expect(replay.status).toBe(200);
-  expect(await replay.json()).toEqual({ id, created: false });
+  expect(await replay.json()).toEqual({ id, created: false, chat: "owner" });
   expect(h.conversations()).toHaveLength(2);
 });
 
@@ -835,7 +837,7 @@ test.each(["pending", "sent", "uncertain"])("same text queued through /send (%s)
   const repeated = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ text: "Checking.", dedupeKey: "another-send-key", sessionId: "ses_1" }) }));
   expect(repeated.status).toBe(200);
-  expect(await repeated.json()).toEqual({ id, created: false });
+  expect(await repeated.json()).toEqual({ id, created: false, chat: "owner" });
   h.backend.settle();
   await h.router.tick();
   expect(h.store.db.query("SELECT count(*) AS n FROM outbox").get()).toEqual({ n: 1 });
@@ -925,7 +927,7 @@ test("restart persists earlySent and does not resend a changed final record", as
   const response = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ text: " Checking. ", dedupeKey: "after-restart", sessionId: "ses_1@1" }) }));
   expect(response.status).toBe(200);
-  expect(await response.json()).toEqual({ id, created: false });
+  expect(await response.json()).toEqual({ id, created: false, chat: "owner" });
   first.content = [{ type: "text", text: "Checking. More text was appended." }];
   await router.tick();
   expect(restored.pendingOutbox()).toEqual([]);
@@ -7206,13 +7208,42 @@ test("tool mode: a text typed while a watcher wake runs is steered into it, not 
   expect(steers.map(call => [call.text, call.messageId])).toEqual([["Are you there?", messageId("typed")]]);
   expect(steers[0]!.guidance).toContain("Answer it with imessage_send");
   expect(inbounds(h.store).find(row => row.id === "typed")?.state).toBe("done");
-  expect(h.store.get("activeTurn")).toMatchObject({ inboundId: wake, typed: true });
+  expect(h.store.get("activeTurn")).toMatchObject({ inboundId: wake, typed: true, replyInboundId: "typed" });
   // The wake ends without a text: because someone typed into it, the agent is asked once whether that was meant.
   h.backend.final("Logged it.");
   await h.router.tick();
   await h.router.tick();
   expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), REPLY_NUDGE]);
   expect(nudgeRows(h.store)).toHaveLength(1);
+});
+
+test("gap monitoring attributes an accepted tool reply to the human steered into its watcher turn", async () => {
+  const h = toolSetup();
+  const at = Date.parse("2026-11-11T12:00:00Z");
+  setSystemTime(at);
+  steering(h.backend);
+  const notify = mock(async () => true);
+  const monitor = new ReplyGapMonitor(h.store, { chat: "owner", notify });
+  h.input(`wake:${"d".repeat(64)}`, wakeBody());
+  await h.router.tick();
+  h.input("human-steer", "Are you there?");
+  await h.router.tick();
+  await h.router.tick();
+  setSystemTime(at + 90_000);
+  const route = h.store.get<{ id: string; generation: number }>("route")!;
+  const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+  const response = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "Yes, here.", dedupeKey: "human-result", sessionId: route.id }) }));
+  expect(response.status).toBe(202);
+  const ack = await response.json() as { id: string };
+  expect(h.store.get<string>(`log-inbound-id:${ack.id}`)).toBe("human-steer");
+  const delivery = new Delivery(h.store, { sendText: async () => ({ providerId: "accepted" }) }, {
+    projectScope: "test", chat: "owner", enabled: () => true, chatGuid: () => options.chatGuid,
+  });
+  await delivery.tick();
+  await monitor.tick();
+  expect(notify).toHaveBeenCalledTimes(1);
 });
 
 test("tool mode: a watcher wake nobody typed into ends silently", async () => {
@@ -9400,4 +9431,134 @@ test("batched turn logging uses the first inbound row and preserves the backend 
     expect(logs.find(l => l.name === name)?.ids).toMatchObject({ inboundId: "batch-first-log", messageId: messageId("batch-first-log") });
   }
   expect(logs.find(l => l.name === "turn.start")?.props?.batchSize).toBe(2);
+});
+
+test.each(["pending", "sent"])("an uncertain human steer repairs %s replies after confirmed admission, even after health scanned them", async state => {
+  const h = toolSetup();
+  const at = Date.parse("2026-11-11T12:00:00Z");
+  setSystemTime(at);
+  const notify = mock(async () => true);
+  const monitor = new ReplyGapMonitor(h.store, { chat: "owner", notify });
+  const delivery = new Delivery(h.store, { sendText: async () => ({ providerId: "accepted" }) }, {
+    projectScope: "test", chat: "owner", enabled: () => true, chatGuid: () => options.chatGuid,
+  });
+  const wake = `wake:${"b".repeat(64)}`;
+  let replyId = "";
+  steering(h.backend, async call => {
+    h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+    setSystemTime(at + 90_000);
+    const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+      chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+    const response = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "Yes, here.", dedupeKey: "uncertain-steer-reply", sessionId: "ses_1" }) }));
+    expect(response.status).toBe(202);
+    replyId = (await response.json() as { id: string }).id;
+    expect(h.store.get<string>(`log-inbound-id:${replyId}`)).toBe(wake);
+    if (state === "sent") await delivery.tick();
+    await monitor.tick();
+    expect(notify).not.toHaveBeenCalled();
+    throw new Error("lost response after server committed the steer");
+  });
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  h.input("human-uncertain", "Are you there?");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.store.get<string>(`log-inbound-id:${replyId}`)).toBe("human-uncertain");
+  if (state === "pending") await delivery.tick();
+  setSystemTime(at + 120_000);
+  await monitor.tick();
+  expect(notify).toHaveBeenCalledTimes(1);
+  expect(h.store.getOperation(replyId)?.state).toBe("sent");
+  expect(h.store.db.query("SELECT key FROM kv WHERE key GLOB 'reply-gap-recheck:*'").all()).toEqual([]);
+});
+
+test("queued-steer settlement uses its saved admission marker and keeps earlier proactive sends synthetic", async () => {
+  const h = toolSetup();
+  const at = Date.parse("2026-11-11T12:00:00Z");
+  setSystemTime(at);
+  const notify = mock(async () => true);
+  const monitor = new ReplyGapMonitor(h.store, { chat: "owner", notify });
+  const steers = steering(h.backend, async () => {
+    if (steers.length === 1) throw new Error("lost response");
+    return "refused";
+  });
+  h.backend.promptBehavior = async call => {
+    if (!h.backend.records.some(record => record.id === call.messageId)) h.backend.accept(call);
+  };
+  const wake = `wake:${"c".repeat(64)}`;
+  h.input(wake, wakeBody());
+  await h.router.tick();
+  const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+  const send = async (text: string, dedupeKey: string) => {
+    const response = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text, dedupeKey, sessionId: "ses_1" }) }));
+    expect(response.status).toBe(202);
+    return (await response.json() as { id: string }).id;
+  };
+  const proactive = await send("Watcher status.", "before-human");
+  h.input("human-queued", "Are you there?");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.store.get<string>("batch-phase:human-queued")).toBe("queued-steer");
+  const committed = steers[0]!;
+  h.backend.records.push({ id: committed.messageId, type: "user", text: committed.text, time: { created: Date.now() } });
+  setSystemTime(at + 90_000);
+  const reply = await send("Yes, here.", "after-human");
+  h.backend.final("Both answered");
+  await h.router.tick();
+  expect(h.store.get<string>(`log-inbound-id:${proactive}`)).toBe(wake);
+  expect(h.store.get<string>(`log-inbound-id:${reply}`)).toBe("human-queued");
+  let accepted = 0;
+  const delivery = new Delivery(h.store, { sendText: async () => ({ providerId: `accepted-${++accepted}` }) }, {
+    projectScope: "test", chat: "owner", enabled: () => true, chatGuid: () => options.chatGuid,
+  });
+  await delivery.tick();
+  await monitor.tick();
+  expect(notify).toHaveBeenCalledTimes(1);
+});
+
+test.each([["wake:intervening", 2], ["secret:intervening", 1]] as const)("a retained steer keeps its source after %s becomes active", async (intervening, attempts) => {
+  const h = toolSetup();
+  const at = Date.parse("2026-11-11T12:00:00Z");
+  setSystemTime(at);
+  const originalRoot = `wake:${"e".repeat(64)}`;
+  const steers = steering(h.backend, async call => {
+    if (steers.length === 1) throw new Error("lost response");
+    h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+    return "steered";
+  });
+  h.input(originalRoot, wakeBody());
+  await h.router.tick();
+  h.input("human-retained", "Are you there?");
+  await h.router.tick();
+  const retained = h.store.get<{ inboundId: string; outbox: number }>("steer-attempt:human-retained")!;
+  expect(retained.inboundId).toBe(originalRoot);
+  // Persisted restart state after another synthetic turn took ownership while admission was unknown.
+  const current = h.store.get<object>("activeTurn")!;
+  h.input(intervening, "Another watcher update");
+  h.store.updateInbound(intervening, "done");
+  h.backend.records.push({ id: messageId(intervening), type: "user", text: "Another watcher update", time: { created: Date.now() } });
+  h.store.set("activeTurn", { ...current, inboundId: intervening, messageId: messageId(intervening), steered: [] });
+  const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+  const response = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "Watcher status.", dedupeKey: "intervening-status", sessionId: "ses_1" }) }));
+  expect(response.status).toBe(202);
+  const proactive = (await response.json() as { id: string }).id;
+  const resumed = new Router(h.store, h.backend, h.transport, { ...options, replyMode: "tool" });
+  await resumed.tick();
+  expect(steers).toHaveLength(attempts);
+  if (attempts === 1) {
+    expect(h.store.get<string>("batch-phase:human-retained")).toBe("queued-steer");
+    const original = steers[0]!;
+    h.backend.records.push({ id: original.messageId, type: "user", text: original.text, time: { created: Date.now() } });
+    h.backend.final("NO_REPLY");
+    await resumed.tick();
+    expect(steers).toHaveLength(1);
+    expect(inbounds(h.store).find(row => row.id === "human-retained")?.state).toBe("done");
+  }
+  expect(h.store.get<string>(`log-inbound-id:${proactive}`)).toBe(intervening);
+  expect(h.store.get(`reply-gap-recheck:${proactive}`)).toBeUndefined();
 });
