@@ -421,8 +421,18 @@ const postTargetFor = Effect.fn("KanbanTools.postTargetFor")(function* (
   cardRef: string | undefined,
   boardId?: string,
 ) {
-  if (explicit?.trim())
-    return { kind: "discussion" as const, id: KanbanDiscussionId.make(explicit.trim()) };
+  if (explicit?.trim()) {
+    const id = KanbanDiscussionId.make(explicit.trim());
+    if (isCardThread(caller)) {
+      const discussion = yield* service.discussion(id);
+      // Ownership applies to a card's own discussion; board channels keep their policy.
+      if (discussion.cardId) {
+        const { card } = yield* service.card(discussion.cardId);
+        yield* ownCard(caller, card);
+      }
+    }
+    return { kind: "discussion" as const, id };
+  }
   if (cardRef?.trim()) {
     const card = yield* cardFor(service, caller, cardRef, boardId, true);
     yield* ownCard(caller, card);
