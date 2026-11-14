@@ -12,7 +12,6 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tests._env import clean_env
 from offbox_lib import bases, identity, runs
 from test_capacity import Isolated
 
@@ -287,9 +286,9 @@ class CrpkoSetupTests(unittest.TestCase):
             target.write_text(source.read_text().replace('/usr/bin/ruby',str(self.bin/'ruby'))
                               .replace('/usr/local/bin',str(self.bin))
                               .replace('/usr/local/aws-cli',str(self.home/'aws-cli')))
-        self.env = clean_env(HOME=str(self.home), PATH=f'{self.bin}:/usr/bin:/bin',
+        # An enclosing offbox run exports shell functions and toolchain state as well as BASH_ENV.
+        self.env = dict(HOME=str(self.home), PATH=f'{self.bin}:/usr/bin:/bin',
                         OFFBOX_REPO_ROOT=str(self.root), OFFBOX_GNU_TIME=str(self.bin/'time'))
-        self.env.pop('BASH_ENV',None)
 
     def pin(self, version):
         self.workflow.write_text('steps:\n  - uses: hashicorp/setup-terraform@v3\n    with:\n'
@@ -853,6 +852,34 @@ class CrpkoSetupTests(unittest.TestCase):
         self.assertIn((TEMPLATES/'tools/crpko.sh').read_text(),body)
         self.assertEqual(body.count('OFFBOX_VECTOR_VERSION=0.50.0'),1)
         self.assertIn('offbox_crpko_tools\n',body)
+
+
+class RecipeFixtureEnvironmentTests(unittest.TestCase):
+    def test_enclosing_run_cannot_change_recipe_environment(self):
+        with tempfile.TemporaryDirectory() as outer:
+            startup = Path(outer) / 'bash-env'
+            startup.write_text('export PATH="$__offbox_toolchain_bin:$PATH"\n')
+            shim = str(Path(outer) / 'toolchain-commands')
+            inputs = {
+                'startup file': {'BASH_ENV': str(startup)},
+                'exported cd': {'BASH_FUNC_cd%%':
+                    '() { builtin cd "$@" && export PATH="$__offbox_toolchain_bin:$PATH"; }'},
+                'run state': {'OFFBOX_FIXTURE_AMBIENT': 'outer-run'},
+            }
+            for name, ambient in inputs.items():
+                with self.subTest(name=name), patch.dict(os.environ,
+                        dict(ambient, HOME=outer, __offbox_toolchain_bin=shim)):
+                    fixture = CrpkoSetupTests('test_repo_environment_does_not_prepend_a_box_node_path')
+                    try:
+                        fixture.setUp()
+                        fixture.test_repo_environment_does_not_prepend_a_box_node_path()
+                        result = fixture.run_setup(command='echo USER_COMMAND; '
+                            'printf "HOME=%s\\nAMBIENT=%s\\n" "$HOME" "${OFFBOX_FIXTURE_AMBIENT-}"')
+                        fixture.assert_ok(result)
+                        self.assertIn('HOME=' + str(fixture.home), result.stdout.splitlines())
+                        self.assertIn('AMBIENT=', result.stdout.splitlines())
+                    finally:
+                        fixture.doCleanups()
 
 
 class RepoKeyTests(Isolated):
