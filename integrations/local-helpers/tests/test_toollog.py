@@ -301,12 +301,20 @@ class ToolLogTests(unittest.TestCase):
     def test_ranking_thread_id_shapes(self):
         uuid = '393a4dd3-d1ca-468e-9367-7c1f1ba1bf32'
         cases = [(t, True) for t in [uuid, 'mcp:' + uuid, 'ardud-control:thread:' + uuid,
+            'ardud-control:thread:nightly-report', 'ardud-control:thread:request%3A2026%2F11',
+            'ardud-opencode-import:thread:ses_e288ff742ffeQTYTEXLuPR3WIO',
+            'import:codex:' + uuid, 'import:claudeAgent:session-id',
+            'thread:mcp:namespace:request%3Akey:0',
+            'thread:delegated-task:command%3Amcp%3Adelegate-task%3Arequest',
             'thread:project:7273c274-25cd-4aa6-8546-03e45da95f0e:' + uuid,
             'thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Ft3code-fork:' + uuid,
             'native:claude:' + uuid, 'native:opencode:ses_e288ff742ffeQTYTEXLuPR3WIO']]
         cases += [(t, False) for t in ['child', 'parent', 'leaf', 'new-fixture', '',
             'native:', 'thread:project:fixture:child', 'mcp:fixture', 'sha256:abcd',
-            uuid + '-suffix', 'prefix-' + uuid]]
+            uuid + '-suffix', 'prefix-' + uuid, 'ardud-control:thread:',
+            'ardud-opencode-import:thread:', 'ardud-opencode-import:thread:ses_',
+            'import::session', 'import:codex:', 'thread:mcp:namespace:key:child',
+            'thread:delegated-task:']]
         for thread, recognized in cases:
             with self.subTest(thread=thread):
                 result = self.hook_rollup([{'ids': {'threadId': thread},

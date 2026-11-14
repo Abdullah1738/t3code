@@ -322,7 +322,16 @@ def read(board, day, kind=None, name=None):
 
 
 _UUID = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
-_ROBOB_THREAD = re.compile(rf'(?:(?:mcp:|ardud-control:thread:)?{_UUID}|thread:project:[A-Za-z0-9_.:%-]+:{_UUID})\Z')
+_ENCODED_ID = r"[A-Za-z0-9_.%~!*'()-]+"
+# Control requests can use an encoded idempotency key instead of a UUID.
+# Imports and MCP-created children also have stable, non-UUID IDs.
+_ROBOB_THREAD = re.compile(
+    rf'(?:{_UUID}|mcp:{_UUID}|ardud-control:thread:{_ENCODED_ID}'
+    rf'|ardud-opencode-import:thread:ses_[A-Za-z0-9]+'
+    rf'|import:[A-Za-z0-9_.-]+:[A-Za-z0-9_.:%-]+'
+    rf'|thread:project:[A-Za-z0-9_.:%-]+:{_UUID}'
+    rf'|thread:mcp:{_ENCODED_ID}:{_ENCODED_ID}:[0-9]+'
+    rf'|thread:delegated-task:{_ENCODED_ID})\Z')
 
 
 def _hook_attempt(row):
@@ -598,16 +607,17 @@ def rollup(board, day, top_n=20):
                                      sorted(threads.items(), key=lambda x: (-x[1], x[0]))[:top_n]]
                                  for rule, threads in sorted(threads_by_rule.items())},
             'repeatLoops': loops,
-            'unattributedByRule': {rule: [
+            'topErrorTags': [{**({'tag': key[0], 'name': key[1]} if board == 'imessage' else {'tag': key}),
+                              'count': count, 'sampleId': samples.get(key, references[key])}
+                             for key, count in sorted(tags.items(), key=lambda x: (-x[1], x[0]))[:20]]}
+    if board == 'agent-tools':
+        result['unattributedByRule'] = {rule: [
                 {'threadId': thread, 'count': sum(counts.values()), 'attributed': False,
                  'denied': counts['denied'], 'rewritten': counts['rewritten'],
                  'sampled': (rule, thread) in sampled_unknown}
                 for (entry_rule, thread), counts in sorted(unattributed.items()) if entry_rule == rule]
-                for rule in sorted({rule for rule, _ in unattributed})},
-            'unrecognizedThreadIds': unrecognized,
-            'topErrorTags': [{**({'tag': key[0], 'name': key[1]} if board == 'imessage' else {'tag': key}),
-                              'count': count, 'sampleId': samples.get(key, references[key])}
-                             for key, count in sorted(tags.items(), key=lambda x: (-x[1], x[0]))[:20]]}
+                for rule in sorted({rule for rule, _ in unattributed})}
+        result['unrecognizedThreadIds'] = unrecognized
     if board == 'orders':
         result['durationsMs'] = {name: dict(values) for name, values in result['durationMsByName'].items()}
         if order_polls:
