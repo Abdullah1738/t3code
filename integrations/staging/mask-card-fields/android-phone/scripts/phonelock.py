@@ -68,7 +68,7 @@ def metadata_lock():
 
 def read_lease():
     try:
-        raw = LEASE.read_text()
+        raw = LEASE.read_bytes()
     except FileNotFoundError:
         return None, None
     try:
@@ -80,7 +80,7 @@ def read_lease():
             raise ValueError()
         lease['purpose'] = safe_purpose(lease['purpose'])
         return lease, raw
-    except (ValueError, TypeError, KeyError):
+    except (ValueError, TypeError, KeyError, UnicodeError):
         # Even a damaged claim cannot be live beyond the maximum lease lifetime
         # after its last write. Recent corruption stays busy, never stolen.
         modified = dt.datetime.fromtimestamp(LEASE.stat().st_mtime, dt.timezone.utc)
@@ -121,7 +121,7 @@ def write_temp(lease):
 def replace_checked(lease, raw):
     path = write_temp(lease)
     try:
-        if LEASE.read_text() != raw:
+        if LEASE.read_bytes() != raw:
             raise Busy('lease changed; yield')
         os.replace(path, LEASE)
     finally:
@@ -185,7 +185,7 @@ def release(owner, *, lease_id=None):
             return
         if lease.get('invalid') or lease['owner'] != owner or (lease_id is not None and lease.get('lease_id') != lease_id):
             raise Busy('lease is not yours')
-        if LEASE.read_text() != raw:
+        if LEASE.read_bytes() != raw:
             raise Busy('lease changed; yield')
         LEASE.unlink()
 

@@ -15,6 +15,7 @@ Speedups vs v1: keep-alive HTTP session (warmed during app start), one choice re
 fast settle (60 ms polls, label-only fingerprint so map animation is ignored), stale-check before tap.
 Safety: never taps labels matching BLOCK (Request/Order/Pay/...), stops on low confidence."""
 import subprocess, json, sys, time, re, pathlib, threading, os, fcntl, tempfile, xml.etree.ElementTree as ET
+import builtins
 import requests, uiautomator2 as u
 T0 = time.time()
 KEY = pathlib.Path('~/.config/opencode/openrouter-key').expanduser().read_text().strip()
@@ -35,6 +36,10 @@ def priority_check():
         print('PHONE_BUSY: ' + ('owner request holds the phone' if reason == phonelock.HOLD_REASON else reason))
         sys.exit(5)
 
+def phone_call(call, *args, **kwargs):
+    priority_check()
+    return call(*args, **kwargs)
+
 priority_check()
 HOLD.parent.mkdir(parents=True, exist_ok=True)
 _lock = (HOLD.parent / 'jevrun.lock').open('a')
@@ -45,22 +50,38 @@ _raw = open(sys.argv[1]).read()
 for _i, _a in enumerate(sys.argv[2:], 1):   # plan templating: {1}, {2} ... are replaced by extra CLI args
     _raw = _raw.replace("{%d}" % _i, json.dumps(_a)[1:-1])
 plan = json.load(__import__("io").StringIO(_raw))
+_typed_values = set()
+for step in plan['steps']:
+    if 'type' in step:
+        value = str(step['type'])
+        _typed_values.update(v for v in [value, *re.split(r"[\\\"'\r\n]+", value),
+                                       repr(value)[1:-1], json.dumps(value)[1:-1]] if v)
+
+def public_text(text):
+    for value in sorted(_typed_values, key=len, reverse=True):
+        text = text.replace(value, '[redacted input]')
+    return text
+
+def print(*values, **kwargs):
+    text = kwargs.pop('sep', ' ').join(str(v) for v in values)
+    builtins.print(public_text(text), **kwargs)
+
 APP = plan["app"]
 if APP == "com.talabat":   # Talabat retired by the owner 2026-11-07: never drive the app
     print("REFUSED: TALABAT_RETIRED: Talabat retired by owner 2026-11-07: never use Talabat again "
           "(no search, ordering, menus or app fallback). Use noon or Careem."); sys.exit(6)
 S = requests.Session(); S.headers.update({"Authorization": "Bearer " + KEY})
-d = u.connect("002473611000997")
+d = phone_call(u.connect, "002473611000997")
 def t(): return f"{time.time()-T0:5.1f}s"
 
 def elements():
     global d
     priority_check()
-    try: xml = d.dump_hierarchy(compressed=False)
+    try: xml = phone_call(d.dump_hierarchy, compressed=False)
     except Exception:                                   # stale uiautomator server: kill + reconnect once
         priority_check()
-        subprocess.run(["adb", "-s", "002473611000997", "shell", "pkill -f uiautomator; pkill -f com.wetest.uia2"], capture_output=True)
-        time.sleep(1); priority_check(); d = u.connect("002473611000997"); xml = d.dump_hierarchy(compressed=False)
+        phone_call(subprocess.run, ["adb", "-s", "002473611000997", "shell", "pkill -f uiautomator; pkill -f com.wetest.uia2"], capture_output=True)
+        time.sleep(1); priority_check(); d = phone_call(u.connect, "002473611000997"); xml = phone_call(d.dump_hierarchy, compressed=False)
     root = ET.fromstring(xml); out = []
     for n in root.iter("node"):
         a = n.attrib
@@ -167,7 +188,7 @@ def click(e):
                 print('HANDBACK: offset overlaps committing control'); sys.exit(2)
     if blocked(e['label']) or RID_BLOCK.search(e['rid']):
         print('HANDBACK: final/committing action blocked'); sys.exit(2)
-    d.click(e['x'], e['y'])
+    phone_call(d.click, e['x'], e['y'])
 
 # --- run -------------------------------------------------------------------
 def warm_connection():
@@ -180,8 +201,8 @@ def warm_connection():
 warm = threading.Thread(target=warm_connection)
 warm.start()
 if plan.get("restart"):
-    priority_check(); d.app_stop(APP)
-    priority_check(); d.app_start(APP, activity=plan.get("activity"))
+    priority_check(); phone_call(d.app_stop, APP)
+    priority_check(); phone_call(d.app_start, APP, activity=plan.get("activity"))
 ready = plan.get("ready")
 while ready and time.time() - T0 < 20:
     rl = [ready] if isinstance(ready, str) else ready
@@ -197,7 +218,7 @@ for i, st in enumerate(plan["steps"]):
         while True:
             tries += 1
             tj = time.time(); ch, pr, cs, c = decide(st["jev"], "; ".join(done) or "app just opened", els); cost += c; tj = time.time()-tj
-            top = " | ".join(f"{p:.2f} {(cs[int(k[1:])]['label'][:30] if k.startswith('e') else k)!r}" for k, p in pr[:3])
+            top = " | ".join(f"{p:.2f} {(public_text(cs[int(k[1:])]['label'])[:30] if k.startswith('e') else k)!r}" for k, p in pr[:3])
             p1 = pr[0][1]; p2 = 0
             if ch.startswith("e"):
                 c0 = cs[int(ch[1:])]
@@ -210,7 +231,7 @@ for i, st in enumerate(plan["steps"]):
             if ch in ("WAIT",) and tries < 6:
                 time.sleep(0.3); els = elements(); continue
             if ch == "BACK" and tries < 3:
-                priority_check(); prev = fp(els); d.press("back"); els = settle(prev); done.append("dismissed a popup with Back"); continue
+                priority_check(); prev = fp(els); phone_call(d.press, "back"); els = settle(prev); done.append("dismissed a popup with Back"); continue
             if not ch.startswith("e") or p1 < THR or p1 - p2 < MARGIN:
                 if tries < 5:                            # low confidence usually = still loading: re-read
                     time.sleep(0.4); els = elements(); continue
@@ -218,10 +239,10 @@ for i, st in enumerate(plan["steps"]):
             tgt = cs[int(ch[1:])]
             f = fresh(tgt)
             if not f:
-                print(f"{t()} step{i} stale target {tgt['label'][:40]!r}, re-deciding"); els = elements(); continue
+                print(f"{t()} step{i} stale target {public_text(tgt['label'])[:40]!r}, re-deciding"); els = elements(); continue
             prev = fp(els); click(f); ts = time.time(); els = settle(prev); ts = time.time()-ts
-            done.append(f"tapped '{tgt['label'][:40]}'")
-            print(f"{t()} step{i} tap {tgt['label'][:45]!r} p={p1:.2f} (+{time.time()-s0:.1f}s jev {tj:.1f} settle {ts:.1f}, tries {tries})  top3: {top}")
+            done.append(f"tapped '{public_text(tgt['label'])[:40]}'")
+            print(f"{t()} step{i} tap {public_text(tgt['label'])[:45]!r} p={p1:.2f} (+{time.time()-s0:.1f}s jev {tj:.1f} settle {ts:.1f}, tries {tries})  top3: {top}")
             break
     elif "type" in st:
         eds = [e for e in elements() if e["edit"]]
@@ -231,7 +252,7 @@ for i, st in enumerate(plan["steps"]):
         elif eds and not any(e["focused"] for e in eds):     # focus the (first/only) input ourselves
             click(eds[0]); time.sleep(0.3)
         priority_check(); prev = fp(els)
-        d.clear_text()
+        phone_call(d.clear_text)
         # React Native search fields can remount after clearing a prior query.
         # Refresh and refocus before pasting, rather than pasting into a stale field.
         els = settle(prev, 1)
@@ -241,10 +262,10 @@ for i, st in enumerate(plan["steps"]):
         if not target:
             print('HANDBACK: input disappeared after clearing'); sys.exit(3)
         if not target["focused"]: click(target)
-        priority_check(); d.send_keys(st["type"], clear=False); els = settle(fp(els), 3)
+        priority_check(); phone_call(d.send_keys, st["type"], clear=False); els = settle(fp(els), 3)
         ok = any(st["type"].lower() in e["label"].lower() for e in els if e["edit"])
-        done.append(f"typed '{st['type']}'")
-        print(f"{t()} step{i} typed {st['type']!r} readback={'ok' if ok else 'MISSING'} (+{time.time()-s0:.1f}s)")
+        done.append(f"typed {len(st['type'])} chars")
+        print(f"{t()} step{i} typed {len(st['type'])} chars readback={'ok' if ok else 'MISSING'} (+{time.time()-s0:.1f}s)")
         if not ok: sys.exit(3)
     elif "tap" in st:                      # deterministic: {"tap":"id=RID"} or {"tap":"visible text"}, waits up to 4 s
         q = st["tap"]; hit = None; tw = time.time()
@@ -256,11 +277,11 @@ for i, st in enumerate(plan["steps"]):
         if not hit: print(f"{t()} step{i} tap target {q!r} not found"); sys.exit(2)
         if st.get('offset'):
             hit = dict(hit, x=hit['x'] + st['offset'][0], y=hit['y'] + st['offset'][1], offset_target=True)
-        prev = fp(els); click(hit); els = settle(prev); done.append(f"tapped '{hit['label'][:40]}'")
+        prev = fp(els); click(hit); els = settle(prev); done.append(f"tapped '{public_text(hit['label'])[:40]}'")
         print(f"{t()} step{i} tap {q!r} (+{time.time()-s0:.1f}s)")
     elif "swipe" in st:
         priority_check(); prev = fp(elements())
-        d.swipe_ext(st['swipe'], scale=0.65); els = settle(prev)
+        phone_call(d.swipe_ext, st['swipe'], scale=0.65); els = settle(prev)
         print(f"{t()} step{i} swipe {st['swipe']}")
     elif "swipe_anchor" in st:
         screen = elements()
@@ -273,7 +294,7 @@ for i, st in enumerate(plan["steps"]):
             if any(e['bounds'][0] <= x <= e['bounds'][2] and e['bounds'][1] <= y <= e['bounds'][3]
                    and blocked(e['label']) for e in screen):
                 print('HANDBACK: swipe overlaps committing control'); sys.exit(2)
-        priority_check(); d.swipe(*points[0], *points[1], duration=0.4); els = settle(fp(screen))
+        priority_check(); phone_call(d.swipe, *points[0], *points[1], duration=0.4); els = settle(fp(screen))
         print(f'{t()} step{i} anchored swipe')
     elif "scroll_to" in st:
         for attempt in range(st.get('max_swipes', 5) + 1):
@@ -282,7 +303,7 @@ for i, st in enumerate(plan["steps"]):
             if attempt == st.get('max_swipes', 5):
                 print(f"{t()} HANDBACK: scroll target absent"); sys.exit(2)
             priority_check(); prev = fp(els)
-            d.swipe_ext(st.get('direction', 'up'), scale=0.65); els = settle(prev)
+            phone_call(d.swipe_ext, st.get('direction', 'up'), scale=0.65); els = settle(prev)
     elif "key" in st:                      # {"key":"enter"|"back"|...}
         if st['key'] not in ('enter', 'back', 'home'):
             print('HANDBACK: unsupported key'); sys.exit(2)
@@ -290,7 +311,7 @@ for i, st in enumerate(plan["steps"]):
             screen = elements()
             if not any(re.search(r'search', e['label'] + ' ' + e['rid'], re.I) for e in screen) or any(re.search(r'\b(send|message|reply|chat)\b', e['label'], re.I) for e in screen):
                 print('HANDBACK: Enter requires a search screen outside message UI'); sys.exit(2)
-        priority_check(); prev = fp(els); d.press(st["key"]); els = settle(prev); done.append(f"pressed {st['key']}")
+        priority_check(); prev = fp(els); phone_call(d.press, st["key"]); els = settle(prev); done.append(f"pressed {st['key']}")
         print(f"{t()} step{i} key {st['key']} (+{time.time()-s0:.1f}s)")
     elif "wait" in st:                     # {"wait":"text","secs":8}
         tw = time.time()
@@ -307,7 +328,7 @@ for i, st in enumerate(plan["steps"]):
     elif "shot" in st:                     # {"shot":"name"}: unique screenshot for the task model's final check
         priority_check(); out = pathlib.Path(os.environ.get('PH_TMP', '/private/var/folders/vt/8qndzr_j44z70bh0rn2zyfkm0000gn/T/opencode/phone'))
         out.mkdir(parents=True, exist_ok=True); path = out / f"{st['shot']}-{time.strftime('%H%M%S')}-{time.time_ns()%10**6}.png"
-        img = d.screenshot(); img.save(path); img.resize((540, img.height*540//img.width)).save(str(path).replace('.png', '-s.png'))
+        img = phone_call(d.screenshot); img.save(path); img.resize((540, img.height*540//img.width)).save(str(path).replace('.png', '-s.png'))
         print(f"{t()} step{i} SHOT {str(path).replace('.png', '-s.png')}")
     elif "verify_ocr" in st:
         tv = time.time()
@@ -315,7 +336,7 @@ for i, st in enumerate(plan["steps"]):
             priority_check()
             with tempfile.TemporaryDirectory(prefix='jevrun-ocr-') as tmp:
                 path = pathlib.Path(tmp) / 'screen.png'
-                d.screenshot().save(path)
+                phone_call(d.screenshot).save(path)
                 result = subprocess.run(['tesseract', str(path), 'stdout'], capture_output=True, text=True, timeout=15)
             text = ' '.join(result.stdout.lower().split())
             missing = [x for x in st['verify_ocr'] if ' '.join(x.lower().split()) not in text]
@@ -331,7 +352,7 @@ for i, st in enumerate(plan["steps"]):
         if APP != 'com.talabat':
             print('HANDBACK: calibrated chip verifier is Talabat-only'); sys.exit(4)
         for repeat in range(2):
-            screen = elements(); priority_check(); image = d.screenshot()
+            screen = elements(); priority_check(); image = phone_call(d.screenshot)
             for label, expected in st['verify_talabat_chips'].items():
                 hits = [e for e in screen if e['label'] == label]
                 state = talabat_chip_state(image, hits[0]['bounds']) if len(hits) == 1 else None

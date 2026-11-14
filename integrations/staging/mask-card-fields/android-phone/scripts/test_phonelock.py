@@ -9,6 +9,7 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import signal
+import threading
 import subprocess
 import sys
 import tempfile
@@ -116,9 +117,9 @@ class PhoneLockTests(unittest.TestCase):
         lock.release('holder', lease_id=successor['lease_id'])
 
     def test_recent_and_expired_corruption_class(self):
-        for raw in ['', '{"owner":', '{}', '{"owner":5}', '{"expires_at":"invalid"}']:
+        for raw in ['', '{"owner":', '{}', '{"owner":5}', '{"expires_at":"invalid"}', b'\xff', b'\xc3', b'\xff\xfe']:
             with self.subTest(raw=raw):
-                lock.LEASE.write_text(raw)
+                lock.LEASE.write_bytes(raw) if isinstance(raw, bytes) else lock.LEASE.write_text(raw)
                 self.assertFalse(lock.check(True)[0])
                 with self.assertRaises(lock.Busy): self.claim('other')
                 with self.assertRaises(lock.Busy): lock.release('unknown')
@@ -368,6 +369,52 @@ class PhoneLockTests(unittest.TestCase):
         with patch.object(os, 'readlink', side_effect=OSError):
             if sys.platform != 'darwin': self.assertEqual(ph.process_comm(1), 'unknown')
 
+    def test_lease_loss_during_final_join_cannot_return_success(self):
+        started, finish = threading.Event(), threading.Event()
+        original_join = threading.Thread.join
+        def refresh(*args, **kwargs):
+            started.set()
+            self.assertTrue(finish.wait(5))
+            lock.release('runner')
+            lock.acquire('successor', 'qa')
+            raise lock.Busy('lease changed; yield')
+        def join(worker, *args, **kwargs):
+            finish.set()
+            return original_join(worker, *args, **kwargs)
+        child = Mock(pid=999999)
+        def wait(**kwargs):
+            self.assertTrue(started.wait(5))
+            return 0
+        child.wait.side_effect = wait
+        child.poll.return_value = 0
+        out = io.StringIO()
+        with patch.object(ph.subprocess, 'Popen', return_value=child), patch.object(lock, 'refresh', side_effect=refresh), patch.object(threading.Thread, 'join', join), patch.object(ph.os, 'killpg'), contextlib.redirect_stdout(out):
+            self.assertEqual(ph.lease_run('runner', 'qa', 1, ['dummy']), 5)
+        self.assertIn('PHONE_BUSY:', out.getvalue())
+        self.assertEqual(lock.status()['lease_owner'], 'successor')
+
+    def test_jevrun_private_labels_are_masked_before_truncating(self):
+        source = Path(__file__).with_name('jevrun.py').read_text()
+        node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name=='public_text')
+        secret = 'PRIVATE-CANARY-'*10
+        scope = dict(_typed_values={secret})
+        exec(compile(ast.Module(body=[node], type_ignores=[]), '<public>', 'exec'), scope)
+        label = 'input field (current value: '+secret+')'
+        self.assertNotIn('PRI', scope['public_text'](label)[:30])
+
+    def test_jevrun_device_call_class_refuses_new_claims(self):
+        source = Path(__file__).with_name('jevrun.py').read_text()
+        functions = [n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name in ('priority_check', 'phone_call')]
+        scope = dict(phonelock=lock, sys=sys)
+        exec(compile(ast.Module(body=functions, type_ignores=[]), '<calls>', 'exec'), scope)
+        self.claim()
+        for method in ('click', 'press', 'clear_text', 'send_keys', 'swipe', 'swipe_ext', 'app_start', 'app_stop', 'screenshot', 'dump_hierarchy', 'connect', 'adb_reset'):
+            with self.subTest(method=method):
+                rpc = Mock()
+                with self.assertRaises(SystemExit) as exc: scope['phone_call'](rpc, 'private-input')
+                self.assertEqual(exc.exception.code, 5)
+                rpc.assert_not_called()
+
     def test_jevrun_priority_and_import_from_other_cwd(self):
         source = Path(__file__).with_name('jevrun.py').read_text()
         node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == 'priority_check')
@@ -483,6 +530,39 @@ class LeaseRunTests(unittest.TestCase):
         self.assertNotIn('PRIVATE_ARGV_CANARY', result.stdout)
         self.assertNotIn('private input', result.stdout)
         self.assertNotIn('unknown', result.stdout)
+
+    def test_jevrun_typing_and_followup_summary_do_not_echo_private_input(self):
+        script = str(Path(__file__).with_name('jevrun.py'))
+        bootstrap = """
+import pathlib, runpy, sys, types, time, xml.etree.ElementTree as ET
+from unittest.mock import patch
+original_read = pathlib.Path.read_text
+patch.object(pathlib.Path, 'read_text', lambda p,*a,**kw: 'dummy' if p.name=='openrouter-key' else original_read(p,*a,**kw)).start()
+clock=[0.0]
+time.time=lambda:clock[0]
+time.sleep=lambda seconds:clock.__setitem__(0,clock[0]+seconds)
+class Device:
+    value=''
+    def dump_hierarchy(self, **kwargs):
+        root=ET.Element('hierarchy')
+        ET.SubElement(root,'node',text=self.value,package='dev.fixture',bounds='[0,0][20,20]',focused='true', **{'class':'android.widget.EditText'})
+        return ET.tostring(root,encoding='unicode')
+    def clear_text(self): self.value=''
+    def send_keys(self,text,**kwargs): self.value=text
+sys.modules['requests']=types.SimpleNamespace(Session=lambda:types.SimpleNamespace(headers={}))
+sys.modules['uiautomator2']=types.SimpleNamespace(connect=lambda *a:Device())
+runpy.run_path(sys.argv[1],run_name='__main__')
+"""
+        for secret in ['PRIVATE-PLAIN-CANARY', 'PRIVATE\'QUOTE\"TAIL', 'PRIVATE-LINE-ONE\nPRIVATE-LINE-TWO', 'سري-اختبار']:
+            with self.subTest(secret=secret):
+                plan = self.root/'plan.json'
+                plan.write_text(json.dumps(dict(app='dev.fixture', steps=[{'type':secret},{'print':'.'}])))
+                code = bootstrap.replace("runpy.run_path(sys.argv[1],run_name='__main__')", "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')")
+                result = subprocess.run([sys.executable,'-I','-c',code,script,str(plan)], env=self.env,cwd=self.root,capture_output=True,text=True,timeout=15)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertIn('readback=ok',result.stdout)
+                for fragment in secret.replace('\"','\n').replace("'",'\n').splitlines():
+                    self.assertNotIn(fragment,result.stdout)
 
     def test_jevrun_subprocess_from_other_cwd(self):
         (self.root/'priority-hold').write_text(HOLD_TOKEN)

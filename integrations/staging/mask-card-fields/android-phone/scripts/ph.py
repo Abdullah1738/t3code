@@ -579,6 +579,8 @@ def lease_run(owner, purpose, ttl, args):
                 if received and time.monotonic() - received[0][1] >= 2:
                     try: os.killpg(child.pid, signal.SIGKILL)
                     except ProcessLookupError: pass
+        stop.set()
+        worker.join()
         if lost_claim:
             refuse(lost_claim[0])
             return 5

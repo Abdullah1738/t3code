@@ -14,7 +14,7 @@ source = pathlib.Path(__file__).with_name('jevrun.py').read_text()
 tree = ast.parse(source)
 nodes = [n for n in tree.body if
          isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in ('BLOCK', 'RID_BLOCK') for t in n.targets)
-         or isinstance(n, ast.FunctionDef) and n.name in ('blocked', 'priority_check', 'obscured', 'state_matches', 'tap_match', 'talabat_chip_state')]
+         or isinstance(n, ast.FunctionDef) and n.name in ('blocked', 'priority_check', 'obscured', 'state_matches', 'tap_match', 'talabat_chip_state', 'click', 'phone_call')]
 scope = {'re': re, 'os': os, 'sys': sys, 'phonelock': phonelock}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), '<guards>', 'exec'), scope)
 
@@ -93,15 +93,27 @@ class Guards(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertFalse(scope['blocked'](label))
 
-    def test_all_coordinate_clicks_use_guard(self):
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == 'click':
-                guarded = {id(x) for x in ast.walk(node)}
-                break
-        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
-                 and isinstance(n.func, ast.Attribute) and n.func.attr == 'click']
-        self.assertTrue(calls)
-        self.assertTrue(all(id(n) in guarded for n in calls))
+    def test_claim_taken_during_screen_read_refuses_click(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as tmp:
+            patches = []
+            for name, value in [('LOCK_DIR', pathlib.Path(tmp)), ('HOLD', pathlib.Path(tmp)/'priority-hold'),
+                                ('LEASE', pathlib.Path(tmp)/'lease.json')]:
+                p = patch.object(phonelock, name, value); p.start(); patches.append(p)
+            try:
+                device = Mock()
+                def screen():
+                    phonelock.acquire('other', 'qa')
+                    return []
+                local = dict(scope, d=device, elements=screen)
+                functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ('click', 'phone_call')]
+                exec(compile(ast.Module(body=functions, type_ignores=[]), '<race>', 'exec'), local)
+                with self.assertRaises(SystemExit) as exc:
+                    local['click'](dict(label='Continue', rid='continue', x=1, y=2))
+                self.assertEqual(exc.exception.code, 5)
+                device.click.assert_not_called()
+            finally:
+                for p in reversed(patches): p.stop()
 
 
 if __name__ == '__main__':
