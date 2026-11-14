@@ -14,7 +14,7 @@ import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type P
 type Assistant = Extract<MessageRecord, { type: "assistant" }>;
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import type { Message } from "@photon-ai/advanced-imessage/grpc";
-import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, pendingOrders, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, rotateNudge, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance } from "../src/router.ts";
+import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, OUTAGE_NOTICE_AFTER_MS, pendingOrders, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, rotateNudge, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance } from "../src/router.ts";
 import { replyModeConfig } from "../src/config.ts";
 import { Store } from "../src/store.ts";
 import { Delivery } from "../src/delivery.ts";
@@ -2292,6 +2292,210 @@ test("synthetic rows never get resend notices from interrupted or failed starts"
 
 const outageText = "I'm having a technical problem; I'll answer this as soon as I'm back.";
 
+test.each(["prompt", "preparation", "rebuild"] as const)("a held %s accepted four minutes after receipt sends no outage notice and logs the deferral once", async kind => {
+  const logs: { batchId: string; heldMs: number; chat: string }[] = [];
+  const h = setup(":memory:", { log: (event, data) => { if (event === "outage-notice-deferred") logs.push(JSON.parse(data!)); } });
+  const start = Date.parse("2026-11-14T05:40:43Z");
+  setSystemTime(start);
+  if (kind === "preparation") h.backend.createBehavior = async () => { throw new Error("offline"); };
+  else h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "Question");
+  await h.router.tick();
+  for (const offset of [60_000, 120_000]) { setSystemTime(start + offset); await h.router.tick(); }
+  if (kind === "rebuild") {
+    h.store.set("resendBody", null);
+    setSystemTime(start + 125_000);
+    await h.router.tick();
+  }
+  setSystemTime(start + (kind === "rebuild" ? 185_000 : 180_000));
+  await h.router.tick();
+  h.backend.promptBehavior = undefined;
+  h.backend.createBehavior = undefined;
+  setSystemTime(start + 240_000);
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "first")?.state).toBe("done");
+  h.backend.final("Answer");
+  await h.router.tick();
+  setSystemTime(start + OUTAGE_NOTICE_AFTER_MS);
+  await h.router.tick();
+  expect(h.controls()).toEqual([]);
+  expect(logs).toEqual([{ chat: "imessage", batchId: "first", heldMs: 240_000 }]);
+});
+
+test.each(["prompt", "preparation", "rebuild"] as const)("a held %s notices once at ten minutes across a restart, preserving minute replay pacing", async kind => {
+  const h = setup();
+  const start = Date.parse("2026-11-14T05:40:43Z");
+  setSystemTime(start);
+  if (kind === "preparation") h.backend.createBehavior = async () => { throw new Error("offline"); };
+  else h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "First question");
+  h.input("second", "Second question");
+  await h.router.tick();
+  for (const offset of [60_000, 120_000]) { setSystemTime(start + offset); await h.router.tick(); }
+  if (kind === "rebuild") {
+    h.store.set("resendBody", null);
+    setSystemTime(start + 180_000);
+    await h.router.tick();
+    setSystemTime(start + 240_000);
+    await h.router.tick();
+  }
+  expect(h.store.get("deliveryOutage")).toMatchObject({ noticeAt: start + OUTAGE_NOTICE_AFTER_MS, noticed: false });
+  setSystemTime(start + 6 * 60_000);
+  const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  await restarted.tick();
+  expect(h.controls()).toEqual([]);
+  const attempts = () => kind === "preparation" ? h.backend.creates.length : h.backend.prompts.length;
+  const before = attempts();
+  setSystemTime(start + 6 * 60_000 + 30_000);
+  await restarted.tick();
+  expect(attempts()).toBe(before);
+  setSystemTime(start + 7 * 60_000);
+  await restarted.tick();
+  expect(attempts()).toBe(before + 1);
+  setSystemTime(start + OUTAGE_NOTICE_AFTER_MS - 1);
+  await restarted.tick();
+  expect(h.controls()).toEqual([]);
+  const lastReplayAt = h.store.get<{ replayAt: number }>("deliveryOutage")!.replayAt;
+  setSystemTime(start + OUTAGE_NOTICE_AFTER_MS);
+  await restarted.tick();
+  expect(h.controls().map(op => [op.text, op.replyTo])).toEqual([[outageText, "first"]]);
+  expect(h.store.get("deliveryOutage")).toMatchObject({ noticed: true, replayAt: lastReplayAt });
+  const after = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  setSystemTime(start + OUTAGE_NOTICE_AFTER_MS + 120_000);
+  await after.tick();
+  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+});
+
+test.each(["earlier", "missing"] as const)("outage notice uses the inbound receipt clock (%s receipt)", async receipt => {
+  const h = setup();
+  const start = Date.parse("2026-11-14T05:40:43Z");
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "Question", { receivedAt: receipt === "earlier" ? start - 120_000 : undefined });
+  await h.router.tick();
+  if (receipt === "missing") h.store.db.query("UPDATE inbound SET payload = json_remove(payload, '$.receivedAt') WHERE id = ?").run("first");
+  for (const offset of [60_000, 120_000]) { setSystemTime(start + offset); await h.router.tick(); }
+  const due = (receipt === "earlier" ? start - 120_000 : start + 120_000) + OUTAGE_NOTICE_AFTER_MS;
+  expect(h.store.get("deliveryOutage")).toMatchObject({ noticeAt: due });
+  setSystemTime(due - 1);
+  await h.router.tick();
+  expect(h.controls()).toEqual([]);
+  setSystemTime(due);
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+});
+
+test("a rebuilt held batch still awaiting acceptance keeps its original notice deadline", async () => {
+  const h = setup();
+  const start = Date.parse("2026-11-14T05:40:43Z");
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "Question");
+  await h.router.tick();
+  for (const offset of [60_000, 120_000]) { setSystemTime(start + offset); await h.router.tick(); }
+  h.store.set("resendBody", null);
+  setSystemTime(start + OUTAGE_NOTICE_AFTER_MS - 10_000);
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ phase: "unknown" });
+  expect(h.controls()).toEqual([]);
+  setSystemTime(start + OUTAGE_NOTICE_AFTER_MS);
+  await h.router.tick();
+  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+});
+
+test.each(["prompt", "preparation"] as const)("/new cancels a held %s notice and the next held text gets its own deadline", async kind => {
+  const deferred: string[] = [];
+  const h = setup(":memory:", { log: (event, data) => { if (event === "outage-notice-deferred") deferred.push(JSON.parse(data!).batchId); } });
+  const start = Date.parse("2026-11-14T05:40:43Z");
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  if (kind === "preparation") h.backend.createBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "Cancelled question");
+  await h.router.tick();
+  for (const offset of [60_000, 120_000]) { setSystemTime(start + offset); await h.router.tick(); }
+  setSystemTime(start + 240_000);
+  h.backend.createBehavior = undefined;
+  h.input("reset", "/new");
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "first")?.state).toBe("cancelled");
+  expect(h.store.get("deliveryOutage")).toBeNull();
+  h.input("second", "New question");
+  await h.router.tick();
+  for (const offset of [300_000, 360_000, OUTAGE_NOTICE_AFTER_MS]) { setSystemTime(start + offset); await h.router.tick(); }
+  expect(h.controls().filter(op => op.text === outageText)).toEqual([]);
+  setSystemTime(start + 240_000 + OUTAGE_NOTICE_AFTER_MS);
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.controls().filter(op => op.text === outageText).map(op => op.replyTo)).toEqual(["second"]);
+  expect(deferred).toEqual(["first"]);
+});
+
+test("a pending outage notice survives closing and reopening the database at six minutes", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "spectrum-outage-restart-"));
+  directories.push(directory);
+  const path = join(directory, "store.sqlite");
+  const h = setup(path);
+  const start = Date.parse("2026-11-14T05:40:43Z");
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "Question");
+  await h.router.tick();
+  for (const offset of [60_000, 120_000]) { setSystemTime(start + offset); await h.router.tick(); }
+  h.store.close();
+  const reopened = new Store(path);
+  stores.push(reopened);
+  const restarted = new Router(reopened, h.backend, h.transport, h.routerOptions);
+  for (const offset of [360_000, OUTAGE_NOTICE_AFTER_MS - 1]) {
+    setSystemTime(start + offset);
+    await restarted.tick();
+    expect(reopened.pendingOutbox()).toEqual([]);
+  }
+  for (const offset of [OUTAGE_NOTICE_AFTER_MS, OUTAGE_NOTICE_AFTER_MS + 60_000]) {
+    setSystemTime(start + offset);
+    await restarted.tick();
+    expect(reopened.pendingOutbox().map(op => op.text)).toEqual([outageText]);
+  }
+});
+
+test.each((["final", "tool"] as const).flatMap(replyMode => ["unavailable", "absent"].map(read => ({ replyMode, read }))))("poll admission suppresses the due outage notice after an $read acceptance read ($replyMode)", async ({ replyMode, read }) => {
+  const deferred: string[] = [];
+  const h = setup(":memory:", { replyMode, log: (event, data) => { if (event === "outage-notice-deferred") deferred.push(JSON.parse(data!).batchId); } });
+  const start = Date.parse("2026-11-14T05:40:43Z");
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "Question");
+  await h.router.tick();
+  for (const offset of [60_000, 120_000]) { setSystemTime(start + offset); await h.router.tick(); }
+  setSystemTime(start + OUTAGE_NOTICE_AFTER_MS - 1_000);
+  h.backend.accept(h.backend.prompts[0]!);
+  h.backend.promptAccepted = async () => {
+    if (read === "unavailable") throw new Error("acceptance read unavailable");
+    return false;
+  };
+  setSystemTime(start + OUTAGE_NOTICE_AFTER_MS);
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "first")?.state).toBe("done");
+  expect(h.controls()).toEqual([]);
+  expect(deferred).toEqual(["first"]);
+});
+
+test("an outage persisted by an older build does not enqueue its notice again", async () => {
+  const h = setup();
+  const start = Date.parse("2026-11-14T05:40:43Z");
+  setSystemTime(start);
+  h.backend.promptBehavior = async () => { throw new Error("offline"); };
+  h.input("first", "Question");
+  await h.router.tick();
+  for (const offset of [60_000, 120_000]) { setSystemTime(start + offset); await h.router.tick(); }
+  const outage = h.store.get<{ id: string; probeAt: number }>("deliveryOutage")!;
+  h.store.enqueue({ id: outage.id, kind: "control", text: outageText, replyTo: "first" });
+  h.store.set("deliveryOutage", { id: outage.id, probeAt: outage.probeAt });
+  setSystemTime(start + OUTAGE_NOTICE_AFTER_MS);
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(h.store.get("deliveryOutage")).toMatchObject({ noticed: true });
+  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+});
+
 test.each(["final", "tool"] as const)("unaccepted sealed batch retries once, notices once, then replays before newer messages (%s)", async replyMode => {
   const id = "owner";
   const events: string[] = [];
@@ -2311,7 +2515,7 @@ test.each(["final", "tool"] as const)("unaccepted sealed batch retries once, not
   expect(h.backend.singleReads.map(read => read[2])).toContain(messageId(id));
   setSystemTime(start + 2 * ACCEPT_WAIT_MS);
   await h.router.tick();
-  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+  expect(h.controls()).toEqual([]);
   expect(h.store.get("activeTurn")).toMatchObject({ phase: "held" });
   h.input("second", "Second question");
   h.input("third", "Third question");
@@ -2340,7 +2544,7 @@ test.each(["final", "tool"] as const)("unaccepted sealed batch retries once, not
   expect(h.conversations().map(op => op.text)).toEqual(["First answer"]);
   expect(h.backend.prompts[4]!.text).toBe("Second question\nThird question");
   if (replyMode === "tool") expect(h.conversations().every(op => op.id.startsWith("send:"))).toBe(true);
-  expect(events).toEqual(["retry", "notice", "replay", "replay"]);
+  expect(events).toEqual(["retry", "replay", "notice", "replay"]);
   expect(h.controls().some(op => /didn't catch|resend|sending it again/i.test(op.text))).toBe(false);
 });
 
@@ -2448,7 +2652,7 @@ test.each(["final", "tool"] as const)("route creation failure keeps the sealed b
   expect(h.backend.creates).toHaveLength(2);
   setSystemTime(start + 120_000);
   await restarted.tick();
-  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+  expect(h.controls()).toEqual([]);
   h.input("later", "Newer question");
   h.backend.healthy = true;
   h.backend.createBehavior = undefined;
@@ -2474,13 +2678,13 @@ test.each((["final", "tool"] as const).flatMap(replyMode => ["before-retry", "af
   h.input("member", "Two");
   await h.router.tick();
   if (when !== "before-retry") { setSystemTime(start + ACCEPT_WAIT_MS); await h.router.tick(); }
-  if (when === "after-notice") { setSystemTime(start + 2 * ACCEPT_WAIT_MS); await h.router.tick(); }
+  if (when === "after-notice") { setSystemTime(start + OUTAGE_NOTICE_AFTER_MS); await h.router.tick(); }
   h.store.updateInbound("first", "failed");
   h.store.updateInbound("member", "failed");
   if (when === "legacy-failed-turn") h.store.set("activeTurn", { ...h.store.get<object>("activeTurn"), phase: "failed" });
   h.backend.accept(h.backend.prompts[0]!);
   const sends = h.backend.prompts.length;
-  setSystemTime(start + 3 * ACCEPT_WAIT_MS);
+  setSystemTime(start + (when === "after-notice" ? OUTAGE_NOTICE_AFTER_MS + ACCEPT_WAIT_MS : 3 * ACCEPT_WAIT_MS));
   await h.router.tick();
   expect(h.backend.prompts).toHaveLength(sends);
   expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "done"]);
@@ -2529,7 +2733,7 @@ test("watchdog notices even when normal poll reads fail, and never retries an un
   h.backend.promptAccepted = async () => { throw new Error("offline"); };
   h.backend.messagesBehavior = async () => { throw new Error("offline"); };
   h.backend.permissionBehavior = async () => { throw new Error("offline"); };
-  for (const offset of [60_000, 120_000, 180_000]) { setSystemTime(start + offset); await h.router.tick(); }
+  for (const offset of [60_000, 120_000, 180_000, OUTAGE_NOTICE_AFTER_MS]) { setSystemTime(start + offset); await h.router.tick(); }
   expect(h.backend.prompts).toHaveLength(1);
   expect(h.controls().map(op => op.text)).toEqual([outageText]);
   expect(inbounds(h.store)[0]!.state).toBe("processing");
@@ -2563,7 +2767,7 @@ test("healthy API keeps replay attempts paced until sends recover without a heal
   h.backend.healthy = true;
   for (const offset of [125_000, 130_000, 135_000]) { setSystemTime(start + offset); await h.router.tick(); }
   expect(h.backend.prompts).toHaveLength(3);
-  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+  expect(h.controls()).toEqual([]);
   h.backend.promptBehavior = undefined;
   setSystemTime(start + 185_000);
   await h.router.tick();
@@ -2593,7 +2797,7 @@ test.each(["prompt", "preparation"])("failed %s replay survives restart and reco
   setSystemTime(start + 190_000);
   await restarted.tick();
   expect(inbounds(h.store).find(row => row.id === "first")?.state).toBe("done");
-  expect(h.controls().map(op => op.text)).toEqual([outageText]);
+  expect(h.controls()).toEqual([]);
   h.backend.final("First answer");
   await restarted.tick();
   expect(h.backend.prompts.at(-1)!.text).toBe("Later");

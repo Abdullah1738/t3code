@@ -412,6 +412,8 @@ const ERRORED_RETRY_MS = 120_000;
 const DROPPED_BATCH_MS = 10 * 60_000;
 /** One idempotent retry, then hold the batch until the route can accept it. */
 export const ACCEPT_WAIT_MS = 60_000;
+// Robob stalls of 1–5 minutes resolve on replay; early notices caused nine false alarms in three days by 14 Nov.
+export const OUTAGE_NOTICE_AFTER_MS = 10 * 60_000;
 /**
  * How long a backend read may take before the tick moves on. A slow backend is
  * not a dead one: on 12 Nov 2026 Robob answered thread reads in 2-25 s, the old
@@ -427,7 +429,7 @@ export const SEND_WAIT_MS = 90_000;
 /** A control (/new, an answer) waiting to be handled is not kept behind one backend call longer than this. */
 const CONTROL_WAIT_MS = 10_000;
 const OUTAGE_TEXT = "I'm having a technical problem; I'll answer this as soon as I'm back.";
-type Outage = { id: string; probeAt: number; replayAt?: number };
+type Outage = { id: string; batchId: string; noticeAt: number; noticed: boolean; probeAt: number; replayAt?: number };
 type PreparingDelivery = {
   id: string; startedAt: number; attemptAt: number; attempt: number; held?: boolean;
   /** Rebuilt from a turn that was already POSTed: its members are fixed, so it is never unsealed. */
@@ -1046,7 +1048,7 @@ export class Router {
       if (attempted) this.logTurnEnd(attempted, "failed");
       if (active?.inboundId === id) this.setTurn({ ...active, phase: "failed" });
       if (this.store.get<ResendBody | null>("resendBody")?.inboundId === id) this.store.set("resendBody", null);
-      if (preparing?.id === id || active?.inboundId === id) this.store.set("deliveryOutage", null);
+      if (preparing?.id === id || active?.inboundId === id) this.clearDeliveryOutage();
     }).immediate();
     return true;
   }
@@ -1388,7 +1390,7 @@ export class Router {
   private landed(turn: Turn): void {
     if (!turn.background) this.store.set("deferredNotice", null);
     this.store.set("resendBody", null);
-    this.store.set("deliveryOutage", null);
+    this.clearDeliveryOutage();
     if (turn.inboundId) {
       this.delivered(turn.inboundId);
       this.store.set(`steer-attempt:${turn.inboundId}`, null);
@@ -1477,6 +1479,7 @@ export class Router {
       }
       const beforePoll = this.store.get<Turn | null>("activeTurn");
       await this.poll();
+      this.flushOutageNotice();
       const afterPoll = this.store.get<Turn | null>("activeTurn");
       // A completion can expose a late acceptance or release a sealed steer for its own turn.
       // Revisit only a changed target, so an uncertain POST is never repeated twice in one tick.
@@ -2353,6 +2356,7 @@ export class Router {
         this.store.set(`batch-phase:${preparing.id}`, null);
       }
       this.store.set("preparingDelivery", null);
+      this.clearDeliveryOutage();
       this.store.set("pendingApprovals", null);
       this.store.set("watermark", null);
     }).immediate();
@@ -3749,12 +3753,48 @@ export class Router {
     this.options.log?.("delivery-watchdog", JSON.stringify({ decision, chat: this.options.context?.chat.slug ?? "imessage", batchId: turn.inboundId, promptId: turn.messageId }));
   }
 
-  private outageNotice(id: string): void {
-    if (this.store.get<Outage | null>("deliveryOutage")) return;
-    const notice = `outage:${hash(id)}`;
-    this.store.set("deliveryOutage", { id: notice, probeAt: Date.now() } satisfies Outage);
-    this.store.enqueue({ id: notice, kind: "control", text: OUTAGE_TEXT, ...this.replyTarget(id) });
-    this.watchdogLog("notice", { inboundId: id, messageId: `msg_${hash(id)}` });
+  private outageNotice(id: string, probeAt = Date.now()): Outage {
+    const stored = this.store.get<Outage | null>("deliveryOutage");
+    if (stored?.noticeAt !== undefined && stored.noticed !== undefined) return stored;
+    const row = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
+    const receivedAt = row ? (JSON.parse(row.payload) as NormalizedInbound).receivedAt : undefined;
+    const notice = stored?.id ?? `outage:${hash(id)}`;
+    const outage: Outage = {
+      ...stored, id: notice, batchId: id,
+      noticeAt: (receivedAt !== undefined && Number.isSafeInteger(receivedAt) && receivedAt >= 0 ? receivedAt : Date.now()) + OUTAGE_NOTICE_AFTER_MS,
+      // Older builds queued the notice when creating the outage record.
+      noticed: this.store.getOperation(notice) !== undefined,
+      probeAt: stored?.probeAt ?? probeAt,
+    };
+    this.store.set("deliveryOutage", outage);
+    return outage;
+  }
+
+  private flushOutageNotice(): void {
+    const outage = this.store.get<Outage | null>("deliveryOutage");
+    if (!outage || outage.noticed !== false || Date.now() < outage.noticeAt) return;
+    this.store.db.transaction(() => {
+      const id = outage.batchId;
+      const turn = this.store.get<Turn | null>("activeTurn");
+      const preparing = this.store.get<PreparingDelivery | null>("preparingDelivery");
+      // A rebuilt held batch can be awaiting acceptance again when its notice comes due.
+      if (!(turn?.inboundId === id && ["held", "submitting", "unknown"].includes(turn.phase)) && preparing?.id !== id) return;
+      if (this.wakeBatch(id) || this.store.get(`inbound-delivered:${id}`) !== undefined) return;
+      const row = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id);
+      if (row?.state !== "processing") return;
+      this.store.enqueue({ id: outage.id, kind: "control", text: OUTAGE_TEXT, ...this.replyTarget(id) });
+      this.store.set("deliveryOutage", { ...outage, noticed: true });
+      this.watchdogLog("notice", { inboundId: id, messageId: `msg_${hash(id)}` });
+    }).immediate();
+  }
+
+  private clearDeliveryOutage(): void {
+    const outage = this.store.get<Outage | null>("deliveryOutage");
+    this.store.set("deliveryOutage", null);
+    if (outage?.noticed === false) this.options.log?.("outage-notice-deferred", JSON.stringify({
+      chat: this.options.context?.chat.slug ?? "imessage", batchId: outage.batchId,
+      heldMs: Date.now() - (outage.noticeAt - OUTAGE_NOTICE_AFTER_MS),
+    }));
   }
 
   private holdDelivery(turn: Turn): void {
@@ -3779,7 +3819,6 @@ export class Router {
         : this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state;
       if (id !== undefined && state === "processing") {
         this.store.set(`batch-phase:${id}`, "preparing");
-        // Held from here on, so the sender is told once, exactly as a held turn tells them.
         this.outageNotice(id);
         // The rebuilt send may go out on this very tick; replays stay paced by replayAt.
         this.store.set("deliveryOutage", { ...this.store.get<Outage>("deliveryOutage")!, probeAt: 0 });
@@ -3790,7 +3829,7 @@ export class Router {
       } else {
         this.logTurnEnd(turn, "failed");
         this.setTurn({ ...turn, phase: "failed" });
-        this.store.set("deliveryOutage", null);
+        this.clearDeliveryOutage();
         if (id !== undefined && this.store.get(`batch-phase:${id}`) === "submitting") this.store.set(`batch-phase:${id}`, null);
       }
       this.store.set("resendBody", null);
@@ -3827,7 +3866,7 @@ export class Router {
       // A held batch is tried again once a minute. The attempt itself is the
       // probe: it is idempotent, and a health endpoint that answers slower than
       // the thread it speaks for must never keep a batch waiting.
-      const outage = this.store.get<Outage | null>("deliveryOutage") ?? { id: `outage:${hash(preparing.id)}`, probeAt: 0 };
+      const outage = this.outageNotice(preparing.id, 0);
       if (Date.now() - outage.probeAt < 5_000 || this.controlArrived(handled)) return;
       if (outage.replayAt !== undefined && Date.now() - outage.replayAt < ACCEPT_WAIT_MS) {
         this.store.set("deliveryOutage", { ...outage, probeAt: Date.now() });
@@ -3916,7 +3955,7 @@ export class Router {
       if (turn.phase === "held" || spent || (absent && (someoneWaiting || (!body && elapsed >= ACCEPT_WAIT_MS)))) {
         this.fail(turn, "", undefined, "undelivered");
         // An outage record left by an older build must not mute the notice for the next person's batch.
-        this.store.set("deliveryOutage", null);
+        this.clearDeliveryOutage();
         this.watchdogLog("release", turn);
       } else if (retryDue && !someoneWaiting) await retry();
       return;
@@ -3928,7 +3967,7 @@ export class Router {
       else if (spent) this.holdDelivery(turn);
       return;
     }
-    const outage = this.store.get<Outage | null>("deliveryOutage") ?? { id: `outage:${hash(turn.inboundId ?? turn.messageId)}`, probeAt: 0 };
+    const outage = this.outageNotice(turn.inboundId ?? turn.messageId, 0);
     if (Date.now() - outage.probeAt < 5_000) return;
     this.store.set("deliveryOutage", { ...outage, probeAt: Date.now() });
     // `absent` means the route just answered every read about this prompt and
