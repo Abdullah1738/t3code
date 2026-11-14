@@ -178,7 +178,20 @@ blindly to hide the keyboard. After tapping a secure target, re-read AX and requ
 keys can reach another field or nowhere. System screens are affected too:
 TorSSH #86's observed Set a PIN / screen-lock sighting had ACKed digit input,
 `secure=true`, `focused=false` afterward and Next disabled (reported, not
-independently verified). For a focused field, per-character `press-key` has one
+independently verified).
+System PIN setup accepted keypad taps at display coordinates → Next → repeat taps
+→ Confirm (TorSSH #84, 2026-11-14; repeated in #129).
+On the SystemUI device-credential sheet (BiometricPrompt with DEVICE_CREDENTIAL),
+`typeText` and semantic `press-key` cancelled authentication even with
+`focused=true`; keypad taps never authenticated, AX omitted IME keys and secure
+screenshots were black.
+There is no verified route or exposed biometric simulation in CLI 0.2.183 / SDK
+0.49.0: pull `runcloud android logs $ID --tail 1000 --json` immediately after each
+route and classify the result, not the ACK (`BiometricService/AuthSession:
+Dismissed! … Error: 10` = USER_CANCELED).
+Wrong-PIN rejection needs a verification failure or explicit error on the still-open
+sheet; success needs App Lock `checked=true`, not just a dismissed prompt.
+For a focused field, per-character `press-key` has one
 reported hex-credential authentication success in TorSSH (alphanumeric only);
 symbols and Shift remain unverified.
 Never put real secrets on the clipboard or command lines that get logged or
