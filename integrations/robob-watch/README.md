@@ -37,6 +37,13 @@ through the control API before succeeding.
 
 Install/sync: copy `src test helpers package.json tsconfig.json` to `~/.local/share/robob-watch`, the wrapper to `~/.local/bin/robob-watch`, the plist to `~/Library/LaunchAgents/`, the skill to `~/.config/opencode/skills/robob-watchers/`, then `launchctl kickstart -k gui/$(id -u)/com.ardud.robob-watch`.
 
+Log analysis: `robob-watch log-rollup --day YYYY-MM-DD` keeps the daily report.
+The runner writes yesterday’s report after 00:30 UTC so late-day markers have their full comparison window. Reports written before the UTC day ended are redone; reports written at or after day end are kept.
+For a release window use `robob-watch log-rollup --since 2026-11-13T18:24:00Z --until 2026-11-14T00:00:00Z [--out /path/window.json]`.
+Windows include the start and exclude the end, require a timezone, and print JSON without writing a daily report.
+Reports include hourly error sources, run failures/timeouts and p95 durations. Each release marker compares error events in the 30 minutes before and after it; a comparison has `complete: false` until its end time has passed; missing log periods contribute zero, so use complete logs for release readback.
+For manual release/restart scripts, call `robob-watch log-marker --service robob-watch --sha <git-sha> --step restart.complete || true` after success. Service/step are short identifiers; SHA is hex. Markers retain no IDs or free text and failures never interrupt the script.
+
 ## Tests
 
 Run from `integrations/robob-watch`. Bun: `bun test test/`. Python uses unittest; pytest is not installed on the Mac.

@@ -92,5 +92,6 @@ fi
 if [[ "${1:-}" == "--dry-run" ]]; then
   print -r -- "dry run: $name"
 else
+  "$HOME/.bun/bin/bun" "${0:A:h}/robob-watch/src/cli.ts" log-marker --service "$name" --sha "$(git -C "${0:A:h}" rev-parse HEAD 2>/dev/null)" --step deploy.complete >/dev/null 2>&1 || true
   print -r -- "deployed $name to $dst"
 fi

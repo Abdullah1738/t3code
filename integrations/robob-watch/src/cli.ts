@@ -1,4 +1,4 @@
-import { toolLog, toolError, rollup } from "./toollog.ts";
+import { toolLog, toolError, rollup, logMarker } from "./toollog.ts";
 import { stderrCause } from "./cause.ts";
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -36,6 +36,8 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
                                          watcher sharing ID's trip
   robob-watch unscoped                   watchers whose text mentions wa draft/send but lists no relays (info only)
   robob-watch log-rollup [--day YYYY-MM-DD]   roll up a UTC day (default yesterday)
+  robob-watch log-rollup --since ISO --until ISO [--out PATH]   roll up [since, until), stdout by default
+  robob-watch log-marker --service NAME --sha SHA --step NAME   best-effort release marker
   robob-watch runner                     LaunchAgent status
 
 Check contract: a zsh command run in the watcher dir with WATCH_DIR set. Print nothing when there is nothing new;
@@ -101,9 +103,19 @@ async function scratchRun(watcher: Watcher, closing: boolean) {
 
 async function main(argv: string[]): Promise<void> {
   const [command, ...rest] = argv;
+  if (command === "log-marker") {
+    try {
+      const { values } = parseArgs({ args: rest, strict: true, options: {
+        service: { type: "string" }, sha: { type: "string" }, step: { type: "string" },
+      } });
+      logMarker(values);
+    } catch { /* Even malformed marker invocations must not interrupt a release. */ }
+    return;
+  }
   const { values, positionals } = parseArgs({
     args: rest, allowPositionals: true, strict: true,
     options: {
+      since: { type: "string" }, until: { type: "string" }, out: { type: "string" },
       day: { type: "string" }, "inflight-check": { type: "string" }, id: { type: "string" }, title: { type: "string" }, check: { type: "string" }, interval: { type: "string" },
       mode: { type: "string" }, context: { type: "string" }, "context-file": { type: "string" }, expires: { type: "string" },
       "max-fires": { type: "string" }, serial: { type: "boolean" }, session: { type: "string" }, replace: { type: "boolean" },
@@ -112,12 +124,14 @@ async function main(argv: string[]): Promise<void> {
       chat: { type: "string" }, to: { type: "string" }, eta: { type: "string" }, quote: { type: "string" }, "owner-only": { type: "boolean" },
     },
   });
-  ensureDirs();
+  if (command !== "log-rollup") ensureDirs();
   switch (command) {
     case "log-rollup": {
       const day = values.day ?? new Date(Date.now() - 86400_000).toISOString().slice(0, 10);
-      const result = await rollup(day);
-      if (!result) throw new CliError("Could not roll up UTC day");
+      const window = values.since !== undefined || values.until !== undefined;
+      if (window && (values.day !== undefined || values.since === undefined || values.until === undefined)) throw new CliError("Use --since and --until together, without --day");
+      const result = await rollup(window ? { since: values.since!, until: values.until! } : day, undefined, values.out);
+      if (!result) throw new CliError(window ? "Could not roll up time window" : "Could not roll up UTC day");
       console.log(JSON.stringify(result));
       return;
     }
