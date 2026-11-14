@@ -2,6 +2,7 @@ import copy
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -121,6 +122,62 @@ class ProcessTests(unittest.TestCase):
             with self.subTest(form=form):
                 self.assertNotIn('abc', lp.redact(form))
                 self.assertNotIn('a' * 48, lp.redact(form))
+
+    def test_uri_userinfo_shape_matrix(self):
+        forms = [
+            ('postgres://user:p7@db/app', 'postgres://[REDACTED]@db/app'),
+            ('postgresql://user:p7@db/app', 'postgresql://[REDACTED]@db/app'),
+            ('redis://user:p7@cache/0', 'redis://[REDACTED]@cache/0'),
+            ('rediss://user:p7@cache/0', 'rediss://[REDACTED]@cache/0'),
+            ('mysql://user:p7@db/app', 'mysql://[REDACTED]@db/app'),
+            ('mongodb://user:p7@db/app', 'mongodb://[REDACTED]@db/app'),
+            ('mongodb+srv://user:p7@db/app', 'mongodb+srv://[REDACTED]@db/app'),
+            ('PoStGrEsQl://user:p7@db/app', 'PoStGrEsQl://[REDACTED]@db/app'),
+            ('http://user:p7@host/path', 'http://[REDACTED]@host/path'),
+            ('https://user:p7@host/path', 'https://[REDACTED]@host/path'),
+            ('ftp://user:p7@host/path', 'ftp://[REDACTED]@host/path'),
+            ('custom-v1.2://user:p7@host/path', 'custom-v1.2://[REDACTED]@host/path'),
+            ('redis://:p7@cache/0', 'redis://[REDACTED]@cache/0'),
+            ('redis://p7@cache/0', 'redis://[REDACTED]@cache/0'),
+            ('postgres://user:p%37@db/app', 'postgres://[REDACTED]@db/app'),
+            ("postgres://user:p'7@db/app", 'postgres://[REDACTED]@db/app'),
+            ('postgres://user:p"7@db/app', 'postgres://[REDACTED]@db/app'),
+            ("postgres://user:p!$&'()*+,;=7@db/app", 'postgres://[REDACTED]@db/app'),
+            ('postgres://user:p@7@db/app', 'postgres://[REDACTED]@db/app'),
+            ('postgres://user:p7@[::1]:5432/app', 'postgres://[REDACTED]@[::1]:5432/app'),
+            ('postgres://db/app/user@item', 'postgres://db/app/user@item'),
+            ('postgres://db?name=user@item', 'postgres://db?name=user@item'),
+            ('postgres://db#user@item', 'postgres://db#user@item'),
+        ]
+        for source, expected in forms:
+            for quote in ('', '"', "'"):
+                with self.subTest(source=source, quote=quote):
+                    command = f'node tool.js --dsn={quote}{source}{quote}'
+                    self.assertEqual(lp.redact(command), f'node tool.js --dsn={quote}{expected}{quote}')
+
+    def test_saved_report_redacts_non_http_userinfo_in_kept_process_and_ancestors(self):
+        import dev_janitor
+        for scheme in ('postgres', 'postgresql', 'redis', 'rediss', 'mysql', 'mongodb'):
+            with self.subTest(scheme=scheme):
+                rows = lp.parse_ps(PS)
+                child = rows[91129]
+                child.update(ppid=10, tty='ttys001', args=f'node tool.js {scheme}://child:p7@db:123/app')
+                rows[10] = dict(pid=10, ppid=1, start=child['start'], tty='ttys001',
+                                args=f'/bin/sh -c "node tool.js {scheme}://parent:q8@other/app"')
+                report = lp.detect(rows, lp.parse_top(TOP), {}, ROSTER)
+                item = report['inventory'][0]
+                self.assertEqual(item['keep_reason'], 'tty')
+                self.assertEqual(report['candidates'], [])
+                self.assertIn(f'{scheme}://[REDACTED]@db:123/app', item['command'])
+                self.assertIn(f'{scheme}://[REDACTED]@other/app', item['parent_chain'][0]['command'])
+                with tempfile.TemporaryDirectory() as tmp, \
+                        patch.object(dev_janitor, 'LOG_DIR', tmp), \
+                        patch.object(dev_janitor, 'LAST', str(Path(tmp) / 'last.json')), \
+                        patch.object(dev_janitor, 'AUDIT', str(Path(tmp) / 'audit.jsonl')):
+                    dev_janitor.record_report(dict(ts=1, liveness_unavailable=None, processes=report))
+                    saved = (Path(tmp) / 'last.json').read_text()
+                for secret in ('child', 'parent:q8', 'p7', 'q8'):
+                    self.assertNotIn(secret, saved)
 
     def test_temporary_server_command_class(self):
         forms = {

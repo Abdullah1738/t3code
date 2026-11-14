@@ -19,6 +19,7 @@ TERMINAL = {"completed", "cancelled", "failed", "interrupted"}
 
 def redact(command):
     # Redact before shortening: a truncated flag value must not escape matching.
+    command = re.sub(r'(?i)([a-z][a-z0-9+.-]*://)[^\s/?#]*@', r'\1[REDACTED]@', command)
     command = re.sub(r'(?i)((?:authorization|proxy-authorization)[= :]+(?:basic|bearer)\s+)\S+',
                      r'\1[REDACTED]', command)
     command = re.sub(r"(?i)([\"'][\w-]*(?:token|password|secret|key|authorization)[\w-]*[\"']\s*:\s*)([\"'])(.*?)\2",
@@ -26,7 +27,6 @@ def redact(command):
     command = re.sub(r'(?i)(bearer\s+|(?:--|\b)[\w-]*(?:token|password|passwd|secret|credential|api[-_]?key|authorization)[\w-]*[= :]+)(?:"[^"]*"|\x27[^\x27]*\x27|\S+)',
                      r'\1[REDACTED]', command)
     command = re.sub(r'(?i)\b(?:sk-|ghp_|github_pat_|xox[baprs]-)[\w.-]+', '[REDACTED]', command)
-    command = re.sub(r'(?i)(https?://)[^\s/@]+@', r'\1[REDACTED]@', command)
     command = re.sub(r'(?<![\w-])[A-Za-z0-9_+/=.\-]{32,}(?![\w-])', '[REDACTED]', command)
     # Generic key flags, query-string values and short credential aliases too.
     command = re.sub(r'(?i)((?:--key|--auth|--pass|--pwd|\bkey|\bauth)[= :]+)(?:"[^"]*"|\x27[^\x27]*\x27|\S+)',
