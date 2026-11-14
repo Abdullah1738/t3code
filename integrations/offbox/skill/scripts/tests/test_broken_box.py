@@ -105,10 +105,9 @@ class BrokenBoxRunTests(Isolated):
 class RefusedStartTests(Isolated):
     def setUp(self):
         super().setUp()
-        self.me = dict(owner='worker', repo_key='repo', repo_root='/checkout/repo', session='s', thread='t')
         self.con.execute("""INSERT INTO leases(box_id,owner,repo_root,repo_key,remote_dir,state,size,last_used_at,source)
-            VALUES ('bx_fake','worker','/checkout/repo','repo','w/fake','running',?,?,'template:crpko-go')""",
-                         ('large', 100))
+            VALUES ('bx_fake','worker',?,'repo','w/fake','running',?,?,'template:crpko-go')""",
+                         (self.me['repo_root'], 'large', 100))
         self.con.commit()
 
     def start_with(self, err):

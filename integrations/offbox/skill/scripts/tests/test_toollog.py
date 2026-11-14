@@ -175,9 +175,9 @@ class Instrumentation(Isolated):
     def test_sync_pull_and_upload_outcomes(self):
         stats={'sent':123,'files':4}
         with patch.object(ssh_sync,'_push_files',return_value=stats), patch.object(ssh_sync,'tracked_secret_matches',return_value=['.env']):
-            ssh_sync.push('bx_fixture',Path('/checkout/repo'),'work',run_id='run-fixture')
+            ssh_sync.push('bx_fixture',Path(self.me['repo_root']),'work',run_id='run-fixture')
         with patch.object(ssh_sync,'_push_files',side_effect=common.OffboxError('private error')):
-            with self.assertRaises(common.OffboxError): ssh_sync.push('bx_fixture',Path('/checkout/repo'),'work')
+            with self.assertRaises(common.OffboxError): ssh_sync.push('bx_fixture',Path(self.me['repo_root']),'work')
         self.outcomes('run.sync')
         self.assertEqual(self.rows('run.sync')[0]['props'],{'bytes':123,'files':4,'skipped':1})
         for rc in (0,23):

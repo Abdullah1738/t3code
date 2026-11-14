@@ -807,6 +807,8 @@ def _catch_up_finished(con, run_id, budget: float = 10) -> None:
 
 
 def _incomplete_log(r, result) -> None:
+    if r['status'] == 'source_gone':
+        return
     settled = r['status'] not in ('starting', 'running')
     p = LOGS_DIR / f"{r['run_id']}.log"
     size = p.stat().st_size if p.exists() else 0
@@ -896,6 +898,9 @@ def _report_never_started(r) -> int:
 def logs(run_id: str, do_follow: bool) -> int:
     r = _run_row(run_id)
     _require_my_run(r)
+    if r['status'] == 'source_gone':
+        say(r['error'])
+        return 2
     if r['status'] == 'forwarded':
         return _follow_forwarded(r, 'logs', follow=do_follow)
     if _never_started(r):
@@ -959,6 +964,9 @@ def wait(run_id: str, timeout: float | None) -> int:
 
 
 def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=False) -> int:
+    if r['status'] == 'source_gone':
+        say(r['error'])
+        return 2
     if r['status'] == 'forwarded':
         return _follow_forwarded(r, 'logs' if echo else 'wait', follow=echo,
                                  timeout=None if echo or until is None else until-now())

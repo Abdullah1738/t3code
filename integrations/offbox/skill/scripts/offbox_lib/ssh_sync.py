@@ -331,7 +331,7 @@ def _gitinfo_exclude(root: Path) -> list[str]:
     cands = [root / ".git" / "info" / "exclude"]
     try:
         p = subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10, cwd=str(root))
         if p.returncode == 0 and p.stdout.strip():
             cands.insert(0, Path(p.stdout.strip()) / "info" / "exclude")
     except Exception:  # noqa: BLE001
@@ -389,7 +389,7 @@ def _ignored_include_tops(root: Path, includes: list[str] | None) -> list[str]:
             anc = "/".join(parts[:i])
             try:
                 p = subprocess.run(["git", "-C", str(root), "check-ignore", "--no-index", "-q", "--", anc + "/"],
-                                   capture_output=True, timeout=10)
+                                   capture_output=True, timeout=10, cwd=str(root))
             except (OSError, subprocess.TimeoutExpired) as e:
                 raise _include_refused(inc) from e
             if p.returncode not in (0, 1):
@@ -492,7 +492,7 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
     if includes:
         try:
             p = subprocess.run(["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
-                               capture_output=True, timeout=10)
+                               capture_output=True, timeout=10, cwd=str(root))
             is_git = p.returncode == 0 and p.stdout.strip() == b"true"
         except (OSError, subprocess.TimeoutExpired):
             pass  # No Git index: guard every opened ancestor.
@@ -501,7 +501,7 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
     if is_git and ancestors:
         try:
             p = subprocess.run(["git", "--literal-pathspecs", "-C", str(root), "ls-files", "-z", "--", *sorted(ancestors)],
-                               capture_output=True, timeout=20)
+                               capture_output=True, timeout=20, cwd=str(root))
         except (OSError, subprocess.TimeoutExpired) as e:
             raise _include_refused(includes[0]) from e
         if p.returncode != 0:
@@ -524,7 +524,7 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
             # Bypass the index to see ignored dirs with tracked descendants. No trailing slash: tmp/*
             # matches tmp/'s empty child in check-ignore, but does not ignore tmp itself.
             p = subprocess.run(["git", "-C", str(root), "check-ignore", "--no-index", "-q", "--", anc],
-                               capture_output=True, timeout=10)
+                               capture_output=True, timeout=10, cwd=str(root))
         except (OSError, subprocess.TimeoutExpired) as e:
             raise _include_refused(inc) from e
         if p.returncode not in (0, 1):
@@ -594,7 +594,7 @@ def tracked_secret_matches(root: Path, includes: list[str] | None) -> list[str]:
     """Git-tracked files the secret filters skip (e.g. a committed sample configs/.env). Shown as a hint only."""
     import fnmatch
     try:
-        p = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=20)
+        p = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=20, cwd=str(root))
     except Exception:  # noqa: BLE001
         return []
     if p.returncode != 0:
@@ -695,7 +695,7 @@ def _tracked_skipped(root: Path, seen: set[str]) -> list[str]:
     """Git-tracked files pass 1 left out, other than secret/heavy ones. Those are .gitignore matches (a tracked
     package-lock.json, 31 Oct) or rsync reading .gitignore more broadly than git (`test/*`, `!` lines)."""
     try:
-        p = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=20)
+        p = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=20, cwd=str(root))
     except Exception:  # noqa: BLE001 - no git: pass 1 is the whole sync, as before
         return []
     if p.returncode != 0:
@@ -744,7 +744,12 @@ def push(box_id: str, root: Path, remote_dir: str, with_git: bool = False, timeo
          includes: list[str] | None = None, seed_candidates: list[str] | None = None,
          run_id: str | None = None) -> dict:
     with toollog.span("sync", "run.sync", ids={"run": run_id, "box": box_id}, tag="sync_failed") as data:
-        result = _push(box_id, root, remote_dir, with_git, timeout, includes, seed_candidates, run_id)
+        try:
+            result = _push(box_id, root, remote_dir, with_git, timeout, includes, seed_candidates, run_id)
+        except (OffboxError, OSError) as error:
+            if not root.is_dir():
+                raise common.SourceGone(root) from error
+            raise
         data["props"].update(bytes=result.get("sent", 0), files=result.get("files", 0),
                              skipped=result.get("skipped", 0))
         return result
@@ -794,18 +799,18 @@ def _content_signature(path: Path) -> tuple[str, str]:
 
 def _tracked_content(root: Path, includes: list[str] | None) -> dict[str, tuple[str, str]]:
     p = subprocess.run(["git", "-C", str(root), "ls-files", "--stage", "-z"], capture_output=True,
-                       env=git_snapshot._git_env(), timeout=30)
+                       env=git_snapshot._git_env(), timeout=30, cwd=str(root))
     if p.returncode:
         # Plain directories are supported too. A broken index in a repository must fail closed.
         probe = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-dir"],
-                               capture_output=True, env=git_snapshot._git_env(), timeout=30)
+                               capture_output=True, env=git_snapshot._git_env(), timeout=30, cwd=str(root))
         if probe.returncode and not os.path.lexists(root / ".git"):
             return {}
         raise OffboxError("cannot list tracked content for sync; nothing ran")
     entries = [raw for raw in p.stdout.split(b"\0") if raw]
     deleted = subprocess.run(["git", "-C", str(root), "diff", "--cached", "--raw", "-z",
                               "--diff-filter=D", "--no-renames"], capture_output=True,
-                             env=git_snapshot._git_env(), timeout=30)
+                             env=git_snapshot._git_env(), timeout=30, cwd=str(root))
     if deleted.returncode:
         raise OffboxError("cannot list staged deletions for sync; nothing ran")
     rows = deleted.stdout.split(b"\0")
@@ -977,7 +982,7 @@ def _kill_rsync(proc) -> None:
         pass
 
 
-def _watch_rsync(cmd, timeout, input=None, *, on_stall=None, on_progress=None):
+def _watch_rsync(cmd, timeout, input=None, *, on_stall=None, on_progress=None, cwd=None):
     """One attempt with independent pipe draining and a wall/idle bound, reusable by artifact pulls."""
     started = last = time.monotonic()
     chunks = [[], []]
@@ -985,7 +990,7 @@ def _watch_rsync(cmd, timeout, input=None, *, on_stall=None, on_progress=None):
     lock = threading.Lock()
     changed = threading.Event()
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True, cwd=cwd)
 
     def read(stream, index):
         nonlocal last, count, sent, source_sent
@@ -1210,7 +1215,12 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
                 # setup can change the proxy endpoint between rsync attempts.
                 with api.budget(left):
                     cmd[cmd.index("-e") + 1] = shlex.join(ssh_base(box_id))
-            p = _watch_rsync(cmd, left, input=input, on_stall=stalled, on_progress=progress)
+            p = _watch_rsync(cmd, left, input=input, on_stall=stalled, on_progress=progress,
+                             cwd=str(source) if source is not None else None)
+        except FileNotFoundError:
+            if source is not None and not source.is_dir():
+                raise common.SourceGone(source) from None
+            raise
         except SyncStalled:
             with api.budget(max(0, deadline - time.monotonic())):
                 _refresh_master(box_id, refresh=False)
@@ -1230,6 +1240,9 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
                 _refresh_master(box_id, close=False)
             stalls += 1
             continue
+        if (p.returncode == 3 and source is not None and not source.is_dir()
+                and re.search(r'(?:getcwd\(\)|change_dir)[^\n]*No such file', p.stderr)):
+            raise common.SourceGone(source)
         if p.returncode:
             check_host_key(box_id, p.stderr.encode(errors="replace"))
         if p.returncode not in (255, 12):

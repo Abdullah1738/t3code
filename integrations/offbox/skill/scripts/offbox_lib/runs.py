@@ -10,6 +10,7 @@ import re
 import select
 import shlex
 import signal
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -1361,17 +1362,39 @@ done''' if repo_key == "crpko-devops" else ':'),
     return "\n".join(lines)
 
 
+def _source_present(root: Path, cwd: Path) -> None:
+    for path in (root, cwd):
+        try:
+            present = stat.S_ISDIR(path.stat().st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            present = False
+        if not present:
+            raise common.SourceGone(path)
+    try:
+        os.getcwd()
+    except FileNotFoundError:
+        # A path can have been recreated while this process still holds its deleted inode.
+        raise common.SourceGone(cwd) from None
+
+
 class Runner:
     def __init__(self, a, me: dict):
         self.a, self.me = a, me
         self.run_id = os.environ.get(BACKGROUND_RUN_ENV) or new_id("run")
         self.root = Path(me["repo_root"])
-        self.cwd = Path(os.getcwd()).resolve()
+        recorded_cwd = None
+        if os.environ.get(BACKGROUND_RUN_ENV):
+            with contextlib.closing(db()) as con:
+                row = con.execute('SELECT local_cwd,cwd FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
+                if row:
+                    recorded_cwd = row['local_cwd'] or row['cwd']
+        self.cwd = Path(recorded_cwd or os.getcwd()).resolve()
         try:
             self.rel = str(self.cwd.relative_to(self.root))
         except ValueError:
             self.rel = "."
         self.box = None
+        self.queue_s = 0.0
         self.pid = None
         self.started = False
         self.registered = False
@@ -1384,6 +1407,30 @@ class Runner:
         self.push_resumed = False
         self.wait_images = False
         self.log_path = LOGS_DIR / f"{self.run_id}.log"
+
+    def check_source(self, checkpoint):
+        try:
+            _source_present(self.root, self.cwd)
+        except common.SourceGone as error:
+            error.checkpoint = checkpoint
+            raise
+
+    def source_gone(self, error):
+        message = f"{error} (queued {self.queue_s:.1f}s; box {self.box or 'none'})"
+        error.args = (message,)
+        with log_lock(self.run_id):
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open('ab') as stream:
+                stream.write(f"offbox: {message}\n".encode())
+                length = stream.tell()
+            _commit(self.log_path, 0, 0, length)
+        self.record(error=message)
+        with contextlib.closing(db()) as con:
+            with write(con):
+                con.execute('DELETE FROM pool_cap_callers WHERE run_id=?', (self.run_id,))
+            event(con, self.box, 'run_source_gone',
+                  f'{self.run_id} checkpoint={error.checkpoint} queue_s={self.queue_s:.1f} box={self.box or "none"} {message}')
+        finish(self.run_id, 2, 'source_gone', catch_up=False, bookkeeping=False)
 
     def _log_pool(self, con):
         import toollog
@@ -1489,11 +1536,17 @@ class Runner:
         replacement = None
         while True:
             options = {'exclude': self.cold_boxes} if self.cold_boxes else {}
-            row = replacement or pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh,
-                                              run_id=self.run_id, **options)
+            queued_at = time.monotonic()
+            try:
+                row = replacement or pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh,
+                                                  run_id=self.run_id, check_source=lambda: self.check_source('queued'),
+                                                  **options)
+            finally:
+                self.queue_s += time.monotonic() - queued_at
             replacement = None
             self.lease_row = row
             self.box = row["box_id"]
+            self.check_source('slot')
             rdir = row["remote_dir"]
             self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
                         docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
@@ -1554,6 +1607,7 @@ class Runner:
         con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', ('containers_expected:' + self.run_id, '1'))
         con.commit()
         self.require_pending(con)
+        self.check_source('push')
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:
@@ -1703,6 +1757,7 @@ class Runner:
         return None
 
     def _sync_box(self, con, a, rdir, env_file, body):
+        self.check_source('push')
         # Env values go through a 0600 file (never the command text, which boat keeps 90 days in history).
         err: list = []
         left = api.left()
@@ -1721,6 +1776,7 @@ class Runner:
             if not a.no_sync:
                 with prepare.phase("push", self.box):
                     candidates = _seed_candidates(con, self.box, rdir, self.me["repo_key"])
+                    self.check_source('push')
                     st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None),
                                        seed_candidates=candidates, run_id=self.run_id)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
@@ -1743,6 +1799,9 @@ class Runner:
             if tw is not None:
                 left = api.left()
                 tw.join(timeout=max(0, left) if left is not None else None)
+        self.check_source('push')
+        if isinstance(push_exc, common.SourceGone):
+            raise push_exc
         # Identity failures take precedence over transfer recovery, even if the other transfer saw a dead mount.
         for e in (push_exc, err[0] if err else None):
             if isinstance(e, common.SshHostKeyMismatch):
@@ -1755,6 +1814,7 @@ class Runner:
             _safe(err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout, terminal_identity=home)
             if err and isinstance(err[0], common.SshHostKeyMismatch):
                 raise err[0]
+        self.check_source('push')
         # A dead mount may have failed either transfer; prefer that over an ordinary error from the other.
         for e in (push_exc, err[0] if err else None):
             reason = ssh_sync.dead_mount(str(e)) if e is not None else None
@@ -2486,6 +2546,8 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
     st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
     def prepare_result():
         nonlocal code, st
+        if status == 'source_gone':
+            return  # No command or step ran; only the caller's source check failed.
         prior = run
         if prior is None:
             with contextlib.closing(db()) as before:
@@ -2596,7 +2658,8 @@ def _background(a, me: dict) -> int:
             # No preexec_fn: Python/CF code in a forked macOS child is unsafe even before urllib sends a request.
             child = subprocess.Popen([sys.executable, '-u', str(BG_ENTRY), '_bg-queue', rn.run_id],
                                      start_new_session=True, close_fds=True, pass_fds=(ready_w, accept_r),
-                                     stdin=subprocess.PIPE, stdout=dst, stderr=subprocess.STDOUT, env=boot_env)
+                                     stdin=subprocess.PIPE, stdout=dst, stderr=subprocess.STDOUT, env=boot_env,
+                                     cwd=str(rn.log_path.parent))
         # Until this publication the original caller remains the provable owner. No payload is sent before it.
         rn.record(client_pid=child.pid, start_at=now())
         os.close(ready_w)
@@ -2656,6 +2719,7 @@ def _background(a, me: dict) -> int:
 
 def background_queue(run_id: str, payload: dict) -> int:
     a, me = SimpleNamespace(**payload['args']), payload['me']
+    source_failure = None
     con = db()
     try:
         with write(con):
@@ -2665,15 +2729,22 @@ def background_queue(run_id: str, payload: dict) -> int:
                     or row['repo_root'] != me['repo_root'] or payload['backend'] != common.backend()):
                 raise OffboxError(f'{run_id}: queued run cannot be adopted', code=EXIT_LOCAL)
             con.execute('UPDATE runs SET client_pid=?,start_at=? WHERE run_id=?', (os.getpid(), now(), run_id))
-        os.chdir(row['local_cwd'] or row['cwd'])
+        cwd = Path(row['local_cwd'] or row['cwd'])
+        try:
+            _source_present(Path(me['repo_root']), cwd)
+            os.chdir(cwd)
+        except (common.SourceGone, FileNotFoundError, NotADirectoryError) as error:
+            error = error if isinstance(error, common.SourceGone) else common.SourceGone(cwd)
+            error.checkpoint = 'queued'
+            source_failure = (error, max(0, now() - row['start_at']))
     finally:
         con.close()
     os.environ[BACKGROUND_RUN_ENV] = run_id
     return background_client(a, me, ready=payload['ready_fd'], accept=payload['accept_fd'],
-                             signal_mask=payload['signal_mask'])
+                             signal_mask=payload['signal_mask'], source_failure=source_failure)
 
 
-def background_client(a, me: dict, ready=None, accept=None, signal_mask=None) -> int:
+def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, source_failure=None) -> int:
     global _background_context
     _background_context = (a, me)
     from . import cli
@@ -2700,6 +2771,19 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None) ->
             if accepted not in (b'1', b''):
                 finish(rid, EXIT_LOCAL, 'local_error')
                 return EXIT_LOCAL
+        rn = Runner(a, me)
+        if source_failure is None:
+            try:
+                rn.check_source('queued')
+            except common.SourceGone as error:
+                source_failure = (error, 0)
+        if source_failure is not None:
+            error, queue_s = source_failure
+            rn.queue_s = queue_s
+            rn.source_gone(error)
+            say(str(error))
+            code = 2
+            return code
         code = cli._run_with_retries(a, me)
         return code
     except KeyboardInterrupt:
@@ -2870,12 +2954,20 @@ def _run_remote(a, rn) -> int:
             rn.start()
         except OffboxError as e:
             if not rn.started:
-                if e.code == EXIT_LOCAL:
+                if not isinstance(e, common.SourceGone):
+                    try:
+                        rn.check_source('push' if rn.box else 'queued')
+                    except common.SourceGone as source_error:
+                        e = source_error
+                if isinstance(e, common.SourceGone):
+                    rn.source_gone(e)
+                elif e.code == EXIT_LOCAL:
                     finish(rn.run_id, EXIT_LOCAL, "local_error")
                 elif not os.environ.get(BACKGROUND_RUN_ENV):
                     finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
-            rn.record(error=str(e)[:500])
-            raise
+            if not isinstance(e, common.SourceGone):
+                rn.record(error=str(e)[:500])
+            raise e
         if a.bg and rn.recovered_code is not None:
             from . import start_check
             con = db()
