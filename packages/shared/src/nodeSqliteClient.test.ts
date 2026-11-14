@@ -92,13 +92,24 @@ vi.mock("node:worker_threads", async (importOriginal) => {
             const children = new Map();
             let nextChild = 0;
             let nextPause;
+            let metadataFailures = 0;
             const pausedStatements = new Map();
+            const sqlitePrototype = require("node:sqlite").DatabaseSync.prototype;
+            const nativePrepare = sqlitePrototype.prepare;
+            sqlitePrototype.prepare = function(sql, ...args) {
+              if (metadataFailures > 0 && sql.startsWith("SELECT name, type, sql FROM ")) {
+                metadataFailures--;
+                throw new Error("test metadata read failure");
+              }
+              return nativePrepare.call(this, sql, ...args);
+            };
             const post = parentPort.postMessage.bind(parentPort);
             const on = parentPort.on.bind(parentPort);
             on("message", message => {
               if (message?.cancel !== undefined) post({ testWriterCancel: message.cancel });
               if (!message?.testCheckpoint) return;
               if (message.kind === "arm") { nextPause = message.args[0]; return; }
+              if (message.kind === "fail-metadata") { metadataFailures = message.args[0]; return; }
               if (message.kind === "resume") {
                 pausedStatements.get(message.args[0])?.();
                 pausedStatements.delete(message.args[0]);
@@ -3360,6 +3371,671 @@ it.effect.each([
           [{ count: 0 }],
         );
         yield* sql.withTransaction(sql`CREATE TABLE recovered(value INTEGER)`);
+      }),
+    ),
+);
+
+it.effect.each([
+  ["plain", "VACUUM", false],
+  ["schema qualified", "VACUUM main", false],
+  ["comment prefixed", "/* maintenance */ VACUUM", false],
+  ["comment prefixed schema", "-- maintenance\nVACUUM main", false],
+  ["INTO literal", "VACUUM INTO", false],
+  ["INTO bound", "VACUUM INTO", true],
+  ["schema INTO literal", "VACUUM main INTO", false],
+  ["schema INTO bound", "VACUUM main INTO", true],
+  ["comment prefixed INTO", "/* backup */ VACUUM INTO", true],
+  ["comment prefixed schema INTO", "-- backup\nVACUUM main INTO", true],
+] as const)("recovers without repeating VACUUM maintenance (%s)", ([, statement, bound]) =>
+  withFileClient((sql, filename) =>
+    Effect.gen(function* () {
+      yield* sql`PRAGMA journal_mode=WAL`;
+      yield* sql`CREATE TABLE vacuum_entries(value INTEGER)`;
+      yield* sql`INSERT INTO vacuum_entries VALUES (1)`;
+      const backupPath = `${filename}.backup`;
+      const into = statement.endsWith("INTO");
+      yield* sql.unsafe(
+        into ? `${statement} ${bound ? "?" : `'${backupPath.replaceAll("'", "''")}'`}` : statement,
+        into && bound ? [backupPath] : [],
+      ).unprepared;
+      if (into) {
+        const backup = yield* openDatabase(backupPath);
+        assert.deepEqual(backup.prepare("SELECT value FROM vacuum_entries").all(), [{ value: 1 }]);
+        backup.exec(
+          "CREATE TABLE backup_marker(value INTEGER); INSERT INTO backup_marker VALUES (7)",
+        );
+      }
+      yield* sql`INSERT INTO vacuum_entries VALUES (2)`;
+      const schemaVersion = yield* sql`PRAGMA main.schema_version`;
+      const writer = writerWorkers.at(-1)!;
+      const count = writerWorkers.length;
+      yield* Effect.promise(() => writer.terminate());
+      assert.deepEqual(yield* sql`SELECT value FROM vacuum_entries ORDER BY value`.values, [
+        [1],
+        [2],
+      ]);
+      assert.equal(writerWorkers.length, count + 1);
+      assert.deepEqual(yield* sql`PRAGMA main.schema_version`, schemaVersion);
+      if (into) {
+        const backup = yield* openDatabase(backupPath);
+        assert.deepEqual(backup.prepare("SELECT value FROM vacuum_entries").all(), [{ value: 1 }]);
+        assert.deepEqual(backup.prepare("SELECT value FROM backup_marker").all(), [{ value: 7 }]);
+      }
+      yield* sql.withTransaction(sql`INSERT INTO vacuum_entries VALUES (3)`);
+      assert.deepEqual(yield* sql`SELECT value FROM vacuum_entries ORDER BY value`.values, [
+        [1],
+        [2],
+        [3],
+      ]);
+    }),
+  ),
+);
+
+const temporaryAlterations = [
+  {
+    name: "rename table",
+    clause: "RENAME TO renamed_table",
+    table: "renamed_table",
+    columns: ["original", "removable"],
+  },
+  {
+    name: "add column",
+    clause: "ADD COLUMN added TEXT NOT NULL DEFAULT 'seed'",
+    table: "altered_table",
+    columns: ["original", "removable", "added"],
+  },
+  {
+    name: "rename column",
+    clause: "RENAME COLUMN original TO renamed_column",
+    table: "altered_table",
+    columns: ["renamed_column", "removable"],
+  },
+  {
+    name: "drop column",
+    clause: "DROP COLUMN removable",
+    table: "altered_table",
+    columns: ["original"],
+  },
+] as const;
+
+for (const schema of ["temp", "scratch"] as const) {
+  for (const boundary of ["autocommit", "commit"] as const) {
+    it.effect.each(temporaryAlterations)(
+      `restores ${schema} ALTER TABLE after ${boundary} and a crash ($name)`,
+      (alteration) =>
+        withFileClient((sql) =>
+          Effect.gen(function* () {
+            yield* sql`PRAGMA journal_mode=WAL`;
+            if (schema === "scratch") yield* sql`ATTACH DATABASE ':memory:' AS scratch`;
+            const setup = Effect.gen(function* () {
+              yield* sql.unsafe(
+                `CREATE TABLE ${schema}.altered_table(original INTEGER, removable TEXT)`,
+              ).unprepared;
+              yield* sql.unsafe(`ALTER TABLE ${schema}.altered_table ${alteration.clause}`)
+                .unprepared;
+            });
+            yield* boundary === "commit" ? sql.withTransaction(setup) : setup;
+            const firstColumn = alteration.columns[0];
+            yield* sql.unsafe(
+              `INSERT INTO ${schema}.${alteration.table}(${firstColumn}) VALUES (7)`,
+            ).unprepared;
+            assert.deepEqual(
+              yield* sql.unsafe(`SELECT ${firstColumn} FROM ${schema}.${alteration.table}`).values,
+              [[7]],
+            );
+            const writer = writerWorkers.at(-1)!;
+            const count = writerWorkers.length;
+            yield* Effect.promise(() => writer.terminate());
+            assert.deepEqual(
+              (yield* sql.unsafe<{ name: string }>(
+                `PRAGMA ${schema}.table_info(${alteration.table})`,
+              )).map((column) => column.name),
+              [...alteration.columns],
+            );
+            assert.equal(writerWorkers.length, count + 1);
+            assert.deepEqual(
+              yield* sql.unsafe(`SELECT name FROM ${schema}.sqlite_schema WHERE type='table'`),
+              [{ name: alteration.table }],
+            );
+            assert.deepEqual(
+              yield* sql.unsafe(`SELECT ${firstColumn} FROM ${schema}.${alteration.table}`).values,
+              [],
+            );
+            yield* sql.unsafe(
+              `INSERT INTO ${schema}.${alteration.table}(${firstColumn}) VALUES (8)`,
+            ).unprepared;
+            if (alteration.name === "add column") {
+              assert.deepEqual(
+                yield* sql.unsafe(`SELECT original, added FROM ${schema}.${alteration.table}`)
+                  .values,
+                [[8, "seed"]],
+              );
+            } else {
+              assert.deepEqual(
+                yield* sql.unsafe(`SELECT ${firstColumn} FROM ${schema}.${alteration.table}`)
+                  .values,
+                [[8]],
+              );
+            }
+            yield* sql.unsafe(`DROP TABLE ${schema}.${alteration.table}`).unprepared;
+            yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+            assert.deepEqual(
+              yield* sql.unsafe(`SELECT name FROM ${schema}.sqlite_schema WHERE type='table'`),
+              [],
+            );
+            assert.equal(writerWorkers.length, count + 2);
+          }),
+        ),
+    );
+  }
+  for (const boundary of ["transaction", "savepoint"] as const) {
+    it.effect.each(temporaryAlterations)(
+      `does not restore ${schema} ALTER TABLE rolled back in a ${boundary} ($name)`,
+      (alteration) =>
+        withFileClient((sql) =>
+          Effect.gen(function* () {
+            yield* sql`PRAGMA journal_mode=WAL`;
+            if (schema === "scratch") yield* sql`ATTACH DATABASE ':memory:' AS scratch`;
+            yield* sql.unsafe(
+              `CREATE TABLE ${schema}.altered_table(original INTEGER, removable TEXT)`,
+            ).unprepared;
+            const rolledBack = sql
+              .withTransaction(
+                Effect.gen(function* () {
+                  yield* sql.unsafe(`ALTER TABLE ${schema}.altered_table ${alteration.clause}`)
+                    .unprepared;
+                  assert.deepEqual(
+                    (yield* sql.unsafe<{ name: string }>(
+                      `PRAGMA ${schema}.table_info(${alteration.table})`,
+                    )).map((column) => column.name),
+                    [...alteration.columns],
+                  );
+                  return yield* Effect.fail("rollback alteration");
+                }),
+              )
+              .pipe(Effect.flip);
+            if (boundary === "savepoint") {
+              yield* sql.withTransaction(
+                Effect.gen(function* () {
+                  yield* sql.unsafe(`CREATE TABLE ${schema}.retained_table(value INTEGER)`)
+                    .unprepared;
+                  assert.equal(yield* rolledBack, "rollback alteration");
+                }),
+              );
+            } else {
+              assert.equal(yield* rolledBack, "rollback alteration");
+            }
+            const writer = writerWorkers.at(-1)!;
+            const count = writerWorkers.length;
+            yield* Effect.promise(() => writer.terminate());
+            assert.deepEqual(
+              (yield* sql.unsafe<{ name: string }>(
+                `PRAGMA ${schema}.table_info(altered_table)`,
+              )).map((column) => column.name),
+              ["original", "removable"],
+            );
+            assert.equal(writerWorkers.length, count + 1);
+            assert.deepEqual(
+              yield* sql.unsafe(
+                `SELECT name FROM ${schema}.sqlite_schema WHERE type='table' ORDER BY name`,
+              ),
+              boundary === "savepoint"
+                ? [{ name: "altered_table" }, { name: "retained_table" }]
+                : [{ name: "altered_table" }],
+            );
+            yield* sql.unsafe(
+              `INSERT INTO ${schema}.altered_table(original, removable) VALUES (1, 'kept')`,
+            ).unprepared;
+            assert.deepEqual(
+              yield* sql.unsafe(`SELECT original, removable FROM ${schema}.altered_table`).values,
+              [[1, "kept"]],
+            );
+          }),
+        ),
+    );
+  }
+}
+
+it.effect.each(["commit", "rollback", "savepoint commit", "savepoint rollback"] as const)(
+  "restores ordered temp setup and query_only after %s and a crash",
+  (boundary) =>
+    withFileClient((sql) =>
+      Effect.gen(function* () {
+        yield* sql`PRAGMA journal_mode=WAL`;
+        yield* sql`CREATE TABLE query_only_entries(value INTEGER)`;
+        yield* Effect.gen(function* () {
+          const rollback = boundary.endsWith("rollback");
+          const setup = sql.withTransaction(
+            Effect.gen(function* () {
+              yield* sql`CREATE TEMP TABLE candidate_table(value INTEGER)`;
+              yield* sql`PRAGMA query_only=ON`;
+              if (rollback) return yield* Effect.fail("rollback query_only setup");
+            }),
+          );
+          if (boundary.startsWith("savepoint")) {
+            yield* sql.withTransaction(
+              Effect.gen(function* () {
+                yield* sql`CREATE TEMP TABLE retained_before(value INTEGER)`;
+                if (rollback) {
+                  assert.equal(yield* setup.pipe(Effect.flip), "rollback query_only setup");
+                } else {
+                  yield* setup;
+                }
+                assert.deepEqual(yield* sql`PRAGMA query_only`, [{ query_only: 1 }]);
+                yield* sql`PRAGMA query_only=OFF`;
+                yield* sql`CREATE TEMP TABLE retained_after(value INTEGER)`;
+                yield* sql`PRAGMA query_only=ON`;
+              }),
+            );
+          } else if (rollback) {
+            assert.equal(yield* setup.pipe(Effect.flip), "rollback query_only setup");
+          } else {
+            yield* setup;
+          }
+          const expected = [
+            ...(!rollback ? [{ name: "candidate_table" }] : []),
+            ...(boundary.startsWith("savepoint")
+              ? [{ name: "retained_after" }, { name: "retained_before" }]
+              : []),
+          ];
+          assert.deepEqual(yield* sql`PRAGMA query_only`, [{ query_only: 1 }]);
+          assert.deepEqual(
+            yield* sql`SELECT name FROM sqlite_temp_schema WHERE type='table' ORDER BY name`,
+            expected,
+          );
+          const writer = writerWorkers.at(-1)!;
+          const count = writerWorkers.length;
+          yield* Effect.promise(() => writer.terminate());
+          assert.deepEqual(yield* sql`PRAGMA query_only`, [{ query_only: 1 }]);
+          assert.equal(writerWorkers.length, count + 1);
+          assert.deepEqual(
+            yield* sql`SELECT name FROM sqlite_temp_schema WHERE type='table' ORDER BY name`,
+            expected,
+          );
+          const readOnly = yield* sql`INSERT INTO query_only_entries VALUES (1)`.pipe(Effect.flip);
+          assert.include(String(readOnly.reason.cause), "readonly");
+          yield* sql`PRAGMA query_only=OFF`;
+          for (const { name } of expected) {
+            yield* sql.unsafe(`INSERT INTO temp.${name} VALUES (7)`).unprepared;
+            assert.deepEqual(yield* sql.unsafe(`SELECT value FROM temp.${name}`).values, [[7]]);
+          }
+          yield* sql.withTransaction(sql`INSERT INTO query_only_entries VALUES (2)`);
+          assert.deepEqual(yield* sql`SELECT value FROM query_only_entries`.values, [[2]]);
+        }).pipe(Effect.ensuring(sql`PRAGMA query_only=OFF`.pipe(Effect.orDie)));
+      }),
+    ),
+);
+
+it.effect.each([
+  ["outside transaction", [["PRAGMA defer_foreign_keys=ON", 1]], 1],
+  [
+    "explicit OFF",
+    [
+      ["PRAGMA defer_foreign_keys=ON", 1],
+      ["PRAGMA defer_foreign_keys=OFF", 0],
+    ],
+    0,
+  ],
+  [
+    "constant SELECT",
+    [
+      ["PRAGMA defer_foreign_keys=ON", 1],
+      ["SELECT 1", 1],
+    ],
+    1,
+  ],
+  [
+    "autocommit read",
+    [
+      ["PRAGMA defer_foreign_keys=ON", 1],
+      ["SELECT * FROM deferral_parent", 0],
+    ],
+    0,
+  ],
+  [
+    "autocommit write",
+    [
+      ["PRAGMA defer_foreign_keys=ON", 1],
+      ["INSERT INTO deferral_parent VALUES (1)", 0],
+    ],
+    0,
+  ],
+  [
+    "autocommit DDL",
+    [
+      ["PRAGMA defer_foreign_keys=ON", 1],
+      ["CREATE TABLE deferral_extra(value INTEGER)", 0],
+    ],
+    0,
+  ],
+  [
+    "commit",
+    [
+      ["BEGIN", 0],
+      ["PRAGMA defer_foreign_keys=ON", 1],
+      ["COMMIT", 0],
+    ],
+    0,
+  ],
+  [
+    "rollback",
+    [
+      ["BEGIN", 0],
+      ["PRAGMA defer_foreign_keys=ON", 1],
+      ["ROLLBACK", 0],
+    ],
+    0,
+  ],
+  [
+    "inherited setting commit",
+    [
+      ["PRAGMA defer_foreign_keys=ON", 1],
+      ["BEGIN", 1],
+      ["COMMIT", 0],
+    ],
+    0,
+  ],
+  [
+    "root savepoint release",
+    [
+      ["SAVEPOINT root", 0],
+      ["PRAGMA defer_foreign_keys=ON", 1],
+      ["RELEASE root", 0],
+    ],
+    0,
+  ],
+  [
+    "nested savepoint rollback",
+    [
+      ["BEGIN", 0],
+      ["SAVEPOINT nested", 0],
+      ["PRAGMA defer_foreign_keys=ON", 1],
+      ["ROLLBACK TO nested", 1],
+      ["RELEASE nested", 1],
+      ["COMMIT", 0],
+    ],
+    0,
+  ],
+  [
+    "crash inside transaction",
+    [
+      ["BEGIN", 0],
+      ["PRAGMA defer_foreign_keys=ON", 1],
+    ],
+    0,
+  ],
+  [
+    "crash after nested rollback",
+    [
+      ["BEGIN", 0],
+      ["SAVEPOINT nested", 0],
+      ["PRAGMA defer_foreign_keys=ON", 1],
+      ["ROLLBACK TO nested", 1],
+      ["RELEASE nested", 1],
+    ],
+    0,
+  ],
+] as const)(
+  "restores SQLite effective defer_foreign_keys after %s and a crash",
+  ([, steps, recovered]) =>
+    withFileClient((sql) =>
+      Effect.gen(function* () {
+        yield* sql`PRAGMA journal_mode=WAL`;
+        yield* sql`PRAGMA foreign_keys=ON`;
+        yield* sql`CREATE TABLE deferral_parent(id INTEGER PRIMARY KEY)`;
+        yield* sql`CREATE TABLE deferral_child(parent_id INTEGER REFERENCES deferral_parent(id))`;
+        const native = yield* openDatabase(":memory:");
+        native.exec(
+          "PRAGMA foreign_keys=ON; CREATE TABLE deferral_parent(id INTEGER PRIMARY KEY); CREATE TABLE deferral_child(parent_id INTEGER REFERENCES deferral_parent(id))",
+        );
+        const count = writerWorkers.length;
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const connection = yield* sql.reserve;
+            for (const [statement, expected] of steps) {
+              const prepared = native.prepare(statement);
+              if (prepared.columns().length) prepared.all();
+              else prepared.run();
+              assert.equal(
+                native.prepare("PRAGMA defer_foreign_keys").get()?.defer_foreign_keys,
+                expected,
+              );
+              yield* connection.executeUnprepared(statement, [], undefined);
+              assert.deepEqual(yield* connection.executeValues("PRAGMA defer_foreign_keys", []), [
+                [expected],
+              ]);
+            }
+            yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+          }),
+        );
+        if (native.isTransaction) native.exec("ROLLBACK");
+        assert.equal(
+          native.prepare("PRAGMA defer_foreign_keys").get()?.defer_foreign_keys,
+          recovered,
+        );
+        assert.deepEqual(yield* sql`PRAGMA defer_foreign_keys`, [
+          { defer_foreign_keys: recovered },
+        ]);
+        assert.equal(writerWorkers.length, count + 1);
+        assert.deepEqual(yield* sql`PRAGMA foreign_keys`, [{ foreign_keys: 1 }]);
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const connection = yield* sql.reserve;
+            yield* connection.executeUnprepared("BEGIN", [], undefined);
+            if (recovered === 1) {
+              yield* connection.executeUnprepared(
+                "INSERT INTO deferral_child VALUES (99)",
+                [],
+                undefined,
+              );
+              const commit = yield* connection
+                .executeUnprepared("COMMIT", [], undefined)
+                .pipe(Effect.flip);
+              assert.include(String(commit.reason.cause), "FOREIGN KEY constraint failed");
+              native.exec("BEGIN; INSERT INTO deferral_child VALUES (99)");
+              assert.throws(() => native.exec("COMMIT"), /FOREIGN KEY constraint failed/);
+              assert.isTrue(native.isTransaction);
+              assert.equal(
+                native.prepare("PRAGMA defer_foreign_keys").get()?.defer_foreign_keys,
+                1,
+              );
+              assert.deepEqual(yield* connection.executeValues("PRAGMA defer_foreign_keys", []), [
+                [1],
+              ]);
+              assert.deepEqual(
+                yield* connection.executeValues("SELECT parent_id FROM deferral_child", []),
+                [[99]],
+              );
+              native.exec("ROLLBACK");
+            } else {
+              const insert = yield* connection
+                .executeUnprepared("INSERT INTO deferral_child VALUES (99)", [], undefined)
+                .pipe(Effect.flip);
+              assert.include(String(insert.reason.cause), "FOREIGN KEY constraint failed");
+            }
+            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
+          }),
+        );
+        assert.deepEqual(yield* sql`PRAGMA defer_foreign_keys`, [{ defer_foreign_keys: 0 }]);
+        assert.deepEqual(yield* sql`SELECT parent_id FROM deferral_child`, []);
+        assert.deepEqual(
+          yield* sql`SELECT id FROM deferral_parent`.values,
+          native
+            .prepare("SELECT id FROM deferral_parent")
+            .all()
+            .map((row) => [row.id]),
+        );
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`PRAGMA defer_foreign_keys=ON`;
+            yield* sql`INSERT INTO deferral_child VALUES (2)`;
+            yield* sql`INSERT INTO deferral_parent VALUES (2)`;
+          }),
+        );
+        assert.deepEqual(yield* sql`PRAGMA defer_foreign_keys`, [{ defer_foreign_keys: 0 }]);
+        yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+        assert.deepEqual(yield* sql`PRAGMA defer_foreign_keys`, [{ defer_foreign_keys: 0 }]);
+        assert.equal(writerWorkers.length, count + 2);
+        assert.deepEqual(yield* sql`SELECT parent_id FROM deferral_child`, [{ parent_id: 2 }]);
+      }),
+    ),
+);
+
+it.effect.each(["managed transaction", "abandoned reservation"] as const)(
+  "releases a failed deferred commit without losing its error or leaking its transaction (%s)",
+  (boundary) =>
+    withFileClient((sql, filename) =>
+      Effect.gen(function* () {
+        yield* sql`PRAGMA journal_mode=WAL`;
+        yield* sql`PRAGMA foreign_keys=ON`;
+        yield* sql`CREATE TABLE lease_parent(id INTEGER PRIMARY KEY)`;
+        yield* sql`CREATE TABLE lease_child(parent_id INTEGER REFERENCES lease_parent(id))`;
+        let reachedCommit = false;
+        let commits = 0;
+        const observeCommit = () => {
+          commits++;
+        };
+        const failed = yield* Effect.gen(function* () {
+          if (boundary === "managed transaction") {
+            yield* sql.withTransaction(
+              Effect.gen(function* () {
+                yield* sql`PRAGMA defer_foreign_keys=ON`;
+                yield* sql`INSERT INTO lease_child VALUES (99)`;
+                reachedCommit = true;
+              }),
+            );
+          } else {
+            yield* Effect.scoped(
+              Effect.gen(function* () {
+                const connection = yield* sql.reserve;
+                yield* connection.executeUnprepared("BEGIN", [], undefined);
+                yield* connection.executeUnprepared("PRAGMA defer_foreign_keys=ON", [], undefined);
+                yield* connection.executeUnprepared(
+                  "INSERT INTO lease_child VALUES (99)",
+                  [],
+                  undefined,
+                );
+                reachedCommit = true;
+                yield* connection.executeUnprepared("COMMIT", [], undefined);
+              }),
+            );
+          }
+        }).pipe(
+          Effect.provideService(SqliteClient.TransactionCommitObserver, observeCommit),
+          Effect.flip,
+        );
+        assert.isTrue(reachedCommit);
+        assert.equal(failed._tag, "SqlError");
+        assert.equal(failed.reason._tag, "ConstraintError");
+        assert.equal(failed.reason.operation, "execute");
+        assert.include(String(failed.reason.cause), "FOREIGN KEY constraint failed");
+        assert.equal(commits, 0);
+        const observer = yield* openDatabase(filename);
+        assert.deepEqual(observer.prepare("SELECT parent_id FROM lease_child").all(), []);
+        assert.deepEqual(yield* sql`PRAGMA defer_foreign_keys`, [{ defer_foreign_keys: 0 }]);
+        assert.deepEqual(yield* sql`SELECT parent_id FROM lease_child`, []);
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`INSERT INTO lease_parent VALUES (1)`;
+              yield* sql`INSERT INTO lease_child VALUES (1)`;
+            }),
+          )
+          .pipe(Effect.provideService(SqliteClient.TransactionCommitObserver, observeCommit));
+        assert.equal(commits, 1);
+        assert.deepEqual(yield* sql`SELECT parent_id FROM lease_child`, [{ parent_id: 1 }]);
+        assert.deepEqual(observer.prepare("SELECT parent_id FROM lease_child").all(), [
+          { parent_id: 1 },
+        ]);
+      }),
+    ),
+);
+
+it.effect.each([-1, 0, 1048576, 9007199254740993n])(
+  "restores the exact journal_size_limit with safe integers after a crash (%s)",
+  (limit) =>
+    withFileClient((sql) =>
+      Effect.gen(function* () {
+        yield* sql`PRAGMA journal_mode=WAL`;
+        yield* sql`CREATE TABLE limit_entries(value INTEGER)`;
+        yield* sql`INSERT INTO limit_entries VALUES (1)`;
+        assert.deepEqual(
+          yield* sql
+            .unsafe(`PRAGMA journal_size_limit=${limit}`)
+            .pipe(Effect.provideService(SqlClient.SafeIntegers, true)),
+          [{ journal_size_limit: BigInt(limit) }],
+        );
+        const writer = writerWorkers.at(-1)!;
+        const count = writerWorkers.length;
+        yield* Effect.promise(() => writer.terminate());
+        assert.deepEqual(
+          yield* sql`PRAGMA journal_size_limit`.pipe(
+            Effect.provideService(SqlClient.SafeIntegers, true),
+          ),
+          [{ journal_size_limit: BigInt(limit) }],
+        );
+        assert.equal(writerWorkers.length, count + 1);
+        yield* sql.withTransaction(sql`INSERT INTO limit_entries VALUES (2)`);
+        assert.deepEqual(yield* sql`SELECT value FROM limit_entries ORDER BY value`.values, [
+          [1],
+          [2],
+        ]);
+      }),
+    ),
+);
+
+it.effect.each([false, true])(
+  "keeps a commit successful when its recovery metadata fails (recapture=%s)",
+  (recapture) =>
+    withFileClient((sql, filename) =>
+      Effect.gen(function* () {
+        yield* sql`PRAGMA journal_mode=WAL`;
+        yield* sql`CREATE TABLE metadata_entries(value INTEGER)`;
+        const writer = writerWorkers.at(-1)!;
+        const count = writerWorkers.length;
+        let commits = 0;
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`CREATE TEMP TABLE metadata_buffer(value INTEGER)`;
+              yield* sql`INSERT INTO metadata_entries VALUES (1)`;
+              // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+              writer.postMessage({ testCheckpoint: true, kind: "fail-metadata", args: [1] });
+              yield* writerBridgeBarrier(writer);
+            }),
+          )
+          .pipe(
+            Effect.provideService(SqliteClient.TransactionCommitObserver, () => {
+              commits++;
+            }),
+          );
+        assert.equal(commits, 1);
+        const observer = yield* openDatabase(filename);
+        assert.deepEqual(observer.prepare("SELECT value FROM metadata_entries").all(), [
+          { value: 1 },
+        ]);
+        if (recapture) {
+          assert.deepEqual(yield* sql`SELECT 1 AS value`, [{ value: 1 }]);
+        }
+        yield* Effect.promise(() => writer.terminate());
+        if (recapture) {
+          assert.deepEqual(yield* sql`SELECT value FROM metadata_entries`, [{ value: 1 }]);
+          assert.equal(writerWorkers.length, count + 1);
+          assert.deepEqual(yield* sql`SELECT value FROM temp.metadata_buffer`, []);
+        } else {
+          for (let attempt = 0; attempt < 2; attempt++) {
+            const unavailable = yield* sql`SELECT value FROM metadata_entries`.pipe(Effect.flip);
+            assert.include(
+              String(unavailable.reason.cause),
+              "connection state could not be observed",
+            );
+            assert.equal(writerWorkers.length, count);
+          }
+        }
+        assert.equal(commits, 1);
+        assert.deepEqual(observer.prepare("SELECT value FROM metadata_entries").all(), [
+          { value: 1 },
+        ]);
       }),
     ),
 );

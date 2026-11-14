@@ -1265,49 +1265,86 @@ interface WriterSetupStatement {
   readonly sql: string;
   readonly params: ReadonlyArray<unknown>;
 }
+interface WriterAttachment extends WriterSetupStatement {
+  readonly schema: string;
+}
+interface WriterPragma {
+  readonly schema: string;
+  readonly name: string;
+  readonly value: number | bigint | string;
+}
+interface WriterSchema {
+  readonly schema: string;
+  readonly sql: string;
+}
 interface WriterSetupReply {
-  readonly setup?: WriterSetupStatement;
-  readonly immediateSetup?: boolean;
+  readonly attachments?: ReadonlyArray<WriterAttachment>;
+  readonly settings?: ReadonlyArray<WriterPragma>;
+  readonly schemas?: ReadonlyArray<WriterSchema>;
   readonly inTransaction?: boolean;
-  readonly control?: { readonly action: string; readonly savepoint?: string };
+  readonly recoveryReady?: boolean;
 }
 
-// Only connection-local setup is replayed. Persistent writes and unknown commits
-// are never retried when the next acquisition replaces a lost worker.
+// Recovery restores acknowledged connection state, never a history of SQL.
+// In particular, SQLite can authorize ATTACH internally for VACUUM INTO.
 const makeWriterSetup = () => {
-  const entries: WriterSetupStatement[] = [];
-  let pending: WriterSetupStatement[] = [];
-  let savepoints: Array<{ name: string; at: number }> = [];
+  let attachments: ReadonlyArray<WriterAttachment> = [];
+  let settings: ReadonlyArray<WriterPragma> = [];
+  let schemas: ReadonlyArray<WriterSchema> = [];
+  let inTransaction = false;
+  let canRecover = true;
+  const quote = (name: string) => `"${name.replaceAll('"', '""')}"`;
+  const pragma = (entry: WriterPragma): WriterSetupStatement => ({
+    sql: `PRAGMA ${quote(entry.schema)}.${quote(entry.name)} = ${typeof entry.value === "string" ? `'${entry.value.replaceAll("'", "''")}'` : String(entry.value)}`,
+    params: [],
+  });
+  const afterSchema = (entry: WriterPragma) =>
+    entry.name === "query_only" || entry.name === "defer_foreign_keys";
   const reset = () => {
-    pending = [];
-    savepoints = [];
+    if (inTransaction)
+      settings = settings.map((entry) =>
+        entry.name === "defer_foreign_keys" ? { ...entry, value: 0 } : entry,
+      );
+    inTransaction = false;
   };
   const record = (reply: WriterSetupReply) => {
-    const control = reply.control;
-    if (control?.savepoint !== undefined) {
-      // SQLite identifiers fold ASCII case, including quoted savepoint names.
-      const name = control.savepoint.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
-      const index = savepoints.findLastIndex((entry) => entry.name === name);
-      if (control.action === "BEGIN") savepoints.push({ name, at: pending.length });
-      else if (index !== -1) {
-        if (control.action === "ROLLBACK") pending.length = savepoints[index]!.at;
-        savepoints.length = control.action === "ROLLBACK" ? index + 1 : index;
-      }
-    } else if (control?.action === "ROLLBACK") reset();
-    if (reply.setup !== undefined) {
-      if (reply.immediateSetup || !reply.inTransaction) entries.push(reply.setup);
-      else pending.push(reply.setup);
+    if (reply.recoveryReady !== undefined) canRecover = reply.recoveryReady;
+    if (reply.attachments !== undefined) {
+      attachments = reply.attachments;
+      const present = new Set(["temp", ...attachments.map((entry) => entry.schema)]);
+      schemas = schemas.filter((entry) => present.has(entry.schema));
     }
-    if (!reply.inTransaction) {
-      if (pending.length > 0)
-        entries.push({ sql: "BEGIN", params: [] }, ...pending, { sql: "COMMIT", params: [] });
-      reset();
-    }
+    if (reply.settings !== undefined) settings = reply.settings;
+    if (reply.schemas !== undefined) schemas = reply.schemas;
+    inTransaction = reply.inTransaction ?? inTransaction;
   };
-  return { entries, record, reset };
+  return {
+    get attachments() {
+      return attachments;
+    },
+    get canRecover() {
+      return canRecover;
+    },
+    get entries(): ReadonlyArray<WriterSetupStatement> {
+      return [
+        ...attachments,
+        ...settings.filter((entry) => !afterSchema(entry)).map(pragma),
+        ...schemas.map((entry) => ({ sql: entry.sql, params: [] })),
+      ];
+    },
+    // These flags can prevent schema restoration, or be reset by that restoration.
+    get postSetup() {
+      return settings.filter(afterSchema).map(pragma);
+    },
+    record,
+    reset,
+  };
 };
 
-type WriterConnection = Connection & { readonly ensure: Effect.Effect<void, SqlError> };
+type WriterConnection = Connection & {
+  readonly ensure: Effect.Effect<void, SqlError>;
+  readonly release: Effect.Effect<void>;
+};
 
 // Each worker is one transaction generation. Replacement happens only after its
 // borrower releases the writer permit, so an interrupted transaction cannot move.
@@ -1320,7 +1357,12 @@ let db;
 const statements = new Map();
 const classifications = new WeakMap();
 let activeClassification;
-let memorySchemas = new Set(["temp"]);
+let memorySchemas = new Set();
+let deferredForeignKeys = false;
+let configurationDirty = false;
+let schemaDirty = false;
+let openingFailed = false;
+const attachmentStatements = new Map((workerData.attachments ?? []).map(entry => [entry.schema, entry]));
 const setupPragmas = new Set(["busy_timeout", "foreign_keys", "defer_foreign_keys", "synchronous",
   "fullfsync", "checkpoint_fullfsync", "journal_size_limit", "cache_size", "temp_store", "mmap_size",
   "wal_autocheckpoint", "query_only", "recursive_triggers", "trusted_schema", "locking_mode"]);
@@ -1330,7 +1372,8 @@ const setupActions = [constants.SQLITE_CREATE_TEMP_TABLE, constants.SQLITE_CREAT
   constants.SQLITE_DROP_TEMP_TRIGGER, constants.SQLITE_DROP_TEMP_VIEW];
 const memorySchemaActions = [constants.SQLITE_CREATE_TABLE, constants.SQLITE_CREATE_INDEX,
   constants.SQLITE_CREATE_TRIGGER, constants.SQLITE_CREATE_VIEW,
-  constants.SQLITE_DROP_TABLE, constants.SQLITE_DROP_INDEX, constants.SQLITE_DROP_TRIGGER, constants.SQLITE_DROP_VIEW];
+  constants.SQLITE_DROP_TABLE, constants.SQLITE_DROP_INDEX, constants.SQLITE_DROP_TRIGGER, constants.SQLITE_DROP_VIEW,
+  constants.SQLITE_CREATE_VTABLE, constants.SQLITE_DROP_VTABLE];
 const localPragmas = new Set(["application_id", "auto_vacuum", "journal_mode", "schema_version", "user_version"]);
 const errorReply = (id, error, operation, extra = {}) => parentPort.postMessage({ id, ...extra, error: {
   operation, message: String(error.message || error), code: error.code,
@@ -1343,22 +1386,18 @@ try {
   if (typeof db.setAuthorizer === "function") db.setAuthorizer((code, action, argument, database) => {
     if (!activeClassification) return constants.SQLITE_OK;
     if (code === constants.SQLITE_ATTACH || code === constants.SQLITE_DETACH) {
-      activeClassification.setup = true;
-      activeClassification.immediateSetup = true;
-    } else if (setupActions.includes(code) || (memorySchemas.has(database) && memorySchemaActions.includes(code))) {
-      activeClassification.setup = true;
+      activeClassification.attachment = true;
+    }
+    if (setupActions.includes(code) || memorySchemaActions.includes(code) || code === constants.SQLITE_ALTER_TABLE) {
+      activeClassification.schema = true;
     }
     if (code === constants.SQLITE_TRANSACTION || code === constants.SQLITE_SAVEPOINT) {
-      activeClassification.control = { action, ...(code === constants.SQLITE_SAVEPOINT ? { savepoint: argument } : {}) };
       activeClassification.write ||= action === "BEGIN";
       activeClassification.check ||= code === constants.SQLITE_SAVEPOINT || action === "COMMIT" || action === "ROLLBACK";
     } else if (code === constants.SQLITE_PRAGMA) {
       const name = action?.toLowerCase();
-      if (argument !== null && setupPragmas.has(name) && !(name === "foreign_keys" && db.isTransaction)) {
-        activeClassification.setup = true;
-        activeClassification.immediateSetup = true;
-      }
-      activeClassification.foreignKeys ||= name === "foreign_keys";
+      activeClassification.configuration ||= argument !== null && setupPragmas.has(name);
+      activeClassification.schema ||= name === "temp_store" && argument !== null;
       activeClassification.journalMode ||= name === "journal_mode" && argument !== null;
       activeClassification.write ||= name === "optimize" || name === "incremental_vacuum" ||
         (name === "wal_checkpoint" && argument?.toLowerCase() !== "noop") ||
@@ -1370,13 +1409,110 @@ try {
   });
   for (const entry of workerData.setup ?? []) {
     const statement = db.prepare(entry.sql);
+    statement.setReadBigInts(true);
     if (statement.columns().length) statement.all(...entry.params);
     else statement.run(...entry.params);
   }
-  if (workerData.setup?.length) memorySchemas = new Set(["temp", ...db.prepare("PRAGMA database_list").all()
-    .filter(row => row.name !== "main" && row.file === "").map(row => row.name)]);
-  parentPort.postMessage({ type: "ready" });
-} catch (error) { errorReply(0, error, "open"); }
+  if (workerData.setup?.length) {
+    memorySchemas = new Set(db.prepare("PRAGMA database_list").all()
+      .filter(row => row.name !== "main" && row.file === "").map(row => row.name));
+  }
+} catch (error) { openingFailed = true; errorReply(0, error, "open"); }
+const quoteIdentifier = name => '"' + name.replaceAll('"', '""') + '"';
+const databases = () => db.prepare("PRAGMA database_list").all();
+const connectionSettings = () => {
+  const settings = [];
+  const names = new Set(["main", ...databases().map(entry => entry.name)]);
+  for (const schema of names) for (const name of setupPragmas) {
+    // The checkpoint controller owns this hook and restores SQLite's default on failure.
+    if (name === "wal_autocheckpoint" && workerData.checkpoint) continue;
+    const statement = db.prepare("PRAGMA " + quoteIdentifier(schema) + "." + name);
+    statement.setReadBigInts(true);
+    const row = statement.get();
+    const value = row && Object.values(row)[0];
+    if (typeof value === "number" || typeof value === "bigint" || typeof value === "string") settings.push({ schema, name, value });
+  }
+  deferredForeignKeys = Boolean(db.prepare("PRAGMA defer_foreign_keys").get().defer_foreign_keys);
+  return settings;
+};
+const volatileSchema = () => {
+  const statements = [];
+  const priority = { table: 0, index: 1, view: 2, trigger: 3 };
+  for (const schema of memorySchemas) {
+    const quoted = quoteIdentifier(schema);
+    const shadows = new Set(db.prepare("PRAGMA " + quoted + ".table_list").all()
+      .filter(entry => entry.type === "shadow").map(entry => entry.name));
+    const rows = db.prepare("SELECT name, type, sql FROM " + quoted + ".sqlite_schema WHERE sql IS NOT NULL ORDER BY rowid").all();
+    rows.sort((left, right) => priority[left.type] - priority[right.type]);
+    for (const row of rows) {
+      if (row.name.startsWith("sqlite_") || shadows.has(row.name)) continue;
+      // sqlite_schema stores CREATE statements without their schema qualifier.
+      const sql = row.sql.replace(/^(CREATE\\s+(?:(?:UNIQUE|VIRTUAL)\\s+)?(?:TABLE|INDEX|VIEW|TRIGGER)\\s+)/i, "$1" + quoted + ".");
+      statements.push({ schema, sql });
+    }
+  }
+  return statements;
+};
+const observeConnectionState = (classification, sql, params) => {
+  const snapshot = {};
+  if (classification?.attachment || typeof db.setAuthorizer !== "function") {
+    const current = databases();
+    const present = new Set(current.filter(entry => entry.name !== "main" && entry.name !== "temp").map(entry => entry.name));
+    for (const name of attachmentStatements.keys()) if (!present.has(name)) attachmentStatements.delete(name);
+    const head = sql?.replace(/^(?:\\s|--[^\\n]*(?:\\n|$)|\\/\\*[\\s\\S]*?\\*\\/)+/, "");
+    if (/^ATTACH\\b/i.test(head ?? "")) for (const name of present) {
+      if (!attachmentStatements.has(name)) attachmentStatements.set(name, { schema: name, sql, params });
+    }
+    memorySchemas = new Set(current.filter(entry => entry.name !== "main" && entry.file === "").map(entry => entry.name));
+    snapshot.attachments = [...attachmentStatements.values()];
+    configurationDirty = true;
+    schemaDirty = true;
+  }
+  if (deferredForeignKeys && !db.isTransaction) {
+    const current = Boolean(db.prepare("PRAGMA defer_foreign_keys").get().defer_foreign_keys);
+    configurationDirty ||= !current;
+  }
+  if (configurationDirty) {
+    snapshot.attachments = [...attachmentStatements.values()];
+    snapshot.settings = connectionSettings();
+    configurationDirty = false;
+  }
+  if (schemaDirty && !db.isTransaction) {
+    memorySchemas = new Set(databases().filter(entry => entry.name !== "main" && entry.file === "").map(entry => entry.name));
+    snapshot.schemas = volatileSchema();
+    schemaDirty = false;
+  }
+  return snapshot;
+};
+let recoveryFailureReported = false;
+const recoverySnapshot = (classification, sql, params) => {
+  // Introspection can itself end a read transaction. Preserve the flag as it
+  // stood after the user's SQL, rather than letting metadata reads consume it.
+  let deferBefore;
+  try {
+    if (deferredForeignKeys || configurationDirty)
+      deferBefore = Boolean(db.prepare("PRAGMA defer_foreign_keys").get().defer_foreign_keys);
+    const snapshot = observeConnectionState(classification, sql, params);
+    if (deferBefore !== undefined && snapshot.settings) snapshot.settings = snapshot.settings.map(entry =>
+      entry.name === "defer_foreign_keys" ? { ...entry, value: deferBefore ? 1 : 0 } : entry);
+    const ready = !recoveryFailureReported || (!configurationDirty && !schemaDirty);
+    if (ready) recoveryFailureReported = false;
+    return { ...snapshot, recoveryReady: ready };
+  } catch (cause) {
+    // Metadata failure must not turn a successful COMMIT into a failed write.
+    if (!recoveryFailureReported) parentPort.postMessage({ type: "recovery-error", error: {
+      code: cause?.code, errcode: cause?.errcode, errstr: cause?.errstr,
+    }});
+    recoveryFailureReported = true;
+    configurationDirty = true;
+    schemaDirty = true;
+    return { recoveryReady: false };
+  } finally {
+    if (deferBefore) {
+      try { db.exec("PRAGMA defer_foreign_keys = ON"); deferredForeignKeys = true; } catch {}
+    }
+  }
+};
 // Serialize statements while WAL admission is waiting on a pinned reader.
 let queue = Promise.resolve();
 let checkpointStarted = workerData.checkpointStarted;
@@ -1515,6 +1651,18 @@ const enableWal = () => {
   if (String(db.prepare("PRAGMA journal_mode").get().journal_mode).toLowerCase() === "wal") startCheckpoint();
 };
 try { if (db && workerData.checkpoint) enableWal(); } catch (cause) { reportCheckpoint(cause); }
+if (db && !openingFailed) {
+  try {
+    for (const entry of workerData.postSetup ?? []) {
+      const statement = db.prepare(entry.sql);
+      statement.setReadBigInts(true);
+      if (statement.columns().length) statement.all(...entry.params);
+      else statement.run(...entry.params);
+    }
+    if (workerData.postSetup?.length) deferredForeignKeys = Boolean(db.prepare("PRAGMA defer_foreign_keys").get().defer_foreign_keys);
+    parentPort.postMessage({ type: "ready" });
+  } catch (error) { openingFailed = true; errorReply(0, error, "open"); }
+}
 parentPort.on("message", (request) => {
   if (request.cancel !== undefined) { wakeAdmission(); return; }
   queue = queue.then(async () => {
@@ -1531,6 +1679,10 @@ parentPort.on("message", (request) => {
       db.close();
       parentPort.postMessage({ id, rows: [] });
       parentPort.close();
+      return;
+    }
+    if (request.rollbackIfOpen && !db.isTransaction) {
+      parentPort.postMessage({ id, rows: [], inTransaction: false });
       return;
     }
     if (checkpointStart) {
@@ -1554,12 +1706,13 @@ parentPort.on("message", (request) => {
     }
     observedWrite = Boolean(classifications.get(statement)?.write || classifications.get(statement)?.check);
     mayWrite = observedWrite || db.isTransaction;
+    configurationDirty ||= Boolean(classifications.get(statement)?.configuration) || typeof db.setAuthorizer !== "function";
+    schemaDirty ||= Boolean(classifications.get(statement)?.schema) || typeof db.setAuthorizer !== "function";
     if (classifications.get(statement)?.write) await checkpoint?.admit(id);
     if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
     operation = "execute";
     statement.setReadBigInts(safeIntegers);
     statement.setReturnArrays(values);
-    const beforeTransaction = db.isTransaction;
     const start = performance.now();
     executionStarted = start;
     activeClassification = classifications.get(statement);
@@ -1575,24 +1728,14 @@ parentPort.on("message", (request) => {
     }
     const committed = !db.isTransaction && /^\\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\\b/i.test(sql);
     const classification = classifications.get(statement);
-    if (classification?.immediateSetup) memorySchemas = new Set(["temp", ...db.prepare("PRAGMA database_list").all()
-      .filter(row => row.name !== "main" && row.file === "").map(row => row.name)]);
     parentPort.postMessage({ id, rows, committed, write: observedWrite, elapsedMs: performance.now() - start,
-      inTransaction: db.isTransaction, control: classification?.control,
-      ...(classification?.setup && !(classification.foreignKeys && beforeTransaction) ? { setup: { sql, params }, immediateSetup: classification.immediateSetup } : {}) });
+      inTransaction: db.isTransaction,
+      ...recoverySnapshot(classification, sql, params) });
   } catch (error) {
-    // A deferred constraint can reject COMMIT while leaving the transaction open.
-    // Never lend that transaction to the next caller.
-    if (/^\\s*(?:COMMIT|END|ROLLBACK)\\b/i.test(sql) && db?.isTransaction) {
-      try { db.exec("ROLLBACK"); }
-      catch {
-        try { db.close(); } catch {}
-        db = undefined;
-        statements.clear();
-      }
-    }
     activeClassification = undefined;
-    errorReply(id, error, operation, { inTransaction: db?.isTransaction ?? false, write: observedWrite, elapsedMs: executionStarted === undefined ? undefined : performance.now() - executionStarted });
+    const elapsedMs = executionStarted === undefined ? undefined : performance.now() - executionStarted;
+    const snapshot = db ? recoverySnapshot(undefined, undefined, undefined) : {};
+    errorReply(id, error, operation, { ...snapshot, inTransaction: db?.isTransaction ?? false, write: observedWrite, elapsedMs });
   } finally {
     // Authorizer classification covers CTE/commented writes; transaction state
     // covers RELEASE/ROLLBACK. OR FAIL may persist rows despite throwing.
@@ -1624,6 +1767,8 @@ const makeWriterSession = Effect.fnUntraced(function* (
         workerData: {
           filename: options.filename,
           setup: setup.entries,
+          postSetup: setup.postSetup,
+          attachments: setup.attachments,
           readonly: options.readonly ?? false,
           allowExtension: options.allowExtension ?? false,
           checkpoint: options.checkpointWorker ?? false,
@@ -1661,6 +1806,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
   const pending = new Map<number, (reply: Reply) => void>();
   let nextId = 0;
   let stopped: string | undefined;
+  let inTransaction = false;
   let announce: (error?: unknown) => void = () => {};
   let ready = false;
   const started = new Promise<unknown>((resolve) => {
@@ -1685,9 +1831,20 @@ const makeWriterSession = Effect.fnUntraced(function* (
         | Reply
         | { type: "ready" }
         | { type: "checkpoint-warning"; reason: string }
+        | { type: "recovery-error"; error: unknown }
         | { type: "checkpoint-error"; connection: "writer" | "checkpoint"; error: unknown }
         | { waiting: number },
     ) => {
+      if ("type" in reply && reply.type === "recovery-error") {
+        classifyError(
+          Object.assign(new Error("SQLite writer recovery snapshot failed"), reply.error),
+          "SQLite writer recovery snapshot failed",
+          "recovery",
+          options,
+          "writer",
+        );
+        return;
+      }
       if ("type" in reply && reply.type === "checkpoint-warning") {
         runFork(
           Effect.logWarning(
@@ -1722,6 +1879,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
         announce(Object.assign(new Error(reply.error.message), reply.error));
         return;
       }
+      if (reply.inTransaction !== undefined) inTransaction = reply.inTransaction;
       const resume = pending.get(reply.id);
       pending.delete(reply.id);
       if (pending.size === 0) worker.unref();
@@ -1732,7 +1890,11 @@ const makeWriterSession = Effect.fnUntraced(function* (
   worker.on("exit", (code) => stop(`SQLite writer exited (${code}); outcome may be unknown`));
 
   const request: (
-    input: Partial<ReaderRequest> & { close?: boolean; checkpointStart?: boolean },
+    input: Partial<ReaderRequest> & {
+      close?: boolean;
+      checkpointStart?: boolean;
+      rollbackIfOpen?: boolean;
+    },
     onClassification?: (write: boolean) => void,
   ) => Effect.Effect<ReadonlyArray<any>, SqlError> = (input, onClassification) =>
     Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
@@ -1764,6 +1926,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
           }
           if ("error" in reply) {
             if (reply.inTransaction === false) setup.reset();
+            setup.record(reply);
             resume(
               Effect.fail(
                 failed(
@@ -1907,8 +2070,32 @@ const makeWriterSession = Effect.fnUntraced(function* (
       statementObserver,
     );
   };
+  const retire = Effect.promise(() => {
+    stop("SQLite writer retired after transaction cleanup failed");
+    return worker.terminate();
+  }).pipe(Effect.asVoid);
+  // A failed raw COMMIT retains SQLite's transaction while the caller owns its
+  // reservation. Only the lease boundary may roll it back or retire the worker.
+  const release = Effect.suspend(() =>
+    stopped !== undefined
+      ? retire
+      : !inTransaction
+        ? Effect.void
+        : request({
+            sql: "ROLLBACK",
+            params: [],
+            cached: false,
+            values: false,
+            raw: false,
+            rollbackIfOpen: true,
+          }).pipe(
+            Effect.asVoid,
+            Effect.catch(() => retire),
+          ),
+  );
   return {
     healthy: () => stopped === undefined,
+    release,
     connection: identity<Connection>({
       execute(sql, params, transform) {
         const result = run(sql, params);
@@ -1945,12 +2132,23 @@ const makeWriter = Effect.fnUntraced(function* (
       : Effect.gen(function* () {
           yield* Scope.close(sessionScope, Exit.void);
           setup.reset();
+          if (!setup.canRecover)
+            return yield* new SqlError({
+              reason: classifyError(
+                new Error("SQLite connection state could not be observed"),
+                "Failed to restore SQLite writer connection",
+                "open",
+                options,
+                "writer",
+              ),
+            });
           sessionScope = yield* Scope.fork(parentScope, "sequential");
           session = yield* open();
         }),
   ).pipe(Effect.uninterruptible);
   return identity<WriterConnection>({
     ensure,
+    release: Effect.suspend(() => session.release),
     execute: (sql, params, transform) =>
       Effect.suspend(() => session.connection.execute(sql, params, transform)),
     executeRaw: (sql, params) => Effect.suspend(() => session.connection.executeRaw(sql, params)),
@@ -2265,6 +2463,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
 
     return identity<WriterConnection>({
       ensure: Effect.void,
+      release: Effect.void,
       execute(sql, params, rowTransform) {
         return rowTransform ? Effect.map(run(sql, params), rowTransform) : run(sql, params);
       },
@@ -2641,7 +2840,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
             observeReader(target, readerWait, grant.lockWaitMs),
             Scope.addFinalizer(
               scope,
-              target.lock.release(1).pipe(
+              (target.name === "writer" ? connection.release : Effect.void).pipe(
+                Effect.ensuring(target.lock.release(1)),
                 Effect.andThen(
                   Effect.suspend(() => {
                     const held = holdMs(clock, granted);
