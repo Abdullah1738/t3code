@@ -18,6 +18,12 @@ from http.client import RemoteDisconnected
 _spec = importlib.util.spec_from_file_location("ph_retry_under_test", Path(__file__).with_name("ph.py"))
 ph = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ph)
+try:
+    from uiautomator2.exceptions import RPCUnknownError
+except ImportError:
+    # The library exception has no custom formatting; retain its tuple/params repr offbox.
+    class RPCUnknownError(Exception): pass
+
 TREE = '<hierarchy><node text="Copy" bounds="[0,0][20,20]" package="dev.test" /></hierarchy>'
 
 
@@ -112,6 +118,83 @@ class RetryTests(unittest.TestCase):
                 for fragment in text.splitlines():
                     self.assertNotIn(fragment, evidence)
                 self.assertNotIn(base64.b64encode(text.encode()).decode(), evidence)
+
+    def test_serialized_typed_input_never_leaves_fragments(self):
+        inputs = [
+            "dummyPRIVATE_SUFFIX",
+            "dummy'PRIVATE_SUFFIX",
+            'dummy"PRIVATE_SUFFIX',
+            "dummy'quoted\"PRIVATE_SUFFIX",
+            'dummy"quoted\'PRIVATE_SUFFIX',
+            "dummy\\'quoted\"PRIVATE_SUFFIX",
+            "dummy\\\\'quoted\"PRIVATE_SUFFIX",
+            "dummy\nquoted'\"PRIVATE_SUFFIX",
+            "dummy\tquoted'\"PRIVATE_SUFFIX",
+            "dummyرمز'\"PRIVATE_SUFFIX",
+            'dummy"PRIVATE_SUFFIX\n"',
+            "dummy'PRIVATE_SUFFIX\n'",
+            'dummy"PRIVATE_SUFFIX\n\\',
+            'dummy"PRIVATE_SUFFIX\r\n"',
+        ]
+        formats = [
+            ("python-repr", repr),
+            ("json", json.dumps),
+            ("json-unicode", lambda value: json.dumps(value, ensure_ascii=False)),
+            ("json-nested", lambda value: json.dumps(json.dumps(value))),
+            ("json-deep", lambda value: json.dumps(json.dumps(json.dumps(value)))),
+            ("json-truncated", lambda value: json.dumps(value)[:-1]),
+            ("json-content", lambda value: json.dumps(value)[1:-1]),
+        ]
+        for text in inputs:
+            for name, encode in formats:
+                with self.subTest(input=text, format=name):
+                    self.device.send_keys.reset_mock()
+                    self.device.send_keys.side_effect = RPCUnknownError("RPC failed", [text], "stack")
+                    log = "InputMethod: payload=" + encode(text)
+                    def adb(args, t=5, strict=False):
+                        return log if "logcat" in args else self.adb(args, t, strict)
+                    with patch.object(ph, "_run", adb):
+                        code, out = self.cli("type", text)
+                    self.assertEqual(code, 4)
+                    self.device.send_keys.assert_called_once_with(text, clear=False)
+                    row = self.events()[-1]
+                    self.assertEqual((row["event"], row["exc_type"], row["phase"]),
+                                     ("maybe_sent", "RPCUnknownError", "action"))
+                    outputs = {"stdout": out, "exception": row["exc_message"],
+                               "logcat": Path(row["drop_log"]).read_text(),
+                               "events": (ph.STATE / "events.jsonl").read_text()}
+                    for name, output in outputs.items():
+                        with self.subTest(output=name):
+                            self.assertNotIn("PRIVATE_SUFFIX", output)
+                            self.assertNotIn(base64.b64encode(text.encode()).decode(), output)
+
+    def test_note_drop_serialized_values_without_private_input_context(self):
+        text = "dummy'quoted\"PRIVATE_SUFFIX"
+        exc = RPCUnknownError("RPC failed", [text], "stack")
+        formats = [repr(text), json.dumps({"params": [text]}),
+                   json.dumps(json.dumps({"params": [text]})),
+                   json.dumps(text)[:-1]]
+        for encoded in formats:
+            with self.subTest(encoded=encoded):
+                def adb(args, t=5, strict=False):
+                    return "InputMethod: " + encoded if "logcat" in args else self.adb(args, t, strict)
+                with patch.object(ph, "_run", adb):
+                    code, _ = self.cli("note-drop", "--source", "torssh", "--cmd", "type",
+                                       "--exc", "RPCUnknownError", "--msg", str(exc))
+                self.assertEqual(code, 0)
+                row = self.events()[-1]
+                self.assertNotIn("PRIVATE_SUFFIX", row["exc_message"])
+                self.assertNotIn("PRIVATE_SUFFIX", Path(row["drop_log"]).read_text())
+        ph.d.assert_not_called()
+
+    def test_unquoted_diagnostics_keep_failure_context(self):
+        with patch.object(ph, "_private_values", ()):
+            self.assertEqual(ph.diagnostic("Remote end closed connection without response"),
+                             "Remote end closed connection without response")
+            self.assertEqual(ph.diagnostic("InputMethod: switching to com.example/.AdbKeyboard"),
+                             "InputMethod: switching to com.example/.AdbKeyboard")
+            self.assertEqual(ph.diagnostic("InputMethod: text=private-input"),
+                             "InputMethod: text=[redacted]")
 
     def test_every_action_drop_is_single_send(self):
         cases = [(('tap', '10', '20'), 'click', 'coords'),

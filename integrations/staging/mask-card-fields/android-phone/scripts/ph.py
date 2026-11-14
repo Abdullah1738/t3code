@@ -194,12 +194,18 @@ def redact(text, field=""):
     return redact_text(text)
 def diagnostic(text):
     text = str(text)
-    for value in sorted(_private_values, key=len, reverse=True):
-        if value: text = text.replace(value, "[redacted]")
-    # Transport messages and logcat can include RPC/IME payloads, not just card fields.
+    # A fragment replacement can corrupt delimiters in nested or truncated payloads.
+    # Keep structured context in event fields; never persist quoted free-form data.
+    if "'" in text or '"' in text: return "[redacted payload]"
+    private = set()
+    for value in _private_values:
+        if value:
+            private.update((value, repr(value)[1:-1], ascii(value)[1:-1],
+                            json.dumps(value)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1]))
+    for value in sorted(private, key=len, reverse=True):
+        text = text.replace(value, "[redacted]")
     text = re.sub(r"(?i)\b(text|password|token|secret|clipboard|params|extras|args)\s*[:=].*",
                   r"\1=[redacted]", text)
-    text = re.sub(r"'[^'\n]*'|\"[^\"\n]*\"", "[redacted]", text)
     return redact_text(text)
 
 def token(value, fallback="unknown"):
