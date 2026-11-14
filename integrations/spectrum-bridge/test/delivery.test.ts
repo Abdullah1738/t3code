@@ -1227,5 +1227,20 @@ test("tool-mode latency keeps its inbound clock after the turn has already ended
   const sent = logs.find(l => l.name === "reply.sent");
   expect(sent?.durationMs).toBeGreaterThanOrEqual(10000);
   expect(sent?.props?.inboundKnown).toBe(true);
+  expect(sent?.ids).toMatchObject({ chat: "owner", inboundId: "tool-inbound", threadId: "thread-fixture" });
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
+});
+
+
+test.each(["validation", "provider"])("%s failure logs the chat, operation, thread and inbound id", async failure => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const logs = await captureLogs(async () => {
+    const h = setup();
+    const delivery = new Delivery(h.store, h.transport, { ...h.options, chat: "moni" });
+    h.enqueue("failed-chain-fixture", { text: failure === "validation" ? "" : "PRIVATE_REPLY", replyTo: "inbound-fixture", sessionId: "thread-fixture" });
+    h.transport.sendText.mockImplementation(async () => { throw new TransportError("http_400:stop_opt_out", false, false); });
+    await delivery.tick();
+  });
+  expect(logs.find(l => l.name === "reply.failed")?.ids).toMatchObject({ chat: "moni", operationId: "failed-chain-fixture", inboundId: "inbound-fixture", threadId: "thread-fixture" });
   expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
 });

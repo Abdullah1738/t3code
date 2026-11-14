@@ -84,5 +84,6 @@ it.effect("decodes a watch saved before passed checks were recorded", () =>
     assert.deepStrictEqual(link?.watch?.passedPending, []);
     assert.strictEqual(link?.watch?.conflictHead, null);
     assert.strictEqual(link?.watch?.conflictWokeFor, null);
+    assert.isUndefined(link?.watch?.observedHeadSha);
   }),
 );

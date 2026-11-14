@@ -39,7 +39,7 @@ Local data: `~/Documents/assistant/inbox-triage/{prefs.md,noise.json,settings.js
 ## Verify
 
 ```sh
-/usr/bin/python3 -B -m unittest -v test_triage.py test_urgent.py test_mail_retry.py test_install.py test_lock.py test_fastpath.py
+ROBOB_TEST=1 /usr/bin/python3 -B -m unittest -v test_triage.py test_urgent.py test_mail_retry.py test_install.py test_lock.py test_fastpath.py
 unset BUN_INSPECT
 robob-watch test inbox-triage
 robob-watch test inbox-triage-fastpath

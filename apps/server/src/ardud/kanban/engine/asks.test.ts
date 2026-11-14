@@ -833,6 +833,23 @@ describe("subtask approval options", () => {
     assert.strictEqual(Asks.approvalWarning(target, revised), expected);
   });
 
+  it("uses the board's guessed gates while keeping explicit gates and negation", () => {
+    assert.isUndefined(Asks.approvalWarning(target, diaAsk(), []));
+    assert.isUndefined(Asks.approvalWarning(target, diaAsk(), ["money"]));
+    assert.include(Asks.approvalWarning(target, diaAsk(), ["deploy"])!, "s4 (deploy steps)");
+    assert.include(
+      Asks.approvalWarning({ subtasks: [{ ...s4, gate: "deploy" }] }, diaAsk(), [])!,
+      "s4 (deploy steps)",
+    );
+    assert.isUndefined(
+      Asks.approvalWarning(
+        { subtasks: [{ ...s4, text: "No install; just inspect the guard" }] },
+        diaAsk(),
+        ["deploy"],
+      ),
+    );
+  });
+
   it("doesn't warn when explicit scope, ids or gate wording give a match", () => {
     const base = diaAsk();
     for (const candidate of [

@@ -284,6 +284,7 @@ export function delegatedTaskProgress(projection: {
     .filter((run) => terminal(run.status) && (run.startedAt !== null || run.ordinal === 1))
     .toSorted((a, b) => (runRanAfter(a, b) ? -1 : runRanAfter(b, a) ? 1 : 0))[0];
   return {
+    hasPendingWork: active || children,
     state:
       active || resultRun === undefined
         ? ("working" as const)

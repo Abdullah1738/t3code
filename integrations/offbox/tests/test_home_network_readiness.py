@@ -12,10 +12,13 @@ from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skill' / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
-sys.path.insert(0, str(SCRIPTS / 'tests'))
 from offbox_lib import allocation, api, common, home, lease, pool
-from test_capacity import Isolated
-from test_resume_stuck import Clock
+if __package__:
+    from .client_fixtures import Isolated
+    from .test_resume_stuck import Clock
+else:
+    from client_fixtures import Isolated
+    from test_resume_stuck import Clock
 
 
 class HomeNetworkReadiness(Isolated):

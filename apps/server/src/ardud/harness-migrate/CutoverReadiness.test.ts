@@ -802,8 +802,14 @@ describe("CutoverReadiness", () => {
           distinct.filter((result) => result.id.startsWith("model:")),
           2,
         );
-        failed(distinct, "evidence-model:codex/gpt-6.1-sol#reasoningEffort=xhigh&serviceTier=default");
-        failed(distinct, "evidence-route:codex/gpt-6.1-sol#reasoningEffort=xhigh&serviceTier=default");
+        failed(
+          distinct,
+          "evidence-model:codex/gpt-6.1-sol#reasoningEffort=xhigh&serviceTier=default",
+        );
+        failed(
+          distinct,
+          "evidence-route:codex/gpt-6.1-sol#reasoningEffort=xhigh&serviceTier=default",
+        );
       }).pipe(Effect.provide(testLayer)),
   );
 
@@ -1163,6 +1169,7 @@ describe("CutoverReadiness", () => {
         );
         const generator = f.path.join(pkg, "generate_homes.py");
         yield* f.fs.copyFile(f.path.join(source, "generate_homes.py"), generator);
+        yield* f.fs.copyFile(f.path.join(source, "toollog.py"), f.path.join(pkg, "toollog.py"));
         yield* f.fs.makeDirectory(f.path.join(pkg, "vendor"));
         yield* f.fs.copyFile(
           f.path.join(source, "vendor", "codex-models-0.166.0.json"),
@@ -1196,16 +1203,18 @@ describe("CutoverReadiness", () => {
         });
         yield* f.writeJson(f.path.join(pkg, "manifest.json"), manifest);
         const root = f.path.dirname(f.homes.claude!);
+        const env = { ...process.env, HOME: pkg, TOOLLOG_ROOT: f.path.join(pkg, "logs") };
         yield* Effect.try(() =>
           NodeChildProcess.execFileSync("python3", [generator, "generate", "--home-root", root], {
             encoding: "utf8",
+            env,
           }),
         );
         const report = yield* Effect.try(() =>
           NodeChildProcess.execFileSync(
             "python3",
             [generator, "check", "--home-root", root, "--json"],
-            { encoding: "utf8" },
+            { encoding: "utf8", env },
           ),
         );
         yield* f.writeEvidence({ homesCheck: JSON.parse(report) });
@@ -1213,6 +1222,80 @@ describe("CutoverReadiness", () => {
           (yield* f.check([...selections])).filter((row) => !row.ready),
           [],
         );
+        yield* f.writeEvidence({
+          homesCheck: JSON.parse(report),
+          checks: {
+            ...f.evidence.checks,
+            "t3-codex-cu": { ready: true, reason: "CU T3 passed." },
+            "dia-codex-cu": { ready: true, reason: "CU Dia passed." },
+          },
+        });
+        for (const name of ["claude", "codex", "codex-cu"]) {
+          const parityFile = f.path.join(f.homes[name]!, "parity-manifest.json");
+          const original = yield* f.fs.readFileString(parityFile);
+          const parity = JSON.parse(original) as {
+            artifacts: Array<{ path: string; sha256: string; format?: string }>;
+          };
+          const ownedFile = name === "claude" ? ".claude.json" : "config.toml";
+          const rawFile = name === "claude" ? "settings.json" : "hooks.json";
+          for (const [file, format, ready] of [
+            [ownedFile, "claude-owned-json", name === "claude"],
+            [ownedFile, "codex-owned-json", name !== "claude"],
+            [ownedFile, undefined, name !== "claude"],
+            [ownedFile, "unknown", false],
+            [rawFile, undefined, true],
+            [rawFile, "claude-owned-json", false],
+            [rawFile, "codex-owned-json", false],
+          ] as const) {
+            const artifacts = [];
+            for (const artifact of parity.artifacts) {
+              if (f.path.basename(artifact.path) !== file) {
+                artifacts.push(artifact);
+                continue;
+              }
+              const { format: _format, ...rest } = artifact;
+              artifacts.push({
+                ...rest,
+                ...(format === undefined
+                  ? {
+                      sha256: NodeCrypto.createHash("sha256")
+                        .update(yield* f.fs.readFile(artifact.path))
+                        .digest("hex"),
+                    }
+                  : { format }),
+              });
+            }
+            yield* f.writeJson(parityFile, { ...parity, artifacts });
+            const results = yield* f.check([...selections, terra]);
+            assert.strictEqual(
+              results.every((row) => row.ready),
+              ready,
+              `${name}/${file}: ${format}`,
+            );
+          }
+          yield* f.fs.writeFileString(parityFile, original);
+        }
+        for (const name of ["codex", "codex-cu"]) {
+          const file = f.path.join(f.homes[name]!, "config.toml");
+          const original = yield* f.fs.readFileString(file);
+          for (const projects of [
+            '[projects."/fixture/space and 日常"]\ntrust_level = "trusted"\n',
+            '[projects."/fixture/a.b"]\ntrust_level = "untrusted"\n',
+            "",
+          ]) {
+            yield* f.fs.writeFileString(file, `${original}\n${projects}`);
+            assert.deepEqual(
+              (yield* f.check([...selections, terra])).filter((row) => !row.ready),
+              [],
+            );
+          }
+          yield* f.fs.writeFileString(
+            file,
+            original.replace('service_tier = "default"', 'service_tier = "priority"'),
+          );
+          failed(yield* f.check([...selections, terra]), `home:${name}`);
+          yield* f.fs.writeFileString(file, original);
+        }
         const claudeFile = f.path.join(f.homes.claude!, ".claude.json");
         const generated = JSON.parse(yield* f.fs.readFileString(claudeFile));
         yield* f.writeJson(claudeFile, {

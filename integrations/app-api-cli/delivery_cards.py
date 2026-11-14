@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 import time
 import traceback
+import order_identity
 from urllib.parse import urlparse
 
 APPS = Path.home() / '.local/share/imessage-apps'
@@ -30,15 +31,15 @@ BUN = str(Path.home() / '.bun/bin/bun')
 BRIDGE = str(Path.home() / '.local/share/spectrum-bridge/src/cli.ts')
 DUBAI = dt.timezone(dt.timedelta(hours=4))
 THEMES = {'noon': ('#feee00', '#16160f'), 'talabat': ('#ff5a00', '#201006'),
-          'careem': ('#00df72', '#062c1b'), 'amazon': ('#ffb347', '#202326')}
+          'careem': ('#00df72', '#062c1b'), 'amazon': ('#ffb347', '#202326'), 'web': ('#d7dce2', '#202326')}
 LANES = {'noon': ('minutes', 'nownow', 'supermall', 'main', 'food', 'marketplace'),
          'talabat': ('restaurants', 'mart', 'shops'), 'careem': ('food', 'quik', 'shops', 'box'),
-         'amazon': ('same-day',)}
-NAMES = {'noon': 'noon', 'talabat': 'Talabat', 'careem': 'Careem', 'amazon': 'Amazon'}
+         'amazon': ('same-day',), 'web': ('web',)}
+NAMES = {'noon': 'noon', 'talabat': 'Talabat', 'careem': 'Careem', 'amazon': 'Amazon', 'web': 'Website'}
 LABELS = {'minutes': 'Minutes', 'nownow': 'NowNow', 'supermall': 'Supermall', 'main': 'Main',
           'marketplace': 'Marketplace',
           'restaurants': 'Food', 'mart': 'Mart', 'shops': 'Shops', 'food': 'Food',
-          'quik': 'Quik', 'box': 'Box', 'same-day': 'Same-day'}
+          'quik': 'Quik', 'box': 'Box', 'same-day': 'Same-day', 'web': ''}
 
 
 def read(path, default=None):
@@ -85,6 +86,11 @@ def instant(value):
 def slug(app, order):
     base = re.sub('[^a-z0-9-]', '-', f'delivery-{app}-{order}'.lower())
     return base if len(base) <= 64 else base[:49] + '-' + hashlib.sha256(base.encode()).hexdigest()[:14]
+
+
+def card_slug(cfg):
+    identity = order_identity.tracker_id(cfg['app'], cfg['order'], cfg.get('merchant_domain'))
+    return slug('web', identity.removeprefix('order-web-')) if cfg['app'] == 'web' else slug(cfg['app'], cfg['order'])
 
 
 def image_url(value):
@@ -322,10 +328,10 @@ def lane(cfg, meta):
         order = cfg['order'].upper()
         return 'nownow' if order.startswith('NN') else 'food' if order.startswith('F') else 'marketplace' if order.startswith('N') else 'minutes'
     # Unknown Careem/Talabat vertical must not invent a food/grocery stage.
-    return 'same-day' if app == 'amazon' else ''
+    return 'web' if app == 'web' else 'same-day' if app == 'amazon' else ''
 
 
-def stage(data, food=False):
+def stage(data, food=False, nearby_label=None):
     steps = ['Confirmed', 'Preparing', 'Picked up', 'On the way', 'Delivered'] if food else [
         'Confirmed', 'Packed', 'Out for delivery', 'Delivered']
     current = str(data.get('status') or 'unknown').lower().replace('_', ' ')
@@ -353,6 +359,8 @@ def stage(data, food=False):
     if current == 'picked up' and not food:
         steps.insert(2, 'In transit')
         idx, label = 2, 'In transit'
+    if current == 'nearby' and nearby_label:
+        steps[idx] = label = nearby_label
     return steps, idx, label, current in ('delivered', 'cancelled')
 
 
@@ -373,6 +381,8 @@ def eta(data, cfg):
         if hours or mins:
             minutes = (int(hours[1])*60 if hours else 0) + (int(mins[2] or mins[1]) if mins else 0)
     at = checked + dt.timedelta(minutes=minutes) if checked and minutes is not None and 0 <= minutes < 2880 else None
+    if data.get('eta_source') == 'careem_notification':
+        at = instant(data.get('eta')) or at
     at = at or instant(data.get('eta')) or instant(cfg.get('eta'))
     if not at:
         return raw or 'No estimate yet', '', None
@@ -383,14 +393,26 @@ def eta(data, cfg):
 
 
 def view(cfg, data, meta):
+    if cfg['app'] == 'web':
+        data = {**data, 'whole_order_complete': False}
     vertical = lane(cfg, meta)
     food = vertical in ('food', 'restaurants')
-    steps, idx, label, terminal = stage(data, food)
+    nearby_label = 'Almost here' if cfg['app'] == 'careem' and vertical in ('food', 'quik') else None
+    steps, idx, label, terminal = stage(data, food, nearby_label)
+    if cfg['app'] == 'web':
+        current = data.get('status') or 'unknown'
+        if current in ('unknown', 'delivered', 'cancelled'):
+            current = data.get('last_confirmed_status', 'unknown')
+        if current in ('delivered', 'cancelled'):
+            current = 'unknown'
+        steps = ['Ordered', 'Shipped', 'Out for delivery', 'Delivered']
+        idx = {'ordered': 0, 'shipped': 1, 'out for delivery': 2, 'delivered': 3}.get(current, -1)
+        label = 'Cancelled' if current == 'cancelled' else steps[idx] if idx >= 0 else 'Tracking pending'
     big, sub, at = eta(data, cfg)
     if terminal:
         big, sub, at = label, '', None
     app = cfg['app']
-    brand = NAMES[app] + (' ' + LABELS[vertical] if vertical else '')
+    brand = (text(cfg.get('merchant_name')) or NAMES[app]) if app == 'web' else NAMES[app] + (' ' + LABELS[vertical] if vertical else '')
     store = text(meta.get('store') or cfg.get('store') or data.get('vendor_name'))
     if not store and ':' in cfg.get('label', ''):
         store = text(cfg['label'].split(':', 1)[0])
@@ -420,7 +442,7 @@ def view(cfg, data, meta):
             'order': cfg['order'], 'big': big, 'sub': sub, 'eta': at, 'stage': label,
             'word': at is None, 'summary': names(rows),
             'steps': steps, 'index': idx, 'terminal': terminal, 'partial': partial,
-            'checked_at': data.get('checked_at'), 'unavailable': bool(data.get('errors')),
+            'checked_at': data.get('checked_at'), 'unavailable': bool(data.get('errors')) and not data.get('live_source_ok'),
             'items': rows, 'count': sum(i['qty'] for i in rows) if rows else data.get('manifest_item_count'),
             'total': total, 'currency': text(meta.get('currency') or 'AED', 5),
             'theme': THEMES[app], 'sample': bool(meta.get('sample'))}
@@ -564,7 +586,7 @@ def build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
 
 
 def _build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
-    folder = Path(outdir) if outdir else APPS / slug(cfg['app'], cfg['order'])
+    folder = Path(outdir) if outdir else APPS / card_slug(cfg)
     folder.mkdir(parents=True, exist_ok=True)
     metadata = {**({} if public else read(folder / 'items.json')), **cfg.get('card_meta', {}), **(meta or {})}
     v = view(cfg, data, {**metadata, 'public':public})
@@ -853,7 +875,7 @@ def sync(cfg, data, *, send=False, recover=False):
         recipient = settings.get('chat') or cfg.get('chat') or cfg['for']
         # Public shares get a separate allowlisted directory. Legacy items.json
         # and arbitrary files must never become public through directory reuse.
-        public_slug = slug(cfg['app'], cfg['order'])
+        public_slug = card_slug(cfg)
         if recipient != 'owner':
             public_slug = public_slug[:48] + '-' + hashlib.sha256((key + ':public-v1').encode()).hexdigest()[:12]
         folder = APPS / public_slug
@@ -1012,6 +1034,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--app', required=True, choices=THEMES)
     ap.add_argument('--order', required=True)
+    ap.add_argument('--merchant-domain', help='web: registered merchant hostname')
     ap.add_argument('--dir')
     ap.add_argument('--items-file')
     ap.add_argument('--data-file', help='fixture/status JSON; never contacts a provider')
@@ -1022,10 +1045,15 @@ def main(argv=None):
     ap.add_argument('--loop', type=int, default=0, help='legacy compatibility; watcher hooks are preferred')
     ap.add_argument('--hours', type=float, default=4)
     a = ap.parse_args(argv)
-    if not re.fullmatch('[A-Za-z0-9_-]{1,80}', a.order):
-        ap.error('Invalid order ID')
-    cfg = read(ROOT / 'orders' / f'order-{a.app}-{a.order.lower()}.json')
+    try:
+        a.order = order_identity.order_id(a.app, a.order)
+        key = order_identity.tracker_id(a.app, a.order, a.merchant_domain)
+    except ValueError as exc:
+        ap.error(str(exc))
+    cfg = read(ROOT / 'orders' / (key + '.json'))
     cfg.update(app=a.app, order=a.order)
+    if a.app == 'web':
+        cfg.setdefault('merchant_domain', a.merchant_domain)
     if (a.send or a.recover_send or a.repair_link) and (a.data_file or a.dir or not cfg.get('delivery_card')):
         ap.error('--send requires a registered, enrolled order; no fixture or custom directory')
     if sum((a.send, a.recover_send, a.repair_link)) > 1:
@@ -1040,7 +1068,9 @@ def main(argv=None):
         if a.data_file:
             data = read(a.data_file)
         else:
-            p = subprocess.run([str(Path.home() / '.local/bin/order-watch'), 'status', '--app', a.app, '--order', a.order], capture_output=True, text=True, timeout=240)
+            domain_args = ['--merchant-domain', a.merchant_domain] if a.app == 'web' else []
+            p = subprocess.run([str(Path.home() / '.local/bin/order-watch'), 'status', '--app', a.app, '--order', a.order,
+                                *domain_args], capture_output=True, text=True, timeout=240)
             if p.returncode:
                 raise SystemExit('order-watch status failed')
             data = json.loads(p.stdout)

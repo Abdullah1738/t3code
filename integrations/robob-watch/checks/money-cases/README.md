@@ -30,7 +30,7 @@ money-cases close ID --outcome "refund landed 27 Oct"
 money-cases reopen ID --deadline 2026-11-01 --note "..."
 money-cases card-dead 5542 --note "cancelled 30 Oct, replaced by 2342"
 money-cases cards      # list dead cards
-money-cases brief      # one line for the morning brief, nothing when no case is open
+money-cases brief      # one line for the morning brief, including closed cases with running watchers
 ```
 
 A deadline is a date (meaning 09:00 Dubai that day) or an ISO time. Every open case needs one. Setting a new deadline re-arms the ping. Every change is kept in the case's `history`.
@@ -125,7 +125,7 @@ Card numbers and labelled codes or passwords (`OTP code 482913`, `OTP is 482 913
 ## Verify
 
 ```sh
-/usr/bin/python3 -B -m unittest -v test_accuracy.py test_cases.py test_charges.py test_install.py
+ROBOB_TEST=1 /usr/bin/python3 -B -m unittest -v test_accuracy.py test_cases.py test_charges.py test_install.py
 unset BUN_INSPECT
 robob-watch test money-cases
 ```
@@ -147,6 +147,8 @@ money-cases note-purchase --merchant MERCHANT --amount AMOUNT --currency CUR \
 Use `--asked-by moni` for her purchases. This records the request, not a payment or a ledger entry. The charge matcher (including inbox triage) checks merchant, exact amount/currency, last four digits and a 15-minute payment window before external lookups. Once matched, the note cannot explain a separate later charge. Purchase notes stay in the private case book, outside git.
 
 ## Daily unasked list
+
+The check records an Abdullah-owned charge as an `unmatched` case once it is at least two hours old and still has verdict `ask`. It stores `case_opened` on the question and opens only one case per card ending, amount, currency and alert time. Receipt waits, explained charges, unreadable sources, declines and Moni's charges do not open one. This records the case without asking him: the linked question keeps its original alert time for the daily list, and the case adds no separate prompt while it awaits his answer.
 
 The first non-quiet check each Dubai day raises one daily list when unasked charges older than 24 hours remain. Awaiting answers do not hold it. Run `money-cases unasked` (or `--json`) to inspect candidates without writing; add `--all` to see excluded items and their reasons; on the daily event, run `money-cases unasked --ask` and send its output as one message, never individual asks.
 

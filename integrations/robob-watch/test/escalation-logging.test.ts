@@ -43,7 +43,7 @@ test.each([
       const calls = readFileSync(capture, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
       expect(calls).toHaveLength(wakeCode ? 2 : 1);
       for (const args of calls) {
-        const text = args[args.indexOf("--text") + 1]!;
+        const text = args.find(arg => arg.startsWith("--text="))!.slice(7);
         expect(text).toContain("failing sources: outlook");
         expect(text).not.toContain("blind");
       }

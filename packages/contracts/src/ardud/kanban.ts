@@ -526,6 +526,29 @@ export const KanbanOwnerAsk = Schema.Struct({
   seq: Schema.NullOr(PositiveInt),
   /** Set once answered or dropped. */
   closedAt: Schema.NullOr(IsoDateTime),
+  timing: Schema.optional(
+    Schema.Struct({
+      kind: Schema.optional(
+        Schema.Literals(["approve", "pick", "draft", "action", "input", "notice"]),
+      ),
+      openAsksAtCreation: Schema.optional(NonNegativeInt),
+      notified: Schema.optional(
+        Schema.Struct({
+          in_app: Schema.optional(IsoDateTime),
+          telegram: Schema.optional(IsoDateTime),
+          push: Schema.optional(IsoDateTime),
+        }),
+      ),
+      firstSeen: Schema.optional(
+        Schema.Struct({
+          web: Schema.optional(IsoDateTime),
+          desktop: Schema.optional(IsoDateTime),
+          mobile: Schema.optional(IsoDateTime),
+        }),
+      ),
+      answeredVia: Schema.optional(Schema.Literals(["single", "batch", "free_text"])),
+    }),
+  ),
   /** A label for the layout; absent means "question". Behaviour comes from `kanbanAskResponse`. */
   kind: Schema.optional(KanbanAskKind),
   /** One short line saying what is being asked. */
@@ -1016,6 +1039,8 @@ export const KanbanCard = Schema.Struct({
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   movedAt: IsoDateTime,
+  /** Lifecycle clock for local analytics; movedAt may deliberately retain queue age on retry. */
+  analyticsStageEnteredAt: Schema.optional(IsoDateTime),
 });
 export type KanbanCard = typeof KanbanCard.Type;
 
@@ -1125,12 +1150,20 @@ export const kanbanCardNeedsOwner = (
     (card.stage === "needs_owner" &&
       card.asks.every((ask) => ask.closedAt !== null || kanbanAskIsNotice(ask))));
 
+/** Options shared by explicit card moves over HTTP and agent tools. */
+export const KanbanMoveOptions = Schema.Struct({
+  note: Schema.optional(Schema.NullOr(Schema.String)),
+  question: Schema.optional(Schema.NullOr(Schema.String)),
+  keepWait: Schema.optional(Schema.Boolean),
+});
+export type KanbanMoveOptions = typeof KanbanMoveOptions.Type;
+
 /** The card's wait, or null. */
 export const kanbanWait = (card: Pick<KanbanCard, "wait">): KanbanWait | null => card.wait ?? null;
 
 /**
- * A wait left behind: the card was moved after it was set, so whoever moved
- * it took the card on. The board drops such a wait without waking anyone.
+ * A wait left behind by a writer that moved the card without resolving it.
+ * The board clears it and wakes its requested role as a safety net.
  */
 export const kanbanWaitStale = (card: Pick<KanbanCard, "wait" | "movedAt">): boolean =>
   card.wait !== undefined && Date.parse(card.movedAt) > Date.parse(card.wait.at);
@@ -1959,6 +1992,7 @@ export const KanbanBoard = Schema.Struct({
   defaultCardModel: ModelSelection,
   reviewChains: Schema.Array(KanbanReviewChain),
   defaultReviewChain: Schema.NullOr(TrimmedNonEmptyString),
+  guessedGates: Schema.optional(Schema.Array(Schema.Literals(["deploy", "money", "secret"]))),
   instructions: KanbanInstructions,
   setup: Schema.NullOr(KanbanBoardSetup).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   pause: Schema.NullOr(KanbanBoardPause).pipe(Schema.withDecodingDefault(Effect.succeed(null))),

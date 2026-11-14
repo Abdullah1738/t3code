@@ -31,6 +31,52 @@ fi
 # Testcontainers: don't start ryuk reaper sidecar per run on a throwaway VM (faster), and let it find docker.
 grep -q TESTCONTAINERS_RYUK_DISABLED ~/.bashrc || sed -i '1i export TESTCONTAINERS_RYUK_DISABLED=true' ~/.bashrc
 
+# Cache warming is optional: registry failures must not prevent a box from running offline harness tests.
+pull_retry() {
+  local label="$1" output rc attempt delay=15
+  shift
+  output=$(mktemp) || return $?
+  for attempt in 1 2 3 4 5; do
+    if "$@" 2>&1 | tee "$output" >&2; then
+      rm -f "$output"
+      return 0
+    else
+      rc=${PIPESTATUS[0]}
+    fi
+    if [ "$attempt" -eq 5 ] || ! grep -Eiq 'toomanyrequests|Rate exceeded|429' "$output"; then
+      rm -f "$output"
+      return "$rc"
+    fi
+    echo "offbox: registry rate limit, retrying $label in ${delay}s (attempt $((attempt + 1))/5)"
+    if "${OFFBOX_PULL_SLEEP:-sleep}" "$delay"; then
+      delay=$((delay * 2))
+    else
+      rc=$?
+      rm -f "$output"
+      return "$rc"
+    fi
+  done
+}
+
+harness_prewarm_skipped() {
+  echo "offbox-harness-prewarm-skipped: $1; images will be pulled when the harness first runs"
+}
+harness_prewarm() {
+  COMPOSE_PARALLEL_LIMIT=2 pull_retry 'compose pull' docker compose -p offbox-harness-template pull --ignore-buildable --quiet || {
+    harness_prewarm_skipped "compose pull failed (exit $?)"; return 0;
+  }
+  docker compose -p offbox-harness-template build --quiet || {
+    harness_prewarm_skipped "compose build failed (exit $?)"; return 0;
+  }
+  docker compose -p offbox-harness-template create || {
+    harness_prewarm_skipped "compose create failed (exit $?)"; return 0;
+  }
+  # Compose's default project is platform; alias the FDB build so runs can reuse it without rebuilding.
+  docker tag offbox-harness-template-foundationdb:latest platform-foundationdb:latest || {
+    harness_prewarm_skipped "foundationdb image tag failed (exit $?)"; return 0;
+  }
+}
+
 # Harness platform stack: images pulled + fdb image built + containers created (not started).
 H=~/harness/platform
 mkdir -p "$H" ~/harness/evidence
@@ -40,13 +86,7 @@ fi
 if [ -f "$H/compose.yaml" ]; then
   cd "$H"
   export RUN_EVIDENCE_DIR=~/harness/evidence
-  docker compose -p offbox-harness-template pull --ignore-buildable --quiet
-  docker compose -p offbox-harness-template build --quiet
-  docker compose -p offbox-harness-template create
-  # Compose names a built image <project>-<service>. Without -p the project is the compose file's dir name
-  # ("platform", also for `-f docker/platform/compose.yaml`), so alias the FDB build there: runs then reuse it
-  # instead of rebuilding (~40 s). Another -p NAME: `docker tag platform-foundationdb NAME-foundationdb` first.
-  docker tag offbox-harness-template-foundationdb:latest platform-foundationdb:latest
+  harness_prewarm
   cd ~
 else
   echo "WARN: harness platform compose not uploaded; skipping stack images"
@@ -55,7 +95,7 @@ fi
 # Extra images the Crpko repos use outside that compose (devops localstack compose, testcontainers defaults).
 keep() {  # pull an image and pin it with a created container so snapshots keep it
   local img="$1" name="offbox-keep-$(echo "$1" | tr '/:@.' '----' | cut -c1-60)"
-  docker pull -q "$img" >/dev/null || { echo "WARN: pull $img failed"; return 0; }
+  pull_retry "$img" docker pull -q "$img" || { echo "WARN: pull $img failed"; return 0; }
   docker inspect "$name" >/dev/null 2>&1 || docker create --name "$name" --entrypoint /bin/true "$img" >/dev/null 2>&1 \
     || docker create --name "$name" "$img" >/dev/null
 }

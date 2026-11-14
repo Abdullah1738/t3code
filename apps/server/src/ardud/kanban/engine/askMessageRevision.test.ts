@@ -26,16 +26,7 @@ it.effect("the ask as asked is revision 0, each edit is the next one, and replie
           askRevision: 0,
         });
 
-        // Replies on the ask, his and the agent's, belong to it and are not a version of it.
-        const his = yield* kanban.replyOnAsk(
-          card.id,
-          "q1",
-          owner,
-          [{ _tag: "md", text: "Which build?" }],
-          "owner",
-        );
-        assert.strictEqual(his.askId, "q1");
-        assert.notProperty(his, "askRevision");
+        // An agent's reply belongs to the ask without making a new revision.
         const reply = yield* kanban.replyOnAsk(
           card.id,
           "q1",
@@ -57,6 +48,28 @@ it.effect("the ask as asked is revision 0, each edit is the next one, and replie
         }
         const ask = askOf((yield* kanban.card(card.id)).card);
         assert.strictEqual(kanbanAskRevision(ask), 2);
+        // #1158 / PR #49: his reply closes the ask, so it follows the edits.
+        const his = yield* kanban.replyOnAsk(
+          card.id,
+          "q1",
+          owner,
+          [{ _tag: "md", text: "Build 43." }],
+          "owner",
+          2,
+        );
+        assert.strictEqual(his.askId, "q1");
+        assert.notProperty(his, "askRevision");
+        const closed = askOf((yield* kanban.card(card.id)).card);
+        assert.isNotNull(closed.closedAt);
+        assert.deepStrictEqual(
+          [
+            closed.answer?.verdict,
+            closed.answer?.by,
+            closed.answer?.text,
+            kanbanAskRevision(closed),
+          ],
+          ["text", owner, "Build 43.", 2],
+        );
         const http = yield* makeHttp;
         const listed = yield* http.get(`/discussions/${discussion.id}/messages`);
         const messages = listed.body as unknown as ReadonlyArray<Record<string, any>>;

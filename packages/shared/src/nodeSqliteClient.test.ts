@@ -118,7 +118,10 @@ layer("NodeSqliteClient", (it) => {
           yield* sql`SELECT 1 AS result`;
           yield* sql`WITH seed AS (SELECT 'private binding' AS value) INSERT INTO observed_statements SELECT value FROM seed RETURNING secret`;
           yield* sql`INSERT INTO observed_statements VALUES ('private binding')`.pipe(Effect.exit);
-        }).pipe(Effect.provideService(SqliteClient.StatementObserver, observer));
+        }).pipe(
+          Effect.provideService(SqliteClient.StatementObserver, observer),
+          Effect.withSpan("ObservedService.query"),
+        );
         assert.deepEqual(
           observed.map((entry) => [entry.operation, entry.connection, entry.outcome]),
           [
@@ -131,6 +134,8 @@ layer("NodeSqliteClient", (it) => {
         assert.isTrue(
           observed.every((entry) => Number.isFinite(entry.durationMs) && entry.durationMs >= 0),
         );
+        assert.isTrue(observed.every((entry) => entry.span === "ObservedService.query"));
+        assert.isTrue(observed.every((entry) => entry.waitMs === undefined || entry.waitMs >= 0));
         assert.isFalse(JSON.stringify(observed).includes("private"));
         assert.isFalse(JSON.stringify(observed).includes("observed_statements"));
         yield* sql`SELECT 2`.pipe(
@@ -608,6 +613,70 @@ it.effect("labels SQL spans with their connection and how long they waited for i
   );
 });
 
+it.effect.each([false, true])(
+  "records reader permit wait even before acquisition (interrupted=%s)",
+  (interrupted) =>
+    withReaderClient((sql) =>
+      Effect.gen(function* () {
+        const waiting = yield* Deferred.make<void>();
+        const spans: Tracer.NativeSpan[] = [];
+        const tracer = Tracer.make({
+          span: (options) => {
+            const span = new Tracer.NativeSpan(options);
+            spans.push(span);
+            const attribute = span.attribute.bind(span);
+            span.attribute = (key, value) => {
+              attribute(key, value);
+              if (
+                key === "db.reader.acquire_stage" &&
+                value === "slot" &&
+                span.attributes.get("db.reader.requested_lane") === "foreground"
+              )
+                Deferred.doneUnsafe(waiting, Effect.void);
+            };
+            return span;
+          },
+        });
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const holder = yield* sql
+          .withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          )
+          .pipe(SqliteClient.readOnly, Effect.forkChild);
+        yield* Deferred.await(held);
+        const waiter = yield* sql
+          .withTransaction(countEntries(sql))
+          .pipe(
+            SqliteClient.readOnly,
+            SqliteClient.foregroundReads,
+            Effect.provideService(Statement.SpanPropagationEnabled, true),
+            Effect.withTracer(tracer),
+            Effect.forkChild,
+          );
+        yield* Deferred.await(waiting);
+        yield* TestClock.adjust("25 millis");
+        if (interrupted) yield* Fiber.interrupt(waiter);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(holder);
+        if (!interrupted) assert.equal(yield* Fiber.join(waiter), 1);
+        const span = spans.find((span) => span.name === "sql.transaction")!;
+        assert.equal(span.attributes.get("db.reader.requested_lane"), "foreground");
+        assert.equal(span.attributes.get("db.reader.effective_lane"), "background");
+        assert.equal(span.attributes.get("db.reader.acquired"), !interrupted);
+        assert.equal(span.attributes.get("db.reader.wait_ms"), 25);
+        assert.equal(
+          span.attributes.get("db.reader.wait_interrupted"),
+          interrupted ? true : undefined,
+        );
+        assert.equal(
+          span.attributes.get("db.reader.acquire_stage"),
+          interrupted ? "slot" : "acquired",
+        );
+      }),
+    ),
+);
+
 it.effect("labels only the span of the statement or transaction that took the lock", () => {
   const spans: Array<Tracer.NativeSpan> = [];
   const tracer = Tracer.make({
@@ -1026,7 +1095,10 @@ const withCheckpointClient = <A, E>(
     sql: SqlClient.SqlClient,
     filename: string,
   ) => Effect.Effect<A, E, SqlClient.SqlClient | FileSystem.FileSystem | Scope.Scope>,
-  options: { readonly readerWorker?: boolean } = {},
+  options: {
+    readonly readerWorker?: boolean;
+    readonly checkpointWorkerStart?: Effect.Effect<void>;
+  } = {},
 ) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -1267,6 +1339,73 @@ const readCheckpointState = (db: NodeSqlite.DatabaseSync) => {
   }
   return { log: state.log, checkpointed: state.checkpointed };
 };
+
+it.effect("defers routine checkpoints during startup and drains pending WAL on activation", () =>
+  Effect.gen(function* () {
+    const activated = yield* Deferred.make<void>();
+    yield* withCheckpointClient(
+      (sql, filename) =>
+        Effect.gen(function* () {
+          const worker = startedWorkers.at(-1)!;
+          const send = vi.spyOn(worker, "postMessage");
+          yield* Effect.addFinalizer(() => Effect.sync(() => send.mockRestore()));
+          yield* sql`CREATE TABLE pages(payload BLOB)`;
+          yield* sql`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1200)
+            INSERT INTO pages SELECT randomblob(4000) FROM n`;
+          const holder = yield* Effect.acquireRelease(
+            Effect.sync(() => new NodeSqlite.DatabaseSync(filename)),
+            (db) => Effect.sync(() => db.close()),
+          );
+          const pending = readCheckpointState(holder);
+          holder.exec("BEGIN IMMEDIATE");
+          assert.isAbove(pending.log - pending.checkpointed, 1000);
+          assert.deepEqual(yield* sql`SELECT COUNT(*) AS count FROM pages`, [{ count: 1200 }]);
+          assert.equal(send.mock.calls.length, 0);
+          holder.exec("ROLLBACK");
+          assert.deepEqual(readCheckpointState(holder), pending);
+          const reply = waitForCheckpointMessage(worker, 1);
+          yield* Deferred.succeed(activated, undefined);
+          const result = yield* Effect.promise(() => reply);
+          assert.equal(result.checkpointed, result.log);
+          assert.deepEqual(readCheckpointState(holder), {
+            log: result.log,
+            checkpointed: result.log,
+          });
+        }),
+      { checkpointWorkerStart: Deferred.await(activated) },
+    );
+  }),
+);
+
+it.effect("keeps WAL backpressure active before startup activation", () =>
+  withCheckpointClient(
+    (sql, filename) =>
+      Effect.gen(function* () {
+        const worker = startedWorkers.at(-1)!;
+        const requests = pauseCheckpointRequests(worker);
+        yield* Effect.addFinalizer(() => Effect.sync(requests.release));
+        yield* sql`CREATE TABLE pages(payload BLOB)`;
+        yield* sql`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 11000)
+          INSERT INTO pages SELECT randomblob(4000) FROM n`;
+        const observer = yield* Effect.acquireRelease(
+          Effect.sync(() => new NodeSqlite.DatabaseSync(filename)),
+          (db) => Effect.sync(() => db.close()),
+        );
+        assert.isAtLeast(readCheckpointState(observer).log, 10000);
+        assert.isAbove(requests.queued.length, 0);
+        const mutation = yield* sql`INSERT INTO pages VALUES ('after checkpoint')`.pipe(
+          Effect.forkChild,
+        );
+        requests.release();
+        yield* Fiber.join(mutation);
+        yield* checkpointWorkerReply(worker);
+        assert.deepEqual(yield* sql`SELECT COUNT(*) AS count FROM pages`, [{ count: 11001 }]);
+        const state = readCheckpointState(observer);
+        assert.isBelow(state.log - state.checkpointed, 1000);
+      }),
+    { checkpointWorkerStart: Effect.never },
+  ),
+);
 
 it.effect("checkpoints the WAL on the worker instead of the writer", () =>
   withCheckpointClient((sql, filename) =>

@@ -434,8 +434,11 @@ def test_effective_rsync_ignore_full_push(unignored_repo, ignore_file, rule, dir
             cmd = [str(part).removeprefix("testbox:") for part in cmd]
         return real_run(cmd, **kwargs)
 
+    def local_ssh(box, command, input=None, timeout=120, check=False):
+        return real_run(["sh", "-c", command], input=input, capture_output=True, timeout=timeout, check=check)
+
     with patch.object(ssh_sync.subprocess, "run", side_effect=local_transport), \
-            patch.object(ssh_sync, "log"), patch.object(ssh_sync, "ssh", side_effect=AssertionError("no ssh")):
+            patch.object(ssh_sync, "log"), patch.object(ssh_sync, "ssh", side_effect=local_ssh):
         baseline = ssh_sync.push("testbox", root, str(dest))
         assert (dest / tracked).exists()
         assert (dest / unrequested).exists() is not excluded

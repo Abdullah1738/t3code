@@ -84,7 +84,7 @@ it.effect("an outer deadline reports the nested caller read that is still pendin
   }),
 );
 
-it.effect.each(["caller", "dispatch", "receipt"] as const)(
+it.effect.each(["caller", "parent_records", "dispatch", "receipt"] as const)(
   "logs elapsed time and the pending operation when $stage expires",
   (stage) =>
     Effect.gen(function* () {
@@ -110,6 +110,12 @@ it.effect.each(["caller", "dispatch", "receipt"] as const)(
       yield* TestClock.adjust("10 seconds");
       const failure = yield* Fiber.join(pending);
       assert.equal(failure.code, stage === "caller" ? "caller_unresolved" : "delegation_timeout");
+      if (stage === "parent_records") {
+        assert.equal(
+          failure.message,
+          "delegate_task timed out during parent_records for thread caller. Nothing was saved; retry the same call.",
+        );
+      }
       assert.deepEqual(logs, [
         [
           "MCP operation timed out",

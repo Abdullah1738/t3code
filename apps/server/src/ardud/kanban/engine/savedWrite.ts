@@ -1,6 +1,60 @@
 import type { KanbanCard, KanbanMessage, ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import type * as Tracer from "effect/Tracer";
+
+export type Stage = "caller" | "admission" | "read" | "mutate" | "commit";
+
+export const traceObserver = Context.Reference<
+  | {
+      readonly span: Tracer.Span;
+      readonly enter: (stage: Stage, fiberId: number) => () => void;
+      readonly mark: (stage: Stage, fiberId: number) => void;
+    }
+  | undefined
+>("KanbanSavedWriteTrace", { defaultValue: () => undefined });
+
+// Only protected MCP writes collect stage timings; each scope owns its stage span.
+export const stage = Effect.fnUntraced(function* <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  name: Stage,
+) {
+  const trace = yield* traceObserver;
+  if (trace === undefined) return yield* effect;
+  const fiberId = yield* Effect.fiberId;
+  return yield* Effect.acquireUseRelease(
+    Effect.sync(() => trace.enter(name, fiberId)),
+    () =>
+      effect.pipe(
+        Effect.withSpan("KanbanSavedWrite.stage", { attributes: { "kanban.reply.stage": name } }),
+      ),
+    (leave) => Effect.sync(leave),
+  );
+});
+
+// Mutation is the enclosing phase after caller resolution, including reply encoding.
+export const mutating = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
+  const trace = yield* traceObserver;
+  if (trace === undefined) return yield* effect;
+  trace.mark("mutate", yield* Effect.fiberId);
+  return yield* effect.pipe(Effect.withSpan("KanbanSavedWrite.mutate"));
+});
+
+// Detached work keeps commit/receipt evidence, but cannot advance the reply's stage.
+export const background = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
+  return yield* effect.pipe(Effect.provideService(traceObserver, undefined));
+});
+
+// MCP's toolkit restores its registration context, including ParentSpan. Link the
+// handler root rather than changing that context or the lifetime of its work.
+export const linkReply = Effect.fnUntraced(function* () {
+  const trace = yield* traceObserver;
+  if (trace === undefined) return;
+  const work = yield* Effect.option(Effect.currentSpan);
+  if (work._tag === "None") return;
+  work.value.addLinks([{ span: trace.span, attributes: { "kanban.reply.work": true } }]);
+  trace.span.addLinks([{ span: work.value, attributes: { "kanban.reply.work": true } }]);
+});
 
 export type Saved =
   | { readonly kind: "card"; readonly card: KanbanCard }
@@ -17,7 +71,11 @@ export const commitObserver = Context.Reference<() => void>("KanbanSavedWriteCom
 });
 
 // Runs at every store write; the enclosing lock operation already supplies its span.
-export const committing = Effect.flatMap(commitObserver, (observe) => Effect.sync(observe));
+export const committing = Effect.gen(function* () {
+  const trace = yield* traceObserver;
+  trace?.mark("commit", yield* Effect.fiberId);
+  (yield* commitObserver)();
+});
 
 export const record = Effect.fn("KanbanSavedWrite.record")(function* (saved: Saved) {
   (yield* observer)(saved);

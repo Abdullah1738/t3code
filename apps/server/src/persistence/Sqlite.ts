@@ -21,6 +21,7 @@ import { archiveCheckpointLayer } from "../ardud/persistence/archiveCheckpoint.t
 import { ArchiveSnapshotGate } from "../ardud/persistence/archiveSnapshotGate.ts";
 import { readerLaneOptions, STATEV2_READER_LANES } from "../ardud/persistence/readerLanes.ts";
 import * as Semaphore from "effect/Semaphore";
+import { ServerActivation } from "../serverActivation.ts";
 // Reads only a tiny installation marker before constructing reader workers.
 import * as NodeSqlite from "node:sqlite";
 
@@ -126,6 +127,7 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
   yield* fs.makeDirectory(path.dirname(dbPath), { recursive: true });
   const observer = yield* ErrorObserver;
   const snapshotGate = yield* Semaphore.make(1);
+  const checkpointWorkerStart = yield* ServerActivation;
   const baseFilename = yield* withStartupPhase(
     "sqlite.marker",
     Effect.gen(function* () {
@@ -197,9 +199,10 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
               "SELECT rootpage FROM ardud_base.sqlite_schema LIMIT 1",
             ],
             readerSnapshotLock: snapshotGate,
-            // Checkpoints sync the database, with F_FULLFSYNC on macOS. Run them off
-            // the event loop so a slow flush cannot stall clients.
+            // Keep checkpoint fsyncs off the event loop. On APFS their writes can
+            // also stall cold reads, so routine checkpoints wait for activation.
             checkpointWorker: true,
+            checkpointWorkerStart,
             spanAttributes: {
               "db.name": path.basename(dbPath),
               "service.name": "t3code-server",

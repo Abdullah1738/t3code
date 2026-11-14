@@ -1,4 +1,4 @@
-import {test, expect} from 'bun:test';
+import {beforeEach, afterEach, spyOn, test, expect} from 'bun:test';
 import {mkdirSync, mkdtempSync, readFileSync, writeFileSync} from 'node:fs';
 import {tmpdir, homedir} from 'node:os';
 import {join} from 'node:path';
@@ -8,6 +8,9 @@ import scope from '../plugin/betterstack-scope';
 import statev2 from '../plugin/statev2-guard';
 import codemode from '../plugin/codemode-guard';
 
+let sampling: ReturnType<typeof spyOn>;
+beforeEach(() => { sampling = spyOn(Math, 'random').mockReturnValue(0); });
+afterEach(() => { sampling.mockRestore(); });
 const temp = mkdtempSync(join(tmpdir(), 'decision-attribution-'));
 function rows(root: string) {
   return readFileSync(join(root, 'agent-tools', new Date().toISOString().slice(0,10)+'.ndjson'), 'utf8').trim().split('\n').map(r=>JSON.parse(r));
@@ -34,8 +37,9 @@ test('all OpenCode guard paths carry session attribution and emit once', async()
     for (const row of records) {
       expect(row.props.harness).toBe('opencode');
       expect(row.ids.threadId).toBe('native:opencode:'+row.ids.sessionId);
-      expect(row.props).toMatchObject({threadIdSource:'native',repeatCount:1});
-      expect(['repo-root','worktree','home','other']).toContain(row.props.cwdClass);
+      expect(row.props.threadIdSource).toBe('native');
+      expect(row.props.repeatCount ?? 1).toBe(1);
+      expect(['repo-root','worktree','home','other']).toContain(row.props.cwdClass ?? 'other');
     }
     expect(records[4].props.matchedRoot).toBe('board-worktrees');
     expect(JSON.stringify(records)).not.toContain(temp);

@@ -23,6 +23,8 @@ export const layer = Layer.effect(
           route: "database",
           durationMs: observation.durationMs,
           props: {
+            ...(observation.waitMs === undefined ? {} : { waitMs: observation.waitMs }),
+            ...(observation.outcome === "interrupt" ? { cause: "unknown" as const } : {}),
             phase: observation.operation,
             key: observation.connection,
             reason: observation.outcome,

@@ -88,10 +88,15 @@ it.effect(
           const changed = yield* http.request("PATCH", "/boards/toy", {
             reviewChains,
             defaultReviewChain: "Focused review",
+            guessedGates: ["money", "secret"],
           });
           assert.strictEqual(changed.status, 200);
           assert.deepStrictEqual(changed.body.reviewChains, reviewChains);
           assert.strictEqual(changed.body.defaultReviewChain, "Focused review");
+
+          assert.deepStrictEqual(changed.body.guessedGates, ["money", "secret"]);
+          const read = yield* http.request("GET", "/boards/toy");
+          assert.deepStrictEqual(read.body.board.guessedGates, ["money", "secret"]);
 
           const resized = yield* http.post("/boards/toy/pools", {
             model: board.defaultCardModel,
@@ -101,6 +106,18 @@ it.effect(
           const saved = yield* kanban.snapshot(board.id);
           assert.deepStrictEqual(saved.board.reviewChains, reviewChains);
           assert.strictEqual(saved.board.defaultReviewChain, "Focused review");
+          assert.deepStrictEqual(saved.board.guessedGates, ["money", "secret"]);
+          const empty = yield* http.request("PATCH", "/boards/toy", { guessedGates: [] });
+          assert.strictEqual(empty.status, 200);
+          yield* http.request("PATCH", "/boards/toy", { name: "Renamed" });
+          assert.deepStrictEqual(
+            (yield* http.request("GET", "/boards/toy")).body.board.guessedGates,
+            [],
+          );
+          const invalid = yield* http.request("PATCH", "/boards/toy", {
+            guessedGates: ["unknown"],
+          });
+          assert.strictEqual(invalid.status, 400);
           assert.strictEqual(
             saved.pools.find((pool) => pool.key === Rules.poolKey(board.defaultCardModel))?.slots,
             3,

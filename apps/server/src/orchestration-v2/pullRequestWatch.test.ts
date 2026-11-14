@@ -72,6 +72,76 @@ const frontendRequired = [
 ].map((name) => ({ ...check(name, "success"), required: true }));
 
 describe("evaluatePullRequestWatch", () => {
+  it.each(
+    [
+      { headSha: "aaaaaaaaaa", headBranchSha: "aaaaaaaaaa", observed: "aaaaaaaaaa" },
+      { headSha: "bbbbbbbbbb", headBranchSha: "aaaaaaaaaa", observed: "aaaaaaaaaa" },
+      { headSha: undefined, headBranchSha: "aaaaaaaaaa", observed: "aaaaaaaaaa" },
+      { headSha: "aaaaaaaaaa", headBranchSha: "bbbbbbbbbb", observed: "bbbbbbbbbb" },
+      { headSha: "bbbbbbbbbb", headBranchSha: "bbbbbbbbbb", observed: "bbbbbbbbbb" },
+      { headSha: undefined, headBranchSha: "bbbbbbbbbb", observed: "bbbbbbbbbb" },
+      { headSha: "aaaaaaaaaa", headBranchSha: null, observed: "aaaaaaaaaa" },
+      { headSha: "bbbbbbbbbb", headBranchSha: null, observed: "bbbbbbbbbb" },
+      { headSha: undefined, headBranchSha: null, observed: null },
+    ].flatMap((heads) =>
+      ["aaaaaaaaaa", "bbbbbbbbbb", null].map((checksHeadSha) => ({ ...heads, checksHeadSha })),
+    ),
+  )(
+    "observed head follows the source branch, then PR record, independently of checks ($headSha/$headBranchSha/$checksHeadSha)",
+    ({ observed, ...heads }) => {
+      const report = evaluatePullRequestWatch(
+        watch({ headSha: "aaaaaaaaaa" }),
+        detail({ ...heads, checks: [] }),
+        noRemarks,
+      );
+      assert.strictEqual(report.next.observedHeadSha, observed);
+    },
+  );
+
+  it.each([
+    {
+      headSha: "bbbbbbbbbb",
+      headBranchSha: "bbbbbbbbbb",
+      checksHeadSha: "aaaaaaaaaa",
+      observed: "bbbbbbbbbb",
+    },
+    {
+      headSha: "aaaaaaaaaa",
+      headBranchSha: "bbbbbbbbbb",
+      checksHeadSha: "aaaaaaaaaa",
+      observed: "bbbbbbbbbb",
+    },
+    {
+      headSha: "bbbbbbbbbb",
+      headBranchSha: null,
+      checksHeadSha: "aaaaaaaaaa",
+      observed: "bbbbbbbbbb",
+    },
+    {
+      headSha: undefined,
+      headBranchSha: "bbbbbbbbbb",
+      checksHeadSha: "aaaaaaaaaa",
+      observed: "bbbbbbbbbb",
+    },
+    {
+      headSha: "aaaaaaaaaa",
+      headBranchSha: "aaaaaaaaaa",
+      checksHeadSha: "bbbbbbbbbb",
+      observed: "aaaaaaaaaa",
+    },
+  ])(
+    "records the observed head while preserving the CI checkpoint ($headSha/$headBranchSha/$checksHeadSha)",
+    ({ observed, ...heads }) => {
+      const before = watch({ headSha: "aaaaaaaaaa", passed: true, passedChecks: ["test"] });
+      const report = evaluatePullRequestWatch(before, detail({ ...heads, checks: [] }), noRemarks);
+      assert.strictEqual(report.next.headSha, before.headSha);
+      assert.strictEqual(report.next.observedHeadSha, observed);
+      assert.strictEqual(report.next.passed, before.passed);
+      assert.deepEqual(report.next.passedChecks, before.passedChecks);
+      assert.deepEqual(report.changes, []);
+    },
+  );
+
   it.each(greenRollups)("confirms PR $number's complete ungated head rollup once", (rollup) => {
     const green = detail({
       headSha: rollup.headSha,

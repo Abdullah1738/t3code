@@ -1,0 +1,33 @@
+#!/bin/sh
+# Local iOS simulators are blocked on this Mac (owner rule 2026-10-09).
+# Refuses simulator runtime downloads and test runs on a local simulator.
+# Builds (device or simulator SDK) and everything else pass through to /usr/bin/xcodebuild.
+REAL=/usr/bin/xcodebuild
+if [ -z "$RCSIM_ALLOW_LOCAL_SIM" ]; then
+  testing=""; simdest=""; dl=""
+  prev=""
+  for a in "$@"; do
+    case "$a" in
+      -downloadPlatform|-downloadAllPlatforms|-importPlatform) dl=1 ;;
+      test|test-without-building) testing=1 ;;
+    esac
+    if [ "$prev" = "-destination" ]; then
+      case "$a" in
+        *generic/platform=*) ;;
+        *Simulator*|*simulator*) simdest=1 ;;
+      esac
+    fi
+    prev="$a"
+  done
+  if [ -n "$dl" ] || { [ -n "$testing" ] && [ -n "$simdest" ]; }; then
+    cat >&2 <<'EOF'
+xcodebuild: local iOS simulators are disabled on this Mac (no runtime downloads, no simulator test runs).
+Use Run Cloud instead: load the run-cloud skill.
+  runcloud xcode build . --scheme <S> --until installable --json   # remote simulator build
+  rcsim launch ios --build <build id> --name "<what>" --purpose "<why>"
+Device builds (-sdk iphoneos) still work locally.
+EOF
+    exit 69
+  fi
+fi
+exec "$REAL" "$@"

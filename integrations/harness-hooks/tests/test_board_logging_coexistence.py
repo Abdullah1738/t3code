@@ -13,6 +13,11 @@ import engine
 
 
 class BoardLoggingCoexistence(unittest.TestCase):
+    def setUp(self):
+        sampling = patch.object(engine.toollog.random, 'random', return_value=0)
+        sampling.start()
+        self.addCleanup(sampling.stop)
+
     def test_each_guard_decision_reaches_each_board_once(self):
         heavy = {'heavy': True, 'rule': 'go-test', 'class': 'go-test', 'size': 'large',
                  'why': 'fixture', 'rewrite': 'offbox run -- go test ./...'}
@@ -74,5 +79,7 @@ class BoardLoggingCoexistence(unittest.TestCase):
             for board, event_name in [('agent-tools', 'hook.decision'), ('offbox', 'gate.decision')]:
                 day = next((root/'logs'/board).glob('*.ndjson')).stem
                 summary = engine.toollog.rollup(board, day)
-                self.assertEqual(summary['total'], len(cases))
-                self.assertEqual(summary['countsByName'], {event_name: len(cases)})
+                expected = sum(engine.toollog._sample_rate(row) for row in records(board))
+                self.assertEqual(summary['recordedRows'], len(cases))
+                self.assertEqual(summary['total'], expected)
+                self.assertEqual(summary['countsByName'], {event_name: expected})

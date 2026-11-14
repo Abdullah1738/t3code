@@ -80,7 +80,8 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
             code: input.code,
             message:
               `${input.code === "caller_unresolved" ? "Caller resolution" : "delegate_task"} timed out during ${input.stage} for thread ${input.threadId ?? "unknown"}.` +
-              (input.code === "caller_unresolved" && input.stage === "caller"
+              ((input.code === "caller_unresolved" && input.stage === "caller") ||
+              input.stage === "parent_records"
                 ? " Nothing was saved; retry the same call."
                 : "") +
               (input.stage === "dispatch"

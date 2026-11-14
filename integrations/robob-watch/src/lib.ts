@@ -30,6 +30,8 @@ export const CHECK_TIMEOUT_MS = Number(process.env.ROBOB_WATCH_CHECK_TIMEOUT_MS 
 /** After SIGKILL, stop waiting for the process to report exit (a throttled process can take minutes to be reaped). */
 export const KILL_GRACE_MS = 5_000;
 export const FAILURE_ALERT_AFTER = 5;
+/** One failed tick that recovers is noise; the second in a row notifies. */
+export const FAILURE_NOTICE_AFTER = 2;
 /** Timeouts are transient (load spikes): no alert until the watcher has been failing at least this long. */
 export const TIMEOUT_ALERT_AFTER_MS = 10 * 60_000;
 /** Timeouts retry at most this far apart, so a watcher catches up soon after a load spike. */
@@ -91,6 +93,8 @@ export type Watcher = {
   paused: boolean;
   /** 0 keeps retrying with backoff; otherwise pause after this many failures (default 5). */
   max_consecutive_failures?: number;
+  /** Failures in a row before the per-run failure notice; default 2, 1 = every failure. */
+  failure_notice_after?: number;
   depends?: Dependency[];
   /** Opt-in: text the owner a short heads-up when a wake sits queued behind a busy turn. Off by default. */
   headsup?: boolean;
@@ -136,7 +140,7 @@ export type State = {
   /** Wall time of the last check run, in ms. */
   last_run_ms?: number;
   /** An event whose delivery has not succeeded yet; retried verbatim with the same key. */
-  pending?: { key: string; event: string; at: string };
+  pending?: { key: string; event: string; at: string; healthRun?: string };
   last_delivery?: string;
   /** Delivered wakes whose bridge inbound row may still be queued behind a busy agent turn. */
   wakes?: TrackedWake[];
@@ -260,6 +264,8 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (!Number.isInteger(maxFires) || maxFires < 0) errors.push("max_fires must be an integer >= 0 (0 = unlimited)");
   const maxFailures = input.max_consecutive_failures;
   if (maxFailures !== undefined && (!Number.isInteger(maxFailures) || maxFailures < 0)) errors.push("max_consecutive_failures must be an integer >= 0 (0 = never pause)");
+  const noticeAfter = input.failure_notice_after;
+  if (noticeAfter !== undefined && (!Number.isInteger(noticeAfter) || noticeAfter < 1)) errors.push("failure_notice_after must be an integer >= 1 (1 = every failure)");
   const depends = input.depends;
   if (depends !== undefined && !validDepends(depends)) errors.push('depends must be an array of "ssd" or "phone"');
   const quiet = input.quiet;
@@ -285,6 +291,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     ...(input.pending_check !== undefined ? { pending_check: input.pending_check } : {}),
     ...(timeout !== undefined ? { timeout_s: timeout } : {}),
     ...(maxFailures !== undefined ? { max_consecutive_failures: maxFailures } : {}),
+    ...(noticeAfter !== undefined ? { failure_notice_after: noticeAfter } : {}),
     ...(depends !== undefined ? { depends: [...new Set(depends)] } : {}),
     ...(triggers.length ? { triggers: (triggers as string[]).map(t => t.trim().replace(/^~(?=\/)/, HOME)) } : {}),
     ...(input.headsup === true ? { headsup: true } : {}),
@@ -363,7 +370,7 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
     };
     const child = spawn(shell[0]!, shell.slice(1), {
       cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { HOME, PATH, ...(process.env.TOOLLOG_DIR ? { TOOLLOG_DIR: process.env.TOOLLOG_DIR } : {}), LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
+      env: { HOME, PATH, ...(process.env.TOOLLOG_DIR ? { TOOLLOG_DIR: process.env.TOOLLOG_DIR } : {}), ...(process.env.HEALTH_TOOLLOG_DIR ? { HEALTH_TOOLLOG_DIR: process.env.HEALTH_TOOLLOG_DIR } : {}), LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
     });
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr!.setEncoding("utf8");
@@ -437,7 +444,7 @@ const telegramCli = () => process.env.ROBOB_WATCH_TELEGRAM_CLI ?? join(HOME, ".l
 
 export function wake(source: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return Promise.resolve(refused("wake"));
-  return run([BUN, spectrumCli(), "wake", "--source", source.slice(0, 100), "--text", clip(text, MAX_WAKE), "--key", key]);
+  return run([BUN, spectrumCli(), "wake", `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--key=${key}`]);
 }
 
 /**
@@ -449,7 +456,7 @@ export async function wakeChat(chat: string, source: string, text: string, key: 
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("wake --chat");
   const session = await liveSession();
   if (!session) return { ok: false, out: "no live route session" };
-  return run([BUN, cli, "wake", "--chat", chat, "--source", source.slice(0, 100), "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
+  return run([BUN, cli, "wake", `--chat=${chat}`, `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
 }
 
 export async function imessage(text: string, key: string): Promise<{ ok: boolean; out: string }> {
@@ -458,12 +465,12 @@ export async function imessage(text: string, key: string): Promise<{ ok: boolean
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("imessage send");
   const session = await liveSession();
   if (!session) return { ok: false, out: "no live route session" };
-  return run([BUN, cli, "send", "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
+  return run([BUN, cli, "send", `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
 }
 
 export function telegram(source: string, text: string, key: string, severity = "info", burstKey?: string): Promise<{ ok: boolean; out: string }> {
   if (underTest() && !process.env.ROBOB_WATCH_TELEGRAM_CLI) return Promise.resolve(refused("telegram notify"));
-  return run([BUN, telegramCli(), "notify", "--source", telegramSource(source), "--severity", severity, "--text", clip(text, MAX_WAKE), "--key", key, ...(burstKey ? ["--burst-key", burstKey] : [])]);
+  return run([BUN, telegramCli(), "notify", `--source=${telegramSource(source)}`, `--severity=${severity}`, `--text=${clip(text, MAX_WAKE)}`, `--key=${key}`, ...(burstKey ? [`--burst-key=${burstKey}`] : [])]);
 }
 
 /** Env a check child gets: its own inputs plus, under a test run, the test markers and every stub override,
@@ -471,7 +478,7 @@ export function telegram(source: string, text: string, key: string, severity = "
 const TEST_ENV_KEYS = ["ROBOB_TEST", "NODE_ENV", "PYTEST_CURRENT_TEST", "WA_WACLI", "WA_DRAFT_DIR", "MAILSEND_HIMALAYA",
   "MAILSEND_DRAFT_DIR", "MAILSEND_SEND_APPROVAL", "RIDE_CARD_BRIDGE", "CONVO_CARD_BRIDGE", "ROBOB_WATCH_SPECTRUM_CLI",
   "ROBOB_WATCH_TELEGRAM_CLI", "WACLI_STORE_DIR", "SEND_APPROVAL_BRIDGE_DIR", "SEND_APPROVAL_STATE_DB",
-  "ROBOB_READONLY_DB", "MONEY_CASES_STATE_DB", "TOOLLOG_DIR", "ROBOB_HOME", "T3CODE_HOME", "XDG_DATA_HOME"];
+  "ROBOB_READONLY_DB", "MONEY_CASES_STATE_DB", "TOOLLOG_DIR", "HEALTH_TOOLLOG_DIR", "ROBOB_HOME", "T3CODE_HOME", "XDG_DATA_HOME"];
 export function testEnv(): Record<string, string> {
   const out: Record<string, string> = {};
   for (const k of TEST_ENV_KEYS) if (process.env[k] !== undefined) out[k] = process.env[k]!;
@@ -682,6 +689,11 @@ export async function alert(watcher: Watcher, text: string, key: string, severit
   if (notified.ok) return { ok: true, via: "telegram", detail: notified.out };
   const sent = await imessage(`${watcher.title}: ${text}`, key);
   return sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${notified.out} | ${sent.out}` };
+}
+
+export function shouldNotifyFailure(watcher: Watcher, state: State, timedOut: boolean, t = now()): boolean {
+  return state.consecutive_failures >= (watcher.failure_notice_after ?? FAILURE_NOTICE_AFTER)
+    && (!timedOut || t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS);
 }
 
 export function shouldPause(watcher: Watcher, state: State, timedOut: boolean, t = now()): boolean {
