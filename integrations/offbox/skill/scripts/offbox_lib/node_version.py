@@ -330,16 +330,40 @@ def _want(root, cwd):
     return None
 
 
+def _quote_end(text, quote, start=0):
+    i = start
+    while i < len(text):
+        if quote == '"' and text[i] == "\\":
+            i += 2
+        elif text[i] == quote:
+            if quote == "'" and i + 1 < len(text) and text[i + 1] == "'":
+                i += 2
+            else:
+                return i
+        else:
+            i += 1
+    return None
+
+
 def _ci_values(text):
     entries = []
-    list_indent = scalar_indent = None
+    list_indent = scalar_indent = quote = None
     flow = ''
     for line in text.splitlines():
+        if quote:
+            if _quote_end(line, quote) is not None:
+                quote = None
+            continue
         indent = len(line) - len(line.lstrip())
         if scalar_indent is not None:
             if not line.strip() or indent > scalar_indent:
                 continue
             scalar_indent = None
+        quoted = re.match(r"^\s*(?:-\s+)?(?:[^:#]+:\s*)?(?:[!&]\S+\s+)*(['\"])", line)
+        if quoted and _quote_end(line, quoted[1], quoted.end()) is None:
+            quote = quoted[1]
+            list_indent = None
+            continue
         # Script/heredoc bodies are YAML data, not workflow keys.
         scalar = re.match(r'^(\s*)(-\s+)?[^#]+:\s*[|>][0-9+-]*\s*(?:#.*)?$', line)
         if scalar:
@@ -354,10 +378,10 @@ def _ci_values(text):
                 entries.extend(flow[1:-1].split(','))
                 flow = ''
             continue
-        match = re.match(r"^(\s*)(?:['\"]node-version['\"]|node-version):\s*(.*)$", clean)
+        match = re.match(r"^(\s*)(-\s+)?(?:['\"]node-version['\"]|node-version):\s*(.*)$", clean)
         if match:
-            value = match[2].strip()
-            list_indent = len(match[1]) if not value else None
+            value = match[3].strip()
+            list_indent = len(match[1]) + len(match[2] or '') if not value else None
             if value.startswith('['):
                 if value.endswith(']'):
                     entries.extend(value[1:-1].split(','))

@@ -168,6 +168,73 @@ class WantTests(unittest.TestCase):
                            '        uses: actions/setup-node@v4\n        with:\n          node-version: 22\n')
                 self.assertEqual(node_version.want(self.root, self.root)[0], [(K(22), K(23))])
 
+    def assert_workflow_selects_22(self, workflow):
+        self.write('.github/workflows/ci.yml', workflow)
+        wanted = node_version.want(self.root, self.root)
+        self.assertIsNotNone(wanted)
+        self.assertEqual(wanted[0], [(K(22), K(23))])
+        with tempfile.TemporaryDirectory() as home:
+            fake_nvm(home, ('v22.13.0', 'v24.1.0'))
+            alias = Path(home) / '.nvm/alias/default'
+            alias.parent.mkdir(parents=True)
+            alias.write_text('24\n')
+            result = subprocess.run(['bash', '-c', node_version.block(wanted) + '\nnode --version'],
+                                    env={'HOME': home, 'PATH': '/usr/bin:/bin'},
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), 'v22.13.0')
+
+    def test_matrix_include_mapping_entries(self):
+        for entry in [
+            '          - node-version: 22',
+            "          - 'node-version': '22'",
+            '          - "node-version": "22"',
+            '          - os: ubuntu-latest\n            node-version: 22',
+            '          - node-version: 22\n            os: ubuntu-latest',
+            '          - node-version: ${{ env.NODE }}\n          - node-version: 22',
+            '        - node-version: 22',
+        ]:
+            with self.subTest(entry=entry):
+                self.assert_workflow_selects_22(
+                    'jobs:\n  test:\n    strategy:\n      matrix:\n        include:\n' + entry + '\n'
+                    '    steps:\n      - uses: actions/setup-node@v4\n        with:\n'
+                    '          node-version: ${{ matrix.node-version }}\n')
+
+    def test_multiline_quoted_scalars_ignore_body_keys(self):
+        scalars = [
+            "'echo \"\n          node-version: 24\n          \"'",
+            '\"echo\n          node-version: 24\n          done\"',
+            "'echo\n          it''s quoted\n          node-version: 24\n          done'",
+            '\"echo\n          a \\\"quoted\\\" value\n          node-version: 24\n          done\"',
+            "'echo # quoted text\n          node-version: 24\n          done' # comment",
+            "'echo misleading: |\n          node-version: 24\n          done'",
+            '"echo misleading: >\n          node-version: 24\n          done"',
+            "&script 'echo\n          node-version: 24\n          done'",
+            "!!str 'echo\n          node-version: 24\n          done'",
+        ]
+        setup = '      - uses: actions/setup-node@v4\n        with:\n          node-version: 22\n'
+        for scalar in scalars:
+            for first in [True, False]:
+                with self.subTest(scalar=scalar, first=first):
+                    run = '      - run: ' + scalar + '\n'
+                    self.assert_workflow_selects_22('jobs:\n  test:\n    steps:\n' +
+                                                    (run + setup if first else setup + run))
+
+    def test_quoted_step_name_preserves_sibling_setup_node_keys(self):
+        for quote in ["'", '\"']:
+            with self.subTest(quote=quote):
+                self.assert_workflow_selects_22(
+                    f'jobs:\n  test:\n    steps:\n      - name: {quote}A multiline name\n'
+                    f'          node-version: 24\n          ending{quote}\n'
+                    '        uses: actions/setup-node@v4\n        with:\n          node-version: 22\n')
+
+    def test_plain_commands_do_not_start_yaml_quoted_scalars(self):
+        for command in ["echo don't", 'echo "shell quote', "echo 'shell quote"]:
+            with self.subTest(command=command):
+                self.assert_workflow_selects_22(
+                    f'jobs:\n  test:\n    steps:\n      - run: {command}\n'
+                    '      - uses: actions/setup-node@v4\n        with:\n          node-version: 22\n')
+
     def test_ci_ignored_forms_and_no_files(self):
         self.assertIsNone(node_version.want(self.root, self.root))
         self.assertIn('no pin;', node_version.block(None))

@@ -94,9 +94,9 @@ Record the Node version, manager/version, install command and the files that cho
    (e.g. `vp i` for this fork, once the manager install has put vite-plus in node_modules). An npm pin without its npm lockfile is a repo prerequisite to resolve, not a
    reason to run a different manager. Hints cover common literal pins; inspect expressions/matrices yourself.
 4. Select **versions**, not just a manager name. Node: `.nvmrc` / `.node-version`, then `engines.node`,
-   then CI `setup-node` / `NODE_VERSION`; check the selected version satisfies the engine range too.
+   then CI `setup-node`; offbox follows the CI setup-node version when the repo has no pin.
    Use an installed match on local narrow checks (e.g. put its `~/.nvm/versions/node/<version>/bin` first
-   on PATH); offbox provisions a matching Node or stops before the command. CI-only Node fallback on boxes is #694. Log `node --version`.
+   on PATH); offbox provisions a matching Node or stops before the command. Log `node --version`.
    pnpm: `packageManager`, then CI `PNPM_VERSION` / `pnpm/action-setup` `version`. Run it explicitly pinned
    (`corepack pnpm@10 ...` for CI major 10), never a conflicting global pnpm. Check the selected manager's
    `--version` under that Node before both install and checks; select matching npm/Yarn/Bun versions too.
