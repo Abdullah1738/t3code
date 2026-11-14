@@ -288,7 +288,9 @@ class DiskSwingTests(unittest.TestCase):
 
     def test_main_state_without_inventory_at_migrates_without_invented_deltas(self):
         for partial in (False, True):
-            with self.subTest(partial=partial):
+            case_logs = self.root/('partial-logs' if partial else 'complete-logs')
+            with self.subTest(partial=partial), patch.object(self, 'logs', case_logs), \
+                 patch.dict(os.environ, TOOLLOG_DIR=str(case_logs)):
                 path = str(self.paths[0])
                 jobs.save_state('disk', dict(sizes={path: GB},
                     partials={path: dict(partial=True)} if partial else {}))
