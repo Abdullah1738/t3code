@@ -1,5 +1,8 @@
-import type { AnalyticsEvent, AnalyticsRollup as ContractRollup } from "@t3tools/contracts";
+import type { AnalyticsEvent, AnalyticsRollup, RunUsageEvent } from "@t3tools/contracts";
+import { LONG_TASK_HISTOGRAM_RATIO } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+
+export type { AnalyticsRollup } from "@t3tools/contracts";
 
 const MAX_GROUPS = 128;
 const EXACT_DURATIONS = 512;
@@ -21,12 +24,11 @@ interface AnalyticsLatency {
   readonly approximate: boolean;
 }
 
-export type AnalyticsRollup = ContractRollup;
-
 interface McpGroup {
   tool: string;
   hour: string;
   build: string;
+  bootId: string;
   durations: Durations;
   failures: number;
   outcomes: Map<string, number>;
@@ -42,15 +44,112 @@ interface RetryAttempt {
   ok: boolean;
 }
 
-const durations = (): Durations => ({ count: 0, max: 0, exact: [], histogram: undefined });
+interface Breakdown {
+  labels: Record<string, string | number | null>;
+  durations: Durations;
+  count: number;
+  totalWaitMs: number;
+}
+
+// Fixed cardinality, including overflow. Keep all overflowing measurements, not just their count.
+function breakdown(
+  groups: Map<string, Breakdown>,
+  labels: Breakdown["labels"],
+  event: AnalyticsEvent,
+) {
+  const identity = JSON.stringify(labels);
+  let key = identity;
+  if (!groups.has(identity) && groups.size >= 25) {
+    if (!groups.has(OTHER)) {
+      const last = [...groups.keys()].at(-1)!;
+      const overflow = groups.get(last)!;
+      groups.delete(last);
+      overflow.labels = Object.fromEntries(
+        Object.entries(overflow.labels).map(([k, v]) => [
+          k,
+          typeof v === "number" || v === null ? null : "other",
+        ]),
+      );
+      groups.set(OTHER, overflow);
+    }
+    key = OTHER;
+  }
+  let group = groups.get(key);
+  if (!group) {
+    group = {
+      labels:
+        key === OTHER
+          ? Object.fromEntries(
+              Object.entries(labels).map(([k, v]) => [
+                k,
+                typeof v === "number" || v === null ? null : "other",
+              ]),
+            )
+          : labels,
+      durations: durations(),
+      count: 0,
+      totalWaitMs: 0,
+    };
+    groups.set(key, group);
+  }
+  group.count++;
+  if (event.durationMs !== undefined) addDuration(group.durations, event.durationMs);
+  group.totalWaitMs += event.props?.waitMs ?? 0;
+}
+
+function finishBreakdown(groups: Map<string, Breakdown>) {
+  return [...groups.values()]
+    .map((group) => ({
+      labels: group.labels,
+      ...summarize(group.durations),
+      count: group.count,
+      totalWaitMs: group.totalWaitMs,
+    }))
+    .sort((a, b) => b.count - a.count);
+}
+
+export const durations = (): Durations => ({ count: 0, max: 0, exact: [], histogram: undefined });
 
 export const makeAccumulator = () => ({
   total: 0,
   invalidLines: 0,
   kinds: new Map<string, number>(),
+  textGenerationOverflow: 0,
+  textGeneration: new Map<
+    string,
+    {
+      labels: {
+        hour: string;
+        provider: string;
+        operation: string;
+        boardId: string | null;
+        kind: "operation" | "child";
+        outcome: NonNullable<AnalyticsEvent["outcome"]>;
+      };
+      durations: Durations;
+    }
+  >(),
   errors: new Map<string, number>(),
-  rpcs: new Map<string, Durations>(),
+  routes: new Map<string, Breakdown>(),
+  mcpCodes: new Map<string, Breakdown>(),
+  dbSpans: new Map<string, Breakdown>(),
+  rpcs: new Map<string, Durations & { totalWaitMs: number; outcomes: Map<string, number> }>(),
+  longTasks: new Map<
+    string,
+    {
+      route: string;
+      surface: AnalyticsEvent["surface"];
+      count: number;
+      totalMs: number;
+      maxMs: number;
+      wallTimeMs: number;
+      histogram: Map<number, number>;
+    }
+  >(),
   answers: durations(),
+  usage: makeUsageAccumulator(),
+  boards: new Map<string, BoardGroup>(),
+  tickPhases: new Map<string, { boardId: string; phase: string; durations: Durations }>(),
   mcp: new Map<string, McpGroup>(),
   retries: new Map<string, RetryAttempt[]>(),
   retryAttempts: 0,
@@ -72,7 +171,7 @@ function bucket(value: number): number {
     : Math.ceil(Math.log(Math.max(0.000001, value)) / Math.log(HISTOGRAM_RATIO));
 }
 
-function addDuration(target: Durations, value: number): void {
+export function addDuration(target: Durations, value: number): void {
   target.count++;
   target.max = Math.max(target.max, value);
   if (!target.histogram && target.exact.length < EXACT_DURATIONS) {
@@ -91,17 +190,312 @@ function addDuration(target: Durations, value: number): void {
   target.histogram.set(key, (target.histogram.get(key) ?? 0) + 1);
 }
 
+interface AskObservation {
+  ts: string;
+  closed: boolean;
+  rank: number;
+  cardId: string;
+  key: string;
+  kind: string;
+  blocking: boolean;
+  createdAt: string;
+}
+interface BoardGroup {
+  moves: Map<string, { from: string; to: string; count: number }>;
+  stages: Map<string, Durations>;
+  reviews: Map<string, { rounds: number; verdicts: number }>;
+  verdicts: Map<string, number>;
+  reviewDuration: Durations;
+  stalls: Map<string, { sets: number; clears: number; durations: Durations }>;
+  failures: Map<string, number>;
+  restarts: number;
+  asks: Map<string, AskObservation>;
+  snapshotRows: number;
+  snapshots: Map<string, { expected: number | undefined; asks: Map<string, AskObservation> }>;
+  pools: Map<
+    string,
+    { hour: string; poolKey: string; samples: number; used: number; slots: number; waiting: number }
+  >;
+  overflow: number;
+}
+const BOARD_LIMIT = 20_000;
+function boardAccumulate(target: ReturnType<typeof makeAccumulator>, event: AnalyticsEvent) {
+  if (!event.boardId || !(event.kind.startsWith("kanban.") || event.kind === "ask.answered"))
+    return;
+  let board = target.boards.get(event.boardId);
+  if (!board) {
+    if (target.boards.size >= MAX_GROUPS) return;
+    board = {
+      moves: new Map(),
+      stages: new Map(),
+      reviews: new Map(),
+      verdicts: new Map(),
+      reviewDuration: durations(),
+      stalls: new Map(),
+      failures: new Map(),
+      restarts: 0,
+      asks: new Map(),
+      snapshotRows: 0,
+      snapshots: new Map(),
+      pools: new Map(),
+      overflow: 0,
+    };
+    target.boards.set(event.boardId, board);
+  }
+  const p = event.props;
+  if (!p) return;
+  if (event.kind === "kanban.card_move" && p.from && p.to) {
+    const key = boundedKey(board.moves, JSON.stringify([p.from, p.to]));
+    const move = board.moves.get(key) ?? {
+      from: key === OTHER ? OTHER : p.from,
+      to: key === OTHER ? OTHER : p.to,
+      count: 0,
+    };
+    move.count++;
+    board.moves.set(key, move);
+    if (p.msInPrevStage !== undefined) {
+      const stage = boundedKey(board.stages, p.from);
+      const values = board.stages.get(stage) ?? durations();
+      addDuration(values, p.msInPrevStage);
+      board.stages.set(stage, values);
+    }
+  }
+  if (event.kind === "kanban.review_verdict") {
+    if (p.verdict) increment(board.verdicts, p.verdict);
+    if (event.durationMs !== undefined) addDuration(board.reviewDuration, event.durationMs);
+    if (event.cardId) {
+      if (!board.reviews.has(event.cardId) && board.reviews.size >= BOARD_LIMIT) board.overflow++;
+      else {
+        const review = board.reviews.get(event.cardId) ?? { rounds: 0, verdicts: 0 };
+        review.rounds = Math.max(review.rounds, p.round ?? 0);
+        review.verdicts++;
+        board.reviews.set(event.cardId, review);
+      }
+    }
+  }
+  if (event.kind === "kanban.stall" && p.reasonClass) {
+    const key = boundedKey(board.stalls, p.reasonClass);
+    const stall = board.stalls.get(key) ?? { sets: 0, clears: 0, durations: durations() };
+    if (p.action === "set") stall.sets++;
+    if (p.action === "clear") {
+      stall.clears++;
+      if (p.ageMs !== undefined) addDuration(stall.durations, p.ageMs);
+    }
+    board.stalls.set(key, stall);
+  }
+  if (event.kind === "kanban.worker_failed") increment(board.failures, p.errorClass ?? "other");
+  if (event.kind === "kanban.worker_restarted") board.restarts++;
+  if (event.kind === "kanban.ask_snapshot" || event.kind === "kanban.ask_pending") {
+    let snapshot = board.snapshots.get(event.ts);
+    if (!snapshot && board.snapshots.size >= MAX_GROUPS) {
+      board.overflow++;
+      return;
+    }
+    if (!snapshot) {
+      snapshot = { expected: undefined, asks: new Map() };
+      board.snapshots.set(event.ts, snapshot);
+    }
+    if (event.kind === "kanban.ask_snapshot") snapshot.expected = p.count;
+    if (event.kind === "kanban.ask_pending" && event.cardId && p.key && p.createdAt) {
+      const key = JSON.stringify([event.cardId, p.key]);
+      if (!snapshot.asks.has(key) && board.snapshotRows >= BOARD_LIMIT) board.overflow++;
+      else {
+        if (!snapshot.asks.has(key)) board.snapshotRows++;
+        snapshot.asks.set(key, {
+          ts: event.ts,
+          rank: 1,
+          closed: false,
+          cardId: event.cardId,
+          key: p.key,
+          kind: p.kind ?? "question",
+          blocking: p.blocking ?? false,
+          createdAt: p.createdAt,
+        });
+      }
+    }
+  }
+  if (
+    ["kanban.ask_opened", "kanban.ask_updated", "kanban.ask_closed", "ask.answered"].includes(
+      event.kind,
+    ) &&
+    event.cardId &&
+    p.key &&
+    p.createdAt
+  ) {
+    const key = JSON.stringify([event.cardId, p.key]);
+    const old = board.asks.get(key);
+    const closed = event.kind === "kanban.ask_closed" || event.kind === "ask.answered";
+    const rank = closed ? 3 : event.kind === "kanban.ask_updated" ? 2 : 0;
+    if (!old && board.asks.size >= BOARD_LIMIT) board.overflow++;
+    else if (!old || event.ts > old.ts || (event.ts === old.ts && rank >= old.rank))
+      board.asks.set(key, {
+        ts: event.ts,
+        rank,
+        closed,
+        cardId: event.cardId,
+        key: p.key,
+        kind: p.kind ?? "question",
+        blocking: p.blocking ?? false,
+        createdAt: p.createdAt,
+      });
+  }
+  if (
+    event.kind === "kanban.pool_usage" &&
+    p.poolKey &&
+    p.used !== undefined &&
+    p.slots !== undefined
+  ) {
+    const hour = `${event.ts.slice(0, 13)}:00:00.000Z`;
+    const key = JSON.stringify([hour, p.poolKey]);
+    if (!board.pools.has(key) && board.pools.size >= BOARD_LIMIT) {
+      board.overflow++;
+      return;
+    }
+    const pool = board.pools.get(key) ?? {
+      hour,
+      poolKey: p.poolKey,
+      samples: 0,
+      used: 0,
+      slots: 0,
+      waiting: 0,
+    };
+    pool.samples++;
+    pool.used += p.used;
+    pool.slots += p.slots;
+    pool.waiting += p.waiting ?? 0;
+    board.pools.set(key, pool);
+  }
+}
+
 export function accumulate(
   target: ReturnType<typeof makeAccumulator>,
   event: AnalyticsEvent,
 ): void {
+  boardAccumulate(target, event);
   target.total++;
+  if ("runId" in event) accumulateUsage(target.usage, event);
+  if (
+    event.surface === "server" &&
+    (event.kind === "text-generation.operation" || event.kind === "text-generation.child") &&
+    event.props?.provider &&
+    event.props.operation &&
+    event.durationMs !== undefined
+  ) {
+    const labels = {
+      hour: (event.startedAt ?? event.ts).slice(11, 13),
+      provider: event.props.provider,
+      operation: event.props.operation,
+      boardId: event.boardId ?? null,
+      kind: event.kind === "text-generation.child" ? ("child" as const) : ("operation" as const),
+      outcome: event.outcome ?? "error",
+    };
+    const key = JSON.stringify(labels);
+    // Bound all dimensions together. Overflow remains visible in kindCounts and raw day files.
+    if (target.textGeneration.has(key) || target.textGeneration.size < 4096) {
+      const group = target.textGeneration.get(key) ?? { labels, durations: durations() };
+      addDuration(group.durations, event.durationMs);
+      target.textGeneration.set(key, group);
+    } else target.textGenerationOverflow++;
+  }
   increment(target.kinds, event.kind);
   if (event.props?.errorTag) increment(target.errors, event.props.errorTag);
   else if (event.errorTag) increment(target.errors, event.errorTag);
   else if (/error|fail/i.test(event.kind)) increment(target.errors, event.kind);
   else if ((event.props?.status ?? 0) >= 400)
     increment(target.errors, `status.${event.props!.status}`);
+
+  const tag = event.props?.errorTag ?? event.errorTag;
+  if (
+    event.surface === "server" &&
+    event.kind !== "mcp.call" &&
+    (tag || (event.props?.status ?? 0) >= 400 || /error|fail/i.test(event.kind))
+  ) {
+    breakdown(
+      target.routes,
+      {
+        route: event.route,
+        method: event.props?.method ?? "unknown",
+        status: event.props?.status ?? null,
+        tag: tag ?? "unknown",
+      },
+      event,
+    );
+  }
+  // The ledger is canonical: server.mcp.error is a compatibility event for the same call.
+  if (event.kind === "mcp.call" && event.outcome !== undefined && event.outcome !== "ok") {
+    breakdown(
+      target.mcpCodes,
+      { tool: event.tool ?? "unknown", code: event.props?.code ?? event.errorTag ?? "unknown" },
+      event,
+    );
+  }
+  if (event.kind === "db.slow") {
+    breakdown(
+      target.dbSpans,
+      {
+        span: event.props?.span ?? "unknown",
+        key: event.props?.key ?? "unknown",
+        phase: event.props?.phase ?? "unknown",
+      },
+      event,
+    );
+  }
+
+  if (event.kind === "performance.long-task-summary") {
+    const props = event.props;
+    const count = props?.count;
+    const histogram = props?.histogram;
+    // Individual samples overlap summaries. Only merge complete distributions, never percentiles.
+    if (
+      props &&
+      count !== undefined &&
+      Number.isInteger(count) &&
+      histogram &&
+      histogram.reduce((sum, [, n]) => sum + n, 0) === count &&
+      props.totalMs !== undefined &&
+      props.maxMs !== undefined &&
+      props.wallTimeMs !== undefined
+    ) {
+      const key = boundedKey(target.longTasks, JSON.stringify([event.surface, event.route]));
+      const group = target.longTasks.get(key) ?? {
+        route: key === OTHER ? OTHER : event.route,
+        surface: event.surface,
+        count: 0,
+        totalMs: 0,
+        maxMs: 0,
+        wallTimeMs: 0,
+        histogram: new Map<number, number>(),
+      };
+      group.count += count;
+      group.totalMs += props.totalMs;
+      group.maxMs = Math.max(group.maxMs, props.maxMs);
+      group.wallTimeMs += props.wallTimeMs;
+      for (const [bucket, n] of histogram)
+        group.histogram.set(bucket, (group.histogram.get(bucket) ?? 0) + n);
+      target.longTasks.set(key, group);
+    }
+  }
+
+  if (
+    event.kind === "kanban.tick_phase" &&
+    event.surface === "server" &&
+    event.boardId &&
+    event.props?.phase &&
+    event.durationMs !== undefined
+  ) {
+    const identity = JSON.stringify([event.boardId, event.props.phase]);
+    const key = boundedKey(target.tickPhases, identity);
+    let group = target.tickPhases.get(key);
+    if (!group) {
+      group = {
+        boardId: key === OTHER ? OTHER : event.boardId,
+        phase: key === OTHER ? OTHER : event.props.phase,
+        durations: durations(),
+      };
+      target.tickPhases.set(key, group);
+    }
+    addDuration(group.durations, event.durationMs);
+  }
 
   if (
     /(^|[._-])rpc([._-]|$)/i.test(event.kind) &&
@@ -112,13 +506,19 @@ export function accumulate(
     const key = boundedKey(target.rpcs, event.props.method);
     let summary = target.rpcs.get(key);
     if (!summary) {
-      summary = durations();
+      summary = { ...durations(), totalWaitMs: 0, outcomes: new Map() };
       target.rpcs.set(key, summary);
     }
     addDuration(summary, event.durationMs);
+    summary.totalWaitMs += event.props.waitMs ?? 0;
+    if (event.outcome !== undefined) increment(summary.outcomes, event.outcome);
   }
 
-  if (/ask/i.test(event.kind) && /answer|respond|resolv/i.test(event.kind)) {
+  if (
+    event.kind !== "ask.answer_sent" &&
+    /ask/i.test(event.kind) &&
+    /answer|respond|resolv/i.test(event.kind)
+  ) {
     const duration =
       event.durationMs ??
       (event.props?.createdAt
@@ -131,7 +531,8 @@ export function accumulate(
   if (event.kind === "mcp.call" && event.tool && event.outcome) {
     const hour = `${event.ts.slice(0, 13)}:00:00.000Z`;
     const build = event.build ?? "unknown";
-    const key = JSON.stringify([event.tool, hour, build]);
+    const bootId = event.bootId ?? "unknown";
+    const key = JSON.stringify([event.tool, hour, build, bootId]);
     let group = target.mcp.get(key);
     if (!group) {
       // Bound both high-cardinality build groups and retry identities on damaged/untrusted logs.
@@ -143,6 +544,7 @@ export function accumulate(
         tool: event.tool,
         hour,
         build,
+        bootId,
         durations: durations(),
         failures: 0,
         outcomes: new Map(),
@@ -184,7 +586,7 @@ export function accumulate(
   }
 }
 
-function summarize(values: Durations): AnalyticsLatency {
+export function summarize(values: Durations): AnalyticsLatency {
   const sorted = values.histogram
     ? [...values.histogram].sort(([a], [b]) => a - b)
     : values.exact.toSorted((a, b) => a - b).map((value) => [value, 1] as const);
@@ -207,6 +609,38 @@ function summarize(values: Durations): AnalyticsLatency {
     p95Ms: percentile(0.95),
     maxMs: values.count === 0 ? null : values.max,
     approximate: values.histogram !== undefined,
+  };
+}
+
+function finishBoardAsks(board: BoardGroup, day: string, generatedAt: string) {
+  const ordered = [...board.snapshots].sort(([a], [b]) => b.localeCompare(a));
+  const complete = ordered.find(
+    ([, snapshot]) => snapshot.expected !== undefined && snapshot.expected === snapshot.asks.size,
+  );
+  const asOf = complete?.[0] ?? null;
+  const asks = new Map(complete?.[1].asks ?? []);
+  for (const [key, observation] of board.asks) {
+    const prior = asks.get(key);
+    if (
+      (asOf === null || observation.ts >= asOf) &&
+      (!prior ||
+        observation.ts > prior.ts ||
+        (observation.ts === prior.ts && observation.rank >= prior.rank))
+    )
+      asks.set(key, observation);
+  }
+  const at = Date.parse(day < generatedAt.slice(0, 10) ? `${day}T23:59:59.999Z` : generatedAt);
+  return {
+    openAsks: [...asks.values()]
+      .filter((ask) => !ask.closed)
+      .map(({ ts: _ts, rank: _rank, closed: _closed, ...ask }) => ({
+        ...ask,
+        ageMs: Math.max(0, at - Date.parse(ask.createdAt)),
+      })),
+    openAsksAsOf: asOf,
+    incompleteAskSnapshots: ordered.filter(
+      ([, snapshot]) => snapshot.expected === undefined || snapshot.expected !== snapshot.asks.size,
+    ).length,
   };
 }
 
@@ -235,17 +669,130 @@ export function finishRollup(
     total: target.total,
     invalidLines: target.invalidLines,
     kindCounts: Object.fromEntries(target.kinds),
+    textGenerationOverflow: target.textGenerationOverflow,
+    textGeneration: [...target.textGeneration.values()]
+      .map((group) => ({ ...group.labels, ...summarize(group.durations) }))
+      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
     errorCounts: Object.fromEntries(target.errors),
+    errorsByRoute: finishBreakdown(target.routes).map((row) => ({
+      route: String(row.labels.route),
+      method: String(row.labels.method),
+      status: typeof row.labels.status === "number" ? row.labels.status : null,
+      tag: String(row.labels.tag),
+      count: row.count,
+      p50Ms: row.p50Ms,
+      p95Ms: row.p95Ms,
+      maxMs: row.maxMs,
+      approximate: row.approximate,
+    })),
+    mcpErrorsByCode: finishBreakdown(target.mcpCodes).map((row) => ({
+      tool: String(row.labels.tool),
+      code: String(row.labels.code),
+      count: row.count,
+      p50Ms: row.p50Ms,
+      p95Ms: row.p95Ms,
+      maxMs: row.maxMs,
+      approximate: row.approximate,
+    })),
+    dbSlowBySpan: finishBreakdown(target.dbSpans).map((row) => ({
+      span: String(row.labels.span),
+      key: String(row.labels.key),
+      phase: String(row.labels.phase),
+      count: row.count,
+      p50Ms: row.p50Ms,
+      p95Ms: row.p95Ms,
+      maxMs: row.maxMs,
+      approximate: row.approximate,
+      totalWaitMs: row.totalWaitMs,
+    })),
+    longTasksByRoute: [...target.longTasks.values()]
+      .map((group) => {
+        let rank = Math.ceil(group.count * 0.95);
+        let p95Ms: number | null = null;
+        for (const [bucket, count] of [...group.histogram].sort(([a], [b]) => a - b)) {
+          rank -= count;
+          if (rank <= 0) {
+            p95Ms = Math.min(group.maxMs, LONG_TASK_HISTOGRAM_RATIO ** bucket);
+            break;
+          }
+        }
+        return {
+          route: group.route,
+          surface: group.surface,
+          count: group.count,
+          totalMs: group.totalMs,
+          maxMs: group.maxMs,
+          p95Ms,
+          wallTimeMs: group.wallTimeMs,
+          wallTimeShare: group.wallTimeMs > 0 ? group.totalMs / group.wallTimeMs : null,
+          approximate: group.count > 0,
+        };
+      })
+      .sort(
+        (a, b) =>
+          b.totalMs - a.totalMs ||
+          a.route.localeCompare(b.route) ||
+          a.surface.localeCompare(b.surface),
+      ),
     topSlowRpcs: [...target.rpcs]
-      .map(([method, values]) => ({ method, ...summarize(values) }))
+      .map(([method, values]) => ({
+        method,
+        ...summarize(values),
+        totalWaitMs: values.totalWaitMs,
+        outcomes: Object.fromEntries(values.outcomes),
+      }))
       .sort((a, b) => (b.p95Ms ?? 0) - (a.p95Ms ?? 0) || a.method.localeCompare(b.method))
       .slice(0, 20),
     askAnswerLatency: summarize(target.answers),
+    usage: finishUsage(target.usage),
+    boards: [...target.boards].map(([boardId, board]) => ({
+      boardId,
+      moves: [...board.moves.values()],
+      timeInStage: [...board.stages].map(([stage, values]) => ({ stage, ...summarize(values) })),
+      reviewRounds: [...board.reviews].map(([cardId, value]) => ({ cardId, ...value })),
+      verdictCounts: Object.fromEntries(board.verdicts),
+      reviewDuration: summarize(board.reviewDuration),
+      stalls: [...board.stalls].map(([reasonClass, value]) => ({
+        reasonClass,
+        sets: value.sets,
+        clears: value.clears,
+        ...summarize(value.durations),
+      })),
+      failureCounts: Object.fromEntries(board.failures),
+      restarts: board.restarts,
+      ...finishBoardAsks(board, day, generatedAt),
+      poolUtilisation: [...board.pools.values()].map((pool) => ({
+        ...pool,
+        used: pool.used / pool.samples,
+        slots: pool.slots / pool.samples,
+        waiting: pool.waiting / pool.samples,
+        utilisation: pool.slots === 0 ? null : pool.used / pool.slots,
+      })),
+      overflow: board.overflow,
+    })),
+    askLatency: {
+      source: "unavailable",
+      sentToSeen: summarize(durations()),
+      seenToAnswered: summarize(durations()),
+      createdToAnswered: summarize(durations()),
+      answeredWithoutSeen: 0,
+      openOver1hAtDayEnd: null,
+      byBlocking: {},
+      byKind: {},
+    },
+    tickPhases: [...target.tickPhases.values()]
+      .map((group) => ({
+        boardId: group.boardId,
+        phase: group.phase,
+        ...summarize(group.durations),
+      }))
+      .sort((a, b) => a.boardId.localeCompare(b.boardId) || a.phase.localeCompare(b.phase)),
     mcpCalls: [...target.mcp]
       .map(([key, group]) => ({
         tool: group.tool,
         hour: group.hour,
         build: group.build,
+        bootId: group.bootId,
         ...summarize(group.durations),
         failures: group.failures,
         failureRate: group.failures / group.durations.count,
@@ -258,7 +805,8 @@ export function finishRollup(
         (a, b) =>
           a.hour.localeCompare(b.hour) ||
           a.tool.localeCompare(b.tool) ||
-          a.build.localeCompare(b.build),
+          a.build.localeCompare(b.build) ||
+          a.bootId.localeCompare(b.bootId),
       ),
     mcpOverflow: { ...target.mcpOverflow },
   };
@@ -292,5 +840,120 @@ export function boundedLines(maxLength: number) {
     finish(): ReadonlyArray<string | null> {
       return oversized ? [null] : pending.length === 0 ? [] : [pending];
     },
+  };
+}
+
+const usageTotals = () => ({
+  runs: 0,
+  inputTokens: null as number | null,
+  outputTokens: null as number | null,
+  cachedInputTokens: null as number | null,
+  reasoningTokens: null as number | null,
+  wallMs: null as number | null,
+  turnCount: 0,
+  completeRuns: 0,
+  partialRuns: 0,
+  unavailableRuns: 0,
+});
+type UsageTotals = ReturnType<typeof usageTotals>;
+const makeUsageAccumulator = () => ({
+  totals: usageTotals(),
+  models: new Map<string, { providerInstance: string; model: string; totals: UsageTotals }>(),
+  roles: new Map<RunUsageEvent["role"], UsageTotals>(),
+  boards: new Map<string, UsageTotals>(),
+  cards: new Map<
+    string,
+    {
+      boardId: string;
+      cardId: string;
+      totals: UsageTotals;
+      evaluatorWakes: number;
+      reviewRounds: Set<number>;
+    }
+  >(),
+  seen: new Set<string>(),
+});
+function addUsage(target: UsageTotals, event: RunUsageEvent): void {
+  target.runs++;
+  for (const key of [
+    "inputTokens",
+    "outputTokens",
+    "cachedInputTokens",
+    "reasoningTokens",
+    "wallMs",
+  ] as const) {
+    if (event[key] !== null) target[key] = (target[key] ?? 0) + event[key];
+  }
+  target.turnCount += event.turnCount;
+  target.completeRuns += Number(event.usageStatus === "complete");
+  target.partialRuns += Number(event.usageStatus === "partial");
+  target.unavailableRuns += Number(event.usageStatus === "unavailable");
+}
+function accumulateUsage(
+  target: ReturnType<typeof makeUsageAccumulator>,
+  event: RunUsageEvent,
+): void {
+  // The writer can replay an ambiguous append; a run is billed only once in the rollup.
+  if (target.seen.has(event.runId)) return;
+  target.seen.add(event.runId);
+  addUsage(target.totals, event);
+  const modelKey = JSON.stringify([event.providerInstance, event.model]);
+  const model = target.models.get(modelKey) ?? {
+    providerInstance: event.providerInstance,
+    model: event.model,
+    totals: usageTotals(),
+  };
+  addUsage(model.totals, event);
+  target.models.set(modelKey, model);
+  const role = target.roles.get(event.role) ?? usageTotals();
+  addUsage(role, event);
+  target.roles.set(event.role, role);
+  if (event.boardId !== undefined) {
+    const board = target.boards.get(event.boardId) ?? usageTotals();
+    addUsage(board, event);
+    target.boards.set(event.boardId, board);
+    if (event.cardId !== undefined) {
+      const key = JSON.stringify([event.boardId, event.cardId]);
+      const card = target.cards.get(key) ?? {
+        boardId: event.boardId,
+        cardId: event.cardId,
+        totals: usageTotals(),
+        evaluatorWakes: 0,
+        reviewRounds: new Set<number>(),
+      };
+      addUsage(card.totals, event);
+      card.evaluatorWakes += Number(event.role === "evaluator" || event.role === "discussion");
+      if (event.role === "review" && event.reviewRound !== null)
+        card.reviewRounds.add(event.reviewRound);
+      target.cards.set(key, card);
+    }
+  }
+}
+function finishUsage(target: ReturnType<typeof makeUsageAccumulator>): AnalyticsRollup["usage"] {
+  const cards = [...target.cards.values()].map(({ totals, reviewRounds, ...card }) => ({
+    ...card,
+    ...totals,
+    reviewRounds: reviewRounds.size,
+  }));
+  const tie = (a: (typeof cards)[number], b: (typeof cards)[number]) =>
+    a.boardId.localeCompare(b.boardId) || a.cardId.localeCompare(b.cardId);
+  return {
+    totals: target.totals,
+    perModel: [...target.models.values()].map(({ totals, ...model }) => ({ ...model, ...totals })),
+    perRole: [...target.roles].map(([role, totals]) => ({ role, ...totals })),
+    perBoard: [...target.boards].map(([boardId, totals]) => ({ boardId, ...totals })),
+    cards,
+    // Cache and reasoning are subsets of input and output, never added twice.
+    topCardsByTokens: cards
+      .toSorted(
+        (a, b) =>
+          (b.inputTokens ?? 0) +
+            (b.outputTokens ?? 0) -
+            ((a.inputTokens ?? 0) + (a.outputTokens ?? 0)) || tie(a, b),
+      )
+      .slice(0, 20),
+    topCardsByWallMs: cards
+      .toSorted((a, b) => (b.wallMs ?? 0) - (a.wallMs ?? 0) || tie(a, b))
+      .slice(0, 20),
   };
 }

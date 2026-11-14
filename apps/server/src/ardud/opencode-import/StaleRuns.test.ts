@@ -41,198 +41,229 @@ const run = (
     providerInstanceId: string;
   }>,
 ) =>
-  Effect.runPromise(
+  Effect.gen(function* () {
+    const service = yield* StaleOpenCodeSessions;
+    return yield* service.abort(sessions);
+  }).pipe(Effect.provide(layer.pipe(Layer.provide(settings(config)))));
+
+// Real HTTP requests keep their wall-clock timeout behavior in these tests.
+describe("StaleOpenCodeSessions", () => {
+  it.live("interrupts each supplied root with the OpenCode 2 path and auth", () =>
     Effect.gen(function* () {
-      const service = yield* StaleOpenCodeSessions;
-      return yield* service.abort(sessions);
-    }).pipe(Effect.provide(layer.pipe(Layer.provide(settings(config))))),
+      const requests: Array<{
+        method: string | undefined;
+        url: string | undefined;
+        auth: string | undefined;
+      }> = [];
+      const server = yield* Effect.promise(() =>
+        serve((req, res) => {
+          requests.push({ method: req.method, url: req.url, auth: req.headers.authorization });
+          res.writeHead(req.url?.startsWith("/api/session/ses_gone/") ? 404 : 200);
+          res.end();
+        }),
+      );
+      try {
+        expect(
+          yield* run(external(server.url), [
+            { sessionId: "ses_a/1", directory: "/tmp/a b&c", providerInstanceId: "opencode" },
+            { sessionId: "ses_gone", directory: null, providerInstanceId: "opencode" },
+          ]),
+        ).toEqual({ aborted: 2, failed: 0 });
+        expect(requests).toHaveLength(2);
+        expect(requests).toContainEqual({
+          method: "POST",
+          url: "/api/session/ses_a%2F1/interrupt",
+          auth: `Basic ${Buffer.from("opencode:test-password").toString("base64")}`,
+        });
+        expect(requests).toContainEqual({
+          method: "POST",
+          url: "/api/session/ses_gone/interrupt",
+          auth: `Basic ${Buffer.from("opencode:test-password").toString("base64")}`,
+        });
+      } finally {
+        server.close();
+      }
+    }),
   );
 
-describe("StaleOpenCodeSessions", () => {
-  it("interrupts each supplied root with the OpenCode 2 path and auth", async () => {
-    const requests: Array<{
-      method: string | undefined;
-      url: string | undefined;
-      auth: string | undefined;
-    }> = [];
-    const server = await serve((req, res) => {
-      requests.push({ method: req.method, url: req.url, auth: req.headers.authorization });
-      res.writeHead(req.url?.startsWith("/api/session/ses_gone/") ? 404 : 200);
-      res.end();
-    });
-    try {
-      expect(
-        await run(external(server.url), [
-          { sessionId: "ses_a/1", directory: "/tmp/a b&c", providerInstanceId: "opencode" },
-          { sessionId: "ses_gone", directory: null, providerInstanceId: "opencode" },
-        ]),
-      ).toEqual({ aborted: 2, failed: 0 });
-      expect(requests).toHaveLength(2);
-      expect(requests).toContainEqual({
-        method: "POST",
-        url: "/api/session/ses_a%2F1/interrupt",
-        auth: `Basic ${Buffer.from("opencode:test-password").toString("base64")}`,
-      });
-      expect(requests).toContainEqual({
-        method: "POST",
-        url: "/api/session/ses_gone/interrupt",
-        auth: `Basic ${Buffer.from("opencode:test-password").toString("base64")}`,
-      });
-    } finally {
-      server.close();
-    }
-  });
+  it.live(
+    "counts a 500 and a timed-out request as failures without failing the effect",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* Effect.promise(() =>
+          serve((req, res) => {
+            if (req.url === "/api/session/ses_hang/interrupt") return;
+            res.writeHead(500);
+            res.end();
+          }),
+        );
+        try {
+          expect(
+            yield* run(external(server.url), [
+              { sessionId: "ses_error", directory: null, providerInstanceId: "opencode" },
+              { sessionId: "ses_hang", directory: null, providerInstanceId: "opencode" },
+            ]),
+          ).toEqual({ aborted: 0, failed: 2 });
+        } finally {
+          server.close();
+        }
+      }),
+    8_000,
+  );
 
-  it("counts a 500 and a timed-out request as failures without failing the effect", async () => {
-    const server = await serve((req, res) => {
-      if (req.url === "/api/session/ses_hang/interrupt") return;
-      res.writeHead(500);
-      res.end();
-    });
-    try {
-      expect(
-        await run(external(server.url), [
+  it.live(
+    "stops issuing requests on subsequent passes after a timeout",
+    () =>
+      Effect.gen(function* () {
+        let requests = 0;
+        const server = yield* Effect.promise(() =>
+          serve(() => {
+            requests++;
+          }),
+        );
+        try {
+          const sessions = [
+            { sessionId: "ses_hang", directory: null, providerInstanceId: "opencode" },
+          ];
+          const results = yield* Effect.gen(function* () {
+            const service = yield* StaleOpenCodeSessions;
+            const first = yield* service.abort(sessions);
+            const second = yield* service.abort(sessions).pipe(Effect.timeout("1 second"));
+            return [first, second];
+          }).pipe(Effect.provide(layer.pipe(Layer.provide(settings(external(server.url))))));
+          expect(results).toEqual([
+            { aborted: 0, failed: 1 },
+            { aborted: 0, failed: 1 },
+          ]);
+          expect(requests).toBe(1);
+        } finally {
+          server.close();
+        }
+      }),
+    8_000,
+  );
+
+  it.live("keeps trying after an HTTP failure", () =>
+    Effect.gen(function* () {
+      let requests = 0;
+      const server = yield* Effect.promise(() =>
+        serve((_req, res) => {
+          requests++;
+          res.writeHead(500);
+          res.end();
+        }),
+      );
+      try {
+        const sessions = [
           { sessionId: "ses_error", directory: null, providerInstanceId: "opencode" },
-          { sessionId: "ses_hang", directory: null, providerInstanceId: "opencode" },
-        ]),
-      ).toEqual({ aborted: 0, failed: 2 });
-    } finally {
-      server.close();
-    }
-  }, 8_000);
-
-  it("stops issuing requests on subsequent passes after a timeout", async () => {
-    let requests = 0;
-    const server = await serve(() => {
-      requests++;
-    });
-    try {
-      const sessions = [{ sessionId: "ses_hang", directory: null, providerInstanceId: "opencode" }];
-      const results = await Effect.runPromise(
-        Effect.gen(function* () {
-          const service = yield* StaleOpenCodeSessions;
-          const first = yield* service.abort(sessions);
-          const second = yield* service.abort(sessions).pipe(Effect.timeout("1 second"));
-          return [first, second];
-        }).pipe(Effect.provide(layer.pipe(Layer.provide(settings(external(server.url)))))),
-      );
-      expect(results).toEqual([
-        { aborted: 0, failed: 1 },
-        { aborted: 0, failed: 1 },
-      ]);
-      expect(requests).toBe(1);
-    } finally {
-      server.close();
-    }
-  }, 8_000);
-
-  it("keeps trying after an HTTP failure", async () => {
-    let requests = 0;
-    const server = await serve((_req, res) => {
-      requests++;
-      res.writeHead(500);
-      res.end();
-    });
-    try {
-      const sessions = [
-        { sessionId: "ses_error", directory: null, providerInstanceId: "opencode" },
-      ];
-      const results = await Effect.runPromise(
-        Effect.gen(function* () {
+        ];
+        const results = yield* Effect.gen(function* () {
           const service = yield* StaleOpenCodeSessions;
           return [yield* service.abort(sessions), yield* service.abort(sessions)];
-        }).pipe(Effect.provide(layer.pipe(Layer.provide(settings(external(server.url)))))),
-      );
-      expect(results).toEqual([
-        { aborted: 0, failed: 1 },
-        { aborted: 0, failed: 1 },
-      ]);
-      expect(requests).toBe(2);
-    } finally {
-      server.close();
-    }
-  });
+        }).pipe(Effect.provide(layer.pipe(Layer.provide(settings(external(server.url))))));
+        expect(results).toEqual([
+          { aborted: 0, failed: 1 },
+          { aborted: 0, failed: 1 },
+        ]);
+        expect(requests).toBe(2);
+      } finally {
+        server.close();
+      }
+    }),
+  );
 
-  it("trips the breaker when the connection drops", async () => {
-    let requests = 0;
-    const server = await serve((req) => {
-      requests++;
-      req.socket.destroy();
-    });
-    try {
-      const sessions = [
-        { sessionId: "ses_reset", directory: null, providerInstanceId: "opencode" },
-      ];
-      const results = await Effect.runPromise(
-        Effect.gen(function* () {
+  it.live("trips the breaker when the connection drops", () =>
+    Effect.gen(function* () {
+      let requests = 0;
+      const server = yield* Effect.promise(() =>
+        serve((req) => {
+          requests++;
+          req.socket.destroy();
+        }),
+      );
+      try {
+        const sessions = [
+          { sessionId: "ses_reset", directory: null, providerInstanceId: "opencode" },
+        ];
+        const results = yield* Effect.gen(function* () {
           const service = yield* StaleOpenCodeSessions;
           return [yield* service.abort(sessions), yield* service.abort(sessions)];
-        }).pipe(Effect.provide(layer.pipe(Layer.provide(settings(external(server.url)))))),
+        }).pipe(Effect.provide(layer.pipe(Layer.provide(settings(external(server.url))))));
+        expect(results).toEqual([
+          { aborted: 0, failed: 1 },
+          { aborted: 0, failed: 1 },
+        ]);
+        expect(requests).toBe(1);
+      } finally {
+        server.close();
+      }
+    }),
+  );
+
+  it.live("makes no request for local or unknown configurations", () =>
+    Effect.gen(function* () {
+      let requests = 0;
+      const server = yield* Effect.promise(() =>
+        serve((_req, res) => {
+          requests++;
+          res.end();
+        }),
       );
-      expect(results).toEqual([
-        { aborted: 0, failed: 1 },
-        { aborted: 0, failed: 1 },
-      ]);
-      expect(requests).toBe(1);
-    } finally {
-      server.close();
-    }
-  });
+      try {
+        const sessions = [{ sessionId: "ses_a", directory: null, providerInstanceId: "opencode" }];
+        expect(yield* run({ opencode: { driver: "opencode", config: {} } }, sessions)).toEqual({
+          aborted: 0,
+          failed: 0,
+        });
+        expect(
+          yield* run(
+            { opencode: { driver: "opencode", config: { serverUrl: server.url } } },
+            sessions,
+          ),
+        ).toEqual({ aborted: 0, failed: 0 });
+        expect(requests).toBe(0);
+      } finally {
+        server.close();
+      }
+    }),
+  );
 
-  it("makes no request for local or unknown configurations", async () => {
-    let requests = 0;
-    const server = await serve((_req, res) => {
-      requests++;
-      res.end();
-    });
-    try {
-      const sessions = [{ sessionId: "ses_a", directory: null, providerInstanceId: "opencode" }];
-      expect(await run({ opencode: { driver: "opencode", config: {} } }, sessions)).toEqual({
-        aborted: 0,
-        failed: 0,
-      });
-      expect(
-        await run(
-          { opencode: { driver: "opencode", config: { serverUrl: server.url } } },
-          sessions,
-        ),
-      ).toEqual({ aborted: 0, failed: 0 });
-      expect(requests).toBe(0);
-    } finally {
-      server.close();
-    }
-  });
-
-  it("targets only the owning external provider instance", async () => {
-    const first: string[] = [];
-    const second: string[] = [];
-    const a = await serve((req, res) => {
-      first.push(req.url!);
-      res.end();
-    });
-    const b = await serve((req, res) => {
-      second.push(req.url!);
-      res.end();
-    });
-    try {
-      const config = {
-        ...external(a.url),
-        other: { driver: "opencode", config: { serverUrl: b.url, serverPassword: "other" } },
-        local: { driver: "opencode", config: {} },
-      };
-      expect(
-        await run(config, [
-          { sessionId: "ses_one", directory: null, providerInstanceId: "opencode" },
-          { sessionId: "ses_two", directory: null, providerInstanceId: "other" },
-          { sessionId: "ses_local", directory: null, providerInstanceId: "local" },
-          { sessionId: "ses_missing", directory: null, providerInstanceId: "missing" },
-        ]),
-      ).toEqual({ aborted: 2, failed: 0 });
-      expect(first).toEqual(["/api/session/ses_one/interrupt"]);
-      expect(second).toEqual(["/api/session/ses_two/interrupt"]);
-    } finally {
-      a.close();
-      b.close();
-    }
-  });
+  it.live("targets only the owning external provider instance", () =>
+    Effect.gen(function* () {
+      const first: string[] = [];
+      const second: string[] = [];
+      const a = yield* Effect.promise(() =>
+        serve((req, res) => {
+          first.push(req.url!);
+          res.end();
+        }),
+      );
+      const b = yield* Effect.promise(() =>
+        serve((req, res) => {
+          second.push(req.url!);
+          res.end();
+        }),
+      );
+      try {
+        const config = {
+          ...external(a.url),
+          other: { driver: "opencode", config: { serverUrl: b.url, serverPassword: "other" } },
+          local: { driver: "opencode", config: {} },
+        };
+        expect(
+          yield* run(config, [
+            { sessionId: "ses_one", directory: null, providerInstanceId: "opencode" },
+            { sessionId: "ses_two", directory: null, providerInstanceId: "other" },
+            { sessionId: "ses_local", directory: null, providerInstanceId: "local" },
+            { sessionId: "ses_missing", directory: null, providerInstanceId: "missing" },
+          ]),
+        ).toEqual({ aborted: 2, failed: 0 });
+        expect(first).toEqual(["/api/session/ses_one/interrupt"]);
+        expect(second).toEqual(["/api/session/ses_two/interrupt"]);
+      } finally {
+        a.close();
+        b.close();
+      }
+    }),
+  );
 });

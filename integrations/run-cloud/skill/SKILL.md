@@ -122,6 +122,7 @@ runcloud ios tap $ID 0.5 0.82
 runcloud ios swipe $ID 0.5 0.8 0.5 0.3 --duration 300
 runcloud ios type-text $ID "hello"
 runcloud android type-text $ID "hello"
+runcloud android set-clipboard $ID "text"
 runcloud ios press-button $ID home               # android: back, menu, home
 runcloud ios open-url $ID "myapp://route"
 runcloud ios logs $ID --tail 500
@@ -132,12 +133,42 @@ Same commands under `runcloud android`. `unsupported_action` errors are final,
 don't retry them. `simulator_capacity_unavailable` means retry later.
 
 Android typing: `completed` and `characterCount` acknowledge injection, not the
-field's value. In a Settings search probe (CLI 0.2.183), a double quote, JSON
-and mixed text left the field empty; a URL lost `://example.com/`. Check every
-typed string: read back non-secure fields from the accessibility tree, and use
-the app's validation for secure fields. Confirm focus before further input. Semantic
-`press-key` with `--shift` worked in the TorSSH report but did not reproduce
-reliably in Settings search; verify its result too.
+field's value. With CLI 0.2.183, a 62-character onion arrived as `vwxy` (4 chars)
+in Settings search. Confirm focus before input and check the field and screen
+afterward. Read non-secure fields from the accessibility tree (AX);
+values containing `"` can read as null even when visible (#113), so also check
+a screenshot. For secure fields, use the app's validator or a Show password
+toggle (confirm masking is off before reading AX).
+
+- Cursor editing (CLI 0.2.183, Settings search): `type-text abcdef` →
+  `press-key arrowLeft` → `type-text X` left `abcdef`, with Back focused,
+  including without intervening AX captures. Adding 0.5 s or 2 s after Left
+  did not help. A single `X` in an empty focused field passed 5/5; re-tapping
+  the field before typing appended correctly at all three tested waits.
+  After navigation keys, check the intended input's focus before typing or
+  Enter; re-focus and verify the value and cursor position. A tap may move
+  the cursor. TorSSH key-strip/Enter recovery remains unverified (#123).
+
+SDK paste: one unverified reporter success in TorSSH #15's app, using
+`setClipboard(text)` + `pressKey('v', control)`. CLI Ctrl-V paste
+(`set-clipboard` then `press-key v --control`) did not work in the 2026-11-14
+Settings-search probe (CLI 0.2.183): all eight clipboard values matched, but
+the field stayed empty (onion, JSON, quote, URL, mixed symbols, long JSON,
+alphanumeric and email controls). Clear public probe text with `set-clipboard $ID ''`.
+In Settings' password field, whole-text typing and Ctrl-V left it empty; `back`
+after typing exited Add network. Per-key input reached Network name instead;
+no route into masked fields was independently verified here. Don't press Back
+blindly to hide the keyboard. After tapping a secure target, re-read AX and require
+`focused=true` before typing; otherwise stop. Re-check focus and value afterward:
+keys can reach another field or nowhere. System screens are affected too:
+TorSSH #86's observed Set a PIN / screen-lock sighting had ACKed digit input,
+`secure=true`, `focused=false` afterward and Next disabled (reported, not
+independently verified). For a focused field, per-character `press-key` has one
+reported hex-credential authentication success in TorSSH (alphanumeric only);
+symbols and Shift remain unverified.
+Never put real secrets on the clipboard or command lines that get logged or
+echoed. Secret symbols remain unverified; prefer alphanumeric test credentials
+when choosing them, and validate the result in the app.
 
 The signed viewer `url` in create/get/list/delete JSON is a secret (anyone with
 it can drive the session). Never print or paste it; strip it with

@@ -17,6 +17,7 @@ from datetime import datetime
 import common
 import mailparse
 import store
+import timing
 
 sys.path.insert(0, common.MAIL_LIBEXEC)
 import mail_oauth  # noqa: E402
@@ -39,6 +40,7 @@ def quote(name):
     return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+@timing.timed("fetch")
 def connect(acct, timeout=60):
     cfg = common.MAIL_ACCOUNTS[acct]
     if acct == "icloud":
@@ -52,6 +54,7 @@ def connect(acct, timeout=60):
     return mail_oauth.xoauth2_connect(acct, cfg["host"], cfg["user"], timeout=timeout)
 
 
+@timing.timed("fetch")
 def folders(m):
     typ, data = m.list()
     out = []
@@ -71,6 +74,7 @@ def folders(m):
     return out
 
 
+@timing.timed("fetch")
 def select(m, folder):
     typ, data = m.select(quote(folder), readonly=True)
     if typ != "OK":
@@ -80,6 +84,7 @@ def select(m, folder):
     return exists, uv
 
 
+@timing.timed("fetch")
 def search_uids(m, crit):
     typ, data = m.uid("SEARCH", None, crit)
     if typ != "OK":
@@ -141,6 +146,7 @@ class Pool:
             except Exception:
                 pass
 
+    @timing.timed("fetch")
     def close(self):
         for c in self.conns:
             try:
@@ -157,6 +163,7 @@ BAD = {}  # (acct, folder, uidvalidity, uid) -> failed single-UID fetches since 
 _BAD_LOCK = threading.Lock()
 
 
+@timing.timed("fetch")
 def _fetch_raw(pool, folder, uids):
     for attempt in range(3):
         try:
@@ -197,6 +204,7 @@ def _fetch_chunk(pool, acct, folder, uv, uids):
     return _items(acct, folder, uv, data)
 
 
+@timing.timed("parse")
 def _items(acct, folder, uv, data):
     me = common.MAIL_ACCOUNTS[acct]["user"].lower()
     items = []
@@ -245,7 +253,7 @@ def _sync_folder(db, pool, ex, acct, folder, stats, stop):
     for i in range(0, len(chunks), 20):
         if stop is not None and stop.is_set():
             return False
-        for items in ex.map(lambda ch: _fetch_chunk(pool, acct, folder, uv, ch), chunks[i:i + 20]):
+        for items in ex.map(timing.worker(lambda ch: _fetch_chunk(pool, acct, folder, uv, ch)), chunks[i:i + 20]):
             # One short write per chunk so the lock is never held while waiting on the network.
             with store.writing(db):
                 for it in items:

@@ -581,6 +581,16 @@ export const OrchestrationV2Run = Schema.Struct({
   restartContinuationOfRunId: Schema.optional(RunId),
   delegatedTaskId: Schema.optional(NodeId),
   delegatedTaskStall: Schema.optional(OrchestrationV2DelegatedTaskStall),
+  providerStartDeadlineAt: Schema.optional(Schema.DateTimeUtc),
+  providerRestartCleanup: Schema.optional(
+    Schema.Struct({
+      providerSessionId: ProviderSessionId,
+      providerThreadId: ProviderThreadId,
+      providerTurnId: ProviderTurnId,
+      replacementProviderSessionId: Schema.optional(ProviderSessionId),
+      completed: Schema.Boolean,
+    }),
+  ),
   workStartedAt: Schema.optional(Schema.DateTimeUtc),
   lastActivityAt: Schema.optional(Schema.DateTimeUtc),
   restartCancelledBackgroundWork: Schema.optional(
@@ -962,6 +972,8 @@ export const OrchestrationV2ProviderThread = Schema.Struct({
   pendingBackgroundTasks: Schema.optional(Schema.Array(OrchestrationV2PendingBackgroundTask)).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
+  // An ordered idle update follows the output of native background work, including child follow-ups.
+  pendingBackgroundWork: Schema.optional(Schema.Boolean),
   contextUsage: Schema.optional(Schema.NullOr(ThreadTokenUsageSnapshot)).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
@@ -1153,6 +1165,7 @@ export type OrchestrationV2NotificationSource = typeof OrchestrationV2Notificati
 
 export const OrchestrationV2Notification = Schema.Struct({
   source: OrchestrationV2NotificationSource,
+  pullRequestWatch: Schema.optional(Schema.Struct({ url: Schema.String, headSha: Schema.String })),
   outcome: Schema.Literals(["completed", "failed", "cancelled", "updated", "unknown"]),
   summary: TrimmedNonEmptyString,
   detail: Schema.optional(Schema.String),
@@ -2131,6 +2144,7 @@ export const OrchestrationV2RunJson = OrchestrationV2Run.mapFields((fields) => (
   requestedAt: Schema.DateTimeUtcFromString,
   startedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   completedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
+  providerStartDeadlineAt: Schema.optional(Schema.DateTimeUtcFromString),
   workStartedAt: Schema.optional(Schema.DateTimeUtcFromString),
   lastActivityAt: Schema.optional(Schema.DateTimeUtcFromString),
   // ardud: the restart work list is stored as JSON, so the child's start time is a string there.
@@ -3225,6 +3239,16 @@ export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
  */
 const OrchestrationV2InternalCommand = Schema.Union([
   Schema.Struct({
+    type: Schema.Literal("run.start-expire"),
+    phase: Schema.Literals(["provider", "restart_admission", "restart_cleanup"]),
+    commandId: CommandId,
+    threadId: ThreadId,
+    runId: RunId,
+    expectedAttemptId: Schema.NullOr(RunAttemptId),
+    deadline: Schema.DateTimeUtc,
+  }),
+
+  Schema.Struct({
     type: Schema.Literal("queue.cutover-release"),
     commandId: CommandId,
     threadId: ThreadId,
@@ -3246,6 +3270,8 @@ const OrchestrationV2InternalCommand = Schema.Union([
     threadId: ThreadId,
     ...ThreadPullRequestKey.fields,
     startedAt: IsoDateTime,
+    expectedHeadSha: Schema.optional(Schema.NullOr(Schema.String)),
+    expectedObservedHeadSha: Schema.optional(Schema.NullOr(Schema.String)),
     watch: Schema.NullOr(ThreadPullRequestWatch),
     /** With `watch: null`, the state the ended watch keeps instead of its last saved one. */
     endedWatch: Schema.optional(ThreadPullRequestWatch),

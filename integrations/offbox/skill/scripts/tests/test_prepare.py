@@ -36,7 +36,7 @@ class PrepareTests(Isolated):
                     self.assertIsNone(error.run_id)
                     self.assertEqual(error.code, common.EXIT_INFRA)
                     self.assertFalse(error.started)
-                    self.assertEqual(error.outage, phase == 'bring_up' and may_fail_over)
+                    self.assertFalse(error.outage)
                     self.assertEqual(str(error), f'could not get a box ready in 1.5s '
                                                 f'(stuck in {phase} on new-1); nothing ran')
 

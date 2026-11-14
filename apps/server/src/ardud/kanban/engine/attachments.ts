@@ -52,61 +52,65 @@ export const makeBoardAttachments = (
   config: ServerConfig.ServerConfig["Service"],
   fileSystem: FileSystem.FileSystem,
 ): BoardAttachments => {
-  const claim: BoardAttachments["claim"] = (boardId, blocks) =>
-    Effect.gen(function* () {
-      const attachments = blocks.flatMap((block) =>
-        block._tag === "attachment" ? [block.attachment] : [],
-      );
-      if (attachments.length === 0) return { blocks: [...blocks], claimedPaths: [] as ReadonlyArray<string> };
+  const claim: BoardAttachments["claim"] = Effect.fn("BoardAttachments.claim")(function* (boardId, blocks) {
+    const attachments = blocks.flatMap((block) =>
+      block._tag === "attachment" ? [block.attachment] : [],
+    );
+    if (attachments.length === 0)
+      return { blocks: [...blocks], claimedPaths: [] as ReadonlyArray<string> };
 
-      const owner = boardOwner(boardId);
-      const segment = toSafeThreadAttachmentSegment(owner);
-      const pending: ChatAttachment[] = [];
-      for (const attachment of attachments) {
-        const existing = resolveAttachmentPathById({
-          attachmentsDir: config.attachmentsDir,
-          attachmentId: attachment.id,
-        });
-        if (attachmentIsPendingUpload(attachment)) {
-          if (!existing) return yield* cantPost(attachment);
-          pending.push(attachment);
-          continue;
-        }
-        // The caller's name and mimeType decide the path agents open, so they must
-        // resolve to the file the id already points at, not a different extension.
-        const kept =
-          segment !== null &&
-          parseThreadSegmentFromAttachmentId(attachment.id) === segment &&
-          existing !== null &&
-          existing ===
-            resolveAttachmentPath({ attachmentsDir: config.attachmentsDir, attachment });
-        if (!kept) return yield* cantPost(attachment);
-      }
-
-      const claimed = yield* claimPendingAttachments({
-        threadId: owner,
-        attachments: pending,
-      }).pipe(
-        Effect.provideService(FileSystem.FileSystem, fileSystem),
-        Effect.provideService(ServerConfig.ServerConfig, config),
-        Effect.mapError((error) => new KanbanError({ code: "invalid", detail: error.message })),
-      );
-      // claimPendingAttachments returns attachments in input order; key by the pending id it came from.
-      const claimedById = new Map<string, ChatAttachment>(
-        pending.map((attachment, index) => [attachment.id, claimed.attachments[index]!]),
-      );
-      const next = blocks.map((block): KanbanBlock => {
-        if (block._tag !== "attachment") return block;
-        const claimedCopy = claimedById.get(block.attachment.id);
-        return claimedCopy
-          ? {
-              ...block,
-              attachment: { ...block.attachment, id: claimedCopy.id, mimeType: claimedCopy.mimeType },
-            }
-          : block;
+    const owner = boardOwner(boardId);
+    const segment = toSafeThreadAttachmentSegment(owner);
+    const pending: ChatAttachment[] = [];
+    for (const attachment of attachments) {
+      const existing = resolveAttachmentPathById({
+        attachmentsDir: config.attachmentsDir,
+        attachmentId: attachment.id,
       });
-      return { blocks: [...next], claimedPaths: claimed.claimedPaths };
+      if (attachmentIsPendingUpload(attachment)) {
+        if (!existing) return yield* cantPost(attachment);
+        pending.push(attachment);
+        continue;
+      }
+      // The caller's name and mimeType decide the path agents open, so they must
+      // resolve to the file the id already points at, not a different extension.
+      const kept =
+        segment !== null &&
+        parseThreadSegmentFromAttachmentId(attachment.id) === segment &&
+        existing !== null &&
+        existing ===
+          resolveAttachmentPath({ attachmentsDir: config.attachmentsDir, attachment });
+      if (!kept) return yield* cantPost(attachment);
+    }
+
+    const claimed = yield* claimPendingAttachments({
+      threadId: owner,
+      attachments: pending,
+    }).pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(ServerConfig.ServerConfig, config),
+      Effect.mapError((error) => new KanbanError({ code: "invalid", detail: error.message })),
+    );
+    // claimPendingAttachments returns attachments in input order; key by the pending id it came from.
+    const claimedById = new Map<string, ChatAttachment>(
+      pending.map((attachment, index) => [attachment.id, claimed.attachments[index]!]),
+    );
+    const next = blocks.map((block): KanbanBlock => {
+      if (block._tag !== "attachment") return block;
+      const claimedCopy = claimedById.get(block.attachment.id);
+      return claimedCopy
+        ? {
+            ...block,
+            attachment: {
+              ...block.attachment,
+              id: claimedCopy.id,
+              mimeType: claimedCopy.mimeType,
+            },
+          }
+        : block;
     });
+    return { blocks: [...next], claimedPaths: claimed.claimedPaths };
+  });
 
   return {
     claim,

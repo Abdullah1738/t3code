@@ -978,7 +978,9 @@ const make = Effect.gen(function* () {
     check: WaitBatch | null = null,
   ): Effect.Effect<KanbanScriptRun, KanbanError> =>
     open(script, trigger).pipe(
-      Effect.tap((run) => Effect.forkIn(finish(script, run, event, done, check), scope)),
+      Effect.tap((run) =>
+        Effect.forkIn(SavedWrite.background(finish(script, run, event, done, check)), scope),
+      ),
       Effect.onError(() => release(script.id, done)),
     );
 

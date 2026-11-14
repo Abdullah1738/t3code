@@ -30,6 +30,7 @@ const board = (id: string, name = id): KanbanBoard => ({
   defaultCardModel: opus,
   reviewChains: [],
   defaultReviewChain: null,
+  standingApprovals: [],
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   setup: null,
   pause: null,

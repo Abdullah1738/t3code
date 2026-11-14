@@ -6,6 +6,7 @@ import {
   KANBAN_BACKLOG,
   KanbanAnswer,
   KanbanBoard,
+  KanbanStandingApproval,
   KanbanNightlyReview,
   KanbanCard,
   KanbanCardEvent,
@@ -620,6 +621,7 @@ describe("kanbanBoardIcon", () => {
     expect(kanbanBoardIcon(decodeBoard({ ...stored, icon: "retired" }))).toBeNull();
     expect(decodeBoard(stored).iconImage).toBeNull();
     expect(decodeBoard(stored).nightlyReview).toBeNull();
+    expect(decodeBoard(stored).standingApprovals).toEqual([]);
   });
 
   it("takes only small inline pictures as a board image", () => {
@@ -1072,6 +1074,21 @@ describe("KanbanCard wait", () => {
     );
   });
 
+  it("round-trips optional wait target metadata and still reads old waits", () => {
+    const original = card("stored", { wait: wait({ on: "card", card: "foreign" as never }) });
+    const roundTrip = (value: KanbanCard) =>
+      Schema.decodeUnknownSync(KanbanCard)(Schema.encodeSync(KanbanCard)(value));
+    expect(roundTrip(original).wait?.cardTarget).toBeUndefined();
+    const cardTarget = {
+      id: "foreign" as never,
+      number: 73,
+      boardId: "board-foreign" as never,
+      boardName: "Foreign",
+    };
+    const shown = { ...original, wait: { ...original.wait!, cardTarget } };
+    expect(roundTrip(shown).wait?.cardTarget).toEqual(cardTarget);
+  });
+
   it("drops the wait key, not sets it to undefined", () => {
     const cleared = kanbanWithoutWait(card("w", { wait: wait() }));
     expect("wait" in cleared).toBe(false);
@@ -1201,4 +1218,24 @@ describe("nightly review configuration", () => {
   it("rejects a zone that cannot be scheduled", () => {
     expect(() => decode({ enabled: true, timeZone: "Not/AZone" })).toThrow();
   });
+});
+
+const decodeStandingApproval = Schema.decodeUnknownSync(KanbanStandingApproval);
+
+it("old standing approvals decode with a four-hour interval", () => {
+  const record = {
+    id: "sa-old",
+    gate: "deploy",
+    quote: "Boards may release",
+    sourceThreadId: "owner-thread",
+    saidAt: "2026-11-13T17:25:00.000Z",
+    approvedAsk: { cardId: "card-one", askId: "q1" },
+    recordedAt: "2026-11-13T18:00:00.000Z",
+    recordedBy: "evaluator",
+    revokedAt: null,
+    revokedBy: null,
+    revokeReason: null,
+  };
+  expect(decodeStandingApproval(record).minIntervalHours).toBe(4);
+  expect(decodeStandingApproval({ ...record, minIntervalHours: 6 }).minIntervalHours).toBe(6);
 });

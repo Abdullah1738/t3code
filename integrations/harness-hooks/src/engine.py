@@ -1,11 +1,10 @@
-"""Shared Claude/Codex policy. Offbox/coord errors fail open; desktop admission
+"""Shared Claude/Codex policy. Offbox errors fail open; desktop admission
 fails closed and local live-DB denials need no control service or identity.
 No harness SDK is required.
 """
 from __future__ import annotations
 
 import datetime
-from contextlib import closing
 import base64
 import hashlib
 import hmac
@@ -15,7 +14,6 @@ from pathlib import Path
 import re
 import secrets
 import shlex
-import sqlite3
 import stat
 import subprocess
 import sys
@@ -29,6 +27,7 @@ import urllib.request
 import card_mask
 import desktop_lease
 import statev2_guard
+import snapshot_guard
 import quint_verify_guard
 import rootwide_search_guard
 
@@ -49,7 +48,6 @@ def _tool_log(**fields):
 
 HOME = Path.home()
 BETTERSTACK_REASON = "Better Stack is restricted to CRPKO work. Open the relevant CRPKO project before using this MCP."
-COORD_REASON = "coord Haiku lane: this changes dev or reads a secret; hand the exact command to your Opus lead, who runs it under a coord claim."
 CRPKO_ROOTS = [
     "/Users/ardud/CrpkoArchitectureBroker", "/Volumes/ExternalSSD/CrpkoArchitectureBroker",
     "/Users/ardud/crpko-devops", "/Volumes/ExternalSSD/crpko-devops",
@@ -77,18 +75,17 @@ _LOG_RULES = {
     "pytest", "js-test", "vp-test", "bun-test", "pkg-test", "pkg-run-test", "pkg-install", "yarn-bare",
     "docker-run", "docker-container-run", "docker-build", "docker-buildx-build", "docker-compose-up", "docker-compose-v1",
     "gradle", "cargo", "make-test", "forge-test", "anvil", "no-policy", "non-pre-tool", "betterstack-scope",
-    "offbox-observe", "offbox-exempt", "offbox-unavailable", "offbox-unresolved", "coord-unresolved", "hook-error",
-    "approved-sha256", "non-member", "excluded", "coord-haiku", "non-haiku", "database-direct", "secret-read",
-    "aws-mutation", "clickhouse-http-write", "terraform-mutation", "coord-control", "github-write", "deploy-script",
-    "force-push", "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
+    "offbox-observe", "offbox-exempt", "offbox-unavailable", "offbox-unresolved", "hook-error",
+    "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
     "native-check-unavailable", "desktop-read-only", "desktop-admitted", "desktop-denied",
     "desktop-unavailable", "desktop-end", "desktop-end-error", "desktop-flush", "desktop-flush-none",
     "live-database-read", "live-database-script", "live-database-script-unresolved", "live-database-unavailable",
+    "live-database-snapshot",
     "rootwide-search", "quint-verify", "card-mask",
 }
 _LOG_ERRORS = {
     "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
-    "identity-unavailable", "identity-pending", "identity-ambiguous", "coord-unresolved", "TimeoutExpired",
+    "identity-unavailable", "identity-pending", "identity-ambiguous", "TimeoutExpired",
     "ValueError", "TypeError", "OSError", "RuntimeError", "PermissionError", "FileNotFoundError",
     "TimeoutError", "HTTPError", "URLError", "JSONDecodeError", "CalledProcessError",
 }
@@ -107,7 +104,7 @@ def _log(**record):
                      "pytest", "js-test", "vp-test", "bun-test", "pkg-test", "pkg-run-test", "pkg-install", "yarn-bare",
                      "docker-run", "docker-container-run", "docker-build", "docker-buildx-build", "docker-compose-up", "docker-compose-v1",
                      "gradle", "cargo", "make-test", "forge-test", "anvil"}
-                 else "desktop-lease" if rule.startswith("desktop") else "coord" if rule.startswith("coord") else "shell")
+                 else "desktop-lease" if rule.startswith("desktop") else "shell")
         harness = record.get("harness")
         if harness == "codex" and Path(os.environ.get("CODEX_HOME", "")).name == "codex-cu":
             harness = "codex-cu"
@@ -388,7 +385,7 @@ def _exit_trap_argument(snapshot):
     return snapshot[start:pos]
 
 
-def _exit_trap_update(path, before, identity, pin):
+def _exit_trap_update(path, before, identity):
     """Bind a changed EXIT trap to its registration context."""
     trap_file = Path(path)
     try:
@@ -399,8 +396,7 @@ def _exit_trap_update(path, before, identity, pin):
         function = function_file.read_text(encoding="utf-8") if function_file.exists() else ""
         old_function = old_function_file.read_text(encoding="utf-8") if old_function_file.exists() else ""
         variable = "__harness_exit_" + secrets.token_hex(8)
-        values = {COMMAND_IDENTITY_ENV: identity or "", "HARNESS_COORD_APPROVED": pin or "",
-                  "AGENT_GUARD_APPROVED": pin or ""}
+        values = {COMMAND_IDENTITY_ENV: identity or ""}
         exports = "; ".join("export " + k + "=" + shlex.quote(v) for k, v in values.items())
         if function:
             if function == old_function:
@@ -431,11 +427,10 @@ def _exit_trap_update(path, before, identity, pin):
 
 # The wrapper assumes a fresh top-level shell for each tool call. An existing
 # ERR trap can fire twice; a top-level return skips cleanup only by ending the shell.
-def _command_with_context(command, identity, pin):
+def _command_with_context(command, identity):
     """Scope exports to this execution without losing shell cwd changes."""
     name = "__harness_hook_" + secrets.token_hex(8)
-    values = {COMMAND_IDENTITY_ENV: identity or "", "HARNESS_COORD_APPROVED": pin or "",
-              "AGENT_GUARD_APPROVED": pin or ""}
+    values = {COMMAND_IDENTITY_ENV: identity or ""}
     setup, cleanup, scratch = [], [], []
     for index, (key, value) in enumerate(values.items()):
         present, previous = name + "_p" + str(index), name + "_v" + str(index)
@@ -463,7 +458,7 @@ def _command_with_context(command, identity, pin):
         "if [ -n \"${ZSH_VERSION-}\" ]; then functions TRAPEXIT > \"$" + trap_file + ".function\" || :; fi\n" +
         install + "=$(trap - EXIT; " + shlex.quote(sys.executable) + " " + shlex.quote(os.path.abspath(__file__)) +
         " --bind-exit \"$" + trap_file + "\" \"$" + before + "\" " +
-        shlex.quote(identity or "") + " " + shlex.quote(pin or "") + ")\n" +
+        shlex.quote(identity or "") + ")\n" +
         "if [ -n \"$" + install + "\" ]; then eval \"$" + install + "\"; fi\nfi\n"
     )
     return ("{\n" + snapshot + "\n".join(setup) + "\n" + body + "\n" + status + "=$?\n" + bind_exit + "\n" + "\n".join(cleanup) +
@@ -706,366 +701,6 @@ def _offbox_denial(v):
     ])
 
 
-# Port of coord-guard's bounded lexer. It intentionally does not evaluate shell.
-def _parse(source):
-    commands, substitutions, words, word, here = [], [], [], "", []
-    active = False
-    i, n = 0, len(source)
-
-    def substitution(index, opening, closing):
-        index += len(opening)
-        start, depth, quote = index, 1, ""
-        while index < n:
-            c = source[index]
-            if c == "\\":
-                index += 2
-                continue
-            if quote:
-                if c == quote:
-                    quote = ""
-            elif c in "'\"":
-                quote = c
-            else:
-                if opening == "$(" and c == "(":
-                    depth += 1
-                if c == closing:
-                    depth -= 1
-                    if not depth:
-                        break
-            index += 1
-        substitutions.append(source[start:index])
-        return index + 1
-
-    def flush():
-        nonlocal word, active
-        if active:
-            words.append(word)
-        word, active = "", False
-
-    def end():
-        nonlocal words
-        flush()
-        if words:
-            commands.append(words)
-        words = []
-
-    while i < n:
-        c = source[i]
-        if c == "\\":
-            if i + 1 < n and source[i + 1] != "\n":
-                word += source[i + 1]
-                active = True
-            i += 2
-        elif c in "'\"":
-            quote, i, active = c, i + 1, True
-            while i < n and source[i] != quote:
-                if quote == '"' and source.startswith("$(", i):
-                    i = substitution(i, "$(", ")")
-                    word += "<substitution>"
-                elif quote == '"' and source[i] == "`":
-                    i = substitution(i, "`", "`")
-                    word += "<substitution>"
-                elif quote == '"' and source[i] == "\\" and i + 1 < n and source[i + 1] in '"\\$`\n':
-                    i += 1
-                    if source[i] != "\n":
-                        word += source[i]
-                    i += 1
-                else:
-                    word += source[i]
-                    i += 1
-            i += 1
-        elif source.startswith("$(", i) or c == "`":
-            opening, closing = ("$(", ")") if c == "$" else ("`", "`")
-            i = substitution(i, opening, closing)
-            word += "<substitution>"
-            active = True
-        elif c == "#" and not active:
-            i = source.find("\n", i)
-            if i < 0:
-                break
-        elif c == "\n":
-            end()
-            i += 1
-            for target, tabs, expand in here:
-                body = []
-                while i < n:
-                    j = source.find("\n", i)
-                    if j < 0:
-                        j = n
-                    line, i = source[i:j], j + 1
-                    if (line.lstrip("\t") if tabs else line) == target:
-                        break
-                    body.append(line)
-                previous = commands[-1] if commands else []
-                if re.fullmatch(r"(ba|z|da|k)?sh", os.path.basename(previous[0] if previous else "")):
-                    substitutions.append("\n".join(body))
-                elif expand:
-                    substitutions.extend(_parse("\n".join(body))[1])
-            here = []
-        elif c.isspace():
-            flush()
-            i += 1
-        elif c in ";&|(){}":
-            end()
-            i += 1
-        elif c in "<>":
-            flush()
-            m = re.match(r"<<-|<<<|<<|>>|[<>]&?|&>", source[i:])
-            op = m.group(0)
-            i += len(op)
-            while i < n and source[i] in " \t":
-                i += 1
-            target = re.match(r"(?:'([^']*)'|\"([^\"]*)\"|([^\s;&|<>]+))", source[i:])
-            if target:
-                if op in ("<<", "<<-"):
-                    here.append((next(x for x in target.groups() if x is not None), op == "<<-", target.group(3) is not None))
-                else:
-                    substitutions.extend(_parse(target.group(0))[1])
-                i += len(target.group(0))
-        else:
-            word += c
-            active = True
-            i += 1
-    end()
-    return commands, substitutions
-
-
-_ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
-_SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
-_SKIP_VALUE = {"--profile", "--region", "--endpoint-url", "--output", "--query", "--ca-bundle", "--cli-connect-timeout", "--cli-read-timeout", "--color", "--repo", "-R", "--hostname", "-C", "-c", "--git-dir", "--work-tree", "--as", "--env", "-chdir"}
-
-
-def _unwrap(source):
-    a = list(source)
-    while a:
-        if _ASSIGN.match(a[0]) or a[0] in {"if", "then", "else", "elif", "do", "while", "until", "!"}:
-            a.pop(0)
-            continue
-        b = os.path.basename(a[0])
-        if b in {"command", "exec", "nohup"}:
-            a.pop(0)
-            while a and a[0].startswith("-"):
-                a.pop(0)
-        elif b == "env":
-            a.pop(0)
-            while a and (a[0].startswith("-") or _ASSIGN.match(a[0])):
-                opt = a.pop(0)
-                if opt in {"-u", "--unset", "-C", "--chdir"} and a:
-                    a.pop(0)
-        elif b == "sudo":
-            a.pop(0)
-            while a and a[0].startswith("-"):
-                opt = a.pop(0)
-                if opt in {"-u", "-g", "-h"} and a:
-                    a.pop(0)
-        elif b == "timeout":
-            a.pop(0)
-            while a and a[0].startswith("-"):
-                opt = a.pop(0)
-                if opt in {"-s", "--signal", "-k", "--kill-after"} and a:
-                    a.pop(0)
-            if a:
-                a.pop(0)
-        else:
-            break
-    return a
-
-
-def _positional(args):
-    out, i = [], 0
-    while i < len(args):
-        if args[i] in _SKIP_VALUE:
-            i += 2
-        else:
-            if not args[i].startswith("-"):
-                out.append(args[i])
-            i += 1
-    return out
-
-
-def classify_coord(source, depth=0):
-    """Return the original coord-guard rule or None; never log arguments."""
-    if depth > 12:
-        return None
-    commands, subs = _parse(source)
-    for sub in subs:
-        hit = classify_coord(sub, depth + 1)
-        if hit:
-            return hit
-    for words in commands:
-        a = _unwrap(words)
-        if not a:
-            continue
-        binary, args = os.path.basename(a[0]), a[1:]
-        p = _positional(args)
-        first, second = (p + ["", ""])[:2]
-        if binary in _SHELLS:
-            if any(re.fullmatch(r"-[a-z]*n[a-z]*", x) for x in args):
-                continue
-            index = next((i for i, x in enumerate(args) if re.fullmatch(r"-[a-z]*c[a-z]*", x)), None)
-            if index is not None:
-                hit = classify_coord(args[index + 1] if index + 1 < len(args) else "", depth + 1)
-                if hit:
-                    return hit
-                continue
-        if binary == "eval":
-            hit = classify_coord(" ".join(args), depth + 1)
-            if hit:
-                return hit
-        if binary == "offbox" and first in {"ssh", "run"} and "--" in args:
-            rest = args[args.index("--") + 1:]
-            hit = classify_coord(rest[0] if len(rest) == 1 else " ".join(shlex.quote(x) for x in rest), depth + 1)
-            if hit:
-                return hit
-        if binary in {"psql", "pg_dump", "pg_restore", "fdbcli", "clickhouse-client"}:
-            return "database-direct"
-        if binary == "aws":
-            if (first == "logs" and second in {"start-query", "stop-query", "start-live-tail"}) or (first == "athena" and second in {"start-query-execution", "stop-query-execution"}):
-                continue
-            if first == "rds-data" or (first == "secretsmanager" and second == "get-secret-value") or (first == "ssm" and re.fullmatch(r"get-parameters?(?:-by-path)?", second) and "--with-decryption" in args):
-                return "secret-read"
-            if re.match(r"^(?:run|start|stop|create|delete|put|update|modify|register|deregister|attach|detach|send|invoke|tag|untag)(?:-|$)", second) or second == "execute-command":
-                return "aws-mutation"
-        if binary in {"curl", "wget"} and any(re.search(r":\b(?:8123|8443)(?:\b|/)", x) for x in args) and any(re.match(r"^(?:POST|--(?:data(?:-raw|-binary|-urlencode)?|json|post-data|post-file)(?:=|$)|-d|--request=POST|-XPOST)", x) for x in args):
-            return "clickhouse-http-write"
-        if binary == "terraform" and (first in {"apply", "destroy", "import"} or (first == "state" and second in {"push", "mv", "rm", "replace-provider"})):
-            return "terraform-mutation"
-        if binary == "coord" and first in {"claim", "release", "reconcile", "qa", "pause", "resume", "drain"}:
-            return "coord-control"
-        if binary == "gh" and ((first == "pr" and second == "merge") or (first == "workflow" and second == "run") or (first == "release" and second == "create") or (first == "api" and any(re.fullmatch(r"(?:-X|--method=)(?:POST|PUT|PATCH|DELETE)", x, re.I) or (x in {"-X", "--method"} and i + 1 < len(args) and re.fullmatch(r"POST|PUT|PATCH|DELETE", args[i + 1], re.I)) for i, x in enumerate(args)))):
-            return "github-write"
-        if binary == "npm" and first == "run" and re.match(r"^(deploy|runbook):", second):
-            return "deploy-script"
-        interpreter = bool(re.fullmatch(r"python[23]?|node|bun", binary))
-        inline = interpreter and any(x in {"-e", "--eval", "-p", "--print", "-c", "--check", "--test"} for x in args)
-        executable = "" if inline else first if binary in _SHELLS or interpreter else a[0]
-        if re.search(r"(?:^|/)scripts/(?:deploy-[^/]+|runbooks/[^/]+)", executable):
-            return "deploy-script"
-        if binary == "git" and first == "push" and any(re.match(r"^(?:--force(?:-with-lease)?(?:=|$)|-f$)", x) for x in args):
-            return "force-push"
-    return None
-
-
-def _allow_file():
-    return Path(os.environ.get("HARNESS_HOOKS_COORD_ALLOW", str(HOME / ".config/opencode/agent-guard-allow.json")))
-
-
-def _hash_file(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
-def _resolve_path(cwd, path):
-    if path.startswith("~/"):
-        path = str(HOME) + path[1:]
-    return os.path.abspath(os.path.join(cwd, path))
-
-
-def approval(command, cwd):
-    """Exact single invocation and pinned script/input, as in coord runtime.ts."""
-    try:
-        commands, subs = _parse(command)
-        if len(commands) != 1 or subs:
-            return None
-        raw = commands[0]
-        args = _unwrap(raw)
-        if len(args) != len(raw):
-            return None
-        if args and re.fullmatch(r"(?:.*/)?(?:zsh|bash|sh)", args[0]):
-            args.pop(0)
-        if not args or "$" in args[0] or args[0].startswith("-") or len(args) > 3:
-            return None
-        path = _resolve_path(cwd, args[0])
-        entries = _read_json(_allow_file(), {}).get("scripts", [])
-        entry = next((e for e in entries if e.get("path") == path and e.get("sha256") == _hash_file(path)), None)
-        if not entry:
-            return None
-        input_path = _resolve_path(cwd, args[1] if len(args) > 1 else "replica-health.sql")
-        input_hash = _hash_file(input_path)
-        if not any(i.get("path") == input_path and i.get("sha256") == input_hash for i in entry.get("inputs", [])):
-            return None
-        return json.dumps({"path": path, "sha256": entry["sha256"], "input": input_path, "inputSha256": input_hash}, separators=(",", ":"))
-    except (OSError, ValueError, TypeError, AttributeError):
-        return None
-
-
-def approval_valid(value):
-    try:
-        a = json.loads(value)
-        entries = _read_json(_allow_file(), {}).get("scripts", [])
-        return any(e.get("path") == a["path"] and e.get("sha256") == a["sha256"] == _hash_file(a["path"]) and any(i.get("path") == a["input"] and i.get("sha256") == a["inputSha256"] == _hash_file(a["input"]) for i in e.get("inputs", [])) for e in entries)
-    except (OSError, ValueError, TypeError, KeyError, AttributeError):
-        return False
-
-
-def _thread_key(value):
-    return re.sub(r"^(?:ardud-control:thread:|mcp:)", "", value or "")
-
-
-def _coord_state(identity, *, lineage=None):
-    if identity.get("resolution") != "resolved" or not identity.get("robobThreadId"):
-        raise ValueError("identity-unresolved")
-    config = _read_json(os.environ.get("HARNESS_HOOKS_COORD_CONFIG", str(HOME / ".config/opencode/agent-guard.json")))
-    if not isinstance(config, dict) or config.get("mode") not in {"enforce", "observe"}:
-        raise ValueError("coord-config-unresolved")
-    model = identity.get("model")
-    model = model.get("model") or model.get("id") if isinstance(model, dict) else model
-    if not isinstance(model, str) or not model:
-        raise ValueError("model-unresolved")
-    nodes = lineage() if lineage else _lineage(identity)
-    db_path = os.environ.get("HARNESS_HOOKS_COORD_DB", str(HOME / ".local/share/coord/data/coord.db"))
-    db_file = Path(db_path).absolute()
-    uri = db_file.as_uri() + "?mode=ro"
-    query = "SELECT id, thread_id FROM actors WHERE kind='thread' AND (thread_id LIKE 'ardud-control:thread:%' OR thread_id LIKE 'mcp:%')"
-    try:
-        with closing(sqlite3.connect(uri, uri=True, timeout=1)) as db:
-            actors = db.execute(query).fetchall()
-    except sqlite3.OperationalError:
-        # A checkpointed WAL db may not have sidecars and may live in a
-        # non-writable directory. Only trust a stable sidecar-free snapshot.
-        before = db_file.stat()
-        if Path(str(db_file) + "-wal").exists():
-            raise
-        with closing(sqlite3.connect(uri + "&immutable=1", uri=True, timeout=1)) as db:
-            actors = db.execute(query).fetchall()
-        after = db_file.stat()
-        if Path(str(db_file) + "-wal").exists() or (before.st_ino, before.st_mtime_ns, before.st_size) != (after.st_ino, after.st_mtime_ns, after.st_size):
-            raise ValueError("coord-snapshot-changed")
-    exclusions = config.get("exclude") or {}
-    node_keys = {_thread_key(n.get("threadId")) for n in nodes}
-    matched = [(actor, thread) for actor, thread in actors if _thread_key(thread) in node_keys]
-    if not matched:
-        return config, False, "non-member"
-    # Find the nearest actor root; a nested actor is not captured by an
-    # otherwise independent actor above it. Exclusions still cover the path
-    # all the way to the true root, just as in the OpenCode runtime.
-    nearest = next(_thread_key(node.get("threadId")) for node in nodes
-                   if any(_thread_key(thread) == _thread_key(node.get("threadId")) for _, thread in matched))
-    matched = [(actor, thread) for actor, thread in matched if _thread_key(thread) == nearest]
-    if identity.get("nativeSessionId") in exclusions.get("sessions", []) or any(n.get("nativeSessionId") in exclusions.get("sessions", []) for n in nodes if n.get("nativeSessionId")):
-        return config, False, "excluded"
-    for actor, thread in matched:
-        if actor in exclusions.get("actors", []) or any(_thread_key(x) == _thread_key(thread) for x in exclusions.get("threads", [])):
-            return config, False, "excluded"
-    return config, "claude-haiku" in model, "coord-haiku" if "claude-haiku" in model else "non-haiku"
-
-
-def decide_coord(command, identity, cwd, *, approved=False, approval_allowed=True, lineage=None):
-    """Shim-facing decision. `approved` must come from approval_valid per invocation.
-
-    A direct executable MCP tool does not accept the shell-input rewrite needed
-    to pass its pin to the shim, so callers can disable hook-side approval.
-    """
-    try:
-        config, guarded, membership = _coord_state(identity, lineage=lineage)
-        hit = classify_coord(command)
-        allowed_pin = approved or (approval_allowed and bool(approval(command, cwd)))
-        deny = bool(hit and guarded and not allowed_pin and config["mode"] == "enforce")
-        rule = "approved-sha256" if allowed_pin else hit if guarded and hit else membership
-        return {"decision": "deny" if deny else "allow", "reason": COORD_REASON if deny else "", "context": {"rule": rule, "guarded": guarded}}
-    except Exception:
-        return {"decision": "allow", "reason": "", "context": {"rule": "coord-unresolved"}}
-
-
 def _betterstack_directory(cwd):
     if not isinstance(cwd, str) or not cwd:
         return False
@@ -1105,7 +740,6 @@ def decide(event, harness):
     """Return {decision, reason, context}; JSONL-log every call, including failures."""
     start = time.monotonic()
     command = None
-    pin = None
     identity = {}
     error_type = None
     log_tool = None
@@ -1163,7 +797,7 @@ def decide(event, harness):
                 root = rootwide_search_guard.classify(command, command_cwd)
             except Exception as error:
                 # A search-parser failure must not disable the independent DB,
-                # offbox or coord policies later in this hook.
+                # offbox policy later in this hook.
                 error_type = type(error).__name__
                 root = None
             if root:
@@ -1171,10 +805,16 @@ def decide(event, harness):
                 result = {"decision": "deny", "reason": rootwide_search_guard.reason(root, command_cwd),
                           "context": {"rule": "rootwide-search"}}
                 return result
-            # The live DB rule is independent of native identity and offbox/coord
+            # The live DB rule is independent of native identity and offbox
             # availability, so a service outage cannot disable this local check.
             try:
+                if snapshot_guard.exact_invocation(command, command_cwd):
+                    result = {"decision": "allow", "reason": "",
+                              "context": {"rule": "live-database-snapshot"}}
+                    return result
                 hit, cause = statev2_guard.classify_detail(command, command_cwd)
+                if not hit and snapshot_guard.snapshot_attempt(command, command_cwd):
+                    hit, cause = "live-database-snapshot", "Snapshot requests require the exact installed, pinned helper invocation."
             except Exception as error:
                 error_type = type(error).__name__
                 result = {"decision": "deny", "reason": "Live database guard unavailable; this shell command was NOT run. Retry after the guard is available; do not bypass it.",
@@ -1192,16 +832,9 @@ def decide(event, harness):
             return result
         native, _, _ = _native(event, harness)
         if native:
-            # Ordinary Claude shell calls only need a binding to sign. Model
-            # policy and shims still refresh rather than trusting a cached model.
-            shell_command = _command(event)
+            # Claude shell calls need only the binding used to sign command context.
             binding_only = (harness == "claude" and kind == "PreToolUse" and
-                            _shell_input_field(event, harness) and shell_command and
-                            not classify_coord(shell_command))
-            if binding_only and not tool.startswith("mcp__"):
-                inp = event["tool_input"]
-                shell_cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
-                binding_only = not approval(shell_command, shell_cwd)
+                            _shell_input_field(event, harness) and _command(event))
             identity = resolve_identity(event, harness, fresh=not binding_only)
             if identity.get("resolution") != "resolved":
                 error_type = "identity-" + str(identity.get("resolution", "unavailable"))
@@ -1214,9 +847,6 @@ def decide(event, harness):
             if command:
                 inp = event.get("tool_input", {})
                 shell_field = _shell_input_field(event, harness)
-                # A matched MCP server may be remote: a local script pin cannot
-                # authorize code at the server's potentially different path.
-                approval_allowed = bool(shell_field and not tool.startswith("mcp__"))
                 cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
                 mode = _offbox_mode()
                 if mode == "off":
@@ -1246,20 +876,6 @@ def decide(event, harness):
                         result["context"].update(rule="offbox-unresolved")
                         _tool_log(kind="error", ok=False, tag="gate_failed",
                                   props={"harness": harness, "decision": "allowed", "commandClass": "unknown"})
-                if result["decision"] != "deny":
-                    # The model was refreshed with this event's identity and
-                    # is never taken from stdin or an older cached binding.
-                    coord = (decide_coord(command, identity, cwd, approval_allowed=approval_allowed, lineage=lineage)
-                             if not binding_only else {"decision": "allow", "reason": "", "context": {"rule": "no-policy"}})
-                    if coord["context"].get("rule") == "coord-unresolved" and not error_type:
-                        error_type = "coord-unresolved"
-                    if coord["decision"] == "deny":
-                        result = coord
-                    elif coord["context"].get("guarded"):
-                        pin = approval(command, cwd) if approval_allowed else None
-                        result = coord
-                    elif result["context"]["rule"] == "no-policy":
-                        result = coord
                 if result["decision"] != "deny" and shell_field:
                     # Always refresh or clear this execution's context, even if
                     # the service is unavailable. Inherited tokens must not
@@ -1271,9 +887,9 @@ def decide(event, harness):
                                 token = _command_identity(event, harness)
                             except Exception as error:
                                 error_type = type(error).__name__
-                        if token or pin or any(os.environ.get(k) for k in (COMMAND_IDENTITY_ENV, "AGENT_GUARD_APPROVED", "HARNESS_COORD_APPROVED")):
+                        if token or os.environ.get(COMMAND_IDENTITY_ENV):
                             updated = dict(inp)
-                            updated[shell_field] = _command_with_context(command, token, pin)
+                            updated[shell_field] = _command_with_context(command, token)
                             result["context"]["updatedInput"] = updated
                     except Exception as error:
                         error_type = type(error).__name__
@@ -1303,5 +919,5 @@ def decide(event, harness):
     return result
 
 
-if __name__ == "__main__" and len(sys.argv) == 6 and sys.argv[1] == "--bind-exit":
+if __name__ == "__main__" and len(sys.argv) == 5 and sys.argv[1] == "--bind-exit":
     _exit_trap_update(*sys.argv[2:])

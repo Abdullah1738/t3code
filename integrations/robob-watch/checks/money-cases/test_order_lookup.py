@@ -1,0 +1,298 @@
+"""Window proofs, source limits and sanitized persistent detail caching."""
+import datetime as dt
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import charges
+import order_lookup as lookup
+
+AT = dt.datetime(2026, 11, 10, 12, tzinfo=dt.timezone.utc)
+CHARGE = dict(kind='charge', merchant='noon', amount='12.34', currency='AED', card='1111', pending=False)
+
+
+def row(oid, minutes=0, status='delivered'):
+    return dict(order=oid, placed_at=(AT + dt.timedelta(minutes=minutes)).isoformat(),
+                status=status, raw_status=status)
+
+
+def proof():
+    return {'orders': [], 'complete': False, 'lanes': {
+        name: dict(exhaustive=False, covered_from=(AT - dt.timedelta(days=1)).isoformat(), limit=None)
+        for name in lookup.LANES}}
+
+
+class Windows(unittest.TestCase):
+    def check(self, result):
+        return charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: result)
+
+    def test_every_lane_covers_window(self):
+        self.assertIsNone(self.check(proof()))
+
+    def test_short_budget_missing_lane_and_invalid_time_are_errors(self):
+        for form in ('short', 'missing', 'time', 'unordered'):
+            with self.subTest(form=form):
+                result = proof()
+                lane = result['lanes']['food']
+                if form == 'short':
+                    lane['covered_from'] = AT.isoformat()
+                elif form == 'missing':
+                    del result['lanes']['food']
+                elif form == 'time':
+                    lane['covered_from'] = 'invalid'
+                else:
+                    lane['covered_from'] = None
+                    lane['limit'] = 'page-1 history only'
+                with self.assertRaises(charges.Lookup) as exc:
+                    self.check(result)
+                self.assertNotIsInstance(exc.exception, charges.SourceLimit)
+
+    def test_limit_is_unverified_and_mixed_failure_stays_error(self):
+        result = proof()
+        result['lanes']['food'].update(covered_from=AT.isoformat(), limit='page-1 history only')
+        with patch.object(lookup, 'read', return_value=result), patch.object(charges, 'receipt', return_value=None), \
+                patch.object(charges, 'card_owner', return_value='abdullah'):
+            verdict = charges.explain(CHARGE, AT, AT + dt.timedelta(days=3), said=lambda *a, **kw: [])
+        self.assertEqual(verdict['verdict'], 'unverified')
+        self.assertEqual(verdict['errors'], [])
+        self.assertEqual(verdict['limits'][0]['kinds'], ['food_page_1'])
+        result['lanes']['minutes']['covered_from'] = AT.isoformat()
+        with self.assertRaises(charges.Lookup) as exc:
+            self.check(result)
+        self.assertNotIsInstance(exc.exception, charges.SourceLimit)
+
+    def test_inclusive_match_boundary_needs_strictly_older_coverage(self):
+        # Oldest covered relative to charge: outside / exact inclusive edge / inside.
+        for minutes, proven in ((-16, True), (-15, False), (-14, False)):
+            with self.subTest(minutes=minutes):
+                result = proof()
+                result['lanes']['minutes']['covered_from'] = row('M1', minutes)['placed_at']
+                if proven:
+                    self.assertIsNone(self.check(result))
+                else:
+                    with self.assertRaises(charges.Lookup):
+                        self.check(result)
+
+    def test_unique_positive_wins_with_short_coverage(self):
+        result = proof()
+        result['lanes'] = {}
+        result['orders'] = [dict(row('N1'), total='12.34', currency='AED')]
+        self.assertEqual(self.check(result)['verdict'], 'receipt')
+
+
+class Reader(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / 'native_orders.py').write_text('''import json
+import threading
+from pathlib import Path
+ROOT=Path(__file__).parent
+def orders(app, service, timeout, page=1):
+    with (ROOT/'pages.log').open('a') as f:f.write(service+':'+str(page)+'\\n')
+    data=json.loads((ROOT/'fixture.json').read_text())
+    if threading.current_thread() is not threading.main_thread():raise ValueError('main thread required')
+    if service in data.get('list_fail',[]):raise TimeoutError('list timeout')
+    rows=data.get(service,{}).get(str(page),[])
+    coverage=({'page':page,'total_pages':len(data.get(service,{'1':[]}))} if service=='minutes'
+              else {'exhaustive':service not in data})
+    coverage=data.get('coverage_override',{}).get(service,coverage)
+    return dict(ok=True,orders=rows,coverage={service:coverage})
+''')
+        (self.root / 'noon_order_details.py').write_text('''import json
+from pathlib import Path
+ROOT=Path(__file__).parent
+def details(oid, service, timeout):
+    with (ROOT/'details.log').open('a') as f:f.write(service+':'+oid+'\\n')
+    data=json.loads((ROOT/'fixture.json').read_text())
+    if oid in data.get('fail',[]):raise ValueError('private error must not escape')
+    row=next(r for page in data[service].values() for r in page if r['order']==oid)
+    return dict(ok=True,account_verified=True,order=oid,total=row.get('total','1.00'),currency='AED',
+                placed_at=row.get('detail_time',row.get('placed_at')),address='PRIVATE',card_last4='9999',items=['PRIVATE'])
+''')
+        self.modules = {}
+        for name in ('native_orders', 'noon_order_details'):
+            spec = importlib.util.spec_from_file_location(name, self.root / (name + '.py'))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.modules[name] = module
+        patcher = patch.dict(sys.modules, self.modules)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = patch.dict(os.environ, {'MONEY_CASES_APP_API': str(self.root),
+                                     'MONEY_CASES_ORDER_PYTHON': sys.executable,
+                                     'MONEY_CASES_DIR': str(self.root),
+                                     'ROBOB_TOOL_LOG_DIR': str(self.root / 'logs')})
+        env.start()
+        self.addCleanup(env.stop)
+        self.cache = self.root / 'order-details.json'
+
+    def fixture(self, **data):
+        (self.root / 'fixture.json').write_text(json.dumps(data))
+
+    def native(self, since=None):
+        return lookup.native('noon', str(self.root), since=since)
+
+    def test_failed_lane_cannot_starve_other_main_thread_readers(self):
+        self.fixture(minutes={'1': []}, food={'1': [row('F1')]}, list_fail=['minutes'])
+        result = self.native()
+        self.assertEqual([r['order'] for r in result['orders']], ['F1'])
+        self.assertEqual(result['lanes']['food']['covered_from'], row('F1')['placed_at'])
+        self.assertIsNone(result['lanes']['minutes']['covered_from'])
+        self.assertFalse(result['complete'])
+
+    def test_detail_gap_cuts_coverage_and_preserves_later_positive(self):
+        self.fixture(food={'1': [row('F1', 2), row('F2', 1), row('F3')]}, fail=['F2'])
+        result = self.native()
+        lane = result['lanes']['food']
+        self.assertEqual(lane['covered_from'], row('F1', 2)['placed_at'])
+        self.assertIsNone(lane['limit'])
+        self.assertFalse(lane['exhaustive'])
+        self.assertEqual([r['order'] for r in result['orders']], ['F1', 'F3'])
+
+    def test_out_of_order_rows_erase_proof(self):
+        self.fixture(nownow={'1': [row('NN1'), row('NN2', 1)]})
+        lane = self.native()['lanes']['nownow']
+        self.assertIsNone(lane['covered_from'])
+        self.assertFalse(lane['exhaustive'])
+
+    def test_unzoned_details_are_errors_and_never_history_limits(self):
+        order = row('F1')
+        order['placed_at'] = '2026-11-10T12:00:00'
+        self.fixture(food={'1': [order]})
+        result = self.native()
+        lane = result['lanes']['food']
+        self.assertIsNone(lane['covered_from'])
+        self.assertIsNone(lane['limit'])
+        self.assertEqual(result['orders'], [])
+
+    def test_minutes_pages_stop_at_window_and_older_rows_need_no_detail(self):
+        self.fixture(minutes={'1': [row('M1', 3)], '2': [row('M2', -30)], '3': [row('M3', -90)]})
+        result = self.native(since=AT)
+        self.assertEqual(result['lanes']['minutes']['pages'], 2)
+        self.assertEqual(result['lanes']['minutes']['covered_from'], row('M2', -30)['placed_at'])
+        self.assertNotIn('M2', (self.root / 'details.log').read_text())
+        self.assertNotIn('minutes:3', (self.root / 'pages.log').read_text())
+        self.assertFalse(result['complete'])
+
+    def test_invalid_page_metadata_cannot_extend_negative_proof(self):
+        forms = [('wrong page', {'page': 2, 'total_pages': 2}),
+                 ('missing count', {'page': 1}), ('invalid count', {'page': 1, 'total_pages': 0})]
+        for label, coverage in forms:
+            with self.subTest(label=label):
+                self.fixture(minutes={'1': [row('M1', -60)]}, coverage_override={'minutes': coverage})
+                result = self.native()
+                self.assertEqual(len(result['orders']), 1)
+                self.assertIsNone(result['lanes']['minutes']['covered_from'])
+                self.assertFalse(result['lanes']['minutes']['exhaustive'])
+
+    def test_minutes_reads_tied_boundary_orders_on_the_next_page(self):
+        self.fixture(minutes={'1': [row('M1', -15)],
+                              '2': [dict(row('M2', -15), total='12.34')],
+                              '3': [row('M3', -30)]})
+        result = self.native(since=AT - dt.timedelta(minutes=15))
+        self.assertEqual(result['lanes']['minutes']['pages'], 3)
+        self.assertEqual(charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: result)['verdict'], 'receipt')
+
+    def test_unknown_time_gap_erases_negative_coverage(self):
+        orders = []
+        for oid, minutes in (('N1', -60), ('N2', 0)):
+            item = row(oid, minutes)
+            item['detail_time'] = item.pop('placed_at')
+            orders.append(item)
+        self.fixture(marketplace={'1': orders}, fail=['N2'])
+        result = self.native()
+        self.assertIsNone(result['lanes']['marketplace']['covered_from'])
+        self.assertEqual([r['order'] for r in result['orders']], ['N1'])
+        complete = proof()
+        complete['lanes']['marketplace'] = result['lanes']['marketplace']
+        with self.assertRaises(charges.Lookup):
+            charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: complete)
+
+    def test_marketplace_shipment_statuses_never_freeze_order_totals(self):
+        forms = [('single terminal', ['delivered']), ('mixed', ['delivered', 'preparing']),
+                 ('all terminal', ['delivered', 'delivered']), ('cancelled', ['cancelled'])]
+        for label, statuses in forms:
+            with self.subTest(label=label):
+                self.fixture(marketplace={'1': [dict(row('N1', status=status), total='1.00') for status in statuses]})
+                lookup.read('noon', cache_path=self.cache)
+                self.fixture(marketplace={'1': [dict(row('N1', status=status), total='2.00') for status in statuses]})
+                result = lookup.read('noon', cache_path=self.cache)
+                if 'cancelled' in statuses:
+                    self.assertEqual(result['orders'], [])
+                else:
+                    self.assertEqual(result['orders'][0]['total'], '2.00')
+                self.assertFalse(any(r['service']=='marketplace' for r in json.loads(self.cache.read_text())))
+
+    def test_shipment_cancellations_never_authorize_no_order_or_ask(self):
+        forms = [('cancelled first', ['cancelled', 'preparing']),
+                 ('cancelled second', ['preparing', 'cancelled']),
+                 ('all cancelled', ['cancelled', 'cancelled']),
+                 ('failed shipment', ['failed', 'preparing']),
+                 ('single cancelled', ['cancelled'])]
+        for label, statuses in forms:
+            with self.subTest(label=label):
+                self.fixture(marketplace={'1': [dict(row('N1', status=status), total='12.34')
+                                                 for status in statuses]})
+                result = self.native()
+                self.assertIsNone(result['lanes']['marketplace']['covered_from'])
+                self.assertFalse(result['complete'])
+                with patch.object(lookup, 'read', return_value=result), \
+                        patch.object(charges, 'receipt', return_value=None), \
+                        patch.object(charges, 'card_owner', return_value='abdullah'):
+                    verdict = charges.explain(CHARGE, AT, AT + dt.timedelta(days=3), said=lambda *a, **kw: [])
+                self.assertEqual(verdict['verdict'], 'unverified')
+                self.assertTrue(verdict['errors'])
+
+    def test_terminal_cache_reuse_nonterminal_refetch_corrupt_empty_and_projection(self):
+        self.fixture(food={'1': [row('F1'), row('F2', -1, 'preparing')]})
+        lookup.read('noon', cache_path=self.cache)
+        lookup.read('noon', cache_path=self.cache)
+        calls = (self.root / 'details.log').read_text().splitlines()
+        self.assertEqual(calls.count('food:F1'), 1)
+        self.assertEqual(calls.count('food:F2'), 2)
+        cached = json.loads(self.cache.read_text())
+        self.assertEqual(len(cached), 1)
+        self.assertEqual(set(cached[0]), set(lookup.CACHE_FIELDS))
+        self.assertNotIn('PRIVATE', self.cache.read_text())
+        self.assertNotIn('9999', self.cache.read_text())
+        self.cache.write_text('broken json')
+        lookup.read('noon', cache_path=self.cache)
+        self.assertEqual((self.root / 'details.log').read_text().count('food:F1'), 2)
+
+    def test_careem_only_allowlisted_failure_is_limit(self):
+        for code in (lookup.BINDING_LIMIT, 'OTHER_PRIVATE_FAILURE'):
+            with self.subTest(code=code):
+                (self.root / 'careem_http_orders.py').write_text(
+                    "def orders():raise ValueError(" + repr(code) + ")\n")
+                with self.assertRaises(ValueError) as exc:
+                    lookup.read('careem', cache_path=self.cache)
+                if code == lookup.BINDING_LIMIT:
+                    self.assertIsInstance(exc.exception, lookup.SourceLimit)
+                    self.assertEqual(exc.exception.code, code)
+                    with patch.object(lookup, 'read', side_effect=exc.exception):
+                        with self.assertRaises(charges.SourceLimit):
+                            charges.order_receipt(dict(CHARGE, merchant='careem'), AT, AT)
+                else:
+                    self.assertNotIsInstance(exc.exception, lookup.SourceLimit)
+                    self.assertEqual(str(exc.exception), 'order lookup unavailable')
+
+    def test_cache_cap_drops_oldest(self):
+        cached = [dict(row('F'+str(i), -i), service='food', total=1, currency='AED', cached_at=AT.isoformat())
+                  for i in range(1002)]
+        self.cache.write_text(json.dumps(cached))
+        self.fixture()
+        lookup.read('noon', cache_path=self.cache)
+        saved = json.loads(self.cache.read_text())
+        self.assertEqual(len(saved), 1000)
+        self.assertNotIn('F1001', {r['order'] for r in saved})
+
+
+if __name__ == '__main__':
+    unittest.main()

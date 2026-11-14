@@ -12,7 +12,7 @@ import {
 } from "@t3tools/contracts";
 
 import type { KanbanBoardState } from "./boardState.ts";
-import { cardOpenBlockers, cardTruth, type CardTruth } from "./cardTruth.ts";
+import { cardOpenBlockers, cardTruth, waitCardLabel, type CardTruth } from "./cardTruth.ts";
 
 /** The board's columns when grouped by stage. The keys are the column preference keys. */
 export type TileColumn =
@@ -293,15 +293,15 @@ function waitLine(card: KanbanCard, state: KanbanBoardState, truth: CardTruth): 
         ...stale,
       });
     case "card": {
-      const target = wait?.card == null ? undefined : state.cards.get(wait.card);
+      const target = wait === undefined ? null : waitCardLabel(wait, state);
       return line(
         "pause",
         tone,
-        target === undefined ? "Held behind another card" : `Held behind #${target.number}`,
+        target === null ? "Held behind another card" : `Held behind ${target}`,
         wakes(
-          target === undefined
+          target === null
             ? "Wakes itself when that card is done"
-            : `Wakes itself when #${target.number} is done`,
+            : `Wakes itself when ${target} is done`,
         ),
         { rest: note, ...stale },
       );

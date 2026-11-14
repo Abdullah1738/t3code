@@ -17,16 +17,25 @@ import {
   type KanbanThreadLink,
   type ModelSelection,
 } from "@t3tools/contracts";
+import { resolvedContext } from "../../analytics/McpCall.ts";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as McpDeadline from "../../../mcp/McpDeadline.ts";
 import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import type { EvaluatorPurpose } from "../engine/briefs.ts";
 import { modelSelectionResult } from "../engine/defaults.ts";
 import * as Asks from "../engine/asks.ts";
-import { gateOf, type SubtaskInput } from "../engine/subtasks.ts";
+import {
+  askGateWarning,
+  gateOf,
+  secretKindApprovalWarning,
+  type SubtaskInput,
+} from "../engine/subtasks.ts";
 import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
 import { cardMatches, isCardNumber } from "../engine/cardSearch.ts";
 import { textProblem } from "../engine/text.ts";
@@ -41,6 +50,7 @@ import { selectionRoutingEnabled } from "../engine/selectionSettings.ts";
 import { KanbanToolkit, type ModelInput } from "./tools.ts";
 import * as BoardReplies from "../engine/boardReplies.ts";
 import * as Activity from "../engine/activity.ts";
+import * as SavedWrite from "../engine/savedWrite.ts";
 
 const gatedResult = (
   card: KanbanCard,
@@ -99,6 +109,7 @@ const withCaller = Effect.fn("KanbanTools.withCaller")(
       caller: Caller,
     ) => Effect.Effect<A, KanbanError | OrchestratorMcpFailure, R>,
   ) {
+    yield* SavedWrite.linkReply();
     const scope = yield* McpInvocationContext.McpInvocationContext;
     const thread = yield* McpInvocationContext.requireThreadScope(scope, "Missions board tools");
     const service = yield* KanbanService;
@@ -107,11 +118,12 @@ const withCaller = Effect.fn("KanbanTools.withCaller")(
       threadId,
       Effect.gen(function* () {
         const link = yield* service.caller(threadId);
+        if (link?.boardId) yield* resolvedContext({ boardId: link.boardId });
         const actor: KanbanActor =
           link !== null && link.role !== "evaluator"
             ? { _tag: "thread", threadId }
             : { _tag: "evaluator", threadId };
-        return yield* run(service, { threadId, link, actor });
+        return yield* SavedWrite.mutating(run(service, { threadId, link, actor }));
       }),
     );
   },
@@ -206,14 +218,18 @@ const boardFor = Effect.fn("KanbanTools.boardFor")(function* (
       return undefined;
     }).pipe(Effect.catch(() => Effect.succeed(undefined)));
   }
-  return yield* service.resolveBoard(caller.threadId, { boardId: wanted, card, discussionId }).pipe(
-    Effect.catchTags({
-      KanbanError: (error) =>
-        error.detail.startsWith("Pass boardId:")
-          ? invalid(`${missingBoard} ${error.detail}`)
-          : Effect.fail(error),
-    }),
-  );
+  const resolved = yield* service
+    .resolveBoard(caller.threadId, { boardId: wanted, card, discussionId })
+    .pipe(
+      Effect.catchTags({
+        KanbanError: (error) =>
+          error.detail.startsWith("Pass boardId:")
+            ? invalid(`${missingBoard} ${error.detail}`)
+            : Effect.fail(error),
+      }),
+    );
+  yield* resolvedContext({ boardId: resolved.id });
+  return resolved;
 });
 
 /**
@@ -241,11 +257,18 @@ const defaultCard = Effect.fn("KanbanTools.defaultCard")(function* (
 ) {
   if (caller.link?.role === "work") {
     const cards = yield* workCards(service, caller);
-    if (cards.length === 1 && cards[0]) return cards[0];
+    if (cards.length === 1 && cards[0]) {
+      yield* resolvedContext(cards[0]);
+      return cards[0];
+    }
     if (cards.length > 1) return yield* invalid(`Pass card: this thread has ${numbers(cards)}.`);
     return yield* invalid("Pass card: this thread has no card of its own.");
   }
-  if (caller.link?.cardId) return (yield* service.card(caller.link.cardId)).card;
+  if (caller.link?.cardId) {
+    const card = (yield* service.card(caller.link.cardId)).card;
+    yield* resolvedContext(card);
+    return card;
+  }
   return yield* invalid("Pass card: this thread has no card of its own.");
 });
 
@@ -256,6 +279,7 @@ const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
   ref: string | undefined,
   boardId?: string,
   inheritAncestorBoard = false,
+  captureContext = true,
 ) {
   const trimmed = ref?.trim();
   if (!trimmed) return yield* defaultCard(service, caller);
@@ -273,9 +297,12 @@ const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
     );
     const card = yield* service.cardByNumber(board.id, number);
     if (!card) return yield* invalid(`No card #${number} on ${board.name}.`);
+    if (captureContext) yield* resolvedContext(card);
     return card;
   }
-  return (yield* service.card(KanbanCardId.make(trimmed))).card;
+  const card = (yield* service.card(KanbanCardId.make(trimmed))).card;
+  if (captureContext) yield* resolvedContext(card);
+  return card;
 });
 
 /**
@@ -369,7 +396,10 @@ const discussionFor = Effect.fn("KanbanTools.discussionFor")(function* (
   if (caller.link?.role === "work") {
     const cards = yield* workCards(service, caller);
     const [only] = cards;
-    if (cards.length === 1 && only) return yield* service.cardDiscussion(only.id);
+    if (cards.length === 1 && only) {
+      yield* resolvedContext(only);
+      return yield* service.cardDiscussion(only.id);
+    }
     return yield* invalid(
       cards.length > 1
         ? `Pass card or discussionId: this thread has ${numbers(cards)}; each has its own discussion.`
@@ -403,7 +433,10 @@ const postTargetFor = Effect.fn("KanbanTools.postTargetFor")(function* (
   if (caller.link?.role === "work") {
     const cards = yield* workCards(service, caller);
     const [only] = cards;
-    if (cards.length === 1 && only) return { kind: "card" as const, id: only.id };
+    if (cards.length === 1 && only) {
+      yield* resolvedContext(only);
+      return { kind: "card" as const, id: only.id };
+    }
     return yield* invalid(
       cards.length > 1
         ? `Pass card or discussionId: this thread has ${numbers(cards)}; each has its own discussion.`
@@ -428,7 +461,7 @@ const cardIds = (
   refs === undefined
     ? Effect.void.pipe(Effect.as(undefined))
     : Effect.forEach(refs, (ref) =>
-        cardFor(service, caller, ref, boardId).pipe(Effect.map((card) => card.id)),
+        cardFor(service, caller, ref, boardId, false, false).pipe(Effect.map((card) => card.id)),
       );
 
 const SEARCH_LIMIT = 20;
@@ -454,10 +487,12 @@ const handlers = {
           const rows = Activity.activeCards(read.cards, byCard, window).map((card) =>
             Activity.compactRow(card, byCard.get(card.id) ?? [], window),
           );
+          const at = DateTime.formatIso(yield* DateTime.now);
           return Activity.pageRowsInReply(rows, input.after ?? 0, limit, (cards, cursor) => ({
             board: {
               id: board.id,
               name: board.name,
+              ...BoardReplies.boardReleaseSummary(board, at),
               window,
               legend: Activity.COMPACT_LEGEND,
               activeCards: rows.length,
@@ -476,7 +511,11 @@ const handlers = {
         const cards = snapshot.cards.slice(0, limit);
         return {
           board: {
-            ...BoardReplies.compactBoard({ ...snapshot, cards }),
+            ...BoardReplies.compactBoard(
+              { ...snapshot, cards },
+              undefined,
+              DateTime.formatIso(yield* DateTime.now),
+            ),
             page: { limit, hasMore, nextAfter: hasMore ? cards.at(-1)!.number : null },
           },
           prompts: "omitted; card_get returns a card's prompt",
@@ -599,10 +638,27 @@ const handlers = {
               Effect.catchTags({ KanbanError: () => Effect.succeed(null) }),
             )
           : null;
+        const dependencyBoard =
+          dependency !== null && dependency.boardId !== card.boardId
+            ? ((yield* service.boards).find((board) => board.id === dependency.boardId)?.name ??
+              dependency.boardId)
+            : undefined;
+        const waitTargets =
+          dependency === null
+            ? undefined
+            : new Map([
+                [
+                  dependency.id as string,
+                  {
+                    ...dependency,
+                    ...(dependencyBoard === undefined ? {} : { boardName: dependencyBoard }),
+                  },
+                ],
+              ]);
         const waitMessage =
           card.wait !== undefined &&
           (moved.stage !== card.stage || moved.movedAt !== card.movedAt || moved.wait === undefined)
-            ? `Wait ${waitingFor(card.wait, dependency === null ? undefined : new Map([[dependency.id as string, dependency]]))} ${
+            ? `Wait ${waitingFor(card.wait, waitTargets)} ${
                 moved.wait === undefined
                   ? "cleared by this move; set it again with card_wait or pass keepWait"
                   : "kept"
@@ -615,7 +671,9 @@ const handlers = {
             ? {
                 message:
                   input.to === moved.stage
-                    ? `already in ${moved.stage}; nothing changed`
+                    ? moved.stage === "needs_review" && caller.link?.role === "work"
+                      ? "already queued for review; note added"
+                      : `already in ${moved.stage}; nothing changed`
                     : `already moved to ${input.to}; now ${moved.stage}, nothing changed`,
               }
             : {}),
@@ -632,14 +690,26 @@ const handlers = {
         if (caller.link?.role === "review") {
           return yield* refuse("Review threads put questions in their findings.");
         }
+        const board = (yield* service.boards).find((entry) => entry.id === card.boardId);
         const asked = yield* service.askOwner(
           card.id,
           { ...askFieldsOf(input), question: input.question, blocking: input.blocking ?? false },
           caller.actor,
           isCardThread(caller) ? "cardThread" : "evaluator",
         );
-        // The newest ask is the one just added.
-        return { card: Asks.askSummary(asked, asked.asks.at(-1)?.id ?? "") };
+        const ask = asked.asks.at(-1);
+        const note = ask
+          ? [
+              askGateWarning(asked, ask, board?.guessedGates),
+              secretKindApprovalWarning(asked, ask, board?.guessedGates),
+            ]
+              .filter((warning) => warning !== undefined)
+              .join(" ")
+          : "";
+        return {
+          card: Asks.askSummary(asked, ask?.id ?? ""),
+          ...(note ? { note } : {}),
+        };
       }),
     ),
   ),
@@ -750,6 +820,35 @@ const handlers = {
     ),
   ),
 
+  board_standing_approval: McpToolAccess.actsAsCaller((input) =>
+    withCaller((service, caller) =>
+      Effect.gen(function* () {
+        if (caller.link?.role !== "evaluator")
+          return yield* refuse("Only evaluators grant or revoke standing approvals.");
+        const board = yield* boardFor(service, caller, input.boardId);
+        const card =
+          input.action === "grant" && input.card
+            ? yield* cardFor(service, caller, input.card, input.boardId)
+            : undefined;
+        return yield* service.standingApproval(
+          board.id,
+          {
+            action: input.action,
+            boards: input.boards,
+            quote: input.quote,
+            sourceThreadId: input.sourceThreadId,
+            saidAt: input.saidAt,
+            cardId: card?.id,
+            ask: input.ask,
+            id: input.id,
+            reason: input.reason,
+          },
+          caller.actor,
+        );
+      }),
+    ),
+  ),
+
   card_wait: McpToolAccess.actsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
@@ -776,7 +875,7 @@ const handlers = {
         const pr = input.pr ?? (prs.length === 1 ? prs[0]?.url : undefined);
         const waitsOn =
           on === "card" && input.waitsOn?.trim()
-            ? yield* cardFor(service, caller, input.waitsOn, card.boardId)
+            ? yield* cardFor(service, caller, input.waitsOn, card.boardId, false, false)
             : null;
         const waiting = yield* service.waitCard(
           card.id,
@@ -933,9 +1032,13 @@ const handlers = {
           return yield* invalid("Pass slug or slugs, not both.");
         }
         const board = yield* boardFor(service, caller, input.boardId, true);
-        const pages = yield* service.wiki(board.id);
+        const pages = yield* service.wiki(board.id, {
+          slug: input.slug,
+          section: input.section,
+          outline: input.outline,
+        });
         if (input.slug !== undefined) {
-          return { pages: pages.filter((page) => page.slug === input.slug) };
+          return { pages };
         }
         if (input.slugs !== undefined) {
           const bySlug = new Map(pages.map((page) => [page.slug, page]));
@@ -1051,6 +1154,13 @@ const handlers = {
           })),
           holdsSlot: next.holdsSlot,
         };
+      }),
+    ).pipe(
+      NodeSqliteClient.foregroundReads,
+      McpDeadline.awaitInterruptibly,
+      Effect.timeoutOrElse({
+        duration: "2 seconds",
+        orElse: () => invalid("card_next is busy; retry shortly."),
       }),
     ),
   ),
@@ -1235,10 +1345,12 @@ const handlers = {
         const board = yield* boardFor(service, caller, input.boardId);
         const page = yield* service.writeWiki(
           board.id,
-          { slug: input.slug, title: input.title, body: input.body },
+          { slug: input.slug, title: input.title, body: input.body, edits: input.edits },
           caller.actor,
         );
-        return { page };
+        if (input.edits === undefined) return { page };
+        const { body, ...metadata } = page;
+        return { page: { ...metadata, bodyLength: body.length, edits: input.edits.length } };
       }),
     ),
   ),
@@ -1290,7 +1402,7 @@ const handlers = {
           return { board: yield* service.pauseBoard(board.id, null, caller.actor, ancestors) };
         }
         const keep = yield* Effect.forEach(input.keep ?? [], (ref) =>
-          cardFor(service, caller, ref, board.id).pipe(Effect.map((card) => card.id)),
+          cardFor(service, caller, ref, board.id, false, false).pipe(Effect.map((card) => card.id)),
         );
         return {
           board: yield* service.pauseBoard(

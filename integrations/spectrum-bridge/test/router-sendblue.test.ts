@@ -2,7 +2,7 @@ import { afterEach, expect, setSystemTime, test } from "bun:test";
 import type { ChatContext, ChatInfo, Role } from "../src/chats.ts";
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import { JudgeError, type GroupJudge, type JudgeState } from "../src/group-judge.ts";
-import { Router, sendblueContextPrompt } from "../src/router.ts";
+import { Router, OUTAGE_NOTICE_AFTER_MS, sendblueContextPrompt } from "../src/router.ts";
 import { MAX_INCOMING_BYTES } from "../src/inbound-files.ts";
 import { Store } from "../src/store.ts";
 import type { Swipes, SwipeTarget } from "../src/swipe.ts";
@@ -12,6 +12,18 @@ import { OpenChamber, type MessageRecord, type PermissionRequest, type QuestionR
 // The backend is a minimal recorder; the Photon-mode suite covers the rest of the router.
 const DM_KEY = "dm:+971585933213";
 const GROUP_KEY = "group:abc123def456";
+
+test("history guidance appears in every foreground chat, with only permitted cross-chat scope", () => {
+  for (const kind of ["owner", "dm", "group"] as const) {
+    const prompt = sendblueContextPrompt(context(kind), false, []);
+    expect(prompt).toContain("messages --session CURRENT_SESSION_ID");
+    expect(prompt.includes("for another chat")).toBe(kind === "owner");
+    expect(prompt.includes("for a group she has written in")).toBe(kind === "dm");
+    expect(sendblueContextPrompt(context(kind), false, [], true)).not.toContain("messages --session CURRENT_SESSION_ID");
+  }
+  const guest = context("dm", { roleOf: () => ({ name: "Guest", role: "guest" }) });
+  expect(sendblueContextPrompt(guest, false, [])).not.toContain("for a group she has written in");
+});
 
 type Prompt = { id: string; text: string; system?: string };
 
@@ -508,7 +520,7 @@ test("location guidance points at the Sendblue commands, never Find My, and only
   expect(owner).toContain("location --session CURRENT_SESSION_ID` (add `--chat moni`");
   expect(owner).toContain("Never use Find My");
   expect(moni).toContain("location-request --session CURRENT_SESSION_ID --key UNIQUE_KEY`, say you've asked");
-  expect(moni).not.toContain("--chat");
+  expect(moni.split("\n").find(line => line.startsWith("Location,"))).not.toContain("--chat");
   expect(group).toContain("Location: not available in groups");
 });
 
@@ -1499,17 +1511,18 @@ test("owner, Moni and group outages each get one notice, with held messages orde
     for (const h of chats) await h.router.tick();
   }
   for (const h of chats) {
+    expect(h.store.pendingOutbox()).toEqual([]);
     h.input("second", "robob second question", "+971585933213");
     h.input("third", "robob third question", "+971585933213");
   }
-  setSystemTime(start + 180_000);
+  setSystemTime(start + OUTAGE_NOTICE_AFTER_MS);
   for (const h of chats) {
     await h.router.tick();
-    expect(h.store.pendingOutbox().map(op => op.text)).toEqual(["I'm having a technical problem; I'll answer this as soon as I'm back."]);
+    expect(h.store.pendingOutbox().map(op => [op.text, op.replyTo])).toEqual([["I'm having a technical problem; I'll answer this as soon as I'm back.", "first"]]);
     h.backend.prompt = Recorder.prototype.prompt.bind(h.backend);
   }
   // The health endpoint stays down: the thread answering is what brings the held batch back, a minute after the last try.
-  setSystemTime(start + 240_000);
+  setSystemTime(start + OUTAGE_NOTICE_AFTER_MS + 60_000);
   for (const h of chats) {
     await h.router.tick();
     await h.router.tick();
@@ -1607,7 +1620,8 @@ test.each(["dm", "group"] as const)("late accepted steer in %s forwards its own 
   expect(h.store.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([
     ["Original answer", "first"], ["Follow-up answer", "followup"],
   ]);
-  expect(steers).toHaveLength(1);
+  expect(new Set(steers.map(call => call.messageId))).toEqual(new Set([original.messageId]));
+  expect(h.backend.records.filter(record => record.type === "user" && record.id === original.messageId)).toHaveLength(1);
   expect(h.backend.prompts).toHaveLength(1);
 });
 

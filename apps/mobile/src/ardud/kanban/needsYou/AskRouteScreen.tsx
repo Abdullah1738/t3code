@@ -1,3 +1,5 @@
+import { AskTimingScrollView } from "./AskTimingScrollView";
+import { AskTiming } from "./useAskTiming";
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
 import {
   EMPTY_NEEDS_YOU_FILTER,
@@ -486,12 +488,13 @@ function OpenAsk(props: {
       ]}
       menus={[{ title: "More", icon: "ellipsis.circle", items: more }]}
     >
-      <ScrollView
+      <AskTimingScrollView
         ref={scroll}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="interactive"
         contentContainerClassName="gap-5 px-4 pb-8 pt-4"
       >
+        <AskTiming cardId={entry.cardId} askId={entry.ask.id} />
         <View className="gap-2.5">
           <Text className="text-sm text-foreground-muted">
             {askKindLabel(entry.kind)} · {askAsker(entry).replace(/^the /, "")} ·{" "}
@@ -721,7 +724,7 @@ function OpenAsk(props: {
             )}
           </View>
         ) : null}
-      </ScrollView>
+      </AskTimingScrollView>
 
       <AskBar
         turn={turn}

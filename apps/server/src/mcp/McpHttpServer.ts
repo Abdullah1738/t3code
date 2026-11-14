@@ -1,4 +1,7 @@
 import * as OwnerAnalytics from "../ardud/analytics/Analytics.ts";
+import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
+import * as StartupPhaseLog from "../ardud/observability/StartupPhaseLog.ts";
+import { bootId } from "../ardud/fast-install/report.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
 import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -904,6 +907,9 @@ const withToolAnalytics =
   /* Request instrumentation already owns the span; keep this helper in that context. */
   Effect.fnUntraced(function* <A, E, R>(registration: Effect.Effect<A, E, R>) {
     const server = yield* McpServer.McpServer;
+    const ledger = yield* McpCallLedger.McpCallLedger;
+    const startup = yield* Effect.serviceOption(StartupPhaseLog.StartupPhaseLog);
+    const callBootId = Option.isSome(startup) ? startup.value.snapshot().bootId : bootId;
     const analytics = yield* Effect.serviceOption(AnalyticsService.AnalyticsService);
     const ownerAnalytics = yield* Effect.serviceOption(OwnerAnalytics.Analytics);
     const config = yield* Effect.serviceOption(ServerConfig.ServerConfig);
@@ -1046,6 +1052,91 @@ const withToolAnalytics =
                 payload,
                 invocation?.thread?.threadId ?? invocation?.requestNamespace,
               );
+              // The request span already covers ledger capture on this hot path.
+              const row = Effect.fnUntraced(function* (
+                outcome: ReturnType<typeof McpCallAnalytics.callOutcome>,
+              ) {
+                const ended = yield* Clock.monotonicTimeNanos;
+                const interrupted =
+                  outcome.outcome === "interrupted" ||
+                  outcome.outcome === "interrupted_by_shutdown";
+                // Reserve most of the shutdown budget for recording and flushing all rows.
+                const observedCommit =
+                  interrupted && options.tool.name === "delegate_task"
+                    ? callState.delegation === undefined
+                      ? false
+                      : yield* callState.delegation.readCommitted.pipe(
+                          Effect.interruptible,
+                          Effect.timeout("250 millis"),
+                          Effect.orElseSucceed(() => "unknown" as const),
+                        )
+                    : undefined;
+                // HTTP teardown follows this snapshot, so admitted handlers can still commit.
+                const committed =
+                  outcome.outcome === "interrupted_by_shutdown" && observedCommit === false
+                    ? "unknown"
+                    : observedCommit;
+                return {
+                  ts: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
+                  kind: "mcp.call" as const,
+                  startedAt: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
+                  bootId: callBootId,
+                  surface: "server" as const,
+                  route: "mcp",
+                  tool: options.tool.name,
+                  build,
+                  ...identifiers,
+                  ...(callState.boardId ? { boardId: callState.boardId } : {}),
+                  ...(callState.cardId ? { cardId: callState.cardId } : {}),
+                  ...(invocation?.thread ? { callerThreadId: invocation.thread.threadId } : {}),
+                  callerResolved: callState.callerResolved,
+                  callerResolveMs:
+                    callState.callerResolveMs +
+                    (callState.callerStarted === undefined
+                      ? 0
+                      : Math.max(0, Number(ended - callState.callerStarted) / 1e6)),
+                  readerLane: callState.readerLane,
+                  durationMs: Math.max(0, Number(ended - started) / 1e6),
+                  ...outcome,
+                  props: {
+                    ...outcome.props,
+                    ...(callState.boardId ? { boardId: callState.boardId } : {}),
+                    ...(callState.cardNumber === undefined
+                      ? {}
+                      : { cardNumber: callState.cardNumber }),
+                    saved: outcome.saved ?? "unknown",
+                  },
+                  ...(committed === undefined
+                    ? {}
+                    : {
+                        committed,
+                        ...(committed === true && callState.delegation !== undefined
+                          ? { taskId: callState.delegation.taskId }
+                          : {}),
+                      }),
+                };
+              });
+              const complete = yield* ledger.begin(() =>
+                row({
+                  outcome: "interrupted_by_shutdown",
+                  props: { code: "unknown", cause: "shutdown" },
+                  saved: callState.saved,
+                  errorPhase: callState.phase,
+                }),
+              );
+              if (Option.isNone(complete))
+                return new McpSchema.CallToolResult({
+                  isError: true,
+                  content: [
+                    { type: "text", text: "Robob is restarting; retry after reconnecting." },
+                  ],
+                  structuredContent: { reason: "server_shutting_down", bootId: callBootId },
+                });
+              if (options.tool.name === "card_next")
+                yield* Effect.logInfo("MCP card_next started", {
+                  threadId: invocation?.thread?.threadId ?? "unknown",
+                  startedAt,
+                });
               const rejection = { exceeded: false };
               const readiness = BOARD_READ_TOOLS.has(options.tool.name)
                 ? boardReplyReady
@@ -1110,6 +1201,11 @@ const withToolAnalytics =
                 Effect.provideService(McpCallAnalytics.McpCall, callState),
                 Effect.provideService(SavedWrite.observer, (receipt) => {
                   callState.saved = true;
+                  if (receipt.kind === "card" && callState.cardId === undefined) {
+                    callState.boardId = receipt.card.boardId;
+                    callState.cardId = receipt.card.id;
+                    callState.cardNumber = receipt.card.number;
+                  }
                   parentSaved(receipt);
                 }),
                 Effect.provideService(SavedWrite.commitObserver, () => {
@@ -1121,32 +1217,22 @@ const withToolAnalytics =
                   // Handoff tools look up threads to record; the response must not wait on them.
                   return Effect.gen(function* () {
                     const endedAt = yield* Clock.currentTimeMillis;
-                    const ended = yield* Clock.monotonicTimeNanos;
-                    const ledger = {
-                      ts: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
-                      kind: "mcp.call",
-                      surface: "server" as const,
-                      route: "mcp",
-                      tool: options.tool.name,
-                      build,
-                      ...identifiers,
-                      ...(invocation?.thread ? { callerThreadId: invocation.thread.threadId } : {}),
-                      callerResolved: callState.callerResolved,
-                      callerResolveMs:
-                        callState.callerResolveMs +
-                        (callState.callerStarted === undefined
-                          ? 0
-                          : Math.max(0, Number(ended - callState.callerStarted) / 1e6)),
-                      readerLane: callState.readerLane,
-                      durationMs: Math.max(0, Number(ended - started) / 1e6),
-                      ...McpCallAnalytics.callOutcome(exit, callState),
+                    const resolved = {
+                      ...(identifiers.boardId ? { boardId: identifiers.boardId } : {}),
+                      ...(callState.boardId ? { boardId: callState.boardId } : {}),
+                      ...(callState.cardId ? { cardId: callState.cardId } : {}),
                     };
+                    const outcome = McpCallAnalytics.callOutcome(exit, callState);
+                    if (options.tool.name === "card_next")
+                      yield* Effect.logInfo("MCP card_next finished", {
+                        threadId: invocation?.thread?.threadId ?? "unknown",
+                        durationMs: Math.max(0, endedAt - startedAt),
+                        outcome: outcome.outcome,
+                      });
+                    yield* complete
+                      .value(row(outcome))
+                      .pipe(Effect.interruptible, Effect.timeout("1 second"), Effect.ignoreCause);
                     yield* Effect.gen(function* () {
-                      if (Option.isSome(ownerAnalytics))
-                        yield* recordServerAnalytics(ownerAnalytics.value, ledger).pipe(
-                          Effect.timeout("1 second"),
-                          Effect.ignoreCause,
-                        );
                       // The anonymous analytics event counts the completed input retry only.
                       if (result instanceof McpSchema.InputRequired) return;
                       if (Option.isSome(ownerAnalytics) && options.tool.name !== "analytics_read") {
@@ -1158,11 +1244,22 @@ const withToolAnalytics =
                           kind: failed ? "server.mcp.error" : "server.mcp",
                           surface: "server",
                           route: "mcp",
+                          ...resolved,
                           ...(invocation?.thread === undefined
                             ? {}
                             : { threadId: invocation.thread.threadId }),
                           durationMs: Math.max(0, endedAt - startedAt),
                           props: {
+                            ...outcome.props,
+                            saved: outcome.saved ?? "unknown",
+                            ...(callState.boardId
+                              ? { boardId: callState.boardId }
+                              : identifiers.boardId
+                                ? { boardId: identifiers.boardId }
+                                : {}),
+                            ...(callState.cardNumber === undefined
+                              ? {}
+                              : { cardNumber: callState.cardNumber }),
                             method: options.tool.name,
                             span: "mcp.tools.call",
                             originKind: invocation?.thread === undefined ? "mcp-client" : "agent",
@@ -1200,7 +1297,7 @@ export const toolkitRegistration = <Tools extends Record<string, Tool.Any>, EX, 
 ) => {
   const registration = Layer.effectDiscard(
     withToolAnalytics(McpServer.registerToolkit(decodeAsAdvertised(toolkit))),
-  ).pipe(Layer.provide(McpServer.McpServer.layer));
+  ).pipe(Layer.provide(McpServer.McpServer.layer), Layer.provide(McpCallLedger.layer));
   // @effect-diagnostics-next-line unsafeEffectTypeAssertion:off - the auth middleware provides it per request.
   const registered = registration as Layer.Layer<
     never,
@@ -1216,6 +1313,7 @@ const imageToolRegistration = <Tools extends Record<string, Tool.Any>, A, E, R, 
 ) =>
   Layer.effectDiscard(withToolAnalytics(register)).pipe(
     Layer.provide(McpToolAccess.HandlersLayer.layer(handlers)),
+    Layer.provide(McpCallLedger.layer),
   );
 
 export const layerHtmlToolkit = Layer.mergeAll(

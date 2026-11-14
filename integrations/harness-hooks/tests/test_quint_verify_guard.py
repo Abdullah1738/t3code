@@ -1,3 +1,8 @@
+if __package__:
+    from . import test_environment
+else:
+    import test_environment
+
 import json
 import os
 from pathlib import Path
@@ -77,8 +82,7 @@ class QuintVerifyTests(unittest.TestCase):
             with patch.dict(os.environ, {'CLAUDE_ENV_FILE': str(env_file)}):
                 claude.session_start()
             line = env_file.read_text().splitlines()[0]
-            self.assertLess(line.index('scripts/blockers'), line.index('coord-blockers'))
-            self.assertLess(line.index('coord-blockers'), line.index('quint-guard/bin'))
+            self.assertLess(line.index('scripts/blockers'), line.index('quint-guard/bin'))
             self.assertLess(line.index('quint-guard/bin'), line.index('$PATH'))
 
 

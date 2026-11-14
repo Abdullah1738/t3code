@@ -555,6 +555,119 @@ it.effect("a stale read-only operation reruns before any write or external side 
   }),
 );
 
+it.effect.each(["validation", "read"] as const)(
+  "#1397 pending dispatch %s releases the gate within its read budget",
+  (stage) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      let free = true;
+      let sent = 0;
+      let first = true;
+      const pending = Effect.suspend(() =>
+        first
+          ? Effect.sync(() => {
+              first = false;
+            }).pipe(
+              Effect.andThen(Deferred.succeed(entered, undefined)),
+              Effect.andThen(Deferred.await(resume)),
+            )
+          : Effect.void,
+      );
+      const dispatch = yield* Effect.forkChild(
+        locks
+          .run(
+            Effect.gen(function* () {
+              yield* locks.scopeDispatch(
+                "a",
+                ["card:target"],
+                Effect.sync(() => free).pipe(
+                  Effect.flatMap((snapshot) =>
+                    (stage === "validation" ? pending : Effect.void).pipe(Effect.as(snapshot)),
+                  ),
+                ),
+              );
+              if (stage === "read") yield* locks.access("a", pending);
+              yield* locks.outside(
+                Effect.sync(() => {
+                  sent += 1;
+                }),
+              );
+            }),
+            "target",
+          )
+          .pipe(Effect.exit),
+      );
+      yield* Deferred.await(entered);
+      const admitted = yield* Deferred.make<void>();
+      const writer = yield* Effect.forkChild(
+        locks
+          .board(
+            "a",
+            locks.access(
+              "a",
+              Effect.sync(() => {
+                free = false;
+              }),
+              true,
+            ),
+          )
+          .pipe(Effect.tap(() => Deferred.succeed(admitted, undefined))),
+      );
+      yield* TestClock.adjust("3 seconds");
+      assert.isTrue(yield* Deferred.isDone(admitted));
+      yield* Fiber.join(writer);
+      yield* Deferred.succeed(resume, undefined);
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(dispatch)));
+      assert.strictEqual(sent, 0);
+    }),
+);
+
+it.effect("#1397 reads share one hold budget and a timeout does not immediately retry", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const first = yield* Deferred.make<void>();
+    const second = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    const pending = yield* Deferred.make<void>();
+    let attempts = 0;
+    let sent = false;
+    const start = yield* Effect.forkChild(
+      locks
+        .run(
+          Effect.gen(function* () {
+            attempts += 1;
+            yield* locks.scopeDispatch("a", ["card:target"], Effect.succeed(true));
+            yield* locks.access(
+              "a",
+              Deferred.succeed(first, undefined).pipe(Effect.andThen(Deferred.await(resume))),
+            );
+            yield* locks.access(
+              "a",
+              Deferred.succeed(second, undefined).pipe(Effect.andThen(Deferred.await(pending))),
+            );
+            sent = true;
+          }),
+          "target",
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(first);
+    yield* TestClock.adjust(1500);
+    yield* Deferred.succeed(resume, undefined);
+    yield* Deferred.await(second);
+    const admitted = yield* Deferred.make<void>();
+    const writer = yield* Effect.forkChild(locks.board("a", Deferred.succeed(admitted, undefined)));
+    yield* TestClock.adjust(1000);
+    assert.isTrue(yield* Deferred.isDone(admitted));
+    yield* Fiber.join(writer);
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(start)));
+    assert.strictEqual(attempts, 1);
+    assert.isFalse(sent);
+  }),
+);
+
 it.effect.each(["unrelated", "card", "slot", "migration"] as const)(
   "dispatch dependencies retain only their card and slot across %s changes",
   (change) =>

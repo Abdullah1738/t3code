@@ -107,7 +107,11 @@ it.effect(
           ];
           const reply = yield* kanban.replyOnAsk(card.id, "q1", owner, full, "owner");
           assert.strictEqual(reply.blocks.length, ASK_LIMITS.blocks);
-          assert.strictEqual(kanbanAskWaitsOn(askOf((yield* kanban.card(card.id)).card)), "agent");
+          // #1158 / PR #49: an accepted owner reply is a closed answer.
+          const answered = askOf((yield* kanban.card(card.id)).card);
+          assert.isNotNull(answered.closedAt);
+          assert.strictEqual(kanbanAskWaitsOn(answered), null);
+          assert.deepStrictEqual([answered.answer?.verdict, answered.answer?.by], ["text", owner]);
         }),
       ).pipe(Effect.provide(testLayer(fake.layer)));
     }),

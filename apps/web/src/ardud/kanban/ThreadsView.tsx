@@ -1,10 +1,12 @@
 import { Link } from "@tanstack/react-router";
+import { useState } from "react";
 import type { KanbanThreadRow } from "@t3tools/contracts";
 import { ageView } from "@t3tools/client-runtime/ardud/common";
 
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useBoardThreads } from "./kanbanStore";
 import { cn } from "../../lib/utils";
+import { useAnalyticsCounts } from "../useAnalytics";
 
 /**
  * The board's runs in two groups: Evaluators (purpose) and Cards (number and
@@ -40,6 +42,13 @@ function ThreadGroup(props: {
 }) {
   const running = props.rows.filter((row) => row.running);
   const ended = props.rows.filter((row) => !row.running);
+  const [endedOpen, setEndedOpen] = useState(false);
+  useAnalyticsCounts(
+    usePrimaryEnvironmentId(),
+    "board.threads",
+    0,
+    running.length + (endedOpen ? ended.length : 0),
+  );
   return (
     <section className="flex flex-col gap-2">
       <h3 className="text-(--m-muted) text-sm font-medium">{props.title}</h3>
@@ -51,7 +60,7 @@ function ThreadGroup(props: {
             <ThreadRow key={row.threadId} row={row} nowMs={props.nowMs} />
           ))}
           {ended.length === 0 ? null : (
-            <details className="group">
+            <details className="group" onToggle={(event) => setEndedOpen(event.currentTarget.open)}>
               <summary className="text-(--m-muted) cursor-pointer text-sm">
                 Ended · {ended.length}
               </summary>

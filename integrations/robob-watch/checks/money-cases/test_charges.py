@@ -146,6 +146,90 @@ class Parse(unittest.TestCase):
 
 
 class AlertText(unittest.TestCase):
+    def test_receipt_queries_keep_money_forms_without_bare_integers(self):
+        for amount in ('0.00', '1.00', '9.00', '10.00', '1000.00', '1.25'):
+            with self.subTest(amount=amount):
+                queries = []
+                charge = dict(kind='charge', currency='AED', amount=amount, card='1111', merchant='Acme')
+                ch.receipt(charge, dt.datetime(2026, 10, 24, tzinfo=TZ),
+                           dt.datetime(2026, 10, 25, tzinfo=TZ),
+                           find=lambda query, *a, **kw: queries.append(query) or [])
+                self.assertTrue(queries)
+                for query in queries:
+                    self.assertNotIn('"' + amount.split('.')[0] + '"', query)
+                if amount.endswith('.00'):
+                    self.assertEqual(queries, ['"acme"', '"1111"'])
+
+    def test_integral_receipts_still_match_symbols_and_spaced_currency(self):
+        now = dt.datetime(2026, 10, 24, tzinfo=TZ)
+        for text, merchant, currency in (('Receipt from Acme: $1', 'Acme', 'USD'),
+                                         ('Receipt from Acme: AED 1', 'Acme', 'AED'),
+                                         ('Receipt from Reseller: 1 USD card 1111', 'Acme', 'USD')):
+            with self.subTest(text=text):
+                row = {'id': 1, 'ts': now.timestamp(), 'sender': 'Acme'}
+                def find(query, *a, **kw):
+                    return [row] if query.strip('"').lower() in text.lower() else []
+                charge = dict(currency=currency, amount='1.00', card='1111', merchant=merchant)
+                self.assertEqual(ch.receipt(charge, now, now, find=find, read=lambda *a: text), row)
+
+    def test_exhausted_receipt_scans_never_authorize_an_ask(self):
+        when = dt.datetime(2026, 10, 24, tzinfo=TZ)
+        now = when + dt.timedelta(days=2)
+        charge = dict(kind='charge', currency='USD', amount='1.00', card='1111', merchant='Acme')
+        for kind in ('distinct bodies', 'search page'):
+            with self.subTest(kind=kind):
+                n = ch.RECEIPT_READS + 1 if kind == 'distinct bodies' else ch.RECEIPT_HITS
+                rows = [{'id': i, 'ts': when.timestamp(), 'sender': 'Acme'} for i in range(n)]
+                def read(row, *a, **kw):
+                    if kind == 'search page':
+                        return 'Acme newsletter, same body'
+                    return 'Receipt from Acme: $1' if row['id'] == n - 1 else f'Acme newsletter {row["id"]}'
+                with patch.object(ch, 'show', side_effect=read), patch.object(ch, 'card_owner', return_value='abdullah'):
+                    result = ch.explain(charge, when, now, find=lambda *a, **kw: rows,
+                                        said=lambda *a, **kw: [])
+                self.assertEqual(result['verdict'], 'unverified')
+                self.assertIn('receipt scan incomplete', str(result['errors']))
+
+    def test_order_results_and_failures_are_shared_only_within_one_run(self):
+        charge = dict(kind='charge', currency='AED', amount='1.00', card='1111', merchant='noon')
+        now = dt.datetime(2026, 10, 24, tzinfo=TZ)
+        for result in ({'orders': [], 'complete': False}, ValueError('unavailable')):
+            with self.subTest(failure=isinstance(result, Exception)):
+                memo = {}
+                with patch.object(ch.order_lookup, 'read', side_effect=[result, result]) as lookup, \
+                        patch.object(ch, 'receipt', return_value=None), \
+                        patch.object(ch, 'card_owner', return_value='abdullah'):
+                    for _ in range(2):
+                        errors = []
+                        self.assertIsNone(ch.found(charge, now, now, said=lambda *a, **kw: [],
+                                                   errors=errors, memo=memo))
+                        self.assertIn('orders: noon orders: lookup unavailable or incomplete', errors)
+                    self.assertEqual(lookup.call_count, 1)
+                    ch.found(charge, now, now, said=lambda *a, **kw: [], memo={})
+                    self.assertEqual(lookup.call_count, 2)
+
+    def test_order_lookup_without_start_budget_does_not_poison_the_run(self):
+        import subprocess
+        charge = dict(kind='charge', currency='AED', amount='1.00', card='1111', merchant='noon')
+        now = dt.datetime(2026, 10, 24, tzinfo=TZ)
+        result = {'orders': [{'service': 'minutes', 'order': 'N1', 'total': '1.00', 'currency': 'AED',
+                              'placed_at': now.isoformat()}], 'complete': True}
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        memo = {('orders_cache',): Path(cache_dir.name) / 'cache.json'}
+        with patch.object(ch.time, 'time', return_value=1000), \
+                patch.object(ch, 'receipt', return_value=None), \
+                patch.object(ch, 'card_owner', return_value='abdullah'), \
+                patch.object(ch.order_lookup.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(result), '')) as run:
+            self.assertIsNone(ch.found(charge, now, now, deadline=1001, memo=memo,
+                                       said=lambda *a, **kw: []))
+            run.assert_not_called()
+            hit = ch.found(charge, now, now, deadline=1010, memo=memo, said=lambda *a, **kw: [])
+            self.assertEqual(hit['verdict'], 'receipt')
+            ch.found(charge, now, now, deadline=1010, memo=memo, said=lambda *a, **kw: [])
+            self.assertEqual(run.call_count, 1)
+
     def test_selected_body_continuations_stop_at_next_context_header(self):
         bodies = [
             'Purchase of USD 100 with your Credit Card ending 2342 at Acme.',

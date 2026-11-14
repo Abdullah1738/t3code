@@ -5,6 +5,7 @@ import { createApi } from "./api.ts";
 import { Attention } from "./attention.ts";
 import { backendConnection, backendKind, loadConfig, spectrumBridgeSocket, stateRoot } from "./config.ts";
 import { Delivery } from "./delivery.ts";
+import { ControlClient } from "./control.ts";
 import { acquireLock } from "./lock.ts";
 import { OpenChamber, type AlertBackend } from "./openchamber.ts";
 import { RobobAlertBackend } from "./robob.ts";
@@ -118,6 +119,7 @@ async function main(): Promise<void> {
     chatId: () => chatId,
     enabled: () => ready() && !stopping,
     beforeSend: item => attention.beforeSend(item),
+    askNotified: (key, at) => new ControlClient().askNotified(key, at),
     log,
   });
   delivery.recover();
