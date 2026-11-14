@@ -165,7 +165,25 @@ test.each(["read", "write", "symlink loop", "non-directory parent"])("rollup %s 
   expect(child.stderr.toString()).toContain("Could not roll up UTC day");
 });
 
-test.skipIf(process.getuid?.() === 0)("an unreadable day file still fails", async () => {
+function canReadMode000(kind: "file" | "directory"): boolean {
+  const root = mkdtempSync(join(tmpdir(), "toollog-permissions-"));
+  const parent = join(root, "parent"), file = join(parent, "probe");
+  mkdirSync(parent); writeFileSync(file, "probe");
+  const target = kind === "file" ? file : parent;
+  try {
+    chmodSync(target, 0o000);
+    try { readFileSync(file); return true; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EACCES") return false;
+      throw error;
+    }
+  } finally {
+    chmodSync(target, kind === "file" ? 0o600 : 0o700);
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test.skipIf(canReadMode000("file"))("an unreadable day file still fails", async () => {
   const dir = fixture(), fixtureDay = "2000-01-01", file = join(dir, `${fixtureDay}.ndjson`);
   writeFileSync(file, ""); chmodSync(file, 0o000);
   expect(await rollup(fixtureDay)).toBeUndefined();
@@ -176,7 +194,7 @@ test.skipIf(process.getuid?.() === 0)("an unreadable day file still fails", asyn
   expect(child.stderr.toString()).toContain("Could not roll up UTC day");
 });
 
-test.skipIf(process.getuid?.() === 0)("a missing log directory beneath an inaccessible parent still fails", async () => {
+test.skipIf(canReadMode000("directory"))("a missing log directory beneath an inaccessible parent still fails", async () => {
   const root = fixture(), parent = join(root, "blocked"), dir = join(parent, "logs"), emptyDay = "2000-01-01";
   mkdirSync(parent); chmodSync(parent, 0o000);
   try {
