@@ -402,6 +402,20 @@ class PhoneLockTests(unittest.TestCase):
         label = 'input field (current value: '+secret+')'
         self.assertNotIn('PRI', scope['public_text'](label)[:30])
 
+    def test_jevrun_serialized_input_class_is_suppressed(self):
+        source = Path(__file__).with_name('jevrun.py').read_text()
+        node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name=='public_text')
+        inputs = ['PRIVATE_CANARY', "ONE\tPRIVATE_CANARY'", 'ONE\tPRIVATE_CANARY"',
+                  'ONE\nPRIVATE_CANARY', 'ONE\r\nPRIVATE_CANARY', 'ONE'+chr(92)+'PRIVATE_CANARY',
+                  "ONE'PRIVATE_CANARY\"", 'ONE\vPRIVATE_CANARY', 'ONE\fPRIVATE_CANARY']
+        for value in inputs:
+            scope = dict(_typed_values={value, *value.split()})
+            exec(compile(ast.Module(body=[node], type_ignores=[]), '<private>', 'exec'), scope)
+            forms = [value, repr([value]), json.dumps([value]), json.dumps(json.dumps([value])), repr(['"'+value+'"'])]
+            for text in forms:
+                with self.subTest(value=value, text=text):
+                    self.assertNotIn('PRIVATE_CANARY', scope['public_text'](text))
+
     def test_jevrun_device_call_class_refuses_new_claims(self):
         source = Path(__file__).with_name('jevrun.py').read_text()
         functions = [n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name in ('priority_check', 'phone_call')]
@@ -553,13 +567,13 @@ sys.modules['requests']=types.SimpleNamespace(Session=lambda:types.SimpleNamespa
 sys.modules['uiautomator2']=types.SimpleNamespace(connect=lambda *a:Device())
 runpy.run_path(sys.argv[1],run_name='__main__')
 """
-        for secret in ['PRIVATE-PLAIN-CANARY', 'PRIVATE\'QUOTE\"TAIL', 'PRIVATE-LINE-ONE\nPRIVATE-LINE-TWO', 'سري-اختبار']:
+        for secret in ["ONE\tPRIVATE_CANARY'", 'PRIVATE-PLAIN-CANARY', 'PRIVATE\'QUOTE\"TAIL', 'PRIVATE-LINE-ONE\nPRIVATE-LINE-TWO', 'سري-اختبار']:
             with self.subTest(secret=secret):
                 plan = self.root/'plan.json'
-                plan.write_text(json.dumps(dict(app='dev.fixture', steps=[{'type':secret},{'print':'.'}])))
+                plan.write_text(json.dumps(dict(app='dev.fixture', steps=[{'type':secret},{'print':'.'},{'verify':['\"'+secret+'\"']}])))
                 code = bootstrap.replace("runpy.run_path(sys.argv[1],run_name='__main__')", "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')")
                 result = subprocess.run([sys.executable,'-I','-c',code,script,str(plan)], env=self.env,cwd=self.root,capture_output=True,text=True,timeout=15)
-                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(result.returncode,4,result.stderr)
                 self.assertIn('readback=ok',result.stdout)
                 for fragment in secret.replace('\"','\n').replace("'",'\n').splitlines():
                     self.assertNotIn(fragment,result.stdout)

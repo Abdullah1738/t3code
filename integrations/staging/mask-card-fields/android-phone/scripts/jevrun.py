@@ -55,9 +55,12 @@ for step in plan['steps']:
     if 'type' in step:
         value = str(step['type'])
         _typed_values.update(v for v in [value, *re.split(r"[\\\"'\r\n]+", value),
-                                       repr(value)[1:-1], json.dumps(value)[1:-1]] if v)
+                                       repr(value)[1:-1], json.dumps(value)[1:-1], *value.split()] if v)
 
 def public_text(text):
+    # Quoted/escaped diagnostics may serialize input at any nesting depth.
+    if _typed_values and any(c in text for c in ("'", '"', chr(92))):
+        return '[redacted output]'
     for value in sorted(_typed_values, key=len, reverse=True):
         text = text.replace(value, '[redacted input]')
     return text
