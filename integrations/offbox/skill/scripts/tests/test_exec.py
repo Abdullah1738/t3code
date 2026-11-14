@@ -137,13 +137,89 @@ class ExecTests(Isolated):
 
     def test_api_and_transport_errors_map_to_infra(self):
         for error in (api.NetworkError("connection refused"), api.ApiError(503, "unavailable", "try later"),
+                      api.ApiError(408, "other_timeout", "not a command timeout"),
                       ConnectionError("secret command could be echoed"), TimeoutError("timed out")):
             with self.subTest(error=type(error).__name__):
                 self.call.side_effect = error
                 code, stdout, stderr = self.invoke("bx_own", "--", "true")
                 self.assertEqual((code, stdout), (90, ""))
                 self.assertTrue(stderr)
+                self.assertIn("exec has no local fallback", stderr)
                 self.assertEqual(self.rows()[-1]["props"]["errorClass"], type(error).__name__)
+
+    def test_timeout_preserves_partial_output_and_structured_metadata(self):
+        data = {"code": "command_timeout", "processId": 1002, "stdout": "partial output\n",
+                "stderr": "partial error\n", "queuedMs": 0, "runMs": 20000, "killed": True}
+        for as_json in (False, True):
+            with self.subTest(as_json=as_json):
+                self.call.side_effect = api.ApiError(408, "command_timeout", "command 1002 timed out", data=data)
+                code, stdout, stderr = self.invoke("bx_own", "--timeout", "20", *(["--json"] if as_json else []),
+                                                   "--", "private command")
+                self.assertEqual(code, 124)
+                self.assertEqual(json.loads(stdout) if as_json else stdout, data if as_json else data["stdout"])
+                if not as_json:
+                    self.assertTrue(stderr.startswith(data["stderr"]))
+                self.assertIn("offbox exec: command ran past --timeout 20s on bx_own (server command 1002); "
+                              "nothing fell back locally", stderr)
+                self.assertEqual({k: self.rows()[-1]["props"][k] for k in ("queueMs", "runMs", "pid", "killed")},
+                                 {"queueMs": 0, "runMs": 20000, "pid": 1002, "killed": True})
+                self.assertNotIn("partial output", json.dumps(self.rows()))
+
+    def test_success_includes_timing_metadata(self):
+        self.result.update(queuedMs=0, runMs=15, killed=False)
+        self.assertEqual(self.invoke("bx_own", "--", "true")[0], 0)
+        self.assertEqual(self.rows()[-1]["props"]["queueMs"], 0)
+        self.assertEqual(self.rows()[-1]["props"]["runMs"], 15)
+
+    def test_api_timeout_log_retains_only_status_code_id_and_timing(self):
+        secret = "private-command-value-123"
+        data = {"code": "command_timeout", "message": secret, "processId": 1002,
+                "queuedMs": 0, "runMs": 20000, "stdout": secret, "stderr": secret, "killed": True}
+        error = urllib.error.HTTPError("https://example.invalid", 408, "timeout", {},
+                                       io.BytesIO(json.dumps(data).encode()))
+        self.call.side_effect = API_CALL
+        with patch.object(api, "_open", side_effect=error), patch.object(api, "_key", return_value="fixture-key"), \
+                patch.object(api, "_own_box"), patch.object(api, "log") as log:
+            self.assertEqual(self.invoke("bx_own", "--timeout", "20", "--", secret)[0], 124)
+        log.assert_called_once_with("api POST /sandboxes/bx_own/commands -> "
+                                    "408 command_timeout command 1002 (queued 0.0s, ran 20.0s)")
+        self.assertNotIn(secret, str(log.call_args_list) + json.dumps(self.rows()))
+
+    def test_api_success_log_has_timing_without_command_or_output(self):
+        data = {**self.result, "queuedMs": 0, "runMs": 10}
+        self.call.side_effect = API_CALL
+        with contextlib.ExitStack() as stack:
+            response = stack.enter_context(patch.object(api, "_open")).return_value.__enter__.return_value
+            response.read.return_value = json.dumps(data).encode()
+            stack.enter_context(patch.object(api, "_key", return_value="fixture-key"))
+            stack.enter_context(patch.object(api, "_own_box"))
+            log = stack.enter_context(patch.object(api, "log"))
+            self.assertEqual(self.invoke("bx_own", "--", "private command")[0], 0)
+        log.assert_called_once_with("api POST /sandboxes/bx_own/commands -> 200 command 123 (queued 0.0s, ran 0.0s)")
+
+    def test_command_log_rejects_untrusted_codes_ids_and_timings(self):
+        self.assertEqual(api._command_summary(400, "private_command", {
+            "processId": "private command", "queuedMs": float("nan"), "runMs": "private command"}), "400 http_400")
+
+    def test_log_write_failure_preserves_remote_results_and_api_errors(self):
+        cases = [(200, "", 0), (200, "", 7), (408, "command_timeout", 124), (503, "server_not_ready", 90)]
+        for status, tag, expected in cases:
+            with self.subTest(status=status, expected=expected), contextlib.ExitStack() as stack:
+                data = {"exitCode": expected, "stdout": "partial\n", "stderr": "warning\n", "processId": 1002,
+                        "code": tag, "queuedMs": 0, "runMs": 1000}
+                opener = stack.enter_context(patch.object(api, "_open"))
+                if status == 200:
+                    opener.return_value.__enter__.return_value.read.return_value = json.dumps(data).encode()
+                else:
+                    opener.side_effect = urllib.error.HTTPError("https://example.invalid", status, "error", {},
+                                                                io.BytesIO(json.dumps(data).encode()))
+                self.call.side_effect = API_CALL
+                stack.enter_context(patch.object(api, "_key", return_value="fixture-key"))
+                stack.enter_context(patch.object(api, "_own_box"))
+                stack.enter_context(patch.object(api, "log", side_effect=OSError("disk full")))
+                code, stdout, _ = self.invoke("bx_own", "--", "true")
+                self.assertEqual(code, expected)
+                self.assertEqual(stdout, "" if status == 503 else data["stdout"])
 
     def test_timeout_default_and_clamps_reach_api_with_cwd(self):
         for requested, expected in ((None, 60), (9999, 600), (0, 1), (-10, 1), (600, 600)):
@@ -195,7 +271,7 @@ class ExecTests(Isolated):
         self.assertEqual((row["name"], row["component"]), ("exec.done", "cli"))
         self.assertEqual(row["ids"], {"box": "bx_own", "owner": "worker", "thread": "t"})
         self.assertEqual(row["props"], {"backend": "home", "exitCode": 0, "timeoutSeconds": 600,
-                                        "commandLength": len(f"echo {secret}")})
+                                        "commandLength": len(f"echo {secret}"), "pid": 123})
         self.assertGreaterEqual(row["durationMs"], 0)
         self.assertNotIn(secret, json.dumps(rows))
         self.assertNotIn("private output", json.dumps(rows))

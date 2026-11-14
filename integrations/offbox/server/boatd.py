@@ -182,7 +182,8 @@ def migrate(con) -> None:
         con.execute("UPDATE boxes SET owner=? WHERE owner IS NULL", (owner,))
     have = _cols(con, "commands")
     for col in ("retry_interrupted INTEGER DEFAULT 0", "attempt INTEGER DEFAULT 1", "boot_id TEXT",
-                "interrupted_at REAL"):
+                "interrupted_at REAL", "sync INTEGER NOT NULL DEFAULT 0", "timeout_s REAL",
+                "killed INTEGER NOT NULL DEFAULT 0"):
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE commands ADD COLUMN {col}")
     if "owner" not in _cols(con, "saved"):
@@ -412,9 +413,10 @@ def health(fresh: bool = False) -> dict:
 # ---------------------------------------------------------------- incus
 
 class Fail(Exception):
-    def __init__(self, status: int, code: str, message: str = ""):
+    def __init__(self, status: int, code: str, message: str = "", details: dict | None = None):
         super().__init__(f"{status} {code}: {message}")
         self.status, self.code, self.message = status, code, message
+        self.details = details or {}
 
 
 def incus(*args, input: bytes | None = None, timeout: float = 600, check: bool = True) -> subprocess.CompletedProcess:
@@ -893,10 +895,13 @@ def start_cmd(con, box_id: str, body: dict, owner: str | None = None) -> dict:
     # retry_interrupted: if the host dies under this run, queue it again once (same id, next attempt). Only the
     # caller knows whether running it twice is safe, so the default is no.
     retry = 1 if body.get("retry_interrupted") is True else 0
+    sync = not bool(body.get("detached"))
+    timeout_s = int(body.get("timeoutSeconds") or 60) if sync else None
     con.execute("INSERT INTO commands (box_id, pid, command_id, command, cwd, status, created_at, kind, repo, run_id, "
-                "retry_interrupted, attempt) VALUES (?,?,?,?,?,?,?,?,?,?,?,1)",
+                "retry_interrupted, attempt, sync, timeout_s) VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?)",
                 (box_id, pid, cid, command, body.get("cwd") or "/home/user", "queued", now(),
-                 meta.get("kind") or guess_kind(command), meta.get("repo"), meta.get("run_id"), retry))
+                 meta.get("kind") or guess_kind(command), meta.get("repo"), meta.get("run_id"), retry,
+                 int(sync), timeout_s))
     con.execute("COMMIT")
     set_box(con, box_id, last_active=now())
     d = cmd_dir(box_id)
@@ -935,6 +940,10 @@ def cmd_status_json(con, box_id: str, pid: int, tail_bytes: int = 4096) -> dict:
     return {"ok": True, "processId": pid, "commandId": r["command_id"], "running": running,
             "status": "running" if running else r["status"], "exitCode": r["exit_code"], "signal": r["signal"],
             "queued": r["status"] == "queued", "startedAt": iso(r["started_at"]), "endedAt": iso(r["ended_at"]),
+            "receivedAt": iso(r["created_at"]), "timeoutSeconds": r["timeout_s"], "killed": bool(r["killed"]),
+            "queuedMs": 0 if r["sync"] else max(0, r["queued_s"] if r["queued_s"] is not None else
+                (r["started_at"] or r["ended_at"] or now()) - r["created_at"]) * 1000,
+            "runMs": max(0, (r["ended_at"] or now()) - r["started_at"]) * 1000 if r["started_at"] else 0,
             "attempt": r["attempt"] or 1, "retryInterrupted": bool(r["retry_interrupted"]),
             "interruptedAt": iso(r["interrupted_at"]), "bootId": boot_id(), "serverStartedAt": iso(STARTED),
             "stdout": tail(d / f"{pid}.out", tail_bytes), "stderr": tail(d / f"{pid}.err", tail_bytes),
@@ -953,6 +962,7 @@ def kill_cmd(con, box_id: str, pid: int, lost: bool = False) -> None:
     if not r or r["status"] not in ("queued", "running"):
         return
     (cmd_dir(box_id) / f"{pid}.kill").write_text("lost" if lost else "kill")
+    con.execute("UPDATE commands SET killed=1 WHERE box_id=? AND pid=?", (box_id, pid))
     for hp in _cg_pids(box_id, pid):
         try:
             os.kill(hp, signal.SIGTERM)
@@ -989,7 +999,7 @@ def mem_available() -> int:
 
 def predicted_peak(con, kind: str) -> int:
     rows = [json.loads(r[0]).get("box_mem_peak") or 0 for r in con.execute(
-        "SELECT metrics FROM commands WHERE kind=? AND metrics IS NOT NULL ORDER BY ended_at DESC LIMIT 50", (kind,))]
+        "SELECT metrics FROM commands WHERE sync=0 AND kind=? AND metrics IS NOT NULL ORDER BY ended_at DESC LIMIT 50", (kind,))]
     rows = sorted(x for x in rows if x)
     if len(rows) < 3:
         return int(CFG["default_peak_gb"] * 2**30)
@@ -1000,7 +1010,7 @@ def predicted_peak(con, kind: str) -> int:
 def admitted_bytes(con) -> int:
     """Memory promised to runs that started in the last 60 s and may not have grown yet."""
     total = 0
-    for r in con.execute("SELECT kind FROM commands WHERE status='running' AND started_at > ?", (now() - 60,)):
+    for r in con.execute("SELECT kind FROM commands WHERE sync=0 AND status='running' AND started_at > ?", (now() - 60,)):
         total += predicted_peak(con, r["kind"])
     return total
 
@@ -1028,18 +1038,18 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
             fcntl.flock(lk, fcntl.LOCK_EX)
             free = mem_available() - reserve - admitted_bytes(con)
             # Oldest first, so a run queued again after a restart goes before runs submitted after it.
-            head = con.execute("SELECT box_id, pid FROM commands WHERE status='queued' ORDER BY created_at, box_id, pid "
+            head = con.execute("SELECT box_id, pid FROM commands WHERE sync=0 AND status='queued' ORDER BY created_at, box_id, pid "
                                "LIMIT 1").fetchone()
             mine = head is None or (head["box_id"] == box_id and head["pid"] == pid)
             cap = int(CFG.get("max_running") or 0)
-            room = not cap or con.execute("SELECT COUNT(*) FROM commands WHERE status='running'").fetchone()[0] < cap
+            room = not cap or con.execute("SELECT COUNT(*) FROM commands WHERE sync=0 AND status='running'").fetchone()[0] < cap
             if (mine and room and free >= need) or now() - t0 > 3600:
                 con.execute("UPDATE commands SET status='running', started_at=?, queued_s=?, boot_id=? "
                             "WHERE box_id=? AND pid=?", (now(), now() - t0, boot_id(), box_id, pid))
                 return now() - t0
         if not said:
             try:
-                position = con.execute("SELECT COUNT(*) FROM commands WHERE status='queued' AND created_at <= (SELECT created_at FROM commands WHERE box_id=? AND pid=?)", (box_id, pid)).fetchone()[0]
+                position = con.execute("SELECT COUNT(*) FROM commands WHERE sync=0 AND status='queued' AND created_at <= (SELECT created_at FROM commands WHERE box_id=? AND pid=?)", (box_id, pid)).fetchone()[0]
             except Exception:
                 position = None
             toollog.emit("boatd", "run.queue", ids={"box": box_id}, props={"backend": "home", "queued": True,
@@ -1137,7 +1147,13 @@ def run_cmd(box_id: str, pid: int) -> int:
     d = cmd_dir(box_id)
     outf = open(d / f"{pid}.out", "ab", buffering=0)
     errf = open(d / f"{pid}.err", "ab", buffering=0)
-    queued = admit(con, box_id, pid, r["kind"], errf)
+    if r["sync"]:
+        # Control commands must remain available while detached runs wait for host capacity.
+        queued = 0
+        con.execute("UPDATE commands SET status='running', started_at=?, queued_s=0, boot_id=? "
+                    "WHERE box_id=? AND pid=?", (now(), boot_id(), box_id, pid))
+    else:
+        queued = admit(con, box_id, pid, r["kind"], errf)
     code, sig = None, None
     t0 = now()
     host_boxes = {"start": running_box_count(con), "end": None}
@@ -1603,8 +1619,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
-    def _err(self, status: int, code: str, message: str) -> None:
-        self._send(status, {"ok": False, "code": code, "message": message,
+    def _err(self, status: int, code: str, message: str, details: dict | None = None) -> None:
+        self._send(status, {**(details or {}), "ok": False, "code": code, "message": message,
                             "error": {"code": code, "message": message}})
 
     def _body(self) -> dict:
@@ -1651,7 +1667,7 @@ class Handler(BaseHTTPRequestHandler):
             if out is not None:
                 self._send(200, out)
         except Fail as e:
-            self._err(e.status, e.code, e.message)
+            self._err(e.status, e.code, e.message, e.details)
         except Exception as e:  # noqa: BLE001
             log(f"{method} {path}: {traceback.format_exc()[-1200:]}")
             self._err(500, "internal", str(e)[:300])
@@ -1846,10 +1862,17 @@ class Handler(BaseHTTPRequestHandler):
             while now() < end:
                 st = cmd_status_json(con, bid, r["processId"], 1 << 20)
                 if not st["running"]:
+                    self._log_sync(bid, st)
                     return st
                 time.sleep(0.3)
+            st = cmd_status_json(con, bid, r["processId"], 1 << 20)
+            if not st["running"]:
+                self._log_sync(bid, st)
+                return st
             kill_cmd(con, bid, r["processId"])
-            raise Fail(408, "command_timeout", f"command {r['processId']} timed out")
+            st = cmd_status_json(con, bid, r["processId"], 1 << 20)
+            self._log_sync(bid, st, timed_out=True)
+            raise Fail(408, "command_timeout", f"command {r['processId']} timed out", st)
         if not rest:
             raise Fail(405, "method_not_allowed", method)
         pid = int(rest[0])
@@ -1863,6 +1886,13 @@ class Handler(BaseHTTPRequestHandler):
             self._stream(con, bid, pid, int(q.get("stdoutOffset") or 0), int(q.get("stderrOffset") or 0))
             return None
         raise Fail(404, "not_found", "/".join(rest))
+
+    def _log_sync(self, bid: str, st: dict, timed_out: bool = False) -> None:
+        ok = not timed_out and st["exitCode"] == 0
+        toollog.emit("boatd", "exec.sync", kind="event" if ok else "error", ok=ok,
+                     tag="command_timeout" if timed_out else None,
+                     ids={"box": bid}, props={"pid": st["processId"], "queueMs": st["queuedMs"],
+                     "runMs": st["runMs"], "killed": st["killed"], "timeoutSeconds": st["timeoutSeconds"]})
 
     def _stream(self, con, bid: str, pid: int, out_off: int, err_off: int) -> None:
         cmd_row(con, bid, pid)
