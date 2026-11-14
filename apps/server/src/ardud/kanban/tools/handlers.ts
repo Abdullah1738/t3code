@@ -596,10 +596,27 @@ const handlers = {
               Effect.catchTags({ KanbanError: () => Effect.succeed(null) }),
             )
           : null;
+        const dependencyBoard =
+          dependency !== null && dependency.boardId !== card.boardId
+            ? ((yield* service.boards).find((board) => board.id === dependency.boardId)?.name ??
+              dependency.boardId)
+            : undefined;
+        const waitTargets =
+          dependency === null
+            ? undefined
+            : new Map([
+                [
+                  dependency.id as string,
+                  {
+                    ...dependency,
+                    ...(dependencyBoard === undefined ? {} : { boardName: dependencyBoard }),
+                  },
+                ],
+              ]);
         const waitMessage =
           card.wait !== undefined &&
           (moved.stage !== card.stage || moved.movedAt !== card.movedAt || moved.wait === undefined)
-            ? `Wait ${waitingFor(card.wait, dependency === null ? undefined : new Map([[dependency.id as string, dependency]]))} ${
+            ? `Wait ${waitingFor(card.wait, waitTargets)} ${
                 moved.wait === undefined
                   ? "cleared by this move; set it again with card_wait or pass keepWait"
                   : "kept"

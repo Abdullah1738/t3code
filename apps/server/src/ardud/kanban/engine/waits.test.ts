@@ -43,6 +43,7 @@ import {
   waitSkipsNudge,
   waitSlotProblem,
   waitTarget,
+  waitingFor,
   withLandedLinks,
   type WaitAnswer,
   type WaitChecker,
@@ -322,6 +323,34 @@ describe("the board's own checks, through the check contract", () => {
       to: "evaluator",
     });
   });
+
+  it.each([
+    ["working", null, [], false],
+    ["completed", null, [subtask("evaluator", "merge into main")], false],
+    ["completed", null, [], true],
+    ["deployed", null, [], true],
+    ["verified", null, [], true],
+    ["todo", AT, [], true],
+  ] as const)(
+    "cross-board card in %s preserves done semantics",
+    (stage, settledAt, subtasks, done) => {
+      const waiting = card(1, { wait: wait({ on: "card", card: "card-2" as never, pr: null }) });
+      const target = {
+        ...card(2, {
+          boardId: "board-foreign" as never,
+          stage,
+          settledAt: settledAt as never,
+          subtasks,
+        }),
+        boardName: "Foreign",
+      };
+      const known = facts({ cards: new Map([[target.id, target]]) });
+      expect(answer(waiting, known)).toEqual(
+        done ? { result: "wake", note: "Card #2 (Foreign) is done" } : hold,
+      );
+      expect(waitingFor(waiting.wait!, known.cards)).toBe("for card #2 (Foreign)");
+    },
+  );
 
   it("card: the pass that sees the other card finish ends the wait and wakes the next actor", () => {
     const waiting = card(1, {
