@@ -27,6 +27,7 @@ class DependencyAdviceTests(unittest.TestCase):
         self.bin.mkdir()
         for tool in ('vp', 'bun', 'pnpm', 'npm', 'npx', 'python3', 'go'):
             self.tool(tool, 'echo REAL_FAILURE >&2; exit 2')
+        self.tool('corepack', 'tool=${1%%@*}; shift; exec "$tool" "$@"')
         self.tool('python3', 'echo "/usr/bin/python3: No module named pytest" >&2; exit 1')
         self.tool('node', 'echo v24.22.1; echo ERR_MODULE_NOT_FOUND >&2; exit 1')
         (self.root / 'scripts').mkdir()
@@ -208,7 +209,10 @@ class DependencyAdviceTests(unittest.TestCase):
         ]
         for cmd, steps, install in cases:
             with self.subTest(cmd=cmd, steps=steps):
-                self.assert_advice(*self.run_command(cmd, steps=steps), install=install)
+                result, hint = self.run_command(cmd, steps=steps)
+                self.assert_advice(result, hint, install=install)
+                if 'corepack' in cmd:
+                    self.assertIn('REAL_FAILURE', result.stderr)
 
     def test_zero_dependency_packages_get_neither_hint(self):
         fields = ('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies')
