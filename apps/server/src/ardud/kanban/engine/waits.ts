@@ -632,16 +632,17 @@ const reviewFinished = (card: Pick<KanbanCard, "reviewStep">, chainLength: numbe
 
 /**
  * Who acts next on a card in its stage: the worker in To-Do (unless the step
- * is the evaluator's or a script's), the reviewer for a card in or awaiting
+ * is the evaluator's or a script's and no findings are pending), the reviewer for a card in or awaiting
  * review whose chain hasn't passed, the evaluator for everything else.
  */
 export function nextActor(
-  card: Pick<KanbanCard, "stage" | "reviewStep" | "subtasks">,
+  card: Pick<KanbanCard, "stage" | "reviewStep" | "subtasks" | "reviewFindingsPending">,
   ctx: WaitContext,
 ): WaitRole {
   switch (card.stage) {
     case "todo":
     case "working":
+      if (card.reviewFindingsPending === true) return "work";
       return kanbanEvaluatorStep(card) || kanbanScriptStep(card) ? "evaluator" : "work";
     case "needs_review":
       return "review";

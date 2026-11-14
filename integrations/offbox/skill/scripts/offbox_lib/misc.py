@@ -1492,7 +1492,8 @@ def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) 
             do_pulls(r["box_id"], row, pulls, until=until)
         if until is not None and now() >= until:
             raise _wait_timeout(r)
-        code = settled_steps_code(r, code, log_path=log_path, locked=True, until=until)
+        code = settled_steps_code(r, code, log_path=log_path, locked=True, until=until,
+                                  report_start_failure=False)
         code = finish(r['run_id'], code, until=until, report=True, run=r)
         if dict(r).get('mode') == 'bg' and not _has_data(log_path):
             settled = _run_row(r['run_id'])

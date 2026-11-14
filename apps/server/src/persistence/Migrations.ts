@@ -203,10 +203,12 @@ const run = Migrator.make({});
 
 export interface RunMigrationsOptions {
   readonly toMigrationInclusive?: number | undefined;
+  readonly skipShellRunLookupPreparation?: boolean | undefined;
 }
 
 export const runMigrations = Effect.fn("runMigrations")(function* ({
   toMigrationInclusive,
+  skipShellRunLookupPreparation = false,
 }: RunMigrationsOptions = {}) {
   const includesV2 =
     toMigrationInclusive === undefined || toMigrationInclusive >= FIRST_V2_MIGRATION_ID;
@@ -214,7 +216,10 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
   if (includesV2) {
     yield* assertV2MigrationsCanRun(toMigrationInclusive);
   }
-  if (toMigrationInclusive === undefined || toMigrationInclusive >= 68) {
+  if (
+    !skipShellRunLookupPreparation &&
+    (toMigrationInclusive === undefined || toMigrationInclusive >= 68)
+  ) {
     yield* warmShellRunLookupPages();
   }
   const executedMigrations = [

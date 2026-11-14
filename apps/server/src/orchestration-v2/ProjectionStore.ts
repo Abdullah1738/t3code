@@ -1,3 +1,5 @@
+import * as Deferred from "effect/Deferred";
+import { ShellRunLookupMigration } from "../ardud/persistence/shellRunLookupMigration.ts";
 import * as IdSetQueries from "./IdSetQueries.ts";
 import * as ShellQueries from "./ShellQueries.ts";
 import { applyThreadPullRequestLinkUpdate } from "@t3tools/shared/threadPullRequests";
@@ -2199,6 +2201,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const speedups = yield* Switches;
+    const lookupMigration = yield* ShellRunLookupMigration;
     // ardud: the writer connection is synchronous on the main thread, so a scan there
     // freezes every request for as long as it runs. Sweeps only need committed data;
     // inside an open write transaction readOnly keeps using the writer.
@@ -6162,7 +6165,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           ),
         );
 
-    const selectShellThreadRows = (
+    const selectShellThreadRows = Effect.fn("ProjectionStore.selectShellThreadRows")(function* (
       threadId?: ThreadId,
       {
         location,
@@ -6177,8 +6180,16 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         threadIds,
       }: ShellSnapshotOptions = {},
       listCandidatesOnly = false,
-    ) =>
-      sql<ShellThreadRow>`
+    ) {
+      const lookupIndexesReady =
+        lookupMigration === undefined ||
+        ((yield* Deferred.isDone(lookupMigration)) &&
+          (yield* sql`SELECT 1 FROM sqlite_schema WHERE name = 'ardud_shell_activity_run_idx'`)
+            .length !== 0);
+      const activityRuns = lookupIndexesReady
+        ? sql`orchestration_v2_projection_runs r INDEXED BY ardud_shell_activity_run_idx`
+        : sql`orchestration_v2_projection_runs r`;
+      return yield* sql<ShellThreadRow>`
             -- Unpaged full snapshots revisit runs for every thread; one sequential
             -- read avoids thrashing the disk cache on the fragmented live database.
             -- A page (limit), a single thread or a filtered snapshot (the PR sync's
@@ -6241,7 +6252,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               active.status AS active_run_status,
               (
                 SELECT r.status
-                FROM ${location === "archive" || listCandidatesOnly ? sql`orchestration_v2_projection_runs r INDEXED BY ardud_shell_activity_run_idx` : sql`shell_runs r`}
+                FROM ${location === "archive" || listCandidatesOnly ? activityRuns : sql`shell_runs r`}
                 WHERE r.thread_id = t.thread_id
                   AND r.status IN ('preparing', 'starting', 'running', 'waiting')
                 ORDER BY r.ordinal DESC, r.run_id DESC
@@ -6254,7 +6265,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   json_extract(r.payload_json, '$.startedAt'),
                   r.requested_at
                 )
-                FROM ${location === "archive" || listCandidatesOnly ? sql`orchestration_v2_projection_runs r INDEXED BY ardud_shell_activity_run_idx` : sql`shell_runs r`}
+                FROM ${location === "archive" || listCandidatesOnly ? activityRuns : sql`shell_runs r`}
                 WHERE r.thread_id = t.thread_id
                   AND r.status IN ('preparing', 'starting', 'running', 'waiting')
                 ORDER BY r.ordinal DESC, r.run_id DESC
@@ -6300,7 +6311,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               (
                 SELECT secret.payload_json
                 -- Keep runs outermost so completed history is never scanned for a pending secret.
-                FROM ${location === "archive" || listCandidatesOnly ? sql`orchestration_v2_projection_runs r INDEXED BY ardud_shell_activity_run_idx` : sql`shell_runs r`}
+                FROM ${location === "archive" || listCandidatesOnly ? activityRuns : sql`shell_runs r`}
                 CROSS JOIN orchestration_v2_projection_turn_items secret
                   INDEXED BY orchestration_v2_projection_turn_items_thread_run_idx
                 WHERE r.thread_id = t.thread_id
@@ -6363,7 +6374,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               } AS runless_item_count
             FROM orchestration_v2_projection_threads t${
               // Walk the recency index and stop at the limit; a sort would build every row.
-              listCandidatesOnly
+              listCandidatesOnly && lookupIndexesReady
                 ? sql` INDEXED BY ardud_shell_project_threads_idx`
                 : recentFirst && limit !== undefined
                   ? sql` INDEXED BY ardud_v2_threads_updated_idx`
@@ -6443,6 +6454,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   : sql`ORDER BY t.thread_id ASC LIMIT ${limit}`
             }
           `;
+    });
 
     const runMapsByThreadId = (input: {
       readonly runRows: ReadonlyArray<ShellRunRow>;

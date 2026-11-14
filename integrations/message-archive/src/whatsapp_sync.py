@@ -8,6 +8,7 @@ import time
 
 import common
 import store
+import timing
 from imessage_sync import Names
 
 QUERY = """
@@ -42,6 +43,7 @@ def _phone_name(jid, names):
     return None
 
 
+@timing.timed("parse")
 def _item(row, contacts, names):
     (rid, chat, chat_name, msg_id, sender_jid, sender_name, ts, from_me, text, display, media, caption,
      filename, revoked, deleted_at, edited_ts, emoji, reaction_to, kind) = row
@@ -64,7 +66,7 @@ def _item(row, contacts, names):
 
 def sync(db, stop=None, full=False):
     stats = {"added": 0, "updated": 0, "same": 0, "deleted": 0}
-    src = sqlite3.connect(f"file:{common.WACLI_DB}?mode=ro", uri=True, timeout=30)
+    src = sqlite3.connect(f"file:{common.WACLI_DB}?mode=ro", uri=True, timeout=30, factory=timing.SourceConnection)
     contacts = _contacts(src)
     names = Names()
     st = store.get_state(db, "whatsapp", {})

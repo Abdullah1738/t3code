@@ -111,10 +111,12 @@ const validSession = (value: unknown): value is string => string(value, 200) && 
 
 /** Shared card validation for session sends and owner-authorized cross-chat sends. */
 export function appContent(body: Record<string, unknown>): OutboxApp | undefined {
-  const { url, caption, subcaption, trailingCaption, trailingSubcaption, summary } = body;
+  const { url, caption, subcaption, trailingCaption, trailingSubcaption, summary, updateOf, previewPage } = body;
   if (!validAppUrl(url) || !line(caption, 200) || !optionalLine(subcaption, 200) || !optionalLine(trailingCaption, 200)
-    || !optionalLine(trailingSubcaption, 200) || !optionalLine(summary, 500)) return;
-  const optional = { subcaption, trailingCaption, trailingSubcaption, summary } as Record<string, string | undefined>;
+    || !optionalLine(trailingSubcaption, 200) || !optionalLine(summary, 500)
+    || (updateOf !== undefined && (typeof updateOf !== "string" || !/^app:[a-f0-9]{64}$/.test(updateOf)))
+    || (previewPage !== undefined && (!validAppUrl(previewPage) || new URL(previewPage).origin !== new URL(url).origin))) return;
+  const optional = { subcaption, trailingCaption, trailingSubcaption, summary, updateOf, previewPage } as Record<string, string | undefined>;
   return { url, caption, ...Object.fromEntries(Object.entries(optional).filter(([, value]) => value !== undefined)) };
 }
 
@@ -390,7 +392,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
       }
 
       if (path === "/app") {
-        fields(body, ["url", "caption", "subcaption", "trailingCaption", "trailingSubcaption", "summary", "dedupeKey", "sessionId"]);
+        fields(body, ["url", "caption", "subcaption", "trailingCaption", "trailingSubcaption", "summary", "updateOf", "previewPage", "dedupeKey", "sessionId"]);
         const { dedupeKey, sessionId } = body;
         const app = appContent(body);
         if (!app || !string(dedupeKey, 200) || !validSession(sessionId)) throw new ApiError(400);

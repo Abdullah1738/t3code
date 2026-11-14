@@ -1088,6 +1088,24 @@ describe("what a waiting card means for the engine", () => {
 });
 
 describe("nextActor", () => {
+  it.each(["todo", "working"] as const)(
+    "pending findings on an evaluator or script step belong to the worker in %s",
+    (stage) => {
+      for (const subtasks of [
+        [subtask("evaluator")],
+        [subtask("evaluator"), subtask("script")],
+        [subtask("script")],
+      ]) {
+        expect(nextActor(card(1, { stage, subtasks, reviewFindingsPending: true }), ctx)).toBe(
+          "work",
+        );
+        expect(nextActor(card(1, { stage, subtasks, reviewFindingsPending: false }), ctx)).toBe(
+          "evaluator",
+        );
+      }
+    },
+  );
+
   it("names who acts next in each stage", () => {
     expect(nextActor(card(1, { stage: "todo" }), ctx)).toBe("work");
     expect(nextActor(card(1, { stage: "todo", subtasks: [subtask("evaluator")] }), ctx)).toBe(

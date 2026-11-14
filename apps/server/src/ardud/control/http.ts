@@ -55,6 +55,8 @@ import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerConfig from "../../config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "./ControlStore.ts";
+import * as ControlRequestAnalytics from "./ControlRequestAnalytics.ts";
+import * as ControlThreadRead from "./ControlThreadRead.ts";
 import * as Usage from "./usage.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
 import * as RecoverySnapshot from "../recovery/RecoverySnapshot.ts";
@@ -73,11 +75,8 @@ import {
   modelSelectionFrom,
   parseSince,
   pendingRequestSummary,
-  runSummary,
-  runsNewestFirst,
   selectionMigrationApplies,
   selectionProblem,
-  shellSummary,
   stateFromRuns,
   stateFromShell,
   TERMINAL_RUN_STATUSES,
@@ -226,7 +225,6 @@ const chunkIds = (ids: ReadonlyArray<string>, size = 400): Array<ReadonlyArray<s
   return out;
 };
 
-const THREAD_DETAIL_RECENT_RUNS = 5;
 const READER_BUSY_MESSAGE = "The database reader is busy; retry shortly.";
 
 const errorResponse = (error: ControlError) => {
@@ -520,8 +518,10 @@ const makeRoutes = Effect.gen(function* () {
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
   const store = yield* ControlStore.ControlStore;
+  const threadRead = yield* ControlThreadRead.ControlThreadRead;
   const usage = yield* Usage.Usage;
   const identities = yield* ExecutionIdentity.ExecutionIdentity;
+  const observeControl = yield* ControlRequestAnalytics.make;
   const recovery = yield* RecoverySnapshot.RecoverySnapshot;
   const crypto = yield* Crypto.Crypto;
   const eventStore = yield* OrchestrationEventStore.OrchestrationEventStore;
@@ -693,56 +693,10 @@ const makeRoutes = Effect.gen(function* () {
     });
   });
 
-  const summarize = Effect.fn("ControlHttp.summarize")(function* (
-    shells: ReadonlyArray<OrchestrationV2ThreadShell>,
-  ) {
-    const ids = shells.map((shell) => shell.id);
-    const [origins, natives, bindings] = yield* Effect.all([
-      store.getOrigins(ids),
-      store.nativeSessionIds(ids),
-      store.nativeBindings(ids),
-    ]).pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-    // Children inherit the root's origin.
-    const rootIds = shells
-      .map((shell) => shell.lineage.rootThreadId)
-      .filter((rootId) => !origins.has(rootId));
-    const rootOrigins =
-      rootIds.length === 0
-        ? new Map<string, string>()
-        : yield* store
-            .getOrigins(rootIds)
-            .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-    return shells.map((shell) => ({
-      ...shellSummary(shell, {
-        origin:
-          origins.get(shell.id) ??
-          origins.get(shell.lineage.rootThreadId) ??
-          rootOrigins.get(shell.lineage.rootThreadId) ??
-          null,
-        nativeSessionId: natives.get(shell.id) ?? null,
-      }),
-      native: bindings.get(shell.id) ?? null,
-    }));
-  });
-
-  const threadDetail = Effect.fn("ControlHttp.threadDetail")(function* (threadId: string) {
-    const shell = yield* getShell(threadId);
-    // ardud: the detail reports the current run and the newest five. Reading every
-    // run the thread ever had made this the slowest call on the iMessage reply path
-    // (p50 14.4 s on 11 Nov 2026, most aborted by the bridge's 15 s timeout).
-    const records = yield* readRecords(threadId, { recentRunLimit: THREAD_DETAIL_RECENT_RUNS });
-    const pending = records.runtimeRequests.filter((request) => request.status === "pending");
-    const { state, run } = stateFromRuns(records.runs, pending.length > 0);
-    const [summary] = yield* summarize([shell]);
-    return {
-      ...summary!,
-      state,
-      status: run?.status ?? "idle",
-      run: run === null ? null : runSummary(run),
-      recentRuns: runsNewestFirst(records.runs).slice(0, THREAD_DETAIL_RECENT_RUNS).map(runSummary),
-      pendingRequests: pending.map((request) => pendingRequestSummary(request, records.turnItems)),
-    };
-  });
+  const summarize = (shells: ReadonlyArray<OrchestrationV2ThreadShell>) =>
+    threadRead.summarize(shells).pipe(Effect.mapError((error) => fail(error.code, error.message)));
+  const threadDetail = (threadId: string) =>
+    threadRead.detail(threadId).pipe(Effect.mapError((error) => fail(error.code, error.message)));
 
   const listUsage = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
@@ -1207,14 +1161,18 @@ const makeRoutes = Effect.gen(function* () {
   const byNative = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const nativeId = yield* param("sessionId");
-    const driver = (yield* searchParams).get("driver") ?? undefined;
-    const threadId = yield* store
-      .threadIdForNativeSession(nativeId, driver)
-      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-    if (threadId === null) {
-      return yield* fail("not_found", `No thread maps to session ${nativeId}.`);
+    const params = yield* searchParams;
+    const view = params.get("view");
+    if (view !== null && view !== "owner") {
+      return yield* fail("invalid_request", "view must be owner when provided.");
     }
-    return json({ ok: true, nativeSessionId: nativeId, thread: yield* threadDetail(threadId) });
+    const thread = yield* threadRead
+      .byNative(nativeId, {
+        ...(params.has("driver") ? { driver: params.get("driver")! } : {}),
+        ...(view === "owner" ? { view } : {}),
+      })
+      .pipe(Effect.mapError((error) => fail(error.code, error.message)));
+    return json({ ok: true, nativeSessionId: nativeId, thread });
   });
 
   // Any native id a hook or tool sees, resolved to its Robob execution.
@@ -1253,48 +1211,38 @@ const makeRoutes = Effect.gen(function* () {
     const params = yield* searchParams;
     // Bridge polls read one thread: they queue on the poll lane only, never
     // behind thread lists, HTTP snapshots or MCP reads.
-    const { records, detail } = yield* ReplyBuilders.bounded(
+    const page = yield* ReplyBuilders.bounded(
       Effect.gen(function* () {
         yield* getShell(threadId);
-        const records = yield* readMessages(threadId);
-        const detail = yield* readRecords(threadId);
-        return { records, detail };
+        // Imported transcripts hydrate through thread management before SQL paging.
+        yield* threads
+          .getThreadRecords(ThreadId.make(threadId), [])
+          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+        return yield* store
+          .messagePage({
+            threadId,
+            role: params.get("role"),
+            runId: params.get("runId"),
+            since: parseSince(params.get("since")),
+            afterMessageId: params.get("afterMessageId"),
+            limit:
+              boolParam(params.get("all")) === true
+                ? null
+                : clampInt(params.get("limit"), DEFAULT_MESSAGE_LIMIT, 1000),
+          })
+          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
       }),
       "poll",
     );
-    const role = params.get("role");
-    const runId = params.get("runId");
-    const since = parseSince(params.get("since"));
-    const after = params.get("afterMessageId");
-    const ordered = records.messages.toSorted(
-      (left, right) =>
-        DateTime.toEpochMillis(left.createdAt) - DateTime.toEpochMillis(right.createdAt) ||
-        left.id.localeCompare(right.id),
-    );
-    const afterIndex = after === null ? -1 : ordered.findIndex((message) => message.id === after);
-    const filtered = ordered
-      .slice(afterIndex + 1)
-      .filter(
-        (message) =>
-          message.role !== "system" &&
-          (role === null || role === "all" || message.role === role) &&
-          (runId === null || message.runId === runId) &&
-          (since === undefined || DateTime.toEpochMillis(message.updatedAt) > since),
-      );
-    const limit = clampInt(params.get("limit"), DEFAULT_MESSAGE_LIMIT, 1000);
-    const page = boolParam(params.get("all")) === true ? filtered : filtered.slice(-limit);
-    const last = lastAssistantText(records.messages, runId);
-    const pending = detail.runtimeRequests.some((request) => request.status === "pending");
-    const { state, run } = stateFromRuns(detail.runs, pending);
     return yield* encoded({
       ok: true,
       threadId,
-      state,
-      status: run?.status ?? "idle",
-      runId: run?.id ?? null,
-      total: filtered.length,
-      messages: page.map(messageSummary),
-      lastAssistant: last,
+      state: page.state,
+      status: page.status,
+      runId: page.runId,
+      total: page.total,
+      messages: page.messages.map(messageSummary),
+      lastAssistant: page.lastAssistant,
     });
   });
 
@@ -1359,6 +1307,7 @@ const makeRoutes = Effect.gen(function* () {
     const session = yield* authenticate(AuthOrchestrationOperateScope);
     const threadId = yield* param("threadId");
     const body = yield* decodeBody(decodeSendBody);
+    yield* ControlRequestAnalytics.sendMode(body.mode ?? "auto");
     const shell = yield* getShell(threadId);
     const commandId = yield* commandIdFor(`send:${threadId}`, body.clientRequestId);
     // ardud: channel guidance is framed as the bridge's, so only it may send some.
@@ -1913,22 +1862,42 @@ const makeRoutes = Effect.gen(function* () {
         }),
       ),
     ),
-    HttpRouter.route("GET", `${p}/requests`, handle(listRequests())),
+    HttpRouter.route(
+      "GET",
+      `${p}/requests`,
+      observeControl("control.requests", handle(listRequests())),
+    ),
     HttpRouter.route("GET", `${p}/projects`, handle(listProjects)),
     HttpRouter.route("GET", `${p}/models`, handle(listModels)),
     HttpRouter.route("GET", `${p}/usage`, handle(listUsage)),
     HttpRouter.route("GET", `${p}/threads`, handle(listThreads)),
     HttpRouter.route("POST", `${p}/threads`, handle(createThread)),
     HttpRouter.route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),
-    HttpRouter.route("GET", `${p}/identity/resolve`, handle(identityResolve)),
+    HttpRouter.route(
+      "GET",
+      `${p}/identity/resolve`,
+      observeControl("control.identity.resolve", handle(identityResolve)),
+    ),
     HttpRouter.route("GET", `${p}/recovery/snapshot`, handle(recoverySnapshot)),
-    HttpRouter.route("GET", `${p}/threads/:threadId`, handle(getThread)),
+    HttpRouter.route(
+      "GET",
+      `${p}/threads/:threadId`,
+      observeControl("control.thread", handle(getThread)),
+    ),
     HttpRouter.route("PATCH", `${p}/threads/:threadId`, handle(patchThread)),
     HttpRouter.route("POST", `${p}/threads/:threadId/archive-if-idle`, handle(archiveThreadIfIdle)),
-    HttpRouter.route("GET", `${p}/threads/:threadId/messages`, handle(getMessages)),
+    HttpRouter.route(
+      "GET",
+      `${p}/threads/:threadId/messages`,
+      observeControl("control.messages", handle(getMessages)),
+    ),
     HttpRouter.route("GET", `${p}/threads/:threadId/runs/:runId/evidence`, handle(getRunEvidence)),
     HttpRouter.route("GET", `${p}/threads/:threadId/wait`, handle(wait)),
-    HttpRouter.route("POST", `${p}/threads/:threadId/send`, handle(send)),
+    HttpRouter.route(
+      "POST",
+      `${p}/threads/:threadId/send`,
+      observeControl("control.send", handle(send)),
+    ),
     HttpRouter.route("POST", `${p}/threads/:threadId/interrupt`, handle(interrupt)),
     HttpRouter.route("POST", `${p}/threads/:threadId/requests/:requestId/respond`, handle(respond)),
     HttpRouter.route("PUT", `${p}/threads/:threadId/origin`, handle(putOrigin)),
@@ -1944,6 +1913,7 @@ export const controlRouteLayer = HttpRouter.addAll(makeRoutes).pipe(
   Layer.provide(
     Layer.mergeAll(
       controlServices,
+      ControlThreadRead.layer.pipe(Layer.provide(controlServices)),
       Usage.layer,
       RecoverySnapshot.layer.pipe(Layer.provide(controlServices)),
     ),

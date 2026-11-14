@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export const HOME = homedir();
 export const ROOT = process.env.ROBOB_WATCH_ROOT ?? join(HOME, ".local/share/robob-watch");
@@ -17,11 +17,20 @@ export const WA_LOCK = join(ROOT, "wa.lock");
 /** wacli's store (kept live by `wacli sync --follow`); its WAL grows/changes whenever a message is stored. */
 export const WACLI_STORE = process.env.WACLI_STORE_DIR ?? join(homedir(), ".wacli");
 export const WA_TRIGGERS = [join(WACLI_STORE, "wacli.db-wal"), join(WACLI_STORE, "wacli.db")];
-export const BUN = join(HOME, ".bun/bin/bun");
+function resolveBun(): string {
+  if (process.env.ROBOB_WATCH_BUN) return process.env.ROBOB_WATCH_BUN;
+  const installed = join(HOME, ".bun/bin/bun");
+  if (existsSync(installed)) return installed;
+  if (process.versions.bun) return process.execPath;
+  const found = Bun.which("bun");
+  if (found) return found;
+  throw new Error("Could not locate Bun; set ROBOB_WATCH_BUN to its executable path");
+}
+export const BUN = resolveBun();
 export const SPECTRUM_CLI = process.env.ROBOB_WATCH_SPECTRUM_CLI ?? join(HOME, ".local/share/spectrum-bridge/src/cli.ts");
 export const TELEGRAM_CLI = process.env.ROBOB_WATCH_TELEGRAM_CLI ?? join(HOME, ".local/share/telegram-bridge/src/cli.ts");
 export const BRIDGE_DB = process.env.ROBOB_WATCH_BRIDGE_DB ?? join(HOME, ".config/spectrum-bridge/state.sqlite");
-export const PATH = [HELPERS, join(HOME, ".local/bin"), join(HOME, ".bun/bin"), "/opt/homebrew/bin", "/usr/local/bin",
+export const PATH = [HELPERS, join(HOME, ".local/bin"), dirname(BUN), "/opt/homebrew/bin", "/usr/local/bin",
   "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":");
 
 export const MIN_INTERVAL = 5;
@@ -162,9 +171,9 @@ export type TrackedWake = { inbound: string; key: string; event: string; deliver
 
 export const PERSON_BATCH_MS = 150_000;
 export const REMOVAL_GRACE_MS = 15 * 60_000;
-// The bridge is the only wake destination on this version; notify keeps its direct-send timing.
 export const personChat = (watcher: Watcher) => watcher.mode === "wake";
-export const sameDestination = (a: Watcher, b: Watcher) => a.mode === b.mode && a.chat === b.chat;
+export const sameDestination = (a: Watcher, b: Watcher) => a.mode === b.mode && a.chat === b.chat
+  && (a.mode !== "wake" || !!a.chat || a.created_by_session === b.created_by_session);
 export const checking = (state: State) => state.status === "active" || (state.status === "closing" && !!state.closing_watcher);
 export function pollingWatcher(watcher: Watcher, state: State) {
   const admitted = state.reply_handoff?.watcher ?? (state.status === "closing" ? state.closing_watcher
@@ -590,13 +599,13 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
   });
 }
 
-async function run(args: string[], timeoutMs = 20_000): Promise<{ ok: boolean; out: string }> {
+async function run(args: string[], timeoutMs = 20_000, maxOutput = 500): Promise<{ ok: boolean; out: string }> {
   const started = now();
   try {
     const child = Bun.spawn(args, { env: { HOME, PATH, ...testEnv() }, stdout: "pipe", stderr: "pipe", timeout: timeoutMs, killSignal: "SIGKILL" });
     const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
     toolLog({ component: "helpers", kind: code === 0 ? "perf" : "error", name: "helper.run", durationMs: now() - started, ok: code === 0, ids: { helper: args[1]?.endsWith(".ts") ? args[1]!.split("/").at(-2) : args[0]?.split("/").at(-1) }, props: { exitCode: code, ...(code === 0 ? {} : stderrCause(stderr)) }, ...(code === 0 ? {} : { error: { tag: "helper.exit_failed" } }) });
-    return { ok: code === 0, out: `${stdout}${stderr}`.trim().slice(0, 500) };
+    return { ok: code === 0, out: `${stdout}${stderr}`.trim().slice(0, maxOutput) };
   } catch (error) {
     toolLog({ component: "helpers", kind: "error", name: "helper.run", durationMs: now() - started, ok: false, props: stderrCause(error instanceof Error ? error.message : ""), error: { tag: "helper.spawn_failed" } });
     throw error;
@@ -643,6 +652,58 @@ export function underTest(): boolean {
 const refused = (what: string) => ({ ok: false, out: `refused: test run; ${what} would reach a real app` });
 const spectrumCli = () => process.env.ROBOB_WATCH_SPECTRUM_CLI ?? join(HOME, ".local/share/spectrum-bridge/src/cli.ts");
 const telegramCli = () => process.env.ROBOB_WATCH_TELEGRAM_CLI ?? join(HOME, ".local/share/telegram-bridge/src/cli.ts");
+const t3ctlCli = () => process.env.ROBOB_WATCH_T3CTL ?? join(HOME, ".local/bin/t3ctl");
+
+type CreatorRoute = { kind: "owner" } | { kind: "thread"; thread: string }
+  | { kind: "unreachable"; thread: string; reason: string } | { kind: "refused"; reason: string };
+const creatorRoutes = new Map<string, { session: string; cli: string; until: number; route: Promise<CreatorRoute> }>();
+const CREATOR_CACHE_MS = 3 * 60_000;
+const shortThread = (id: string) => id.split(":").at(-1)!.slice(0, 8);
+
+async function creatorRoute(session: string, cli: string): Promise<CreatorRoute> {
+  let thread = session;
+  if (session.startsWith("ses_")) {
+    try {
+      const result = await run([cli, "native", session], 10_000, 100_000);
+      const value: unknown = result.ok ? JSON.parse(result.out) : undefined;
+      if (!jsonObject(value) || !jsonObject(value.thread) || typeof value.thread.threadId !== "string" || !value.thread.threadId) return { kind: "owner" };
+      thread = value.thread.threadId;
+    } catch { return { kind: "owner" }; }
+  }
+  try {
+    if (thread === await liveSession()) return { kind: "owner" };
+    // Thread status includes recent runs and can be much larger than a delivery receipt.
+    const result = await run([cli, "status", thread], 10_000, 100_000);
+    if (!result.ok) return { kind: "unreachable", thread, reason: `status: ${result.out}` };
+    const value: unknown = JSON.parse(result.out);
+    if (!jsonObject(value) || !jsonObject(value.thread) || value.thread.threadId !== thread
+      || typeof value.thread.archived !== "boolean") return { kind: "unreachable", thread, reason: "invalid thread status" };
+    const status = value.thread;
+    const project = typeof status.projectId === "string" ? status.projectId : "";
+    if (status.origin === "imessage" || /(?:^|[/:])imessage\/?$/i.test(project)) return { kind: "owner" };
+    return status.archived ? { kind: "unreachable", thread, reason: "thread is archived" } : { kind: "thread", thread };
+  } catch (error) {
+    return { kind: "unreachable", thread, reason: `status: ${String(error).slice(0, 500)}` };
+  }
+}
+
+function resolveCreator(watcher: Watcher, cli: string): Promise<CreatorRoute> {
+  const session = watcher.created_by_session?.trim();
+  if (!session) return Promise.resolve({ kind: "owner" });
+  if (underTest() && !process.env.ROBOB_WATCH_T3CTL) return Promise.resolve({ kind: "refused", reason: refused("t3ctl").out });
+  const at = now();
+  for (const [id, entry] of creatorRoutes) if (entry.until <= at) creatorRoutes.delete(id);
+  const cached = creatorRoutes.get(watcher.id);
+  if (cached?.session === session && cached.cli === cli) return cached.route;
+  const route = creatorRoute(session, cli);
+  creatorRoutes.set(watcher.id, { session, cli, until: at + CREATOR_CACHE_MS, route });
+  return route;
+}
+
+function wakeThread(cli: string, thread: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
+  if (underTest() && !process.env.ROBOB_WATCH_T3CTL) return Promise.resolve(refused("t3ctl send"));
+  return run([cli, "send", thread, clip(text, MAX_WAKE), "--request-id", key, "--mode", "queue"], 20_000);
+}
 
 export function wake(source: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return Promise.resolve(refused("wake"));
@@ -679,7 +740,7 @@ export function telegram(source: string, text: string, key: string, severity = "
  * so a check that runs a helper (wa, mailsend, the bridge CLIs) hits the same guard the test set up. */
 const TEST_ENV_KEYS = ["ROBOB_TEST", "NODE_ENV", "PYTEST_CURRENT_TEST", "WA_WACLI", "WA_DRAFT_DIR", "MAILSEND_HIMALAYA",
   "MAILSEND_DRAFT_DIR", "MAILSEND_SEND_APPROVAL", "RIDE_CARD_BRIDGE", "CONVO_CARD_BRIDGE", "ROBOB_WATCH_SPECTRUM_CLI",
-  "ROBOB_WATCH_TELEGRAM_CLI", "WACLI_STORE_DIR", "SEND_APPROVAL_BRIDGE_DIR", "SEND_APPROVAL_STATE_DB",
+  "ROBOB_WATCH_TELEGRAM_CLI", "ROBOB_WATCH_T3CTL", "WACLI_STORE_DIR", "SEND_APPROVAL_BRIDGE_DIR", "SEND_APPROVAL_STATE_DB",
   "ROBOB_READONLY_DB", "MONEY_CASES_STATE_DB", "TOOLLOG_DIR", "HEALTH_TOOLLOG_DIR", "ROBOB_HOME", "T3CODE_HOME", "XDG_DATA_HOME"];
 export function testEnv(): Record<string, string> {
   const out: Record<string, string> = {};
@@ -878,7 +939,26 @@ export async function deliver(watcher: Watcher, event: string, key: string, stat
     return result.ok ? { ok: true, via: `wake:${watcher.chat}`, detail: result.out } : { ok: false, via: "none", detail: `wake --chat ${watcher.chat}: ${result.out}` };
   }
   if (watcher.mode === "wake") {
-    const result = await wake(`robob-watch ${watcher.id}`, wakeText(watcher, event, state, test), key);
+    // Capture the override before awaiting resolution, so a removed test stub cannot open the live path.
+    const cli = t3ctlCli();
+    const creator = await resolveCreator(watcher, cli);
+    if (creator.kind === "refused") return { ok: false, via: "none", detail: creator.reason };
+    let text = wakeText(watcher, event, state, test);
+    let missed: { thread: string; reason: string } | undefined;
+    if (creator.kind === "thread") {
+      const prefix = `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this thread.]`;
+      try {
+        const result = await wakeThread(cli, creator.thread, `${prefix}\n${text}`, key);
+        if (result.ok) return { ok: true, via: `thread:${shortThread(creator.thread)}`, detail: result.out };
+        missed = { thread: creator.thread, reason: `send: ${result.out}` };
+      } catch (error) { missed = { thread: creator.thread, reason: `send: ${String(error).slice(0, 500)}` }; }
+    } else if (creator.kind === "unreachable") missed = creator;
+    if (missed) {
+      text = `(meant for thread ${shortThread(missed.thread)}, which could not be reached)\n${text}`;
+      log(watcher.id, `creator wake fallback thread=${missed.thread} ${missed.reason}`);
+      tried.push(`thread:${shortThread(missed.thread)}: ${missed.reason}`);
+    }
+    const result = await wake(`robob-watch ${watcher.id}`, text, key);
     if (result.ok) return { ok: true, via: "wake", detail: result.out };
     tried.push(`wake: ${result.out}`);
   }

@@ -12,6 +12,8 @@ import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import { expect } from "vite-plus/test";
 
+import type { AnalyticsEvent } from "@t3tools/contracts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
 import * as ServerConfig from "../config.ts";
 import { makeProcessProbe, processProbeSource } from "../testUtils/processProbe.ts";
 import {
@@ -60,6 +62,7 @@ function makeFakeClaudeBinary(dir: string, lifecyclePort?: number) {
 function withFakeClaudeEnv<A, E, R>(
   input: {
     output: string;
+    environment?: NodeJS.ProcessEnv;
     lifecyclePort?: number;
     exitCode?: number;
     stderr?: string;
@@ -191,7 +194,7 @@ function withFakeClaudeEnv<A, E, R>(
     const config = decodeClaudeSettings(input.claudeConfig ?? {});
     const textGeneration = yield* makeClaudeTextGeneration(
       config,
-      undefined,
+      { ...process.env, ...input.environment },
       Effect.succeed(SYNTHETIC_CLAUDE_MODEL_CATALOG),
     );
     return yield* effectFn(textGeneration);
@@ -199,9 +202,130 @@ function withFakeClaudeEnv<A, E, R>(
 }
 
 it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
+  it.effect.each([
+    { key: "test-key", bare: true, investigate: false },
+    { key: undefined, bare: false, investigate: false },
+    { key: "   ", bare: false, investigate: false },
+    { key: "test-key", bare: false, investigate: true },
+  ])(
+    "isolates JSON cwd and preserves auth (bare=$bare, investigate=$investigate, key=$key)",
+    ({ key, bare, investigate }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "claude-json-proof-" });
+        const report = `${dir}/report.json`;
+        const events: AnalyticsEvent[] = [];
+        yield* withFakeClaudeEnv(
+          {
+            output: JSON.stringify({ structured_output: { answer: "ok" } }),
+            environment: { ANTHROPIC_API_KEY: key, T3_FAKE_CLAUDE_REPORT: report },
+          },
+          (generation) =>
+            generation.generateJson!({
+              cwd: dir,
+              prompt: "Return ok",
+              outputSchema: Schema.Struct({ answer: Schema.String }),
+              modelSelection: createModelSelection(
+                ProviderInstanceId.make("claudeAgent"),
+                SYNTHETIC_CLAUDE_STANDARD_MODEL,
+              ),
+              operationLabel: "writeGroups",
+              boardId: "board-robob",
+              ...(investigate ? { investigate: { timeoutMs: 180_000 } } : {}),
+            }),
+        ).pipe(
+          Effect.provideService(
+            Analytics.Analytics,
+            Analytics.Analytics.of({
+              record: (event) =>
+                Effect.sync(() => {
+                  events.push(event);
+                }),
+              flush: Effect.void,
+              ingest: () => Effect.void,
+              read: () => Effect.die("unused"),
+            }),
+          ),
+        );
+        const proof = JSON.parse(yield* fs.readFileString(report)) as {
+          cwd: string;
+          files: string[];
+          argv: string[];
+        };
+        expect(proof.argv.includes("--bare")).toBe(bare);
+        expect(proof.argv).toContain("--no-session-persistence");
+        expect(proof.argv).not.toContain("--setting-sources");
+        if (investigate) {
+          expect(proof.cwd).toBe(yield* fs.realPath(dir));
+          expect(yield* fs.exists(dir)).toBe(true);
+        } else {
+          expect(proof.cwd).not.toBe(dir);
+          expect(proof.files).toEqual([]);
+          expect(yield* fs.exists(proof.cwd)).toBe(false);
+        }
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({
+          kind: "text-generation.child",
+          boardId: "board-robob",
+          outcome: "ok",
+          props: {
+            provider: "claudeAgent",
+            operation: "generateJson:writeGroups",
+            count: 1,
+            exitCode: 0,
+          },
+        });
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("counts a failed child once and removes its cwd", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "claude-json-failure-" });
+      const report = `${dir}/report.json`;
+      const events: AnalyticsEvent[] = [];
+      yield* withFakeClaudeEnv(
+        { output: "", exitCode: 7, environment: { T3_FAKE_CLAUDE_REPORT: report } },
+        (generation) =>
+          generation.generateJson!({
+            cwd: dir,
+            prompt: "Fail",
+            outputSchema: Schema.Struct({ answer: Schema.String }),
+            operationLabel: "writeGoals",
+            boardId: "board-robob",
+            modelSelection: createModelSelection(
+              ProviderInstanceId.make("claudeAgent"),
+              SYNTHETIC_CLAUDE_STANDARD_MODEL,
+            ),
+          }).pipe(Effect.flip),
+      ).pipe(
+        Effect.provideService(
+          Analytics.Analytics,
+          Analytics.Analytics.of({
+            record: (event) =>
+              Effect.sync(() => {
+                events.push(event);
+              }),
+            flush: Effect.void,
+            ingest: () => Effect.void,
+            read: () => Effect.die("unused"),
+          }),
+        ),
+      );
+      const proof = JSON.parse(yield* fs.readFileString(report)) as { cwd: string };
+      expect(yield* fs.exists(proof.cwd)).toBe(false);
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        outcome: "error",
+        props: { operation: "generateJson:writeGoals", count: 1, exitCode: 7 },
+      });
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("kills a stalled CLI when the request times out", () =>
     Effect.gen(function* () {
       const probe = yield* makeProcessProbe;
+      const events: AnalyticsEvent[] = [];
       yield* withFakeClaudeEnv({ output: "", lifecyclePort: probe.port }, (textGeneration) =>
         Effect.gen(function* () {
           const fiber = yield* textGeneration
@@ -220,7 +344,26 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
           yield* probe.exited;
           expect((yield* Fiber.join(fiber)).detail).toBe("Claude CLI request timed out.");
         }),
+      ).pipe(
+        Effect.provideService(
+          Analytics.Analytics,
+          Analytics.Analytics.of({
+            record: (event) =>
+              Effect.sync(() => {
+                events.push(event);
+              }),
+            flush: Effect.void,
+            ingest: () => Effect.void,
+            read: () => Effect.die("unused"),
+          }),
+        ),
       );
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        kind: "text-generation.child",
+        outcome: "interrupted",
+        props: { operation: "generateThreadTitle", count: 1 },
+      });
     }),
   );
 

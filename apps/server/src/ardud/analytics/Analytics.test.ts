@@ -366,6 +366,62 @@ describe("Analytics", () => {
       assert.lengthOf((yield* analytics.read({ day: "2026-11-14" })).rollup.longTasksByRoute, 0);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
+  it.effect("groups legacy stored asks by the same response kind as answer events", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TABLE ardud_kanban_cards (id TEXT, board_id TEXT, json TEXT)`;
+      const variants = [
+        { kind: "draft", draft: { target: "private", format: "text", text: "private draft" } },
+        { kind: "approve", respond: { verdict: {} } },
+        { kind: "pick", options: [{ id: "o1", label: "private option" }] },
+        { kind: "action", respond: { task: { steps: [] } } },
+        { kind: "input" },
+        { kind: "notice", respond: { ack: true } },
+        { kind: "private label", options: [{ id: "o1", label: "private option" }] },
+        { timing: { kind: "approve" } },
+        {
+          timing: { firstSeen: { web: `${day}T02:00:00.000Z` } },
+          options: [{ id: "o1", label: "private option" }],
+        },
+        { kind: "private label", respond: { fields: [] } },
+        { options: "unreadable private options" },
+      ];
+      const asks = variants.map((fields, index) => ({
+        id: `q${index}`,
+        text: "private question",
+        at: `${day}T01:00:00.000Z`,
+        blocking: false,
+        closedAt: `${day}T03:00:00.000Z`,
+        answer: {
+          at: `${day}T03:00:00.000Z`,
+          by: { _tag: "owner" },
+          verdict: "approved",
+          text: "private answer",
+        },
+        ...fields,
+      }));
+      yield* sql`INSERT INTO ardud_kanban_cards VALUES ('card', 'board', ${JSON.stringify({ asks })})`;
+      const analytics = yield* open(setup, {}, setup.fs, {
+        sql,
+        ready: Effect.void,
+        path: ":memory:",
+      });
+      const result = yield* analytics.read({ day });
+      const split = result.rollup.askLatency;
+      assert.equal(split.createdToAnswered.count, 11);
+      assert.deepStrictEqual(
+        Object.fromEntries(
+          Object.entries(split.byKind).map(([kind, group]) => [
+            kind,
+            group.createdToAnswered.count,
+          ]),
+        ),
+        { draft: 1, approve: 2, pick: 3, action: 1, input: 2, notice: 1, unknown: 1 },
+      );
+      assert.isFalse(JSON.stringify(result).includes("private"));
+    }).pipe(Effect.provide(Layer.merge(NodeServices.layer, Sqlite.layerMemory))),
+  );
   it.effect(
     "reads the ask split by board/card while persisting the full day without text",
     () =>

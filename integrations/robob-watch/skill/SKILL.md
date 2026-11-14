@@ -5,7 +5,7 @@ description: Use whenever you'd watch/monitor/wait for something for the owner (
 
 # Robob watchers
 
-`robob-watch` runs small check commands on a schedule (default every 15s, or within ~1s of a trigger file changing) and, when one prints something, **wakes the agent**: the event arrives as a new turn in whichever iMessage session is live (it follows session rotation and `/new`), together with the context you saved when you set it up. The agent handles it and its reply goes to the owner as usual.
+`robob-watch` runs small check commands on a schedule (default every 15s, or within ~1s of a trigger file changing) and, when one prints something, **wakes the agent**: the event arrives as a new turn, together with the context you saved when you set it up, in the thread that set the watcher up (`--session`). Watchers set up from an iMessage chat go to whichever iMessage session is live (they follow session rotation and `/new`), and `--chat` keeps its chat. If the setting-up thread is gone or can't be reached, the event goes to the owner's live chat with a line naming the thread it was meant for. The woken agent handles it there; from the owner's chat its reply goes to him as usual.
 Person-chat wakes batch events oldest first for 150 seconds; a check can return JSON with `"urgent": true` for an immediate wake (prices or yes/no offers), while other events keep their batch.
 
 ## When to use

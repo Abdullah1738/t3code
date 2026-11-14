@@ -15,7 +15,7 @@ import time
 from jobs import (read_state, save_state, state_path, directory_inventory,
                   SourceFailure, source_error, stderr_line, permission_denied, deadline_call)
 from rollup import rollup
-from toollog import emit, private_dir
+from toollog import emit, private_dir, safe_fields
 
 REPORT_DIRS = [Path('/Library/Logs/DiagnosticReports'), Path('/Library/Logs/DiagnosticReports/Retired'),
                Path.home() / 'Library/Logs/DiagnosticReports']
@@ -394,11 +394,11 @@ def process_sample(pids, run, timeout):
     return samples
 
 
-def sample_disk_wait(candidates, run, deadline):
+def sample_disk_wait(candidates, run, deadline, sample_count=DISK_WAIT_SAMPLES):
     observations = {p['pid']: [] for p in candidates}
     count = 0
     starts = {}
-    for i in range(DISK_WAIT_SAMPLES):
+    for i in range(sample_count):
         if not observations:
             break
         remaining = deadline-time.monotonic()
@@ -427,6 +427,159 @@ def sample_disk_wait(candidates, run, deadline):
             if remaining > 0:
                 starts = process_starts(observations, run, min(10, remaining))
     return observations, count, starts
+
+
+def clone_wait_paths(proc):
+    # ps arguments are not shell input. A quote may be a literal filename
+    # character, so shell parsing must not suppress a known clone command.
+    args = proc['args'].split()
+    command = proc['comm'].rsplit('/', 1)[-1]
+    clone = command == 'clonefile'
+    operands = args[1:]
+    if command == 'cp':
+        for index, arg in enumerate(args[1:], 1):
+            if arg == '--':
+                operands = args[index+1:]
+                break
+            if not arg.startswith('-'):
+                operands = args[index:]
+                break
+            clone |= 'c' in arg[1:] and not arg.startswith('--')
+    paths = list(dict.fromkeys(operands if clone else (arg for arg in args[1:] if arg.startswith('/'))))
+    return clone, paths
+
+
+def exact_wait_paths(proc):
+    if any(char in proc['args'] for char in "'\"\\"):
+        return set()
+    args = proc['args'].split()
+    # A bare word after an absolute token may be part of an unquoted path.
+    # Omit that ambiguous operand rather than group unrelated files by prefix.
+    return {arg for index, arg in enumerate(args[1:], 1) if arg.startswith('/') and
+            (index == len(args)-1 or args[index+1].startswith(('/', '-')))}
+
+
+def clone_wait_alerts(procs, snapshot, starts, run, deadline):
+    root = state_path('clone-wait-alert').parent
+    with (root / 'clone-wait-alert.lock').open('a') as lock:
+        os.chmod(lock.name, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        alive = {str(p['pid']) for p in snapshot}
+        state = {pid: entry for pid, entry in read_state('clone-wait-alert').items() if pid in alive}
+        # Several waiters for one pathname are one incident. A clone PID is
+        # preferred as its identity when it also belongs to that group.
+        groups = {}
+        for proc in procs:
+            identity = ('path', proc['_incidentPath']) if proc['_incidentPath'] else ('pid', proc['pid'])
+            groups.setdefault(identity, []).append(proc)
+        for group in groups.values():
+            group.sort(key=lambda p: (p['reason'] != 'clone', p['pid']))
+            existing = [state[str(p['pid'])] for p in group
+                if state.get(str(p['pid']), {}).get('start') == starts[p['pid']]]
+            sent_entry = next((entry for entry in existing if entry.get('sent')), None)
+            if sent_entry:
+                for member in group:
+                    state[str(member['pid'])] = dict(sent_entry, start=starts[member['pid']])
+                save_state('clone-wait-alert', state)
+                continue
+            proc = group[0]
+            pid = str(proc['pid'])
+            entry = existing[0] if existing else None
+            if entry is None:
+                path = safe_fields(dict(procs=[proc]), 'disk.clone_wedge')['procs'][0]['path']
+                key = 'mac-upkeep:clone-wait:%s:%s' % (pid, starts[proc['pid']])
+                entry = dict(start=starts[proc['pid']], key=key, sent=False,
+                    text='APFS clone/path I/O wait: pid %s, %s. This may be progressing; compare CPU time and iostat, then collect spindump. Avoid more clones or pathname probes.' % (pid, path))
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                break
+            # Queueing can succeed before notify returns. Persist every
+            # survivor's retry identity before that interruption window.
+            for member in group:
+                state[str(member['pid'])] = dict(entry, start=starts[member['pid']], sent=False)
+            save_state('clone-wait-alert', state)
+            try:
+                sent = notify(entry['text'], entry['key'], run, timeout=min(20, remaining))
+            except Exception:
+                sent = False
+            emit('disk', 'event' if sent else 'error', 'disk.clone_wedge_alert', ok=sent,
+                 error_tag=None if sent else 'disk.notify_failed')
+            for member in group:
+                state[str(member['pid'])] = dict(entry, start=starts[member['pid']], sent=sent)
+            save_state('clone-wait-alert', state)
+
+
+def clone_wait(snapshot, run, deadline):
+    deadline = min(deadline, time.monotonic()+20)
+    props = dict(count=0, procs=[], sampleCount=0, sampling='full')
+    try:
+        selected, by_path = {}, {}
+        for proc in snapshot:
+            if 'U' not in proc['stat'] or proc['comm'] in ('umount', '/sbin/umount'):
+                continue
+            clone, paths = clone_wait_paths(proc)
+            exact = exact_wait_paths(proc)
+            selected[proc['pid']] = (proc, clone, paths, exact)
+            for path in paths:
+                if path in exact:
+                    by_path.setdefault(path, set()).add(proc['pid'])
+        shared = {path: pids for path, pids in by_path.items() if len(pids) >= 2}
+        candidates = [p for p, clone, paths, exact in selected.values()
+                      if clone or any(p['pid'] in shared.get(path, ()) for path in paths)]
+        if candidates:
+            observations, count, starts = sample_disk_wait(candidates, run, deadline, sample_count=3)
+            props.update(sampleCount=count, sampling='full' if count == 3 else 'partial')
+            if count != 3:
+                raise SourceFailure('timeout', 'incomplete clone observation')
+            # Revalidate identity after sampling rather than attributing a
+            # recycled PID's CPU or wait channel to its predecessor.
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                raise SourceFailure('timeout', 'clone observation budget exhausted')
+            ends = process_starts(observations, run, min(5, remaining)) if observations else {}
+            valid = {pid: rows for pid, rows in observations.items()
+                     if pid in starts and starts[pid] == ends.get(pid)}
+            waiting = {pid for pid, rows in valid.items() if all('U' in r['stat'] for r in rows)}
+            shared = {path: pids & waiting for path, pids in shared.items() if len(pids & waiting) >= 2}
+            procs = []
+            for proc in candidates:
+                pid = proc['pid']
+                if pid not in waiting:
+                    continue
+                _, clone, paths, exact = selected[pid]
+                matched = [path for path in paths if pid in shared.get(path, ())]
+                if not clone and not matched:
+                    continue
+                procs.append(dict(pid=pid, path=(matched[0] if matched else paths[-1] if paths else ''),
+                    _incidentPath=matched[0] if matched else paths[-1] if paths and paths[-1] in exact else None,
+                    reason='clone' if clone else 'shared_path', processAgeS=proc['processAgeS'],
+                    wchan='-', cpuDeltaS=max(0, valid[pid][-1]['cpu']-valid[pid][0]['cpu'])))
+            if procs:
+                remaining = deadline-time.monotonic()
+                if remaining <= 0:
+                    raise SourceFailure('timeout', 'clone observation budget exhausted')
+                channels = run(['/bin/ps', '-p', ','.join(str(p['pid']) for p in procs), '-o', 'pid=,wchan='],
+                               capture_output=True, text=True, timeout=min(5, remaining))
+                for line in channels.stdout.splitlines() if channels.returncode == 0 else []:
+                    fields = line.split()
+                    if len(fields) == 2:
+                        for proc in procs:
+                            if fields[0] == str(proc['pid']):
+                                proc['wchan'] = fields[1]
+            props.update(count=len(procs), procs=procs[:10])
+            props = safe_fields(props, 'disk.clone_wedge')
+            emit('disk', 'event', 'disk.clone_wedge', ok=True, props=props)
+            clone_wait_alerts(procs, snapshot, starts, run, deadline)
+            return
+    except Exception as exc:
+        props.update(failure='timeout' if isinstance(exc, subprocess.TimeoutExpired) else (
+            exc.failure if isinstance(exc, SourceFailure) else 'unavailable'), sampling='partial')
+        emit('disk', 'error', 'disk.clone_wedge', ok=False, props=props, error_tag='disk.clone_probe_failed')
+        return
+    emit('disk', 'event', 'disk.clone_wedge', ok=True, props=props)
 
 
 def stuck_durations(procs, observations, starts, now):
@@ -515,6 +668,7 @@ def disk_wait(run=subprocess.run, deadline=None):
         if remaining <= 0:
             raise SourceFailure('timeout', 'collector budget exhausted')
         snapshot = process_snapshot(run, min(10, remaining))
+        clone_wait(snapshot, run, deadline)
         candidates = sorted((p for p in snapshot if 'U' in p['stat'] and p['processAgeS'] >= 600),
                             key=lambda p: (-p['processAgeS'], p['pid']))
         observations, count, starts = sample_disk_wait(candidates, run, deadline)

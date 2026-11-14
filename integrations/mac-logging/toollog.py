@@ -33,6 +33,8 @@ BACKUP_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'fil
 FAILURE_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'files',
                   'restic', 'prune', 'dropbox', 'manifest', 'unknown'}
 NUMBERS.update(('durationMs', 'childrenMeasured', 'childrenPartial', 'childrenRemaining', 'bytesMeasured'))
+NUMBERS.update(('timeouts', 'secondsInTimeouts', 'childrenDescended', 'partsMeasured',
+                'childrenWithPartsInProgress', 'partsDone', 'partsTotal', 'partsFreshnessS'))
 NUMBERS.update(('loadPerCore', 'lastSuccessAgeS', 'deferredCount'))
 BACKUP_PROGRAMS = {'bash', 'zsh', 'sh', 'python', 'python3', 'restic', 'launchd',
                    'Robob', 'codex', 'claude', 'opencode', 'node', 'sleep', 'unknown'}
@@ -62,6 +64,7 @@ PROBE_ERRORS = {prefix+field for prefix in ('internal', 'external')
                 for field in ('PurgeableError', 'SnapshotError')}
 TEXT.update('blockedIn samplePath skipped storagekitdStat diskarbitrationdStat'.split())
 TEXT.add('failure')
+TEXT.add('spawnPolicy')
 ATOM = re.compile(r'^[A-Za-z0-9_.:@/+ ()-]{1,180}$')
 SECRET = re.compile(r'(?i)(bearer |password|secret|token[=: ]|cookie|otp[=: ]|sk-[a-z0-9]|\b(?:\d[ -]?){13,19}\b)')
 
@@ -195,6 +198,27 @@ def memory_fields(values, event):
 
 
 def safe_fields(values, event=None):
+    if event == 'disk.clone_wedge':
+        result = {k: v for k, v in disk_wait_fields(values).items()
+                  if k in ('count', 'sampleCount', 'sampling', 'failure')}
+        if isinstance((values or {}).get('procs'), list):
+            result['procs'] = []
+            for proc in values['procs'][:10]:
+                if not isinstance(proc, dict) or proc.get('reason') not in ('clone', 'shared_path'):
+                    continue
+                if any(type(proc.get(k)) is not int or proc[k] < 0 for k in ('pid', 'processAgeS')):
+                    continue
+                cpu = proc.get('cpuDeltaS')
+                if type(cpu) not in (int, float) or not math.isfinite(cpu) or cpu < 0:
+                    continue
+                if not all(isinstance(proc.get(k), str) for k in ('path', 'wchan')):
+                    continue
+                clean = {k: proc[k] for k in ('pid', 'processAgeS', 'cpuDeltaS', 'reason')}
+                for key in ('path', 'wchan'):
+                    value = proc[key][:300 if key == 'path' else 64]
+                    clean[key] = '[redacted]' if SECRET.search(value) else ''.join(c if c.isprintable() else ' ' for c in value)
+                result['procs'].append(clean)
+        return result
     if event == 'proc.disk_wait':
         return disk_wait_fields(values)
     if event in ('memory.sample', 'memory.alert'):
