@@ -144,6 +144,95 @@ class ToolLogTests(unittest.TestCase):
         self.assertEqual(result['malformedCount'], 1)
         self.assertEqual(stat.S_IMODE(next(self.root.glob('rollup-*.json')).stat().st_mode), 0o600)
 
+    def test_nag_outcome_schema_and_daily_rollup(self):
+        now = dt.datetime(2026, 11, 13, 20, 1, tzinfo=dt.timezone.utc)
+        with mock.patch.object(log, 'utcnow', return_value=now):
+            for latency in range(1, 101):
+                log.emit('took', 'nag.resolved', props={'slotKind': 'morning', 'nagCount': 3,
+                    'firstNagToTookSeconds': latency, 'snoozeCount': 1, 'lateMinutes': 5,
+                    'med': 'PRIVATE_MED', 'dose': 'PRIVATE_DOSE', 'site': 'PRIVATE_SITE'}, run_id='a' * 32)
+            log.emit('meds-nag', 'nag.day_end', props={
+                'slotsDue': 5, 'slotsTaken': 3, 'slotsOpen': 2, 'nagsSent': 4})
+            log.emit('took', 'nag.resolved', props={'slotKind': 'PRIVATE_MED',
+                'nagCount': True, 'firstNagToTookSeconds': -1, 'snoozeCount': '3', 'lateMinutes': 1.5})
+            result = log.rollup('2026-11-13')
+        self.assertEqual(result['nag'], {'firstNagToTookSeconds': {
+            'median': 50.5, 'p95': 95, 'samples': 100}, 'openSlotsByDay': {'2026-11-13': 2}})
+        raw = ''.join(p.read_text() for p in self.root.iterdir())
+        for secret in ('PRIVATE_MED', 'PRIVATE_DOSE', 'PRIVATE_SITE'):
+            self.assertNotIn(secret, raw)
+        self.assertNotIn('props', self.rows()[-1])
+
+    def test_cadence_and_nag_rollups_coexist_for_all_day_shapes(self):
+        intervals = {'meds-nag': 300, 'gym-nudge': 300, 'nutrition-nudge': 300,
+                     'nutrition-checkin': 300, 'whoop-sync': 3600, 'forge-workouts': 600}
+        config = Path(self.temp.name) / 'expected.json'
+        config.write_text(json.dumps({'expected': intervals}))
+        start = dt.datetime(2026, 11, 13, tzinfo=dt.timezone.utc)
+        def row(seconds, component, name, props=None):
+            return {'ts': (start + dt.timedelta(seconds=seconds)).isoformat(), 'tool': 'health',
+                    'component': component, 'kind': 'event', 'name': name, 'props': props or {}}
+        outcomes = [row(72010, 'took', 'nag.resolved', {'firstNagToTookSeconds': value})
+                    for value in (30, 90)]
+        outcomes.append(row(72060, 'meds-nag', 'nag.day_end',
+                            {'slotsDue': 3, 'slotsTaken': 1, 'slotsOpen': 2, 'nagsSent': 4}))
+        hole = [row(t, 'meds-nag', 'watcher.run') for t in range(0, 86400, 300)
+                if not 3600 < t < 14400]
+        steady = [row(t, 'gym-nudge', 'watcher.run') for t in range(0, 86400, 300)]
+        scenarios = [('hole_and_steady', hole + steady + outcomes, 86400),
+                     ('single_run', [row(43200, 'meds-nag', 'watcher.run')] + outcomes, 86400),
+                     ('empty', [], 86400), ('absent', None, 86400),
+                     ('current_day', [row(0, 'meds-nag', 'watcher.run')], 3600)]
+        for name, rows, elapsed in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / 'logs'
+                if rows is not None:
+                    root.mkdir()
+                    (root / '2026-11-13.ndjson').write_text(
+                        ''.join(json.dumps(value) + '\n' for value in rows))
+                with mock.patch.object(log, 'EXPECTED_PATH', config), \
+                     mock.patch.object(log, 'utcnow', return_value=start + dt.timedelta(seconds=elapsed)), \
+                     mock.patch.dict(os.environ, HEALTH_TOOLLOG_DIR=str(root)):
+                    result = log.rollup('2026-11-13')
+                self.assertIsNotNone(result)
+                components = result['components']
+                self.assertEqual(set(components), set(intervals))
+                for component, interval in intervals.items():
+                    summary = components[component]
+                    self.assertEqual(set(summary), {'runs', 'firstRunTs', 'lastRunTs',
+                        'medianGapSeconds', 'maxGapSeconds', 'gapsOver', 'expectedRuns', 'missedRuns'})
+                    self.assertEqual(summary['expectedRuns'], elapsed // interval)
+                    self.assertEqual(summary['missedRuns'], max(0, elapsed // interval - summary['runs']))
+                if name == 'hole_and_steady':
+                    self.assertEqual(components['meds-nag'], {'runs': 253,
+                        'firstRunTs': '2026-11-13T00:00:00Z', 'lastRunTs': '2026-11-13T23:55:00Z',
+                        'medianGapSeconds': 300, 'maxGapSeconds': 10800,
+                        'gapsOver': [{'startTs': '2026-11-13T01:00:00Z', 'seconds': 10800}],
+                        'expectedRuns': 288, 'missedRuns': 35})
+                    self.assertEqual((components['gym-nudge']['runs'], components['gym-nudge']['gapsOver']), (288, []))
+                elif name == 'single_run':
+                    self.assertEqual((components['meds-nag']['runs'], components['meds-nag']['maxGapSeconds'],
+                                      components['meds-nag']['medianGapSeconds']), (1, 43200, None))
+                elif name in ('empty', 'absent'):
+                    self.assertEqual(result['total'], 0)
+                    self.assertTrue(all(value['maxGapSeconds'] == 86400 for value in components.values()))
+                if name in ('hole_and_steady', 'single_run'):
+                    self.assertEqual(result['nag'], {'firstNagToTookSeconds': {
+                        'median': 60.0, 'p95': 90, 'samples': 2}, 'openSlotsByDay': {'2026-11-13': 2}})
+                else:
+                    self.assertEqual(result['nag'], {'firstNagToTookSeconds': {
+                        'median': None, 'p95': None, 'samples': 0}, 'openSlotsByDay': {}})
+                for component in set(intervals) - {'meds-nag', 'gym-nudge'}:
+                    self.assertEqual(components[component]['runs'], 0)
+                    self.assertEqual(components[component]['maxGapSeconds'], elapsed)
+                self.assertTrue((root / 'rollup-2026-11-13.json').exists())
+
+    def test_nag_rollup_without_outcomes(self):
+        log.emit('took', 'cli.run')
+        result = log.rollup(log.utcnow().date().isoformat())
+        self.assertEqual(result['nag'], {'firstNagToTookSeconds': {
+            'median': None, 'p95': None, 'samples': 0}, 'openSlotsByDay': {}})
+
     def test_rollup_after_0005_only_once_and_gap(self):
         now = dt.datetime(2026, 11, 13, 0, 4, tzinfo=dt.timezone.utc)
         with mock.patch.object(log, 'utcnow', return_value=now), mock.patch.object(log, 'rollup') as roll:
@@ -159,6 +248,81 @@ class ToolLogTests(unittest.TestCase):
         log.sync_gap((log.utcnow() - dt.timedelta(hours=37)).isoformat())
         log.sync_gap(log.utcnow().isoformat())
         self.assertEqual([r['name'] for r in self.rows()], ['sync.gap'])
+
+
+
+class IsolationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.live = self.home / '.robob/logs/tools/health'
+        self.live.mkdir(parents=True)
+        self.day = log.utcnow().date().isoformat()
+        (self.live / (self.day + '.ndjson')).write_text('{}\n')
+        self.before = self.snapshot()
+
+    def snapshot(self):
+        return {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in self.live.iterdir()}
+
+    def test_each_marker_drops_all_write_paths_without_override(self):
+        for marker in ('HEALTH_VAULT_TEST_COPY', 'PYTEST_CURRENT_TEST', 'unittest'):
+            for value in ('1', ''):
+                with self.subTest(marker=marker, value=value), mock.patch.dict(os.environ, {'HOME': str(self.home)}, clear=True):
+                    # unittest is already loaded; remove it to prove each env marker independently.
+                    modules = dict(sys.modules)
+                    if marker != 'unittest':
+                        modules.pop('unittest', None)
+                        os.environ[marker] = value
+                    with mock.patch.dict(sys.modules, modules, clear=True):
+                        self.assertIsNone(log.log_dir())
+                        with log.run('food', ['today']):
+                            pass
+                        log.emit('food', 'cli.run')
+                        log.conflicts([('other', 1)])
+                        log.delivery('card', 'a' * 32)
+                        log.sync_gap(None)
+                        self.assertIsNone(log.rollup(self.day))
+                        log.rollup_previous()
+                    self.assertEqual(self.snapshot(), self.before)
+
+    def test_explicit_override_writes_under_all_markers(self):
+        target = self.home / 'isolated'
+        with mock.patch.dict(os.environ, {'HOME': str(self.home), 'HEALTH_TOOLLOG_DIR': str(target),
+                         'HEALTH_VAULT_TEST_COPY': '', 'PYTEST_CURRENT_TEST': ''}, clear=True):
+            log.emit('food', 'cli.run')
+            self.assertIsNotNone(log.rollup(self.day))
+        self.assertEqual(len(list(target.glob('*.ndjson'))), 1)
+        self.assertEqual(self.snapshot(), self.before)
+
+    def test_empty_override_does_not_enable_live_writes(self):
+        with mock.patch.dict(os.environ, {'HOME': str(self.home), 'HEALTH_TOOLLOG_DIR': ''}, clear=True):
+            log.emit('food', 'cli.run')
+            self.assertIsNone(log.rollup(self.day))
+        self.assertEqual(self.snapshot(), self.before)
+
+    def test_production_fallback_in_fresh_process(self):
+        import subprocess
+        code = ('import sys, runpy; from pathlib import Path; '
+                'm = runpy.run_path(sys.argv[1]); '
+                'assert "unittest" not in sys.modules; '
+                'assert m["log_dir"]() == Path.home()/".robob/logs/tools/health"; '
+                'm["emit"]("food", "cli.run"); '
+                'assert m["rollup"](sys.argv[2]) is not None')
+        result = subprocess.run([sys.executable, '-I', '-c', code, str(log.__file__), self.day],
+                                env={'HOME': str(self.home)}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(self.snapshot(), self.before)
+        self.assertIn('rollup-' + self.day + '.json', self.snapshot())
+
+    def test_guard_failures_still_never_raise_or_hide_original_error(self):
+        with mock.patch.object(log, 'log_dir', side_effect=RuntimeError('guard failure')):
+            log.emit('food', 'cli.run')
+            self.assertIsNone(log.rollup())
+            log.rollup_previous()
+            with self.assertRaisesRegex(ValueError, 'tool failure'):
+                with log.run('food'):
+                    raise ValueError('tool failure')
 
 
 if __name__ == '__main__':

@@ -40,6 +40,7 @@ const makeHarness = Effect.fn("makeWatchFailureHarness")(function* (
   let watch: ThreadPullRequestWatch | undefined = {
     startedAt: "2026-11-12T00:00:00.000Z",
     headSha: null,
+    observedHeadSha: initial.headSha ?? null,
     failedChecks: [],
     passed: false,
     passedChecks: [],
@@ -294,17 +295,18 @@ it.effect.each(["success", "failure"] as const)(
       const harness = yield* makeHeadHarness();
       const stale = greenDetail();
       harness.setDetail({ ...stale, checks: stale.checks.map((check) => ({ ...check, status })) });
-      const before = harness.watch();
+      const before = harness.watch()!;
       yield* harness.reactor.sweep;
-      assert.deepStrictEqual(harness.commands, []);
-      assert.deepStrictEqual(harness.watch(), before);
+      assert.strictEqual(harness.commands.length, 1);
+      assert.isUndefined(harness.commands[0]?.wake);
+      assert.deepStrictEqual(harness.watch(), { ...before, observedHeadSha: NEW_HEAD });
       harness.setDetail({ ...stale, headSha: NEW_HEAD, checksHeadSha: NEW_HEAD });
       yield* harness.reactor.sweep;
       assert.strictEqual(harness.reads(), 2);
-      assert.strictEqual(harness.commands.length, 1);
-      assert.include(harness.commands[0]!.wake?.text ?? "", "passed on 048997a");
+      assert.strictEqual(harness.commands.length, 2);
+      assert.include(harness.commands[1]!.wake?.text ?? "", "passed on 048997a");
       yield* harness.reactor.sweep;
-      assert.strictEqual(harness.commands.length, 1);
+      assert.strictEqual(harness.commands.length, 2);
     }),
 );
 
@@ -321,9 +323,28 @@ it.effect("keeps a new required check from growing the reported gate on a settli
   Effect.gen(function* () {
     const harness = yield* makeHeadHarness({ passed: true, passedChecks: ["test"] });
     yield* harness.reactor.sweep;
-    assert.deepStrictEqual(harness.commands, []);
+    assert.strictEqual(harness.commands.length, 1);
+    assert.isUndefined(harness.commands[0]?.wake);
+    assert.strictEqual(harness.watch()?.observedHeadSha, NEW_HEAD);
     assert.deepStrictEqual(harness.watch()?.passedChecks, ["test"]);
   }),
+);
+
+it.effect(
+  "persists a newly observed head while its check checkpoint stays put, without waking twice",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHeadHarness({ passed: true, passedChecks: ["test"] });
+      harness.setDetail({ ...greenDetail(), headSha: NEW_HEAD, checksHeadSha: OLD_HEAD });
+      yield* harness.reactor.sweep;
+      assert.strictEqual(harness.commands.length, 1);
+      assert.isUndefined(harness.commands[0]?.wake);
+      assert.strictEqual(harness.watch()?.headSha, OLD_HEAD);
+      assert.strictEqual(harness.watch()?.observedHeadSha, NEW_HEAD);
+      assert.deepStrictEqual(harness.watch()?.passedChecks, ["test"]);
+      yield* harness.reactor.sweep;
+      assert.strictEqual(harness.commands.length, 1);
+    }),
 );
 
 it.effect("still reports green checks when the branch ref cannot be read", () =>
@@ -539,34 +560,86 @@ it.effect("ends visibly when the fingerprint stays rate limited", () =>
   }),
 );
 
-it.effect("ends visibly when the PR head never settles, without giving a stale verdict", () =>
-  Effect.gen(function* () {
-    const harness = yield* makeHeadHarness();
-    for (let attempt = 0; attempt < 7; attempt++) yield* harness.reactor.sweep;
-    assert.deepStrictEqual(harness.commands, []);
-    yield* harness.reactor.sweep;
-    assert.strictEqual(harness.commands.length, 1);
-    assert.isNull(harness.commands[0]!.watch);
-    assert.include(harness.commands[0]!.wake?.text ?? "", "head");
-    assert.notInclude(harness.commands[0]!.wake?.text ?? "", "checks passed");
-  }),
+it.effect.each([false, true])(
+  "evaluates the branch rollup after three disagreeing reads (fingerprint=%s)",
+  (withFingerprint) =>
+    Effect.gen(function* () {
+      const harness = yield* makeHeadHarness({ failedChecks: ["aggregate"] }, withFingerprint);
+      harness.setDetail({
+        ...greenDetail(),
+        checksHeadSha: NEW_HEAD,
+        checks: [
+          { name: "aggregate", status: "failure", required: false, description: null, url: null },
+        ],
+      });
+      for (let pass = 0; pass < 2; pass++) yield* harness.reactor.sweep;
+      assert.lengthOf(
+        harness.commands.filter((command) => command.wake),
+        0,
+      );
+      yield* harness.reactor.sweep;
+      assert.equal(harness.watch()?.headSha, NEW_HEAD);
+      const wakes = harness.commands.filter((command) => command.wake);
+      assert.lengthOf(wakes, 1);
+      assert.include(wakes[0]!.wake!.text, `Checks failed on ${NEW_HEAD.slice(0, 7)}`);
+      for (let pass = 0; pass < 8; pass++) yield* harness.reactor.sweep;
+      assert.isDefined(harness.watch());
+      assert.lengthOf(
+        harness.commands.filter((command) => command.wake),
+        1,
+      );
+    }),
 );
 
-it.effect("clears the unsuccessful-read count once a settled head can be evaluated", () =>
+it.effect(
+  "advances beyond a stale rollup without ending the watch or attributing old failures",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHeadHarness({ failedChecks: ["lint"] });
+      harness.setDetail({
+        ...greenDetail(),
+        checks: greenDetail().checks.map((check) => ({ ...check, status: "failure" })),
+      });
+      for (let pass = 0; pass < 10; pass++) yield* harness.reactor.sweep;
+      assert.equal(harness.watch()?.headSha, NEW_HEAD);
+      assert.lengthOf(
+        harness.commands.filter((command) => command.wake),
+        0,
+      );
+      harness.setDetail({
+        ...greenDetail(),
+        headSha: NEW_HEAD,
+        checksHeadSha: NEW_HEAD,
+        checks: greenDetail().checks.map((check) => ({ ...check, status: "failure" })),
+      });
+      yield* harness.reactor.sweep;
+      assert.lengthOf(
+        harness.commands.filter((command) => command.wake),
+        1,
+      );
+    }),
+);
+
+it.effect("restarts the settling bound when the source branch moves again", () =>
   Effect.gen(function* () {
     const harness = yield* makeHeadHarness();
-    for (let attempt = 0; attempt < 7; attempt++) yield* harness.reactor.sweep;
+    for (let pass = 0; pass < 2; pass++) yield* harness.reactor.sweep;
     harness.setDetail({
       ...greenDetail(),
-      headBranchSha: OLD_HEAD,
-      checks: [{ name: "lint", status: "pending", required: false, description: null, url: null }],
+      headBranchSha: "cccccccccc",
+      checksHeadSha: "cccccccccc",
     });
+    for (let pass = 0; pass < 2; pass++) yield* harness.reactor.sweep;
+    assert.lengthOf(
+      harness.commands.filter((command) => command.wake),
+      0,
+    );
     yield* harness.reactor.sweep;
-    harness.setDetail(greenDetail());
-    for (let attempt = 0; attempt < 7; attempt++) yield* harness.reactor.sweep;
-    assert.deepStrictEqual(harness.commands, []);
-    yield* harness.reactor.sweep;
-    assert.isNull(harness.commands[0]!.watch);
+    assert.equal(harness.watch()?.headSha, "cccccccccc");
+    assert.lengthOf(
+      harness.commands.filter((command) => command.wake),
+      1,
+    );
   }),
 );
 
@@ -642,10 +715,13 @@ it.effect("measures project listing and identity spawns across watch sweeps", ()
     yield* TestClock.adjust("2 minutes");
     yield* reactor.sweep;
     const second = workspace.counts();
-    assert.deepStrictEqual({ first, second }, {
-      first: { listShells: 1, gitSpawns: 180 },
-      second: { listShells: 1, gitSpawns: 0 },
-    });
+    assert.deepStrictEqual(
+      { first, second },
+      {
+        first: { listShells: 1, gitSpawns: 180 },
+        second: { listShells: 1, gitSpawns: 0 },
+      },
+    );
     assert.strictEqual(commands.length, 40);
   }),
 );

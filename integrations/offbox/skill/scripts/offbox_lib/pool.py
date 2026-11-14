@@ -231,13 +231,18 @@ def lock_name(key: str) -> str:
 def _pool_lock(key: str, deadline: float, wait: int, *, prepare_end: float | None = None,
                box_id: str = "repository pool"):
     """Queue expiry means busy; a selected box's readiness deadline also bounds its claim."""
+    from . import allocation
     continuation = prepare.guard(box_id, prepare_end) if prepare_end is not None else contextlib.nullcontext()
     with continuation:
         acquired = False
         try:
             while not acquired:
+                allocation.check_source()
                 started = time.monotonic()
                 timeout = min(LOCK_WAIT_S, max(0, deadline - started))
+                queue = allocation._QUEUE.get()
+                if queue is not None and queue.get('check_source') is not None:
+                    timeout = min(2, timeout)
                 lk = file_lock(lock_name(key), timeout=timeout)
                 try:
                     with prepare.guard(box_id), prepare.phase("lock_wait", box_id):
@@ -256,6 +261,7 @@ def _pool_lock(key: str, deadline: float, wait: int, *, prepare_end: float | Non
                             f"retry, or raise OFFBOX_POOL_WAIT_SECONDS (max {wait_max()})")
                     raise PoolBusyError(f"repository pool busy/full for {key}: {detail}. "
                                         f"Nothing ran (exit {EXIT_BUSY}): {hint}") from e
+            allocation.check_source()
             yield
         finally:
             if acquired:
@@ -389,6 +395,8 @@ class _QueuePoll:
                     if not busy(error):
                         raise
                     self.con.rollback()
+                    from . import allocation
+                    allocation.check_source()
                     log(f"pool queue {self.run_id or '-'} poll failed:\n" + traceback.format_exc())
                     left = self.deadline - time.monotonic()
                     if left <= 0:
@@ -413,12 +421,12 @@ def _clear_queue_rows(con, me, run_id):
     db_retry(clear)
 
 
-def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, exclude=None):
+def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, exclude=None, check_source=None):
     import toollog
     with toollog.span("pool", "run.lease", ids={"run": run_id}, tag="lease_failed") as data:
         started = time.monotonic()
         try:
-            row = _acquire_logged(me, size, template, base, fresh, run_id, exclude)
+            row = _acquire_logged(me, size, template, base, fresh, run_id, exclude, check_source)
         except BaseException:
             toollog.emit("pool", "run.queue", kind="error", ok=False, duration_ms=(time.monotonic()-started)*1000,
                          ids={"run": run_id}, props={"queued": True, "waitMs": (time.monotonic()-started)*1000}, tag="queue_failed")
@@ -426,10 +434,13 @@ def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, e
         data["ids"] = {"run": run_id, "box": row["box_id"]}
         data["props"]["leaseKind"] = row.pop("_log_lease_kind", "reused")
         data["props"]["size"] = row.get("size")
+        if data["props"]["leaseKind"] == "reused":
+            from . import lease
+            lease.report_reused_template(me, row, template)
         return row
 
 
-def _acquire_logged(me, size=None, template=None, base=None, fresh=False, run_id=None, exclude=None):
+def _acquire_logged(me, size=None, template=None, base=None, fresh=False, run_id=None, exclude=None, check_source=None):
     from . import allocation
     con = db()
     token = new_id('waiter')
@@ -440,6 +451,7 @@ def _acquire_logged(me, size=None, template=None, base=None, fresh=False, run_id
     try:
         with allocation.scope(key), allocation.queue(), prepare.attempts():
             queue = allocation._QUEUE.get()
+            queue['check_source'] = check_source
             queue["log_setup_ms"] = 0
             poll = _QueuePoll(con, queue['wait'], run_id, deadline=queue['end'])
             poll.call(lambda: capacity.schema(con))
@@ -579,6 +591,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
         say(f"could not prepare your box {bid} ({error}); trying other pool boxes")
 
     while True:
+        allocation.check_source()
         lease.cap_check()
         pending = poll.call(lambda: con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
                               f"WHERE l.repo_key=? AND {token_mine('l')} AND l.state IN ('running','stopped') "
@@ -839,8 +852,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         if wait_for_own:
                             needs_start = grow or row['state'] != 'running'
                             budget = max(0, min(AFFINITY_WAIT_S, deadline - time.monotonic()))
-                            if time.monotonic() < affinity_deadline:
-                                budget = min(budget, affinity_deadline - time.monotonic())
+                            # Affinity bounds waiting for our box; a selected box gets its own readiness window.
+                            # Resize stops yield to the queue, so their wait is excluded on the resume attempt.
                             if not wait and not needs_start:
                                 budget = AFFINITY_WAIT_S  # a zero queue wait still permits a ready box's health check
                             with api.budget(budget):
@@ -909,6 +922,9 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                             f"offbox release {row['box_id']} --delete). Trying other pool boxes, then a fresh lease.")
                         continue
                     except OffboxError as e:
+                        if isinstance(e, api.BudgetExpired) and con.execute("SELECT 1 FROM kv WHERE k IN (?,?)",
+                                (f"resume_unanswered:{row['box_id']}", f"resume_provision:{row['box_id']}")).fetchone():
+                            raise
                         if (row['state'] == 'running' and not wait_for_own) or e.code != EXIT_INFRA:
                             raise
                         # A stopped box failed to resume: a running box later in the list may still be free.
@@ -948,6 +964,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         last_error = e
                         break
                     except OffboxError as e:
+                        if isinstance(e, common.SourceGone):
+                            raise
                         if resume_stall is not None:
                             from . import home
                             refused = 400 <= (getattr(e, 'status', None) or 0) < 500
@@ -1090,6 +1108,7 @@ def try_warm(me, size, source, exclude, run_id):
                     return None
                 _claim(con, me, got, run_id)
                 claimed = True
+                lease.report_reused_template(me, got)
                 return got
             finally:
                 if not claimed:

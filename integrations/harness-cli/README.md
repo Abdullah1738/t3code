@@ -131,7 +131,7 @@ Deploying does not stage or promote anything by itself. The first run happens at
 ## Tests
 
 ```sh
-cd integrations/harness-cli && /opt/homebrew/bin/python3 -m unittest discover -s tests -v
+/bin/sh integrations/harness-cli/test.sh /opt/homebrew/bin/python3
 ```
 
 Every path lives in a temp dir; a fake `npm` answers `view` and `pack`; fake CLI binaries print

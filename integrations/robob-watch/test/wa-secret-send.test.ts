@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
 
 setDefaultTimeout(30_000);
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 // wa send over stdin / --file / --quiet. The text must reach the sync daemon's socket only: never argv, env, a file or any output.
@@ -101,7 +101,34 @@ const baseEnv = (): Record<string, string> => ({
   LANG: "en_US.UTF-8",
 });
 
-// Runs wa and samples every process's argv+env (ps -axwwE) until it exits, so a leak onto any process shows up.
+function sampleProcesses() {
+  if (process.platform === "darwin") {
+    const result = Bun.spawnSync(["/bin/ps", "-axwwE", "-o", "command="]);
+    if (result.exitCode !== 0) throw new Error("ps could not sample process argv and environment");
+    return result.stdout.toString();
+  }
+  if (process.platform !== "linux") throw new Error("process sampling requires macOS or Linux");
+
+  const processes: string[] = [];
+  for (const pid of readdirSync("/proc")) {
+    if (!/^\d+$/.test(pid)) continue;
+    const fields: string[] = [];
+    for (const field of ["cmdline", "environ"]) {
+      try {
+        fields.push(readFileSync("/proc/" + pid + "/" + field, "utf8").replaceAll("\0", " "));
+      } catch (error) {
+        // Processes can exit mid-sample; other users' environments may be unreadable.
+        if (error instanceof Error && "code" in error &&
+            ["EACCES", "EPERM", "ENOENT", "ESRCH"].includes(String(error.code))) continue;
+        throw error;
+      }
+    }
+    processes.push(fields.join(" "));
+  }
+  return processes.join("\n");
+}
+
+// Samples every process's argv+env until wa exits, so a leak onto any process shows up.
 async function runWa(args: string[], stdin: Uint8Array | null, extra: Record<string, string> = {}, withSock = true) {
   const env = { ...baseEnv(), ...(withSock ? { WA_SEND_SOCK: sock } : {}), ...extra };
   const proc = Bun.spawn(["/bin/zsh", waBin, ...args], {
@@ -114,7 +141,7 @@ async function runWa(args: string[], stdin: Uint8Array | null, extra: Record<str
   let done = false;
   proc.exited.then(() => (done = true));
   while (!done) {
-    samples.push(Bun.spawnSync(["/bin/ps", "-axwwE", "-o", "command="]).stdout.toString());
+    samples.push(sampleProcesses());
     await sleep(30);
   }
   const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
@@ -128,10 +155,19 @@ const waEnv = (extra: Record<string, string>, ...args: string[]) => {
 };
 
 function expectNoSecret(r: { out: string; err: string; samples: string[] }, s: string) {
+  expect(r.samples.some(sample => sample.includes("bun test"))).toBe(true);
   expect(r.out).not.toContain(s);
   expect(r.err).not.toContain(s);
   for (const sample of r.samples) expect(sample).not.toContain(s);
 }
+
+test.each([
+  { name: "no samples", samples: [] },
+  { name: "empty samples", samples: [""] },
+  { name: "unrelated processes", samples: ["/bin/sleep 60"] },
+])("leak check refuses $name", ({ samples }) => {
+  expect(() => expectNoSecret({ out: "", err: "", samples }, "test-only-secret")).toThrow();
+});
 
 let daemon: ReturnType<typeof Bun.spawn>;
 

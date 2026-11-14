@@ -6,6 +6,7 @@ import base64
 import json
 from pathlib import Path
 import unittest
+import order_card
 
 import noon_minutes_checkout as m
 import noon_cvv
@@ -83,7 +84,7 @@ class CapturedContractTests(unittest.TestCase):
         from test.test_noon_minutes_checkout import Harness
         h = Harness([{'status': 'payment_pending'}])
         card = m.SavedCard(FIXTURE['complete']['req']['idCustomerToken'],
-                          '522873xxxxxx2342', 'mastercard')
+                          'xxxxxxxxxxxx' + order_card.LAST4, order_card.NETWORK)
         h.client.complete_payment(order=ORDER, client_secret='<secret>', card=card,
             provider_code='NOON_PAY',
             cvv_encryption={'encCvv': '<secret>', 'publicKeyName': 'key_1'},

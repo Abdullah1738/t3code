@@ -23,6 +23,7 @@ import {
   KanbanScriptAcknowledgeInput,
   KanbanScriptTrigger,
   KanbanStage,
+  KanbanMoveOptions,
   ProviderOptionSelections,
   ProjectId,
 } from "@t3tools/contracts";
@@ -36,7 +37,7 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import { modelSelectionResult, type ModelInput } from "./engine/defaults.ts";
-import { KanbanService } from "./engine/KanbanService.ts";
+import { KanbanService, askAnswerVia } from "./engine/KanbanService.ts";
 import { requireOwner } from "./ownerGate.ts";
 import { selectionRoutingEnabled } from "./engine/selectionSettings.ts";
 import { KanbanScripts } from "./engine/ScriptService.ts";
@@ -130,7 +131,7 @@ const CreateCardBody = Schema.Struct({
   reviewChain: Text,
 });
 
-const MoveBody = Schema.Struct({ to: KanbanStage, note: Text, question: Text });
+const MoveBody = Schema.Struct({ to: KanbanStage, ...KanbanMoveOptions.fields });
 
 const PostBody = Schema.Struct({
   revision: Schema.optional(Schema.Number),
@@ -215,6 +216,7 @@ const BoardBody = Schema.Struct({
     Schema.Array(Schema.Struct({ name: Schema.String, steps: Schema.Array(ModelBody) })),
   ),
   defaultReviewChain: Schema.optional(Schema.NullOr(Schema.String)),
+  guessedGates: Schema.optional(Schema.Array(Schema.Literals(["deploy", "money", "secret"]))),
 });
 
 const PoolBody = Schema.Struct({
@@ -422,7 +424,11 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         const hasMore = snapshot.cards.length > limit;
         const cards = snapshot.cards.slice(0, limit);
         return {
-          ...BoardReplies.compactBoard({ ...snapshot, cards }),
+          ...BoardReplies.compactBoard(
+            { ...snapshot, cards },
+            undefined,
+            DateTime.formatIso(yield* DateTime.now),
+          ),
           page: { limit, hasMore, nextAfter: hasMore ? cards.at(-1)!.number : null },
         };
       }),
@@ -475,6 +481,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           ...(evaluatorModel ? { evaluatorModel } : {}),
           ...(defaultCardModel ? { defaultCardModel } : {}),
           ...(reviewChains ? { reviewChains } : {}),
+          ...(input.guessedGates !== undefined ? { guessedGates: input.guessedGates } : {}),
           ...(input.defaultReviewChain !== undefined
             ? { defaultReviewChain: input.defaultReviewChain }
             : {}),
@@ -516,6 +523,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         return yield* service.moveCard(card.id, input.to, "owner", OWNER, {
           note: input.note ?? null,
           question: input.question ?? null,
+          ...(input.keepWait === undefined ? {} : { keepWait: input.keepWait }),
         });
       }),
     );
@@ -659,6 +667,37 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
+    const seenAsk = ownerWrite(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        const { surface, at } = yield* body(
+          Schema.Struct({
+            surface: Schema.Literals(["web", "desktop", "mobile"]),
+            at: Schema.optional(Schema.String),
+          }),
+        );
+        yield* service.noteAskTiming(card.id, yield* param("ask"), { type: "seen", surface, at });
+        return { recorded: true };
+      }),
+    );
+    const notifiedAsk = write(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        const input = yield* body(
+          Schema.Struct({
+            channel: Schema.Literals(["in_app", "telegram", "push"]),
+            at: Schema.optional(
+              Schema.String.check(
+                Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+              ),
+            ),
+          }),
+        );
+        yield* service.noteAskTiming(card.id, yield* param("ask"), { type: "notified", ...input });
+        return { recorded: true };
+      }),
+    );
+
     // Each ask is answered on its own: one stale or closed ask doesn't hold back the rest.
     const answerAsks = ownerWrite(
       Effect.gen(function* () {
@@ -689,12 +728,9 @@ export const kanbanRouteLayer = HttpRouter.addAll(
                 );
               }
             }
-            const result = yield* service.answerAsk(
-              card.id,
-              item.askId,
-              { ...answer, revision: item.revision },
-              OWNER,
-            );
+            const result = yield* service
+              .answerAsk(card.id, item.askId, { ...answer, revision: item.revision }, OWNER)
+              .pipe(Effect.provideService(askAnswerVia, "batch"));
             return {
               card: item.card,
               askId: item.askId,
@@ -1017,6 +1053,8 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       HttpRouter.route("POST", `${p}/asks/hand`, handle(handAsks)),
       HttpRouter.route("GET", `${p}/cards/:card/asks/:ask`, handle(getAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/answer`, handle(answerAsk)),
+      HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/seen`, handle(seenAsk)),
+      HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/notified`, handle(notifiedAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/reply`, handle(replyOnAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/hand`, handle(handAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/snooze`, handle(snoozeAsk)),

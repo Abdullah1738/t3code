@@ -174,6 +174,9 @@ def fail_over(reason: str, argv: list[str], run_id: str = "") -> bool:
     log(f"failover to boat: {reason[:300]}")
     env = dict(os.environ, OFFBOX_BACKEND="boat")
     env[FAILOVER_ENV] = reason[:200]
+    if queued:
+        from .runs import forward_background
+        forward_background(env)
     sys.stdout.flush()
     sys.stderr.flush()
     os.execve(sys.executable, [sys.executable, os.path.realpath(sys.argv[0]), *argv], env)

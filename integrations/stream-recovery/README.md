@@ -189,7 +189,11 @@ Recovery reads authenticated `GET /api/ardud/control/harness-cutover/status`:
 `claimedRuns: [{threadId, runId}]` is also accepted. While active, claimed threads
 get no restart/stream-loss note, stall interruption, or queue release. Retained
 run claims suppress only the old cut runs after completion, not future restarts
-of those threads. Status must expose prepared input claims before ledger creation;
+of those threads. After completion the default reply keeps `claimedRuns` but returns
+an empty `claimedThreadIds` with `threadClaimsIncluded: false`. The installer requests
+`?claims=1` to retain historical thread ownership checks, including snapshots without
+a run ID; it refuses a saved status with omitted thread claims. `?items=1` independently
+adds ledger rows without payloads. Status must expose prepared input claims before ledger creation;
 missing/invalid/unauthorized status fails closed rather than assuming no claims.
 Claims are rechecked before mutation. The server must establish preparation before
 recovery starts, and fence dispatch against its cutover ledger to close a claim

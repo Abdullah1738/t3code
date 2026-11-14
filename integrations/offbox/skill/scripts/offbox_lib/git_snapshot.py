@@ -25,7 +25,7 @@ def _git_env() -> dict[str, str]:
 def _git(root: Path, *args: str, input: str | None = None, stdin=None) -> str:
     try:
         p = subprocess.run(["git", "-C", str(root), *args], input=input,
-                           stdin=stdin, capture_output=True, text=True, env=_git_env(), timeout=3600)
+                           stdin=stdin, capture_output=True, text=True, env=_git_env(), timeout=3600, cwd=str(root))
     except (OSError, subprocess.TimeoutExpired) as e:
         raise OffboxError(f"cannot prepare --git history ({type(e).__name__})", code=2) from e
     if p.returncode:
@@ -39,7 +39,7 @@ def _is_partial_clone(root: Path) -> bool:
     try:
         p = subprocess.run(["git", "-C", str(root), "config", "--get-regexp",
                             r"^(extensions\.partialclone|remote\..*\.promisor)$"],
-                           capture_output=True, text=True, env=_git_env(), timeout=60)
+                           capture_output=True, text=True, env=_git_env(), timeout=60, cwd=str(root))
     except (OSError, subprocess.TimeoutExpired) as e:
         raise OffboxError(f"cannot prepare --git history ({type(e).__name__})", code=2) from e
     for line in p.stdout.splitlines():
@@ -70,7 +70,7 @@ def _pack_objects(root: Path, dest: Path, revisions: str, revs: bool = True) -> 
             with subprocess.Popen(
                 ["git", "-C", str(root), "pack-objects", "--stdout", *(["--revs"] if revs else []),
                  "--no-reuse-delta", "--threads=1"],
-                stdin=revfile, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=_git_env(),
+                stdin=revfile, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=_git_env(), cwd=str(root),
             ) as producer:
                 try:
                     index_error = None

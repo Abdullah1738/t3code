@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import order_card
 from unittest.mock import Mock, patch
 import time
 
@@ -27,8 +28,8 @@ def failed_responses(order, amount):
     """Sanitized shape of the native failed order/refund GETs, 23 Oct."""
     amount = f'{amount / 100:.2f}'
     item = order + '-1'
-    method = {'code': 'mastercard', 'title': 'MASTERCARD xxxx2342', 'amount': amount}
-    medium = {'code': 'mastercard', 'title': 'Processed to xxxx2342', 'amount': amount,
+    method = {'code': order_card.NETWORK, 'title': f'{order_card.NETWORK.upper()} xxxx{order_card.LAST4}', 'amount': amount}
+    medium = {'code': order_card.NETWORK, 'title': f'Processed to xxxx{order_card.LAST4}', 'amount': amount,
               'description': disposition.NO_CAPTURE + ' Any temporary hold will be released by your bank.'}
     block = {'refundMediums': [medium], 'refundBreakup': {
         'totalAmount': amount, 'items': [{'itemNr': item, 'amount': amount}], 'feeGroups': []}}

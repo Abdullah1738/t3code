@@ -1,32 +1,40 @@
 """Queued background clients use a real session/process boundary; all box operations are fake."""
 import contextlib
 import io
+import json
+import faulthandler
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, os.environ.get('OFFBOX_TEST_SCRIPTS', str(Path(__file__).resolve().parents[1])))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from offbox_lib import api, cli, common, home, lease, misc, outage, pool, reap, runs
 from test_capacity import Isolated
 
 
-def fixture(root, bg, backend):
+def configure_fixture(root, backend):
     common.STATE = root / 'STATE'
     common.DB_PATH = root / 'db.sqlite'
     common.LOG_PATH = root / 'log'
     common.LOCKS_DIR = root / 'LOCKS_DIR'
     common.LOGS_DIR = runs.LOGS_DIR = misc.LOGS_DIR = root / 'LOGS_DIR'
     api.BACKEND = backend
+    common._BACKEND = backend
     api._key = lambda: (_ for _ in ()).throw(AssertionError('no live API'))
+    runs.BG_ENTRY = Path(os.environ.get('OFFBOX_TEST_ENTRY', __file__)).resolve()
+    os.environ['OFFBOX_TEST_ROOT'] = str(root)
     me = dict(owner='worker', repo_key='repo', repo_root=str(root), session='s', thread='t')
-    a = SimpleNamespace(bg=bg, no_sync=True, cmd=['proof'], steps=[], pull=[], env=[], size=None,
+    a = SimpleNamespace(bg=True, no_sync=True, cmd=['proof'], steps=[], pull=[], env=[], size=None,
                         template=None, base=None, fresh=False, git=False)
+    if os.environ.get('OFFBOX_TEST_ENTRY'):
+        a.cmd = ['proof' + 'x' * 300000]
     pool.release_guard = lambda row: None
     lease.ensure_ttl = lambda *args: (root / 'ttl').write_text('extended')
     api.get = lambda *args: {'state': 'running'}
@@ -60,10 +68,34 @@ def fixture(root, bg, backend):
 
     pool.acquire = acquire
     api.cmd_start = start
+    return a, me
+
+
+def fixture(root, bg, backend):
+    a, me = configure_fixture(root, backend)
+    a.bg = bg
+    if os.environ.get('OFFBOX_TEST_THREADED_CALLER'):
+        threading.Thread(target=threading.Event().wait, daemon=True).start()
+    masked = bool(os.environ.get('OFFBOX_TEST_MASKED_MAIN'))
+    if masked:
+        interruptions = 0
+        def interrupted(signum, frame):
+            nonlocal interruptions
+            interruptions += 1
+            (root / 'caller-interrupted').write_text(str(interruptions))
+        signal.signal(signal.SIGINT, interrupted)
+        signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGINT,))
+    if os.environ.get('OFFBOX_TEST_READY_TIMEOUT'):
+        runs.BG_READY_TIMEOUT_S = float(os.environ['OFFBOX_TEST_READY_TIMEOUT'])
     code = runs.run_remote(a, me)
+    if masked:
+        (root / 'mask-restored').write_text(str(signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, ())))
     (root / 'returned').write_text(str(code))
     while True:
-        signal.pause()
+        if masked:
+            time.sleep(.01)
+        else:
+            signal.pause()
 
 
 class BackgroundQueueTests(Isolated):
@@ -87,11 +119,21 @@ class BackgroundQueueTests(Isolated):
         proc.communicate(timeout=5)
 
     def stop_child(self, pid, caller):
-        if pid and pid != caller:
+        if not pid or pid == caller:
+            return
+        # The child settles its run on SIGTERM; wait for it so it isn't still writing when the tempdir is removed.
+        for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
             try:
-                os.kill(pid, signal.SIGTERM)
+                os.kill(pid, sig)
             except ProcessLookupError:
-                pass
+                return
+            end = time.monotonic() + wait
+            while time.monotonic() < end:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return
+                time.sleep(.02)
 
     def until(self, predicate, proc=None):
         end = time.monotonic() + 8
@@ -163,29 +205,10 @@ class BackgroundQueueTests(Isolated):
 
     def test_caller_dies_before_readiness_acknowledgement(self):
         root = Path(self.tmp.name)
-        # Stop the child at its first post-fork DB write, while the caller is still awaiting its readiness byte.
-        script = '''import os, runpy, sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from offbox_lib import common, runs
-original = runs.Runner.record
-root = Path(sys.argv[3])
-def record(self, **kw):
-    if kw.get('client_pid') is not None:
-        (root / 'handoff').write_text(str(os.getpid()))
-        with common.file_lock('fixture-handoff', timeout=15):
-            pass
-    return original(self, **kw)
-runs.Runner.record = record
-target = sys.argv[2]
-sys.argv = [target, '--fixture', str(root), '1', 'boat']
-runpy.run_path(target, run_name='__main__')
-'''
         with common.file_lock('fixture-handoff'):
-            proc = subprocess.Popen([sys.executable, '-I', '-c', script,
-                                     str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve()),
-                                     self.tmp.name],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            proc = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), '--fixture',
+                                     self.tmp.name, '1', 'boat'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    start_new_session=True, env=dict(os.environ, OFFBOX_TEST_HANDOFF='1'))
             self.addCleanup(self.stop, proc)
             self.until(lambda: (root / 'handoff').exists(), proc)
             child = int((root / 'handoff').read_text())
@@ -202,6 +225,34 @@ runpy.run_path(target, run_name='__main__')
         self.until(lambda: (root / 'ttl').exists())
         self.assertEqual(len((root / 'starts').read_text().splitlines()), 1)
 
+    def test_removed_cwd_before_adoption_settles_source_gone(self):
+        root = Path(self.tmp.name)
+        source_cwd = root / 'work'
+        source_cwd.mkdir()
+        with common.file_lock('fixture-handoff'):
+            proc = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), '--fixture',
+                                     self.tmp.name, '1', 'boat'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    start_new_session=True, cwd=source_cwd,
+                                    env=dict(os.environ, OFFBOX_TEST_HANDOFF='1'))
+            self.addCleanup(self.stop, proc)
+            self.until(lambda: (root / 'handoff').exists(), proc)
+            child = int((root / 'handoff').read_text())
+            self.addCleanup(self.stop_child, child, proc.pid)
+            source_cwd.rmdir()
+        self.until(lambda: (root / 'returned').exists(), proc)
+        row = self.con.execute('SELECT * FROM runs ORDER BY start_at DESC LIMIT 1').fetchone()
+        self.until(lambda: self.con.execute('SELECT status FROM runs WHERE run_id=?',
+                                            (row['run_id'],)).fetchone()[0] == 'source_gone', proc)
+        row = self.con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone()
+        self.assertEqual(row['exit_code'], 2)
+        self.assertIn(str(source_cwd), row['error'])
+        self.assertIsNone(row['box_id'])
+        self.assertGreater(Path(row['log_path']).stat().st_size, 0)
+        self.assertFalse((root / 'starts').exists())
+        self.assertFalse((root / 'waiting').exists())
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(misc.wait(row['run_id'], 1), 2)
+
     def test_foreground_term_in_pool_wait_still_settles_killed(self):
         with common.file_lock('fixture-slot'):
             proc, row = self.launch(bg=False)
@@ -212,8 +263,104 @@ runpy.run_path(target, run_name='__main__')
             self.assertEqual(tuple(current), ('killed', 130))
         self.assertFalse((Path(self.tmp.name) / 'starts').exists())
 
+    def test_caller_sigint_during_readiness_does_not_cancel_the_child(self):
+        self.readiness_sigint(threaded=False)
+
+    def test_threaded_caller_sigint_during_readiness_does_not_cancel_the_child(self):
+        self.readiness_sigint(threaded=True)
+
+    def test_threaded_caller_sigint_does_not_waive_readiness_timeout(self):
+        self.readiness_sigint(threaded=True, timeout=True)
+
+    def test_masked_main_replays_sigint_through_an_unmasked_thread(self):
+        self.readiness_sigint(threaded=True, masked=True)
+
+    def readiness_sigint(self, *, threaded, timeout=False, masked=False):
+        root = Path(self.tmp.name)
+        with common.file_lock('fixture-handoff'):
+            proc = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), '--fixture',
+                                     self.tmp.name, '1', 'boat'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    start_new_session=True, env=dict(os.environ, OFFBOX_TEST_HANDOFF='1',
+                                                                   OFFBOX_TEST_THREADED_CALLER='1' if threaded else '',
+                                                                   OFFBOX_TEST_MASKED_MAIN='1' if masked else '',
+                                                                   OFFBOX_TEST_READY_TIMEOUT='1' if timeout else ''))
+            self.addCleanup(self.stop, proc)
+            self.until(lambda: (root / 'handoff').exists(), proc)
+            child = int((root / 'handoff').read_text())
+            self.addCleanup(self.stop_child, child, proc.pid)
+            os.killpg(proc.pid, signal.SIGINT)
+            if timeout:
+                # Keep readiness blocked until the original deadline fences the transferred worker.
+                proc.communicate(timeout=5)
+                row = self.con.execute('SELECT status,exit_code FROM runs ORDER BY start_at DESC LIMIT 1').fetchone()
+                self.assertEqual(tuple(row), ('local_error', common.EXIT_LOCAL))
+                self.assertFalse(misc._client_alive(child, None))
+                self.assertFalse((root / 'starts').exists())
+                return
+        if masked:
+            self.until(lambda: (root / 'returned').exists(), proc)
+            self.until(lambda: (root / 'caller-interrupted').exists(), proc)
+            self.assertEqual((root / 'caller-interrupted').read_text(), '1')
+            self.assertEqual((root / 'mask-restored').read_text(), 'True')
+            self.assertEqual((root / 'returned').read_text(), '0')
+        else:
+            proc.communicate(timeout=5)
+            self.assertNotEqual(proc.returncode, 0)
+        row = self.con.execute('SELECT * FROM runs ORDER BY start_at DESC LIMIT 1').fetchone()
+        self.assertNotEqual(row['status'], 'local_error')
+        self.until(lambda: (root / 'ttl').exists())
+        self.assertEqual((root / 'starts').read_text().splitlines(), [row['run_id']])
+
+    def test_partial_payload_then_caller_sigkill_has_a_proven_dead_client(self):
+        root = Path(self.tmp.name)
+        entry = root / 'bootstrap.py'
+        entry.write_text('import json,sys,time\nfrom pathlib import Path\n'
+                         'data=sys.stdin.buffer.read(16)\n'
+                         f'Path({str(root / "partial")!r}).touch()\n'
+                         f'while not Path({str(root / "release-partial")!r}).exists(): time.sleep(.01)\n'
+                         'json.loads(data+sys.stdin.buffer.read())\n')
+        proc = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), '--fixture',
+                                 self.tmp.name, '1', 'boat'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True, env=dict(os.environ, OFFBOX_TEST_ENTRY=str(entry)))
+        self.addCleanup(self.stop, proc)
+        self.until(lambda: (root / 'partial').exists(), proc)
+        row = self.con.execute('SELECT * FROM runs ORDER BY start_at DESC LIMIT 1').fetchone()
+        self.assertIsNotNone(row['client_pid'])
+        self.assertNotEqual(row['client_pid'], proc.pid)
+        self.addCleanup(self.stop_child, row['client_pid'], proc.pid)
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate(timeout=5)
+        (root / 'release-partial').touch()
+        self.until(lambda: not misc._client_alive(row['client_pid'], row['start_at']))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(misc.wait(row['run_id'], 1), common.EXIT_NOT_STARTED)
+        self.assertFalse((root / 'starts').exists())
+
 
 class NeverStartedTests(Isolated):
+    def test_empty_client_log_does_not_guess_caller_interruption(self):
+        self.con.execute("INSERT INTO runs(run_id,mode,status) VALUES ('run-empty-client','bg','lost')")
+        (misc.LOGS_DIR / 'run-empty-client.client.log').touch()
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(misc.wait('run-empty-client', 1), common.EXIT_NOT_STARTED)
+        self.assertNotIn('caller interrupted?', err.getvalue())
+
+    def test_client_diagnostics_tail_precedes_any_step_history_recovery(self):
+        self.con.execute("INSERT INTO runs(run_id,mode,status,error,step_count) VALUES "
+                         "('run-crash','bg','lost','client ended before it got a box',2)")
+        (misc.LOGS_DIR / 'run-crash.client.log').write_text(''.join(f'crash line {i}\n' for i in range(30)))
+        for command in (lambda: misc.wait('run-crash', 1), lambda: misc.logs('run-crash', False),
+                        lambda: misc.logs('run-crash', True)):
+            with contextlib.redirect_stderr(io.StringIO()) as err, \
+                    patch.object(misc, '_catch_up_log', side_effect=AssertionError('never started')):
+                self.assertEqual(command(), common.EXIT_NOT_STARTED)
+                self.assertIn('nothing ran, safe to rerun', err.getvalue())
+                self.assertNotIn('caller interrupted?', err.getvalue())
+                self.assertNotIn('crash line 9\n', err.getvalue())
+                self.assertIn('crash line 10\n', err.getvalue())
+                self.assertIn('crash line 29\n', err.getvalue())
+                self.assertNotIn('incomplete', err.getvalue())
+
     def test_wait_and_logs_killed_while_queued_keep_exit_130(self):
         for mode in ('fg', 'bg'):
             for steps in (0, 2):
@@ -463,7 +610,8 @@ class BackgroundFailoverTests(Isolated):
                     patch.object(api, 'probe_backend', return_value=answer) as probe, \
                     patch.object(home, 'record_failure') as record, \
                     patch.object(home, '_forward_background', side_effect=forward) as forwarded, \
-                    patch.object(os, 'execve', side_effect=execute) as executed, \
+                    patch.object(runs, 'forward_background', side_effect=execute) as executed, \
+                    patch.object(os, 'execve', side_effect=AssertionError('background argv must stay private')), \
                     contextlib.redirect_stderr(io.StringIO()):
                 if answer is None:
                     with self.assertRaises(Moved):
@@ -491,5 +639,18 @@ class BackgroundFailoverTests(Isolated):
                     self.assertEqual(common._known('server', ident, suffix=suffix), match and status != 'forwarded')
 
 
-if __name__ == '__main__' and len(sys.argv) > 1 and sys.argv[1] == '--fixture':
-    fixture(Path(sys.argv[2]), bool(int(sys.argv[3])), sys.argv[4])
+if __name__ == '__main__' and len(sys.argv) > 1:
+    if sys.argv[1] == '--fixture':
+        fixture(Path(sys.argv[2]), bool(int(sys.argv[3])), sys.argv[4])
+    elif sys.argv[1] == '_bg-queue':
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+        payload = json.load(sys.stdin)
+        os.environ.clear()
+        os.environ.update(payload['env'])
+        root = Path(os.environ['OFFBOX_TEST_ROOT'])
+        configure_fixture(root, payload['backend'])
+        if os.environ.get('OFFBOX_TEST_HANDOFF'):
+            (root / 'handoff').write_text(str(os.getpid()))
+            with common.file_lock('fixture-handoff', timeout=15):
+                pass
+        sys.exit(runs.background_queue(sys.argv[2], payload))

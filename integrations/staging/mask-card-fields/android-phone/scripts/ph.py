@@ -29,6 +29,8 @@ def doctor(as_json):
         pw = (_run(["adb", "-s", SERIAL, "shell", "dumpsys power | grep -m1 mWakefulness"]).strip().splitlines() or [""])[0]
         if echo == "ok":
             st, detail, code = "ok", f"adb reachable; {pw or 'screen state unknown'}", 0
+            if not re.search(r"\bmWakefulness=Awake\b", pw):
+                detail += "; phone not awake; run ph wake"
         else:
             st, detail, ask = "offline", "adb lists the phone but its shell did not answer", None
     elif s == "unauthorized":
@@ -53,6 +55,46 @@ def doctor(as_json):
         print(f"{st}: {detail}")
         if ask: print(f"ask: {ask}")
     sys.exit(code)
+def wake(timeout=6.0):
+    deadline = time.monotonic() + timeout
+    retry_at = deadline - timeout / 2
+    state = {"wakefulness": None, "keyguard": "unknown", "actions": []}
+    def run(*args):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0: return ""
+        # Bound each adb call as well as polling; the outer step alarm defaults to 45s.
+        return _run(["adb", "-s", SERIAL, *args], t=min(1.0, remaining))
+    def act(name, *args):
+        if time.monotonic() < deadline:
+            state["actions"].append(name)
+            run(*args)
+    def power():
+        match = re.search(r"\bmWakefulness=(\w+)", run("shell", "dumpsys power | grep -m1 mWakefulness"))
+        return match.group(1) if match else None
+    def wake_key():
+        act("KEYCODE_WAKEUP", "shell", "input", "keyevent", "KEYCODE_WAKEUP")
+    def dismiss():
+        act("dismiss-keyguard", "shell", "wm", "dismiss-keyguard")
+
+    state["wakefulness"] = power()
+    # ADB wakes Dozing directly; u2's screen_on() treats AOD as already on.
+    if state["wakefulness"] != "Awake": wake_key()
+    dismiss()
+    retried = False
+    while time.monotonic() < deadline:
+        state["wakefulness"] = power()
+        match = re.search(r"\bisKeyguardShowing=(true|false)\b", run("shell", "dumpsys window"))
+        # Missing keyguard data cannot prove the app is accessible.
+        state["keyguard"] = {"true": "showing", "false": "hidden"}.get(match.group(1) if match else None, "unknown")
+        if state["wakefulness"] == "Awake" and state["keyguard"] == "hidden":
+            return True, state
+        if not retried and time.monotonic() >= retry_at and state["wakefulness"] != "Awake":
+            wake_key()
+            dismiss()
+            retried = True
+        remaining = deadline - time.monotonic()
+        if remaining > 0: time.sleep(min(0.3, remaining))
+    return False, state
 def nodes():
     root = ET.fromstring(d().dump_hierarchy(compressed=False))
     out = []
@@ -182,7 +224,17 @@ sh CMD...                  raw adb shell
     elif c == "cur":
         out = subprocess.run(["adb","-s",SERIAL,"shell","dumpsys activity activities | grep -m1 topResumedActivity"],capture_output=True,text=True).stdout.strip()
         print(out or d().app_current())
-    elif c == "wake": d().screen_on(); adb("shell", "wm", "dismiss-keyguard"); print("awake")
+    elif c == "wake":
+        ok, state = wake()
+        if "--json" in a:
+            import json
+            print(json.dumps({"ok": ok, **state}))
+        elif ok: print("awake")
+        elif state["wakefulness"] == "Awake" and state["keyguard"] == "showing":
+            print("locked: wakefulness=Awake keyguard=showing after dismiss (secure lock?)")
+        else:
+            print(f"not awake: wakefulness={state['wakefulness'] or 'unknown'} keyguard={state['keyguard']}")
+        if not ok: sys.exit(1)
     elif c == "sms":
         q = ("select datetime(date/1000000000+978307200,'unixepoch','localtime'), text from message "
              f"where is_from_me=0 and text is not null and text != '' order by date desc limit {int(a[1]) if len(a)>1 else 4}")

@@ -1,6 +1,6 @@
 import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { homedir } from "node:os";
+import { logDirectory as bridgeLogDirectory } from "./log-directory.ts";
 import { join } from "node:path";
 
 export type LogEntry = {
@@ -19,7 +19,7 @@ const values: Record<string, readonly string[]> = {
   action: ["create", "queue", "cancel", "snooze", "sent", "retry", "check", "wake", "notify", "send", "coalesce", "conflict", "expire", "pause", "remove", "cap", "resume"],
   state: ["pending", "sending", "sent", "uncertain", "cancelled", "failed", "scheduled", "queued", "done", "expired", "paused", "active"],
 };
-export const logDirectory = () => process.env.TOOLLOG_DIR ?? join(homedir(), ".robob/logs/tools/watchers");
+export const logDirectory = () => bridgeLogDirectory("watchers");
 const initialized = new Set<string>();
 const CAP = 50 * 1024 * 1024;
 

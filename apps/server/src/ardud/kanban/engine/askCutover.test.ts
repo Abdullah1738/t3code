@@ -300,18 +300,18 @@ it.effect("an evaluator edits a worker's old ask in place into a typed one", () 
   }),
 );
 
-it.effect("who may edit an ask: an evaluator any, a worker those on the card it is running", () =>
+it.effect("an evaluator edits any ask; a worker edits its own card, running or parked", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
       const { kanban, board, first, worker } = yield* oldBoard;
-      // The worker that raised the blocking ask is parked: the card is not its to change now.
-      const parked = yield* Effect.flip(
-        kanban.editAsk(first.id, "q1", { title: "Mine" }, worker, "cardThread"),
-      );
+      // #1282 / 9a3c33c0b8 lets the parked work thread revise its card's open asks.
+      const parked = yield* kanban.editAsk(first.id, "q1", { title: "Mine" }, worker, "cardThread");
+      assert.strictEqual(parked.stage, "needs_owner");
+      assert.isNull(parked.activeThreadId);
       assert.deepStrictEqual(
-        [parked.code, parked.detail],
-        ["denied", "card #1 is not assigned to this thread"],
+        [askOf(parked).title, askOf(parked).revision, askOf(parked).by, askOf(parked).closedAt],
+        ["Mine", 1, worker, null],
       );
       // A worker running its card edits its own async ask.
       const card = yield* kanban.createCard(board.id, { prompt: "Logo", title: "Logo" }, owner);
@@ -359,7 +359,7 @@ it.effect("who may edit an ask: an evaluator any, a worker those on the card it 
   }),
 );
 
-it.effect("words in the card discussion from an older client do not approve a typed ask", () =>
+it.effect("words from an older client close a typed ask as text without approving it", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -395,22 +395,21 @@ it.effect("words in the card discussion from an older client do not approve a ty
         ["q1", "Deploy build 42 tonight?", ["Approve", "Reject"]],
       );
 
-      // He replies in words from there: no values, no verdict. That is not an approval of
-      // the action: the ask stays open, waits on its asker, and the card stays held.
+      // #1158 / PR #49 closes a reply as text when required values are missing;
+      // it records his decision without granting approval for the action.
       const text = "Yes, go at 22:00 Dubai time.";
       yield* kanban.post(discussion.id, owner, [{ _tag: "md", text }]);
       const after = (yield* kanban.card(card.id)).card;
-      assert.strictEqual(after.stage, "needs_owner");
+      assert.strictEqual(after.stage, "todo");
+      const answer = askOf(after).answer!;
+      assert.isNotNull(askOf(after).closedAt);
       assert.deepStrictEqual(
-        [askOf(after).closedAt, askOf(after).answer, kanbanAskWaitsOn(askOf(after))],
-        [null, undefined, "agent"],
+        [answer.verdict, answer.by, answer.text, answer.values, kanbanAskWaitsOn(askOf(after))],
+        ["text", owner, text, undefined, null],
       );
-      // The worker is parked on its ask, so the discussion's evaluator hears his words and
-      // that they were not the ask's answer.
-      const told = (yield* fake.evaluators).flatMap((entry) => entry.messages).join("\n");
-      assert.include(told, ownerMessageText("#1 Deploy", discussion.id, text));
-      assert.include(told, "It is not an approval, a pick or a decision on that ask");
-      assert.notInclude((yield* fake.heard(threadId)).join("\n"), text);
+      assert.include(after.wakeNote ?? "", text);
+      yield* kanban.dispatchNow;
+      assert.include((yield* fake.heard(threadId)).join("\n"), text);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

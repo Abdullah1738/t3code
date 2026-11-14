@@ -2,6 +2,7 @@ import copy
 from dataclasses import replace
 from decimal import Decimal
 import unittest
+import order_card
 
 from noon_checkout import AccountHome, fingerprint
 from noon_nownow_checkout import SavedCard, Snapshot, QUIET_NOTE
@@ -20,7 +21,7 @@ class ReviewTests(unittest.TestCase):
             orderPaymentAmount=Decimal('25'), hasPackageFee=False,
             vipSingleCheckoutInfo={'isAddedToCart': False}, priceBreakdown=[{'label': 'Total', 'values': ['25 AED']}],
             paymentMethodCode='prepaid', prepaidPaymentMisc={'prepaidPaymentMethodCode': 'cc_noonpay', 'isCvvRequired': False},
-            creditCardMask='xxxx2342', paymentToken='synthetic-token', hasPaymentSubscription=True,
+            creditCardMask='xxxx' + order_card.LAST4, paymentToken='synthetic-token', hasPaymentSubscription=True,
             isVerifyDeviceRequired=False, deliveryPreference={'dont_ring_the_bell': True, 'leave_it_at_my_door': True},
             driverNotes=QUIET_NOTE, checkoutWarningPopup=None)
         self.args = dict(account_home=AccountHome('nownow', fingerprint('customer'), fingerprint('home', 'key'), 100),
@@ -28,7 +29,7 @@ class ReviewTests(unittest.TestCase):
             expected_manifest=[{'productCode': 'p', 'qty': 2, 'modifiers': {}, 'notes': None}],
             expected_financials_minor={k: int(self.row[k] * 100) for k in r.FINANCIAL_FIELDS},
             expected_price_breakdown=copy.deepcopy(self.row['priceBreakdown']),
-             card=SavedCard('synthetic-token', 'xxxx2342', 'mastercard'), now=110)
+             card=SavedCard('synthetic-token', 'xxxx' + order_card.LAST4, order_card.NETWORK), now=110)
         self.args['card_binding']=CardSyncBinding(fingerprint('customer'),fingerprint('home','key'),
             fingerprint('owned'),fingerprint('synthetic-token'),'1'*64,'2'*64,100)
 

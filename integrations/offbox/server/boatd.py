@@ -1109,6 +1109,26 @@ def box_window(con, box_id: str, t0: float, t1: float) -> dict:
             "box_io_bytes": (rows[-1]["io_bytes"] or 0) - (rows[0]["io_bytes"] or 0)}
 
 
+def running_box_count(con) -> int | None:
+    # Existing state only: telemetry must never invoke Incus or wait for a sampler tick.
+    try:
+        return con.execute("SELECT COUNT(*) FROM boxes WHERE deleted_at IS NULL "
+                           "AND state IN ('ready','running')").fetchone()[0]
+    except Exception:
+        return None
+
+
+def host_box_metrics(value) -> dict:
+    try:
+        host = (json.loads(value) if value else {}).get('host_boxes')
+        if isinstance(host, dict):
+            return {'host_boxes': {k: host[k] if type(host.get(k)) is int and host[k] >= 0 else None
+                                   for k in ('start', 'end')}}
+    except Exception:
+        pass
+    return {'host_boxes': None}
+
+
 def run_cmd(box_id: str, pid: int) -> int:
     load_cfg()
     con = db()
@@ -1120,6 +1140,7 @@ def run_cmd(box_id: str, pid: int) -> int:
     queued = admit(con, box_id, pid, r["kind"], errf)
     code, sig = None, None
     t0 = now()
+    host_boxes = {"start": running_box_count(con), "end": None}
     try:
         if (d / f"{pid}.kill").exists():
             code, sig = 143, "SIGTERM"
@@ -1135,6 +1156,7 @@ def run_cmd(box_id: str, pid: int) -> int:
         errf.write(f"\noffbox-server: command failed to start: {e}\n".encode())
         code = 125
     t1 = now()
+    host_boxes['end'] = running_box_count(con)
     toollog.emit("boatd", "run.command", kind="perf" if code == 0 else "error", duration_ms=max(0, t1-t0)*1000,
                  ok=code == 0, ids={"box": box_id, "run": r["run_id"]},
                  props={"exitCode": code, "timeoutHit": code == 124, "attempt": attempt, "backend": "home"},
@@ -1146,7 +1168,8 @@ def run_cmd(box_id: str, pid: int) -> int:
     # The result goes to disk first: if boatd or this runner is gone before the database has it, the next
     # reconcile finalizes the run from this file instead of calling it interrupted.
     write_json(result_path(box_id, pid), {"attempt": attempt, "status": status, "exit_code": code, "signal": sig,
-                                          "started_at": t0, "ended_at": t1, "boot_id": boot_id()})
+                                          "started_at": t0, "ended_at": t1, "boot_id": boot_id(),
+                                          "host_boxes": host_boxes})
     m = read_cg(cg_path(box_id) / "boatd" / str(pid))
     try:
         (cg_path(box_id) / "boatd" / str(pid)).rmdir()
@@ -1155,6 +1178,7 @@ def run_cmd(box_id: str, pid: int) -> int:
     m.update(box_window(con, box_id, t0, t1))
     m["wall_s"] = round(t1 - t0, 2)
     m["queued_s"] = round(queued, 2)
+    m["host_boxes"] = host_boxes
     con.execute("UPDATE commands SET status=?, exit_code=?, signal=?, ended_at=?, metrics=? WHERE box_id=? AND pid=? "
                 "AND attempt=?", (status, code, sig, t1, json.dumps(m), box_id, pid, attempt))
     con.execute("UPDATE boxes SET last_active=?, updated_at=? WHERE id=?", (now(), now(), box_id))
@@ -1191,7 +1215,7 @@ def settle_cmd(con, c) -> str:
     t = now()
     if res:
         m = {"wall_s": round((res.get("ended_at") or t) - (res.get("started_at") or t), 2),
-             "queued_s": c["queued_s"], "recovered": True}
+             "queued_s": c["queued_s"], "recovered": True, "host_boxes": res.get('host_boxes')}
         con.execute("UPDATE commands SET status=?, exit_code=?, signal=?, ended_at=?, metrics=COALESCE(metrics, ?) "
                     "WHERE box_id=? AND pid=?", (res.get("status") or "exited", res.get("exit_code"),
                                                  res.get("signal"), res.get("ended_at") or t, json.dumps(m),
@@ -1756,9 +1780,12 @@ class Handler(BaseHTTPRequestHandler):
                 with open(p, "rb") as f:
                     f.seek(off)
                     data = f.read(1 << 20)
+                    size = os.fstat(f.fileno()).st_size
                 data, nxt = _utf8_cut(data, off)
-                return {"ok": True, "data": data, "nextOffset": nxt,
-                        "done": r["status"] not in ("queued", "running") and nxt >= p.stat().st_size}
+                return {"ok": True, "data": data, "nextOffset": nxt, "size": size,
+                        "done": r["status"] not in ("queued", "running") and nxt >= size,
+                        "commandId": r['command_id'], "status": r['status'],
+                        "metrics": host_box_metrics(r['metrics'])}
             return {"ok": True, "command": cmd_status_json(con, bid, r["pid"], 0)}
         raise Fail(404, "not_found", path)
 
@@ -1868,7 +1895,7 @@ class Handler(BaseHTTPRequestHandler):
                             sent = True
                 if sent:
                     continue
-                r = con.execute("SELECT status, exit_code, signal, attempt, command_id, started_at, ended_at FROM commands WHERE box_id=? AND pid=?",
+                r = con.execute("SELECT status, exit_code, signal, attempt, command_id, started_at, ended_at, metrics FROM commands WHERE box_id=? AND pid=?",
                                 (bid, pid)).fetchone()
                 if (r["attempt"] or 1) != attempt:
                     attempt = r["attempt"] or 1
@@ -1885,7 +1912,8 @@ class Handler(BaseHTTPRequestHandler):
                     if all(offs[w] >= sizes[w] for w in sizes):
                         emit({"type": "exit", "exitCode": r["exit_code"], "signal": r["signal"],
                               "status": r["status"], "attempt": attempt, "commandId": r["command_id"],
-                              "startedAt": iso(r["started_at"]), "endedAt": iso(r["ended_at"])})
+                              "startedAt": iso(r["started_at"]), "endedAt": iso(r["ended_at"]),
+                              "metrics": host_box_metrics(r['metrics'])})
                         break
                     continue
                 if now() - started > 600:

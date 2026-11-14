@@ -5,10 +5,12 @@ import {
   KANBAN_WS_METHODS,
   ORCHESTRATION_V2_WS_METHODS,
   WS_METHODS,
+  LONG_TASK_HISTOGRAM_BUCKETS,
   type AnalyticsEvent,
 } from "@t3tools/contracts";
 import { DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts/settings";
 import * as RpcSerialization from "effect/rpc/RpcSerialization";
+import { createLongTaskTracker, type LongTaskEntry, type LongTaskView } from "./longTasks.ts";
 
 export type ClientAnalyticsEvent = AnalyticsEvent & {
   readonly surface: "web" | "desktop" | "mobile";
@@ -22,7 +24,7 @@ const kinds = new Set([
   "screen.open",
   "screen.dwell",
   "owner.action",
-  "ask.answered",
+  "ask.answer_sent",
   "ask.dropped",
   "discussion.post",
   "discussion.read-end",
@@ -39,6 +41,7 @@ const kinds = new Set([
   "performance.route",
   "performance.action",
   "performance.long-task",
+  "performance.long-task-summary",
   "performance.frames",
   "performance.memory",
   "rpc.summary",
@@ -60,6 +63,18 @@ const routes = new Set([
   "connect",
   "welcome",
   "other",
+]);
+const screenKinds = new Set([
+  ...routes,
+  "board.threads",
+  "board.goals",
+  "board.discussions",
+  "board.automations",
+  "board.scripts",
+  "board.wiki",
+  "board.settings",
+  "needs-owner.history",
+  "needs-owner.reference",
 ]);
 const methods = new Set<string>([
   ...Object.values(WS_METHODS),
@@ -284,6 +299,7 @@ const ownerMutationMethods = new Set<string>([
   WS_METHODS.worktreeSetupCancel,
   KANBAN_WS_METHODS.boardCreate,
   KANBAN_WS_METHODS.boardUpdate,
+  KANBAN_WS_METHODS.standingApprovalRevoke,
   KANBAN_WS_METHODS.setupStart,
   KANBAN_WS_METHODS.setupEnd,
   KANBAN_WS_METHODS.boardPause,
@@ -307,6 +323,17 @@ const ownerMutationMethods = new Set<string>([
   ORCHESTRATION_V2_WS_METHODS.stopWorkflow,
 ]);
 const labels: Readonly<Record<string, ReadonlySet<string>>> = {
+  screen: screenKinds,
+  containerType: new Set(["iframe", "embed", "object", "window", "unknown"]),
+  containerName: new Set(["none", "redacted"]),
+  ownerAction: new Set([
+    ...methods,
+    ...ownerOperations,
+    "owner.action",
+    "command.palette",
+    "command.keybinding",
+    "settings.change",
+  ]),
   method: methods,
   errorTag: errorTags,
   span: new Set([
@@ -382,6 +409,13 @@ const measurements = [
   "depth",
   "droppedFrames",
   "memoryBytes",
+  "visibleCardCount",
+  "visibleThreadCount",
+  "subscriptionBytes",
+  "subscriptionMessages",
+  "totalMs",
+  "maxMs",
+  "wallTimeMs",
 ] as const;
 const ids = ["boardId", "cardId", "discussionId", "threadId"] as const;
 const record = (value: unknown): Record<string, unknown> =>
@@ -412,7 +446,7 @@ export function sanitizeAnalyticsEvent(input: unknown): ClientAnalyticsEvent | u
     (value.surface !== "web" && value.surface !== "desktop" && value.surface !== "mobile")
   )
     return;
-  const props: Record<string, string | number> = {};
+  const props: Record<string, string | number | ReadonlyArray<readonly [number, number]>> = {};
   const raw = record(value.props);
   for (const [key, allowed] of Object.entries(labels)) {
     if (typeof raw[key] === "string" && allowed.has(raw[key])) props[key] = raw[key];
@@ -422,6 +456,53 @@ export function sanitizeAnalyticsEvent(input: unknown): ClientAnalyticsEvent | u
   if (token(raw.poolKey, 160)) props.poolKey = raw.poolKey;
   if (iso(raw.createdAt)) props.createdAt = raw.createdAt;
   for (const key of measurements) if (measurement(raw[key])) props[key] = raw[key];
+  const longTask =
+    value.kind === "performance.long-task" || value.kind === "performance.long-task-summary";
+  if (longTask) {
+    for (const key of Object.keys(props))
+      if (
+        ![
+          "method",
+          "screen",
+          "containerType",
+          "containerName",
+          "ownerAction",
+          "visibleCardCount",
+          "visibleThreadCount",
+          "subscriptionBytes",
+          "subscriptionMessages",
+          "count",
+          "totalMs",
+          "p95Ms",
+          "maxMs",
+          "wallTimeMs",
+        ].includes(key)
+      )
+        delete props[key];
+    if (
+      value.kind === "performance.long-task-summary" &&
+      Array.isArray(raw.histogram) &&
+      raw.histogram.length <= LONG_TASK_HISTOGRAM_BUCKETS
+    ) {
+      const histogram: Array<readonly [number, number]> = [];
+      for (const item of raw.histogram) {
+        if (
+          !Array.isArray(item) ||
+          item.length !== 2 ||
+          !Number.isInteger(item[0]) ||
+          item[0] < 0 ||
+          item[0] >= LONG_TASK_HISTOGRAM_BUCKETS ||
+          !measurement(item[1]) ||
+          !Number.isInteger(item[1])
+        ) {
+          histogram.length = 0;
+          break;
+        }
+        histogram.push([item[0], item[1]]);
+      }
+      props.histogram = histogram;
+    }
+  }
   const event: ClientAnalyticsEvent = {
     ts: value.ts,
     kind: value.kind,
@@ -432,7 +513,7 @@ export function sanitizeAnalyticsEvent(input: unknown): ClientAnalyticsEvent | u
   };
   const cleanIds: Partial<Record<(typeof ids)[number], string>> = {};
   for (const key of ids) if (token(value[key], 512)) cleanIds[key] = value[key];
-  return { ...event, ...cleanIds };
+  return longTask ? event : { ...event, ...cleanIds };
 }
 
 export function analyticsErrorTag(error: unknown): string {
@@ -488,7 +569,7 @@ export interface AnalyticsCollector {
   readonly endRoute: () => void;
   readonly trackScreen: (details: AnalyticsDetails) => () => void;
   readonly record: (kind: string, details?: AnalyticsDetails) => void;
-  readonly setRoute: (details: AnalyticsDetails) => void;
+  readonly setRoute: (details: AnalyticsDetails, foreground?: boolean) => void;
   readonly beginRpc: (
     method: string,
   ) => (durationMs: number, bytes: number, errorTag?: string) => void;
@@ -499,6 +580,9 @@ export interface AnalyticsCollector {
     errorTag?: string,
     stream?: boolean,
   ) => void;
+  readonly recordLongTask: (entry: LongTaskEntry) => void;
+  readonly enableLongTasks: () => void;
+  readonly trackLongTaskView: (view: LongTaskView) => () => void;
   readonly flush: () => Promise<void>;
   readonly background: (phase: "background" | "close") => Promise<void>;
   readonly foreground: () => void;
@@ -528,6 +612,36 @@ export function createAnalyticsCollector(options: {
   let visible = true;
   const rpc = new Map<string, RpcSamples>();
   const screens = new Set<{ details: AnalyticsDetails; started: number; elapsed: number }>();
+  const views = new Set<LongTaskView>();
+  const longTasks = createLongTaskTracker({
+    now,
+    emit: (kind, route, durationMs, props, at) =>
+      enqueue(
+        kind,
+        { route, ...(durationMs === undefined ? {} : { durationMs }), props },
+        false,
+        at,
+      ),
+  });
+  const updateLongTaskView = () => {
+    const details = [...screens].at(-1)?.details;
+    const view = [...views].at(-1);
+    const safeRoute = route.route && routes.has(route.route) ? route.route : "other";
+    const screen = details?.route ?? view?.screen ?? safeRoute;
+    longTasks.context(
+      {
+        screen: screenKinds.has(screen) ? screen : "other",
+        visibleCardCount:
+          [...views].reduce((n, view) => n + (view.visibleCardCount ?? 0), 0) +
+          (details?.cardId ? 1 : 0),
+        visibleThreadCount: [...views].reduce(
+          (n, view) => n + (view.visibleThreadCount ?? 0),
+          route.route === "thread" ? 1 : 0,
+        ),
+      },
+      safeRoute,
+    );
+  };
   const arm = () => {
     if (disposed || timer !== undefined) return;
     timer = setTimeout(() => {
@@ -535,7 +649,12 @@ export function createAnalyticsCollector(options: {
       void flush();
     }, options.flushMs ?? ANALYTICS_FLUSH_MS);
   };
-  const enqueue = (kind: string, details: AnalyticsDetails = {}, inheritContext = true) => {
+  const enqueue = (
+    kind: string,
+    details: AnalyticsDetails = {},
+    inheritContext = true,
+    at = now(),
+  ) => {
     if (disposed) return;
     const event = sanitizeAnalyticsEvent({
       ...(inheritContext ? route : {}),
@@ -547,7 +666,7 @@ export function createAnalyticsCollector(options: {
       },
       kind,
       surface: options.surface,
-      ts: new Date(now()).toISOString(),
+      ts: new Date(at).toISOString(),
     });
     if (!event) return;
     const available = maxEvents - inFlight.length;
@@ -563,10 +682,21 @@ export function createAnalyticsCollector(options: {
     arm();
   };
   const recordEvent = (kind: string, details?: AnalyticsDetails) => {
+    if (
+      ["owner.action", "command.palette", "command.keybinding", "settings.change"].includes(kind)
+    ) {
+      const key = details?.props?.key;
+      const method = details?.props?.method;
+      longTasks.action(
+        key && ownerOperations.has(key) ? key : method && methods.has(method) ? method : kind,
+      );
+    }
     enqueue(kind, details);
     if (queue.length >= ANALYTICS_BATCH_SIZE) void flush();
   };
   const drainSamples = () => {
+    drainLongTaskObserver?.();
+    longTasks.flush();
     for (const sample of rpc.values()) {
       sample.samples.sort((a, b) => a - b);
       const percentile = (p: number) =>
@@ -680,11 +810,14 @@ export function createAnalyticsCollector(options: {
   return {
     context: () => route,
     record: recordEvent,
-    setRoute: (details) => {
+    setRoute: (details, foreground = true) => {
       dwell();
       if (!visible) for (const screen of screens) screen.started = now();
-      visible = true;
+      visible = foreground;
       route = details;
+      updateLongTaskView();
+      if (foreground) longTasks.foreground();
+      else longTasks.pause();
       routeStarted = now();
       recordEvent("screen.open");
     },
@@ -692,14 +825,17 @@ export function createAnalyticsCollector(options: {
       dwell();
       pauseScreens();
       visible = false;
+      longTasks.pause();
     },
     trackScreen: (details) => {
       const screen = { details, started: now(), elapsed: 0 };
       if (screens.size >= 64) return () => {};
       screens.add(screen);
+      updateLongTaskView();
       recordEvent("screen.open", details);
       return () => {
         if (!screens.delete(screen)) return;
+        updateLongTaskView();
         recordEvent("screen.dwell", {
           ...details,
           durationMs: screen.elapsed + (visible ? Math.max(0, now() - screen.started) : 0),
@@ -723,19 +859,54 @@ export function createAnalyticsCollector(options: {
       if (!disposed && methods.has(method) && method !== WS_METHODS.analyticsIngest) {
         const sample = rpcSample(method, captureRpcContext(context), errorTag, stream);
         sample.bytes += bytes;
+        if (stream) longTasks.received(method, bytes);
         if (stream) sample.count++;
         arm();
       }
+    },
+    recordLongTask: (entry) => {
+      longTasks.record({
+        ...entry,
+        attribution: entry.attribution?.slice(0, 1).map((item) => ({
+          containerType: labels.containerType!.has(item.containerType ?? "")
+            ? item.containerType!
+            : "unknown",
+          // Browser container names can be arbitrary DOM names, including user content.
+          containerName: item.containerName ? "redacted" : "none",
+        })),
+      });
+      arm();
+    },
+    enableLongTasks: () => {
+      longTasks.enable();
+      arm();
+    },
+    trackLongTaskView: (view) => {
+      if (views.size >= 64) return () => {};
+      const clean = {
+        screen: screenKinds.has(view.screen) ? view.screen : "other",
+        visibleCardCount: measurement(view.visibleCardCount) ? view.visibleCardCount : 0,
+        visibleThreadCount: measurement(view.visibleThreadCount) ? view.visibleThreadCount : 0,
+      };
+      views.add(clean);
+      updateLongTaskView();
+      return () => {
+        views.delete(clean);
+        updateLongTaskView();
+      };
     },
     flush,
     background: async (phase) => {
       if (visible) dwell();
       pauseScreens();
       visible = false;
+      drainLongTaskObserver?.();
+      longTasks.flush(true);
       enqueue("client.lifecycle", { props: { phase } });
       await flush(true);
     },
     foreground: () => {
+      longTasks.foreground();
       if (!visible) {
         visible = true;
         routeStarted = now();
@@ -754,7 +925,15 @@ export function createAnalyticsCollector(options: {
 }
 
 const collectors = new Map<string, AnalyticsCollector>();
+let drainLongTaskObserver: (() => void) | undefined;
+export function registerAnalyticsLongTaskObserver(drain: () => void) {
+  drainLongTaskObserver = drain;
+  return () => {
+    if (drainLongTaskObserver === drain) drainLongTaskObserver = undefined;
+  };
+}
 let activeEnvironmentId: string | null = null;
+const longTaskEnvironments: Array<{ at: number; environmentId: string | null }> = [];
 export const analyticsForEnvironment = (environmentId: string | null | undefined) =>
   environmentId ? collectors.get(environmentId) : undefined;
 export function registerEnvironmentAnalytics(
@@ -771,10 +950,17 @@ export function registerEnvironmentAnalytics(
     }
   };
 }
-export const setActiveAnalyticsEnvironment = (environmentId: string | null) => {
+export const setActiveAnalyticsEnvironment = (environmentId: string | null, at = Date.now()) => {
+  drainLongTaskObserver?.();
+  longTaskEnvironments.push({ at, environmentId });
+  if (longTaskEnvironments.length > 128) longTaskEnvironments.shift();
   activeEnvironmentId = environmentId;
 };
 export const activeAnalytics = () => analyticsForEnvironment(activeEnvironmentId);
+export const analyticsForLongTask = (startedAt: number) =>
+  analyticsForEnvironment(
+    longTaskEnvironments.findLast((entry) => entry.at <= startedAt)?.environmentId,
+  );
 export async function flushEnvironmentAnalytics(phase: "background" | "close") {
   const active = activeAnalytics();
   await Promise.all(

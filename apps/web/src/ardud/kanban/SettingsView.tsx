@@ -4,6 +4,7 @@ import { useAtomValue } from "@effect/atom-react";
 
 import {
   boardModelSelection,
+  boardRenameValue,
   modelName,
   poolAddLevel,
   poolListed,
@@ -40,6 +41,7 @@ import {
 import type { UnifiedSettings } from "@t3tools/contracts/settings";
 
 import * as Schema from "effect/Schema";
+import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Link } from "@tanstack/react-router";
 import { Switch } from "../../components/ui/switch";
@@ -289,6 +291,8 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
     void runAction("Couldn't save", () => kanban.updateBoard({ boardId: board.id, ...input }));
   const canEdit = useKanbanPermission(KANBAN_WS_METHODS.boardUpdate);
   const canPool = useKanbanPermission(KANBAN_WS_METHODS.poolSet);
+  const canRevoke = useKanbanPermission(KANBAN_WS_METHODS.standingApprovalRevoke);
+  const lastRelease = board.releaseLedger?.at(-1);
   // The level "Add model" gives a new pool; null when every level of it is pooled.
   const addLevel = (instanceId: ProviderInstanceId, model: string) =>
     boardPoolAddition(instanceId, model, instanceEntries, pools, apply);
@@ -297,6 +301,9 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
 
   return (
     <div className="flex max-w-225 flex-col gap-5.5 pb-12">
+      <Section title="Name">
+        <BoardNameInput key={board.id} board={board} disabled={!canEdit} editNote={editNote} />
+      </Section>
       <Section title="Icon">
         <IconPicker
           board={board}
@@ -306,6 +313,41 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
           onImage={(iconImage) => update({ iconImage })}
         />
       </Section>
+      {board.standingApprovals.some((entry) => entry.revokedAt === null) && (
+        <Section title="Standing deploy approval">
+          {lastRelease && (
+            <p className="break-words text-sm text-(--m-muted)">
+              Last interrupting release: #{lastRelease.cardNumber} at{" "}
+              <time dateTime={lastRelease.at}>{new Date(lastRelease.at).toLocaleString()}</time>
+              {lastRelease.critical ? ` (critical: ${lastRelease.critical})` : ""}
+            </p>
+          )}
+          {board.standingApprovals
+            .filter((entry) => entry.revokedAt === null)
+            .map((entry) => (
+              <div key={entry.id} className="flex min-w-0 items-center gap-3 py-2">
+                <p className="min-w-0 flex-1 break-words text-sm">
+                  {entry.quote}{" "}
+                  <time dateTime={entry.saidAt} className="text-(--m-muted)">
+                    {new Date(entry.saidAt).toLocaleString()}
+                  </time>
+                </p>
+                <Button
+                  variant="outline"
+                  disabled={!canRevoke}
+                  aria-label={`Revoke standing deploy approval from ${new Date(entry.saidAt).toLocaleString()}`}
+                  onClick={() =>
+                    void runAction("Couldn't revoke approval", () =>
+                      kanban.revokeStandingApproval(board.id, entry.id),
+                    )
+                  }
+                >
+                  Revoke
+                </Button>
+              </div>
+            ))}
+        </Section>
+      )}
       <Section title="Nightly review">
         <NightlyReviewSettings key={board.id} board={board} disabled={!canEdit} />
       </Section>
@@ -514,6 +556,9 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
           onChange={(defaultCardModel) => update({ defaultCardModel })}
         />
       </Section>
+      <Section title="Guess approval gates">
+        <GuessedGateSettings board={board} disabled={!canEdit} disabledReason={editNote} />
+      </Section>
       <Section title="Review">
         {board.reviewChains.map((chain, chainIndex) => {
           const isDefault = chain.name === board.defaultReviewChain;
@@ -657,6 +702,51 @@ async function boardImage(file: File): Promise<string | null> {
     if (url.startsWith(`data:${type};`) && url.length <= KANBAN_BOARD_IMAGE_MAX) return url;
   }
   return null;
+}
+
+function BoardNameInput(props: {
+  board: KanbanBoard;
+  disabled: boolean;
+  editNote: string | undefined;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const cancelled = useRef(false);
+  const save = (value: string) => {
+    const name = boardRenameValue(value, props.board.name);
+    if (cancelled.current || props.disabled || saving || name === null) {
+      cancelled.current = false;
+      setDraft(null);
+      return;
+    }
+    setDraft(name);
+    setSaving(true);
+    void runAction("Couldn't rename board", () =>
+      kanban.updateBoard({ boardId: props.board.id, name }),
+    ).then(() => {
+      setDraft(null);
+      setSaving(false);
+    });
+  };
+  return (
+    <Input
+      aria-label="Name"
+      name="board-name"
+      autoComplete="off"
+      title={props.editNote}
+      disabled={props.disabled || saving}
+      value={draft ?? props.board.name}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={(event) => save(event.currentTarget.value)}
+      onKeyDown={(event) => {
+        if (event.nativeEvent.isComposing) return;
+        if (event.key !== "Enter" && event.key !== "Escape") return;
+        event.preventDefault();
+        cancelled.current = event.key === "Escape";
+        event.currentTarget.blur();
+      }}
+    />
+  );
 }
 
 function IconPicker(props: {
@@ -1092,4 +1182,47 @@ function NightlyReviewSettings(props: { board: KanbanBoard; disabled: boolean })
       ) : null}
     </div>
   );
+}
+
+function GuessedGateSettings(props: {
+  board: KanbanBoard;
+  disabled: boolean;
+  disabledReason?: string | undefined;
+}) {
+  const gates = ["deploy", "money", "secret"] as const;
+  const selected = props.board.guessedGates ?? gates;
+  const [pending, setPending] = useState(false);
+  const save = async (gate: (typeof gates)[number], checked: boolean) => {
+    setPending(true);
+    try {
+      await runAction("Couldn't save approval gates", () =>
+        kanban.updateBoard({
+          boardId: props.board.id,
+          guessedGates: gates.filter((kind) => (kind === gate ? checked : selected.includes(kind))),
+        }),
+      );
+    } finally {
+      setPending(false);
+    }
+  };
+  return gates.map((gate) => (
+    <label
+      key={gate}
+      htmlFor={`guess-${props.board.id}-${gate}`}
+      className="flex min-h-12 items-center justify-between gap-4 not-last:border-b not-last:border-(--m-rule)"
+    >
+      <span className="font-medium">
+        {{ deploy: "Deploy", money: "Money", secret: "Secret" }[gate]}
+      </span>
+      <Switch
+        id={`guess-${props.board.id}-${gate}`}
+        name={`guess-${gate}`}
+        aria-label={`Guess ${gate} approval gates from wording`}
+        checked={selected.includes(gate)}
+        disabled={props.disabled || pending}
+        title={props.disabledReason}
+        onCheckedChange={(checked) => void save(gate, checked)}
+      />
+    </label>
+  ));
 }

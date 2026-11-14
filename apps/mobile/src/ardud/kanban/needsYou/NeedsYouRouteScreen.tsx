@@ -1,3 +1,4 @@
+import { useIsFocused } from "@react-navigation/native";
 import type { StaticScreenProps } from "@react-navigation/native";
 import {
   askAge,
@@ -14,8 +15,9 @@ import {
   type NeedsYouItem,
   type NeedsYouMark,
 } from "@t3tools/client-runtime/ardud/kanban";
-import { useEffect, useRef, useState } from "react";
-import { FlatList, Pressable, RefreshControl, View } from "react-native";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { FlatListProps } from "react-native";
+import { AppState, FlatList, Pressable, RefreshControl, View } from "react-native";
 import type { TextInputInstance } from "react-native";
 
 import type { AppBarMenu } from "../../../components/ui/AppBar.types";
@@ -26,7 +28,14 @@ import { cn } from "../../../lib/cn";
 import { LoadingLine } from "../../common/FeedError";
 import { useNowMs } from "../../common/hooks";
 import { ChoiceRow } from "../../common/parts";
-import { useAsk, useAsks, useOwnerStanding, useQueueFigures, useWatchAsks } from "./askStore";
+import {
+  useAskScope,
+  useAsk,
+  useAsks,
+  useOwnerStanding,
+  useQueueFigures,
+  useWatchAsks,
+} from "./askStore";
 import {
   MARK_LABELS,
   askRowMedia,
@@ -81,6 +90,31 @@ export function NeedsYouRouteScreen({ route }: StaticScreenProps<NeedsYouQueuePa
     queue.hidden,
   );
   const rows = queueRows(sections, openBatches);
+  const { api: timingApi } = useAskScope();
+  const focused = useIsFocused();
+  const visibleRows = useRef<readonly QueueRow[]>([]);
+  const reportSeen = useCallback(() => {
+    if (!focused || AppState.currentState !== "active") return;
+    for (const row of visibleRows.current)
+      if (row._tag === "ask")
+        void timingApi.seen?.(row.item.cardId, row.item.ask.id, "mobile").catch(() => undefined);
+  }, [timingApi, focused]);
+  const viewability = useCallback(
+    ({
+      viewableItems,
+    }: Parameters<NonNullable<FlatListProps<QueueRow>["onViewableItemsChanged"]>>[0]) => {
+      visibleRows.current = viewableItems
+        .filter((item) => item.isViewable)
+        .map((item) => item.item);
+      reportSeen();
+    },
+    [reportSeen],
+  );
+  useEffect(() => {
+    reportSeen();
+    const listener = AppState.addEventListener("change", reportSeen);
+    return () => listener.remove();
+  }, [reportSeen]);
   useAnalyticsSearch(
     analyticsEnvironmentId,
     "needs-owner",
@@ -244,6 +278,7 @@ export function NeedsYouRouteScreen({ route }: StaticScreenProps<NeedsYouQueuePa
     <Screen title="Needs you" onBack={nav.back} menus={menus}>
       <FlatList
         data={rows}
+        onViewableItemsChanged={viewability}
         keyExtractor={(row) => row.key}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="on-drag"

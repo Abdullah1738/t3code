@@ -2,6 +2,7 @@
 # Set up the offbox server on Ubuntu 24.04. Idempotent; run as root:
 #   bash install-host.sh            # packages, ZFS pool, state datasets, Incus, firewall, boatd service, timers
 #   bash install-host.sh image      # (re)build the offbox-base image from base-image.sh
+#   bash install-host.sh tmp-profile # only configure /tmp for future box starts; no service restarts
 # Everything that must outlive an OS reinstall is on the pool: boatd's state (dataset offbox/boatd at
 # /var/lib/boatd: database, run logs, hashed tokens) and Incus's own state (offbox/incus-var at /var/lib/incus:
 # its database of boxes, images, profiles). So this script handles both a fresh pool and one that already holds
@@ -17,6 +18,37 @@ MGMT_ASSETS=$HERE
 [ -f "$MGMT_ASSETS/offbox_mgmt_sshd_config" ] || MGMT_ASSETS=$HERE/../skill/templates/home
 POOL=offbox
 export DEBIAN_FRONTEND=noninteractive
+
+tmp_profile() {
+  local current entry
+  entry='lxc.mount.entry = tmpfs tmp tmpfs rw,nosuid,nodev,mode=1777,size=8G,create=dir 0 0'
+  current=$(incus profile get offbox raw.lxc)
+  if awk -v managed="$entry" '
+    $0 == managed { next }
+    /^[[:space:]]*lxc\.mount\.entry[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, "")
+      split($0, fields, /[[:space:]]+/)
+      n = split(fields[2], parts, "/")
+      depth = 0
+      for (i = 1; i <= n; i++) {
+        if (parts[i] == "" || parts[i] == ".") continue
+        if (parts[i] == "..") { if (depth > 0) depth--; continue }
+        path[++depth] = parts[i]
+      }
+      if (depth >= 1 && path[1] == "tmp") conflict = 1
+    }
+    END { exit !conflict }
+  ' <<< "$current"; then
+    echo "offbox profile already mounts /tmp or a descendant; reconcile raw.lxc before configuring tmpfs" >&2
+    return 1
+  fi
+  if ! grep -Fxq -- "$entry" <<< "$current"; then
+    # raw.lxc is startup-only: a profile update must not hide scratch files from running jobs.
+    incus profile set offbox raw.lxc "${current:+$current$'\n'}$entry"
+  fi
+}
+
+if [ "${1:-}" = tmp-profile ]; then tmp_profile; exit 0; fi
 
 image() {
   incus delete --force offbox-build 2>/dev/null || true
@@ -244,6 +276,7 @@ incus profile set offbox security.nesting=true security.syscalls.intercept.mknod
   security.syscalls.intercept.setxattr=true security.syscalls.intercept.sysinfo=true \
   linux.kernel_modules=overlay,br_netfilter,nf_nat,ip_tables,ip6_tables,iptable_nat,iptable_filter,xt_conntrack,xt_MASQUERADE \
   boot.autostart=false limits.processes=65536
+tmp_profile
 
 # ---- firewall: boxes reach the internet, never the host's services or the tailnet. Public side: ssh only.
 cat > /etc/nftables.conf <<'EOF'

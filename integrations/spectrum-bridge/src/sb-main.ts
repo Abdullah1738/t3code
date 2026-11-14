@@ -1,4 +1,4 @@
-import { toolError, toolLog } from "./toollog.ts";
+import { toolError, toolLog, type LogLine } from "./toollog.ts";
 import { acknowledgeReceived, notifyFailedInbound } from "./inbound-failure.ts";
 /**
  * Sendblue serve loop. Kept apart from main.ts so the Photon path stays exactly as it was:
@@ -14,6 +14,7 @@ import { backendKind, createBackend } from "./backend.ts";
 import type { Access } from "./chats.ts";
 import { alertSkillPath, skillPath, stateRoot, telegramBridgeSocket, type Config } from "./config.ts";
 import { Delivery } from "./delivery.ts";
+import { ReplyGapMonitor } from "./reply-gap.ts";
 import { checkReply, readReplyRules } from "./replyCheck.ts";
 import { sendblueErrorKey, type Line, type LineEvent } from "./line.ts";
 import { acquireLock } from "./lock.ts";
@@ -45,7 +46,7 @@ export type MainIo = {
   removeStaleSocket: (path: string) => Promise<void>;
 };
 
-type Parts = { router: Router; delivery: Delivery; api: (request: Request) => Promise<Response>; backend: ChatBackend; busy: boolean };
+type Parts = { router: Router; delivery: Delivery; replyGap: ReplyGapMonitor; api: (request: Request) => Promise<Response>; backend: ChatBackend; busy: boolean };
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -58,18 +59,22 @@ export function sendblueLine(config: Config, env: Record<string, string | undefi
   return new Sendblue({ keyId, secret, number, ...(config.cardApp ? { cardApp: config.cardApp } : {}) });
 }
 
+export function cardDeliveryOptions(line: Pick<Line, "upload">, live: boolean, fetchFn: typeof fetch = fetch) {
+  return { static: !live, previewImage: cardPreviewImage(file => line.upload(file), fetchFn) };
+}
+
 /**
  * Wraps the line so health can see the stream: a finished backfill means caught up, and any
  * event means the connection is alive. Explicit delegation keeps Sendblue's private fields intact.
  */
-export function observedLine(line: Line, seen: { synchronized: boolean; lastEventAt: number }): Line {
+export function observedLine(line: Line, seen: { synchronized: boolean; lastEventAt: number }, replyIds?: (handle: string) => LogLine["ids"]): Line {
   return {
     get number() { return line.number; },
     async *events(signal: AbortSignal): AsyncIterable<LineEvent> {
       for await (const event of line.events(signal)) {
         seen.lastEventAt = Date.now();
         if (event.type === "status" && /^(error|declined|failed)$/i.test(event.status)) toolLog.capture(() => toolLog.write({
-          component: "sendblue", kind: "error", name: "reply.failed", ok: false, ids: { messageId: event.handle },
+          component: "sendblue", kind: "error", name: "reply.failed", ok: false, ids: { messageId: event.handle, ...replyIds?.(event.handle) },
           error: { tag: `sendblue.${sendblueErrorKey(event.errorCode) ?? "async_failure"}`, message: "" },
         }));
         yield event;
@@ -86,6 +91,7 @@ export function observedLine(line: Line, seen: { synchronized: boolean; lastEven
     upload: file => line.upload(file),
     getMessage: handle => line.getMessage(handle),
     sendApp: (chat, card) => line.sendApp(chat, card),
+    ...(line.updateApp ? { updateApp: (handle: string, card: Parameters<Line["sendApp"]>[1], key: string) => line.updateApp!(handle, card, key) } : {}),
     react: (handle, reaction) => line.react(handle, reaction),
     typing: (chat, options) => line.typing(chat, options),
     read: chat => line.read(chat),
@@ -137,14 +143,22 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const accessFile = accessPath(stateRoot);
   const reload = accessReloader(accessFile);
   let access: Access = emptyAccess;
-  const refreshAccess = async () => { access = await reload().catch(() => { toolError("sb-main", "sb-main.catch1"); return access; }); };
+  const refreshAccess = async () => { access = await reload().catch((caughtError) => { toolError("sb-main", "sb-main.catch1", caughtError); return access; }); };
   await refreshAccess();
 
   let stopping = false;
   const seen = { synchronized: false, lastEventAt: 0 };
   const health = { backendLastOk: 0, startedAt: Date.now() };
   const ready = () => config.enabled && seen.synchronized;
-  const observed = observedLine(line, seen);
+  const observed = observedLine(line, seen, handle => {
+    for (const chat of registry?.all() ?? []) {
+      const item = chat.store.byProviderId(handle);
+      if (!item) continue;
+      const inboundId = chat.store.get<string>(`log-inbound-id:${item.id}`) ?? item.replyTo;
+      return { chat: chat.info.slug, operationId: item.id, ...(item.sessionId ? { threadId: item.sessionId } : {}),
+        ...(inboundId ? { inboundId } : {}) };
+    }
+  });
 
   let apps: ReturnType<typeof startAppsServer> | undefined;
   let appsUrl: string | undefined;
@@ -155,7 +169,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     apps = startAppsServer(config.appsRoot, config.appsPort,
       token => registry?.all().find(chat => getSecretRequest(chat.store, token))?.secretDeps);
     log("apps-listening");
-  } catch (error) { toolError("sb-main", "sb-main.catch2");
+  } catch (error) { toolError("sb-main", "sb-main.catch2", error);
     log("apps-unavailable", errorCode(error));
   }
   const PUBLISH_WAIT_MS = 6_000;
@@ -169,11 +183,11 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       return url;
     });
     if (!known) return attempt;
-    attempt.catch(error => { toolError("sb-main", "sb-main.catch3"); return log("apps-publish-failed", errorCode(error)); });
+    attempt.catch(error => { toolError("sb-main", "sb-main.catch3", error); return log("apps-publish-failed", errorCode(error)); });
     let timer: ReturnType<typeof setTimeout> | undefined;
     const fallback = new Promise<string>(resolve => { timer = setTimeout(() => resolve(known), PUBLISH_WAIT_MS); });
     try {
-      appsUrl = await Promise.race([attempt.catch(() => { toolError("sb-main", "sb-main.catch4"); return known; }), fallback]);
+      appsUrl = await Promise.race([attempt.catch((caughtError) => { toolError("sb-main", "sb-main.catch4", caughtError); return known; }), fallback]);
       return appsUrl;
     } finally { clearTimeout(timer); }
   };
@@ -181,7 +195,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     origin: config.shareOrigin,
     secrets: token => registry?.all().find(chat => getSecretRequest(chat.store, token))?.secretDeps });
   process.once("exit", () => shares.killAll());
-  void shares.restore().catch(() => { toolError("sb-main", "sb-main.catch5"); return log("share-sweep-failed"); });
+  void shares.restore().catch((caughtError) => { toolError("sb-main", "sb-main.catch5", caughtError); return log("share-sweep-failed"); });
   const post = socketPost(telegramBridgeSocket);
   const outlet = telegramOutlet({
     post, appsRoot: config.appsRoot,
@@ -197,8 +211,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       ? backend.forChat(`chats/${chat.info.slug}`, chat.info.title) : backend;
     if (chatBackend instanceof RobobBackend) chatBackend.trackFirstTurns(chat.store);
     const liveCards = (config.liveCardChats ?? []).includes(chat.info.slug);
-    const transport = sbTransport(observed, chat.info.key, chat.store, undefined,
-      liveCards ? {} : { static: true, previewImage: cardPreviewImage(file => observed.upload(file)) });
+    const transport = sbTransport(observed, chat.info.key, chat.store, undefined, cardDeliveryOptions(observed, liveCards));
     // getMessage may resolve undefined for an unknown handle; the router's reply lookup already treats a throw there as unavailable.
     const router = new Router(chat.store, chatBackend, transport as unknown as ConstructorParameters<typeof Router>[2], {
       ...config, chatGuid: chat.info.key, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
@@ -207,7 +220,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       swipes: { find: swipes, line: config.sendblueNumber ?? "" },
     });
     const delivery = new Delivery(chat.store, transport, {
-      projectScope, chatGuid: () => chat.info.key,
+      projectScope, chat: chat.info.slug, chatGuid: () => chat.info.key,
       statuses: since => transport.outboundStatuses(since),
       beforeSend: async item => router.beforeSend(item),
       enabled: () => ready() && !chat.controlsPending && !stopping, log,
@@ -223,9 +236,11 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
         publishApps: isOwner ? publishApps : async () => shares.secretBase() } } : {}),
       enabled: ready, health: () => ({}),
       replyCheck: text => checkReply(chat.info, text, readReplyRules(join(stateRoot, "reply-rules.json"))),
+      foldText: (text, operationId) => router.foldToolText(text, operationId),
       log,
     });
-    return { router, delivery, api: chatApi, backend: chatBackend, busy: false };
+    const replyGap = new ReplyGapMonitor(chat.store, { chat: chat.info.slug, notify: outlet.notify });
+    return { router, delivery, replyGap, api: chatApi, backend: chatBackend, busy: false };
   };
   registry = new ChatRegistry<Parts>({ line, owner: config.owner, ownerStore, stateRoot, access: () => access, build });
   registry.restore();
@@ -236,7 +251,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const wakeOwner = (text: string, key: string) => { chats.wake(chats.owner, text, key); };
   /** A plain bridge line into the owner's chat, no agent turn. */
   const tellOwner = (text: string, key: string) => {
-    try { chats.owner.store.enqueue({ id: `guest-note:${hash(key)}`, kind: "conversation", text }); } catch { toolError("sb-main", "sb-main.catch6"); log("guest-note-failed"); }
+    try { chats.owner.store.enqueue({ id: `guest-note:${hash(key)}`, kind: "conversation", text }); } catch (caughtError) { toolError("sb-main", "sb-main.catch6", caughtError); log("guest-note-failed"); }
   };
   const shareContact = (address: string) => line.shareContact(address);
   const flights = flightyDb();
@@ -276,7 +291,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const ingress = runIngress({
     line: observed, owner: config.owner, ownerStore, access: async () => access,
     sink: chats.sink(note, () => config.enabled, message => guestDesk.unknown(message),
-      (chat, input) => { void acknowledgeReceived(chat.store, chat.context, input).catch(() => { toolError("sb-main", "sb-main.catch7"); return log("receipt-ack-failed"); }); }), log,
+      (chat, input) => { void acknowledgeReceived(chat.store, chat.context, input).catch((caughtError) => { toolError("sb-main", "sb-main.catch7", caughtError); return log("receipt-ack-failed"); }); }), log,
     notify: (text, key) => outlet.notify("attention", text, key),
   }, abort.signal);
 
@@ -291,28 +306,28 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       await refreshAccess();
       if (Date.now() - sharesSweptAt >= 30_000) {
         sharesSweptAt = Date.now();
-        void shares.sweep().catch(() => { toolError("sb-main", "sb-main.catch8"); return log("share-sweep-failed"); });
+        void shares.sweep().catch((caughtError) => { toolError("sb-main", "sb-main.catch8", caughtError); return log("share-sweep-failed"); });
       }
       if (Date.now() - secretsSweptAt >= 30_000) {
         secretsSweptAt = Date.now();
-        for (const chat of chats.all()) await sweepSecrets(chat.secretDeps).catch(() => { toolError("sb-main", "sb-main.catch9"); return log("secret-sweep-failed"); });
+        for (const chat of chats.all()) await sweepSecrets(chat.secretDeps).catch((caughtError) => { toolError("sb-main", "sb-main.catch9", caughtError); return log("secret-sweep-failed"); });
       }
       if (ready() && Date.now() - flightsCheckedAt >= 60_000) {
         flightsCheckedAt = Date.now();
-        await guestResponder.flightTick().catch(() => { toolError("sb-main", "sb-main.catch10"); return log("guest-flight-tick-failed"); });
+        await guestResponder.flightTick().catch((caughtError) => { toolError("sb-main", "sb-main.catch10", caughtError); return log("guest-flight-tick-failed"); });
       }
       if (ready() && Date.now() - routeCheckedAt >= 30_000) {
         routeCheckedAt = Date.now();
         for (const chat of chats.all()) {
           const chatBackend = chat.parts.backend;
           if (!(chatBackend instanceof RobobBackend) || chat.parts.router.status().activeTurn) continue;
-          if (await retireUnresolvedRoute(chat.store, chatBackend).catch(() => { toolError("sb-main", "sb-main.catch11"); return false; })) log("route-unresolved-retired");
+          if (await retireUnresolvedRoute(chat.store, chatBackend).catch((caughtError) => { toolError("sb-main", "sb-main.catch11", caughtError); return false; })) log("route-unresolved-retired");
         }
       }
       if (ready()) {
         if (Date.now() - backendCheckedAt >= 30_000) {
           backendCheckedAt = Date.now();
-          await backend.health().then(() => { health.backendLastOk = Date.now(); }, () => { toolError("sb-main", "sb-main.catch12");});
+          await backend.health().then(() => { health.backendLastOk = Date.now(); }, (caughtError) => { toolError("sb-main", "sb-main.catch12", caughtError);});
         }
       }
       await sleep(1_000);
@@ -320,16 +335,17 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   }
   const timer = setInterval(() => {
     for (const chat of chats.all()) {
-      void chat.parts.delivery.tick().catch(() => { toolError("sb-main", "sb-main.catch13"); return log("sender-failed"); });
-      if (ready()) void chat.parts.router.checkInboundLatency().catch(() => { toolError("sb-main", "sb-main.catch14"); return log("inbound-latency-check-failed"); });
+      void chat.parts.delivery.tick().catch((caughtError) => { toolError("sb-main", "sb-main.catch13", caughtError); return log("sender-failed"); });
+      if (ready()) void chat.parts.replyGap.tick().catch((caughtError) => { toolError("sb-main", "reply-gap.check", caughtError); });
+      if (ready()) void chat.parts.router.checkInboundLatency().catch((caughtError) => { toolError("sb-main", "sb-main.catch14", caughtError); return log("inbound-latency-check-failed"); });
       if (ready() && !chat.parts.busy) {
         chat.parts.busy = true;
         const revision = chat.revision;
         void chat.parts.router.tick().then(() => {
           if (revision === chat.revision && seen.synchronized) chat.controlsPending = false;
-        }, () => { toolError("sb-main", "sb-main.catch15"); return log("router-tick-failed"); }).finally(() => { chat.parts.busy = false; });
+        }, (caughtError) => { toolError("sb-main", "sb-main.catch15", caughtError); return log("router-tick-failed"); }).finally(() => { chat.parts.busy = false; });
       }
-      if (ready()) void chat.parts.router.checkFailedInbound().catch(() => { toolError("sb-main", "sb-main.catch16"); return log("failed-inbound-check-failed"); });
+      if (ready()) void chat.parts.router.checkFailedInbound().catch((caughtError) => { toolError("sb-main", "sb-main.catch16", caughtError); return log("failed-inbound-check-failed"); });
     }
   }, 1_000);
   const stop = async () => {
@@ -339,8 +355,8 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     abort.abort();
     clearInterval(timer);
     await server.stop(true);
-    await apps?.stop().catch(() => { toolError("sb-main", "sb-main.catch17");});
-    await shares.stopAll().catch(() => { toolError("sb-main", "sb-main.catch18");});
+    await apps?.stop().catch((caughtError) => { toolError("sb-main", "sb-main.catch17", caughtError);});
+    await shares.stopAll().catch((caughtError) => { toolError("sb-main", "sb-main.catch18", caughtError);});
     // In-flight rows are intentionally recovered on the next startup rather than marked successful.
     process.exit(0);
   };

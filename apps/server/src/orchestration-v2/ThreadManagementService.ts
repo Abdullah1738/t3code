@@ -407,6 +407,7 @@ export interface ThreadManagementServiceShape {
   readonly getCallerRow: Orchestrator.OrchestratorV2["Service"]["getCallerRow"];
   readonly getThreadShell: Orchestrator.OrchestratorV2["Service"]["getThreadShell"];
   readonly getThreadIdsForWorktree: Orchestrator.OrchestratorV2["Service"]["getThreadIdsForWorktree"];
+  readonly getThreadListCandidates: Orchestrator.OrchestratorV2["Service"]["getThreadListCandidates"];
   readonly listProjectThreads: (input: {
     readonly projectId: ProjectId;
     readonly includeSubagents: boolean;
@@ -430,6 +431,12 @@ export interface ThreadManagementServiceShape {
    * just refuse a retry the project's settings no longer allow fresh.
    */
   readonly hasReceipt: (commandId: CommandId) => Effect.Effect<boolean>;
+  readonly getDelegationCommandState: (
+    commandId: CommandId,
+  ) => Effect.Effect<
+    CommandReceiptStore.CommandReceiptV2 | { readonly status: "pending" | "never_saved" },
+    CommandReceiptStore.CommandReceiptStoreV2Error
+  >;
   readonly getCommandReceipt: CommandReceiptStore.CommandReceiptStoreV2["Service"]["getByCommandId"];
   readonly findMcpThreadCreations: CommandReceiptStore.CommandReceiptStoreV2["Service"]["findMcpThreadCreations"];
   readonly waitForThread: (
@@ -557,6 +564,31 @@ const make = Effect.gen(function* () {
   // Orchestrator's lock is not reentrant. This separate lock covers the
   // preflight + selection update + send across callers of this service.
   const selectionDispatchLock = yield* KeyedLock.make<ThreadId>();
+  const delegationDispatchLock = yield* KeyedLock.make<CommandId>();
+  const pendingDelegations = yield* Ref.make<ReadonlyMap<CommandId, number>>(new Map());
+  const getDelegationCommandState = Effect.fn("ThreadManagementService.getDelegationCommandState")(
+    function* (commandId: CommandId) {
+      const receipt = yield* receipts.getByCommandId(commandId);
+      if (Option.isSome(receipt)) return receipt.value;
+      if ((yield* Ref.get(pendingDelegations)).has(commandId)) {
+        return { status: "pending" as const };
+      }
+      // Fence the second read against a create starting or finishing after the first read.
+      // The dispatch holds this key through commit and interruption cleanup.
+      return yield* delegationDispatchLock.withLock(
+        commandId,
+        Effect.gen(function* () {
+          const latest = yield* receipts.getByCommandId(commandId);
+          if (Option.isSome(latest)) return latest.value;
+          return {
+            status: (yield* Ref.get(pendingDelegations)).has(commandId)
+              ? ("pending" as const)
+              : ("never_saved" as const),
+          };
+        }),
+      );
+    },
+  );
 
   const assertProviderInstanceEnabled: ThreadManagementServiceShape["assertProviderInstanceEnabled"] =
     (input) =>
@@ -886,6 +918,24 @@ const make = Effect.gen(function* () {
   });
 
   const dispatch: ThreadManagementServiceShape["dispatch"] = (command) => {
+    if (command.type === "delegated_task.request") {
+      return Effect.acquireUseRelease(
+        Ref.update(pendingDelegations, (current) => {
+          const next = new Map(current);
+          next.set(command.commandId, (current.get(command.commandId) ?? 0) + 1);
+          return next;
+        }),
+        () => delegationDispatchLock.withLock(command.commandId, dispatchUnchanged(command)),
+        () =>
+          Ref.update(pendingDelegations, (current) => {
+            const next = new Map(current);
+            const remaining = (current.get(command.commandId) ?? 1) - 1;
+            if (remaining === 0) next.delete(command.commandId);
+            else next.set(command.commandId, remaining);
+            return next;
+          }),
+      );
+    }
     if (
       command.type !== "message.dispatch" &&
       command.type !== "thread.model-selection.set" &&
@@ -963,28 +1013,44 @@ const make = Effect.gen(function* () {
         ),
       );
 
-  const listProjectThreads: ThreadManagementServiceShape["listProjectThreads"] = (input) =>
-    orchestrator.getShellSnapshot({ projectId: input.projectId, location: "active" }).pipe(
-      Effect.mapError(
-        (cause) =>
-          new ThreadManagementProjectThreadsListError({
-            projectId: input.projectId,
-            cause,
-          }),
-      ),
-      Effect.map((snapshot) =>
-        snapshot.threads
-          .filter(
-            (thread) =>
-              input.includeSubagents || thread.lineage.relationshipToParent !== "subagent",
-          )
-          .toSorted(
-            (left, right) =>
-              DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt) ||
-              right.id.localeCompare(left.id),
+  const listProjectThreads: ThreadManagementServiceShape["listProjectThreads"] = Effect.fn(
+    "ThreadManagementService.listProjectThreads",
+  )(function* (input) {
+    const threads: OrchestrationV2ThreadShell[] = [];
+    let afterThreadId: string | undefined;
+    // Each page releases the reader before the next one. MCP lists must not
+    // monopolize the background slot while building every shell in a project.
+    while (true) {
+      const snapshot = yield* orchestrator
+        .getShellSnapshot({
+          projectId: input.projectId,
+          location: "active",
+          limit: 100,
+          ...(afterThreadId === undefined ? {} : { afterThreadId }),
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new ThreadManagementProjectThreadsListError({
+                projectId: input.projectId,
+                cause,
+              }),
           ),
-      ),
-    );
+        );
+      threads.push(...snapshot.threads);
+      if (snapshot.threads.length < 100) break;
+      afterThreadId = snapshot.threads.at(-1)?.id;
+    }
+    return threads
+      .filter(
+        (thread) => input.includeSubagents || thread.lineage.relationshipToParent !== "subagent",
+      )
+      .toSorted(
+        (left, right) =>
+          DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt) ||
+          right.id.localeCompare(left.id),
+      );
+  });
 
   const sendToThread: ThreadManagementServiceShape["sendToThread"] = Effect.fn(
     "ThreadManagementService.sendToThread",
@@ -1528,10 +1594,12 @@ const make = Effect.gen(function* () {
     getThreadShell: orchestrator.getThreadShell,
     getThreadIdsForWorktree: orchestrator.getThreadIdsForWorktree,
     listProjectThreads,
+    getThreadListCandidates: orchestrator.getThreadListCandidates,
     sendToThread,
     assertProviderInstanceEnabled,
     isProviderInstanceEnabledForProject,
     hasReceipt,
+    getDelegationCommandState,
     findMcpThreadCreations: receipts.findMcpThreadCreations,
     getCommandReceipt: Effect.fn("ThreadManagementService.getCommandReceipt")(
       receipts.getByCommandId,
