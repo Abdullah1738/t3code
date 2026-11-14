@@ -101,6 +101,7 @@ export interface KanbanLaunchInput {
 }
 
 export interface KanbanSendInput {
+  readonly flushQueued?: "wake" | "steer";
   readonly threadId: ThreadId;
   readonly text: string;
   /** Stable per logical send when a retry must not deliver a second message. */
@@ -702,6 +703,13 @@ const make = Effect.gen(function* () {
         let id = yield* sendId(input, pruneMessageWakes);
         if (id === undefined) return;
         // Queue edits cannot change a run's model selection or steer a live turn.
+        if (input.flushQueued !== undefined) {
+          yield* threads.promoteQueuedMessages(input.threadId, input.flushQueued, {
+            deferBoardWakes: input.text.trim().length > 0,
+            isStale: () => input.isStale?.() === true,
+          });
+          if (!input.text.trim()) return;
+        }
         if (scope !== undefined) {
           const records = yield* threads.getThreadRecords(input.threadId, ["runs", "messages"]);
           if (input.isStale?.()) return;
@@ -778,9 +786,15 @@ const make = Effect.gen(function* () {
               ...(input.mode === "steer" ? { activeTurnOnly: true } : {}),
               createdBy: "system",
               creationSource: "server",
+              ...(input.isStale === undefined ? {} : { isStale: input.isStale }),
             }),
           );
           if (Result.isFailure(result)) {
+            if (isCommandRejected(result.failure) && result.failure.revoked) {
+              // No enqueue occurred; a future retry must not inherit cleanup for this id.
+              acceptedMessageId = undefined;
+              return yield* sendError(result.failure);
+            }
             if (input.isStale?.()) {
               const sent = (yield* threads.getThreadRecords(input.threadId, ["runs"]).pipe(
                 Effect.retry({ times: 1 }),

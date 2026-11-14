@@ -1260,6 +1260,7 @@ it.effect(
   () => {
     const registered: string[] = [];
     const registry = Layer.succeed(RestartPacing.RestartPacing, {
+      settingsSnapshot: Effect.die("unused settings snapshot"),
       register: (input) =>
         Effect.sync(() => {
           registered.push(input.sourceRunId);

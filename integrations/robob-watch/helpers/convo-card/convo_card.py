@@ -50,6 +50,8 @@ from pathlib import Path
 
 HOME = Path.home()
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+from watch_admission import admission
 DXB = timezone(timedelta(hours=4))
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")      # bridge app slug
 CHAT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")     # bridge chat slug
@@ -906,7 +908,9 @@ def cmd_watch(a):
         pre.append(lambda: write_json(state / "cursor.json", oc))
     if cur is None:
         if not a.dry_run:
-            write_json(state / "cursor.json", {"rowid": top, "seq": 0, "fps": fps, "since": cfg["since"]})
+            with admission() as allowed:
+                if allowed:
+                    write_json(state / "cursor.json", {"rowid": top, "seq": 0, "fps": fps, "since": cfg["since"]})
         return
     carry = []
     if run and ob.get("batches"):
@@ -1008,18 +1012,21 @@ def cmd_watch(a):
             share.pop("alerted_url", None)
         writes.append(lambda: write_json(state / "share.json", share))
     batches = carry + ([{"lines": out, "at": now, "replays": 0}] if out else [])
-    if not a.dry_run:
-        for f in pre:
-            f()
-        if run and (batches or nc):
-            write_json(outbox, {"run": run, "batches": batches, "cursor": nc})
-        elif run and outbox.exists():
-            outbox.unlink()
-        for f in writes:
-            f()
-    lines = [x for b in batches for x in b["lines"]]
-    if lines:
-        print("\n".join(lines))
+    with admission() as allowed:
+        if not allowed:
+            return
+        if not a.dry_run:
+            for f in pre:
+                f()
+            if run and (batches or nc):
+                write_json(outbox, {"run": run, "batches": batches, "cursor": nc})
+            elif run and outbox.exists():
+                outbox.unlink()
+            for f in writes:
+                f()
+        lines = [x for b in batches for x in b["lines"]]
+        if lines:
+            print("\n".join(lines))
 
 
 def main(argv=None):

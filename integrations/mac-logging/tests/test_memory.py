@@ -17,6 +17,7 @@ import toollog
 FIXTURES = Path(__file__).parent / 'fixtures/memory'
 # Captured on 14 Nov; top-incident substitutes the reported fseventsd 38G/34G row.
 TOP = (FIXTURES / 'top-incident.txt').read_text()
+FULL_TOP = TOP + '42 Robob 100M 32M 0.0\n43 codex 100M 32M 0.0\n44 opencode 100M 32M 0.0\n'
 VM = (FIXTURES / 'vm_stat.txt').read_text()
 SWAP = (FIXTURES / 'swap.txt').read_text()
 IO = (FIXTURES / 'iostat.txt').read_text()
@@ -51,8 +52,8 @@ class MemoryTests(unittest.TestCase):
         return [json.loads(line) for p in self.root.glob('*.ndjson')
                 for line in p.read_text().splitlines() if json.loads(line)['name'] == name]
 
-    def runner(self, fail=None, fail_kind='timeout', notify_fail=False, top=TOP, ps=PS, vm=VM, boot=100,
-               swap='total = 27238.40M used = 25907.20M', pressure=1, free=65):
+    def runner(self, fail=None, fail_kind='timeout', notify_fail=False, top=FULL_TOP, ps=PS, vm=VM, boot=100,
+               swap='total = 27238.40M used = 25907.20M', pressure=1, free=65, pressure_level=1):
         def run(argv, **kwargs):
             self.commands.append(argv)
             self.assertEqual(kwargs['timeout'], 10)
@@ -72,6 +73,7 @@ class MemoryTests(unittest.TestCase):
                 text = ''
             elif name == 'sysctl':
                 text = {'vm.swapusage': swap, 'vm.memory_pressure': str(pressure),
+                        'kern.memorystatus_vm_pressure_level': str(pressure_level),
                         'kern.boottime': '{ sec = %d, usec = 10 }' % boot}[argv[-1]]
             elif name == 'vm_stat':
                 text = vm
@@ -82,12 +84,9 @@ class MemoryTests(unittest.TestCase):
             elif name == 'iostat':
                 text = IO
             elif name == 'top':
-                if '-pid' in argv:
-                    pids = [argv[i+1] for i,v in enumerate(argv) if v == '-pid']
-                    text = 'PID COMMAND MEM CMPRS %CPU\n'+'\n'.join(
-                        pid+' watcher 100M 32M 0.0' for pid in pids)
-                else:
-                    text = top
+                self.assertNotIn('-n',argv)
+                self.assertNotIn('-pid',argv)
+                text = top
             else:
                 self.fail('Unexpected command '+repr(argv))
             return SimpleNamespace(returncode=0, stdout=text)
@@ -142,7 +141,7 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(counts['python'], dict(command='python', count=2, ppid1Count=1))
         self.assertEqual(props['processCount'], 13)
         self.assertEqual(props['ppid1Count'], 8)
-        self.assertEqual(len([c for c in self.commands if c[0] == '/usr/bin/top']), 2)
+        self.assertEqual(len([c for c in self.commands if c[0] == '/usr/bin/top']), 1)
         memory.sample(run, now=1300, notify=False)
         props = self.rows('memory.sample')[-1]['props']
         self.assertEqual(props['swapinsDelta'], 0)
@@ -190,7 +189,8 @@ class MemoryTests(unittest.TestCase):
 
     def test_each_command_failure_is_null_and_tagged(self):
         for cmd, field in [('vm.swapusage','swap'), ('/usr/bin/vm_stat','vm'),
-                           ('vm.memory_pressure','pressure'), ('kern.boottime','boot'),
+                           ('vm.memory_pressure','pressure'),
+                           ('kern.memorystatus_vm_pressure_level','pressureLevel'), ('kern.boottime','boot'),
                            ('/usr/bin/memory_pressure','freePercent'), ('/usr/bin/top','top'),
                            ('/bin/ps','counts'), ('/usr/sbin/iostat','io')]:
             for error in ('timeout', 'exit', 'unavailable', 'parse'):
@@ -202,8 +202,22 @@ class MemoryTests(unittest.TestCase):
                     self.assertFalse(row['ok'])
                     self.assertEqual(row['error']['tag'], 'memory.partial')
 
+    def test_top15_and_watched_share_one_full_snapshot(self):
+        # fseventsd is below all15 large holders and its label is truncated.
+        top='PID COMMAND MEM CMPRS %CPU\n'+''.join(
+            '%s big-holder 500M 10M 0.0\n' % pid for pid in range(100,115))
+        top+='1227 fsevents 6M 2M 1.5\n'
+        memory.sample(self.runner(top=top,ps='1227 1 30:00 /System/fseventsd',
+                      swap='total = 7168M used = 5788M'),now=1000)
+        props=self.rows('memory.sample')[-1]['props']
+        self.assertEqual([p['pid'] for p in props['top']],list(range(100,115)))
+        self.assertEqual(props['watched'],[dict(pid=1227,command='fseventsd',memMb=6,
+                         cmprsMb=2,cpu=1.5,etime='30:00',error=None)])
+        self.assertEqual(len([c for c in self.commands if c[0]=='/usr/bin/top']),1)
+        self.assertTrue(self.rows('memory.sample')[-1]['ok'])
+
     def test_watched_timeout_preserves_entries_as_null(self):
-        memory.sample(self.runner(fail='-pid'),now=1000,notify=False)
+        memory.sample(self.runner(fail='/usr/bin/top'),now=1000,notify=False)
         props = self.rows('memory.sample')[-1]['props']
         self.assertEqual(props['watchedError'], 'timeout')
         codex = next(p for p in props['watched'] if p['command']=='codex')
@@ -212,9 +226,9 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(codex['error'], 'timeout')
 
     def test_threshold_boundaries(self):
-        for total, used, mem, fsevent, expected in [(20000,16384,8192,4096,set()),
-                (20000,16384.01,8192,4096,{'swap'}), (20000,0,8192.01,4096,{'footprint'}),
-                (0,0,8192,4096.01,{'fseventsd'}), (0,0,38912,34816,{'footprint','fseventsd'})]:
+        for total, used, mem, fsevent, expected in [(20000,16384,8192,2048,set()),
+                (20000,16384.01,8192,2048,{'swap'}), (20000,0,8192.01,2048,{'footprint'}),
+                (0,0,8192,2048.01,{'fseventsd'}), (0,0,38912,34816,{'footprint','fseventsd'})]:
             props = dict(swap=dict(totalMb=total,usedMb=used), top=[dict(pid=1,command='Robob',memMb=mem)],
                          watched=[dict(pid=2,command='fseventsd',memMb=fsevent)])
             self.assertEqual(set(memory.alert_reasons(props)),expected)
@@ -227,24 +241,134 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(len(self.notifications), 1)
         self.assertEqual(self.rows('memory.alert')[-1]['props']['reason'], 'swap')
 
+    def test_raw_pressure_counter_does_not_alert_or_reuse_old_streak(self):
+        memory.save_state('memory',dict(pressure=dict(at=700,consecutive=2)))
+        top='PID COMMAND MEM CMPRS %CPU\n1227 fseventsd 6M 2M 0.0\n'
+        for i in range(2):
+            memory.sample(self.runner(top=top,swap='total = 7168M used = 5788M',
+                                      pressure=247,pressure_level=1,free=72),now=1000+300*i)
+            self.assertEqual(self.notifications,[])
+            props=self.rows('memory.sample')[-1]['props']
+            self.assertEqual(props['pressure'],247)
+            self.assertEqual(props['pressureLevel'],1)
+            self.assertEqual(props['criticalSamples'],0)
+        self.assertEqual(self.notifications,[])
+
     def test_pressure_requires_consecutive_samples_and_resets(self):
         top='PID COMMAND MEM CMPRS %CPU\n1227 fseventsd 5.6M 2M 0.0\n'
-        cases=[(1,15,None,0), (2,72,None,1), (0,14,None,2),
-               (0,72,None,0), (2,72,None,1), (0,72,'/usr/bin/memory_pressure',0),
-               (2,72,None,1), (2,72,None,2)]
-        for i,(pressure,free,fail,streak) in enumerate(cases):
+        cases=[(1,15,None,0), (4,72,None,1), (1,14,None,2),
+               (1,72,None,0), (4,72,None,1), (1,72,'/usr/bin/memory_pressure',0),
+               (4,72,None,1), (4,72,None,2)]
+        for i,(pressure_level,free,fail,streak) in enumerate(cases):
             memory.sample(self.runner(top=top,swap='total = 7168M used = 5788M',
-                                      pressure=pressure,free=free,fail=fail),now=1000+300*i)
+                                      pressure=247,pressure_level=pressure_level,free=free,fail=fail),now=1000+300*i)
             self.assertEqual(self.rows('memory.sample')[-1]['props']['criticalSamples'], streak)
         self.assertEqual(len(self.notifications),1) # pressure shares its own 6h cooldown
         self.assertEqual(self.rows('memory.alert')[-1]['props']['reason'], 'pressure')
         state={}
-        props=dict(pressure=2,freePercent=72)
+        props=dict(pressure=247,pressureLevel=4,freePercent=72)
         for at,expected in [(1000,1),(1300,2),(2000,1),(1900,1)]:
             memory.pressure_streak(props,state,at)
             self.assertEqual(props['criticalSamples'],expected)
-        memory.pressure_streak(dict(pressure=None,freePercent=None),state,2200)
-        self.assertEqual(state['pressure']['consecutive'],0)
+        memory.pressure_streak(dict(pressureLevel=None,freePercent=None),state,2200)
+        self.assertEqual(state['pressureLevel']['consecutive'],0)
+
+    def test_pressure_level_matrix_and_old_critical_streak(self):
+        top='PID COMMAND MEM CMPRS %CPU\n1227 fseventsd 6M 2M 0.0\n'
+        for level,free,expected in [(1,72,0), (2,72,0), (4,72,2), (8,72,0),
+                                    (247,72,0), (1,15,0), (1,14,2)]:
+            with self.subTest(level=level,free=free):
+                memory.save_state('memory',dict(pressure=dict(at=700,consecutive=2)))
+                before=len(self.notifications)
+                for i in range(2):
+                    memory.sample(self.runner(top=top,swap='total = 7168M used = 5788M',
+                                pressure=247,pressure_level=level,free=free),now=1000+300*i)
+                    self.assertEqual(self.rows('memory.sample')[-1]['props']['criticalSamples'],
+                                     i+1 if expected else 0)
+                self.assertEqual(len(self.notifications)-before,1 if expected else 0)
+        # Missing critical-level input must not fall back to the raw counter.
+        memory.save_state('memory',{})
+        before=len(self.notifications)
+        for at in (1000,1300):
+            memory.sample(self.runner(top=top,swap='total = 7168M used = 5788M',pressure=247,
+                         fail='kern.memorystatus_vm_pressure_level'),now=at)
+            self.assertIsNone(self.rows('memory.sample')[-1]['props']['pressureLevel'])
+        self.assertEqual(len(self.notifications),before)
+
+    def fs_sample(self, mem, at, pid=1227, boot=100, age=None, fail=None, notify_fail=False):
+        age=at if age is None else age
+        ps='%s 1 %02d:%02d /System/fseventsd' % (pid,age//60,age%60)
+        top='PID COMMAND MEM CMPRS %%CPU\n%s fseventsd %sM 2M 0.0\n' % (pid,mem)
+        memory.sample(self.runner(top=top,ps=ps,boot=boot,swap='total = 7168M used = 5788M',
+                      pressure=247,pressure_level=1,free=72,fail=fail,notify_fail=notify_fail),now=at)
+        return self.rows('memory.sample')[-1]['props']
+
+    def test_fseventsd_lower_absolute_threshold(self):
+        for mem,alerts in [(6,0), (2048,0), (2150.4,1)]:
+            memory.save_state('memory',{})
+            before=len(self.notifications)
+            self.fs_sample(mem,1000)
+            self.assertEqual(len(self.notifications)-before,alerts)
+            if alerts:
+                self.assertEqual(self.rows('memory.alert')[-1]['props']['reason'],'fseventsd')
+
+    def test_fseventsd_sustained_growth_and_cooldown(self):
+        for i in range(4):
+            props=self.fs_sample(6+10*i,1000+300*i)
+            self.assertEqual(props['fseventsdGrowthSamples'],i)
+            self.assertEqual(len(self.notifications),1 if i==3 else 0)
+        self.assertEqual(props['fseventsdGrowthWindowS'],900)
+        self.assertEqual(props['fseventsdGrowthMbPerHour'],120)
+        self.assertEqual(props['fseventsdGrowthPid'],1227)
+        self.assertEqual(self.rows('memory.alert')[-1]['props']['reason'],'fseventsd_growth')
+        self.assertIn('120 MiB/h',self.notifications[-1][self.notifications[-1].index('--text')+1])
+        # Persisted state survives each sample and stays quiet for six hours.
+        for i in range(4,76):
+            self.fs_sample(6+10*i,1000+300*i)
+            self.assertEqual(len(self.notifications),2 if i>=75 else 1)
+        self.assertEqual([r['props']['reason'] for r in self.rows('memory.alert')],
+                         ['fseventsd_growth','fseventsd_growth'])
+        self.assertNotEqual(self.notifications[0][-1],self.notifications[1][-1])
+
+    def test_fseventsd_single_jump_and_rate_boundary_stay_quiet(self):
+        for sequence in [(6,156,156,156,156), (6,16,6,16,6), (6,31,56,81)]:
+            with self.subTest(sequence=sequence):
+                memory.save_state('memory',{})
+                before=len(self.notifications)
+                for i,mem in enumerate(sequence):
+                    # 25 MiB/15min is exactly100/h, but cadence gap invalidates it.
+                    props=self.fs_sample(mem,1000+900*i if sequence[-1]==81 else 1000+300*i)
+                self.assertEqual(len(self.notifications),before)
+        # Exact100 MiB/h is not greater than100.
+        state={}
+        for at,mem in [(1000,6),(1432,18),(1864,30),(2296,42)]:
+            props=dict(boot=100,watched=[dict(pid=1227,command='fseventsd',memMb=mem,
+                       etime='%d:%02d' % (at//60,at%60))])
+            memory.fseventsd_growth(props,state,at)
+            self.assertEqual(props['fseventsdGrowthSamples'],0)
+        self.assertEqual(props['fseventsdGrowthMbPerHour'],100)
+
+    def test_fseventsd_growth_resets_on_identity_gaps_and_missing_data(self):
+        for reset in ('pid','boot','age','timeout','absent','gap','rollback'):
+            with self.subTest(reset=reset):
+                memory.save_state('memory',{})
+                before=len(self.notifications)
+                self.fs_sample(6,1000)
+                self.fs_sample(16,1300)
+                props=self.fs_sample(26,1600)
+                self.assertEqual(props['fseventsdGrowthSamples'],2)
+                kwargs={'pid':1228} if reset=='pid' else {'boot':200} if reset=='boot' else (
+                        {'age':100} if reset=='age' else {'fail':'/bin/ps'} if reset=='timeout' else {})
+                at=2301 if reset=='gap' else 1500 if reset=='rollback' else 1900
+                if reset=='absent':
+                    memory.sample(self.runner(top='PID COMMAND MEM CMPRS %CPU\n',ps='1 0 30:00 /sbin/launchd',
+                                  swap='total = 7168M used = 5788M'),now=at)
+                    props=self.rows('memory.sample')[-1]['props']
+                else:
+                    props=self.fs_sample(36,at,**kwargs)
+                self.assertEqual(props['fseventsdGrowthSamples'],0)
+                self.assertIsNone(props['fseventsdGrowthMbPerHour'])
+                self.assertEqual(len(self.notifications),before)
 
     def test_alerts_six_hour_cooldown_and_day_rollover(self):
         run = self.runner()

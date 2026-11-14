@@ -1,13 +1,15 @@
 import { useNavigation } from "@react-navigation/native";
-import type { KanbanBoardSummary } from "@t3tools/contracts";
+import { KANBAN_WS_METHODS, type KanbanBoardSummary } from "@t3tools/contracts";
 import { Fragment } from "react";
-import { View } from "react-native";
+import { Pressable, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
 import { SymbolView } from "../../components/ui/AppSymbol";
+import { Menu } from "../../components/ui/Menu";
 import { Group, Row, SectionHead, Separator, Title } from "../common/parts";
 import { BoardIcon } from "./BoardIcon";
-import { useKanbanBoards } from "./kanbanStore";
+import { useKanbanBoards, useKanbanPermission } from "./kanbanStore";
+import { renameBoard } from "./boardActions";
 import { NeedsYouHomeRow } from "./needsYou/NeedsYouHomeRow";
 import { Glyph } from "./parts";
 
@@ -77,31 +79,52 @@ function BoardBadge(props: {
 function BoardRow(props: { readonly summary: KanbanBoardSummary; readonly onOpen: () => void }) {
   const { board, needsOwner: owner, running, unread } = props.summary;
   const name = board.name;
+  const canRename = useKanbanPermission(KANBAN_WS_METHODS.boardUpdate);
   const parts = [
     name,
     ...(unread > 0 ? [`${unread} unread messages`] : []),
     ...(owner > 0 ? [`${owner} questions for you`] : []),
   ];
+  const row = (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={parts.join(", ")}
+      accessibilityHint={canRename ? "Long-press to rename" : undefined}
+      onPress={props.onOpen}
+    >
+      <Row className="items-center">
+        <BoardIcon board={board} />
+        <Title className="flex-1">{name}</Title>
+        {owner === 0 && running > 0 ? <Glyph kind="ok" /> : null}
+        {unread > 0 ? (
+          <BoardBadge
+            symbol="text.bubble"
+            count={unread}
+            accessibilityLabel={`${unread} unread messages`}
+          />
+        ) : null}
+        {owner > 0 ? (
+          <BoardBadge
+            symbol="questionmark.bubble"
+            count={owner}
+            accessibilityLabel={`${owner} questions for you`}
+            warning
+          />
+        ) : null}
+      </Row>
+    </Pressable>
+  );
+  if (!canRename) return row;
   return (
-    <Row accessibilityLabel={parts.join(", ")} onPress={props.onOpen} className="items-center">
-      <BoardIcon board={board} />
-      <Title className="flex-1">{name}</Title>
-      {owner === 0 && running > 0 ? <Glyph kind="ok" /> : null}
-      {unread > 0 ? (
-        <BoardBadge
-          symbol="text.bubble"
-          count={unread}
-          accessibilityLabel={`${unread} unread messages`}
-        />
-      ) : null}
-      {owner > 0 ? (
-        <BoardBadge
-          symbol="questionmark.bubble"
-          count={owner}
-          accessibilityLabel={`${owner} questions for you`}
-          warning
-        />
-      ) : null}
-    </Row>
+    <Menu
+      shouldOpenOnLongPress
+      title={name}
+      actions={[{ id: "rename", title: "Rename", image: "square.and.pencil" }]}
+      onPressAction={({ nativeEvent }) => {
+        if (nativeEvent.event === "rename") renameBoard(board.id, name);
+      }}
+    >
+      {row}
+    </Menu>
   );
 }

@@ -19,7 +19,7 @@ function definedTimes<Key extends string>(
   return result;
 }
 export const askKind = (
-  ask: KanbanOwnerAsk,
+  ask: Parameters<typeof kanbanAskResponse>[0],
 ): NonNullable<NonNullable<KanbanOwnerAsk["timing"]>["kind"]> => {
   const response = kanbanAskResponse(ask);
   return response.edit

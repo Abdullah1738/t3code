@@ -5,9 +5,153 @@ import { Sendblue } from "../src/sendblue.ts";
 import { sbTransport } from "../src/sb-transport.ts";
 import { Store } from "../src/store.ts";
 import { Delivery, RETRY_WINDOW } from "../src/delivery.ts";
+import { cardDeliveryOptions, observedLine } from "../src/sb-main.ts";
 
 const url = "https://mac.tailnet.ts.net:18400/delivery-noon-fgbcnno52e6n0ka/";
 const json = (body: unknown) => Response.json(body);
+
+function continuationFixture(live = false) {
+  const store = new Store(":memory:");
+  const requests: { path: string; body: Record<string, unknown> }[] = [];
+  let uploads = 0;
+  let failUpload = false;
+  let loseResponse = false;
+  let status = "DELIVERED";
+  let peer = "dm:+15555550002";
+  let originalUrl = url;
+  let session: string | undefined = "388250ee-8227-4a76-8bee-7470d7606c28";
+  const updates = new Map<string, string>();
+  const line = new Sendblue({ keyId: "test", secret: "test", number: "+15555550001", fetch: (async (input, init) => {
+    const target = String(input);
+    if (target.startsWith(url)) return target.endsWith(".png")
+      ? new Response("stage bytes", { headers: { "content-type": "image/png" } })
+      : new Response('<meta property="og:image" content="preview.png">', { headers: { "content-type": "text/html" } });
+    const path = new URL(target).pathname;
+    if (path === "/api/upload-file") {
+      uploads++;
+      if (failUpload) throw new Error("upload unavailable");
+      return json({ media_url: `https://cdn.example/stage-${uploads}.png` });
+    }
+    if (init?.method === "GET") return json({ message_handle: "original", is_outbound: true, number: peer.slice(3),
+      status, app_card: { url: originalUrl, layout: { caption: "Delivery tracking" }, sessionIdentifier: session } });
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    requests.push({ path, body });
+    if (path === "/api/send-message") return json({ message_handle: "original" });
+    const key = String(body.idempotency_key);
+    if (!updates.has(key)) updates.set(key, `update-${updates.size + 1}`);
+    if (loseResponse) { loseResponse = false; throw new Error("response lost after accept"); }
+    return json({ message_handle: updates.get(key) });
+  }) as typeof fetch });
+  const observed = observedLine(line, { synchronized: true, lastEventAt: 0 });
+  const transport = sbTransport(observed, "dm:+15555550002", store, undefined,
+    cardDeliveryOptions(observed, live, lineFetch as typeof fetch));
+  // Use the same intercepted provider and private-page fetch for preview preparation.
+  async function lineFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+    if (String(input).startsWith(url)) return String(input).endsWith(".png")
+      ? new Response("stage bytes", { headers: { "content-type": "image/png" } })
+      : new Response('<meta property="og:image" content="preview.png">', { headers: { "content-type": "text/html" } });
+    throw new Error("Unexpected preview fetch");
+  }
+  const delivery = new Delivery(store, transport, { projectScope: "test", enabled: () => true, chatGuid: () => peer });
+  const enqueue = (id: string, updateOf?: string) => store.enqueue({ id, kind: "conversation", text: "",
+    app: { url, caption: "Delivery tracking", ...(updateOf ? { updateOf, previewPage: url + "stages/preparing/" } : {}) } });
+  enqueue("placement");
+  return { store, line: observed, transport, delivery, requests, updates, enqueue, uploads: () => uploads,
+    failUpload: (value: boolean) => { failUpload = value; }, loseResponse: () => { loseResponse = true; },
+    original: (change: { status?: string; peer?: string; url?: string; noSession?: boolean }) => {
+      status = change.status ?? status; peer = change.peer ?? peer; originalUrl = change.url ?? originalUrl;
+      if (change.noSession) session = undefined;
+    } };
+}
+
+test("a stage uploads a fresh static picture in the original session, and repeats send nothing", async () => {
+  const f = continuationFixture();
+  try {
+    await f.delivery.tick();
+    f.enqueue("preparing", "placement");
+    await f.delivery.tick();
+    f.enqueue("preparing", "placement");
+    await f.delivery.tick();
+    expect(f.uploads()).toBe(2);
+    expect(f.requests.map(r => r.path)).toEqual(["/api/send-message", "/api/messages/original/update-app-card"]);
+    expect(f.requests[1]!.body).toMatchObject({ url, interactive: false,
+      layout: { imageUrl: "https://cdn.example/stage-2.png" } });
+    expect(f.store.get<{ handle: string; sessionIdentifier: string }>("app-session:placement")).toEqual({ handle: "original", sessionIdentifier: "388250ee-8227-4a76-8bee-7470d7606c28" });
+  } finally { f.store.close(); }
+});
+
+test("the production live-card configuration still uploads a static image for continuations", async () => {
+  const f = continuationFixture(true);
+  try {
+    await f.delivery.tick();
+    expect(f.uploads()).toBe(0);
+    f.enqueue("preparing", "placement");
+    await f.delivery.tick();
+    expect(f.uploads()).toBe(1);
+    expect(f.requests[1]).toMatchObject({path:"/api/messages/original/update-app-card",body:{interactive:false,
+      layout:{imageUrl:"https://cdn.example/stage-1.png"}}});
+  } finally {f.store.close();}
+});
+
+test("stage upload failure is known unsent and retryable; a lost continuation response reuses its image and provider key", async () => {
+  const f = continuationFixture();
+  try {
+    await f.delivery.tick();
+    f.enqueue("preparing", "placement");
+    f.failUpload(true);
+    await f.delivery.tick();
+    expect(f.store.getOperation("preparing")?.state).toBe("pending");
+    expect(f.store.get<boolean>("sendAmbiguous:preparing")).toBe(false);
+    expect(f.requests).toHaveLength(1);
+    f.failUpload(false);
+    f.loseResponse();
+    setSystemTime(f.store.get<number>("retry:preparing")!);
+    await f.delivery.tick();
+    expect(f.store.getOperation("preparing")?.state).toBe("pending");
+    const uploaded = f.uploads();
+    setSystemTime(f.store.get<number>("retry:preparing")!);
+    await f.delivery.tick();
+    expect(f.uploads()).toBe(uploaded);
+    expect(f.requests[1]).toEqual(f.requests[2]);
+    expect(f.updates.size).toBe(1);
+    expect(f.store.getOperation("preparing")?.state).toBe("sent");
+  } finally { setSystemTime(); f.store.close(); }
+});
+
+for (const invalid of [{ status: "QUEUED" }, { status: "ERROR" }, { url: "https://other.example/" }, { noSession: true }]) {
+  test(`a continuation never creates a fresh card when its original is unusable: ${JSON.stringify(invalid)}`, async () => {
+    const f = continuationFixture();
+    try {
+      await f.delivery.tick(); f.original(invalid); f.enqueue("preparing", "placement");
+      await f.delivery.tick();
+      expect(f.requests).toHaveLength(1);
+      expect(f.uploads()).toBe(1);
+    } finally { f.store.close(); }
+  });
+}
+
+test("a newer stage cancels a pending older continuation before it can overwrite the new picture", async () => {
+  const f = continuationFixture();
+  try {
+    await f.delivery.tick();
+    f.enqueue("preparing", "placement");
+    const prepared = Promise.withResolvers<string>();
+    const entered = Promise.withResolvers<void>();
+    const transport = sbTransport(f.line, "dm:+15555550002", f.store, undefined, { static: true,
+      previewImage: () => { entered.resolve(); return prepared.promise; } });
+    const delivery = new Delivery(f.store, transport, { projectScope: "test", enabled: () => true, chatGuid: () => "dm:+15555550002" });
+    const tick = delivery.tick();
+    await entered.promise;
+    f.enqueue("delivered", "placement");
+    prepared.resolve("https://cdn.example/old.png");
+    await tick;
+    expect(f.store.getOperation("preparing")?.state).toBe("cancelled");
+    expect(f.requests).toHaveLength(1);
+    await f.delivery.tick();
+    expect(f.requests).toHaveLength(2);
+    expect(f.store.getOperation("delivered")?.state).toBe("sent");
+  } finally { f.store.close(); }
+});
 
 test("owner delivery card has a static image layout with a private tap-through; retry sends once", async () => {
   const requests: { path: string; body: unknown }[] = [];

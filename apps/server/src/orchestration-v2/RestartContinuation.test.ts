@@ -1508,7 +1508,11 @@ it.effect(
         const commands: Parameters<
           ThreadManagementService.ThreadManagementService["Service"]["dispatch"]
         >[0][] = [];
-        yield* continueRestartedRun({ threadId, sourceRunId: runId }).pipe(
+        yield* continueRestartedRun({
+          threadId,
+          sourceRunId: runId,
+          beforeDispatch: Effect.die("A declined continuation must not acquire admission"),
+        }).pipe(
           Effect.provide(
             Layer.merge(
               Layer.mock(ThreadManagementService.ThreadManagementService)({

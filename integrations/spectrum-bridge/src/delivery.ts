@@ -44,7 +44,8 @@ type App = NonNullable<OutboxRecord["app"]>;
 function sanitizeApp(app: App): App | undefined {
   const caption = stripInternalText(app.caption);
   if (!caption) return undefined;
-  const clean: App = { url: app.url, caption };
+  const clean: App = { url: app.url, caption, ...(app.updateOf ? { updateOf: app.updateOf } : {}),
+    ...(app.previewPage ? { previewPage: app.previewPage } : {}) };
   for (const key of ["subcaption", "trailingCaption", "trailingSubcaption", "summary"] as const) {
     const value = app[key] === undefined ? "" : stripInternalText(app[key]);
     if (value) clean[key] = value;
@@ -126,6 +127,10 @@ export class Delivery {
 
   private current(item: OutboxRecord, state: string): boolean {
     if (this.store.getOperation(item.id)?.state !== state) return false;
+    if (item.app?.updateOf && this.store.get<string>(`app-latest:${item.app.updateOf}`) !== item.id) {
+      this.store.outboxState(item.id, "cancelled");
+      return false;
+    }
     const route = this.store.get<{ id: string; generation: number } | null>("route");
     if (item.generation !== undefined && (route?.id !== item.sessionId || route?.generation !== item.generation)) {
       this.store.outboxState(item.id, "cancelled");
@@ -239,7 +244,7 @@ export class Delivery {
     ).all();
     for (const { id } of rows) {
       const item = this.store.getOperation(id);
-      if (!item || (!item.attachment && !item.app) || !this.withinRetryWindow(id)) continue;
+      if (!item || item.app?.updateOf || (!item.attachment && !item.app) || !this.withinRetryWindow(id)) continue;
       if (this.store.get<unknown>(`fallback:${id}`) !== undefined || (this.fallbackRetry.get(id) ?? 0) > Date.now()) continue;
       if (item.state === "pending") {
         const firstAttempt = this.store.get<number>(`firstAttempt:${id}`)!;

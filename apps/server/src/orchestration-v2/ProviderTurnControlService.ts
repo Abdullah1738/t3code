@@ -19,6 +19,7 @@ import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAda
 import * as ProjectionStore from "./ProjectionStore.ts";
 import { providerUserMessageText } from "./ProviderMessageText.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import { PROVIDER_START_CLEANUP_TIMEOUT_MS } from "./providerStartDeadlinePolicy.ts";
 
 const yieldToRuntime = Effect.yieldNow.pipe(
   Effect.andThen(
@@ -46,6 +47,8 @@ const isProviderTurnControlError = Schema.is(ProviderTurnControlError);
 
 export interface ProviderTurnControlServiceV2Shape {
   readonly interrupt: (input: {
+    readonly stopBackgroundWork?: boolean;
+    readonly replacementProviderSessionId?: ProviderSessionId;
     readonly subagent?: {
       readonly id: NodeId;
       readonly nativeTaskId: string;
@@ -95,6 +98,7 @@ export const layer: Layer.Layer<
       readonly threadId: ThreadId;
       readonly providerSessionId: ProviderSessionId;
       readonly replacementProviderSessionId?: ProviderSessionId;
+      readonly allowReplacementInterrupt?: boolean;
       readonly providerThreadId: ProviderThreadId;
       readonly providerTurnId: ProviderTurnId;
       readonly operation: "interrupt" | "restart" | "steer";
@@ -104,7 +108,7 @@ export const layer: Layer.Layer<
       const { providerThread, providerTurn } = context;
       const targetsRecordedSession = providerThread?.providerSessionId === input.providerSessionId;
       const targetsCommittedReplacement =
-        input.operation === "restart" &&
+        (input.operation === "restart" || input.allowReplacementInterrupt === true) &&
         input.replacementProviderSessionId !== undefined &&
         providerThread?.providerSessionId === input.replacementProviderSessionId;
       if (
@@ -181,7 +185,11 @@ export const layer: Layer.Layer<
     return ProviderTurnControlServiceV2.of({
       interrupt: Effect.fn("ProviderTurnControlService.interrupt")(
         function* (input) {
-          const loaded = yield* load({ ...input, operation: "interrupt" });
+          const loaded = yield* load({
+            ...input,
+            operation: "interrupt",
+            allowReplacementInterrupt: input.stopBackgroundWork === false,
+          });
           const session = Option.isSome(loaded.session)
             ? loaded.session
             : yield* sessions.get(input.providerSessionId);
@@ -216,11 +224,15 @@ export const layer: Layer.Layer<
           // A settled turn reaches its adapter too: only the adapter knows
           // whether it still runs work for the thread, and each one either
           // stops it or reports there is nothing left to stop.
-          yield* session.value.interruptTurn({
+          const interrupt = session.value.interruptTurn({
             providerThread: loaded.providerThread,
             providerTurnId: loaded.providerTurn.id,
-            requestRuntimeRestart: true,
+            requestRuntimeRestart: input.stopBackgroundWork ?? true,
+            ...(input.stopBackgroundWork === false ? { stopBackgroundWork: false } : {}),
           });
+          yield* input.stopBackgroundWork === false
+            ? interrupt.pipe(Effect.timeout(PROVIDER_START_CLEANUP_TIMEOUT_MS))
+            : interrupt;
           // The wait is real time: ingestion runs on other fibers and never
           // advances a test clock, so a test clock would hold Stop forever.
           yield* Effect.gen(function* () {

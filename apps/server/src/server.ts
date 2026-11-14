@@ -1,3 +1,4 @@
+import * as RunStartDeadline from "./orchestration-v2/RunStartDeadline.ts";
 import * as McpCallLedger from "./ardud/analytics/McpCallLedger.ts";
 import * as McpAvailability from "./ardud/analytics/McpAvailability.ts";
 import * as AnalyticsDatabase from "./observability/AnalyticsDatabase.ts";
@@ -202,7 +203,7 @@ import * as ProjectHttp from "./project/http.ts";
 import { controlRouteLayer } from "./ardud/control/http.ts";
 import { desktopLeaseRouteLayer } from "./ardud/desktop-lease/http.ts";
 import { harnessCutoverRouteLayer } from "./ardud/harness-migrate/http.ts";
-import { deferIdleSocketClose } from "./ardud/http/deferIdleSocketClose.ts";
+import * as HttpSocketTelemetry from "./ardud/http/HttpSocketTelemetry.ts";
 // ardud fork: OpenCode session import
 import { ArdudOpenCodeImportLive } from "./ardud/opencode-import/layer.ts";
 import { openCodeImportRouteLayer } from "./ardud/opencode-import/http.ts";
@@ -229,6 +230,7 @@ const HTTP_ROUTER_CONFIG = {
 const HTTP_PREEMPTIVE_SHUTDOWN_GRACE_MS = 0;
 const layerResourceAttribution = ResourceAttribution.layer;
 const layerApplicationObservability = EventLoopMonitor.layer.pipe(
+  Layer.provideMerge(HttpSocketTelemetry.layer),
   Layer.provideMerge(Observability.layer),
   Layer.provideMerge(layerResourceAttribution),
 );
@@ -335,10 +337,11 @@ const layerHttpServer = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
     const availability = yield* McpAvailability.McpAvailability;
+    const sockets = yield* HttpSocketTelemetry.HttpSocketTelemetry;
     return NodeHttpServer.layer(
       () =>
         rejectRequestsUntilServing(
-          guardHttpResponseWriteErrors(deferIdleSocketClose(NodeHttp.createServer())),
+          guardHttpResponseWriteErrors(sockets.instrument(NodeHttp.createServer())),
           availability.reject,
         ),
       {
@@ -620,6 +623,9 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ),
   layerThreadPullRequestWorker,
   DelegatedTaskAnalytics.layer,
+  Layer.effectDiscard(
+    Effect.flatMap(RunStartDeadline.RunStartDeadline, (service) => service.start()),
+  ),
   Layer.effectDiscard(
     Effect.flatMap(DelegatedTaskProgressGuard.DelegatedTaskProgressGuard, (service) =>
       service.start(),

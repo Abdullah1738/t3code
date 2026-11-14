@@ -122,6 +122,20 @@ describe("recipient app cards", () => {
     expect(chats.owner.store.pendingOutbox()[0]!.id).not.toBe(first.body.id);
   });
 
+  test("stage continuation identity and immutable preview survive both enqueue routes", async () => {
+    const { chats, post } = api();
+    const updateOf = `app:${"a".repeat(64)}`;
+    const app = { ...card, updateOf, previewPage: card.url + "stages/preparing/" };
+    for (const to of [undefined, "owner"]) {
+      const response = await post({ ...app, ...(to ? { to } : {}), dedupeKey: `stage-${to}`, sessionId: "ses_owner@1" });
+      expect(response.status).toBe(202);
+      expect(chats.owner.store.getOperation(response.body.id)?.app).toEqual(app);
+      expect(chats.owner.store.get<string>(`app-latest:${updateOf}`)).toBe(response.body.id);
+      expect((await post({ ...app, to, dedupeKey: `stage-${to}`, sessionId: "ses_owner@1" })).status).toBe(200);
+      expect((await post({ ...app, to, previewPage: "https://elsewhere.example/", dedupeKey: "invalid", sessionId: "ses_owner@1" })).status).toBe(400);
+    }
+  });
+
   test("app cards are refused for group chats, with --to and without it", async () => {
     const { chats, post } = api();
     const group = chats.open(chatKey.group("GRP-Allowed-123"), "Family Trip");
@@ -541,6 +555,26 @@ describe("Sendblue socket API", () => {
     expect((await post("/send", { text: "x", to: "moni", dedupeKey: "k", sessionId: "ses_owner" })).status).toBe(503);
     expect((await post("/chats", { sessionId: "ses_owner" })).status).toBe(200);
   });
+});
+
+test("recipient sends, wakes and guest sends report their own message length limit", async () => {
+  const env = setup(true);
+  const registry = env.registry();
+  registry.open(chatKey.dm(moni));
+  env.ownerStore.set("route", { id: "ses_owner", generation: 1 });
+  const guests = { send: async () => { throw new Error("must not send"); } } as unknown as NonNullable<Parameters<typeof createSbApi>[0]["guests"]>;
+  const handler = createSbApi({ registry, line: env.line, accessPath: join(env.stateRoot, "access.json"),
+    enabled: () => true, health: () => ({}), guests });
+  for (const [path, limit, extra] of [
+    ["/send", 12_000, { to: "moni" }],
+    ["/wake", 12_000, { chat: "moni", source: "watch" }],
+    ["/guest-send", 2_000, { address: "+15555550198" }],
+  ] as const) {
+    const response = await handler(new Request(`http://bridge${path}`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "x".repeat(limit + 412), dedupeKey: "long", sessionId: "ses_owner", ...extra }) }));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: `message too long: ${(limit + 412).toLocaleString("en-US")} chars, limit ${limit.toLocaleString("en-US")}; split it or send as a card` });
+  }
 });
 
 test("accepted live and backfill ingress logs canonical chat ids and failure tags", async () => {

@@ -148,6 +148,7 @@ it.live(
           records: orchestrator.getThreadRecords(threadId, ["messages"]),
           snapshot: orchestrator.getThreadSnapshot(threadId),
           window: orchestrator.getThreadSnapshotWindow(threadId, { rowLimit: 20 }),
+          activeThreadIds: orchestrator.listActiveThreadIds(),
           shellSnapshot: orchestrator.getShellSnapshot(),
           threadShell: orchestrator.getThreadShell(threadId),
           projectShell: projects.getShell(projectId),
@@ -159,6 +160,7 @@ it.live(
           messageText: string,
           projectTitle: string,
         ) => {
+          assert.deepEqual(result.activeThreadIds, [threadId]);
           assert.equal(result.records.thread.title, threadTitle);
           assert.deepEqual(
             result.records.messages.map((item) => item.text),

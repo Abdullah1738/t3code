@@ -156,14 +156,50 @@ const vote = {
 afterEach(() => tolerateUnknownKanbanBlocks(false));
 
 describe("createKanbanClient", () => {
-  it.each([true, false])("sends archived=%s through the existing board update", async (archived) => {
+  it.each([true, false])(
+    "sends archived=%s through the existing board update",
+    async (archived) => {
+      const fake = fakeTransport();
+      const client = createKanbanClient(fake.transport);
+      const updated = client.updateBoard({ boardId: "board-toy" as never, archived });
+      const request = fake.take("kanban.board.update");
+      expect(request.input).toEqual({ boardId: "board-toy", archived });
+      request.resolve({});
+      await updated;
+    },
+  );
+
+  it("keeps board names live in the open board and boards list after rename", async () => {
     const fake = fakeTransport();
     const client = createKanbanClient(fake.transport);
-    const updated = client.updateBoard({ boardId: "board-toy" as never, archived });
+    const board = client.board("board-toy");
+    const stopBoard = board.subscribe(() => {});
+    const stopList = client.boards.subscribe(() => {});
+    fake.push(snapshotEvent(0));
+    const original = board.get()!.board;
+    const entry = {
+      boardId: original.id,
+      board: original,
+      needsOwner: 0,
+      running: 0,
+      unread: 0,
+      threadIds: [],
+    };
+    fake.pushList([entry]);
+    const streams = fake.streams();
+    const renamed = { ...original, name: "Board work" };
+    const save = client.updateBoard({ boardId: original.id, name: renamed.name });
     const request = fake.take("kanban.board.update");
-    expect(request.input).toEqual({ boardId: "board-toy", archived });
-    request.resolve({});
-    await updated;
+    expect(request.input).toEqual({ boardId: original.id, name: renamed.name });
+    fake.push({ _tag: "change", change: { _tag: "board", board: renamed } });
+    fake.pushList([{ ...entry, board: renamed }]);
+    request.resolve(renamed);
+    await save;
+    expect(board.get()?.board.name).toBe("Board work");
+    expect(client.boards.get()?.[0]?.board.name).toBe("Board work");
+    expect(fake.streams()).toBe(streams);
+    stopBoard();
+    stopList();
   });
 
   it("lets the app read a message that carries a block of a kind its build doesn't know", () => {

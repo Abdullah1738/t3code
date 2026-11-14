@@ -44,7 +44,15 @@ interface Fixture {
     readonly status: string;
     readonly runId?: string;
     readonly origin?: string;
+    readonly providerThreadId?: string | null;
     readonly completionDelivery?: { readonly state: string };
+  }>;
+  readonly providerThreads?: ReadonlyArray<{
+    readonly id: string;
+    readonly appThreadId: string | null;
+    readonly ownerNodeId: string | null;
+    readonly status: OrchestrationV2ProviderThread["status"];
+    readonly native?: string;
   }>;
   readonly roster?: ReadonlyArray<{ readonly taskId: string; readonly kind: string }>;
   readonly native?: string | null;
@@ -88,6 +96,9 @@ const input = (fixture: Fixture = {}): IdleInput => {
   }));
   const active = {
     id: "provider-thread-active",
+    appThreadId: "thread-idle",
+    ownerNodeId: null,
+    status: "idle",
     nativeThreadRef:
       fixture.native === null
         ? null
@@ -95,6 +106,7 @@ const input = (fixture: Fixture = {}): IdleInput => {
     pendingBackgroundTasks: fixture.roster ?? [],
   };
   const old = {
+    ...active,
     id: "provider-thread-old",
     nativeThreadRef: { driver: "opencode", nativeId: "ses_old", strength: "strong" },
     pendingBackgroundTasks: [],
@@ -125,9 +137,19 @@ const input = (fixture: Fixture = {}): IdleInput => {
         title: null,
         nativeTaskRef: null,
         childThreadId: null,
+        providerThreadId: null,
         ...subagent,
       })),
-      providerThreads: fixture.singleProviderThread === true ? [active] : [old, active],
+      providerThreads:
+        fixture.providerThreads?.map((providerThread) => ({
+          ...active,
+          ...providerThread,
+          nativeThreadRef: {
+            driver: "opencode",
+            nativeId: providerThread.native ?? "ses_current",
+            strength: "strong",
+          },
+        })) ?? (fixture.singleProviderThread === true ? [active] : [old, active]),
     },
     restartContinuationPending: fixture.restartContinuationPending ?? false,
     continuationOffered: fixture.continuationOffered ?? false,
@@ -308,11 +330,114 @@ describe("idleBlocker", () => {
     ).toBe("session-changed");
   });
 
-  it("trusts a runless thread's session only with a single provider thread", () => {
-    expect(reason({ runs: [], expectedNativeSessionId: "ses_current" })).toBe("session-changed");
+  it("trusts a runless thread's session only with a single own provider thread", () => {
+    expect(idleBlocker(input({ runs: [], expectedNativeSessionId: "ses_current" }))).toEqual({
+      reason: "session-changed",
+      detail: "Thread thread-idle has 2 provider threads and no run to tell which is current.",
+    });
     expect(
       reason({ runs: [], singleProviderThread: true, expectedNativeSessionId: "ses_current" }),
     ).toBeNull();
+  });
+
+  // Trimmed ownership shape from Recall #66: the root was itself a nested
+  // session elsewhere, so both providers have ownerNodeId set.
+  const nested = (
+    subagentStatus = "completed",
+    childStatus: OrchestrationV2ProviderThread["status"] = "idle",
+  ) =>
+    ({
+      runs: [],
+      expectedNativeSessionId: "ses_current",
+      providerThreads: [
+        {
+          id: "provider-thread-active",
+          appThreadId: "thread-idle",
+          ownerNodeId: "external-parent-node",
+          status: "idle",
+        },
+        {
+          id: "provider-thread-child",
+          appThreadId: "thread-child",
+          ownerNodeId: "subagent-1",
+          status: childStatus,
+          native: "ses_child",
+        },
+      ],
+      subagents: [
+        { id: "subagent-1", status: subagentStatus, providerThreadId: "provider-thread-child" },
+      ],
+    }) satisfies Fixture;
+
+  it.each(["completed", "failed", "cancelled", "interrupted"])(
+    "ignores a settled nested provider thread with a %s subagent",
+    (status) => expect(reason(nested(status))).toBeNull(),
+  );
+
+  it("refuses an active nested provider thread even after its subagent completed", () => {
+    expect(idleBlocker(input(nested("completed", "active")))).toEqual({
+      reason: "session-changed",
+      detail: "Thread thread-idle has nested provider thread provider-thread-child still active.",
+    });
+  });
+
+  it.each(["pending", "running", "waiting", "idle"])(
+    "refuses a nested provider thread whose subagent is %s",
+    (status) =>
+      expect(reason(nested(status))).toBe(
+        status === "idle" ? "session-changed" : "background-work",
+      ),
+  );
+
+  it("still refuses a live runless child turn before checking identity", () => {
+    expect(
+      reason({ ...nested(), turns: [{ id: "turn-child", runAttemptId: null, status: "running" }] }),
+    ).toBe("background-work");
+  });
+
+  it("checks the expected native session on a runless thread with settled children", () => {
+    expect(idleBlocker(input({ ...nested(), expectedNativeSessionId: "ses_other" }))).toEqual({
+      reason: "session-changed",
+      detail: "Thread thread-idle is on native session ses_current, not ses_other.",
+    });
+  });
+
+  it("excludes subagent references even when their appThreadId matches the root", () => {
+    const fixture = nested();
+    expect(
+      reason({
+        ...fixture,
+        providerThreads: fixture.providerThreads.map((providerThread) => ({
+          ...providerThread,
+          appThreadId: "thread-idle",
+        })),
+      }),
+    ).toBeNull();
+  });
+
+  it("checks a nested provider's activity even without a subagent record", () => {
+    expect(reason({ ...nested(), subagents: [] })).toBeNull();
+    expect(reason({ ...nested("completed", "active"), subagents: [] })).toBe("session-changed");
+  });
+
+  it("refuses when the active pointer names a nested session rather than the sole own session", () => {
+    const fixture = nested();
+    expect(
+      reason({
+        ...fixture,
+        expectedNativeSessionId: "ses_child",
+        providerThreads: fixture.providerThreads.map((providerThread) => ({
+          ...providerThread,
+          id:
+            providerThread.id === "provider-thread-active"
+              ? "provider-thread-own"
+              : "provider-thread-active",
+        })),
+        subagents: [
+          { id: "subagent-1", status: "completed", providerThreadId: "provider-thread-active" },
+        ],
+      }),
+    ).toBe("session-changed");
   });
 
   it("refuses an archived thread first", () => {

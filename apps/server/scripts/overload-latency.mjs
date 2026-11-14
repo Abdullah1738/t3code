@@ -284,7 +284,7 @@ const program = Effect.scoped(
     const startupIndexMs = NodePerfHooks.performance.now() - indexStarted;
     process.stdout.write("Setup: startup index path complete\n");
     const indexes =
-      yield* sql`SELECT name FROM sqlite_schema WHERE type='index' AND name='ardud_control_thread_candidates_idx'`;
+      yield* sql`SELECT name FROM sqlite_schema WHERE type='index' AND name='ardud_control_thread_candidates_desc_idx'`;
     yield* sql`CREATE TABLE overload_latency_writer (id INTEGER PRIMARY KEY, value INTEGER)`;
     yield* sql`INSERT INTO overload_latency_writer VALUES (1,0)`;
     const node = {

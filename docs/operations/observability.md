@@ -116,8 +116,8 @@ on. The span time is when the sample ran, not when the stall happened.
 
 Each stall is also appended as one
 NDJSON line to `event-loop-stalls.ndjson`, next to the trace file. A line has `time` and the span
-attributes. The file keeps the last 1000 or more stalls, with one rotated backup
-(`event-loop-stalls.ndjson.1`). Use it to see how often a server stalls over days.
+attributes. Each file is capped at 256 KiB, with one rotated backup
+(`event-loop-stalls.ndjson.1`). Quiet samples and heap diagnostics share that budget.
 
 Some delay is not recorded:
 

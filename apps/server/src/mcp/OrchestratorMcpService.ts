@@ -784,6 +784,29 @@ function delegationCommandId(
   );
 }
 
+function delegationTaskCommandId(taskId: NodeId): CommandId | undefined {
+  if (!taskId.startsWith("node:delegated-task:")) return undefined;
+  try {
+    const commandId = CommandId.make(
+      decodeURIComponent(taskId.slice("node:delegated-task:".length)),
+    );
+    const parts = commandId.split(":");
+    if (
+      parts[0] !== "command" ||
+      parts[1] !== "mcp" ||
+      !(
+        (parts.length === 6 && parts[2] === "delegate-task") ||
+        (parts.length === 5 && parts[3] === "delegate-task")
+      ) ||
+      IdAllocator.derive.delegatedTaskNode({ commandId }) !== taskId
+    )
+      return undefined;
+    return commandId;
+  } catch {
+    return undefined;
+  }
+}
+
 function threadCreationIds(namespace: string, requestKey: string, index: number) {
   const identity = stablePart(namespace);
   const key = stablePart(requestKey);
@@ -1934,12 +1957,47 @@ const make = Effect.gen(function* () {
         candidate.threadId === scope.thread.threadId,
     );
     if (task === undefined || task.childThreadId === null) {
+      let detail = "";
+      const commandId = delegationTaskCommandId(taskId);
+      if (commandId !== undefined) {
+        const state = yield* threadManagement.getDelegationCommandState(commandId).pipe(
+          NodeSqliteClient.readOnly,
+          NodeSqliteClient.foregroundReads,
+          Effect.mapError((error) => failure("orchestration_error", errorMessage(error))),
+          (effect) => McpTaskTrace.stage(effect, "command_receipt", "t3.task"),
+        );
+        if (
+          "threadId" in state &&
+          (state.threadId !== scope.thread.threadId ||
+            state.commandType !== "delegated_task.request")
+        ) {
+          return yield* failure(
+            "task_not_found",
+            `Delegated task ${taskId} does not belong to this thread.`,
+          );
+        }
+        yield* Effect.annotateCurrentSpan({ "t3.task.creation_state": state.status });
+        switch (state.status) {
+          case "accepted":
+            detail =
+              " This delegation was saved; its task projection is catching up. Retry task_status with this task id.";
+            break;
+          case "rejected":
+            detail = ` This delegation was rejected: ${state.error ?? "No reason was recorded."}`;
+            break;
+          case "pending":
+            detail =
+              " This delegation is still being created; retry task_status with this task id, or retry delegate_task with the same clientRequestId.";
+            break;
+          case "never_saved":
+            detail =
+              " This delegation was never saved. Retry delegate_task with the same clientRequestId.";
+            break;
+        }
+      }
       return yield* failure(
         "task_not_found",
-        `Delegated task ${taskId} was not found for thread ${scope.thread.threadId}.` +
-          (taskId.startsWith("node:delegated-task:")
-            ? " Creation may still be in flight; retry task_status with this task id. If it is still not found about 30 seconds after the timeout, retry delegate_task with the same clientRequestId; this safely returns the same task."
-            : ""),
+        `Delegated task ${taskId} was not found for thread ${scope.thread.threadId}.${detail}`,
       );
     }
     onProgress?.({ childThreadId: task.childThreadId, childNodeId: task.id });
@@ -3716,7 +3774,10 @@ const make = Effect.gen(function* () {
       return yield* SendAcknowledgement.bounded(
         (clientRequestId) =>
           Effect.gen(function* () {
-            const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId);
+            const { parent, limits, target } = yield* SendAcknowledgement.waitingOn(
+              loadScopedThread(scope, input.threadId),
+              `target thread read for thread ${input.threadId}`,
+            );
             yield* assertLiveCallerForOtherThread(scope, parent, target);
             yield* resolveRuntimeMode(limits.runtimeMode, target.thread.runtimeMode);
             yield* resolveInteractionMode(limits.interactionMode, target.thread.interactionMode);
@@ -3727,12 +3788,15 @@ const make = Effect.gen(function* () {
             const messages =
               scope.thread === undefined
                 ? []
-                : (yield* threadManagement
-                    .getThreadRecords(input.threadId, ["messages"], {
-                      messageRoles: ["user"],
-                      turnItemTypes: [],
-                    })
-                    .pipe(Effect.mapError(threadManagementFailure))).messages;
+                : (yield* SendAcknowledgement.waitingOn(
+                    threadManagement
+                      .getThreadRecords(input.threadId, ["messages"], {
+                        messageRoles: ["user"],
+                        turnItemTypes: [],
+                      })
+                      .pipe(Effect.mapError(threadManagementFailure)),
+                    `prior send read for thread ${input.threadId}`,
+                  )).messages;
             const prior =
               scope.thread === undefined
                 ? undefined
@@ -3760,29 +3824,32 @@ const make = Effect.gen(function* () {
                 : CommandId.make(
                     `command:mcp:${prior.id.split(":")[2]}:thread-send:${stablePart(key)}`,
                   );
-            const result = yield* threadManagement
-              .sendToThread({
-                projectId: target.thread.projectId,
-                commandId,
-                threadId: input.threadId,
-                ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
-                messageId,
-                text: input.message,
-                attachments: [],
-                mode,
-                createdBy: "agent",
-                creationSource: "mcp",
-              })
-              .pipe(
-                Effect.mapError((error) =>
-                  isThreadManagementError(error)
-                    ? threadManagementFailure(error)
-                    : failure(
-                        "orchestration_error",
-                        `Unable to send to thread ${input.threadId}: ${errorMessage(error)}`,
-                      ),
+            const result = yield* SendAcknowledgement.waitingOn(
+              threadManagement
+                .sendToThread({
+                  projectId: target.thread.projectId,
+                  commandId,
+                  threadId: input.threadId,
+                  ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
+                  messageId,
+                  text: input.message,
+                  attachments: [],
+                  mode,
+                  createdBy: "agent",
+                  creationSource: "mcp",
+                })
+                .pipe(
+                  Effect.mapError((error) =>
+                    isThreadManagementError(error)
+                      ? threadManagementFailure(error)
+                      : failure(
+                          "orchestration_error",
+                          `Unable to send to thread ${input.threadId}: ${errorMessage(error)}`,
+                        ),
+                  ),
                 ),
-              );
+              `message dispatch for thread ${input.threadId}`,
+            );
             // Delivery is the committed route, not provider acceptance. Claude's priority-next
             // steer may wait for a tool boundary; that wait must never hold the MCP reply.
             return {

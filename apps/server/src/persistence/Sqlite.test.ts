@@ -20,6 +20,8 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as StartupPhaseLog from "../ardud/observability/StartupPhaseLog.ts";
 import { ServerActivation } from "../serverActivation.ts";
+import { ShellRunLookupMigration } from "../ardud/persistence/shellRunLookupMigration.ts";
+import * as Statement from "effect/sql/Statement";
 
 const lockHolderSource = `
 const { DatabaseSync } = require("node:sqlite");
@@ -193,6 +195,96 @@ it.effect(
             ),
           );
         }),
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+      ),
+    );
+  },
+);
+
+it.effect(
+  "boots a pending lookup migration with inherited WAL before warming or taking its writer",
+  () => {
+    const directory = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "t3-pending-migration-wal-"),
+    );
+    const filename = NodePath.join(directory, "state.sqlite");
+    return Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        yield* SqlClient.SqlClient;
+      }).pipe(
+        Effect.provide(
+          SqlitePersistence.layerFromPath(filename).pipe(Layer.provide(NodeServices.layer)),
+        ),
+      );
+      const seed = NodeChildProcess.spawnSync(
+        process.execPath,
+        [
+          "-e",
+          `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec('PRAGMA wal_autocheckpoint=0; DELETE FROM effect_sql_migrations WHERE migration_id=68;         DROP INDEX ardud_shell_project_threads_idx; DROP INDEX ardud_shell_activity_run_idx;         DROP INDEX ardud_shell_executed_run_idx; CREATE TABLE startup_pages(payload BLOB);         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1200)         INSERT INTO startup_pages SELECT randomblob(4000) FROM n');
+      process.exit(0);
+    `,
+          filename,
+        ],
+        { encoding: "utf8" },
+      );
+      assert.equal(seed.status, 0, seed.stderr);
+      const activation = yield* Deferred.make<void>();
+      const warmEntered = yield* Deferred.make<void>();
+      const releaseWarm = yield* Deferred.make<void>();
+      const observe: Statement.Transformer = (statement) =>
+        Effect.gen(function* () {
+          if (statement.compile()[0].includes("NOT INDEXED")) {
+            yield* Deferred.succeed(warmEntered, undefined);
+            yield* Deferred.await(releaseWarm);
+          }
+          return statement;
+        });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const ready = yield* ShellRunLookupMigration;
+        assert.isDefined(ready);
+        assert.isFalse(yield* Deferred.isDone(ready!));
+        assert.isFalse(yield* Deferred.isDone(warmEntered));
+        assert.deepEqual(yield* sql`SELECT max(migration_id) AS id FROM effect_sql_migrations`, [
+          { id: 67 },
+        ]);
+        const pending = (yield* sql<{
+          log: number;
+          checkpointed: number;
+        }>`PRAGMA wal_checkpoint(NOOP)`)[0]!;
+        assert.isAbove(pending.log - pending.checkpointed, 1000);
+        assert.isBelow(pending.log, 10000);
+        yield* Deferred.succeed(activation, undefined);
+        yield* Deferred.await(warmEntered);
+        // Even while preparation is parked, the server writer accepts work.
+        yield* sql`INSERT INTO startup_pages VALUES (X'01')`;
+        assert.deepEqual(yield* sql`SELECT count(*) AS count FROM startup_pages`, [
+          { count: 1201 },
+        ]);
+        yield* Deferred.succeed(releaseWarm, undefined);
+        yield* Deferred.await(ready!);
+        assert.deepEqual(yield* sql`SELECT max(migration_id) AS id FROM effect_sql_migrations`, [
+          { id: 68 },
+        ]);
+        assert.lengthOf(
+          yield* sql`SELECT name FROM sqlite_schema WHERE name IN
+        ('ardud_shell_project_threads_idx', 'ardud_shell_activity_run_idx', 'ardud_shell_executed_run_idx')`,
+          3,
+        );
+      }).pipe(
+        Effect.provide(
+          SqlitePersistence.layerFromPath(filename).pipe(
+            Layer.provide(NodeServices.layer),
+            Layer.provide(Layer.succeed(ServerActivation, Deferred.await(activation))),
+          ),
+        ),
+        Effect.provideService(Statement.CurrentTransformer, observe),
       );
     }).pipe(
       Effect.ensuring(

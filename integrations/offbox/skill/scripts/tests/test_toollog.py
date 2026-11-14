@@ -30,6 +30,14 @@ class Logs(unittest.TestCase):
     def rows(self):
         return [json.loads(line) for path in self.root.glob('*.ndjson') for line in path.read_text().splitlines()]
 
+    def test_command_transport_fields_survive_serialization(self):
+        for mode in ('argv', 'file'):
+            for name in ('run.start', 'run.command'):
+                toollog.emit('run', name, props={'cmd_bytes': 140111, 'cmd_via': mode, 'step_count': 39})
+        self.assertEqual([row['props'] for row in self.rows()],
+                         [{'cmd_bytes': 140111, 'cmd_via': mode, 'step_count': 39}
+                          for mode in ('argv', 'file') for name in ('run.start', 'run.command')])
+
     def test_format_private_modes_and_only_allowed_metadata(self):
         secret = 'password=secret-1234567890123456'
         toollog.emit('run', 'run.request', ok=True, duration_ms=1.2345,
@@ -175,9 +183,9 @@ class Instrumentation(Isolated):
     def test_sync_pull_and_upload_outcomes(self):
         stats={'sent':123,'files':4}
         with patch.object(ssh_sync,'_push_files',return_value=stats), patch.object(ssh_sync,'tracked_secret_matches',return_value=['.env']):
-            ssh_sync.push('bx_fixture',Path('/checkout/repo'),'work',run_id='run-fixture')
+            ssh_sync.push('bx_fixture',Path(self.me['repo_root']),'work',run_id='run-fixture')
         with patch.object(ssh_sync,'_push_files',side_effect=common.OffboxError('private error')):
-            with self.assertRaises(common.OffboxError): ssh_sync.push('bx_fixture',Path('/checkout/repo'),'work')
+            with self.assertRaises(common.OffboxError): ssh_sync.push('bx_fixture',Path(self.me['repo_root']),'work')
         self.outcomes('run.sync')
         self.assertEqual(self.rows('run.sync')[0]['props'],{'bytes':123,'files':4,'skipped':1})
         for rc in (0,23):

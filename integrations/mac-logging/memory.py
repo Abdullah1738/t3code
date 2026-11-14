@@ -168,10 +168,11 @@ def collect(run, previous, now):
         ('swap', ['/usr/sbin/sysctl', '-n', 'vm.swapusage'], parse_swap),
         ('vm', ['/usr/bin/vm_stat'], parse_vm),
         ('pressure', ['/usr/sbin/sysctl', '-n', 'vm.memory_pressure'], lambda s: int(s.strip())),
+        ('pressureLevel', ['/usr/sbin/sysctl', '-n', 'kern.memorystatus_vm_pressure_level'], lambda s: int(s.strip())),
         ('freePercent', ['/usr/bin/memory_pressure', '-Q'], pressure_free),
         ('boot', ['/usr/sbin/sysctl', '-n', 'kern.boottime'],
          lambda s: int(re.search(r'\bsec\s*=\s*(\d+)', s)[1]) if re.search(r'\bsec\s*=\s*(\d+)', s) else None),
-        ('top', ['/usr/bin/top', '-l', '1', '-o', 'mem', '-n', '15', '-stats', STATS], parse_top),
+        ('top', ['/usr/bin/top', '-l', '1', '-o', 'mem', '-stats', STATS], parse_top),
         ('processes', ['/bin/ps', '-axo', 'pid=,ppid=,etime=,comm='], parse_ps),
         ('io', ['/usr/sbin/iostat', '-d', '-c', '2', '-w', '1', 'disk0'], parse_io),
     )
@@ -194,35 +195,30 @@ def collect(run, previous, now):
     props['counts'] = counted(rows) if rows is not None else None
     props['processCount'] = len(rows) if rows is not None else None
     props['ppid1Count'] = sum(p['ppid'] == 1 for p in rows) if rows is not None else None
-    # ps supplies elapsed time and exact names, never args. A single filtered top
-    # measures watched PIDs omitted from the first snapshot, including compression.
+    # One full top snapshot supplies both sets. ps adds exact names and elapsed
+    # time without argv, so truncated COMMAND labels cannot hide watched PIDs.
+    snapshot = props['top']
+    props['top'] = snapshot[:15] if snapshot is not None else None
     props['watched'] = None
-    props['watchedError'] = props['countsError']
+    props['watchedError'] = props['countsError'] or props['topError']
     if rows is not None:
         watched = [p for p in rows if p['command'] in WATCHED]
         props['watchedOmitted'] = max(0, len(watched)-512)
         watched = watched[:512]
-        observed = {p['pid']: p for p in props['top'] or []}
-        missing = [p['pid'] for p in watched if p['pid'] not in observed]
-        error = None
-        if missing:
-            argv = ['/usr/bin/top', '-l', '1', '-n', str(len(missing)), '-stats', STATS]
-            for pid in missing:
-                argv.extend(('-pid', str(pid)))
-            extra, error = probe(argv, parse_top, run)
-            observed.update((p['pid'], p) for p in extra or [])
-        props['watchedError'] = error
+        observed = {p['pid']: p for p in snapshot or []}
         props['watched'] = [dict(pid=p['pid'], command=p['command'], etime=p['etime'],
             **({k: observed[p['pid']][k] for k in ('memMb', 'cmprsMb', 'cpu')}
                if p['pid'] in observed else dict(memMb=None, cmprsMb=None, cpu=None)),
-            error=None if p['pid'] in observed else error or 'gone') for p in watched]
+            error=None if p['pid'] in observed else props['topError'] or 'gone') for p in watched]
     return props, baseline
 
 
 def pressure_streak(props, state, now):
-    pressure, free = props.get('pressure'), props.get('freePercent')
-    critical = (pressure is not None and pressure >= 2) or (free is not None and free < 15)
-    previous = state.get('pressure')
+    pressure, free = props.get('pressureLevel'), props.get('freePercent')
+    critical = (pressure == 4) or (free is not None and free < 15)
+    # New state key discards streaks built from the old raw counter.
+    state.pop('pressure', None)
+    previous = state.get('pressureLevel')
     previous = previous if isinstance(previous, dict) else {}
     consecutive = previous.get('consecutive', 0)
     consecutive = consecutive if type(consecutive) is int else 0
@@ -230,8 +226,50 @@ def pressure_streak(props, state, now):
     # A failed observation or a missed cadence breaks consecutive evidence.
     recent = type(at) in (int, float) and 0 < now-at <= 600
     streak = min(2, consecutive+1) if critical and recent else int(critical)
-    state['pressure'] = dict(at=now, consecutive=streak)
+    state['pressureLevel'] = dict(at=now, consecutive=streak)
     props['criticalSamples'] = streak
+
+
+def elapsed_seconds(value):
+    days, _, clock = value.rpartition('-')
+    parts = [int(part) for part in clock.split(':')]
+    seconds = sum(part * 60**i for i, part in enumerate(reversed(parts)))
+    return int(days or 0)*86400 + seconds
+
+
+def fseventsd_growth(props, state, now):
+    previous = state.get('fseventsdGrowth')
+    previous = previous if isinstance(previous, dict) else {}
+    current, candidates = {}, []
+    for proc in props.get('watched') or []:
+        if proc['command'] != 'fseventsd' or proc['memMb'] is None or props.get('boot') is None:
+            continue
+        pid = str(proc['pid'])
+        old = previous.get(pid)
+        old = old if isinstance(old, dict) else {}
+        age = elapsed_seconds(proc['etime'])
+        interval = now-old['at'] if type(old.get('at')) in (int, float) else 0
+        valid = (0 < interval <= 600 and old.get('boot') == props['boot']
+                 and type(old.get('ageS')) is int and age > old['ageS']
+                 and abs(age-old['ageS']-interval) <= 10
+                 and type(old.get('memMb')) in (int, float))
+        rate = max(0, (proc['memMb']-old['memMb'])*3600/interval) if valid else None
+        growing = rate is not None and rate > 100
+        count = old.get('consecutive', 0)
+        count = count if type(count) is int and 0 <= count <= 3 else 0
+        streak = min(3, count+1) if growing else 0
+        since = old.get('since') if growing and count else now-interval
+        since = since if type(since) in (int, float) and since <= now-interval else now-interval
+        window = now-since if growing else 0
+        current[pid] = dict(at=now, boot=props['boot'], ageS=age, memMb=proc['memMb'],
+                            consecutive=streak, since=since if growing else now)
+        candidates.append((streak, rate or 0, proc['pid'], window, rate))
+    # Replacing the map drops disappeared/unreadable PIDs. Boot, elapsed-age
+    # reset and missing samples cannot turn a daemon restart into memory growth.
+    state['fseventsdGrowth'] = current
+    best = max(candidates) if candidates else (0, 0, None, 0, None)
+    props.update(fseventsdGrowthSamples=best[0], fseventsdGrowthPid=best[2],
+                 fseventsdGrowthWindowS=best[3], fseventsdGrowthMbPerHour=best[4])
 
 
 def alert_reasons(props):
@@ -245,9 +283,12 @@ def alert_reasons(props):
     ordered = sorted(holders.values(), key=lambda p: p['memMb'], reverse=True)
     if ordered and ordered[0]['memMb'] > 8 * 1024:
         reasons['footprint'] = '%s %.1f GB' % (ordered[0]['command'], ordered[0]['memMb']/1024)
-    fsevents = [p for p in ordered if p['command'] == 'fseventsd' and p['memMb'] > 4 * 1024]
+    fsevents = [p for p in ordered if p['command'] == 'fseventsd' and p['memMb'] > 2 * 1024]
     if fsevents:
         reasons['fseventsd'] = 'fseventsd %.1f GB' % (fsevents[0]['memMb']/1024)
+    if props.get('fseventsdGrowthSamples', 0) >= 3 and props.get('fseventsdGrowthWindowS', 0) >= 900:
+        reasons['fseventsd_growth'] = 'fseventsd growing %.0f MiB/h for %.0f min' % (
+            props['fseventsdGrowthMbPerHour'], props['fseventsdGrowthWindowS']/60)
     top3 = ', '.join('%s %.1f GB' % (memory_command(p['command']), p['memMb']/1024) for p in ordered[:3]) or 'unavailable'
     return {reason: '%s; top: %s.\n%s' % (text, top3, CARD) for reason, text in reasons.items()}
 
@@ -297,6 +338,7 @@ def sample(run=subprocess.run, now=None, notify=True):
         props, baseline = collect(run, state.get('baseline', {}), now)
         state['baseline'] = baseline
         pressure_streak(props, state, now)
+        fseventsd_growth(props, state, now)
         save_state('memory', state)
         errors = bool(props.get('watchedOmitted')) or any(value for key, value in props.items() if key.endswith('Error') and key != 'deltaError')
         emit('memory', 'error' if errors else 'event', 'memory.sample', ok=not errors,

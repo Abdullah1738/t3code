@@ -161,9 +161,10 @@ export const writesThreads = <P, A, E, R>(
       const caller = yield* writingCaller;
       for (const threadId of threads(params)) {
         if (threadId === undefined || threadId === caller.scope.thread?.threadId) continue;
-        const target = yield* caller.threads
-          .getThreadShell(threadId)
-          .pipe(Effect.mapError(unavailable));
+        const target = yield* SendAcknowledgement.waitingOn(
+          caller.threads.getThreadShell(threadId).pipe(Effect.mapError(unavailable)),
+          `target permission read for thread ${threadId}`,
+        );
         if (target !== null && target.deletedAt === null) {
           yield* assertTargetWithinLimits(caller.limits, target);
         }

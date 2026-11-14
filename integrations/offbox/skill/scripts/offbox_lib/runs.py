@@ -10,6 +10,7 @@ import re
 import select
 import shlex
 import signal
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -771,21 +772,41 @@ def planned_steps(run) -> int:
     return int(run['step_count'] or 0) if 'step_count' in run.keys() else 0
 
 
+def argument_list_failure(run, path: Path, *, report: bool) -> bool:
+    try:
+        text = path.read_text(errors='replace')
+    except OSError:
+        return False
+    if (COMMAND_STARTED_MARKER in text or run_evidence.PREFIX in text
+            or not re.search(r'^.*boatd-wrap: line \d+: .*Argument list too long$', text, re.M)
+            or any(STEP_RETRY.fullmatch(line) for line in text.splitlines())
+            or 'Error: Command not executable' not in text):
+        return False
+    if report:
+        size = run['cmd_bytes'] if 'cmd_bytes' in run.keys() else None
+        detail = f', {size} bytes' if size is not None else ', command bytes unavailable'
+        say(f'the box could not start the command (argument list too long{detail}); '
+            'update offbox or run a script file; a single argument over 128 KiB needs its contents '
+            'in a file read by the command')
+    return True
+
+
 def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, planned: int | None = None,
                        locked: bool = False, until: float | None = None, catch_up: bool = True,
-                       report: bool = True, history_result: str | None = None) -> int | None:
+                       report: bool = True, history_result: str | None = None,
+                       report_start_failure: bool = True) -> int | None:
     """Completion requires evidence from every step, even when a process/receipt says zero.
 
     Reuse history catch-up before rejecting a partial follow, including for a process whose
     row is still active. The caller has already established that the process ended.
     """
+    path = log_path or LOGS_DIR / f"{run['run_id']}.log"
     planned = planned_steps(run) if planned is None else planned
     if not planned:
-        return code
+        return 126 if code in (None, 126) and argument_list_failure(run, path, report=report and report_start_failure) else code
     known = run['known_exit_code'] if 'known_exit_code' in run.keys() else None
     if known not in (None, 0) and code in (None, 0):
         code = known
-    path = log_path or LOGS_DIR / f"{run['run_id']}.log"
     result = history_result
     if catch_up and (api.BACKEND == 'server' or missing_step_count(step_results(path), planned)):
         from .misc import _catch_up_log
@@ -796,6 +817,8 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
     # Complete old markers cannot prove the final attempt when the host's appended retry note is unread.
     history_incomplete = (api.BACKEND == 'server' and run['command_id'] and result is not None
                           and result not in ('complete', 'caught_up'))
+    if code in (None, 126) and not history_incomplete and argument_list_failure(run, path, report=report and report_start_failure):
+        return 126
     checked = checked_steps_code(path, planned, code, report=report)
     if history_incomplete:
         if report and checked is not None:
@@ -931,7 +954,27 @@ def scope_failed(log_path: Path | None) -> bool:
     return bool(lines) and all(SCOPE_FAILED.match(ln) for ln in lines)
 
 
-def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = None) -> str:
+# A measured 123,144-byte Crpko script became a 139,882-byte POST after quoting.
+# Old home wrappers exec that whole POST as one argument (Linux limit 131,072,
+# including NUL). Reserve 28 KiB for backend wrapping; measure the final POST.
+COMMAND_INLINE_MAX = 100 * 1024
+
+
+def command_payload(script: str, run_id: str, *, claim_id: str | None = None) -> tuple[str, str | None]:
+    command = exit_recording_command(script, run_id, claim_id=claim_id)
+    path = None
+    if len(command.encode()) > COMMAND_INLINE_MAX:
+        path = f"/home/user/.offbox/cmd/{claim_id or run_id}.sh"
+        command = exit_recording_command(script, run_id, claim_id=claim_id, script_file=path)
+    if len(command.encode()) > COMMAND_INLINE_MAX:
+        raise OffboxError(f"command is {len(command.encode())} bytes, over the box start limit; "
+                          "put the steps in a script file and run it; a single argument over 128 KiB needs its contents "
+                          "in a file read by the command", code=2)
+    return command, path
+
+
+def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = None,
+                           script_file: str | None = None) -> str:
     """Run the remote script under a parent shell that writes its exit code to ~/.offbox/exit/<run>.rc,
     so a run boat later reports as lost still has its real status on the box."""
     f = f'"$HOME/.offbox/exit/{run_id}.rc"'
@@ -939,6 +982,8 @@ def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = N
     persist = '\n'.join([
         'mkdir -p "$HOME/.offbox/exit" || exit 1',
         f'printf "%s\\n" "$1" > {f}.tmp && mv -f {f}.tmp {f}',
+        *(["rm -f -- " + shlex.quote(script_file),
+           'find "$HOME/.offbox/cmd" -name "*.sh" -mtime +2 -delete'] if script_file else []),
         'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" -o -name "*.pid" '
         '-o -name "*.trace" -o -name "*.containers.json" -o -name "*.containers.tmp" \\) -mtime +2 -delete',
     ])
@@ -981,7 +1026,7 @@ def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = N
           for name, code in (("HUP", 129), ("INT", 130), ("TERM", 143))],
         '__offbox_t0=$(date +%s)',
         '__offbox_evidence wrapper pid=$$',
-        'bash -lc "$0"',
+        'bash -l ' + shlex.quote(script_file) if script_file else 'bash -lc "$0"',
         '__offbox_rc=$?',
         'fi',
         persist_block,
@@ -1002,6 +1047,8 @@ def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = N
         'fi',
         'exit "$__offbox_rc"',
     ])
+    if script_file:
+        return "bash -c " + shlex.quote(outer)
     return "bash -c " + shlex.quote(outer) + " " + shlex.quote(script)
 
 
@@ -1347,7 +1394,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               f"_offbox_needs_go={int(usage.needs_go)}\n{GO_REPAIR}",
               node,
               node_tools.block(rdir, repo_root),
-              ('''for _offbox_tool in terraform aws ruby vector; do
+              ('''for _offbox_tool in terraform aws ruby vector gh; do
   command -v "$_offbox_tool" >/dev/null || {
     echo "offbox: required tool missing on command PATH: $_offbox_tool" >&2
     echo offbox-repo-setup-failed >&2
@@ -1361,17 +1408,39 @@ done''' if repo_key == "crpko-devops" else ':'),
     return "\n".join(lines)
 
 
+def _source_present(root: Path, cwd: Path) -> None:
+    for path in (root, cwd):
+        try:
+            present = stat.S_ISDIR(path.stat().st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            present = False
+        if not present:
+            raise common.SourceGone(path)
+    try:
+        os.getcwd()
+    except FileNotFoundError:
+        # A path can have been recreated while this process still holds its deleted inode.
+        raise common.SourceGone(cwd) from None
+
+
 class Runner:
     def __init__(self, a, me: dict):
         self.a, self.me = a, me
         self.run_id = os.environ.get(BACKGROUND_RUN_ENV) or new_id("run")
         self.root = Path(me["repo_root"])
-        self.cwd = Path(os.getcwd()).resolve()
+        recorded_cwd = None
+        if os.environ.get(BACKGROUND_RUN_ENV):
+            with contextlib.closing(db()) as con:
+                row = con.execute('SELECT local_cwd,cwd FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
+                if row:
+                    recorded_cwd = row['local_cwd'] or row['cwd']
+        self.cwd = Path(recorded_cwd or os.getcwd()).resolve()
         try:
             self.rel = str(self.cwd.relative_to(self.root))
         except ValueError:
             self.rel = "."
         self.box = None
+        self.queue_s = 0.0
         self.pid = None
         self.started = False
         self.registered = False
@@ -1384,6 +1453,30 @@ class Runner:
         self.push_resumed = False
         self.wait_images = False
         self.log_path = LOGS_DIR / f"{self.run_id}.log"
+
+    def check_source(self, checkpoint):
+        try:
+            _source_present(self.root, self.cwd)
+        except common.SourceGone as error:
+            error.checkpoint = checkpoint
+            raise
+
+    def source_gone(self, error):
+        message = f"{error} (queued {self.queue_s:.1f}s; box {self.box or 'none'})"
+        error.args = (message,)
+        with log_lock(self.run_id):
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open('ab') as stream:
+                stream.write(f"offbox: {message}\n".encode())
+                length = stream.tell()
+            _commit(self.log_path, 0, 0, length)
+        self.record(error=message)
+        with contextlib.closing(db()) as con:
+            with write(con):
+                con.execute('DELETE FROM pool_cap_callers WHERE run_id=?', (self.run_id,))
+            event(con, self.box, 'run_source_gone',
+                  f'{self.run_id} checkpoint={error.checkpoint} queue_s={self.queue_s:.1f} box={self.box or "none"} {message}')
+        finish(self.run_id, 2, 'source_gone', catch_up=False, bookkeeping=False)
 
     def _log_pool(self, con):
         import toollog
@@ -1485,18 +1578,44 @@ class Runner:
         claim = start_check.claim_id(con, self.run_id)
         env_file = f"/home/user/.offbox/env/{claim}.env"
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()
+        w = node_version.want(self.root, self.cwd)
+        node_block = node_version.block(w)
+        pm = pnpm_version.want(self.root, self.cwd)
+        if pm:
+            node_block += "\n" + pnpm_version.block(pm)
+        usage = command_usage.inspect(self.root, self.rel, a.cmd, steps)
+
+        def build_command(rdir, box, preserve):
+            script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
+                                   node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
+                                   repo_key=me["repo_key"], repo_root=self.root,
+                                   preserve_containers=preserve, box_id=box, usage=usage)
+            command, path = command_payload(script, self.run_id, claim_id=claim)
+            return command, path, script.encode()
+
+        # Validate the same transport before acquiring anything; final box-specific values are checked again.
+        build_command(identity.remote_dir_for(self.root), "<box>", "private lease")
         dead_attempts = 0
         replacement = None
         while True:
             options = {'exclude': self.cold_boxes} if self.cold_boxes else {}
-            row = replacement or pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh,
-                                              run_id=self.run_id, **options)
+            queued_at = time.monotonic()
+            try:
+                row = replacement or pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh,
+                                                  run_id=self.run_id, check_source=lambda: self.check_source('queued'),
+                                                  **options)
+            finally:
+                self.queue_s += time.monotonic() - queued_at
             replacement = None
             self.lease_row = row
             self.box = row["box_id"]
+            self.check_source('slot')
             rdir = row["remote_dir"]
             self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
                         docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
+            command, self.command_file, self.command_body = build_command(
+                rdir, self.box, containers.preserve_reason(con, row))
+            self.record(cmd_bytes=len(command.encode()), cmd_via='file' if self.command_file else 'argv')
             keeper_scope = None
             if row.get('_prepare_end') is None:
                 row['_prepare_end'] = prepare.Budget(self.box).end
@@ -1537,23 +1656,14 @@ class Runner:
                 if keeper_scope is not None and not keeper_scope.settled.is_set():
                     self.record(box_id=None)  # finish must not assign an idle TTL to a fenced box
                 raise
-        w = node_version.want(self.root, self.cwd)
-        node_block = node_version.block(w)
-        pm = pnpm_version.want(self.root, self.cwd)
-        if pm:
-            node_block += "\n" + pnpm_version.block(pm)
-        usage = command_usage.inspect(self.root, self.rel, a.cmd, steps)
         new_checkout_hint(row, self.root, usage)
         warning = clickhouse_suite_warning(me['repo_key'], row['size'], cmd_text)
         if warning:
             say(warning)
-        script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
-                               node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
-                               repo_key=me["repo_key"], repo_root=self.root,
-                               preserve_containers=containers.preserve_reason(con, row), box_id=self.box, usage=usage)
         con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', ('containers_expected:' + self.run_id, '1'))
         con.commit()
         self.require_pending(con)
+        self.check_source('push')
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:
@@ -1562,7 +1672,11 @@ class Runner:
         except Exception:
             pass
         try:
-            r = api.cmd_start(self.box, exit_recording_command(script, self.run_id, claim_id=claim),
+            import toollog
+            toollog.emit('run', 'run.start', ids={'run': self.run_id, 'box': self.box},
+                         props={'cmd_bytes': len(command.encode()),
+                                'cmd_via': 'file' if self.command_file else 'argv', 'step_count': len(steps)})
+            r = api.cmd_start(self.box, command,
                               meta={"repo": me.get("repo_key"), "kind": run_kind(cmd_text), "run_id": self.run_id},
                               retry_interrupted=retry_interrupted(a))
         except (api.ApiError, api.NetworkError) as e:
@@ -1621,7 +1735,8 @@ class Runner:
             self.record(process_id=self.pid, command_id=r.get("commandId"), status="running", command_at=now())
             lease.touch(self.box)
             event(con, self.box, "run_start", f"{self.run_id} pid={self.pid} env={','.join(explicit) or '-'} "
-                                              f"cmd={cmd_text[:200]}")
+                                              f"cmd_bytes={len(command.encode())} cmd_via={'file' if self.command_file else 'argv'} "
+                                              f"steps={len(steps)} cmd={cmd_text[:200]}")
         except sqlite3.Error as error:
             state_warning(self.run_id, None, error)
         return row
@@ -1703,11 +1818,16 @@ class Runner:
         return None
 
     def _sync_box(self, con, a, rdir, env_file, body):
+        self.check_source('push')
         # Env values go through a 0600 file (never the command text, which boat keeps 90 days in history).
         err: list = []
         left = api.left()
         upload_timeout = 120 if left is None else max(.001, min(120, left))
-        upload = (err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout)
+        def upload_files():
+            ssh_sync.put_file(self.box, env_file, body, '600', upload_timeout)
+            if getattr(self, 'command_file', None):
+                ssh_sync.put_file(self.box, self.command_file, self.command_body, '600', upload_timeout)
+        upload = (err, upload_files)
         tw = None
         home = api.BACKEND == "server"
         if home:
@@ -1721,6 +1841,7 @@ class Runner:
             if not a.no_sync:
                 with prepare.phase("push", self.box):
                     candidates = _seed_candidates(con, self.box, rdir, self.me["repo_key"])
+                    self.check_source('push')
                     st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None),
                                        seed_candidates=candidates, run_id=self.run_id)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
@@ -1743,6 +1864,9 @@ class Runner:
             if tw is not None:
                 left = api.left()
                 tw.join(timeout=max(0, left) if left is not None else None)
+        self.check_source('push')
+        if isinstance(push_exc, common.SourceGone):
+            raise push_exc
         # Identity failures take precedence over transfer recovery, even if the other transfer saw a dead mount.
         for e in (push_exc, err[0] if err else None):
             if isinstance(e, common.SshHostKeyMismatch):
@@ -1752,9 +1876,10 @@ class Runner:
             err.clear()
             left = api.left()
             upload_timeout = 120 if left is None else max(.001, min(120, left))
-            _safe(err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout, terminal_identity=home)
+            _safe(err, upload_files, terminal_identity=home)
             if err and isinstance(err[0], common.SshHostKeyMismatch):
                 raise err[0]
+        self.check_source('push')
         # A dead mount may have failed either transfer; prefer that over an ordinary error from the other.
         for e in (push_exc, err[0] if err else None):
             reason = ssh_sync.dead_mount(str(e)) if e is not None else None
@@ -2474,7 +2599,9 @@ def emit_terminal(row):
             command_ms = api.command_execution_ms(row['box_id'], row['process_id'], row['command_id'])
             toollog.emit('run', 'run.command', kind='perf' if code == 0 else 'error', ok=code == 0,
                          duration_ms=command_ms, ids={'run': run_id, 'box': row['box_id']},
-                         props={'exitCode': code, 'timeoutHit': code == 124}, tag='command_failed' if code != 0 else None)
+                         props={'exitCode': code, 'timeoutHit': code == 124,
+                                'cmd_bytes': row['cmd_bytes'], 'cmd_via': row['cmd_via'],
+                                'step_count': planned_steps(row)}, tag='command_failed' if code != 0 else None)
     except Exception:
         pass
 
@@ -2486,6 +2613,8 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
     st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
     def prepare_result():
         nonlocal code, st
+        if status == 'source_gone':
+            return  # No command or step ran; only the caller's source check failed.
         prior = run
         if prior is None:
             with contextlib.closing(db()) as before:
@@ -2596,7 +2725,8 @@ def _background(a, me: dict) -> int:
             # No preexec_fn: Python/CF code in a forked macOS child is unsafe even before urllib sends a request.
             child = subprocess.Popen([sys.executable, '-u', str(BG_ENTRY), '_bg-queue', rn.run_id],
                                      start_new_session=True, close_fds=True, pass_fds=(ready_w, accept_r),
-                                     stdin=subprocess.PIPE, stdout=dst, stderr=subprocess.STDOUT, env=boot_env)
+                                     stdin=subprocess.PIPE, stdout=dst, stderr=subprocess.STDOUT, env=boot_env,
+                                     cwd=str(rn.log_path.parent))
         # Until this publication the original caller remains the provable owner. No payload is sent before it.
         rn.record(client_pid=child.pid, start_at=now())
         os.close(ready_w)
@@ -2656,6 +2786,7 @@ def _background(a, me: dict) -> int:
 
 def background_queue(run_id: str, payload: dict) -> int:
     a, me = SimpleNamespace(**payload['args']), payload['me']
+    source_failure = None
     con = db()
     try:
         with write(con):
@@ -2665,15 +2796,22 @@ def background_queue(run_id: str, payload: dict) -> int:
                     or row['repo_root'] != me['repo_root'] or payload['backend'] != common.backend()):
                 raise OffboxError(f'{run_id}: queued run cannot be adopted', code=EXIT_LOCAL)
             con.execute('UPDATE runs SET client_pid=?,start_at=? WHERE run_id=?', (os.getpid(), now(), run_id))
-        os.chdir(row['local_cwd'] or row['cwd'])
+        cwd = Path(row['local_cwd'] or row['cwd'])
+        try:
+            _source_present(Path(me['repo_root']), cwd)
+            os.chdir(cwd)
+        except (common.SourceGone, FileNotFoundError, NotADirectoryError) as error:
+            error = error if isinstance(error, common.SourceGone) else common.SourceGone(cwd)
+            error.checkpoint = 'queued'
+            source_failure = (error, max(0, now() - row['start_at']))
     finally:
         con.close()
     os.environ[BACKGROUND_RUN_ENV] = run_id
     return background_client(a, me, ready=payload['ready_fd'], accept=payload['accept_fd'],
-                             signal_mask=payload['signal_mask'])
+                             signal_mask=payload['signal_mask'], source_failure=source_failure)
 
 
-def background_client(a, me: dict, ready=None, accept=None, signal_mask=None) -> int:
+def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, source_failure=None) -> int:
     global _background_context
     _background_context = (a, me)
     from . import cli
@@ -2700,6 +2838,19 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None) ->
             if accepted not in (b'1', b''):
                 finish(rid, EXIT_LOCAL, 'local_error')
                 return EXIT_LOCAL
+        rn = Runner(a, me)
+        if source_failure is None:
+            try:
+                rn.check_source('queued')
+            except common.SourceGone as error:
+                source_failure = (error, 0)
+        if source_failure is not None:
+            error, queue_s = source_failure
+            rn.queue_s = queue_s
+            rn.source_gone(error)
+            say(str(error))
+            code = 2
+            return code
         code = cli._run_with_retries(a, me)
         return code
     except KeyboardInterrupt:
@@ -2870,12 +3021,20 @@ def _run_remote(a, rn) -> int:
             rn.start()
         except OffboxError as e:
             if not rn.started:
-                if e.code == EXIT_LOCAL:
+                if not isinstance(e, common.SourceGone):
+                    try:
+                        rn.check_source('push' if rn.box else 'queued')
+                    except common.SourceGone as source_error:
+                        e = source_error
+                if isinstance(e, common.SourceGone):
+                    rn.source_gone(e)
+                elif e.code == EXIT_LOCAL:
                     finish(rn.run_id, EXIT_LOCAL, "local_error")
                 elif not os.environ.get(BACKGROUND_RUN_ENV):
                     finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
-            rn.record(error=str(e)[:500])
-            raise
+            if not isinstance(e, common.SourceGone):
+                rn.record(error=str(e)[:500])
+            raise e
         if a.bg and rn.recovered_code is not None:
             from . import start_check
             con = db()
@@ -2975,7 +3134,8 @@ def _run_remote(a, rn) -> int:
             con.close()
         step_run = row if row is not None else dict(run_id=rn.run_id, box_id=rn.box, command_id=None, mode='fg')
         rn.remote_code = None
-        code = settled_steps_code(step_run, code, log_path=rn.log_path, planned=len(steps), locked=True)
+        code = settled_steps_code(step_run, code, log_path=rn.log_path, planned=len(steps), locked=True,
+                                  report_start_failure=False)
         rn.remote_code = code
     code = finish(rn.run_id, code, report=True)
     rn.remote_code = code

@@ -85,6 +85,22 @@ class LoggingTests(unittest.TestCase):
         self.assertTrue(keep.exists())
         self.assertEqual(rows[-1]['kind'], 'error')
 
+    def test_invalid_numeric_fields_do_not_discard_a_record(self):
+        for value in (10**400, -10**400, float('nan'), float('inf'), float('-inf'),
+                      True, None, '123', {}, []):
+            with self.subTest(value=value):
+                count = len(self.rows())
+                toollog.emit('disk', 'perf', 'disk.sample', duration_ms=value,
+                             props={'externalFreeGb': 737, 'inventorySourceErrors': value})
+                rows = self.rows()
+                self.assertEqual(len(rows), count+1)
+                self.assertEqual(rows[-1]['props'], {'externalFreeGb': 737})
+                self.assertNotIn('durationMs', rows[-1])
+        for value in (0, 1, -1, 1.5):
+            with self.subTest(valid=value):
+                toollog.emit('disk', 'event', 'disk.swing', props={'externalFreeGbDelta': value})
+                self.assertEqual(self.rows()[-1]['props']['externalFreeGbDelta'], value)
+
     def test_rollup_fixture_and_quantiles(self):
         now = dt.datetime(2026, 11, 13, tzinfo=dt.timezone.utc)
         for value in range(1, 21):
@@ -165,7 +181,7 @@ class LoggingTests(unittest.TestCase):
         state=self.root/'worker';state.mkdir()
         resources=[dict(id='expo:1',kind='expo',candidate=True,age_s=7200),
                    dict(id='container:local',kind='container',candidate=True,age_s=7400,image='localstack/localstack')]
-        scan=dict(resources=resources,candidates=[r['id'] for r in resources])
+        scan=dict(ts=0,liveness_unavailable=None,processes=dict(candidates=[],problems=[],checked=0,skipped=0,budget_skipped=0),resources=resources,candidates=[r['id'] for r in resources])
         with patch.object(watcher,'STATE_DIR',state), patch.object(janitor,'scan',return_value=scan), \
              patch.object(janitor,'act',side_effect=[(True,'done'),(False,'password=secret')]), \
              patch.object(janitor,'audit'), patch.object(janitor,'sh',return_value=(1,'','')), \
@@ -264,7 +280,7 @@ class LoggingTests(unittest.TestCase):
         import dev_janitor as janitor
         import janitor_watch as watcher
         resources=[dict(id='expo:1',kind='expo',candidate=True),dict(id='expo:2',kind='expo',candidate=True)]
-        scan=dict(resources=resources,candidates=['expo:1','expo:2'])
+        scan=dict(ts=0,liveness_unavailable=None,processes=dict(candidates=[],problems=[],checked=0,skipped=0,budget_skipped=0),resources=resources,candidates=['expo:1','expo:2'])
         for entry in ('cli','hourly'):
             with self.subTest(entry=entry), patch.object(janitor,'scan',return_value=scan), \
                  patch.object(janitor,'act',side_effect=[(True,'done'),RuntimeError('failed')]), \

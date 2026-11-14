@@ -52,9 +52,9 @@ for (const row of cases) test(`outage evidence to alert: ${row.name}`, async () 
       },
     },
     readRuntime: () => row.missingRuntime ? null : { origin: "http://127.0.0.1:3773", pid: process.pid, startedAt: boot, ...row.runtime },
-    checkListener: identity => {
+    checkListener: ({ pid, port }) => {
       ownershipChecks++;
-      assert.deepEqual(identity, { pid: process.pid, port: 3773 });
+      assert.deepEqual({ pid, port }, { pid: process.pid, port: 3773 });
       if (row.ownershipError) throw new Error("ownership unavailable");
       return row.owned !== false;
     },

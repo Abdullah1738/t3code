@@ -10,7 +10,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import api, capacity, ssh_sync
+from . import api, capacity, common, ssh_sync
 from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, EXIT_INFRA, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
                      SshHostKeyMismatch, file_lock, iso, kv_get, kv_set, log, mine, new_id, now, read_json, say, token_owner, write)
 from .identity import remote_dir_for
@@ -517,10 +517,8 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
             full = base if ":" in base else f"{rk}:{base}"
             brow = con.execute(f"SELECT * FROM bases WHERE name=? AND {mine()}", (full,)).fetchone()
             if not brow and home.only_on_home("bases", "name=?", (full,)):
-                # Saved on the home server, which is down: Boat never had it.
-                say(f"saved base '{full}' exists only on the home offbox server, which is down: "
-                    "using the repo template or recipe for this run")
-                base = None
+                raise home.base_down_error(full, os.environ.get(home.FAILOVER_ENV) or
+                                           'marked down by the health monitor')
             elif not brow:
                 from .base_catalog import missing
                 raise missing(full)
@@ -1254,6 +1252,8 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
     except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled, BoxNotReady, SshHostKeyMismatch):
         raise
     except OffboxError as e:
+        if isinstance(e, common.SourceGone):
+            raise
         raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}", e) from e
 
 
