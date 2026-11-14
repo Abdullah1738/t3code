@@ -114,6 +114,165 @@ class DeepInventoryTests(unittest.TestCase):
         jobs.directory_inventory(roots,self.runner(lambda p: .01,calls))
         self.assertTrue(calls)
 
+    def test_one_denied_child_of_fifty_finishes_as_complete_with_denied(self):
+        root = self.roots([('denied', 50)])[0]
+        bad = str(root/'0000')
+        calls = []
+        def run(cmd, **kw):
+            calls.append(cmd[2:])
+            self.clock[0] += .1
+            return SimpleNamespace(returncode=1 if bad in cmd else 0,
+                stdout=''.join('1\t'+p+'\n' for p in cmd[2:]),
+                stderr='du: '+bad+': Permission denied' if bad in cmd else '')
+        deep.run_pass([root], run)
+        state = jobs.read_state('disk-inventory')
+        self.assertTrue(state['partials'][str(root)]['completeWithDenied'])
+        self.assertEqual(state['sizes'][str(root)], 50*1024)
+        self.assertEqual(self.rows('disk.deep.end')[-1]['props']['childrenRemaining'], 0)
+        self.assertEqual(self.rows('disk.deep.root')[-1]['props']['deniedCount'], 1)
+        self.clock[0] += 3600
+        jobs.directory_inventory([root], lambda *a, **k: self.fail('fresh denied estimate retried'))
+        self.assertEqual(self.rows('disk.inventory')[-1]['props']['rootsComplete'], 1)
+        self.assertEqual(self.rows('disk.inventory')[-1]['props']['rootsCompleteWithDenied'], 1)
+
+    def test_failed_six_hundred_second_part_backs_off_without_blocking_siblings(self):
+        root = self.roots([('backoff', 3)])[0]
+        giant = root/'0000'
+        (giant/'000-stuck').touch()
+        (giant/'good').touch()
+        calls = []
+        jobs.save_state('disk-inventory', dict(duMode='links', childState={str(root):{
+            str(giant):dict(timeouts=1, lastTimeoutAt=self.now, partial=True)}}))
+        deep.run_pass([root], self.runner(lambda p: 700 if p.name == '000-stuck' else .1, calls))
+        state = jobs.read_state('disk-inventory')
+        part = state['childState'][str(root)][str(giant)]['parts'][str(giant/'000-stuck')]
+        self.assertGreaterEqual(part['nextAttemptAt']-part['lastTimeoutAt'], 86400)
+        root_props = self.rows('disk.deep.root')[-1]['props']
+        self.assertEqual(root_props['slowest1Path'], str(giant))
+        self.assertEqual(root_props['slowest1Ms'], 600000)
+        self.assertEqual(root_props['backedOffCount'], 1)
+        self.assertEqual(sum(str(giant/'000-stuck') in c for c, _ in calls), 1)
+        self.assertTrue(all('bytes' in state['childState'][str(root)][str(root/n)] for n in ('0001','0002')))
+        calls.clear()
+        self.clock[0] += 3600
+        deep.run_pass([root], self.runner(lambda p: .1, calls))
+        self.assertFalse(any(str(giant/'000-stuck') in c for c, _ in calls))
+
+    def test_timeout_retry_delays_are_daily_exponential_and_survive_cache_cleanup(self):
+        value = dict(partial=True, timeouts=1)
+        for delay in (1,2,4,8,8):
+            jobs.inventory_timeout(value)
+            self.assertEqual(value['nextAttemptAt']-value['lastTimeoutAt'], delay*86400)
+            cache = {'child':value}
+            jobs.inventory_clean_cache(cache, self.now+self.clock[0])
+            value = cache['child']
+            self.assertTrue(jobs.inventory_backed_off(value, value['nextAttemptAt']-.001))
+            self.assertFalse(jobs.inventory_backed_off(value, value['nextAttemptAt']))
+            self.assertTrue(jobs.inventory_deep_owned(value, value['nextAttemptAt']-.001))
+            self.assertTrue(jobs.inventory_deep_owned(value, value['nextAttemptAt']+1))
+            self.clock[0] += delay*86400
+
+    def test_expired_file_backoff_stays_deep_owned_until_success(self):
+        root = self.roots([('file-backoff',1)])[0]
+        child = root/'0000'
+        child.rmdir()
+        child.touch()
+        jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{
+            str(child):dict(partial=True,timeouts=2,leafTimeouts=1,nextAttemptAt=self.now-1,
+                            isDirectory=False,attemptedAt=0)}}))
+        jobs.directory_inventory([root], lambda *a,**k:self.fail('hourly reclaimed a failed file'))
+        calls = []
+        deep.run_pass([root], self.runner(lambda p:.1,calls))
+        self.assertTrue(calls)
+        self.assertNotIn('nextAttemptAt',jobs.read_state('disk-inventory')['childState'][str(root)][str(child)])
+
+    def test_slow_directory_listing_failure_class(self):
+        root = self.roots([('denied-listing',1)])[0]
+        child = root/'0000'
+        for error in (PermissionError(13,'denied',str(child)), OSError(5,'I/O',str(child))):
+            with self.subTest(error=type(error).__name__):
+                jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{
+                    str(child):dict(partial=True,slow=True,limited=True)}}))
+                scan = jobs.os.scandir
+                def scandir(path):
+                    if str(path) == str(child):
+                        raise error
+                    return scan(path)
+                with patch.object(jobs.os,'scandir',side_effect=scandir):
+                    for night in range(3):
+                        self.clock[0] = night*86400
+                        deep.run_pass([root], lambda cmd,**kw: SimpleNamespace(
+                            returncode=1,stdout='',stderr='du: '+cmd[-1]+': Permission denied')
+                            if isinstance(error, PermissionError) else self.fail('listing failed'))
+                        state = jobs.read_state('disk-inventory')
+                        denied = isinstance(error, PermissionError)
+                        self.assertEqual(state['partials'][str(root)]['completeWithDenied'], denied)
+                        value = state['childState'][str(root)][str(child)]
+                        self.assertEqual(value.get('deniedCount',0),int(denied))
+                        self.assertEqual('bytes' in value,denied)
+
+    def test_live_short_timeout_classes_do_not_acquire_backoff(self):
+        observed = []
+        for cap, parts in ((2,False),(139,True)):
+            root = self.roots([('cutoff%d'%cap,1)])[0]
+            cache, calls = {}, []
+            start = self.clock[0]
+            jobs.big_root_inventory(root,self.runner(lambda p:700,calls), start+cap,cache,
+                                    deep=True,parts_mode=parts,max_batches=1)
+            self.assertEqual(self.clock[0]-start,cap)
+            self.assertEqual(calls[0][1],cap)
+            value = cache[str(root/'0000')]
+            self.assertNotIn('nextAttemptAt',value)
+            self.assertFalse(value.get('timeouts'))
+            self.assertNotIn('bytes',value)
+            observed.append(calls[0][1])
+        print('TRUNCATED_TIMEOUT_REPLAY',json.dumps(dict(observedCutoffsS=observed,backedOff=0)))
+
+    def test_leaf_setup_overhead_preserves_full_cap_backoff(self):
+        for regular_file in (False, True):
+            for budget in (139, 2700):
+                with self.subTest(regular_file=regular_file,budget=budget):
+                    root = self.roots([('setup-%s-%d'%(regular_file,budget),1)])[0]
+                    child = root/'0000'
+                    leaf = child/'leaf'
+                    if regular_file:
+                        child.rmdir()
+                        child.touch()
+                    else:
+                        leaf.touch()
+                    jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{
+                        str(child):dict(slow=True,limited=True,partial=True)}}))
+                    original = jobs.os.lstat
+                    def lstat(path):
+                        self.clock[0] += .02
+                        return original(path)
+                    with patch.object(jobs.os,'lstat',side_effect=lstat):
+                        deep.run_pass([root],self.runner(lambda p:700),budget=budget)
+                    value = jobs.read_state('disk-inventory')['childState'][str(root)][str(child)]
+                    failed = value if regular_file else value['parts'][str(leaf)]
+                    self.assertEqual('nextAttemptAt' in failed,budget==2700)
+                    if budget == 2700:
+                        self.assertEqual(failed['nextAttemptAt']-failed['lastTimeoutAt'],86400)
+                        if regular_file:
+                            self.assertIs(value['isDirectory'],False)
+                            self.assertNotIn('parts',value)
+                            props = self.rows('disk.deep.root')[-1]['props']
+                            self.assertEqual(props['timedOutCount'],1)
+                            self.assertEqual(props['backedOffCount'],1)
+
+    def test_new_siblings_precede_retry_of_failed_child_on_next_pass(self):
+        root = self.roots([('fair-retry', 3)])[0]
+        bad = str(root/'0000')
+        def run(cmd, **kw):
+            self.clock[0] += 1
+            return SimpleNamespace(returncode=1, stdout='', stderr='du: '+bad+': Input/output error')
+        deep.run_pass([root], run, budget=1)
+        self.clock[0] += 3600
+        calls = []
+        deep.run_pass([root], self.runner(lambda p: .1, calls))
+        order = [p for c, _ in calls for p in c[2:]]
+        self.assertEqual(order[-1], bad)
+
     def test_checkpoint_survives_mid_pass_kill_and_resume(self):
         roots = self.roots([('kill',3)])
         good = self.runner(lambda p:1)
@@ -169,8 +328,8 @@ class DeepInventoryTests(unittest.TestCase):
         self.assertTrue(state['partials'][str(root)]['partial'])
         self.assertEqual(state['sizes'][str(root)],3*1024)
         self.assertNotIn('bytes',state['childState'][str(root)][str(root/'0000')])
-        self.assertEqual(self.rows('disk.deep.end')[-1]['props']['childrenRemaining'],2)
-        self.assertEqual(self.rows('disk.deep.root')[-1]['props']['completedCount'],1)
+        self.assertEqual(self.rows('disk.deep.end')[-1]['props']['childrenRemaining'],1)
+        self.assertEqual(self.rows('disk.deep.root')[-1]['props']['completedCount'],2)
 
     def test_hourly_skips_inventory_while_deep_holds_lock_but_collects_crashes(self):
         root=self.roots([('lock',1)])[0]
@@ -222,8 +381,8 @@ class DeepInventoryTests(unittest.TestCase):
         child=str(root/'0000')
         (root/'0000'/'leaf').touch()
         cases=[('complete',0,'1\t'+child+'\n','',False),
-               ('permission',1,'1\t'+child+'\n','du: child: Permission denied',True),
-               ('operation',1,'1\t'+child+'\n','du: child: Operation not permitted',True),
+               ('permission',1,'1\t'+child+'\n','du: child: Permission denied',False),
+               ('operation',1,'1\t'+child+'\n','du: child: Operation not permitted',False),
                ('io',1,'1\t'+child+'\n','du: child: Input/output error',True),
                ('io-zero',0,'1\t'+child+'\n','du: child: Input/output error',True),
                ('parse',0,'bad\t'+child+'\n','',True),
@@ -245,9 +404,9 @@ class DeepInventoryTests(unittest.TestCase):
     def test_finished_batch_stderr_matrix_preserves_last_good_on_io_errors(self):
         root=self.roots([('batch-errors',128)])[0]
         cases=[(0,'',False,False),
-               (0,'du: child: Permission denied',True,False),
-               (1,'du: child: Permission denied',True,False),
-               (1,'du: child: Operation not permitted',True,False),
+               (0,'du: child: Permission denied',True,True),
+               (1,'du: child: Permission denied',True,True),
+               (1,'du: child: Operation not permitted',True,True),
                (0,'du: child: Input/output error',True,True),
                (1,'du: child: Input/output error',True,True),
                (0,'du: child: Permission denied\ndu: child: Input/output error',True,True)]

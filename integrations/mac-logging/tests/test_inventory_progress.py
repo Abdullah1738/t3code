@@ -174,6 +174,53 @@ class InventoryProgressTests(unittest.TestCase):
         self.assertEqual(len(children),1024)
         self.assertEqual(len(calls),8)
 
+    def test_vanished_and_denied_batch_children_do_not_poison_siblings(self):
+        for failure in ('vanished', 'denied'):
+            with self.subTest(failure=failure):
+                root = self.root/failure
+                root.mkdir()
+                paths = [root/('%03d'%i) for i in range(128)]
+                for path in paths:
+                    path.mkdir()
+                bad = str(paths[0])
+                def run(cmd, **kw):
+                    if failure == 'vanished':
+                        paths[0].rmdir()
+                    return SimpleNamespace(returncode=1,
+                        stdout=''.join('1\t'+p+'\n' for p in cmd[2:] if p != bad),
+                        stderr='du: '+bad+(': Permission denied' if failure == 'denied' else ': No such file or directory'))
+                cache = {}
+                total, status, children = jobs.big_root_inventory(root, run, jobs.time.monotonic()+10, cache)
+                self.assertEqual(total, 127*1024)
+                self.assertEqual(status['unmeasuredCount'], 0)
+                self.assertEqual(status['completeWithDenied'], failure == 'denied')
+                self.assertTrue(all(not v['partial'] for v in cache.values()))
+                self.assertEqual(cache[bad]['bytes'], 0)
+
+    def test_quiet_successes_emit_only_root_and_notable_children(self):
+        root = self.root/'quiet'
+        root.mkdir()
+        for i in range(1000):
+            (root/('%04d'%i)).mkdir()
+        def run(cmd, **kw):
+            return SimpleNamespace(returncode=0, stderr='', stdout=''.join(
+                str(1024**2 if Path(p).name in ('0001','0002','0003') else 1)+'\t'+p+'\n' for p in cmd[2:]))
+        jobs.directory_inventory([root], run)
+        self.assertEqual(len(self.rows('disk.inventory.source')), 4)
+
+    def test_timeout_with_denied_stderr_does_not_invent_a_finished_child(self):
+        root = self.root/'interrupted-denial'
+        root.mkdir()
+        for i in range(128):
+            (root/('%03d'%i)).mkdir()
+        bad = str(root/'0000')
+        cache = {}
+        def run(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw['timeout'], output='', stderr='du: '+bad+'/private: Permission denied')
+        _, status, _ = jobs.big_root_inventory(root, run, jobs.time.monotonic()+.01, cache, max_batches=1)
+        self.assertNotIn('bytes', cache.get(bad, {}))
+        self.assertFalse(status['completeWithDenied'])
+
     def test_cached_partial_flag_survives_even_without_denied_count(self):
         root=self.root/'partial'
         root.mkdir()

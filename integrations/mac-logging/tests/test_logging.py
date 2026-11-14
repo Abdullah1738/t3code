@@ -31,6 +31,21 @@ def load(name, path):
 
 
 class LoggingTests(unittest.TestCase):
+    def test_inventory_summaries_preserve_only_bounded_metadata(self):
+        root = '/Volumes/ExternalSSD/board-wt'
+        values = {root:dict(deniedCount=2, timedOutCount=1, backedOffCount=1,
+                           estimatedCount=2, completeWithDenied=True,
+                           slowest1Path=root+'/child',slowest1Ms=600000,
+                           privateContents='must not log')}
+        clean = toollog.safe_fields(dict(roots=values), 'disk.inventory')
+        self.assertEqual(clean['roots'][root]['slowest1Ms'], 600000)
+        self.assertNotIn('privateContents', clean['roots'][root])
+        self.assertEqual(toollog.safe_fields(dict(secondsByRoot={root:600}), 'disk.deep.end'),
+                         dict(secondsByRoot={root:600}))
+        self.assertEqual(toollog.safe_fields(dict(secondsByRoot={root:float('nan')}), 'disk.deep.end'),
+                         dict(secondsByRoot={}))
+        self.assertEqual(toollog.safe_fields(dict(roots=values)), {})
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

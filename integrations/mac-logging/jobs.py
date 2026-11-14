@@ -144,6 +144,7 @@ def du_total(path, run, timeout):
     # git clone --local) and are an upper bound, not freeable space.
     if timeout <= 0:
         raise SourceFailure('timeout', 'directory inventory overall budget exhausted')
+    deadline = time.monotonic()+timeout
     result = run(['/usr/bin/du', '-skl', str(path)], capture_output=True, text=True,
                  timeout=timeout, env={**os.environ, 'LC_ALL': 'C'})
     stderr = getattr(result, 'stderr', '') or ''
@@ -151,6 +152,8 @@ def du_total(path, run, timeout):
     other_errors = any(line.strip() and not permission_denied(line) for line in stderr.splitlines())
     message = stderr_line(stderr)
     if other_errors or result.returncode and (result.returncode != 1 or not denied):
+        if inventory_vanished(path, deadline):
+            raise SourceFailure('vanished', 'child vanished during inventory', result.returncode)
         failure = 'permission' if not result.stdout.strip() and denied else 'exit'
         raise SourceFailure(failure, message or 'du exited without a total', result.returncode)
     # Match the requested root, not an arbitrary number printed by du.
@@ -161,19 +164,30 @@ def du_total(path, run, timeout):
                 raise SourceFailure('parse', message or 'invalid du total', result.returncode)
             return int(fields[0])*1024, denied, result.returncode
     failure = 'permission' if denied else 'missing-total' if not result.stdout.strip() or '\t' in result.stdout else 'parse'
-    raise SourceFailure(failure, message or 'du did not print a root total', result.returncode)
+    exc = SourceFailure(failure, message or 'du did not print a root total', result.returncode)
+    exc.denied_only = bool(denied and not other_errors)
+    raise exc
+
+
+class InventoryListing(tuple):
+    def __new__(cls, entries, listed, failure=None):
+        result = super().__new__(cls, (entries, listed))
+        result.failure = failure
+        return result
 
 
 def inventory_listing(path, deadline):
     entries, listed = [], False
+    failure = None
     started = time.monotonic()
     try:
         with deadline_call(deadline, os.scandir, path) as listing:
             deadline_call(deadline, entries.extend, listing)
         listed = True
     except (OSError, SourceFailure) as exc:
+        failure = exc
         source_error('disk', 'disk.inventory.source', path, started, exc)
-    return entries, listed
+    return InventoryListing(entries, listed, failure)
 
 
 INVENTORY_FRESH_S = 24*3600
@@ -182,6 +196,36 @@ INVENTORY_FRESH_S = 24*3600
 INVENTORY_PARTS_FRESH_S = 3*24*3600
 DEEP_PROBE_S = 15
 DEEP_CHILD_CAP_S = 600
+
+
+def inventory_vanished(path, deadline):
+    try:
+        deadline_call(min(deadline, time.monotonic()+2), os.lstat, path)
+    except FileNotFoundError as exc:
+        return confirmed_absent(path, exc)
+    except (OSError, SourceFailure):
+        pass
+    return False
+
+
+def inventory_du_errors(paths, stderr, deadline):
+    denied, vanished, failed, unknown = {}, set(), set(), False
+    for line in stderr.splitlines():
+        if not line.strip():
+            continue
+        matches = [p for p in paths if line.startswith('du: '+p+': ')
+                   or line.startswith('du: '+p+'/')]
+        if not matches:
+            unknown = True
+            continue
+        path = max(matches, key=len)
+        if permission_denied(line):
+            denied[path] = denied.get(path, 0)+1
+        elif 'No such file or directory' in line and inventory_vanished(path, deadline):
+            vanished.add(path)
+        else:
+            failed.add(path)
+    return denied, vanished, failed, unknown
 
 
 def inventory_has_timeout(value):
@@ -194,8 +238,37 @@ def inventory_has_parts(value):
 
 def inventory_deep_owned(value, now):
     last = value.get('lastTimeoutAt')
-    return (inventory_has_parts(value)
+    return (value.get('denied') or number(value.get('nextAttemptAt')) or inventory_has_parts(value)
             or number(last) and now-last < INVENTORY_FRESH_S)
+
+
+def inventory_backed_off(value, now):
+    retry = value.get('nextAttemptAt')
+    return number(retry) and retry > now
+
+
+def inventory_timeout(value):
+    value['timeouts'] = value.get('timeouts', 0)+1
+    value['leafTimeouts'] = value.get('leafTimeouts', 0)+1
+    value['lastTimeoutAt'] = time.time()
+    # A failed leaf gets one attempt per night at most. Parent probes still
+    # descend immediately; backing those off would discard useful parts work.
+    value['nextAttemptAt'] = time.time()+86400*2**min(value['leafTimeouts']-1, 3)
+
+
+def inventory_diagnostics(cache, now):
+    cache = {k:v for k,v in cache.items() if isinstance(v, dict)} if isinstance(cache, dict) else {}
+    leaves = [part for value in cache.values() for part in
+              (value['parts'].values() if inventory_has_parts(value) else [value])]
+    props = dict(deniedCount=sum(v['deniedCount'] for v in cache.values() if number(v.get('deniedCount'))),
+                 timedOutCount=sum(inventory_has_timeout(v) for v in leaves),
+                 backedOffCount=sum(inventory_backed_off(v, now) for v in leaves),
+                 estimatedCount=sum(bool(v.get('estimate')) for v in cache.values()))
+    slowest = sorted(cache.items(), key=lambda item: item[1].get('elapsedMs', 0), reverse=True)[:3]
+    for i, (path, value) in enumerate(slowest, 1):
+        props['slowest%dPath' % i] = path
+        props['slowest%dMs' % i] = value.get('elapsedMs', 0)
+    return props
 
 
 @contextmanager
@@ -268,14 +341,15 @@ def inventory_clean_cache(cache, now):
             # Those are ordinary measurements, with the ordinary freshness.
             for field in ('parts', 'partsDone', 'partsTotal'):
                 value.pop(field, None)
-        for field in ('timeouts', 'lastTimeoutAt', 'elapsedMs'):
+        for field in ('timeouts', 'leafTimeouts', 'lastTimeoutAt', 'nextAttemptAt', 'elapsedMs'):
             if field in value and not number(value[field]):
                 value.pop(field)
         if 'parts' in value and not isinstance(value['parts'], dict):
             value.pop('parts')
         if not number(value.get('bytes')) or not number(value.get('at')) or value['at'] > now:
             cache[key] = {k: value[k] for k in ('attemptedAt', 'slow', 'limited', 'partial',
-                'timeouts', 'lastTimeoutAt', 'parts', 'partsDone', 'partsTotal', 'elapsedMs') if k in value}
+                'timeouts', 'leafTimeouts', 'lastTimeoutAt', 'nextAttemptAt', 'parts', 'partsDone', 'partsTotal', 'elapsedMs',
+                'isDirectory') if k in value}
         if isinstance(cache[key].get('parts'), dict):
             inventory_clean_cache(cache[key]['parts'], now)
             inventory_expire_parts(cache[key], now)
@@ -297,21 +371,23 @@ def inventory_status(cache, entries, listed, now, completed=0, failures=0, fresh
     children = {key: value['bytes'] for key, value in cache.items() if number(value.get('bytes'))}
     cached = [value for value in cache.values() if 'bytes' in value and value['at'] < now]
     missing = len({entry.path for entry in entries}-set(children))
-    denied = sum(value['deniedCount'] if number(value.get('deniedCount'))
-                 else int(value.get('partial') is not False) for value in cache.values())
-    return sum(children.values()), dict(partial=bool(not listed or failures or missing or denied
+    denied = sum(value['deniedCount'] if number(value.get('deniedCount')) else 0 for value in cache.values())
+    incomplete = bool(not listed or failures or missing
                      or any(v.get('partial') is not False or v.get('limited') for v in cache.values())
-                     or any(inventory_needs_measurement(v, now, freshness_s) for v in cached)),
+                     or any(inventory_needs_measurement(v, now, freshness_s) for v in cached))
+    return sum(children.values()), dict(partial=bool(incomplete or denied),
+        completeWithDenied=bool(not incomplete and denied),
         failedCount=failures+int(bool(missing) and not failures), completedCount=completed,
         deniedCount=denied, cachedCount=len(cached), unmeasuredCount=missing,
         limitedCount=sum(bool(v.get('limited')) for v in cache.values()),
-        ageS=max((now-value['at'] for value in cached), default=0)), children
+        ageS=max((now-value['at'] for value in cached), default=0),
+        **{k:v for k,v in inventory_diagnostics(cache, now).items() if k != 'deniedCount'}), children
 
 
 def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_only=False, refresh_only=False,
                        deep=False, checkpoint=None, attempted=None, max_batches=None, single_paths=None,
                        parts_mode=False, metrics=None, turn_seconds=None, part_work=None,
-                       due_at=None, descend=True):
+                       due_at=None, descend=True, full_leaf_budget=False):
     cache = {} if cache is None else cache
     single_paths = set() if single_paths is None else single_paths
     part_work = {} if part_work is None else part_work
@@ -349,10 +425,12 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
         selected = sorted((e for e in entries if (inventory_needs_measurement(cache.get(e.path), now, freshness_s)
                                if parts_mode else inventory_due(cache.get(e.path), now, due_at))
                            and (attempted is None or e.path not in attempted)
+                           and (not parts_mode or not inventory_backed_off(cache.get(e.path, {}), now))
                            and (descend or not (inventory_has_timeout(cache.get(e.path, {}))
                                                or inventory_has_parts(cache.get(e.path, {}))))),
                           key=lambda e: (inventory_has_timeout(cache.get(e.path, {})),
                                          'bytes' in cache.get(e.path, {}),
+                                         bool(cache.get(e.path, {}).get('attemptedAt', 0)),
                                          cache.get(e.path, {}).get('elapsedMs', 0),
                                          cache.get(e.path, {}).get('at', 0),
                                          cache.get(e.path, {}).get('attemptedAt', 0), e.path))
@@ -399,10 +477,12 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
         started = time.monotonic()
         done = set()
         uncertain = rejected = False
+        denied_by_path, vanished, bad_paths = {}, set(), set()
         try:
             if len(batch) == 1:
                 size, denied, code = du_total(Path(first.path), run, timeout)
                 values = [(first.path, size)]
+                denied_by_path = {first.path: denied} if denied else {}
             else:
                 command = ['/usr/bin/du', '-skl', *paths]
                 try:
@@ -415,13 +495,14 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
                     output = output.decode('utf-8', errors='replace')
                 if isinstance(stderr, bytes):
                     stderr = stderr.decode('utf-8', errors='replace')
-                uncertain = bool((stderr or '').strip())
+                denied_by_path, vanished, bad_paths, uncertain = inventory_du_errors(paths, stderr or '', deadline)
                 denied = sum(permission_denied(line) for line in (stderr or '').splitlines())
                 other_errors = any(line.strip() and not permission_denied(line)
                                    for line in (stderr or '').splitlines())
-                # Hourly keeps #26's bounded whole-batch rejection on failure;
-                # only the deep pass has the budget to isolate bad children.
-                if code is not None and (deep and other_errors or code != 0 and (code != 1 or not denied or other_errors)):
+                # Unknown diagnostics stay conservative. Exact argv/subpath
+                # matches let healthy sibling totals survive a nonzero exit.
+                if code is not None and (code not in (0, 1) or uncertain and
+                        (deep or code != 0 and (not denied or other_errors))):
                     raise SourceFailure('exit', stderr_line(stderr) or 'du exited unsuccessfully', code)
                 values = []
                 for line in output.splitlines(keepends=True):
@@ -429,26 +510,42 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
                     # A killed process may leave an unfinished final row.
                     if line.endswith('\n') and len(fields) == 2 and fields[0].isdigit() and fields[1] in paths:
                         values.append((fields[1], int(fields[0])*1024))
+                values += [(key, 0) for key in vanished if key not in {p for p, _ in values}]
+                if code is not None:
+                    values += [(key, 0) for key in denied_by_path if key not in {p for p, _ in values}]
             for key, size in values:
-                if key in done:
+                if key in done or key in bad_paths:
                     continue
                 entry = paths[key]
-                partial = bool(denied or uncertain or kind(entry) is None)
+                child_denied = denied_by_path.get(key, 0)
+                partial = bool(uncertain or kind(entry) is None and key not in vanished)
                 hints = {k: cache[key][k] for k in ('slow', 'limited') if partial and k in cache.get(key, {})}
                 hints.update({k: cache[key][k] for k in ('timeouts', 'lastTimeoutAt') if k in cache.get(key, {})})
+                previous_size = cache.get(key, {}).get('bytes')
+                elapsed = (time.monotonic()-started)*1000/len(batch)
                 cache[key] = dict(bytes=size, at=time.time(), attemptedAt=time.time(), partial=partial,
-                                  deniedCount=denied if key == values[0][0] else 0, isDirectory=kind(entry),
-                                  **({'elapsedMs': (time.monotonic()-started)*1000/len(batch)} if deep else {}), **hints)
+                                  deniedCount=child_denied if not uncertain else denied if key == values[0][0] else 0,
+                                  denied=bool(child_denied), estimate=bool(child_denied), vanished=key in vanished,
+                                  isDirectory=kind(entry), elapsedMs=elapsed, **hints)
                 done.add(key)
                 completed += 1
-                emit('disk', 'event', 'disk.inventory.source', ok=True,
+                if child_denied or partial:
+                    source_error('disk', 'disk.inventory.source', key, started,
+                                 SourceFailure('permission' if child_denied else 'partial', 'du returned an incomplete total', code),
+                                 dict(bytes=size, deniedCount=child_denied, estimate=bool(child_denied)))
+                elif elapsed >= 10000 or key in vanished or (previous_size is None and size >= 1024**3) or (
+                        number(previous_size) and abs(size-previous_size) >= min(1024**3, previous_size*.2)
+                        and size != previous_size):
+                    emit('disk', 'event', 'disk.inventory.source', ok=True,
                      props=dict(source=key, bytes=size, partial=partial, deniedCount=denied,
-                                exitCode=code, elapsedMs=(time.monotonic()-started)*1000))
+                                exitCode=code, elapsedMs=elapsed))
             if len(done) != len(batch):
                 raise SourceFailure('timeout' if code is None else 'missing-total',
                                     'source command timed out' if code is None else 'du did not print a child total', code)
         except Exception as exc:
-            failures += 1
+            terminal = len(batch) == 1 and isinstance(exc, SourceFailure) and (
+                exc.failure == 'vanished' or exc.failure == 'permission' and getattr(exc, 'denied_only', False))
+            failures += int(not terminal)
             timed_out = isinstance(exc, subprocess.TimeoutExpired) or isinstance(exc, SourceFailure) and exc.failure == 'timeout'
             rejected = bool(deep and len(batch) > 1 and isinstance(exc, SourceFailure) and exc.failure in ('exit', 'timeout'))
             if rejected:
@@ -461,14 +558,27 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
             # attempt still rotates, but gets its full allowance next time.
             value['attemptedAt'] = time.time()
             value['partial'] = True
+            value['elapsedMs'] = (time.monotonic()-started)*1000
+            if terminal:
+                value.clear()
+                value.update(bytes=0, at=time.time(), attemptedAt=time.time(), partial=False,
+                             denied=exc.failure == 'permission', deniedCount=int(exc.failure == 'permission'),
+                             estimate=exc.failure == 'permission', vanished=exc.failure == 'vanished',
+                             elapsedMs=(time.monotonic()-started)*1000)
+                done.add(unfinished.path)
+                completed += 1
             if timed_out:
                 if deep:
                     # Batch deadlines and probes cut short by the pass budget
                     # do not establish that this child needs decomposition.
                     effective = exc.timeout if isinstance(exc, subprocess.TimeoutExpired) else timeout
-                    if len(batch) == 1 and number(effective) and effective+0.000001 >= allowance:
-                        value['timeouts'] = value.get('timeouts', 0)+1
-                        value['lastTimeoutAt'] = time.time()
+                    required = timeout if parts_mode and full_leaf_budget and batches == 0 else allowance
+                    if len(batch) == 1 and number(effective) and effective+0.000001 >= required:
+                        if parts_mode:
+                            inventory_timeout(value)
+                        else:
+                            value['timeouts'] = value.get('timeouts', 0)+1
+                            value['lastTimeoutAt'] = time.time()
                     if metrics is not None:
                         metrics['timeouts'] += 1
                         metrics['secondsInTimeouts'] += time.monotonic()-started
@@ -476,7 +586,8 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
                     value['slow'] = True
                     if allowance == 60:
                         value['limited'] = True
-            source_error('disk', 'disk.inventory.source', unfinished.path, started, exc)
+            source_error('disk', 'disk.inventory.source', unfinished.path, started, exc,
+                         dict(deniedCount=value.get('deniedCount', 0), estimate=value.get('estimate', False)))
         finally:
             if attempted is not None:
                 attempted.update(done)
@@ -514,6 +625,8 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
 
 def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, metrics, part_work):
     value = cache[entry.path]
+    if inventory_backed_off(value, time.time()):
+        return False
     value.update(partial=True, attemptedAt=time.time())
     # A previous whole-child measurement must not masquerade as the sum of an
     # unfinished decomposition, even when the process dies at the next command.
@@ -526,36 +639,71 @@ def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, me
     work['completed'] = False
     if work['seconds'] >= DEEP_CHILD_CAP_S:
         return False
-    deadline = min(deadline, time.monotonic()+DEEP_CHILD_CAP_S-work['seconds'])
+    child_deadline = time.monotonic()+DEEP_CHILD_CAP_S-work['seconds']
+    full_leaf_budget = work['seconds'] == 0 and deadline >= child_deadline
+    deadline = min(deadline, child_deadline)
     started = time.monotonic()
     try:
         own = deadline_call(deadline, os.lstat, entry.path)
     except Exception as exc:
+        if isinstance(exc, FileNotFoundError) and confirmed_absent(entry.path, exc):
+            value.clear()
+            value.update(bytes=0, at=time.time(), attemptedAt=time.time(), partial=False, vanished=True)
+        elif isinstance(exc, PermissionError):
+            value.clear()
+            value.update(bytes=0, at=time.time(), attemptedAt=time.time(), partial=False,
+                         denied=True, deniedCount=1, estimate=True)
+        value['elapsedMs'] = (time.monotonic()-started)*1000
         source_error('disk', 'disk.inventory.source', entry.path, started, exc)
         if checkpoint:
             checkpoint(*inventory_status(cache, entries, listed, time.time()))
         return False
     if not stat.S_ISDIR(own.st_mode):
+        value['isDirectory'] = False
+        for field in ('parts', 'partsDone', 'partsTotal'):
+            value.pop(field, None)
+        timeout = max(0, deadline-time.monotonic())
         try:
-            total, denied, code = du_total(Path(entry.path), run, max(0, deadline-time.monotonic()))
-            if not denied:
-                value.update(bytes=total, at=time.time(), partial=False, isDirectory=False, deniedCount=0)
-                value.pop('limited', None)
-                value.pop('slow', None)
-                for field in ('parts', 'partsDone', 'partsTotal'):
-                    value.pop(field, None)
+            total, denied, code = du_total(Path(entry.path), run, timeout)
+            value.update(bytes=total, at=time.time(), partial=False, isDirectory=False, deniedCount=denied,
+                         denied=bool(denied), estimate=bool(denied))
+            value.pop('nextAttemptAt', None)
+            value.pop('leafTimeouts', None)
+            value.pop('limited', None)
+            value.pop('slow', None)
+            for field in ('parts', 'partsDone', 'partsTotal'):
+                value.pop(field, None)
         except Exception as exc:
+            if isinstance(exc, SourceFailure) and (exc.failure == 'vanished' or getattr(exc, 'denied_only', False)):
+                value.clear()
+                value.update(bytes=0, at=time.time(), attemptedAt=time.time(), partial=False,
+                             denied=exc.failure == 'permission', deniedCount=int(exc.failure == 'permission'),
+                             estimate=exc.failure == 'permission', vanished=exc.failure == 'vanished',
+                             isDirectory=False)
             if isinstance(exc, subprocess.TimeoutExpired):
-                value['timeouts'] = value.get('timeouts', 0)+1
-                value['lastTimeoutAt'] = time.time()
+                if exc.timeout+0.000001 >= (timeout if full_leaf_budget else DEEP_CHILD_CAP_S):
+                    inventory_timeout(value)
                 if metrics is not None:
                     metrics['timeouts'] += 1
                     metrics['secondsInTimeouts'] += time.monotonic()-started
             source_error('disk', 'disk.inventory.source', entry.path, started, exc)
+        value['elapsedMs'] = (time.monotonic()-started)*1000
         if checkpoint:
             checkpoint(*inventory_status(cache, entries, listed, time.time()))
         return False
-    part_entries, part_listed = inventory_listing(entry.path, min(deadline, time.monotonic()+2))
+    listing = inventory_listing(entry.path, min(deadline, time.monotonic()+2))
+    part_entries, part_listed = listing
+    failure = getattr(listing, 'failure', None)
+    if isinstance(failure, PermissionError) or (isinstance(failure, FileNotFoundError)
+                                               and confirmed_absent(entry.path, failure)):
+        denied = isinstance(failure, PermissionError)
+        value.clear()
+        value.update(bytes=0, at=time.time(), attemptedAt=time.time(), partial=False,
+                     denied=denied, deniedCount=int(denied), estimate=denied, vanished=not denied,
+                     isDirectory=True, elapsedMs=(time.monotonic()-started)*1000)
+        if checkpoint:
+            checkpoint(*inventory_status(cache, entries, listed, time.time()))
+        return False
     if part_listed:
         present = {part.path for part in part_entries}
         for key in set(parts)-present:
@@ -580,21 +728,26 @@ def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, me
     try:
         big_root_inventory(Path(entry.path), run, deadline, parts, (part_entries, True),
             deep=True, checkpoint=save_parts, max_batches=1, parts_mode=True, metrics=metrics,
-            attempted=work['attempted'], single_paths=work['singles'])
+            attempted=work['attempted'], single_paths=work['singles'], full_leaf_budget=full_leaf_budget)
     finally:
         work['seconds'] += time.monotonic()-started
+        value['elapsedMs'] = work['seconds']*1000
         if metrics is not None:
             metrics['partsMeasured'] += sum(v.get('at') != before.get(key) and number(v.get('at'))
                                             for key, v in parts.items())
     save_parts()
     if value['partsDone'] != value['partsTotal']:
         return (work['seconds'] < DEEP_CHILD_CAP_S and any(p.path not in work['attempted']
+                and not inventory_backed_off(parts.get(p.path, {}), time.time())
                 and inventory_needs_measurement(parts.get(p.path), time.time(), INVENTORY_PARTS_FRESH_S)
                 for p in part_entries))
     try:
         total = sum(v['bytes'] for v in parts.values()) + ((own.st_blocks*512+1023)//1024)*1024
         value.update(bytes=total, at=min((v['at'] for v in parts.values()), default=time.time()),
-                     partial=False, isDirectory=True, deniedCount=0)
+                     partial=False, isDirectory=True,
+                     deniedCount=sum(v.get('deniedCount', 0) for v in parts.values()),
+                     denied=any(v.get('denied') for v in parts.values()),
+                     estimate=any(v.get('estimate') for v in parts.values()))
         # Aggregation can expire this total during sibling work before the
         # scheduler sees it; retain the completion milestone for requeueing.
         work['completed'] = True
@@ -616,11 +769,16 @@ def directory_inventory(paths=None, run=subprocess.run, deadline=None):
         previous = read_state('disk-inventory')
         roots = list(DIRECTORY_ROOTS if paths is None else paths)
         sizes, partials = previous.get('sizes', {}), previous.get('partials', {})
+        root_props = {str(p):dict(inventory_diagnostics(previous.get('childState', {}).get(str(p), {}), time.time()),
+                                  completeWithDenied=bool(partials.get(str(p), {}).get('completeWithDenied')))
+                      for p in roots}
+        with_denied = sum(v['completeWithDenied'] for v in root_props.values())
         emit('disk', 'perf', 'disk.inventory', duration_ms=(time.monotonic()-started)*1000,
              props=dict(duMode=previous.get('duMode'), skipReason='deep_pass_running',
                         count=len(sizes), bytes=sum(sizes.values()),
-                        rootsComplete=sum(str(p) in sizes and str(p) not in partials for p in roots),
-                        rootsPartial=sum(str(p) not in sizes or str(p) in partials for p in roots)))
+                        rootsComplete=sum(str(p) in sizes and str(p) not in partials for p in roots)+with_denied,
+                        rootsCompleteWithDenied=with_denied, roots=root_props,
+                        rootsPartial=sum(str(p) not in sizes or str(p) in partials for p in roots)-with_denied))
 
 
 def _directory_inventory(paths=None, run=subprocess.run, deadline=None):
@@ -708,6 +866,7 @@ def _directory_inventory(paths=None, run=subprocess.run, deadline=None):
     # Return unused refresh capacity to discovery on cold or cheap roots.
     fill(deadline)
     errors = 0
+    root_props = {}
     for path in roots:
         key = str(path)
         status = flags[key]
@@ -716,6 +875,8 @@ def _directory_inventory(paths=None, run=subprocess.run, deadline=None):
         total, status, measured = inventory_status(child_state[key], *listings[key], time.time(),
                                                   status['completedCount'], status['failedCount'])
         children[key] = measured
+        root_props[key] = dict(inventory_diagnostics(child_state[key], time.time()),
+                               completeWithDenied=status['completeWithDenied'])
         if measured or not status['partial']:
             sizes[key] = total
         else:
@@ -734,10 +895,13 @@ def _directory_inventory(paths=None, run=subprocess.run, deadline=None):
     save_state('disk-inventory',dict(previous, at=time.time(),duMode='links',sizes=sizes,partials=partials,children=children,
         sourceErrors=errors,attemptedAt=attempts,childState=child_state))
     cached = [v for cache in child_state.values() for v in cache.values() if 'bytes' in v]
+    with_denied = sum(v['completeWithDenied'] for v in root_props.values())
     emit('disk','error' if errors else 'perf','disk.inventory',ok=not errors,
          duration_ms=(time.monotonic()-started)*1000,
-         props=dict(duMode='links',count=len(sizes),sourceErrors=errors,rootsComplete=len(roots)-len(partials),
-                    rootsPartial=len(partials),childrenCached=len(cached),
+         props=dict(duMode='links',count=len(sizes),sourceErrors=errors,rootsComplete=len(roots)-len(partials)+with_denied,
+                    rootsPartial=len(partials)-with_denied,childrenCached=len(cached),
+                    rootsCompleteWithDenied=with_denied,
+                    roots=root_props,
                     oldestChildAgeS=max((max(0,now-v['at']) for v in cached),default=0)),
          error_tag='disk.inventory_failed' if errors else None)
 
@@ -919,6 +1083,7 @@ def drop_inventory(inventory, volume, now):
             valid = (fresh and isinstance(path, str) and Path(path).parent == root and number(size)
                      and isinstance(state, dict) and type(state.get('isDirectory')) is bool
                      and state.get('partial') is False and number(state.get('at'))
+                     and not state.get('estimate') and not state.get('denied') and not state.get('deniedCount')
                      and 0 <= now-state['at'] <= 7200)
             if not valid:
                 complete = parent_complete = False

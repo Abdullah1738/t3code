@@ -85,6 +85,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
     deadline, wall_deadline = started+budget, wall_started+budget
     measured = partial = bytes_measured = 0
     metrics = dict(timeouts=0, secondsInTimeouts=0, childrenDescended=set(), partsMeasured=0)
+    seconds_by_root = {}
     roots = list(jobs.DIRECTORY_ROOTS if paths is None else paths)
     priorities = {str(Path('/Volumes/ExternalSSD')/name): i for i, name in enumerate(SLOW_ROOTS)}
     roots.sort(key=lambda p: (priorities.get(str(p), len(priorities)), str(p)))
@@ -164,6 +165,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
         part_work = {str(path): {} for path in roots}
         def needs_work(root, entry):
             return (entry.path not in attempted[root]
+                    and not jobs.inventory_backed_off(child_state[root].get(entry.path, {}), time.time())
                     and jobs.inventory_due(child_state[root].get(entry.path), time.time(), wall_deadline))
 
         def healthy_pending():
@@ -205,7 +207,9 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                     if stopped() or time.time() >= wall_deadline:
                         raise PassStopped()
 
-                result = jobs.big_root_inventory(path, runner, deadline, child_state[key],
+                turn_started = time.monotonic()
+                try:
+                    result = jobs.big_root_inventory(path, runner, deadline, child_state[key],
                                                  listings[key], deep=True, checkpoint=checkpoint,
                                                  attempted=attempted[key], max_batches=4, turn_seconds=60,
                                                  single_paths=single_paths[key], metrics=metrics,
@@ -213,6 +217,8 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                                                  # One early parts turn preserves daily progress;
                                                  # then ordinary work due this pass takes priority.
                                                  descend=not any(part_work.values()) or not healthy_pending())
+                finally:
+                    seconds_by_root[key] = seconds_by_root.get(key, 0)+time.monotonic()-turn_started
                 checkpoint(*result)
                 # Yield after 60 s or four cheap batches; an expensive parts
                 # command is capped at 600 s across this child for the pass.
@@ -253,9 +259,12 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                 store_root(key, *jobs.inventory_status(cache, entries, listed, time.time()))
                 complete = sum(not jobs.inventory_needs_measurement(cache.get(e.path), time.time()) for e in entries)
                 ages = [max(0, time.time()-v['at']) for v in cache.values() if jobs.number(v.get('at'))]
+                _, status, _ = jobs.inventory_status(cache, entries, listed, time.time())
                 emit('disk', 'event', 'disk.deep.root', props=dict(duMode='links', source=key,
                      completedCount=complete, partial=not listed or complete != len(entries),
                      failedCount=len(entries)-complete, ageS=max(ages, default=0),
+                     completeWithDenied=status['completeWithDenied'],
+                     **jobs.inventory_diagnostics(cache, time.time()),
                      childrenWithPartsInProgress=sum(isinstance(v.get('parts'), dict)
                          and v.get('partial') is not False for v in cache.values())))
             state['sourceErrors'] = len(state['partials'])
@@ -263,7 +272,8 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
             jobs.save_state('disk-inventory', state)
             if stop_reason == 'done' and (time.monotonic() >= deadline or time.time() >= wall_deadline):
                 stop_reason = 'budget'
-            emit('disk', 'perf', 'disk.deep.end', duration_ms=(time.monotonic()-started)*1000, props=props())
+            emit('disk', 'perf', 'disk.deep.end', duration_ms=(time.monotonic()-started)*1000,
+                 props=dict(props(), secondsByRoot=seconds_by_root))
 
 
 def main():
