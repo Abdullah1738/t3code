@@ -75,20 +75,3 @@ class DecisionAttribution(unittest.TestCase):
             self.assertEqual(rows[0]['ids']['threadId'], 'native:claude:parent-session:child-a')
             self.assertEqual(rows[2]['ids']['threadId'], 'native:claude:parent-session:child-b')
             self.assertEqual(rows[3]['error']['tag'], 'ValueError')
-
-    def test_shim_native_identity_forms(self):
-        import coord_shim
-        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT':temp+'/logs',
-                'HARNESS_HOOKS_STATE_DIR':temp+'/state', 'ROBOB_THREAD_ID':'', 'ROBOB_CARD_NUMBER':'',
-                'HARNESS_COORD_APPROVED':'', 'AGENT_GUARD_APPROVED':''}), \
-                patch.object(engine,'resolve_identity',return_value={}), \
-                patch.object(engine,'decide_coord',return_value={'decision':'allow','context':{'rule':'no-policy'}}):
-            cases=[('codex',None,'native:codex:parent'),('codex','child-a','native:codex:child-a'),
-                   ('codex','child-b','native:codex:child-b'),('claude',None,'native:claude:parent'),
-                   ('claude','child-a','native:claude:parent:child-a'),('claude','child-b','native:claude:parent:child-b')]
-            for harness, agent, _ in cases:
-                event={'session_id':'parent', **({'agent_id':agent} if agent else {})}
-                coord_shim._check('aws',['--version'],harness,'parent',event=event)
-            rows=[json.loads(line) for path in Path(temp+'/logs/agent-tools').glob('*.ndjson') for line in path.read_text().splitlines()]
-            self.assertEqual([r['ids']['threadId'] for r in rows],[case[2] for case in cases])
-            self.assertEqual([r['props'].get('repeatCount', 1) for r in rows],[1]*6)

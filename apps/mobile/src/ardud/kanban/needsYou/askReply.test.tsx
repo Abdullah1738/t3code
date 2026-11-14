@@ -127,6 +127,7 @@ vi.mock("../../common/hooks", () => ({
 }));
 // The board's own discussion post: a reply on an ask must never go this way.
 vi.mock("../kanbanStore", () => ({
+  useKanbanPermissionStatus: () => "allowed",
   kanbanClient: () => ({ post: ui.boardPost, expandMessage: async () => undefined }),
   useKanbanBoardCard: () => undefined,
   useKanbanMessages: () => undefined,
@@ -329,7 +330,10 @@ describe("a reply under an ask whose thread holds stand-ins", () => {
     expect(ui.alerts).toEqual([]);
     expect(writes).toHaveLength(1);
     expect(writes[0]!.path).toBe("/api/ardud/kanban/cards/robob%3A1/asks/q1/reply");
-    expect(JSON.parse(writes[0]!.body)).toEqual({ blocks: [{ _tag: "md", text: "his reply" }] });
+    expect(JSON.parse(writes[0]!.body)).toEqual({
+      blocks: [{ _tag: "md", text: "his reply" }],
+      revision: 0,
+    });
     // Nothing that was read went back: no stand-in, no block of the ask or the thread.
     expect(writes[0]!.body).not.toContain(KANBAN_UNKNOWN_BLOCK_TEXT);
     expect(writes[0]!.body).not.toContain("READ-");
@@ -368,8 +372,8 @@ describe("a reply under an ask whose thread holds stand-ins", () => {
       });
     }
     expect(writes.map((write) => JSON.parse(write.body))).toEqual([
-      { blocks: [{ _tag: "md", text: "first" }] },
-      { blocks: [{ _tag: "md", text: "second" }] },
+      { blocks: [{ _tag: "md", text: "first" }], revision: 0 },
+      { blocks: [{ _tag: "md", text: "second" }], revision: 0 },
     ]);
   });
 });

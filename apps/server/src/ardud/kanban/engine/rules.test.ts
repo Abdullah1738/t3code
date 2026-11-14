@@ -78,6 +78,7 @@ const board: KanbanBoard = {
     { name: "Default", steps: [opus] },
   ],
   defaultReviewChain: "Default",
+  standingApprovals: [],
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   setup: null,
   pause: null,
@@ -154,7 +155,10 @@ describe("checkMove", () => {
     expect(
       checkMove("cardThread", card({ activeThreadId: ThreadId.make("other") }), "needs_review").ok,
     ).toBe(false);
-    expect(checkMove("cardThread", card(), "needs_owner").ok).toBe(false);
+    expect(checkMove("cardThread", card(), "needs_owner").ok).toBe(true);
+    expect(
+      checkMove("cardThread", card({ activeThreadId: ThreadId.make("other") }), "needs_owner").ok,
+    ).toBe(false);
     expect(checkMove("cardThread", card({ stage: "needs_owner" }), "needs_review").ok).toBe(false);
   });
 

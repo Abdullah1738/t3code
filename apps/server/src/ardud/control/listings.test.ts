@@ -9,6 +9,7 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { assert, describe, it } from "@effect/vitest";
 import {
   AuthSessionId,
+  OrchestrationV2AppThreadJson,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
   ProjectId,
@@ -16,6 +17,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -24,6 +26,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
@@ -38,6 +41,7 @@ import * as ThreadLaunchService from "../../orchestration-v2/ThreadLaunchService
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
@@ -50,6 +54,9 @@ import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "./http.ts";
 import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
 
 const askedAt = DateTime.makeUnsafe("2026-01-01T00:05:00.000Z");
+const encodeThreadPayload = Schema.encodeEffect(
+  Schema.fromJsonString(OrchestrationV2AppThreadJson),
+);
 
 const shell = (
   id: string,
@@ -233,11 +240,15 @@ const makeHarness = (
   vanished: ReadonlySet<string> = new Set(),
   // Failures the session check returns, in order, before it succeeds.
   authFailures: Array<unknown> = [],
+  realSnapshots = false,
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const projects = yield* ProjectStore.make;
-    yield* seedRows;
+    if (!realSnapshots) yield* seedRows;
+    const projection = realSnapshots
+      ? yield* ProjectionStore.ProjectionStoreV2.pipe(Effect.provide(ProjectionStore.layer))
+      : undefined;
     // Light-row listings and shell reads must see the same persisted threads.
     for (const extra of [...shells, ...extraShells]) {
       yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert({
@@ -253,12 +264,9 @@ const makeHarness = (
         archived_at: extra.archivedAt === null ? null : DateTime.formatIso(extra.archivedAt),
         deleted_at: extra.deletedAt === null ? null : DateTime.formatIso(extra.deletedAt),
         provider_instance_id: "codex",
-        payload_json: JSON.stringify({
-          lineage: extra.lineage,
-          creationSource: extra.creationSource,
-          archivedAt: extra.archivedAt === null ? null : DateTime.formatIso(extra.archivedAt),
-          updatedAt: DateTime.formatIso(extra.updatedAt),
-        }),
+        payload_json: yield* encodeThreadPayload(idleThreadProjection(extra).thread).pipe(
+          Effect.orDie,
+        ),
       })} ON CONFLICT(thread_id) DO UPDATE SET updated_at = excluded.updated_at`;
     }
     const snapshotReads = yield* Ref.make(0);
@@ -277,6 +285,13 @@ const makeHarness = (
     const threads = Layer.mock(ThreadManagementService.ThreadManagementService)({
       getShellSnapshot: (options) => {
         const ids = options?.threadIds;
+        if (projection !== undefined) {
+          return (
+            ids === undefined
+              ? Ref.update(snapshotReads, (count) => count + 1)
+              : Ref.update(targetedReads, (reads) => [...reads, ids])
+          ).pipe(Effect.andThen(projection.getShellSnapshot(options)), Effect.orDie);
+        }
         if (ids !== undefined) {
           const full = snapshotFor(options?.location ?? "active", extraShells);
           const keep = (candidate: OrchestrationV2ThreadShell) =>
@@ -780,6 +795,97 @@ describe("control listings", () => {
         assert.strictEqual(yield* Ref.get(snapshotReads), 0);
       }),
     ),
+  );
+
+  it.live(
+    "pages default listings with the full listing's fields, filters and total",
+    () => {
+      const extra = Array.from({ length: 2_500 }, (_, index) =>
+        shell(`page-${String(index).padStart(4, "0")}`, {
+          ...idle,
+          updatedAt: DateTime.makeUnsafe(1_800_000_000_000 + Math.floor(index / 2) * 1_000),
+          ...(index % 7 === 0 ? { creationSource: "mobile" as const } : {}),
+          ...(index % 11 === 0 ? { projectId: ProjectId.make("other") } : {}),
+          ...(index % 13 === 0 ? { archivedAt: askedAt } : {}),
+          ...(index % 17 === 0 ? { deletedAt: askedAt } : {}),
+          ...(index % 19 === 0
+            ? {
+                lineage: {
+                  rootThreadId: ThreadId.make("quiet"),
+                  parentThreadId: ThreadId.make("quiet"),
+                  relationshipToParent: "subagent" as const,
+                },
+              }
+            : {}),
+        }),
+      );
+      return Effect.scoped(
+        Effect.gen(function* () {
+          const { get, snapshotReads, targetedReads, sql } = yield* makeHarness(
+            undefined,
+            extra,
+            new Set(),
+            [],
+            true,
+          );
+          yield* sql`INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
+          VALUES ('quiet', 'imessage', '2026-01-01T00:00:00.000Z'),
+                 ('page-2498', 'telegram', '2026-01-01T00:00:00.000Z')`;
+          // Selecting every fixture id supplies an independent reference for candidate paging.
+          // Both paths use the real projection store against the same seeded database.
+          const ids = [...shells, ...extra].map((row) => row.id).join(",");
+          for (const query of [
+            "",
+            "limit=1",
+            "limit=2",
+            "limit=0",
+            "limit=9000",
+            "limit=invalid",
+            "archived=true&limit=1",
+            "includeSubagents=true&limit=2",
+            "creationSource=mobile,provider&includeSubagents=true&limit=1",
+            "creationSource=",
+            "projectId=other&limit=1",
+            "projectId=missing",
+            "origin=none&limit=1",
+            "origin=imessage&includeSubagents=true&limit=2",
+            "origin=telegram&limit=1",
+            "origin=missing",
+            "origin=",
+          ]) {
+            const beforeStart = yield* Clock.currentTimeMillis;
+            const previous = yield* get(`/threads?ids=${ids}&${query}`);
+            const beforeMs = (yield* Clock.currentTimeMillis) - beforeStart;
+            assert.strictEqual(previous.status, 200);
+            yield* Ref.set(snapshotReads, 0);
+            yield* Ref.set(targetedReads, []);
+            const afterStart = yield* Clock.currentTimeMillis;
+            const current = yield* get(`/threads?${query}`);
+            const afterMs = (yield* Clock.currentTimeMillis) - afterStart;
+            assert.strictEqual(current.status, 200);
+            assert.deepStrictEqual(current.body, previous.body, query);
+            assert.strictEqual(yield* Ref.get(snapshotReads), 0, query);
+            const pages = yield* Ref.get(targetedReads);
+            assert.strictEqual(
+              pages.flat().length,
+              (current.body.threads as ReadonlyArray<unknown>).length,
+              `only the returned shells are built: ${query}`,
+            );
+            if (query === "" || query === "limit=1") {
+              yield* Effect.logInfo("control listing seeded parity", {
+                query,
+                seededThreads: shells.length + extra.length,
+                beforeMs,
+                afterMs,
+                total: current.body.total,
+                builtShells: pages.flat().length,
+              });
+            }
+          }
+        }),
+      ).pipe(Effect.provide(Sqlite.layerMemory));
+    },
+    { timeout: 60_000 },
   );
 
   it.effect("filters /threads by creationSource, with includeSubagents and updatedSince", () => {

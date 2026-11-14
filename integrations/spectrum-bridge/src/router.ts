@@ -3,7 +3,9 @@ import { toolError, toolLog } from "./toollog.ts";
 import { appendFold, foldMedsLine, foldSkipped, type FoldOptions } from "./meds-fold.ts";
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
-import { isAbsolute } from "node:path";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming, savePreview } from "./inbound-files.ts";
 import { BUBBLE_CHARS, formatText, splitFormatted, stripInternalText } from "./formatting.ts";
@@ -60,6 +62,8 @@ type Turn = Route & {
   steeredAt?: number;
   /** A person's text was steered into this watcher turn, so it owes them an answer like a typed turn does. */
   typed?: boolean;
+  /** First human message admitted into a watcher turn, whose synthetic root stays unchanged. */
+  replyInboundId?: string;
   /** The first reply already queued while this turn was still running, including a matching /send. */
   earlySent?: string;
   earlyText?: string;
@@ -69,7 +73,7 @@ type Turn = Route & {
   outbox?: number;
 };
 /** Older persisted steer attempts contain only their route. */
-type SteerAttempt = Route & { text?: string; guidance?: string; parts?: FilePart[]; fileGuidance?: string; startedAt?: number; outbox?: number };
+type SteerAttempt = Route & { inboundId?: string; text?: string; guidance?: string; parts?: FilePart[]; fileGuidance?: string; startedAt?: number; outbox?: number };
 /** The sealed prompt body, retained until delivery is confirmed. */
 type ResendBody = {
   inboundId: string; text: string; system: string; parts: FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string };
@@ -143,7 +147,7 @@ type Options = {
   notifyFailure?: (text: string, key: string) => Promise<boolean>;
 };
 /** What a Sendblue swipe reply points at, kept per row. `unknown` is never guessed from neighbouring messages. */
-type Swipe =
+export type Swipe =
   | { kind: "robob"; text: string; at?: number; outboxId?: string }
   | { kind: "owner"; text: string; at?: number; thread?: { text: string; at?: number }[] }
   | { kind: "person"; sender: string; text: string; at?: number; thread?: { text: string; at?: number }[] }
@@ -219,6 +223,9 @@ export function sendblueContextPrompt(context: ChatContext, eyes: boolean, sende
   }
   // Turns nobody typed (wakes) carry no attachments and don't open Robob asks; guest wakes bring their own commands.
   if (!background) {
+    const other = chat.kind === "owner" ? " Add `--chat <slug>` for another chat."
+      : chat.kind === "dm" && context.roleOf(chatKey.target(chat.key)).role === "admin" ? " Add `--chat <slug>` for a group she has written in." : "";
+    lines.push("History: `messages --session CURRENT_SESSION_ID [--limit N] [--before ID]` lists this chat's recent messages, oldest first, with what each swipe-replied to; `--id ID` shows one. Use it when someone refers to an earlier message you can't see or a quote is missing." + other);
     lines.push("Files: images attach natively; other files (voice notes, PDFs, docs) are saved at the quoted paths. If you can't read them directly, work on them with tools (transcribe, extract text, convert).");
     if (chat.kind === "group") lines.push("Polls and app cards are not available in groups; ask in text and send links as text.");
     else lines.push("Polls are not available on this line; ask in text. App cards still work (`app`).");
@@ -267,6 +274,44 @@ export function rotateNudge(replyMode: ReplyMode = "final"): string {
   ].join("\n");
 }
 export const ROTATE_NUDGE = rotateNudge();
+
+export function pendingOrders(directory: string): string | null {
+  try {
+    const path = join(directory, "pending-orders.md");
+    const stat = lstatSync(path);
+    if (!stat.isFile()) return null;
+    // Refuse replacements with symlinks or special files between lstat and open.
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const opened = fstatSync(fd);
+      if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) return null;
+      // Stop reading once enough UTF-8 text has arrived, even for a huge file.
+      const buffer = Buffer.alloc(6_000);
+      const decoder = new StringDecoder("utf8");
+      let decoded = "";
+      while (decoded.length < 6_000) {
+        const count = readSync(fd, buffer, 0, 6_000 - decoded.length, null);
+        if (!count) break;
+        decoded += decoder.write(buffer.subarray(0, count));
+      }
+      const text = decoded.slice(0, 6_000).replace(/[\uD800-\uDBFF]$/, "");
+      const open = /^##[\t ]+Open[\t ]*\r?$/m.exec(text);
+      const section = open ? text.slice(open.index) : text;
+      const end = open ? /^#{1,2}(?:[\t ]|\r?$)/m.exec(section.slice(open[0].length)) : null;
+      const result = (end ? section.slice(0, open![0].length + end.index) : section).trim();
+      return result || null;
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
+function quotedPendingOrders(text: string): string {
+  const fence = "`".repeat(Math.max(3, ...Array.from(text.matchAll(/`+/g), match => match[0].length + 1)));
+  return `${fence}\n${text}\n${fence}`;
+}
 /**
  * Tool mode: the one reminder sent after a typed message's turn ends with nothing texted.
  * It travels as a bridge row (`wake:`), so its own turn never earns another.
@@ -367,6 +412,8 @@ const ERRORED_RETRY_MS = 120_000;
 const DROPPED_BATCH_MS = 10 * 60_000;
 /** One idempotent retry, then hold the batch until the route can accept it. */
 export const ACCEPT_WAIT_MS = 60_000;
+// Robob stalls of 1–5 minutes resolve on replay; early notices caused nine false alarms in three days by 14 Nov.
+export const OUTAGE_NOTICE_AFTER_MS = 10 * 60_000;
 /**
  * How long a backend read may take before the tick moves on. A slow backend is
  * not a dead one: on 12 Nov 2026 Robob answered thread reads in 2-25 s, the old
@@ -382,7 +429,7 @@ export const SEND_WAIT_MS = 90_000;
 /** A control (/new, an answer) waiting to be handled is not kept behind one backend call longer than this. */
 const CONTROL_WAIT_MS = 10_000;
 const OUTAGE_TEXT = "I'm having a technical problem; I'll answer this as soon as I'm back.";
-type Outage = { id: string; probeAt: number; replayAt?: number };
+type Outage = { id: string; batchId: string; noticeAt: number; noticed: boolean; probeAt: number; replayAt?: number };
 type PreparingDelivery = {
   id: string; startedAt: number; attemptAt: number; attempt: number; held?: boolean;
   /** Rebuilt from a turn that was already POSTed: its members are fixed, so it is never unsealed. */
@@ -709,6 +756,11 @@ export class Router {
     const quiet = options.quietMs ?? (options.context ? SENDBLUE_QUIET_MS : 15_000);
     if (!Number.isSafeInteger(quiet) || quiet < 0) throw new Error("Invalid quiet period");
     new Intl.DateTimeFormat("en-US", { timeZone: options.timezone });
+    toolLog.capture(() => {
+      const restored = this.store.get<Turn | null>("activeTurn");
+      // A persisted running turn can poll without passing through setTurn again.
+      if (restored && restored.phase !== "failed" && this.current(restored)) this.logTurnStart(restored);
+    });
   }
 
   tick(): Promise<void> {
@@ -856,7 +908,7 @@ export class Router {
               absent = false;
               break;
             }
-          } catch { toolError("router", "router.catch1"); absent = false; }
+          } catch (caughtError) { toolError("router", "router.catch1", caughtError); absent = false; }
         }
         const live = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id);
         if (live?.state === "done" || this.store.get(`inbound-delivered:${leader}`) !== undefined) continue;
@@ -866,7 +918,7 @@ export class Router {
         // Failed rows belong to #932. This path reports only an unadmitted wake still in the queue.
         const live = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id);
         if (live && ["pending", "batched", "processing"].includes(live.state)) {
-          const sent = await this.options.notifyFailure(`An iMessage background update still has no confirmed turn after its retry. Chat: ${chat?.slug ?? "owner"}. Message: ${row.id}.`, `imessage-stuck-wake:${row.id}`).catch(() => { toolError("router", "router.catch2"); return false; });
+          const sent = await this.options.notifyFailure(`An iMessage background update still has no confirmed turn after its retry. Chat: ${chat?.slug ?? "owner"}. Message: ${row.id}.`, `imessage-stuck-wake:${row.id}`).catch((caughtError) => { toolError("router", "router.catch2", caughtError); return false; });
           if (sent) this.store.set(`stuck-wake-alert:${row.id}`, true);
         }
       }
@@ -996,7 +1048,7 @@ export class Router {
       if (attempted) this.logTurnEnd(attempted, "failed");
       if (active?.inboundId === id) this.setTurn({ ...active, phase: "failed" });
       if (this.store.get<ResendBody | null>("resendBody")?.inboundId === id) this.store.set("resendBody", null);
-      if (preparing?.id === id || active?.inboundId === id) this.store.set("deliveryOutage", null);
+      if (preparing?.id === id || active?.inboundId === id) this.clearDeliveryOutage();
     }).immediate();
     return true;
   }
@@ -1012,7 +1064,7 @@ export class Router {
       let found: string | undefined;
       for (const id of [turn.messageId, ...turn.earlier ?? []]) {
         try { if (await bounded(this.backend.promptAccepted(turn.id, turn.directory, id))) { found = id; break; } }
-        catch { toolError("router", "router.catch3"); /* Unknown admission retains the receipt watch, never POST permission. */ }
+        catch (caughtError) { toolError("router", "router.catch3", caughtError); /* Unknown admission retains the receipt watch, never POST permission. */ }
       }
       if (!found) continue;
       this.store.db.transaction(() => {
@@ -1049,7 +1101,7 @@ export class Router {
         this.store.set(`failed-alert:${id}`, true);
         this.store.set(`failed-alert-pending:${id}`, null);
       }).immediate();
-    } catch { toolError("router", "router.catch4"); this.options.log?.("failed-alert-unavailable", id); }
+    } catch (caughtError) { toolError("router", "router.catch4", caughtError); this.options.log?.("failed-alert-unavailable", id); }
   }
 
   private async recoverFailedInbound(): Promise<void> {
@@ -1110,7 +1162,7 @@ export class Router {
         let conclusive = original !== undefined;
         for (const target of destinations) for (const id of [target.messageId, ...(target.earlier ?? [])]) {
           try { if (await bounded(this.backend.promptAccepted(target.id, target.directory, id))) return true; }
-          catch { toolError("router", "router.catch5"); conclusive = false; }
+          catch (caughtError) { toolError("router", "router.catch5", caughtError); conclusive = false; }
           if (receipted()) return true;
         }
         if (route && !this.current(route)) return undefined;
@@ -1338,7 +1390,7 @@ export class Router {
   private landed(turn: Turn): void {
     if (!turn.background) this.store.set("deferredNotice", null);
     this.store.set("resendBody", null);
-    this.store.set("deliveryOutage", null);
+    this.clearDeliveryOutage();
     if (turn.inboundId) {
       this.delivered(turn.inboundId);
       this.store.set(`steer-attempt:${turn.inboundId}`, null);
@@ -1427,6 +1479,7 @@ export class Router {
       }
       const beforePoll = this.store.get<Turn | null>("activeTurn");
       await this.poll();
+      this.flushOutageNotice();
       const afterPoll = this.store.get<Turn | null>("activeTurn");
       // A completion can expose a late acceptance or release a sealed steer for its own turn.
       // Revisit only a changed target, so an uncertain POST is never repeated twice in one tick.
@@ -1448,7 +1501,7 @@ export class Router {
       if (this.isGroup()) await this.gateGroup();
       if (!dispatchFirst) await this.dispatch(preceding);
       // Transport hints are best effort and never part of prompt acceptance.
-      if (!sendblue && rows.length) await bounded(this.transport.read(this.options.chatGuid)).catch(() => { toolError("router", "router.catch6");});
+      if (!sendblue && rows.length) await bounded(this.transport.read(this.options.chatGuid)).catch((caughtError) => { toolError("router", "router.catch6", caughtError);});
       completed = true;
     } finally {
       let active = false;
@@ -1674,6 +1727,10 @@ export class Router {
       if (!this.current(attempt) || (state !== "processing" && !queued)) return;
       const messageId = `msg_${hash(id)}`;
       const turn = this.store.get<Turn | null>("activeTurn");
+      const sourceAttempt = this.store.get<SteerAttempt | null>(`steer-attempt:${id}`);
+      if (!synthetic(id) && sourceAttempt?.outbox !== undefined && this.current(sourceAttempt)) {
+        this.store.attributeSteeredReplies(id, sourceAttempt.id, sourceAttempt.generation, sourceAttempt.outbox, sourceAttempt.inboundId);
+      }
       if (!turn || !this.current(turn) || turn.phase === "failed") {
         const adopted: Turn = {
           id: attempt.id, directory: attempt.directory, generation: attempt.generation,
@@ -1689,7 +1746,7 @@ export class Router {
       // A person's text confirmed inside a watcher turn: that turn now owes them an answer.
       const typed = !turn.typed && turn.inboundId !== undefined && synthetic(turn.inboundId) && !synthetic(id);
       if (add || typed) this.setTurn({
-        ...turn, ...(add ? { steered: [...turn.steered ?? [], messageId], steeredAt: Date.now() } : {}), ...(typed ? { typed: true } : {}),
+        ...turn, ...(add ? { steered: [...turn.steered ?? [], messageId], steeredAt: Date.now() } : {}), ...(typed ? { typed: true, replyInboundId: id } : {}),
       });
       this.delivered(id);
       this.store.set(`steer-attempt:${id}`, null);
@@ -1717,7 +1774,7 @@ export class Router {
     const attempt: SteerAttempt | undefined = this.store.get<SteerAttempt | null>(`steer-attempt:${row.id}`)
       ?? (turn?.steered?.includes(messageId) ? turn : undefined);
     if (attempt) {
-      const accepted = await this.reading(this.backend.promptAccepted(attempt.id, attempt.directory, messageId)).catch(() => { toolError("router", "router.catch7"); return undefined; });
+      const accepted = await this.reading(this.backend.promptAccepted(attempt.id, attempt.directory, messageId)).catch((caughtError) => { toolError("router", "router.catch7", caughtError); return undefined; });
       if (accepted === undefined) {
         this.options.log?.("steer-readback-unknown", `id=${row.id}`);
         return;
@@ -1734,7 +1791,7 @@ export class Router {
     const eyes = context !== undefined && this.eyesFor(input.batchIds ?? [row.id]);
     if (eyes && !this.store.get<boolean>(`eyes:${row.id}`)) {
       this.store.set(`eyes:${row.id}`, true);
-      await bounded(context.react(input.id, "👀")).catch(() => { toolError("router", "router.catch8"); return this.options.log?.("eyes-reaction-failed"); });
+      await bounded(context.react(input.id, "👀")).catch((caughtError) => { toolError("router", "router.catch8", caughtError); return this.options.log?.("eyes-reaction-failed"); });
       if (this.typingActive) await this.updateTyping(true, true);
     }
     let quote = "";
@@ -1812,7 +1869,8 @@ export class Router {
       return true;
     };
     if (attempt?.text === undefined && !await admission()) return;
-    const sent: SteerAttempt = { id: turn.id, directory: turn.directory, generation: turn.generation, text: body, guidance, ...(parts ? { parts, fileGuidance } : {}), startedAt: attempt?.startedAt ?? Date.now(), outbox: attempt?.outbox ?? this.outboxMark() };
+    // A different wake can own the turn by the time an uncertain steer is retried.
+    const sent: SteerAttempt = { id: turn.id, inboundId: attempt ? attempt.inboundId : turn.inboundId, directory: turn.directory, generation: turn.generation, text: body, guidance, ...(parts ? { parts, fileGuidance } : {}), startedAt: attempt?.startedAt ?? Date.now(), outbox: attempt?.outbox ?? this.outboxMark() };
     this.store.db.transaction(() => {
       this.store.set(`steer-attempt:${row.id}`, sent);
       this.store.set(`failed-delivery:${row.id}`, { ...turn, inboundId: row.id, messageId });
@@ -1826,14 +1884,14 @@ export class Router {
     try {
       delivery = await this.sending(this.backend.steer!(turn.id, turn.directory, messageId, body, guidance, parts,
         { signal: abort.signal, beforeSend: admission }), handled);
-    } catch { toolError("router", "router.catch9");
+    } catch (caughtError) { toolError("router", "router.catch9", caughtError);
       // Keep the sealed attempt: the next tick reads acceptance before retrying its id.
       this.options.log?.("steer-uncertain");
       return;
     } finally { abort.abort(); }
     if (delivery === "refused") {
       // A replayed send can be refused after its first try landed; only then is the text already in.
-      const accepted = await this.reading(this.backend.promptAccepted(turn.id, turn.directory, messageId)).catch(() => { toolError("router", "router.catch10"); return undefined; });
+      const accepted = await this.reading(this.backend.promptAccepted(turn.id, turn.directory, messageId)).catch((caughtError) => { toolError("router", "router.catch10", caughtError); return undefined; });
       if (accepted === undefined) return;
       if (accepted) this.consumeSteer(row.id, sent);
       else {
@@ -1906,7 +1964,7 @@ export class Router {
     const unread = rows.some(row => !synthetic(row.id) && !this.readIds.has(row.id));
     for (const row of rows) this.readIds.add(row.id);
     if (!unread) return;
-    await bounded(this.transport.read(this.options.chatGuid)).catch(() => { toolError("router", "router.catch11");});
+    await bounded(this.transport.read(this.options.chatGuid)).catch((caughtError) => { toolError("router", "router.catch11", caughtError);});
     if (this.typingActive) this.typingAt = 0;
   }
 
@@ -1933,7 +1991,7 @@ export class Router {
     if (!this.listing && (!this.listed || Date.now() - this.listed.at >= STATUS_LIST_MS)) {
       const revision = this.statusRevision;
       this.listing = bounded(this.backend.statuses(), 30_000)
-        .then(statuses => { if (revision === this.statusRevision) this.listed = { at: Date.now(), statuses }; }, () => { toolError("router", "router.catch12");})
+        .then(statuses => { if (revision === this.statusRevision) this.listed = { at: Date.now(), statuses }; }, (caughtError) => { toolError("router", "router.catch12", caughtError);})
         .finally(() => { this.listing = undefined; });
     }
     const own = await this.reading(busy.call(this.backend, route.id, route.directory));
@@ -1964,7 +2022,7 @@ export class Router {
     try {
       await bounded(this.transport.typing(this.options.chatGuid, active));
       if (sendblue && changed) this.options.log?.(active ? "typing-started" : "typing-stopped");
-    } catch (error) { toolError("router", "router.catch13");
+    } catch (error) { toolError("router", "router.catch13", error);
       // Best effort, but a silent failure here is what hid the missing bubble once.
       if (sendblue) this.options.log?.(active ? "typing-start-failed" : "typing-stop-failed", typingFailure(error));
     }
@@ -2042,7 +2100,7 @@ export class Router {
     this.retiring = true;
     void backend.retireOthers(keep)
       .then(count => { if (count) this.options.log?.("chats-settled", String(count)); })
-      .catch(() => { toolError("router", "router.catch14");})
+      .catch((caughtError) => { toolError("router", "router.catch14", caughtError);})
       .finally(() => {
         this.retiring = false;
         if (this.retireAgain) { this.retireAgain = false; this.retireOthers(); }
@@ -2219,7 +2277,7 @@ export class Router {
     try {
       const messages = await this.reading(this.backend.messages(route.id, route.directory, { until: mark.id, limit: 20 }));
       return messages.at(-1)?.id === mark.id;
-    } catch { toolError("router", "router.catch15");
+    } catch (caughtError) { toolError("router", "router.catch15", caughtError);
       return false;
     }
   }
@@ -2228,9 +2286,9 @@ export class Router {
   private async familyBusy(route: Route): Promise<boolean> {
     // A waiting root can still owe background work (commands, monitors) with no child session,
     // which statuses() and sessionBusy() both call idle, so the reset check asks resetBlocked.
-    const blocked = await this.reading(this.backend.resetBlocked?.(route.id, route.directory) ?? Promise.resolve(false)).catch(() => { toolError("router", "router.catch16"); return undefined; });
+    const blocked = await this.reading(this.backend.resetBlocked?.(route.id, route.directory) ?? Promise.resolve(false)).catch((caughtError) => { toolError("router", "router.catch16", caughtError); return undefined; });
     if (blocked === undefined || blocked) return true;
-    const statuses = await this.statusesFor(route).catch(() => { toolError("router", "router.catch17"); return undefined; });
+    const statuses = await this.statusesFor(route).catch((caughtError) => { toolError("router", "router.catch17", caughtError); return undefined; });
     if (!statuses) return true;
     if (statuses[route.id] !== undefined) return true;
     const seen = new Set<string>([route.id]);
@@ -2238,7 +2296,7 @@ export class Router {
     for (let depth = 0; parents.length && depth < MAX_SUBAGENT_DEPTH; depth++) {
       const next: Pick<Route, "id" | "directory">[] = [];
       for (const parent of parents) {
-        const children = await this.reading(this.backend.children(parent.id, parent.directory)).catch(() => { toolError("router", "router.catch18"); return undefined; });
+        const children = await this.reading(this.backend.children(parent.id, parent.directory)).catch((caughtError) => { toolError("router", "router.catch18", caughtError); return undefined; });
         // A family we can't list counts as busy: the deferral waits instead of repeating the refusal.
         if (!children) return true;
         for (const child of children) {
@@ -2298,13 +2356,14 @@ export class Router {
         this.store.set(`batch-phase:${preparing.id}`, null);
       }
       this.store.set("preparingDelivery", null);
+      this.clearDeliveryOutage();
       this.store.set("pendingApprovals", null);
       this.store.set("watermark", null);
     }).immediate();
     await this.updateTyping(false);
     if (old && turn && turn.id === old.id && turn.generation === old.generation && turn.directory === old.directory) {
       // A turn that won't stop can't take the nudge, so that /new escapes to a new thread.
-      await this.reading(this.backend.abort(old.id, old.directory)).catch(() => { toolError("router", "router.catch19"); inPlace = false; });
+      await this.reading(this.backend.abort(old.id, old.directory)).catch((caughtError) => { toolError("router", "router.catch19", caughtError); inPlace = false; });
     }
     if (old && inPlace) {
       this.store.db.transaction(() => {
@@ -2329,7 +2388,7 @@ export class Router {
         this.acknowledge(inboundId, "Fresh start. What's up?");
       }).immediate();
       this.retireOthers();
-    } catch { toolError("router", "router.catch20");
+    } catch (caughtError) { toolError("router", "router.catch20", caughtError);
       this.acknowledge(inboundId, "Couldn't start fresh just now. Try /new again in a moment.", "unknown");
     }
   }
@@ -2364,7 +2423,7 @@ export class Router {
       const requests = await bounded<(PermissionRequest | QuestionRequest)[] | undefined>(pending.kind === "permission"
         ? this.backend.permissions(sessionId, directory) : this.backend.questions(sessionId, directory));
       request = requests?.find(r => r.id === pending.id && r.sessionID === sessionId);
-    } catch { toolError("router", "router.catch21");
+    } catch (caughtError) { toolError("router", "router.catch21", caughtError);
       // Leave the message queued; the next tick retries.
       return;
     }
@@ -2441,7 +2500,7 @@ export class Router {
         this.store.updateInbound(inboundId, "done");
       }).immediate();
       this.advance(turn);
-    } catch { toolError("router", "router.catch22");
+    } catch (caughtError) { toolError("router", "router.catch22", caughtError);
       if (!this.current(route)) return;
       this.store.db.transaction(() => {
         entry.state = "unknown";
@@ -2474,7 +2533,7 @@ export class Router {
       return;
     }
     let parsed: unknown;
-    try { parsed = JSON.parse(reply); } catch { toolError("router", "router.catch23"); /* handled below */ }
+    try { parsed = JSON.parse(reply); } catch (caughtError) { toolError("router", "router.catch23", caughtError); /* handled below */ }
     if (!Array.isArray(parsed) || !parsed.every(a => Array.isArray(a) && a.every(v => typeof v === "string"))) {
       this.acknowledge(inboundId, 'Use /answer REQUESTID with a JSON array of string arrays, for example [["choice"]].');
       return;
@@ -2486,7 +2545,7 @@ export class Router {
     let request: QuestionRequest | undefined;
     try {
       request = (await this.reading(this.backend.questions(sessionId, directory)))?.find(r => r.id === pending.id && r.sessionID === sessionId);
-    } catch { toolError("router", "router.catch24");
+    } catch (caughtError) { toolError("router", "router.catch24", caughtError);
       this.acknowledge(inboundId, "Couldn't check that question just now. Try again in a moment.");
       return;
     }
@@ -2520,7 +2579,7 @@ export class Router {
         this.store.set("pendingApprovals", entries);
         this.store.updateInbound(inboundId, "done");
       }).immediate();
-    } catch { toolError("router", "router.catch25");
+    } catch (caughtError) { toolError("router", "router.catch25", caughtError);
       if (!this.current(route)) return;
       this.store.db.transaction(() => {
         entry.state = "unknown";
@@ -2625,7 +2684,7 @@ export class Router {
       if (!requests) return "wait";
       if (!this.current(route) || !this.pending().some(entry => entry.prompt === item.id && entry.state === "pending")) return "cancel";
       return requests.some(request => request.id === pending.id && request.sessionID === sessionId && this.signature(request) === pending.signature) ? "send" : "cancel";
-    } catch { toolError("router", "router.catch26"); return "wait"; }
+    } catch (caughtError) { toolError("router", "router.catch26", caughtError); return "wait"; }
   }
 
   private isGroup(): boolean {
@@ -2730,7 +2789,7 @@ export class Router {
             const p = scores[index] ?? 0;
             gates.set(item.row.id, { verdict: p >= JEV_THRESHOLD ? "followup" : "observe", reason: `jev:${p.toFixed(2)}` });
           });
-        } catch (error) { toolError("router", "router.catch27");
+        } catch (error) { toolError("router", "router.catch27", error);
           this.options.log?.("group-judge-failed", `${context.chat.slug} ${error instanceof JudgeError ? error.code : "judgeFailed"}`);
           for (const item of chunk) gates.set(item.row.id, window(item, "fallback"));
         }
@@ -2824,7 +2883,7 @@ export class Router {
     const look = () => {
       try {
         return swipes.find(row.id);
-      } catch { toolError("router", "router.catch28");
+      } catch (caughtError) { toolError("router", "router.catch28", caughtError);
         failed = true;
         return undefined;
       }
@@ -2977,7 +3036,7 @@ export class Router {
         ? chat !== context.chat.key : !ownerChatGuid(chat, this.options.owner))) return;
       const said = (message.content.text ?? "").replace(/\uFFFC/g, "");
       return said.trim() ? { text: said, fromOwner: !message.isFromMe } : undefined;
-    } catch { toolError("router", "router.catch29");
+    } catch (caughtError) { toolError("router", "router.catch29", caughtError);
       this.options.log?.("reply-target-unavailable");
       return;
     }
@@ -3011,7 +3070,7 @@ export class Router {
     if (deferLargeFiles && taken.some(attachment => attachment.totalBytes > MAX_BLOB_BYTES)) {
       const id = deferLargeFiles.id;
       let busy = false;
-      try { busy = (await this.statusesFor(deferLargeFiles))[id] !== undefined; } catch { toolError("router", "router.catch30"); /* Checked again after downloads. */ }
+      try { busy = (await this.statusesFor(deferLargeFiles))[id] !== undefined; } catch (caughtError) { toolError("router", "router.catch30", caughtError); /* Checked again after downloads. */ }
       if (interrupted()) return;
       if (busy) { this.deferBusyBatch(row); return; }
     }
@@ -3040,7 +3099,7 @@ export class Router {
           assert.ok(file.data instanceof Uint8Array && (!cached || file.data.byteLength === cached.size));
           assert.match(file.mimeType, /^[\s\S]*$/u);
           assert.match(file.name, /^[\s\S]*$/u);
-        } catch { toolError("router", "router.catch31"); throw new TransportError("invalidAttachment"); }
+        } catch (caughtError) { toolError("router", "router.catch31", caughtError); throw new TransportError("invalidAttachment"); }
         if (file.data.byteLength > MAX_INCOMING_BYTES - total) throw new TransportError("attachmentTooLarge");
         total += file.data.byteLength;
         toolLog.capture(() => toolLog.write({ component: "attachments", kind: "event", name: "attachment.received", ids: { messageId: input.id }, props: { attachmentBytes: file.data.byteLength, count: 1 } }));
@@ -3053,7 +3112,7 @@ export class Router {
         }).immediate();
         else if (!cached) this.store.set(`${key}:retry`, null);
         downloaded.push({ ...file, guid: attachment.guid });
-      } catch (error) { toolError("router", "router.catch32");
+      } catch (error) { toolError("router", "router.catch32", error);
         if (interrupted()) return;
         const failure = classifyDownloadFailure(error);
         if (failure.code === "attachmentTooLarge") {
@@ -3075,7 +3134,7 @@ export class Router {
               ...(input.receivedAt === undefined ? {} : { receivedAt: input.receivedAt }),
               maxBytes: Math.max(1, MAX_INCOMING_BYTES - total),
             }), LOCAL_RECOVERY_MS);
-          } catch { toolError("router", "router.catch33"); result = { detail: { reason: "recoveryTimedOut" } }; }
+          } catch (caughtError) { toolError("router", "router.catch33", caughtError); result = { detail: { reason: "recoveryTimedOut" } }; }
           this.options.log?.("attachment-local-recovery", /^[A-Za-z]{1,32}$/.test(result.detail.reason) ? result.detail.reason : "unknown");
           const recovered = result.file;
           if (result.detail.reason === "tooLarge" || (recovered && recovered.data instanceof Uint8Array && recovered.data.byteLength > MAX_INCOMING_BYTES - total)) {
@@ -3120,7 +3179,7 @@ export class Router {
         try {
           transcript = (await bounded(this.options.transcribe!({ data: file.data, name: file.name, mimeType: file.mimeType }), 90_000)).trim();
           this.store.set(key, transcript);
-        } catch (error) { toolError("router", "router.catch34");
+        } catch (error) { toolError("router", "router.catch34", error);
           const code = error instanceof SttError ? error.code : "unknown";
           this.options.log?.("transcription-failed", /^[A-Za-z0-9]{1,32}$/.test(code) ? code : "unknown");
           transcript = "";
@@ -3156,7 +3215,7 @@ export class Router {
           } else {
             // If saving the preview fails, the original remains readable by path.
             let path: string | undefined;
-            try { path = savePreview(prepared.file, route.directory); } catch { toolError("router", "preview-save"); /* Use the original. */ }
+            try { path = savePreview(prepared.file, route.directory); } catch (caughtError) { toolError("router", "preview-save", caughtError); /* Use the original. */ }
             if (interrupted()) return;
             notes.push(path
               ? `The preceding file's preview was not attached (10 MiB of previews per message); the ${prepared.file.mime === "image/jpeg" ? "JPEG " : ""}preview is at ${JSON.stringify(path)} and the original at the quoted path. Open the preview with your read tool.`
@@ -3164,7 +3223,7 @@ export class Router {
           }
         }
       }
-    } catch { toolError("router", "router.catch37");
+    } catch (caughtError) { toolError("router", "router.catch37", caughtError);
       if (interrupted()) return;
       this.acknowledge(row.id, "I couldn't save those files. Mind sending them again?", "failed");
       return;
@@ -3266,7 +3325,7 @@ export class Router {
         const statuses = await this.statusesFor(activeRoute);
         busy = statuses[activeRoute.id] !== undefined;
         if (!busy && !steerAttempt && !latencyRoute) activeRoute = await this.rotate(activeRoute, statuses);
-      } catch { toolError("router", "router.catch35"); /* Unknown status: keep the current conversation. */ }
+      } catch (caughtError) { toolError("router", "router.catch35", caughtError); /* Unknown status: keep the current conversation. */ }
       if (busy) {
         // The agent is still finishing something on its own. Let that land first.
         this.deferBusyBatch(row);
@@ -3289,7 +3348,7 @@ export class Router {
           this.store.set(`batch-phase:${row.id}`, "preparing");
         }).immediate();
         this.retireOthers();
-      } catch (error) { toolError("router", "router.catch36");
+      } catch (error) { toolError("router", "router.catch36", error);
         this.recordFailure(row.id, "create-chat", error);
         if (replyNudgeRow(row.id)) this.store.db.transaction(() => {
           this.retrySynthetic(row.id, "undelivered");
@@ -3318,7 +3377,7 @@ export class Router {
         for (const prompt of earlier) {
           if (await this.reading(this.backend.promptAccepted(prompt.sessionId, prompt.directory, prompt.messageId))) { landed = prompt; break; }
         }
-      } catch { toolError("router", "router.catch38");
+      } catch (caughtError) { toolError("router", "router.catch38", caughtError);
         // Unknown is never permission to POST. Look again shortly.
         if (interrupted()) return;
         this.store.db.transaction(() => {
@@ -3373,7 +3432,7 @@ export class Router {
     const eyes = context !== undefined && this.eyesFor(input.batchIds ?? [row.id]);
     if (eyes && !this.store.get<boolean>(`eyes:${row.id}`)) {
       this.store.set(`eyes:${row.id}`, true);
-      await bounded(context.react(input.id, "👀")).catch(() => { toolError("router", "router.catch39"); return this.options.log?.("eyes-reaction-failed"); });
+      await bounded(context.react(input.id, "👀")).catch((caughtError) => { toolError("router", "router.catch39", caughtError); return this.options.log?.("eyes-reaction-failed"); });
       // A tapback is an outbound message too, and it ends the bubble on the recipient's phone.
       if (this.typingActive) await this.updateTyping(true, true);
     }
@@ -3471,10 +3530,18 @@ export class Router {
         this.store.set(`seed:${turn.id}`, null);
         this.landed(turn);
       }).immediate();
-    } catch (error) { toolError("router", "router.catch40");
+    } catch (error) { toolError("router", "router.catch40", error);
       if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
       if (this.current(turn)) await this.reconcile(turn);
     }
+  }
+
+  private pendingOrders(route: Route): string | null {
+    const chat = this.options.context?.chat;
+    const directory = this.backend.chatFolder?.(chat);
+    if (directory) return pendingOrders(directory);
+    // A shared legacy session directory cannot identify a non-owner's chat.
+    return !chat || chat.kind === "owner" ? pendingOrders(route.directory) : null;
   }
 
   /** True once the agent's current context is old or large enough to hand off. */
@@ -3504,7 +3571,7 @@ export class Router {
       return;
     }
     if (Date.now() - settledAt < (this.options.resetIdleMs ?? RESET_IDLE)) return;
-    const statuses = await this.statusesFor(route).catch(() => { toolError("router", "router.catch41"); return undefined; });
+    const statuses = await this.statusesFor(route).catch((caughtError) => { toolError("router", "router.catch41", caughtError); return undefined; });
     if (!statuses || statuses[route.id] !== undefined) return;
     const nudged = this.store.db.transaction(() => {
       if (!this.current(route) || this.store.pendingInbound().length) return false;
@@ -3513,7 +3580,11 @@ export class Router {
       const next: Route = { ...route, createdAt: Date.now(), threadAt: route.threadAt ?? route.createdAt };
       this.store.set("route", next);
       this.store.set("routeContext", null);
-      this.nudgeReset(next, rotateNudge(this.options.replyMode));
+      const orders = this.pendingOrders(route);
+      const nudge = rotateNudge(this.options.replyMode);
+      this.nudgeReset(next, orders
+        ? `${nudge}\n\nCopy this chat's pending-orders list into your resume note word for word, under 'Pending orders (from pending-orders.md)':\nQuoted data from pending-orders.md:\n${quotedPendingOrders(orders)}`
+        : nudge);
       return true;
     }).immediate();
     if (nudged) this.options.log?.("context-reset-nudged", "rotate");
@@ -3590,7 +3661,9 @@ export class Router {
     const created = await this.reading(this.backend.createChat());
     if (!this.current(route)) return route;
     const next: Route = { ...created, generation: route.generation, createdAt: Date.now(), threadAt: Date.now() };
-    const seed = `Continuity: this conversation continues seamlessly from your earlier exchanges with the owner. Carry on naturally and never mention any change, recap, restart or memory mechanism. Files from earlier remain under ${JSON.stringify(route.directory)}. The full earlier transcript is session ${route.id}; use recall_read or recall_search if you need more than the recent exchange below.\nRecent exchange (quoted data, oldest first):\n${lines.join("\n")}`;
+    const orders = this.pendingOrders(route);
+    const seed = `Continuity: this conversation continues seamlessly from your earlier exchanges with the owner. Carry on naturally and never mention any change, recap, restart or memory mechanism. Files from earlier remain under ${JSON.stringify(route.directory)}. The full earlier transcript is session ${route.id}; use recall_read or recall_search if you need more than the recent exchange below.\nRecent exchange (quoted data, oldest first):\n${lines.join("\n")}`
+      + (orders ? `\n\nPending orders for this chat (from pending-orders.md, quoted data):\n${quotedPendingOrders(orders)}` : "");
     this.store.db.transaction(() => {
       this.store.set(`seed:${next.id}`, seed);
       this.store.set("route", next);
@@ -3639,7 +3712,7 @@ export class Router {
       try {
         const session = await this.reading(this.backend.getSession(turn.id, turn.directory));
         if (session?.id === turn.id && refusalTitle(session.title)) hits.push(`title:${turn.id}`);
-      } catch { toolError("router", "router.catch42"); /* Unknown title: no evidence either way. */ }
+      } catch (caughtError) { toolError("router", "router.catch42", caughtError); /* Unknown title: no evidence either way. */ }
     }
     if (!hits.length || !this.current(turn)) return;
     this.store.set("refusedRoute", { sessionId: turn.id, generation: turn.generation, at: Date.now(), messageIds: hits } satisfies Refused);
@@ -3661,7 +3734,7 @@ export class Router {
     for (const id of found ? [] : ids) {
       try {
         if (await this.reading(this.backend.promptAccepted(turn.id, turn.directory, id))) { found = id; break; }
-      } catch { toolError("router", "router.catch43"); conclusive = false; /* Absence and failed reads are both uncertainty, never permission to POST. */ }
+      } catch (caughtError) { toolError("router", "router.catch43", caughtError); conclusive = false; /* Absence and failed reads are both uncertainty, never permission to POST. */ }
     }
     if (!this.current(turn)) return false;
     const next: Turn = found ? { ...turn, messageId: found, phase: "running" } : { ...turn, phase: turn.phase === "held" ? "held" : "unknown" };
@@ -3680,12 +3753,48 @@ export class Router {
     this.options.log?.("delivery-watchdog", JSON.stringify({ decision, chat: this.options.context?.chat.slug ?? "imessage", batchId: turn.inboundId, promptId: turn.messageId }));
   }
 
-  private outageNotice(id: string): void {
-    if (this.store.get<Outage | null>("deliveryOutage")) return;
-    const notice = `outage:${hash(id)}`;
-    this.store.set("deliveryOutage", { id: notice, probeAt: Date.now() } satisfies Outage);
-    this.store.enqueue({ id: notice, kind: "control", text: OUTAGE_TEXT, ...this.replyTarget(id) });
-    this.watchdogLog("notice", { inboundId: id, messageId: `msg_${hash(id)}` });
+  private outageNotice(id: string, probeAt = Date.now()): Outage {
+    const stored = this.store.get<Outage | null>("deliveryOutage");
+    if (stored?.noticeAt !== undefined && stored.noticed !== undefined) return stored;
+    const row = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
+    const receivedAt = row ? (JSON.parse(row.payload) as NormalizedInbound).receivedAt : undefined;
+    const notice = stored?.id ?? `outage:${hash(id)}`;
+    const outage: Outage = {
+      ...stored, id: notice, batchId: id,
+      noticeAt: (receivedAt !== undefined && Number.isSafeInteger(receivedAt) && receivedAt >= 0 ? receivedAt : Date.now()) + OUTAGE_NOTICE_AFTER_MS,
+      // Older builds queued the notice when creating the outage record.
+      noticed: this.store.getOperation(notice) !== undefined,
+      probeAt: stored?.probeAt ?? probeAt,
+    };
+    this.store.set("deliveryOutage", outage);
+    return outage;
+  }
+
+  private flushOutageNotice(): void {
+    const outage = this.store.get<Outage | null>("deliveryOutage");
+    if (!outage || outage.noticed !== false || Date.now() < outage.noticeAt) return;
+    this.store.db.transaction(() => {
+      const id = outage.batchId;
+      const turn = this.store.get<Turn | null>("activeTurn");
+      const preparing = this.store.get<PreparingDelivery | null>("preparingDelivery");
+      // A rebuilt held batch can be awaiting acceptance again when its notice comes due.
+      if (!(turn?.inboundId === id && ["held", "submitting", "unknown"].includes(turn.phase)) && preparing?.id !== id) return;
+      if (this.wakeBatch(id) || this.store.get(`inbound-delivered:${id}`) !== undefined) return;
+      const row = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id);
+      if (row?.state !== "processing") return;
+      this.store.enqueue({ id: outage.id, kind: "control", text: OUTAGE_TEXT, ...this.replyTarget(id) });
+      this.store.set("deliveryOutage", { ...outage, noticed: true });
+      this.watchdogLog("notice", { inboundId: id, messageId: `msg_${hash(id)}` });
+    }).immediate();
+  }
+
+  private clearDeliveryOutage(): void {
+    const outage = this.store.get<Outage | null>("deliveryOutage");
+    this.store.set("deliveryOutage", null);
+    if (outage?.noticed === false) this.options.log?.("outage-notice-deferred", JSON.stringify({
+      chat: this.options.context?.chat.slug ?? "imessage", batchId: outage.batchId,
+      heldMs: Date.now() - (outage.noticeAt - OUTAGE_NOTICE_AFTER_MS),
+    }));
   }
 
   private holdDelivery(turn: Turn): void {
@@ -3710,7 +3819,6 @@ export class Router {
         : this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state;
       if (id !== undefined && state === "processing") {
         this.store.set(`batch-phase:${id}`, "preparing");
-        // Held from here on, so the sender is told once, exactly as a held turn tells them.
         this.outageNotice(id);
         // The rebuilt send may go out on this very tick; replays stay paced by replayAt.
         this.store.set("deliveryOutage", { ...this.store.get<Outage>("deliveryOutage")!, probeAt: 0 });
@@ -3721,7 +3829,7 @@ export class Router {
       } else {
         this.logTurnEnd(turn, "failed");
         this.setTurn({ ...turn, phase: "failed" });
-        this.store.set("deliveryOutage", null);
+        this.clearDeliveryOutage();
         if (id !== undefined && this.store.get(`batch-phase:${id}`) === "submitting") this.store.set(`batch-phase:${id}`, null);
       }
       this.store.set("resendBody", null);
@@ -3758,7 +3866,7 @@ export class Router {
       // A held batch is tried again once a minute. The attempt itself is the
       // probe: it is idempotent, and a health endpoint that answers slower than
       // the thread it speaks for must never keep a batch waiting.
-      const outage = this.store.get<Outage | null>("deliveryOutage") ?? { id: `outage:${hash(preparing.id)}`, probeAt: 0 };
+      const outage = this.outageNotice(preparing.id, 0);
       if (Date.now() - outage.probeAt < 5_000 || this.controlArrived(handled)) return;
       if (outage.replayAt !== undefined && Date.now() - outage.replayAt < ACCEPT_WAIT_MS) {
         this.store.set("deliveryOutage", { ...outage, probeAt: Date.now() });
@@ -3795,7 +3903,7 @@ export class Router {
         this.store.set(`seed:${turn.id}`, null);
         this.landed(turn);
       }).immediate();
-    } catch (error) { toolError("router", "router.catch44");
+    } catch (error) { toolError("router", "router.catch44", error);
       if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
       if (this.current(turn)) await this.reconcile(turn);
     }
@@ -3847,7 +3955,7 @@ export class Router {
       if (turn.phase === "held" || spent || (absent && (someoneWaiting || (!body && elapsed >= ACCEPT_WAIT_MS)))) {
         this.fail(turn, "", undefined, "undelivered");
         // An outage record left by an older build must not mute the notice for the next person's batch.
-        this.store.set("deliveryOutage", null);
+        this.clearDeliveryOutage();
         this.watchdogLog("release", turn);
       } else if (retryDue && !someoneWaiting) await retry();
       return;
@@ -3859,7 +3967,7 @@ export class Router {
       else if (spent) this.holdDelivery(turn);
       return;
     }
-    const outage = this.store.get<Outage | null>("deliveryOutage") ?? { id: `outage:${hash(turn.inboundId ?? turn.messageId)}`, probeAt: 0 };
+    const outage = this.outageNotice(turn.inboundId ?? turn.messageId, 0);
     if (Date.now() - outage.probeAt < 5_000) return;
     this.store.set("deliveryOutage", { ...outage, probeAt: Date.now() });
     // `absent` means the route just answered every read about this prompt and
@@ -3883,7 +3991,7 @@ export class Router {
     if (this.requestScan?.key !== key) {
       this.requestScan = { key, result: this.requests(turn, statuses) };
       // A scan may fail between ticks, before its next reader attaches.
-      void this.requestScan.result.catch(() => { toolError("router", "router.catch45");});
+      void this.requestScan.result.catch((caughtError) => { toolError("router", "router.catch45", caughtError);});
     }
     const scan = this.requestScan;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -3895,7 +4003,7 @@ export class Router {
       ]);
       if (result !== undefined && this.requestScan === scan) this.requestScan = undefined;
       return result;
-    } catch (error) { toolError("router", "router.catch46");
+    } catch (error) { toolError("router", "router.catch46", error);
       if (this.requestScan === scan) this.requestScan = undefined;
       throw error;
     } finally { clearTimeout(timer); }
@@ -4100,7 +4208,7 @@ export class Router {
             break;
           }
         }
-      } catch { toolError("router", "router.catch47");
+      } catch (caughtError) { toolError("router", "router.catch47", caughtError);
         expansionHeld = true;
       }
       if (!this.current(turn)) return;
@@ -4349,7 +4457,7 @@ export class Router {
       // text; one that ends without text (after a reaction, poll or file, say)
       // or with NO_REPLY simply closes.
       await this.enqueueReply(turn, idle, replies, earlier, final, text, scope, entries, priorFailure);
-    } catch { toolError("router", "router.catch48");
+    } catch (caughtError) { toolError("router", "router.catch48", caughtError);
       // Transient backend trouble: polling simply retries on the next tick.
     }
   }
@@ -4503,7 +4611,7 @@ export class Router {
         id: route.id, directory: route.directory, generation: route.generation,
         messageId: mark.id, startedAt: now, phase: "running", background: true,
       } satisfies Turn);
-    } catch { toolError("router", "router.catch49");
+    } catch (caughtError) { toolError("router", "router.catch49", caughtError);
       // Best effort; the next tick looks again.
     }
   }
@@ -4516,13 +4624,15 @@ export class Router {
 
   private logTurnStart(turn: Turn): void {
     toolLog.capture(() => {
+      toolLog.beginRun(turn.id, turn.messageId);
       if (this.store.get(`log-turn-start:${turn.messageId}`)) return;
       this.store.set(`log-turn-start:${turn.messageId}`, true);
       const inbound = turn.inboundId ? this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(turn.inboundId) : undefined;
       const receivedAt = inbound ? (JSON.parse(inbound.payload) as { receivedAt?: number }).receivedAt : undefined;
       toolLog.write({ component: "router", kind: "event", name: "turn.start",
-        ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId },
-        props: { queued: this.store.get(`log-queued-behind:${turn.inboundId}`) === true,
+        ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId, ...(turn.inboundId ? { inboundId: turn.inboundId } : {}) },
+        props: { ...(turn.inboundId ? { batchSize: this.store.get<NormalizedInbound>(`batch:${turn.inboundId}`)?.batchIds?.length ?? 1 } : {}),
+          queued: this.store.get(`log-queued-behind:${turn.inboundId}`) === true,
           waitMs: Math.max(0, Date.now() - (receivedAt ?? turn.startedAt)) } });
     });
   }
@@ -4533,7 +4643,7 @@ export class Router {
       if (this.store.get(`log-turn-end:${turn.messageId}`)) return;
       this.store.set(`log-turn-end:${turn.messageId}`, true);
       toolLog.write({ component: "router", kind: "perf", name: "turn.end", durationMs: Math.max(0, Date.now() - turn.startedAt),
-        ok: outcome === "replied" || outcome === "no_reply", ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId }, props: { outcome } });
+        ok: outcome === "replied" || outcome === "no_reply", ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId, ...(turn.inboundId ? { inboundId: turn.inboundId } : {}) }, props: { outcome } });
     });
   }
 

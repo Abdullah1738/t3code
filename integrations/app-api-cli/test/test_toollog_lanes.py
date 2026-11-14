@@ -25,7 +25,11 @@ class LaneLogs(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 suite.run(result)
             self.assertEqual(result.errors+result.failures,[],name)
-            return [json.loads(line) for p in (Path(temp)/'orders').glob('*.ndjson') for line in p.read_text().splitlines()]
+            rows = [json.loads(line) for p in (Path(temp)/'orders').glob('*.ndjson') for line in p.read_text().splitlines()]
+            for row in rows:
+                if row['name'].startswith(('provider.', 'track.')):
+                    self.assertIn(row['props']['merchant'], {'noon', 'careem', 'amazon', 'uber', 'other', 'unknown'})
+            return rows
 
     def test_lane_success_and_refusal_diagnostics(self):
         cases=[

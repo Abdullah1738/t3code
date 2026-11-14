@@ -188,6 +188,8 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
     Duration.fromInputUnsafe(options.slowCycle ?? defaultSupervisorOptions.slowCycle!),
   );
   let metrics: ReadonlyExportMetrics = {
+    lineageRepairCounts: {},
+    lineageRepairs: [],
     phaseMs: {},
     phaseSteps: {},
     identityRows: 0,
@@ -233,6 +235,10 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
         } else {
           lastBeat = clock.currentTimeMillisUnsafe();
           if (message?.type === "metrics") {
+            for (const [cause, count] of Object.entries(message.metrics.lineageRepairCounts))
+              metrics.lineageRepairCounts[cause] =
+                (metrics.lineageRepairCounts[cause] ?? 0) + count;
+            metrics.lineageRepairs.push(...message.metrics.lineageRepairs);
             for (const [phase, ms] of Object.entries(message.metrics.phaseMs))
               metrics.phaseMs[phase] = (metrics.phaseMs[phase] ?? 0) + ms;
             for (const [phase, steps] of Object.entries(message.metrics.phaseSteps))
@@ -275,6 +281,11 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
     while (true) {
       yield* Effect.sleep(Duration.millis(Math.max(10, Math.min(stallMs / 4, 30_000))));
       const now = clock.currentTimeMillisUnsafe();
+      for (const bump of metrics.lineageRepairs.splice(0))
+        yield* Effect.logInfo("Readonly lineage repair revision bumped").pipe(
+          Effect.annotateLogs({ ...bump }),
+          Effect.withSpan("ardud.readonlyExport.lineageRepair"),
+        );
       if (slowCycleMs !== undefined && now - slowLoggedAt >= SLOW_CYCLE_LOG_INTERVAL_MS) {
         // Its own span: the worker span stays open while the worker is healthy.
         yield* Effect.logWarning(
@@ -288,7 +299,11 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
       }
       if (Object.keys(metrics.phaseSteps).length && now - metricsLoggedAt >= 60_000) {
         yield* Effect.logInfo("Readonly export phase timings").pipe(
-          Effect.annotateLogs({ phaseMs: metrics.phaseMs, phaseSteps: metrics.phaseSteps }),
+          Effect.annotateLogs({
+            phaseMs: metrics.phaseMs,
+            phaseSteps: metrics.phaseSteps,
+            lineageRepairCounts: metrics.lineageRepairCounts,
+          }),
           Effect.withSpan("ardud.readonlyExport.cyclePhases"),
         );
         if (metrics.identityRows)
@@ -296,7 +311,14 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
             Effect.annotateLogs({ rows: metrics.identityRows, maxLagMs: metrics.identityLagMaxMs }),
             Effect.withSpan("ardud.readonlyExport.identityPublishLag"),
           );
-        metrics = { phaseMs: {}, phaseSteps: {}, identityRows: 0, identityLagMaxMs: 0 };
+        metrics = {
+          lineageRepairCounts: {},
+          lineageRepairs: [],
+          phaseMs: {},
+          phaseSteps: {},
+          identityRows: 0,
+          identityLagMaxMs: 0,
+        };
         metricsLoggedAt = now;
       }
       const silent = now - lastBeat;

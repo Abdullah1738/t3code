@@ -1,3 +1,29 @@
+import * as Effect from "effect/Effect";
+import type * as SqlClient from "effect/sql/SqlClient";
+
+// Legacy board copies can lack the older ask/open indexes too. Fetch their
+// payload pages before CREATE INDEX takes the writer, without parsing JSON.
+export const initializeKanbanSchema = Effect.fn("initializeKanbanSchema")(function* (
+  sql: SqlClient.SqlClient,
+) {
+  const objects = yield* sql<{ name: string }>`SELECT name FROM sqlite_schema`;
+  const names = new Set(objects.map(({ name }) => name));
+  for (const table of [
+    "ardud_kanban_cards",
+    "ardud_kanban_card_events",
+    "ardud_kanban_discussions",
+  ]) {
+    const missingIndex = kanbanDDL.some((ddl) => {
+      const match = /^CREATE INDEX IF NOT EXISTS (\w+)\s+ON (\w+)/.exec(ddl);
+      return match?.[2] === table && !names.has(match[1]!);
+    });
+    if (names.has(table) && missingIndex) {
+      yield* sql.unsafe(`SELECT sum(length(json || '')) FROM ${table} NOT INDEXED`);
+    }
+  }
+  yield* Effect.forEach(kanbanDDL, (ddl) => sql.unsafe(ddl), { discard: true });
+});
+
 export const kanbanDDL = [
   `CREATE TABLE IF NOT EXISTS ardud_kanban_evaluator_spawns (
     launch_key TEXT PRIMARY KEY, board_id TEXT NOT NULL, card_id TEXT, at TEXT NOT NULL
@@ -37,11 +63,8 @@ export const kanbanDDL = [
   `CREATE INDEX IF NOT EXISTS ardud_kanban_cards_open ON ardud_kanban_cards(board_id, number)
     WHERE json_extract(json, '$.settledAt') IS NULL`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_cards_dispatch ON ardud_kanban_cards(board_id, number)
-    WHERE json_extract(json, '$.settledAt') IS NULL
-      AND (stage IN ('todo', 'working', 'needs_review', 'in_review')
-        OR json_extract(json, '$.wait') IS NOT NULL
-        OR json_extract(json, '$.deciding') IS NOT NULL
-        OR active_thread_id IS NOT NULL)`,
+    WHERE stage IN ('todo', 'working', 'needs_review', 'in_review')
+      OR active_thread_id IS NOT NULL`,
   `CREATE INDEX IF NOT EXISTS ardud_kanban_cards_thread ON ardud_kanban_cards (active_thread_id)`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_card_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, card_id TEXT NOT NULL, json TEXT NOT NULL

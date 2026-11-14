@@ -219,15 +219,15 @@ export class Sendblue implements Line {
     let response: Response;
     try {
       response = await this.#fetch(url, { method, headers, body, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-    } catch (error) { toolError("sendblue", "sendblue.catch1");
+    } catch (error) { toolError("sendblue", "sendblue.catch1", error);
       throw new LineError(`Sendblue ${method} ${path} failed: ${describe(error)}`, "network", true, send);
     }
 
-    const text = await response.text().catch(() => { toolError("sendblue", "sendblue.catch2"); return ""; });
+    const text = await response.text().catch((caughtError) => { toolError("sendblue", "sendblue.catch2", caughtError); return ""; });
     let parsed: unknown;
     try {
       parsed = text ? JSON.parse(text) : undefined;
-    } catch { toolError("sendblue", "sendblue.catch3");
+    } catch (caughtError) { toolError("sendblue", "sendblue.catch3", caughtError);
       parsed = undefined;
     }
     if (response.status === 404 && options.allow404) return undefined;
@@ -268,7 +268,7 @@ export class Sendblue implements Line {
           const event = this.#toEvent(frame, seen);
           if (event) yield event;
         }
-      } catch { toolError("sendblue", "sendblue.catch4");
+      } catch (caughtError) { toolError("sendblue", "sendblue.catch4", caughtError);
         // Stream errors and stall aborts both end in a reconnect below; only the caller's signal stops the loop.
       } finally {
         clearTimeout(stall);
@@ -284,7 +284,7 @@ export class Sendblue implements Line {
     let envelope: unknown;
     try {
       envelope = JSON.parse(frame.data);
-    } catch { toolError("sendblue", "sendblue.catch5");
+    } catch (caughtError) { toolError("sendblue", "sendblue.catch5", caughtError);
       return undefined;
     }
     if (!isObject(envelope)) return undefined;
@@ -434,7 +434,7 @@ export class Sendblue implements Line {
     };
     try {
       await this.#call("POST", "/api/send-typing-indicator", { json });
-    } catch (error) { toolError("sendblue", "sendblue.catch6");
+    } catch (error) { toolError("sendblue", "sendblue.catch6", error);
       // Workers without typing-v2 firmware 503 on state/duration; the legacy start always works.
       if (!v2 || options.state === "stop" || !(error instanceof LineError) || !error.code.startsWith("http_503")) throw error;
       await this.#call("POST", "/api/send-typing-indicator", { json: base });
@@ -486,7 +486,7 @@ export class Sendblue implements Line {
       let response: Response;
       try {
         response = await this.#fetch(url, { signal: controller.signal });
-      } catch (error) { toolError("sendblue", "sendblue.catch7");
+      } catch (error) { toolError("sendblue", "sendblue.catch7", error);
         throw new LineError(`download failed: ${describe(error)}`, "download_failed", true, false);
       }
       if (!response.ok) throw new LineError(`download returned ${response.status}`, `http_${response.status}`, response.status === 429 || response.status >= 500, false);
@@ -510,7 +510,7 @@ export class Sendblue implements Line {
           }
           chunks.push(value);
         }
-      } catch (error) { toolError("sendblue", "sendblue.catch8");
+      } catch (error) { toolError("sendblue", "sendblue.catch8", error);
         if (error instanceof LineError) throw error;
         throw new LineError(`download aborted: ${describe(error)}`, "download_failed", true, false);
       }
@@ -536,7 +536,7 @@ export class Sendblue implements Line {
 function safeDecode(value: string): string {
   try {
     return decodeURIComponent(value);
-  } catch { toolError("sendblue", "sendblue.catch9");
+  } catch (caughtError) { toolError("sendblue", "sendblue.catch9", caughtError);
     return value;
   }
 }

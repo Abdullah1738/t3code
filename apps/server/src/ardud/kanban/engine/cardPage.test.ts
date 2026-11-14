@@ -46,6 +46,7 @@ const board: KanbanBoard = {
   defaultCardModel: model,
   reviewChains: [],
   defaultReviewChain: null,
+  standingApprovals: [],
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   createdAt: at,
   setup: null,

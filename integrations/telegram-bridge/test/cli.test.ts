@@ -27,6 +27,11 @@ describe("parseCommand", () => {
     });
   });
 
+  test.each(["-", "--", "- notice", "--key=mail text", "- first\n-- second=value"])("accepts bound dash-prefixed notification text %s", text => {
+    expect(parseCommand(["notify", "--source=Inbox triage", `--text=${text}`, "--key=--fixture"]).body)
+      .toEqual({ source: "Inbox triage", severity: "info", text, dedupeKey: "--fixture" });
+  });
+
   test("maps ask and failure source keys and redacts notify text before HTTP", () => {
     expect(parseCommand([...notify, "--ask-key", "robob:582:q2"]).body?.askKey).toBe("robob:582:q2");
     expect(parseCommand([...notify, "--burst-key", "infra"]).body?.burstKey).toBe("infra");

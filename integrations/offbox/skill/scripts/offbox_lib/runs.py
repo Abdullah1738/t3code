@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
 from . import command_usage, common, containers, prune, prepare, userns
+from . import resources
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
                      is_silenced, offsets_path, person, read_json, record_delivery, say, silence, write)
@@ -1299,6 +1300,11 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
                   usage: command_usage.Usage | None = None) -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
+    if api.BACKEND == 'server':
+        try:
+            cmd = resources.wrap(cmd, BOUNDED_PROCESS)
+        except Exception:
+            pass
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
     root = '"$HOME"/' + shlex.quote(rdir)
     usage = usage or command_usage.inspect(repo_root or Path.cwd(), rel, argv, steps)
@@ -1447,6 +1453,11 @@ class Runner:
         try:
             db_retry(register)
             self.registered = True
+            try:
+                save_run_state(self.run_id, resources=resources.unavailable(
+                    'not_started' if api.BACKEND == 'server' else 'boat'))
+            except Exception:
+                pass
             if a.bg:
                 with log_lock(self.run_id):
                     self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1527,7 +1538,7 @@ class Runner:
                     self.record(box_id=None)  # finish must not assign an idle TTL to a fenced box
                 raise
         w = node_version.want(self.root, self.cwd)
-        node_block = node_version.block(w) if w else ""
+        node_block = node_version.block(w)
         pm = pnpm_version.want(self.root, self.cwd)
         if pm:
             node_block += "\n" + pnpm_version.block(pm)
@@ -1545,6 +1556,11 @@ class Runner:
         self.require_pending(con)
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
+        try:
+            save_run_state(self.run_id, resources=resources.unavailable(
+                'pending' if api.BACKEND == 'server' else 'boat'))
+        except Exception:
+            pass
         try:
             r = api.cmd_start(self.box, exit_recording_command(script, self.run_id, claim_id=claim),
                               meta={"repo": me.get("repo_key"), "kind": run_kind(cmd_text), "run_id": self.run_id},
@@ -1709,7 +1725,9 @@ class Runner:
                                        seed_candidates=candidates, run_id=self.run_id)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
-                    f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
+                    f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s; "
+                    f"verified {st.get('verified', 0)} tracked files"
+                    f"{', repaired ' + str(st['repaired']) if st.get('repaired') else ''})")
                 note = ssh_sync.tracked_ignored_note(st)
                 if note:
                     say(note)
@@ -2518,6 +2536,7 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
     if log_row is not None:
         emit_terminal(log_row)
     if not r["box_id"] or not bookkeeping:
+        resources.finalize(r)
         return code
     # No transaction is open while Docker/TTL calls reach the box or boat.
     con = None
@@ -2540,6 +2559,7 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
     finally:
         if con:
             con.close()
+    resources.finalize(r)
     return code
 
 
@@ -2686,14 +2706,18 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None) ->
         code = 130
         return code
     finally:
-        con = db()
         try:
-            row = con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
-            if (row and row['client_pid'] == os.getpid() and row['status'] == 'starting'
-                    and not row['box_id'] and not row['process_id']):
-                finish(rid, code, 'killed' if code == 130 else 'infra')
+            with contextlib.closing(db()) as con:
+                row = con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
+                if (row and row['client_pid'] == os.getpid() and row['status'] == 'starting'
+                        and not row['box_id'] and not row['process_id']):
+                    finish(rid, code, 'killed' if code == 130 else 'infra')
+        except sqlite3.Error as error:
+            # The runner already saved any known result; cleanup cannot replace it or mask an active error.
+            saved = read_json(LOGS_DIR / f'{rid}.state.json', {})
+            with contextlib.suppress(OSError):
+                state_warning(rid, saved.get('exit_code') if isinstance(saved, dict) else None, error)
         finally:
-            con.close()
             for s, handler in old.items():
                 signal.signal(s, handler)
 
@@ -2958,6 +2982,7 @@ def _run_remote(a, rn) -> int:
     go_std_glitch(rn.box, rn.run_id, rn.log_path, code)
     if code is None:
         say("remote process was lost (box restarted?); treating as infra failure")
+    resources.display(rn.run_id)
     steps = getattr(a, "steps", None) or []
     deps_hint = box_deps_hint(rn.root, rn.log_path)
     if steps:

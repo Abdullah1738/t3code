@@ -10,6 +10,7 @@ import json
 import tempfile
 import time
 import unittest
+import order_card
 from pathlib import Path
 from unittest.mock import patch
 
@@ -97,8 +98,8 @@ class MinutesMultiBasketTests(unittest.TestCase):
         return data
 
     def card_wire(self):
-        return {'data': [{'id': 'synthetic-payment-token', 'ccMasked': 'xxxx 2342',
-                          'ccType': 'mastercard', 'isDefault': True, 'isDeleted': False}]}
+        return {'data': [{'id': 'synthetic-payment-token', 'ccMasked': 'xxxx ' + order_card.LAST4,
+                          'ccType': order_card.NETWORK, 'isDefault': True, 'isDeleted': False}]}
 
     def test_items_alias_matches_skus_scope(self):
         rows = [{'sku': 'SYNTHETIC_SHAKE', 'qty': 2}, {'sku': 'SYNTHETIC_BAR', 'qty': 3}]

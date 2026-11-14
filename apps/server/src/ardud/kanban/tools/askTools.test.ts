@@ -80,6 +80,7 @@ const testLayer = () => {
     KanbanThreads,
     KanbanThreads.of({
       pendingUserInputs: () => Effect.succeed([]),
+      claimContext: () => Effect.succeed(null),
       view: (threadId) =>
         Effect.succeed({
           threadId,
@@ -106,6 +107,7 @@ const testLayer = () => {
       model: () => Effect.succeed(null),
       withdraw: () => Effect.void,
       setModel: () => Effect.void,
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),

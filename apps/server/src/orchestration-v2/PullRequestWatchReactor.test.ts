@@ -560,41 +560,86 @@ it.effect("ends visibly when the fingerprint stays rate limited", () =>
   }),
 );
 
-it.effect("ends visibly when the PR head never settles, without giving a stale verdict", () =>
-  Effect.gen(function* () {
-    const harness = yield* makeHeadHarness();
-    for (let attempt = 0; attempt < 7; attempt++) yield* harness.reactor.sweep;
-    assert.deepStrictEqual(
-      harness.commands.filter((command) => command.wake),
-      [],
-    );
-    yield* harness.reactor.sweep;
-    const wakes = harness.commands.filter((command) => command.wake);
-    assert.strictEqual(wakes.length, 1);
-    assert.isNull(wakes[0]!.watch);
-    assert.include(wakes[0]!.wake?.text ?? "", "head");
-    assert.notInclude(wakes[0]!.wake?.text ?? "", "checks passed");
-  }),
+it.effect.each([false, true])(
+  "evaluates the branch rollup after three disagreeing reads (fingerprint=%s)",
+  (withFingerprint) =>
+    Effect.gen(function* () {
+      const harness = yield* makeHeadHarness({ failedChecks: ["aggregate"] }, withFingerprint);
+      harness.setDetail({
+        ...greenDetail(),
+        checksHeadSha: NEW_HEAD,
+        checks: [
+          { name: "aggregate", status: "failure", required: false, description: null, url: null },
+        ],
+      });
+      for (let pass = 0; pass < 2; pass++) yield* harness.reactor.sweep;
+      assert.lengthOf(
+        harness.commands.filter((command) => command.wake),
+        0,
+      );
+      yield* harness.reactor.sweep;
+      assert.equal(harness.watch()?.headSha, NEW_HEAD);
+      const wakes = harness.commands.filter((command) => command.wake);
+      assert.lengthOf(wakes, 1);
+      assert.include(wakes[0]!.wake!.text, `Checks failed on ${NEW_HEAD.slice(0, 7)}`);
+      for (let pass = 0; pass < 8; pass++) yield* harness.reactor.sweep;
+      assert.isDefined(harness.watch());
+      assert.lengthOf(
+        harness.commands.filter((command) => command.wake),
+        1,
+      );
+    }),
 );
 
-it.effect("clears the unsuccessful-read count once a settled head can be evaluated", () =>
+it.effect(
+  "advances beyond a stale rollup without ending the watch or attributing old failures",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHeadHarness({ failedChecks: ["lint"] });
+      harness.setDetail({
+        ...greenDetail(),
+        checks: greenDetail().checks.map((check) => ({ ...check, status: "failure" })),
+      });
+      for (let pass = 0; pass < 10; pass++) yield* harness.reactor.sweep;
+      assert.equal(harness.watch()?.headSha, NEW_HEAD);
+      assert.lengthOf(
+        harness.commands.filter((command) => command.wake),
+        0,
+      );
+      harness.setDetail({
+        ...greenDetail(),
+        headSha: NEW_HEAD,
+        checksHeadSha: NEW_HEAD,
+        checks: greenDetail().checks.map((check) => ({ ...check, status: "failure" })),
+      });
+      yield* harness.reactor.sweep;
+      assert.lengthOf(
+        harness.commands.filter((command) => command.wake),
+        1,
+      );
+    }),
+);
+
+it.effect("restarts the settling bound when the source branch moves again", () =>
   Effect.gen(function* () {
     const harness = yield* makeHeadHarness();
-    for (let attempt = 0; attempt < 7; attempt++) yield* harness.reactor.sweep;
+    for (let pass = 0; pass < 2; pass++) yield* harness.reactor.sweep;
     harness.setDetail({
       ...greenDetail(),
-      headBranchSha: OLD_HEAD,
-      checks: [{ name: "lint", status: "pending", required: false, description: null, url: null }],
+      headBranchSha: "cccccccccc",
+      checksHeadSha: "cccccccccc",
     });
-    yield* harness.reactor.sweep;
-    harness.setDetail(greenDetail());
-    for (let attempt = 0; attempt < 7; attempt++) yield* harness.reactor.sweep;
-    assert.deepStrictEqual(
+    for (let pass = 0; pass < 2; pass++) yield* harness.reactor.sweep;
+    assert.lengthOf(
       harness.commands.filter((command) => command.wake),
-      [],
+      0,
     );
     yield* harness.reactor.sweep;
-    assert.isNull(harness.commands.at(-1)!.watch);
+    assert.equal(harness.watch()?.headSha, "cccccccccc");
+    assert.lengthOf(
+      harness.commands.filter((command) => command.wake),
+      1,
+    );
   }),
 );
 

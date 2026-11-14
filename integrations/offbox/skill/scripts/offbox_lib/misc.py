@@ -797,6 +797,8 @@ def _catch_up_finished(con, run_id, budget: float = 10) -> None:
         if planned_steps(r):
             return
         result = _catch_up_log(r, budget=min(10, budget), locked=True)
+        from . import resources
+        resources.finalize(r)
         if result == 'n/a' or result.startswith('incomplete:'):
             reason = result.split(':', 1)[1] if ':' in result else 'run log lock held'
             event(con, r['box_id'], 'log_catchup_failed', f"{run_id} {reason}")
@@ -928,6 +930,8 @@ def logs(run_id: str, do_follow: bool) -> int:
                 f"or `offbox wait {r['run_id']} --timeout <s>` for current output.")
         return 0
     result = _catch_up_log(r, lock_wait=LOG_READ_WAIT_S)
+    from . import resources
+    resources.finalize(r)
     _tail(p, 0, True)
     from .runs import settled_steps_code, planned_steps
     code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
@@ -965,6 +969,8 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
     result = _catch_up_log(r, budget=budget, lock_wait=LOG_READ_WAIT_S)
     code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
     checked = _validated_step_row(r, code)
+    from . import resources
+    resources.finalize(r)
     if until is not None and now() >= until:
         _incomplete_log(checked, result)
         raise _wait_timeout(checked)
@@ -992,7 +998,9 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
                 con.commit()
             finally:
                 con.close()
-    out(f"{r['run_id']}: {status} exit={code}")
+    if not echo and code == 0:
+        resources.display(r['run_id'])
+    out(f"{r['run_id']}: {status} exit={code}" + resources.failure_suffix(r['run_id'], code))
     if code is None:
         from .run_evidence import report
         report(dict(r), LOGS_DIR / f"{r['run_id']}.log", until=until)
@@ -1185,13 +1193,15 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None, *, show_
         code, how = _recover_by(r, log_path, deadline)
     receipt_code = code
     code = settled_steps_code(r, code, log_path=log_path, until=deadline)
+    from . import resources
+    resources.finalize(r)
     _tail(log_path, pos, echo)
     failure = show_failure and not echo and r['mode'] == 'bg' and code not in (0, None)
     if failure:
         _failure_tail(log_path)
     say(f"{r['run_id']} ended on {r['box_id']} over {_grace(r)}s ago, but the offbox process following it has not "
         f"recorded the end (it looks stuck); exit {code} taken from {how}. Full output: offbox logs {r['run_id']}")
-    out(f"{r['run_id']}: {'failed ' if failure else ''}exit={code}")
+    out(f"{r['run_id']}: {'failed ' if failure else ''}exit={code}" + resources.failure_suffix(r['run_id'], code))
     if code is None:
         from .run_evidence import report
         report(dict(r), log_path, until=deadline, receipt_code=receipt_code)
@@ -1501,7 +1511,11 @@ def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) 
     failure = show_failure and code not in (0, None)
     if failure and not failure_tail_shown:
         _failure_tail(log_path)
-    out(f"{r['run_id']}: {'failed ' if failure else ''}exit={code}")
+    from . import resources
+    resources.finalize(r)
+    if not echo and code == 0:
+        resources.display(r['run_id'])
+    out(f"{r['run_id']}: {'failed ' if failure else ''}exit={code}" + resources.failure_suffix(r['run_id'], code))
     if code is None:
         from .run_evidence import report
         report(dict(r), log_path, until=until, receipt_code=receipt_code)

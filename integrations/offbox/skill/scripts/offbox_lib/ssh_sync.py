@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import hashlib
+import json
 import os
+import stat
 import signal
 from functools import lru_cache
 import re
@@ -26,6 +29,8 @@ from .common import CM_DIR, KEY_PATH, SSH_DIR, OffboxError, ensure_dirs, log
 RSYNC = "/opt/homebrew/bin/rsync" if Path("/opt/homebrew/bin/rsync").exists() else "rsync"
 STALL_S = capacity.setting("OFFBOX_SYNC_STALL_S", 180)
 SYNC_PROGRESS_S = 60
+MAX_TRACKED_INCLUDE_FILES = 200
+MAX_INCLUDE_FILTER_BYTES = 512 * 1024
 RETRY_PAUSES = (5, 15, 45)
 CHECKOUT_DIR = re.compile(r"^w/[A-Za-z0-9._-]{1,40}-[0-9a-f]{6}$")
 _HOME_PORTS: dict[str, tuple[str, int]] = {}
@@ -73,18 +78,26 @@ def _atomic_write_text(path: Path, text: str) -> None:
 @toollog.observed("ssh", "ssh.setup", "ssh_setup")
 def setup(box_id: str) -> Path:
     """Authorize our key on the box's current machine and pin its host key. Needed after every create/resume/fork."""
+    from . import prepare
     ensure_dirs()
     last = None
     for attempt in range(8):
         try:
             r = api.sshkey(box_id, pubkey())
+            prepare.observe_outage()
             break
         except api.ApiError as e:
+            prepare.observe_outage(e)
             if not (e.api_code in ("machine_not_running", "sandbox_starting", "boat_starting", "ssh_host_key_unavailable")
                     or e.status in (409, 502, 503) or api.gateway_timeout(e)):
                 raise
             last = e
+        except api.BudgetExpired as error:
+            if last is not None and last.outage:
+                raise last from error
+            raise
         except OffboxError as e:
+            prepare.observe_outage(e)
             if not e.outage:
                 raise
             last = e
@@ -201,7 +214,9 @@ def ssh(box_id: str, command: str, input: bytes | None = None, timeout: float = 
 @toollog.observed("ssh", "ssh.readiness", "readiness")
 def wait_ssh(box_id: str, timeout: float = 90) -> None:
     left = api.left()
-    deadline = time.time() + (timeout if left is None else max(0, min(timeout, left)))
+    window = timeout if left is None else max(0, min(timeout, left))
+    client_limited = left is not None and left < timeout
+    deadline = time.time() + window
     err = ""
     while time.time() < deadline:
         try:
@@ -215,7 +230,15 @@ def wait_ssh(box_id: str, timeout: float = 90) -> None:
                 setup(box_id)
         except subprocess.TimeoutExpired:
             err = "timeout"
+        except common.SshHostKeyMismatch:
+            raise
+        except OffboxError as error:
+            if error.outage or not client_limited or time.time() < deadline:
+                raise
+            err = str(error)
         time.sleep(max(0, min(1, deadline - time.time())))
+    if client_limited:
+        raise api.BudgetExpired(f"ssh to {box_id} not ready within {window:g}s client budget: {err}")
     raise OffboxError(f"ssh to {box_id} not ready after {int(timeout)}s: {err}")
 
 
@@ -342,20 +365,30 @@ def _soft_partial(stderr: str) -> list[str] | None:
     return bad or None
 
 
+INCLUDE_WORKAROUND = ("Create a dot-directory at the checkout root (mktemp -d ./.scratch.XXXX), "
+                      "put the script there and --include that path, or use a committed or included file in the repo.")
+
+
 def _include_refused(inc: str) -> OffboxError:
     return OffboxError(f"cannot sync --include {inc!r}: offbox couldn't tell what else sits beside it, "
-                       "so it won't send it (local filter inspection failed)", code=2)
+                       f"so it won't send it (local filter inspection failed). {INCLUDE_WORKAROUND}", code=2)
+
+
+def _include_alias_refused(inc: str, path: str, real: str) -> OffboxError:
+    return OffboxError(f"cannot sync --include {inc!r}: {path!r} has disk spelling {real!r}; "
+                       f"offbox can't safely guard aliased paths. {INCLUDE_WORKAROUND}", code=2)
 
 
 def _ignored_include_tops(root: Path, includes: list[str] | None) -> list[str]:
     """For each --include, its shortest ancestor dir that git ignores (tmp for tmp/a/b.sh), once each."""
+    # Ignore rules must protect box-only siblings even when the index tracks files below this top.
     tops: list[str] = []
     for inc in includes or []:
         parts = inc.strip("/").split("/")
         for i in range(1, len(parts)):
             anc = "/".join(parts[:i])
             try:
-                p = subprocess.run(["git", "-C", str(root), "check-ignore", "-q", "--", anc + "/"],
+                p = subprocess.run(["git", "-C", str(root), "check-ignore", "--no-index", "-q", "--", anc + "/"],
                                    capture_output=True, timeout=10)
             except (OSError, subprocess.TimeoutExpired) as e:
                 raise _include_refused(inc) from e
@@ -430,20 +463,31 @@ def _visible_include_ancestors(root: Path, ancestors: set[str], inc: str) -> set
         raise _include_refused(inc) from e
 
 
+def _literal_filter_path(path: str, *, wildcard: bool = False) -> str:
+    # Rsync only interprets backslash escapes in rules containing wildcard syntax.
+    if not wildcard and not any(char in path for char in "*?["):
+        return path
+    return re.sub(r"([\\*?\[])", r"\\\1", path)
+
+
 def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) -> list[str]:
     # --git uses a separate portable export. Never send a raw git-dir or pointer,
     # even when --include .git is supplied, or copy private config/hooks/worktrees.
     f = ["--filter=- /.git"]
     ancestors: set[str] = set()
+    names: dict[str, list[str]] = {}
     for inc in includes or []:      # explicit opt-in (e.g. committed test certs); wins over every exclude
         inc = inc.strip("/")
+        real = _disk_path(root, inc, names)
+        if real is not None and real != inc:
+            raise _include_alias_refused(inc, inc, real)
         parts = inc.split("/")
         for i in range(1, len(parts)):
             anc = "/".join(parts[:i])
             ancestors.add(anc)
-            f.append(f"--filter=+ /{anc}/")
-        f.append(f"--filter=+ /{inc}")
-        f.append(f"--filter=+ /{inc}/**")
+            f.append(f"--filter=+ /{_literal_filter_path(anc)}/")
+        f.append(f"--filter=+ /{_literal_filter_path(inc)}")
+        f.append(f"--filter=+ /{_literal_filter_path(inc, wildcard=True)}/**")
     is_git = False
     if includes:
         try:
@@ -453,9 +497,10 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
         except (OSError, subprocess.TimeoutExpired):
             pass  # No Git index: guard every opened ancestor.
     guarded = ancestors.copy()
+    tracked: set[str] = set()
     if is_git and ancestors:
         try:
-            p = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", *sorted(ancestors)],
+            p = subprocess.run(["git", "--literal-pathspecs", "-C", str(root), "ls-files", "-z", "--", *sorted(ancestors)],
                                capture_output=True, timeout=20)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise _include_refused(includes[0]) from e
@@ -463,13 +508,16 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
             raise _include_refused(includes[0])
         for raw in p.stdout.split(b"\0"):
             if raw:
-                parts = os.fsdecode(raw).split("/")
+                path = os.fsdecode(raw)
+                tracked.add(path)
+                parts = path.split("/")
                 for i in range(1, len(parts)):
                     guarded.discard("/".join(parts[:i]))
     # A whole-directory include already authorizes these siblings, even with redundant child includes.
     unchecked = {anc for anc in ancestors - guarded
                  if not any(anc == i.strip("/") or anc.startswith(i.strip("/") + "/") for i in includes)}
     visible = _visible_include_ancestors(root, unchecked, includes[0]) if unchecked else set()
+    reopen: set[str] = set()
     for anc in sorted(unchecked):
         inc = next(i for i in includes if i.strip("/").startswith(anc + "/"))
         try:
@@ -486,19 +534,46 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
             anc == pat or anc.endswith("/" + pat)
             for pat in SECRET_EXCLUDES + HEAVY_EXCLUDES if "/" in pat.rstrip("/")
         )
-        if p.returncode == 0 or excluded or anc not in visible:
+        if excluded:
             raise OffboxError(f"cannot sync --include {inc!r}: excluded ancestor {anc!r} contains tracked files; "
-                              "offbox can't send only the named path there. Pass the script inline in argv or "
-                              "with --step, or move it out of the excluded directory", code=2)
-    # Opening an ignored ancestor bypasses its ignore rule. Close its other children after all includes,
-    # so rsync never walks unrelated scratch trees; tracked ancestors retain the normal sync behavior.
+                              f"offbox can't send only the named path there. {INCLUDE_WORKAROUND}", code=2)
+        if p.returncode == 0 or anc not in visible:
+            descendants = {path for path in tracked if path.startswith(anc + "/")}
+            if len(descendants) > MAX_TRACKED_INCLUDE_FILES:
+                raise OffboxError(f"cannot sync --include {inc!r}: excluded ancestor {anc!r} contains "
+                                  f"{len(descendants)} tracked files (limit {MAX_TRACKED_INCLUDE_FILES}); "
+                                  f"offbox can't send only the named path there. {INCLUDE_WORKAROUND}", code=2)
+            guarded.add(anc)
+            reopen.update(descendants)
+    # Plain sync sends ignored tracked files in pass 2. Reopen the same eligible files here,
+    # closing every intermediate directory so their untracked siblings are never traversed.
+    reopened_dirs: set[str] = set()
+    for path in sorted(reopen):
+        real = _disk_path(root, path, names)
+        if real is None or _offbox_skips(path) or _offbox_skips(real):
+            continue
+        if real != path:
+            # Mixing index/include aliases with disk spellings bypasses rsync's case-sensitive guards.
+            raise _include_alias_refused(includes[0], path, real)
+        if not (root / real).is_symlink() and (root / real).is_dir():
+            continue  # A submodule must not authorize its whole working tree.
+        parts = real.split("/")
+        for i in range(1, len(parts)):
+            parent = "/".join(parts[:i])
+            if parent not in reopened_dirs:
+                f.append(f"--filter=+ /{_literal_filter_path(parent)}/")
+                reopened_dirs.add(parent)
+            if any(parent == anc or parent.startswith(anc + "/") for anc in guarded):
+                guarded.add(parent)
+        f.append(f"--filter=+ /{_literal_filter_path(real)}")
+    # Close only after all requested and tracked paths have been opened (rsync's first match wins).
     for anc in sorted(guarded, key=lambda a: (-a.count("/"), a)):
-        f.append(f"--filter=- /{anc}/*")
+        f.append(f"--filter=- /{_literal_filter_path(anc, wildcard=True)}/*")
     # An include under an ignored dir (tmp/) makes rsync walk that dir, and --delete would then remove the box's own
     # files there (31 Oct: root-owned tmp/localstack, written by the LocalStack container, failed the sync with 23).
     # Protect the rest of that dir on the box; the included path itself still mirrors.
     for top in _ignored_include_tops(root, includes) if is_git else []:
-        f.append(f"--filter=P /{top}/**")
+        f.append(f"--filter=P /{_literal_filter_path(top, wildcard=True)}/**")
     for t in SAFE_ENV_TEMPLATES:
         f.append(f"--filter=+ {t}")
     for x in SECRET_EXCLUDES:
@@ -507,6 +582,11 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
         f.append(f"--filter=- {x}")
     f.append("--filter=:- .gitignore")
     f += _gitinfo_exclude(root)
+    # A file count alone cannot bound argv when tracked files have distinct deep parents.
+    # Leave half of macOS ARG_MAX for the environment and rsync's other arguments.
+    if includes and (size := sum(len(os.fsencode(arg)) + 1 for arg in f)) > MAX_INCLUDE_FILTER_BYTES:
+        raise OffboxError(f"cannot sync --include {includes[0]!r}: include filters need {size} bytes "
+                          f"(limit {MAX_INCLUDE_FILTER_BYTES}). {INCLUDE_WORKAROUND}", code=2)
     return f
 
 
@@ -551,6 +631,13 @@ def _seen(out: str) -> set[str]:
     return seen
 
 
+@lru_cache(maxsize=8)
+def _skip_component_pattern(patterns: tuple[str, ...]) -> re.Pattern:
+    import fnmatch
+    # One compiled match avoids a Python fnmatch loop over every rule for every path component.
+    return re.compile("|".join(fnmatch.translate(os.path.normcase(p)) for p in patterns))
+
+
 def _offbox_skips(path: str) -> bool:
     """True when the secret or heavy excludes cover the path (a dir rule covers everything below it)."""
     import fnmatch
@@ -558,7 +645,8 @@ def _offbox_skips(path: str) -> bool:
     if any(fnmatch.fnmatch(parts[-1], t) for t in SAFE_ENV_TEMPLATES):
         parts = parts[:-1]
     pats = [x.rstrip("/") for x in SECRET_EXCLUDES + HEAVY_EXCLUDES]
-    if any(fnmatch.fnmatch(seg, pat) for seg in parts for pat in pats if "/" not in pat):
+    pattern = _skip_component_pattern(tuple(p for p in pats if "/" not in p))
+    if any(pattern.match(os.path.normcase(seg)) for seg in parts):
         return True
     joined = "/" + "/".join(parts)
     return any(joined.endswith("/" + pat) or ("/" + pat + "/") in joined for pat in pats if "/" in pat)
@@ -675,11 +763,160 @@ def _push(box_id: str, root: Path, remote_dir: str, with_git: bool = False, time
             extra = _push_git(box_id, gitdir, remote_dir, timeout, run_id=run_id)
             for key, value in extra.items():
                 st[key] = st.get(key, 0) + value
+        verified = _verify_content(box_id, root, remote_dir, _tracked_content(root, includes), timeout, run_id)
+        for key, value in verified.items():
+            st[key] = st.get(key, 0) + value
     st["seconds"] = round(time.time() - t, 2)
     st["secret_skips"] = tracked_secret_matches(root, includes)
     st["skipped"] = len(st["secret_skips"])
     log(f"push {box_id} {root} -> {remote_dir} {st}")
     return st
+
+
+def _content_signature(path: Path) -> tuple[str, str]:
+    try:
+        info = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return ("missing", "")
+    if stat.S_ISLNK(info.st_mode):
+        data = os.fsencode(os.readlink(path))
+        return ("link", hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest())
+    if stat.S_ISDIR(info.st_mode):
+        return ("dir", "")
+    if not stat.S_ISREG(info.st_mode):
+        return ("other", "")
+    h = hashlib.sha1(b"blob " + str(info.st_size).encode() + b"\0")
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(chunk)
+    return ("file", h.hexdigest())
+
+
+def _tracked_content(root: Path, includes: list[str] | None) -> dict[str, tuple[str, str]]:
+    p = subprocess.run(["git", "-C", str(root), "ls-files", "--stage", "-z"], capture_output=True,
+                       env=git_snapshot._git_env(), timeout=30)
+    if p.returncode:
+        # Plain directories are supported too. A broken index in a repository must fail closed.
+        probe = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-dir"],
+                               capture_output=True, env=git_snapshot._git_env(), timeout=30)
+        if probe.returncode and not os.path.lexists(root / ".git"):
+            return {}
+        raise OffboxError("cannot list tracked content for sync; nothing ran")
+    entries = [raw for raw in p.stdout.split(b"\0") if raw]
+    deleted = subprocess.run(["git", "-C", str(root), "diff", "--cached", "--raw", "-z",
+                              "--diff-filter=D", "--no-renames"], capture_output=True,
+                             env=git_snapshot._git_env(), timeout=30)
+    if deleted.returncode:
+        raise OffboxError("cannot list staged deletions for sync; nothing ran")
+    rows = deleted.stdout.split(b"\0")
+    for meta, raw_path in zip(rows[::2], rows[1::2]):
+        # A file merely untracked with git rm --cached still exists and stays outside verification.
+        if not os.path.lexists(root / os.fsdecode(raw_path)):
+            entries.append(meta[1:7] + b" \t" + raw_path)
+    names, result = {}, {}
+    inc = [i.strip("/") for i in includes or []]
+    for raw in entries:
+        entry, _, raw_path = raw.partition(b"\t")
+        if entry.startswith(b"160000 "):
+            continue
+        path = os.fsdecode(raw_path)
+        real = _disk_path(root, path, names)
+        if real is None:
+            # Do not inspect descendants hidden behind a symlinked parent.
+            if any((root / Path(path).parents[i]).is_symlink() for i in range(len(Path(path).parents) - 1)):
+                continue
+            real = path
+        if real == ".git" or real.startswith(".git/"):
+            continue
+        included = any(real == i or real.startswith(i + "/") for i in inc)
+        if not included and (_offbox_skips(path) or (real != path and _offbox_skips(real))):
+            continue
+        try:
+            sig = _content_signature(root / real)
+        except OSError as e:
+            raise OffboxError(f"cannot hash tracked file {real!r}; nothing ran") from e
+        if sig[0] == "other":
+            raise OffboxError(f"unsupported tracked file type {real!r}; nothing ran")
+        result[real] = sig
+    return result
+
+
+# Run the same raw Git-blob hash on both hosts: no git installation, filters, index or history needed remotely.
+_CONTENT_CHECK = '''import hashlib,json,os,stat,sys
+def signature(path):
+    try:
+        if any(os.path.islink(os.path.join(*path.split('/')[:i])) for i in range(1,len(path.split('/')))):
+            return ('other','')
+        info=os.lstat(path)
+        if stat.S_ISLNK(info.st_mode):
+            data=os.fsencode(os.readlink(path))
+            return ('link',hashlib.sha1(b'blob '+str(len(data)).encode()+b'\\0'+data).hexdigest())
+        if stat.S_ISDIR(info.st_mode): return ('dir','')
+        if not stat.S_ISREG(info.st_mode): return ('other','')
+        h=hashlib.sha1(b'blob '+str(info.st_size).encode()+b'\\0')
+        with open(path,'rb') as stream:
+            for chunk in iter(lambda:stream.read(1024*1024),b''): h.update(chunk)
+        return ('file',h.hexdigest())
+    except (FileNotFoundError,NotADirectoryError): return ('missing','')
+    except OSError: return ('unreadable','')
+rows=json.load(sys.stdin)
+print(json.dumps([p for p,want in rows.items() if list(signature(p))!=want]))
+'''
+
+
+def _content_mismatches(box_id: str, remote_dir: str, expected: dict, timeout: float) -> list[str]:
+    command = f'cd -- {shlex.quote(remote_dir)} && python3 -I -c {shlex.quote(_CONTENT_CHECK)}'
+    p = ssh(box_id, command, input=json.dumps(expected).encode(), timeout=min(timeout, 120), check=True)
+    try:
+        bad = json.loads(p.stdout)
+        if not isinstance(bad, list) or any(not isinstance(x, str) or x not in expected for x in bad):
+            raise ValueError("unexpected paths")
+        return bad
+    except (ValueError, TypeError) as e:
+        raise OffboxError("invalid tracked-content verification response; nothing ran") from e
+
+
+def _content_event(box_id: str, paths: list[str], repaired: bool, run_id: str | None) -> None:
+    con = common.db()
+    try:
+        common.event(con, box_id, "sync_content_mismatch", json.dumps(
+            {"run_id": run_id, "path_count": len(paths), "repaired": repaired,
+             "paths": [p[:200] for p in paths[:5]]}, ensure_ascii=False))
+    finally:
+        con.close()
+
+
+def _verify_content(box_id: str, root: Path, remote_dir: str, expected: dict, timeout: float,
+                    run_id: str | None) -> dict:
+    if not expected:
+        return {"verified": 0, "repaired": 0}
+    t = time.monotonic()
+    bad = _content_mismatches(box_id, remote_dir, expected, timeout)
+    result = {"verified": len(expected), "repaired": 0}
+    if bad:
+        repaired = False
+        try:
+            cmd = [RSYNC, "-az", "--checksum", "--from0", "--files-from=-", "--delete-missing-args",
+                   "--no-o", "--no-g", "--omit-dir-times", "--stats", "--timeout=120",
+                   "-e", " ".join(shlex.quote(x) for x in ssh_base(box_id)),
+                   f"{root}/", f"{box_id}:{remote_dir}/"]
+            extra = _stats(_rsync(box_id, remote_dir, cmd, timeout, files="\0".join(bad) + "\0",
+                                  source=root, phase="content-repair", run_id=run_id))
+            for key in ("sent", "received", "files", "xfer"):
+                result[key] = extra.get(key, 0)
+            remaining = _content_mismatches(box_id, remote_dir, expected, timeout)
+            if remaining:
+                raise OffboxError(f"tracked content differs after checksum repair: {remaining[:20]!r}; nothing ran")
+            repaired = True
+            result["repaired"] = len(bad)
+        except common.SshHostKeyMismatch:
+            raise
+        except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
+            raise OffboxError(f"tracked content repair failed for {bad[:20]!r}: {e}; nothing ran") from e
+        finally:
+            _content_event(box_id, bad, repaired, run_id)
+    result["verify_seconds"] = round(time.monotonic() - t, 3)
+    return result
 
 
 class BoxStoppedDuringPush(OffboxError):
@@ -1080,6 +1317,8 @@ def _push_file_passes(box_id: str, root: Path, remote_dir: str, with_git: bool, 
     cmd = [RSYNC, "-az", "--delete", "--mkpath", "--no-o", "--no-g", "--omit-dir-times", "--stats",
            "--timeout=120", "-e", ssh_cmd, "-ii", "-8", f"--out-format={ITEM}%i %n"]
     if sibling:
+        # --copy-dest otherwise trusts size + whole-second mtime across different working trees.
+        cmd.append("--checksum")
         cmd.append(f"--copy-dest=../{sibling.split('/')[-1]}")
     cmd += push_filters(root, with_git, includes)
     cmd += [f"{root}/", f"{box_id}:{remote_dir}/"]

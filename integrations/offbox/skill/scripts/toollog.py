@@ -15,7 +15,7 @@ import tempfile
 import time
 
 CAP_BYTES = 50 * 1024 * 1024
-NUMBERS = set("bytes files skipped exitCode waitMs position ttlSeconds reasonLength busy idle stopped count flagsCount envCount pullCount includeCount stepCount attempt pid".split())
+NUMBERS = set("bytes files skipped exitCode waitMs position ttlSeconds reasonLength busy idle stopped count flagsCount envCount pullCount includeCount stepCount attempt pid timeoutSeconds commandLength".split())
 BOOLEANS = set("queued fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
 ENUMS = {
     "backend": {"home", "boat"}, "from": {"home", "boat"}, "to": {"home", "boat"},
@@ -46,7 +46,7 @@ def _atom(value):
 
 def _ids(values):
     return {k: v for k, v in (values or {}).items()
-            if k in {"run", "box", "thread", "card", "chat", "order"} and isinstance(v, str)
+            if k in {"run", "box", "thread", "card", "chat", "order", "owner"} and isinstance(v, str)
             and len(v) <= 200 and re.fullmatch(r"[A-Za-z0-9_:%.\-/]+", v)
             and not re.search(r"\d{13,}", v)}
 
@@ -63,6 +63,8 @@ def _props(values):
         elif k == "repo" and isinstance(v, str) and re.fullmatch(r"[a-f0-9]{16}", v):
             out[k] = v
         elif k == "size" and v in ("small", "default", "large", "xlarge"):
+            out[k] = v
+        elif k == "errorClass" and _atom(v):
             out[k] = v
         elif k == "exitRelay" and isinstance(v, str) and re.fullmatch(r"[a-z]{2}-[a-z]{3}-wg-\d{3}", v):
             out[k] = v

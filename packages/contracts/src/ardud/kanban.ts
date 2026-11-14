@@ -138,6 +138,7 @@ export const KanbanSubtask = Schema.Struct({
   text: Schema.String,
   owner: KanbanSubtaskOwner,
   gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
+  ownerOnly: Schema.optional(Schema.Boolean),
   createdAt: Schema.optional(IsoDateTime),
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   script: Schema.optional(Schema.String),
@@ -524,6 +525,29 @@ export const KanbanOwnerAsk = Schema.Struct({
   seq: Schema.NullOr(PositiveInt),
   /** Set once answered or dropped. */
   closedAt: Schema.NullOr(IsoDateTime),
+  timing: Schema.optional(
+    Schema.Struct({
+      kind: Schema.optional(
+        Schema.Literals(["approve", "pick", "draft", "action", "input", "notice"]),
+      ),
+      openAsksAtCreation: Schema.optional(NonNegativeInt),
+      notified: Schema.optional(
+        Schema.Struct({
+          in_app: Schema.optional(IsoDateTime),
+          telegram: Schema.optional(IsoDateTime),
+          push: Schema.optional(IsoDateTime),
+        }),
+      ),
+      firstSeen: Schema.optional(
+        Schema.Struct({
+          web: Schema.optional(IsoDateTime),
+          desktop: Schema.optional(IsoDateTime),
+          mobile: Schema.optional(IsoDateTime),
+        }),
+      ),
+      answeredVia: Schema.optional(Schema.Literals(["single", "batch", "free_text"])),
+    }),
+  ),
   /** A label for the layout; absent means "question". Behaviour comes from `kanbanAskResponse`. */
   kind: Schema.optional(KanbanAskKind),
   /** One short line saying what is being asked. */
@@ -1014,6 +1038,8 @@ export const KanbanCard = Schema.Struct({
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   movedAt: IsoDateTime,
+  /** Lifecycle clock for local analytics; movedAt may deliberately retain queue age on retry. */
+  analyticsStageEnteredAt: Schema.optional(IsoDateTime),
 });
 export type KanbanCard = typeof KanbanCard.Type;
 
@@ -1399,6 +1425,23 @@ export interface KanbanSchedule extends KanbanBlocking {
   readonly waitingSince: string | null;
 }
 
+/** Card metadata used for scheduling, without descriptions, prompts or conversation state. */
+export type KanbanScheduleCard = Pick<
+  KanbanCard,
+  | "id"
+  | "number"
+  | "stage"
+  | "settledAt"
+  | "priority"
+  | "blockedBy"
+  | "updatedAt"
+  | "movedAt"
+  | "activeThreadId"
+  | "subtasks"
+  | "wait"
+  | "deciding"
+>;
+
 export interface KanbanScheduleOptions {
   /**
    * The clock waiting is measured against. Left out, it is the newest `updatedAt` on
@@ -1636,7 +1679,7 @@ export function kanbanBoardClock(cards: ReadonlyArray<Pick<KanbanCard, "updatedA
  * 3 days a To-Do card has been startable, at most two.
  */
 export function kanbanSchedule(
-  cards: ReadonlyArray<KanbanCard>,
+  cards: ReadonlyArray<KanbanScheduleCard>,
   options: KanbanScheduleOptions = {},
 ): Map<string, KanbanSchedule> {
   const graph = blockingGraph(cards, options.maxWords ?? SCHEDULE_MAX_WORDS);
@@ -1685,12 +1728,13 @@ export function kanbanSchedule(
  * board's To-Do column shows it.
  */
 export function kanbanPickOrder(
-  cards: ReadonlyArray<KanbanCard>,
+  cards: ReadonlyArray<KanbanScheduleCard>,
   options: KanbanScheduleOptions = {},
 ) {
   const schedule = kanbanSchedule(cards, options);
-  const of = (card: KanbanCard) => schedule.get(card.id) ?? { holds: 0, rank: card.priority };
-  return (a: KanbanCard, b: KanbanCard) => {
+  type RankedCard = Pick<KanbanScheduleCard, "id" | "priority" | "movedAt" | "number">;
+  const of = (card: RankedCard) => schedule.get(card.id) ?? { holds: 0, rank: card.priority };
+  return (a: RankedCard, b: RankedCard) => {
     const x = of(a);
     const y = of(b);
     return (
@@ -1950,6 +1994,21 @@ export const KanbanNightlyReview = Schema.Struct({
 });
 export type KanbanNightlyReview = typeof KanbanNightlyReview.Type;
 
+export const KanbanStandingApproval = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  gate: Schema.Literal("deploy"),
+  quote: TrimmedNonEmptyString,
+  sourceThreadId: TrimmedNonEmptyString,
+  saidAt: IsoDateTime,
+  approvedAsk: Schema.Struct({ cardId: TrimmedNonEmptyString, askId: TrimmedNonEmptyString }),
+  recordedAt: IsoDateTime,
+  recordedBy: TrimmedNonEmptyString,
+  revokedAt: Schema.NullOr(IsoDateTime),
+  revokedBy: Schema.NullOr(TrimmedNonEmptyString),
+  revokeReason: Schema.NullOr(Schema.String),
+});
+export type KanbanStandingApproval = typeof KanbanStandingApproval.Type;
+
 export const KanbanBoard = Schema.Struct({
   id: KanbanBoardId,
   slug: TrimmedNonEmptyString,
@@ -1966,6 +2025,9 @@ export const KanbanBoard = Schema.Struct({
   reviewChains: Schema.Array(KanbanReviewChain),
   defaultReviewChain: Schema.NullOr(TrimmedNonEmptyString),
   guessedGates: Schema.optional(Schema.Array(Schema.Literals(["deploy", "money", "secret"]))),
+  standingApprovals: Schema.Array(KanbanStandingApproval).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
   instructions: KanbanInstructions,
   setup: Schema.NullOr(KanbanBoardSetup).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   pause: Schema.NullOr(KanbanBoardPause).pipe(Schema.withDecodingDefault(Effect.succeed(null))),

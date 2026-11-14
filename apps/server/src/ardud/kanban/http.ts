@@ -37,7 +37,7 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import { modelSelectionResult, type ModelInput } from "./engine/defaults.ts";
-import { KanbanService } from "./engine/KanbanService.ts";
+import { KanbanService, askAnswerVia } from "./engine/KanbanService.ts";
 import { requireOwner } from "./ownerGate.ts";
 import { selectionRoutingEnabled } from "./engine/selectionSettings.ts";
 import { KanbanScripts } from "./engine/ScriptService.ts";
@@ -663,6 +663,37 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
+    const seenAsk = ownerWrite(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        const { surface, at } = yield* body(
+          Schema.Struct({
+            surface: Schema.Literals(["web", "desktop", "mobile"]),
+            at: Schema.optional(Schema.String),
+          }),
+        );
+        yield* service.noteAskTiming(card.id, yield* param("ask"), { type: "seen", surface, at });
+        return { recorded: true };
+      }),
+    );
+    const notifiedAsk = write(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        const input = yield* body(
+          Schema.Struct({
+            channel: Schema.Literals(["in_app", "telegram", "push"]),
+            at: Schema.optional(
+              Schema.String.check(
+                Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+              ),
+            ),
+          }),
+        );
+        yield* service.noteAskTiming(card.id, yield* param("ask"), { type: "notified", ...input });
+        return { recorded: true };
+      }),
+    );
+
     // Each ask is answered on its own: one stale or closed ask doesn't hold back the rest.
     const answerAsks = ownerWrite(
       Effect.gen(function* () {
@@ -693,12 +724,9 @@ export const kanbanRouteLayer = HttpRouter.addAll(
                 );
               }
             }
-            const result = yield* service.answerAsk(
-              card.id,
-              item.askId,
-              { ...answer, revision: item.revision },
-              OWNER,
-            );
+            const result = yield* service
+              .answerAsk(card.id, item.askId, { ...answer, revision: item.revision }, OWNER)
+              .pipe(Effect.provideService(askAnswerVia, "batch"));
             return {
               card: item.card,
               askId: item.askId,
@@ -1021,6 +1049,8 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       HttpRouter.route("POST", `${p}/asks/hand`, handle(handAsks)),
       HttpRouter.route("GET", `${p}/cards/:card/asks/:ask`, handle(getAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/answer`, handle(answerAsk)),
+      HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/seen`, handle(seenAsk)),
+      HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/notified`, handle(notifiedAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/reply`, handle(replyOnAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/hand`, handle(handAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/snooze`, handle(snoozeAsk)),

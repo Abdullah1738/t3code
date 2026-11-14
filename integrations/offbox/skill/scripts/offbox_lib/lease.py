@@ -763,6 +763,29 @@ def acquire_private(me: dict, size: str | None = None, template: str | None = No
             owner_lock.__exit__(None, None, None)
 
 
+def _cmake_cache_cleanup_shell() -> str:
+    return r'''set -e
+removed=0
+failed=0
+while IFS= read -r -d '' cache; do
+  # Removing a parent's CMakeFiles can invalidate nested paths already queued by find.
+  [ -f "$cache" ] && [ ! -L "$cache" ] || continue
+  current=$(cd -- "${cache%/*}" && pwd -P) || { failed=1; continue; }
+  previous=$(sed -n 's/^CMAKE_CACHEFILE_DIR:INTERNAL=//p' "$cache") || { failed=1; continue; }
+  # Without an INTERNAL entry there is no evidence that this cache is stale.
+  if [ -n "$previous" ] && [ "$previous" != "$current" ]; then
+    if rm -rf -- "$cache" "${cache%/*}/CMakeFiles"; then
+      printf 'CMake cache removed: %s -> %s\n' "$previous" "$current"
+      removed=$((removed + 1))
+    else
+      failed=1
+    fi
+  fi
+done < <(find "$1" -type f -name CMakeCache.txt -not -path '*/node_modules/*' -print0)
+printf 'cmake_caches_removed=%s\n' "$removed"
+exit "$failed"'''
+
+
 def _relocate_base_checkout(con, box_id: str, base_dir: str, remote_dir: str, *, box_held: bool) -> None:
     guard = contextlib.nullcontext() if box_held else file_lock(f"box-{box_id}", timeout=120)
     with guard:
@@ -778,13 +801,34 @@ if [ -d "$src" ] && [ ! -e "$dst" ] && [ ! -L "$dst" ]; then
   mkdir -p "$(dirname "$dst")"
   mv -- "$src" "$dst"
   printf 'offbox-base-checkout-relocated\\n'
+  timeout -k 5 60 bash -c {shlex.quote(_cmake_cache_cleanup_shell())} offbox-cmake "$dst" ||
+    printf 'CMake cache cleanup failed (rc=%s); continuing lease\\n' "$?"
 fi'''
-        result = ssh_sync.ssh(box_id, command, timeout=120)
+        try:
+            result = ssh_sync.ssh(box_id, command, timeout=120)
+        except subprocess.TimeoutExpired as exc:
+            # Only a confirmed move makes a cleanup timeout non-fatal. Keep pre-move timeouts unchanged.
+            if b"offbox-base-checkout-relocated\n" not in (exc.stdout or b""):
+                raise
+            result = subprocess.CompletedProcess([], 0, exc.stdout,
+                                                 b"CMake cache cleanup SSH timed out; continuing lease")
         if result.returncode:
-            raise OffboxError(f"base checkout relocation failed on {box_id}: "
-                              f"{result.stderr.decode(errors='replace')[-300:]}")
+            if b"offbox-base-checkout-relocated\n" not in result.stdout:
+                raise OffboxError(f"base checkout relocation failed on {box_id}: "
+                                  f"{result.stderr.decode(errors='replace')[-300:]}")
+            say(f"CMake cache cleanup failed (rc={result.returncode}); continuing lease")
         if b"offbox-base-checkout-relocated\n" in result.stdout:
             event(con, box_id, "base_checkout_cleared", f"{base_dir} -> {remote_dir}: project .gradle metadata")
+            output = result.stdout.decode(errors="replace").splitlines()
+            for line in output:
+                if line != "offbox-base-checkout-relocated":
+                    say(line)
+            if result.stderr:
+                say(result.stderr.decode(errors="replace")[-1000:])
+            count = next((line.split("=", 1)[1] for line in reversed(output)
+                          if re.fullmatch(r"cmake_caches_removed=\d+", line)), "unknown")
+            event(con, box_id, "base_relocated",
+                  f"from={base_dir} to={remote_dir} cmake_caches_removed={count}\n" + "\n".join(output[1:]))
 
 
 def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_held: bool = False,
@@ -966,7 +1010,7 @@ def _wait_unanswered_resume(con, box_id):
             budget_left = api.left()
             if budget_left is not None:
                 if budget_left <= 0.05:
-                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later")
+                    raise api.BudgetExpired(f"client budget expired confirming resume of {box_id}; nothing ran. Retry later")
                 left = min(left, budget_left)
             if left <= 0:
                 con.execute("UPDATE leases SET state='resume_stalled' WHERE box_id=?", (box_id,))
@@ -975,6 +1019,8 @@ def _wait_unanswered_resume(con, box_id):
                                              "nothing ran; set aside and trying a new box")
             try:
                 state = api.readiness_get(box_id, deadline=time.time() + left)
+            except api.BudgetExpired:
+                raise
             except OffboxError as error:
                 network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
                 from . import home
@@ -1053,12 +1099,14 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
                 if budget_left <= 0.05:
                     from . import prepare
                     prepare.check(reserve=0.05)
-                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later") from unanswered
+                    raise api.BudgetExpired(f"client budget expired confirming resume of {box_id}; nothing ran. Retry later") from unanswered
                 left = min(left, budget_left)
             if left <= 0:
                 break
             try:
                 last = api.readiness_get(box_id, deadline=time.time() + left)
+            except api.BudgetExpired:
+                raise
             except OffboxError as error:
                 network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
                 from . import home
@@ -1099,7 +1147,7 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             budget_left = api.left()
             if budget_left is not None:
                 if budget_left <= 0.05:
-                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later") from unanswered
+                    raise api.BudgetExpired(f"client budget expired confirming resume of {box_id}; nothing ran. Retry later") from unanswered
                 left = min(left, budget_left)
             if remaining is not None and remaining <= 0:
                 raise ResumeUnresolved(f"resume of {box_id} was unanswered; its state could not be confirmed; "

@@ -62,7 +62,11 @@ interface AttachedTab {
   /** Each pending command, by the extra session waiting on it; the main connection's have none. */
   readonly focusPending: Map<
     object,
-    { readonly owner: string | undefined; readonly paints: boolean }
+    {
+      readonly owner: string | undefined;
+      readonly paints: boolean;
+      readonly paintScope: object | undefined;
+    }
   >;
   /** Whether the client keeps the guest painting, as published on `painting`. */
   painting: boolean;
@@ -74,6 +78,7 @@ interface AttachedTab {
   focusReleasing: boolean;
   /** The sessions streaming the guest; one stopping leaves the others' screencasts running. */
   readonly screencasts: Set<string | undefined>;
+  readonly paintOwners: Map<string, object>;
   readonly onMessage: (
     event: Electron.Event,
     method: string,
@@ -209,7 +214,12 @@ export const make = Effect.gen(function* () {
         } while (uses !== tab.focusUses);
         tab.focusReleasing = false;
         // The last pending command to settle starts another idle wait.
-        if (tab.focusPending.size > 0 || tab.screencasts.size > 0 || waitingHolds(tab)) {
+        if (
+          tab.focusPending.size > 0 ||
+          tab.screencasts.size > 0 ||
+          tab.paintOwners.size > 0 ||
+          waitingHolds(tab)
+        ) {
           return;
         }
         // The agent pauses to think between steps; its tab stays focused until the turn ends.
@@ -229,6 +239,7 @@ export const make = Effect.gen(function* () {
     const active =
       tabs.get(keyOf(tab.key)) === tab &&
       (tab.screencasts.size > 0 ||
+        tab.paintOwners.size > 0 ||
         waitingHolds(tab) ||
         [...tab.focusPending.values()].some((hold) => hold.paints));
     if (tab.painting === active) return;
@@ -246,6 +257,7 @@ export const make = Effect.gen(function* () {
     const pending = {};
     tab.focusPending.set(pending, {
       owner,
+      paintScope: owner === undefined ? undefined : tab.paintOwners.get(owner),
       paints: /^(?:Page\.captureScreenshot|Runtime\.(?:evaluate|callFunctionOn))$/.test(method),
     });
     tab.focusUses += 1;
@@ -274,6 +286,7 @@ export const make = Effect.gen(function* () {
   const dropRelay = (tab: AttachedTab) => {
     tab.relay = null;
     tab.screencasts.clear();
+    tab.paintOwners.clear();
     tab.agentUsed = false;
     dropFocusHolds(tab);
   };
@@ -281,6 +294,7 @@ export const make = Effect.gen(function* () {
   /** A detached session, such as a closed viewer, waits on nothing it sent. */
   const dropSessionHolds = (tab: AttachedTab, owner: string) => {
     tab.screencasts.delete(owner);
+    tab.paintOwners.delete(owner);
     for (const [pending, hold] of tab.focusPending) {
       if (hold.owner === owner) tab.focusPending.delete(pending);
     }
@@ -298,6 +312,7 @@ export const make = Effect.gen(function* () {
     for (const tab of tabs.values()) {
       if (tab.key.threadId !== threadId) continue;
       tab.agentUsed = false;
+      tab.paintOwners.clear();
       // Still sent in turn, so the queue keeps moving, but no longer kept painting.
       for (const waiting of tab.waitingScreenshots) waiting.held = false;
       dropFocusHolds(tab);
@@ -340,11 +355,15 @@ export const make = Effect.gen(function* () {
                 : Promise.reject(new Error("The page this screenshot was for has moved on."));
             return change === null ? run() : change.then(run);
           };
+          const paintScope = owner === undefined ? undefined : tab.paintOwners.get(owner);
           return method === "Page.captureScreenshot"
             ? takeScreenshot(
                 tab,
                 relay,
-                () => owner === undefined || !detachedOwners.has(owner),
+                () =>
+                  owner === undefined ||
+                  (!detachedOwners.has(owner) &&
+                    (paintScope === undefined || tab.paintOwners.get(owner) === paintScope)),
                 (current, held) =>
                   held ? holdFocus(tab, method, owner, () => forward(current)) : forward(current),
               )
@@ -357,6 +376,28 @@ export const make = Effect.gen(function* () {
                   throw cause;
                 })
               : holdFocus(tab, method, owner, forward);
+        },
+        setPaintHold: async (owner, enabled) => {
+          if (enabled) {
+            if (!tab.paintOwners.has(owner)) tab.paintOwners.set(owner, {});
+            tab.focusUses += 1;
+            setFocusEmulation(tab, true);
+          } else {
+            const scope = tab.paintOwners.get(owner);
+            tab.paintOwners.delete(owner);
+            // A timed-out copy stays serialized in Chromium, but its caller no longer needs paint.
+            // Commands from before the capture keep their independent holds.
+            if (scope) {
+              for (const [pending, hold] of tab.focusPending) {
+                if (hold.owner === owner && hold.paintScope === scope)
+                  tab.focusPending.delete(pending);
+              }
+            }
+          }
+          releaseFocusWhenIdle(tab);
+          syncPainting(tab);
+          await tab.focusChange;
+          return {};
         },
         sessionDetached: (owner) => {
           detachedOwners.add(owner);
@@ -442,6 +483,7 @@ export const make = Effect.gen(function* () {
       agentUsed: false,
       focusReleasing: false,
       screencasts: new Set(),
+      paintOwners: new Map(),
       onMessage: (_event, method, params, sessionId) => {
         if (method === "Browser.downloadWillBegin") {
           const guid = (params as { guid?: unknown } | undefined)?.guid;

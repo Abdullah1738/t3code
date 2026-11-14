@@ -203,6 +203,10 @@ export const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const bootedAt = yield* Clock.currentTimeMillis;
   const lives = new Map<string, WatchLife>();
+  const settlingReads = new Map<
+    string,
+    { readonly head: string | null; readonly passes: number }
+  >();
 
   const lifeOf = (target: WatchTarget): WatchLife => {
     const existing = lives.get(lifeKey(target));
@@ -287,6 +291,8 @@ export const make = Effect.gen(function* () {
       threadId: target.thread.id,
       ...identityOf(target.link),
       startedAt: target.watch.startedAt,
+      expectedHeadSha: target.watch.headSha,
+      expectedObservedHeadSha: target.watch.observedHeadSha ?? null,
       watch: next,
       ...(endedWatch === undefined ? {} : { endedWatch }),
       ...(wake === undefined
@@ -554,18 +560,16 @@ export const make = Effect.gen(function* () {
       );
     }
 
-    if (pullRequestChecksSettling(detail)) {
-      if (
-        yield* unsuccessfulRead(
-          group,
-          Option.none(),
-          "The PR head, source branch, and check rollup still disagree.",
-        )
-      )
-        return;
-    } else {
-      readFailures.delete(group.key);
-    }
+    readFailures.delete(group.key);
+    const settling = pullRequestChecksSettling(detail);
+    const observedHead = detail.headBranchSha ?? detail.checksHeadSha ?? headSha;
+    const previous = settlingReads.get(group.key);
+    const passes = settling ? (previous?.head === observedHead ? previous.passes + 1 : 1) : 0;
+    if (settling) settlingReads.set(group.key, { head: observedHead, passes });
+    else settlingReads.delete(group.key);
+    // Three reads allow ordinary post-push lag (~4 minutes at the existing cadence).
+    // After that the source branch wins; a rollup for another commit still cannot give a verdict.
+    const settlingExpired = passes >= 3;
 
     // Never advance the remark watermark past comments an incomplete read could have missed.
     const remarks = Option.isSome(activity)
@@ -587,7 +591,7 @@ export const make = Effect.gen(function* () {
         pullRequestChecksSettling(detail) ||
         detail.mergeability === "unknown" ||
         group.targets.some(({ watch }) => {
-          const next = evaluatePullRequestWatch(watch, detail, null).next;
+          const next = evaluatePullRequestWatch(watch, detail, null, settlingExpired).next;
           return (
             (next.conflictHead !== null && !next.conflicting) ||
             // The first optional green read still needs a confirmation on the next sweep.
@@ -603,7 +607,7 @@ export const make = Effect.gen(function* () {
     yield* eachTarget(
       group,
       Effect.fn("PullRequestWatchReactor.sendReport")(function* (target: WatchTarget) {
-        let report = evaluatePullRequestWatch(target.watch, detail, remarks);
+        let report = evaluatePullRequestWatch(target.watch, detail, remarks, settlingExpired);
         if (report.changes.some((change) => change.kind === "conflicting")) {
           const current = yield* projections.getThread(target.thread.id);
           const watch = current?.pullRequests?.find(
@@ -624,7 +628,7 @@ export const make = Effect.gen(function* () {
             number: target.link.number,
             url: target.link.url,
             baseBranch: detail.baseBranch,
-            headSha: detail.headSha ?? null,
+            headSha: report.next.headSha,
             report,
           });
           // An ending watch keeps what this pass saw, so watching again starts from it.
@@ -682,7 +686,7 @@ export const make = Effect.gen(function* () {
       targets: members,
       fingerprint: [...new Set(members.map(snapshotFingerprint))].toSorted().join("\n"),
     }));
-    for (const cache of [readFailures, lastReads, threadTails]) {
+    for (const cache of [readFailures, lastReads, threadTails, settlingReads]) {
       for (const key of cache.keys()) if (!byPullRequest.has(key)) cache.delete(key);
     }
     yield* Effect.forEach(

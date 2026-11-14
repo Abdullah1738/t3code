@@ -100,7 +100,7 @@ export const ImessageSendMcpResult = Schema.Struct({
   id: Schema.String,
   /** False when the key matched an earlier send, so nothing new was queued. */
   created: Schema.Boolean,
-  /** The chat slug it went to, or `owner` for the chat this thread serves. */
+  /** The actual recipient chat slug; `unknown` when an older bridge omits it. */
   chat: Schema.String,
 });
 export type ImessageSendMcpResult = typeof ImessageSendMcpResult.Type;

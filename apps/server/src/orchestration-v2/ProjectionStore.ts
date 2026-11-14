@@ -6411,7 +6411,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   : sql` AND t.thread_id IN ${sql.in(threadIds)}`
             }${projectId === undefined ? sql`` : sql` AND t.project_id = ${projectId}`}${
               location === "active"
-                ? sql` AND json_extract(t.payload_json, '$.archivedAt') IS NULL`
+                ? listCandidatesOnly
+                  ? sql` AND t.archived_at IS NULL`
+                  : sql` AND json_extract(t.payload_json, '$.archivedAt') IS NULL`
                 : location === "archive"
                   ? sql` AND json_extract(t.payload_json, '$.archivedAt') IS NOT NULL`
                   : sql``

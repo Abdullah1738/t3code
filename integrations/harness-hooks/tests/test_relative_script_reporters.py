@@ -31,12 +31,11 @@ class RelativeScriptReporterTests(unittest.TestCase):
         # Only source inspection matters here; do not contact identity services
         # or let the unrelated compute policy reject historical test commands.
         for mock in (
-            patch.dict(os.environ, isolated_source_cases.fixture_environment()),
+            isolated_source_cases.fixture_environment_patch(),
             patch.object(engine, '_native', return_value=(None, None, None)),
             patch.object(engine, '_offbox_mode', return_value='off'),
-            patch.object(engine, 'decide_coord', return_value={'decision':'allow', 'reason':'', 'context':{'rule':'no-policy'}}),
             patch.object(engine, '_log'),
-            patch.dict(os.environ, {name:'' for name in (engine.COMMAND_IDENTITY_ENV, 'AGENT_GUARD_APPROVED', 'HARNESS_COORD_APPROVED')}),
+            patch.dict(os.environ, {name:'' for name in (engine.COMMAND_IDENTITY_ENV,)}),
         ):
             mock.start()
             self.addCleanup(mock.stop)

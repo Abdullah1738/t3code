@@ -1176,7 +1176,7 @@ const layerMakeServer = Layer.unwrap(
       Layer.provide(AnalyticsDatabase.layer),
       Layer.provide(McpCallLedger.layer),
       Layer.provide(McpAvailability.layer),
-      Layer.provide(OwnerAnalytics.layer),
+      Layer.provide(OwnerAnalytics.layer.pipe(Layer.provide(layerPersistence))),
       Layer.provide(LargeReplyLog.layer),
       Layer.provide(ReplyBuilders.layer),
       Layer.provideMerge(FetchHttpClient.layer),
