@@ -1095,3 +1095,62 @@ it.effect.each(["new-admission", "transfer"] as const)(
     );
   },
 );
+
+it.effect.each([
+  "continuation",
+  "provider-start",
+  "refreshed-before-finalizer",
+  "expired-reservation",
+] as const)("admitted preparation does not spend the next admission deadline: %s", (exit) => {
+  const h = harness({ maxActive: 1, spacingMs: 0 });
+  h.setLoad(2);
+  const first = source(1);
+  h.runSources.set(first.sourceRunId, first);
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    const providerStart = exit === "provider-start" || exit === "refreshed-before-finalizer";
+    const acquire = providerStart
+      ? pacing.acquireRun(first.threadId, first.sourceRunId, "start:retry")
+      : pacing.acquire(first);
+    assert.isAbove(yield* acquire, 0);
+    yield* TestClock.adjust("20 minutes");
+    assert.equal(yield* acquire, 0);
+    // Workspace/preparation and the retry backoff are outside the waiting budget.
+    yield* TestClock.adjust("31 minutes");
+    if (exit === "refreshed-before-finalizer" || exit === "expired-reservation") {
+      assert.isAbove(yield* pacing.acquire(source(2)), 0);
+      h.cancelled.add(source(2).sourceRunId);
+    }
+    if (providerStart)
+      yield* pacing.releaseRun(first.threadId, first.sourceRunId, "start:retry", true);
+    else if (exit === "continuation") yield* pacing.release(first);
+    yield* TestClock.adjust("31 minutes");
+    const retried = yield* acquire.pipe(Effect.result);
+    assert.equal(retried._tag, "Success", "admitted time must not expire the new admission wait");
+    if (retried._tag === "Success")
+      assert.equal(retried.success, 0, "the retry keeps its spent load credit");
+  }).pipe(Effect.provide(h.layer));
+});
+
+it.effect.each(["deferred", "pruned"] as const)(
+  "a continuously waiting %s retry retains its admission deadline",
+  (exit) => {
+    const h = harness({ spacingMs: 0 });
+    h.setLoad(2);
+    const first = source(1);
+    h.runSources.set(first.sourceRunId, first);
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      const acquire = pacing.acquireRun(first.threadId, first.sourceRunId, "start:waiting");
+      assert.isAbove(yield* acquire, 0);
+      yield* TestClock.adjust("15 minutes");
+      if (exit === "pruned") {
+        h.cancelled.add("start:waiting");
+        assert.isAbove(yield* pacing.acquire(source(2)), 0);
+        h.cancelled.delete("start:waiting");
+      } else yield* pacing.releaseRun(first.threadId, first.sourceRunId, "start:waiting", true);
+      yield* TestClock.adjust("16 minutes");
+      assert.instanceOf(yield* acquire.pipe(Effect.flip), RestartPacing.RestartAdmissionTimeoutError);
+    }).pipe(Effect.provide(h.layer));
+  },
+);

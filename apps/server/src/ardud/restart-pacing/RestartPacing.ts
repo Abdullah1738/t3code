@@ -26,10 +26,12 @@ const DISPATCH_GRACE_MS = 2 * 60_000;
 const STUCK_MS = 10 * 60_000;
 
 type LoadHold = {
-  registeredAt: number;
   loadHoldMs: number;
   checkedAt: number;
   wasLoaded: boolean;
+};
+type WaitingHold = LoadHold & {
+  registeredAt?: number;
   expiredEffectId?: string;
 };
 
@@ -86,7 +88,7 @@ const make = Effect.gen(function* () {
   >();
   // A requeued run can outlive its settled start effect. Keep its load budget
   // across pruning until a replacement effect registers it again.
-  const requeuedHolds = new Map<string, LoadHold>();
+  const requeuedHolds = new Map<string, WaitingHold>();
   const active = new Map<
     string,
     { source: RestartSource; dispatching: boolean; admittedAt: number; hold: LoadHold }
@@ -341,8 +343,7 @@ const make = Effect.gen(function* () {
         dispatching: true,
         admittedAt: now,
         hold: {
-          // Native admission ends this wait; retries retain load credit, not its old deadline.
-          registeredAt: now,
+          // Admission ends this clock; retries retain only spent load credit.
           loadHoldMs: entry.loadHoldMs,
           checkedAt: now,
           wasLoaded: loaded,

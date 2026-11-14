@@ -1543,3 +1543,50 @@ it.effect("retries native settlement after cancellation already released its ses
     }).pipe(Effect.provide(layer));
   }),
 );
+
+it.effect("long preparation does not discard an admitted provider start's retry", () =>
+  Effect.gen(function* () {
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    let starts = 0;
+    const commands: string[] = [];
+    const executorLayer = layerExecutorFor({
+      events,
+      pacing: slotPacing,
+      start: () =>
+        Effect.suspend(() => {
+          starts++;
+          return starts === 1
+            ? TestClock.adjust("31 minutes").pipe(
+                Effect.andThen(
+                  Effect.fail(
+                    new ProviderTurnStartService.ProviderTurnStartError({
+                      runId,
+                      cause: "retryable preparation failure before native admission",
+                    }),
+                  ),
+                ),
+              )
+            : Effect.void;
+        }),
+      threads: {
+        dispatch: (command) =>
+          Effect.sync(() => {
+            commands.push(command.type);
+            return { sequence: 0, storedEvents: [] };
+          }),
+      },
+    });
+    yield* Effect.gen(function* () {
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+      const effect = {
+        ...restartEffect(yield* DateTime.now, { type: "detach" }),
+        request: { type: "provider-turn.start" as const, runId },
+      };
+      const first = yield* executor.execute(effect, { willRetry: true }).pipe(Effect.result);
+      assert.equal(first._tag, "Failure");
+      yield* executor.execute(effect, { willRetry: true });
+      assert.equal(starts, 2, "the admitted retry must reach ProviderTurnStartService");
+      assert.deepEqual(commands, []);
+    }).pipe(Effect.provide(Layer.merge(executorLayer, slotPacing)));
+  }),
+);
