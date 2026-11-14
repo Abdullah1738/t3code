@@ -4141,6 +4141,78 @@ it.effect.each([-1, 0, 1048576, 9007199254740993n])(
     ),
 );
 
+it.effect.each(["ON", "OFF", "700"] as const)(
+  "preserves spill behavior or refuses unobservable cache_spill=%s",
+  (value) =>
+    withFileClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const native = yield* openDatabase(":memory:");
+          native.exec(`PRAGMA cache_size=1000; PRAGMA cache_spill=${value}; PRAGMA cache_size=100`);
+          const expected = native
+            .prepare("PRAGMA cache_spill")
+            .all()
+            .map((row) => Object.values(row));
+          yield* sql`PRAGMA cache_size=1000`;
+          yield* sql.unsafe(`PRAGMA cache_spill=${value}`);
+          const count = writerWorkers.length;
+          yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+          if (value === "700") {
+            const failed = yield* sql`PRAGMA cache_size=100`.pipe(Effect.flip);
+            assert.include(String(failed.reason.cause), "connection state could not be observed");
+            assert.equal(writerWorkers.length, count);
+          } else {
+            yield* sql`PRAGMA cache_size=100`;
+            assert.deepEqual(yield* sql`PRAGMA cache_spill`.values, expected);
+          }
+        }),
+      { readerWorker: false },
+    ),
+);
+
+it.effect.each(["survives", "renamed externally", "closed"] as const)(
+  "restores attached shared memory when the other connection is %s",
+  (state) =>
+    withFileClient(
+      (sql, filename) =>
+        Effect.gen(function* () {
+          const uri = `file:shared-${Buffer.from(filename).toString("hex")}?mode=memory&cache=shared`;
+          const native = yield* openDatabase(":memory:");
+          native.prepare("ATTACH DATABASE ? AS shared").run(uri);
+          native.exec(
+            "CREATE TABLE shared.entries(value INTEGER); INSERT INTO shared.entries VALUES (1); CREATE INDEX shared.entry_index ON entries(value)",
+          );
+          yield* sql`ATTACH DATABASE ${uri} AS shared`;
+          assert.deepEqual(yield* sql`SELECT value FROM shared.entries`.values, [[1]]);
+          yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+          if (state === "closed") native.exec("DETACH DATABASE shared");
+          if (state === "renamed externally")
+            native.exec("ALTER TABLE shared.entries RENAME TO renamed");
+          const table = state === "renamed externally" ? "renamed" : "entries";
+          assert.deepEqual(
+            yield* sql.unsafe(`SELECT value FROM shared.${table}`).values,
+            state === "closed" ? [] : [[1]],
+          );
+          if (state === "renamed externally") {
+            assert.deepEqual(
+              yield* sql`SELECT name FROM shared.sqlite_schema WHERE name='entries'`.values,
+              [],
+            );
+          }
+          yield* sql.unsafe(`INSERT INTO shared.${table} VALUES (2)`);
+          if (state !== "closed")
+            assert.deepEqual(
+              native
+                .prepare(`SELECT value FROM shared.${table} ORDER BY value`)
+                .all()
+                .map((row) => row.value),
+              [1, 2],
+            );
+        }),
+      { readerWorker: false },
+    ),
+);
+
 it.effect.each([
   { name: "Uint8Array", make: () => new Uint8Array([1, 2, 3]) },
   { name: "offset view", make: () => new Uint8Array([0, 1, 2, 3, 0]).subarray(1, 4) },

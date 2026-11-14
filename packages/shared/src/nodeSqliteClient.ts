@@ -1335,7 +1335,7 @@ const makeWriterSetup = () => {
         ...settings.filter(prerequisite).map(pragma),
         ...attachments,
         ...settings.filter((entry) => !afterSchema(entry) && !prerequisite(entry)).map(pragma),
-        ...schemas.map((entry) => ({ sql: entry.sql, params: [] })),
+        ...schemas.map((entry) => ({ sql: entry.sql, params: [], restoreSchema: entry.schema })),
       ];
     },
     // These flags can prevent schema restoration, or be reset by that restoration.
@@ -1418,6 +1418,8 @@ try {
     } else if (code === constants.SQLITE_PRAGMA) {
       const name = action?.toLowerCase();
       activeClassification.configuration ||= argument !== null && setupPragmas.has(name);
+      activeClassification.unreadableSpillThreshold ||= name === "cache_spill" && argument !== null &&
+        Number.isFinite(Number(argument)) && Number(argument) > 1;
       activeClassification.globalMmap ||= name === "mmap_size" && argument !== null && database === null;
       if (argument !== null && (name === "page_size" || name === "auto_vacuum")) {
         (activeClassification.pendingVacuum ??= new Map()).set((database ?? "main") + ":" + name,
@@ -1436,7 +1438,16 @@ try {
     }
     return constants.SQLITE_OK;
   });
+  const schemaRestore = new Map();
   for (const entry of workerData.setup ?? []) {
+    if (entry.restoreSchema !== undefined) {
+      if (!schemaRestore.has(entry.restoreSchema)) {
+        const quoted = '"' + entry.restoreSchema.replaceAll('"', '""') + '"';
+        const version = Object.values(db.prepare("PRAGMA " + quoted + ".schema_version").get())[0];
+        schemaRestore.set(entry.restoreSchema, Number(version) === 0);
+      }
+      if (!schemaRestore.get(entry.restoreSchema)) continue;
+    }
     const statement = db.prepare(entry.sql);
     statement.setReadBigInts(true);
     if (statement.columns().length) statement.all(...entry.params);
@@ -1470,7 +1481,8 @@ const connectionSettings = () => {
     const statement = db.prepare("PRAGMA " + quoteIdentifier(schema) + "." + name);
     statement.setReadBigInts(true);
     const row = statement.get();
-    const value = row && Object.values(row)[0];
+    const observed = row && Object.values(row)[0];
+    const value = name === "cache_spill" && typeof observed === "number" ? (observed === 0 ? "OFF" : "ON") : observed;
     if (typeof value === "number" || typeof value === "bigint" || typeof value === "string") settings.push({ schema, name, value });
   }
   deferredForeignKeys = Boolean(db.prepare("PRAGMA defer_foreign_keys").get().defer_foreign_keys);
@@ -1541,6 +1553,7 @@ let recoveryFailureReported = false;
 let recoveryFailureCause;
 const recoverySnapshot = (classification, sql, params, expandedSql) => {
   globalMmapPending ||= Boolean(classification?.globalMmap);
+  unsupportedConfiguration ||= Boolean(classification?.unreadableSpillThreshold);
   configurationDirty ||= Boolean(classification?.configuration) || pendingVacuum.size > 0 || globalMmapPending;
   schemaDirty ||= Boolean(classification?.schema);
   for (const [key, setting] of classification?.pendingVacuum ?? []) pendingVacuum.set(key, setting);
