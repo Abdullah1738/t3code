@@ -171,7 +171,25 @@ export type TrackedWake = { inbound: string; key: string; event: string; deliver
 
 export const PERSON_BATCH_MS = 150_000;
 export const REMOVAL_GRACE_MS = 15 * 60_000;
-export const personChat = (watcher: Watcher) => watcher.mode === "wake";
+export function personChat(watcher: Watcher): boolean {
+  if (watcher.mode !== "wake" || !watcher.chat) return false;
+  let db: Database | undefined;
+  try {
+    // The bridge registry owns chat identity; names and slug prefixes cannot distinguish a DM from a group.
+    // A busy or unavailable registry keeps existing immediate timing rather than delaying an unknown target.
+    db = new Database(BRIDGE_DB, { readonly: true });
+    db.exec("PRAGMA busy_timeout = 0");
+    const row = db.query<{ value: string }, [string]>("SELECT value FROM kv WHERE key = ?").get("sbChats");
+    const saved: unknown = row ? JSON.parse(row.value) : undefined;
+    if (!jsonObject(saved)) return false;
+    const matches = Object.entries(saved).filter(([, entry]) => jsonObject(entry) && entry.slug === watcher.chat);
+    return matches.length > 0 && matches.every(([key]) => key.startsWith("dm:"));
+  } catch {
+    return false;
+  } finally {
+    db?.close();
+  }
+}
 export const sameDestination = (a: Watcher, b: Watcher) => a.mode === b.mode && a.chat === b.chat
   && (a.mode !== "wake" || !!a.chat || a.created_by_session === b.created_by_session);
 export const checking = (state: State) => state.status === "active" || (state.status === "closing" && !!state.closing_watcher);

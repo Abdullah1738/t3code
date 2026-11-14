@@ -214,7 +214,7 @@ test("creator changes invalidate the cache and keep pending batches on their acc
     const next = { ...watcher, created_by_session: 'thread:project:work:ffff0000' };
     writeFileSync(configPath, JSON.stringify({ status: { threadId: next.created_by_session, projectId: 'work', origin: null, archived: false } }));
     queueEvent(watcher, state, 'held', false);
-    sealBatch(next, state);
+    if (state.batch) sealBatch(next, state);
     const same = sameDestination(watcher, next);
     const delivery = await deliver(next, 'second', key + ':2', state);
     return { ...delivery, same, state };
