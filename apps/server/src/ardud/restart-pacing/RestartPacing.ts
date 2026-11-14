@@ -18,6 +18,7 @@ import { RestartPacingStateError, type RestartSource } from "./RestartPacingStat
 
 const RECHECK_MS = 15_000;
 const MAX_RECHECK_MS = 60_000;
+const MAX_ORDER_RECHECK_MS = 100;
 const PASS_MS = 10_000;
 const MAX_LOAD_HOLD_MS = 20 * 60_000;
 // Allow the full load hold plus ten minutes for admission, but never let an
@@ -108,6 +109,7 @@ const make = Effect.gen(function* () {
       retryMs: number;
       position?: number;
       waitKey?: string;
+      orderWait?: { head: string; retryMs: number };
     }
   >();
   // A requeued run can outlive its settled start effect. Keep its load budget
@@ -168,7 +170,6 @@ const make = Effect.gen(function* () {
       admitted: true,
       hold: reservation.hold,
     });
-    activeCheckedAt = undefined;
   };
   const register = Effect.fn("RestartPacing.register")(function* (source: RestartSource) {
     const existing = pending.get(key(source));
@@ -179,6 +180,7 @@ const make = Effect.gen(function* () {
         // next promotion owns a new effect, but retains its elapsed load hold.
         delete replacement.position;
         delete replacement.waitKey;
+        delete replacement.orderWait;
         replacement.retryMs = RECHECK_MS;
         pending.set(key(source), replacement);
       }
@@ -322,12 +324,29 @@ const make = Effect.gen(function* () {
         });
       }
       if (position === 0) return RECHECK_MS;
+      // Async persistence lets claims reach the gate out of priority order.
+      // Retry promptly when that head advances, but back off if it stays stuck.
+      if (
+        position !== 1 &&
+        active.size < config.maxActive &&
+        spacing === 0 &&
+        (!loaded || entry.loadHoldMs >= MAX_LOAD_HOLD_MS)
+      ) {
+        const head = key(queue[0]!);
+        const retryMs =
+          entry.orderWait?.head === head
+            ? Math.min(MAX_ORDER_RECHECK_MS, entry.orderWait.retryMs * 2)
+            : 1;
+        entry.orderWait = { head, retryMs };
+        return retryMs;
+      }
       if (
         position !== 1 ||
         active.size >= config.maxActive ||
         spacing > 0 ||
         (loaded && entry.loadHoldMs < MAX_LOAD_HOLD_MS)
       ) {
+        delete entry.orderWait;
         const wait = {
           total: queue.length,
           active: active.size,
@@ -431,8 +450,16 @@ const make = Effect.gen(function* () {
       // Dispatch has finished even if its settlement read temporarily fails.
       // Later admissions must be able to re-check this reservation.
       reservation.dispatching = false;
-      activeCheckedAt = undefined;
-      if (!(yield* state.active(source))) {
+      // Successful per-holder progress must not make a burst rescan every
+      // earlier reservation. A failed check still needs a fresh global pass.
+      const stillStarting = yield* state.active(source).pipe(
+        Effect.onError(() =>
+          Effect.sync(() => {
+            activeCheckedAt = undefined;
+          }),
+        ),
+      );
+      if (!stillStarting) {
         releaseReservation(source, yield* Clock.currentTimeMillis);
       }
     },
