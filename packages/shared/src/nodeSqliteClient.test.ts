@@ -23,15 +23,157 @@ import { vi } from "vite-plus/test";
 import * as SqliteClient from "./nodeSqliteClient.ts";
 
 const startedWorkers = vi.hoisted((): Array<NodeWorkerThreads.Worker> => []);
+const writerWorkers = vi.hoisted((): Array<NodeWorkerThreads.Worker> => []);
+const checkpointOwners = vi.hoisted(
+  () => new WeakMap<NodeWorkerThreads.Worker, NodeWorkerThreads.Worker>(),
+);
 const silentWorkers = vi.hoisted(() => ({ on: false, readyOnTerminate: false }));
 const failingWorkers = vi.hoisted(() => ({ message: undefined as string | undefined }));
 const gatedWorker = vi.hoisted(() => ({ state: undefined as Int32Array | undefined }));
 
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof NodeWorkerThreads>();
+  const { EventEmitter } = await import("node:events");
+  const sqlite = await import("node:sqlite");
+  type BridgeMessage = {
+    readonly testCheckpoint: true;
+    readonly childId: number;
+    readonly kind: "create" | "postMessage" | "emit" | "terminated";
+    readonly args: unknown[];
+  };
+  class CheckpointProxy extends EventEmitter {
+    threadId: number;
+    constructor(
+      readonly writer: NodeWorkerThreads.Worker,
+      readonly childId: number,
+      threadId: number,
+    ) {
+      super();
+      this.threadId = threadId;
+      // Native Workers retain an error listener even when a test only awaits exit.
+      this.on("error", () => {});
+    }
+    send(kind: string, args: unknown[] = []) {
+      actual.Worker.prototype.postMessage.call(this.writer, {
+        testCheckpoint: true,
+        childId: this.childId,
+        kind,
+        args,
+      });
+    }
+    postMessage(...args: Parameters<NodeWorkerThreads.Worker["postMessage"]>) {
+      this.send("postMessage", args);
+    }
+    override emit(event: string | symbol, ...args: unknown[]) {
+      this.send("emit", [event, ...args]);
+      if (event === "exit") this.threadId = -1;
+      return super.emit(event, ...args);
+    }
+    terminate() {
+      if (this.threadId === -1) return Promise.resolve(0);
+      const terminated = new Promise<number>((resolve) => this.once("terminated", resolve));
+      this.send("terminate");
+      return terminated;
+    }
+  }
   class RecordedWorker extends actual.Worker {
+    readonly checkpoints = new Map<number, CheckpointProxy>();
     constructor(...args: ConstructorParameters<typeof actual.Worker>) {
-      if (gatedWorker.state !== undefined && typeof args[0] === "string") {
+      const writer = args[1]?.workerData?.cancelled !== undefined;
+      if (writer && typeof args[0] === "string") {
+        // The checkpoint belongs to the writer's thread. Bridge its real events
+        // through proxies so the race tests can still hold and release messages.
+        args = [
+          args[0]
+            .replace(
+              'const { parentPort, workerData, Worker } = require("node:worker_threads");',
+              `
+            const { parentPort, workerData, Worker: NativeWorker } = require("node:worker_threads");
+            const children = new Map();
+            let nextChild = 0;
+            let nextPause;
+            const pausedStatements = new Map();
+            const post = parentPort.postMessage.bind(parentPort);
+            const on = parentPort.on.bind(parentPort);
+            on("message", message => {
+              if (message?.cancel !== undefined) post({ testWriterCancel: message.cancel });
+              if (!message?.testCheckpoint) return;
+              if (message.kind === "arm") { nextPause = message.args[0]; return; }
+              if (message.kind === "resume") {
+                pausedStatements.get(message.args[0])?.();
+                pausedStatements.delete(message.args[0]);
+                return;
+              }
+              if (message.kind === "barrier") {
+                setImmediate(() => post({ testWriterBarrier: message.args[0] }));
+                return;
+              }
+              const child = children.get(message.childId);
+              if (!child) return;
+              if (message.kind === "emit") NativeWorker.prototype.emit.call(child, ...message.args);
+              if (message.kind === "postMessage") NativeWorker.prototype.postMessage.call(child, ...message.args);
+              if (message.kind === "terminate") child.terminate().then(code => post({
+                testCheckpoint: true, childId: message.childId, kind: "terminated", args: [code],
+              }));
+            });
+            parentPort.on = (event, listener) => on(event,
+              event === "message" ? message => { if (!message?.testCheckpoint) listener(message); } : listener);
+            const pauseStatement = async (point, id, sql, params) => {
+              if (nextPause?.point !== point || !sql.includes(nextPause.sql) ||
+                (nextPause.value !== undefined && params[0] !== nextPause.value)) return;
+              nextPause = undefined;
+              await new Promise(resolve => {
+                pausedStatements.set(id, resolve);
+                post({ testWriterPaused: id });
+              });
+            };
+            class Worker extends NativeWorker {
+              constructor(source, options) {
+                super(workerData.testSilent ? "setInterval(() => {}, 1 << 30);" :
+                  workerData.testFailure === undefined ? source :
+                    "throw new Error(" + JSON.stringify(workerData.testFailure) + ");", options);
+                this.childId = ++nextChild;
+                children.set(this.childId, this);
+                post({ testCheckpoint: true, childId: this.childId, kind: "create", args: [this.threadId] });
+              }
+              postMessage(...args) {
+                post({ testCheckpoint: true, childId: this.childId, kind: "postMessage", args });
+              }
+              emit(event, ...args) {
+                if (["message", "error", "exit"].includes(event)) {
+                  post({ testCheckpoint: true, childId: this.childId, kind: "emit", args: [event, ...args] });
+                  // Native Worker exit cleanup removes its terminate() listener
+                  // as soon as emit returns, so lifecycle events cannot be held.
+                  if (event !== "message") return super.emit(event, ...args);
+                  return true;
+                }
+                return super.emit(event, ...args);
+              }
+            }
+            if (!workerData.testAuthorizer) Object.defineProperty(
+              require("node:sqlite").DatabaseSync.prototype, "setAuthorizer", { value: undefined });
+            `,
+            )
+            .replace(
+              'if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");\n    const entry = cached',
+              'await pauseStatement("elected", id, sql, params);\n    if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");\n    const entry = cached',
+            )
+            .replace(
+              'if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");\n    operation = "execute";',
+              'await pauseStatement("resumed", id, sql, params);\n    if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");\n    operation = "execute";',
+            ),
+          {
+            ...args[1],
+            workerData: {
+              ...args[1]?.workerData,
+              testSilent: silentWorkers.on,
+              testFailure: failingWorkers.message,
+              testAuthorizer: typeof sqlite.DatabaseSync.prototype.setAuthorizer === "function",
+            },
+          },
+        ];
+      }
+      if (!writer && gatedWorker.state !== undefined && typeof args[0] === "string") {
         args = [
           `
           (() => {
@@ -57,13 +199,71 @@ vi.mock("node:worker_threads", async (importOriginal) => {
         gatedWorker.state = undefined;
       }
       super(
-        ...((silentWorkers.on
+        ...((!writer && silentWorkers.on
           ? ["setInterval(() => {}, 1 << 30);", { eval: true }]
-          : failingWorkers.message !== undefined
+          : !writer && failingWorkers.message !== undefined
             ? [`throw new Error(${JSON.stringify(failingWorkers.message)});`, { eval: true }]
             : args) as ConstructorParameters<typeof actual.Worker>),
       );
-      startedWorkers.push(this);
+      (writer ? writerWorkers : startedWorkers).push(this);
+    }
+    override emit(event: string | symbol, ...args: unknown[]) {
+      const message = args[0];
+      if (
+        event === "message" &&
+        message !== null &&
+        typeof message === "object" &&
+        "testWriterBarrier" in message
+      ) {
+        return super.emit("test-writer-barrier", message.testWriterBarrier);
+      }
+      if (
+        event === "message" &&
+        message !== null &&
+        typeof message === "object" &&
+        "testWriterPaused" in message
+      ) {
+        return super.emit("test-writer-paused", message.testWriterPaused);
+      }
+      if (
+        event === "message" &&
+        message !== null &&
+        typeof message === "object" &&
+        "testWriterCancel" in message
+      ) {
+        return super.emit("test-writer-cancel", message.testWriterCancel);
+      }
+      if (
+        event === "message" &&
+        message !== null &&
+        typeof message === "object" &&
+        "testCheckpoint" in message
+      ) {
+        const { childId, kind, args: values } = message as BridgeMessage;
+        if (kind === "create") {
+          const checkpoint = new CheckpointProxy(this, childId, Number(values[0]));
+          this.checkpoints.set(childId, checkpoint);
+          startedWorkers.push(checkpoint as unknown as NodeWorkerThreads.Worker);
+          checkpointOwners.set(checkpoint as unknown as NodeWorkerThreads.Worker, this);
+        } else {
+          const checkpoint = this.checkpoints.get(childId)!;
+          if (kind === "postMessage")
+            checkpoint.postMessage(
+              ...(values as Parameters<NodeWorkerThreads.Worker["postMessage"]>),
+            );
+          if (kind === "emit") {
+            if (values[0] === "message") checkpoint.emit("message", ...values.slice(1));
+            else {
+              if (values[0] === "exit") checkpoint.threadId = -1;
+              EventEmitter.prototype.emit.call(checkpoint, values[0] as string, ...values.slice(1));
+            }
+          }
+          if (kind === "terminated")
+            EventEmitter.prototype.emit.call(checkpoint, "terminated", ...values);
+        }
+        return true;
+      }
+      return super.emit(event, ...args);
     }
     override terminate() {
       // A "ready" already queued when termination starts reaches the parent before "exit".
@@ -73,6 +273,58 @@ vi.mock("node:worker_threads", async (importOriginal) => {
   }
   return { ...actual, Worker: RecordedWorker };
 });
+
+let writerBarrierId = 0;
+const flushWriterBridge = (worker = writerWorkers.at(-1)!) =>
+  new Promise<void>((resolve) => {
+    const id = ++writerBarrierId;
+    const onBarrier = (reply: number) => {
+      if (reply !== id) return;
+      worker.off("test-writer-barrier", onBarrier);
+      resolve();
+    };
+    worker.on("test-writer-barrier", onBarrier);
+    // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+    worker.postMessage({ testCheckpoint: true, kind: "barrier", args: [id] });
+  });
+const writerBridgeBarrier = (worker = writerWorkers.at(-1)!) =>
+  Effect.promise(() => flushWriterBridge(worker));
+
+const pauseWriterStatement = (
+  worker: NodeWorkerThreads.Worker,
+  point: "elected" | "resumed",
+  sql: string,
+  value?: number,
+) => {
+  let id: number | undefined;
+  const ready = new Promise<void>((resolve) =>
+    worker.once("test-writer-paused", (requestId: number) => {
+      id = requestId;
+      resolve();
+    }),
+  );
+  // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+  worker.postMessage({ testCheckpoint: true, kind: "arm", args: [{ point, sql, value }] });
+  return {
+    ready,
+    release() {
+      if (id === undefined) return;
+      // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+      worker.postMessage({ testCheckpoint: true, kind: "resume", args: [id] });
+      id = undefined;
+    },
+  };
+};
+
+const writerWaiting = (worker: NodeWorkerThreads.Worker) =>
+  new Promise<void>((resolve) => {
+    const onMessage = (message: unknown) => {
+      if (message === null || typeof message !== "object" || !("waiting" in message)) return;
+      worker.off("message", onMessage);
+      resolve();
+    };
+    worker.on("message", onMessage);
+  });
 
 const withReaderClient = <A, E>(
   use: (sql: SqlClient.SqlClient) => Effect.Effect<A, E, SqlClient.SqlClient>,
@@ -97,176 +349,252 @@ const countEntries = (sql: SqlClient.SqlClient) =>
     (rows) => rows[0]?.count,
   );
 
-const layer = it.layer(SqliteClient.layer({ filename: ":memory:" }));
+const walContractLayer = Layer.effect(
+  SqlClient.SqlClient,
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-sqlite-contract-" });
+    const context = yield* Layer.build(
+      SqliteClient.layer({
+        filename: path.join(directory, "state.sqlite"),
+        readerWorker: true,
+      }),
+    );
+    const sql = Context.get(context, SqlClient.SqlClient);
+    yield* sql`PRAGMA journal_mode = WAL`;
+    return sql;
+  }),
+).pipe(Layer.provide(NodeServices.layer));
 
-layer("NodeSqliteClient", (it) => {
-  it.effect(
-    "observes slow read/write metadata, including returning writes, without SQL or bindings",
-    () =>
-      Effect.gen(function* () {
-        const sql = yield* SqlClient.SqlClient;
-        const observed: SqliteClient.SqliteStatementObservation[] = [];
-        const observer: SqliteClient.SqliteStatementObserver = {
-          slowThresholdMs: 0,
-          record: (entry) =>
-            Effect.sync(() => {
-              observed.push(entry);
-            }),
-        };
-        yield* Effect.gen(function* () {
-          yield* sql`CREATE TABLE observed_statements(secret TEXT UNIQUE)`;
-          yield* sql`SELECT 1 AS result`;
-          yield* sql`WITH seed AS (SELECT 'private binding' AS value) INSERT INTO observed_statements SELECT value FROM seed RETURNING secret`;
-          yield* sql`INSERT INTO observed_statements VALUES ('private binding')`.pipe(Effect.exit);
-        }).pipe(
-          Effect.provideService(SqliteClient.StatementObserver, observer),
-          Effect.withSpan("ObservedService.query"),
-        );
-        assert.deepEqual(
-          observed.map((entry) => [entry.operation, entry.connection, entry.outcome]),
-          [
-            ["write", "writer", "success"],
-            ["read", "writer", "success"],
-            ["write", "writer", "success"],
-            ["write", "writer", "failure"],
-          ],
-        );
-        assert.isTrue(
-          observed.every((entry) => Number.isFinite(entry.durationMs) && entry.durationMs >= 0),
-        );
-        assert.isTrue(observed.every((entry) => entry.span === "ObservedService.query"));
-        assert.isTrue(observed.every((entry) => entry.waitMs === undefined || entry.waitMs >= 0));
-        assert.isFalse(JSON.stringify(observed).includes("private"));
-        assert.isFalse(JSON.stringify(observed).includes("observed_statements"));
-        yield* sql`SELECT 2`.pipe(
-          Effect.provideService(SqliteClient.StatementObserver, {
-            ...observer,
-            slowThresholdMs: Number.MAX_SAFE_INTEGER,
-          }),
-        );
-        assert.equal(observed.length, 4);
-        assert.deepEqual(
-          yield* sql`SELECT 3 AS result`.pipe(
+for (const [name, clientLayer] of [
+  ["NodeSqliteClient", SqliteClient.layer({ filename: ":memory:" })],
+  ["NodeSqliteClient WAL worker", walContractLayer],
+] as const) {
+  const layer = it.layer(clientLayer);
+  layer(name, (it) => {
+    it.effect(
+      "observes slow read/write metadata, including returning writes, without SQL or bindings",
+      () =>
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const observed: SqliteClient.SqliteStatementObservation[] = [];
+          const observer: SqliteClient.SqliteStatementObserver = {
+            slowThresholdMs: 0,
+            record: (entry) =>
+              Effect.sync(() => {
+                observed.push(entry);
+              }),
+          };
+          yield* Effect.gen(function* () {
+            yield* sql`CREATE TABLE observed_statements(secret TEXT UNIQUE)`;
+            yield* sql`SELECT 1 AS result`;
+            yield* sql`WITH seed AS (SELECT 'private binding' AS value) INSERT INTO observed_statements SELECT value FROM seed RETURNING secret`;
+            yield* sql`INSERT INTO observed_statements VALUES ('private binding')`.pipe(
+              Effect.exit,
+            );
+          }).pipe(
+            Effect.provideService(SqliteClient.StatementObserver, observer),
+            Effect.withSpan("ObservedService.query"),
+          );
+          assert.deepEqual(
+            observed.map((entry) => [entry.operation, entry.connection, entry.outcome]),
+            [
+              ["write", "writer", "success"],
+              ["read", "writer", "success"],
+              ["write", "writer", "success"],
+              ["write", "writer", "failure"],
+            ],
+          );
+          assert.isTrue(
+            observed.every((entry) => Number.isFinite(entry.durationMs) && entry.durationMs >= 0),
+          );
+          assert.isTrue(observed.every((entry) => entry.span === "ObservedService.query"));
+          assert.isTrue(observed.every((entry) => entry.waitMs === undefined || entry.waitMs >= 0));
+          assert.isFalse(JSON.stringify(observed).includes("private"));
+          assert.isFalse(JSON.stringify(observed).includes("observed_statements"));
+          yield* sql`SELECT 2`.pipe(
             Effect.provideService(SqliteClient.StatementObserver, {
-              slowThresholdMs: 0,
-              record: () => Effect.die("observer defect"),
+              ...observer,
+              slowThresholdMs: Number.MAX_SAFE_INTEGER,
             }),
-          ),
-          [{ result: 3 }],
-        );
-      }),
-  );
+          );
+          assert.equal(observed.length, 4);
+          assert.deepEqual(
+            yield* sql`SELECT 3 AS result`.pipe(
+              Effect.provideService(SqliteClient.StatementObserver, {
+                slowThresholdMs: 0,
+                record: () => Effect.die("observer defect"),
+              }),
+            ),
+            [{ result: 3 }],
+          );
+        }),
+    );
 
-  it.effect(
-    "observes only successful outer commits and keeps observer errors out of SQL results",
-    () =>
+    it.effect(
+      "observes only successful outer commits and keeps observer errors out of SQL results",
+      () =>
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          let commits = 0;
+          yield* sql`CREATE TABLE observed_commits(value TEXT)`;
+          const observe = () => {
+            commits += 1;
+          };
+          yield* sql
+            .withTransaction(
+              Effect.gen(function* () {
+                yield* sql`INSERT INTO observed_commits VALUES ('outer')`;
+                yield* sql.withTransaction(sql`INSERT INTO observed_commits VALUES ('nested')`);
+                assert.equal(commits, 0);
+              }),
+            )
+            .pipe(Effect.provideService(SqliteClient.TransactionCommitObserver, observe));
+          assert.equal(commits, 1);
+          yield* sql
+            .withTransaction(
+              sql`INSERT INTO observed_commits VALUES ('rolled back')`.pipe(
+                Effect.andThen(Effect.fail("rollback")),
+              ),
+            )
+            .pipe(
+              Effect.provideService(SqliteClient.TransactionCommitObserver, observe),
+              Effect.result,
+            );
+          assert.equal(commits, 1);
+          yield* sql
+            .withTransaction(sql`INSERT INTO observed_commits VALUES ('observer throws')`)
+            .pipe(
+              Effect.provideService(SqliteClient.TransactionCommitObserver, () => {
+                throw new Error("observer");
+              }),
+            );
+          assert.deepEqual(yield* sql`SELECT value FROM observed_commits`, [
+            { value: "outer" },
+            { value: "nested" },
+            { value: "observer throws" },
+          ]);
+        }),
+    );
+    it.effect("retries preparing a query after the missing schema becomes available", () =>
       Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
-        let commits = 0;
-        yield* sql`CREATE TABLE observed_commits(value TEXT)`;
-        const observe = () => {
-          commits += 1;
-        };
-        yield* sql
-          .withTransaction(
-            Effect.gen(function* () {
-              yield* sql`INSERT INTO observed_commits VALUES ('outer')`;
-              yield* sql.withTransaction(sql`INSERT INTO observed_commits VALUES ('nested')`);
-              assert.equal(commits, 0);
-            }),
-          )
-          .pipe(Effect.provideService(SqliteClient.TransactionCommitObserver, observe));
-        assert.equal(commits, 1);
-        yield* sql
-          .withTransaction(
-            sql`INSERT INTO observed_commits VALUES ('rolled back')`.pipe(
-              Effect.andThen(Effect.fail("rollback")),
-            ),
-          )
-          .pipe(
-            Effect.provideService(SqliteClient.TransactionCommitObserver, observe),
-            Effect.result,
-          );
-        assert.equal(commits, 1);
-        yield* sql
-          .withTransaction(sql`INSERT INTO observed_commits VALUES ('observer throws')`)
-          .pipe(
-            Effect.provideService(SqliteClient.TransactionCommitObserver, () => {
-              throw new Error("observer");
-            }),
-          );
-        assert.deepEqual(yield* sql`SELECT value FROM observed_commits`, [
-          { value: "outer" },
-          { value: "nested" },
-          { value: "observer throws" },
-        ]);
+        const select = sql<{ name: string }>`SELECT name FROM created_after_prepare_failure`;
+        const error = yield* select.pipe(Effect.flip);
+        assert.equal(error._tag, "SqlError");
+        assert.equal(error.reason.operation, "prepare");
+
+        yield* sql`CREATE TABLE created_after_prepare_failure(name TEXT NOT NULL)`;
+        yield* sql`INSERT INTO created_after_prepare_failure VALUES ('recovered')`;
+        assert.deepEqual(yield* select, [{ name: "recovered" }]);
+        assert.deepEqual(yield* select.values, [["recovered"]]);
       }),
-  );
-  it.effect("retries preparing a query after the missing schema becomes available", () =>
-    Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
-      const select = sql<{ name: string }>`SELECT name FROM created_after_prepare_failure`;
-      const error = yield* select.pipe(Effect.flip);
-      assert.equal(error._tag, "SqlError");
-      assert.equal(error.reason.operation, "prepare");
+    );
 
-      yield* sql`CREATE TABLE created_after_prepare_failure(name TEXT NOT NULL)`;
-      yield* sql`INSERT INTO created_after_prepare_failure VALUES ('recovered')`;
-      assert.deepEqual(yield* select, [{ name: "recovered" }]);
-      assert.deepEqual(yield* select.values, [["recovered"]]);
-    }),
-  );
+    it.effect("runs prepared queries and returns positional values", () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
 
-  it.effect("runs prepared queries and returns positional values", () =>
-    Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE entries(id INTEGER PRIMARY KEY, name TEXT NOT NULL)`;
+        yield* sql`INSERT INTO entries(name) VALUES (${"alpha"}), (${"beta"})`;
 
-      yield* sql`CREATE TABLE entries(id INTEGER PRIMARY KEY, name TEXT NOT NULL)`;
-      yield* sql`INSERT INTO entries(name) VALUES (${"alpha"}), (${"beta"})`;
-
-      const rows = yield* sql<{ readonly id: number; readonly name: string }>`
+        const rows = yield* sql<{ readonly id: number; readonly name: string }>`
       SELECT id, name FROM entries ORDER BY id
     `;
-      assert.equal(rows.length, 2);
-      assert.equal(rows[0]?.name, "alpha");
-      assert.equal(rows[1]?.name, "beta");
+        assert.equal(rows.length, 2);
+        assert.equal(rows[0]?.name, "alpha");
+        assert.equal(rows[1]?.name, "beta");
 
-      const values = yield* sql`SELECT id, name FROM entries ORDER BY id`.values;
-      assert.equal(values.length, 2);
-      assert.equal(values[0]?.[1], "alpha");
-      assert.equal(values[1]?.[1], "beta");
+        const values = yield* sql`SELECT id, name FROM entries ORDER BY id`.values;
+        assert.equal(values.length, 2);
+        assert.equal(values[0]?.[1], "alpha");
+        assert.equal(values[1]?.[1], "beta");
 
-      const unpreparedValues = yield* sql`SELECT id, name FROM entries ORDER BY id`
-        .valuesUnprepared;
-      assert.deepEqual(unpreparedValues, values);
-    }),
-  );
+        const unpreparedValues = yield* sql`SELECT id, name FROM entries ORDER BY id`
+          .valuesUnprepared;
+        assert.deepEqual(unpreparedValues, values);
+      }),
+    );
 
-  it.effect("returns a typed failure when an unprepared statement cannot be prepared", () =>
-    Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
-      const error = yield* Effect.flip(sql.unsafe("SELECT FROM").unprepared);
+    it.effect("preserves raw results, blobs and safe integers across execution paths", () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE raw_entries(id INTEGER PRIMARY KEY, payload BLOB)`;
+        const payload = new Uint8Array([0, 127, 255]);
+        const result = yield* sql`INSERT INTO raw_entries(payload) VALUES (${payload})`.raw;
+        assert.include(result, { changes: 1, lastInsertRowid: 1 });
+        assert.deepEqual(yield* sql`SELECT payload FROM raw_entries`.unprepared, [{ payload }]);
+        for (const query of [
+          sql`SELECT id, payload FROM raw_entries`.values,
+          sql`SELECT id, payload FROM raw_entries`.valuesUnprepared,
+        ]) {
+          assert.deepEqual(yield* query.pipe(Effect.provideService(SqlClient.SafeIntegers, true)), [
+            [1n, payload],
+          ]);
+          assert.deepEqual(yield* query, [[1, payload]]);
+        }
+        assert.deepEqual(
+          yield* sql`SELECT ${9007199254740993n} AS large`.pipe(
+            Effect.provideService(SqlClient.SafeIntegers, true),
+          ),
+          [{ large: 9007199254740993n }],
+        );
+        for (const binding of [{ $value: "named" }, Object.assign(() => {}, { $value: "named" })]) {
+          assert.deepEqual(yield* sql.unsafe("SELECT length($value) AS size", [binding]), [
+            { size: 5 },
+          ]);
+        }
+      }),
+    );
 
-      assert.equal(error._tag, "SqlError");
-      assert.equal(error.reason.operation, "prepare");
-    }),
-  );
+    it.effect("rolls back a nested savepoint while allowing its outer transaction to commit", () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE savepoints(value TEXT)`;
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`INSERT INTO savepoints VALUES ('outer')`;
+            yield* sql
+              .withTransaction(
+                sql`INSERT INTO savepoints VALUES ('nested')`.pipe(
+                  Effect.andThen(Effect.fail("rollback nested")),
+                ),
+              )
+              .pipe(Effect.ignore);
+            assert.deepEqual(yield* sql`SELECT value FROM savepoints`, [{ value: "outer" }]);
+          }),
+        );
+        assert.deepEqual(yield* sql`SELECT value FROM savepoints`, [{ value: "outer" }]);
+      }),
+    );
 
-  it.effect("classifies constraint failures by their SQLite result code", () =>
-    Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
-      yield* sql`CREATE TABLE constrained(name TEXT NOT NULL UNIQUE)`;
-      yield* sql`INSERT INTO constrained VALUES ('taken')`;
+    it.effect("returns a typed failure when an unprepared statement cannot be prepared", () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const error = yield* Effect.flip(sql.unsafe("SELECT FROM").unprepared);
 
-      const duplicate = yield* sql`INSERT INTO constrained VALUES ('taken')`.pipe(Effect.flip);
-      assert(duplicate.reason._tag === "UniqueViolation");
-      assert.equal(duplicate.reason.constraint, "constrained.name");
+        assert.equal(error._tag, "SqlError");
+        assert.equal(error.reason.operation, "prepare");
+      }),
+    );
 
-      const missing = yield* sql`INSERT INTO constrained VALUES (NULL)`.pipe(Effect.flip);
-      assert.equal(missing.reason._tag, "ConstraintError");
-    }),
-  );
-});
+    it.effect("classifies constraint failures by their SQLite result code", () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE constrained(name TEXT NOT NULL UNIQUE)`;
+        yield* sql`INSERT INTO constrained VALUES ('taken')`;
+
+        const duplicate = yield* sql`INSERT INTO constrained VALUES ('taken')`.pipe(Effect.flip);
+        assert(duplicate.reason._tag === "UniqueViolation");
+        assert.equal(duplicate.reason.constraint, "constrained.name");
+
+        const missing = yield* sql`INSERT INTO constrained VALUES (NULL)`.pipe(Effect.flip);
+        assert.equal(missing.reason._tag, "ConstraintError");
+      }),
+    );
+  });
+}
 
 it.effect("observes worker-reader statements with their lane and no query content", () =>
   withReaderClient((sql) =>
@@ -890,7 +1218,8 @@ const withFileClient = <A, E>(
   setup: (
     sql: SqlClient.SqlClient,
     filename: string,
-  ) => Effect.Effect<A, E, SqlClient.SqlClient | FileSystem.FileSystem>,
+  ) => Effect.Effect<A, E, SqlClient.SqlClient | FileSystem.FileSystem | Scope.Scope>,
+  options: Omit<Partial<SqliteClient.SqliteClientConfig>, "filename"> = {},
 ) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -899,7 +1228,7 @@ const withFileClient = <A, E>(
     const filename = path.join(directory, "state.sqlite");
     return yield* Effect.gen(function* () {
       return yield* setup(yield* SqlClient.SqlClient, filename);
-    }).pipe(Effect.provide(SqliteClient.layer({ filename, readerWorker: true })));
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, readerWorker: true, ...options })));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 it.effect("uses the writer when the reader cannot open the database", () =>
@@ -1098,6 +1427,7 @@ const withCheckpointClient = <A, E>(
   options: {
     readonly readerWorker?: boolean;
     readonly checkpointWorkerStart?: Effect.Effect<void>;
+    readonly errorObserver?: SqliteClient.SqliteClientConfig["errorObserver"];
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -1108,6 +1438,7 @@ const withCheckpointClient = <A, E>(
     return yield* Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* sql`PRAGMA journal_mode = WAL`;
+      yield* writerBridgeBarrier();
       return yield* use(sql, filename);
     }).pipe(Effect.provide(SqliteClient.layer({ filename, checkpointWorker: true, ...options })));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
@@ -1127,15 +1458,17 @@ const checkpointWorkerReply = (worker: NodeWorkerThreads.Worker) =>
         let replies = 0;
         const onReply = (reply: unknown) => {
           if (reply !== "barrier") return;
-          if (++replies < 2) {
-            // One checkpoint response may queue a coalesced follow-up behind the first barrier.
-            // A second barrier observes that follow-up and makes the helper deterministic.
-            // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
-            worker.postMessage("barrier");
-            return;
-          }
-          worker.off("message", onReply);
-          resolve();
+          // Flush controller deliveries and their resulting sends before the next
+          // barrier, which otherwise could overtake a coalesced check in the bridge.
+          void flushWriterBridge(checkpointOwners.get(worker)).then(() => {
+            if (++replies < 2) {
+              // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+              worker.postMessage("barrier");
+            } else {
+              worker.off("message", onReply);
+              resolve();
+            }
+          });
         };
         worker.on("message", onReply);
         // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
@@ -1218,60 +1551,49 @@ const holdWorkerMessage = (worker: NodeWorkerThreads.Worker, type: string) => {
   };
 };
 
-const schedulerHoldingDispatch = (afterResume = false) => {
-  let resuming = false;
-  let yielded = false;
-  let resolveContinuation = () => {};
-  const continuation = new Promise<void>((resolve) => {
-    resolveContinuation = resolve;
+const holdWriterReply = (worker: NodeWorkerThreads.Worker, sql: RegExp) => {
+  const send = worker.postMessage.bind(worker);
+  const emit = worker.emit.bind(worker) as (event: string | symbol, ...args: unknown[]) => boolean;
+  let id: number | undefined;
+  let held: unknown;
+  let resolve = (_reply: unknown) => {};
+  const ready = new Promise<unknown>((done) => {
+    resolve = done;
   });
-  let holdNext = false;
-  let heldTask: (() => void) | undefined;
-  let resolvePaused: () => void = () => {};
-  const paused = new Promise<void>((resolve) => {
-    resolvePaused = resolve;
+  const sent = vi.spyOn(worker, "postMessage").mockImplementation((...args) => {
+    const message = args[0] as { sql?: string; id?: number };
+    if (id === undefined && typeof message.sql === "string" && sql.test(message.sql))
+      id = message.id;
+    send(...args);
   });
-  const mixed = new Scheduler.MixedScheduler("async", (task) => {
-    if (holdNext) {
-      holdNext = false;
-      heldTask = task;
-      if (resuming) resolveContinuation();
-      else resolvePaused();
-      return () => {
-        if (heldTask === task) heldTask = undefined;
-      };
+  const received = vi.spyOn(worker, "emit").mockImplementation((event, ...args) => {
+    const reply = args[0];
+    if (
+      event === "message" &&
+      id !== undefined &&
+      reply !== null &&
+      typeof reply === "object" &&
+      "id" in reply &&
+      reply.id === id
+    ) {
+      held = reply;
+      resolve(reply);
+      return true;
     }
-    const immediate = setImmediate(task);
-    return () => clearImmediate(immediate);
+    return emit(event, ...args);
   });
-  const scheduler: Scheduler.Scheduler = {
-    executionMode: mixed.executionMode,
-    makeDispatcher: () => mixed.makeDispatcher(),
-    shouldYield: () => {
-      if (resuming && afterResume && !yielded) {
-        yielded = true;
-        holdNext = true;
-        return true;
-      }
-      return false;
-    },
+  const discard = () => {
+    sent.mockRestore();
+    received.mockRestore();
+    held = undefined;
   };
   return {
-    scheduler,
-    paused,
-    continuation,
-    arm() {
-      holdNext = true;
-    },
-    resume() {
-      const task = heldTask;
-      heldTask = undefined;
-      if (task !== undefined)
-        setImmediate(() => {
-          resuming = true;
-          task();
-          resuming = false;
-        });
+    ready,
+    discard,
+    deliver() {
+      const reply = held;
+      discard();
+      if (reply !== undefined) emit("message", reply);
     },
   };
 };
@@ -1321,6 +1643,7 @@ const blockCheckpointBehindReader = (
       WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1200)
       INSERT INTO pages(payload) SELECT randomblob(4000) FROM n
     `).unprepared;
+    yield* writerBridgeBarrier();
 
     const request = checkpointRequests.queued[0]?.[0];
     assert(typeof request === "object" && request !== null && "id" in request);
@@ -1392,6 +1715,7 @@ it.effect("keeps WAL backpressure active before startup activation", () =>
           (db) => Effect.sync(() => db.close()),
         );
         assert.isAtLeast(readCheckpointState(observer).log, 10000);
+        yield* writerBridgeBarrier();
         assert.isAbove(requests.queued.length, 0);
         const mutation = yield* sql`INSERT INTO pages VALUES ('after checkpoint')`.pipe(
           Effect.forkChild,
@@ -1415,6 +1739,10 @@ it.effect("checkpoints the WAL on the worker instead of the writer", () =>
       const worker = startedWorkers.at(-1)!;
       const checkpointRequests = pauseCheckpointRequests(worker);
       yield* Effect.addFinalizer(() => Effect.sync(checkpointRequests.release));
+      const replies: unknown[] = [];
+      const onReply = (reply: unknown) => replies.push(reply);
+      worker.on("message", onReply);
+      yield* Effect.addFinalizer(() => Effect.sync(() => worker.off("message", onReply)));
       const limit = 1024 * 1024;
       yield* sql.unsafe(`PRAGMA journal_size_limit = ${limit}`);
       const autocheckpoint = yield* sql<{
@@ -1435,6 +1763,8 @@ it.effect("checkpoints the WAL on the worker instead of the writer", () =>
       }>`PRAGMA wal_checkpoint(NOOP)`;
       assert.isAbove(pending[0]!.log, 1000);
       assert.isBelow(pending[0]!.checkpointed, pending[0]!.log);
+      yield* writerBridgeBarrier();
+      const requests = checkpointRequests.queued.map(([request]) => request);
       checkpointRequests.release();
       yield* checkpointWorkerReply(worker);
       const wal = yield* sql<{
@@ -1443,7 +1773,11 @@ it.effect("checkpoints the WAL on the worker instead of the writer", () =>
       }>`PRAGMA wal_checkpoint(NOOP)`;
       assert.isAtMost(wal[0]!.log - wal[0]!.checkpointed, 1000);
 
-      assert.isAtMost(yield* walSize, limit);
+      assert.isAtMost(
+        yield* walSize,
+        limit,
+        JSON.stringify({ requests, replies, limit: yield* sql`PRAGMA journal_size_limit` }),
+      );
       yield* sql`INSERT INTO pages(payload) VALUES (x'00')`;
       assert.isAtMost(yield* walSize, limit);
     }),
@@ -1472,6 +1806,7 @@ it.effect.skipIf(!supportsNoopCheckpoint)(
           WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1200)
           INSERT INTO pages(payload) SELECT randomblob(4000) FROM n
         `).unprepared;
+        yield* writerBridgeBarrier();
         checkpointRequests.sendNext();
         const pending = yield* Effect.promise(() => truncateRequest.ready);
         assert(typeof pending === "object" && pending !== null && "generation" in pending);
@@ -1533,7 +1868,7 @@ it.effect("warns once and hands checkpoints back when the worker fails at startu
           assert.equal(autocheckpoint[0]?.wal_autocheckpoint, 1000);
           assert.deepEqual(warnings, [
             [
-              "SQLite checkpoint worker unavailable; checkpoints run on the main connection",
+              "SQLite checkpoint worker unavailable; checkpoints run on the writer connection",
               { reason },
             ],
           ]);
@@ -1711,6 +2046,7 @@ it.effect.each([false, true])(
           WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1200)
           INSERT INTO pages(payload) SELECT zeroblob(4000) FROM n
         `;
+        yield* writerBridgeBarrier();
         // Reading before PASSIVE pins the last WAL frame even when every frame is copied.
         reader.exec("BEGIN");
         assert.equal(reader.prepare("SELECT COUNT(*) AS count FROM pages").get()?.count, 1200);
@@ -1892,40 +2228,38 @@ it.effect.each([
               connection
                 ? connection.executeUnprepared("INSERT INTO entries VALUES (?)", [value], undefined)
                 : sql`INSERT INTO entries VALUES (${value})`;
-            const scheduled = schedulerHoldingDispatch(stage === "resumed");
-            yield* Effect.addFinalizer(() => Effect.sync(scheduled.resume));
-            const first = yield* Effect.forkChild(
-              insert(1).pipe(Effect.provideService(Scheduler.Scheduler, scheduled.scheduler)),
-              { startImmediately: true },
-            );
+            const writer = writerWorkers.at(-1)!;
+            const pause =
+              stage === "queued"
+                ? undefined
+                : pauseWriterStatement(writer, stage, "INSERT INTO entries", 1);
+            if (pause) yield* Effect.addFinalizer(() => Effect.sync(pause.release));
+            const waiting = stage === "elected" ? pause!.ready : writerWaiting(writer);
+            const first = yield* Effect.forkChild(insert(1), { startImmediately: true });
             const second = yield* Effect.forkChild(insert(2), { startImmediately: true });
-            yield* eventLoopTurn;
+            yield* Effect.promise(() => waiting);
             assert.isUndefined(first.pollUnsafe());
             assert.isUndefined(second.pollUnsafe());
             if (stage !== "queued") {
-              scheduled.arm();
-              const truncated = waitForTruncateCompletion(worker);
               checkpointRequests.release();
               reader.exec("ROLLBACK");
-              yield* Effect.promise(() => truncated);
-              yield* Effect.promise(() => scheduled.paused);
-              if (stage === "resumed") {
-                scheduled.resume();
-                yield* Effect.promise(() => scheduled.continuation);
-              }
+              yield* checkpointWorkerReply(worker);
+              yield* Effect.promise(() => pause!.ready);
             }
-            yield* Fiber.interrupt(first);
-            scheduled.resume();
+            const cancelled = new Promise<void>((resolve) =>
+              writer.once("test-writer-cancel", () => resolve()),
+            );
+            const interrupted = yield* Effect.forkChild(Fiber.interrupt(first), {
+              startImmediately: true,
+            });
+            yield* Effect.promise(() => cancelled);
+            pause?.release();
+            yield* Fiber.join(interrupted);
             if (stage === "queued") {
               reader.exec("ROLLBACK");
               checkpointRequests.release();
               yield* checkpointWorkerReply(worker);
             }
-            yield* eventLoopTurn;
-            assert.isDefined(
-              second.pollUnsafe(),
-              "cancellation must hand off without waiting for a later checkpoint",
-            );
             yield* Fiber.join(second);
           }),
         );
@@ -2507,4 +2841,399 @@ it.effect("keeps statement metrics opt-in with explicit configuration taking pre
       );
     }
   }),
+);
+
+it.effect(
+  "keeps memory databases on their local connection with both worker options enabled",
+  () => {
+    const readersBefore = startedWorkers.length;
+    const writersBefore = writerWorkers.length;
+    return Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TEMP TABLE memory_state(value INTEGER)`;
+      yield* sql.withTransaction(sql`INSERT INTO memory_state VALUES (1)`);
+      assert.deepEqual(yield* sql`SELECT value FROM memory_state`.pipe(SqliteClient.readOnly), [
+        { value: 1 },
+      ]);
+      assert.deepEqual(yield* sql`PRAGMA journal_mode`, [{ journal_mode: "memory" }]);
+      assert.equal(startedWorkers.length, readersBefore);
+      assert.equal(writerWorkers.length, writersBefore);
+    }).pipe(
+      Effect.provide(
+        SqliteClient.layer({ filename: ":memory:", readerWorker: true, checkpointWorker: true }),
+      ),
+    );
+  },
+);
+
+it.effect(
+  "keeps worker statement metrics opt-in with explicit configuration taking precedence",
+  () =>
+    Effect.gen(function* () {
+      for (const [option, env, expected] of [
+        [undefined, {}, false],
+        [undefined, { ROBOB_SQL_STATEMENT_METRICS: "true" }, true],
+        [false, { ROBOB_SQL_STATEMENT_METRICS: "true" }, false],
+        [true, {}, true],
+      ] as const) {
+        const spans: Array<Tracer.NativeSpan> = [];
+        const tracer = Tracer.make({
+          span: (options) => {
+            const span = new Tracer.NativeSpan(options);
+            spans.push(span);
+            return span;
+          },
+        });
+        yield* withFileClient(
+          (sql) =>
+            Effect.gen(function* () {
+              yield* sql`PRAGMA journal_mode=WAL`;
+              yield* sql`CREATE TABLE metrics(value INTEGER)`;
+              yield* sql`INSERT INTO metrics VALUES (1)`;
+              assert.deepEqual(yield* sql`SELECT value FROM metrics`, [{ value: 1 }]);
+            }),
+          { statementMetrics: option },
+        ).pipe(
+          Effect.provideService(Statement.SpanPropagationEnabled, true),
+          Effect.withTracer(tracer),
+          Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env }))),
+        );
+        assert.equal(
+          spans.some((span) => span.attributes.has("db.commit.at_ms")),
+          expected,
+        );
+        assert.equal(
+          spans.some((span) => span.attributes.has("db.rows_returned")),
+          expected,
+        );
+      }
+    }),
+);
+
+it.effect("keeps an ordinary file on its local connection until a WAL client opens it", () => {
+  const writersBefore = writerWorkers.length;
+  return withFileClient(
+    (sql) =>
+      Effect.gen(function* () {
+        yield* sql`CREATE TABLE local_state(value INTEGER)`;
+        yield* sql.withTransaction(sql`INSERT INTO local_state VALUES (1)`);
+        assert.deepEqual(yield* sql`SELECT value FROM local_state`, [{ value: 1 }]);
+        assert.deepEqual(yield* sql`PRAGMA journal_mode`, [{ journal_mode: "delete" }]);
+        assert.equal(writerWorkers.length, writersBefore);
+      }),
+    { readerWorker: false },
+  );
+});
+
+it.effect.each([
+  "PRAGMA journal_mode=WAL",
+  "PRAGMA main.journal_mode='wal'",
+  'PRAGMA "main"."journal_mode"(\'wal\')',
+  "/* enable WAL */ PRAGMA journal_mode = WAL",
+])("starts and closes the nested checkpoint for WAL activation (%s)", (pragma) => {
+  const checkpointsBefore = startedWorkers.length;
+  let checkpoint: NodeWorkerThreads.Worker | undefined;
+  let writer: NodeWorkerThreads.Worker | undefined;
+  return withFileClient(
+    (sql) =>
+      Effect.gen(function* () {
+        writer = writerWorkers.at(-1)!;
+        assert.equal(startedWorkers.length, checkpointsBefore);
+        yield* sql.unsafe(pragma).unprepared;
+        yield* writerBridgeBarrier(writer);
+        assert.equal(startedWorkers.length, checkpointsBefore + 1);
+        checkpoint = startedWorkers.at(-1)!;
+        assert.strictEqual(checkpointOwners.get(checkpoint), writer);
+        assert.deepEqual(yield* sql`PRAGMA wal_autocheckpoint`, [{ wal_autocheckpoint: 0 }]);
+        assert.deepEqual(yield* sql`PRAGMA synchronous`, [{ synchronous: 2 }]);
+        yield* sql`CREATE TABLE checkpoint_state(value INTEGER)`;
+        yield* sql.withTransaction(sql`INSERT INTO checkpoint_state VALUES (1)`);
+        assert.deepEqual(yield* sql`SELECT value FROM checkpoint_state`, [{ value: 1 }]);
+      }),
+    { readerWorker: false, checkpointWorker: true },
+  ).pipe(
+    Effect.tap(() =>
+      Effect.sync(() => {
+        assert.equal(checkpoint?.threadId, -1);
+        assert.equal(writer?.threadId, -1);
+      }),
+    ),
+  );
+});
+
+it.effect("observes a commit only after the writer acknowledgement is delivered", () =>
+  withFileClient((sql, filename) =>
+    Effect.gen(function* () {
+      yield* sql`PRAGMA journal_mode=WAL`;
+      yield* sql`CREATE TABLE ack_entries(value INTEGER)`;
+      const observer = yield* openDatabase(filename);
+      const writer = writerWorkers.at(-1)!;
+      const held = holdWriterReply(writer, /^COMMIT$/i);
+      yield* Effect.addFinalizer(() => Effect.sync(held.deliver));
+      let commits = 0;
+      const transaction = yield* sql.withTransaction(sql`INSERT INTO ack_entries VALUES (1)`).pipe(
+        Effect.provideService(SqliteClient.TransactionCommitObserver, () => {
+          commits++;
+        }),
+        Effect.forkChild,
+      );
+      yield* Effect.promise(() => held.ready);
+      assert.equal(observer.prepare("SELECT COUNT(*) AS count FROM ack_entries").get()?.count, 1);
+      assert.equal(commits, 0);
+      assert.isUndefined(transaction.pollUnsafe());
+      held.deliver();
+      yield* Fiber.join(transaction);
+      assert.equal(commits, 1);
+      yield* sql.withTransaction(sql`INSERT INTO ack_entries VALUES (2)`).pipe(
+        Effect.provideService(SqliteClient.TransactionCommitObserver, () => {
+          throw new Error("observer");
+        }),
+      );
+      assert.deepEqual(yield* sql`SELECT value FROM ack_entries ORDER BY value`.values, [[1], [2]]);
+    }),
+  ),
+);
+
+it.effect.each([false, true])(
+  "holds the writer permit until an interrupted statement acknowledges completion (transaction=%s)",
+  (transactional) =>
+    withFileClient((sql, filename) =>
+      Effect.gen(function* () {
+        yield* sql`PRAGMA journal_mode=WAL`;
+        yield* sql`CREATE TABLE inflight_entries(value INTEGER)`;
+        const writer = writerWorkers.at(-1)!;
+        const held = holdWriterReply(writer, /^INSERT INTO inflight_entries/);
+        yield* Effect.addFinalizer(() => Effect.sync(held.deliver));
+        const insert = sql`INSERT INTO inflight_entries VALUES (1)`;
+        const work = yield* (transactional ? sql.withTransaction(insert) : insert).pipe(
+          Effect.forkChild,
+        );
+        yield* Effect.promise(() => held.ready);
+        const cancelled = new Promise<void>((resolve) =>
+          writer.once("test-writer-cancel", () => resolve()),
+        );
+        const interrupt = yield* Effect.forkChild(Fiber.interrupt(work), {
+          startImmediately: true,
+        });
+        yield* Effect.promise(() => cancelled);
+        const next = yield* Effect.forkChild(sql`INSERT INTO inflight_entries VALUES (2)`, {
+          startImmediately: true,
+        });
+        yield* writerBridgeBarrier(writer);
+        assert.isUndefined(interrupt.pollUnsafe());
+        assert.isUndefined(next.pollUnsafe());
+        const observer = yield* openDatabase(filename);
+        assert.equal(
+          observer.prepare("SELECT COUNT(*) AS count FROM inflight_entries").get()?.count,
+          transactional ? 0 : 1,
+        );
+        held.deliver();
+        yield* Fiber.join(interrupt);
+        yield* Fiber.join(next);
+        assert.deepEqual(
+          yield* sql`SELECT value FROM inflight_entries ORDER BY value`.values,
+          transactional ? [[2]] : [[1], [2]],
+        );
+      }),
+    ),
+);
+
+it.effect(
+  "poisons a crashed writer transaction and recovers only through a fresh client layer",
+  () =>
+    withFileClient((sql, filename) =>
+      Effect.gen(function* () {
+        yield* sql`PRAGMA journal_mode=WAL`;
+        yield* sql`CREATE TABLE crash_entries(value INTEGER)`;
+        yield* sql`INSERT INTO crash_entries VALUES (1)`;
+        const writer = writerWorkers.at(-1)!;
+        const count = writerWorkers.length;
+        const failed = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`INSERT INTO crash_entries VALUES (2)`;
+              yield* Effect.promise(() => writer.terminate());
+              return yield* sql`SELECT value FROM crash_entries`;
+            }),
+          )
+          .pipe(Effect.flip);
+        assert.equal(failed._tag, "SqlError");
+        assert.include(String(failed.reason.cause), "outcome may be unknown");
+        const unavailable = yield* sql`INSERT INTO crash_entries VALUES (3)`.pipe(Effect.flip);
+        assert.include(String(unavailable.reason.cause), "outcome may be unknown");
+        assert.equal(writerWorkers.length, count);
+        yield* Effect.gen(function* () {
+          const fresh = yield* SqlClient.SqlClient;
+          assert.equal(writerWorkers.length, count + 1);
+          assert.deepEqual(yield* fresh`SELECT value FROM crash_entries`.values, [[1]]);
+          yield* fresh.withTransaction(fresh`INSERT INTO crash_entries VALUES (4)`);
+          assert.deepEqual(yield* fresh`SELECT value FROM crash_entries ORDER BY value`.values, [
+            [1],
+            [4],
+          ]);
+        }).pipe(Effect.provide(SqliteClient.layer({ filename })));
+      }),
+    ),
+);
+
+it.effect("does not replay a committed transaction whose acknowledgement was lost", () =>
+  withFileClient((sql, filename) =>
+    Effect.gen(function* () {
+      yield* sql`PRAGMA journal_mode=WAL`;
+      yield* sql`CREATE TABLE lost_ack(value INTEGER)`;
+      const writer = writerWorkers.at(-1)!;
+      const count = writerWorkers.length;
+      const held = holdWriterReply(writer, /^COMMIT$/i);
+      yield* Effect.addFinalizer(() => Effect.sync(held.discard));
+      let commits = 0;
+      const transaction = yield* sql.withTransaction(sql`INSERT INTO lost_ack VALUES (1)`).pipe(
+        Effect.provideService(SqliteClient.TransactionCommitObserver, () => {
+          commits++;
+        }),
+        Effect.flip,
+        Effect.forkChild,
+      );
+      yield* Effect.promise(() => held.ready);
+      const observer = yield* openDatabase(filename);
+      assert.equal(observer.prepare("SELECT COUNT(*) AS count FROM lost_ack").get()?.count, 1);
+      held.discard();
+      yield* Effect.promise(() => writer.terminate());
+      const failure = yield* Fiber.join(transaction);
+      assert.include(String(failure.reason.cause), "outcome may be unknown");
+      assert.equal(commits, 0);
+      assert.equal(writerWorkers.length, count);
+      yield* Effect.gen(function* () {
+        const fresh = yield* SqlClient.SqlClient;
+        assert.deepEqual(yield* fresh`SELECT value FROM lost_ack`.values, [[1]]);
+        yield* fresh`INSERT INTO lost_ack VALUES (2)`;
+        assert.deepEqual(yield* fresh`SELECT value FROM lost_ack ORDER BY value`.values, [
+          [1],
+          [2],
+        ]);
+      }).pipe(Effect.provide(SqliteClient.layer({ filename })));
+    }),
+  ),
+);
+
+it.effect(
+  "reports a checkpoint database error once and resumes writes on automatic checkpoints",
+  () => {
+    const { warnings, layer: logs } = captureWarnings();
+    const failures: string[] = [];
+    return withCheckpointClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const checkpoint = startedWorkers.at(-1)!;
+          checkpoint.emit("message", {
+            type: "db-error",
+            errcode: 11,
+            errstr: "test checkpoint corruption",
+            code: "ERR_SQLITE_ERROR",
+          });
+          yield* writerBridgeBarrier();
+          assert.deepEqual(yield* sql`PRAGMA wal_autocheckpoint`, [{ wal_autocheckpoint: 1000 }]);
+          yield* sql`CREATE TABLE after_checkpoint_error(value INTEGER)`;
+          yield* sql.withTransaction(sql`INSERT INTO after_checkpoint_error VALUES (1)`);
+          assert.deepEqual(yield* sql`SELECT value FROM after_checkpoint_error`, [{ value: 1 }]);
+          assert.deepEqual(failures, ["checkpoint"]);
+          assert.lengthOf(warnings, 1);
+        }),
+      {
+        errorObserver: (_cause, context) => {
+          failures.push(context.connection);
+        },
+      },
+    ).pipe(Effect.provide(logs));
+  },
+);
+
+it.effect(
+  "preserves attached archives and snapshot consistency across writer transactions and reader replacement",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-sqlite-archive-" });
+      const filename = path.join(directory, "state.sqlite");
+      const archivePath = path.join(directory, "archive.sqlite");
+      const archive = yield* openDatabase(archivePath);
+      archive.exec(
+        "PRAGMA journal_mode=WAL; CREATE TABLE entries(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO entries VALUES (2, 'archived')",
+      );
+      const attach = `ATTACH DATABASE '${archivePath.replaceAll("'", "''")}' AS archive`;
+      const view =
+        "CREATE TEMP VIEW all_entries AS SELECT * FROM main.entries UNION ALL SELECT * FROM archive.entries";
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`PRAGMA journal_mode=WAL`;
+        yield* sql`CREATE TABLE entries(id INTEGER PRIMARY KEY, value TEXT)`;
+        yield* sql`INSERT INTO entries VALUES (1, 'live')`;
+        yield* sql.unsafe(attach).unprepared;
+        yield* sql.unsafe(view).unprepared;
+        const expected = [
+          [1, "live"],
+          [2, "archived"],
+        ];
+        assert.deepEqual(
+          yield* sql`SELECT id, value FROM all_entries ORDER BY id`.values,
+          expected,
+        );
+        const moveRequested = yield* Deferred.make<void>();
+        const move = yield* Deferred.await(moveRequested).pipe(
+          Effect.andThen(
+            sql.withTransaction(
+              Effect.gen(function* () {
+                yield* sql`INSERT INTO archive.entries SELECT * FROM main.entries`;
+                yield* sql`DELETE FROM main.entries`;
+              }),
+            ),
+          ),
+          Effect.forkChild,
+        );
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              assert.deepEqual(
+                yield* sql`SELECT id, value FROM all_entries ORDER BY id`.values,
+                expected,
+              );
+              yield* Deferred.succeed(moveRequested, undefined);
+              yield* Fiber.join(move);
+              assert.deepEqual(
+                yield* sql`SELECT id, value FROM all_entries ORDER BY id`.values,
+                expected,
+              );
+            }),
+          )
+          .pipe(SqliteClient.readOnly);
+        assert.deepEqual(yield* sql`SELECT COUNT(*) AS count FROM main.entries`, [{ count: 0 }]);
+        assert.deepEqual(
+          yield* sql`SELECT id, value FROM all_entries ORDER BY id`.values.pipe(
+            SqliteClient.readOnly,
+          ),
+          expected,
+        );
+        const reader = startedWorkers.at(-1)!;
+        yield* Effect.promise(() => reader.terminate());
+        assert.deepEqual(
+          yield* sql`SELECT id, value FROM all_entries ORDER BY id`.values.pipe(
+            SqliteClient.readOnly,
+          ),
+          expected,
+        );
+        assert.notStrictEqual(startedWorkers.at(-1), reader);
+      }).pipe(
+        Effect.provide(
+          SqliteClient.layer({
+            filename,
+            readerWorker: true,
+            readerInitializationSql: [attach, view],
+            readerSnapshotSql: [
+              "SELECT COUNT(*) FROM main.entries",
+              "SELECT COUNT(*) FROM archive.entries",
+            ],
+          }),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

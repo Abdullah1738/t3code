@@ -1,4 +1,6 @@
 import * as NodeSqlite from "node:sqlite";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- SQLite connection selection reads only the file header without adding a FileSystem layer requirement.
+import * as NodeFSP from "node:fs/promises";
 import * as NodeUtil from "node:util";
 import * as NodeWorkerThreads from "node:worker_threads";
 
@@ -1136,11 +1138,6 @@ const CHECKPOINT_FRAMES = 1000;
 const CHECKPOINT_IDLE_MS = 100;
 const CHECKPOINT_BACKPRESSURE_FRAMES = 10 * CHECKPOINT_FRAMES;
 
-const readSafeSqliteInteger = (value: unknown) => {
-  const number = typeof value === "bigint" ? Number(value) : value;
-  return typeof number === "number" && Number.isSafeInteger(number) ? number : undefined;
-};
-
 // Evaluated source also works in bundles and single-executable builds.
 const checkpointWorkerSource = `
 const { parentPort, workerData } = require("node:worker_threads");
@@ -1264,262 +1261,598 @@ parentPort.on("message", (request) => {
 });
 `;
 
-const startCheckpointWorker = Effect.fnUntraced(function* (
-  filename: string,
-  writer: NodeSqlite.DatabaseSync,
-  options: SqliteClientConfig,
-) {
-  const warn = (reason: string) =>
-    Effect.logWarning(
-      "SQLite checkpoint worker unavailable; checkpoints run on the main connection",
-      { reason },
-    );
-  if (typeof writer.isTransaction !== "boolean" || typeof writer.setAuthorizer !== "function") {
-    yield* warn("Node SQLite lacks transaction-state or statement-authorizer support");
-    return undefined;
+// A connection is never replaced after failure: replaying a COMMIT with a lost
+// reply could acknowledge a different outcome. Reopen at the service boundary.
+const writerWorkerSource = `
+const { parentPort, workerData, Worker } = require("node:worker_threads");
+const { DatabaseSync, constants } = require("node:sqlite");
+let cancelled = new Int32Array(workerData.cancelled);
+const isCancelled = () => Atomics.load(cancelled, 0) !== 0;
+let db;
+const statements = new Map();
+const classifications = new WeakMap();
+let activeClassification;
+const localPragmas = new Set(["application_id", "auto_vacuum", "journal_mode", "schema_version", "user_version"]);
+const errorReply = (id, error, operation, extra = {}) => parentPort.postMessage({ id, ...extra, error: {
+  operation, message: String(error.message || error), code: error.code,
+  errcode: error.errcode, errstr: error.errstr,
+}});
+try {
+  db = new DatabaseSync(workerData.filename, {
+    readOnly: workerData.readonly, allowExtension: workerData.allowExtension,
+  });
+  if (typeof db.setAuthorizer === "function") db.setAuthorizer((code, action, argument) => {
+    if (!activeClassification) return constants.SQLITE_OK;
+    if (code === constants.SQLITE_TRANSACTION || code === constants.SQLITE_SAVEPOINT) {
+      activeClassification.write ||= action === "BEGIN";
+      activeClassification.check ||= code === constants.SQLITE_SAVEPOINT || action === "COMMIT" || action === "ROLLBACK";
+    } else if (code === constants.SQLITE_PRAGMA) {
+      const name = action?.toLowerCase();
+      activeClassification.journalMode ||= name === "journal_mode" && argument !== null;
+      activeClassification.write ||= name === "optimize" || name === "incremental_vacuum" ||
+        (name === "wal_checkpoint" && argument?.toLowerCase() !== "noop") ||
+        (argument !== null && localPragmas.has(name));
+    } else if (![constants.SQLITE_READ, constants.SQLITE_SELECT, constants.SQLITE_FUNCTION, constants.SQLITE_RECURSIVE].includes(code)) {
+      activeClassification.write = true;
+    }
+    return constants.SQLITE_OK;
+  });
+  parentPort.postMessage({ type: "ready" });
+} catch (error) { errorReply(0, error, "open"); }
+// Serialize statements while WAL admission is waiting on a pinned reader.
+let queue = Promise.resolve();
+let checkpointStarted = workerData.checkpointStarted;
+let checkpoint;
+let wakeAdmission = () => {};
+const reportCheckpoint = (cause, connection = "checkpoint") => parentPort.postMessage({ type: "checkpoint-error", connection, error: {
+  code: cause?.code, errcode: cause?.errcode, errstr: cause?.errstr,
+}});
+let checkpointAttempted = false;
+const startCheckpoint = () => {
+  if (checkpointAttempted || !workerData.checkpoint || workerData.readonly) return;
+  checkpointAttempted = true;
+  const warn = (reason) => parentPort.postMessage({ type: "checkpoint-warning", reason });
+  if (typeof db.isTransaction !== "boolean" || typeof db.setAuthorizer !== "function") {
+    warn("Node SQLite lacks transaction-state or statement-authorizer support");
+    return;
   }
-  const version = String(writer.prepare("SELECT sqlite_version() AS version").get()?.version);
-  const [major = 0, minor = 0] = version.split(".").map(Number);
-  // Older SQLite treats NOOP as PASSIVE, which would checkpoint on the writer.
+  const version = String(db.prepare("SELECT sqlite_version() AS version").get().version);
+  const [major, minor] = version.split(".").map(Number);
   if (major < 3 || (major === 3 && minor < 51)) {
-    yield* warn(`SQLite ${version} has no NOOP checkpoint`);
-    return undefined;
+    warn("SQLite " + version + " has no NOOP checkpoint");
+    return;
   }
-  const frames = writer.prepare("PRAGMA main.wal_checkpoint(NOOP)");
-  const sizeLimit = writer.prepare("PRAGMA journal_size_limit");
-  let worker: NodeWorkerThreads.Worker;
-  try {
-    worker = new NodeWorkerThreads.Worker(checkpointWorkerSource, {
-      eval: true,
-      workerData: {
-        filename,
-        frames: CHECKPOINT_FRAMES,
-        backpressureFrames: CHECKPOINT_BACKPRESSURE_FRAMES,
-        idleMs: CHECKPOINT_IDLE_MS,
-      },
-    });
-  } catch (cause) {
-    yield* warn(String(cause));
-    return undefined;
-  }
-  const runFork = Effect.runForkWith(yield* Effect.context<never>());
+  const frames = db.prepare("PRAGMA main.wal_checkpoint(NOOP)");
+  let child;
+  try { child = new Worker(workerData.checkpointSource, { eval: true, workerData: {
+    filename: workerData.filename,
+    frames: workerData.checkpointFrames,
+    backpressureFrames: workerData.checkpointBackpressureFrames,
+    idleMs: workerData.checkpointIdleMs,
+  }}); } catch (cause) { warn(String(cause)); return; }
   let stopped = false;
-  let started = options.checkpointWorkerStart === undefined;
   let generation = 0;
   let nextId = 0;
-  let inFlight: number | undefined;
+  let inFlight;
   let checkAgain = false;
   let blocked = false;
   let log = 0;
   let checkpointed = 0;
   let unknown = false;
-  let truncate: { id: number; acknowledged: boolean } | undefined;
-  type Waiter = { resume: () => void; cancelled: boolean };
-  const waiters: Array<Waiter> = [];
-  let elected: Waiter | undefined;
-  const gated = () =>
-    !stopped &&
-    !writer.isTransaction &&
-    (unknown || blocked || truncate !== undefined || log >= CHECKPOINT_BACKPRESSURE_FRAMES);
-  const wake = () => {
-    if (!gated() && elected === undefined) {
-      elected = waiters.shift();
-      elected?.resume();
-    }
-    if (waiters.length === 0 && elected === undefined) worker.unref();
-  };
-  const release = (waiter: Waiter) => {
-    waiter.cancelled = true;
-    const index = waiters.indexOf(waiter);
-    if (index !== -1) waiters.splice(index, 1);
-    if (elected === waiter) elected = undefined;
-    wake();
-  };
-  const handBack = (reason: string) => {
+  let truncate;
+  const gated = () => !stopped && !db.isTransaction &&
+    (unknown || blocked || truncate !== undefined || log >= workerData.checkpointBackpressureFrames);
+  const handBack = (reason) => {
     if (stopped) return;
     stopped = true;
     truncate = undefined;
-    try {
-      writer.exec(`PRAGMA wal_autocheckpoint = ${CHECKPOINT_FRAMES};`);
-    } catch {}
-    wake();
-    runFork(warn(reason));
+    try { db.exec("PRAGMA wal_autocheckpoint = " + workerData.checkpointFrames); } catch {}
+    wakeAdmission();
+    warn(reason);
   };
-  const send = (message: unknown) => {
-    try {
-      // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
-      worker.postMessage(message);
-    } catch (cause) {
-      handBack(String(cause));
-    }
+  const send = (message) => {
+    try { child.postMessage(message); } catch (cause) { handBack(String(cause)); }
   };
   const acknowledge = () => {
-    if (truncate === undefined || truncate.acknowledged || stopped || writer.isTransaction) return;
+    if (!truncate || truncate.acknowledged || stopped || db.isTransaction) return;
     truncate.acknowledged = true;
     send({ type: "truncate", truncateId: truncate.id });
   };
   const observe = () => {
     try {
       const state = frames.get();
-      const nextLog = readSafeSqliteInteger(state?.log);
-      const nextCheckpointed = readSafeSqliteInteger(state?.checkpointed);
-      if (nextLog === undefined || nextCheckpointed === undefined)
+      const nextLog = Number(state.log), nextCheckpointed = Number(state.checkpointed);
+      if (!Number.isSafeInteger(nextLog) || !Number.isSafeInteger(nextCheckpointed))
         throw new Error("Invalid WAL frame counts");
       log = nextLog;
       checkpointed = nextCheckpointed;
       unknown = false;
-    } catch (cause) {
-      classifyError(cause, "WAL inspection failed", "checkpoint", options, "writer");
-      unknown = true;
-    }
+    } catch (cause) { reportCheckpoint(cause, "writer"); unknown = true; }
   };
   const request = (force = false) => {
-    if (stopped || writer.isTransaction) return;
-    // Even a background checkpoint can block a cold foreground pread on APFS.
-    // Keep routine inherited-WAL work off startup, without bypassing the WAL ceiling.
-    if (!started && !gated()) return;
-    if (truncate !== undefined) {
-      acknowledge();
-      return;
-    }
-    if (inFlight !== undefined) {
-      checkAgain = true;
-      return;
-    }
-    if (!force && !gated() && log - checkpointed < CHECKPOINT_FRAMES) return;
+    if (stopped || db.isTransaction || (!checkpointStarted && !gated())) return;
+    if (truncate !== undefined) { acknowledge(); return; }
+    if (inFlight !== undefined) { checkAgain = true; return; }
+    if (!force && !gated() && log - checkpointed < workerData.checkpointFrames) return;
     inFlight = ++nextId;
-    try {
-      send({
-        type: "check",
-        id: inFlight,
-        generation,
-        journalSizeLimit: readSafeSqliteInteger(sizeLimit.get()?.journal_size_limit),
-        force: force || gated(),
-      });
-    } catch (cause) {
-      handBack(String(cause));
-    }
+    // A PRAGMA prepared before its setting changes can return the old value on its first step.
+    try { send({ type: "check", id: inFlight, generation,
+      journalSizeLimit: Number(db.prepare("PRAGMA journal_size_limit").get().journal_size_limit), force: force || gated() }); }
+    catch (cause) { handBack(String(cause)); }
   };
   const check = () => {
-    if (stopped || writer.isTransaction) return;
+    if (stopped || db.isTransaction) return;
     generation++;
     observe();
     request();
-    wake();
+    wakeAdmission();
   };
-  worker.on("error", (cause) => {
-    classifyError(cause, "Checkpoint worker failed", "checkpoint", options, "checkpoint");
-    handBack(cause.message);
-  });
-  worker.on("exit", (code) => handBack(`exited with code ${code}`));
-  worker.on("message", (message: unknown) => {
-    if (stopped || typeof message !== "object" || message === null || !("type" in message)) return;
-    if (
-      message.type === "truncate-request" &&
-      "truncateId" in message &&
-      typeof message.truncateId === "number"
-    ) {
+  child.on("error", cause => { reportCheckpoint(cause); handBack(cause.message); });
+  child.on("exit", code => handBack("exited with code " + code));
+  child.on("message", message => {
+    if (stopped || !message || typeof message !== "object") return;
+    if (message.type === "truncate-request" && typeof message.truncateId === "number") {
       truncate = { id: message.truncateId, acknowledged: false };
       blocked = true;
       acknowledge();
       return;
     }
     if (message.type === "db-error") {
-      classifyError(message, "Checkpoint worker failed", "checkpoint", options, "checkpoint");
+      reportCheckpoint(message);
       handBack("SQLite checkpoint failed");
-      void worker.terminate();
+      void child.terminate();
       return;
     }
     if (message.type !== "checkpoint") return;
-    const completedTruncate =
-      truncate !== undefined && "truncateId" in message && message.truncateId === truncate.id;
+    const completedTruncate = truncate !== undefined && message.truncateId === truncate.id;
     if (completedTruncate) truncate = undefined;
-    // An acknowledged truncate excludes new writer mutations, so its result is current.
-    if (
-      (completedTruncate || ("generation" in message && message.generation === generation)) &&
-      "log" in message &&
-      typeof message.log === "number" &&
-      "checkpointed" in message &&
-      typeof message.checkpointed === "number" &&
-      "blocked" in message &&
-      typeof message.blocked === "boolean"
-    ) {
-      log = message.log;
-      checkpointed = message.checkpointed;
-      blocked = message.blocked;
-      unknown = false;
+    if ((completedTruncate || message.generation === generation) &&
+      typeof message.log === "number" && typeof message.checkpointed === "number" &&
+      typeof message.blocked === "boolean") {
+      log = message.log; checkpointed = message.checkpointed;
+      blocked = message.blocked; unknown = false;
     }
-    // Even a stale snapshot must retire its request so a newer check can run.
-    if ("id" in message && message.id === inFlight) inFlight = undefined;
-    if (checkAgain && inFlight === undefined) {
-      checkAgain = false;
-      request(true);
-    }
-    wake();
+    if (message.id === inFlight) inFlight = undefined;
+    if (checkAgain && inFlight === undefined) { checkAgain = false; request(true); }
+    wakeAdmission();
   });
-  yield* Effect.addFinalizer(() =>
-    Effect.promise(() => {
-      stopped = true;
-      truncate = undefined;
-      wake();
-      return worker.terminate();
-    }),
-  );
-  writer.exec("PRAGMA wal_autocheckpoint = 0;");
+  db.exec("PRAGMA wal_autocheckpoint = 0");
   observe();
-  worker.unref();
-
-  const runWithAdmission = <A, E>(
-    execute: () => Exit.Exit<A, E>,
-    admitted?: Waiter,
-  ): Effect.Effect<A, E> =>
-    Effect.suspend(() => {
-      if (!gated()) {
-        // Release the election after executing; its successor must see the new WAL state.
-        try {
-          return execute();
-        } finally {
-          if (admitted !== undefined) release(admitted);
-        }
+  child.unref();
+  checkpoint = {
+    check,
+    async admit(id) {
+      while (gated()) {
+        if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
+        parentPort.postMessage({ waiting: id });
+        child.ref();
+        await new Promise(resolve => { wakeAdmission = resolve; request(true); if (!gated()) resolve(); });
       }
-      if (admitted !== undefined) release(admitted);
-      const waiter: Waiter = { resume: () => {}, cancelled: false };
-      const wait = Effect.uninterruptibleMask((restore) =>
-        Effect.withFiber((fiber) =>
-          (fiber.getRef(TransactionAcquire)?.restore ?? restore)(
-            Effect.callback<void>(function (this: Scheduler.Scheduler, resume) {
-              const dispatcher = this.makeDispatcher();
-              waiter.resume = () => {
-                dispatcher.scheduleTask(() => {
-                  if (!waiter.cancelled) resume(Effect.void);
-                }, 0);
-              };
-              waiters.push(waiter);
-              worker.ref();
-              request(true);
-              wake();
-              return Effect.sync(() => release(waiter));
-            }),
+      child.unref();
+    },
+    async close() { stopped = true; truncate = undefined; wakeAdmission(); await child.terminate(); },
+  };
+};
+const enableWal = () => {
+  if (String(db.prepare("PRAGMA journal_mode").get().journal_mode).toLowerCase() === "wal") startCheckpoint();
+};
+try { if (db) enableWal(); } catch (cause) { reportCheckpoint(cause); }
+parentPort.on("message", (request) => {
+  if (request.cancel !== undefined) { wakeAdmission(); return; }
+  queue = queue.then(async () => {
+  const { id, sql, params, cached, values, raw, safeIntegers, close, checkpointStart } = request;
+  cancelled = new Int32Array(request.cancellation ?? workerData.cancelled);
+  let operation = "prepare";
+  let mayWrite = false;
+  let observedWrite = false;
+  let executionStarted;
+  try {
+    if (close) {
+      operation = "close";
+      if (checkpoint) await checkpoint.close();
+      db.close();
+      parentPort.postMessage({ id, rows: [] });
+      parentPort.close();
+      return;
+    }
+    if (checkpointStart) {
+      checkpointStarted = true;
+      checkpoint?.check();
+      parentPort.postMessage({ id, rows: [] });
+      return;
+    }
+    if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
+    const entry = cached ? statements.get(sql) : undefined;
+    let statement = entry && performance.now() - entry.at < workerData.prepareCacheTTL ? entry.statement : undefined;
+    if (!statement) {
+      const classification = { write: typeof db.setAuthorizer !== "function", check: false, journalMode: false };
+      activeClassification = classification;
+      try { statement = db.prepare(sql); } finally { activeClassification = undefined; }
+      classifications.set(statement, classification);
+      if (cached) {
+        if (statements.size >= workerData.prepareCacheSize) statements.delete(statements.keys().next().value);
+        statements.set(sql, { statement, at: performance.now() });
+      }
+    }
+    observedWrite = Boolean(classifications.get(statement)?.write || classifications.get(statement)?.check);
+    mayWrite = observedWrite || db.isTransaction;
+    if (classifications.get(statement)?.write) await checkpoint?.admit(id);
+    if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
+    operation = "execute";
+    statement.setReadBigInts(safeIntegers);
+    statement.setReturnArrays(values);
+    const start = performance.now();
+    executionStarted = start;
+    activeClassification = classifications.get(statement);
+    const rows = statement.columns().length > 0 ? statement.all(...params) : (() => {
+      const result = statement.run(...params);
+      return raw ? result : [];
+    })();
+    activeClassification = undefined;
+    observedWrite ||= Boolean(classifications.get(statement)?.write || classifications.get(statement)?.check);
+    mayWrite ||= observedWrite;
+    if (!checkpoint && classifications.get(statement)?.journalMode) {
+      enableWal();
+    }
+    const committed = !db.isTransaction && /^\\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\\b/i.test(sql);
+    parentPort.postMessage({ id, rows, committed, write: observedWrite, elapsedMs: performance.now() - start });
+  } catch (error) {
+    // A deferred constraint can reject COMMIT while leaving the transaction open.
+    // Never lend that transaction to the next caller.
+    if (/^\\s*(?:COMMIT|END|ROLLBACK)\\b/i.test(sql) && db?.isTransaction) {
+      try { db.exec("ROLLBACK"); }
+      catch {
+        try { db.close(); } catch {}
+        db = undefined;
+        statements.clear();
+      }
+    }
+    activeClassification = undefined;
+    errorReply(id, error, operation, { write: observedWrite, elapsedMs: executionStarted === undefined ? undefined : performance.now() - executionStarted });
+  } finally {
+    // Authorizer classification covers CTE/commented writes; transaction state
+    // covers RELEASE/ROLLBACK. OR FAIL may persist rows despite throwing.
+    if (mayWrite && db && !db.isTransaction) checkpoint?.check();
+  }
+  });
+});
+`;
+
+// Worker lifecycle deadlines must fire independently of an Effect/TestClock.
+const scheduleWorkerDeadline = (callback: () => void, milliseconds: number) =>
+  // @effect-diagnostics-next-line globalTimers:off -- Native worker deadlines must not depend on the Effect clock.
+  setTimeout(callback, milliseconds);
+
+const makeWriter = Effect.fnUntraced(function* (
+  options: SqliteClientConfig,
+  statementObserver: SqliteStatementObserver | undefined,
+  statementMetrics: boolean,
+) {
+  const failed = (cause: unknown, message: string, operation: string) =>
+    new SqlError({ reason: classifyError(cause, message, operation, options, "writer") });
+  const cancelledBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const runFork = Effect.runForkWith(yield* Effect.context<never>());
+  const worker = yield* Effect.try({
+    try: () =>
+      new NodeWorkerThreads.Worker(writerWorkerSource, {
+        eval: true,
+        workerData: {
+          filename: options.filename,
+          readonly: options.readonly ?? false,
+          allowExtension: options.allowExtension ?? false,
+          checkpoint: options.checkpointWorker ?? false,
+          checkpointStarted: options.checkpointWorkerStart === undefined,
+          checkpointSource: checkpointWorkerSource,
+          checkpointFrames: CHECKPOINT_FRAMES,
+          checkpointIdleMs: CHECKPOINT_IDLE_MS,
+          checkpointBackpressureFrames: CHECKPOINT_BACKPRESSURE_FRAMES,
+          cancelled: cancelledBuffer,
+          prepareCacheSize: options.prepareCacheSize ?? 200,
+          prepareCacheTTL: Duration.toMillis(
+            Duration.fromInputUnsafe(options.prepareCacheTTL ?? "10 minutes"),
           ),
-        ),
-      );
-      return wait.pipe(
-        Effect.flatMap(() => runWithAdmission(execute, waiter)),
-        Effect.onInterrupt(() => Effect.sync(() => release(waiter))),
-      );
+        },
+      }),
+    catch: (cause) => failed(cause, "Failed to open database", "open"),
+  });
+  type Reply = {
+    readonly id: number;
+    readonly committed?: boolean;
+    readonly elapsedMs?: number;
+    readonly write?: boolean;
+  } & (
+    | { readonly rows: ReadonlyArray<any> }
+    | {
+        readonly error: {
+          readonly operation: "open" | "prepare" | "execute" | "close";
+          readonly message: string;
+          readonly code?: unknown;
+          readonly errcode?: unknown;
+          readonly errstr?: unknown;
+        };
+      }
+  );
+  const pending = new Map<number, (reply: Reply) => void>();
+  let nextId = 0;
+  let stopped: string | undefined;
+  let announce: (error?: unknown) => void = () => {};
+  let ready = false;
+  const started = new Promise<unknown>((resolve) => {
+    announce = resolve;
+  });
+  const startupTimer = scheduleWorkerDeadline(() => {
+    stop("SQLite writer startup timed out after 10 seconds");
+    void worker.terminate();
+  }, 10_000);
+  const stop = (message: string) => {
+    if (stopped !== undefined) return;
+    stopped = message;
+    clearTimeout(startupTimer);
+    announce(new Error(message));
+    for (const [id, resume] of pending) resume({ id, error: { operation: "execute", message } });
+    pending.clear();
+  };
+  worker.on(
+    "message",
+    (
+      reply:
+        | Reply
+        | { type: "ready" }
+        | { type: "checkpoint-warning"; reason: string }
+        | { type: "checkpoint-error"; connection: "writer" | "checkpoint"; error: unknown }
+        | { waiting: number },
+    ) => {
+      if ("type" in reply && reply.type === "checkpoint-warning") {
+        runFork(
+          Effect.logWarning(
+            "SQLite checkpoint worker unavailable; checkpoints run on the writer connection",
+            { reason: reply.reason },
+          ),
+        );
+        return;
+      }
+      if ("type" in reply && reply.type === "checkpoint-error") {
+        classifyError(
+          Object.assign(new Error("Checkpoint worker failed"), reply.error),
+          "Checkpoint worker failed",
+          "checkpoint",
+          options,
+          reply.connection,
+        );
+        return;
+      }
+      if ("waiting" in reply) return;
+      if ("type" in reply && reply.type === "ready") {
+        if (stopped !== undefined) return;
+        clearTimeout(startupTimer);
+        ready = true;
+        announce();
+        if (pending.size === 0) worker.unref();
+        return;
+      }
+      if ("type" in reply) return;
+      if (reply.id === 0 && "error" in reply) {
+        clearTimeout(startupTimer);
+        announce(Object.assign(new Error(reply.error.message), reply.error));
+        return;
+      }
+      const resume = pending.get(reply.id);
+      pending.delete(reply.id);
+      if (pending.size === 0) worker.unref();
+      resume?.(reply);
+    },
+  );
+  worker.on("error", (error) => stop(error.message));
+  worker.on("exit", (code) => stop(`SQLite writer exited (${code}); outcome may be unknown`));
+
+  const request: (
+    input: Partial<ReaderRequest> & { close?: boolean; checkpointStart?: boolean },
+    onClassification?: (write: boolean) => void,
+  ) => Effect.Effect<ReadonlyArray<any>, SqlError> = (input, onClassification) =>
+    Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
+      const restore = fiber.getRef(TransactionAcquire)?.restore;
+      const awaitingBegin = restore !== undefined && /^\s*BEGIN\b/i.test(input.sql ?? "");
+      const execute = Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {
+        if (stopped !== undefined) {
+          resume(Effect.fail(failed(new Error(stopped), "SQLite writer unavailable", "execute")));
+          return;
+        }
+        const id = ++nextId;
+        const cancellation = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+        let acknowledge: () => void = () => {};
+        const acknowledged = new Promise<void>((resolve) => {
+          acknowledge = resolve;
+        });
+        pending.set(id, (reply) => {
+          acknowledge();
+          onClassification?.(reply.write ?? false);
+          const currentSpan = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
+          if (
+            fiber.getRef(References.TracerEnabled) &&
+            fiber.getRef(Statement.SpanPropagationEnabled) &&
+            currentSpan?._tag === "Span" &&
+            reply.elapsedMs !== undefined
+          ) {
+            currentSpan.attribute("db.statement.execution_ms", reply.elapsedMs);
+            currentSpan.attribute("db.execution.thread", "worker");
+          }
+          if ("error" in reply) {
+            resume(
+              Effect.fail(
+                failed(
+                  Object.assign(new Error(reply.error.message), reply.error),
+                  reply.error.operation === "close"
+                    ? "Failed to close database"
+                    : readerFailureMessages[reply.error.operation],
+                  reply.error.operation,
+                ),
+              ),
+            );
+          } else {
+            // Observe after SQLite returns; tracing must never change a commit result.
+            try {
+              if (reply.committed && /^\s*(?:COMMIT|END)\s*;?\s*$/i.test(input.sql ?? ""))
+                fiber.getRef(TransactionCommitObserver)?.();
+              const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
+              if (
+                statementMetrics &&
+                fiber.getRef(References.TracerEnabled) &&
+                fiber.getRef(Statement.SpanPropagationEnabled) &&
+                span?._tag === "Span"
+              ) {
+                span.attribute(
+                  "db.rows_returned",
+                  Array.isArray(reply.rows) ? reply.rows.length : 0,
+                );
+                span.attribute("db.stmt_status.available", false);
+                if (reply.committed) {
+                  span.attribute(
+                    "db.commit.at_ms",
+                    fiber.getRef(Clock.Clock).currentTimeMillisUnsafe(),
+                  );
+                  span.attribute("db.commit.duration_ms", reply.elapsedMs ?? 0);
+                  span.attribute("db.commit.boundary", "sqlite-worker-returned");
+                }
+              }
+            } catch {
+              /* Observations cannot invalidate a commit. */
+            }
+            resume(Effect.succeed(reply.rows));
+          }
+        });
+        worker.ref();
+        try {
+          const message = {
+            ...input,
+            // node:sqlite accepts callable named-binding objects; structured clone does not.
+            ...(input.params === undefined
+              ? {}
+              : {
+                  params: input.params.map((value) =>
+                    typeof value === "function" ? Object.fromEntries(Object.entries(value)) : value,
+                  ),
+                }),
+            id,
+            cancellation: cancellation.buffer,
+            safeIntegers: Boolean(Context.get(fiber.context, Client.SafeIntegers)),
+          };
+          // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+          worker.postMessage(message);
+        } catch (cause) {
+          pending.delete(id);
+          if (pending.size === 0) worker.unref();
+          acknowledge();
+          resume(Effect.fail(failed(cause, "Failed to send SQLite request", "execute")));
+        }
+        // Retain the permit until the worker confirms it skipped or finished SQL.
+        return Effect.promise(() => {
+          Atomics.store(cancellation, 0, 1);
+          try {
+            // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+            worker.postMessage({ cancel: id });
+          } catch {}
+          return acknowledged;
+        }).pipe(
+          Effect.andThen(
+            awaitingBegin
+              ? request({
+                  sql: "ROLLBACK",
+                  params: [],
+                  cached: false,
+                  values: false,
+                  raw: false,
+                }).pipe(Effect.ignore)
+              : Effect.void,
+          ),
+        );
+      });
+      return awaitingBegin && restore !== undefined ? restore(execute) : execute;
     });
+  yield* Effect.addFinalizer(() =>
+    Effect.flatMap(
+      Effect.sync(() =>
+        scheduleWorkerDeadline(() => {
+          void worker.terminate();
+        }, 5000),
+      ),
+      (timer) =>
+        (ready ? request({ close: true }) : Effect.void).pipe(
+          Effect.ignore,
+          Effect.ensuring(Effect.sync(() => clearTimeout(timer))),
+          Effect.ensuring(Effect.promise(() => worker.terminate())),
+        ),
+    ),
+  );
   if (options.checkpointWorkerStart !== undefined) {
     yield* options.checkpointWorkerStart.pipe(
-      Effect.andThen(
-        Effect.sync(() => {
-          started = true;
-          check();
-        }),
-      ),
+      Effect.andThen(request({ checkpointStart: true })),
+      Effect.ignore,
       Effect.forkScoped,
     );
   }
-  return { check, runWithAdmission };
+  const startupError = yield* Effect.promise(() => started);
+  if (startupError !== undefined)
+    return yield* Effect.fail(failed(startupError, "Failed to open database", "open"));
+  const run = (
+    sql: string,
+    params: ReadonlyArray<unknown>,
+    values = false,
+    raw = false,
+    cached = true,
+  ) => {
+    let write = false;
+    return observeStatement(
+      request(
+        {
+          sql,
+          params,
+          values,
+          raw,
+          cached: cached && (options.prepareCacheSize ?? 200) > 0 && !hasLargeBinding(params),
+        },
+        (value) => {
+          write = value;
+        },
+      ),
+      () => (write ? "write" : "read"),
+      "writer",
+      statementObserver,
+    );
+  };
+  return identity<Connection>({
+    execute(sql, params, transform) {
+      const result = run(sql, params);
+      return transform ? Effect.map(result, transform) : result;
+    },
+    executeRaw: (sql, params) => run(sql, params, false, true),
+    executeValues: (sql, params) => run(sql, params, true),
+    executeValuesUnprepared: (sql, params) => run(sql, params ?? [], true, false, false),
+    executeUnprepared(sql, params, transform) {
+      const result = run(sql, params ?? [], false, false, false);
+      return transform ? Effect.map(result, transform) : result;
+    },
+    executeStream: () => Stream.die(new UnsupportedNodeSqliteOperationError()),
+  });
+});
+
+// WAL intent is explicit for server stores, including their first empty open.
+// Other file clients retain their synchronous connection unless the file is WAL.
+const usesWalWriter = Effect.fnUntraced(function* (options: SqliteClientConfig) {
+  if (options.filename === ":memory:" || options.filename === "") return false;
+  if (options.readerWorker || options.checkpointWorker) return true;
+  return yield* Effect.promise(async () => {
+    let file;
+    try {
+      file = await NodeFSP.open(options.filename, "r");
+      const header = new Uint8Array(20);
+      const { bytesRead } = await file.read(header, 0, header.length, 0);
+      return bytesRead === 20 && header[18] === 2 && header[19] === 2;
+    } catch {
+      return false;
+    } finally {
+      await file?.close();
+    }
+  });
 });
 
 const make = Effect.fn("makeWithDatabase")(function* (
@@ -1546,7 +1879,9 @@ const make = Effect.fn("makeWithDatabase")(function* (
     ? Statement.defaultTransforms(options.transformResultNames).array
     : undefined;
 
+  const workerWriter = yield* usesWalWriter(options);
   const makeConnection = Effect.gen(function* () {
+    if (workerWriter) return yield* makeWriter(options, statementObserver, statementMetrics);
     const scope = yield* Effect.scope;
     const db = yield* Effect.try({
       try: () =>
@@ -1569,11 +1904,6 @@ const make = Effect.fn("makeWithDatabase")(function* (
           }),
       }).pipe(Effect.orDie),
     );
-    // Started after the close finalizer, so the worker stops before the writer closes.
-    const checkpoint =
-      options.checkpointWorker && isFileDatabase
-        ? yield* startCheckpointWorker(options.filename, db, options)
-        : undefined;
 
     const statementReaderCache = new WeakMap<NodeSqlite.StatementSync, boolean>();
     interface CheckpointClassification {
@@ -1785,9 +2115,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
             }
             return result;
           };
-          return checkpoint !== undefined && classification?.backpressure
-            ? checkpoint.runWithAdmission(execute)
-            : execute();
+          return execute();
         }),
         () => {
           const classification = checkpointClassifications.get(statement);
