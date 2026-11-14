@@ -15,6 +15,70 @@ const event = (input: Partial<AnalyticsEvent> = {}): AnalyticsEvent => ({
 });
 
 describe("analytics rollups", () => {
+  it("counts actual children separately from operations by provider, board and launch hour beyond the sample limit", () => {
+    const target = makeAccumulator();
+    for (let i = 0; i < 600; i++)
+      accumulate(
+        target,
+        event({
+          kind: "text-generation.child",
+          boardId: "board-robob",
+          durationMs: 20,
+          startedAt: "2026-11-13T11:59:59.000Z",
+          outcome: "ok",
+          props: {
+            provider: "claude",
+            operation: "generateJson:writeGroups",
+            count: 1,
+            exitCode: 0,
+          },
+        }),
+      );
+    accumulate(
+      target,
+      event({
+        kind: "text-generation.operation",
+        boardId: "board-robob",
+        durationMs: 50,
+        outcome: "error",
+        props: { provider: "claude", operation: "generateJson:writeGroups", count: 1 },
+      }),
+    );
+    accumulate(
+      target,
+      event({
+        kind: "text-generation.child",
+        boardId: "board-other",
+        durationMs: 10,
+        outcome: "interrupted",
+        props: { provider: "codex", operation: "generateThreadTitle", count: 1 },
+      }),
+    );
+    const rows = finishRollup(target, "2026-11-13", ts).textGeneration!;
+    assert.equal(rows.length, 3);
+    const many = rows.find((row) => row.count === 600)!;
+    assert.closeTo(many.p50Ms!, 20, 0.4);
+    assert.closeTo(many.p95Ms!, 20, 0.4);
+    assert.deepEqual(
+      { ...many, p50Ms: 20, p95Ms: 20 },
+      {
+        hour: "11",
+        provider: "claude",
+        operation: "generateJson:writeGroups",
+        boardId: "board-robob",
+        kind: "child",
+        outcome: "ok",
+        count: 600,
+        p50Ms: 20,
+        p95Ms: 20,
+        maxMs: 20,
+        approximate: true,
+      },
+    );
+    assert.equal(rows.find((row) => row.kind === "operation")?.outcome, "error");
+    assert.equal(rows.find((row) => row.provider === "codex")?.outcome, "interrupted");
+  });
+
   it("rolls server tick phases up independently by board and phase, including idle phases", () => {
     const accumulator = makeAccumulator();
     const phase = (boardId: string, phase: string, durationMs: number) =>

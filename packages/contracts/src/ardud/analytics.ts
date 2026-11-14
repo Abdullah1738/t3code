@@ -85,6 +85,9 @@ const GeneralEvent = Schema.Struct({
       reasonClass: Schema.optionalKey(Label),
       errorClass: Schema.optionalKey(Label),
       model: Schema.optionalKey(Label),
+      provider: Schema.optionalKey(Label),
+      operation: Schema.optionalKey(Label),
+      exitCode: Schema.optionalKey(Schema.Int),
       kind: Schema.optionalKey(Label),
       ageMs: Schema.optionalKey(Measurement),
       used: Schema.optionalKey(Measurement),
@@ -268,6 +271,20 @@ export const AnalyticsRollup = Schema.Struct({
   total: Measurement,
   invalidLines: Measurement,
   kindCounts: Schema.Record(Label, Measurement),
+  textGenerationOverflow: Schema.optionalKey(Measurement),
+  textGeneration: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        hour: Label,
+        provider: Label,
+        operation: Label,
+        boardId: Schema.NullOr(Id),
+        kind: Schema.Literals(["operation", "child"]),
+        outcome: McpOutcome,
+        ...LatencyFields,
+      }),
+    ),
+  ),
   errorCounts: Schema.Record(Label, Measurement),
   errorsByRoute: Schema.Array(
     Schema.Struct({
