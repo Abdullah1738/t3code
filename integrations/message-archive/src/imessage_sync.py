@@ -13,6 +13,7 @@ import time
 
 import common
 import store
+import timing
 
 APPLE_EPOCH = 978307200
 TAPBACK_MIN = 2000
@@ -61,7 +62,7 @@ def load_contacts():
     paths += glob.glob(os.path.join(common.ADDRESSBOOK, "Sources", "*", "AddressBook-v22.abcddb"))
     for p in paths:
         try:
-            db = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
+            db = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5, factory=timing.SourceConnection)
             names = {}
             for pk, first, last, org, nick in db.execute(
                     "SELECT Z_PK, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION, ZNICKNAME FROM ZABCDRECORD"):
@@ -99,7 +100,7 @@ class Names:
 
 
 def open_chatdb():
-    return sqlite3.connect(f"file:{common.CHAT_DB}?mode=ro", uri=True, timeout=30)
+    return sqlite3.connect(f"file:{common.CHAT_DB}?mode=ro", uri=True, timeout=30, factory=timing.SourceConnection)
 
 
 def chat_names(src, names):
@@ -145,6 +146,7 @@ def attachments(src, rowids):
     return out
 
 
+@timing.timed("parse")
 def _item(row, chats, names, atts):
     rid, guid, text, ab, date, from_me, service, has_att, edited, retracted, spam, handle, chat_id = row
     body = text if text else decode_attributed(ab)
