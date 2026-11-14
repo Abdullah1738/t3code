@@ -118,7 +118,7 @@ export const makeAccumulator = () => ({
   routes: new Map<string, Breakdown>(),
   mcpCodes: new Map<string, Breakdown>(),
   dbSpans: new Map<string, Breakdown>(),
-  rpcs: new Map<string, Durations>(),
+  rpcs: new Map<string, Durations & { totalWaitMs: number; outcomes: Map<string, number> }>(),
   longTasks: new Map<
     string,
     {
@@ -466,10 +466,12 @@ export function accumulate(
     const key = boundedKey(target.rpcs, event.props.method);
     let summary = target.rpcs.get(key);
     if (!summary) {
-      summary = durations();
+      summary = { ...durations(), totalWaitMs: 0, outcomes: new Map() };
       target.rpcs.set(key, summary);
     }
     addDuration(summary, event.durationMs);
+    summary.totalWaitMs += event.props.waitMs ?? 0;
+    if (event.outcome !== undefined) increment(summary.outcomes, event.outcome);
   }
 
   if (
@@ -689,7 +691,12 @@ export function finishRollup(
           a.surface.localeCompare(b.surface),
       ),
     topSlowRpcs: [...target.rpcs]
-      .map(([method, values]) => ({ method, ...summarize(values) }))
+      .map(([method, values]) => ({
+        method,
+        ...summarize(values),
+        totalWaitMs: values.totalWaitMs,
+        outcomes: Object.fromEntries(values.outcomes),
+      }))
       .sort((a, b) => (b.p95Ms ?? 0) - (a.p95Ms ?? 0) || a.method.localeCompare(b.method))
       .slice(0, 20),
     askAnswerLatency: summarize(target.answers),
