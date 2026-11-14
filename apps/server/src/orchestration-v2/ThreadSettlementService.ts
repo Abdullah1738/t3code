@@ -48,7 +48,7 @@ export const promoteAgedQueuedMessages = Effect.fn(
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     for (const threadId of yield* projections.getRecoveryThreadIds("running-queued-runs")) {
       yield* orchestrator
-        .promoteQueuedMessages(threadId, "age", QUEUED_MESSAGE_MAX_WAIT_MS)
+        .promoteQueuedMessages(threadId, "age", { minWaitMs: QUEUED_MESSAGE_MAX_WAIT_MS })
         .pipe(
           Effect.catchCause((cause) =>
             Effect.logWarning("queued-message.age-promotion-failed", { thread: threadId, cause }),

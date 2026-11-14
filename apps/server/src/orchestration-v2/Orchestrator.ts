@@ -359,7 +359,7 @@ export interface OrchestratorV2Shape {
   readonly promoteQueuedMessages: (
     threadId: ThreadId,
     reason: "wake" | "steer" | "age",
-    minWaitMs?: number,
+    options?: { readonly minWaitMs?: number; readonly deferBoardWakes?: boolean },
   ) => Effect.Effect<number, OrchestratorV2Error>;
   readonly resumeQueuedRuns: Effect.Effect<number, OrchestratorV2Error>;
   readonly recoverDelegatedTasks: Effect.Effect<DelegatedRecoveryCounts>;
@@ -507,6 +507,20 @@ function isGoalCommand(message: {
   readonly attachments: ReadonlyArray<ChatAttachment>;
 }): boolean {
   return message.attachments.length === 0 && /^\/goal(?:\s|$)/u.test(message.text.trim());
+}
+
+function isBufferedCompletion(
+  message: Pick<
+    OrchestrationV2ConversationMessage,
+    "delegatedCompletion" | "notification" | "creationSource"
+  >,
+): boolean {
+  // Provider continuations already buffer their output. Server continuations
+  // carry message text that must reach the provider through normal delivery.
+  return (
+    message.delegatedCompletion !== undefined ||
+    (message.notification !== undefined && message.creationSource !== "server")
+  );
 }
 
 const threadPullRequestLinksEqual = Schema.toEquivalence(Schema.NullOr(ThreadLinkedPullRequest));
@@ -4363,6 +4377,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     readonly scheduledTaskId?: OrchestrationV2ConversationMessage["scheduledTaskId"];
     readonly senderThreadId?: OrchestrationV2ConversationMessage["senderThreadId"];
     readonly delegatedCompletion?: OrchestrationV2ConversationMessage["delegatedCompletion"];
+    readonly notification?: OrchestrationV2ConversationMessage["notification"];
     readonly forceRestart: boolean;
     readonly activeTurnOnly?: boolean;
   }) {
@@ -4513,6 +4528,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         const message: OrchestrationV2ConversationMessage = {
           createdBy: input.createdBy,
           creationSource: input.creationSource,
+          ...(input.notification === undefined ? {} : { notification: input.notification }),
           ...(input.delegatedCompletion === undefined
             ? {}
             : { delegatedCompletion: input.delegatedCompletion }),
@@ -4581,6 +4597,31 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           occurredAt: now,
           payload: notificationTurnItem(turnItem, message, input.projection.subagents),
         });
+        if (
+          input.command.type === "message.dispatch" &&
+          input.notification === undefined &&
+          input.delegatedCompletion === undefined &&
+          !input.messageId.startsWith("kanban:wake:")
+        ) {
+          // Commit snapshot disposal with its replacement, so rejected or empty
+          // board sends leave the latest coalesced snapshot available to flush.
+          for (const wake of input.projection.runs.filter(
+            (run) =>
+              run.status === "queued" &&
+              run.queueHeld !== true &&
+              run.userMessageId.startsWith("kanban:wake:"),
+          )) {
+            yield* dispatchQueuedRunCancel(
+              {
+                type: "queued-run.cancel",
+                commandId: input.command.commandId,
+                threadId: input.command.threadId,
+                runId: wake.id,
+              },
+              input.events,
+            );
+          }
+        }
       },
     );
 
@@ -8741,10 +8782,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: `Queued run ${queuedRun.id} is missing message or execution state.`,
       });
     }
-    if (
-      queuedMessage.delegatedCompletion !== undefined ||
-      queuedMessage.notification !== undefined
-    ) {
+    if (isBufferedCompletion(queuedMessage)) {
       return yield* new OrchestratorDispatchError({
         commandId: command.commandId,
         commandType: command.type,
@@ -8808,6 +8846,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ...(queuedMessage.context ? { context: queuedMessage.context } : {}),
       createdBy: queuedMessage.createdBy,
       creationSource: queuedMessage.creationSource,
+      ...(queuedMessage.notification === undefined
+        ? {}
+        : { notification: queuedMessage.notification }),
       ...(queuedMessage.scheduledTaskId === undefined
         ? {}
         : { scheduledTaskId: queuedMessage.scheduledTaskId }),
@@ -13308,7 +13349,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   });
 
   const promoteQueuedMessages = Effect.fn("Orchestrator.promoteQueuedMessages")(
-    (threadId: ThreadId, reason: "wake" | "steer" | "age", minWaitMs = 0) =>
+    (
+      threadId: ThreadId,
+      reason: "wake" | "steer" | "age",
+      options?: {
+        readonly minWaitMs?: number;
+        readonly deferBoardWakes?: boolean;
+      },
+    ) =>
       threadDispatch.withLock(
         threadId,
         Effect.gen(function* () {
@@ -13333,8 +13381,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             const message = byMessageId.get(run.userMessageId);
             return (
               message !== undefined &&
-              message.delegatedCompletion === undefined &&
-              message.notification === undefined &&
+              !isBufferedCompletion(message) &&
               !isNativeMaintenanceCommand(message) &&
               !isGoalCommand(message)
             );
@@ -13344,7 +13391,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           const through =
             reason === "age"
               ? ordered.findLastIndex(
-                  (run) => nowMs - DateTime.toEpochMillis(run.requestedAt) > minWaitMs,
+                  (run) =>
+                    nowMs - DateTime.toEpochMillis(run.requestedAt) > (options?.minWaitMs ?? 0),
                 )
               : ordered.length - 1;
           const latestRealOrdinal = Math.max(
@@ -13364,10 +13412,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               );
             // Real board input supersedes earlier disposable snapshots (#1394).
             // A coalesced wake with no later input is still one queue entry (#1296).
-            if (
-              run.userMessageId.startsWith("kanban:wake:") &&
-              (reason !== "age" || run.ordinal < latestRealOrdinal)
-            ) {
+            if (run.userMessageId.startsWith("kanban:wake:") && run.ordinal < latestRealOrdinal) {
               yield* dispatchWithReceiptEffect({
                 type: "queued-run.cancel",
                 commandId: CommandId.make(`command:queue-steer:discard:${run.id}:${attemptId}`),
@@ -13376,6 +13421,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               });
               continue;
             }
+            if (options?.deferBoardWakes && run.userMessageId.startsWith("kanban:wake:")) continue;
             // The queued row fences acceptance; a rejected plan needs a fresh receipt to retry.
             yield* dispatchWithReceiptEffect({
               type: "queued-message.promote-to-steer",

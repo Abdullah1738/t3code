@@ -697,7 +697,9 @@ const make = Effect.gen(function* () {
       if (id === undefined) return;
       // Queue edits cannot change a run's model selection or steer a live turn.
       if (input.flushQueued !== undefined) {
-        yield* threads.promoteQueuedMessages(input.threadId, input.flushQueued);
+        yield* threads.promoteQueuedMessages(input.threadId, input.flushQueued, {
+          deferBoardWakes: input.text.trim().length > 0,
+        });
         if (!input.text.trim()) return;
       }
       if (scope !== undefined) {
