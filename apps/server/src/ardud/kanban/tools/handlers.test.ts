@@ -4166,6 +4166,42 @@ it.effect("card_wait sets a push wait from the card's last review, logs it and c
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("card_wait accepts a cross-board waitsOn id", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const { kanban, card } = yield* waitFixture;
+    const foreign = yield* kanban.ensureBoard({
+      slug: "foreign",
+      name: "Foreign",
+      defaultProjectId: null,
+    });
+    const target = yield* kanban.createCard(
+      foreign.id,
+      { prompt: "Dependency", title: "Dependency", description: "Explicit" },
+      owner,
+    );
+    const reply = yield* call(evaluatorThread, "card_wait", {
+      card: card.id,
+      on: "card",
+      waitsOn: target.id,
+      wakeRole: "evaluator",
+      note: "foreign dependency",
+    });
+    assert.isFalse(reply.isError, reply.text);
+    const detail = yield* kanban.card(card.id);
+    assert.deepInclude(detail.card.wait, { on: "card", card: target.id, wakeRole: "evaluator" });
+    assert.include(detail.events.at(-1)?.body ?? "", `#${target.number} (Foreign)`);
+    const moved = yield* call(evaluatorThread, "card_move", { card: card.id, to: "todo" });
+    assert.isFalse(moved.isError, moved.text);
+    assert.include(String(moved.structured.message), `#${target.number} (Foreign)`);
+    const cleared = yield* kanban.card(card.id);
+    assert.isUndefined(cleared.card.wait);
+    assert.isTrue(
+      cleared.events.some((event) => event.body?.includes(`card #${target.number} (Foreign)`)),
+    );
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("card_wait validates the PR, the card, the time and the owner question it names", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {

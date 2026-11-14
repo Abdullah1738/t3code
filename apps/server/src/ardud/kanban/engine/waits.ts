@@ -135,10 +135,12 @@ export interface WaitFacts {
    * the same readings builds it once; without it each card scans `prs`.
    */
   readonly prsByKey?: ReadonlyMap<string, WaitPrFacts> | undefined;
-  /** The board's cards by id. A card not in the map is gone. */
+  /** The board's cards and named wait targets by id. A card not in the map is gone. */
   readonly cards: ReadonlyMap<
     string,
-    Pick<KanbanCard, "id" | "number" | "stage" | "settledAt" | "subtasks">
+    Pick<KanbanCard, "id" | "number" | "stage" | "settledAt" | "subtasks"> & {
+      readonly boardName?: string;
+    }
   >;
 }
 
@@ -263,7 +265,9 @@ export function waitTarget(wait: KanbanWait, cards?: WaitFacts["cards"]): string
       return `the owner's answer${wait.ask === null ? "" : ` to ${wait.ask}`}`;
     case "card": {
       const target = wait.card === null ? undefined : cards?.get(wait.card);
-      return target ? `card #${target.number}` : "another card";
+      return target
+        ? `card #${target.number}${target.boardName ? ` (${target.boardName})` : ""}`
+        : "another card";
     }
     case "time":
       return wait.until === null ? "a set time" : `${wait.until}`;
@@ -302,6 +306,7 @@ export interface WaitCheckInput {
     readonly cards: ReadonlyArray<{
       readonly id: string;
       readonly number: number;
+      readonly boardName?: string;
       readonly stage: KanbanStage;
       /** Settled, or in a done stage with no merge left open. */
       readonly done: boolean;
@@ -455,7 +460,9 @@ const cardCheck: WaitChecker = ({ wait, facts }) => {
   if (wait.card === null) return HOLD;
   const target = facts.cards.find((entry) => entry.id === wait.card);
   if (target === undefined) return wake("The card it waited on is gone", { to: "evaluator" });
-  return target.done ? wake(`Card #${target.number} is done`) : HOLD;
+  return target.done
+    ? wake(`Card #${target.number}${target.boardName ? ` (${target.boardName})` : ""} is done`)
+    : HOLD;
 };
 
 const timeCheck: WaitChecker = ({ wait, facts }) => {
@@ -704,6 +711,7 @@ export function checkInput(
               {
                 id: target.id,
                 number: target.number,
+                ...(target.boardName === undefined ? {} : { boardName: target.boardName }),
                 stage: target.stage,
                 done:
                   target.settledAt !== null ||
