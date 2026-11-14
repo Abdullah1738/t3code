@@ -8619,18 +8619,23 @@ const make = Effect.gen(function* () {
         current.nudgedAt !== card.nudgedAt
       )
         continue;
-      yield* saveCard({
+      const next = {
         ...current,
         ...(sent && current.activeRole === "work" && current.wakeNote === card.wakeNote
           ? { wakeNote: null }
           : {}),
         nudgedAt: at,
         updatedAt: at,
-      });
+      };
+      if (current.activeRole === "work")
+        yield* logEvent(next, { _tag: "system", component: "dispatcher" }, "thread", {
+          body: Rules.WORKER_NUDGE_EVENT,
+        });
+      yield* saveCard(next);
     }
   });
 
-  /** A stopped worker hears about its cards still in Working, every time. nudgedAt records the last nudge instead of a card event, so a looping worker can't flood the history. */
+  /** Nudge a stopped worker once, then release cards still idle after the grace. */
   const nudgeWorker = Effect.fn("KanbanService.nudgeWorker")(function* (
     threadId: ThreadId,
     planned: ReadonlyArray<KanbanCard>,
@@ -8654,32 +8659,129 @@ const make = Effect.gen(function* () {
     const board = cards[0] ? yield* boardOf(cards[0].boardId) : null;
     // A batched thread may carry both kept and held cards. Do not start it for a
     // kept sibling while another card it owns is held.
-    const carried = board?.pause ? yield* store.cardsByThread(threadId) : cards;
+    const carried = yield* store.cardsByThread(threadId);
     if (board?.pause && carried.some((card) => !board.pause!.keep.includes(card.id))) {
       yield* Ref.update(deferredNudges, (set) => new Set(set).add(threadId));
       return;
     }
+    // A parked sibling must not be woken by another card on the same thread.
+    if (
+      carried.some(
+        (card) => card.wait !== undefined || kanbanOpenAsks(card).some((ask) => ask.blocking),
+      )
+    )
+      return;
     const nudge = (yield* upgradeFindings(cards)).filter(
       (card) =>
         card.stage === "working" &&
         card.activeRole === "work" &&
         card.stalled === null &&
-        kanbanWorkStep(card) &&
         (!board?.pause || board.pause.keep.includes(card.id)),
     );
-    if (
-      nudge.length === 0 &&
-      cards.some((card) => card.stage === "working" && card.stalled === null)
-    ) {
-      yield* Ref.update(deferredNudges, (set) => new Set(set).add(threadId));
-    }
     if (nudge.length === 0) return;
     yield* Ref.update(deferredNudges, (set) => {
       const next = new Set(set);
       next.delete(threadId);
       return next;
     });
-    yield* nudgeThread(threadId, nudge, Briefs.nudgeWorkText(nudge));
+    if ((yield* threads.queuedRuns(threadId)).length > 0) return;
+    const view = yield* freshThreads.find(threadId);
+    const now = yield* nowMillis;
+    if (view?.state !== "idle" || Rules.waitingOnBackground(view, now)) return;
+    const latestBoard = board ? yield* boardOf(board.id) : null;
+    if ((yield* store.threadLink(threadId))?.paused || waking(threadId)) return;
+    const latestCarried = yield* store.cardsByThread(threadId);
+    if (
+      latestCarried.some(
+        (card) =>
+          (latestBoard !== null && Retries.heldByPause(latestBoard, card)) ||
+          card.wait !== undefined ||
+          kanbanOpenAsks(card).some((ask) => ask.blocking),
+      )
+    )
+      return;
+    const at = yield* nowIso;
+    const first: Array<KanbanCard> = [];
+    const released: Array<KanbanCard> = [];
+    for (const planned of nudge) {
+      const card = yield* store.card(planned.id);
+      if (
+        card === null ||
+        card.activeThreadId !== threadId ||
+        card.activeRole !== "work" ||
+        card.stage !== "working" ||
+        !sameCardState(card, planned) ||
+        card.stalled !== null
+      )
+        continue;
+      const nudged =
+        card.nudgedAt !== null && Rules.workerHandoffNudged(card, yield* store.cardEvents(card.id));
+      // An evaluator-only step still gets its normal chance to advance before
+      // the idle backstop asks the worker to finish its handoff.
+      if (
+        !nudged &&
+        (kanbanWorkStep(card) ||
+          Rules.workerWorkDone(card) ||
+          Rules.workerQuietDue(card, view, now))
+      )
+        first.push(card);
+      if (!nudged || !Rules.workerQuietDue(card, view, now)) continue;
+      const done = Rules.workerWorkDone(card);
+      const next: KanbanCard = {
+        ...Retries.withoutRetries(release(card)),
+        stage: done ? "needs_review" : "todo",
+        ...(done ? { reviewStep: 0, reviewFindingsPending: false } : {}),
+        nudgedAt: null,
+        movedAt: at,
+        updatedAt: at,
+      };
+      const reason = done
+        ? "Work thread idle with work done; moved to review"
+        : "Work thread idle; slot freed";
+      // Cleanup can yield to turn admission. Finish it before taking that
+      // non-reentrant lock, then confirm the turn cannot resume before saving.
+      yield* prepareTransition(next);
+      const saved = yield* turnAdmission.withLock(
+        threadId,
+        Effect.gen(function* () {
+          const queued = yield* threadIo.queuedRuns(threadId);
+          const live = yield* threadIo.find(threadId);
+          const liveBoard = yield* boardOf(card.boardId);
+          const held = (yield* store.cardsByThread(threadId)).some(
+            (entry) =>
+              Retries.heldByPause(liveBoard, entry) ||
+              entry.wait !== undefined ||
+              kanbanOpenAsks(entry).some((ask) => ask.blocking),
+          );
+          if (
+            held ||
+            (yield* store.threadLink(threadId))?.paused ||
+            queued.length > 0 ||
+            live?.state !== "idle" ||
+            Rules.waitingOnBackground(live, yield* nowMillis) ||
+            !Rules.workerQuietDue(card, live, yield* nowMillis) ||
+            !sameCardState(yield* store.card(card.id), card)
+          )
+            return false;
+          yield* logEvent(next, { _tag: "system", component: "dispatcher" }, "moved", {
+            fromStage: card.stage,
+            toStage: next.stage,
+            body: reason,
+          });
+          yield* saveCard(next);
+          return true;
+        }),
+      );
+      if (!saved) continue;
+      (yield* tickKicks)?.stoppedCards.add(card.id);
+      if (!done) released.push(next);
+      yield* kick;
+    }
+    if (first.length > 0) yield* nudgeThread(threadId, first, Briefs.nudgeWorkText(first));
+    for (const card of released)
+      yield* noteDiscussion(card, `Card #${card.number}: Work thread idle; slot freed`).pipe(
+        Effect.ignore,
+      );
   });
 
   /** Refused verdicts flag immediately; a missing verdict gets a nudge and one restart first. */
