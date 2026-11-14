@@ -268,6 +268,7 @@ export function createReadonlyReplica(
         kind TEXT NOT NULL CHECK(kind IN ('insert','update')), at TEXT NOT NULL
       );`);
     const out = target;
+    const replicaStat = fs.statSync(replicaName);
     const meta = (key: string, value: string) =>
       out
         .prepare(
@@ -674,6 +675,32 @@ export function createReadonlyReplica(
           : { error: String((error as Error)?.message ?? error).slice(0, 1000) }),
       };
       meta("rebuild_progress", JSON.stringify(value));
+      // A full rebuild holds the SQLite writer until publication. Commit
+      // diagnostics separately so mode=ro readers can see its latest page.
+      let diagnosticsDir: string | undefined;
+      try {
+        diagnosticsDir = fs.mkdtempSync(replicaName + ".diagnostics-");
+        const temporary = path.join(diagnosticsDir, "progress.json");
+        fs.writeFileSync(
+          temporary,
+          JSON.stringify({
+            replica_identity: [replicaStat.dev, replicaStat.ino],
+            rebuild_started_at: new Date(rebuild.started).toISOString(),
+            rebuild_finished_at: event === "publish" ? new Date(Date.now()).toISOString() : "",
+            rebuild_progress: JSON.stringify(value),
+          }),
+          { mode: 0o600 },
+        );
+        fs.renameSync(temporary, replicaName + ".rebuild.json");
+      } catch {
+        // Diagnostics must not prevent publication; meta and logs still work.
+      } finally {
+        try {
+          if (diagnosticsDir) fs.rmSync(diagnosticsDir, { recursive: true, force: true });
+        } catch {
+          // A cleanup failure must not turn diagnostics into an export failure.
+        }
+      }
       options.onRebuildEvent?.(value);
       rebuild.loggedAt = Date.now();
     };

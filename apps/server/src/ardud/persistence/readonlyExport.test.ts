@@ -2837,6 +2837,78 @@ test("rebuild logs bounded page progress and aborts, without publishing a scan e
   expect(metaValue(out, "ready")).toBe("1");
 });
 
+test.each(["publish", "abort"])(
+  "full rebuild diagnostics reach a separate Python reader before %s",
+  (terminal) => {
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = fixture(1);
+    f.finish();
+    f.exporter.close();
+    const writer = new NodeSqlite.DatabaseSync(f.options.replicaPath);
+    writer.exec("UPDATE ardud_readonly_meta SET value='0' WHERE key='ready'");
+    writer.close();
+    f.source.exec(
+      "ALTER TABLE orchestration_v2_projection_run_attempts RENAME COLUMN payload_json TO owner_payload_json",
+    );
+    const exporter = openExporter(f);
+    const out = f.connect();
+    const generation = metaValue(out, "generation");
+    out.exec("BEGIN");
+    expect(JSON.parse(String(metaValue(out, "rebuild_progress")))).toMatchObject({
+      event: "start",
+      table: "",
+      rows: 0,
+    });
+    now += 31_000;
+    exporter.step();
+    expect(metaValue(out, "ready")).toBe("0");
+    expect(metaValue(out, "generation")).toBe(generation);
+    expect(JSON.parse(String(metaValue(out, "rebuild_progress")))).toMatchObject({
+      event: "start",
+    });
+    const diagnosticsPath = f.options.replicaPath + ".rebuild.json";
+    const diagnostics = () => JSON.parse(NodeFS.readFileSync(diagnosticsPath, "utf8"));
+    expect(JSON.parse(diagnostics().rebuild_progress)).toMatchObject({
+      event: "progress",
+      table: "orchestration_v2_projection_threads",
+      rows: 1,
+      pages: 1,
+      elapsedMs: 31_000,
+    });
+    expect(NodeFS.statSync(diagnosticsPath).mode & 0o777).toBe(0o600);
+    const reader = NodeChildProcess.spawnSync(
+      "/usr/bin/python3",
+      [
+        "-I",
+        "-c",
+        `
+import sys
+sys.path.insert(0, sys.argv[1])
+import robob_readonly as ro
+try:
+    ro.state_ro(sys.argv[2])
+except ro.ReplicaNotReady as exc:
+    print(exc)
+else:
+    raise AssertionError("unready replica was accepted")
+`,
+        NodePath.resolve(import.meta.dirname, "../../../../../integrations/memory-system/src"),
+        f.options.replicaPath,
+      ],
+      { encoding: "utf8", timeout: 5000 },
+    );
+    expect(reader.error).toBeUndefined();
+    expect(reader.status, reader.stderr).toBe(0);
+    expect(reader.stdout).toContain("table orchestration_v2_projection_threads, 1 rows");
+    if (terminal === "publish") drive(exporter);
+    else exporter.close();
+    expect(JSON.parse(diagnostics().rebuild_progress).event).toBe(terminal);
+    expect(Boolean(diagnostics().rebuild_finished_at)).toBe(terminal === "publish");
+    out.exec("ROLLBACK");
+  },
+);
+
 test.each([
   ["dropped column", "attempt_id TEXT PRIMARY KEY"],
   ["renamed column", "attempt_id TEXT PRIMARY KEY, owner_payload_json TEXT"],
