@@ -4158,8 +4158,8 @@ it.effect.each([
         const native = yield* openDatabase(":memory:");
         const expected = native.prepare("SELECT hex(?) AS value").get(value)!.value;
         assert.deepEqual(yield* sql`SELECT hex(${value}) AS value`.values, [[expected]]);
-        assert.deepEqual(yield* sql.unsafe("SELECT hex(?) AS value", [value]).unprepared.values, [
-          [expected],
+        assert.deepEqual(yield* sql.unsafe("SELECT hex(?) AS value", [value]).unprepared, [
+          { value: expected },
         ]);
         assert.deepEqual(
           yield* sql.unsafe("SELECT hex($value) AS value", [{ $value: value }]).values,
