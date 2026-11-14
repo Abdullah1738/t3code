@@ -4206,21 +4206,25 @@ it.effect("preserves effective CHECK constraint enforcement through writer recov
   ),
 );
 
-it.effect.each([
-  ["automatic_index", 0],
-  ["reverse_unordered_selects", 1],
-  ["read_uncommitted", 1],
-  ["count_changes", 1],
-  ["short_column_names", 0],
-  ["full_column_names", 1],
-  ["cell_size_check", 1],
-  ["legacy_alter_table", 1],
-  ["cache_spill", 0],
-  ["secure_delete", 1],
-  ["analysis_limit", 37],
-  ["threads", 2],
-  ["max_page_count", 1000],
-] as const)("restores effective connection pragma %s=%s", (name, value) =>
+it.effect.each(
+  (
+    [
+      ["automatic_index", 0],
+      ["reverse_unordered_selects", 1],
+      ["read_uncommitted", 1],
+      ["count_changes", 1],
+      ["short_column_names", 0],
+      ["full_column_names", 1],
+      ["cell_size_check", 1],
+      ["legacy_alter_table", 1],
+      ["cache_spill", 0],
+      ["secure_delete", 1],
+      ["analysis_limit", 37],
+      ["threads", 2],
+      ["max_page_count", 1000],
+    ] as const
+  ).map(([name, value]) => ({ name, value })),
+)("restores effective connection pragma $name=$value", ({ name, value }) =>
   withFileClient(
     (sql) =>
       Effect.gen(function* () {
@@ -4423,12 +4427,13 @@ it.effect.each(
         if (fault === "deferral") yield* sql`PRAGMA defer_foreign_keys=ON`;
         const writer = writerWorkers.at(-1)!;
         const count = writerWorkers.length;
-        // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
-        writer.postMessage({
+        const message = {
           testCheckpoint: true,
           kind: fault === "deferral" ? "fail-attachment-deferral" : "fail-attachments",
           args: [1],
-        });
+        };
+        // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+        writer.postMessage(message);
         yield* writerBridgeBarrier(writer);
         if (operation === "attach") yield* sql`ATTACH DATABASE ${attachment} AS scratch`;
         else yield* sql`DETACH DATABASE scratch`;
@@ -4445,10 +4450,12 @@ it.effect.each(
           assert.equal(writerWorkers.length, count);
           return;
         }
-        const names = (yield* sql<{ name: string }>`PRAGMA database_list`).map((row) => row.name);
-        assert.equal(names.includes("scratch"), operation === "attach");
-        assert.equal(names.includes("stable"), followup !== "detach");
-        assert.equal(names.includes("extra"), followup === "attach");
+        const names = new Set(
+          (yield* sql<{ name: string }>`PRAGMA database_list`).map((row) => row.name),
+        );
+        assert.equal(names.has("scratch"), operation === "attach");
+        assert.equal(names.has("stable"), followup !== "detach");
+        assert.equal(names.has("extra"), followup === "attach");
         assert.equal(writerWorkers.length, count + 1);
         if (operation === "attach") {
           if (target === "memory") {
@@ -4481,16 +4488,18 @@ it.effect.each(["attach", "detach"] as const)(
         );
         assert.equal(failed._tag, "SqlError");
         assert.include(String(failed.reason.cause), "test attachment metadata failure");
-        const names = (yield* sql<{ name: string }>`PRAGMA database_list`).map((row) => row.name);
-        assert.equal(names.includes("scratch"), operation === "attach");
-        assert.isFalse(names.includes("extra"));
+        const names = new Set(
+          (yield* sql<{ name: string }>`PRAGMA database_list`).map((row) => row.name),
+        );
+        assert.equal(names.has("scratch"), operation === "attach");
+        assert.isFalse(names.has("extra"));
         yield* sql`ATTACH DATABASE ${`${filename}.extra`} AS extra`;
         yield* Effect.promise(() => writer.terminate());
-        const reopened = (yield* sql<{ name: string }>`PRAGMA database_list`).map(
-          (row) => row.name,
+        const reopened = new Set(
+          (yield* sql<{ name: string }>`PRAGMA database_list`).map((row) => row.name),
         );
-        assert.equal(reopened.includes("scratch"), operation === "attach");
-        assert.isTrue(reopened.includes("extra"));
+        assert.equal(reopened.has("scratch"), operation === "attach");
+        assert.isTrue(reopened.has("extra"));
       }),
     ),
 );
