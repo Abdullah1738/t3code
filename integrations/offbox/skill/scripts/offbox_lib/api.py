@@ -393,7 +393,7 @@ def _read_response(response, deadline):
 
 def call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
          retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
-    from . import allocation, pool
+    from . import allocation, home, pool
     if method != "POST" or not (path == "/sandboxes" or path.endswith("/fork")):
         return _call(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
     box_id = path.split("/")[2] if path != "/sandboxes" else None
@@ -414,7 +414,7 @@ def call(method: str, path: str, body=None, headers: dict | None = None, timeout
             con.commit()
         try:
             result = _call(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
-        except (ApiError, BoatAtCapacity, capacity.CapacityError) as e:
+        except (ApiError, BoatAtCapacity, capacity.CapacityError, home.StartWaitFailed) as e:
             # _call wraps any refusal preceded by an uncertain send as a plain OffboxError.
             if pending and not isinstance(e, pool.PoolBusyError):
                 raise allocation.Unresolved("the retained create/fork is still unresolved; nothing ran. "
@@ -456,32 +456,33 @@ def _call(method: str, path: str, body=None, headers: dict | None = None, timeou
     _own_box(path)
     from . import home
     scope = _REQUEST_SCOPE.get()
-    with scope.request() if scope is not None else contextlib.nullcontext():
-        wait_end = None
-        while True:
-            try:
+    wait_end = None
+    while True:
+        try:
+            # A refusal ends this request. Startup has its own bound; a retry needs a fresh child timer.
+            with scope.request() if scope is not None else contextlib.nullcontext():
                 return _request(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
-            except ApiError as error:
-                phase = home.error_phase(error)
-                if BACKEND != "server" or home.PRE_START.get() is None or not phase:
-                    raise
-                box = path.split("/")[2] if path.startswith("/sandboxes/") else None
-                checkpoint = "person" if person() else (
-                    "post" if path.endswith("/commands") else "autostop" if method == "PATCH" else "probe")
-                if wait_end is None:
-                    wait_end = time.monotonic() + home.wait_seconds()
-                began = time.monotonic()
-                why = home.wait_while_starting(phase, home.PRE_START.get(), checkpoint=checkpoint, box=box,
-                                               deadline=wait_end)
-                if why:
-                    raise home.StartWaitFailed(why, home.PRE_START.get(), box) from error
-                elapsed = time.monotonic() - began
-                if deadline is not None:
-                    deadline += elapsed
-                if _DEADLINE is not None:
-                    _DEADLINE += elapsed
-                if scope is not None:
-                    scope.end += elapsed
+        except ApiError as error:
+            phase = home.error_phase(error)
+            if BACKEND != "server" or home.PRE_START.get() is None or not phase:
+                raise
+            box = path.split("/")[2] if path.startswith("/sandboxes/") else None
+            checkpoint = "person" if person() else (
+                "post" if path.endswith("/commands") else "autostop" if method == "PATCH" else "probe")
+            if wait_end is None:
+                wait_end = time.monotonic() + home.wait_seconds()
+            began = time.monotonic()
+            why = home.wait_while_starting(phase, home.PRE_START.get(), checkpoint=checkpoint, box=box,
+                                           deadline=wait_end)
+            if why:
+                raise home.StartWaitFailed(why, home.PRE_START.get(), box) from error
+            elapsed = time.monotonic() - began
+            if deadline is not None:
+                deadline += elapsed
+            if _DEADLINE is not None:
+                _DEADLINE += elapsed
+            if scope is not None:
+                scope.end += elapsed
 
 
 def _log_request_error(method: str, path: str, detail: str) -> None:

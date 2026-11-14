@@ -1118,6 +1118,8 @@ def try_warm(me, size, source, exclude, run_id):
                     release_guard(got)
     except common.SshHostKeyMismatch:
         raise
+    except home.StartWaitFailed:
+        raise
     except OffboxError:
         # A contended pool is optional here: keep the already-held cold box.
         return None

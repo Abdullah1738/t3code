@@ -29,6 +29,35 @@ class Clock:
         self.now += n
 
 
+class TimerClock(Clock):
+    def __init__(self):
+        super().__init__()
+        self.timers = []
+
+    def timer(self, seconds, callback):
+        clock = self
+
+        class Timer:
+            def start(self):
+                self.end = clock.now + seconds
+                self.cancelled = False
+                clock.timers.append(self)
+
+            def cancel(self):
+                self.cancelled = True
+
+        timer = Timer()
+        timer.callback = callback
+        return timer
+
+    def sleep(self, seconds):
+        super().sleep(seconds)
+        for timer in self.timers:
+            if not timer.cancelled and timer.end <= self.now:
+                timer.cancel()
+                timer.callback()
+
+
 class StartupTests(HomeFiles):
     def setUp(self):
         super().setUp()
@@ -200,6 +229,127 @@ class StartupTests(HomeFiles):
                     data = {field: [message] if field == "reasons" else message}
                     self.assertEqual(starting_phase(data) is not None, expected)
         self.assertIsNone(starting_phase({"ok": True, "starting": True, "phase": "reconcile"}))
+
+
+    def test_real_request_scope_survives_startup_at_each_bounded_entry(self):
+        for entry in ('preflight', 'resume', 'readiness'):
+            with self.subTest(entry=entry), contextlib.ExitStack() as stack:
+                clock = TimerClock()
+                stack.enter_context(patch.object(api.time, 'time', clock.time))
+                stack.enter_context(patch.object(api.time, 'monotonic', clock.time))
+                stack.enter_context(patch.object(api.time, 'sleep', clock.sleep))
+                stack.enter_context(patch.object(api.threading, 'Timer', clock.timer))
+                stack.enter_context(patch.object(api, '_key', return_value='fixture'))
+                stack.enter_context(patch.object(home, 'may_fail_over', return_value=True))
+                error = urllib.error.HTTPError('http://fixture', 503, 'starting', {}, io.BytesIO(json.dumps({
+                    'code': 'server_not_ready', 'message': 'waiting for incus'}).encode()))
+                send = stack.enter_context(patch.object(api, '_open', side_effect=[
+                    error, io.BytesIO(b'{"sandbox":{"state":"ready","id":"bx_one"}}')]))
+                health_scopes = []
+                def health(timeout):
+                    health_scopes.append(api._REQUEST_SCOPE.get())
+                    self.assertTrue(all(timer.cancelled for timer in clock.timers))
+                    return READY
+                stack.enter_context(patch.object(home, '_health', side_effect=health))
+                parent = api.RequestScope(30)
+                with parent.active(), home.pre_start('run-1'):
+                    if entry == 'preflight':
+                        self.assertIsNone(api.probe_backend('server', 3))
+                    elif entry == 'resume':
+                        self.assertEqual(api.resume('bx_one', 1200)['sandbox']['id'], 'bx_one')
+                    else:
+                        self.assertEqual(api.readiness_get('bx_one')['id'], 'bx_one')
+                self.assertEqual(send.call_count, 2)
+                self.assertEqual(send.call_args_list[0].args[0].data, send.call_args_list[1].args[0].data)
+                self.assertEqual(clock.now, 5)
+                self.assertTrue(all(scope.parent is None or scope.parent is parent for scope in health_scopes))
+                self.assertEqual(len(clock.timers), 2)
+                self.assertTrue(all(timer.cancelled for timer in clock.timers))
+
+    def test_parent_cancellation_during_startup_still_prevents_retry(self):
+        clock = TimerClock()
+        parent = api.RequestScope(3)
+        error = urllib.error.HTTPError('http://fixture', 503, 'starting', {}, io.BytesIO(json.dumps({
+            'code': 'server_not_ready', 'message': 'waiting for incus'}).encode()))
+        def health(timeout):
+            parent.cancel()
+            return READY
+        with patch.object(api.time, 'time', clock.time), patch.object(api.time, 'monotonic', clock.time), \
+                patch.object(api.time, 'sleep', clock.sleep), patch.object(api.threading, 'Timer', clock.timer), \
+                patch.object(api, '_key', return_value='fixture'), patch.object(api, '_open', side_effect=error) as send, \
+                patch.object(home, '_health', side_effect=health), parent.active(), home.pre_start('run-1'):
+            with self.assertRaisesRegex(common.OffboxError, 'worker cancelled'):
+                api.call('GET', '/limits', retries=0)
+        self.assertEqual(send.call_count, 1)
+
+    def test_flapping_startup_uses_one_bound_and_fresh_request_timers(self):
+        clock = TimerClock()
+        parent = api.RequestScope(3)
+        def refuse(*args, **kwargs):
+            raise urllib.error.HTTPError('http://fixture', 503, 'starting', {}, io.BytesIO(json.dumps({
+                'code': 'server_not_ready', 'message': 'waiting for incus'}).encode()))
+        with patch.object(api.time, 'time', clock.time), patch.object(api.time, 'monotonic', clock.time), \
+                patch.object(api.time, 'sleep', clock.sleep), patch.object(api.threading, 'Timer', clock.timer), \
+                patch.object(api, '_key', return_value='fixture'), patch.object(api, '_open', side_effect=refuse) as send, \
+                patch.object(home, '_health', return_value=READY), patch.dict(os.environ, OFFBOX_HOME_START_WAIT_S='10'), \
+                parent.active(), home.pre_start('run-1'):
+            with self.assertRaisesRegex(home.StartWaitFailed, 'home still starting after 10 s'):
+                api.call('GET', '/limits', retries=0)
+        self.assertEqual(clock.now, 10)
+        self.assertEqual(send.call_count, 3)
+        self.assertTrue(all(timer.cancelled for timer in clock.timers))
+
+
+class AllocationStartupTests(Isolated):
+    guard_home_failover = False
+
+    def setUp(self):
+        super().setUp()
+        self.stack.enter_context(patch.object(api, 'BACKEND', 'server'))
+        self.stack.enter_context(patch.object(api, '_own_box'))
+        self.stack.enter_context(patch.object(api, '_key', return_value='fixture'))
+        self.stack.enter_context(patch.object(home, 'say'))
+        self.stack.enter_context(patch.dict(os.environ, OFFBOX_HOME_START_WAIT_S='0'))
+
+    def test_create_and_fork_refusal_clear_only_a_new_marker_and_keep_outage(self):
+        from offbox_lib import allocation
+        for path in ('/sandboxes', '/sandboxes/bx_source/fork'):
+            for pending in (False, True):
+                with self.subTest(path=path, pending=pending), allocation.scope('startup-fixture'):
+                    key = 'create_unanswered:startup-fixture'
+                    body, headers = {'type': 'large'}, {'Idempotency-Key': 'fixture'}
+                    self.con.execute('DELETE FROM kv WHERE k=?', (key,))
+                    if pending:
+                        self.con.execute('INSERT INTO kv VALUES (?,?,?)', (key, json.dumps({
+                            'path': path, 'body': body, 'headers': headers}), 1))
+                    self.con.commit()
+                    error = urllib.error.HTTPError('http://fixture', 503, 'starting', {}, io.BytesIO(json.dumps({
+                        'code': 'server_not_ready', 'message': 'waiting for incus'}).encode()))
+                    with home.pre_start('run-1'), patch.object(api, '_open', side_effect=error) as send:
+                        expected = allocation.Unresolved if pending else home.StartWaitFailed
+                        with self.assertRaises(expected) as raised:
+                            api.call('POST', path, body, headers)
+                    self.assertEqual(send.call_count, 1)
+                    self.assertEqual(home.unreachable(raised.exception), not pending)
+                    self.assertEqual(self.con.execute('SELECT 1 FROM kv WHERE k=?', (key,)).fetchone() is not None,
+                                     pending)
+
+    def test_startup_answer_after_an_ambiguous_send_keeps_the_fence(self):
+        from offbox_lib import allocation
+        for path in ('/sandboxes', '/sandboxes/bx_source/fork'):
+            with self.subTest(path=path), allocation.scope('startup-ambiguous'):
+                self.con.execute("DELETE FROM kv WHERE k='create_unanswered:startup-ambiguous'")
+                self.con.commit()
+                error = urllib.error.HTTPError('http://fixture', 503, 'starting', {}, io.BytesIO(json.dumps({
+                    'code': 'server_not_ready', 'message': 'waiting for incus'}).encode()))
+                with home.pre_start('run-1'), patch.object(api.time, 'sleep'), \
+                        patch.object(api, '_open', side_effect=[urllib.error.URLError('timed out'), error]) as send:
+                    with self.assertRaises(allocation.Unresolved) as raised:
+                        api.call('POST', path, {'type': 'large'}, {'Idempotency-Key': 'fixture'})
+                self.assertFalse(home.unreachable(raised.exception))
+                self.assertEqual(send.call_count, 2)
+                self.assertIsNotNone(self.con.execute(
+                    "SELECT 1 FROM kv WHERE k='create_unanswered:startup-ambiguous'").fetchone())
 
 
 class RunnerStartupTests(Isolated):
