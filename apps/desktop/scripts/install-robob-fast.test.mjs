@@ -1,14 +1,16 @@
-import { test } from "node:test";
-import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, readFile, rename, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { createServer } from "node:http";
+import * as NodeTest from "node:test";
+import * as NodeAssert from "node:assert/strict";
+import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+import * as NodeHttp from "node:http";
 import { acquireInstallHold, finishInstallHold } from "./robob-install-hold.mjs";
 import {
   INSTALL_DATABASE_FILE,
   checkSignature,
   clearStaleStaging,
+  cloneBackup,
+  createBackupRetention,
   createDmgStage,
   getJson,
   hostPreflight,
@@ -17,6 +19,7 @@ import {
   otherInstallerPids,
   pidsRunningFrom,
   probeDirectory,
+  pruneBackups,
   relaunchAfterFailure,
   uStateProcesses,
 } from "./install-robob-fast.mjs";
@@ -48,7 +51,7 @@ function dmgFixture({ detachFailures = 0, failAt, synchronous = false } = {}) {
   return { dmg, calls, phases, copy };
 }
 
-test("DMG staging detaches immediately after copy, before verification and quit", async () => {
+NodeTest.test("DMG staging detaches immediately after copy, before verification and quit", async () => {
   const { dmg, calls, phases, copy } = dmgFixture();
   const ops = Object.fromEntries(
     ["verify", "migrations", "hostPreflight", "cancelWindow", "quit", "backup", "swap",
@@ -60,33 +63,33 @@ test("DMG staging detaches immediately after copy, before verification and quit"
   } finally {
     await dmg.detach();
   }
-  assert.deepEqual(calls.slice(0, 5).map(([cmd, args]) =>
+  NodeAssert.deepEqual(calls.slice(0, 5).map(([cmd, args]) =>
     cmd === "/usr/bin/hdiutil" ? args[0] : cmd), ["attach", "ditto", "detach", "rmdir", "verify"]);
   const detaches = calls.filter(([cmd, args]) => cmd === "/usr/bin/hdiutil" && args[0] === "detach");
-  assert.equal(detaches.length, 1);
-  assert.deepEqual(detaches[0], ["/usr/bin/hdiutil", ["detach", "-quiet", "/scratch/mount"],
+  NodeAssert.equal(detaches.length, 1);
+  NodeAssert.deepEqual(detaches[0], ["/usr/bin/hdiutil", ["detach", "-quiet", "/scratch/mount"],
     { timeout: 30_000, killSignal: "SIGKILL", maxBuffer: 2 ** 20 }]);
-  assert.deepEqual(phases, []);
+  NodeAssert.deepEqual(phases, []);
 });
 
 for (const synchronous of [false, true]) {
-  test(`DMG detach retries once with force after a ${synchronous ? "synchronous throw" : "rejection"}`, async () => {
+  NodeTest.test(`DMG detach retries once with force after a ${synchronous ? "synchronous throw" : "rejection"}`, async () => {
     const { dmg, calls, phases, copy } = dmgFixture({ detachFailures: 1, synchronous });
     await dmg.stage("/release.dmg", copy);
     await dmg.detach();
     const detaches = calls.filter(([cmd, args]) => cmd === "/usr/bin/hdiutil" && args[0] === "detach");
-    assert.deepEqual(detaches.map(([, args]) => args), [
+    NodeAssert.deepEqual(detaches.map(([, args]) => args), [
       ["detach", "-quiet", "/scratch/mount"],
       ["detach", "-quiet", "-force", "/scratch/mount"],
     ]);
-    assert.ok(detaches.every(([, , options]) => options.timeout === 30_000));
-    assert.equal(calls.at(-1)[0], "rmdir");
-    assert.deepEqual(phases, []);
+    NodeAssert.ok(detaches.every(([, , options]) => options.timeout === 30_000));
+    NodeAssert.equal(calls.at(-1)[0], "rmdir");
+    NodeAssert.deepEqual(phases, []);
   });
 }
 
 for (const failure of [undefined, new Error("install failed")]) {
-  test(`double detach failure logs both errors and preserves install ${failure ? "failure" : "success"}`, async () => {
+  NodeTest.test(`double detach failure logs both errors and preserves install ${failure ? "failure" : "success"}`, async () => {
     const { dmg, calls, phases, copy } = dmgFixture({ detachFailures: Infinity });
     const attempt = async () => {
       try {
@@ -97,54 +100,54 @@ for (const failure of [undefined, new Error("install failed")]) {
         await dmg.detach();
       }
     };
-    if (failure) await assert.rejects(attempt, (error) => error === failure);
-    else assert.equal(await attempt(), "installed");
-    assert.deepEqual(phases, [
+    if (failure) await NodeAssert.rejects(attempt, (error) => error === failure);
+    else NodeAssert.equal(await attempt(), "installed");
+    NodeAssert.deepEqual(phases, [
       { name: "dmg_detach_failed", mount: "/scratch/mount",
         error: "Error: detach failed 1; force retry: Error: detach failed 2" },
       { name: "dmg_detach_failed", mount: "/scratch/mount",
         error: "Error: detach failed 3; force retry: Error: detach failed 4" },
     ]);
-    assert.equal(calls.some(([cmd]) => cmd === "rmdir"), false);
+    NodeAssert.equal(calls.some(([cmd]) => cmd === "rmdir"), false);
   });
 }
 
 for (const failAt of ["attach", "copy"]) {
-  test(`finally backstop detaches after ${failAt} failure`, async () => {
+  NodeTest.test(`finally backstop detaches after ${failAt} failure`, async () => {
     const { dmg, calls, copy } = dmgFixture({ failAt });
-    await assert.rejects(async () => {
+    await NodeAssert.rejects(async () => {
       try {
         await dmg.stage("/release.dmg", copy);
       } finally {
         await dmg.detach();
       }
     }, new RegExp(`${failAt} failed`));
-    assert.deepEqual(calls.at(-2).slice(0, 2), ["/usr/bin/hdiutil", ["detach", "-quiet", "/scratch/mount"]]);
-    assert.deepEqual(calls.at(-1), ["rmdir", "/scratch/mount"]);
+    NodeAssert.deepEqual(calls.at(-2).slice(0, 2), ["/usr/bin/hdiutil", ["detach", "-quiet", "/scratch/mount"]]);
+    NodeAssert.deepEqual(calls.at(-1), ["rmdir", "/scratch/mount"]);
   });
 }
 
-test("finally retries a mount left attached by failed early detach", async () => {
+NodeTest.test("finally retries a mount left attached by failed early detach", async () => {
   const { dmg, calls, phases, copy } = dmgFixture({ detachFailures: 2 });
   await dmg.stage("/release.dmg", copy);
-  assert.equal(phases.length, 1);
+  NodeAssert.equal(phases.length, 1);
   await dmg.detach();
   await dmg.detach();
-  assert.equal(calls.filter(([cmd, args]) => cmd === "/usr/bin/hdiutil" && args[0] === "detach").length, 3);
-  assert.deepEqual(calls.at(-1), ["rmdir", "/scratch/mount"]);
+  NodeAssert.equal(calls.filter(([cmd, args]) => cmd === "/usr/bin/hdiutil" && args[0] === "detach").length, 3);
+  NodeAssert.deepEqual(calls.at(-1), ["rmdir", "/scratch/mount"]);
 });
 
-test("DMG backstop does nothing when staging was skipped", async () => {
+NodeTest.test("DMG backstop does nothing when staging was skipped", async () => {
   const { dmg, calls, phases } = dmgFixture();
   await dmg.detach();
-  assert.deepEqual(calls, []);
-  assert.deepEqual(phases, []);
+  NodeAssert.deepEqual(calls, []);
+  NodeAssert.deepEqual(phases, []);
 });
 
 // Every post-quit failure must keep its owner alive through recovery, including rollback.
 for (const rollback of [false, true]) {
   for (const failed of ["quit", "backup", "swap", "launch", "readReady", "report"]) {
-    test(`${rollback ? "rollback" : "install"} ${failed} failure retains hold until healthy recovery`, async () => {
+    NodeTest.test(`${rollback ? "rollback" : "install"} ${failed} failure retains hold until healthy recovery`, async () => {
       const calls = [];
       let quitStarted = false;
       const ops = Object.fromEntries([
@@ -173,37 +176,37 @@ for (const rollback of [false, true]) {
               return recovered.promise;
             },
             onWaiting: async () => calls.push("attention"),
-            sleep: async () => { assert.ok(!calls.includes("stop")); },
+            sleep: async () => { NodeAssert.ok(!calls.includes("stop")); },
           });
         }
       })();
-      const failure = assert.rejects(attempt, new RegExp(`failed ${failed}`));
+      const failure = NodeAssert.rejects(attempt, new RegExp(`failed ${failed}`));
       await waiting.promise;
-      assert.equal(calls[0], "start");
-      assert.equal(calls.includes("stop"), false);
-      assert.equal(calls.filter((x) => x === "attention").length, 1);
+      NodeAssert.equal(calls[0], "start");
+      NodeAssert.equal(calls.includes("stop"), false);
+      NodeAssert.equal(calls.filter((x) => x === "attention").length, 1);
       recovered.resolve(true);
       await failure;
-      assert.equal(calls.at(-1), "stop");
+      NodeAssert.equal(calls.at(-1), "stop");
     });
   }
 }
 
-test("preflights before downtime, swaps sandbox bundles and waits for a new server", async () => {
-  const root = await mkdtemp(join(tmpdir(), "install-test-"));
+NodeTest.test("preflights before downtime, swaps sandbox bundles and waits for a new server", async () => {
+  const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "install-test-"));
   const events = [];
-  const server = createServer((_req, res) => {
+  const server = NodeHttp.createServer((_req, res) => {
     res.setHeader("content-type", "application/json");
     res.end('{"ready":true}');
   });
   try {
-    await mkdir(join(root, "current"));
-    await writeFile(join(root, "current/version"), "old");
+    await NodeFSP.mkdir(NodePath.join(root, "current"));
+    await NodeFSP.writeFile(NodePath.join(root, "current/version"), "old");
     await install({
       stage: async () => {
         events.push("stage");
-        await mkdir(join(root, "next"));
-        await writeFile(join(root, "next/version"), "new");
+        await NodeFSP.mkdir(NodePath.join(root, "next"));
+        await NodeFSP.writeFile(NodePath.join(root, "next/version"), "new");
       },
       verify: async () => events.push("verify"),
       migrations: async () => events.push("migrations"),
@@ -213,19 +216,19 @@ test("preflights before downtime, swaps sandbox bundles and waits for a new serv
       quit: async () => events.push("stop"),
       backup: async () => events.push("backup"),
       swap: async () => {
-        await rename(join(root, "current"), join(root, "prev"));
-        await rename(join(root, "next"), join(root, "current"));
+        await NodeFSP.rename(NodePath.join(root, "current"), NodePath.join(root, "prev"));
+        await NodeFSP.rename(NodePath.join(root, "next"), NodePath.join(root, "current"));
       },
       launch: async () => new Promise((resolve) => server.listen(0, "127.0.0.1", resolve)),
       readReady: async () =>
-        assert.deepEqual(await (await fetch(`http://127.0.0.1:${server.address().port}`)).json(), {
+        NodeAssert.deepEqual(await (await fetch(`http://127.0.0.1:${server.address().port}`)).json(), {
           ready: true,
         }),
       report: async () => events.push("report"),
     });
-    assert.equal(await readFile(join(root, "current/version"), "utf8"), "new");
-    assert.equal(await readFile(join(root, "prev/version"), "utf8"), "old");
-    assert.deepEqual(events.slice(0, 8), [
+    NodeAssert.equal(await NodeFSP.readFile(NodePath.join(root, "current/version"), "utf8"), "new");
+    NodeAssert.equal(await NodeFSP.readFile(NodePath.join(root, "prev/version"), "utf8"), "old");
+    NodeAssert.deepEqual(events.slice(0, 8), [
       "stage",
       "verify",
       "migrations",
@@ -235,11 +238,11 @@ test("preflights before downtime, swaps sandbox bundles and waits for a new serv
       "stop",
       "closed",
     ]);
-    assert.equal(events.at(-1), "report");
+    NodeAssert.equal(events.at(-1), "report");
   } finally {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
-    await rm(root, { recursive: true, force: true });
+    await NodeFSP.rm(root, { recursive: true, force: true });
   }
 });
 
@@ -256,7 +259,7 @@ for (const failed of [
   "readReady",
   "report",
 ]) {
-  test(`failure at ${failed} stops before later actions`, async () => {
+  NodeTest.test(`failure at ${failed} stops before later actions`, async () => {
     const calls = [];
     const ops = Object.fromEntries(
       [
@@ -280,14 +283,14 @@ for (const failed of [
       ]),
     );
     ops.phase = async () => {};
-    await assert.rejects(install(ops), new RegExp(failed));
-    assert.equal(calls.at(-1), failed);
+    await NodeAssert.rejects(install(ops), new RegExp(failed));
+    NodeAssert.equal(calls.at(-1), failed);
     if (["stage", "verify", "migrations", "hostPreflight", "cancelWindow"].includes(failed))
-      assert.ok(!calls.includes("quit"));
+      NodeAssert.ok(!calls.includes("quit"));
   });
 }
 
-test("rollback verifies the previous bundle and schema compatibility before quitting", async () => {
+NodeTest.test("rollback verifies the previous bundle and schema compatibility before quitting", async () => {
   const calls = [];
   const ops = Object.fromEntries(
     [
@@ -303,9 +306,9 @@ test("rollback verifies the previous bundle and schema compatibility before quit
       "phase",
     ].map((name) => [name, async () => calls.push(name)]),
   );
-  ops.swap = async (rollback) => assert.equal(rollback, true);
+  ops.swap = async (rollback) => NodeAssert.equal(rollback, true);
   await install(ops, { rollback: true });
-  assert.equal(calls[0], "verifyPrevious");
+  NodeAssert.equal(calls[0], "verifyPrevious");
 });
 
 const signed = (overrides = {}) => {
@@ -329,7 +332,7 @@ const signed = (overrides = {}) => {
   ].join("\n");
 };
 
-test("accepts an un-notarized Developer ID build from the expected team", () => {
+NodeTest.test("accepts an un-notarized Developer ID build from the expected team", () => {
   checkSignature(signed());
 });
 
@@ -354,7 +357,7 @@ for (const [name, overrides, message] of [
     /Apple Root CA/,
   ],
 ])
-  test(`rejects ${name}`, () => assert.throws(() => checkSignature(signed(overrides)), message));
+  NodeTest.test(`rejects ${name}`, () => NodeAssert.throws(() => checkSignature(signed(overrides)), message));
 
 // Host preflight, failure relaunch and stale staging (install-20261110.1 issue 1).
 
@@ -370,7 +373,7 @@ const fakeProbe = (script) => {
   };
 };
 
-test("host preflight passes a healthy mount without restarting ovnfs", async () => {
+NodeTest.test("host preflight passes a healthy mount without restarting ovnfs", async () => {
   const logs = [];
   const { probe, calls } = fakeProbe([
     { state: "ok", stdout: ".\n..\n.hidden\nrobob-1\n" },
@@ -384,16 +387,16 @@ test("host preflight passes a healthy mount without restarting ovnfs", async () 
     uState: async () => [{ pid: 7, stat: "U", command: "git" }],
     log: async (phase, extra) => logs.push([phase, extra]),
   });
-  assert.equal(result.restarted, false);
-  assert.equal(restarted, false);
+  NodeAssert.equal(result.restarted, false);
+  NodeAssert.equal(restarted, false);
   // Root first, then one checkout inside it (lookups inside hung on 10 Nov).
-  assert.deepEqual(calls, ["/c", "/c/robob-1"]);
+  NodeAssert.deepEqual(calls, ["/c", "/c/robob-1"]);
   const u = logs.find(([phase]) => phase === "host_preflight_u_state");
-  assert.equal(u[1].count, 1);
-  assert.equal(u[1].processes[0].pid, 7);
+  NodeAssert.equal(u[1].count, 1);
+  NodeAssert.equal(u[1].processes[0].pid, 7);
 });
 
-test("host preflight restarts ovnfs once for a hung checkout and continues when it answers", async () => {
+NodeTest.test("host preflight restarts ovnfs once for a hung checkout and continues when it answers", async () => {
   const logs = [];
   const { probe } = fakeProbe([
     { state: "ok", stdout: "a\n" },
@@ -410,16 +413,16 @@ test("host preflight restarts ovnfs once for a hung checkout and continues when 
     log: async (phase) => logs.push(phase),
     sleep: async () => {},
   });
-  assert.equal(restarts, 1);
-  assert.equal(result.restarted, true);
-  assert.ok(logs.includes("host_preflight_ovnfs_restart"));
+  NodeAssert.equal(restarts, 1);
+  NodeAssert.equal(result.restarted, true);
+  NodeAssert.ok(logs.includes("host_preflight_ovnfs_restart"));
 });
 
-test("host preflight aborts before the quit when the mount still hangs after the restart", async () => {
+NodeTest.test("host preflight aborts before the quit when the mount still hangs after the restart", async () => {
   const hang = { state: "hang", timeoutMs: 10_000 };
   const { probe } = fakeProbe([hang, hang, hang, hang]);
   let restarts = 0;
-  await assert.rejects(
+  await NodeAssert.rejects(
     hostPreflight({
       checkoutsDir: "/c",
       probe,
@@ -431,18 +434,18 @@ test("host preflight aborts before the quit when the mount still hangs after the
     }),
     /still hangs after ovnfs restart; not quitting Robob/,
   );
-  assert.equal(restarts, 1);
+  NodeAssert.equal(restarts, 1);
 });
 
-test("host preflight refuses a hung mount when no ovnfs restart is available", async () => {
+NodeTest.test("host preflight refuses a hung mount when no ovnfs restart is available", async () => {
   const { probe } = fakeProbe([{ state: "hang", timeoutMs: 10 }]);
-  await assert.rejects(
+  await NodeAssert.rejects(
     hostPreflight({ checkoutsDir: "/c", probe, uState: async () => [], log: async () => {} }),
     /not quitting Robob/,
   );
 });
 
-test("host preflight tolerates a missing ~/checkouts", async () => {
+NodeTest.test("host preflight tolerates a missing ~/checkouts", async () => {
   const { probe } = fakeProbe([{ state: "absent" }]);
   const result = await hostPreflight({
     checkoutsDir: "/c",
@@ -450,10 +453,10 @@ test("host preflight tolerates a missing ~/checkouts", async () => {
     uState: async () => [],
     log: async () => {},
   });
-  assert.equal(result.result.state, "absent");
+  NodeAssert.equal(result.result.state, "absent");
 });
 
-test("a failed host preflight stops the install before the cancel window and quit", async () => {
+NodeTest.test("a failed host preflight stops the install before the cancel window and quit", async () => {
   const calls = [];
   const ops = Object.fromEntries(
     [
@@ -474,39 +477,39 @@ test("a failed host preflight stops the install before the cancel window and qui
     calls.push("hostPreflight");
     throw new Error("still hangs");
   };
-  await assert.rejects(install(ops), /still hangs/);
-  assert.deepEqual(calls, ["stage", "verify", "migrations", "hostPreflight"]);
+  await NodeAssert.rejects(install(ops), /still hangs/);
+  NodeAssert.deepEqual(calls, ["stage", "verify", "migrations", "hostPreflight"]);
 });
 
-test("probeDirectory reports a real directory, a missing one, and a hang", async () => {
-  const root = await mkdtemp(join(tmpdir(), "probe-test-"));
+NodeTest.test("probeDirectory reports a real directory, a missing one, and a hang", async () => {
+  const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "probe-test-"));
   try {
-    await mkdir(join(root, "x"));
+    await NodeFSP.mkdir(NodePath.join(root, "x"));
     const ok = await probeDirectory(root, 5000);
-    assert.equal(ok.state, "ok");
-    assert.match(ok.stdout, /\bx\b/);
-    assert.equal((await probeDirectory(join(root, "missing"), 5000)).state, "absent");
+    NodeAssert.equal(ok.state, "ok");
+    NodeAssert.match(ok.stdout, /\bx\b/);
+    NodeAssert.equal((await probeDirectory(NodePath.join(root, "missing"), 5000)).state, "absent");
     // A stand-in for a lookup stuck on a hung mount: a command that outlives the timeout.
     const hung = await probeDirectory(root, 200, ["/bin/sleep", ["30"]]);
-    assert.equal(hung.state, "hang");
-    assert.equal(hung.timeoutMs, 200);
+    NodeAssert.equal(hung.state, "hang");
+    NodeAssert.equal(hung.timeoutMs, 200);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await NodeFSP.rm(root, { recursive: true, force: true });
   }
 });
 
-test("uStateProcesses keeps only U-state rows", async () => {
+NodeTest.test("uStateProcesses keeps only U-state rows", async () => {
   const rows = await uStateProcesses(async () => ({
     stdout:
       "  1 Ss   /sbin/launchd\n5646 U    /Applications/Robob.app/Contents/MacOS/Robob\n 77 U+   git\n",
   }));
-  assert.deepEqual(
+  NodeAssert.deepEqual(
     rows.map((r) => r.pid),
     [5646, 77],
   );
 });
 
-test("failure relaunch waits for the old server to exit before reopening the app", async () => {
+NodeTest.test("failure relaunch waits for the old server to exit before reopening the app", async () => {
   const logs = [];
   let checks = 0;
   let launched = 0;
@@ -514,19 +517,19 @@ test("failure relaunch waits for the old server to exit before reopening the app
   const ok = await relaunchAfterFailure({
     survivors: async () => (++checks < 4 ? [{ pid: 5646 }] : []),
     launch: async () => {
-      assert.equal(checks, 4, "launch only after the survivor is gone");
+      NodeAssert.equal(checks, 4, "launch only after the survivor is gone");
       launched++;
     },
     log: async (phase) => logs.push(phase),
     sleep: async (ms) => (clock += ms),
     now: () => clock,
   });
-  assert.equal(ok, true);
-  assert.equal(launched, 1);
-  assert.ok(logs.includes("relaunch_waiting"));
+  NodeAssert.equal(ok, true);
+  NodeAssert.equal(launched, 1);
+  NodeAssert.ok(logs.includes("relaunch_waiting"));
 });
 
-test("failure relaunch never reopens beside a survivor and alerts instead", async () => {
+NodeTest.test("failure relaunch never reopens beside a survivor and alerts instead", async () => {
   const notes = [];
   let clock = 0;
   let launched = false;
@@ -539,12 +542,12 @@ test("failure relaunch never reopens beside a survivor and alerts instead", asyn
     now: () => clock,
     boundMs: 5000,
   });
-  assert.equal(ok, false);
-  assert.equal(launched, false);
-  assert.match(notes[0], /NOT relaunched.*5646/);
+  NodeAssert.equal(ok, false);
+  NodeAssert.equal(launched, false);
+  NodeAssert.match(notes[0], /NOT relaunched.*5646/);
 });
 
-test("failure relaunch treats an unreadable process table as still running", async () => {
+NodeTest.test("failure relaunch treats an unreadable process table as still running", async () => {
   let clock = 0;
   let launched = false;
   const ok = await relaunchAfterFailure({
@@ -557,8 +560,8 @@ test("failure relaunch treats an unreadable process table as still running", asy
     now: () => clock,
     boundMs: 2000,
   });
-  assert.equal(ok, false);
-  assert.equal(launched, false);
+  NodeAssert.equal(ok, false);
+  NodeAssert.equal(launched, false);
 });
 
 const stagingDeps = (overrides = {}) => {
@@ -582,29 +585,29 @@ const stagingDeps = (overrides = {}) => {
   };
 };
 
-test("a stale Robob staging bundle is moved aside, removed and logged", async () => {
+NodeTest.test("a stale Robob staging bundle is moved aside, removed and logged", async () => {
   const { deps, calls } = stagingDeps();
-  assert.equal(await clearStaleStaging(deps), "removed");
-  assert.deepEqual(
+  NodeAssert.equal(await clearStaleStaging(deps), "removed");
+  NodeAssert.deepEqual(
     calls.map((c) => c[0]),
     ["stale_staging_found", "rename", "remove", "stale_staging_removed"],
   );
-  assert.equal(calls[1][2], "/A/.Robob.next.app.stale-s1");
+  NodeAssert.equal(calls[1][2], "/A/.Robob.next.app.stale-s1");
 });
 
-test("a partial staging copy (Contents only, no Info.plist) counts as stale", async () => {
+NodeTest.test("a partial staging copy (Contents only, no Info.plist) counts as stale", async () => {
   const { deps } = stagingDeps({
     readBundleId: async () => {
       throw new Error("no Info.plist");
     },
   });
-  assert.equal(await clearStaleStaging(deps), "removed");
+  NodeAssert.equal(await clearStaleStaging(deps), "removed");
 });
 
-test("no staging bundle means nothing to do", async () => {
+NodeTest.test("no staging bundle means nothing to do", async () => {
   const { deps, calls } = stagingDeps({ exists: async () => false });
-  assert.equal(await clearStaleStaging(deps), "absent");
-  assert.equal(calls.length, 0);
+  NodeAssert.equal(await clearStaleStaging(deps), "absent");
+  NodeAssert.equal(calls.length, 0);
 });
 
 for (const [name, overrides, message] of [
@@ -625,28 +628,28 @@ for (const [name, overrides, message] of [
     /Processes run from .* \(pid 99\)/,
   ],
 ])
-  test(`staging bundle is kept when it has ${name}`, async () => {
+  NodeTest.test(`staging bundle is kept when it has ${name}`, async () => {
     const { deps, calls } = stagingDeps(overrides);
-    await assert.rejects(clearStaleStaging(deps), message);
-    assert.ok(!calls.some((c) => c[0] === "rename" || c[0] === "remove"));
+    await NodeAssert.rejects(clearStaleStaging(deps), message);
+    NodeAssert.ok(!calls.some((c) => c[0] === "rename" || c[0] === "remove"));
   });
 
-test("installer and process-path parsers", () => {
+NodeTest.test("installer and process-path parsers", () => {
   const ps = [
     "100 /usr/local/bin/node /x/apps/desktop/scripts/install-robob-fast.mjs --dmg /a.dmg",
     "101 node /x/install-robob-fast.mjs --dry-run",
     "102 tmux -L robob-install new-session -d -s install-1 zsh /x/install-robob-fast.zsh --dmg /a.dmg",
     "103 /usr/local/bin/node /x/install-robob-fast.mjs --dmg /b.dmg",
   ].join("\n");
-  assert.deepEqual(otherInstallerPids(ps, 103), [100]);
+  NodeAssert.deepEqual(otherInstallerPids(ps, 103), [100]);
   const comm = "5 /A/.Robob.next.app/Contents/MacOS/Robob\n6 /A/Robob.app/Contents/MacOS/Robob\n";
-  assert.deepEqual(pidsRunningFrom(comm, "/A/.Robob.next.app"), [{ pid: 5 }]);
-  assert.deepEqual(pidsRunningFrom(comm, "/A/Robob.app"), [{ pid: 6 }]);
+  NodeAssert.deepEqual(pidsRunningFrom(comm, "/A/.Robob.next.app"), [{ pid: 5 }]);
+  NodeAssert.deepEqual(pidsRunningFrom(comm, "/A/Robob.app"), [{ pid: 6 }]);
 });
 
-test("readiness polls reject on every failure and never use global fetch", async () => {
+NodeTest.test("readiness polls reject on every failure and never use global fetch", async () => {
   const hits = [];
-  const server = createServer((req, res) => {
+  const server = NodeHttp.createServer((req, res) => {
     hits.push(req.headers.authorization);
     if (req.url === "/ok") {
       res.setHeader("content-type", "application/json");
@@ -697,7 +700,7 @@ test("readiness polls reject on every failure and never use global fetch", async
   let trickleClosed = false;
   // Another origin (same host, other port) that the first one redirects to.
   const otherHits = [];
-  const other = createServer((req, res) => {
+  const other = NodeHttp.createServer((req, res) => {
     otherHits.push(req.headers.authorization);
     res.setHeader("content-type", "application/json");
     res.end('{"bootId":"b2"}');
@@ -707,38 +710,38 @@ test("readiness polls reject on every failure and never use global fetch", async
   const { port } = server.address();
   const origin = `http://127.0.0.1:${port}`;
   try {
-    assert.deepEqual(await getJson(`${origin}/ok`, { headers: { authorization: "Bearer t" } }), {
+    NodeAssert.deepEqual(await getJson(`${origin}/ok`, { headers: { authorization: "Bearer t" } }), {
       bootId: "b1",
     });
-    assert.deepEqual(hits, ["Bearer t"]);
-    await assert.rejects(getJson(`${origin}/bad`), /HTTP 503/);
-    await assert.rejects(getJson(`${origin}/text`), SyntaxError);
-    await assert.rejects(getJson(`${origin}/slow`, { timeoutMs: 50 }), /timed out/);
+    NodeAssert.deepEqual(hits, ["Bearer t"]);
+    await NodeAssert.rejects(getJson(`${origin}/bad`), /HTTP 503/);
+    await NodeAssert.rejects(getJson(`${origin}/text`), SyntaxError);
+    await NodeAssert.rejects(getJson(`${origin}/slow`, { timeoutMs: 50 }), /timed out/);
     // The deadline bounds the whole exchange: a reply that keeps trickling still ends,
     // and its connection is closed.
     const trickleStarted = Date.now();
-    await assert.rejects(getJson(`${origin}/trickle`, { timeoutMs: 80 }), /timed out/);
-    assert.ok(Date.now() - trickleStarted < 1000);
+    await NodeAssert.rejects(getJson(`${origin}/trickle`, { timeoutMs: 80 }), /timed out/);
+    NodeAssert.ok(Date.now() - trickleStarted < 1000);
     for (let i = 0; i < 50 && !trickleClosed; i++) await new Promise((ok) => setTimeout(ok, 10));
-    assert.equal(trickleClosed, true);
-    await assert.rejects(getJson(`${origin}/huge`), /too large/);
+    NodeAssert.equal(trickleClosed, true);
+    await NodeAssert.rejects(getJson(`${origin}/huge`), /too large/);
     // Redirects are followed as fetch followed them, within a bound; the credential goes
     // only to the origin it was given for.
     hits.length = 0;
-    assert.deepEqual(await getJson(`${origin}/moved`, { headers: { authorization: "Bearer t" } }), {
+    NodeAssert.deepEqual(await getJson(`${origin}/moved`, { headers: { authorization: "Bearer t" } }), {
       bootId: "b1",
     });
-    assert.deepEqual(hits, ["Bearer t", "Bearer t"]);
+    NodeAssert.deepEqual(hits, ["Bearer t", "Bearer t"]);
     hits.length = 0;
-    assert.deepEqual(
+    NodeAssert.deepEqual(
       await getJson(`${origin}/elsewhere`, { headers: { authorization: "Bearer t" } }),
       { bootId: "b2" },
     );
-    assert.deepEqual([hits, otherHits], [["Bearer t"], [undefined]]);
-    await assert.rejects(getJson(`${origin}/loop`), /Too many redirects/);
+    NodeAssert.deepEqual([hits, otherHits], [["Bearer t"], [undefined]]);
+    await NodeAssert.rejects(getJson(`${origin}/loop`), /Too many redirects/);
     // A redirect node:http cannot request rejects the poll; it used to throw from the
     // response callback and end the process.
-    await assert.rejects(getJson(`${origin}/malformed`), URIError);
+    await NodeAssert.rejects(getJson(`${origin}/malformed`), URIError);
   } finally {
     server.closeAllConnections();
     other.closeAllConnections();
@@ -746,26 +749,26 @@ test("readiness polls reject on every failure and never use global fetch", async
     await new Promise((resolve) => other.close(resolve));
   }
   // The server is gone: what the installer polls right after launching the new app.
-  for (let i = 0; i < 20; i++) await assert.rejects(getJson(`${origin}/ok`), /ECONNREFUSED/);
+  for (let i = 0; i < 20; i++) await NodeAssert.rejects(getJson(`${origin}/ok`), /ECONNREFUSED/);
   // Node 26.2's fetch crashed the installer from a socket callback; keep it out.
-  const source = await readFile(new URL("./install-robob-fast.mjs", import.meta.url), "utf8");
-  assert.doesNotMatch(source.replace(/^\s*(\*|\/\/).*$/gm, ""), /\bfetch\(/);
+  const source = await NodeFSP.readFile(new URL("./install-robob-fast.mjs", import.meta.url), "utf8");
+  NodeAssert.doesNotMatch(source.replace(/^\s*(\*|\/\/).*$/gm, ""), /\bfetch\(/);
 });
 
-test("the pre-quit migration check waits 10 minutes by default and takes an env override", () => {
-  assert.equal(migrationCheckTimeoutMs({}), 600_000);
-  assert.equal(
+NodeTest.test("the pre-quit migration check waits 10 minutes by default and takes an env override", () => {
+  NodeAssert.equal(migrationCheckTimeoutMs({}), 600_000);
+  NodeAssert.equal(
     migrationCheckTimeoutMs({ ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS: "900000" }),
     900_000,
   );
-  assert.equal(migrationCheckTimeoutMs({ ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS: "5" }), 600_000);
-  assert.equal(
+  NodeAssert.equal(migrationCheckTimeoutMs({ ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS: "5" }), 600_000);
+  NodeAssert.equal(
     migrationCheckTimeoutMs({ ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS: "nope" }),
     600_000,
   );
 });
 
-test("clones only the live databases, never the pre-shrink copy", () => {
+NodeTest.test("clones only the live databases, never the pre-shrink copy", () => {
   const names = [
     "statev2.sqlite",
     "statev2.sqlite-wal",
@@ -776,13 +779,13 @@ test("clones only the live databases, never the pre-shrink copy", () => {
     "boards.sqlite.pre-ledger14",
     "archive.sqlite",
   ];
-  assert.deepEqual(
+  NodeAssert.deepEqual(
     names.filter((n) => INSTALL_DATABASE_FILE.test(n)),
     ["statev2.sqlite", "statev2.sqlite-wal", "boards.sqlite", "boards.sqlite-wal"],
   );
 });
 
-test("prunes old backups only after the report, and a prune failure does not fail the install", async () => {
+NodeTest.test("prunes old backups only after the report, and a prune failure does not fail the install", async () => {
   const calls = [];
   const ops = Object.fromEntries(
     [
@@ -805,6 +808,283 @@ test("prunes old backups only after the report, and a prune failure does not fai
     throw new Error("rm failed");
   };
   await install(ops);
-  assert.deepEqual(calls.slice(-4), ["ready", "report", "prune", "prune_failed:Error: rm failed"]);
-  assert.ok(calls.indexOf("backup") < calls.indexOf("swap"));
+  NodeAssert.deepEqual(calls.slice(-4), ["ready", "report", "prune", "prune_failed:Error: rm failed"]);
+  NodeAssert.ok(calls.indexOf("backup") < calls.indexOf("swap"));
+});
+
+const backupStamp = (day) => `2026-11-${String(day).padStart(2, "0")}T12-00-00.000Z`;
+const pruneOutcomes = (events) => events.filter(({ name }) =>
+  ["backups_pruned", "prune_failed", "prune_skipped"].includes(name));
+
+async function backupFixture(t) {
+  const backupRoot = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "robob-backup-retention-"));
+  t.after(() => NodeFSP.rm(backupRoot, { recursive: true, force: true }));
+  const events = [];
+  const phase = async (name, details = {}) => events.push({ name, ...details });
+  const put = async (name, { marked = true, pinned = false, database = "backup" } = {}) => {
+    const directory = NodePath.join(backupRoot, name);
+    await NodeFSP.mkdir(directory);
+    if (database !== null) await NodeFSP.writeFile(NodePath.join(directory, "statev2.sqlite"), database);
+    if (marked) await NodeFSP.writeFile(NodePath.join(directory, ".complete"), "{}");
+    if (pinned) await NodeFSP.writeFile(NodePath.join(directory, ".pinned"), "{}");
+  };
+  return { backupRoot, events, phase, put, names: async () => (await NodeFSP.readdir(backupRoot)).sort() };
+}
+
+NodeTest.test("clone completion marker is synced only after the clone succeeds", async (t) => {
+  const { backupRoot } = await backupFixture(t);
+  const stamp = backupStamp(1);
+  const order = [];
+  const io = {
+    ...NodeFSP,
+    open: async (...args) => {
+      order.push("open marker");
+      const handle = await NodeFSP.open(...args);
+      return {
+        writeFile: (value) => handle.writeFile(value),
+        sync: async () => { order.push("sync"); await handle.sync(); },
+        close: async () => { order.push("close"); await handle.close(); },
+      };
+    },
+  };
+  await cloneBackup({ backupRoot, stamp, fs: io, clone: async (destination) => {
+    await NodeFSP.mkdir(destination);
+    await NodeFSP.writeFile(NodePath.join(destination, "statev2.sqlite"), "backup");
+    order.push("cloned");
+    return ["statev2.sqlite"];
+  } });
+  const marker = JSON.parse(await NodeFSP.readFile(NodePath.join(backupRoot, stamp, ".complete"), "utf8"));
+  NodeAssert.deepEqual(order, ["cloned", "open marker", "sync", "close"]);
+  NodeAssert.equal(marker.stamp, stamp);
+  NodeAssert.deepEqual(marker.files, ["statev2.sqlite"]);
+  NodeAssert.ok(Number.isFinite(Date.parse(marker.completedAt)));
+});
+
+for (const failedAt of ["clone", "sync"]) {
+  NodeTest.test(`a ${failedAt} failure leaves a partial clone, never a completed timestamp dir`, async (t) => {
+    const { backupRoot, names } = await backupFixture(t);
+    const stamp = backupStamp(1);
+    const failure = new Error(`${failedAt} failed`);
+    let closed = false;
+    const io = { ...NodeFSP, open: async (...args) => {
+      const handle = await NodeFSP.open(...args);
+      return {
+        writeFile: (value) => handle.writeFile(value),
+        sync: async () => { throw failure; },
+        close: async () => { closed = true; await handle.close(); },
+      };
+    } };
+    await NodeAssert.rejects(cloneBackup({ backupRoot, stamp, fs: io, clone: async (destination) => {
+      await NodeFSP.mkdir(destination);
+      await NodeFSP.writeFile(NodePath.join(destination, "statev2.sqlite"), "half cloned");
+      if (failedAt === "clone") throw failure;
+      return ["statev2.sqlite"];
+    } }), (error) => error === failure);
+    NodeAssert.deepEqual(await names(), [`partial-${stamp}`]);
+    NodeAssert.equal(closed, failedAt === "sync");
+  });
+}
+
+NodeTest.test("prune keeps two marked backups and removes older, partial and interrupted clones", async (t) => {
+  const f = await backupFixture(t);
+  for (let i = 1; i <= 5; i++) await f.put(backupStamp(i));
+  await f.put(backupStamp(6), { marked: false });
+  const partial = `partial-${backupStamp(7)}`;
+  await f.put(partial, { marked: false });
+  await pruneBackups({ ...f, currentStamp: backupStamp(6), trigger: "ready" });
+  NodeAssert.deepEqual(await f.names(), [backupStamp(4), backupStamp(5)]);
+  NodeAssert.deepEqual(f.events, [
+    { name: "prune_started", trigger: "ready" },
+    { name: "backups_pruned", trigger: "ready",
+      removed: [partial, backupStamp(6), backupStamp(3), backupStamp(2), backupStamp(1)],
+      kept: [backupStamp(5), backupStamp(4)], pinned: [], incomplete: [partial, backupStamp(6)] },
+  ]);
+});
+
+for (const markedBoundary of [false, true]) {
+  NodeTest.test(`legacy backups need a nonempty database${markedBoundary ? " and must precede the oldest marker" : " before any markers exist"}`, async (t) => {
+    const f = await backupFixture(t);
+    await f.put(backupStamp(1), { marked: false });
+    await f.put(backupStamp(2), { marked: false });
+    await f.put(backupStamp(3), { marked: false });
+    await f.put(backupStamp(4), { marked: false, database: "" });
+    await f.put(backupStamp(5), { marked: false, database: null });
+    if (markedBoundary) {
+      await f.put(backupStamp(6));
+      await f.put(backupStamp(7), { marked: false });
+    }
+    await pruneBackups({ ...f, trigger: "ready" });
+    NodeAssert.deepEqual(await f.names(), markedBoundary
+      ? [backupStamp(3), backupStamp(6)] : [backupStamp(2), backupStamp(3)]);
+    NodeAssert.deepEqual(f.events.at(-1).incomplete,
+      (markedBoundary ? [7, 5, 4] : [5, 4]).map(backupStamp));
+  });
+}
+
+for (const pinnedDay of [1, 5]) {
+  NodeTest.test(`pinned backup ${pinnedDay} survives without using either retention slot`, async (t) => {
+    const f = await backupFixture(t);
+    for (let i = 1; i <= 5; i++) await f.put(backupStamp(i), { pinned: i === pinnedDay });
+    await pruneBackups({ ...f, trigger: "ready" });
+    NodeAssert.deepEqual(await f.names(), (pinnedDay === 1 ? [1, 4, 5] : [3, 4, 5]).map(backupStamp));
+    NodeAssert.deepEqual(f.events.at(-1).pinned, [backupStamp(pinnedDay)]);
+  });
+}
+
+NodeTest.test("current usable backup survives even when older than the two retention slots", async (t) => {
+  const f = await backupFixture(t);
+  for (let i = 1; i <= 4; i++) await f.put(backupStamp(i));
+  await pruneBackups({ ...f, currentStamp: backupStamp(1), trigger: "ready" });
+  NodeAssert.deepEqual(await f.names(), [1, 3, 4].map(backupStamp));
+});
+
+NodeTest.test("zero usable backups preserves timestamps and pins, removing only unpinned partials", async (t) => {
+  const f = await backupFixture(t);
+  await f.put(backupStamp(1), { marked: false, database: "" });
+  await f.put(backupStamp(2), { marked: false, database: null });
+  const partial = `partial-${backupStamp(3)}`;
+  const pinned = `partial-${backupStamp(4)}`;
+  await f.put(partial, { marked: false });
+  await f.put(pinned, { marked: false, pinned: true });
+  await pruneBackups({ ...f, trigger: "relaunched" });
+  NodeAssert.deepEqual(await f.names(), [backupStamp(1), backupStamp(2), pinned]);
+  NodeAssert.equal(f.events.at(-1).reason, "no_usable_backup");
+  NodeAssert.deepEqual(f.events.at(-1).removed, [partial]);
+  NodeAssert.deepEqual(f.events.at(-1).pinned, [pinned]);
+  NodeAssert.equal(pruneOutcomes(f.events).length, 1);
+});
+
+NodeTest.test("missing backup root skips retention after a pre-backup relaunch", async (t) => {
+  const f = await backupFixture(t);
+  await pruneBackups({ ...f, backupRoot: NodePath.join(f.backupRoot, "missing"), trigger: "relaunched" });
+  NodeAssert.equal(f.events.at(-1).reason, "no_usable_backup");
+});
+
+async function recoveryFixture(t, { failAt, holdFails = false, releaseFails = false, pruneFails = false } = {}) {
+  const f = await backupFixture(t);
+  for (let i = 1; i <= 3; i++) await f.put(backupStamp(i));
+  const currentStamp = backupStamp(4);
+  const failure = new Error("Install exceeded the 3 minute limit");
+  const io = { ...NodeFSP, rm: async (...args) => {
+    if (pruneFails && args[1]?.recursive) throw new Error("rm failed");
+    return NodeFSP.rm(...args);
+  } };
+  const retention = createBackupRetention({ ...f, currentStamp, fs: io });
+  let quitStarted = false;
+  let backupDone = false;
+  let swapped = false;
+  let healthCalls = 0;
+  const ops = Object.fromEntries(["stage", "verify", "migrations", "hostPreflight", "cancelWindow",
+    "launch", "readReady", "report"].map((name) => [name, async () => {
+      if (failAt === name) throw failure;
+    }]));
+  Object.assign(ops, {
+    phase: f.phase,
+    quit: async () => { quitStarted = true; },
+    backup: async () => {
+      await cloneBackup({ ...f, stamp: currentStamp, clone: async (destination) => {
+        await NodeFSP.mkdir(destination);
+        await NodeFSP.writeFile(NodePath.join(destination, "statev2.sqlite"), "backup");
+        return ["statev2.sqlite"];
+      } });
+      backupDone = true;
+    },
+    swap: async () => {
+      if (failAt === "swap") throw failure;
+      swapped = true;
+    },
+    prune: () => retention.prune("ready"),
+  });
+  const run = async () => {
+    let installFailure;
+    try {
+      await install(ops);
+    } catch (error) {
+      installFailure = error;
+      if (backupDone || swapped) await retention.pin(error);
+      throw error;
+    } finally {
+      await retention.finish({
+        failure: installFailure, swapped, quitStarted,
+        release: async () => {
+          if (releaseFails) throw new Error("hold release failed");
+          await f.phase("hold_released");
+        },
+        healthy: async () => ++healthCalls > 1,
+        onWaiting: () => f.phase("recovery_waiting"),
+        sleep: async () => { if (holdFails) throw new Error("recovery interrupted"); },
+      });
+    }
+  };
+  return { ...f, run, failure, currentStamp, retention };
+}
+
+for (const failAt of ["launch", "report", "swap"]) {
+  NodeTest.test(`recovery after ${failAt} pins, releases, unpins then prunes once and preserves the install error`, async (t) => {
+    const f = await recoveryFixture(t, { failAt });
+    await NodeAssert.rejects(f.run(), (error) => error === f.failure);
+    NodeAssert.deepEqual(f.events.filter(({ name }) => ["backup_pinned", "recovery_waiting", "hold_released",
+      "backup_unpinned", "prune_started", "backups_pruned"].includes(name)).map(({ name }) => name),
+    ["backup_pinned", "recovery_waiting", "hold_released", "backup_unpinned", "prune_started", "backups_pruned"]);
+    NodeAssert.equal(f.events.at(-1).trigger, failAt === "swap" ? "relaunched" : "recovered");
+    NodeAssert.deepEqual(await f.names(), [backupStamp(3), f.currentStamp]);
+    NodeAssert.equal(pruneOutcomes(f.events).length, 1);
+    await NodeAssert.rejects(NodeFSP.readFile(NodePath.join(f.backupRoot, f.currentStamp, ".pinned")), { code: "ENOENT" });
+  });
+}
+
+NodeTest.test("an interrupted failed install leaves its rollback pinned through a later run's prune", async (t) => {
+  const f = await recoveryFixture(t, { failAt: "launch", holdFails: true });
+  await NodeAssert.rejects(f.run(), (error) => error === f.failure);
+  NodeAssert.equal(f.events.at(-1).reason, "not_healthy");
+  NodeAssert.equal(pruneOutcomes(f.events).length, 1);
+  const pin = JSON.parse(await NodeFSP.readFile(NodePath.join(f.backupRoot, f.currentStamp, ".pinned"), "utf8"));
+  NodeAssert.equal(pin.reason, "install_failed");
+  NodeAssert.equal(pin.error, String(f.failure));
+  for (let i = 5; i <= 8; i++) await f.put(backupStamp(i));
+  await pruneBackups({ ...f, currentStamp: backupStamp(8), trigger: "ready" });
+  NodeAssert.deepEqual(await f.names(), [4, 7, 8].map(backupStamp));
+  NodeAssert.deepEqual(f.events.at(-1).pinned, [f.currentStamp]);
+});
+
+NodeTest.test("failure before quit releases the hold and logs one reasoned skip", async (t) => {
+  const f = await recoveryFixture(t, { failAt: "verify" });
+  await NodeAssert.rejects(f.run(), (error) => error === f.failure);
+  NodeAssert.deepEqual(f.events, [
+    { name: "hold_released" }, { name: "prune_skipped", reason: "failed_before_quit" },
+  ]);
+  NodeAssert.deepEqual(await f.names(), [1, 2, 3].map(backupStamp));
+});
+
+NodeTest.test("a failed hold release preserves the rollback pin and original install error", async (t) => {
+  const f = await recoveryFixture(t, { failAt: "launch", releaseFails: true });
+  await NodeAssert.rejects(f.run(), (error) => error === f.failure);
+  NodeAssert.deepEqual(pruneOutcomes(f.events), [
+    { name: "prune_skipped", reason: "not_healthy", error: "Error: hold release failed" },
+  ]);
+  NodeAssert.equal(f.events.some(({ name }) => name === "backup_unpinned"), false);
+  NodeAssert.equal(f.events.some(({ name }) => name === "prune_started"), false);
+  NodeAssert.equal(JSON.parse(await NodeFSP.readFile(NodePath.join(f.backupRoot, f.currentStamp, ".pinned"), "utf8")).reason,
+    "install_failed");
+});
+
+for (const failAt of [undefined, "launch"]) {
+  NodeTest.test(`a prune failure logs once and preserves ${failAt ? "the install error" : "success"}`, async (t) => {
+    const f = await recoveryFixture(t, { failAt, pruneFails: true });
+    if (failAt) await NodeAssert.rejects(f.run(), (error) => error === f.failure);
+    else await f.run();
+    NodeAssert.deepEqual(pruneOutcomes(f.events), [
+      { name: "prune_failed", trigger: failAt ? "recovered" : "ready", error: "Error: rm failed" },
+    ]);
+    NodeAssert.equal(f.events.filter(({ name }) => name === "prune_started").length, 1);
+  });
+}
+
+NodeTest.test("normal install still prunes once after report with the ready trigger", async (t) => {
+  const f = await recoveryFixture(t);
+  await f.run();
+  NodeAssert.deepEqual(pruneOutcomes(f.events).map(({ name, trigger }) => ({ name, trigger })),
+    [{ name: "backups_pruned", trigger: "ready" }]);
+  NodeAssert.deepEqual(await f.names(), [backupStamp(3), f.currentStamp]);
+  NodeAssert.equal(f.events.filter(({ name }) => name === "prune_started").length, 1);
 });
