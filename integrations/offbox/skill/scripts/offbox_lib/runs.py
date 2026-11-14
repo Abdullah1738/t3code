@@ -1394,7 +1394,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               f"_offbox_needs_go={int(usage.needs_go)}\n{GO_REPAIR}",
               node,
               node_tools.block(rdir, repo_root),
-              ('''for _offbox_tool in terraform aws ruby vector; do
+              ('''for _offbox_tool in terraform aws ruby vector gh; do
   command -v "$_offbox_tool" >/dev/null || {
     echo "offbox: required tool missing on command PATH: $_offbox_tool" >&2
     echo offbox-repo-setup-failed >&2
@@ -2728,6 +2728,7 @@ def _background(a, me: dict) -> int:
         ready_r, ready_w = os.pipe()
         accept_r, accept_w = os.pipe()
         payload = json.dumps(dict(args=vars(a), me=me, env=dict(os.environ), backend=common.backend(),
+                                  home_wait_deadline=home.wait_budget_end(),
                                   ready_fd=ready_w, accept_fd=accept_r, signal_mask=list(mask))).encode()
         boot_env = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR')}
         with open(client_log, 'ab', opener=lambda p, f: os.open(p, f, 0o600)) as dst:
@@ -2816,8 +2817,9 @@ def background_queue(run_id: str, payload: dict) -> int:
     finally:
         con.close()
     os.environ[BACKGROUND_RUN_ENV] = run_id
-    return background_client(a, me, ready=payload['ready_fd'], accept=payload['accept_fd'],
-                             signal_mask=payload['signal_mask'], source_failure=source_failure)
+    with home.wait_budget(payload.get('home_wait_deadline')):
+        return background_client(a, me, ready=payload['ready_fd'], accept=payload['accept_fd'],
+                                 signal_mask=payload['signal_mask'], source_failure=source_failure)
 
 
 def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, source_failure=None) -> int:

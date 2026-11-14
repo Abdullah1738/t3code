@@ -521,10 +521,8 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
             full = base if ":" in base else f"{rk}:{base}"
             brow = con.execute(f"SELECT * FROM bases WHERE name=? AND {mine()}", (full,)).fetchone()
             if not brow and home.only_on_home("bases", "name=?", (full,)):
-                # Saved on the home server, which is down: Boat never had it.
-                say(f"saved base '{full}' exists only on the home offbox server, which is down: "
-                    "using the repo template or recipe for this run")
-                base = None
+                raise home.base_down_error(full, os.environ.get(home.FAILOVER_ENV) or
+                                           'marked down by the health monitor')
             elif not brow:
                 from .base_catalog import missing
                 raise missing(full)

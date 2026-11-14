@@ -37,6 +37,7 @@ import * as EventStore from "../../orchestration-v2/EventStore.ts";
 import * as Executor from "../../orchestration-v2/ThreadCommandExecutor.ts";
 import * as LegacyV1ThreadImporter from "../../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
 import * as ThreadRedaction from "./ThreadRedaction.ts";
+import * as ServerLogFile from "../observability/serverLogFile.ts";
 
 const writerHooks = vi.hoisted(() => ({
   before: undefined as ((sql: string) => void) | undefined,
@@ -674,6 +675,72 @@ it.effect(
         expect(contents.join().includes(fake)).toBe(false);
       }),
     ),
+);
+
+it.effect("drains the buffered server log before redaction and keeps later flushes clean", () =>
+  run(
+    Effect.gen(function* () {
+      yield* seed;
+      const config = yield* Config.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      const sql = yield* SqlClient.SqlClient;
+      const providerRoot = NodePath.join(
+        config.baseDir,
+        "harness-homes",
+        "claude",
+        "projects",
+        "fixture",
+      );
+      yield* fs.makeDirectory(providerRoot, { recursive: true });
+      yield* fs.writeFileString(
+        NodePath.join(providerRoot, "session-fixture.jsonl"),
+        JSON.stringify({ type: "tool_result", tool_use_id: "call-fixture", content: fake }) + "\n",
+      );
+      yield* sql`INSERT INTO projection_thread_sessions(thread_id,status,provider_name,provider_session_id,updated_at) VALUES (${threadId},'stopped','claudeAgent','session-fixture','2026-01-01')`;
+      const filePath = NodePath.join(config.logsDir, "server.log");
+      const fileLog = yield* ServerLogFile.make({ filePath });
+      yield* Effect.logInfo("redaction fixture", { output: fake }).pipe(
+        Effect.provide(Logger.layer([fileLog.logger], { mergeWithExisting: false })),
+      );
+      const service = yield* ThreadRedaction.ThreadRedaction.pipe(
+        Effect.provide(
+          Layer.fresh(ThreadRedaction.layer).pipe(
+            Layer.provide(
+              Layer.succeed(ServerLogFile.Maintenance, {
+                withMaintenance: fileLog.withMaintenance,
+              }),
+            ),
+            Layer.provide(
+              Layer.succeed(
+                ProviderEventLoggers.ProviderEventLoggers,
+                ProviderEventLoggers.NoOpProviderEventLoggers,
+              ),
+            ),
+            Layer.provide(
+              Layer.succeed(
+                SharedObservability.TraceStorageMaintenance,
+                SharedObservability.NoOpTraceStorageMaintenance,
+              ),
+            ),
+            Layer.provide(
+              Layer.mock(CommandOutputHub.CommandOutputHub)({ forgetThread: () => Effect.void }),
+            ),
+          ),
+        ),
+      );
+      const result = yield* service.redactItem({
+        threadId,
+        itemId: "call-fixture",
+        reason: "fixture",
+        compact: true,
+      });
+      expect(result.verify).toBe(true);
+      yield* TestClock.adjust(1_000);
+      const contents = yield* fs.readFileString(filePath);
+      expect(contents.includes(fake)).toBe(false);
+      expect(contents.includes("redaction fixture")).toBe(true);
+    }),
+  ),
 );
 
 const extendedStores = (distinct = true) =>

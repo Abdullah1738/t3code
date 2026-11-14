@@ -19,15 +19,30 @@ import {
 // Unknown continuations need approval, including nouns and possessives after a resource name.
 const resourceReleaseClause =
   /^\s+(?:(?:the|a|an)\s+)?(?:Run\s+Cloud\s+)?(?:sessions?|emulators?|sims?|simulators?|box|boxes|holds?|locks?|slots?|phones?(?:\s+(?:holds?|locks?)(?:\/locks?)?)?|devices?)(?:\s+(?:when\s+done|after\s+the\s+run))?\s*(?:$|[.;!?](?=\s|$))/i;
+const resourceMention =
+  /\b(?:sessions?|emulators?|sims?|simulators?|box|boxes|devices?|phones?(?:\s+(?:holds?|locks?)(?:\/locks?)?)?|holds?|locks?|slots?)\b/i;
 
 const hasReleaseGate = (text: string): boolean => {
-  const resourceMention =
-    /\b(?:sessions?|emulators?|sims?|simulators?|box|boxes|devices?|phones?|holds?|locks?|slots?)\b/i;
+  const resourceSubject = new RegExp(
+    String.raw`\b(?:(?:the|both|all|each)\s+)?(?:Run\s+Cloud\s+)?${resourceMention.source}(?:\s+([A-Z]|\d+))?(?:\s+(?:is|are|was|were|got|been|now|both|all)){0,2}\s+$`,
+    "i",
+  );
   for (const release of text.matchAll(/\brelease(?:s|d)?\b/gi)) {
+    const before = text.slice(0, release.index);
     const tail = text.slice(release.index + release[0].length);
     if (resourceReleaseClause.test(tail)) continue;
+    if (release[0].toLowerCase() === "released") {
+      const subject = resourceSubject.exec(before);
+      // Resource names ignore case; single-letter labels must be capitals.
+      if (
+        subject &&
+        (subject[1] === undefined || /^(?:[A-Z]|\d+)$/.test(subject[1])) &&
+        /^(?:\s+(?:when\s+done|after\s+the\s+run))?\s*(?:$|[.;,!?)](?=\s|$))/i.test(tail)
+      )
+        continue;
+    }
     const reference = /^\s+(?:both|them|each|all|it)\b/i.exec(tail);
-    if (reference && resourceMention.test(text.slice(0, release.index))) {
+    if (reference && resourceMention.test(before)) {
       const rest = tail.slice(reference[0].length);
       if (
         resourceReleaseClause.test(rest) ||
@@ -51,12 +66,9 @@ const negatableSecretAction = new RegExp(
   "i",
 );
 const secretKeyword =
-  /\b(?:secrets?|passwords?|credentials?|tokens?|(?:(?:api|private|signing|ssh)\s+)?keys?)\b/i;
-const secretNoun = String.raw`(?:secrets?|passwords?|credentials?|tokens?|keys?)`;
-const negatableSecretKeyword = new RegExp(
-  String.raw`\b${secretNoun}(?:[ \t]+${secretNoun})*\b`,
-  "i",
-);
+  /(?<![\w-])(?:secrets?|passwords?|credentials?|tokens?|(?:(?:api|private|signing|ssh)\s+)?keys?)(?![\w-])/i;
+const secretNoun = String.raw`(?<![\w-])(?:secrets?|passwords?|credentials?|tokens?|keys?)(?![\w-])`;
+const negatableSecretKeyword = new RegExp(String.raw`${secretNoun}(?:[ \t]+${secretNoun})*`, "i");
 const secretMention = new RegExp(
   `${secretAction.source}[^.;\\r\\n]{0,40}${secretKeyword.source}`,
   "i",
@@ -477,6 +489,7 @@ export const approvalProblem = (
   guessedGates?: KanbanBoard["guessedGates"],
   intent: "do" | "skip" = "do",
 ): string | null => {
+  if (subtask.state === "skipped" && subtask.gateSkipped !== undefined) return null;
   const gate = gateOf(subtask, guessedGates);
   if (gate === undefined) return null;
   const context = "approvals" in standing ? standing : undefined;
@@ -958,13 +971,20 @@ export const markSubtask = (
   by: KanbanActor,
   at: string,
 ): ReadonlyArray<KanbanSubtask> =>
-  subtasks.map((subtask) =>
-    subtask.id !== id
-      ? subtask
-      : state === "open"
-        ? { ...subtask, state, note: null, doneBy: null, doneAt: null }
-        : { ...subtask, state, note: note?.trim() || null, doneBy: by, doneAt: at },
-  );
+  subtasks.map((subtask) => {
+    if (subtask.id !== id) return subtask;
+    const { gateSkipped, ...rest } = subtask;
+    return state === "open"
+      ? { ...rest, state, note: null, doneBy: null, doneAt: null }
+      : {
+          ...rest,
+          ...(state === "skipped" && gateSkipped ? { gateSkipped } : {}),
+          state,
+          note: note?.trim() || null,
+          doneBy: by,
+          doneAt: at,
+        };
+  });
 
 export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">) {
   const current = kanbanOpenStep(card);

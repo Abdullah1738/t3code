@@ -10,7 +10,7 @@ import urllib.error
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offbox_lib import api, common, home, lease
+from offbox_lib import api, cli, common, home, identity, lease
 from offbox_lib.startup_health import starting_phase, wait_seconds
 from test_home_backend import HomeFiles
 from test_capacity import Isolated
@@ -61,6 +61,8 @@ class TimerClock(Clock):
 class StartupTests(HomeFiles):
     def setUp(self):
         super().setUp()
+        self.stack.enter_context(patch.object(common, 'STATE', self.dir))
+        self.stack.enter_context(patch.object(common, 'DB_PATH', self.dir / 'offbox-home.db'))
         self.configure()
         common.select_backend("server")
         self.clock = Clock()
@@ -144,6 +146,42 @@ class StartupTests(HomeFiles):
         self.assertFalse(raised.exception.started)
         self.assertEqual((raised.exception.run_id, raised.exception.box), ("run-1", "bx_one"))
         self.assertEqual(req.call_count, 1)
+
+    def test_sync_exec_waits_on_flag_then_preserves_timeout_metadata(self):
+        payload = {'starting': True, 'phase': 'reconcile', 'code': 'server_starting', 'message': 'starting'}
+        timeout = {'code': 'command_timeout', 'message': 'timed out', 'processId': 123,
+                   'stdout': 'partial', 'queuedMs': 0, 'runMs': 1000, 'killed': True}
+        def wire(request, **kwargs):
+            data = payload if self.clock.now == 0 else timeout
+            raise urllib.error.HTTPError(request.full_url, 503 if data is payload else 408, 'fixture', {},
+                                         io.BytesIO(json.dumps(data).encode()))
+        with home.pre_start('run-1'), patch.object(api, '_key', return_value='fixture'), \
+                patch.object(api, '_open', side_effect=wire) as send, patch.object(home, '_health', return_value=READY):
+            with self.assertRaises(api.ApiError) as raised:
+                api.cmd_sync('bx_one', 'true', timeout=1)
+        self.assertEqual((raised.exception.code, raised.exception.api_code), (124, 'command_timeout'))
+        self.assertEqual(raised.exception.data, timeout)
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(self.clock.now, 5)
+
+    def test_person_gate_and_allocation_share_the_invocation_budget(self):
+        def allocate(a, me):
+            with home.pre_start('run-person'):
+                return api.call('GET', '/limits', retries=0)
+        error = api.ApiError(503, 'server_starting', 'waiting for incus')
+        me = dict(owner='thread:test', repo_root=str(self.dir), repo_key='repo')
+        with patch.dict(os.environ, OFFBOX_HOME_START_WAIT_S='10'), \
+                patch.object(common, 'person', return_value='moni'), \
+                patch.object(identity, 'whoami', return_value=me), \
+                patch.object(home, '_health', side_effect=[STARTING, READY, STARTING, STARTING]), \
+                patch.object(api, '_request', side_effect=error) as send, \
+                patch.object(cli, '_remote_once', side_effect=allocate), \
+                patch.object(home, 'fail_over') as failover, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(['run', '--remote', '--', 'true']), 93)
+        self.assertEqual(self.clock.now, 10)
+        send.assert_called_once()
+        failover.assert_not_called()
+        self.assertIsNone(home.WAIT_BUDGET.get())
 
     def test_http_error_retains_starting_flag_and_phase_without_generic_retries(self):
         for envelope in ({"code": "server_not_ready", "message": "warming storage"},

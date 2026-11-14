@@ -1096,6 +1096,10 @@ const withToolAnalytics =
                       ? 0
                       : Math.max(0, Number(ended - callState.callerStarted) / 1e6)),
                   readerLane: callState.readerLane,
+                  ...(callState.waitStage === undefined ? {} : { waitStage: callState.waitStage }),
+                  ...(callState.waitLookupMs === undefined
+                    ? {}
+                    : { waitLookupMs: callState.waitLookupMs }),
                   durationMs: Math.max(0, Number(ended - started) / 1e6),
                   ...outcome,
                   props: {

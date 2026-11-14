@@ -770,6 +770,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "run_not_found",
       "thread_not_sendable",
       "send_timeout",
+      "lookup_timeout",
       "thread_not_interruptible",
       "invalid_request",
       "orchestration_error",

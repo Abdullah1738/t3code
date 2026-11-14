@@ -85,6 +85,22 @@ class LoggingTests(unittest.TestCase):
         self.assertTrue(keep.exists())
         self.assertEqual(rows[-1]['kind'], 'error')
 
+    def test_invalid_numeric_fields_do_not_discard_a_record(self):
+        for value in (10**400, -10**400, float('nan'), float('inf'), float('-inf'),
+                      True, None, '123', {}, []):
+            with self.subTest(value=value):
+                count = len(self.rows())
+                toollog.emit('disk', 'perf', 'disk.sample', duration_ms=value,
+                             props={'externalFreeGb': 737, 'inventorySourceErrors': value})
+                rows = self.rows()
+                self.assertEqual(len(rows), count+1)
+                self.assertEqual(rows[-1]['props'], {'externalFreeGb': 737})
+                self.assertNotIn('durationMs', rows[-1])
+        for value in (0, 1, -1, 1.5):
+            with self.subTest(valid=value):
+                toollog.emit('disk', 'event', 'disk.swing', props={'externalFreeGbDelta': value})
+                self.assertEqual(self.rows()[-1]['props']['externalFreeGbDelta'], value)
+
     def test_rollup_fixture_and_quantiles(self):
         now = dt.datetime(2026, 11, 13, tzinfo=dt.timezone.utc)
         for value in range(1, 21):

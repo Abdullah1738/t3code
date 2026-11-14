@@ -49,6 +49,11 @@ class BigRootTests(unittest.TestCase):
         self.assertFalse(root['ok'])
         self.assertEqual(root['props']['failure'], 'partial')
         self.assertEqual(root['props']['failedCount'], 1)
+        self.assertEqual((root['props']['deniedCount'], root['props']['partialChildCount']), (0, 1))
+        summary = self.rows('disk.inventory.root')[-1]['props']
+        self.assertEqual((summary['deniedCount'], summary['partialChildCount']), (0, 1))
+        self.assertTrue(summary['partial'])
+        self.assertEqual(self.rows('disk.inventory')[-1]['props']['rootsDenied'], 0)
         child = [r for r in self.rows('disk.inventory.source') if r['props']['source'].endswith('/slow')][0]
         self.assertEqual(child['props']['failure'], 'timeout')
         self.assertNotIn('private', json.dumps(self.rows('disk.inventory.source')))

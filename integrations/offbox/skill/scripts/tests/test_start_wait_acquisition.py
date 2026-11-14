@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
+from types import SimpleNamespace
 import urllib.error
 from unittest.mock import patch
 
@@ -151,3 +153,41 @@ class AcquisitionStartupTests(Isolated):
             with self.assertRaises(home.StartWaitFailed):
                 runs._safe(errors, ssh_sync.setup, 'box')
         self.assertEqual(errors, [])
+
+    def test_background_payload_keeps_the_parents_remaining_wait(self):
+        payloads = []
+        captured = threading.Event()
+        class Payload(io.BytesIO):
+            def close(self):
+                if not self.closed:
+                    payloads.append(json.loads(self.getvalue()))
+                    captured.set()
+                super().close()
+        def spawn(*args, **kwargs):
+            ready, accept = kwargs['pass_fds']
+            # Stand in for the child holding its inherited acceptance pipe open.
+            child_accept = os.dup(accept)
+            self.addCleanup(os.close, child_accept)
+            os.write(ready, b'1')
+            return SimpleNamespace(pid=os.getpid(), stdin=Payload(), poll=lambda: 0)
+        self.args.bg, self.args.no_sync = True, True
+        with home.wait_budget(), patch.object(runs.subprocess, 'Popen', side_effect=spawn), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(home.wait_while_starting('waiting for incus', read=lambda timeout: {'ok': True}))
+            self.assertEqual(runs._background(self.args, self.me), 0)
+        self.assertTrue(captured.wait(2))
+        payload, = payloads
+        self.assertEqual(payload['home_wait_deadline'], 1010)
+        self.assertIsNone(home.WAIT_BUDGET.get())
+        rid = self.con.execute('SELECT run_id FROM runs').fetchone()[0]
+        refusal = api.ApiError(503, 'server_not_ready', 'waiting for incus')
+        def child(*args, **kwargs):
+            with home.wait_budget(), home.pre_start(rid):
+                return api.call('GET', '/limits', retries=0)
+        with patch.object(runs, 'background_client', side_effect=child), patch.object(os, 'chdir'), \
+                patch.object(api, '_request', side_effect=refusal) as send:
+            with self.assertRaises(home.StartWaitFailed):
+                runs.background_queue(rid, payload)
+        self.assertEqual(self.clock.now, 1010)
+        send.assert_called_once()
+        self.assertIsNone(home.WAIT_BUDGET.get())

@@ -417,7 +417,7 @@ def check_watcher(watcher_id, root=None):
 
 
 UNMATCHED = 'unmatched'
-KINDS = ('charge', 'hold', 'payment_deadline', 'autopay_expected')
+KINDS = ('charge', 'hold', 'payment_deadline', 'autopay_expected', 'charge_unconfirmed')
 # Sent once after 2 days of reminders with no answer. The case then stays quiet until he answers.
 ASK = ('no reply from you for 2 days. Yes or no: keep chasing this case, or close it? '
        'I stay quiet on it until you answer')
@@ -2625,6 +2625,31 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
         if active(q) or (q.get('status') == 'case' and now - at <= FOLLOW_CASE):
             todo.append((q.get('checked') or '', at, q))
     stats = stats if stats is not None else {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+    # Count the active input snapshot, including deferred questions. not_checked
+    # is a subset of limited; only completed, error-free screens are proven_clean.
+    census = stats['charge_census'] = {app: dict.fromkeys(
+        ('open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked'), 0)
+        for app in ('noon', 'careem')}
+    census_questions = {}
+    for q in questions:
+        app = charges.order_app(charge_of(q)) if q.get('kind') == 'charge' and active(q) else None
+        if app in census:
+            census_questions[q['id']] = app
+            for key in ('open', 'limited', 'not_checked'):
+                census[app][key] += 1
+    census_outcomes = {}
+
+    def counted(qid, outcome):
+        old = census_outcomes.get(qid)
+        census_outcomes[qid] = outcome
+        app = census_questions.get(qid)
+        if app is None:
+            return
+        census[app][old or 'limited'] -= 1
+        if old is None:
+            census[app]['not_checked'] -= 1
+        census[app][outcome] += 1
+
     memo = {('orders_cache',): Path(data) / 'order-details.json'}
     for app in ('noon', 'careem'):
         times = [at - charges.SAME_TIME for _, at, q in todo
@@ -2683,6 +2708,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             with Locked(data, 'questions', wait=lock_wait(commit_end)) as book:
                 book['follow_cursor'] = {'at': stamp(at), 'id': q['id']}
         looked.add(q['id'])
+        counted(q['id'], 'error')  # An interrupted attempt must never look clean.
         before_errors = len(errors)
         limits = []
         if q.get('kind') == 'charge':
@@ -2715,6 +2741,8 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                 # A slow receipt cannot hide owner evidence already loaded in this run.
                 hit = charges.owner_found(charge_of(q), at, now, said=owner, errors=errors) \
                     if owner_rows is not None and charges.card_owner(charge_of(q)) == 'abdullah' else None
+            counted(q['id'], 'matched' if hit else 'error' if owner_error or len(errors) > before_errors
+                    else 'limited' if limits else 'proven_clean')
             if hit:
                 hits[q['id']] = hit
             if limits and not hit:
@@ -2737,6 +2765,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             purchase = hit.get('purchase')
             if purchase and not bind_purchase(data, hit, parse_time(q['at']), q['id']):
                 failed.add(q['id'])
+                counted(q['id'], 'error')
                 errors.append(f"{q['id']}: purchase note matched a different charge; recheck next run")
                 continue
             verdicts[q['id']] = {k: v for k, v in hit.items() if k != 'purchase'}
@@ -2780,6 +2809,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                 except CheckTimeout:
                     raise
                 except CaseError as e:
+                    counted(q['id'], 'error')
                     errors.append(f"{q['id']}: {e}")
             if result and not hit and active(q):
                 note_why(q, result['why'], now)
@@ -2796,6 +2826,22 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                         raise
                     except CaseError as e:
                         errors.append(f"{q['id']}: {e}")
+        # Reconcile from a snapshot: updating one alias must not propagate its
+        # outcome through another alias to a distinct same-descriptor question.
+        attempted = census_outcomes.copy()
+        for q in book['questions']:
+            if q['id'] not in census_questions:
+                continue
+            if q.get('status') == 'closed' and (q.get('explanation') or {}).get('verdict') in (
+                    'receipt', 'owner', 'subscription'):
+                counted(q['id'], 'matched')
+            elif active(q) and q['id'] in attempted:
+                result = alert_verdict(transactions, q, now)
+                if result and result['verdict'] == 'unverified':
+                    peers = transactions.get(unmatched_id(q), [])
+                    failed_alias = any(attempted.get(source['id']) == 'error' and alert_alias(q, source)
+                                       for source, _ in peers)
+                    counted(q['id'], 'error' if failed_alias else 'limited')
         prune_questions(book, now)
     return errors
 
@@ -3228,13 +3274,79 @@ def payment_entries(cases, now, sent, pending=False):
     return entries
 
 
+def follow_order_charges(data, now, deadline, find=None, stats=None, end=None, registry=None, read=None):
+    import order_charges
+    registry = registry or Path(os.environ.get('ORDER_TRACKER_ROOT', '~/.local/state/order-tracker')).expanduser()
+    source = find or (lambda *args, **kwargs: charges.search(*args, **kwargs, stats=stats))
+    reader = read or (lambda *args, **kwargs: charges.show(*args, **kwargs, stats=stats))
+    book = load(data)
+    settled = book.get('order_charges', {})
+    orders = {cfg['watcher']: cfg for cfg in order_charges.registrations(registry)}
+    for case in book['cases']:
+        if case.get('kind') == 'charge_unconfirmed' and active(case) and case.get('order_registration'):
+            cfg = case['order_registration']
+            orders.setdefault(cfg['watcher'], cfg)
+    errors = []
+    # Rotate long lists so a noisy archive cannot starve the same older order forever.
+    for wid, cfg in sorted(orders.items(), key=lambda pair: settled.get(pair[0], {}).get('checked', '')):
+        prior = settled.get(wid, {})
+        placed = parse_time(cfg['placed_at'])
+        if prior.get('confirmed') or now < placed + dt.timedelta(minutes=15):
+            continue
+        cid = 'order-charge-' + hashlib.sha256(wid.encode()).hexdigest()[:20]
+        case = next((c for c in book['cases'] if c['id'] == cid), None)
+        if case and not active(case):
+            continue
+        if time.time() + 1 >= deadline:
+            break
+        proof = None
+        try:
+            each = min(deadline, time.time() + 4)
+            with within(each, LookupTimeout('order charge lookup out of time')):
+                peers = [dict(other, bank_confirmed_at=(settled.get(key, {}).get('confirmed') or {}).get('at'))
+                         for key, other in orders.items()]
+                proof = order_charges.matching_charge(cfg, now, source, reader, each, charges, peers)
+        except (charges.Lookup, LookupTimeout) as exc:
+            errors.append(f'{wid}: {exc}')
+        # One transaction owns both the per-order receipt and its case. Concurrent
+        # checks and repeated SMS/email copies cannot open a second case.
+        with Locked(data, wait=lock_wait(end or deadline + 2)) as current:
+            notes = current.setdefault('order_charges', {})
+            if notes.get(wid, {}).get('confirmed'):
+                continue
+            notes[wid] = {'checked': stamp(now), 'confirmed': proof}
+            settled[wid] = notes[wid]
+            live = next((c for c in current['cases'] if c['id'] == cid), None)
+            if proof:
+                if live and active(live):
+                    live.update(status='closed', closed=stamp(now), updated=stamp(now),
+                                outcome='bank charge confirmed')
+                    live['history'].append({'at': stamp(now), 'text': 'bank charge confirmed', 'source': proof['source']})
+            elif live is None:
+                merchant = check_text('merchant', order_charges.merchant(cfg))
+                current['cases'].append({
+                    'id': cid, 'kind': 'charge_unconfirmed', 'merchant': merchant,
+                    'amount': check_amount(cfg['amount']), 'currency': check_currency(cfg.get('currency', 'AED')),
+                    'card': cfg['card_last4'], 'reference': cfg['order'], 'charged': placed.date().isoformat(),
+                    'state': 'charge unconfirmed', 'next': 'Check bank evidence; do not pay or reorder again',
+                    'deadline': stamp(placed + dt.timedelta(minutes=15)),
+                    'why': 'No matching bank charge observed 15 minutes after order placement; this does not prove payment failed',
+                    'who': 'Moni' if cfg.get('for') == 'moni' else 'Abdullah', 'watchers': [], 'status': 'open',
+                    'asks': [], 'rev': 0, 'cycle': 0, 'opened': stamp(now), 'updated': stamp(now),
+                    'closed': None, 'outcome': None, 'history': [{'at': stamp(now), 'text': 'opened'}],
+                    'order_registration': cfg})
+    return errors
+
+
 @log_scope
 def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
     diagnostic = {'budgetHit': False, 'openCases': 0, 'fired': 0, 'ok': False,
                   'slowest': 'reconcile', 'started': time.time()}
     try:
         event = _run_check(wd, run, data, root, now, find, said, diagnostic=diagnostic)
-        # Exceptions and incomplete work (lookup/lock timeouts, follow-up errors or an unsaved outbox) are not ok.
+        # ok means the pass completed and saved without errors, including source
+        # read failures. Known source limits alone are not errors; coverage and
+        # the census describe those. Exceptions leave the initial False intact.
         diagnostic['ok'] = diagnostic.get('complete', True)
         return event
     finally:
@@ -3243,12 +3355,16 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
             duration = diagnostic.get('total_s')
             if duration is None:
                 duration = time.time() - diagnostic['started']
+            stats = diagnostic.get('stats', {})
+            diagnostic['charge_census'] = stats.get('charge_census', {})
+            diagnostic['order_coverage'] = stats.get('order_coverage', diagnostic.get('order_coverage', {}))
             record_event('check.run', kind='perf', duration_ms=duration * 1000, ok=diagnostic['ok'],
                          props={key: diagnostic[key] for key in ('budgetHit', 'openCases', 'fired')} |
                                {'slowestPhase': diagnostic['slowest'],
                                 'sourceLimits': diagnostic.get('sourceLimits', 0),
                                 'limitKinds': diagnostic.get('limitKinds', []),
-                                'orderCoverage': diagnostic.get('order_coverage', {})})
+                                'orderCoverage': diagnostic.get('order_coverage', {}),
+                                'chargeCensus': diagnostic.get('charge_census', {})})
         except Exception:
             pass
 
@@ -3259,6 +3375,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
     # Reserve a second for the final save, which still has the whole-check deadline.
     work_end = end - 1
     stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+    diagnostic['stats'] = stats
     phases = {}
     phase, phase_at = 'reconcile', started
     now = (now or now_dubai()).astimezone(TZ)
@@ -3308,6 +3425,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
                 raise
             except CaseError as exc:
                 errors.append(str(exc))
+            errors += follow_order_charges(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
             errors += follow_payments(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
             errors += follow(data or DATA, now, root, min(end - 8, time.time() + FOLLOW_BUDGET), find, said,
                             end=work_end, stats=stats)

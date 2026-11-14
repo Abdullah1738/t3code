@@ -119,6 +119,7 @@ export type KanbanCardPatchInput = typeof KanbanCardPatchInput.Type;
 
 export const KanbanBoardUpdateInput = Schema.Struct({
   boardId: KanbanBoardId,
+  archived: Schema.optional(Schema.Boolean),
   name: Schema.optional(Schema.String),
   icon: Schema.optional(Schema.NullOr(KanbanBoardIcon)),
   iconImage: Schema.optional(Schema.NullOr(KanbanBoardIconImage)),

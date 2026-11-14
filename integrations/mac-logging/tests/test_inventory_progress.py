@@ -196,8 +196,8 @@ class InventoryProgressTests(unittest.TestCase):
         (good/'child').mkdir()
         entry=SimpleNamespace(path=str(bad/'child'),is_dir=lambda **kw: (_ for _ in ()).throw(OSError('fixture')))
         listing=jobs.inventory_listing
-        def entries(path,deadline):
-            return ([entry],True) if path==bad else listing(path,deadline)
+        def entries(path,deadline,source_failures=None):
+            return ([entry],True) if path==bad else listing(path,deadline,source_failures)
         def run(cmd,**kw):
             return SimpleNamespace(returncode=0,stdout='1\t'+cmd[-1]+'\n',stderr='')
         with patch.object(jobs,'inventory_listing',side_effect=entries):
@@ -209,7 +209,7 @@ class InventoryProgressTests(unittest.TestCase):
     def test_unavailable_root_never_logs_a_zero_total(self):
         root=self.root/'unavailable'
         listing=jobs.inventory_listing
-        with patch.object(jobs,'inventory_listing',side_effect=lambda p,d: ([],False) if p==root else listing(p,d)), \
+        with patch.object(jobs,'inventory_listing',side_effect=lambda p,d,f=None: ([],False) if p==root else listing(p,d,f)), \
              patch.object(jobs,'confirmed_absent',return_value=False):
             jobs.directory_inventory([root],lambda *a,**k:self.fail('unavailable'))
         rows=[r for r in self.rows('disk.inventory.source') if r['props']['source']==str(root)]

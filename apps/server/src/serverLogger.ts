@@ -1,5 +1,6 @@
 import { RotatingFileSink } from "@t3tools/shared/logging";
 import * as OwnerAnalytics from "./ardud/analytics/Analytics.ts";
+import * as ServerLogFile from "./ardud/observability/serverLogFile.ts";
 import { makeAnalyticsLogger } from "./observability/AnalyticsLogger.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as SharedObservability from "@t3tools/shared/observability";
@@ -11,6 +12,7 @@ import * as Redactable from "effect/Redactable";
 import * as References from "effect/References";
 import * as OtlpExporter from "effect/observability/OtlpExporter";
 import * as OtlpLogger from "effect/observability/OtlpLogger";
+import * as Path from "effect/Path";
 
 import * as ServerConfig from "./config.ts";
 
@@ -57,6 +59,7 @@ export const layer = Effect.gen(function* () {
   const localAnalyticsLoggers =
     analytics._tag === "Some" ? [makeAnalyticsLogger(analytics.value)] : [];
   const hostName = yield* HostProcess.Hostname;
+  const path = yield* Path.Path;
   const layerMinimumLogLevel = Layer.succeed(References.MinimumLogLevel, config.logLevel);
 
   // Desktop buffers stdout until a backend failure. Keep sparse lock diagnostics
@@ -85,6 +88,9 @@ export const layer = Effect.gen(function* () {
   });
 
   const logs = config.otlpLogsExport;
+  const fileLog = yield* ServerLogFile.make({
+    filePath: path.join(config.logsDir, "server.log"),
+  }).pipe(Effect.orDie);
   const otlpLogger =
     config.otlpLogsUrl === undefined
       ? undefined
@@ -104,13 +110,25 @@ export const layer = Effect.gen(function* () {
   // superset: keeping both would export every in-span message twice.
   const layerLogger = Logger.layer(
     otlpLogger === undefined
-      ? [consolePretty(), Logger.tracerLogger, boardLockLogger, ...localAnalyticsLoggers]
-      : [consolePretty(), otlpLogger, boardLockLogger, ...localAnalyticsLoggers],
+      ? [
+          consolePretty(),
+          fileLog.logger,
+          Logger.tracerLogger,
+          boardLockLogger,
+          ...localAnalyticsLoggers,
+        ]
+      : [consolePretty(), fileLog.logger, otlpLogger, boardLockLogger, ...localAnalyticsLoggers],
     { mergeWithExisting: false },
   ).pipe(
     Layer.provide(OtlpExporter.layerFlusher),
     Layer.provide(SharedObservability.layerOtlpSerialization(logs.protocol)),
   );
 
-  return Layer.mergeAll(layerLogger, layerMinimumLogLevel);
+  return Layer.mergeAll(
+    layerLogger,
+    layerMinimumLogLevel,
+    Layer.succeed(ServerLogFile.Maintenance, {
+      withMaintenance: fileLog.withMaintenance,
+    }),
+  );
 }).pipe(Layer.unwrap);

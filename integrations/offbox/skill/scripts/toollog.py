@@ -15,14 +15,14 @@ import tempfile
 import time
 
 CAP_BYTES = 50 * 1024 * 1024
-NUMBERS = set("bytes files skipped exitCode waitMs position ttlSeconds reasonLength busy idle stopped count flagsCount envCount pullCount includeCount stepCount attempt pid timeoutSeconds commandLength cmd_bytes step_count".split())
-BOOLEANS = set("queued fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
+NUMBERS = set("bytes files skipped exitCode waitMs queueMs runMs position ttlSeconds reasonLength busy idle stopped count flagsCount envCount pullCount includeCount stepCount attempt pid timeoutSeconds commandLength cmd_bytes step_count".split())
+BOOLEANS = set("queued killed fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
 ENUMS = {
     "cmd_via": {"argv", "file"},
     "backend": {"home", "boat"}, "from": {"home", "boat"}, "to": {"home", "boat"},
-    "reason": {"pinned", "home_up", "home_down", "unreachable", "boat_only", "boat_only_base", "infra", "cap", "busy", "person_home_down"},
+    "reason": {"pinned", "home_up", "home_down", "unreachable", "boat_only", "boat_only_base", "infra", "cap", "busy", "person_home_down", "base_home_down"},
     "leaseKind": {"fresh", "reused", "saved-base"},
-    "decision": {"allowed", "denied", "local-override"},
+    "decision": {"allowed", "denied", "local-override", "boat", "wait_explicit_base", "wait_person", "wait_pinned"},
     "harness": {"opencode", "codex", "claudeAgent", "codex-cu"},
     "commandClass": {"cargo", "evm", "go-build", "go-test", "gradle", "js-test", "lint", "make-test", "pytest", "typecheck", "light", "heavy", "unknown", "test", "install", "build", "docker", "opaque", "cpu"},
     "action": {"stop", "delete", "forget", "settle", "keep", "other"},
@@ -66,6 +66,8 @@ def _props(values):
         elif k == "size" and v in ("small", "default", "large", "xlarge"):
             out[k] = v
         elif k == "errorClass" and _atom(v):
+            out[k] = v
+        elif k == 'base' and (v is None or isinstance(v, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,200}', v)):
             out[k] = v
         elif k == "exitRelay" and isinstance(v, str) and re.fullmatch(r"[a-z]{2}-[a-z]{3}-wg-\d{3}", v):
             out[k] = v

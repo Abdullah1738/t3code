@@ -1605,6 +1605,225 @@ it.effect.each(
     ),
 );
 
+it.effect.each(
+  (["wake", "steer"] as const).flatMap((action) =>
+    ["", " \n\t", "replacement input"].map((text) => ({ action, text })),
+  ),
+)(
+  "a revoked $action cannot flush queued notices or merged wakes (text '$text')",
+  ({ action, text }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { steered, layer, db, startFirstTurn } = yield* nextTurnSelectionHarness(
+          `revoked-queue-${action}-${text.length}`,
+        );
+        const entered = yield* Deferred.make<void>();
+        const resume = yield* Deferred.make<void>();
+        let revoked = false;
+        const management = ThreadManagementService.layer.pipe(
+          Layer.provideMerge(layer),
+          Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(db))),
+          Layer.provide(ServerSettings.layerTest()),
+          Layer.provideMerge(db),
+        );
+        const delayed = Layer.effect(
+          ThreadManagementService.ThreadManagementService,
+          Effect.map(ThreadManagementService.ThreadManagementService, (real) => ({
+            ...real,
+            promoteQueuedMessages: (...args: Parameters<typeof real.promoteQueuedMessages>) =>
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(resume)),
+                Effect.andThen(real.promoteQueuedMessages(...args)),
+              ),
+          })),
+        ).pipe(Layer.provide(management));
+        const lifecycle = KanbanThreads.layer.pipe(
+          Layer.provide(delayed),
+          Layer.provide(db),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        );
+        yield* Effect.gen(function* () {
+          const threadId = yield* startFirstTurn;
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const threads = yield* KanbanThreads.KanbanThreads;
+          // A real notice followed by a merged board wake must both survive a revoked flush.
+          for (const [id, queuedText] of [
+            ["notice", "queued notice"],
+            ["kanban:wake:nudge:latest", "latest snapshot"],
+          ] as const)
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              threadId,
+              commandId: CommandId.make(id),
+              messageId: MessageId.make(id),
+              text: queuedText,
+              attachments: [],
+              dispatchMode: { type: "queue_after_active" },
+              createdBy: "system",
+              creationSource: "server",
+            });
+          const sending = yield* threads
+            .send({ threadId, text, flushQueued: action, isStale: () => revoked })
+            .pipe(Effect.forkChild);
+          yield* Deferred.await(entered);
+          revoked = true;
+          yield* Deferred.succeed(resume, undefined);
+          yield* Fiber.join(sending);
+          yield* worker.drain();
+          assert.deepEqual(steered, []);
+          assert.lengthOf(yield* threads.queuedRuns(threadId), 2);
+          const afterRevocation = yield* orchestrator.getThreadRecords(threadId, ["messages"]);
+          assert.isFalse(
+            afterRevocation.messages.some((message) => message.text === "replacement input"),
+          );
+          // A fresh Wake after Restore may flush these same inputs normally.
+          yield* threads.send({ threadId, text: "", flushQueued: "wake" });
+          yield* worker.drain();
+          assert.deepEqual(steered, ["queued notice", "latest snapshot"]);
+          assert.lengthOf(yield* threads.queuedRuns(threadId), 0);
+        }).pipe(Effect.provide(Layer.merge(layer, lifecycle)));
+      }),
+    ),
+);
+
+it.effect.each(
+  ([undefined, "steer"] as const).flatMap((mode) =>
+    [false, true].map((explicitModel) => ({ mode, explicitModel })),
+  ),
+)(
+  "revoked preflight cannot steer restored work (mode $mode, model $explicitModel)",
+  ({ mode, explicitModel }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const name = `revoked-preflight-${mode ?? "auto"}-${explicitModel}`;
+        const { events, started, steered, layer, db, startFirstTurn } =
+          yield* nextTurnSelectionHarness(name);
+        const entered = yield* Deferred.make<void>();
+        const resume = yield* Deferred.make<void>();
+        let hold = true;
+        let revoked = false;
+        const delayed = Layer.effect(
+          Orchestrator.OrchestratorV2,
+          Effect.map(Orchestrator.OrchestratorV2, (real) => {
+            const getThreadRecords: typeof real.getThreadRecords = (id, fields, filter) =>
+              Effect.gen(function* () {
+                if (
+                  hold &&
+                  fields.length === 2 &&
+                  fields[0] === "runs" &&
+                  fields[1] === "providerTurns"
+                ) {
+                  hold = false;
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(resume);
+                }
+                return yield* real.getThreadRecords(id, fields, filter);
+              });
+            return { ...real, getThreadRecords };
+          }),
+        ).pipe(Layer.provideMerge(layer));
+        const management = ThreadManagementService.layer.pipe(
+          Layer.provideMerge(delayed),
+          Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(db))),
+          Layer.provide(ServerSettings.layerTest()),
+          Layer.provideMerge(db),
+        );
+        const lifecycle = KanbanThreads.layer.pipe(
+          Layer.provide(management),
+          Layer.provide(db),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        );
+        yield* Effect.gen(function* () {
+          const threadId = yield* startFirstTurn;
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const threads = yield* KanbanThreads.KanbanThreads;
+          const sending = yield* threads
+            .send({
+              threadId,
+              text: "Old board post",
+              key: "revoked-preflight",
+              ...(mode === undefined ? {} : { mode }),
+              ...(explicitModel ? { model: runSelection } : {}),
+              isStale: () => revoked,
+            })
+            .pipe(Effect.result, Effect.forkChild);
+          yield* Deferred.await(entered);
+          revoked = true;
+          const settled = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) => event.type === "run.updated" && event.payload.status === "interrupted",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* threads.interrupt(threadId, "Board deleted", true);
+          yield* worker.drain();
+          const turn = (yield* orchestrator.getThreadRecords(threadId, ["providerTurns"]))
+            .providerTurns[0]!;
+          yield* Queue.offer(events, {
+            type: "provider_turn.updated",
+            driver,
+            providerTurn: { ...turn, status: "interrupted", completedAt: yield* DateTime.now },
+          });
+          yield* Queue.offer(events, {
+            type: "turn.terminal",
+            driver,
+            providerThreadId: turn.providerThreadId,
+            providerTurnId: turn.id,
+            runOrdinal: started[0]!.runOrdinal,
+            status: "interrupted",
+            failure: null,
+            threadDisposition: "reusable",
+          });
+          yield* Fiber.join(settled);
+          const running = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "provider-turn.updated" && event.payload.status === "running",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("restored-work"),
+            threadId,
+            messageId: MessageId.make("restored-work"),
+            text: "Restored board work",
+            attachments: [],
+            modelSelection: runSelection,
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "system",
+            creationSource: "server",
+          });
+          yield* worker.drain();
+          yield* Fiber.join(running);
+          const restoredRun = started.at(-1)!.runId;
+          assert.notEqual(restoredRun, started[0]!.runId);
+          yield* Deferred.succeed(resume, undefined);
+          const result = yield* Fiber.join(sending);
+          assert.isTrue(Result.isFailure(result));
+          if (Result.isSuccess(result)) return;
+          assert.isUndefined(result.failure.sentRunId);
+          assert.isUndefined(result.failure.wakeMessageId);
+          yield* worker.drain();
+          const records = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
+          assert.equal(records.runs.find((run) => run.id === restoredRun)!.status, "running");
+          assert.isFalse(records.messages.some((message) => message.text === "Old board post"));
+          assert.deepEqual(steered, []);
+          assert.lengthOf(started, 2);
+          yield* threads.send({ threadId, text: "Fresh board post" });
+          yield* worker.drain();
+          assert.deepEqual(steered, ["Fresh board post"]);
+        }).pipe(Effect.provide(Layer.merge(layer, lifecycle)));
+      }),
+    ),
+);
+
 it.effect("#1431 a transient rejected promotion does not poison the next sweep", () =>
   Effect.scoped(
     Effect.gen(function* () {

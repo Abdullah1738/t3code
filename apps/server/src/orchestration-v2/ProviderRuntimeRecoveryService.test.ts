@@ -745,6 +745,7 @@ it.effect("expires orphaned runtime requests before command readiness", () => {
     ],
     providerSessions: [],
     providerThreads: [],
+    providerTurns: [],
     runs: [],
     nodes: [],
   } as unknown as OrchestrationV2ThreadProjection;
@@ -796,6 +797,7 @@ it.effect("preserves async questions across startup and shutdown", () => {
     ],
     providerSessions: [],
     providerThreads: [],
+    providerTurns: [],
     runs: [],
     nodes: [],
     turnItems: [],
@@ -847,6 +849,7 @@ it.effect("uses the same reconciliation path to cancel runtime requests during s
     ],
     providerSessions: [],
     providerThreads: [],
+    providerTurns: [],
     runs: [],
     nodes: [],
   } as unknown as OrchestrationV2ThreadProjection;
@@ -907,6 +910,7 @@ it.effect(
       thread: { id: threadId },
       runtimeRequests: [],
       providerSessions: [],
+      providerTurns: [],
       providerThreads: [
         {
           id: providerThreadId,

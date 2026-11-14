@@ -81,10 +81,10 @@ def current() -> dict | None:
     return kv_get(db(), KEY, max_age=SAME_OUTAGE_S)
 
 
-def wait_until_up(reason: str, budget_s: float) -> bool:
+def wait_until_up(reason: str, budget_s: float, *, service: str = 'boat.dev') -> bool:
     """Probe boat until it answers or `budget_s` is spent. True when it is back."""
     since = note_down(reason)
-    say(f"boat.dev API is down ({reason} since {iso(since)[-5:]}); nothing has started. Waiting up to "
+    say(f"{service} API is down ({reason} since {iso(since)[-5:]}); nothing has started. Waiting up to "
         f"{int(budget_s)}s for it to come back. Use a tool timeout above {int(budget_s)}s or run this in a "
         "background shell.")
     start = time.monotonic()
@@ -100,13 +100,13 @@ def wait_until_up(reason: str, budget_s: float) -> bool:
         why = api.probe(timeout=min(PROBE_EVERY_S, left))
         if why is None:
             note_up()
-            say(f"boat.dev is back after {int(now() - since)}s; retrying")
+            say(f"{service} is back after {int(now() - since)}s; retrying")
             return True
         note_down(why)
         left = budget_s - (time.monotonic() - start)
         if last_say is None or time.monotonic() - last_say >= PROGRESS_EVERY_S:
             last_say = time.monotonic()
-            say(f"still waiting for boat.dev: down {int(now() - since)}s ({why}), {int(max(0, left))}s left")
+            say(f"still waiting for {service}: down {int(now() - since)}s ({why}), {int(max(0, left))}s left")
 
 
 def down_error(e, waited_s: float) -> OffboxError:

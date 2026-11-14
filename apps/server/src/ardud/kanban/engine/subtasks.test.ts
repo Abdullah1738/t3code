@@ -34,6 +34,11 @@ const torsshReview =
   "Review (single GPT-6 Astra xhigh, design chain): torrc injection impossible, token fresh per launch and never logged, only the policy FD inherited, no bridge fallback on PT failure/relaunch, snowflake consent rechecked, #30/#36/#56 lyrebird gates unchanged";
 const mergeOnly =
   "Merge into main-dev after clear review at exact head with green CI (test-only, no deploy)";
+const typingRouteSteps = [
+  "Masked-field probe (session B in the packet): a Settings password field with a public dummy onion, routes type-text / type-text+back / per-char press-key / paste, read back through show-password. Table on the card, session released.",
+  "Once #91 is merged: edit the Android typing note in integrations/run-cloud/skill/SKILL.md (paste route if verified, secret-input rule, the press-key evidence corrected to say alphanumeric only). Push the branch, open a PR against main and link it.",
+  "Tell TorSSH #84 lane 1 thread f82df753 whether long plain text truncates under type-text, and which route works (paste / per-char press-key), plus that the skill note is live. Stable clientRequestId, send once.",
+] as const;
 const repeatedNegationCases = [1, 2, 3, 4].flatMap((count) =>
   [
     ["deploy agent-bridges", "deploy"],
@@ -407,6 +412,73 @@ const negatedGateCases = [
 ];
 
 const resourceReleaseCases = [
+  ...[
+    "session released.",
+    "Session released",
+    "Table on the card, session released.",
+    "Both sims released when done.",
+    "The Run Cloud session was released.",
+    "session B released.",
+    "phone hold released; notes on the card.",
+    "Sessions are now released.",
+    ...[
+      "sessions",
+      "emulator",
+      "emulators",
+      "sim",
+      "sims",
+      "simulator",
+      "simulators",
+      "box",
+      "boxes",
+      "device",
+      "devices",
+      "phone",
+      "phones",
+      "phone holds",
+      "phone lock",
+      "phone locks",
+      "phone hold/lock",
+      "hold",
+      "holds",
+      "lock",
+      "locks",
+      "slot",
+      "slots",
+    ].map((resource) => `${resource} released.`),
+    ...["the", "both", "all", "each", "Run Cloud"].map((prefix) => `${prefix} session released.`),
+    ...["A", "Z", "0", "2", "12"].map((label) => `sim ${label} released.`),
+    ...["is", "are", "was", "were", "got", "been", "now", "both", "all"].map(
+      (word) => `sessions ${word} released.`,
+    ),
+    "sim 2 was now released after the run.",
+    ...[".", ";", ",", "!", "?", ")"].map(
+      (punctuation) => `session released${punctuation} Notes on the card.`,
+    ),
+  ].map((text) => [text, undefined] as const),
+  ...[
+    "v0.1.12 released.",
+    "Robob released to both clients.",
+    "Build released",
+    "sessions released to production",
+    "session data released publicly",
+    "Release the build, session released.",
+    "release v2; session released.",
+    "sessions release.",
+    "session releases.",
+    "session b released.",
+    "session AB released.",
+    "session 2b released.",
+    "session v2 released.",
+    "session was all now released.",
+    "session: released.",
+    "session was, released.",
+    "session data released.",
+    "session released when done shipping software.",
+    "session released after the run to production.",
+    "session released.publicly",
+    "session released,publicly",
+  ].map((text) => [text, "deploy"] as const),
   ["Release the device software to production", "deploy"],
   ["Release the phone's firmware to production", "deploy"],
   ["Release the phone’s firmware to production", "deploy"],
@@ -441,6 +513,52 @@ const resourceReleaseCases = [
 ] as const;
 
 describe("inferGate", () => {
+  it("does not infer a gate for the exact Agent Tools #94 s8 cleanup", () => {
+    const s8 = typingRouteSteps[0];
+    expect(inferGate(s8)).toBeUndefined();
+  });
+
+  it.each([
+    typingRouteSteps[1],
+    typingRouteSteps[2],
+    "paste, read back through show-password",
+    "Press the key combo ctrl+v",
+    "Paste the key-value pairs into the form",
+    ...[
+      "secret",
+      "secrets",
+      "password",
+      "passwords",
+      "credential",
+      "credentials",
+      "token",
+      "tokens",
+      "key",
+      "keys",
+    ].flatMap((noun) => [
+      `Paste command-${noun} into the note`,
+      `Paste ${noun}-command into the note`,
+      `Paste command-${noun}-name into the note`,
+    ]),
+  ])("ignores hyphenated command names and typing routes: %s", (text) => {
+    expect(inferGate(text)).toBeUndefined();
+  });
+
+  it.each([
+    "Paste the API key into the env file",
+    "Enter the password on the login screen",
+    "Rotate the signing key and store it in Keychain",
+    "Share the token with the CI job",
+    "Set the SSH key on the box",
+    "Store the private key in Keychain",
+    "Paste credentials into the form",
+    "Share the secret with CI",
+    "Paste 'token' into the form",
+    "Paste (password) into the form",
+  ])("keeps standalone secret nouns gated: %s", (text) => {
+    expect(inferGate(text)).toBe("secret");
+  });
+
   it.each(repeatedNegationCases)("counts repeated negation: $text", ({ text, gate }) => {
     expect(inferGate(text)).toBe(gate);
   });
@@ -681,6 +799,10 @@ describe("price and resource-release wording", () => {
 });
 
 describe("board gate guessing", () => {
+  it("does not guess a secret gate for an evaluator reporting a paste route", () => {
+    expect(gateOf({ owner: "evaluator", text: typingRouteSteps[2] }, ["secret"])).toBeUndefined();
+  });
+
   const cases = [
     ["Tag the main-dev tip and dev-deploy it", "deploy"],
     ["Pay the invoice", "money"],
@@ -921,6 +1043,18 @@ describe("approvalProblem", () => {
     closedAt: at,
     answer: { verdict: "approved", by: owner, at },
   });
+
+  it.each(resourceReleaseCases.filter(([, gate]) => gate === undefined))(
+    "does not bind a cleanup ask to an unrelated deployment: %s",
+    (text) => {
+      const action = deploy("s4");
+      expect(
+        approvalProblem({ ...card, subtasks: [action], asks: [approvedAsk(text)] }, action),
+      ).toContain(
+        'q1 was approved but doesn\'t name s4; ask again naming the subtask id (e.g. "Approve s4")',
+      );
+    },
+  );
 
   it.each([
     ...negativeCredentialPhrases,
@@ -2707,4 +2841,33 @@ describe("cleared gates with standing approval and typed asks", () => {
       ).toContain("no owner answer");
     },
   );
+});
+
+it("replanning keeps a skipped gate record, while reopening or doing clears it", () => {
+  const skipped: KanbanSubtask = {
+    id: "s3",
+    step: 3,
+    owner: "evaluator",
+    text: "Edit fork source",
+    gate: "deploy",
+    gateSource: "set",
+    state: "skipped",
+    note: "Only edits fork code",
+    doneBy: owner,
+    doneAt: at,
+    gateSkipped: {
+      gate: "deploy",
+      reason: "Only edits fork code",
+      by: owner,
+      at,
+      text: "Edit fork source",
+    },
+  };
+  const plan = planSubtasks([skipped], [{ id: "s3", text: "Reword skipped step" }]);
+  expect(plan.ok && plan.subtasks[0]).toEqual(skipped);
+  for (const state of ["open", "done"] as const) {
+    const marked = markSubtask([skipped], "s3", state, null, owner, at)[0]!;
+    expect(marked.state).toBe(state);
+    expect(marked).not.toHaveProperty("gateSkipped");
+  }
 });

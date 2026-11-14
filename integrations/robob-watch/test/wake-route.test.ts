@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Delivery, State, Watcher } from "../src/lib.ts";
+import type { LogEntry } from "../src/toollog.ts";
 
 const projectThread = "thread:project:work:abcd1234-5678-4000-8000-123456789abc";
 const ownerThread = "ardud-control:thread:11111111-2222-4000-8000-123456789abc";
@@ -21,6 +22,10 @@ type Fixture = {
   telegramError?: boolean;
   noOverride?: boolean;
   missingCli?: boolean;
+  nativeOutput?: string;
+  statusOutput?: string;
+  nativeSleep?: boolean;
+  statusSleep?: boolean;
 };
 
 // Each delivery runs in a fresh process: caches, bridge rows, logs and every CLI stay inside its fixture.
@@ -39,8 +44,9 @@ const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify({ cli: ${JSON.stringify(cli)}, args }) + '\\n');
 const config = JSON.parse(readFileSync(${JSON.stringify(config)}, 'utf8'));
 if (${JSON.stringify(cli)} === 't3ctl') {
+  if (config[args[0] + 'Sleep']) await Bun.sleep(10_000);
   if (config[args[0] + 'Error']) { console.error(args[0] + ' stub failure'); process.exit(1); }
-  console.log(JSON.stringify(args[0] === 'send' ? { ok: true, duplicate: false } : { ok: true, thread: config.status }));
+  console.log(config[args[0] + 'Output'] ?? JSON.stringify(args[0] === 'send' ? { ok: true, duplicate: false } : { ok: true, thread: config.status }));
 } else {
   if (args[0] === 'wake' && config.wakeError || args[0] === 'send' && config.imessageError
     || ${JSON.stringify(cli)} === 'telegram' && config.telegramError) process.exit(1);
@@ -74,11 +80,21 @@ console.log(JSON.stringify(await (async () => (${body}))()));`;
     const env = { ...process.env, ROBOB_TEST: "1", ROBOB_WATCH_ROOT: join(dir, "root"),
       ROBOB_WATCH_BRIDGE_DB: dbPath, ROBOB_WATCH_SPECTRUM_CLI: spectrum, ROBOB_WATCH_TELEGRAM_CLI: telegram,
       ROBOB_WATCH_T3CTL: options.noOverride ? undefined : options.missingCli ? join(dir, "missing-cli") : t3ctl,
+      ROBOB_WATCH_TEST_CREATOR_TIMEOUT_MS: "2000",
       ROBOB_WATCH_LOAD_OVERRIDE: "0.1", TOOLLOG_DIR: join(dir, "logs") };
     const child = Bun.spawn([process.execPath, "-e", code], { env, stdout: "pipe", stderr: "pipe" });
     const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
     expect(exitCode, stderr).toBe(0);
-    return { result: JSON.parse(stdout) as Delivery & { state: State; held: State; same: boolean; env: string },
+    const lines = stdout.trim().split("\n");
+    const logsDir = join(dir, "logs");
+    return { result: JSON.parse(lines.pop()!) as Delivery & { state: State; held: State; same: boolean; env: string; deliveries: Delivery[] },
+      sentLogs: existsSync(logsDir) ? readdirSync(logsDir).filter(file => file.endsWith(".ndjson"))
+        .flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line) as LogEntry))
+        .filter(row => row.name === "wake.sent") : [],
+      runnerLog: lines.join("\n"),
+      fallbacks: existsSync(logsDir) ? readdirSync(logsDir).filter(file => file.endsWith(".ndjson"))
+        .flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line) as LogEntry))
+        .filter(row => row.name === "wake.creator_fallback") : [],
       calls: existsSync(callsFile) ? readFileSync(callsFile, "utf8").trim().split("\n").map(line => JSON.parse(line) as Call) : [],
       log: existsSync(join(watcherDir, "log")) ? readFileSync(join(watcherDir, "log"), "utf8") : "" };
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -150,11 +166,90 @@ test("a resolved ses_ creator goes to its Robob thread", async () => {
   expect(calls[2]!.args.slice(0, 2)).toEqual(["send", projectThread]);
 });
 
-test("an unresolved ses_ creator keeps today's owner path", async () => {
-  const { result, calls } = await fixture({ watcher: { created_by_session: "ses_gone" }, nativeError: true });
-  expect(result.via).toBe("wake");
-  expect(calls.filter(c => c.cli === "t3ctl").map(c => c.args)).toEqual([["native", "ses_gone"]]);
+test.each([
+  { name: "timeout", nativeSleep: true, reason: "timeout" },
+  { name: "exit", nativeError: true, reason: "exit:1" },
+  { name: "spawn", missingCli: true, reason: "exit:127" },
+  ...["not json", "null", "[]", "{}", '{"thread":null}', '{"thread":[]}',
+    '{"thread":{"threadId":12}}', '{"thread":{"threadId":""}}', '{"thread":{"threadId":"   "}}']
+    .map(nativeOutput => ({ name: `invalid ${nativeOutput}`, nativeOutput, reason: "invalid" })),
+])("native $name logs one fallback and delivers once to the owner", async ({ name, reason, ...options }) => {
+  const session = "ses_gone_123456789";
+  const { result, calls, fallbacks, runnerLog } = await fixture({ watcher: { created_by_session: session }, ...options });
+  expect(result).toMatchObject({ ok: true, via: "wake" });
+  expect(calls.filter(c => c.cli === "spectrum")).toHaveLength(1);
+  expect(calls.filter(c => c.cli === "t3ctl").map(c => c.args)).toEqual(options.missingCli ? [] : [["native", session]]);
   expect(wakeText(calls)).not.toContain("meant for thread");
+  expect(runnerLog.split("\n")).toHaveLength(1);
+  expect(runnerLog).toEndWith(`creator lookup failed watcher=route-test session=${session.slice(0, 12)} reason=${reason}`);
+  expect(fallbacks).toHaveLength(1);
+  expect(fallbacks[0]!.props!.durationMs).toBeGreaterThanOrEqual(0);
+  expect(fallbacks[0]).toMatchObject({ component: "wakes", ok: false, ids: { watcher: "route-test" },
+    props: { step: "native", reason } });
+  if (options.nativeSleep) expect(fallbacks[0]!.durationMs).toBeLessThan(5_000);
+});
+
+test.each([
+  { name: "timeout", statusSleep: true, reason: "timeout" },
+  { name: "exit", statusError: true, reason: "exit:1" },
+  { name: "spawn", missingCli: true, reason: "exit:127" },
+  { name: "invalid JSON", statusOutput: "not json", reason: "invalid" },
+  { name: "invalid shape", status: { archived: null }, reason: "invalid" },
+  { name: "archived", status: { archived: true }, reason: "archived" },
+])("status $name logs one fallback and keeps the intended-thread prefix", async ({ name, reason, ...options }) => {
+  const { result, calls, fallbacks, runnerLog } = await fixture(options);
+  expect(result).toMatchObject({ ok: true, via: "wake" });
+  expect(calls.filter(c => c.cli === "spectrum")).toHaveLength(1);
+  expect(wakeText(calls)).toStartWith("(meant for thread abcd1234, which could not be reached)\n");
+  expect(runnerLog.split("\n")).toHaveLength(1);
+  expect(runnerLog).toEndWith(`creator lookup failed watcher=route-test session=${projectThread.slice(0, 12)} reason=${reason}`);
+  expect(fallbacks).toHaveLength(1);
+  expect(fallbacks[0]!.props!.durationMs).toBeGreaterThanOrEqual(0);
+  expect(fallbacks[0]).toMatchObject({ component: "wakes", ok: false, ids: { watcher: "route-test" },
+    props: { step: "status", reason } });
+});
+
+test.each([
+  { name: "native timeout", nativeSleep: true, watcher: { created_by_session: "ses_old" } },
+  { name: "native invalid", nativeOutput: "not json", watcher: { created_by_session: "ses_old" } },
+  { name: "status unreachable", statusError: true },
+])("$name is cached once, then looked up again after 30 seconds", async ({ name, ...options }) => {
+  const { result, calls, fallbacks } = await fixture(options, `(async () => {
+    const originalNow = Date.now;
+    let at = originalNow();
+    Date.now = () => at;
+    const deliveries = [await deliver(watcher, 'first', key, state)];
+    at += 29_000;
+    deliveries.push(await deliver(watcher, 'cached', key + ':2', state));
+    writeFileSync(configPath, JSON.stringify({ status: ${JSON.stringify({ threadId: projectThread, projectId: "work", origin: null, archived: false })} }));
+    at += 2_000;
+    deliveries.push(await deliver(watcher, 'recovered', key + ':3', state));
+    return { deliveries };
+  })()`);
+  expect(result.deliveries.map(d => d.via)).toEqual(["wake", "wake", "thread:abcd1234"]);
+  expect(calls.filter(c => c.cli === "spectrum")).toHaveLength(2);
+  expect(calls.filter(c => c.args[0] === (options.watcher ? "native" : "status"))).toHaveLength(2);
+  expect(fallbacks).toHaveLength(1);
+});
+
+test("successful native resolution is cached for three minutes", async () => {
+  const { result, calls, fallbacks } = await fixture({ watcher: { created_by_session: "ses_old" } }, `(async () => {
+    const originalNow = Date.now;
+    let at = originalNow();
+    Date.now = () => at;
+    const deliveries = [await deliver(watcher, 'first', key, state)];
+    at += 179_000;
+    deliveries.push(await deliver(watcher, 'cached', key + ':2', state));
+    at += 2_000;
+    deliveries.push(await deliver(watcher, 'refreshed', key + ':3', state));
+    return { deliveries };
+  })()`);
+  expect(result.deliveries.every(d => d.via === "thread:abcd1234")).toBe(true);
+  expect(calls.filter(c => c.args[0] === "native")).toHaveLength(2);
+  expect(calls.filter(c => c.args[0] === "status")).toHaveLength(2);
+  expect(calls.filter(c => c.cli === "spectrum")).toHaveLength(0);
+  expect(calls.map(c => c.args[0])).toEqual(["native", "status", "send", "send", "native", "status", "send"]);
+  expect(fallbacks).toHaveLength(0);
 });
 
 test("a retried pending event reuses its request ID and cached creator resolution", async () => {
@@ -243,4 +338,18 @@ test("the runner records thread delivery without adding a spectrum heads-up row"
 test("the t3ctl stub override is forwarded to child helpers", async () => {
   const { result } = await fixture({}, "({ env: testEnv().ROBOB_WATCH_T3CTL })");
   expect(result.env).toEndWith("/t3ctl.ts");
+});
+
+
+test("direct creator and owner fallback deliveries log one attempt each", async () => {
+  for (const sendError of [false, true]) {
+    const { result, sentLogs } = await fixture({ sendError });
+    expect(result.route).toBe(sendError ? "owner" : "creator");
+    expect(sentLogs).toHaveLength(1);
+    expect(sentLogs[0]).toMatchObject({ component: "wakes", kind: "perf", ok: true,
+      ids: { watcher: "route-test" }, props: { via: sendError ? "wake" : "thread", events: 1 } });
+    expect(sentLogs[0]!.durationMs).toBeGreaterThanOrEqual(0);
+    expect(JSON.stringify(sentLogs)).not.toContain("event happened");
+    expect(JSON.stringify(sentLogs)).not.toContain("Handle this event");
+  }
 });

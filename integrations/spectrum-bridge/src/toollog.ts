@@ -23,10 +23,10 @@ const processRunId = randomUUID();
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
-const ID_KEYS = new Set(["chat", "messageId", "inboundId", "threadId", "operationId", "formId", "runId", "callBatchId"]);
-const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs"]);
+const ID_KEYS = new Set(["chat", "messageId", "inboundId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId"]);
+const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars"]);
 const ENUMS: Record<string, readonly string[]> = {
-  replyMode: ["final", "tool"], reason: ["background", "no_text", "already_folded", "exit", "stdout", "hook"],
+  replyMode: ["final", "tool"], reason: ["background", "no_text", "already_folded", "exit", "stdout", "hook", "age", "contextSize", "providerRefusal"],
   source: ["live", "backfill"], outcome: ["replied", "failed", "refused", "no_reply"],
   cardKind: ["quick", "delivery", "ride", "nutrition", "other"], phase: ["start", "stop"],
   method: ["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -48,7 +48,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
     if (NUMBERS.has(key) && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
-    else if (["queued", "inboundKnown", "bytesKnown"].includes(key) && typeof value === "boolean") props[key] = value;
+    else if (["queued", "inboundKnown", "bytesKnown", "pendingOrders"].includes(key) && typeof value === "boolean") props[key] = value;
     else if (typeof value === "string" && ENUMS[key]?.includes(value)) props[key] = value;
     // A route template is code-owned; no query strings, ids, or URLs enter the log.
     else if (key === "route" && typeof value === "string" && /^(?:\/(?:[a-z-]+|:id))*$/.test(value)) props[key] = value;

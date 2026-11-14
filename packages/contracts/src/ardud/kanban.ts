@@ -148,6 +148,15 @@ export const KanbanSubtask = Schema.Struct({
       text: Schema.String,
     }),
   ),
+  gateSkipped: Schema.optional(
+    Schema.Struct({
+      gate: Schema.Literals(["deploy", "money", "secret"]),
+      reason: Schema.String,
+      by: KanbanActor,
+      at: IsoDateTime,
+      text: Schema.String,
+    }),
+  ),
   ownerOnly: Schema.optional(Schema.Boolean),
   interrupting: Schema.optional(Schema.Boolean),
   createdAt: Schema.optional(IsoDateTime),

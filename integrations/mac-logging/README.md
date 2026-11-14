@@ -183,6 +183,11 @@ exit code is available), and `elapsedMs`. Budget-exhausted roots get their own
 timeout line without launching another command. Confirmed missing inventory
 paths retain a zero total without a source error.
 
+`disk.inventory` also reports `rootsOk`, `rootsPartial`, `rootsTimeout`,
+`rootsDenied` and `scanMs`. Timeout/denial counts include affected children and
+can overlap the partial count. Daily `diskInventory` rollups sum those counts
+and scan time across `scans`; lock-skipped hourly runs are excluded.
+
 Only these source errors accept a diagnostic `error.message`: the first stderr
 or filesystem-error line, trimmed to 300 characters with credential-like text
 redacted. No du stdout, unified log messages, report contents or arbitrary
@@ -197,7 +202,11 @@ only readable entries; permission grants remain an owner action.
 
 Big roots emit child source events with `bytes`, `exitCode`, `elapsedMs`,
 `partial`, and `deniedCount`, plus a root aggregate with `completedCount` and
-`failedCount`. Child timeouts/errors remain named source errors. An incomplete
+`failedCount`. `deniedCount` sums only explicit numeric permission-denial counts.
+Root aggregates also report `partialChildCount`: cached children without a valid
+numeric denial count whose `partial` flag is true or unknown. An explicit zero
+denial count does not contribute to `partialChildCount`. Both counts preserve
+the root's existing `partial` flag. Child timeouts/errors remain named source errors. An incomplete
 root emits an error with `failure=partial`, `partial=true`, and the available
 children's `bytes`. The aggregate includes only recorded child measurements. `failedCount` includes one additional
 incomplete remainder when the root deadline stops enumeration; it is not a
@@ -206,7 +215,8 @@ hard links across children and excludes the root directory's own blocks.
 Root attempts rotate oldest first, with never-attempted roots ahead of measured
 ones. Budget-skipped roots retain their place; full failed attempts rotate too.
 Shortened failed attempts keep priority for a full allowance on the next run.
-`disk.inventory.root` summarizes each root once per run. Detailed child sizes stay
+`disk.inventory.root` summarizes each root once per run, including `deniedCount`
+and `partialChildCount`. Detailed child sizes stay
 in `state/disk-inventory.json` (`childState`); successful child lines are retained
 only for changes of at least 1 GiB or 20%, new children of at least 1 GiB,
 or measurements taking at least ten seconds. Partial and error diagnostics

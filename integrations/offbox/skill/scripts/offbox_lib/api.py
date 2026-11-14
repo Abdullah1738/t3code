@@ -109,14 +109,16 @@ CF_NOT_DELIVERED = (521, 522, 523, 525, 526)
 
 
 class ApiError(OffboxError):
-    def __init__(self, status: int, code: str, message: str, retryable: bool = False):
+    def __init__(self, status: int, code: str, message: str, retryable: bool = False, data: dict | None = None):
         if status in CF_OUTAGE and not message:
             message = f"Cloudflare could not reach boat.dev ({CF_OUTAGE[status]})"
         # server_not_ready: our server is up but still importing its pool or reconciling after a restart.
-        super().__init__(f"{NAME} API {status} {code}: {message}", EXIT_INFRA,
+        super().__init__(f"{NAME} API {status} {code}: {message}",
+                         124 if status == 408 and code == "command_timeout" else EXIT_INFRA,
                          outage=status in CF_OUTAGE or code in ("server_not_ready", "server_starting"))
         self.status, self.api_code, self.retryable = status, code, retryable
         self.message = message
+        self.data = data or {}
 
 
 def gateway_timeout(e: OffboxError) -> bool:
@@ -470,7 +472,7 @@ def _call(method: str, path: str, body=None, headers: dict | None = None, timeou
             checkpoint = "person" if person() else (
                 "post" if path.endswith("/commands") else "autostop" if method == "PATCH" else "probe")
             if wait_end is None:
-                wait_end = time.monotonic() + home.wait_seconds()
+                wait_end = home.wait_deadline(home.wait_seconds())
             began = time.monotonic()
             why = home.wait_while_starting(phase, home.PRE_START.get(), checkpoint=checkpoint, box=box,
                                            deadline=wait_end)
@@ -485,10 +487,43 @@ def _call(method: str, path: str, body=None, headers: dict | None = None, timeou
                 scope.end += elapsed
 
 
-def _log_request_error(method: str, path: str, detail: str) -> None:
+def command_metadata(data: dict) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    props = {}
+    for key, dest in (("processId", "pid"), ("queuedMs", "queueMs"), ("runMs", "runMs")):
+        value = data.get(key)
+        if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+            if key != "processId" or type(value) is int:
+                props[dest] = value
+    if type(data.get("killed")) is bool:
+        props["killed"] = data["killed"]
+    return props
+
+
+def _command_summary(status: int, code: str, data: dict) -> str:
+    # Only protocol tags and numeric metadata are safe: backend messages can echo shell input.
+    tags = {"command_timeout", "invalid_command", "machine_not_running", "spawn_failed", "incus_failed",
+            "server_not_ready", "server_starting", "not_found", "unauthorized", "admin_token", "internal", "sandbox_starting",
+            "boat_starting", "rate_limited", "sandbox_direct_failed"}
+    summary = str(status)
+    if code:
+        summary += " " + (code if code in tags else f"http_{status}")
+    props = command_metadata(data)
+    if "pid" in props:
+        summary += f" command {props['pid']}"
+    if "queueMs" in props and "runMs" in props:
+        summary += f" (queued {props['queueMs'] / 1000:.1f}s, ran {props['runMs'] / 1000:.1f}s)"
+    return summary
+
+
+def _log_request_error(method: str, path: str, detail: str, *, status: int | None = None,
+                       code: str = "", data: dict | None = None) -> None:
     # A command endpoint may echo its input in an error. Keep shell text and secrets out of offbox.log.
     if method == "POST" and path.endswith("/commands"):
-        log(f"api {method} {path} -> command request failed (details omitted)")
+        with contextlib.suppress(Exception):
+            summary = _command_summary(status, code, data or {}) if status is not None else "network error"
+            log(f"api {method} {path} -> {summary}")
     else:
         log(f"api {method} {path} -> {detail}")
 
@@ -593,6 +628,8 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
                     scope.acknowledge()
                 if request_id:
                     capacity.complete(request_id, "accepted", (result.get("sandbox") or {}).get("id"))
+                if method == "POST" and path.endswith("/commands") and not (body or {}).get("detached"):
+                    _log_request_error(method, path, "", status=200, data=result)
                 return result
         except urllib.error.HTTPError as e:
             try:
@@ -636,7 +673,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
                 "sandbox_starting", "boat_starting", "idempotency_in_progress", "ssh_host_key_unavailable",
                 "rate_limited") or msg == "sandbox_restoring"
             if BACKEND == "server" and e.code == 503 and code in ("server_not_ready", "server_starting"):
-                failure = ApiError(e.code, code, msg, retryable)
+                failure = ApiError(e.code, code, msg, retryable, data=d)
                 failure.starting, failure.phase = d.get("starting") is True, d.get("phase")
                 raise failure
             if e.code == 404 and ok404:
@@ -655,14 +692,15 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             if _never_delivered(e.code, code, msg) and not start_not_delivered \
                     and attempt <= max(retries, max_connect) \
                     and _room(min(2.0 * attempt, 8)) and _in_deadline(deadline, min(2.0 * attempt, 8)):
-                _log_request_error(method, path, f"{e.code} {code} {msg[:120]} (not delivered; retry {attempt})")
+                _log_request_error(method, path, f"{e.code} {code} {msg[:120]} (not delivered; retry {attempt})",
+                                   status=e.code, code=code, data=d)
                 time.sleep(min(2.0 * attempt, 8))
                 continue
-            _log_request_error(method, path, f"{e.code} {code} {msg[:200]}")
+            _log_request_error(method, path, f"{e.code} {code} {msg[:200]}", status=e.code, code=code, data=d)
             if is_start and uncertain_start and "Idempotency-Key" in h:
                 raise OffboxError("create/fork was unanswered and may have been accepted; "
                                   "nothing ran. Check boat before retrying")
-            raise ApiError(e.code, code, msg, retryable)
+            raise ApiError(e.code, code, msg, retryable, data=d)
         except (NetworkError, urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError, OSError) as e:
             if request_id:
                 capacity.complete(request_id, "uncertain")
@@ -684,9 +722,12 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
 def probe(timeout: float = 15) -> str | None:
     """One cheap GET to see whether boat answers. None = it answers; else why not. No connect retries: each
     would add sends and sleeps, so a probe would outrun its interval."""
+    from .home import StartWaitFailed
     try:
         call("GET", "/limits", timeout=timeout, retries=0, connect_retries=0, deadline=time.time() + timeout)
         return None
+    except StartWaitFailed:
+        raise
     except ApiError as e:
         return None if not e.outage else f"HTTP {e.status}"
     except OffboxError:

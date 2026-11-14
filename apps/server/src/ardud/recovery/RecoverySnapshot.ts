@@ -199,14 +199,13 @@ const make = Effect.gen(function* () {
           ),
         );
     }
-    const snapshot = yield* threads
-      .getShellSnapshot({ location: "active" })
+    return yield* threads
+      .listActiveThreadIds()
       .pipe(
         Effect.mapError(
           (cause) => new RecoverySnapshotError({ operation: "list-active-threads", cause }),
         ),
       );
-    return snapshot.threads.map((shell) => shell.id);
   });
 
   const entryFor = Effect.fn("RecoverySnapshot.entryFor")(function* (

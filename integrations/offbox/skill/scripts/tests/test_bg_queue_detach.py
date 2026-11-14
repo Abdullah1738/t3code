@@ -47,7 +47,8 @@ def configure_fixture(root, backend):
     runs.new_checkout_hint = lambda *args: None
     runs.remote_script = lambda *args, **kwargs: 'proof'
     # A detached worker must exercise the shared startup loop without consulting the Mac's home configuration.
-    home.may_fail_over = home.on_standby = home.active = lambda: False
+    home.may_fail_over = lambda *args: False
+    home.on_standby = home.active = lambda: False
     if os.environ.get('OFFBOX_TEST_OLD_REGISTRATION'):
         register = runs.Runner.register_pending
         def aged(self):
@@ -625,7 +626,7 @@ class BackgroundFailoverTests(Isolated):
                     row = self.con.execute('SELECT status FROM runs WHERE run_id=?', (rid,)).fetchone()
                     self.assertEqual(row[0], 'starting')
                 probe.assert_called_once_with('boat', home.PROBE_TIMEOUT_S)
-                record.assert_called_once_with('home unavailable', rid)
+                record.assert_called_once_with('home unavailable', rid, base=None, base_kept=False)
 
     def test_exact_and_suffix_lookup_both_filter_forwarded_rows(self):
         for status in ('starting', 'forwarded', None):

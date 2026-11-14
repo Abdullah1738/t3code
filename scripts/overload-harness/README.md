@@ -47,3 +47,11 @@ The retained `suite.py` runner holds three existing pooled xlarge jobs while fre
 Paired extension version3 adds a fourth hashed runtime module, `paired-resources.mjs`. It proves the server PID belongs to the sampled container cgroup and records CPU pressure at both steady boundaries. Loaded batches after03:45Z gate A/C scheduling-pressure difference at2.0pp using each arm’s exact ELU wall denominator. Limited cpu.max also gates throttling; unlimited throttling and shared-host steal are diagnostic. Idle and quiet-enough pressure is diagnostic. PASS-LINE.md contains the authoritative launch, storage, pressure and placement decisions.
 
 The controller’s collect operation returns an explicit lifecycle status: pending/waiting exits75, done exits0, failed exits1. Finish through `suite.py`’s `collect_then_stop` helper; it runs cleanup only for done or failed. A pending collection leaves every retained lease running. Explicit abort remains a separate action. `suite_test.py` covers the pending cleanup regression.
+
+## Delegation dispatch probe
+
+`node scripts/delegate-dispatch-overload.mjs --revision=<product-sha> --out=<folder>` adds real MCP async delegation (30 new requests plus 30 same-id retries/hour) and thread sends (80/hour) to the normal workload. Add `--reader-hold-ms=12000` for a separate background-reader occupancy diagnostic. Run offbox on both product pins with identical harness files.
+
+`node scripts/delegate-dispatch-report.mjs <folder>/result.json <inventory.json>` scores the MCP criteria only. Samples retain warmup flags, the original result, task_status and projection evidence before retry, and the same-id retry result. The persisted inventory is `{rows:[{id,child,runs:[runId]}]}` read from the isolated database after all retries; missing evidence cannot pass. Both original and retry calls contribute latency and timeout samples. Whole-service latency is an upper bound on dispatch latency. A normal run that also passes on the broken revision does not establish fidelity.
+
+This probe does not start external providers or run their effect worker. Its pending provider effects therefore grow the outbox; it cannot certify the full overload release gate, provider throughput or HTTP/auth transport. Keep CPU/stall observations and workload-validity decisions separate from the MCP verdict.

@@ -1229,3 +1229,28 @@ it("old standing approvals decode with a four-hour interval", () => {
   expect(decodeStandingApproval(record).minIntervalHours).toBe(4);
   expect(decodeStandingApproval({ ...record, minIntervalHours: 6 }).minIntervalHours).toBe(6);
 });
+
+it("stored subtasks decode with or without a gate skip record", () => {
+  const legacy = {
+    id: "s3",
+    step: 3,
+    text: "Edit fork source",
+    owner: "evaluator",
+    gate: "deploy",
+    gateSource: "set",
+    state: "skipped",
+    note: "Only edits fork code",
+    doneBy: { _tag: "owner" },
+    doneAt: "2026-11-14T00:00:00.000Z",
+  };
+  const decode = Schema.decodeUnknownSync(KanbanSubtask);
+  expect(decode(legacy).gateSkipped).toBeUndefined();
+  const gateSkipped = {
+    gate: "deploy",
+    reason: "Only edits fork code",
+    by: { _tag: "evaluator", threadId: "evaluator" },
+    at: "2026-11-14T00:00:00.000Z",
+    text: legacy.text,
+  };
+  expect(decode({ ...legacy, gateSkipped }).gateSkipped).toEqual(gateSkipped);
+});

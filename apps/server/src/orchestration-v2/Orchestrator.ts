@@ -238,7 +238,12 @@ export class OrchestratorThreadAlreadyExistsError extends Schema.TaggedError<Orc
 
 export class OrchestratorCommandRejectedError extends Schema.TaggedError<OrchestratorCommandRejectedError>()(
   "OrchestratorCommandRejectedError",
-  { commandId: CommandId, commandType: Schema.String, cause: Schema.optional(Schema.Defect()) },
+  {
+    commandId: CommandId,
+    commandType: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+    revoked: Schema.optional(Schema.Literal(true)),
+  },
 ) {
   override get message(): string {
     return `Orchestration command ${this.commandType} (${this.commandId}) was rejected before commit.`;
@@ -366,11 +371,19 @@ export interface OrchestratorV2DispatchResult {
   readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
 }
 
+export interface OrchestratorDispatchOptions {
+  readonly isStale?: () => boolean;
+}
+
 export interface OrchestratorV2Shape {
   readonly promoteQueuedMessages: (
     threadId: ThreadId,
     reason: "wake" | "steer" | "age",
-    options?: { readonly minWaitMs?: number; readonly deferBoardWakes?: boolean },
+    options?: {
+      readonly minWaitMs?: number;
+      readonly deferBoardWakes?: boolean;
+      readonly isStale?: () => boolean;
+    },
   ) => Effect.Effect<number, OrchestratorV2Error>;
   readonly resumeQueuedRuns: Effect.Effect<number, OrchestratorV2Error>;
   readonly repairRunlessProviderTurns: Effect.Effect<
@@ -390,6 +403,7 @@ export interface OrchestratorV2Shape {
   readonly awaitRestartContinuation: (run: OrchestrationV2Run) => Effect.Effect<void>;
   readonly dispatch: (
     command: OrchestrationV2ServerCommand,
+    options?: OrchestratorDispatchOptions,
   ) => Effect.Effect<OrchestratorV2DispatchResult, OrchestratorV2Error>;
   readonly autoArmLimitRecovery: (input: {
     readonly commandId: CommandId;
@@ -447,6 +461,7 @@ export interface OrchestratorV2Shape {
     },
     OrchestratorV2Error
   >;
+  readonly listActiveThreadIds: () => Effect.Effect<ReadonlyArray<ThreadId>, OrchestratorV2Error>;
   readonly getShellSnapshot: (
     options?: ShellSnapshotOptions,
   ) => Effect.Effect<OrchestrationV2ThreadShellSnapshot, OrchestratorV2Error>;
@@ -13596,10 +13611,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   // dispatchWithReceiptEffect owns the dispatch span; this wrapper selects the thread locks.
   const dispatchWithReceipt = Effect.fnUntraced(function* (
     command: OrchestrationV2ServerCommand,
+    options?: OrchestratorDispatchOptions,
   ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
     const dispatch = threadDispatch.withLock(
       commandThreadId(command),
-      dispatchWithReceiptEffect(command),
+      Effect.suspend(() =>
+        options?.isStale?.()
+          ? Effect.fail(
+              new OrchestratorCommandRejectedError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause: "Delivery was revoked before dispatch.",
+                revoked: true,
+              }),
+            )
+          : dispatchWithReceiptEffect(command),
+      ),
     );
     if (command.type === "thread.stop") {
       const result = yield* dispatch;
@@ -13651,11 +13678,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       options?: {
         readonly minWaitMs?: number;
         readonly deferBoardWakes?: boolean;
+        readonly isStale?: () => boolean;
       },
     ) =>
       threadDispatch.withLock(
         threadId,
         Effect.gen(function* () {
+          // Check after taking Stop's dispatch lock so revoked board wakes cannot
+          // promote notices into a run restored while this delivery was waiting.
+          if (options?.isStale?.()) return 0;
           const records = yield* projectionStore
             .getThreadRecords(threadId, ["runs"], { recentRunLimit: 0 })
             .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
@@ -14177,6 +14208,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         NodeSqliteClient.readOnly,
         Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
       ),
+    listActiveThreadIds: () =>
+      projectionStore
+        .listActiveThreadIds()
+        .pipe(NodeSqliteClient.readOnly, Effect.mapError(shellProjectionError)),
     getShellSnapshot: (options) =>
       projectionStore
         .getShellSnapshot(options)
@@ -14335,6 +14370,13 @@ const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
       Effect.fail(
         new OrchestratorProjectionError({
           threadId,
+          cause: "Orchestration V2 live runtime is not configured.",
+        }),
+      ),
+    listActiveThreadIds: () =>
+      Effect.fail(
+        new OrchestratorProjectionError({
+          threadId: ThreadId.make("thread:shell"),
           cause: "Orchestration V2 live runtime is not configured.",
         }),
       ),

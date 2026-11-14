@@ -15,7 +15,7 @@ import time
 from jobs import (read_state, save_state, state_path, directory_inventory,
                   SourceFailure, source_error, stderr_line, permission_denied, deadline_call)
 from rollup import rollup
-from toollog import emit, private_dir, safe_fields
+from toollog import emit, private_dir, safe_fields, finite_number
 
 REPORT_DIRS = [Path('/Library/Logs/DiagnosticReports'), Path('/Library/Logs/DiagnosticReports/Retired'),
                Path.home() / 'Library/Logs/DiagnosticReports']
@@ -597,8 +597,7 @@ def stuck_durations(procs, observations, starts, now):
                 # CPU progress between hourly observations also breaks a stall.
                 if (entry.get('start') == starts[pid] and
                         cpu_seconds(entry.get('cpu', '')) == rows[0]['cpu'] and
-                        type(entry.get('firstStuckAt')) in (int, float) and
-                        math.isfinite(entry['firstStuckAt']) and 0 <= entry['firstStuckAt'] <= now):
+                        finite_number(entry.get('firstStuckAt')) and 0 <= entry['firstStuckAt'] <= now):
                     first = entry['firstStuckAt']
             except (TypeError, ValueError):
                 pass
