@@ -79,10 +79,45 @@ class DiskSpaceTests(unittest.TestCase):
         self.log.write_text(disk.warning(self.space(disk.GIB-1), 'bx_test')+'\nassertion failed\n')
         self.assertIsNone(disk.result(self.log, 1)['infra_failure'])
 
-    def test_final_attempt_replaces_earlier_enospc(self):
+    def test_start_probes_cannot_discard_unattributed_errors(self):
         for phase in ['server_start', 'start']:
             self.log.write_text('ENOSPC\n'+disk.MARKER+json.dumps(dict(phase=phase, space=self.space(disk.GIB)))+'\nassertion failed\n')
-            self.assertIsNone(disk.result(self.log, 1)['infra_failure'])
+            self.assertEqual(disk.result(self.log, 1)['infra_failure'], 'enospc')
+
+    def test_byte_ranges_and_final_attempt_result_ignore_stream_merge_order(self):
+        stdout = self.root / 'stdout'
+        stderr = self.root / 'stderr'
+        for current_error in (False, True):
+            with self.subTest(current_error=current_error):
+                stdout.write_text('\N{SNOWMAN}\nENOSPC from previous attempt\n')
+                probes = ''.join(disk.MARKER+json.dumps(dict(phase=p, space=self.space(2*disk.GIB)))+'\n'
+                                 for p in ('start', 'end'))
+                stderr.write_text(probes)
+                first = disk.command_result(stdout, stderr, 2)
+                first_summary = disk.MARKER+json.dumps(dict(phase='result', attempt=1, record=first))+'\n'
+                with stderr.open('a') as f:
+                    f.write(first_summary)
+                out_offset, err_offset = stdout.stat().st_size, stderr.stat().st_size
+                with stdout.open('a') as f:
+                    f.write('ENOSPC current\n' if current_error else 'ordinary assertion\n')
+                with stderr.open('a') as f:
+                    f.write(probes)
+                final = disk.command_result(stdout, stderr, 2, stdout_offset=out_offset, stderr_offset=err_offset)
+                self.assertEqual(final['infra_failure'], 'enospc' if current_error else None)
+                summary = disk.MARKER+json.dumps(dict(phase='result', attempt=2, record=final))+'\n'
+                for merged in (stdout.read_text()+stderr.read_text()+summary,
+                               stderr.read_text()+summary+stdout.read_text(),
+                               summary+stdout.read_text()+first_summary):
+                    self.log.write_text(merged)
+                    actual = disk.result(self.log, 2)
+                    self.assertEqual(actual['infra_failure'], 'enospc' if current_error else None)
+                    self.assertEqual(actual['disk_attempt'], 2)
+
+    def test_incomplete_new_attempt_does_not_reuse_an_older_result(self):
+        record = dict(disk_space={}, infra_failure=None)
+        self.log.write_text(disk.MARKER+json.dumps(dict(phase='result', attempt=1, record=record))+'\n'+
+                            disk.MARKER+json.dumps(dict(phase='attempt', attempt=2))+'\nENOSPC\n')
+        self.assertEqual(disk.result(self.log, 2)['infra_failure'], 'enospc')
 
     def test_precommand_gate_is_infra(self):
         self.log.write_text(disk.MARKER+json.dumps(dict(phase='gate', space=self.space(0)))+'\n')

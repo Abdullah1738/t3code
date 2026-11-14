@@ -1178,6 +1178,8 @@ def run_cmd(box_id: str, pid: int) -> int:
     d = cmd_dir(box_id)
     outf = open(d / f"{pid}.out", "ab", buffering=0)
     errf = open(d / f"{pid}.err", "ab", buffering=0)
+    out_offset, err_offset = outf.tell(), errf.tell()
+    errf.write((offbox_disk_space.MARKER + json.dumps(dict(phase='attempt', attempt=attempt)) + '\n').encode())
     if r["sync"]:
         # Control commands must remain available while detached runs wait for host capacity.
         queued = 0
@@ -1214,6 +1216,10 @@ def run_cmd(box_id: str, pid: int) -> int:
     if kill and code in (137, 143, 255, None):
         sig = sig or ("SIGKILL" if code == 137 else "SIGTERM")
     status = "lost" if kill == "lost" or (code == 255 and not ct_running(box_id)) else "exited"
+    disk = offbox_disk_space.command_result(d / f'{pid}.out', d / f'{pid}.err', code,
+                                            stdout_offset=out_offset, stderr_offset=err_offset)
+    errf.write((offbox_disk_space.MARKER + json.dumps(
+        dict(phase='result', attempt=attempt, record=disk)) + '\n').encode())
     # The result goes to disk first: if boatd or this runner is gone before the database has it, the next
     # reconcile finalizes the run from this file instead of calling it interrupted.
     write_json(result_path(box_id, pid), {"attempt": attempt, "status": status, "exit_code": code, "signal": sig,
@@ -1225,11 +1231,6 @@ def run_cmd(box_id: str, pid: int) -> int:
     except OSError:
         pass
     m.update(box_window(con, box_id, t0, t1))
-    disk = offbox_disk_space.result(d / f'{pid}.err', code)
-    if code not in (0, None) and not disk['infra_failure']:
-        with open(d / f'{pid}.out', errors='replace') as output:
-            if any(offbox_disk_space.ENOSPC.search(line) for line in output):
-                disk.update(infra_failure='enospc', infra_reason='disk_exhausted')
     m.update(disk)
     m["wall_s"] = round(t1 - t0, 2)
     m["queued_s"] = round(queued, 2)

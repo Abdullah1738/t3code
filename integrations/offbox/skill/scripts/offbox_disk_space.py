@@ -211,40 +211,68 @@ def preflight(context, *, measure=None, reaper=reap, emit=print):
     return 0
 
 
-def result(path, code):
-    phases, matches = {}, False
+def valid_space(space):
+    return (isinstance(space, dict) and all(isinstance(s, dict) for s in space.values()) and
+            all(type(s[k]) is int and s[k] >= 0 for s in space.values()
+                for k in ('free_bytes', 'size_bytes') if k in s))
+
+
+def error_line(line):
+    return not line.startswith((MARKER, 'offbox: warning:')) and bool(ENOSPC.search(line))
+
+
+def result(path, code, *, offset=0):
+    phases, matches, seen_attempt, final = {}, False, 0, None
     try:
-        with open(path, errors='replace') as f:
-            for line in f:
+        with open(path, 'rb') as f:
+            f.seek(offset)
+            for raw in f:
+                line = raw.decode(errors='replace')
                 if line.startswith(MARKER):
                     try:
                         item = json.loads(line[len(MARKER):])
                         phase = item['phase']
+                        if phase in ('attempt', 'result'):
+                            attempt = item.get('attempt')
+                            if type(attempt) is not int or attempt < 1:
+                                continue
+                            if phase == 'attempt':
+                                seen_attempt = max(seen_attempt, attempt)
+                            else:
+                                record = item.get('record')
+                                if (isinstance(record, dict) and isinstance(record.get('disk_space'), dict) and
+                                        all(p in ('server_start', 'start', 'end', 'gate') and valid_space(s)
+                                            for p, s in record['disk_space'].items()) and
+                                        record.get('infra_failure') in (None, 'enospc') and
+                                        (final is None or attempt >= final[0])):
+                                    final = attempt, record
+                            continue
                         space = item['space']
-                        if phase not in ('server_start', 'start', 'end', 'gate') or not isinstance(space, dict):
-                            continue
-                        if any(not isinstance(s, dict) for s in space.values()):
-                            continue
-                        if any(type(s[k]) is not int or s[k] < 0 for s in space.values()
-                               for k in ('free_bytes', 'size_bytes') if k in s):
+                        if phase not in ('server_start', 'start', 'end', 'gate') or not valid_space(space):
                             continue
                         if phase == 'server_start':
-                            phases = {}  # host retries append output: only classify the final attempt
-                            matches = False
+                            phases = {}
                         elif phase == 'start':
                             server_start = phases.get('server_start') if set(phases) == {'server_start'} else None
                             phases = {'server_start': server_start} if server_start is not None else {}
-                            matches = False
                         phases[phase] = space
                     except (ValueError, KeyError, TypeError):
                         pass
-                elif not line.startswith('offbox: warning:'):
-                    matches |= bool(ENOSPC.search(line))
+                else:
+                    matches |= error_line(line)
     except OSError:
         pass
+    # Stream interleaving is not chronology. Only the server's explicit byte-range result
+    # can attribute errors to one attempt; legacy/Boat logs retain all observed evidence.
+    authoritative = final is not None and final[0] >= seen_attempt
+    if authoritative:
+        phases = final[1]['disk_space']
+        matches = final[1].get('infra_failure') == 'enospc'
     start, end = phases.get('start', phases.get('server_start', {})), phases.get('end', {})
     out = dict(disk_space=phases, command_exit_code=None if 'gate' in phases else code,
                wrapper_exit_code=code, infra_failure=None, infra_reason=None)
+    if authoritative:
+        out['disk_attempt'] = final[0]
     for key, s in start.items():
         for field in ('free_bytes', 'size_bytes', 'fstype'):
             if field in s:
@@ -254,6 +282,16 @@ def result(path, code):
         out['infra_failure'] = 'enospc'
         out['infra_reason'] = 'low_space_gate' if 'gate' in phases else 'disk_exhausted'
     return out
+
+
+def command_result(stdout, stderr, code, *, stdout_offset=0, stderr_offset=0):
+    record = result(stderr, code, offset=stderr_offset)
+    if code not in (0, None) and not record['infra_failure']:
+        with open(stdout, 'rb') as output:
+            output.seek(stdout_offset)
+            if any(error_line(line.decode(errors='replace')) for line in output):
+                record.update(infra_failure='enospc', infra_reason='disk_exhausted')
+    return record
 
 
 def message(record):

@@ -1312,7 +1312,8 @@ def space_result(run_id, code, path=None, *, report=False):
     record = offbox_disk_space.result(path or LOGS_DIR / f'{run_id}.log', code)
     previous = read_json(LOGS_DIR / f'{run_id}.state.json', {})
     # A missing/incomplete local log must not erase disk evidence already recorded for this exit.
-    if not record['disk_space'] and code is not None and previous.get('wrapper_exit_code') == code:
+    if (not record['disk_space'] and not record['infra_failure'] and 'disk_attempt' not in record and code is not None and
+            previous.get('wrapper_exit_code') == code):
         record.update({k: v for k, v in previous.items() if k in record or
                        k.startswith(('tmp_', 'var_tmp_', 'home_', 'workspace_'))})
     if any(previous.get(k) != v for k, v in record.items()):
