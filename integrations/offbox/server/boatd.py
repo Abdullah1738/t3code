@@ -52,6 +52,9 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skill/scripts"))
     import toollog
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import boatd_disk as disk
+
 VAR = Path(os.environ.get("BOATD_VAR", "/var/lib/boatd"))
 ETC = Path(os.environ.get("BOATD_ETC", "/etc/boatd"))
 CMDS = VAR / "cmds"
@@ -121,6 +124,7 @@ def load_cfg() -> dict:
     if p.exists():
         c.update(json.loads(p.read_text()))
     c["retention"] = {**RETENTION, **(c.get("retention") or {})}
+    DISK.update(ts=0, value=None, boxes={}, write_at=0, write_error=None)
     CFG.clear()
     CFG.update(c)
     return c
@@ -402,12 +406,138 @@ def health(fresh: bool = False) -> dict:
             except sqlite3.Error:
                 ok = False
                 reasons.append("state database is not readable")
-        out = {"ok": ok, "up": True, "mode": "ok" if not reasons else "degraded", "reasons": reasons,
+        storage = {k: v for k, v in disk_state().items() if k != 'boxes'}
+        if storage["level"] in ("full", "unknown"):
+            ok = False
+        if storage["disk_low"] or (storage["level"] == "unknown" and pool == 'ONLINE'):
+            reasons.append("disk_" + storage["level"] + ": " + disk.description(storage))
+        out = {"disk": storage, "disk_low": storage["disk_low"], "disk_full": storage["disk_full"], "ok": ok, "up": True, "mode": "ok" if not reasons else "degraded", "reasons": reasons,
                "pool": {"name": CFG["zpool"], "state": pool}, "mdraid": md, "queue": queue, "running": running,
                "boot_id": boot_id(), "uptime_s": int(host_uptime()), "boatd_uptime_s": int(now() - STARTED),
                "version": VERSION}
         _HEALTH.update(ts=now(), v=out)
         return out
+
+
+# Disk state also lives in memory and the root-disk tool log: SQLite can be unwritable
+# precisely when this measurement matters most. Health never needs a successful DB write.
+DISK = {"ts": 0, "value": None}
+
+
+def disk_state(fresh=False, writer=False):
+    if not CFG.get("state_dataset"):
+        return {"level": "ok", "disk_low": False, "disk_full": False, "filesystems": []}
+    if not fresh and DISK["value"] is not None and now() - DISK["ts"] < 5:
+        if DISK.get('write_error') and not writer:
+            return {**DISK['value'], 'level': 'full', 'disk_full': True, 'disk_low': True, 'write_ok': False}
+        return DISK["value"]
+    value = disk.sample(CFG["zpool"], VAR)
+    value.update(write_ok=bool(DISK.get('write_at')) and not DISK.get('write_error'), written_at=DISK.get('write_at', 0))
+    if DISK.get('write_error') and not writer:
+        value.update(level='full', disk_full=True, disk_low=True)
+    DISK.update(ts=now(), value=value)
+    return value
+
+
+def pool_free(value):
+    return next((r['free_bytes'] for r in value['filesystems'] if r['filesystem'] == CFG['zpool']), 0)
+
+
+def disk_admit():
+    value = disk_state()
+    if value["level"] in ("full", "unknown"):
+        raise Fail(503, "server_disk_low", disk.description(value), {"disk": {k: v for k, v in value.items() if k != 'boxes'}})
+
+
+def snapshot_protected(con, pressure=True):
+    # Unknown/interrupted results stay protected too, until their owner reconciles them.
+    protected = {r['id'] for r in con.execute('SELECT id,pinned,state,owner FROM boxes')
+                 if r['pinned'] or (pressure and (r['state'] not in ('ready','running','archived')
+                                                or r['owner'] in (CFG.get('person_owners') or [])))}
+    protected.update(r[0] for r in con.execute("SELECT DISTINCT box_id FROM commands WHERE status IS NULL OR status NOT IN ('exited','killed') OR (status='exited' AND exit_code IS NULL)"))
+    protected.update(r[0] for r in con.execute("SELECT source FROM saved WHERE status IN ('ready','pending')"))
+    return protected
+
+
+def disk_maintenance(con, error=None):
+    value = disk_state(fresh=True, writer=True)
+    if not CFG.get("state_dataset"):
+        return value
+    toollog.emit("boatd", "disk.sample", ok=value["level"] != "unknown", props=value)
+    if value["disk_low"]:
+        log(f"disk_low: {disk.description(value)}")
+        toollog.emit("boatd", "disk.warning", kind="error", ok=False, props=value, tag="server_disk_low")
+    if con is None:
+        if error is not None:
+            DISK['write_error'] = str(error)
+            value.update(level='full', disk_full=True, disk_low=True, write_ok=False)
+        return value
+    try:
+        sizes, snaps = disk.inventory(zpool())
+        previous = (DISK.get('boxes') or {})
+        for bid, size in sizes.items():
+            if previous.get(bid) != size:
+                toollog.emit('boatd', 'disk.box_snapshots', ok=True, ids={'box': bid}, props=size)
+        DISK['boxes'] = sizes
+        value["boxes"] = sizes
+        con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('disk',?)", (json.dumps(value),))
+        DISK.update(write_error=None, write_at=now())
+        value.update(write_ok=True, written_at=DISK['write_at'])
+    except sqlite3.Error as e:
+        DISK['write_error'] = str(e)
+        value.update(level='full', disk_full=True, disk_low=True, write_ok=False)
+        toollog.emit('boatd', 'disk.sample', kind='error', ok=False, props=value, tag='disk_state_write')
+        return value
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        toollog.emit("boatd", "disk.sample", kind="error", ok=False, props={"error": str(e)[:200]}, tag="disk_inventory")
+        return value
+    # flock spans sampler and command-runner processes. A busy cleanup must not block
+    # running command completion. Work per pass is bounded; the next sampler continues.
+    with open(VAR / "disk.lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return value
+        pressure = value["disk_low"]
+        deadline = now() + 30
+        for row in disk.candidates(snaps, snapshot_protected(con))[:256]:
+            if now() >= deadline:
+                break
+            pool = next((r for r in value['filesystems'] if r['filesystem'] == CFG['zpool']), None)
+            box = con.execute("SELECT name FROM boxes WHERE id=? AND deleted_at IS NULL", (row['box'],)).fetchone()
+            if box is None:
+                continue
+            usage = sizes.get(row['box'], {})
+            too_large = (box and 'repository pool' in (box['name'] or '') and usage.get('live_bytes', 0) > 0
+                         and usage.get('snapshot_bytes', 0) > disk.SNAPSHOT_RATIO * usage['live_bytes'])
+            need_pool = pressure and pool and pool['free_bytes'] < pool['total_bytes'] * disk.TARGET
+            if not need_pool and not too_large:
+                continue
+            if row['box'] in snapshot_protected(con):
+                continue
+            # Recheck clone dependencies just before deleting. Incus performs the deletion
+            # so its own snapshot inventory stays consistent; never destroy ZFS directly.
+            rc, clones = _sh(['zfs', 'get', '-Hp', '-o', 'value', 'clones', row['dataset']])
+            if rc or clones.strip() != '-':
+                continue
+            before = pool['free_bytes'] if pool else 0
+            result = incus('snapshot', 'delete', ct(row['box']), row['name'], timeout=120, check=False)
+            reason = 'pool_pressure' if need_pool else 'box_snapshot_bytes'
+            if result.returncode:
+                toollog.emit('boatd', 'snapshot.prune', kind='error', ok=False,
+                             ids={'box': row['box']}, props={'snapshot': row['name'], 'reason': reason}, tag='snapshot_prune')
+                continue
+            con.execute('DELETE FROM snaps WHERE box_id=? AND name=?', (row['box'], row['name']))
+            value = disk_state(fresh=True)
+            sizes, _ = disk.inventory(zpool())
+            value['boxes'] = sizes
+            after = next((r['free_bytes'] for r in value['filesystems'] if r['filesystem'] == CFG['zpool']), before)
+            toollog.emit('boatd', 'snapshot.prune', ok=True, ids={'box': row['box']},
+                         props={'snapshot': row['name'], 'bytes': row['bytes'], 'bytes_freed': max(0, after-before),
+                                'snapshot_bytes': sizes.get(row['box'], {}).get('snapshot_bytes'), 'reason': reason})
+    DISK['boxes'] = sizes
+    con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES ('disk',?)", (json.dumps(value),))
+    return value
 
 
 # ---------------------------------------------------------------- incus
@@ -516,6 +646,7 @@ def box_json(con, r) -> dict:
     if state in LIVE and r["ttl"]:
         archive_after = iso((r["last_active"] or r["updated_at"]) + r["ttl"])
     return {
+        "snapshotBytes": (DISK.get('boxes') or {}).get(r['id'], {}).get('snapshot_bytes'),
         "id": r["id"], "name": r["name"], "state": state, "error": r["error"], "dataExpiredAt": None,
         "stoppedAt": iso(r["stopped_at"]) if state == "archived" else None, "labels": json.loads(r["labels"] or "{}"),
         "health": "ok", "type": r["type"], "vcpu": s["vcpu"], "memoryGB": int(re.sub(r"\D", "", s["mem"])),
@@ -625,6 +756,7 @@ def create_box(con, body: dict, idem: str | None, owner: str, src_box: str | Non
         r = con.execute("SELECT box_id FROM idem WHERE key=?", (idem,)).fetchone()
         if r:
             return box_json(con, box_row(con, r["box_id"], owner))
+    disk_admit()
     t = size_of(body.get("type") or (src_box and box_row(con, src_box, owner)["type"]))
     if src_box:
         box_row(con, src_box, owner)
@@ -654,6 +786,12 @@ def create_box(con, body: dict, idem: str | None, owner: str, src_box: str | Non
 
 
 def snapshot(con, box_id: str, kind: str) -> str | None:
+    if kind == 'auto':
+        value = disk_maintenance(con)
+        if value['level'] in ('full', 'unknown'):
+            toollog.emit('boatd', 'snapshot.skip', ok=True, ids={'box': box_id},
+                         props={'snapshot': 'auto', 'bytes_freed': 0, 'reason': 'server_disk_low', 'disk': value})
+            return None
     name = f"{kind}-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%f')[:-3]}"
     p = incus("snapshot", "create", ct(box_id), name, timeout=120, check=False)
     if p.returncode != 0:
@@ -688,14 +826,25 @@ def snaps_to_prune(rows: list, ret: dict, t: float) -> list[str]:
 
 
 def prune_snaps(con, box_id: str) -> None:
+    if CFG.get('state_dataset') and box_id in snapshot_protected(con, pressure=False):
+        return
     rows = con.execute("SELECT * FROM snaps WHERE box_id=? ORDER BY created_at DESC", (box_id,)).fetchall()
     gone = set(snaps_to_prune(rows, CFG["retention"], now()))
     for r in rows:
         if r["name"] not in gone:
             continue
+        before = disk_state(fresh=True) if CFG.get('state_dataset') else None
+        if CFG.get('state_dataset'):
+            rc, clones = _sh(['zfs', 'get', '-Hp', '-o', 'value', 'clones',
+                              f"{zpool()}/containers/{ct(box_id)}@snapshot-{r['name']}"])
+            if rc or clones.strip() != '-':
+                continue
         p = incus("snapshot", "delete", ct(box_id), r["name"], timeout=120, check=False)
         if p.returncode == 0 or b"not found" in p.stderr.lower():
             con.execute("DELETE FROM snaps WHERE box_id=? AND name=?", (box_id, r["name"]))
+            toollog.emit('boatd', 'snapshot.prune', ok=True, ids={'box': box_id},
+                         props={'snapshot': r['name'], 'reason': 'count_retention',
+                                'bytes_freed': max(0, pool_free(disk_state(fresh=True)) - pool_free(before)) if before else 0})
 
 
 def stop_box(con, box_id: str, why: str) -> None:
@@ -716,6 +865,7 @@ def stop_box(con, box_id: str, why: str) -> None:
 
 
 def resume_box(con, box_id: str, body: dict) -> None:
+    disk_admit()
     r = box_row(con, box_id)
     if body.get("ttlSeconds"):
         set_box(con, box_id, ttl=int(body["ttlSeconds"]))
@@ -888,6 +1038,7 @@ def start_cmd(con, box_id: str, body: dict, owner: str | None = None) -> dict:
     command = body.get("command") or ""
     if not command:
         raise Fail(400, "invalid_command", "command is empty")
+    disk_admit()
     meta = body.get("meta") or {}
     con.execute("BEGIN IMMEDIATE")
     pid = (con.execute("SELECT MAX(pid) FROM commands WHERE box_id=?", (box_id,)).fetchone()[0] or 1000) + 1
@@ -1524,6 +1675,9 @@ def box_mem(box_id: str) -> int | None:
 
 
 def sample_once(con) -> None:
+    disk_maintenance(con)
+    if con is None:
+        return
     t = now()
     live = 0
     for r in con.execute("SELECT id FROM boxes WHERE deleted_at IS NULL AND state IN ('ready','running')").fetchall():
@@ -1548,13 +1702,20 @@ def sample_once(con) -> None:
 
 def loop(fn, every: float, name: str) -> None:
     while True:
-        con = db()
+        con = None
         try:
+            try:
+                con = db()
+            except sqlite3.Error as e:
+                if name == 'sampler':
+                    disk_maintenance(None, error=e)
+                raise
             fn(con)
         except Exception:  # noqa: BLE001
             log(f"{name}: {traceback.format_exc()[-800:]}")
         finally:
-            con.close()
+            if con is not None:
+                con.close()
         time.sleep(every)
 
 
@@ -1650,8 +1811,13 @@ class Handler(BaseHTTPRequestHandler):
         if not READY.is_set():
             # No pool or still reconciling: nothing but /health is answered, so no caller sees half-settled runs.
             return self._err(503, "server_not_ready", STATE["problem"] or "starting")
-        con = db()
+        con = None
         try:
+            # Refuse new writes before opening SQLite or updating token last-used.
+            # Existing status/stream/kill paths stay available to running commands.
+            if method == 'POST' and (path == '/sandboxes' or path.endswith(('/resume', '/fork', '/commands'))):
+                disk_admit()
+            con = db()
             who = token_auth(con, self.headers.get("Authorization"))
             if not who:
                 return self._err(401, "unauthorized", "bad token")
@@ -1672,7 +1838,8 @@ class Handler(BaseHTTPRequestHandler):
             log(f"{method} {path}: {traceback.format_exc()[-1200:]}")
             self._err(500, "internal", str(e)[:300])
         finally:
-            con.close()
+            if con is not None:
+                con.close()
 
     def _admin(self, con, method: str, rest: list[str], q: dict):
         """Host-level calls, admin token only: every owner's stats and boxes (no box contents), token management."""
@@ -1696,7 +1863,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/limits" and method == "GET":
             n = con.execute("SELECT COUNT(*) FROM boxes WHERE deleted_at IS NULL AND state IN ('ready','running') "
                             "AND owner=?", (owner,)).fetchone()[0]
-            return {"ok": True, "type": "limits.info", "canStart": True, "startBlockedReason": None,
+            storage = {k: v for k, v in disk_state().items() if k != 'boxes'}
+            blocked = storage['level'] in ('full', 'unknown')
+            return {"ok": True, "type": "limits.info", "disk": storage, "canStart": not blocked,
+                    "startBlockedReason": 'server_disk_low: ' + disk.description(storage) if blocked else None,
                     "activeSandboxes": n, "maxActiveSandboxes": 1000, "creditUsedSeconds": 0,
                     "creditSecondsPerDollar": 100000, "subscriptionQuotaSeconds": 0,
                     "subscriptionRemainingSeconds": 0, "subscriptionCurrentPeriodEnd": "2099-01-01T00:00:00.000Z",

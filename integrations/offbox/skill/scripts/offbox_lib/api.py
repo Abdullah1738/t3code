@@ -65,6 +65,12 @@ def probe_backend(name: str, timeout: float = 3) -> str | None:
     """An authenticated /limits must succeed before moving new work onto a backend."""
     end = time.time() + timeout
     try:
+        from . import disk_pressure
+        if name == 'server' and disk_pressure.pending():
+            from . import home
+            why = home.probe(timeout)
+            if why:
+                return why
         if name == BACKEND:
             _key(timeout=timeout)
             with RequestScope(max(.001, end - time.time())).active():
@@ -110,9 +116,17 @@ class ApiError(OffboxError):
         if status in CF_OUTAGE and not message:
             message = f"Cloudflare could not reach boat.dev ({CF_OUTAGE[status]})"
         # server_not_ready: our server is up but still importing its pool or reconciling after a restart.
-        super().__init__(f"{NAME} API {status} {code}: {message}",
+        from . import disk_pressure
+        full = BACKEND == 'server' and disk_pressure.is_full(message)
+        low = BACKEND == 'server' and code == 'server_disk_low'
+        if full or low:
+            disk_pressure.remember(True)
+        text = ('home server out of disk' if full else
+                'home offbox server is ' + disk_pressure.refusal(message, ((data or {}).get('error') or {}).get('details') or data) if low else
+                f"{NAME} API {status} {code}: {message}")
+        super().__init__(text,
                          124 if status == 408 and code == "command_timeout" else EXIT_INFRA,
-                         outage=status in CF_OUTAGE or code == "server_not_ready")
+                         outage=status in CF_OUTAGE or code == "server_not_ready" or full or low)
         self.status, self.api_code, self.retryable = status, code, retryable
         self.message = message
         self.data = data or {}
@@ -195,7 +209,7 @@ _PRE_DELIVERY = re.compile(r"^connect (EADDRNOTAVAIL|ECONNREFUSED|ETIMEDOUT|EHOS
 
 
 def _never_delivered(status: int, code: str, msg: str) -> bool:
-    if status in CF_NOT_DELIVERED:
+    if status in CF_NOT_DELIVERED or (BACKEND == 'server' and code == 'server_disk_low'):
         return True
     return status in (502, 503) and code == "sandbox_direct_failed" and bool(_PRE_DELIVERY.match(msg or ""))
 
@@ -598,6 +612,9 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
                     capacity.complete(request_id, "accepted", (result.get("sandbox") or {}).get("id"))
                 if method == "POST" and path.endswith("/commands") and not (body or {}).get("detached"):
                     _log_request_error(method, path, "", status=200, data=result)
+                if BACKEND == 'server' and method not in ('GET', 'HEAD'):
+                    from . import disk_pressure
+                    disk_pressure.remember(False)
                 return result
         except urllib.error.HTTPError as e:
             try:
@@ -645,7 +662,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             safe_method = method in ("GET", "DELETE", "PATCH") or "Idempotency-Key" in h
             # A start is never resent on a Cloudflare not-delivered answer, not even under the generic retry below:
             # each send reserves a start slot (create/fork carry an Idempotency-Key, so safe_method is true there).
-            start_not_delivered = is_start and e.code in CF_NOT_DELIVERED
+            start_not_delivered = is_start and (e.code in CF_NOT_DELIVERED or (BACKEND == 'server' and code == 'server_disk_low'))
             if attempt <= retries and (retryable or (e.code >= 500 and safe_method)) and not start_not_delivered \
                     and _room(1.5 * attempt) and _in_deadline(deadline, 1.5 * attempt):
                 time.sleep(1.5 * attempt)
@@ -687,6 +704,12 @@ def probe(timeout: float = 15) -> str | None:
     """One cheap GET to see whether boat answers. None = it answers; else why not. No connect retries: each
     would add sends and sleeps, so a probe would outrun its interval."""
     try:
+        from . import disk_pressure
+        if BACKEND == 'server' and disk_pressure.pending():
+            from . import home
+            why = home.probe(timeout)
+            if why:
+                return why
         call("GET", "/limits", timeout=timeout, retries=0, connect_retries=0, deadline=time.time() + timeout)
         return None
     except ApiError as e:

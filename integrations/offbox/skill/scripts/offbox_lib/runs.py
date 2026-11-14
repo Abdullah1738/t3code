@@ -1887,6 +1887,10 @@ class Runner:
                 raise lease.DeadMount(self.box, reason) from e
         sync_exc = push_exc if push_exc is not None else err[0] if err else None
         if sync_exc is not None:
+            from . import disk_pressure
+            if api.BACKEND == 'server' and disk_pressure.is_full(sync_exc):
+                disk_pressure.remember(True)
+                raise OffboxError('home server out of disk during sync; nothing ran', code=EXIT_INFRA, outage=True) from sync_exc
             if re.search(r"Broken pipe|code 255|\(255\)", str(sync_exc)):
                 state = _boat_state(self.box)
                 if state and state not in api.LIVE_STATES:

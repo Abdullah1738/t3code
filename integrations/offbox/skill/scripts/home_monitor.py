@@ -163,10 +163,17 @@ def health_facts(data):
         return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
     # boot_id is the kernel's (it changes when the box restarts); boatd_uptime_s is boatd's own, when sent.
-    return {"mode": clean(data.get("mode"), 20), "reasons": [clean(r) for r in reasons[:8]],
+    disk = dict(data.get('disk')) if isinstance(data.get('disk'), dict) else {}
+    for flag in ('disk_low', 'disk_full'):
+        if data.get(flag):
+            disk[flag] = True
+    facts = {"mode": clean(data.get("mode"), 20), "reasons": [clean(r) for r in reasons[:8]],
             "pool": clean(pool.get("state"), 20), "mdraid": clean(mdraid.get("state"), 20),
             "boot_id": clean(data.get("boot_id"), 64), "version": clean(data.get("version"), 40),
             "uptime_s": number("uptime_s"), "boatd_uptime_s": number("boatd_uptime_s")}
+    if disk:
+        facts['disk'] = {k: disk[k] for k in ('level', 'disk_low', 'disk_full', 'filesystems', 'sampled_at') if k in disk}
+    return facts
 
 
 def check_health(url):
@@ -192,9 +199,12 @@ def check_health(url):
     if not isinstance(data, dict):
         return {"ok": False, "error": "bad_json", "health": {}}
     facts = health_facts(data)
+    storage = facts.get('disk') or {}
+    if data.get('disk_full') or storage.get('disk_full') or storage.get('level') == 'full':
+        return {'ok': False, 'error': 'disk_full', 'health': facts}
     if data.get("ok") is not True:
         return {"ok": False, "error": "not_ok", "health": facts}
-    return {"ok": True, "error": "", "health": facts}
+    return {"ok": True, "error": "disk_low" if data.get('disk_low') or storage.get('disk_low') else "", "health": facts}
 
 
 def _run(args, timeout):
@@ -352,7 +362,7 @@ def backend_view(state):
             "bad_streak": state["bad_streak"], "last_check": state["last_check"], "last_ok": state["last_ok"],
             "reason": state["reason"] if down else "",
             "outage_id": (state.get("outage") or {}).get("id", "") if down else "",
-            "degraded": list(state.get("degraded") or [])}
+            "degraded": list(state.get("degraded") or []), "disk": state.get('disk') or {}}
 
 
 def failure_text(check):
@@ -372,6 +382,7 @@ def step(state, obs, now):
     sooner than MIN_SPACING_S after the last one changes nothing: one blip seen twice is still one blip.
     """
     check, mac = obs["check"], obs["mac"]
+    state['disk'] = (check.get('health') or {}).get('disk') or state.get('disk') or {}
     events = []
     last = state.get("last_tick")
     warmup = last is None or now - last > GAP_S
@@ -569,6 +580,25 @@ def reconcile(state, url, effects, now, verdict, dry_run=False, note=lambda text
     With dry_run nothing is called and nothing is marked done: the actions are what a real tick would do.
     """
     actions = []
+    storage = state.get('disk') or {}
+    if storage.get('disk_low') or storage.get('disk_full'):
+        alert = state.get('disk_alert')
+        if alert is None:
+            bad = next((r for r in storage.get('filesystems', []) if r.get('level') in ('full', 'low')), {})
+            detail = f"{bad.get('free_bytes', 0) / 1024**3:.1f} GiB free on {bad.get('filesystem', 'pool')}"
+            alert = {'at': int(now), 'sent': False, 'text': f'Home offbox disk is low: {detail}. Snapshot cleanup needs attention.'}
+            if not dry_run:
+                state['disk_alert'] = alert
+        key = f"offbox-home-disk:{alert['at']}"
+        if not alert['sent']:
+            if dry_run:
+                actions.append({'action': 'telegram-disk-low', 'would': 'send', 'key': key, 'text': alert['text']})
+            else:
+                ok = effects.telegram(alert['text'], key)
+                actions.append({'action': 'telegram-disk-low', 'ok': ok, 'key': key})
+                alert['sent'] = ok
+    elif storage.get('level') == 'ok':
+        state.pop('disk_alert', None)
     outage = state.get("outage")
     if outage and state["state"] == "home_down":
         if outage["told_down"] < outage["down_count"]:
@@ -632,7 +662,7 @@ def reconcile(state, url, effects, now, verdict, dry_run=False, note=lambda text
     alerts = state.setdefault("degraded_alerts", {})
     for key in [k for k, v in alerts.items() if now - v.get("at", 0) > 7 * 86400]:
         del alerts[key]
-    reasons = state.get("degraded") or []
+    reasons = [r for r in state.get("degraded") or [] if not r.startswith('disk_')]
     if verdict == "good" and reasons:
         key = degraded_key(reasons)
         record = alerts.get(key)
@@ -705,6 +735,7 @@ def _tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac
             log(sdir, "check-good verdict=indeterminate" + skipped)
         elif not quiet or events:
             log(sdir, f"check-good good_streak={state['good_streak']} state={state['state']}"
+                      + (" class=disk_low" if result.get('error') == 'disk_low' else "")
                       + (" degraded" if state["degraded"] else ""))
         for event in events:
             if event in ("down", "up"):

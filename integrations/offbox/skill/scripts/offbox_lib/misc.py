@@ -508,6 +508,9 @@ def status(me: dict) -> None:
                   "Runs go back home after three good health checks")
         if st.get("degraded"):
             print(f"home server degraded: {'; '.join(str(x) for x in st['degraded'][:3])}")
+    for row in (st.get('disk') or {}).get('filesystems', []) if common.home_config() is not None else []:
+        print(f"home disk {row['filesystem']}: {row['free_bytes'] / 1024**3:.1f} GiB free "
+              f"({row.get('free_pct', 0):.1f}%), inodes {row.get('free_inodes', '?')}, {row.get('level', '?')}")
     d = outage.current()
     if d:
         print(f"boat.dev: DOWN since {iso(d['since'])} ({d.get('reason')}), last failure {ago(d.get('seen'))} ago")
@@ -533,6 +536,8 @@ def status(me: dict) -> None:
         for b in boxes:
             hold = con.execute("SELECT created_at FROM prune_holds WHERE box_id=?", (b["id"],)).fetchone()
             held = f" prune-held since {time.strftime('%H:%M', time.localtime(hold['created_at']))}" if hold else ''
+            snapshot_bytes = b.get('snapshotBytes')
+            held += f" snapshots {snapshot_bytes / 1024**3:.1f} GiB" if snapshot_bytes is not None else ''
             print(f"  {b['id']:<12} {b.get('state'):<9} {b.get('type'):<8} {(b.get('name') or '')[:60]}{held}")
     except OffboxError as e:
         print(f"boxes: boat API unreachable ({e})")

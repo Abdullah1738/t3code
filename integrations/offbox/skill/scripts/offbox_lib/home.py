@@ -82,6 +82,11 @@ def _probe(timeout: float = PROBE_TIMEOUT_S) -> str | None:
         return f"health answered HTTP {e.code}"
     except (OSError, ValueError) as e:
         return f"no answer ({type(e).__name__})"
+    if isinstance(d, dict):
+        from . import disk_pressure
+        why = disk_pressure.health_reason(d)
+        if why:
+            return why
     if not isinstance(d, dict) or not d.get("ok"):
         why = "; ".join(str(x) for x in (d.get("reasons") or [])[:2]) if isinstance(d, dict) else ""
         return f"server says it cannot take runs ({why or 'not ready'})"
@@ -126,8 +131,11 @@ def recent_failure() -> bool:
 
 def preflight_reason() -> str | None:
     from . import api
+    from . import disk_pressure
     recent = recent_failure()
-    why = None if recent else probe()
+    why = None if recent and not disk_pressure.pending() else probe()
+    if why and ('disk' in why):
+        return why
     health_ok = not recent and why is None
     if recent or health_ok or (why or "").startswith("no answer"):
         # /health can stay green while authenticated allocation reads stop answering.
@@ -199,7 +207,13 @@ def fail_over(reason: str, argv: list[str], run_id: str = "", *, explicit_base: 
     elapsed = max(0, time.monotonic() - WAIT_STARTED)*1000 if WAIT_STARTED is not None else 0
     toollog.emit("backend", "backend.failover", duration_ms=elapsed, ok=True, ids={"run": run_id},
                  props={"from": "home", "to": "boat", "reason": "unreachable", "waitMs": elapsed})
-    say(f"home offbox server not reachable ({reason[:160]}); this run goes to Boat instead")
+    if 'low on disk' in reason:
+        detail = reason[reason.index('low on disk'):]
+        say(f"home offbox server is {detail}; this run is going to Boat")
+    elif 'out of disk' in reason:
+        say('home server out of disk; this run is going to Boat')
+    else:
+        say(f"home offbox server not reachable ({reason[:160]}); this run goes to Boat instead")
     log(f"failover to boat: {reason[:300]}")
     env = dict(os.environ, OFFBOX_BACKEND="boat")
     env[FAILOVER_ENV] = reason[:200]
