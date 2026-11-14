@@ -13,8 +13,18 @@ esac
 rsync --copy-unsafe-links "${flags[@]}" \
   --exclude __pycache__ --exclude '*.pyc' --exclude tests --exclude .gitignore \
   "$pkg/" "$dst/"
+# rsync preserves removed source files; retire the old wrappers explicitly.
+for retired in "$dst/coord-blockers" "$dst/src/coord_shim.py"; do
+  if [[ -e $retired || -L $retired ]]; then
+    if [[ ${1:-} == --dry-run ]]; then
+      print -r -- "remove $retired"
+    else
+      rm -rf -- "$retired"
+    fi
+  fi
+done
 # The hooks call Robob's control API with their own component credential. Without it every
-# identity, coord, offbox and desktop-lease check is unavailable (desktop actions are denied).
+# identity, offbox and desktop-lease check is unavailable (desktop actions are denied).
 cred="$HOME/.robob/components/harness-hooks.json"
 if [[ ! -f $cred ]]; then
   print -u2 "WARNING: $cred is missing. Issue it: ELECTRON_RUN_AS_NODE=1 /Applications/Robob.app/Contents/MacOS/Robob /Applications/Robob.app/Contents/Resources/app.asar/apps/server/dist/bin.mjs ardud component-token issue harness-hooks --base-dir ~/.robob --json, then write {url: http://127.0.0.1:3773, token} there with mode 600."
