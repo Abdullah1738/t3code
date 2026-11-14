@@ -125,7 +125,7 @@ Card numbers and labelled codes or passwords (`OTP code 482913`, `OTP is 482 913
 ## Verify
 
 ```sh
-/usr/bin/python3 -B -m unittest -v test_accuracy.py test_cases.py test_charges.py test_install.py
+ROBOB_TEST=1 /usr/bin/python3 -B -m unittest -v test_accuracy.py test_cases.py test_charges.py test_install.py
 unset BUN_INSPECT
 robob-watch test money-cases
 ```
