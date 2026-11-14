@@ -15,6 +15,27 @@ export interface ReadonlyReplicaOptions {
   readonly rebuildNoticeMs?: number;
 }
 
+export interface LineageRepairBump {
+  readonly revision: number;
+  readonly cause:
+    | "fast_lane_insert"
+    | "fast_lane_update"
+    | "reconcile_change"
+    | "reconcile_delete"
+    | "reset";
+  readonly table: string;
+  readonly ids: number;
+}
+
+export interface ReadonlyExportMetrics {
+  readonly lineageRepairCounts: Record<string, number>;
+  readonly lineageRepairs: LineageRepairBump[];
+  readonly phaseMs: Record<string, number>;
+  readonly phaseSteps: Record<string, number>;
+  readonly identityRows: number;
+  readonly identityLagMaxMs: number;
+}
+
 /** Self-contained for the packaged server's eval worker. No live write handle. */
 export function createReadonlyReplica(
   sqlite: typeof NodeSqlite,
@@ -22,6 +43,30 @@ export function createReadonlyReplica(
   path: typeof NodePath,
   options: ReadonlyReplicaOptions,
 ) {
+  const emptyMetrics = (): ReadonlyExportMetrics => ({
+    lineageRepairCounts: {
+      fast_lane_insert: 0,
+      fast_lane_update: 0,
+      reconcile_change: 0,
+      reconcile_delete: 0,
+      reset: 0,
+    },
+    lineageRepairs: [],
+    phaseMs: {},
+    phaseSteps: {},
+    identityRows: 0,
+    identityLagMaxMs: 0,
+  });
+  let metrics = emptyMetrics();
+  const measure = <A>(phase: string, body: () => A): A => {
+    const started = Date.now();
+    try {
+      return body();
+    } finally {
+      metrics.phaseMs[phase] = (metrics.phaseMs[phase] ?? 0) + Date.now() - started;
+      metrics.phaseSteps[phase] = (metrics.phaseSteps[phase] ?? 0) + 1;
+    }
+  };
   const batchSize = Math.max(1, Math.min(options.batchSize ?? 100, 500));
   const rebuildBackoffMs = options.rebuildBackoffMs ?? 6 * 60 * 60 * 1000;
   const rebuildNoticeMs = options.rebuildNoticeMs ?? 60 * 60 * 1000;
@@ -110,6 +155,21 @@ export function createReadonlyReplica(
         throw new Error("Readonly export requires a WAL source");
     };
     setupReader(source);
+    const assertRedactionComplete = () => {
+      if (
+        source
+          .prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_thread_redaction_recovery'")
+          .get() &&
+        source
+          .prepare("SELECT 1 FROM ardud_thread_redaction_recovery WHERE pending=1 LIMIT 1")
+          .get()
+      ) {
+        const error = new Error("Readonly export is paused for incomplete redaction maintenance.");
+        Object.assign(error, { code: "REDACTION_PENDING" });
+        throw error;
+      }
+    };
+    assertRedactionComplete();
     const baseFilename = () => {
       if (
         !source.prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_history_base_archive'").get()
@@ -190,7 +250,11 @@ export function createReadonlyReplica(
     target.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=0;
       PRAGMA journal_size_limit=33554432; PRAGMA cache_size=-8192;
       CREATE TABLE IF NOT EXISTS ardud_readonly_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-      ${bookkeeping}`);
+      ${bookkeeping}
+      CREATE TABLE IF NOT EXISTS ardud_readonly_lineage_touches (
+        revision INTEGER PRIMARY KEY, table_name TEXT NOT NULL, id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('insert','update')), at TEXT NOT NULL
+      );`);
     const out = target;
     const meta = (key: string, value: string) =>
       out
@@ -210,6 +274,30 @@ export function createReadonlyReplica(
       out.prepare("SELECT value FROM ardud_readonly_meta WHERE key=?").get(key)?.value as
         | string
         | undefined;
+    if (getMeta("lineage_touch_revision") === undefined) meta("lineage_touch_revision", "0");
+    if (getMeta("lineage_touch_min_revision") === undefined)
+      meta("lineage_touch_min_revision", "0");
+    const insertTouch = out.prepare(
+      "INSERT INTO ardud_readonly_lineage_touches VALUES (?,?,?,?,?)",
+    );
+    const touchIdentity = (
+      name: string,
+      id: NodeSqlite.SQLInputValue,
+      kind: "insert" | "update",
+    ) => {
+      const revision = Number(getMeta("lineage_touch_revision")) + 1;
+      insertTouch.run(revision, name, id, kind, new Date(Date.now()).toISOString());
+      meta("lineage_touch_revision", String(revision));
+    };
+    const pruneTouches = () => {
+      // Keep 20k touches so slow readers can overlay without unbounded replica growth.
+      const through = Math.max(0, Number(getMeta("lineage_touch_revision")) - 20_000);
+      out.prepare("DELETE FROM ardud_readonly_lineage_touches WHERE revision<=?").run(through);
+      const oldest = out
+        .prepare("SELECT min(revision) AS n FROM ardud_readonly_lineage_touches")
+        .get()?.n;
+      meta("lineage_touch_min_revision", String(oldest ?? 0));
+    };
     const nextGeneration = () => {
       const n = Number(getMeta("generation") ?? 0) + 1;
       meta("generation", String(n));
@@ -244,12 +332,40 @@ export function createReadonlyReplica(
             '{"cursor":0,"done":false}',
         ),
       );
-    // After bootstrap, a routine cycle runs in one replica write transaction.
+    // Auxiliary pages are staged privately before the atomic publication transaction.
     // WAL readers keep the previous completed generation (ready=1, old
     // updated_at) until it commits, so readiness is not cleared per cycle.
+    let pendingRepairs: LineageRepairBump[] = [];
+    const flushRepairs = () => {
+      for (const bump of pendingRepairs) {
+        metrics.lineageRepairCounts[bump.cause] =
+          (metrics.lineageRepairCounts[bump.cause] ?? 0) + 1;
+        metrics.lineageRepairs.push(bump);
+      }
+      pendingRepairs = [];
+    };
+    const bumpRepair = (causes: ReadonlyArray<Omit<LineageRepairBump, "revision">>) => {
+      const revision = Number(getMeta("lineage_repair_revision") ?? 0) + 1;
+      meta("lineage_repair_revision", String(revision));
+      pendingRepairs.push(...causes.map((cause) => ({ ...cause, revision })));
+    };
     let cycleTransaction = false;
+    let cycleSession: NodeSqlite.Session | undefined;
+    const beginCycle = () => {
+      out.exec("BEGIN IMMEDIATE");
+      cycleTransaction = true;
+      cycleSession = out.createSession();
+    };
+    const commitCycle = () => {
+      cycleSession?.close();
+      cycleSession = undefined;
+      out.exec("COMMIT");
+      cycleTransaction = false;
+      flushRepairs();
+    };
     let invalidated: string | undefined;
     const transaction = <A>(body: () => A) => {
+      const pendingCount = pendingRepairs.length;
       if (cycleTransaction) {
         out.exec("SAVEPOINT readonly_page");
         try {
@@ -263,6 +379,7 @@ export function createReadonlyReplica(
           } catch {
             // The cycle transaction itself is gone; step() discards the cycle.
           }
+          pendingRepairs.length = pendingCount;
           throw error;
         }
       }
@@ -270,15 +387,20 @@ export function createReadonlyReplica(
       try {
         const result = body();
         out.exec("COMMIT");
+        flushRepairs();
         return result;
       } catch (error) {
         out.exec("ROLLBACK");
+        pendingRepairs.length = pendingCount;
         throw error;
       }
     };
     const abortCycle = () => {
       if (!cycleTransaction) return false;
+      cycleSession?.close();
+      cycleSession = undefined;
       cycleTransaction = false;
+      pendingRepairs = [];
       try {
         out.exec("ROLLBACK");
       } catch {
@@ -387,7 +509,7 @@ export function createReadonlyReplica(
         out.exec(bookkeeping);
         out
           .prepare(
-            "DELETE FROM ardud_readonly_meta WHERE key LIKE 'schema:%' OR key IN ('archive_deletion_sequence','resetting_events')",
+            "DELETE FROM ardud_readonly_meta WHERE key LIKE 'schema:%' OR key LIKE 'identity_%' OR key IN ('archive_deletion_sequence','resetting_events')",
           )
           .run();
         meta("ready", "0");
@@ -508,17 +630,44 @@ export function createReadonlyReplica(
     const copyRow = (name: string, row: Record<string, NodeSqlite.SQLOutputValue>) => {
       const table = tables.get(name)!;
       if (name.endsWith("_turn_items") && !selectedItems.has(String(row.type))) {
-        out.prepare(`DELETE FROM ${q(name)} WHERE ${q(table.primary)}=?`).run(row[table.primary]!);
+        return out
+          .prepare(`DELETE FROM ${q(name)} WHERE ${q(table.primary)}=?`)
+          .run(row[table.primary]!).changes;
       } else {
-        table.upsert.run(...table.columns.map((c) => row[c]!));
+        const changes = table.upsert.run(...table.columns.map((c) => row[c]!)).changes;
         if (name.endsWith("_turn_items"))
           out
             .prepare(
               "INSERT INTO ardud_readonly_item_fences VALUES (?,?) ON CONFLICT(item_id) DO UPDATE SET sequence=excluded.sequence",
             )
             .run(row[table.primary]!, threadSequence(row.thread_id!));
+        return changes;
       }
     };
+    // Match recall_core.py's cached identities and live subagent traversal.
+    // Early publications advertise tuple changes through the touch log until events export.
+    const lineageStatements = new Map([
+      [
+        "orchestration_v2_projection_threads",
+        out.prepare(
+          "SELECT json_array(thread_id,json_extract(payload_json,'$.lineage.parentThreadId'),json_extract(payload_json,'$.lineage.rootThreadId')) AS identity FROM orchestration_v2_projection_threads WHERE thread_id=?",
+        ),
+      ],
+      [
+        "orchestration_v2_projection_provider_threads",
+        out.prepare(
+          "SELECT json_array(provider_thread_id,thread_id,json_extract(payload_json,'$.nativeThreadRef.nativeId')) AS identity FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id=?",
+        ),
+      ],
+      [
+        "orchestration_v2_projection_subagents",
+        out.prepare(
+          "SELECT json_array(subagent_id,thread_id,child_thread_id,json_extract(payload_json,'$.nativeTaskRef.nativeId')) AS identity FROM orchestration_v2_projection_subagents WHERE subagent_id=?",
+        ),
+      ],
+    ]);
+    const lineageIdentity = (name: string, id: NodeSqlite.SQLInputValue) =>
+      lineageStatements.get(name)?.get(id)?.identity;
     const selectColumns = (name: string) =>
       tables
         .get(name)!
@@ -533,8 +682,8 @@ export function createReadonlyReplica(
       const row = table.db
         .prepare(`SELECT ${selectColumns(name)} FROM ${q(name)} WHERE ${q(table.primary)}=?`)
         .get(id);
-      if (row) copyRow(name, row);
-      else out.prepare(`DELETE FROM ${q(name)} WHERE ${q(table.primary)}=?`).run(id);
+      if (row) return copyRow(name, row);
+      return out.prepare(`DELETE FROM ${q(name)} WHERE ${q(table.primary)}=?`).run(id).changes;
     };
     const page = (name: string, cursor: number) => {
       const table = tables.get(name)!;
@@ -544,6 +693,44 @@ export function createReadonlyReplica(
           `SELECT rowid AS __rowid,${selectColumns(name)} FROM ${q(name)} WHERE rowid>? ORDER BY rowid LIMIT ?`,
         )
         .all(cursor, batchSize);
+    };
+    // TEMP staging keeps auxiliary page pacing outside the publication lock.
+    // No partial auxiliary generation is visible to outside readers.
+    const auxiliaryStages = new Map(
+      auxiliary.map((name) => {
+        const table = tables.get(name)!;
+        const stage = `readonly_stage_${name}`;
+        out.exec(
+          sourceSchemas
+            .get(name)!
+            .replace(
+              /^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?[^ (]+/i,
+              `CREATE TEMP TABLE ${q(stage)}`,
+            ),
+        );
+        return [
+          name,
+          {
+            stage,
+            insert: out.prepare(
+              `INSERT OR REPLACE INTO temp.${q(stage)} (${table.columns.map(q)}) VALUES (${table.columns.map(() => "?")})`,
+            ),
+          },
+        ];
+      }),
+    );
+    const applyAuxiliary = () => {
+      for (const name of auxiliary) {
+        const { stage } = auxiliaryStages.get(name)!;
+        const { primary, columns } = tables.get(name)!;
+        const values = columns.filter((c) => c !== primary);
+        out.exec(`INSERT INTO main.${q(name)} (${columns.map(q)}) SELECT ${columns.map(q)} FROM temp.${q(stage)} WHERE 1
+          ON CONFLICT(${q(primary)}) DO UPDATE SET ${values.map((c) => `${q(c)}=excluded.${q(c)}`)}
+          WHERE ${values.map((c) => `${q(name)}.${q(c)} IS NOT excluded.${q(c)}`).join(" OR ")}`);
+        out.exec(
+          `DELETE FROM main.${q(name)} WHERE NOT EXISTS (SELECT 1 FROM temp.${q(stage)} s WHERE s.${q(primary)}=main.${q(name)}.${q(primary)})`,
+        );
+      }
     };
     const upsertEvent = out.prepare("INSERT OR REPLACE INTO orchestration_events VALUES (?,?,?,?)");
     const routes: Record<string, string> = {
@@ -556,10 +743,9 @@ export function createReadonlyReplica(
     };
     let cycleTarget: number | undefined;
     let auxiliaryCapturedAt: number | undefined;
-    let auxiliaryGeneration = nextGeneration();
+    nextGeneration();
     let auxiliaryIndex = 0,
       auxiliaryCursor = 0,
-      pruning = false,
       reconcileIndex = 0,
       closed = false;
     const sourceSchemaVersion = Number(
@@ -596,7 +782,6 @@ export function createReadonlyReplica(
         .run(name, generation, batchSize);
       return { pruneCursor: Number(rows.at(-1)?.__rowid ?? cursor), done: rows.length < batchSize };
     };
-    let auxiliaryPruneCursor = 0;
     // While a publish drains its backlog, every source read shares one
     // pinned snapshot (main, delta archive and base, pinned in that order).
     let pinned = false;
@@ -649,7 +834,184 @@ export function createReadonlyReplica(
         unpin();
       }
     };
-    const stepOnce = (): boolean => {
+    const eventReadFirst = (cursor: number) => {
+      let first = Infinity;
+      eventRead(() => {
+        for (const { db, table } of [
+          { db: source, table: "orchestration_events" },
+          ...(archive ? [{ db: archive, table: "ardud_events" }] : []),
+          ...(baseArchive ? [{ db: baseArchive, table: "orchestration_events" }] : []),
+        ]) {
+          const row = db
+            .prepare(`SELECT sequence FROM ${q(table)} WHERE sequence>? ORDER BY sequence LIMIT 1`)
+            .get(cursor);
+          if (row) first = Math.min(first, Number(row.sequence));
+        }
+      });
+      return first;
+    };
+    const identityNames = [
+      "orchestration_v2_projection_threads",
+      "orchestration_v2_projection_provider_threads",
+      "orchestration_v2_projection_subagents",
+    ];
+    // Source rowids are insertion ordered; never use replica rowids as cursors.
+    // Restarted workers resume only committed cursors. Bootstrap covers history.
+    const identityCursors = new Map(
+      identityNames.map((name) => [
+        name,
+        Number(
+          getMeta(`identity_cursor:${name}`) ??
+            source.prepare(`SELECT max(rowid) AS n FROM ${q(name)}`).get()?.n ??
+            0,
+        ),
+      ]),
+    );
+    let identitySequence = Number(
+      getMeta("identity_sequence") ?? getMeta("sequence") ?? sequence(),
+    );
+    transaction(() => {
+      for (const [name, cursor] of identityCursors) meta(`identity_cursor:${name}`, String(cursor));
+      meta("identity_sequence", String(identitySequence));
+    });
+    let identityCheckedAt = Number.NEGATIVE_INFINITY;
+    const identityCreatedAt = (row: Record<string, NodeSqlite.SQLOutputValue>) => {
+      const timestamp = row.created_at ?? row.started_at ?? row.updated_at;
+      const created = typeof timestamp === "string" ? Date.parse(timestamp) : NaN;
+      return Number.isFinite(created) ? created : undefined;
+    };
+    const publishIdentities = (): boolean => {
+      if (!published() || Date.now() - identityCheckedAt < 1_000) return false;
+      identityCheckedAt = Date.now();
+      return measure("identity", () =>
+        sourceRead(() => {
+          assertRedactionComplete();
+          const pages = identityNames.map((name) => ({
+            name,
+            rows: page(name, identityCursors.get(name)!),
+          }));
+          // Bindings may acquire their native id after insertion. A bounded event
+          // scan also catches those updates without scanning updated_at columns.
+          const events = eventPage(source, "orchestration_events", identitySequence, sequence());
+          const changed =
+            pages.some(({ rows }) => rows.length > 0) ||
+            events.some(
+              (row) =>
+                row.event_type === "provider-thread.updated" ||
+                row.event_type === "subagent.updated" ||
+                row.event_type === "thread.created",
+            );
+          let suspended: Uint8Array | undefined;
+          if (changed && cycleTransaction) {
+            // Save the pending replica diff before releasing its write lock.
+            // Replaying it after the short identity commit preserves catch-up
+            // progress even when new children arrive throughout a long cycle.
+            suspended = measure("identitySuspend", () => cycleSession!.changeset());
+            abortCycle();
+          }
+          if (cycleTransaction) {
+            // This cursor is a source scan, independent of the full-cycle
+            // sequence. Do not rescan the same non-identity prefix forever.
+            identitySequence = Number(events.at(-1)?.sequence ?? identitySequence);
+            if (events.length === batchSize) identityCheckedAt = Number.NEGATIVE_INFINITY;
+            return events.length === batchSize;
+          }
+          if (!changed && events.length === 0) return false;
+          const nextCursors = new Map(identityCursors);
+          let oldestCreated: number | undefined;
+          transaction(() => {
+            let changes = 0;
+
+            const copyIdentityRow = (
+              name: string,
+              row: Record<string, NodeSqlite.SQLOutputValue>,
+            ) => {
+              const id = row[tables.get(name)!.primary]!;
+              const before = lineageIdentity(name, id);
+              changes += Number(copyRow(name, row));
+              if (before !== lineageIdentity(name, id))
+                touchIdentity(name, id, before === undefined ? "insert" : "update");
+            };
+            const copyIdentity = (name: string, row: Record<string, NodeSqlite.SQLOutputValue>) => {
+              // A provider/subagent page may outrun the thread page. Resolve its
+              // lineage by indexed primary key in this same source snapshot.
+              for (const key of ["thread_id", "child_thread_id"]) {
+                if (name === identityNames[0] || typeof row[key] !== "string") continue;
+                const thread = source
+                  .prepare(`SELECT * FROM ${q(identityNames[0]!)} WHERE thread_id=?`)
+                  .get(row[key]!);
+                if (thread) copyIdentityRow(identityNames[0]!, thread);
+              }
+              copyIdentityRow(name, row);
+            };
+            for (const { name, rows } of pages) {
+              for (const row of rows) {
+                copyIdentity(name, row);
+                const created = identityCreatedAt(row);
+                if (created !== undefined)
+                  oldestCreated = Math.min(oldestCreated ?? created, created);
+              }
+              nextCursors.set(name, Number(rows.at(-1)?.__rowid ?? identityCursors.get(name)!));
+              meta(`identity_cursor:${name}`, String(nextCursors.get(name)));
+            }
+            for (const event of events) {
+              const name =
+                event.event_type === "provider-thread.updated"
+                  ? identityNames[1]
+                  : event.event_type === "subagent.updated"
+                    ? identityNames[2]
+                    : event.event_type === "thread.created"
+                      ? identityNames[0]
+                      : undefined;
+              const id = event.event_type === "thread.created" ? event.stream_id : event.entity_id;
+              if (name && id) {
+                const table = tables.get(name)!;
+                const row = source
+                  .prepare(`SELECT * FROM ${q(name)} WHERE ${q(table.primary)}=?`)
+                  .get(id);
+                if (row) copyIdentity(name, row);
+              }
+            }
+            // These rows precede their events; readers overlay touches without
+            // invalidating the full snapshot or advancing its publication markers.
+            pruneTouches();
+            metrics = { ...metrics, identityRows: metrics.identityRows + changes };
+            meta("identity_sequence", String(Number(events.at(-1)?.sequence ?? identitySequence)));
+          });
+          // Measure at COMMIT, and only newly inserted rows. A later status
+          // event must not report the age of a long-running subagent as lag.
+          if (oldestCreated !== undefined)
+            metrics = {
+              ...metrics,
+              identityLagMaxMs: Math.max(metrics.identityLagMaxMs, Date.now() - oldestCreated),
+            };
+          for (const [name, cursor] of nextCursors) identityCursors.set(name, cursor);
+          identitySequence = Number(events.at(-1)?.sequence ?? identitySequence);
+          if (suspended)
+            measure("identityResume", () => {
+              beginCycle();
+              // Early identity rows shadow the older pending identity values.
+              // Every other table must replay without conflicts: run/Stop state
+              // and publication markers still switch together at cycle end.
+              if (
+                !out.applyChangeset(suspended, {
+                  filter: (name) => !identityNames.includes(name),
+                }) ||
+                !out.applyChangeset(suspended, {
+                  filter: (name) => identityNames.includes(name),
+                  onConflict: () => sqlite.constants.SQLITE_CHANGESET_OMIT,
+                })
+              )
+                throw new Error("Readonly cycle could not resume after identity publication");
+            });
+          // Drain a backlog in bounded pages at the worker's 10 ms cadence.
+          if (pages.some(({ rows }) => rows.length === batchSize) || events.length === batchSize)
+            identityCheckedAt = Number.NEGATIVE_INFINITY;
+          return changed || identityCheckedAt === Number.NEGATIVE_INFINITY;
+        }),
+      );
+    };
+    const validate = () => {
       if (closed) throw new Error("Readonly exporter is closed");
       if (invalidated) throw new Error(invalidated);
       if (baseFilename() !== baseName)
@@ -689,12 +1051,12 @@ export function createReadonlyReplica(
             throw invalidate("Readonly source schema changed; restart export");
         }
       }
-      // Routine refresh of a published replica: one write transaction for the
-      // whole cycle. Bootstrap and event resets commit page by page instead,
-      // so they stay resumable while ready=0.
-      if (!cycleTransaction && published()) {
-        out.exec("BEGIN IMMEDIATE");
-        cycleTransaction = true;
+    };
+    const stepOnce = (): boolean => {
+      // Only projection/event catch-up and the final staged auxiliary diff hold
+      // the publication transaction. Bootstrap/reset pages remain resumable.
+      if (!cycleTransaction && auxiliaryIndex >= auxiliary.length && published()) {
+        beginCycle();
       }
       if (resettingEvents) {
         const result = out
@@ -739,35 +1101,36 @@ export function createReadonlyReplica(
         }
         return true;
       }
-      if (cycleTarget === undefined) cycleTarget = sequence();
-      if (catchUpWork()) return true;
+      if (auxiliaryIndex === 0 && auxiliaryCursor === 0 && cycleTarget === undefined) {
+        cycleTarget = sequence();
+        const cursor = Number(getMeta("sequence"));
+        if (cursor < cycleTarget) {
+          const first = eventReadFirst(cursor);
+          if (first !== cursor + 1) return measure("eventCatchup", catchUpWork);
+        }
+      }
       if (auxiliaryIndex < auxiliary.length) {
-        auxiliaryCapturedAt ??= Date.now();
-        const name = auxiliary[auxiliaryIndex]!,
-          table = tables.get(name)!;
-        if (!pruning) {
+        return measure("auxiliary", () => {
+          auxiliaryCapturedAt ??= Date.now();
+          const name = auxiliary[auxiliaryIndex]!;
+          const stage = auxiliaryStages.get(name)!;
+          if (auxiliaryCursor === 0) out.exec(`DELETE FROM temp.${q(stage.stage)}`);
           const rows = page(name, auxiliaryCursor);
           transaction(() => {
-            for (const row of rows) {
-              copyRow(name, row);
-              markSeen(name, row[table.primary]!, auxiliaryGeneration);
-            }
+            for (const row of rows)
+              stage.insert.run(...tables.get(name)!.columns.map((c) => row[c]!));
           });
           auxiliaryCursor = Number(rows.at(-1)?.__rowid ?? auxiliaryCursor);
-          pruning = rows.length < batchSize;
-        } else {
-          const result = transaction(() => prune(name, auxiliaryPruneCursor, auxiliaryGeneration));
-          auxiliaryPruneCursor = result.pruneCursor;
-          if (result.done) {
+          if (rows.length < batchSize) {
             auxiliaryIndex++;
             auxiliaryCursor = 0;
-            pruning = false;
-            auxiliaryPruneCursor = 0;
           }
-        }
-        return true;
+          return true;
+        });
       }
-      return publishStep();
+      if (cycleTarget === undefined) cycleTarget = sequence();
+      if (measure("eventCatchup", catchUpWork)) return true;
+      return measure("publish", publishStep);
     };
     /**
      * Event catchup, dirty turn items and the archive deletion journal: one
@@ -808,21 +1171,19 @@ export function createReadonlyReplica(
               meta("sequence", String(sequence()));
               out.prepare("DELETE FROM ardud_readonly_progress").run();
               meta("resetting_events", "1");
+              bumpRepair([{ cause: "reset", table: "orchestration_events", ids: 0 }]);
             });
             // Publish the reset: readers must not keep using this replica
             // while projections are rebuilt and events are cleared.
             if (cycleTransaction) {
-              cycleTransaction = false;
-              out.exec("COMMIT");
+              commitCycle();
             }
             resettingEvents = true;
             cycleTarget = undefined;
             auxiliaryIndex = 0;
             auxiliaryCursor = 0;
-            pruning = false;
-            auxiliaryPruneCursor = 0;
             auxiliaryCapturedAt = undefined;
-            auxiliaryGeneration = nextGeneration();
+            nextGeneration();
             return;
           }
           transaction(() => {
@@ -977,7 +1338,22 @@ export function createReadonlyReplica(
         }
         reconcileIndex++;
         transaction(() => {
-          for (const row of rows) refresh(name, row.id!);
+          measure("auxiliaryCommit", applyAuxiliary);
+          const causes = new Map<string, Omit<LineageRepairBump, "revision">>();
+          for (const row of rows) {
+            const before = lineageIdentity(name, row.id!);
+            refresh(name, row.id!);
+            const after = lineageIdentity(name, row.id!);
+            if (before !== undefined && before !== after) {
+              const cause = after === undefined ? "reconcile_delete" : "reconcile_change";
+              causes.set(cause, { cause, table: name, ids: (causes.get(cause)?.ids ?? 0) + 1 });
+            }
+          }
+          // Eventless repairs cannot be replayed from orchestration_events.
+          // Readers invalidate only for those repairs, not ordinary publishes.
+          if (causes.size) bumpRepair([...causes.values()]);
+          else if (getMeta("lineage_repair_revision") === undefined)
+            meta("lineage_repair_revision", "0");
           checkpoint(`reconcile:${name}`, {
             cursor: rows.length < batchSize ? 0 : Number(rows.at(-1)!.__rowid),
             done: false,
@@ -990,8 +1366,8 @@ export function createReadonlyReplica(
               "INSERT OR IGNORE INTO orchestration_events VALUES (?, 'readonly.watermark', '', '{}')",
             )
             .run(cycleTarget!);
-          // Recall invalidates its lineage cache at each completed generation;
-          // it does not need an unbounded copy of the event history.
+          // Readers rebuild if this retained prefix no longer covers their overlay.
+          // They do not need an unbounded copy of the event history.
           out
             .prepare(
               "DELETE FROM orchestration_events WHERE sequence IN (SELECT sequence FROM orchestration_events WHERE sequence<? ORDER BY sequence LIMIT ?)",
@@ -1008,6 +1384,9 @@ export function createReadonlyReplica(
               Math.max(Math.min(confirmedAt, auxiliaryCapturedAt ?? confirmedAt), previous + 1),
             ).toISOString(),
           );
+          // Bind capability evidence to this publication. An older exporter
+          // leaves it behind, so readers safely fall back after a downgrade.
+          meta("lineage_repair_watermark", getMeta("updated_at")!);
           meta("ready", "1");
           out
             .prepare(
@@ -1021,20 +1400,38 @@ export function createReadonlyReplica(
       drainPages = drainPagesInitial;
       // Readers switch from the previous generation to this one atomically.
       if (cycleTransaction) {
-        cycleTransaction = false;
-        out.exec("COMMIT");
+        commitCycle();
       }
       cycleTarget = undefined;
       auxiliaryIndex = 0;
       auxiliaryCursor = 0;
       auxiliaryCapturedAt = undefined;
-      auxiliaryGeneration = nextGeneration();
+      nextGeneration();
       return false;
     };
     return {
+      pollIdentities() {
+        try {
+          assertRedactionComplete();
+          validate();
+          return publishIdentities();
+        } catch (error) {
+          if (abortCycle()) invalidated ??= "Readonly refresh cycle aborted; reopen exporter";
+          recordFailure(error);
+          throw error;
+        }
+      },
+      takeMetrics() {
+        const result = metrics;
+        metrics = emptyMetrics();
+        return result;
+      },
       /** One bounded page; false means caught up, ready for the next interval. */
       step(): boolean {
         try {
+          assertRedactionComplete();
+          validate();
+          publishIdentities();
           return stepOnce();
         } catch (error) {
           // Discarding a routine cycle leaves the in-memory cursors ahead of

@@ -1,4 +1,5 @@
 import { messageLengthError } from "./message-length.ts";
+import { toolError } from "./toollog.ts";
 import { newFormKeys } from "./secret-crypto.ts";
 import { createHash } from "node:crypto";
 import { MAX_FILE_BYTES, validAppUrl, validFileName, validMimeType } from "./cli.ts";
@@ -31,6 +32,7 @@ type Options = {
   shares?: Shares;
   /** Standing chat-rule check on agent sends; absent where no rules apply. */
   replyCheck?: (text: string) => { rule: string; reason: string } | undefined;
+  foldText?: (text: string, operationId: string) => Promise<string>;
   /** Receives rule names only, never message text. */
   log?: (event: string, code?: string) => void;
 };
@@ -67,7 +69,7 @@ async function readBody(request: Request, maxBytes: number): Promise<Record<stri
   const length = request.headers.get("content-length");
   if (length !== null && (!/^\d+$/.test(length) || !Number.isSafeInteger(Number(length)))) throw new ApiError(400);
   if (length !== null && Number(length) > maxBytes) {
-    void request.body?.cancel().catch(() => {});
+    void request.body?.cancel().catch((caughtError) => { toolError("api", "api.catch1", caughtError);});
     throw new ApiError(413);
   }
   if (!request.body) return {};
@@ -83,7 +85,7 @@ async function readBody(request: Request, maxBytes: number): Promise<Record<stri
       size += value.byteLength;
       if (size > maxBytes) {
         // Do not wait for an untrusted stream's cancellation callback.
-        void reader.cancel().catch(() => {});
+        void reader.cancel().catch((caughtError) => { toolError("api", "api.catch2", caughtError);});
         throw new ApiError(413);
       }
       text += decoder.decode(value, { stream: true });
@@ -92,7 +94,7 @@ async function readBody(request: Request, maxBytes: number): Promise<Record<stri
     const body: unknown = JSON.parse(text);
     if (!body || typeof body !== "object" || Array.isArray(body)) throw new ApiError(400);
     return body as Record<string, unknown>;
-  } catch (error) {
+  } catch (error) { toolError("api", "api.catch3", error);
     throw error instanceof ApiError ? error : new ApiError(400);
   } finally {
     reader.releaseLock();
@@ -124,19 +126,22 @@ type SessionContent = Omit<OutboxOperation, "id" | "kind" | "sessionId" | "gener
 
 /** Session-bound, idempotent enqueue shared by every agent-authored conversation route. */
 function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId: string,
-  content: SessionContent, prepare?: () => void): { id: string; created: boolean } {
+  content: SessionContent, prepare?: () => void, output: SessionContent = content, attribution?: { inboundId?: string }): { id: string; created: boolean } {
   const id = `${prefix}:${hash(dedupeKey)}`;
   const created = store.db.transaction(() => {
     const route = store.get<{ id: string; generation: number } | null>("route");
     if (!sessionMatches(route, sessionId)) throw new ApiError(409);
+    if (prefix === "send" && store.get<boolean>(`cancelledSend:${id}`)) throw new ApiError(409);
     // Delivery and the origin backfill match on the bare id.
     const operation: OutboxOperation = { id, kind: "conversation", ...content, sessionId: route.id, generation: route.generation };
     const key = `api:${prefix}:${id}`;
     const spec = JSON.stringify(operation);
     const saved = store.get<{ spec: string; queuedAt?: number }>(key);
     if (saved && saved.spec !== spec) throw new ApiError(409);
+    // Concurrent callers may finish folding after the turn has closed; the accepted original spec owns its stored text.
+    if (saved && store.getOperation(id)) return false;
     prepare?.();
-    const created = store.enqueue(operation);
+    const created = store.enqueue({ ...operation, ...output }, attribution);
     store.set(key, { spec, ...(prefix === "send" ? { queuedAt: saved?.queuedAt ?? Date.now() } : {}) });
     return created;
   }).immediate();
@@ -193,7 +198,7 @@ function sendConflict(store: Store, dedupeKey: string, route: { id: string; gene
 }
 
 /** Fetch-compatible handler only; socket ownership and listening belong to main. */
-export function createApi({ store, photon, router, chatGuid, enabled, health, secrets, shares, replyCheck, log }: Options): (request: Request) => Promise<Response> {
+export function createApi({ store, photon, router, chatGuid, enabled, health, secrets, shares, replyCheck, foldText, log }: Options): (request: Request) => Promise<Response> {
   const pairedChat = () => {
     const guid = chatGuid();
     // Photon chat guids, or Sendblue chat keys (dm:<address> | group:<id>).
@@ -232,7 +237,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         }
         throw new ApiError(404);
       }
-      if (request.method !== "POST" || !["/files", "/react", "/send", "/poll", "/app", "/wake", "/secret-request", "/secret-read",
+      if (request.method !== "POST" || !["/files", "/react", "/send", "/cancel-send", "/poll", "/app", "/wake", "/secret-request", "/secret-read",
         "/secret-forget", ...SHARE_ROUTES].includes(path)) throw new ApiError(404);
       const body = await readBody(request, path === "/files" ? MAX_FILE_BODY : path === "/send" || path === "/wake" ? MAX_SEND_BODY : MAX_BODY);
 
@@ -255,10 +260,36 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
             return json({ forgotten: true });
           }
           return json({ value: await readSecret(deps, token, field as string) });
-        } catch (error) {
+        } catch (error) { toolError("api", "api.catch4", error);
           if (error instanceof SecretError) throw new ApiError(error.status);
           throw error;
         }
+      }
+
+      if (path === "/cancel-send") {
+        fields(body, ["dedupeKey", "sessionId"]);
+        const { dedupeKey, sessionId } = body;
+        if (!string(dedupeKey, 200) || !validSession(sessionId)) throw new ApiError(400);
+        liveSendRoute(store, sessionId);
+        const id = `send:${hash(dedupeKey)}`;
+        const cancelled = store.db.transaction(() => {
+          const item = store.getOperation(id);
+          if (item && item.state !== "cancelled") {
+            const marks = store.db.query<{ key: string }, [string]>("SELECT key FROM kv WHERE key GLOB ?")
+              .all(`chunk:${id}:*`);
+            const ambiguity = store.get<boolean>(`sendAmbiguous:${id}`);
+            const unattempted = item.attempts === 0 && store.get(`firstAttempt:${id}`) === undefined
+              && ambiguity === undefined;
+            if (item.state !== "pending" || marks.length || (!unattempted && ambiguity !== false)) return false;
+            store.outboxState(id, "cancelled");
+          }
+          // A timed-out enqueue can still be reaching this process. Fence its
+          // key even if the operation is not here yet; never create a new send.
+          store.set(`cancelledSend:${id}`, true);
+          return true;
+        }).immediate();
+        const state = store.getOperation(id)?.state;
+        return json({ id, cancelled, settled: state === "sent" || state === "failed" || state === "cancelled" });
       }
 
       const chat = pairedChat();
@@ -284,7 +315,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const attachment = { sha256: createHash("sha256").update(data).digest("hex"), name, mimeType, size: data.length };
         const { id, created } = queueSession(store, "file", dedupeKey, sessionId, { text, attachment }, () => store.putBlob(data));
         // Durable queue acceptance only; upload and delivery happen outside this handler.
-        return json({ id, created }, created ? 202 : 200);
+        return json({ id, created, chat: "owner" }, created ? 202 : 200);
       }
 
       if (path === "/send") {
@@ -301,20 +332,29 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         // stale or conflicting request, keep their existing answer and never touch bounce state.
         const route = liveSendRoute(store, sessionId);
         const existing = sendReplay(store, dedupeKey, route, content);
-        if (existing) return json({ id: existing, created: false }, 200);
+        if (existing) return json({ id: existing, created: false, chat: "owner" }, 200);
         // A stored key with different content is a conflict, reported before any rule is applied.
         if (sendConflict(store, dedupeKey, route, content)) throw new ApiError(409);
         const early = reuseEarlyReply(store, dedupeKey, route, content);
-        if (early) return json({ id: early, created: false }, 200);
+        if (early) return json({ id: early, created: false, chat: "owner" }, 200);
         const hit = replyCheck?.(text);
         if (hit && mayBounce(store, turnKey)) {
           noteBounce(store, turnKey);
           log?.("reply-bounced", hit.rule);
           return json({ error: `Nothing was sent: ${hit.reason}. Rewrite and send again.` }, 422);
         }
-        const { id, created } = queueSession(store, "send", dedupeKey, sessionId, content);
+        const operationId = `send:${hash(dedupeKey)}`;
+        if (store.get<boolean>(`cancelledSend:${operationId}`)) throw new ApiError(409);
+        // Folding can outlive this turn or overlap its replacement in the same session.
+        const turn = store.get<{ id: string; generation: number; inboundId?: string; replyInboundId?: string } | null>("activeTurn");
+        const attribution = { inboundId: turn?.id === route.id && turn.generation === route.generation ? turn.replyInboundId ?? turn.inboundId : undefined };
+        let folded = text;
+        try { folded = await foldText?.(text, operationId) ?? text; } catch { /* Optional folds never block a send. */ }
+        const { id, created } = queueSession(store, "send", dedupeKey, sessionId, content, () => {
+          if (liveSendRoute(store, sessionId).generation !== route.generation) throw new ApiError(409);
+        }, { ...content, text: folded }, attribution);
         if (created) noteSent(store, turnKey, text);
-        return json({ id, created }, created ? 202 : 200);
+        return json({ id, created, chat: "owner" }, created ? 202 : 200);
       }
 
       if (path === "/wake") {
@@ -387,7 +427,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const earlier = replay();
         if (earlier) return json(earlier, 200);
         let base: string;
-        try { base = await secrets.publishApps(); } catch { throw new ApiError(502); }
+        try { base = await secrets.publishApps(); } catch (caughtError) { toolError("api", "api.catch5", caughtError); throw new ApiError(502); }
         if (!validAppUrl(base)) throw new ApiError(502);
         const encryption = secrets.publicForm ? await newFormKeys() : undefined;
         const token = newToken();
@@ -424,7 +464,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
       }
 
       throw new ApiError(404);
-    } catch (error) {
+    } catch (error) { toolError("api", "api.catch6", error);
       const status = error instanceof ApiError ? error.status : 409;
       return json({ error: error instanceof ApiError ? error.message : errors[status] }, status);
     }

@@ -1,5 +1,8 @@
+import { redact } from "./redact.ts";
+import { allowQueuedAsk, flushBursts, runCloudUp } from "./notification-policy.ts";
 import { classifySendFailure, type SendFailure, type Telegram } from "./telegram.ts";
 import type { OutboxRecord, Store } from "./store.ts";
+import { toolError, toolLog } from "./toollog.ts";
 
 export { classifySendFailure } from "./telegram.ts";
 
@@ -9,6 +12,7 @@ type Options = {
   beforeSend?: (item: OutboxRecord) => Promise<"send" | "wait" | "cancel">;
   log?: (event: string, code?: string) => void;
   sleep?: (ms: number) => Promise<void>;
+  askNotified?: (key: string, at: number) => Promise<void>;
 };
 type Checkpoint = { accepted: boolean; providerId?: number };
 const RETRY_WINDOW = 24 * 60 * 60 * 1_000;
@@ -33,6 +37,8 @@ export class Delivery {
   }
 
   tick(): Promise<void> {
+    if (this.ticking) toolLog({ component: "telegram", kind: "event", name: "tg.dedupe", ok: true,
+      props: { action: "coalesce", deduped: true } });
     return this.ticking ??= Promise.resolve().then(() => this.run()).finally(() => { this.ticking = undefined; });
   }
 
@@ -64,6 +70,31 @@ export class Delivery {
     this.options.log?.("outbound-failed", code);
   }
 
+  private accepted(id: string, providerId?: number): void {
+    this.store.db.transaction(() => {
+      this.store.outboxState(id, "sent", providerId);
+      this.store.set(`acceptedAt:${id}`, this.store.get<number>(`acceptedAt:${id}`) ?? Date.now());
+      const key = this.store.get<string>(`ask-timing-key:${id}`);
+      if (key !== undefined && !this.store.get<boolean>(`ask-timing-reported:${id}`)) this.store.set(`ask-timing-pending:${id}`, { key, at: this.store.get<number>(`acceptedAt:${id}`)! });
+    }).immediate();
+    this.options.log?.("outbound-accepted");
+  }
+
+  private async reportAskTimings(): Promise<void> {
+    if (!this.options.askNotified) return;
+    const rows = this.store.db.query<{ key: string; value: string }, []>(
+      "SELECT key, value FROM kv WHERE key LIKE 'ask-timing-pending:%' ORDER BY key LIMIT 100",
+    ).all();
+    for (const row of rows) {
+      const receipt = JSON.parse(row.value) as { key: string; at: number };
+      try {
+        await this.options.askNotified(receipt.key, receipt.at);
+        this.store.set(row.key.replace("ask-timing-pending:", "ask-timing-reported:"), true);
+        this.store.db.query("DELETE FROM kv WHERE key = ?").run(row.key);
+      } catch (error) { toolError("telegram", "tg.askTiming.receipt", undefined, error); break; }
+    }
+  }
+
   private failed(item: OutboxRecord, state: string, wasAmbiguous: boolean, failure: SendFailure): void {
     if (!this.current(item, state)) return;
     this.store.db.transaction(() => {
@@ -83,25 +114,41 @@ export class Delivery {
 
   private async run(): Promise<void> {
     if (!this.options.enabled()) return;
+    await this.reportAskTimings();
     const boundChat = this.options.chatId();
     if (boundChat === undefined) return;
+    flushBursts(this.store);
     let dispatched = 0;
     operations: for (const queued of this.store.pendingOutbox()) {
       if (dispatched >= 10) break;
       if (!this.options.enabled() || this.options.chatId() === undefined) break;
       const item = this.store.getOperation(queued.id);
       if (!item || !this.current(item, "pending")) continue;
+      if (runCloudUp("run.cloud", item.text.replace(/^\[run\.cloud\] /, "")) && item.text.startsWith("[run.cloud] ")) {
+        this.store.outboxState(item.id, "cancelled");
+        continue;
+      }
       if (!item.text.trim() && !item.attachment) {
         this.store.outboxState(item.id, "failed");
         this.error("emptyContent");
         continue;
       }
       if ((this.store.get<number>(`retry:${item.id}`) ?? 0) > Date.now()) continue;
+      if (!allowQueuedAsk(this.store, item)) {
+        this.store.outboxState(item.id, "cancelled");
+        continue;
+      }
 
-      const characters = Array.from(item.text.trim() ? item.text : "");
+      // Accepted chunk indices belong to the original layout. Mask in place when resuming an older send.
+      const layoutKey = `redactionLayout:${item.id}`;
+      const layout = this.store.get<"preserve" | "compact">(layoutKey)
+        ?? (item.attempts > 0 || this.store.get<Checkpoint>(`chunk:${item.id}:0`)?.accepted ? "preserve" : "compact");
+      this.store.set(layoutKey, layout);
+      const characters = Array.from(item.text.trim() ? redact(item.text, layout === "preserve") : "");
       const chunks: string[] = [];
       for (let offset = 0; offset < characters.length; offset += CHUNK) {
-        chunks.push(characters.slice(offset, offset + CHUNK).join(""));
+        const chunk = characters.slice(offset, offset + CHUNK).join("");
+        chunks.push(chunk.trim() ? chunk : "[redacted]");
       }
       let state = "pending";
       let firstId = item.providerId;
@@ -161,6 +208,13 @@ export class Delivery {
         if (state === "pending") dispatched++;
         state = "sending";
         let result: { providerId?: number };
+        const ids = { operation: item.id, key: item.id, chat: chatId };
+        let severity = item.kind === "control" ? "attention" : "info";
+        try {
+          severity = this.store.get<{ severity: string }>(`api:notification:${item.id}`)?.severity
+            ?? this.store.get<string>(`log:severity:${item.id}`) ?? severity;
+        } catch (error) { toolError("telegram", "tg.send.severityRead", ids, error); }
+        const started = performance.now();
         try {
           if (item.attachment && index === chunks.length) {
             const previous = index > 0 ? this.store.get<Checkpoint>(`chunk:${item.id}:${index - 1}`) : undefined;
@@ -182,13 +236,25 @@ export class Delivery {
             });
           }
         } catch (error) {
-          this.failed(item, state, wasAmbiguous, classifySendFailure(error));
+          const failure = classifySendFailure(error);
+          // TransportError codes may come from a caller; the log tag depends only on the classified outcome.
+          const tag = failure.code === "floodWait" ? "tg.send.floodWait"
+            : failure.uncertain ? "tg.send.uncertain" : failure.retryable ? "tg.send.retryable" : "tg.send.rejected";
+          toolLog({ component: "telegram", kind: "error", name: "tg.send", durationMs: performance.now() - started,
+            ok: false, ids, props: { severity, attempt: item.attempts + 1, accepted: false }, error: { tag } });
+          this.failed(item, state, wasAmbiguous, failure);
           continue operations;
         }
+        toolLog({ component: "telegram", kind: "perf", name: "tg.send", durationMs: performance.now() - started,
+          ok: true, ids, props: { severity, attempt: item.attempts + 1, accepted: true } });
         // Provider acceptance is durable even if cancellation raced with this call.
         // Keep every message alias and its checkpoint in the same SQLite transaction.
         this.store.db.transaction(() => {
           this.store.set(chunkKey, { accepted: true, providerId: result.providerId } satisfies Checkpoint);
+          this.store.set(`acceptedAt:${item.id}`, this.store.get<number>(`acceptedAt:${item.id}`) ?? Date.now());
+          const askKey = this.store.get<string>(`ask-timing-key:${item.id}`);
+          if (askKey !== undefined && !this.store.get<boolean>(`ask-timing-reported:${item.id}`))
+            this.store.set(`ask-timing-pending:${item.id}`, { key: askKey, at: this.store.get<number>(`acceptedAt:${item.id}`)! });
           if (result.providerId !== undefined) {
             const key = `provider-operation:${result.providerId}`;
             const existing = this.store.get<string>(key) ?? this.store.byProviderId(result.providerId)?.id;
@@ -200,16 +266,14 @@ export class Delivery {
         firstId ??= result.providerId;
         const active = this.current(item, state);
         if (active && index === steps - 1) {
-          this.store.outboxState(item.id, "sent", firstId);
-          this.options.log?.("outbound-accepted");
+          this.accepted(item.id, firstId);
         }
         await this.sleep(800);
         if (!active || index === steps - 1) continue operations;
       }
       // All remaining chunks were already checkpointed; no RPC or attempt is needed.
       if (this.current(item, state)) {
-        this.store.outboxState(item.id, "sent", firstId);
-        this.options.log?.("outbound-accepted");
+        this.accepted(item.id, firstId);
       }
     }
   }

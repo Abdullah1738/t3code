@@ -7,11 +7,13 @@ from unittest.mock import patch
 import commerce_journal as j
 import commerce_nownow_order as c
 import commerce_nownow_capture as capture
+from owner_go_support import approve_test_flows
 from test.test_commerce_nownow_order import make_flow, happy_responses, FakeAuth, STORE, PRODUCT
 
 
 class CaptureTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         for module in (j, c.receipts):

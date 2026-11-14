@@ -10,6 +10,7 @@ import {
   AuthOrchestrationReadScope,
   KanbanBlockInput,
   type KanbanBoard,
+  KanbanNightlyReviewSettings,
   KanbanBoardIcon,
   KanbanBoardIconImage,
   type KanbanCard,
@@ -19,8 +20,10 @@ import {
   KanbanError,
   KanbanPriority,
   KanbanScriptId,
+  KanbanScriptAcknowledgeInput,
   KanbanScriptTrigger,
   KanbanStage,
+  KanbanMoveOptions,
   ProviderOptionSelections,
   ProjectId,
 } from "@t3tools/contracts";
@@ -34,7 +37,7 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import { modelSelectionResult, type ModelInput } from "./engine/defaults.ts";
-import { KanbanService } from "./engine/KanbanService.ts";
+import { KanbanService, askAnswerVia } from "./engine/KanbanService.ts";
 import { requireOwner } from "./ownerGate.ts";
 import { selectionRoutingEnabled } from "./engine/selectionSettings.ts";
 import { KanbanScripts } from "./engine/ScriptService.ts";
@@ -128,9 +131,10 @@ const CreateCardBody = Schema.Struct({
   reviewChain: Text,
 });
 
-const MoveBody = Schema.Struct({ to: KanbanStage, note: Text, question: Text });
+const MoveBody = Schema.Struct({ to: KanbanStage, ...KanbanMoveOptions.fields });
 
 const PostBody = Schema.Struct({
+  revision: Schema.optional(Schema.Number),
   text: Text,
   blocks: Schema.optional(Schema.Array(KanbanBlockInput)),
 });
@@ -200,6 +204,7 @@ const AskSnoozeBatchBody = Schema.Struct({
 const ASK_BATCH_MAX = 50;
 
 const BoardBody = Schema.Struct({
+  nightlyReview: Schema.optional(Schema.NullOr(KanbanNightlyReviewSettings)),
   name: Text,
   icon: Schema.optional(Schema.NullOr(KanbanBoardIcon)),
   iconImage: Schema.optional(Schema.NullOr(KanbanBoardIconImage)),
@@ -211,6 +216,7 @@ const BoardBody = Schema.Struct({
     Schema.Array(Schema.Struct({ name: Schema.String, steps: Schema.Array(ModelBody) })),
   ),
   defaultReviewChain: Schema.optional(Schema.NullOr(Schema.String)),
+  guessedGates: Schema.optional(Schema.Array(Schema.Literals(["deploy", "money", "secret"]))),
 });
 
 const PoolBody = Schema.Struct({
@@ -226,13 +232,24 @@ const ScriptBody = Schema.Struct({
   enabled: Schema.optional(Schema.Boolean),
 });
 
+const ScriptAcknowledgeBody = KanbanScriptAcknowledgeInput.mapFields(Struct.omit(["scriptId"]));
+
 const ScriptPatchBody = Schema.Struct({ enabled: Schema.Boolean });
 
 /** A webhook sender calls the run route with `trigger: "webhook"`. */
 const RunBody = Schema.Struct({ trigger: Schema.optional(Schema.Literals(["manual", "webhook"])) });
 
 const EvaluatorBody = Schema.Struct({
-  kind: Schema.Literals(["setup", "request", "stalled", "completed", "deployed", "check"]),
+  forceNew: Schema.optional(Schema.Boolean),
+  kind: Schema.Literals([
+    "setup",
+    "request",
+    "stalled",
+    "completed",
+    "deployed",
+    "check",
+    "nightly",
+  ]),
   text: Text,
 });
 
@@ -450,6 +467,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           : undefined;
         return yield* service.updateBoard(board.id, {
           ...(input.name ? { name: input.name } : {}),
+          ...(input.nightlyReview !== undefined ? { nightlyReview: input.nightlyReview } : {}),
           ...(input.icon !== undefined ? { icon: input.icon } : {}),
           ...(input.iconImage !== undefined ? { iconImage: input.iconImage } : {}),
           ...(input.projectId !== undefined
@@ -459,6 +477,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           ...(evaluatorModel ? { evaluatorModel } : {}),
           ...(defaultCardModel ? { defaultCardModel } : {}),
           ...(reviewChains ? { reviewChains } : {}),
+          ...(input.guessedGates !== undefined ? { guessedGates: input.guessedGates } : {}),
           ...(input.defaultReviewChain !== undefined
             ? { defaultReviewChain: input.defaultReviewChain }
             : {}),
@@ -500,6 +519,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         return yield* service.moveCard(card.id, input.to, "owner", OWNER, {
           note: input.note ?? null,
           question: input.question ?? null,
+          ...(input.keepWait === undefined ? {} : { keepWait: input.keepWait }),
         });
       }),
     );
@@ -643,6 +663,37 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
+    const seenAsk = ownerWrite(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        const { surface, at } = yield* body(
+          Schema.Struct({
+            surface: Schema.Literals(["web", "desktop", "mobile"]),
+            at: Schema.optional(Schema.String),
+          }),
+        );
+        yield* service.noteAskTiming(card.id, yield* param("ask"), { type: "seen", surface, at });
+        return { recorded: true };
+      }),
+    );
+    const notifiedAsk = write(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        const input = yield* body(
+          Schema.Struct({
+            channel: Schema.Literals(["in_app", "telegram", "push"]),
+            at: Schema.optional(
+              Schema.String.check(
+                Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+              ),
+            ),
+          }),
+        );
+        yield* service.noteAskTiming(card.id, yield* param("ask"), { type: "notified", ...input });
+        return { recorded: true };
+      }),
+    );
+
     // Each ask is answered on its own: one stale or closed ask doesn't hold back the rest.
     const answerAsks = ownerWrite(
       Effect.gen(function* () {
@@ -673,12 +724,9 @@ export const kanbanRouteLayer = HttpRouter.addAll(
                 );
               }
             }
-            const result = yield* service.answerAsk(
-              card.id,
-              item.askId,
-              { ...answer, revision: item.revision },
-              OWNER,
-            );
+            const result = yield* service
+              .answerAsk(card.id, item.askId, { ...answer, revision: item.revision }, OWNER)
+              .pipe(Effect.provideService(askAnswerVia, "batch"));
             return {
               card: item.card,
               askId: item.askId,
@@ -713,7 +761,9 @@ export const kanbanRouteLayer = HttpRouter.addAll(
           ...(input.blocks ?? []),
         ];
         if (blocks.length === 0) return yield* fail("invalid", "Nothing to post.");
-        return stubMessage(yield* service.replyOnAsk(card.id, askId, OWNER, blocks, "owner"));
+        return stubMessage(
+          yield* service.replyOnAsk(card.id, askId, OWNER, blocks, "owner", input.revision),
+        );
       }),
     );
 
@@ -915,8 +965,10 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         // setup/request already carry their text in purpose; only sweeps pass it separately.
         const sweepText =
           input.kind === "setup" || input.kind === "request" ? undefined : input.text;
-        const threadId = yield* service.startEvaluator(board.id, purpose, sweepText);
-        return { threadId };
+        return yield* service.submitEvaluator(board.id, purpose, {
+          ...(sweepText ? { text: sweepText } : {}),
+          ...(input.forceNew === undefined ? {} : { forceNew: input.forceNew }),
+        });
       }),
     );
 
@@ -942,6 +994,14 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         const id = yield* scriptId;
         const input = yield* body(ScriptPatchBody);
         return yield* scripts.setEnabled(id, input.enabled);
+      }),
+    );
+
+    const acknowledgeScript = write(
+      Effect.gen(function* () {
+        const id = yield* scriptId;
+        const input = yield* body(ScriptAcknowledgeBody);
+        return yield* scripts.acknowledge({ ...input, scriptId: id });
       }),
     );
 
@@ -978,6 +1038,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       HttpRouter.route("POST", `${p}/boards/:board/scripts`, handle(registerScript)),
       HttpRouter.route("PATCH", `${p}/scripts/:script`, handle(patchScript)),
       HttpRouter.route("POST", `${p}/scripts/:script/run`, handle(runScript)),
+      HttpRouter.route("POST", `${p}/scripts/:script/acknowledge`, handle(acknowledgeScript)),
       HttpRouter.route("GET", `${p}/scripts/:script/runs`, handle(listRuns)),
       HttpRouter.route("GET", `${p}/cards/:card`, handle(getCard)),
       HttpRouter.route("POST", `${p}/cards/:card/move`, handle(moveCard)),
@@ -988,6 +1049,8 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       HttpRouter.route("POST", `${p}/asks/hand`, handle(handAsks)),
       HttpRouter.route("GET", `${p}/cards/:card/asks/:ask`, handle(getAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/answer`, handle(answerAsk)),
+      HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/seen`, handle(seenAsk)),
+      HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/notified`, handle(notifiedAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/reply`, handle(replyOnAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/hand`, handle(handAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/snooze`, handle(snoozeAsk)),

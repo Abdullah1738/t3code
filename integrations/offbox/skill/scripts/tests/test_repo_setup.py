@@ -1,9 +1,11 @@
 """Run the repository setup preamble under real bash without root or network access."""
+import base64
 import contextlib
 import hashlib
 import io
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -14,7 +16,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from offbox_lib import runs
 from offbox_lib import common, misc, pool, reap
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tests._env import clean_env
 from test_capacity import Isolated
+
+TEMPLATES = runs.REPO_RECIPES_DIR.parent
+FETCH = (TEMPLATES / 'tools/fetch.sh').read_bytes()
 
 KEY = 'usdtwallet-android'
 RECIPE = r'''set -euo pipefail
@@ -39,6 +45,8 @@ class RepoSetupTests(unittest.TestCase):
         self.mod.write_text('module wallet\nrequire (\n golang.org/x/mobile v1.0.0\n)\n')
         self.recipes = self.home / 'recipes'
         self.recipes.mkdir()
+        (self.recipes.parent / 'tools').mkdir()
+        (self.recipes.parent / 'tools/fetch.sh').write_bytes(FETCH)
         self.recipe = self.recipes / f'{KEY}.sh'
         self.recipe.write_text(RECIPE)
         bins = self.home / 'bin'
@@ -51,13 +59,13 @@ class RepoSetupTests(unittest.TestCase):
         flock.chmod(0o755)
         python = bins / 'python3'
         python.symlink_to(sys.executable)
-        self.env = dict(os.environ, HOME=str(self.home), PATH=f'{bins}:/usr/bin:/bin:/usr/sbin:/sbin')
+        self.env = clean_env(HOME=str(self.home), PATH=f'{bins}:/usr/bin:/bin:/usr/sbin:/sbin')
         self.stamp = self.home / f'.offbox/repo-setup-{KEY}.stamp'
 
     def script(self, key=KEY):
         with patch.object(runs, 'REPO_RECIPES_DIR', self.recipes), \
              patch.object(runs, 'DOCKER_REPAIR', ':'), patch.object(runs, 'LDCACHE_REPAIR', ':'), \
-             patch.object(runs, 'GO_REPAIR', 'echo GO_REPAIR'):
+             patch.object(runs, 'GO_REPAIR', 'echo GO_REPAIR'), patch.object(runs.userns, 'setup', return_value=':'):
             return runs.remote_script('w/repo', 'android', [], None, 'run-test', repo_key=key,
                                       steps=['echo USER_COMMAND; echo "$JAVA_HOME"; command -v gomobile'])
 
@@ -76,7 +84,7 @@ class RepoSetupTests(unittest.TestCase):
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), ['run'])
-        expected = hashlib.sha256(RECIPE.encode() + b'\0v1.0.0').hexdigest()
+        expected = hashlib.sha256(FETCH + b'\n' + RECIPE.encode() + b'\0v1.0.0').hexdigest()
         self.assertEqual(self.stamp.read_text().strip(), expected)
         self.assertIn(str(self.home / 'java'), result.stdout)
         self.assertIn(str(self.home / 'mobile/bin/gomobile'), result.stdout)
@@ -121,6 +129,33 @@ class RepoSetupTests(unittest.TestCase):
         self.assertNotIn('USER_COMMAND', result.stdout)
         self.assertNotIn('GO_REPAIR', result.stdout)
         self.assertEqual(self.run_script().returncode, 0)
+
+    def test_download_failure_uses_setup_failure_path_without_running_command(self):
+        curl = self.home / 'bin/curl'
+        curl.write_text('#!/bin/bash\nexit 28\n')
+        curl.chmod(0o755)
+        self.recipe.write_text('set -euo pipefail\noffbox_fetch https://example.test/archive "$HOME/archive"\n' + RECIPE)
+        result = self.run_script()
+        self.assertEqual(result.returncode, 98, result.stderr)
+        self.assertIn('offbox: download failed (curl exit 28): https://example.test/archive', result.stderr)
+        self.assertIn('toolchain setup failed on this box; nothing ran', result.stderr)
+        self.assertIn(runs.REPO_SETUP_FAILED_MARKER, result.stderr)
+        self.assertFalse(self.stamp.exists())
+        self.assertFalse((self.home / 'calls').exists())
+        self.assertNotIn('USER_COMMAND', result.stdout)
+        self.assertNotIn('GO_REPAIR', result.stdout)
+
+    def test_all_real_recipes_define_fetch_before_downloads(self):
+        with patch.object(runs, 'REPO_RECIPES_DIR', TEMPLATES / 'repos'):
+            for recipe in (TEMPLATES / 'repos').glob('*.sh'):
+                with self.subTest(recipe=recipe.name):
+                    block = runs.repo_setup_block(recipe.stem, 'w/repo')
+                    encoded = re.search(r"base64.b64decode\('([^']+)'\)", block)[1]
+                    body = base64.b64decode(encoded).decode()
+                    self.assertTrue(body.startswith(FETCH.decode() + '\n'))
+                    uses = list(re.finditer(r'^\s*offbox_fetch\s+', body, re.M))
+                    self.assertTrue(uses)
+                    self.assertLess(body.index('offbox_fetch()'), uses[0].start())
 
     def test_lock_failure_never_runs_recipe_or_command(self):
         result = self.run_script(FAIL_LOCK='1')
@@ -189,7 +224,7 @@ class RepoSetupTests(unittest.TestCase):
                        ' mkdir -p "$ANDROID_HOME/${package//;///}"\n'
                        ' touch "$ANDROID_HOME/${package//;///}/package.xml"\ndone\n')
         sdk.chmod(0o755)
-        recipe = (runs.REPO_RECIPES_DIR / f'{KEY}.sh').read_text()
+        recipe = FETCH.decode() + '\n' + (runs.REPO_RECIPES_DIR / f'{KEY}.sh').read_text()
         recipe = recipe.replace('/usr/lib/jvm/java-17-openjdk-amd64', str(java_home))
         recipe = recipe.replace('/usr/local/go/bin', str(bins))
         path = self.home / 'real-recipe.sh'

@@ -93,8 +93,10 @@ Exact tracking of first returned ID `FE96NN7V0AOPFGA` returned
 was independently consistent with the list row. Second list ID was
 `FE96NN0QMKW5XRA`; no tracking call was needed for that order.
 
-Only Food `delivered` is live-verified. Unknown/active/cancelled enums are not
-mapped. ETA remains null. Delivered tracking still exposes rider contact and
+Exact Food tracking also maps `preparing`, `delivering` and `picked_up`, with
+verified native ETA windows. Live evidence on 13 November 2026 confirmed raw
+`canceled`, projected to `cancelled`; provider status labels remain verbatim.
+Other enum values remain unknown. Delivered tracking still exposes rider contact and
 coordinates without an established display gate; these are deliberately omitted.
 Food list responses also include payment-client-secret fields: never return or
 log the upstream object. The module constructs a fresh small allowlisted output.

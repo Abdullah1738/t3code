@@ -18,6 +18,7 @@ import {
   TrimmedNonEmptyString,
 } from "../baseSchemas.ts";
 import { ChatFileAttachment, ChatImageAttachment } from "../chatAttachment.ts";
+import { ProviderInstanceId } from "../providerInstance.ts";
 import { ModelSelection } from "../modelSelection.ts";
 
 const kanbanId = <Brand extends string>(brand: Parameters<typeof Schema.brand<Brand>>[0]) =>
@@ -136,6 +137,8 @@ export const KanbanSubtask = Schema.Struct({
   step: PositiveInt,
   text: Schema.String,
   owner: KanbanSubtaskOwner,
+  gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
+  createdAt: Schema.optional(IsoDateTime),
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   script: Schema.optional(Schema.String),
   state: Schema.Literals(["open", "done", "skipped"]),
@@ -521,6 +524,29 @@ export const KanbanOwnerAsk = Schema.Struct({
   seq: Schema.NullOr(PositiveInt),
   /** Set once answered or dropped. */
   closedAt: Schema.NullOr(IsoDateTime),
+  timing: Schema.optional(
+    Schema.Struct({
+      kind: Schema.optional(
+        Schema.Literals(["approve", "pick", "draft", "action", "input", "notice"]),
+      ),
+      openAsksAtCreation: Schema.optional(NonNegativeInt),
+      notified: Schema.optional(
+        Schema.Struct({
+          in_app: Schema.optional(IsoDateTime),
+          telegram: Schema.optional(IsoDateTime),
+          push: Schema.optional(IsoDateTime),
+        }),
+      ),
+      firstSeen: Schema.optional(
+        Schema.Struct({
+          web: Schema.optional(IsoDateTime),
+          desktop: Schema.optional(IsoDateTime),
+          mobile: Schema.optional(IsoDateTime),
+        }),
+      ),
+      answeredVia: Schema.optional(Schema.Literals(["single", "batch", "free_text"])),
+    }),
+  ),
   /** A label for the layout; absent means "question". Behaviour comes from `kanbanAskResponse`. */
   kind: Schema.optional(KanbanAskKind),
   /** One short line saying what is being asked. */
@@ -552,6 +578,17 @@ export const KanbanOwnerAsk = Schema.Struct({
   revisionNote: Schema.optional(Schema.String),
   /** The message that first asked it, kept once an edit moves `seq` to the new version. */
   firstSeq: Schema.optional(PositiveInt),
+  confirmation: Schema.optional(
+    Schema.Struct({
+      seq: PositiveInt,
+      revision: NonNegativeInt,
+      sourceSeq: PositiveInt,
+      text: Schema.optional(Schema.String),
+      note: Schema.optional(Schema.String),
+      values: KanbanAskAnswer.fields.values,
+      finalDraft: KanbanAskAnswer.fields.finalDraft,
+    }),
+  ),
   /** Set when it closes through the answer path, a hand-over or a drop. */
   answer: Schema.optional(KanbanAskAnswer),
   /** The owner asked a clarifying question: the ask waits for the agent, not for him. */
@@ -744,7 +781,8 @@ export const KANBAN_ASK_WORDS_REFUSED = "can't be answered in words alone";
  * verdict): there is no verdict to give and no pick he has to make, and there
  * is something words fill in (a field, or a pick he may leave empty). An
  * approval, a required pick, a task with nothing to fill in and a notice
- * never close on words: he says them in a reply on the ask, which stays open.
+ * use the owner reply classifier when he types words instead. A text answer
+ * closes the ask without granting an approval or completing a task.
  */
 export const kanbanResponseTakesWords = (response: KanbanAskResponse): boolean =>
   !response.ack &&
@@ -960,6 +998,8 @@ export const KanbanCard = Schema.Struct({
   /** Position in the review chain while in review; reset when findings send it back. */
   reviewStep: NonNegativeInt,
   reviewRound: NonNegativeInt,
+  /** Findings remain actionable through worker retries after the delivery note is consumed. */
+  reviewFindingsPending: Schema.optional(Schema.Boolean),
   activeThreadId: Schema.NullOr(ThreadId),
   activeRole: Schema.NullOr(Schema.Literals(["work", "review"])),
   /** Pool key (instance/model#level) the active thread holds a slot in. */
@@ -984,6 +1024,8 @@ export const KanbanCard = Schema.Struct({
   deciding: ForwardCompatibleOptional(KanbanCardDeciding),
   /** Set when the server nudged the active thread after a turn ended without a card move. */
   nudgedAt: Schema.NullOr(IsoDateTime),
+  /** A delivered steer can start the detached work thread while a newer wait remains. */
+  detachedSteerAt: Schema.optional(IsoDateTime),
   /**
    * Automatic retries used on the current attempt, at most one per kind. Absent on
    * most cards and on every card stored before retries existed. Cleared by a real
@@ -995,6 +1037,8 @@ export const KanbanCard = Schema.Struct({
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   movedAt: IsoDateTime,
+  /** Lifecycle clock for local analytics; movedAt may deliberately retain queue age on retry. */
+  analyticsStageEnteredAt: Schema.optional(IsoDateTime),
 });
 export type KanbanCard = typeof KanbanCard.Type;
 
@@ -1104,12 +1148,20 @@ export const kanbanCardNeedsOwner = (
     (card.stage === "needs_owner" &&
       card.asks.every((ask) => ask.closedAt !== null || kanbanAskIsNotice(ask))));
 
+/** Options shared by explicit card moves over HTTP and agent tools. */
+export const KanbanMoveOptions = Schema.Struct({
+  note: Schema.optional(Schema.NullOr(Schema.String)),
+  question: Schema.optional(Schema.NullOr(Schema.String)),
+  keepWait: Schema.optional(Schema.Boolean),
+});
+export type KanbanMoveOptions = typeof KanbanMoveOptions.Type;
+
 /** The card's wait, or null. */
 export const kanbanWait = (card: Pick<KanbanCard, "wait">): KanbanWait | null => card.wait ?? null;
 
 /**
- * A wait left behind: the card was moved after it was set, so whoever moved
- * it took the card on. The board drops such a wait without waking anyone.
+ * A wait left behind by a writer that moved the card without resolving it.
+ * The board clears it and wakes its requested role as a safety net.
  */
 export const kanbanWaitStale = (card: Pick<KanbanCard, "wait" | "movedAt">): boolean =>
   card.wait !== undefined && Date.parse(card.movedAt) > Date.parse(card.wait.at);
@@ -1237,16 +1289,29 @@ export const kanbanScriptStep = (card: Pick<KanbanCard, "subtasks">): boolean =>
 };
 
 /**
- * A todo card the dispatcher leaves alone because its step is the
- * evaluator's or a board script's. One with a wake note still goes back to
- * its worker: review findings and the owner's words have to reach it.
+ * Unplanned cards retain the legacy workflow. Planned work uses the same open
+ * step as subtask_done; a note never grants work on a later step. Findings
+ * leave the review subtask open, so that review-only step is the one exception.
+ * Its durable verdict bit survives note consumption, retries and fresh threads;
+ * notes alone never grant eligibility; older verdicts are upgraded by the server.
  */
+export const kanbanWorkStep = (
+  card: Pick<KanbanCard, "wakeNote" | "subtasks" | "reviewFindingsPending">,
+): boolean => {
+  if (card.subtasks.length === 0) return true;
+  const open = kanbanStepSubtasks(card);
+  return (
+    open.some((subtask) => subtask.owner === "work") ||
+    (open.length > 0 &&
+      open.every((subtask) => subtask.owner === "review") &&
+      card.reviewFindingsPending === true)
+  );
+};
+
+/** A todo card whose current step cannot be assigned to a worker. */
 export const kanbanWaitsOnEvaluator = (
-  card: Pick<KanbanCard, "stage" | "wakeNote" | "subtasks">,
-): boolean =>
-  card.stage === "todo" &&
-  card.wakeNote === null &&
-  (kanbanEvaluatorStep(card) || kanbanScriptStep(card));
+  card: Pick<KanbanCard, "stage" | "wakeNote" | "subtasks" | "reviewFindingsPending">,
+): boolean => card.stage === "todo" && !kanbanWorkStep(card);
 
 /** Stages past the work: a card here no longer blocks anything or waits on anything. */
 export const KANBAN_DONE_STAGES: ReadonlySet<KanbanStage> = new Set([
@@ -1870,6 +1935,46 @@ export const KanbanBoardPause = Schema.Struct({
 });
 export type KanbanBoardPause = typeof KanbanBoardPause.Type;
 
+export const KanbanNightlyReviewTime = Schema.String.check(
+  Schema.isPattern(/^([01]\d|2[0-3]):[0-5]\d$/),
+);
+export const KanbanNightlyReviewTimeZone = Schema.String.check(
+  Schema.makeFilter((value) => {
+    try {
+      new Intl.DateTimeFormat("en", { timeZone: value });
+      return true;
+    } catch {
+      return false;
+    }
+  }),
+);
+export const KanbanNightlyReviewSettings = Schema.Struct({
+  enabled: Schema.Boolean,
+  timeOfDay: KanbanNightlyReviewTime.pipe(Schema.withDecodingDefault(Effect.succeed("00:00"))),
+  timeZone: KanbanNightlyReviewTimeZone.pipe(
+    Schema.withDecodingDefault(Effect.succeed("Asia/Dubai")),
+  ),
+  model: ModelSelection.pipe(
+    Schema.withDecodingDefault(
+      Effect.succeed({
+        instanceId: ProviderInstanceId.make("claudeAgent"),
+        model: "claude-sonnet-5-5",
+        options: [{ id: "effort", value: "medium" }],
+      }),
+    ),
+  ),
+});
+export type KanbanNightlyReviewSettings = typeof KanbanNightlyReviewSettings.Type;
+export const KanbanNightlyReview = Schema.Struct({
+  ...KanbanNightlyReviewSettings.fields,
+  lastRunAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  lastRunDay: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  lastDiscussionId: Schema.NullOr(KanbanDiscussionId).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+});
+export type KanbanNightlyReview = typeof KanbanNightlyReview.Type;
+
 export const KanbanBoard = Schema.Struct({
   id: KanbanBoardId,
   slug: TrimmedNonEmptyString,
@@ -1885,9 +1990,13 @@ export const KanbanBoard = Schema.Struct({
   defaultCardModel: ModelSelection,
   reviewChains: Schema.Array(KanbanReviewChain),
   defaultReviewChain: Schema.NullOr(TrimmedNonEmptyString),
+  guessedGates: Schema.optional(Schema.Array(Schema.Literals(["deploy", "money", "secret"]))),
   instructions: KanbanInstructions,
   setup: Schema.NullOr(KanbanBoardSetup).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   pause: Schema.NullOr(KanbanBoardPause).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  nightlyReview: Schema.NullOr(KanbanNightlyReview).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
   createdAt: IsoDateTime,
   archivedAt: Schema.NullOr(IsoDateTime),
 });
@@ -2062,6 +2171,48 @@ export const KanbanScriptTrigger = Schema.Union([
 ]);
 export type KanbanScriptTrigger = typeof KanbanScriptTrigger.Type;
 
+export const KanbanScriptCardCommand = Schema.Struct({
+  kanban: Schema.Literal("card"),
+  prompt: Schema.String,
+  title: Schema.optional(Schema.String),
+  description: Schema.optional(Schema.String),
+  priority: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 4 }))),
+  projects: Schema.optional(Schema.Array(Schema.String)),
+  links: Schema.optional(
+    Schema.Array(Schema.Struct({ url: Schema.String, label: Schema.optional(Schema.String) })),
+  ),
+});
+
+export const KanbanScriptPostCommand = Schema.Struct({
+  kanban: Schema.Literal("post"),
+  text: Schema.String,
+  discussion: Schema.optional(Schema.String),
+  card: Schema.optional(Schema.Int),
+});
+
+export const KanbanScriptDeliveryRef = Schema.Struct({
+  command: Schema.Union([KanbanScriptCardCommand, KanbanScriptPostCommand]),
+  firstFailedAt: IsoDateTime,
+  /** Total delivery attempts, including retries within a run. */
+  attempts: NonNegativeInt,
+});
+export type KanbanScriptDeliveryRef = typeof KanbanScriptDeliveryRef.Type;
+
+/** Acknowledgement clears checked outcomes; it never sends the commands again. */
+export const KanbanScriptAcknowledgeInput = Schema.Struct({
+  scriptId: KanbanScriptId,
+  deliveries: Schema.Array(KanbanScriptDeliveryRef).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(100),
+  ),
+});
+export type KanbanScriptAcknowledgeInput = typeof KanbanScriptAcknowledgeInput.Type;
+
+const KanbanScriptHeldCommand = Schema.Struct({
+  ...KanbanScriptDeliveryRef.fields,
+  lastError: Schema.String,
+});
+
 export const KanbanScript = Schema.Struct({
   id: KanbanScriptId,
   boardId: KanbanBoardId,
@@ -2072,6 +2223,16 @@ export const KanbanScript = Schema.Struct({
   enabled: Schema.Boolean,
   createdBy: KanbanActor,
   createdAt: IsoDateTime,
+  held: Schema.optional(Schema.Array(KanbanScriptHeldCommand)),
+  /** A write started but has no confirmed outcome. These records must never replay automatically. */
+  unresolved: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        ...KanbanScriptHeldCommand.fields,
+        reported: Schema.optional(Schema.Boolean),
+      }),
+    ),
+  ),
   lastRun: Schema.NullOr(
     Schema.Struct({
       startedAt: IsoDateTime,
@@ -2141,6 +2302,8 @@ export class KanbanError extends Schema.TaggedError<KanbanError>()("KanbanError"
    * (`invalid`) or an older one (`conflict`). The detail says it in words too.
    */
   revision: Schema.optionalKey(NonNegativeInt),
+  /** The savedReply signal: false means definitely not written, null means possibly saved. */
+  saved: Schema.optional(Schema.NullOr(Schema.Boolean)),
 }) {
   override get message(): string {
     return `Missions board ${this.code}: ${this.detail}`;

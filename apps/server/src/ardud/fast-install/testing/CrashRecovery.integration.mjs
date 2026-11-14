@@ -1,24 +1,24 @@
 // Run offbox: node apps/server/src/ardud/fast-install/testing/CrashRecovery.integration.mjs <output-dir>
 // The inspector is bound to loopback on a synthetic subprocess only.
-import fs from "node:fs";
-import path from "node:path";
-import os from "node:os";
-import { spawn } from "node:child_process";
-import { once } from "node:events";
-import net from "node:net";
-import assert from "node:assert/strict";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+import * as NodeOS from "node:os";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeEvents from "node:events";
+import * as NodeNet from "node:net";
+import * as NodeAssert from "node:assert/strict";
 import { addRecoveryHistory } from "./RecoveryShape.fixture.mjs";
 const root = process.cwd();
-const fixtures = path.join(root, "apps/server/src/ardud/fast-install/testing");
-const output = path.resolve(process.argv[2] ?? "tmp/l5-crash");
-fs.mkdirSync(output, { recursive: true });
+const fixtures = NodePath.join(root, "apps/server/src/ardud/fast-install/testing");
+const output = NodePath.resolve(process.argv[2] ?? "tmp/l5-crash");
+NodeFS.mkdirSync(output, { recursive: true });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Synthetic workspaces may live below this checkout. Keep checkpoint discovery
 // from treating the enclosing repository as their workspace (150 concurrent
 // baselines otherwise scan the whole checkout instead of measuring recovery).
 const serverEnv = (home) => ({
   ...process.env,
-  GIT_CEILING_DIRECTORIES: path.dirname(home),
+  GIT_CEILING_DIRECTORIES: NodePath.dirname(home),
 });
 const sanitizeLog = (text) =>
   text.replace(/Connection string:[\s\S]*?(?=\n\[\d\d:|$)/g, "[synthetic pairing details omitted]");
@@ -32,15 +32,15 @@ async function until(f, label, timeout = 90000) {
   throw Error("Timed out: " + label);
 }
 async function command(args, log) {
-  const fd = fs.openSync(log, "w");
-  const child = spawn(process.execPath, args, { cwd: root, stdio: ["ignore", fd, fd] });
-  fs.closeSync(fd);
-  const [code, signal] = await once(child, "exit");
-  assert.equal(code, 0, `${args[0]} exited ${code}/${signal}: ${log}`);
+  const fd = NodeFS.openSync(log, "w");
+  const child = NodeChildProcess.spawn(process.execPath, args, { cwd: root, stdio: ["ignore", fd, fd] });
+  NodeFS.closeSync(fd);
+  const [code, signal] = await NodeEvents.once(child, "exit");
+  NodeAssert.equal(code, 0, `${args[0]} exited ${code}/${signal}: ${log}`);
 }
 async function inspector(url) {
   const ws = new WebSocket(url);
-  await once(ws, "open");
+  await NodeEvents.once(ws, "open");
   let id = 0;
   const pending = new Map();
   const events = [];
@@ -68,27 +68,27 @@ async function inspector(url) {
   return { request, events, close: () => ws.close() };
 }
 async function port() {
-  const server = net.createServer();
+  const server = NodeNet.createServer();
   server.listen(0, "127.0.0.1");
-  await once(server, "listening");
+  await NodeEvents.once(server, "listening");
   const value = server.address().port;
   await new Promise((r) => server.close(r));
   return value;
 }
 async function verifyStubExit(home) {
-  const file = path.join(home, "processes.ndjson");
-  if (!fs.existsSync(file)) return;
-  const owned = fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+  const file = NodePath.join(home, "processes.ndjson");
+  if (!NodeFS.existsSync(file)) return;
+  const owned = NodeFS.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
   await until(
     () =>
       owned.every((record) => {
         try {
-          const stat = fs.readFileSync(`/proc/${record.pid}/stat`, "utf8");
+          const stat = NodeFS.readFileSync(`/proc/${record.pid}/stat`, "utf8");
           const fields = stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/);
           return (
             fields[0] === "Z" ||
             fields[19] !== record.startTime ||
-            fs.readlinkSync(`/proc/${record.pid}/exe`) !== record.executable
+            NodeFS.readlinkSync(`/proc/${record.pid}/exe`) !== record.executable
           );
         } catch {
           return true;
@@ -103,11 +103,11 @@ for (const [count, active] of [
   [38, 35],
   [150, 150],
 ]) {
-  const home = fs.mkdtempSync(path.join(output, `shape-${count}-`));
-  fs.writeFileSync(path.join(home, ".crash-sandbox"), "seed=1\n");
+  const home = NodeFS.mkdtempSync(NodePath.join(output, `shape-${count}-`));
+  NodeFS.writeFileSync(NodePath.join(home, ".crash-sandbox"), "seed=1\n");
   await command(
-    [path.join(fixtures, "CrashSeed.fixture.mjs"), home, String(count), String(active)],
-    path.join(home, "seed.log"),
+    [NodePath.join(fixtures, "CrashSeed.fixture.mjs"), home, String(count), String(active)],
+    NodePath.join(home, "seed.log"),
   );
   if (process.env.T3CODE_RECOVERY_SHAPE)
     addRecoveryHistory(home, Number(process.env.T3CODE_RECOVERY_SHAPE));
@@ -115,13 +115,13 @@ for (const [count, active] of [
   const start = Date.now();
   let stdout = "",
     stderr = "";
-  const child = spawn(
+  const child = NodeChildProcess.spawn(
     process.execPath,
     [
       "--import",
-      path.join(fixtures, "InstallProbe.fixture.mjs"),
+      NodePath.join(fixtures, "InstallProbe.fixture.mjs"),
       "--inspect=127.0.0.1:0",
-      path.join(root, "apps/server/src/bin.ts"),
+      NodePath.join(root, "apps/server/src/bin.ts"),
       "serve",
       "--base-dir",
       home,
@@ -138,7 +138,7 @@ for (const [count, active] of [
   child.stderr.on("data", (b) => {
     stderr += b;
   });
-  const exit = once(child, "exit");
+  const exit = NodeEvents.once(child, "exit");
   let debug;
   try {
     const url = await until(
@@ -164,7 +164,7 @@ for (const [count, active] of [
         if (
           r.status === 200 &&
           (await r.json()).environmentId ===
-            fs.readFileSync(path.join(home, "userdata/environment-id"), "utf8").trim()
+            NodeFS.readFileSync(NodePath.join(home, "userdata/environment-id"), "utf8").trim()
         ) {
           readReady = Date.now();
           return true;
@@ -177,8 +177,8 @@ for (const [count, active] of [
     }, "reconciliation");
     const requests = () => {
       try {
-        return fs
-          .readFileSync(path.join(home, "provider-requests.ndjson"), "utf8")
+        return NodeFS
+          .readFileSync(NodePath.join(home, "provider-requests.ndjson"), "utf8")
           .trim()
           .split("\n")
           .filter(Boolean)
@@ -196,20 +196,20 @@ for (const [count, active] of [
       45000,
     );
     const last = await report();
-    assert.equal(last.continued, active, "every preparation cut is continued");
-    assert.equal(turns.length, active, "I7: exactly one request per interrupted preparation");
+    NodeAssert.equal(last.continued, active, "every preparation cut is continued");
+    NodeAssert.equal(turns.length, active, "I7: exactly one request per interrupted preparation");
     const prompts = turns.map((r) => r.params.input.find((i) => i.type === "text")?.text);
-    assert.deepEqual(
+    NodeAssert.deepEqual(
       prompts.sort(),
       Array.from({ length: active }, (_, i) => `Synthetic request ${i}`).sort(),
       "I7: exact original inputs each continued once",
     );
     rows.push({
       machine: {
-        hostname: os.hostname(),
-        platform: os.platform(),
-        arch: os.arch(),
-        cpus: os.cpus().length,
+        hostname: NodeOS.hostname(),
+        platform: NodeOS.platform(),
+        arch: NodeOS.arch(),
+        cpus: NodeOS.cpus().length,
         node: process.version,
       },
       seed: 1,
@@ -239,9 +239,9 @@ for (const [count, active] of [
       }),
     ]);
     await verifyStubExit(home);
-    fs.writeFileSync(path.join(home, "server.stdout.log"), sanitizeLog(stdout));
-    fs.writeFileSync(path.join(home, "server.stderr.log"), stderr);
-    fs.writeFileSync(path.join(output, "timings.json"), JSON.stringify(rows, null, 2));
+    NodeFS.writeFileSync(NodePath.join(home, "server.stdout.log"), sanitizeLog(stdout));
+    NodeFS.writeFileSync(NodePath.join(home, "server.stderr.log"), stderr);
+    NodeFS.writeFileSync(NodePath.join(output, "timings.json"), JSON.stringify(rows, null, 2));
   }
 }
 console.log(JSON.stringify(rows, null, 2));
@@ -251,17 +251,17 @@ if (process.env.T3CODE_RECOVERY_TIMINGS_ONLY === "1") process.exit(0);
 const cases = [];
 async function boot(home, label, pauseAt) {
   const listenPort = await port();
-  if (pauseAt) fs.writeFileSync(path.join(home, ".pause-reconcile"), "1");
+  if (pauseAt) NodeFS.writeFileSync(NodePath.join(home, ".pause-reconcile"), "1");
   let stdout = "",
     stderr = "";
   const began = Date.now();
-  const child = spawn(
+  const child = NodeChildProcess.spawn(
     process.execPath,
     [
       "--import",
-      path.join(fixtures, "InstallProbe.fixture.mjs"),
+      NodePath.join(fixtures, "InstallProbe.fixture.mjs"),
       "--inspect=127.0.0.1:0",
-      path.join(root, "apps/server/src/bin.ts"),
+      NodePath.join(root, "apps/server/src/bin.ts"),
       "serve",
       "--base-dir",
       home,
@@ -274,7 +274,7 @@ async function boot(home, label, pauseAt) {
   );
   child.stdout.on("data", (b) => (stdout += b));
   child.stderr.on("data", (b) => (stderr += b));
-  const exit = once(child, "exit");
+  const exit = NodeEvents.once(child, "exit");
   let debug;
   const stop = async (signal = "SIGKILL") => {
     debug?.close();
@@ -287,8 +287,8 @@ async function boot(home, label, pauseAt) {
       }),
     ]);
     await verifyStubExit(home);
-    fs.writeFileSync(path.join(home, label + ".stdout.log"), sanitizeLog(stdout));
-    fs.writeFileSync(path.join(home, label + ".stderr.log"), stderr);
+    NodeFS.writeFileSync(NodePath.join(home, label + ".stdout.log"), sanitizeLog(stdout));
+    NodeFS.writeFileSync(NodePath.join(home, label + ".stderr.log"), stderr);
   };
   try {
     debug = await inspector(
@@ -306,11 +306,11 @@ async function boot(home, label, pauseAt) {
     };
     const setBoundary = async (file, needle) => {
       await debug.request("Debugger.enable");
-      const line = fs
-        .readFileSync(path.join(root, file), "utf8")
+      const line = NodeFS
+        .readFileSync(NodePath.join(root, file), "utf8")
         .split("\n")
         .findIndex((l) => l.includes(needle));
-      assert.ok(line >= 0);
+      NodeAssert.ok(line >= 0);
       const { breakpointId } = await debug.request("Debugger.setBreakpointByUrl", {
         urlRegex: file.split("/").at(-1).replaceAll(".", "\\.") + "$",
         lineNumber: line,
@@ -327,7 +327,7 @@ async function boot(home, label, pauseAt) {
     };
     if (pauseAt)
       await until(
-        () => fs.existsSync(path.join(home, ".reconcile-boundary")),
+        () => NodeFS.existsSync(NodePath.join(home, ".reconcile-boundary")),
         label + " reconcile commit boundary",
         30000,
       );
@@ -361,16 +361,16 @@ for (const mode of [
   "startup",
   "second-recovery",
 ]) {
-  const home = fs.mkdtempSync(path.join(output, mode + "-"));
-  fs.writeFileSync(path.join(home, ".crash-sandbox"), "seed=1\n");
+  const home = NodeFS.mkdtempSync(NodePath.join(output, mode + "-"));
+  NodeFS.writeFileSync(NodePath.join(home, ".crash-sandbox"), "seed=1\n");
   await command(
-    [path.join(fixtures, "CrashSeed.fixture.mjs"), home, "1", "1"],
-    path.join(home, "seed.log"),
+    [NodePath.join(fixtures, "CrashSeed.fixture.mjs"), home, "1", "1"],
+    NodePath.join(home, "seed.log"),
   );
   const ledger = () => {
     try {
-      return fs
-        .readFileSync(path.join(home, "provider-requests.ndjson"), "utf8")
+      return NodeFS
+        .readFileSync(NodePath.join(home, "provider-requests.ndjson"), "utf8")
         .trim()
         .split("\n")
         .filter(Boolean)
@@ -383,8 +383,8 @@ for (const mode of [
   let current;
   try {
     if (mode !== "startup")
-      fs.writeFileSync(
-        path.join(home, ".crash-plan"),
+      NodeFS.writeFileSync(
+        NodePath.join(home, ".crash-plan"),
         JSON.stringify({
           seed: 1,
           mode: ["shutdown", "second-recovery"].includes(mode) ? "running" : mode,
@@ -393,7 +393,7 @@ for (const mode of [
     current = await boot(home, "before", mode === "startup" ? reconcileBoundary : undefined);
     if (mode !== "startup")
       await until(
-        () => fs.existsSync(path.join(home, ".boundary")),
+        () => NodeFS.existsSync(NodePath.join(home, ".boundary")),
         mode + " provider boundary",
         30000,
       );
@@ -416,11 +416,11 @@ for (const mode of [
     }
     const cut =
       mode === "startup"
-        ? JSON.parse(fs.readFileSync(path.join(home, ".cut-snapshot"), "utf8"))
+        ? JSON.parse(NodeFS.readFileSync(NodePath.join(home, ".cut-snapshot"), "utf8"))
         : await current.snapshot();
-    fs.writeFileSync(path.join(home, "cut-snapshot.json"), JSON.stringify(cut, null, 2));
+    NodeFS.writeFileSync(NodePath.join(home, "cut-snapshot.json"), JSON.stringify(cut, null, 2));
     if (["awaiting", "child"].includes(mode)) {
-      assert.ok(
+      NodeAssert.ok(
         cut.subagents.some((task) => task.origin === "app_owned" && task.childThreadId),
         "real awaited child relationship",
       );
@@ -428,14 +428,14 @@ for (const mode of [
     trace.push({ phase: mode, signal: "SIGKILL", at: Date.now() });
     await current.stop();
     current = null;
-    fs.rmSync(path.join(home, ".crash-plan"), { force: true });
+    NodeFS.rmSync(NodePath.join(home, ".crash-plan"), { force: true });
     if (mode === "second-recovery") {
       current = await boot(home, "recovery-cut", reconcileBoundary);
       trace.push({ phase: "reconcile", signal: "SIGKILL", at: Date.now() });
       await current.stop();
       current = null;
     }
-    fs.rmSync(path.join(home, ".pause-reconcile"), { force: true });
+    NodeFS.rmSync(NodePath.join(home, ".pause-reconcile"), { force: true });
     const baseline = ledger().filter((r) => r.method === "turn/start").length;
     current = await boot(home, "after");
     const report = await until(async () => {
@@ -451,13 +451,13 @@ for (const mode of [
     const resumed = ledger()
       .filter((r) => r.method === "turn/start")
       .slice(baseline);
-    assert.equal(resumed.length, expected, "I7: one resumed request per interrupted turn");
-    assert.equal(
+    NodeAssert.equal(resumed.length, expected, "I7: one resumed request per interrupted turn");
+    NodeAssert.equal(
       report.threads.filter((t) => t.continued || t.reason).length,
       expected,
       "I7: every interrupted thread is accounted for",
     );
-    assert.equal(
+    NodeAssert.equal(
       new Set(resumed.map((r) => r.params.threadId)).size,
       expected,
       "I7: no thread resumed twice",
@@ -470,7 +470,7 @@ for (const mode of [
       const messages = recovered.messages.filter(
         (m) => m.id === `message:restart-continuation:${source.id}`,
       );
-      assert.equal(
+      NodeAssert.equal(
         messages.length,
         1,
         "I7: one durable continuation for exact cut run " + source.id,
@@ -480,14 +480,14 @@ for (const mode of [
       );
       if (!hadNativeTurn) {
         const original = cut.messages.find((m) => m.id === source.userMessageId);
-        assert.equal(messages[0].text, original.text, "preparation replays exact input");
-        assert.ok(
+        NodeAssert.equal(messages[0].text, original.text, "preparation replays exact input");
+        NodeAssert.ok(
           resumed.some((r) => r.params.input.some((i) => i.text === original.text)),
           "provider receives original preparation input",
         );
       } else {
         const native = cut.provider_threads.find((t) => t.id === source.providerThreadId);
-        assert.ok(
+        NodeAssert.ok(
           resumed.some((r) => r.params.threadId === native.nativeThreadRef.nativeId),
           "provider resumes the exact native thread for the cut run",
         );
@@ -495,16 +495,16 @@ for (const mode of [
     }
     for (const task of cut.subagents.filter((t) => t.origin === "app_owned" && t.childThreadId)) {
       const retained = recovered.subagents.find((t) => t.id === task.id);
-      assert.equal(
+      NodeAssert.equal(
         retained?.childThreadId,
         task.childThreadId,
         "child dependency survives recovery",
       );
       const child = recovered.threads.find((t) => t.id === task.childThreadId);
-      assert.ok(child?.lineage.parentThreadId, "child retains its parent");
+      NodeAssert.ok(child?.lineage.parentThreadId, "child retains its parent");
     }
     const final = await current.report();
-    fs.writeFileSync(path.join(home, "recovery-report.json"), JSON.stringify(final, null, 2));
+    NodeFS.writeFileSync(NodePath.join(home, "recovery-report.json"), JSON.stringify(final, null, 2));
     trace.push({ phase: "verified", resumed: resumed.length, at: Date.now() });
     cases.push({ mode, seed: 1, passed: true });
   } catch (e) {
@@ -512,8 +512,8 @@ for (const mode of [
     throw e;
   } finally {
     if (current) await current.stop();
-    fs.writeFileSync(path.join(home, "kill-trace.json"), JSON.stringify(trace, null, 2));
-    fs.writeFileSync(path.join(output, "cases.json"), JSON.stringify(cases, null, 2));
+    NodeFS.writeFileSync(NodePath.join(home, "kill-trace.json"), JSON.stringify(trace, null, 2));
+    NodeFS.writeFileSync(NodePath.join(output, "cases.json"), JSON.stringify(cases, null, 2));
   }
 }
 console.log(JSON.stringify(cases, null, 2));

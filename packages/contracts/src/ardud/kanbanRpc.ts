@@ -23,6 +23,7 @@ import { ModelSelection } from "../modelSelection.ts";
 import {
   KanbanBlockInput,
   KanbanBoard,
+  KanbanNightlyReviewSettings,
   KanbanBoardIcon,
   KanbanBoardIconImage,
   KanbanBoardId,
@@ -42,6 +43,7 @@ import {
   KanbanPriority,
   KanbanReviewChain,
   KanbanScript,
+  KanbanScriptAcknowledgeInput,
   KanbanScriptId,
   KanbanScriptRun,
   KanbanStage,
@@ -81,6 +83,7 @@ export const KANBAN_WS_METHODS = {
   scriptRuns: "kanban.script.runs",
   scriptEnable: "kanban.script.enable",
   scriptRun: "kanban.script.run",
+  scriptAcknowledge: "kanban.script.acknowledge",
 } as const;
 
 type KanbanMethod = (typeof KANBAN_WS_METHODS)[keyof typeof KANBAN_WS_METHODS];
@@ -124,7 +127,9 @@ export const KanbanBoardUpdateInput = Schema.Struct({
   defaultCardModel: Schema.optional(ModelSelection),
   reviewChains: Schema.optional(Schema.Array(KanbanReviewChain)),
   defaultReviewChain: Schema.optional(Schema.NullOr(Schema.String)),
+  guessedGates: Schema.optional(Schema.Array(Schema.Literals(["deploy", "money", "secret"]))),
   instructions: Schema.optional(KanbanInstructions),
+  nightlyReview: Schema.optional(Schema.NullOr(KanbanNightlyReviewSettings)),
 });
 export type KanbanBoardUpdateInput = typeof KanbanBoardUpdateInput.Type;
 
@@ -303,6 +308,7 @@ export const KanbanRpcs = RpcGroup.make(
   ),
   /** Starts a run now and answers with it open; it finishes in the background. */
   call(M.scriptRun, ScriptRef, KanbanScriptRun),
+  call(M.scriptAcknowledge, KanbanScriptAcknowledgeInput, KanbanScript),
 );
 
 export const KANBAN_READ_SCOPES = {
@@ -340,6 +346,7 @@ export const KANBAN_GUARDED_SCOPES = {
   [M.answer]: AuthOrchestrationOperateScope,
   [M.scriptEnable]: AuthOrchestrationOperateScope,
   [M.scriptRun]: AuthOrchestrationOperateScope,
+  [M.scriptAcknowledge]: AuthOrchestrationOperateScope,
 } as const;
 
 export const KANBAN_AGGREGATES = Object.fromEntries(

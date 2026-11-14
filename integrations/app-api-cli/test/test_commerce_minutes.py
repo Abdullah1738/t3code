@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import os as _os, tempfile as _tempfile
 # commerce_cli reads the pause file at import; the owner's real one must not refuse test orders.
 _os.environ['ORDERING_PAUSE_FILE'] = _os.path.join(_tempfile.gettempdir(), 'ordering-pause-test-absent', 'ordering-paused')
@@ -12,6 +13,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import order_card
 from unittest.mock import patch
 
 import commerce_cli as cli
@@ -19,12 +21,13 @@ import commerce_minutes as c
 from commerce_auth_status import CommerceAuth
 from noon_auth_lifecycle import AuthSnapshot
 from noon_checkout import fingerprint
-from test.test_minutes_payment_chain import FIXTURE, ORDER, TOTAL_MINOR
-from test.test_noon_minutes_checkout import Harness, HEADERS, fixture
+from test_minutes_payment_chain import FIXTURE, ORDER, TOTAL_MINOR
+from test_noon_minutes_checkout import Harness, HEADERS, fixture
 
 
 class MinutesIntegrationTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         p=patch.object(c.options,'read_options',return_value={'groups':[]})
         p.start();self.addCleanup(p.stop)
 
@@ -109,7 +112,7 @@ class MinutesIntegrationTests(unittest.TestCase):
         flow.flow_id='10000000-0000-4000-8000-000000000001'
         flow.review={'order':'IAEGA123','amount':1725}
         flow.current=c.m.Snapshot({'isCvvRequired':True,'paymentProviderCode':'NOON_PAY'}, {},time.time())
-        flow.card=c.m.SavedCard('synthetic-token','xxxx2342','mastercard')
+        flow.card=c.m.SavedCard('synthetic-token','xxxx' + order_card.LAST4,order_card.NETWORK)
         flow.client=Mock()
         flow.client.order_status.return_value=c.m.Snapshot({'orderTotal':17.25,
             'paymentIntentToken':'synthetic-intent','installmentCount':None,'paymentType':None,'idEmiPlan':None},
@@ -133,7 +136,7 @@ class MinutesIntegrationTests(unittest.TestCase):
         flow.flow_id='10000000-0000-4000-8000-000000000001'
         flow.review={'order':'IAEGA123','amount':1725}
         flow.current=c.m.Snapshot({'isCvvRequired':False,'paymentProviderCode':'NOON_PAY'},{},time.time())
-        flow.card=c.m.SavedCard('synthetic-token','xxxx2342','mastercard')
+        flow.card=c.m.SavedCard('synthetic-token','xxxx' + order_card.LAST4,order_card.NETWORK)
         flow.client=Mock()
         flow.client.order_status.return_value=c.m.Snapshot({'orderTotal':17.25,
             'paymentIntentToken':'synthetic-intent','placedAt':'2026-10-10T13:18:29',
@@ -150,7 +153,7 @@ class MinutesIntegrationTests(unittest.TestCase):
 def _session_wire(cvv_required):
     """A fixture-based cart session that satisfies approve()'s fee and arithmetic gates."""
     import copy
-    from test.test_noon_minutes_checkout import fixture as _fixture
+    from test_noon_minutes_checkout import fixture as _fixture
     session=copy.deepcopy(_fixture())
     session['isCvvRequired']=cvv_required
     for key in ('orderDeliveryFee','orderServiceFee','orderSmallOrderFee','orderGiftBagFee',
@@ -192,7 +195,7 @@ def _empty_session_wire(cvv_required):
 
 def _saved_cards():
     # The saved card's id is the same token the session's paymentToken fingerprints to.
-    return {'data':[{'id':'synthetic-payment-token','ccMasked':'xxxx2342','ccType':'mastercard',
+    return {'data':[{'id':'synthetic-payment-token','ccMasked':'xxxx' + order_card.LAST4,'ccType':order_card.NETWORK,
                      'isDefault':True,'isDeleted':False}]}
 
 
@@ -284,6 +287,9 @@ PREPARE_SENDS=7
 
 
 class OrderMinutesEndToEndTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     """`commerce order minutes --cvv-from-keychain` through the real CLI, MinutesFlow
     constructor and client. Only the outside world is faked: noon's HTTP (urllib
     opener), the noon auth lifecycle, the Keychain CVV read and the Telegram /
@@ -418,6 +424,9 @@ def paid_projection(status='payment_confirmed',txn='CAPTURED',authorized=1725,ca
 
 
 class PaymentAwaitTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def flow(self):
         from unittest.mock import Mock
         flow=object.__new__(c.MinutesFlow)
@@ -606,6 +615,7 @@ class PaymentAwaitTests(unittest.TestCase):
 
 class ResumeActiveTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         p=patch.object(c.options,'read_options',return_value={'groups':[]})
         p.start();self.addCleanup(p.stop)
 
@@ -684,7 +694,7 @@ class ResumeActiveTests(unittest.TestCase):
     def test_scope_digest_unchanged_without_extra_and_differs_with_extra(self):
         skus=[{'sku':'SYNTHETIC_SHAKE','qty':1,'modifiers':()}]
         home=fingerprint('home')
-        old=c.j.digest({'skus':skus,'home':home,'card':'2342','quiet':True,'extras':False})
+        old=c.j.digest({'skus':skus,'home':home,'card':order_card.LAST4,'quiet':True,'extras':False})
         self.assertEqual(c._scope_hash(skus,home,None),old)
         self.assertNotEqual(c._scope_hash(skus,home,'Gate 1'),old)
 
@@ -701,7 +711,7 @@ class ResumeActiveTests(unittest.TestCase):
         flow.driver_note=c.m.quiet_note()
         from unittest.mock import Mock
         flow.client=Mock()
-        with patch.object(c.m,'saved_order_card',return_value=c.m.SavedCard('synthetic-payment-token','xxxx 2342','mastercard')):
+        with patch.object(c.m,'saved_order_card',return_value=c.m.SavedCard('synthetic-payment-token','xxxx ' + order_card.LAST4,order_card.NETWORK)):
             review=flow.approve()
         self.assertEqual(review['quiet_codes_set'],['dont_ring_the_bell'])
         self.assertEqual(review['quiet_codes_not_offered'],['leave_it_at_my_door'])
@@ -759,6 +769,9 @@ class ResumeActiveTests(unittest.TestCase):
 
 
 class ResumeAndCloseTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_exact_failed_evidence_accepts_rejected_dead_intent_only(self):
         from unittest.mock import Mock
         auth=Mock()

@@ -1,6 +1,8 @@
+import { redact } from "./redact.ts";
 import { Bot, GrammyError, HttpError, InputFile } from "grammy";
 import type { Chat } from "grammy/types";
 import type { KeyboardSpec } from "./store.ts";
+import { toolError } from "./toollog.ts";
 
 export const MAX_TEXT = 4_096;
 
@@ -56,7 +58,7 @@ function replyMarkup(keyboard?: KeyboardSpec) {
   if (keyboard === undefined) return undefined;
   if ("remove" in keyboard) return { inline_keyboard: [] };
   return {
-    inline_keyboard: keyboard.rows.map(row => row.map(button => ({ text: button.text, callback_data: button.data }))),
+    inline_keyboard: keyboard.rows.map(row => row.map(button => ({ text: redact(button.text), callback_data: button.data }))),
   };
 }
 
@@ -93,7 +95,8 @@ export class Telegram {
     try {
       const me = await this.#client().api.getMe();
       return me?.is_bot === true && typeof me.id === "number";
-    } catch {
+    } catch (error) {
+      toolError("telegram", "tg.transport.ping", undefined, error);
       return false;
     }
   }
@@ -103,7 +106,7 @@ export class Telegram {
     if (typeof input.text !== "string" || !input.text.trim() || input.text.length > MAX_TEXT) {
       throw new TransportError("invalidText");
     }
-    const message = await this.#client().api.sendMessage(input.chatId, input.text, {
+    const message = await this.#client().api.sendMessage(input.chatId, redact(input.text), {
       link_preview_options: { is_disabled: true },
       ...(input.replyTo === undefined ? {} : { reply_parameters: { message_id: input.replyTo } }),
       ...(replyMarkup(input.keyboard) === undefined ? {} : { reply_markup: replyMarkup(input.keyboard)! }),
@@ -128,7 +131,7 @@ export class Telegram {
     }
     const document = new InputFile(input.data, input.name);
     const message = await this.#client().api.sendDocument(input.chatId, document, {
-      ...(input.caption?.trim() ? { caption: input.caption.slice(0, 1_024) } : {}),
+      ...(input.caption?.trim() ? { caption: redact(input.caption).slice(0, 1_024) } : {}),
       ...(input.replyTo === undefined ? {} : { reply_parameters: { message_id: input.replyTo } }),
     });
     if (typeof message.message_id !== "number" || !Number.isSafeInteger(message.message_id)) {
@@ -141,7 +144,7 @@ export class Telegram {
     if (!Number.isSafeInteger(chatId) || !Number.isSafeInteger(messageId)) throw new TransportError("invalidChat");
     if (typeof text !== "string" || !text.trim() || text.length > MAX_TEXT) throw new TransportError("invalidText");
     const markup = replyMarkup(keyboard);
-    await this.#client().api.editMessageText(chatId, messageId, text, {
+    await this.#client().api.editMessageText(chatId, messageId, redact(text), {
       ...(markup === undefined ? {} : { reply_markup: markup! }),
     });
   }
@@ -149,7 +152,7 @@ export class Telegram {
   async answerCallback(callbackId: string, text?: string): Promise<void> {
     if (!callbackId.trim()) throw new TransportError("invalidCallback");
     await this.#client().api.answerCallbackQuery(callbackId, {
-      ...(text === undefined ? {} : { text: text.slice(0, 200) }),
+      ...(text === undefined ? {} : { text: redact(text).slice(0, 200) }),
     });
   }
 
@@ -157,7 +160,7 @@ export class Telegram {
   async start(options: StartOptions): Promise<void> {
     const bot = this.#client();
     const log = options.log;
-    bot.catch(error => log?.("polling-error", classifySendFailure(error.error).code));
+    bot.catch(error => { toolError("telegram", "tg.transport.polling", undefined, error.error); log?.("polling-error", classifySendFailure(error.error).code); });
     const accepted = (from: { id?: number } | undefined): number | undefined => {
       const id = from?.id;
       if (!Number.isSafeInteger(id)) return undefined;
@@ -204,12 +207,13 @@ export class Telegram {
       try {
         await bot.start({ allowed_updates: ["message", "callback_query"] });
         backoff = 2_000;
-      } catch {
+      } catch (error) {
+        toolError("telegram", "tg.transport.start", undefined, error);
         // grammY resolves or rejects; both mean polling ended without stop().
         if (!this.#stopping) backoff = Math.min(60_000, backoff * 2);
       }
       if (this.#stopping) break;
-      try { await bot.stop(); } catch { /* Best effort cleanup before reconnecting. */ }
+      try { await bot.stop(); } catch (error) { toolError("telegram", "tg.transport.reconnectStop", undefined, error); }
       await sleep(backoff);
     }
   }
@@ -217,6 +221,6 @@ export class Telegram {
   stop(): Promise<void> {
     this.#stopping = true;
     const bot = this.#bot;
-    return (bot ? bot.stop() : Promise.resolve()).catch(() => undefined) as Promise<void>;
+    return (bot ? bot.stop() : Promise.resolve()).catch(error => { toolError("telegram", "tg.transport.stop", undefined, error); }) as Promise<void>;
   }
 }

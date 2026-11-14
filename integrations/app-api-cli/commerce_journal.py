@@ -1,11 +1,15 @@
 """Durable local HTTP-commerce ownership and at-most-once operations.
 
 No network, credentials, raw cart/payment payloads, retry, reset or cancellation.
-An unknown send retains account ownership; a different flow ID cannot escape it.
+An unknown send remains consumed on its flow; new noon flows remain independent.
 Stored order IDs are for exact reconciliation/tracking, never inferred from history.
 """
+import toollog
 import order_card
+import inbox_auth
+import owner_go
 from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import json
 import os
@@ -29,7 +33,7 @@ VERTICALS = {'noon': {'nownow', 'main', 'minutes', 'supermall', 'food'},
 OUTCOMES = frozenset({'RESPONSE_RECEIVED', 'UNKNOWN', 'CHALLENGE_REQUIRED', 'PAYMENT_FAILED',
                        'ORDER_ID_RECEIVED', 'PAYMENT_REPORTED_SUCCESS',
                        'EXACT_ORDER_CONFIRMED', 'TRACKER_REGISTERED',
-                       'PREORDER_INTENT_RECEIVED','PREORDER_PAYMENT_CONFIRMED',
+                       'PREORDER_INTENT_RECEIVED','PREORDER_PAYMENT_CONFIRMED','PREORDER_ZERO_AMOUNTS',
                        'FLOW_RELEASED_NO_PAYMENT_SENT', 'STABLE_CART_ADOPTED',
                         'FENCED_PAYMENT_RECONCILED', 'PREPARATION_FAILED', 'CART_READBACK'})
 KINDS = frozenset({'cart', 'quote', 'instructions', 'selection', 'place', 'payment',
@@ -82,6 +86,16 @@ SCHEMA = {**SCHEMA,
         evidence TEXT NOT NULL, evidence_hash TEXT NOT NULL)''',
 }
 
+SCHEMA_V3 = SCHEMA.copy()
+SCHEMA = {**SCHEMA,
+    'active_account': """CREATE UNIQUE INDEX active_account
+        ON flows(app, account_hash) WHERE app != 'noon' AND state NOT IN ('COMPLETE','RELEASED','OWNER_ATTESTED_UNCHARGED','REJECTED_DUPLICATE') """,
+    'baskets': """CREATE TABLE baskets (
+        flow_id TEXT PRIMARY KEY, vertical TEXT NOT NULL, account_hash TEXT NOT NULL,
+        basket_hash TEXT NOT NULL, card_last4 TEXT NOT NULL, acknowledgements TEXT NOT NULL,
+        legacy_scopes TEXT NOT NULL, approval_minor INTEGER)""",
+}
+
 
 def _schema_matches(objects, expected):
     return (set(objects) == set(expected) and all(
@@ -103,7 +117,75 @@ class PaymentError(JournalError):
 
     def __init__(self, code, details):
         super().__init__(code)
+        self.code = code
         self.details = details
+
+
+def _nownow_prepare_gate(db, flow, review_hash=None):
+    now = time.time()
+    prepared = db.execute("SELECT * FROM observations WHERE flow_id=? AND outcome='NOWNOW_PREPARED' "
+                          "ORDER BY sequence DESC LIMIT 1", (flow['id'],)).fetchone()
+    if (not 0 <= now - flow['created_at'] <= 12 * 3600 or prepared is None
+            or not 0 <= now - prepared['observed_at'] <= 3600
+            or (review_hash is not None and prepared['evidence_hash'] != review_hash)):
+        raise PaymentError('NOWNOW_FRESH_PREPARE_REQUIRED', {
+            'flow_id': flow['id'], 'next_action': 're-run --prepare-only for the same basket; use a new flow if older than 12 h',
+            'financial_send': False, 'financial_retry': False})
+
+
+def require_nownow_prepared(flow_id, review_hash=None):
+    with _db() as db:
+        flow = _get(db, flow_id)
+        if flow['app'] != 'noon' or flow['vertical'] != 'nownow':
+            fail('NOWNOW_FLOW_REQUIRED')
+        _nownow_prepare_gate(db, flow, review_hash)
+
+
+def bind_nownow_session(flow_id, session_hash):
+    """Persist creation provenance separately from reviews of an adopted cart."""
+    if not _hash(session_hash):
+        fail('NOWNOW_SESSION_BINDING_INVALID')
+    with _db() as db:
+        flow = _get(db, flow_id)
+        _active(flow)
+        op = db.execute("SELECT * FROM operations WHERE flow_id=? AND name='cart_create' AND kind='cart'",
+                        (flow_id,)).fetchone()
+        if (flow['app'] != 'noon' or flow['vertical'] != 'nownow' or not op or op['state'] != 'OBSERVED'
+                or flow['order_id'] or flow['reserved_minor']):
+            fail('NOWNOW_SESSION_BINDING_INVALID')
+        if db.execute("SELECT 1 FROM observations WHERE flow_id=? AND outcome='NOWNOW_SESSION_OWNED'", (flow_id,)).fetchone():
+            fail('NOWNOW_SESSION_ALREADY_BOUND')
+        if (not db.execute("SELECT 1 FROM observations WHERE flow_id=? AND operation='cart_create' AND outcome='RESPONSE_RECEIVED'", (flow_id,)).fetchone()
+                or db.execute("SELECT 1 FROM observations WHERE flow_id=? AND operation='cart_create' AND outcome='UNKNOWN'", (flow_id,)).fetchone()):
+            fail('NOWNOW_SESSION_CREATION_UNPROVEN')
+        db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,observed_at) VALUES (?,?,?,?,?)',
+                   (flow_id, 'cart_create', 'NOWNOW_SESSION_OWNED', session_hash, time.time()))
+
+
+def require_nownow_session(flow_id, session_hash):
+    with _db() as db:
+        flow = _get(db, flow_id)
+        rows = db.execute("SELECT evidence_hash FROM observations WHERE flow_id=? AND operation='cart_create' "
+                          "AND outcome='NOWNOW_SESSION_OWNED'", (flow_id,)).fetchall()
+        if (flow['app'] != 'noon' or flow['vertical'] != 'nownow' or len(rows) != 1
+                or rows[0]['evidence_hash'] != session_hash):
+            fail('NOWNOW_SESSION_OWNERSHIP_UNPROVEN')
+
+
+def record_nownow_prepared(flow_id, review_hash):
+    """Only explicit nonfinancial preparation can grant the live-send window."""
+    if not _hash(review_hash):
+        fail('NOWNOW_PREPARE_REVIEW_INVALID')
+    with _db() as db:
+        flow = _get(db, flow_id)
+        _active(flow)
+        if (flow['vertical'] != 'nownow' or flow['app'] != 'noon' or flow['order_id']
+                or db.execute("SELECT 1 FROM operations WHERE flow_id=? AND state!='OBSERVED'", (flow_id,)).fetchone()):
+            fail('NOWNOW_PREPARE_STATE_INVALID')
+        db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,observed_at) VALUES (?,?,?,?,?)',
+                   (flow_id, 'flow', 'NOWNOW_PREPARED', review_hash, time.time()))
+    return {'flow_age_seconds': round(time.time() - flow['created_at'], 1),
+            'prepare_valid_seconds': 3600, 'live_flow_max_age_seconds': 12 * 3600}
 
 
 def payment_details(*, flow_id, order, amount_minor, outcome):
@@ -214,8 +296,48 @@ def _stat(path, directory=False):
     return info
 
 
+_READ_ONLY = ContextVar('commerce_journal_read_only', default=False)
+
+
+@contextmanager
+def read_only():
+    """Use validated in-memory snapshots, without creating or migrating live state."""
+    token = _READ_ONLY.set(True)
+    try:
+        yield
+    finally:
+        _READ_ONLY.reset(token)
+
+
+@contextmanager
+def _read_db():
+    db = sqlite3.connect(':memory:')
+    try:
+        _stat(ROOT.parent, True)
+        _stat(ROOT, True)
+        path = ROOT / 'journal.sqlite'
+        _stat(path)
+        db.deserialize(_snapshot(path))
+        db.row_factory = sqlite3.Row
+        objects = dict(db.execute("SELECT name,sql FROM sqlite_master WHERE substr(name,1,7) != 'sqlite_'"))
+        version = db.execute('PRAGMA user_version').fetchone()[0]
+        if not ((version == 3 and _schema_matches(objects, SCHEMA_V3))
+                or (version == 4 and _schema_matches(objects, SCHEMA))):
+            fail('JOURNAL_SCHEMA_UNSUPPORTED')
+        db.execute('PRAGMA query_only=ON')
+        yield db
+    except sqlite3.Error:
+        fail('JOURNAL_READ_ONLY_OR_UNAVAILABLE')
+    finally:
+        db.close()
+
+
 @contextmanager
 def _db():
+    if _READ_ONLY.get():
+        with _read_db() as snapshot:
+            yield snapshot
+        return
     db = None
     try:
         _stat(ROOT.parent, True)
@@ -240,23 +362,29 @@ def _db():
         objects = dict(db.execute("SELECT name,sql FROM sqlite_master WHERE substr(name,1,7) != 'sqlite_'"))
         version = db.execute('PRAGMA user_version').fetchone()[0]
         if not objects and version == 0 and before.st_size == 0:
-            for statement in SCHEMA.values():
+            for statement in SCHEMA_V3.values():
                 db.execute(statement)
             db.execute('PRAGMA user_version=3')
         elif version == 1 and any(_schema_matches(objects, expected) for expected in
                 (SCHEMA_V1, {**SCHEMA_V1, 'active_account': LEGACY_ACTIVE_ACCOUNT})):
             db.execute('DROP INDEX active_account')
-            db.execute(SCHEMA['active_account'])
+            db.execute(SCHEMA_V3['active_account'])
             db.execute(SCHEMA['owner_attestations'])
             db.execute(SCHEMA['duplicate_closures'])
             db.execute('PRAGMA user_version=3')
         elif version == 2 and _schema_matches(objects, SCHEMA_V2):
             db.execute('DROP INDEX active_account')
-            db.execute(SCHEMA['active_account'])
+            db.execute(SCHEMA_V3['active_account'])
             db.execute(SCHEMA['duplicate_closures'])
             db.execute('PRAGMA user_version=3')
-        elif version != 3 or not _schema_matches(objects, SCHEMA):
+        elif not ((version == 3 and _schema_matches(objects, SCHEMA_V3))
+                  or (version == 4 and _schema_matches(objects, SCHEMA))):
             fail('JOURNAL_SCHEMA_UNSUPPORTED')
+        if db.execute('PRAGMA user_version').fetchone()[0] == 3:
+            db.execute('DROP INDEX active_account')
+            db.execute(SCHEMA['active_account'])
+            db.execute(SCHEMA['baskets'])
+            db.execute('PRAGMA user_version=4')
         yield db
         db.execute('COMMIT')
         for directory in (ROOT, ROOT.parent):
@@ -293,7 +421,7 @@ def _active(row):
 
 
 def open_flow(*, flow_id, app, vertical, account_hash, scope_hash):
-    """Claim the account for a specific new intent; never adopts an existing flow."""
+    """Open a new intent; never adopts an existing flow."""
     _flow(flow_id)
     if (type(app) is not str or app not in VERTICALS or type(vertical) is not str
             or vertical not in VERTICALS[app] or not _hash(account_hash) or not _hash(scope_hash)):
@@ -309,6 +437,7 @@ def open_flow(*, flow_id, app, vertical, account_hash, scope_hash):
     return {'flow_id': flow_id, 'state': 'ACTIVE', 'request_sent': False}
 
 
+@toollog.consumed
 def consume(flow_id, operation, *, kind, request_hash, cart_hash=None,
             review_hash=None, payable_minor=None, payment_order_id=None, payment_intent_hash=None):
     """Return True ONLY after durable MAY_HAVE_SENT; no second use of an operation.
@@ -339,6 +468,8 @@ def consume(flow_id, operation, *, kind, request_hash, cart_hash=None,
     with _db() as db:
         flow = _get(db, flow_id)
         _active(flow)
+        if flow['app'] == 'noon' and flow['vertical'] == 'nownow' and operation == 'cart_delete':
+            _nownow_cleanup_gate(db, flow['account_hash'], flow_id)
         if financial:
             pause = Path(os.environ.get('ORDERING_PAUSE_FILE') or Path.home() / '.local/state/ordering-paused')
             if pause.exists():
@@ -350,7 +481,17 @@ def consume(flow_id, operation, *, kind, request_hash, cart_hash=None,
                     order_card.require_purchase_fallback()
                 except RuntimeError as exc:
                     fail(str(exc))
+            try:
+                owner_go.require(vendor=flow['app'], item=owner_go.commerce_item(flow),
+                                 amount=payable_minor, currency='AED')
+            except owner_go.ApprovalError:
+                fail('OWNER_GO_REQUIRED')
+        if financial and flow['app'] == 'noon':
+            from commerce_pending import require_acknowledged
+            require_acknowledged(db, flow)
         policy = db.execute('SELECT * FROM campaigns WHERE name=?', (flow['campaign'],)).fetchone()
+        if flow['app'] == 'noon' and flow['vertical'] == 'nownow' and kind in ('place', 'payment', 'preauthorize', 'prepay'):
+            _nownow_prepare_gate(db, flow, review_hash)
         if policy is None:
             fail('JOURNAL_CAMPAIGN_METADATA_INVALID')
         if db.execute('SELECT 1 FROM operations WHERE flow_id=? AND state=?',
@@ -405,6 +546,8 @@ def consume(flow_id, operation, *, kind, request_hash, cart_hash=None,
                 fail('JOURNAL_PAYMENT_ALREADY_REPORTED')
         db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
                    (flow_id, operation, kind, request_hash, 'MAY_HAVE_SENT', time.time()))
+        if financial and flow['app'] == 'noon':
+            inbox_auth.expect_payment(order_card.LAST4)
     return True
 
 
@@ -859,8 +1002,7 @@ def release_preparation(flow_id, operation, *, evidence_hash):
 def release(flow_id, *, evidence_hash):
     """Terminal evidence-reviewed closure of a fenced never-paid flow.
 
-    The journal's permanent fence exists because an unknown send keeps
-    account ownership. When the exact merchant state later proves the order
+    An unknown send stays consumed. When exact merchant state later proves the order
     dead (failed/cancelled, not active, intent never captured) and no payment
     continuation was ever consumed, the caller may release THIS fence after
     gathering that evidence. The reservation stays counted; no order ID is
@@ -1262,7 +1404,7 @@ def _snapshot(path, tries=20):
 
 
 def open_payments(*, since_seconds=1800, now=None):
-    """All account-blocking flows, including ACTIVE preparations. Read only.
+    """Unresolved flows, including ACTIVE preparations. Read only.
 
     since_seconds is retained for CLI compatibility; unresolved fences do not
     disappear with age, and a preparation never authorizes a bank prompt.
@@ -1279,10 +1421,23 @@ def open_payments(*, since_seconds=1800, now=None):
         # code fully understands may give it.
         objects = {r['name']: r['sql'] for r in db.execute(
             "SELECT name,sql FROM sqlite_master WHERE substr(name,1,7) != 'sqlite_'")}
-        if db.execute('PRAGMA user_version').fetchone()[0] != 3 or not _schema_matches(objects, SCHEMA):
+        version = db.execute('PRAGMA user_version').fetchone()[0]
+        if not ((version == 3 and _schema_matches(objects, SCHEMA_V3))
+                or (version == 4 and _schema_matches(objects, SCHEMA))):
             fail('JOURNAL_SCHEMA_UNSUPPORTED')
         rows = db.execute(
             "SELECT f.id, f.app, f.vertical, f.state, f.order_id, f.reserved_minor, "
+            "EXISTS(SELECT 1 FROM observations s WHERE s.flow_id=f.id AND "
+            "NOT EXISTS(SELECT 1 FROM observations correction WHERE correction.flow_id=f.id "
+            "AND correction.sequence>s.sequence AND correction.outcome IN ('UNKNOWN','CHALLENGE_REQUIRED','PAYMENT_FAILED')) AND "
+            "(s.outcome='PAYMENT_REPORTED_SUCCESS' OR (s.outcome='PREORDER_PAYMENT_CONFIRMED' AND "
+            "NOT EXISTS(SELECT 1 FROM operations placed WHERE placed.flow_id=f.id AND placed.kind='place')))) AS settled, "
+            "(SELECT MAX(c.observed_at) FROM observations c WHERE c.flow_id=f.id AND c.outcome='UNKNOWN' "
+            "AND EXISTS(SELECT 1 FROM observations prior WHERE prior.flow_id=f.id "
+            "AND prior.outcome='PAYMENT_REPORTED_SUCCESS' AND prior.sequence<c.sequence)) AS reopened_at, "
+            "(SELECT s.outcome FROM observations s JOIN operations p ON p.flow_id=s.flow_id AND p.name=s.operation "
+            "WHERE s.flow_id=f.id AND p.kind='prepay' ORDER BY s.sequence DESC LIMIT 1) AS intent_outcome, "
+            "MAX(CASE WHEN o.kind='place' THEN 1 ELSE 0 END) AS has_place, "
             "MAX(CASE WHEN o.kind IN ('place','payment','preauthorize','prepay') THEN o.created_at END) AS sent_at "
             "FROM flows f LEFT JOIN operations o ON o.flow_id=f.id "
             "WHERE f.state NOT IN ('COMPLETE','RELEASED','OWNER_ATTESTED_UNCHARGED','REJECTED_DUPLICATE') "
@@ -1291,10 +1446,24 @@ def open_payments(*, since_seconds=1800, now=None):
         fail('JOURNAL_BUSY_OR_UNAVAILABLE')
     finally:
         db.close()
-    return [{'flow_id': r['id'], 'app': r['app'], 'vertical': r['vertical'], 'state': r['state'],
+    result = [{'flow_id': r['id'], 'app': r['app'], 'vertical': r['vertical'], 'state': r['state'],
              'order_id': r['order_id'], 'amount_minor': r['reserved_minor'],
+             'settlement_epoch': r['reopened_at'] or 0,
+             'in_flight': bool(r['sent_at'] is not None and not r['settled']
+                 and not (r['state'] == 'FENCED' and (r['reserved_minor'] == 0
+                     or (not r['has_place'] and r['intent_outcome'] == 'PREORDER_ZERO_AMOUNTS')))),
              'financial_send': r['sent_at'] is not None,
              'sent_seconds_ago': round(now - r['sent_at']) if r['sent_at'] is not None else None} for r in rows]
+    for row in result:
+        if row['vertical'] == 'nownow':
+            try:
+                retained = json.loads((ROOT / 'nownow' / (row['flow_id'] + '.json')).read_text())
+                card = retained['card_last4']
+                if re.fullmatch(r'[0-9]{4}', card):
+                    row['card_last4'] = card
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+    return result
 
 
 def flow_created_at(flow_id):
@@ -1537,14 +1706,42 @@ def adopt_stable_cart(new_flow_id, old_flow_id, cart_hash, *, evidence_hash):
     return {'adopted_cart_hash': cart_hash, 'prior_flow_id': old_flow_id, 'transferred': True}
 
 
-def require_account_available(app, account_hash, *, flow_id=None):
-    """Reject a fenced/owned account before preparing a new remote operation.
+def _nownow_cleanup_gate(db, account_hash, flow_id=None):
+    if db.execute("SELECT 1 FROM flows WHERE app='noon' AND account_hash=? AND id!=? "
+                  "AND state NOT IN ('COMPLETE','RELEASED','OWNER_ATTESTED_UNCHARGED','REJECTED_DUPLICATE')",
+                  (account_hash, flow_id or '')).fetchone():
+        fail('NOWNOW_CLEAR_OPEN_FLOW')
 
-    Reads remain available independently. This does not release, reset, or adopt
-    an existing flow; consume() repeats the check atomically before every send.
-    """
+
+def require_nownow_cleanup_available(account_hash, *, flow_id=None):
+    """Deletion needs exclusive cart context; this never gates new noon orders."""
+    if not _hash(account_hash):
+        fail('JOURNAL_SCOPE_INVALID')
+    if flow_id is not None:
+        _flow(flow_id)
+    with _db() as db:
+        if flow_id is not None:
+            flow = _get(db, flow_id)
+            if flow['app'] != 'noon' or flow['vertical'] != 'nownow' or flow['account_hash'] != account_hash:
+                fail('JOURNAL_SCOPE_INVALID')
+            _active(flow)
+        _nownow_cleanup_gate(db, account_hash, flow_id)
+    return True
+
+
+def require_account_available(app, account_hash, *, flow_id=None):
+    """Noon fences constrain their own flow; legacy apps retain account ownership."""
     if app not in VERTICALS or not _hash(account_hash):fail('JOURNAL_SCOPE_INVALID')
     if flow_id is not None:_flow(flow_id)
+    if app == 'noon':
+        if flow_id is not None:
+            with _db() as db:
+                row = db.execute('SELECT * FROM flows WHERE id=?', (flow_id,)).fetchone()
+                if row is not None:
+                    if row['app'] != app or row['account_hash'] != account_hash:
+                        fail('JOURNAL_SCOPE_INVALID')
+                    _active(row)
+        return True
     with _db() as db:
         active=db.execute("SELECT id,state FROM flows WHERE app=? AND account_hash=? "
                           "AND state NOT IN ('COMPLETE','RELEASED','OWNER_ATTESTED_UNCHARGED','REJECTED_DUPLICATE')",

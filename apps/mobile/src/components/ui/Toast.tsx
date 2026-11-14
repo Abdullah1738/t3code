@@ -1,4 +1,5 @@
 import { MOBILE_SHAPE } from "../../lib/designTokens";
+import { activeAnalytics } from "@t3tools/client-runtime/ardud/analytics";
 import { useEffect } from "react";
 import { AccessibilityInfo, Platform, View } from "react-native";
 
@@ -20,6 +21,9 @@ export interface ToastProps {
 
 /** The owning screen places and dismisses feedback; actions are never implicit. */
 export function Toast(props: ToastProps) {
+  useEffect(() => {
+    activeAnalytics()?.record("toast.show", { props: { status: props.tone === "danger" ? 1 : 0 } });
+  }, [props.tone]);
   useEffect(() => {
     if (Platform.OS === "ios") AccessibilityInfo.announceForAccessibility(props.message);
   }, [props.message]);

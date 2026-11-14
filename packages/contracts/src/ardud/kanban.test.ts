@@ -6,6 +6,7 @@ import {
   KANBAN_BACKLOG,
   KanbanAnswer,
   KanbanBoard,
+  KanbanNightlyReview,
   KanbanCard,
   KanbanCardEvent,
   kanbanAwaitsMerge,
@@ -91,6 +92,14 @@ function card(id: string, patch: CardPatch = {}): KanbanCard {
 
 const decodeCard = Schema.decodeUnknownSync(KanbanCard);
 const encodeCard = Schema.encodeSync(KanbanCard);
+
+it.each([undefined, "2026-11-13T10:00:00.000Z"])(
+  "preserves a detached steer signal through storage (%s)",
+  (detachedSteerAt) => {
+    const stored = JSON.parse(JSON.stringify({ ...card("a"), detachedSteerAt }));
+    expect(encodeCard(decodeCard(stored))).toEqual(stored);
+  },
+);
 
 describe("KanbanCard retries", () => {
   const stored = JSON.parse(JSON.stringify(card("a")));
@@ -610,6 +619,7 @@ describe("kanbanBoardIcon", () => {
     expect(kanbanBoardIcon(decodeBoard({ ...stored, icon: "rocket" }))).toBe("rocket");
     expect(kanbanBoardIcon(decodeBoard({ ...stored, icon: "retired" }))).toBeNull();
     expect(decodeBoard(stored).iconImage).toBeNull();
+    expect(decodeBoard(stored).nightlyReview).toBeNull();
   });
 
   it("takes only small inline pictures as a board image", () => {
@@ -677,7 +687,7 @@ const scriptSubtask = (
   id: string,
   step: number,
   text: string,
-  owner: "script" | "evaluator" | "work",
+  owner: "script" | "evaluator" | "work" | "review",
   state: "open" | "done" = "open",
 ) => ({
   id,
@@ -1082,5 +1092,113 @@ describe("KanbanCard wait", () => {
     expect(kanbanWaitExpired(wait({ expiredAt: "2026-10-25T10:05:00.000Z" as never }), at)).toBe(
       true,
     );
+  });
+});
+
+describe("worker dispatch uses the current step", () => {
+  it.each(["evaluator", "script", "review"] as const)(
+    "does not let owner/system notes bypass a %s step",
+    (owner) => {
+      const subtasks = [
+        scriptSubtask("s7", 3, "Hold", owner),
+        scriptSubtask("s4", 4, "Later work", "work"),
+      ];
+      expect(kanbanWaitsOnEvaluator({ stage: "todo", wakeNote: "Owner says go", subtasks })).toBe(
+        true,
+      );
+    },
+  );
+  it("a fresh-thread findings header alone cannot grant worker eligibility", () => {
+    const note = "Fresh thread: earlier context ended.\n\nReview findings (round 1):\n- Fix rate";
+    expect(
+      kanbanWaitsOnEvaluator({
+        stage: "todo",
+        wakeNote: note,
+        subtasks: [scriptSubtask("s2", 2, "Review", "review")],
+      }),
+    ).toBe(true);
+    expect(
+      kanbanWaitsOnEvaluator({
+        stage: "todo",
+        wakeNote: note,
+        subtasks: [scriptSubtask("s3", 3, "Merge", "evaluator")],
+      }),
+    ).toBe(true);
+  });
+});
+
+it("pending findings survive note consumption but never bypass evaluator or script steps", () => {
+  expect(
+    kanbanWaitsOnEvaluator({
+      stage: "todo",
+      wakeNote: null,
+      reviewFindingsPending: true,
+      subtasks: [scriptSubtask("s2", 2, "Review", "review")],
+    }),
+  ).toBe(false);
+  expect(
+    kanbanWaitsOnEvaluator({
+      stage: "todo",
+      wakeNote: null,
+      reviewFindingsPending: true,
+      subtasks: [
+        scriptSubtask("s3", 3, "Hold", "evaluator"),
+        scriptSubtask("s4", 4, "Review", "review"),
+      ],
+    }),
+  ).toBe(true);
+  expect(
+    kanbanWaitsOnEvaluator({
+      stage: "todo",
+      wakeNote: null,
+      reviewFindingsPending: true,
+      subtasks: [
+        scriptSubtask("s3", 3, "Hold", "script"),
+        scriptSubtask("s4", 4, "Review", "review"),
+      ],
+    }),
+  ).toBe(true);
+});
+
+it.each([false, true])(
+  "an explicit pending-findings verdict %s overrides a legacy header",
+  (reviewFindingsPending) => {
+    expect(
+      kanbanWaitsOnEvaluator({
+        stage: "todo",
+        wakeNote: "Review findings (round 1): old words",
+        reviewFindingsPending,
+        subtasks: [scriptSubtask("s2", 2, "Review", "review")],
+      }),
+    ).toBe(!reviewFindingsPending);
+  },
+);
+
+describe("nightly review configuration", () => {
+  const decode = Schema.decodeUnknownSync(KanbanNightlyReview);
+  it("defaults to midnight Dubai and Sonnet medium without run state", () => {
+    const settings = decode({ enabled: true });
+    expect(settings.timeOfDay).toBe("00:00");
+    expect(settings.timeZone).toBe("Asia/Dubai");
+    expect(settings.model).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-sonnet-5-5",
+      options: [{ id: "effort", value: "medium" }],
+    });
+    expect(settings.lastRunAt).toBeNull();
+    expect(settings.lastRunDay).toBeNull();
+    expect(settings.lastDiscussionId).toBeNull();
+  });
+  it.each(["00:00", "09:05", "23:59"])("accepts time %s", (timeOfDay) => {
+    expect(decode({ enabled: true, timeOfDay }).timeOfDay).toBe(timeOfDay);
+  });
+  it.each(["24:00", "12:60", "0:00", "00:0", " 00:00", "00:00:00"])(
+    "rejects time %s",
+    (timeOfDay) => {
+      expect(() => decode({ enabled: true, timeOfDay })).toThrow();
+    },
+  );
+  it("rejects a zone that cannot be scheduled", () => {
+    expect(() => decode({ enabled: true, timeZone: "Not/AZone" })).toThrow();
   });
 });

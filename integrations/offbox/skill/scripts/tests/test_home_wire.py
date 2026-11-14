@@ -2,7 +2,9 @@
 server restarted under. boatd's host side (Incus, systemd, ZFS) is test_boatd's fakes; HTTP, SQLite and the
 client are real."""
 import contextlib
+import importlib.util
 import io
+import json
 from pathlib import Path
 import sys
 import threading
@@ -12,10 +14,15 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS / "tests"))
-sys.path.insert(0, str(SCRIPTS.parents[1] / "tests"))
-from offbox_lib import api, common, lease, misc, reap, runs, ssh_sync  # noqa: E402
+from offbox_lib import api, cli, common, lease, misc, reap, runs, ssh_sync  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
-import test_boatd  # noqa: E402
+
+# Keep server fixtures off sys.path: client discovery has same-named test modules.
+_spec = importlib.util.spec_from_file_location(
+    "offbox_server_test_boatd", SCRIPTS.parents[1] / "tests" / "test_boatd.py")
+test_boatd = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = test_boatd
+_spec.loader.exec_module(test_boatd)
 
 boatd = test_boatd.boatd
 
@@ -31,10 +38,11 @@ class Wire(Isolated):
             self.stack.enter_context(patch.object(api, name, value))
         self.as_owner("ardud")
         self.stack.enter_context(patch.object(runs, "_ttl_keeper"))
+        self.stack.enter_context(patch.object(api, "_COMMAND_DURATIONS", {}))
         self.log = Path(self.tmp.name) / "run.log"
 
     def as_owner(self, who):
-        self.stack.enter_context(patch.object(api, "_KEY", self.srv.tok[who]))
+        self.stack.enter_context(patch.object(api, "_key", return_value=self.srv.tok[who]))
 
     def follow(self, box, pid, **kw):
         err = io.StringIO()
@@ -103,6 +111,118 @@ class Wire(Isolated):
         self.assertIn("half", self.log.read_text())
         self.assertEqual(api.cmd_status(box, pid)["status"], "interrupted")
 
+    def test_restart_settlement_does_not_count_downtime_as_execution(self):
+        cases=[('interrupted',None,None),('lost','lost',None),('killed','kill',None),('recovered',None,10000)]
+        for index,(name,marker,duration) in enumerate(cases):
+            with self.subTest(name=name):
+                box=self.srv.box(bid=f'bx_timing{index:04d}')
+                pid=self.srv.cmd(box)
+                self.srv.con.execute('UPDATE commands SET started_at=100 WHERE box_id=? AND pid=?',(box,pid))
+                if marker:
+                    (boatd.cmd_dir(box)/f'{pid}.kill').write_text(marker)
+                if name=='recovered':
+                    boatd.write_json(boatd.result_path(box,pid),{'attempt':1,'status':'exited','exit_code':7,
+                                                              'started_at':100,'ended_at':110})
+                with patch.object(boatd,'now',return_value=3710):
+                    boatd.reconcile(self.srv.con)
+                status=api.cmd_status(box,pid)
+                if name!='recovered':
+                    self.assertIsNone(status['metrics'])
+                    self.assertEqual(status['endedAt'],boatd.iso(3710))
+                # Both existing response paths must retain only an observed execution duration.
+                self.assertEqual(api.command_execution_ms(box,pid,f'cmd_{pid}'),duration)
+                list(api.cmd_attach(box,pid))
+                self.assertEqual(api.command_execution_ms(box,pid,f'cmd_{pid}'),duration)
+                rid='run-restart-'+name
+                self.con.execute("INSERT INTO runs(run_id,box_id,command_id,process_id,status,mode,start_at) "
+                                 "VALUES (?,?,?,?,'running','bg',100)",(rid,box,f'cmd_{pid}',pid))
+                self.con.commit()
+                runs.finish(rid,status['exitCode'] if status['exitCode'] is not None else common.EXIT_INTERRUPTED,
+                            bookkeeping=False)
+                records=[json.loads(line) for p in (self.srv.tmp/'shared-logs').glob('*.ndjson')
+                         for line in p.read_text().splitlines()]
+                command=[r for r in records if r['name']=='run.command' and r['ids']['run']==rid]
+                self.assertEqual(len(command),1)
+                self.assertEqual(command[0].get('durationMs'),duration)
+
+    def test_step_results_belong_to_the_final_home_attempt(self):
+        first = 'offbox step 1 rc=5: a\noffbox step 2 rc=0: b\n'
+        cases = [('', 90), ('offbox step 1 rc=0: a\n', 90),
+                 ('offbox step 1 rc=0: a\noffbox step 2 rc=0: b\n', 0),
+                 ('offbox step 1 rc=0: a\noffbox step 2 rc=7: b\n', 7)]
+        for index, (second, expected) in enumerate(cases):
+            with self.subTest(second=second):
+                box = self.srv.box(bid=f'bx_step{index:04d}', running=False)
+                pid = self.srv.cmd(box, retry=1)
+                err_file = boatd.cmd_dir(box) / f'{pid}.err'
+                err_file.write_text(first)
+                self.assertEqual(boatd.reconcile(self.srv.con)['retry'], 1)
+                with err_file.open('a') as f:
+                    f.write(second)
+                self.end(box, pid, 0)
+                run_id = f'run-attempt-{index}'
+                log = common.LOGS_DIR / f'{run_id}.log'
+                self.con.execute("INSERT INTO runs(run_id,box_id,command_id,process_id,status,mode,pulls,step_count) "
+                                 "VALUES (?,?,?,?,'running','bg','[]',2)", (run_id, box, f'cmd_{pid}', pid))
+                self.con.commit()
+                # Start from a captured prefix of the first attempt, as a reconnecting client would.
+                log.write_text(first)
+                runs._commit(log, 0, len(first), len(first))
+                with patch.object(lease, 'touch'), patch.object(lease, 'idle_ttl'), patch.object(runs, 'settle_docker'), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    reap._check_stale_runs(self.con, box, 'running', False, [])
+                    self.assertEqual(misc.wait(run_id, None), expected)
+                    self.assertEqual(misc.wait(run_id, None), expected)
+                    self.assertEqual(misc.logs(run_id, False), 90 if expected == 90 else 0)
+                self.assertEqual(runs.step_results(log), [(int(n), int(rc)) for n, rc in
+                                 runs.STEP_RESULT.findall(second)])
+                row = misc._run_row(run_id)
+                self.assertEqual(row['status'], 'infra' if expected == 90 else 'done' if expected == 0 else 'failed')
+
+    def test_interrupted_step_run_uses_completeness_without_changing_plain_exit_94(self):
+        for index, step_count in enumerate((0, 2)):
+            box = self.srv.box(bid=f'bx_intr{index:04d}')
+            pid = self.srv.cmd(box)
+            (boatd.cmd_dir(box) / f'{pid}.err').write_text('offbox step 1 rc=0: a\n')
+            boatd.reconcile(self.srv.con)
+            run_id = f'run-interrupted-{index}'
+            self.con.execute("INSERT INTO runs(run_id,box_id,command_id,process_id,status,mode,pulls,step_count) "
+                             "VALUES (?,?,?,?,'running','bg','[]',?)", (run_id, box, f'cmd_{pid}', pid, step_count))
+            self.con.commit()
+            with patch.object(lease, 'touch'), patch.object(lease, 'idle_ttl'), patch.object(runs, 'settle_docker'), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                expected = 90 if step_count else 94
+                self.assertEqual(cli.main(['wait', run_id]), expected)
+                self.assertEqual(misc.wait(run_id, None), expected)
+
+    def test_unavailable_final_history_cannot_accept_old_complete_step_results(self):
+        box = self.srv.box()
+        pid = self.srv.cmd(box)
+        run_id = 'run-old-complete'
+        log = common.LOGS_DIR / f'{run_id}.log'
+        log.write_text('offbox step 1 rc=0: a\noffbox step 2 rc=0: b\n')
+        self.con.execute("INSERT INTO runs(run_id,box_id,command_id,process_id,status,mode,pulls,step_count) "
+                         "VALUES (?,?,?,?,'running','bg','[]',2)", (run_id, box, f'cmd_{pid}', pid))
+        self.con.commit()
+        row = misc._run_row(run_id)
+        with patch.object(misc, '_catch_up_log', return_value='incomplete:history unavailable'), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertIsNone(runs.settled_steps_code(row, 0))
+        self.assertIn('steps incomplete:', err.getvalue())
+        self.assertNotIn('remote exit 0', err.getvalue())
+        for status, code in (('done', 0), ('infra', None)):
+            with self.subTest(status=status, code=code):
+                self.con.execute("UPDATE runs SET status=?,exit_code=? WHERE run_id=?", (status, code, run_id))
+                self.con.commit()
+                with patch.object(misc, '_catch_up_log', return_value='incomplete:history unavailable'), \
+                        contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+                    for _ in range(2):
+                        self.assertEqual(misc.wait(run_id, None), 90)
+                        self.assertEqual(misc.logs(run_id, False), 90)
+                self.assertNotIn('done exit=0', out.getvalue())
+                row = misc._run_row(run_id)
+                self.assertEqual((row['status'], row['exit_code']), (status, code))
+
     def test_another_owners_token_gets_404_for_the_box_and_its_run(self):
         box = self.srv.box()
         pid = self.srv.cmd(box)
@@ -169,7 +289,7 @@ class Wire(Isolated):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 self.assertEqual(misc.logs('run-silent', False), 1)
             self.assertEqual(out.getvalue(), '')
-            self.assertIn('offbox server history empty', err.getvalue())
+            self.assertIn('server history checked', err.getvalue())
             self.assertEqual(len(err.getvalue().splitlines()), 1)
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(misc.wait('run-silent', None), 0)

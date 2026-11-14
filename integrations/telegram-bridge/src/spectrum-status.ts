@@ -1,5 +1,6 @@
 import { request } from "node:http";
 import { isAbsolute } from "node:path";
+import { toolError } from "./toollog.ts";
 
 export type RouterStatus = {
   route: { id: string; directory: string; generation: number } | null;
@@ -58,11 +59,21 @@ function decodeStatus(data: unknown): RouterStatus | undefined {
  */
 export function spectrumRouterStatus(socketPath: string, timeoutMs = 3_000): Promise<RouterStatus | undefined> {
   return new Promise(resolve => {
-    if (!isAbsolute(socketPath) || socketPath.includes("\0")) return resolve(undefined);
+    if (!isAbsolute(socketPath) || socketPath.includes("\0")) {
+      toolError("telegram", "tg.router.socket", undefined, { name: "SyntaxError" });
+      return resolve(undefined);
+    }
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    const finish = (value: RouterStatus | undefined) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      finish(undefined, "tg.router.timeout", { name: "TimeoutError" });
+      controller.abort();
+    }, timeoutMs);
+    const finish = (value: RouterStatus | undefined, tag?: string, error?: unknown) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      if (tag) toolError("telegram", tag, undefined, error);
       resolve(value);
     };
     try {
@@ -73,29 +84,33 @@ export function spectrumRouterStatus(socketPath: string, timeoutMs = 3_000): Pro
       }, res => {
         const chunks: Buffer[] = [];
         let size = 0;
-        res.on("error", () => finish(undefined));
+        res.on("error", error => finish(undefined, "tg.router.response", error));
+        res.on("aborted", () => finish(undefined, "tg.router.incomplete", { name: "SyntaxError" }));
+        res.on("close", () => { if (!res.complete) finish(undefined, "tg.router.incomplete", { name: "SyntaxError" }); });
         res.on("data", (chunk: Buffer) => {
           size += chunk.length;
           if (size > MAX_STATUS_BYTES) {
-            finish(undefined);
+            finish(undefined, "tg.router.tooLarge", { name: "SyntaxError" });
             req.destroy();
             return;
           }
           chunks.push(chunk);
         });
         res.on("end", () => {
-          if ((res.statusCode ?? 0) !== 200 || !res.complete) return finish(undefined);
+          if ((res.statusCode ?? 0) !== 200) return finish(undefined, "tg.router.httpStatus", { status: res.statusCode });
+          if (!res.complete) return finish(undefined, "tg.router.incomplete", { name: "SyntaxError" });
           try {
-            finish(decodeStatus(JSON.parse(Buffer.concat(chunks, size).toString("utf8"))));
+            const status = decodeStatus(JSON.parse(Buffer.concat(chunks, size).toString("utf8")));
+            finish(status, status ? undefined : "tg.router.decode", { name: "SyntaxError" });
           } catch {
-            finish(undefined);
+            finish(undefined, "tg.router.decode", { name: "SyntaxError" });
           }
         });
       });
-      req.on("error", () => finish(undefined));
+      req.on("error", error => finish(undefined, "tg.router.request", error));
       req.end();
-    } catch {
-      finish(undefined);
+    } catch (error) {
+      finish(undefined, "tg.router.request", error);
     }
   });
 }

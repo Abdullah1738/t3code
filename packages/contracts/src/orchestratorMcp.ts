@@ -36,6 +36,7 @@ import { ThreadTitleRegeneration } from "./threadTitle.ts";
 import {
   OrchestrationV2Actor,
   OrchestrationV2CreationSource,
+  OrchestrationV2ProviderFailureCategory,
   OrchestrationV2RunStatus,
   OrchestrationV2TurnItemStatus,
 } from "./orchestrationV2.ts";
@@ -185,7 +186,7 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
   ),
   timeoutMs: Schema.optional(Schema.Finite).annotate({
     description:
-      "Wait budget for mode=wait only. Default 10 minutes. Elapsing it returns waitTimedOut=true on that call and does not cancel the child.",
+      "Total wait budget from call start for mode=wait only, including setup. Defaults to and is capped at 4 minutes 30 seconds. When it expires, waitTimedOut=true is returned without cancelling the child.",
   }),
   idleTimeoutMs: Schema.optional(Schema.Finite).annotate({
     description:
@@ -211,6 +212,19 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   currentRunId: Schema.optional(Schema.NullOr(RunId)),
   currentRunStatus: Schema.optional(Schema.NullOr(OrchestrationV2RunStatus)),
   status: OrchestratorMcpDelegatedTaskStatus,
+  failure: Schema.optional(
+    Schema.NullOr(
+      Schema.Struct({
+        category: OrchestrationV2ProviderFailureCategory,
+        code: Schema.NullOr(Schema.String),
+        message: Schema.String.check(Schema.isMaxLength(2_000)),
+        retryable: Schema.NullOr(Schema.Boolean),
+      }),
+    ),
+  ).annotate({
+    description:
+      "Why the latest run failed, normalized across providers. content_filter means the provider refused the content: re-dispatch on another model instead of retrying the same one.",
+  }),
   startedAt: Schema.optional(Schema.NullOr(Schema.String)).annotate({
     description:
       "The original child run's start time in ISO format, or null if it has not started.",
@@ -229,7 +243,7 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   ),
   startPending: Schema.optional(Schema.Boolean).annotate({
     description:
-      "True means the child's provider turn has not started yet (waiting for a server worker); it is not executing.",
+      "True means the child's provider turn has not been observed starting yet (including pending run creation, workspace preparation or a server worker); keep taskId for later status reads.",
   }),
   workState: Schema.Literals(["working", "waiting_for_children", "result_available"]),
   hasPendingChildRuns: Schema.Boolean,
@@ -239,6 +253,7 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   latestTerminalResultContextTransferId: Schema.NullOr(ContextTransferId),
   providerInstanceId: ProviderInstanceId,
   model: Schema.NullOr(Schema.String),
+  finishedOn: Schema.optional(Schema.String),
   selectionRouting: Schema.optional(Schema.NullOr(ModelSelectionRouting)),
   options: Schema.optional(
     Schema.Array(ProviderOptionSelection).annotate({
@@ -266,7 +281,7 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   }),
   waitTimedOut: Schema.Boolean.annotate({
     description:
-      "True only on that mode=wait call when timeoutMs elapsed. The timeout does not cancel the child. Later task_status reads return false and use status for liveness.",
+      "True only on a mode=wait call whose effective wait budget expired (at most 4 minutes 30 seconds). The timeout does not cancel the child. Later task_status reads return false and use status for liveness.",
   }),
 });
 export type OrchestratorMcpDelegateTaskResult = typeof OrchestratorMcpDelegateTaskResult.Type;
@@ -277,6 +292,15 @@ export const OrchestratorMcpTaskStatusResult = Schema.Union([
     ...Struct.map(fields, Schema.optionalKey),
     taskId: NodeId,
     partial: Schema.Literal(true),
+    callerResolved: Schema.optional(Schema.Literal(true)),
+    stoppedAt: Schema.Literals(["caller", "parent_records", "child_records", "result"]).annotate({
+      description:
+        "Read stage still pending when the status deadline expired. This describes the status read, not the delegated task's progress.",
+    }),
+    retryHint: Schema.String.annotate({
+      description:
+        "What to do after this status read timed out. The delegated task is unaffected; follow this hint to retry or read the known child thread.",
+    }),
   })),
 ]);
 export type OrchestratorMcpTaskStatusResult = typeof OrchestratorMcpTaskStatusResult.Type;
@@ -527,7 +551,10 @@ export type OrchestratorMcpThreadSendResult = typeof OrchestratorMcpThreadSendRe
 export const OrchestratorMcpThreadWaitInput = Schema.Struct({
   threadId: ThreadId,
   runId: Schema.optional(RunId),
-  timeoutMs: Schema.optional(Schema.Finite),
+  timeoutMs: Schema.optional(Schema.Finite).annotate({
+    description:
+      "Total wait budget from call start, including lookup. Defaults to and is capped at 4 minutes 30 seconds.",
+  }),
 });
 export type OrchestratorMcpThreadWaitInput = typeof OrchestratorMcpThreadWaitInput.Type;
 
@@ -683,7 +710,10 @@ export const OrchestratorMcpRequestSecretInput = Schema.Struct({
   }),
   timeoutMs: Schema.optional(
     Schema.Int.check(Schema.isBetween({ minimum: 1_000, maximum: 60 * 60 * 1_000 })),
-  ).annotate({ description: "How long to wait for the user. Default 10 minutes." }),
+  ).annotate({
+    description:
+      "Total wait budget from call start, including setup. Defaults to and is capped at 4 minutes 30 seconds.",
+  }),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId).annotate({
     description:
       "Reuse when retrying a call that lost its result, so the user sees one card and its answer is returned again. Use a new id to ask again after timed_out or cancelled.",
@@ -702,7 +732,7 @@ export const OrchestratorMcpRequestSecretResult = Schema.Union([
   Schema.Struct({
     status: Schema.Literals(["declined", "cancelled", "timed_out"]).annotate({
       description:
-        "declined: the user chose not to. cancelled: the request ended with the run. timed_out: the user did not answer in time; the card is closed, so ask again with a new clientRequestId if still needed.",
+        "declined: the user chose not to. cancelled: the request ended with the run. timed_out: the response budget expired; card cleanup continues on the server. Ask again with a new clientRequestId if still needed.",
     }),
   }),
 ]);
@@ -729,6 +759,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "parent_not_active",
       "caller_unresolved",
       "delegation_timeout",
+      "ambiguous_replay",
       "provider_unavailable",
       "model_unavailable",
       "runtime_mode_escalation_denied",
@@ -738,6 +769,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "thread_not_found",
       "run_not_found",
       "thread_not_sendable",
+      "send_timeout",
       "thread_not_interruptible",
       "invalid_request",
       "orchestration_error",

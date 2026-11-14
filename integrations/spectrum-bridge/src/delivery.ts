@@ -1,3 +1,4 @@
+import { cardKind, toolError, toolLog } from "./toollog.ts";
 import { createHash } from "node:crypto";
 import { IMessageError } from "@photon-ai/advanced-imessage/grpc";
 import { BUBBLE_CHARS, formatText, isSingleUrl, splitFormatted, stripInternalText } from "./formatting.ts";
@@ -9,6 +10,7 @@ export { classifySendFailure } from "./photon.ts";
 
 type Options = {
   projectScope: string;
+  chat?: string;
   chatGuid: () => string | undefined;
   enabled: () => boolean;
   beforeSend?: (item: OutboxRecord) => Promise<"send" | "wait" | "cancel">;
@@ -78,6 +80,7 @@ export class Delivery {
 
   /** Call after Store's startup recovery, never on another process's live sends. */
   recover(): void {
+    toolLog.capture(() => toolLog.write({ component: "recovery", kind: "event", name: "bridge.recover" }));
     this.store.db.transaction(() => {
       const rows = this.store.db.query<{ id: string }, []>("SELECT id FROM outbox WHERE state IN ('uncertain', 'failed')").all();
       for (const { id } of rows) {
@@ -96,6 +99,19 @@ export class Delivery {
 
   /** Record acceptance, and when it happened: replies to a prompt only count once it reached the phone. */
   private markSent(id: string, providerId: string | undefined): void {
+    toolLog.capture(() => {
+      const item = this.store.getOperation(id);
+      const at = Date.now();
+      const queuedAt = this.store.get<number>(`log-queued:${id}`) ?? at;
+      const inbound = item?.replyTo ? this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(item.replyTo) : undefined;
+      const receivedAt = this.store.get<number>(`log-inbound-at:${id}`) ?? (inbound ? (JSON.parse(inbound.payload) as { receivedAt?: number }).receivedAt : undefined);
+      toolLog.capture(() => toolLog.write({ component: "delivery", kind: "perf", name: "reply.sent", ok: true,
+        durationMs: Math.max(0, at - (receivedAt ?? queuedAt)), ids: this.logIds(id, item),
+        props: { inboundKnown: receivedAt !== undefined, outboxDelayMs: Math.max(0, at - queuedAt), parts: item ? splitFormatted(formatText(item.text), BUBBLE_CHARS).length : 0, files: item?.attachment ? 1 : 0 } }));
+      const kind = item?.app ? cardKind(item.app.url) : item?.attachment ? cardKind(item.attachment.name) : "other";
+      if (item?.app || kind !== "other") toolLog.capture(() => toolLog.write({ component: "cards", kind: "event", name: "card.sent", ok: true, ids: { operationId: id }, props: { cardKind: kind } }));
+      if (/^(?:outage:|failed:|notice:|turn:|drop:)/.test(id)) toolLog.capture(() => toolLog.write({ component: "recovery", kind: "event", name: "recovery.notice_sent", ids: { operationId: id } }));
+    });
     this.store.db.transaction(() => {
       this.store.outboxState(id, "sent", providerId);
       if (this.store.get<number>(`sent-at:${id}`) === undefined) this.store.set(`sent-at:${id}`, Date.now());
@@ -118,12 +134,19 @@ export class Delivery {
     return true;
   }
 
-  private error(code: string): void {
+  private logIds(id: string, item?: OutboxRecord) {
+    const inboundId = this.store.get<string>(`log-inbound-id:${id}`) ?? item?.replyTo;
+    return { chat: this.options.chat ?? "owner", operationId: id,
+      ...(item?.sessionId ? { threadId: item.sessionId } : {}), ...(inboundId ? { inboundId } : {}) };
+  }
+
+  private error(code: string, item: OutboxRecord): void {
+    toolLog.capture(() => toolLog.write({ component: "delivery", kind: "error", name: "reply.failed", ok: false, ids: this.logIds(item.id, item), error: { tag: code, message: "" } }));
     this.lastError = code;
     this.options.log?.("outbound-failed", code);
   }
 
-  private failed(item: OutboxRecord, state: string, wasAmbiguous: boolean, failure: ReturnType<typeof classifySendFailure>): void {
+  private failed(item: OutboxRecord, state: string, wasAmbiguous: boolean, failure: ReturnType<typeof classifySendFailure>, cause?: unknown): void {
     if (!this.current(item, state)) return;
     this.store.db.transaction(() => {
       const ambiguous = wasAmbiguous || failure.uncertain;
@@ -144,7 +167,10 @@ export class Delivery {
         ? { since: now, last: now, code: failure.code, failures: 1 }
         : { ...health, last: now, code: failure.code, failures: health.failures + 1 } satisfies Health);
     }).immediate();
-    this.error(failure.code);
+    toolLog.capture(() => toolLog.write({ component: "delivery", kind: "error", name: "reply.failed", ok: false,
+      ids: this.logIds(item.id, item), error: { tag: failure.code, cause } }));
+    this.lastError = failure.code;
+    this.options.log?.("outbound-failed", failure.code);
   }
 
   /** An accepted send ends an outage only once nothing is still waiting on a retry. */
@@ -164,12 +190,12 @@ export class Delivery {
     this.nextHousekeeping = Date.now() + HOUSEKEEPING_EVERY;
     try {
       await this.alert();
-    } catch {
+    } catch (caughtError) { toolError("delivery", "delivery.catch1", caughtError);
       this.options.log?.("outage-alert-failed");
     }
     try {
       await this.fallBack();
-    } catch {
+    } catch (caughtError) { toolError("delivery", "delivery.catch2", caughtError);
       this.options.log?.("outbound-fallback-failed");
     }
   }
@@ -223,7 +249,7 @@ export class Delivery {
       let outcome: "sent" | "skip" | "retry";
       try {
         outcome = await this.options.fallback(item);
-      } catch {
+      } catch (caughtError) { toolError("delivery", "delivery.catch3", caughtError);
         outcome = "retry";
       }
       if (outcome === "retry") {
@@ -279,7 +305,7 @@ export class Delivery {
     let statuses: Map<string, string>;
     try {
       statuses = await this.options.statuses(Math.min(...candidates.map(row => row.at)) - 60_000);
-    } catch {
+    } catch (caughtError) { toolError("delivery", "delivery.catch4", caughtError);
       return; // the next check tries again
     }
     for (const { id, indexes } of candidates) {
@@ -321,19 +347,19 @@ export class Delivery {
       if (!item || !this.current(item, "pending")) continue;
       if (!item.text.trim() && !item.attachment && !item.poll && !item.app) {
         this.store.outboxState(item.id, "failed");
-        this.error("emptyContent");
+        this.error("emptyContent", item);
         continue;
       }
       if ([item.attachment, item.poll, item.app].filter(Boolean).length > 1
         || (item.effect !== undefined && !isEffect(item.effect))) {
         this.store.outboxState(item.id, "failed");
-        this.error("invalidContent");
+        this.error("invalidContent", item);
         continue;
       }
       if ((item.attachment && (!this.photon.uploadAttachment || !this.photon.sendAttachment))
         || (item.poll && !this.photon.sendPoll) || (item.app && !this.photon.sendApp)) {
         this.store.outboxState(item.id, "failed");
-        this.error("unsupported");
+        this.error("unsupported", item);
         continue;
       }
       if (!backlogDue && (this.store.get<number>(`retry:${item.id}`) ?? 0) > Date.now()) continue;
@@ -366,14 +392,14 @@ export class Delivery {
         const firstAttempt = this.store.get<unknown>(`firstAttempt:${item.id}`);
         if ((item.attempts > 0 || firstAttempt !== undefined) && !this.withinRetryWindow(item.id)) {
           this.store.outboxState(item.id, "uncertain");
-          this.error("retryWindowExpired");
+          this.error("retryWindowExpired", item);
           continue operations;
         }
         const ambiguityKey = `sendAmbiguous:${item.id}`;
         const wasAmbiguous = this.store.get<boolean>(ambiguityKey) ?? item.attempts > 0;
         if (state === "pending" && item.attempts >= MAX_ATTEMPTS) {
           this.store.outboxState(item.id, wasAmbiguous ? "uncertain" : "failed");
-          this.error("retryLimitReached");
+          this.error("retryLimitReached", item);
           continue operations;
         }
         // Freeze the destination as well as the Store's immutable content and reply target.
@@ -381,7 +407,7 @@ export class Delivery {
         const chatGuid = this.store.get<string>(destinationKey) ?? availableChat;
         if (chatGuid !== availableChat) {
           this.store.outboxState(item.id, "uncertain");
-          this.error("chatChanged");
+          this.error("chatChanged", item);
           continue operations;
         }
         const id = `bridge-${createHash("sha256").update(`${this.options.projectScope}:${item.id}:${index}`).digest("hex")}`;
@@ -391,7 +417,7 @@ export class Delivery {
         if (attachment && (upload !== undefined || wasAmbiguous)) {
           if (!upload || upload.sha256 !== attachment.sha256 || typeof upload.guid !== "string" || !upload.guid.trim()) {
             this.store.outboxState(item.id, wasAmbiguous ? "uncertain" : "failed");
-            this.error("invalidAttachment");
+            this.error("invalidAttachment", item);
             continue operations;
           }
         }
@@ -402,9 +428,9 @@ export class Delivery {
             if (data.byteLength !== attachment.size || createHash("sha256").update(data).digest("hex") !== attachment.sha256) {
               throw new Error("Invalid attachment blob");
             }
-          } catch {
+          } catch (caughtError) { toolError("delivery", "delivery.catch5", caughtError);
             this.store.outboxState(item.id, "failed");
-            this.error("invalidAttachment");
+            this.error("invalidAttachment", item);
             continue operations;
           }
           this.store.db.transaction(() => {
@@ -421,8 +447,8 @@ export class Delivery {
             uploaded = await this.photon.uploadAttachment!(Object.freeze({
               id, data, name: attachment.name, mimeType: attachment.mimeType,
             }));
-          } catch (error) {
-            this.failed(item, state, false, { ...classifySendFailure(error), uncertain: false });
+          } catch (error) { toolError("delivery", "delivery.catch6", error);
+            this.failed(item, state, false, { ...classifySendFailure(error), uncertain: false }, error);
             continue operations;
           }
           if (typeof uploaded.guid !== "string" || !uploaded.guid.trim()) {
@@ -450,11 +476,11 @@ export class Delivery {
             if (state === "pending") dispatched++;
             state = "sending";
             sendPreparedApp = await this.photon.prepareApp({ id, chatGuid, ...app });
-          } catch (error) {
+          } catch (error) { toolError("delivery", "delivery.catch7", error);
             if (!this.current(item, state)) continue operations;
             if (this.store.get(`firstAttempt:${item.id}`) === undefined) this.store.set(`firstAttempt:${item.id}`, Date.now());
             // Preparing an image cannot send a message; preserve uncertainty from any earlier send.
-            this.failed(item, state, wasAmbiguous, { ...classifySendFailure(error), uncertain: false });
+            this.failed(item, state, wasAmbiguous, { ...classifySendFailure(error), uncertain: false }, error);
             continue operations;
           }
         }
@@ -471,7 +497,7 @@ export class Delivery {
         }
         if (this.store.get(`firstAttempt:${item.id}`) !== undefined && !this.withinRetryWindow(item.id)) {
           this.store.outboxState(item.id, wasAmbiguous ? "uncertain" : "failed");
-          this.error("retryWindowExpired");
+          this.error("retryWindowExpired", item);
           continue operations;
         }
         this.store.db.transaction(() => {
@@ -519,7 +545,7 @@ export class Delivery {
             try {
               // Once rich options were rejected, replays go straight to the plain copy.
               result = await sendChunk(this.store.get<boolean>(fallbackKey) === true);
-            } catch (error) {
+            } catch (error) { toolError("delivery", "delivery.catch8", error);
               if (this.store.get<boolean>(fallbackKey)) throw error;
               // A rejected rich option must never cost the owner the reply itself. An invalid
               // argument is a definite rejection, so nothing was delivered.
@@ -530,7 +556,7 @@ export class Delivery {
               result = await sendChunk(true);
             }
           }
-        } catch (error) {
+        } catch (error) { toolError("delivery", "delivery.catch9", error);
           const failure = classifySendFailure(error);
           // SMS refuses threaded replies (the owner's number dropped off iMessage on 20 Oct), so a
           // text reply that fails goes again shortly without its thread target, under its own id,
@@ -540,11 +566,11 @@ export class Delivery {
             && this.current(item, state)) {
             this.store.set(`unthreaded:${item.id}`, true);
             this.options.log?.("outbound-unthreaded", failure.code);
-            this.failed(item, state, wasAmbiguous, { ...failure, retryable: true });
+            this.failed(item, state, wasAmbiguous, { ...failure, retryable: true }, error);
             if (this.store.getOperation(item.id)?.state === "pending") this.store.set(`retry:${item.id}`, Date.now() + 5_000);
             continue operations;
           }
-          this.failed(item, state, wasAmbiguous, failure);
+          this.failed(item, state, wasAmbiguous, failure, error);
           continue operations;
         }
         // Provider acceptance is durable even if cancellation raced with this RPC.

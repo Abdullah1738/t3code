@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 /**
  * Replies to scoped third parties without an agent. The model gets no tools at all: the bridge
  * gathers the few pieces of the owner's data the grant's providers allow (free/busy without
@@ -120,7 +121,7 @@ export function parseDecision(raw: string): GuestDecision | undefined {
   const first = text.indexOf("{");
   const last = text.lastIndexOf("}");
   if (first < 0 || last < first) return undefined;
-  try { value = JSON.parse(text.slice(first, last + 1)); } catch { return undefined; }
+  try { value = JSON.parse(text.slice(first, last + 1)); } catch (caughtError) { toolError("guest-responder", "guest-responder.catch1", caughtError); return undefined; }
   const decision = value as GuestDecision;
   if (!decision || typeof decision !== "object" || typeof decision.reply !== "string") return undefined;
   if (!["none", "propose", "book", "escalate", "decline"].includes(decision.action)) return undefined;
@@ -187,7 +188,7 @@ export class GuestResponder {
         this.pending.delete(key);
         return batch.length ? this.process(this.deps.book.active(grant.address) ?? grant, batch) : undefined;
       })
-      .catch(() => this.deps.log?.("guest-failed"));
+      .catch((caughtError) => { toolError("guest-responder", "guest-responder.catch2", caughtError); return this.deps.log?.("guest-failed"); });
     this.queues.set(key, run);
     return run;
   }
@@ -216,10 +217,10 @@ export class GuestResponder {
       book.audit(grant.address, event, { ...detail, chars: text.length });
       if (!store.get(`contact-shared:${normalizeAddress(grant.address)}`) && this.deps.shareContact) {
         store.set(`contact-shared:${normalizeAddress(grant.address)}`, this.now());
-        await this.deps.shareContact(grant.address).catch(() => this.deps.log?.("contact-share-failed"));
+        await this.deps.shareContact(grant.address).catch((caughtError) => { toolError("guest-responder", "guest-responder.catch3", caughtError); return this.deps.log?.("contact-share-failed"); });
       }
       return true;
-    } catch {
+    } catch (caughtError) { toolError("guest-responder", "guest-responder.catch4", caughtError);
       book.audit(grant.address, "send-failed");
       this.deps.log?.("guest-send-failed");
       return false;
@@ -260,7 +261,7 @@ export class GuestResponder {
     const views: string[] = [];
     let windows: FreeWindow[] | "unavailable" | undefined;
     for (const spec of grant.providers) {
-      const view = await PROVIDERS[spec.kind].view?.(spec.arg, grant, this.providerDeps()).catch(() => undefined);
+      const view = await PROVIDERS[spec.kind].view?.(spec.arg, grant, this.providerDeps()).catch((caughtError) => { toolError("guest-responder", "guest-responder.catch5", caughtError); return undefined; });
       if (!view) continue;
       views.push(view.prompt);
       if (view.windows !== undefined) windows = view.windows;
@@ -274,7 +275,7 @@ export class GuestResponder {
     let decision: GuestDecision | undefined;
     try {
       decision = parseDecision(await (this.deps.complete ?? openRouterComplete(DEFAULT_GUEST_MODEL))(system, chat));
-    } catch { decision = undefined; }
+    } catch (caughtError) { toolError("guest-responder", "guest-responder.catch6", caughtError); decision = undefined; }
     if (!decision) {
       book.audit(grant.address, "model-failed");
       this.deps.log?.("guest-model-failed");

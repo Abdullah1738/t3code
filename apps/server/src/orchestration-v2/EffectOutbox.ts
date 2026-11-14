@@ -28,6 +28,10 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import { forkParked } from "../serverActivation.ts";
 
+const StoppedRunAttempts = Schema.Array(
+  Schema.Struct({ runId: RunId, attemptId: Schema.NullOr(RunAttemptId) }),
+);
+
 export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("provider-runtime.continue"),
@@ -39,6 +43,19 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     providerSessionId: ProviderSessionId,
     detail: Schema.optional(Schema.String),
     revokeMcpCredential: Schema.optional(Schema.Boolean),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("provider-session.stop-background-work"),
+    throughRunOrdinal: Schema.Number,
+    runAttempts: StoppedRunAttempts,
+    backgroundThreads: Schema.Array(
+      Schema.Struct({
+        providerSessionId: ProviderSessionId,
+        providerThreadId: ProviderThreadId,
+        providerTurnId: ProviderTurnId,
+      }),
+    ),
+    onlyIfCancelled: Schema.Boolean,
   }),
   Schema.Struct({
     type: Schema.Literal("mcp-credential.revoke-thread"),
@@ -54,9 +71,13 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
     subagent: Schema.optional(Schema.Struct({ id: NodeId, nativeTaskId: Schema.String })),
+    stopThroughRunOrdinal: Schema.optional(Schema.Number),
+    stopRunAttempts: Schema.optional(StoppedRunAttempts),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.steer"),
+    // Accepted input only needs replay-safe mailbox bookkeeping on later attempts.
+    providerAccepted: Schema.optional(Schema.Boolean),
     activeTurnOnly: Schema.optional(Schema.Boolean),
     providerSessionId: ProviderSessionId,
     providerThreadId: ProviderThreadId,
@@ -132,6 +153,7 @@ export const CONTROL_LANE_EFFECT_TYPES = [
   "runtime-request.respond",
   "delegated-tasks.stop",
   "provider-session.detach",
+  "provider-session.stop-background-work",
   "mcp-credential.revoke-thread",
   "checkpoint.capture",
   "scheduled-tasks.cleanup",
@@ -143,6 +165,7 @@ export const CONTROL_LANE_EFFECT_TYPES = [
 export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
   "provider-runtime.continue",
   "provider-session.detach",
+  "provider-session.stop-background-work",
   "mcp-credential.revoke-thread",
   "provider-thread.rollback",
   "checkpoint.capture",
@@ -178,7 +201,7 @@ export type OrchestrationEffectStatusV2 = typeof OrchestrationEffectStatusV2.Typ
  * cleanup keeps a deleted thread's worktree while any of its effects failed.
  */
 export const SETTLED_EFFECT_RETENTION = Duration.days(7);
-const PRUNE_BATCH_SIZE = 500;
+const PRUNE_BATCH_SIZE = 200;
 
 export interface OrchestrationEffectV2 {
   readonly id: string;
@@ -233,6 +256,14 @@ export interface EffectOutboxV2Shape {
   readonly hasPendingRunContinuation: (
     threadId: ThreadId,
   ) => Effect.Effect<boolean, EffectOutboxError>;
+  readonly hasPendingRunStart: (input: {
+    readonly threadId: ThreadId;
+    readonly runIds: ReadonlyArray<RunId>;
+  }) => Effect.Effect<boolean, EffectOutboxError>;
+  readonly listRestartContinuations: Effect.Effect<
+    ReadonlyArray<OrchestrationEffectV2>,
+    EffectOutboxError
+  >;
   readonly listByCommandId: (
     commandId: CommandId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
@@ -268,6 +299,8 @@ export interface EffectOutboxV2Shape {
     readonly workerId: string;
     readonly error: string;
     readonly delayMs: number;
+    readonly steerAccepted?: boolean;
+    readonly refundAttempt?: boolean;
   }) => Effect.Effect<boolean, EffectOutboxError>;
   readonly fail: (input: {
     readonly effectId: string;
@@ -355,10 +388,9 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
     };
     // An earlier effect waiting out a retry backoff still blocks later ones, so
     // a turn cannot start while a failed rollback is about to restore files.
-    const claimableCandidatePredicate = (
-      availableBefore?: string,
-      excludeRestartContinuations = false,
-    ) =>
+    // A pending restart wake holds no provider or filesystem resources. Fresh
+    // user turns must pass it while restart admission is paced.
+    const claimableCandidatePredicate = (availableBefore?: string) =>
       sql`
         ${
           availableBefore === undefined
@@ -375,11 +407,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               OR (
                 active.status = 'pending'
                 AND active.rowid < candidate.rowid
-                AND ${
-                  excludeRestartContinuations
-                    ? sql`active.effect_type != 'provider-runtime.continue'`
-                    : sql`1 = 1`
-                }
+                AND active.effect_type != 'provider-runtime.continue'
+                AND NOT (active.effect_type = 'provider-turn.start' AND COALESCE(active.last_error, '') = 'Resuming after restart')
               )
             )
             AND (
@@ -480,6 +509,20 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         },
         Effect.mapError((cause) => new EffectOutboxError({ operation: "get", cause })),
       ),
+      hasPendingRunStart: Effect.fn("EffectOutbox.hasPendingRunStart")(
+        function* ({ threadId, runIds }) {
+          if (runIds.length === 0) return false;
+          const rows = yield* sql`
+            SELECT 1 FROM orchestration_v2_effect_outbox
+            WHERE thread_id = ${threadId} AND status IN ('pending', 'running')
+              AND effect_type = 'provider-turn.start'
+              AND json_extract(payload_json, '$.runId') IN ${sql.in(runIds)}
+            LIMIT 1
+          `;
+          return rows.length > 0;
+        },
+        Effect.mapError((cause) => new EffectOutboxError({ operation: "get", cause })),
+      ),
       listByCommandId: (commandId) =>
         sql<EffectRow>`
           SELECT *
@@ -510,6 +553,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             WHERE thread_id = ${threadId}
               AND status IN ('pending', 'running')
               AND effect_type IN ${sql.in(effectTypes)}
+              AND NOT (effect_type = 'provider-turn.steer'
+                AND COALESCE(json_extract(payload_json, '$.providerAccepted'), 0) = 1)
             RETURNING effect_id
           `;
           return rows.map(({ effect_id }) => effect_id);
@@ -556,6 +601,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             last_error = 'Cancelled because the server process ended before the effect completed.'
           WHERE status IN ('pending', 'running')
             AND effect_type IN ${sql.in(PROCESS_BOUND_EFFECT_TYPES)}
+            AND NOT (effect_type = 'provider-turn.steer'
+              AND COALESCE(json_extract(payload_json, '$.providerAccepted'), 0) = 1)
           RETURNING effect_id
         `;
         const requeuedRows = yield* sql<{ readonly effect_id: string }>`
@@ -568,7 +615,9 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             updated_at = ${now},
             last_error = 'Requeued after the previous server process ended.'
           WHERE status = 'running'
-            AND effect_type IN ${sql.in(REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS)}
+            AND (effect_type IN ${sql.in(REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS)}
+              OR (effect_type = 'provider-turn.steer'
+                AND json_extract(payload_json, '$.providerAccepted') = 1))
           RETURNING effect_id
         `;
         if (requeuedRows.length > 0) yield* notifyAvailable(requeuedRows.length);
@@ -608,7 +657,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             WHERE effect_id = (
               SELECT candidate.effect_id
               FROM orchestration_v2_effect_outbox AS candidate
-              WHERE ${claimableCandidatePredicate(nowIso, excludeRestartContinuations)}
+              WHERE ${claimableCandidatePredicate(nowIso)}
                 AND ${threadId === undefined ? sql`1 = 1` : sql`candidate.thread_id = ${threadId}`}
                 AND ${excludeRestartContinuations ? sql`candidate.effect_type != 'provider-runtime.continue'` : sql`1 = 1`}
                 AND ${onlyEffectTypes === undefined ? sql`1 = 1` : sql`candidate.effect_type IN ${sql.in(onlyEffectTypes)}`}
@@ -624,6 +673,15 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           return Option.some(yield* rowToEffect(row));
         },
         Effect.mapError((cause) => new EffectOutboxError({ operation: "claim", cause })),
+      ),
+      listRestartContinuations: Effect.gen(function* () {
+        const rows =
+          yield* sql<EffectRow>`SELECT * FROM orchestration_v2_effect_outbox WHERE effect_type = 'provider-runtime.continue' AND status IN ('pending', 'running') ORDER BY created_at, effect_id`;
+        return yield* Effect.forEach(rows, rowToEffect);
+      }).pipe(
+        Effect.mapError(
+          (cause) => new EffectOutboxError({ operation: "list-restart-continuations", cause }),
+        ),
       ),
       nextClaimableAt: Effect.gen(function* () {
         const rows = yield* sql<{ readonly available_at: string | null }>`
@@ -704,7 +762,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           ),
       ),
       retry: Effect.fn("EffectOutbox.retry")(
-        function* ({ effectId, workerId, error, delayMs }) {
+        function* ({ effectId, workerId, error, delayMs, steerAccepted, refundAttempt }) {
           const now = yield* DateTime.now;
           const nowIso = DateTime.formatIso(now);
           const availableAt = DateTime.formatIso(
@@ -714,10 +772,15 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             UPDATE orchestration_v2_effect_outbox
             SET
               status = 'pending',
+              attempt_count = MAX(0, attempt_count - ${refundAttempt === true ? 1 : 0}),
               available_at = ${availableAt},
               lease_owner = NULL,
               lease_expires_at = NULL,
               updated_at = ${nowIso},
+              payload_json = CASE
+                WHEN ${steerAccepted === true} AND effect_type = 'provider-turn.steer'
+                THEN json_set(payload_json, '$.providerAccepted', json('true'))
+                ELSE payload_json END,
               last_error = ${error}
             WHERE effect_id = ${effectId}
               AND status = 'running'
@@ -773,12 +836,13 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           DateTime.subtractDuration(yield* DateTime.now, SETTLED_EFFECT_RETENTION),
         );
         // Each batch is its own statement, so a large backlog never holds the
-        // write lock for long and writers can commit between batches.
+        // write lock for long. SQLite otherwise prefers the claim index and
+        // scans retained settled rows even when nothing has expired.
         const deleteBatch = sql<{ readonly effect_id: string }>`
           DELETE FROM orchestration_v2_effect_outbox
           WHERE rowid IN (
             SELECT rowid
-            FROM orchestration_v2_effect_outbox
+            FROM orchestration_v2_effect_outbox INDEXED BY orchestration_v2_effect_outbox_settled_idx
             WHERE status IN ('succeeded', 'cancelled')
               AND completed_at < ${cutoff}
             LIMIT ${PRUNE_BATCH_SIZE}
@@ -790,7 +854,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           const deleted = (yield* deleteBatch).length;
           pruned += deleted;
           if (deleted < PRUNE_BATCH_SIZE) return pruned;
-          yield* Effect.yieldNow;
+          yield* Effect.sleep(Duration.millis(50));
         }
       }).pipe(
         Effect.mapError((cause) => new EffectOutboxError({ operation: "prune-settled", cause })),

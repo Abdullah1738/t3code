@@ -17,6 +17,9 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Request from "effect/Request";
+import * as RequestResolver from "effect/RequestResolver";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -25,6 +28,8 @@ import * as Semaphore from "effect/Semaphore";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
 
 import { replayAndBufferProjectedLiveEvents } from "./LiveStreamBudget.ts";
 import type { UnsequencedProjectEvent } from "../persistence/OrchestrationEventStore.ts";
@@ -69,6 +74,10 @@ export const EventSinkV2Error = Schema.Union([EventSinkWriteError, EventSinkStre
 export type EventSinkV2Error = typeof EventSinkV2Error.Type;
 
 export interface EventSinkV2Shape {
+  /** Publish an already-committed maintenance rewrite to application and live thread subscribers. */
+  readonly publishCommitted: (
+    events: ReadonlyArray<OrchestrationV2StoredEvent>,
+  ) => Effect.Effect<void>;
   readonly write: (input: {
     /** Restate still-bound canonical session rows inside the write transaction. */
     readonly refreshBoundProviderSessions?: true;
@@ -99,6 +108,7 @@ export interface EventSinkV2Shape {
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
   readonly writeIfRunCurrent: (input: {
+    readonly unlessClaudeRefused?: ProviderThreadId;
     readonly guardPendingUserInputCancellations?: boolean;
     readonly commandId?: CommandId;
     readonly threadId: ThreadId;
@@ -219,6 +229,18 @@ export class EventSinkV2 extends Context.Service<EventSinkV2, EventSinkV2Shape>(
   "t3/orchestration-v2/EventSink/EventSinkV2",
 ) {}
 
+// Only ordinary writes join a batch. Conditional and acknowledged commands keep
+// their own transaction, and callers already in a transaction stay on its connection.
+const WriteBatch = Context.Reference<
+  { readonly publications: Array<Effect.Effect<void>> } | undefined
+>("t3/orchestration-v2/EventSink/WriteBatch", { defaultValue: () => undefined });
+
+interface QueuedWrite extends Request.Request<ReadonlyArray<OrchestrationV2StoredEvent>, unknown> {
+  readonly isCancelled: () => boolean;
+  readonly input: Parameters<EventSinkV2Shape["writeWithEffects"]>[0];
+}
+const QueuedWrite = Request.of<QueuedWrite>();
+
 type WritePhase = "normalize" | "append" | "project" | "outbox" | "lane_wait";
 
 interface WriteTiming {
@@ -281,7 +303,12 @@ const layerBase: Layer.Layer<
       events: ReadonlyArray<{ readonly type: string }>,
       transaction: (timing: WriteTiming) => Effect.Effect<A, E, R>,
       publish: (committed: A) => Effect.Effect<void>,
+      acceptance?: {
+        readonly check: () => boolean;
+        readonly prepare: (value: A) => () => void;
+      },
     ) {
+      const batch = yield* WriteBatch;
       const clock = yield* Clock.Clock;
       const now = () => clock.monotonicTimeNanosUnsafe();
       const elapsed = (start: bigint) => Number(now() - start) / 1_000_000;
@@ -356,35 +383,58 @@ const layerBase: Layer.Layer<
         );
       });
       const started = performance.now();
-      return yield* sql
-        .withTransaction(
-          Effect.suspend(() => {
-            txStart = now();
-            return Effect.tap(transaction(timing), () => takeLane);
-          }),
-        )
-        .pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              // Capture before restoring scheduler yields, so a descheduled reporter cannot
-              // inflate the writer hold. db.lock_wait_ms already records acquisition.
-              txMs = txStart === undefined ? 0 : elapsed(txStart);
+      let accepted: (() => void) | undefined;
+      const body = Effect.suspend(() => {
+        txStart = now();
+        return transaction(timing).pipe(
+          Effect.tap(() => (batch === undefined ? takeLane : Effect.void)),
+          Effect.tap((value) =>
+            Effect.suspend(() => {
+              // The lane wait is masked. A timed-out sender must roll back when it resumes.
+              if (acceptance !== undefined && !acceptance.check()) return Effect.interrupt;
+              return Effect.sync(() => {
+                accepted = acceptance?.prepare(value);
+              });
             }),
           ),
-          // Keep synchronous writer work from yielding behind the saturated run queue.
-          // A real wait (including the publish lane) still suspends.
-          Effect.provideService(Scheduler.PreventSchedulerYield, true),
-          Effect.tap(() =>
-            Effect.annotateCurrentSpan(
-              "orchestration_v2.transaction_ms",
-              Math.round(performance.now() - started),
-            ),
-          ),
-          // Diagnostics must not suppress publication after a successful commit.
-          Effect.ensuring(report.pipe(Effect.ignoreCause)),
-          Effect.tap(publish),
-          Effect.ensuring(Effect.suspend(() => (holdsLane ? publishLane.release(1) : Effect.void))),
         );
+      });
+      return yield* (batch === undefined ? sql.withTransaction(body) : body).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            // Capture before restoring scheduler yields, so a descheduled reporter cannot
+            // inflate the writer hold. db.lock_wait_ms already records acquisition.
+            txMs = txStart === undefined ? 0 : elapsed(txStart);
+          }),
+        ),
+        // Keep synchronous writer work from yielding behind the saturated run queue.
+        // A real wait (including the publish lane) still suspends.
+        Effect.provideService(Scheduler.PreventSchedulerYield, true),
+        Effect.provideService(
+          NodeSqliteClient.TransactionCommitObserver,
+          acceptance === undefined
+            ? undefined
+            : () => {
+                accepted?.();
+              },
+        ),
+        Effect.tap(() =>
+          Effect.annotateCurrentSpan(
+            "orchestration_v2.transaction_ms",
+            Math.round(performance.now() - started),
+          ),
+        ),
+        // Diagnostics must not suppress publication after a successful commit.
+        Effect.ensuring(report.pipe(Effect.ignoreCause)),
+        Effect.tap((value) =>
+          batch === undefined
+            ? publish(value)
+            : Effect.sync(() => {
+                batch.publications.push(publish(value));
+              }),
+        ),
+        Effect.ensuring(Effect.suspend(() => (holdsLane ? publishLane.release(1) : Effect.void))),
+      );
     });
 
     // A user can answer after terminal normalization reads the pending request.
@@ -434,6 +484,15 @@ const layerBase: Layer.Layer<
       });
 
     const normalizeEvents = (events: ReadonlyArray<OrchestrationV2DomainEvent>) => {
+      const providerSessions = new Map<
+        ProviderThreadId,
+        {
+          native_id: string | null;
+          instance_id: string;
+          driver: string;
+          refused: number;
+        }
+      >();
       const runOrdinals = new Map(
         events.flatMap((event) =>
           event.type === "run.created" || event.type === "run.updated"
@@ -444,14 +503,64 @@ const layerBase: Layer.Layer<
       return Effect.forEach(
         events,
         (event): Effect.Effect<OrchestrationV2DomainEvent, unknown> =>
-          event.type === "turn-item.updated"
-            ? turnItemPositions
-                .normalize(
-                  event.payload,
-                  event.payload.runId === null ? undefined : runOrdinals.get(event.payload.runId),
-                )
-                .pipe(Effect.map((payload) => ({ ...event, payload })))
-            : Effect.succeed(event),
+          Effect.gen(function* () {
+            if (event.type === "provider-thread.updated") {
+              const incoming = event.payload;
+              if (incoming.driver !== "claudeAgent") {
+                providerSessions.set(incoming.id, {
+                  native_id: incoming.nativeThreadRef?.nativeId ?? null,
+                  instance_id: incoming.providerInstanceId,
+                  driver: incoming.driver,
+                  refused: 0,
+                });
+                return event;
+              }
+              const prior =
+                providerSessions.get(incoming.id) ??
+                (yield* sql<{
+                  native_id: string | null;
+                  instance_id: string;
+                  driver: string;
+                  refused: number;
+                }>`SELECT
+              json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_id,
+              provider_instance_id AS instance_id, driver,
+              COALESCE(json_extract(payload_json, '$.nativeMetadata.claudeRefusalObserved'), 0) AS refused
+              FROM orchestration_v2_projection_provider_threads
+              WHERE provider_thread_id = ${incoming.id} LIMIT 1`)[0];
+              const nativeId = incoming.nativeThreadRef?.nativeId ?? null;
+              // A queued pre-refusal snapshot must not erase durable history for
+              // the same native Claude session. A new native identity starts fresh.
+              const preserve =
+                incoming.driver === "claudeAgent" &&
+                nativeId !== null &&
+                prior?.driver === incoming.driver &&
+                prior.instance_id === incoming.providerInstanceId &&
+                prior.native_id === nativeId &&
+                prior.refused === 1;
+              const payload = preserve
+                ? {
+                    ...incoming,
+                    nativeMetadata: { ...incoming.nativeMetadata, claudeRefusalObserved: true },
+                  }
+                : incoming;
+              providerSessions.set(incoming.id, {
+                native_id: nativeId,
+                instance_id: incoming.providerInstanceId,
+                driver: incoming.driver,
+                refused: payload.nativeMetadata?.claudeRefusalObserved === true ? 1 : 0,
+              });
+              return { ...event, payload };
+            }
+            return event.type === "turn-item.updated"
+              ? yield* turnItemPositions
+                  .normalize(
+                    event.payload,
+                    event.payload.runId === null ? undefined : runOrdinals.get(event.payload.runId),
+                  )
+                  .pipe(Effect.map((payload) => ({ ...event, payload })))
+              : event;
+          }),
         { concurrency: 1 },
       );
     };
@@ -494,8 +603,9 @@ const layerBase: Layer.Layer<
         }
       });
 
-    const writeEffect = Effect.fn("orchestrationV2.EventSink.write")(function* (
+    const writeDirect = Effect.fn("orchestrationV2.EventSink.write")(function* (
       input: Parameters<EventSinkV2Shape["writeWithEffects"]>[0],
+      isCancelled?: () => boolean,
     ) {
       yield* Effect.annotateCurrentSpan({
         "orchestration_v2.command_id": input.commandId ?? null,
@@ -648,6 +758,112 @@ const layerBase: Layer.Layer<
             }
             yield* publishStoredEvents(storedEvents);
           }),
+        isCancelled === undefined
+          ? undefined
+          : {
+              check: () => !isCancelled(),
+              prepare: () => () => {},
+            },
+      );
+    });
+
+    const writeResolver = RequestResolver.makeWith<QueuedWrite>({
+      batchKey: () => undefined,
+      // A real event-loop turn collects independent fibers without a wall-clock
+      // delay or a TestClock dependency. Serial callers still await durability.
+      delay: Effect.callback<void>((resume) => {
+        const handle = setImmediate(() => resume(Effect.void));
+        return Effect.sync(() => clearImmediate(handle));
+      }),
+      collectWhile: (entries) => entries.size < 100,
+      runAll: (entries) => {
+        const direct = (entry: Request.Entry<QueuedWrite>) =>
+          (entry.request.isCancelled()
+            ? Effect.interrupt
+            : writeDirect(entry.request.input, entry.request.isCancelled)
+          ).pipe(Effect.provideContext(entry.context));
+        if (entries.length === 1)
+          return Effect.exit(direct(entries[0]!)).pipe(
+            Effect.tap((exit) => Effect.sync(() => entries[0]!.completeUnsafe(exit))),
+            Effect.asVoid,
+          );
+        return Effect.gen(function* () {
+          const publications: Array<Effect.Effect<void>> = [];
+          let holdsLane = false;
+          const committed = yield* sql
+            .withTransaction(
+              Effect.gen(function* () {
+                const transactionContext = yield* Effect.context<never>();
+                const connection = Context.getUnsafe(transactionContext, sql.transactionService);
+                const results = yield* Effect.forEach(entries, (entry) =>
+                  writeDirect(entry.request.input, entry.request.isCancelled).pipe(
+                    // Keep the transaction's private savepoint semaphore while restoring
+                    // caller references. Every statement stays on this batch's writer.
+                    Effect.provideContext(
+                      Context.add(
+                        Context.add(
+                          Context.merge(transactionContext, entry.context),
+                          sql.transactionService,
+                          connection,
+                        ),
+                        WriteBatch,
+                        { publications },
+                      ),
+                    ),
+                  ),
+                );
+                yield* publishLane.take(1);
+                holdsLane = true;
+                if (entries.some((entry) => entry.request.isCancelled()))
+                  return yield* Effect.interrupt;
+                return results;
+              }),
+            )
+            .pipe(Effect.provideService(Scheduler.PreventSchedulerYield, true), Effect.exit);
+          if (Exit.isFailure(committed)) {
+            if (holdsLane) yield* publishLane.release(1);
+            // The whole speculative batch rolled back. Retry in admission order,
+            // giving each caller its own error and retaining later successful writes.
+            for (const entry of entries) entry.completeUnsafe(yield* Effect.exit(direct(entry)));
+            return;
+          }
+          yield* Effect.forEach(entries, (entry, index) =>
+            Effect.gen(function* () {
+              const published = yield* Effect.exit(publications[index]!);
+              entry.completeUnsafe(
+                Exit.isFailure(published)
+                  ? Exit.failCause(published.cause)
+                  : Exit.succeed(committed.value[index]!),
+              );
+            }),
+          ).pipe(Effect.ensuring(publishLane.release(1)));
+        }).pipe(
+          Effect.withSpan("orchestrationV2.EventSink.batch", {
+            attributes: { "orchestration_v2.batch_size": entries.length },
+          }),
+          // Once admitted, a caller leaving must not strand committed publication
+          // or cancel the other callers sharing its transaction.
+          Effect.uninterruptible,
+        );
+      },
+    });
+    // The direct operation owns the per-write phase span.
+    const writeEffect = Effect.fnUntraced(function* (
+      input: Parameters<EventSinkV2Shape["writeWithEffects"]>[0],
+    ) {
+      if (Option.isSome(yield* Effect.serviceOption(sql.transactionService))) {
+        return yield* writeDirect(input);
+      }
+      let cancelled = false;
+      return yield* Effect.request(
+        QueuedWrite({ input, isCancelled: () => cancelled }),
+        writeResolver,
+      ).pipe(
+        Effect.onInterrupt(() =>
+          Effect.sync(() => {
+            cancelled = true;
+          }),
+        ),
       );
     });
 
@@ -686,6 +902,16 @@ const layerBase: Layer.Layer<
                   committed: false as const,
                   storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
                 };
+              }
+
+              if (input.unlessClaudeRefused !== undefined) {
+                const refused = yield* sql`SELECT provider_thread_id
+                  FROM orchestration_v2_projection_provider_threads
+                  WHERE provider_thread_id = ${input.unlessClaudeRefused}
+                    AND driver = 'claudeAgent'
+                    AND json_extract(payload_json, '$.nativeMetadata.claudeRefusalObserved') = 1
+                  LIMIT 1`;
+                if (refused.length > 0) return { committed: false as const, storedEvents: [] };
               }
 
               const normalized = yield* timing.measure(
@@ -840,6 +1066,8 @@ const layerBase: Layer.Layer<
     const commitCommandEffect = Effect.fn("orchestrationV2.EventSink.commitCommand")(function* (
       input: Parameters<EventSinkV2Shape["commitCommand"]>[0],
     ) {
+      const observer = yield* SendAcknowledgement.command;
+      const acceptance = observer?.id === input.commandId ? observer : undefined;
       const result = yield* commitThenPublish(
         input.events,
         (timing) =>
@@ -905,6 +1133,25 @@ const layerBase: Layer.Layer<
             }
             if (result.committed) yield* publishStoredEvents(result.storedEvents);
           }),
+        acceptance === undefined
+          ? undefined
+          : {
+              check: acceptance.check,
+              prepare: (result) => {
+                // Another thread can win the command-id reservation after planning.
+                // The orchestrator checks the receipt before returning its refusal.
+                if (
+                  result.receipt.threadId !== input.threadId ||
+                  result.receipt.status !== "accepted" ||
+                  result.receipt.commandType !== input.commandType
+                )
+                  return () => {};
+                const reply = acceptance.result(result.storedEvents);
+                if (reply === undefined)
+                  throw new Error("Message commit has no acknowledgement result.");
+                return () => acceptance.accept(reply);
+              },
+            },
       );
       return {
         receipt: result.receipt,
@@ -917,26 +1164,29 @@ const layerBase: Layer.Layer<
     const commitRejectedCommandEffect = Effect.fn(
       "orchestrationV2.EventSink.commitRejectedCommand",
     )(function* (input: Parameters<EventSinkV2Shape["commitRejectedCommand"]>[0]) {
-      return yield* sql.withTransaction(
-        Effect.gen(function* () {
-          const sequence = yield* eventStore.latestSequence({ threadId: input.threadId });
-          const receipt: CommandReceiptStore.CommandReceiptV2 = {
-            commandId: input.commandId,
-            threadId: input.threadId,
-            commandType: input.commandType,
-            acceptedAt: input.rejectedAt,
-            resultSequence: sequence,
-            status: "rejected",
-            error: input.error,
-          };
-          const inserted = yield* commandReceipts.insertIfAbsent(receipt);
-          if (inserted) {
-            return receipt;
-          }
-          const existing = yield* commandReceipts.getByCommandId(input.commandId);
-          return Option.getOrElse(existing, () => receipt);
-        }),
-      );
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const sequence = yield* eventStore.latestSequence({ threadId: input.threadId });
+            const receipt: CommandReceiptStore.CommandReceiptV2 = {
+              commandId: input.commandId,
+              threadId: input.threadId,
+              commandType: input.commandType,
+              acceptedAt: input.rejectedAt,
+              resultSequence: sequence,
+              status: "rejected",
+              error: input.error,
+            };
+            const inserted = yield* commandReceipts.insertIfAbsent(receipt);
+            yield* SendAcknowledgement.check(input.commandId);
+            if (inserted) {
+              return receipt;
+            }
+            const existing = yield* commandReceipts.getByCommandId(input.commandId);
+            return Option.getOrElse(existing, () => receipt);
+          }),
+        )
+        .pipe(Effect.provideService(Scheduler.PreventSchedulerYield, true));
     });
 
     const existingProjectReceipt = (commandId: CommandId) =>
@@ -1093,6 +1343,9 @@ const layerBase: Layer.Layer<
     };
 
     return EventSinkV2.of({
+      publishCommitted: Effect.fn("orchestrationV2.EventSink.publishCommitted")((events) =>
+        publishLane.withPermit(publishStoredEvents(events)).pipe(Effect.uninterruptible),
+      ),
       write: (input) =>
         writeEffect({ ...input, effects: [] }).pipe(
           Effect.mapError(

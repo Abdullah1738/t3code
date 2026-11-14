@@ -9,7 +9,9 @@ import {
   PULL_REQUEST_WATCH_WAKE_LIMIT,
   evaluatePullRequestWatch,
   pullRequestWatchMessage,
+  refreshPullRequestCheckWake,
 } from "./pullRequestWatch.ts";
+import greenRollups from "./fixtures/crpko-green-rollups.json" with { type: "json" };
 
 const STARTED = "2026-10-02T12:00:00.000Z";
 
@@ -71,6 +73,232 @@ const frontendRequired = [
 ].map((name) => ({ ...check(name, "success"), required: true }));
 
 describe("evaluatePullRequestWatch", () => {
+  it("evaluates a lagging PR record at the branch head after the settling bound", () => {
+    const failed = check("aggregate", "failure");
+    const lagging = detail({
+      headSha: "aaaaaaaaaa",
+      headBranchSha: "bbbbbbbbbb",
+      checksHeadSha: "bbbbbbbbbb",
+      checks: [failed],
+    });
+    const before = watch({ headSha: "aaaaaaaaaa", failedChecks: ["aggregate"] });
+    assert.deepEqual(evaluatePullRequestWatch(before, lagging, noRemarks).changes, []);
+    const current = evaluatePullRequestWatch(before, lagging, noRemarks, true);
+    assert.equal(current.next.headSha, "bbbbbbbbbb");
+    assert.deepEqual(current.changes, [{ kind: "checks-failed", failed: [failed] }]);
+    assert.deepEqual(evaluatePullRequestWatch(current.next, lagging, noRemarks, true).changes, []);
+  });
+
+  it("leaves an obsolete rollup unevaluated after advancing the bounded checkpoint", () => {
+    const old = detail({
+      headSha: "bbbbbbbbbb",
+      headBranchSha: "bbbbbbbbbb",
+      checksHeadSha: "aaaaaaaaaa",
+      checks: [check("aggregate", "failure")],
+    });
+    const current = evaluatePullRequestWatch(
+      watch({ headSha: "aaaaaaaaaa", failedChecks: ["aggregate"] }),
+      old,
+      noRemarks,
+      true,
+    );
+    assert.equal(current.next.headSha, "bbbbbbbbbb");
+    assert.deepEqual(current.next.failedChecks, []);
+    assert.deepEqual(current.changes, []);
+    const matched = { ...old, checksHeadSha: "bbbbbbbbbb" };
+    assert.equal(
+      evaluatePullRequestWatch(current.next, matched, noRemarks).changes[0]?.kind,
+      "checks-failed",
+    );
+  });
+
+  it.each(
+    (
+      [
+        { status: "failure", required: false },
+        { status: "cancelled", required: false },
+        { status: "action-required", required: false },
+        { status: "success", required: true },
+        { status: "success", required: false },
+      ] as const
+    ).flatMap((verdict) => [false, true].map((returnSettling) => ({ ...verdict, returnSettling }))),
+  )(
+    "reports $status again once when the observed head returns during settling (required=$required, lag=$returnSettling)",
+    ({ status, required, returnSettling }) => {
+      const checks = [{ ...check("aggregate", status), required }];
+      const settled = detail({
+        headSha: "aaaaaaaaaa",
+        headBranchSha: "aaaaaaaaaa",
+        checksHeadSha: "aaaaaaaaaa",
+        checks,
+      });
+      const initial = evaluatePullRequestWatch(watch(), settled, noRemarks).next;
+      const onA = evaluatePullRequestWatch(initial, settled, noRemarks).next;
+      const away = evaluatePullRequestWatch(
+        onA,
+        { ...settled, headBranchSha: "bbbbbbbbbb" },
+        noRemarks,
+      );
+      assert.deepEqual(away.changes, []);
+      assert.equal(away.next.headSha, onA.headSha);
+      const returned = evaluatePullRequestWatch(
+        away.next,
+        returnSettling ? { ...settled, headSha: "bbbbbbbbbb" } : settled,
+        noRemarks,
+      );
+      const confirmed = evaluatePullRequestWatch(returned.next, settled, noRemarks);
+      const next = evaluatePullRequestWatch(confirmed.next, settled, noRemarks);
+      const changes = [...returned.changes, ...confirmed.changes, ...next.changes];
+      if (returnSettling) assert.deepEqual(returned.changes, []);
+      assert.lengthOf(changes, 1);
+      assert.equal(changes[0]!.kind, status === "success" ? "checks-passed" : "checks-failed");
+      if (status === "success" && !required) {
+        assert.deepEqual(returned.changes, []);
+        assert.isFalse(returned.next.passed);
+      }
+      assert.deepEqual(evaluatePullRequestWatch(next.next, settled, noRemarks).changes, []);
+    },
+  );
+
+  it("compares the full persisted head even when abbreviated SHAs collide", () => {
+    const headA = "abcdef0123456789";
+    const headB = "abcdef0987654321";
+    const report = evaluatePullRequestWatch(
+      watch(),
+      detail({ headSha: headA, checks: [check("aggregate", "failure")] }),
+      noRemarks,
+    );
+    const wake = pullRequestWatchMessage({
+      number: 1,
+      url: "https://github.com/o/r/pull/1",
+      baseBranch: "main",
+      headSha: headA,
+      report,
+    });
+    assert.isNull(
+      refreshPullRequestCheckWake(wake, [
+        { url: "https://github.com/o/r/pull/1", watch: watch({ headSha: headB }) } as never,
+      ]),
+    );
+  });
+
+  it.each([false, true])("removes only obsolete checks from a mixed wake (legacy=%s)", (legacy) => {
+    const report = evaluatePullRequestWatch(
+      watch(),
+      detail({ checks: [check("aggregate", "failure")] }),
+      [remark("reviewer", "2026-10-02T12:01:00.000Z")],
+    );
+    const wake = pullRequestWatchMessage({
+      number: 1,
+      url: "https://github.com/o/r/pull/1",
+      baseBranch: "main",
+      headSha: "aaaaaaaaaa",
+      report,
+    });
+    if (legacy) {
+      const notification = { ...wake.notification };
+      delete notification.pullRequestWatch;
+      Object.assign(wake, { notification });
+    }
+    const refreshed = refreshPullRequestCheckWake(wake, [
+      { url: "https://github.com/o/r/pull/1", watch: watch({ headSha: "bbbbbbbbbb" }) } as never,
+    ]);
+    assert.isOk(refreshed);
+    assert.notInclude(refreshed!.text, "Checks failed");
+    assert.include(refreshed!.text, "Please rename this");
+    assert.equal(refreshed!.notification.summary, "#1: new comments");
+    assert.equal(refreshed!.notification.outcome, "updated");
+  });
+
+  it.each(
+    [
+      { headSha: "aaaaaaaaaa", headBranchSha: "aaaaaaaaaa", observed: "aaaaaaaaaa" },
+      { headSha: "bbbbbbbbbb", headBranchSha: "aaaaaaaaaa", observed: "aaaaaaaaaa" },
+      { headSha: undefined, headBranchSha: "aaaaaaaaaa", observed: "aaaaaaaaaa" },
+      { headSha: "aaaaaaaaaa", headBranchSha: "bbbbbbbbbb", observed: "bbbbbbbbbb" },
+      { headSha: "bbbbbbbbbb", headBranchSha: "bbbbbbbbbb", observed: "bbbbbbbbbb" },
+      { headSha: undefined, headBranchSha: "bbbbbbbbbb", observed: "bbbbbbbbbb" },
+      { headSha: "aaaaaaaaaa", headBranchSha: null, observed: "aaaaaaaaaa" },
+      { headSha: "bbbbbbbbbb", headBranchSha: null, observed: "bbbbbbbbbb" },
+      { headSha: undefined, headBranchSha: null, observed: null },
+    ].flatMap((heads) =>
+      ["aaaaaaaaaa", "bbbbbbbbbb", null].map((checksHeadSha) => ({ ...heads, checksHeadSha })),
+    ),
+  )(
+    "observed head follows the source branch, then PR record, independently of checks ($headSha/$headBranchSha/$checksHeadSha)",
+    ({ observed, ...heads }) => {
+      const report = evaluatePullRequestWatch(
+        watch({ headSha: "aaaaaaaaaa" }),
+        detail({ ...heads, checks: [] }),
+        noRemarks,
+      );
+      assert.strictEqual(report.next.observedHeadSha, observed);
+    },
+  );
+
+  it.each([
+    {
+      headSha: "bbbbbbbbbb",
+      headBranchSha: "bbbbbbbbbb",
+      checksHeadSha: "aaaaaaaaaa",
+      observed: "bbbbbbbbbb",
+    },
+    {
+      headSha: "aaaaaaaaaa",
+      headBranchSha: "bbbbbbbbbb",
+      checksHeadSha: "aaaaaaaaaa",
+      observed: "bbbbbbbbbb",
+    },
+    {
+      headSha: "bbbbbbbbbb",
+      headBranchSha: null,
+      checksHeadSha: "aaaaaaaaaa",
+      observed: "bbbbbbbbbb",
+    },
+    {
+      headSha: undefined,
+      headBranchSha: "bbbbbbbbbb",
+      checksHeadSha: "aaaaaaaaaa",
+      observed: "bbbbbbbbbb",
+    },
+    {
+      headSha: "aaaaaaaaaa",
+      headBranchSha: "aaaaaaaaaa",
+      checksHeadSha: "bbbbbbbbbb",
+      observed: "aaaaaaaaaa",
+    },
+  ])(
+    "records the observed head while preserving the CI checkpoint ($headSha/$headBranchSha/$checksHeadSha)",
+    ({ observed, ...heads }) => {
+      const before = watch({ headSha: "aaaaaaaaaa", passed: true, passedChecks: ["test"] });
+      const report = evaluatePullRequestWatch(before, detail({ ...heads, checks: [] }), noRemarks);
+      assert.strictEqual(report.next.headSha, before.headSha);
+      assert.strictEqual(report.next.observedHeadSha, observed);
+      assert.strictEqual(report.next.passed, before.passed);
+      assert.deepEqual(report.next.passedChecks, before.passedChecks);
+      assert.deepEqual(report.changes, []);
+    },
+  );
+
+  it.each(greenRollups)("confirms PR $number's complete ungated head rollup once", (rollup) => {
+    const green = detail({
+      headSha: rollup.headSha,
+      headBranchSha: rollup.headSha,
+      checksHeadSha: rollup.headSha,
+      checks: rollup.checks.map(([name, conclusion]) => ({
+        ...check(name!, conclusion === "skipped" ? "skipped" : "success"),
+        required: false,
+      })),
+    });
+    const first = evaluatePullRequestWatch(watch(), green, noRemarks);
+    assert.deepEqual(first.changes, []);
+    const confirmed = evaluatePullRequestWatch(first.next, green, noRemarks);
+    assert.deepEqual(confirmed.changes, [
+      { kind: "checks-passed", count: rollup.checks.length, required: false },
+    ]);
+    assert.deepEqual(evaluatePullRequestWatch(confirmed.next, green, noRemarks).changes, []);
+  });
+
   it("holds PR 1571's required green while its test shards are pending, then wakes once", () => {
     const pending = detail({
       headSha: "d1f7fff87a6c38e3235f45d2a16ccafbe3cf0aab",
@@ -633,6 +861,7 @@ describe("pullRequestWatchMessage", () => {
     assert.include(message.text, "unwatch_pull_request");
     assert.deepEqual(message.notification, {
       source: { kind: "monitor" },
+      pullRequestWatch: { url: "https://github.com/o/r/pull/12", headSha: "aaaaaaaaaa" },
       outcome: "failed",
       summary: "#12: checks failed, new comments",
     });

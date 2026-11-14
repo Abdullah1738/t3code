@@ -4,6 +4,7 @@ The coordinator is exercised with injected transports. Recovery uses only exact
 session/order/intent reads and never calls a financial writer. No secret is
 persisted: intent and selected-card bindings are hashes.
 """
+import toollog
 import fcntl
 import json
 import os
@@ -153,6 +154,7 @@ class Coordinator:
     def _observe_unknown(self, operation):
         j.observe(self.flow_id,operation,outcome='UNKNOWN',evidence_hash=j.digest({'operation':operation,'outcome':'unknown'}))
 
+    @toollog.timed('commerce', 'step.payment_submit', lane="food")
     def place(self):
         def action():
             self.transport.assert_enabled()  # Gate before reads, reservation or journal consumption.
@@ -204,6 +206,7 @@ class Coordinator:
             state['intent_hash']=digest;self.save(state)
         return row
 
+    @toollog.timed('commerce', 'step.payment_submit', lane="food")
     def complete_payment(self, *, cvv_encryption=None):
         require(not isinstance(self.transport, AutomaticTransport), 'FOOD_NEEDS_APP_PAYMENT_REQUIREMENT')
         def action():
@@ -229,7 +232,8 @@ class Coordinator:
         return self.locked(action)
 
     def recover(self):
-        return self.locked(self._recover_report)
+        with toollog.deferred():
+            return self.locked(self._recover_report)
 
     def _recover_report(self):
         try:
@@ -244,6 +248,7 @@ class Coordinator:
                 'tell':'Placement was sent and may have charged the card. Do not place another order.',
                 'next':[f'commerce recover-payment {self.flow_id} (reads only; never resends)']}) from None
 
+    @toollog.timed('commerce', 'step.confirmation', lane="food")
     def _recover(self):
         state=json.loads(self.path.read_text());local=j.inspect(self.flow_id)
         candidate=local.get('order_id') or state.get('candidate_order_id')

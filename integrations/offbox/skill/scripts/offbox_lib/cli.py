@@ -5,11 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import time
 
+import toollog
+
 from . import common
-from .common import (EXIT_BUSY, EXIT_CAP, EXIT_HOME_DOWN, EXIT_INFRA, SIZES, TEMPLATES, OffboxError, db, log, new_id, now,
+from .common import (EXIT_BUSY, EXIT_CAP, EXIT_HOME_DOWN, EXIT_INFRA, SIZES, TEMPLATES, OffboxError, db, local_error, log, new_id, now,
                      say)
 
 HELP = """offbox: run heavy work (tests, installs, docker) off the Mac: on the home offbox server when one is set up
@@ -17,17 +20,19 @@ and up, else on a boat.dev VM.
   offbox run [opts] -- <cmd...>     sync repo, run in the same relative dir, stream, exit with its code
   offbox run [opts] --step 'CMD' [--step 'CMD' ...]   each step runs with pipefail; per-step rc; first nonzero rc wins
   offbox logs <run> [--follow] | wait <run> [--timeout S]     for --bg runs; also a run another shell follows
-  offbox kill <run>                 stop a hung starting/running box run (confirmed on boat), then release works
+  offbox kill <run>                 stop your box run, or cancel it while queued or still syncing/starting
   offbox save [--name N] [--default] [--note ..] | bases | base rm N | keep [--days N]
   offbox local --reason ".." [--ttl 2h] | --list | --clear
   offbox list [--all] | release [<id>|--mine] [--delete] | ssh [<id>] [-- cmd] | ports <port> [--local N] [--reverse]
+  offbox exec [<id>] [--timeout N] [--cwd DIR] [--json] -- <cmd...>   owner-checked control API, no SSH
   offbox spend [--json] [--check] | reap [--dry-run] | status | whoami | template build <name> | template list
 Light Go checks (single-package go test -run, go vet of 1-3 packages, gofmt -l) run on this Mac in a sandbox;
 --remote forces the box.
 Exit codes: the command's code (last stderr line: "offbox: remote exit N" or "offbox: local exit N"); 90 infra/start-limit
-failure; 91 spend cap; 92 pool busy for the whole queue wait (nothing ran; retry). Only small commands may fall back locally.
+failure; 91 spend cap; 92 pool busy for the whole queue wait (nothing ran; retry). Only small commands may fall back locally after 90/91/92.
 With a home server: 93 a person's task while the home server is down (it waits; never sent to Boat; nothing ran);
 94 the home server restarted under the run and it was not run again (--no-retry, a person's task, or already retried once).
+96 local state failure (no local fallback); 100 queued client ended before getting a box (nothing ran, safe to rerun).
 95 Robob restarted: the remote run detached and keeps going (offbox wait <run-id>)."""
 
 
@@ -57,6 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="repeatable: run each CMD in order with pipefail; reports per-step rc and exits with the first nonzero rc")
     r.add_argument("cmd", nargs=argparse.REMAINDER)
 
+    lr = sp.add_parser("log-rollup", help="roll up shared tool logs for a UTC day")
+    lr.add_argument("--day", metavar="YYYY-MM-DD")
+
     lg = sp.add_parser("logs")
     lg.add_argument("run_id")
     lg.add_argument("--follow", "-f", action="store_true")
@@ -74,7 +82,9 @@ def build_parser() -> argparse.ArgumentParser:
     li = sp.add_parser("list")
     li.add_argument("--all", action="store_true")
     li.add_argument("--json", action="store_true")
-    kl = sp.add_parser("kill", help="stop a hung box run by run id")
+    kl = sp.add_parser("kill", help="stop your box run, including while queued or still syncing/starting",
+                       description="Stop your box run, or cancel it before its command starts while queued for "
+                                   "a box or still syncing/starting on one.")
     kl.add_argument("run_id")
     rl = sp.add_parser("release")
     rl.add_argument("box_id", nargs="?")
@@ -83,6 +93,12 @@ def build_parser() -> argparse.ArgumentParser:
     sh = sp.add_parser("ssh")
     sh.add_argument("box_id", nargs="?")
     sh.add_argument("cmd", nargs=argparse.REMAINDER)
+    ex = sp.add_parser("exec", help="run on your box through the control API, without SSH",
+                       usage="offbox exec [box_id] [--timeout N] [--cwd DIR] [--json] -- <command...>")
+    ex.add_argument("--timeout", type=int, default=60, metavar="N", help="seconds (default: 60; clamped to 1..600)")
+    ex.add_argument("--cwd", metavar="DIR", help="working directory on the box")
+    ex.add_argument("--json", action="store_true", help="print the raw result dict")
+    ex.add_argument("cmd", nargs="*", metavar="box_id/command")
     po = sp.add_parser("ports")
     po.add_argument("remote_port", type=int)
     po.add_argument("--local", type=int)
@@ -107,11 +123,13 @@ def build_parser() -> argparse.ArgumentParser:
     sv.add_argument("--note")
     bs = sp.add_parser("bases")
     bs.add_argument("--json", action="store_true")
+    bs.add_argument("--all", action="store_true", help="include expired bases")
     b = sp.add_parser("base")
     b.add_argument("action", choices=["rm"])
     b.add_argument("name")
     k = sp.add_parser("keep", help="pin this lease so the reaper never deletes it")
     k.add_argument("--days", type=float, default=30)
+    k.add_argument("--box", help="clear your pin on a previous box (with --days 0)")
 
     t = sp.add_parser("template")
     t.add_argument("action", choices=["build", "list"])
@@ -120,12 +138,26 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def parse_args(argv: list[str]):
+    # Parse exec's options before its separator, including options after a box ID. The shell command after it
+    # is opaque: flags there belong to the remote program, even when they look like offbox's own options.
+    p = build_parser()
+    if argv[:1] == ["exec"] and "--" in argv:
+        separator = argv.index("--")
+        a = p.parse_args(argv[:separator])
+        a.cmd.extend(argv[separator + 1:])
+        return a
+    return p.parse_args(argv)
+
+
 def _remote_once(a, me) -> int:
     from . import runs
     try:
         return runs.run_remote(a, me)
     except (OffboxError, KeyboardInterrupt):
         raise
+    except sqlite3.Error as error:
+        raise local_error(error) from error
     except Exception as e:  # noqa: BLE001  unexpected bug/network error: treat as infra, keep fallback working
         import traceback
         log("run crashed: " + traceback.format_exc()[-2000:])
@@ -143,7 +175,31 @@ def _outage_wait_applies(a, e: OffboxError) -> bool:
     return not fallback.allowed(a.cmd, e, os.getcwd())
 
 
+def _log_request(a, me):
+    backend = "home" if common.backend() == "server" else "boat"
+    reason = "boat_only_base" if common._BACKEND_REASON == "boat-only-base" else "unreachable" if os.environ.get("OFFBOX_FAILOVER") else "pinned" if common.backend_pinned() else "home_up" if backend == "home" else "home_down" if common.standby() else "boat_only"
+    props = dict(repo=toollog.repo_id(me.get("repo_key", me["repo_root"])), backend=backend, reason=reason,
+                 size=a.size, sizeGiven=bool(a.size), baseGiven=bool(a.base), templateGiven=bool(a.template), bg=a.bg, noSync=a.no_sync, git=a.git, noFallback=a.no_fallback, noRetry=getattr(a, "no_retry", False),
+                 remote=a.remote, fresh=a.fresh, envCount=len(a.env), pullCount=len(a.pull),
+                 includeCount=len(getattr(a, "include", []) or []), stepCount=len(a.step), flagsCount=sum(bool(getattr(a, key, False)) for key in ("size", "base", "template", "bg", "no_sync", "git", "no_fallback", "no_retry", "remote", "fresh", "env", "pull", "include", "step")))
+    toollog.emit("run", "run.request", ids={"thread": me.get("thread")}, props=props)
+
+
 def cmd_run(a, me) -> int:
+    if not getattr(a, "log_requested", False):
+        _log_request(a, me)
+    a.log_fallback = False
+    with toollog.span("run", "run.invocation", ids={"thread": me.get("thread")}) as data:
+        code = _cmd_run(a, me)
+        data["ok"] = code == 0
+        data["props"].update(exitCode=code, fallback=a.log_fallback)
+        if code in (90, 91, 92, 93):
+            toollog.emit("run", "run.error", kind="error", ok=False, tag="exit_" + str(code),
+                         props={"exitCode": code, "reason": {90: "infra", 91: "cap", 92: "busy", 93: "person_home_down"}[code]})
+        return code
+
+
+def _cmd_run(a, me) -> int:
     from . import capacity, fallback, runs
     if a.cmd and a.cmd[0] == "--":
         a.cmd = a.cmd[1:]
@@ -157,17 +213,24 @@ def cmd_run(a, me) -> int:
     if not a.cmd:
         say("usage: offbox run [opts] -- <cmd...>  or  offbox run --step CMD [--step CMD ...]")
         return 2
+    if os.environ.get(runs.BACKGROUND_RUN_ENV):
+        return runs.background_client(a, me)
+    return _run_with_retries(a, me)
+
+
+def _run_with_retries(a, me) -> int:
+    from . import capacity, fallback, runs
     # No local-first lane any more (owner, 13 Nov 2026): it existed to save boat.dev minutes, and home boxes cost
     # nothing. Every `offbox run` goes to a box; --remote stays as "never fall back to the Mac".
     log("remote")
     from . import home
+    home.WAIT_STARTED = time.monotonic()
     if home.may_fail_over():
-        # One short look before any work: a home server that does not answer costs this run 3 s, not minutes.
-        down = home.probe()
-        if down:
-            home.fail_over(down, getattr(a, "argv", None) or sys.argv[1:])
-    elif home.on_standby() and not os.environ.get(home.FAILOVER_ENV):
+        home.before_run(getattr(a, "argv", None) or sys.argv[1:])
+    elif (home.on_standby() and not os.environ.get(home.FAILOVER_ENV)
+          and common._BACKEND_REASON != "boat-only-base"):
         st = common.home_state()
+        toollog.emit("backend", "backend.failover", duration_ms=0, ok=True, props={"from": "home", "to": "boat", "reason": "home_down", "waitMs": 0})
         say(f"home offbox server is down ({st.get('reason') or 'marked down by the health monitor'}); "
             "this run is on Boat")
     from . import api, outage, pool
@@ -175,6 +238,7 @@ def cmd_run(a, me) -> int:
     capacity_since = capacity_last_say = None
     capacity_round = None
     last_outage = None
+    reprobed = False
     try:
         while True:
             try:
@@ -194,6 +258,7 @@ def cmd_run(a, me) -> int:
                 with outage.allocation_budget(remaining):
                     return _remote_once(a, me)
             except OffboxError as e:
+                runs.retry_background(e)
                 if isinstance(e, pool.PoolBusyError) and waited_from is not None and last_outage is not None and \
                         time.monotonic() - waited_from >= outage.window_seconds() and not e.started:
                     raise last_outage
@@ -201,6 +266,10 @@ def cmd_run(a, me) -> int:
                     # Nothing was accepted by the home server. Ordinary work goes to Boat for this one run; a
                     # person's work waits for the home server; a pinned backend keeps today's waiting.
                     if home.may_fail_over():
+                        if not reprobed and not home.recent_failure() and home.network_failure(e):
+                            reprobed = True
+                            if api.probe_backend("server", home.PROBE_TIMEOUT_S) is None:
+                                continue
                         home.fail_over(str(e), getattr(a, "argv", None) or sys.argv[1:])
                     if common.person():
                         raise OffboxError(f"the home offbox server is down ({e}); {common.person()}'s tasks wait "
@@ -233,7 +302,7 @@ def cmd_run(a, me) -> int:
         if e.code not in (EXIT_INFRA, EXIT_CAP, EXIT_BUSY):
             say(str(e))
             return e.code
-        if e.code == EXIT_INFRA and not isinstance(e, capacity.CapacityError):
+        if e.code == EXIT_INFRA and not isinstance(e, capacity.CapacityError) and not api.client_budget_expired(e):
             fallback.note_infra_failure(str(e))
         if e.started:
             from .start_check import hint
@@ -258,13 +327,14 @@ def cmd_run(a, me) -> int:
                      " ".join(a.cmd)[:4000], now()))
         con.commit()
         why = {EXIT_CAP: "spend cap", EXIT_BUSY: "repository pool busy"}.get(e.code, "boat infra failure")
+        a.log_fallback = True
         code = fallback.run_local(a.cmd, f"{why}: {e}", rid)
         say(f"local fallback exit {code}")
         return code
 
 
 # Commands that never talk to a box: they work for a person's lease even while the home server is down.
-LOCAL_ONLY = ("whoami", "local", "list", "status", "spend", "stats", "reap", "bases")
+LOCAL_ONLY = ("whoami", "local", "list", "status", "spend", "stats", "reap", "bases", "log-rollup")
 
 
 def _reap_other_backend(dry_run: bool) -> None:
@@ -286,21 +356,49 @@ def _reap_other_backend(dry_run: bool) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    p = build_parser()
-    a = p.parse_args(argv)
+    name = argv[0] if argv else "help"
+    if name not in {"wait", "logs", "kill", "save", "status", "ssh", "reap", "local", "log-rollup"}:
+        return _main(argv)
+    with toollog.span("cli", "cli." + name, tag="cli_failed") as data:
+        code = _main(argv)
+        data["ok"] = code == 0
+        data["props"]["exitCode"] = code
+        return code
+
+
+def _main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    a = parse_args(argv)
     if not a.sub:
-        p.print_help()
+        build_parser().print_help()
         return 2
     from . import bases, home, misc, reap, spend
     from .identity import whoami
     from .redact import redact_argv, warn_env_values
     try:
+        if a.sub == "log-rollup":
+            print(json.dumps(toollog.rollup(a.day), sort_keys=True))
+            return 0
+        if a.sub == "reap":
+            toollog.rollup_previous()
         me = whoami()
-        log(f"cmd {a.sub} owner={me['owner']} repo={me['repo_root']} backend={common.backend()} "
+        if a.sub == "exec":
+            from . import execute
+            return execute.command(a, me)
+        reason = f" reason={common._BACKEND_REASON}" if common._BACKEND_REASON else ""
+        if a.sub == "run" and common._BACKEND_REASON == "boat-only-base":
+            say(f"running on Boat because base '{a.base}' lives only on the Boat standby")
+        log(f"cmd {a.sub} owner={me['owner']} repo={me['repo_root']} backend={common.backend()}{reason} "
             f"argv={redact_argv(argv)[:12]}")
+        if a.sub == "run":
+            _log_request(a, me)
+            a.log_requested = True
         if a.sub not in LOCAL_ONLY:
             home.person_gate()   # a person's box lives on the home server only: stop here while it is down
         if a.sub == "run":
+            if a.base and not a.fresh:
+                from . import base_catalog
+                base_catalog.validate(a.base, me["repo_key"])
             warn_env_values(a.env)
             a.argv = list(argv)
             return cmd_run(a, me)
@@ -340,11 +438,11 @@ def main(argv: list[str] | None = None) -> int:
         elif a.sub == "save":
             print(json.dumps(bases.save(me, a.name, a.make_default, a.note), indent=1))
         elif a.sub == "bases":
-            bases.list_bases(a.json)
+            bases.list_bases(a.json, include_expired=a.all)
         elif a.sub == "base":
             bases.rm_base(me, a.name)
         elif a.sub == "keep":
-            bases.keep(me, a.days)
+            bases.keep(me, a.days, box_id=a.box)
         elif a.sub == "template":
             if a.action == "list":
                 bases.list_templates(a.json)
@@ -355,8 +453,13 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(bases.build_template(a.name), indent=1))
         return 0
     except OffboxError as e:
+        if e.code in (90, 91, 92, 93):
+            toollog.emit("cli", "run.error", kind="error", ok=False, tag="exit_" + str(e.code), props={"exitCode": e.code})
         say(str(e))
         return e.code
+    except sqlite3.Error as error:
+        say(str(local_error(error)))
+        return local_error(error).code
     except KeyboardInterrupt:
         return 130
     except Exception as e:  # noqa: BLE001

@@ -8,7 +8,7 @@ import sqlite3
 import subprocess
 
 from . import ssh_sync
-from .common import OffboxError, event, now, say
+from .common import OffboxError, log, now, say, write
 
 
 def preserve_reason(con, row) -> str:
@@ -132,15 +132,23 @@ def record(con, run, bounded_process: str, timeout: float = 30) -> None:
         if p.returncode:
             return
         data = json.loads(p.stdout)
-        with con:
+        recorded = []
+        with write(con):
+            if con.execute('SELECT 1 FROM kv WHERE k=?', (key,)).fetchone():
+                return
             initial_key = 'containers_initial_recorded:' + run['run_id']
             if data['initial'] and not con.execute('SELECT 1 FROM kv WHERE k=?', (initial_key,)).fetchone():
-                event(con, run['box_id'], 'stale_containers', json.dumps(dict(run=run['run_id'], **data)))
+                recorded.append(('stale_containers', json.dumps(dict(run=run['run_id'], **data))))
                 con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', (initial_key, '1'))
             if data.get('left'):
-                event(con, run['box_id'], 'stale_containers_left', json.dumps(dict(run=run['run_id'], names=data['left'])))
-                say('containers left after ' + run['run_id'] + ': ' + ', '.join(data['left']))
+                recorded.append(('stale_containers_left', json.dumps(dict(run=run['run_id'], names=data['left']))))
             if data.get('post_checked'):
                 con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', (key, '1'))
+            for kind, detail in recorded:
+                con.execute('INSERT INTO events VALUES (?,?,?,?)', (now(), run['box_id'], kind, detail[:2000]))
+        for kind, detail in recorded:
+            log(f"{kind} {run['box_id']} {detail[:300]}")
+        if data.get('left'):
+            say('containers left after ' + run['run_id'] + ': ' + ', '.join(data['left']))
     except (OSError, subprocess.TimeoutExpired, OffboxError, ValueError, KeyError, sqlite3.Error):
         pass

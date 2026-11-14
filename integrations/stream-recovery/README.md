@@ -167,10 +167,14 @@ model stream that died mid tool call and left the session "running" for hours.
 - Once Robob's run and OpenCode's session have both let go, a thread whose run
   was interrupted gets a note telling it to carry on. crw, iMessage and
   archived threads get none (crw nudges its own jobs once they are idle).
-- One Telegram summary per stall (`stream-recovery:st-<ses>-<quiet start>`):
-  info when cleared, error when it is still stuck 10 min after the interrupt.
+- Telegram summarizes a stall only when a distinct earlier stall has been
+  detected for the same known owning thread within one hour, inclusive. Active
+  sessions and ghosts count together; the first stall is still recovered and
+  recorded. Missing ownership defers notification briefly, then suppresses it
+  rather than guessing. Eligible summaries use `stream-recovery:st-<ses>-<quiet
+  start>` and keep the normal send retries. Restart summaries are unaffected.
   After 3 interrupts of one session in 24h it only reports.
-- A Robob thread that shows a run as running for 15 min while its OpenCode session is not active and has no message from the last 15 min (the turn never reached OpenCode, as on #433 after the 29 Oct restart) is interrupted through Robob, gets the carry-on note (not crw/iMessage) and one Telegram summary. It waits while the installer's resume is pending and only reports after 3 interrupts of a session in 24h. Ghost candidates are kept under `ghosts` in the state file.
+- A Robob thread that shows a run as running for 15 min while its OpenCode session is not active and has no message from the last 15 min (the turn never reached OpenCode, as on #433 after the 29 Oct restart) is interrupted through Robob and gets the carry-on note (not crw/iMessage). It waits while the installer's resume is pending and only reports after 3 interrupts of a session in 24h. Ghost candidates are kept under `ghosts` in the state file.
 
 Stalls are kept in the same state file (`watch`, `stalls`, `servers`, `ghosts`).
 
@@ -185,7 +189,11 @@ Recovery reads authenticated `GET /api/ardud/control/harness-cutover/status`:
 `claimedRuns: [{threadId, runId}]` is also accepted. While active, claimed threads
 get no restart/stream-loss note, stall interruption, or queue release. Retained
 run claims suppress only the old cut runs after completion, not future restarts
-of those threads. Status must expose prepared input claims before ledger creation;
+of those threads. After completion the default reply keeps `claimedRuns` but returns
+an empty `claimedThreadIds` with `threadClaimsIncluded: false`. The installer requests
+`?claims=1` to retain historical thread ownership checks, including snapshots without
+a run ID; it refuses a saved status with omitted thread claims. `?items=1` independently
+adds ledger rows without payloads. Status must expose prepared input claims before ledger creation;
 missing/invalid/unauthorized status fails closed rather than assuming no claims.
 Claims are rechecked before mutation. The server must establish preparation before
 recovery starts, and fence dispatch against its cutover ledger to close a claim

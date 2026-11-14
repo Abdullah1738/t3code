@@ -22,6 +22,7 @@ import {
   selectionEffort,
 } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import { modelProblem } from "../kanban/engine/modelCheck.ts";
+import { GUIDANCE_KIND } from "../imessage/guidance.ts";
 
 /**
  * The coarse state external callers act on:
@@ -325,6 +326,23 @@ export function pendingRequestSummary(
   return base;
 }
 
+function inboundMessageId(message: OrchestrationV2ConversationMessage): string | null {
+  for (const record of message.context?.records ?? []) {
+    if (record.kind !== GUIDANCE_KIND || !("payload" in record)) continue;
+    const payload = record.payload as { readonly text?: unknown } | null;
+    if (typeof payload?.text !== "string") continue;
+    const match = /Current incoming message ID: ("(?:[^"\\]|\\.)*")/.exec(payload.text);
+    if (match === null) continue;
+    try {
+      const id: unknown = JSON.parse(match[1]!);
+      return typeof id === "string" ? id : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 export function messageSummary(message: OrchestrationV2ConversationMessage) {
   return {
     messageId: message.id,
@@ -335,6 +353,13 @@ export function messageSummary(message: OrchestrationV2ConversationMessage) {
     streaming: message.streaming,
     createdBy: message.createdBy,
     creationSource: message.creationSource,
+    automated: Boolean(
+      message.scheduledTaskId ||
+      message.notification ||
+      message.delegatedCompletion ||
+      message.senderThreadId,
+    ),
+    inboundMessageId: inboundMessageId(message),
     attachments: message.attachments.map((attachment) => ({
       id: attachment.id,
       type: attachment.type,

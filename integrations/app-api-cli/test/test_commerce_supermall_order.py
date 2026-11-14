@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 """Synthetic fixtures + captured-contract bodies; never live requests."""
 import copy
 import json
@@ -5,6 +6,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+import order_card
 from unittest.mock import patch
 
 import commerce_journal as j
@@ -72,7 +74,7 @@ def cart_state(*, empty=False, offer=OFFER, sku=SKU, quantity=1):
 def session_state(*, total=25.49, subtotal=17.0, quantity=1, address=HEADERS['x-addresskey'],
                   silent=True, card_default=True, credits=False, is_rocket=True,
                   delivery_date='2026-10-11T00:37:00', unit_price='17.00'):
-    cards = [{'id': '<secret>', 'type': 'MASTERCARD', 'mask': '52287301xxxx2342',
+    cards = [{'id': '<secret>', 'type': order_card.NETWORK.upper(), 'mask': 'xxxxxxxxxxxx' + order_card.LAST4,
               'isSelected': card_default, 'isDefault': card_default},
              {'id': '<secret>', 'type': 'VISA', 'mask': '419649xxxxxx9963',
               'isSelected': False, 'isDefault': False}]
@@ -163,6 +165,9 @@ def make_flow(responses, *, quantity=1, search=None):
 
 
 class CapturedContractTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_rocket_add_is_quick_atc_route_with_deselect_flags(self):
         self.assertEqual(FIXTURE['add_path'],
                          '/_svc/cart-v1/cart/item/aaa9dcee08bdd46c/1?showCart')
@@ -239,6 +244,9 @@ class CapturedContractTests(unittest.TestCase):
 
 
 class ResolveOfferTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_exact_variant_uses_rocket_catalog_experience(self):
         hit = FIXTURE['search']['hits'][0]
         class Opener:
@@ -290,6 +298,9 @@ class ResolveOfferTests(unittest.TestCase):
 
 
 class LaneTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def run_lane(self, responses, *, quantity=1):
         with patch.object(c.urllib.request, 'build_opener',
                           return_value=patched_resolve(FIXTURE['search'])()):
@@ -360,7 +371,7 @@ class LaneTests(unittest.TestCase):
         state = session_state()
         cards = state['paymentMethods'][1]['cards']
         for card in cards:
-            card['mask'] = card['mask'].replace('2342', '5542')
+            card['mask'] = card['mask'].replace(order_card.LAST4, '5542')
         self.assertTrue(any(card['mask'].endswith('5542') and card['isDefault'] for card in cards))
         responses = happy_responses(session=state)
         with tempfile.TemporaryDirectory() as temp, \
@@ -508,6 +519,9 @@ class LaneTests(unittest.TestCase):
 
 
 class ResumeTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def prepare_partial_flow(self):
         temp = tempfile.mkdtemp()
         roots = (patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'),
@@ -561,6 +575,9 @@ class ResumeTests(unittest.TestCase):
 
 
 class CompletionTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_paid_order_completes_journal_with_tracker_and_eta(self):
         temp = tempfile.mkdtemp()
         with patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'), \

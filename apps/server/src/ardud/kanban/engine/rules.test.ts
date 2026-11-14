@@ -80,6 +80,7 @@ const board: KanbanBoard = {
   setup: null,
   pause: null,
   createdAt: "2026-10-25T00:00:00Z",
+  nightlyReview: null,
   archivedAt: null,
 };
 
@@ -162,6 +163,21 @@ describe("checkMove", () => {
       checkMove("owner", card({ stage: "verified", settledAt: "2026-10-25T01:00:00Z" }), "todo").ok,
     ).toBe(false);
   });
+
+  it.each(["in_review", "completed"] as const)(
+    "lets an unattached %s card return to review",
+    (stage) => {
+      expect(checkMove("cardThread", card({ stage }), "needs_review").ok).toBe(true);
+      expect(
+        checkMove(
+          "cardThread",
+          card({ stage, activeThreadId: ThreadId.make("reviewer") }),
+          "needs_review",
+        ).ok,
+      ).toBe(false);
+      expect(checkMove("cardThread", card({ stage }), "deployed").ok).toBe(false);
+    },
+  );
 
   it("lets a script move a card only to completed, deployed or verified, off a quiet stage", () => {
     expect(checkMove("script", card({ stage: "todo" }), "deployed").ok).toBe(true);
@@ -1281,7 +1297,7 @@ describe("thread batching", () => {
       planDispatch(board, [review, todo, findings], pools([[opus, 3]])).map(
         (entry) => entry.cardId,
       ),
-    ).toEqual([review.id, findings.id]);
+    ).toEqual([review.id]);
   });
 
   it("offers related todo cards with a reason, in pick order", () => {

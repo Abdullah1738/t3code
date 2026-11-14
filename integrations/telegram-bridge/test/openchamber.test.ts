@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { useToolLogFixture } from "./toollog-fixture.ts";
 import { OpenChamber, type JsonValue } from "../src/openchamber.ts";
 import { parseNotificationEvent } from "../src/notification-events.ts";
 
@@ -135,3 +136,5 @@ describe("notification events", () => {
     ] } })).toEqual({ type: "board", entries: [{ identity: "/Chats\0ses_1", fingerprint: JSON.stringify(["waiting", "idle", 2, undefined, undefined, undefined]) }] });
   });
 });
+
+useToolLogFixture();

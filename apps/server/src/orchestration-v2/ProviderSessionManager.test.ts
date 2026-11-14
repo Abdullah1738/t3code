@@ -538,6 +538,7 @@ function layerTest(input: {
   readonly flakyReleaseWrites?: FlakyReleaseWrites;
   readonly pauseAttachWrite?: Parameters<typeof layerPausingAttachEventSink>[0];
   readonly beforeUnchangedWrite?: Ref.Ref<Effect.Effect<void>>;
+  readonly beforeMessageRead?: Effect.Effect<void>;
   readonly pauseResolve?: {
     readonly armed: Ref.Ref<boolean>;
     readonly paused: Deferred.Deferred<void>;
@@ -574,6 +575,25 @@ function layerTest(input: {
             : input.failReleaseEventWrites
               ? layerFailingReleaseEventSink
               : layerTestEventSink;
+  const layerManagerStores =
+    input.beforeMessageRead === undefined
+      ? layerTestStores
+      : Layer.effect(
+          ProjectionStore.ProjectionStoreV2,
+          Effect.gen(function* () {
+            const delegate = yield* ProjectionStore.ProjectionStoreV2;
+            const getThreadRecords: ProjectionStore.ProjectionStoreV2Shape["getThreadRecords"] = (
+              threadId,
+              fields,
+              filter,
+            ) =>
+              (fields.some((field) => field === "messages")
+                ? input.beforeMessageRead!
+                : Effect.void
+              ).pipe(Effect.andThen(delegate.getThreadRecords(threadId, fields, filter)));
+            return ProjectionStore.ProjectionStoreV2.of({ ...delegate, getThreadRecords });
+          }),
+        ).pipe(Layer.provideMerge(layerTestStores));
   const layerRegistry = Layer.unwrap(
     makeProviderAdapter(input.state, {
       failEventStream: input.failEventStream ?? false,
@@ -652,7 +672,7 @@ function layerTest(input: {
           IdAllocator.layer,
           layerProviderEventIngestorTest,
           layerConfiguredMcpRegistry,
-          layerTestStores,
+          layerManagerStores,
           ...(input.serverSettingsLayer === undefined ? [] : [input.serverSettingsLayer]),
           ...(input.projectServiceLayer === undefined ? [] : [input.projectServiceLayer]),
         ),
@@ -4583,6 +4603,7 @@ it.effect("ProviderSessionManagerV2 defers idle release while background work is
         layerTest({
           state,
           idleTimeoutMs: 1000,
+          backgroundTasksEndWithProcess: true,
           hasPendingBackgroundWork: Ref.get(pendingWork),
         }),
       ),
@@ -5085,6 +5106,18 @@ it.effect("ProviderSessionManagerV2 releases sessions when provider event stream
       yield* eventSink.write({
         events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
       });
+      // The stream reports failure before releaseEntry persists the error status.
+      const persistedError = yield* eventSink.stream({ threadId }).pipe(
+        Stream.filter(
+          ({ event }) =>
+            event.type === "provider-session.updated" &&
+            event.payload.id === providerSessionId &&
+            event.payload.status === "error",
+        ),
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkScoped,
+      );
       const runtime = yield* manager.open({
         threadId,
         providerSessionId,
@@ -5092,7 +5125,7 @@ it.effect("ProviderSessionManagerV2 releases sessions when provider event stream
         runtimePolicy,
       });
       yield* runtime.events.pipe(Stream.runDrain, Effect.ignore, Effect.forkScoped);
-      yield* Effect.yieldNow;
+      yield* Fiber.join(persistedError);
 
       const liveSession = yield* manager.get(providerSessionId);
       const runtimeState = yield* Ref.get(state);
@@ -7813,4 +7846,491 @@ it.effect(
         ),
       );
     }),
+);
+
+it.effect.each(["same", "session", "native", "instance", "driver", "missing", "thread"] as const)(
+  "persists only the current idle Claude refusal session: %s",
+  (identity) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const f = yield* makeSessionAudienceFixture(state, 1);
+        const threadId = f.threadIds[0]!;
+        const old = {
+          ...f.providerThreadOf(threadId),
+          nativeMetadata: { claudeRefusalObserved: false },
+        };
+        yield* f.eventSink.write({
+          events: [
+            {
+              id: yield* f.idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: f.now,
+              payload: old,
+            },
+          ],
+        });
+        yield* f.resume(threadId);
+        yield* f.start(threadId);
+        yield* f.finish(threadId);
+        // f.publish uses a temporary raw receipt subscriber only. There is no
+        // run ingestion subscriber; the receipt proves the real pump completed.
+        const incoming = {
+          ...old,
+          status: "error" as const,
+          nativeMetadata: { claudeRefusalObserved: true },
+        };
+        if (identity === "session")
+          incoming.providerSessionId = "old-provider-session" as typeof old.providerSessionId;
+        if (identity === "native")
+          incoming.nativeThreadRef = { ...old.nativeThreadRef!, nativeId: "old-native-session" };
+        if (identity === "missing") incoming.nativeThreadRef = null;
+        if (identity === "thread") incoming.appThreadId = ThreadId.make("retired-thread");
+        if (identity === "instance")
+          incoming.providerInstanceId = ProviderInstanceId.make("old-instance");
+        if (identity === "driver") incoming.driver = ProviderDriverKind.make("codex");
+        yield* f.publish({
+          type: "provider_thread.updated",
+          driver: f.runtime.driver,
+          providerThread: incoming,
+        });
+        const records = yield* f.projectionStore.getThreadRecords(threadId, ["providerThreads"]);
+        const stored = records.providerThreads.find((thread) => thread.id === old.id);
+        assert.equal(
+          stored?.nativeMetadata?.claudeRefusalObserved,
+          identity === "same",
+          "only the current native session may record its exclusion",
+        );
+        assert.equal(stored?.status, old.status, "marker persistence must not copy a stale status");
+        assert.deepEqual(stored?.nativeThreadRef, old.nativeThreadRef);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 60000,
+            driver: ProviderDriverKind.make("claudeAgent"),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each(
+  (
+    [
+      "snapshot",
+      "batch",
+      "new-runtime",
+      "new-native",
+      "new-instance",
+      "other-driver",
+      "missing-native",
+    ] as const
+  ).flatMap((change) => [false, undefined].map((marker) => ({ change, marker }))),
+)("keeps durable Claude refusal history through $change/$marker", ({ change, marker }) =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    yield* Effect.gen(function* () {
+      const f = yield* makeSessionAudienceFixture(state, 1);
+      const threadId = f.threadIds[0]!;
+      const initial: OrchestrationV2ProviderThread = {
+        ...f.providerThreadOf(threadId),
+        nativeMetadata: { claudeRefusalObserved: false },
+      };
+      const write = (payloads: ReadonlyArray<OrchestrationV2ProviderThread>) =>
+        Effect.forEach(payloads, (payload) =>
+          Effect.gen(function* () {
+            return {
+              id: yield* f.idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated" as const,
+              threadId,
+              occurredAt: yield* DateTime.now,
+              payload,
+            };
+          }),
+        ).pipe(Effect.flatMap((events) => f.eventSink.write({ events })));
+      yield* write([initial]);
+      yield* f.resume(threadId);
+      yield* f.start(threadId);
+      yield* f.finish(threadId);
+      const observed = { ...initial, nativeMetadata: { claudeRefusalObserved: true } };
+      if (change !== "batch")
+        yield* f.publish({
+          type: "provider_thread.updated",
+          driver: f.runtime.driver,
+          providerThread: observed,
+        });
+      const snapshot = {
+        ...initial,
+        nativeMetadata: marker === undefined ? {} : { claudeRefusalObserved: marker },
+      };
+      if (change === "new-runtime")
+        snapshot.providerSessionId = yield* f.idAllocator.allocate.providerSession({
+          threadId,
+          providerInstanceId: modelSelection.instanceId,
+        });
+      if (change === "new-native")
+        snapshot.nativeThreadRef = { ...initial.nativeThreadRef!, nativeId: "new-native-session" };
+      if (change === "new-instance")
+        snapshot.providerInstanceId = ProviderInstanceId.make("new-instance");
+      if (change === "other-driver") snapshot.driver = CODEX_DRIVER;
+      if (change === "missing-native") snapshot.nativeThreadRef = null;
+      yield* write(change === "batch" ? [observed, snapshot] : [snapshot]);
+      const stored = (yield* f.projectionStore.getThreadRecords(threadId, [
+        "providerThreads",
+      ])).providerThreads.find((row) => row.id === initial.id);
+      const preserved = change === "snapshot" || change === "batch" || change === "new-runtime";
+      assert.equal(stored?.nativeMetadata?.claudeRefusalObserved, preserved ? true : marker);
+      const events = yield* f.eventStore
+        .read({ eventType: "provider-thread.updated" })
+        .pipe(Stream.runCollect);
+      const last = events.at(-1)?.event;
+      assert.equal(
+        last?.type === "provider-thread.updated"
+          ? last.payload.nativeMetadata?.claudeRefusalObserved
+          : undefined,
+        preserved ? true : marker,
+      );
+    }).pipe(
+      Effect.provide(
+        layerTest({ state, driver: ProviderDriverKind.make("claudeAgent"), idleTimeoutMs: 60000 }),
+      ),
+    );
+  }),
+);
+
+it.effect.each([false, true, "session"] as const)(
+  "guards a refusal write racing native replacement: %s",
+  (replaceNative) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const before = yield* Ref.make<Effect.Effect<void>>(Effect.void);
+      yield* Effect.gen(function* () {
+        const f = yield* makeSessionAudienceFixture(state, 1);
+        const threadId = f.threadIds[0]!;
+        const initial = {
+          ...f.providerThreadOf(threadId),
+          nativeMetadata: { claudeRefusalObserved: false },
+        };
+        const write = (payload: OrchestrationV2ProviderThread) =>
+          Effect.gen(function* () {
+            yield* f.eventSink.write({
+              events: [
+                {
+                  id: yield* f.idAllocator.allocate.event({ threadId }),
+                  type: "provider-thread.updated",
+                  threadId,
+                  occurredAt: yield* DateTime.now,
+                  payload,
+                },
+              ],
+            });
+          });
+        yield* write(initial);
+        yield* f.resume(threadId);
+        yield* f.start(threadId);
+        yield* f.finish(threadId);
+        const concurrent = {
+          ...initial,
+          status: "active" as const,
+          nativeThreadRef:
+            replaceNative === true
+              ? { ...initial.nativeThreadRef!, nativeId: "replacement-native" }
+              : initial.nativeThreadRef,
+        };
+        if (replaceNative === "session")
+          concurrent.providerSessionId = yield* f.idAllocator.allocate.providerSession({
+            threadId,
+            providerInstanceId: modelSelection.instanceId,
+          });
+        yield* Ref.set(before, write(concurrent).pipe(Effect.orDie));
+        yield* f.publish({
+          type: "provider_thread.updated",
+          driver: f.runtime.driver,
+          providerThread: { ...initial, nativeMetadata: { claudeRefusalObserved: true } },
+        });
+        const stored = (yield* f.projectionStore.getThreadRecords(threadId, [
+          "providerThreads",
+        ])).providerThreads.find((row) => row.id === initial.id);
+        assert.equal(stored?.nativeMetadata?.claudeRefusalObserved, replaceNative !== true);
+        assert.equal(stored?.status, "active");
+        assert.equal(stored?.providerSessionId, concurrent.providerSessionId);
+        assert.equal(stored?.nativeThreadRef?.nativeId, concurrent.nativeThreadRef?.nativeId);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            beforeUnchangedWrite: before,
+            driver: ProviderDriverKind.make("claudeAgent"),
+            idleTimeoutMs: 60000,
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each(["shared Claude", "muse", "codex"] as const)(
+  "stopping background work keeps a %s session",
+  (kind) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const f = yield* makeSessionAudienceFixture(state, kind === "shared Claude" ? 2 : 1);
+        yield* f.eventSink.write({
+          events: [
+            {
+              id: yield* f.idAllocator.allocate.event({ threadId: f.threadIds[0]! }),
+              type: "provider-thread.updated",
+              threadId: f.threadIds[0]!,
+              occurredAt: f.now,
+              payload: f.providerThreadOf(f.threadIds[0]!),
+            },
+          ],
+        });
+        if (kind === "shared Claude") yield* f.start(f.threadIds[1]!);
+        yield* f.manager.stopBackgroundWork({
+          threadId: f.threadIds[0]!,
+          throughRunOrdinal: 0,
+          onlyIfCancelled: false,
+        });
+        assert.isTrue(Option.isSome(yield* f.manager.get(f.providerSessionId)));
+        assert.equal((yield* Ref.get(state)).closeCount, 0);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            driver: ProviderDriverKind.make(kind === "shared Claude" ? "claudeAgent" : kind),
+            backgroundTasksEndWithProcess: true,
+            hasPendingBackgroundWork: Effect.succeed(true),
+            hasPendingBackgroundWorkForThread: Effect.succeed(true),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each([
+  { change: "new start", releases: false },
+  { change: "new start and finish", releases: false },
+  { change: "same turn finishes", releases: true },
+  { change: "old thread errors", releases: true },
+  { change: "starting cancellation", releases: true },
+] as const)("Stop revalidates $change during its background probe", ({ change, releases }) =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const probing = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    const startEntered = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const f = yield* makeSessionAudienceFixture(state, 1);
+      yield* f.eventSink.write({
+        events: [
+          {
+            id: yield* f.idAllocator.allocate.event({ threadId: f.threadIds[0]! }),
+            type: "provider-thread.updated",
+            threadId: f.threadIds[0]!,
+            occurredAt: f.now,
+            payload: f.providerThreadOf(f.threadIds[0]!),
+          },
+        ],
+      });
+      const starting =
+        change === "starting cancellation"
+          ? yield* f.start(f.threadIds[0]!, 1).pipe(Effect.forkScoped)
+          : null;
+      if (starting === null) yield* f.start(f.threadIds[0]!, 1);
+      else yield* Deferred.await(startEntered);
+      const stopping = yield* f.manager
+        .stopBackgroundWork({
+          threadId: f.threadIds[0]!,
+          throughRunOrdinal: 1,
+          onlyIfCancelled: false,
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(probing);
+      if (starting !== null) yield* Fiber.interrupt(starting);
+      else if (change === "same turn finishes" || change === "old thread errors") {
+        yield* f.finish(f.threadIds[0]!, 1);
+        if (change === "old thread errors")
+          yield* f.publish({
+            type: "provider_thread.updated",
+            driver: f.runtime.driver,
+            providerThread: { ...f.providerThreadOf(f.threadIds[0]!), status: "error" },
+          });
+      } else {
+        yield* f.start(f.threadIds[0]!, 2);
+        if (change === "new start and finish") yield* f.finish(f.threadIds[0]!, 2);
+      }
+      yield* Deferred.succeed(resume, undefined);
+      const released = yield* Fiber.join(stopping);
+      assert.equal(released.length, releases ? 1 : 0);
+      assert.equal(Option.isNone(yield* f.manager.get(f.providerSessionId)), releases);
+      assert.equal((yield* Ref.get(state)).closeCount, releases ? 1 : 0);
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          driver: ProviderDriverKind.make("claudeAgent"),
+          backgroundTasksEndWithProcess: true,
+          ...(change === "starting cancellation"
+            ? {
+                startTurn: Deferred.succeed(startEntered, undefined).pipe(
+                  Effect.andThen(Effect.never),
+                ),
+              }
+            : {}),
+          hasPendingBackgroundWorkForThread: Deferred.succeed(probing, undefined).pipe(
+            Effect.andThen(Deferred.await(resume)),
+            Effect.as(true),
+          ),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect.each([
+  { change: "new user queued", releases: false },
+  { change: "new agent queued", releases: false },
+  { change: "wake unheld", releases: false },
+  { change: "wake starting", releases: false },
+  { change: "new automatic wake", releases: true },
+] as const)("Stop revalidates $change during its message lookup", ({ change, releases }) =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const armed = yield* Ref.make(false);
+    const reading = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const f = yield* makeSessionAudienceFixture(state, 1);
+      const threadId = f.threadIds[0]!;
+      const providerThread = f.providerThreadOf(threadId);
+      yield* f.eventSink.write({
+        events: [
+          {
+            id: yield* f.idAllocator.allocate.event({ threadId }),
+            type: "provider-thread.updated",
+            threadId,
+            occurredAt: f.now,
+            payload: providerThread,
+          },
+        ],
+      });
+      yield* f.start(threadId);
+      const seedRun = Effect.fnUntraced(function* (
+        ordinal: number,
+        createdBy: "user" | "agent",
+        creationSource: "provider" | "web" | "mcp",
+      ) {
+        const runId = f.idAllocator.derive.run({ threadId, ordinal });
+        const messageId = yield* f.idAllocator.allocate.message({ threadId, ordinal });
+        const rootNodeId = f.idAllocator.derive.rootNode({ runId });
+        const run = {
+          id: runId,
+          threadId,
+          ordinal,
+          providerInstanceId: modelSelection.instanceId,
+          modelSelection,
+          providerThreadId: providerThread.id,
+          userMessageId: messageId,
+          rootNodeId,
+          activeAttemptId: f.idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+          status: "queued" as const,
+          queueHeld: true,
+          requestedAt: f.now,
+          startedAt: null,
+          completedAt: null,
+          checkpointId: null,
+          contextHandoffId: null,
+        };
+        yield* f.eventSink.write({
+          events: [
+            {
+              id: yield* f.idAllocator.allocate.event({ threadId }),
+              type: "run.updated",
+              threadId,
+              occurredAt: f.now,
+              payload: run,
+            },
+            {
+              id: yield* f.idAllocator.allocate.event({ threadId }),
+              type: "message.updated",
+              threadId,
+              occurredAt: f.now,
+              payload: {
+                id: messageId,
+                threadId,
+                runId,
+                nodeId: rootNodeId,
+                role: "user",
+                text: "late work",
+                attachments: [],
+                streaming: false,
+                createdBy,
+                creationSource,
+                createdAt: f.now,
+                updatedAt: f.now,
+              },
+            },
+          ],
+        });
+        return run;
+      });
+      const wake = yield* seedRun(2, "agent", "provider");
+      yield* Ref.set(armed, true);
+      const stopping = yield* f.manager
+        .stopBackgroundWork({
+          threadId,
+          throughRunOrdinal: 1,
+          onlyIfCancelled: false,
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(reading);
+      if (change === "wake unheld" || change === "wake starting") {
+        yield* f.eventSink.write({
+          events: [
+            {
+              id: yield* f.idAllocator.allocate.event({ threadId }),
+              type: "run.updated",
+              threadId,
+              occurredAt: f.now,
+              payload: {
+                ...wake,
+                queueHeld: false,
+                status: change === "wake starting" ? "starting" : "queued",
+              },
+            },
+          ],
+        });
+      } else {
+        yield* seedRun(
+          3,
+          change === "new user queued" ? "user" : "agent",
+          change === "new user queued" ? "web" : change === "new agent queued" ? "mcp" : "provider",
+        );
+      }
+      yield* Deferred.succeed(resume, undefined);
+      const released = yield* Fiber.join(stopping);
+      assert.equal(released.length, releases ? 1 : 0);
+      assert.equal(Option.isNone(yield* f.manager.get(f.providerSessionId)), releases);
+      assert.equal((yield* Ref.get(state)).closeCount, releases ? 1 : 0);
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          driver: ProviderDriverKind.make("claudeAgent"),
+          backgroundTasksEndWithProcess: true,
+          hasPendingBackgroundWorkForThread: Effect.succeed(true),
+          beforeMessageRead: Ref.getAndSet(armed, false).pipe(
+            Effect.flatMap((pause) =>
+              pause
+                ? Deferred.succeed(reading, undefined).pipe(Effect.andThen(Deferred.await(resume)))
+                : Effect.void,
+            ),
+          ),
+        }),
+      ),
+    );
+  }),
 );

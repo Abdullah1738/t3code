@@ -3,6 +3,7 @@
 Food and NowNow tracking are exact-order. Marketplace completion requires the
 exact full-detail inventory to reconcile with its independent invoice count.
 """
+import toollog
 import http.client
 import datetime as dt
 import json
@@ -79,35 +80,40 @@ def _read(route, headers, deadline, order=None):
         raise NoonError('ENDPOINT_OR_ORDER_DENIED')
     headers = dict(headers)
     headers.update({'content-type': 'application/json', 'accept': 'application/json', 'accept-encoding': 'identity'})
-    try:
-        req = urllib.request.Request('https://' + host + path, headers=headers,
-                                     method='POST' if body is not None else 'GET', data=body)
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), core.NoRedirect())
-        with core.read_deadline(deadline) as left:
-            with opener.open(req, timeout=left) as response:
-                raw = response.read(core.MAX_BYTES + 1)
-            if len(raw) > core.MAX_BYTES:
-                raise NoonError('RESPONSE_TOO_LARGE')
-            if raw[:2] == b'\x1f\x8b':
-                decoder = zlib.decompressobj(31)
-                raw = decoder.decompress(raw, core.MAX_BYTES + 1)
-                if len(raw) > core.MAX_BYTES or decoder.unconsumed_tail:
+    with toollog.request(path):
+        try:
+            req = urllib.request.Request('https://' + host + path, headers=headers,
+                                         method='POST' if body is not None else 'GET', data=body)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), core.NoRedirect())
+            with core.read_deadline(deadline) as left:
+                with toollog.phase('fetch'):
+                    with opener.open(req, timeout=left) as response:
+                        raw = response.read(core.MAX_BYTES + 1)
+                toollog.response(getattr(response, 'code', None), None)
+                if len(raw) > core.MAX_BYTES:
                     raise NoonError('RESPONSE_TOO_LARGE')
-                if not decoder.eof:
-                    raise NoonError('NATIVE_READ_FAILED')
-            data = json.loads(raw, object_pairs_hook=_unique_object)
-            if not isinstance(data, dict):
-                raise NoonError('SCHEMA_CHANGED')
-        return data
-    except urllib.error.HTTPError as exc:
-        code = exc.code
-        exc.close()
-        raise NoonError({401: 'AUTH_EXPIRED', 403: 'AUTH_FORBIDDEN', 404: 'ORDER_NOT_FOUND',
-                         429: 'RATE_LIMITED'}.get(code, 'HTTP_' + str(code))) from None
-    except TimeoutError:
-        raise NoonError('NATIVE_READ_TIMEOUT') from None
-    except (urllib.error.URLError, http.client.HTTPException, ValueError, OSError, zlib.error):
-        raise NoonError('NATIVE_READ_FAILED') from None
+                if raw[:2] == b'\x1f\x8b':
+                    decoder = zlib.decompressobj(31)
+                    raw = decoder.decompress(raw, core.MAX_BYTES + 1)
+                    if len(raw) > core.MAX_BYTES or decoder.unconsumed_tail:
+                        raise NoonError('RESPONSE_TOO_LARGE')
+                    if not decoder.eof:
+                        raise NoonError('NATIVE_READ_FAILED')
+                with toollog.phase('parse'):
+                    data = json.loads(raw, object_pairs_hook=_unique_object)
+                if not isinstance(data, dict):
+                    raise NoonError('SCHEMA_CHANGED')
+            toollog.response(getattr(response, 'code', None), data)
+            return data
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+            exc.close()
+            raise NoonError({401: 'AUTH_EXPIRED', 403: 'AUTH_FORBIDDEN', 404: 'ORDER_NOT_FOUND',
+                             429: 'RATE_LIMITED'}.get(code, 'HTTP_' + str(code))) from None
+        except TimeoutError:
+            raise NoonError('NATIVE_READ_TIMEOUT') from None
+        except (urllib.error.URLError, http.client.HTTPException, ValueError, OSError, zlib.error):
+            raise NoonError('NATIVE_READ_FAILED') from None
 
 
 def _unique_object(pairs):
@@ -132,9 +138,9 @@ def food_projection(data, order):
         raise NoonError('ORDER_MISMATCH_OR_SCHEMA_CHANGED')
     out = core.base(order, 'food')
     out.update(raw_status=raw, status={'preparing': 'preparing', 'delivered': 'delivered', 'delivering': 'out for delivery',
-                                     'picked_up': 'picked up'}.get(raw, 'unknown'),
+                                     'picked_up': 'picked up', 'canceled': 'cancelled'}.get(raw, 'unknown'),
                scope='order', status_text=core.text(row.get('statusLabel')),
-               coverage='exact_native_food_order; delivered_delivering_picked_up_verified')
+               coverage='exact_native_food_order; delivered_delivering_picked_up_canceled_verified')
     estimate = row.get('estimate')
     if isinstance(estimate, dict):
         window = estimate.get('time')
@@ -302,6 +308,7 @@ def nownow_projection(detail, tracking, order):
     return out
 
 
+@toollog.timed("noon", "provider.track")
 def track(order, service, timeout=10, *, deadline=None):
     deadline = _deadline(timeout, deadline)
     valid = isinstance(order, str) and ((service == 'food' and FOOD_ORDER.fullmatch(order))
@@ -325,6 +332,7 @@ def track(order, service, timeout=10, *, deadline=None):
     return out
 
 
+@toollog.timed("noon", "provider.orders", lane="food")
 def food_orders(timeout=10):
     deadline = _deadline(timeout)
     headers = _headers('food', deadline)
@@ -351,6 +359,7 @@ def food_orders(timeout=10):
                                   'reported_pages': data.get('pages') if type(data.get('pages')) is int else None}}}
 
 
+@toollog.timed("noon", "provider.orders", lane="nownow")
 def nownow_orders(timeout=10):
     deadline = _deadline(timeout)
     headers = _headers('nownow', deadline)

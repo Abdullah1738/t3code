@@ -1,5 +1,6 @@
 """Native export fixtures; production databases are never opened by this suite."""
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -12,13 +13,14 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from export_opencode import Exporter, ReadBudgetExceeded, ProgressWatchdog
+import export_opencode
 import robob_readonly
 
 
 class NativeExportTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         guard = mock.patch.object(robob_readonly, '_live_paths', return_value={self.root / 'live.db'})
         guard.start()
         self.addCleanup(guard.stop)
@@ -424,6 +426,115 @@ class NativeExportTests(unittest.TestCase):
             self.start()
         with self.out() as out:
             self.assertEqual(out.execute('SELECT count(*) FROM session_message').fetchone()[0], 1)
+
+    def test_source_identity_migrates_legacy_device_stamp_and_reopens(self):
+        self.start()
+        self.finish()
+        for filename in ('source.sqlite', 'source:with:colons.sqlite', 'source.sqlite:123'):
+            with self.subTest(filename=filename):
+                self.exporter.close()
+                self.src.close()
+                renamed = self.root / filename
+                self.source.rename(renamed)
+                self.source = renamed
+                self.src = sqlite3.connect(self.source, isolation_level=None)
+                info = self.source.stat()
+                with self.out() as out:
+                    out.execute("UPDATE ardud_readonly_meta SET value=? WHERE key='source'",
+                                (f'{self.source}:{info.st_dev + 1}:{info.st_ino}',))
+                self.start()
+                self.assertEqual(json.loads(self.exporter.meta('source')), [str(self.source), str(info.st_ino)])
+                self.finish()
+                self.assertEqual(self.exporter.meta('ready'), '1')
+                self.exporter.close()
+                self.start()
+                self.finish()
+
+    def test_source_identity_refuses_changed_path_or_inode_in_either_format(self):
+        self.start()
+        self.finish()
+        info = self.source.stat()
+        for legacy in (False, True):
+            for changed in ('path', 'numeric path suffix', 'inode'):
+                with self.subTest(legacy=legacy, changed=changed):
+                    path = self.source.with_name('other:source.sqlite') if changed == 'path' else self.source
+                    if changed == 'numeric path suffix':
+                        path = self.source.with_name(self.source.name + ':123')
+                    inode = info.st_ino + 1 if changed == 'inode' else info.st_ino
+                    stamp = f'{path}:{info.st_dev}:{inode}' if legacy else json.dumps([str(path), str(inode)])
+                    with self.out() as out:
+                        out.execute("UPDATE ardud_readonly_meta SET value=? WHERE key='source'",
+                                    (stamp,))
+                    self.exporter.close()
+                    with self.assertRaisesRegex(RuntimeError, 'source replaced; rebuild'):
+                        self.start()
+                    with self.out() as out:
+                        self.assertEqual(out.execute('SELECT count(*) FROM session_message').fetchone()[0], 1)
+
+    def test_numeric_suffix_rename_with_same_inode_is_not_a_legacy_stamp(self):
+        self.src.close()
+        suffixed = self.source.with_name(self.source.name + ':123')
+        self.source.rename(suffixed)
+        original = self.source
+        self.source = suffixed
+        self.src = sqlite3.connect(self.source, isolation_level=None)
+        self.start()
+        self.finish()
+        inode = self.source.stat().st_ino
+        self.exporter.close()
+        self.src.close()
+        self.source.rename(original)
+        self.source = original
+        self.src = sqlite3.connect(self.source, isolation_level=None)
+        self.assertEqual(self.source.stat().st_ino, inode)
+        with self.assertRaisesRegex(RuntimeError, 'source replaced; rebuild'):
+            self.start()
+        with self.out() as out:
+            self.assertEqual(out.execute('SELECT count(*) FROM session_message').fetchone()[0], 1)
+
+    def test_begin_cycle_ignores_device_but_refuses_inode_or_path_change(self):
+        self.start()
+        original_stat = Path.stat
+        source_stat = self.source.stat()
+        for changed in ('device', 'inode', 'path'):
+            with self.subTest(changed=changed):
+                source_path = self.source.with_name('other.sqlite') if changed == 'path' else self.source
+
+                def stat(path, *args, **kwargs):
+                    if path == source_path:
+                        fields = list(source_stat)
+                        if changed != 'path':
+                            fields[2 if changed == 'device' else 1] += 1
+                        return os.stat_result(fields)
+                    return original_stat(path, *args, **kwargs)
+
+                with mock.patch.object(self.exporter, 'source_path', source_path), \
+                        mock.patch.object(Path, 'stat', stat):
+                    if changed == 'device':
+                        self.exporter.begin_cycle()
+                        self.finish()
+                        self.assertEqual(self.exporter.meta('ready'), '1')
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'source replaced; reopen'):
+                            self.exporter.begin_cycle()
+
+    def test_main_logs_fixed_runtime_reason_but_keeps_sqlite_and_data_errors_private(self):
+        for exc, expected in (
+            (RuntimeError('native source replaced; rebuild disposable export'),
+             'RuntimeError: native source replaced; rebuild disposable export'),
+            (sqlite3.OperationalError('secret row contents'), 'OperationalError'),
+            (ValueError('secret row contents'), 'ValueError'),
+        ):
+            with self.subTest(error=type(exc).__name__), \
+                    mock.patch.object(sys, 'argv', ['export_opencode.py', '--once']), \
+                    mock.patch.object(export_opencode, 'run', side_effect=exc), \
+                    mock.patch('sys.stderr') as stderr:
+                with self.assertRaises(SystemExit) as stopped:
+                    export_opencode.main()
+                self.assertEqual(stopped.exception.code, 1)
+                output = ''.join(call.args[0] for call in stderr.write.call_args_list)
+                self.assertIn(f'native export unavailable: {expected}\n', output)
+                self.assertNotIn('secret row contents', output)
 
     def test_destination_lost_or_replaced_exits_instead_of_using_old_handle(self):
         for lost in (True, False):

@@ -36,12 +36,21 @@ class RootwideSearchTests(unittest.TestCase):
                         if case['root']:
                             response = adapter.response(event, result)['hookSpecificOutput']
                             self.assertEqual(response['permissionDecision'], 'deny')
-                            self.assertIn('Refused: recursive search over ' + case['root'], response['permissionDecisionReason'])
+                            self.assertIn('Refused: a recursive search over ' + case['root'], response['permissionDecisionReason'])
+
+    def test_reason_names_current_worktree_without_retired_guidance(self):
+        cwd = '/Volumes/ExternalSSD/t3code-fork-wt/task-1'
+        message = guard.reason('/Volumes/ExternalSSD', cwd)
+        self.assertIn('/Volumes/ExternalSSD', message)
+        self.assertIn(cwd, message)
+        self.assertIn('exact file path', message)
+        self.assertNotIn('ovnfs', message.lower())
+        self.assertNotIn('/Users/ardud/checkouts', message)
 
     def test_guard_needs_no_identity_or_services(self):
         with patch.object(engine, '_log'), patch.object(engine, 'resolve_identity', side_effect=AssertionError('service called')):
             event = {'hook_event_name': 'PreToolUse', 'session_id': 'unavailable', 'tool_name': 'exec_command',
-                     'tool_input': {'cmd': 'rg foo /Users/ardud/checkouts', 'workdir': '/tmp'}}
+                     'tool_input': {'cmd': 'rg foo /Volumes/ExternalSSD', 'workdir': '/tmp'}}
             self.assertEqual(engine.decide(event, 'codex')['context']['rule'], 'rootwide-search')
 
     def test_parser_failure_does_not_disable_the_database_guard(self):
@@ -52,8 +61,8 @@ class RootwideSearchTests(unittest.TestCase):
 
     def test_inherited_override(self):
         with patch.dict(os.environ, {'AGENT_GUARD_APPROVED': 'owner-approved'}):
-            self.assertIsNone(guard.classify('rg --files /Users/ardud/checkouts', '/tmp'))
-            self.assertEqual(guard.classify('env -u AGENT_GUARD_APPROVED rg --files /Users/ardud/checkouts', '/tmp'), '/Users/ardud/checkouts')
+            self.assertIsNone(guard.classify('rg --files /Volumes/ExternalSSD', '/tmp'))
+            self.assertEqual(guard.classify('env -u AGENT_GUARD_APPROVED rg --files /Volumes/ExternalSSD', '/tmp'), '/Volumes/ExternalSSD')
 
     def test_manifest_registers_all_native_shell_entry_points_and_parity(self):
         manifest = json.loads((SRC.parents[1] / 'harness-homes/manifest.json').read_text())

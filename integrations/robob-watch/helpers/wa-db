@@ -21,6 +21,11 @@ DB = os.path.join(STORE, "wacli.db")
 SESSION_DB = os.path.join(STORE, "session.db")
 
 
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from redact import redact
+
+
 def die(msg, code=1):
     print(msg, file=sys.stderr)
     sys.exit(code)
@@ -118,13 +123,13 @@ def body(row):
         text += " (edited)"
     if row["revoked"]:
         text = "[deleted] " + text
-    return " / ".join(l for l in text.splitlines() if l.strip()) or text
+    return " / ".join(l for l in redact(text).splitlines() if l.strip()) or text
 
 
 def fmt(con, row):
     t = time.strftime("%d-%m-%y %H:%M:%S", time.localtime(row["ts"]))
     who = "Me" if row["from_me"] else label(con, row)
-    return f"({t}) {who}: {body(row)}"
+    return redact(f"({t}) {who}: {body(row)}")
 
 
 COLS = "rowid, chat_jid, msg_id, sender_jid, sender_name, ts, from_me, text, display_text, media_type, media_caption, filename, reaction_emoji, edited, edited_ts, revoked"
@@ -409,7 +414,7 @@ def cmd_new(args):
             ob["lines"] = prev + add
             json.dump(ob, open(outbox + ".tmp", "w"))
             os.replace(outbox + ".tmp", outbox)
-            print("\n".join(add))
+            print(redact("\n".join(add)))
             sys.stdout.flush()
     else:
         if outbox_same_run:  # retry after this run's earlier attempt was killed: its output never reached the runner
@@ -436,7 +441,7 @@ def emit(lines, run, outbox, replays=0):
     elif os.path.exists(outbox):
         os.remove(outbox)
     if lines:
-        print("\n".join(lines))
+        print(redact("\n".join(lines)))
 
 
 def main():
@@ -454,4 +459,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        from pathlib import Path as _LogPath
+        sys.path.insert(0, str(_LogPath(__file__).resolve().parent))
+        from toollog import helper_main
+    except Exception:
+        # Standalone copies of helpers can run before the optional logger is installed.
+        def helper_main(_name, fn, *args):
+            return fn(*args)
+    helper_main("wa-db", main)

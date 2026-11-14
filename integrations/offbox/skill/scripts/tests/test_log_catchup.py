@@ -4,6 +4,8 @@ import hashlib
 import io
 from pathlib import Path
 import sys
+import threading
+import time
 import tracemalloc
 import unittest
 from unittest.mock import patch
@@ -79,6 +81,24 @@ class LogCatchupTests(Isolated):
         self.assertIn('failed exit=7', out)
         self.assertEqual(err, '')
 
+    def test_detached_recovery_places_setup_before_command_output(self):
+        preamble = b'offbox: node v24.22.1\noffbox: pnpm v11.10.0\noffbox-command-started: run-x\n'
+        stdout = b'pytest failure details\n20 failed, 3 passed\n'
+        stderr = preamble + b'command error\n'
+        self.path.write_bytes(b'')
+        common.offsets_path(self.path).unlink(missing_ok=True)
+        self.streams(stdout, stderr, page=7)
+        self.state('failed', 1)
+        code, output, errors = self.invoke(wait=True)
+        self.assertEqual(code, 1)
+        expected = preamble + stdout + b'command error\n'
+        self.assertEqual(self.path.read_bytes(), expected)
+        self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=len(stdout), stderrOffset=len(stderr),
+                                                           logBytes=len(expected)))
+        self.assertIn(expected.decode(), output)
+        self.assertEqual(errors, '')
+        self.assertNotIn('pytest failure details', self.invoke(wait=True)[1])
+
     def test_uncommitted_suffix_is_removed_before_appending(self):
         with self.path.open('ab') as f:
             f.write(b'rest\nuncommitted')
@@ -98,6 +118,79 @@ class LogCatchupTests(Isolated):
         self.assertFalse(list(self.path.parent.glob('*.catchup.*')))
         self.assertEqual(self.invoke(wait=True)[0], 0)
 
+    def test_incomplete_step_warnings_never_repeat_a_recorded_zero(self):
+        self.con.execute("UPDATE runs SET step_count=2 WHERE run_id='run-x'")
+        self.con.commit()
+        self.prefix(b'offbox step 1 rc=0: first\n')
+        for result in ('complete', 'caught_up', 'n/a', 'incomplete:history unavailable', 'incomplete:timeout'):
+            for reader in ('logs', 'logs-follow', 'wait'):
+                with self.subTest(result=result, reader=reader):
+                    self.state('done', 0)
+                    with patch.object(api, 'BACKEND', 'server'), \
+                            patch.object(misc, '_catch_up_log', return_value=result):
+                        for _ in range(2):
+                            code, out, err = self.invoke(wait=reader == 'wait', follow=reader == 'logs-follow')
+                            self.assertEqual(code, 90)
+                            self.assertIn('steps incomplete: got 1 of 2 step results', err)
+                            self.assertNotIn('done exit=0', out + err)
+                            self.assertNotIn('remote exit 0', out + err)
+
+    def test_step_history_timeout_never_describes_a_recorded_zero_as_validated(self):
+        self.con.execute("UPDATE runs SET step_count=2 WHERE run_id='run-x'")
+        self.con.commit()
+        for complete_prefix in (False, True):
+            with self.subTest(complete_prefix=complete_prefix):
+                self.state('done', 0)
+                data = b'offbox step 1 rc=0: first\n'
+                if complete_prefix:
+                    data += b'offbox step 2 rc=0: second\n'
+                self.prefix(data)
+                clock = [1000]
+                def timeout(*args, **kwargs):
+                    clock[0] = 1002
+                    return 'incomplete:timeout'
+                out, err = io.StringIO(), io.StringIO()
+                with patch.object(api, 'BACKEND', 'server'), \
+                        patch.object(misc, 'now', side_effect=lambda: clock[0]), \
+                        patch.object(misc, '_catch_up_log', side_effect=timeout), \
+                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    with self.assertRaises(OffboxError) as raised:
+                        misc.wait('run-x', 1)
+                self.assertEqual(raised.exception.code, common.EXIT_WAIT_TIMEOUT)
+                self.assertIn('steps incomplete:', err.getvalue())
+                report = out.getvalue() + err.getvalue() + str(raised.exception)
+                self.assertNotIn('done exit=0', report)
+                self.assertNotIn('remote exit 0', report)
+
+    def test_wait_replays_failure_recovered_from_a_recorded_zero(self):
+        self.con.execute("UPDATE runs SET step_count=1 WHERE run_id='run-x'")
+        self.con.commit()
+        failure = b'actual failed assertion\noffbox step 1 rc=7: check\n'
+        self.prefix(failure)
+        self.streams(failure, b'')
+        code, output, errors = self.invoke(wait=True)
+        self.assertEqual(code, 7)
+        self.assertIn(failure.decode(), output)
+        self.assertIn('failed exit=7', output)
+        self.assertNotIn('actual failed assertion', self.invoke(wait=True)[1])
+
+    def test_failure_tail_stops_at_sampled_size_when_history_grows(self):
+        self.path.write_bytes(b'x' * 20000)
+        tail = misc._tail
+        def grow(*args, **kwargs):
+            with self.path.open('ab') as log:
+                log.write(b'late failure\n' * 2000)
+            return tail(*args, **kwargs)
+        output = io.StringIO()
+        with patch.object(misc, '_tail', side_effect=grow), contextlib.redirect_stdout(output):
+            misc._failure_tail(self.path)
+        self.assertEqual(output.getvalue(), 'x' * 16384)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            misc._failure_tail(self.path)
+        self.assertIn('late failure', output.getvalue())
+        self.assertLessEqual(len(output.getvalue()), 16384)
+
     def test_no_checkpoint_does_not_guess_stream_offsets(self):
         common.offsets_path(self.path).unlink()
         code, out, err = self.invoke()
@@ -106,15 +199,265 @@ class LogCatchupTests(Isolated):
         self.assertIn('output is incomplete', err)
         self.assertEqual(self.path.read_bytes(), b'prefix\n')
 
-    def test_held_lock_skips_fetch_and_write(self):
-        with common.file_lock('box-bx_a', timeout=0):
+    def test_box_lock_does_not_block_settled_logs_or_wait(self):
+        for wait in (False, True):
+            with self.subTest(wait=wait):
+                self.prefix(b'prefix\n')
+                self.streams(b'prefix\nrest\n', b'error\n')
+                with common.file_lock('box-bx_a', timeout=0):
+                    code, out, err = self.invoke(wait=wait)
+                self.assertEqual(code, 0)
+                self.assertEqual(self.path.read_bytes(), b'prefix\nrest\nerror\n')
+                self.assertIn('done exit=0' if wait else 'rest\nerror\n', out)
+                self.assertEqual(err, '')
+
+    def test_held_run_lock_skips_fetch_and_write(self):
+        ck = common.offsets_path(self.path).read_bytes()
+        with common.file_lock('log-run-x', timeout=0), patch.object(misc, 'LOG_READ_WAIT_S', 0.02):
             self.assertEqual(misc._catch_up_log(self.row()), 'n/a')
             code, out, err = self.invoke()
-            self.assertEqual((code, out), (0, 'prefix\n'))
-            self.assertIn('box lock held', err)
-            self.assertIn('output is incomplete', err)
+        self.assertEqual((code, out), (0, 'prefix\n'))
+        self.assertIn("couldn't be checked against the server and may be incomplete", err)
+        self.assertNotIn('box lock', err)
+        self.assertNotIn('this output is incomplete', err)
         self.history.assert_not_called()
         self.assertEqual(self.path.read_bytes(), b'prefix\n')
+        self.assertEqual(common.offsets_path(self.path).read_bytes(), ck)
+
+    def test_empty_skipped_readback_names_recorded_failure(self):
+        self.prefix(b'')
+        self.state('failed', 127)
+        with common.file_lock('log-run-x', timeout=0), patch.object(misc, 'LOG_READ_WAIT_S', 0.02):
+            for wait in (False, True):
+                code, out, err = self.invoke(wait=wait)
+                self.assertEqual(code, 127 if wait else 1)
+                self.assertIn('run ended failed exit=127', err)
+                self.assertIn('may be incomplete', err)
+                self.assertNotIn('no output', err)
+        self.history.assert_not_called()
+
+    def test_wait_timeout_caps_settled_run_lock_wait(self):
+        for status, code in (('done', 0), ('failed', 127), ('infra', None)):
+            for prefix in (b'', b'prefix\n'):
+                with self.subTest(status=status, prefix=prefix):
+                    self.prefix(prefix)
+                    self.state(status, code)
+                    err = io.StringIO()
+                    with common.file_lock('log-run-x', timeout=0), contextlib.redirect_stderr(err):
+                        started = time.monotonic()
+                        with self.assertRaises(OffboxError) as raised:
+                            misc.wait('run-x', 0.02)
+                        elapsed = time.monotonic() - started
+                    self.assertEqual(raised.exception.code, common.EXIT_WAIT_TIMEOUT)
+                    self.assertLess(elapsed, 0.25)
+                    self.assertIn(f'run ended {status} exit={code}', str(raised.exception))
+                    self.assertNotIn('keeps running', str(raised.exception))
+                    self.assertIn('may be incomplete', err.getvalue())
+                    self.assertNotIn('no output', err.getvalue())
+        self.history.assert_not_called()
+
+    def test_skipped_checks_without_history_identity_report_recorded_result(self):
+        self.prefix(b'')
+        for box, command in ((None, None), ('bx_a', None)):
+            for mode in ('bg', 'fg'):
+                for status, code in (('done', 0), ('failed', 127), ('infra', None)):
+                    with self.subTest(box=box, mode=mode, status=status):
+                        self.con.execute("UPDATE runs SET box_id=?,command_id=?,mode=? WHERE run_id='run-x'",
+                                         (box, command, mode))
+                        self.con.commit()
+                        self.state(status, code)
+                        with patch.object(api, 'BACKEND', 'server'):
+                            for wait in (False, True):
+                                actual, out, err = self.invoke(wait=wait)
+                                expected = (90 if code is None else code) if wait else (1 if mode == 'bg' else 0)
+                                self.assertEqual(actual, expected)
+                                self.assertIn(f'run ended {status} exit={code}', err)
+                                self.assertIn('server history is unavailable', err)
+                                self.assertIn('may be incomplete', err)
+                                self.assertNotIn('no output', err)
+        self.history.assert_not_called()
+
+    def test_running_writers_preserve_timeout_exit_when_run_lock_is_busy(self):
+        self.state('running', None)
+        for route in ('follow', 'takeover'):
+            with self.subTest(route=route), common.file_lock('log-run-x', timeout=0):
+                ck = common.offsets_path(self.path).read_bytes()
+                deadline = misc.now() + 0.02
+                with self.assertRaises(OffboxError) as raised:
+                    if route == 'follow':
+                        runs.follow('bx_a', 7, self.path, echo=False, run_id='run-x', until=deadline)
+                    else:
+                        misc._replay_takeover(self.row(), False, deadline, (7, 0), self.path, 7, True)
+                self.assertEqual(raised.exception.code, common.EXIT_WAIT_TIMEOUT)
+                self.assertEqual(self.path.read_bytes(), b'prefix\n')
+                self.assertEqual(common.offsets_path(self.path).read_bytes(), ck)
+
+    def test_reaper_completes_during_readers_wait(self):
+        for wait in (False, True):
+            with self.subTest(wait=wait):
+                self.prefix(b'')
+                held, release, done = threading.Event(), threading.Event(), threading.Event()
+                errors = []
+                row = dict(self.row())
+                def reaper():
+                    try:
+                        with runs.log_lock('run-x'):
+                            held.set()
+                            if not release.wait(2):
+                                raise AssertionError('reader did not wait')
+                            self.assertEqual(misc._catch_up_log(row, locked=True), 'caught_up')
+                    except BaseException as e:
+                        errors.append(e)
+                    finally:
+                        done.set()
+                worker = threading.Thread(target=reaper)
+                worker.start()
+                self.assertTrue(held.wait(2))
+                def finish_reaper(_):
+                    release.set()
+                    self.assertTrue(done.wait(2))
+                self.history.reset_mock()
+                try:
+                    with patch.object(runs.time, 'sleep', side_effect=finish_reaper):
+                        code, out, err = self.invoke(wait=wait)
+                finally:
+                    release.set()
+                    worker.join(2)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(code, 0)
+                self.assertEqual(self.path.read_bytes(), b'prefix\nrest\n')
+                self.assertEqual(self.history.call_count, 2)  # Only the reaper fetched the two streams.
+                self.assertEqual(err, '')
+                if not wait:
+                    self.assertEqual(out, 'prefix\nrest\n')
+
+    def test_contended_checkpoint_reuse_requires_identity_and_success_marker(self):
+        cases = (
+            (None, {}, False),
+            (None, dict(settledCheck=1), False),
+            (None, dict(settledCommandId=None, settledCheck=1), False),
+            ('cmd_a', {}, False),
+            ('cmd_a', dict(settledCommandId='cmd_a'), False),
+            ('cmd_a', dict(settledCommandId='cmd_a', settledCheck=None), False),
+            ('cmd_a', dict(settledCommandId='cmd_a', settledCheck=0), False),
+            ('cmd_a', dict(settledCommandId='other', settledCheck=1), False),
+            ('cmd_a', dict(settledCommandId='cmd_a', settledCheck=1), True),
+        )
+        for command, marker, reusable in cases:
+            for reader in ('logs', 'logs-follow', 'wait'):
+                with self.subTest(command=command, marker=marker, reader=reader):
+                    self.prefix(b'prefix\n')
+                    self.state('failed', 127)
+                    self.con.execute("UPDATE runs SET command_id=? WHERE run_id='run-x'", (command,))
+                    self.con.commit()
+                    self.history.reset_mock()
+                    with contextlib.ExitStack() as holder:
+                        holder.enter_context(common.file_lock('log-run-x', timeout=0))
+                        def publish(_):
+                            self.prefix(b'')
+                            ck = common.checkpoint(self.path)
+                            common.atomic_write_json(common.offsets_path(self.path), dict(ck, **marker))
+                            holder.close()
+                        with patch.object(runs.time, 'sleep', side_effect=publish), \
+                                patch.object(api, 'BACKEND', 'server'):
+                            code, out, err = self.invoke(wait=reader == 'wait', follow=reader == 'logs-follow')
+                    self.assertEqual(code, 127 if reader == 'wait' else (1 if reusable or not command else 0))
+                    if not command:
+                        self.assertIn('server history is unavailable', err)
+                        self.assertIn('may be incomplete', err)
+                        self.assertIn('run ended failed exit=127', err)
+                        self.assertNotIn('no output', err)
+                        self.history.assert_not_called()
+                    elif reusable:
+                        self.assertIn('no output', err)
+                        self.assertNotIn('incomplete', err)
+                        self.history.assert_not_called()
+                    else:
+                        self.assertEqual(self.path.read_bytes(), b'prefix\nrest\n')
+                        self.assertEqual(self.history.call_count, 2)
+                        self.assertEqual(err, '')
+
+    def test_finalization_deadline_reports_the_persisted_result(self):
+        finish_run = runs.finish
+        for route in ('takeover', 'direct-follow'):
+            for mode in ('bg', 'fg'):
+                for exit_code in (0, 127):
+                    with self.subTest(route=route, mode=mode, exit_code=exit_code):
+                        self.prefix(b'')
+                        self.state('running', None)
+                        self.con.execute("UPDATE runs SET mode=? WHERE run_id='run-x'", (mode,))
+                        self.con.commit()
+                        clock = [1000.0]
+                        out, err = io.StringIO(), io.StringIO()
+                        def finish(*args, **kwargs):
+                            finish_run(*args, **kwargs)
+                            if mode == 'fg':
+                                clock[0] = 1011.0
+                        def history(*args, **kwargs):
+                            clock[0] = 1011.0
+                            raise OffboxError('history deadline')
+                        self.history.side_effect = history
+                        self.history.reset_mock()
+                        with patch.object(api, 'BACKEND', 'server'), \
+                                patch.object(misc.time, 'time', side_effect=lambda: clock[0]), \
+                                patch.object(misc, '_resolve_exit', return_value=exit_code), \
+                                patch.object(misc, '_catch_up_finished'), \
+                                patch.object(runs, 'finish', side_effect=finish), \
+                                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                            with self.assertRaises(OffboxError) as raised:
+                                if route == 'takeover':
+                                    misc._replay_takeover(self.row(), False, 1010, (0, 0), self.path, 0, True)
+                                else:
+                                    misc._wait_run(self.row(), False, until=1010)
+                        status = 'failed' if exit_code else 'done'
+                        self.assertEqual((self.row()['status'], self.row()['exit_code']), (status, exit_code))
+                        self.assertEqual(raised.exception.code, common.EXIT_WAIT_TIMEOUT)
+                        self.assertIn(f'run ended {status} exit={exit_code}', str(raised.exception))
+                        self.assertNotIn('keeps running', str(raised.exception))
+                        if mode == 'bg':
+                            self.assertIn(f'run ended {status} exit={exit_code}', err.getvalue())
+                            self.assertIn('this output is incomplete', err.getvalue())
+                        self.assertNotIn('no output', err.getvalue())
+
+    def test_maintenance_skips_held_run_lock_and_records_reason(self):
+        ck = common.offsets_path(self.path).read_bytes()
+        with common.file_lock('log-run-x', timeout=0):
+            misc._catch_up_finished(self.con, 'run-x')
+        self.history.assert_not_called()
+        self.assertEqual(self.path.read_bytes(), b'prefix\n')
+        self.assertEqual(common.offsets_path(self.path).read_bytes(), ck)
+        recorded = self.con.execute("SELECT * FROM events WHERE kind='log_catchup_failed'").fetchall()
+        self.assertEqual(len(recorded), 1)
+        self.assertIn('run log lock held', str(tuple(recorded[0])))
+
+    def test_takeover_and_catchup_cannot_write_together(self):
+        held, release = threading.Event(), threading.Event()
+        errors = []
+        row = dict(self.row())
+        def replay(*args, **kwargs):
+            held.set()
+            if not release.wait(2):
+                raise AssertionError('reader did not try catchup')
+            return 0
+        def takeover():
+            try:
+                misc._replay_takeover(row, False, None, (7, 0), self.path, 7, has_checkpoint=True)
+            except BaseException as e:
+                errors.append(e)
+        with patch.object(misc, '_resolve_exit', side_effect=replay), patch.object(misc, '_finalize', return_value=0):
+            worker = threading.Thread(target=takeover)
+            worker.start()
+            try:
+                self.assertTrue(held.wait(2))
+                self.assertEqual(misc._catch_up_log(row, locked=True), 'n/a')
+                self.assertEqual(self.path.read_bytes(), b'prefix\n')
+            finally:
+                release.set()
+                worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.history.assert_not_called()
 
     def test_running_plain_logs_leave_active_followers_log_alone(self):
         for status in ('starting', 'running'):
@@ -148,10 +491,56 @@ class LogCatchupTests(Isolated):
     def test_already_complete_does_not_replace_log(self):
         self.streams(b'prefix\n', b'')
         inode = self.path.stat().st_ino
-        ck = common.offsets_path(self.path).stat().st_mtime_ns
         self.assertEqual(misc._catch_up_log(self.row()), 'complete')
         self.assertEqual(self.path.stat().st_ino, inode)
-        self.assertEqual(common.offsets_path(self.path).stat().st_mtime_ns, ck)
+        self.assertEqual(common.checkpoint(self.path)['logBytes'], 7)
+
+    def test_running_quiet_history_without_size_is_caught_up(self):
+        self.state('running', None)
+        self.history.side_effect = lambda box, cmd, which, offset, **kw: dict(
+            data='', nextOffset=offset, done=False)
+        ck = common.offsets_path(self.path).read_bytes()
+        before = self.path.stat()
+        self.assertEqual(misc._catch_up_log(self.row(), live=True), 'complete')
+        with patch.object(misc, '_refresh_running_ttl'):
+            code, out, err = self.invoke()
+        self.assertEqual((code, out), (0, 'prefix\n'))
+        self.assertNotIn('incomplete', err)
+        self.assertEqual([c.args[2:4] for c in self.history.call_args_list],
+                         [('stdout', 7), ('stderr', 0)] * 2)
+        self.assertEqual(self.path.read_bytes(), b'prefix\n')
+        self.assertEqual(self.path.stat().st_mtime_ns, before.st_mtime_ns)
+        self.assertEqual(common.offsets_path(self.path).read_bytes(), ck)
+
+    def test_running_history_without_size_appends_and_advances_both_streams(self):
+        self.state('running', None)
+        streams = dict(stdout='prefix\nrest €\n'.encode(), stderr=b'error\n')
+        def history(box, cmd, which, offset, **kw):
+            data = streams[which][offset:]
+            return dict(data=data.decode(), nextOffset=offset + len(data), done=False)
+        self.history.side_effect = history
+        self.assertEqual(misc._catch_up_log(self.row(), live=True), 'caught_up')
+        expected = streams['stdout'] + streams['stderr']
+        self.assertEqual(self.path.read_bytes(), expected)
+        self.assertEqual(common.checkpoint(self.path),
+                         dict(stdoutOffset=len(streams['stdout']), stderrOffset=len(streams['stderr']),
+                              logBytes=len(expected)))
+        with patch.object(misc, '_refresh_running_ttl'):
+            code, out, err = self.invoke()
+        self.assertEqual((code, out), (0, expected.decode()))
+        self.assertNotIn('incomplete', err)
+
+    def test_running_quiet_history_without_size_cannot_hide_uncheckpointed_bytes(self):
+        self.state('running', None)
+        with self.path.open('ab') as log:
+            log.write(b'uncheckpointed\n')
+        original = self.path.read_bytes()
+        ck = common.offsets_path(self.path).read_bytes()
+        self.history.side_effect = lambda box, cmd, which, offset, **kw: dict(
+            data='', nextOffset=offset, done=False)
+        self.assertEqual(misc._catch_up_log(self.row(), live=True), 'incomplete:history behind local log')
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(common.offsets_path(self.path).read_bytes(), ck)
 
     def test_stderr_only_prefix_with_stdout_zero_and_stderr_tail(self):
         prefix = b'e' * 4082
@@ -210,9 +599,13 @@ class LogCatchupTests(Isolated):
 
     def test_no_progress_preserves_original(self):
         self.history.side_effect = None
-        self.history.return_value = dict(data='', nextOffset=7, done=False, size=100)
-        self.assertEqual(misc._catch_up_log(self.row()), 'incomplete:no progress')
-        self.assertEqual(self.path.read_bytes(), b'prefix\n')
+        ck = common.offsets_path(self.path).read_bytes()
+        for size in ({'size': 100}, {}):
+            with self.subTest(size=size):
+                self.history.return_value = dict(data='', nextOffset=7, done=False, **size)
+                self.assertEqual(misc._catch_up_log(self.row()), 'incomplete:no progress')
+                self.assertEqual(self.path.read_bytes(), b'prefix\n')
+                self.assertEqual(common.offsets_path(self.path).read_bytes(), ck)
 
     def test_partial_second_stream_error_does_not_publish_stdout_tail(self):
         original = self.history.side_effect
@@ -287,7 +680,7 @@ class LogCatchupTests(Isolated):
 
     def test_held_lock_with_missing_log_does_not_create_it(self):
         self.path.unlink()
-        with common.file_lock('box-bx_a', timeout=0):
+        with common.file_lock('log-run-x', timeout=0):
             self.assertEqual(misc._catch_up_log(self.row()), 'n/a')
         self.assertFalse(self.path.exists())
         self.history.assert_not_called()

@@ -5,13 +5,15 @@ import type {
   OrchestrationV2StoredEvent,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
-import { ProviderInstanceId } from "@t3tools/contracts";
+import { ComposerContextId, ProviderInstanceId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import { guidanceContext } from "../imessage/guidance.ts";
 
 import { controlEventFromStored } from "./http.ts";
 import {
   formatModel,
   lastAssistantText,
+  messageSummary,
   modelSelectionFrom,
   parseSince,
   selectionMigrationApplies,
@@ -52,6 +54,71 @@ const message = (
     createdAt: at(createdAt),
     updatedAt: at(createdAt),
   }) as unknown as OrchestrationV2ConversationMessage;
+
+describe("message provenance", () => {
+  const userMessage = () => ({ ...message("m1", "user", "I paid Acme", 1), attachments: [] });
+
+  it("marks app typing as non-automated without an inbound id", () => {
+    expect(messageSummary(userMessage())).toMatchObject({
+      automated: false,
+      inboundMessageId: null,
+    });
+  });
+
+  it.each(["scheduledTaskId", "notification", "delegatedCompletion", "senderThreadId"] as const)(
+    "marks %s as automated even with a relayed id",
+    (key) => {
+      const automated = {
+        ...userMessage(),
+        [key]: key === "notification" || key === "delegatedCompletion" ? {} : "id-1",
+        context: guidanceContext('Current incoming message ID: "real-id"'),
+      } as OrchestrationV2ConversationMessage;
+      expect(messageSummary(automated)).toMatchObject({
+        automated: true,
+        inboundMessageId: "real-id",
+      });
+    },
+  );
+
+  it.each(["real-id", 'escaped-"quote\\slash', "wake:1", "reset:1", "secret:1", ""])(
+    "preserves the JSON-quoted inbound id %s",
+    (id) => {
+      const context = guidanceContext(`Current incoming message ID: ${JSON.stringify(id)}. Rest.`);
+      expect(messageSummary({ ...userMessage(), context }).inboundMessageId).toBe(id);
+    },
+  );
+
+  it.each([
+    "no inbound id",
+    "Current incoming message ID: unquoted",
+    'Current incoming message ID: "bad\\q"',
+  ])("returns null for missing or malformed ids: %s", (text) => {
+    expect(
+      messageSummary({ ...userMessage(), context: guidanceContext(text) }).inboundMessageId,
+    ).toBeNull();
+  });
+
+  it("only reads channel guidance and continues past records without an id", () => {
+    const first = guidanceContext("No id here")!;
+    const second = guidanceContext('Current incoming message ID: "real-id"')!;
+    const unrelated = {
+      version: 1 as const,
+      contextId: ComposerContextId.make("other"),
+      label: "Other",
+      kind: "other",
+      payload: { text: 'Current incoming message ID: "unrelated-id"' },
+    };
+    const context = {
+      version: 1 as const,
+      records: [unrelated, ...first.records, ...second.records],
+    };
+    expect(messageSummary({ ...userMessage(), context }).inboundMessageId).toBe("real-id");
+    expect(
+      messageSummary({ ...userMessage(), context: { ...context, records: [unrelated] } })
+        .inboundMessageId,
+    ).toBeNull();
+  });
+});
 
 describe("state mapping", () => {
   it("maps run statuses onto control states", () => {

@@ -1,0 +1,13 @@
+[
+  {"state":"checkout_warning", "patch":{"checkoutWarningPopup":{"title":"Review cart"}}, "error":"NOWNOW_CHECKOUT_WARNING_REQUIRES_REVIEW", "journal":"RELEASED"},
+  {"state":"membership_not_added", "patch":{"vipSingleCheckoutInfo":{"isAddedToCart":false}}, "journal":"ACTIVE"},
+  {"state":"membership_added", "patch":{"vipSingleCheckoutInfo":{"isAddedToCart":true}}, "error":"NOWNOW_MEMBERSHIP_PURCHASE_REQUIRES_APPROVAL", "journal":"RELEASED"},
+  {"state":"membership_null", "patch":{"vipSingleCheckoutInfo":null,"membershipInfo":{"hasMembership":true,"orderValue":20.5,"applyMinOrder":100,"applyAfter":79.5,"isMovExceeded":false,"membershipSaving":0,"isAutoApplied":null}}, "journal":"ACTIVE"},
+  {"state":"membership_null_unknown", "patch":{"vipSingleCheckoutInfo":null}, "error":"NOWNOW_MEMBERSHIP_STATE_UNVERIFIED", "journal":"RELEASED"},
+  {"state":"flow_expired_24h", "error":"NOWNOW_FLOW_EXPIRED_24H", "journal":"RELEASED"},
+  {"state":"stale_store_cart", "error":"NOWNOW_STORE_CART_PRESENT", "journal":null},
+  {"state":"3ds_pending", "status":"payment_ready_to_redirect", "redirect":false, "journal":"FENCED"},
+  {"state":"3ds_redirect_opened", "status":"payment_ready_to_redirect", "redirect":true, "journal":"FENCED"},
+  {"state":"verification_confirmed", "status":"payment_confirmed", "journal":"ACTIVE"},
+  {"state":"payment_error_code", "status":"payment_failed", "journal":"FENCED"}
+]

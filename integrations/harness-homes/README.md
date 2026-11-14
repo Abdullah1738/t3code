@@ -36,12 +36,37 @@ instance's environment, and OAuth state stays in the home it was created in.
   new skills and AGENTS.md edits reach the homes.
 - `tests/test_generate_homes.py`: temp-dir tests only.
 
-Flighty and InBody use their existing venvs on `127.0.0.1:18766/mcp` and
+Flighty uses a private copy of its venv's base Python at
+`~/.local/share/shared-mcp-flighty/python`, with packages from the existing venv.
+InBody keeps its existing venv. They serve `127.0.0.1:18766/mcp` and
 `127.0.0.1:18767/mcp`. Their LaunchAgents restart failed servers; `install.zsh
---check` fails if either endpoint stops answering. cua-driver retains a separate
-MCP connection per client because its transport owns private session state.
+--check` also calls Flighty's `search_airports` to catch database access errors.
+cua-driver retains a separate MCP connection per client because its transport
+owns private session state.
 After owner-approved installation, new native sessions pick up the URLs;
 existing stdio clients finish naturally. No Robob restart is needed.
+
+### Flighty Full Disk Access
+
+Run these steps in order from `integrations/harness-homes`:
+
+1. `/bin/zsh -f install.zsh --flighty-python` prepares only the dedicated
+   interpreter and prints `FULL_DISK_ACCESS_PATH=/Users/ardud/.local/share/shared-mcp-flighty/python/bin/python3.12`.
+   It reads the base installation from the venv's `pyvenv.cfg`; an unchanged
+   copy is left untouched. It does not load jobs or change harness config.
+2. Add the printed binary in **System Settings > Privacy & Security > Full Disk
+   Access**. Grant access to this copy only; the shared uv interpreter is used
+   by other projects.
+3. `/bin/zsh -f install.zsh` syncs the copy before loading the services, then
+   checks them before switching config. A failed install restores the previous
+   package/config/jobs and leaves the dedicated copy in place.
+4. `install.zsh --check` verifies the installed homes, plists, jobs and endpoints.
+
+Repeat this order if an interpreter update changes the binary and macOS requires
+a new grant. InBody's check lists tools without calling its authenticated API.
+The temporary servers started by `shared/smoke.py` use the same interpreters as
+the LaunchAgents, but inherit the caller's access. Only the installed service's
+health check proves Flighty's database is readable under launchd.
 
 ## Source parity checks
 
@@ -65,11 +90,15 @@ Each parity manifest has schema version 1 and these fields:
   `settings.json`, `.claude.json`, `CLAUDE.md`, `overlay.md`; each Codex home
   covers `config.toml`, `hooks.json`, `AGENTS.md`, `models.json`. Hashes come
   from the generator's plan, never from potentially edited output files.
-  Only `.claude.json` has `format: "claude-owned-json"`: hash the projection
+  `.claude.json` has `format: "claude-owned-json"`: hash the projection
   `{mcpServers, hasCompletedOnboarding}` as recursively key-sorted compact JSON
   (`separators=(",", ":")`, UTF-8, `ensure_ascii=False`, no trailing newline).
   CLI-managed projects/counters remain preserved and do not invalidate parity.
-  All other artifacts omit `format` and retain raw-byte SHA-256.
+  Codex `config.toml` has `format: "codex-owned-json"`: hash the parsed config
+  with only `projects` removed, using the same sorted compact JSON encoding.
+  Codex manages those trust entries
+  at runtime; generation preserves them in each home. All other artifacts omit
+  `format` and retain raw-byte SHA-256.
 - `skills: [{name, source, sha256}]`, hashing the source `SKILL.md`.
 - `mcpServers`: the manifest's shared non-secret server specifications.
 - `runtimeMcpServers: ["t3-code"]`: injected per thread, not proven by home generation.

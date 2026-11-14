@@ -1,3 +1,4 @@
+import { ThreadItemRedacted } from "./ardud/threadRedaction.ts";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -591,6 +592,16 @@ export const OrchestrationV2Run = Schema.Struct({
       planId: PlanId,
     }),
   ),
+  launchRecovery: Schema.optional(
+    Schema.Struct({
+      kind: Schema.Literals(["model_access", "relay"]),
+      replayAllowed: Schema.optional(Schema.Boolean),
+      retriesOnModel: Schema.Number,
+      attempt: PositiveInt,
+      delayMs: Schema.Number,
+      since: IsoDateTime,
+    }),
+  ),
   transientRecovery: Schema.optional(
     Schema.Struct({
       firstError: Schema.suspend(() => OrchestrationV2ProviderFailure),
@@ -902,6 +913,7 @@ export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
   itemIdentityVersion: Schema.optional(Schema.Literal(2)),
   seededHistory: Schema.optional(OrchestrationV2SeededHistory),
   successfulModels: Schema.optional(Schema.Array(Schema.String)),
+  claudeRefusalObserved: Schema.optional(Schema.Boolean),
 });
 export type OrchestrationV2ProviderThreadNativeMetadata =
   typeof OrchestrationV2ProviderThreadNativeMetadata.Type;
@@ -950,6 +962,8 @@ export const OrchestrationV2ProviderThread = Schema.Struct({
   pendingBackgroundTasks: Schema.optional(Schema.Array(OrchestrationV2PendingBackgroundTask)).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
+  // An ordered idle update follows the output of native background work, including child follow-ups.
+  pendingBackgroundWork: Schema.optional(Schema.Boolean),
   contextUsage: Schema.optional(Schema.NullOr(ThreadTokenUsageSnapshot)).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
@@ -1141,6 +1155,7 @@ export type OrchestrationV2NotificationSource = typeof OrchestrationV2Notificati
 
 export const OrchestrationV2Notification = Schema.Struct({
   source: OrchestrationV2NotificationSource,
+  pullRequestWatch: Schema.optional(Schema.Struct({ url: Schema.String, headSha: Schema.String })),
   outcome: Schema.Literals(["completed", "failed", "cancelled", "updated", "unknown"]),
   summary: TrimmedNonEmptyString,
   detail: Schema.optional(Schema.String),
@@ -1351,6 +1366,14 @@ export const OrchestrationV2ProviderFailure = Schema.Struct({
   message: OrchestrationV2ProviderFailureMessage,
   code: Schema.NullOr(OrchestrationV2ProviderFailureCode),
   retryable: Schema.NullOr(Schema.Boolean),
+  claudeAccess: Schema.optional(
+    Schema.Struct({
+      status: Schema.NullOr(Schema.Number),
+      beforeResponse: Schema.Boolean,
+      refusalFree: Schema.Boolean,
+      refused: Schema.Boolean,
+    }),
+  ),
   resetAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   category: Schema.optional(OrchestrationV2ProviderFailureCategory).pipe(
     Schema.withDecodingDefault(Effect.succeed("unknown" as const)),
@@ -1824,6 +1847,11 @@ export const OrchestrationV2DomainEvent = Schema.Union([
   }),
   Schema.Struct({
     ...OrchestrationV2EventBase.fields,
+    type: Schema.Literal("thread.item-redacted"),
+    payload: ThreadItemRedacted,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
     type: Schema.Literal("turn-item.updated"),
     payload: OrchestrationV2TurnItem,
   }),
@@ -2045,12 +2073,14 @@ export const OrchestrationV2ShellStreamItem = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("thread.updated"),
     sequence: NonNegativeInt,
+    redactionSequence: Schema.optionalKey(NonNegativeInt),
     location: Schema.Literals(["active", "archive"]),
     thread: OrchestrationV2ThreadShell,
   }),
   Schema.Struct({
     kind: Schema.Literal("thread.removed"),
     sequence: NonNegativeInt,
+    redactionSequence: Schema.optionalKey(NonNegativeInt),
     location: Schema.Literals(["active", "archive"]),
     threadId: ThreadId,
   }),
@@ -2663,6 +2693,11 @@ export const OrchestrationV2DomainEventJson = Schema.Union([
   }),
   Schema.Struct({
     ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literal("thread.item-redacted"),
+    payload: ThreadItemRedacted,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
     type: Schema.Literal("turn-item.updated"),
     payload: OrchestrationV2TurnItemJson,
   }),
@@ -3214,6 +3249,8 @@ const OrchestrationV2InternalCommand = Schema.Union([
     threadId: ThreadId,
     ...ThreadPullRequestKey.fields,
     startedAt: IsoDateTime,
+    expectedHeadSha: Schema.optional(Schema.NullOr(Schema.String)),
+    expectedObservedHeadSha: Schema.optional(Schema.NullOr(Schema.String)),
     watch: Schema.NullOr(ThreadPullRequestWatch),
     /** With `watch: null`, the state the ended watch keeps instead of its last saved one. */
     endedWatch: Schema.optional(ThreadPullRequestWatch),

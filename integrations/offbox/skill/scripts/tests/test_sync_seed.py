@@ -1,16 +1,14 @@
 """Offline first-sync seeding and progress tests."""
-import contextlib
-import io
 import os
 from pathlib import Path
 import subprocess
 import sys
-import time
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tests._env import clean_env
 from offbox_lib import runs, ssh_sync  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
 
@@ -29,6 +27,9 @@ class SyncSeedTests(Isolated):
         self.rsyncs = []
         self.real_run = subprocess.run
         self.stack.enter_context(patch.object(ssh_sync, "log"))
+        self.stack.enter_context(patch.object(ssh_sync, "_watch_rsync", side_effect=self.watch_local))
+        self.stack.enter_context(patch.object(ssh_sync, "_progress_args", return_value=()))
+
         self.stack.enter_context(patch.object(ssh_sync, "ssh", side_effect=self.fake_ssh))
         self.stack.enter_context(patch.object(ssh_sync.subprocess, "run", side_effect=self.run_local))
 
@@ -39,8 +40,12 @@ class SyncSeedTests(Isolated):
         self.con.commit()
 
     def fake_ssh(self, box, command, **kwargs):
-        return self.real_run(["sh", "-c", command], env={**os.environ, "HOME": str(self.box_home)},
+        return self.real_run(["sh", "-c", command], env=clean_env(HOME=str(self.box_home)),
                              capture_output=True, timeout=kwargs.get("timeout"))
+
+    def watch_local(self, cmd, timeout, input=None, **kwargs):
+        return subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape",
+                              timeout=timeout, input=input)
 
     def run_local(self, cmd, **kwargs):
         if cmd[0] == ssh_sync.RSYNC:
@@ -81,6 +86,20 @@ class SyncSeedTests(Isolated):
         self.push()
         self.assertFalse(any(a.startswith("--copy-dest") for a in self.rsyncs[0]))
 
+    def test_seed_same_size_same_second_different_content_is_not_reused(self):
+        sibling = self.box_home / self.sibling
+        sibling.mkdir()
+        src, basis = self.src / "tracked.txt", sibling / "tracked.txt"
+        src.write_text("pin=721dcbf6\n")
+        basis.write_text("pin=0366b5ae\n")
+        os.utime(src, ns=(1794618566083649423, 1794618566083649423))
+        os.utime(basis, ns=(1794618566083434298, 1794618566083434298))
+        self.add_run(self.sibling)
+        self.push()
+        self.assertEqual((self.box_home / self.current / "tracked.txt").read_bytes(), src.read_bytes())
+        self.assertEqual(basis.read_text(), "pin=0366b5ae\n")
+        self.assertIn("--checksum", self.rsyncs[0])
+
     def test_wrong_box_repo_and_invalid_names_are_ignored(self):
         other = self.base / "other"
         other.mkdir()
@@ -103,28 +122,6 @@ class SyncSeedTests(Isolated):
         with patch.object(ssh_sync, "ssh", return_value=subprocess.CompletedProcess([], 255, b"", b"failed")):
             self.push()
         self.assertFalse(any(a.startswith("--copy-dest") for a in self.rsyncs[0]))
-
-    def test_progress_only_for_slow_push_and_stops_on_error(self):
-        for delay, fail in ((0.12, False), (0, False), (0.12, True)):
-            stderr = io.StringIO()
-            def fake_pass(*args):
-                time.sleep(delay)
-                if fail:
-                    raise RuntimeError("failed")
-                return {}
-            with self.subTest(delay=delay, fail=fail), patch.object(ssh_sync, "SYNC_PROGRESS_S", 0.04), \
-                    patch.object(ssh_sync, "_push_file_passes", side_effect=fake_pass), \
-                    contextlib.redirect_stderr(stderr):
-                if fail:
-                    with self.assertRaises(RuntimeError):
-                        ssh_sync._push_files("box", self.src, self.current, False, 1, None, [])
-                else:
-                    ssh_sync._push_files("box", self.src, self.current, False, 1, None, [])
-                output = stderr.getvalue()
-                self.assertEqual("still syncing repo -> box" in output, delay > 0)
-                time.sleep(0.06)
-                self.assertEqual(stderr.getvalue(), output)
-
 
 if __name__ == "__main__":
     unittest.main()

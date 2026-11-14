@@ -1,4 +1,8 @@
-import { annotateSqliteError, ErrorObserver } from "@t3tools/shared/nodeSqliteErrors";
+import {
+  annotateSqliteError,
+  ErrorObserver,
+  sqliteErrorDetails,
+} from "@t3tools/shared/nodeSqliteErrors";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
@@ -17,10 +21,12 @@ import { archiveCheckpointLayer } from "../ardud/persistence/archiveCheckpoint.t
 import { ArchiveSnapshotGate } from "../ardud/persistence/archiveSnapshotGate.ts";
 import { readerLaneOptions, STATEV2_READER_LANES } from "../ardud/persistence/readerLanes.ts";
 import * as Semaphore from "effect/Semaphore";
+import { ServerActivation } from "../serverActivation.ts";
 // Reads only a tiny installation marker before constructing reader workers.
 import * as NodeSqlite from "node:sqlite";
 
 export const WAL_SIZE_LIMIT_BYTES = 32 * 1024 * 1024;
+const SQLITE_READONLY_ROLLBACK = 776;
 
 export const runSqliteSetupPhases = Effect.fn("runSqliteSetupPhases")(function* <E1, R1, E2, R2>(
   migrations: Effect.Effect<void, E1, R1>,
@@ -121,11 +127,15 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
   yield* fs.makeDirectory(path.dirname(dbPath), { recursive: true });
   const observer = yield* ErrorObserver;
   const snapshotGate = yield* Semaphore.make(1);
+  const checkpointWorkerStart = yield* ServerActivation;
   const baseFilename = yield* withStartupPhase(
     "sqlite.marker",
-    Effect.sync(() => {
-      try {
-        const marker = new NodeSqlite.DatabaseSync(dbPath);
+    Effect.gen(function* () {
+      if (!(yield* fs.exists(dbPath))) return undefined;
+      const readMarker = (readOnly: boolean) => {
+        // A writable last connection checkpoints on close, even after SELECTs.
+        // Leave inherited WAL frames to the main client's checkpoint worker.
+        const marker = new NodeSqlite.DatabaseSync(dbPath, { readOnly });
         try {
           const exists = marker
             .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'ardud_history_base_archive'")
@@ -139,6 +149,16 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
             : undefined;
         } finally {
           marker.close();
+        }
+      };
+      try {
+        try {
+          return readMarker(true);
+        } catch (cause) {
+          // A hot rollback journal must be recovered by a writable connection.
+          // This is rollback mode; closing it cannot checkpoint an inherited WAL.
+          if (sqliteErrorDetails(cause)?.errcode !== SQLITE_READONLY_ROLLBACK) throw cause;
+          return readMarker(false);
         }
       } catch (cause) {
         annotateSqliteError(
@@ -179,9 +199,10 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
               "SELECT rootpage FROM ardud_base.sqlite_schema LIMIT 1",
             ],
             readerSnapshotLock: snapshotGate,
-            // Checkpoints sync the database, with F_FULLFSYNC on macOS. Run them off
-            // the event loop so a slow flush cannot stall clients.
+            // Keep checkpoint fsyncs off the event loop. On APFS their writes can
+            // also stall cold reads, so routine checkpoints wait for activation.
             checkpointWorker: true,
+            checkpointWorkerStart,
             spanAttributes: {
               "db.name": path.basename(dbPath),
               "service.name": "t3code-server",

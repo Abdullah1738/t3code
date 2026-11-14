@@ -134,6 +134,33 @@ class CardTests(unittest.TestCase):
         self.assertEqual(c.eta({**d,'eta_text':'1 hr 5 min'}, {})[0], '13:05')
         self.assertIsNone(c.eta({'eta_text':'in 8 min'}, {})[2])
 
+    def test_careem_live_stages_and_journal_health(self):
+        for vertical in ('food', 'quik'):
+            cfg = dict(self.cfg, app='careem', vertical=vertical)
+            for status, label, idx in [('preparing', 'Preparing' if vertical == 'food' else 'Packing', 1),
+                                       ('out for delivery', 'On the way' if vertical == 'food' else 'Out for delivery', 3 if vertical == 'food' else 2),
+                                       ('nearby', 'Almost here', 3 if vertical == 'food' else 2),
+                                       ('delivered', 'Delivered', 4 if vertical == 'food' else 3)]:
+                with self.subTest(vertical=vertical, status=status):
+                    data = dict(self.data, status=status, errors=['native_account_capture_required_guest_catalog_only'], live_source_ok=True)
+                    v = c.view(cfg, data, {})
+                    self.assertEqual((v['stage'], v['index']), (label, idx))
+                    self.assertEqual(v['steps'][idx], label)
+                    self.assertFalse(v['unavailable'])
+                    self.assertEqual(v['terminal'], status == 'delivered')
+                    self.assertTrue(c.view(cfg, {**data, 'live_source_ok': False}, {})['unavailable'])
+        self.assertEqual(c.view(dict(self.cfg, app='careem', vertical='box'),
+                                dict(self.data, status='nearby'), {})['stage'], 'Out for delivery')
+        stale = dict(self.data, status='unknown', last_confirmed_status='nearby', errors=['notification_collector_stale'])
+        v = c.view(dict(self.cfg, app='careem', vertical='food'), stale, {})
+        self.assertEqual(v['stage'], 'Almost here')
+        self.assertTrue(v['unavailable'])
+
+    def test_careem_notification_eta_takes_precedence(self):
+        cfg = dict(self.cfg, app='careem', eta='2026-11-11T15:15:00+04:00')
+        data = dict(self.data, eta='2026-11-11T15:05:50+04:00', eta_source='careem_notification', eta_text='in 20 min')
+        self.assertEqual(c.eta(data, cfg)[0], '15:05')
+
     def test_label_reads_before_the_time_and_no_estimate_is_a_word(self):
         d = {'checked_at':'2026-10-22T08:00:00Z','eta_text':'Arrives in 25-35 mins'}
         v = c.view(self.cfg, d, self.cfg['card_meta'])
@@ -348,6 +375,7 @@ class CardTests(unittest.TestCase):
         with patch.object(c, 'sync', side_effect=ModuleNotFoundError("No module named 'PIL'")), contextlib.redirect_stderr(stderr):
             result = c.safe_sync(self.cfg, self.data)
         self.assertEqual(result['status'], "failed:ModuleNotFoundError:No module named 'PIL'")
+        self.assertIs(result['rendered'], False)
         self.assertIn('Traceback', stderr.getvalue())
         self.assertIn("No module named 'PIL'", stderr.getvalue())
 
@@ -707,6 +735,7 @@ class CardTests(unittest.TestCase):
         (folder/'items.json').write_text('{"store":"private metadata"}')
         result=c.sync(self.cfg,{**self.data,'status':'delivered'},send=False)
         self.assertEqual(result['status'],'failed:public_directory_has_extra_files')
+        self.assertIs(result['rendered'], False)
         self.assertEqual(before,(folder/'index.html').read_bytes())
 
     def test_now_now_native_total_and_minutes_price_omission(self):
@@ -803,3 +832,23 @@ class CardTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RenderLoggingTests(unittest.TestCase):
+    def test_render_success_failure_and_no_payload_in_emitter(self):
+        from unittest.mock import Mock
+        with patch.object(c, '_build', return_value={'has_preview': True}), patch.object(c, 'log_render') as log:
+            self.assertEqual(c.build({}, {}), {'has_preview': True})
+            self.assertTrue(log.call_args.args[1])
+        with patch.object(c, '_build', return_value={'has_preview': False}), patch.object(c, 'log_render') as log:
+            self.assertFalse(c.build({}, {})['has_preview'])
+            self.assertFalse(log.call_args.args[1])
+        with patch.object(c, '_build', side_effect=ValueError('PRIVATE_CARD')), patch.object(c, 'log_render') as log:
+            with self.assertRaises(ValueError):
+                c.build({}, {})
+            self.assertFalse(log.call_args.args[1])
+        with patch.object(c.subprocess, 'Popen') as child, patch.object(c.threading, 'Thread'):
+            c.log_render(time.monotonic(), False)
+            self.assertEqual(child.call_args.args[0][2:5], ['log-card-render', '--kind', 'delivery'])
+        with patch.object(c.subprocess, 'Popen', side_effect=OSError('unavailable')):
+            c.log_render(time.monotonic(), True)

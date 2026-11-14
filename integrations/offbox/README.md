@@ -6,6 +6,9 @@ server (`server/`, once `server/bootstrap.zsh <ip> client` has written
 the standby while home is down) instead of the Mac, and runs light Go checks
 locally in a macOS sandbox.
 
+`offbox exec [box_id] [--timeout N] [--cwd DIR] [--json] -- <cmd...>` uses the authenticated, owner-checked control API on home or Boat when the guest stops, masks or replaces sshd (such as TorSSH testhost); timeout defaults to 60s, clamped to 1..600, and it returns the remote exit code (90 for API/transport failure).
+Never bypass a host-key mismatch by editing known_hosts or disabling strict checking; `boat exec` is Boat-only and returns 404 for home boxes.
+
 | Path here | Live copy |
 | --- | --- |
 | `skill/` | `~/.config/opencode/skills/remote-compute/` (the `remote-compute` skill, `offbox` CLI, classifier, monitor, box templates) |
@@ -16,7 +19,7 @@ locally in a macOS sandbox.
 | (link) | `~/.local/bin/offbox` -> `skill/scripts/offbox.py` in the live skill |
 
 State stays outside the repo: `~/.local/share/offbox/` (offbox.db for Boat,
-offbox-home.db for the home server, logs, backups, `server.json`,
+offbox-home.db for the home server, repo-keys.db for checkout identity shared by both, logs, backups, `server.json`,
 `backend-state.json`), gate mode `~/.config/opencode/offbox-gate.json`, boat token under
 `~/Library/Application Support/ascii/boat/`.
 
@@ -50,6 +53,31 @@ Until `bootstrap.zsh` writes `server.json` (or while it says `"disabled": true`)
 network, no files. `home_monitor.py tick --dry-run` (or `OFFBOX_HOME_MONITOR_DRY_RUN=1`) checks and records
 state but starts no thread and sends nothing, and prints what it would have done; `home_monitor.py status`
 prints the state. Events are in `~/.local/share/offbox/home-monitor.log`.
+
+## Repo Node and pnpm
+
+Before running user code, offbox selects Node satisfying the nearest `.nvmrc` /
+`.node-version` and `engines.node` together. Missing versions are installed through
+nvm from official Node archives, checked against SHASUMS256 and staged before
+activation. The crpko-node recipe carries nvm Node 20, 22 (>=22.13), and 24;
+it does not depend on the base image's system Node.
+
+For repos with `pnpm-lock.yaml`, selection is `packageManager` (including 11+) >
+CI `PNPM_VERSION` / `pnpm/action-setup` > lockfile compatibility (9.0 → pnpm 10,
+never 11+ by fallback). A checksum-verified package and PATH shim in the box-local
+cache avoid Corepack's implicit latest lookup. Each run prints `offbox: node vX
+(...)` and `offbox: pnpm vX (<source>)`; matching installed toolchains need no
+network calls. Repos without Node pins or a pnpm lockfile keep their behaviour.
+
+Toolchain downloads allow 20 s to connect, fail below 30 KB/s for 60 s, cap each
+attempt at 600 s, and retry all errors twice (including partial transfers and
+connection resets). Cached archives survive runs; extraction is staged, so an
+incomplete install is never selected.
+
+Toolchain exit code:
+
+- **99**: pinned Node/pnpm provisioning, checksum verification, or activation
+  failed. The user command never started. No box-default fallback.
 
 ## Changing it
 

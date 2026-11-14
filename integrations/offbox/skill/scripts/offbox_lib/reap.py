@@ -5,11 +5,13 @@ boat's 14 days (bases.upkeep). Every action is logged to events + offbox.log."""
 from __future__ import annotations
 
 import time
+import sqlite3
+import re
 
 from . import api, bases, capacity, lease, prune
 from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, EXIT_INTERRUPTED, IDLE_STOP_S, KEEPALIVE_S, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
-                     iso_ts, kv_set, mine, now, say)
+                     iso_ts, kv_set, mine, now, owner_of_root, owner_scoped, PERSON_PREFIX, require_mine, say, token_owner, write)
 from .identity import thread_get
 
 # The monitor kills a reap pass at 120 s; keep every boat call and wait inside this budget.
@@ -45,6 +47,22 @@ def _recheck_prune_holds(con, actions: list[str]) -> None:
 
 
 def reap(dry: bool = False) -> list[str]:
+    import toollog
+    with toollog.span("reaper", "reaper.pass", props={"dryRun": dry}, tag="reaper_failed") as data:
+        actions = _reap_logged(dry)
+        data["props"]["count"] = len(actions)
+        data["ok"] = not any("(FAILED:" in action or " list failed:" in action for action in actions)
+        for action in actions:
+            word = action.removeprefix("would ").split(" ", 1)[0]
+            failed = "(FAILED:" in action or " list failed:" in action
+            lost = re.fullmatch(r"(?:would )?mark (?:local |no-box )?run (\S+) lost(?: \(client \d+ gone\))?", action)
+            toollog.emit("reaper", "reaper.action", kind="error" if failed else "event", ok=not failed,
+                         tag="reaper_action" if failed else None, ids={"run": lost[1]} if lost else None,
+                         props={"dryRun": dry, "action": word if word in {"stop", "delete", "forget", "settle", "keep"} else "other"})
+        return actions
+
+
+def _reap_logged(dry: bool = False) -> list[str]:
     actions: list[str] = []
     con = db()
     try:
@@ -70,16 +88,23 @@ def _bringup_lock(row) -> str:
 
 
 def _forget(con, box_id: str, actions: list[str], dry: bool = False) -> None:
+    if lease.pinned_until(con, box_id) > now():
+        actions.append(f"keep {box_id}: pinned; backend miss does not retire its lease")
+        return
     actions.append(f"{'would forget' if dry else 'forget'} {box_id}: quarantined and gone from {api.NAME}")
     if not dry:
-        con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-        con.commit()
-        event(con, box_id, "reap_forget", f"recipe box no longer exists on {api.NAME}")
+        try:
+            lease.forget_box(con, box_id, "reap_forget", f"recipe box no longer exists on {api.NAME}")
+        except lease.PinnedLeaseError as pin:
+            actions[-1] = f"keep {box_id}: {pin}"
 
 
 def _retire_locked(con, bid: str, row, dry: bool, act, actions: list[str]) -> None:
     """Delete a quarantined or abandoned bring-up box. The bring-up lock is taken first (no wait), then the row is
     re-read: a live acquisition that finished meanwhile is left alone. act() takes the box lock itself."""
+    if lease.pinned_until(con, bid) > now():
+        actions.append(f"keep {bid}: pinned recipe box")
+        return
     if dry:
         actions.append(f"would delete {bid}: recipe box quarantined or bring-up abandoned")
         return
@@ -94,41 +119,78 @@ def _retire_locked(con, bid: str, row, dry: bool, act, actions: list[str]) -> No
         lambda bid=bid: lease.delete_box(con, bid, "reap: recipe box quarantined or abandoned"))
 
 
+def _mark_lost(con, run_id, error=None, *, no_box=False, expected_client=None):
+    from .runs import claim_terminal_log, emit_terminal
+    with write(con):
+        changed = con.execute("UPDATE runs SET status='lost', end_at=?, error=COALESCE(?,error) "
+                              "WHERE run_id=? AND status IN ('starting','running')" +
+                              (" AND box_id IS NULL" if no_box else "") +
+                              (" AND client_pid IS ? AND start_at IS ?" if expected_client is not None else ""),
+                              (now(), error, run_id, *(expected_client or ())))
+        row = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone() if changed.rowcount else None
+        log_row = claim_terminal_log(con, row)
+    if log_row is not None:
+        emit_terminal(log_row)
+
+
 def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     capacity.schema(con)
+    # Cleanup can declare an absent client/box lost before _check_unlocked ever sees its runs.
+    # A saved result is stronger evidence, including for a placeholder left by an earlier pass.
+    from .runs import finish, restore_run_state, terminal_result
+    recovered, unowned = set(), set()
+    owned = f"(r.box_id IS NULL OR (l.box_id IS NOT NULL AND {mine('l')}))" if owner_scoped() else '1=1'
+    for run in con.execute("SELECT r.* FROM runs r LEFT JOIN leases l USING(box_id) "
+                           "WHERE (r.status IN ('starting','running') OR (r.status='lost' AND r.exit_code IS NULL) OR "
+                           "(r.status='infra' AND r.exit_code IS NULL AND EXISTS "
+                           "(SELECT 1 FROM kv WHERE k='start_unknown:' || r.run_id))) "
+                           f"AND {owned}").fetchall():
+        if owner_scoped() and not run['box_id']:
+            owner = run['owner'] or ''
+            who = owner[len(PERSON_PREFIX):] if owner.startswith(PERSON_PREFIX) else owner_of_root(run['repo_root'])
+            if who != token_owner():
+                unowned.add(run['run_id'])
+                continue
+        saved = restore_run_state(run)
+        if saved['box_id']:
+            require_mine(con, saved['box_id'])
+        if terminal_result(saved):
+            recovered.add(run['run_id'])
+            if not dry:
+                finish(run['run_id'], saved['exit_code'], saved['status'], catch_up=False)
+            actions.append(f"{'would repair' if dry else 'repair'} run {run['run_id']} exit={saved['exit_code']}")
     # Local runs (local-first or fallback) whose offbox process died without recording an end.
     stale = con.execute("SELECT run_id FROM runs WHERE mode='local' AND status IN ('starting','running') "
                         "AND start_at<?", (now() - 6 * 3600,)).fetchall()
     for (rid,) in stale:
+        if rid in recovered or rid in unowned:
+            continue
         actions.append(f"{'would mark' if dry else 'mark'} local run {rid} lost")
         if not dry:
-            con.execute("UPDATE runs SET status='lost', end_at=? WHERE run_id=?", (now(), rid))
-    if stale and not dry:
-        con.commit()
+            _mark_lost(con, rid)
     # Foreground/--bg runs that never got a box (client died while waiting in the pool): nothing remote to check.
-    # Two hours is past any pool wait, so live waiters are never touched.
-    nobox = con.execute("SELECT run_id FROM runs WHERE mode IN ('fg','bg') AND box_id IS NULL "
-                        "AND status IN ('starting','running') AND start_at<?", (now() - 2 * 3600,)).fetchall()
-    for (rid,) in nobox:
+    # Old clients without a PID retain the legacy age limit; a live queued client can wait longer at home.
+    nobox = con.execute("SELECT run_id,start_at FROM runs WHERE mode IN ('fg','bg') AND box_id IS NULL "
+                        "AND client_pid IS NULL AND status IN ('starting','running') AND start_at<?", (now() - 2 * 3600,)).fetchall()
+    for rid, start_at in nobox:
+        if rid in recovered or rid in unowned:
+            continue
         actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost")
         if not dry:
-            con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=?",
-                        (now(), "client ended before it got a box", rid))
-    if nobox and not dry:
-        con.commit()
+            _mark_lost(con, rid, "client ended before it got a box", no_box=True, expected_client=(None, start_at))
     # A no-box run whose own `offbox run` client is gone never got a box: mark it lost now, not after 2 h.
     from .misc import _client_alive
     orphan = [tuple(r) for r in con.execute(
         "SELECT run_id, client_pid, start_at FROM runs WHERE mode IN ('fg','bg') AND box_id IS NULL "
         "AND status IN ('starting','running') AND client_pid IS NOT NULL").fetchall()]
     for rid, pid, start_at in orphan:
+        if rid in recovered or rid in unowned:
+            continue
         if _client_alive(pid, start_at):
             continue
         actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost (client {pid} gone)")
         if not dry:
-            con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=? AND box_id IS NULL "
-                        "AND status IN ('starting','running')", (now(), "client ended before it got a box", rid))
-            con.commit()
+            _mark_lost(con, rid, "client ended before it got a box", no_box=True, expected_client=(pid, start_at))
     start_budget = {'checks': START_CHECKS_PER_PASS}
     pooled = {r[0] for r in con.execute('SELECT box_id FROM pool_members')}
     snap = capacity.snapshot(con)
@@ -184,14 +246,19 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             continue
         if bid in protected:
             continue
+        if (b is None or b.get('dataExpiredAt')) and lease.pinned_until(con, bid) > now():
+            actions.append(f"keep {bid}: pinned; backend miss does not retire its lease")
+            continue
         if b is None:
             if not dry:
                 # Release first. The lease is retired only once no hold remains: a busy lock or a failed read keeps
                 # the hold and the lease state, so a later pass finds it again and retries.
                 if lease.release_if_confirmed(con, bid):
-                    con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), bid))
-                    con.commit()
-                    event(con, bid, "reap_forget", f"box no longer exists on {api.NAME}")
+                    try:
+                        lease.forget_box(con, bid, "reap_forget", f"box no longer exists on {api.NAME}")
+                    except lease.PinnedLeaseError as pin:
+                        actions.append(f"keep {bid}: {pin}")
+                        continue
                     actions.append(f"forget {bid}: gone from {api.NAME}")
                 else:
                     actions.append(f"hold kept {bid}: gone from {api.NAME}, not yet confirmed")
@@ -203,9 +270,11 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             # hold goes only after a locked, fresh confirmation; a busy lock leaves it for a later pass.
             if not dry:
                 if lease.release_if_confirmed(con, bid):
-                    con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), bid))
-                    con.commit()
-                    event(con, bid, "reap_expired", f"{api.NAME} deleted its data at {b['dataExpiredAt']}")
+                    try:
+                        lease.forget_box(con, bid, "reap_expired", f"{api.NAME} deleted its data at {b['dataExpiredAt']}")
+                    except lease.PinnedLeaseError as pin:
+                        actions.append(f"keep {bid}: {pin}")
+                        continue
                     actions.append(f"forget {bid}: {api.NAME} deleted its data")
                 else:
                     actions.append(f"hold kept {bid}: {api.NAME} deleted its data, not yet confirmed")
@@ -342,6 +411,7 @@ def _renew_live_runs(con, rows, live: dict, protected: set[str], dry: bool) -> N
 
 def _keep_live_runs(con, bid: str, box: dict, dry: bool) -> None:
     from .runs import remote_alive
+    from . import start_check
     if dry or box.get('state') not in api.LIVE_STATES:
         return
     for run in con.execute("SELECT * FROM runs WHERE box_id=? AND status='running'", (bid,)).fetchall():
@@ -352,11 +422,15 @@ def _keep_live_runs(con, bid: str, box: dict, dry: bool) -> None:
             if inserted:
                 event(con, bid, 'run_orphan_cap', run['run_id'])
             continue
-        if not run['process_id']:
+        pid = start_check.api_pid(con, run)
+        if not pid:
+            if start_check.recovery_marked(con, run):
+                lease.ensure_ttl(bid, RUN_TTL_S, box)
+                return
             continue
         try:
             with api.budget(10):
-                st = api.cmd_status(bid, run['process_id'], timeout=5, retries=0)
+                st = api.cmd_status(bid, pid, timeout=5, retries=0)
                 alive = bool(st and st.get('running') is True)
                 # A missing/lost tracker is not evidence of death; #770's wrapper marker is independent.
                 if not alive and (st is None or st.get('status') == 'lost'):
@@ -382,20 +456,36 @@ def _check_stale_runs(con, bid: str, state: str, dry: bool, actions: list[str], 
 
 def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], budget=None) -> None:
     """Runs marked running on a box that is stopped, or whose process ended while nobody was attached."""
+    require_mine(con, bid)
+    from .runs import EXIT_REPO_SETUP, REPO_SETUP_FAILED_MARKER, finish, restore_run_state, completed_result, terminal_result
     from .runs import confirmed_lost, reconcile_lost
     from . import start_check
     from .misc import _client_alive
     budget = budget if budget is not None else {'checks': START_CHECKS_PER_PASS}
     if not dry and state in api.STOPPED_STATES and con.execute(
             "SELECT 1 FROM kv WHERE k LIKE 'start_unknown:%' AND v=?", (bid,)).fetchone():
+        for row in con.execute('SELECT * FROM runs WHERE box_id=?', (bid,)).fetchall():
+            if row['process_id'] and start_check.api_pid(con, row) is None:
+                start_check.remember_wrapper(con, row, None)
+        con.commit()
         lease._release_locked(con, bid)
     if not dry:
         reconcile_lost(con, bid, state=state)
     from .runs import EXIT_REPO_SETUP, REPO_SETUP_FAILED_MARKER
-    for run in con.execute("SELECT * FROM runs WHERE box_id=? AND status IN ('starting','running')", (bid,)).fetchall():
+    for run in con.execute("SELECT * FROM runs WHERE box_id=? AND (status IN ('starting','running') OR "
+                           "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))",
+                           (bid,)).fetchall():
+        saved = restore_run_state(run)
+        if terminal_result(saved):
+            if not dry:
+                finish(run['run_id'], saved['exit_code'], saved['status'])
+            actions.append(f"{'would repair' if dry else 'repair'} run {run['run_id']} exit={saved['exit_code']}")
+            continue
+        run = saved
         status, code = None, None
+        pid = start_check.api_pid(con, run)
         unattached = con.execute('SELECT 1 FROM kv WHERE k=?', (f"start_unattached:{run['run_id']}",)).fetchone()
-        if (run['status'] == 'starting' and not run['process_id']) or unattached:
+        if (run['status'] == 'starting' and not pid) or unattached or (not pid and start_check.recovery_marked(con, run)):
             age = now() - (run['start_at'] or 0)
             orphan = bool(run['error']) or not _client_alive(run['client_pid'], run['start_at'])
             if orphan and age >= START_GRACE_S:
@@ -415,6 +505,8 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                                        until=None if api.left() is None else now() + max(0, api.left()))
                     actions.append(f"settled run {run['run_id']} on {bid}: {result.verdict} exit={result.code}")
                     continue
+            if state in api.LIVE_STATES and not pid:
+                continue
             if age < 3600 or not orphan:
                 continue
         if state in api.STOPPED_STATES or state in ('error','cancelled'):
@@ -422,15 +514,15 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
             if run['command_id']:
                 # Process status can disappear on stop; retained history survives it without resuming the box.
                 try:
-                    st = api.cmd_status(bid, run['process_id']) if run['process_id'] else None
+                    st = api.cmd_status(bid, pid) if pid else None
                     code = st.get('exitCode') if st else None
                 except OffboxError:
                     continue
         elif state not in api.LIVE_STATES:
             continue
-        elif run["process_id"]:
+        elif pid:
             try:
-                st = api.cmd_status(bid, run["process_id"])
+                st = api.cmd_status(bid, pid)
             except OffboxError:
                 continue
             if st is None:
@@ -448,8 +540,7 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                     if confirmed is None:
                         continue
                     st = {**st, **confirmed}
-                code = st.get("exitCode")
-                status = "lost" if st.get("status") == "lost" else ("done" if code == 0 else "failed")
+                status, code = completed_result(run, st)
                 # Detached runs may have no local log yet; cmd_status includes the remote stderr tail.
                 if (st.get('status') == 'exited' and code == EXIT_REPO_SETUP
                         and REPO_SETUP_FAILED_MARKER in (st.get('stderr') or '').splitlines()):
@@ -477,17 +568,22 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                     import json
                     from .runs import do_pulls
                     do_pulls(bid, dict(run), json.loads(run['pulls']))
-                con.execute("UPDATE runs SET status=?, exit_code=?, end_at=? WHERE run_id=?",
-                            (status, code, now(), run["run_id"]))
-                con.commit()
-                from .misc import _catch_up_finished
-                _catch_up_finished(con, run['run_id'])
-                event(con, bid, "run_reaped", f"{run['run_id']} {status} exit={code}")
-                if state in api.LIVE_STATES:
-                    from .runs import settle_docker
-                    settle_docker(con, run, status)
-                    # The run's client died: the box still has its 30-min run ttl. Bring it to the idle window.
-                    lease.idle_ttl(bid)
+                from .runs import planned_steps
+                code = finish(run['run_id'], code, status, run=run, bookkeeping=False, report=True)
+                if planned_steps(run):
+                    status = 'infra' if code is None else ('done' if code == 0 else 'failed')
+                try:
+                    from .misc import _catch_up_finished
+                    _catch_up_finished(con, run['run_id'])
+                    event(con, bid, "run_reaped", f"{run['run_id']} {status} exit={code}")
+                    if state in api.LIVE_STATES:
+                        from .runs import settle_docker
+                        settle_docker(con, run, status)
+                        # The client died: shorten the run TTL to the idle window.
+                        lease.idle_ttl(bid)
+                except sqlite3.Error as error:
+                    from .runs import state_warning
+                    state_warning(run['run_id'], code, error)
 
 
 def print_actions(actions: list[str]) -> None:

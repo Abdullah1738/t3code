@@ -1,0 +1,30 @@
+#!/usr/bin/python3
+"""Claude apiKeyHelper: stdout is reserved for the key."""
+import os
+from pathlib import Path
+import sys
+import time
+start = time.monotonic()
+try:
+    source = Path(__file__).resolve().parents[2] / 'router-logging'
+    sys.path.insert(0, str(source if source.is_dir() else Path.home() / '.local/share/router-logging'))
+    from toollog import emit
+except Exception:
+    def emit(*_args, **_kwargs):
+        pass
+
+def main():
+    key = os.environ.get('RCLAUDE_API_KEY', '')
+    if not key:
+        emit('rclaude', 'auth.helper', kind='error', ok=False, durationMs=(time.monotonic() - start) * 1000, error={'tag': 'missing_key'})
+        return 1
+    try:
+        print(key)
+        emit('rclaude', 'auth.helper', kind='perf', ok=True, durationMs=(time.monotonic() - start) * 1000)
+        return 0
+    except Exception:
+        emit('rclaude', 'auth.helper', kind='error', ok=False, durationMs=(time.monotonic() - start) * 1000, error={'tag': 'output_failed'})
+        return 1
+
+if __name__ == '__main__':
+    raise SystemExit(main())

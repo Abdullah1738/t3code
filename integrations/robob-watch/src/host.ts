@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 import { statSync } from "node:fs";
 import { cpus, loadavg } from "node:os";
 import { dirname } from "node:path";
@@ -23,7 +24,7 @@ export function checkSlotCap(load: number): number {
 }
 
 export function isMounted(path: string): boolean {
-  try { return statSync(path).dev !== statSync(dirname(path)).dev; } catch { return false; }
+  try { return statSync(path).dev !== statSync(dirname(path)).dev; } catch { toolError("runner", "watch.mount_stat_failed"); return false; }
 }
 
 /** Recheck the cap on every admission; lowering it never interrupts an admitted check. */

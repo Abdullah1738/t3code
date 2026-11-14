@@ -1,3 +1,4 @@
+import { recordConsumedShortcut } from "../ardud/keybindingAnalytics";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
 import { resolveThreadCurrentPullRequestLink } from "@t3tools/shared/threadPullRequests";
 import { Spinner } from "~/components/ui/spinner";
@@ -3438,6 +3439,7 @@ export default function LegacySidebar() {
       event.preventDefault();
       event.stopPropagation();
       navigateToThread(scopeThreadRef(targetThread.environmentId, targetThread.id));
+      if (targetThreadKey !== routeThreadKey) recordConsumedShortcut(event, command);
       return;
     }
 
@@ -3458,6 +3460,7 @@ export default function LegacySidebar() {
     event.preventDefault();
     event.stopPropagation();
     navigateToThread(scopeThreadRef(targetThread.environmentId, targetThread.id));
+    if (targetThreadKey !== routeThreadKey) recordConsumedShortcut(event, command);
   });
   useEffect(() => {
     const handleWindowKeyDown = (event: globalThis.KeyboardEvent) => onWindowKeyDown(event);

@@ -14,16 +14,25 @@ import urllib.error
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import isolate_boat, isolate_home
 from offbox_lib import api, bases, capacity, cli, common, fallback, lease, misc, pool, reap, runs, spend
 
 
 class Isolated(unittest.TestCase):
+    guard_home_failover = True
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
+        key_lookup = self.stack.enter_context(patch.object(
+            api, '_key', side_effect=AssertionError('real API-key lookup forbidden in unit tests; stub the API boundary')))
+        # Cleanup also catches lookups swallowed by production error handling or background workers.
+        self.addCleanup(key_lookup.assert_not_called)
         root = Path(self.tmp.name)
+        isolate_home(self.stack, root, guard_failover=self.guard_home_failover)
+        isolate_boat(self.stack)
         for name in ('STATE','LOGS_DIR','LOCKS_DIR','SSH_DIR','CM_DIR'):
             self.stack.enter_context(patch.object(common, name, root/name))
         # Modules that import these by name keep the real paths; point them at the fixture and the repo's templates.
@@ -37,7 +46,7 @@ class Isolated(unittest.TestCase):
         self.stack.enter_context(patch.object(common, 'LOG_PATH', root/'log'))
         self.stack.enter_context(patch.object(spend, 'CAP_PATH', root/'cap.json'))
         self.stack.enter_context(patch.object(lease, 'CAP_PATH', root/'cap.json'))
-        self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS':'0', 'OFFBOX_POOL_SIZE':'2'}))
+        self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_BACKEND':'boat', 'OFFBOX_POOL_WAIT_SECONDS':'0', 'OFFBOX_POOL_SIZE':'2'}))
         for name in ('OFFBOX_STARTS_PER_MINUTE','OFFBOX_STARTS_PER_HOUR','OFFBOX_STARTS_PER_DAY'):
             self.stack.enter_context(patch.dict(os.environ, {name: str(dict(MINUTE=25,HOUR=180,DAY=760)[name.rsplit('_',1)[-1]])}))
         self.con = common.db()
@@ -156,7 +165,9 @@ class PoolTests(Isolated):
         self.busy('bg')
         self.con.execute("UPDATE runs SET mode='bg',process_id=123 WHERE box_id='bg'")
         self.con.commit()
-        with patch.object(api,'cmd_status',return_value={'running':False,'status':'exited','exitCode':0}), patch.object(lease,'idle_ttl'), patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)):
+        with patch.object(api,'cmd_status',return_value={'running':False,'status':'exited','exitCode':0}), \
+                patch.object(misc, '_catch_up_finished'), patch.object(lease,'idle_ttl'), \
+                patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)):
             row=pool.acquire(self.me)
             pool.release_guard(row)
         self.assertEqual(self.con.execute("SELECT status FROM runs WHERE run_id='run-bg'").fetchone()[0],'done')

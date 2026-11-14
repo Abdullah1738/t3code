@@ -1,3 +1,4 @@
+import { readCallerIdentity, type CallerIdentity } from "./callerIdentity.ts";
 import type { ProjectionRecordField } from "../orchestration-v2/ProjectionStore.ts";
 import {
   CommandId,
@@ -6,7 +7,6 @@ import {
   type ProviderInteractionMode,
   type RuntimeMode,
   type ThreadId,
-  type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -46,7 +46,7 @@ export interface CallerLimits {
 export interface Caller {
   readonly scope: McpInvocationContext.McpInvocationScope;
   readonly threads: ThreadManagement.ThreadManagementService["Service"];
-  readonly caller: OrchestrationV2ThreadShell | undefined;
+  readonly caller: CallerIdentity | undefined;
   readonly limits: CallerLimits;
 }
 
@@ -76,15 +76,15 @@ export const loadCaller = Effect.fn("mcp.loadCaller")(function* () {
     } satisfies Caller;
   }
   const threadId = scope.thread.threadId;
-  const caller = yield* threads
-    .getThreadShell(threadId)
-    .pipe(Effect.mapError(unavailable), (effect) =>
+  const caller = yield* readCallerIdentity(threads, threadId, scope.thread.providerInstanceId).pipe(
+    Effect.mapError((error) => (error._tag === "OrchestratorMcpFailure" ? error : unavailable())),
+    (effect) =>
       McpDeadline.withDeadline(effect, {
         code: "caller_unresolved",
         threadId,
         stage: "caller",
       }),
-    );
+  );
   if (caller === null || caller.deletedAt !== null) {
     return yield* new OrchestratorMcpFailure({
       code: "thread_not_found",

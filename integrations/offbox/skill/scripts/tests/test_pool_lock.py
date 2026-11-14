@@ -1,10 +1,12 @@
 """The pool lock covers only choosing a box (31 Oct, edge-api: a 900 s resume under the pool lock failed every other
 caller with exit 90 "timed out waiting for lock pool-..."). Offline: no boat calls."""
 import contextlib
+import contextvars
 import io
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import threading
 import sys
 import unittest
@@ -12,7 +14,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import api, capacity, cli, common, lease, pool, prune, runs  # noqa: E402
+from offbox_lib import allocation, api, capacity, cli, common, lease, pool, prune, runs  # noqa: E402
+from test_exit_and_queue import FakeClock
 from test_capacity import Isolated  # noqa: E402
 
 
@@ -209,7 +212,7 @@ class PoolLockTests(Isolated):
         real_claim = pool._claim
         seen_lock_free = []
 
-        def claim(con, me, row, run_id):
+        def claim(con, me, row, run_id, **kwargs):
             seen_lock_free.append(pool_lock_free())
 
             def other():
@@ -220,7 +223,7 @@ class PoolLockTests(Isolated):
             th = threading.Thread(target=other)
             th.start()
             th.join(10)
-            return real_claim(con, me, row, run_id)
+            return real_claim(con, me, row, run_id, **kwargs)
 
         with patch.object(lease, 'acquire_private', side_effect=creator), \
                 patch.object(pool, '_claim', side_effect=claim), \
@@ -234,6 +237,76 @@ class PoolLockTests(Isolated):
             self.assertEqual([r['box_id'] for r in pool.members(self.con, 'repo')], ['bx_a'])
         finally:
             pool.release_guard(row)
+
+    def test_queue_snapshot_counts_create_once_through_member_handoff(self):
+        for run_id in (None, 'starting-run'):
+            with self.subTest(run_id=run_id):
+                for table in ('leases', 'pool_members', 'pool_callers', 'runs'):
+                    self.con.execute('DELETE FROM ' + table)
+                if run_id:
+                    self.con.execute("INSERT INTO runs(run_id,status) VALUES (?,'starting')", (run_id,))
+                self.con.commit()
+                observer = common.db()
+                self.addCleanup(observer.close)
+                real_claim, observations, lines = pool._claim, [], []
+
+                def snapshot(phase):
+                    # The observer only reads while the creator has a write transaction open.
+                    state = pool._queue_snapshot(observer, 'repo', None, 'template:crpko-go', None)
+                    observations.append((phase, state['busy'], state['pending'], state['total'], state['cap']))
+                    lines.append(pool._queue_line(state))
+
+                def claim(con, me, row, run_id, **kwargs):
+                    snapshot('before claim')
+                    def trace(sql):
+                        if sql.startswith('DELETE FROM pool_pending'):
+                            snapshot('before slot removal')
+                        elif sql == 'COMMIT':
+                            snapshot('before commit')
+                    con.set_trace_callback(trace)
+                    try:
+                        real_claim(con, me, row, run_id, **kwargs)
+                    finally:
+                        con.set_trace_callback(None)
+                    # The review's exact interleaving: a full progress read immediately after _claim returns.
+                    state = pool.queue_state(observer, 'repo', source='template:crpko-go')
+                    observations.append(('after claim', state['busy'], state['pending'], state['total'], state['cap']))
+                    lines.append(pool._queue_line(state))
+
+                with patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '1'}), \
+                        patch.object(lease, 'acquire_private', side_effect=self.new_box()), \
+                        patch.object(pool, '_claim', side_effect=claim):
+                    row = pool.acquire(self.me, run_id=run_id)
+                try:
+                    self.assertEqual(observations, [
+                        ('before claim', 0, 1, 0, 1),
+                        ('before slot removal', 0, 1, 0, 1),
+                        ('before commit', 0, 1, 0, 1),
+                        ('after claim', 1, 0, 1, 1),
+                    ])
+                    for line in lines:
+                        self.assertNotIn('cap fell', line)
+                        self.assertNotIn('surplus', line)
+                finally:
+                    pool.release_guard(row)
+
+    def test_failed_claim_rolls_back_member_adoption_and_preserves_create_slot(self):
+        self.box('created')
+        self.pending(os.getpid())
+        self.con.execute("INSERT INTO runs(run_id,status) VALUES ('starting-run','starting')")
+        self.con.execute("""CREATE TRIGGER reject_claim BEFORE INSERT ON pool_callers BEGIN
+            SELECT RAISE(ABORT, 'claim failed'); END""")
+        self.con.commit()
+        row = dict(self.con.execute("SELECT * FROM leases WHERE box_id='created'").fetchone())
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'claim failed'):
+            pool._claim(self.con, self.me, row, 'starting-run', pending_token='create-x')
+        observer = common.db()
+        try:
+            self.assertEqual(observer.execute('SELECT COUNT(*) FROM pool_members').fetchone()[0], 0)
+            self.assertEqual(observer.execute('SELECT token FROM pool_pending').fetchone()[0], 'create-x')
+            self.assertEqual(observer.execute("SELECT box_id FROM runs WHERE run_id='starting-run'").fetchone()[0], None)
+        finally:
+            observer.close()
 
     def test_pooled_recipe_creation_runs_with_creator_box_lock_held(self):
         """Integration through pool.acquire: a pool-created recipe box runs its recipe under the lock the creator
@@ -297,7 +370,8 @@ class PruneQueueTests(Isolated):
                 patch.object(prune, 'recheck', side_effect=gone), \
                 patch.object(lease, '_reuse', side_effect=lambda con, row, size, **kw: dict(row)), \
                 patch.object(lease, 'acquire_private') as new, contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(pool.queue_state(self.con, 'repo'), (1, 4, 0, 3))
+            state = pool.queue_state(self.con, 'repo')
+            self.assertEqual((state['busy'], state['cap'], state['held']), (1, 4, 3))
             row = pool.acquire(self.me)
             pool.release_guard(row)
         self.assertEqual(row['box_id'], 'held3')
@@ -344,14 +418,318 @@ class PruneQueueTests(Isolated):
                 contextlib.redirect_stderr(io.StringIO()) as err:
             with self.assertRaises(pool.PoolBusyError):
                 pool.acquire(self.me)
-        self.assertIn('1/4 busy, 3 held by checkout cleanup, 0 other caller(s) waiting', err.getvalue())
+        self.assertIn('1 busy + 3 idle that can', err.getvalue())
+        self.assertIn('3 held by checkout cleanup; #1 of 1', err.getvalue())
         self.assertEqual(probe.call_count, 2)
 
     def test_active_run_with_hold_counted_once_as_busy(self):
         self.hold('held-busy')
         self.busy('held-busy')
-        self.assertEqual(pool.queue_state(self.con, 'repo'), (1, 2, 0, 0))
+        state = pool.queue_state(self.con, 'repo')
+        self.assertEqual((state['busy'], state['held']), (1, 0))
 
+
+
+class FairQueueTests(Isolated):
+    new_box = PoolLockTests.new_box
+    def waiter(self, token='older', source=None, size=None, pid=None, cap=2, run_id=None):
+        self.con.execute("INSERT INTO pool_waiters(pool_key,token,pid,run_id,queued_at,source,size) "
+                         "VALUES (?,?,?,?,?,?,?)",
+                         (pool._queue_key('repo'), token, pid or os.getpid(), run_id, common.now() - 10, source, size))
+        self.con.execute("INSERT INTO pool_cap_callers(token,pool_key,pid,run_id,cap) VALUES (?,?,?,?,?)",
+                         (token, pool._queue_key('repo'), pid or os.getpid(), run_id, cap))
+        self.con.commit()
+
+    def test_newer_poll_yields_next_free_box_to_oldest(self):
+        self.box('next', member=True)
+        self.box('busy', member=True)
+        self.busy('busy')
+        self.waiter()
+        clock, granted = FakeClock(), []
+        def sleep(seconds):
+            clock.t += seconds
+            if not granted:
+                granted.append(pool._acquire(self.con, dict(self.me, owner='old'), None, None, None, False,
+                                              None, waiter='older'))
+        clock.time.sleep = sleep
+        with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '4'}), patch.object(pool, 'time', clock.time), \
+                patch.object(lease, '_reuse', side_effect=lambda c, r, s, **kw: dict(r)), \
+                patch.object(lease, 'acquire_private') as create, contextlib.redirect_stderr(io.StringIO()):
+            try:
+                with self.assertRaises(pool.PoolBusyError):
+                    pool.acquire(self.me)
+                self.assertEqual([r['box_id'] for r in granted], ['next'])
+                create.assert_not_called()
+            finally:
+                for row in granted:
+                    pool.release_guard(row)
+
+    def test_incompatible_older_source_does_not_block_free_box(self):
+        for source in ('template:other', 'base:repo:saved', 'fresh'):
+            with self.subTest(source=source):
+                self.con.execute('DELETE FROM pool_waiters')
+                self.con.execute('DELETE FROM pool_cap_callers')
+                self.con.execute('DELETE FROM leases')
+                self.con.execute('DELETE FROM pool_members')
+                self.con.commit()
+                self.box('free', member=True, source='recipe:crpko-go')
+                self.waiter(source=source)
+                with patch.object(lease, '_reuse', side_effect=lambda c, r, s, **kw: dict(r)):
+                    row = pool.acquire(self.me, template='crpko-go')
+                    pool.release_guard(row)
+                self.assertEqual(row['box_id'], 'free')
+
+    def test_smaller_box_still_belongs_to_older_larger_request(self):
+        self.box('small', member=True, size='default')
+        self.waiter(size='xlarge', source='template:crpko-go')
+        self.assertTrue(pool._older(self.con, 'repo', None, pool.members(self.con, 'repo')[0]))
+
+    def test_dead_waiter_dropped_from_line_and_cap(self):
+        self.waiter(pid=dead_pid(), cap=12)
+        state = pool.queue_state(self.con, 'repo')
+        self.assertEqual((state['waiting'], state['cap']), (0, 4))
+        self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_waiters').fetchone()[0], 0)
+
+    def test_newer_raised_cap_gives_oldest_extra_create_slot(self):
+        for bid in ('one', 'two'):
+            self.box(bid, member=True)
+            self.busy(bid)
+        self.waiter()
+        clock, granted, observed = FakeClock(), [], []
+        def sleep(seconds):
+            clock.t += seconds
+            if not granted:
+                with patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '2'}):
+                    observed.append(pool.pool_cap(self.con, 'repo'))
+                    granted.append(pool._acquire(self.con, dict(self.me, owner='old'), None, None, None,
+                                                  False, None, waiter='older'))
+        clock.time.sleep = sleep
+        with patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '3', 'OFFBOX_POOL_WAIT_SECONDS': '4'}), \
+                patch.object(pool, 'time', clock.time), \
+                patch.object(lease, 'acquire_private', side_effect=self.new_box()) as create, \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                with self.assertRaises(pool.PoolBusyError):
+                    pool.acquire(self.me)
+                self.assertEqual(observed, [3])
+                self.assertEqual(granted[0]['box_id'], 'bx_new')
+                create.assert_called_once()
+            finally:
+                for row in granted:
+                    pool.release_guard(row)
+
+    def test_cap_falls_back_when_raised_waiter_leaves(self):
+        self.waiter(cap=12)
+        self.assertEqual(pool.pool_cap(self.con, 'repo'), 12)
+        self.con.execute("DELETE FROM pool_cap_callers WHERE token='older'")
+        self.con.commit()
+        self.assertEqual(pool.pool_cap(self.con, 'repo'), 4)
+        self.assertEqual(self.con.execute("SELECT cap FROM pool_caps WHERE pool_key='repo'").fetchone()[0], 4)
+
+    def test_detached_holder_keeps_cap_until_run_finishes(self):
+        self.box('holder', member=True)
+        self.busy('holder')
+        self.waiter(cap=12, pid=dead_pid(), run_id='run-holder')
+        self.con.execute("UPDATE pool_cap_callers SET granted=1")
+        self.con.commit()
+        self.assertEqual(pool.pool_cap(self.con, 'repo'), 12)
+        self.con.execute("UPDATE runs SET status='done'")
+        self.con.commit()
+        self.assertEqual(pool.pool_cap(self.con, 'repo'), 4)
+
+    def test_waiter_cleaned_on_grant_and_error_and_interrupt(self):
+        for error in (None, common.OffboxError('create failed'), KeyboardInterrupt()):
+            with self.subTest(error=error), patch.object(lease, 'acquire_private',
+                    side_effect=error if error else self.new_box()):
+                if error:
+                    with self.assertRaises(type(error)):
+                        pool.acquire(self.me, fresh=True)
+                else:
+                    row = pool.acquire(self.me)
+                    pool.release_guard(row)
+                self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_waiters').fetchone()[0], 0)
+                self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_cap_callers').fetchone()[0], 0)
+                self.con.execute('DELETE FROM leases')
+                self.con.execute('DELETE FROM pool_members')
+                self.con.commit()
+
+    def test_failed_create_rejoins_queue_before_sleeping(self):
+        clock, checks = FakeClock(), []
+        def sleep(seconds):
+            clock.t += seconds
+            self.box('available', member=True)
+            old = self.con.execute('SELECT token,reserved FROM pool_waiters').fetchone()
+            checks.append(old['reserved'])
+            self.assertEqual(old['reserved'], 0)
+            with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '0'}), \
+                    patch.object(lease, 'acquire_private') as create, \
+                    patch.object(allocation, '_QUEUE', contextvars.ContextVar('newer_queue', default=None)):
+                with self.assertRaises(pool.PoolBusyError):
+                    pool.acquire(dict(self.me, owner='newer'))
+                create.assert_not_called()
+        clock.time.sleep = sleep
+        with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '10'}), patch.object(pool, 'time', clock.time), \
+                patch.object(lease, 'acquire_private', side_effect=api.SupplyOut('large', None, 'supply out')), \
+                patch.object(lease, '_reuse', side_effect=lambda c, r, s, **kw: dict(r)), \
+                contextlib.redirect_stderr(io.StringIO()):
+            row = pool.acquire(self.me)
+            pool.release_guard(row)
+        self.assertEqual(checks, [0])
+        self.assertEqual(row['box_id'], 'available')
+
+    def test_holder_status_matrix_matches_active_runs_and_releases_only_its_contribution(self):
+        self.box('holder', member=True)
+        cases = [
+            ('starting', None, None, True), ('running', None, None, True),
+            ('lost', None, None, True), ('lost', 0, None, False),
+            ('lost', None, 'lost_confirmed', False), ('done', 0, None, False),
+            ('infra', None, None, False), ('infra', None, 'start_unknown', True),
+        ]
+        for status, code, marker, held in cases:
+            with self.subTest(status=status, code=code, marker=marker):
+                self.con.execute('DELETE FROM pool_waiters')
+                self.con.execute('DELETE FROM pool_cap_callers')
+                self.con.execute('DELETE FROM runs')
+                self.con.execute('DELETE FROM kv')
+                self.con.execute("INSERT INTO runs(run_id,box_id,status,exit_code) VALUES ('run-holder','holder',?,?)",
+                                 (status, code))
+                if marker:
+                    self.con.execute('INSERT INTO kv(k,v) VALUES (?,?)', (marker + ':run-holder', 'fenced'))
+                self.con.commit()
+                self.waiter(cap=12, pid=dead_pid(), run_id='run-holder')
+                self.con.execute('UPDATE pool_cap_callers SET granted=1')
+                self.con.commit()
+                state = pool.queue_state(self.con, 'repo')
+                self.assertEqual(bool(lease.active_runs(self.con, 'holder')), held)
+                self.assertEqual((state['cap'], state['busy']), (12 if held else 4, int(held)))
+                if held:
+                    self.con.execute("UPDATE runs SET status='running',exit_code=NULL WHERE run_id='run-holder'")
+                    self.con.commit()
+                    self.assertEqual(pool.pool_cap(self.con, 'repo'), 12)
+        self.con.execute("DELETE FROM kv")
+        self.con.execute("UPDATE runs SET status='done' WHERE run_id='run-holder'")
+        self.con.execute("INSERT INTO runs(run_id,box_id,status) VALUES ('next-run','holder','running')")
+        self.con.commit()
+        self.assertEqual(pool.pool_cap(self.con, 'repo'), 4)
+
+    def test_pending_resume_does_not_block_unrelated_compatible_box(self):
+        for older_source in ('template:a', 'template:c', None):
+            with self.subTest(older_source=older_source):
+                self.con.execute('DELETE FROM pool_waiters')
+                self.con.execute('DELETE FROM pool_cap_callers')
+                self.con.execute('DELETE FROM leases')
+                self.con.execute('DELETE FROM pool_members')
+                self.con.execute('DELETE FROM kv')
+                self.con.commit()
+                self.box('unanswered', member=True, source='template:a')
+                self.box('ready', member=True, source='template:b')
+                self.con.execute("INSERT INTO kv VALUES (?,?,?)", ('resume_unanswered:unanswered', 'large', common.now() - 3600))
+                self.con.commit()
+                if older_source:
+                    self.waiter(source=older_source)
+                with patch.object(lease, '_reuse', side_effect=lambda c, r, s, **kw: dict(r)) as reuse, \
+                        patch.object(lease, 'acquire_private') as create:
+                    row = pool.acquire(self.me, template='b')
+                    pool.release_guard(row)
+                self.assertEqual(row['box_id'], 'ready')
+                self.assertEqual([c.args[1]['box_id'] for c in reuse.call_args_list], ['ready'])
+                create.assert_not_called()
+
+    def test_failed_reuse_restores_order_before_releasing_box_guard(self):
+        cases = [('normal', 'skip'), ('normal', 'none'), ('recovery', 'none'), ('recovery', 'stopped')]
+        for path, result in cases:
+            with self.subTest(path=path, result=result):
+                for table in ('pool_waiters', 'pool_cap_callers', 'pool_members', 'pool_callers', 'leases', 'kv'):
+                    self.con.execute('DELETE FROM ' + table)
+                self.con.commit()
+                self.box('first', member=True, used=200)
+                self.box('second', member=True, used=100)
+                if path == 'recovery':
+                    self.con.execute("INSERT INTO kv VALUES (?,?,?)", ('resume_unanswered:first', 'large', common.now() - 3600))
+                    self.con.commit()
+                real_lock, checked, failed = common.file_lock, [], []
+                @contextlib.contextmanager
+                def lock(name, timeout=600):
+                    with real_lock(name, timeout=timeout):
+                        try:
+                            yield
+                        finally:
+                            if name == 'box-first' and failed and not checked:
+                                checked.append(True)
+                                waiter = self.con.execute('SELECT reserved FROM pool_waiters').fetchone()
+                                self.assertEqual(waiter['reserved'], 0)
+                                with self.assertRaises(pool.PoolBusyError):
+                                    pool.acquire(dict(self.me, owner='newer'))
+                def reuse(con, row, size, **kwargs):
+                    if row['box_id'] == 'first' and not failed:
+                        failed.append(True)
+                        if path == 'recovery':
+                            con.execute("DELETE FROM kv WHERE k='resume_unanswered:first'")
+                            con.commit()
+                        if result == 'skip':
+                            raise lease.ArchivingSkip('archiving')
+                        if result == 'stopped':
+                            raise lease.ResumeStopped('stopped')
+                        return None
+                    return dict(row)
+                with patch.object(pool, 'file_lock', lock), patch.object(lease, '_reuse', side_effect=reuse), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    row = pool.acquire(self.me)
+                    pool.release_guard(row)
+                self.assertEqual(checked, [True])
+
+    def test_unusable_alternatives_do_not_suppress_pending_recovery(self):
+        for kind in ('excluded', 'stopped', 'undersized', 'locked'):
+            with self.subTest(kind=kind):
+                for table in ('pool_waiters', 'pool_cap_callers', 'pool_members', 'pool_callers', 'leases', 'kv'):
+                    self.con.execute('DELETE FROM ' + table)
+                self.con.commit()
+                self.box('pending', member=True, source='template:a')
+                self.box('other', state='stopped' if kind == 'stopped' else 'running', member=True,
+                         size='default' if kind == 'undersized' else 'large', source='template:b')
+                self.con.execute("INSERT INTO kv VALUES (?,?,?)", ('resume_unanswered:pending', 'large', common.now() - 3600))
+                self.con.commit()
+                guard = common.file_lock('box-other', timeout=0) if kind == 'locked' else contextlib.nullcontext()
+                def recover(con, row, size, **kwargs):
+                    self.assertEqual(row['box_id'], 'pending')
+                    raise lease.ResumeProvisionStalled('provisioning stalled')
+                with guard, patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '3'}), \
+                        patch.object(lease, '_reuse', side_effect=recover) as reuse, \
+                        patch.object(lease, 'acquire_private', side_effect=self.new_box('replacement')) as create, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    row = pool.acquire(self.me, template='b', size='xlarge' if kind == 'undersized' else None,
+                                       exclude={'other'} if kind == 'excluded' else None)
+                    pool.release_guard(row)
+                self.assertEqual(row['box_id'], 'replacement')
+                reuse.assert_called_once()
+                self.assertEqual(create.call_args.args[2], 'b')
+
+    def test_home_owner_queues_and_cap_contributions_are_separate(self):
+        for current, older in [('', 'person:moni'), ('person:moni', '')]:
+            with self.subTest(current=current, older=older):
+                for table in ('pool_waiters', 'pool_cap_callers', 'pool_members', 'pool_callers', 'leases'):
+                    self.con.execute('DELETE FROM ' + table)
+                self.con.commit()
+                with patch.dict(os.environ, {'OFFBOX_BACKEND': 'server', 'OFFBOX_THREAD': older}):
+                    self.waiter(cap=64)
+                    self.assertEqual(pool.pool_cap(self.con, 'repo'), 64)
+                with patch.dict(os.environ, {'OFFBOX_BACKEND': 'server', 'OFFBOX_THREAD': current}):
+                    self.box('free', member=True)
+                    self.con.execute('UPDATE leases SET token_owner=?', (common.token_owner(),))
+                    self.con.commit()
+                    self.assertEqual(pool.queue_state(self.con, 'repo')['waiting'], 0)
+                    self.assertEqual(pool.pool_cap(self.con, 'repo'), 8)
+                    with patch.object(lease, '_reuse', side_effect=lambda c, r, s, **kw: dict(r)), \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        row = pool.acquire(self.me)
+                        pool.release_guard(row)
+                    self.assertEqual(row['box_id'], 'free')
+
+    def test_warm_relocation_yields_to_existing_waiter(self):
+        self.box('warm', member=True)
+        self.waiter()
+        with patch.object(api, 'call', side_effect=AssertionError('no network')):
+            self.assertIsNone(pool.try_warm(self.me, 'large', None, set(), 'mine'))
 
 
 class PrePoolLockDatabase(Isolated):
@@ -362,17 +740,32 @@ class PrePoolLockDatabase(Isolated):
         self.con.executescript("""DROP TABLE pool_pending;
             CREATE TABLE pool_pending (
               token TEXT PRIMARY KEY, pool_key TEXT NOT NULL, pid INTEGER, created_at REAL NOT NULL
-            );""")
+            );
+            PRAGMA user_version=0;""")
+        self.con.schema_ready = False
 
     def cols(self):
         return [r[1] for r in self.con.execute("PRAGMA table_info(pool_pending)")]
+
+    def test_old_database_gets_queue_tables_without_changing_pending_rows(self):
+        for table in ('pool_waiters', 'pool_cap_callers', 'pool_caps'):
+            self.con.execute('DROP TABLE ' + table)
+        self.old_table()
+        self.con.execute("INSERT INTO pool_pending VALUES ('retained','repo',1,1)")
+        self.con.commit()
+        capacity.schema(self.con)
+        capacity.schema(self.con)
+        for table in ('pool_waiters', 'pool_cap_callers', 'pool_caps'):
+            self.assertEqual(self.con.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0], 0)
+        self.assertEqual(tuple(self.con.execute('SELECT * FROM pool_pending').fetchone()),
+                         ('retained', 'repo', 1, 1, None))
 
     def test_schema_adds_source_to_an_old_pool_pending(self):
         self.old_table()
         self.con.execute("INSERT INTO pool_pending VALUES ('create-old','repo',1,1)")
         self.con.commit()
         capacity.schema(self.con)
-        capacity.schema(self.con)  # a second run (every offbox call runs it) changes nothing
+        capacity.schema(self.con)  # a second run observes the migrated version
         self.assertEqual(self.cols(), ['token', 'pool_key', 'pid', 'created_at', 'source'])
         self.assertEqual([tuple(r) for r in self.con.execute("SELECT * FROM pool_pending")],
                          [('create-old', 'repo', 1, 1.0, None)])

@@ -1,4 +1,5 @@
 """Main/Supermall payment continuation; one send, then bounded exact reads."""
+import toollog
 import order_card
 import json
 import math
@@ -58,6 +59,7 @@ def telegram_stall_notify(order, total_minor):
 class MarketplacePayment:
     vertical = None
 
+    @toollog.timed("commerce", "step.payment_submit")
     def prepare_payment(self, cvv=None, *, cvv_loader=None):
         """Check/load secrets before place; keep the encrypted envelope in RAM."""
         if self.review is None or self.session_response is None:
@@ -96,6 +98,7 @@ class MarketplacePayment:
         journal.payment_fail(self.vertical.upper() + code, flow_id=self.flow_id, order=self.order,
                              amount_minor=self.review['payable_minor'], **kind)
 
+    @toollog.timed("commerce", "step.bank_approval_wait")
     def await_success(self, *, attempts=300, sleep=time.sleep, timeout=25,
                       wait_seconds=600, clock=time.monotonic, notify=telegram_3ds_notify,
                       stall_notify=telegram_stall_notify):

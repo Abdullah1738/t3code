@@ -1,10 +1,16 @@
 """Narrow offline checks for filtering and no-loss cursor/outbox behavior."""
 import copy
+import datetime as dt
 import importlib.util
+import imaplib
+import contextlib
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import sqlite3
+import shutil
 import tempfile
 import time
 import types
@@ -14,6 +20,181 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location('triage', Path(__file__).with_name('triage.py'))
 t = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(t)
+
+
+@contextlib.contextmanager
+def parsed_notifiers(root):
+    """Use each bridge's real parser, recording delivery without opening its socket."""
+    calls = root / 'deliveries.ndjson'
+    env = {'ROBOB_TEST': '1', 'TOOLLOG_DIR': str(root / 'logs'), 'TEST_DELIVERIES': str(calls)}
+    for channel, variable, bridge in (('telegram', 'ROBOB_WATCH_TELEGRAM_CLI', 'telegram-bridge'),
+                                      ('imessage', 'INBOX_TRIAGE_SPECTRUM_CLI', 'spectrum-bridge')):
+        cli = Path(__file__).resolve().parents[3] / bridge / 'src/cli.ts'
+        stub = root / f'{channel}.ts'
+        stub.write_text('import { parseCommand } from ' + json.dumps(str(cli)) + ";\n" +
+                        'import { appendFileSync } from "node:fs";\n' +
+                        'const command = parseCommand(process.argv.slice(2));\n' +
+                        'appendFileSync(process.env.TEST_DELIVERIES, JSON.stringify(command) + "\\n");\n')
+        env[variable] = str(stub)
+    with patch.dict(os.environ, env), patch.object(t, 'BUN', shutil.which('bun') or t.BUN):
+        yield calls
+
+
+class NotifierParserTests(unittest.TestCase):
+    def test_health_and_item_text_reaches_real_parsers_intact_once(self):
+        texts = ('- outlook: down', '-- outlook: down', '-', '--', '--key=mail text',
+                 'Bank debit: AED 12.00 at Example', '- first\n-- second=value')
+        for text in texts:
+            for kind in ('health', 'telegram', 'imessage'):
+                with self.subTest(text=text, kind=kind), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    with parsed_notifiers(root) as calls, patch.object(t, 'LIVE', root):
+                        if kind == 'health':
+                            state = {'health_pending': {'text': text, 'key': '--health-key', 'sources': []}}
+                            self.assertEqual(t.send_health(state, [], root, 10600), {'health_alerts': []})
+                            self.assertEqual(t.send_health(state, [], root, 10900), {})
+                        else:
+                            with patch.object(t, 'owner_route', return_value='fixture-session'), \
+                                 patch.object(t, 'imessage_status', side_effect=[None, ('sent', 1, 'fixture')]):
+                                self.assertEqual(t.send_urgent('item', text, kind, 10600), 10600)
+                                self.assertEqual(t.send_urgent('item', text, kind, 10900), 10600)
+                        delivered = [json.loads(line) for line in calls.read_text().splitlines()]
+                        self.assertEqual(len(delivered), 1)
+                        self.assertEqual(delivered[0]['body']['text'], text)
+                        if kind == 'health':
+                            self.assertEqual(delivered[0]['body']['dedupeKey'], '--health-key')
+
+
+class ExclusionTests(unittest.TestCase):
+    def setUp(self):
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        self.logs = self.root / 'logs'
+        self.stack.enter_context(patch.dict(os.environ, {'TOOLLOG_DIR': str(self.logs),
+                                                        'WATCH_ID': 'inbox-triage', 'ROBOB_TEST': '1'}))
+        self.watcher = {'id': 'fixture-watcher', '_dir': str(self.root), '_healthy': True,
+                        'check': 'bash check.sh'}
+
+    def seen(self, account, query, folder='Inbox'):
+        key = hashlib.sha256(f'{account}|{folder}|{query}'.encode()).hexdigest()[:16]
+        (self.root / f'mail-{key}.seen').write_text('exact-message-id\n')
+
+    def errors(self):
+        rows = [json.loads(line) for p in self.logs.glob('*.ndjson') for line in p.read_text().splitlines()]
+        return [row for row in rows if row.get('error', {}).get('tag') == 'watcher.command_invalid']
+
+    def test_multiline_quoted_script_and_query_preserve_exact_exclusions(self):
+        query = 'from example.test\nor subject booking'
+        (self.root / 'check.sh').write_text(
+            "# The owner's watcher\npython3 -c '\nprint(\"fixture\")\n'\n"
+            f"email-new-message gmail '{query}'\n"
+            "printf 'finished'\nwhatsapp-new-message '123@s.whatsapp.net'\n")
+        self.seen('gmail', query)
+        jids, seen = t.exclusions([self.watcher], {})
+        self.assertEqual(jids, {'123@s.whatsapp.net'})
+        self.assertEqual(seen['gmail'], {'exact-message-id'})
+        self.assertEqual(self.errors(), [])
+
+    def test_command_boundaries_comments_and_mailbox_defaults(self):
+        commands = (
+            "email-new-message gmail 'from example.test'",
+            "email-new-message gmail 'from example.test' Inbox",
+            "email-new-message gmail 'from example.test'\nprintf done",
+            "email-new-message gmail 'from example.test' # owner's comment\nprintf done",
+            "# owner's comment\nemail-new-message gmail 'from example.test'\n# another's comment",
+            "email-new-message gmail 'from example.test' && printf done",
+            "email-new-message gmail 'from example.test' ; printf done",
+            "email-new-message gmail 'from example.test' || printf failed",
+        )
+        self.seen('gmail', 'from example.test')
+        for command in commands:
+            with self.subTest(command=command):
+                self.watcher['check'] = command
+                _, seen = t.exclusions([self.watcher], {})
+                self.assertEqual(seen['gmail'], {'exact-message-id'})
+        self.assertEqual(self.errors(), [])
+
+    def test_broken_command_logs_once_per_watcher_and_change_across_runs(self):
+        script = self.root / 'check.sh'
+        script.write_text("printf 'private-unclosed\n")
+        self.watcher['check'] = "email-new-message gmail 'from example.test'"
+        self.seen('gmail', 'from example.test')
+        state = {}
+        _, seen = t.exclusions([self.watcher], state)
+        self.assertEqual(seen['gmail'], {'exact-message-id'})
+        self.assertEqual(len(self.errors()), 1)
+        # Re-load the same state a new process receives on the next tick.
+        t.atomic(self.root / 'cursor.json', state)
+        state = t.read_json(self.root / 'cursor.json')
+        t.exclusions([self.watcher], state)
+        self.assertEqual(len(self.errors()), 1)
+        script.write_text("printf 'private-changed\n")
+        t.exclusions([self.watcher], state)
+        self.assertEqual(len(self.errors()), 2)
+        self.watcher['check'] += '\nprintf changed'
+        t.exclusions([self.watcher], state)
+        self.assertEqual(len(self.errors()), 3)
+        other = dict(self.watcher, id='other-watcher')
+        t.exclusions([self.watcher, other], state)
+        self.assertEqual([row['ids']['watcher'] for row in self.errors()],
+                         ['fixture-watcher'] * 3 + ['other-watcher'])
+        for private in ('private-unclosed', 'private-changed', 'from example.test'):
+            self.assertNotIn(private, json.dumps(self.errors()))
+            self.assertNotIn(private, json.dumps(state))
+
+    def test_shell_hash_and_escape_forms_keep_the_exact_query(self):
+        queries = (
+            (r'subject\ booking#123', 'subject booking#123'),
+            (r'subject\ booking\#123', 'subject booking#123'),
+            ("'subject booking#123'", 'subject booking#123'),
+            ('"subject booking#123"', 'subject booking#123'),
+            ("subject\\ booking'#123'", 'subject booking#123'),
+            ("'subject #123'", 'subject #123'),
+            ('"subject #123"', 'subject #123'),
+            (r'subject\ \#123', 'subject #123'),
+            ("'subject booking' # owner's comment", 'subject booking'),
+            ("'subject booking'\t# owner's comment", 'subject booking'),
+            ("'subject booking' ;# owner's comment", 'subject booking'),
+            ("'subject booking'\n# owner's comment", 'subject booking'),
+            ("'subject booking'\\\n#123", 'subject booking#123'),
+            ("\\\n'subject booking'", 'subject booking'),
+            ("'subject booking\\\n#123'", 'subject booking\\\n#123'),
+            ('"subject booking\\\n#123"', 'subject booking#123'),
+        )
+        for shell_query, query in queries:
+            with self.subTest(shell_query=shell_query):
+                for path in self.root.glob('mail-*.seen'):
+                    path.unlink()
+                self.seen('gmail', query)
+                self.watcher['check'] = 'email-new-message gmail ' + shell_query
+                _, seen = t.exclusions([self.watcher], {})
+                self.assertEqual(seen['gmail'], {'exact-message-id'})
+        self.assertEqual(self.errors(), [])
+
+    def test_recovery_clears_failure_and_unhealthy_watcher_is_ignored(self):
+        self.watcher['check'] = "printf 'broken"
+        state = {}
+        t.exclusions([dict(self.watcher, _healthy=False)], state)
+        self.assertEqual(self.errors(), [])
+        t.exclusions([self.watcher], state)
+        self.watcher['check'] = 'printf fixed'
+        t.exclusions([self.watcher], state)
+        self.assertNotIn(self.watcher['id'], state['watcher_command_invalid'])
+        self.assertEqual(len(self.errors()), 1)
+
+    def test_exact_seen_ids_only_and_all_existing_whatsapp_jid_forms(self):
+        self.watcher['check'] = (
+            "email-new-message gmail 'from example.test' Sent\n"
+            "# email-new-message gmail 'from example.test'\n"
+            "whatsapp-new-message '123@s.whatsapp.net'\n"
+            "whatsapp-new-message '456@lid'\nwhatsapp-new-message '789@g.us'")
+        self.seen('gmail', 'from example.test')
+        self.seen('gmail', 'from example.test', 'Sent')
+        jids, seen = t.exclusions([self.watcher], {})
+        self.assertEqual(jids, {'123@s.whatsapp.net', '456@lid', '789@g.us'})
+        self.assertEqual(seen, {a: set() for a in t.ACCOUNTS})
+        self.assertEqual(self.errors(), [])
 
 
 class TriageTests(unittest.TestCase):
@@ -143,13 +324,24 @@ class TriageTests(unittest.TestCase):
             def shutdown(self): pass
         request = {'now': 2000, 'cursor': {'validity': 1, 'uid': 0}, 'initialized_at': 1000,
                    'seen': [], 'rules': []}
-        processed = [(self.item(id=f'mail:a:1:{i}'), None) for i in (1, 2, 3)] + [TimeoutError()]
-        with patch.object(t, 'load_module', return_value=type('Mail', (), {'connect': lambda *args: FakeImap()})), \
-             patch.object(t, 'mail_record', side_effect=processed):
-            result = t.mail_worker('icloud', request)
-        self.assertEqual(result['cursor']['uid'], 3)
-        self.assertEqual(len(result['items']), 3)
-        self.assertIn('completed prefix', result['partial'])
+        for error, transient in (
+            (TimeoutError(), True),
+            (imaplib.IMAP4.abort('socket error: Connection reset by peer'), True),
+            (imaplib.IMAP4.abort('socket error: Connection refused'), True),
+            (imaplib.IMAP4.abort('TLS handshake timed out'), True),
+            (imaplib.IMAP4.abort('Temporary failure in name resolution'), True),
+            (imaplib.IMAP4.abort('LOGIN failed'), False),
+            (ValueError('parse error'), False),
+        ):
+            with self.subTest(error=repr(error)):
+                processed = [(self.item(id=f'mail:a:1:{i}'), None) for i in (1, 2, 3)] + [error]
+                with patch.object(t, 'load_module', return_value=type('Mail', (), {'connect': lambda *args: FakeImap()})), \
+                     patch.object(t, 'mail_record', side_effect=processed):
+                    result = t.mail_worker('icloud', request)
+                self.assertEqual(result['cursor']['uid'], 3)
+                self.assertEqual(len(result['items']), 3)
+                self.assertIn('completed prefix', result['partial'])
+                self.assertEqual(t.transient_error(result['partial']), transient)
 
     def test_empty_classifier_result_commits_cursor_without_event(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -179,7 +371,7 @@ class TriageTests(unittest.TestCase):
                  patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
                  patch.object(t, 'collect', return_value=({}, {'gmail': 'timeout'})), patch.object(t, 'build_context', return_value={}), \
                  patch.object(t, 'classify', side_effect=TimeoutError) as model, patch('builtins.print'):
-                self.assertEqual(t.run(args), 0)
+                self.assertEqual(t.run(args), 1)
                 model.assert_called_once()
             state = t.read_json(wd / 'cursor.json')
             self.assertEqual(state['cursors']['gmail']['uid'], 8)
@@ -198,7 +390,7 @@ class TriageTests(unittest.TestCase):
                 return ticks.pop(0) if len(ticks) > 1 else ticks[0]
             with patch.dict(t.os.environ, {'WATCH_DIR': str(wd), 'WATCH_RUN': 'test'}), \
                  patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
-                 patch.object(t, 'collect', return_value=({}, {})), patch.object(t, 'build_context', return_value={}), \
+                 patch.object(t, 'collect', return_value=({'gmail': {'cursor': {}, 'items': [], 'drops': {}, 'scanned': 0}}, {})), patch.object(t, 'build_context', return_value={}), \
                  patch.object(t, 'handled', return_value=({}, {})), patch.object(t.time, 'time', side_effect=clock), \
                  patch.object(t, 'classify', side_effect=AssertionError('no time left to call it')) as model, patch('builtins.print'):
                 self.assertEqual(t.run(args), 0)
@@ -401,6 +593,41 @@ class ChargeTests(unittest.TestCase):
         self.assertEqual(model.call_args[0][0][0]['id'], item['id'])
         self.assertNotIn('renewal_case', runs[-1]['dropped'])
         self.assertEqual(self.mc.load(self.tmp / 'wd' / 'scratch-money')['cases'], [])
+        rows = self.mc.load_subscriptions(self.tmp / 'wd' / 'scratch-money')['subscriptions']
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['last4'], '2342')
+
+    def test_registered_charge_is_explained_and_rolls_only_scratch_books(self):
+        due = t.dt.datetime.fromtimestamp(self.now, self.mc.TZ).date().isoformat()
+        self.mc.sub_change(self.mc.DATA, 'acme', dict(merchant='Acme', last4='1111', amount='100',
+                           currency='EUR', cadence='monthly', next_renewal=due), 'add')
+        item = self.alert(90, '100', 'Acme', 600)
+        reasons, held, error = t.charge_checks([item], self.now, False, wd=self.tmp / 'subs')
+        self.assertIsNone(error)
+        self.assertEqual(reasons, {item['id']: 'charge_explained'})
+        self.assertFalse(held)
+        self.assertEqual(self.mc.load_subscriptions(self.mc.DATA)['subscriptions'][0]['next_renewal'], due)
+        row = self.mc.load_subscriptions(self.tmp / 'subs' / 'scratch-money')['subscriptions'][0]
+        self.assertEqual(row['next_renewal'], self.mc.sub_next(due, 'monthly'))
+
+    def test_registered_merchant_with_wrong_amount_still_reaches_classifier(self):
+        due = t.dt.datetime.fromtimestamp(self.now, self.mc.TZ).date().isoformat()
+        self.mc.sub_change(self.mc.DATA, 'acme', dict(merchant='Acme', last4='1111', amount='100',
+                           currency='EUR', cadence='monthly', next_renewal=due), 'add')
+        item = self.alert(91, '200', 'Acme', 600)
+        model, _, runs = self.run_triage([item])
+        self.assertEqual(model.call_args[0][0][0]['id'], item['id'])
+        self.assertNotIn('charge_explained', runs[-1]['dropped'])
+
+    def test_dry_charge_matching_does_not_roll_live_register(self):
+        due = t.dt.datetime.fromtimestamp(self.now, self.mc.TZ).date().isoformat()
+        self.mc.sub_change(self.mc.DATA, 'acme', dict(merchant='Acme', last4='1111', amount='100',
+                           currency='EUR', cadence='monthly', next_renewal=due), 'add')
+        before = (self.mc.DATA / 'subscriptions.json').read_bytes()
+        reasons, _, error = t.charge_checks([self.alert(92, '100', 'Acme', 600)], self.now, True, wd=self.tmp / 'dry-subs')
+        self.assertIsNone(error)
+        self.assertEqual(reasons, {'imsg:92': 'charge_explained'})
+        self.assertEqual((self.mc.DATA / 'subscriptions.json').read_bytes(), before)
 
     def test_generic_renewals_from_different_sender_domains_create_separate_cases(self):
         self.mc.card_dead(self.mc.DATA, '5542', 'cancelled')
@@ -619,6 +846,15 @@ class ChargeTests(unittest.TestCase):
         self.assertEqual((qs['20.00']['status'], qs['30.00']['wait_until'] is not None, qs['50.00']['passed'],
                           qs['40.00']['passed']), ('closed', True, True, False))
         self.assertEqual(self.mc.load_questions()['questions'], [])
+
+    def test_delegated_purchase_is_explained_before_the_classifier(self):
+        self.mc.note_purchase(self.mc.DATA, 'CHATGPT', '1920', 'EUR', '1111', 'owner', 'thread:purchase',
+                              'invoice-4', now=dt.datetime.fromtimestamp(self.now - 660, self.mc.TZ))
+        item = self.alert(77, '1920.00', 'CHATGPT', 600)
+        model, state, runs = self.run_triage([item])
+        model.assert_not_called()
+        self.assertEqual(state['queue'], [])
+        self.assertEqual(runs[-1]['dropped']['charge_explained'], 1)
 
     def test_an_unexplained_charge_goes_on_even_when_the_classifier_skips_it(self):
         model, state, runs = self.run_triage([self.alert(4, '50.00', 'UMBRELLA', 600)])
@@ -870,7 +1106,7 @@ class ChatFollowUpTests(unittest.TestCase):
                  patch.object(t, 'handled', return_value=({'imsg:1': 'answered'}, {})), \
                  patch.object(t.time, 'time', side_effect=clock), \
                  patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
-                 patch.object(t, 'collect', return_value=({}, {})) as collect, patch('builtins.print'):
+                 patch.object(t, 'collect', return_value=({'gmail': {'cursor': {}, 'items': [], 'drops': {}, 'scanned': 0}}, {})) as collect, patch('builtins.print'):
                 self.assertEqual(t.run(args), 0)
             self.assertEqual(collect.called, collects)
             self.assertNotIn('outbox', t.read_json(wd / 'cursor.json'))
@@ -906,7 +1142,7 @@ class ChatFollowUpTests(unittest.TestCase):
                 return {}, {}
             with patch.dict(t.os.environ, {'WATCH_DIR': str(wd), 'WATCH_RUN': 'test'}), \
                  patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
-                 patch.object(t, 'collect', return_value=({}, {})), patch.object(t, 'build_context', return_value={}), \
+                 patch.object(t, 'collect', return_value=({'gmail': {'cursor': {}, 'items': [], 'drops': {}, 'scanned': 0}}, {})), patch.object(t, 'build_context', return_value={}), \
                  patch.object(t, 'handled', side_effect=handled), patch.object(t.time, 'time', return_value=1000.0), \
                  patch.object(t, 'classify', return_value=([], {})), patch('builtins.print'):
                 self.assertEqual(t.run(args), 0)
@@ -992,7 +1228,7 @@ class ReplayTests(unittest.TestCase):
             args = types.SimpleNamespace(dry_run_hours=1, report=str(report))
             with patch.dict(t.os.environ, {'WATCH_DIR': tmp}), patch.object(t, 'active_watchers', return_value=[]), \
                  patch.object(t, 'noise_rules', return_value=[]), patch.object(t, 'collect', return_value=(result, {})), \
-                 patch.object(t, 'handled', return_value=({}, {})), patch('builtins.print'):
+                 patch.object(t, 'handled', return_value=({}, {})), patch.object(t, 'build_context', return_value={}), patch('builtins.print'):
                 self.assertEqual(t.run(args), 0)
             self.assertEqual(sorted(map(tuple, t.read_json(report)['dropped_ids'])),
                              [('mail:a:1:5', 'bulk'), ('wa:8', 'own'), ('wa:9', 'greeting')])
@@ -1041,7 +1277,7 @@ class LiveWorkTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][1:], ['open-flows', '--minutes', '60'])
         # sent_at errs late by the second commerce rounds away.
         self.assertEqual(work, {'open_payments': [{'ref': 'p1', 'app': 'noon', 'vertical': 'supermall', 'state': 'PLACED',
-                                                   'amount_aed': 123.45, 'minutes_ago': 19, 'sent_at': 3861.0}],
+                                                   'amount_aed': 123.45, 'minutes_ago': 19, 'sent_at': 3861.0, 'flow_id': 'f1', 'order_id': None}],
                                 'phone_task': {'running': True, 'minutes': 10}})
         self.assertEqual(t.work_line(work), 'In flight: noon supermall payment AED 123.45 (19 min ago); a phone task has run for 10 min.')
 
@@ -1082,8 +1318,130 @@ class LiveWorkTests(unittest.TestCase):
         self.assertIn('In flight: talabat mart payment (3 min ago).', event)
         state = t.read_json(wd / 'cursor.json')
         self.assertEqual(t.read_json(Path(state['outbox']['batch']))['live_work'], work)
-        with patch.object(t, 'handled', return_value=({}, {})):
+        with patch.object(t, 'handled', return_value=({}, {})), patch.object(t, 'live_work', return_value=work):
             self.assertEqual(t.replay_outbox(state, wd, 'second'), event)
+
+
+class DegradedRunTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.wd = Path(tmp.name)
+        self.args = types.SimpleNamespace(dry_run_hours=None, report=None)
+        self.initial = {'version': 1, 'initialized_at': 1000,
+                        'cursors': {'outlook': {'validity': 1, 'uid': 7}, 'gmail': {'validity': 1, 'uid': 2}}, 'queue': [], 'pending': {}}
+        t.atomic(self.wd / 'cursor.json', self.initial)
+        for name, value in [('active_watchers', []), ('noise_rules', []), ('build_context', {}),
+                            ('handled', ({}, {})), ('live_work', {}), ('classify', ([], {}))]:
+            mocked = patch.object(t, name, return_value=value)
+            mocked.start()
+            self.addCleanup(mocked.stop)
+
+    def run_check(self, run_id='degraded', fast=False):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, {'WATCH_DIR': str(self.wd), 'WATCH_RUN': run_id}), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = t.run_fast(self.args) if fast else t.run(self.args)
+        return code, out.getvalue(), err.getvalue()
+
+    def good(self):
+        return {'cursor': {'validity': 1, 'uid': 3}, 'items': [TriageTests.item(None)], 'drops': {}, 'scanned': 1}
+
+    def test_timeout_in_real_collect_keeps_failed_cursor_and_advances_healthy_sources(self):
+        def mail(account, request):
+            if account == 'outlook':
+                raise t.subprocess.TimeoutExpired('mail-worker', 19)
+            return self.good()
+        chat = {'cursor': 42, 'items': [], 'drops': {}, 'scanned': 0}
+        with patch.object(t, 'run_mail', side_effect=mail), \
+             patch.object(t, 'collect_whatsapp', return_value=chat), patch.object(t, 'collect_imessage', return_value=chat):
+            code, out, err = self.run_check()
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '')
+        self.assertIn('inbox-triage degraded: outlook: TimeoutExpired', err)
+        state = t.read_json(self.wd / 'cursor.json')
+        self.assertEqual(state['cursors']['outlook'], self.initial['cursors']['outlook'])
+        self.assertEqual(state['cursors']['gmail']['uid'], 3)
+        self.assertEqual(state['cursors']['imessage'], 42)
+
+    def test_all_sources_failed_or_nothing_read_is_failure(self):
+        for errors in ({s: 'TimeoutError' for s in (*t.ACCOUNTS, 'imessage', 'whatsapp')}, {}):
+            with self.subTest(errors=errors), patch.object(t, 'collect', return_value=({}, errors)):
+                code, out, err = self.run_check()
+                self.assertEqual(code, 1)
+                self.assertIn('source failure:', err)
+
+    def test_acked_outbox_is_cleared_before_empty_degraded_run_ack(self):
+        self.initial['outbox'] = {'run': 'old', 'event': 'already queued'}
+        t.atomic(self.wd / 'cursor.json', self.initial)
+        (self.wd / '.run-ok').write_text('old')
+        result = {'gmail': {**self.good(), 'items': []}}
+        with patch.object(t, 'collect', return_value=(result, {'outlook': 'TimeoutError'})):
+            code, out, err = self.run_check()
+            self.assertEqual((code, out), (0, ''))
+            self.assertNotIn('outbox', t.read_json(self.wd / 'cursor.json'))
+            # Simulate runner ackRun on a successful empty check, then another tick.
+            (self.wd / '.run-ok').write_text('degraded')
+            self.assertEqual(self.run_check('next')[:2], (0, ''))
+
+    def test_unacked_outbox_replays_before_collection_and_is_not_lost(self):
+        self.initial['outbox'] = {'run': 'old', 'event': 'pending event'}
+        t.atomic(self.wd / 'cursor.json', self.initial)
+        with patch.object(t, 'collect', return_value=({'gmail': self.good()}, {'outlook': 'TimeoutError'})) as collect:
+            self.assertEqual(self.run_check()[:2], (0, 'pending event\n'))
+            collect.assert_not_called()
+            state = t.read_json(self.wd / 'cursor.json')
+            self.assertEqual(state['outbox']['run'], 'degraded')
+            (self.wd / '.run-ok').write_text('degraded')
+            self.assertEqual(self.run_check('next')[:2], (0, ''))
+            self.assertNotIn('outbox', t.read_json(self.wd / 'cursor.json'))
+
+    def test_fastpath_partial_and_total_source_failures(self):
+        # fastpath.py is a classifier; triage.py --fast-only owns its exit status.
+        for results, expected in (({'gmail': {**self.good(), 'items': []}}, 0), ({}, 1)):
+            with self.subTest(expected=expected), patch.object(t, 'collect', return_value=(results, {'outlook': 'TimeoutError'})):
+                code, _, err = self.run_check(fast=True)
+                self.assertEqual(code, expected)
+                self.assertIn('degraded:' if expected == 0 else 'source failure:', err)
+
+    def test_twenty_fastpath_outlook_timeouts_deliver_one_parsed_notice(self):
+        data = self.wd / 'data'
+        data.mkdir()
+        normal = self.wd / 'inbox-triage'
+        normal.mkdir()
+        fast = self.wd / 'inbox-triage-fastpath'
+        fast.mkdir()
+        self.wd = fast
+        t.atomic(fast / 'cursor.json', self.initial)
+        clock = [10000]
+
+        def mail(account, request):
+            if account == 'outlook':
+                raise t.subprocess.TimeoutExpired(['python3', 'triage.py', '--mail-worker'], 19)
+            return {**self.good(), 'items': []}
+        chat = {'cursor': 42, 'items': [], 'drops': {}, 'scanned': 0}
+        with parsed_notifiers(data) as calls, patch.object(t, 'LIVE', normal), patch.object(t, 'DATA', data), \
+             patch.object(t, 'money_books', return_value=data / 'money'), \
+             patch.object(t.time, 'time', side_effect=lambda: clock[0]), \
+             patch.object(t, 'run_mail', side_effect=mail), \
+             patch.object(t, 'collect_whatsapp', return_value=chat), patch.object(t, 'collect_imessage', return_value=chat):
+            for n in range(20):
+                clock[0] = 10000 + n * 300
+                code, out, err = self.run_check(f'replay-{n}', fast=True)
+                self.assertEqual((code, out), (0, ''), err)
+                self.assertIn('inbox-triage-fastpath degraded: outlook: TimeoutExpired', err)
+            delivered = [json.loads(line) for line in calls.read_text().splitlines()]
+            self.assertEqual(len(delivered), 1)
+            self.assertTrue(delivered[0]['body']['text'].startswith('- outlook: 3 run(s)'))
+            state = t.read_json(fast / 'cursor.json')
+            self.assertNotIn('health_pending', state)
+            self.assertEqual(state['source_health']['outlook']['alerted_at'], 10600)
+            self.assertEqual(state['cursors']['outlook'], self.initial['cursors']['outlook'])
+            self.assertEqual(state['cursors']['gmail']['uid'], 3)
+            rows = [json.loads(line) for f in (data / 'logs').glob('*.ndjson') for line in f.read_text().splitlines()]
+            for tag in ('health.delivery_failed', 'tg.cli.arguments'):
+                self.assertEqual(sum(row.get('error', {}).get('tag') == tag for row in rows), 0, tag)
+            print('Outlook replay: runs=20 degraded_notices=1 health.delivery_failed=0 tg.cli.arguments=0')
 
 
 class SourceHealthTests(unittest.TestCase):
@@ -1125,10 +1483,243 @@ class SourceHealthTests(unittest.TestCase):
         # It recovers; once the hour and the quiet period pass its entry goes.
         later = now + 600 + t.HEALTH_REALERT
         state['source_health']['outlook']['alerted_at'] = later
-        t.track_health(state, {}, later + 300)
-        self.assertIn('outlook', state['source_health'])
+        self.assertEqual(t.track_health(state, {}, later + 300), ['outlook'])
+        t.health_alert(state, ['outlook'], later + 300)
+        with self.stub_telegram(), patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)):
+            t.send_health(state, ['outlook'], t.LIVE, later + 300)
         t.track_health(state, {}, later + t.HEALTH_REALERT)
         self.assertNotIn('outlook', state['source_health'])
+
+    def test_transient_outage_notices_escalation_and_recovery_are_once_each(self):
+        state = {'read_sources': ['gmail']}
+        wd = Path('/fixture/live')
+        bad = {'outlook': 'TimeoutExpired: mail worker'}
+        sent = types.SimpleNamespace(returncode=0, stdout='', stderr='')
+        with patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', return_value=sent) as run:
+            for n in range(20):
+                self.tick(state, wd, bad, 10_000 + n * 300)
+            self.assertEqual(run.call_count, 1)
+            first = run.call_args.args[0]
+            text = next(v.split('=', 1)[1] for v in first if v.startswith('--text='))
+            self.assertIn('outlook', text)
+            self.assertIn('provider/network', text)
+            self.assertIn('Other sources are still being read', text)
+            self.assertIn('cursor holds', text)
+            for n in range(5):
+                self.tick(state, wd, bad, 10_000 + t.HEALTH_TRANSIENT_ESCALATE + n * 300)
+            self.assertEqual(run.call_count, 2)
+            escalation = run.call_args.args[0]
+            self.assertIn('outlook still failing after 180 min', next(v.split('=', 1)[1] for v in escalation if v.startswith('--text=')))
+            self.assertIn('--severity=attention', escalation)
+            self.tick(state, wd, bad, 10_000 + t.HEALTH_REALERT + 900)
+            self.assertEqual(run.call_count, 2)
+            self.tick(state, wd, {}, 10_000 + t.HEALTH_REALERT + 1200)
+            self.assertEqual(run.call_count, 3)
+            recovery = run.call_args.args[0]
+            self.assertIn('outlook reading again after', next(v.split('=', 1)[1] for v in recovery if v.startswith('--text=')))
+            self.tick(state, wd, {}, 10_000 + t.HEALTH_REALERT + 1500)
+            self.assertEqual(run.call_count, 3)
+
+    def test_delivered_notices_keep_six_hour_cooldown_across_flapping(self):
+        for error in ('TimeoutExpired: worker', 'IMAP auth failed'):
+            with self.subTest(error=error):
+                state = {}
+                bad = {'outlook': error}
+                with patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+                    for n in range(12):
+                        errors = bad if n < 3 or n % 2 == 0 else {}
+                        self.tick(state, t.LIVE, errors, 10_000 + n * 300)
+                    # These sends succeeded; one outage and one recovery, no repeat at five/hour.
+                    self.assertEqual(run.call_count, 2)
+                    texts = [next(v.split('=', 1)[1] for v in c.args[0] if v.startswith('--text=')) for c in run.call_args_list]
+                    self.assertNotIn('reading again', texts[0])
+                    self.assertIn('outlook reading again', texts[1])
+                    self.assertEqual(state['source_health']['outlook']['last_notice_at'], 10_600)
+                    self.tick(state, t.LIVE, {}, 10_600 + t.HEALTH_REALERT - 1)
+                    self.assertIn('outlook', state['source_health'])
+                    self.tick(state, t.LIVE, {}, 10_600 + t.HEALTH_REALERT)
+                    self.assertNotIn('outlook', state['source_health'])
+                    for n in range(3):
+                        self.tick(state, t.LIVE, bad, 10_600 + t.HEALTH_REALERT + n * 300)
+                    self.assertEqual(run.call_count, 3)
+
+    def test_cooldown_does_not_delay_escalation_of_a_new_continuous_outage(self):
+        state = {}
+        bad = {'outlook': 'TimeoutExpired'}
+        with patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+            for now in (10_000, 10_300, 10_600):
+                self.tick(state, t.LIVE, bad, now)
+            self.tick(state, t.LIVE, {}, 10_900)
+            for now in (11_200, 11_500, 11_800):
+                self.tick(state, t.LIVE, bad, now)
+            self.assertEqual(run.call_count, 2)
+            self.tick(state, t.LIVE, bad, 11_200 + t.HEALTH_TRANSIENT_ESCALATE)
+            self.assertEqual(run.call_count, 3)
+            args = run.call_args.args[0]
+            self.assertIn('outlook still failing after 180 min', next(v.split('=', 1)[1] for v in args if v.startswith('--text=')))
+            self.tick(state, t.LIVE, bad, 11_200 + t.HEALTH_TRANSIENT_ESCALATE + 300)
+            self.assertEqual(run.call_count, 3)
+            self.tick(state, t.LIVE, {}, 11_200 + t.HEALTH_TRANSIENT_ESCALATE + 600)
+            self.assertEqual(run.call_count, 4)
+            self.tick(state, t.LIVE, {}, 11_200 + t.HEALTH_TRANSIENT_ESCALATE + 900)
+            self.assertEqual(run.call_count, 4)
+
+    def test_recovery_retry_cannot_suppress_the_next_outage_notice(self):
+        state = {'read_sources': ['gmail']}
+        bad = {'outlook': 'TimeoutError'}
+        sent = types.SimpleNamespace(returncode=0)
+        failed = types.SimpleNamespace(returncode=1, stderr='bridge down', stdout='')
+        with patch.object(t.subprocess, 'run', return_value=sent) as run:
+            for now in (10_000, 10_300, 10_600):
+                self.tick(state, t.LIVE, bad, now)
+            self.assertEqual(run.call_count, 1)
+            with patch.object(t.subprocess, 'run', return_value=failed):
+                self.tick(state, t.LIVE, {}, 10_900)
+            pending = copy.deepcopy(state['health_pending'])
+            self.tick(state, t.LIVE, bad, 11_200)
+            self.assertEqual(state['source_health']['outlook']['since'], 11_200)
+            args = run.call_args.args[0]
+            self.assertEqual(next(v.split('=', 1)[1] for v in args if v.startswith('--key=')), pending['key'])
+            self.assertEqual(next(v.split('=', 1)[1] for v in args if v.startswith('--text=')), pending['text'])
+            self.tick(state, t.LIVE, bad, 11_500)
+            self.tick(state, t.LIVE, bad, 11_800)
+            self.assertEqual(run.call_count, 2)  # recovery retries do not erase the outage cooldown
+            later = 10_600 + t.HEALTH_REALERT
+            self.tick(state, t.LIVE, {}, later)
+            for now in (later + 300, later + 600, later + 900):
+                self.tick(state, t.LIVE, bad, now)
+            self.assertEqual(run.call_count, 3)
+            self.assertNotIn('reading again', next(v.split('=', 1)[1] for v in run.call_args.args[0] if v.startswith('--text=')))
+
+    def test_outage_notice_retry_after_health_window_still_has_one_recovery(self):
+        state = {}
+        bad = {'outlook': 'TimeoutExpired'}
+        sent = types.SimpleNamespace(returncode=0)
+        failed = types.SimpleNamespace(returncode=1, stderr='bridge down', stdout='')
+        with patch.object(t.subprocess, 'run', return_value=failed):
+            for now in (10_000, 10_300, 10_600):
+                self.tick(state, t.LIVE, bad, now)
+            original = copy.deepcopy(state['health_pending'])
+            self.tick(state, t.LIVE, {}, 10_900)
+            self.tick(state, t.LIVE, {}, 14_500)
+        self.assertIn('outlook', state['source_health'])
+        with patch.object(t.subprocess, 'run', return_value=sent) as run:
+            self.tick(state, t.LIVE, {}, 14_800)
+            args = run.call_args.args[0]
+            self.assertEqual(next(v.split('=', 1)[1] for v in args if v.startswith('--key=')), original['key'])
+            self.assertEqual(next(v.split('=', 1)[1] for v in args if v.startswith('--text=')), original['text'])
+            self.tick(state, t.LIVE, {}, 15_100)
+            self.assertEqual(run.call_count, 2)
+            args = run.call_args.args[0]
+            self.assertIn('outlook reading again after 15 min', next(v.split('=', 1)[1] for v in args if v.startswith('--text=')))
+            self.tick(state, t.LIVE, {}, 15_400)
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(state['source_health']['outlook']['last_notice_at'], 14_800)
+            self.tick(state, t.LIVE, {}, 14_800 + t.HEALTH_REALERT)
+            self.assertNotIn('outlook', state['source_health'])
+
+    def test_legacy_recovered_state_keeps_cooldown_then_allows_a_new_notice(self):
+        for extra in ({}, {'recovered_at': 9000}, {'escalated_at': 8500}):
+            with self.subTest(extra=extra):
+                state = {'source_health': {'outlook': {'streak': 0, 'since': 8000, 'fails': [],
+                         'alerted_at': 8600, 'alerts': 1, **extra}}}
+                with patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+                    for now in (10_000, 10_300, 10_600):
+                        self.tick(state, t.LIVE, {'outlook': 'TimeoutError'}, now)
+                    self.assertEqual(run.call_count, 0)
+                    self.assertEqual(state['source_health']['outlook']['since'], 10_000)
+                    self.assertEqual(state['source_health']['outlook']['last_notice_at'], 8600)
+                    self.assertNotIn('escalated_at', state['source_health']['outlook'])
+                    self.tick(state, t.LIVE, {}, 10_900)
+                    for now in (30_300, 30_600, 30_900):
+                        self.tick(state, t.LIVE, {'outlook': 'TimeoutError'}, now)
+                    self.assertEqual(run.call_count, 1)
+                    self.assertEqual(state['source_health']['outlook']['alerted_at'], 30_900)
+
+    def test_legacy_escalation_is_the_last_notice_across_upgrade_and_recovery(self):
+        for newest in (10_800, 15_000):
+            with self.subTest(newest=newest):
+                state = {'source_health': {'outlook': {
+                    'since': 0, 'streak': 75, 'fails': [21_000, 21_300, 21_600, 21_900],
+                    'alerted_at': 600, 'escalated_at': 10_800, 'notified_since': 0,
+                    'last_error': 'TimeoutExpired', 'transient': True,
+                    **({'last_notice_at': newest} if newest > 10_800 else {})}}}
+                with patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+                    self.tick(state, t.LIVE, {}, 22_200)  # upgrade and recovery at 06:10
+                    self.assertEqual(run.call_count, 1)
+                    self.assertEqual(state['source_health']['outlook']['last_notice_at'], newest)
+                    self.tick(state, t.LIVE, {'outlook': 'TimeoutExpired'}, 22_500)
+                    self.assertEqual(run.call_count, 1)  # five/hour cannot bypass the escalation cooldown
+                    self.tick(state, t.LIVE, {}, 22_800)
+                    self.tick(state, t.LIVE, {}, newest + t.HEALTH_REALERT - 1)
+                    self.assertIn('outlook', state['source_health'])
+                    self.tick(state, t.LIVE, {}, newest + t.HEALTH_REALERT)
+                    self.assertNotIn('outlook', state['source_health'])
+
+    def test_old_outage_delivery_during_new_failure_still_gets_recovery(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                state = {}
+                bad = {'outlook': 'TimeoutError'}
+                failed = types.SimpleNamespace(returncode=1, stderr='bridge down', stdout='')
+                with patch.object(t.subprocess, 'run', return_value=failed):
+                    for now in (10_000, 10_300, 10_600):
+                        self.tick(state, t.LIVE, bad, now)
+                    if legacy:
+                        state['health_pending'].pop('notices')
+                    original = copy.deepcopy(state['health_pending'])
+                    self.tick(state, t.LIVE, {}, 10_900)
+                with patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+                    self.tick(state, t.LIVE, bad, 11_200)
+                    self.assertNotIn('alerted_at', state['source_health']['outlook'])
+                    self.assertEqual(next(v.split('=', 1)[1] for v in run.call_args.args[0] if v.startswith('--key=')), original['key'])
+                    self.tick(state, t.LIVE, {}, 11_500)
+                    self.assertEqual(run.call_count, 2)
+                    args = run.call_args.args[0]
+                    self.assertIn('outlook reading again after', next(v.split('=', 1)[1] for v in args if v.startswith('--text=')))
+                    self.tick(state, t.LIVE, {}, 11_800)
+                    self.assertEqual(run.call_count, 2)
+
+    def test_old_escalation_delivery_still_sets_cooldown_and_recovery_obligation(self):
+        # This outage's initial notice was suppressed by the previous outage's cooldown.
+        state = {'source_health': {'outlook': {'streak': 4, 'since': 11_000, 'fails': [21_800],
+                    'transient': True, 'last_notice_at': 10_600, 'last_error': 'TimeoutError'}},
+                 'health_pending': {'key': 'old-escalation', 'text': 'outlook still failing',
+                    'sources': ['outlook'], 'at': 21_800,
+                    'notices': {'outlook': {'kind': 'escalation', 'since': 11_000}}}}
+        with patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=1, stderr='bridge down', stdout='')):
+            self.tick(state, t.LIVE, {}, 22_100)
+        with patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+            self.tick(state, t.LIVE, {'outlook': 'TimeoutError'}, 22_400)
+            self.assertEqual(state['source_health']['outlook']['last_notice_at'], 22_400)
+            self.assertNotIn('escalated_at', state['source_health']['outlook'])
+            self.tick(state, t.LIVE, {}, 22_700)
+            self.assertEqual(run.call_count, 2)
+            args = run.call_args.args[0]
+            self.assertIn('outlook reading again', next(v.split('=', 1)[1] for v in args if v.startswith('--text=')))
+            self.tick(state, t.LIVE, {'outlook': 'TimeoutError'}, 23_000)
+            self.assertEqual(run.call_count, 2)
+
+    def test_error_classes(self):
+        for error in ('TimeoutExpired', 'TimeoutError', 'timed out after 10s', 'time budget; completed prefix saved', 'TLS handshake stalled', 'SSL handshake failure',
+                      'Connection reset by peer', 'connection refused', 'ConnectionResetError', 'ConnectionRefusedError', 'ECONNRESET', 'ECONNREFUSED',
+                      'Temporary failure in name resolution', 'temporary DNS failure', 'EAI_AGAIN'):
+            with self.subTest(error=error):
+                self.assertTrue(t.transient_error(error))
+        for error in ('IMAP auth expired', 'OAuth invalid_grant', 'login failed', 'credentials missing',
+                      'parse error', 'auth timeout', 'ValueError: malformed mail', 'certificate verify failed'):
+            with self.subTest(error=error):
+                self.assertFalse(t.transient_error(error))
+
+    def test_persistent_auth_alerts_on_third_run(self):
+        state = {}
+        with patch.object(t.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+            for n in range(2):
+                self.tick(state, t.LIVE, {'outlook': 'OAuth credentials expired'}, 10_000 + n * 300)
+            run.assert_not_called()
+            self.tick(state, t.LIVE, {'outlook': 'OAuth credentials expired'}, 10_600)
+            self.assertEqual(run.call_count, 1)
+            self.assertNotIn('provider/network', run.call_args.args[0])
 
     def test_a_test_run_never_calls_the_live_telegram_cli(self):
         # Card #14: even in the live directory, a test-marked run refuses the Telegram notify and never spawns it.
@@ -1156,16 +1747,16 @@ class SourceHealthTests(unittest.TestCase):
             lost = t.subprocess.TimeoutExpired('bun', 4)
             sent = types.SimpleNamespace(returncode=0, stdout='', stderr='')
             with self.stub_telegram(), patch.object(t, 'LIVE', wd), patch.object(t.subprocess, 'run', side_effect=[lost, sent]) as run:
-                self.assertTrue(self.tick(state, wd, bad, 10_600)['health_alert_error'].startswith('TimeoutExpired'))
+                self.assertEqual(self.tick(state, wd, bad, 10_600)['health_alert_error'], 'telegram-bridge notify failed: timeout')
                 self.assertNotIn('alerted_at', state['source_health']['gmail'])
                 # The next run counts another failure, but resends the same text under the same key.
                 self.assertEqual(self.tick(state, wd, bad, 10_900), {'health_alerts': ['gmail', 'outlook']})
                 self.assertEqual(self.tick(state, wd, bad, 11_200), {})
             first, second = (c.args[0] for c in run.call_args_list)
             self.assertEqual(first, second)
-            self.assertEqual(first[2:4], ['notify', '--source'])
-            self.assertEqual(first[first.index('--severity') + 1], 'attention')
-            text = first[first.index('--text') + 1]
+            self.assertEqual(first[2:4], ['notify', '--source=Inbox triage'])
+            self.assertEqual(next(v.split('=', 1)[1] for v in first if v.startswith('--severity=')), 'attention')
+            text = next(v.split('=', 1)[1] for v in first if v.startswith('--text='))
             self.assertIn('- outlook: 3 run(s) in a row, 3 in the last hour. Last error: IMAP auth failed', text)
             self.assertIn('- gmail:', text)
             self.assertEqual(state['source_health']['outlook']['alerted_at'], 10_900)
@@ -1187,10 +1778,10 @@ class SourceHealthTests(unittest.TestCase):
                 self.assertEqual(self.tick(state, wd, both, 11_200), {'health_alerts': ['outlook']})
                 self.assertEqual(self.tick(state, wd, both, 11_500), {'health_alerts': ['gmail']})
                 self.assertEqual(self.tick(state, wd, both, 11_800), {})
-            keys = [c.args[0][c.args[0].index('--key') + 1] for c in run.call_args_list]
+            keys = [next(v.split('=', 1)[1] for v in c.args[0] if v.startswith('--key=')) for c in run.call_args_list]
             self.assertEqual(len(set(keys[:3])), 1)
             self.assertNotEqual(keys[2], keys[3])
-            self.assertNotIn('gmail', run.call_args_list[2].args[0][run.call_args_list[2].args[0].index('--text') + 1])
+            self.assertNotIn('gmail', next(v.split('=', 1)[1] for v in run.call_args_list[2].args[0] if v.startswith('--text=')))
 
     def test_an_alert_the_bridge_never_takes_is_dropped_after_six_hours(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1599,6 +2190,131 @@ class PaymentNotices(unittest.TestCase):
                     self.assertIsNone(self.mc.payments.parse(text, 'Wio', self.when))
                     scheduled = f'Your {alias} of AED 100.00 is scheduled today at 21:00. ' + text
                     self.assertEqual(self.mc.payments.parse(scheduled, 'Wio', self.when)['kind'], 'autopay_expected')
+
+
+
+class PaymentSettlementTests(unittest.TestCase):
+    def payment(self, **changes):
+        return {'flow_id': 'flow1', 'order_id': 'NNTEST1', 'card_last4': '9546',
+                'sent_at': 1000, 'amount_aed': 26.75, **changes}
+
+    def test_terminal_and_zero_flows_never_reach_in_flight(self):
+        cases = [dict(state='ACTIVE', financial_send=False, sent_seconds_ago=None),
+                 dict(state='FENCED', amount_minor=0), dict(in_flight=False),
+                 *[dict(state=s) for s in ('COMPLETE', 'RELEASED', 'OWNER_ATTESTED_UNCHARGED', 'REJECTED_DUPLICATE')]]
+        for change in cases:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temp:
+                flow = {'app':'noon', 'vertical':'nownow', 'state':'ACTIVE', 'amount_minor':2675,
+                        'financial_send':True, 'sent_seconds_ago':30, **change}
+                answer = types.SimpleNamespace(stdout=json.dumps({'ok':True,'open':[flow]}), returncode=0, stderr='')
+                with patch.object(t.subprocess, 'run', return_value=answer), patch.object(t, 'PHONE_LOCK', Path(temp)):
+                    work = t.live_work(2000)
+                self.assertEqual(work['open_payments'], [])
+                self.assertIsNone(t.work_line(work))
+
+    def test_evidence_class_matches_and_persists_only_exact_settlements(self):
+        cases = [
+            ('purchase', 'imessage', 'Mashreq', 'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at noon', 1100, True),
+            ('receipt', 'email', 'orders@noon.com', 'Order NNTEST1 receipt', 1100, True),
+            ('other_card', 'imessage', 'Mashreq', 'Purchase AED 26.75 at noon using card 2342', 1100, False),
+            ('other_amount', 'imessage', 'Mashreq', 'Purchase AED 267.50 at noon using card 9546', 1100, False),
+            ('other_merchant', 'imessage', 'Mashreq', 'Purchase AED 26.75 at cafe using card 9546', 1100, False),
+            ('older', 'imessage', 'Mashreq', 'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at noon', 999, False),
+            ('approval', 'imessage', 'Mashreq', 'Approve purchase AED 26.75 at noon card 9546', 1100, False),
+            ('failed', 'imessage', 'Mashreq', 'Purchase declined AED 26.75 at noon card 9546', 1100, False),
+            ('otp', 'imessage', 'Mashreq', 'OTP for purchase AED 26.75 at noon card 9546', 1100, False),
+            ('foreign_receipt', 'email', 'orders@other.com', 'Order NNTEST1 receipt', 1100, False),
+            ('substring_order', 'email', 'orders@noon.com', 'Order NNTEST12 receipt', 1100, False),
+            ('noon_card_other_shop', 'imessage', 'Mashreq', 'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at ACME', 1100, False),
+            ('noon_card_noon_shop', 'imessage', 'Mashreq', 'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at noon.com', 1100, True),
+            ('enbd_noon_shop', 'imessage', 'EmiratesNBD', 'Purchase of AED 26.75 with Credit Card ending 9546 at noon, Dubai.', 1100, True),
+            ('similar_merchant', 'imessage', 'Mashreq', 'Your Card ending with 9546 was used for a purchase of AED26.75 at noon cafe', 1100, False),
+            ('failed_email', 'email', 'orders@noon.com', 'Payment failed for order NNTEST1', 1100, False),
+            ('failed_receipt', 'email', 'orders@noon.com', 'Receipt: payment failed for order NNTEST1', 1100, False),
+            ('pending_receipt', 'email', 'orders@noon.com', 'Receipt: payment pending for order NNTEST1', 1100, False),
+            ('cancelled_receipt', 'email', 'orders@noon.com', 'Receipt: cancelled order NNTEST1', 1100, False),
+            ('unpaid_receipt', 'email', 'orders@noon.com', 'Receipt: order NNTEST1 not paid', 1100, False),
+            ('plain_order_mail', 'email', 'orders@noon.com', 'Order NNTEST1 update', 1100, False),
+            ('positive_receipt', 'email', 'orders@noon.com', 'Payment received for order NNTEST1', 1100, True),
+            ('mashreq_email', 'email', 'MashreqAlerts@mashreq.com', 'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at noon.com', 1100, True),
+            ('mashreq_native_merchant', 'email', 'MashreqAlerts@mashreq.com', 'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at Noon 80038888 AE on 09-NOV-2026 05:48 PM.', 1100, True),
+            ('foreign_bank_email', 'email', 'MashreqAlerts@other.com', 'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at noon.com', 1100, False),
+            ('declined_receipt', 'email', 'orders@noon.com', 'Receipt: payment declined for NNTEST1', 1100, False),
+            ('refund_receipt', 'email', 'orders@noon.com', 'Receipt: order NNTEST1 refunded', 1100, False),
+            ('reversed_receipt', 'email', 'orders@noon.com', 'Receipt: payment reversed for NNTEST1', 1100, False),
+            ('unpaid_literal_receipt', 'email', 'orders@noon.com', 'Receipt: order NNTEST1 unpaid', 1100, False),
+        ]
+        for name, source, sender, text, at, expected in cases:
+            with self.subTest(name=name):
+                work = {'open_payments':[self.payment()]}; state = {}
+                item = {'id':'evidence', 'source':source, 'sender':sender, 'subject':text, 'preview':'', 'ts':at}
+                t.settle_work(work, [item], state)
+                self.assertEqual(not work['open_payments'], expected)
+                work = {'open_payments':[self.payment()]}
+                t.settle_work(work, [], state)
+                self.assertEqual(not work['open_payments'], expected)
+                self.assertNotIn(text, json.dumps(state))
+
+    def test_same_amount_is_ambiguous(self):
+        work = {'open_payments':[self.payment(), self.payment(flow_id='flow2')]}
+        t.settle_work(work, [{'id':'sms','source':'imessage','sender':'Mashreq',
+             'preview':'Your Mashreq noon Card ending with 9546 was used for a purchase of AED26.75 at noon','ts':1100}], {})
+        self.assertEqual(len(work['open_payments']), 2)
+
+    def test_reopened_payment_invalidates_old_settlement_and_old_evidence(self):
+        state = {}
+        item = {'id':'sms', 'source':'imessage', 'sender':'Mashreq', 'ts':1100,
+                'preview':'Your Card ending with 9546 was used for a purchase of AED26.75 at noon.com'}
+        t.settle_work({'open_payments':[self.payment()]}, [item], state)
+        self.assertIn('flow1', state['settled_payments'])
+        reopened = self.payment(sent_at=1200, settlement_epoch=1200)
+        work = {'open_payments':[reopened]}
+        t.settle_work(work, [item], state)
+        self.assertEqual(work['open_payments'], [reopened])
+        self.assertNotIn('flow1', state['settled_payments'])
+        t.settle_work(work, [{**item, 'id':'new', 'ts':1300}], state)
+        self.assertEqual(work['open_payments'], [])
+        self.assertEqual(state['settled_payments']['flow1']['epoch'], 1200)
+
+    def test_held_and_previously_queued_evidence_settles_without_classifier_readiness(self):
+        for initially_queued in (False, True):
+            with self.subTest(initially_queued=initially_queued), tempfile.TemporaryDirectory() as temp:
+                wd = Path(temp)
+                item = {'id':'imsg:1','source':'imessage','sender':'Mashreq','ts':1100,'subject':'',
+                        'preview':'Your Card ending with 9546 was used for a purchase of AED26.75 at noon.com'}
+                t.atomic(wd/'cursor.json', {'version':1,'initialized_at':1000,'cursors':{},
+                    'queue':[item] if initially_queued else []})
+                first = {'imessage':{'cursor':1,'items':[] if initially_queued else [item],'drops':{},'scanned':1}}
+                args = types.SimpleNamespace(dry_run_hours=None, report=None)
+                with patch.dict(t.os.environ, {'WATCH_DIR':str(wd), 'WATCH_RUN':'test'}), \
+                        patch.object(t,'active_watchers',return_value=[]), patch.object(t,'noise_rules',return_value=[]), \
+                        patch.object(t,'collect',side_effect=[(first,{}), ({'imessage': {**first['imessage'], 'items': []}}, {})]), \
+                        patch.object(t,'handled',return_value=({},{})), \
+                        patch.object(t,'payment_checks',return_value=({},None)), \
+                        patch.object(t,'renewal_checks',return_value=({},None)), \
+                        patch.object(t,'charge_checks',return_value=({}, {'imsg:1'},None)), \
+                        patch.object(t,'build_context',side_effect=lambda *_: {'live_work':{'open_payments':[self.payment()]}}), \
+                        patch.object(t,'classify_batch') as classify, patch('builtins.print'):
+                    self.assertEqual(t.run(args),0)
+                    state = t.read_json(wd/'cursor.json')
+                    self.assertIn('flow1', state['settled_payments'])
+                    self.assertEqual(t.run(args),0)
+                    self.assertIn('flow1', t.read_json(wd/'cursor.json')['settled_payments'])
+                    classify.assert_not_called()
+
+    def test_replayed_outbox_uses_current_terminal_payment_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            wd = Path(temp); batch = wd/'batch.json'
+            hit = {'id':'email:1','source':'email','sender':'orders@noon.com', 'subject':'Receipt',
+                   'preview':'Order NNTEST1','ts':1100,'reason':'receipt','urgency':'info'}
+            t.atomic(batch, {'hits':[hit], 'live_work':{'open_payments':[self.payment()]}})
+            state = {'outbox':{'run':'first','batch':str(batch),'event':'In flight: stale payment'},'queue':[]}
+            with patch.object(t,'handled',return_value=({},{})), \
+                    patch.object(t,'live_work',return_value={'open_payments':[]}), \
+                    patch.object(t,'withdrawal_statuses'), patch.object(t,'urgent_alerts',return_value={}):
+                event = t.replay_outbox(state,wd,'second')
+            self.assertNotIn('In flight:',event)
+            self.assertEqual(t.read_json(batch)['live_work']['open_payments'],[])
 
 
 if __name__ == '__main__':

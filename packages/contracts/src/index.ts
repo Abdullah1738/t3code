@@ -74,3 +74,7 @@ export * from "./ardud/imessageSend.ts";
 export * from "./ardud/scheduledTaskBlockRetry.ts";
 export * from "./secretRequest.ts";
 export * from "./clientRpcPermissions.ts";
+
+export * from "./ardud/threadRedaction.ts";
+
+export * from "./ardud/analytics.ts";

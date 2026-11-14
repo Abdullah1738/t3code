@@ -1,5 +1,6 @@
 """Offline keepalive after client loss, plus durable live-log snapshots."""
 import contextlib
+from datetime import datetime, timezone
 import io
 import types
 from unittest.mock import patch
@@ -99,7 +100,7 @@ class OrphanTTLTests(Isolated):
         self.stop.assert_not_called()
 
     def test_longer_background_deadline_is_preserved(self):
-        self.remote['archiveAfter'] = common.iso(common.now() + 5 * 3600)
+        self.remote['archiveAfter'] = datetime.fromtimestamp(common.now() + 5 * 3600, timezone.utc).isoformat()
         with patch.object(api, 'set_ttl') as set_ttl:
             self.keep.side_effect = ENSURE_TTL
             reap._reap(self.con, False, [])
@@ -117,8 +118,9 @@ class OrphanTTLTests(Isolated):
         )
         for listed, current_ttl, state, patch_ttl in cases:
             with self.subTest(listed=listed, current=current_ttl, state=state):
-                self.remote['archiveAfter'] = common.iso(common.now() + listed)
-                current = dict(state=state, archiveAfter=common.iso(common.now() + current_ttl)) if state else None
+                self.remote['archiveAfter'] = datetime.fromtimestamp(common.now() + listed, timezone.utc).isoformat()
+                current = dict(state=state, archiveAfter=datetime.fromtimestamp(
+                    common.now() + current_ttl, timezone.utc).isoformat()) if state else None
                 self.get.side_effect = None
                 self.get.return_value = current
                 self.keep.side_effect = ENSURE_TTL

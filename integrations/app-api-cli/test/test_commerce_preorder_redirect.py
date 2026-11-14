@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ FLOW = '10000000-0000-4000-8000-000000000001'
 
 class RedirectTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         root = patch.object(j, 'ROOT', Path(self.temp.name) / 'commerce')
@@ -19,6 +21,7 @@ class RedirectTests(unittest.TestCase):
         self.addCleanup(root.stop)
         j.open_flow(flow_id=FLOW, app='noon', vertical='nownow',
                     account_hash='1'*64, scope_hash='2'*64)
+        j.record_nownow_prepared(FLOW, '5'*64)
 
     def test_preparation_visible_even_after_window(self):
         rows = j.open_payments(now=j.flow_created_at(FLOW)+86400)
@@ -55,7 +58,7 @@ class RedirectTests(unittest.TestCase):
             return {'payment_status': 'payment_ready_to_redirect'}
         with patch.object(p, 'recover', side_effect=recover), patch.object(r, 'open_once') as opened, \
                 patch.object(p, 'notify_owner') as notify:
-            result = p.await_payment(FLOW, wait_seconds=0)
+            result = p.await_payment(FLOW, wait_seconds=0, notify=False)
         self.assertTrue(result['timed_out'])
         opened.assert_not_called()
         notify.assert_not_called()
@@ -69,14 +72,14 @@ class RedirectTests(unittest.TestCase):
     def test_redirect_outranks_raw_confirmation(self):
         with patch.object(p, 'recover', return_value={
                 'payment_status': 'payment_confirmed', 'redirect_required': True}):
-            result = p.await_payment(FLOW, wait_seconds=0)
+            result = p.await_payment(FLOW, wait_seconds=0, notify=False)
         self.assertTrue(result['timed_out'])
         self.assertFalse(result['verification_confirmed'])
 
     def test_cli_pending_exception_enters_wait_without_replaying_verification(self):
         import commerce_cli as cli
         from types import SimpleNamespace
-        args = SimpleNamespace(resume_flow=None, store_code='store', prepare_only=False,
+        args = SimpleNamespace(resume_flow=FLOW, store_code='store', prepare_only=False,
                                cvv_from_keychain=True)
         flow = Mock(flow_id=FLOW)
         flow.prepare_only.return_value = {'review': {}}
@@ -86,13 +89,14 @@ class RedirectTests(unittest.TestCase):
                 patch.object(cli, 'CommerceAuth'), patch.object(cli, 'prepared_result'), \
                 patch('commerce_nownow_order.NowNowOrderFlow', return_value=flow) as cls, \
                 patch.object(p, 'await_payment', return_value={'verification_confirmed': False}) as wait:
+            cls.resume_active.return_value = flow
             with self.assertRaises(j.PaymentError) as caught:
                 cli.order_nownow(args)
         self.assertIs(caught.exception, pending)
         wait.assert_called_once_with(FLOW, open_redirect=True)
         flow.prepare_payment.assert_called_once()
         flow.place.assert_not_called()
-        cls.resume_active.assert_not_called()
+        self.assertEqual(cls.resume_active.call_count, 1)
         resumed = Mock()
         resumed.prepare_payment.side_effect = AssertionError('verification replay')
         resumed.place.side_effect = RuntimeError('placement boundary')
@@ -100,10 +104,10 @@ class RedirectTests(unittest.TestCase):
                 patch.object(cli, 'CommerceAuth'), patch.object(cli, 'prepared_result'), \
                 patch('commerce_nownow_order.NowNowOrderFlow', return_value=flow) as cls, \
                 patch.object(p, 'await_payment', return_value={'verification_confirmed': True}):
-            cls.resume_active.return_value = resumed
-            with self.assertRaisesRegex(RuntimeError, 'placement boundary'):
+            cls.resume_active.side_effect = [flow, resumed]
+            with self.assertRaisesRegex(j.PaymentError, 'NOWNOW_ORDER_STOPPED'):
                 cli.order_nownow(args)
-        resumed.prepare_only.assert_called_once()
+        resumed.prepare_only.assert_called_once_with(record=False)
         resumed.prepare_payment.assert_not_called()
         resumed.place.assert_called_once()
 
@@ -141,7 +145,7 @@ class RedirectTests(unittest.TestCase):
                 patch.object(r, 'open_once', side_effect=lambda *a: events.append('open')), \
                 patch.object(p, 'notify_owner', side_effect=lambda *a: events.append(a) or True):
             p.await_payment(FLOW, open_redirect=True, wait_seconds=0)
-        self.assertEqual(events, ['open', (FLOW, 100, '9546')])
+        self.assertEqual(events, [(FLOW, 100, '9546'), 'open'])
 
 
 if __name__ == '__main__':

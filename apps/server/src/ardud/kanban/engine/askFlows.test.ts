@@ -1,6 +1,6 @@
 /**
  * Typed owner asks end to end on the board service and its HTTP routes:
- * asking with a template and blocks, answering, replying without answering,
+ * asking with a template and blocks, answering, replying,
  * editing, handing one to the evaluator, and the Needs-you feed.
  */
 import { assert, it } from "@effect/vitest";
@@ -377,206 +377,6 @@ it.effect("a stale ask refuses the answer: revised since it was read, or expired
       );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
-);
-
-it.effect(
-  "a reply on an ask keeps it open and blocking, and the agent's reply or edit gives the turn back",
-  () =>
-    Effect.gen(function* () {
-      const fake = yield* makeFake;
-      yield* Effect.gen(function* () {
-        const { kanban, card, threadId, worker } = yield* workingCard();
-        yield* kanban.askOwner(
-          card.id,
-          { question: "Ship tonight?", blocking: true, options: ["Yes", "No"] },
-          worker,
-          "cardThread",
-        );
-        // A second ask on the same card, from someone else.
-        yield* kanban.askOwner(
-          card.id,
-          { question: "And the logo?", blocking: false },
-          { _tag: "evaluator", threadId: ThreadId.make("evaluator-other") },
-          "evaluator",
-        );
-        const shot = yield* writePending("screen.png", "image/png", "png-bytes");
-
-        // The owner asks about q1 with a screenshot instead of answering.
-        const reply = yield* kanban.replyOnAsk(
-          card.id,
-          "q1",
-          owner,
-          [
-            { _tag: "md", text: "I don't understand: tonight where?" },
-            { _tag: "attachment", attachment: shot },
-          ],
-          "owner",
-        );
-        assert.strictEqual(reply.askId, "q1");
-        assert.deepStrictEqual(
-          reply.blocks.map((block) => block._tag),
-          ["md", "attachment"],
-        );
-        const waiting = (yield* kanban.card(card.id)).card;
-        assert.strictEqual(waiting.stage, "needs_owner");
-        assert.isNull(askOf(waiting).closedAt);
-        assert.isTrue(askOf(waiting).blocking);
-        assert.strictEqual(kanbanAskWaitsOn(askOf(waiting)), "agent");
-        // The other ask on the card is untouched: a reply on one ask answers none.
-        assert.isNull(askOf(waiting, "q2").closedAt);
-        assert.strictEqual(kanbanAskWaitsOn(askOf(waiting, "q2")), "owner");
-
-        // Its worker is parked, so the card's evaluator is woken with the message and what to do.
-        const [evaluator] = yield* fake.evaluators;
-        assert.isDefined(evaluator);
-        const told = evaluator!.messages.find((text) => text.includes("without answering it"))!;
-        assert.include(told, "I don't understand: tonight where?");
-        assert.include(told, "still holds the card");
-        assert.include(told, "can't hear this");
-        assert.include(told, 'discussion_post (card #1, ask "q1")');
-        assert.include(told, "card_ask_change");
-        assert.strictEqual(
-          (yield* fake.heard(threadId)).filter((text) => text.includes("without answering")).length,
-          0,
-        );
-
-        // The agent replies with a picture: the ask stays open, and it is the owner's turn again.
-        const evaluatorActor: KanbanActor = { _tag: "evaluator", threadId: evaluator!.threadId };
-        const answerShot = yield* writePending("staging.png", "image/png", "png-bytes-2");
-        const agentReply = yield* kanban.replyOnAsk(
-          card.id,
-          "q1",
-          evaluatorActor,
-          [
-            { _tag: "md", text: "Tonight on staging only." },
-            { _tag: "attachment", attachment: answerShot },
-            { _tag: "html", html: "<p>plan</p>", title: "Plan", height: null },
-          ],
-          "evaluator",
-        );
-        assert.strictEqual(agentReply.askId, "q1");
-        const back = (yield* kanban.card(card.id)).card;
-        assert.strictEqual(kanbanAskWaitsOn(askOf(back)), "owner");
-        assert.isNull(askOf(back).closedAt);
-        assert.strictEqual(back.stage, "needs_owner");
-
-        // He asks again; this time the agent fixes the ask itself.
-        yield* kanban.replyOnAsk(
-          card.id,
-          "q1",
-          owner,
-          [{ _tag: "md", text: "Still unclear." }],
-          "owner",
-        );
-        assert.strictEqual(kanbanAskWaitsOn(askOf((yield* kanban.card(card.id)).card)), "agent");
-        const edited = yield* kanban.editAsk(
-          card.id,
-          "q1",
-          { question: "Ship to staging tonight?", revisionNote: "Said where" },
-          evaluatorActor,
-          "evaluator",
-        );
-        const revised = askOf(edited);
-        assert.strictEqual(kanbanAskWaitsOn(revised), "owner");
-        assert.strictEqual(revised.revision, 1);
-        assert.strictEqual(revised.revisionNote, "Said where");
-        assert.strictEqual(edited.question, "Ship to staging tonight?");
-        assert.strictEqual(edited.stage, "needs_owner");
-        const events = (yield* kanban.card(card.id)).events;
-        assert.strictEqual(events.at(-1)?.body, "Updated q1 (revision 1): Said where");
-
-        // The ask's thread in the feed: the ask, both replies, and the new version, in order.
-        const feed = yield* kanban.askFeed({});
-        const item = feed.open.find((entry) => entry.ask.id === "q1")!;
-        assert.deepStrictEqual(
-          item.messages.map((message) => [
-            message.author._tag,
-            message.blocks.map((block) => block._tag),
-          ]),
-          [
-            ["thread", ["choice"]],
-            ["owner", ["md", "attachment"]],
-            ["evaluator", ["md", "attachment", "html"]],
-            ["owner", ["md"]],
-            ["evaluator", ["md", "choice"]],
-          ],
-        );
-        assert.strictEqual(item.waitsOn, "owner");
-
-        // An old client's pick on the new version still answers it and wakes the card: it is
-        // stored as the pick it is, checked like one sent to the ask.
-        const talk = yield* kanban.cardDiscussion(card.id);
-        yield* kanban.answer(talk.id, revised.seq!, "q1", ["o1"], owner);
-        const answered = (yield* kanban.card(card.id)).card;
-        assert.isNotNull(askOf(answered).closedAt);
-        assert.deepStrictEqual(
-          [askOf(answered).answer?.verdict, askOf(answered).answer?.optionIds],
-          ["picked", ["o1"]],
-        );
-        assert.strictEqual(answered.stage, "todo");
-        assert.include(answered.wakeNote ?? "", "Yes");
-      }).pipe(Effect.provide(testLayer(fake.layer)));
-    }),
-);
-
-it.effect(
-  "a live asker hears the owner's reply on its ask itself, and a plain reply still answers",
-  () =>
-    Effect.gen(function* () {
-      const fake = yield* makeFake;
-      yield* Effect.gen(function* () {
-        const { kanban, card, threadId, worker } = yield* workingCard();
-        yield* kanban.askOwner(
-          card.id,
-          { question: "Which fee?", blocking: false },
-          worker,
-          "cardThread",
-        );
-        yield* kanban.replyOnAsk(
-          card.id,
-          "q1",
-          owner,
-          [{ _tag: "md", text: "Fee on what?" }],
-          "owner",
-        );
-        const told = (yield* fake.heard(threadId)).filter((text) =>
-          text.includes("without answering it"),
-        );
-        assert.strictEqual(told.length, 1);
-        assert.include(told[0]!, "His message:\nFee on what?");
-        assert.notInclude(told[0]!, "can't hear this");
-        assert.deepStrictEqual(yield* fake.evaluators, []);
-
-        // The asker replies on the ask through the same call: its turn is over, the ask stays open.
-        yield* kanban.replyOnAsk(
-          card.id,
-          "q1",
-          worker,
-          [{ _tag: "md", text: "On withdrawals." }],
-          "cardThread",
-        );
-        const open = askOf((yield* kanban.card(card.id)).card);
-        assert.isNull(open.closedAt);
-        assert.strictEqual(kanbanAskWaitsOn(open), "owner");
-
-        // A reply typed in the card discussion (an old client) answers the open asks as before.
-        const talk = yield* kanban.cardDiscussion(card.id);
-        yield* kanban.post(talk.id, owner, [{ _tag: "md", text: "Use 2%" }]);
-        const closed = askOf((yield* kanban.card(card.id)).card);
-        assert.isNotNull(closed.closedAt);
-        assert.deepStrictEqual(closed.answer?.verdict, "answered");
-        assert.strictEqual(
-          (yield* fake.heard(threadId)).filter((text) => text.includes("Use 2%")).length,
-          1,
-        );
-
-        // A closed ask takes no more replies.
-        const late = yield* kanban
-          .replyOnAsk(card.id, "q1", owner, [{ _tag: "md", text: "?" }], "owner")
-          .pipe(Effect.flip);
-        assert.strictEqual(late.code, "not-found");
-      }).pipe(Effect.provide(testLayer(fake.layer)));
-    }),
 );
 
 it.effect(
@@ -1121,22 +921,28 @@ it.effect("the HTTP routes: feed shape, single answer, batch answer, reply and h
         assert.strictEqual(reply.status, 200);
         assert.strictEqual(reply.body.askId, "q3");
         assert.strictEqual(
-          kanbanAskWaitsOn(askOf((yield* kanban.card(other.id)).card, "q3")),
-          "agent",
+          askOf((yield* kanban.card(other.id)).card, "q3").answer?.verdict,
+          "text",
         );
-        const hand = yield* http.post("/cards/toy:2/asks/q3/hand", {});
+        yield* kanban.askOwner(
+          other.id,
+          { question: "Color again?", blocking: false, options: ["Red", "Blue"] },
+          asker,
+          "evaluator",
+        );
+        const hand = yield* http.post("/cards/toy:2/asks/q4/hand", {});
         assert.strictEqual(hand.status, 200);
         assert.isString(hand.body.ask.handedAt);
-        const detail = yield* http.get("/cards/toy:2/asks/q3");
+        const detail = yield* http.get("/cards/toy:2/asks/q4");
         assert.strictEqual(detail.status, 200);
-        assert.strictEqual(detail.body.ask.id, "q3");
+        assert.strictEqual(detail.body.ask.id, "q4");
         assert.strictEqual(detail.body.cardNumber, 2);
         const waiting = (yield* http.get("/asks")).body as unknown as KanbanAskFeed;
         assert.deepStrictEqual(
           waiting.open.map((item) => [item.ask.id, item.waitsOn]),
-          [["q3", "evaluator"]],
+          [["q4", "evaluator"]],
         );
-        const taken = yield* http.post("/cards/toy:2/asks/q3/hand", { action: "take_back" });
+        const taken = yield* http.post("/cards/toy:2/asks/q4/hand", { action: "take_back" });
         assert.isUndefined(taken.body.ask.handedAt);
       }),
     ).pipe(Effect.provide(testLayer(fake.layer)));

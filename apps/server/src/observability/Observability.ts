@@ -45,6 +45,8 @@ export const layer = Layer.unwrap(
         const sink = yield* makeTraceSink({
           filePath: config.serverTracePath,
           ...retention,
+          compressBackups: true,
+          fileFilter: { minDurationMs: config.traceFileMinDurationMs },
           batchWindowMs: config.traceBatchWindowMs,
           onFlush: (stats) =>
             attribution.record({
@@ -75,6 +77,9 @@ export const layer = Layer.unwrap(
 
         return Layer.mergeAll(
           Layer.succeed(Tracer.Tracer, tracer),
+          Layer.succeed(SharedObservability.TraceStorageMaintenance, {
+            withMaintenance: sink.withMaintenance,
+          }),
           BrowserTraceCollector.layer(sink),
         );
       }),

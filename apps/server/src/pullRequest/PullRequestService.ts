@@ -97,17 +97,23 @@ import * as PullRequestProviderRegistry from "./PullRequestProviderRegistry.ts";
 import * as ViewedFiles from "./pullRequestViewedFiles.ts";
 
 type ProjectShellRead = ReturnType<ProjectService.ProjectService["Service"]["getShell"]>;
+type ProjectShellsRead = ReturnType<ProjectService.ProjectService["Service"]["listShells"]>;
 
-/**
- * Every PR read resolves its project (canonicalRef, the read cache key), and the background
- * sync made ~95% of all ProjectService.getShell calls that way: one per PR per sweep, each
- * queued on the shared orchestration reader. A sweep provides a fresh memo so each project is
- * read once per sweep; nothing is kept across sweeps, and other callers read fresh.
- */
-export const SweepProjectShells = Context.Reference<Map<ProjectId, ProjectShellRead> | null>(
-  "@t3tools/server/pullRequest/PullRequestService/SweepProjectShells",
-  { defaultValue: () => null },
-);
+/** A fresh memo per background sweep; interactive reads keep their normal freshness. */
+export const SweepProjectShells = Context.Reference<{
+  projects: ProjectShellsRead | undefined;
+  readonly fallbackRoutes: Map<
+    string,
+    Effect.Effect<SupportedProject | undefined, PullRequestError>
+  >;
+} | null>("@t3tools/server/pullRequest/PullRequestService/SweepProjectShells", {
+  defaultValue: () => null,
+});
+
+export const makeSweepProjectMemo = () => ({
+  projects: undefined as ProjectShellsRead | undefined,
+  fallbackRoutes: new Map<string, Effect.Effect<SupportedProject | undefined, PullRequestError>>(),
+});
 
 export interface PullRequestMergeEvent extends PullRequestRef {
   readonly mergedAt: string;
@@ -677,28 +683,57 @@ export const make = Effect.gen(function* () {
     ).pipe(Effect.map((resolved) => new Map(resolved)));
   };
 
+  const sweepProjectShells = Effect.fn("PullRequestService.sweepProjectShells")(function* () {
+    const memo = yield* SweepProjectShells;
+    const read = projects
+      .listShells()
+      .pipe(
+        Effect.flatMap((shells) =>
+          Effect.forEach(
+            shells,
+            (project) =>
+              project.repositoryIdentity != null
+                ? Effect.succeed(project)
+                : repositoryIdentities
+                    .resolve(project.workspaceRoot)
+                    .pipe(Effect.map((repositoryIdentity) => ({ ...project, repositoryIdentity }))),
+            { concurrency: REPOSITORY_CONCURRENCY },
+          ),
+        ),
+      );
+    if (memo === null) return yield* read;
+    if (memo.projects === undefined) memo.projects = yield* Effect.cached(read);
+    return yield* memo.projects;
+  });
+
   const projectShell: (projectId: ProjectId) => ProjectShellRead = Effect.fn(
     "PullRequestService.projectShell",
   )(function* (projectId: ProjectId) {
     const memo = yield* SweepProjectShells;
     if (memo === null) return yield* projects.getShell(projectId);
-    let read = memo.get(projectId);
-    if (read === undefined) {
-      read = yield* Effect.cached(projects.getShell(projectId));
-      memo.set(projectId, read);
-    }
-    return yield* read;
+    const shells = yield* sweepProjectShells();
+    return Option.fromNullishOr(shells.find((project) => project.id === projectId));
   });
 
   const listWorkspaceProjects = (
     filter: Pick<PullRequestListInput, "projectId" | "projectIds" | "host">,
   ): Effect.Effect<WorkspaceProjects, PullRequestError> =>
-    (filter.projectId === undefined
-      ? projects.listShells(
-          filter.projectIds === undefined ? undefined : { projectIds: filter.projectIds },
-        )
-      : projectShell(filter.projectId).pipe(Effect.map(Option.toArray))
+    Effect.flatMap(SweepProjectShells, (memo) =>
+      memo !== null
+        ? sweepProjectShells()
+        : filter.projectId === undefined
+          ? projects.listShells(
+              filter.projectIds === undefined ? undefined : { projectIds: filter.projectIds },
+            )
+          : projectShell(filter.projectId).pipe(Effect.map(Option.toArray)),
     ).pipe(
+      Effect.map((projects) =>
+        projects.filter(
+          (project) =>
+            (filter.projectId === undefined || project.id === filter.projectId) &&
+            (filter.projectIds === undefined || filter.projectIds.includes(project.id)),
+        ),
+      ),
       Effect.mapError(
         (error) =>
           new PullRequestOperationError({
@@ -708,15 +743,22 @@ export const make = Effect.gen(function* () {
           }),
       ),
       Effect.flatMap((projects) =>
-        Effect.forEach(
-          projects,
-          (project) =>
-            project.repositoryIdentity != null
-              ? Effect.succeed(project)
-              : repositoryIdentities
-                  .resolve(project.workspaceRoot)
-                  .pipe(Effect.map((repositoryIdentity) => ({ ...project, repositoryIdentity }))),
-          { concurrency: REPOSITORY_CONCURRENCY },
+        Effect.flatMap(SweepProjectShells, (memo) =>
+          memo !== null
+            ? Effect.succeed(projects)
+            : Effect.forEach(
+                projects,
+                (project) =>
+                  project.repositoryIdentity != null
+                    ? Effect.succeed(project)
+                    : repositoryIdentities.resolve(project.workspaceRoot).pipe(
+                        Effect.map((repositoryIdentity) => ({
+                          ...project,
+                          repositoryIdentity,
+                        })),
+                      ),
+                { concurrency: REPOSITORY_CONCURRENCY },
+              ),
         ),
       ),
       Effect.flatMap((projects) =>
@@ -787,6 +829,43 @@ export const make = Effect.gen(function* () {
       }),
     );
 
+  const fallbackProject = Effect.fn("PullRequestService.fallbackProject")(function* (
+    host: string,
+    repository: string,
+  ) {
+    const repositoryKey = canonicalRepositoryKey(`${host}/${repository}`.toLowerCase());
+    const memo = yield* SweepProjectShells;
+    const memoKey = `${host}\0${repository.toLowerCase()}`;
+    let read = memo?.fallbackRoutes.get(memoKey);
+    if (read === undefined) {
+      read = listWorkspaceProjects(
+        // Azure SSH and legacy clone hosts differ from the browser URL's host.
+        repositoryKey.startsWith("dev.azure.com/") ? {} : { host },
+      ).pipe(
+        Effect.map(({ supported }) => {
+          const onHost = supported.filter((candidate) => candidate.host === host);
+          return (
+            supported.find(
+              (candidate) =>
+                candidate.repositoryKey !== null && candidate.repositoryKey === repositoryKey,
+            ) ??
+            onHost.find(
+              (candidate) =>
+                candidate.repositoryKey === null &&
+                candidate.repository.toLowerCase() === repository.toLowerCase(),
+            ) ??
+            onHost.find((candidate) => candidate.repositoryKey === null)
+          );
+        }),
+      );
+      if (memo !== null) {
+        read = yield* Effect.cached(read);
+        memo.fallbackRoutes.set(memoKey, read);
+      }
+    }
+    return yield* read;
+  });
+
   /**
    * Azure derives its organization from the checkout, so it requires a matching
    * repository.
@@ -811,25 +890,8 @@ export const make = Effect.gen(function* () {
             }),
           );
         }
-        const repositoryKey = canonicalRepositoryKey(`${host}/${repository}`.toLowerCase());
-        // Azure SSH and legacy clone hosts differ from the browser URL's host. Compare
-        // the complete repository identity before narrowing those checkouts by host.
-        return listWorkspaceProjects(
-          repositoryKey.startsWith("dev.azure.com/") ? {} : { host },
-        ).pipe(
-          Effect.flatMap(({ supported }) => {
-            const onHost = supported.filter((candidate) => candidate.host === host);
-            const route =
-              supported.find(
-                (candidate) =>
-                  candidate.repositoryKey !== null && candidate.repositoryKey === repositoryKey,
-              ) ??
-              onHost.find(
-                (candidate) =>
-                  candidate.repositoryKey === null &&
-                  candidate.repository.toLowerCase() === repository.toLowerCase(),
-              ) ??
-              onHost.find((candidate) => candidate.repositoryKey === null);
+        return fallbackProject(host, repository).pipe(
+          Effect.flatMap((route) => {
             if (route === undefined) {
               return Effect.gen(function* () {
                 const provider = ["github.com", "bitbucket.org", "codeberg.org"].includes(host)
@@ -859,7 +921,9 @@ export const make = Effect.gen(function* () {
                     };
                   }
                 }
-                return yield* new PullRequestUnavailableError({ reason: "provider-unsupported" });
+                return yield* new PullRequestUnavailableError({
+                  reason: "provider-unsupported",
+                });
               });
             }
             return Effect.succeed(

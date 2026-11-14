@@ -1,3 +1,11 @@
+import * as McpCallLedger from "./ardud/analytics/McpCallLedger.ts";
+import * as McpAvailability from "./ardud/analytics/McpAvailability.ts";
+import * as AnalyticsDatabase from "./observability/AnalyticsDatabase.ts";
+import { layerServerAnalyticsErrors } from "./observability/RpcInstrumentation.ts";
+import * as OwnerAnalytics from "./ardud/analytics/Analytics.ts";
+import * as ThreadRedaction from "./ardud/redaction/ThreadRedaction.ts";
+import * as ThreadCommandExecutor from "./orchestration-v2/ThreadCommandExecutor.ts";
+import { redactionRouteLayer } from "./ardud/redaction/http.ts";
 import * as DelegatedTaskProgressGuard from "./orchestration-v2/DelegatedTaskProgressGuard.ts";
 import { canServeBeforeRecovery } from "./ardud/fast-install/readiness.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
@@ -244,7 +252,11 @@ const layerProviderEventLoggers = Layer.effect(
     );
     if (!store) return ProviderEventLoggers.NoOpProviderEventLoggers;
     yield* Effect.addFinalizer(() => store.close());
-    return { native: store.logger("native"), canonical: store.logger("canonical") };
+    return {
+      native: store.logger("native"),
+      canonical: store.logger("canonical"),
+      withMaintenance: store.withMaintenance,
+    };
   }),
 );
 
@@ -322,10 +334,12 @@ const layerRelayClient = Layer.unwrap(
 const layerHttpServer = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
+    const availability = yield* McpAvailability.McpAvailability;
     return NodeHttpServer.layer(
       () =>
         rejectRequestsUntilServing(
           guardHttpResponseWriteErrors(deferIdleSocketClose(NodeHttp.createServer())),
+          availability.reject,
         ),
       {
         host: config.host ?? "127.0.0.1",
@@ -770,6 +784,8 @@ const layerMakeRoutes = Layer.mergeAll(
     ServerBrowserStream.routeLayer,
     // ardud fork: local control API for bridges, crw and CLIs.
     controlRouteLayer,
+    redactionRouteLayer,
+    McpHttpServer.layerRedactionToolkit,
     desktopLeaseRouteLayer,
     harnessCutoverRouteLayer,
     openCodeImportRouteLayer,
@@ -783,6 +799,17 @@ const layerMakeRoutes = Layer.mergeAll(
     Layer.provide(McpOAuth.layerMcpClientAuthenticator),
   ),
 ).pipe(
+  Layer.provide(
+    ThreadRedaction.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ThreadCommandExecutor.layer,
+          EventStoreV2.layerFromOrchestrationEventStore,
+          RuntimeLayer.layerEventSink,
+        ),
+      ),
+    ),
+  ),
   Layer.provide(
     PullRequestReviewGuideService.layer.pipe(Layer.provide(PullRequestReviewGuides.layer)),
   ),
@@ -1111,7 +1138,16 @@ const layerMakeServer = Layer.unwrap(
     }).pipe(
       StartupPhaseLog.withStartupLayer("http.routes"),
       withUntracedRequests,
-      Layer.tap(() => Deferred.succeed(routesReady, undefined).pipe(Effect.orDie)),
+      Layer.tap(() =>
+        Effect.gen(function* () {
+          const calls = yield* McpCallLedger.McpCallLedger;
+          const availability = yield* McpAvailability.McpAvailability;
+          // Run before HTTP serving interrupts request fibers and closes their tool scopes.
+          yield* Effect.addFinalizer(() => calls.shutdown);
+          yield* availability.ready;
+          yield* Deferred.succeed(routesReady, undefined).pipe(Effect.orDie);
+        }),
+      ),
     );
     const layerServerApplication = Layer.mergeAll(
       layerRoutes,
@@ -1135,7 +1171,12 @@ const layerMakeServer = Layer.unwrap(
       Layer.provide(layerActivation),
       Layer.provideMerge(RelayTracing.layerServerRelayBroker),
       Layer.provideMerge(layerHttpServer),
+      Layer.provide(layerServerAnalyticsErrors),
       Layer.provide(layerApplicationObservability),
+      Layer.provide(AnalyticsDatabase.layer),
+      Layer.provide(McpCallLedger.layer),
+      Layer.provide(McpAvailability.layer),
+      Layer.provide(OwnerAnalytics.layer.pipe(Layer.provide(layerPersistence))),
       Layer.provide(LargeReplyLog.layer),
       Layer.provide(ReplyBuilders.layer),
       Layer.provideMerge(FetchHttpClient.layer),

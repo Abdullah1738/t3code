@@ -24,6 +24,37 @@ Stdlib only. Opens opencode.db read-only.
 import argparse, calendar, json, os, re, signal, sqlite3, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from active_sessions import snapshot  # noqa: E402
+sys.path.insert(0, os.path.expanduser("~/.local/lib/mac-logging"))
+try:
+    from toollog import emit
+except Exception:
+    def emit(*args, **kwargs):
+        pass
+
+
+def log_kill(resource, ok):
+    try:
+        kind = resource.get("kind")
+        mapped = {"simulator": "sim", "simulator-app": "sim", "expo": "metro"}.get(kind, "docker")
+        if kind == "container" and "localstack" in resource.get("image", "").lower():
+            mapped = "localstack"
+        sessions = resource.get("sessions") or []
+        owner = resource.get("owner_thread") or next((x.get("threadId") for x in sessions if x.get("threadId")), None)
+        emit("janitor", "event" if ok else "error", "janitor.kill", ok=ok,
+             ids={"threadId": owner}, props={"resourceKind": mapped, "ageS": resource.get("age_s")},
+             error_tag=None if ok else "janitor.kill_failed")
+    except Exception:
+        pass
+
+
+def log_run(started, found, killed, ok):
+    try:
+        emit("janitor", "perf" if ok else "error", "janitor.run", ok=ok,
+             duration_ms=(time.monotonic()-started)*1000, props={"found": found, "killed": killed},
+             error_tag=None if ok else "janitor.failed")
+    except Exception:
+        pass
+
 
 IDLE_MIN = int(os.environ.get("DEV_JANITOR_IDLE_MIN", "60"))
 OC_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
@@ -299,9 +330,11 @@ def act(r):
     return False, "unknown kind"
 
 
-def apply(ids):
+def apply(ids, stats=None):
+    stats = stats if stats is not None else {}
     order = {"sim": 0, "simulator-app": 1, "expo": 2, "container": 3, "docker-desktop": 4}
     want = [i.strip() for i in ids.split(",") if i.strip()]
+    stats["found"] = max(stats.get("found", 0), len(want))
     done = []
     for rid in sorted(want, key=lambda x: order.get(x.split(":")[0], 9)):
         st = scan()  # re-scan before every action; state may have changed
@@ -312,7 +345,14 @@ def apply(ids):
         if not r["candidate"]:
             done.append({"id": rid, "ok": False, "action": "skipped", "keep_reasons": r["keep_reasons"]})
             continue
-        ok, msg = act(r)
+        try:
+            ok, msg = act(r)
+        except Exception:
+            log_kill(r, False)
+            raise
+        log_kill(r, ok)
+        if ok:
+            stats["killed"] = stats.get("killed", 0) + 1
         entry = {"ts": int(time.time()), "id": rid, "kind": r["kind"], "ok": ok, "msg": msg[:300],
                  "age_s": r.get("age_s"), "detail": {k: r.get(k) for k in ("name", "cwd", "port", "image", "rss_mb", "vm_rss_mb")}}
         audit(entry)
@@ -335,7 +375,8 @@ def quit_simulator_app():
                "msg": "no booted devices; Simulator.app terminated"})
 
 
-def main():
+def run(stats=None):
+    stats = stats if stats is not None else {}
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("scan")
@@ -344,11 +385,25 @@ def main():
     args = ap.parse_args()
     if args.cmd == "scan":
         st = scan()
+        stats["found"] = len(st["resources"])
         os.makedirs(LOG_DIR, exist_ok=True)
         json.dump(st, open(LAST, "w"), indent=1)
         print(json.dumps(st, indent=1))
+        return len(st["resources"]), 0, True
     else:
-        print(json.dumps(apply(args.ids), indent=1))
+        results = apply(args.ids, stats)
+        print(json.dumps(results, indent=1))
+        return len(results), sum(r.get("ok", False) and r.get("action") != "gone" for r in results), all(r.get("ok") or r.get("action") == "skipped" for r in results)
+
+
+def main():
+    started = time.monotonic()
+    stats = {"found": 0, "killed": 0}
+    ok = False
+    try:
+        _, _, ok = run(stats)
+    finally:
+        log_run(started, stats["found"], stats["killed"], ok)
 
 
 if __name__ == "__main__":

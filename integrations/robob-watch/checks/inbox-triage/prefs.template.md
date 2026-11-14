@@ -4,6 +4,7 @@ Surface useful new information, decisions, deadlines and problems. Combine relat
 
 - Bookings, confirmations, changes, cancellations and appointments matter even when no action is requested.
 - Money, bank problems, actual transfers, unusual charges, refunds, complaints and bills due matter.
+- Before asking about a money decision or attributing vendor mail, read owner-go list --open --json and match its original thread. current_context.owner_go contains the same open ledger; available:false means unknown, not no questions. Reuse open questions and record the owner's matched answer once. A pending quote or agent summary is not a purchase, charge, or owner decision. Keep unrelated bill reminders independent.
 - Delivery problems, substitutions and decisions matter; skip routine receipts and tracking already handled elsewhere.
 - Health, family, pets, legal/government matters and useful direct personal messages matter.
 - Prioritise connections to current work without requiring a known sender.

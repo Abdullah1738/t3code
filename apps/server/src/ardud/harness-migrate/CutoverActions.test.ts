@@ -64,6 +64,7 @@ import * as Rules from "../kanban/engine/rules.ts";
 import * as BoardStore from "../kanban/store/KanbanStore.ts";
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 import { kanbanDDL } from "../persistence/kanbanSchema.ts";
+import { ensureKanbanCacheVersions } from "../persistence/kanbanCacheVersions.ts";
 import { readBlockRetry, writeBlockRetry, type BlockRetry } from "../schedules/runFollow.ts";
 import * as Actions from "./CutoverActions.ts";
 import * as CutoverEngine from "./CutoverEngine.ts";
@@ -121,6 +122,7 @@ const board: KanbanBoard = {
   setup: null,
   pause: { reason: "Harness cutover", keep: [], at, by: "owner" },
   createdAt: at,
+  nightlyReview: null,
   archivedAt: null,
 };
 const pool = (model: ModelSelection, slots: number): KanbanPool => ({
@@ -499,6 +501,7 @@ const splitDatabase = Layer.unwrap(
     const boardContext = yield* Layer.build(NodeSqliteClient.layer({ filename: ":memory:" }));
     const sql = yield* SqlClient.SqlClient.pipe(Effect.provide(boardContext));
     for (const ddl of kanbanDDL) yield* sql.unsafe(ddl);
+    yield* ensureKanbanCacheVersions(sql);
     return Layer.mergeAll(
       BoardStore.layer,
       CutoverStore.layerWithOptions({ snapshotPath: path.join(directory, "plan.json") }),

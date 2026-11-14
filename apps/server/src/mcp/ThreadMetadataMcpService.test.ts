@@ -30,6 +30,7 @@ function layerService(
     Layer.provide(
       Layer.merge(
         Layer.mock(ThreadManagement.ThreadManagementService)({
+          getCallerRow: getThreadShell,
           getThreadShell,
           getThreadRecords: () => Effect.die("projection must not load after shell failure"),
         } satisfies Partial<ThreadManagement.ThreadManagementService["Service"]>),

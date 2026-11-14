@@ -28,8 +28,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from functools import wraps
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+
+import toollog
 
 HOME = Path.home()
 STATE_DIR = HOME / ".local/share/rcsim"
@@ -411,20 +415,6 @@ def register(con, sess: dict, platform: str, me: dict, purpose: str | None, sour
     event(con, sess["id"], "register", f"source={source} owner={me.get('thread')} manager={me.get('manager')}")
 
 
-def announce(sess: dict, platform: str, me: dict, purpose: str | None) -> bool:
-    url = sess.get("url")
-    lines = [f"Run Cloud {'iOS simulator' if platform == 'ios' else 'Android emulator'} up: {sess.get('displayName') or sess['id'][:8]}"]
-    if me.get("title"):
-        lines.append(f"Thread: {me['title']}")
-    if purpose:
-        lines.append(f"Purpose: {purpose}")
-    lines.append(f"Id: {sess['id']}")
-    lines.append(f"Hard stop: {hhmm(iso_ts(sess.get('expiresAt')))} (Dubai)")
-    if url:
-        lines.append(url)
-    return telegram("\n".join(lines), f"rcsim:{sess['id']}:up")
-
-
 def label_args(me: dict, purpose: str | None) -> list[str]:
     out = ["--label", "rcsim=1"]
     if me.get("thread"):
@@ -464,11 +454,45 @@ def print_created(sess: dict, platform: str, me: dict, notified: bool, as_json: 
     print(f"owner thread: {me.get('thread') or '(none: not running in a Robob thread)'}")
     if me.get("manager"):
         print(f"manager thread: {me['manager']}")
-    print(f"hard stop: {hhmm(exp)} Dubai ({sess.get('expiresAt')})  telegram link sent: {'yes' if notified else 'NO'}")
+    print(f"hard stop: {hhmm(exp)} Dubai ({sess.get('expiresAt')})")
     print(f"next heartbeat due by {hhmm(now() + HEARTBEAT_S)}: rcsim heartbeat {sess['id']}")
     print(f"release when done: rcsim release {sess['id']}")
 
 
+def log_error_tag(code, data):
+    error = data.get('error') if isinstance(data, dict) else None
+    error = error if isinstance(error, dict) else {}
+    status = error.get('httpStatus')
+    tag = error.get('code') or error.get('tag')
+    # Provider fields and text are untrusted. Only known diagnostic tags survive.
+    known = {'api_origin_unavailable', 'not_found', 'unauthorized', 'quota_exceeded', 'capacity_exceeded'}
+    if code == 124:
+        return 'timeout'
+    return (str(status) + '.' if isinstance(status, int) else '') + (tag if tag in known else 'runcloud.failed')
+
+
+def logged_sim(name):
+    def decorate(fn):
+        @wraps(fn)
+        def run(a):
+            start = time.perf_counter()
+            ok = False
+            try:
+                result = fn(a)
+                ok = True
+                return result
+            finally:
+                if name != 'sim.heartbeat' or not ok:
+                    toollog.emit('rcsim', 'perf' if ok else 'error', name,
+                             duration_ms=(time.perf_counter() - start) * 1000, ok=ok,
+                             ids={'sessionId': getattr(a, '_log_session_id', None)},
+                             props={'platform': getattr(a, 'platform', 'unknown')},
+                             error_tag=None if ok else getattr(a, '_log_error_tag', name + '.failed'))
+        return run
+    return decorate
+
+
+@logged_sim('sim.create')
 def cmd_create(a) -> None:
     me = whoami(a.thread, a.manager)
     refuse_unresolved(me, "create")
@@ -485,14 +509,18 @@ def cmd_create(a) -> None:
     if a.install_asset:
         args += ["--install-asset", a.install_asset]
     code, data, out, err = rc(args)
+    a._log_session_id = data.get("id") if isinstance(data, dict) else None
     if code != 0 or not isinstance(data, dict) or not data.get("id"):
+        a._log_error_tag = log_error_tag(code, data)
         print(json.dumps(redact(data)) if data else (out + err).strip(), file=sys.stderr)
         die("runcloud create failed", 1)
+    a._log_session_id = data["id"]
     register(con, data, a.platform, me, a.purpose, "rcsim")
-    notified = False if a.no_notify else announce(data, a.platform, me, a.purpose)
+    notified = False
     print_created(data, a.platform, me, notified, a.json)
 
 
+@logged_sim('sim.create')
 def cmd_launch(a) -> None:
     if bool(a.build) == bool(a.asset):
         die("pass exactly one of --build BUILD_ID or --asset ASSET_ID")
@@ -511,11 +539,14 @@ def cmd_launch(a) -> None:
         args += ["--region", a.region]
     code, data, out, err = rc(args, timeout=900)
     sess = (data or {}).get("session") if isinstance(data, dict) else None
+    a._log_session_id = sess.get("id") if isinstance(sess, dict) else None
     if code != 0 or not sess or not sess.get("id"):
         print(json.dumps(redact(data)) if data else (out + err).strip(), file=sys.stderr)
+        a._log_error_tag = log_error_tag(code, data)
         die("runcloud mobile launch failed", 1)
+    a._log_session_id = sess["id"]
     register(con, sess, a.platform, me, a.purpose, "rcsim", launch_id=data.get("id"))
-    notified = False if a.no_notify else announce(sess, a.platform, me, a.purpose)
+    notified = False
     print_created(sess, a.platform, me, notified, a.json)
 
 
@@ -536,6 +567,19 @@ def my_active(con, me: dict):
     return out
 
 
+def _log_session(name, row, started, *, ok=True, error_tag=None, observed_at=None, operation=None):
+    try:
+        observed_at = now() if observed_at is None else observed_at
+        toollog.emit('rcsim', 'perf' if ok else 'error', name, ok=ok,
+                     duration_ms=(time.perf_counter() - started) * 1000,
+                     ids={'sessionId': row['id']}, props={'platform': row['platform'],
+                     'billedMinutes': max(0, min(observed_at, row['expires_at'] or observed_at) - row['created_at']) / 60,
+                     'status': 'elapsed-estimate', 'operation': operation}, error_tag=error_tag)
+    except Exception:
+        pass
+
+
+@logged_sim('sim.heartbeat')
 def cmd_heartbeat(a) -> None:
     con = db()
     me = whoami(a.thread)
@@ -546,6 +590,7 @@ def cmd_heartbeat(a) -> None:
         die("no active simulators registered to this thread (pass ids explicitly)", 1)
     who = me.get("thread") or me.get("ses") or "cli"
     for sid in ids:
+        started = time.perf_counter()
         row = get_row(con, sid)
         if not row or row["state"] != "active":
             print(f"{sid}: not active ({row['release_reason'] if row else 'unregistered'}); nothing to heartbeat")
@@ -553,22 +598,34 @@ def cmd_heartbeat(a) -> None:
         con.execute("UPDATE sims SET last_hb=?, hb_by=?, warned_at=NULL WHERE id=?", (now(), who, sid))
         con.commit()
         event(con, sid, "heartbeat", who)
+        a._log_session_id = sid
+        a.platform = row['platform']
+        _log_session('sim.heartbeat', row, started)
         left = (row["expires_at"] or 0) - now()
         print(f"{sid}: heartbeat ok, next due by {hhmm(now() + HEARTBEAT_S)}; hard stop {hhmm(row['expires_at'])} ({mins(max(left, 0))} left)")
 
 
 def release(con, row, reason: str) -> tuple[bool, str]:
-    code, data, out, err = rc([row["platform"], "delete", row["id"], "--json"], timeout=120)
-    gone = code == 0 or (isinstance(data, dict) and (data.get("error") or {}).get("httpStatus") == 404) \
-        or "not found" in (out + err).lower()
-    status = (data or {}).get("status") if isinstance(data, dict) else None
-    if gone:
-        con.execute("UPDATE sims SET state='released', released_at=?, release_reason=? WHERE id=?",
-                    (now(), reason, row["id"]))
-        con.commit()
-        event(con, row["id"], "release", reason)
-        return True, status or "released"
-    return False, (json.dumps(redact(data)) if data else (out + err).strip())[:300]
+    started = time.perf_counter()
+    ok = False
+    tag = 'sim.release.failed'
+    try:
+        code, data, out, err = rc([row['platform'], 'delete', row['id'], '--json'], timeout=120)
+        error = data.get('error') if isinstance(data, dict) else None
+        gone = code == 0 or isinstance(error, dict) and error.get('httpStatus') == 404 or 'not found' in (out + err).lower()
+        tag = None if gone else log_error_tag(code, data)
+        status = data.get('status') if isinstance(data, dict) else None
+        if gone:
+            con.execute("UPDATE sims SET state='released', released_at=?, release_reason=? WHERE id=?",
+                        (now(), reason, row['id']))
+            con.commit()
+            event(con, row['id'], 'release', reason)
+            ok = True
+            return True, status or 'released'
+        return False, (json.dumps(redact(data)) if data else (out + err).strip())[:300]
+    finally:
+        _log_session('sim.release', row, started, ok=ok,
+                     error_tag=None if ok else tag or 'sim.release.failed')
 
 
 def cmd_release(a) -> None:
@@ -593,7 +650,16 @@ def cmd_release(a) -> None:
             # unregistered id: try both platforms
             sid = a.ids[i]
             for plat in PLATFORMS:
-                code, *_ = rc([plat, "delete", sid, "--json"])
+                started = time.perf_counter()
+                code, data = 1, None
+                tag = 'sim.release.start_failed'
+                try:
+                    code, data, *_ = rc([plat, "delete", sid, "--json"])
+                    tag = None if code == 0 else log_error_tag(code, data)
+                finally:
+                    toollog.emit('rcsim', 'perf' if code == 0 else 'error', 'sim.release', ok=code == 0,
+                                 duration_ms=(time.perf_counter() - started) * 1000,
+                                 ids={'sessionId': sid}, props={'platform': plat}, error_tag=tag)
                 if code == 0:
                     print(f"{sid}: released (unregistered {plat})")
                     break
@@ -732,10 +798,16 @@ def fold_touches(con) -> None:
             except ValueError:
                 pass
     tmp.unlink(missing_ok=True)
+    updated = []
     for sid, ts in latest.items():
-        con.execute("UPDATE sims SET last_hb=?, hb_by='interaction', warned_at=NULL "
-                    "WHERE id=? AND state='active' AND (last_hb IS NULL OR last_hb < ?)", (ts, sid, ts))
+        started = time.perf_counter()
+        cursor = con.execute("UPDATE sims SET last_hb=?, hb_by='interaction', warned_at=NULL "
+                             "WHERE id=? AND state='active' AND (last_hb IS NULL OR last_hb < ?)", (ts, sid, ts))
+        if cursor.rowcount:
+            updated.append((get_row(con, sid), ts, started))
     con.commit()
+    for row, ts, started in updated:
+        _log_session('sim.heartbeat', row, started, observed_at=ts, operation='interaction')
 
 
 def describe(row) -> str:
@@ -805,10 +877,13 @@ def monitor(dry: bool = False) -> None:
         exp = row["expires_at"] or 0
         reason = "hard timeout" if exp and t >= exp - 5 else "released outside rcsim"
         if not dry:
+            started = time.perf_counter()
             con.execute("UPDATE sims SET state='released', released_at=?, release_reason=? WHERE id=?",
                         (t, reason, row["id"]))
             con.commit()
             event(con, row["id"], "gone", reason)
+            _log_session('sim.release', row, started, observed_at=t,
+                         operation='hard-timeout' if reason == 'hard timeout' else 'outside')
         log(f"{row['id']} no longer active ({reason})")
 
     # 2. live sims we don't know: adopt from tags, else orphan
@@ -836,8 +911,6 @@ def monitor(dry: bool = False) -> None:
                      f"Deleting it at {hhmm(t + ORPHAN_GRACE_S)} unless an agent runs `rcsim claim {sid}`."
                      + (f"\n{s['url']}" if s.get("url") else ""),
                      f"rcsim:{sid}:orphan", "info")
-        else:
-            announce(s, s["platform"], me, tags.get("purpose"))
 
     # 3. enforce ownership + heartbeats
     for row in con.execute("SELECT * FROM sims WHERE state='active'").fetchall():
@@ -955,7 +1028,7 @@ def main() -> None:
                         help="viewer-enforced idle timeout (default none; heartbeats + hard timeout protect cost)")
         sp.add_argument("--thread", help="owner Robob thread id (default: this session's thread)")
         sp.add_argument("--manager", help="manager thread id (default: parent thread for subagents; 'none' to disable)")
-        sp.add_argument("--no-notify", action="store_true", help="skip the Telegram link (rare)")
+        sp.add_argument("--no-notify", action="store_true", help="deprecated; session creation no longer sends Telegram notices")
         sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("create", help="create a simulator/emulator session")

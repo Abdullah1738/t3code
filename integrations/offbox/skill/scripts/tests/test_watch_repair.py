@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from offbox_lib import runs
 
 
@@ -68,7 +69,7 @@ fi
 [ -z "${FAIL_SHUTDOWN:-}" ]
 ''')
         self.script = runs.WATCH_REPAIR.replace('/etc/sysctl.d/90-offbox-inotify.conf', str(self.config))
-        self.env = dict(os.environ, PATH=str(self.bins), FIX=str(self.root),
+        self.env = clean_env(PATH=str(self.bins), FIX=str(self.root),
                         OFFBOX_INOTIFY_PROC_DIR=str(self.proc), WATCH_OUTPUT=watchman or '')
 
     def tool(self, name, body):
@@ -194,7 +195,8 @@ echo "watchman $*" >> "$FIX/calls"
 [ "$1" != watch-list ] || echo poison
 ''')
         with patch.object(runs, 'WATCH_REPAIR', fx.script), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs, 'GO_REPAIR', ':'):
+                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs, 'GO_REPAIR', ':'), \
+                patch.object(runs.userns, 'setup', return_value=':'):
             script = runs.remote_script('w/repo', '.', ['echo USER_COMMAND; exit 3'], None, 'watch-test')
         result = fx.run(script)
         self.assertEqual((result.returncode, result.stdout), (3, 'USER_COMMAND\n'))

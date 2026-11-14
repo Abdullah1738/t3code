@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 from collections.abc import Callable
 import hashlib
 import json
+import sqlite3
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from time import monotonic, sleep
@@ -16,7 +19,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .common import HOME, OffboxError, db, kv_get, kv_set, log, now
+from . import common
+from .common import HOME, OffboxError, db, kv_get, kv_set, log, now, say
 
 # offbox's own component credential first, the old shared file last.
 CTL_CFGS = (HOME / ".robob/components/offbox.json", HOME / ".robob/ardud-control.json")
@@ -131,12 +135,13 @@ def opencode_session(ses: str) -> dict | None:
         return None
 
 
-def telegram(text: str, key: str, severity: str = "info") -> bool:
+def telegram(text: str, key: str, severity: str = "info", burst_key: str | None = None) -> bool:
     env = dict(os.environ)
     env.pop("BUN_INSPECT", None)
     try:
         p = subprocess.run([BUN, TG_CLI, "notify", "--source", "offbox", "--severity", severity,
-                            "--text", text[:4000], "--key", key[:200]],
+                            "--text", text[:4000], "--key", key[:200],
+                            *(["--burst-key", burst_key] if burst_key else [])],
                            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=40)
         ok = p.returncode == 0
     except Exception:  # noqa: BLE001
@@ -158,6 +163,7 @@ STALE_RESOLVED_MAX = 86400
 UNRESOLVED_TTL = 5
 IDENTITY_WAIT = 60
 IDENTITY_POLL = 2.5
+IDENTITY_RESTART_WAIT = 90
 
 
 def caller_native() -> tuple[str | None, str | None]:
@@ -174,13 +180,15 @@ def caller_native() -> tuple[str | None, str | None]:
     return None, None
 
 
-def _resolve_identity(path: str, on_pending: Callable[[dict], None]) -> tuple[int, dict]:
-    # A reader restart can fail even an established mapping. Retry that transport failure separately
-    # from pending proof; a successful unknown/ambiguous answer must still refuse immediately.
-    deadline = monotonic() + IDENTITY_WAIT
+def _resolve_identity(path: str, on_pending: Callable[[dict], None],
+                      has_stale: Callable[[], bool]) -> tuple[int, dict, float | None]:
+    started = monotonic()
+    deadline = started + IDENTITY_WAIT
     timeout = min(10, IDENTITY_WAIT)
     transport_retried = False
     last_pending = None
+    restart_waiting = False
+    backoff = 2
     while True:
         status, body = ctl("GET", path, timeout=timeout, whole_response=True)
         if not isinstance(body, dict):
@@ -190,15 +198,31 @@ def _resolve_identity(path: str, on_pending: Callable[[dict], None]) -> tuple[in
         if pending:
             if last_pending is None:
                 on_pending(answer)
+                if restart_waiting:
+                    # Recovery starts a separate pending budget; repeated replies must not extend it.
+                    deadline = monotonic() + IDENTITY_WAIT
             last_pending = body
         if pending:
             pause, next_timeout = IDENTITY_POLL, 10
+        elif (status == 0 or status >= 500) and last_pending is None and has_stale():
+            return status, body, None
+        elif status in (0, 502, 503) and last_pending is None:
+            if not restart_waiting:
+                message = f"Robob isn't answering (restarting?); waiting up to {IDENTITY_RESTART_WAIT} s for the caller lookup"
+                say(message)
+                log(message)
+                restart_waiting = True
+            deadline = started + IDENTITY_RESTART_WAIT
+            pause, next_timeout = backoff, 20
+            backoff = min(backoff * 2, 10)
         elif (status == 0 or status >= 500) and not transport_retried:
-            # Keep #626's single transport retry; pending polling shares its overall deadline.
+            # Other 5xx and an outage after pending keep the existing single retry.
             transport_retried = True
             pause, next_timeout = 1.5, 20
         else:
-            return (200, last_pending) if last_pending is not None and (status == 0 or status >= 500) else (status, body)
+            if last_pending is not None and (status == 0 or status >= 500):
+                return 200, last_pending, None
+            return status, body, None
         remaining = deadline - monotonic()
         if remaining <= 0:
             break
@@ -208,7 +232,33 @@ def _resolve_identity(path: str, on_pending: Callable[[dict], None]) -> tuple[in
             break
         timeout = min(next_timeout, remaining)
     # Pending invalidates an older proof. A later outage must not restore that cached owner.
-    return (200, last_pending) if last_pending is not None else (status, body)
+    if last_pending is not None:
+        return 200, last_pending, None
+    return status, body, monotonic() - started if restart_waiting else None
+
+
+def _identity_cache_path(key):
+    from . import common
+    return common.STATE / ('identity-cache-' + hashlib.sha256(key.encode()).hexdigest() + '.json')
+
+
+def _cache_identity(con, key, value):
+    from .common import atomic_write_json
+    previous = con.execute("SELECT v,ts FROM kv WHERE k=?", (key,)).fetchone()
+    if previous and kv_get(con, key) == value and now() - previous['ts'] <= RESOLVED_TTL:
+        return
+    timeout = con.execute('PRAGMA busy_timeout').fetchone()[0]
+    try:
+        # Optional caching must not stall read-only commands for the ordinary writer timeout.
+        con.execute('PRAGMA busy_timeout=100')
+        kv_set(con, key, value)
+    except sqlite3.Error as error:
+        log(f"identity cache write skipped for {key}: {error}")
+        # Preserve every authoritative update: an old resolved owner must never return
+        # after an ambiguous/none/unavailable answer, or a changed resolved owner.
+        atomic_write_json(_identity_cache_path(key), {'ts': now(), 'identity': value})
+    finally:
+        con.execute(f'PRAGMA busy_timeout={timeout}')
 
 
 def identity_for(native: str, driver: str) -> dict:
@@ -216,56 +266,66 @@ def identity_for(native: str, driver: str) -> dict:
 
     A pending or unavailable answer is never reported as unowned: callers treat it as "not yet".
     """
-    con = db()
-    key = f"identity:{driver}:{native}"
-    row = con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()
-    cached = None
-    age = 0
-    if row:
-        try:
-            cached = json.loads(row["v"])
-        except Exception:  # noqa: BLE001
-            cached = None
-        age = now() - (row["ts"] or 0)
-        if isinstance(cached, dict):
-            if cached.get("resolution") == "resolved" and age <= RESOLVED_TTL:
-                return cached
-            if cached.get("resolution") not in ("resolved", "pending") and age <= UNRESOLVED_TTL:
-                return cached
-    path = f"/identity/resolve?nativeId={q(native)}&driver={q(driver)}"
-
-    def invalidate_proof(answer):
-        nonlocal cached
-        cached = {**answer, "driver": driver, "nativeId": native}
-        kv_set(con, key, cached)
-
-    st, d = _resolve_identity(path, invalidate_proof)
-    had_resolved = isinstance(cached, dict) and cached.get("resolution") == "resolved"
-    if st == 200 and isinstance(d.get("identity"), dict):
-        ident = dict(d["identity"])
-    else:
-        # Only short reason fields belong in diagnostics, never the response body or headers.
-        error = d.get("error")
-        reason = error.get("message") or error.get("reason") if isinstance(error, dict) else error
-        err = next((v for v in (d.get("errorDetail"), reason, d.get("message"), d.get("reason"))
-                    if isinstance(v, str) and v), "no error detail")
-        detail = f"status={st} {' '.join(err.split())[:120]}"
+    with contextlib.closing(db()) as con:
+        key = f"identity:{driver}:{native}"
+        row = con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()
+        from .common import read_json
+        pending = read_json(_identity_cache_path(key), {})
+        if pending.get('ts', 0) > (row['ts'] if row else 0):
+            row = {'v': json.dumps(pending['identity']), 'ts': pending['ts']}
+        cached = None
+        age = 0
         if row:
+            try:
+                cached = json.loads(row["v"])
+            except Exception:  # noqa: BLE001
+                cached = None
             age = now() - (row["ts"] or 0)
-        if (st == 0 or st >= 500) and had_resolved and age <= STALE_RESOLVED_MAX:
-            log(f"identity resolve failed for {driver} {native[:8]} ({detail}); "
-                f"using last resolved identity from {age:.0f}s ago")
-            return cached
-        log(f"identity resolve failed for {driver} {native[:8]}: {detail}")
-        ident = {"resolution": "unavailable", "robobThreadId": None, "parentThreadId": None,
-                 "executionKind": None, "acceptsMessages": False, "candidates": []}
-        if st != 200:
-            ident["lookupError"] = detail
-    ident.update(driver=driver, nativeId=native)
-    # A failed lookup must not erase a confirmed mapping or refresh its timestamp.
-    if st == 200 or not had_resolved:
-        kv_set(con, key, ident)
-    return ident
+            if isinstance(cached, dict):
+                if cached.get("resolution") == "resolved" and age <= RESOLVED_TTL:
+                    return cached
+                if cached.get("resolution") not in ("resolved", "pending") and age <= UNRESOLVED_TTL:
+                    return cached
+        path = f"/identity/resolve?nativeId={q(native)}&driver={q(driver)}"
+
+        def invalidate_proof(answer):
+            nonlocal cached
+            cached = {**answer, "driver": driver, "nativeId": native}
+            _cache_identity(con, key, cached)
+
+        def has_stale():
+            return (isinstance(cached, dict) and cached.get('resolution') == 'resolved'
+                    and now() - (row['ts'] or 0) <= STALE_RESOLVED_MAX)
+
+        st, d, waited = _resolve_identity(path, invalidate_proof, has_stale)
+        had_resolved = isinstance(cached, dict) and cached.get("resolution") == "resolved"
+        if st == 200 and isinstance(d.get("identity"), dict):
+            ident = dict(d["identity"])
+        else:
+            # Only short reason fields belong in diagnostics, never the response body or headers.
+            error = d.get("error")
+            reason = error.get("message") or error.get("reason") if isinstance(error, dict) else error
+            err = next((v for v in (d.get("errorDetail"), reason, d.get("message"), d.get("reason"))
+                        if isinstance(v, str) and v), "no error detail")
+            detail = f"status={st} {' '.join(err.split())[:120]}"
+            if row:
+                age = now() - (row["ts"] or 0)
+            if (st == 0 or st >= 500) and had_resolved and age <= STALE_RESOLVED_MAX:
+                log(f"identity resolve failed for {driver} {native} ({detail}); "
+                    f"using last resolved identity from {age:.0f}s ago")
+                return cached
+            log(f"identity resolve failed for {driver} {native}: {detail}")
+            ident = {"resolution": "unavailable", "robobThreadId": None, "parentThreadId": None,
+                     "executionKind": None, "acceptsMessages": False, "candidates": []}
+            if st != 200:
+                ident["lookupError"] = detail
+            if waited is not None:
+                ident["lookupWaited"] = waited
+        ident.update(driver=driver, nativeId=native)
+        # A failed lookup must not erase a confirmed mapping or refresh its timestamp.
+        if st == 200 or not had_resolved:
+            _cache_identity(con, key, ident)
+        return ident
 
 
 HOOKS_SRC = HOME / ".local/share/harness-hooks/src"
@@ -324,7 +384,10 @@ def _lookup_thread(ses: str) -> dict:
             if st2 == 200 and d2.get("thread"):
                 me["manager"] = d2["thread"]["threadId"]
     if me["thread"] or st in (200, 404):
-        kv_set(con, ck, me)
+        try:
+            _cache_identity(con, ck, me)
+        except sqlite3.Error as error:
+            log(f"whoami cache write skipped: {error}")
     return me
 
 
@@ -339,19 +402,71 @@ def repo_root(cwd: str | None = None) -> Path:
     return Path(cwd).resolve()
 
 
+def normalize_repo_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:40] or "repo"
+
+
+def repo_key_db():
+    """Checkout identity belongs to the Mac, so a home/Boat failover must share its cache."""
+    common.ensure_dirs()
+    con = sqlite3.connect(common.STATE / "repo-keys.db", timeout=5)
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT, ts REAL)")
+        return con
+    except BaseException:
+        con.close()
+        raise
+
+
 def repo_key(root: Path) -> str:
-    """Stable short name for a repo: basename of the origin URL, falling back to the directory name."""
-    name = root.name
+    """Remember the last successful origin lookup per resolved checkout, without caching a guessed name."""
+    root = root.resolve()
+    cache_key = "repo_key:" + str(root)
+    con, remembered = None, None
+    name, reason = None, None
     try:
         p = subprocess.run(["git", "config", "--get", "remote.origin.url"], cwd=root, capture_output=True,
                            text=True, timeout=5)
         url = p.stdout.strip()
-        if url:
-            name = re.sub(r"\.git$", "", url.rstrip("/").split("/")[-1].split(":")[-1]) or name
+        if p.returncode != 0:
+            reason = "error"
+        elif url:
+            name = re.sub(r"\.git$", "", url.rstrip("/").split("/")[-1].split(":")[-1])
+            if not name:
+                reason = "empty"
+        else:
+            reason = "empty"
+    except subprocess.TimeoutExpired:
+        reason = "timeout"
     except Exception:  # noqa: BLE001
-        pass
-    name = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:40] or "repo"
-    return name
+        reason = "error"
+    try:
+        # Another lookup can commit the origin key while this one waits on git.
+        try:
+            con = repo_key_db()
+            remembered = kv_get(con, cache_key)
+            if not isinstance(remembered, str) or not remembered:
+                remembered = None
+        except (OSError, sqlite3.Error) as error:
+            log(f"repo_key_cache_error {root} operation=read error={type(error).__name__}")
+        if reason:
+            used = remembered or normalize_repo_name(root.name)
+            log(f"repo_key_fallback {root} reason={reason} used={used}")
+            if remembered is None:
+                say(f"warning: origin lookup failed ({reason}) for {root}; no remembered pool key, using {used}")
+            return used
+        key = normalize_repo_name(name)
+        if con is not None and key != remembered:
+            try:
+                kv_set(con, cache_key, key)
+            except (OSError, sqlite3.Error) as error:
+                log(f"repo_key_cache_error {root} operation=write error={type(error).__name__}")
+        return key
+    finally:
+        if con is not None:
+            con.close()
 
 
 def _ancestors(thread_id: str) -> set[str]:
@@ -432,6 +547,7 @@ def whoami(cwd: str | None = None) -> dict:
         ident = identity_for(native, driver)
         me["resolution"] = ident.get("resolution")
         me["lookupError"] = ident.get("lookupError")
+        me["lookupWaited"] = ident.get("lookupWaited")
         me["executionKind"] = ident.get("executionKind")
         me["acceptsMessages"] = ident.get("acceptsMessages")
         # A Claude shell carries only its session id, which a native child shares with its parent. C1 answers a
@@ -456,7 +572,7 @@ def whoami(cwd: str | None = None) -> dict:
         else:
             # Not yet (pending), ambiguous or unavailable: never the unowned local owner.
             detail = f" ({me['lookupError']})" if me.get("lookupError") else ""
-            log(f"caller {driver} {native[:8]} unresolved: {ident.get('resolution')}{detail}")
+            log(f"caller {driver} {native} unresolved: {ident.get('resolution')}{detail}")
         explicit = _explicit_thread(me["thread"], driver, me["executionKind"])
         if explicit is not None:
             me["thread"] = explicit
@@ -482,14 +598,15 @@ def require_proven(me: dict, action: str) -> None:
     must never reach a selector, where it would silently match nothing or the wrong caller's rows.
     """
     if not me.get("proven", True):
+        waited = f"; waited {me['lookupWaited']:.0f} s" if me.get("lookupWaited") is not None else ""
         if me.get("resolution") == "unavailable" and me.get("lookupError"):
             raise OffboxError(
                 f"{action} refused: this {me.get('driver')} caller can't be proven to be one Robob execution. "
-                f"Robob's control API didn't answer the caller lookup ({me['lookupError']}). "
+                f"Robob's control API didn't answer the caller lookup ({me['lookupError']}{waited}). "
                 f"Robob may be busy or restarting. Retry in ~30 s. Nothing was changed.", code=2)
         if me.get("driver") == "claudeAgent":
             raise OffboxError(
-                f"{action} refused: Claude identity can't be proven because the hook couldn't reach the Robob control API to sign this command. "
+                f"{action} refused: Claude identity can't be proven because the hook couldn't reach the Robob control API to sign this command{waited}. "
                 "Retry in a moment. Nothing was changed.", code=2)
         raise OffboxError(
             f"{action} refused: this caller ({me.get('driver')}) can't be proven to be one Robob execution yet "

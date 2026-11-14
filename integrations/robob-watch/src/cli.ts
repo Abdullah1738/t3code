@@ -1,3 +1,5 @@
+import { toolLog, toolError, rollup } from "./toollog.ts";
+import { stderrCause } from "./cause.ts";
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,7 +17,7 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
                   [--depends ssd,phone] [--inflight-check CMD]
                   [--chat SLUG]  (wake that bridge chat, e.g. moni, instead of the owner's; her own data)
   robob-watch add --json FILE|-          same fields as watcher.json (id, title, check, interval_s, mode, context,
-                                         expires_at, max_fires, inflight_check, timeout_s, max_consecutive_failures, depends, serial, triggers, quiet, trip, relays, chat, created_by_session)
+                                         expires_at, max_fires, inflight_check, timeout_s, max_consecutive_failures, failure_notice_after, depends, serial, triggers, quiet, trip, relays, chat, created_by_session)
   robob-watch list                       all watchers with status
   robob-watch show ID                    definition, state and recent log
   robob-watch context ID [--json FILE|- | --context TEXT | --context-file PATH] [--replace]
@@ -33,10 +35,12 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
   robob-watch relays-off ID [--to JID] --quote TEXT   the owner stopped updates to JID (default everyone), on every
                                          watcher sharing ID's trip
   robob-watch unscoped                   watchers whose text mentions wa draft/send but lists no relays (info only)
+  robob-watch log-rollup [--day YYYY-MM-DD]   roll up a UTC day (default yesterday)
   robob-watch runner                     LaunchAgent status
 
 Check contract: a zsh command run in the watcher dir with WATCH_DIR set. Print nothing when there is nothing new;
-print the event text on stdout (exit 0) when it fires. Non-zero exit = failure (backoff; pause and alert after 5 in a row).
+print the event text on stdout (exit 0) when it fires. Non-zero exit = failure (backoff; failure notice from the 2nd in a row).
+watcher.json failure_notice_after overrides 2 (1 = every failure); pause and alert after 5 in a row.
 watcher.json max_consecutive_failures overrides 5 (0 = backoff only); resume clears the failure pause and count.
 Keep your own state in $WATCH_DIR. Helpers on PATH: whatsapp-new-message, output-changed, email-new-message.
 Default interval 15s (min 5s). --trigger FILE runs the check within ~1s of FILE changing (push instead of poll),
@@ -100,7 +104,7 @@ async function main(argv: string[]): Promise<void> {
   const { values, positionals } = parseArgs({
     args: rest, allowPositionals: true, strict: true,
     options: {
-      "inflight-check": { type: "string" }, id: { type: "string" }, title: { type: "string" }, check: { type: "string" }, interval: { type: "string" },
+      day: { type: "string" }, "inflight-check": { type: "string" }, id: { type: "string" }, title: { type: "string" }, check: { type: "string" }, interval: { type: "string" },
       mode: { type: "string" }, context: { type: "string" }, "context-file": { type: "string" }, expires: { type: "string" },
       "max-fires": { type: "string" }, serial: { type: "boolean" }, session: { type: "string" }, replace: { type: "boolean" },
       "no-prime": { type: "boolean" }, trigger: { type: "string", multiple: true }, json: { type: "string" }, n: { type: "string" }, help: { type: "boolean", short: "h" }, now: { type: "boolean" },
@@ -110,6 +114,13 @@ async function main(argv: string[]): Promise<void> {
   });
   ensureDirs();
   switch (command) {
+    case "log-rollup": {
+      const day = values.day ?? new Date(Date.now() - 86400_000).toISOString().slice(0, 10);
+      const result = await rollup(day);
+      if (!result) throw new CliError("Could not roll up UTC day");
+      console.log(JSON.stringify(result));
+      return;
+    }
     case "add": {
       let input: Record<string, unknown>;
       if (values.json !== undefined) {
@@ -141,13 +152,15 @@ async function main(argv: string[]): Promise<void> {
         if (values.json === undefined && previous?.relays && !values["owner-only"]) input.relays = previous.relays;
         if (values.json === undefined && previous?.inflight_check && values["inflight-check"] === undefined) input.inflight_check = previous.inflight_check;
         if (values.json === undefined && previous?.timeout_s !== undefined) input.timeout_s = previous.timeout_s;
+        if (values.json === undefined && previous?.pending_check !== undefined) input.pending_check = previous.pending_check;
         if (values.json === undefined && previous?.depends) input.depends = previous.depends;
         if (values.json === undefined && previous?.max_consecutive_failures !== undefined) input.max_consecutive_failures = previous.max_consecutive_failures;
+        if (values.json === undefined && previous?.failure_notice_after !== undefined) input.failure_notice_after = previous.failure_notice_after;
         if (values.json === undefined && previous?.trip) input.trip = previous.trip;
         if (values.json === undefined && previous?.chat && values.chat === undefined) input.chat = previous.chat;
         if (values.depends !== undefined) input.depends = values.depends === "none" ? [] : dependencies(values.depends);
         let watcher: Watcher;
-        try { watcher = normalize(input as Partial<Watcher> & Record<string, unknown>); } catch (error) { throw new CliError((error as Error).message); }
+        try { watcher = normalize(input as Partial<Watcher> & Record<string, unknown>); } catch (error) { toolError("cli", "watch.invalid_definition", undefined, { stderrClass: "usage_error" }); throw new CliError((error as Error).message); }
         const dir = watcherDir(watcher.id);
         const replacingExisting = existsSync(join(dir, "watcher.json"));
         if (retiredWatcher(watcher.id)) throw new CliError(`Watcher ${watcher.id} was removed; use a new ID`);
@@ -272,6 +285,7 @@ async function main(argv: string[]): Promise<void> {
       const { w, s } = withRelayLock(() => {
         const w = need(positionals[0]);
         w.paused = command === "pause";
+        toolLog({ component: "cli", kind: "event", name: command === "pause" ? "watch.disabled" : "watch.recovered", ids: { watcher: w.id }, props: { action: command } });
         if (command === "resume" && values.expires !== undefined) w.expires_at = duration(values.expires);
         writeJson(join(watcherDir(w.id), "watcher.json"), w);
         const s: State = loadState(w.id);
@@ -296,6 +310,7 @@ async function main(argv: string[]): Promise<void> {
           delete s.failure_escalated;
           delete s.failing_since;
           delete s.last_error;
+          delete s.last_error_sources;
         }
         s.next_at = 0;
         saveState(w.id, s);
@@ -338,6 +353,7 @@ async function main(argv: string[]): Promise<void> {
     }
     case "rm":
     case "remove": {
+      toolLog({ component: "cli", kind: "event", name: "watch.disabled", ids: { watcher: positionals[0] }, props: { action: "remove" } });
       const w = need(positionals[0]);
       console.log(JSON.stringify({ id: w.id, ...removeWatcher(w.id, values.now) }));
       return;
@@ -369,6 +385,8 @@ async function main(argv: string[]): Promise<void> {
 try {
   await main(process.argv.slice(2));
 } catch (error) {
+  const cause = stderrCause(error instanceof Error ? error.message : "");
+  toolError("cli", "watch.command_failed", undefined, { stderrClass: error instanceof CliError ? "usage_error" : cause.stderrClass });
   console.error(`robob-watch: ${error instanceof CliError ? error.message : String((error as Error)?.message ?? error)}`);
   process.exitCode = 1;
 }

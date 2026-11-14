@@ -1,11 +1,14 @@
 #!/bin/zsh
 # activity-digest: fires with a short summary of the unreported lines of the assistant activity log
 # when the oldest is 3h+ old, or at 18:00-18:10 Dubai. Never 23:00-08:00 Dubai, and at most once per
-# MIN_GAP (2h). The wake text is capped at ~15 lines (totals, counts per topic, path); the full list of
-# unreported lines goes to $WATCH_DIR/digests/<stamp>.md for the woken agent to read.
+# MIN_GAP (2h). Counts and item lines share one rendered digest. Large digests send only a path
+# to $WATCH_DIR/digests/<stamp>.md so the runner's wake limit cannot clip counted items.
 # $WATCH_DIR/marker holds the number of log lines already reported; $WATCH_DIR/last_fire the epoch of
 # the last fire. 2026-10-15: replaced a 40-line dump that dropped 30+ items on busy days (72/70 entries).
 set -u
+setopt pipefail
+REDACTOR="${0:A:h:h:h}/helpers/redact.py"
+[[ -f $REDACTOR ]] || REDACTOR="$HOME/.local/share/robob-watch/helpers/redact.py"
 LOG="${ACTIVITY_LOG:-$HOME/Documents/assistant/activity-log.md}"
 MARKER="$WATCH_DIR/marker"
 LAST_FIRE="$WATCH_DIR/last_fire"
@@ -59,7 +62,7 @@ full="$DIGESTS/$(TZ=Asia/Dubai date -r "$now" +%Y-%m-%d-%H%M).md"
   print -r -- "# Activity digest: ${#entries} unreported entries (log lines $((seen + 1))-$total of $LOG)"
   print -r -- ""
   print -rl -- "${entries[@]}"
-} > "$full"
+} | /usr/bin/python3 "$REDACTOR" > "$full" || exit 1
 summary=$(print -rl -- "${entries[@]}" | /usr/bin/python3 "${0:A:h}/summarize.py" "$full") || { print -r -- "digest summary failed" >&2; exit 1; }
 [[ -n $summary ]] || { print -r -- "digest summary empty" >&2; exit 1; }
 

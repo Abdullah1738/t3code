@@ -8,7 +8,8 @@ async function scenario(body: string) {
   const root = mkdtempSync(join(tmpdir(), "person-relays-"));
   writeFileSync(join(root, "bridge.ts"), `import {appendFileSync,existsSync} from "node:fs";
 if(existsSync(${JSON.stringify(join(root, "fail"))})) process.exit(1);
-appendFileSync(${JSON.stringify(join(root, "calls"))}, JSON.stringify(process.argv.slice(2))+"\\n"); console.log("ok");`);
+const args = process.argv.slice(2).flatMap(a => { const i = a.indexOf("="); return a.startsWith("--") && i > 0 ? [a.slice(0, i), a.slice(i + 1)] : [a]; });
+appendFileSync(${JSON.stringify(join(root, "calls"))}, JSON.stringify(args)+"\\n"); console.log("ok");`);
   const source = `
     import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
     import { join } from "node:path";
@@ -16,6 +17,8 @@ appendFileSync(${JSON.stringify(join(root, "calls"))}, JSON.stringify(process.ar
     process.env.ROBOB_TEST = "1";
     delete process.env.ROBOB_WATCH_TEST_BATCH_MS;
     process.env.ROBOB_WATCH_ROOT = root;
+    process.env.TOOLLOG_DIR = join(root,"logs");
+    process.env.HEALTH_TOOLLOG_DIR = join(root,"health-logs");
     process.env.WACLI_STORE_DIR = join(root,"wacli");
     process.env.ROBOB_WATCH_LOAD_OVERRIDE = "0.1";
     process.env.ROBOB_WATCH_BRIDGE_DB = join(root, "bridge.sqlite");
@@ -51,7 +54,7 @@ appendFileSync(${JSON.stringify(join(root, "calls"))}, JSON.stringify(process.ar
     }
     function setupWhatsApp() {
       const store=process.env.WACLI_STORE_DIR; mkdirSync(store,{recursive:true}); mkdirSync(lib.HELPERS,{recursive:true});
-      for(const helper of ["whatsapp-new-message","wa-db"]) writeFileSync(join(lib.HELPERS,helper),readFileSync(join(${JSON.stringify(join(import.meta.dir,"../helpers"))},helper)),{mode:0o755});
+      for(const helper of ["whatsapp-new-message","wa-db","redact.py","toollog.py","toollog.zsh"]) writeFileSync(join(lib.HELPERS,helper),readFileSync(join(${JSON.stringify(join(import.meta.dir,"../helpers"))},helper)),{mode:0o755});
       const db=new Database(join(store,"wacli.db"));
       db.exec('create table contacts (jid text primary key, phone text, push_name text, full_name text, first_name text, business_name text, system_name text, updated_at int); create table contact_aliases (jid text primary key, alias text, notes text, updated_at int); create table chats (jid text primary key, kind text, name text, last_message_ts int, unread_count int default 0); create table messages (rowid integer primary key autoincrement, chat_jid text, chat_name text, msg_id text, sender_jid text, sender_name text, ts int, from_me int, text text, display_text text, media_type text, media_caption text, filename text, reaction_emoji text, edited int default 0, edited_ts int default 0, revoked int default 0, deleted_at int, unique(chat_jid,msg_id))');
       const jid="971500000001@s.whatsapp.net";

@@ -3,6 +3,7 @@
 Only verified native reads are allowed. Marketplace evidence is shipment-scoped;
 bounded active/history pages never certify whole-order terminal completion.
 """
+import toollog
 import datetime as dt
 import html
 import http.client
@@ -170,34 +171,39 @@ def request(route, headers, deadline, payload=None, shipment=None, item=None):
         raise NoonError('INVALID_READ_PAYLOAD')
     h = dict(headers)
     h.update({'content-type': 'application/json', 'accept': 'application/json', 'accept-encoding': 'identity'})
-    try:
-        req = urllib.request.Request('https://' + host + path, headers=h, method=method,
-                                     data=json.dumps(payload).encode() if payload is not None else None)
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        with read_deadline(deadline) as left:
-            with opener.open(req, timeout=left) as response:
-                raw = response.read(MAX_BYTES + 1)
-            if len(raw) > MAX_BYTES:
-                raise NoonError('RESPONSE_TOO_LARGE')
-            if raw[:2] == b'\x1f\x8b':
-                decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
-                raw = decoder.decompress(raw, MAX_BYTES + 1)
-                if len(raw) > MAX_BYTES or decoder.unconsumed_tail:
+    with toollog.request(path):
+        try:
+            req = urllib.request.Request('https://' + host + path, headers=h, method=method,
+                                         data=json.dumps(payload).encode() if payload is not None else None)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+            with read_deadline(deadline) as left:
+                with toollog.phase('fetch'):
+                    with opener.open(req, timeout=left) as response:
+                        raw = response.read(MAX_BYTES + 1)
+                toollog.response(getattr(response, 'code', None), None)
+                if len(raw) > MAX_BYTES:
                     raise NoonError('RESPONSE_TOO_LARGE')
-                if not decoder.eof:
-                    raise NoonError('NATIVE_READ_FAILED')
-            data = json.loads(raw)
-            if not isinstance(data, dict):
-                raise NoonError('SCHEMA_CHANGED')
-        return data
-    except urllib.error.HTTPError as exc:
-        exc.close()
-        raise NoonError({401: 'AUTH_EXPIRED', 403: 'AUTH_FORBIDDEN', 404: 'ORDER_NOT_FOUND',
-                         429: 'RATE_LIMITED'}.get(exc.code, 'HTTP_' + str(exc.code))) from None
-    except TimeoutError:
-        raise NoonError('NATIVE_READ_TIMEOUT') from None
-    except (urllib.error.URLError, http.client.HTTPException, ValueError, OSError, zlib.error):
-        raise NoonError('NATIVE_READ_FAILED') from None
+                if raw[:2] == b'\x1f\x8b':
+                    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    raw = decoder.decompress(raw, MAX_BYTES + 1)
+                    if len(raw) > MAX_BYTES or decoder.unconsumed_tail:
+                        raise NoonError('RESPONSE_TOO_LARGE')
+                    if not decoder.eof:
+                        raise NoonError('NATIVE_READ_FAILED')
+                with toollog.phase('parse'):
+                    data = json.loads(raw)
+                if not isinstance(data, dict):
+                    raise NoonError('SCHEMA_CHANGED')
+            toollog.response(getattr(response, 'code', None), data)
+            return data
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            raise NoonError({401: 'AUTH_EXPIRED', 403: 'AUTH_FORBIDDEN', 404: 'ORDER_NOT_FOUND',
+                             429: 'RATE_LIMITED'}.get(exc.code, 'HTTP_' + str(exc.code))) from None
+        except TimeoutError:
+            raise NoonError('NATIVE_READ_TIMEOUT') from None
+        except (urllib.error.URLError, http.client.HTTPException, ValueError, OSError, zlib.error):
+            raise NoonError('NATIVE_READ_FAILED') from None
 
 
 def verify_home(data, headers):
@@ -458,6 +464,7 @@ def _merge_cards(rows, reads):
     return merged
 
 
+@toollog.timed("noon", "provider.track")
 def track(order, timeout=10, *, deadline=None):
     if not isinstance(order, str) or not ORDER.fullmatch(order):
         raise NoonError('INVALID_ORDER_ID')
@@ -534,6 +541,7 @@ def track(order, timeout=10, *, deadline=None):
     return reads.finish(out)
 
 
+@toollog.timed("noon", "provider.orders")
 def orders(service='all', page=1, timeout=10):
     if service not in {'all', 'minutes', 'marketplace'} or type(page) is not int or not 1 <= page <= 100:
         raise NoonError('INVALID_ORDER_LIST_OPTIONS')

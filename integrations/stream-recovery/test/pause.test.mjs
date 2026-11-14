@@ -271,7 +271,8 @@ test('already-sent stall note reconciles once and long pause does not trigger gi
   f.setTime(T0 + 120 * MIN);
   await stallScan(f.args(), f.io);
   assert.equal(f.state.stalls.pending.outcome, 'cleared');
-  assert.deepEqual(f.calls, [['note'], ['telegram']]);
+  assert.deepEqual(f.calls, [['note']]);
+  assert.equal(f.state.stalls.pending.alertEligible, false);
 });
 
 test('late delegated note is guarded and its accepted send survives pause without a duplicate', async () => {

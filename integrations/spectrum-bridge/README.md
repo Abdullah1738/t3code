@@ -87,7 +87,9 @@ under `~/.config/spectrum-bridge/`.
   stops the bridge.
 - Incoming batches wait 15 seconds after the latest message. Photon 2.1 exposes
   outgoing typing only, so text still being composed cannot extend the quiet window.
-- Incoming attachments are limited to 10 files and 100 MiB total per batch. Every
+- Incoming batches take up to 30 files and 100 MiB total. Files beyond either
+  limit, or with invalid declared sizes, are listed in the prompt with recovery
+  instructions; the question and accepted files still reach the agent. Every taken
   file is saved under the chat's `attachments/` folder and passed to the agent by
   absolute path. Only images (PNG, JPEG, GIF, WebP, plus a JPEG preview of HEIC)
   are also attached natively, since a part the model provider rejects leaves the
@@ -97,7 +99,8 @@ under `~/.config/spectrum-bridge/`.
   allows 5 MB per image, and 8000 px per side, but only 2000 px once a request
   carries more than 20 images, and earlier turns count. Headers claiming over
   100 megapixels are never decoded. Native previews share a 10 MiB budget per
-  batch.
+  batch; previews beyond that budget are saved beside the originals and their
+  paths are included in the prompt.
 - 100 MiB is about iMessage's own ceiling. Files are buffered whole in memory,
   and the download deadline grows with size: 30 seconds plus one per MiB. Only
   files up to 20 MiB are checkpointed as SQLite blobs, which are never pruned;
@@ -331,6 +334,18 @@ in the `x-opencode-directory` header, percent-encoded; answers come wrapped in
 The operational setup and private credential handling remain in the local
 `imessage-notifications` skill. Use `bun run check` and `bun test` from this
 directory when changing the bridge.
+
+Tool-log rollups refresh at turn end, hourly, and after the UTC day changes.
+Read today's saved rollup with:
+
+```sh
+jq . "$HOME/.robob/logs/tools/imessage/rollup-$(date -u +%F).json"
+```
+
+`total` includes calls represented by turn summaries; `recordedRows` counts disk
+records. Call percentiles merge millisecond histograms, including slow and failed
+calls that also retain individual rows. `byComponent` includes each call name.
+After 50 MB, `log.degraded` marks errors-and-turns logging for the rest of the day.
 
 ## Upstream
 

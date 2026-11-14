@@ -6,6 +6,7 @@ orders(**options), track(order_id, **options). Raw mail lives in memory only.
 """
 from __future__ import annotations
 
+import toollog
 import argparse
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -432,6 +433,8 @@ def _scan(*, order_id=None, since=None, days=30, timeout=75, limit=150, max_read
     Do not rely on Gmail exact-ID fulltext search: live combined-package messages
     omit an order from indexed text although a trusted tracking link contains it.
     """
+    measure = toollog.phase_recorder()
+    record_error = toollog.error_recorder()
     runner = runner or subprocess.run
     now = now or dt.datetime.now(UTC)
     if now.tzinfo is None:
@@ -468,9 +471,11 @@ def _scan(*, order_id=None, since=None, days=30, timeout=75, limit=150, max_read
                                 'moni_account_not_supported_by_mailsearch',
                                 'unrecognized_subjects_not_read', 'from_domain_is_not_dkim_verification']}
     try:
-        process = runner(args + [query], capture_output=True, text=True,
-                         timeout=min(timeout, search_timeout + 3), env=_clean_env())
-        data = json.loads(process.stdout)
+        with measure('fetch'):
+            process = runner(args + [query], capture_output=True, text=True,
+                             timeout=min(timeout, search_timeout + 3), env=_clean_env())
+        with measure('parse'):
+            data = json.loads(process.stdout)
         if not isinstance(data, dict) or not isinstance(data.get('hits'), list) or not isinstance(data.get('status'), dict):
             raise ValueError('invalid_search_response')
         for account in requested:
@@ -484,9 +489,11 @@ def _scan(*, order_id=None, since=None, days=30, timeout=75, limit=150, max_read
         if process.returncode and not errors:
             errors.append(_error('mailsearch_nonzero_exit'))
         hits = data['hits']
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        record_error(exc)
         errors.append(_error('search_deadline_exceeded'))
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError) as exc:
+        record_error(exc)
         errors.append(_error('mailsearch_unavailable_or_invalid_response'))
     for account in requested:
         if account not in coverage['accounts']:
@@ -536,16 +543,20 @@ def _scan(*, order_id=None, since=None, days=30, timeout=75, limit=150, max_read
         if remaining <= 0:
             return [], _error('overall_deadline_exceeded', hit['account']), False
         try:
-            p = runner(['mailsearch', 'read', hit['account'], hit['folder'], str(hit['uid']), '--raw'],
-                       capture_output=True, text=True, timeout=min(12, remaining), env=_clean_env())
+            with measure('fetch'):
+                p = runner(['mailsearch', 'read', hit['account'], hit['folder'], str(hit['uid']), '--raw'],
+                           capture_output=True, text=True, timeout=min(12, remaining), env=_clean_env())
             if p.returncode:
                 return [], _error('message_read_failed', hit['account'], hit['folder'], hit['uid']), True
-            events = parse_message(p.stdout, account=hit['account'], folder=hit['folder'],
-                                   uid=hit['uid'], observed_at=iso())
+            with measure('parse'):
+                events = parse_message(p.stdout, account=hit['account'], folder=hit['folder'],
+                                       uid=hit['uid'], observed_at=iso())
             return events, None, True
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            record_error(exc)
             return [], _error('message_read_timeout', hit['account'], hit['folder'], hit['uid']), True
-        except (OSError, ValueError, TypeError, AttributeError, IndexError):
+        except (OSError, ValueError, TypeError, AttributeError, IndexError) as exc:
+            record_error(exc)
             return [], _error('message_read_or_parse_failed', hit['account'], hit['folder'], hit['uid']), True
 
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -566,10 +577,12 @@ def _scan(*, order_id=None, since=None, days=30, timeout=75, limit=150, max_read
             'coverage': coverage, 'errors': sorted(errors, key=lambda e: json.dumps(e, sort_keys=True))}
 
 
+@toollog.timed("amazon", "provider.orders")
 def orders(**options):
     return _scan(**options)
 
 
+@toollog.timed('amazon', 'provider.track')
 def track(order_id, **options):
     result = _scan(order_id=order_id, **options)
     order = result.pop('orders')[0]

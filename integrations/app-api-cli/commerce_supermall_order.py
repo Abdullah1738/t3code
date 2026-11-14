@@ -24,6 +24,7 @@ Lifecycle (mutations journalled at-most-once):
   {total} -> order-status poll until success+shipments (paid signal;
   paymentError is failure) -> exact tracking -> watcher.
 """
+import toollog
 import order_card
 import datetime as dt
 import json
@@ -257,6 +258,7 @@ class SupermallOrderFlow(MarketplacePayment):
                                                response_cookies=self._cookies, request=request)
 
     # -- auth / journal plumbing -------------------------------------------
+    @toollog.timed("commerce", "step.auth", lane="supermall")
     def _snapshot(self, deadline=None):
         state = self.auth.status('supermall')
         return (self.auth.reconcile('supermall') if state['maintenance_state'] != 'none'
@@ -288,6 +290,8 @@ class SupermallOrderFlow(MarketplacePayment):
         if financial and (self.review is None or kind == 'place' and time.time() - self.review['observed_at'] > 60):
             _fail('SUPERMALL_FRESH_REVIEW_REQUIRED')
         if not self.opened:
+            from commerce_pending import register, legacy_scopes
+            register(self.flow_id, 'supermall', self.account_hash, self.items, legacy=legacy_scopes('supermall', self.items, self.address_hash))
             journal.open_flow(flow_id=self.flow_id, app='noon', vertical='supermall',
                               account_hash=self.account_hash, scope_hash=self.scope_hash)
             self.opened = True
@@ -408,6 +412,7 @@ class SupermallOrderFlow(MarketplacePayment):
         return result
 
     # -- lifecycle ----------------------------------------------------------
+    @toollog.timed("commerce", "step.cart_build", lane="supermall")
     def add(self, *, timeout=25):
         """Quick-add every resolved rocket offer; verify the exact manifest.
 
@@ -457,6 +462,7 @@ class SupermallOrderFlow(MarketplacePayment):
                                                  timeout=timeout)
         return self.session_response
 
+    @toollog.timed("commerce", "step.checkout", lane="supermall")
     def review_session(self, *, timeout=25):
         """Verify the server-carried defaults + rocket manifest; freeze review.
 
@@ -617,6 +623,7 @@ class SupermallOrderFlow(MarketplacePayment):
                              'shipments': self.review['projection'].get('shipments'),
                              'eta': self.review.get('eta')}}
 
+    @toollog.timed("commerce", "step.payment_submit", lane="supermall")
     def place(self, *, timeout=25):
         """Single financial send: place-order {total} -> bare order number."""
         if self.review is None:
@@ -644,6 +651,7 @@ class SupermallOrderFlow(MarketplacePayment):
                 sleep(6)
         raise last_error
 
+    @toollog.timed("commerce", "step.confirmation", lane="supermall")
     def verify_tracking(self, *, attempts=10, sleep=time.sleep, timeout=25):
         tracking = self.exact_tracking(attempts=attempts, sleep=sleep, timeout=timeout)
         if tracking.get('order') != self.order:
@@ -755,6 +763,8 @@ class SupermallOrderFlow(MarketplacePayment):
         if cart['empty'] or manifest != expected:
             _fail('SUPERMALL_RESUME_MANIFEST_MISMATCH')
         self.last_cart = cart_read
+        from commerce_pending import register, legacy_scopes
+        register(self.flow_id, 'supermall', self.account_hash, self.items, legacy=legacy_scopes('supermall', self.items, self.address_hash))
         return self
 
     @classmethod

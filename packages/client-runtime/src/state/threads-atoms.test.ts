@@ -1,4 +1,10 @@
+import * as TestClock from "effect/testing/TestClock";
+import { threadCacheRedactions } from "./threadCacheRedactions.ts";
+import { makeEnvironmentShellState } from "./shell.ts";
+import * as ShellSnapshotLoader from "./shellSnapshotHttp.ts";
 import {
+  type OrchestrationV2ShellStreamItem,
+  ThreadId,
   EnvironmentId,
   EventId,
   MessageId,
@@ -35,7 +41,13 @@ import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import { createEnvironmentThreadDetailAtoms } from "./threadDetail.ts";
 import { THREAD_SNAPSHOT_IDLE_TTL_MS } from "./threadRetention.ts";
-import { v2Projection, v2ThreadId } from "./orchestrationV2TestFixtures.ts";
+import {
+  v2Projection,
+  v2ThreadId,
+  v2ThreadShell,
+  v2ShellSnapshot,
+  v2Now,
+} from "./orchestrationV2TestFixtures.ts";
 import * as ThreadHistoryController from "./threadHistoryController.ts";
 import { createEnvironmentThreadStateAtoms, type EnvironmentThreadState } from "./threads.ts";
 import * as ThreadSnapshotLoader from "./threadSnapshotHttp.ts";
@@ -56,6 +68,8 @@ const SNAPSHOT: OrchestrationV2ThreadDetailSnapshot = { snapshotSequence: 7, pro
 const makeHarness = Effect.fn("TestThreadAtoms.makeHarness")(function* (options?: {
   readonly snapshot?: OrchestrationV2ThreadDetailSnapshot;
   readonly snapshotUnavailable?: boolean;
+  readonly persist?: boolean;
+  readonly beforeSave?: Effect.Effect<void>;
 }) {
   const subscriptions = yield* Queue.unbounded<{
     readonly afterSequence: number | undefined;
@@ -68,11 +82,16 @@ const makeHarness = Effect.fn("TestThreadAtoms.makeHarness")(function* (options?
     readonly closed: Deferred.Deferred<void>;
   }>();
   const snapshot = options?.snapshot ?? SNAPSHOT;
+  let unavailable = options?.snapshotUnavailable ?? false;
+  const disks = new Map<ThreadId, OrchestrationV2ThreadDetailSnapshot>();
+  const shellEvents = yield* Queue.unbounded<OrchestrationV2ShellStreamItem>();
+  const diskSaves = yield* Queue.unbounded<OrchestrationV2ThreadDetailSnapshot>();
   let httpLoads = 0;
   let diskLoads = 0;
   let opened = 0;
   let active = 0;
   const client = {
+    [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: () => Stream.fromQueue(shellEvents),
     [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: (input: { readonly afterSequence?: number }) =>
       Stream.unwrap(
         Effect.gen(function* () {
@@ -96,6 +115,8 @@ const makeHarness = Effect.fn("TestThreadAtoms.makeHarness")(function* (options?
   const session: RpcSession = {
     client,
     initialConfig: Effect.succeed({
+      environment: { serverVersion: "fixture" },
+      shellResumeCompletionMarker: true,
       threadResumeCompletionMarker: true,
       threadSnapshotPagination: true,
     } as never),
@@ -160,39 +181,47 @@ const makeHarness = Effect.fn("TestThreadAtoms.makeHarness")(function* (options?
       return HttpClientResponse.fromWeb(request, Response.json(page));
     }).pipe(Effect.scoped),
   );
+  const cache = Persistence.EnvironmentCacheStore.of({
+    loadShell: () => Effect.succeedNone,
+    saveShell: () => Effect.void,
+    loadThread: (_environmentId, threadId) =>
+      Effect.sync(() => {
+        diskLoads += 1;
+        return Option.fromNullishOr(disks.get(threadId));
+      }),
+    saveThread: (_environmentId, snapshot) =>
+      Effect.gen(function* () {
+        if (options?.persist) {
+          if (options.beforeSave) yield* options.beforeSave;
+          disks.set(snapshot.projection.thread.id, snapshot);
+          yield* Queue.offer(diskSaves, snapshot);
+        }
+      }),
+    removeThread: (_environmentId, threadId) =>
+      Effect.sync(() => {
+        disks.delete(threadId);
+      }),
+    loadServerConfig: () => Effect.succeedNone,
+    saveServerConfig: () => Effect.void,
+    loadVcsRefs: () => Effect.succeedNone,
+    saveVcsRefs: () => Effect.void,
+    removeVcsRefs: () => Effect.void,
+    clearVcsRefs: () => Effect.void,
+    clear: () => Effect.void,
+  });
   const runtime = Atom.runtime(
     Layer.mergeAll(
       Layer.succeed(ThreadHistoryController.ThreadHistoryController, historyController),
       Layer.succeed(HttpClient.HttpClient, historyHttpClient),
       Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
-      Layer.succeed(
-        Persistence.EnvironmentCacheStore,
-        Persistence.EnvironmentCacheStore.of({
-          loadShell: () => Effect.succeedNone,
-          saveShell: () => Effect.void,
-          loadThread: () =>
-            Effect.sync(() => {
-              diskLoads += 1;
-              return Option.none();
-            }),
-          saveThread: () => Effect.void,
-          removeThread: () => Effect.void,
-          loadServerConfig: () => Effect.succeedNone,
-          saveServerConfig: () => Effect.void,
-          loadVcsRefs: () => Effect.succeedNone,
-          saveVcsRefs: () => Effect.void,
-          removeVcsRefs: () => Effect.void,
-          clearVcsRefs: () => Effect.void,
-          clear: () => Effect.void,
-        }),
-      ),
+      Layer.succeed(Persistence.EnvironmentCacheStore, cache),
       Layer.succeed(
         ThreadSnapshotLoader.ThreadSnapshotLoader,
         ThreadSnapshotLoader.ThreadSnapshotLoader.of({
           load: () =>
             Effect.sync(() => {
               httpLoads += 1;
-              if (options?.snapshotUnavailable === true) {
+              if (unavailable) {
                 return { _tag: "unavailable" as const };
               }
               return {
@@ -232,6 +261,17 @@ const makeHarness = Effect.fn("TestThreadAtoms.makeHarness")(function* (options?
     ref,
     subscriptions,
     olderLoads,
+    cache,
+    supervisor,
+    shellEvents,
+    diskSaves,
+    disk: (id: ThreadId = THREAD_ID) => Option.fromNullishOr(disks.get(id)),
+    seedDisk: (snapshot: OrchestrationV2ThreadDetailSnapshot) => {
+      disks.set(snapshot.projection.thread.id, snapshot);
+    },
+    setUnavailable: (next: boolean) => {
+      unavailable = next;
+    },
     loadEarlier: () => historyController.loadEarlier(TARGET.environmentId, THREAD_ID),
     counts: () => ({ httpLoads, diskLoads, opened, active }),
   };
@@ -631,5 +671,256 @@ it.effect("keeps snapshot boundaries and completion markers ordered inside a rep
     expect(next.afterSequence).toBe(21);
     remount();
     yield* Deferred.await(next.closed);
+  }),
+);
+
+it.effect.each(["active", "archive"] as const)(
+  "shell redaction purges a closed %s detail while the environment stays connected",
+  (location) =>
+    Effect.gen(function* () {
+      const fake = "eyJFAKE.CLOSED-DETAIL-CACHE";
+      const item = {
+        id: TurnItemId.make("closed-tool"),
+        type: "command_execution" as const,
+        threadId: THREAD_ID,
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        status: "completed" as const,
+        title: null,
+        startedAt: v2Now,
+        completedAt: v2Now,
+        updatedAt: v2Now,
+        input: "fixture",
+        output: fake,
+        exitCode: 0,
+      };
+      const dirty: OrchestrationV2ThreadProjection = {
+        ...THREAD,
+        turnItems: [item],
+        visibleTurnItems: [
+          {
+            position: 0,
+            visibility: "local",
+            sourceThreadId: THREAD_ID,
+            sourceItemId: item.id,
+            item,
+          },
+        ],
+      };
+      const h = yield* makeHarness({
+        snapshot: { snapshotSequence: 7, projection: dirty },
+        persist: true,
+      });
+      const otherId = ThreadId.make("other-cached-thread");
+      const otherSnapshot = {
+        ...SNAPSHOT,
+        projection: {
+          ...THREAD,
+          thread: { ...THREAD.thread, id: otherId, title: "Other cached thread" },
+        },
+      };
+      h.seedDisk(otherSnapshot);
+      const unmount = h.registry.mount(h.stateAtom);
+      const first = yield* Queue.take(h.subscriptions);
+      yield* Queue.offer(first.events, { kind: "synchronized" });
+      yield* observeState(h.registry, h.stateAtom, (state) => state.status === "live");
+      unmount();
+      yield* Deferred.await(first.closed);
+      expect(h.counts().active).toBe(0);
+      yield* Queue.take(h.diskSaves);
+      expect(JSON.stringify(Option.getOrThrow(h.disk()))).toContain(fake);
+      const shell = yield* makeEnvironmentShellState().pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, h.supervisor),
+        Effect.provideService(Persistence.EnvironmentCacheStore, h.cache),
+        Effect.provideService(ShellSnapshotLoader.ShellSnapshotLoader, {
+          load: () => Effect.succeed(Option.some(v2ShellSnapshot)),
+        }),
+      );
+      const frame: OrchestrationV2ShellStreamItem =
+        location === "active"
+          ? {
+              kind: "thread.updated",
+              sequence: 10,
+              redactionSequence: 9,
+              location,
+              thread: v2ThreadShell,
+            }
+          : {
+              kind: "thread.removed",
+              sequence: 10,
+              redactionSequence: 9,
+              location: "active",
+              threadId: THREAD_ID,
+            };
+      yield* Queue.offer(h.shellEvents, frame);
+      yield* SubscriptionRef.changes(shell).pipe(
+        Stream.filter(
+          (state) => Option.isSome(state.snapshot) && state.snapshot.value.snapshotSequence === 10,
+        ),
+        Stream.runHead,
+      );
+      expect(Option.isNone(h.disk())).toBe(true);
+      expect(Option.getOrThrow(h.disk(otherId))).toEqual(otherSnapshot);
+      expect(h.counts().active).toBe(0);
+      h.setUnavailable(true);
+      const seen: string[] = [];
+      const observer = yield* AtomRegistry.toStream(h.registry, h.stateAtom).pipe(
+        Stream.runForEach((state) =>
+          Effect.sync(() => {
+            seen.push(JSON.stringify(state));
+          }),
+        ),
+        Effect.forkScoped,
+      );
+      const reopened = yield* Queue.take(h.subscriptions);
+      expect(reopened.afterSequence).toBeUndefined();
+      expect(JSON.stringify(h.registry.get(h.stateAtom))).not.toContain(fake);
+      const clean = {
+        ...dirty,
+        turnItems: [{ ...item, output: "[redacted fixture]" }],
+        visibleTurnItems: dirty.visibleTurnItems.map((row) => ({
+          ...row,
+          item: { ...item, output: "[redacted fixture]" },
+        })),
+      };
+      yield* Queue.offer(reopened.events, {
+        kind: "snapshot",
+        snapshotSequence: 10,
+        projection: clean,
+      });
+      yield* Queue.offer(reopened.events, { kind: "synchronized" });
+      yield* observeState(
+        h.registry,
+        h.stateAtom,
+        (state) => state.status === "live" && Option.isSome(state.data),
+      );
+      expect(seen.join("\n")).not.toContain(fake);
+      yield* Fiber.interrupt(observer);
+    }),
+);
+
+it.effect("environment redaction drains an old detail save before purging it", () =>
+  Effect.gen(function* () {
+    const started = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const marked = yield* Deferred.make<void>();
+    const h = yield* makeHarness({
+      persist: true,
+      beforeSave: Deferred.succeed(started, undefined).pipe(
+        Effect.andThen(Deferred.await(release)),
+      ),
+    });
+    const unmount = h.registry.mount(h.stateAtom);
+    const first = yield* Queue.take(h.subscriptions);
+    yield* Queue.offer(first.events, { kind: "synchronized" });
+    yield* observeState(h.registry, h.stateAtom, (state) => state.status === "live");
+    unmount();
+    yield* Deferred.await(started);
+    yield* threadCacheRedactions(h.cache, TARGET.environmentId, THREAD_ID).listen(() =>
+      Deferred.succeed(marked, undefined).pipe(Effect.asVoid),
+    );
+    const shell = yield* makeEnvironmentShellState().pipe(
+      Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, h.supervisor),
+      Effect.provideService(Persistence.EnvironmentCacheStore, h.cache),
+      Effect.provideService(ShellSnapshotLoader.ShellSnapshotLoader, {
+        load: () => Effect.succeed(Option.some(v2ShellSnapshot)),
+      }),
+    );
+    yield* Queue.offer(h.shellEvents, {
+      kind: "thread.updated",
+      sequence: 10,
+      redactionSequence: 9,
+      location: "active",
+      thread: v2ThreadShell,
+    });
+    yield* Deferred.await(marked);
+    yield* Deferred.succeed(release, undefined);
+    yield* Deferred.await(first.closed);
+    yield* SubscriptionRef.changes(shell).pipe(
+      Stream.filter(
+        (state) => Option.isSome(state.snapshot) && state.snapshot.value.snapshotSequence === 10,
+      ),
+      Stream.runHead,
+    );
+    expect(Option.isNone(h.disk())).toBe(true);
+    h.setUnavailable(true);
+    const remount = h.registry.mount(h.stateAtom);
+    const next = yield* Queue.take(h.subscriptions);
+    expect(next.afterSequence).toBeUndefined();
+    expect(Option.isNone(h.registry.get(h.stateAtom).data)).toBe(true);
+    remount();
+  }),
+);
+
+it.effect("retries failed environment cache removal and then consumes later shell frames", () =>
+  Effect.gen(function* () {
+    const h = yield* makeHarness();
+    h.seedDisk(SNAPSHOT);
+    let attempts = 0;
+    const failed = yield* Deferred.make<void>();
+    const cache = {
+      ...h.cache,
+      removeThread: (environmentId: EnvironmentId, threadId: ThreadId) =>
+        Effect.suspend(() => {
+          attempts++;
+          if (attempts === 1)
+            return Deferred.succeed(failed, undefined).pipe(
+              Effect.andThen(
+                Effect.fail(
+                  new Persistence.ConnectionPersistenceError({
+                    operation: "remove-thread",
+                    message: "fixture removal failure",
+                  }),
+                ),
+              ),
+            );
+          return h.cache.removeThread(environmentId, threadId);
+        }),
+    };
+    const shell = yield* makeEnvironmentShellState().pipe(
+      Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, h.supervisor),
+      Effect.provideService(Persistence.EnvironmentCacheStore, cache),
+      Effect.provideService(ShellSnapshotLoader.ShellSnapshotLoader, {
+        load: () => Effect.succeed(Option.some(v2ShellSnapshot)),
+      }),
+    );
+    yield* Queue.offer(h.shellEvents, {
+      kind: "thread.updated",
+      sequence: 10,
+      redactionSequence: 9,
+      location: "active",
+      thread: v2ThreadShell,
+    });
+    yield* Deferred.await(failed);
+    expect(attempts).toBe(1);
+    expect(Option.isSome(h.disk())).toBe(true);
+    expect(
+      Option.getOrThrow((yield* SubscriptionRef.get(shell)).snapshot).snapshotSequence,
+    ).toBeLessThan(10);
+    yield* Queue.offer(h.shellEvents, {
+      kind: "thread.updated",
+      sequence: 11,
+      location: "active",
+      thread: { ...v2ThreadShell, title: "After redaction" },
+    });
+    yield* TestClock.adjust("1 second");
+    yield* SubscriptionRef.changes(shell).pipe(
+      Stream.filter(
+        (state) => Option.isSome(state.snapshot) && state.snapshot.value.snapshotSequence === 11,
+      ),
+      Stream.runHead,
+    );
+    expect(attempts).toBe(2);
+    expect(Option.isNone(h.disk())).toBe(true);
+    expect(
+      Option.getOrThrow((yield* SubscriptionRef.get(shell)).snapshot).threads.find(
+        (thread) => thread.id === THREAD_ID,
+      )?.title,
+    ).toBe("After redaction");
   }),
 );

@@ -1,0 +1,202 @@
+{
+  "files": {
+    "1": "open('/Users/guard-review/.robob/userdata/statev2.sqlite').read()\n",
+    "tmp/safe.py": "print(1)\n",
+    "tmp/read.py": "open('/Users/guard-review/.robob/userdata/statev2.sqlite').read()\n",
+    "tmp/safe.sh": "echo hi\n",
+    "tmp/read.sh": "cat /Users/guard-review/.robob/userdata/statev2.sqlite\n",
+    "$S": "open('/Users/guard-review/.robob/userdata/statev2.sqlite').read()\n",
+    "tmp/a.py": "open('/Users/guard-review/.robob/userdata/statev2.sqlite').read()\n",
+    "tmp/other.py": "print(1)\n",
+    "safetmp/read.py": "print(1)\n",
+    "tmp/safe.pyx": "open('/Users/guard-review/.robob/userdata/statev2.sqlite').read()\n"
+  },
+  "cases": [
+    [
+      "stdin-python",
+      "python3 - \"$X\" < tmp/read.py"
+    ],
+    [
+      "stdin-python-isolated",
+      "python3 -I - \"$X\" < tmp/read.py"
+    ],
+    [
+      "stdin-shell",
+      "bash -s \"$X\" < tmp/read.sh"
+    ],
+    [
+      "child-shell-binding",
+      "S=tmp/read.py; bash -c 'S=tmp/safe.py'; python3 \"$S\""
+    ],
+    [
+      "child-shell-stdin-binding",
+      "S=tmp/read.py; bash <<'EOF'\nS=tmp/safe.py\nEOF\npython3 \"$S\""
+    ],
+    [
+      "loop-read-binding",
+      "S=tmp/safe.py; for i in a b; do python3 \"$S\"; read S; done"
+    ],
+    [
+      "loop-printf-binding",
+      "S=tmp/safe.py; for i in a b; do python3 \"$S\"; printf -v S tmp/read.py; done"
+    ],
+    [
+      "loop-inner-for-binding",
+      "S=tmp/safe.py; for i in a b; do python3 \"$S\"; for S in tmp/read.py; do :; done; done"
+    ],
+    [
+      "single-quoted-binding",
+      "S=tmp/safe.py; T='$S'; python3 \"$T\""
+    ],
+    [
+      "literal-tee-overwrite",
+      "D=tmp; cat > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\ntee \"$D/a.py\" < tmp/read.py; python3 \"$D/a.py\""
+    ],
+    [
+      "literal-sed-overwrite",
+      "D=tmp; cat > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\nsed -i.bak 'r tmp/read.py' \"$D/a.py\"; python3 \"$D/a.py\""
+    ],
+    [
+      "opaque-cat-alias-overwrite",
+      "D=$(mktemp -d); cat > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\ncat tmp/read.py > \"${D}/a.py\"; python3 \"$D/a.py\""
+    ],
+    [
+      "opaque-tee-alias-overwrite",
+      "D=$(mktemp -d); cat > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\ntee \"${D}/a.py\" < tmp/read.py; python3 \"$D/a.py\""
+    ],
+    [
+      "cat-file-operand-writer",
+      "D=tmp; cat tmp/read.py > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\npython3 \"$D/a.py\""
+    ],
+    [
+      "single-quoted-script-operand",
+      "S=tmp/safe.py; python3 '$S'"
+    ],
+    [
+      "unquoted-word-splitting",
+      "S='tmp/read.py tmp/safe.py'; python3 $S"
+    ],
+    [
+      "conditional-opaque-heredoc",
+      "D=$(printf tmp); false && cat > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\npython3 \"$D/a.py\""
+    ],
+    [
+      "unquoted-heredoc-source-expansion",
+      "D=$(mktemp -d); cat > \"$D/a.py\" <<EOF\n$(cat tmp/read.py)\nEOF\npython3 \"$D/a.py\""
+    ],
+    [
+      "arithmetic-binding-mutation",
+      "S=tmp/safe.py; : \"$((S=1))\"; python3 \"$S\""
+    ],
+    [
+      "unexecuted-function-binding",
+      "S=tmp/read.py; f() { :; S=tmp/safe.py; }; python3 \"$S\""
+    ],
+    [
+      "loop-file-overwrite",
+      "D=tmp; cat > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\nfor i in a b; do python3 \"$D/a.py\"; cp tmp/read.py \"$D/a.py\"; done"
+    ],
+    [
+      "candidate-write-proves-unwritten-file",
+      "S=tmp/read.py; if true; then S=tmp/other.py; fi; cat > \"$S\" <<'EOF'\nprint(1)\nEOF\npython3 tmp/read.py"
+    ],
+    [
+      "heredoc-overridden-stdin-literal",
+      "D=tmp; cat > \"$D/a.py\" <<'EOF' < tmp/read.py\nprint(1)\nEOF\npython3 \"$D/a.py\""
+    ],
+    [
+      "heredoc-overridden-stdin-opaque",
+      "D=$(printf tmp); cat > \"$D/a.py\" <<'EOF' < tmp/read.py\nprint(1)\nEOF\npython3 \"$D/a.py\""
+    ],
+    [
+      "failing-mkdir-chain",
+      "D=$(printf tmp); mkdir tmp/safe.py && cat > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\npython3 \"$D/a.py\""
+    ],
+    [
+      "failing-assignment-chain",
+      "D=$(printf tmp; false) && cat > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\npython3 \"$D/a.py\""
+    ],
+    [
+      "function-after-and",
+      "S=tmp/read.py; true && f() { :; S=tmp/safe.py; }; python3 \"$S\""
+    ],
+    [
+      "arithmetic-command-assignment",
+      "S=tmp/safe.py; (( S = 1 )); python3 \"$S\""
+    ],
+    [
+      "literal-inline-writer",
+      "D=tmp; cat > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\npython3 -c \"from pathlib import Path; Path('tmp/a.py').write_text(Path('tmp/read.py').read_text())\"; python3 \"$D/a.py\""
+    ],
+    [
+      "literal-dd-writer",
+      "D=tmp; cat > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\ndd if=tmp/read.py of=tmp/a.py; python3 \"$D/a.py\""
+    ],
+    [
+      "loop-install-writer",
+      "D=tmp; cat > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\nfor i in a b; do python3 \"$D/a.py\"; install tmp/read.py \"$D/a.py\"; done"
+    ],
+    [
+      "loop-wrapped-cp-writer",
+      "D=tmp; cat > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\nfor i in a b; do python3 \"$D/a.py\"; command cp tmp/read.py \"$D/a.py\"; done"
+    ],
+    [
+      "unexported-child-command",
+      "unset D; D=safe; bash -c 'python3 \"${D}tmp/read.py\"'"
+    ],
+    [
+      "unexported-child-stdin",
+      "unset D; D=safe; bash -s \"$X\" <<'EOF'\npython3 \"${D}tmp/read.py\"\nEOF"
+    ],
+    [
+      "expanded-executable-python-heredoc",
+      "python3 - \"$X\" <<EOF\n$(cat tmp/read.py)\nEOF"
+    ],
+    [
+      "expanded-executable-shell-heredoc",
+      "bash -s \"$X\" <<EOF\n$(cat tmp/read.sh)\nEOF"
+    ],
+    [
+      "late-loop-append-binding",
+      "S=tmp/safe.py; for i in a b; do python3 \"$S\"; S+=x; done"
+    ],
+    [
+      "late-loop-array-binding",
+      "S=tmp/safe.py; for i in a b; do python3 \"$S\"; S[0]=tmp/read.py; done"
+    ],
+    [
+      "tee-invalid-option",
+      "D=tmp; tee -z \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\npython3 \"$D/a.py\""
+    ],
+    [
+      "tee-help-option",
+      "D=tmp; tee --help \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\npython3 \"$D/a.py\""
+    ],
+    [
+      "literal-output-opaque-alias",
+      "D=tmp; cat > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\nOUT=$(printf tmp/a.py); cat tmp/read.py > \"$OUT\"; python3 \"$D/a.py\""
+    ],
+    [
+      "literal-output-unknown-alias",
+      "D=tmp; cat > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\ncat tmp/read.py > \"$OUT\"; python3 \"$D/a.py\""
+    ],
+    [
+      "literal-noclobber",
+      "D=tmp; set -C; cat > \"$D/a.py\" <<'EOF'\nprint(1)\nEOF\npython3 \"$D/a.py\""
+    ],
+    [
+      "negative-literal-loop",
+      "for S in tmp/safe.py tmp/read.py; do python3 \"$S\"; done"
+    ]
+  ],
+  "allow_cases": [
+    [
+      "positive-literal-writer",
+      "D=tmp; cat > \"$D/other.py\" <<'EOF'\nprint(1)\nEOF\npython3 \"$D/other.py\""
+    ],
+    [
+      "positive-literal-loop",
+      "for S in tmp/safe.py tmp/other.py; do python3 \"$S\"; done"
+    ]
+  ]
+}

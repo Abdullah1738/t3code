@@ -1,9 +1,11 @@
+import { redact } from "./redact.ts";
 import { constants } from "node:fs";
 import { lstat, open, stat } from "node:fs/promises";
 import { request } from "node:http";
 import { homedir } from "node:os";
 import { basename, extname, isAbsolute, join, resolve, win32 } from "node:path";
 import { parseArgs } from "node:util";
+import { toolError, toolLog } from "./toollog.ts";
 
 type Command = { method: "GET" | "POST"; path: string; body?: Record<string, string> };
 
@@ -27,7 +29,7 @@ export function sanitizeSource(value: string): string {
 export function parseCommand(args: string[]): Command {
   const optionsByCommand: Record<string, string[]> = {
     health: [],
-    notify: ["source", "severity", "text", "key"],
+    notify: ["source", "severity", "text", "key", "ask-key", "burst-key"],
     "send-file": ["file", "key", "text", "mime"],
     remind: ["at", "text", "key", "timezone"],
     reminders: [],
@@ -49,7 +51,8 @@ export function parseCommand(args: string[]): Command {
       allowPositionals: true,
       tokens: true,
     });
-  } catch {
+  } catch (error) {
+    toolError("telegram", "tg.cli.arguments", undefined, error);
     // parseArgs errors can quote arbitrary argument values.
     throw new CliError("Invalid command arguments");
   }
@@ -96,7 +99,9 @@ export function parseCommand(args: string[]): Command {
       }
       return {
         method: "POST", path: "/notify",
-        body: { source: sanitizeSource(required(values.source, "--source")), severity, text: required(values.text, "--text"), dedupeKey: required(values.key, "--key") },
+        body: { source: sanitizeSource(required(values.source, "--source")), severity, text: redact(required(values.text, "--text")), dedupeKey: required(values.key, "--key"),
+          ...(values["ask-key"] === undefined ? {} : { askKey: required(values["ask-key"], "--ask-key") }),
+          ...(values["burst-key"] === undefined ? {} : { burstKey: required(values["burst-key"], "--burst-key") }) },
       };
     }
     case "send-file": {
@@ -122,7 +127,8 @@ export function parseCommand(args: string[]): Command {
         try {
           if (/^[+-]/.test(timezone)) throw new Error();
           new Intl.DateTimeFormat("en-US", { timeZone: timezone });
-        } catch {
+        } catch (error) {
+          toolError("telegram", "tg.cli.timezone", undefined, error);
           throw new CliError("--timezone must be a valid IANA timezone");
         }
         body.timezone = timezone;
@@ -168,7 +174,8 @@ export async function loadCommandPayload(command: Command): Promise<Record<strin
     // Check identities too: a hard link, case alias, or parent symlink must not bypass the fixed exclusions.
     for (const path of protectedPaths) {
       const secret = await stat(path, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
-        if (error.code !== "ENOENT") throw error;
+        if (error.code === "ENOENT") toolLog({ component: "telegram", kind: "event", name: "tg.cli.protectedFileAbsent", ok: true });
+        else { toolError("telegram", "tg.cli.protectedFileStat", undefined, error); throw error; }
       });
       if (secret && secret.dev === before.dev && secret.ino === before.ino) throw new CliError("Bridge credentials and state cannot be attached");
     }
@@ -190,9 +197,10 @@ export async function loadCommandPayload(command: Command): Promise<Record<strin
       mimeType: mimeType ?? mimeTypes[extname(name).toLowerCase()] ?? "application/octet-stream",
       text, dedupeKey };
   } catch (error) {
+    toolError("telegram", "tg.cli.attachmentRead", undefined, error);
     throw error instanceof CliError ? error : new CliError("Attachment could not be read safely");
   } finally {
-    await handle?.close().catch(() => {});
+    await handle?.close().catch(error => { toolError("telegram", "tg.cli.attachmentClose", undefined, error); });
   }
 }
 
@@ -202,7 +210,8 @@ async function sendCommand(command: Command): Promise<unknown> {
   try {
     if (!isAbsolute(socketPath) || socketPath.includes("\0")) throw new Error();
     socket = await lstat(socketPath);
-  } catch {
+  } catch (error) {
+    toolError("telegram", "tg.cli.socketStat", undefined, error);
     throw new CliError("Bridge socket is unavailable");
   }
   // The daemon owns the private parent directory; never follow a socket symlink.
@@ -243,7 +252,8 @@ async function sendCommand(command: Command): Promise<unknown> {
           let data: unknown;
           try {
             data = JSON.parse(Buffer.concat(chunks, size).toString("utf8"));
-          } catch {
+          } catch (error) {
+            toolError("telegram", "tg.cli.responseJson", undefined, error);
             reject(new CliError(ok ? "Bridge returned invalid JSON" : `Bridge request failed (HTTP ${status})`));
             return;
           }
@@ -279,6 +289,7 @@ if (import.meta.main) {
   try {
     console.log(JSON.stringify(await sendCommand(parseCommand(process.argv.slice(2)))));
   } catch (error) {
+    toolError("telegram", "tg.cli.commandFailed", undefined, error);
     console.error(JSON.stringify({ error: error instanceof CliError ? error.message : "Bridge request failed" }));
     process.exitCode = 1;
   }

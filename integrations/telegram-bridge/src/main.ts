@@ -5,11 +5,13 @@ import { createApi } from "./api.ts";
 import { Attention } from "./attention.ts";
 import { backendConnection, backendKind, loadConfig, spectrumBridgeSocket, stateRoot } from "./config.ts";
 import { Delivery } from "./delivery.ts";
+import { ControlClient } from "./control.ts";
 import { acquireLock } from "./lock.ts";
 import { OpenChamber, type AlertBackend } from "./openchamber.ts";
 import { RobobAlertBackend } from "./robob.ts";
 import { Store } from "./store.ts";
 import { Telegram } from "./telegram.ts";
+import { toolError, toolLog } from "./toollog.ts";
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -24,7 +26,8 @@ function errorCode(error: unknown): string {
 
 async function removeStaleSocket(path: string): Promise<void> {
   const info = await lstat(path).catch((error: NodeJS.ErrnoException) => {
-    if (error.code !== "ENOENT") throw error;
+    if (error.code === "ENOENT") toolLog({ component: "telegram", kind: "event", name: "tg.main.socketAbsent", ok: true });
+    else { toolError("telegram", "tg.main.socketStat", undefined, error); throw error; }
   });
   if (!info) return;
   if (!info.isSocket() || info.uid !== process.getuid?.()) throw new Error("Unsafe socket path");
@@ -116,6 +119,7 @@ async function main(): Promise<void> {
     chatId: () => chatId,
     enabled: () => ready() && !stopping,
     beforeSend: item => attention.beforeSend(item),
+    askNotified: (key, at) => new ControlClient().askNotified(key, at),
     log,
   });
   delivery.recover();
@@ -138,7 +142,7 @@ async function main(): Promise<void> {
   }
   async function ping(): Promise<void> {
     while (!stopping) {
-      const ok = await telegram.ping().catch(() => false);
+      const ok = await telegram.ping().catch(error => { toolError("telegram", "tg.main.ping", undefined, error); return false; });
       if (ok) health.telegramLastOk = Date.now();
       else if (!stopping) log("telegram-unavailable");
       await sleep(30_000);
@@ -153,7 +157,7 @@ async function main(): Promise<void> {
           health.backendLastOk = Date.now();
           attention.processEvent(event);
         }
-      } catch { if (!stopping) log("backend-events-unavailable"); }
+      } catch (error) { toolError("telegram", "tg.main.backendEvents", undefined, error); if (!stopping) log("backend-events-unavailable"); }
       if (!stopping) await sleep(5_000);
     }
   }
@@ -161,7 +165,7 @@ async function main(): Promise<void> {
     if (!(backend instanceof RobobAlertBackend)) return;
     // The control stream's keepalives are SSE comments, so a quiet stream proves nothing; check health directly.
     const healthTimer = setInterval(() => {
-      void backend.health().then(() => { health.backendLastOk = Date.now(); }, () => {});
+      void backend.health().then(() => { health.backendLastOk = Date.now(); }, error => { toolError("telegram", "tg.main.backendHealth", undefined, error); });
     }, 30_000);
     shutdown.signal.addEventListener("abort", () => clearInterval(healthTimer), { once: true });
     while (!stopping) {
@@ -171,16 +175,16 @@ async function main(): Promise<void> {
           health.backendLastOk = Date.now();
           attention.processNotification(event);
         }
-      } catch { if (!stopping) log("backend-events-unavailable"); }
+      } catch (error) { toolError("telegram", "tg.main.controlEvents", undefined, error); if (!stopping) log("backend-events-unavailable"); }
       if (!stopping) await sleep(5_000);
     }
   }
   const timer = setInterval(() => {
     if (ready()) store.enqueueDueReminders(Date.now());
-    void delivery.tick().catch(() => log("sender-failed"));
+    void delivery.tick().catch(error => { toolError("telegram", "tg.main.senderTick", undefined, error); log("sender-failed"); });
   }, 1_000);
   const attentionTimer = setInterval(() => {
-    if (ready()) void attention.tick().catch(() => log("attention-unavailable"));
+    if (ready()) void attention.tick().catch(error => { toolError("telegram", "tg.main.attentionTick", undefined, error); log("attention-unavailable"); });
   }, 5_000);
   const stop = async () => {
     if (stopping) return;
@@ -203,4 +207,4 @@ async function main(): Promise<void> {
   await Promise.all([updates(), ping(), events("/api/event"), events("/api/openchamber/events"), controlEvents()]);
 }
 
-if (import.meta.main) main().catch(error => { log("bridge-start-failed", errorCode(error)); process.exit(1); });
+if (import.meta.main) main().catch(error => { toolError("telegram", "tg.main.startFailed", undefined, error); log("bridge-start-failed", errorCode(error)); process.exit(1); });

@@ -3,6 +3,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  NodeId,
   type OrchestrationV2ServerCommand as OrchestrationCommand,
   PullRequestOperationError,
   type OrchestrationProjectShell,
@@ -10,21 +11,30 @@ import {
   type PullRequestReviewGuideResult,
   type ThreadPullRequestLink,
 } from "@t3tools/contracts";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as SqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { describe, expect, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/sql/SqlClient";
 import type { Tool } from "effect/ai";
 
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
+import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
 import {
   type PullRequestTestThread,
   v2PullRequestThread,
 } from "../../../orchestration-v2/testkit/pullRequestFixtures.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
+import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
@@ -135,6 +145,7 @@ function makeLink(
 }
 
 interface HarnessOptions {
+  readonly callerLayer?: Layer.Layer<ThreadManagement.ThreadManagementService>;
   readonly thread?: PullRequestTestThread | null;
   readonly project?: OrchestrationProjectShell | null;
   readonly reject?: (command: OrchestrationCommand) => string | null;
@@ -169,6 +180,9 @@ const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
       return { sequence: 1, storedEvents: [] };
     });
   const layerDependencies = Layer.mergeAll(
+    Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
+      resolve: () => Effect.succeed(null),
+    }),
     Layer.mock(ProjectService.ProjectService)({
       getShell: () => Effect.succeed(Option.fromNullishOr(project)),
       listShells: () => Effect.succeed(options.projects ?? (project ? [project] : [])),
@@ -197,7 +211,7 @@ const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
       dispatch,
     }),
     Layer.succeed(Crypto.Crypto, testCrypto),
-    McpToolAccessTestkit.liveThreadsLayer,
+    options.callerLayer ?? McpToolAccessTestkit.liveThreadsLayer,
   );
   const toolkit = yield* PullRequestsToolkit.pipe(
     Effect.provide(
@@ -224,6 +238,75 @@ const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
 });
 
 describe("pull request toolkit handlers", () => {
+  it.effect("links a delegated caller's PR while the background reader is pinned", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "delegated-pr-caller-" });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`PRAGMA journal_mode = WAL`;
+        yield* sql`CREATE TABLE entries(value INTEGER)`;
+        yield* sql`INSERT INTO entries VALUES (1)`;
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const holder = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`SELECT * FROM entries`;
+              yield* Deferred.succeed(held, undefined);
+              yield* Deferred.await(release);
+            }),
+          )
+          .pipe(SqliteClient.readOnly, SqliteClient.backgroundReads, Effect.forkChild);
+        yield* Deferred.await(held);
+        let callerReads = 0;
+        const harness = yield* makeHarness({
+          callerLayer: Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: (id) =>
+              Effect.gen(function* () {
+                expect(yield* SqliteClient.ReaderLane).toBe("foreground");
+                yield* sql
+                  .withTransaction(sql`SELECT * FROM entries`)
+                  .pipe(SqliteClient.readOnly, Effect.orDie);
+                callerReads++;
+                return {
+                  ...McpToolAccessTestkit.liveThreadShell(id),
+                  forkedFrom: { type: "node" as const, nodeId: NodeId.make("delegated-task") },
+                };
+              }),
+            getThreadShell: () => Effect.die("live delegated caller must not load its full shell"),
+          }),
+        });
+        yield* Effect.gen(function* () {
+          const result = yield* harness.call("link_pull_request", {
+            url: "https://github.com/t3tools/t3code/pull/123",
+          });
+          expect(result.alreadyLinked).toBe(false);
+          expect(yield* Ref.get(harness.commands)).toMatchObject([
+            {
+              type: "thread.pull-request.link",
+              threadId: THREAD_ID,
+              number: 123,
+            },
+          ]);
+          expect(callerReads).toBe(1);
+          expect(yield* Deferred.isDone(release)).toBe(false);
+        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+        yield* Fiber.join(holder);
+      }).pipe(
+        Effect.provide(
+          SqliteClient.layer({
+            filename: path.join(directory, "state.sqlite"),
+            readerWorker: true,
+            foregroundReaderSlots: 1,
+            backgroundReaderSlots: 1,
+          }),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("refuses a credential without the pull-requests capability", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();

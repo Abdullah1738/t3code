@@ -1,0 +1,71 @@
+{
+  "default": "2342",
+  "forbidden": [
+    "5542"
+  ],
+  "other_owners": {
+    "2792": "Moni"
+  },
+  "merchants": {
+    "noon": {
+      "expected": "9546",
+      "fallback": "2342",
+      "aliases": [
+        "noon food",
+        "noon minutes",
+        "minutes",
+        "noon nownow",
+        "nownow",
+        "noon main",
+        "noon supermall",
+        "supermall",
+        "food",
+        "main",
+        "noon.com",
+        "noon grocery"
+      ]
+    },
+    "uber": {
+      "expected": "2342",
+      "aliases": [
+        "uber app",
+        "uber lux"
+      ]
+    },
+    "amazon": {
+      "expected": "2342",
+      "aliases": [
+        "amazon app",
+        "amazon.ae"
+      ]
+    },
+    "boat.dev": {
+      "expected": "7572",
+      "aliases": [
+        "boat"
+      ]
+    },
+    "openai": {
+      "expected": "7572",
+      "aliases": [
+        "openai (chatgpt)",
+        "chatgpt",
+        "openai billing"
+      ]
+    },
+    "bupa": {
+      "expected": "2342",
+      "aliases": [
+        "bupa (membersworld)",
+        "bupa membersworld",
+        "membersworld"
+      ]
+    },
+    "stripe link": {
+      "expected": "2342",
+      "aliases": [
+        "stripe link (dia personal)"
+      ]
+    }
+  }
+}

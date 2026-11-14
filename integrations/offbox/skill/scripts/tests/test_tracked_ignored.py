@@ -45,8 +45,15 @@ class TrackedIgnoredTests(unittest.TestCase):
         self.rsyncs = []
         self.real_run = subprocess.run
         stack.enter_context(patch.object(ssh_sync, "log"))
+        stack.enter_context(patch.object(ssh_sync, "_watch_rsync", side_effect=self.watch_local))
+        stack.enter_context(patch.object(ssh_sync, "_progress_args", return_value=()))
+
         stack.enter_context(patch.object(ssh_sync.subprocess, "run", side_effect=self.run_local))
-        stack.enter_context(patch.object(ssh_sync, "ssh", side_effect=AssertionError("no ssh expected")))
+        stack.enter_context(patch.object(ssh_sync, "ssh", side_effect=self.ssh_local))
+
+    def ssh_local(self, box, command, input=None, timeout=120, check=False):
+        return self.real_run(["sh", "-c", command], input=input, capture_output=True,
+                             timeout=timeout, check=check)
 
     def write(self, rel, text):
         p = self.src / rel
@@ -55,6 +62,10 @@ class TrackedIgnoredTests(unittest.TestCase):
 
     def git(self, *args):
         subprocess.run(["git", "-C", str(self.src), *args], check=True, capture_output=True)
+
+    def watch_local(self, cmd, timeout, input=None, **kwargs):
+        return subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape",
+                              timeout=timeout, input=input)
 
     def run_local(self, cmd, **kwargs):
         if cmd[0] == ssh_sync.RSYNC:
@@ -174,9 +185,9 @@ class TrackedIgnoredTests(unittest.TestCase):
         with patch.object(ssh_sync.subprocess, "run", side_effect=fake_ls_files), \
                 patch.object(ssh_sync, "_same_file", return_value=True):
             out = ssh_sync._tracked_skipped(self.src, set())
+            self.assertEqual(ssh_sync._disk_path(self.src, ".AWS/canary", {}), ".aws/canary")
         self.assertNotIn(".aws/canary", out)
         self.assertNotIn(".AWS/canary", out)
-        self.assertEqual(ssh_sync._disk_path(self.src, ".AWS/canary", {}), ".aws/canary")
 
     def test_not_a_git_repo_is_one_pass(self):
         plain = Path(self.tmp.name) / "plain"

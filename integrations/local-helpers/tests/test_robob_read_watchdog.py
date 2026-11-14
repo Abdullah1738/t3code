@@ -72,6 +72,17 @@ with (root / 'calls.jsonl').open('a') as out:
 sys.exit(rc)
 ''')
         fake.chmod(0o755)
+        fake_bin = self.home / ".local/bin"
+        fake_bin.mkdir(parents=True)
+        if sys.platform != "darwin":
+            # The watchdog is a Mac launchd helper; emulate BSD date, not its incident logic.
+            date = fake_bin / "date"
+            date.write_text(f"#!{sys.executable}\n" + '''import sys, time
+if len(sys.argv) != 4 or sys.argv[1] != '-r' or not sys.argv[3].startswith('+'):
+    sys.exit(2)
+print(time.strftime(sys.argv[3][1:], time.localtime(int(sys.argv[2]))))
+''')
+            date.chmod(0o755)
         command = shlex.quote(str(fake))
         self.env = {
             "HOME": str(self.home), "PATH": "/usr/bin:/bin", "TZ": "Asia/Dubai",

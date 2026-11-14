@@ -6,6 +6,7 @@ import { assessCache, planRefresh, cachedSlugs, summarize, watchPolicy, MIN_REFR
 import * as realIo from './lib/io.mjs';
 import { pathToFileURL } from 'node:url';
 const io = realIo;
+const { emit, observed } = await import('../router-logging/toollog.mjs').catch(() => ({ emit: () => {}, observed: (_c, _n, work) => work() }));
 
 function parseArgs(argv) {
   const [cmd = 'check', ...rest] = argv;
@@ -23,6 +24,12 @@ function parseArgs(argv) {
 const log = (...parts) => console.log(new Date().toISOString(), 'catalog-guard', ...parts);
 
 export async function check(opts, io = realIo) {
+  return observed('catalog-guard', 'catalog.check', () => checkImpl(opts, io), { exitCodeResult: true });
+}
+
+async function checkImpl(opts, io) {
+  const start = performance.now();
+  const decision = (action, ok = true) => emit('catalog-guard', 'catalog.decision', { kind: ok ? 'perf' : 'error', ok, durationMs: performance.now() - start, props: { action, tag: action, dryRun: opts.dryRun }, ...(ok ? {} : { error: { tag: action } }) });
   if (io.INSTANCE_ID !== 'opencode') throw new Error('catalog-guard only compares the OpenCode instance');
   const now = Date.now();
   const state = opts.dryRun ? {} : io.readState();
@@ -34,6 +41,7 @@ export async function check(opts, io = realIo) {
   };
 
   if (assessed.next !== 'check-service') {
+    decision(assessed.next);
     if (opts.dryRun) log(`dry-run: cache ${assessed.count ?? '?'} models, ${assessed.next} (${assessed.reason})`);
     record({ lastResult: assessed.next });
     return 0;
@@ -44,10 +52,12 @@ export async function check(opts, io = realIo) {
     service = await io.serviceSlugs();
   } catch (e) {
     log(`cache ${assessed.count} models (${assessed.reason}); could not read the OpenCode service: ${e.message}`);
+    decision('service-error', false);
     record({ lastResult: 'service-error' });
     return 1;
   }
   const plan = planRefresh({ cache, serviceSlugs: service, lastRefreshAt: Date.parse(state.lastRefreshAt ?? '') || 0, now, ...policy });
+  decision(plan.action);
   const head = `cache ${assessed.count} models, service ${service.length}`;
 
   if (plan.action === 'service-lacks') {
@@ -71,13 +81,14 @@ export async function check(opts, io = realIo) {
   // A cutover can begin while the service list is being read. Do not repair an
   // old requirement after ownership has moved to native harnesses.
   const freshPolicy = watchPolicy(await io.harnessCutoverStatus(), io.configuredWatch());
-  if (JSON.stringify(policy) !== JSON.stringify(freshPolicy)) return 0;
+  if (JSON.stringify(policy) !== JSON.stringify(freshPolicy)) { decision('policy-changed'); return 0; }
   io.writeState({ ...state, lastRefreshAt: refreshAt, lastCheckAt: new Date(now).toISOString(), lastResult: 'refreshing' });
   try {
-    const reply = await io.refreshProviders();
+    const reply = await observed('catalog-guard', 'catalog.refresh', () => io.refreshProviders());
     const after = io.readJson(opts.cache);
     const left = planRefresh({ cache: after, serviceSlugs: service, now: Date.now(), lastRefreshAt: 0, ...freshPolicy }).missing;
     const result = left.length === 0 ? 'repaired' : 'still-missing';
+    decision(result, left.length === 0);
     log(`${head}, missing ${summarize(plan.missing)}; refreshed (status ${reply.status}, rpc ${reply.slugs.length} models), cache now ${cachedSlugs(after).size} models: ${result}${left.length ? ` (${summarize(left)})` : ''}`);
     io.writeState({ ...state, lastRefreshAt: refreshAt, lastCheckAt: new Date(now).toISOString(), lastResult: result, refreshes: (state.refreshes ?? 0) + 1 });
     return left.length === 0 ? 0 : 1;

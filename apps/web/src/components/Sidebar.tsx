@@ -1,3 +1,4 @@
+import { recordConsumedShortcut } from "../ardud/keybindingAnalytics";
 import { type EnvironmentId, type ScopedProjectRef } from "@t3tools/contracts";
 import type { EnvironmentServerConfig } from "@t3tools/client-runtime/connection";
 import { ThreadHoverCard, ThreadHoverCardPopup } from "./ThreadHoverCard";
@@ -4548,6 +4549,7 @@ export default function Sidebar() {
         event.preventDefault();
         event.stopPropagation();
         navigateToThread(scopeThreadRef(targetThread.environmentId, targetThread.id));
+        if (targetThreadKey !== routeRowThreadKey) recordConsumedShortcut(event, command);
         return true;
       };
       const traversalDirection = threadTraversalDirectionFromCommand(command);

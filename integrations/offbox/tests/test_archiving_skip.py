@@ -5,6 +5,7 @@ archiving member must be skipped without any wait there.
 """
 import contextlib
 import io
+import os
 import sys
 import time
 import unittest
@@ -13,9 +14,11 @@ from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skill' / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
-sys.path.insert(0, str(SCRIPTS / 'tests'))
-from offbox_lib import api, lease, pool  # noqa: E402
-from test_capacity import Isolated  # noqa: E402
+from offbox_lib import api, common, lease, pool  # noqa: E402
+if __package__:
+    from .client_fixtures import Isolated, FakeClock
+else:
+    from client_fixtures import Isolated, FakeClock
 
 
 class FakeBoats:
@@ -43,6 +46,132 @@ class ArchivingSkipTests(Isolated):
 
     def row(self, bid):
         return self.con.execute('SELECT * FROM leases WHERE box_id=?', (bid,)).fetchone()
+
+    def test_stopping_at_cap_keeps_queueing_until_a_peer_is_free(self):
+        self.stopping_at_cap()
+
+    def test_own_stopping_box_at_cap_keeps_queueing_until_a_peer_is_free(self):
+        self.stopping_at_cap(own=True)
+
+    def stopping_at_cap(self, own=False):
+        self.box('cold', 'stopped', member=True)
+        if own:
+            self.con.execute("UPDATE leases SET owner=?, repo_root=? WHERE box_id='cold'",
+                             (self.me['owner'], self.me['repo_root']))
+            self.con.commit()
+        self.box('busy', 'running', member=True)
+        self.busy('busy')
+        clock = FakeClock()
+        boats = FakeBoats({'cold': ['stopping'], 'busy': ['idle']})
+        err = io.StringIO()
+
+        def free_peer(seconds):
+            clock.sleep(seconds)
+            self.con.execute("UPDATE runs SET status='done' WHERE box_id='busy'")
+            self.con.commit()
+
+        clock.time.sleep = free_peer
+        with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '10'}), \
+                patch.object(pool, 'time', clock.time), patch.object(pool, '_refresh_background'), \
+                patch.object(api, 'get', side_effect=boats.get), patch.object(api, 'resume') as resume, \
+                patch.object(api, 'wait_state', side_effect=AssertionError('must queue, not wait inline')), \
+                patch.object(lease, 'acquire_private') as create, contextlib.redirect_stderr(err):
+            got = pool.acquire(self.me)
+        try:
+            self.assertEqual(got['box_id'], 'busy')
+            self.assertGreater(clock.t, 1000)
+            self.assertIn('queued for a repo pool box', err.getvalue())
+            self.assertIn('skipping pool box cold', err.getvalue())
+            self.assertEqual(self.row('cold')['state'], 'stopped')
+            resume.assert_not_called()
+            create.assert_not_called()
+        finally:
+            pool.release_guard(got)
+
+    def test_stopping_under_cap_is_skipped_and_a_fresh_box_created(self):
+        self.box('cold', 'stopped', member=True)
+        new = {'box_id': 'new', 'state': 'running', 'size': 'large', 'source': 'fresh'}
+        with patch.object(api, 'get', return_value={'state': 'stopping', 'type': 'large'}), \
+                patch.object(api, 'resume') as resume, \
+                patch.object(api, 'wait_state', side_effect=AssertionError('must not wait inline')), \
+                patch.object(lease, 'acquire_private', return_value=new) as create, \
+                contextlib.redirect_stderr(io.StringIO()):
+            got = pool.acquire(self.me)
+        try:
+            self.assertEqual(got['box_id'], 'new')
+            create.assert_called_once()
+            resume.assert_not_called()
+            self.assertEqual(self.row('cold')['state'], 'stopped')
+        finally:
+            pool.release_guard(got)
+
+    def test_real_resume_500_at_cap_keeps_its_error(self):
+        self.box('cold', 'stopped', member=True)
+        error = api.ApiError(500, 'resume_failed', 'provider failure')
+        with patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '1'}), \
+                patch.object(api, 'get', return_value={'state': 'archived', 'type': 'large'}), \
+                patch.object(api, 'resume', side_effect=error) as resume, \
+                patch.object(lease, 'acquire_private') as create, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(api.ApiError) as caught:
+                pool.acquire(self.me)
+        self.assertIs(caught.exception, error)
+        self.assertEqual(caught.exception.code, common.EXIT_INFRA)
+        resume.assert_called_once()
+        create.assert_not_called()
+
+    def test_unknown_state_at_cap_is_still_an_infrastructure_error(self):
+        self.box('cold', 'stopped', member=True)
+        with patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '1'}), \
+                patch.object(api, 'get', return_value={'state': 'unknown', 'type': 'large'}), \
+                patch.object(api, 'resume') as resume, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(common.OffboxError, 'unexpected state unknown') as caught:
+                pool.acquire(self.me)
+        self.assertEqual(caught.exception.code, common.EXIT_INFRA)
+        resume.assert_not_called()
+
+    def test_resume_stuck_still_skips_to_the_next_stopped_member(self):
+        self.box('stuck', 'stopped', used=200, member=True)
+        self.box('cold', 'stopped', used=100, member=True)
+        clock = FakeClock()
+        boats = FakeBoats({'stuck': ['archived'], 'cold': ['archived']})
+
+        def bring_up(box_id, *, on_state=None, **kwargs):
+            if box_id == 'stuck':
+                for _ in range(3):
+                    on_state({'state': 'archived'})
+                    clock.sleep(lease.RESUME_STUCK_S)
+            return {'type': 'large'}
+
+        with patch.object(lease, 'now', side_effect=lambda: clock.t), \
+                patch.object(api, 'get', side_effect=boats.get), \
+                patch.object(api, 'resume', return_value={}) as resume, \
+                patch.object(lease, '_bring_up', side_effect=bring_up), \
+                patch.object(lease, 'acquire_private') as create, \
+                contextlib.redirect_stderr(io.StringIO()):
+            got = pool.acquire(self.me)
+        try:
+            self.assertEqual(got['box_id'], 'cold')
+            self.assertEqual([call.args[0] for call in resume.call_args_list], ['stuck', 'stuck', 'cold'])
+            self.assertEqual(self.row('stuck')['state'], 'stopped')
+            self.assertEqual(self.con.execute(
+                "SELECT COUNT(*) FROM events WHERE box_id='stuck' AND kind='resume_stuck'").fetchone()[0], 1)
+            create.assert_not_called()
+        finally:
+            pool.release_guard(got)
+
+    def test_direct_stopping_has_retry_message_and_keeps_infrastructure_exit(self):
+        self.box('cold', 'stopped')
+        self.con.execute("UPDATE leases SET owner=?, repo_root=? WHERE box_id='cold'",
+                         (self.me['owner'], self.me['repo_root']))
+        self.con.commit()
+        with patch.object(lease, 'db', return_value=self.con), \
+                patch.object(api, 'get', return_value={'state': 'stopping', 'type': 'large'}), \
+                patch.object(api, 'resume') as resume, \
+                patch.object(api, 'wait_state', side_effect=AssertionError('must not wait inline')):
+            with self.assertRaisesRegex(lease.ArchivingSkip, 'cold is stopping; retry in a moment') as caught:
+                lease.acquire_private(self.me)
+        self.assertEqual(caught.exception.code, common.EXIT_INFRA)
+        resume.assert_not_called()
 
     def test_archiving_first_candidate_is_skipped_and_next_free_box_used_without_waiting(self):
         # 'arch' is the most recently used running member, so it sorts first and is picked first.

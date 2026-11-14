@@ -18,6 +18,7 @@ import unittest
 from unittest.mock import patch
 
 from test_capacity import Isolated
+from tests._env import clean_env
 from test_wait_lock import Clock, FastEvent
 from offbox_lib import api, common, misc, runs, reap
 
@@ -34,6 +35,7 @@ class LostReviewFixture(Isolated):
         self.stack.enter_context(patch.object(misc,'_catch_up_finished'))
         self.stack.enter_context(patch.object(misc,'_catch_up_log',return_value='complete'))
         self.stack.enter_context(patch('offbox_lib.lease.idle_ttl'))
+        self.stack.enter_context(patch.object(misc, '_refresh_running_ttl'))
 
     def row(self):
         return self.con.execute("SELECT * FROM runs WHERE run_id='run-t'").fetchone()
@@ -49,7 +51,7 @@ class LostReviewTests(LostReviewFixture):
                 def ssh(box, command, **kwargs):
                     # The wrapper writes its exit after remote_alive's first test, just before kill -0 fails.
                     probe = f'kill() {{ printf "%s\\n" {code} > "$HOME/.offbox/exit/run-t.rc"; return 1; }}; '
-                    return subprocess.run(['bash','-c',probe+command],env={**os.environ,'HOME':home},
+                    return subprocess.run(['bash','-c',probe+command],env=clean_env(HOME=home),
                                           capture_output=True,timeout=5)
                 self.con.execute("UPDATE runs SET status='running',exit_code=NULL,end_at=NULL")
                 self.con.execute("DELETE FROM kv WHERE k LIKE 'lost_%'")
@@ -117,7 +119,7 @@ class MarkerStartupTests(unittest.TestCase):
             (tools/'mkdir').chmod(0o755)
         script='echo PREAMBLE; echo USER_COMMAND'
         cmd=runs.exit_recording_command(script,'run-t')
-        proc=subprocess.Popen(shlex.split(cmd),env={**os.environ,'HOME':str(home),'PATH':str(tools)+':'+os.environ['PATH']},
+        proc=subprocess.Popen(shlex.split(cmd),env=clean_env(HOME=str(home), PATH=str(tools)+':'+os.environ['PATH']),
                               stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
         started=time.monotonic()
         try:
@@ -179,6 +181,8 @@ class FollowSettlementTests(LostReviewFixture):
                         contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(misc.wait('run-t',5),90)
                     self.assertEqual(read.call_count,1)
+                self.assertEqual(self.con.execute("SELECT v FROM kv WHERE k='lost_confirmed:run-t'").fetchone()[0],
+                                 'box')
                 self.assertEqual(self.row()['status'],'lost')
 
     def test_unavailable_ssh_on_live_or_unknown_box_does_not_settle(self):

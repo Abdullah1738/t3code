@@ -46,12 +46,23 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+try:
+    import toollog
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skill/scripts"))
+    import toollog
+
 VAR = Path(os.environ.get("BOATD_VAR", "/var/lib/boatd"))
 ETC = Path(os.environ.get("BOATD_ETC", "/etc/boatd"))
 CMDS = VAR / "cmds"
 DB_PATH = VAR / "boatd.db"
 CG_ROOT = Path("/sys/fs/cgroup")
 SELF = Path(__file__).resolve()
+_mgmt_config = SELF.with_name("offbox_mgmt_sshd_config")
+if not _mgmt_config.is_file():
+    _mgmt_config = SELF.parents[1] / "skill/templates/home/offbox_mgmt_sshd_config"
+# Use the image's actual configuration, including when installed separately on the host.
+MGMT_PORT = int(next(line.split()[1] for line in _mgmt_config.read_text().splitlines() if line.startswith("Port ")))
 VERSION = "2.0"
 STARTED = time.time()
 
@@ -163,6 +174,8 @@ def _cols(con, table: str) -> set:
 def migrate(con) -> None:
     """Idempotent: owner columns, per-owner saved states, run attempts, hashed tokens."""
     con.executescript(SCHEMA_V2)
+    if "mgmt_ssh_port" not in _cols(con, "boxes"):
+        con.execute("ALTER TABLE boxes ADD COLUMN mgmt_ssh_port INTEGER")
     owner = CFG.get("default_owner") or "ardud"
     if "owner" not in _cols(con, "boxes"):
         con.execute("ALTER TABLE boxes ADD COLUMN owner TEXT")
@@ -449,10 +462,12 @@ def new_box_id(con) -> str:
 
 
 def next_ssh_port(con) -> int:
-    used = {r[0] for r in con.execute("SELECT ssh_port FROM boxes WHERE deleted_at IS NULL AND ssh_port IS NOT NULL")}
+    used = {p for r in con.execute("SELECT ssh_port, mgmt_ssh_port FROM boxes WHERE deleted_at IS NULL") for p in r if p}
     p = CFG["ssh_port_base"]
     while p in used:
         p += 1
+    if p > 65535:
+        raise Fail(503, "ssh_ports_exhausted", "no free SSH proxy port")
     return p
 
 
@@ -522,6 +537,28 @@ def _ensure_proxy(box_id: str, port: int) -> None:
               "connect=tcp:127.0.0.1:22", "bind=host", timeout=30)
 
 
+def _ensure_mgmt_proxy(con, box_id: str) -> int:
+    # Old boxes get a second proxy on demand; their stock SSH endpoint is never repointed.
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        port = box_row(con, box_id)["mgmt_ssh_port"]
+        if port is None:
+            port = next_ssh_port(con)
+            con.execute("UPDATE boxes SET mgmt_ssh_port=? WHERE id=?", (port, box_id))
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    devs = incus("config", "device", "list", ct(box_id), timeout=30).stdout.decode().split()
+    if "offbox-mgmt-ssh" in devs:
+        incus("config", "device", "set", ct(box_id), "offbox-mgmt-ssh",
+              f"listen=tcp:{CFG['ssh_host']}:{port}", f"connect=tcp:127.0.0.1:{MGMT_PORT}", timeout=30)
+    else:
+        incus("config", "device", "add", ct(box_id), "offbox-mgmt-ssh", "proxy",
+              f"listen=tcp:{CFG['ssh_host']}:{port}", f"connect=tcp:127.0.0.1:{MGMT_PORT}", "bind=host", timeout=30)
+    return port
+
+
 def _fresh_identity(box_id: str) -> None:
     """A copied box gets its own ssh host keys and hostname, and drops the source's authorized key list.
     The base image ships without host keys, so on a box's first boot sshd fails until systemd's start limit
@@ -532,13 +569,17 @@ def _fresh_identity(box_id: str) -> None:
                     "systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true; "
                     "systemctl is-active -q ssh.socket ssh.service sshd.service || systemctl start ssh.socket 2>/dev/null || true",
             timeout=60)
+    ct_exec(box_id, "if test -f /etc/ssh/offbox_mgmt_sshd_config; then "
+                    "systemctl reset-failed offbox-mgmt-ssh.service; systemctl restart offbox-mgmt-ssh.service; fi",
+            timeout=60)
 
 
 def _wait_boot(box_id: str, timeout: float = 120, ssh: bool = True) -> None:
-    """Wait for systemd inside the box to finish booting, then (ssh=True) for sshd on port 22."""
+    """Wait for systemd and management SSH; older images still use stock port 22."""
     end = now() + timeout
     probe = ("s=$(systemctl is-system-running 2>/dev/null); case $s in running|degraded) echo BOOTED;; esac; "
-             "ss -Hltn 'sport = :22' | grep -q . && echo SSHUP")
+             f"p=22; test ! -f /etc/ssh/offbox_mgmt_sshd_config || p={MGMT_PORT}; "
+             "ss -Hltn \"sport = :$p\" | grep -q . && echo SSHUP")
     while now() < end:
         out = ct_exec(box_id, probe, timeout=20, check=False).stdout.decode()
         if "BOOTED" in out and (not ssh or "SSHUP" in out):
@@ -562,6 +603,7 @@ def provision(box_id: str, source: tuple[str, str | None], t: str) -> None:
         apply_size(box_id, t)
         r = box_row(con, box_id)
         _ensure_proxy(box_id, r["ssh_port"])
+        _ensure_mgmt_proxy(con, box_id)
         incus("start", name, timeout=300)
         _wait_boot(box_id, ssh=False)
         _fresh_identity(box_id)
@@ -688,6 +730,7 @@ def resume_box(con, box_id: str, body: dict) -> None:
         try:
             apply_size(box_id, box_row(c2, box_id)["type"])
             _ensure_proxy(box_id, box_row(c2, box_id)["ssh_port"])
+            _ensure_mgmt_proxy(c2, box_id)
             if not ct_running(box_id):
                 incus("start", ct(box_id), timeout=300)
             _wait_boot(box_id)
@@ -966,6 +1009,13 @@ ADMIT_LOCK = VAR / "admit.lock"
 
 
 def admit(con, box_id: str, pid: int, kind: str, errf) -> float:
+    with toollog.span("boatd", "run.queue", ids={"box": box_id}, props={"backend": "home"}, tag="queue_failed") as data:
+        queued = _admit(con, box_id, pid, kind, errf)
+        data["props"].update(queued=queued > 1, waitMs=queued*1000)
+        return queued
+
+
+def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
     """Wait until the host has room for this run's predicted peak. Returns seconds queued."""
     need = predicted_peak(con, kind)
     reserve = int(CFG["mem_reserve_gb"] * 2**30)
@@ -988,6 +1038,12 @@ def admit(con, box_id: str, pid: int, kind: str, errf) -> float:
                             "WHERE box_id=? AND pid=?", (now(), now() - t0, boot_id(), box_id, pid))
                 return now() - t0
         if not said:
+            try:
+                position = con.execute("SELECT COUNT(*) FROM commands WHERE status='queued' AND created_at <= (SELECT created_at FROM commands WHERE box_id=? AND pid=?)", (box_id, pid)).fetchone()[0]
+            except Exception:
+                position = None
+            toollog.emit("boatd", "run.queue", ids={"box": box_id}, props={"backend": "home", "queued": True,
+                         "waitMs": (now()-t0)*1000, "position": position})
             why = "for earlier runs in the queue" if not (mine and room) else \
                 (f"for memory (this kind peaks ~{need / 2**30:.1f} GB, {max(0, free) / 2**30:.1f} GB free "
                  "after reserve)")
@@ -1053,6 +1109,26 @@ def box_window(con, box_id: str, t0: float, t1: float) -> dict:
             "box_io_bytes": (rows[-1]["io_bytes"] or 0) - (rows[0]["io_bytes"] or 0)}
 
 
+def running_box_count(con) -> int | None:
+    # Existing state only: telemetry must never invoke Incus or wait for a sampler tick.
+    try:
+        return con.execute("SELECT COUNT(*) FROM boxes WHERE deleted_at IS NULL "
+                           "AND state IN ('ready','running')").fetchone()[0]
+    except Exception:
+        return None
+
+
+def host_box_metrics(value) -> dict:
+    try:
+        host = (json.loads(value) if value else {}).get('host_boxes')
+        if isinstance(host, dict):
+            return {'host_boxes': {k: host[k] if type(host.get(k)) is int and host[k] >= 0 else None
+                                   for k in ('start', 'end')}}
+    except Exception:
+        pass
+    return {'host_boxes': None}
+
+
 def run_cmd(box_id: str, pid: int) -> int:
     load_cfg()
     con = db()
@@ -1064,6 +1140,7 @@ def run_cmd(box_id: str, pid: int) -> int:
     queued = admit(con, box_id, pid, r["kind"], errf)
     code, sig = None, None
     t0 = now()
+    host_boxes = {"start": running_box_count(con), "end": None}
     try:
         if (d / f"{pid}.kill").exists():
             code, sig = 143, "SIGTERM"
@@ -1079,6 +1156,11 @@ def run_cmd(box_id: str, pid: int) -> int:
         errf.write(f"\noffbox-server: command failed to start: {e}\n".encode())
         code = 125
     t1 = now()
+    host_boxes['end'] = running_box_count(con)
+    toollog.emit("boatd", "run.command", kind="perf" if code == 0 else "error", duration_ms=max(0, t1-t0)*1000,
+                 ok=code == 0, ids={"box": box_id, "run": r["run_id"]},
+                 props={"exitCode": code, "timeoutHit": code == 124, "attempt": attempt, "backend": "home"},
+                 tag="command_failed" if code != 0 else None)
     kill = (d / f"{pid}.kill").read_text() if (d / f"{pid}.kill").exists() else None
     if kill and code in (137, 143, 255, None):
         sig = sig or ("SIGKILL" if code == 137 else "SIGTERM")
@@ -1086,7 +1168,8 @@ def run_cmd(box_id: str, pid: int) -> int:
     # The result goes to disk first: if boatd or this runner is gone before the database has it, the next
     # reconcile finalizes the run from this file instead of calling it interrupted.
     write_json(result_path(box_id, pid), {"attempt": attempt, "status": status, "exit_code": code, "signal": sig,
-                                          "started_at": t0, "ended_at": t1, "boot_id": boot_id()})
+                                          "started_at": t0, "ended_at": t1, "boot_id": boot_id(),
+                                          "host_boxes": host_boxes})
     m = read_cg(cg_path(box_id) / "boatd" / str(pid))
     try:
         (cg_path(box_id) / "boatd" / str(pid)).rmdir()
@@ -1095,6 +1178,7 @@ def run_cmd(box_id: str, pid: int) -> int:
     m.update(box_window(con, box_id, t0, t1))
     m["wall_s"] = round(t1 - t0, 2)
     m["queued_s"] = round(queued, 2)
+    m["host_boxes"] = host_boxes
     con.execute("UPDATE commands SET status=?, exit_code=?, signal=?, ended_at=?, metrics=? WHERE box_id=? AND pid=? "
                 "AND attempt=?", (status, code, sig, t1, json.dumps(m), box_id, pid, attempt))
     con.execute("UPDATE boxes SET last_active=?, updated_at=? WHERE id=?", (now(), now(), box_id))
@@ -1131,7 +1215,7 @@ def settle_cmd(con, c) -> str:
     t = now()
     if res:
         m = {"wall_s": round((res.get("ended_at") or t) - (res.get("started_at") or t), 2),
-             "queued_s": c["queued_s"], "recovered": True}
+             "queued_s": c["queued_s"], "recovered": True, "host_boxes": res.get('host_boxes')}
         con.execute("UPDATE commands SET status=?, exit_code=?, signal=?, ended_at=?, metrics=COALESCE(metrics, ?) "
                     "WHERE box_id=? AND pid=?", (res.get("status") or "exited", res.get("exit_code"),
                                                  res.get("signal"), res.get("ended_at") or t, json.dumps(m),
@@ -1175,6 +1259,7 @@ def start_container(box_id: str) -> str | None:
         if not ct_running(box_id):
             apply_size(box_id, r["type"])
             _ensure_proxy(box_id, r["ssh_port"])
+            _ensure_mgmt_proxy(c2, box_id)
             incus("start", ct(box_id), timeout=300)
         _wait_boot(box_id)
         set_box(c2, box_id, state="ready", last_active=now(), error=None)
@@ -1318,7 +1403,7 @@ def snap_rotate(con, kind: str) -> dict:
 # ---------------------------------------------------------------- reaper + sampler
 
 def ssh_sessions(box_id: str) -> int:
-    """Established TCP connections on the box's port 22 (offbox tunnels and ssh keep a box warm, like boat)."""
+    """Guest and management SSH sessions keep a box warm, including offbox tunnels."""
     st = ct_state(box_id)
     p = st.get("pid")
     n = 0
@@ -1326,14 +1411,16 @@ def ssh_sessions(box_id: str) -> int:
         try:
             for line in Path(f"/proc/{p}/net/{f}").read_text().splitlines()[1:]:
                 parts = line.split()
-                if parts[1].endswith(":0016") and parts[3] == "01":
+                if parts[1].rsplit(":", 1)[-1] in ("0016", f"{MGMT_PORT:04X}") and parts[3] == "01":
                     n += 1
         except (OSError, IndexError):
             pass
     return n
 
 
+@toollog.observed("boatd", "reaper.pass", "reaper_failed")
 def reap_once(con) -> None:
+    toollog.rollup_previous()
     t = now()
     for r in con.execute("SELECT * FROM boxes WHERE deleted_at IS NULL").fetchall():
         bid = r["id"]
@@ -1346,7 +1433,9 @@ def reap_once(con) -> None:
             if r["ttl"] and t > (r["last_active"] or r["updated_at"]) + r["ttl"]:
                 try:
                     stop_box(con, bid, "idle ttl")
+                    toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid}, props={"action": "stop"})
                 except Exception as e:  # noqa: BLE001
+                    toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid}, props={"action": "stop"}, tag="reaper_stop")
                     log(f"idle stop {bid} failed: {e}")
         elif r["state"] == "archived" and not r["pinned"] and r["owner"] not in (CFG.get("person_owners") or []):
             # A person's box is never deleted for being unused: it is where her data lives.
@@ -1354,12 +1443,16 @@ def reap_once(con) -> None:
             if not used and t - (r["stopped_at"] or t) > CFG["prune_unused_days"] * 86400:
                 try:
                     delete_box(con, bid)
+                    toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid}, props={"action": "delete"})
                 except Exception as e:  # noqa: BLE001
+                    toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid}, props={"action": "delete"}, tag="reaper_delete")
                     log(f"prune {bid} failed: {e}")
         elif r["state"] == "error" and t - (r["updated_at"] or t) > 86400:
             try:
                 delete_box(con, bid)
+                toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid}, props={"action": "delete"})
             except Exception as e:  # noqa: BLE001
+                toollog.emit("boatd", "reaper.action", kind="error", ok=False, ids={"box": bid}, props={"action": "delete"}, tag="reaper_delete")
                 log(f"prune {bid} failed: {e}")
     # Commands whose runner went away without recording an exit: same rules as at start-up.
     for c in con.execute("SELECT * FROM commands WHERE status IN ('queued','running') AND created_at < ? AND "
@@ -1687,9 +1780,12 @@ class Handler(BaseHTTPRequestHandler):
                 with open(p, "rb") as f:
                     f.seek(off)
                     data = f.read(1 << 20)
+                    size = os.fstat(f.fileno()).st_size
                 data, nxt = _utf8_cut(data, off)
-                return {"ok": True, "data": data, "nextOffset": nxt,
-                        "done": r["status"] not in ("queued", "running") and nxt >= p.stat().st_size}
+                return {"ok": True, "data": data, "nextOffset": nxt, "size": size,
+                        "done": r["status"] not in ("queued", "running") and nxt >= size,
+                        "commandId": r['command_id'], "status": r['status'],
+                        "metrics": host_box_metrics(r['metrics'])}
             return {"ok": True, "command": cmd_status_json(con, bid, r["pid"], 0)}
         raise Fail(404, "not_found", path)
 
@@ -1735,8 +1831,9 @@ class Handler(BaseHTTPRequestHandler):
         if len(hk) < 2:
             raise Fail(503, "ssh_host_key_unavailable", "no host key yet")
         set_box(con, bid, last_active=now())
+        mgmt_port = _ensure_mgmt_proxy(con, bid)
         return {"ok": True, "sshEndpoint": f"{CFG['ssh_host']}:{r['ssh_port']}", "hostKey": f"{hk[0]} {hk[1]}",
-                "sshUser": "user"}
+                "sshUser": "user", "managementSshEndpoint": f"{CFG['ssh_host']}:{mgmt_port}"}
 
     def _commands(self, con, method: str, bid: str, rest: list[str], q: dict):
         if not rest and method == "POST":
@@ -1798,7 +1895,7 @@ class Handler(BaseHTTPRequestHandler):
                             sent = True
                 if sent:
                     continue
-                r = con.execute("SELECT status, exit_code, signal, attempt FROM commands WHERE box_id=? AND pid=?",
+                r = con.execute("SELECT status, exit_code, signal, attempt, command_id, started_at, ended_at, metrics FROM commands WHERE box_id=? AND pid=?",
                                 (bid, pid)).fetchone()
                 if (r["attempt"] or 1) != attempt:
                     attempt = r["attempt"] or 1
@@ -1814,7 +1911,9 @@ class Handler(BaseHTTPRequestHandler):
                             emit({"type": typ, "data": rest.decode(errors="replace"), "nextOffset": offs[which]})
                     if all(offs[w] >= sizes[w] for w in sizes):
                         emit({"type": "exit", "exitCode": r["exit_code"], "signal": r["signal"],
-                              "status": r["status"], "attempt": attempt})
+                              "status": r["status"], "attempt": attempt, "commandId": r["command_id"],
+                              "startedAt": iso(r["started_at"]), "endedAt": iso(r["ended_at"]),
+                              "metrics": host_box_metrics(r['metrics'])})
                         break
                     continue
                 if now() - started > 600:

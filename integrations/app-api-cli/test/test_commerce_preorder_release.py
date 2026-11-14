@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 from pathlib import Path
 import copy
 import tempfile
@@ -10,11 +11,12 @@ import commerce_preorder_release as r
 from commerce_preorder import IntentVault
 from noon_checkout import fingerprint
 from noon_nownow_checkout import Snapshot
-from test.test_commerce_preorder import Store
+from test_commerce_preorder import Store
 
 
 class ReleaseTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.p = patch.object(j, 'ROOT', Path(self.tmp.name) / 'commerce')
@@ -23,6 +25,7 @@ class ReleaseTests(unittest.TestCase):
         self.account = fingerprint('customer')
         j.open_flow(flow_id=self.flow, app='noon', vertical='nownow', account_hash=self.account, scope_hash='2'*64)
         args = dict(request_hash='3'*64, cart_hash='4'*64, review_hash='5'*64, payable_minor=2670)
+        j.record_nownow_prepared(self.flow, args['review_hash'])
         j.consume(self.flow, 'subscription', kind='preauthorize', **args)
         self.vault = IntentVault(Store())
         self.intent = self.vault.retain(self.flow, secret='synthetic', review_hash='5'*64,
@@ -111,8 +114,11 @@ class ReleaseTests(unittest.TestCase):
 
 
 class CartReviewTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_exact_cart_review_rejects_changed_session_amount_and_identity(self):
-        from test import test_commerce_nownow_order as f
+        import test_commerce_nownow_order as f
         import commerce_receipts
         import order_card
         from commerce_nownow import reader

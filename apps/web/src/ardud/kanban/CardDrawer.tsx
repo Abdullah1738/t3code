@@ -1,3 +1,4 @@
+import { askTimingRef } from "./needsYou/useAskTiming";
 import { Link } from "@tanstack/react-router";
 import {
   ArrowRightIcon,
@@ -49,6 +50,7 @@ import { cn } from "../../lib/utils";
 import { isConfirmDialogActive, requestConfirmDialog } from "../../confirmDialog";
 import { stepFromKey } from "./drawerKeys";
 import { usePrimaryEnvironmentId } from "../../state/environments";
+import { useAnalyticsScreen } from "../useAnalytics";
 import { boardViewFor, useBoardClock } from "./useBoardClock";
 import { useNowMs } from "./useNowMs";
 import { CardDescription } from "./CardDescription";
@@ -103,6 +105,7 @@ export function CardDrawer(props: {
   onOpenCard: (cardId: string) => void;
 }) {
   const { boardId, state } = props;
+  useAnalyticsScreen(usePrimaryEnvironmentId(), "card", boardId, props.cardId);
   const feedCard = state.cards.get(props.cardId);
   const detail = useCardDetail(boardId, props.cardId);
   // The feed's copy has no description or prompt and trims long texts; the card read
@@ -841,7 +844,11 @@ function OwnerAsks(props: { card: KanbanCard; nowMs: number; onAnswer: () => voi
   return (
     <ul className="mb-3.5 flex max-h-[30vh] shrink-0 flex-col gap-1 overflow-y-auto overscroll-contain rounded-xl bg-(--m-warnband) py-1.5">
       {asks.map((ask) => (
-        <li key={ask.id} className="flex items-start gap-2 px-3 py-1 text-sm leading-snug">
+        <li
+          ref={askTimingRef(card.id, ask.id)}
+          key={ask.id}
+          className="flex items-start gap-2 px-3 py-1 text-sm leading-snug"
+        >
           <Glyph kind={ask.blocking ? "wait" : "ask"} className="mt-1" />
           <span className="min-w-0 flex-1">
             <span className="line-clamp-3 break-words">{ask.text}</span>

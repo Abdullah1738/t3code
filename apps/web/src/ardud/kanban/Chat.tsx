@@ -66,7 +66,10 @@ import { formatInlineContextReference } from "../../lib/composerContextReference
 import { cn, randomUUID } from "../../lib/utils";
 import { useAssetUrls } from "../../assets/assetUrls";
 import { usePrimaryEnvironmentId } from "../../state/environments";
+import { useAnalyticsScreen } from "../useAnalytics";
+import { recordAnalytics } from "@t3tools/client-runtime/ardud/analytics";
 import { useServerConfigs } from "../../state/entities";
+import { askTimingRef } from "./needsYou/useAskTiming";
 import { useNowMs } from "./useNowMs";
 import {
   kanban,
@@ -94,12 +97,39 @@ export function Chat(props: {
   className?: string;
 }) {
   const { boardId, discussion, state } = props;
+  const environmentId = usePrimaryEnvironmentId();
+  useAnalyticsScreen(environmentId, "discussion", boardId, undefined, discussion.id);
   const messages = useMessages(boardId, discussion.id);
   const postPermission = useKanbanPermissionStatus(KANBAN_WS_METHODS.messagePost);
   const feed = useFeed(kanban.messages(boardId, discussion.id));
   const nowMs = useNowMs();
   const presence = discussionPresence(discussion, messages ?? [], nowMs);
   const lastSeq = messages?.at(-1)?.seq ?? 0;
+  const scroller = useRef<HTMLDivElement>(null);
+  const readEnd = useRef("");
+  const noteReadEnd = () => {
+    const element = scroller.current;
+    if (
+      !element ||
+      element.clientHeight <= 0 ||
+      Math.abs(element.scrollTop) > 2 ||
+      lastSeq === 0 ||
+      document.visibilityState !== "visible"
+    )
+      return;
+    const key = `${environmentId}:${discussion.id}:${lastSeq}`;
+    if (readEnd.current === key) return;
+    readEnd.current = key;
+    recordAnalytics(environmentId, "discussion.read-end", {
+      boardId,
+      discussionId: discussion.id,
+      props: { count: lastSeq },
+    });
+  };
+  useEffect(() => {
+    const frame = requestAnimationFrame(noteReadEnd);
+    return () => cancelAnimationFrame(frame);
+  }, [noteReadEnd]);
 
   const unread = state.unread.get(discussion.id) ?? 0;
 
@@ -112,7 +142,11 @@ export function Chat(props: {
   return (
     <div className={cn("flex min-h-0 flex-1 flex-col", props.className)}>
       {/* Column-reverse keeps the view pinned to the newest message without a scroll effect. */}
-      <div className="flex min-h-0 flex-1 flex-col-reverse overflow-y-auto overscroll-contain">
+      <div
+        ref={scroller}
+        onScroll={noteReadEnd}
+        className="flex min-h-0 flex-1 flex-col-reverse overflow-y-auto overscroll-contain"
+      >
         <div className="flex shrink-0 flex-col gap-3.5 py-4">
           {feed.failure ? (
             <p role="status" className="flex items-center gap-3 text-sm text-(--m-muted)">
@@ -139,6 +173,7 @@ export function Chat(props: {
                 key={message.seq}
                 boardId={boardId}
                 message={message}
+                cardId={discussion.cardId}
                 cards={state.cards}
                 onOpenCard={props.onOpenCard}
                 seen={message.seq === lastOwnSeq ? presence.seenBy : undefined}
@@ -172,6 +207,7 @@ export function Chat(props: {
 }
 
 export const Message = memo(function Message(props: {
+  cardId?: string | null;
   boardId: string;
   message: KanbanMessage;
   cards: KanbanBoardState["cards"];
@@ -180,6 +216,11 @@ export const Message = memo(function Message(props: {
 }) {
   const { message } = props;
   const time = formatTimeOfDay(message.createdAt);
+  const ask = props.cardId
+    ? props.cards
+        .get(props.cardId)
+        ?.asks.find((ask) => ask.closedAt === null && ask.seq === message.seq)
+    : undefined;
   const renderBlock = (block: KanbanBlock, index: number) => (
     <Block
       key={blockKey(block, index)}
@@ -235,7 +276,10 @@ export const Message = memo(function Message(props: {
 
   const face = avatarOf(message.author, message.authorName);
   return (
-    <div className="grid grid-cols-[28px_1fr] gap-2.5">
+    <div
+      ref={props.cardId && ask ? askTimingRef(props.cardId, ask.id) : undefined}
+      className="grid grid-cols-[28px_1fr] gap-2.5"
+    >
       <Avatar kind={face.kind} letter={face.letter} name={message.authorName} />
       <div className="flex min-w-0 flex-col gap-1">
         <span className="flex items-baseline gap-2">
@@ -510,6 +554,7 @@ function ChoiceBlock(props: {
         block.id,
         [...choice],
         text.trim() || null,
+        { createdAt: message.createdAt, phase: block.style },
       ),
     );
     setSending(false);

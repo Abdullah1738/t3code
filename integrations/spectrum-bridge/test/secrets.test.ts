@@ -335,3 +335,16 @@ describe("secret API routes", () => {
     expect(await gone.json()).toEqual({ error: "Expired" });
   });
 });
+
+test("form lifecycle logs hashed ids and no tokens, labels, purpose or submitted values", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const token = "x".repeat(43);
+  const logs = await captureLogs(async () => {
+    openRequest(token, FIELDS, "PRIVATE_PURPOSE");
+    expect((await post(token, { email: "me@example.com", password: "PRIVATE_PASSWORD", otp: "" })).status).toBe(400);
+    expect((await post(token, { email: "me@example.com", password: "PRIVATE_PASSWORD", otp: "123456" })).status).toBe(200);
+  });
+  expect(logs.map(l => l.name)).toEqual(expect.arrayContaining(["form.open", "form.submit", "form.fail"]));
+  expect(logs.find(l => l.name === "form.submit")?.ids?.formId).toBe(tokenHash(token));
+  for (const value of [token, "PRIVATE_", "123456", "me@example.com"]) expect(JSON.stringify(logs)).not.toContain(value);
+});

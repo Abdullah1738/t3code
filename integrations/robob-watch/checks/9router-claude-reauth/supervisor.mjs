@@ -6,6 +6,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acquireLease, DEFAULT_LEASE, leaseOwner, releaseLease } from './lease.mjs';
 
+const { emit, observed } = await import('../../../router-logging/toollog.mjs').catch(() => ({ emit: () => {}, observed: (_c, _n, work) => work() }));
+
 export const ROOT = dirname(fileURLToPath(import.meta.url));
 const STATE = join(ROOT, 'supervisor-state.json');
 // No currently deployed capability is known to enforce an atomic fence over
@@ -177,13 +179,22 @@ function detectorAlertText(i) {
 // Notices are durable per exact (connection ID, effective marker), including
 // across restarts and a temporary clear/disable followed by the same marker.
 async function detectOnly(ctx, state) {
-  const pending = pendingConnections(await ctx.providers());
+  const payload = await ctx.providers();
+  const pending = pendingConnections(payload);
+  for (const item of pending) emit('reauth', 'relogin.needed', { ids: { account: item.accountId }, props: { tag: 'effective_marker' } });
   state.detectorIncidents ??= [];
   for (const item of pending) {
     const coveredByRecoveryAlert = state.incidents.some(i => i.accountId === item.accountId && i.marker === item.marker && i.notified);
     if (!coveredByRecoveryAlert && !state.detectorIncidents.some(i => i.accountId === item.accountId && i.marker === item.marker)) {
       state.detectorIncidents.push({ id: randomUUID(), kind: 'detector', ...item, notified: false });
     }
+  }
+  for (const incident of state.detectorIncidents) {
+    const present = pending.some(p => p.accountId === incident.accountId && p.marker === incident.marker);
+    const cleared = payload.connections.some(c => c.id === incident.accountId && c.provider === 'claude' && c.authType === 'oauth' && c.isActive === true && !c.reauthRequiredAt);
+    if (cleared && !incident.logResolved) emit('reauth', 'relogin.ok', { kind: 'perf', ok: true, ids: { account: incident.accountId }, durationMs: Math.max(0, ctx.now() - Date.parse(incident.marker)), props: { tag: 'marker_cleared_observed' } });
+    if (cleared) incident.logResolved = true;
+    else if (present) incident.logResolved = false;
   }
   // Persist the stable dedupe identity before even attempting to enqueue.
   ctx.save(state);
@@ -263,6 +274,7 @@ async function detectOnly(ctx, state) {
 }
 
 async function holdActive(ctx, state, i, a, reason) {
+  emit('reauth', 'relogin.fail', { kind: 'error', ok: false, ids: { account: i.accountId }, durationMs: Math.max(0, ctx.now() - (a.nextSendAt - REPLAY_DELAY)), error: { tag: reason } });
   i.blocked = true; a.holdReason ??= reason; ctx.save(state);
   await alertOnce(ctx, state, i);
 }
@@ -290,12 +302,17 @@ function ensureIncidents(state, list) {
 
 // All IO is injected so the synthetic suite cannot hit a live endpoint or send.
 export async function tick(ctx) {
+  return observed('reauth', 'relogin.tick', () => tickImpl(ctx));
+}
+
+async function tickImpl(ctx) {
   const state = ctx.load();
   // In the live build the unverified server fence selects detector-only mode;
   // flags and local files cannot enable the recovery path. A future code change
   // must integrate and verify a real server capability before launch is allowed.
   if (ctx.enforceSafetyFence && !SERVER_IDENTITY_FENCE_VERIFIED) return detectOnly(ctx, state);
   const list = pendingConnections(await ctx.providers()); // failure is UNKNOWN, never healthy
+  for (const item of list) emit('reauth', 'relogin.needed', { ids: { account: item.accountId }, props: { tag: 'effective_marker' } });
   ensureIncidents(state, list); ctx.save(state);
   for (const i of state.incidents) await checkAlert(ctx, state, i);
   for (const i of state.incidents) if (i.blocked && !i.notified && i.id !== state.active?.incidentId && stillBad(list, i)) await alertOnce(ctx, state, i);
@@ -382,6 +399,7 @@ export async function tick(ctx) {
     try { confirm = (await ctx.thread(a.threadId))?.thread; } catch { throw new Error('control status unavailable'); }
     if (!confirm || confirm.threadId !== a.threadId || confirm.state !== 'idle' || confirm.run?.runId !== a.runId || confirm.run?.status !== 'completed' || !Array.isArray(confirm.recentRuns) || confirm.recentRuns.length !== 1 || confirm.recentRuns[0]?.runId !== a.runId || !matchingModel(confirm.model) || !matchingModel(confirm.run.model)) { await holdActive(ctx, state, i, a, 'run-changed'); return; }
     const current = fresh.find(c => c.accountId === i.accountId);
+    emit('reauth', current ? 'relogin.fail' : 'relogin.ok', { kind: current ? 'error' : 'perf', ok: !current, ids: { account: i.accountId }, durationMs: Math.max(0, ctx.now() - (a.nextSendAt - REPLAY_DELAY)), props: { tag: current ? 'marker_remains' : 'marker_cleared' }, ...(current ? { error: { tag: 'marker_remains' } } : {}) });
     // Cooldown applies even when the marker briefly clears then reappears.
     if (i.attempts < MAX_ATTEMPTS) i.nextAt = ctx.now() + COOLDOWNS[i.attempts - 1];
     else i.blocked = true;
@@ -415,8 +433,10 @@ export async function tick(ctx) {
   // Persist before launch, including the idempotency key and next retry time.
   a.phase = 'sent'; a.sends++; a.nextSendAt = ctx.now() + REPLAY_DELAY; ctx.save(state);
   let created;
+  const launchStart = performance.now();
+  emit('reauth', 'relogin.start', { ids: { account: i.accountId }, props: { tag: 'worker_launch', attempt: i.attempts } });
   try { created = await ctx.create(createInput(i, a, ctx.leasePath)); }
-  catch { throw new Error('control launch outcome unknown'); }
+  catch { emit('reauth', 'relogin.fail', { kind: 'error', ok: false, ids: { account: i.accountId }, durationMs: performance.now() - launchStart, error: { tag: 'launch_unknown' } }); throw new Error('control launch outcome unknown'); }
   if (!created || typeof created.threadId !== 'string' || !created.model) throw new Error('launch outcome not verified');
   if (created.threadId !== a.threadId || !matchingModel(created.model)) {
     // Defer the notice until status is queried and the mark rechecked. The
@@ -496,7 +516,7 @@ export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_
   let previousStall;
   try {
     const old = JSON.parse(previous ?? readFileSync(path, 'utf8'));
-    if (typeof old.phase === 'string' && /^[a-z:-]{1,80}$/.test(old.phase) && Number.isFinite(old.t) && old.phase !== 'done') {
+    if (typeof old.phase === 'string' && /^[a-z:-]{1,80}$/.test(old.phase) && Number.isFinite(old.t) && old.phase !== 'done' && old.phase !== 'failed') {
       previousStall = `previous run stalled in ${old.phase} (${Math.max(0, (Date.now() - old.t) / 1000).toFixed(1)}s)`;
       stderr(previousStall);
     }
@@ -520,6 +540,7 @@ export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_
       // The runner keeps only the last 500 stderr characters on failure.
       if (previousStall) stderr(previousStall);
       stderr(`9router Claude detector: ${phase} ${reason}`);
+      try { writeFileSync(path, JSON.stringify({ phase: 'failed', at: phase, t: Date.now() }) + '\n', { mode: 0o600 }); } catch { /* observability must not change detector safety */ }
     },
   };
 }

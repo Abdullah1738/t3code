@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 /**
  * Group chats: is an unnamed message meant for Robob? Messages that name him or
  * swipe-reply to him never get here; for the rest Jev (TypeSafe's decision
@@ -9,6 +10,7 @@ import type { Database } from "bun:sqlite";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isCommand } from "./commands.ts";
 
 export const JEV_MODEL = "typesafe/jev-1.13";
 /** Same line the Moni classifier settled on: a false wake costs less than a missed request. */
@@ -75,7 +77,7 @@ export function inboundTime(input: { receivedAt?: number; sentAt?: number }): nu
 }
 
 function personLine(id: string, input: InboundPayload, nameOf: (address: string) => string, at: number | undefined): GroupLine | undefined {
-  if (synthetic(id) || input.poll || (input.text ?? "").trimStart().startsWith("/")) return;
+  if (synthetic(id) || input.poll || isCommand(input.text ?? "")) return;
   if (at === undefined) return;
   const text = inboundWords(input);
   if (!text) return;
@@ -221,7 +223,7 @@ export function jevJudge(deps: JevDeps = {}): GroupJudge {
     if (!states.length) return [];
     const keyFile = deps.keyFile ?? join(homedir(), ".config/opencode/openrouter-key");
     let key: string;
-    try { key = (await readFile(keyFile, "utf8")).trim(); } catch { throw new JudgeError("keyUnavailable"); }
+    try { key = (await readFile(keyFile, "utf8")).trim(); } catch (caughtError) { toolError("group-judge", "group-judge.catch1", caughtError); throw new JudgeError("keyUnavailable"); }
     if (!key || /[\s\x00-\x1f\x7f]/.test(key)) throw new JudgeError("keyUnavailable");
     const keys = states.map((_, index) => `m${index}`);
     const body = JSON.stringify({
@@ -239,19 +241,19 @@ export function jevJudge(deps: JevDeps = {}): GroupJudge {
             method: "POST", body, redirect: "error", signal,
             headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json", "X-OpenRouter-Title": "spectrum-bridge group gate" },
           });
-        } catch { throw new JudgeError(signal.aborted ? "timeout" : "network"); }
+        } catch (caughtError) { toolError("group-judge", "group-judge.catch2", caughtError); throw new JudgeError(signal.aborted ? "timeout" : "network"); }
         if (!response.ok) {
-          await response.body?.cancel().catch(() => {});
+          await response.body?.cancel().catch((caughtError) => { toolError("group-judge", "group-judge.catch3", caughtError);});
           throw new JudgeError(`http${response.status}`);
         }
         let result: { answers?: Record<string, { noul?: unknown }> };
-        try { result = await response.json() as typeof result; } catch { throw new JudgeError(signal.aborted ? "timeout" : "invalidResponse"); }
+        try { result = await response.json() as typeof result; } catch (caughtError) { toolError("group-judge", "group-judge.catch4", caughtError); throw new JudgeError(signal.aborted ? "timeout" : "invalidResponse"); }
         return keys.map(k => {
           const p = result.answers?.[k]?.noul;
           if (typeof p !== "number" || !(p >= 0 && p <= 1)) throw new JudgeError("invalidResponse");
           return p;
         });
-      } catch (error) {
+      } catch (error) { toolError("group-judge", "group-judge.catch5", error);
         failure = error instanceof JudgeError ? error : new JudgeError("jevFailed");
       }
     }

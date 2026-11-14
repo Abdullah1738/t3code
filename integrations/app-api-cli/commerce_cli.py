@@ -1,4 +1,5 @@
 """Native HTTP commerce: caller-authorized baskets and exact recovery."""
+import toollog
 import argparse
 import json
 import re
@@ -280,7 +281,12 @@ def prepared_result(flow, prepared):
             or not isinstance(prepared.get('readback'),dict)
             or not prepared['readback']):
         journal.fail('PREPARE_ONLY_READBACK_UNCONFIRMED')
-    return {**prepared,'ok':True,'state':'PREPARED_NOT_ORDERED',
+    from commerce_pending import warnings
+    import owner_go
+    pending = warnings(flow.flow_id)
+    approval_item=owner_go.commerce_item(journal.binding(flow.flow_id))
+    return {**prepared,**({'warnings':pending} if pending else {}),'ok':True,'state':'PREPARED_NOT_ORDERED',
+            'owner_go_item':approval_item,
             'cart_readback_verified':True,'financial_send':False,'financial_retry':False}
 
 
@@ -320,6 +326,8 @@ def order_minutes(args):
         flow=MinutesFlow(items=items,auth=auth,driver_note_extra=extra,use_current_cart=use_current)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'created'}),flush=True)
     try:
+        from commerce_pending import cli_review
+        cli_review(flow,args)
         prepared=flow.prepare_only()
         verified=prepared_result(flow,prepared)
         review=prepared['review']
@@ -384,15 +392,50 @@ def order_minutes(args):
 def order_nownow(args):
     if not args.prepare_only and order_card.LAST4 == '9546':
         journal.fail('NOWNOW_9546_PAID_CONTRACT_UNPROVEN')
-    """Paid NowNow E2E replay of the captured contract (NNGAANNWEFJMZW8A).
+    flows = []
+    try:
+        return _order_nownow(args, flows)
+    except BaseException as exc:
+        from noon_nownow_checkout import NowNowError
+        if (isinstance(exc, NowNowError) and exc.code == 'SEND_RESERVATION_FAILED'
+                and not exc.may_have_sent and isinstance(exc.__cause__, journal.JournalError)
+                and str(exc.__cause__) in ('NOWNOW_FRESH_PREPARE_REQUIRED', 'ORDERING_PAUSED',
+                    'NOWNOW_9546_PAID_CONTRACT_UNPROVEN', 'NOON_FALLBACK_REQUIRES_RECORDED_9546_DECLINE',
+                    'SAME_BASKET_PENDING_ACK_REQUIRED')):
+            cause = exc.__cause__
+            exc = cause if isinstance(cause, journal.PaymentError) else journal.PaymentError(str(cause), {
+                'financial_send': False, 'financial_retry': False})
+        try:
+            if flows:
+                cleanup = flows[-1].stop_unsent()
+            elif args.resume_flow:
+                from commerce_nownow_cleanup import stop_retained_preparation
+                cleanup = stop_retained_preparation(args.resume_flow)
+            else:
+                cleanup = {'cart_checked': False, 'reason': 'NOWNOW_NO_OWNED_CART'}
+        except Exception as stopped:
+            cleanup = {'cart_checked': False, 'reason': getattr(stopped, 'code', None) or
+                       (str(stopped) if re.fullmatch(r'[A-Z][A-Z0-9_]+', str(stopped)) else 'NOWNOW_STOP_CLEAR_UNVERIFIED')}
+        if isinstance(exc, journal.PaymentError):
+            exc.details['cleanup'] = cleanup
+            raise exc
+        if isinstance(exc, Exception):
+            code = getattr(exc, 'code', None) or str(exc)
+            if not re.fullmatch(r'[A-Z][A-Z0-9_]+', code):
+                code = 'NOWNOW_ORDER_STOPPED'
+            raise journal.PaymentError(code, {'cleanup': cleanup}) from exc
+        raise
 
-    session/create -> edit-product -> validate guard -> edit-payment (saved
-    card) -> set-delivery-preference (BOTH flags one call) -> place-order ->
-    tracking poll. Payment rides the session token; place is the only
-    financial send. On 401: stop, no re-login attempt.
-    """
+
+def _order_nownow(args, flows):
+    """Explicit preparation, then same-basket verification and one placement."""
     import noon_nownow_checkout as nownow_transport
     from commerce_nownow_order import NowNowOrderFlow
+    if not args.prepare_only:
+        if not args.resume_flow:
+            raise journal.PaymentError('NOWNOW_FRESH_PREPARE_REQUIRED', {
+                'next_action': 're-run --prepare-only, then use --resume-flow with that flow', 'financial_send': False})
+        journal.require_nownow_prepared(args.resume_flow)
     items=input_items(args,id_argument='product_code',id_key='product_code')
     auth=CommerceAuth().noon
     if args.resume_flow:
@@ -405,7 +448,10 @@ def order_nownow(args):
     else:
         flow=NowNowOrderFlow(store_code=args.store_code,items=items,auth=auth)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'created'}),flush=True)
-    prepared=flow.prepare_only()
+    flows.append(flow)
+    from commerce_pending import cli_review
+    cli_review(flow,args)
+    prepared=flow.prepare_only(record=args.prepare_only)
     verified=prepared_result(flow,prepared)
     review=prepared['review']
     print(json.dumps({'flow_id':flow.flow_id,'phase':'review','review':review}),flush=True)
@@ -424,7 +470,8 @@ def order_nownow(args):
         # before the one placement; no CVV/verification operation is replayed.
         flow = NowNowOrderFlow.resume_active(flow.flow_id, store_code=args.store_code,
             items=items, auth=auth)
-        flow.prepare_only()
+        flows.append(flow)
+        flow.prepare_only(record=False)
     try:
         placed=flow.place()
     except nownow_transport.NowNowError as exc:
@@ -467,6 +514,8 @@ def order_main(args):
     else:
         flow=MainOrderFlow(items=items,auth=auth)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'created'}),flush=True)
+    from commerce_pending import cli_review
+    cli_review(flow,args)
     prepared=flow.prepare_only()
     verified=prepared_result(flow,prepared)
     review=prepared['review']
@@ -522,6 +571,8 @@ def order_supermall(args):
     else:
         flow = SupermallOrderFlow(items=items, auth=auth)
         print(json.dumps({'flow_id': flow.flow_id, 'phase': 'created'}), flush=True)
+    from commerce_pending import cli_review
+    cli_review(flow,args)
     prepared=flow.prepare_only()
     verified=prepared_result(flow,prepared)
     review=prepared['review']
@@ -573,6 +624,7 @@ def minutes_payment_fail(flow,paid):
                          outcome=outcome)
 
 
+@toollog.timed("commerce", "step.bank_approval_wait")
 def await_payment_flow(args):
     """Restart-safe status-only continuation of a consumed, unconfirmed payment.
 
@@ -646,14 +698,24 @@ def await_payment_flow(args):
         **order_watch_receipt.fields(registration),'financial_retry':False}
 
 
+@toollog.timed("commerce", "flow.release")
 def release_flow(args):
+    if getattr(args,'dry_run',False):
+        with journal.read_only():
+            return _release_flow(args)
+    return _release_flow(args)
+
+
+def _release_flow(args):
     """Evidence-reviewed release of a fenced never-paid flow (noon minutes / talabat)."""
     from commerce_minutes import exact_failed_evidence
     binding=journal.binding(args.flow_id)
     local=journal.inspect(args.flow_id)
     if binding['app']=='noon' and binding['vertical']=='nownow':
-        from commerce_preorder_release import release
-        return release(args.flow_id)
+        from commerce_nownow_release import release
+        return release(args.flow_id, dry_run=getattr(args,'dry_run',False))
+    if getattr(args,'dry_run',False):
+        journal.fail('RELEASE_DRY_RUN_NOWNOW_ONLY')
     if binding['app']=='noon' and binding['vertical'] in ('food','main','supermall'):
         # These lanes place before paying; no pre-order intent contract exists.
         journal.fail('RELEASE_EXACT_ORDER_RECONCILIATION_REQUIRED')
@@ -696,6 +758,7 @@ def release_flow(args):
             'reservation_minor_retained':local['reserved_minor'],'financial_retry':False}
 
 
+@toollog.timed("commerce", "flow.abandon")
 def abandon_flow(args):
     """Terminal close of an ACTIVE flow that never sent anything (process-loss recovery)."""
     return {'ok':True,'flow_id':args.flow_id,**journal.abandon(args.flow_id),'financial_retry':False}
@@ -890,6 +953,7 @@ def recover_talabat(flow_id, *, max_reads=90, recipient='owner'):
     return finish_recovered(result.state, result.reason, poller.next_index)
 
 
+@toollog.timed("commerce", "flow.recover_payment")
 def recover_payment(flow_id, *, max_reads=90, recipient='owner'):
     binding=journal.binding(flow_id)
     if binding['app']=='noon' and binding['vertical']=='food':
@@ -916,6 +980,7 @@ def basket_arguments(parser, flag):
         help='basket JSON array or {"items":[...]}; use - for stdin')
     parser.add_argument('--quantity',type=int,default=None,
         help='quantity for the single-item flag (default 1); not combined with --items-file')
+    parser.add_argument('--ack-pending',action='append',default=[],metavar='FLOW_UUID')
     parser.add_argument('--prepare-only',action='store_true',
         help='create/review the basket with exact readback, without ordering or paying (not read-only)')
     recipient_argument(parser)
@@ -1008,6 +1073,8 @@ def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     commands=parser.add_subparsers(dest='command',required=True)
     commands.add_parser('capabilities')
+    logs=commands.add_parser('log-rollup',help='Summarize a UTC orders log day')
+    logs.add_argument('--day',default=None)
     commands.add_parser('restaurant-cart-contract')
     options=commands.add_parser('item-options',help='Read Minutes option groups; no cart changes')
     options.add_argument('vertical',choices=('minutes',))
@@ -1081,6 +1148,7 @@ def main(argv=None):
     food_order=order_commands.add_parser('food', help='Journalled Food automatic saved-card order; explicit payment requirements need app')
     food_order.add_argument('--outlet-code',required=True)
     food_order.add_argument('--items-file',required=True)
+    food_order.add_argument('--ack-pending',action='append',default=[],metavar='FLOW_UUID')
     food_order.add_argument('--prepare-only',action='store_true')
     food_order.add_argument('--resume-flow')
     talabat_order=order_commands.add_parser('talabat',
@@ -1135,15 +1203,23 @@ def main(argv=None):
     release=commands.add_parser('release-flow',
         help='Evidence-reviewed local release: failed Talabat quote with no financial send, or verified never-paid order')
     release.add_argument('flow_id')
+    release.add_argument('--dry-run',action='store_true',help='NowNow: evaluate evidence without closing the flow')
     abandon=commands.add_parser('abandon-flow',
         help='Local close of eligible preparation with all sends observed, no financial ops and zero reserved')
     abandon.add_argument('flow_id')
     args=parser.parse_args(argv)
+    return toollog.run_command(args, dispatch)
+
+
+def dispatch(args):
     # Talabat retired by the owner (2026-11-07): refuse before pause, auth or network.
     import talabat_retired
-    if talabat_retired.requested(args):return talabat_retired.refuse()
+    if talabat_retired.requested(args):
+        toollog.emit('commerce','guard.refused',kind='error',ok=False,error='TALABAT_RETIRED')
+        return talabat_retired.refuse()
     # Owner pause first: nothing below (chat lookup, auth, network) runs while it holds.
     if args.command in PAUSED_COMMANDS and PAUSE_FILE.exists():
+        toollog.emit('commerce','guard.refused',kind='error',ok=False,error='ORDERING_PAUSED')
         print(json.dumps({'ok':False,'error':'ORDERING_PAUSED',
                           'message':f"Ordering is paused: {PAUSE_FILE.read_text().strip()}",
                           'financial_send':False,'financial_retry':False}))
@@ -1161,11 +1237,15 @@ def main(argv=None):
     try:
         declined=card_preflight(args)
         if declined:
+            toollog.emit('commerce','guard.refused',kind='error',ok=False,error=declined['error'])
             print(json.dumps({'ok':False,'error':declined['error'],'card_last4':declined['card_last4'],
                               'message':declined['message'],'financial_send':False,'financial_retry':False}))
             return card_status.EXIT_BLOCKED
         moni_go=require_moni_go(args)
-        if args.command=='capabilities':result=capabilities()
+        if args.command=='log-rollup':
+            summary=toollog.rollup(args.day)
+            result={'ok':summary is not None,'rollup':summary}
+        elif args.command=='capabilities':result=capabilities()
         elif args.command=='item-options':
             from noon_minutes_options import read_options
             result={'ok':True,'financial_send':False,'cart_mutation_sent':False,
@@ -1285,9 +1365,15 @@ def main(argv=None):
             if not state['order_id']:journal.fail('EXACT_ORDER_ID_UNAVAILABLE')
             result=track_exact(state['app'],state['vertical'],state['order_id'])
         if moni_go and isinstance(result,dict):result={**result,'moni_go':moni_go}
+        if result.get('ok') is False:
+            toollog.emit('commerce','cmd.error',kind='error',ok=False,error=result.get('error'))
+            toollog.guard_refused(result.get('error'))
         print(json.dumps(result))
         return 1 if result.get('ok') is False else 0
     except Exception as exc:
+        code=toollog.tag(getattr(exc,'code',str(exc)))
+        toollog.emit('commerce','cmd.error',kind='error',ok=False,error=code)
+        toollog.guard_refused(code)
         from noon_minutes_options import OptionsError
         from commerce_supermall_order import CatalogError
         if isinstance(exc,(OptionsError,CatalogError)):
@@ -1305,10 +1391,11 @@ def main(argv=None):
             print(json.dumps({'ok':False,'error':'PREPARATION_FAILED','phase':preparation[1],
                               'cause':preparation[2],'financial_send':False,'financial_retry':False}))
             return 1
-        if not re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}',code):code='COMMERCE_OPERATION_FAILED'
+        if not re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}',code):
+            code = 'NOWNOW_CLEAR_FAILED' if args.command == 'clear-cart' and args.vertical == 'nownow' else 'COMMERCE_OPERATION_FAILED'
         # A sent payment that didn't confirm: say whether a no-charge is proven, never assume it.
         details=exc.details if isinstance(exc,journal.PaymentError) else {}
-        if code == 'COMMERCE_OPERATION_FAILED':
+        if code in ('COMMERCE_OPERATION_FAILED', 'NOWNOW_CLEAR_FAILED'):
             # Exception messages may contain credentials or raw provider responses.
             cause = exc.__cause__ or exc
             tb = cause.__traceback__

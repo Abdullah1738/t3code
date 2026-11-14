@@ -1,5 +1,6 @@
 import {
   KanbanError,
+  kanbanWorkStep,
   type KanbanBoard,
   type KanbanCard,
   type KanbanCardId,
@@ -53,6 +54,7 @@ export const planCutoverCardRestore = (input: {
   if (card.settledAt !== null) return denied(`card #${card.number} is settled`);
 
   const role = restore.stage === "working" ? "work" : "review";
+  if (role === "work" && !kanbanWorkStep(card)) return denied("current step has no worker work");
   const same =
     card.stage === restore.stage &&
     card.activeThreadId === restore.threadId &&
@@ -127,7 +129,12 @@ export const planCutoverCardRestore = (input: {
   };
   const nextCard = sameValue(restored, card)
     ? card
-    : { ...restored, movedAt: input.at, updatedAt: input.at };
+    : {
+        ...restored,
+        ...(restored.wait === undefined ? {} : { wait: { ...restored.wait, at: input.at } }),
+        movedAt: input.at,
+        updatedAt: input.at,
+      };
   const restoredLink: KanbanThreadLink = { ...link, model, endedAt: null, paused: null };
   const nextLink = sameValue(restoredLink, link) ? link : restoredLink;
   return {

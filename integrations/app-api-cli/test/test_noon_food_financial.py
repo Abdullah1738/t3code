@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 import copy
 import json
 import tempfile
@@ -41,6 +42,7 @@ class Reader:
 
 class FoodFinancialTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         self.root=Path(temp.name)/"commerce"
         p=patch.object(j,'ROOT',self.root);p.start();self.addCleanup(p.stop)
@@ -67,6 +69,27 @@ class FoodFinancialTests(unittest.TestCase):
         self.assertEqual([call[0] for call in self.calls],['place'])
         self.co.recover()
         self.assertEqual(len(self.calls),1)
+
+    def test_placement_logs_confirmation_before_any_recovery_call(self):
+        self.reader.order_data.update(intent=None,accepted=True,automatic_payment_processed=True)
+        self.reader.bank_capture=lambda order:{'paid':True,'order':order,'source':'native_and_bank'}
+        rows=[]
+        def record(row):
+            # A second descriptor cannot acquire the financial lock until place releases it.
+            with self.co.path.with_suffix('.lock').open('a') as lock:
+                f.fcntl.flock(lock,f.fcntl.LOCK_EX | f.fcntl.LOCK_NB)
+            rows.append(row)
+        with patch.object(self.co,'recover',side_effect=AssertionError('must not recover')) as recover, \
+                patch.object(f.toollog,'_write',side_effect=record):
+            result=self.co.place()
+            self.assertEqual(result['state'],'PAID_AND_ACCEPTED')
+            confirmation=[r for r in rows if r['name']=='step.confirmation']
+            self.assertEqual(len(confirmation),1)
+            self.assertTrue(confirmation[0]['ok'])
+            self.assertGreaterEqual(confirmation[0]['durationMs'],0)
+            self.assertEqual(confirmation[0]['props']['lane'],'food')
+            recover.assert_not_called()
+        self.assertEqual([call[0] for call in self.calls],['place'])
 
     def test_bank_receipt_cannot_be_claimed_by_another_order(self):
         self.co.place()
@@ -163,8 +186,9 @@ class FoodFinancialTests(unittest.TestCase):
         self.assertEqual(unknown['charge'],'unknown')
         self.assertEqual(j.inspect(self.flow)['reserved_minor'],4585)
         self.assertEqual(self.registrations,[])
-        with self.assertRaises(j.JournalError):
-            j.open_flow(flow_id=str(uuid.uuid4()),app='noon',vertical='food',account_hash='a'*64,scope_hash='e'*64)
+        new=str(uuid.uuid4())
+        j.open_flow(flow_id=new,app='noon',vertical='food',account_hash='a'*64,scope_hash='e'*64)
+        self.assertEqual(j.inspect(new)['state'],'ACTIVE')
 
     def test_automatic_processing_does_not_claim_capture_or_release(self):
         self.reader.order_data.update(intent=None,accepted=True,automatic_payment_processed=True)
@@ -186,8 +210,9 @@ class FoodFinancialTests(unittest.TestCase):
         self.assertEqual(state['reserved_minor'],4585)
         self.assertEqual(state['order_id'],ORDER)
         with self.assertRaises(j.JournalError):self.co.place()
-        with self.assertRaises(j.JournalError):
-            j.open_flow(flow_id=str(uuid.uuid4()),app='noon',vertical='food',account_hash='a'*64,scope_hash='e'*64)
+        new=str(uuid.uuid4())
+        j.open_flow(flow_id=new,app='noon',vertical='food',account_hash='a'*64,scope_hash='e'*64)
+        self.assertEqual(j.inspect(new)['state'],'ACTIVE')
 
     def test_ambiguous_complete_recovery_and_repeat_are_read_only(self):
         self.co.place();self.fail_send='complete'
@@ -345,6 +370,9 @@ class FoodFinancialTests(unittest.TestCase):
 
 
 class NativeOrderTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def fixture(self):
         flow=SimpleNamespace(account=fingerprint('synthetic-customer'),scope='b'*64,outlet='OUTLET1',
             headers={'x-addresscode':'ADDRESS','x-addresskey':'ADDRESS-1'},
@@ -473,6 +501,9 @@ class NativeOrderTests(unittest.TestCase):
 
 
 class RegistrarTests(unittest.TestCase):
+    def setUp(self):
+        approve_test_flows(self)
+
     def test_registration_requires_receipt_exact_config_watcher_and_hold(self):
         with tempfile.TemporaryDirectory() as temp,patch.object(Path,'home',return_value=Path(temp)):
             root=Path(temp);name='order-noon-'+ORDER.lower()

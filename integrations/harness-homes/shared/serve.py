@@ -7,17 +7,29 @@ import contextvars
 from functools import partial, wraps
 import importlib
 import os
+import site
 import subprocess
 import sys
 from pathlib import Path
 
 
-def configure(mcp, port):
+def configure(mcp, port, server=None):
     mcp.settings.host = "127.0.0.1"
     mcp.settings.port = port
     mcp.settings.stateless_http = True
     mcp.settings.json_response = True
     mcp.settings.log_level = "WARNING"
+    if server is not None:
+        from request_log import RequestLogMiddleware
+        factory = mcp.streamable_http_app
+        tools = frozenset(tool.name for tool in mcp._tool_manager.list_tools())
+
+        def logged_app():
+            app = factory()
+            app.add_middleware(RequestLogMiddleware, server=server, tools=tools)
+            return app
+
+        mcp.streamable_http_app = logged_app
     return mcp
 
 
@@ -54,6 +66,10 @@ def main():
         parser.error("port must be between 1 and 65535")
     if args.server == "flighty":
         source = Path.home() / ".local/share/flighty-mcp"
+        site_dirs = sorted(path for path in source.glob(".venv/lib/python3.*/site-packages") if path.is_dir())
+        if len(site_dirs) != 1:
+            raise SystemExit(f"flighty: expected exactly one venv site-packages directory under {source / '.venv/lib'}; found {len(site_dirs)}")
+        site.addsitedir(str(site_dirs[0]))
         sys.path.insert(0, str(source))
         mcp = importlib.import_module("main").mcp
     else:
@@ -71,7 +87,7 @@ def main():
         mcp = importlib.import_module("inbody_api_mcp.server").mcp
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mcp-tools") as executor:
         offload_sync_tools(mcp, executor)
-        configure(mcp, args.port).run(transport="streamable-http")
+        configure(mcp, args.port, args.server).run(transport="streamable-http")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,6 @@
 import { PermissionUpdateNotice } from "../components/PermissionUpdateNotice";
+import { AnalyticsCoordinator } from "../ardud/AnalyticsCoordinator";
+import { activeAnalytics, analyticsErrorTag } from "@t3tools/client-runtime/ardud/analytics";
 import { type ServerLifecycleWelcomePayload } from "@t3tools/contracts";
 import { applyGlassOpacity } from "../glassAppearance"; // ardud missions: desk-theme
 import { scopedProjectKey, scopeProjectRef } from "@t3tools/client-runtime/environment";
@@ -142,6 +144,15 @@ function RootRouteNotFoundView() {
 }
 
 function RootRouteView() {
+  return (
+    <>
+      <AnalyticsCoordinator />
+      <RootRouteContent />
+    </>
+  );
+}
+
+function RootRouteContent() {
   useEffect(() => installDesktopPasteAsText(window.desktopBridge, window), []);
   const pathname = useLocation({ select: (location) => location.pathname });
   const { authGateState } = Route.useRouteContext();
@@ -392,6 +403,20 @@ function HostedStaticEnvironmentBootstrap() {
 }
 
 function RootRouteErrorView({ error }: ErrorComponentProps) {
+  return (
+    <>
+      <AnalyticsCoordinator />
+      <RootRouteErrorContent error={error} />
+    </>
+  );
+}
+
+function RootRouteErrorContent({ error }: Pick<ErrorComponentProps, "error">) {
+  useEffect(() => {
+    activeAnalytics()?.record("client.error", {
+      props: { errorTag: analyticsErrorTag(error), phase: "render" },
+    });
+  }, [error]);
   const router = useRouter();
   const message = errorMessage(error);
   // Router pathname rather than window.location: desktop uses hash history, where the window path is always "/".
@@ -407,10 +432,23 @@ function RootRouteErrorView({ error }: ErrorComponentProps) {
       />
 
       <div className="mt-5 flex flex-wrap gap-2">
-        <Button size="sm" onClick={() => void router.invalidate()}>
+        <Button
+          size="sm"
+          onClick={() => {
+            activeAnalytics()?.record("client.retry", { props: { reason: "retry" } });
+            void router.invalidate();
+          }}
+        >
           Try again
         </Button>
-        <Button size="sm" variant="outline" onClick={() => window.location.reload()}>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => {
+            activeAnalytics()?.record("client.refresh", { props: { reason: "refresh" } });
+            window.location.reload();
+          }}
+        >
           Reload app
         </Button>
         <CopyErrorButton report={report} />

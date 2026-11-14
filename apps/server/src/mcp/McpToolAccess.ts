@@ -1,5 +1,6 @@
 import {
   OrchestratorMcpFailure,
+  type OrchestratorMcpThreadSendResult,
   type ProviderInteractionMode,
   type RuntimeMode,
   type ThreadId,
@@ -18,6 +19,8 @@ import {
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import { jsonExceedsBudget, MAX_REPLY_BYTES, ReplyTooLarge } from "../ardud/http/replyBudget.ts";
 import { ReplyRejection } from "../ardud/http/ReplyRejection.ts";
+import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
+import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
 import { resolveInteractionMode, resolveRuntimeMode } from "./OrchestratorMcpService.ts";
 import {
   assertFullAccess,
@@ -72,6 +75,15 @@ export class Declaration<out Handler> {
     declare = (handle) =>
       new Declaration(builtHere, (params) =>
         handle(params).pipe(
+          Effect.onError((cause) => McpCallAnalytics.handlerFailure(cause)),
+          Effect.tap(() =>
+            Effect.flatMap(Effect.serviceOption(McpCallAnalytics.McpCall), (call) =>
+              Effect.sync(() => {
+                if (call._tag === "Some" && call.value.callerStarted === undefined)
+                  call.value.phase = "result";
+              }),
+            ),
+          ),
           Effect.flatMap((result) =>
             jsonExceedsBudget(result, (MAX_REPLY_BYTES - 4096) / 3)
               ? Effect.serviceOption(ReplyRejection).pipe(
@@ -171,6 +183,23 @@ export const writesThreads = <P, A, E, R>(
         ),
       );
     }),
+  );
+
+/** Includes access reads in the send deadline without bypassing their checks. */
+export const boundedThreadSend = <
+  P extends { readonly clientRequestId?: string | undefined },
+  E,
+  R,
+>(
+  declaration: Declaration<(params: P) => Effect.Effect<OrchestratorMcpThreadSendResult, E, R>>,
+  scope: Scope.Scope,
+) =>
+  declare((params: P) =>
+    SendAcknowledgement.bounded(
+      (clientRequestId) => checkedHandler(declaration)({ ...params, clientRequestId }),
+      scope,
+      params.clientRequestId,
+    ),
   );
 
 const escalationDenied = (refusal: DispatchModeRefusal) =>

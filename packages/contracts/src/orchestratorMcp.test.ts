@@ -37,6 +37,8 @@ describe("orchestrator MCP contracts", () => {
     const partial = {
       taskId: "node:task",
       partial: true,
+      stoppedAt: "result",
+      retryHint: "Retry task_status in a few seconds, or read childThreadId with t3_thread_read.",
       childThreadId: "thread:child",
       currentRunId: "run:resumed",
       currentRunStatus: "starting",
@@ -44,12 +46,77 @@ describe("orchestrator MCP contracts", () => {
       latestTerminalStatus: "cancelled",
     };
     expect(decode(partial)).toEqual(partial);
-    expect(decode({ taskId: "node:task", partial: true })).toEqual({
-      taskId: "node:task",
-      partial: true,
-    });
+    for (const stoppedAt of ["caller", "parent_records", "child_records", "result"]) {
+      const minimal = {
+        taskId: "node:task",
+        partial: true,
+        stoppedAt,
+        retryHint: "Retry task_status in a few seconds.",
+      };
+      expect(decode(minimal)).toEqual(minimal);
+      expect(decode({ ...minimal, callerResolved: true })).toEqual({
+        ...minimal,
+        callerResolved: true,
+      });
+      expect(() => decode({ ...minimal, stoppedAt: undefined })).toThrow();
+      expect(() => decode({ ...minimal, retryHint: undefined })).toThrow();
+    }
+    expect(() => decode({ ...partial, stoppedAt: "unknown" })).toThrow();
+    expect(() => decode({ taskId: "node:task", partial: true })).toThrow();
     expect(() => decode({ ...partial, partial: false })).toThrow();
     expect(() => decode({ taskId: "node:task" })).toThrow();
+  });
+
+  it("decodes optional bounded failures on full and partial task status, including old payloads", () => {
+    const decode = Schema.decodeUnknownSync(OrchestratorMcpTaskStatusResult);
+    const full = {
+      taskId: "node:task",
+      childThreadId: "thread:child",
+      childRunId: "run:child",
+      childNodeId: "node:task",
+      status: "failed",
+      workState: "result_available",
+      hasPendingChildRuns: false,
+      providerInstanceId: "codex",
+      model: "gpt-5",
+      summary: null,
+      resultContextTransferId: null,
+      latestTerminalRunId: "run:child",
+      latestTerminalStatus: "failed",
+      latestTerminalSummary: null,
+      latestTerminalResultContextTransferId: null,
+      hasPendingQuestion: false,
+      pendingApproval: null,
+      waitTimedOut: false,
+    };
+    const partial = {
+      taskId: "node:task",
+      partial: true,
+      status: "failed",
+      stoppedAt: "result",
+      retryHint: "Retry task_status in a few seconds.",
+    };
+    const failure = {
+      category: "content_filter",
+      code: "cyberPolicy",
+      message: "Provider refused the content.",
+      retryable: false,
+    };
+    for (const payload of [full, partial]) {
+      expect(decode(payload)).toEqual(payload);
+      expect(decode({ ...payload, failure: null }).failure).toBeNull();
+      expect(decode({ ...payload, failure }).failure).toEqual(failure);
+      const legacy = { ...payload, failure: { ...failure, code: null, retryable: null } };
+      expect(decode(legacy)).toEqual(legacy);
+      expect(
+        decode({ ...payload, failure: { ...failure, message: "x".repeat(2_000) } }).failure
+          ?.message,
+      ).toHaveLength(2_000);
+      expect(() =>
+        decode({ ...payload, failure: { ...failure, message: "x".repeat(2_001) } }),
+      ).toThrow();
+      expect(() => decode({ ...payload, failure: { ...failure, category: "invalid" } })).toThrow();
+    }
   });
 
   it("accepts explicit worktree isolation and keeps shared delegation as the default", () => {

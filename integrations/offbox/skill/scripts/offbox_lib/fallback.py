@@ -2,24 +2,24 @@
 
 from __future__ import annotations
 
-import datetime as dt
 import fcntl
 import os
 import shlex
+import sqlite3
 import subprocess
 import time
+import uuid
 
-from .common import LOCAL_SEM, LOCKS_DIR, TZ, db, ensure_dirs, event, kv_get, kv_set, log, now, say, warn_loud
+from .common import LOCAL_SEM, LOCKS_DIR, db, db_retry, ensure_dirs, event, log, now, say, warn_loud
 from .identity import telegram
 
 SLOTS = 2
-INFRA_WINDOW_S = 3600
-INFRA_ALERT_AT = 3
 
 
 def allowed(argv: list[str], error, cwd: str) -> bool:
     """Heavy commands never spill onto the Mac; small commands retain the existing fallback."""
-    if error.started:
+    from .common import EXIT_LOCAL
+    if error.started or error.code == EXIT_LOCAL:
         return False
     try:
         from classify import classify
@@ -51,20 +51,11 @@ def allowed(argv: list[str], error, cwd: str) -> bool:
 
 
 def note_infra_failure(msg: str) -> None:
-    """Count infra failures; on the 3rd within an hour send one Telegram alert per clock hour."""
+    """Record every failure; the bridge sends the first and summarizes the rest hourly."""
     con = db()
-    hist = [t for t in (kv_get(con, "infra_failures") or []) if now() - t < INFRA_WINDOW_S]
-    hist.append(now())
-    kv_set(con, "infra_failures", hist)
     event(con, None, "infra_failure", msg[:500])
-    if len(hist) >= INFRA_ALERT_AT:
-        hour = dt.datetime.now(TZ).strftime("%Y%m%d-%H")
-        key = f"offbox-infra-{hour}"
-        if not kv_get(con, f"sent:{key}"):
-            ok = telegram(f"offbox: {len(hist)} boat infra failures in the last hour; heavy runs remain remote-only. "
-                          f"Last error: {msg[:300]}", key, severity="attention")
-            if ok:
-                kv_set(con, f"sent:{key}", True)
+    telegram(f"offbox: boat infra failure; heavy runs remain remote-only. Latest: {msg[:300]}",
+             f"offbox-infra-{uuid.uuid4()}", severity="attention", burst_key="infra")
 
 
 class Semaphore:
@@ -125,10 +116,29 @@ def run_local(argv: list[str], reason: str, run_id: str | None = None) -> int:
             code = 130
     finally:
         sem.release()
-    con = db()
-    if run_id:
-        con.execute("UPDATE runs SET mode='local', status=?, exit_code=?, end_at=?, error=? WHERE run_id=?",
-                    ("done" if code == 0 else "failed", code, now(), reason[:500], run_id))
-        con.commit()
-    event(con, None, "local_run", f"exit={code} {round(now() - t)}s reason={reason[:200]}")
+    def persist():
+        con = db()
+        try:
+            if run_id:
+                con.execute("UPDATE runs SET mode='local', status=?, exit_code=?, end_at=?, error=? WHERE run_id=?",
+                            ("done" if code == 0 else "failed", code, now(), reason[:500], run_id))
+            event(con, None, "local_run", f"exit={code} {round(now() - t)}s reason={reason[:200]}")
+        finally:
+            con.close()
+    try:
+        db_retry(persist)
+    except sqlite3.Error as error:
+        from .runs import save_run_state
+        if run_id:
+            save_run_state(run_id, mode='local', status='done' if code == 0 else 'failed', exit_code=code, end_at=now())
+        message = (f"{run_id or 'local command'}: local exit {code}; bookkeeping failed: {error}. "
+                   f"Do not rerun the command; read/repair its result with: offbox wait {run_id or ''}")
+        say("warning: " + message)
+        log(message)
+    import toollog
+    for name in ("run.command", "run.end"):
+        toollog.emit("run", name, kind="perf" if code == 0 else "error", ok=code == 0,
+                     duration_ms=max(0, now()-t)*1000, ids={"run": run_id},
+                     props={"exitCode": code, "fallback": True, "timeoutHit": code == 124},
+                     tag="local_command_failed" if code else None)
     return code

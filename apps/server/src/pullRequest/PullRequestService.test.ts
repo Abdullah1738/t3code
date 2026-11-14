@@ -1,4 +1,4 @@
-import { SourceControlProviderKind } from "@t3tools/contracts";
+import { ProjectId, SourceControlProviderKind } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeV8 from "node:v8";
 import * as NodeVM from "node:vm";
@@ -19,7 +19,6 @@ import { HttpClient, HttpClientResponse } from "effect/http";
 import * as TestClock from "effect/testing/TestClock";
 import type {
   OrchestrationProjectShell,
-  ProjectId,
   PullRequestReviewCapabilities,
   PullRequestReviewerCapabilities,
 } from "@t3tools/contracts";
@@ -52,6 +51,7 @@ import {
 } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestProviderRegistry from "./PullRequestProviderRegistry.ts";
 import * as PullRequestService from "./PullRequestService.ts";
+import { makeSweepFixture } from "./testkit/sweepFixture.ts";
 import * as PullRequestReadCache from "./PullRequestReadCache.ts";
 import {
   FILE_REVISIONS_CACHE_CAPACITY,
@@ -562,6 +562,7 @@ function makeService(input: {
   readonly resolveHandle?: SourceControlProviderRegistry.SourceControlProviderRegistry["Service"]["resolveHandle"];
   readonly resolveRepositoryIdentity?: RepositoryIdentityResolver.RepositoryIdentityResolver["Service"]["resolve"];
   readonly getShellCalls?: Array<string>;
+  readonly listShellsCalls?: Array<unknown>;
 }) {
   // Built into the test's own scope rather than provided call by call: the marks store owns a
   // database, and `Effect.provide` would close it the moment the service was handed back.
@@ -582,9 +583,12 @@ function makeService(input: {
         }),
         Layer.mock(ProjectService.ProjectService)({
           listShells: (options) =>
-            Effect.succeed(
-              input.projects.filter((project) => options?.projectIds?.includes(project.id) ?? true),
-            ),
+            Effect.sync(() => {
+              input.listShellsCalls?.push(options);
+              return input.projects.filter(
+                (project) => options?.projectIds?.includes(project.id) ?? true,
+              );
+            }),
           getShell: (projectId) =>
             Effect.sync(() => {
               input.getShellCalls?.push(projectId);
@@ -8013,6 +8017,7 @@ it.effect("checks expanded files against a diff too large to cache without fetch
 it.effect("a sweep's memo reads each project's shell once; reads outside a sweep stay fresh", () =>
   Effect.gen(function* () {
     const getShellCalls: Array<string> = [];
+    const listShellsCalls: Array<unknown> = [];
     const service = yield* makeService({
       projects: [
         project({
@@ -8031,6 +8036,7 @@ it.effect("a sweep's memo reads each project's shell once; reads outside a sweep
         }),
       ],
       getShellCalls,
+      listShellsCalls,
     });
     const reference = (number: number) => ({
       projectId: "p1" as ProjectId,
@@ -8054,12 +8060,157 @@ it.effect("a sweep's memo reads each project's shell once; reads outside a sweep
     assert.isAtLeast(unmemoized, 4);
 
     getShellCalls.length = 0;
-    yield* readAll.pipe(Effect.provideService(PullRequestService.SweepProjectShells, new Map()));
-    assert.deepStrictEqual(getShellCalls, ["p1"]);
+    yield* readAll.pipe(
+      Effect.provideService(
+        PullRequestService.SweepProjectShells,
+        PullRequestService.makeSweepProjectMemo(),
+      ),
+    );
+    assert.deepStrictEqual(getShellCalls, []);
+    assert.strictEqual(listShellsCalls.length, 1);
 
     // The next sweep reads again: nothing carries over.
     getShellCalls.length = 0;
-    yield* readAll.pipe(Effect.provideService(PullRequestService.SweepProjectShells, new Map()));
-    assert.deepStrictEqual(getShellCalls, ["p1"]);
+    yield* readAll.pipe(
+      Effect.provideService(
+        PullRequestService.SweepProjectShells,
+        PullRequestService.makeSweepProjectMemo(),
+      ),
+    );
+    assert.deepStrictEqual(getShellCalls, []);
+    assert.strictEqual(listShellsCalls.length, 2);
+  }),
+);
+
+it.effect("sweep listing filters share one list and see projects added between sweeps", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeSweepFixture();
+    const memo = PullRequestService.makeSweepProjectMemo();
+    const first = yield* Effect.all(
+      [
+        fixture.service.list({ state: "open", projectId: fixture.projects[0]!.id }),
+        fixture.service.list({ state: "open", projectIds: [fixture.projects[1]!.id] }),
+        fixture.service.list({ state: "open", host: "github.com" }),
+        fixture.service.list({ state: "open" }),
+      ],
+      { concurrency: 4 },
+    ).pipe(Effect.provideService(PullRequestService.SweepProjectShells, memo));
+    assert.deepStrictEqual(
+      first.map((result) => result.providers[0]?.projectCount),
+      [1, 1, 60, 60],
+    );
+    assert.strictEqual(fixture.counts().listShells, 1);
+    const added = {
+      ...fixture.projects[0]!,
+      id: ProjectId.make("added"),
+      workspaceRoot: "/repo/added",
+      repositoryIdentity: {
+        canonicalKey: "github.com/acme/added",
+        provider: "github",
+        locator: {
+          source: "git-remote" as const,
+          remoteName: "origin",
+          remoteUrl: "https://github.com/acme/added.git",
+        },
+      },
+    };
+    fixture.projects.push(added);
+    const next = yield* fixture.service
+      .list({ state: "open", projectId: added.id })
+      .pipe(
+        Effect.provideService(
+          PullRequestService.SweepProjectShells,
+          PullRequestService.makeSweepProjectMemo(),
+        ),
+      );
+    assert.strictEqual(next.providers[0]?.projectCount, 1);
+    assert.strictEqual(fixture.counts().listShells, 2);
+  }),
+);
+
+it.effect("sweep fallback routes cache both matches and misses", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeSweepFixture();
+    const memo = PullRequestService.makeSweepProjectMemo();
+    const read = (host: string, projectId = fixture.projects[0]!.id) =>
+      fixture.service.summary({
+        projectId,
+        host,
+        repository: "Abdullah1738/robob-mission-control",
+        number: 1,
+      });
+    yield* Effect.all(
+      Array.from({ length: 20 }, () => read("github.com")),
+      { concurrency: 20 },
+    ).pipe(Effect.provideService(PullRequestService.SweepProjectShells, memo));
+    assert.strictEqual(memo.fallbackRoutes.size, 1);
+    const match = yield* memo.fallbackRoutes.values().next().value!;
+    assert.strictEqual(match?.repository, "pingdotgg/t3code");
+    for (let index = 0; index < 2; index++)
+      yield* read("unrecognized.test").pipe(
+        Effect.flip,
+        Effect.provideService(PullRequestService.SweepProjectShells, memo),
+      );
+    assert.strictEqual(memo.fallbackRoutes.size, 2);
+    const miss = yield* memo.fallbackRoutes.get(
+      "unrecognized.test\0abdullah1738/robob-mission-control",
+    )!;
+    assert.isUndefined(miss);
+    assert.strictEqual(fixture.counts().listShells, 1);
+  }),
+);
+
+it.effect("a sweep resolves a missing repository route only once", () =>
+  Effect.gen(function* () {
+    let refinements = 0;
+    const service = yield* makeService({
+      projects: [
+        project({ id: "own", title: "Own", workspaceRoot: "/own", repository: "acme/own" }),
+        project({
+          id: "unknown",
+          title: "Unknown",
+          workspaceRoot: "/unknown",
+          repository: "acme/unknown",
+          host: "forge.test",
+          provider: "unknown",
+        }),
+      ],
+      providers: [fakeProvider(SourceControlProviderKind.make("github"))],
+      resolveHandle: ({ context }) => {
+        refinements++;
+        assert.ok(context);
+        return Effect.succeed({ context, provider: undefined as never });
+      },
+    });
+    yield* service
+      .list({ state: "open", projectIds: [ProjectId.make("own")] })
+      .pipe(
+        Effect.provideService(
+          PullRequestService.SweepProjectShells,
+          PullRequestService.makeSweepProjectMemo(),
+        ),
+      );
+    assert.strictEqual(refinements, 0);
+    const read = service
+      .summary({
+        projectId: ProjectId.make("own"),
+        host: "forge.test",
+        repository: "acme/missing",
+        number: 1,
+      })
+      .pipe(Effect.flip);
+    const errors = yield* Effect.all(
+      Array.from({ length: 20 }, () => read),
+      { concurrency: 20 },
+    ).pipe(
+      Effect.provideService(
+        PullRequestService.SweepProjectShells,
+        PullRequestService.makeSweepProjectMemo(),
+      ),
+    );
+    assert.strictEqual(refinements, 1);
+    assert.ok(errors.every((error) => error._tag === "PullRequestUnavailableError"));
+    yield* read;
+    assert.strictEqual(refinements, 2);
   }),
 );

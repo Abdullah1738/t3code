@@ -11,10 +11,127 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tests._env import clean_env
 from offbox_lib import bases, identity, runs
+from test_capacity import Isolated
 
 TEMPLATES = runs.REPO_RECIPES_DIR.parent
 KEY = 'crpko-devops'
+
+REAL_DEV_LOCK = '''# This file is maintained automatically by "terraform init".
+# Manual edits may be lost in future updates.
+
+provider "registry.terraform.io/hashicorp/archive" {
+  version     = "2.7.1"
+  constraints = ">= 2.4.0, ~> 2.4, < 3.0.0"
+  hashes = [
+    "h1:62VrkalDPMKB9zerCBS4iKTbvxejwnAWn/XXYZZQWD4=",
+    "h1:A7EnRBVm4h9ryO9LwxYnKr4fy7ExPMwD5a1DsY7m1Y0=",
+    "zh:19881bb356a4a656a865f48aee70c0b8a03c35951b7799b6113883f67f196e8e",
+    "zh:2fcfbf6318dd514863268b09bbe19bfc958339c636bcbcc3664b45f2b8bf5cc6",
+    "zh:3323ab9a504ce0a115c28e64d0739369fe85151291a2ce480d51ccbb0c381ac5",
+    "zh:362674746fb3da3ab9bd4e70c75a3cdd9801a6cf258991102e2c46669cf68e19",
+    "zh:7140a46d748fdd12212161445c46bbbf30a3f4586c6ac97dd497f0c2565fe949",
+    "zh:78d5eefdd9e494defcb3c68d282b8f96630502cac21d1ea161f53cfe9bb483b3",
+    "zh:875e6ce78b10f73b1efc849bfcc7af3a28c83a52f878f503bb22776f71d79521",
+    "zh:b872c6ed24e38428d817ebfb214da69ea7eefc2c38e5a774db2ccd58e54d3a22",
+    "zh:cd6a44f731c1633ae5d37662af86e7b01ae4c96eb8b04144255824c3f350392d",
+    "zh:e0600f5e8da12710b0c52d6df0ba147a5486427c1a2cc78f31eea37a47ee1b07",
+    "zh:f21b2e2563bbb1e44e73557bcd6cdbc1ceb369d471049c40eb56cb84b6317a60",
+    "zh:f752829eba1cc04a479cf7ae7271526b402e206d5bcf1fcce9f535de5ff9e4e6",
+  ]
+}
+
+provider "registry.terraform.io/hashicorp/aws" {
+  version     = "5.100.0"
+  constraints = ">= 5.0.0, ~> 5.0, ~> 5.100, < 6.0.0"
+  hashes = [
+    "h1:Ijt7pOlB7Tr7maGQIqtsLFbl7pSMIj06TVdkoSBcYOw=",
+    "h1:edXOJWE4ORX8Fm+dpVpICzMZJat4AX0VRCAy/xkcOc0=",
+    "zh:054b8dd49f0549c9a7cc27d159e45327b7b65cf404da5e5a20da154b90b8a644",
+    "zh:0b97bf8d5e03d15d83cc40b0530a1f84b459354939ba6f135a0086c20ebbe6b2",
+    "zh:1589a2266af699cbd5d80737a0fe02e54ec9cf2ca54e7e00ac51c7359056f274",
+    "zh:6330766f1d85f01ae6ea90d1b214b8b74cc8c1badc4696b165b36ddd4cc15f7b",
+    "zh:7c8c2e30d8e55291b86fcb64bdf6c25489d538688545eb48fd74ad622e5d3862",
+    "zh:99b1003bd9bd32ee323544da897148f46a527f622dc3971af63ea3e251596342",
+    "zh:9b12af85486a96aedd8d7984b0ff811a4b42e3d88dad1a3fb4c0b580d04fa425",
+    "zh:9f8b909d3ec50ade83c8062290378b1ec553edef6a447c56dadc01a99f4eaa93",
+    "zh:aaef921ff9aabaf8b1869a86d692ebd24fbd4e12c21205034bb679b9caf883a2",
+    "zh:ac882313207aba00dd5a76dbd572a0ddc818bb9cbf5c9d61b28fe30efaec951e",
+    "zh:bb64e8aff37becab373a1a0cc1080990785304141af42ed6aa3dd4913b000421",
+    "zh:dfe495f6621df5540d9c92ad40b8067376350b005c637ea6efac5dc15028add4",
+    "zh:f0ddf0eaf052766cfe09dea8200a946519f653c384ab4336e2a4a64fdd6310e9",
+    "zh:f1b7e684f4c7ae1eed272b6de7d2049bb87a0275cb04dbb7cda6636f600699c9",
+    "zh:ff461571e3f233699bf690db319dfe46aec75e58726636a0d97dd9ac6e32fb70",
+  ]
+}
+
+provider "registry.terraform.io/hashicorp/external" {
+  version     = "2.4.2"
+  constraints = ">= 2.3.0, < 3.0.0"
+  hashes = [
+    "h1:4UInMFuK4GNw4uf2vkUwwDtc0CajvJ88BkAE6xLKOa4=",
+    "h1:QP724n6VWM/iitpILCwO079UOlzx6I0Ylh7g8Gwv1Y0=",
+    "zh:0b51793be4f66934a3666339e44c01fd56e1c6a56256dfc66d1cb391584b4c2f",
+    "zh:31cdd9b30e4ec63d130befc89471757ef3937b99a8f6cc006769d215365c5ba8",
+    "zh:61f86de4a3166cfa5da6800eeba8e6a2e4ab6403fc3d7b396508260b45d3de7d",
+    "zh:78d5eefdd9e494defcb3c68d282b8f96630502cac21d1ea161f53cfe9bb483b3",
+    "zh:817e8d5946aed6ca692e0bb2f6463c28774ef8fb2fdd3922543a495a249229ea",
+    "zh:b35f1bd1be09ed1a1620b43ab8cb43fe93407cf419586d53fe965691cc1b4a8e",
+    "zh:bcb170063ec8b5728bc2a4568bc48f539a1991cdaaf31667aa35568aebc34725",
+    "zh:c0d2c824cc7c047f26ce793bb0cbb6746f9745d1fc6e630d34a0afb5b92850d1",
+    "zh:cde68f51089b02db50e2c5a17f6e132dc1ead2fc08d3dd267b8dd54ec58133fa",
+    "zh:d1f3c497aa41f17e8d61067122f6d94e51ef942ab08be5465489864d900854ab",
+    "zh:e62568bfc0934b63e14f3547c823b01ed60d7475ff16bf12c0e55d5ac8d98ba7",
+    "zh:ed8890c29dba2b0ac27afcefa75e7395e27253b7025aaaa4258345fc59dad23e",
+    "zh:f220c56c7e487f01fd158126066f6525178bbd82805b27205354bc523cc7c413",
+  ]
+}
+
+provider "registry.terraform.io/hashicorp/random" {
+  version     = "3.8.1"
+  constraints = ">= 3.6.0, ~> 3.6, < 4.0.0"
+  hashes = [
+    "h1:Eexl06+6J+s75uD46+WnZtpJZYRVUMB0AiuPBifK6Jc=",
+    "h1:u8AKlWVDTH5r9YLSeswoVEjiY72Rt4/ch7U+61ZDkiQ=",
+    "zh:08dd03b918c7b55713026037c5400c48af5b9f468f483463321bd18e17b907b4",
+    "zh:0eee654a5542dc1d41920bbf2419032d6f0d5625b03bd81339e5b33394a3e0ae",
+    "zh:229665ddf060aa0ed315597908483eee5b818a17d09b6417a0f52fd9405c4f57",
+    "zh:2469d2e48f28076254a2a3fc327f184914566d9e40c5780b8d96ebf7205f8bc0",
+    "zh:37d7eb334d9561f335e748280f5535a384a88675af9a9eac439d4cfd663bcb66",
+    "zh:741101426a2f2c52dee37122f0f4a2f2d6af6d852cb1db634480a86398fa3511",
+    "zh:78d5eefdd9e494defcb3c68d282b8f96630502cac21d1ea161f53cfe9bb483b3",
+    "zh:a902473f08ef8df62cfe6116bd6c157070a93f66622384300de235a533e9d4a9",
+    "zh:b85c511a23e57a2147355932b3b6dce2a11e856b941165793a0c3d7578d94d05",
+    "zh:c5172226d18eaac95b1daac80172287b69d4ce32750c82ad77fa0768be4ea4b8",
+    "zh:dab4434dba34aad569b0bc243c2d3f3ff86dd7740def373f2a49816bd2ff819b",
+    "zh:f49fd62aa8c5525a5c17abd51e27ca5e213881d58882fd42fec4a545b53c9699",
+  ]
+}
+
+provider "registry.terraform.io/hashicorp/tls" {
+  version     = "4.2.1"
+  constraints = ">= 4.0.0, < 5.0.0"
+  hashes = [
+    "h1:F5d6bQY8UlBo0D71Sv7CsV+3aZOFz0yeNF+vufog7h4=",
+    "h1:akFNuHwvrtnYMBofieoeXhPJDhYZzJVu/Q/BgZK2fgg=",
+    "zh:0d1e7d07ac973b97fa228f46596c800de830820506ee145626f079dd6bbf8d8a",
+    "zh:5c7e3d4348cb4861ab812973ef493814a4b224bdd3e9d534a7c8a7c992382b86",
+    "zh:7c6d4a86cd7a4e9c1025c6b3a3a6a45dea202af85d870cddbab455fb1bd568ad",
+    "zh:7d0864755ba093664c4b2c07c045d3f5e3d7c799dda1a3ef33d17ed1ac563191",
+    "zh:83734f57950ab67c0d6a87babdb3f13c908cbe0a48949333f489698532e1391b",
+    "zh:951e3c285218ebca0cf20eaa4265020b4ef042fea9c6ade115ad1558cfe459e5",
+    "zh:b9543955b4297e1d93b85900854891c0e645d936d8285a190030475379c5c635",
+    "zh:bb1bd9e86c003d08c30c1b00d44118ed5bbbf6b1d2d6f7eaac4fa5c6ebea5933",
+    "zh:c9477bfe00653629cd77ddac3968475f7ad93ac3ca8bc45b56d1d9efb25e4a6e",
+    "zh:d4cfda8687f736d0cba664c22ec49dae1188289e214ef57f5afe6a7217854fed",
+    "zh:dc77ee066cf96532a48f0578c35b1eaf6dc4d8ddd0e3ae8e029a3b10676dd5d3",
+    "zh:f569b65999264a9416862bca5cd2a6177d94ccb0424f3a4ef424428912b9cb3c",
+  ]
+}
+'''
+
 
 FAKE = r'''
 import hashlib, json, os, pathlib, shutil, sys
@@ -32,6 +149,33 @@ def binary(tool, version):
 def record():
     with (home/'calls').open('a') as f: f.write(name+' '+ ' '.join(args)+'\n')
 if name == 'time': sys.exit(0)
+elif name == 'timeout':
+    if args[0] != '900': sys.exit(0)
+    record()
+    assert args[0] == '900', args
+    if state.get('mirror_timeout') or (p.cwd().name.startswith('fixture-') and state.get('fixture_timeout')):
+        sys.exit(124)
+    os.execvp(args[1], args[1:])
+elif name == 'sleep': pass
+elif name == 'terraform' and args[:2] == ['providers','mirror']:
+    record()
+    dest=p(args[-1])
+    dest.mkdir(parents=True,exist_ok=True)
+    (dest/'.partial').write_text('unfinished download')
+    if state.get('mirror_fails') or (p.cwd().name.startswith('fixture-') and state.get('fixture_fails')):
+        sys.exit(1)
+    config=json.loads((p.cwd()/'main.tf.json').read_text())
+    for provider in config['terraform']['required_providers'].values():
+        source=provider['source']
+        version=provider.get('version','')
+        if not version.replace('.','').isdigit():
+            version=state.get('resolved',{}).get(source,'6.67.0')
+        target=dest/source
+        target.mkdir(parents=True,exist_ok=True)
+        platform=next(a.split('=',1)[1] for a in args if a.startswith('-platform='))
+        (target/f'terraform-provider-{source.split("/")[-1]}_{version}_{platform}.zip').write_text('authenticated zip '+version)
+        (target/'index.json').write_text('{"stale":true}')
+        (target/(version+'.json')).write_text('{"stale":true}')
 elif name in ('vector','aws','terraform','ruby'):
     version = state[name]
     if name == 'vector': print('vector '+version+' (linux)')
@@ -128,7 +272,7 @@ class CrpkoSetupTests(unittest.TestCase):
         self.fake.write_text('#!'+sys.executable+'\n'+FAKE)
         self.fake.chmod(0o755)
         self.state = dict(vector='0.50.0', aws='2.99.0', terraform='1.16.1', ruby='3.3.0', time='GNU')
-        for tool in ('curl','sudo','tar','unzip','uname','readlink','dpkg-query',*self.state):
+        for tool in ('curl','sudo','tar','unzip','uname','readlink','dpkg-query','timeout','sleep',*self.state):
             shutil.copy(self.fake, self.bin/tool)
         (self.bin/'python3').symlink_to(sys.executable)
         flock = self.bin/'flock'
@@ -137,13 +281,13 @@ class CrpkoSetupTests(unittest.TestCase):
         self.recipes = self.home/'templates/repos'
         self.recipes.mkdir(parents=True)
         (self.recipes.parent/'tools').mkdir()
-        for source in (TEMPLATES/'tools/crpko.sh', TEMPLATES/'repos/crpko-devops.sh'):
+        for source in (TEMPLATES/'tools/fetch.sh', TEMPLATES/'tools/crpko.sh', TEMPLATES/'repos/crpko-devops.sh'):
             target = self.recipes.parent/source.relative_to(TEMPLATES)
             # Keep all fake installs in a temporary tree, including the absolute Ruby check.
             target.write_text(source.read_text().replace('/usr/bin/ruby',str(self.bin/'ruby'))
                               .replace('/usr/local/bin',str(self.bin))
                               .replace('/usr/local/aws-cli',str(self.home/'aws-cli')))
-        self.env = dict(os.environ, HOME=str(self.home), PATH=f'{self.bin}:/usr/bin:/bin',
+        self.env = clean_env(HOME=str(self.home), PATH=f'{self.bin}:/usr/bin:/bin',
                         OFFBOX_REPO_ROOT=str(self.root), OFFBOX_GNU_TIME=str(self.bin/'time'))
         self.env.pop('BASH_ENV',None)
 
@@ -151,12 +295,12 @@ class CrpkoSetupTests(unittest.TestCase):
         self.workflow.write_text('steps:\n  - uses: hashicorp/setup-terraform@v3\n    with:\n'
                                  f'      terraform_version: "{version}"\n')
 
-    def run_setup(self, node='', command='echo USER_COMMAND; command -v terraform aws ruby vector'):
+    def run_setup(self, node='', command='echo USER_COMMAND; command -v terraform aws ruby vector', repo='w/repo'):
         (self.home/'state').write_text(json.dumps(self.state))
         with patch.object(runs,'REPO_RECIPES_DIR',self.recipes), \
              patch.object(runs,'DOCKER_REPAIR',':'), patch.object(runs,'LDCACHE_REPAIR',':'), \
-             patch.object(runs,'GO_REPAIR',':'):
-            script = runs.remote_script('w/repo','.',[command],None,'run-test',repo_key=KEY,node=node)
+             patch.object(runs,'GO_REPAIR',':'), patch.object(runs.userns,'setup',return_value=':'):
+            script = runs.remote_script(repo,'.',[command],None,'run-test',repo_key=KEY,node=node)
         result = subprocess.run(['bash','-c',script],env=self.env,capture_output=True,text=True,timeout=15)
         self.state = json.loads((self.home/'state').read_text())
         return result
@@ -173,10 +317,11 @@ class CrpkoSetupTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertIn('USER_COMMAND',result.stdout)
 
-    def run_check(self):
+    def run_check(self, repo_root=None):
         (self.home/'state').write_text(json.dumps(self.state))
         body=(self.recipes.parent/'tools/crpko.sh').read_text()+'\n'+(self.recipes/f'{KEY}.sh').read_text()
-        return subprocess.run(['bash','-c',body,'recipe','--check'],env=self.env,
+        env=self.env if repo_root is None else dict(self.env,OFFBOX_REPO_ROOT=str(repo_root))
+        return subprocess.run(['bash','-c',body,'recipe','--check'],env=env,
                               capture_output=True,text=True,timeout=15)
 
     def test_empty_apt_lists_refresh_once_and_retry_install(self):
@@ -274,6 +419,279 @@ class CrpkoSetupTests(unittest.TestCase):
         self.assertNotIn('setting up', result.stderr)
         self.assertEqual(self.calls(),'')
 
+    def lock(self, name, providers):
+        path=self.root/'terraform/roots'/name/'.terraform.lock.hcl'
+        path.parent.mkdir(parents=True,exist_ok=True)
+        path.write_text('\n'.join(f'provider "registry.terraform.io/hashicorp/{tool}" {{\n'
+                                 f'  version     = "{version}"\n  constraints = ">= 1.0"\n'
+                                 '  hashes = [\n    "h1:fixture",\n    "zh:fixture",\n  ]\n}\n'
+                                 for tool,version in providers.items()))
+        return path
+
+    def mirror_package(self, tool, version, platform='linux_amd64'):
+        return self.home/f'.offbox/tf-provider-mirror/registry.terraform.io/hashicorp/{tool}/terraform-provider-{tool}_{version}_{platform}.zip'
+
+    def test_mirror_fills_locks_and_unpinned_fixture_then_warm_run_skips(self):
+        self.lock('dev',{'aws':'5.100.0','random':'3.8.1'})
+        self.lock('prod',{'aws':'5.100.0','tls':'4.2.1'})
+        fixture=self.root/'terraform/modules/unpinned/versions.tf'
+        fixture.parent.mkdir(parents=True)
+        fixture.write_text('terraform { required_providers { aws = { source = "hashicorp/aws" } } }')
+        self.assertNotEqual(self.run_check().returncode,0)
+        self.assert_ok(self.run_setup(command='echo USER_COMMAND; echo "$TERRAFORM_PROVIDER_MIRROR"; test -z "${TF_CLI_CONFIG_FILE:-}"'))
+        for tool,version in [('aws','5.100.0'),('random','3.8.1'),('tls','4.2.1'),('aws','6.67.0')]:
+            self.assertTrue(self.mirror_package(tool,version).is_file())
+        env=(self.home/'.offbox/repo-env/crpko-devops.sh').read_text()
+        self.assertIn('export TERRAFORM_PROVIDER_MIRROR=',env)
+        self.assertNotIn('TF_CLI_CONFIG_FILE',env)
+        rc=(self.home/'.terraformrc').read_text()
+        self.assertIn('filesystem_mirror {',rc)
+        self.assertIn('direct {}',rc)
+        self.assertIn(str(self.home/'.offbox/tf-provider-mirror'),rc)
+        self.assertEqual(self.run_check().returncode,0)
+        calls=self.calls()
+        self.assertIn('timeout 900 terraform providers mirror -platform=linux_amd64',calls)
+        self.assert_ok(self.run_setup())
+        self.assertEqual(self.calls(),calls)
+
+    def test_mirror_preserves_existing_package_and_regenerates_indexes(self):
+        self.lock('dev',{'aws':'5.100.0','random':'3.8.1'})
+        module=self.root/'terraform/modules/streaming-plane/.terraform.lock.hcl'
+        module.parent.mkdir(parents=True)
+        module.write_text('provider "registry.terraform.io/hashicorp/aws" {\n  version = "6.62.0"\n}\n')
+        existing=self.mirror_package('aws','5.100.0')
+        existing.parent.mkdir(parents=True)
+        existing.write_text('never replace this package')
+        marker=existing.parent/'marker'
+        marker.write_text('untouched')
+        inode=existing.stat().st_ino
+        (existing.parent/'index.json').write_text('{}')
+        self.assert_ok(self.run_setup())
+        self.assertEqual(existing.read_text(),'never replace this package')
+        self.assertEqual(existing.stat().st_ino,inode)
+        self.assertEqual(marker.read_text(),'untouched')
+        self.assertTrue(self.mirror_package('random','3.8.1').is_file())
+        versions=json.loads((existing.parent/'index.json').read_text())['versions']
+        self.assertEqual(versions,{'5.100.0':{},'6.62.0':{}})
+        self.assertIn('linux_amd64',json.loads((existing.parent/'5.100.0.json').read_text())['archives'])
+
+    def test_mirror_fill_failure_and_timeout_are_nonfatal_and_retry_next_run(self):
+        self.lock('dev',{'aws':'5.100.0'})
+        for flag in ('mirror_fails','mirror_timeout'):
+            with self.subTest(flag=flag):
+                self.state[flag]=True
+                before=self.calls()
+                self.assert_ok(self.run_setup(command='echo USER_COMMAND; cat "$HOME/.offbox/repo-setup-crpko-devops.log"'))
+                log=(self.home/'.offbox/repo-setup-crpko-devops.log').read_text()
+                self.assertIn('offbox: terraform provider mirror fill failed (',log)
+                self.assertIn('; tests will download providers',log)
+                self.assertTrue((self.home/'.offbox/repo-env/crpko-devops.sh').is_file())
+                self.assertNotEqual(self.run_check().returncode,0)
+                self.assertEqual(list((self.home/'.offbox').glob('tf-provider-mirror-stage.*')),[])
+                self.assertEqual(self.calls()[len(before):].count('timeout 900 terraform providers mirror'),3)
+                del self.state[flag]
+        self.assert_ok(self.run_setup())
+        self.assertEqual(self.run_check().returncode,0)
+
+    def test_existing_terraformrc_is_untouched(self):
+        self.lock('dev',{'aws':'5.100.0'})
+        rc=self.home/'.terraformrc'
+        rc.write_text('# owner config\ndisable_checkpoint = true\n')
+        self.assert_ok(self.run_setup())
+        self.assertEqual(rc.read_text(),'# owner config\ndisable_checkpoint = true\n')
+
+    def assert_fixture_failure_retries(self, flag, previously_complete=False):
+        self.lock('dev',{}).write_text(REAL_DEV_LOCK)
+        if previously_complete:
+            self.assert_ok(self.run_setup())
+            self.assertEqual(self.run_check().returncode,0)
+            # A new pin must invalidate the old completion state before fixture filling starts.
+            self.lock('prod',{'aws':'6.62.0'})
+        scripts=self.root/'scripts'
+        scripts.mkdir()
+        (scripts/'fixture.mjs').write_text('const text = `terraform { required_providers { '
+                                         'external = { source = "hashicorp/external", version = "2.3.5" } } }`;')
+        self.state[flag]=True
+        self.env['TERRAFORM_PROVIDER_MIRROR']=str(self.home/'.offbox/tf-provider-mirror')
+        before=self.calls()
+        self.assert_ok(self.run_setup(command='echo USER_COMMAND; test -z "${TERRAFORM_PROVIDER_MIRROR:-}"'))
+        self.assertEqual(self.calls()[len(before):].count('timeout 900 terraform providers mirror'),4)
+        for tool,version in [('archive','2.7.1'),('aws','5.100.0'),('external','2.4.2'),('random','3.8.1'),('tls','4.2.1')]:
+            self.assertTrue(self.mirror_package(tool,version).is_file())
+        self.assertFalse(self.mirror_package('external','2.3.5').exists())
+        self.assertNotEqual(self.run_check().returncode,0)
+        env=(self.home/'.offbox/repo-env/crpko-devops.sh').read_text()
+        self.assertNotIn('export TERRAFORM_PROVIDER_MIRROR=',env)
+        self.assertIn('unset TERRAFORM_PROVIDER_MIRROR',env)
+        self.assertIn('fixture registry.terraform.io/hashicorp/external 2.3.5',
+                      (self.home/'.offbox/repo-setup-crpko-devops.log').read_text())
+        self.assertEqual(list((self.home/'.offbox').glob('tf-provider-mirror-stage.*')),[])
+        pinned=self.mirror_package('external','2.4.2')
+        pinned_stat=pinned.stat()
+        before=self.calls()
+        del self.state[flag]
+        self.assert_ok(self.run_setup(command='echo USER_COMMAND; test -n "$TERRAFORM_PROVIDER_MIRROR"'))
+        self.assertEqual(self.calls()[len(before):].count('timeout 900 terraform providers mirror'),1)
+        self.assertTrue(self.mirror_package('external','2.3.5').is_file())
+        self.assertEqual(self.run_check().returncode,0)
+        self.assertEqual((pinned.stat().st_ino,pinned.stat().st_mtime_ns),
+                         (pinned_stat.st_ino,pinned_stat.st_mtime_ns))
+        before=self.calls()
+        self.assert_ok(self.run_setup())
+        self.assertEqual(self.calls(),before)
+
+    def test_fixture_failure_after_locked_fill_disables_hook_and_retries(self):
+        self.assert_fixture_failure_retries('fixture_fails')
+
+    def test_fixture_timeout_after_locked_fill_disables_hook_and_retries(self):
+        self.assert_fixture_failure_retries('fixture_timeout')
+
+    def test_refill_failure_invalidates_previous_completion(self):
+        self.assert_fixture_failure_retries('fixture_fails',previously_complete=True)
+
+    def test_existing_pins_without_completion_still_fill_fixtures(self):
+        self.lock('dev',{'aws':'5.100.0'})
+        pinned=self.mirror_package('aws','5.100.0')
+        pinned.parent.mkdir(parents=True)
+        pinned.write_text('existing locked package')
+        inode=pinned.stat().st_ino
+        scripts=self.root/'scripts'
+        scripts.mkdir()
+        (scripts/'fixture.mjs').write_text('const text = `terraform { required_providers { '
+                                         'external = { source = "hashicorp/external", version = "2.3.5" } } }`;')
+        self.assertNotEqual(self.run_check().returncode,0)
+        self.assert_ok(self.run_setup())
+        self.assertEqual(self.calls().count('timeout 900 terraform providers mirror'),1)
+        self.assertTrue(self.mirror_package('external','2.3.5').is_file())
+        self.assertEqual(pinned.stat().st_ino,inode)
+        self.assertEqual(pinned.read_text(),'existing locked package')
+        self.assertEqual(self.run_check().returncode,0)
+
+    def test_changed_fixture_requirements_refill_with_unchanged_locks(self):
+        lock=self.lock('dev',{})
+        lock.write_text(REAL_DEV_LOCK)
+        self.assert_ok(self.run_setup())
+        original_calls=self.calls()
+        scripts=self.root/'scripts'
+        scripts.mkdir()
+        fixture=scripts/'fixture.mjs'
+        fixture.write_text('const text = `terraform { required_providers { '
+                           'external = { source = "hashicorp/external", version = "2.3.5" } } }`;')
+        self.assertNotEqual(self.run_check().returncode,0)
+        self.assertEqual(self.calls(),original_calls)
+        self.assert_ok(self.run_setup())
+        self.assertEqual(self.calls()[len(original_calls):].count('timeout 900 terraform providers mirror'),1)
+        self.assertTrue(self.mirror_package('external','2.3.5').is_file())
+        self.assertEqual(self.run_check().returncode,0)
+        self.state['resolved']={'registry.terraform.io/hashicorp/external':'2.4.2'}
+        fixture.write_text(fixture.read_text().replace('"2.3.5"','"~> 2.3"'))
+        self.assertNotEqual(self.run_check().returncode,0)
+        before=self.calls()
+        self.assert_ok(self.run_setup())
+        self.assertEqual(self.calls()[len(before):].count('timeout 900 terraform providers mirror'),1)
+        self.assertEqual(self.run_check().returncode,0)
+        before=self.calls()
+        self.assert_ok(self.run_setup())
+        self.assertEqual(self.calls(),before)
+        # Switching back to an input set already filled on this box needs no network.
+        fixture.write_text(fixture.read_text().replace('"~> 2.3"','"2.3.5"'))
+        self.assertEqual(self.run_check().returncode,0)
+        self.assert_ok(self.run_setup())
+        self.assertEqual(self.calls(),before)
+        fixture.unlink()
+        self.assertEqual(self.run_check().returncode,0)
+        self.assert_ok(self.run_setup())
+        self.assertEqual(self.calls(),before)
+        self.assertEqual(lock.read_text(),REAL_DEV_LOCK)
+
+    def test_fixture_signature_ignores_order_duplicates_and_formatting(self):
+        self.lock('dev',{}).write_text(REAL_DEV_LOCK)
+        self.state['resolved']={'registry.terraform.io/hashicorp/external':'2.4.2'}
+        scripts=self.root/'scripts'
+        scripts.mkdir()
+        (scripts/'one.mjs').write_text('const text = `terraform { required_providers { '
+            'external = { source = "hashicorp/external", version = "= 2.3.5" } } }`;')
+        (scripts/'two.mjs').write_text('const text = `terraform { required_providers { '
+            'external = { source = "hashicorp/external", version = ">= 2.3.0, < 3.0.0" } '
+            'tls = { source = "hashicorp/tls", version = "4.2.1" } } }`;')
+        self.assert_ok(self.run_setup())
+        before=self.calls()
+        (scripts/'one.mjs').rename(scripts/'renamed.mjs')
+        (scripts/'renamed.mjs').write_text('const text = `terraform { required_providers { '
+            'renamed = { version = "2.3.5", source = "registry.terraform.io/hashicorp/external" } } }`;')
+        (scripts/'two.mjs').write_text('const text = `terraform { required_providers { '
+            'tls = { version = "=4.2.1", source = "hashicorp/tls" } '
+            'external = { version = "<3.0.0, >=2.3.0", source = "hashicorp/external" } } }`;')
+        shutil.copyfile(scripts/'renamed.mjs',scripts/'duplicate.mjs')
+        self.assertEqual(self.run_check().returncode,0)
+        self.assert_ok(self.run_setup())
+        self.assertEqual(self.calls(),before)
+
+    def test_reused_box_fills_another_checkout_fixture_with_same_pins(self):
+        self.lock('dev',{}).write_text(REAL_DEV_LOCK)
+        self.assert_ok(self.run_setup())
+        other=self.home/'w/other'
+        shutil.copytree(self.root,other)
+        (other/'scripts').mkdir()
+        (other/'scripts/fixture.mjs').write_text('const text = `terraform { required_providers { '
+            'external = { source = "hashicorp/external", version = "2.3.5" } } }`;')
+        self.assertNotEqual(self.run_check(repo_root=other).returncode,0)
+        before=self.calls()
+        self.assert_ok(self.run_setup(repo='w/other'))
+        self.assertEqual(self.calls()[len(before):].count('timeout 900 terraform providers mirror'),1)
+        self.assertTrue(self.mirror_package('external','2.3.5').is_file())
+        self.assertEqual(self.run_check(repo_root=other).returncode,0)
+        before=self.calls()
+        self.assert_ok(self.run_setup(repo='w/other'))
+        self.assertEqual(self.calls(),before)
+        self.assertEqual(self.run_check().returncode,0)
+        self.assert_ok(self.run_setup())
+        self.assertEqual(self.calls(),before)
+
+    def test_generated_fixture_requirement_forms(self):
+        self.lock('dev',{'aws':'5.100.0'})
+        scripts=self.root/'scripts'
+        scripts.mkdir()
+        forms=[
+            'terraform { required_providers { p = { source = "hashicorp/aws", version = ">= 5.0" } } }',
+            'terraform { required_providers { p = { version = "6.62.0"\n source = "hashicorp/aws" } } }',
+            'terraform {\\n required_providers {\\n p = { source = "registry.terraform.io/hashicorp/aws" }\\n }\\n}',
+        ]
+        for i,form in enumerate(forms):
+            (scripts/f'fixture-{i}.mjs').write_text('const text = `'+form+'`;')
+        self.assert_ok(self.run_setup())
+        self.assertTrue(self.mirror_package('aws','6.67.0').exists())
+        self.assertTrue(self.mirror_package('aws','6.62.0').exists())
+
+    def test_two_setups_share_one_publisher(self):
+        self.lock('dev',{'aws':'5.100.0'})
+        (self.home/'state').write_text(json.dumps(self.state))
+        script=(self.recipes.parent/'tools/crpko.sh').read_text()+'\n'+(self.recipes/f'{KEY}.sh').read_text()
+        children=[subprocess.Popen(['bash','-c',script],env=self.env,stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE,text=True) for _ in range(2)]
+        for child in children:
+            stdout,stderr=child.communicate(timeout=15)
+            self.assertEqual(child.returncode,0,stdout+stderr)
+        self.assertEqual(self.calls().count('terraform providers mirror -platform='),2)  # timeout + terraform
+        self.assertTrue(self.mirror_package('aws','5.100.0').exists())
+        self.assertEqual(list((self.home/'.offbox').glob('tf-provider-mirror-stage.*')),[])
+
+    def test_real_dev_lock_shape(self):
+        path=self.lock('dev',{})
+        path.write_text(REAL_DEV_LOCK)
+        self.assert_ok(self.run_setup())
+        for tool,version in [('archive','2.7.1'),('aws','5.100.0'),('external','2.4.2'),('random','3.8.1'),('tls','4.2.1')]:
+            self.assertTrue(self.mirror_package(tool,version).exists())
+        self.assertEqual(self.run_check().returncode,0)
+        self.assertEqual(path.read_text(),REAL_DEV_LOCK)
+
+    def test_mirror_uses_platform_from_box_architecture(self):
+        self.state['arch']='aarch64'
+        self.lock('dev',{'aws':'5.100.0'})
+        self.assert_ok(self.run_setup())
+        self.assertTrue(self.mirror_package('aws','5.100.0','linux_arm64').exists())
+        self.assertEqual(self.run_check().returncode,0)
+
     def test_missing_and_wrong_versions_install_then_skip(self):
         for tool, versions in [('vector',(None,'0.49.0')),('aws',(None,'1.45.0')),
                                ('terraform',(None,'1.15.0')),('ruby',(None,))]:
@@ -314,6 +732,11 @@ class CrpkoSetupTests(unittest.TestCase):
         self.assertEqual(result.returncode,98,result.stderr)
         self.assertNotIn('curl ',self.calls())
         self.assertNotIn('USER_COMMAND',result.stdout)
+
+    def test_repo_environment_does_not_prepend_a_box_node_path(self):
+        result = self.run_setup(command='echo USER_COMMAND; printf "PATH=%s\\n" "$PATH"')
+        self.assert_ok(result)
+        self.assertIn('PATH=' + self.env['PATH'], result.stdout.splitlines())
 
     def test_missing_unzip_is_installed(self):
         self.env['PATH']=str(self.bin)
@@ -432,7 +855,7 @@ class CrpkoSetupTests(unittest.TestCase):
         self.assertIn('offbox_crpko_tools\n',body)
 
 
-class RepoKeyTests(unittest.TestCase):
+class RepoKeyTests(Isolated):
     def test_origin_defines_key_for_main_ovnfs_and_tmp_clones(self):
         urls=['https://github.com/Equicom-Crypto/crpko-devops.git',
               'git@github.com:Equicom-Crypto/crpko-devops.git',

@@ -7,6 +7,7 @@ import sys
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from offbox_lib import containers, runs
 from test_capacity import Isolated
 
@@ -45,7 +46,7 @@ class StaleContainersTests(Isolated):
             p=bins/name; p.write_text(body); p.chmod(0o755)
         self.state=self.home/'state'; self.state.write_text(json.dumps([item('a')]))
         self.calls=self.home/'calls'
-        self.env=dict(os.environ,HOME=str(self.home),PATH=str(bins)+os.pathsep+os.environ['PATH'],
+        self.env=clean_env(HOME=str(self.home),PATH=str(bins)+os.pathsep+os.environ['PATH'],
                       FAKE_STATE=str(self.state),FAKE_CALLS=str(self.calls))
         self.box('bx',member=True)
         self.con.execute("INSERT INTO runs(run_id,box_id,status,end_at,docker) VALUES ('r','bx','killed',?,0)",(1794528000,))
@@ -195,7 +196,7 @@ class StaleContainersTests(Isolated):
         self.state.write_text(json.dumps([item('a'),item('b','leaked')]))
         def ssh(box,command,timeout):
             return subprocess.run(['bash','-c',command],env=self.env,capture_output=True,timeout=timeout)
-        with patch.object(containers.ssh_sync,'ssh',side_effect=ssh), patch.object(runs,'db',return_value=self.con), patch.object(
+        with patch.object(containers.ssh_sync,'ssh',side_effect=ssh), patch.object(
                 runs.lease,'touch'), patch.object(runs.lease,'idle_ttl'):
             runs.finish('r',143,'killed',catch_up=False)
         self.assertTrue(self.con.execute("SELECT 1 FROM events WHERE kind='stale_containers_left'").fetchone())

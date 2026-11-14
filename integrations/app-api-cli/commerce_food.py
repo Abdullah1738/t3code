@@ -1,4 +1,5 @@
 """Journalled Food preparation and automatic saved-card placement."""
+import toollog
 import json
 import os
 import re
@@ -11,6 +12,7 @@ from pathlib import Path
 import commerce_journal as journal
 import native
 import order_card
+import owner_go
 import noon_http_orders as core
 import noon_vertical_reads as vertical
 from noon_checkout import project_home, QUIET_NOTE
@@ -104,6 +106,7 @@ def request(operation, headers, body):
 
 
 class FoodFlow:
+    @toollog.timed("commerce", "step.auth", lane="food")
     def __init__(self, outlet, rows, flow_id=None, *, read_only=False):
         require(isinstance(outlet, str) and re.fullmatch(r'[A-Z0-9]{5,64}', outlet), 'FOOD_OUTLET_INVALID')
         self.outlet, self.rows = outlet, manifest(rows)
@@ -160,6 +163,7 @@ class FoodFlow:
     def read(self):
         return request('details', self.headers, {'sessionCode':self.state['session']})
 
+    @toollog.timed("commerce", "step.checkout", lane="food")
     def review(self, data, *, quiet=True):
         require(data.get('checkoutSessionCode')==self.state['session'] and not data.get('orderNr'), 'FOOD_SESSION_ALREADY_ORDERED_OR_CHANGED')
         require(data.get('outletCode')==self.outlet and data.get('addressCode')==self.headers['x-addresscode'], 'FOOD_CART_HOME_OR_OUTLET_CHANGED')
@@ -185,7 +189,10 @@ class FoodFlow:
             'orderDeliveryFee','orderSmallOrderFee','orderServiceFee','orderRiderTip','orderDonationAmount') if data.get(k) is not None}
         return review
 
+    @toollog.timed("commerce", "step.cart_build", lane="food")
     def prepare(self):
+        from commerce_pending import register
+        register(self.flow_id, 'food', self.account, self.rows, card_last4=self.card_last4)
         info, items = native.food_menu_raw(self.outlet, self.headers, 15)
         require(info['status']=='open' and info['serviceable'] is True, 'FOOD_OUTLET_UNAVAILABLE')
         validate_choices(self.rows, items)
@@ -232,6 +239,7 @@ class FoodFlow:
         review['display_items']=[{'name':names[r['itemCode']],'qty':r['qty']} for r in self.rows]
         self.state['review_hash']=journal.digest(review); self.state['review']=review; self.save()
         return {'ok':True,'state':'PREPARED_NOT_ORDERED','flow_id':self.flow_id,'review':review,
+                'owner_go_item':owner_go.commerce_item(journal.binding(self.flow_id)),
                 'financial_send':False,'purchase_enabled':True,'cleanup':'Leave this isolated session; no owner basket was reset or cleared.'}
 
 
@@ -239,7 +247,10 @@ def prepare(args):
     raw=json.loads(Path(args.items_file).read_text())
     rows=raw.get('items') if isinstance(raw,dict) else raw
     flow=FoodFlow(args.outlet_code, rows, args.resume_flow)
+    from commerce_pending import cli_review
+    pending=cli_review(flow,args)
     result=flow.prepare()
+    if pending:result['warnings']=pending
     if args.prepare_only:return result
     from noon_food_financial import Coordinator, AutomaticTransport
     from noon_food_recovery import NativeReader, TrackerRegistrar

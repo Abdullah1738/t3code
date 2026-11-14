@@ -80,11 +80,12 @@ sys.exit(int(os.environ.get('NOTIFY_EXIT', '0')))
         calls = self.calls()
         self.assertEqual(len(calls), 1)
         key = 'inbox-triage:urgent:' + hashlib.sha256(hit['id'].encode()).hexdigest()[:16]
-        self.assertEqual(calls[0][calls[0].index('--key') + 1], key)
-        text = calls[0][calls[0].index('--text') + 1]
+        self.assertEqual(next(a.split('=', 1)[1] for a in calls[0] if a.startswith('--key=')), key)
+        text = next(a.split('=', 1)[1] for a in calls[0] if a.startswith('--text='))
         self.assertLessEqual(len(text), 300)
         self.assertNotIn('123456', text)
-        self.assertIn('Please review this activity', text)
+        self.assertIn('Security:', text)
+        self.assertNotIn(hit['sender'], text)
         self.assertIn('telegram_sent_at', report['hits'][0])
         self.assertEqual(event, '')  # no raw event for the runner to send to Telegram a second time
         followup = t.event_text('batch.json', report['hits'], {})
@@ -148,7 +149,7 @@ sys.exit(int(os.environ.get('NOTIFY_EXIT', '0')))
         report = {'hits': [{**hit, 'reason': 'Security: reason changed'}]}
         t.urgent_alerts(state, report, self.wd, self.now)
         call = self.calls()[0]
-        self.assertEqual(call[call.index('--text') + 1], text)
+        self.assertEqual(next(a.split('=', 1)[1] for a in call if a.startswith('--text=')), text)
 
     def test_deferred_security_alert_retries_after_otp_expires(self):
         os.environ['NOTIFY_EXIT'] = '1'

@@ -23,7 +23,7 @@ def log(text):
 
 
 def connect(path):
-    con = sqlite3.connect(path, timeout=5)
+    con = sqlite3.connect(path, timeout=30, isolation_level=None)
     con.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     return con
 
@@ -171,6 +171,8 @@ def tick(con, dry_run=False):
 
 
 def main():
+    import toollog
+    toollog.rollup_previous()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", nargs="?", choices=["loop"])
     parser.add_argument("--once", action="store_true")

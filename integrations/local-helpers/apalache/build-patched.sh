@@ -3,6 +3,7 @@ set -euo pipefail
 umask 022
 
 # Run on the build box with JDK 21; this never installs or selects a live backend.
+readonly script_dir=$(cd "$(dirname "$0")" && pwd)
 readonly commit=7954daf7563a69cce9d0b89c8542e40bf46f7c6e
 readonly sbt_version=1.12.11
 readonly sbt_sha256=b4c0c55d68f11b1510d884641cb1b1456191dac40ddc958bf86c825adc344e16
@@ -32,6 +33,8 @@ cd "$work/source"
 git checkout --detach "$commit"
 [[ $(git rev-parse 'v0.62.4^{commit}') == "$commit" ]]
 [[ $(cat project/build.properties) == "sbt.version=$sbt_version" ]]
+git apply --check "$script_dir/loopback.patch"
+git apply "$script_dir/loopback.patch"
 epoch=$(git show -s --format=%ct HEAD)
 export SOURCE_DATE_EPOCH=$epoch TZ=UTC LC_ALL=C
 

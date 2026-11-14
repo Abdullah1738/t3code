@@ -6,9 +6,12 @@
 import {
   CARD_ASK_TOOL_DESCRIPTION,
   KanbanBlockInput,
+  KanbanNightlyReviewTime,
+  KanbanNightlyReviewTimeZone,
   KanbanBoardIcon,
   KanbanPriority,
   KanbanStage,
+  KanbanMoveOptions,
   KanbanWaitKind,
   NonNegativeInt,
   OrchestratorMcpFailure,
@@ -99,32 +102,37 @@ const SubtasksInput = describe(
       id: Schema.optional(
         describe(
           TrimmedNonEmptyString,
-          "Existing s<N> id from card_get to keep it; omit id for a new subtask.",
+          "Existing s<N> id from card_get. Listed alone it keeps that subtask as it is; omit id for a new subtask.",
         ),
       ),
       step: Schema.optional(
         describe(
           PositiveInt,
-          "Subtasks with the same step go in any order. Leave out for the step after the previous entry.",
+          "Subtasks with the same step go in any order. Leave out to keep an existing id's step, or for the step after the previous entry on a new subtask. Done and skipped subtasks keep their step.",
         ),
       ),
-      text: describe(
-        RawBoardText.check(Schema.isMaxLength(MAX_TEXT)),
-        `Subtask text, at most ${MAX_TEXT} characters.`,
+      text: Schema.optional(
+        describe(
+          RawBoardText.check(Schema.isMaxLength(MAX_TEXT)),
+          `Subtask text, at most ${MAX_TEXT} characters. Required for a new subtask; for an existing open id, sent text replaces it. Done and skipped subtasks keep their text.`,
+        ),
       ),
-      owner: describe(
-        Schema.Literals(["work", "review", "evaluator", "script"]),
-        "Who does it: the worker, the reviewer (ticked when the review passes), an evaluator, or a board script (the script ticks it from its output; the evaluator hears about it only if the script hands it back).",
+      owner: Schema.optional(
+        describe(
+          Schema.Literals(["work", "review", "evaluator", "script"]),
+          "Who does it: the worker, the reviewer (ticked when the review passes), an evaluator, or a board script (the script ticks it from its output; the evaluator hears about it only if the script hands it back). Required for a new subtask; omitted on an existing open id, keeps its owner. Done and skipped subtasks keep their owner.",
+        ),
       ),
+      gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
       script: Schema.optional(
         describe(
           TrimmedNonEmptyString,
-          "For a script's subtask: the name of the board script that does it. Left out, any script on the board can.",
+          "For a script's subtask: the name of the board script that does it. Left out on a new or edited entry, any script on the board can. An id alone keeps its stored binding; done and skipped subtasks keep theirs.",
         ),
       ),
     }),
   ),
-  `At most ${MAX_SUBTASKS} subtasks, each at most ${MAX_TEXT} characters. The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: listed ids keep their state, open ones left out go, done ones stay.`,
+  `At most ${MAX_SUBTASKS} subtasks, each at most ${MAX_TEXT} characters. The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: list existing ids to keep them (an id alone keeps it unchanged; done and skipped ones can't be rewritten), add new entries without an id; open ones left out go, done ones stay.`,
 );
 
 const LinkInput = Schema.Struct({
@@ -173,15 +181,34 @@ const tool = <
 const BoardGet = tool(
   "board_get",
   "Read the board",
-  "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500; follow board.page.nextAfter with after while hasMore. boardId defaults to the board identified by this thread; when ambiguous, pass one of the candidate board ids in the error.",
+  "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500; follow board.page.nextAfter with after while hasMore. With since, only cards active since then (an event, or an open or touched ask), one short row each: stage changes, review verdicts, run failures, stall, asks with asked/answered times; no settings, groups or unread; each page stays under 50,000 characters. boardId defaults to the board identified by this thread; when ambiguous, pass one of the candidate board ids in the error.",
   {
     boardId: BoardRef,
     after: Schema.optional(
       describe(NonNegativeInt, "Cards numbered after this cursor (default 0)."),
     ),
     limit: Schema.optional(describe(PositiveInt, "Page size, default 200, capped at 500.")),
+    since: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        "ISO time, at most 72 hours ago: only cards active since then, as short rows.",
+      ),
+    ),
   },
   { board: Record, prompts: Schema.String },
+  { readonly: true },
+);
+
+const BoardActivity = tool(
+  "board_activity",
+  "Board activity rollup",
+  "A board's activity in a window (default the last 24 hours, at most 72): every ask answered in the window with asked/answered times and minutes to answer (p50/p90/max), open asks and asks open over 6 hours, review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls and how long they lasted, run failures (stalled, retried, fresh thread, reviewer without verdict) by kind and model, threads started, restarts and evaluator wakes, cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. Card numbers only, no titles or text. Read from the cards' stored history; long lists other than the answered asks are cut and say how many more.",
+  {
+    boardId: BoardRef,
+    since: Schema.optional(describe(TrimmedNonEmptyString, "ISO start; default 24 hours before until.")),
+    until: Schema.optional(describe(TrimmedNonEmptyString, "ISO end; default now.")),
+  },
+  { activity: Record },
   { readonly: true },
 );
 
@@ -203,9 +230,30 @@ const CardSearch = tool(
 const CardGet = tool(
   "card_get",
   "Read a card",
-  "One card with its history (moves, edits, comments, review verdicts) and every thread it has had.",
-  { card: Schema.optional(CardRef), boardId: BoardRef },
-  { card: Record, events: Records, threads: Records },
+  'One card with its latest 20 events (moves, edits, comments, review verdicts), eventsTotal, a cursor for older ones (olderEvents) and every thread it has had. Pass events {before: olderEvents, limit} to page back, or "all" for every event (it can be more than your client accepts). The card itself is never trimmed; a reply stays under 60,000 characters by leaving out its oldest events.',
+  {
+    card: Schema.optional(CardRef),
+    boardId: BoardRef,
+    events: Schema.optional(
+      Schema.Union([
+        Schema.Literal("all"),
+        Schema.Struct({
+          before: Schema.optional(
+            describe(PositiveInt, "Only events older than this (olderEvents from the last read)."),
+          ),
+          limit: Schema.optional(describe(PositiveInt, "Events per page, default 20, max 200.")),
+        }),
+      ]),
+    ),
+  },
+  {
+    card: Record,
+    events: Records,
+    threads: Records,
+    eventsTotal: NonNegativeInt,
+    olderEvents: Schema.NullOr(NonNegativeInt),
+    note: Schema.optional(Schema.String),
+  },
   { readonly: true },
 );
 
@@ -227,11 +275,12 @@ const CardUpdate = tool(
 const CardMove = tool(
   "card_move",
   "Move a card",
-  "Work threads may move only their assigned cards; review threads use card_review_result. Evaluators change card fields with card_edit. Work thread: move your card to needs_review when the work is done (a reviewer starts), including from todo when you are its own work thread and no thread is attached, or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed.",
+  "Work threads may move only their assigned cards; review threads use card_review_result. Evaluators change card fields with card_edit. Work thread: move your card to needs_review when the work is done (a reviewer starts), including from todo when you are its own work thread and no thread is attached, or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed. A move clears its wait unless keepWait is true or it moves to completed/deployed with open evaluator/script subtasks; the result reports keep/clear.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
     to: KanbanStage,
+    keepWait: KanbanMoveOptions.fields.keepWait,
     note: Schema.optional(describe(Schema.String, "One line for the card history.")),
     question: Schema.optional(
       describe(Schema.String, "Required for needs_owner: what the owner must decide."),
@@ -614,13 +663,16 @@ const DiscussionPost = tool(
 const DiscussionRead = tool(
   "discussion_read",
   "Read a discussion",
-  "Messages of a discussion, newest last, with answers to polls and picks: the latest ones (after afterSeq / before beforeSeq when given), up to 200 and about 1 MB. When older ones were left out, earlierBefore is set: read again with beforeSeq. seq reads one message in full. Defaults like discussion_post.",
+  "Messages of a discussion, newest last, with answers to polls and picks: the latest ones (after afterSeq / before beforeSeq when given), up to 200 and about 1 MB, or with limit up to that many and about 50,000 characters. When older ones were left out, earlierBefore is set: read again with beforeSeq. seq reads one message in full. Defaults like discussion_post.",
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
     boardId: BoardRef,
     card: Schema.optional(CardRef),
     afterSeq: Schema.optional(NonNegativeInt),
     beforeSeq: Schema.optional(NonNegativeInt),
+    limit: Schema.optional(
+      describe(PositiveInt, "At most this many messages (max 200), within about 50,000 characters."),
+    ),
     seq: Schema.optional(describe(PositiveInt, "Read only this message, in full.")),
   },
   {
@@ -640,12 +692,14 @@ const DiscussionRead = tool(
 const WikiRead = tool(
   "wiki_read",
   "Read the board wiki",
-  "The board's shared lessons. Without slug: a list of pages (slug, title, size); pass slug or slugs to read them.",
+  "The board's shared lessons. Without slug: a list of pages (slug, title, size); pass slug or slugs to read them. With slug, section reads the first matching ATX heading (case-insensitive) and its content through the next same-or-higher heading. outline: true returns heading lines with character offsets. Headings in code fences are ignored. section and outline require slug and cannot be combined.",
   {
     slug: Schema.optional(TrimmedNonEmptyString),
     slugs: Schema.optional(
       Schema.Array(TrimmedNonEmptyString).check(Schema.isMinLength(1), Schema.isMaxLength(20)),
     ),
+    section: Schema.optional(TrimmedNonEmptyString),
+    outline: Schema.optional(Schema.Boolean),
     boardId: BoardRef,
   },
   {
@@ -796,6 +850,21 @@ const PoolSet = tool(
   { readonly: false },
 );
 
+const BoardInstructionsSet = tool(
+  "board_instructions_set",
+  "Apply approved board instructions",
+  "Evaluators: set one of a board's instructions (escalation, modelRouting, reviewerRouting) to text Abdullah approved. The ask must be closed with his approval, and one of its change/changes entries must have a label naming the board (slug or name) and the field, before equal to the board's current text and after equal to text. Text he didn't approve is refused.",
+  {
+    boardId: Schema.optional(TrimmedNonEmptyString),
+    field: Schema.Literals(["escalation", "modelRouting", "reviewerRouting"]),
+    text: Schema.String,
+    card: CardRef,
+    ask: TrimmedNonEmptyString,
+  },
+  { board: Record, applied: Schema.Boolean, reason: Schema.optional(Schema.String) },
+  { readonly: false, destructive: true },
+);
+
 const PoolRemove = tool(
   "pool_remove",
   "Remove a model pool",
@@ -852,12 +921,21 @@ const DiscussionCreate = tool(
 const WikiWrite = tool(
   "wiki_write",
   "Write a wiki page",
-  "Evaluators: create or replace a wiki page of lessons future threads should know.",
+  "Evaluators: create or replace a page with body, or change an existing page with edits (1–50). Pass exactly one of body or edits. Each oldString must appear exactly count times (default 1) in the page as left by the edits before it; all edits apply or none do. title is kept when left out (new pages default to slug). Edits return page metadata, bodyLength and edits count without the body; body writes return the full page.",
   {
     boardId: BoardRef,
     slug: TrimmedNonEmptyString,
-    title: RawBoardText,
-    body: Schema.String,
+    title: Schema.optional(RawBoardText),
+    body: Schema.optional(Schema.String),
+    edits: Schema.optional(
+      Schema.Array(
+        Schema.Struct({
+          oldString: Schema.String.check(Schema.isMinLength(1)),
+          newString: Schema.String,
+          count: Schema.optional(PositiveInt),
+        }),
+      ).check(Schema.isMinLength(1), Schema.isMaxLength(50)),
+    ),
   },
   { page: Record },
   { readonly: false },
@@ -877,18 +955,55 @@ const BoardOpen = tool(
   { readonly: false },
 );
 
+const ReportBug = tool(
+  "report_bug",
+  "Report a bug",
+  "Report a tooling bug from any thread. Pass cardHint (e.g. #722) when you already know its card (any stage until it is settled). A hint or strong title match appends a sighting without starting an evaluator; weak matches start a request evaluator, or queue it when the board's spawn limit is full. Identical evidence from this thread on the same card is deduped for 30 minutes. Search matches return up to three candidates, best first.",
+  {
+    boardId: describe(TrimmedNonEmptyString, "Destination board id or slug."),
+    title: describe(TrimmedNonEmptyString, "Short bug title to search for."),
+    evidence: describe(TrimmedNonEmptyString, "What broke, with errors, run ids or log paths."),
+    cardHint: Schema.optional(describe(TrimmedNonEmptyString, "Known card number, e.g. #722.")),
+  },
+  {
+    appendedTo: Schema.optional(TrimmedNonEmptyString),
+    deduped: Schema.optional(Schema.Boolean),
+    candidates: Schema.optional(Records),
+    threadId: Schema.optional(TrimmedNonEmptyString),
+    queued: Schema.optional(Schema.Boolean),
+    queueId: Schema.optional(Schema.Number),
+  },
+  { readonly: false },
+);
+
 const EvaluatorStart = tool(
   "evaluator_start",
   "Start an evaluator",
-  "Start an evaluator thread on a board for a job: setup or request (text required), or a sweep: stalled, completed, deployed, check (optional text is added to its brief). A board runs one sweep of each kind at a time; starting another while one runs fails and names it. To give one card or job to a new evaluator, use kind request with text. Card threads may start only kind request (for example to hand a broken tool to the Robob board); their text is stamped with their board, card and thread.",
+  "Start an evaluator thread on a board for a job: setup or request (text required), or a sweep: stalled, completed, deployed, check, nightly (optional text is added to its brief). A board runs one sweep of each kind at a time; starting another while one runs fails and names it. For requests, one matching open card with a live or recently ended evaluator receives a sighting instead of a new thread. Pass forceNew:true to skip matching; spawn caps still apply. Excess launches queue durably in board order. Card threads may start only kind request (for example to hand a broken tool to the Robob board); their text is stamped with their board, card and thread.",
   {
     boardId: BoardRef,
-    kind: Schema.Literals(["setup", "request", "stalled", "completed", "deployed", "check"]),
+    kind: Schema.Literals([
+      "setup",
+      "request",
+      "stalled",
+      "completed",
+      "deployed",
+      "check",
+      "nightly",
+    ]),
     text: Schema.optional(Schema.String),
+    forceNew: Schema.optional(Schema.Boolean),
     /** For setup: an existing discussion on this board to use as the Setup discussion. */
     discussionId: Schema.optional(TrimmedNonEmptyString),
   },
-  { threadId: TrimmedNonEmptyString },
+  {
+    threadId: Schema.optional(TrimmedNonEmptyString),
+    matched: Schema.optional(Schema.Boolean),
+    card: Schema.optional(Record),
+    sightingAppended: Schema.optional(Schema.Boolean),
+    queued: Schema.optional(Schema.Boolean),
+    queueId: Schema.optional(Schema.Number),
+  },
   { readonly: false },
 );
 
@@ -915,10 +1030,26 @@ const BoardPause = tool(
   { readonly: false },
 );
 
+const BoardNightlyReview = tool(
+  "board_nightly_review",
+  "Set nightly review",
+  "Evaluators: enable or disable this board's daily review. Defaults to midnight Asia/Dubai with Sonnet 5.5 medium. Omitted time and zone keep the saved values.",
+  {
+    boardId: BoardRef,
+    enabled: Schema.Boolean,
+    timeOfDay: Schema.optional(KanbanNightlyReviewTime),
+    timeZone: Schema.optional(KanbanNightlyReviewTimeZone),
+  },
+  { board: Record },
+  { readonly: false },
+);
+
 export const KanbanToolkit = Toolkit.make(
+  BoardNightlyReview,
   SetupDone,
   BoardPause,
   BoardGet,
+  BoardActivity,
   CardSearch,
   CardGet,
   CardUpdate,
@@ -939,6 +1070,7 @@ export const KanbanToolkit = Toolkit.make(
   SubtaskDone,
   CardThread,
   PoolSet,
+  BoardInstructionsSet,
   PoolRemove,
   GoalSet,
   GroupSet,
@@ -946,4 +1078,5 @@ export const KanbanToolkit = Toolkit.make(
   WikiWrite,
   BoardOpen,
   EvaluatorStart,
+  ReportBug,
 );

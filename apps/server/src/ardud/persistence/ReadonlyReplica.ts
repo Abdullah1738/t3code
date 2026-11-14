@@ -7,14 +7,33 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
+import * as Fiber from "effect/Fiber";
 
 import * as ServerConfig from "../../config.ts";
 import { forkParked } from "../../serverActivation.ts";
-import { createReadonlyReplica, type ReadonlyReplicaOptions } from "./readonlyExport.ts";
+import {
+  createReadonlyReplica,
+  type ReadonlyReplicaOptions,
+  type ReadonlyExportMetrics,
+} from "./readonlyExport.ts";
 
-class ReadonlyReplica extends Context.Service<
+export class ReadonlyReplicaMaintenanceError extends Schema.TaggedError<ReadonlyReplicaMaintenanceError>()(
+  "ReadonlyReplicaMaintenanceError",
+  {},
+) {
+  override get message() {
+    return "Readonly export could not be stopped for maintenance.";
+  }
+}
+
+export type ReplicaMaintenance = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+) => Effect.Effect<A, E | ReadonlyReplicaMaintenanceError, R>;
+
+export class ReadonlyReplica extends Context.Service<
   ReadonlyReplica,
-  { readonly run: Effect.Effect<void> }
+  { readonly run: Effect.Effect<void>; readonly withMaintenance: ReplicaMaintenance }
 >()("t3/ardud/persistence/ReadonlyReplica") {}
 
 export class ReadonlyExportUnavailable extends Schema.TaggedError<ReadonlyExportUnavailable>()(
@@ -29,6 +48,7 @@ export class ReadonlyExportUnavailable extends Schema.TaggedError<ReadonlyExport
 
 /** Messages the export worker posts to its supervisor. */
 type WorkerMessage =
+  | { readonly type: "metrics"; readonly metrics: ReadonlyExportMetrics }
   | { readonly type: "opened" | "step" }
   | { readonly type: "published"; readonly cycleMs?: number }
   | {
@@ -91,6 +111,7 @@ const { parentPort, workerData } = require('node:worker_threads');
 const describe = (error) => String((error && error.message) || error).slice(0, 2000);
 let replica;
 let lastBeat = 0;
+let lastMetrics = 0;
 let cycleStarted = Date.now();
 const beat = (type) => {
   const now = Date.now();
@@ -101,16 +122,22 @@ const beat = (type) => {
     lastBeat = now;
     parentPort.postMessage({ type });
   }
+  if (now - lastMetrics >= ${HEARTBEAT_MS}) {
+    lastMetrics = now;
+    const metrics = replica?.takeMetrics?.();
+    if (metrics) parentPort.postMessage({ type: 'metrics', metrics });
+  }
 };
 const fail = (stage, error) => {
   try { replica?.close(); } catch {}
+  const pendingRedaction = error && error.code === 'REDACTION_PENDING';
   const held = error && error.code === 'READONLY_REBUILD_HELD';
   parentPort.postMessage({
     type: 'failed',
-    stage: held ? 'rebuild-held' : stage,
+    stage: pendingRedaction ? 'redaction-pending' : held ? 'rebuild-held' : stage,
     error: describe(error),
     native: { errcode: error && error.errcode, errstr: error && error.errstr, code: error && error.code, sqliteFile: error && error.sqliteFile, sqliteRole: error && error.sqliteRole, sqliteOperation: error && error.sqliteOperation },
-    quiet: held && error.notify === false,
+    quiet: pendingRedaction || (held && error.notify === false),
   });
 };
 try {
@@ -120,8 +147,21 @@ try {
     try {
       const more = replica.step();
       beat(more ? 'step' : 'published');
-      if (!more) cycleStarted = Date.now() + ${idleMs};
-      setTimeout(step, more ? 10 : ${idleMs});
+      if (more) setTimeout(step, 10);
+      else {
+        const idleUntil = Date.now() + ${idleMs};
+        const idle = () => {
+          try {
+            const woke = replica.pollIdentities?.() === true;
+            beat('step');
+            if (woke || Date.now() >= idleUntil) {
+              cycleStarted = Date.now();
+              step();
+            } else setTimeout(idle, Math.min(1000, idleUntil - Date.now()));
+          } catch (error) { fail('idle', error); }
+        };
+        setTimeout(idle, Math.min(1000, ${idleMs}));
+      }
     } catch (error) {
       fail('step', error);
     }
@@ -147,6 +187,15 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
   const slowMs = Duration.toMillis(
     Duration.fromInputUnsafe(options.slowCycle ?? defaultSupervisorOptions.slowCycle!),
   );
+  let metrics: ReadonlyExportMetrics = {
+    lineageRepairCounts: {},
+    lineageRepairs: [],
+    phaseMs: {},
+    phaseSteps: {},
+    identityRows: 0,
+    identityLagMaxMs: 0,
+  };
+  let metricsLoggedAt = Number.NEGATIVE_INFINITY;
   let slowCycleMs: number | undefined;
   let slowLoggedAt = Number.NEGATIVE_INFINITY;
   const signal = (worker: ExportWorker) =>
@@ -185,6 +234,24 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
           );
         } else {
           lastBeat = clock.currentTimeMillisUnsafe();
+          if (message?.type === "metrics") {
+            for (const [cause, count] of Object.entries(message.metrics.lineageRepairCounts))
+              metrics.lineageRepairCounts[cause] =
+                (metrics.lineageRepairCounts[cause] ?? 0) + count;
+            metrics.lineageRepairs.push(...message.metrics.lineageRepairs);
+            for (const [phase, ms] of Object.entries(message.metrics.phaseMs))
+              metrics.phaseMs[phase] = (metrics.phaseMs[phase] ?? 0) + ms;
+            for (const [phase, steps] of Object.entries(message.metrics.phaseSteps))
+              metrics.phaseSteps[phase] = (metrics.phaseSteps[phase] ?? 0) + steps;
+            metrics = {
+              ...metrics,
+              identityRows: metrics.identityRows + message.metrics.identityRows,
+              identityLagMaxMs: Math.max(
+                metrics.identityLagMaxMs,
+                message.metrics.identityLagMaxMs,
+              ),
+            };
+          }
           if (message?.type === "published" && (message.cycleMs ?? 0) > slowMs)
             slowCycleMs = Math.max(slowCycleMs ?? 0, message.cycleMs!);
         }
@@ -214,6 +281,11 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
     while (true) {
       yield* Effect.sleep(Duration.millis(Math.max(10, Math.min(stallMs / 4, 30_000))));
       const now = clock.currentTimeMillisUnsafe();
+      for (const bump of metrics.lineageRepairs.splice(0))
+        yield* Effect.logInfo("Readonly lineage repair revision bumped").pipe(
+          Effect.annotateLogs({ ...bump }),
+          Effect.withSpan("ardud.readonlyExport.lineageRepair"),
+        );
       if (slowCycleMs !== undefined && now - slowLoggedAt >= SLOW_CYCLE_LOG_INTERVAL_MS) {
         // Its own span: the worker span stays open while the worker is healthy.
         yield* Effect.logWarning(
@@ -224,6 +296,30 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
         );
         slowLoggedAt = now;
         slowCycleMs = undefined;
+      }
+      if (Object.keys(metrics.phaseSteps).length && now - metricsLoggedAt >= 60_000) {
+        yield* Effect.logInfo("Readonly export phase timings").pipe(
+          Effect.annotateLogs({
+            phaseMs: metrics.phaseMs,
+            phaseSteps: metrics.phaseSteps,
+            lineageRepairCounts: metrics.lineageRepairCounts,
+          }),
+          Effect.withSpan("ardud.readonlyExport.cyclePhases"),
+        );
+        if (metrics.identityRows)
+          yield* Effect.logInfo("Readonly identity publication lag").pipe(
+            Effect.annotateLogs({ rows: metrics.identityRows, maxLagMs: metrics.identityLagMaxMs }),
+            Effect.withSpan("ardud.readonlyExport.identityPublishLag"),
+          );
+        metrics = {
+          lineageRepairCounts: {},
+          lineageRepairs: [],
+          phaseMs: {},
+          phaseSteps: {},
+          identityRows: 0,
+          identityLagMaxMs: 0,
+        };
+        metricsLoggedAt = now;
       }
       const silent = now - lastBeat;
       if (silent > stallMs) {
@@ -262,7 +358,7 @@ export const superviseReadonlyExport = (
     superviseExportWorker(spawn, options).pipe(
       Effect.catch((error) => {
         const message = `Readonly export unavailable (${error.stage}): ${error.reason}; restarting the export worker`;
-        const held = error.stage === "rebuild-held";
+        const held = error.stage === "rebuild-held" || error.stage === "redaction-pending";
         return (error.quiet ? Effect.logDebug(message) : Effect.logWarning(message)).pipe(
           Effect.annotateLogs({ stage: error.stage, reason: error.reason }),
           Effect.as(
@@ -279,6 +375,52 @@ export const superviseReadonlyExport = (
     ),
   );
 
+export const makeCoordinatedReplica = Effect.fn("ReadonlyReplica.makeCoordinated")(function* (
+  spawn: () => ExportWorker,
+  options: SupervisorOptions = defaultSupervisorOptions,
+) {
+  const gate = yield* Semaphore.make(1);
+  const workers = new Set<ExportWorker>();
+  let active: Fiber.Fiber<never, never> | undefined;
+  const trackedSpawn = () => {
+    const worker = spawn();
+    workers.add(worker);
+    worker.on("exit", () => workers.delete(worker));
+    return worker;
+  };
+  const run = Effect.forever(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fiber = yield* gate.withPermit(
+          Effect.gen(function* () {
+            const next = yield* Effect.forkScoped(superviseReadonlyExport(trackedSpawn, options), {
+              startImmediately: true,
+            });
+            active = next;
+            return next;
+          }),
+        );
+        yield* Fiber.await(fiber);
+      }),
+    ),
+  );
+  const withMaintenance: ReplicaMaintenance = (effect) =>
+    gate.withPermit(
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          if (active) {
+            yield* Fiber.interrupt(active);
+            active = undefined;
+          }
+          // A timed-out termination is not permission to mutate beneath that worker.
+          if (workers.size) return yield* new ReadonlyReplicaMaintenanceError({});
+          return yield* restore(effect);
+        }),
+      ),
+    );
+  return ReadonlyReplica.of({ run, withMaintenance });
+});
+
 const make = Effect.gen(function* () {
   const config = yield* ServerConfig.ServerConfig;
   const path = yield* Path.Path;
@@ -291,7 +433,7 @@ const make = Effect.gen(function* () {
     archivePath: path.join(path.dirname(config.dbPath), "archive.sqlite"),
   };
   const source = exportWorkerSource(createReadonlyReplica.toString());
-  const run = superviseReadonlyExport(
+  return yield* makeCoordinatedReplica(
     () =>
       new NodeWorkerThreads.Worker(source, {
         eval: true,
@@ -299,12 +441,13 @@ const make = Effect.gen(function* () {
         workerData: options,
       }) as unknown as ExportWorker,
   );
-  return ReadonlyReplica.of({ run });
 });
+
+export const serviceLayer = Layer.effect(ReadonlyReplica, make);
 
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const replica = yield* ReadonlyReplica;
     yield* forkParked(replica.run);
   }),
-).pipe(Layer.provide(Layer.effect(ReadonlyReplica, make)));
+).pipe(Layer.provideMerge(serviceLayer));

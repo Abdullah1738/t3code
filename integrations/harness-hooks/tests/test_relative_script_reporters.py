@@ -31,11 +31,11 @@ class RelativeScriptReporterTests(unittest.TestCase):
         # Only source inspection matters here; do not contact identity services
         # or let the unrelated compute policy reject historical test commands.
         for mock in (
+            patch.dict(os.environ, isolated_source_cases.fixture_environment()),
             patch.object(engine, '_native', return_value=(None, None, None)),
             patch.object(engine, '_offbox_mode', return_value='off'),
-            patch.object(engine, 'decide_coord', return_value={'decision':'allow', 'reason':'', 'context':{'rule':'no-policy'}}),
             patch.object(engine, '_log'),
-            patch.dict(os.environ, {name:'' for name in (engine.COMMAND_IDENTITY_ENV, 'AGENT_GUARD_APPROVED', 'HARNESS_COORD_APPROVED')}),
+            patch.dict(os.environ, {name:'' for name in (engine.COMMAND_IDENTITY_ENV,)}),
         ):
             mock.start()
             self.addCleanup(mock.stop)
@@ -134,6 +134,47 @@ class RelativeScriptReporterTests(unittest.TestCase):
                     with self.subTest(case=label, path=search_path, harness=harness, tool=tool), patch.dict(os.environ, {'PATH':search_path}):
                         self.check(self.event(command, tool), expected, harness)
 
+    def test_backup_command_shapes_and_edited_copies_through_hooks(self):
+        source = ROOT.parents[1] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        commands, variants = isolated_source_cases.backup_cases(self.root, source.read_text())
+        self.write('sibling.sh', 'cat ~/.t3/userdata/statev2.sqlite')
+        for variant, body, expected in variants:
+            self.write('integrations/memory-system/tests/test_backup_replica.sh', body)
+            for shape, command, cwd in commands:
+                for harness, tool in [('claude', 'Bash'), ('codex', 'Bash'), ('codex', 'exec_command')]:
+                    with self.subTest(variant=variant, shape=shape, harness=harness, tool=tool):
+                        event = self.event(command, tool)
+                        event['tool_input']['workdir'] = str(cwd)
+                        self.check(event, expected, harness)
+
+    def test_fixture_and_migration_review_corpus_through_hooks(self):
+        backup = ROOT.parents[1] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        migrate = ROOT.parents[1] / 'apps/server/scripts/migrate-dev-db.ts'
+        rows = [('tmp/fixture.sh', 'bash tmp/fixture.sh', row) for row in isolated_source_cases.setup_control_cases(backup.read_text())]
+        rows += [('apps/server/scripts/migrate-dev-db.ts', 'node apps/server/scripts/migrate-dev-db.ts --source /tmp/copy.sqlite --base-dir /tmp/dev-home', row) for row in isolated_source_cases.migration_mutations(migrate.read_text())]
+        for path, command, (label, body, expected) in rows:
+            self.write(path, body)
+            prefixes = ('', 'offbox run -- ', 'offbox run --remote --no-fallback -- ') if label.startswith('sqlite-input-') else ('',)
+            for prefix in prefixes:
+                for harness, tool in [('claude', 'Bash'), ('codex', 'Bash'), ('codex', 'exec_command')]:
+                    with self.subTest(case=label, prefix=prefix, harness=harness, tool=tool):
+                        self.check(self.event(prefix + command, tool), expected, harness)
+        self.write('tmp/fixture.sh', backup.read_text())
+        for destination in (LIVE, '~/.t3/userdata/statev2.sqlite', '$HOME/.robob/userdata/statev2.sqlite'):
+            for harness, tool in [('claude', 'Bash'), ('codex', 'Bash'), ('codex', 'exec_command')]:
+                with self.subTest(destination=destination, harness=harness, tool=tool):
+                    self.check(self.event('bash tmp/fixture.sh > ' + destination + ' 2>&1', tool), 'live-database-script', harness)
+
+    def test_fixture_startup_environment_through_hooks(self):
+        backup = ROOT.parents[1] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        self.write('tmp/fixture.sh', backup.read_text())
+        for name in ('BASH_ENV', 'ENV', 'BASHOPTS', 'SHELLOPTS', 'PYTHONPATH', 'PYTHONHOME', 'PYTHONWARNINGS', 'LD_PRELOAD', 'DYLD_INSERT_LIBRARIES'):
+            for harness, tool in [('claude', 'Bash'), ('codex', 'Bash'), ('codex', 'exec_command')]:
+                with self.subTest(startup=name, harness=harness, tool=tool):
+                    self.check(self.event(name + '=/tmp/unproved-helper bash tmp/fixture.sh', tool), 'live-database-script', harness)
+                    with patch.dict(os.environ, {name: '/tmp/unproved-helper'}):
+                        self.check(self.event('bash tmp/fixture.sh', tool), 'live-database-script', harness)
+
     def test_exact_3464_code_mode_call(self):
         fixture = json.loads((FIXTURES / '3464.json').read_text())
         calls = code_mode_fixture.commands(fixture['payload']['input'], fixture['session_cwd'])
@@ -162,12 +203,10 @@ class RelativeScriptReporterTests(unittest.TestCase):
         cases = json.loads((FIXTURES / 'reporters.json').read_text())
         cases += json.loads((FIXTURES / 'added-reporters.json').read_text())
         unresolved = {
-            # These later calls use variables; #841 owns their resolution.
-            'toolu_01HSF5SDthxAE7CbBKJtcbqA': '$SCRIPT_DIR/write_card.py',
+            # Dynamic paths without a matching source proof stay unresolved.
             'toolu_01LPn1qyRFv4j2FU9XM3ojgT': '$D/scripts/lib/registry-rtl-consumers.mjs',
             'toolu_01Xp2QFFAsiQnUd25VKtmmyT': '$D/scripts/lib/registry-rtl-consumers.mjs',
             'toolu_01EJVS24gL3YVQkyaDpezY74': '$f',
-            'toolu_01BcVNBuxA9GW9DqcBXTJHEj': 'scripts/$t.mjs',
         }
         seen = set()
         # Replaying old commands must not read checkouts that still happen to

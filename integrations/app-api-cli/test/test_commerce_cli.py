@@ -350,7 +350,7 @@ class MinutesOrderTests(unittest.TestCase):
             self.assertEqual(c.cvv_from_keychain(),b'007')
         command=run.call_args.args[0]
         self.assertEqual(command,['security','find-generic-password','-s','robob-card',
-                                   '-a','Marriott.card_cvc','-w'])
+                                   '-a',c.order_card.CVV_ACCOUNT,'-w'])
         # stdout/stderr are captured pipes; the CVV never becomes an argument.
         self.assertTrue(run.call_args.kwargs['stdout'] is not None)
         for bad in (Mock(returncode=1,stdout=b''),Mock(returncode=0,stdout=b'12x\n'),
@@ -598,7 +598,6 @@ class MinutesOrderTests(unittest.TestCase):
         complete.assert_called_once_with('f')
 
 
-if __name__=='__main__':unittest.main()
 
 
 class OrderChatTests(unittest.TestCase):
@@ -662,3 +661,23 @@ class OrderChatTests(unittest.TestCase):
     def test_owner_order_without_chat_leaves_env_unset(self):
         code,seen,_=self.run_lane(['order','minutes','--sku','SKU1','--for','owner'])
         self.assertEqual((code,seen['chat']),(0,None))
+
+# Metadata checks run even when a transport is stubbed.
+_journal_temp = tempfile.TemporaryDirectory()
+_journal_patch = patch.object(c.journal, 'ROOT', Path(_journal_temp.name).resolve()/'commerce')
+_original_setup = globals().get('setUpModule', lambda: None)
+_original_teardown = globals().get('tearDownModule', lambda: None)
+def setUpModule():
+    _journal_patch.start()
+    _original_setup()
+    import order_card, card_status
+    if order_card.LAST4=='2342':
+        card_status.record_declined('9546',reason='synthetic issuer decline',source='test')
+def tearDownModule():
+    _original_teardown()
+    _journal_patch.stop()
+    _journal_temp.cleanup()
+
+
+if __name__ == '__main__':
+    unittest.main()

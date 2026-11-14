@@ -1,9 +1,10 @@
-import { IMESSAGE_ORIGIN, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
+import { toolError } from "./toollog.ts";
+import { IMESSAGE_ORIGIN, isCompletionNoticeText, subagentNoticeState, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery, type SteerGuard } from "./openchamber.ts";
 import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
   type ControlConfigOptions, type ControlMessage, type RunSummary, type ThreadDetail, type ThreadSummary,
 } from "./control.ts";
-import { nativeMessageId, opencodeFinishes, opencodeRunEvidence, type RunEvidence, type StepFinishes } from "./opencode-steps.ts";
+import { nativeMessageId, opencodeCompletedSteps, opencodeFinishes, opencodeRunEvidence, type CompletedSteps, type RunEvidence, type StepFinishes } from "./opencode-steps.ts";
 import { controlModelFields, imessagePreferences, type PreferredModel } from "./preferred-model.ts";
 import type { Store } from "./store.ts";
 
@@ -42,7 +43,7 @@ export const sentMessagePrefix = (threadId: string) => `ardud-control:send:${thr
 function promptId(threadId: string, message: ControlMessage): string {
   const prefix = sentMessagePrefix(threadId);
   if (!message.messageId.startsWith(prefix)) return message.messageId;
-  try { return decodeURIComponent(message.messageId.slice(prefix.length)); } catch { return message.messageId; }
+  try { return decodeURIComponent(message.messageId.slice(prefix.length)); } catch (caughtError) { toolError("robob", "robob.catch1", caughtError); return message.messageId; }
 }
 
 /** The router's prompt ids (`msg_` plus a sha256), which it sends as `clientRequestId`. */
@@ -53,8 +54,8 @@ const runOrdinal = (runId: string) => Number(/:ordinal:(\d+)$/.exec(runId)?.[1] 
  * Rebuilds OpenCode-2-style session records from Robob runs and messages, the
  * shape the router reads turns from: each run's user prompt, its assistant
  * steps, then an `idle` marker once the run has settled. User messages the
- * agent or server sent to itself (background completion wakes) are left out:
- * to the router a user record means the owner wrote something. The bridge's
+ * agent or server sent to itself are left out, except completion and native progress notices:
+ * the router needs their boundaries when a completion races a sealed wake. The bridge's
  * own prompts stay in even when Robob did not record them as the owner's (a
  * relay it could not verify is attributed to the bridge, not to him).
  */
@@ -70,7 +71,7 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
   const latest = [...runs.values()].sort((a, b) => b.ordinal - a.ordinal)[0]?.runId;
   const records: MessageRecord[] = [];
   for (const [runId, group] of [...byRun].sort((a, b) => ordinal(a[0]) - ordinal(b[0]))) {
-    group.sort((a, b) => epoch(a.createdAt) - epoch(b.createdAt) || a.messageId.localeCompare(b.messageId));
+    group.sort((a, b) => epoch(a.createdAt) - epoch(b.createdAt) || a.messageId.localeCompare(b.messageId, undefined, { numeric: true }));
     const run = runs.get(runId);
     const settled = run !== undefined && TERMINAL.has(run.status);
     let last: Extract<MessageRecord, { type: "assistant" }> | undefined;
@@ -79,8 +80,10 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
       if (message.role === "user") {
         const id = promptId(thread.threadId, message);
         const bridgeSent = id !== message.messageId && BRIDGE_PROMPT.test(id);
-        if (message.createdBy !== undefined && message.createdBy !== "user" && !bridgeSent) continue;
-        records.push({ id, type: "user", text: withoutGuidance(message.text), time: { created } });
+        const notice = isCompletionNoticeText(message.text) || subagentNoticeState(message.text) !== undefined;
+        if (message.createdBy !== undefined && message.createdBy !== "user" && !bridgeSent && !notice) continue;
+        records.push({ id, type: "user", text: withoutGuidance(message.text), time: { created },
+          ...(notice && message.createdBy !== undefined ? { createdBy: message.createdBy } : {}) });
         continue;
       }
       const done = settled || !message.streaming;
@@ -135,6 +138,8 @@ export interface RobobBackendOptions extends ControlConfigOptions {
   title?: string;
   /** How each assistant step ended, read from OpenCode (see opencode-steps.ts). */
   finishes?: StepFinishes;
+  /** Completed native blocks for interrupted OpenCode replies. */
+  completedSteps?: CompletedSteps;
   /** Whether a native run called tools (see opencode-steps.ts opencodeRunEvidence). */
   runEvidence?: RunEvidence;
   /**
@@ -154,6 +159,7 @@ export class RobobBackend implements ChatBackend {
   private readonly directories: ThreadDirectories;
   private readonly native = new Map<string, string>();
   private readonly finishes: StepFinishes;
+  private readonly completedSteps: CompletedSteps;
   private readonly runEvidence: RunEvidence;
   /** A step's finish never changes once written, so each is looked up once. */
   private readonly finished = new Map<string, string>();
@@ -189,6 +195,7 @@ export class RobobBackend implements ChatBackend {
     this.client = options.client ?? new ControlClient(options);
     this.directories = new ThreadDirectories(this.client);
     this.finishes = options.finishes ?? opencodeFinishes();
+    this.completedSteps = options.completedSteps ?? opencodeCompletedSteps();
     this.runEvidence = options.runEvidence ?? opencodeRunEvidence();
   }
 
@@ -218,7 +225,7 @@ export class RobobBackend implements ChatBackend {
       const fromRobob = (await this.client.runEvidence(threadId, run.runId)).toolEvidence;
       if (fromRobob !== "unknown" || !this.isOpenCodeThread(thread) || !thread.nativeSessionId) return fromRobob;
       return this.runEvidence(thread.nativeSessionId, sinceMs);
-    } catch {
+    } catch (caughtError) { toolError("robob", "robob.catch2", caughtError);
       return "unknown";
     }
   }
@@ -247,7 +254,7 @@ export class RobobBackend implements ChatBackend {
     const now = new Date();
     const date = [now.getFullYear(), String(now.getMonth() + 1).padStart(2, "0"), String(now.getDate()).padStart(2, "0")].join("-");
     const directory = `${this.chatFolder()}/${date}/session-${crypto.randomUUID()}`;
-    const model = await (this.options.model ?? (async () => (await imessagePreferences()).model))().catch(() => undefined);
+    const model = await (this.options.model ?? (async () => (await imessagePreferences()).model))().catch((caughtError) => { toolError("robob", "robob.catch3", caughtError); return undefined; });
     const created = await this.client.request<{ threadId: string; directory: string | null }>("POST", "/threads", {
       directory, origin: IMESSAGE_ORIGIN, runtimeMode: "full-access",
       title: title ?? this.options.title ?? `iMessage ${date} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`,
@@ -302,16 +309,16 @@ export class RobobBackend implements ChatBackend {
         this.firstTurns.delete(id);
         this.saveFirstTurns();
       }
-    } catch { /* The durable payload is attempted on the next read. */ }
+    } catch (caughtError) { toolError("robob", "robob.catch4", caughtError); /* The durable payload is attempted on the next read. */ }
     finally { this.checkingFirstTurns.delete(id); }
   }
 
   /** Backend for one non-owner Sendblue chat: same server and client, its own folder and thread title. */
   forChat(subdir: string, title: string): RobobBackend {
-    return new RobobBackend({ ...this.options, client: this.client, finishes: this.finishes, subdir, title });
+    return new RobobBackend({ ...this.options, client: this.client, finishes: this.finishes, completedSteps: this.completedSteps, subdir, title });
   }
 
-  private chatFolder(): string {
+  chatFolder(): string {
     return this.options.subdir ? `${this.chatRoot}/${this.options.subdir}` : this.chatRoot;
   }
 
@@ -325,7 +332,7 @@ export class RobobBackend implements ChatBackend {
     let thread: ThreadDetail;
     try {
       thread = await this.detail(id);
-    } catch (error) {
+    } catch (error) { toolError("robob", "robob.catch5", error);
       // An unimported `ses_` id is not missing yet; only a known thread id can be.
       if (error instanceof ControlError && error.status === 404 && !id.startsWith("ses_")) return "missing";
       throw error;
@@ -347,7 +354,7 @@ export class RobobBackend implements ChatBackend {
         const result = await this.client.request<{ thread?: { settled?: boolean } } | undefined>("PATCH", `/threads/${encodeURIComponent(thread.threadId)}`, { settled: true });
         // An older server ignores the field and answers 200, so only count what it reports as settled.
         if (result?.thread?.settled === true) settled += 1;
-      } catch {
+      } catch (caughtError) { toolError("robob", "robob.catch6", caughtError);
         // A thread that started a run in the meantime refuses to settle; leave it.
       }
     }
@@ -367,9 +374,10 @@ export class RobobBackend implements ChatBackend {
     return this.record(id, await this.detail(id));
   }
 
-  async children(id: string, _directory?: string): Promise<SessionRecord[]> {
+  async children(id: string, _directory?: string, complete = false): Promise<SessionRecord[]> {
     const threadId = await this.resolve(id);
-    const { threads } = await this.client.listThreads({ parentThreadId: threadId, includeSubagents: true, limit: 500 });
+    const { total, threads } = await this.client.listThreads({ parentThreadId: threadId, includeSubagents: true, limit: 500 });
+    if (complete && total > threads.length) throw new Error("Incomplete child discovery");
     return Promise.all(threads.filter(thread => thread.parentThreadId === threadId).map(thread => this.record(thread.threadId, thread, id)));
   }
 
@@ -391,7 +399,7 @@ export class RobobBackend implements ChatBackend {
     // Evidence is fetched for the runs on this page only, never the whole history.
     await this.markRunEvidence(thread, page);
     // OpenCode's own step rows are a fallback for OpenCode threads only; every other driver is judged by Robob.
-    return this.isOpenCodeThread(thread) ? this.markAnswers(page) : page;
+    return this.isOpenCodeThread(thread) ? this.markInterrupted(this.markAnswers(page)) : page;
   }
 
   /** The detail keeps five runs, not five outcomes. Read missing page outcomes before forwarding any partial text. */
@@ -459,15 +467,19 @@ export class RobobBackend implements ChatBackend {
     // One route read per run on this page, so each run's steps get only that run's evidence.
     const runIds = [...new Set(records.flatMap(record => record.type === "assistant" && record.runId ? [record.runId] : []))];
     const byRun = new Map<string, "ran" | "none" | "unknown">();
+    const completed = new Set<string>();
     for (const runId of runIds) {
       const key = `${thread.threadId}\u0000${runId}`;
       const proven = this.settledEvidence.get(key);
-      if (proven !== undefined) {
+      const interrupted = (thread.recentRuns.find(run => run.runId === runId) ?? (thread.run?.runId === runId ? thread.run : undefined))?.status === "interrupted";
+      if (proven !== undefined && !interrupted) {
         byRun.set(runId, proven);
         continue;
       }
       try {
-        const evidence = (await this.client.runEvidence(thread.threadId, runId)).toolEvidence;
+        const proof = await this.client.runEvidence(thread.threadId, runId);
+        const evidence = proof.toolEvidence;
+        if (proof.complete && proof.status === "interrupted") completed.add(runId);
         byRun.set(runId, evidence);
         const run = thread.recentRuns.find(candidate => candidate.runId === runId) ?? (thread.run?.runId === runId ? thread.run : undefined);
         // Only a settled run's proof is final. A running run may still call tools, so it is never cached.
@@ -476,7 +488,7 @@ export class RobobBackend implements ChatBackend {
           if (this.settledEvidence.size > 5_000) this.settledEvidence.clear();
           this.settledEvidence.set(key, evidence);
         }
-      } catch {
+      } catch (caughtError) { toolError("robob", "robob.catch7", caughtError);
         byRun.set(runId, "unknown");
       }
     }
@@ -492,7 +504,55 @@ export class RobobBackend implements ChatBackend {
       if (record.type !== "assistant") continue;
       const evidence = record.runId ? byRun.get(record.runId) : undefined;
       if (evidence !== undefined) record.toolEvidence = evidence;
+      // Only completed provider streams prove an interrupted answer finished; restart recovery also closes partial messages.
+      if (record.runId && completed.has(record.runId) && record.answer === true && !record.error) {
+        record.finish = "stop";
+        record.interruptReplyComplete = true;
+      }
     }
+  }
+
+  private markInterrupted(page: MessageRecord[]): MessageRecord[] {
+    // Robob also marks interrupted streams completed. Match every native text
+    // block against a finished step before treating that projection as a reply.
+    const interrupted: Extract<MessageRecord, { type: "assistant" }>[] = [];
+    let run: Extract<MessageRecord, { type: "assistant" }>[] = [];
+    for (const record of page) {
+      if (record.type === "user") run = [];
+      else if (record.type === "assistant") run.push(record);
+      else if (record.type === "idle") {
+        if (record.outcome === "interrupted") interrupted.push(...run.filter(step => step.interruptReplyComplete !== true));
+        run = [];
+      }
+    }
+    const completed = this.completedSteps(interrupted.map(step => step.id));
+    const groups = new Map<string, Extract<MessageRecord, { type: "assistant" }>[]>();
+    for (const step of interrupted) {
+      const native = nativeMessageId(step.id);
+      if (native) groups.set(native, [...groups.get(native) ?? [], step]);
+      else step.interruptReplyComplete = false;
+    }
+    for (const [native, group] of groups) {
+      const expected = completed.get(native);
+      const actual = new Map<number, string>();
+      let valid = expected !== undefined;
+      for (const step of group) {
+        let suffix = "";
+        try { suffix = decodeURIComponent(step.id.slice("message:provider:opencode:native-item:".length)); } catch { valid = false; }
+        const match = /^msg_[A-Za-z0-9]+:text:(\d+)$/.exec(suffix);
+        const part = match ? Number(match[1]) : -1;
+        if (!Number.isSafeInteger(part) || part < 0 || actual.has(part)) valid = false;
+        else actual.set(part, step.content.map(p => p.type === "text" ? p.text : "").join(""));
+      }
+      // Empty native blocks do not produce a Robob projection.
+      if (expected && (actual.size !== expected.filter(Boolean).length
+        || expected.some((text, i) => text ? actual.get(i) !== text : actual.has(i)))) valid = false;
+      for (const step of group) {
+        step.interruptReplyComplete = valid;
+        if (valid) step.finish = "stop";
+      }
+    }
+    return page;
   }
 
   /**
@@ -568,14 +628,23 @@ export class RobobBackend implements ChatBackend {
    * `mode: "steer"` never queues: with no steerable run Robob answers 409 and
    * dispatches nothing. A retried POST replays under the same `clientRequestId`.
    */
-  async steer(id: string, _directory: string, messageId: string, text: string, guidance = ""): Promise<SteerDelivery> {
+  async steer(id: string, _directory: string, messageId: string, text: string, guidance = "", files: readonly FilePart[] = [], guard?: SteerGuard): Promise<SteerDelivery> {
+    if (guard?.signal.aborted) return "refused";
     const threadId = await this.resolve(id);
+    const attachments = [];
+    for (const [index, file] of files.entries()) {
+      if (guard?.signal.aborted) return "refused";
+      const { mimeType, bytes } = dataUrl(file.url);
+      attachments.push(await this.client.upload({ name: file.filename ?? `attachment-${index + 1}`, mimeType: file.mime || mimeType, bytes }, guard?.signal));
+    }
+    if (guard && (guard.signal.aborted || !await guard.beforeSend() || guard.signal.aborted)) return "refused";
     try {
       const { delivery } = await this.client.request<{ delivery?: string }>("POST", `/threads/${encodeURIComponent(threadId)}/send`, {
         text, mode: "steer", clientRequestId: messageId, ...(guidance.trim() ? { guidance: guidance.trim() } : {}),
-      }, { timeoutMs: 60_000 });
+        ...(attachments.length ? { attachments } : {}),
+      }, { timeoutMs: 60_000, signal: guard?.signal });
       return delivery === "started" || delivery === "queued" ? delivery : "steered";
-    } catch (error) {
+    } catch (error) { toolError("robob", "robob.catch8", error);
       if (error instanceof ControlError && error.status === 409) return "refused";
       throw error;
     }
@@ -588,8 +657,9 @@ export class RobobBackend implements ChatBackend {
   }
 
   /** Busy threads, keyed by thread id and, for imported threads, by their `ses_` id too. */
-  async statuses(): Promise<Record<string, SessionStatus>> {
-    const { threads } = await this.client.listThreads({ active: true, includeSubagents: true, limit: 500 });
+  async statuses(complete = false): Promise<Record<string, SessionStatus>> {
+    const { total, threads } = await this.client.listThreads({ active: true, includeSubagents: true, limit: 500 });
+    if (complete && total > threads.length) throw new Error("Incomplete active family discovery");
     const alias = new Map([...this.native].map(([session, threadId]) => [threadId, session]));
     const statuses: Record<string, SessionStatus> = {};
     for (const thread of threads) {
@@ -650,7 +720,7 @@ export class RobobBackend implements ChatBackend {
 
   /** Robob threads in full-access mode never ask; subagents inherit the mode. Undefined when unknown. */
   async isSessionAutoAccepting(sessionId: string, _directory?: string): Promise<boolean | undefined> {
-    try { return (await this.detail(sessionId)).runtimeMode === "full-access"; } catch { return undefined; }
+    try { return (await this.detail(sessionId)).runtimeMode === "full-access"; } catch (caughtError) { toolError("robob", "robob.catch9", caughtError); return undefined; }
   }
 }
 
@@ -665,7 +735,7 @@ export async function retireUnresolvedRoute(store: Store, backend: Pick<RobobBac
   try {
     await backend.resolve(route.id);
     return false;
-  } catch (error) {
+  } catch (error) { toolError("robob", "robob.catch10", error);
     if (!(error instanceof ControlError) || error.status !== 404) return false;
   }
   store.db.transaction(() => {

@@ -1,3 +1,4 @@
+from owner_go_support import approve_test_flows
 """Synthetic fixtures + captured-contract bodies; never live requests."""
 import copy
 from decimal import Decimal
@@ -11,6 +12,7 @@ from unittest.mock import patch
 import commerce_journal as j
 import commerce_nownow_order as c
 import noon_nownow_checkout as native
+import order_card
 from noon_auth_lifecycle import AuthSnapshot
 from noon_checkout import fingerprint
 
@@ -23,6 +25,11 @@ STORE = 'SPNNYSAKBB'
 PRODUCT = 'P4372707388695472A'
 SYNTHETIC_ORDER = 'NNGAANNTEST01'
 SYNTHETIC_TOKEN = '9876543210'
+
+
+def card_mask():
+    prefix = '4' if order_card.NETWORK == 'visa' else '5'
+    return prefix + 'xxxxxxxxxxx' + order_card.LAST4
 
 
 class FakeAuth:
@@ -54,7 +61,7 @@ def nn_state(*, session='S-SESSION-1', store=STORE, product=PRODUCT, qty=1.0,
 
     return {'data': {'checkoutSessionCode': session, 'channelCode': 'noon',
                      'paymentMethodCode': 'prepaid' if payment else None,
-                     'creditCardMask': '52287301xxxx2342' if payment else None,
+                     'creditCardMask': card_mask() if payment else None,
                      'hasPaymentSubscription': payment, 'addressCode': address,
                      'addressVersion': 1, 'storeCode': store,
                      'storeInfo': {'storeCode': store, 'nameEn': 'Spinneys'},
@@ -84,7 +91,7 @@ def place_state(order=SYNTHETIC_ORDER):
         'customerStatusCode': 'placed', 'orderSubtotal': 20.5, 'orderDeliveryFee': 6.45,
         'orderServiceFee': 4.5, 'orderTotal': 31.45, 'orderPaymentAmount': 31.45,
         'orderWalletAmount': 0.0, 'paymentMethodCode': 'prepaid',
-        'creditCardMask': '52287301xxxx2342',
+        'creditCardMask': card_mask(),
         'prepaidPaymentMisc': {'isCvvRequired': False, 'prepaidPaymentMethodCode': 'cc_noonpay'},
         'products': [{'productCode': PRODUCT, 'qty': 1.0}]}}}
 
@@ -117,8 +124,8 @@ def happy_responses(**overrides):
     responses = {
         'home': {'data': {'active': []}},
         'carts_recent': {'data': {'carts': []}},
-        'payment_cards': {'data': [{'id': int(SYNTHETIC_TOKEN), 'ccMasked': '52287301xxxx2342',
-                                    'ccType': 'MASTERCARD', 'isDefault': True,
+        'payment_cards': {'data': [{'id': int(SYNTHETIC_TOKEN), 'ccMasked': card_mask(),
+                                    'ccType': order_card.NETWORK.upper(), 'isDefault': True,
                                     'isDeleted': False}]},
         'payment_subscription_list': {'data': [{'paymentToken': SYNTHETIC_TOKEN},
                                                {'paymentToken': 'uuid-shaped-token'}]},
@@ -146,6 +153,7 @@ def make_flow(responses, **kwargs):
 
 class FixtureTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         for module in (j, c.receipts):
@@ -186,9 +194,10 @@ class CapturedContractTests(unittest.TestCase):
             flow._guard_state(row)
 
     def test_edit_payment_body_matches_capture(self):
-        card = native.SavedCard(SYNTHETIC_TOKEN, '52287301xxxx2342', 'MASTERCARD')
+        card = native.SavedCard(SYNTHETIC_TOKEN, card_mask(), order_card.NETWORK.upper())
         body = native.payment_payload(FIXTURE['edit_payment_req']['sessionCode'], card)
-        expected = dict(FIXTURE['edit_payment_req'], paymentToken=SYNTHETIC_TOKEN)
+        expected = dict(FIXTURE['edit_payment_req'], paymentToken=SYNTHETIC_TOKEN,
+                        creditCardMask=card_mask())
         self.assertEqual(body, expected)
 
     def test_place_body_binds_session_total(self):
@@ -264,18 +273,47 @@ class GuardTests(FixtureTests):
         self.assertFalse(c.corroborate_token(flow.client, flow.card))
 
     def test_ambiguous_saved_card_refused(self):
-        cards = {'data': [{'id': 1111111111, 'ccMasked': '52287301xxxx2342',
-                           'ccType': 'MASTERCARD', 'isDefault': True, 'isDeleted': False},
-                          {'id': 2222222222, 'ccMasked': '111122xxxxxx2342',
-                           'ccType': 'MASTERCARD', 'isDefault': False, 'isDeleted': False}]}
+        cards = {'data': [{'id': 1111111111, 'ccMasked': card_mask(),
+                           'ccType': order_card.NETWORK.upper(), 'isDefault': True, 'isDeleted': False},
+                          {'id': 2222222222, 'ccMasked': card_mask(),
+                           'ccType': order_card.NETWORK.upper(), 'isDefault': False, 'isDeleted': False}]}
         flow, _ = make_flow(happy_responses(payment_cards=cards))
         with self.assertRaisesRegex(j.JournalError, 'SAVED_CARD_NOT_UNIQUE'):
             flow.guard()
 
+    def test_default_card_ignores_wrong_network_and_marriott(self):
+        with patch.object(order_card, 'LAST4', '9546'), patch.object(order_card, 'NETWORK', 'visa'):
+            selected = happy_responses()['payment_cards']['data'][0]
+            rejected = [
+                dict(selected, id=1111111111, ccType='MASTERCARD'),
+                dict(selected, id=2222222222, ccMasked='5xxxxxxxxxxx2342', ccType='MASTERCARD'),
+            ]
+            for row in rejected:
+                with self.subTest(row=row):
+                    flow, _ = make_flow(happy_responses(payment_cards={'data': [row, selected]}))
+                    self.assertEqual(c.saved_card(flow.client).token, SYNTHETIC_TOKEN)
+                    flow, _ = make_flow(happy_responses(payment_cards={'data': [row]}))
+                    with self.assertRaisesRegex(j.JournalError, 'NOWNOW_SAVED_CARD_NOT_UNIQUE'):
+                        c.saved_card(flow.client)
+
+    def test_explicit_fallback_card_ignores_visa(self):
+        with patch.object(order_card, 'LAST4', '2342'), patch.object(order_card, 'NETWORK', 'mastercard'):
+            selected = happy_responses()['payment_cards']['data'][0]
+            visa = dict(selected, id=1111111111, ccMasked='4xxxxxxxxxxx9546', ccType='VISA')
+            flow, _ = make_flow(happy_responses(payment_cards={'data': [visa, selected]}))
+            self.assertEqual(c.saved_card(flow.client),
+                             native.SavedCard(SYNTHETIC_TOKEN, '5xxxxxxxxxxx2342', 'MASTERCARD'))
+
 
 class BankFixtureTests(FixtureTests):
     def setUp(self):
+        approve_test_flows(self)
         super().setUp()
+        # Paid captures exercise the explicit fallback; Visa placement remains gated.
+        for key, value in (('LAST4', '2342'), ('NETWORK', 'mastercard')):
+            card = patch.object(order_card, key, value)
+            card.start()
+            self.addCleanup(card.stop)
         p = patch('commerce_food_capture.find_bank_capture', return_value={'source_id': 123, 'source': 'msgs'})
         p.start()
         self.addCleanup(p.stop)
@@ -321,6 +359,7 @@ class LaneTests(BankFixtureTests):
             flow.quiet_delivery()
             flow.pre_place_read()
             review = flow.review_final()
+            j.record_nownow_prepared(flow.flow_id, flow.review['digest'])
             placed = flow.place()
             tracking = flow.poll_tracking(sleep=lambda _: None)
             paid = flow.confirm_paid(tracking)
@@ -459,6 +498,7 @@ class ResumeTests(BankFixtureTests):
         self.assertNotIn('payment', [x[0] for x in harness.calls])
         resumed.pre_place_read()
         resumed.review_final()
+        j.record_nownow_prepared(resumed.flow_id, resumed.review['digest'])
         placed = resumed.place()
         self.assertEqual(placed['order'], SYNTHETIC_ORDER)
         tracking = resumed.poll_tracking(sleep=lambda _: None)
@@ -495,6 +535,7 @@ class CompletionTests(BankFixtureTests):
             flow.quiet_delivery()
             flow.pre_place_read()
             flow.review_final()
+            j.record_nownow_prepared(flow.flow_id, flow.review['digest'])
             flow.place()
             tracking = flow.poll_tracking(sleep=lambda _: None)
             flow.confirm_paid(tracking)
@@ -559,7 +600,7 @@ class CheckoutNoticeTests(unittest.TestCase):
     def test_member_prepare_reviews_exact_total_without_financial_send(self):
         responses = happy_responses()
         row = self.member_row()
-        row.update(paymentMethodCode='prepaid', creditCardMask='52287301xxxx2342',
+        row.update(paymentMethodCode='prepaid', creditCardMask=card_mask(),
                    deliveryPreference={code: True for code in c.QUIET_FLAGS},
                    driverNotes=native.QUIET_NOTE)
         responses['cart_get'] = {'data': row}

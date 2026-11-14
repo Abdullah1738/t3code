@@ -1,9 +1,12 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { recordHealthDelivery, isHealthNag } from "./healthDelivery.ts";
+import { toolLog, toolError, logDirectory } from "./toollog.ts";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  withRelayLock, watcherInstance, finalizeClosing, checking, pollingWatcher, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
+  withRelayLock, watcherInstance, finalizeClosing, checking, pollingWatcher, checkEvent, PERSON_BATCH_MS, queueEvent, sealBatch, sameDestination, alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
   inboundState, inQuiet, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
-  heldByMaintenance, loadMaintenance, type Maintenance, shouldPause, triggerSig, type Watcher, wakeInboundId, watcherDir, shouldAlert, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
+  heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, triggerSig, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
 
 import { CheckSlots, checkSlotCap, checkTimeout, hostLoad, isMounted, LOAD_GRACE_MS, LOAD_HIGH, SSD_PATH } from "./host.ts";
@@ -37,9 +40,25 @@ function backoff(state: State, interval: number, timedOut: boolean): number {
 
 
 function finish(watcher: Watcher, state: State, status: State["status"]): void {
+  toolLog({ component: "runner", kind: "event", name: "watch.disabled", ids: { watcher: watcher.id }, props: { state: status } });
   state.status = status;
   saveState(watcher.id, state);
   log(watcher.id, `status -> ${status}`);
+}
+
+async function runPendingCheck(watcher: Watcher, at: number, mainChecked = false): Promise<void> {
+  const instance = watcherInstance(watcher.id);
+  if (!watcher.pending_check || !instance) return;
+  await slots.run(async () => {
+    const current = loadWatcher(watcher.id);
+    const state = loadState(watcher.id);
+    if (!current || watcherInstance(watcher.id) !== instance || held(current) || current.paused || !current.pending_check
+      || state.status === "closing" || state.reply_handoff) return;
+    const result = await runCheck({ ...current, check: current.pending_check }, watcherDir(watcher.id),
+      { WATCH_PENDING: "1", WATCH_RUN: `pending-${at.toString(36)}`, ...(mainChecked ? { WATCH_MAIN_CHECKED: "1" } : {}) },
+      checkTimeout(current, sampleLoad()), instance);
+    log(watcher.id, `pending check exit=${result.code} timeout=${result.timedOut}`);
+  });
 }
 
 /** Returns true once the event is delivered (or had been already). */
@@ -48,7 +67,10 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
   // A held event keeps its key and is retried each minute, so it goes out once the quiet hours end.
   if (held(watcher) || inQuiet(watcher.quiet)) return false;
   const pending = state.pending!;
-  const delivery = await deliver(pending.watcher ?? watcher, pending.event, pending.key, state);
+  const accepted = pending.watcher ?? watcher;
+  const delivery = await deliver(accepted, pending.event, pending.key, state);
+  for (const run of pending.healthRuns ?? [pending.healthRun]) await recordHealthDelivery(watcher.id, run, delivery);
+  toolLog({ component: "wakes", kind: delivery.ok ? "perf" : "error", name: "wake.sent", durationMs: Math.max(0, now() - Date.parse(pending.at)), ok: delivery.ok, ids: { watcher: watcher.id, chat: accepted.chat ?? "owner", key: wakeInboundId(pending.key) }, ...(delivery.ok ? {} : { error: { tag: "wake.delivery_failed" } }) });
   if (watcherInstance(watcher.id) !== instance) return false;
   log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via} ${delivery.detail}`);
   const definition = loadWatcher(watcher.id);
@@ -58,13 +80,17 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
   state = current;
   if (!delivery.ok) return false;
   state.fires += pending.count ?? 1;
+  toolLog({ component: "runner", kind: "event", name: "watch.fire", ok: true, ids: { watcher: watcher.id, key: wakeInboundId(pending.key) }, props: { count: state.fires } });
   state.last_fire_at = iso();
   state.last_delivery = delivery.via;
   if (delivery.via === "wake") {
     state.wakes = [...(state.wakes ?? []), { inbound: wakeInboundId(pending.key), key: pending.key, event: pending.event, delivered_at: now() }];
   }
   delete state.pending;
-  if (state.status !== "closing" && definition.max_fires !== 0 && state.fires >= definition.max_fires && !state.batch) finish(definition, state, "done");
+  if (state.status !== "closing" && definition.max_fires !== 0 && state.fires >= definition.max_fires && !state.batch) {
+    toolLog({ component: "runner", kind: "event", name: "watch.fire_cap", ids: { watcher: watcher.id }, props: { count: state.fires } });
+    finish(definition, state, "done");
+  }
   else saveState(watcher.id, state);
   return true;
 }
@@ -170,7 +196,7 @@ export async function tickOne(id: string): Promise<void> {
   const unacked = state.discarded_run ?? state.reply_handoff?.accepted_run;
   if (unacked) {
     // State records acceptance before the separate helper ack; finish that ack after a crash/write failure.
-    try { acknowledgeRun(id, instance, unacked); } catch { return; }
+    try { acknowledgeRun(id, instance, unacked); } catch { toolError("runner", "watch.ack_failed", { watcher: id }); return; }
     state = loadState(id);
   }
   const initialPoller = pollingWatcher(initial, state);
@@ -208,11 +234,16 @@ export async function tickOne(id: string): Promise<void> {
   }
   if (state.pending) {
     if ((state.next_at ?? 0) > t) return;
+    state.last_run_at = iso();
+    state.next_at = t + watcher.interval_s * 1_000;
+    saveState(id, state);
+    toolLog({ component: "runner", kind: "event", name: "watch.retry", ids: { watcher: id }, props: { action: "send" } });
     if (!(await deliverPending(watcher, state))) {
       if (sameInstance() && loadWatcher(id)) {
         state = loadState(id);
         state.next_at = now() + Math.min(watcher.interval_s, 60) * 1_000;
         saveState(id, state);
+        if (!held(watcher)) await runPendingCheck(watcher, t);
       }
       return;
     }
@@ -239,6 +270,7 @@ export async function tickOne(id: string): Promise<void> {
   // WATCH_RUN lets helpers that commit their own cursor (whatsapp-new-message) keep an outbox: anything they
   // printed in a run that never reached RUN_OK_FILE (timeout, crash) is printed again on the next run.
   const runId = `${t.toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const healthRun = isHealthNag(id) ? randomUUID().replaceAll("-", "") : undefined;
   let startLoad = 0;
   let timeoutMs = 0;
   let checkedWatcher: Watcher | undefined;
@@ -259,15 +291,20 @@ export async function tickOne(id: string): Promise<void> {
     schedule();
     startLoad = sampleLoad();
     timeoutMs = checkTimeout(current, startLoad);
-    return runCheck(current, watcherDir(id), { WATCH_RUN: runId, WATCH_CLOSING: state.status === "closing" ? "1" : "0" }, timeoutMs, instance);
+    if (state.consecutive_failures || state.load_timeouts) toolLog({ component: "runner", kind: "event", name: "watch.retry", ids: { watcher: id, run: runId }, props: { action: "check", attempt: state.consecutive_failures + 1 } });
+    return runCheck(current, watcherDir(id), { WATCH_RUN: runId, WATCH_CLOSING: state.status === "closing" ? "1" : "0", ...(healthRun ? { HEALTH_TOOLLOG_RUN: healthRun } : {}) }, timeoutMs, instance);
   }));
-  if (!result || !sameInstance()) return;
+  if (!result) return;
+  const runTimedOut = result.timedOut && (result.code === null || result.code === 0);
+  const failed = runTimedOut || result.code !== 0;
+  toolLog({ component: "runner", kind: failed ? "error" : "perf", name: "watch.run", durationMs: result.ms, ok: !failed, ids: { watcher: id, run: runId }, props: { outcome: runTimedOut ? "timeout" : failed ? "fail" : result.stdout.trim() ? "fire" : "no_change", exitCode: result.code, signal: result.signal, timedOut: result.timedOut, queuedMs: Math.max(0, now() - t - result.ms) }, ...(failed ? { error: { tag: runTimedOut ? "watch.timeout" : "watch.check_failed" } } : {}) });
+  if (!sameInstance()) return;
   const endLoad = sampleLoad();
   let fresh = loadState(id);
   const currentDefinition = loadWatcher(id);
   const current = currentDefinition && pollingWatcher(currentDefinition, fresh);
   if (!current || !checking(fresh)) return;
-  const ackRun = () => { try { acknowledgeRun(id, instance, runId); } catch { /* retry a recorded handoff on the next tick */ } };
+  const ackRun = () => { try { acknowledgeRun(id, instance, runId); } catch { toolError("runner", "watch.ack_failed", { watcher: id }); } };
   if (fresh.status === "closing" && checkedWatcher?.check !== current.check) {
     // Only the reply-only command may recover helper output. Keep its original delivery identity
     // until that poll succeeds, so an unacked outbox cannot cross recipients after a retarget.
@@ -302,6 +339,7 @@ export async function tickOne(id: string): Promise<void> {
       fresh.load_timeout_since ??= iso();
       if (now() - Date.parse(fresh.load_timeout_since) < LOAD_GRACE_MS) {
         fresh.last_error = `timed out after ${timeoutMs / 1000}s under host load ${Math.max(startLoad, endLoad).toFixed(1)}/core`;
+        delete fresh.last_error_sources;
         fresh.next_at = now() + Math.min(watcher.interval_s, TIMEOUT_BACKOFF_CAP_S) * 1_000;
         saveState(id, fresh);
         log(id, `load timeout (${fresh.load_timeouts}): ${fresh.last_error}`);
@@ -309,11 +347,16 @@ export async function tickOne(id: string): Promise<void> {
       }
     }
     fresh.consecutive_failures += 1;
+    fresh.failure_alerted = false;
     if (fresh.consecutive_failures === 1 || !fresh.failing_since) fresh.failing_since = iso(t);
+    const sources = timedOut ? [] : failureSources(result.stderr);
     fresh.last_error = timedOut ? `timed out after ${timeoutMs / 1000}s` : `exit ${result.code}: ${result.stderr.trim().slice(-500)}`;
+    if (sources.length) fresh.last_error_sources = sources;
+    else delete fresh.last_error_sources;
     fresh.next_at = now() + backoff(fresh, watcher.interval_s, timedOut);
     log(id, `check failed (${fresh.consecutive_failures}) ${fresh.last_error}${timedOut && result.stderr.trim() ? ` | stderr: ${result.stderr.trim().slice(-300)}` : ""}`);
     if (shouldPause(watcher, fresh, timedOut)) {
+      toolLog({ component: "runner", kind: "event", name: "watch.disabled", ids: { watcher: id }, props: { action: "pause", count: fresh.consecutive_failures } });
       fresh.failure_paused_at = iso();
       fresh.failure_alerted = false;
       // Commit the pause before sending: a crash or failed send must retry the notice, never the check.
@@ -322,10 +365,10 @@ export async function tickOne(id: string): Promise<void> {
       return;
     }
     saveState(id, fresh);
-    if (watcher.max_consecutive_failures === 0 && shouldAlert(fresh, timedOut)) {
+    if (shouldNotifyFailure(watcher, fresh, timedOut)) {
       const mins = Math.round((now() - Date.parse(fresh.failing_since!)) / 60_000);
-      const sent = await alert(watcher, `Watcher "${watcher.title}" has failed ${fresh.consecutive_failures} times in a row (${mins} min) and is backing off. Last error: ${fresh.last_error.slice(0, 300)}. Check ${join(watcherDir(id), "log")}.`,
-        `robob-watch:${id}:failing:${hash(fresh.failing_since ?? "")}`, "error");
+      const sent = await alert(watcher, `Watcher "${watcher.title}" has failed ${fresh.consecutive_failures} ${fresh.consecutive_failures === 1 ? "time" : "times"} in a row (${mins} min) and is backing off. Last error: ${fresh.last_error.slice(0, 300)}. Check ${join(watcherDir(id), "log")}.`,
+        `robob-watch:${id}:failing:${hash(fresh.failing_since ?? "")}:${fresh.consecutive_failures}`, "error");
       const current = loadState(id);
       if (!loadWatcher(id) || !sameInstance() || current.failing_since !== fresh.failing_since) {
         log(id, "failure notice completed after resume/remove; state kept");
@@ -335,6 +378,11 @@ export async function tickOne(id: string): Promise<void> {
       fresh.failure_alerted = sent.ok;
       saveState(id, fresh);
       log(id, `failure alert ok=${sent.ok} via=${sent.via}`);
+    } else {
+      const count = fresh.consecutive_failures;
+      const threshold = watcher.failure_notice_after ?? FAILURE_NOTICE_AFTER;
+      log(id, `failure notice held (${count}/${threshold})`);
+      toolLog({ component: "runner", kind: "event", name: "watch.failure_notice_held", ids: { watcher: id }, props: { count, threshold, timedOut } });
     }
     if (shouldEscalate(watcher, fresh)) {
       const sent = await escalate(watcher, fresh, `robob-watch:${id}:escalate:${hash(fresh.failing_since ?? "").slice(0, 32)}`);
@@ -357,11 +405,17 @@ export async function tickOne(id: string): Promise<void> {
   if (finalDeadline !== undefined && fresh.status === "closing" && fresh.closing_until === finalDeadline) fresh.closing_final_check = true;
   delete fresh.load_timeouts;
   delete fresh.load_timeout_since;
-  if (fresh.consecutive_failures) log(id, `check recovered after ${fresh.consecutive_failures} failures`);
+  if (fresh.consecutive_failures) {
+    const failures = fresh.consecutive_failures;
+    const notified = fresh.failure_alerted;
+    toolLog({ component: "runner", kind: "event", name: "watch.recovered", ids: { watcher: id }, props: { count: failures, failures, notified } });
+    log(id, `check recovered after ${failures} failures (${notified ? "notified" : "not notified"})`);
+  }
   fresh.consecutive_failures = 0;
   fresh.failure_alerted = false;
   delete fresh.failure_escalated;
   delete fresh.last_error;
+  delete fresh.last_error_sources;
   delete fresh.failing_since;
   if (handoffRun && fresh.reply_handoff?.run === handoffRun) {
     fresh.reply_handoff.accepted_run = runId;
@@ -371,18 +425,42 @@ export async function tickOne(id: string): Promise<void> {
   if (!event) {
     saveState(id, fresh); ackRun();
     if (fresh.status === "closing" && fresh.closing_final_check && !fresh.batch) finalizeClosing(id);
+    await runPendingCheck(watcher, t, true);
     return;
   }
   queueEvent(checkedWatcher!, fresh, event, urgent, !!handoffRun);
+  if (healthRun) {
+    if (fresh.pending) fresh.pending.healthRun = healthRun;
+    else if (fresh.batch) (fresh.batch.healthRuns ??= []).push(healthRun);
+  }
   saveState(id, fresh);
   ackRun();
   log(id, `event: ${event.slice(0, 500)}`);
   if (inQuiet(watcher.quiet)) log(id, "quiet hours: event held until they end");
   if (fresh.pending && !current.paused) await deliverPending(current, fresh);
+  await runPendingCheck(watcher, t, true);
 }
 
 let previousMaintenance: Maintenance | undefined;
-async function tick(): Promise<void> {
+let rollingDay: string | undefined;
+export function previousDayRollup(): void {
+  const at = new Date();
+  if (at.getUTCHours() === 0 && at.getUTCMinutes() < 5) return;
+  const day = new Date(at.getTime() - 86400_000).toISOString().slice(0, 10);
+  if (rollingDay === day) return;
+  rollingDay = day;
+  const dayEnd = Date.parse(`${day}T00:00:00Z`) + 86400_000;
+  try {
+    if (statSync(join(logDirectory(), `rollup-${day}.json`)).mtimeMs >= dayEnd) return;
+  } catch { /* Missing or unreadable rollups need another attempt. */ }
+  // Parsing a day file runs outside the one-second runner tick.
+  try {
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "log-rollup", "--day", day], { env: process.env, stdout: "ignore", stderr: "ignore" });
+    void child.exited.then(code => { if (code) toolError("runner", "log.rollup_failed"); }).catch(() => toolError("runner", "log.rollup_failed"));
+  } catch { toolError("runner", "log.rollup_spawn_failed"); }
+}
+export async function tick(): Promise<void> {
+  previousDayRollup();
   sampleLoad();
   const mounted = isMounted(SSD_PATH);
   if (mounted !== ssdMounted) log(null, `SSD ${mounted ? "mounted again" : "missing"}: ${SSD_PATH}`);
@@ -396,7 +474,7 @@ async function tick(): Promise<void> {
   for (const id of listIds()) {
     if (running.has(id)) continue;
     running.add(id);
-    jobs.push(tickOne(id).catch(error => log(id, `runner error: ${String(error).slice(0, 500)}`)).finally(() => running.delete(id)));
+    jobs.push(tickOne(id).catch(error => { toolError("runner", "watch.runner_failed", { watcher: id }); log(id, `runner error: ${String(error).slice(0, 500)}`); }).finally(() => running.delete(id)));
   }
   // Watchers run concurrently; a slow one never delays the next tick of the others.
   void Promise.all(jobs);
@@ -409,7 +487,7 @@ if (import.meta.main) {
   const other = Number(existsSync(pidPath) ? readFileSync(pidPath, "utf8").trim() : 0);
   if (other && other !== process.pid) {
     let alive = false;
-    try { process.kill(other, 0); alive = true; } catch { /* stale */ }
+    try { process.kill(other, 0); alive = true; } catch { toolError("runner", "watch.stale_pid"); }
     const command = alive ? Bun.spawnSync(["/bin/ps", "-o", "command=", "-p", String(other)]).stdout.toString() : "";
     if (alive && command.includes("robob-watch/src/runner.ts")) {
       log(null, `another runner is live (pid ${other}); exiting`);
@@ -418,6 +496,6 @@ if (import.meta.main) {
   }
   writeFileSync(pidPath, `${process.pid}\n`);
   log(null, `robob-watch runner started pid=${process.pid} host load=${hostLoad().toFixed(1)}/core`);
-  await tick();
-  setInterval(() => void tick(), TICK_MS);
+  await tick().catch(() => toolError("runner", "watch.tick_failed"));
+  setInterval(() => void tick().catch(() => toolError("runner", "watch.tick_failed")), TICK_MS);
 }

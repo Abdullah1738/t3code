@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Install this check's source and register its definition, preserving private state."""
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -12,7 +13,9 @@ import tempfile
 SOURCE = Path(__file__).resolve().parent
 LIVE = Path.home() / '.local/share/robob-watch/watchers/inbox-triage'
 DATA = Path.home() / 'Documents/assistant/inbox-triage'
-SOURCE_FILES = ('triage.py', 'check.sh', 'install.py', 'test_triage.py', 'test_urgent.py', 'test_mail_retry.py', 'test_install.py', 'test_lock.py', 'README.md', 'settings.template.json', 'noise.template.json', 'prefs.template.md')
+AUTH_PRODUCERS = Path.home() / '.local/share/app-api-cli'
+PRODUCER_FILES = ('inbox_auth.py', 'careem_account_auth.py', 'commerce_journal.py')
+SOURCE_FILES = ('triage.py', 'fastpath.py', 'expected_auth.py', 'check.sh', 'install.py', 'test_triage.py', 'test_owner_go.py', 'test_urgent.py', 'test_fastpath.py', 'test_mail_retry.py', 'test_install.py', 'test_lock.py', 'README.md', 'settings.template.json', 'noise.template.json', 'prefs.template.md')
 
 
 def atomic_copy(source, destination, executable=False):
@@ -30,23 +33,33 @@ def atomic_copy(source, destination, executable=False):
 
 
 def install(source=SOURCE, live=LIVE, data=DATA, cli='robob-watch'):
+    producers = source.parents[2] / 'app-api-cli'
+    if any(not (AUTH_PRODUCERS / name).is_file()
+           or (AUTH_PRODUCERS / name).read_bytes() != (producers / name).read_bytes()
+           for name in PRODUCER_FILES):
+        raise RuntimeError('Install the matching app-api-cli auth producers before enabling inbox-triage-fastpath')
     os.umask(0o077)
     live.mkdir(parents=True, exist_ok=True)
     data.mkdir(parents=True, exist_ok=True)
     # Keep the inode: replacing a held lock file would admit a concurrent check.
-    with (live / 'check.lock').open('a') as lock:
+    fast_live = live.parent / 'inbox-triage-fastpath'
+    fast_live.mkdir(parents=True, exist_ok=True)
+    with contextlib.ExitStack() as stack:
+        locks = [stack.enter_context((directory / 'check.lock').open('a')) for directory in (live, fast_live)]
         previous_handler = signal.getsignal(signal.SIGALRM)
         def timed_out(*_):
             raise TimeoutError('check still running after 65s; deployment not started')
         signal.signal(signal.SIGALRM, timed_out)
         signal.alarm(65)
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            for lock in locks:
+                fcntl.flock(lock, fcntl.LOCK_EX)
         finally:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, previous_handler)
         for name in SOURCE_FILES:
-            atomic_copy(source / name, live / name, name == 'check.sh')
+            for destination in (live, fast_live):
+                atomic_copy(source / name, destination / name, name == 'check.sh')
         for name in ('settings', 'noise', 'prefs'):
             suffix = 'md' if name == 'prefs' else 'json'
             target = data / f'{name}.{suffix}'
@@ -75,6 +88,21 @@ def install(source=SOURCE, live=LIVE, data=DATA, cli='robob-watch'):
     # Re-arm after releasing the lock; registration may have met a busy check.
     if resume:
         subprocess.run([cli, 'resume', definition['id']], check=True, env=environment, timeout=20)
+    fast = json.loads((source / 'watcher.fastpath.json').read_text())
+    fast_live = live.parent / fast['id']
+    fast_live.mkdir(parents=True, exist_ok=True)
+    fast_old = fast_live / 'watcher.json'
+    if fast_old.exists():
+        previous = json.loads(fast_old.read_text())
+        for field in ('paused', 'created_by_session'):
+            if field in previous:
+                fast[field] = previous[field]
+    else:
+        fast['paused'] = definition.get('paused', False) if not resume else False
+    command = [cli, 'add', '--json', '-', '--no-prime']
+    if fast_old.exists():
+        command.append('--replace')
+    subprocess.run(command, input=json.dumps(fast), text=True, check=True, env=environment, timeout=20)
 
 
 if __name__ == '__main__':

@@ -773,7 +773,7 @@ def cmd_send(a):
             return
         card_url = url.rstrip("/") + "/?v=" + data["v"]
         to = [] if own_chat(a.to, a.session) else ["--to", a.to]
-        res = bridge("app", "--url", card_url, "--caption", caption, "--subcaption", sub,
+        res = bridge("app", "--url", card_url, f"--caption={caption}", f"--subcaption={sub}",
                      "--summary", "Live WhatsApp chat", "--session", a.session, "--key", key, *to)
         sent[a.to] = {"key": key, "url": url, "card_url": card_url, "last_id": data["last_id"],
                       "at": datetime.now(DXB).isoformat(timespec="seconds"), "op": res.get("id"),
@@ -1069,4 +1069,12 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        from pathlib import Path as _LogPath
+        sys.path.insert(0, str(_LogPath(__file__).resolve().parents[1]))
+        from toollog import helper_main
+    except Exception:
+        # Standalone copies of helpers can run before the optional logger is installed.
+        def helper_main(_name, fn, *args):
+            return fn(*args)
+    helper_main("convo-card", main)

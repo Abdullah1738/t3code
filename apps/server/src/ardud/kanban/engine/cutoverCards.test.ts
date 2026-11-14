@@ -25,6 +25,7 @@ import * as ServerSettings from "../../../serverSettings.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import { kanbanDDL } from "../../persistence/kanbanSchema.ts";
+import { ensureKanbanCacheVersions } from "../../persistence/kanbanCacheVersions.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
 import { KanbanService, layer as kanbanLayer } from "./KanbanService.ts";
 import { planCutoverCardRestore } from "./cutoverCards.ts";
@@ -62,6 +63,7 @@ const board: KanbanBoard = {
   setup: null,
   pause: { reason: "Harness cutover", keep: [], at, by: "owner" },
   createdAt: at,
+  nightlyReview: null,
   archivedAt: null,
 };
 const stopped: KanbanCard = {
@@ -303,6 +305,7 @@ const separateBoardsLayer = Layer.effect(
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     yield* Effect.forEach(kanbanDDL, (ddl) => sql.unsafe(ddl), { discard: true });
+    yield* ensureKanbanCacheVersions(sql);
     return BoardsDatabase.BoardsDatabase.of({ sql, ready: Effect.void, path: ":memory:boards" });
   }),
 ).pipe(Layer.provide(Layer.fresh(NodeSqliteClient.layer({ filename: ":memory:" }))));
@@ -543,3 +546,65 @@ it.effect(
     );
   },
 );
+
+it("refuses worker cutover restoration while an evaluator step precedes work", () => {
+  const result = planCutoverCardRestore(
+    fixture({
+      card: {
+        ...stopped,
+        wakeNote: "Owner replied",
+        subtasks: [
+          {
+            id: "s7",
+            step: 3,
+            text: "Wait for QA",
+            owner: "evaluator",
+            state: "open",
+            note: null,
+            doneBy: null,
+            doneAt: null,
+          },
+          {
+            id: "s4",
+            step: 4,
+            text: "Later work",
+            owner: "work",
+            state: "open",
+            note: null,
+            doneBy: null,
+            doneAt: null,
+          },
+        ],
+      },
+    }),
+  );
+  assert.isFalse(result.ok);
+});
+
+
+it("cutover reconciliation re-stamps an existing wait with its restored move", () => {
+  const wait = {
+    on: "time" as const,
+    pr: null,
+    card: null,
+    ask: null,
+    until: "2026-12-01T00:00:00.000Z",
+    sinceHead: null,
+    note: "After cutover",
+    by: { _tag: "owner" as const },
+    at,
+    wakeRole: "evaluator" as const,
+    expiredAt: null,
+    script: null,
+    args: null,
+    status: null,
+    lastCheckedAt: null,
+    failures: 0,
+    problem: null,
+  };
+  const result = planCutoverCardRestore(fixture({ card: { ...stopped, wait } }));
+  assert.isTrue(result.ok);
+  if (!result.ok) return;
+  assert.deepStrictEqual(result.card.wait, { ...wait, at: later });
+  assert.strictEqual(result.card.movedAt, later);
+});

@@ -3,7 +3,9 @@
 Mutations run only through explicit bootstrap/refresh commands. No browser or
 phone integration. Account material never appears in CLI output or argv.
 """
+import toollog
 import argparse
+import inbox_auth
 import base64
 from contextlib import contextmanager
 import copy
@@ -123,27 +125,32 @@ def _transport(method, url, headers, body, form, deadline):
     if body is not None:
         h['Content-Type'] = 'application/x-www-form-urlencoded' if form else 'application/json'
         payload = urllib.parse.urlencode(body).encode() if form else json.dumps(body).encode()
-    try:
-        request = urllib.request.Request(url, headers=h, data=payload, method=method)
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        with elapsed(deadline) as left:
-            try:
-                response = opener.open(request, timeout=left)
-            except urllib.error.HTTPError as exc:
-                response = exc
-            with response:
-                code = response.code
-                raw = response.read(MAX_BYTES+1)
-            if len(raw) > MAX_BYTES:
-                raise AccountError('RESPONSE_TOO_LARGE')
-            data = json.loads(raw)
-            if not isinstance(data, dict):
-                raise AccountError('SCHEMA_CHANGED')
-        return code, data
-    except AccountError:
-        raise
-    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
-        raise AccountError('HTTP_FAILED') from None
+    with toollog.request(url):
+        try:
+            request = urllib.request.Request(url, headers=h, data=payload, method=method)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+            with elapsed(deadline) as left:
+                with toollog.phase('fetch'):
+                    try:
+                        response = opener.open(request, timeout=left)
+                    except urllib.error.HTTPError as exc:
+                        response = exc
+                    with response:
+                        code = response.code
+                        raw = response.read(MAX_BYTES+1)
+                toollog.response(code, None)
+                if len(raw) > MAX_BYTES:
+                    raise AccountError('RESPONSE_TOO_LARGE')
+                with toollog.phase('parse'):
+                    data = json.loads(raw)
+                if not isinstance(data, dict):
+                    raise AccountError('SCHEMA_CHANGED')
+            toollog.response(code, data)
+            return code, data
+        except AccountError:
+            raise
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
+            raise AccountError('HTTP_FAILED') from None
 
 
 def guest_context():
@@ -321,6 +328,7 @@ class Bootstrap:
         guard = solve_pow(config)
         body = {'client_id': self.context['client_id'], 'identifier': self.phone,
                 'type': 'SMS', 'locale': 'en', 'multiTimeUse': False, 'guard': guard}
+        inbox_auth.expect(('Careem',))
         # Mark before send: an ambiguous timeout must not cause duplicate OTP.
         self.otp_sent = True
         started = time.monotonic()

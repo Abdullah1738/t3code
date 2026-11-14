@@ -4,7 +4,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import sqlite3
+import http.server
+import threading
+import urllib.parse
 import sys
 import tempfile
 import time
@@ -19,10 +21,73 @@ spec.loader.exec_module(ch)
 TZ = ch.TZ
 
 
-def replica_meta(db):
-    db.execute('CREATE TABLE ardud_readonly_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
-    db.executemany('INSERT INTO ardud_readonly_meta VALUES (?,?)',
-                   [('ready', '1'), ('updated_at', dt.datetime.now(dt.timezone.utc).isoformat()), ('schema_version', '1')])
+def summary(text, **extra):
+    return {'role': 'user', 'text': text, 'createdAt': '2026-10-24T00:10:00.000Z',
+            'createdBy': 'user', 'creationSource': 'web', 'automated': False, 'inboundMessageId': None, **extra}
+
+
+class ControlServer:
+    """Loopback-only control fixtures. Never reads credentials or state from the real home."""
+    def __init__(self, rows=None, threads=None, stall=None, drip=False):
+        self.rows = {'a': rows or []}
+        self.threads = threads if threads is not None else [{'threadId': 'a', 'title': 'iMessage test'}]
+        self.calls = []
+        self.stall, self.drip = stall, drip
+        self.stop = threading.Event()
+        self.status = 200
+        self.raw = None
+        self.responses = {}
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                path = urllib.parse.urlsplit(self.path)
+                owner.calls.append((path.path, urllib.parse.parse_qs(path.query), self.headers.get('Authorization')))
+                if owner.stall and owner.stall in path.path:
+                    owner.stop.wait(5)
+                if path.path.endswith('/threads'):
+                    data = {'ok': True, 'threads': owner.threads, 'total': len(owner.threads)}
+                else:
+                    rows = owner.rows.get(urllib.parse.unquote(path.path.split('/')[-2]), [])
+                    data = {'ok': True, 'messages': rows, 'total': len(rows)}
+                data = owner.responses.get(path.path, data)
+                body = owner.raw if owner.raw is not None else json.dumps(data).encode()
+                self.send_response(owner.status)
+                self.end_headers()
+                try:
+                    if owner.drip:
+                        while not owner.stop.wait(0.05):
+                            self.wfile.write(b' ')
+                            self.wfile.flush()
+                    else:
+                        self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)
+
+    def __enter__(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.credentials = Path(self.tmp.name) / 'control.json'
+        self.credentials.write_text(json.dumps({'url': f'http://127.0.0.1:{self.server.server_port}',
+                                                'token': 'test-secret-never-print'}))
+        self.credentials.chmod(0o600)
+        self.env = patch.dict(os.environ, {'T3_CONTROL_TOKEN_FILE': str(self.credentials)})
+        self.env.start()
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stop.set()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.env.stop()
+        self.tmp.cleanup()
 
 
 def at(text):
@@ -78,6 +143,40 @@ class Parse(unittest.TestCase):
             with self.subTest(text=text[:40]):
                 self.assertIsNone(ch.parse(text, sender))
         self.assertIsNotNone(ch.parse('Purchase of AED 12.00 with Credit Card ending 1111 at ACME, Dubai. Avl'))
+
+
+class AlertText(unittest.TestCase):
+    def test_selected_body_continuations_stop_at_next_context_header(self):
+        bodies = [
+            'Purchase of USD 100 with your Credit Card ending 2342 at Acme.',
+            'Purchase of USD 100\nwith your Credit Card ending 2342 at Acme.',
+            'Purchase of USD 100\n\n  with your Credit Card ending 2342 at Acme.',
+            'Purchase of USD 100\r\nwith your Credit Card ending 2342 at Acme.',
+            'Purchase of USD 100\nwith your Credit Card ending 2342 at Acme.\n> continuation',
+        ]
+        for body in bodies:
+            for following in (False, True):
+                with self.subTest(body=body, following=following):
+                    shown = ('imessage: EmiratesNBD\n\n'
+                             '         9 2026-11-15 11:59 EmiratesNBD: USD 100 has been refunded.\n'
+                             '>       10 2026-11-15 12:00 EmiratesNBD: ' + body)
+                    if following:
+                        shown += '\n        11 2026-11-15 12:01 EmiratesNBD: Payment of USD 100 towards your Credit Card.'
+                    selected = ch.alert_text(shown)
+                    self.assertEqual(selected, body.replace('\r\n', '\n'))
+                    self.assertEqual(ch.parse(selected, 'EmiratesNBD')['merchant'], 'Acme')
+
+    def test_unknown_timestamp_header_still_bounds_selected_body(self):
+        shown = ('imessage: EmiratesNBD\n\n'
+                 '>       10 ????-??-?? ??:?? EmiratesNBD: Selected\ncontinuation\n'
+                 '        11 ????-??-?? ??:?? EmiratesNBD: Neighbor')
+        self.assertEqual(ch.alert_text(shown), 'Selected\ncontinuation')
+
+    def test_unframed_messages_and_email_quotes_are_unchanged(self):
+        for shown in ('Purchase of USD 100\nwith your Credit Card ending 2342 at Acme.',
+                      'Subject: Bank alert\n\nPurchase of USD 100\n> quoted text'):
+            with self.subTest(shown=shown):
+                self.assertEqual(ch.alert_text(shown), shown)
 
 
 class Finder:
@@ -212,29 +311,10 @@ class Explain(unittest.TestCase):
         self.assertEqual(r['verdict'], 'ask')
 
     def test_a_schedule_bound_to_his_imessage_thread_is_not_his_words(self):
-        # ScheduledTaskService sends a stored prompt into the owner's iMessage thread as 'system', with
-        # no [tag], and the task id in the payload. Only that metadata tells it from his own send.
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'state.sqlite'
-            db = sqlite3.connect(path)
-            replica_meta(db)
-            db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT, title TEXT, updated_at TEXT)')
-            db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id TEXT, role TEXT, created_at TEXT, '
-                       'payload_json TEXT)')
-            db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?,?,?)',
-                       ('a', 'iMessage 2026-10-24 00:30', '2026-10-24T00:00:00.000Z'))
-            rows = [('2026-10-24T00:10:00.000Z', {'createdBy': 'system', 'text': 'Check my Apple order status',
-                                                  'scheduledTaskId': 'scheduled-task:apple'}),
-                    ('2026-10-24T00:11:00.000Z', relayed('Ok'))]
-            for created, payload in rows:
-                db.execute('INSERT INTO orchestration_v2_projection_messages VALUES (?,?,?,?)',
-                           ('a', 'user', created, json.dumps(payload)))
-            db.commit()
-            db.close()
-            with patch.object(ch, 'STATE_DB', path):
-                got = [t for _, t, _ in ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))]
-            self.assertNotIn('Check my Apple order status', got)
-            self.assertIn('Ok', got)
+        rows = [summary('Check my Apple order status', automated=True, createdBy='system'), relayed('Ok')]
+        with ControlServer(rows):
+            got = [t for _, t, _ in ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))]
+        self.assertEqual(got, ['Ok'])
 
 
     def test_a_purchase_for_another_merchant_does_not_explain_this_charge(self):
@@ -511,138 +591,167 @@ class Explain(unittest.TestCase):
 
 
 def relayed(text, inbound='BCA7F873-4770-43DB-8E0E-7E3294F6C71A', **extra):
-    """A turn as the iMessage bridge sends it: stamped 'system', the relayed id in its channel guidance."""
-    guidance = f'You are the owner\'s personal assistant. Current incoming message ID: {json.dumps(inbound)}. Rest.'
-    record = {'version': 1, 'contextId': 'ardud-guidance', 'label': 'Channel guidance', 'kind': 'ardud-guidance',
-              'payload': {'text': guidance}}
-    return {'createdBy': 'system', 'creationSource': 'server', 'text': text,
-            'context': {'version': 1, 'records': [record]}, **extra}
+    return summary(text, createdBy='system', creationSource='server', inboundMessageId=inbound, **extra)
 
 
 class OwnerTexts(unittest.TestCase):
-    def test_default_state_is_the_read_replica(self):
-        with patch.dict(os.environ, {}, clear=True):
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-        self.assertTrue(str(module.STATE_DB).endswith('/readonly/state.sqlite'))
-
-    def test_progress_handler_bounds_a_slow_query(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'owner.sqlite'
-            with sqlite3.connect(path) as db:
-                replica_meta(db)
-                db.execute('CREATE TABLE threads (thread_id, title, updated_at)')
-                db.execute('CREATE VIEW orchestration_v2_projection_threads AS '
-                           'SELECT thread_id, title, slow(updated_at) AS updated_at FROM threads')
-                db.execute('CREATE TABLE orchestration_v2_projection_messages '
-                           '(thread_id, role, created_at, payload_json)')
-                db.executemany('INSERT INTO threads VALUES (?, ?, ?)',
-                               [(str(n), 'app', '2000-01-01') for n in range(20000)])
-            connect = sqlite3.connect
-            def slow(value):
-                time.sleep(0.0002)
-                return value
-            def connection(*args, **kw):
-                db = connect(*args, **kw)
-                db.create_function('slow', 1, slow)
-                return db
-            started = time.time()
-            remaining = 1.5
-            with patch.object(ch, 'STATE_DB', path), patch.object(ch.sqlite3, 'connect', connection):
-                with self.assertRaisesRegex(ch.Lookup, 'query over time'):
-                    ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'), started + remaining)
-            self.assertLess(time.time() - started, remaining + 1)
+    def read(self, **kwargs):
+        return ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'), **kwargs)
 
     def test_only_what_he_typed_counts(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'state.sqlite'
-            db = sqlite3.connect(path)
-            replica_meta(db)
-            db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT, title TEXT, updated_at TEXT)')
-            db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id TEXT, role TEXT, created_at TEXT, '
-                       'payload_json TEXT)')
-            for tid, title in (('a', 'iMessage 2026-10-24 00:30'), ('m', 'Moni'), ('g', 'Group sb_gro')):
-                db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?,?,?)', (tid, title, '2026-10-24T00:00:00.000Z'))
-            rows = [('a', 'user', {'createdBy': 'user', 'creationSource': 'web', 'text': 'acme is mine'}),
-                    # The bridge stamps the owner's iMessage turns 'system' (control/http.ts).
-                    ('a', 'user', relayed('Acme ordering now')),
-                    ('a', 'user', {'createdBy': 'agent', 'text': 'acme agent'}),
-                    ('a', 'user', {'createdBy': 'user', 'creationSource': 'web',
-                                   'text': '[Forwarded by the owner from x] acme'}),
-                    # Coord and crw wakes were stamped 'user' by the server before 27 Oct.
-                    ('a', 'user', {'createdBy': 'user', 'creationSource': 'server', 'text': 'acme ordered by coord'}),
-                    ('m', 'user', {'createdBy': 'user', 'creationSource': 'web', 'text': 'acme from moni'}),
-                    ('g', 'user', {'createdBy': 'user', 'creationSource': 'web', 'text': 'acme in the group'}),
-                    ('a', 'assistant', {'createdBy': 'user', 'creationSource': 'web', 'text': 'acme reply'})]
-            for tid, role, payload in rows:
-                db.execute('INSERT INTO orchestration_v2_projection_messages VALUES (?,?,?,?)',
-                           (tid, role, '2026-10-24T00:10:00.000Z', json.dumps(payload)))
-            db.commit()
-            db.close()
-            with patch.object(ch, 'STATE_DB', path):
-                got = ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))
-            # Newest first, as the state DB returns the rows.
-            self.assertEqual([t for _, t, _ in got], ['Acme ordering now', 'acme is mine'])
-            # Automation stamped 'system' (a kanban prompt, a bracketed watcher wake) isn't his words.
-            with patch.object(ch, 'STATE_DB', path):
-                db = sqlite3.connect(path)
-                # A kanban task and a watcher run each have their own thread, not his iMessage thread.
-                db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?,?,?)',
-                           ('k', 'Kanban: Apple order receipt parsing', '2026-10-24T00:00:00.000Z'))
-                db.execute('INSERT INTO orchestration_v2_projection_messages VALUES (?,?,?,?)',
-                           ('k', 'user', '2026-10-24T00:11:00.000Z',
-                            json.dumps({'createdBy': 'system', 'text': 'Review Apple order receipt parsing'})))
-                db.execute('INSERT INTO orchestration_v2_projection_messages VALUES (?,?,?,?)',
-                           ('a', 'user', '2026-10-24T00:12:00.000Z',
-                            json.dumps({'createdBy': 'system', 'text': '[Watcher] APPLE.COM/BILL USD 99 charged'})))
-                db.commit()
-                db.close()
-                kanban = [t for _, t, _ in ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))]
-            self.assertNotIn('Review Apple order receipt parsing', kanban)
-            self.assertNotIn('[Watcher] APPLE.COM/BILL USD 99 charged', kanban)
-            with patch.object(ch, 'STATE_DB', Path(tmp) / 'missing.sqlite'), self.assertRaises(ch.Lookup):
-                ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))
+        cases = [
+            (summary('web'), True),
+            (summary('mobile', creationSource='mobile'), True),
+            (summary('desktop', creationSource='desktop'), True),
+            (relayed('real iMessage'), True),
+            (summary('old user-stamped iMessage', creationSource='server', inboundMessageId='real-id'), True),
+            (summary('agent', createdBy='agent'), False),
+            (summary('coord', creationSource='server'), False),
+            (summary('[Forwarded by the owner from x] Acme'), False),
+            (summary('assistant', role='assistant'), False),
+            (relayed('[Watcher] Acme'), False),
+            (relayed('   [Wake] Acme'), False),
+            (relayed('no inbound', inbound=None), False),
+            (relayed('empty inbound', inbound=''), False),
+        ]
+        for marker in ('schedule', 'notification', 'delegatedCompletion', 'senderThreadId'):
+            cases.extend([(summary(marker, automated=True), False), (relayed(marker, automated=True), False)])
+        for prefix in ('wake:', 'reset:', 'secret:'):
+            cases.append((relayed(prefix, inbound=prefix + 'abc'), False))
+        rows = [row for row, _ in cases]
+        with ControlServer(rows) as server:
+            got = {text for _, text, _ in self.read()}
+            for row, wanted in cases:
+                with self.subTest(text=row['text']):
+                    self.assertEqual(row['text'] in got, wanted)
+            self.assertEqual(len(server.calls), 2)
+            self.assertEqual(server.calls[0][1]['limit'], ['500'])
+            self.assertEqual(server.calls[1][1]['all'], ['true'])
+            self.assertEqual(server.calls[1][1]['role'], ['user'])
+            self.assertTrue(all(call[2] == 'Bearer test-secret-never-print' for call in server.calls))
 
-    def test_a_schedule_or_wake_in_his_imessage_thread_is_not_his_words(self):
-        # ScheduledTaskService sends a bound task's stored prompt into his iMessage thread as plain text, with
-        # scheduledTaskId and the task's saved actor ('system', or 'user' when he made the task in the app).
-        texts = {'Check my Apple order status': {'createdBy': 'system', 'creationSource': 'server',
-                                                 'scheduledTaskId': 'scheduled-task:1'},
-                 'Apple order is mine, check it': {'createdBy': 'user', 'creationSource': 'web',
-                                                   'scheduledTaskId': 'scheduled-task:2'},
-                 'I paid Apple, notification': {'createdBy': 'system', 'notification': {'kind': 'x'}},
-                 'Apple order from another thread': {'createdBy': 'system', 'senderThreadId': 'thread:x'},
-                 'Apple ordered by a plain control send': {'createdBy': 'system', 'creationSource': 'server'}}
-        rows = [(text, {'text': text, **extra}) for text, extra in texts.items()]
-        # The bridge's own turns carry made-up ids, not a relayed iMessage.
-        for i, fake in enumerate(('wake:abc', 'reset:59:1793073710879', 'secret:abc')):
-            rows.append((f'Apple ordering now {i}', relayed(f'Apple ordering now {i}', inbound=fake)))
-        rows.append(('I am ordering Apple now', relayed('I am ordering Apple now')))
+    def test_filters_threads_and_created_at_and_encodes_thread_ids(self):
+        threads = [{'threadId': 'a:with/slash', 'title': 'App'},
+                   {'threadId': 'm', 'title': 'Moni'}, {'threadId': 'g', 'title': 'Group sb_gro'},
+                   {'threadId': 'archived', 'title': 'App', 'archived': True},
+                   {'threadId': 'kanban', 'title': 'Kanban task'}]
+        with ControlServer(threads=threads) as server:
+            server.rows['a:with/slash'] = [summary('before', createdAt='2026-10-23T22:59:59Z'),
+                summary('since', createdAt='2026-10-23T23:00:00Z'),
+                summary('until', createdAt='2026-10-24T01:00:00Z'),
+                summary('after', createdAt='2026-10-24T01:00:01Z')]
+            server.rows['kanban'] = [relayed('control send'), summary('board task', createdBy='system')]
+            self.assertEqual([text for _, text, _ in self.read()], ['until', 'since'])
+            paths = [path for path, _, _ in server.calls]
+            self.assertIn('/api/ardud/control/threads/a%3Awith%2Fslash/messages', paths)
+            self.assertEqual(len(paths), 3)
+
+    def test_schedule_and_wake_cannot_explain_a_charge(self):
+        rows = [summary('I paid Apple', automated=True), relayed('I paid Apple', inbound='wake:abc')]
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00', pending=False)
+        with ControlServer(rows):
+            result = ch.explain(apple, at('2026-10-24T04:10'), at('2026-10-24T04:20'), find=Finder([]))
+        self.assertEqual(result['verdict'], 'ask')
+
+    def test_old_or_invalid_provenance_discards_all_evidence(self):
+        for key, value in [('automated', 'missing'), ('inboundMessageId', 'missing'),
+                           ('automated', None), ('automated', 0), ('inboundMessageId', 123)]:
+            with self.subTest(key=key, value=value):
+                old = summary('I paid Apple')
+                if value == 'missing':
+                    old.pop(key)
+                else:
+                    old[key] = value
+                with ControlServer([summary('I paid Apple'), old]), \
+                        self.assertRaisesRegex(ch.Lookup, 'provenance unavailable'):
+                    self.read()
+
+    def test_http_and_invalid_json_fail_without_credentials_in_errors(self):
+        for status, raw in [(503, b'test-secret-never-print'), (200, b'not json'), (200, b'<html>app</html>')]:
+            with self.subTest(status=status, raw=raw), ControlServer() as server:
+                server.status, server.raw = status, raw
+                with self.assertRaises(ch.Lookup) as error:
+                    self.read()
+                self.assertIn('Robob control:', str(error.exception))
+                self.assertNotIn('test-secret-never-print', str(error.exception))
+
+    def test_old_server_cannot_authorize_a_charge_question(self):
+        old = summary('I paid Apple')
+        del old['automated']
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00', pending=False)
+        with ControlServer([old]):
+            result = ch.explain(apple, at('2026-10-24T04:10'), at('2026-10-24T04:20'), find=Finder([]))
+        self.assertEqual(result['verdict'], 'unverified')
+        self.assertIn('provenance unavailable', str(result['errors']))
+
+    def test_truncated_or_malformed_lists_are_lookup_failures(self):
+        for result in ({'ok': True, 'total': 501, 'threads': []},
+                       {'ok': True, 'total': 'bad', 'threads': []},
+                       {'ok': True, 'threads': None}, {'ok': True, 'threads': [None]}):
+            with self.subTest(result=result), ControlServer() as server:
+                server.raw = json.dumps(result).encode()
+                with self.assertRaises(ch.Lookup):
+                    self.read()
+
+    def test_credential_errors_do_not_print_the_file_contents(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'state.sqlite'
-            db = sqlite3.connect(path)
-            replica_meta(db)
-            db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT, title TEXT, updated_at TEXT)')
-            db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id TEXT, role TEXT, created_at TEXT, '
-                       'payload_json TEXT)')
-            db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?,?,?)',
-                       ('a', 'iMessage 2026-10-24 00:30', '2026-10-24T00:00:00.000Z'))
-            for _, payload in rows:
-                db.execute('INSERT INTO orchestration_v2_projection_messages VALUES (?,?,?,?)',
-                           ('a', 'user', '2026-10-24T00:10:00.000Z', json.dumps(payload)))
-            db.commit()
-            db.close()
-            with patch.object(ch, 'STATE_DB', path):
-                got = [t for _, t, _ in ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'))]
-                self.assertEqual(got, ['I am ordering Apple now'])
-                # The replay from review round 3: the scheduled prompt explains nothing, so the charge is asked.
-                apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00', pending=False)
-                db = sqlite3.connect(path)
-                db.execute("DELETE FROM orchestration_v2_projection_messages WHERE payload_json LIKE '%I am ordering%'")
-                db.commit()
-                db.close()
-                r = ch.explain(apple, at('2026-10-24T04:10'), at('2026-10-24T04:20'), find=Finder([]))
-                self.assertEqual(r['verdict'], 'ask')
+            path = Path(tmp) / 'control.json'
+            for contents in ('{"token":"test-secret-never-print",}', '{}', '[]'):
+                path.write_text(contents)
+                with patch.dict(os.environ, {'T3_CONTROL_TOKEN_FILE': str(path)}), self.assertRaises(ch.Lookup) as error:
+                    self.read()
+                self.assertEqual(str(error.exception), 'Robob control: credentials unavailable')
+
+    def test_control_list_count_class_is_complete_or_fails_closed(self):
+        # Every count shape applies to both list endpoints; a partial list is never owner silence.
+        cases = [('missing', 0, False), (None, 0, False), ('1', 1, False), (True, 1, False),
+                 (1.0, 1, False), (-1, 0, False), (1, 0, False), (0, 1, False),
+                 (0, 0, True), (1, 1, True)]
+        for key in ('threads', 'messages'):
+            for total, count, complete in cases:
+                with self.subTest(key=key, total=total, count=count), ControlServer() as server:
+                    row = {'threadId': 'a', 'title': 'iMessage test'} if key == 'threads' else summary('I paid Apple')
+                    result = {'ok': True, key: [row] * count}
+                    if total != 'missing':
+                        result['total'] = total
+                    path = '/api/ardud/control/threads' + ('/a/messages' if key == 'messages' else '')
+                    server.responses[path] = result
+                    if complete:
+                        self.read()
+                    else:
+                        with self.assertRaisesRegex(ch.Lookup, 'Robob control:'):
+                            self.read()
+
+    def test_incomplete_messages_cannot_authorize_a_charge_question(self):
+        apple = dict(CHARGE, merchant='APPLE.COM/BILL', currency='USD', amount='99.00', pending=False)
+        with ControlServer() as server:
+            server.responses['/api/ardud/control/threads/a/messages'] = {'ok': True, 'total': 1, 'messages': []}
+            result = ch.explain(apple, at('2026-10-24T04:10'), at('2026-10-24T04:20'), find=Finder([]))
+        self.assertEqual(result['verdict'], 'unverified')
+        self.assertIn('incomplete message list', str(result['errors']))
+
+    def test_unreachable_server_is_a_lookup(self):
+        with ControlServer() as server:
+            config = ch.control_config()
+        with patch.object(ch, 'control_config', return_value=config), self.assertRaisesRegex(ch.Lookup, 'Robob control'):
+            self.read()
+
+    def test_stalled_headers_and_trickled_body_obey_remaining_budget(self):
+        for stall, drip in [('/threads', False), ('/messages', False), (None, True)]:
+            with self.subTest(stall=stall, drip=drip), ControlServer(stall=stall, drip=drip):
+                started = time.time()
+                remaining = 2.2
+                with self.assertRaises(ch.Lookup):
+                    self.read(deadline=started + remaining)
+                self.assertGreater(time.time() - started, 1)
+                self.assertLess(time.time() - started, remaining + 1)
+
+    def test_nested_alarm_is_restored(self):
+        with ControlServer(stall='/threads'), ch.within(time.time() + 3, RuntimeError('outer')):
+            with self.assertRaises(ch.Lookup):
+                self.read(deadline=time.time() + 2.2)
+            self.assertGreater(ch.signal.getitimer(ch.signal.ITIMER_REAL)[0], 0)
+
 
 
 class SearchOutput(unittest.TestCase):

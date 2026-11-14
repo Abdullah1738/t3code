@@ -4,6 +4,8 @@ import {
   CheckpointScopeId,
   CommandId,
   NodeId,
+  OrchestrationV2ThreadProjection,
+  ProjectId,
   ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
@@ -16,6 +18,12 @@ import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as Schema from "effect/Schema";
+import * as Orchestrator from "./Orchestrator.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as RestartPacing from "../ardud/restart-pacing/RestartPacing.ts";
+import * as RestartPacingState from "../ardud/restart-pacing/RestartPacingState.ts";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -26,7 +34,10 @@ import * as TestClock from "effect/testing/TestClock";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+import * as RestartPacingTestkit from "../ardud/restart-pacing/RestartPacing.testkit.ts";
 import * as EffectWorker from "./EffectWorker.ts";
+import * as EventSink from "./EventSink.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
 import * as McpSessionRegistryTestkit from "../mcp/McpSessionRegistry.testkit.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
@@ -86,8 +97,12 @@ function restartEffect(
 function layerExecutorFor(input: {
   readonly events: Ref.Ref<ReadonlyArray<string>>;
   readonly failFirstStart?: Ref.Ref<boolean>;
+  readonly stopBackgroundWork?: ProviderSessionManager.ProviderSessionManagerV2Shape["stopBackgroundWork"];
+  readonly isSessionLive?: ProviderSessionManager.ProviderSessionManagerV2Shape["isLive"];
   readonly threads?: Partial<ThreadManagementService.ThreadManagementService["Service"]>;
   readonly continueAfterRestart?: boolean;
+  readonly pacing?: Layer.Layer<RestartPacing.RestartPacing>;
+  readonly start?: ProviderTurnStartService.ProviderTurnStartServiceV2["Service"]["start"];
   readonly interrupt?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"];
   readonly rollback?: CheckpointRollbackService.CheckpointRollbackServiceV2Shape["execute"];
   readonly mcpRegistry?: Layer.Layer<McpSessionRegistry.McpSessionRegistry>;
@@ -110,13 +125,14 @@ function layerExecutorFor(input: {
     Layer.succeed(
       ProviderSessionManager.ProviderSessionManagerV2,
       ProviderSessionManager.ProviderSessionManagerV2.of({
+        stopBackgroundWork: input.stopBackgroundWork ?? (() => Effect.succeed([])),
         shutdown: Effect.void,
         sweepOrphanedThreads: () => Effect.void,
         observeThreadSessionUpdates: () => Effect.void,
         refreshThreadSessionUpdates: () => Effect.void,
         open: () => Effect.die("unused open"),
         get: () => Effect.succeed(Option.none()),
-        isLive: () => Effect.succeed(false),
+        isLive: input.isSessionLive ?? (() => Effect.succeed(false)),
         close: () => Effect.void,
         closeInstance: () => Effect.void,
         release: () => record("release"),
@@ -126,19 +142,21 @@ function layerExecutorFor(input: {
     Layer.succeed(
       ProviderTurnStartService.ProviderTurnStartServiceV2,
       ProviderTurnStartService.ProviderTurnStartServiceV2.of({
-        start: () =>
-          Effect.gen(function* () {
-            yield* record("start");
-            if (
-              input.failFirstStart !== undefined &&
-              (yield* Ref.getAndSet(input.failFirstStart, false))
-            ) {
-              return yield* new ProviderTurnStartService.ProviderTurnStartError({
-                runId,
-                cause: "simulated first start failure",
-              });
-            }
-          }),
+        start:
+          input.start ??
+          (() =>
+            Effect.gen(function* () {
+              yield* record("start");
+              if (
+                input.failFirstStart !== undefined &&
+                (yield* Ref.getAndSet(input.failFirstStart, false))
+              ) {
+                return yield* new ProviderTurnStartService.ProviderTurnStartError({
+                  runId,
+                  cause: "simulated first start failure",
+                });
+              }
+            })),
       }),
     ),
     Layer.succeed(
@@ -166,6 +184,9 @@ function layerExecutorFor(input: {
     Layer.provide(
       Layer.mergeAll(
         layerDependencies,
+        Layer.mock(EventSink.EventSinkV2)({}),
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
+        input.pacing ?? RestartPacingTestkit.layer,
         input.mcpRegistry ?? McpSessionRegistryTestkit.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)(input.threads ?? {}),
         ServerSettings.layerTest(
@@ -1051,4 +1072,276 @@ it.effect.each(["confirmed", "unconfirmed", "failed"] as const)(
         outcome === "confirmed" ? ["stop-child", "settle-child"] : ["stop-child"],
       );
     }),
+);
+
+const slotTime = DateTime.makeUnsafe(0);
+const queuedProjection = Schema.decodeUnknownSync(OrchestrationV2ThreadProjection)({
+  thread: {
+    id: threadId,
+    projectId: ProjectId.make("project:slot"),
+    title: "Restart slot",
+    providerInstanceId: "codex",
+    modelSelection: { instanceId: "codex", model: "gpt-6.1-sol" },
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: null,
+    activeProviderThreadId: null,
+    lineage: { parentThreadId: null, rootThreadId: threadId, relationshipToParent: null },
+    forkedFrom: null,
+    createdAt: slotTime,
+    updatedAt: slotTime,
+    archivedAt: null,
+    deletedAt: null,
+    createdBy: "system",
+    creationSource: "server",
+  },
+  runs: [
+    {
+      id: runId,
+      threadId,
+      ordinal: 1,
+      providerInstanceId: "codex",
+      modelSelection: { instanceId: "codex", model: "gpt-6.1-sol" },
+      providerThreadId,
+      userMessageId: "message:slot",
+      rootNodeId: "node:slot",
+      activeAttemptId: attemptId,
+      status: "queued",
+      queueHeld: false,
+      queuePosition: 1,
+      requestedAt: slotTime,
+      startedAt: null,
+      completedAt: null,
+      checkpointId: null,
+      contextHandoffId: null,
+    },
+  ],
+  attempts: [],
+  nodes: [],
+  subagents: [],
+  providerSessions: [],
+  providerThreads: [],
+  providerTurns: [],
+  runtimeRequests: [],
+  messages: [],
+  plans: [],
+  turnItems: [],
+  checkpointScopes: [],
+  checkpoints: [],
+  contextHandoffs: [],
+  contextTransfers: [],
+  visibleTurnItems: [],
+  updatedAt: slotTime,
+});
+
+const slotPacing = RestartPacing.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      ServerSettings.layerTest({ restartPacing: { maxActive: 1, spacingMs: 0 } }),
+      Layer.succeed(RestartPacing.RestartLoad, () => 0),
+      Layer.succeed(RestartPacingState.RestartPacingState, {
+        describe: () => Effect.succeed({ priority: 3, activityAt: 0 }),
+        pending: () => Effect.succeed(true),
+        sourceForRun: (threadId, sourceRunId) => Effect.succeed({ threadId, sourceRunId }),
+        active: () => Effect.succeed(true),
+        status: () => Effect.succeed(true),
+      }),
+    ),
+  ),
+  Layer.orDie,
+);
+
+it.effect("a failed admitted continuation cannot block the next outbox provider start", () =>
+  Effect.gen(function* () {
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const executor = layerExecutorFor({
+      events,
+      pacing: slotPacing,
+      continueAfterRestart: true,
+      threads: {
+        getThreadRecords: () => Effect.succeed(queuedProjection),
+        dispatch: (command) =>
+          Effect.fail(
+            new Orchestrator.OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: "dispatch failed",
+            }),
+          ),
+        recoverDelegatedTask: () => Effect.void,
+      },
+    });
+    yield* Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      yield* outbox.enqueue([
+        {
+          id: "slot:continuation",
+          commandId: CommandId.make("slot:continue"),
+          threadId,
+          request: { type: "provider-runtime.continue", sourceRunId: runId, queued: true },
+        },
+        {
+          id: "slot:start",
+          commandId: CommandId.make("slot:start"),
+          threadId: ThreadId.make("thread:next"),
+          request: { type: "provider-turn.start", runId: RunId.make("run:next") },
+        },
+      ]);
+      yield* worker.drain();
+      assert.deepEqual(yield* Ref.get(events), ["start"]);
+      assert.equal(Option.getOrThrow(yield* outbox.get("slot:start")).status, "succeeded");
+    }).pipe(
+      Effect.provide(
+        EffectWorker.layer.pipe(
+          Layer.provideMerge(
+            Layer.merge(
+              executor,
+              EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+            ),
+          ),
+        ),
+      ),
+    );
+  }),
+);
+
+it.effect.each(["defect", "cancelled"] as const)(
+  "an admitted continuation releases on %s",
+  (outcome) =>
+    Effect.gen(function* () {
+      const events = yield* Ref.make<ReadonlyArray<string>>([]);
+      const entered = yield* Deferred.make<void>();
+      const executorLayer = layerExecutorFor({
+        events,
+        pacing: slotPacing,
+        continueAfterRestart: true,
+        threads: {
+          getThreadRecords: () => Effect.succeed(queuedProjection),
+          dispatch: () =>
+            outcome === "defect"
+              ? Effect.die("dispatch defect")
+              : Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+          recoverDelegatedTask: () => Effect.void,
+        },
+      });
+      yield* Effect.gen(function* () {
+        const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+        const pacing = yield* RestartPacing.RestartPacing;
+        const effect = {
+          ...restartEffect(yield* DateTime.now, { type: "detach" }),
+          request: { type: "provider-runtime.continue" as const, sourceRunId: runId, queued: true },
+        };
+        const fiber = yield* executor.execute(effect).pipe(Effect.forkChild);
+        if (outcome === "cancelled") {
+          yield* Deferred.await(entered);
+          yield* Fiber.interrupt(fiber);
+        }
+        assert.isTrue(Exit.isFailure(yield* Fiber.await(fiber)));
+        assert.equal(
+          yield* pacing.acquire({
+            threadId: ThreadId.make("thread:next"),
+            sourceRunId: RunId.make("run:next"),
+          }),
+          0,
+        );
+      }).pipe(Effect.provide(Layer.merge(executorLayer, slotPacing)));
+    }),
+);
+
+it.effect.each(["success", "failure", "defect", "cancelled"] as const)(
+  "a provider start releases its admission on %s",
+  (outcome) =>
+    Effect.gen(function* () {
+      const events = yield* Ref.make<ReadonlyArray<string>>([]);
+      const entered = yield* Deferred.make<void>();
+      const executorLayer = layerExecutorFor({
+        events,
+        pacing: slotPacing,
+        start: () =>
+          outcome === "success"
+            ? Effect.void
+            : outcome === "failure"
+              ? Effect.fail(
+                  new ProviderTurnStartService.ProviderTurnStartError({
+                    runId,
+                    cause: "start failed",
+                  }),
+                )
+              : outcome === "defect"
+                ? Effect.die("start defect")
+                : Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      });
+      yield* Effect.gen(function* () {
+        const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+        const pacing = yield* RestartPacing.RestartPacing;
+        const effect = {
+          ...restartEffect(yield* DateTime.now, { type: "detach" }),
+          request: { type: "provider-turn.start" as const, runId },
+        };
+        const fiber = yield* executor.execute(effect).pipe(Effect.forkChild);
+        if (outcome === "cancelled") {
+          yield* Deferred.await(entered);
+          yield* Fiber.interrupt(fiber);
+        }
+        const exit = yield* Fiber.await(fiber);
+        assert.equal(Exit.isSuccess(exit), outcome === "success");
+        assert.equal(
+          yield* pacing.acquire({
+            threadId: ThreadId.make("thread:next"),
+            sourceRunId: RunId.make("run:next"),
+          }),
+          0,
+        );
+      }).pipe(Effect.provide(Layer.merge(executorLayer, slotPacing)));
+    }),
+);
+
+it.effect("retries native settlement after cancellation already released its session", () =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const live = yield* Ref.make(true);
+    const failSettlement = yield* Ref.make(true);
+    let settlements = 0;
+    const layer = layerExecutorFor({
+      events,
+      isSessionLive: () => Ref.get(live),
+      stopBackgroundWork: () =>
+        Ref.getAndSet(live, false).pipe(Effect.map((wasLive) => (wasLive ? [oldSessionId] : []))),
+      threads: {
+        dispatch: (command) =>
+          Effect.gen(function* () {
+            settlements++;
+            if (yield* Ref.getAndSet(failSettlement, false))
+              return yield* new Orchestrator.OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause: "transient write failure",
+              });
+            return { sequence: 1, storedEvents: [] };
+          }),
+      },
+    });
+    yield* Effect.gen(function* () {
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+      const effect = {
+        ...restartEffect(now, { type: "detach" }),
+        request: {
+          type: "provider-session.stop-background-work",
+          throughRunOrdinal: 1,
+          runAttempts: [],
+          onlyIfCancelled: true,
+          backgroundThreads: [
+            { providerSessionId: oldSessionId, providerThreadId, providerTurnId },
+          ],
+        },
+      } satisfies EffectOutbox.OrchestrationEffectV2;
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(executor.execute(effect))));
+      assert.isFalse(yield* Ref.get(live));
+      yield* executor.execute(effect);
+      assert.equal(settlements, 2);
+    }).pipe(Effect.provide(layer));
+  }),
 );

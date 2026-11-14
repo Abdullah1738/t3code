@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from offbox_lib import api, cli, common, lease, pool, runs, ssh_sync
 from offbox_lib.common import OffboxError
 from test_box_owned_files import DENIED
@@ -25,7 +26,7 @@ class SyncRetryTests(unittest.TestCase):
         self.src.mkdir()
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
-        env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        env = {k: v for k, v in clean_env().items() if not k.startswith('GIT_')}
         env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
         self.stack.enter_context(patch.dict(os.environ, env, clear=True))
         subprocess.run(['git', '-C', str(self.src), 'init', '-q', '--template='], check=True)
@@ -38,6 +39,9 @@ class SyncRetryTests(unittest.TestCase):
         self.setup = self.stack.enter_context(patch.object(ssh_sync, 'setup'))
         self.state = self.stack.enter_context(patch.object(api, 'get', return_value={'state': 'ready'}))
         self.log = self.stack.enter_context(patch.object(ssh_sync, 'log'))
+        self.stack.enter_context(patch.object(ssh_sync, "_watch_rsync", side_effect=self.watch_local))
+        self.stack.enter_context(patch.object(ssh_sync, "_progress_args", return_value=()))
+
         clock = self.stack.enter_context(patch.object(ssh_sync, 'time', wraps=ssh_sync.time))
         self.sleep = clock.sleep
         self.sleep.return_value = None
@@ -50,6 +54,10 @@ class SyncRetryTests(unittest.TestCase):
 
     def write_endpoint(self, host, port):
         self.config.write_text(f'Host testbox\n  HostName {host}\n  Port {port}\n')
+
+    def watch_local(self, cmd, timeout, input=None, **kwargs):
+        return subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape",
+                              timeout=timeout, input=input)
 
     def run_local(self, cmd, **kwargs):
         if cmd[0] == ssh_sync.RSYNC:
@@ -64,7 +72,8 @@ class SyncRetryTests(unittest.TestCase):
         return self.real_run(cmd, **kwargs)
 
     def ssh_local(self, box, command, **kwargs):
-        return self.real_run(['sh', '-c', command], capture_output=True, check=kwargs.get('check', False))
+        return self.real_run(['sh', '-c', command], input=kwargs.get('input'), capture_output=True,
+                             check=kwargs.get('check', False))
 
     def push(self):
         return ssh_sync.push('testbox', self.src, str(self.remote))

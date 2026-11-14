@@ -1,9 +1,16 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as FileSystem from "effect/FileSystem";
 import * as NodePath from "@effect/platform-node/NodePath";
-import { assert, describe, it } from "@effect/vitest";
+import { assert, describe, it, vi } from "@effect/vitest";
 import * as NodeOS from "node:os";
 import * as NodeUtil from "node:util";
 
-import { ExternalLauncherBrowserSpawnError } from "@t3tools/contracts";
+import { KanbanError, ExternalLauncherBrowserSpawnError } from "@t3tools/contracts";
+import { RotatingFileSink } from "@t3tools/shared/logging";
+import * as BoardLocks from "./ardud/kanban/engine/boardLocks.ts";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 import * as Cause from "effect/Cause";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Console from "effect/Console";
@@ -61,6 +68,7 @@ const layerConfig = (overrides: Partial<ServerConfig.ServerConfig["Service"]>) =
       return ServerConfig.make({
         logLevel: "Info",
         traceMinLevel: "Info",
+        traceFileMinDurationMs: 2,
         traceTimingEnabled: false,
         traceBatchWindowMs: 200,
         traceMaxBytes: 1024,
@@ -382,3 +390,75 @@ describe("ServerLoggerLive", () => {
     );
   });
 });
+
+it.effect("persists board lock warnings without OTLP or a recorded span", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "board-lock-log-" });
+    const line =
+      '{"event":"kanban board write refused","board.waiter":"card_move","board.waiting_on":"gate","board.holders":[{"label":"tick","heldForMs":134000}]}';
+    yield* Effect.gen(function* () {
+      yield* Effect.logWarning("ordinary warning");
+      yield* Effect.logWarning(line).pipe(Effect.annotateLogs({ "board.waiting_on": "gate" }));
+    }).pipe(
+      Effect.provide(
+        ServerLogger.layer.pipe(
+          Layer.provide(layerConfig({ logsDir: root, otlpLogsUrl: undefined })),
+          Layer.provide(layerCollector([])),
+        ),
+      ),
+    );
+    assert.strictEqual(
+      yield* fs.readFileString(path.join(root, "board-locks.ndjson")),
+      `${line}\n`,
+    );
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "a throwing diagnostic sink preserves the board admission timeout and retry response",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "board-lock-log-failure-" });
+      const write = vi.spyOn(RotatingFileSink.prototype, "write").mockImplementation(() => {
+        throw new Error("log directory inaccessible");
+      });
+      yield* Effect.gen(function* () {
+        const locks = yield* BoardLocks.make();
+        const entered = yield* Deferred.make<void>();
+        const holder = yield* Effect.forkChild(
+          locks.board(
+            "crpko",
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+          ),
+        );
+        yield* Deferred.await(entered);
+        const waiter = yield* Effect.forkChild(locks.board("crpko", Effect.void).pipe(Effect.exit));
+        yield* TestClock.adjust(60_000);
+        assert.isTrue(write.mock.calls.length > 0);
+        assert.isUndefined(waiter.pollUnsafe());
+        yield* TestClock.adjust(60_000);
+        const result = yield* Fiber.join(waiter);
+        assert.isTrue(Exit.isFailure(result));
+        if (Exit.isFailure(result)) {
+          const error = Cause.squash(result.cause);
+          assert.instanceOf(error, KanbanError);
+          assert.strictEqual((error as KanbanError).saved, false);
+          assert.include(String(error), "Board busy: not written (held 2m0s by");
+          assert.include(String(error), "Safe to retry once.");
+        }
+        yield* Fiber.interrupt(holder);
+        assert.deepStrictEqual(yield* locks.holders, []);
+      }).pipe(
+        Effect.provide(
+          ServerLogger.layer.pipe(
+            Layer.provide(layerConfig({ logsDir: root, otlpLogsUrl: undefined })),
+            Layer.provide(layerCollector([])),
+          ),
+        ),
+        Effect.ensuring(Effect.sync(() => write.mockRestore())),
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+);

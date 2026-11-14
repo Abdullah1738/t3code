@@ -4,6 +4,7 @@ Covers: Claude and Codex env resolve by driver, an inherited OFFBOX_THREAD of an
 a pending answer resolves within the same call, and an unresolved caller never claims the shared local owner.
 """
 import json
+import io
 import os
 from pathlib import Path
 import sys
@@ -212,6 +213,191 @@ class IdentityTests(unittest.TestCase):
         con.execute("UPDATE kv SET ts = ts - ? WHERE k = ?", (seconds, f"identity:codex:{native}"))
         con.commit()
 
+    def test_outage_diagnostics_distinguish_native_ids_with_the_same_prefix(self):
+        warm = "01a1c899-754b-7012-9748-4cff20dd6d58"
+        cold = "01a1c899-5b43-7c93-8701-dd6f51b76e60"
+        con = common.db()
+        common.kv_set(con, f"identity:codex:{warm}", resolved(OTHER, driver="codex"))
+        self.age_identity_row(warm, 10517)
+        before = tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (f"identity:codex:{warm}",)).fetchone())
+        with patch.object(identity, "ctl", return_value=(0, {"error": "control request failed"})):
+            kept = self.who(CODEX_THREAD_ID=warm)
+            refused = self.who(CODEX_THREAD_ID=cold)
+        self.assertEqual(kept["thread"], OTHER)
+        self.assertIsNone(refused["thread"])
+        with self.assertRaises(OffboxError):
+            identity.require_proven(refused, "run")
+        self.assertEqual(tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (f"identity:codex:{warm}",)).fetchone()), before)
+        logs = (Path(self.tmp.name) / "log").read_text()
+        self.assertIn(f"identity resolve failed for codex {warm} (status=0", logs)
+        self.assertIn(f"identity resolve failed for codex {cold}: status=0", logs)
+        self.assertIn(f"caller codex {cold} unresolved: unavailable", logs)
+
+    def test_restart_wait_recovers_after_two_unreachable_answers(self):
+        for index, error in enumerate(("control request failed", "control request exceeded its deadline")):
+            with self.subTest(error=error), patch.object(identity, "ctl", side_effect=[
+                (0, {"error": error}), (0, {"error": error}),
+                (200, {"identity": resolved(OTHER, driver="codex")}),
+            ]) as ctl, patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                me = self.who(CODEX_THREAD_ID=f"restart-{index}")
+            identity.require_proven(me, "run")
+            self.assertEqual(me["thread"], OTHER)
+            self.assertEqual(ctl.call_count, 3)
+            self.assertEqual(stderr.getvalue().count("waiting up to 90 s for the caller lookup"), 1)
+
+    def test_restart_wait_exhausts_one_ninety_second_budget_including_requests(self):
+        timeouts = []
+
+        def request_times_out(*args, **kwargs):
+            timeout = kwargs["timeout"]
+            self.assertLessEqual(timeout, 90 - self.elapsed)
+            timeouts.append(timeout)
+            self.advance(min(11, timeout))
+            return 0, {"error": "control request exceeded its deadline"}
+
+        with patch.object(identity, "ctl", side_effect=request_times_out), patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            me = self.who(CODEX_THREAD_ID=CODEX_UUID)
+        self.assertEqual(self.elapsed, 90)
+        self.assertLess(timeouts[-1], 20)
+        with self.assertRaises(OffboxError) as refused:
+            identity.require_proven(me, "run")
+        self.assertIn("waited 90 s", str(refused.exception))
+        self.assertEqual(stderr.getvalue().count("waiting up to 90 s"), 1)
+
+    def test_restart_wait_uses_backoff_for_only_unreachable_bad_gateway_and_unavailable(self):
+        for status in (0, 502, 503):
+            with self.subTest(status=status):
+                self.elapsed = 0
+                with patch.object(identity, "ctl", return_value=(status, {})), patch.object(
+                    identity, "sleep", side_effect=self.advance
+                ) as sleep:
+                    me = self.who(CODEX_THREAD_ID=f"restart-status-{status}")
+                self.assertEqual(self.elapsed, 90)
+                self.assertEqual([c.args[0] for c in sleep.call_args_list[:4]], [2, 4, 8, 10])
+                with self.assertRaises(OffboxError) as refused:
+                    identity.require_proven(me, "run")
+                self.assertIn("waited 90 s", str(refused.exception))
+
+    def test_restart_wait_never_delays_client_refusals(self):
+        with patch.object(identity, "ctl", return_value=(403, {})) as ctl, patch.object(identity, "sleep") as sleep:
+            me = self.who(CODEX_THREAD_ID=CODEX_UUID)
+        ctl.assert_called_once()
+        sleep.assert_not_called()
+        with self.assertRaises(OffboxError) as refused:
+            identity.require_proven(me, "run")
+        self.assertNotIn("waited", str(refused.exception))
+
+    def test_restart_wait_is_reported_when_claude_has_no_signed_command_proof(self):
+        with patch.object(identity, "ctl", return_value=(0, {})), patch.object(
+            identity, "claude_command_identity", return_value=None
+        ):
+            me = self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID)
+        self.assertEqual(self.elapsed, 90)
+        self.assertEqual(me["resolution"], "unresolved")
+        with self.assertRaises(OffboxError) as refused:
+            identity.require_proven(me, "run")
+        self.assertIn("Claude identity can't be proven", str(refused.exception))
+        self.assertIn("waited 90 s", str(refused.exception))
+
+    def test_restart_wait_returns_stale_proof_immediately(self):
+        _, _, old = self.seed_resolved_identity(3700)
+        with patch.object(identity, "ctl", return_value=(0, {})) as ctl, patch.object(identity, "sleep") as sleep:
+            ident = identity.identity_for(CODEX_UUID, "codex")
+        self.assertEqual(ident, old)
+        ctl.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_restart_wait_stops_at_a_real_pending_answer(self):
+        with patch.object(identity, "ctl", side_effect=[
+            (0, {}), (200, {"identity": {"resolution": "pending"}}), (503, {}), (503, {}),
+        ]) as ctl:
+            me = self.who(CODEX_THREAD_ID=CODEX_UUID)
+        self.assertEqual(me["resolution"], "pending")
+        self.assertEqual(ctl.call_count, 4)
+        self.assertLessEqual(self.elapsed, 60)
+        with self.assertRaises(OffboxError) as refused:
+            identity.require_proven(me, "run")
+        self.assertIn("resolution=pending", str(refused.exception))
+
+    def test_restart_recovery_pending_has_its_own_fixed_poll_budget(self):
+        cases = (
+            ("early", 0, (0,), 2),
+            ("before-old-deadline", 0, (10, 17.5, 17.5), 59),
+            ("at-old-deadline", 0, (10, 17.5, 18.5), 60),
+            ("late-unreachable", 0, (10, 20, 20), 64),
+            ("late-bad-gateway", 502, (10, 20, 20), 64),
+            ("late-unavailable", 503, (10, 20, 20), 64),
+            ("near-restart-deadline", 0, (10, 20, 20, 15), 89),
+        )
+        for label, status, request_times, recovered_at in cases:
+            for completes in (True, False):
+                with self.subTest(case=label, completes=completes):
+                    self.elapsed = 0
+                    calls = []
+
+                    def request(*args, **kwargs):
+                        calls.append((self.elapsed, kwargs["timeout"]))
+                        index = len(calls) - 1
+                        if index < len(request_times):
+                            self.assertLessEqual(kwargs["timeout"], 90 - self.elapsed)
+                            duration = request_times[index]
+                            self.assertLessEqual(duration, kwargs["timeout"])
+                            self.advance(duration)
+                            return status, {"error": "control request exceeded its deadline"}
+                        if index == len(request_times):
+                            self.assertEqual(self.elapsed, recovered_at)
+                        elif completes:
+                            return 200, {"identity": resolved(OTHER, driver="codex")}
+                        else:
+                            remaining = recovered_at + 60 - self.elapsed
+                            self.assertLessEqual(kwargs["timeout"], remaining)
+                            self.advance(min(8, kwargs["timeout"]))
+                        return 200, {"identity": {"resolution": "pending"}}
+
+                    native = f"restart-pending-{label}-{completes}"
+                    with patch.object(identity, "ctl", side_effect=request):
+                        me = self.who(CODEX_THREAD_ID=native)
+                    if completes:
+                        identity.require_proven(me, "run")
+                        self.assertEqual(me["thread"], OTHER)
+                        self.assertEqual(len(calls), len(request_times) + 2)
+                        self.assertEqual(self.elapsed, recovered_at + 2.5)
+                    else:
+                        self.assertEqual(self.elapsed, recovered_at + 60)
+                        self.assertEqual(me["resolution"], "pending")
+                        with self.assertRaises(OffboxError) as refused:
+                            identity.require_proven(me, "run")
+                        self.assertIn("resolution=pending", str(refused.exception))
+
+    def test_pending_invalidates_the_shared_cache_before_any_terminal_log(self):
+        con, key, _ = self.seed_resolved_identity(3700)
+        calls = 0
+
+        def request(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return 200, {"identity": {"resolution": "pending"}}
+            self.assertEqual(common.kv_get(con, key)["resolution"], "pending")
+            self.assertFalse((Path(self.tmp.name) / "log").exists())
+            return 503, {}
+
+        with patch.object(identity, "ctl", side_effect=request):
+            me = self.who(CODEX_THREAD_ID=CODEX_UUID)
+        self.assertEqual(me["resolution"], "pending")
+        self.assertEqual(common.kv_get(con, key)["resolution"], "pending")
+        self.assertNotIn("using last resolved", (Path(self.tmp.name) / "log").read_text())
+
+    def test_restart_wait_stops_when_the_server_answers_authoritatively(self):
+        for status, answer in ((403, {}), (200, {"identity": {"resolution": "unavailable"}})):
+            self.elapsed = 0
+            with self.subTest(status=status), patch.object(identity, "ctl", side_effect=[(0, {}), (status, answer)]) as ctl:
+                me = self.who(CODEX_THREAD_ID=f"restart-answer-{status}")
+            self.assertEqual(self.elapsed, 2)
+            self.assertEqual(ctl.call_count, 2)
+            with self.assertRaises(OffboxError):
+                identity.require_proven(me, "run")
+
     def test_pending_waits_for_mapping_and_proceeds_in_the_same_call(self):
         pending = {"resolution": "pending", "robobThreadId": None, "parentThreadId": None,
                    "executionKind": None, "acceptsMessages": False, "candidates": []}
@@ -265,7 +451,7 @@ class IdentityTests(unittest.TestCase):
 
     def test_cwd_outside_every_project_cannot_change_native_proof(self):
         self.stub.identities[(CODEX_UUID, "codex")] = resolved(OTHER, driver="codex")
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as outside, patch.object(
+        with tempfile.TemporaryDirectory(dir="/tmp") as outside, patch.object(
             identity, "repo_root", REAL_REPO_ROOT
         ):
             for native, expected in ((CODEX_UUID, "resolved"), (PENDING_UUID, "unavailable")):
@@ -308,7 +494,7 @@ class IdentityTests(unittest.TestCase):
                         os.chdir(original_cwd)
 
     def test_transport_retry_policy_remains_one_retry(self):
-        for status in (0, 500, 503):
+        for status in (500, 501, 504):
             start = self.elapsed
             with self.subTest(status=status), patch.object(identity, "ctl", return_value=(status, {})) as ctl:
                 result = identity.identity_for(f"outage-{status}", "codex")
@@ -426,8 +612,8 @@ class IdentityTests(unittest.TestCase):
         for text in ("control API", "can't be proven", "status=0 timed out", "Nothing was changed"):
             self.assertIn(text, str(refused.exception))
         logs = (Path(self.tmp.name) / "log").read_text()
-        self.assertIn(f"identity resolve failed for codex {CODEX_UUID[:8]}: status=0 timed out", logs)
-        self.assertIn(f"caller codex {CODEX_UUID[:8]} unresolved: unavailable (status=0 timed out)", logs)
+        self.assertIn(f"identity resolve failed for codex {CODEX_UUID}: status=0 timed out", logs)
+        self.assertIn(f"caller codex {CODEX_UUID} unresolved: unavailable (status=0 timed out)", logs)
 
     def test_client_errors_are_not_retried(self):
         for status in range(400, 500):
@@ -453,7 +639,7 @@ class IdentityTests(unittest.TestCase):
                 before = tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone())
                 with patch.object(identity, "ctl", return_value=(status, {"error": "timed out"})) as ctl:
                     ident = identity.identity_for(CODEX_UUID, "codex")
-                self.assertGreater(ctl.call_count, 1)
+                ctl.assert_called_once()
                 self.assertEqual(ident, old)
                 self.assertEqual(tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()), before)
                 with patch.object(identity, "ctl", return_value=(200, {"identity": resolved(OTHER, driver="codex")})) as ctl:
@@ -528,7 +714,7 @@ class IdentityTests(unittest.TestCase):
                 before = tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone())
                 with patch.object(identity, "ctl", return_value=(500, body)) as ctl:
                     self.assertEqual(identity.identity_for(CODEX_UUID, "codex"), old)
-                self.assertGreater(ctl.call_count, 1)
+                ctl.assert_called_once()
                 self.assertEqual(tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()), before)
 
     def test_server_error_body_shapes_without_cached_identity_refuse_with_detail(self):

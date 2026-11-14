@@ -130,15 +130,16 @@ describe("buildAskAnswer", () => {
     expect(askPrimaryLabel(decision, typed)).toBe("Send answer");
   });
 
-  it("never sends words alone as the answer to a pick he has to make", () => {
+  it("sends words alone to the owner reply classifier for a required pick", () => {
     const decision = ask({ kind: "decision", options: OPTIONS });
     const typed = filled(decision, { ownWords: " Neither, wait a week " });
-    expect(buildAskAnswer(decision, typed, "primary")).toMatchObject({
-      ok: false,
-      first: "choose",
+    expect(buildAskAnswer(decision, typed, "primary")).toEqual({
+      ok: true,
+      body: { verdict: "answered", text: "Neither, wait a week" },
+      label: "Answer sent",
     });
     expect(askWordsForReply(decision, typed)).toBe("Neither, wait a week");
-    expect(askPrimaryLabel(decision, typed)).toBe("Send as a reply");
+    expect(askPrimaryLabel(decision, typed)).toBe("Send answer");
     // A pick with words beside it is an answer, and so is a pick alone.
     expect(askWordsForReply(decision, filled(decision, { optionIds: ["now"] }))).toBeNull();
     expect(askWordsForReply(decision, askFormFor(decision))).toBeNull();

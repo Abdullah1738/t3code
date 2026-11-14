@@ -1,6 +1,7 @@
 import { expect, it } from "@effect/vitest";
 import {
   CommandId,
+  EventId,
   type ModelSelection,
   MessageId,
   NodeId,
@@ -43,6 +44,8 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
+import { idleThreadProjection, liveThreadShell } from "../mcp/McpToolAccess.testkit.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { DispatchModeLimit, type DispatchModeRefusal } from "./DispatchModeLimit.ts";
 
@@ -1450,6 +1453,60 @@ it.effect("preserves failed legacy materialization when reading checkpoint conte
   }).pipe(Effect.provide(layerTest));
 });
 
+it.effect("waitForThread counts initial projection loading against its budget", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("project:wait-budget");
+    const threadId = ThreadId.make("thread:wait-budget");
+    const runId = RunId.make("run:wait-budget");
+    const loading = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const subscribed = yield* Deferred.make<void>();
+    let reads = 0;
+    const projection = {
+      thread: { id: threadId, projectId, deletedAt: null },
+      runs: [{ id: runId, status: "running" }],
+    } as unknown as OrchestrationV2ThreadProjection;
+    const layerTest = ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+      Layer.provide(
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadEventSequence: () => Effect.succeed(0),
+          restartContinuationPending: () => Effect.succeed(false),
+          getThreadRecords: () => {
+            reads++;
+            return reads === 1
+              ? Deferred.succeed(loading, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.as(projection),
+                )
+              : Effect.succeed(projection);
+          },
+          streamStoredEventsFrom: () =>
+            Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
+              Stream.drain,
+              Stream.concat(Stream.never),
+            ),
+        }),
+      ),
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(layerReceiptsTest),
+    );
+    const service = yield* ThreadManagementService.ThreadManagementService.pipe(
+      Effect.provide(layerTest),
+    );
+    const call = yield* service
+      .waitForThread({ projectId, threadId, runId, timeoutMs: 1000 })
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(loading);
+    yield* TestClock.adjust(600);
+    yield* Deferred.succeed(release, undefined);
+    yield* Deferred.await(subscribed);
+    yield* TestClock.adjust(400);
+    expect(call.pollUnsafe()).toBeDefined();
+    expect((yield* Fiber.join(call)).timedOut).toBe(true);
+  }),
+);
+
 it.effect.each([
   { finalStatus: "completed" as const, timedOut: false },
   { finalStatus: "failed" as const, timedOut: false },
@@ -1956,4 +2013,94 @@ it.effect.each([
 
     expect(dispatched).toEqual(settles ? ["thread.settle"] : []);
   }),
+);
+
+it.effect(
+  "project listings page the memory store without losing a thread updated between batches",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const projectId = ProjectId.make("project:paged-list");
+      const at = DateTime.makeUnsafe("2026-11-13T00:00:00Z");
+      const ids = Array.from({ length: 205 }, (_, index) =>
+        ThreadId.make(`thread:${String(index).padStart(3, "0")}`),
+      );
+      for (const [index, id] of ids.entries()) {
+        const thread = {
+          ...idleThreadProjection(liveThreadShell(id)).thread,
+          projectId,
+          updatedAt: DateTime.add(at, { seconds: index }),
+          lineage: {
+            rootThreadId: id,
+            parentThreadId: null,
+            relationshipToParent: index % 2 === 0 ? ("subagent" as const) : null,
+          },
+        };
+        yield* store.apply({
+          id: EventId.make(`event:page:${index}`),
+          type: "thread.created",
+          threadId: id,
+          occurredAt: at,
+          payload: thread,
+        });
+      }
+      const reads: Array<string | undefined> = [];
+      let changed = false;
+      const threads = yield* ThreadManagementService.ThreadManagementService.pipe(
+        Effect.provide(
+          ThreadManagementService.layer.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                Layer.mock(Orchestrator.OrchestratorV2)({
+                  getShellSnapshot: (options) =>
+                    Effect.gen(function* () {
+                      expect(options?.projectId).toEqual(projectId);
+                      expect(options?.location).toEqual("active");
+                      expect(options?.limit).toEqual(100);
+                      reads.push(options?.afterThreadId);
+                      if (!changed && options?.afterThreadId === "thread:099") {
+                        changed = true;
+                        const { thread } = yield* store.getThreadRecords(ids[150]!, []);
+                        yield* store.apply({
+                          id: EventId.make("event:page:update"),
+                          type: "thread.metadata-updated",
+                          threadId: thread.id,
+                          occurredAt: at,
+                          payload: { ...thread, updatedAt: DateTime.add(at, { seconds: 999 }) },
+                        });
+                      }
+                      return yield* store.getShellSnapshot(options);
+                    }).pipe(Effect.orDie),
+                }),
+                Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+                Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({}),
+                Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({}),
+                ServerSettings.layerTest(),
+              ),
+            ),
+          ),
+        ),
+      );
+      const all = yield* threads.listProjectThreads({ projectId, includeSubagents: true });
+      expect(reads).toEqual([undefined, "thread:099", "thread:199"]);
+      expect(all.map((thread) => thread.id)).toEqual([
+        ids[150],
+        ...ids.toReversed().filter((id) => id !== ids[150]),
+      ]);
+      expect(new Set(all.map((thread) => thread.id)).size).toEqual(205);
+      reads.length = 0;
+      const roots = yield* threads.listProjectThreads({ projectId, includeSubagents: false });
+      expect(roots.map((thread) => thread.id)).toEqual(
+        all
+          .filter((thread) => thread.lineage.relationshipToParent !== "subagent")
+          .map((thread) => thread.id),
+      );
+      const empty = yield* store.getShellSnapshot({
+        projectId,
+        location: "active",
+        limit: 100,
+        afterThreadId: ids.at(-1)!,
+      });
+      expect(empty.threads).toEqual([]);
+    }).pipe(Effect.provide(ProjectionStore.layerMemory)),
 );

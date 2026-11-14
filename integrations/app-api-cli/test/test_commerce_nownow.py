@@ -1,7 +1,9 @@
+from owner_go_support import approve_test_flows
 from pathlib import Path
 import tempfile
 import time
 import unittest
+import order_card
 from unittest.mock import Mock,patch
 
 import commerce_nownow as c
@@ -11,6 +13,7 @@ from noon_checkout import fingerprint
 
 class NowNowFlowTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         for module in (c.journal,c.receipts):
             p=patch.object(module,'ROOT',Path(temp.name).resolve()/'commerce');p.start();self.addCleanup(p.stop)
@@ -18,12 +21,14 @@ class NowNowFlowTests(unittest.TestCase):
         self.auth.revalidate.side_effect=lambda *a,**k:AuthSnapshot('nownow','1'*64,fingerprint('HOME','KEY'),
             time.time(),{'cookie':'synthetic=secret','x-addresscode':'HOME','x-addresskey':'KEY'},time.monotonic()+30)
 
-    def test_existing_account_fence_prevents_new_flow_before_wire(self):
+    def test_existing_noon_flow_allows_new_flow_before_wire(self):
         flow='10000000-0000-4000-8000-000000000001'
         c.journal.open_flow(flow_id=flow,app='noon',vertical='minutes',account_hash='1'*64,scope_hash='2'*64)
         wire=Mock()
-        with self.assertRaisesRegex(c.journal.JournalError,'RECONCILIATION_REQUIRED'):
-            c.NowNowFlow(store_code='STORE',products=(('PRODUCT',1),),auth=self.auth,request=wire)
+        fresh=c.NowNowFlow(store_code='STORE',products=(('PRODUCT',1),),auth=self.auth,request=wire)
+        self.assertNotEqual(fresh.flow_id,flow)
+        self.assertFalse(fresh.opened)
+        self.assertEqual(c.journal.inspect(flow)['state'],'ACTIVE')
         wire.assert_not_called()
 
     def test_existing_store_cart_never_adopted_or_changed(self):
@@ -47,9 +52,10 @@ class NowNowFlowTests(unittest.TestCase):
             flow._before(*flow.expected)
         self.assertFalse(flow.opened)
 
+    @patch.multiple(order_card, LAST4='2342', NETWORK='mastercard')
     def test_current_controller_finalize_with_exact_review_journals_once(self):
         import json
-        from test import test_noon_nownow_review as fixtures
+        import test_noon_nownow_review as fixtures
         from noon_nownow_checkout import Snapshot,SavedCard
         fixture=fixtures.ReviewTests();fixture.setUp()
         flow=c.NowNowFlow(store_code='shop',products=(('p',2),),auth=self.auth,request=Mock())
@@ -57,8 +63,8 @@ class NowNowFlowTests(unittest.TestCase):
         flow.account_hash=fingerprint('customer');flow.address_hash=fingerprint('home','key')
         flow.snapshot=AuthSnapshot('nownow',flow.account_hash,flow.address_hash,time.time(),
             {'x-addresscode':'home','x-addresskey':'key','cookie':'synthetic=secret'},time.monotonic()+30)
-        flow.session_code='owned';flow.card=SavedCard('synthetic-token','xxxx2342','mastercard')
-        flow.controller_card={'id':'synthetic-token','ccMasked':'xxxx2342','ccType':'mastercard','isDeleted':False}
+        flow.session_code='owned';flow.card=SavedCard('synthetic-token','xxxx' + order_card.LAST4,order_card.NETWORK)
+        flow.controller_card={'id':'synthetic-token','ccMasked':'xxxx' + order_card.LAST4,'ccType':order_card.NETWORK,'isDeleted':False}
         from noon_nownow_controller import CardSyncBinding
         flow.card_binding=CardSyncBinding(flow.account_hash,flow.address_hash,fingerprint('owned'),
             fingerprint('synthetic-token'),'1'*64,'2'*64,time.time())
@@ -70,6 +76,7 @@ class NowNowFlowTests(unittest.TestCase):
         flow.receipt_store=c.receipts.create(flow_id=flow.flow_id,app='noon',vertical='nownow',
             account_hash=flow.account_hash,scope_hash=flow.scope_hash)
         flow.opened=True
+        c.journal.record_nownow_prepared(flow.flow_id, flow.review.digest)
         controller={'observed_at':time.time(),'review_digest':flow.review.digest,'status':'idle',
             'orderPaymentAmount':25,'selection':{'kind':'card','cardId':'synthetic-token'},
             'wallet':{'enabled':False},'requiresCardSubscription':False,'isCvvRequired':False}

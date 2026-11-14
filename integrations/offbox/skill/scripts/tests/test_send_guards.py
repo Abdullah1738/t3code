@@ -1,8 +1,12 @@
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 
 BLOCKERS = Path(__file__).resolve().parent.parent / "blockers"
 
@@ -17,7 +21,7 @@ class SendGuardTest(unittest.TestCase):
             fake = self.real / name
             fake.write_text(f"#!/bin/sh\necho real-{name} \"$@\"\n")
             fake.chmod(0o755)
-        self.env = dict(os.environ, HOME=self.tmp.name, OPENCODE_SESSION_ID="ses_test",
+        self.env = clean_env(HOME=self.tmp.name, OPENCODE_SESSION_ID="ses_test",
                         PATH=f"{BLOCKERS}:{self.real}:/usr/bin:/bin")
 
     def tearDown(self):

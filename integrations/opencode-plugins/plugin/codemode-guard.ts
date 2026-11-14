@@ -1,3 +1,4 @@
+import { hook as toolLogHook } from "../lib/toollog";
 import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -32,23 +33,29 @@ function log(record: Record<string, unknown>) {
 type Event = { tool: string; sessionID?: string; input?: { code?: unknown; [key: string]: unknown } };
 type Dependencies = { mode: () => string; log: (record: Record<string, unknown>) => void };
 
-export function createGuardHook(deps: Dependencies = { mode, log }) {
+export function createGuardHook(deps: Dependencies = { mode, log }, directory = process.cwd()) {
   return async (e: Event) => {
+    const started = performance.now();
+    let decision = 'allowed', errorTag: string | undefined;
     try {
       if (e.tool !== "execute") return;
       const input = e.input;
       if (typeof input?.code !== "string" || deps.mode() === "off" || !neverSettles(input.code)) return;
-      deps.log({ event: "deny", session: e.sessionID, code: input.code.slice(0, 300) });
+      decision = "denied";
+      deps.log({ event: "deny", session: e.sessionID });
       e.input = { ...input, code: `throw new Error(${JSON.stringify(denial)});` };
     } catch (err) {
-      try { deps.log({ event: "hook-error", session: e?.sessionID, error: String(err) }); } catch {}
+      errorTag = 'hook.error';
+      try { deps.log({ event: "hook-error", session: e?.sessionID, error: 'hook.error' }); } catch {}
+    } finally {
+      if (e.tool === 'execute') toolLogHook('codemode', decision, 'never-settles', started, undefined, errorTag, {sessionId:e.sessionID}, {cwd:directory});
     }
   };
 }
 
 export default {
   id: "codemode-guard",
-  setup: async (ctx: { tool: { hook: (event: string, fn: ReturnType<typeof createGuardHook>) => Promise<unknown> } }) => {
-    try { await ctx.tool.hook("execute.before", createGuardHook()); } catch {}
+  setup: async (ctx: { location?: {directory?: string}; tool: { hook: (event: string, fn: ReturnType<typeof createGuardHook>) => Promise<unknown> } }) => {
+    try { await ctx.tool.hook("execute.before", createGuardHook(undefined, ctx.location?.directory)); } catch {}
   },
 };

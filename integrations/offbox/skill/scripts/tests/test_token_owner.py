@@ -18,10 +18,9 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS / "tests"))
-sys.path.insert(0, str(SCRIPTS.parents[1] / "tests"))
 from offbox_lib import api, bases, common, lease, misc, pool, reap  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
-import test_boatd  # noqa: E402
+from test_home_wire import test_boatd  # noqa: E402
 
 GONE = "bx_gone0000"   # a box id the server has never heard of
 
@@ -73,7 +72,7 @@ class Home(Scoped):
     @contextlib.contextmanager
     def who(self, name):
         env = {"OFFBOX_THREAD": f"person:{name}"} if name != common.DEFAULT_OWNER else {}
-        with patch.dict(os.environ, env), patch.object(api, "_KEY", self.srv.tok[name]):
+        with patch.dict(os.environ, env), patch.object(api, "_key", return_value=self.srv.tok[name]):
             yield
 
     def reap(self, name):
@@ -200,7 +199,7 @@ class OtherPaths(Home):
                 patch.object(api, "fork", side_effect=AssertionError("our template is not hers to fork")):
             _box, source, _dir, _size = self.quiet(lease._new_box, self.con, dict(self.me, owner="person:moni"), None,
                                                     None, None, False)
-        self.assertEqual((source, made), ("fresh", [{}]), "a plain box, not our saved snapshot")
+        self.assertEqual((source, made), ("recipe:generic", [{}]), "her own recipe box, without our saved snapshot")
         row = self.con.execute("SELECT saved, expired_at FROM templates WHERE name='generic'").fetchone()
         self.assertEqual((row["saved"], row["expired_at"]), ("offbox-template-generic", None))
         with self.who("moni"), self.assertRaises(common.OffboxError) as cm:

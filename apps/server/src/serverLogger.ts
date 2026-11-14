@@ -1,3 +1,6 @@
+import { RotatingFileSink } from "@t3tools/shared/logging";
+import * as OwnerAnalytics from "./ardud/analytics/Analytics.ts";
+import { makeAnalyticsLogger } from "./observability/AnalyticsLogger.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as SharedObservability from "@t3tools/shared/observability";
 import * as Cause from "effect/Cause";
@@ -50,8 +53,36 @@ function prettyCauseFields(value: unknown): unknown {
 
 export const layer = Effect.gen(function* () {
   const config = yield* ServerConfig.ServerConfig;
+  const analytics = yield* Effect.serviceOption(OwnerAnalytics.Analytics);
+  const localAnalyticsLoggers =
+    analytics._tag === "Some" ? [makeAnalyticsLogger(analytics.value)] : [];
   const hostName = yield* HostProcess.Hostname;
   const layerMinimumLogLevel = Layer.succeed(References.MinimumLogLevel, config.logLevel);
+
+  // Desktop buffers stdout until a backend failure. Keep sparse lock diagnostics
+  // independently of that buffer and the high-volume trace rotation.
+  const boardLockSink = yield* Effect.try(
+    () =>
+      new RotatingFileSink({
+        filePath: `${config.logsDir}/board-locks.ndjson`,
+        maxBytes: 8 * 1024 * 1024,
+        maxFiles: 4,
+      }),
+  ).pipe(
+    Effect.catch(() =>
+      Effect.logWarning("board lock diagnostic log unavailable").pipe(Effect.as(undefined)),
+    ),
+  );
+  const boardLockLogger = Logger.make(({ fiber, message }) => {
+    if (fiber.getRef(References.CurrentLogAnnotations)["board.waiting_on"] === undefined) return;
+    const line = Array.isArray(message) ? message[0] : message;
+    try {
+      if (typeof line === "string") boardLockSink?.write(`${line}\n`);
+    } catch {
+      // Console/OTLP still receive the record. A failed diagnostic sink must
+      // never replace a board write's saved/retry result with a logger defect.
+    }
+  });
 
   const logs = config.otlpLogsExport;
   const otlpLogger =
@@ -73,8 +104,8 @@ export const layer = Effect.gen(function* () {
   // superset: keeping both would export every in-span message twice.
   const layerLogger = Logger.layer(
     otlpLogger === undefined
-      ? [consolePretty(), Logger.tracerLogger]
-      : [consolePretty(), otlpLogger],
+      ? [consolePretty(), Logger.tracerLogger, boardLockLogger, ...localAnalyticsLoggers]
+      : [consolePretty(), otlpLogger, boardLockLogger, ...localAnalyticsLoggers],
     { mergeWithExisting: false },
   ).pipe(
     Layer.provide(OtlpExporter.layerFlusher),

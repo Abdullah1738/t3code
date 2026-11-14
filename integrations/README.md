@@ -14,11 +14,11 @@ code here, test here, then sync it over.
 | `coord` | `~/.local/share/coord` | `com.ardud.coord-pump` (delivery pump) |
 | `app-api-cli` | `~/.local/share/app-api-cli` | none (order tracking, delivery store) |
 | `stream-recovery` | `~/.local/share/stream-recovery` | `com.ardud.stream-recovery` (event-stream loss recovery, every 60s) |
+| `robob-guard` | `~/.local/share/robob-guard` + `~/.local/bin/robob-install-hold` | `com.ardud.robob-guard` (background reopen on close/crash/login, every 30s; live install heartbeat holds it off) |
 | `catalog-guard` | `~/.local/share/catalog-guard` | `com.ardud.catalog-guard` (repairs a partial OpenCode model catalog, every 150s) |
 | `message-archive` | `~/.local/share/message-archive` | `com.ardud.message-archive` (local mail mirror + `msgs` search over email, iMessage, WhatsApp) |
 | `offbox` | `~/.config/opencode/skills/remote-compute` + gate plugin, `~/.local/bin/{offbox,boat}` | `com.ardud.offbox-monitor` (boat.dev offload gate, monitor and reaper; deploy via `offbox/install.zsh`) |
 | `opencode-plugins` | `~/.config/opencode/{plugin,lib}` | none (Code Mode guard; install via `opencode-plugins/install.zsh`, then owner-approved OpenCode restart) |
-| `ovnfs-recovery` | `~/.local/share/ovnfs-recovery` (internal disk) | `com.abdullah.ovnfs-recovery` (SSD-return recovery; install via `ovnfs-recovery/install.zsh` after owner approval) |
 | `local-helpers` | `~/.local/libexec/{mail,card-preview,qcard}`, `~/.local/bin/{himalaya-heal,mailsearch,qcard}` | `local.ardud.otp-watch`, `local.ardud.otp-idle`, `local.ardud.mail-token-refresh` (mail OAuth heal, OTP watcher, card helpers; deploy via `local-helpers/install.zsh`) |
 | `tail-gateway` | `~/.local/share/tail-gateway`, `~/.local/bin/tailname` | `com.ardud.tail-gateway-{node,dns,proxy}` (friendly `https://<name>.tail` names for local services, tailnet only; deploy via `tail-gateway/install.zsh`) |
 | `robob-cards` | none (runs from the repo; builds and enrollments in `~/.local/share/robob-cards`) | none (iMessage card app; `bin/robob-cards-build`, `bin/robob-cards-enroll`) |

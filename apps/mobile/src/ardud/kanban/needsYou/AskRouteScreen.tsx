@@ -1,3 +1,5 @@
+import { AskTimingScrollView } from "./AskTimingScrollView";
+import { AskTiming } from "./useAskTiming";
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
 import {
   EMPTY_NEEDS_YOU_FILTER,
@@ -17,7 +19,6 @@ import {
   askRepliedOnCard,
   askRequiresSecret,
   askSecretAnswerInput,
-  askWordsForReply,
   buildAskAnswer,
   isPlainAnswerField,
   needsYouFocusOrder,
@@ -369,21 +370,8 @@ function OpenAsk(props: {
     // He is elsewhere: say it where he is, since the ask's own line is out of sight.
     else asks.showAskToast({ text: `Answer not sent. ${failure.message}` }, 9_000);
   };
-  // Words alone never close a pick he has to make: they go to its agent as a reply and the ask stays open.
-  const sendWordsAsReply = (words: string) => {
-    void asks.replyOnAsk(entry, [{ _tag: "md", text: words }]).then(
-      () => {
-        asks.patchAskForm(entry, { ownWords: "" });
-        asks.showAskToast({ text: "Sent as a reply. The ask stays open." });
-      },
-      (error: unknown) =>
-        asks.showAskToast({ text: `Reply not sent. ${askFailureText(error)}` }, 9_000),
-    );
-  };
   const send = (intent: "primary" | "refuse") => {
     if (locked || secretBusy) return;
-    const words = intent === "primary" ? askWordsForReply(ask, form) : null;
-    if (words !== null) return sendWordsAsReply(words);
     const now = buildAskAnswer(
       ask,
       askFormWithSecrets(ask, form, secrets),
@@ -500,12 +488,13 @@ function OpenAsk(props: {
       ]}
       menus={[{ title: "More", icon: "ellipsis.circle", items: more }]}
     >
-      <ScrollView
+      <AskTimingScrollView
         ref={scroll}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="interactive"
         contentContainerClassName="gap-5 px-4 pb-8 pt-4"
       >
+        <AskTiming cardId={entry.cardId} askId={entry.ask.id} />
         <View className="gap-2.5">
           <Text className="text-sm text-foreground-muted">
             {askKindLabel(entry.kind)} · {askAsker(entry).replace(/^the /, "")} ·{" "}
@@ -735,7 +724,7 @@ function OpenAsk(props: {
             )}
           </View>
         ) : null}
-      </ScrollView>
+      </AskTimingScrollView>
 
       <AskBar
         turn={turn}

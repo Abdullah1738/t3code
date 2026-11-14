@@ -50,6 +50,7 @@ import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { threadTranscriptHeader } from "@t3tools/shared/threadTranscript";
 import { runningBackgroundWork } from "../ardud/context-reset/backgroundWork.ts";
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -68,6 +69,7 @@ import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { DispatchModeLimit, exceededDispatchModeLimit } from "./DispatchModeLimit.ts";
 import { projectTurnItemForDetail } from "./WireProjection.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
+import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
 import * as ServerSettings from "../serverSettings.ts";
 
 export type ThreadManagementSendMode = "auto" | "queue" | "steer" | "restart";
@@ -402,7 +404,10 @@ export interface ThreadManagementServiceShape {
     Effect.Effect<OrchestrationV2ThreadShellSnapshot, Orchestrator.OrchestratorV2Error>,
     Orchestrator.OrchestratorV2Error
   >;
+  readonly getCallerRow: Orchestrator.OrchestratorV2["Service"]["getCallerRow"];
   readonly getThreadShell: Orchestrator.OrchestratorV2["Service"]["getThreadShell"];
+  readonly getThreadIdsForWorktree: Orchestrator.OrchestratorV2["Service"]["getThreadIdsForWorktree"];
+  readonly getThreadListCandidates: Orchestrator.OrchestratorV2["Service"]["getThreadListCandidates"];
   readonly listProjectThreads: (input: {
     readonly projectId: ProjectId;
     readonly includeSubagents: boolean;
@@ -427,6 +432,7 @@ export interface ThreadManagementServiceShape {
    */
   readonly hasReceipt: (commandId: CommandId) => Effect.Effect<boolean>;
   readonly getCommandReceipt: CommandReceiptStore.CommandReceiptStoreV2["Service"]["getByCommandId"];
+  readonly findMcpThreadCreations: CommandReceiptStore.CommandReceiptStoreV2["Service"]["findMcpThreadCreations"];
   readonly waitForThread: (
     input: ThreadManagementWaitInput,
   ) => Effect.Effect<ThreadManagementWaitResult, ThreadManagementError>;
@@ -958,28 +964,44 @@ const make = Effect.gen(function* () {
         ),
       );
 
-  const listProjectThreads: ThreadManagementServiceShape["listProjectThreads"] = (input) =>
-    orchestrator.getShellSnapshot({ projectId: input.projectId, location: "active" }).pipe(
-      Effect.mapError(
-        (cause) =>
-          new ThreadManagementProjectThreadsListError({
-            projectId: input.projectId,
-            cause,
-          }),
-      ),
-      Effect.map((snapshot) =>
-        snapshot.threads
-          .filter(
-            (thread) =>
-              input.includeSubagents || thread.lineage.relationshipToParent !== "subagent",
-          )
-          .toSorted(
-            (left, right) =>
-              DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt) ||
-              right.id.localeCompare(left.id),
+  const listProjectThreads: ThreadManagementServiceShape["listProjectThreads"] = Effect.fn(
+    "ThreadManagementService.listProjectThreads",
+  )(function* (input) {
+    const threads: OrchestrationV2ThreadShell[] = [];
+    let afterThreadId: string | undefined;
+    // Each page releases the reader before the next one. MCP lists must not
+    // monopolize the background slot while building every shell in a project.
+    while (true) {
+      const snapshot = yield* orchestrator
+        .getShellSnapshot({
+          projectId: input.projectId,
+          location: "active",
+          limit: 100,
+          ...(afterThreadId === undefined ? {} : { afterThreadId }),
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new ThreadManagementProjectThreadsListError({
+                projectId: input.projectId,
+                cause,
+              }),
           ),
-      ),
-    );
+        );
+      threads.push(...snapshot.threads);
+      if (snapshot.threads.length < 100) break;
+      afterThreadId = snapshot.threads.at(-1)?.id;
+    }
+    return threads
+      .filter(
+        (thread) => input.includeSubagents || thread.lineage.relationshipToParent !== "subagent",
+      )
+      .toSorted(
+        (left, right) =>
+          DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt) ||
+          right.id.localeCompare(left.id),
+      );
+  });
 
   const sendToThread: ThreadManagementServiceShape["sendToThread"] = Effect.fn(
     "ThreadManagementService.sendToThread",
@@ -1090,23 +1112,26 @@ const make = Effect.gen(function* () {
       };
     }
 
-    const dispatched = yield* dispatch({
-      type: "message.dispatch",
-      commandId: input.commandId,
-      threadId: input.threadId,
-      messageId: input.messageId,
-      ...(input.scheduledTaskId === undefined ? {} : { scheduledTaskId: input.scheduledTaskId }),
-      ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
-      text: input.text,
-      attachments: input.attachments,
-      ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
-      dispatchMode,
-      createdBy: input.createdBy,
-      creationSource: input.creationSource,
-      ...(input.contextReset === true ? { contextReset: true } : {}),
-      // ardud:
-      ...(input.context === undefined ? {} : { context: input.context }),
-    });
+    const dispatched = yield* SendAcknowledgement.observe(
+      dispatch({
+        type: "message.dispatch",
+        commandId: input.commandId,
+        threadId: input.threadId,
+        messageId: input.messageId,
+        ...(input.scheduledTaskId === undefined ? {} : { scheduledTaskId: input.scheduledTaskId }),
+        ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
+        text: input.text,
+        attachments: input.attachments,
+        ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+        dispatchMode,
+        createdBy: input.createdBy,
+        creationSource: input.creationSource,
+        ...(input.contextReset === true ? { contextReset: true } : {}),
+        // ardud:
+        ...(input.context === undefined ? {} : { context: input.context }),
+      }),
+      input,
+    );
     const projection = yield* getProjectThreadRecords(input, ["runs", "messages", "turnItems"], {
       messageIds: [input.messageId],
       turnItemTypes: ["user_message"],
@@ -1147,6 +1172,7 @@ const make = Effect.gen(function* () {
   const waitForThread: ThreadManagementServiceShape["waitForThread"] = Effect.fn(
     "ThreadManagementService.waitForThread",
   )(function* (input) {
+    const waitStartedAt = yield* Clock.monotonicTimeNanos;
     const loadError = (cause: unknown) =>
       new ThreadManagementProjectionLoadError({
         projectId: input.projectId,
@@ -1227,7 +1253,14 @@ const make = Effect.gen(function* () {
       ),
       Stream.filter((current) => current.settled),
       Stream.runHead,
-      Effect.timeoutOption(Duration.millis(Math.max(1, input.timeoutMs))),
+      Effect.timeoutOption(
+        Duration.millis(
+          Math.max(
+            0,
+            input.timeoutMs - Number((yield* Clock.monotonicTimeNanos) - waitStartedAt) / 1_000_000,
+          ),
+        ),
+      ),
     );
     const waited = Option.flatten(yield* wait);
     if (Option.isSome(waited)) {
@@ -1508,12 +1541,16 @@ const make = Effect.gen(function* () {
     getProjectThread,
     getShellSnapshot: orchestrator.getShellSnapshot,
     readShellSnapshot: orchestrator.readShellSnapshot,
+    getCallerRow: orchestrator.getCallerRow,
     getThreadShell: orchestrator.getThreadShell,
+    getThreadIdsForWorktree: orchestrator.getThreadIdsForWorktree,
     listProjectThreads,
+    getThreadListCandidates: orchestrator.getThreadListCandidates,
     sendToThread,
     assertProviderInstanceEnabled,
     isProviderInstanceEnabledForProject,
     hasReceipt,
+    findMcpThreadCreations: receipts.findMcpThreadCreations,
     getCommandReceipt: Effect.fn("ThreadManagementService.getCommandReceipt")(
       receipts.getByCommandId,
     ),

@@ -16,14 +16,15 @@ def session_start():
         return
     home = Path.home()
     offbox = os.environ.get("HARNESS_HOOKS_OFFBOX_BLOCKERS", str(home / ".config/opencode/skills/remote-compute/scripts/blockers"))
-    coord = os.environ.get("HARNESS_HOOKS_COORD_BLOCKERS", str(home / ".local/share/harness-hooks/coord-blockers"))
     with open(env_file, "a", encoding="utf-8") as f:
-        f.write("export PATH=" + shlex.quote(offbox + ":" + coord) + ':"$PATH"\n')
+        f.write("export PATH=" + shlex.quote(offbox + ":" + str(home / ".local/share/quint-guard/bin")) + ':"$PATH"\n')
         f.write("export OFFBOX_GATE=1\nexport ROBOB_HARNESS=claude\n")
 
 
 def response(event, result):
     kind = event.get("hook_event_name")
+    if kind == "PostToolUse" and "updatedToolOutput" in result["context"]:
+        return {"hookSpecificOutput": {"hookEventName": kind, "updatedToolOutput": result["context"]["updatedToolOutput"]}}
     if kind != "PreToolUse" or (result["decision"] != "deny" and "updatedInput" not in result["context"]):
         return None
     specific = {"hookEventName": kind}
@@ -51,6 +52,9 @@ def main():
             except OSError:
                 engine.log_event_error("claude", "SessionStart", "session-export-error", "session-export-error")
                 return
+        # The desktop-specific registration already masks and ends its lease.
+        if sys.argv[1:] == ["--card-mask"] and engine.desktop_lease.matches(event.get("tool_name")):
+            return
         result = engine.decide(event, "claude")
         output = response(event, result)
         if output is not None:

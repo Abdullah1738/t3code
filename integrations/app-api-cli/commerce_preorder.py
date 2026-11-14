@@ -1,4 +1,5 @@
 """NowNow pre-order intent binding. Secrets stay in Keychain, hashes in journal."""
+import toollog
 import copy
 import hashlib
 
@@ -78,8 +79,11 @@ def recover(flow_id, *, auth=None, vault=None, timeout=20, challenge=None):
     # needed; the durable journal+vault supply that local ownership binding.
     result=client._call('payment_status',{'clientSecret':saved['secret']},timeout,
         project=lambda data:Snapshot(data,project_payment(data,None),time.time()))
+    from commerce_pending import record_approval
+    record_approval(flow_id,result.wire)
     op=next(x['name'] for x in state['operations'] if x['kind']=='prepay')
     journal.observe(flow_id,op,outcome=payment_outcome(result.projection),evidence_hash=journal.digest(result.projection))
+    observe_zero_amounts(flow_id, op, result.wire)
     if payment_outcome(result.projection) == 'PREORDER_PAYMENT_CONFIRMED':
         journal.reconcile_nownow_preorder(flow_id)
     if challenge is not None and payment_outcome(result.projection) == 'CHALLENGE_REQUIRED':
@@ -88,12 +92,13 @@ def recover(flow_id, *, auth=None, vault=None, timeout=20, challenge=None):
             'journal_state':journal.inspect(flow_id)['state']}
 
 
+@toollog.timed("commerce", "step.bank_approval_wait", lane="nownow")
 def await_payment(flow_id, *, open_redirect=False, notify=True, wait_seconds=600,
                   poll_seconds=5, sleep=None, clock=None):
     """Continue a consumed verification; never place or send completion again.
 
-    Opening the bank challenge is explicit on recovery. Plain recovery and
-    await-payment remain status-only, including for old unopened intents.
+    Opening the bank challenge is explicit on recovery. Alerts use the exact
+    verification amount even when redirect opening was not requested.
     """
     import time
     from commerce_redirect import open_once
@@ -111,7 +116,7 @@ def await_payment(flow_id, *, open_redirect=False, notify=True, wait_seconds=600
     amount = None
     def challenge(saved, wire):
         nonlocal notified, amount
-        if not open_redirect:
+        if not open_redirect and not notify:
             return
         state = load(flow_id)
         if (fingerprint(wire.get('customer_code')) != state['binding']['account_hash']
@@ -122,9 +127,10 @@ def await_payment(flow_id, *, open_redirect=False, notify=True, wait_seconds=600
         amount = amount_minor(wire.get('amount'))
         if amount <= 0 or amount > saved['payable_minor']:
             journal.fail('PREORDER_CHALLENGE_AMOUNT_INVALID')
-        open_once(flow_id, saved['intent_hash'], wire.get('redirect_url'))
         if notify and not notified:
             notified = notify_owner(flow_id, amount, state['card_last4'])
+        if open_redirect:
+            open_once(flow_id, saved['intent_hash'], wire.get('redirect_url'))
     while True:
         result = recover(flow_id, challenge=challenge)
         confirmed = payment_outcome(result) == 'PREORDER_PAYMENT_CONFIRMED'
@@ -139,6 +145,16 @@ def await_payment(flow_id, *, open_redirect=False, notify=True, wait_seconds=600
             return {**result, 'financial_send': False, 'timed_out': True,
                     'verification_only': True, 'verification_confirmed': False, 'notified': notified}
         sleep(min(poll_seconds, wait_seconds-elapsed))
+
+
+def observe_zero_amounts(flow_id, operation, wire):
+    """A zero-valued intent is not a purchase in flight; its account fence remains."""
+    from noon_minutes_checkout import amount_minor
+    keys = ('authorized_amount', 'captured_amount', 'reversed_amount', 'refunded_amount')
+    if all(wire.get(k) is not None for k in keys):
+        if all(amount_minor(wire[k]) == 0 for k in keys):
+            journal.observe(flow_id, operation, outcome='PREORDER_ZERO_AMOUNTS',
+                            evidence_hash=journal.digest({k: 0 for k in keys}))
 
 
 def notify_owner(flow_id, amount, card_last4, *, stalled=False):

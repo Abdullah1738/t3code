@@ -17,8 +17,14 @@ import os
 import re
 import sys
 import tempfile
+import time
+from functools import wraps
+from contextvars import ContextVar
 import tomllib
 from pathlib import Path
+
+
+import toollog
 
 PKG = Path(__file__).resolve().parent
 SECRET_RE = re.compile(r"(sk-[A-Za-z0-9]{10,}|Bearer [A-Za-z0-9._-]{10,}|ghp_[A-Za-z0-9]{10,})")
@@ -197,6 +203,8 @@ def discover_skills(skill_roots: list[str]) -> tuple[list[tuple[str, str]], list
                     continue
                 except OSError as exc:
                     cannot_inspect(current if entry.name == "SKILL.md" else entry.path, exc)
+            if is_skill and '.bak' in Path(current).name:
+                toollog.emit('skills', 'error', 'skill.backup', ok=False, props={'count': 1}, error_tag='skill.backup')
             if is_skill and real not in seen_real:
                 try:
                     name = skill_name(Path(current) / "SKILL.md")
@@ -216,8 +224,11 @@ def discover_skills(skill_roots: list[str]) -> tuple[list[tuple[str, str]], list
         by_name.setdefault(name, []).append(path)
     clashes = {n: p for n, p in by_name.items() if len(p) > 1}
     if clashes:
+        toollog.emit('skills', 'error', 'skill.duplicate', ok=False, props={'count': len(clashes)}, error_tag='skill.duplicate')
         lines = [f"  {name}: " + " and ".join(paths) for name, paths in sorted(clashes.items())]
         raise HomeError("skill name collision, nothing written:\n" + "\n".join(lines))
+    toollog.emit('skills', 'error' if unreadable else 'event', 'skill.scan', ok=not unreadable,
+                 props={'count': len(found)}, error_tag='skill.unreadable' if unreadable else None)
     return sorted(found), unreadable
 
 
@@ -337,6 +348,7 @@ def claude_settings_owned(manifest: dict, existing: dict | None = None) -> dict:
             "DISABLE_AUTOUPDATER": "1",
             "DISABLE_TELEMETRY": "1",
             "DISABLE_ERROR_REPORTING": "1",
+            "PATH": ":".join(manifest["shellPathPrefix"] + manifest["shellPath"]),
             "BUN_INSPECT": "",
             "ANTHROPIC_BASE_URL": "http://127.0.0.1:20128",
             "ANTHROPIC_CUSTOM_HEADERS": "x-9router-token-saver: off",
@@ -344,6 +356,8 @@ def claude_settings_owned(manifest: dict, existing: dict | None = None) -> dict:
             "ENABLE_PROMPT_CACHING_1H": "1",
             "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS": "450000",
             "API_TIMEOUT_MS": "1800000",
+            "MCP_TIMEOUT": str(c["mcpTimeoutMs"]),
+            "MCP_CONNECT_TIMEOUT_MS": str(c["mcpTimeoutMs"]),
             "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "900000",
             "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": "900000",
             "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS": "900000",
@@ -799,6 +813,7 @@ def build(manifest: dict, homes: dict[str, str]) -> dict:
     for name in ("codex", "codex-cu"):
         home = homes[name]
         existing_state = None
+        prior = {}
         config_path = os.path.join(home, "config.toml")
         if os.path.exists(config_path):
             try:
@@ -806,7 +821,11 @@ def build(manifest: dict, homes: dict[str, str]) -> dict:
             except tomllib.TOMLDecodeError as exc:
                 raise HomeError(f"{config_path} is not valid TOML ({exc}); fix or remove it") from exc
             existing_state = (prior.get("hooks") or {}).get("state")
-        files[config_path] = toml_dump(codex_config(manifest, home, existing_state, name)).encode("utf-8")
+        config = codex_config(manifest, home, existing_state, name)
+        # Codex writes project trust decisions at runtime; regeneration must retain them.
+        if "projects" in prior:
+            config["projects"] = prior["projects"]
+        files[config_path] = toml_dump(config).encode("utf-8")
         instructions = canonical + b"\n\n" + overlays["codex"]
         if name == "codex-cu":
             instructions += b"\n\n" + overlays["codex-cu"]
@@ -841,11 +860,20 @@ def claude_owned_json(content: bytes) -> bytes:
     return json.dumps(owned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+def codex_owned_json(content: bytes) -> bytes:
+    value = tomllib.loads(content.decode("utf-8"))
+    value.pop("projects", None)
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
 def artifact_digest(path: str, content: bytes) -> dict:
     artifact = {"path": os.path.abspath(path)}
     if os.path.basename(path) == ".claude.json":
         content = claude_owned_json(content)
         artifact["format"] = "claude-owned-json"
+    elif os.path.basename(path) == "config.toml":
+        content = codex_owned_json(content)
+        artifact["format"] = "codex-owned-json"
     artifact["sha256"] = hashlib.sha256(content).hexdigest()
     return artifact
 
@@ -900,8 +928,12 @@ def plan_all(home_root: str | None) -> tuple[dict, dict, list, list, dict]:
 class Writer:
     def __init__(self, dry_run: bool):
         self.dry_run = dry_run
+        self.changed = 0
 
     def _say(self, verb: str, path: str) -> None:
+        self.changed += 1
+        if _run_metrics.get() is not None:
+            _run_metrics.get()["filesChanged"] = self.changed
         prefix = "would " if self.dry_run else ""
         print(f"{prefix}{verb} {path}")
 
@@ -963,6 +995,31 @@ def warn_mcp_parity(manifest: dict, home_root: str | None, override: str | None)
         print(f"warning: {msg}", file=sys.stderr)
 
 
+_run_metrics = ContextVar("toollog_run_metrics", default=None)
+
+
+def logged_run(name):
+    def decorate(fn):
+        @wraps(fn)
+        def run(*args, **kwargs):
+            started = time.perf_counter()
+            ok = False
+            metrics = {"filesChanged": 0, "driftFound": 0}
+            token = _run_metrics.set(metrics)
+            try:
+                result = fn(*args, **kwargs)
+                ok = result == 0
+                return result
+            finally:
+                toollog.emit('harness-homes', 'perf' if ok else 'error', name,
+                             duration_ms=(time.perf_counter() - started) * 1000, ok=ok, props=metrics,
+                             error_tag=None if ok else name + '.failed')
+                _run_metrics.reset(token)
+        return run
+    return decorate
+
+
+@logged_run('generate.run')
 def generate(home_root: str | None, dry_run: bool, opencode_config: str | None = None) -> int:
     manifest, homes, skills, unreadable, files = plan_all(home_root)
     farms = [os.path.join(home, "skills") for home in homes.values()]
@@ -984,11 +1041,16 @@ def generate(home_root: str | None, dry_run: bool, opencode_config: str | None =
             else:
                 writer.link(op[1], op[2])
     warn_mcp_parity(manifest, home_root, opencode_config)
+    if _run_metrics.get() is not None:
+        _run_metrics.get()["filesChanged"] = writer.changed
+    toollog.emit('harness-homes', 'event', 'generate.files', ok=True,
+                 props={'filesChanged': writer.changed, 'dryRun': dry_run})
     return 0
 
 
 # ---------- check ----------
 
+@logged_run('generate.check')
 def check(home_root: str | None, *, json_output: bool = False, opencode_config: str | None = None) -> int:
     manifest, homes, skills, unreadable, files = plan_all(home_root)
     guard_outputs([*homes.values(), *(os.path.join(home, "skills") for home in homes.values()), *files])
@@ -1045,6 +1107,10 @@ def check(home_root: str | None, *, json_output: bool = False, opencode_config: 
             elif os.path.normpath(os.path.join(farm, os.readlink(link))) != path:
                 failures.append(f"{label} skills: link {name} points at the wrong directory")
 
+    if _run_metrics.get() is not None:
+        _run_metrics.get()["driftFound"] = len(failures)
+    toollog.emit('harness-homes', 'event' if not failures else 'error', 'generate.drift', ok=not failures,
+                 props={'driftFound': len(failures)}, error_tag='home.drift' if failures else None)
     if json_output:
         print(json.dumps({"schemaVersion": 1, "ok": not failures, "failures": failures,
                           "homes": [{"harness": name, "home": home,
@@ -1076,11 +1142,20 @@ def describe_side(view: dict | None) -> str:
     return redact(text)
 
 
+@logged_run('mcp_diff.run')
 def mcp_diff(*, json_output: bool, opencode_config: str | None) -> int:
     """Read-only: print both sides per id. Exit 0 in parity, 1 on any drift or unreadable config."""
     manifest = load_manifest()
     validate_manifest(manifest)
     path, rows, failures = mcp_parity(manifest, opencode_config)
+    if _run_metrics.get() is not None:
+        _run_metrics.get()["differingCount"] = sum(r["status"] not in {"ok", "ignored", "disabled"} for r in rows)
+    for row in rows:
+        if row['status'] not in {'ok', 'ignored', 'disabled'}:
+            toollog.emit('harness-homes', 'error', 'mcp_diff.difference', ok=False,
+                         ids={'serverId': row['id']}, props={'status': row['status']}, error_tag='mcp.drift')
+    toollog.emit('harness-homes', 'event', 'mcp_diff.summary', ok=not failures,
+                 props={'differingCount': sum(r['status'] not in {'ok', 'ignored', 'disabled'} for r in rows)})
     ignore = sorted((manifest.get("mcpParity") or {}).get("ignore", []))
     if json_output:
         print(json.dumps({"schemaVersion": 1, "ok": not failures, "opencodeConfig": path,

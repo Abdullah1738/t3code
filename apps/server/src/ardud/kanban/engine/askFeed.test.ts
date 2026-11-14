@@ -244,7 +244,7 @@ it.effect(
     }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
 );
 
-it.effect("bounds each ask scan before matching, including gaps and an empty trailing batch", () =>
+it.effect("pages indexed ask candidates across gaps without reading the empty trailing cards", () =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     yield* KanbanStore.KanbanStore;
@@ -290,7 +290,7 @@ it.effect("bounds each ask scan before matching, including gaps and an empty tra
     assert.isAtMost(Math.max(...batches), 64);
     assert.strictEqual(
       batches.reduce((a, b) => a + b, 0),
-      3_000,
+      2_800,
     );
     assert.deepStrictEqual(
       all.open.map((item) => item.cardRef),
@@ -307,6 +307,134 @@ it.effect("bounds each ask scan before matching, including gaps and an empty tra
     assert.strictEqual(history.closed.length, 2 * Math.floor(2_800 / 30));
     assert.deepStrictEqual(history.open, all.open);
     yield* sql`UPDATE ardud_kanban_cards SET json = json_set(json, '$.asks', json('[]'))`;
+    assert.deepStrictEqual((yield* readAskFeed(sql, {}, AT)).open, []);
+  }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+);
+
+it.effect("uses partial indexes for three asking cards among 5,100 cards, including history", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* KanbanStore.KanbanStore;
+    for (const boardId of ["board-a", "board-b"]) {
+      yield* sql`INSERT INTO ardud_kanban_boards (id, slug, json)
+        VALUES (${boardId}, ${boardId.slice(6)}, ${JSON.stringify({ name: boardId })})`;
+    }
+    const asking = new Set([17, 2_600, 5_099]);
+    const cards = Array.from({ length: 5_100 }, (_, i) => {
+      const number = i + 1;
+      const boardId = number > 2_550 ? "board-b" : "board-a";
+      const card = JSON.parse(cardJson(number, boardId));
+      card.asks = asking.has(number) ? JSON.parse(cardJson(100, boardId)).asks : [];
+      card.stage = asking.has(number) ? "needs_owner" : "verified";
+      return card;
+    });
+    // Mixed open/closed, closed-only, old history, and the exact history boundary.
+    cards[16].asks.push(
+      ...JSON.parse(cardJson(30, "board-a")).asks,
+      ...JSON.parse(cardJson(3, "board-a")).asks.map((ask: object) => ({ ...ask, id: "old" })),
+    );
+    cards[18].asks = JSON.parse(cardJson(60, "board-a")).asks;
+    cards[19].asks = JSON.parse(cardJson(90, "board-a")).asks;
+    cards[19].asks[0].closedAt = "2026-11-10T09:00:00.000Z";
+    yield* sql.withTransaction(
+      Effect.forEach(
+        cards,
+        (card) => sql`INSERT INTO ardud_kanban_cards
+        (id, board_id, number, stage, json)
+        VALUES (${card.id}, ${card.boardId}, ${card.number}, ${card.stage}, ${JSON.stringify(card)})`,
+        { discard: true },
+      ),
+    );
+
+    const pages: Array<{ rows: number; plan: string }> = [];
+    const observe: Statement.Transformer = (statement) => {
+      const [query, params] = statement.compile();
+      if (!query.includes("'boardId', c.board_id")) return Effect.succeed(statement);
+      return Effect.gen(function* () {
+        const plan = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`, params);
+        const rows = yield* sql.unsafe<{ count: number }>(
+          `SELECT COUNT(*) AS count FROM (${query})`,
+          params,
+        );
+        pages.push({ rows: rows[0]!.count, plan: plan.map((row) => row.detail).join("\n") });
+        return statement;
+      }).pipe(Effect.provideService(Statement.CurrentTransformer, undefined), Effect.orDie);
+    };
+    for (const boardId of [undefined, "board-a", "board-b"]) {
+      for (const closedSince of [undefined, "2026-11-10T09:00:00.000Z", AT]) {
+        pages.length = 0;
+        const feed = yield* readAskFeed(sql, { boardId: boardId as never, closedSince }, AT).pipe(
+          Effect.provideService(Statement.CurrentTransformer, observe),
+        );
+        assert.strictEqual(pages.length, 1);
+        assert.isAtMost(pages[0]!.rows, closedSince === undefined ? 3 : 5);
+        assert.match(
+          pages[0]!.plan,
+          /USING (?:COVERING )?INDEX ardud_kanban_cards_open_asks/,
+          pages[0]!.plan,
+        );
+        assert.notMatch(pages[0]!.plan, /SCAN (?:c|ardud_kanban_cards)(?:$|\s)/m);
+        if (closedSince !== undefined)
+          assert.match(
+            pages[0]!.plan,
+            /USING (?:COVERING )?INDEX ardud_kanban_cards_closed_asks/,
+            pages[0]!.plan,
+          );
+        const scoped = cards.filter((card) => boardId === undefined || card.boardId === boardId);
+        // Full-card scan oracle: the old query's per-ask predicate, card order and history cap.
+        const expected = scoped.flatMap((card) =>
+          card.asks.flatMap((ask: { id: string; closedAt: string | null }) =>
+            (
+              ask.closedAt === null
+                ? card.settledAt === null
+                : closedSince !== undefined && ask.closedAt >= closedSince
+            )
+              ? [{ cardId: card.id, ask }]
+              : [],
+          ),
+        );
+        assert.deepStrictEqual(
+          feed.open.map((item) => ({ cardId: item.cardId, ask: item.ask })),
+          expected.filter((item) => item.ask.closedAt === null),
+        );
+        assert.deepStrictEqual(
+          feed.closed.map((item) => ({ cardId: item.cardId, ask: item.ask })),
+          expected
+            .filter((item) => item.ask.closedAt !== null)
+            .sort((a, b) => (b.ask.closedAt ?? "").localeCompare(a.ask.closedAt ?? ""))
+            .slice(0, 200),
+        );
+      }
+    }
+
+    const started = performance.now();
+    const measured = yield* readAskFeed(sql, {}, AT);
+    const ms = performance.now() - started;
+    assert.strictEqual(measured.open.length, 3);
+    yield* Effect.logInfo(
+      JSON.stringify({
+        fixtureCards: cards.length,
+        openAsks: measured.open.length,
+        legacyCandidatePages: Math.ceil(cards.length / 64),
+        indexedCandidatePages: 1,
+        indexedCandidateRows: 3,
+        syntheticRequestMs: ms,
+      }),
+    );
+
+    // Index membership follows JSON writes (including SQLite json_set) in both directions.
+    yield* sql`UPDATE ardud_kanban_cards SET json = json_set(json, '$.asks', json('[]'))`;
+    const empty = yield* readAskFeed(sql, { closedSince: "2026-11-01T00:00:00.000Z" }, AT);
+    assert.deepStrictEqual([empty.open, empty.closed], [[], []]);
+    const card = cards[1]!;
+    const asks = JSON.parse(cardJson(100, card.boardId)).asks;
+    yield* sql`UPDATE ardud_kanban_cards SET json = json_set(json, '$.asks', json(${JSON.stringify(asks)}))
+      WHERE id = ${card.id}`;
+    assert.deepStrictEqual(
+      (yield* readAskFeed(sql, {}, AT)).open.map((item) => item.cardId),
+      [card.id],
+    );
+    yield* sql`DELETE FROM ardud_kanban_cards WHERE id = ${card.id}`;
     assert.deepStrictEqual((yield* readAskFeed(sql, {}, AT)).open, []);
   }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
 );

@@ -87,7 +87,7 @@ class RemoteWrapperTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             (Path(home) / 'w/repo/sub').mkdir(parents=True)
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                patch.object(runs, 'LDCACHE_REPAIR', ':'):
+                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('w/repo', 'sub', argv, None, 'run-test')
             env = {'HOME': home, 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
             return subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True,
@@ -172,7 +172,7 @@ class RemoteWrapperTests(unittest.TestCase):
             env = {'HOME': home, 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
             cases = [(['false'], 1), (['exit 3'], 3), (['true'], 0), (['sh', '-c', 'kill -KILL $$'], 137)]
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                    patch.object(runs, 'LDCACHE_REPAIR', ':'):
+                    patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
                 for i, (argv, code) in enumerate(cases):
                     run_id = f"run-test-{i}"
                     with self.subTest(argv=argv):
@@ -219,15 +219,30 @@ class PoolQueueTests(Isolated):
             self.box(bid, member=True)
             self.busy(bid)
 
-    def test_default_wait_is_600_and_capped(self):
+    @patch.object(pool, 'at_home', return_value=False)
+    def test_boat_default_wait_is_600_and_capped(self, _at_home):
         env = dict(os.environ)
         env.pop('OFFBOX_POOL_WAIT_SECONDS', None)
         with patch.dict(os.environ, env, clear=True):
             self.assertEqual(pool.wait_seconds(), 600)
+        self.assertEqual(pool.wait_max(), 1200)
         with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '5000'}):
             self.assertEqual(pool.wait_seconds(), 1200)
 
-    def test_busy_timeout_is_distinct_92_and_says_nothing_ran(self):
+    @patch.object(pool, 'at_home', return_value=True)
+    def test_home_default_wait_is_86400_and_capped(self, _at_home):
+        env = dict(os.environ)
+        env.pop('OFFBOX_POOL_WAIT_SECONDS', None)
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(pool.wait_seconds(), 86400)
+        self.assertEqual(pool.wait_max(), 86400)
+        with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '5000'}):
+            self.assertEqual(pool.wait_seconds(), 5000)
+        with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '999999'}):
+            self.assertEqual(pool.wait_seconds(), 86400)
+
+    @patch.object(pool, 'at_home', return_value=False)
+    def test_busy_timeout_is_distinct_92_and_says_nothing_ran(self, _at_home):
         self.full_pool()
         with patch.object(lease, 'acquire_private') as new:
             with self.assertRaises(pool.PoolBusyError) as caught:
@@ -242,7 +257,8 @@ class PoolQueueTests(Isolated):
         self.assertIn('remote queue timed out', str(e))
         self.assertIn('Nothing ran', str(e))
 
-    def test_start_limit_timeout_stays_90(self):
+    @patch.object(pool, 'at_home', return_value=False)
+    def test_start_limit_timeout_stays_90(self, _at_home):
         capacity.cooldown({}, {'message': 'day limit'})
         self.box('stopped', 'stopped')
         with self.assertRaises(capacity.CapacityError) as caught:
@@ -250,12 +266,14 @@ class PoolQueueTests(Isolated):
         self.assertNotIsInstance(caught.exception, pool.PoolBusyError)
         self.assertEqual(caught.exception.code, 90)
 
-    def test_queue_prints_position_progress_and_hint(self):
+    def queue_position_progress_and_hint(self):
         self.full_pool()
         self.con.execute("INSERT INTO runs(run_id,status,repo_root,start_at) VALUES ('waiter','starting','/old/worktree',?)",
                          (common.now(),))
         self.con.execute("INSERT INTO runs(run_id,status,repo_root,start_at) VALUES ('mine','starting','/old/worktree',?)",
                          (common.now(),))
+        self.con.execute("INSERT INTO pool_waiters(pool_key,token,pid,run_id,queued_at) VALUES ('repo','first',?,'waiter',?)",
+                         (os.getpid(), common.now() - 1))
         self.con.commit()
         clock, err = FakeClock(), io.StringIO()
         with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '130'}), patch.object(pool, 'time', clock.time), \
@@ -263,16 +281,73 @@ class PoolQueueTests(Isolated):
             with self.assertRaises(pool.PoolBusyError) as caught:
                 pool.acquire(self.me, run_id='mine')
         lines = err.getvalue().splitlines()
-        self.assertIn('queued for a repo pool box: 2/2 busy, 0 held by checkout cleanup, '
-                      '1 other caller(s) waiting; will wait up to 130s', lines[0])
-        self.assertIn('tool timeout above 130s', lines[0])
-        self.assertIn('background', lines[0])
+        self.assertIn("queued for a repo pool box: 2 busy + 0 idle that can't serve this run "
+                      '(other template/base/size or checkout cleanup) + 0 being created / 2-box pool; #2 of 2; will wait up to 130s', lines[0])
         progress = [ln for ln in lines if 'still queued' in ln]
         self.assertEqual(len(progress), 2)
         self.assertIn('waited 60s of 130s', progress[0])
-        self.assertIn('2/2 busy, 0 held by checkout cleanup for 130s', str(caught.exception))
+        self.assertIn('waited 120s of 130s', progress[1])
+        self.assertIn('boxes stayed busy for 130s', str(caught.exception))
+        return lines[0]
 
-    def test_box_freed_while_queued_is_taken(self):
+    @patch.object(pool, 'at_home', return_value=False)
+    def test_boat_queue_prints_position_progress_and_hint(self, _at_home):
+        line = self.queue_position_progress_and_hint()
+        self.assertIn('tool timeout above 130s', line)
+        self.assertIn('background', line)
+
+    @patch.object(pool, 'at_home', return_value=True)
+    def test_home_queue_prints_position_progress_and_hint(self, _at_home):
+        line = self.queue_position_progress_and_hint()
+        self.assertIn('leave it waiting', line)
+        self.assertIn('--bg', line)
+        self.assertIn('offbox wait <run>', line)
+        self.assertNotIn('tool timeout above', line)
+
+    @patch.object(pool, 'at_home', return_value=False)
+    def test_template_queue_counts_one_set_and_explains_surplus(self, _at_home):
+        self.full_pool()
+        self.box('unusable', member=True, source='base:repo:other')
+        self.con.execute("INSERT INTO pool_pending VALUES ('pending','repo',?,?,'template:crpko-go')",
+                         (os.getpid(), common.now()))
+        self.con.commit()
+        state = pool.queue_state(self.con, 'repo', source='template:crpko-go')
+        self.assertEqual((state['busy'], state['unusable'], state['pending'], state['cap']), (2, 1, 1, 4))
+        self.assertEqual(state['busy'] + state['unusable'] + state['idle'] + state['pending'], 4)
+        self.assertIn('2 of 3 members can serve template:crpko-go', pool._queue_line(state, 'template:crpko-go'))
+        self.busy('unusable')
+        for bid in ('legacy1', 'legacy2'):
+            self.box(bid, member=True)
+            self.busy(bid)
+        line = pool._queue_line(pool.queue_state(self.con, 'repo'))
+        self.assertIn('5 busy (4-box pool + 1 legacy/surplus member(s))', line)
+
+    @patch.object(pool, 'at_home', return_value=True)
+    def test_home_queue_has_24h_eight_boxes_place_and_waiting_guidance(self, _at_home):
+        env = dict(os.environ)
+        env.pop('OFFBOX_POOL_SIZE', None)
+        env.pop('OFFBOX_POOL_WAIT_SECONDS', None)
+        for i in range(8):
+            self.box(str(i), member=True)
+            self.busy(str(i))
+        clock, err = FakeClock(), io.StringIO()
+        def stop(seconds):
+            clock.t += seconds
+            raise KeyboardInterrupt
+        clock.time.sleep = stop
+        with patch.dict(os.environ, env, clear=True), patch.object(pool, 'time', clock.time), \
+                patch.object(lease, 'cap_check'), contextlib.redirect_stderr(err):
+            with self.assertRaises(KeyboardInterrupt):
+                pool.acquire(self.me)
+        line = err.getvalue()
+        self.assertIn('8 busy + 0 idle', line)
+        self.assertIn('/ 8-box pool; #1 of 1; will wait up to 24h00m', line)
+        self.assertIn('It starts by itself when a box is free: leave it waiting, do not retry or kill it.', line)
+        self.assertNotIn(': retry', line)
+        self.assertNotIn('failure', line)
+
+    @patch.object(pool, 'at_home', return_value=False)
+    def test_box_freed_while_queued_is_taken(self, _at_home):
         self.full_pool()
         clock = FakeClock()
 

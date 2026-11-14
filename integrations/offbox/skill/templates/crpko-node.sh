@@ -1,5 +1,5 @@
 # offbox template: crpko-node (large). Expo/React Native prototypes (crpko-mobile-prototype), crpko-devops scripts,
-# Next.js frontends. Node 24 (nvm default) plus Node 22 for repos that pin 22.13 (.nvmrc/engines); offbox picks the one the repo asks for.
+# Next.js frontends. Node 24 (nvm default), Node 20 and Node 22 for repos that pin 22.13 (.nvmrc/engines); offbox picks the one the repo asks for.
 # npm cache lives in $HOME/.npm (npm_config_cache), kept by stops/forks.
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -8,18 +8,23 @@ export NVM_DIR="$HOME/.nvm"
 . "$NVM_DIR/nvm.sh"
 
 NODE_MAJOR="${OFFBOX_NODE_MAJOR:-24}"
-nvm install "$NODE_MAJOR" >/dev/null
-nvm install 22 >/dev/null  # crpko_mobile_app and backoffice-frontend pin 22.13 via .nvmrc/engines; offbox picks per repo
+# The builder provisions nvm Node 20, >=22.13 <23 and 24 with the run prelude before this recipe.
 nvm alias default "$NODE_MAJOR" >/dev/null
 nvm use default >/dev/null
 node --version
 npm --version
 
-corepack enable >/dev/null 2>&1 || true
+for major in 20 22 "$NODE_MAJOR"; do
+  nvm use "$major" >/dev/null
+  corepack enable
+  corepack prepare pnpm@10 --activate
+done
+nvm use default >/dev/null
 
 sudo apt-get update -qq
-sudo apt-get install -y -qq --no-install-recommends build-essential python3 jq rsync watchman >/dev/null || \
-  sudo apt-get install -y -qq --no-install-recommends build-essential python3 jq rsync >/dev/null
+sudo apt-get install -y -qq --no-install-recommends build-essential python3 jq rsync zsh openjdk-21-jre-headless >/dev/null
+sudo apt-get install -y -qq --no-install-recommends watchman >/dev/null || true
+sudo update-alternatives --set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java
 sudo apt-get clean
 
 sudo tee /etc/sysctl.d/90-offbox-inotify.conf >/dev/null <<'EOF'

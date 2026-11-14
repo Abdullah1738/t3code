@@ -1,6 +1,6 @@
 # Home server: the headless installer stick
 
-The home offbox server (ASUS Prime B850M-A WiFi, Ryzen 9 9950X3D, 96 GB in two of the four sticks bought, 2x 2 TB NVMe) has no monitor and
+The home offbox server (ASUS Prime B850M-A WiFi, Ryzen 9 9950X3D, 96 GB in two sticks (the second pair is being returned, 13 Nov 2026: four never trained, FAILURE-MODES 1.15), 2x 2 TB NVMe) has no monitor and
 nobody sitting at it. This directory builds the USB stick that installs it with zero touch, the tests that
 prove it, and the Mac-side scripts for the day it arrives. It replaces the `os` and `ts` steps of
 `../bootstrap.zsh`.
@@ -102,6 +102,46 @@ The installed system finds the marker on its next boot, points the firmware at t
   and never restart the machine.
 - `offbox-status` prints the state of all of that in a dozen lines.
 
+## Box scratch space
+
+The `offbox` Incus profile mounts an executable tmpfs at `/tmp` when a box starts: mode `1777`,
+`nosuid,nodev`, capped at 8 GiB. The ZFS rootfs uses `normalization=formD`: a legal NFC filename can expand
+beyond 255 bytes during comparison and fail with `ENOTSUP`. tmpfs accepts those names without migrating
+datasets. `$HOME`, its caches and the checkout remain on ZFS and retain that limitation.
+
+8 GiB is a ceiling, not reserved RAM. Written pages count against the box's memory limit and swap is
+disabled. Normal home sizes have 16/24/48 GiB RAM; a small box has 8 GiB, so a job must leave room for its
+own processes too. npm, Go, pip and uv caches already live under `$HOME`; Terraform working directories
+and provider caches remain on disk. For scratch larger than the available memory or the cap, create a
+private disk-backed directory with `mktemp -d "$HOME/scratch.XXXXXX"` and set `TMPDIR` (also `GOTMPDIR`
+for Go). That disk-backed directory still has ZFS's filename limitation. Docker storage is unaffected.
+`/tmp` contents disappear at every box stop and are not saved in snapshots or clones.
+
+Full host provisioning configures this automatically. To update an existing host without upgrades,
+service restarts or a base-image rebuild, copy the reviewed `../install-host.sh` to
+`/root/offbox-server/install-host.sh`, then run on the host:
+
+```sh
+# Keep the pre-change value once; retain this backup until rollout and rollback are settled.
+if ! test -f /root/offbox-tmp-before-67.raw.lxc; then
+  previous=$(incus profile get offbox raw.lxc) || exit
+  printf '%s\n' "$previous" > /root/offbox-tmp-before-67.raw.lxc
+fi
+bash /root/offbox-server/install-host.sh tmp-profile
+incus profile get offbox raw.lxc
+```
+
+`raw.lxc` changes take effect only at the next start. Running boxes keep their current `/tmp`; new boxes
+and existing boxes resumed after a normal stop get tmpfs. Do not hot-mount over a running job's `/tmp` or
+restart boxes to accelerate rollout. Old files underneath the mount remain on disk but are hidden after
+the next start. The command preserves other `raw.lxc` settings and refuses existing mounts at `/tmp` or
+any of its descendants, which a later parent mount would hide.
+Per-instance `raw.lxc` overrides take precedence over the profile; reconcile those separately if present.
+
+Rollback on the host: `incus profile set offbox raw.lxc "$(cat /root/offbox-tmp-before-67.raw.lxc)"`.
+This also takes effect at future starts; current mounts stay in place until boxes stop naturally.
+Revert the provisioning change too if future host installs must retain the rollback.
+
 ## VPN (Mullvad)
 
 Owner, 12 Nov 2026: Mullvad on the box, permanently on. `mullvad.sh` (copied to the server as
@@ -127,7 +167,8 @@ Owner, 13 Nov 2026: "buy a residential proxy and use that as the exit". `exit-pr
 through one static residential address; everything else still leaves through Mullvad.
 
 - Why only a list: the address is "unlimited" under a fair-use policy, and the server pulls far more than any
-  such policy allows (22 GB in 87 minutes on 13 Nov). The list starts with `dl.google.com` and `go.dev`.
+  such policy allows (22 GB in 87 minutes on 13 Nov). The list starts with `dl.google.com`, `go.dev` and
+  `ftp.gnu.org` (GNU source archives reset TLS from the VPN exit).
   Add a name only when a site refuses the VPN address, then `offbox-exit-proxy reload`.
 - The address: IPRoyal "ISP Dedicated", 1 address, premium ("zero fraud score"), ordered for Germany, registered
   to a UK residential provider (Glide). $5.40 per 30 days, renews by itself on the Marriott card. Account

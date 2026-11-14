@@ -463,3 +463,15 @@ test("errors are classified for retry and uncertainty", async () => {
   const readFailure = await dropped.location("+15550001").catch((error: unknown) => error);
   expect(readFailure).toMatchObject({ code: "network", retryable: true, uncertain: false });
 });
+
+test("reaction success and failure emit timing and a target id only", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const logs = await captureLogs(async () => {
+    const good = fakeFetch(() => Response.json({ status: "success" }));
+    await new Sendblue({ keyId: "PRIVATE_KEY", secret: "PRIVATE_SECRET", number: LINE, fetch: good.fetch }).react("target-fixture", "PRIVATE_REACTION");
+    const bad = fakeFetch(() => Response.json({ error: "PRIVATE_PROVIDER_BODY" }, { status: 400 }));
+    await expect(new Sendblue({ keyId: "PRIVATE_KEY", secret: "PRIVATE_SECRET", number: LINE, fetch: bad.fetch }).react("target-failed", "like")).rejects.toThrow();
+  });
+  expect(logs.filter(l => l.name === "reaction.sent").map(l => l.ok)).toEqual([true, false]);
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
+});

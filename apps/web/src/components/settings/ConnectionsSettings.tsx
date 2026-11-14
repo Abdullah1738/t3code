@@ -1,3 +1,4 @@
+import { recordConsumedShortcut } from "../../ardud/keybindingAnalytics";
 import { SessionPermissions } from "./SessionPermissions";
 import { AUTH_SCOPE_OPTIONS as PAIRING_SCOPE_OPTIONS } from "@t3tools/shared/authScopeOptions";
 import {
@@ -2654,6 +2655,7 @@ export function ConnectionsSettings() {
         event.stopPropagation();
         setSshHostSuggestionsOpen(false);
         void handleSelectSshHostSuggestion(target);
+        if (!isAddingSavedBackend && desktopBridge) recordConsumedShortcut(event, command);
         return;
       }
 

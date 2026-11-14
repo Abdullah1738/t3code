@@ -2,6 +2,7 @@
 import importlib.machinery
 import importlib.util
 import os
+import sys
 import shutil
 import tempfile
 import time
@@ -13,6 +14,7 @@ QCARD = os.path.join(HERE, "..", "bin", "qcard")
 
 
 def load_qcard():
+    sys.path.insert(0, os.path.join(HERE, "..", "libexec", "qcard"))
     loader = importlib.machinery.SourceFileLoader("qcard_under_test", QCARD)
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
@@ -64,3 +66,27 @@ class QcardCleanTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QcardLogTest(unittest.TestCase):
+    def test_render_logs_success_and_failure_without_spec_data(self):
+        q = load_qcard()
+        with tempfile.TemporaryDirectory() as folder:
+            args = ['qcard', 'stat', '--json', '{"title":"PRIVATE_CARD", "value":123}', '--out', folder, '--no-og']
+            with mock.patch.object(q.sys, 'argv', args), mock.patch.object(q.render, 'build', return_value=('page', 'og', {'caption':'x', 'subcaption':'y', 'title':'t', 'description':'d'})), mock.patch.object(q, 'log_render') as log, mock.patch('builtins.print'):
+                q.main()
+                self.assertTrue(log.call_args.args[1])
+            with mock.patch.object(q.sys, 'argv', args), mock.patch.object(q.render, 'build', side_effect=ValueError('PRIVATE_CARD')), mock.patch.object(q, 'log_render') as log:
+                with self.assertRaises(ValueError):
+                    q.main()
+                self.assertFalse(log.call_args.args[1])
+
+    def test_log_emitter_is_best_effort_and_sends_only_kind_duration_ok(self):
+        q = load_qcard()
+        with mock.patch.object(q.subprocess, 'Popen') as child, mock.patch.object(q.threading, 'Thread'):
+            q.log_render(time.monotonic(), False)
+            command = child.call_args.args[0]
+            self.assertEqual(command[2:5], ['log-card-render', '--kind', 'quick'])
+            self.assertEqual(command[-2:], ['--ok', 'false'])
+        with mock.patch.object(q.subprocess, 'Popen', side_effect=OSError('unavailable')):
+            q.log_render(time.monotonic(), True)

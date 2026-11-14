@@ -12,6 +12,8 @@ import * as NodeHttp from "node:http";
 import * as NodeHttps from "node:https";
 import { fileURLToPath } from "node:url";
 
+import { acquireInstallHold, finishInstallHold } from "./robob-install-hold.mjs";
+
 // Exit 75: the bundle is installed, but sustained reads did not pass. Do not reinstall.
 export const READ_CHECK_FAILED = 75;
 const exec = promisify(execFile);
@@ -96,6 +98,49 @@ export function installCommandTimeout(timeout, quitAt, startupComplete, now = Da
     quitAt === undefined || startupComplete ? timeout : Math.min(timeout, 180_000 - (now - quitAt));
   if (remaining <= 0) throw new Error("Install exceeded the 3 minute limit");
   return remaining;
+}
+
+export function createDmgStage({
+  run = exec,
+  phase,
+  mkdtemp = fs.mkdtemp,
+  rmdir = fs.rmdir,
+}) {
+  let mount;
+  const detach = async () => {
+    if (!mount) return;
+    // Cleanup must still run after the install's three-minute startup deadline.
+    const options = { timeout: 30_000, killSignal: "SIGKILL", maxBuffer: 2 ** 20 };
+    try {
+      await run("/usr/bin/hdiutil", ["detach", "-quiet", mount], options);
+    } catch (first) {
+      try {
+        await run("/usr/bin/hdiutil", ["detach", "-quiet", "-force", mount], options);
+      } catch (error) {
+        await phase("dmg_detach_failed", {
+          mount,
+          error: `${String(first)}; force retry: ${String(error)}`,
+        });
+        return;
+      }
+    }
+    const detached = mount;
+    mount = undefined;
+    await rmdir(detached).catch(() => {});
+  };
+  return {
+    stage: async (dmg, copy) => {
+      mount = await mkdtemp(path.join(os.tmpdir(), "robob-fast-dmg-"));
+      await run(
+        "/usr/bin/hdiutil",
+        ["attach", "-nobrowse", "-readonly", "-mountpoint", mount, dmg],
+        { timeout: 60_000, killSignal: "SIGKILL", maxBuffer: 2 ** 20 },
+      );
+      await copy(mount);
+      await detach();
+    },
+    detach,
+  };
 }
 
 export async function checkSustainedReads({
@@ -588,7 +633,7 @@ async function main(args) {
   try {
     oldBootId = (await get("/api/ardud/control/install-report")).bootId;
   } catch {}
-  let mount;
+  const dmgStage = createDmgStage({ phase });
   let quitTree;
   let ownsStaging = false;
   let swapped = false;
@@ -642,16 +687,12 @@ async function main(args) {
         remove: (target) => fs.rm(target, { recursive: true, force: true }),
         stat: fs.stat,
       });
-      mount = await fs.mkdtemp(path.join(os.tmpdir(), "robob-fast-dmg-"));
-      await run(
-        "/usr/bin/hdiutil",
-        ["attach", "-nobrowse", "-readonly", "-mountpoint", mount, dmg],
-        60_000,
-      );
-      if (await exists(next))
-        throw new Error(`Staging bundle already exists: ${next}; inspect it before retrying`);
-      ownsStaging = true;
-      await run("/usr/bin/ditto", [path.join(mount, "Robob.app"), next], 120_000);
+      await dmgStage.stage(dmg, async (mount) => {
+        if (await exists(next))
+          throw new Error(`Staging bundle already exists: ${next}; inspect it before retrying`);
+        ownsStaging = true;
+        await run("/usr/bin/ditto", [path.join(mount, "Robob.app"), next], 120_000);
+      });
     },
     verify: () => verifyBundle(next),
     migrations: async () => {
@@ -807,7 +848,7 @@ async function main(args) {
         );
       });
       // Continuations still start inside the startup bound. Healthy-read observation,
-      // its notification and final DMG detach must be allowed to outlast that bound.
+      // and its notification must be allowed to outlast that bound.
       startupComplete = true;
       await reportInstall({
         report,
@@ -834,6 +875,7 @@ async function main(args) {
       });
     },
   };
+  const hold = await acquireInstallHold();
   try {
     await install(ops, { rollback });
   } catch (e) {
@@ -885,15 +927,44 @@ async function main(args) {
     }
     throw e;
   } finally {
-    // Our own unswapped staging copy is useless after a failure; drop it so the
-    // next run does not trip on it, but only while the live app is in place.
-    if (ownsStaging && !swapped && (quitAt === undefined || (await exists(app)))) {
-      await fs.rm(next, { recursive: true, force: true });
-      if (quitAt !== undefined) await phase("staging_removed", { path: next });
-    }
-    if (mount) {
-      await run("/usr/bin/hdiutil", ["detach", "-quiet", mount]).catch(() => {});
-      await fs.rmdir(mount).catch(() => {});
+    try {
+      await dmgStage.detach();
+      // Our own unswapped staging copy is useless after a failure; drop it so the
+      // next run does not trip on it, but only while the live app is in place.
+      if (ownsStaging && !swapped && (quitAt === undefined || (await exists(app)))) {
+        await fs.rm(next, { recursive: true, force: true });
+        if (quitAt !== undefined) await phase("staging_removed", { path: next });
+      }
+    } finally {
+      await finishInstallHold({
+        release: hold.release,
+        quitStarted: quitAt !== undefined,
+        healthy: async () => {
+          const health = await get("/api/ardud/control/health");
+          if (health.ok !== true || health.status !== "healthy") return false;
+          if (!swapped) return true;
+          const report = await get("/api/ardud/control/install-report");
+          return Boolean(report.bootId && report.bootId !== oldBootId);
+        },
+        onWaiting: async () => {
+          await phase("recovery_waiting", {
+            swapped,
+            message: "Keeping install heartbeat until Robob is healthy. Repair or complete a compatible rollback from another Terminal; keep this installer running.",
+            holdBy: hold.by,
+            holdPid: hold.pid,
+          });
+          await exec(
+            "/Users/ardud/.bun/bin/bun",
+            [
+              "/Users/ardud/.local/share/telegram-bridge/src/cli.ts",
+              "notify", "--source", "Robob install", "--severity", "attention",
+              "--key", `robob-install:${stamp}:recovery`,
+              "--text", "Robob install needs recovery. Its heartbeat is still held. Keep the installer running while repairing or completing a compatible rollback, then reopen Robob. Check the install log for the hold PID.",
+            ],
+            { timeout: 5000 },
+          ).catch(() => {});
+        },
+      });
     }
   }
 }

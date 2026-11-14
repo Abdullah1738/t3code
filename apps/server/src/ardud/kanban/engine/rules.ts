@@ -11,7 +11,6 @@ import {
   kanbanHeldUpBy,
   kanbanBoardClock,
   kanbanPickOrder,
-  kanbanRetryNotBefore,
   kanbanSchedule,
   kanbanScriptStep,
   kanbanDeciding,
@@ -26,6 +25,7 @@ import {
   type ModelSelection,
 } from "@t3tools/contracts";
 import { selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
+import { heldForRetry } from "./retries.ts";
 
 /**
  * Who is asking for a move. `cardThread` is the card's own work or review thread.
@@ -112,7 +112,12 @@ export function checkMove(role: MoveRole, card: KanbanCard, to: KanbanStage): Mo
       return no(`dispatcher cannot move ${from} -> ${to}`);
     case "cardThread":
       if (from === "working" && (to === "needs_review" || to === "needs_owner")) return ok;
-      if (from === "todo" && card.activeThreadId === null && to === "needs_review") return ok;
+      if (
+        (from === "todo" || from === "in_review" || from === "completed") &&
+        card.activeThreadId === null &&
+        to === "needs_review"
+      )
+        return ok;
       return no(
         `a card thread can move working -> needs_review or needs_owner, not ${from} -> ${to}`,
       );
@@ -189,6 +194,14 @@ export function applyReviewResult(
 
 export const reviewFinished = (card: KanbanCard, chainLength: number) =>
   card.reviewStep >= Math.max(chainLength, 1);
+
+/** A queued review keeps its thread identity, including between chain steps. */
+export const reviewThreadToReuse = (board: KanbanBoard, card: KanbanCard) =>
+  card.settledAt === null &&
+  card.stage === "needs_review" &&
+  !reviewFinished(card, chainFor(board, card)?.steps.length ?? 1)
+    ? card.reviewThreadId
+    : null;
 
 /** Why a card can't be completed or deployed yet, or null. */
 export function reviewGate(card: KanbanCard, chainLength: number): string | null {
@@ -562,10 +575,6 @@ export function planDispatch(
   for (const pool of pools) free.set(pool.key, pool.slots - (holding.get(pool.key)?.size ?? 0));
   const byId = new Map(cards.map((card) => [card.id as string, card]));
   const clock = nowMs ?? kanbanBoardClock(cards);
-  const retryHeld = (card: KanbanCard) => {
-    const notBefore = kanbanRetryNotBefore(card);
-    return notBefore !== null && notBefore > clock;
-  };
   const waiting = cards.filter(
     (card) =>
       !attempted.has(card.id) &&
@@ -574,7 +583,7 @@ export function planDispatch(
       card.activeThreadId === null &&
       card.stalled === null &&
       card.priority !== KANBAN_BACKLOG &&
-      !retryHeld(card) &&
+      !heldForRetry(card, clock) &&
       // A step that's only the evaluator's is done by an evaluator, not a new thread.
       // Reviews still go: a review never waits on the evaluator's step.
       !kanbanWaitsOnEvaluator(card) &&
@@ -603,7 +612,7 @@ export function planDispatch(
 
   const plan: Array<Dispatch> = [];
   for (const { role, card } of queue) {
-    // Once a card has a work thread it stays on that thread's model.
+    // An existing work thread follows the card's pinned model.
     const model =
       role === "work" && card.workThreadId === null
         ? weightedModel(card, pools, free, pick)
@@ -683,7 +692,9 @@ export function confirmDispatch(
     return false;
   if (
     dispatch.role === "work" &&
-    (isBlocked(card, byId) || (dispatch.fresh && isBlocked(card, byId, null)))
+    (kanbanWaitsOnEvaluator(card) ||
+      isBlocked(card, byId) ||
+      (dispatch.fresh && isBlocked(card, byId, null)))
   )
     return false;
   const thread = dispatch.role === "work" && !dispatch.fresh ? card.workThreadId : null;

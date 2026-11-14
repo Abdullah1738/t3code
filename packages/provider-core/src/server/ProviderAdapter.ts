@@ -295,6 +295,15 @@ export class ProviderAdapterTurnStartError extends Schema.TaggedError<ProviderAd
   }
 }
 
+export class ProviderAdapterRecoveryRefusedError extends Schema.TaggedError<ProviderAdapterRecoveryRefusedError>()(
+  "ProviderAdapterRecoveryRefusedError",
+  {},
+) {
+  override get message() {
+    return "Automatic recovery excluded after a native session refusal.";
+  }
+}
+
 export class ProviderAdapterSteerRunUnsupportedError extends Schema.TaggedError<ProviderAdapterSteerRunUnsupportedError>()(
   "ProviderAdapterSteerRunUnsupportedError",
   {
@@ -436,6 +445,7 @@ export interface ProviderAdapterV2TurnInput {
   readonly runId: RunId;
   readonly runOrdinal: number;
   readonly nativeThreadHasTurns?: boolean;
+  readonly automaticRecovery?: true;
   readonly providerTurnOrdinal: number;
   readonly restartContinuationOfRunId?: RunId;
   readonly attemptId: RunAttemptId;

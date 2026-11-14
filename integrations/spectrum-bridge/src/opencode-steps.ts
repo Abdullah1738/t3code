@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 import { Database } from "bun:sqlite";
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -19,13 +20,15 @@ export function nativeMessageId(id: string): string | undefined {
   if (!match) return undefined;
   try {
     return /^msg_[A-Za-z0-9]+$/.exec(decodeURIComponent(match[1]!).split(":")[0]!)?.[0];
-  } catch {
+  } catch (caughtError) { toolError("opencode-steps", "opencode-steps.catch1", caughtError);
     return undefined;
   }
 }
 
 /** Native `finish` per control message id; ids it can't resolve are simply absent. */
 export type StepFinishes = (ids: readonly string[]) => Map<string, string>;
+/** Native text blocks whose stop and completion timestamp were persisted. */
+export type CompletedSteps = (ids: readonly string[]) => Map<string, string[]>;
 
 export const OPENCODE_DB = join(homedir(), ".local/share/opencode/opencode.db");
 
@@ -47,7 +50,7 @@ export function opencodeRunEvidence(path = OPENCODE_DB, maxRows = 2_000): RunEvi
   let db: Database | undefined;
   let inode: number | undefined;
   const close = () => {
-    try { db?.close(); } catch { /* already gone */ }
+    try { db?.close(); } catch (caughtError) { toolError("opencode-steps", "opencode-steps.catch2", caughtError); /* already gone */ }
     db = undefined;
   };
   return (sessionId, sinceMs) => {
@@ -77,7 +80,7 @@ export function opencodeRunEvidence(path = OPENCODE_DB, maxRows = 2_000): RunEvi
       if (idle < 0 || typeof rows[idle]!.outcome !== "string") return "unknown";
       if (rows.slice(idle + 1).some(row => row.type === "assistant")) return "unknown";
       return steps.every(stepIsTerminalNoTool) ? "none" : "unknown";
-    } catch {
+    } catch (caughtError) { toolError("opencode-steps", "opencode-steps.catch3", caughtError);
       close();
       return "unknown";
     }
@@ -88,7 +91,7 @@ export function opencodeRunEvidence(path = OPENCODE_DB, maxRows = 2_000): RunEvi
 function stepRan(row: { finish: unknown; content: unknown }): boolean {
   if (row.finish === "tool-calls") return true;
   if (typeof row.content === "string") {
-    try { return (JSON.parse(row.content) as unknown[]).some(part => (part as { type?: unknown })?.type === "tool"); } catch { return true; }
+    try { return (JSON.parse(row.content) as unknown[]).some(part => (part as { type?: unknown })?.type === "tool"); } catch (caughtError) { toolError("opencode-steps", "opencode-steps.catch4", caughtError); return true; }
   }
   return Array.isArray(row.content) && row.content.some(part => (part as { type?: unknown })?.type === "tool");
 }
@@ -114,14 +117,14 @@ function stepIsTerminalNoTool(row: { finish: unknown; content: unknown; retry: u
 }
 
 function parseParts(text: string): unknown {
-  try { return JSON.parse(text); } catch { return undefined; }
+  try { return JSON.parse(text); } catch (caughtError) { toolError("opencode-steps", "opencode-steps.catch5", caughtError); return undefined; }
 }
 
 export function opencodeFinishes(path = OPENCODE_DB): StepFinishes {
   let db: Database | undefined;
   let inode: number | undefined;
   const close = () => {
-    try { db?.close(); } catch { /* already gone */ }
+    try { db?.close(); } catch (caughtError) { toolError("opencode-steps", "opencode-steps.catch6", caughtError); /* already gone */ }
     db = undefined;
   };
   return ids => {
@@ -148,7 +151,47 @@ export function opencodeFinishes(path = OPENCODE_DB): StepFinishes {
         if (typeof row.finish !== "string") continue;
         for (const id of wanted.get(row.id) ?? []) found.set(id, row.finish);
       }
-    } catch {
+    } catch (caughtError) { toolError("opencode-steps", "opencode-steps.catch7", caughtError);
+      close();
+      found.clear();
+    }
+    return found;
+  };
+}
+
+export function opencodeCompletedSteps(path = OPENCODE_DB): CompletedSteps {
+  let db: Database | undefined;
+  let inode: number | undefined;
+  const close = () => {
+    try { db?.close(); } catch { /* already gone */ }
+    db = undefined;
+  };
+  return ids => {
+    const found = new Map<string, string[]>();
+    const wanted = new Set<string>();
+    for (const id of ids) {
+      const native = nativeMessageId(id);
+      if (native) wanted.add(native);
+    }
+    if (!wanted.size) return found;
+    try {
+      const current = statSync(path).ino;
+      if (db && current !== inode) close();
+      if (!db) {
+        db = new Database(path, { readonly: true });
+        inode = current;
+      }
+      const rows = db.query<{ id: string; content: string }, [string]>(
+        "SELECT id, json_extract(data, '$.content') AS content FROM session_message WHERE id IN (SELECT value FROM json_each(?)) AND json_extract(data, '$.finish') = 'stop' AND json_type(data, '$.time.completed') IN ('integer', 'real') AND (json_type(data, '$.error') IS NULL OR json_type(data, '$.error') = 'null')",
+      ).all(JSON.stringify([...wanted]));
+      for (const row of rows) {
+        const content: unknown = JSON.parse(row.content);
+        if (!Array.isArray(content) || content.some(part => !part || typeof part !== "object" || !["text", "reasoning"].includes(part.type))) continue;
+        const blocks = content.filter(part => part.type === "text");
+        if (blocks.some(part => typeof part.text !== "string")) continue;
+        found.set(row.id, blocks.map(part => part.text));
+      }
+    } catch (caughtError) { toolError("opencode-steps", "opencode-steps.completed", caughtError);
       close();
       found.clear();
     }

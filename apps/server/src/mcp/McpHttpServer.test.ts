@@ -19,6 +19,7 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as Tracer from "effect/Tracer";
 import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 import {
   HttpBody,
@@ -29,6 +30,7 @@ import {
 } from "effect/http";
 
 import * as ProjectService from "../project/ProjectService.ts";
+import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as PullRequestReviewGuideService from "../pullRequest/PullRequestReviewGuideService.ts";
 import * as ServerConfig from "../config.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
@@ -87,6 +89,9 @@ const layerPullRequestsTest = McpHttpServer.layerPullRequestsToolkit.pipe(
   Layer.provide(
     Layer.mergeAll(
       Layer.mock(ProjectService.ProjectService)({}),
+      Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
+        resolve: () => Effect.succeed(null),
+      }),
       Layer.mock(PullRequestReviewGuideService.PullRequestReviewGuideService)({}),
       Layer.mock(Orchestrator.OrchestratorV2)({}),
       Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
@@ -177,11 +182,72 @@ const layerRecordingTools = (calls: Array<unknown>) => {
         McpToolAccessTestkit.liveThreadsLayer,
         Layer.mock(OrchestratorMcpService.OrchestratorMcpService)({}),
         Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
+          resolve: () => Effect.succeed(null),
+        }),
         NodeServices.layer,
       ),
     ),
   );
 };
+
+it.effect("correlates tool calls with their caller without recording arguments", () =>
+  Effect.gen(function* () {
+    const spans: Array<Tracer.NativeSpan> = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      for (const suffix of ["first", "second", "client"]) {
+        yield* server
+          .callTool({
+            name: "delegate_task",
+            arguments: {
+              task: "private task text",
+              clientRequestId: "private request text",
+              mode: "async",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, {
+              ...invocation,
+              requestNamespace: `session-${suffix}`,
+              thread:
+                suffix === "client"
+                  ? undefined
+                  : { ...invocation.thread, threadId: ThreadId.make(`thread-${suffix}`) },
+            }),
+            Effect.provideService(McpSchema.McpServerClient, client),
+            Effect.withSpan("incoming-tool-call"),
+          );
+      }
+    }).pipe(Effect.provide(layerRecordingTools([])), Effect.withTracer(tracer));
+
+    const calls = spans.filter((span) => span.attributes.has("mcp.tool.name"));
+    expect(calls).toHaveLength(3);
+    expect(
+      calls.map((span) => ({
+        tool: span.attributes.get("mcp.tool.name"),
+        caller: span.attributes.get("mcp.caller.thread_id"),
+        namespace: span.attributes.get("mcp.request.namespace"),
+      })),
+    ).toEqual([
+      { tool: "delegate_task", caller: "thread-first", namespace: "session-first" },
+      { tool: "delegate_task", caller: "thread-second", namespace: "session-second" },
+      { tool: "delegate_task", caller: null, namespace: "session-client" },
+    ]);
+    const correlation = calls.map((span) =>
+      Object.fromEntries([...span.attributes].filter(([key]) => key.startsWith("mcp."))),
+    );
+    expect(correlation.every((attributes) => Object.keys(attributes).length === 3)).toBe(true);
+    expect(JSON.stringify(correlation)).not.toContain("private");
+  }),
+);
 
 it("normalizes empty successful notification responses to accepted", () => {
   const notificationResponse = McpHttpServer.normalizeMcpHttpResponse(

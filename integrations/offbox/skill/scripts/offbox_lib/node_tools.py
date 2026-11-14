@@ -1,31 +1,31 @@
 """Repo-local Node executables and package-manager bootstrap advice."""
 
+import os
 import shlex
 from pathlib import Path
 
+from . import package_manager
 from .common import read_json
 
 
-def install_command(root_files: set[str], package_manager: str | None) -> str:
-    manager = package_manager.split("@", 1)[0] if isinstance(package_manager, str) else ""
-    if manager not in {"pnpm", "bun", "yarn", "npm"}:
-        manager = next((pm for files, pm in (({"pnpm-lock.yaml"}, "pnpm"),
-                                            ({"bun.lock", "bun.lockb"}, "bun"),
-                                            ({"yarn.lock"}, "yarn"),
-                                            ({"package-lock.json"}, "npm")) if files & root_files), "npm")
-    return {"pnpm": "pnpm install --frozen-lockfile", "bun": "bun install",
-            "yarn": "yarn install --frozen-lockfile",
-            "npm": "npm ci" if "package-lock.json" in root_files else "npm install"}[manager]
+def install_root(package: Path, root: Path | None = None) -> Path:
+    package = package.resolve()
+    root = root.resolve() if root else None
+    if root and package != root:
+        manifest = read_json(root / 'package.json', {})
+        if (root / 'pnpm-workspace.yaml').exists() or (isinstance(manifest, dict) and manifest.get('workspaces')):
+            package = root
+    return package
 
 
-def repo_install(root: Path) -> str:
-    manifest = read_json(root / "package.json", {})
-    manager = manifest.get("packageManager") if isinstance(manifest, dict) else None
-    try:
-        files = {p.name for p in root.iterdir()}
-    except OSError:
-        files = set()
-    return install_command(files, manager)
+def install_from(package: Path, cwd: Path, root: Path | None = None) -> str:
+    package = install_root(package, root)
+    install = package_manager.install_command(package)
+    relative = os.path.relpath(package, cwd.resolve())
+    return install if relative == '.' else f'(cd {shlex.quote(relative)} && {install})'
+
+
+REPO_LOCAL_TOOLS = {"vp": "vite-plus", "tsc-rs": "tsc-rs"}
 
 
 # Include absent bin directories and disable hashing so installs cannot leave a
@@ -37,10 +37,12 @@ PATH_BLOCK = r'''if [ -f "$HOME"/@ROOT@/package.json ]; then
     local dir=$(pwd -P) bins= rest= entry tail=$PATH sep=
     while :; do
       entry=${tail%%:*}
-      case ":$__offbox_repo_bins" in
-        *":$entry:"*) ;;
-        *) rest="$rest$sep$entry"; sep=: ;;
-      esac
+      if [ -z "${__offbox_toolchain_bin:-}" ] || [ "$entry" != "$__offbox_toolchain_bin" ]; then
+        case ":$__offbox_repo_bins" in
+          *":$entry:"*) ;;
+          *) rest="$rest$sep$entry"; sep=: ;;
+        esac
+      fi
       [[ $tail == *:* ]] || break
       tail=${tail#*:}
     done
@@ -53,7 +55,7 @@ PATH_BLOCK = r'''if [ -f "$HOME"/@ROOT@/package.json ]; then
         done ;;
     esac
     __offbox_repo_bins=$bins
-    export PATH="$bins$rest"
+    export PATH="${__offbox_toolchain_bin:+$__offbox_toolchain_bin:}$bins$rest"
     hash -r 2>/dev/null || :
     set +h
   }
@@ -111,11 +113,23 @@ PATH_BLOCK = r'''if [ -f "$HOME"/@ROOT@/package.json ]; then
   mkdir -p "$HOME/.offbox"
   __offbox_bash_env=$(mktemp "$HOME/.offbox/bash-env.XXXXXX") || exit 97
   export __offbox_bash_env
-  printf '%s\n' \
-    'export BASH_ENV=$__offbox_original_bash_env' \
-    '__offbox_expand_bash_env "$@"' \
-    '[ ! -r "$__offbox_expanded_bash_env" ] || . "$__offbox_expanded_bash_env"' \
-    '__offbox_repo_init' > "$__offbox_bash_env"
+  {
+    # Non-Bash launchers can drop exported functions while keeping BASH_ENV.
+    printf '%s\n' 'if [[ -n ${__offbox_repo_root-} && ${__offbox_repo_bins+x} && ${__offbox_original_bash_env+x} && -n ${__offbox_bash_env-} ]]; then'
+    for __offbox_function in __offbox_repo_path __offbox_repo_init __offbox_expand_bash_env __offbox_command_not_found; do
+      if declare -F "$__offbox_function" >/dev/null; then
+        printf 'declare -F %s >/dev/null || {\n' "$__offbox_function"
+        declare -f "$__offbox_function"
+        printf '}\nexport -f %s\n' "$__offbox_function"
+      fi
+    done
+    printf '%s\n' \
+      'export BASH_ENV=$__offbox_original_bash_env' \
+      '__offbox_expand_bash_env "$@"' \
+      '[ ! -r "$__offbox_expanded_bash_env" ] || . "$__offbox_expanded_bash_env"' \
+      '__offbox_repo_init' \
+      'fi'
+  } > "$__offbox_bash_env"
   export BASH_ENV=$__offbox_bash_env
 fi'''
 
@@ -123,11 +137,11 @@ fi'''
 def block(rdir: str, root: Path | None = None) -> str:
     manifest = read_json(root / "package.json", {}) if root else {}
     cases = []
-    for tool, package in (("vp", "vite-plus"), ("tsc-rs", "tsc-rs")):
+    for tool, package in REPO_LOCAL_TOOLS.items():
         if isinstance(manifest, dict) and any(isinstance(manifest.get(key), dict) and package in manifest[key]
                                               for key in ("dependencies", "devDependencies")):
             message = (f"offbox: {tool} is a repo-local tool ({package}) and node_modules isn't installed on this box yet. "
-                       f"Run: offbox run -- sh -c '{repo_install(root)} && <your command>'")
+                       f"Run: offbox run -- sh -c '{package_manager.install_command(root)} && <your command>'")
             cases.append(f"      {tool}) printf '%s\\n' {shlex.quote(message)} >&2; return 127 ;;")
     # Let Bash identify the failed command, including assignments and cd/--step forms.
     # No preflight may reject a tool that an earlier command in this run installs.

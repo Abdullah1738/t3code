@@ -3,6 +3,7 @@ import type * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as ConfigProvider from "effect/ConfigProvider";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -24,11 +25,37 @@ import * as SqliteClient from "./nodeSqliteClient.ts";
 const startedWorkers = vi.hoisted((): Array<NodeWorkerThreads.Worker> => []);
 const silentWorkers = vi.hoisted(() => ({ on: false, readyOnTerminate: false }));
 const failingWorkers = vi.hoisted(() => ({ message: undefined as string | undefined }));
+const gatedWorker = vi.hoisted(() => ({ state: undefined as Int32Array | undefined }));
 
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof NodeWorkerThreads>();
   class RecordedWorker extends actual.Worker {
     constructor(...args: ConstructorParameters<typeof actual.Worker>) {
+      if (gatedWorker.state !== undefined && typeof args[0] === "string") {
+        args = [
+          `
+          (() => {
+            const { parentPort, workerData } = require("node:worker_threads");
+            const gates = new Int32Array(workerData.testGates);
+            const postMessage = parentPort.postMessage.bind(parentPort);
+            parentPort.postMessage = (reply) => {
+              postMessage(reply);
+              if (!("started" in reply) || Atomics.load(gates, 0) === 0) return;
+              const started = Atomics.add(gates, 1, 1) + 1;
+              Atomics.notify(gates, 1);
+              while (Atomics.load(gates, 2) < started) {
+                Atomics.wait(gates, 2, started - 1);
+              }
+            };
+          })();
+          ${args[0]}`,
+          {
+            ...args[1],
+            workerData: { ...args[1]?.workerData, testGates: gatedWorker.state.buffer },
+          },
+        ];
+        gatedWorker.state = undefined;
+      }
       super(
         ...((silentWorkers.on
           ? ["setInterval(() => {}, 1 << 30);", { eval: true }]
@@ -73,6 +100,108 @@ const countEntries = (sql: SqlClient.SqlClient) =>
 const layer = it.layer(SqliteClient.layer({ filename: ":memory:" }));
 
 layer("NodeSqliteClient", (it) => {
+  it.effect(
+    "observes slow read/write metadata, including returning writes, without SQL or bindings",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const observed: SqliteClient.SqliteStatementObservation[] = [];
+        const observer: SqliteClient.SqliteStatementObserver = {
+          slowThresholdMs: 0,
+          record: (entry) =>
+            Effect.sync(() => {
+              observed.push(entry);
+            }),
+        };
+        yield* Effect.gen(function* () {
+          yield* sql`CREATE TABLE observed_statements(secret TEXT UNIQUE)`;
+          yield* sql`SELECT 1 AS result`;
+          yield* sql`WITH seed AS (SELECT 'private binding' AS value) INSERT INTO observed_statements SELECT value FROM seed RETURNING secret`;
+          yield* sql`INSERT INTO observed_statements VALUES ('private binding')`.pipe(Effect.exit);
+        }).pipe(
+          Effect.provideService(SqliteClient.StatementObserver, observer),
+          Effect.withSpan("ObservedService.query"),
+        );
+        assert.deepEqual(
+          observed.map((entry) => [entry.operation, entry.connection, entry.outcome]),
+          [
+            ["write", "writer", "success"],
+            ["read", "writer", "success"],
+            ["write", "writer", "success"],
+            ["write", "writer", "failure"],
+          ],
+        );
+        assert.isTrue(
+          observed.every((entry) => Number.isFinite(entry.durationMs) && entry.durationMs >= 0),
+        );
+        assert.isTrue(observed.every((entry) => entry.span === "ObservedService.query"));
+        assert.isTrue(observed.every((entry) => entry.waitMs === undefined || entry.waitMs >= 0));
+        assert.isFalse(JSON.stringify(observed).includes("private"));
+        assert.isFalse(JSON.stringify(observed).includes("observed_statements"));
+        yield* sql`SELECT 2`.pipe(
+          Effect.provideService(SqliteClient.StatementObserver, {
+            ...observer,
+            slowThresholdMs: Number.MAX_SAFE_INTEGER,
+          }),
+        );
+        assert.equal(observed.length, 4);
+        assert.deepEqual(
+          yield* sql`SELECT 3 AS result`.pipe(
+            Effect.provideService(SqliteClient.StatementObserver, {
+              slowThresholdMs: 0,
+              record: () => Effect.die("observer defect"),
+            }),
+          ),
+          [{ result: 3 }],
+        );
+      }),
+  );
+
+  it.effect(
+    "observes only successful outer commits and keeps observer errors out of SQL results",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        let commits = 0;
+        yield* sql`CREATE TABLE observed_commits(value TEXT)`;
+        const observe = () => {
+          commits += 1;
+        };
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`INSERT INTO observed_commits VALUES ('outer')`;
+              yield* sql.withTransaction(sql`INSERT INTO observed_commits VALUES ('nested')`);
+              assert.equal(commits, 0);
+            }),
+          )
+          .pipe(Effect.provideService(SqliteClient.TransactionCommitObserver, observe));
+        assert.equal(commits, 1);
+        yield* sql
+          .withTransaction(
+            sql`INSERT INTO observed_commits VALUES ('rolled back')`.pipe(
+              Effect.andThen(Effect.fail("rollback")),
+            ),
+          )
+          .pipe(
+            Effect.provideService(SqliteClient.TransactionCommitObserver, observe),
+            Effect.result,
+          );
+        assert.equal(commits, 1);
+        yield* sql
+          .withTransaction(sql`INSERT INTO observed_commits VALUES ('observer throws')`)
+          .pipe(
+            Effect.provideService(SqliteClient.TransactionCommitObserver, () => {
+              throw new Error("observer");
+            }),
+          );
+        assert.deepEqual(yield* sql`SELECT value FROM observed_commits`, [
+          { value: "outer" },
+          { value: "nested" },
+          { value: "observer throws" },
+        ]);
+      }),
+  );
   it.effect("retries preparing a query after the missing schema becomes available", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -138,6 +267,30 @@ layer("NodeSqliteClient", (it) => {
     }),
   );
 });
+
+it.effect("observes worker-reader statements with their lane and no query content", () =>
+  withReaderClient((sql) =>
+    Effect.gen(function* () {
+      const observed: SqliteClient.SqliteStatementObservation[] = [];
+      const rows = yield* sql`SELECT name FROM entries`.pipe(
+        SqliteClient.readOnly,
+        Effect.provideService(SqliteClient.StatementObserver, {
+          slowThresholdMs: 0,
+          record: (entry) =>
+            Effect.sync(() => {
+              observed.push(entry);
+            }),
+        }),
+      );
+      assert.deepEqual(rows, [{ name: "first" }]);
+      assert.deepEqual(
+        observed.map((entry) => [entry.operation, entry.connection, entry.lane]),
+        [["read", "reader", "background"]],
+      );
+      assert.isFalse(JSON.stringify(observed).includes("entries"));
+    }),
+  ),
+);
 
 const largeText = "x".repeat(64 * 1024 + 1);
 
@@ -460,6 +613,70 @@ it.effect("labels SQL spans with their connection and how long they waited for i
   );
 });
 
+it.effect.each([false, true])(
+  "records reader permit wait even before acquisition (interrupted=%s)",
+  (interrupted) =>
+    withReaderClient((sql) =>
+      Effect.gen(function* () {
+        const waiting = yield* Deferred.make<void>();
+        const spans: Tracer.NativeSpan[] = [];
+        const tracer = Tracer.make({
+          span: (options) => {
+            const span = new Tracer.NativeSpan(options);
+            spans.push(span);
+            const attribute = span.attribute.bind(span);
+            span.attribute = (key, value) => {
+              attribute(key, value);
+              if (
+                key === "db.reader.acquire_stage" &&
+                value === "slot" &&
+                span.attributes.get("db.reader.requested_lane") === "foreground"
+              )
+                Deferred.doneUnsafe(waiting, Effect.void);
+            };
+            return span;
+          },
+        });
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const holder = yield* sql
+          .withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          )
+          .pipe(SqliteClient.readOnly, Effect.forkChild);
+        yield* Deferred.await(held);
+        const waiter = yield* sql
+          .withTransaction(countEntries(sql))
+          .pipe(
+            SqliteClient.readOnly,
+            SqliteClient.foregroundReads,
+            Effect.provideService(Statement.SpanPropagationEnabled, true),
+            Effect.withTracer(tracer),
+            Effect.forkChild,
+          );
+        yield* Deferred.await(waiting);
+        yield* TestClock.adjust("25 millis");
+        if (interrupted) yield* Fiber.interrupt(waiter);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(holder);
+        if (!interrupted) assert.equal(yield* Fiber.join(waiter), 1);
+        const span = spans.find((span) => span.name === "sql.transaction")!;
+        assert.equal(span.attributes.get("db.reader.requested_lane"), "foreground");
+        assert.equal(span.attributes.get("db.reader.effective_lane"), "background");
+        assert.equal(span.attributes.get("db.reader.acquired"), !interrupted);
+        assert.equal(span.attributes.get("db.reader.wait_ms"), 25);
+        assert.equal(
+          span.attributes.get("db.reader.wait_interrupted"),
+          interrupted ? true : undefined,
+        );
+        assert.equal(
+          span.attributes.get("db.reader.acquire_stage"),
+          interrupted ? "slot" : "acquired",
+        );
+      }),
+    ),
+);
+
 it.effect("labels only the span of the statement or transaction that took the lock", () => {
   const spans: Array<Tracer.NativeSpan> = [];
   const tracer = Tracer.make({
@@ -495,6 +712,62 @@ it.effect("labels only the span of the statement or transaction that took the lo
     }),
   );
 });
+
+it.effect.each(["statement", "transaction", "reservation"] as const)(
+  "a second client's %s labels its own acquisition inside another client's transaction",
+  (mode) =>
+    Effect.gen(function* () {
+      const a = Context.get(
+        yield* Layer.build(
+          SqliteClient.layer({ filename: ":memory:", spanAttributes: { "db.name": "a" } }),
+        ),
+        SqlClient.SqlClient,
+      );
+      const b = Context.get(
+        yield* Layer.build(
+          SqliteClient.layer({ filename: ":memory:", spanAttributes: { "db.name": "b" } }),
+        ),
+        SqlClient.SqlClient,
+      );
+      const spans: Tracer.NativeSpan[] = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          spans.push(span);
+          return span;
+        },
+      });
+      const read =
+        mode === "statement"
+          ? b`SELECT 1`
+          : mode === "transaction"
+            ? b.withTransaction(b`SELECT 1`)
+            : Effect.scoped(
+                Effect.flatMap(b.reserve, (connection) =>
+                  connection.execute("SELECT 1", [], undefined),
+                ),
+              );
+      yield* a
+        .withTransaction(read.pipe(SqliteClient.readOnly))
+        .pipe(
+          Effect.withTracer(tracer),
+          Effect.provideService(Statement.SpanPropagationEnabled, true),
+        );
+      const parent = spans.find(
+        (span) => span.name === "sql.transaction" && span.attributes.get("db.name") === "a",
+      );
+      assert.equal(parent?.attributes.get("db.connection"), "writer");
+      assert.isUndefined(parent?.attributes.get("db.reader.requested_lane"));
+      if (mode !== "reservation") {
+        const own = spans.find(
+          (span) => span.attributes.get("db.name") === "b" && span.attributes.has("db.connection"),
+        );
+        assert.equal(own?.attributes.get("db.connection"), "writer");
+        assert.isNumber(own?.attributes.get("db.lock_wait_ms"));
+        assert.equal(own?.attributes.get("db.reader.requested_lane"), "background");
+      }
+    }).pipe(Effect.scoped),
+);
 
 it.effect("keeps identity reads read-only and preserves an enclosing writer transaction", () =>
   withReaderClient((sql) =>
@@ -822,7 +1095,10 @@ const withCheckpointClient = <A, E>(
     sql: SqlClient.SqlClient,
     filename: string,
   ) => Effect.Effect<A, E, SqlClient.SqlClient | FileSystem.FileSystem | Scope.Scope>,
-  options: { readonly readerWorker?: boolean } = {},
+  options: {
+    readonly readerWorker?: boolean;
+    readonly checkpointWorkerStart?: Effect.Effect<void>;
+  } = {},
 ) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -1063,6 +1339,73 @@ const readCheckpointState = (db: NodeSqlite.DatabaseSync) => {
   }
   return { log: state.log, checkpointed: state.checkpointed };
 };
+
+it.effect("defers routine checkpoints during startup and drains pending WAL on activation", () =>
+  Effect.gen(function* () {
+    const activated = yield* Deferred.make<void>();
+    yield* withCheckpointClient(
+      (sql, filename) =>
+        Effect.gen(function* () {
+          const worker = startedWorkers.at(-1)!;
+          const send = vi.spyOn(worker, "postMessage");
+          yield* Effect.addFinalizer(() => Effect.sync(() => send.mockRestore()));
+          yield* sql`CREATE TABLE pages(payload BLOB)`;
+          yield* sql`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1200)
+            INSERT INTO pages SELECT randomblob(4000) FROM n`;
+          const holder = yield* Effect.acquireRelease(
+            Effect.sync(() => new NodeSqlite.DatabaseSync(filename)),
+            (db) => Effect.sync(() => db.close()),
+          );
+          const pending = readCheckpointState(holder);
+          holder.exec("BEGIN IMMEDIATE");
+          assert.isAbove(pending.log - pending.checkpointed, 1000);
+          assert.deepEqual(yield* sql`SELECT COUNT(*) AS count FROM pages`, [{ count: 1200 }]);
+          assert.equal(send.mock.calls.length, 0);
+          holder.exec("ROLLBACK");
+          assert.deepEqual(readCheckpointState(holder), pending);
+          const reply = waitForCheckpointMessage(worker, 1);
+          yield* Deferred.succeed(activated, undefined);
+          const result = yield* Effect.promise(() => reply);
+          assert.equal(result.checkpointed, result.log);
+          assert.deepEqual(readCheckpointState(holder), {
+            log: result.log,
+            checkpointed: result.log,
+          });
+        }),
+      { checkpointWorkerStart: Deferred.await(activated) },
+    );
+  }),
+);
+
+it.effect("keeps WAL backpressure active before startup activation", () =>
+  withCheckpointClient(
+    (sql, filename) =>
+      Effect.gen(function* () {
+        const worker = startedWorkers.at(-1)!;
+        const requests = pauseCheckpointRequests(worker);
+        yield* Effect.addFinalizer(() => Effect.sync(requests.release));
+        yield* sql`CREATE TABLE pages(payload BLOB)`;
+        yield* sql`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 11000)
+          INSERT INTO pages SELECT randomblob(4000) FROM n`;
+        const observer = yield* Effect.acquireRelease(
+          Effect.sync(() => new NodeSqlite.DatabaseSync(filename)),
+          (db) => Effect.sync(() => db.close()),
+        );
+        assert.isAtLeast(readCheckpointState(observer).log, 10000);
+        assert.isAbove(requests.queued.length, 0);
+        const mutation = yield* sql`INSERT INTO pages VALUES ('after checkpoint')`.pipe(
+          Effect.forkChild,
+        );
+        requests.release();
+        yield* Fiber.join(mutation);
+        yield* checkpointWorkerReply(worker);
+        assert.deepEqual(yield* sql`SELECT COUNT(*) AS count FROM pages`, [{ count: 11001 }]);
+        const state = readCheckpointState(observer);
+        assert.isBelow(state.log - state.checkpointed, 1000);
+      }),
+    { checkpointWorkerStart: Effect.never },
+  ),
+);
 
 it.effect("checkpoints the WAL on the worker instead of the writer", () =>
   withCheckpointClient((sql, filename) =>
@@ -1946,27 +2289,48 @@ it.effect(
 
 it.effect(
   "does not replay a read the worker started while the parent was too busy to hear about it",
-  () =>
-    withWatchedReader({ slow: 60_000, limit: 1500 }, (sql) =>
+  () => {
+    const gates = new Int32Array(new SharedArrayBuffer(3 * Int32Array.BYTES_PER_ELEMENT));
+    gatedWorker.state = gates;
+    // Only the parent's watchdog clock moves; worker progress uses the atomic gates.
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "performance"] });
+    return withWatchedReader({ slow: 60_000, limit: 1500 }, (sql) =>
       Effect.gen(function* () {
         yield* countEntries(sql).pipe(SqliteClient.readOnly);
         const startedBefore = startedWorkers.length;
-        // About 1 s; its caller gives up, so the next read is posted behind it.
-        const first = yield* Effect.forkChild(
-          slowRead(sql, 12_000_000).pipe(SqliteClient.readOnly),
+        const worker = startedWorkers.at(-1)!;
+        const firstStarted = new Promise<{ started: number }>((resolve) =>
+          worker.once("message", resolve),
         );
-        yield* realPause(100);
+        Atomics.store(gates, 0, 1);
+        const first = yield* Effect.forkChild(sql`SELECT 1`.pipe(SqliteClient.readOnly));
+        // The parent knows read 1 started, but the worker cannot finish it yet.
+        const firstMessage = yield* Effect.promise(() => firstStarted);
+        assert.property(firstMessage, "started");
+        assert.notEqual(Atomics.wait(gates, 1, 0, 10_000), "timed-out");
+        assert.equal(Atomics.load(gates, 1), 1);
         yield* Fiber.interrupt(first);
-        // About 30 s, queued in the worker behind the first.
+        const postMessage = worker.postMessage.bind(worker);
+        const secondPosted = new Promise<void>((resolve) => {
+          vi.spyOn(worker, "postMessage").mockImplementationOnce((...args) => {
+            postMessage(...args);
+            resolve();
+          });
+        });
         const second = yield* Effect.forkChild(
-          slowRead(sql, 400_000_000).pipe(SqliteClient.readOnly, Effect.flip),
+          sql`SELECT 2`.pipe(SqliteClient.readOnly, Effect.flip),
         );
-        yield* realPause(50);
-        // Block this thread past the limit: the worker finishes the first read
-        // and starts the second before the parent reads either message, so the
-        // watchdog may still think the first is running when it retires it.
+        yield* Effect.promise(() => secondPosted);
+        // Stay on this stack until read 2 is claimed and the watchdog fires.
+        // The parent cannot process read 1's result or read 2's started message.
         yield* Effect.sync(() => {
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2500);
+          Atomics.store(gates, 2, 1);
+          Atomics.notify(gates, 2);
+          while (Atomics.load(gates, 1) < 2) {
+            assert.notEqual(Atomics.wait(gates, 1, 1, 10_000), "timed-out");
+          }
+          assert.equal(Atomics.load(gates, 1), 2);
+          vi.advanceTimersByTime(2_000);
         });
         assert.include(String((yield* Fiber.join(second)).reason.cause), "Database reader retired");
         // Had the second read moved, a replacement would have run it too.
@@ -1974,7 +2338,15 @@ it.effect(
         assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
         assert.equal(startedWorkers.length, startedBefore + 1);
       }),
-    ),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          gatedWorker.state = undefined;
+          vi.useRealTimers();
+        }),
+      ),
+    );
+  },
   20_000,
 );
 
@@ -2061,37 +2433,42 @@ it.effect("stops moving queued reads and respawning readers when they keep stopp
 
 it.effect("marks committed writes separately from reads and rolled back writes", () => {
   const spans: Array<Tracer.NativeSpan> = [];
-  const tracer = Tracer.make({ span: options => {
-    const span = new Tracer.NativeSpan(options);
-    const attribute = span.attribute.bind(span);
-    span.attribute = (key, value) => {
-      if (key === "db.commit.boundary") throw new Error("exporter failure");
-      attribute(key, value);
-    };
-    spans.push(span);
-    return span;
-  }});
+  const tracer = Tracer.make({
+    span: (options) => {
+      const span = new Tracer.NativeSpan(options);
+      const attribute = span.attribute.bind(span);
+      span.attribute = (key, value) => {
+        if (key === "db.commit.boundary") throw new Error("exporter failure");
+        attribute(key, value);
+      };
+      spans.push(span);
+      return span;
+    },
+  });
   return Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     yield* sql`CREATE TABLE commits(value TEXT)`;
     yield* sql`INSERT INTO commits VALUES ('committed')`;
-    yield* sql.withTransaction(Effect.gen(function* () {
-      yield* sql`INSERT INTO commits VALUES ('rolled back')`;
-      return yield* Effect.fail("rollback");
-    })).pipe(Effect.ignore);
+    yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          yield* sql`INSERT INTO commits VALUES ('rolled back')`;
+          return yield* Effect.fail("rollback");
+        }),
+      )
+      .pipe(Effect.ignore);
     yield* sql`SELECT * FROM commits`;
   }).pipe(
     Effect.provide(SqliteClient.layer({ filename: ":memory:", statementMetrics: true })),
     Effect.provideService(Statement.SpanPropagationEnabled, true),
     Effect.withTracer(tracer),
     Effect.map(() => {
-      const commits = spans.filter(span => span.attributes.has("db.commit.at_ms"));
+      const commits = spans.filter((span) => span.attributes.has("db.commit.at_ms"));
       assert.equal(commits.length, 1);
       assert.isNumber(commits[0]!.attributes.get("db.commit.at_ms"));
     }),
   );
 });
-
 
 it.effect("keeps statement metrics opt-in with explicit configuration taking precedence", () =>
   Effect.gen(function* () {
@@ -2120,8 +2497,14 @@ it.effect("keeps statement metrics opt-in with explicit configuration taking pre
         Effect.withTracer(tracer),
         Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env }))),
       );
-      assert.equal(spans.some((span) => span.attributes.has("db.commit.at_ms")), expected);
-      assert.equal(spans.some((span) => span.attributes.has("db.rows_returned")), expected);
+      assert.equal(
+        spans.some((span) => span.attributes.has("db.commit.at_ms")),
+        expected,
+      );
+      assert.equal(
+        spans.some((span) => span.attributes.has("db.rows_returned")),
+        expected,
+      );
     }
   }),
 );

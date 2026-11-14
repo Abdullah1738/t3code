@@ -1,3 +1,6 @@
+import * as NodeEvents from "node:events";
+import * as NodeVM from "node:vm";
+import * as Fiber from "effect/Fiber";
 import { ErrorObserver, sqliteErrorDetails } from "@t3tools/shared/nodeSqliteErrors";
 // @effect-diagnostics nodeBuiltinImport:off globalDate:off - fixtures drive real worker threads and native SQLite.
 import * as NodeFS from "node:fs";
@@ -9,13 +12,14 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Logger from "effect/Logger";
-import { afterEach } from "vite-plus/test";
+import { afterEach, test } from "vite-plus/test";
 
 import {
   type ExportWorker,
   exportWorkerSource,
   superviseExportWorker,
   superviseReadonlyExport,
+  makeCoordinatedReplica,
 } from "./ReadonlyReplica.ts";
 import { createReadonlyReplica } from "./readonlyExport.ts";
 
@@ -188,9 +192,9 @@ function staleRemountedReplica() {
     CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, payload_json TEXT);
     CREATE TABLE orchestration_v2_projection_runs (run_id TEXT PRIMARY KEY, thread_id TEXT, payload_json TEXT);
     CREATE TABLE orchestration_v2_projection_run_attempts (attempt_id TEXT PRIMARY KEY, payload_json TEXT);
-    CREATE TABLE orchestration_v2_projection_provider_threads (provider_thread_id TEXT PRIMARY KEY, payload_json TEXT);
+    CREATE TABLE orchestration_v2_projection_provider_threads (provider_thread_id TEXT PRIMARY KEY, payload_json TEXT, thread_id TEXT);
     CREATE TABLE orchestration_v2_projection_provider_turns (provider_turn_id TEXT PRIMARY KEY, payload_json TEXT);
-    CREATE TABLE orchestration_v2_projection_subagents (subagent_id TEXT PRIMARY KEY, payload_json TEXT);
+    CREATE TABLE orchestration_v2_projection_subagents (subagent_id TEXT PRIMARY KEY, payload_json TEXT, thread_id TEXT, child_thread_id TEXT);
     CREATE TABLE orchestration_v2_projection_messages (message_id TEXT PRIMARY KEY, payload_json TEXT);
     CREATE TABLE orchestration_v2_projection_turn_items (turn_item_id TEXT PRIMARY KEY, type TEXT, payload_json TEXT, thread_id TEXT DEFAULT 'a', ordinal INTEGER DEFAULT 0);
     CREATE TABLE scheduled_tasks (task_id TEXT PRIMARY KEY, thread_id TEXT);
@@ -278,6 +282,105 @@ it.live("the packaged worker advances a replica stranded by a volume remount", (
   }).pipe(Effect.scoped),
 );
 
+it.live("maintenance waits for worker exit and prevents respawn until released", () =>
+  Effect.gen(function* () {
+    let spawned = 0;
+    let first!: () => void;
+    let second!: () => void;
+    const started = new Promise<void>((resolve) => {
+      first = resolve;
+    });
+    const resumed = new Promise<void>((resolve) => {
+      second = resolve;
+    });
+    const coordinator = yield* makeCoordinatedReplica(() => {
+      const n = ++spawned;
+      const { worker } = evalWorker(
+        "const {parentPort}=require('node:worker_threads'); parentPort.postMessage({type:'opened'}); setInterval(()=>{},1000)",
+      );
+      worker.on("message", () => {
+        if (n === 1) first();
+        else second();
+      });
+      return worker;
+    }, fast);
+    const supervisor = yield* Effect.forkScoped(coordinator.run, { startImmediately: true });
+    yield* Effect.promise(() => started);
+    yield* coordinator.withMaintenance(
+      Effect.gen(function* () {
+        assert.equal(spawned, 1);
+        yield* Effect.yieldNow;
+        assert.equal(spawned, 1);
+      }),
+    );
+    yield* Effect.promise(() => resumed);
+    assert.equal(spawned, 2);
+    yield* Fiber.interrupt(supervisor);
+  }).pipe(Effect.scoped),
+);
+
+it.live("maintenance taken before startup fences the first export worker", () =>
+  Effect.gen(function* () {
+    let spawned = 0;
+    let opened!: () => void;
+    const started = new Promise<void>((resolve) => {
+      opened = resolve;
+    });
+    const coordinator = yield* makeCoordinatedReplica(() => {
+      spawned++;
+      const { worker } = evalWorker(
+        "const {parentPort}=require('node:worker_threads'); parentPort.postMessage({type:'opened'}); setInterval(()=>{},1000)",
+      );
+      worker.on("message", opened);
+      return worker;
+    }, fast);
+    const supervisor = yield* coordinator.withMaintenance(
+      Effect.gen(function* () {
+        const fiber = yield* Effect.forkScoped(coordinator.run, { startImmediately: true });
+        assert.equal(spawned, 0);
+        yield* Effect.yieldNow;
+        assert.equal(spawned, 0);
+        return fiber;
+      }),
+    );
+    yield* Effect.promise(() => started);
+    assert.equal(spawned, 1);
+    yield* Fiber.interrupt(supervisor);
+  }).pipe(Effect.scoped),
+);
+
+it.live("maintenance refuses when a worker termination cannot be confirmed", () =>
+  Effect.gen(function* () {
+    let started!: () => void;
+    const startup = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const coordinator = yield* makeCoordinatedReplica(
+      () => {
+        const worker = Object.assign(new NodeEvents.EventEmitter(), {
+          terminate: () => new Promise<number>(() => {}),
+        });
+        started();
+        return worker as unknown as ExportWorker;
+      },
+      { ...fast, terminateTimeout: "20 millis" },
+    );
+    const supervisor = yield* Effect.forkScoped(coordinator.run, { startImmediately: true });
+    yield* Effect.promise(() => startup);
+    let mutated = false;
+    const refused = yield* coordinator
+      .withMaintenance(
+        Effect.sync(() => {
+          mutated = true;
+        }),
+      )
+      .pipe(Effect.result);
+    assert.equal(refused._tag, "Failure");
+    assert.equal(mutated, false);
+    yield* Fiber.interrupt(supervisor);
+  }).pipe(Effect.scoped),
+);
+
 it.live.each(["primary", "replica"] as const)(
   "forwards raw %s exporter errors through supervision",
   (role) => {
@@ -299,3 +402,41 @@ it.live.each(["primary", "replica"] as const)(
     );
   },
 );
+
+test("idle polling wakes on an identity at 1 s instead of waiting the full 15 s", () => {
+  let now = 0;
+  const timers: Array<{ run: () => void; at: number }> = [];
+  const messages: Array<{ type: string; cycleMs?: number }> = [];
+  let pending = false;
+  let steps = 0;
+  NodeVM.runInNewContext(exportWorkerSource("() => workerData.replica"), {
+    require: (name: string) =>
+      name === "node:worker_threads"
+        ? {
+            parentPort: { postMessage: (message: { type: string }) => messages.push(message) },
+            workerData: {
+              replica: {
+                step: () => {
+                  steps++;
+                  return false;
+                },
+                pollIdentities: () => pending,
+              },
+            },
+          }
+        : {},
+    Date: { now: () => now },
+    setTimeout: (run: () => void, delay: number) => timers.push({ run, at: now + delay }),
+  });
+  assert.equal(steps, 1);
+  pending = true;
+  const timer = timers.shift()!;
+  assert.equal(timer.at, 1_000);
+  now = timer.at;
+  timer.run();
+  assert.equal(steps, 2);
+  assert.deepStrictEqual(
+    messages.filter((m) => m.type === "published").map((m) => m.cycleMs),
+    [0, 0],
+  );
+});

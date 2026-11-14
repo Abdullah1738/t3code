@@ -20,6 +20,8 @@ import { useMemo, useSyncExternalStore } from "react";
 import { connectionAtomRuntime } from "../../connection/runtime";
 import { appAtomRegistry } from "../../state/atom-registry";
 import { type FeedState, pairedEnvironmentIdAtom } from "../common/environment";
+import { usePairedEnvironmentId } from "../common/environment";
+import { recordAnalytics } from "@t3tools/client-runtime/ardud/analytics";
 
 // Leaving a card or discussion and coming back finds its feed still open.
 const KEEP_ALIVE_MS = 2 * 60_000;
@@ -61,8 +63,18 @@ function useStore<T>(store: SnapshotStore<T>): T | undefined {
 }
 
 function useFeed(store: SnapshotStore<unknown>): FeedState {
+  const environmentId = usePairedEnvironmentId();
   const failure = useSyncExternalStore(store.subscribe, store.failure);
-  return useMemo(() => ({ failure, retry: store.retry }), [failure, store]);
+  return useMemo(
+    () => ({
+      failure,
+      retry: () => {
+        recordAnalytics(environmentId, "client.retry", { props: { reason: "retry" } });
+        store.retry();
+      },
+    }),
+    [failure, store, environmentId],
+  );
 }
 
 /**

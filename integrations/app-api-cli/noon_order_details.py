@@ -1,4 +1,5 @@
 """Allowlisted order merchandise projection. Never return raw payment/customer data."""
+import toollog
 import math
 import re
 import datetime as dt
@@ -44,12 +45,21 @@ def food(row, order):
             'vendor_name':core.text((row.get('outletInfo') or {}).get('name')),
             'placed_at':row.get('createdAt') or row.get('placedAt'),
             'items':lines,'total':number(row.get('orderTotal')),'currency':'AED',
+            'card_last4':str(row.get('creditCardMask') or '')[-4:] or None,
             'notes':row.get('notes') if isinstance(row.get('notes'),str) else None,
             'price_breakdown':{k:number(row.get(k)) for k in ('orderSubtotal','orderSubtotalDiscounted','orderDiscount',
                                 'orderDeliveryFee','orderServiceFee','orderSmallOrderFee')},
             'source':'exact_native_order_detail','items_complete':True,'account_verified':True}
 
 
+def _check_order_identity(row, order):
+    if not isinstance(row, dict):
+        raise core.NoonError('ORDER_MISMATCH_OR_SCHEMA_CHANGED')
+    if row.get('orderNr') is not None and row['orderNr'] != order:
+        raise core.NoonError('ORDER_MISMATCH')
+
+
+@toollog.timed("noon", "provider.details")
 def details(order, service, timeout=12):
     deadline=core.operation_deadline(timeout)
     extra={}
@@ -59,15 +69,18 @@ def details(order, service, timeout=12):
     if service=='nownow':
         headers=vertical._headers('nownow',deadline)
         row=vertical._nownow_data(vertical._read('nownow_detail',headers,deadline,order))
+        _check_order_identity(row, order)
         raw=row.get('products'); store=core.text((row.get('storeInfo') or {}).get('name'))
     elif service=='minutes':
         import noon_minutes_checkout as minutes
         headers=core.verified_session('minutes',deadline)
         row=minutes.native_request('order_get',headers,deadline,{'orderNr':order},response_observer=lambda *a,**k:None)
+        _check_order_identity(row, order)
         raw=row.get('items'); store='noon Minutes'
     elif service in ('main','supermall','marketplace'):
         headers=vertical._headers('marketplace',deadline)
         row=vertical._read('marketplace_manifest',headers,deadline,order)
+        _check_order_identity(row, order)
         groups=row.get('itemGroups')
         if not isinstance(groups,list):raise core.NoonError('ORDER_ITEM_SCHEMA_CHANGED')
         raw=[i for g in groups for i in g.get('items',[])];store='noon'
@@ -104,6 +117,7 @@ def details(order, service, timeout=12):
         image=item.get('imageUrl') or next((m.get('path') for m in media if m.get('type')=='image' and m.get('isAbsolutePath')),None)
         if not image and item.get('images'):image='https://f.nooncdn.com/'+item['images'][0]
         lines.append({'item_code':item.get('itemCode') or item.get('productCode') or item.get('sku'),
+                      'sku_config':item.get('skuConfig'),
                       'name':core.text(item.get('name') or item.get('title')),'qty':int(qty) if qty==int(qty) else qty,
                       'price':price,'line_total':number(item.get('totalPrice')),'notes':notes,
                       'detail':detail,'options':None,'image_url':image,
@@ -111,5 +125,6 @@ def details(order, service, timeout=12):
     return {'ok':True,'app':'noon','order':order,'vertical':service,'vendor_name':store,
             'placed_at':row.get('createdAt') or row.get('placedAt'),
             'items':lines,'total':number(row.get('orderTotal')),'currency':'AED',
+            'card_last4':str(row.get('creditCardMask') or '')[-4:] or None,
             'items_complete':not extra or extra['declared_item_units']==extra['observed_item_units'],
             'source':'exact_native_order_detail','account_verified':True,**extra}

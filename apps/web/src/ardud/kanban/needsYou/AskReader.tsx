@@ -1,3 +1,5 @@
+import { usePrimaryEnvironmentId } from "../../../state/environments";
+import { useAnalyticsScreen } from "../../useAnalytics";
 import {
   STAGE_LABELS,
   askAge,
@@ -5,7 +7,6 @@ import {
   askFormFor,
   askDiscussion,
   askRepliedOnCard,
-  askWordsForReply,
   askFormWithSecrets,
   nextChangeView,
   askKindLabel,
@@ -42,6 +43,7 @@ import {
   type RefObject,
 } from "react";
 
+import { useAskTiming } from "./useAskTiming";
 import { observeResize } from "../../../lib/observeResize";
 import { cn } from "../../../lib/utils";
 import { BoardIcon } from "../boardIcon";
@@ -117,6 +119,14 @@ export function AskReader(props: {
   onLeave: () => void;
 }) {
   const { entry, item, layout } = props;
+  useAnalyticsScreen(
+    usePrimaryEnvironmentId(),
+    "ask",
+    entry.boardId,
+    entry.cardId,
+    entry.discussionId ?? undefined,
+    entry.ask.id,
+  );
   const key = askKey(entry);
   const turn = askTurn(entry, item);
   const detail = useAskStore((state) => state.details[`${key}@${entry.revision}`]);
@@ -150,6 +160,7 @@ export function AskReader(props: {
   const refusal = askRefusal(response);
   const locked = turn === "evaluator" || turn === "expired";
   const root = useRef<HTMLDivElement>(null);
+  useAskTiming(entry.cardId, entry.ask.id, root);
 
   // The feed carries big blocks as stubs: read the ask whole once it is open.
   const needsDetail = detail === undefined && askNeedsDetail(entry.ask);
@@ -233,17 +244,8 @@ export function AskReader(props: {
     if (failure.stale) noteAskStale(entry);
     focusAt(`field:${failure.field ?? askSecretFieldIds(ask)[0] ?? ""}`);
   };
-  // Words alone never close a pick he has to make: they go to its agent as a reply and the ask stays open.
-  const sendWordsAsReply = (words: string) => {
-    void replyOnAsk(entry, [{ _tag: "md", text: words }]).then(
-      () => patchAskForm(entry, { ownWords: "" }),
-      (error: unknown) => showAskToast({ text: `Reply not sent. ${askFailureText(error)}` }, 9_000),
-    );
-  };
   const send = (intent: "primary" | "refuse") => {
     if (locked || secretBusy) return;
-    const words = intent === "primary" ? askWordsForReply(ask, form) : null;
-    if (words !== null) return sendWordsAsReply(words);
     const now = buildAskAnswer(
       ask,
       askFormWithSecrets(ask, form, secrets),

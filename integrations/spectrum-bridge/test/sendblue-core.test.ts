@@ -422,7 +422,7 @@ describe("transport shim", () => {
   test("line failure codes reach the logs and keep their flags; free text in an HTTP error key does not", async () => {
     const fail = (error: LineError) => sbTransport(fakeLine({ typing: async () => { throw error; } }), chatKey.dm(owner), store()).typing("x", true);
     await expect(fail(new LineError("x", "http_400:invalid_number", false, false))).rejects.toMatchObject({ code: "http_400:invalid_number", retryable: false });
-    await expect(fail(new LineError("x", "http_400:Number is not valid, see https://x", false, false))).rejects.toMatchObject({ code: "http_400" });
+    await expect(fail(new LineError("x", "http_400:Number is not valid, see https://x", false, false))).rejects.toMatchObject({ code: "http_400:provider_error" });
     await expect(fail(new LineError("x", "weird\ncode", true, true))).rejects.toMatchObject({ code: "lineFailure", retryable: true, ambiguous: true });
     expect(classifySendFailure(new TransportError("http_400:invalid_number", false, false))).toEqual({ retryable: false, uncertain: false, code: "http_400:invalid_number" });
     expect(classifySendFailure(new TransportError("network", true, true))).toEqual({ retryable: true, uncertain: true, code: "network" });
@@ -725,4 +725,44 @@ test("fresh text reserves and dispatches before queued cancellation; concurrent 
   expect(await first).toMatchObject({providerId:"accepted"});
   expect(await transport.sendText(input)).toMatchObject({providerId:"accepted",duplicate:true});
   expect(events).toEqual(["send","cancel"]);
+});
+
+const providerFailureCases = [
+  { field: "error", value: "private_message_sentinel", tag: "http_400:provider_error", private: true },
+  { field: "error_key", value: "private token with spaces", tag: "http_400:provider_error", private: true },
+  { field: "error_key", value: "stop_opt_out_private_sentinel", tag: "http_400:provider_error", private: true },
+  { field: "error_key", value: "INVALID_NUMBER", tag: "http_400:invalid_number", private: false },
+  { field: "error_key", value: "private_token_sentinel", tag: "http_400:provider_error", private: true },
+  { field: "error", value: "otp_654321", tag: "http_400:provider_error", private: true },
+  { field: "error_code", value: 654321, tag: "http_400:provider_error", private: true },
+  { field: "message", value: "private_message_sentinel", tag: "http_400", private: true },
+  { field: "error_reason", value: "private_message_sentinel", tag: "http_400", private: true },
+  { field: "error_key", value: "invalid_number", tag: "http_400:invalid_number", private: false },
+  { field: "error_key", value: "worker_unavailable", tag: "http_400:worker_unavailable", private: false },
+  { field: "error_key", value: "stop_opt_out", tag: "http_400:stop_opt_out", private: false },
+  { field: "error_key", value: "STOP", tag: "http_400:stop_opt_out", private: false },
+  { field: "error_code", value: 5504, tag: "http_400:5504", private: false },
+];
+
+test.each(providerFailureCases)("provider failure $field=$value stays private through delivery and rollup", async fixture => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const { toolLog } = await import("../src/toollog.ts");
+  setSystemTime(Date.parse("2026-11-13T12:00:00Z"));
+  let rollup = "";
+  const logs = await captureLogs(async () => {
+    const s = store();
+    const line = new Sendblue({ keyId: "fixture-key", secret: "fixture-secret", number: "+19362300565",
+      fetch: (async () => Response.json({ [fixture.field]: fixture.value }, { status: 400 })) as unknown as typeof fetch });
+    s.enqueue({ id: "privacy-fixture", kind: "conversation", text: String(fixture.value) });
+    await new Delivery(s, sbTransport(line, chatKey.dm(owner), s), {
+      projectScope: "privacy-fixture", chatGuid: () => chatKey.dm(owner), enabled: () => true, sleep: async () => {},
+    }).tick();
+    rollup = JSON.stringify(await toolLog.rollup("2026-11-13"));
+  });
+  expect(logs.find(line => line.name === "reply.failed")?.error?.tag).toBe(fixture.tag);
+  expect(rollup).toContain(fixture.tag);
+  if (fixture.private) {
+    expect(JSON.stringify(logs)).not.toContain(String(fixture.value));
+    expect(rollup).not.toContain(String(fixture.value));
+  }
 });

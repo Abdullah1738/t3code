@@ -1,3 +1,4 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import type {
   ApplicationStoredEvent,
@@ -6,17 +7,25 @@ import type {
   OrchestrationV2StoredEvent,
   OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
-import { ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import { NodeId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
+import * as ProjectionStore from "./ProjectionStore.ts";
+
 import {
+  toShellApplicationEvent,
+  shellChangeEvents,
   archivedShellStreamItemFromThreadShell,
   buildActiveShellSnapshot,
   coalesceShellApplicationEvents,
@@ -146,6 +155,103 @@ describe("loadShellSnapshotParts", () => {
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 });
+
+it.live("unbounded shell reads cannot occupy a point reader, even from a foreground request", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "shell-request-latency-" });
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`PRAGMA journal_mode = WAL`;
+      yield* sql`CREATE TABLE nodes(id TEXT PRIMARY KEY, value TEXT)`;
+      yield* sql`INSERT INTO nodes VALUES ('node', 'committed')`;
+      const snapshot = { schemaVersion: 1, snapshotSequence: 0, threads: [], archivedThreads: [] };
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const writerHeld = yield* Deferred.make<void>();
+      const writerRelease = yield* Deferred.make<void>();
+      yield* sql`CREATE TABLE orchestration_v2_projection_nodes(node_id TEXT PRIMARY KEY, payload_json TEXT)`;
+      const point = Effect.flatMap(ProjectionStore.ProjectionStoreV2, (store) =>
+        store.isNodeStored({
+          id: NodeId.make("node"),
+          threadId: ThreadId.make("thread"),
+          runId: null,
+          parentNodeId: null,
+          rootNodeId: NodeId.make("node"),
+          kind: "root_turn",
+          status: "running",
+          countsForRun: true,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          runtimeRequestId: null,
+          checkpointScopeId: null,
+          startedAt: null,
+          completedAt: null,
+        }),
+      ).pipe(Effect.provide(ProjectionStore.layer));
+      const read = sql`SELECT value FROM nodes WHERE id = 'node'`;
+      // Warm the worker before imposing the latency bound.
+      yield* read.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.foregroundReads);
+      yield* read.pipe(NodeSqliteClient.authReadOnly);
+      expect(yield* point).toBe(false);
+      const full = yield* loadShellSnapshotParts({
+        sql,
+        readThreads: Effect.gen(function* () {
+          yield* read;
+          yield* Deferred.succeed(held, undefined);
+          yield* Deferred.await(release);
+          return Effect.succeed(snapshot);
+        }),
+        listProjects: Effect.succeed([]),
+        latestSequence: Effect.succeed(0),
+      }).pipe(NodeSqliteClient.foregroundReads, Effect.forkChild);
+      yield* Deferred.await(held);
+      const writer = yield* sql
+        .withTransaction(
+          sql`UPDATE nodes SET value = 'uncommitted' WHERE id = 'node'`.pipe(
+            Effect.andThen(Deferred.succeed(writerHeld, undefined)),
+            Effect.andThen(Deferred.await(writerRelease)),
+          ),
+        )
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(writerHeld);
+      yield* Effect.gen(function* () {
+        expect(yield* point).toBe(false);
+        expect(
+          yield* read.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.foregroundReads),
+        ).toEqual([{ value: "committed" }]);
+        expect(yield* read.pipe(NodeSqliteClient.authReadOnly)).toEqual([{ value: "committed" }]);
+        const page = yield* loadShellSnapshotParts({
+          sql,
+          bounded: true,
+          readThreads: read.pipe(Effect.as(Effect.succeed(snapshot))),
+          listProjects: Effect.succeed([]),
+          latestSequence: Effect.succeed(0),
+        }).pipe(NodeSqliteClient.foregroundReads);
+        expect(page.threads).toEqual(snapshot);
+        expect(full.pollUnsafe()).toBeUndefined();
+        expect(writer.pollUnsafe()).toBeUndefined();
+      }).pipe(
+        Effect.timeout("500 millis"),
+        Effect.ensuring(Deferred.succeed(release, undefined)),
+        Effect.ensuring(Deferred.succeed(writerRelease, undefined)),
+      );
+      yield* Fiber.join(full);
+      yield* Fiber.join(writer);
+    }).pipe(
+      Effect.provide(
+        NodeSqliteClient.layer({
+          filename: path.join(dir, "state.sqlite"),
+          readerWorker: true,
+          authReaderProcess: true,
+          foregroundReaderSlots: 1,
+        }),
+      ),
+    );
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
 
 function shellFixture(overrides: Partial<OrchestrationV2ThreadShell>): OrchestrationV2ThreadShell {
   return {
@@ -745,3 +851,46 @@ describe("withSubagentRequestAncestors", () => {
     }),
   );
 });
+
+it.effect(
+  "redaction invalidation survives shell coalescing, archived removal, replay and unchanged-shell suppression",
+  () =>
+    Effect.gen(function* () {
+      const redacted = toShellApplicationEvent({
+        ...storedThreadEvent(8, "thread-a", { type: "thread.item-redacted" }),
+      });
+      const later = toShellApplicationEvent({
+        ...storedThreadEvent(9, "thread-a", { type: "thread.metadata-updated" }),
+      });
+      const [coalesced] = coalesceShellApplicationEvents([redacted, later]);
+      expect(coalesced).toEqual({
+        sequence: 9,
+        event: { threadId: "thread-a" },
+        redactionSequence: 8,
+      });
+      const replayed = shellChangeEvents({
+        threads: [{ threadId: ThreadId.make("thread-a"), sequence: 9, redactionSequence: 8 }],
+        projects: [],
+      });
+      expect(replayed).toEqual([coalesced]);
+      if (!coalesced || !("event" in coalesced)) throw new Error("Missing fixture event");
+      const shell = shellFixture({ id: ThreadId.make("thread-a") });
+      const ordinary = shellStreamItemFromThreadShell({
+        stored: { sequence: 7, event: { threadId: shell.id } },
+        shell,
+      });
+      const invalidation = shellStreamItemFromThreadShell({ stored: coalesced, shell });
+      expect(invalidation).toMatchObject({ kind: "thread.updated", redactionSequence: 8 });
+      const delivered = yield* Stream.make(ordinary, invalidation).pipe(
+        skipUnchangedThreadShells,
+        Stream.runCollect,
+      );
+      expect(delivered).toEqual([ordinary, invalidation]);
+      expect(
+        shellStreamItemFromThreadShell({
+          stored: coalesced,
+          shell: { ...shell, archivedAt: shell.createdAt },
+        }),
+      ).toMatchObject({ kind: "thread.removed", redactionSequence: 8, threadId: shell.id });
+    }),
+);

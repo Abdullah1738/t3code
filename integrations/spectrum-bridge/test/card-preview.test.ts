@@ -60,3 +60,17 @@ test("caption-only pages such as secure forms do not require an image upload", a
   }));
   expect(await preview("https://a.example/")).toBeUndefined();
 });
+
+test("card preparation logs render success/failure without page or caption text", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const logs = await captureLogs(async () => {
+    await cardPreviewImage(async () => "https://media.example/p.png", fakeFetch({
+      "https://a.example/q-fixture/": html('<title>PRIVATE_CARD_TEXT</title><meta property="og:image" content="p.png">'),
+      "https://a.example/q-fixture/p.png": () => new Response("png", { headers: { "content-type": "image/png" } }),
+    }))("https://a.example/q-fixture/");
+    await expect(cardPreviewImage(async () => "", fakeFetch({}))("https://a.example/delivery-fixture/")).rejects.toThrow();
+  });
+  expect(logs.filter(l => l.name === "card.render").map(l => [l.ok, l.props?.cardKind])).toEqual([[true, "quick"], [false, "delivery"]]);
+  expect(logs.some(l => l.name === "bridge.catch")).toBe(true);
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_CARD_TEXT");
+});

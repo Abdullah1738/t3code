@@ -10,6 +10,18 @@
 #    Dropbox CLI (src/dropbox_mirror.py), verified by Dropbox content_hash.
 # Status goes to logs/backup_last.json; the health check reads it.
 set -u
+mac_log() { :; }
+. "${MAC_LOG_HOME:-$HOME/.local/lib/mac-logging}/toollog.sh" 2>/dev/null || :
+TL_START=$(date +%s)
+TL_RESTIC_RC=""
+TL_SNAPSHOT_AT=0
+TL_SKIP_REASON=other
+summary=""
+backup_log_exit() {
+  local status=$?
+  printf '%s' "$summary" | mac_log backup memory "$TL_START" "$TL_RESTIC_RC" "$status" "$TL_SNAPSHOT_AT" "$TL_SKIP_REASON" "${LOCK:-}"
+}
+trap backup_log_exit EXIT
 ROOT="$HOME/.local/share/memory-system"
 if [ "${MEMORY_BACKUP_GUARDED:-}" != 1 ]; then
   exec /opt/homebrew/bin/python3 "$ROOT/src/backup_control.py" guard "$ROOT/logs/backup.lock" /bin/bash "$0" "$@"
@@ -65,7 +77,14 @@ json.dump(st, open(tmp, "w"), indent=1)
 os.replace(tmp, path)
 PY
 }
-fail() { log "FAIL [$1] $2"; write_status 0 "$1" "$2" "" 0; exit 1; }
+fail() {
+  if [ "$TL_SNAPSHOT_AT" = 0 ] && [ "$TL_SKIP_REASON" != source_missing ]; then
+    TL_SKIP_REASON=$(printf '%s' "$2" | mac_log backup-reason "$1" "$TL_RESTIC_RC")
+    TL_SKIP_REASON=${TL_SKIP_REASON:-other}
+    [ "$1" != files ] || [ -d "$DATA" ] || TL_SKIP_REASON=source_missing
+  fi
+  log "FAIL [$1] $2"; write_status 0 "$1" "$2" "" 0; exit 1
+}
 run_bg_limited() { # seconds command...
   local seconds="$1"; shift
   /opt/homebrew/bin/python3 "$ROOT/src/run_limited.py" --seconds "$seconds" --background --load-aware --max-seconds-under-load "${MEMORY_BACKUP_MAX_SECONDS_UNDER_LOAD:-10800}" -- "$@"
@@ -142,7 +161,7 @@ PY
 # Restore: sqlite3 new.sqlite < robob-state.sql. Missing export fails closed.
 ROBOB_DB=$(/opt/homebrew/bin/python3 "$ROOT/src/robob_readonly.py" 2>&1) \
   || fail replica "robob-state.sql: $ROBOB_DB"
-[ -f "$ROBOB_DB" ] || fail replica "Robob read-only replica missing: $ROBOB_DB"
+[ -f "$ROBOB_DB" ] || { TL_SKIP_REASON=source_missing; fail replica "Robob read-only replica missing: $ROBOB_DB"; }
 ROBOB_GENERATION=$(/opt/homebrew/bin/python3 "$ROOT/src/robob_readonly.py" --generation 2>&1) \
   || fail replica "robob-state.sql: $ROBOB_GENERATION"
 ROBOB_TABLES="scheduled_tasks projection_projects ardud_board_% ardud_kanban_% ardud_mission_%
@@ -245,6 +264,8 @@ done
 out=$(run_bg_limited "$RESTIC_TIMEOUT_S" nice -n 10 "$RESTIC" backup --host ardud-mac --tag memory-live --json --quiet \
   --pack-size 64 "${excl[@]}" "$STAGE" 2>&1)
 rc=$?
+TL_RESTIC_RC=$(printf '%s' "$out" | mac_log backup-restic-exit "$RESTIC" "$rc")
+TL_SKIP_REASON=""
 if [ "$rc" -eq 124 ]; then
   [ -z "$out" ] || log "restic timeout output: $(printf '%s' "$out" | tail -c 600)"
   fail restic "restic backup timed out after $RESTIC_TIMEOUT_S s (disk contention?)"
@@ -253,6 +274,8 @@ summary=$(printf '%s\n' "$out" | grep '"message_type":"summary"' | tail -1)
 [ $rc -eq 0 ] && [ -n "$summary" ] || fail restic "rc=$rc $(printf '%s' "$out" | tail -c 600)"
 snap=$(printf '%s' "$summary" | /opt/homebrew/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["snapshot_id"][:8])')
 added=$(printf '%s' "$summary" | /opt/homebrew/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("data_added_packed",0))')
+TL_SNAPSHOT_AT=$(date +%s)
+TL_SKIP_REASON=""
 log "snapshot $snap added_packed=$added"
 
 # 3. retention, daily

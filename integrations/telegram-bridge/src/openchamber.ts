@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { errorCause, toolError } from "./toollog.ts";
 
 // JSON.parse establishes this representation; notification consumers decode its
 // event variants before using them as session/request identities.
@@ -128,9 +129,9 @@ export function sessionOrigin(session: SessionRecord | undefined): string | unde
   return typeof origin === "string" && origin ? origin : undefined;
 }
 
-function requestError(status: number, signal?: AbortSignal): Error & { status: number } {
+function requestError(status: number, signal?: AbortSignal, cause?: unknown): Error & { status: number } {
   // Never expose response bodies, URLs, headers, parser errors, or abort reasons.
-  const error = Object.assign(new Error(`OpenChamber request failed (HTTP ${status})`), { status });
+  const error = Object.assign(new Error(`OpenChamber request failed (HTTP ${status})`), { status, causeClass: signal?.aborted ? errorCause(signal.reason) : cause === undefined ? status || "unknown" : errorCause(cause) });
   if (signal?.aborted) error.name = "AbortError";
   return error;
 }
@@ -238,12 +239,14 @@ export class OpenChamber implements AlertBackend {
         throw new Error();
       }
       this.baseUrl = new URL(baseUrl).origin;
-    } catch {
+    } catch (error) {
+      toolError("telegram", "tg.openchamber.url", undefined, error);
       throw new Error("OpenChamber URL must be an HTTP origin on 127.0.0.1 or localhost");
     }
     try {
       this.headers = new Headers(headers);
-    } catch {
+    } catch (error) {
+      toolError("telegram", "tg.openchamber.headers", undefined, error);
       throw new Error("Invalid OpenChamber headers");
     }
   }
@@ -275,11 +278,12 @@ export class OpenChamber implements AlertBackend {
         proxy: "",
         verbose: false,
       });
-    } catch {
-      throw requestError(0, signal);
+    } catch (error) {
+      toolError("telegram", "tg.openchamber.request", undefined, signal?.aborted ? signal.reason : error);
+      throw requestError(0, signal, error);
     }
     if (!response.ok) {
-      await response.body?.cancel().catch(() => {});
+      await response.body?.cancel().catch(error => { toolError("telegram", "tg.openchamber.responseCancel", undefined, error); });
       throw requestError(response.status, signal);
     }
     return response;
@@ -292,8 +296,9 @@ export class OpenChamber implements AlertBackend {
     if (response.status === 204) return undefined;
     try {
       return (await response.json()) as T;
-    } catch {
-      throw requestError(response.status, signal);
+    } catch (error) {
+      toolError("telegram", "tg.openchamber.responseJson", undefined, error);
+      throw requestError(response.status, signal, error);
     }
   }
 
@@ -352,7 +357,7 @@ export class OpenChamber implements AlertBackend {
         assert.match(session.parentID, ID);
         id = session.parentID;
       }
-    } catch { /* Keep pending permissions visible when the policy owner is unavailable. */ }
+    } catch (error) { toolError("telegram", "tg.openchamber.runtimeMode", { thread: sessionId }, error); }
   }
 
   async getSession(id: string, directory: string): Promise<SessionRecord | undefined> {
@@ -431,7 +436,7 @@ export class OpenChamber implements AlertBackend {
     const response = await this.response(path, { signal }, "text/event-stream");
     if (response.status === 204) return;
     if (!response.body || response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "text/event-stream") {
-      await response.body?.cancel().catch(() => {});
+      await response.body?.cancel().catch(error => { toolError("telegram", "tg.openchamber.eventBodyCancel", undefined, error); });
       throw requestError(response.status, signal);
     }
     const reader = response.body.getReader();
@@ -473,10 +478,11 @@ export class OpenChamber implements AlertBackend {
         // SSE dispatch requires a blank line; discard incomplete frames at EOF.
         if (done) return;
       }
-    } catch {
-      throw requestError(response.status, signal);
+    } catch (error) {
+      toolError("telegram", "tg.openchamber.events", undefined, error);
+      throw requestError(response.status, signal, error);
     } finally {
-      await reader.cancel().catch(() => {});
+      await reader.cancel().catch(error => { toolError("telegram", "tg.openchamber.eventReaderCancel", undefined, error); });
       reader.releaseLock();
     }
   }

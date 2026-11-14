@@ -2,6 +2,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+import order_card
 from unittest.mock import Mock,patch
 
 import commerce_marketplace as c
@@ -61,8 +62,8 @@ class IntegrationTests(unittest.TestCase):
         with self.assertRaises(c.market.MarketplaceError):flow.cart()
         self.assertEqual(events,[])
 
-    def test_reviewed_synthetic_shape_place_and_payment_use_real_journal(self):
-        from test import test_noon_marketplace_review as fixtures
+    def test_legacy_review_cannot_authorize_a_financial_send(self):
+        import test_noon_marketplace_review as fixtures
         from noon_minutes_checkout import SavedCard
         fixture=fixtures.ReviewTests();fixture.setUp()
         flow,auth,events=self.setup_flow()
@@ -74,21 +75,18 @@ class IntegrationTests(unittest.TestCase):
         flow.last_cart=c.market.Response(c.market.operation('main','cart'),200,fixture.cart,now)
         flow.session_response=c.market.Response(c.market.operation('main','session'),200,fixture.session,now)
         flow.owned_offers=(('offer-1','vanilla',2),)
-        flow.card=SavedCard('saved-token','****2342','mastercard')
+        flow.card=SavedCard('saved-token','****' + order_card.LAST4,order_card.NETWORK)
         reviewed=flow.review_selected(manifest=fixture.manifest,expected_fees=(('shipping',250),),
             quiet_options=fixture.quiet,shape=fixture.shape)
         self.assertEqual(reviewed.payable_minor,2250)
-        def wire(op,headers,deadline,*,response_observer):
-            response_observer(c.market.ResponseObservation('https://'+op.host+op.path,200,()))
-            return 'NORDER123' if op.name=='place' else {'status':'pending','clientSecret':'synthetic-intent'} if op.name=='order_status' else {'status':'payment_confirmed'}
-        flow.client._request=wire
-        flow.place_reviewed()
-        flow.complete_existing_payment('NORDER123')
+        flow.client._request=Mock(side_effect=AssertionError('no financial request'))
+        with self.assertRaisesRegex(c.market.MarketplaceError,'^OWNER_GO_REQUIRED$'):
+            flow.place_reviewed()
         state=c.journal.inspect(flow.flow_id)
-        self.assertEqual(state['reserved_minor'],2250)
-        self.assertEqual(state['order_id'],'NORDER123')
-        self.assertEqual([x['kind'] for x in state['operations']],['quote','place','payment'])
-        with self.assertRaises(c.market.MarketplaceError):flow.place_reviewed()
+        self.assertEqual(state['reserved_minor'],0)
+        self.assertIsNone(state['order_id'])
+        self.assertEqual([x['kind'] for x in state['operations']],['quote'])
+        flow.client._request.assert_not_called()
 
 
 if __name__=='__main__':unittest.main()

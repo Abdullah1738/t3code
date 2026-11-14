@@ -15,6 +15,8 @@ import { create } from "zustand";
 
 import { kanban } from "../kanbanStore";
 import { askApi } from "./askApi";
+import { appAtomRegistry } from "../../../rpc/atomRegistry";
+import { primaryEnvironmentIdAtom } from "../../../state/primaryEnvironment";
 
 export {
   HAND_WORDS_MAX,
@@ -31,6 +33,7 @@ export const useAskStore = create<AskState>(() => INITIAL_ASK_STATE);
 export const formOf = askFormOf;
 
 const store = createAskStore({
+  analyticsEnvironmentId: () => appAtomRegistry.get(primaryEnvironmentIdAtom),
   api: askApi,
   cell: {
     getState: useAskStore.getState,

@@ -6,9 +6,13 @@ import { join } from "node:path";
 import { Attention, type AttentionOptions } from "../src/attention.ts";
 import { callbackToken, sessionNoticeId, Store, type SessionNotice } from "../src/store.ts";
 import { OpenChamber, type BoardSnapshot, type JsonValue, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus } from "../src/openchamber.ts";
+import { useToolLogFixture } from "./toollog-fixture.ts";
+
+const logs = useToolLogFixture();
 
 const now = Date.parse("2026-09-10T12:00:00Z");
 const stores: Store[] = [];
+const attentions: Attention[] = [];
 const servers: Server[] = [];
 const directories: string[] = [];
 
@@ -75,6 +79,7 @@ function setup(spectrumSocket = "/nonexistent/router.sock", path = ":memory:") {
   const state = { chat: 100 as number | undefined };
   const options: AttentionOptions = { chatId: () => state.chat, spectrumSocket };
   const attention = new Attention(store, backend, transport, options);
+  attentions.push(attention);
   const message = (messageId: number, text: string, replyToMessageId?: number) => ({ type: "message" as const, messageId, chatId: 100, fromUserId: 7, text, ...(replyToMessageId !== undefined ? { replyToMessageId } : {}) });
   const callback = (messageId: number, data: string, callbackId = "cb") =>
     ({ type: "callback" as const, callbackId, chatId: 100, messageId, fromUserId: 7, data });
@@ -97,6 +102,7 @@ async function spectrumResponder(status: unknown): Promise<string> {
 beforeEach(() => { setSystemTime(now); });
 afterEach(async () => {
   setSystemTime();
+  for (const attention of attentions.splice(0)) attention.stop();
   for (const store of stores.splice(0)) store.close();
   for (const server of servers.splice(0)) await new Promise<void>(resolve => server.close(() => resolve()));
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
@@ -283,6 +289,10 @@ test("tapping Reject answers reject; transport failures keep the prompt actionab
   expect(h.backend.permissionReplies).toEqual([]);
   expect(h.answers).toEqual([["cb", "The reply failed; try again."]]);
   expect(h.store.sessionNotice(id)?.state).toBe("sent");
+  expect(logs.entries().find(row => row.error?.tag === "tg.attention.approvalReply")).toMatchObject({
+    tool: "watchers", kind: "error", ok: false, error: { tag: "tg.attention.approvalReply", message: "tg.attention.approvalReply" },
+  });
+  expect(logs.text()).not.toContain("PRIVATE_FAILURE");
   h.backend.failReplies = false;
   await h.attention.handleUpdate(h.callback(901, `a:${token}:reject`));
   expect(h.backend.permissionReplies).toEqual([["perm_1", "/Chats", "reject"]]);
@@ -889,4 +899,32 @@ test("a backend read per folder keeps polling every tick, and a failed read is r
   h.backend.permissionRequests = [];
   await h.attention.tick();
   expect(h.backend.permissionReads).toBeGreaterThanOrEqual(3);
+});
+
+
+test("failed request reads carry their safe cause and a hashed directory, then recover", async () => {
+  const h = setup();
+  h.backend.board = { version: 1, revision: 1, activatedAt: 1, migrationComplete: true,
+    entries: [{ sessionId: "ses_1", directory: "/Chats", title: "Deployment", state: "running", workRevision: 1, updatedAt: now }] };
+  const permissions = h.backend.permissions.bind(h.backend);
+  h.backend.permissions = async () => { throw Object.assign(new Error("private URL token=123456"), { status: 503 }); };
+  await h.attention.tick();
+  expect(logs.entries().find(row => row.error?.tag === "tg.attention.pendingRequests")).toMatchObject({ props: { cause: 503 }, ids: { directory: expect.stringMatching(/^[a-f0-9]{24}$/) } });
+  expect(logs.text()).not.toContain("private URL");
+  expect(logs.text()).not.toContain("/Chats");
+  h.backend.permissions = permissions;
+  h.backend.permissionRequests = [permission()];
+  await h.attention.tick();
+  expect(h.store.pendingSessionNotices()).toHaveLength(1);
+});
+
+test("a rejected shared read retains its timeout class in every dependent failure", async () => {
+  const h = setup();
+  h.backend.board = { version: 1, revision: 1, activatedAt: 1, migrationComplete: true,
+    entries: [{ sessionId: "ses_1", directory: "/Chats", title: "Deployment", state: "running", workRevision: 1, updatedAt: now }] };
+  Object.assign(h.backend, { pendingRequests: async () => { throw { causeClass: "timeout" }; } });
+  await h.attention.tick();
+  const failures = logs.entries().filter(row => row.kind === "error");
+  expect(failures.map(row => row.error?.tag)).toEqual(["tg.attention.requests", "tg.attention.directories", "tg.attention.pendingRequests", "tg.attention.pendingRequests"]);
+  expect(failures.every(row => row.props?.cause === "timeout")).toBe(true);
 });

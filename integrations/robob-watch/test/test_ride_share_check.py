@@ -47,6 +47,7 @@ print(json.dumps(out))
 FAKE_BRIDGE = """#!/usr/bin/python3
 import hashlib, json, os, sqlite3, sys
 args = sys.argv[1:]
+args = [v for a in args for v in (a.split("=", 1) if a.startswith("--") and "=" in a else [a])]
 log = os.environ["FAKE_BRIDGE_LOG"]
 with open(log, "a") as f:
     f.write(json.dumps(args) + "\\n")
@@ -989,10 +990,10 @@ class RecipientTest(Base):
         return self.card_cli("meta", "--trip", A, *args, ok=ok)
 
     def test_extras_deduped_and_each_non_owner_gets_public_url(self):
+        self.route("sara-k", "sara-thread", 1)
         p = self.meta("--rider", "sara-k", "--rider-name", "Sara", "--recipient", "moni",
                       "--recipient", "omar", "--recipient", "sara-k", "--recipient", "omar")
         self.assertEqual(json.loads(p.stdout)["recipients"], ["abdullah", "moni", "sara-k", "omar"])
-        self.route("sara-k", "sara-thread", 1)
         self.set_state(trip(A, "Accepted"), {})
         res = json.loads(self.card_cli("send", "--trip", A, "--session", "thread-1@3").stdout)
         self.assertEqual(res, {"abdullah": "sent", "moni": "sent", "sara-k": "sent", "omar": "sent"})
@@ -1018,6 +1019,8 @@ class RecipientTest(Base):
         self.assertEqual(set(again.values()), {"already sent"})
 
     def test_recipient_metadata_private_and_not_in_public_files(self):
+        self.route("sara-k", "sara-thread", 1)
+        self.route("group-run-club-abc123", "club-thread", 1)
         self.meta("--rider", "sara-k", "--rider-name", "Sara", "--recipient", "group-run-club-abc123")
         self.set_state(trip(A, "OnTrip"), {})
         self.run_check(0)
@@ -1030,6 +1033,7 @@ class RecipientTest(Base):
         self.assertFalse(any(f.endswith("meta.json") for f in os.listdir(os.path.join(self.cards, f"ride-{A}"))))
 
     def test_unnamed_extra_rider_shows_no_slug(self):
+        self.route("lina-2", "lina-thread", 1)
         self.meta("--rider", "lina-2")
         self.set_state(trip(A, "Accepted"), {})
         self.run_check(0)
@@ -1039,6 +1043,7 @@ class RecipientTest(Base):
         self.assertIn("The Uber", page)
 
     def test_invalid_recipient_and_names_rejected(self):
+        self.route("sara-k", "sara-thread", 1)
         for args in (["--rider", "moni", "--recipient", "Bad Slug!"],
                      ["--rider", "+971501234567"],
                      ["--rider", "sara-k", "--rider-name", "+971 50 123 4567"],
@@ -1076,14 +1081,113 @@ class RecipientTest(Base):
         self.assertEqual(omar[0], "send", "other people get a plain public link")
 
     def test_display_name_with_digits_rejected(self):
+        self.route("sara-k", "sara-thread", 1)
         p = self.meta("--rider", "sara-k", "--rider-name", "Al 50 12 34", ok=False)
         self.assertNotEqual(p.returncode, 0)
 
     def test_adding_extras_later_keeps_rider_booker_and_earlier_extras(self):
+        self.route("lina", "lina-thread", 1)
         self.meta("--rider", "moni", "--booker", "moni", "--recipient", "omar")
         p = self.meta("--rider", "moni", "--recipient", "lina")
         self.assertEqual(json.loads(p.stdout)["booker"], "moni")
         self.assertEqual(json.loads(p.stdout)["recipients"], ["abdullah", "moni", "omar", "lina"])
+
+    def test_unknown_chat_refused_without_writing_metadata(self):
+        cases = [
+            ("rider", ["--rider", "Kabita"]),
+            ("booker", ["--rider", "moni", "--booker", "kabita"]),
+            ("recipient", ["--rider", "moni", "--recipient", "omar", "--recipient", "kabita"]),
+            ("off-bridge booker", ["--rider", "guest", "--rider-off-bridge", "--rider-name", "Guest",
+                                   "--booker", "kabita"]),
+            ("off-bridge recipient", ["--rider", "guest", "--rider-off-bridge", "--rider-name", "Guest",
+                                      "--recipient", "kabita"]),
+        ]
+        path = os.path.join(self.journal, f"{A}.meta.json")
+        for role, args in cases:
+            with self.subTest(role=role, existing=False):
+                p = self.meta(*args, ok=False)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("no bridge chat 'kabita'", p.stderr)
+                self.assertIn("--rider-off-bridge", p.stderr)
+                self.assertFalse(os.path.exists(path))
+        self.meta("--rider", "moni")
+        with open(path) as f:
+            before = f.read()
+        for role, args in cases:
+            with self.subTest(role=role, existing=True):
+                p = self.meta(*args, ok=False)
+                self.assertNotEqual(p.returncode, 0)
+                with open(path) as f:
+                    self.assertEqual(f.read(), before)
+
+    def test_base_recipients_need_no_chat_store(self):
+        rc = self.rc()
+        with unittest.mock.patch.dict(os.environ, self.env), unittest.mock.patch.object(rc, "known_chat", return_value=False):
+            rc.set_meta(A, "moni", booker="owner", extras=["moni", "me"])
+            self.assertEqual(rc.recipients_for(A), ["abdullah", "moni"])
+
+    def test_off_bridge_rider_named_but_never_an_automatic_recipient(self):
+        p = self.meta("--rider", "kabita", "--rider-name", "Kabita", "--rider-off-bridge")
+        result = json.loads(p.stdout)
+        self.assertEqual(result["recipients"], ["abdullah", "moni"])
+        self.assertEqual(result["off_bridge"], ["kabita"])
+        self.assertEqual(result["rider"], "kabita")
+        with open(os.path.join(self.journal, f"{A}.meta.json")) as f:
+            self.assertIs(json.load(f)["rider_off_bridge"], True)
+        self.set_state(trip(A, "Accepted"), {})
+        res = json.loads(self.card_cli("send", "--trip", A, "--session", "thread-1@3").stdout)
+        self.assertEqual(res, {"abdullah": "sent", "moni": "sent"})
+        self.assertEqual(self.card(A)["rider"], "Kabita")
+        self.assertIn("Kabita", self.page(A))
+        self.assertNotIn("kabita", json.dumps(self.card(A)) + self.page(A))
+        captions = [c[c.index("--caption") + 1] for c in self.bridge_calls() if c[0] == "app"]
+        self.assertEqual(captions, ["Kabita's ride"])
+        self.assertNotIn("--to kabita", " ".join(" ".join(c) for c in self.bridge_calls()))
+
+    def test_off_bridge_requires_name_and_cannot_name_base_recipient(self):
+        cases = [
+            (["--rider", "kabita"], "requires --rider-name"),
+            (["--rider", "kabita", "--rider-name", "   "], "unsafe display name"),
+            *[(["--rider", rider, "--rider-name", "Name"], "cannot name abdullah or moni")
+              for rider in ("abdullah", "moni", "owner", "me", " Moni ")],
+        ]
+        for args, error in cases:
+            with self.subTest(args=args):
+                p = self.meta("--rider-off-bridge", *args, ok=False)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn(error, p.stderr)
+                self.assertFalse(os.path.exists(os.path.join(self.journal, f"{A}.meta.json")))
+
+    def test_off_bridge_excluded_even_if_chat_exists_and_other_roles_repeat_it(self):
+        self.route("kabita", "kabita-thread", 1)
+        p = self.meta("--rider", "kabita", "--rider-name", "Kabita", "--rider-off-bridge",
+                      "--booker", "kabita", "--recipient", "kabita", "--recipient", "omar")
+        self.assertEqual(json.loads(p.stdout)["recipients"], ["abdullah", "moni", "omar"])
+        p = self.meta("--rider", "kabita")
+        self.assertEqual(json.loads(p.stdout)["recipients"], ["abdullah", "moni", "kabita", "omar"])
+        self.assertEqual(json.loads(p.stdout)["off_bridge"], [])
+        p = self.meta("--rider", "moni", "--booker", "owner")
+        self.assertEqual(json.loads(p.stdout)["recipients"], ["abdullah", "moni", "kabita", "omar"])
+
+    def test_watcher_never_requests_off_bridge_rider_after_base_chats_sent(self):
+        self.meta("--rider", "kabita", "--rider-name", "Kabita", "--rider-off-bridge")
+        self.set_state(trip(A, "Accepted"), {})
+        self.card_cli("send", "--trip", A, "--session", "thread-1@3")
+        self.assertEqual(self.run_check(0), [])
+        self.assertEqual(self.run_check(70), [])
+
+    def test_legacy_unknown_chats_filtered_from_recipients_and_send_plan(self):
+        os.makedirs(self.journal, exist_ok=True)
+        with open(os.path.join(self.journal, f"{A}.meta.json"), "w") as f:
+            json.dump({"trip": A, "rider": "kabita", "booker": "unknown-booker",
+                       "extras": ["unknown-extra", "omar", "kabita", "omar"]}, f)
+        rc = self.rc()
+        with unittest.mock.patch.dict(os.environ, self.env):
+            self.assertEqual(rc.recipients_for(A), ["abdullah", "moni", "omar"])
+        res = json.loads(self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--dry-run").stdout)
+        self.assertEqual(set(res) - {"note"}, {"abdullah", "moni", "omar"})
+        self.assertNotIn("kabita", json.dumps(res))
+        self.assertEqual(self.bridge_calls(), [])
 
 
 class UnshareTest(Base):
@@ -1876,3 +1980,20 @@ print(json.dumps(res))
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RenderLogTest(unittest.TestCase):
+    def test_render_success_failure_and_logger_failure_do_not_change_result(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('ride_log_test', CARD)
+        rc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rc)
+        for ok in (True, False):
+            with unittest.mock.patch.object(rc, '_render_preview', return_value=ok), unittest.mock.patch.object(rc, 'log_render') as log:
+                self.assertEqual(rc.render_preview({}, None), ok)
+                self.assertEqual(log.call_args.args[1], ok)
+        with unittest.mock.patch.object(rc.subprocess, 'Popen') as child, unittest.mock.patch.object(rc.threading, 'Thread'):
+            rc.log_render(time.monotonic(), False)
+            self.assertEqual(child.call_args.args[0][2:5], ['log-card-render', '--kind', 'ride'])
+        with unittest.mock.patch.object(rc.subprocess, 'Popen', side_effect=OSError('unavailable')):
+            rc.log_render(time.monotonic(), True)

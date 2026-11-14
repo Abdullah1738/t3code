@@ -26,12 +26,14 @@ import {
   type KanbanAskTaskStep,
   type KanbanBlock,
   type KanbanCard,
+  type KanbanBoard,
   type KanbanError,
   type KanbanOwnerAsk,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 
+import { gateOf } from "./subtasks.ts";
 import { stubBlockAt } from "./messagePages.ts";
 
 /** An upload as a board message or an ask's file field holds it. */
@@ -1708,6 +1710,41 @@ export const answerFor = (
       `${ref} expired at ${ask.expiresAt}: what it rests on${ask.basis ? ` (${ask.basis})` : ""} may have changed. Its asker has to renew it before it can be answered.`,
     );
   }
+  if (input.verdict === "text" && by._tag === "owner") {
+    const text = line("answer", input.text, ASK_LIMITS.answerText);
+    if (isProblem(text)) return text;
+    if (!text) return invalid("a text answer needs text");
+    const note = line("note", input.note, ASK_LIMITS.note);
+    if (isProblem(note)) return note;
+    const finalDraft = input.finalDraft;
+    if (finalDraft !== undefined) {
+      if (ask.draft === undefined) return invalid(`${ref} has no draft`);
+      if (kanbanAskResponse(ask).edit !== "draft")
+        return invalid(`the draft on ${ref} is not his to edit`);
+      const long = tooLong("finalDraft", finalDraft, ASK_LIMITS.draft);
+      if (long) return long;
+    }
+    const values: Record<string, unknown> = {};
+    for (const [id, raw] of Object.entries(input.values ?? {})) {
+      const field = kanbanAskResponse(ask).fields.find((field) => field.id === id);
+      if (!field) return invalid(`${ref} has no field "${id}"`);
+      if (field.type === "secret") return invalid(`${ref}: field "${id}" ${SECRET_PRIVATE}`);
+      const checked = fieldValue(field, raw);
+      if (isProblem(checked)) return checked;
+      values[id] = checked.value;
+    }
+    return {
+      verdict: "text",
+      text,
+      ...(note ? { note } : {}),
+      ...(finalDraft ? { finalDraft } : {}),
+      ...(Object.keys(values).length
+        ? { values: values as NonNullable<KanbanAskAnswer["values"]> }
+        : {}),
+      by,
+      at: at as KanbanAskAnswer["at"],
+    };
+  }
   const response = kanbanAskResponse(ask);
   const ids = [...new Set(input.optionIds ?? [])];
   let verdict = input.verdict;
@@ -1965,7 +2002,7 @@ export const answerText = (
   });
   if (filled.length > 0) parts.push(filled.join("\n"));
   if (refs.length > 0) parts.push(secretRefNote(refs[0]!));
-  if (ask.draft !== undefined && verdict !== "rejected" && answer.finalDraft !== undefined) {
+  if (ask.draft !== undefined && verdict === "approved" && answer.finalDraft !== undefined) {
     parts.push(
       answer.draftEdited === true
         ? `Post exactly this text (${handed ? "the evaluator" : "the owner"} edited your draft):\n${answer.finalDraft}`
@@ -2001,24 +2038,6 @@ export const blockAnswer = (
 export const takesReply = (ask: KanbanOwnerAsk, nowMs: number): boolean =>
   ask.closedAt === null && kanbanAskIsFreeText(ask) && !kanbanAskExpired(ask, nowMs);
 
-/**
- * For whoever hears an owner reply which left asks open: his words are not an
- * answer to them. `asks` are the open asks the reply did not close.
- */
-export const wordsOnlyNote = (
-  card: KanbanCard,
-  asks: ReadonlyArray<KanbanOwnerAsk>,
-  nowMs: number,
-): string =>
-  asks
-    .map((ask) => {
-      const name = `${ask.id} on card #${card.number} ("${ask.title ?? ask.text}")`;
-      return kanbanAskExpired(ask, nowMs)
-        ? `${name} has expired, so this reply did not answer it. It is still open: ${askerName(ask.by)} asked it and renews it with card_ask_change, or drops it.`
-        : `He wrote this in the card's discussion without using the answer on ${name}. It is not an approval, a pick or a decision on that ask: nobody may act as if it were. The ask is still open and now waits on its asker, ${askerName(ask.by)} (the evaluator when that thread cannot hear this): reply to him on it (discussion_post with ask "${ask.id}"), change the ask or ask again (card_ask_change), or drop it.`;
-    })
-    .join("\n");
-
 /** A pick, or his own words, on an ask's pick block as the structured answer it stands for. */
 export const pickAnswer = (
   ask: KanbanOwnerAsk,
@@ -2046,8 +2065,17 @@ export const plainAnswer = (by: KanbanActor, at: string, dropped: boolean): Kanb
 export const passOnText = (card: KanbanCard, ask: KanbanOwnerAsk, answer: string) =>
   `This answers question ${ask.id} on card #${card.number} ("${ask.text}"), asked by a thread that has moved on. Act on it or pass it on (card_edit, card_thread):\n\n${answer}`;
 
-export const droppedText = (card: KanbanCard, ask: KanbanOwnerAsk, byOwner: boolean) =>
-  `Question ${ask.id} on card #${card.number} ("${ask.text}") was dropped${byOwner ? " by the owner" : ""}. Go on without it.`;
+export const droppedText = (
+  card: KanbanCard,
+  ask: KanbanOwnerAsk,
+  byOwner: boolean,
+  guessedGates?: KanbanBoard["guessedGates"],
+) => {
+  const gated = card.subtasks.filter(
+    (subtask) => subtask.state === "open" && gateOf(subtask, guessedGates) !== undefined,
+  );
+  return `${byOwner ? "Abdullah" : "The evaluator"} dropped ${ask.id}. That is not approval for ${gated.length > 0 ? gated.map((subtask) => `${subtask.id} (${subtask.text})`).join(", ") : "any deploy, money or secret step"}; ask again or skip them only with his answer.\n\nCard #${card.number}: ${ask.text}`;
+};
 
 /** The ask in full, for an agent that has to act on it without reading the card. */
 const askInFull = (ask: KanbanOwnerAsk) => {
@@ -2071,39 +2099,6 @@ const askInFull = (ask: KanbanOwnerAsk) => {
     .filter((entry) => entry !== null)
     .join("\n\n");
 };
-
-/** What his words on an ask are not, when it needs more than words. */
-const notAnAnswer = (ask: KanbanOwnerAsk) => {
-  const response = kanbanAskResponse(ask);
-  return response.verdict !== null
-    ? " It is not an approval or a rejection."
-    : response.choose !== null && response.choose.min >= 1
-      ? " It is not a pick."
-      : "";
-};
-
-/**
- * The owner replied on an ask without answering it. `passedOn` is for the
- * evaluator that gets it when the asker can't hear it (a parked or ended
- * thread): the ask stays open, and blocking if it was.
- */
-export const clarifyText = (
-  card: KanbanCard,
-  ask: KanbanOwnerAsk,
-  ownerText: string,
-  passedOn: boolean,
-) =>
-  [
-    `The owner replied on ${ask.id} on card #${card.number} ("${ask.title ?? ask.text}") without answering it. It stays open${ask.blocking ? " and still holds the card" : ""}, and now waits on you, not on him.`,
-    passedOn
-      ? "The thread that asked it can't hear this (it is parked or has moved on), so it is yours to handle."
-      : null,
-    `His message:\n${ownerText}`,
-    `Reply to him with discussion_post (card #${card.number}, ask "${ask.id}"): that keeps the ask open and gives him the turn back. If the question, context or options were unclear or wrong, fix the ask itself with card_ask_change (ask "${ask.id}", the fields to change, revisionNote saying what changed) instead of only explaining. Don't treat his message as the answer.${notAnAnswer(ask)}`,
-    passedOn ? askInFull(ask) : null,
-  ]
-    .filter((entry) => entry !== null)
-    .join("\n\n");
 
 const askerName = (by: KanbanActor) =>
   by._tag === "thread"

@@ -84,9 +84,10 @@ test.each(["disabled", "unpaired"])("%s ticks do not change any stored state", a
   if (mode === "disabled") h.readiness.enabled = false;
   else h.readiness.chatGuid = undefined;
   const before = h.store.pendingOutbox();
+  const beforeKv = h.store.db.query("SELECT * FROM kv").all();
   await h.delivery.tick();
   expect(h.store.pendingOutbox()).toEqual(before);
-  expect(h.store.db.query("SELECT * FROM kv").all()).toEqual([]);
+  expect(h.store.db.query("SELECT * FROM kv").all()).toEqual(beforeKv);
   expect(h.transport.sendText).not.toHaveBeenCalled();
   expect(h.log).not.toHaveBeenCalled();
   expect(h.sleep).not.toHaveBeenCalled();
@@ -1186,4 +1187,60 @@ test("review: a deferred status check coalesces with a send tick", async () => {
   await delivery.tick();
   expect(h.calls).toHaveLength(2);
   expect(h.calls[1]!.replyTo).toBeUndefined();
+});
+
+test("delivery logs actual acceptance, latency, cards, recovery and STOP failure", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const logs = await captureLogs(async () => {
+    const h = setup();
+    h.store.acceptInbound("inbound-fixture", { text: "PRIVATE_INBOUND", receivedAt: Date.now() - 500 });
+    h.enqueue("outage:fixture", { replyTo: "inbound-fixture", text: "PRIVATE_REPLY" });
+    await h.delivery.tick();
+    h.enqueue("card-fixture", { text: "", app: { url: "https://cards.example/q-fixture/", caption: "PRIVATE_CAPTION" } });
+    const cards = new Delivery(h.store, { ...h.transport, sendApp: async () => ({ providerId: "card-handle" }) }, h.options);
+    await cards.tick();
+    h.enqueue("stop-fixture", { text: "PRIVATE_STOP_TEXT" });
+    h.transport.sendText.mockImplementation(async () => { throw new TransportError("http_400:stop_opt_out", false, false); });
+    await h.delivery.tick();
+    h.delivery.recover();
+  });
+  const sent = logs.find(l => l.name === "reply.sent" && l.ids?.operationId === "outage:fixture");
+  expect(sent?.durationMs).toBeGreaterThanOrEqual(500);
+  expect(sent?.props?.parts).toBe(1);
+  expect(logs.some(l => l.name === "card.sent" && l.props?.cardKind === "quick")).toBe(true);
+  expect(logs.some(l => l.name === "recovery.notice_sent")).toBe(true);
+  expect(logs.some(l => l.name === "bridge.recover")).toBe(true);
+  expect(logs.find(l => l.name === "reply.failed")?.error?.tag).toBe("http_400:stop_opt_out");
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
+});
+
+test("tool-mode latency keeps its inbound clock after the turn has already ended", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const logs = await captureLogs(async () => {
+    const h = setup();
+    h.store.acceptInbound("tool-inbound", { text: "PRIVATE_TOOL_MESSAGE", receivedAt: Date.now() - 10000 });
+    h.store.set("activeTurn", { id: "thread-fixture", inboundId: "tool-inbound" });
+    h.enqueue("tool-reply", { text: "PRIVATE_TOOL_REPLY", sessionId: "thread-fixture" });
+    h.store.set("activeTurn", null);
+    await h.delivery.tick();
+  });
+  const sent = logs.find(l => l.name === "reply.sent");
+  expect(sent?.durationMs).toBeGreaterThanOrEqual(10000);
+  expect(sent?.props?.inboundKnown).toBe(true);
+  expect(sent?.ids).toMatchObject({ chat: "owner", inboundId: "tool-inbound", threadId: "thread-fixture" });
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
+});
+
+
+test.each(["validation", "provider"])("%s failure logs the chat, operation, thread and inbound id", async failure => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const logs = await captureLogs(async () => {
+    const h = setup();
+    const delivery = new Delivery(h.store, h.transport, { ...h.options, chat: "moni" });
+    h.enqueue("failed-chain-fixture", { text: failure === "validation" ? "" : "PRIVATE_REPLY", replyTo: "inbound-fixture", sessionId: "thread-fixture" });
+    h.transport.sendText.mockImplementation(async () => { throw new TransportError("http_400:stop_opt_out", false, false); });
+    await delivery.tick();
+  });
+  expect(logs.find(l => l.name === "reply.failed")?.ids).toMatchObject({ chat: "moni", operationId: "failed-chain-fixture", inboundId: "inbound-fixture", threadId: "thread-fixture" });
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
 });

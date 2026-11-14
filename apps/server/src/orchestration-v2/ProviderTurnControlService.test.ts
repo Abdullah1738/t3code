@@ -222,11 +222,14 @@ it.effect(
           getLimitRecoveryCandidates: () => Effect.die("unused getLimitRecoveryCandidates"),
           getShellSnapshot: () => Effect.die("unused getShellSnapshot"),
           readShellSnapshot: () => Effect.die("unused readShellSnapshot"),
+          getThreadListCandidates: () => Effect.die("unused getThreadListCandidates"),
+          getCallerRow: () => Effect.die("unused getCallerRow"),
           getThreadShell: () => Effect.die("unused getThreadShell"),
           getThread: () => Ref.get(projection).pipe(Effect.map((state) => state.thread)),
           getSettlementCandidates: () => Effect.die("unused getSettlementCandidates"),
           getThreadsWithPullRequests: () => Effect.die("unused getThreadsWithPullRequests"),
           getThreadWorktreePaths: () => Effect.die("unused getThreadWorktreePaths"),
+          getThreadIdsForWorktree: () => Effect.die("unused getThreadIdsForWorktree"),
           getThreadProjection: () => Effect.die("control effects must not load transcript"),
           getTurnStartContext: () => Effect.die("unused"),
           getTurnStartHistory: () => Effect.die("unused"),
@@ -277,6 +280,7 @@ it.effect(
       const layerSessionManager = Layer.succeed(
         ProviderSessionManager.ProviderSessionManagerV2,
         ProviderSessionManager.ProviderSessionManagerV2.of({
+          stopBackgroundWork: () => Effect.succeed([]),
           shutdown: Effect.void,
           sweepOrphanedThreads: () => Effect.void,
           observeThreadSessionUpdates: () => Effect.void,

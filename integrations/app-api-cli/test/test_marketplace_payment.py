@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import order_card
 from unittest.mock import Mock, patch
 import time
 
@@ -20,14 +21,15 @@ import commerce_marketplace_disposition as disposition
 import noon_marketplace_checkout as market
 import test_commerce_main_order as main
 import test_commerce_supermall_order as rocket
+from owner_go_support import approve_test_flows
 
 
 def failed_responses(order, amount):
     """Sanitized shape of the native failed order/refund GETs, 23 Oct."""
     amount = f'{amount / 100:.2f}'
     item = order + '-1'
-    method = {'code': 'mastercard', 'title': 'MASTERCARD xxxx2342', 'amount': amount}
-    medium = {'code': 'mastercard', 'title': 'Processed to xxxx2342', 'amount': amount,
+    method = {'code': order_card.NETWORK, 'title': f'{order_card.NETWORK.upper()} xxxx{order_card.LAST4}', 'amount': amount}
+    medium = {'code': order_card.NETWORK, 'title': f'Processed to xxxx{order_card.LAST4}', 'amount': amount,
               'description': disposition.NO_CAPTURE + ' Any temporary hold will be released by your bank.'}
     block = {'refundMediums': [medium], 'refundBreakup': {
         'totalAmount': amount, 'items': [{'itemNr': item, 'amount': amount}], 'feeGroups': []}}
@@ -43,6 +45,7 @@ def failed_responses(order, amount):
 
 class PaymentTests(unittest.TestCase):
     def setUp(self):
+        approve_test_flows(self)
         browser = patch('commerce_redirect.open_dia', return_value=True)
         self.redirect_opener = browser.start()
         self.addCleanup(browser.stop)
@@ -532,11 +535,11 @@ class PaymentTests(unittest.TestCase):
         flow, _ = self.placed(order_status={'status': 'pending'})
         flow.place()
         with sqlite3.connect(self.root / 'journal.sqlite') as db:
-            db.execute('PRAGMA user_version=4')
+            db.execute('PRAGMA user_version=999')
         with self.assertRaisesRegex(j.JournalError, 'JOURNAL_SCHEMA_UNSUPPORTED'):
             j.open_payments()
         with sqlite3.connect(self.root / 'journal.sqlite') as db:
-            db.execute('PRAGMA user_version=3')
+            db.execute('PRAGMA user_version=4')
             db.execute('CREATE TABLE payments_v4 (id TEXT)')
         with self.assertRaisesRegex(j.JournalError, 'JOURNAL_SCHEMA_UNSUPPORTED'):
             j.open_payments()
