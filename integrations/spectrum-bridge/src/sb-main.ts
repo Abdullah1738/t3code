@@ -1,4 +1,4 @@
-import { toolError, toolLog } from "./toollog.ts";
+import { toolError, toolLog, type LogLine } from "./toollog.ts";
 import { acknowledgeReceived, notifyFailedInbound } from "./inbound-failure.ts";
 /**
  * Sendblue serve loop. Kept apart from main.ts so the Photon path stays exactly as it was:
@@ -62,14 +62,14 @@ export function sendblueLine(config: Config, env: Record<string, string | undefi
  * Wraps the line so health can see the stream: a finished backfill means caught up, and any
  * event means the connection is alive. Explicit delegation keeps Sendblue's private fields intact.
  */
-export function observedLine(line: Line, seen: { synchronized: boolean; lastEventAt: number }): Line {
+export function observedLine(line: Line, seen: { synchronized: boolean; lastEventAt: number }, replyIds?: (handle: string) => LogLine["ids"]): Line {
   return {
     get number() { return line.number; },
     async *events(signal: AbortSignal): AsyncIterable<LineEvent> {
       for await (const event of line.events(signal)) {
         seen.lastEventAt = Date.now();
         if (event.type === "status" && /^(error|declined|failed)$/i.test(event.status)) toolLog.capture(() => toolLog.write({
-          component: "sendblue", kind: "error", name: "reply.failed", ok: false, ids: { messageId: event.handle },
+          component: "sendblue", kind: "error", name: "reply.failed", ok: false, ids: { messageId: event.handle, ...replyIds?.(event.handle) },
           error: { tag: `sendblue.${sendblueErrorKey(event.errorCode) ?? "async_failure"}`, message: "" },
         }));
         yield event;
@@ -144,7 +144,15 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const seen = { synchronized: false, lastEventAt: 0 };
   const health = { backendLastOk: 0, startedAt: Date.now() };
   const ready = () => config.enabled && seen.synchronized;
-  const observed = observedLine(line, seen);
+  const observed = observedLine(line, seen, handle => {
+    for (const chat of registry?.all() ?? []) {
+      const item = chat.store.byProviderId(handle);
+      if (!item) continue;
+      const inboundId = chat.store.get<string>(`log-inbound-id:${item.id}`) ?? item.replyTo;
+      return { chat: chat.info.slug, operationId: item.id, ...(item.sessionId ? { threadId: item.sessionId } : {}),
+        ...(inboundId ? { inboundId } : {}) };
+    }
+  });
 
   let apps: ReturnType<typeof startAppsServer> | undefined;
   let appsUrl: string | undefined;
@@ -207,7 +215,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       swipes: { find: swipes, line: config.sendblueNumber ?? "" },
     });
     const delivery = new Delivery(chat.store, transport, {
-      projectScope, chatGuid: () => chat.info.key,
+      projectScope, chat: chat.info.slug, chatGuid: () => chat.info.key,
       statuses: since => transport.outboundStatuses(since),
       beforeSend: async item => router.beforeSend(item),
       enabled: () => ready() && !chat.controlsPending && !stopping, log,

@@ -159,7 +159,7 @@ export class Store {
     ).all().map(row => ({ ...row, payload: JSON.parse(row.payload) }));
   }
 
-  enqueue(op: OutboxOperation): boolean {
+  enqueue(op: OutboxOperation, attribution?: { inboundId?: string }): boolean {
     // Normalize property order and omit unrelated caller fields before comparing content.
     const payload = json({
       id: op.id, kind: op.kind, text: op.text, sessionId: op.sessionId,
@@ -178,7 +178,10 @@ export class Store {
         toolLog.capture(() => {
           this.set(`log-queued:${op.id}`, Date.now());
           const turn = this.get<{ id: string; inboundId?: string } | null>("activeTurn");
-          const inboundId = op.replyTo ?? (turn?.id === op.sessionId ? turn?.inboundId : undefined);
+          // The quote may target a later batch member; correlation follows the turn that caused the send.
+          const inboundId = attribution ? attribution.inboundId
+            : (turn?.id === op.sessionId ? turn?.inboundId : undefined) ?? op.replyTo;
+          if (inboundId) this.set(`log-inbound-id:${op.id}`, inboundId);
           const row = inboundId ? this.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(inboundId) : undefined;
           const receivedAt = row ? (JSON.parse(row.payload) as { receivedAt?: number }).receivedAt : undefined;
           if (typeof receivedAt === "number" && Number.isFinite(receivedAt)) this.set(`log-inbound-at:${op.id}`, receivedAt);

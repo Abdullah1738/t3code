@@ -125,7 +125,7 @@ type SessionContent = Omit<OutboxOperation, "id" | "kind" | "sessionId" | "gener
 
 /** Session-bound, idempotent enqueue shared by every agent-authored conversation route. */
 function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId: string,
-  content: SessionContent, prepare?: () => void, output: SessionContent = content): { id: string; created: boolean } {
+  content: SessionContent, prepare?: () => void, output: SessionContent = content, attribution?: { inboundId?: string }): { id: string; created: boolean } {
   const id = `${prefix}:${hash(dedupeKey)}`;
   const created = store.db.transaction(() => {
     const route = store.get<{ id: string; generation: number } | null>("route");
@@ -140,7 +140,7 @@ function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId
     // Concurrent callers may finish folding after the turn has closed; the accepted original spec owns its stored text.
     if (saved && store.getOperation(id)) return false;
     prepare?.();
-    const created = store.enqueue({ ...operation, ...output });
+    const created = store.enqueue({ ...operation, ...output }, attribution);
     store.set(key, { spec, ...(prefix === "send" ? { queuedAt: saved?.queuedAt ?? Date.now() } : {}) });
     return created;
   }).immediate();
@@ -342,11 +342,14 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         }
         const operationId = `send:${hash(dedupeKey)}`;
         if (store.get<boolean>(`cancelledSend:${operationId}`)) throw new ApiError(409);
+        // Folding can outlive this turn or overlap its replacement in the same session.
+        const turn = store.get<{ id: string; generation: number; inboundId?: string } | null>("activeTurn");
+        const attribution = { inboundId: turn?.id === route.id && turn.generation === route.generation ? turn.inboundId : undefined };
         let folded = text;
         try { folded = await foldText?.(text, operationId) ?? text; } catch { /* Optional folds never block a send. */ }
         const { id, created } = queueSession(store, "send", dedupeKey, sessionId, content, () => {
           if (liveSendRoute(store, sessionId).generation !== route.generation) throw new ApiError(409);
-        }, { ...content, text: folded });
+        }, { ...content, text: folded }, attribution);
         if (created) noteSent(store, turnKey, text);
         return json({ id, created }, created ? 202 : 200);
       }

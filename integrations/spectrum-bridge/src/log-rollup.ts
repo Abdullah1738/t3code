@@ -1,7 +1,8 @@
 import type { LogLine } from "./toollog.ts";
 import { callName, percentiles } from "./log-calls.ts";
+import { createChainAggregation } from "./log-chains.ts";
 
-export async function summarizeLog(lines: AsyncIterable<LogLine>) {
+export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: AsyncIterable<LogLine>) {
   const countsByName: Record<string, number> = Object.create(null);
   const countsByKind: Record<string, number> = { event: 0, perf: 0, error: 0 };
   const durations = new Map<string, Map<number, number>>();
@@ -9,6 +10,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>) {
   const errors = new Map<string, { tag: string; name: string; count: number; sampleId?: string; site?: string }>();
   const represented = new Set<string>();
   const individualCalls: LogLine[] = [];
+  const chainAggregation = createChainAggregation();
   let total = 0, ok = 0, failed = 0, recordedRows = 0;
   function merge(target: Map<number, number>, values: Iterable<[number, number]>) {
     for (const [ms, count] of values) target.set(ms, (target.get(ms) ?? 0) + count);
@@ -44,6 +46,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>) {
   }
   for await (const line of lines) {
     recordedRows++;
+    chainAggregation.accept(line);
     if (line.name === "turn.robob_calls" && line.calls) {
       for (const [name, stats] of Object.entries(line.calls)) {
         if (line.ids?.callBatchId) represented.add(`${line.ids.callBatchId}\0${name}`);
@@ -53,6 +56,8 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>) {
     } else if (line.name === "turn.robob_call" && line.kind === "perf") individualCalls.push(line);
     else consume(line);
   }
+  // Later days complete this day's receipts without moving their event counts into this day.
+  if (laterLines) for await (const line of laterLines) chainAggregation.accept(line, true);
   // Slow/failed rows remain readable, but their batch histogram already counts them.
   for (const line of individualCalls) if (!line.ids?.callBatchId || !represented.has(`${line.ids.callBatchId}\0${callName(line)}`)) consume(line);
   const durationMs: Record<string, ReturnType<typeof percentiles>> = Object.create(null);
@@ -67,6 +72,6 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>) {
   }
   return { total, recordedRows, countsByName, countsByKind, ok, failed,
     okRate: ok + failed ? ok / (ok + failed) : 0, errorRate: total ? countsByKind.error / total : 0,
-    durationMs, byComponent,
+    durationMs, byComponent, chains: chainAggregation.summary(),
     topErrorTags: [...errors.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.name.localeCompare(b.name)).slice(0, 20) };
 }

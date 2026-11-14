@@ -4530,8 +4530,9 @@ export class Router {
       const inbound = turn.inboundId ? this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(turn.inboundId) : undefined;
       const receivedAt = inbound ? (JSON.parse(inbound.payload) as { receivedAt?: number }).receivedAt : undefined;
       toolLog.write({ component: "router", kind: "event", name: "turn.start",
-        ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId },
-        props: { queued: this.store.get(`log-queued-behind:${turn.inboundId}`) === true,
+        ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId, ...(turn.inboundId ? { inboundId: turn.inboundId } : {}) },
+        props: { ...(turn.inboundId ? { batchSize: this.store.get<NormalizedInbound>(`batch:${turn.inboundId}`)?.batchIds?.length ?? 1 } : {}),
+          queued: this.store.get(`log-queued-behind:${turn.inboundId}`) === true,
           waitMs: Math.max(0, Date.now() - (receivedAt ?? turn.startedAt)) } });
     });
   }
@@ -4542,7 +4543,7 @@ export class Router {
       if (this.store.get(`log-turn-end:${turn.messageId}`)) return;
       this.store.set(`log-turn-end:${turn.messageId}`, true);
       toolLog.write({ component: "router", kind: "perf", name: "turn.end", durationMs: Math.max(0, Date.now() - turn.startedAt),
-        ok: outcome === "replied" || outcome === "no_reply", ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId }, props: { outcome } });
+        ok: outcome === "replied" || outcome === "no_reply", ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id, messageId: turn.messageId, ...(turn.inboundId ? { inboundId: turn.inboundId } : {}) }, props: { outcome } });
     });
   }
 
