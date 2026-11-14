@@ -385,6 +385,7 @@ const fakeThreads = (
 };
 
 const owner: KanbanActor = { _tag: "owner" };
+const decodeMessage = Schema.decodeUnknownEffect(KanbanMessage);
 
 it.effect.each(["subtask_done", "report_bug"] as const)(
   "%s saves an attached active worker's result while the state background reader is held",
@@ -963,9 +964,7 @@ it.effect.each(["work", "review"] as const)(
         text: "Channel update",
       });
       assert.isFalse(channelPost.isError, channelPost.text);
-      const message = yield* Schema.decodeUnknownEffect(KanbanMessage)(
-        channelPost.structured.message,
-      );
+      const message = yield* decodeMessage(channelPost.structured.message);
       assert.deepStrictEqual(yield* kanban.messages(channel.id), [message]);
     }).pipe(Effect.provide(layer));
   },
@@ -990,7 +989,7 @@ it.effect("a work thread can post to its own card's discussion by id", () => {
       text: "Own card update",
     });
     assert.isFalse(posted.isError, posted.text);
-    const message = yield* Schema.decodeUnknownEffect(KanbanMessage)(posted.structured.message);
+    const message = yield* decodeMessage(posted.structured.message);
     assert.deepStrictEqual(yield* kanban.messages(discussion.id), [message]);
     assert.strictEqual((yield* kanban.discussion(discussion.id)).lastSeq, discussion.lastSeq + 1);
   }).pipe(Effect.provide(layer));
@@ -1014,7 +1013,7 @@ it.effect("an evaluator can post to a card's discussion by id", () => {
       text: "Evaluator update",
     });
     assert.isFalse(posted.isError, posted.text);
-    const message = yield* Schema.decodeUnknownEffect(KanbanMessage)(posted.structured.message);
+    const message = yield* decodeMessage(posted.structured.message);
     assert.deepStrictEqual(yield* kanban.messages(discussion.id), [message]);
     assert.strictEqual((yield* kanban.discussion(discussion.id)).lastSeq, discussion.lastSeq + 1);
   }).pipe(Effect.provide(layer));
