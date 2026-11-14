@@ -5275,7 +5275,7 @@ it.effect(
         boardId: "tools",
         title: "Different words",
         evidence: "run-1 failed",
-        cardHint: `#${bug.number}`,
+        cardHint: `tools#${bug.number}`,
       };
       const appended = yield* call(reporter, "report_bug", input);
       assert.isFalse(appended.isError, appended.text);
