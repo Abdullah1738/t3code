@@ -22,6 +22,7 @@ import {
 import { makeFake, owner, testLayer, toyBoard } from "./askFlows.testkit.ts";
 
 const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("asker") };
+const worker: KanbanActor = { _tag: "thread", threadId: ThreadId.make("worker") };
 
 const goChoiceSubtask: KanbanSubtask = {
   id: "s1",
@@ -765,7 +766,7 @@ it.effect("a missing decision names the gate and the subtask's time bound", () =
         .pipe(Effect.flip);
       assert.strictEqual(
         refused.detail,
-        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: no owner answer on a deploy ask since ${card.subtasks[0]!.createdAt}; ask with card_ask naming s1 (e.g. "Approve s1: <step>") (this board has no standing deploy approval); for a guessed gate on an evaluator/script step, an evaluator can pass clearGate with a reason on s1; a gate set on purpose still needs Abdullah's answer naming s1`,
+        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: no owner answer on a deploy ask since ${card.subtasks[0]!.createdAt}; ask with card_ask naming s1 (e.g. "Approve s1: <step>"); no owner answer on a deploy ask since ${card.subtasks[0]!.createdAt}; name the subtask id (e.g. s7) in the ask or set approves: [s1] on the go option (this board has no standing deploy approval); for a guessed gate on an evaluator/script step, an evaluator can pass clearGate with a reason on s1; a gate set on purpose still needs Abdullah's answer naming s1`,
       );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
@@ -1342,15 +1343,672 @@ it.effect("a rejected model edit leaves no clear event or notice, including retr
   }),
 );
 
+const approvalAt = "2026-11-13T10:00:00.000Z";
+const decisionAt = "2026-11-13T15:13:16.000Z";
+const laterDecisionAt = "2026-11-13T16:17:14.000Z";
+const gatedStep = (id: string, text = "Install the skill") => ({
+  id,
+  text,
+  step: 1,
+  owner: "evaluator" as const,
+  state: "open" as const,
+  note: null,
+  doneBy: null,
+  doneAt: null,
+});
+const pickedAsk = (text: string, approves?: ReadonlyArray<string>): KanbanCard["asks"][number] => ({
+  id: "q5",
+  text,
+  kind: "change",
+  by: evaluator,
+  at: approvalAt,
+  blocking: true,
+  seq: null,
+  changes: [{ label: "Rule", before: "Old", after: "New", format: "markdown" }],
+  options: [
+    {
+      id: "o1",
+      label: "Add just these lines to the live skill now",
+      ...(approves === undefined ? {} : { approves }),
+    },
+    { id: "o2", label: "Wait for #73, then run install.zsh" },
+    { id: "o3", label: "Change the wording" },
+    { id: "o4", label: "Drop it" },
+  ],
+  closedAt: decisionAt,
+  answer: { verdict: "picked", optionIds: ["o1"], by: owner, at: decisionAt },
+});
+const approvalCard = (
+  subtasks: KanbanCard["subtasks"],
+  asks: KanbanCard["asks"],
+): Pick<KanbanCard, "number" | "subtasks" | "asks" | "createdAt"> => ({
+  number: 83,
+  createdAt: approvalAt,
+  subtasks,
+  asks,
+});
+
+it.each([true, false])("Agent Tools #83 q4/q5/s9: explicit approval %s", (explicit) => {
+  const s9 = gatedStep(
+    "s9",
+    "Ask owner (card_ask, before/after) to approve the skill wording change and running integrations/run-cloud/install.zsh; install after OK",
+  );
+  const q4: KanbanCard["asks"][number] = {
+    ...pickedAsk("Approve one final Android session capped at 7 minutes/$0.14"),
+    id: "q4",
+    kind: "action",
+    action: { summary: "Purchase one Android session" },
+    closedAt: "2026-11-13T12:01:29.000Z",
+    answer: { verdict: "dropped", by: worker, at: "2026-11-13T12:01:29.000Z" },
+  };
+  const q5 = pickedAsk(
+    "The Android typing warning is merged into the fork. How should it reach the live Run Cloud skill?",
+    explicit ? ["s9"] : undefined,
+  );
+  const result = approvalProblem(approvalCard([s9], [q4, q5]), s9);
+  if (explicit) assert.isNull(result);
+  else {
+    assert.include(result!, "no owner answer on a deploy ask");
+    assert.include(result!, "or set approves: [s9] on the go option");
+    assert.notInclude(result!, "q4");
+  }
+});
+
+it.each([true, false])("Dia #18 q1/s4: explicit approval %s", (explicit) => {
+  const s4 = gatedStep(
+    "s4",
+    "After his yes: re-read main, replay onto it if it moved (compare HEAD^{tree} with the tested head or re-run offbox full suite), move main with update-ref <new> <expected-old> per wiki dia-bridge-source-and-go-live. No new dependency expected; if there is one, install it in live node_modules first.",
+  );
+  const q1 = {
+    ...pickedAsk(
+      "Put the outside-navigation guard live in the Dia bridge (move main to the reviewed branch), with the tool wording below?",
+    ),
+    id: "q1",
+    title: "#18 go-live: Dia bridge stops before acting on a tab someone else navigated",
+    batchKey: "dia-go-live",
+    options: [
+      { id: "o1", label: "Approve", recommended: true, ...(explicit ? { approves: ["s4"] } : {}) },
+      { id: "o2", label: "Change" },
+      { id: "o3", label: "Drop" },
+    ],
+  };
+  const done = (id: string, text: string) => ({ ...gatedStep(id, text), state: "done" as const });
+  const result = approvalProblem(
+    approvalCard(
+      [
+        done(
+          "s3",
+          "Ask Abdullah for go-live (card_ask, blocking, options Approve / Change / Drop) with the exact before/after tool description text (dia_tab_focus, the new acknowledgeNavigation param) and what changes for agents. Batch with other pending Dia go-lives if one is open (batchKey dia-go-live).",
+        ),
+        s4,
+        done(
+          "s5",
+          "Read-back on a fresh bridge process: own Personal agent window at example.com; dia_navigate + dia_page_state show no flag; navigate the target from a separate raw CDP websocket (scratch script in mktemp -d) to https://example.com/?outside; next dia_evaluate returns actionPerformed:false with navigatedOutsideSession; repeat with acknowledgeNavigation runs. Close the window. Then update the wiki page.",
+        ),
+      ],
+      [q1],
+    ),
+    s4,
+  );
+  if (explicit) assert.isNull(result);
+  else assert.include(result!, "or set approves: [s4] on the go option");
+});
+
+it.each([owner, worker, evaluator])(
+  "only a matching drop by $_tag blocks an earlier approval",
+  (by) => {
+    const s9 = gatedStep("s9");
+    const approved = pickedAsk("Install s9?", ["s9"]);
+    const dropped = (
+      text: string,
+      approves?: ReadonlyArray<string>,
+    ): KanbanCard["asks"][number] => ({
+      ...pickedAsk(text, approves),
+      id: "q6",
+      closedAt: laterDecisionAt,
+      answer: { verdict: "dropped", by, at: laterDecisionAt },
+    });
+    for (const drop of [dropped("Install s9?"), dropped("Put it live?", ["s9"])]) {
+      assert.include(approvalProblem(approvalCard([s9], [approved, drop]), s9)!, "q6, was dropped");
+    }
+    assert.isNull(
+      approvalProblem(approvalCard([s9], [approved, dropped("Purchase a session?")]), s9),
+    );
+  },
+);
+
+it("an explicit list replaces wording matching and needs a single picked option", () => {
+  const s7 = gatedStep("s7");
+  const s9 = gatedStep("s9");
+  const ask = pickedAsk("Install s9?", ["s7"]);
+  const card = approvalCard([s7, s9], [ask]);
+  assert.isNull(approvalProblem(card, s7));
+  assert.include(approvalProblem(card, s9)!, "no owner answer");
+  const multi = { ...ask, answer: { ...ask.answer!, optionIds: ["o1", "o3"] } };
+  assert.isNotNull(approvalProblem({ ...card, asks: [multi] }, s7));
+  const other = { ...ask, answer: { ...ask.answer!, optionIds: ["o3"] } };
+  assert.isNotNull(approvalProblem({ ...card, asks: [other] }, s9));
+  const empty = pickedAsk("Install s9?", []);
+  assert.isNotNull(approvalProblem({ ...card, asks: [empty] }, s9));
+});
+
+it("explicit approval obeys owner, draft, timestamps and later matched decisions", () => {
+  const s9 = { ...gatedStep("s9"), createdAt: decisionAt };
+  const ask = { ...pickedAsk("Put it live?", ["s9"]), at: decisionAt };
+  const check = (candidate: KanbanCard["asks"][number]) =>
+    approvalProblem(approvalCard([s9], [candidate]), s9);
+  assert.isNull(check(ask));
+  for (const candidate of [
+    { ...ask, answer: { ...ask.answer!, by: evaluator } },
+    { ...ask, draft: { text: "The text to send", format: "markdown" as const } },
+    { ...ask, at: approvalAt },
+    { ...ask, answer: { ...ask.answer!, at: approvalAt } },
+  ])
+    assert.isNotNull(check(candidate));
+  assert.isNull(check({ ...ask, at: approvalAt, revisedAt: decisionAt }));
+  const later = {
+    ...pickedAsk("Install s9?"),
+    id: "q6",
+    at: laterDecisionAt,
+    closedAt: laterDecisionAt,
+    answer: { verdict: "rejected" as const, by: owner, at: laterDecisionAt },
+  };
+  assert.isNotNull(approvalProblem(approvalCard([s9], [later, ask]), s9));
+});
+
+it.effect("ask create and revise validate approval ids before saving", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Scoped go",
+          prompt: "Work",
+          subtasks: [{ text: "Install the skill", owner: "evaluator" }],
+        },
+        owner,
+      );
+      const unknown = { label: "Approve", approves: ["s99"] };
+      const refused = yield* kanban
+        .askOwner(
+          card.id,
+          {
+            question: "Put it live?",
+            blocking: false,
+            options: [unknown, "Change"],
+          },
+          evaluator,
+          "evaluator",
+        )
+        .pipe(Effect.flip);
+      assert.include(
+        refused.detail,
+        `option o1 approves s99, which isn't a subtask on card #${card.number}`,
+      );
+      assert.lengthOf((yield* kanban.card(card.id)).card.asks, 0);
+      yield* kanban.askOwner(
+        card.id,
+        {
+          question: "Put it live?",
+          blocking: false,
+          options: [{ label: "Approve", approves: ["s1"] }, "Change"],
+        },
+        evaluator,
+        "evaluator",
+      );
+      const edit = yield* kanban
+        .editAsk(card.id, "q1", { options: [unknown, "Change"] }, evaluator, "evaluator")
+        .pipe(Effect.flip);
+      assert.include(edit.detail, "approves s99");
+      yield* kanban.answerAsk(
+        card.id,
+        "q1",
+        { verdict: "picked", optionIds: ["o1"], revision: 0 },
+        owner,
+      );
+      const done = yield* kanban.markSubtask(
+        card.id,
+        "s1",
+        "done",
+        "Explicit approval",
+        evaluator,
+        "evaluator",
+      );
+      assert.strictEqual(done.subtasks[0]?.state, "done");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.each(["Deploy the skill", "Purchase a session", "Share the API key"])(
+  "explicit options also clear the gate for %s",
+  (text) => {
+    for (const owner of ["evaluator", "script"] as const) {
+      const subtask = { ...gatedStep("s7", text), owner };
+      const ask = pickedAsk("Put it live?", ["s7"]);
+      assert.isNull(approvalProblem(approvalCard([subtask], [ask]), subtask));
+    }
+  },
+);
+
+it.each(["none", "text", "title"] as const)(
+  "Agent Tools #83 q7/s9: subtask id in %s after unrelated q4 drop",
+  (namedIn) => {
+    const s9 = gatedStep(
+      "s9",
+      "Ask owner (card_ask, before/after) to approve the skill wording change and running integrations/run-cloud/install.zsh; install after OK",
+    );
+    const q4: KanbanCard["asks"][number] = {
+      id: "q4",
+      kind: "action",
+      text: "Approve one final Android session capped at 7 minutes/$0.14?",
+      action: { summary: "Purchase one Android session" },
+      by: worker,
+      at: approvalAt,
+      blocking: false,
+      seq: null,
+      closedAt: "2026-11-13T12:01:29.000Z",
+      answer: { verdict: "dropped", by: worker, at: "2026-11-13T12:01:29.000Z" },
+    };
+    const answeredAt = "2026-11-13T17:35:11.000Z";
+    const q7: KanbanCard["asks"][number] = {
+      id: "q7",
+      kind: "action",
+      by: evaluator,
+      at: decisionAt,
+      blocking: true,
+      seq: null,
+      title: `#83: one tap to close the card (your q5 pick is already done)${namedIn === "title" ? " s9" : ""}`,
+      text: `Approve the live-skill edit you picked in q5? It's already in place, and the board needs a yes/no to close the card.${namedIn === "text" ? " s9" : ""}`,
+      action: {
+        summary:
+          "Keep the two approved additions in the live run-cloud SKILL.md (already applied, matches fork 9226b391ee).",
+      },
+      closedAt: answeredAt,
+      answer: { verdict: "approved", by: owner, at: answeredAt },
+    };
+    const result = approvalProblem(approvalCard([s9], [q4, q7]), s9);
+    if (namedIn !== "none") assert.isNull(result);
+    else {
+      assert.include(result!, "no owner answer on a deploy ask");
+      assert.include(result!, "name the subtask id");
+      assert.include(result!, "or set approves: [s9] on the go option");
+      assert.notInclude(result!, "q4");
+    }
+  },
+);
+
 it.each([
-  { verdict: "picked", by: "owner", skip: true, done: false },
-  { verdict: "rejected", by: "owner", skip: true, done: false },
-  { verdict: "approved", by: "owner", skip: true, done: true },
-  { verdict: "answered", by: "owner", skip: true, done: false },
-  { verdict: "dropped", by: "owner", skip: false, done: false },
-  { verdict: "picked", by: "evaluator", skip: false, done: false },
-  { verdict: "absent", by: "owner", skip: false, done: false },
-] as const)("gate intent: $by $verdict", ({ verdict, by, skip, done }) => {
+  "Approve s1, s2, s3",
+  "Yes, tick s1 and s2",
+  "Ok, clear s1 and s2",
+  "Approved s1, s2",
+  "Go ahead, do s1 and s2",
+])("a consent label scopes its approval: %s", (label) => {
+  const s1 = gatedStep("s1");
+  const s2 = gatedStep("s2");
+  const s3 = gatedStep("s3");
+  const s5 = gatedStep("s5");
+  const ask = {
+    ...pickedAsk("Install these steps?"),
+    options: [
+      { id: "o1", label },
+      { id: "o2", label: "Drop" },
+    ],
+  };
+  const card = approvalCard([s1, s2, s3, s5], [ask]);
+  assert.isNull(approvalProblem(card, s1));
+  assert.isNull(approvalProblem(card, s2));
+  assert.isNotNull(approvalProblem(card, s5));
+  const multi = { ...ask, answer: { ...ask.answer!, optionIds: ["o1", "o2"] } };
+  assert.isNotNull(approvalProblem({ ...card, asks: [multi] }, s1));
+});
+
+it.each([
+  { label: "Approve s4", approved: true },
+  { label: "Yes, tick s4", approved: true },
+  { label: "  Go ahead, clear s4 and s99", approved: true },
+  { label: "Approve s99", approved: false },
+  { label: "Approve s40", approved: false },
+  { label: "Don't approve s4", approved: false },
+  { label: "Wait, s4 later", approved: false },
+  { label: "Approve s4 later", approved: false },
+  { label: "Review s4", approved: false },
+])("#1334 explicit s4 label $label: $approved", ({ label, approved }) => {
+  const s4 = gatedStep("s4");
+  const ask = {
+    ...pickedAsk("Put the fix live?"),
+    options: [
+      { id: "o1", label },
+      { id: "o2", label: "Drop" },
+    ],
+  };
+  const result = approvalProblem(approvalCard([s4], [ask]), s4);
+  if (approved) assert.isNull(result);
+  else assert.isNotNull(result);
+});
+
+it("an approves field stays authoritative when a consent label names different ids", () => {
+  const s4 = gatedStep("s4");
+  const s5 = gatedStep("s5");
+  const ask = {
+    ...pickedAsk("Install s4?"),
+    options: [{ id: "o1", label: "Approve s4", approves: ["s5"] }],
+  };
+  const card = approvalCard([s4, s5], [ask]);
+  assert.isNotNull(approvalProblem(card, s4));
+  assert.isNull(approvalProblem(card, s5));
+});
+
+it.each(["Drop", "Wait"])(
+  "review regression: a newer %s pick supersedes an earlier approval",
+  (label) => {
+    const s4 = gatedStep("s4");
+    const earlier = {
+      ...pickedAsk("Install s4?"),
+      id: "q1",
+      options: [
+        { id: "o1", label: "Approve" },
+        { id: "o2", label: "Drop" },
+      ],
+    };
+    const later = {
+      ...pickedAsk("Install s4?", ["s4"]),
+      id: "q2",
+      options: [
+        { id: "o1", label: "Approve", approves: ["s4"] },
+        { id: "o2", label },
+      ],
+      closedAt: laterDecisionAt,
+      answer: { verdict: "picked" as const, optionIds: ["o2"], by: owner, at: laterDecisionAt },
+    };
+    assert.isNotNull(approvalProblem(approvalCard([s4], [earlier, later]), s4));
+  },
+);
+
+it.each(["Approve s4 after the review", "Yes, do not approve s4", "Approve s1, not s4"])(
+  "review regression: qualified consent never grants s4: %s",
+  (label) => {
+    const s1 = gatedStep("s1");
+    const s4 = gatedStep("s4");
+    const ask = {
+      ...pickedAsk("Install s4?"),
+      options: [
+        { id: "o1", label },
+        { id: "o2", label: "Drop" },
+      ],
+    };
+    assert.isNotNull(approvalProblem(approvalCard([s1, s4], [ask]), s4));
+  },
+);
+
+it.each([
+  { scopedBy: "field", go: { id: "o1", label: "Approve", approves: ["s4", "s5"] } },
+  { scopedBy: "label", go: { id: "o1", label: "Approve s4 and s5" } },
+])("refusals supersede all $scopedBy scopes, go choices retain their own scope", ({ go }) => {
+  const s4 = gatedStep("s4");
+  const s5 = gatedStep("s5");
+  const s7 = gatedStep("s7");
+  const earlier = pickedAsk("Put these live?", ["s4", "s5", "s7"]);
+  for (const label of ["Drop", "Wait", "Change", "Don't approve", "Wait for the review"]) {
+    const later = {
+      ...pickedAsk("Put these live?"),
+      id: "q6",
+      options: [go, { id: "o2", label }],
+      answer: { verdict: "picked" as const, optionIds: ["o2"], by: owner, at: laterDecisionAt },
+    };
+    const card = approvalCard([s4, s5, s7], [earlier, later]);
+    for (const target of [s4, s5]) {
+      const result = approvalProblem(card, target);
+      assert.include(result!, "the latest decision, q6");
+      assert.include(result!, label);
+    }
+    assert.isNull(approvalProblem(card, s7));
+  }
+  const scopedGo = {
+    ...pickedAsk("Install s5 and s7?"),
+    id: "q6",
+    options: [go, { id: "o2", label: "Approve s7" }],
+    answer: { verdict: "picked" as const, optionIds: ["o2"], by: owner, at: laterDecisionAt },
+  };
+  const rejected = {
+    ...pickedAsk("Install s4?", ["s4"]),
+    id: "q5",
+    answer: { verdict: "rejected" as const, by: owner, at: decisionAt },
+  };
+  const card = approvalCard([s4, s5, s7], [rejected, scopedGo]);
+  assert.include(approvalProblem(card, s4)!, "q5");
+  assert.isNull(approvalProblem(card, s7));
+});
+
+it.each([
+  "Yes, do not approve s4",
+  "Yes, don't approve s4",
+  "Yes, don’t approve s4",
+  "Approve s1, not s4",
+  "Approve s1 but not s4",
+  "Approve s1 except s4",
+  "Approve s1 without s4",
+  "Yes, no approval for s4",
+  "Yes, never approve s4",
+  "Yes, we won't approve s4",
+  "Yes, we can’t approve s4",
+  "Yes, we cannot approve s4",
+  "Approve s4 after the review",
+  "Approve s4 before the review",
+  "Approve s4 if reviewed",
+  "Approve s4 unless review fails",
+  "Approve s4 once reviewed",
+  "Approve s4 when reviewed",
+  "Approve s4 pending review",
+  "Approve s4, first review",
+  "Approve s4, then review",
+  "Approve s4 later",
+  "Approve s4 tomorrow",
+  "Approve s4 next week",
+  "Approve s4 next month",
+  "Approve s1; reject s4",
+  "Approve s1; hold s4",
+  "Approve s1; wait for s4",
+  "Approve s1, cancel s4",
+  "Approve s1, skip s4",
+  "Approve s1; decline s4",
+  "Yes, approve s4 only if needed",
+  "Approve s4 after review",
+  ...["refuse", "deny", "defer", "postpone", "delay", "pause", "suspend", "abort"].map(
+    (verb) => `Yes, we ${verb} approval for s4`,
+  ),
+])("a qualified label cannot grant any explicit scope: %s", (label) => {
+  const s1 = gatedStep("s1");
+  const s4 = gatedStep("s4");
+  const ask = {
+    ...pickedAsk("Install s1 and s4?"),
+    options: [
+      { id: "o1", label },
+      { id: "o2", label: "Drop" },
+    ],
+  };
+  const card = approvalCard([s1, s4], [ask]);
+  for (const target of [s1, s4]) assert.isNotNull(approvalProblem(card, target));
+  const earlier = pickedAsk("Put it live?", ["s4"]);
+  const later = {
+    ...ask,
+    id: "q6",
+    options: [...ask.options, { id: "o3", label: "Approve", approves: ["s1", "s4"] }],
+    answer: { ...ask.answer!, at: laterDecisionAt },
+  };
+  assert.include(approvalProblem(approvalCard([s1, s4], [earlier, later]), s4)!, "q6");
+  for (const verdict of ["picked", "approved"] as const) {
+    for (const scoped of [false, true]) {
+      const signoff = {
+        ...ask,
+        id: "q7",
+        kind: "signoff",
+        options: ask.options.map((option) =>
+          scoped && option.id === "o1" ? { ...option, approves: ["s1", "s4"] } : option,
+        ),
+        answer: { verdict, optionIds: ["o1"], by: owner, at: laterDecisionAt },
+      };
+      const result = approvalProblem(approvalCard([s1, s4], [earlier, signoff]), s4);
+      assert.include(result!, "the latest decision, q7");
+    }
+  }
+});
+
+it.each(["field", "label"])("Crpko #3868 signoff approved with one %s-scoped option", (scope) => {
+  const s4 = gatedStep("s4");
+  const s5 = gatedStep("s5");
+  const go =
+    scope === "field"
+      ? { id: "o1", label: "Approve", approves: ["s4"] }
+      : { id: "o1", label: "Approve s4" };
+  const ask: KanbanCard["asks"][number] = {
+    ...pickedAsk("Sign off so the card can close this step?"),
+    id: "q1",
+    kind: "signoff",
+    title: "Sign off: quick-setup frontend is on dev",
+    options: [go, { id: "o2", label: "Change" }, { id: "o3", label: "Drop" }],
+    answer: { verdict: "approved", optionIds: ["o1"], by: owner, at: decisionAt },
+  };
+  const card = approvalCard([s4, s5], [ask]);
+  assert.isNull(approvalProblem(card, s4));
+  assert.isNotNull(approvalProblem(card, s5));
+  for (const optionIds of [undefined, [], ["o1", "o2"], ["o2"], ["unknown"]]) {
+    const candidate = {
+      ...ask,
+      answer: {
+        verdict: "approved" as const,
+        ...(optionIds === undefined ? {} : { optionIds }),
+        by: owner,
+        at: laterDecisionAt,
+      },
+    };
+    const earlier = pickedAsk("Install s4?", ["s4"]);
+    const result = approvalProblem({ ...card, asks: [earlier, candidate] }, s4);
+    assert.include(result!, "the latest decision, q1");
+    assert.include(result!, "pick exactly one option naming s4");
+  }
+  for (const candidate of [
+    { ...ask, answer: { ...ask.answer!, by: evaluator } },
+    { ...ask, draft: { text: "Text to send", format: "markdown" as const } },
+    { ...ask, answer: { ...ask.answer!, at: "2026-11-12T00:00:00.000Z" } },
+  ])
+    assert.isNotNull(approvalProblem({ ...card, asks: [candidate] }, s4));
+});
+
+it.effect("signoff persists approved plus optionIds and clears only the selected scope", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Signoff approval",
+          prompt: "Work",
+          subtasks: [{ text: "Install the skill", owner: "evaluator" }],
+        },
+        owner,
+      );
+      yield* kanban.askOwner(
+        card.id,
+        {
+          question: "Sign off so the card can close this step?",
+          kind: "signoff",
+          blocking: false,
+          options: [{ label: "Approve", approves: ["s1"] }, "Change", "Drop"],
+        },
+        evaluator,
+        "evaluator",
+      );
+      const answered = yield* kanban.answerAsk(
+        card.id,
+        "q1",
+        { verdict: "approved", optionIds: ["o1"], revision: 0 },
+        owner,
+      );
+      assert.strictEqual(answered.card.asks[0]?.answer?.verdict, "approved");
+      assert.deepStrictEqual(answered.card.asks[0]?.answer?.optionIds, ["o1"]);
+      const done = yield* kanban.markSubtask(
+        card.id,
+        "s1",
+        "done",
+        "Scoped signoff",
+        evaluator,
+        "evaluator",
+      );
+      assert.strictEqual(done.subtasks[0]?.state, "done");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.each([
+  "Approve s1,s4",
+  "Approve s1 and s4",
+  "Approve s1, and s4",
+  "Approve s1; s4",
+  "Approve s1 / s4",
+  "Approve s1 & s4",
+  "Approve s1 + s4",
+  "Approve s1 s4",
+  "Yes, tick s1 and s4",
+  "Ok: clear s1 and s4",
+  "Approved s1 and s4 now!",
+  "Go ahead, do s1 and s4.",
+])("direct id-list consent works for picked and approved: %s", (label) => {
+  const s1 = gatedStep("s1");
+  const s4 = gatedStep("s4");
+  const s5 = gatedStep("s5");
+  for (const verdict of ["picked", "approved"] as const) {
+    const ask = {
+      ...pickedAsk("Put it live?"),
+      options: [
+        { id: "o1", label },
+        { id: "o2", label: "Drop" },
+      ],
+      answer: { verdict, optionIds: ["o1"], by: owner, at: decisionAt },
+    };
+    const card = approvalCard([s1, s4, s5], [ask]);
+    assert.isNull(approvalProblem(card, s1));
+    assert.isNull(approvalProblem(card, s4));
+    assert.isNotNull(approvalProblem(card, s5));
+  }
+});
+
+it.each([
+  "Don't approve s4",
+  "Wait, s4 later",
+  "Yes, do not approve s4",
+  "Approve s4 after the review",
+])("an approved answer cannot bypass a qualified selected label: %s", (label) => {
+  const s4 = gatedStep("s4");
+  const ask = {
+    ...pickedAsk("Install s4?"),
+    kind: "signoff",
+    options: [
+      { id: "o1", label },
+      { id: "o2", label: "Change" },
+    ],
+    answer: { verdict: "approved" as const, optionIds: ["o1"], by: owner, at: decisionAt },
+  };
+  assert.isNotNull(approvalProblem(approvalCard([s4], [ask]), s4));
+});
+
+it.each([
+  ...(
+    [
+      { verdict: "picked", by: "owner", skip: true, done: false },
+      { verdict: "rejected", by: "owner", skip: true, done: false },
+      { verdict: "approved", by: "owner", skip: true, done: false },
+      { verdict: "answered", by: "owner", skip: true, done: false },
+      { verdict: "dropped", by: "owner", skip: false, done: false },
+      { verdict: "picked", by: "evaluator", skip: false, done: false },
+      { verdict: "absent", by: "owner", skip: false, done: false },
+    ] as const
+  ).map((entry) => ({ ...entry, plain: false })),
+  { verdict: "approved", by: "owner", skip: true, done: true, plain: true },
+] as const)("gate intent: $by $verdict plain=$plain", ({ verdict, by, skip, done, plain }) => {
   const at = "2026-11-13T18:00:00.000Z";
   const subtask: KanbanCard["subtasks"][number] = {
     id: "s6",
@@ -1383,7 +2041,12 @@ it.each([
                 { id: "o1", label: "Skip deploy" },
                 { id: "o2", label: "Deploy anyway" },
               ],
-              answer: { verdict, by: by === "owner" ? owner : evaluator, at, optionIds: ["o1"] },
+              answer: {
+                verdict,
+                by: by === "owner" ? owner : evaluator,
+                at,
+                ...(plain ? {} : { optionIds: ["o1"] }),
+              },
             },
           ],
   };
@@ -1927,6 +2590,289 @@ it.effect(
         assert.strictEqual(old._tag, "Failure");
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
+);
+
+it.each(["picked", "rejected", "approved", "dropped"] as const)(
+  "scoped %s answers keep owner-skip intent separate from permission to act",
+  (verdict) => {
+    const s4 = gatedStep("s4");
+    const s5 = gatedStep("s5");
+    const ask = {
+      ...pickedAsk("Put it live?", ["s4"]),
+      answer: {
+        verdict,
+        ...(verdict === "picked" ? { optionIds: ["o4"] } : {}),
+        by: owner,
+        at: decisionAt,
+      },
+    };
+    const card = approvalCard([s4, s5], [ask]);
+    assert.strictEqual(
+      approvalProblem(card, s4, [], undefined, "skip") === null,
+      verdict !== "dropped",
+    );
+    assert.isNotNull(approvalProblem(card, s4));
+    assert.isNotNull(approvalProblem(card, s5, [], undefined, "skip"));
+  },
+);
+
+it.each(
+  [
+    "Yes, ",
+    "Ok: ",
+    "Please ",
+    "Go ahead and ",
+    "Approve ",
+    "Yes, please ",
+    "Please approve ",
+  ].flatMap((prefix) =>
+    [
+      "hold the deployment",
+      "wait for the deployment",
+      "stop the deployment",
+      "cancel the deployment",
+      "skip the deployment",
+      "drop the deployment",
+      "reject the deployment",
+    ].map((refusal) => ({ label: `${prefix}${refusal}` })),
+  ),
+)("merged go/hold fallback refuses polite refusal: $label", ({ label }) => {
+  const base = goChoiceCard([label, "Wait for #4280"]);
+  for (const verdict of ["picked", "approved"] as const) {
+    const ask = { ...base.asks[0]!, answer: { ...base.asks[0]!.answer!, verdict } };
+    assert.isNotNull(approvalProblem({ ...base, asks: [ask] }, goChoiceSubtask));
+  }
+});
+
+it.each([
+  "Yes, hold the purchase",
+  "Please cancel the charge",
+  "Ok, stop the transfer",
+  "Go ahead and skip the refund",
+])("merged money fallback refuses polite refusal: %s", (label) => {
+  const subtask = { ...goChoiceSubtask, text: "Purchase the license", gate: "money" as const };
+  const base = goChoiceCard([label, "Wait for the license"], ["o1"], subtask);
+  for (const verdict of ["picked", "approved"] as const) {
+    const ask = { ...base.asks[0]!, answer: { ...base.asks[0]!.answer!, verdict } };
+    assert.isNotNull(approvalProblem({ ...base, asks: [ask] }, subtask));
+  }
+});
+
+it.each(
+  (
+    [
+      { label: "Yes! Hold the deployment", text: "Deploy the release", gate: "deploy" },
+      { label: "Yes, let's hold the deployment", text: "Deploy the release", gate: "deploy" },
+      { label: "Yes, put the deployment on hold", text: "Deploy the release", gate: "deploy" },
+      { label: "Yes, let's cancel the purchase", text: "Purchase the license", gate: "money" },
+    ] as const
+  ).flatMap((entry) => (["picked", "approved"] as const).map((verdict) => ({ ...entry, verdict }))),
+)("merge review regression: $verdict $label", ({ label, text, gate, verdict }) => {
+  const subtask = { ...goChoiceSubtask, text, gate };
+  const base = goChoiceCard([label, "Wait"], ["o1"], subtask);
+  const ask = { ...base.asks[0]!, answer: { ...base.asks[0]!.answer!, verdict } };
+  assert.isNotNull(approvalProblem({ ...base, asks: [ask] }, subtask));
+});
+
+it.each(
+  [
+    "Yes, let's ",
+    "Yes, let’s ",
+    "Yes, let us ",
+    "Yes! ",
+    "Yes? Please ",
+    "We should ",
+    "Please, let's ",
+  ].flatMap((prefix) =>
+    [
+      "hold",
+      "cancel",
+      "wait for",
+      "stop",
+      "skip",
+      "drop",
+      "reject",
+      "decline",
+      "refuse",
+      "deny",
+      "defer",
+      "postpone",
+      "delay",
+      "pause",
+      "suspend",
+      "abort",
+    ].flatMap((verb) => [
+      {
+        label: `${prefix}${verb} the deployment`,
+        text: "Deploy the release",
+        gate: "deploy" as const,
+      },
+      {
+        label: `${prefix}${verb} the purchase`,
+        text: "Purchase the license",
+        gate: "money" as const,
+      },
+    ]),
+  ),
+)(
+  "fallback refusal cannot hide behind arbitrary consent wording: $label",
+  ({ label, text, gate }) => {
+    const subtask = { ...goChoiceSubtask, text, gate };
+    const base = goChoiceCard([label, "Wait"], ["o1"], subtask);
+    for (const scoped of [false, true]) {
+      for (const verdict of ["picked", "approved"] as const) {
+        const ask = {
+          ...base.asks[0]!,
+          options: base.asks[0]!.options!.map((option) =>
+            scoped && option.id === "o1" ? { ...option, approves: [subtask.id] } : option,
+          ),
+          answer: { ...base.asks[0]!.answer!, verdict },
+        };
+        assert.isNotNull(approvalProblem({ ...base, asks: [ask] }, subtask));
+      }
+    }
+  },
+);
+
+it.each(
+  ["Yes, ", "Yes! ", "Yes, let's ", "We should "].flatMap((prefix) =>
+    ["put", "keep", "place"].flatMap((verb) => [
+      {
+        label: `${prefix}${verb} the deployment on hold`,
+        text: "Deploy the release",
+        gate: "deploy" as const,
+      },
+      {
+        label: `${prefix}${verb} the purchase on hold`,
+        text: "Purchase the license",
+        gate: "money" as const,
+      },
+    ]),
+  ),
+)("fallback refuses object-first hold choice: $label", ({ label, text, gate }) => {
+  const subtask = { ...goChoiceSubtask, text, gate };
+  const base = goChoiceCard([label, "Wait"], ["o1"], subtask);
+  for (const scoped of [false, true]) {
+    for (const verdict of ["picked", "approved"] as const) {
+      const ask = {
+        ...base.asks[0]!,
+        options: base.asks[0]!.options!.map((option) =>
+          scoped && option.id === "o1" ? { ...option, approves: [subtask.id] } : option,
+        ),
+        answer: { ...base.asks[0]!.answer!, verdict },
+      };
+      assert.isNotNull(approvalProblem({ ...base, asks: [ask] }, subtask));
+    }
+  }
+});
+
+it.each([
+  { label: "Deploy the on-hold build", text: "Deploy the on-hold build", gate: "deploy" },
+  { label: "Purchase the hold service", text: "Purchase the hold service", gate: "money" },
+] as const)("strict action matching keeps the target name: $label", ({ label, text, gate }) => {
+  const subtask = { ...goChoiceSubtask, text, gate };
+  const base = goChoiceCard([label, "Wait"], ["o1"], subtask);
+  for (const scoped of [false, true]) {
+    for (const verdict of ["picked", "approved"] as const) {
+      const ask = {
+        ...base.asks[0]!,
+        options: base.asks[0]!.options!.map((option) =>
+          scoped && option.id === "o1" ? { ...option, approves: [subtask.id] } : option,
+        ),
+        answer: { ...base.asks[0]!.answer!, verdict },
+      };
+      assert.isNull(approvalProblem({ ...base, asks: [ask] }, subtask));
+    }
+  }
+});
+
+it.each(
+  ["Deploy the pause worker", "Deploy the delay queue"].flatMap((label) =>
+    (["picked", "approved"] as const).map((verdict) => ({ label, verdict })),
+  ),
+)(
+  "round 3 review regression: exact positive target with scope: $verdict $label",
+  ({ label, verdict }) => {
+    const subtask = { ...goChoiceSubtask, text: label };
+    const base = goChoiceCard([label, "Wait"], ["o1"], subtask);
+    const ask = { ...base.asks[0]!, answer: { ...base.asks[0]!.answer!, verdict } };
+    assert.isNull(approvalProblem({ ...base, asks: [ask] }, subtask));
+    const scoped = {
+      ...ask,
+      options: ask.options!.map((option) =>
+        option.id === "o1" ? { ...option, approves: [subtask.id] } : option,
+      ),
+    };
+    assert.isNull(approvalProblem({ ...base, asks: [scoped] }, subtask));
+  },
+);
+
+it.each(
+  ["decline", "refuse", "deny", "defer", "postpone", "delay", "pause", "suspend", "abort"].flatMap(
+    (name) => [
+      { label: `Deploy the ${name} worker`, gate: "deploy" as const },
+      { label: `Purchase the ${name} service`, gate: "money" as const },
+      { label: `Use the ${name} secret`, gate: "secret" as const },
+    ],
+  ),
+)("exact positive target names retain approval in every gate: $label", ({ label, gate }) => {
+  const subtask = { ...goChoiceSubtask, text: label, gate };
+  const base = goChoiceCard([label, "Wait"], ["o1"], subtask);
+  for (const scoped of [false, true]) {
+    for (const verdict of ["picked", "approved"] as const) {
+      const ask = {
+        ...base.asks[0]!,
+        options: base.asks[0]!.options!.map((option) =>
+          scoped && option.id === "o1" ? { ...option, approves: [subtask.id] } : option,
+        ),
+        answer: { ...base.asks[0]!.answer!, verdict },
+      };
+      assert.isNull(approvalProblem({ ...base, asks: [ask] }, subtask));
+    }
+  }
+});
+
+it.each(
+  (["deploy", "money", "secret"] as const).flatMap((gate) =>
+    (["field", "label"] as const).flatMap((scope) =>
+      (["picked", "approved"] as const).flatMap((verdict) =>
+        [
+          "Yes, don't approve s4",
+          "Yes, we cannot approve s4",
+          "Approve s4 after the review",
+          "Approve s4 only if needed",
+        ].map((label) => ({ gate, scope, verdict, label })),
+      ),
+    ),
+  ),
+)(
+  "refusal never narrows the ask's $scope scopes: $gate $verdict $label",
+  ({ gate, scope, verdict, label }) => {
+    const s4 = { ...gatedStep("s4"), gate };
+    const s7 = { ...gatedStep("s7"), gate };
+    const earlier = pickedAsk("Approve s7", ["s7"]);
+    const go =
+      scope === "field"
+        ? { id: "o2", label: "Approve", approves: ["s4", "s7"] }
+        : { id: "o2", label: "Approve s4 and s7" };
+    const later = {
+      ...pickedAsk("Choose for these steps"),
+      id: "q6",
+      options: [{ id: "o1", label }, go],
+      closedAt: laterDecisionAt,
+      answer: { verdict, optionIds: ["o1"], by: owner, at: laterDecisionAt },
+    };
+    const base = approvalCard([s4, s7], [earlier]);
+    assert.isNull(approvalProblem(base, s7));
+    for (const target of [s4, s7]) {
+      assert.include(
+        approvalProblem({ ...base, asks: [earlier, later] }, target)!,
+        "the latest decision, q6",
+      );
+      const approved = { ...later, answer: { ...later.answer, optionIds: ["o2"] } };
+      assert.isNull(approvalProblem({ ...base, asks: [earlier, approved] }, target));
+    }
+  },
 );
 
 const mergeSubtask: KanbanSubtask = {
@@ -2661,3 +3607,31 @@ it.effect(
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
 );
+
+it("#1386 q4: a single Approve s1, s4 pick clears stored secret and deploy gates", () => {
+  const secret: KanbanSubtask = {
+    ...goChoiceSubtask,
+    id: "s1",
+    text: "Share the approved secret",
+    gate: "secret",
+  };
+  const deploy: KanbanSubtask = {
+    ...goChoiceSubtask,
+    id: "s4",
+    text: "Deploy the reviewed change",
+    gate: "deploy",
+  };
+  const fixture = goChoiceCard(["Approve s1, s4", "Leave open"]);
+  const card = {
+    ...fixture,
+    number: 1386,
+    subtasks: [secret, deploy],
+    asks: fixture.asks.map((ask) => ({
+      ...ask,
+      id: "q4",
+      text: "Approve the completed steps and close the card?",
+    })),
+  };
+  assert.isNull(approvalProblem(card, secret));
+  assert.isNull(approvalProblem(card, deploy));
+});
