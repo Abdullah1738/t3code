@@ -1294,7 +1294,7 @@ const makeWriterSetup = () => {
   let canRecover = true;
   const quote = (name: string) => `"${name.replaceAll('"', '""')}"`;
   const pragma = (entry: WriterPragma): WriterSetupStatement => ({
-    sql: `PRAGMA ${quote(entry.schema)}.${quote(entry.name)} = ${typeof entry.value === "string" ? `'${entry.value.replaceAll("'", "''")}'` : String(entry.value)}`,
+    sql: `PRAGMA ${entry.schema === "" ? "" : `${quote(entry.schema)}.`}${quote(entry.name)} = ${typeof entry.value === "string" ? `'${entry.value.replaceAll("'", "''")}'` : String(entry.value)}`,
     params: [],
   });
   const afterSchema = (entry: WriterPragma) =>
@@ -1372,7 +1372,7 @@ const setupPragmas = new Set(["busy_timeout", "foreign_keys", "defer_foreign_key
   "wal_autocheckpoint", "query_only", "recursive_triggers", "trusted_schema", "locking_mode",
   "ignore_check_constraints", "automatic_index", "reverse_unordered_selects", "read_uncommitted",
   "count_changes", "short_column_names", "full_column_names", "cell_size_check", "legacy_alter_table",
-  "cache_spill", "secure_delete", "analysis_limit", "threads", "max_page_count", "journal_mode"]);
+  "cache_spill", "secure_delete", "analysis_limit", "threads", "max_page_count", "journal_mode", "encoding", "page_size", "auto_vacuum"]);
 const setupActions = [constants.SQLITE_CREATE_TEMP_TABLE, constants.SQLITE_CREATE_TEMP_INDEX,
   constants.SQLITE_CREATE_TEMP_TRIGGER, constants.SQLITE_CREATE_TEMP_VIEW,
   constants.SQLITE_DROP_TEMP_TABLE, constants.SQLITE_DROP_TEMP_INDEX,
@@ -1438,7 +1438,7 @@ try {
 const quoteIdentifier = name => '"' + name.replaceAll('"', '""') + '"';
 const databases = () => db.prepare("PRAGMA database_list").all();
 const connectionSettings = () => {
-  const settings = [];
+  const settings = [{ schema: "", name: "locking_mode", value: db.prepare("PRAGMA locking_mode").get().locking_mode }];
   const names = new Set(["main", ...databases().map(entry => entry.name)]);
   for (const schema of names) for (const name of setupPragmas) {
     // The checkpoint controller owns this hook and restores SQLite's default on failure.
@@ -2044,12 +2044,15 @@ const makeWriterSession = Effect.fnUntraced(function* (
         try {
           const message = {
             ...input,
-            // node:sqlite accepts callable named-binding objects; structured clone does not.
+            // Structured clone drops named fields from built-in objects and rejects functions.
             ...(input.params === undefined
               ? {}
               : {
                   params: input.params.map((value) =>
-                    typeof value === "function" ? Object.fromEntries(Object.entries(value)) : value,
+                    typeof value === "function" ||
+                    (typeof value === "object" && value !== null && !ArrayBuffer.isView(value))
+                      ? Object.fromEntries(Object.entries(value))
+                      : value,
                   ),
                 }),
             id,

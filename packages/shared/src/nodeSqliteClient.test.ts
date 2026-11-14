@@ -4135,6 +4135,93 @@ it.effect.each([-1, 0, 1048576, 9007199254740993n])(
     ),
 );
 
+it.effect.each([
+  { name: "plain object", make: () => ({}) },
+  { name: "null prototype", make: () => Object.create(null) as object },
+  { name: "Date", make: () => new Date(0) },
+  { name: "Map", make: () => new Map() },
+  { name: "Set", make: () => new Set() },
+  { name: "WeakMap", make: () => new WeakMap() },
+  { name: "WeakSet", make: () => new WeakSet() },
+  { name: "RegExp", make: () => /fixture/ },
+  { name: "boxed number", make: () => Object(1) as object },
+  { name: "class instance", make: () => new (class Binding {})() },
+  { name: "callable", make: () => () => undefined },
+])("preserves native named bindings on $name", ({ make }) =>
+  withFileClient(
+    (sql) =>
+      Effect.gen(function* () {
+        const bindings = Object.assign(make(), { $value: 42, $text: "fixture" });
+        const native = yield* openDatabase(":memory:");
+        const statement = "SELECT $value AS value, $text AS text";
+        const expected = native.prepare(statement).all(bindings);
+        assert.deepEqual(yield* sql.unsafe(statement, [bindings]), expected);
+        assert.deepEqual(yield* sql.unsafe(statement, [bindings]).unprepared, expected);
+        assert.deepEqual(yield* sql.unsafe(statement, [bindings]).values, [[42, "fixture"]]);
+      }),
+    { readerWorker: false },
+  ),
+);
+
+it.effect.each([
+  { pragma: "encoding", value: "UTF-8" },
+  { pragma: "encoding", value: "UTF-16le" },
+  { pragma: "encoding", value: "UTF-16be" },
+  { pragma: "page_size", value: "512" },
+  { pragma: "page_size", value: "8192" },
+  { pragma: "page_size", value: "65536" },
+  { pragma: "auto_vacuum", value: "NONE" },
+  { pragma: "auto_vacuum", value: "FULL" },
+  { pragma: "auto_vacuum", value: "INCREMENTAL" },
+])("restores pending $pragma=$value before file initialization", ({ pragma, value }) =>
+  withFileClient(
+    (sql, filename) =>
+      Effect.gen(function* () {
+        yield* sql.unsafe(`PRAGMA ${pragma}='${value}'`);
+        const before = yield* sql.unsafe(`PRAGMA ${pragma}`).values;
+        yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+        assert.deepEqual(yield* sql.unsafe(`PRAGMA ${pragma}`).values, before);
+        yield* sql`CREATE TABLE pending_entries(value INTEGER)`;
+        yield* sql`INSERT INTO pending_entries VALUES (1)`;
+        const native = yield* openDatabase(filename);
+        assert.deepEqual(
+          native
+            .prepare(`PRAGMA ${pragma}`)
+            .all()
+            .map((row) => Object.values(row)),
+          before,
+        );
+      }),
+    { readerWorker: false },
+  ),
+);
+
+it.effect.each([
+  { global: "EXCLUSIVE", main: "NORMAL" },
+  { global: "NORMAL", main: "EXCLUSIVE" },
+  { global: "EXCLUSIVE", main: "EXCLUSIVE" },
+  { global: "NORMAL", main: "NORMAL" },
+])("restores default locking mode $global separately from main $main", ({ global, main }) =>
+  withFileClient(
+    (sql, filename) =>
+      Effect.gen(function* () {
+        yield* sql.unsafe(`PRAGMA locking_mode=${global}`);
+        yield* sql.unsafe(`PRAGMA main.locking_mode=${main}`);
+        const before = yield* sql`PRAGMA locking_mode`.values;
+        const mainBefore = yield* sql`PRAGMA main.locking_mode`.values;
+        yield* sql`ATTACH DATABASE ${`${filename}.first`} AS first`;
+        const firstBefore = yield* sql`PRAGMA first.locking_mode`.values;
+        yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+        assert.deepEqual(yield* sql`PRAGMA locking_mode`.values, before);
+        assert.deepEqual(yield* sql`PRAGMA main.locking_mode`.values, mainBefore);
+        assert.deepEqual(yield* sql`PRAGMA first.locking_mode`.values, firstBefore);
+        yield* sql`ATTACH DATABASE ${`${filename}.second`} AS second`;
+        assert.deepEqual(yield* sql`PRAGMA second.locking_mode`.values, before);
+      }),
+    { readerWorker: false },
+  ),
+);
+
 it.effect.each([false, true])(
   "checks the acknowledged identity of a computed attachment during recovery (bound=%s)",
   (bound) =>
