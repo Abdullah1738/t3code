@@ -224,7 +224,7 @@ class BaseRouting(unittest.TestCase):
             self.assertEqual(cli.main(['run', '--base', 'warm', '--fresh', '--', 'true']), 17)
         local.assert_called_once()
 
-    def test_home_outage_is_checked_before_entering_a_full_pool(self):
+    def full_home_pool(self):
         self.add('server', 'warm')
         common.select_backend('server')
         con = self.cons['server']
@@ -233,6 +233,9 @@ class BaseRouting(unittest.TestCase):
         con.execute("INSERT INTO pool_members VALUES ('busy','torssh')")
         con.execute("INSERT INTO runs(run_id,box_id,status,mode) VALUES ('busy-run','busy','running','fg')")
         con.commit()
+
+    def test_home_outage_is_checked_before_entering_a_full_pool(self):
+        self.full_home_pool()
         for state, health, auth in (('home_down', 'server says it cannot take runs', None),
                                     ('home_up', 'server says it cannot take runs', None),
                                     ('home_up', None, 'authenticated API did not answer')):
@@ -267,6 +270,101 @@ class BaseRouting(unittest.TestCase):
                     acquire.assert_not_called()
                     local.assert_not_called()
                     execute.assert_not_called()
+
+    def test_healthy_preflight_then_outage_interrupts_named_base_queue_waits(self):
+        self.full_home_pool()
+        for contention in ('full_pool', 'pool_lock'):
+            for failure in ('health', 'authenticated_api'):
+                for flags in ([], ['--bg']):
+                    with self.subTest(contention=contention, failure=failure, flags=flags):
+                        clock = [1000.0]
+                        def advance(seconds):
+                            clock[0] += seconds
+                        fake_time = types.SimpleNamespace(monotonic=lambda: clock[0], sleep=advance)
+                        real_lock = common.file_lock
+                        @contextlib.contextmanager
+                        def pool_lock(name, timeout=600):
+                            if contention == 'pool_lock' and name == pool.lock_name('torssh'):
+                                advance(timeout)
+                                raise common.OffboxError('timed out waiting for lock ' + name)
+                            with real_lock(name, timeout=timeout):
+                                yield
+                        def health():
+                            # A slow health request must not hold the shared pool lock.
+                            with real_lock(pool.lock_name('torssh'), timeout=0):
+                                pass
+                            return 'server says it cannot take runs' if failure == 'health' and clock[0] > 1000 else None
+                        def auth(*args):
+                            return 'authenticated API did not answer' if failure == 'authenticated_api' and clock[0] > 1000 else None
+                        with patch.object(home, 'probe', side_effect=health) as health_probe, \
+                                patch.object(api, 'probe_backend', side_effect=auth), \
+                                patch.object(api, 'probe', return_value='no answer'), \
+                                patch.object(outage, 'window_seconds', return_value=60), \
+                                patch.object(cli, 'time', fake_time), patch.object(outage, 'time', fake_time), \
+                                patch.object(pool, 'time', fake_time), patch.object(allocation, 'time', fake_time), \
+                                patch.dict(os.environ, OFFBOX_POOL_SIZE='1', OFFBOX_POOL_WAIT_SECONDS='120'), \
+                                patch.object(pool, 'file_lock', pool_lock), \
+                                patch.object(pool, '_refresh_background'), patch.object(pool, '_recheck_prune_holds'), \
+                                patch.object(pool, 'acquire', side_effect=self.real_acquire), \
+                                patch.object(cli, '_remote_once', side_effect=lambda a, me: pool.acquire(me, base=a.base)) as remote, \
+                                patch.object(fallback, 'run_local') as local, patch.object(os, 'execve') as execute, \
+                                contextlib.redirect_stderr(io.StringIO()) as err:
+                            code = cli.main(['run', '--base', 'warm', *flags, '--', 'true'])
+                        self.assertEqual(code, 93, err.getvalue())
+                        self.assertIn("saved base 'torssh:warm'", err.getvalue())
+                        self.assertLessEqual(clock[0] - 1000, 60 + pool.LOCK_WAIT_S)
+                        self.assertGreaterEqual(health_probe.call_count, 2)
+                        remote.assert_called_once()
+                        local.assert_not_called()
+                        execute.assert_not_called()
+                        for table in ('pool_waiters', 'pool_pending', 'pool_cap_callers'):
+                            self.assertEqual(self.cons['server'].execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0], 0)
+                        self.assertEqual(self.cons['server'].execute("SELECT status FROM runs WHERE run_id='busy-run'").fetchone()[0], 'running')
+
+    def test_healthy_named_base_keeps_its_queue_place_until_a_slot_frees(self):
+        self.full_home_pool()
+        con = self.cons['server']
+        con.execute('UPDATE bases SET is_default=1')
+        con.commit()
+        for explicit in (True, False):
+            with self.subTest(explicit=explicit):
+                con.execute("INSERT OR REPLACE INTO runs(run_id,box_id,status,mode) VALUES ('busy-run','busy','running','fg')")
+                con.commit()
+                clock = [1000.0]
+                seen_waiters = []
+                def advance(seconds):
+                    clock[0] += seconds
+                    if clock[0] >= 1018:
+                        con.execute("DELETE FROM runs WHERE run_id='busy-run'")
+                        con.commit()
+                def health():
+                    seen_waiters.append(tuple(row[0] for row in con.execute('SELECT token FROM pool_waiters')))
+                    return None
+                fake_time = types.SimpleNamespace(monotonic=lambda: clock[0], sleep=advance)
+                got = []
+                def remote(a, me):
+                    row = pool.acquire(me, base=a.base)
+                    got.append(row['box_id'])
+                    pool.release_guard(row)
+                    return 7
+                with patch.object(home, 'probe', side_effect=health), \
+                        patch.object(cli, 'time', fake_time), patch.object(pool, 'time', fake_time), \
+                        patch.object(allocation, 'time', fake_time), \
+                        patch.dict(os.environ, OFFBOX_POOL_SIZE='1', OFFBOX_POOL_WAIT_SECONDS='120'), \
+                        patch.object(pool, '_refresh_background'), patch.object(pool, '_recheck_prune_holds'), \
+                        patch.object(lease, '_reuse', side_effect=lambda c, r, s, **kw: dict(r)), \
+                        patch.object(pool, 'acquire', side_effect=self.real_acquire), \
+                        patch.object(cli, '_remote_once', side_effect=remote), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    args = ['--base', 'warm'] if explicit else []
+                    self.assertEqual(cli.main(['run', *args, '--', 'true']), 7)
+                self.assertEqual(got, ['busy'])
+                self.assertEqual(seen_waiters[0], ())
+                if explicit:
+                    self.assertGreaterEqual(len(seen_waiters), 2)
+                    self.assertEqual(len({token for sample in seen_waiters[1:] for token in sample}), 1)
+                else:
+                    self.assertEqual(len(seen_waiters), 1, 'implicit defaults retain preflight-only probing')
 
     def test_fresh_ignores_named_base_during_failover(self):
         self.add('server', 'warm')

@@ -124,10 +124,7 @@ def recent_failure() -> bool:
     return False
 
 
-def before_run(argv: list[str], *, explicit_base: str | None = None) -> None:
-    wait_for_base = active() and common.person() is None and base_needs_home(explicit_base)
-    if not may_fail_over(explicit_base) and not wait_for_base:
-        return
+def preflight_reason() -> str | None:
     from . import api
     recent = recent_failure()
     why = None if recent else probe()
@@ -137,6 +134,14 @@ def before_run(argv: list[str], *, explicit_base: str | None = None) -> None:
         why = api.probe_backend("server", PROBE_TIMEOUT_S)
         if why and health_ok:
             why = api.probe_backend("server", PROBE_TIMEOUT_S)
+    return why
+
+
+def before_run(argv: list[str], *, explicit_base: str | None = None) -> None:
+    wait_for_base = active() and common.person() is None and base_needs_home(explicit_base)
+    if not may_fail_over(explicit_base) and not wait_for_base:
+        return
+    why = preflight_reason()
     if why:
         if wait_for_base:
             raise OffboxError(f"home offbox server not reachable ({why})", outage=True)

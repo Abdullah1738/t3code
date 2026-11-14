@@ -229,13 +229,15 @@ def lock_name(key: str) -> str:
 
 @contextlib.contextmanager
 def _pool_lock(key: str, deadline: float, wait: int, *, prepare_end: float | None = None,
-               box_id: str = "repository pool"):
+               box_id: str = "repository pool", check_home=None):
     """Queue expiry means busy; a selected box's readiness deadline also bounds its claim."""
     continuation = prepare.guard(box_id, prepare_end) if prepare_end is not None else contextlib.nullcontext()
     with continuation:
         acquired = False
         try:
             while not acquired:
+                if check_home is not None:
+                    check_home()
                 started = time.monotonic()
                 timeout = min(LOCK_WAIT_S, max(0, deadline - started))
                 lk = file_lock(lock_name(key), timeout=timeout)
@@ -531,7 +533,7 @@ def _reuse_prepared(con, row, *args, **kwargs):
 
 
 def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=None):
-    from . import allocation, api, lease, outage
+    from . import allocation, api, home, lease, outage
     from .identity import require_proven
     # A pooled box is mapped to the caller's owner string. An unproven caller's string is shared, so it can't take one.
     require_proven(me, "run")
@@ -545,6 +547,20 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
     poll.call(lambda: capacity.schema(con))
     poll.call(lambda: allocation.recover_resumes(con, key))
     started = deadline - wait
+    protected_base = bool(base and not fresh and home.active() and home.base_needs_home(source[5:]))
+    next_home_probe = time.monotonic() + outage.PROBE_EVERY_S
+
+    def check_home():
+        nonlocal next_home_probe
+        if not protected_base or time.monotonic() < next_home_probe:
+            return
+        # Foreground pool holders never reach _refresh_background's API checks. Probe without a pool lock.
+        why = home.preflight_reason()
+        next_home_probe = time.monotonic() + outage.PROBE_EVERY_S
+        if why:
+            raise OffboxError(f"home offbox server not reachable ({why})", outage=True, run_id=run_id)
+
+    lock_options = {'check_home': check_home} if protected_base else {}
     said, last_error = False, None
     next_refresh = 0
     next_progress = 0
@@ -597,7 +613,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
             acquired = False
             try:
                 bid = pending["box_id"]
-                with _pool_lock(key, deadline, wait):
+                with _pool_lock(key, deadline, wait, **lock_options):
                     con.execute("UPDATE pool_waiters SET reserved=0 WHERE token=?", (waiter,))
                     con.commit()
                     alternatives = candidates(con, key, size, source, me)[0] if not _matches(pending, source) else []
@@ -704,7 +720,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                 try:
                     row = guard = token = None
                     wait_own = False
-                    with _pool_lock(key, deadline, wait):
+                    with _pool_lock(key, deadline, wait, **lock_options):
                         con.execute("UPDATE pool_waiters SET reserved=0 WHERE token=?", (waiter,))
                         con.commit()
                         rows, can_create = candidates(con, key, size, source, me)
@@ -972,7 +988,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                     try:
                         # The member row and the slot's removal happen in one step under the pool lock, so a
                         # selection never sees the box as neither a member nor a pending slot.
-                        with _pool_lock(key, deadline, wait, prepare_end=got['_prepare_end'], box_id=got['box_id']):
+                        with _pool_lock(key, deadline, wait, prepare_end=got['_prepare_end'], box_id=got['box_id'], **lock_options):
                             _claim(con, me, got, run_id, pending_token=token)
                             token = None
                     except BaseException:
@@ -996,6 +1012,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
         t = time.monotonic()
         if last_error and not isinstance(last_error, (api.SupplyOut, api.BoatAtCapacity)):
             raise last_error
+        check_home()
         if t >= deadline:
             if last_error:
                 raise last_error
