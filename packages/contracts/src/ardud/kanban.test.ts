@@ -23,6 +23,7 @@ import {
   kanbanSchedule,
   kanbanScriptStep,
   kanbanWaitsOnEvaluator,
+  kanbanWorkStep,
   KANBAN_AGING_STEP_MS,
   KANBAN_RETRY_BACKOFF_MS,
   KanbanBoardIconImage,
@@ -1144,38 +1145,27 @@ describe("worker dispatch uses the current step", () => {
   });
 });
 
-it("pending findings survive note consumption but never bypass evaluator or script steps", () => {
-  expect(
-    kanbanWaitsOnEvaluator({
-      stage: "todo",
-      wakeNote: null,
-      reviewFindingsPending: true,
-      subtasks: [scriptSubtask("s2", 2, "Review", "review")],
-    }),
-  ).toBe(false);
-  expect(
-    kanbanWaitsOnEvaluator({
-      stage: "todo",
-      wakeNote: null,
-      reviewFindingsPending: true,
-      subtasks: [
-        scriptSubtask("s3", 3, "Hold", "evaluator"),
-        scriptSubtask("s4", 4, "Review", "review"),
-      ],
-    }),
-  ).toBe(true);
-  expect(
-    kanbanWaitsOnEvaluator({
-      stage: "todo",
-      wakeNote: null,
-      reviewFindingsPending: true,
-      subtasks: [
-        scriptSubtask("s3", 3, "Hold", "script"),
-        scriptSubtask("s4", 4, "Review", "review"),
-      ],
-    }),
-  ).toBe(true);
-});
+it.each([["evaluator"], ["evaluator", "script"], ["script"], ["review"]] as const)(
+  "pending findings are worker work on a %j step",
+  (...owners) => {
+    for (const reviewFindingsPending of [false, true]) {
+      for (const wakeNote of [null, "Review findings (round 1): old words"]) {
+        const input = {
+          stage: "todo" as const,
+          wakeNote,
+          reviewFindingsPending,
+          subtasks: [
+            { ...scriptSubtask("s1", 1, "Build", "work"), state: "done" as const },
+            ...owners.map((owner, index) => scriptSubtask(`s${index + 2}`, 2, "Hold", owner)),
+            scriptSubtask("s4", 3, "Review", "review"),
+          ],
+        };
+        expect(kanbanWorkStep(input)).toBe(reviewFindingsPending);
+        expect(kanbanWaitsOnEvaluator(input)).toBe(!reviewFindingsPending);
+      }
+    }
+  },
+);
 
 it.each([false, true])(
   "an explicit pending-findings verdict %s overrides a legacy header",

@@ -169,6 +169,19 @@ describe("cardTruth: To-Do", () => {
     });
   });
 
+  it.each(["evaluator", "script"] as const)(
+    "pending findings on a %s step wait for the worker",
+    (owner) => {
+      const target = card(1, {
+        stage: "todo",
+        subtasks: [subtask(owner, "Check the build")],
+        reviewFindingsPending: true,
+      });
+      expect(truth(target)).toMatchObject({ state: "ready", label: "Ready" });
+      expect(truth({ ...target, reviewFindingsPending: false }).state).toBe("evaluator");
+    },
+  );
+
   it("names every unfinished blocker, lowest first, and skips finished ones", () => {
     const blocked = card(1, {
       stage: "todo",

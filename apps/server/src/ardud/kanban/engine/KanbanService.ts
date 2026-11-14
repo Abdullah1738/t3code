@@ -1024,6 +1024,7 @@ const STEP_WAIT_P1_MS = 15 * 60_000;
 const STEP_WAIT_MS = 60 * 60_000;
 const waitingOnEvaluatorStep = (card: KanbanCard) =>
   card.stage === "todo" &&
+  !kanbanWorkStep(card) &&
   card.priority !== KANBAN_BACKLOG &&
   card.settledAt === null &&
   card.activeThreadId === null &&
@@ -3281,6 +3282,7 @@ const make = Effect.gen(function* () {
         ),
       ),
       stage: to,
+      ...(to === "needs_review" ? { reviewFindingsPending: false } : {}),
       movedAt: at,
       updatedAt: at,
       question: to === "needs_owner" ? (asked ?? card.question) : null,
@@ -5264,6 +5266,7 @@ const make = Effect.gen(function* () {
   // in_review with no thread: its review passed and it waits for its PRs.
   const stepTurn = (card: KanbanCard) =>
     !kanbanWaiting(card) &&
+    !kanbanWorkStep(card) &&
     kanbanEvaluatorStep(card) &&
     card.activeThreadId === null &&
     card.settledAt === null &&
