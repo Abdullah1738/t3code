@@ -6,12 +6,15 @@ import json
 import math
 import os
 import re
+import sys
+import statistics
 from pathlib import Path
 import time
 import uuid
 from collections import Counter, defaultdict
 
 CAP_BYTES = 50 * 1024 * 1024
+EXPECTED_PATH = Path(__file__).with_name('toollog_expected.json')
 COMPONENTS = {'food', 'hlog', 'validate', 'whoop', 'cards', 'took', 'whoop-sync',
               'meds-nag', 'nutrition-checkin', 'nutrition-nudge', 'forge-workouts', 'gym-nudge', 'rollup'}
 COMMANDS = {
@@ -52,8 +55,14 @@ def utcnow():
 
 
 def log_dir():
-    # Override is for isolated tests; callers never pass payload-derived paths.
-    return Path(os.environ.get('HEALTH_TOOLLOG_DIR') or Path.home() / '.robob/logs/tools/health')
+    # Keep the established override; test markers must never select the live fallback.
+    override = os.environ.get('HEALTH_TOOLLOG_DIR')
+    if override:
+        return Path(override)
+    if ('HEALTH_VAULT_TEST_COPY' in os.environ or 'PYTEST_CURRENT_TEST' in os.environ
+            or 'unittest' in sys.modules):
+        return None
+    return Path.home() / '.robob/logs/tools/health'
 
 
 def error_tag(exc, renderer=False):
@@ -153,6 +162,8 @@ def emit(component, name, kind='event', duration_ms=None, ok=None, props=None, t
             return
         now = utcnow()
         root = log_dir()
+        if root is None:
+            return
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         root.chmod(0o700)
         path = root / (now.date().isoformat() + '.ndjson')
@@ -263,17 +274,59 @@ def _percentile(values, fraction):
     return values[max(0, math.ceil(len(values) * fraction) - 1)]
 
 
+def _expected_intervals():
+    try:
+        expected = json.loads(EXPECTED_PATH.read_text()).get('expected', {})
+        return {k: v for k, v in expected.items() if k in COMPONENTS
+                and type(v) in (int, float) and 0 < v <= 10**9 and math.isfinite(v)
+                and math.isfinite(86400 / v)}
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+        return {}
+
+
+def _run_summary(timestamps, start, end, interval=None):
+    timestamps = sorted(timestamps)
+    # Day boundaries measure outages, but must not skew the observed cadence.
+    observed = [(b - a).total_seconds() for a, b in zip(timestamps, timestamps[1:]) if b > a]
+    median = statistics.median(observed) if observed else None
+    points = [start] + timestamps + [end]
+    gaps = [(a, (b - a).total_seconds()) for a, b in zip(points, points[1:])]
+    result = {'runs': len(timestamps),
+              'firstRunTs': timestamps[0].isoformat().replace('+00:00', 'Z') if timestamps else None,
+              'lastRunTs': timestamps[-1].isoformat().replace('+00:00', 'Z') if timestamps else None,
+              'medianGapSeconds': median, 'maxGapSeconds': max(seconds for _, seconds in gaps),
+              'gapsOver': [{'startTs': stamp.isoformat().replace('+00:00', 'Z'), 'seconds': seconds}
+                           for stamp, seconds in sorted(gaps, key=lambda gap: -gap[1])
+                           if median is not None and seconds > 3 * median][:10]}
+    if interval is not None:
+        # The config has no phase/history: these are elapsed-day count estimates.
+        result['expectedRuns'] = math.floor((end - start).total_seconds() / interval)
+        result['missedRuns'] = max(0, result['expectedRuns'] - len(timestamps))
+    return result
+
+
 def rollup(day=None):
     try:
-        day = dt.date.fromisoformat(day) if day else utcnow().date() - dt.timedelta(days=1)
+        now = utcnow()
+        day = dt.date.fromisoformat(day) if day else now.date() - dt.timedelta(days=1)
+        start = dt.datetime.combine(day, dt.time(), tzinfo=dt.timezone.utc)
+        day_end = start + dt.timedelta(days=1)
+        end = max(start, min(now, day_end))
+        intervals, run_times = _expected_intervals(), defaultdict(list)
         root = log_dir()
+        if root is None:
+            return
         source = root / (day.isoformat() + '.ndjson')
         names, kinds, outcomes, tags = Counter(), Counter(), Counter(), Counter()
         durations, samples = defaultdict(list), {}
         malformed = 0
         zero_sleep, last_scored = 0, None
         food_errors, delivered, expected = Counter(), {}, set()
-        with source.open() as fh:
+        try:
+            source_file = source.open()
+        except FileNotFoundError:
+            source_file = contextlib.nullcontext(())
+        with source_file as fh:
             for line in fh:
                 try:
                     r = json.loads(line)
@@ -284,6 +337,13 @@ def rollup(day=None):
                     if type(r.get('ok')) is bool:
                         outcomes['ok' if r['ok'] else 'error'] += 1
                     props = _props(r['name'], r.get('props') or {})
+                    component = r.get('component')
+                    if r['name'] in ('watcher.run', 'sync.run') and component in COMPONENTS:
+                        stamp = iso_stamp(r.get('ts'))
+                        if stamp:
+                            timestamp = dt.datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+                            if start <= timestamp < day_end and timestamp <= end:
+                                run_times[component].append(timestamp)
                     origin = r.get('ids', {}).get('run')
                     if r['name'] == 'sync.run':
                         saved = props.get('lastScoredSleep')
@@ -325,6 +385,8 @@ def rollup(day=None):
                   'errorRate': outcomes['error'] / rated if rated else None,
                   'errorKindRate': kinds['error'] / total if total else None,
                   'durationMs': {}, 'topErrors': [],
+                  'components': {component: _run_summary(run_times[component], start, end, intervals.get(component))
+                                 for component in sorted(set(run_times) | set(intervals))},
                   'whoop': {'lastScoredSleep': last_scored, 'zeroSleepRuns': zero_sleep},
                   'food': {'errorsBySubcommand': dict(food_errors)},
                   'delivery': {'sent': sum(v is True for v in delivered.values()),
@@ -334,6 +396,7 @@ def rollup(day=None):
             values.sort()
             result['durationMs'][name] = {'p50': _percentile(values, .5), 'p95': _percentile(values, .95), 'max': values[-1]}
         result['topErrors'] = [{'tag': tag, 'count': count, 'sampleId': samples.get(tag)} for tag, count in tags.most_common(20)]
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
         root.chmod(0o700)
         target = root / ('rollup-' + day.isoformat() + '.json')
         temp = root / ('.rollup-' + uuid.uuid4().hex)
@@ -351,7 +414,10 @@ def rollup_previous():
     try:
         now = utcnow()
         day = now.date() - dt.timedelta(days=1)
-        if (now.hour, now.minute) >= (0, 5) and not (log_dir() / ('rollup-' + day.isoformat() + '.json')).exists():
+        root = log_dir()
+        if root is None:
+            return
+        if (now.hour, now.minute) >= (0, 5) and not (root / ('rollup-' + day.isoformat() + '.json')).exists():
             rollup(day.isoformat())
     except BaseException:
         pass
