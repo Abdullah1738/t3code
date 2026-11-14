@@ -1,4 +1,5 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { appendFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -68,6 +69,7 @@ test("tick invalidates a cached receipt-day rollup when a later day changes, inc
     tool: "imessage", component: "fixture", kind: "event", name, ts, ok: true, ids: { chat: "moni", inboundId: "cache-fixture" },
   }) + "\n");
   append("turn.start", "2026-11-14T00:00:01Z");
+  time += 3_600_000;
   await log.tick();
   expect(JSON.parse(readFileSync(path, "utf8")).chains.moni.turnStarted).toBe(1);
   append("reply.sent", "2026-11-14T00:00:02Z");
@@ -78,6 +80,63 @@ test("tick invalidates a cached receipt-day rollup when a later day changes, inc
   expect(after.total).toBe(1);
   expect(after.chains.moni).toEqual({ received: 1, turnStarted: 1, replySent: 1, completed: 1,
     receivedToStartMs: { p50: 2000, p95: 2000, max: 2000 }, receivedToReplyMs: { p50: 3000, p95: 3000, max: 3000 } });
+});
+
+test("unrelated appends do not rescan history on each tick, while matching late chains refresh immediately", async () => {
+  let time = Date.parse("2026-11-13T23:59:59Z");
+  const root = mkdtempSync(join(tmpdir(), "toollog-chains-bounded-"));
+  const log = createToolLog({ root, now: () => time }); fixtures.push({ root, logs: [log] });
+  log.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: "owner", messageId: "bounded-fixture" } });
+  await log.rollup("2026-11-13");
+  time = Date.parse("2026-11-14T00:05:00Z");
+  log.write({ component: "process", kind: "event", name: "bridge.start" });
+  await log.tick();
+  const path = join(root, "rollup-2026-11-13.json");
+  const before = readFileSync(path, "utf8");
+  const original = fs.createReadStream;
+  const streams = spyOn(fs, "createReadStream").mockImplementation((...args: Parameters<typeof original>) => original(...args));
+  try {
+    for (let i = 0; i < 20; i++) {
+      time += 1000;
+      log.write({ component: "process", kind: "event", name: "bridge.start" });
+      await log.tick();
+    }
+    expect(streams).not.toHaveBeenCalled();
+    expect(readFileSync(path, "utf8")).toBe(before);
+    log.write({ component: "router", kind: "event", name: "turn.start", ids: { chat: "owner", inboundId: "bounded-fixture" } });
+    log.write({ component: "delivery", kind: "perf", name: "reply.sent", ok: true, ids: { chat: "owner", inboundId: "bounded-fixture" } });
+    await log.settled();
+    expect(JSON.parse(readFileSync(path, "utf8")).chains.owner.completed).toBe(1);
+  } finally { streams.mockRestore(); }
+});
+
+test("an hourly sweep streams each retained day once across several stale caches and overlapping ticks", async () => {
+  let time = Date.parse("2026-11-11T12:00:00Z");
+  const root = mkdtempSync(join(tmpdir(), "toollog-chains-shared-scan-"));
+  const log = createToolLog({ root, now: () => time }); fixtures.push({ root, logs: [log] });
+  const days = ["2026-11-11", "2026-11-12", "2026-11-13"];
+  for (const day of days) {
+    time = Date.parse(`${day}T12:00:00Z`);
+    log.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: "moni", messageId: `fixture-${day}` } });
+    await log.rollup(day);
+  }
+  time = Date.parse("2026-11-14T00:05:00Z");
+  log.write({ component: "process", kind: "event", name: "bridge.start" });
+  await log.tick();
+  time += 3_600_000;
+  log.write({ component: "process", kind: "event", name: "bridge.start" });
+  const original = fs.createReadStream;
+  const opened: string[] = [];
+  const streams = spyOn(fs, "createReadStream").mockImplementation((...args: Parameters<typeof original>) => {
+    opened.push(String(args[0])); return original(...args);
+  });
+  try { await Promise.all([log.tick(), log.tick()]); } finally { streams.mockRestore(); }
+  expect(opened.sort()).toEqual([...days, "2026-11-14"].map(day => join(root, `${day}.ndjson`)).sort());
+  for (const day of days) {
+    const rollup = JSON.parse(readFileSync(join(root, `rollup-${day}.json`), "utf8"));
+    expect(rollup.total).toBe(1);
+    expect(rollup.chains.moni.received).toBe(1);
+  }
 });
 
 test("overlapping builds retain the last cross-day append and keep other chats independent", async () => {

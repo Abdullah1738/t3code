@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { cleanCalls, createCallAggregation, type CallSummary } from "./log-calls.ts";
 import { summarizeLog } from "./log-rollup.ts";
+import { createChainAggregation } from "./log-chains.ts";
 import { cleanSite, errorDetail, logSite, type ErrorDetail } from "./log-error.ts";
 
 export type LogLine = {
@@ -103,6 +104,8 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   let maintainedRoot = "";
   let rolling = false;
   let rolledHour = -1;
+  let rolledYesterday = "";
+  let recovery: Promise<void> | undefined;
   const calls = createCallAggregation(processRunId);
   function append(entry: Entry, stamp?: string): void {
     let fd: number | undefined;
@@ -164,10 +167,19 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       }
     } catch { /* Optional logging never affects the caller. */ }
   }
-  async function buildRollup(requestedDay?: string) {
+  async function saveRollup(dir: string, day: string, result: unknown): Promise<void> {
+    const path = join(dir, `rollup-${day}.json`);
+    const temporary = join(dir, `.rollup-${day}-${randomUUID()}.tmp`);
+    try {
+      await writeFile(temporary, JSON.stringify(result, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+      await rename(temporary, path);
+    } finally { await unlink(temporary).catch(() => {}); }
+  }
+  async function buildRollup(requestedDay?: string, precedingRecovery?: Promise<void>) {
     try {
       // Finish queued records before reading a day, without doing I/O in the caller's transaction.
       await Promise.resolve();
+      await precedingRecovery;
       const day = requestedDay ?? new Date(now() - 86400_000).toISOString().slice(0, 10);
       if (!DAY.test(day) || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day) return;
       const dir = root();
@@ -178,12 +190,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       const later = Object.fromEntries(Object.entries(sources).filter(([date]) => date > day));
       const result = { day, tool: "imessage", sourceBytes, chainSources: sources,
         ...await summarizeLog(records(dir, { [day]: sourceBytes }), records(dir, later)) };
-      const path = join(dir, `rollup-${day}.json`);
-      const temporary = join(dir, `.rollup-${day}-${randomUUID()}.tmp`);
-      try {
-        await writeFile(temporary, JSON.stringify(result, null, 2) + "\n", { mode: 0o600, flag: "wx" });
-        await rename(temporary, path);
-      } finally { await unlink(temporary).catch(() => {}); }
+      await saveRollup(dir, day, result);
       return result;
     } catch { return; }
   }
@@ -193,11 +200,12 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   function scheduleRollup(day: string): Promise<Rollup> {
     const existing = jobs.get(day);
     if (existing) { dirty.add(day); return existing; }
+    const precedingRecovery = recovery;
     const job = (async () => {
       let result: Rollup;
       do {
         dirty.delete(day);
-        result = await buildRollup(day);
+        result = await buildRollup(day, precedingRecovery);
       } while (dirty.has(day));
       jobs.delete(day);
       return result;
@@ -248,7 +256,9 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   }
   async function settled(): Promise<void> {
     await Promise.resolve();
-    while (jobs.size || refreshingChains) await Promise.all([...jobs.values(), ...(refreshingChains ? [refreshingChains] : [])]);
+    while (jobs.size || refreshingChains || recovery) await Promise.all([
+      ...jobs.values(), ...(refreshingChains ? [refreshingChains] : []), ...(recovery ? [recovery] : []),
+    ]);
   }
   async function rollup(requestedDay?: string) {
     try {
@@ -257,44 +267,77 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       return await scheduleRollup(day);
     } catch { return; }
   }
+  async function cachedRollup(dir: string, day: string) {
+    try { return JSON.parse(await readFile(join(dir, `rollup-${day}.json`), "utf8")) as NonNullable<Rollup>; }
+    catch { return; }
+  }
+  function validOwnDay(saved: Rollup, day: string, bytes: number): saved is NonNullable<Rollup> {
+    return Boolean(saved?.day === day && saved.tool === "imessage" && saved.sourceBytes === bytes
+      && Number.isSafeInteger(saved.total) && saved.total >= 0 && saved.byComponent && saved.chains && Array.isArray(saved.topErrorTags));
+  }
+  function recoverRollups(at: number, hourly: boolean, yesterday?: string): Promise<void> {
+    const precedingJobs = [...jobs.values()];
+    recovery = (async () => {
+      // Finish earlier per-day jobs; new targeted refreshes wait for this shared snapshot instead.
+      await Promise.all(precedingJobs);
+      const dir = root();
+      mkdirSync(dir, { recursive: true, mode: 0o700 }); chmodSync(dir, 0o700);
+      const sources = logSources(dir);
+      const days = new Set<string>(yesterday ? [yesterday] : []);
+      if (hourly) {
+        const today = new Date(at).toISOString().slice(0, 10);
+        const cutoff = new Date(at - 30 * 86400_000).toISOString().slice(0, 10);
+        if (today in sources) days.add(today);
+        for (const file of readdirSync(dir)) {
+          const day = /^rollup-(\d{4}-\d{2}-\d{2})\.json$/.exec(file)?.[1];
+          if (day && day >= cutoff && day < today && day in sources) days.add(day);
+        }
+      }
+      const stale = new Set<string>();
+      const cached = new Map<string, NonNullable<Rollup>>();
+      for (const day of days) {
+        const saved = await cachedRollup(dir, day);
+        if (validOwnDay(saved, day, sources[day] ?? 0)) {
+          if (JSON.stringify(saved.chainSources) === JSON.stringify(chainSources(sources, day))) continue;
+          cached.set(day, saved);
+        }
+        stale.add(day);
+      }
+      if (!stale.size) return;
+      const chains = createChainAggregation();
+      const summaries = new Map<string, Awaited<ReturnType<typeof summarizeLog>>>();
+      // Every file is streamed once for the entire sweep, including any daily counters needing a rebuild.
+      for (const day of new Set([...Object.keys(sources), ...stale])) {
+        async function* scan() {
+          for await (const line of records(dir, { [day]: sources[day] ?? 0 })) { chains.accept(line); yield line; }
+        }
+        if (stale.has(day) && !cached.has(day)) summaries.set(day, await summarizeLog(scan()));
+        else for await (const _line of scan()) { /* Only chain milestones are needed for unchanged daily totals. */ }
+      }
+      for (const day of stale) {
+        const base = cached.get(day) ?? summaries.get(day)!;
+        const result = { ...base, day, tool: "imessage", sourceBytes: sources[day] ?? 0,
+          chainSources: chainSources(sources, day), chains: chains.summary(day) };
+        await saveRollup(dir, day, result);
+      }
+    })().catch(() => {}).finally(() => { recovery = undefined; });
+    return recovery;
+  }
   async function tick(): Promise<void> {
     try {
       const at = now();
       if (rolling) { await settled(); return; }
+      const hour = Math.floor(at / 3_600_000);
+      const hourly = hour !== rolledHour;
+      const yesterday = new Date(at - 86400_000).toISOString().slice(0, 10);
+      const dueYesterday = at % 86400_000 >= 5 * 60_000 && rolledYesterday !== yesterday;
+      if (!hourly && !dueYesterday) return;
       rolling = true;
       try {
-        const hour = Math.floor(at / 3_600_000);
-        const hourly = hour !== rolledHour;
-        if (hourly) {
-          flushAll();
-          const today = new Date(at).toISOString().slice(0, 10);
-          if (existsSync(join(root(), `${today}.ndjson`))) await scheduleRollup(today);
-          rolledHour = hour;
-        }
-        const day = new Date(at - 86400_000).toISOString().slice(0, 10);
-        const checkDays = new Set<string>();
-        if (at % 86400_000 >= 5 * 60_000) checkDays.add(day);
-        if (hourly) {
-          // A writer may have exited after appending a late reply but before refreshing its old receipt day.
-          const dir = root();
-          const cutoff = new Date(at - 30 * 86400_000).toISOString().slice(0, 10);
-          if (existsSync(dir)) for (const file of readdirSync(dir)) {
-            const cachedDay = /^rollup-(\d{4}-\d{2}-\d{2})\.json$/.exec(file)?.[1];
-            if (cachedDay && cachedDay >= cutoff && cachedDay < new Date(at).toISOString().slice(0, 10)
-              && existsSync(join(dir, `${cachedDay}.ndjson`))) checkDays.add(cachedDay);
-          }
-        }
-        for (const checkDay of checkDays) {
-          let fresh = false;
-          try {
-            const saved = JSON.parse(await readFile(join(root(), `rollup-${checkDay}.json`), "utf8"));
-            const sources = chainSources(logSources(root()), checkDay);
-            fresh = saved?.day === checkDay && saved.tool === "imessage" && saved.sourceBytes === sources[checkDay]
-              && JSON.stringify(saved.chainSources) === JSON.stringify(sources)
-              && Number.isSafeInteger(saved.total) && saved.total >= 0 && saved.byComponent && saved.chains && Array.isArray(saved.topErrorTags);
-          } catch { /* Missing, stale or interrupted rollups are rebuilt. */ }
-          if (!fresh) await scheduleRollup(checkDay);
-        }
+        flushAll();
+        await recoverRollups(at, hourly, dueYesterday ? yesterday : undefined);
+        rolledHour = hour;
+        if (dueYesterday) rolledYesterday = yesterday;
         await settled();
       } finally { rolling = false; }
     } catch { /* Best effort. */ }
