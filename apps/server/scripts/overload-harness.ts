@@ -347,6 +347,7 @@ const threads = Layer.effect(
         }),
       withdraw: () => Effect.void,
       setModel: () => Effect.void,
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: (id) =>
         Effect.sync(() => {
