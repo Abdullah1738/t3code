@@ -1600,6 +1600,7 @@ test("control calls aggregate success timing and retain failed method/duration, 
   const failed = logs.filter(l => l.name === "turn.robob_call" && l.ok === false);
   expect(failed).toHaveLength(1);
   expect(failed[0]).toMatchObject({ props: { method: "POST", route: "/missing" } });
+  expect(failed[0]!.error?.tag).toBe("control.request_failed");
   expect(failed[0]!.durationMs).toBeGreaterThanOrEqual(0);
   for (const value of ["PRIVATE_", "test-token"]) expect(JSON.stringify(logs)).not.toContain(value);
 });
