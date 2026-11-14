@@ -2,6 +2,7 @@
 import multiprocessing
 from multiprocessing.connection import wait
 import datetime as dt
+import fcntl
 from decimal import Decimal, InvalidOperation
 import json
 import os
@@ -70,16 +71,35 @@ def read(app, deadline=None, since=None, cache_path=None):
     remaining = 10 if deadline is None else min(10, deadline - time.time() - 0.1)
     if remaining < 1:
         raise OutOfTime('order lookup out of time')
+    end = time.monotonic() + remaining
     python = Path(os.environ.get('MONEY_CASES_ORDER_PYTHON', '~/.local/share/uv/tools/mitmproxy/bin/python')).expanduser()
     root = Path(os.environ.get('MONEY_CASES_APP_API', '~/.local/share/app-api-cli')).expanduser()
     cache_path = Path(cache_path) if cache_path else Path(os.environ.get(
         'MONEY_CASES_DIR', '~/Documents/assistant/money-cases')).expanduser() / 'order-details.json'
-    cache = load_cache(cache_path) if app == 'noon' else []
+    lock_fd = None
     try:
+        if app == 'noon':
+            # The lock must precede the snapshot and span the subprocess: locking
+            # only the write lets a stale reader restore an evicted receipt.
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_fd = os.open(cache_path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR, 0o600)
+            while True:
+                left = end - time.monotonic()
+                if left < 1:
+                    raise OutOfTime('order lookup out of time')
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(min(0.05, left))
+        cache = load_cache(cache_path) if app == 'noon' else []
         # Readers log by default. Their diagnostics are disposable: only our sanitized
         # lane metrics leave this sandbox. They never write the live app state/logs.
         with tempfile.TemporaryDirectory(prefix='money-orders-') as scratch:
             env = {**os.environ, 'ROBOB_TOOL_LOG_DIR': scratch}
+            remaining = end - time.monotonic()
+            if remaining < 1:
+                raise OutOfTime('order lookup out of time')
             result = subprocess.run([str(python), '-I', '-B', str(Path(__file__).resolve()), app, str(root),
                                      str(time.time() + remaining - 0.5)],
                                     input=json.dumps({'since': since.isoformat() if since else None, 'cache': cache}),
@@ -118,10 +138,13 @@ def read(app, deadline=None, since=None, cache_path=None):
                 if invalidated:
                     raise  # A failed eviction must not be reported as a completed lookup.
         return result
-    except SourceLimit:
+    except (SourceLimit, OutOfTime):
         raise
     except (OSError, subprocess.TimeoutExpired, ValueError, TypeError) as e:
         raise ValueError('order lookup unavailable') from e
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
 
 
 def lane_process(connection, service, root, deadline, since, cache):

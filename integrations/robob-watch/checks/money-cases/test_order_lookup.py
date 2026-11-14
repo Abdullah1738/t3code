@@ -1,11 +1,14 @@
 """Window proofs, source limits and sanitized persistent detail caching."""
 import datetime as dt
+import fcntl
 import importlib.util
 import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -241,6 +244,139 @@ def details(oid, service, timeout):
             with self.assertRaisesRegex(ValueError, 'order lookup unavailable'):
                 lookup.read('noon', cache_path=self.cache)
 
+    def test_overlapping_cache_readers_cannot_restore_cancelled_receipt(self):
+        cached = {**row('N1'), 'service': 'marketplace', 'total': CHARGE['amount'],
+                  'currency': 'AED', 'whole_order_complete': True}
+        fresh = {**cached, 'total': '99.00', 'whole_order_complete': False}
+        self.cache.write_text(json.dumps([cached]))
+        a_loading, allow_a, a_done = threading.Event(), threading.Event(), threading.Event()
+        results, errors, snapshots, sizes = {}, [], [], [1]
+        original_load, original_flock = lookup.load_cache, fcntl.flock
+
+        def load(path):
+            name = threading.current_thread().name
+            if name == 'reader-a':
+                a_loading.set()
+                if not allow_a.wait(5):
+                    raise AssertionError('reader B did not reach the transaction')
+            value = original_load(path)
+            if name == 'reader-b':
+                snapshots.append(value)
+                # Before the fix, B can load before A evicts. With the lock,
+                # B instead releases A through the contention hook below.
+                allow_a.set()
+            return value
+
+        def flock(fd, operation):
+            try:
+                return original_flock(fd, operation)
+            except BlockingIOError:
+                if threading.current_thread().name == 'reader-b':
+                    allow_a.set()
+                raise
+
+        def reader_process(args, **kwargs):
+            if threading.current_thread().name == 'reader-a':
+                result = {'orders': [], 'complete': False,
+                          'invalidated': [{'service': 'marketplace', 'order': 'N1'}]}
+            else:
+                if not a_done.wait(5):
+                    raise AssertionError('cancellation eviction did not complete')
+                snapshot = json.loads(kwargs['input'])['cache']
+                result = {'orders': snapshot or [fresh], 'complete': False}
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(result), stderr='')
+
+        def run(name):
+            try:
+                results[name] = lookup.read('noon', cache_path=self.cache)
+                sizes.append(len(original_load(self.cache)))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                if name == 'reader-a':
+                    a_done.set()
+
+        a = threading.Thread(target=run, args=('reader-a',), name='reader-a')
+        b = threading.Thread(target=run, args=('reader-b',), name='reader-b')
+        with patch.object(lookup, 'load_cache', side_effect=load), \
+                patch.object(fcntl, 'flock', side_effect=flock), \
+                patch.object(lookup.subprocess, 'run', side_effect=reader_process):
+            try:
+                a.start()
+                self.assertTrue(a_loading.wait(5))
+                b.start()
+                a.join(5)
+                b.join(5)
+                self.assertFalse(a.is_alive() or b.is_alive())
+            finally:
+                allow_a.set()
+                a_done.set()
+                a.join(5)
+                if b.ident is not None:
+                    b.join(5)
+        self.assertEqual(errors, [])
+        first = {**row('N1'), 'item_id': 'N1-1', 'shipment_id': 'N1-S1', 'total': '99.00'}
+        self.fixture(marketplace={'1': [first], '2': [first]}, paging=['marketplace'],
+                     page_fail={'marketplace': [2]})
+        result = lookup.read('noon', cache_path=self.cache)
+        with self.assertRaises(charges.Lookup):
+            charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: result)
+        with self.assertRaises(charges.Lookup):
+            charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: results['reader-b'])
+        self.assertEqual(sizes, [1, 0, 0])
+        self.assertEqual(snapshots, [[]])
+        self.assertEqual(self.cache.with_suffix('.lock').read_bytes(), b'')
+
+    def test_cache_lock_contention_exhausts_budget_before_loading(self):
+        clock = [100.0]
+        def advance(seconds):
+            clock[0] += seconds
+        with self.cache.with_suffix('.lock').open('a') as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(lookup.time, 'time', return_value=100.0), \
+                    patch.object(lookup.time, 'monotonic', side_effect=lambda: clock[0]), \
+                    patch.object(lookup.time, 'sleep', side_effect=advance), \
+                    patch.object(lookup, 'load_cache') as load, \
+                    patch.object(lookup.subprocess, 'run') as process:
+                with self.assertRaises(ValueError):
+                    lookup.read('noon', deadline=102.1, cache_path=self.cache)
+                load.assert_not_called()
+                process.assert_not_called()
+        self.assertGreater(clock[0], 100)
+        self.assertLessEqual(clock[0], 102)
+        self.assertEqual(self.cache.with_suffix('.lock').read_bytes(), b'')
+
+    def test_cache_lock_wait_reduces_subprocess_timeout(self):
+        clock, attempts = [100.0], [0]
+        original_flock = fcntl.flock
+        def flock(fd, operation):
+            attempts[0] += 1
+            if attempts[0] == 1:
+                raise BlockingIOError('busy')
+            return original_flock(fd, operation)
+        def advance(_seconds):
+            clock[0] += 2.5
+        with patch.object(fcntl, 'flock', side_effect=flock), \
+                patch.object(lookup.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(lookup.time, 'sleep', side_effect=advance), \
+                patch.object(lookup.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=json.dumps({'orders': [], 'complete': False}), stderr='')) as process:
+            lookup.read('noon', cache_path=self.cache)
+        self.assertAlmostEqual(process.call_args.kwargs['timeout'], 7.5)
+        self.assertEqual(self.cache.with_suffix('.lock').read_bytes(), b'')
+
+    def test_cache_transaction_releases_lock_on_subprocess_and_validation_errors(self):
+        for outcome in (subprocess.TimeoutExpired('reader', 1),
+                        subprocess.CompletedProcess([], 0, stdout='invalid json', stderr=''),
+                        subprocess.CompletedProcess([], 0, stdout='{}', stderr='')):
+            with self.subTest(outcome=type(outcome).__name__):
+                options = {'side_effect': outcome} if isinstance(outcome, Exception) else {'return_value': outcome}
+                with patch.object(lookup.subprocess, 'run', **options), self.assertRaises(ValueError):
+                    lookup.read('noon', cache_path=self.cache)
+                with self.cache.with_suffix('.lock').open('a') as check:
+                    fcntl.flock(check, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertEqual(self.cache.with_suffix('.lock').read_bytes(), b'')
+
     def test_unverified_reader_retains_page_one_limit(self):
         self.fixture(food={'1': [row('A')], '2': [row('B', -60)]},
                      coverage_override={'food': {'paging_verified': True, 'default_page_only': True}})
@@ -407,8 +543,10 @@ def details(oid, service, timeout):
             with self.subTest(code=code):
                 (self.root / 'careem_http_orders.py').write_text(
                     "def orders():raise ValueError(" + repr(code) + ")\n")
-                with self.assertRaises(ValueError) as exc:
+                with patch.object(fcntl, 'flock') as lock, self.assertRaises(ValueError) as exc:
                     lookup.read('careem', cache_path=self.cache)
+                lock.assert_not_called()
+                self.assertFalse(self.cache.with_suffix('.lock').exists())
                 if code == lookup.BINDING_LIMIT:
                     self.assertIsInstance(exc.exception, lookup.SourceLimit)
                     self.assertEqual(exc.exception.code, code)
