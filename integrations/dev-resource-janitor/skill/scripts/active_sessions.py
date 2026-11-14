@@ -119,11 +119,15 @@ def _control_threads(query, timeout, label, traversal_timeout=CONTROL_TRAVERSAL_
     """Complete cursor walk plus one catch-up, or (None, reason); never publish a partial roster.
 
     Old servers without nextCursor retain the single-page completeness checks.
-    The deadline and page budget cover both the walk and catch-up together.
+    Short coverage retries once; all attempts share the deadline and page budget.
     """
-    started, t0 = time.monotonic(), int(time.time() * 1000)
-    counts = {'pages': 0, 'rows': 0, 'catch_up_pages': 0, 'catch_up_rows': 0}
+    started = time.monotonic()
+    counts = {'pages': 0, 'rows': 0, 'catch_up_pages': 0, 'catch_up_rows': 0, 'retried': False}
     phase = 'walk'
+
+    def record_total(key, total):
+        seen = counts.setdefault(key, {'first': total, 'last': total, 'min': total, 'max': total})
+        seen.update(last=total, min=min(seen['min'], total), max=max(seen['max'], total))
 
     def check_deadline():
         if time.monotonic() - started >= traversal_timeout:
@@ -154,9 +158,8 @@ def _control_threads(query, timeout, label, traversal_timeout=CONTROL_TRAVERSAL_
             counts['rows'] += len(rows)
             if phase == 'catch-up':
                 counts['catch_up_rows'] += len(rows)
-            if total is not None and total != page_total:
-                raise ValueError('total changed during traversal')
             total = page_total
+            record_total('totals' if phase == 'walk' else 'catch_up_totals', total)
             legacy = 'nextCursor' not in body
             if legacy and not (legacy_allowed and cursor is None):
                 raise ValueError('nextCursor missing during traversal')
@@ -187,8 +190,6 @@ def _control_threads(query, timeout, label, traversal_timeout=CONTROL_TRAVERSAL_
                 if len(mapped) != total:
                     raise ValueError('duplicate thread ids')
                 return mapped, total, True
-            if len(mapped) > total:
-                raise ValueError('walk unique ids exceed total')
             cursor = body['nextCursor']
             if cursor is None:
                 return {tid: value[1] for tid, value in mapped.items()}, total, False
@@ -199,27 +200,32 @@ def _control_threads(query, timeout, label, traversal_timeout=CONTROL_TRAVERSAL_
             cursors.add(cursor)
 
     try:
-        mapped, total, legacy = walk(query, legacy_allowed=True)
-        counts['total'] = total
-        if not legacy:
-            # A row updated while walking can jump ahead of our cursor. Read that
-            # interval once more, without recursively starting another catch-up.
-            phase = 'catch-up'
-            parts = urllib.parse.urlsplit(query)
-            params = dict(urllib.parse.parse_qsl(parts.query))
-            params.pop('cursor', None)
-            params['updatedSince'] = str(t0 - 5000)
-            catch_query = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(params)))
-            fresh, catch_total, _ = walk(catch_query)
-            if len(fresh) < catch_total:
-                raise ValueError(f'short by {catch_total - len(fresh)}')
-            mapped.update(fresh)
+        for attempt in range(2):
+            phase = 'walk'
+            t0 = int(time.time() * 1000)
+            counts['retried'] = attempt == 1
+            mapped, total, legacy = walk(query, legacy_allowed=attempt == 0)
+            counts['total'] = total
+            if not legacy:
+                # A row updated while walking can jump ahead of our cursor. Read
+                # that interval once more before judging coverage of this attempt.
+                phase = 'catch-up'
+                parts = urllib.parse.urlsplit(query)
+                params = dict(urllib.parse.parse_qsl(parts.query))
+                params.pop('cursor', None)
+                params['updatedSince'] = str(t0 - 5000)
+                catch_query = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(params)))
+                fresh, _, _ = walk(catch_query)
+                mapped.update(fresh)
             phase = 'completeness'
-            if len(mapped) < total:
-                raise ValueError(f'short by {total - len(mapped)}')
-        check_deadline()
-        counts['unique_rows'] = len(mapped)
-        return mapped, None
+            counts['unique_rows'] = len(mapped)
+            check_deadline()
+            # Total can grow through creation or shrink through archive/deletion.
+            # Only coverage against the newest main page proves a count gap.
+            if len(mapped) >= total:
+                return mapped, None
+            if attempt:
+                raise ValueError(f'short by {total - len(mapped)} after retry')
     except ValueError as exc:
         reason = f'control api {label}: {exc}'
         counts.update(error=reason, failure_phase=phase)

@@ -137,16 +137,16 @@ separately for the 60-day window, following `nextCursor` through every page. Eac
 listing gets one paginated catch-up with `updatedSince` set to five seconds before
 the walk started, covering rows that moved ahead of a cursor. Walks merge duplicate
 ids by newest `updatedAt`; the later catch-up row wins. The full match `total`
-must stay stable within each pass, and the merged unique count must reach the
-initial total (extra ids may only come from catch-up). A page failure, malformed
-row/cursor, missing cursor after page one, repeated cursor, changing total,
-short count, more than 400 requests, or a 180-second traversal deadline keeps
-that repository report-only with `activity_history_unavailable` and its exact
-reason. The request budget and deadline cover walk plus catch-up together;
+may change as threads are created, archived, or deleted. The merged unique count
+must reach the total on the newest main-listing page. Short coverage retries that
+listing once from scratch with a new catch-up window; a remaining gap fails with
+`short by N after retry`. A page failure, malformed row/cursor, missing cursor
+after page one, repeated cursor, more than 400 requests, or a 180-second traversal
+deadline keeps that repository report-only with `activity_history_unavailable` and its exact
+reason. The request budget and deadline cover both attempts, including catch-up;
 per-page timeouts are unchanged. Older servers without `nextCursor` on page one
 retain the single-page check, including the truncation error when `total` exceeds
-the returned count. An incomplete
-OpenCode history keeps all repositories. No partial list proves inactivity. The daily reaper alone reads session history;
+the returned count. An incomplete OpenCode history keeps all repositories. No partial list proves inactivity. The daily reaper alone reads session history;
 the hourly process/resource scan does not. Directory activity and an updated-time
 high-water mark are cached in `~/.local/share/dev-janitor/session-history.json`.
 A full read runs at most daily (also on missing/corrupt state or cursor failure).
@@ -162,8 +162,9 @@ the candidate; the global history still rebuilds at most daily. History stats in
 pages and duration. Reaper status also includes `project_history_stats` per project:
 `pages`, raw `rows` (including duplicate and catch-up rows), `archived_rows`
 (the archived listing's raw rows), `catch_up_rows`, `seconds`, and per-listing
-counts or the exact failure. `repo_outcomes` records kept reason counts and
-would-remove paths per repository.
+counts or the exact failure. Each listing logs `totals` (first/last/min/max
+main-page totals), `catch_up_totals`, merged `unique_rows`, and `retried`.
+`repo_outcomes` records kept reason counts and would-remove paths per repository.
 A linked worktree is removed only when all of these hold:
 
 - last commit on HEAD is older than 60 days (`WORKTREE_STALE_DAYS`)

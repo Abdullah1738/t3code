@@ -614,14 +614,88 @@ class ControlPaginationTests(unittest.TestCase):
         self.assertEqual(set(rows), {'a', 'b', 'new'})
 
     def test_short_after_catch_up_returns_no_partial_map(self):
-        (rows, error), _ = self.read([self.page(['a'], 3), self.page(['b'])])
+        stats = {}
+        (rows, error), _ = self.read([self.page(['a'], 3), self.page(['b']),
+                                    self.page(['a'], 3), self.page(['b'])], stats=stats)
         self.assertIsNone(rows)
-        self.assertIn('short by 1', error)
+        self.assertIn('short by 1 after retry', error)
+        self.assertTrue(stats['retried'])
 
-    def test_walk_cannot_return_more_unique_ids_than_total(self):
-        (rows, error), _ = self.read([self.page(['a'], 1, 'a'), self.page(['b'], 1)])
+    def test_growing_total_is_covered_by_catch_up(self):
+        stats = {}
+        (rows, error), _ = self.read([self.page(['a'], 2, 'next'), self.page(['b'], 3),
+                                    self.page(['new'])], stats=stats)
+        self.assertIsNone(error)
+        self.assertEqual(set(rows), {'a', 'b', 'new'})
+        self.assertEqual(stats['totals'], dict(first=2, last=3, min=2, max=3))
+        self.assertFalse(stats['retried'])
+
+    def test_shrinking_total_after_archival_is_not_a_gap(self):
+        for first_rows, first_total, last_total in [(['a'], 3, 2), (['a', 'archived'], 3, 2)]:
+            with self.subTest(first_rows=first_rows):
+                stats = {}
+                (rows, error), _ = self.read([self.page(first_rows, first_total, 'next'),
+                                            self.page(['b'], last_total), self.page()], stats=stats)
+                self.assertIsNone(error)
+                self.assertGreaterEqual(len(rows), last_total)
+                self.assertEqual(stats['totals'], dict(first=3, last=2, min=2, max=3))
+                self.assertFalse(stats['retried'])
+
+    def test_real_gap_retries_from_scratch_then_fails(self):
+        stats = {}
+        (rows, error), api = self.read([self.page(['a'], 2), self.page(),
+                                      self.page(['a'], 2), self.page()], stats=stats)
         self.assertIsNone(rows)
-        self.assertIn('unique ids exceed total', error)
+        self.assertEqual(error, 'control api test: short by 1 after retry')
+        self.assertEqual(api.call_count, 4)
+        self.assertTrue(stats['retried'])
+
+    def test_retry_closes_gap_and_uses_a_new_catch_up_window(self):
+        stats = {}
+        with patch.object(active.time, 'time', side_effect=[100, 110]):
+            (rows, error), api = self.read([self.page(['a'], 2), self.page(),
+                                          self.page(['a'], 2, 'next'), self.page(['b'], 2),
+                                          self.page()], stats=stats)
+        self.assertIsNone(error)
+        self.assertEqual(set(rows), {'a', 'b'})
+        self.assertTrue(stats['retried'])
+        self.assertNotIn('cursor', parse_qs(urlparse(api.call_args_list[2].args[0]).query))
+        self.assertEqual(parse_qs(urlparse(api.call_args_list[1].args[0]).query)['updatedSince'], ['95000'])
+        self.assertEqual(parse_qs(urlparse(api.call_args_list[-1].args[0]).query)['updatedSince'], ['105000'])
+
+    def test_catch_up_totals_can_change_without_a_count_gap(self):
+        stats = {}
+        (rows, error), _ = self.read([self.page(['a'], 2), self.page(['b'], 2, 'next'),
+                                    self.page(['new'], 3)], stats=stats)
+        self.assertIsNone(error)
+        self.assertEqual(set(rows), {'a', 'b', 'new'})
+        self.assertEqual(stats['catch_up_totals'], dict(first=2, last=3, min=2, max=3))
+
+    def test_retry_keeps_request_and_deadline_budgets_and_discards_first_partial_map(self):
+        with patch.object(active, 'CONTROL_MAX_PAGES', 2):
+            (rows, error), api = self.read([self.page(['a'], 2), self.page()])
+        self.assertIsNone(rows)
+        self.assertIn('page cap', error)
+        self.assertEqual(api.call_count, 2)
+        # The second attempt cannot fill its own gap with a discarded first-attempt row.
+        (rows, error), _ = self.read([self.page(['a'], 2), self.page(),
+                                    self.page(['b'], 2), self.page()])
+        self.assertIsNone(rows)
+        self.assertIn('short by 1 after retry', error)
+        with patch.object(active.time, 'monotonic', side_effect=[0, 0, 0, 0, 0, 0, 181, 182]):
+            (rows, error), api = self.read([self.page(['a'], 2), self.page()])
+        self.assertIsNone(rows)
+        self.assertIn('deadline exceeded', error)
+        self.assertEqual(api.call_count, 2)
+
+    def test_oscillating_totals_use_last_main_total_and_log_extrema(self):
+        stats = {}
+        (rows, error), _ = self.read([self.page(['a'], 2, 'one'), self.page(['b'], 4, 'two'),
+                                    self.page(['c'], 3), self.page()], stats=stats)
+        self.assertIsNone(error)
+        self.assertEqual(set(rows), {'a', 'b', 'c'})
+        self.assertEqual(stats['totals'], dict(first=2, last=3, min=2, max=4))
+        self.assertFalse(stats['retried'])
 
     def test_legacy_server_behavior(self):
         cases = [(['a'], 2, '2 threads, only 1 returned (truncated)'),
@@ -653,7 +727,6 @@ class ControlPaginationTests(unittest.TestCase):
             (self.page([dict(threadId='b', state='idle')], 2), 'updatedAt unavailable'),
             (self.page([self.row('b', 'invalid')], 2), 'updatedAt unavailable'),
             (self.page([self.row('b', '2026-11-01')], 2), 'updatedAt unavailable'),
-            (self.page(['b'], 3), 'total changed during traversal'),
             ((200, dict(ok=True, threads=[], total=2)), 'nextCursor missing during traversal'),
         ]
         for pass_name in ('walk', 'catch-up'):
@@ -701,9 +774,8 @@ class ControlPaginationTests(unittest.TestCase):
         self.assertIsNone(rows)
         self.assertIn('deadline', error)
 
-    def test_short_or_legacy_catch_up_is_incomplete(self):
-        for page, expected in [(self.page(['b'], 2), 'short by 1'),
-                               ((200, dict(ok=True, threads=[], total=0)), 'nextCursor missing')]:
+    def test_legacy_catch_up_is_incomplete(self):
+        for page, expected in [((200, dict(ok=True, threads=[], total=0)), 'nextCursor missing')]:
             with self.subTest(page=page):
                 (rows, error), _ = self.read([self.page(['a']), page])
                 self.assertIsNone(rows)
