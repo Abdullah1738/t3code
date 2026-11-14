@@ -23,6 +23,19 @@ OWNER = {'thread': {'threadId': 'owner', 'state': 'idle', 'status': 'completed',
 DETAILS = dict(cwd='/private/tmp/benchmark-deleted', cwd_exists=False,
                listeners=['192.168.1.209:8765'], tcp_states=['LISTEN'],
                binding={'CLAUDE_CODE_SESSION_ID': 'native-owner'})
+OPAQUE_RELATIVE_TOKENS = [
+    'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    'wJalrXUtnFEMI/K7MDENGbPxRfiCYEXAMPLEKEY',
+    'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY=',
+    'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY==',
+    'wJalrXUtnFEMI_K7MDENG/bPxRfiCYEXAMPLEKEY',
+    'wJalrXUtnFEMI-K7MDENG/bPxRfiCYEXAMPLEKEY',
+    'AbC+/012' * 5,
+    'abcdefghijklmnopqrst/uvwxyzabcdefghijklm',
+    '0123456789abcdef/0123456789abcdef/01234567',
+    'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.signature/opaque',
+    'project/packages/server/scripts/serve',
+]
 
 
 class ProcessTests(unittest.TestCase):
@@ -154,6 +167,102 @@ class ProcessTests(unittest.TestCase):
                 with self.subTest(source=source, quote=quote):
                     command = f'node tool.js --dsn={quote}{source}{quote}'
                     self.assertEqual(lp.redact(command), f'node tool.js --dsn={quote}{expected}{quote}')
+
+    def test_command_path_shape_matrix(self):
+        paths = [
+            '/Users/ardud/.local/share/foo/serve.py',
+            '/opt/homebrew/Cellar/python@3.13/3.13.7/Frameworks/Python.framework/Versions/3.13/bin/python3.13',
+            '~/projects/long-project-directory/scripts/serve.py',
+            './projects/long-project-directory/scripts/serve.py',
+            'node_modules/.bin/long-development-server',
+            './project/packages/server/scripts/serve',
+            'project/.cache/scripts/development-server',
+            'scripts/' + 'long-script-name-' * 3 + '.py',
+            'a+b/long-module-directory/development-entrypoint.js',
+            'project/a+b/scripts/development-entrypoint.js',
+            'project/scripts/development+entrypoint.js',
+        ]
+        for path in paths:
+            for quote in ('', '"', "'"):
+                with self.subTest(path=path, quote=quote):
+                    command = f'python3 {quote}{path}{quote} serve'
+                    self.assertEqual(lp.redact(command), command)
+        command = 'python3 -m http.server 8461 --directory /Users/ardud/.local/share/foo/public'
+        self.assertEqual(lp.redact(command), command)
+
+    def test_opaque_tokens_still_redact(self):
+        tokens = ['0123456789abcdef' * 2 + '01234567',
+                  'AbC012xy' * 5, 'AbC+/012' * 5,
+                  'a' * 33 + '/bcdefg',
+                  'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.signature']
+        for token in tokens:
+            for quote in ('', '"', "'"):
+                with self.subTest(token=token, quote=quote):
+                    self.assertEqual(lp.redact(f'node tool.js {quote}{token}{quote}'),
+                                     f'node tool.js {quote}[REDACTED]{quote}')
+
+    def test_ambiguous_relative_tokens_still_redact(self):
+        for token in OPAQUE_RELATIVE_TOKENS:
+            for quote in ('', '"', "'"):
+                with self.subTest(token=token, quote=quote):
+                    self.assertEqual(lp.redact(f'node tool.js {quote}{token}{quote}'),
+                                     f'node tool.js {quote}[REDACTED]{quote}')
+
+    def test_saved_report_redacts_ambiguous_tokens_in_inventory_and_ancestors(self):
+        import dev_janitor
+        for token in OPAQUE_RELATIVE_TOKENS:
+            for quote in ('', '"', "'"):
+                with self.subTest(token=token, quote=quote):
+                    rows = lp.parse_ps(PS)
+                    child = rows[91129]
+                    child.update(ppid=10, tty='ttys001', args=f'node tool.js {quote}{token}{quote}')
+                    rows[10] = dict(pid=10, ppid=1, start=child['start'], tty='ttys001',
+                                    args=f'/bin/sh -c "node tool.js {quote}{token}{quote}"')
+                    report = lp.detect(rows, lp.parse_top(TOP), {}, ROSTER)
+                    item = report['inventory'][0]
+                    self.assertEqual(item['command'], f'node tool.js {quote}[REDACTED]{quote}')
+                    self.assertEqual(item['parent_chain'][0]['command'],
+                                     f'/bin/sh -c "node tool.js {quote}[REDACTED]{quote}"')
+                    with tempfile.TemporaryDirectory() as tmp, \
+                            patch.object(dev_janitor, 'LOG_DIR', tmp), \
+                            patch.object(dev_janitor, 'LAST', str(Path(tmp) / 'last.json')), \
+                            patch.object(dev_janitor, 'AUDIT', str(Path(tmp) / 'audit.jsonl')):
+                        dev_janitor.record_report(dict(ts=1, liveness_unavailable=None, processes=report))
+                        for name in ('last.json', 'audit.jsonl'):
+                            saved = (Path(tmp) / name).read_text()
+                            self.assertNotIn(token, saved)
+                            if name == 'last.json':
+                                self.assertIn('[REDACTED]', saved)
+
+    def test_explicit_credentials_win_over_path_shape(self):
+        values = ['a' * 40, '/Users/ardud/.local/share/credential-file',
+                  '~/secrets/credential-file', './secrets/credential-file',
+                  'node_modules/.bin/credential-file']
+        for value in values:
+            for flag in ('--token', '--password', '--key', '--auth'):
+                for separator in ('=', ' '):
+                    for quote in ('', '"', "'"):
+                        with self.subTest(value=value, flag=flag, separator=separator, quote=quote):
+                            redacted = lp.redact(f'node tool.js {flag}{separator}{quote}{value}{quote}')
+                            self.assertNotIn(value, redacted)
+                            self.assertIn('[REDACTED]', redacted)
+        for prefix in ('sk-', 'ghp_', 'github_pat_', 'xoxb-', 'xoxa-', 'xoxp-', 'xoxr-', 'xoxs-'):
+            for base in ('/tmp/', '~/secrets/', './secrets/', 'project/secrets/',
+                         '/tmp/backup_', '~/secrets/backup_', './secrets/backup_',
+                         'project/secrets/backup_', '/tmp/backup-', '/tmp/backup.'):
+                with self.subTest(prefix=prefix, base=base):
+                    self.assertEqual(lp.redact(f'node {base}{prefix}abc123/file.js'),
+                                     f'node {base}[REDACTED]/file.js')
+
+    def test_shell_delimiters_cannot_extend_a_path_exemption(self):
+        token = '0123456789abcdef' * 2 + '01234567'
+        for delimiter in (';', ';;', '&', '&&', '|', '||', '(', ')', '<', '>', '>>',
+                          '`', '{', '}', '\n'):
+            for quote in ('', '"', "'"):
+                with self.subTest(delimiter=delimiter, quote=quote):
+                    command = f'sh -c {quote}/usr/bin/node{delimiter}{token}{quote}'
+                    self.assertEqual(lp.redact(command),
+                                     f'sh -c {quote}/usr/bin/node{delimiter}[REDACTED]{quote}')
 
     def test_saved_report_redacts_non_http_userinfo_in_kept_process_and_ancestors(self):
         import dev_janitor

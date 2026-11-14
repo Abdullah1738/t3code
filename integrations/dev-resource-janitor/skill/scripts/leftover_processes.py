@@ -17,6 +17,22 @@ THREAD_KEYS = {"T3_THREAD_ID", "T3CODE_THREAD_ID", "ROBOB_THREAD_ID"}
 TERMINAL = {"completed", "cancelled", "failed", "interrupted"}
 
 
+def redact_opaque_token(match):
+    token = match.group()
+    if token.startswith(("/", "~/", "./")):
+        return token
+    segments = token.split("/")
+    if (len(segments) > 1
+            and re.fullmatch(r'[\w.@+~-]+(?:/[\w.@+~-]+)+/?', token)
+            # Slash-separated opaque credentials also have short segments.
+            and (any(segment.startswith('.') for segment in segments)
+                 or re.search(r'\.[a-zA-Z][a-zA-Z0-9]{0,9}$', segments[-1]))
+            and all(len(segment) < 32 or re.search(r'\.[a-zA-Z][a-zA-Z0-9]{0,9}$', segment)
+                    for segment in segments)):
+        return token
+    return re.sub(r'(?<![\w-])[A-Za-z0-9_+/=.\-]{32,}(?![\w-])', '[REDACTED]', token)
+
+
 def redact(command):
     # Redact before shortening: a truncated flag value must not escape matching.
     command = re.sub(r'(?i)([a-z][a-z0-9+.-]*://)[^\s/?#]*@', r'\1[REDACTED]@', command)
@@ -26,8 +42,10 @@ def redact(command):
                      r'\1"[REDACTED]"', command)
     command = re.sub(r'(?i)(bearer\s+|(?:--|\b)[\w-]*(?:token|password|passwd|secret|credential|api[-_]?key|authorization)[\w-]*[= :]+)(?:"[^"]*"|\x27[^\x27]*\x27|\S+)',
                      r'\1[REDACTED]', command)
-    command = re.sub(r'(?i)\b(?:sk-|ghp_|github_pat_|xox[baprs]-)[\w.-]+', '[REDACTED]', command)
-    command = re.sub(r'(?<![\w-])[A-Za-z0-9_+/=.\-]{32,}(?![\w-])', '[REDACTED]', command)
+    command = re.sub(r'(?i)(?<![a-z0-9])(?:sk-|ghp_|github_pat_|xox[baprs]-)[\w.-]+', '[REDACTED]', command)
+    # Inspect whole tokens so @ in a Homebrew path cannot split off an opaque suffix.
+    # Explicit credentials above still redact inside otherwise readable paths.
+    command = re.sub(r'''[^\s"';&|()<>`{}]+''', redact_opaque_token, command)
     # Generic key flags, query-string values and short credential aliases too.
     command = re.sub(r'(?i)((?:--key|--auth|--pass|--pwd|\bkey|\bauth)[= :]+)(?:"[^"]*"|\x27[^\x27]*\x27|\S+)',
                      r'\1[REDACTED]', command)
