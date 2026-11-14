@@ -1,6 +1,7 @@
 """Outside readers use the server export, never the server's writable database."""
 
 import os
+import json
 import sqlite3
 import stat
 import sys
@@ -109,6 +110,7 @@ def connect_ro(path, *, timeout=30, check_same_thread=True):
     con = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=timeout,
                          check_same_thread=check_same_thread, factory=_ReplicaConnection)
     con.replica_identity = info.st_dev, info.st_ino
+    con.replica_path = path
     try:
         ensure_same_file(con, path)
     except Exception:
@@ -117,27 +119,59 @@ def connect_ro(path, *, timeout=30, check_same_thread=True):
     return con
 
 
+def _rebuild_status(con, metadata):
+    if not metadata.get("rebuild_started_at") or metadata.get("rebuild_finished_at"):
+        return ""
+    # This sidecar advances outside the publication transaction. It explains a
+    # rejected read; it never supplies readiness, generation or freshness.
+    try:
+        with con.replica_path.with_name(con.replica_path.name + ".rebuild.json").open() as diagnostic:
+            diagnostics = json.loads(diagnostic.read(16_384))
+        if (diagnostics.get("replica_identity") == list(con.replica_identity)
+                and diagnostics.get("rebuild_started_at") == metadata.get("rebuild_started_at")):
+            metadata = {**metadata, **{key: diagnostics[key] for key in (
+                "rebuild_started_at", "rebuild_finished_at", "rebuild_progress")}}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    if not metadata.get("rebuild_started_at") or metadata.get("rebuild_finished_at"):
+        return ""
+    rebuilding = f"; rebuilding since {metadata['rebuild_started_at']}"
+    try:
+        progress = json.loads(metadata.get("rebuild_progress", "{}"))
+        if progress.get("event") == "abort":
+            rebuilding = f"; rebuild aborted since {metadata['rebuild_started_at']}"
+        rebuilding += f" (table {progress.get('table') or 'pending'}, {progress.get('rows', 0)} rows)"
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return rebuilding
+
+
 def ready_generation(con, *, max_age=120, source="Robob", schema_version=None, require_destructive=False):
-    """The exporter clears ready while paging, then publishes a new watermark."""
+    """Validate the published watermark; rebuild diagnostics never imply freshness."""
     try:
         metadata = dict(con.execute(
             "SELECT key,value FROM ardud_readonly_meta "
-            "WHERE key IN ('schema_version','destructive_ready','updated_at','ready','generation')"))
+            "WHERE key IN ('schema_version','destructive_ready','updated_at','ready','generation',"
+            "'rebuild_started_at','rebuild_progress','rebuild_finished_at')"))
         if schema_version is not None and metadata.get("schema_version") != schema_version:
             raise ValueError("unsupported export schema")
         if require_destructive and metadata.get("destructive_ready") != "1":
             raise ValueError("native metadata changed during validation")
-        updated = metadata["updated_at"]
-        if not isinstance(updated, str):
-            raise ValueError("timestamp is not text")
-        at = datetime.fromisoformat(updated.replace("Z", "+00:00"))
-        if at.tzinfo is None:
-            raise ValueError("timestamp has no timezone")
-        age = (datetime.now(timezone.utc) - at).total_seconds()
+        updated = metadata.get("updated_at", "missing")
+        age = None
+        if metadata.get("ready") == "1":
+            if not isinstance(updated, str):
+                raise ValueError("timestamp is not text")
+            at = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            if at.tzinfo is None:
+                raise ValueError("timestamp has no timezone")
+            age = (datetime.now(timezone.utc) - at).total_seconds()
         if metadata.get("ready") != "1" or not -30 <= age <= max_age:
+            rebuilding = _rebuild_status(con, metadata)
+            status = "not ready" if metadata.get("ready") != "1" else "stale"
             raise ReplicaNotReady(
-                f"{source} recall replica not ready (generation {metadata.get('generation', 'unknown')}, "
-                f"updated_at {updated}, ready {metadata.get('ready', 'missing')}); retry later")
+                f"{source} recall replica {status} (generation {metadata.get('generation', 'unknown')}, "
+                f"updated_at {updated}, ready {metadata.get('ready', 'missing')}){rebuilding}; retry later")
     except ReplicaNotReady:
         raise
     except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
