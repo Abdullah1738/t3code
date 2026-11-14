@@ -44,6 +44,8 @@ Rules added 2026-10-30 (money-cases fixes, card #10):
 - **Charges are never merged or split silently.** A new charge with the same merchant, amount, currency, day and kind as a recorded one is refused, and the refusal names the candidate. The caller decides: `--repeat ID` if it is the same charge (seen again, a note is added to that case), or `--distinct` if it is a second transaction. Free-form references such as "email 09:13" describe where a charge was seen, so they never tell two charges apart. An unmatched charge is never a candidate.
 - **Build once, acknowledge delivery separately.** Event keys and the case’s daily cap are recorded in `built` before the check prints an event; they suppress another build even if the runner never accepts or acknowledges it. Existing outbox keys migrate on the first check. Delivery still controls the reminder clock: The runner acks a run before it delivers the event and may retry it later or the next day. A reminder is recorded as sent, and it counts toward the one-a-day cap and starts the two-day clock, only when the runner's `state.json` confirms delivery (`fires` rose and `last_fire_at` is the delivery time). An event the runner owns stays pending; a lost event releases the outbox, while its keys remain consumed.
 - **Holds.** A pre-auth hold (`--kind hold`) that drops off is closed as `released`, not `refunded`.
+- A merchant mail after the case's last edit saying a refund was processed holds the dispute deadline until mail time + 7 days (or the existing later deadline) and tells him once; any negation in the merchant's own text blocks the hold.
+- A hold requires a direct completed-refund statement; questions, confirmation requests, and future or conditional processing do not qualify. Ambiguous proof-led wording keeps the existing deadline. Past approval timing before or after the confirmation, or a later card-credit estimate, does not cancel completed evidence. A trailing receipt or help question can be ignored after an affirmative statement.
 - **No guesses.** A charge whose merchant or order can't be matched is `unmatched`, never named by a guess.
 
 ## Saved merchant cards
@@ -83,6 +85,8 @@ One institution/amount/currency/deadline is one case, including mail/SMS copies 
 The initial payment alert and reminders go alone through the existing outbox: once on detection, once 60–75 minutes before the deadline (the watcher's 15-minute cadence), then at most once at/after it. The usual one-per-day/third-question flow does not apply to these two reminders. Existing 23:00–08:00 quiet hours still apply, so a midnight deadline gets its first reminder before quiet hours and its final reminder in the morning. Payment deadlines come first in `brief`. Bank payment-received/autopay-success notices close matching rows; `money-cases close ID --outcome paid --source sms:<id>` (or `done`, with its source) is the existing chat-confirmation path and closes the related autopay row too. Closed cases are never reopened by replays.
 
 ## Charge questions
+
+- A decline closes as paid after decline when a charge with the same card, merchant, currency and amount follows within 60 minutes.
 
 Before anyone asks him about a card charge (owner rule, nightly review 24 Oct; his words that day: "Wait for the email"), `money-cases ask` decides whether to ask:
 

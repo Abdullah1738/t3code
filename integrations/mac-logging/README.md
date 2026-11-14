@@ -117,6 +117,35 @@ Partial inventories and older snapshots without that evidence remain unknown.
 An unknown directory baseline also makes the event incomplete.
 These events never alert or launch extra scans.
 
+## Memory samples
+
+`com.abdullah.mac-memory` runs `memory.py` every 300 seconds independently of
+inventory, through `/bin/zsh` for launchd file access. `memory.sample` contains
+swap MB, VM page counts and page size, pressure/free percentage, load averages,
+the top 15 footprints with compressed MB, watched daemons with elapsed time,
+process/parent-1 counts, and disk0's second iostat sample. MB/GB use powers of
+1024. `top` MEM already includes compressed pages. A filtered second top reads
+watched PIDs outside the first 15. At most 512 watched PIDs are queried; excess
+is explicit in `watchedOmitted` and makes the sample partial. Each subprocess,
+including notifications, has a ten-second timeout. Failed probes are null with
+fixed `…Error` codes; watched PID failures retain null metrics per PID.
+
+`state/memory.json` retains swap counter baselines and alert receipts under a
+separate nonblocking lock. `swapinsDelta`/`swapoutsDelta` compare successful reads
+on the same boot, with `deltaWindowS`; first reads, resets, gaps over an hour and
+clock rollback establish a null baseline. Missing/failed probes remain unknown.
+No process arguments, command output or notification text enter the day log.
+
+Swap above 16 GB, critical pressure in two consecutive samples, a footprint
+above 8 GB, or fseventsd above 4 GB queues a Telegram notification and writes
+`memory.alert`. Critical means `vm.memory_pressure >= 2` or free percentage
+below 15; unavailable/healthy samples or gaps over ten minutes reset the streak. Each reason has a six-hour cooldown
+across day boundaries. Keys start `mac-memory:<reason>:<YYYYMMDD>` with a time
+suffix so another alert can be queued after six hours on the same day. An
+unconfirmed send retains its exact key/text for idempotent retry. For a diagnostic
+sample without notifications, run `TOOLLOG_DIR=<private-temp-dir> /usr/bin/python3
+integrations/mac-logging/memory.py --no-alert`.
+
 ## Source events
 
 `disk.inventory` and `crash.collect` retain `count` and `sourceErrors` summary
