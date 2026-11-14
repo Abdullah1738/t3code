@@ -48,6 +48,27 @@ const monitor = (
   );
 
 describe("EventLoopMonitor", () => {
+  it.effect("samples HTTP sockets on the resource telemetry tick", () =>
+    Effect.gen(function* () {
+      let samples = 0;
+      yield* Layer.build(
+        EventLoopMonitor.layerWith(
+          Effect.succeed(Effect.succeed(quiet)),
+          { filePath: "\0", maxBytes: 1 },
+          undefined,
+          undefined,
+          Effect.sync(() => {
+            samples++;
+          }),
+        ),
+      );
+      yield* TestClock.adjust("60 seconds");
+      assert.equal(samples, 1);
+      yield* TestClock.adjust("30 seconds");
+      assert.equal(samples, 2);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("records a warning span only for samples that saw a stall", () =>
     Effect.gen(function* () {
       const spans: Array<Tracer.NativeSpan> = [];
