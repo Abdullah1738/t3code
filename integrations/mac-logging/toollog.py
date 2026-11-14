@@ -95,7 +95,7 @@ def process_fields(values, busy=False):
     for proc in values[:10]:
         if not isinstance(proc, dict):
             continue
-        if any(type(proc.get(k)) not in (int, float) or not math.isfinite(proc[k]) or proc[k] < 0 for k in numeric):
+        if any(not finite_number(proc.get(k)) or proc[k] < 0 for k in numeric):
             continue
         if any(type(proc[k]) is not int for k in numeric if k != 'cpuDeltaS'):
             continue
@@ -114,6 +114,14 @@ def process_fields(values, busy=False):
                 c if c.isprintable() else ' ' for c in value)
         result.append(clean)
     return result
+
+
+def finite_number(value):
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        # Untrusted JSON integers can exceed the float range used by isfinite.
+        return False
 
 
 def disk_wait_fields(values):
@@ -160,7 +168,7 @@ def memory_fields(values, event):
                'mbPerS', 'tps', 'pid', 'memMb', 'cmprsMb', 'cpu', 'count', 'ppid1Count'}
 
     def numeric(value):
-        return type(value) in (int, float) and math.isfinite(value) and value >= 0
+        return finite_number(value) and value >= 0
 
     def row(value, keys):
         if not isinstance(value, dict):
@@ -214,7 +222,7 @@ def safe_fields(values, event=None):
                 if any(type(proc.get(k)) is not int or proc[k] < 0 for k in ('pid', 'processAgeS')):
                     continue
                 cpu = proc.get('cpuDeltaS')
-                if type(cpu) not in (int, float) or not math.isfinite(cpu) or cpu < 0:
+                if not finite_number(cpu) or cpu < 0:
                     continue
                 if not all(isinstance(proc.get(k), str) for k in ('path', 'wchan')):
                     continue
@@ -265,7 +273,7 @@ def safe_fields(values, event=None):
             result[key] = None
         elif key in BOOLEANS and type(value) is bool:
             result[key] = value
-        elif key in NUMBERS and type(value) in (int, float) and math.isfinite(value):
+        elif key in NUMBERS and finite_number(value):
             result[key] = value
         elif key in TEXT and isinstance(value, str) and ATOM.fullmatch(value) and not SECRET.search(value):
             result[key] = value
@@ -279,7 +287,7 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
         raise ValueError('invalid component')
     row = dict(ts=now.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), tool='mac',
                component=component, kind=kind, name=name)
-    if type(duration_ms) in (int, float) and math.isfinite(duration_ms) and duration_ms >= 0:
+    if finite_number(duration_ms) and duration_ms >= 0:
         row['durationMs'] = round(duration_ms, 3)
     if type(ok) is bool:
         row['ok'] = ok

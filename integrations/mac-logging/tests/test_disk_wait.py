@@ -376,6 +376,30 @@ class DiskWaitTests(unittest.TestCase):
         self.assertEqual(props['procs'][0]['stuckForS'], 8*3600)
         self.assertEqual(len(self.notifications), 1)
 
+    def test_invalid_cached_stuck_timestamp_preserves_observation_and_recovers(self):
+        now = 1800000000
+        for value in (10**309, -10**309, 10**400, -10**400, float('nan'),
+                      float('inf'), float('-inf'), True, False, None, '123', {}, [], -1, now+1):
+            with self.subTest(value=value):
+                jobs.save_state('disk-wait-stuck', {})
+                jobs.save_state('disk-wait-alert', {})
+                self.notifications = []
+                with patch.object(collector.time, 'time', return_value=now):
+                    collector.disk_wait(self.runner([ps_row()]))
+                state = jobs.read_state('disk-wait-stuck')
+                state['99184']['firstStuckAt'] = value
+                jobs.save_state('disk-wait-stuck', state)
+                with patch.object(collector.time, 'time', return_value=now):
+                    props = collector.disk_wait(self.runner([ps_row()]))
+                self.assertTrue(self.rows('proc.disk_wait')[-1]['ok'])
+                self.assertEqual(props['count'], 1)
+                self.assertEqual(props['procs'][0]['stuckForS'], 97200)
+                self.assertEqual(jobs.read_state('disk-wait-stuck')['99184']['firstStuckAt'], now)
+                with patch.object(collector.time, 'time', return_value=now+7*3600):
+                    collector.disk_wait(self.runner([ps_row()]))
+                self.assertEqual(jobs.read_state('disk-wait-stuck')['99184']['firstStuckAt'], now)
+                self.assertEqual(len(self.notifications), 1)
+
     def test_existing_sent_incident_is_not_sent_again(self):
         entry = dict(key='mac-upkeep:disk-wait:99184:1794507355',
                      text='old process-age alert', sent=True)

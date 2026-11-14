@@ -8,7 +8,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
-from toollog import directory, private_dir, safe_fields
+from toollog import directory, private_dir, safe_fields, finite_number
 
 
 def rollup(day, root=None):
@@ -51,14 +51,14 @@ def rollup(day, root=None):
                             elif props.get('skipped') == 0 and row.get('ok') is False:
                                 backup['failed_runs'][target] += 1
                     value = row.get('durationMs')
-                    if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                    if finite_number(value) and value >= 0:
                         durations[name].append(value)
                     if name == 'disk.tooling_probe':
                         props = row.get('props', {})
                         if not props.get('skipped'):
                             disk['probes'] += 1
                             disk['timeouts'] += props.get('timedOut') is True
-                            if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                            if finite_number(value) and value >= 0:
                                 disk['maxDurationMs'] = max(disk['maxDurationMs'] or 0, value)
                         blocked = props.get('blockedIn')
                         stamp = row.get('ts', '')
