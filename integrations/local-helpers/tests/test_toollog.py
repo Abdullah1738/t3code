@@ -16,6 +16,32 @@ import toollog
 
 
 class ToolLogTests(unittest.TestCase):
+    def test_imessage_causes_and_render_counters_are_reduced(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        rows = [
+            {'component': 'delivery-renderer', 'kind': 'perf', 'name': 'card.renders', 'ok': True,
+             'renders': {'count': 250, 'histogram': [[10, 250]]}},
+            {'component': 'delivery-renderer', 'kind': 'perf', 'name': 'card.render', 'ok': False,
+             'durationMs': 20, 'props': {'failureCode': 'preview_missing'}},
+        ]
+        for key in ['code.ECONNRESET', 'code.ECONNRESET', 'errno.-61', 'http.5xx', 'prompt_acceptance_probe',
+                    'PRIVATE_TOKEN', 'code.PRIVATE_TOKEN', 'code.971501234567',
+                    'errno./Users/private/PRIVATE', 'code.https://private/?token=PRIVATE']:
+            rows.append({'kind': 'error', 'name': 'bridge.catch', 'error': {
+                'tag': 'router.catch1', 'name': 'Error', 'causeKey': key}})
+        rows.append({'kind': 'error', 'name': 'bridge.catch', 'error': {
+            'tag': 'router.catch49', 'name': 'UnknownError', 'causeKey': 'background_watch'}})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        result = toollog.rollup('imessage', self.day)
+        self.assertEqual(result['topCauses'][0], {'tag': 'router.catch1', 'causeKey': 'code.ECONNRESET', 'count': 2})
+        self.assertEqual(len(result['topCauses']), 5)
+        self.assertEqual(result['cardRenderFailures'], {'preview_missing': 1})
+        self.assertEqual(result['byComponent']['delivery-renderer']['card.render']['count'], 251)
+        self.assertEqual(result['byComponent']['delivery-renderer']['card.render']['failed'], 1)
+        self.assertNotIn('PRIVATE', json.dumps(result))
+        self.assertNotIn('971501234567', json.dumps(result))
+
     def test_imessage_rollup_summary_appended_after_read_is_never_double_counted(self):
         directory = toollog.board_dir('imessage')
         directory.mkdir(parents=True)

@@ -429,7 +429,7 @@ test("nutrition's live-only renderer is observed at file preparation, on success
       await loadCommandPayload(parseCommand(["send-file", "--file", path, "--session", "fixture-session", "--key", "nutrition-fixture"]));
       await expect(loadCommandPayload(parseCommand(["send-file", "--file", join(root, "nutrition-missing.png"), "--session", "fixture-session", "--key", "missing-fixture"]))).rejects.toThrow();
     });
-    expect(logs.filter(l => l.name === "card.render").map(l => [l.component, l.ok, l.props?.cardKind])).toEqual([["card-file", true, "nutrition"], ["card-file", false, "nutrition"]]);
+    expect(logs.filter(l => l.name === "card.render" || l.name === "card.renders").map(l => [l.component, l.ok, l.props?.cardKind]).sort((a, b) => Number(b[1]) - Number(a[1]))).toEqual([["card-file", true, "nutrition"], ["card-file", false, "nutrition"]]);
     expect(JSON.stringify(logs)).not.toContain("PRIVATE_HEALTH_IMAGE");
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });

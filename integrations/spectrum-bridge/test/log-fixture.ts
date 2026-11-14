@@ -4,11 +4,14 @@ import { join } from "node:path";
 import { toolLog, type LogLine } from "../src/toollog.ts";
 
 export async function captureLogs(action: () => Promise<void>): Promise<LogLine[]> {
+  toolLog.flush();
+  await toolLog.settled();
   const previous = process.env.TOOLLOG_DIR;
   const root = mkdtempSync(join(tmpdir(), "imessage-log-fixture-"));
   process.env.TOOLLOG_DIR = root;
   try {
     await action();
+    toolLog.flush();
     await toolLog.settled();
     const lines = readdirSync(root).filter(file => file.endsWith(".ndjson")).flatMap(file =>
       readFileSync(join(root, file), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as LogLine));

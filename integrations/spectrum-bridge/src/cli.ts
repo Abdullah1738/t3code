@@ -1,5 +1,5 @@
 import { messageLengthError } from "./message-length.ts";
-import { cardKind, toolError, toolLog } from "./toollog.ts";
+import { cardKind, logCardRender, toolError, toolLog } from "./toollog.ts";
 import { constants } from "node:fs";
 import { lstat, open, stat } from "node:fs/promises";
 import { request } from "node:http";
@@ -17,7 +17,7 @@ type Command = { method: "GET" | "POST"; path: string; body?: Body };
 /** Tailnet publishing runs in the CLI process itself; it never goes through the bridge socket. */
 export type LocalCommand =
   | { command: "log-rollup"; day?: string }
-  | { command: "log-card-render"; kind: string; durationMs: number; ok: boolean }
+  | { command: "log-card-render"; kind: string; durationMs: number; ok: boolean; chat?: string; outcome?: "ok" | "fallback" | "failed"; failureCode?: string; attempt?: number }
   | { command: "publish"; localPort: number }
   | { command: "publish"; app: string }
   | { command: "unpublish"; port: number }
@@ -60,7 +60,7 @@ export const validAppUrl = (value: unknown): value is string => {
 const control = /[\x00-\x1f\x7f-\x9f]/;
 
 const OPTIONS_BY_COMMAND: Record<string, string[]> = {
-  "log-card-render": ["kind", "ms", "ok"],
+  "log-card-render": ["kind", "ms", "ok", "chat", "outcome", "failure-code", "attempt"],
   "log-rollup": ["day"],
   health: [],
   "send-file": ["file", "key", "text", "session", "mime"],
@@ -154,7 +154,14 @@ export function parseLocalCommand(args: string[]): LocalCommand {
   if (command === "log-card-render") {
     const durationMs = Number(values.ms);
     if (!["quick", "delivery", "ride", "nutrition"].includes(values.kind ?? "") || !values.ms || !Number.isFinite(durationMs) || durationMs < 0 || !["true", "false"].includes(values.ok ?? "")) throw new CliError("Invalid render log");
-    return { command, kind: values.kind!, durationMs, ok: values.ok === "true" };
+    const outcome = values.outcome;
+    if (outcome !== undefined && !["ok", "fallback", "failed"].includes(outcome)) throw new CliError("Invalid render outcome");
+    const failureCode = values["failure-code"];
+    if (failureCode !== undefined && !["none", "renderer_failed", "preview_missing", "render_exception"].includes(failureCode)) throw new CliError("Invalid render failure code");
+    const attempt = values.attempt === undefined ? 1 : Number(values.attempt);
+    if (!Number.isSafeInteger(attempt) || attempt < 1 || attempt > 100) throw new CliError("Invalid render attempt");
+    return { command, kind: values.kind!, durationMs, ok: values.ok === "true", chat: values.chat,
+      outcome: outcome as "ok" | "fallback" | "failed" | undefined, failureCode, attempt };
   }
   if (command === "log-rollup") {
     const day = values.day;
@@ -202,7 +209,7 @@ function runRulesCommand(command: RulesCommand, rulesPath: string): Promise<unkn
 
 export async function runLocalCommand(command: LocalCommand, options: { exec?: Exec; apps?: () => Promise<{ appsRoot: string; appsPort: number }>; rulesPath?: string } = {}): Promise<unknown> {
   if (command.command === "log-card-render") {
-    toolLog.capture(() => toolLog.write({ component: `${command.kind}-renderer`, kind: "perf", name: "card.render", durationMs: command.durationMs, ok: command.ok, props: { cardKind: command.kind } }));
+    logCardRender(`${command.kind}-renderer`, command.kind, command.durationMs, command.ok, command);
     return { logged: true };
   }
   if (command.command === "log-rollup") {
@@ -545,8 +552,7 @@ export async function loadCommandPayload(command: Command): Promise<Body | undef
     await handle?.close().catch((caughtError) => { toolError("cli", "cli.catch7", caughtError);});
     toolLog.capture(() => {
       const kind = cardKind(name);
-      if (kind !== "other") toolLog.write({ component: "card-file", kind: "perf", name: "card.render", ok: prepared,
-        durationMs: performance.now() - preparedAt, props: { cardKind: kind } });
+      if (kind !== "other") logCardRender("card-file", kind, performance.now() - preparedAt, prepared, { failureCode: prepared ? "none" : "file_prepare" });
     });
   }
 }
@@ -668,5 +674,5 @@ if (import.meta.main) {
   } catch (error) { toolError("cli", "cli.catch10", error);
     console.error(JSON.stringify({ error: error instanceof CliError ? error.message : "Bridge request failed" }));
     process.exitCode = 1;
-  }
+  } finally { toolLog.flush(); }
 }
