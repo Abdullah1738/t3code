@@ -31602,22 +31602,42 @@ it.effect.each(
       const before = yield* lifecycle.queuedRuns(work);
       expectedCancellations = cancellations + 4;
       if (mode === "delayed cleanup") {
-        const departure = yield* Effect.forkChild(
-          kanban.reviewResult(card.activeThreadId!, "findings", ["Fix queue ordering"]),
-        );
-        yield* Deferred.await(cleanupEntered);
-        assert.equal((yield* kanban.card(card.id)).card.stage, "in_review");
-        yield* Deferred.succeed(releaseCleanup, undefined);
-        yield* Fiber.join(departure);
-        yield* kanban.claimCard(work, card.id);
-        assert.equal((yield* kanban.card(card.id)).card.stage, "working");
-        const fresh = yield* lifecycle.send({
-          threadId: work,
-          text: "Fresh owner reminder",
-          coalesce: `owner:${card.id}`,
-        });
-        assert.isTrue((yield* lifecycle.queuedRuns(work)).some((run) => run.id === fresh));
-        return;
+        return yield* Effect.gen(function* () {
+          const departure = yield* Effect.forkChild(
+            kanban.reviewResult(card.activeThreadId!, "findings", ["Fix queue ordering"]),
+          );
+          yield* Deferred.await(cleanupEntered);
+          assert.equal((yield* kanban.card(card.id)).card.stage, "in_review");
+          const editStarted = yield* Deferred.make<void>();
+          const edit = yield* Effect.forkChild(
+            Deferred.succeed(editStarted, undefined).pipe(
+              Effect.andThen(
+                kanban.editCard(card.id, { description: "Concurrent edit during cleanup" }, owner),
+              ),
+            ),
+          );
+          yield* Deferred.await(editStarted);
+          yield* Effect.yieldNow;
+          assert.isUndefined(edit.pollUnsafe());
+          yield* Deferred.succeed(releaseCleanup, undefined);
+          yield* Fiber.join(departure);
+          yield* Fiber.join(edit);
+          const departed = yield* kanban.card(card.id);
+          assert.equal(departed.card.stage, "todo");
+          assert.equal(departed.card.description, "Concurrent edit during cleanup");
+          assert.lengthOf(
+            departed.events.filter((event) => event.kind === "review"),
+            1,
+          );
+          yield* kanban.claimCard(work, card.id);
+          assert.equal((yield* kanban.card(card.id)).card.stage, "working");
+          const fresh = yield* lifecycle.send({
+            threadId: work,
+            text: "Fresh owner reminder",
+            coalesce: `owner:${card.id}`,
+          });
+          assert.isTrue((yield* lifecycle.queuedRuns(work)).some((run) => run.id === fresh));
+        }).pipe(Effect.ensuring(Deferred.succeed(releaseCleanup, undefined)));
       }
       if (action === "review to todo") {
         yield* kanban.reviewResult(card.activeThreadId!, "findings", ["Fix queue ordering"]);

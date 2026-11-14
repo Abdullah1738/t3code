@@ -2889,8 +2889,9 @@ const make = Effect.gen(function* () {
       `owner:${cardId}`,
       ...(discussionId === null ? [] : [`owner:${discussionId}`]),
     ];
-    for (const wake of queuedWakes(yield* threads.queuedRuns(threadId), Infinity, scopes)) {
-      yield* threads.cancelQueued(threadId, wake.id);
+    // Keep the transition gate: releasing it after its event write can strand that event on a concurrent edit.
+    for (const wake of queuedWakes(yield* threadIo.queuedRuns(threadId), Infinity, scopes)) {
+      yield* touching(threadId, threadIo.cancelQueued(threadId, wake.id));
     }
   });
 
