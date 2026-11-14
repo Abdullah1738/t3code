@@ -502,23 +502,22 @@ export const approvalProblem = (
     .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at));
   const latest = decisions.at(-1);
   const answer = latest?.answer;
-  const unnamedApproval = latest
-    ? undefined
-    : card.asks
-        .filter(
-          (ask) =>
-            ask.closedAt &&
-            ask.answer !== undefined &&
-            approvingAnswer(ask, gate, subtask.text) &&
-            ask.answer.by._tag === "owner" &&
-            ask.answer.at >= since &&
-            (ask.revisedAt ?? ask.at) >= since &&
-            !ask.draft &&
-            !/\bs\d+\b/.test(askWording(ask)) &&
-            !askConcerns(card, ask, subtask, gate, guessedGates, ask.answer.at),
-        )
-        .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at))
-        .at(-1);
+  const unnamedApproval = card.asks
+    .filter(
+      (ask) =>
+        ask.closedAt &&
+        ask.answer !== undefined &&
+        approvingAnswer(ask, gate, subtask.text) &&
+        ask.answer.by._tag === "owner" &&
+        ask.answer.at >= since &&
+        (answer === undefined || ask.answer.at > answer.at) &&
+        (ask.revisedAt ?? ask.at) >= since &&
+        !ask.draft &&
+        !/\bs\d+\b/.test(askWording(ask)) &&
+        !askConcerns(card, ask, subtask, gate, guessedGates, ask.answer.at),
+    )
+    .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at))
+    .at(-1);
   const noDecisionReason = unnamedApproval
     ? `${unnamedApproval.id} was approved but doesn't name ${subtask.id}; ask again naming the subtask id (e.g. "Approve ${subtask.id}")`
     : `no owner answer on a ${gate} ask since ${since}; ask with card_ask naming ${subtask.id} (e.g. "Approve ${subtask.id}: <step>")`;
@@ -555,6 +554,9 @@ export const approvalProblem = (
     reason = `the latest decision, ${latest.id}, picked "${labels}", which doesn't read as approving ${gate}; ask again with an Approve option or an action ask`;
   } else {
     reason = `the latest decision, ${latest.id}, was ${answer.verdict}`;
+  }
+  if (latest && unnamedApproval) {
+    reason += `; ${unnamedApproval.id} (approved later) doesn't name ${subtask.id}, so it doesn't count; ask again naming ${subtask.id} (e.g. "Approve ${subtask.id}: <step>")`;
   }
   return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's approval: ${reason}${standingReason}`.replace(
     /[\r\n]+/g,
