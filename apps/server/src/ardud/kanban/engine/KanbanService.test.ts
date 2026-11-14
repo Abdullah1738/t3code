@@ -350,7 +350,7 @@ const makeFake = Effect.gen(function* () {
               );
             }
             sendControl.afterSend?.(input.threadId, input.text);
-            return Effect.void;
+            return Effect.succeed(`fake-send-${sends.length}`);
           }),
         ),
       withdraw: (input) =>
@@ -412,6 +412,7 @@ const makeFake = Effect.gen(function* () {
       latestRun: (threadId) => Effect.succeed(lastRuns.get(threadId) ?? null),
       runSettled: () => Effect.succeed(true),
       compactRun: (_threadId, runId) => Effect.succeed(runHistory.get(runId) ?? null),
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: (threadId) => Effect.sync(() => void interrupted.push(threadId)),
     }),
@@ -31458,4 +31459,184 @@ it.effect(
         }
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
+);
+
+it.effect.each(
+  (["steer", "review to todo", "release", "flag"] as const).flatMap((action) =>
+    (["inline", "deferred"] as const).map((mode) => ({ action, mode })),
+  ),
+)("#1394 disposable wakes: $action preserves real queued messages ($mode)", ({ action, mode }) =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const lifecycle = yield* KanbanThreads.pipe(Effect.provide(KanbanThreadLifecycle.layer));
+    const fake = yield* makeFake;
+    let work: ThreadId | undefined;
+    let expectedCancellations = Infinity;
+    let cancellations = 0;
+    const pruned = yield* Deferred.make<void>();
+    const initialCleaned = yield* Deferred.make<void>();
+    const wrapped = Layer.succeed(
+      KanbanThreads,
+      KanbanThreads.of({
+        ...(yield* KanbanThreads.pipe(Effect.provide(fake.layer))),
+        queuedRuns: (id) =>
+          id === work
+            ? lifecycle
+                .queuedRuns(id)
+                .pipe(Effect.tap(() => Deferred.succeed(initialCleaned, undefined)))
+            : Effect.succeed([]),
+        cancelQueued: (id, run) =>
+          lifecycle.cancelQueued(id, run).pipe(
+            Effect.tap((cancelled) => {
+              if (cancelled) cancellations += 1;
+              return cancellations === expectedCancellations
+                ? Deferred.succeed(pruned, undefined)
+                : Effect.void;
+            }),
+          ),
+        send: (input) => {
+          if (input.threadId !== work) return Effect.void;
+          const { model: _model, ...message } = input;
+          return lifecycle.send(message);
+        },
+      }),
+    );
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const created = yield* kanban.createCard(
+        board.id,
+        { title: "Queue ordering", prompt: "Work" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      let card = (yield* kanban.card(created.id)).card;
+      work = card.workThreadId!;
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("1394:create"),
+        threadId: work,
+        projectId: ProjectId.make("project-1"),
+        title: "Queue ordering",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "system",
+        creationSource: "server",
+      });
+      yield* lifecycle.send({ threadId: work, text: "Unstarted active run" });
+      if (action === "steer") {
+        yield* kanban.turnEnded(work);
+        const wake = (yield* lifecycle.queuedRuns(work))[0]!;
+        assert.isTrue(wake.userMessageId.startsWith("kanban:wake:nudge:"));
+        yield* kanban.cardThread(card.id, "steer", "Apply round-2 findings", owner);
+        const queued = yield* lifecycle.queuedRuns(work);
+        assert.lengthOf(queued, 1);
+        let records = yield* orchestrator.getThreadRecords(work, ["runs", "messages"]);
+        assert.equal(records.runs.find((run) => run.id === wake.id)!.status, "cancelled");
+        assert.equal(
+          records.messages.find((message) => message.id === queued[0]!.userMessageId)!.text,
+          "Apply round-2 findings",
+        );
+        const before = records.runs.length;
+        const nudgedAt = (yield* kanban.card(card.id)).card.nudgedAt;
+        yield* kanban.turnEnded(work);
+        records = yield* orchestrator.getThreadRecords(work, ["runs", "messages"]);
+        assert.lengthOf(records.runs, before);
+        assert.equal((yield* kanban.card(card.id)).card.nudgedAt, nudgedAt);
+        yield* lifecycle.send({ threadId: work, text: "Owner relay", key: "1394:relay" });
+        assert.deepEqual(
+          (yield* lifecycle.queuedRuns(work)).map((run) => run.id).slice(0, 1),
+          queued.map((run) => run.id),
+        );
+        return;
+      }
+      if (action === "review to todo") {
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: work,
+        });
+        yield* Deferred.await(initialCleaned);
+        yield* kanban.turnEnded(work);
+        yield* kanban.dispatchNow;
+        assert.equal((yield* kanban.card(card.id)).card.stage, "in_review");
+        card = (yield* kanban.card(card.id)).card;
+      }
+      // Simulate a discussion reminder queued after the worker's own move to review.
+      yield* lifecycle.send({ threadId: work, text: "Owner relay", key: "1394:relay" });
+      const scopes = [
+        "nudge",
+        `step:${card.id}`,
+        `plan:${card.id}`,
+        `owner:${card.id}`,
+        "step:other-card",
+      ];
+      for (const scope of scopes)
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`1394:seed:${scope}`),
+          threadId: work,
+          messageId: MessageId.make(`kanban:wake:${scope}:1394`),
+          text: scope,
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "system",
+          creationSource: "server",
+        });
+      const before = yield* lifecycle.queuedRuns(work);
+      expectedCancellations = cancellations + 4;
+      if (action === "review to todo") {
+        yield* kanban.reviewResult(card.activeThreadId!, "findings", ["Fix queue ordering"]);
+        assert.equal((yield* kanban.card(card.id)).card.stage, "todo");
+      } else if (action === "flag") {
+        yield* kanban.flagCard(card.id, "Work blocked", { _tag: "thread", threadId: work });
+      } else {
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: work,
+        });
+      }
+      yield* Deferred.await(pruned);
+      const queued = yield* lifecycle.queuedRuns(work);
+      assert.deepEqual(
+        queued.map((run) => run.id),
+        [before[0]!.id, before.at(-1)!.id],
+      );
+      assert.equal(
+        (yield* orchestrator.getThreadRecords(work, ["runs"])).runs[0]!.status,
+        "starting",
+      );
+      if (action === "review to todo") {
+        yield* kanban.dispatchNow;
+        assert.equal((yield* kanban.card(card.id)).card.activeThreadId, work);
+        const fresh = yield* lifecycle.send({ threadId: work, text: "Fresh assignment" });
+        assert.deepEqual(
+          (yield* lifecycle.queuedRuns(work)).map((run) => run.id),
+          [before[0]!.id, fresh],
+        );
+      }
+    }).pipe(Effect.provide(mode === "inline" ? inlineTestLayer(wrapped) : testLayer(wrapped)));
+  }).pipe(Effect.provide(unstartedLifecycleLayer())),
+);
+
+it.effect("#1394 the turn-end owner discussion reminder has a card wake scope", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { title: "Reminder", prompt: "Work" }, owner);
+      yield* kanban.dispatchNow;
+      const work = (yield* kanban.card(card.id)).card.workThreadId!;
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Please reply" }]);
+      yield* kanban.turnEnded(work);
+      const reminder = fake.sends.find(
+        (send) => send.threadId === work && send.text === Briefs.nudgeDiscussionText(discussion.id),
+      );
+      assert.isDefined(reminder);
+      assert.equal(reminder!.coalesce, `owner:${card.id}`);
+    }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+  }),
 );

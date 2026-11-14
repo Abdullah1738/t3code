@@ -118,7 +118,7 @@ import * as Pages from "./messagePages.ts";
 import { wikiOutline, wikiSection } from "./wikiSections.ts";
 import * as BoardReplies from "./boardReplies.ts";
 import * as ReplyBuilders from "../../http/ReplyBuilders.ts";
-import { KanbanThreads, KanbanThreadError, type KanbanThreadView } from "./threads.ts";
+import { KanbanThreads, KanbanThreadError, queuedWakes, type KanbanThreadView } from "./threads.ts";
 import { KanbanModels, isListed } from "./models.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
 import { planCutoverCardRestore, type RestoreCutoverCardInput } from "./cutoverCards.ts";
@@ -1379,6 +1379,12 @@ type BoardEffect =
       readonly actor: KanbanActor;
     }
   | ({ readonly kind: "tellAnswered" } & AnsweredNotice)
+  | {
+      readonly kind: "pruneWakes";
+      readonly threadId: string;
+      readonly cardId: string;
+      readonly discussionId: string | null;
+    }
   | { readonly kind: "syncPrs"; readonly cardId: string }
   | { readonly kind: "noteDiscussion"; readonly cardId: string; readonly text: string };
 interface OwnerRouteEffect {
@@ -1892,6 +1898,7 @@ const make = Effect.gen(function* () {
         "thread_status",
         locks.outside(threadIo.pendingUserInputs(id), undefined, true),
       ),
+    queuedRuns: (id) => locks.outside(threadIo.queuedRuns(id), undefined, true),
     view: (id) => threadRead("view", id, threadIo.view(id)),
     find: (id) => threadRead("find", id, threadIo.find(id)),
     model: (id, activeRun = false) =>
@@ -2622,8 +2629,12 @@ const make = Effect.gen(function* () {
             Rules.reviewThreadToReuse(yield* boardOf(card.boardId), card) === card.reviewThreadId;
           if (!active && !queued) yield* endReviewLink(card.reviewThreadId);
         }
-        let before = Option.isSome(analytics) ? yield* store.card(card.id) : null;
-        if (before !== null && before.analyticsStageEnteredAt === undefined) {
+        let before = yield* store.card(card.id);
+        if (
+          Option.isSome(analytics) &&
+          before !== null &&
+          before.analyticsStageEnteredAt === undefined
+        ) {
           // Seed old cards from their actual transition history, since queue age may predate it.
           const stage = before.stage;
           const entered = (yield* store.cardEvents(card.id)).findLast(
@@ -2646,6 +2657,30 @@ const make = Effect.gen(function* () {
         const write = store.putCard(card);
         yield* dispatchMetadata ? locks.dispatchMetadata(write) : write;
         yield* SavedWrite.record({ kind: "card", card });
+        if (
+          before !== null &&
+          ((before.activeThreadId !== null && before.activeThreadId !== card.activeThreadId) ||
+            (before.stage !== card.stage &&
+              !KANBAN_THREAD_STAGES.includes(card.stage) &&
+              ["working", "in_review", "needs_review"].includes(before.stage)))
+        ) {
+          // Verdicts and self-flags release without letGo; the saved transition covers all three paths.
+          for (const id of new Set([before.activeThreadId, before.workThreadId])) {
+            if (id === null) continue;
+            yield* later(
+              card.boardId,
+              cardLane(card),
+              {
+                kind: "pruneWakes",
+                threadId: id,
+                cardId: card.id,
+                discussionId: card.discussionId,
+              },
+              pruneWakes(id, card.id, card.discussionId),
+            );
+          }
+        }
+
         for (const event of BoardAnalytics.cardEvents(before, card, actor))
           yield* recordAnalytics(event);
         if (card.stalled?.by._tag === "evaluator") yield* forgetStepWait(card.id);
@@ -2855,6 +2890,23 @@ const make = Effect.gen(function* () {
     const link = known ?? (yield* store.threadLink(threadId));
     if (link?.role !== "review" || link.endedAt !== null) return;
     yield* store.putThreadLink({ ...link, endedAt: at ?? (yield* nowIso) });
+  });
+
+  const pruneWakes = Effect.fn("KanbanService.pruneWakes")(function* (
+    threadId: ThreadId,
+    cardId: string,
+    discussionId: string | null,
+  ) {
+    const scopes = [
+      "nudge",
+      `step:${cardId}`,
+      `plan:${cardId}`,
+      `owner:${cardId}`,
+      ...(discussionId === null ? [] : [`owner:${discussionId}`]),
+    ];
+    for (const wake of queuedWakes(yield* threads.queuedRuns(threadId), Infinity, scopes)) {
+      yield* threads.cancelQueued(threadId, wake.id);
+    }
   });
 
   /**
@@ -5862,6 +5914,8 @@ const make = Effect.gen(function* () {
         return Effect.gen(function* () {
           yield* noteDiscussion(yield* cardOf(KanbanCardId.make(effect.cardId)), effect.text);
         });
+      case "pruneWakes":
+        return pruneWakes(ThreadId.make(effect.threadId), effect.cardId, effect.discussionId);
       case "syncPrs":
         return Effect.gen(function* () {
           yield* syncPrs(yield* cardOf(KanbanCardId.make(effect.cardId)));
@@ -6657,6 +6711,7 @@ const make = Effect.gen(function* () {
         .send({
           threadId,
           text: Briefs.nudgeDiscussionText(discussion.id),
+          coalesce: `owner:${discussion.cardId ?? discussion.id}`,
           ...(participant.deferred
             ? {
                 key: `discussion:${participant.deferredKey ?? `${discussion.id}:${threadId}:${participant.lastReadSeq}`}`,
@@ -7972,11 +8027,19 @@ const make = Effect.gen(function* () {
     cards: ReadonlyArray<KanbanCard>,
     text: string,
   ) {
+    if (
+      (yield* threads.queuedRuns(threadId)).some(
+        (run) => !run.userMessageId.startsWith("kanban:wake:"),
+      )
+    ) {
+      yield* Effect.logDebug("kanban nudge skipped: unread message queued", { threadId });
+      return;
+    }
     // The send is accepted before the gate resumes. Acknowledge it on current rows,
     // like discussion delivery, so a concurrent edit cannot replay the same nudge.
     const sent = yield* locks.outside(
       threads.send({ threadId, text, coalesce: "nudge" }).pipe(
-        Effect.as(true),
+        Effect.map((runId) => runId !== undefined),
         Effect.catchCause(() => Effect.succeed(false)),
       ),
       undefined,
@@ -10342,6 +10405,7 @@ const make = Effect.gen(function* () {
                         .send({
                           threadId: evaluatorId,
                           text: Briefs.ownerWaitingText(discussion, minutes),
+                          coalesce: `owner:${discussion.cardId ?? discussion.id}`,
                         })
                         .pipe(
                           Effect.as(true),

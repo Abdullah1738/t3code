@@ -204,6 +204,7 @@ const fakeThreads = (
           models.set(threadId, model);
         }),
       withdraw: () => Effect.void,
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),

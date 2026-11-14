@@ -109,6 +109,7 @@ export const makeFake = Effect.gen(function* () {
           const thread = all.get(threadId);
           return thread ? new Map(all).set(threadId, { ...thread, model }) : all;
         }),
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),

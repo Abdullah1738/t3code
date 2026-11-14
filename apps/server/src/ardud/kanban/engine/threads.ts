@@ -180,6 +180,9 @@ export interface KanbanThreadsShape {
     threadId: ThreadId,
     model: ModelSelection,
   ) => Effect.Effect<void, KanbanThreadError>;
+  readonly queuedRuns: (
+    threadId: ThreadId,
+  ) => Effect.Effect<ReadonlyArray<OrchestrationV2Run>, KanbanThreadError>;
   /** Cancels only this queued brief; false means it may already be acting. */
   readonly cancelQueued: (threadId: ThreadId, runId: string) => Effect.Effect<boolean>;
   /** A thread that no longer exists counts as stopped; a failed read or stop fails. */
@@ -213,6 +216,24 @@ export const coalesceTarget = <
   }
   return oldest;
 };
+
+export const queuedWakes = <
+  R extends Pick<OrchestrationV2Run, "ordinal" | "status" | "userMessageId">,
+>(
+  runs: ReadonlyArray<R>,
+  beforeOrdinal = Infinity,
+  scopes?: ReadonlyArray<string>,
+): R[] =>
+  runs
+    .filter(
+      (run) =>
+        run.status === "queued" &&
+        run.ordinal < beforeOrdinal &&
+        run.userMessageId.startsWith("kanban:wake:") &&
+        (scopes === undefined ||
+          scopes.some((scope) => run.userMessageId.startsWith(`kanban:wake:${scope}:`))),
+    )
+    .toSorted((a, b) => a.ordinal - b.ordinal);
 
 const commandId = (prefix: string) => CommandId.make(`kanban:${prefix}:${NodeCrypto.randomUUID()}`);
 
@@ -582,6 +603,17 @@ const make = Effect.gen(function* () {
       if (shell === null || shell.deletedAt !== null) {
         return yield* new KanbanThreadError({ operation: "send", detail: "thread not found" });
       }
+      if (
+        input.coalesce === "nudge" &&
+        (yield* queuedRuns(input.threadId)).some(
+          (run) => !run.userMessageId.startsWith("kanban:wake:"),
+        )
+      ) {
+        yield* Effect.logDebug("kanban nudge skipped: unread message queued", {
+          threadId: input.threadId,
+        });
+        return;
+      }
       let id = yield* sendId(input);
       if (id === undefined) return;
       // Queue edits cannot change a run's model selection or steer a live turn.
@@ -637,6 +669,12 @@ const make = Effect.gen(function* () {
             detail: "withdrawal did not steer a live run",
             rejected: true,
           });
+        }
+        if (scope === undefined && sent.delivery === "queued") {
+          const records = yield* threads.getThreadRecords(input.threadId, ["runs"]);
+          for (const wake of queuedWakes(records.runs, sent.run.ordinal)) {
+            yield* cancelQueued(input.threadId, wake.id);
+          }
         }
         return sent.run.id;
       });
@@ -699,6 +737,17 @@ const make = Effect.gen(function* () {
       isKanbanThreadError(error)
         ? error
         : new KanbanThreadError({ operation: "setModel", detail: detailOf(error) }),
+    ),
+  );
+
+  const queuedRuns: KanbanThreadsShape["queuedRuns"] = Effect.fn("KanbanThreads.queuedRuns")(
+    function* (threadId) {
+      return (yield* threads.getThreadRecords(threadId, ["runs"])).runs.filter(
+        (run) => run.status === "queued",
+      );
+    },
+    Effect.mapError(
+      (error) => new KanbanThreadError({ operation: "queue", detail: detailOf(error) }),
     ),
   );
 
@@ -812,6 +861,7 @@ const make = Effect.gen(function* () {
     send,
     withdraw,
     setModel,
+    queuedRuns,
     cancelQueued,
     interrupt,
   });

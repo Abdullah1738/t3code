@@ -38,6 +38,7 @@ import * as ThreadManagementService from "../../../orchestration-v2/ThreadManage
 import {
   backgroundWorkOf,
   coalesceTarget,
+  queuedWakes,
   KanbanThreadError,
   KanbanThreads,
   layer,
@@ -1448,8 +1449,8 @@ it.effect.each([
         text: "First snapshot",
         key: "coalesce:first",
       };
-      const first = yield* threads.send(wake);
       yield* threads.send({ threadId, text: "Owner message", key: "owner" });
+      const first = yield* threads.send(wake);
       yield* threads.send({ threadId, text: "Other card", coalesce: "step:B", key: "other" });
       yield* threads.send({ threadId, text: "Plan", coalesce: "plan:A", key: "plan" });
       let records = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
@@ -1498,8 +1499,8 @@ it.effect.each([
         expect(updated).toBe(first);
         expect(texts).toEqual([
           "Unstarted active run",
-          "Newest snapshot",
           "Owner message",
+          "Newest snapshot",
           "Other card",
           "Plan",
         ]);
@@ -1521,6 +1522,10 @@ it.effect.each([
             (message) => message.id === target.userMessageId,
           )?.text,
         ).toBe(latest.text);
+        // A rejection other than the start race must never become a new send.
+        const empty = yield* Effect.result(threads.send({ ...latest, text: "", key: "empty" }));
+        expect(Result.isFailure(empty)).toBe(true);
+        expect((yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs).toHaveLength(5);
         yield* threads.send({
           ...latest,
           key: "new-model",
@@ -1528,10 +1533,6 @@ it.effect.each([
         });
         const modelRun = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.at(-1)!;
         expect(modelRun.userMessageId).toBe("kanban:new-model");
-        // A rejection other than the start race must never become a new send.
-        const empty = yield* Effect.result(threads.send({ ...latest, text: "", key: "empty" }));
-        expect(Result.isFailure(empty)).toBe(true);
-        expect((yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs).toHaveLength(6);
         yield* projections
           .apply({
             id: EventId.make("coalesce:same-started"),
@@ -1548,8 +1549,8 @@ it.effect.each([
         expect(updated).not.toBe(first);
         expect(texts).toEqual([
           "Unstarted active run",
-          "First snapshot",
           "Owner message",
+          "First snapshot",
           "Other card",
           "Plan",
           "Newest snapshot",
@@ -1645,3 +1646,42 @@ it.effect.each([
     );
   }),
 );
+
+describe("queuedWakes", () => {
+  const run = (
+    ordinal: number,
+    userMessageId: string,
+    status: "queued" | "running" | "completed" | "cancelled" = "queued",
+  ) => ({ ordinal, userMessageId: MessageId.make(userMessageId), status });
+  it("selects only queued snapshots older than the new message, in order", () => {
+    const first = run(2, "kanban:wake:nudge:old");
+    const second = run(4, "kanban:wake:owner:A:old");
+    expect(
+      queuedWakes(
+        [
+          second,
+          run(1, "kanban:steer"),
+          run(3, "owner:relay"),
+          first,
+          run(5, "kanban:wake:nudge:same"),
+          run(6, "kanban:wake:nudge:new"),
+          ...(["running", "completed", "cancelled"] as const).map((status) =>
+            run(1, "kanban:wake:nudge:active", status),
+          ),
+        ],
+        5,
+      ),
+    ).toEqual([first, second]);
+  });
+  it.each(["step:A", "plan:A", "owner:A", "owner:discussion-A", "nudge"])(
+    "matches exact scope %s",
+    (scope) => {
+      const target = run(1, `kanban:wake:${scope}:id`);
+      expect(
+        queuedWakes([target, run(2, `kanban:wake:${scope}B:id`), run(3, "kanban:real")], Infinity, [
+          scope,
+        ]),
+      ).toEqual([target]);
+    },
+  );
+});
