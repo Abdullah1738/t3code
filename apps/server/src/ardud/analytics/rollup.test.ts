@@ -1,5 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
-import { LONG_TASK_HISTOGRAM_RATIO, type AnalyticsEvent } from "@t3tools/contracts";
+import type { AnalyticsEvent, RunUsageEvent } from "@t3tools/contracts";
+import { LONG_TASK_HISTOGRAM_RATIO } from "@t3tools/contracts";
 
 import { sampleMix } from "./samples.ts";
 import { accumulate, boundedLines, finishRollup, makeAccumulator } from "./rollup.ts";
@@ -337,6 +338,73 @@ describe("analytics rollups", () => {
     assert.isAtLeast(timings.p50Ms!, 0.25);
     assert.isBelow(timings.p50Ms!, 0.255);
   });
+});
+
+it("rolls up usage by model, role, board and card, without counting cache twice", () => {
+  const accumulator = makeAccumulator();
+  const row: RunUsageEvent = {
+    ts,
+    kind: "run.usage",
+    surface: "server",
+    route: "provider",
+    runId: "run:1",
+    threadId: "thread:one",
+    boardId: "robob",
+    cardId: "card:one",
+    role: "work",
+    providerInstance: "codex",
+    model: "gpt-6.1-sol",
+    effort: "max",
+    inputTokens: 100,
+    outputTokens: 20,
+    cachedInputTokens: 80,
+    reasoningTokens: 10,
+    wallMs: 1000,
+    turnCount: 1,
+    endReason: "completed",
+    usageStatus: "complete",
+    reviewRound: null,
+  };
+  accumulate(accumulator, row);
+  accumulate(accumulator, row); // An ambiguous append replay.
+  for (const [runId, role, reviewRound] of [
+    ["2", "review", 1],
+    ["3", "review", 1],
+    ["4", "review", 2],
+    ["5", "evaluator", null],
+  ] as const)
+    accumulate(accumulator, { ...row, runId, role, reviewRound });
+  accumulate(accumulator, {
+    ...row,
+    runId: "6",
+    cardId: "card:two",
+    model: "unsupported",
+    role: "discussion",
+    inputTokens: null,
+    outputTokens: null,
+    cachedInputTokens: null,
+    reasoningTokens: null,
+    wallMs: 10000,
+    usageStatus: "unavailable",
+  });
+  const usage = finishRollup(accumulator, "2026-11-13", ts).usage;
+  assert.equal(usage.totals.runs, 6);
+  assert.equal(usage.totals.inputTokens, 500);
+  assert.equal(usage.totals.outputTokens, 100);
+  assert.equal(usage.totals.cachedInputTokens, 400);
+  assert.equal(usage.totals.reasoningTokens, 50);
+  assert.equal(usage.totals.wallMs, 15000);
+  assert.equal(usage.perBoard[0]?.runs, 6);
+  assert.equal(usage.perRole.find((r) => r.role === "review")?.runs, 3);
+  assert.equal(usage.perModel.find((r) => r.model === "unsupported")?.inputTokens, null);
+  assert.equal(usage.cards.find((r) => r.cardId === "card:one")?.reviewRounds, 2);
+  assert.equal(usage.cards.find((r) => r.cardId === "card:one")?.evaluatorWakes, 1);
+  assert.equal(usage.cards.find((r) => r.cardId === "card:two")?.evaluatorWakes, 1);
+  assert.equal(usage.topCardsByTokens[0]?.cardId, "card:one");
+  assert.equal(usage.topCardsByWallMs[0]?.cardId, "card:two");
+  for (let i = 0; i < 25; i++)
+    accumulate(accumulator, { ...row, runId: `extra:${i}`, cardId: `card:extra:${i}` });
+  assert.equal(finishRollup(accumulator, "2026-11-13", ts).usage.topCardsByTokens.length, 20);
 });
 
 describe("board analytics", () => {

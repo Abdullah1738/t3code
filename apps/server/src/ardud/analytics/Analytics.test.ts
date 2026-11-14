@@ -1,6 +1,12 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
-import { AnalyticsError, LONG_TASK_HISTOGRAM_RATIO, type AnalyticsEvent } from "@t3tools/contracts";
+import {
+  AnalyticsError,
+  CommandId,
+  LONG_TASK_HISTOGRAM_RATIO,
+  AnalyticsEvent,
+} from "@t3tools/contracts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -8,6 +14,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -360,7 +367,7 @@ describe("Analytics", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
   it.effect(
-    "reads the ask split from existing records and filters by board without recording text",
+    "reads the ask split by board/card while persisting the full day without text",
     () =>
       Effect.gen(function* () {
         const setup = yield* fixture;
@@ -384,8 +391,12 @@ describe("Analytics", () => {
             firstSeen: { web: `${day}T02:00:00.000Z`, mobile: `${day}T02:30:00.000Z` },
           },
         };
-        for (const board of ["board-a", "board-b"])
-          yield* sql`INSERT INTO ardud_kanban_cards VALUES (${board}, ${board}, ${JSON.stringify({ asks: [ask] })})`;
+        for (const [cardId, boardId] of [
+          ["card-a", "board-a"],
+          ["card-b", "board-a"],
+          ["card-c", "board-b"],
+        ])
+          yield* sql`INSERT INTO ardud_kanban_cards VALUES (${cardId}, ${boardId}, ${JSON.stringify({ asks: [ask] })})`;
         const boards = { sql, ready: Effect.void, path: ":memory:" };
         let scans = 0;
         const tracked = FileSystem.FileSystem.of({
@@ -400,12 +411,26 @@ describe("Analytics", () => {
         yield* analytics.ingest({
           events: [event({ kind: "ask.answered" }), event({ kind: "ask.seen" })],
         });
+        yield* analytics.record(event({ kind: "server.rpc", surface: "server", route: "rpc" }));
         const result = yield* analytics.read({ day, boardId: "board-a" });
-        assert.equal(result.rollup.askLatency.createdToAnswered.count, 1);
+        assert.equal(result.rollup.askLatency.createdToAnswered.count, 2);
         assert.equal(result.rollup.askLatency.sentToSeen.p50Ms, 50 * 60_000);
         assert.equal(result.rollup.askLatency.seenToAnswered.p50Ms, 60 * 60_000);
         assert.equal(result.rollup.askLatency.source, "stored-asks");
-        assert.equal((yield* analytics.read({ day })).rollup.askLatency.createdToAnswered.count, 2);
+        assert.equal((yield* analytics.read({ day })).rollup.askLatency.createdToAnswered.count, 3);
+        for (const [filter, count] of [
+          [{ cardId: "card-a" }, 1],
+          [{ boardId: "board-a", cardId: "card-a" }, 1],
+          [{ boardId: "board-b", cardId: "card-a" }, 0],
+          [{ cardId: "missing" }, 0],
+        ] as const) {
+          const filtered = yield* analytics.read({ day, ...filter });
+          assert.equal(filtered.rollup.askLatency.createdToAnswered.count, count);
+          const persisted = JSON.parse(
+            yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
+          ) as AnalyticsRollup;
+          assert.equal(persisted.askLatency.createdToAnswered.count, 3);
+        }
         assert.lengthOf(result.samples, 0);
         assert.isFalse(JSON.stringify(result).includes("private"));
         const before = scans;
@@ -426,7 +451,7 @@ describe("Analytics", () => {
         const persisted = JSON.parse(
           yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
         ) as AnalyticsRollup;
-        assert.equal(persisted.askLatency.createdToAnswered.count, 2);
+        assert.equal(persisted.askLatency.createdToAnswered.count, 3);
         assert.equal(persisted.askLatency.sentToSeen.p50Ms, 20 * 60_000);
         assert.isFalse(JSON.stringify(persisted).includes("private"));
       }).pipe(Effect.provide(Sqlite.layerMemory.pipe(Layer.provideMerge(NodeServices.layer)))),
@@ -821,6 +846,130 @@ describe("Analytics", () => {
   );
 });
 
+it.effect("reads run usage by card and kind with capped samples and persists the full rollup", () =>
+  Effect.gen(function* () {
+    const setup = yield* fixture;
+    const analytics = yield* open(setup);
+    for (let i = 0; i < 4; i++)
+      yield* analytics.record({
+        ts,
+        kind: "run.usage",
+        surface: "server",
+        route: "provider",
+        runId: `run:${i}`,
+        threadId: "thread:one",
+        boardId: "robob",
+        cardId: i < 3 ? "card:one" : "card:two",
+        role: "work",
+        providerInstance: "codex",
+        model: "Claude Opus 5[1m]",
+        effort: null,
+        inputTokens: null,
+        outputTokens: null,
+        cachedInputTokens: null,
+        reasoningTokens: null,
+        wallMs: 50,
+        turnCount: 1,
+        endReason: "interrupted",
+        usageStatus: "unavailable",
+        reviewRound: null,
+      });
+    yield* analytics.record(event({ cardId: "card:one" }));
+    const result = yield* analytics.read({ day, kind: "run.usage", cardId: "card:one", limit: 2 });
+    assert.lengthOf(result.samples, 2);
+    assert.equal(result.rollup.usage.totals.runs, 3);
+    assert.equal(result.rollup.usage.totals.inputTokens, null);
+    assert.isTrue(
+      result.samples.every((row) => row.kind === "run.usage" && row.cardId === "card:one"),
+    );
+    const persisted = JSON.parse(
+      yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
+    );
+    assert.equal(persisted.usage.totals.runs, 4);
+    const lines = (yield* setup.fs.readFileString(`${setup.directory}/${day}.ndjson`))
+      .trim()
+      .split("\n");
+    assert.equal(lines.filter((line) => JSON.parse(line).kind === "run.usage").length, 4);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+const delegatedUsageKeys = [
+  ["plain", "review-1338_v1.2"],
+  ["parentheses", "review(1338)"],
+  ["bang", "review!1338"],
+  ["apostrophe", "review'1338"],
+  ["star", "review*1338"],
+  ["tilde", "review~1338"],
+  ["separators", "review:/#@%+1338"],
+  ["whitespace", "review 1338\tunit"],
+  ["unicode", "مراجعة-1338"],
+  ["maximum-key", "界".repeat(256)],
+] as const;
+const delegatedUsage = (key: string) => {
+  const threadId = IdAllocator.derive.delegatedTaskThread({
+    commandId: CommandId.make(`command:mcp:delegate-task:caller:${encodeURIComponent(key)}`),
+  });
+  const runId = IdAllocator.derive.run({ threadId, ordinal: 1 });
+  return {
+    ts,
+    kind: "run.usage" as const,
+    surface: "server" as const,
+    route: "provider",
+    runId,
+    threadId,
+    boardId: "robob",
+    cardId: "card:1338",
+    role: "delegated" as const,
+    providerInstance: "codex",
+    model: "gpt-6.1-sol",
+    effort: null,
+    inputTokens: 123,
+    outputTokens: 45,
+    cachedInputTokens: null,
+    reasoningTokens: null,
+    wallMs: 50,
+    turnCount: 1,
+    endReason: "completed" as const,
+    usageStatus: "partial" as const,
+    reviewRound: null,
+  };
+};
+const delegatedUsageCases = delegatedUsageKeys.map(([name, key]) => ({ name, key }));
+const decodeUsage = Schema.decodeUnknownSync(AnalyticsEvent, { onExcessProperty: "error" });
+it.each(delegatedUsageCases)("accepts derived usage IDs with $name allocator keys", ({ key }) => {
+  const row = delegatedUsage(key);
+  assert.deepEqual(decodeUsage(row), row);
+});
+// The maximum key's two IDs exceed the 8 KiB row cap; its schema is checked above.
+it.effect.each(delegatedUsageCases.filter(({ name }) => name !== "maximum-key"))(
+  "persists delegated run usage and card/model totals with $name allocator keys",
+  ({ key }) =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const row = delegatedUsage(key);
+      yield* analytics.record(row);
+      const result = yield* analytics.read({ day, kind: "run.usage", cardId: row.cardId });
+      assert.deepEqual(result.samples, [row]);
+      assert.deepInclude(result.rollup.usage.cards[0], {
+        cardId: row.cardId,
+        runs: 1,
+        inputTokens: 123,
+        outputTokens: 45,
+      });
+      assert.deepInclude(result.rollup.usage.perModel[0], {
+        model: row.model,
+        runs: 1,
+        inputTokens: 123,
+        outputTokens: 45,
+      });
+      const lines = (yield* setup.fs.readFileString(`${setup.directory}/${day}.ndjson`))
+        .trim()
+        .split("\n");
+      assert.deepEqual(lines.map((line) => JSON.parse(line)), [row]);
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.effect(
   "reads cached rollups for 250k retained events under one second and updates warm filtered views incrementally",
   () =>
@@ -883,5 +1032,48 @@ it.effect("invalidates cached views after external replacement", () =>
     const result = yield* analytics.read({ day });
     assert.equal(result.rollup.total, 2);
     assert.deepEqual(result.rollup.kindCounts, { "replacement.event": 2 });
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("keeps card usage views distinct through repeated reads and appends", () =>
+  Effect.gen(function* () {
+    const setup = yield* fixture;
+    const analytics = yield* open(setup);
+    for (const row of [
+      { ...delegatedUsage("cache-a1"), cardId: "card:a", inputTokens: 100 },
+      { ...delegatedUsage("cache-b1"), cardId: "card:b", inputTokens: 200 },
+    ])
+      yield* analytics.record(row);
+    for (const [filter, tokens] of [
+      [{ cardId: "card:a" }, 100],
+      [{ cardId: "card:b" }, 200],
+      [{ kind: "run.usage", cardId: "card:a" }, 100],
+      [{ kind: "run.usage", cardId: "card:b" }, 200],
+    ] as const) {
+      const result = yield* analytics.read({ day, ...filter });
+      assert.equal(result.rollup.usage.totals.runs, 1);
+      assert.equal(result.rollup.usage.totals.inputTokens, tokens);
+    }
+    yield* analytics.record({
+      ...delegatedUsage("cache-a2"),
+      cardId: "card:a",
+      inputTokens: 50,
+    });
+    for (const [filter, runs, tokens] of [
+      [{ cardId: "card:b" }, 1, 200],
+      [{ cardId: "card:a" }, 2, 150],
+      [{ kind: "run.usage", cardId: "card:b" }, 1, 200],
+      [{ kind: "run.usage", cardId: "card:a" }, 2, 150],
+    ] as const) {
+      const result = yield* analytics.read({ day, ...filter });
+      assert.equal(result.rollup.usage.totals.runs, runs);
+      assert.equal(result.rollup.usage.totals.inputTokens, tokens);
+      assert.isTrue(result.samples.every((row) => row.cardId === filter.cardId));
+      const persisted = JSON.parse(
+        yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
+      ) as AnalyticsRollup;
+      assert.equal(persisted.usage.totals.runs, 3);
+      assert.equal(persisted.usage.totals.inputTokens, 350);
+    }
   }).pipe(Effect.provide(NodeServices.layer)),
 );

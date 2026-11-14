@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
-import { AnalyticsEvent, AnalyticsIngestInput, AnalyticsReadInput } from "./analytics.ts";
+import {
+  AnalyticsEvent,
+  RunUsageEvent,
+  AnalyticsIngestInput,
+  AnalyticsReadInput,
+} from "./analytics.ts";
 import { clientRpcRequiredScopes } from "../clientRpcPermissions.ts";
 import { AuthOrchestrationOperateScope } from "../auth.ts";
 import { WS_METHODS } from "../rpc.ts";
@@ -15,6 +20,7 @@ const event = {
 const decode = Schema.decodeUnknownSync(AnalyticsIngestInput);
 const decodeEvent = Schema.decodeUnknownSync(AnalyticsEvent);
 const decodeRead = Schema.decodeUnknownSync(AnalyticsReadInput);
+const decodeRunUsage = Schema.decodeUnknownSync(RunUsageEvent, { onExcessProperty: "error" });
 describe("analytics ingest contract", () => {
   it("preserves typed board metadata and excludes text", () => {
     const input = {
@@ -98,4 +104,87 @@ describe("analytics ingest contract", () => {
     ])
       expect(() => read(input)).toThrow();
   });
+});
+
+const usage = {
+  ts: event.ts,
+  kind: "run.usage",
+  surface: "server",
+  route: "provider",
+  runId: "run:one",
+  threadId: "thread:one",
+  role: "chat",
+  providerInstance: "codex",
+  model: "gpt-6.1-sol",
+  effort: "max",
+  inputTokens: null,
+  outputTokens: null,
+  cachedInputTokens: null,
+  reasoningTokens: null,
+  wallMs: null,
+  turnCount: 0,
+  endReason: "failed",
+  usageStatus: "unavailable",
+  reviewRound: null,
+};
+it("requires the metadata-only usage schema and preserves null measurements", () => {
+  const decodeUsage = Schema.decodeUnknownSync(RunUsageEvent, { onExcessProperty: "error" });
+  expect(decodeUsage(usage)).toEqual(usage);
+  for (const key of ["prompt", "message", "text", "toolArgs", "toolOutput", "output"]) {
+    expect(() => decodeUsage({ ...usage, [key]: "private" })).toThrow();
+  }
+  const decodeEvent = Schema.decodeUnknownSync(AnalyticsEvent, { onExcessProperty: "error" });
+  expect(() =>
+    decodeEvent({ ts: event.ts, kind: "run.usage", surface: "server", route: "provider" }),
+  ).toThrow();
+  expect(() => decode({ events: [{ ...usage, surface: "web" }] })).toThrow();
+  expect(() => decodeUsage({ ...usage, inputTokens: -1 })).toThrow();
+  expect(
+    Schema.decodeUnknownSync(AnalyticsReadInput)({
+      day: "2026-11-13",
+      kind: "run.usage",
+      cardId: "card:one",
+    }).cardId,
+  ).toBe("card:one");
+});
+
+it.each(["runId", "threadId"] as const)("accepts bounded derived usage %s values", (field) => {
+  const decodeUsage = Schema.decodeUnknownSync(RunUsageEvent);
+  for (const value of ["derived:review!~'()*1338", "a".repeat(8192)]) {
+    expect(decodeUsage({ ...usage, [field]: value })[field]).toBe(value);
+  }
+  for (const value of ["a".repeat(8193), "unencoded space", "unencoded界", "line\nbreak"]) {
+    expect(() => decodeUsage({ ...usage, [field]: value })).toThrow();
+  }
+});
+
+it.each([
+  ["plain", "review-1338_v1.2"],
+  ["parentheses", "review(1338)"],
+  ["bang", "review!1338"],
+  ["apostrophe", "review'1338"],
+  ["star", "review*1338"],
+  ["tilde", "review~1338"],
+  ["separators", "review:/#@%+1338"],
+  ["whitespace", "review 1338\tunit"],
+  ["unicode", "مراجعة-1338"],
+  ["maximum-key", "界".repeat(256)],
+] as const)("accepts %s allocator keys in both run usage IDs", (_name, key) => {
+  const commandId = `command:mcp:delegate-task:caller:${encodeURIComponent(key)}`;
+  const threadId = `thread:delegated-task:${encodeURIComponent(commandId)}`;
+  const runId = `run:thread:${encodeURIComponent(threadId)}:ordinal:1`;
+  const row = { ...usage, threadId, runId };
+  expect(decodeRunUsage(row)).toEqual(row);
+  expect(decodeEvent(row)).toEqual(row);
+});
+
+it.each([
+  "claude-opus-5[1m]",
+  "Claude Opus 5.5",
+  "vendor/model:variant@2026-11-13",
+  "vendor/model|route?hint=value",
+  "m".repeat(161),
+  "m".repeat(4096),
+])("accepts provider-owned model identifiers: %s", (model) => {
+  expect(Schema.decodeUnknownSync(RunUsageEvent)({ ...usage, model }).model).toBe(model);
 });
