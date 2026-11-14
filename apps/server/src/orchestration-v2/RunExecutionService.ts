@@ -1,4 +1,9 @@
 import {
+  PROVIDER_START_CLEANUP_TIMEOUT_MS,
+  nativeOutputAcknowledgesStart,
+  withoutProviderStartDeadline,
+} from "./providerStartDeadlinePolicy.ts";
+import {
   claudeRecoveryExcluded,
   isAutomaticClaudeRecovery,
   nextLaunchRecovery,
@@ -1334,7 +1339,7 @@ export const layer: Layer.Layer<
               attemptOrdinal,
             });
             const run = {
-              ...input.run,
+              ...withoutProviderStartDeadline(input.run),
               status: "starting" as const,
               activeAttemptId: attemptId,
               ...(launch === undefined
@@ -1719,7 +1724,12 @@ export const layer: Layer.Layer<
                 continue;
               }
               const stopped = yield* input.session
-                .interruptTurn({ providerThread, providerTurnId })
+                .interruptTurn({
+                  providerThread,
+                  providerTurnId,
+                  requestRuntimeRestart: false,
+                  stopBackgroundWork: false,
+                })
                 .pipe(Effect.timeout("30 seconds"), Effect.exit);
               if (Exit.isSuccess(stopped)) {
                 yield* Ref.set(orphanStopConfirmed, true);
@@ -1752,6 +1762,7 @@ export const layer: Layer.Layer<
               ),
             ),
         );
+        let observedRootTurn: OrchestrationV2ProviderTurn | undefined;
         const providerEventFiber = yield* eventSubscription.events.pipe(
           Stream.mapEffect((event) =>
             Effect.gen(function* () {
@@ -1834,6 +1845,49 @@ export const layer: Layer.Layer<
               yield* observeFirstToken(event);
               yield* usage.observe(event);
               yield* observeNativeLifecycle(event);
+              const rootTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
+              if (event.type === "provider_turn.updated" && event.providerTurn.id === rootTurnId) {
+                observedRootTurn = {
+                  ...event.providerTurn,
+                  ...(observedRootTurn?.promptAcceptedAt === undefined
+                    ? {}
+                    : { promptAcceptedAt: observedRootTurn.promptAcceptedAt }),
+                };
+              }
+              // Acceptance belongs to native lifecycle, before presentation can
+              // hold streamed text until a paragraph or the whole turn ends.
+              if (
+                event.type === "turn_item.updated" &&
+                event.turnItem.providerTurnId === rootTurnId &&
+                nativeOutputAcknowledgesStart(event.turnItem) &&
+                observedRootTurn !== undefined &&
+                observedRootTurn.promptAcceptedAt === undefined
+              ) {
+                const acknowledged = { ...observedRootTurn, promptAcceptedAt: yield* DateTime.now };
+                yield* providerEventIngestor.ingestNormalized({
+                  analyticsContext: {
+                    modelSelection: input.modelSelection,
+                    runtimeMode: input.runtimePolicy.runtimeMode,
+                    interactionMode: input.runtimePolicy.interactionMode,
+                  },
+                  providerSessionId: input.providerSessionId,
+                  providerInstanceId: input.run.providerInstanceId,
+                  threadId: input.run.threadId,
+                  runId: input.run.id,
+                  nodeId: input.rootNode.id,
+                  event: {
+                    type: "provider_turn.updated",
+                    driver: event.driver,
+                    providerTurn: acknowledged,
+                  },
+                  writeIfRunCurrent: {
+                    runId: input.run.id,
+                    activeAttemptId: input.attempt.id,
+                    expectedStatus: "running",
+                  },
+                });
+                observedRootTurn = acknowledged;
+              }
               // Native completion remains termination evidence even if persisting it fails.
               if (event.type === "turn.terminal") {
                 yield* Ref.set(rootTerminalSeen, true);
@@ -1841,7 +1895,11 @@ export const layer: Layer.Layer<
               }
               let storedEventCount = 0;
               const deliveredEvent = filterAssistantEvent(
-                event,
+                event.type === "provider_turn.updated" &&
+                  event.providerTurn.id === rootTurnId &&
+                  observedRootTurn !== undefined
+                  ? { ...event, providerTurn: observedRootTurn }
+                  : event,
                 DateTime.toEpochMillis(yield* DateTime.now),
               );
               if (deliveredEvent) {
@@ -2208,6 +2266,7 @@ export const layer: Layer.Layer<
               providerThread: input.providerThread,
               runId: input.run.id,
               attemptId: input.attemptId,
+              stopBackgroundWork: false,
             })
             ?.pipe(
               Effect.catchCause((cause) =>
@@ -2236,6 +2295,15 @@ export const layer: Layer.Layer<
           // The event fiber is detached; an interrupted start must not leak it.
           Effect.onInterrupt(() =>
             stopStartingRun.pipe(
+              Effect.interruptible,
+              Effect.timeout(PROVIDER_START_CLEANUP_TIMEOUT_MS),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("Provider start cancellation remains unconfirmed", {
+                  runId: input.run.id,
+                  attemptId: input.attemptId,
+                  cause,
+                }),
+              ),
               Effect.ensuring(stopProviderEventIngestion),
               // A wrapper can still be awaiting admission without a native turn to terminalize.
               Effect.andThen(deferUsage()),

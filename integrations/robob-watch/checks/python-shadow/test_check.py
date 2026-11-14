@@ -78,6 +78,8 @@ class ShadowCheckTests(unittest.TestCase):
             ("old-delivery", 7, {"fires": 7, "last_fire_at": "2026-11-12T12:00:00Z"}, None, True),
             ("check-failed", 7, {"fires": 7, "consecutive_failures": 5}, None, True),
             ("unrelated-pending", 7, {"fires": 7, "pending": {"event": "another event"}}, None, True),
+            ("unrelated-batch", 7, {"fires": 7, "batch": {"events": ["another event"]}}, None, True),
+            ("accepted-batch-before-ack", 7, {"fires": 7, "batch": {"events": ["MATCH"]}}, None, False),
             ("stale-ack", 7, {"fires": 7}, "older-run", True),
             ("accepted-ack", 7, {"fires": 7}, "r1", False),
             ("accepted-before-ack", 7, {"fires": 7, "pending": {"event": "MATCH"}}, None, False),
@@ -100,6 +102,8 @@ class ShadowCheckTests(unittest.TestCase):
                 if runner_after is not None:
                     if name == "accepted-before-ack":
                         runner_after["pending"]["event"] = first
+                    if runner_after.get("batch") and runner_after["batch"]["events"] == ["MATCH"]:
+                        runner_after["batch"]["events"] = [first]
                     runner_file.write_text(json.dumps(runner_after))
                 if ack is not None:
                     (watch_dir / ".run-ok").write_text(ack)

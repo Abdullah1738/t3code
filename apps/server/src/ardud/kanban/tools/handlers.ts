@@ -18,6 +18,7 @@ import {
 } from "@t3tools/contracts";
 import { resolvedContext } from "../../analytics/McpCall.ts";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
@@ -28,6 +29,7 @@ import * as ThreadManagementService from "../../../orchestration-v2/ThreadManage
 import type { EvaluatorPurpose } from "../engine/briefs.ts";
 import { modelSelectionResult } from "../engine/defaults.ts";
 import * as Asks from "../engine/asks.ts";
+import { askGateWarning, secretKindApprovalWarning } from "../engine/subtasks.ts";
 import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
 import { cardMatches, isCardNumber } from "../engine/cardSearch.ts";
 import { textProblem } from "../engine/text.ts";
@@ -450,10 +452,12 @@ const handlers = {
           const rows = Activity.activeCards(read.cards, byCard, window).map((card) =>
             Activity.compactRow(card, byCard.get(card.id) ?? [], window),
           );
+          const at = DateTime.formatIso(yield* DateTime.now);
           return Activity.pageRowsInReply(rows, input.after ?? 0, limit, (cards, cursor) => ({
             board: {
               id: board.id,
               name: board.name,
+              ...BoardReplies.boardReleaseSummary(board, at),
               window,
               legend: Activity.COMPACT_LEGEND,
               activeCards: rows.length,
@@ -472,7 +476,11 @@ const handlers = {
         const cards = snapshot.cards.slice(0, limit);
         return {
           board: {
-            ...BoardReplies.compactBoard({ ...snapshot, cards }),
+            ...BoardReplies.compactBoard(
+              { ...snapshot, cards },
+              undefined,
+              DateTime.formatIso(yield* DateTime.now),
+            ),
             page: { limit, hasMore, nextAfter: hasMore ? cards.at(-1)!.number : null },
           },
           prompts: "omitted; card_get returns a card's prompt",
@@ -595,10 +603,27 @@ const handlers = {
               Effect.catchTags({ KanbanError: () => Effect.succeed(null) }),
             )
           : null;
+        const dependencyBoard =
+          dependency !== null && dependency.boardId !== card.boardId
+            ? ((yield* service.boards).find((board) => board.id === dependency.boardId)?.name ??
+              dependency.boardId)
+            : undefined;
+        const waitTargets =
+          dependency === null
+            ? undefined
+            : new Map([
+                [
+                  dependency.id as string,
+                  {
+                    ...dependency,
+                    ...(dependencyBoard === undefined ? {} : { boardName: dependencyBoard }),
+                  },
+                ],
+              ]);
         const waitMessage =
           card.wait !== undefined &&
           (moved.stage !== card.stage || moved.movedAt !== card.movedAt || moved.wait === undefined)
-            ? `Wait ${waitingFor(card.wait, dependency === null ? undefined : new Map([[dependency.id as string, dependency]]))} ${
+            ? `Wait ${waitingFor(card.wait, waitTargets)} ${
                 moved.wait === undefined
                   ? "cleared by this move; set it again with card_wait or pass keepWait"
                   : "kept"
@@ -630,14 +655,26 @@ const handlers = {
         if (caller.link?.role === "review") {
           return yield* refuse("Review threads put questions in their findings.");
         }
+        const board = (yield* service.boards).find((entry) => entry.id === card.boardId);
         const asked = yield* service.askOwner(
           card.id,
           { ...askFieldsOf(input), question: input.question, blocking: input.blocking ?? false },
           caller.actor,
           isCardThread(caller) ? "cardThread" : "evaluator",
         );
-        // The newest ask is the one just added.
-        return { card: Asks.askSummary(asked, asked.asks.at(-1)?.id ?? "") };
+        const ask = asked.asks.at(-1);
+        const note = ask
+          ? [
+              askGateWarning(asked, ask, board?.guessedGates),
+              secretKindApprovalWarning(asked, ask, board?.guessedGates),
+            ]
+              .filter((warning) => warning !== undefined)
+              .join(" ")
+          : "";
+        return {
+          card: Asks.askSummary(asked, ask?.id ?? ""),
+          ...(note ? { note } : {}),
+        };
       }),
     ),
   ),

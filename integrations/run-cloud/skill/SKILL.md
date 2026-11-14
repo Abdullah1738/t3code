@@ -139,6 +139,16 @@ afterward. Read non-secure fields from the accessibility tree (AX);
 values containing `"` can read as null even when visible (#113), so also check
 a screenshot. For secure fields, use the app's validator or a Show password
 toggle (confirm masking is off before reading AX).
+
+- Cursor editing (CLI 0.2.183, Settings search): `type-text abcdef` →
+  `press-key arrowLeft` → `type-text X` left `abcdef`, with Back focused,
+  including without intervening AX captures. Adding 0.5 s or 2 s after Left
+  did not help. A single `X` in an empty focused field passed 5/5; re-tapping
+  the field before typing appended correctly at all three tested waits.
+  After navigation keys, check the intended input's focus before typing or
+  Enter; re-focus and verify the value and cursor position. A tap may move
+  the cursor. TorSSH key-strip/Enter recovery remains unverified (#123).
+
 SDK paste: one unverified reporter success in TorSSH #15's app, using
 `setClipboard(text)` + `pressKey('v', control)`. CLI Ctrl-V paste
 (`set-clipboard` then `press-key v --control`) did not work in the 2026-11-14

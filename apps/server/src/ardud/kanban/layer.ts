@@ -29,6 +29,15 @@ import { layer as KanbanStoreLayer } from "./store/KanbanStore.ts";
  */
 const THREAD_STATE_EVENTS = new Set<string>(["run.updated", "runtime-request.updated"]);
 
+export const startTimeoutOf = (event: OrchestrationV2DomainEvent) =>
+  event.type === "turn-item.updated" &&
+  event.payload.type === "error" &&
+  event.payload.status === "failed" &&
+  event.payload.failure.code === "provider_start_timeout" &&
+  event.payload.runId !== null
+    ? { runId: event.payload.runId, reason: event.payload.failure.message }
+    : undefined;
+
 /** Which board action a domain event triggers, if any. Exported so the route is tested itself. */
 export const boardEventRoute = (
   event: OrchestrationV2DomainEvent,
@@ -118,6 +127,9 @@ export const ArdudKanbanLive = Layer.effectDiscard(
     );
     yield* forkParked(
       Stream.runForEach(engine.streamDomainEvents, (event) => {
+        const startTimeout = startTimeoutOf(event);
+        if (startTimeout !== undefined)
+          return service.notifyTurnEnded(event.threadId, startTimeout);
         const route = boardEventRoute(event);
         if (route === "turnEnd") return service.notifyTurnEnded(event.threadId);
         if (route === "threadChanged")

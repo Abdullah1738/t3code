@@ -122,6 +122,7 @@ const fakeThreads = (
   const storeControl: {
     afterBoardWrite?: () => Effect.Effect<void>;
     beforeThreadLink?: () => Effect.Effect<void>;
+    beforeCardWrite?: () => Effect.Effect<void, KanbanStore.KanbanStoreError>;
     beforeCardEvent?: (
       event: KanbanStore.NewCardEvent,
     ) => Effect.Effect<void, KanbanStore.KanbanStoreError>;
@@ -135,6 +136,10 @@ const fakeThreads = (
         threadLink: (id) =>
           Effect.suspend(() => storeControl.beforeThreadLink?.() ?? Effect.void).pipe(
             Effect.andThen(store.threadLink(id)),
+          ),
+        putCard: (card) =>
+          Effect.suspend(() => storeControl.beforeCardWrite?.() ?? Effect.void).pipe(
+            Effect.andThen(store.putCard(card)),
           ),
         putBoardWithPools: (...args) =>
           store
@@ -4178,6 +4183,62 @@ it.effect("card_wait sets a push wait from the card's last review, logs it and c
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("card_wait accepts a cross-board waitsOn id", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const { kanban, store, card } = yield* waitFixture;
+    const foreign = yield* kanban.ensureBoard({
+      slug: "foreign",
+      name: "Foreign",
+      defaultProjectId: null,
+    });
+    const target = yield* kanban.createCard(
+      foreign.id,
+      { prompt: "Dependency", title: "Dependency", description: "Explicit" },
+      owner,
+    );
+    const reply = yield* call(evaluatorThread, "card_wait", {
+      card: card.id,
+      on: "card",
+      waitsOn: target.id,
+      wakeRole: "evaluator",
+      note: "foreign dependency",
+    });
+    assert.isFalse(reply.isError, reply.text);
+    const detail = yield* kanban.card(card.id);
+    assert.deepInclude(detail.card.wait, { on: "card", card: target.id, wakeRole: "evaluator" });
+    assert.include(detail.events.at(-1)?.body ?? "", `#${target.number} (Foreign)`);
+    const summary = yield* call(evaluatorThread, "board_get", { boardId: card.boardId });
+    assert.isFalse(summary.isError, summary.text);
+    assert.include(JSON.stringify(summary.structured), `Waiting for card #${target.number} (Foreign)`);
+    const paged = yield* call(evaluatorThread, "board_get", { boardId: card.boardId, limit: 1 });
+    assert.include(JSON.stringify(paged.structured), `Waiting for card #${target.number} (Foreign)`);
+    const expectedTarget = { id: target.id, number: target.number, boardId: foreign.id, boardName: "Foreign" };
+    assert.deepStrictEqual(detail.card.wait?.cardTarget, expectedTarget);
+    const read = yield* call(evaluatorThread, "card_get", { card: card.id });
+    assert.include(JSON.stringify(read.structured), `"boardName":"Foreign"`);
+    const apiPage = yield* kanban.cardPage({ board: card.boardId, fields: ["wait"], limit: 1 });
+    assert.deepStrictEqual(apiPage.cards[0]?.wait?.cardTarget, expectedTarget);
+    assert.deepStrictEqual((yield* kanban.cards(card.boardId)).find((entry) => entry.id === card.id)?.wait?.cardTarget, expectedTarget);
+    for (const snapshot of [yield* kanban.snapshot(card.boardId), yield* kanban.replySnapshot(card.boardId)]) {
+      assert.isFalse(snapshot.cards.some((entry) => entry.id === target.id));
+      assert.deepStrictEqual(snapshot.cards.find((entry) => entry.id === card.id)?.wait?.cardTarget, expectedTarget);
+    }
+    assert.isUndefined((yield* store.card(card.id))?.wait?.cardTarget, "display metadata is not persisted");
+    yield* kanban.updateBoard(foreign.id, { name: "Renamed foreign" });
+    assert.strictEqual((yield* kanban.card(card.id)).card.wait?.cardTarget?.boardName, "Renamed foreign");
+    yield* kanban.updateBoard(foreign.id, { name: "Foreign" });
+    const moved = yield* call(evaluatorThread, "card_move", { card: card.id, to: "todo" });
+    assert.isFalse(moved.isError, moved.text);
+    assert.include(String(moved.structured.message), `#${target.number} (Foreign)`);
+    const cleared = yield* kanban.card(card.id);
+    assert.isUndefined(cleared.card.wait);
+    assert.isTrue(
+      cleared.events.some((event) => event.body?.includes(`card #${target.number} (Foreign)`)),
+    );
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("card_wait validates the PR, the card, the time and the owner question it names", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {
@@ -6195,4 +6256,358 @@ it.effect("card_next refuses a stalled caller lookup within its deadline", () =>
       assert.include(result.text, "card_next is busy");
     }).pipe(Effect.provide(layer));
   }),
+);
+
+const releaseFixture = Effect.gen(function* () {
+  const { kanban, store, board } = yield* waitFixture;
+  const evaluator = yield* kanban.startEvaluator(board.id, {
+    kind: "request",
+    text: "Release pacing",
+  });
+  const actor = { _tag: "evaluator", threadId: evaluator } as const;
+  const at = DateTime.formatIso(yield* DateTime.now);
+  const approval = {
+    id: "sa-pacing",
+    gate: "deploy" as const,
+    quote: "Boards may release on their own",
+    sourceThreadId: "owner-thread",
+    saidAt: at,
+    approvedAsk: { cardId: "source", askId: "q1" },
+    recordedAt: at,
+    recordedBy: evaluator,
+    revokedAt: null,
+    revokedBy: null,
+    revokeReason: null,
+  };
+  yield* store.putBoard({ ...board, standingApprovals: [approval] });
+  let releaseNumber = 0;
+  const create = (
+    patch: { interrupting?: boolean; ownerOnly?: boolean; gate?: "deploy" } = {
+      interrupting: true,
+    },
+  ) =>
+    kanban.createCard(
+      board.id,
+      {
+        title: `Apply build ${++releaseNumber}`,
+        prompt: "Apply build",
+        subtasks: [{ text: "Apply build", owner: "evaluator", ...patch }],
+      },
+      actor,
+    );
+  return { kanban, store, board, evaluator, actor, approval, create };
+});
+
+it.effect(
+  "interrupting releases persist receipts, pace other cards, and expose the compact window",
+  () => {
+    return Effect.gen(function* () {
+      const { kanban, store, board, actor, approval, evaluator, create } = yield* releaseFixture;
+      const first = yield* create();
+      const done = yield* kanban.markSubtask(
+        first.id,
+        "s1",
+        "done",
+        "Installed",
+        actor,
+        "evaluator",
+      );
+      const firstAt = done.subtasks[0]!.doneAt!;
+      let ledger = (yield* kanban.snapshot(board.id)).board.releaseLedger!;
+      assert.deepStrictEqual(ledger, [
+        {
+          boardId: board.id,
+          cardId: first.id,
+          cardNumber: first.number,
+          subtaskId: "s1",
+          at: firstAt,
+          critical: null,
+          approvalId: approval.id,
+        },
+      ]);
+      yield* TestClock.adjust("3 hours");
+      const second = yield* create();
+      const denied = yield* kanban
+        .markSubtask(second.id, "s1", "done", "Installed", actor, "evaluator")
+        .pipe(Effect.flip);
+      assert.include(denied.detail, "inside the 4 h release window");
+      assert.include(denied.detail, `last release #${first.number}`);
+      assert.include(denied.detail, "next window");
+      assert.lengthOf((yield* kanban.snapshot(board.id)).board.releaseLedger!, 1);
+      const read = yield* call(evaluator, "board_get", { boardId: board.slug });
+      const compact = (
+        read.structured.board as {
+          board: { releaseLedger: ReadonlyArray<unknown>; nextReleaseWindowAt: string | null };
+        }
+      ).board;
+      assert.deepStrictEqual(compact.releaseLedger, ledger);
+      assert.strictEqual(
+        compact.nextReleaseWindowAt,
+        DateTime.formatIso(DateTime.add(DateTime.makeUnsafe(firstAt), { hours: 4 })),
+      );
+      const ordinary = yield* create({ gate: "deploy" });
+      yield* kanban.markSubtask(ordinary.id, "s1", "done", "Installed", actor, "evaluator");
+      assert.lengthOf((yield* kanban.snapshot(board.id)).board.releaseLedger!, 1);
+      yield* kanban.markSubtask(
+        second.id,
+        "s1",
+        "done",
+        "critical: server will not start after .10",
+        actor,
+        "evaluator",
+      );
+      ledger = (yield* kanban.snapshot(board.id)).board.releaseLedger!;
+      assert.strictEqual(ledger[1]!.critical, "server will not start after .10");
+      yield* TestClock.adjust(4 * 3_600_000 + 60_000);
+      const third = yield* create();
+      yield* kanban.markSubtask(third.id, "s1", "done", null, actor, "evaluator");
+      assert.lengthOf((yield* kanban.snapshot(board.id)).board.releaseLedger!, 3);
+      // Later lifecycle checks must not reject a release against its own receipt.
+      yield* kanban.moveCard(third.id, "verified", "evaluator", actor);
+      const worker = ThreadId.make("pacing-worker");
+      yield* store.putThreadLink({
+        ...(yield* kanban.caller(evaluator))!,
+        threadId: worker,
+        role: "work",
+        cardId: first.id,
+      });
+      for (const interrupting of [true, false]) {
+        const refused = yield* call(worker, "card_create", {
+          title: "Release",
+          prompt: "Release",
+          subtasks: [{ text: "Apply build", owner: "evaluator", interrupting }],
+        });
+        assert.isTrue(refused.isError);
+        assert.include(refused.text, "only evaluators");
+        const edit = yield* kanban
+          .editCard(
+            second.id,
+            { subtasks: [{ id: "s1", interrupting }] },
+            { _tag: "thread", threadId: worker },
+          )
+          .pipe(Effect.flip);
+        assert.include(edit.detail, "only evaluators");
+      }
+    }).pipe(Effect.provide(fakeThreads().layer));
+  },
+);
+
+it.effect(
+  "on-card owner yes overrides pacing and ownerOnly; other boards have independent windows",
+  () =>
+    Effect.gen(function* () {
+      const { kanban, store, board, actor, create } = yield* releaseFixture;
+      const first = yield* create();
+      yield* kanban.markSubtask(first.id, "s1", "done", null, actor, "evaluator");
+      const restricted = yield* create({ interrupting: true, ownerOnly: true });
+      const denied = yield* kanban
+        .markSubtask(
+          restricted.id,
+          "s1",
+          "done",
+          "critical: server will not start",
+          actor,
+          "evaluator",
+        )
+        .pipe(Effect.flip);
+      assert.include(denied.detail, "marked owner-only");
+      for (const card of [restricted, yield* create()]) {
+        yield* kanban.askOwner(
+          card.id,
+          { question: "Approve s1", action: { summary: "Apply build" }, blocking: false },
+          actor,
+          "evaluator",
+        );
+        yield* kanban.answerAsk(card.id, "q1", { verdict: "approved", revision: 0 }, owner);
+        yield* kanban.markSubtask(card.id, "s1", "done", "Installed", actor, "evaluator");
+        assert.strictEqual(
+          (yield* kanban.snapshot(board.id)).board.releaseLedger!.at(-1)!.approvalId,
+          null,
+        );
+      }
+      const other = yield* kanban.ensureBoard({
+        slug: "another",
+        name: "Another",
+        defaultProjectId: board.defaultProjectId,
+      });
+      const otherEvaluator = yield* kanban.startEvaluator(other.id, {
+        kind: "request",
+        text: "Release",
+      });
+      const otherActor = { _tag: "evaluator", threadId: otherEvaluator } as const;
+      const saved = (yield* kanban.snapshot(board.id)).board;
+      yield* store.putBoard({
+        ...other,
+        standingApprovals: saved.standingApprovals,
+        releaseLedger: saved.releaseLedger,
+      });
+      const card = yield* kanban.createCard(
+        other.id,
+        {
+          title: "Apply",
+          prompt: "Apply",
+          subtasks: [{ text: "Apply build", owner: "evaluator", interrupting: true }],
+        },
+        otherActor,
+      );
+      yield* kanban.markSubtask(card.id, "s1", "done", null, otherActor, "evaluator");
+      const noApproval = yield* create();
+      yield* store.putBoard({ ...saved, standingApprovals: [] });
+      const no = yield* kanban
+        .markSubtask(
+          noApproval.id,
+          "s1",
+          "done",
+          "critical: server will not start",
+          actor,
+          "evaluator",
+        )
+        .pipe(Effect.flip);
+      assert.include(no.detail, "no standing deploy approval");
+    }).pipe(Effect.provide(fakeThreads().layer)),
+);
+
+it.effect("parallel evaluators cannot clear two interrupting releases in one window", () =>
+  Effect.gen(function* () {
+    const { kanban, board, actor, create } = yield* releaseFixture;
+    const cards = [yield* create(), yield* create()];
+    const results = yield* Effect.all(
+      cards.map((card) =>
+        kanban.markSubtask(card.id, "s1", "done", null, actor, "evaluator").pipe(Effect.result),
+      ),
+      { concurrency: "unbounded" },
+    );
+    assert.lengthOf(results.filter(Result.isSuccess), 1);
+    assert.lengthOf((yield* kanban.snapshot(board.id)).board.releaseLedger!, 1);
+  }).pipe(Effect.provide(fakeThreads().layer)),
+);
+
+it.effect("release ledger and pacing survive rebuilding the service on the same database", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "release-pacing-restart-" });
+    const db = path.join(dir, "state.sqlite");
+    const saved = yield* Effect.gen(function* () {
+      const { kanban, board, actor, create } = yield* releaseFixture;
+      const first = yield* create();
+      yield* kanban.markSubtask(first.id, "s1", "done", null, actor, "evaluator");
+      const next = yield* create();
+      return {
+        boardId: board.id,
+        nextId: next.id,
+        actor,
+        ledger: (yield* kanban.snapshot(board.id)).board.releaseLedger,
+      };
+    }).pipe(Effect.provide(fakeThreads(db).layer));
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      assert.deepStrictEqual(
+        (yield* kanban.snapshot(saved.boardId)).board.releaseLedger,
+        saved.ledger,
+      );
+      const refused = yield* kanban
+        .markSubtask(saved.nextId, "s1", "done", null, saved.actor, "evaluator")
+        .pipe(Effect.flip);
+      assert.include(refused.detail, "inside the 4 h release window");
+    }).pipe(Effect.provide(fakeThreads(db).layer));
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("release receipt rolls back if completion fails, and retains only the newest 200", () => {
+  const fake = fakeThreads();
+  return Effect.gen(function* () {
+    const { kanban, store, board, actor, create, evaluator } = yield* releaseFixture;
+    const card = yield* create();
+    fake.storeControl.beforeCardWrite = () =>
+      Effect.fail(
+        new KanbanStore.KanbanStoreError({ operation: "write card", cause: "unavailable" }),
+      );
+    const failed = yield* kanban
+      .markSubtask(card.id, "s1", "done", null, actor, "evaluator")
+      .pipe(Effect.result);
+    assert.isTrue(Result.isFailure(failed));
+    assert.lengthOf((yield* kanban.snapshot(board.id)).board.releaseLedger!, 0);
+    assert.strictEqual((yield* kanban.card(card.id)).card.subtasks[0]!.state, "open");
+    delete fake.storeControl.beforeCardWrite;
+    const saved = (yield* kanban.snapshot(board.id)).board;
+    const at = DateTime.formatIso(yield* DateTime.now);
+    const history = Array.from({ length: 205 }, (_, index) => ({
+      boardId: board.id,
+      cardId: card.id,
+      cardNumber: index + 1,
+      subtaskId: "s1",
+      at,
+      critical: null,
+      approvalId: "sa-pacing",
+    }));
+    yield* store.putBoard({ ...saved, releaseLedger: history });
+    yield* TestClock.adjust(4 * 3_600_000 + 60_000);
+    yield* kanban.markSubtask(card.id, "s1", "done", null, actor, "evaluator");
+    const ledger = (yield* kanban.snapshot(board.id)).board.releaseLedger!;
+    assert.lengthOf(ledger, 200);
+    assert.strictEqual(ledger[0]!.cardNumber, 7);
+    const read = yield* call(evaluator, "board_get", { boardId: board.slug });
+    const compact = (
+      read.structured.board as {
+        board: { releaseLedger: ReadonlyArray<unknown>; nextReleaseWindowAt: string | null };
+      }
+    ).board;
+    assert.deepStrictEqual(compact.releaseLedger, ledger.slice(-5));
+    yield* TestClock.adjust(4 * 3_600_000 + 60_000);
+    const open = yield* call(evaluator, "board_get", { boardId: board.slug });
+    assert.strictEqual(
+      (open.structured.board as { board: { nextReleaseWindowAt: string | null } }).board
+        .nextReleaseWindowAt,
+      null,
+    );
+  }).pipe(Effect.provide(fake.layer));
+});
+
+it.effect.each([
+  { name: "unreviewed", reviewRound: 0, pending: undefined, expected: undefined },
+  { name: "legacy", reviewRound: 1, pending: undefined, expected: false },
+  { name: "repaired clear", reviewRound: 1, pending: false, expected: false },
+  { name: "repaired findings", reviewRound: 1, pending: true, expected: true },
+])(
+  "$name findings repair cannot commit a release completion before its receipt",
+  ({ reviewRound, pending, expected }) => {
+    const fake = fakeThreads();
+    return Effect.gen(function* () {
+      const { kanban, store, board, actor, create } = yield* releaseFixture;
+      const card = yield* create();
+      const { reviewFindingsPending: _pending, ...legacy } = card;
+      const { interrupting: _interrupting, gate: _gate, ...review } = card.subtasks[0]!;
+      yield* store.putCard({
+        ...legacy,
+        reviewRound,
+        ...(pending === undefined ? {} : { reviewFindingsPending: pending }),
+        subtasks: [
+          ...card.subtasks,
+          { ...review, id: "s2", step: 2, owner: "review", text: "Review build" },
+        ],
+      });
+      fake.storeControl.beforeCardEvent = (event) =>
+        event.kind === "subtask"
+          ? Effect.fail(
+              new KanbanStore.KanbanStoreError({
+                operation: "subtask event",
+                cause: "unavailable after findings repair",
+              }),
+            )
+          : Effect.void;
+      const failed = yield* kanban
+        .markSubtask(card.id, "s1", "done", null, actor, "evaluator")
+        .pipe(Effect.result);
+      assert.isTrue(Result.isFailure(failed));
+      assert.strictEqual((yield* store.card(card.id))!.subtasks[0]!.state, "open");
+      assert.lengthOf((yield* kanban.snapshot(board.id)).board.releaseLedger!, 0);
+      delete fake.storeControl.beforeCardEvent;
+      yield* kanban.markSubtask(card.id, "s1", "done", null, actor, "evaluator");
+      const saved = (yield* store.card(card.id))!;
+      assert.strictEqual(saved.reviewFindingsPending, expected);
+      assert.strictEqual(saved.subtasks[0]!.state, "done");
+      assert.lengthOf((yield* kanban.snapshot(board.id)).board.releaseLedger!, 1);
+    }).pipe(Effect.provide(fake.layer));
+  },
 );

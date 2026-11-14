@@ -453,6 +453,7 @@ export function shellSummary(
           },
     lastError: shell.lastError ?? null,
     archived: shell.archivedAt !== null,
+    archivedAt: shell.archivedAt === null ? null : iso(shell.archivedAt),
     settled: shell.settledOverride === "settled",
     createdAt: iso(shell.createdAt),
     updatedAt: iso(shell.updatedAt),

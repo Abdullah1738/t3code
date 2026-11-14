@@ -21,23 +21,22 @@ import argparse
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import sys
 import tarfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from active_sessions import snapshot  # noqa: E402
+import active_sessions  # noqa: E402
 
 HOME = os.path.expanduser("~")
 STALE_DAYS = int(os.environ.get("WORKTREE_STALE_DAYS", "60"))
 CREATED_MIN_DAYS = 7
 MAX_PER_RUN = 50
-OC_DB = f"{HOME}/.local/share/opencode/opencode.db"
 LOG_DIR = f"{HOME}/.local/share/dev-janitor"
 AUDIT = f"{LOG_DIR}/worktree_reaper.jsonl"
 STATUS = f"{LOG_DIR}/worktree_reaper_last.json"
+HISTORY_CACHE = f"{LOG_DIR}/session-history.json"
 KEEP_FILE = f"{HOME}/.config/opencode/worktree-reaper-keep.txt"
 ARCHIVE_ROOT = "/Volumes/ExternalSSD/worktree-reaper-archive"
 SCAN_ROOTS = [(HOME, 3), ("/Volumes/ExternalSSD", 3)]
@@ -111,31 +110,70 @@ def worktrees(common):
     return res, None
 
 
-def running_dirs(c):
-    """Directories of every active OpenCode session and every active Robob thread (Claude and Codex included).
-
-    Raises when the active set is incomplete: the caller then keeps every worktree (see main()).
-    """
-    snap = snapshot(timeout=30)
-    if not snap["complete"]:
-        raise RuntimeError("cannot read the complete active set: " + "; ".join(snap["problems"]))
-    dirs = set()
-    for sid in snap["opencode"]:
-        row = c.execute("SELECT directory FROM session_v2 WHERE id=?", (sid,)).fetchone()
-        if row and row[0]:
-            dirs.add(row[0].rstrip("/"))
-    # Each in-use thread's directory comes from this same snapshot: a root-workspace thread resolves to its
-    # project root. The snapshot is complete here, so every in-use thread has one.
-    dirs.update(d.rstrip("/") for d in snap["workspaces"].values())
-    return dirs
+def running_dirs():
+    snap = active_sessions.checked_snapshot(timeout=30)
+    dirs, err = active_sessions.directories(snap)
+    if err:
+        raise RuntimeError("liveness_unavailable: " + err)
+    return {path.rstrip("/") for path in dirs.values()}
 
 
-def session_activity(c):
-    act = {}
-    for d, t in c.execute("SELECT directory, max(max(time_updated, coalesce(time_viewed, 0))) "
-                          "FROM session_v2 WHERE directory IS NOT NULL GROUP BY directory"):
-        act[d.rstrip("/")] = t / 1000
-    return act
+class Activity(dict):
+    def __init__(self, paths, projects, stats, error):
+        super().__init__(paths or {})
+        self.projects, self.stats, self.error = projects or {}, stats, error
+        self.commons = None
+
+
+def session_activity(write_cache=False):
+    paths, stats, err = active_sessions.session_history(HISTORY_CACHE, write_cache=write_cache)
+    roots, roots_err = active_sessions.project_roots()
+    return Activity(paths, roots, stats, err or roots_err)
+
+
+def activity_for_repo(common, history, now, worktree_paths=None):
+    if history is None:
+        return None, "session history unavailable"
+    if not isinstance(history, Activity):
+        return history, None
+    if history.error:
+        return None, history.error
+    if history.commons is None:
+        history.commons = {pid: common_dir(root) for pid, root in history.projects.items() if os.path.isdir(root)}
+    activity = dict(history)
+    if worktree_paths is None:
+        listed, error = worktrees(common)
+        if error:
+            return None, "worktree history coverage unavailable: " + error
+        worktree_paths = [w["worktree"] for w in listed]
+    for pid, root in history.projects.items():
+        # A registered project can point inside a missing linked checkout. Git's
+        # worktree roster still binds that path to this repo without opening it.
+        belongs = history.commons.get(pid) == common or any(inside(root, path) for path in worktree_paths)
+        if not belongs:
+            continue
+        paths, err = active_sessions.project_activity(pid, history.projects[pid], int((now - STALE_DAYS * 86400) * 1000))
+        if err:
+            return None, err
+        for path, updated in paths.items():
+            activity[path] = max(activity.get(path, 0), updated)
+    return activity, None
+
+
+def removal_activity(common, path, now):
+    # Refresh updated-time deltas first so newly created/moved session directories
+    # join the known set. Then read every session in this worktree's directories,
+    # including old rows whose viewed/idle changed without an updated-time bump.
+    history = session_activity()
+    activity, err = activity_for_repo(common, history, now)
+    if err:
+        return None
+    fresh, err = active_sessions.worktree_activity(path, history)
+    if err:
+        return None
+    for directory, updated in fresh.items():
+        activity[directory] = max(activity.get(directory, 0), updated)
+    return activity
 
 
 def process_cwds():
@@ -161,6 +199,9 @@ def evaluate(w, now, running, activity, cwds, keep):
     r = {"path": path, "common": w["common"], "branch": (w.get("branch") or "").replace("refs/heads/", "") or None,
          "head": w.get("HEAD"), "reasons": []}
     why = r["reasons"]
+    if activity is None:
+        why.append("activity_history_unavailable: report_only")
+        activity = {}
     if w["main"]:
         why.append("main_worktree")
         return r
@@ -269,26 +310,31 @@ def main():
     ap.add_argument("--limit", type=int, default=MAX_PER_RUN)
     a = ap.parse_args()
     t0 = time.time()
-    os.makedirs(LOG_DIR, exist_ok=True)
+    if not a.dry_run:
+        os.makedirs(LOG_DIR, exist_ok=True)
     st = {"ts": int(t0), "dry_run": a.dry_run, "state": "done", "removed": [], "would_remove": [],
           "kept": {}, "missing_directories": [], "errors": []}
     try:
-        c = sqlite3.connect(f"file:{OC_DB}?mode=ro", uri=True, timeout=30)
-        running = running_dirs(c)
-        activity = session_activity(c)
+        running = running_dirs()
+        activity = session_activity(write_cache=not a.dry_run)
+        st["history_stats"] = getattr(activity, "stats", {})
+        st["activity_history_unavailable"] = {}
         cwds = process_cwds()
         keep = keep_list()
-        commons = discover(set(activity))
+        commons = discover(set(running) | set(activity or {}) | set(getattr(activity, "projects", {}).values()))
         st["repos"] = len(commons)
         cands = []
         total = 0
         for common in commons:
             wts, err = worktrees(common)
+            repo_activity, history_error = activity_for_repo(common, activity, t0, [w["worktree"] for w in wts])
+            if history_error:
+                st["activity_history_unavailable"][common] = history_error
             if err:
                 st["errors"].append(f"{common}: {err[:120]}")
             for w in wts:
                 total += 1
-                r = evaluate(w, t0, running, activity, cwds, keep)
+                r = evaluate(w, t0, running, repo_activity, cwds, keep)
                 if "missing_directory" in r["reasons"]:
                     st["missing_directories"].append(r["path"])
                 for x in r["reasons"]:
@@ -309,7 +355,7 @@ def main():
             # re-check right before removal
             again = evaluate({"worktree": r["path"], "common": r["common"], "main": False,
                               "HEAD": r["head"], "branch": r.get("branch")},
-                             time.time(), running_dirs(c), session_activity(c), process_cwds(), keep_list())
+                             time.time(), running_dirs(), removal_activity(r["common"], r["path"], time.time()), process_cwds(), keep_list())
             if again["reasons"] or again.get("head") != r["head"]:
                 st["kept"]["changed_before_remove"] = st["kept"].get("changed_before_remove", 0) + 1
                 continue
@@ -337,7 +383,8 @@ def main():
         st["state"] = "error"
     st["duration_s"] = round(time.time() - t0, 1)
     if not a.dry_run:
-        json.dump(st, open(STATUS, "w"), indent=1)
+        with open(STATUS, "w") as status_file:
+            json.dump(st, status_file, indent=1)
     json.dump(st, sys.stdout, indent=1)
     print()
     return 0 if st["state"] == "done" else 1

@@ -2,6 +2,8 @@
  * A card's subtasks: its flow as steps (write the PR, review, merge and
  * deploy, tell the reporter, read back). Pure rules; KanbanService applies them.
  */
+import * as DateTime from "effect/DateTime";
+
 import {
   kanbanOpenStep,
   kanbanStepSubtasks,
@@ -11,6 +13,7 @@ import {
   type KanbanOwnerAsk,
   type KanbanSubtask,
   type KanbanStandingApproval,
+  type KanbanRelease,
 } from "@t3tools/contracts";
 
 // Unknown continuations need approval, including nouns and possessives after a resource name.
@@ -18,16 +21,28 @@ const resourceReleaseClause =
   /^\s+(?:(?:the|a|an)\s+)?(?:Run\s+Cloud\s+)?(?:sessions?|emulators?|sims?|simulators?|box|boxes|holds?|locks?|slots?|phones?(?:\s+(?:holds?|locks?)(?:\/locks?)?)?|devices?)(?:\s+(?:when\s+done|after\s+the\s+run))?\s*(?:$|[.;!?](?=\s|$))/i;
 
 const hasReleaseGate = (text: string): boolean => {
+  const resourceMention =
+    /\b(?:sessions?|emulators?|sims?|simulators?|box|boxes|devices?|phones?|holds?|locks?|slots?)\b/i;
   for (const release of text.matchAll(/\brelease(?:s|d)?\b/gi)) {
     const tail = text.slice(release.index + release[0].length);
-    if (!resourceReleaseClause.test(tail)) return true;
+    if (resourceReleaseClause.test(tail)) continue;
+    const reference = /^\s+(?:both|them|each|all|it)\b/i.exec(tail);
+    if (reference && resourceMention.test(text.slice(0, release.index))) {
+      const rest = tail.slice(reference[0].length);
+      if (
+        resourceReleaseClause.test(rest) ||
+        /^(?:\s+when\s+done)?\s*(?:$|[.;!?](?=\s|$))/i.test(rest)
+      )
+        continue;
+    }
+    return true;
   }
   return false;
 };
 
 const deployKeyword = /\b(?:deploy\w*|install\w*|restart\w*|launchagents?|release(?:s|d)?)\b/i;
 const moneyKeyword =
-  /\b(?:pay(?:ment|ments)?|purchase\w*|charg(?:e|es|ed|ing)|refund\w*|money transfer)\b/i;
+  /(?:\b(?:pay(?:ment|ments)?|purchase\w*|charg(?:e|es|ed|ing)|refund\w*|money transfer|spend(?:ing)?|billed|billing)\b|[$€£]\s*\d+(?:[.,]\d+)*|\b(?:\d+(?:[.,]\d+)*\s*(?:USD|AED|EUR|GBP|dirhams?|dollars?)\b|(?:USD|AED|EUR|GBP|dirhams?|dollars?)\s*\d+(?:[.,]\d+)*))/i;
 const negatableMoneyKeyword = new RegExp(`${moneyKeyword.source}|\\b(?:paying|purchasing)\\b`, "i");
 const secretAction =
   /\b(?:share|provide|enter|paste|set|store|create|generate|issue|rotate|regenerate|revoke|reveal|send|give|hand\s+over|add)\b/i;
@@ -214,7 +229,7 @@ export const inferGate = (text: string): KanbanSubtask["gate"] => {
 };
 
 export const gateOf = (
-  subtask: Pick<KanbanSubtask, "owner" | "gate" | "text" | "ownerOnly">,
+  subtask: Pick<KanbanSubtask, "owner" | "gate" | "text" | "ownerOnly" | "interrupting">,
   guessedGates?: KanbanBoard["guessedGates"],
 ): KanbanSubtask["gate"] => {
   // Older plans stored inferred gates on coding and review checklists too.
@@ -224,7 +239,9 @@ export const gateOf = (
   const guessed = inferGate(subtask.text);
   return guessed !== undefined && (guessedGates === undefined || guessedGates.includes(guessed))
     ? guessed
-    : undefined;
+    : subtask.interrupting
+      ? "deploy"
+      : undefined;
 };
 
 export const isNegativeOption = (label: string): boolean =>
@@ -266,6 +283,7 @@ export const approvesGate = (
   gate: NonNullable<KanbanSubtask["gate"]>,
   task: string,
   others: readonly string[],
+  scope: "subtask" | "standing" = "standing",
 ): boolean => {
   const words = label
     .trim()
@@ -283,6 +301,15 @@ export const approvesGate = (
     /^(?:yes|approve|approved|sign off|sign-off|signoff|signed off|go|go ahead|go for it|ok|okay|do it|proceed)$/i.test(
       command,
     )
+  )
+    return true;
+  // Retaining one merge cannot grant permission for future deployments.
+  if (
+    scope === "subtask" &&
+    gate === "deploy" &&
+    /^merge\b/i.test(task.trim()) &&
+    /^keep it$/i.test(command) &&
+    others.some((other) => /^revert it[.!]*$/i.test(other.trim()))
   )
     return true;
   const action = command.replace(/^(?:approve|approved|authorize)\s+/i, "");
@@ -353,18 +380,108 @@ const askConcerns = (
   return inferGate(wording) === gate && candidates.length === 1 && candidates[0]?.id === subtask.id;
 };
 
+export const askGateWarning = (
+  card: Pick<KanbanCard, "createdAt" | "subtasks">,
+  ask: KanbanOwnerAsk,
+  guessedGates?: KanbanBoard["guessedGates"],
+): string | undefined => {
+  const gated = card.subtasks.flatMap((subtask) => {
+    const gate = gateOf(subtask, guessedGates);
+    return subtask.state === "open" && gate !== undefined ? [{ subtask, gate }] : [];
+  });
+  if (
+    gated.length === 0 ||
+    gated.some(({ subtask, gate }) => askConcerns(card, ask, subtask, gate, guessedGates, ask.at))
+  )
+    return undefined;
+  const steps = gated.map(({ subtask, gate }) => `${subtask.id} (${gate})`).join(", ");
+  const target = gated.length === 1 ? gated[0]!.subtask.id : "the intended subtask id";
+  return `This ask won't clear ${steps}. Name ${target} in the text if it should.`;
+};
+
+export const secretKindApprovalWarning = (
+  card: Pick<KanbanCard, "subtasks">,
+  ask: KanbanOwnerAsk,
+  guessedGates?: KanbanBoard["guessedGates"],
+): string | undefined => {
+  if (ask.kind !== "secret") return undefined;
+  const ids = card.subtasks
+    .filter((subtask) => subtask.state === "open" && gateOf(subtask, guessedGates) === "secret")
+    .map((subtask) => subtask.id);
+  if (ids.length === 0) return undefined;
+  const target = ids.length === 1 ? ids[0]! : "the intended subtask id";
+  return `Kind "secret" asks Abdullah to type a secret value. To approve ${ids.join(", ")}, ask a decision naming ${target} instead.`;
+};
+
+const approvingAnswer = (
+  ask: KanbanOwnerAsk,
+  gate: NonNullable<KanbanSubtask["gate"]>,
+  task: string,
+): boolean => {
+  const answer = ask.answer;
+  if (answer?.verdict === "approved") return true;
+  // Multiple picks keep the strict paths; the go/hold fallback needs a single choice.
+  const others =
+    answer?.optionIds?.length === 1
+      ? (ask.options ?? [])
+          .filter((option) => !answer.optionIds!.includes(option.id))
+          .map((option) => option.label)
+      : [];
+  return (
+    answer?.verdict === "picked" &&
+    Boolean(answer.optionIds?.length) &&
+    answer.optionIds!.every((id) => {
+      const option = ask.options?.find((entry) => entry.id === id);
+      return option !== undefined && approvesGate(option.label, gate, task, others, "subtask");
+    })
+  );
+};
+
+export interface StandingReleaseContext {
+  readonly approvals: ReadonlyArray<KanbanStandingApproval>;
+  readonly ledger: ReadonlyArray<KanbanRelease>;
+  readonly boardId: string;
+  readonly at: string;
+  readonly note: string | null;
+}
+
+export const criticalReleaseReason = (note: string | null): string | null => {
+  if (!note?.startsWith("critical:")) return null;
+  const reason = note.slice("critical:".length).trim();
+  return reason.length >= 10 ? reason : null;
+};
+
+export const releaseWindow = (
+  standing: Pick<StandingReleaseContext, "approvals" | "ledger" | "boardId" | "at">,
+) => {
+  const approval = standing.approvals.find((entry) => entry.revokedAt === null);
+  const last = standing.ledger
+    .filter((entry) => entry.boardId === standing.boardId)
+    .toSorted((a, b) => a.at.localeCompare(b.at))
+    .at(-1);
+  if (!approval || !last) return null;
+  const hours = approval.minIntervalHours ?? 4;
+  const next = DateTime.formatIso(DateTime.add(DateTime.makeUnsafe(last.at), { hours }));
+  return next > standing.at ? { last, next, hours } : null;
+};
+
 /** Legacy plans have no timestamps: their card's creation is the earliest safe bound. */
 export const approvalProblem = (
   card: Pick<KanbanCard, "number" | "asks" | "createdAt" | "subtasks">,
   subtask: KanbanSubtask,
-  standing: ReadonlyArray<KanbanStandingApproval> = [],
+  standing: ReadonlyArray<KanbanStandingApproval> | StandingReleaseContext = [],
   guessedGates?: KanbanBoard["guessedGates"],
   intent: "do" | "skip" = "do",
 ): string | null => {
   const gate = gateOf(subtask, guessedGates);
   if (gate === undefined) return null;
-  if (gate === "deploy" && !subtask.ownerOnly && standing.some((entry) => entry.revokedAt === null))
-    return null;
+  const context = "approvals" in standing ? standing : undefined;
+  const approvals = "approvals" in standing ? standing.approvals : standing;
+  const cleared =
+    gate === "deploy" && !subtask.ownerOnly && approvals.some((entry) => entry.revokedAt === null);
+  const window =
+    cleared && subtask.interrupting && context && intent === "do" ? releaseWindow(context) : null;
+  if (cleared && (!window || criticalReleaseReason(context?.note ?? null))) return null;
   const standingReason =
     gate !== "deploy"
       ? ""
@@ -385,25 +502,25 @@ export const approvalProblem = (
     .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at));
   const latest = decisions.at(-1);
   const answer = latest?.answer;
-  const unnamedApproval = latest
-    ? undefined
-    : card.asks
-        .filter(
-          (ask) =>
-            ask.closedAt &&
-            ask.answer?.verdict === "approved" &&
-            ask.answer.by._tag === "owner" &&
-            ask.answer.at >= since &&
-            (ask.revisedAt ?? ask.at) >= since &&
-            !ask.draft &&
-            !/\bs\d+\b/.test(askWording(ask)) &&
-            !askConcerns(card, ask, subtask, gate, guessedGates, ask.answer.at),
-        )
-        .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at))
-        .at(-1);
+  const unnamedApproval = card.asks
+    .filter(
+      (ask) =>
+        ask.closedAt &&
+        ask.answer !== undefined &&
+        approvingAnswer(ask, gate, subtask.text) &&
+        ask.answer.by._tag === "owner" &&
+        ask.answer.at >= since &&
+        (answer === undefined || ask.answer.at > answer.at) &&
+        (ask.revisedAt ?? ask.at) >= since &&
+        !ask.draft &&
+        !/\bs\d+\b/.test(askWording(ask)) &&
+        !askConcerns(card, ask, subtask, gate, guessedGates, ask.answer.at),
+    )
+    .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at))
+    .at(-1);
   const noDecisionReason = unnamedApproval
     ? `${unnamedApproval.id} was approved but doesn't name ${subtask.id}; ask again naming the subtask id (e.g. "Approve ${subtask.id}")`
-    : `no owner answer on a ${gate} ask since ${since}; name the subtask id (e.g. s7) in the ask`;
+    : `no owner answer on a ${gate} ask since ${since}; ask with card_ask naming ${subtask.id} (e.g. "Approve ${subtask.id}: <step>")`;
   if (intent === "skip") {
     if (answer && answer.verdict !== "dropped" && answer.by._tag === "owner") return null;
     const reason =
@@ -415,22 +532,16 @@ export const approvalProblem = (
       " ",
     );
   }
-  // Multiple picks keep the strict paths; the go/hold fallback needs a single choice.
-  const others =
-    answer?.optionIds?.length === 1
-      ? (latest?.options ?? [])
-          .filter((option) => !answer.optionIds!.includes(option.id))
-          .map((option) => option.label)
-      : [];
-  const approved =
-    answer?.verdict === "approved" ||
-    (answer?.verdict === "picked" &&
-      Boolean(answer.optionIds?.length) &&
-      answer.optionIds!.every((id) => {
-        const option = latest?.options?.find((entry) => entry.id === id);
-        return option !== undefined && approvesGate(option.label, gate, subtask.text, others);
-      }));
-  if (approved) return null;
+  const approved = latest !== undefined && approvingAnswer(latest, gate, subtask.text);
+  if (
+    approved &&
+    (!window || (askWording(latest!).match(/\bs\d+\b/g) ?? []).some((id) => id === subtask.id))
+  )
+    return null;
+  if (window) {
+    const time = (at: string) => `${at.slice(11, 16)}Z`;
+    return `card #${card.number} ${subtask.id} (interrupting) is inside the ${window.hours} h release window: last release #${window.last.cardNumber} at ${time(window.last.at)}, next window ${time(window.next)}; write "critical: <reason>" in the done note to override`;
+  }
   let reason: string;
   if (!latest || !answer) {
     reason = noDecisionReason;
@@ -443,6 +554,9 @@ export const approvalProblem = (
     reason = `the latest decision, ${latest.id}, picked "${labels}", which doesn't read as approving ${gate}; ask again with an Approve option or an action ask`;
   } else {
     reason = `the latest decision, ${latest.id}, was ${answer.verdict}`;
+  }
+  if (latest && unnamedApproval) {
+    reason += `; ${unnamedApproval.id} (approved later) doesn't name ${subtask.id}, so it doesn't count; ask again naming ${subtask.id} (e.g. "Approve ${subtask.id}: <step>")`;
   }
   return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's approval: ${reason}${standingReason}`.replace(
     /[\r\n]+/g,
@@ -462,6 +576,7 @@ export interface SubtaskInput {
   readonly owner?: KanbanSubtask["owner"] | undefined;
   readonly gate?: KanbanSubtask["gate"] | null;
   readonly ownerOnly?: boolean | undefined;
+  readonly interrupting?: boolean | undefined;
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   readonly script?: string | undefined;
 }
@@ -541,6 +656,7 @@ export function planSubtasks(
           input.step === undefined &&
           input.gate === undefined &&
           input.ownerOnly === undefined &&
+          input.interrupting === undefined &&
           input.script === undefined)
       ) {
         planned.push(known);
@@ -564,12 +680,19 @@ export function planSubtasks(
         reason: `subtask "${text}" is the worker's; a deploy, money or secret step must be owned by the evaluator or a script`,
       };
     }
+    const interrupting = input.interrupting ?? known?.interrupting;
+    if (interrupting && (owner === "work" || owner === "review")) {
+      return {
+        ok: false,
+        reason: "an interrupting step must be owned by the evaluator or a script",
+      };
+    }
     const ownerOnly = input.ownerOnly ?? known?.ownerOnly;
     if (ownerOnly && (owner === "work" || owner === "review")) {
       return { ok: false, reason: "an owner-only step must be owned by the evaluator or a script" };
     }
     const inputGate = gateOf(
-      { owner, text, gate: input.gate ?? undefined, ownerOnly },
+      { owner, text, gate: input.gate ?? undefined, ownerOnly, interrupting },
       guessedGates,
     );
     const script = input.script?.trim() || undefined;
@@ -586,17 +709,27 @@ export function planSubtasks(
     if (known) {
       const { script: _old, gate: _oldGate, ...rest } = known;
       const previousGate = gateOf(known, guessedGates);
-      const gate = owner === "work" || owner === "review" ? undefined : (previousGate ?? inputGate);
+      const gate =
+        owner === "work" || owner === "review"
+          ? undefined
+          : previousGate === "deploy" &&
+              (known.interrupting || interrupting) &&
+              (inputGate === "money" || inputGate === "secret")
+            ? inputGate
+            : (previousGate ?? inputGate);
       planned.push({
         ...rest,
         step,
         text,
         owner,
         ...(ownerOnly === undefined ? {} : { ownerOnly }),
+        ...(interrupting === undefined ? {} : { interrupting }),
         ...(gate === undefined ? {} : { gate }),
         ...((text !== known.text ||
           script !== known.script ||
           ownerOnly !== known.ownerOnly ||
+          interrupting !== known.interrupting ||
+          gate !== previousGate ||
           !previousGate) &&
         gate &&
         at
@@ -613,6 +746,7 @@ export function planSubtasks(
         text,
         owner,
         ...(ownerOnly === undefined ? {} : { ownerOnly }),
+        ...(interrupting === undefined ? {} : { interrupting }),
         ...(gate === undefined ? {} : { gate }),
         ...(at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),

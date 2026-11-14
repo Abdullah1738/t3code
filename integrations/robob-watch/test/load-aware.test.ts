@@ -11,7 +11,7 @@ function fixture(options: Record<string, string> = {}) {
   const root = join(sandbox, "root"), calls = join(sandbox, "calls"), stub = join(sandbox, "bridge.ts");
   writeFileSync(stub, `import {appendFileSync} from "node:fs";
 appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) + "\\n"); console.log('{"created":true}');`);
-  const env: Record<string, string | undefined> = { ...process.env, BUN_INSPECT: undefined, ROBOB_WATCH_ROOT: root,
+  const env: Record<string, string | undefined> = { ...process.env, BUN_INSPECT: undefined, ROBOB_WATCH_TEST_BATCH_MS: "0", ROBOB_WATCH_ROOT: root,
     ROBOB_WATCH_TELEGRAM_CLI: stub, ROBOB_WATCH_SPECTRUM_CLI: stub,
     ROBOB_WATCH_BRIDGE_DB: join(sandbox, "absent.sqlite"), WACLI_STORE_DIR: join(sandbox, "wacli"),
     ROBOB_WATCH_LOAD_OVERRIDE: "0.1", ROBOB_WATCH_CHECK_TIMEOUT_MS: "40", ...options };

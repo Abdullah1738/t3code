@@ -1,3 +1,4 @@
+import { messageLengthError } from "./message-length.ts";
 import { toolError, toolLog } from "./toollog.ts";
 /**
  * Sendblue mode: one shared line, one Store + Router + Delivery per chat. The owner's chat keeps
@@ -349,6 +350,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           if (!adminGroup(typeof body.to === "string" ? registry.bySlugName(body.to) : undefined)) ownerOnly(false);
           live();
           const { to, dedupeKey } = body;
+          if (typeof body.text === "string" && body.text.length > 12_000) throw new HttpError(400, messageLengthError(body.text, 12_000));
           if (!text(body.text, 12_000) || !text(to, 100) || !text(dedupeKey, 200)) throw new HttpError(400, "Invalid request");
           const target = registry.bySlugName(to);
           if (!target) throw new HttpError(404, "Unknown chat");
@@ -363,6 +365,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           ownerOnly(false);
           live();
           const { chat, dedupeKey } = body;
+          if (typeof body.text === "string" && body.text.length > 12_000) throw new HttpError(400, messageLengthError(body.text, 12_000));
           if (!text(body.text, 12_000) || !text(chat, 100) || !text(dedupeKey, 200)
             || (body.source !== undefined && !text(body.source, 100))) throw new HttpError(400, "Invalid request");
           const target = registry.bySlugName(chat);
@@ -424,6 +427,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
         case "/ask-owner": {
           only(body, ["text", "sessionId", "dedupeKey"]);
           live();
+          if (typeof body.text === "string" && body.text.length > 12_000) throw new HttpError(400, messageLengthError(body.text, 12_000));
           if (!sessionId || !text(body.text, 12_000) || !text(body.dedupeKey, 200)) throw new HttpError(400, "Invalid request");
           return result(askOwner(deps(caller?.info), sessionId, body.text, body.dedupeKey));
         }
@@ -481,6 +485,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           ownerOnly(false);
           live();
           if (!options.guests) throw new HttpError(503, "Guests unavailable");
+          if (typeof body.text === "string" && body.text.length > 2_000) throw new HttpError(400, messageLengthError(body.text, 2_000));
           if (!text(body.address, 200) || !text(body.text, 2_000) || !text(body.dedupeKey, 200)) throw new HttpError(400, "Invalid request");
           return result(await options.guests.send(body.address, body.text, body.dedupeKey));
         }
