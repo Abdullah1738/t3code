@@ -37,6 +37,8 @@ import {
   type KanbanScript,
   type KanbanThreadLink,
   type KanbanWikiPage,
+  kanbanPickOrder,
+  kanbanSchedule,
 } from "@t3tools/contracts";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
@@ -45,6 +47,7 @@ import { kanbanDDL } from "../../persistence/kanbanSchema.ts";
 import { ensureKanbanCacheVersions } from "../../persistence/kanbanCacheVersions.ts";
 import { summaries, tallyBoards } from "../engine/summaries.ts";
 import * as KanbanStore from "./KanbanStore.ts";
+import * as Rules from "../engine/rules.ts";
 
 const TestLayer = KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory));
 
@@ -1959,4 +1962,108 @@ it.effect(
         [seed.id, todo.id, blocker.id, ancestor.id],
       );
     }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect.each([
+  "urgency",
+  "fanout",
+  "aging",
+  "waiting",
+  "deciding",
+  "completed blocker",
+  "legacy",
+  "cycle",
+] as const)("compact claim ranking matches the whole board for %s", (kind) =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const threadId = ThreadId.make("worker");
+    const seed = { ...card(1, "needs_review"), workThreadId: threadId };
+    const blocker = { ...card(2, "todo"), priority: 4, movedAt: "2026-10-24T13:00:00.000Z" };
+    const rivals = [3, 4, 5, 6].map((n) => ({ ...card(n, "todo"), priority: 2 }));
+    const waiter = { ...card(7, "needs_owner"), priority: 1, blockedBy: [blocker.id] };
+    const history = {
+      ...card(8, "verified"),
+      updatedAt: "2026-11-05T13:00:00.000Z",
+      prompt: "x".repeat(10000),
+      description: "x".repeat(10000),
+    };
+    const cards = [seed, blocker, ...rivals, history];
+    if (kind === "urgency") cards.push(waiter);
+    if (kind === "fanout") {
+      blocker.priority = 3;
+      for (let n = 10; n < 21; n++)
+        cards.push({ ...card(n, "needs_owner"), priority: 3, blockedBy: [blocker.id] });
+    }
+    if (kind === "waiting")
+      Object.assign(blocker, {
+        wait: {
+          on: "time",
+          until: "2026-12-01T00:00:00.000Z",
+          at,
+          note: "Wait",
+          by: { _tag: "owner" },
+          script: null,
+          args: null,
+          pr: null,
+          card: null,
+          ask: null,
+          sinceHead: null,
+          wakeRole: null,
+          expiredAt: null,
+          status: null,
+          lastCheckedAt: null,
+          failures: 0,
+          problem: null,
+        },
+      });
+    if (kind === "deciding")
+      Object.assign(blocker, { deciding: { since: at, why: "Wake", toldAt: null } });
+    if (kind === "completed blocker") {
+      const completed = { ...card(9, "completed"), movedAt: "2026-11-05T13:00:00.000Z" };
+      blocker.blockedBy = [completed.id];
+      cards.push(completed);
+    }
+    if (kind === "cycle") {
+      blocker.blockedBy = [waiter.id];
+      cards.push(waiter);
+    }
+    for (const row of cards) yield* store.putCard(row);
+    if (kind === "legacy") {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE ardud_kanban_cards SET json = json_remove(json, '$.subtasks') WHERE board_id = ${boardId}`;
+    }
+    const scoped = yield* store.claimCards(boardId, [seed.id]);
+    const metadata = yield* store.schedulingCards(boardId);
+    const base = {
+      board,
+      groups: [
+        {
+          id: "related",
+          name: "related",
+          summary: "",
+          updatedAt: at,
+          cardIds: [seed.id, blocker.id, ...rivals.map((row) => row.id)],
+        },
+      ],
+      seeds: [seed],
+      threadId,
+      pool: Rules.poolKey(model),
+      projectId: null,
+      carrying: 0,
+      slots: 1,
+    };
+    const expected = Rules.relatedCandidates({ ...base, cards }).map(({ card }) => card.id);
+    const actual = Rules.relatedCandidates({ ...base, cards: scoped, rankingCards: metadata }).map(
+      ({ card }) => card.id,
+    );
+    assert.deepEqual(actual, expected);
+    assert.deepEqual(kanbanSchedule(metadata), kanbanSchedule(cards));
+    assert.deepEqual(
+      [...cards].sort(kanbanPickOrder(metadata)),
+      [...cards].sort(kanbanPickOrder(cards)),
+    );
+    assert.notInclude(JSON.stringify(metadata), "prompt");
+    assert.notInclude(JSON.stringify(metadata), "description");
+    if (kind === "urgency") assert.equal(actual[0], blocker.id);
+  }).pipe(Effect.provide(TestLayer)),
 );

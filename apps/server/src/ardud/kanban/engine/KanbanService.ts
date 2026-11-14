@@ -1555,9 +1555,13 @@ const make = Effect.gen(function* () {
   const inFlightSends = new Map<ThreadId, number>();
   const delivering = new Map<
     KanbanCard["id"],
-    { readonly threadId: ThreadId; touched: boolean; revoked: boolean }
+    { readonly threadId: ThreadId; touched: boolean; revoked: boolean; rollingBack: boolean }
   >();
   const agentCalls = new Map<ThreadId, number>();
+  const rollingBack = (threadId: ThreadId) =>
+    [...delivering.values()].some(
+      (pending) => pending.threadId === threadId && pending.rollingBack,
+    );
   const trackSend = Effect.fn("KanbanService.trackSend")(function* <A, E, R>(
     threadId: ThreadId,
     effect: Effect.Effect<A, E, R>,
@@ -7160,6 +7164,7 @@ const make = Effect.gen(function* () {
             threadId: reused,
             touched: (inFlightSends.get(reused) ?? 0) > 0 || (agentCalls.get(reused) ?? 0) > 0,
             revoked: false,
+            rollingBack: false,
           }
         : null;
     const key = pending !== null ? wakeKey(pending.threadId, `${card.id}:${at}`) : null;
@@ -7182,6 +7187,8 @@ const make = Effect.gen(function* () {
                 // A live consumer already owns this claim independently of the assignment send.
                 if (owns && !pending.revoked && pending.touched) return false;
                 if (owns && !pending.revoked) {
+                  // Admission and this decision are synchronous: no new consumer may see the claim during the save.
+                  pending.rollingBack = true;
                   const restored: KanbanCard = {
                     ...current,
                     // An undelivered hand-off must not consume the old wait's requested wake.
@@ -11156,11 +11163,19 @@ const make = Effect.gen(function* () {
       return yield* Effect.acquireUseRelease(
         // These in-memory markers must be atomic with delivery/rollback, but need no board lock or I/O.
         Effect.sync(() => {
+          if (rollingBack(threadId)) return false;
           agentCalls.set(threadId, (agentCalls.get(threadId) ?? 0) + 1);
           for (const pending of delivering.values()) {
             if (pending.threadId === threadId) pending.touched = true;
           }
-        }),
+          return true;
+        }).pipe(
+          Effect.flatMap((admitted) =>
+            admitted
+              ? Effect.void
+              : failWith("conflict", "Assignment is being rolled back; retry shortly."),
+          ),
+        ),
         () => effect,
         () =>
           Effect.sync(() => {
@@ -11988,6 +12003,7 @@ const make = Effect.gen(function* () {
             candidates: Rules.relatedCandidates({
               board: thread.board,
               cards,
+              rankingCards: yield* store.schedulingCards(thread.board.id),
               groups: yield* store.groups(thread.board.id),
               seeds: cards.filter((card) => mine.has(card.id)),
               threadId,

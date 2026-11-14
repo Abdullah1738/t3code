@@ -1424,6 +1424,23 @@ export interface KanbanSchedule extends KanbanBlocking {
   readonly waitingSince: string | null;
 }
 
+/** Card metadata used for scheduling, without descriptions, prompts or conversation state. */
+export type KanbanScheduleCard = Pick<
+  KanbanCard,
+  | "id"
+  | "number"
+  | "stage"
+  | "settledAt"
+  | "priority"
+  | "blockedBy"
+  | "updatedAt"
+  | "movedAt"
+  | "activeThreadId"
+  | "subtasks"
+  | "wait"
+  | "deciding"
+>;
+
 export interface KanbanScheduleOptions {
   /**
    * The clock waiting is measured against. Left out, it is the newest `updatedAt` on
@@ -1661,7 +1678,7 @@ export function kanbanBoardClock(cards: ReadonlyArray<Pick<KanbanCard, "updatedA
  * 3 days a To-Do card has been startable, at most two.
  */
 export function kanbanSchedule(
-  cards: ReadonlyArray<KanbanCard>,
+  cards: ReadonlyArray<KanbanScheduleCard>,
   options: KanbanScheduleOptions = {},
 ): Map<string, KanbanSchedule> {
   const graph = blockingGraph(cards, options.maxWords ?? SCHEDULE_MAX_WORDS);
@@ -1710,12 +1727,13 @@ export function kanbanSchedule(
  * board's To-Do column shows it.
  */
 export function kanbanPickOrder(
-  cards: ReadonlyArray<KanbanCard>,
+  cards: ReadonlyArray<KanbanScheduleCard>,
   options: KanbanScheduleOptions = {},
 ) {
   const schedule = kanbanSchedule(cards, options);
-  const of = (card: KanbanCard) => schedule.get(card.id) ?? { holds: 0, rank: card.priority };
-  return (a: KanbanCard, b: KanbanCard) => {
+  type RankedCard = Pick<KanbanScheduleCard, "id" | "priority" | "movedAt" | "number">;
+  const of = (card: RankedCard) => schedule.get(card.id) ?? { holds: 0, rank: card.priority };
+  return (a: RankedCard, b: RankedCard) => {
     const x = of(a);
     const y = of(b);
     return (
