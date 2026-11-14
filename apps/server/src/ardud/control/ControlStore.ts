@@ -8,6 +8,7 @@ import {
   OrchestrationV2TurnItemJson,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2TurnItem,
+  type OrchestrationV2Run,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -32,6 +33,7 @@ export interface ThreadOriginRow {
 }
 
 export interface ControlStoreShape {
+  readonly ownerShell: (threadId: string) => Effect.Effect<OwnerShell | null, ControlStoreError>;
   readonly getOrigin: (threadId: string) => Effect.Effect<string | null, ControlStoreError>;
   readonly getOrigins: (
     threadIds: ReadonlyArray<string>,
@@ -49,6 +51,8 @@ export interface ControlStoreShape {
     nativeSessionId: string,
     driver?: string,
   ) => Effect.Effect<string | null, ControlStoreError>;
+  /** Indexed count for slow-lookup diagnostics only. */
+  readonly threadRunCount: (threadId: string) => Effect.Effect<number, ControlStoreError>;
   /**
    * Current native id per thread (its active provider thread), for listings.
    * A migrated thread reports its new id. Threads with no active binding fall
@@ -101,6 +105,16 @@ export interface ThreadCandidateFilter {
   readonly parentThreadId: string | null;
   readonly projectId: string | null;
   readonly creationSources?: ReadonlyArray<string>;
+}
+
+export interface OwnerShell {
+  readonly threadId: string;
+  readonly title: string;
+  readonly projectId: string;
+  readonly status: OrchestrationV2Run["status"] | "idle";
+  readonly pending: boolean;
+  readonly archived: boolean;
+  readonly deleted: boolean;
 }
 
 export interface ThreadCandidateCursor {
@@ -173,8 +187,66 @@ export const make = Effect.gen(function* () {
       Effect.mapError(fail("read-origins")),
     );
 
+  const threadRunCount: ControlStoreShape["threadRunCount"] = Effect.fn(
+    "ControlStore.threadRunCount",
+  )(
+    (threadId) =>
+      sql<{ readonly count: number }>`
+      SELECT COUNT(*) AS count FROM orchestration_v2_projection_runs WHERE thread_id = ${threadId}
+    `.pipe(Effect.map((rows) => rows[0]?.count ?? 0)),
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("count-thread-runs")),
+  );
+
   const getOrigin: ControlStoreShape["getOrigin"] = (threadId) =>
     getOrigins([threadId]).pipe(Effect.map((origins) => origins.get(threadId) ?? null));
+
+  const ownerShell: ControlStoreShape["ownerShell"] = Effect.fn("ControlStore.ownerShell")(
+    function* (threadId) {
+      // Ownership needs no transcript, provider enrichment, error history or run
+      // payload. Each status probe is bounded by the thread/status or ordinal index.
+      const rows = yield* sql<{
+        readonly thread_id: string;
+        readonly project_id: string;
+        readonly title: string;
+        readonly status: OwnerShell["status"];
+        readonly pending: number;
+        readonly archived: number;
+        readonly deleted: number;
+      }>`
+        SELECT t.thread_id, t.project_id, t.title,
+          COALESCE(
+            (SELECT status FROM orchestration_v2_projection_runs INDEXED BY orchestration_v2_projection_runs_thread_status_idx
+              WHERE thread_id = t.thread_id AND status IN ('preparing','starting','running')
+              ORDER BY ordinal DESC LIMIT 1),
+            (SELECT status FROM orchestration_v2_projection_runs INDEXED BY orchestration_v2_projection_runs_thread_status_idx
+              WHERE thread_id = t.thread_id AND status = 'waiting' ORDER BY ordinal DESC LIMIT 1),
+            (SELECT status FROM orchestration_v2_projection_runs INDEXED BY orchestration_v2_projection_runs_thread_status_idx
+              WHERE thread_id = t.thread_id AND status = 'queued' ORDER BY ordinal DESC LIMIT 1),
+            (SELECT status FROM orchestration_v2_projection_runs
+              WHERE thread_id = t.thread_id ORDER BY ordinal DESC LIMIT 1),
+            'idle') AS status,
+          EXISTS(SELECT 1 FROM orchestration_v2_projection_runtime_requests
+            WHERE thread_id = t.thread_id AND status = 'pending') AS pending,
+          t.archived_at IS NOT NULL AS archived, t.deleted_at IS NOT NULL AS deleted
+        FROM orchestration_v2_projection_threads t WHERE t.thread_id = ${threadId}
+      `;
+      const row = rows[0];
+      return row === undefined
+        ? null
+        : {
+            threadId: row.thread_id,
+            projectId: row.project_id,
+            title: row.title,
+            status: row.status,
+            pending: row.pending !== 0,
+            archived: row.archived !== 0,
+            deleted: row.deleted !== 0,
+          };
+    },
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("read-owner-shell")),
+  );
 
   const setOrigin: ControlStoreShape["setOrigin"] = Effect.fn("ControlStore.setOrigin")(
     function* (threadId, origin) {
@@ -438,6 +510,8 @@ export const make = Effect.gen(function* () {
     getOrigins,
     setOrigin,
     threadIdForNativeSession,
+    threadRunCount,
+    ownerShell,
     nativeSessionIds,
     nativeBindings,
     liveThreadIds,

@@ -454,6 +454,65 @@ const run = <A, E>(
   ).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("control listings", () => {
+  it.live("by-native owner reads complete while the background reader holds a transaction", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "control-native-owner-lane-" });
+      yield* Effect.gen(function* () {
+        const h = yield* makeHarness();
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`INSERT INTO ardud_opencode_import (native_session_id, thread_id, imported_at)
+          VALUES ('ses_owner', 'live-running', '2026-11-14')`;
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const holder = yield* sql.withTransaction(
+          Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        ).pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
+        yield* Deferred.await(held);
+        const response = yield* h.get("/threads/by-native/ses_owner?view=owner").pipe(
+          Effect.timeout("5 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)),
+        );
+        yield* Fiber.join(holder);
+        assert.strictEqual(response.status, 200);
+        assert.strictEqual(response.body.thread.threadId, "live-running");
+      }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+  it.effect("by-native defaults to full detail and offers a history-free owner view", () =>
+    run(({ get, sql, recordReads, shellReads }) =>
+      Effect.gen(function* () {
+        yield* sql`INSERT INTO ardud_opencode_import (native_session_id, thread_id, imported_at)
+        VALUES ('ses_owner', 'live-running', '2026-11-14')`;
+        const owner = yield* get("/threads/by-native/ses_owner?view=owner");
+        assert.strictEqual(owner.status, 200);
+        assert.deepStrictEqual(Object.keys(owner.body.thread), [
+          "id",
+          "threadId",
+          "title",
+          "projectId",
+          "state",
+          "status",
+          "archived",
+          "deleted",
+        ]);
+        assert.strictEqual(owner.body.thread.threadId, "live-running");
+        assert.strictEqual(yield* Ref.get(recordReads), 0);
+        assert.strictEqual(yield* Ref.get(shellReads), 0);
+        const full = yield* get("/threads/by-native/ses_owner");
+        const detail = yield* get("/threads/live-running");
+        assert.strictEqual(JSON.stringify(full.body.thread), JSON.stringify(detail.body.thread));
+        for (const view of ["", "invalid", "full", "OWNER", "owner "]) {
+        assert.strictEqual((yield* get(`/threads/by-native/ses_owner?view=${encodeURIComponent(view)}`)).status, 400);
+      }
+        assert.strictEqual((yield* get("/threads/by-native/unknown?view=owner")).status, 404);
+        assert.strictEqual(
+          (yield* get("/threads/by-native/ses_owner?driver=codex&view=owner")).status,
+          404,
+        );
+      }),
+    ),
+  );
   it.effect("includes current boot phase timings in the authenticated install report", () =>
     run(({ get, startupLog }) =>
       Effect.gen(function* () {

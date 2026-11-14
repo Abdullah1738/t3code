@@ -204,9 +204,16 @@ export class ControlClient {
     return this.request("GET", `/threads/${encodeURIComponent(threadId)}`);
   }
 
-  /** Looks up the thread for an OpenCode session id (ses_...). @param {string} sessionId */
+  /**
+   * Looks up the Robob thread for a native session id.
+   * @param {string} sessionId
+   * @param {{ driver?: string, view?: "owner" }} [options]
+   */
   threadByNativeSession(sessionId, options = {}) {
-    const query = options.driver ? `?driver=${encodeURIComponent(options.driver)}` : "";
+    const params = new URLSearchParams();
+    if (options.driver) params.set("driver", options.driver);
+    if (options.view !== undefined) params.set("view", options.view);
+    const query = params.size ? `?${params}` : "";
     return this.request("GET", `/threads/by-native/${encodeURIComponent(sessionId)}${query}`);
   }
 
