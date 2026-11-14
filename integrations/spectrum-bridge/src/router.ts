@@ -3537,7 +3537,12 @@ export class Router {
     if (preparing?.held) system += this.delayNote(input, turn.startedAt);
     if (context) system += `\n${sendblueContextPrompt(context, eyes, this.batchSenders(members), background, this.options.replyMode)}`;
     const seed = this.store.get<string>(`seed:${turn.id}`);
-    if (seed) system += `\n${seed}`;
+    if (seed) {
+      system += `\n${seed}`;
+      toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "context.seed_applied",
+        ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id },
+        props: { seedChars: seed.length, pendingOrders: seed.includes("Pending orders for this chat (from pending-orders.md") } }));
+    }
     system += steerAttempt?.fileGuidance ?? incomingFileGuidance(notes);
     // Background updates given up on earlier ride along until a prompt carrying them lands.
     const missed = steerAttempt ? [] : (this.store.get<Missed[] | null>("missedSynthetic") ?? []).filter(m => !members.includes(m.id));
@@ -3675,6 +3680,9 @@ export class Router {
       this.nudgeReset(next, orders
         ? `${nudge}\n\nCopy this chat's pending-orders list into your resume note word for word, under 'Pending orders (from pending-orders.md)':\nQuoted data from pending-orders.md:\n${quotedPendingOrders(orders)}`
         : nudge);
+      toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "context.nudged",
+        ids: { chat: this.options.context?.chat.slug ?? "owner", threadId: route.id },
+        props: { pendingOrders: orders !== null, pendingOrdersChars: orders?.length ?? 0 } }));
       return true;
     }).immediate();
     if (nudged) this.options.log?.("context-reset-nudged", "rotate");
@@ -3762,6 +3770,10 @@ export class Router {
       if (refused) this.store.set("refusedRoute", null);
     }).immediate();
     this.options.log?.("route-rotated", refused ? "providerRefusal" : large ? "contextSize" : "age");
+    toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "context.rotated",
+      ids: { chat: this.options.context?.chat.slug ?? "owner", fromThreadId: route.id, toThreadId: next.id },
+      props: { reason: refused ? "providerRefusal" : large ? "contextSize" : "age", seedChars: seed.length,
+        recapLines: lines.length, pendingOrders: orders !== null, pendingOrdersChars: orders?.length ?? 0 } }));
     this.retireOthers();
     return next;
   }
