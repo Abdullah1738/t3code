@@ -22,6 +22,12 @@ class WebMailProofTests(TestCase):
             result = tracker.fetch(cfg, {} if state is None else state, self.f.now)
         return cfg, result
 
+    def assert_arrival_notice(self, cfg, result):
+        self.assertFalse(tracker.terminal_order(cfg, result))
+        self.assertFalse(result['whole_order_complete'])
+        self.assertNotIn(result['status'], tracker.TERMINAL)
+        self.assertTrue(any(p['stage'] == 'delivered' for p in result['partial_evidence']))
+
     def test_incidental_numbers_and_conflicting_order_references(self):
         rows = [
             ('13', 'Order #9999 has been delivered on November 13', ''),
@@ -38,6 +44,7 @@ class WebMailProofTests(TestCase):
                 cfg, result = self.fetch(order, subject, body)
                 self.assertFalse(tracker.terminal_order(cfg, result))
                 self.assertEqual(result['evidence'], [])
+                self.assertEqual(result['partial_evidence'], [])
 
     def test_reference_label_and_separator_class(self):
         references = ['Order #2606', 'Order#2606', 'Order 2606', 'Order: 2606',
@@ -47,10 +54,10 @@ class WebMailProofTests(TestCase):
         for reference in references:
             with self.subTest(reference=reference):
                 cfg, result = self.fetch('2606', 'Your order has been delivered', reference)
-                self.assertTrue(tracker.terminal_order(cfg, result))
+                self.assert_arrival_notice(cfg, result)
         for order in ('A_b-1', 'RC-1042', 'ABC'):
             cfg, result = self.fetch(order, 'Your order has been delivered', 'Order ID: ' + order)
-            self.assertTrue(tracker.terminal_order(cfg, result))
+            self.assert_arrival_notice(cfg, result)
 
     def test_package_shipment_item_scope_cannot_retire_the_order(self):
         rows = [('Your package has been delivered - Order #2606', 'shipment'),
@@ -81,7 +88,7 @@ class WebMailProofTests(TestCase):
                 self.assertFalse(tracker.terminal_order(cfg, result))
                 self.assertNotEqual(result['status'], 'delivered')
 
-    def test_numbered_affirmative_delivery_forms_close_once(self):
+    def test_numbered_affirmative_delivery_forms_notify_once_without_closing(self):
         for order in ('2606', 'RC-1042'):
             for reference in ('Order #{id} delivered', 'Order {id} delivered',
                               'Order #{id}: delivered', 'Order #{id} - delivered',
@@ -92,11 +99,10 @@ class WebMailProofTests(TestCase):
                 subject = reference.format(id=order)
                 with self.subTest(subject=subject):
                     cfg, result = self.fetch(order, subject)
-                    self.assertEqual(result['status'], 'delivered')
-                    self.assertTrue(tracker.terminal_order(cfg, result))
+                    self.assert_arrival_notice(cfg, result)
                     state = {'primed': True, 'status': 'ordered'}
-                    self.assertEqual(tracker.transition(result, state, cfg, self.f.now),
-                                     [{'kind': 'stage_change', 'status': 'delivered'}])
+                    self.assertEqual([e['kind'] for e in tracker.transition(result, state, cfg, self.f.now)],
+                                     ['shipment_delivered'])
                     self.assertEqual(tracker.transition(result, state, cfg, self.f.now + 60), [])
 
     def test_legacy_token_only_cache_cannot_supply_new_proof(self):
@@ -182,7 +188,7 @@ class WebMailProofTests(TestCase):
                 _, result = self.fetch('2606', prose, 'Order #2606')
                 self.assertEqual(result['status'], 'ordered')
                 cfg, result = self.fetch('2606', 'Your order has been delivered', prose + '\nOrder #2606')
-                self.assertTrue(tracker.terminal_order(cfg, result))
+                self.assert_arrival_notice(cfg, result)
 
     def test_absence_of_remaining_items_also_fails_closed(self):
         for statement in ('No remaining items.', 'There are no remaining shipments.',
@@ -194,21 +200,21 @@ class WebMailProofTests(TestCase):
             cfg, result = self.fetch('2606', 'Order #2606 delivered', 'Order #2606\n' + statement)
             self.assertFalse(tracker.terminal_order(cfg, result))
 
-    def test_newer_package_mail_cannot_mask_whole_order_proof(self):
+    def test_full_order_and_newer_package_mail_both_remain_scoped(self):
         hits = [self.f.hit(subject='Order #2606 delivered', uid=1, date=tracker.stamp(self.f.now - 600))]
         for uid in (2, 3, 4):
             hits.append(self.f.hit(subject='Your package has been delivered - Order #2606', uid=uid))
         with self.f.mail(hits), mock.patch.object(tracker, 'run', return_value='Order #2606'):
             result = tracker.fetch(self.f.cfg, {}, self.f.now)
-        self.assertTrue(tracker.terminal_order(self.f.cfg, result))
-        self.assertEqual(len(result['partial_evidence']), 3)
+        self.assert_arrival_notice(self.f.cfg, result)
+        self.assertEqual(len(result['partial_evidence']), 4)
 
     def test_keyword_fragments_inside_order_ids_are_not_status_words(self):
         for order in ('MAY-2606', 'WHEN_2606', 'IF-2606', 'CAN-2606', 'WILL-2606',
                       'SHIPMENT-2606', 'PACKAGE-2606', 'ITEM-2606', 'MAY'):
             with self.subTest(order=order):
                 cfg, result = self.fetch(order, f'Order #{order} delivered')
-                self.assertTrue(tracker.terminal_order(cfg, result))
+                self.assert_arrival_notice(cfg, result)
                 cfg, result = self.fetch(order, f'Order #{order} may be successfully delivered')
                 self.assertFalse(tracker.terminal_order(cfg, result))
 
@@ -218,7 +224,7 @@ class WebMailProofTests(TestCase):
                 with self.subTest(label=label, separator=separator):
                     cfg, result = self.fetch('2606', 'Order #2606 delivered - all 2 items',
                                              f'Order #2606\n{label}{separator}2 of 2')
-                    self.assertTrue(tracker.terminal_order(cfg, result))
+                    self.assert_arrival_notice(cfg, result)
                     cfg, result = self.fetch('2606', 'Order #2606 delivered',
                                              f'Order #2606\n{label}{separator}1 of 2')
                     self.assertFalse(tracker.terminal_order(cfg, result))
@@ -248,11 +254,11 @@ class WebMailProofTests(TestCase):
                 cfg, result = self.fetch('2606', 'Order #2606 delivered', 'Order #2606. ' + statement)
                 self.assertFalse(tracker.terminal_order(cfg, result))
                 self.assertFalse(result['whole_order_complete'])
-        for statement, complete in (('This is not a partial delivery.', False), ('Your delivery is not partial.', False),
-                                    ('Your entire order has been delivered.', True), ('No remaining items.', False)):
+        for statement in ('This is not a partial delivery.', 'Your delivery is not partial.',
+                          'Your entire order has been delivered.', 'No remaining items.'):
             with self.subTest(statement=statement):
                 cfg, result = self.fetch('2606', 'Order #2606 delivered', 'Order #2606. ' + statement)
-                self.assertEqual(tracker.terminal_order(cfg, result), complete)
+                self.assert_arrival_notice(cfg, result)
 
     def test_worded_and_mixed_partial_counts_in_body(self):
         for unit in ('items', 'packages', 'parcels', 'shipments'):
@@ -261,7 +267,7 @@ class WebMailProofTests(TestCase):
                     cfg, result = self.fetch('2606', 'Order #2606 delivered', f'Order #2606. {count} {unit} has been delivered.')
                     self.assertFalse(tracker.terminal_order(cfg, result))
             cfg, result = self.fetch('2606', 'Order #2606 delivered', f'Order #2606. {unit}: two of two delivered.')
-            self.assertTrue(tracker.terminal_order(cfg, result))
+            self.assert_arrival_notice(cfg, result)
 
     def test_other_parts_still_in_transit_keep_order_open(self):
         for unit in ('item', 'package', 'parcel', 'shipment'):
@@ -275,11 +281,10 @@ class WebMailProofTests(TestCase):
             for predicate in ('are still on the way', 'will ship separately', 'are in transit'):
                 cfg, result = self.fetch('2606', 'Order #2606 delivered', f'Order #2606. Other {unit}s {predicate}.')
                 self.assertFalse(tracker.terminal_order(cfg, result))
-        for statement, complete in (('No other shipments are still on the way.', False), ('Other shipments have been delivered.', True),
-                                    ('Other shipments are not pending.', False),
-                                    ('All other items have already arrived.', True)):
+        for statement in ('No other shipments are still on the way.', 'Other shipments have been delivered.',
+                          'Other shipments are not pending.', 'All other items have already arrived.'):
             cfg, result = self.fetch('2606', 'Order #2606 delivered', 'Order #2606. ' + statement)
-            self.assertEqual(tracker.terminal_order(cfg, result), complete)
+            self.assert_arrival_notice(cfg, result)
 
     def test_newer_scoped_nonterminal_progress_advances_confirmation(self):
         for unit in ('package', 'parcel', 'shipment', 'item'):
@@ -317,10 +322,10 @@ class WebMailProofTests(TestCase):
         self.assertTrue(tracker.read(path)['active'])
         self.assertTrue(any(call.args[0][:2] == ['mailsearch', 'read'] for call in read.call_args_list))
 
-    def test_status_discards_obsolete_terminal_label_but_keeps_current_proof(self):
+    def test_status_never_restores_a_web_terminal_label(self):
         cfg = self.f.cfg
         tracker.write(tracker.ROOT / 'orders' / (cfg['watcher'] + '.json'), cfg)
-        for version, expected in ((2, 'unknown'), (3, 'unknown'), (tracker.WEB_PROOF_VERSION, 'delivered')):
+        for version, expected in ((2, 'unknown'), (3, 'unknown'), (4, 'unknown'), (tracker.WEB_PROOF_VERSION, 'unknown')):
             tracker.write(tracker.WATCHERS / cfg['watcher'] / 'order-tracker-state.json',
                           {'status': 'delivered', 'web_proof_version': version,
                            'last_result': {'status': 'delivered', 'whole_order_complete': True,
@@ -329,7 +334,7 @@ class WebMailProofTests(TestCase):
                 tracker.main(['status', '--app', 'web', '--order', '2606', '--merchant-domain', 'fabrique.ae'])
             self.assertEqual(json.loads(output.getvalue())['last_confirmed_status'], expected)
 
-    def test_conditional_support_text_does_not_invent_partial_scope(self):
+    def test_hypothetical_support_controls_still_allow_arrival_notices(self):
         for condition in ('If', 'When', 'Once', 'Unless'):
             for phrase in ('your order is partially delivered', 'this is a partial delivery',
                            'other shipments are pending', 'one of two shipments has arrived',
@@ -337,7 +342,7 @@ class WebMailProofTests(TestCase):
                 body = f'Order #2606 delivered in full.\n{condition} {phrase}, contact support.'
                 with self.subTest(condition=condition, phrase=phrase):
                     cfg, result = self.fetch('2606', 'Order #2606 delivered', body)
-                    self.assertTrue(tracker.terminal_order(cfg, result))
+                    self.assert_arrival_notice(cfg, result)
         for body in ('If you need help, contact support. This is a partial delivery.',
                      'This is a partial delivery. If you need help, contact support.',
                      'Product WHEN-ITEM: this is a partial delivery.',
@@ -345,15 +350,14 @@ class WebMailProofTests(TestCase):
             cfg, result = self.fetch('2606', 'Order #2606 delivered', 'Order #2606. ' + body)
             self.assertFalse(tracker.terminal_order(cfg, result))
 
-    def test_negated_signals_fail_closed_while_negated_transit_stays_clear(self):
+    def test_negated_pending_and_transit_prose_only_allow_scoped_notices(self):
         for unit in ('items', 'packages', 'parcels', 'shipments'):
-            for predicate, complete in (('are no longer pending', False), ('are no longer in transit', True),
-                                        ('are no longer on the way', True), ('are no  longer pending', False),
-                                        ("aren't pending", False), ('aren’t pending', False)):
+            for predicate in ('are no longer pending', 'are no longer in transit', 'are no longer on the way',
+                              'are no  longer pending', "aren't pending", 'aren’t pending'):
                 with self.subTest(unit=unit, predicate=predicate):
                     cfg, result = self.fetch('2606', 'Order #2606 delivered',
                                              f'Order #2606 delivered in full. The other {unit} {predicate}.')
-                    self.assertEqual(tracker.terminal_order(cfg, result), complete)
+                    self.assert_arrival_notice(cfg, result)
 
     def assert_partial_check_stays_active(self, body, initial_state=None):
         cfg = self.f.cfg
@@ -442,13 +446,12 @@ class WebMailProofTests(TestCase):
             self.assert_partial_check_stays_active('Order #2606. ' + statement)
 
     def test_absence_signals_fail_closed_and_signal_word_boundaries(self):
-        for body, complete in (('No items pending.', False), ('Nothing remaining.', False),
-                               ('Pending items: 0', False), ('Pending items = zero', False),
-                               ('Delivery status: delivered in full.', True), ('Outstandingly good service.', True),
-                               ('An impartially selected gift.', True), ('2 of 2', True), ('2/2', True)):
+        for body in ('No items pending.', 'Nothing remaining.', 'Pending items: 0', 'Pending items = zero',
+                     'Delivery status: delivered in full.', 'Outstandingly good service.',
+                     'An impartially selected gift.', '2 of 2', '2/2'):
             with self.subTest(control=body):
                 cfg, result = self.fetch('2606', 'Order #2606 delivered', 'Order #2606\n' + body)
-                self.assertEqual(tracker.terminal_order(cfg, result), complete)
+                self.assert_arrival_notice(cfg, result)
         for body in ('No items pending; backordered.', 'Nothing remaining. Separate shipment.',
                      'Pending items: 0; 1/2', 'Other shipments are not pending; items left.'):
             cfg, result = self.fetch('2606', 'Order #2606 delivered', 'Order #2606\n' + body)
@@ -489,7 +492,7 @@ class WebMailProofTests(TestCase):
             cfg, result = self.fetch('2606', 'Order #2606 delivered', 'Order #2606. ' + body)
             self.assertFalse(tracker.terminal_order(cfg, result))
 
-    def test_partial_check_keeps_watcher_and_later_whole_delivery_retires(self):
+    def test_partial_and_later_full_delivery_only_notify_and_keep_tracking(self):
         cfg = self.f.cfg
         folder = tracker.WATCHERS / cfg['watcher']
         path = tracker.ROOT / 'orders' / (cfg['watcher'] + '.json')
@@ -510,7 +513,7 @@ class WebMailProofTests(TestCase):
             with self.f.mail([self.f.hit(subject='Order #2606 delivered', uid=2)]):
                 tracker._check(cfg)
                 tracker._check(cfg)
-            self.assertFalse(tracker.read(path)['active'])
+            self.assertTrue(tracker.read(path)['active'])
         self.assertNotIn('Your package', json.dumps(tracker.read(folder / 'order-tracker-state.json')))
 
 

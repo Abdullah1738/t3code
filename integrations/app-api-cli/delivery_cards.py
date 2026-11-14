@@ -393,14 +393,18 @@ def eta(data, cfg):
 
 
 def view(cfg, data, meta):
+    if cfg['app'] == 'web':
+        data = {**data, 'whole_order_complete': False}
     vertical = lane(cfg, meta)
     food = vertical in ('food', 'restaurants')
     nearby_label = 'Almost here' if cfg['app'] == 'careem' and vertical in ('food', 'quik') else None
     steps, idx, label, terminal = stage(data, food, nearby_label)
     if cfg['app'] == 'web':
         current = data.get('status') or 'unknown'
-        if current == 'unknown':
+        if current in ('unknown', 'delivered', 'cancelled'):
             current = data.get('last_confirmed_status', 'unknown')
+        if current in ('delivered', 'cancelled'):
+            current = 'unknown'
         steps = ['Ordered', 'Shipped', 'Out for delivery', 'Delivered']
         idx = {'ordered': 0, 'shipped': 1, 'out for delivery': 2, 'delivered': 3}.get(current, -1)
         label = 'Cancelled' if current == 'cancelled' else steps[idx] if idx >= 0 else 'Tracking pending'

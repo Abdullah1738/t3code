@@ -64,7 +64,7 @@ RECEIPT_SUBJECT = re.compile(r'\bservice charges receipt\b', re.I)
 RANK = {'unknown': -1, 'pending confirmation': 0, 'placed': 0, 'ordered': 0, 'shipped': 2, 'preparing': 1, 'packed':1, 'picked up': 2,
         'out for delivery': 3, 'nearby': 4, 'delivered': 5, 'cancelled': 5}
 TRACKING_PROBLEM_REPEAT_S = 86400
-WEB_PROOF_VERSION = 4
+WEB_PROOF_VERSION = 5
 WEB_NUMBER_WORDS = {word: value for value, word in enumerate(
     'zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty'.split())}
 # Bridge chat slug rule; group slugs carry "_" (group-sb_gro). Env is read at call time.
@@ -238,10 +238,11 @@ def eta_elapsed_due(cfg, state, now):
 
 
 def terminal_order(cfg, result, status=None):
+    if cfg['app'] == 'web':
+        return False
     status = result.get('status') if status is None else status
     return (status in TERMINAL and result.get('whole_order_complete') is not False
-            and (cfg['app'] not in {'amazon', 'web'} or result.get('whole_order_complete') is True)
-            and (cfg['app'] != 'web' or result.get('web_proof_version') == WEB_PROOF_VERSION))
+            and (cfg['app'] != 'amazon' or result.get('whole_order_complete') is True))
 
 
 def part_delivered(result, state):
@@ -864,12 +865,12 @@ def email_body(value):
 
 
 def web_fetch(cfg, state, now):
+    if state.get('status') in TERMINAL:
+        state.pop('status', None)
+    state.pop('terminal_at', None)
     if state.get('web_proof_version') != WEB_PROOF_VERSION:
         for key in ('mail_cache', 'mail_checked', 'mail_bodies_verified', 'web_mail_last_at'):
             state.pop(key, None)
-        if state.get('status') in TERMINAL and not terminal_order(cfg, state.get('last_result', {})):
-            state.pop('status', None)
-            state.pop('terminal_at', None)
         state['web_proof_version'] = WEB_PROOF_VERSION
     if 'mail_cache' not in state or now - state.get('mail_checked', 0) >= 300:
         state['mail_checked'] = now
@@ -881,9 +882,8 @@ def web_fetch(cfg, state, now):
         except (RuntimeError, OSError, ValueError, TypeError, subprocess.TimeoutExpired):
             state['mail_errors'] = ['email_unavailable']
     mails = state.get('mail_cache', [])
-    completion = [proof for proof in mails if proof['scope'] == 'order' and proof['stage'] in TERMINAL]
     progress = [proof for proof in mails if proof['stage'] not in TERMINAL]
-    best = max(completion or progress or mails, key=lambda e: e['observed_at'], default=None)
+    best = max(progress, key=lambda e: e['observed_at'], default=None)
     result = {'app': 'web', 'order': cfg['order'], 'status': best['stage'] if best else 'unknown',
               'eta': cfg.get('eta'), 'eta_source': 'checkout_supplied' if cfg.get('eta') else None,
               'rider': None, 'checked_at': stamp(now), 'source': 'order_email',
@@ -896,16 +896,14 @@ def web_fetch(cfg, state, now):
         result['problem'] = problem
         if result['status'] == 'problem' or result['status'] in TERMINAL:
             result['status'] = 'unknown'
-    result['whole_order_complete'] = bool(best and best['scope'] == 'order' and result['status'] in TERMINAL)
-    result['partial_evidence'] = [proof for proof in mails
-                                  if proof['scope'] in {'shipment', 'item'} and proof['stage'] in TERMINAL]
-    if best and best['stage'] in TERMINAL and not result['whole_order_complete']:
-        result.update(status='unknown', evidence=[])
+    # Merchant mail can announce a part without proving the whole order ended.
+    result['whole_order_complete'] = False
+    result['partial_evidence'] = [{**proof, 'scope': proof['scope'] if proof['scope'] in {'shipment', 'item'} else 'shipment'}
+                                for proof in mails if proof['stage'] in TERMINAL]
     latest = max([state.get('web_mail_last_at', epoch(cfg['placed_at'])),
                   *(epoch(e['observed_at']) for e in mails)])
     state['web_mail_last_at'] = latest
-    if (result['status'] in {'unknown', 'ordered'}
-            and state.get('status', 'unknown') in {'unknown', 'ordered'} and now - latest >= 48 * 3600):
+    if now - latest >= 48 * 3600:
         result['errors'] = [*result['errors'], 'web_email_stalled']
     return result
 
@@ -1234,7 +1232,15 @@ def transition(result, state, cfg, now):
     events = []
     for proof in result.get('partial_evidence', []):
         key = proof.get('evidence_key') or proof.get('mail_key')
-        if not key or proof.get('stage') != 'delivered':
+        if not key:
+            continue
+        if cfg.get('app') == 'web' and proof.get('stage') == 'cancelled':
+            seen = state.setdefault('web_cancellations_seen', [])
+            if key not in seen:
+                seen.append(key)
+                events.append({'kind': 'shipment_cancelled', 'status': 'cancelled', 'scope': proof['scope']})
+            continue
+        if proof.get('stage') != 'delivered':
             continue
         seen = state.setdefault('parts_delivered_seen', [])
         shipments_seen = state.setdefault('native_shipments_delivered_seen', [])
@@ -1330,9 +1336,10 @@ def transition(result, state, cfg, now):
     if failing and now - epoch(cfg['registered_at']) > 600 and state.get('status') not in TERMINAL:
         errors = result.get('errors') or ['no_order_status_evidence']
         last = state.get('tracking_problem_last_at') or 0
-        if cfg.get('app') == 'web' and 'web_email_stalled' in errors and state.get('web_stall_alerted'):
+        web_stall = cfg.get('app') == 'web' and 'web_email_stalled' in errors
+        if web_stall and state.get('web_stall_alerted'):
             reason = 'web_stall_already_reported'
-        elif part_delivered(result, state) and eta_open(cfg, result, now, state):
+        elif not web_stall and part_delivered(result, state) and eta_open(cfg, result, now, state):
             reason = 'partial_delivery_eta_open'
         elif all(quiet_error(e) for e in errors) and (
                 state['tracking_problem_streak'] < TRACKING_PROBLEM_QUIET_STREAK or eta_open(cfg, result, now, state)):
@@ -1351,7 +1358,9 @@ def transition(result, state, cfg, now):
     else:
         state.pop('tracking_problem_suppressed', None)
     if not state.get('primed'):
-        events = []
+        # A web notice must survive the first successful check that consumes its key.
+        events = ([event for event in events if event['kind'] in {'shipment_delivered', 'shipment_cancelled'}]
+                  if cfg.get('app') == 'web' else [])
         # Baseline stage only; overdue/coverage alerts must fire on the next tick.
         state.pop('delay_sent', None)
         state.pop('coverage_alert', None)
@@ -1376,6 +1385,9 @@ def _check(cfg, pending_only=False):
         fcntl.flock(lock, fcntl.LOCK_EX)
         path = folder / 'order-tracker-state.json'
         state = read(path)
+        # The watcher never delivers prime output; web notices must wait for a real check.
+        if cfg.get('app') == 'web' and os.environ.get('WATCH_RUN', '').startswith('prime-'):
+            return {'ok': True}
         if pending_only and order_total_aed(cfg, {}, state) < 500:
             return {'ok': True}
         if pending_only and os.environ.get('WATCH_MAIN_CHECKED') == '1':
@@ -1458,6 +1470,8 @@ def _check(cfg, pending_only=False):
 
 
 def retire_terminal(cfg, folder, path, state):
+    if cfg.get('app') == 'web':
+        return
     if folder.resolve() != (WATCHERS / cfg['watcher']).resolve():
         return
     # Direct checks can race the runner before it stores or delivers an event.
@@ -1716,7 +1730,7 @@ def main(argv=None, _locked=False):
                        'Use existing read-only evidence first; no phone UI while priority-hold is present.')
             command = shlex.join([sys.executable, str(Path(__file__).resolve()), 'check', '--app', app, '--order', args.order,
                                   *merchant_args(cfg)])
-            # add writes watcher.json, then primes one real check (robob-watch
+            # For native apps, add writes watcher.json, then primes one real check (robob-watch
             # caps it at 60s); that check's state supplies the ETA for Moni's
             # text. add 80s + bridge send 20s stays under the lanes' 125s budget, and a
             # slow or failed prime is retried on schedule once the watcher exists.

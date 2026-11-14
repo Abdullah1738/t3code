@@ -126,7 +126,7 @@ class WebTrackerTest(unittest.TestCase):
                       dt.datetime.fromtimestamp(self.now - 60).astimezone().strftime('%Y-%m-%d %H:%M'),
                       dt.datetime.fromtimestamp(self.now - 60, dt.timezone.utc).strftime('%a, %d %b %Y %H:%M:%S +0000')):
             with self.subTest(date=value), self.mail([self.hit(date=value)]):
-                self.assertEqual(tracker.fetch(self.cfg, {}, self.now)['status'], 'delivered')
+                self.assertEqual(tracker.fetch(self.cfg, {}, self.now)['partial_evidence'][0]['stage'], 'delivered')
 
     def test_subject_and_body_ids_require_whole_web_order_number(self):
         for other in ('12606', '26060', '2606-2', 'A_2606', '2606_extra'):
@@ -141,7 +141,8 @@ class WebTrackerTest(unittest.TestCase):
             result = tracker.fetch(self.cfg, state, self.now)
             tracker.fetch(self.cfg, state, self.now + 301)
             self.assertEqual(read.call_count, 1)
-        self.assertEqual(result['status'], 'delivered')
+        self.assertEqual(result['status'], 'unknown')
+        self.assertEqual(result['partial_evidence'][0]['stage'], 'delivered')
         serialized = json.dumps([result, state])
         for private in ('Private customer detail', 'secret marker', 'Your order has been delivered'):
             self.assertNotIn(private, serialized)
@@ -160,7 +161,12 @@ class WebTrackerTest(unittest.TestCase):
                     mock.patch('native_orders.track', side_effect=AssertionError('native called')), \
                     mock.patch.object(tracker, 'run', return_value='Order #2606'), \
                     mock.patch.object(store, 'evidence', side_effect=AssertionError('pushes called')):
-                self.assertEqual(tracker.fetch(self.cfg, {}, self.now)['status'], expected)
+                result = tracker.fetch(self.cfg, {}, self.now)
+                if expected in tracker.TERMINAL:
+                    self.assertEqual(result['status'], 'unknown')
+                    self.assertEqual(result['partial_evidence'][0]['stage'], expected)
+                else:
+                    self.assertEqual(result['status'], expected)
         self.assertEqual(tracker.classify('Thanks for your order #2606'), 'placed')
         self.assertEqual(tracker.classify('Order shipped #2606'), 'unknown')
 
@@ -178,7 +184,10 @@ class WebTrackerTest(unittest.TestCase):
                     for stage in ('cancelled', 'canceled', 'shipped', 'dispatched', 'confirmed', 'received', 'placed'))
         for subject, expected in rows:
             with self.subTest(subject=subject), self.mail([self.hit(subject=subject)]):
-                self.assertEqual(tracker.fetch(self.cfg, {}, self.now)['status'], expected)
+                result = tracker.fetch(self.cfg, {}, self.now)
+                self.assertEqual(result['status'], 'unknown')
+                self.assertEqual([p['stage'] for p in result['partial_evidence']],
+                                 ['cancelled'] if expected == 'cancelled' else [])
 
     def test_new_failure_supersedes_old_confirmations(self):
         hits = [self.hit(subject='Thanks for your order #2606', uid=uid,
@@ -238,7 +247,7 @@ class WebTrackerTest(unittest.TestCase):
                         'Your order #2606 has been delivered - both items',
                         'Your entire order #2606 has been delivered'):
             with self.subTest(subject=subject), self.mail([self.hit(subject=subject)]):
-                self.assertEqual(tracker.fetch(self.cfg, {}, self.now)['status'], 'delivered')
+                self.assertEqual(tracker.fetch(self.cfg, {}, self.now)['partial_evidence'][0]['stage'], 'delivered')
 
     def test_email_only_fallback_uses_stored_sender_domain(self):
         cfg = dict(self.cfg, **{'for': 'moni'})
@@ -250,7 +259,7 @@ class WebTrackerTest(unittest.TestCase):
         self.assertEqual(evidence[0]['stage'], 'delivered')
         self.assertTrue(any('from fabrique.ae and after' in call.args[0][-1] for call in run.call_args_list))
 
-    def test_no_email_for_48_hours_reports_once_and_delivery_closes(self):
+    def test_no_email_for_48_hours_reports_once_and_delivery_only_notifies(self):
         now = self.now + 48 * 3600
         state = {'primed': True, 'status': 'ordered'}
         with self.mail([]):
@@ -263,16 +272,16 @@ class WebTrackerTest(unittest.TestCase):
         state = {'primed': True, 'status': 'ordered'}
         with self.mail([self.hit()]):
             result = tracker.fetch(self.cfg, state, self.now)
-            self.assertEqual(tracker.transition(result, state, self.cfg, self.now),
-                             [{'kind': 'stage_change', 'status': 'delivered'}])
-            self.assertTrue(tracker.terminal_order(self.cfg, result))
+            self.assertEqual([e['kind'] for e in tracker.transition(result, state, self.cfg, self.now)],
+                             ['shipment_delivered'])
+            self.assertFalse(tracker.terminal_order(self.cfg, result))
             self.assertEqual(tracker.transition(result, state, self.cfg, self.now + 60), [])
 
     def test_card_and_reconciliation_keep_merchants_separate(self):
         other = dict(self.cfg, merchant_domain='another.shop', merchant_name='Another Shop')
         self.assertNotEqual(cards.card_slug(self.cfg), cards.card_slug(other))
         for status, expected in (('ordered', 'Ordered'), ('shipped', 'Shipped'),
-                                  ('out for delivery', 'Out for delivery'), ('delivered', 'Delivered'), ('cancelled', 'Cancelled')):
+                                  ('out for delivery', 'Out for delivery'), ('delivered', 'Tracking pending'), ('cancelled', 'Tracking pending')):
             view = cards.view(self.cfg, {'status': status}, {})
             self.assertEqual((view['vertical'], view['brand'], view['stage']), ('web', 'Fabrique', expected))
             self.assertIsNone(view['eta'])
@@ -292,7 +301,7 @@ class WebTrackerTest(unittest.TestCase):
             late = tracker.fetch(cfg, state, self.now + 49 * 3600)
             self.assertEqual(late['errors'], ['web_email_stalled'])
             state['status'] = 'shipped'
-            self.assertEqual(tracker.fetch(cfg, state, self.now + 50 * 3600)['errors'], [])
+            self.assertEqual(tracker.fetch(cfg, state, self.now + 50 * 3600)['errors'], ['web_email_stalled'])
 
     def test_large_web_order_waits_for_evidence_and_problem_keys_include_domain(self):
         keys = []
@@ -320,7 +329,7 @@ class WebTrackerTest(unittest.TestCase):
         self.assertEqual(build.call_args.args[0]['merchant_name'], 'Fabrique')
         self.assertEqual(sync.call_args.args[0]['watcher'], cfg['watcher'])
 
-    def test_check_delivery_event_and_retirement_without_native_reads(self):
+    def test_check_delivery_notice_keeps_tracking_without_native_reads(self):
         folder = tracker.WATCHERS / self.cfg['watcher']
         cfgpath = tracker.ROOT / 'orders' / (self.cfg['watcher'] + '.json')
         tracker.write(cfgpath, dict(self.cfg, active=True))
@@ -332,14 +341,13 @@ class WebTrackerTest(unittest.TestCase):
                 mock.patch.object(cards, 'safe_sync', return_value={'status': 'skipped'}), \
                 mock.patch.dict(os.environ, {'WATCH_DIR': str(folder), 'WATCH_RUN': 'scheduled-fixture'}), redirect_stdout(output):
             tracker._check(self.cfg)
-            with mock.patch.object(tracker, 'fetch', side_effect=AssertionError('terminal order polled')):
-                tracker._check(self.cfg)
+            tracker._check(self.cfg)
         notice = json.loads(output.getvalue())
-        self.assertEqual(notice['events'], [{'kind': 'stage_change', 'status': 'delivered'}])
+        self.assertEqual([e['kind'] for e in notice['events']], ['shipment_delivered'])
         state = (folder / 'order-tracker-state.json').read_text()
         self.assertNotIn('secret body marker', state + output.getvalue())
         self.assertNotIn('Your order has been delivered', state + output.getvalue())
-        self.assertFalse(tracker.read(cfgpath)['active'])
+        self.assertTrue(tracker.read(cfgpath)['active'])
 
 
 if __name__ == '__main__':
