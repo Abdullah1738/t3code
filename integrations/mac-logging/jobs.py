@@ -300,13 +300,15 @@ def inventory_status(cache, entries, listed, now, completed=0, failures=0, fresh
     children = {key: value['bytes'] for key, value in cache.items() if number(value.get('bytes'))}
     cached = [value for value in cache.values() if 'bytes' in value and value['at'] < now]
     missing = len({entry.path for entry in entries}-set(children))
-    denied = sum(value['deniedCount'] if number(value.get('deniedCount'))
-                 else int(value.get('partial') is not False) for value in cache.values())
-    return sum(children.values()), dict(partial=bool(not listed or failures or missing or denied
+    denied = sum(value['deniedCount'] for value in cache.values()
+                 if number(value.get('deniedCount')) and value['deniedCount'] > 0)
+    partial_children = sum(not number(value.get('deniedCount')) and value.get('partial') is not False
+                           for value in cache.values())
+    return sum(children.values()), dict(partial=bool(not listed or failures or missing or denied or partial_children
                      or any(v.get('partial') is not False or v.get('limited') for v in cache.values())
                      or any(inventory_needs_measurement(v, now, freshness_s) for v in cached)),
         failedCount=failures+int(bool(missing) and not failures), completedCount=completed,
-        deniedCount=denied, cachedCount=len(cached), unmeasuredCount=missing,
+        deniedCount=denied, partialChildCount=partial_children, cachedCount=len(cached), unmeasuredCount=missing,
         limitedCount=sum(bool(v.get('limited')) for v in cache.values()),
         ageS=max((now-value['at'] for value in cached), default=0)), children
 
@@ -358,6 +360,7 @@ class InventoryLog:
                          childrenPartial=sum(v.get('partial') is not False or bool(v.get('limited'))
                                              for v in cache.values()),
                          unmeasuredCount=status['unmeasuredCount'], partial=status['partial'],
+                         deniedCount=status['deniedCount'], partialChildCount=status['partialChildCount'],
                          elapsedMs=self.elapsed_ms, slowestChildMs=self.slowest_ms)
             if skip_reason is not None:
                 props['skipReason'] = skip_reason

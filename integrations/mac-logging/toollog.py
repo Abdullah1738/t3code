@@ -14,7 +14,7 @@ CAP_BYTES = 50 * 1024 * 1024
 # Explicit schema: unknown keys and nested payloads cannot enter a log by accident.
 NUMBERS = set('internalFreeGb externalFreeGb baseline count bytes files snapshotAgeS resticExitCode exitCode found killed ageS autoFixed needsOwner critical high moderate medium low unknown skipped sourceErrors reports inventoryAgeS'.split())
 NUMBERS.update('diskCount storagekitdPid storagekitdUptimeS diskarbitrationdPid diskarbitrationdUptimeS hdiutilMs'.split())
-NUMBERS.update('elapsedMs deniedCount inventorySourceErrors'.split())
+NUMBERS.update('elapsedMs deniedCount partialChildCount inventorySourceErrors'.split())
 NUMBERS.update('rootsOk rootsTimeout rootsDenied scanMs'.split())
 NUMBERS.update(('unreadableCount', 'turn', 'cachedCount', 'rootsComplete', 'rootsPartial',
                 'childrenCached', 'oldestChildAgeS', 'unmeasuredCount', 'limitedCount', 'lagS'))
