@@ -45,12 +45,12 @@ class RefreshFairnessTests(unittest.TestCase):
         for form in forms:
             with self.subTest(form=form),patch.dict(os.environ, TOOLLOG_DIR=str(self.root/('logs-'+form))):
                 clock, now = [0], [1000000]
-                cached = {str(child):dict(bytes=1024,at=now[0]-3600,attemptedAt=now[0]-3600,
+                cached = {str(child):dict(bytes=1024,at=now[0]-86400,attemptedAt=now[0]-86400,
                           partial=False,isDirectory=True) for child in large.iterdir()}
                 cached[str(unknown)] = dict(attemptedAt=0,limited=True) if form=='limited' else (
                     {} if form=='missing' else dict(bytes=1024,at='invalid' if form=='invalid_at' else now[0]+7200))
                 jobs.save_state('disk-inventory',dict(duMode='links',childState={str(large):cached,
-                    str(small):{str(healthy):dict(bytes=1024,at=now[0]-3600,attemptedAt=now[0]-3600,
+                    str(small):{str(healthy):dict(bytes=1024,at=now[0]-86400,attemptedAt=now[0]-86400,
                                                partial=False,isDirectory=True)}}))
                 run = self.runner(clock,lambda p:120 if p.parent in (first,second) or p==unknown else 3.4)
                 with patch.object(jobs.time,'monotonic',side_effect=lambda:clock[0]), \
@@ -65,7 +65,7 @@ class RefreshFairnessTests(unittest.TestCase):
                         self.assertFalse(current['partial'])
                         self.assertNotIn(str(small),state['partials'])
                         self.assertTrue(state['partials'][str(large)]['partial'])
-                        now[0] += 3600
+                        now[0] += 86400
                 self.assertTrue(any('bytes' not in value for cache in state['childState'].values() for value in cache.values()))
 
     def test_older_large_root_shares_refresh_budget_with_several_healthy_roots(self):
@@ -80,7 +80,7 @@ class RefreshFairnessTests(unittest.TestCase):
         clock, now = [0], [1000000]
         with patch.dict(os.environ,TOOLLOG_DIR=str(self.root/'older-logs')):
             jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{
-                str(child):dict(bytes=1024,at=now[0]-(86400 if root==large else 3600),
+                str(child):dict(bytes=1024,at=now[0]-(2*86400 if root==large else 86400),
                     attemptedAt=0,partial=False,isDirectory=True) for child in root.iterdir()}
                 for root in [large]+healthy_roots}))
             run = self.runner(clock,lambda p:120 if p.parent in pending_roots else 3.4)
@@ -94,4 +94,4 @@ class RefreshFairnessTests(unittest.TestCase):
                     for root in healthy_roots:
                         self.assertEqual(state['childState'][str(root)][str(root/'0000')]['at'],now[0])
                     self.assertTrue(any(v.get('at',0)>=1000000 for v in state['childState'][str(large)].values()))
-                    now[0] += 3600
+                    now[0] += 86400
