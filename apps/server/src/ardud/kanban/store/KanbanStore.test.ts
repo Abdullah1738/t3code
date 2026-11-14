@@ -2119,6 +2119,35 @@ it.effect("slot event windows and open slots keep board, pool and thread identit
   }).pipe(Effect.provide(TestLayer)),
 );
 
+it.effect("slot history reads carry-in and the window together, including closed slots", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const base = { boardId: "b", poolKey: "p", threadId: "t", cardId: null, why: "start" as const };
+    const add = (
+      patch: Partial<KanbanStore.SlotEvent> & Pick<KanbanStore.SlotEvent, "at" | "kind">,
+    ) => store.addSlotEvent({ ...base, ...patch });
+    const from = "2026-11-12T01:00:00.000Z",
+      to = "2026-11-12T03:00:00.000Z";
+    yield* add({ kind: "take", at: "2026-11-12T00:00:00.000Z" });
+    yield* add({ kind: "release", at: "2026-11-12T00:30:00.000Z" });
+    yield* add({ kind: "take", at: "2026-11-12T00:45:00.000Z", threadId: "held" });
+    yield* add({ kind: "take", at: "2026-11-12T00:00:00.000Z", boardId: "other" });
+    yield* add({ kind: "take", at: from });
+    yield* add({ kind: "release", at: from, threadId: "held" });
+    yield* add({ kind: "release", at: to });
+    const history = yield* store.slotHistory({ boardId: "b", from, to });
+    assert.deepStrictEqual(
+      history.events.map((event) => event.id),
+      [2, 3, 5, 6],
+    );
+    assert.strictEqual(history.recordedSince, "2026-11-12T00:00:00.000Z");
+    assert.deepStrictEqual(yield* store.slotHistory({ boardId: "absent", from, to }), {
+      events: [],
+      recordedSince: null,
+    });
+  }).pipe(Effect.provide(TestLayer)),
+);
+
 // Event counts use ledger order; boundary samples use the last count at that
 // instant, so a release on the hour cannot carry the previous hour's peak in.
 const hourlySlotQuery = `

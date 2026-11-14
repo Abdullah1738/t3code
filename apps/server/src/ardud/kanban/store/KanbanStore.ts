@@ -167,6 +167,14 @@ export interface KanbanStoreShape {
     readonly from: string;
     readonly to: string;
   }) => Effect.Effect<ReadonlyArray<SlotEvent>, KanbanStoreError>;
+  readonly slotHistory: (filter: {
+    readonly boardId: string;
+    readonly from: string;
+    readonly to: string;
+  }) => Effect.Effect<
+    { readonly events: ReadonlyArray<SlotEvent>; readonly recordedSince: string | null },
+    KanbanStoreError
+  >;
   readonly openSlots: (
     boardId?: string,
   ) => Effect.Effect<ReadonlyArray<SlotEvent>, KanbanStoreError>;
@@ -972,6 +980,27 @@ const make = Effect.gen(function* () {
       WHERE board_id = ${boardId} AND at >= ${from} AND at < ${to} ORDER BY id
     `,
     );
+  const slotHistory: KanbanStoreShape["slotHistory"] = ({ boardId, from, to }) =>
+    runRead(
+      "read slot history",
+      Effect.gen(function* () {
+        const rows = yield* sql<SlotEvent & { readonly recordedSince: string }>`
+        WITH carry AS (
+          SELECT MAX(id) AS id FROM ardud_kanban_slot_events
+          WHERE board_id = ${boardId} AND at < ${from}
+          GROUP BY pool_key, thread_id
+        ), selected AS (
+          SELECT * FROM ardud_kanban_slot_events WHERE id IN (SELECT id FROM carry)
+          UNION ALL SELECT * FROM ardud_kanban_slot_events
+          WHERE board_id = ${boardId} AND at >= ${from} AND at < ${to}
+        )
+        SELECT ${slotColumns},
+          (SELECT MIN(at) FROM ardud_kanban_slot_events WHERE board_id = ${boardId}) AS "recordedSince"
+        FROM selected ORDER BY id
+      `;
+        return { events: rows, recordedSince: rows[0]?.recordedSince ?? null };
+      }),
+    );
   const openSlots: KanbanStoreShape["openSlots"] = (boardId) =>
     runRead(
       "read open slots",
@@ -1671,6 +1700,7 @@ const make = Effect.gen(function* () {
     putCard,
     addSlotEvent,
     slotEvents,
+    slotHistory,
     openSlots,
     addCardEvent,
     pendingInstructionApplications,

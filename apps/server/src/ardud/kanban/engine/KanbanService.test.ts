@@ -88,6 +88,7 @@ import {
   modelSelectionOf,
 } from "./defaults.ts";
 import * as Rules from "./rules.ts";
+import * as Activity from "./activity.ts";
 import * as Briefs from "./briefs.ts";
 import * as BoardLocks from "./boardLocks.ts";
 import * as SavedWrite from "./savedWrite.ts";
@@ -8557,6 +8558,7 @@ it.effect.each([
         yield* sql`CREATE TRIGGER fail_archive_stop BEFORE INSERT ON ardud_kanban_owner_routes
         WHEN json_extract(NEW.json, '$.effect.kind') = 'interrupt'
         BEGIN SELECT RAISE(FAIL, 'Injected stop failure'); END`;
+      const ledgerBefore = yield* slotRows(board.id);
       const stoppedBefore = fake.interrupted.length;
       armed = true;
       const result = yield* kanban
@@ -8564,6 +8566,8 @@ it.effect.each([
         .pipe(Effect.exit);
       assert.isTrue(Exit.isFailure(result));
       armed = false;
+      assert.deepStrictEqual(yield* slotRows(board.id), ledgerBefore);
+      yield* assertSlotReplay(board.id);
       if (failure === "stop write") yield* sql`DROP TRIGGER fail_archive_stop`;
       assert.isNull((yield* kanban.boards).find((entry) => entry.id === board.id)!.archivedAt);
       assert.deepStrictEqual(
@@ -8580,6 +8584,11 @@ it.effect.each([
       assert.isTrue(before.every((card) => running.get(card.activeThreadId!)!.running));
       yield* kanban.updateBoard(board.id, { archived: true }, owner);
       assert.isNotNull((yield* kanban.boards).find((entry) => entry.id === board.id)!.archivedAt);
+      assert.deepStrictEqual(
+        (yield* slotRows(board.id)).map((event) => event.kind),
+        ["take", "take", "release", "release"],
+      );
+      yield* assertSlotReplay(board.id);
     }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, injected)));
   }),
 );
@@ -33316,6 +33325,31 @@ it.effect.each(["scheduled", "scheduled-null", "manual"] as const)(
         assert.strictEqual((yield* Ref.get(fake.threads)).size, origin === "manual" ? 1 : 0);
       }).pipe(Effect.provide(testLayer(wrapped)));
     }),
+);
+
+it.effect("board activity reads committed ledger occupancy rather than thread lifetimes", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const since = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+      const card = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+      yield* kanban.dispatchNow;
+      yield* TestClock.adjust("1 hour");
+      yield* kanban.moveCard(card.id, "completed", "owner", owner);
+      yield* TestClock.adjust("1 minute");
+      const until = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+      const read = yield* kanban.activity(board.id, { since, until });
+      const result = Activity.rollup({ window: { since, until }, ...read });
+      const pool = Rules.poolKey(board.defaultCardModel);
+      assert.deepStrictEqual(result.pools.used[pool], [1, 0]);
+      assert.deepStrictEqual(result.pools.slotHours[pool], [1, 0]);
+      assert.deepStrictEqual(
+        read.slotHistory.events.map((event) => event.kind),
+        ["take", "release"],
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
 );
 
 const slotRows = (boardId: string) =>

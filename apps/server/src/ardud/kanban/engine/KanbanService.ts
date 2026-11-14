@@ -102,6 +102,7 @@ import {
   KanbanStoreError,
   type InstructionApplication,
   type SlotEventWhy,
+  type SlotEvent,
 } from "../store/KanbanStore.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import * as AskFeed from "./askFeed.ts";
@@ -510,6 +511,10 @@ export interface KanbanServiceShape {
       readonly events: ReadonlyArray<KanbanCardEvent>;
       readonly threads: ReadonlyArray<KanbanThreadLink>;
       readonly pools: ReadonlyArray<KanbanPool>;
+      readonly slotHistory: {
+        readonly events: ReadonlyArray<SlotEvent>;
+        readonly recordedSince: string | null;
+      };
       /** Each card with an event in the window: its last stage change before it. */
       readonly prior: ReadonlyArray<KanbanCardEvent>;
     },
@@ -13794,11 +13799,16 @@ const make = Effect.gen(function* () {
               const restoredCard = { ...plan.card, analyticsStageEnteredAt: yield* nowIso };
               yield* store.putCard(restoredCard);
               yield* store.putThreadLink(plan.link);
-              yield* logEvent(plan.card, { _tag: "system", component: "harness-cutover" }, "thread", {
-                fromStage: card.stage,
-                toStage: plan.card.stage,
-                body: `Restored existing ${plan.link.role} thread after cutover`,
-              });
+              yield* logEvent(
+                plan.card,
+                { _tag: "system", component: "harness-cutover" },
+                "thread",
+                {
+                  fromStage: card.stage,
+                  toStage: plan.card.stage,
+                  body: `Restored existing ${plan.link.role} thread after cutover`,
+                },
+              );
               return { before: card, after: restoredCard };
             }),
           ).pipe(
@@ -17073,6 +17083,7 @@ const make = Effect.gen(function* () {
             events: store.boardEvents(boardId, window.since, window.until),
             threads: store.threadLinks({ boardId, open: false }),
             pools: store.pools(boardId),
+            slotHistory: store.slotHistory({ boardId, from: window.since, to: window.until }),
           });
           // Event ids grow with time, so the window's first id bounds "before the window".
           const first = read.events[0];
