@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireLock } from "../src/lock.ts";
 
-test("kernel lock rejects another open and is releasable without deleting the inode", () => {
+// src/lock.ts dlopens macOS libSystem.
+test.skipIf(process.platform !== "darwin")("kernel lock rejects another open and is releasable without deleting the inode", () => {
   const dir = mkdtempSync(join(tmpdir(), "spectrum-lock-"));
   const path = join(dir, "lock");
   try {
