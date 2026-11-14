@@ -4136,6 +4136,148 @@ it.effect.each([-1, 0, 1048576, 9007199254740993n])(
 );
 
 it.effect.each([
+  { name: "Uint8Array", make: () => new Uint8Array([1, 2, 3]) },
+  { name: "offset view", make: () => new Uint8Array([0, 1, 2, 3, 0]).subarray(1, 4) },
+  { name: "Buffer", make: () => Buffer.from([1, 2, 3]) },
+  { name: "DataView", make: () => new DataView(new Uint8Array([1, 2, 3]).buffer) },
+  { name: "Uint16Array", make: () => new Uint16Array([1, 2, 3]) },
+  { name: "ArrayBuffer", make: () => new Uint8Array([1, 2, 3]).buffer },
+  {
+    name: "SharedArrayBuffer",
+    make: () => {
+      const value = new SharedArrayBuffer(3);
+      new Uint8Array(value).set([1, 2, 3]);
+      return value;
+    },
+  },
+])("preserves native $name blob bindings", ({ make }) =>
+  withFileClient(
+    (sql) =>
+      Effect.gen(function* () {
+        const value = make();
+        const native = yield* openDatabase(":memory:");
+        const expected = native.prepare("SELECT hex(?) AS value").get(value)!.value;
+        assert.deepEqual(yield* sql`SELECT hex(${value}) AS value`.values, [[expected]]);
+        assert.deepEqual(yield* sql.unsafe("SELECT hex(?) AS value", [value]).unprepared.values, [
+          [expected],
+        ]);
+        assert.deepEqual(
+          yield* sql.unsafe("SELECT hex($value) AS value", [{ $value: value }]).values,
+          [[expected]],
+        );
+      }),
+    { readerWorker: false },
+  ),
+);
+
+it.effect.each(["UTF-16le", "UTF-16be"] as const)(
+  "restores pending main encoding before attaching a %s file",
+  (encoding) =>
+    withFileClient(
+      (sql, filename) =>
+        Effect.gen(function* () {
+          const path = `${filename}.unicode`;
+          const native = yield* openDatabase(path);
+          native.exec(
+            `PRAGMA encoding='${encoding}'; CREATE TABLE entries(value); INSERT INTO entries VALUES ('fixture')`,
+          );
+          yield* sql.unsafe(`PRAGMA encoding='${encoding}'`);
+          yield* sql`ATTACH DATABASE ${path} AS archive`;
+          const fs = yield* FileSystem.FileSystem;
+          assert.equal(Number((yield* fs.stat(filename)).size), 0);
+          yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+          assert.deepEqual(yield* sql`SELECT value FROM archive.entries`.values, [["fixture"]]);
+          assert.deepEqual(yield* sql`PRAGMA encoding`.values, [[encoding]]);
+        }),
+      { readerWorker: false },
+    ),
+);
+
+it.effect.each(
+  [
+    { pragma: "page_size", value: "8192", actual: 8192 },
+    { pragma: "auto_vacuum", value: "FULL", actual: 1 },
+  ].flatMap((setting) => [false, true].map((vacuum) => ({ ...setting, vacuum }))),
+)(
+  "tracks pending VACUUM setting $pragma=$value (vacuum=$vacuum)",
+  ({ pragma, value, actual, vacuum }) =>
+    withFileClient(
+      (sql) =>
+        Effect.gen(function* () {
+          yield* sql`CREATE TABLE vacuum_pending(value INTEGER)`;
+          yield* sql`INSERT INTO vacuum_pending VALUES (1)`;
+          const before = yield* sql.unsafe(`PRAGMA ${pragma}`).values;
+          yield* sql.unsafe(`PRAGMA ${pragma}='${value}'`);
+          assert.deepEqual(yield* sql.unsafe(`PRAGMA ${pragma}`).values, before);
+          if (vacuum) {
+            yield* sql`VACUUM`;
+            assert.deepEqual(yield* sql.unsafe(`PRAGMA ${pragma}`).values, [[actual]]);
+          }
+          const count = writerWorkers.length;
+          yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+          if (vacuum) {
+            assert.deepEqual(yield* sql.unsafe(`PRAGMA ${pragma}`).values, [[actual]]);
+            assert.deepEqual(yield* sql`SELECT value FROM vacuum_pending`.values, [[1]]);
+          } else {
+            const failed = yield* sql`SELECT value FROM vacuum_pending`.pipe(Effect.flip);
+            assert.include(String(failed.reason.cause), "connection state could not be observed");
+            assert.equal(writerWorkers.length, count);
+          }
+        }),
+      { readerWorker: false },
+    ),
+);
+
+it.effect.each(
+  [
+    {
+      statement: "PRAGMA case_sensitive_like=ON",
+      check: "SELECT 'a' LIKE 'A'",
+      expected: 0,
+      unsafe: true,
+    },
+    {
+      statement: "PRAGMA ignore_check_constraints=ON",
+      check: "PRAGMA ignore_check_constraints",
+      expected: 1,
+      unsafe: false,
+    },
+    {
+      statement: "PRAGMA page_size=8192",
+      check: "PRAGMA page_size",
+      expected: 8192,
+      unsafe: false,
+    },
+  ].flatMap((setting) => [false, true].map((cached) => ({ ...setting, cached }))),
+)(
+  "records preparation-time settings after failed binding ($statement, cached=$cached)",
+  ({ statement, check, expected, unsafe, cached }) =>
+    withFileClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const native = yield* openDatabase(":memory:");
+          assert.throws(() => native.prepare(statement).all(42));
+          assert.equal(Object.values(native.prepare(check).get()!)[0], expected);
+          const request = sql.unsafe(statement, [42]);
+          const failed = yield* (cached ? request : request.unprepared).pipe(Effect.flip);
+          assert.equal(failed._tag, "SqlError");
+          assert.deepEqual(yield* sql.unsafe(check).values, [[expected]]);
+          const count = writerWorkers.length;
+          yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+          if (unsafe) {
+            const unavailable = yield* sql.unsafe(check).pipe(Effect.flip);
+            assert.include(
+              String(unavailable.reason.cause),
+              "connection state could not be observed",
+            );
+            assert.equal(writerWorkers.length, count);
+          } else assert.deepEqual(yield* sql.unsafe(check).values, [[expected]]);
+        }),
+      { readerWorker: false },
+    ),
+);
+
+it.effect.each([
   { name: "plain object", make: () => ({}) },
   { name: "null prototype", make: () => Object.create(null) as object },
   // @effect-diagnostics-next-line globalDate:off -- Native SQLite binding compatibility requires a Date instance.

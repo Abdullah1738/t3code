@@ -1325,9 +1325,13 @@ const makeWriterSetup = () => {
       return canRecover;
     },
     get entries(): ReadonlyArray<WriterSetupStatement> {
+      const prerequisite = (entry: WriterPragma) =>
+        entry.schema === "main" &&
+        (entry.name === "encoding" || entry.name === "page_size" || entry.name === "auto_vacuum");
       return [
+        ...settings.filter(prerequisite).map(pragma),
         ...attachments,
-        ...settings.filter((entry) => !afterSchema(entry)).map(pragma),
+        ...settings.filter((entry) => !afterSchema(entry) && !prerequisite(entry)).map(pragma),
         ...schemas.map((entry) => ({ sql: entry.sql, params: [] })),
       ];
     },
@@ -1366,6 +1370,7 @@ let openingFailed = false;
 let unsupportedConfiguration = false;
 let availablePragmas;
 const pendingPragmas = new Set();
+const pendingVacuum = new Map();
 const attachmentStatements = new Map((workerData.attachments ?? []).map(entry => [entry.schema, entry]));
 const setupPragmas = new Set(["busy_timeout", "foreign_keys", "defer_foreign_keys", "synchronous",
   "fullfsync", "checkpoint_fullfsync", "journal_size_limit", "cache_size", "temp_store", "mmap_size",
@@ -1407,6 +1412,10 @@ try {
     } else if (code === constants.SQLITE_PRAGMA) {
       const name = action?.toLowerCase();
       activeClassification.configuration ||= argument !== null && setupPragmas.has(name);
+      if (argument !== null && (name === "page_size" || name === "auto_vacuum")) {
+        (activeClassification.pendingVacuum ??= new Map()).set((database ?? "main") + ":" + name,
+          { schema: database ?? "main", name, value: argument });
+      }
       if (argument !== null && !setupPragmas.has(name) && !localPragmas.has(name) && !argumentPragmas.has(name)) {
         (activeClassification.unknownPragmas ??= new Set()).add(name);
       }
@@ -1505,6 +1514,9 @@ const observeConnectionState = () => {
 let recoveryFailureReported = false;
 let recoveryFailureCause;
 const recoverySnapshot = (classification, sql, params) => {
+  configurationDirty ||= Boolean(classification?.configuration) || pendingVacuum.size > 0;
+  schemaDirty ||= Boolean(classification?.schema);
+  for (const [key, setting] of classification?.pendingVacuum ?? []) pendingVacuum.set(key, setting);
   for (const name of classification?.unknownPragmas ?? []) pendingPragmas.add(name);
   if (classification?.attachment || typeof db.setAuthorizer !== "function") {
     attachmentsDirty = true;
@@ -1523,12 +1535,19 @@ const recoverySnapshot = (classification, sql, params) => {
     if (deferredForeignKeys || configurationDirty)
       deferBefore = Boolean(db.prepare("PRAGMA defer_foreign_keys").get().defer_foreign_keys);
     const snapshot = observeConnectionState();
+    if (snapshot.settings) for (const [key, setting] of pendingVacuum) {
+      const modes = { NONE: 0, FULL: 1, INCREMENTAL: 2 };
+      const wanted = setting.name === "auto_vacuum" && setting.value.toUpperCase() in modes
+        ? modes[setting.value.toUpperCase()] : Number(setting.value);
+      const current = snapshot.settings.find(entry => entry.schema === setting.schema && entry.name === setting.name)?.value;
+      if (Number(current) === wanted) pendingVacuum.delete(key);
+    }
     if (deferBefore !== undefined && snapshot.settings) snapshot.settings = snapshot.settings.map(entry =>
       entry.name === "defer_foreign_keys" ? { ...entry, value: deferBefore ? 1 : 0 } : entry);
     const observed = !attachmentsDirty && (!recoveryFailureReported || (!configurationDirty && !schemaDirty));
     if (observed) { recoveryFailureReported = false; recoveryFailureCause = undefined; }
     // Unreadable settings and missing classification cannot be reconstructed safely.
-    return { ...snapshot, recoveryReady: observed && !unsupportedConfiguration && typeof db.setAuthorizer === "function" };
+    return { ...snapshot, recoveryReady: observed && pendingVacuum.size === 0 && !unsupportedConfiguration && typeof db.setAuthorizer === "function" };
   } catch (cause) {
     // Metadata failure must not turn a successful COMMIT into a failed write.
     if (!recoveryFailureReported) parentPort.postMessage({ type: "recovery-error", error: {
@@ -1708,6 +1727,7 @@ parentPort.on("message", (request) => {
   let controlStarted;
   let controlMs;
   let priorRecovery = {};
+  let classification;
   try {
     if (close) {
       operation = "close";
@@ -1734,7 +1754,7 @@ parentPort.on("message", (request) => {
     const entry = cached ? statements.get(sql) : undefined;
     let statement = entry && performance.now() - entry.at < workerData.prepareCacheTTL ? entry.statement : undefined;
     if (!statement) {
-      const classification = { write: typeof db.setAuthorizer !== "function", check: false, journalMode: false };
+      classification = { write: typeof db.setAuthorizer !== "function", check: false, journalMode: false };
       activeClassification = classification;
       try { statement = db.prepare(sql); } finally { activeClassification = undefined; }
       classifications.set(statement, classification);
@@ -1743,6 +1763,7 @@ parentPort.on("message", (request) => {
         statements.set(sql, { statement, at: performance.now() });
       }
     }
+    classification = classifications.get(statement);
     if (attachmentsDirty && (classifications.get(statement)?.attachment || typeof db.setAuthorizer !== "function")) throw recoveryFailureCause ?? new Error("SQLite attachment state unavailable");
     observedWrite = Boolean(classifications.get(statement)?.write || classifications.get(statement)?.check);
     mayWrite = observedWrite || db.isTransaction;
@@ -1773,7 +1794,6 @@ parentPort.on("message", (request) => {
       enableWal();
     }
     const committed = !db.isTransaction && /^\\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\\b/i.test(sql);
-    const classification = classifications.get(statement);
     parentPort.postMessage({ id, rows, committed, write: observedWrite, elapsedMs, controlMs,
       inTransaction: db.isTransaction,
       ...priorRecovery, ...recoverySnapshot(classification, sql, params) });
@@ -1781,7 +1801,7 @@ parentPort.on("message", (request) => {
     activeClassification = undefined;
     const statementElapsed = executionStarted === undefined ? elapsedMs : (elapsedMs ?? 0) + performance.now() - executionStarted;
     if (controlStarted !== undefined && controlMs === undefined) controlMs = performance.now() - controlStarted;
-    const snapshot = db ? { ...priorRecovery, ...recoverySnapshot(undefined, undefined, undefined) } : {};
+    const snapshot = db ? { ...priorRecovery, ...recoverySnapshot(classification, sql, params) } : {};
     errorReply(id, error, operation, { ...snapshot, inTransaction: db?.isTransaction ?? false, write: observedWrite, elapsedMs: statementElapsed, controlMs });
   } finally {
     // Authorizer classification covers CTE/commented writes; transaction state
@@ -2050,7 +2070,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
               : {
                   params: input.params.map((value) =>
                     typeof value === "function" ||
-                    (typeof value === "object" && value !== null && !ArrayBuffer.isView(value))
+                    (typeof value === "object" && value !== null && !isBlob(value))
                       ? Object.fromEntries(Object.entries(value))
                       : value,
                   ),
