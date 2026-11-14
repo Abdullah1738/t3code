@@ -93,6 +93,14 @@ it.effect.each(["caller row", "caller records", "idle target", "dispatch"] as co
           expect(result.failure.message).toContain(
             blocked === "caller row" ? "Nothing was saved" : "not save",
           );
+        if (result._tag === "Failure" && blocked === "idle target") {
+          expect(result.failure.message).toContain(
+            `target thread read for thread ${childThreadId}`,
+          );
+          expect(result.failure.message).toContain("bounded-send");
+        }
+        if (result._tag === "Failure" && blocked === "dispatch")
+          expect(result.failure.message).toContain(`message dispatch for thread ${childThreadId}`);
         expect(sends).toBe(blocked === "dispatch" ? 1 : 0);
       }).pipe(Effect.provide(layer));
     }),

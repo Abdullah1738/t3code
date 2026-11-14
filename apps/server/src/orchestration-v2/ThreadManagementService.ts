@@ -748,7 +748,14 @@ const make = Effect.gen(function* () {
   const dispatchUnchanged = (command: OrchestrationV2ServerCommand) =>
     ensureCommandTranscripts(command).pipe(
       Effect.andThen(assertDispatchTargetEnabled(command)),
-      Effect.andThen(orchestrator.dispatch(command)),
+      Effect.andThen(
+        SendAcknowledgement.waitingOn(
+          orchestrator.dispatch(command),
+          command.type === "message.dispatch"
+            ? `message command admission for thread ${command.threadId}`
+            : "command dispatch",
+        ),
+      ),
     );
 
   const dispatchWithSelectionMigration = Effect.fn(
@@ -772,12 +779,29 @@ const make = Effect.gen(function* () {
             }),
         ),
       );
-    const receipt = yield* readReceipt(receipts.getByCommandId(command.commandId));
-    if (Option.isSome(receipt)) return yield* orchestrator.dispatch(command);
-    const projectReceipt = yield* readReceipt(receipts.getProjectByCommandId(command.commandId));
-    if (Option.isSome(projectReceipt)) return yield* orchestrator.dispatch(command);
+    const receipt = yield* SendAcknowledgement.waitingOn(
+      readReceipt(receipts.getByCommandId(command.commandId)),
+      `command receipt read for thread ${command.threadId}`,
+    );
+    if (Option.isSome(receipt))
+      return yield* SendAcknowledgement.waitingOn(
+        orchestrator.dispatch(command),
+        `message replay dispatch for thread ${command.threadId}`,
+      );
+    const projectReceipt = yield* SendAcknowledgement.waitingOn(
+      readReceipt(receipts.getProjectByCommandId(command.commandId)),
+      `project command receipt read for thread ${command.threadId}`,
+    );
+    if (Option.isSome(projectReceipt))
+      return yield* SendAcknowledgement.waitingOn(
+        orchestrator.dispatch(command),
+        `message replay dispatch for thread ${command.threadId}`,
+      );
 
-    yield* ensureCommandTranscripts(command);
+    yield* SendAcknowledgement.waitingOn(
+      ensureCommandTranscripts(command),
+      `transcript readiness for thread ${command.threadId}`,
+    );
 
     if (options.cutoverComplete && command.modelSelection !== undefined) {
       const reason = postCutoverSelectionProblem(command.modelSelection);
@@ -800,7 +824,10 @@ const make = Effect.gen(function* () {
     }
     if (!options.migrate) return yield* dispatchUnchanged(command);
 
-    const projection = yield* orchestrator.getThreadRecords(command.threadId, []);
+    const projection = yield* SendAcknowledgement.waitingOn(
+      orchestrator.getThreadRecords(command.threadId, []),
+      `provider selection read for thread ${command.threadId}`,
+    );
     const stored = projection.thread.modelSelection;
     const requested = command.modelSelection ?? stored;
     const canonicalize = (selection: ModelSelection) => {
@@ -915,7 +942,10 @@ const make = Effect.gen(function* () {
     // Re-read the target after a selection update and check the actual send,
     // rather than allowing a disabled destination on an inherited command.
     yield* assertDispatchTargetEnabled(nextCommand);
-    return yield* orchestrator.dispatch(nextCommand);
+    return yield* SendAcknowledgement.waitingOn(
+      orchestrator.dispatch(nextCommand),
+      `message command admission for thread ${command.threadId}`,
+    );
   });
 
   const dispatch: ThreadManagementServiceShape["dispatch"] = (command) => {
