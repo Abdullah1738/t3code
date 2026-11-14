@@ -695,7 +695,13 @@ export async function clearStaleStaging({
   return "removed";
 }
 
-async function main(args) {
+export async function main(args, {
+  home = NodeOS.homedir(),
+  env = process.env,
+  acquireHold = acquireInstallHold,
+  phase = async (phase, extra = {}) =>
+    console.log(JSON.stringify({ phase, at: new Date().toISOString(), ...extra })),
+} = {}) {
   const rollback = args.includes("--rollback");
   const dmgIndex = args.indexOf("--dmg");
   const skipIndex = args.indexOf("--skip-migration-check");
@@ -726,24 +732,22 @@ async function main(args) {
     );
     return;
   }
-  if (!process.env.TMUX) throw new Error("Use the zsh wrapper: installs must run in tmux");
+  if (!env.TMUX) throw new Error("Use the zsh wrapper: installs must run in tmux");
   const app = "/Applications/Robob.app";
   const next = "/Applications/.Robob.next.app";
   const prev = "/Applications/.Robob.prev.app";
-  const data = await NodeFSP.realpath(NodePath.join(NodeOS.homedir(), ".robob/userdata"));
+  const data = await NodeFSP.realpath(NodePath.join(home, ".robob/userdata"));
   const stamp = new Date().toISOString().replaceAll(":", "-");
   const backupRoot = NodePath.join(NodePath.dirname(data), "fast-install-backups");
-  const phase = async (phase, extra = {}) =>
-    console.log(JSON.stringify({ phase, at: new Date().toISOString(), ...extra }));
   const retention = createBackupRetention({ backupRoot, currentStamp: stamp, phase });
   let backupDone = false;
   let installFailure;
   let cleanupFailure;
   let quitAt;
   let startupComplete = false;
-  const run = (cmd, args, timeout = 20_000, env = process.env) => {
+  const run = (cmd, args, timeout = 20_000, commandEnv = env) => {
     const remaining = installCommandTimeout(timeout, quitAt, startupComplete);
-    return exec(cmd, args, { timeout: remaining, maxBuffer: 2 ** 20, env });
+    return exec(cmd, args, { timeout: remaining, maxBuffer: 2 ** 20, env: commandEnv });
   };
   const exists = async (p) =>
     NodeFSP.access(p).then(
@@ -769,7 +773,7 @@ async function main(args) {
   };
   const cfg = JSON.parse(
     await NodeFSP.readFile(
-      process.env.T3_CONTROL_TOKEN_FILE || NodePath.join(NodeOS.homedir(), ".robob/components/t3ctl.json"),
+      env.T3_CONTROL_TOKEN_FILE || NodePath.join(home, ".robob/components/t3ctl.json"),
       "utf8",
     ),
   );
@@ -869,7 +873,7 @@ async function main(args) {
           NodePath.join(candidate, "Contents/MacOS/Robob"),
           [entry, "__install-migration-check", sandbox],
           migrationCheckTimeoutMs(),
-          { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+          { ...env, ELECTRON_RUN_AS_NODE: "1" },
         );
         if (!result.stdout.includes('"migrationCheck":"passed"'))
           throw new Error("Candidate did not confirm migration compatibility");
@@ -880,9 +884,9 @@ async function main(args) {
     },
     verifyPrevious: () => verifyBundle(prev),
     hostPreflight: async () => {
-      const ovnfs = NodePath.join(NodeOS.homedir(), ".local/bin/ovnfs");
+      const ovnfs = NodePath.join(home, ".local/bin/ovnfs");
       await hostPreflight({
-        checkoutsDir: NodePath.join(NodeOS.homedir(), "checkouts"),
+        checkoutsDir: NodePath.join(home, "checkouts"),
         log: phase,
         // Keep-mount restart (ovnfs >= 0.3.0). Never `ovnfs stop`: it unmounts
         // and can wedge the kernel mount point while processes still use it.
@@ -1003,8 +1007,9 @@ async function main(args) {
       });
     },
   };
-  const hold = await acquireInstallHold();
+  let hold;
   try {
+    hold = await acquireHold({ home, env });
     await install(ops, { rollback });
   } catch (e) {
     installFailure = e;
@@ -1072,7 +1077,8 @@ async function main(args) {
       await retention.finish({
         swapped,
         failure: installFailure ?? cleanupFailure,
-        release: hold.release,
+        // A rejected acquisition owns no hold and must not stop another installer.
+        release: hold?.release ?? (async () => {}),
         quitStarted: quitAt !== undefined,
         healthy: async () => {
           const health = await get("/api/ardud/control/health");
@@ -1085,8 +1091,8 @@ async function main(args) {
           await phase("recovery_waiting", {
             swapped,
             message: "Keeping install heartbeat until Robob is healthy. Repair or complete a compatible rollback from another Terminal; keep this installer running.",
-            holdBy: hold.by,
-            holdPid: hold.pid,
+            holdBy: hold?.by,
+            holdPid: hold?.pid,
           });
           await exec(
             "/Users/ardud/.bun/bin/bun",
