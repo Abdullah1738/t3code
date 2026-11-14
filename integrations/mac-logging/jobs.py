@@ -15,7 +15,7 @@ import sys
 import subprocess
 import tempfile
 import time
-from toollog import emit, directory, private_dir, SKIP_REASONS, BACKUP_PROGRAMS, BACKUP_ARGS
+from toollog import emit, directory, private_dir, SKIP_REASONS, BACKUP_PROGRAMS, BACKUP_ARGS, BACKUP_STAGES
 
 
 def state_path(name):
@@ -967,8 +967,32 @@ def backup_holder(props, processes):
                      lockHolderStartedAgoS=process['age'], lockHolderTrigger=backup_origin(holder, processes))
 
 
+def backup_status():
+    try:
+        # Independent of the backup's repository/staging overrides. The MAC_LOG
+        # override, like MAC_LOG_RESTIC, is for isolated diagnostic fixtures.
+        path = Path(os.environ.get('MAC_LOG_MEMORY_STATUS',
+                    str(Path.home()/'.local/share/memory-system/logs/backup_last.json')))
+        with path.open('rb') as stream:
+            if os.fstat(stream.fileno()).st_size > 65536:
+                return {}
+            value = json.loads(stream.read(65536))
+        if not isinstance(value, dict):
+            return {}
+        result = {key: value.get(key) for key in ('ts', 'ok', 'stage', 'last_success_ts')}
+        for key in ('ts', 'last_success_ts'):
+            stamp = result[key]
+            if type(stamp) not in (int, float) or not math.isfinite(stamp) or stamp <= 0:
+                result[key] = None
+        stage = result['stage']
+        result['stage'] = stage if isinstance(stage, str) and stage in BACKUP_STAGES and stage != 'unknown' else 'other'
+        return result
+    except Exception:
+        return {}
+
+
 def backup_run(target, start, restic_rc, exit_code, snapshot_at, summary, skip_reason='', lock_path='',
-               load_per_core='', last_success_age_s='', deferred_count=''):
+               load_per_core='', last_success_age_s='', deferred_count='', failed_stage=''):
     now = time.time()
     if target not in ('health', 'memory', 'other'):
         return
@@ -978,11 +1002,18 @@ def backup_run(target, start, restic_rc, exit_code, snapshot_at, summary, skip_r
         summary = {}
     if not isinstance(summary, dict):
         summary = {}
+    status = backup_status() if target == 'memory' else {}
     ran = str(restic_rc) not in ('', '-1')
-    if not ran and not skip_reason:
+    if not ran and not skip_reason and int(exit_code) == 0:
         skip_reason = 'other'
     if skip_reason and skip_reason not in SKIP_REASONS:
         skip_reason = 'other'
+    # fail() passes backup_reason's result through the legacy skip argument.
+    # Only admission/lock reasons prove work was skipped when the job failed.
+    fail_reason = None
+    if int(exit_code) != 0 and skip_reason not in ('lock_held', 'stale_lock', 'load_deferred', 'boot_grace'):
+        fail_reason = skip_reason if skip_reason in ('other', 'password_unavailable', 'no_repo_access', 'source_missing') else None
+        skip_reason = ''
     props = dict(target=target, exitCode=int(exit_code), skipped=int(bool(skip_reason)))
     for key, value in [('loadPerCore', load_per_core), ('lastSuccessAgeS', last_success_age_s),
                        ('deferredCount', deferred_count)]:
@@ -1019,11 +1050,23 @@ def backup_run(target, start, restic_rc, exit_code, snapshot_at, summary, skip_r
                    else 'backup.skipped_lock_held')
         elif skip_reason in ('load_deferred', 'boot_grace') and int(exit_code) == 0:
             ok, tag = True, None
+    elif not ok:
+        stage = failed_stage if target == 'health' and failed_stage else 'unknown'
+        if target == 'memory' and status.get('ok') is False and status.get('ts') is not None and status['ts'] >= float(start):
+            stage = status['stage']
+        stage = stage if isinstance(stage, str) and stage in BACKUP_STAGES else 'other'
+        props.update(failedStage=stage, failReason=fail_reason or backup_reason(stage, restic_rc, ''))
+        tag = 'backup.failed_'+stage
     # Only counters are copied from restic's summary, never paths/errors or command output.
     for key, source in [('bytes', 'total_bytes_processed'), ('files', 'total_files_processed')]:
         if type(summary.get(source)) is int:
             props[key] = summary[source]
     age, snapshot_error = backup_snapshot_age(target)
+    if age is not None:
+        props['lastGoodSnapshotSource'] = 'restic'
+    elif snapshot_error and status.get('last_success_ts') is not None and status['last_success_ts'] <= now:
+        age = now-status['last_success_ts']
+        props['lastGoodSnapshotSource'] = 'status_file'
     props['lastGoodSnapshotAgeS'] = age
     if snapshot_error:
         props['lastGoodSnapshotError'] = snapshot_error
@@ -1044,7 +1087,7 @@ def main(argv):
             emit('disk', 'event' if ok else 'error', 'disk.alert', ok=ok,
                  props={'exitCode': int(argv[1])}, error_tag=None if ok else 'disk.alert_failed')
         elif argv[0] == 'backup':
-            backup_run(*argv[1:6], sys.stdin.read(16384), *argv[6:11])
+            backup_run(*argv[1:6], sys.stdin.read(16384), *argv[6:12])
         elif argv[0] == 'backup-reason':
             print(backup_reason(*argv[1:3], sys.stdin.read(16384)))
         elif argv[0] == 'backup-restic-exit':

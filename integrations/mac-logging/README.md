@@ -40,15 +40,21 @@ was not reached. Fix versions use the sweep's known version transition or
 local package metadata; unavailable versions are `unknown`.
 
 Every `backup.run` includes `trigger` and `lastGoodSnapshotAgeS`. The latter
-comes from a lock-free restic snapshot query, even on admission skips; unreadable
-repositories yield null with a fixed `lastGoodSnapshotError` tag. The probe
+comes from a lock-free restic snapshot query, even on admission skips. On probe
+failure, memory backups fall back to the status file's last successful backup
+time; unavailable ages remain null. `lastGoodSnapshotSource` identifies `restic`
+or `status_file`, and `lastGoodSnapshotError` retains a fixed probe error. The probe
 uses an inherited password or the target's fixed Keychain entry, never a supplied
 password command/file, with one second for Keychain and three for restic.
 Lock skips include holder parent PID, elapsed process age, and a command reduced
 to a known executable and first argument; other arguments are redacted. Ancestry
 supplies a best-effort holder trigger, including `agent`; unavailable details are
 null/unknown. A proven missing PID becomes `stale_lock`. No lock is changed.
-Daily rollups count `backup.skipped_runs` and `backup.ok_runs` by target;
+Nonzero exits are failures with `failedStage` and `failReason`, including failure
+reasons passed through the legacy skip argument. Lock and load/boot deferrals
+retain their skip behavior. Memory failure stages use only fresh status metadata;
+unavailable stages are `unknown` and unrecognized stages are `other`.
+Daily rollups count `backup.skipped_runs`, `backup.ok_runs` and `backup.failed_runs` by target;
 `log.rollup` flattens them as e.g. `backup.skipped_runs.memory`. Healthy lock
 skips count only as skips.
 
