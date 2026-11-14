@@ -31693,3 +31693,92 @@ it.effect("#1394 the turn-end owner discussion reminder has a card wake scope", 
     }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
   }),
 );
+
+it.effect.each(
+  (["findings", "clear"] as const).flatMap((verdict) =>
+    (["review", "work"] as const).map((target) => ({ verdict, target })),
+  ),
+)(
+  "#1394 $verdict queue read failure on $target leaves the verdict retryable",
+  ({ verdict, target }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      let failingThread: ThreadId | undefined;
+      let oncePerTransition = false;
+      const reads = new Map<ThreadId, number>();
+      const failing = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            queuedRuns: (id) =>
+              Effect.suspend(() => {
+                const count = (reads.get(id) ?? 0) + 1;
+                reads.set(id, count);
+                return id === failingThread || (oncePerTransition && count > 1)
+                  ? Effect.fail(
+                      new KanbanThreadError({
+                        operation: "queue",
+                        detail: "queue projection unavailable",
+                      }),
+                    )
+                  : real.queuedRuns(id);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const created = yield* kanban.createCard(
+          board.id,
+          { title: "Queue failure", prompt: "Work" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const work = (yield* kanban.card(created.id)).card.workThreadId!;
+        yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: work,
+        });
+        yield* kanban.turnEnded(work);
+        yield* kanban.dispatchNow;
+        const before = (yield* kanban.card(created.id)).card;
+        const review = before.activeThreadId!;
+        assert.equal(before.stage, "in_review");
+        failingThread = target === "review" ? review : work;
+        const failed = yield* Effect.exit(
+          kanban.reviewResult(review, verdict, ["Fix queue ordering"], "f202e471a2"),
+        );
+        assert.isTrue(Exit.isFailure(failed));
+        const detail = yield* kanban.card(created.id);
+        assert.equal(detail.card.stage, before.stage);
+        assert.equal(detail.card.activeThreadId, review);
+        assert.equal(detail.card.reviewRound, before.reviewRound);
+        assert.equal(detail.card.reviewStep, before.reviewStep);
+        assert.lengthOf(
+          detail.events.filter((event) => event.kind === "review"),
+          0,
+        );
+
+        failingThread = undefined;
+        reads.clear();
+        oncePerTransition = true;
+        const retried = yield* kanban.reviewResult(
+          review,
+          verdict,
+          ["Fix queue ordering"],
+          "f202e471a2",
+        );
+        assert.isTrue(retried.recorded);
+        const saved = yield* kanban.card(created.id);
+        assert.equal(saved.card.stage, verdict === "findings" ? "todo" : "completed");
+        assert.isNull(saved.card.activeThreadId);
+        assert.lengthOf(
+          saved.events.filter((event) => event.kind === "review"),
+          1,
+        );
+        assert.equal(reads.get(review), 1);
+        assert.equal(reads.get(work), 1);
+      }).pipe(Effect.provide(inlineTestLayer(failing)));
+    }),
+);

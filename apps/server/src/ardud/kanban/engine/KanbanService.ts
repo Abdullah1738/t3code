@@ -1495,6 +1495,7 @@ const make = Effect.gen(function* () {
     else yield* recordServerAnalytics(analytics.value, recorded);
   });
   const analyticsActors = new WeakMap<KanbanCard, KanbanActor>();
+  const preparedTransitions = new WeakSet<KanbanCard>();
   const poolHours = new Map<string, number>();
   const failedRuns = new Set<string>();
   const stoppedRunCards = new Map<
@@ -2561,6 +2562,26 @@ const make = Effect.gen(function* () {
     } satisfies KanbanBoardSnapshot;
   });
 
+  const prepareTransition = Effect.fn("KanbanService.prepareTransition")(function* (
+    card: KanbanCard,
+  ) {
+    if (preparedTransitions.has(card)) return;
+    const before = yield* store.card(card.id);
+    if (
+      before !== null &&
+      ((before.activeThreadId !== null && before.activeThreadId !== card.activeThreadId) ||
+        (before.stage !== card.stage &&
+          !KANBAN_THREAD_STAGES.includes(card.stage) &&
+          ["working", "in_review", "needs_review"].includes(before.stage)))
+    ) {
+      for (const id of new Set([before.activeThreadId, before.workThreadId])) {
+        if (id !== null) yield* pruneWakes(id, card.id, card.discussionId);
+      }
+    }
+    // The event and card write share this immutable candidate; never re-read a fallible queue between them.
+    preparedTransitions.add(card);
+  });
+
   // Callers hold the lock, and log a card's event before saving it: clients
   // re-read the card's history when its change is published.
 
@@ -2569,8 +2590,8 @@ const make = Effect.gen(function* () {
     incoming: KanbanCard,
     by?: KanbanActor,
     dispatchMetadata = false,
-    pruneQueuedWakes = true,
   ) {
+    yield* prepareTransition(incoming);
     const actor: KanbanActor = analyticsActors.get(incoming) ??
       by ?? { _tag: "system", component: "dispatcher" };
     let card = incoming;
@@ -2649,20 +2670,6 @@ const make = Effect.gen(function* () {
                 ? yield* nowIso
                 : (before.analyticsStageEnteredAt ?? before.movedAt),
           };
-        if (
-          pruneQueuedWakes &&
-          before !== null &&
-          ((before.activeThreadId !== null && before.activeThreadId !== card.activeThreadId) ||
-            (before.stage !== card.stage &&
-              !KANBAN_THREAD_STAGES.includes(card.stage) &&
-              ["working", "in_review", "needs_review"].includes(before.stage)))
-        ) {
-          // Verdicts and self-flags bypass letGo. Prune before saving so reuse cannot overtake cleanup.
-          for (const id of new Set([before.activeThreadId, before.workThreadId])) {
-            if (id === null) continue;
-            yield* pruneWakes(id, card.id, card.discussionId);
-          }
-        }
         const write = store.putCard(card);
         yield* dispatchMetadata ? locks.dispatchMetadata(write) : write;
         yield* SavedWrite.record({ kind: "card", card });
@@ -2688,8 +2695,11 @@ const make = Effect.gen(function* () {
       readonly body?: string | null;
       readonly head?: string | null;
       readonly instructionApplication?: InstructionApplication;
+      readonly undoAssignment?: true;
     } = {},
   ) {
+    if (extra.undoAssignment) preparedTransitions.add(card);
+    else yield* prepareTransition(card);
     analyticsActors.set(card, actor);
     const write = store.addCardEvent(
       {
@@ -2889,7 +2899,7 @@ const make = Effect.gen(function* () {
       `owner:${cardId}`,
       ...(discussionId === null ? [] : [`owner:${discussionId}`]),
     ];
-    // Keep the transition gate: releasing it after its event write can strand that event on a concurrent edit.
+    // Keep the transition gate so a new assignment cannot overtake cleanup.
     for (const wake of queuedWakes(yield* threadIo.queuedRuns(threadId), Infinity, scopes)) {
       yield* touching(threadId, threadIo.cancelQueued(threadId, wake.id));
     }
@@ -6815,7 +6825,6 @@ const make = Effect.gen(function* () {
 
   const saveDispatchCard = Effect.fn("KanbanService.saveDispatchCard")(function* (
     card: KanbanCard,
-    undoAssignment = false,
   ) {
     const current = yield* cardOf(card.id);
     const saved = {
@@ -6824,7 +6833,8 @@ const make = Effect.gen(function* () {
       discussionId: current.discussionId,
       updatedAt: yield* nowIso,
     };
-    yield* saveCard(saved, undefined, false, !undoAssignment);
+    if (preparedTransitions.has(card)) preparedTransitions.add(saved);
+    yield* saveCard(saved);
     return saved;
   });
 
@@ -7218,9 +7228,10 @@ const make = Effect.gen(function* () {
                     fromStage: current.stage,
                     toStage: restored.stage,
                     body: "Assignment wake did not complete",
+                    // No consumer owns this claim; interrupted rollback cannot wait on thread I/O.
+                    undoAssignment: true,
                   });
-                  // No consumer owns this assignment; interrupted rollback cannot wait on thread I/O.
-                  destination.expectedCard = yield* saveDispatchCard(restored, true);
+                  destination.expectedCard = yield* saveDispatchCard(restored);
                 }
                 return true;
               }),
