@@ -52,6 +52,12 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skill/scripts"))
     import toollog
 
+try:
+    import offbox_disk_space
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skill/scripts"))
+    import offbox_disk_space
+
 VAR = Path(os.environ.get("BOATD_VAR", "/var/lib/boatd"))
 ETC = Path(os.environ.get("BOATD_ETC", "/etc/boatd"))
 CMDS = VAR / "cmds"
@@ -1139,6 +1145,31 @@ def host_box_metrics(value) -> dict:
     return {'host_boxes': None}
 
 
+def disk_preflight(con, row, errf):
+    if not row['run_id']:
+        return 0
+    owner = con.execute('SELECT owner FROM boxes WHERE id=?', (row['box_id'],)).fetchone()
+    if owner and owner['owner'] in CFG.get('person_owners', []):
+        return 0
+    # Hold the same lock as admission: the live-run snapshot remains valid throughout cleanup.
+    with open(ADMIT_LOCK, 'w') as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        live = [dict(r) for r in con.execute(
+            "SELECT run_id,COALESCE(started_at,created_at) AS started_at FROM commands "
+            "WHERE box_id=? AND pid!=? AND status IN ('queued','running')",
+            (row['box_id'], row['pid']))]
+        context = dict(box_id=row['box_id'], run_id=row['run_id'], live=live)
+        source = Path(offbox_disk_space.__file__).read_text()
+        command = 'python3 -I -c ' + shlex.quote(source) + ' preflight ' + shlex.quote(json.dumps(context))
+        probe = ct_exec(row['box_id'], command, timeout=120, check=False)
+        for text in (probe.stdout, probe.stderr):
+            if text:
+                errf.write(text)
+                for line in text.decode(errors='replace').splitlines():
+                    log(f"{row['box_id']} {row['run_id']}: {line}")
+        return probe.returncode
+
+
 def run_cmd(box_id: str, pid: int) -> int:
     load_cfg()
     con = db()
@@ -1160,6 +1191,8 @@ def run_cmd(box_id: str, pid: int) -> int:
     try:
         if (d / f"{pid}.kill").exists():
             code, sig = 143, "SIGTERM"
+        elif disk_preflight(con, r, errf):
+            code = 90
         else:
             ct_exec(box_id, f"mkdir -p /run/boatd && cat > /run/boatd/{pid}.sh && chmod 600 /run/boatd/{pid}.sh",
                     input=r["command"].encode(), timeout=60)
@@ -1192,6 +1225,12 @@ def run_cmd(box_id: str, pid: int) -> int:
     except OSError:
         pass
     m.update(box_window(con, box_id, t0, t1))
+    disk = offbox_disk_space.result(d / f'{pid}.err', code)
+    if code not in (0, None) and not disk['infra_failure']:
+        with open(d / f'{pid}.out', errors='replace') as output:
+            if any(offbox_disk_space.ENOSPC.search(line) for line in output):
+                disk.update(infra_failure='enospc', infra_reason='disk_exhausted')
+    m.update(disk)
     m["wall_s"] = round(t1 - t0, 2)
     m["queued_s"] = round(queued, 2)
     m["host_boxes"] = host_boxes

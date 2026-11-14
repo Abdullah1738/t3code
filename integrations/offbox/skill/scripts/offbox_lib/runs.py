@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import offbox_disk_space
+
 import base64
 import contextlib
 import json
@@ -31,7 +33,8 @@ from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT
 def _source_stamp():
     try:
         folder = Path(__file__).resolve().parent
-        files = [*folder.glob('*.py'), folder.parent / 'offbox.py', folder.parent / 'toollog.py']
+        files = [*folder.glob('*.py'), folder.parent / 'offbox.py', folder.parent / 'toollog.py',
+                 folder.parent / 'offbox_disk_space.py']
         return tuple((p.name, p.stat().st_mtime_ns, p.stat().st_size) for p in sorted(files))
     except Exception:
         return None
@@ -801,6 +804,9 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
     row is still active. The caller has already established that the process ended.
     """
     path = log_path or LOGS_DIR / f"{run['run_id']}.log"
+    disk = offbox_disk_space.result(path, code)
+    if disk.get('infra_failure'):
+        return code
     planned = planned_steps(run) if planned is None else planned
     if not planned:
         return 126 if code in (None, 126) and argument_list_failure(run, path, report=report and report_start_failure) else code
@@ -1302,6 +1308,33 @@ def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: 
     return None, ""
 
 
+def space_result(run_id, code, path=None, *, report=False):
+    record = offbox_disk_space.result(path or LOGS_DIR / f'{run_id}.log', code)
+    previous = read_json(LOGS_DIR / f'{run_id}.state.json', {})
+    # A missing/incomplete local log must not erase disk evidence already recorded for this exit.
+    if not record['disk_space'] and code is not None and previous.get('wrapper_exit_code') == code:
+        record.update({k: v for k, v in previous.items() if k in record or
+                       k.startswith(('tmp_', 'var_tmp_', 'home_', 'workspace_'))})
+    if any(previous.get(k) != v for k, v in record.items()):
+        try:
+            save_run_state(run_id, **record)
+        except OSError as error:
+            state_warning(run_id, code, error)
+        if record['disk_space'] or record['infra_failure']:
+            try:
+                import toollog
+                toollog.emit('run', 'run.disk_space', ids={'run': run_id}, props=record,
+                             kind='error' if record['infra_failure'] else 'event',
+                             ok=not bool(record['infra_failure']), tag=record['infra_failure'])
+            except Exception:
+                pass
+    if record.get('infra_failure'):
+        if report:
+            say(offbox_disk_space.message(record))
+        return EXIT_INFRA
+    return code
+
+
 def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | None = None, planned: int = 0,
                 where: str = "remote", deps_hint: str = "", box_id: str | None = None) -> None:
     """Always the last offbox line, so a caller's own `| tail` / `; echo` can't be mistaken for it."""
@@ -1371,7 +1404,11 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
     else:
         advice = (f'printf "\\n%s%s\\n%s\\n" {shlex.quote(DEPS_CONTEXT_MARKER)} '
                   f'"$__offbox_deps_context" {NO_NODE_MODULES_MARKER} >&2')
-    deps_check = (f'__offbox_exit=$?; if [ "${{__offbox_command_started:-0}}" = 1 ] '
+    probe_command = ('/usr/bin/python3 -I -c ' + shlex.quote(
+        'import base64,zlib,sys;exec(zlib.decompress(base64.b64decode(sys.argv.pop(1))))')
+        + ' "$__obsp" "$@"')
+    probe = '__obprobe'
+    deps_check = (f'__offbox_exit=$?; {probe} end "$__obsw"; if [ "${{__offbox_command_started:-0}}" = 1 ] '
                   f'&& [ "$__offbox_exit" -ne 0 ] && [ {int(usage.uses_js)} = 1 ] '
                   f'&& [ -f {root}/package.json ] && [ ! -e {root}/node_modules ] '
                   f'; then __offbox_deps_context=; {missing}; '
@@ -1379,8 +1416,13 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
                   'if [ -n "${__offbox_bash_env:-}" ]; then rm -f -- "$__offbox_bash_env"; fi; exit "$__offbox_exit"')
     lines = ["set -a", f'[ -f "{env_file}" ] && . "{env_file}"; rm -f "{env_file}"' if env_file else ":", "set +a",
              f'export OFFBOX_RUN_ID={run_id}',
+             f'export OFFBOX_BOX_ID={shlex.quote(box_id)}',
+             '__obsp=' + shlex.quote(offbox_disk_space.probe_payload()),
+             '__obprobe() { ' + probe_command + '; }',
+             f'__obsw="$HOME/{rdir}"',
               '__offbox_command_started=0',
               'trap ' + shlex.quote(deps_check) + ' EXIT',
+              probe + ' start "$__obsw" || exit 90',
               userns.setup(api.BACKEND, box_id),
               DOCKER_REPAIR,
               LDCACHE_REPAIR,
@@ -2593,7 +2635,8 @@ def emit_terminal(row):
         ended = row['end_at'] or now()
         elapsed = max(0, ended - (row['start_at'] or ended)) * 1000
         toollog.emit('run', 'run.end', kind='perf' if code == 0 else 'error', ok=code == 0, duration_ms=elapsed,
-                     ids={'run': run_id, 'box': row['box_id']}, props={'exitCode': code, 'fallback': row['mode'] == 'local'},
+                     ids={'run': run_id, 'box': row['box_id']}, props={'exitCode': code, 'fallback': row['mode'] == 'local',
+                            **read_json(LOGS_DIR / f'{run_id}.state.json', {})},
                      tag='run_failed' if code != 0 else None)
         if row['process_id'] or row['wrapper_pid']:
             command_ms = api.command_execution_ms(row['box_id'], row['process_id'], row['command_id'])
@@ -2624,11 +2667,17 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         # History can reach the server. An unvalidated wrapper result is never saved as terminal.
         if planned_steps(prior):
             code = None
-        code = settled_steps_code(prior, incoming, locked=True, until=until, catch_up=catch_up, report=report)
+        disk = offbox_disk_space.result(LOGS_DIR / f'{run_id}.log', incoming)
+        code = incoming if disk.get('infra_failure') else settled_steps_code(
+            prior, incoming, locked=True, until=until, catch_up=catch_up, report=report)
         if planned_steps(prior) and status in (None, 'done', 'failed', 'infra'):
             st = 'infra' if code is None else ('done' if code == 0 else 'failed')
         else:
             st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
+        if dict(prior).get('mode') != 'local':
+            space_result(run_id, code)
+            if disk.get('infra_failure'):
+                st = 'infra'
     def persist():
         nonlocal log_row
         con = db()
@@ -3145,10 +3194,11 @@ def _run_remote(a, rn) -> int:
     resources.display(rn.run_id)
     steps = getattr(a, "steps", None) or []
     deps_hint = box_deps_hint(rn.root, rn.log_path)
+    effective = space_result(rn.run_id, code, rn.log_path, report=True)
     if steps:
         res = step_results(rn.log_path)
         failed = next((n for n, rc in res if rc != 0), None)
         report_exit(steps[failed - 1] if failed else "", code, res, len(steps), deps_hint=deps_hint, box_id=rn.box)
     else:
         report_exit(a.cmd[0] if len(a.cmd) == 1 else shlex.join(a.cmd), code, deps_hint=deps_hint, box_id=rn.box)
-    return 90 if code is None else code
+    return 90 if effective is None else effective

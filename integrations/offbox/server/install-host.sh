@@ -324,6 +324,9 @@ install -m 0644 "$MGMT_ASSETS/offbox_mgmt_sshd_config" /opt/boatd/offbox_mgmt_ss
 tool_log="$HERE/toollog.py"
 [ -f "$tool_log" ] || tool_log="$HERE/../skill/scripts/toollog.py"
 install -m 0644 "$tool_log" /opt/boatd/toollog.py
+disk_space="$HERE/offbox_disk_space.py"
+[ -f "$disk_space" ] || disk_space="$HERE/../skill/scripts/offbox_disk_space.py"
+install -m 0644 "$disk_space" /opt/boatd/offbox_disk_space.py
 printf '#!/bin/sh\nexec /usr/bin/python3 /opt/boatd/boatd.py "$@"\n' > /usr/local/sbin/boatd
 chmod 0755 /usr/local/sbin/boatd
 # Settings this script owns are set; anything else already in config.json (owners, retention, sizes) is kept.

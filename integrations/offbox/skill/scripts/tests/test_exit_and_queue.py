@@ -44,6 +44,38 @@ class ExitFidelityTests(Isolated):
             self.assertEqual(rc, code)
             self.assertEqual(last, f'offbox: remote exit {code}')
 
+    def test_enospc_returns_infra_but_preserves_the_command_exit(self):
+        def start(runner):
+            fake_start(runner)
+            runner.log_path.write_text('OSError: [Errno 28] No space left on device\n')
+        a = cli.build_parser().parse_args(['run', '--', 'python', '-m', 'unittest'])
+        err = io.StringIO()
+        with patch.object(runs.Runner, 'start', start), patch.object(runs, 'follow', return_value=2), \
+                contextlib.redirect_stderr(err):
+            code = cli.cmd_run(a, self.me)
+        self.assertEqual(code, 90)
+        self.assertIn('test results from this run are not valid', err.getvalue())
+        import json
+        state_path = next(runs.LOGS_DIR.glob('*.state.json'))
+        state = json.loads(state_path.read_text())
+        self.assertEqual(state['command_exit_code'], 2)
+        self.assertEqual(state['infra_failure'], 'enospc')
+        run_id = state_path.name.removesuffix('.state.json')
+        self.con.execute("INSERT INTO runs(run_id,status,mode) VALUES (?,'running','bg')", (run_id,))
+        self.con.commit()
+        self.assertEqual(runs.finish(run_id, 2, bookkeeping=False), 2)
+        row = self.con.execute('SELECT * FROM runs').fetchone()
+        self.assertEqual((row['status'], row['exit_code']), ('infra', 2))
+        from offbox_lib import misc
+        with patch.object(misc, '_catch_up_log', return_value='complete'), \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(misc.wait(row['run_id'], None), 90)
+            self.assertEqual(misc.logs(row['run_id'], False), 90)
+        (runs.LOGS_DIR / f'{run_id}.log').unlink()
+        self.assertEqual(runs.space_result(run_id, 2), 90)
+        saved = json.loads(state_path.read_text())
+        self.assertEqual(saved['infra_failure'], 'enospc')
+
     def test_zero_from_trailing_echo_is_flagged(self):
         rc, last = self.run_cli(['set -o pipefail; go test -count=1 -v ./... 2>&1; echo EXIT=$?'], 0)
         self.assertEqual(rc, 0)
