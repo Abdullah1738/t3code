@@ -297,19 +297,25 @@ class BaseRouting(unittest.TestCase):
                             return 'server says it cannot take runs' if failure == 'health' and clock[0] > 1000 else None
                         def auth(*args):
                             return 'authenticated API did not answer' if failure == 'authenticated_api' and clock[0] > 1000 else None
-                        with patch.object(home, 'probe', side_effect=health) as health_probe, \
-                                patch.object(api, 'probe_backend', side_effect=auth), \
-                                patch.object(api, 'probe', return_value='no answer'), \
-                                patch.object(outage, 'window_seconds', return_value=60), \
-                                patch.object(cli, 'time', fake_time), patch.object(outage, 'time', fake_time), \
-                                patch.object(pool, 'time', fake_time), patch.object(allocation, 'time', fake_time), \
-                                patch.dict(os.environ, OFFBOX_POOL_SIZE='1', OFFBOX_POOL_WAIT_SECONDS=queue_wait), \
-                                patch.object(pool, 'file_lock', pool_lock), \
-                                patch.object(pool, '_refresh_background'), patch.object(pool, '_recheck_prune_holds'), \
-                                patch.object(pool, 'acquire', side_effect=self.real_acquire), \
-                                patch.object(cli, '_remote_once', side_effect=lambda a, me: pool.acquire(me, base=a.base)) as remote, \
-                                patch.object(fallback, 'run_local') as local, patch.object(os, 'execve') as execute, \
-                                contextlib.redirect_stderr(io.StringIO()) as err:
+                        with contextlib.ExitStack() as stack:
+                            health_probe = stack.enter_context(patch.object(home, 'probe', side_effect=health))
+                            remote = stack.enter_context(patch.object(cli, '_remote_once',
+                                side_effect=lambda a, me: pool.acquire(me, base=a.base)))
+                            local = stack.enter_context(patch.object(fallback, 'run_local'))
+                            execute = stack.enter_context(patch.object(os, 'execve'))
+                            err = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                            for mocked in (
+                                patch.object(api, 'probe_backend', side_effect=auth),
+                                patch.object(api, 'probe', return_value='no answer'),
+                                patch.object(outage, 'window_seconds', return_value=60),
+                                patch.object(cli, 'time', fake_time), patch.object(outage, 'time', fake_time),
+                                patch.object(pool, 'time', fake_time), patch.object(allocation, 'time', fake_time),
+                                patch.dict(os.environ, OFFBOX_POOL_SIZE='1', OFFBOX_POOL_WAIT_SECONDS=queue_wait),
+                                patch.object(pool, 'file_lock', pool_lock),
+                                patch.object(pool, '_refresh_background'), patch.object(pool, '_recheck_prune_holds'),
+                                patch.object(pool, 'acquire', side_effect=self.real_acquire),
+                            ):
+                                stack.enter_context(mocked)
                             code = cli.main(['run', '--base', 'warm', *flags, '--', 'true'])
                         self.assertEqual(code, 93, err.getvalue())
                         self.assertIn("saved base 'torssh:warm'", err.getvalue())
