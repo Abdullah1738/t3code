@@ -266,7 +266,7 @@ describe("DesktopObservability", () => {
     ),
   );
 
-  it.effect("keeps buffering output after a non-terminal failure snapshot", () =>
+  it.effect("persists only failure snapshots while the child keeps logging after a timeout", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const baseDir = yield* fileSystem.makeTempDirectoryScoped({
@@ -285,6 +285,9 @@ describe("DesktopObservability", () => {
         yield* outputLog.writeOutputChunk("stdout", new TextEncoder().encode("before timeout\n"));
         yield* outputLog.persistFailureSnapshot({ details: "readiness timeout" });
         yield* outputLog.writeOutputChunk("stderr", new TextEncoder().encode("after timeout\n"));
+        const snapshot = yield* fileSystem.readFileString(logPath);
+        assert.include(snapshot, "before timeout");
+        assert.notInclude(snapshot, "after timeout");
         yield* outputLog.persistFailure({ details: "code=1" });
       }).pipe(
         Effect.annotateLogs({ runId: "test-run" }),
