@@ -23,7 +23,7 @@ describe("send, poll, and app commands", () => {
 
   test("send validates text, effect, subject, and session", () => {
     expect(() => parseCommand(["send", ...session])).toThrow("--text is required");
-    expect(() => parseCommand(["send", "--text", "x".repeat(12_001), ...session])).toThrow("--text must be at most");
+    expect(() => parseCommand(["send", "--text", "x".repeat(12_001), ...session])).toThrow("message too long: 12,001 chars, limit 12,000");
     expect(() => parseCommand(["send", "--text", "Hi", ...session, "--effect", "rainbow"])).toThrow("--effect must be one of slam");
     expect(() => parseCommand(["send", "--text", "Hi", ...session, "--subject", "a\nb"])).toThrow("--subject must be");
     expect(() => parseCommand(["send", "--text", "Hi", "--key", "k"])).toThrow("--session is required");
@@ -48,7 +48,7 @@ describe("send, poll, and app commands", () => {
     expect(parseCommand(["wake", "--text", "Nik replied", "--source", "robob-watch nik", "--key", "nik:3"])).toEqual({
       method: "POST", path: "/wake", body: { text: "Nik replied", source: "robob-watch nik", dedupeKey: "nik:3" } });
     expect(() => parseCommand(["wake", "--source", "s", "--key", "k"])).toThrow("--text is required");
-    expect(() => parseCommand(["wake", "--text", "x".repeat(12_001), "--source", "s", "--key", "k"])).toThrow("--text must be at most");
+    expect(() => parseCommand(["wake", "--text", "x".repeat(12_001), "--source", "s", "--key", "k"])).toThrow("message too long: 12,001 chars, limit 12,000");
     expect(() => parseCommand(["wake", "--text", "t", "--key", "k"])).toThrow("--source is required");
     expect(() => parseCommand(["wake", "--text", "t", "--source", "a\nb", "--key", "k"])).toThrow("--source must be");
     expect(() => parseCommand(["wake", "--text", "t", "--source", "s"])).toThrow("--key is required");
