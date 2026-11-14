@@ -112,7 +112,7 @@ def memory_fields(values, event):
     if not isinstance(values, dict):
         return result
     if event == 'memory.alert':
-        if values.get('reason') in ('swap', 'pressure', 'footprint', 'fseventsd'):
+        if values.get('reason') in ('swap', 'pressure', 'footprint', 'fseventsd', 'fseventsd_growth'):
             result['reason'] = values['reason']
         if values.get('notifyError') is None or values.get('notifyError') in MEMORY_ERRORS:
             result['notifyError'] = values.get('notifyError')
@@ -153,10 +153,11 @@ def memory_fields(values, event):
             result[key] = None if value is None else [row(p, keys) for p in value[:{'top': 15, 'watched': 512, 'counts': 5}[key]]]
         elif key == 'load' and (value is None or isinstance(value, list)):
             result[key] = None if value is None else [n for n in value[:3] if numeric(n)]
-        elif key in ('pressure', 'freePercent', 'boot', 'swapinsDelta', 'swapoutsDelta',
-                     'deltaWindowS', 'processCount', 'ppid1Count', 'watchedOmitted', 'criticalSamples') and (value is None or numeric(value)):
+        elif key in ('pressure', 'pressureLevel', 'freePercent', 'boot', 'swapinsDelta', 'swapoutsDelta',
+                     'deltaWindowS', 'processCount', 'ppid1Count', 'watchedOmitted', 'criticalSamples', 'fseventsdGrowthSamples',
+                     'fseventsdGrowthPid', 'fseventsdGrowthWindowS', 'fseventsdGrowthMbPerHour') and (value is None or numeric(value)):
             result[key] = value
-        elif key in {n+'Error' for n in ('swap', 'vm', 'pressure', 'freePercent', 'boot',
+        elif key in {n+'Error' for n in ('swap', 'vm', 'pressure', 'pressureLevel', 'freePercent', 'boot',
                                        'top', 'counts', 'io', 'load', 'delta', 'watched')}:
             if value is None or (isinstance(value, str) and value in MEMORY_ERRORS):
                 result[key] = value
