@@ -7087,6 +7087,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 live.stopping = true;
                 input.context.acceptingSteers = false;
                 yield* Ref.update(queryContext, (current) => (current === live ? null : current));
+                // The reasoning emitter needs the active context to publish its
+                // final update; the fenced query cannot add more deltas.
+                yield* reasoningDeltas.flushTurn(input.context.nativeTurnId);
                 yield* Ref.update(activeTurn, (current) =>
                   current === input.context ? null : current,
                 );
@@ -9145,7 +9148,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 message.api_error_status < 500 &&
                 message.api_error_status !== 404);
             const cause =
-              (currentPermanentFailure ? (turnFailure ?? undefined) : undefined) ??
+              (currentPermanentFailure ? turnFailure : undefined) ??
               transcriptFailure ??
               (selectedModelAfterSuccess
                 ? latestFailure

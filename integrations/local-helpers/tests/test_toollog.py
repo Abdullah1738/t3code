@@ -16,6 +16,66 @@ import toollog
 
 
 class ToolLogTests(unittest.TestCase):
+    def test_imessage_rollup_summary_appended_after_read_is_never_double_counted(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        path = directory / (self.day + '.ndjson')
+        raw = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False, 'durationMs': 1001,
+               'ids': {'callBatchId': 'batch-fixture'}, 'props': {'method': 'GET', 'route': '/threads/:id'}}
+        summary = {**raw, 'name': 'turn.robob_calls', 'calls': {'thread': {
+            'ok': 2, 'failed': 1, 'histogram': [[10, 1], [20, 1], [1001, 1]]}}}
+        path.write_text(json.dumps(raw) + '\n')
+        original = toollog._read_records
+        reads = 0
+        def append_after_read(board, day):
+            nonlocal reads
+            yield from original(board, day)
+            if day == self.day:
+                reads += 1
+                if reads == 1:
+                    with path.open('a') as dest:
+                        dest.write(json.dumps(summary) + '\n')
+        with patch.object(toollog, '_read_records', append_after_read):
+            first = toollog.rollup('imessage', self.day)
+        self.assertEqual((first['total'], first['failedCount']), (1, 1))
+        second = toollog.rollup('imessage', self.day)
+        self.assertEqual((second['total'], second['failedCount']), (3, 1))
+
+    def test_imessage_aggregate_counts_and_percentiles_without_duplicate_slow_rows(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        stats = {'count': 3, 'ok': 2, 'failed': 1, 'p50': 10, 'p95': 1002, 'max': 1002,
+                 'histogram': [[10, 2], [1002, 1]]}
+        call = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False,
+                'durationMs': 1002, 'ids': {'runId': 'run-fixture', 'callBatchId': 'batch-fixture'},
+                'props': {'method': 'GET', 'route': '/threads/:id'}}
+        rows = [{**call, 'name': 'turn.robob_calls', 'calls': {'thread': stats}}, call,
+                {**call, 'durationMs': 2000, 'ids': {'callBatchId': 'orphan'}},
+                {'component': 'router', 'kind': 'perf', 'name': 'turn.end', 'ok': True}]
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        result = toollog.rollup('imessage', self.day)
+        self.assertEqual((result['total'], result['recordedRows'], result['okCount'], result['failedCount']), (5, 4, 3, 2))
+        self.assertEqual(result['countsByName']['turn.robob_call'], 4)
+        self.assertFalse(result['sampled'])
+        self.assertEqual(result['byComponent']['robob']['thread'], {
+            'count': 4, 'ok': 2, 'failed': 2, 'errorRate': .5, 'durationMs': {'p50': 10, 'p95': 2000, 'max': 2000}})
+
+    def test_imessage_aggregate_rejects_private_names_and_invalid_histograms(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        for histogram, expected in [([[5, 1], [971501234567, 1]], 5), ([[5, 2]], None), ([[5, -1]], None)]:
+            stats = {'ok': 1, 'failed': 0, 'histogram': histogram, 'p50': 'PRIVATE_BODY'}
+            row = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_calls',
+                   'calls': {'PRIVATE_TOKEN': stats, 'thread': stats}}
+            (directory / (self.day + '.ndjson')).write_text(json.dumps(row) + '\n')
+            result = toollog.rollup('imessage', self.day)
+            self.assertNotIn('PRIVATE', json.dumps(result))
+            self.assertNotIn('971501234567', json.dumps(result))
+            if expected:
+                self.assertEqual(result['byComponent']['robob']['thread']['durationMs']['p95'], expected)
+            else:
+                self.assertNotIn('thread', result['byComponent']['robob'])
+
     def test_missing_override_uses_private_temp_root(self):
         with patch.dict(os.environ):
             os.environ.pop('TOOLLOG_ROOT', None)
@@ -39,6 +99,61 @@ class ToolLogTests(unittest.TestCase):
 
     def rows(self, board='agent-tools'):
         return list(toollog.read(board, self.day))
+
+    def test_orders_rollup_preserves_cause_groups_and_merchant_timings(self):
+        directory = toollog.board_dir('orders')
+        directory.mkdir(parents=True)
+        records = []
+        for merchant, status, duration in [('noon', 401, 10), ('noon', 401, 20),
+                                           ('noon', 500, 30), ('amazon', 500, 5000),
+                                           (None, None, 40)]:
+            records.append({'ts': self.day + 'T12:00:00Z', 'tool': 'orders', 'component': 'order-watch',
+                'name': 'track.poll', 'kind': 'error', 'durationMs': duration, 'ok': False,
+                'props': {'merchant': merchant},
+                'error': {'tag': 'OPERATION_FAILED', 'cause': {'httpStatus': status}}})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in records))
+        result = toollog.rollup('orders', self.day)
+        self.assertEqual({(row['httpStatus'], row['merchant']): row['count'] for row in result['topErrors']},
+                         {(401, 'noon'): 2, (500, 'noon'): 1, (500, 'amazon'): 1, (None, 'unknown'): 1})
+        self.assertEqual(result['durationsMs']['track.poll']['byMerchant']['noon'],
+                         {'count': 3, 'p50': 20, 'p95': 30, 'max': 30})
+        self.assertEqual(result['durationMsByName']['track.poll'], {'p50': 30, 'p95': 5000, 'max': 5000})
+        self.assertEqual(result['topErrorTags'][0]['count'], 5)
+
+    def test_sampled_orders_rollup_weights_merchant_durations_and_groups_errors(self):
+        directory = toollog.board_dir('orders')
+        directory.mkdir(parents=True)
+        records = []
+        for merchant, kind, duration, rate, status in [
+            ('noon', 'perf', 10, 20, None), ('noon', 'perf', 100, 1, None),
+            ('noon', 'error', 1000, 128, 401), ('noon', 'error', 2000, 32, 401),
+            ('careem', 'perf', 25, 2, None), ('amazon', 'perf', 50, 1, None),
+            ('amazon', 'error', 3000, 64, 500), (None, 'error', 4000, 1, None),
+        ]:
+            records.append({'ts': self.day + 'T12:00:00Z', 'tool': 'orders',
+                'name': 'track.poll', 'kind': kind, 'durationMs': duration, 'ok': kind != 'error',
+                'props': {'merchant': merchant, 'sampleRate': rate},
+                **({'error': {'tag': 'OPERATION_FAILED', 'cause': {'httpStatus': status}}}
+                   if kind == 'error' else {})})
+        records.append({'ts': self.day + 'T12:00:01Z', 'kind': 'error', 'name': 'log.cap',
+            'props': {'component': 'hooks', 'capBytes': 100}, 'error': {'tag': 'LOG_CAP'}})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in records))
+        result = toollog.rollup('orders', self.day)
+        self.assertEqual(result['recordedRows'], 9)
+        self.assertEqual(result['total'], 29)
+        self.assertTrue(result['sampled'])
+        self.assertEqual(result['countsByName'], {'track.poll': 28, 'log.cap': 1})
+        self.assertEqual(result['logCaps'], [{'component': 'hooks', 'capBytes': 100,
+                                              'ts': self.day + 'T12:00:01Z'}])
+        self.assertEqual({(r['tag'], r['httpStatus'], r['merchant']): r['count'] for r in result['topErrors']},
+            {('OPERATION_FAILED', 401, 'noon'): 2, ('OPERATION_FAILED', 500, 'amazon'): 1,
+             ('OPERATION_FAILED', None, 'unknown'): 1, ('LOG_CAP', None, 'unknown'): 1})
+        self.assertEqual(result['durationMsByName']['track.poll'], {'p50': 10, 'p95': 3000, 'max': 4000})
+        self.assertEqual(result['durationsMs']['track.poll']['byMerchant'], {
+            'noon': {'count': 23, 'p50': 10, 'p95': 1000, 'max': 2000},
+            'careem': {'count': 2, 'p50': 25, 'p95': 25, 'max': 25},
+            'amazon': {'count': 2, 'p50': 50, 'p95': 3000, 'max': 3000},
+            'unknown': {'count': 1, 'p50': 4000, 'p95': 4000, 'max': 4000}})
 
     def test_format_privacy_modes_and_fail_open(self):
         os.chmod(self.tmp.name, 0o755)
@@ -111,15 +226,15 @@ class ToolLogTests(unittest.TestCase):
         for decision in ('allowed', 'rewritten'):
             with patch.object(toollog.random, 'random', side_effect=[0, 1 / toollog.HOOK_SAMPLE_RATE, .99]):
                 for _ in range(3):
-                    toollog.hook('codex', 'shell', decision, 'fixture', 2, ids={'threadId': 'fixture'})
+                    toollog.hook('codex', 'shell', decision, 'fixture', 2, ids={'threadId': 'native:codex:fixture'})
         with patch.object(toollog.random, 'random', return_value=.99):
-            toollog.hook('codex', 'shell', 'denied', 'fixture', 4, ids={'threadId': 'fixture'})
+            toollog.hook('codex', 'shell', 'denied', 'fixture', 4, ids={'threadId': 'native:codex:fixture'})
             toollog.hook('codex', 'shell', 'allowed', 'failure', 4, error_tag='fixture.error')
         rows = self.rows()
         self.assertEqual(len(rows), 4)
         for row in rows[:2]:
             self.assertEqual(row['durationMs'], 2)
-            self.assertEqual(row['ids']['threadId'], 'fixture')
+            self.assertEqual(row['ids']['threadId'], 'native:codex:fixture')
             self.assertEqual(row['props']['sampleRate'], toollog.HOOK_SAMPLE_RATE)
             for key in ('cwdClass', 'matchedRoot', 'argv0Class'):
                 self.assertNotIn(key, row['props'])
@@ -137,9 +252,114 @@ class ToolLogTests(unittest.TestCase):
         self.assertEqual(result['failedCount'], 2)
         self.assertEqual(result['countsByKind'], {'perf': 2 * toollog.HOOK_SAMPLE_RATE, 'error': 2})
         self.assertEqual(result['durationMsByName']['hook.decision'], {'p50': 2, 'p95': 2, 'max': 4})
-        self.assertEqual(result['topThreadsByRule']['fixture'], [{'threadId': 'fixture', 'count': 2 * toollog.HOOK_SAMPLE_RATE + 1}])
-        self.assertEqual(result['repeatLoops'][0]['maxCountInHour'], 2 * toollog.HOOK_SAMPLE_RATE + 1)
+        self.assertEqual(result['topThreadsByRule']['fixture'], [{'threadId': 'native:codex:fixture', 'count': toollog.HOOK_SAMPLE_RATE + 1, 'denied': 1, 'rewritten': toollog.HOOK_SAMPLE_RATE, 'attributed': True, 'sampled': True}])
+        self.assertEqual(result['repeatLoops'][0]['maxCountInHour'], toollog.HOOK_SAMPLE_RATE)
+        self.assertEqual(result['repeatLoops'][0]['decision'], 'rewritten')
+        self.assertTrue(result['repeatLoops'][0]['sampled'])
         self.assertEqual(result['logCaps'], [])
+
+    def hook_rollup(self, rows, top_n=20):
+        path = toollog.board_dir('agent-tools') / (self.day + '.ndjson')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        base = {'ts': self.day + 'T12:00:00Z', 'name': 'hook.decision', 'kind': 'error',
+                'ok': False, 'ids': {'threadId': 'native:codex:refusals'}}
+        path.write_text(''.join(json.dumps({**base, **row}) + '\n' for row in rows))
+        return toollog.rollup('agent-tools', self.day, top_n)
+
+    def test_sampled_allowed_is_not_a_refusal(self):
+        result = self.hook_rollup([{'kind': 'perf', 'ok': True,
+            'props': {'rule': 'retry', 'decision': 'allowed', 'sampleRate': 128}}])
+        self.assertEqual(result['topThreadsByRule'], {})
+        self.assertEqual(result['repeatLoops'], [])
+        self.assertEqual(result['unattributedByRule'], {})
+        self.assertEqual(result['unrecognizedThreadIds'], 0)
+        self.assertEqual((result['total'], result['okCount'], result['countsByName']),
+                         (128, 128, {'hook.decision': 128}))
+
+    def test_denied_loop_and_separate_rewrites(self):
+        result = self.hook_rollup([{'props': {'rule': 'retry', 'decision': decision}}
+                                  for decision in ['denied'] * 25 + ['rewritten'] * 15])
+        self.assertEqual(result['topThreadsByRule']['retry'], [{
+            'threadId': 'native:codex:refusals', 'count': 40, 'denied': 25,
+            'rewritten': 15, 'attributed': True, 'sampled': False}])
+        self.assertEqual(result['repeatLoops'], [{
+            'threadId': 'native:codex:refusals', 'rule': 'retry', 'decision': 'denied',
+            'maxCountInHour': 25, 'repeatLoop': True, 'sampled': False}])
+        split = self.hook_rollup([{'props': {'rule': 'retry', 'decision': decision}}
+                                 for decision in ['denied'] * 15 + ['rewritten'] * 15])
+        self.assertEqual(split['repeatLoops'], [])
+
+    def test_unknown_refusals_visible_without_loops_or_top_limit(self):
+        result = self.hook_rollup([{'ids': {'threadId': 'unknown:codex'},
+                                   'props': {'rule': 'rootwide-search', 'decision': 'denied'}}] * 25, top_n=0)
+        self.assertEqual(result['unattributedByRule']['rootwide-search'], [{
+            'threadId': 'unknown:codex', 'count': 25, 'denied': 25, 'rewritten': 0,
+            'attributed': False, 'sampled': False}])
+        self.assertEqual(result['repeatLoops'], [])
+        self.assertEqual(result['topThreadsByRule'], {})
+
+    def test_ranking_thread_id_shapes(self):
+        uuid = '393a4dd3-d1ca-468e-9367-7c1f1ba1bf32'
+        cases = [(t, True) for t in [uuid, 'mcp:' + uuid, 'mcp:' + uuid + ':fork', 'ardud-control:thread:' + uuid,
+            'ardud-control:thread:nightly-report', 'ardud-control:thread:request%3A2026%2F11',
+            'ardud-opencode-import:thread:ses_e288ff742ffeQTYTEXLuPR3WIO',
+            'import:codex:' + uuid, 'import:claudeAgent:session-id',
+            'thread:mcp:namespace:request%3Akey:0',
+            'thread:delegated-task:command%3Amcp%3Adelegate-task%3Arequest',
+            'thread:project:7273c274-25cd-4aa6-8546-03e45da95f0e:' + uuid,
+            'thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Ft3code-fork:' + uuid,
+            'native:claude:' + uuid, 'native:opencode:ses_e288ff742ffeQTYTEXLuPR3WIO']]
+        cases += [(t, False) for t in ['child', 'parent', 'leaf', 'new-fixture', '',
+            'native:', 'thread:project:fixture:child', 'mcp:fixture', 'sha256:abcd',
+            uuid + '-suffix', 'prefix-' + uuid, 'mcp:' + uuid + ':other', 'ardud-control:thread:',
+            'ardud-opencode-import:thread:', 'ardud-opencode-import:thread:ses_',
+            'import::session', 'import:codex:', 'thread:mcp:namespace:key:child',
+            'thread:delegated-task:']]
+        for thread, recognized in cases:
+            with self.subTest(thread=thread):
+                result = self.hook_rollup([{'ids': {'threadId': thread},
+                    'props': {'rule': 'retry', 'decision': 'denied'}}] * 25)
+                self.assertEqual(result['unrecognizedThreadIds'], 0 if recognized else 25)
+                self.assertFalse(result['unrecognizedThreadIdsSampled'])
+                self.assertEqual(bool(result['topThreadsByRule']), recognized)
+                self.assertEqual(bool(result['repeatLoops']), recognized)
+
+    def test_legacy_decision_fallback_only_when_missing(self):
+        cases = [({'kind': 'error'}, {}, True), ({'kind': 'perf', 'ok': False}, {}, True),
+                 ({'kind': 'perf', 'ok': True}, {}, False),
+                 ({'kind': 'error'}, {'decision': 'allowed'}, False),
+                 ({'kind': 'error'}, {'decision': None}, False),
+                 ({'kind': 'error'}, {'decision': 'other'}, False),
+                 ({'kind': 'error'}, {'decision': ['denied']}, False)]
+        for fields, props, expected in cases:
+            with self.subTest(fields=fields, props=props):
+                result = self.hook_rollup([{**fields, 'props': {'rule': 'retry', **props}}])
+                self.assertEqual(bool(result['topThreadsByRule']), expected)
+
+    def test_unexpected_sampled_refusals_are_labeled(self):
+        for kind in ['error', 'perf']:
+            for thread, block in [('native:codex:refusals', 'topThreadsByRule'),
+                                  ('unknown:codex', 'unattributedByRule')]:
+                with self.subTest(kind=kind, thread=thread):
+                    result = self.hook_rollup([{'kind': kind, 'ids': {'threadId': thread},
+                        'props': {'rule': 'retry', 'decision': 'denied', 'sampleRate': 128}}])
+                    entry = result[block]['retry'][0]
+                    self.assertEqual((entry['count'], entry['denied'], entry['sampled']), (128, 128, True))
+                    self.assertEqual(result['total'], 1 if kind == 'error' else 128)
+
+    def test_unrecognized_refusal_sample_rate_shapes(self):
+        cases = [(None, 1), (True, 1), (False, 1), (0, 1), (-1, 1),
+                 (1.5, 1), ('128', 1), (2**53, 1), (1, 1), (128, 128),
+                 (2**53 - 1, 2**53 - 1)]
+        for rate, weight in cases:
+            with self.subTest(rate=rate):
+                result = self.hook_rollup([{'ids': {'threadId': 'fixture'},
+                    'props': {'rule': 'retry', 'decision': 'denied', 'sampleRate': rate}}])
+                self.assertEqual(result['unrecognizedThreadIds'], weight)
+                self.assertEqual(result['unrecognizedThreadIdsSampled'], weight > 1)
+                self.assertEqual((result['total'], result['sampled']), (1, False))
+                self.assertEqual(result['topThreadsByRule'], {})
+                self.assertEqual(result['repeatLoops'], [])
 
     def test_rollup_legacy_caps_and_sample_rate_shapes(self):
         path = toollog.board_dir('agent-tools') / (self.day + '.ndjson')
@@ -198,6 +418,35 @@ class ToolLogTests(unittest.TestCase):
         for board, day in [('../escape', self.day), ('orders', '../../escape'), ('Orders', self.day)]:
             with self.assertRaises(ValueError):
                 list(toollog.read(board, day))
+
+    def test_rollup_groups_error_tag_and_class(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        path = directory / (self.day + '.ndjson')
+        records = [{'kind': 'error', 'name': 'bridge.catch',
+                    'error': {'tag': 'secrets.catch9', **({'name': name} if name else {})}}
+                   for name in ('Error', 'Error', 'TypeError', None)]
+        path.write_text(''.join(json.dumps(row) + '\n' for row in records))
+        result = toollog.rollup('imessage', self.day)['topErrorTags']
+        self.assertEqual([(row['tag'], row['name'], row['count']) for row in result], [
+            ('secrets.catch9', 'Error', 2), ('secrets.catch9', 'TypeError', 1),
+            ('secrets.catch9', 'UnknownError', 1)])
+        self.assertEqual([row['sampleId']['line'] for row in result], [1, 3, 4])
+
+    def test_imessage_rollup_reduces_untrusted_class_name_shapes(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        cases = [('PRIVATE_FORM_VALUE', 'UnknownError'), ('PRIVATEError', 'UnknownError'),
+                 ('PRIVATE_PHONE_971501234567', 'UnknownError'), ('https://private/?token=PRIVATE', 'UnknownError'),
+                 ('/private/attachment.png', 'UnknownError'), (42, 'UnknownError'),
+                 (None, 'UnknownError'), ('TypeError', 'TypeError'), ('ControlError', 'ControlError')]
+        for name, expected in cases:
+            with self.subTest(name=name):
+                (directory / (self.day + '.ndjson')).write_text(json.dumps({
+                    'kind': 'error', 'name': 'bridge.catch', 'error': {'tag': 'fixture.catch1', 'name': name}}) + '\n')
+                result = toollog.rollup('imessage', self.day)['topErrorTags']
+                self.assertEqual(result[0]['name'], expected)
+                self.assertNotIn('PRIVATE', json.dumps(result))
 
     def test_rollup_prefers_available_error_ids(self):
         toollog.emit('fixture', 'error', 'fixture.error', error_tag='fixture.failure')
@@ -302,15 +551,15 @@ class AttributionTests(unittest.TestCase):
             directory.mkdir()
             rows = []
             base = datetime(2026, 11, 13, 0, 59, tzinfo=timezone.utc)
-            for thread, count, spacing in [('loop',21,10), ('quiet',20,10), ('spread',21,181)]:
+            for thread, count, spacing in [('native:codex:loop',21,10), ('native:codex:quiet',20,10), ('native:codex:spread',21,181)]:
                 for i in range(count):
                     rows.append({'ts':(base+timedelta(seconds=i*spacing)).isoformat(), 'name':'hook.decision',
                         'kind':'error', 'ids':{'threadId':thread}, 'props':{'rule':'rootwide-search','decision':'denied'}})
             rows.append({'name':'other.event', 'ids':{'threadId':'loop'}, 'props':{'rule':'other'}})
             (directory/(day+'.ndjson')).write_text('\n'.join(json.dumps(r) for r in reversed(rows))+'\n')
             result = toollog.rollup('agent-tools',day,2)
-            self.assertEqual(result['topThreadsByRule']['rootwide-search'], [{'threadId':'loop','count':21},{'threadId':'spread','count':21}])
-            self.assertEqual(result['repeatLoops'], [{'threadId':'loop','rule':'rootwide-search','maxCountInHour':21,'repeatLoop':True}])
+            self.assertEqual(result['topThreadsByRule']['rootwide-search'], [{'threadId':t,'count':21,'denied':21,'rewritten':0,'attributed':True,'sampled':False} for t in ['native:codex:loop','native:codex:spread']])
+            self.assertEqual(result['repeatLoops'], [{'threadId':'native:codex:loop','rule':'rootwide-search','decision':'denied','maxCountInHour':21,'repeatLoop':True,'sampled':False}])
 
     def test_attributed_hook_under_point_one_ms(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT':temp}):
@@ -334,11 +583,11 @@ class AttributionTests(unittest.TestCase):
 
     def test_midnight_sampled_loop_estimates(self):
         cases = [
-            ('previous-sampled', 128, 1, -10, 'fixture', 129, True),
-            ('current-sampled', 1, 128, -10, 'fixture', 129, True),
-            ('both-unsampled', 1, 1, -10, 'fixture', 2, False),
-            ('outside-window', 128, 1, -3601, 'fixture', 1, False),
-            ('unrelated-thread', 128, 1, -10, 'other', 1, False),
+            ('previous-sampled', 128, 1, -10, 'native:codex:fixture', 129, True),
+            ('current-sampled', 1, 128, -10, 'native:codex:fixture', 129, True),
+            ('both-unsampled', 1, 1, -10, 'native:codex:fixture', 2, False),
+            ('outside-window', 128, 1, -3601, 'native:codex:fixture', 1, False),
+            ('unrelated-thread', 128, 1, -10, 'native:codex:other', 1, False),
         ]
         for label, previous_rate, current_rate, offset, thread, peak, sampled in cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT': temp}):
@@ -346,9 +595,9 @@ class AttributionTests(unittest.TestCase):
                 directory.mkdir()
                 base = datetime(2026, 11, 14, tzinfo=timezone.utc)
                 for at, rate, identity in [(base + timedelta(seconds=offset), previous_rate, thread),
-                                           (base, current_rate, 'fixture')]:
+                                           (base, current_rate, 'native:codex:fixture')]:
                     row = {'ts': at.isoformat(), 'name': 'hook.decision', 'kind': 'perf',
-                           'ids': {'threadId': identity}, 'props': {'rule': 'fixture', 'sampleRate': rate}}
+                           'ids': {'threadId': identity}, 'props': {'rule': 'fixture', 'sampleRate': rate, 'decision': 'rewritten'}}
                     (directory / (at.strftime('%Y-%m-%d') + '.ndjson')).write_text(json.dumps(row) + '\n')
                 result = toollog.rollup('agent-tools', '2026-11-14')
                 self.assertEqual(result['sampled'], sampled)
@@ -366,7 +615,7 @@ class AttributionTests(unittest.TestCase):
                 base=datetime(2026,11,13,23,59,tzinfo=timezone.utc)
                 for i in range(count):
                     at=base+timedelta(seconds=i*spacing)
-                    row={'ts':at.isoformat(),'name':'hook.decision','ids':{'threadId':'loop'},'props':{'rule':'retry'}}
+                    row={'ts':at.isoformat(),'name':'hook.decision','ids':{'threadId':'native:codex:loop'},'props':{'rule':'retry','decision':'denied'}}
                     with (directory/(at.strftime('%Y-%m-%d')+'.ndjson')).open('a') as dest:
                         dest.write(json.dumps(row)+'\n')
                 result=toollog.rollup('agent-tools','2026-11-14')

@@ -52,6 +52,7 @@ const compactWait = (card: KanbanCard, byId: ReadonlyMap<string, KanbanCard>) =>
       on: wait.on,
       pr: wait.pr,
       card: wait.card,
+      ...(wait.cardTarget === undefined ? {} : { cardTarget: wait.cardTarget }),
       script: wait.script,
       note: short(wait.note),
       status: wait.status,
@@ -66,6 +67,13 @@ export const compactBoard = (
   byId = new Map(snapshot.cards.map((card) => [card.id as string, card])),
 ) => ({
   ...snapshot,
+  board: {
+    ...snapshot.board,
+    standingApprovals: snapshot.board.standingApprovals.map((entry) => ({
+      ...entry,
+      quote: entry.quote.slice(0, 200),
+    })),
+  },
   cards: snapshot.cards.map((card) => ({
     id: card.id,
     number: card.number,

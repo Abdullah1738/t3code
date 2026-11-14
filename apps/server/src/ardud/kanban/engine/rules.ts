@@ -18,6 +18,7 @@ import {
   kanbanWaitsOnEvaluator,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanScheduleCard,
   type KanbanDiscussion,
   type KanbanGroup,
   type KanbanPool,
@@ -112,6 +113,7 @@ export function checkMove(role: MoveRole, card: KanbanCard, to: KanbanStage): Mo
       return no(`dispatcher cannot move ${from} -> ${to}`);
     case "cardThread":
       if (from === "working" && (to === "needs_review" || to === "needs_owner")) return ok;
+      if (from === "todo" && card.activeThreadId === null && to === "needs_owner") return ok;
       if (
         (from === "todo" || from === "in_review" || from === "completed") &&
         card.activeThreadId === null &&
@@ -812,6 +814,7 @@ export function relatedCandidates(input: {
   readonly slots: number;
   readonly pools?: ReadonlyArray<KanbanPool>;
   readonly limit?: number;
+  readonly rankingCards?: ReadonlyArray<KanbanScheduleCard>;
 }): ReadonlyArray<Candidate> {
   const byId = new Map(input.cards.map((card) => [card.id as string, card]));
   const seeds = new Set<string>(input.seeds.map((seed) => seed.id));
@@ -845,7 +848,7 @@ export function relatedCandidates(input: {
     slots: input.slots,
     ...(input.pools ? { pools: input.pools } : {}),
   };
-  const order = kanbanPickOrder(input.cards);
+  const order = kanbanPickOrder(input.rankingCards ?? input.cards);
   return [...reasons]
     .flatMap(([id, why]) => {
       const card = byId.get(id);

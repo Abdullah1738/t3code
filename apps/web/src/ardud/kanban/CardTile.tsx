@@ -4,6 +4,7 @@ import { memo } from "react";
 import type { BoardTileView, TileLine } from "@t3tools/client-runtime/ardud/kanban";
 import { ageView, clockLabel, formatTimeOfDay } from "@t3tools/client-runtime/ardud/common";
 
+import { askTimingRef } from "./needsYou/useAskTiming";
 import { cn } from "../../lib/utils";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../../components/ui/tooltip";
 import { useBoardClock } from "./useBoardClock";
@@ -117,6 +118,7 @@ export const CardTile = memo(function CardTile(props: {
     <button
       type="button"
       onClick={() => props.onOpen(card.id)}
+      ref={card.askId ? askTimingRef(card.id, card.askId) : undefined}
       data-card={card.id}
       aria-current={props.selected ? "true" : undefined}
       className={cn(

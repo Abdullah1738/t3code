@@ -139,8 +139,11 @@ def log_drop(item, reason):
     log_decision(item, category, 'ignored', source=source, deduped=deduped)
 
 
-def log_failure(tag, item=None):
-    tool_error('triage', tag, log_ids(item))
+def log_failure(tag, item=None, *, watcher=None):
+    ids = log_ids(item)
+    if watcher is not None:
+        ids['watcher'] = watcher
+    tool_error('triage', tag, ids)
 
 
 def trace_run(name):
@@ -285,8 +288,39 @@ def active_watchers(now):
     return result
 
 
-def exclusions(watchers):
+def watcher_command_text(command):
+    # shlex's comment mode also strips literal # inside shell words (booking#123).
+    text, quote, escaped, word, comment = [], None, False, False, False
+    for char in command:
+        if comment:
+            if char != '\n':
+                continue
+            comment = False
+        if escaped:
+            escaped = False
+            if char == '\n':
+                text.pop()  # Shell line continuation, including inside double quotes.
+                continue
+            word = True
+        elif char == '\\' and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            quote, word = char, True
+        elif char == '#' and not word:
+            comment = True
+            continue
+        else:
+            word = not (char.isspace() or char in ';&|()<>')
+        text.append(char)
+    return ''.join(text)
+
+
+def exclusions(watchers, state):
     jids, mail_seen = set(), {a: set() for a in ACCOUNTS}
+    invalid = state.setdefault('watcher_command_invalid', {})
     for w in watchers:
         if not w['_healthy']:
             continue
@@ -296,13 +330,34 @@ def exclusions(watchers):
             command += '\n' + script.read_text()
         if 'whatsapp-new-message' in command:
             jids.update(re.findall(r'\b\d+@(?:s\.whatsapp\.net|lid|g\.us)\b', command))
+        watcher = w.get('id') or Path(w['_dir']).name
+        text = watcher_command_text(command)
+        try:
+            shlex.split(text)
+        except ValueError:
+            digest = hashlib.sha256(command.encode()).hexdigest()[:16]
+            if invalid.get(watcher) != digest:
+                log_failure('watcher.command_invalid', watcher=watcher)
+                invalid[watcher] = digest
+            groups = []
+            for line in text.splitlines():
+                try:
+                    groups.append(shlex.split(line))
+                except ValueError:
+                    continue
+        else:
+            invalid.pop(watcher, None)
+            # Keep command boundaries for the optional mailbox, joining quoted lines.
+            groups, pending = [], ''
+            for line in text.splitlines(keepends=True):
+                pending += line
+                try:
+                    groups.append(shlex.split(pending))
+                except ValueError:
+                    continue
+                pending = ''
         # Only exact already-seen IDs, never a guessed broad sender blacklist.
-        for line in command.splitlines():
-            try:
-                tokens = shlex.split(line)
-            except ValueError:
-                log_failure('watcher.command_invalid')
-                continue
+        for tokens in groups:
             for i, token in enumerate(tokens):
                 if token != 'email-new-message' or i + 2 >= len(tokens):
                     continue
@@ -1473,11 +1528,11 @@ def send_urgent(item_id, text, channel, now, seconds=4):
             elif status:
                 raise RuntimeError('iMessage queued or unresolved; awaiting transport confirmation')
         if channel == 'telegram':
-            command = [str(BUN), stub or str(TELEGRAM_CLI), 'notify', '--source', 'Inbox triage',
-                       '--severity', 'attention', '--text', entry[text_key], '--key', key]
+            command = [str(BUN), stub or str(TELEGRAM_CLI), 'notify', '--source=Inbox triage',
+                       '--severity=attention', f'--text={entry[text_key]}', f'--key={key}']
         else:
-            command = [str(BUN), stub or str(SPECTRUM_CLI), 'send', '--text', entry[text_key],
-                       '--session', owner_route(), '--key', key]
+            command = [str(BUN), stub or str(SPECTRUM_CLI), 'send', f'--text={entry[text_key]}',
+                       f'--session={owner_route()}', f'--key={key}']
         out = run_helper('telegram-bridge' if channel == 'telegram' else 'spectrum-bridge', command,
                          capture_output=True, text=True, timeout=seconds,
                          env={k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'})
@@ -1826,8 +1881,8 @@ def send_health(state, due, wd, now):
     failures = state.setdefault('health_delivery_failures', {})
     previous = failures.get('telegram-bridge')
     try:
-        out = run_helper('telegram-bridge', [str(BUN), stub or str(TELEGRAM_CLI), 'notify', '--source', 'Inbox triage', '--severity', 'attention',
-                          '--text=' + pending['text'], '--key', pending['key']], capture_output=True, text=True, timeout=4,
+        out = run_helper('telegram-bridge', [str(BUN), stub or str(TELEGRAM_CLI), 'notify', '--source=Inbox triage', '--severity=attention',
+                          f'--text={pending["text"]}', f'--key={pending["key"]}'], capture_output=True, text=True, timeout=4,
                          failure_state=failures,
                          env={k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'})
         if out.returncode:
@@ -1889,7 +1944,7 @@ def replay_pages(collect_page):
 
 
 def collect(state, now, watchers, rules, since=None, baseline=False, fast=None):
-    jids, seen = exclusions(watchers)
+    jids, seen = exclusions(watchers, state)
     tasks = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=7) as pool:
         for account in ACCOUNTS:

@@ -80,6 +80,7 @@ const testLayer = () => {
     KanbanThreads,
     KanbanThreads.of({
       pendingUserInputs: () => Effect.succeed([]),
+      claimContext: () => Effect.succeed(null),
       view: (threadId) =>
         Effect.succeed({
           threadId,
@@ -106,6 +107,7 @@ const testLayer = () => {
       model: () => Effect.succeed(null),
       withdraw: () => Effect.void,
       setModel: () => Effect.void,
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
@@ -154,6 +156,95 @@ const setup = Effect.gen(function* () {
   );
   return { kanban, board, card };
 });
+
+it.effect("card_ask warns when an ask cannot clear an open evaluator gate", () =>
+  Effect.gen(function* () {
+    const { kanban, board } = yield* setup;
+    const card = yield* kanban.createCard(
+      board.id,
+      {
+        title: "Merge",
+        prompt: "Work",
+        subtasks: [
+          { text: "Write code", owner: "work" },
+          { text: "Review", owner: "review" },
+          { text: "Check CI", owner: "evaluator" },
+          { text: "Merge after review (no deploy)", owner: "evaluator", gate: "deploy" },
+        ],
+      },
+      owner,
+    );
+    const unnamed = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      kind: "signoff",
+      question: "Do you approve the merge?",
+      title: "Sign off: PR #1288 merged into native-v1 (CI/test only)",
+    });
+    assert.isFalse(unnamed.isError, unnamed.text);
+    assert.strictEqual(
+      unnamed.structured.note,
+      "This ask won't clear s4 (deploy). Name s4 in the text if it should.",
+    );
+    assert.strictEqual((yield* kanban.card(card.id)).card.asks.length, 1);
+    for (const fields of [
+      { question: "Approve s4: merge PR #1288" },
+      { question: "Approve the merge?", title: "Approve s4" },
+      { question: "Approve the merge?", action: { summary: "Approve s4" } },
+      { question: "Deploy the build?" },
+    ]) {
+      const named = yield* call(evaluator, "card_ask", { card: card.id, ...fields });
+      assert.isFalse(named.isError, named.text);
+      assert.notProperty(named.structured, "note");
+    }
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("card_ask has no gate warning for work, review or ungated steps", () =>
+  Effect.gen(function* () {
+    const { kanban, board } = yield* setup;
+    const card = yield* kanban.createCard(
+      board.id,
+      {
+        title: "Work",
+        prompt: "Work",
+        subtasks: [
+          { text: "Fix the deploy code", owner: "work" },
+          { text: "Review the deploy code", owner: "review" },
+          { text: "Check CI", owner: "evaluator" },
+        ],
+      },
+      owner,
+    );
+    const asked = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      question: "Close the card?",
+    });
+    assert.isFalse(asked.isError, asked.text);
+    assert.notProperty(asked.structured, "note");
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("card_ask respects the board's disabled guessed gates", () =>
+  Effect.gen(function* () {
+    const { kanban, board } = yield* setup;
+    yield* kanban.updateBoard(board.id, { guessedGates: [] });
+    const card = yield* kanban.createCard(
+      board.id,
+      {
+        title: "Work",
+        prompt: "Work",
+        subtasks: [{ text: "Deploy the build", owner: "script" }],
+      },
+      owner,
+    );
+    const asked = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      question: "Close the card?",
+    });
+    assert.isFalse(asked.isError, asked.text);
+    assert.notProperty(asked.structured, "note");
+  }).pipe(Effect.provide(testLayer())),
+);
 
 it.effect("card_ask takes a template with blocks and answers with a small summary", () =>
   Effect.gen(function* () {

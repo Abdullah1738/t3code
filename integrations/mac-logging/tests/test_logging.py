@@ -135,7 +135,8 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(a['props']['snapshotAgeS'],1)
         self.assertNotIn('snapshotAgeS', b['props'])
         self.assertEqual(b['props']['resticExitCode'],3)
-        self.assertNotIn('password',str(self.rows()))
+        self.assertNotIn('banned',str(self.rows()))
+        self.assertNotIn('failed with password',str(self.rows()))
 
     def test_cve_entrypoint_and_fix_success_failure_no_commands(self):
         cve=load('cve_test',REPO/'integrations/cve-sweep/cve-sweep')
@@ -187,10 +188,17 @@ class LoggingTests(unittest.TestCase):
             p=reports/name;p.write_text('{"app_name":"Finder","bug_type":"309"}\nprivate stack')
             os.utime(p,(now-100,now-100))
         reader=lambda a,b: {('restart','kernel'):1} if a==now-3600 else {}
+        toollog.emit('backup', 'perf', 'backup.run', ok=True,
+                     now=dt.datetime.fromtimestamp(now-86400, dt.timezone.utc),
+                     props={'target':'memory', 'skipped':1})
         self.assertTrue(collector.collect(now, [reports], reader))
         observed=[r for r in self.rows() if r['name']=='crash.observed']
         self.assertEqual(sum(r['props']['count'] for r in observed),4)
         self.assertTrue((self.logs/'rollup-2026-11-12.json').exists())
+        rollup_props = next(r['props'] for r in self.rows() if r['name']=='log.rollup')
+        self.assertEqual(rollup_props['backup.skipped_runs.memory'], 1)
+        self.assertEqual(rollup_props['backup.ok_runs.memory'], 0)
+        self.assertEqual(rollup_props['backup.skipped_runs.health'], 0)
         collector.collect(now+1,[reports],lambda a,b:{})
         self.assertEqual(len([r for r in self.rows() if r['name']=='crash.observed']),4)
         collector.collect(now+2,[reports],lambda a,b: (_ for _ in ()).throw(RuntimeError('secret')))
@@ -225,18 +233,28 @@ class LoggingTests(unittest.TestCase):
         from types import SimpleNamespace
         cache=self.root/'cache';cache.mkdir()
         worktree=self.root/'worktree';worktree.mkdir()
+        for root in (cache,worktree):
+            (root/'child').mkdir()
+        def make_due():
+            state=jobs.read_state('disk-inventory')
+            for children in state.get('childState',{}).values():
+                for value in children.values():
+                    value['at']-=86400
+            jobs.save_state('disk-inventory',state)
         value=[100]
         def run(cmd,**kwargs):
-            self.assertEqual(cmd[:2],['/usr/bin/du','-sk'])
+            self.assertEqual(cmd[:2],['/usr/bin/du','-skl'])
             return SimpleNamespace(returncode=0,stdout=str(value[0])+'\t'+cmd[-1])
         jobs.directory_inventory([cache,worktree],run)
         jobs.disk_sample(self.root,self.root,volumes=(self.root,self.root),paths=[])
         value[0]=200
+        make_due()
         jobs.directory_inventory([cache,worktree],run)
         jobs.disk_sample(self.root,self.root,volumes=(self.root,self.root),paths=[])
         row=self.rows()[-1]
         self.assertEqual(row['props']['count'],2)
         self.assertGreater(row['props']['grower1DeltaGb'],0)
+        make_due()
         jobs.directory_inventory([cache],lambda *a,**kw: SimpleNamespace(returncode=1,stdout='private error'))
         self.assertFalse(self.rows()[-1]['ok'])
         self.assertEqual(self.rows()[-1]['name'],'disk.inventory')
@@ -665,7 +683,7 @@ class DiskProbeTests(unittest.TestCase):
             self.assertFalse(jobs.state_path('disk-tooling-pid').exists())
             if outcome == 'error':
                 self.assertTrue(self.child.reaped)
-        with patch.object(collector, 'directory_inventory'), patch.object(collector, 'collect') as collect, \
+        with patch.object(collector, 'disk_wait'), patch.object(collector, 'directory_inventory'), patch.object(collector, 'collect') as collect, \
              patch.object(collector, 'state_path', side_effect=OSError('private state failure')):
             collector.main()
             collect.assert_called_once()

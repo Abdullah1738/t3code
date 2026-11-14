@@ -191,7 +191,7 @@ test("files atomically queue bytes and descriptors, dedupe across handlers, and 
   const response = await h.post("/files", file);
   const id = `file:${hash(file.dedupeKey)}`;
   expect(response.status).toBe(202);
-  expect(await response.json()).toEqual({ id, created: true });
+  expect(await response.json()).toEqual({ id, created: true, chat: "owner" });
   const data = Buffer.from(file.base64, "base64");
   const attachment = { sha256: createHash("sha256").update(data).digest("hex"), name: file.name, mimeType: file.mimeType, size: data.length };
   expect(h.store.getOperation(id)).toEqual({ id, kind: "conversation", text: file.text, attachment,
@@ -204,7 +204,7 @@ test("files atomically queue bytes and descriptors, dedupe across handlers, and 
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(file),
   }));
   expect(replay.status).toBe(200);
-  expect(await replay.json()).toEqual({ id, created: false });
+  expect(await replay.json()).toEqual({ id, created: false, chat: "owner" });
   expect(h.store.getOperation(id)?.state).toBe("sent");
   const concurrent = await Promise.all(Array.from({ length: 8 }, () => h.post("/files", { ...file, dedupeKey: "concurrent" })));
   expect(concurrent.map(res => res.status).sort()).toEqual([200, 200, 200, 200, 200, 200, 200, 202]);

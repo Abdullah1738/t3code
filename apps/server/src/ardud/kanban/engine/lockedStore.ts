@@ -14,31 +14,30 @@ export const wrap = (
     write = false,
     collection = false,
   ) =>
-    store
-      .card(id)
-      .pipe(
-        Effect.flatMap((row) =>
-          row
-            ? locks.access(row.boardId, effect, write, collection ? undefined : `card:${id}`)
-            : effect,
-        ),
-      );
+    store.card(id).pipe(
+      locks.dispatchRead,
+      Effect.flatMap((row) =>
+        row
+          ? locks.access(row.boardId, effect, write, collection ? undefined : `card:${id}`)
+          : effect,
+      ),
+    );
   const discussion = <A, E, R>(
     id: Parameters<KanbanStoreShape["discussion"]>[0],
     effect: Effect.Effect<A, E, R>,
     write = false,
   ) =>
-    store
-      .discussion(id)
-      .pipe(
-        Effect.flatMap((row) =>
-          row ? locks.access(row.boardId, effect, write, `discussion:${id}`) : effect,
-        ),
-      );
+    store.discussion(id).pipe(
+      locks.dispatchRead,
+      Effect.flatMap((row) =>
+        row ? locks.access(row.boardId, effect, write, `discussion:${id}`) : effect,
+      ),
+    );
   const thread = <A, E, R>(id: string, effect: Effect.Effect<A, E, R>) =>
-    store
-      .threadLink(id)
-      .pipe(Effect.flatMap((row) => (row ? locks.access(row.boardId, effect) : effect)));
+    store.threadLink(id).pipe(
+      locks.dispatchRead,
+      Effect.flatMap((row) => (row ? locks.access(row.boardId, effect) : effect)),
+    );
   return {
     ...store,
     boards: locks.observe(store.boards),
@@ -47,11 +46,14 @@ export const wrap = (
     putBoardWithPools: (row, pools, application) =>
       locks.access(row.id, store.putBoardWithPools(row, pools, application), true, "board"),
     cards: (id) => locks.access(id, store.cards(id)),
+    schedulingCards: (id) => locks.access(id, store.schedulingCards(id)),
+    claimCards: (id, seeds) => locks.access(id, store.claimCards(id, seeds)),
     dispatchCards: (id) => locks.access(id, store.dispatchCards(id)),
     openCards: (id) => locks.access(id, store.openCards(id)),
     summaryCards: (id) => locks.access(id, store.summaryCards(id)),
     card: (id) => card(id, store.card(id)),
     cardByNumber: (id, number) => locks.access(id, store.cardByNumber(id, number)),
+    poolThreadIds: (id, pool) => locks.access(id, store.poolThreadIds(id, pool)),
     cardsByThread: (id) => thread(id, store.cardsByThread(id)),
     nextCardNumber: (id) => locks.access(id, store.nextCardNumber(id)),
     putCard: (row) => locks.access(row.boardId, store.putCard(row), true, `card:${row.id}`),

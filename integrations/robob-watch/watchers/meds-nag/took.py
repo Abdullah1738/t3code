@@ -9,7 +9,7 @@ try:
 except Exception:
     _tl = None
 with (_tl.run('took', _log_sys.argv[1:], name='cli.run')
-      if _tl is not None and __name__ == '__main__' else _log_context.nullcontext()):
+      if _tl is not None and __name__ == '__main__' else _log_context.nullcontext()) as _took_log:
     # Confirm a dose: ./took.py [YYYY-MM-DD] all|name[=2mg][:L|R]... (also test:R=100mg)
     # Skip a dose:     ./took.py [YYYY-MM-DD] skip <name>... [--note "text"]   (writes moved.json, never taken.json)
     import json, os, sys, datetime as dt, re
@@ -147,6 +147,8 @@ with (_tl.run('took', _log_sys.argv[1:], name='cli.run')
                 except (ValueError, OverflowError) as e: sys.exit(str(e) + "\n" + USAGE)
             active = mc.active_snoozes(); active[name] = until.isoformat()
             write_snoozes(active)
+            mc.outcome_action("snooze", day, MEDS if name == "all" else [name],
+                              mc.load("taken.json", {}))
             show_snoozed()
         raise SystemExit(0)
     def show_open(day, t):
@@ -196,7 +198,10 @@ with (_tl.run('took', _log_sys.argv[1:], name='cli.run')
     if not names or any(x not in MEDS for x in names): sys.exit(USAGE)
     closes = [(label, date) for label, date in mc.carried(dt.date.fromisoformat(day), t) if mc.key(label) in names]
     flags = record_amounts(day, t, amounts) if amounts else []
+    before_taken = dict(t)
     t[day] = sorted(set(t.get(day, []) + names)); json.dump(t, open(p,"w"), indent=1); print(day, t[day])
+    mc.outcome_action("resolve", dt.date.fromisoformat(day), names, before_taken,
+                      getattr(_took_log, 'run_id', None))
     for flag in flags: print(flag)
     for label, date in closes: print("closes %s from %s" % (label, date.strftime("%a %-d %b")))
     prune_snoozes()

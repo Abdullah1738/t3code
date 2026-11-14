@@ -33,12 +33,32 @@ class Router:
         # Exact allowlist prevents accidentally polling a mutating GET endpoint.
         if route not in ('/api/providers', '/api/usage/logs', '/api/usage/stats?period=today'):
             raise ValueError('route not allowed')
-        request = urllib.request.Request(BASE + route, method='GET', headers={'x-9r-cli-token': self.auth, 'accept': 'application/json'})
-        with self.opener.open(request, timeout=8) as response:
-            raw = response.read(4 * 1024 * 1024 + 1)
-            if len(raw) > 4 * 1024 * 1024:
-                raise ValueError('response too large')
-            return json.loads(raw)
+        start = time.monotonic()
+        status = 0
+        ok = False
+        error_tag = None
+        try:
+            request = urllib.request.Request(BASE + route, method='GET', headers={'x-9r-cli-token': self.auth, 'accept': 'application/json'})
+            with self.opener.open(request, timeout=8) as response:
+                status = response.status
+                raw = response.read(4 * 1024 * 1024 + 1)
+                if len(raw) > 4 * 1024 * 1024:
+                    raise ValueError('response too large')
+                result = json.loads(raw)
+                ok = True
+                return result
+        except Exception as error:
+            if isinstance(error, urllib.error.HTTPError):
+                status = error.code
+                error_tag = 'http_' + str(status)
+            else:
+                error_tag = 'request_failed'
+            raise
+        finally:
+            emit('poller', 'endpoint.get', kind='perf', ok=ok,
+                 durationMs=(time.monotonic() - start) * 1000,
+                 props={'endpoint': route.split('?')[0], 'status': status},
+                 **({'error': {'tag': error_tag}} if error_tag else {}))
 
 
 def locked(value, now):

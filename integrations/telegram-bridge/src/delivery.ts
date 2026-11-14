@@ -12,6 +12,7 @@ type Options = {
   beforeSend?: (item: OutboxRecord) => Promise<"send" | "wait" | "cancel">;
   log?: (event: string, code?: string) => void;
   sleep?: (ms: number) => Promise<void>;
+  askNotified?: (key: string, at: number) => Promise<void>;
 };
 type Checkpoint = { accepted: boolean; providerId?: number };
 const RETRY_WINDOW = 24 * 60 * 60 * 1_000;
@@ -73,8 +74,25 @@ export class Delivery {
     this.store.db.transaction(() => {
       this.store.outboxState(id, "sent", providerId);
       this.store.set(`acceptedAt:${id}`, this.store.get<number>(`acceptedAt:${id}`) ?? Date.now());
+      const key = this.store.get<string>(`ask-timing-key:${id}`);
+      if (key !== undefined && !this.store.get<boolean>(`ask-timing-reported:${id}`)) this.store.set(`ask-timing-pending:${id}`, { key, at: this.store.get<number>(`acceptedAt:${id}`)! });
     }).immediate();
     this.options.log?.("outbound-accepted");
+  }
+
+  private async reportAskTimings(): Promise<void> {
+    if (!this.options.askNotified) return;
+    const rows = this.store.db.query<{ key: string; value: string }, []>(
+      "SELECT key, value FROM kv WHERE key LIKE 'ask-timing-pending:%' ORDER BY key LIMIT 100",
+    ).all();
+    for (const row of rows) {
+      const receipt = JSON.parse(row.value) as { key: string; at: number };
+      try {
+        await this.options.askNotified(receipt.key, receipt.at);
+        this.store.set(row.key.replace("ask-timing-pending:", "ask-timing-reported:"), true);
+        this.store.db.query("DELETE FROM kv WHERE key = ?").run(row.key);
+      } catch (error) { toolError("telegram", "tg.askTiming.receipt", undefined, error); break; }
+    }
   }
 
   private failed(item: OutboxRecord, state: string, wasAmbiguous: boolean, failure: SendFailure): void {
@@ -96,6 +114,7 @@ export class Delivery {
 
   private async run(): Promise<void> {
     if (!this.options.enabled()) return;
+    await this.reportAskTimings();
     const boundChat = this.options.chatId();
     if (boundChat === undefined) return;
     flushBursts(this.store);
@@ -233,6 +252,9 @@ export class Delivery {
         this.store.db.transaction(() => {
           this.store.set(chunkKey, { accepted: true, providerId: result.providerId } satisfies Checkpoint);
           this.store.set(`acceptedAt:${item.id}`, this.store.get<number>(`acceptedAt:${item.id}`) ?? Date.now());
+          const askKey = this.store.get<string>(`ask-timing-key:${item.id}`);
+          if (askKey !== undefined && !this.store.get<boolean>(`ask-timing-reported:${item.id}`))
+            this.store.set(`ask-timing-pending:${item.id}`, { key: askKey, at: this.store.get<number>(`acceptedAt:${item.id}`)! });
           if (result.providerId !== undefined) {
             const key = `provider-operation:${result.providerId}`;
             const existing = this.store.get<string>(key) ?? this.store.byProviderId(result.providerId)?.id;

@@ -12,6 +12,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+import order_card
 import os as _os, tempfile as _tempfile
 # The live card-status record must never decide these tests.
 _os.environ['CARD_STATUS_FILE']=_os.path.join(_tempfile.mkdtemp(prefix='card-status-test-'),'card-status.json')
@@ -53,7 +54,7 @@ class FreebieTests(unittest.TestCase):
     def review(self,data):
         return c.m.review_snapshot(snapshot(data),expected_skus=[c.m.sku_line('SYNTHETIC_SHAKE',1)],
             expected_total_minor=2050,required_preferences=['synthetic_leave','synthetic_quiet'],
-            card=c.m.SavedCard('synthetic-payment-token','xxxx2342','mastercard'))
+            card=c.m.SavedCard('synthetic-payment-token','xxxx' + order_card.LAST4,order_card.NETWORK))
 
     def test_recorded_freebie_with_qtymax_zero_passes_and_is_digest_bound(self):
         data=fixture();data['items'].insert(0,gift())

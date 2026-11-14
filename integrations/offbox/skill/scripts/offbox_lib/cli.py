@@ -24,6 +24,7 @@ and up, else on a boat.dev VM.
   offbox save [--name N] [--default] [--note ..] | bases | base rm N | keep [--days N]
   offbox local --reason ".." [--ttl 2h] | --list | --clear
   offbox list [--all] | release [<id>|--mine] [--delete] | ssh [<id>] [-- cmd] | ports <port> [--local N] [--reverse]
+  offbox exec [<id>] [--timeout N] [--cwd DIR] [--json] -- <cmd...>   owner-checked control API, no SSH
   offbox spend [--json] [--check] | reap [--dry-run] | status | whoami | template build <name> | template list
 Light Go checks (single-package go test -run, go vet of 1-3 packages, gofmt -l) run on this Mac in a sandbox;
 --remote forces the box.
@@ -31,7 +32,7 @@ Exit codes: the command's code (last stderr line: "offbox: remote exit N" or "of
 failure; 91 spend cap; 92 pool busy for the whole queue wait (nothing ran; retry). Only small commands may fall back locally after 90/91/92.
 With a home server: 93 a person's task while the home server is down (it waits; never sent to Boat; nothing ran);
 94 the home server restarted under the run and it was not run again (--no-retry, a person's task, or already retried once).
-96 local state failure (no local fallback).
+96 local state failure (no local fallback); 100 queued client ended before getting a box (nothing ran, safe to rerun).
 95 Robob restarted: the remote run detached and keeps going (offbox wait <run-id>)."""
 
 
@@ -92,6 +93,12 @@ def build_parser() -> argparse.ArgumentParser:
     sh = sp.add_parser("ssh")
     sh.add_argument("box_id", nargs="?")
     sh.add_argument("cmd", nargs=argparse.REMAINDER)
+    ex = sp.add_parser("exec", help="run on your box through the control API, without SSH",
+                       usage="offbox exec [box_id] [--timeout N] [--cwd DIR] [--json] -- <command...>")
+    ex.add_argument("--timeout", type=int, default=60, metavar="N", help="seconds (default: 60; clamped to 1..600)")
+    ex.add_argument("--cwd", metavar="DIR", help="working directory on the box")
+    ex.add_argument("--json", action="store_true", help="print the raw result dict")
+    ex.add_argument("cmd", nargs="*", metavar="box_id/command")
     po = sp.add_parser("ports")
     po.add_argument("remote_port", type=int)
     po.add_argument("--local", type=int)
@@ -129,6 +136,18 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("name", nargs="?")
     t.add_argument("--json", action="store_true")
     return p
+
+
+def parse_args(argv: list[str]):
+    # Parse exec's options before its separator, including options after a box ID. The shell command after it
+    # is opaque: flags there belong to the remote program, even when they look like offbox's own options.
+    p = build_parser()
+    if argv[:1] == ["exec"] and "--" in argv:
+        separator = argv.index("--")
+        a = p.parse_args(argv[:separator])
+        a.cmd.extend(argv[separator + 1:])
+        return a
+    return p.parse_args(argv)
 
 
 def _remote_once(a, me) -> int:
@@ -194,6 +213,13 @@ def _cmd_run(a, me) -> int:
     if not a.cmd:
         say("usage: offbox run [opts] -- <cmd...>  or  offbox run --step CMD [--step CMD ...]")
         return 2
+    if os.environ.get(runs.BACKGROUND_RUN_ENV):
+        return runs.background_client(a, me)
+    return _run_with_retries(a, me)
+
+
+def _run_with_retries(a, me) -> int:
+    from . import capacity, fallback, runs
     # No local-first lane any more (owner, 13 Nov 2026): it existed to save boat.dev minutes, and home boxes cost
     # nothing. Every `offbox run` goes to a box; --remote stays as "never fall back to the Mac".
     log("remote")
@@ -232,6 +258,7 @@ def _cmd_run(a, me) -> int:
                 with outage.allocation_budget(remaining):
                     return _remote_once(a, me)
             except OffboxError as e:
+                runs.retry_background(e)
                 if isinstance(e, pool.PoolBusyError) and waited_from is not None and last_outage is not None and \
                         time.monotonic() - waited_from >= outage.window_seconds() and not e.started:
                     raise last_outage
@@ -275,7 +302,7 @@ def _cmd_run(a, me) -> int:
         if e.code not in (EXIT_INFRA, EXIT_CAP, EXIT_BUSY):
             say(str(e))
             return e.code
-        if e.code == EXIT_INFRA and not isinstance(e, capacity.CapacityError):
+        if e.code == EXIT_INFRA and not isinstance(e, capacity.CapacityError) and not api.client_budget_expired(e):
             fallback.note_infra_failure(str(e))
         if e.started:
             from .start_check import hint
@@ -341,10 +368,9 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    p = build_parser()
-    a = p.parse_args(argv)
+    a = parse_args(argv)
     if not a.sub:
-        p.print_help()
+        build_parser().print_help()
         return 2
     from . import bases, home, misc, reap, spend
     from .identity import whoami
@@ -356,6 +382,9 @@ def _main(argv: list[str] | None = None) -> int:
         if a.sub == "reap":
             toollog.rollup_previous()
         me = whoami()
+        if a.sub == "exec":
+            from . import execute
+            return execute.command(a, me)
         reason = f" reason={common._BACKEND_REASON}" if common._BACKEND_REASON else ""
         if a.sub == "run" and common._BACKEND_REASON == "boat-only-base":
             say(f"running on Boat because base '{a.base}' lives only on the Boat standby")

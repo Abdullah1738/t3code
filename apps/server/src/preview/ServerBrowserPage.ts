@@ -227,8 +227,56 @@ export const within = async <A>(
     .finally(() => clearTimeout(timer));
 };
 
+// A desktop guest must stay on its composited surface between the paint probe and copy.
+// Per-command relay holds otherwise remove it as soon as the probe's evaluation answers.
+const paintUses = new WeakMap<CDPSession, { uses: number; ready: Promise<unknown> }>();
+const withPaint = async <A>(
+  cdp: CDPSession,
+  enabled: boolean,
+  work: () => Promise<A>,
+  signal?: AbortSignal,
+) => {
+  signal?.throwIfAborted();
+  if (!enabled) return work();
+  let hold = paintUses.get(cdp);
+  if (!hold) {
+    hold = { uses: 0, ready: cdp.send("Emulation.setFocusEmulationEnabled", { enabled: true }) };
+    paintUses.set(cdp, hold);
+  }
+  hold.uses += 1;
+  const controller = new AbortController();
+  let onAbort = constVoid;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal?.reason);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([
+      (async () => {
+        await within(
+          hold.ready,
+          500,
+          "No fresh paint from the preview tab; paint wake did not answer",
+        );
+        controller.signal.throwIfAborted();
+        signal?.throwIfAborted();
+        return work();
+      })(),
+      aborted,
+    ]);
+  } finally {
+    controller.abort();
+    signal?.removeEventListener("abort", onAbort);
+    if (--hold.uses === 0) {
+      paintUses.delete(cdp);
+      // A frozen renderer must not hold up the caller's timeout or keep its guest painting.
+      void cdp.send("Emulation.setFocusEmulationEnabled", { enabled: false }).catch(constVoid);
+    }
+  }
+};
+
 /** Two animation frames let the layout change reach the compositor before copying pixels. */
-export const waitForPaint = async (cdp: CDPSession, signal?: AbortSignal) => {
+export const waitForPaint = async (cdp: CDPSession, signal?: AbortSignal, timeoutMs = 2_000) => {
   const controller = new AbortController();
   const check = () => {
     controller.signal.throwIfAborted();
@@ -255,7 +303,7 @@ export const waitForPaint = async (cdp: CDPSession, signal?: AbortSignal) => {
   try {
     await within(
       paint(),
-      2_000,
+      timeoutMs,
       "No fresh paint from the preview tab; its background surface or renderer did not answer",
     );
   } finally {
@@ -539,12 +587,15 @@ export const waitForViewport = async (
       acknowledged &&
       (!desired || (viewport.width === desired.width && viewport.height === desired.height))
     ) {
-      await waitForPaint(cdp);
-      const applied = await within(
-        readPageMetrics(cdp),
-        Math.max(1, deadline - Date.now()),
-        "Preview resize metrics did not answer after paint",
-      );
+      const applied = await withPaint(cdp, metrics.desktopViewport !== undefined, async () => {
+        // Reserve half the remaining resize budget for the confirming metrics read.
+        await waitForPaint(cdp, undefined, Math.max(1, Math.floor((deadline - Date.now()) / 2)));
+        return within(
+          readPageMetrics(cdp),
+          Math.max(1, deadline - Date.now()),
+          "Preview resize metrics did not answer after paint",
+        );
+      });
       const appliedDesired = expected ?? (requireFill ? applied.desktopViewport : undefined);
       if (
         (requireFill && applied.desktopViewport?.mode !== "fill") ||
@@ -568,16 +619,37 @@ export const waitForViewport = async (
 // in any capture it shrinks.
 export const captureViewport = async (
   cdp: CDPSession,
-  options: { readonly format: "png" | "jpeg"; readonly quality?: number },
+  options: {
+    readonly format: "png" | "jpeg";
+    readonly quality?: number;
+    readonly keepPaintable?: boolean;
+  },
   signal?: AbortSignal,
 ) => {
-  await waitForPaint(cdp, signal);
-  signal?.throwIfAborted();
-  const { data } = await cdp.send("Page.captureScreenshot", {
-    format: options.format,
-    ...(options.quality === undefined ? {} : { quality: options.quality }),
-  });
-  return data;
+  const controller = new AbortController();
+  const lifetime = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+  try {
+    return await within(
+      withPaint(
+        cdp,
+        options.keepPaintable === true,
+        async () => {
+          await waitForPaint(cdp, lifetime);
+          lifetime.throwIfAborted();
+          const { data } = await cdp.send("Page.captureScreenshot", {
+            format: options.format,
+            ...(options.quality === undefined ? {} : { quality: options.quality }),
+          });
+          return data;
+        },
+        lifetime,
+      ),
+      4_000,
+      "Snapshot pixels did not arrive; background paint or the screenshot queue is stalled",
+    );
+  } finally {
+    controller.abort();
+  }
 };
 
 /** Runs in the page's own isolated world, as the server has no image library. */
@@ -690,7 +762,11 @@ const capture = async (
     input.captureImage === false
       ? Promise.resolve(undefined)
       : within(
-          captureViewport(input.cdp, { format: "png" }, input.signal).then((png) => {
+          captureViewport(
+            input.cdp,
+            { format: "png", keepPaintable: input.renderScale === "display" },
+            input.signal,
+          ).then((png) => {
             input.signal?.throwIfAborted();
             return scale < 1 ? shrinkPng(input.cdp, png, scale) : png;
           }),

@@ -32,12 +32,13 @@ test("an entire message/error fixture cannot leak text, secrets, health values o
   const { root, log } = setup();
   const message = { id: "m-fixture", text: "PRIVATE_MESSAGE_SENTINEL", prompt: "PRIVATE_PROMPT_SENTINEL", attachments: [], token: "TOKEN_SENTINEL", otp: "654321", health: 83.7 };
   log.write({ ...entry, ...message, kind: "error", error: { tag: "fixture.failed", message: "Bearer TOKEN_SENTINEL PRIVATE_MESSAGE_SENTINEL" },
-    ids: { text: message.text, token: message.token, messageId: message.id, password: "PASSWORD_SENTINEL", card: "4111111111111111" },
+    ids: { text: message.text, token: message.token, messageId: message.id, inboundId: message.id, password: "PASSWORD_SENTINEL", card: "4111111111111111" },
     props: { text: message.text, token: message.token, otp: message.otp, count: 2, body: "EMAIL_BODY_SENTINEL", value: 83.7, caption: "PRIVATE_CAPTION" } });
   const raw = readFileSync(join(root, `${day}.ndjson`), "utf8");
   for (const secret of [message.text, message.prompt, message.token, message.otp, "83.7", "PASSWORD_SENTINEL", "4111111111111111", "EMAIL_BODY_SENTINEL", "PRIVATE_CAPTION"]) expect(raw).not.toContain(secret);
+  expect(JSON.parse(raw).ids.inboundId).toBe(message.id);
   expect(JSON.parse(raw).props).toEqual({ count: 2 });
-  expect(JSON.parse(raw).error).toEqual({ tag: "fixture.failed", message: "Operation failed" });
+  expect(JSON.parse(raw).error).toEqual({ tag: "fixture.failed", name: "UnknownError", message: "[redacted]" });
 });
 
 test("retention runs on the first write of each UTC day and touches only old log artifacts", () => {
@@ -57,7 +58,7 @@ test("cap suppresses event/perf, retains errors and emits one notice across writ
   log.write(entry); log.write(entry); log.write({ ...entry, kind: "event" });
   createToolLog({ root, now: () => at, capBytes: 1 }).write(entry);
   log.write({ ...entry, kind: "error", name: "reply.failed", ok: false, error: { tag: "stop_opt_out", message: "private" } });
-  expect(lines().map(l => l.name)).toEqual(["turn.robob_call", "log.cap", "reply.failed"]);
+  expect(lines().map(l => l.name)).toEqual(["turn.robob_call", "log.degraded", "reply.failed"]);
 });
 
 test("all logging failures, malformed input and optional attribution failures are swallowed", async () => {
@@ -86,6 +87,41 @@ test("fixture rollup counts names/kinds, rates, percentiles and top tags with on
   expect(result?.topErrorTags[0].sampleId).toBe("msg-fixture");
   expect(statSync(join(root, `rollup-${day}.json`)).mode & 0o777).toBe(0o600);
   expect(await log.rollup("../bad")).toBeUndefined();
+});
+
+test("rollup joins unique inbound chains per chat using first start and first accepted reply", async () => {
+  let time = at;
+  const { log } = setup({ now: () => time });
+  const emit = (name: string, chat: string, id: string, ms: number) => {
+    time = at + ms;
+    log.write({ component: "fixture", kind: "event", name, ...(name === "reply.sent" ? { ok: true } : {}),
+      ids: { chat, ...(name === "msg.received" ? { messageId: id } : { messageId: "different-turn-id", inboundId: id }) } });
+  };
+  for (let i = 1; i <= 100; i++) {
+    emit("msg.received", "owner", `in-${i}`, 0);
+    emit("turn.start", "owner", `in-${i}`, i);
+    emit("reply.sent", "owner", `in-${i}`, i * 10);
+    emit("reply.sent", "owner", `in-${i}`, i * 10 + 1);
+  }
+  emit("msg.received", "owner", "in-1", 5000); // Replayed receipt cannot move the clock.
+  emit("msg.received", "owner", "unanswered", 0);
+  emit("turn.start", "owner", "unanswered", 200);
+  emit("msg.received", "moni", "in-1", 0); // Same id in another chat is independent.
+  emit("reply.sent", "moni", "in-1", 500);
+  emit("turn.start", "moni", "in-1", 100); // File order need not be time order.
+  emit("msg.received", "moni", "backwards", 1000);
+  emit("turn.start", "moni", "backwards", 900);
+  emit("reply.sent", "moni", "backwards", 900);
+  emit("reply.sent", "moni", "unmatched", 500);
+  log.write({ component: "fixture", name: "turn.start", kind: "event", ids: { chat: "moni", messageId: "in-1" } });
+  const result = await log.rollup(day);
+  expect(result?.chains).toEqual({
+    owner: { received: 101, turnStarted: 101, replySent: 100, completed: 100,
+      receivedToStartMs: { p50: 51, p95: 96, max: 200 }, receivedToReplyMs: { p50: 500, p95: 950, max: 1000 } },
+    moni: { received: 2, turnStarted: 1, replySent: 1, completed: 1,
+      receivedToStartMs: { p50: 100, p95: 100, max: 100 }, receivedToReplyMs: { p50: 500, p95: 500, max: 500 } },
+  });
+  expect(JSON.stringify(result?.chains)).not.toContain("in-1");
 });
 
 test("first tick after 00:05 UTC rolls up yesterday, once across restarts", async () => {
@@ -177,6 +213,7 @@ test.each([
   // Older or externally supplied input must pass the same filter when aggregated.
   appendFileSync(join(root, `${day}.ndjson`), JSON.stringify({ ...row, ts: `${day}T12:00:00.000Z`, tool: "imessage" }) + "\n");
   const rollup = await log.rollup(day);
-  expect(rollup?.topErrorTags).toEqual([{ tag: expected, count: 2, sampleId: "msg-fixture" }]);
+  expect(rollup?.topErrorTags).toHaveLength(1);
+  expect(rollup?.topErrorTags[0]).toMatchObject({ tag: expected, count: 2, sampleId: "msg-fixture" });
   expect(JSON.stringify(rollup)).not.toContain("PRIVATE_MESSAGE");
 });

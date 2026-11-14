@@ -8,6 +8,7 @@ import {
 import { kanbanAskResponse, type KanbanAskFeedItem } from "@t3tools/contracts";
 import { useImperativeHandle, useRef, useState, type RefObject } from "react";
 
+import { askTimingRef } from "./useAskTiming";
 import { cn } from "../../../lib/utils";
 import { GrowingText, Problem } from "./AnswerParts";
 import type { AskReaderHandle } from "./AskReader";
@@ -402,7 +403,11 @@ function AskList(props: {
         </li>
       ) : null}
       {props.entries.map((entry, index) => (
-        <li key={askKey(entry)} className="flex min-w-0 items-baseline gap-3 px-3.5 py-2.5 text-sm">
+        <li
+          ref={askTimingRef(entry.cardId, entry.ask.id)}
+          key={askKey(entry)}
+          className="flex min-w-0 items-baseline gap-3 px-3.5 py-2.5 text-sm"
+        >
           {left && onToggle ? (
             // The label is the target: 44 px under a finger, the box itself stays small.
             <label className="-m-2.5 flex p-2.5 pointer-coarse:-mx-3 pointer-coarse:-my-3.5 pointer-coarse:px-3 pointer-coarse:py-3.5">

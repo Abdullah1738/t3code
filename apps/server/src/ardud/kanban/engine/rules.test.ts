@@ -76,6 +76,7 @@ const board: KanbanBoard = {
     { name: "Default", steps: [opus] },
   ],
   defaultReviewChain: "Default",
+  standingApprovals: [],
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   setup: null,
   pause: null,
@@ -152,7 +153,10 @@ describe("checkMove", () => {
     expect(
       checkMove("cardThread", card({ activeThreadId: ThreadId.make("other") }), "needs_review").ok,
     ).toBe(false);
-    expect(checkMove("cardThread", card(), "needs_owner").ok).toBe(false);
+    expect(checkMove("cardThread", card(), "needs_owner").ok).toBe(true);
+    expect(
+      checkMove("cardThread", card({ activeThreadId: ThreadId.make("other") }), "needs_owner").ok,
+    ).toBe(false);
     expect(checkMove("cardThread", card({ stage: "needs_owner" }), "needs_review").ok).toBe(false);
   });
 
@@ -868,21 +872,20 @@ describe("planDispatch", () => {
     for (const entry of ranks.values()) held += entry.holds;
     expect(held).toBe(walkPerCard());
 
-    const median = (work: () => unknown) => {
-      const times: Array<number> = [];
-      for (let i = 0; i < 5; i += 1) {
-        const from = performance.now();
-        work();
-        times.push(performance.now() - from);
-      }
-      return times.toSorted((a, b) => a - b)[2]!;
-    };
-    const planMs = median(run);
-    const walkMs = median(walkPerCard);
-    // Measured on an M4: the whole plan about 5 ms, the walk per card alone about
-    // 95 ms. The ratio holds on a slow or busy machine where a fixed number would not.
-    expect(planMs * 4).toBeLessThan(walkMs);
-    expect(planMs).toBeLessThan(250);
+    walkPerCard();
+    let planMin = Infinity;
+    let walkMin = Infinity;
+    for (let i = 0; i < 9; i += 1) {
+      const planFrom = performance.now();
+      run();
+      planMin = Math.min(planMin, performance.now() - planFrom);
+      const walkFrom = performance.now();
+      walkPerCard();
+      walkMin = Math.min(walkMin, performance.now() - walkFrom);
+    }
+    // Interleaving shares contention across both paths; minimums exclude scheduling and GC pauses.
+    expect(planMin * 4).toBeLessThan(walkMin);
+    expect(planMin).toBeLessThan(250);
   });
 
   it("doesn't count done or settled cards as held up, and survives a loop of blocks", () => {

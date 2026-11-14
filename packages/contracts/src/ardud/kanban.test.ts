@@ -620,6 +620,7 @@ describe("kanbanBoardIcon", () => {
     expect(kanbanBoardIcon(decodeBoard({ ...stored, icon: "retired" }))).toBeNull();
     expect(decodeBoard(stored).iconImage).toBeNull();
     expect(decodeBoard(stored).nightlyReview).toBeNull();
+    expect(decodeBoard(stored).standingApprovals).toEqual([]);
   });
 
   it("takes only small inline pictures as a board image", () => {
@@ -1070,6 +1071,21 @@ describe("KanbanCard wait", () => {
     expect(Schema.decodeUnknownSync(KanbanCardDetail)(asEdits).card.wait?.script).toBe(
       "linear-state",
     );
+  });
+
+  it("round-trips optional wait target metadata and still reads old waits", () => {
+    const original = card("stored", { wait: wait({ on: "card", card: "foreign" as never }) });
+    const roundTrip = (value: KanbanCard) =>
+      Schema.decodeUnknownSync(KanbanCard)(Schema.encodeSync(KanbanCard)(value));
+    expect(roundTrip(original).wait?.cardTarget).toBeUndefined();
+    const cardTarget = {
+      id: "foreign" as never,
+      number: 73,
+      boardId: "board-foreign" as never,
+      boardName: "Foreign",
+    };
+    const shown = { ...original, wait: { ...original.wait!, cardTarget } };
+    expect(roundTrip(shown).wait?.cardTarget).toEqual(cardTarget);
   });
 
   it("drops the wait key, not sets it to undefined", () => {

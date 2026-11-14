@@ -915,9 +915,10 @@ class NoBoxYetTests(WaitLockTests):
         with patch.object(misc.os, 'kill', side_effect=ProcessLookupError), \
                 patch.object(runs, 'follow', side_effect=AssertionError('no box to attach to')):
             rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '30'], Clock())
-        self.assertEqual(rc, 90)
-        self.assertIn('never started, nothing ran', err)
-        self.assertIn('run-x: lost exit=None', out)
+        self.assertEqual(rc, common.EXIT_NOT_STARTED)
+        self.assertIn('never started:', err)
+        self.assertIn('nothing ran, safe to rerun', err)
+        self.assertNotIn('lost exit=None', out)
         status, box, pid, code = self.row()
         self.assertEqual((status, box, code), ('lost', None, None))
         self.assertEqual(self.con.execute("SELECT error FROM runs WHERE run_id='run-x'").fetchone()[0],
@@ -929,7 +930,7 @@ class NoBoxYetTests(WaitLockTests):
         self.con.commit()
         with patch.object(misc.os, 'kill'), patch.object(misc, '_pid_started_at', return_value=5000.0):
             rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '30'], Clock())
-        self.assertEqual(rc, 90)
+        self.assertEqual(rc, common.EXIT_NOT_STARTED)
         self.assertEqual(self.row()[0], 'lost')
 
     def test_nobox_wait_keeps_waiting_while_the_client_lives(self):

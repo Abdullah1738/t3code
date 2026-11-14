@@ -208,7 +208,7 @@ it.effect.each([
     stage: "dispatch",
     taskId: "task",
     message:
-      "delegate_task timed out during dispatch for thread caller. Task task may still be created; check it with task_status. Retry only with the same clientRequestId: retry.",
+      "delegate_task timed out during dispatch for thread caller. Task task may still be created; use task_status to check whether it was saved. Retry only with the same clientRequestId: retry.",
   },
   {
     code: "delegation_timeout",
@@ -248,4 +248,119 @@ it.effect.each([
     yield* TestClock.adjust("10 seconds");
     assert.equal((yield* Fiber.join(pending)).message, message);
   }),
+);
+
+it.effect.each(["catalog", "request_key", "receipt", "settings", "selection", "workspace"])(
+  "a pre-dispatch %s timeout says nothing was saved",
+  (stage) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const stopped = yield* Deferred.make<void>();
+      const pending = yield* McpDeadline.withDeadline(
+        Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.ensuring(Deferred.succeed(stopped, undefined)),
+        ),
+        {
+          code: "delegation_timeout",
+          stage,
+          threadId: ThreadId.make("caller"),
+          requestKey: "retry",
+        },
+      ).pipe(Effect.flip, Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("10 seconds");
+      assert.equal(
+        (yield* Fiber.join(pending)).message,
+        `delegate_task timed out during ${stage} for thread caller. Nothing was saved; retry the same call. Retry only with the same clientRequestId: retry.`,
+      );
+      yield* Deferred.await(stopped);
+    }),
+);
+
+it.effect.each([
+  { outcome: "committed", masked: false },
+  { outcome: "failed", masked: false },
+  { outcome: "capped", masked: false },
+  { outcome: "capped", masked: true },
+] as const)(
+  "a detached create logs $outcome (masked=$masked) and cleans up its watchdog",
+  ({ outcome, masked }) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const stopped = yield* Deferred.make<void>();
+      const capLogged = yield* Deferred.make<void>();
+      const settled = yield* Deferred.make<void>();
+      const logs: Array<Record<string, unknown>> = [];
+      const logger = Logger.make(({ message }) => {
+        if (!Array.isArray(message) || message[0] !== "MCP detached operation finished") return;
+        const fields: unknown = message[1];
+        if (typeof fields !== "object" || fields === null || !("outcome" in fields)) return;
+        logs.push({ ...fields });
+        Deferred.doneUnsafe(fields.outcome === "capped" ? capLogged : settled, Effect.void);
+      });
+      let commits = 0;
+      const operation = Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(Deferred.await(release)),
+        Effect.andThen(
+          outcome === "failed"
+            ? Effect.fail(
+                new OrchestratorMcpFailure({
+                  code: "orchestration_error",
+                  message: "create failed",
+                }),
+              )
+            : Effect.sync(() => {
+                commits++;
+              }),
+        ),
+        Effect.ensuring(Deferred.succeed(stopped, undefined)),
+      );
+      const pending = yield* McpDeadline.withDeadline(
+        masked ? Effect.uninterruptible(operation) : operation,
+        {
+          code: "delegation_timeout",
+          stage: "dispatch",
+          threadId: ThreadId.make("caller"),
+          requestKey: "retry",
+          taskId: "task",
+          onTimeout: "detach",
+        },
+      ).pipe(
+        Effect.flip,
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("10 seconds");
+      assert.equal((yield* Fiber.join(pending)).code, "delegation_timeout");
+      assert.equal(commits, 0);
+      assert.isFalse(yield* Deferred.isDone(stopped));
+      if (outcome === "capped") {
+        yield* TestClock.adjust("110 seconds");
+        yield* Deferred.await(capLogged);
+        assert.deepEqual(logs[0], {
+          outcome: "capped",
+          requestKey: "retry",
+          taskId: "task",
+          cancellationPending: true,
+        });
+        if (masked) assert.isFalse(yield* Deferred.isDone(stopped));
+      }
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(settled);
+      yield* Deferred.await(stopped);
+      const expectedCommits = outcome === "committed" || masked ? 1 : 0;
+      assert.equal(commits, expectedCommits);
+      if (outcome === "capped") {
+        assert.lengthOf(logs, 2);
+        assert.deepInclude(logs[1], { requestKey: "retry", taskId: "task", afterCap: true });
+        assert.oneOf(logs[1]!.outcome, ["committed", "failed"]);
+      } else assert.deepEqual(logs, [{ outcome, requestKey: "retry", taskId: "task" }]);
+      const logCount = logs.length;
+      yield* TestClock.adjust("2 minutes");
+      assert.equal(commits, expectedCommits);
+      assert.equal(logs.length, logCount);
+    }),
 );

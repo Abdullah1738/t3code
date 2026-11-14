@@ -15,12 +15,13 @@ from pathlib import Path
 import re
 import stat
 import sys
+from typing import TYPE_CHECKING
 import uuid
-import talabat_quote_diagnostics as quote_diagnostics
 
-from talabat_http_checkout import AsyncPaymentContext, PaymentResult
-from talabat_place_contract import PlaceObservation
 from commerce_journal import MAX_SQLITE_INTEGER
+
+if TYPE_CHECKING:
+    from talabat_http_checkout import AsyncPaymentContext, PaymentResult
 
 ROOT = Path.home() / '.local/state/app-api-cli/commerce'
 MAX_BYTES = 65536
@@ -122,7 +123,7 @@ class Receipt:
     balance_amount: str | None = None
     payment_id: str | None = None
     metadata: str | None = None
-    context: AsyncPaymentContext | None = None
+    context: 'AsyncPaymentContext | None' = None
     next_index: int | None = None
     # Account-stable ids this receipt legitimately re-records from a prior
     # terminal flow (Talabat grocery cart). Validated globally in _check_foreign.
@@ -139,9 +140,9 @@ class TalabatReadback:
     A terminal stored result must be handled before creating another poller.
     Nothing here can reconstruct Checkout or authorize place/payment.
     """
-    context: AsyncPaymentContext
+    context: 'AsyncPaymentContext'
     next_index: int
-    result: PaymentResult
+    result: 'PaymentResult'
     stopped: bool
 
 
@@ -154,6 +155,7 @@ class Snapshot:
         _require(self.binding.app == 'talabat', 'RECEIPT_NOT_TALABAT')
         records = [r for r in self.receipts if r.context is not None]
         _require(bool(records), 'RECEIPT_ASYNC_CONTEXT_UNAVAILABLE')
+        from talabat_http_checkout import PaymentResult
         r = records[-1]
         result = PaymentResult(r.state, r.reason, r.order_id, r.transaction_id, r.payment_id, r.metadata)
         # The rejected-auth poller stops; recovery may supply fresh verified auth
@@ -173,6 +175,7 @@ def _binding_wire(b):
 def _context_wire(c):
     if c is None:
         return None
+    from talabat_http_checkout import AsyncPaymentContext
     _require(type(c) is AsyncPaymentContext, 'RECEIPT_CONTEXT_INVALID')
     return dict(order_id=c.order_id, transaction_id=c.transaction_id, acceptance_id=c.acceptance_id,
                 intervals=list(c.intervals), account_binding=c.account_binding,
@@ -201,6 +204,7 @@ def _validate(b, r):
         _require(b.app=='talabat' and b.vertical=='restaurants' and r.operation=='create_cart'
                  and r.state=='SUCCEEDED' and _hash(r.manifest_sha256), 'RECEIPT_MANIFEST_INVALID')
     if r.diagnostic is not None:
+        import talabat_quote_diagnostics as quote_diagnostics
         _require(b.app == 'talabat' and r.operation in PREPARATION - {'create_cart'}
                  and r.state == 'PREPARATION_FAILED' and quote_diagnostics.valid(r.diagnostic)
                  and r.reason == r.diagnostic['error_code'], 'RECEIPT_DIAGNOSTIC_INVALID')
@@ -268,6 +272,7 @@ def _validate(b, r):
     if r.context is None:
         _require(r.operation == 'payment' and type(r.next_index) is int and r.next_index == 0)
         return
+    from talabat_http_checkout import AsyncPaymentContext
     c = r.context
     _require(type(c) is AsyncPaymentContext and type(c.intervals) is tuple
              and 1 <= len(c.intervals) <= 180 and all(type(x) in (int, float) and math.isfinite(x)
@@ -304,6 +309,7 @@ def _callback(b, record):
         _require(set(record) == keys, 'RECEIPT_CALLBACK_FIELDS_INVALID')
         return Receipt(**record)
     if operation == 'place':
+        from talabat_place_contract import PlaceObservation
         _require(set(record) == {'operation', 'observation', 'http_status'}, 'RECEIPT_CALLBACK_FIELDS_INVALID')
         o = record['observation']
         _require(type(o) is PlaceObservation)
@@ -314,6 +320,7 @@ def _callback(b, record):
                        transaction_id=o.transaction_id, balance_amount=balance)
     _require(operation in {'payment', 'payment_status'} and set(record) ==
              {'operation', 'result', 'context', 'next_index', 'http_status'}, 'RECEIPT_CALLBACK_FIELDS_INVALID')
+    from talabat_http_checkout import PaymentResult
     p = record['result']
     _require(type(p) is PaymentResult)
     return Receipt(**base, state=p.state, reason=p.reason, order_id=p.order_id, transaction_id=p.transaction_id,
@@ -544,6 +551,7 @@ def _scan(fd):
         value['adopted'] = tuple(value['adopted'])
         _require(set(value) == set(_wire(Receipt('', ''))), 'RECEIPT_CORRUPT')
         if value['context'] is not None:
+            from talabat_http_checkout import AsyncPaymentContext
             c = value['context']
             _require(type(c) is dict and type(c.get('intervals')) is list, 'RECEIPT_CORRUPT')
             value['context'] = AsyncPaymentContext(**{**c, 'intervals': tuple(c['intervals'])})

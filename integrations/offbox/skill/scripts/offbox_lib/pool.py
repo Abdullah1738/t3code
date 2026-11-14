@@ -842,8 +842,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         if wait_for_own:
                             needs_start = grow or row['state'] != 'running'
                             budget = max(0, min(AFFINITY_WAIT_S, deadline - time.monotonic()))
-                            if time.monotonic() < affinity_deadline:
-                                budget = min(budget, affinity_deadline - time.monotonic())
+                            # Affinity bounds waiting for our box; a selected box gets its own readiness window.
+                            # Resize stops yield to the queue, so their wait is excluded on the resume attempt.
                             if not wait and not needs_start:
                                 budget = AFFINITY_WAIT_S  # a zero queue wait still permits a ready box's health check
                             with api.budget(budget):
@@ -912,6 +912,9 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                             f"offbox release {row['box_id']} --delete). Trying other pool boxes, then a fresh lease.")
                         continue
                     except OffboxError as e:
+                        if isinstance(e, api.BudgetExpired) and con.execute("SELECT 1 FROM kv WHERE k IN (?,?)",
+                                (f"resume_unanswered:{row['box_id']}", f"resume_provision:{row['box_id']}")).fetchone():
+                            raise
                         if (row['state'] == 'running' and not wait_for_own) or e.code != EXIT_INFRA:
                             raise
                         # A stopped box failed to resume: a running box later in the list may still be free.

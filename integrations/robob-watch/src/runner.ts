@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { recordHealthDelivery, isHealthNag } from "./healthDelivery.ts";
 import { toolLog, toolError, logDirectory } from "./toollog.ts";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   alert, deliver, ensureDirs, escalate, failureSources, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
   inboundState, inQuiet, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
-  heldByMaintenance, loadMaintenance, type Maintenance, shouldPause, triggerSig, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
+  heldByMaintenance, loadMaintenance, type Maintenance, shouldNotifyFailure, shouldPause, FAILURE_NOTICE_AFTER, triggerSig, type Watcher, wakeInboundId, watcherDir, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
 
 import { CheckSlots, checkSlotCap, checkTimeout, hostLoad, isMounted, LOAD_GRACE_MS, LOAD_HIGH, SSD_PATH } from "./host.ts";
@@ -273,7 +273,7 @@ export async function tickOne(id: string): Promise<void> {
       return;
     }
     saveState(id, fresh);
-    {
+    if (shouldNotifyFailure(watcher, fresh, timedOut)) {
       const mins = Math.round((now() - Date.parse(fresh.failing_since!)) / 60_000);
       const sent = await alert(watcher, `Watcher "${watcher.title}" has failed ${fresh.consecutive_failures} ${fresh.consecutive_failures === 1 ? "time" : "times"} in a row (${mins} min) and is backing off. Last error: ${fresh.last_error.slice(0, 300)}. Check ${join(watcherDir(id), "log")}.`,
         `robob-watch:${id}:failing:${hash(fresh.failing_since ?? "")}:${fresh.consecutive_failures}`, "error");
@@ -286,6 +286,11 @@ export async function tickOne(id: string): Promise<void> {
       fresh.failure_alerted = sent.ok;
       saveState(id, fresh);
       log(id, `failure alert ok=${sent.ok} via=${sent.via}`);
+    } else {
+      const count = fresh.consecutive_failures;
+      const threshold = watcher.failure_notice_after ?? FAILURE_NOTICE_AFTER;
+      log(id, `failure notice held (${count}/${threshold})`);
+      toolLog({ component: "runner", kind: "event", name: "watch.failure_notice_held", ids: { watcher: id }, props: { count, threshold, timedOut } });
     }
     if (shouldEscalate(watcher, fresh)) {
       const sent = await escalate(watcher, fresh, `robob-watch:${id}:escalate:${hash(fresh.failing_since ?? "").slice(0, 32)}`);
@@ -308,8 +313,10 @@ export async function tickOne(id: string): Promise<void> {
   delete fresh.load_timeouts;
   delete fresh.load_timeout_since;
   if (fresh.consecutive_failures) {
-    toolLog({ component: "runner", kind: "event", name: "watch.recovered", ids: { watcher: id }, props: { count: fresh.consecutive_failures } });
-    log(id, `check recovered after ${fresh.consecutive_failures} failures`);
+    const failures = fresh.consecutive_failures;
+    const notified = fresh.failure_alerted;
+    toolLog({ component: "runner", kind: "event", name: "watch.recovered", ids: { watcher: id }, props: { count: failures, failures, notified } });
+    log(id, `check recovered after ${failures} failures (${notified ? "notified" : "not notified"})`);
   }
   fresh.consecutive_failures = 0;
   fresh.failure_alerted = false;
@@ -336,7 +343,10 @@ export function previousDayRollup(): void {
   const day = new Date(at.getTime() - 86400_000).toISOString().slice(0, 10);
   if (rollingDay === day) return;
   rollingDay = day;
-  if (existsSync(join(logDirectory(), `rollup-${day}.json`))) return;
+  const dayEnd = Date.parse(`${day}T00:00:00Z`) + 86400_000;
+  try {
+    if (statSync(join(logDirectory(), `rollup-${day}.json`)).mtimeMs >= dayEnd) return;
+  } catch { /* Missing or unreadable rollups need another attempt. */ }
   // Parsing a day file runs outside the one-second runner tick.
   try {
     const child = Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "log-rollup", "--day", day], { env: process.env, stdout: "ignore", stderr: "ignore" });

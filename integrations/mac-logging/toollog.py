@@ -15,21 +15,46 @@ CAP_BYTES = 50 * 1024 * 1024
 NUMBERS = set('internalFreeGb externalFreeGb baseline count bytes files snapshotAgeS resticExitCode exitCode found killed ageS autoFixed needsOwner critical high moderate medium low unknown skipped sourceErrors reports inventoryAgeS'.split())
 NUMBERS.update('diskCount storagekitdPid storagekitdUptimeS diskarbitrationdPid diskarbitrationdUptimeS hdiutilMs'.split())
 NUMBERS.update('elapsedMs deniedCount inventorySourceErrors'.split())
-NUMBERS.update(('unreadableCount', 'turn', 'cachedCount'))
+NUMBERS.update(('unreadableCount', 'turn', 'cachedCount', 'rootsComplete', 'rootsPartial',
+                'childrenCached', 'oldestChildAgeS', 'unmeasuredCount', 'limitedCount', 'lagS'))
+NUMBERS.update(('deltaGb', 'deltaWindowS', 'purgeableGb', 'localSnapshotCount'))
 NUMBERS.update(('lockAgeS', 'lockPid', 'completedCount', 'failedCount',
                 'windowStart', 'windowEnd', 'windowS', 'skippedS', 'chunks', 'chunksDone', 'observedAt'))
+NUMBERS.update(('lockHolderPpid', 'lockHolderStartedAgoS', 'lastGoodSnapshotAgeS',
+                'backup.skipped_runs.memory', 'backup.skipped_runs.health', 'backup.skipped_runs.other',
+                'backup.ok_runs.memory', 'backup.ok_runs.health', 'backup.ok_runs.other',
+                'backup.failed_runs.memory', 'backup.failed_runs.health', 'backup.failed_runs.other'))
 for prefix in ('internal', 'external'):
     NUMBERS.update(prefix+field for field in ('FreeGbDelta', 'PurgeableGb', 'LocalSnapshotCount'))
-SKIP_REASONS = {'lock_held', 'no_repo_access', 'password_unavailable', 'source_missing', 'dry_run', 'other'}
-BOOLEANS = {'timedOut', 'hdiutilOk', 'probeError', 'partial', 'inventoryStale'}
+    NUMBERS.add(prefix+'DeltaWindowS')
+SKIP_REASONS = {'deep_pass_running', 'lock_held', 'stale_lock', 'no_repo_access', 'password_unavailable', 'source_missing', 'dry_run', 'other', 'load_deferred', 'boot_grace'}
+BACKUP_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'files',
+                 'restic', 'prune', 'vault', 'dropbox', 'manifest', 'unknown', 'other'}
+FAILURE_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'files',
+                  'restic', 'prune', 'dropbox', 'manifest', 'unknown'}
+NUMBERS.update(('durationMs', 'childrenMeasured', 'childrenPartial', 'childrenRemaining', 'bytesMeasured'))
+NUMBERS.update(('loadPerCore', 'lastSuccessAgeS', 'deferredCount'))
+BACKUP_PROGRAMS = {'bash', 'zsh', 'sh', 'python', 'python3', 'restic', 'launchd',
+                   'Robob', 'codex', 'claude', 'opencode', 'node', 'sleep', 'unknown'}
+BACKUP_ARGS = {'memory_backup.sh', 'health_backup.sh', 'backup_control.py', 'redact_lock.py',
+               'run_limited.py', 'install.zsh', 'install-jobs.zsh', 'deploy.zsh',
+               'backup', 'snapshots', 'forget', 'prune',
+               '-c', '-f', '-l', '-lc', '-u', '-m', '[redacted]'}
+BOOLEANS = {'timedOut', 'hdiutilOk', 'probeError', 'partial', 'inventoryStale', 'inventoryComplete'}
 NULLABLE = {'exitCode', 'diskCount', 'storagekitdPid', 'storagekitdUptimeS', 'storagekitdStat',
             'diskarbitrationdPid', 'diskarbitrationdUptimeS', 'diskarbitrationdStat'}
 NULLABLE.add('inventoryAgeS')
 NULLABLE.update(('internalFreeGbDelta', 'externalFreeGbDelta'))
+NULLABLE.update(('lastGoodSnapshotAgeS', 'lockHolderCmd', 'lockHolderPpid', 'lockHolderStartedAgoS'))
+NULLABLE.update(('deltaFromTs', 'deltaWindowS', 'purgeableGb', 'localSnapshotCount'))
+for prefix in ('internal', 'external'):
+    NULLABLE.update((prefix+'DeltaFromTs', prefix+'DeltaWindowS'))
 TEXT = set('target resourceKind process package fromVersion toVersion source operation runId threadId snapshotId resourceId'.split())
 for i in range(1, 6):
     TEXT.add('grower%dPath' % i)
     NUMBERS.add('grower%dDeltaGb' % i)
+    TEXT.add('grower%dName' % i)
+    NUMBERS.add('grower%dBytes' % i)
 for i in range(1, 4):
     TEXT.add('topMover%dPath' % i)
     NUMBERS.add('topMover%dGbDelta' % i)
@@ -41,16 +66,143 @@ ATOM = re.compile(r'^[A-Za-z0-9_.:@/+ ()-]{1,180}$')
 SECRET = re.compile(r'(?i)(bearer |password|secret|token[=: ]|cookie|otp[=: ]|sk-[a-z0-9]|\b(?:\d[ -]?){13,19}\b)')
 
 
+def backup_command(value):
+    # Closed vocabulary: even an innocuous-looking argv token can be a secret.
+    if not isinstance(value, str):
+        return False
+    parts = value.split(' ')
+    return (1 <= len(parts) <= 2 and parts[0] in BACKUP_PROGRAMS and
+            (len(parts) == 1 or parts[1] in BACKUP_ARGS))
+
+
 def directory():
     return Path(os.environ.get('TOOLLOG_DIR', str(Path.home() / '.robob/logs/tools/mac')))
 
 
-def safe_fields(values):
+def process_fields(values):
+    result = []
+    for proc in values[:10]:
+        if not isinstance(proc, dict):
+            continue
+        if any(type(proc.get(k)) is not int or proc[k] < 0 for k in ('pid', 'ppid', 'ageS')):
+            continue
+        if not all(isinstance(proc.get(k), str) for k in ('stat', 'comm', 'args')):
+            continue
+        clean = {k: proc[k] for k in ('pid', 'ppid', 'ageS')}
+        for key, limit in (('stat', 16), ('comm', 300), ('args', 300)):
+            value = proc[key][:limit]
+            clean[key] = '[redacted]' if SECRET.search(value) else ''.join(
+                c if c.isprintable() else ' ' for c in value)
+        result.append(clean)
+    return result
+
+
+MEMORY_ERRORS = {'timeout', 'unavailable', 'exit', 'parse', 'baseline', 'gone'}
+
+
+def memory_command(value):
+    # top's command column is a name, never argv; reject paths and secret shapes.
+    if not isinstance(value, str) or '/' in value or SECRET.search(value):
+        return '[redacted]'
+    return ''.join(c if c.isprintable() else ' ' for c in value[:40])
+
+
+def memory_fields(values, event):
+    result = {}
+    if not isinstance(values, dict):
+        return result
+    if event == 'memory.alert':
+        if values.get('reason') in ('swap', 'pressure', 'footprint', 'fseventsd'):
+            result['reason'] = values['reason']
+        if values.get('notifyError') is None or values.get('notifyError') in MEMORY_ERRORS:
+            result['notifyError'] = values.get('notifyError')
+        return result
+    numbers = {'pageSize', 'freePages', 'activePages', 'inactivePages', 'wiredPages',
+               'speculativePages', 'purgeablePages', 'compressorPages', 'totalMb', 'usedMb',
+               'mbPerS', 'tps', 'pid', 'memMb', 'cmprsMb', 'cpu', 'count', 'ppid1Count'}
+
+    def numeric(value):
+        return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+    def row(value, keys):
+        if not isinstance(value, dict):
+            return {}
+        clean = {}
+        for key in keys:
+            item = value.get(key)
+            if key in numbers and (item is None or numeric(item)):
+                clean[key] = item
+            elif key == 'command' and isinstance(item, str):
+                clean[key] = memory_command(item)
+            elif key == 'etime' and isinstance(item, str) and re.fullmatch(r'\d+(?:-\d+)?(?::\d+){1,2}', item):
+                clean[key] = item
+            elif key == 'error' and (item is None or item in MEMORY_ERRORS):
+                clean[key] = item
+        return clean
+
+    for key, value in values.items():
+        if key in ('swap', 'vm', 'io'):
+            keys = {'swap': ('totalMb', 'usedMb'), 'io': ('tps', 'mbPerS'),
+                    'vm': ('pageSize', 'freePages', 'activePages', 'inactivePages',
+                           'wiredPages', 'speculativePages', 'purgeablePages', 'compressorPages')}[key]
+            result[key] = None if value is None else row(value, keys)
+        elif key in ('top', 'watched', 'counts') and (value is None or isinstance(value, list)):
+            keys = ('command', 'count', 'ppid1Count') if key == 'counts' else ('pid', 'command', 'memMb', 'cmprsMb', 'cpu')
+            if key == 'watched':
+                keys += ('etime', 'error')
+            result[key] = None if value is None else [row(p, keys) for p in value[:{'top': 15, 'watched': 512, 'counts': 5}[key]]]
+        elif key == 'load' and (value is None or isinstance(value, list)):
+            result[key] = None if value is None else [n for n in value[:3] if numeric(n)]
+        elif key in ('pressure', 'freePercent', 'boot', 'swapinsDelta', 'swapoutsDelta',
+                     'deltaWindowS', 'processCount', 'ppid1Count', 'watchedOmitted', 'criticalSamples') and (value is None or numeric(value)):
+            result[key] = value
+        elif key in {n+'Error' for n in ('swap', 'vm', 'pressure', 'freePercent', 'boot',
+                                       'top', 'counts', 'io', 'load', 'delta', 'watched')}:
+            if value is None or (isinstance(value, str) and value in MEMORY_ERRORS):
+                result[key] = value
+    return result
+
+
+def safe_fields(values, event=None):
+    if event in ('memory.sample', 'memory.alert'):
+        return memory_fields(values, event)
     result = {}
     for key, value in (values or {}).items():
-        if key in PROBE_ERRORS and value in ('timeout', 'exit', 'parse', 'unsupported', 'unavailable', 'busy'):
+        if event == 'proc.disk_wait' and key == 'procs' and isinstance(value, list):
+            result[key] = process_fields(value)
+        elif event == 'proc.disk_wait' and key == 'stuckUnmount' and type(value) is bool:
             result[key] = value
-        elif key in ('previousTs', 'sampleTs') and isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z', value):
+        elif event == 'proc.disk_wait' and key == 'mountPoint' and isinstance(value, str):
+            result[key] = '[redacted]' if SECRET.search(value) else ''.join(
+                c if c.isprintable() else ' ' for c in value[:300])
+        elif key == 'lockHolderCmd' and backup_command(value):
+            result[key] = value
+        elif key in ('trigger', 'lockHolderTrigger') and value in ('launchd', 'manual', 'installer', 'unknown', 'agent'):
+            if key != 'trigger' or value != 'agent':
+                result[key] = value
+        elif key == 'lastGoodSnapshotError' and value in ('password_unavailable', 'timeout', 'exit', 'parse', 'unavailable', 'no_snapshots'):
+            result[key] = value
+        elif key == 'lastGoodSnapshotSource' and value in ('restic', 'status_file'):
+            result[key] = value
+        elif key == 'failedStage' and isinstance(value, str) and value in BACKUP_STAGES:
+            result[key] = value
+        elif event == 'backup.run' and key == 'failureStage' and isinstance(value, str):
+            result[key] = value if value in FAILURE_STAGES else 'unknown'
+        elif key == 'failReason' and value in ('password_unavailable', 'no_repo_access', 'source_missing', 'other'):
+            result[key] = value
+        elif key == 'stopReason' and value in ('done', 'budget', 'killed'):
+            result[key] = value
+        elif key == 'duMode' and value == 'links':
+            result[key] = value
+        elif key in PROBE_ERRORS and value in ('timeout', 'exit', 'parse', 'unsupported', 'unavailable', 'busy'):
+            result[key] = value
+        elif key in ('deltaUnavailable', 'internalDeltaUnavailable', 'externalDeltaUnavailable') and value in (
+                'corrupt_state', 'missing_state', 'unreadable_state', 'no_previous_numeric',
+                'invalid_timestamp', 'current_unavailable'):
+            result[key] = value
+        elif key == 'volume' and value in ('internal', 'external'):
+            result[key] = value
+        elif key in ('previousTs', 'sampleTs', 'deltaFromTs', 'internalDeltaFromTs', 'externalDeltaFromTs') and isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z', value):
             result[key] = value
         elif key == 'skipReason' and isinstance(value, str) and value in SKIP_REASONS:
             result[key] = value
@@ -77,7 +229,7 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
     if type(ok) is bool:
         row['ok'] = ok
     for key, value in [('ids', {'runId': RUN_ID, **(ids or {})}), ('props', props)]:
-        clean = safe_fields(value)
+        clean = safe_fields(value, name if key == 'props' else None)
         if clean:
             row[key] = clean
     if error_tag and re.fullmatch(r'[a-z][a-z0-9_.-]{0,79}', error_tag):

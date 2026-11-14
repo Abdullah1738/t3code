@@ -8,7 +8,9 @@ import {
   type KanbanActor,
   type KanbanCard,
   type KanbanBoard,
+  type KanbanOwnerAsk,
   type KanbanSubtask,
+  type KanbanStandingApproval,
 } from "@t3tools/contracts";
 
 // Unknown continuations need approval, including nouns and possessives after a resource name.
@@ -16,36 +18,221 @@ const resourceReleaseClause =
   /^\s+(?:(?:the|a|an)\s+)?(?:Run\s+Cloud\s+)?(?:sessions?|emulators?|sims?|simulators?|box|boxes|holds?|locks?|slots?|phones?(?:\s+(?:holds?|locks?)(?:\/locks?)?)?|devices?)(?:\s+(?:when\s+done|after\s+the\s+run))?\s*(?:$|[.;!?](?=\s|$))/i;
 
 const hasReleaseGate = (text: string): boolean => {
+  const resourceMention =
+    /\b(?:sessions?|emulators?|sims?|simulators?|box|boxes|devices?|phones?|holds?|locks?|slots?)\b/i;
   for (const release of text.matchAll(/\brelease(?:s|d)?\b/gi)) {
     const tail = text.slice(release.index + release[0].length);
-    if (!resourceReleaseClause.test(tail)) return true;
+    if (resourceReleaseClause.test(tail)) continue;
+    const reference = /^\s+(?:both|them|each|all|it)\b/i.exec(tail);
+    if (reference && resourceMention.test(text.slice(0, release.index))) {
+      const rest = tail.slice(reference[0].length);
+      if (
+        resourceReleaseClause.test(rest) ||
+        /^(?:\s+when\s+done)?\s*(?:$|[.;!?](?=\s|$))/i.test(rest)
+      )
+        continue;
+    }
+    return true;
   }
   return false;
 };
 
-export const inferGate = (text: string): KanbanSubtask["gate"] => {
-  if (/\b(deploy\w*|install\w*|restart\w*|launchagents?)\b/i.test(text) || hasReleaseGate(text))
-    return "deploy";
-  if (
-    /\b(pay(?:ment|ments)?|purchase\w*|charg(?:e|es|ed|ing)|refund\w*|money transfer)\b/i.test(text)
-  )
-    return "money";
-  if (
-    /\b(?:share|provide|enter|paste|set|store|create|generate|issue|rotate|regenerate|revoke|reveal|send|give|hand\s+over|add)\b[^.;\r\n]{0,40}\b(?:secrets?|passwords?|credentials?|tokens?|(?:(?:api|private|signing|ssh)\s+)?keys?)\b/i.test(
-      text,
+const deployKeyword = /\b(?:deploy\w*|install\w*|restart\w*|launchagents?|release(?:s|d)?)\b/i;
+const moneyKeyword =
+  /(?:\b(?:pay(?:ment|ments)?|purchase\w*|charg(?:e|es|ed|ing)|refund\w*|money transfer|spend(?:ing)?|billed|billing)\b|[$€£]\s*\d+(?:[.,]\d+)*|\b(?:\d+(?:[.,]\d+)*\s*(?:USD|AED|EUR|GBP|dirhams?|dollars?)\b|(?:USD|AED|EUR|GBP|dirhams?|dollars?)\s*\d+(?:[.,]\d+)*))/i;
+const negatableMoneyKeyword = new RegExp(`${moneyKeyword.source}|\\b(?:paying|purchasing)\\b`, "i");
+const secretAction =
+  /\b(?:share|provide|enter|paste|set|store|create|generate|issue|rotate|regenerate|revoke|reveal|send|give|hand\s+over|add)\b/i;
+const negatableSecretAction = new RegExp(
+  `${secretAction.source}|\\b(?:sharing|providing|entering|pasting|setting|storing|creating|generating|issuing|rotating|regenerating|revoking|revealing|sending|giving|handing\\s+over|adding)\\b`,
+  "i",
+);
+const secretKeyword =
+  /\b(?:secrets?|passwords?|credentials?|tokens?|(?:(?:api|private|signing|ssh)\s+)?keys?)\b/i;
+const secretNoun = String.raw`(?:secrets?|passwords?|credentials?|tokens?|keys?)`;
+const negatableSecretKeyword = new RegExp(
+  String.raw`\b${secretNoun}(?:[ \t]+${secretNoun})*\b`,
+  "i",
+);
+const secretMention = new RegExp(
+  `${secretAction.source}[^.;\\r\\n]{0,40}${secretKeyword.source}`,
+  "i",
+);
+
+const inlinePairs = new Map([
+  ["(", ")"],
+  ["[", "]"],
+  ["{", "}"],
+  ['"', '"'],
+  ["'", "'"],
+  ["“", "”"],
+  ["‘", "’"],
+  ["—", "—"],
+  ["–", "–"],
+  ["--", "--"],
+]);
+
+const inlineClosers = new Set(inlinePairs.values());
+
+function* inlineDelimiters(text: string) {
+  for (let i = 0; i < text.length; i++) {
+    const index = i;
+    let char = text[i]!;
+    if (
+      (char === "'" || char === "’") &&
+      /\w/.test(text[i - 1] ?? "") &&
+      /^(?:s|t|re|ve|ll|d|m)\b/i.test(text.slice(i + 1))
     )
+      continue;
+    if (char === "-" && text[i + 1] === "-") {
+      char = "--";
+      i++;
+    }
+    if (inlinePairs.has(char) || inlineClosers.has(char)) yield { char, index };
+  }
+}
+
+const closesInlineAside = (prefix: string, suffix: string): boolean | undefined => {
+  const expected: string[] = [];
+  for (const { char, index } of inlineDelimiters(prefix)) {
+    if (expected.at(-1) === char) expected.pop();
+    else {
+      const closing = inlinePairs.get(char);
+      const dash = char === "—" || char === "–" || char === "--";
+      if (closing && (!dash || prefix.includes(char, index + char.length) || suffix.includes(char)))
+        expected.push(closing);
+    }
+  }
+  const depth = expected.length;
+  if (depth === 0) return undefined;
+  for (const { char, index } of inlineDelimiters(suffix)) {
+    if (expected.at(-1) === char) {
+      expected.pop();
+      if (expected.length < depth) return !negatableSecretKeyword.test(suffix.slice(0, index));
+    } else {
+      const closing = inlinePairs.get(char);
+      const dash = char === "—" || char === "–" || char === "--";
+      if (closing && (!dash || suffix.includes(char, index + char.length))) expected.push(closing);
+    }
+  }
+  return false;
+};
+
+const withoutNegated = (
+  text: string,
+  keyword: RegExp,
+  options: { readonly boundary?: boolean; readonly object?: RegExp } = {},
+): string => {
+  const gap = String.raw`(?:[ \t]+|-(?!-))`;
+  // Unknown words stay gated: arbitrary fillers can turn "don't delay deployment" into permission.
+  const qualifierWord = String.raw`(?:a|an|the|any|my|your|our|their|his|her|its|\w+[’']s|\w+s[’']|new|old|existing|further|additional|more|actual|real|live|prod|production|dev|test|local|remote|planned|scheduled|required|manual|automatic|immediate|full|api|private|signing|ssh)`;
+  const filler = String.raw`${qualifierWord}${gap}`;
+  const qualifiers = String.raw`(?:(?:just|quite)${gap}yet${gap}|yet${gap}(?:${filler})?|(?:${filler}){0,2}?)`;
+  const negation = String.raw`(?:no|not|without|never|don[’']?t|do[ \t]+not|doesn[’']?t|won[’']?t|nothing[ \t]+to)`;
+  const objectStop = String.raw`(?:${negatableSecretAction.source}|${negation}|and|or|but|then|yet|so|however|instead|except)\b`;
+  const objectQualifier = String.raw`(?!${objectStop})\w+(?:[’']s)?${gap}`;
+  const pluralPossessive = String.raw`(?!(?:${negatableSecretKeyword.source})[’'])\w+s[’'](?=${gap}(?:${objectQualifier})*${secretKeyword.source}[^.;\r\n]*[)\]}"'”’–—])`;
+  const objectWord = String.raw`(?:\w+[’']s|${pluralPossessive}|\w+)`;
+  const objectFiller = String.raw`(?!${objectStop})${objectWord}${gap}`;
+  // Consume the whole noun phrase: stopping at "secret" strands "token" inside an aside.
+  const objectQualifiers = options.boundary ? String.raw`(?:${objectFiller})*` : qualifiers;
+  const bareObject = options.object ? `${objectQualifiers}${options.object.source}` : "";
+  const quotedObjects = (
+    [
+      ["'", "'"],
+      ['"', '"'],
+      ["‘", "’"],
+      ["“", "”"],
+    ] as const
+  ).map(([open, close]) => String.raw`${objectQualifiers}${open}[ \t]*${bareObject}[ \t]*${close}`);
+  const objectItem = options.object ? `(?:${[bareObject, ...quotedObjects].join("|")})` : "";
+  const objectSeparator = String.raw`(?:[ \t]*,[ \t]*(?:(?:and|or)[ \t]+)?|[ \t]+(?:and|or)[ \t]+)`;
+  const objectList = options.boundary ? String.raw`(?:${objectSeparator}${objectItem})*` : "";
+  const object = options.object ? String.raw`(?:${gap}${objectItem}${objectList})?` : "";
+  const precedingNegation = new RegExp(String.raw`\b${negation}${gap}$`, "i");
+  const sharedObject = new RegExp(
+    String.raw`${secretAction.source}(?:[ \t,:()\[\]{}"'“”‘’–—-]|\b(?:${qualifierWord}|and|but|or|then|also)\b)*$`,
+    "i",
+  );
+  const boundaries: number[] = [];
+  let delta = 0;
+  const stripped = text.replace(
+    new RegExp(
+      String.raw`\b(?:${negation}${gap}${qualifiers}|non${gap})(${keyword.source})(${object})`,
+      "gi",
+    ),
+    (match, action: string, directObject: string, offset: number) => {
+      const prefix = text.slice(0, offset);
+      let before = prefix;
+      let negations = 0;
+      for (
+        let previous = precedingNegation.exec(before);
+        previous;
+        previous = precedingNegation.exec(before)
+      ) {
+        negations++;
+        before = before.slice(0, previous.index);
+      }
+      if (negations % 2 === 1) return match;
+      if (/^keys?$/i.test(action) && /^(?:no|not)-(?:api|private|signing|ssh)[ \t-]/i.test(match))
+        return action;
+      const modifier = /^(?:(?:no|not)-|non\b)/i.test(match);
+      const aside = options.boundary
+        ? closesInlineAside(prefix, text.slice(offset + match.length))
+        : undefined;
+      const shared = options.boundary ? (aside ?? sharedObject.test(prefix)) : false;
+      const replacement = options.boundary && !modifier && !shared ? ";" : " ";
+      // "No-restart deployment" negates the modifier, unlike "don't restart the deployment".
+      const nounModifier =
+        !options.boundary &&
+        /^no[ \t]/i.test(match) &&
+        !/ing$/i.test(action) &&
+        /\b(?:a|an|the)[ \t]+$/i.test(prefix);
+      const value =
+        modifier || nounModifier || (options.boundary && shared && aside === undefined)
+          ? replacement + directObject
+          : replacement;
+      if (options.boundary && value.startsWith(";")) boundaries.push(offset + delta);
+      delta += value.length - match.length;
+      return value;
+    },
+  );
+  if (boundaries.length === 0) return stripped;
+  // Resolve an aside after all its negated actions have lost their objects.
+  const characters = stripped.split("");
+  for (const position of boundaries) {
+    if (closesInlineAside(stripped.slice(0, position), stripped.slice(position + 1)) === true)
+      characters[position] = " ";
+  }
+  return characters.join("");
+};
+
+export const inferGate = (text: string): KanbanSubtask["gate"] => {
+  const deployText = withoutNegated(text, deployKeyword, { object: deployKeyword });
+  if (
+    /\b(deploy\w*|install\w*|restart\w*|launchagents?)\b/i.test(deployText) ||
+    hasReleaseGate(deployText)
   )
-    return "secret";
+    return "deploy";
+  if (moneyKeyword.test(withoutNegated(text, negatableMoneyKeyword, { object: moneyKeyword })))
+    return "money";
+  // Removing a negated action must not attach its object to an earlier unrelated action.
+  const secretText = withoutNegated(
+    withoutNegated(text, negatableSecretAction, { boundary: true, object: secretKeyword }),
+    negatableSecretKeyword,
+  );
+  if (secretMention.test(secretText)) return "secret";
   return undefined;
 };
 
 export const gateOf = (
-  subtask: Pick<KanbanSubtask, "owner" | "gate" | "text">,
+  subtask: Pick<KanbanSubtask, "owner" | "gate" | "text" | "ownerOnly">,
   guessedGates?: KanbanBoard["guessedGates"],
 ): KanbanSubtask["gate"] => {
   // Older plans stored inferred gates on coding and review checklists too.
   if (subtask.owner === "work" || subtask.owner === "review") return undefined;
   if (subtask.gate !== undefined) return subtask.gate;
+  if (subtask.ownerOnly) return "deploy";
   const guessed = inferGate(subtask.text);
   return guessed !== undefined && (guessedGates === undefined || guessedGates.includes(guessed))
     ? guessed
@@ -86,11 +273,12 @@ const harmlessFollowup = (task: string, target: string): boolean => {
   return !/(?:[.!]|\b(?:a|an|the))$/i.test(action) && approvalAction(action) === target;
 };
 
-const approvesGate = (
+export const approvesGate = (
   label: string,
   gate: NonNullable<KanbanSubtask["gate"]>,
   task: string,
   others: readonly string[],
+  scope: "subtask" | "standing" = "standing",
 ): boolean => {
   const words = label
     .trim()
@@ -108,6 +296,15 @@ const approvesGate = (
     /^(?:yes|approve|approved|sign off|sign-off|signoff|signed off|go|go ahead|go for it|ok|okay|do it|proceed)$/i.test(
       command,
     )
+  )
+    return true;
+  // Retaining one merge cannot grant permission for future deployments.
+  if (
+    scope === "subtask" &&
+    gate === "deploy" &&
+    /^merge\b/i.test(task.trim()) &&
+    /^keep it$/i.test(command) &&
+    others.some((other) => /^revert it[.!]*$/i.test(other.trim()))
   )
     return true;
   const action = command.replace(/^(?:approve|approved|authorize)\s+/i, "");
@@ -154,57 +351,141 @@ const approvesGate = (
   );
 };
 
+const askWording = (ask: KanbanOwnerAsk) =>
+  `${ask.text} ${ask.title ?? ""} ${ask.action?.summary ?? ""}`;
+
+const askConcerns = (
+  card: Pick<KanbanCard, "createdAt" | "subtasks">,
+  ask: KanbanOwnerAsk,
+  subtask: KanbanSubtask,
+  gate: NonNullable<KanbanSubtask["gate"]>,
+  guessedGates: KanbanBoard["guessedGates"],
+  answerAt: string,
+): boolean => {
+  const wording = askWording(ask);
+  const ids = new Set(wording.match(/\bs\d+\b/g) ?? []);
+  if (ids.size > 0) return ids.has(subtask.id);
+  if (subtask.ownerOnly) return false;
+  const candidates = card.subtasks.filter(
+    (entry) =>
+      gateOf(entry, guessedGates) === gate &&
+      entry.state !== "skipped" &&
+      (entry.createdAt ?? card.createdAt) <= answerAt,
+  );
+  return inferGate(wording) === gate && candidates.length === 1 && candidates[0]?.id === subtask.id;
+};
+
+export const askGateWarning = (
+  card: Pick<KanbanCard, "createdAt" | "subtasks">,
+  ask: KanbanOwnerAsk,
+  guessedGates?: KanbanBoard["guessedGates"],
+): string | undefined => {
+  const gated = card.subtasks.flatMap((subtask) => {
+    const gate = gateOf(subtask, guessedGates);
+    return subtask.state === "open" && gate !== undefined ? [{ subtask, gate }] : [];
+  });
+  if (
+    gated.length === 0 ||
+    gated.some(({ subtask, gate }) => askConcerns(card, ask, subtask, gate, guessedGates, ask.at))
+  )
+    return undefined;
+  const steps = gated.map(({ subtask, gate }) => `${subtask.id} (${gate})`).join(", ");
+  const target = gated.length === 1 ? gated[0]!.subtask.id : "the intended subtask id";
+  return `This ask won't clear ${steps}. Name ${target} in the text if it should.`;
+};
+
+const approvingAnswer = (
+  ask: KanbanOwnerAsk,
+  gate: NonNullable<KanbanSubtask["gate"]>,
+  task: string,
+): boolean => {
+  const answer = ask.answer;
+  if (answer?.verdict === "approved") return true;
+  // Multiple picks keep the strict paths; the go/hold fallback needs a single choice.
+  const others =
+    answer?.optionIds?.length === 1
+      ? (ask.options ?? [])
+          .filter((option) => !answer.optionIds!.includes(option.id))
+          .map((option) => option.label)
+      : [];
+  return (
+    answer?.verdict === "picked" &&
+    Boolean(answer.optionIds?.length) &&
+    answer.optionIds!.every((id) => {
+      const option = ask.options?.find((entry) => entry.id === id);
+      return option !== undefined && approvesGate(option.label, gate, task, others, "subtask");
+    })
+  );
+};
+
 /** Legacy plans have no timestamps: their card's creation is the earliest safe bound. */
 export const approvalProblem = (
   card: Pick<KanbanCard, "number" | "asks" | "createdAt" | "subtasks">,
   subtask: KanbanSubtask,
+  standing: ReadonlyArray<KanbanStandingApproval> = [],
   guessedGates?: KanbanBoard["guessedGates"],
+  intent: "do" | "skip" = "do",
 ): string | null => {
   const gate = gateOf(subtask, guessedGates);
   if (gate === undefined) return null;
+  if (gate === "deploy" && !subtask.ownerOnly && standing.some((entry) => entry.revokedAt === null))
+    return null;
+  const standingReason =
+    gate !== "deploy"
+      ? ""
+      : subtask.ownerOnly
+        ? " (marked owner-only)"
+        : " (this board has no standing deploy approval)";
   const since = subtask.createdAt ?? card.createdAt;
   const decisions = card.asks
     .filter((ask) => {
       const answer = ask.answer;
       if (!ask.closedAt || !answer || answer.at < since) return false;
+      if (!askConcerns(card, ask, subtask, gate, guessedGates, answer.at)) return false;
       if (answer.verdict === "dropped") return true;
       if (answer.by._tag !== "owner" || (ask.revisedAt ?? ask.at) < since) return false;
       if (ask.draft) return false;
-      const wording = `${ask.text} ${ask.title ?? ""} ${ask.action?.summary ?? ""}`;
-      const ids = new Set(wording.match(/\bs\d+\b/g) ?? []);
-      if (ids.size > 0) return ids.has(subtask.id);
-      const candidates = card.subtasks.filter(
-        (entry) =>
-          gateOf(entry, guessedGates) === gate &&
-          entry.state !== "skipped" &&
-          (entry.createdAt ?? card.createdAt) <= answer.at,
-      );
-      return (
-        inferGate(wording) === gate && candidates.length === 1 && candidates[0]?.id === subtask.id
-      );
+      return true;
     })
     .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at));
   const latest = decisions.at(-1);
   const answer = latest?.answer;
-  // Multiple picks keep the strict paths; the go/hold fallback needs a single choice.
-  const others =
-    answer?.optionIds?.length === 1
-      ? (latest?.options ?? [])
-          .filter((option) => !answer.optionIds!.includes(option.id))
-          .map((option) => option.label)
-      : [];
-  const approved =
-    answer?.verdict === "approved" ||
-    (answer?.verdict === "picked" &&
-      Boolean(answer.optionIds?.length) &&
-      answer.optionIds!.every((id) => {
-        const option = latest?.options?.find((entry) => entry.id === id);
-        return option !== undefined && approvesGate(option.label, gate, subtask.text, others);
-      }));
+  const unnamedApproval = latest
+    ? undefined
+    : card.asks
+        .filter(
+          (ask) =>
+            ask.closedAt &&
+            ask.answer !== undefined &&
+            approvingAnswer(ask, gate, subtask.text) &&
+            ask.answer.by._tag === "owner" &&
+            ask.answer.at >= since &&
+            (ask.revisedAt ?? ask.at) >= since &&
+            !ask.draft &&
+            !/\bs\d+\b/.test(askWording(ask)) &&
+            !askConcerns(card, ask, subtask, gate, guessedGates, ask.answer.at),
+        )
+        .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at))
+        .at(-1);
+  const noDecisionReason = unnamedApproval
+    ? `${unnamedApproval.id} was approved but doesn't name ${subtask.id}; ask again naming the subtask id (e.g. "Approve ${subtask.id}")`
+    : `no owner answer on a ${gate} ask since ${since}; ask with card_ask naming ${subtask.id} (e.g. "Approve ${subtask.id}: <step>")`;
+  if (intent === "skip") {
+    if (answer && answer.verdict !== "dropped" && answer.by._tag === "owner") return null;
+    const reason =
+      answer?.verdict === "dropped"
+        ? `the latest decision, ${latest!.id}, was dropped (a dropped ask is not approval)`
+        : noDecisionReason;
+    return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's answer before it can be skipped: ${reason}${standingReason}`.replace(
+      /[\r\n]+/g,
+      " ",
+    );
+  }
+  const approved = latest !== undefined && approvingAnswer(latest, gate, subtask.text);
   if (approved) return null;
   let reason: string;
   if (!latest || !answer) {
-    reason = `no owner answer on a ${gate} ask since ${since}; name the subtask id (e.g. s7) in the ask`;
+    reason = noDecisionReason;
   } else if (answer.verdict === "dropped") {
     reason = `the latest decision, ${latest.id}, was dropped (a dropped ask is not approval)`;
   } else if (answer.verdict === "picked") {
@@ -215,7 +496,7 @@ export const approvalProblem = (
   } else {
     reason = `the latest decision, ${latest.id}, was ${answer.verdict}`;
   }
-  return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's approval: ${reason}`.replace(
+  return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's approval: ${reason}${standingReason}`.replace(
     /[\r\n]+/g,
     " ",
   );
@@ -232,6 +513,7 @@ export interface SubtaskInput {
   readonly text?: string | undefined;
   readonly owner?: KanbanSubtask["owner"] | undefined;
   readonly gate?: KanbanSubtask["gate"] | null;
+  readonly ownerOnly?: boolean | undefined;
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   readonly script?: string | undefined;
 }
@@ -310,6 +592,7 @@ export function planSubtasks(
           input.owner === undefined &&
           input.step === undefined &&
           input.gate === undefined &&
+          input.ownerOnly === undefined &&
           input.script === undefined)
       ) {
         planned.push(known);
@@ -333,7 +616,14 @@ export function planSubtasks(
         reason: `subtask "${text}" is the worker's; a deploy, money or secret step must be owned by the evaluator or a script`,
       };
     }
-    const inputGate = gateOf({ owner, text, gate: input.gate ?? undefined }, guessedGates);
+    const ownerOnly = input.ownerOnly ?? known?.ownerOnly;
+    if (ownerOnly && (owner === "work" || owner === "review")) {
+      return { ok: false, reason: "an owner-only step must be owned by the evaluator or a script" };
+    }
+    const inputGate = gateOf(
+      { owner, text, gate: input.gate ?? undefined, ownerOnly },
+      guessedGates,
+    );
     const script = input.script?.trim() || undefined;
     if (script && owner !== "script") {
       return {
@@ -354,8 +644,14 @@ export function planSubtasks(
         step,
         text,
         owner,
+        ...(ownerOnly === undefined ? {} : { ownerOnly }),
         ...(gate === undefined ? {} : { gate }),
-        ...((text !== known.text || script !== known.script || !previousGate) && gate && at
+        ...((text !== known.text ||
+          script !== known.script ||
+          ownerOnly !== known.ownerOnly ||
+          !previousGate) &&
+        gate &&
+        at
           ? { createdAt: at }
           : {}),
         ...(script ? { script } : {}),
@@ -368,6 +664,7 @@ export function planSubtasks(
         step,
         text,
         owner,
+        ...(ownerOnly === undefined ? {} : { ownerOnly }),
         ...(gate === undefined ? {} : { gate }),
         ...(at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),
@@ -499,13 +796,35 @@ export const markSubtask = (
         : { ...subtask, state, note: note?.trim() || null, doneBy: by, doneAt: at },
   );
 
-/** A passed review marks the review subtasks of the step the card is on. */
+export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">) {
+  const current = kanbanOpenStep(card);
+  if (current === null) return [];
+  const open = card.subtasks.filter(
+    (subtask) => subtask.owner === "review" && subtask.state === "open",
+  );
+  const step = Math.min(...open.map((subtask) => subtask.step));
+  // Unfinished work in the current step can already have been reviewed, but
+  // future work must get its turn before its review can pass.
+  if (
+    card.subtasks.some(
+      (subtask) =>
+        subtask.owner === "work" &&
+        subtask.state === "open" &&
+        subtask.step > current &&
+        subtask.step <= step,
+    )
+  )
+    return [];
+  return open.filter((subtask) => subtask.step === step);
+}
+
+/** Earlier unfinished work must not hide the review step that just passed. */
 export function passReview(
   card: Pick<KanbanCard, "subtasks">,
   by: KanbanActor,
   at: string,
 ): ReadonlyArray<KanbanSubtask> {
-  const ids = new Set(kanbanStepSubtasks(card, "review").map((subtask) => subtask.id));
+  const ids = new Set(reviewSubtasksToPass(card).map((subtask) => subtask.id));
   return card.subtasks.map((subtask) =>
     ids.has(subtask.id)
       ? { ...subtask, state: "done", note: "Review passed", doneBy: by, doneAt: at }

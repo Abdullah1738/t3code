@@ -2104,3 +2104,109 @@ it.effect(
       expect(empty.threads).toEqual([]);
     }).pipe(Effect.provide(ProjectionStore.layerMemory)),
 );
+
+it.effect.each(["accepted", "rejected"] as const)(
+  "rechecks a receipt that becomes %s between the missing read and the dispatch fence",
+  (status) =>
+    Effect.gen(function* () {
+      const read = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const commandId = CommandId.make("command:receipt-race");
+      const receipt: CommandReceiptStore.CommandReceiptV2 = {
+        commandId,
+        threadId: ThreadId.make("parent:receipt-race"),
+        commandType: "delegated_task.request",
+        acceptedAt: DateTime.makeUnsafe(0),
+        resultSequence: 1,
+        status,
+        error: status === "rejected" ? "Parent stopped." : null,
+      };
+      let saved = false;
+      let reads = 0;
+      const layerTest = ThreadManagementService.layer.pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({})),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(
+          Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
+            getByCommandId: () =>
+              Effect.gen(function* () {
+                reads++;
+                const snapshot = saved ? Option.some(receipt) : Option.none();
+                if (reads === 1) {
+                  yield* Deferred.succeed(read, undefined);
+                  yield* Deferred.await(release);
+                }
+                return snapshot;
+              }),
+          }),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* ThreadManagementService.ThreadManagementService;
+        const reading = yield* service.getDelegationCommandState(commandId).pipe(Effect.forkChild);
+        yield* Deferred.await(read);
+        saved = true;
+        yield* Deferred.succeed(release, undefined);
+        expect(yield* Fiber.join(reading)).toEqual(receipt);
+        expect(reads).toBe(2);
+      }).pipe(Effect.provide(layerTest));
+    }),
+);
+
+it.effect("reports a delegation queued behind a receipt-read fence as pending", () =>
+  Effect.gen(function* () {
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const parent = ThreadId.make("parent:read-fence-queue");
+    const commandId = CommandId.make("command:read-fence-queue");
+    let reads = 0;
+    const layerTest = ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadRecords: () => Effect.succeed(idleThreadProjection(liveThreadShell(parent))),
+          dispatch: () => Effect.succeed({ sequence: 0, storedEvents: [] }),
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
+          getByCommandId: () =>
+            Effect.gen(function* () {
+              reads++;
+              if (reads === 2) {
+                yield* Deferred.succeed(held, undefined);
+                yield* Deferred.await(release);
+              }
+              return Option.none();
+            }),
+        }),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ThreadManagementService.ThreadManagementService;
+      const reading = yield* service.getDelegationCommandState(commandId).pipe(Effect.forkChild);
+      yield* Deferred.await(held);
+      const creating = yield* service
+        .dispatch({
+          type: "delegated_task.request",
+          commandId,
+          parentThreadId: parent,
+          parentRunId: RunId.make("run:read-fence-queue"),
+          parentNodeId: NodeId.make("node:read-fence-queue"),
+          task: "Review",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdBy: "agent",
+          creationSource: "mcp",
+        })
+        .pipe(Effect.forkChild);
+      yield* TestClock.adjust(0);
+      yield* Deferred.succeed(release, undefined);
+      expect(yield* Fiber.join(reading)).toEqual({ status: "pending" });
+      yield* Fiber.join(creating);
+    }).pipe(Effect.provide(layerTest));
+  }),
+);

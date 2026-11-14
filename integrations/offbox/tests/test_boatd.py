@@ -186,6 +186,25 @@ class ReconcileRuns(Base):
         self.assertEqual([s["kind"] for s in snaps], ["auto"])
         self.assertEqual(self.f.spawned, [])
 
+    def test_resource_host_counts_survive_result_recovery(self):
+        b = self.box()
+        self.box('bx_foreign1', owner='moni')
+        self.box('bx_archived', state='archived', running=False)
+        self.assertEqual(boatd.running_box_count(self.con), 2)
+        p = self.cmd(b)
+        boatd.write_json(boatd.result_path(b, p), {
+            'attempt': 1, 'status': 'exited', 'exit_code': 7, 'started_at': 100, 'ended_at': 120,
+            'host_boxes': {'start': 2, 'end': 3}})
+        boatd.settle_cmd(self.con, self.con.execute('SELECT * FROM commands WHERE box_id=? AND pid=?', (b, p)).fetchone())
+        status = boatd.cmd_status_json(self.con, b, p)
+        self.assertEqual(status['metrics']['host_boxes'], {'start': 2, 'end': 3})
+        self.assertEqual(status['exitCode'], 7)
+        with patch.object(boatd, 'db') as broken:
+            broken.execute.side_effect = RuntimeError('telemetry failed')
+            self.assertIsNone(boatd.running_box_count(broken))
+        for malformed in ('broken', 'null', '[]', '{"host_boxes":"private"}'):
+            self.assertEqual(boatd.host_box_metrics(malformed), {'host_boxes': None})
+
     def test_result_of_an_earlier_attempt_is_not_taken_for_this_one(self):
         b = self.box()
         p = self.cmd(b, attempt=2, retry=1)
@@ -645,6 +664,8 @@ class Http(Base):
         p = self.cmd(b, status="running")
         (boatd.cmd_dir(b) / f"{p}.out").write_text("before the cut\n")
         boatd.reconcile(self.con)
+        self.con.execute('UPDATE commands SET metrics=? WHERE box_id=? AND pid=?',
+                         (json.dumps({'host_boxes': {'start': 9, 'end': 14}}), b, p))
         req = urllib.request.Request(self.url + f"/sandboxes/{b}/commands/{p}/stream?stdoutOffset=7",
                                      headers={"Authorization": "Bearer " + self.tok["ardud"]})
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -653,6 +674,7 @@ class Http(Base):
         self.assertEqual((frames[0]["attempt"], frames[0]["bootId"]), (1, "boot-2"))
         out = "".join(f["data"] for f in frames if f["type"] == "stdout")
         self.assertEqual(out, "the cut\n", "resumes from the byte offset it was given")
+        self.assertEqual(frames[-1]['metrics']['host_boxes'], {'start': 9, 'end': 14})
         self.assertEqual((frames[-1]["type"], frames[-1]["status"], frames[-1]["exitCode"]), ("exit", "interrupted", None))
 
 

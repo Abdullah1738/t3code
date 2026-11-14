@@ -17,25 +17,24 @@ import {
 import * as ServerConfig from "../../config.ts";
 import { COMPONENTS, issueComponentSession, listComponentSessions } from "./components.ts";
 
-const withAuth = <A, E, R>(
+const withAuth = Effect.fn("ComponentTokenCommand.withAuth")(function* <A, E, R>(
   flags: CliAuthLocationFlags,
   quiet: boolean,
   run: Effect.Effect<A, E, R>,
-) =>
-  Effect.gen(function* () {
-    const logLevel = yield* GlobalFlag.LogLevel;
-    const config = yield* resolveCliAuthConfig(flags, logLevel);
-    return yield* run.pipe(
-      Effect.provide(
-        EnvironmentAuth.layerRuntime.pipe(
-          Layer.provide(ServerConfig.layer(config)),
-          Layer.provide(
-            Layer.succeed(References.MinimumLogLevel, quiet ? "Error" : config.logLevel),
-          ),
+) {
+  const logLevel = yield* GlobalFlag.LogLevel;
+  const config = yield* resolveCliAuthConfig(flags, logLevel);
+  return yield* run.pipe(
+    Effect.provide(
+      EnvironmentAuth.layerRuntime.pipe(
+        Layer.provide(ServerConfig.layer(config)),
+        Layer.provide(
+          Layer.succeed(References.MinimumLogLevel, quiet ? "Error" : config.logLevel),
         ),
       ),
-    );
-  });
+    ),
+  );
+});
 
 const encodePretty = Schema.encodeUnknownEffect(
   Schema.fromJsonString(Schema.Unknown, { space: 2 }),

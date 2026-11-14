@@ -126,18 +126,19 @@ def evidence(cfg, classifier, single=False):
 
 
 def reconcile(cfg, detected=None, source=None, evidence_time=None, reported=None, note=None, asked=None):
+    order = cfg['merchant_domain'] + ':' + cfg['order'] if cfg['app'] == 'web' else cfg['order']
     with connect() as db:
         db.execute('INSERT OR IGNORE INTO reconciliation(app,order_id,placed) VALUES (?,?,?)',
-                   (cfg['app'], cfg['order'], cfg['placed_at']))
+                   (cfg['app'], order, cfg['placed_at']))
         for key, value in [('detected', detected), ('source', source), ('evidence_time', evidence_time),
                            ('reported', reported), ('report_note', note), ('asked', asked)]:
             if value is not None:
                 # Preserve the first machine detection. Human corrections can replace reports.
                 expr = f'COALESCE({key},?)' if key in ('detected', 'source', 'evidence_time', 'asked') else '?'
                 db.execute(f'UPDATE reconciliation SET {key}={expr} WHERE app=? AND order_id=?',
-                           (value, cfg['app'], cfg['order']))
+                           (value, cfg['app'], order))
         row = dict(db.execute('SELECT * FROM reconciliation WHERE app=? AND order_id=?',
-                              (cfg['app'], cfg['order'])).fetchone())
+                              (cfg['app'], order)).fetchone())
     row['gap_seconds'] = ((dt.datetime.fromisoformat(row['detected']) - dt.datetime.fromisoformat(row['reported'])).total_seconds()
                           if row['detected'] and row['reported'] else None)
     return row

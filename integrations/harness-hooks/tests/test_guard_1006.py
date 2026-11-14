@@ -1,4 +1,9 @@
 """Historical commands are source-inspected only, never executed."""
+if __package__:
+    from . import test_environment
+else:
+    import test_environment
+
 import hashlib
 import json
 import os
