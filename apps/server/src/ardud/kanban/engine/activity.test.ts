@@ -892,8 +892,10 @@ describe("ledger pool activity", () => {
     );
     // Replay independently: one slot per identity, never one per card or link.
     const open = new Set<string>();
-    for (const event of events)
-      event.kind === "take" ? open.add(event.threadId) : open.delete(event.threadId);
+    for (const event of events) {
+      if (event.kind === "take") open.add(event.threadId);
+      else open.delete(event.threadId);
+    }
     expect(open.size).toBe(0);
   });
 
