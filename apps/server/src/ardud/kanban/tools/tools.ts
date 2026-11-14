@@ -486,7 +486,7 @@ const CardAsk = tool(
     blocking: Schema.optional(Schema.Boolean),
     ...AskFieldsInput,
   },
-  { card: Record },
+  { card: Record, note: Schema.optional(Schema.String) },
   { readonly: false },
 );
 
@@ -834,7 +834,7 @@ const CardEdit = tool(
 const SubtaskDone = tool(
   "subtask_done",
   "Mark a subtask",
-  "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent. With a standing approval live, keep deploy steps worded honestly; don't reword them to dodge the gate.",
+  "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent. Unless standing deploy approval covers it, a gated subtask needs the owner's answer on an ask naming its id; a refusal says which ask is missing. With a standing approval live, keep deploy steps worded honestly; don't reword them to dodge the gate.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),

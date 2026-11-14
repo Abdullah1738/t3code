@@ -9,7 +9,13 @@ import {
 import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
 import * as KanbanStore from "../store/KanbanStore.ts";
-import { approvalProblem, inferGate, isNegativeOption } from "./subtasks.ts";
+import {
+  approvalProblem,
+  approvesGate,
+  askGateWarning,
+  inferGate,
+  isNegativeOption,
+} from "./subtasks.ts";
 import { makeFake, owner, testLayer, toyBoard } from "./askFlows.testkit.ts";
 
 const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("asker") };
@@ -756,7 +762,7 @@ it.effect("a missing decision names the gate and the subtask's time bound", () =
         .pipe(Effect.flip);
       assert.strictEqual(
         refused.detail,
-        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: no owner answer on a deploy ask since ${card.subtasks[0]!.createdAt}; name the subtask id (e.g. s7) in the ask (this board has no standing deploy approval)`,
+        `card #${card.number} subtask s1 (deploy: Deploy) needs Abdullah's approval: no owner answer on a deploy ask since ${card.subtasks[0]!.createdAt}; ask with card_ask naming s1 (e.g. "Approve s1: <step>") (this board has no standing deploy approval)`,
       );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
@@ -1432,4 +1438,230 @@ it.effect(
         assert.strictEqual(old._tag, "Failure");
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
+);
+
+const mergeSubtask: KanbanSubtask = {
+  ...goChoiceSubtask,
+  id: "s4",
+  text: "Merge after a clear review at the exact head with green CI (CI/test only, no deploy)",
+};
+
+it("#4297: sign-off must name the merge subtask with a stored deploy gate", () => {
+  const ask = relevanceAsk({
+    id: "q1",
+    kind: "signoff",
+    title: "Sign off: PR #1288 merged into native-v1 (CI/test only)",
+    text: "Do you approve the merge?",
+  });
+  const card = { ...relevanceCard([ask]), number: 4297, subtasks: [mergeSubtask] };
+  for (const intent of ["do", "skip"] as const) {
+    assert.include(
+      approvalProblem(card, mergeSubtask, [], undefined, intent)!,
+      "q1 was approved but doesn't name s4",
+    );
+    assert.isNull(
+      approvalProblem(
+        { ...card, asks: [{ ...ask, text: "Approve s4: merge PR #1288" }] },
+        mergeSubtask,
+        [],
+        undefined,
+        intent,
+      ),
+    );
+  }
+});
+
+it.each([
+  { label: "Approve", hint: true },
+  { label: "Change", hint: false },
+  { label: "Drop", hint: false },
+])("#4281: unnamed decision pick $label approval hint=$hint", ({ label, hint }) => {
+  const subtask = { ...mergeSubtask, text: "Write the wiki note" };
+  const ask = relevanceAsk({
+    id: "q1",
+    kind: "decision",
+    text: "Close the card?",
+    options: ["Approve", "Change", "Drop"].map((label) => ({ id: label, label })),
+    answer: { verdict: "picked", optionIds: [label], by: owner, at: "2026-11-13T14:03:00.000Z" },
+  });
+  const card = { ...relevanceCard([ask]), number: 4281, subtasks: [subtask] };
+  const problem = approvalProblem(card, subtask)!;
+  assert.strictEqual(problem.includes("q1 was approved but doesn't name s4"), hint);
+  if (!hint) assert.include(problem, "no owner answer on a deploy ask");
+});
+
+it("explains how to ask when a gated step has no approval", () => {
+  const card = { ...relevanceCard([]), subtasks: [mergeSubtask] };
+  assert.include(
+    approvalProblem(card, mergeSubtask)!,
+    'ask with card_ask naming s4 (e.g. "Approve s4: <step>")',
+  );
+});
+
+it.each([
+  [mergeSubtask.text, undefined],
+  ["Merge (no deploy)", undefined],
+  ["Merge (no deploy), then restart Robob", "deploy"],
+  ["Deploy after CI (no restart)", "deploy"],
+] as const)("merge gate regression: %s", (text, gate) => assert.strictEqual(inferGate(text), gate));
+
+it.each([
+  { text: "Close the card?", warning: true },
+  { text: "Approve s4: merge PR #1288", warning: false },
+  { text: "Deploy the build?", warning: false },
+  { text: "Approve s5", warning: true },
+])("ask gate warning: $text", ({ text, warning }) => {
+  const card = { ...relevanceCard([]), subtasks: [mergeSubtask] };
+  const note = askGateWarning(card, relevanceAsk({ text }));
+  assert.strictEqual(note !== undefined, warning);
+  if (warning)
+    assert.strictEqual(note, "This ask won't clear s4 (deploy). Name s4 in the text if it should.");
+});
+
+it.each(["done", "skipped"] as const)("a %s gate needs no ask warning", (state) => {
+  const card = { ...relevanceCard([]), subtasks: [{ ...mergeSubtask, state }] };
+  assert.isUndefined(askGateWarning(card, relevanceAsk({ text: "Close the card?" })));
+});
+
+it("ambiguous inferred wording warns and naming one gate avoids the warning", () => {
+  const card = { ...relevanceCard([]), subtasks: [mergeSubtask, { ...mergeSubtask, id: "s6" }] };
+  assert.include(
+    askGateWarning(card, relevanceAsk({ text: "Deploy the build?" }))!,
+    "s4 (deploy), s6 (deploy)",
+  );
+  assert.isUndefined(askGateWarning(card, relevanceAsk({ text: "Approve s6" })));
+});
+
+it("ask kind and context cannot replace the gate's wording", () => {
+  const card = { ...relevanceCard([]), subtasks: [mergeSubtask] };
+  assert.isDefined(
+    askGateWarning(
+      card,
+      relevanceAsk({ text: "Close the card?", kind: "deploy", context: "Approve s4" }),
+    ),
+  );
+});
+
+it.each([
+  { label: "Keep it", hint: true },
+  { label: "Revert it", hint: false },
+])("Watchers #49: unnamed $label pick approval hint=$hint", ({ label, hint }) => {
+  const subtask = { ...mergeSubtask, id: "s5", text: "Merge into ardud/main and push origin main" };
+  const ask = relevanceAsk({
+    id: "q2",
+    kind: "decision",
+    title: "#49: keep the test-only merge I already pushed to main?",
+    text: "Keep it, or revert it?",
+    options: ["Keep it", "Revert it"].map((label) => ({ id: label, label })),
+    answer: { verdict: "picked", optionIds: [label], by: owner, at: "2026-11-13T14:03:00.000Z" },
+  });
+  const card = { ...relevanceCard([ask]), number: 49, subtasks: [subtask] };
+  assert.strictEqual(
+    approvalProblem(card, subtask)!.includes("q2 was approved but doesn't name s5"),
+    hint,
+  );
+  const named = { ...card, asks: [{ ...ask, text: "For s5: keep it, or revert it?" }] };
+  assert.strictEqual(approvalProblem(named, subtask) === null, hint);
+});
+
+it.each([
+  { task: "Deploy the build", gate: "deploy", hold: "Revert it" },
+  { task: "Purchase the license", gate: "money", hold: "Revert it" },
+  { task: "Merge into ardud/main", gate: "deploy", hold: "Wait" },
+] as const)("Keep it cannot approve $task against $hold", ({ task, gate, hold }) => {
+  const subtask = { ...mergeSubtask, text: task, gate };
+  assert.isNotNull(approvalProblem(goChoiceCard(["Keep it", hold], ["o1"], subtask), subtask));
+});
+
+it.each([
+  { owner: "evaluator", gate: "deploy", text: "Check CI" },
+  { owner: "script", gate: "money", text: "Check prices" },
+  { owner: "evaluator", gate: "secret", text: "Check access" },
+] as const)("warns for an explicit $gate gate owned by $owner", ({ owner, gate, text }) => {
+  const subtask = { ...mergeSubtask, owner, gate, text };
+  const card = { ...relevanceCard([]), subtasks: [subtask] };
+  assert.include(
+    askGateWarning(card, relevanceAsk({ text: "Close the card?" }), [])!,
+    `s4 (${gate})`,
+  );
+});
+
+it("warns for enabled inferred script gates", () => {
+  const subtask = {
+    ...mergeSubtask,
+    owner: "script" as const,
+    gate: undefined,
+    text: "Deploy the build",
+  };
+  const card = { ...relevanceCard([]), subtasks: [subtask] };
+  assert.isDefined(askGateWarning(card, relevanceAsk({ text: "Close the card?" }), ["deploy"]));
+  assert.isUndefined(askGateWarning(card, relevanceAsk({ text: "Close the card?" }), []));
+});
+
+it.each(["Keep it", "Keep it!", "Yes, keep it", "Please keep it"])(
+  "%s retains one merge without granting standing deploy permission",
+  (label) => {
+    const task = "Merge the watchers test-only change for s5";
+    assert.isTrue(approvesGate(label, "deploy", task, ["Revert it"], "subtask"));
+    assert.isFalse(approvesGate(label, "deploy", task, ["Revert it"]));
+    assert.isFalse(approvesGate(label, "deploy", task, ["Revert it"], "standing"));
+  },
+);
+
+it.effect("retaining a merge cannot become a board-wide standing approval", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard("watchers");
+      const store = yield* KanbanStore.KanbanStore;
+      const threadId = yield* kanban.startEvaluator(board.id, {
+        kind: "request",
+        text: "Check standing approval",
+      });
+      const actor: KanbanActor = { _tag: "evaluator", threadId };
+      const card = yield* kanban.createCard(
+        board.id,
+        { title: "Keep merge", prompt: "Work" },
+        owner,
+      );
+      for (const field of ["text", "summary"] as const) {
+        for (const label of ["Keep it", "Keep it!", "Yes, keep it", "Please keep it"]) {
+          const wording = "Merge the watchers test-only change for s5: keep it, or revert it?";
+          const ask = relevanceAsk({
+            id: "q1",
+            text: field === "text" ? wording : "Keep it, or revert it?",
+            ...(field === "summary" ? { action: { summary: wording } } : {}),
+            options: [
+              { id: "keep", label },
+              { id: "revert", label: "Revert it" },
+            ],
+            answer: {
+              verdict: "picked",
+              optionIds: ["keep"],
+              by: owner,
+              at: "2026-11-13T14:03:00.000Z",
+            },
+          });
+          yield* store.putCard({ ...card, asks: [ask] });
+          const denied = yield* kanban
+            .standingApproval(
+              board.id,
+              {
+                action: "grant",
+                cardId: card.id,
+                ask: "q1",
+                quote: label,
+                sourceThreadId: "owner-thread",
+                saidAt: ask.answer!.at,
+              },
+              actor,
+            )
+            .pipe(Effect.flip);
+          assert.strictEqual(denied.code, "denied", `${field}: ${label}`);
+          assert.include(denied.detail, "grant needs a closed ask approved by the owner");
+          assert.deepStrictEqual((yield* kanban.snapshot(board.id)).board.standingApprovals, []);
+        }
+      }
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
 );
