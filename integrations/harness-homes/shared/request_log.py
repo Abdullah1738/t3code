@@ -20,14 +20,24 @@ METHODS = frozenset(("initialize", "ping", "tools/list", "tools/call",
                      "resources/list", "resources/read", "resources/templates/list",
                      "resources/subscribe", "resources/unsubscribe", "prompts/list",
                      "prompts/get", "logging/setLevel", "completion/complete"))
+HTTP_METHODS = frozenset(("GET", "POST", "DELETE", "OPTIONS", "HEAD"))
 
 
-def emit_request(server, tools, body, status, duration_ms, load):
+def emit_request(server, tools, body, status, duration_ms, load, http_method,
+                 ttfb_ms, stream, reason):
     if toollog is None:
         return
-    props = {"method": "unknown", "status": status}
+    props = {"method": "stream" if stream else "http:" + http_method,
+             "httpMethod": http_method, "status": status}
+    if ttfb_ms is not None:
+        props["ttfbMs"] = round(ttfb_ms, 3)
+    if reason:
+        props["reason"] = reason
     try:
-        rpc = json.loads(body)
+        rpc = None
+        if http_method == "POST" and body != b"":
+            props["method"] = "unknown"
+            rpc = json.loads(body) if body is not None else None
         if isinstance(rpc, dict):
             method = rpc.get("method")
             props["method"] = method if isinstance(method, str) and method in METHODS else "unknown"
@@ -37,9 +47,10 @@ def emit_request(server, tools, body, status, duration_ms, load):
                 props["toolName"] = tool
     except (ValueError, UnicodeError, RecursionError):
         pass
-    if load is not None:
+    if load is not None and not stream:
         props.update(zip(("load1", "load5", "load15"), load))
-    toollog.emit("shared-mcp", "perf", "mcp.request", ids={"serverId": server},
+    toollog.emit("shared-mcp", "event" if stream else "perf",
+                 "mcp.stream" if stream else "mcp.request", ids={"serverId": server},
                  props=props, duration_ms=duration_ms, ok=status < 400)
 
 
@@ -80,6 +91,11 @@ class RequestLogMiddleware:
         body = bytearray()
         oversized = False
         status = 500
+        http_method = scope.get("method")
+        http_method = http_method if http_method in HTTP_METHODS else "other"
+        ttfb = None
+        content_type = b""
+        reason = bytearray()
 
         async def read():
             nonlocal oversized
@@ -96,9 +112,18 @@ class RequestLogMiddleware:
             return message
 
         async def write(message):
-            nonlocal status
+            nonlocal status, ttfb, content_type
             if message["type"] == "http.response.start":
                 status = int(message["status"])
+                ttfb = (time.perf_counter() - started) * 1000
+                content_type = next((value.split(b";", 1)[0].strip().lower()
+                                     for name, value in message.get("headers", ())
+                                     if name.lower() == b"content-type"), b"")
+            elif (message["type"] == "http.response.body" and status >= 400
+                  and (content_type in (b"application/json", b"text/plain")
+                       or content_type.startswith(b"application/") and content_type.endswith(b"+json"))):
+                # Four UTF-8 bytes per character suffice even across chunks.
+                reason.extend(message.get("body", b"")[:480 - len(reason)])
             await send(message)
 
         try:
@@ -106,7 +131,9 @@ class RequestLogMiddleware:
         finally:
             try:
                 duration = (time.perf_counter() - started) * 1000
-                load = os.getloadavg() if duration > 1000 else None
-                self.pending.put_nowait((bytes(body), status, duration, load))
+                stream = http_method == "GET" and status == 200 and content_type == b"text/event-stream"
+                load = os.getloadavg() if duration > 1000 and not stream else None
+                self.pending.put_nowait((None if oversized else bytes(body), status, duration, load,
+                                        http_method, ttfb, stream, reason.decode("utf-8", errors="replace")[:120]))
             except Exception:
                 pass
