@@ -1,3 +1,8 @@
+if __package__:
+    from . import test_environment
+else:
+    import test_environment
+
 from contextlib import ExitStack
 import os
 from pathlib import Path
