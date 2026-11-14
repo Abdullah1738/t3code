@@ -93,6 +93,61 @@ const MAX_LIST_LIMIT = 500;
 const DEFAULT_MESSAGE_LIMIT = 50;
 const MAX_WAIT_MS = 60 * 60 * 1000;
 
+const ThreadListCursorJson = Schema.fromJsonString(
+  Schema.Struct({
+    u: Schema.Int.check(
+      Schema.isBetween({ minimum: -8_640_000_000_000_000, maximum: 8_640_000_000_000_000 }),
+    ),
+    id: Schema.String.check(Schema.isPattern(/\S/)),
+  }),
+);
+type ThreadListCursor = typeof ThreadListCursorJson.Type;
+
+const decodeThreadListCursor = Effect.fn("ControlHttp.decodeThreadListCursor")(function* (
+  value: string | null,
+) {
+  if (value === null) return null;
+  const text = yield* Effect.try({
+    try: () => {
+      if (value.length > 8192 || !/^[A-Za-z0-9_-]+$/.test(value)) throw new Error();
+      const bytes = Buffer.from(value, "base64url");
+      if (bytes.toString("base64url") !== value) throw new Error();
+      return bytes.toString("utf8");
+    },
+    catch: () => fail("invalid_request", "cursor must be a valid thread listing cursor."),
+  });
+  return yield* Schema.decodeEffect(ThreadListCursorJson, { onExcessProperty: "error" })(text).pipe(
+    Effect.mapError(() => fail("invalid_request", "cursor must be a valid thread listing cursor.")),
+  );
+});
+
+const afterThreadListCursor = (
+  shell: OrchestrationV2ThreadShell,
+  cursor: ThreadListCursor | null,
+) =>
+  cursor === null ||
+  DateTime.toEpochMillis(shell.updatedAt) < cursor.u ||
+  (DateTime.toEpochMillis(shell.updatedAt) === cursor.u &&
+    Buffer.compare(Buffer.from(shell.id), Buffer.from(cursor.id)) < 0);
+
+const compareThreadListShells = (
+  left: OrchestrationV2ThreadShell,
+  right: OrchestrationV2ThreadShell,
+) =>
+  DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt) ||
+  Buffer.compare(Buffer.from(right.id), Buffer.from(left.id));
+
+const nextThreadListCursor = (shells: ReadonlyArray<OrchestrationV2ThreadShell>, limit: number) => {
+  const last = shells[limit - 1];
+  return shells.length > limit && last !== undefined
+    ? Buffer.from(
+        Schema.encodeSync(ThreadListCursorJson)({
+          u: DateTime.toEpochMillis(last.updatedAt),
+          id: last.id,
+        }),
+      ).toString("base64url")
+    : null;
+};
 
 type ControlErrorCode =
   | "unauthorized"
@@ -185,7 +240,6 @@ const errorResponse = (error: ControlError) => {
     : response;
 };
 
-
 type Scope = typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope;
 
 const searchParams = Effect.gen(function* () {
@@ -215,9 +269,7 @@ const decodeBody = Effect.fn("ControlHttp.decodeBody")(function* <A>(
     text.trim().length === 0
       ? {}
       : yield* decodeJsonText(text).pipe(
-          Effect.mapError(() =>
-            fail("invalid_request", "The request body is not valid JSON."),
-          ),
+          Effect.mapError(() => fail("invalid_request", "The request body is not valid JSON.")),
         );
   return yield* decode(raw).pipe(
     Effect.mapError((error) => fail("invalid_request", error.message)),
@@ -231,7 +283,6 @@ const clampInt = (raw: string | null, fallback: number, max: number) => {
 
 const boolParam = (raw: string | null): boolean | undefined =>
   raw === null ? undefined : raw === "" || raw === "1" || raw === "true";
-
 
 const OptionalString = Schema.optional(Schema.String);
 const ModelOptions = Schema.optional(Schema.Array(ProviderOptionSelection));
@@ -356,7 +407,6 @@ const DECISIONS: Record<string, ProviderApprovalDecision> = {
   always: "acceptForSession",
 };
 
-
 export type ControlEvent =
   | {
       readonly type: "thread.created";
@@ -451,7 +501,6 @@ const encoder = new TextEncoder();
 const encodeEventJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const sseFrame = (sequence: number, event: ControlEvent & { readonly origin?: string | null }) =>
   `id: ${sequence}\nevent: ${event.type}\ndata: ${encodeEventJson(event)}\n\n`;
-
 
 const makeRoutes = Effect.gen(function* () {
   const candidateBuildCommit = (yield* ServerConfig.ServerConfig).robobBuildCommit;
@@ -631,6 +680,19 @@ const makeRoutes = Effect.gen(function* () {
       .getThreadRecords(ThreadId.make(threadId), ["messages"])
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
 
+  const filterByOrigin = Effect.fn("ControlHttp.filterByOrigin")(function* (
+    shells: ReadonlyArray<OrchestrationV2ThreadShell>,
+    origin: string,
+  ) {
+    const origins = yield* store
+      .getOrigins([...new Set(shells.flatMap((shell) => [shell.id, shell.lineage.rootThreadId]))])
+      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    return shells.filter((shell) => {
+      const value = origins.get(shell.id) ?? origins.get(shell.lineage.rootThreadId) ?? null;
+      return origin === "none" ? value === null : value === origin;
+    });
+  });
+
   const summarize = Effect.fn("ControlHttp.summarize")(function* (
     shells: ReadonlyArray<OrchestrationV2ThreadShell>,
   ) {
@@ -677,15 +739,10 @@ const makeRoutes = Effect.gen(function* () {
       state,
       status: run?.status ?? "idle",
       run: run === null ? null : runSummary(run),
-      recentRuns: runsNewestFirst(records.runs)
-        .slice(0, THREAD_DETAIL_RECENT_RUNS)
-        .map(runSummary),
-      pendingRequests: pending.map((request) =>
-        pendingRequestSummary(request, records.turnItems),
-      ),
+      recentRuns: runsNewestFirst(records.runs).slice(0, THREAD_DETAIL_RECENT_RUNS).map(runSummary),
+      pendingRequests: pending.map((request) => pendingRequestSummary(request, records.turnItems)),
     };
   });
-
 
   const listUsage = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
@@ -765,7 +822,6 @@ const makeRoutes = Effect.gen(function* () {
     });
   });
 
-
   const resolveProject = Effect.fn("ControlHttp.resolveProject")(function* (
     body: typeof CreateThreadBody.Type,
   ) {
@@ -775,10 +831,7 @@ const makeRoutes = Effect.gen(function* () {
       body.scratch === true ? "scratch" : undefined,
     ].filter((value) => value !== undefined).length;
     if (chosen > 1) {
-      return yield* fail(
-        "invalid_request",
-        "Pass only one of projectId, directory or scratch.",
-      );
+      return yield* fail("invalid_request", "Pass only one of projectId, directory or scratch.");
     }
     if (body.projectId !== undefined) {
       const project = yield* projects
@@ -962,9 +1015,11 @@ const makeRoutes = Effect.gen(function* () {
       readonly states: ReadonlyArray<string> | undefined;
       readonly origin: string | null;
       readonly limit: number;
+      readonly cursor: ThreadListCursor | null;
     },
   ) {
-    const { location, since, active, states, projectId, parentThreadId, origin, limit } = input;
+    const { location, since, active, states, projectId, parentThreadId, origin, limit, cursor } =
+      input;
     const needsState = active !== undefined || states !== undefined;
     const scanAll = needsState || origin !== null;
     let total = scanAll
@@ -973,9 +1028,14 @@ const makeRoutes = Effect.gen(function* () {
           .threadCandidateCount(input)
           .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
     const shells: Array<OrchestrationV2ThreadShell> = [];
-    let after: ControlStore.ThreadCandidateCursor | undefined;
-    while (scanAll || shells.length < limit) {
-      const pageLimit = scanAll ? 128 : Math.min(128, limit - shells.length);
+    // Origin/state totals still scan every candidate, but only this page loads native metadata.
+    let after: ControlStore.ThreadCandidateCursor | undefined =
+      !scanAll && cursor !== null
+        ? { updatedAt: DateTime.formatIso(DateTime.makeUnsafe(cursor.u)), threadId: cursor.id }
+        : undefined;
+    const pageSize = limit + 1;
+    while (scanAll || shells.length < pageSize) {
+      const pageLimit = scanAll ? 128 : Math.min(128, pageSize - shells.length);
       const page = yield* store
         .threadCandidatePage({
           ...input,
@@ -1000,10 +1060,10 @@ const makeRoutes = Effect.gen(function* () {
       let consumed = 0;
       // A shell can disappear after candidate selection; refill from this page
       // before moving its cursor past eligible rows we have not tried.
-      while (consumed < matched.length && (needsState || shells.length < limit)) {
+      while (consumed < matched.length && (needsState || shells.length < pageSize)) {
         const batch = matched.slice(
           consumed,
-          needsState ? matched.length : consumed + limit - shells.length,
+          needsState ? matched.length : consumed + pageSize - shells.length,
         );
         consumed += batch.length;
         const loaded = (yield* shellsFor(
@@ -1027,27 +1087,37 @@ const makeRoutes = Effect.gen(function* () {
               (states === undefined || states.includes(stateFromShell(shell))),
           );
           total += filtered.length;
-          shells.push(...filtered.slice(0, limit - shells.length));
+          shells.push(
+            ...filtered
+              .filter((shell) => afterThreadListCursor(shell, cursor))
+              .slice(0, pageSize - shells.length),
+          );
         } else {
           total -= batch.length - loaded.length;
-          shells.push(...loaded);
+          shells.push(
+            ...loaded
+              .filter((shell) => afterThreadListCursor(shell, cursor))
+              .slice(0, pageSize - shells.length),
+          );
         }
       }
       after = { updatedAt: last.updatedAt, threadId: last.threadId };
       if (page.length < pageLimit) break;
     }
-    const summaries = yield* summarize(
-      shells.toSorted(
-        (left, right) =>
-          DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
-      ),
-    );
-    return yield* encoded({ ok: true, total, threads: summaries });
+    const ordered = shells.toSorted(compareThreadListShells);
+    const summaries = yield* summarize(ordered.slice(0, limit));
+    return yield* encoded({
+      ok: true,
+      total,
+      threads: summaries,
+      nextCursor: nextThreadListCursor(ordered, limit),
+    });
   });
 
   const listThreads = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const params = yield* searchParams;
+    const cursor = yield* decodeThreadListCursor(params.get("cursor"));
     const archived = boolParam(params.get("archived")) === true;
     const location = archived ? "archive" : "active";
     const since = parseSince(params.get("updatedSince"));
@@ -1079,6 +1149,7 @@ const makeRoutes = Effect.gen(function* () {
         ...(creationSources === undefined ? {} : { creationSources }),
         origin,
         limit,
+        cursor,
       });
     }
     const candidateIds =
@@ -1105,20 +1176,18 @@ const makeRoutes = Effect.gen(function* () {
     if (states !== undefined) {
       shells = shells.filter((shell) => states.includes(stateFromShell(shell)));
     }
-    shells = shells.toSorted(
-      (left, right) =>
-        DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
-    );
-    let summaries = yield* summarize(shells);
-    if (origin !== null) {
-      summaries = summaries.filter((summary) =>
-        origin === "none" ? summary.origin === null : summary.origin === origin,
-      );
-    }
+    if (origin !== null) shells = yield* filterByOrigin(shells, origin);
+    const total = shells.length;
+    const page = shells
+      .filter((shell) => afterThreadListCursor(shell, cursor))
+      .toSorted(compareThreadListShells)
+      .slice(0, limit + 1);
+    const summaries = yield* summarize(page.slice(0, limit));
     return yield* encoded({
       ok: true,
-      total: summaries.length,
-      threads: summaries.slice(0, limit),
+      total,
+      threads: summaries,
+      nextCursor: nextThreadListCursor(page, limit),
     });
   }).pipe(NodeSqliteClient.foregroundReads);
 
@@ -1734,7 +1803,6 @@ const makeRoutes = Effect.gen(function* () {
     yield* Effect.annotateCurrentSpan("control.returned_count", requests.length);
     return json({ ok: true, requests });
   }, NodeSqliteClient.foregroundReads);
-
 
   const events = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);

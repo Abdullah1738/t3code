@@ -657,11 +657,26 @@ describe("ControlClient", () => {
         response.end(JSON.stringify({ ok: false, error: { code: "unauthorized", message: "no" } }));
         return;
       }
-      response.end(JSON.stringify({ ok: true, threads: [], total: 0, path: request.url }));
+      response.end(
+        JSON.stringify({
+          ok: true,
+          threads: [],
+          total: 0,
+          nextCursor: "next-page",
+          path: request.url,
+        }),
+      );
     });
     const client = new ControlClient({ url, token: "t0k" });
-    const result = await client.listThreads({ origin: "imessage", active: true });
-    expect(result.path).toBe("/api/ardud/control/threads?origin=imessage&active=true");
+    const result = await client.listThreads({
+      origin: "imessage",
+      active: true,
+      cursor: "current-page",
+    });
+    expect(result.nextCursor).toBe("next-page");
+    expect(result.path).toBe(
+      "/api/ardud/control/threads?origin=imessage&active=true&cursor=current-page",
+    );
     const bad = new ControlClient({ url, token: "wrong" });
     await expect(bad.projects()).rejects.toBeInstanceOf(ControlApiError);
   });
