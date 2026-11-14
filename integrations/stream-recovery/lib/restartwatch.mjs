@@ -1,4 +1,4 @@
-import { emit, observed, recoveryIo } from './logging.mjs';
+import { emit, observed, recoveryIo, timedScan } from './logging.mjs';
 // Restart watch: spot interrupted native subagents, delegated tasks and turns,
 // tell each parent thread what it lost (once), and send one summary per restart.
 // The caller loads and saves state.
@@ -311,25 +311,33 @@ function stallInterrupted(state, ses, cancelMs, threadId = null) {
 }
 
 export async function restartScan(options, io = realIo) {
-  return observed('stream-recovery', 'restart.scan', () => restartScanImpl(options, io));
+  return timedScan('restart', io, timed => restartScanImpl(options, timed));
 }
 
-async function restartScanImpl({ db, state, now, sinceIso, floorMs, dryRun = false, seed = false, verbose = false, log }, io = realIo) {
+async function restartScanImpl({ db, refreshDb, state, now, sinceIso, floorMs, dryRun = false, seed = false, verbose = false, log }, io = realIo) {
   assertRecoveryActive(io);
   io = recoveryIo(guardRecoveryIo(io));
+  const freshBatch = () => { if (refreshDb) db = refreshDb(); else io.assertReplicaFresh(db); };
   io.assertReplicaFresh(db);
   state.servers = trackServer(state.servers, io.serverRuntime(), now);
   state.servers = trackServer(state.servers, io.openCodeRuntime(), now);
+  freshBatch();
   const nativeSubs = io.cancelledSubagentsSince(db, sinceIso)
     .filter((s) => !stallInterrupted(state, sessionFromProviderThread(s.provider_thread_id), toMs(s.completed_at)));
-  const delegatedSubs = io.cancelledDelegatedTasksSince(db, sinceIso)
+  freshBatch();
+  const delegatedCandidates = io.cancelledDelegatedTasksSince(db, sinceIso);
+  freshBatch();
+  const delegatedSubs = delegatedCandidates
     .filter((s) => !stallInterrupted(state, io.childNativeSession(db, s.childThreadId), toMs(s.completed_at), s.childThreadId));
   const subs = [...nativeSubs, ...delegatedSubs];
   for (const s of subs) {
+    freshBatch();
     s.parentThreadId = topParent(io, db, s.thread_id) ?? s.thread_id;
     s.rootThreadId = io.threadRoot(db, s.parentThreadId) ?? s.parentThreadId;
   }
+  freshBatch();
   const runs = io.restartRunsSince(db, sinceIso);
+  freshBatch();
   const incidents = findRestartIncidents(subs, { runs, serverStarts: state.servers });
   // Deferred fresh work can outlive the discovery lookback. Keep its original
   // rows until every affected thread is handled, without widening DB scans.
@@ -434,6 +442,7 @@ async function restartScanImpl({ db, state, now, sinceIso, floorMs, dryRun = fal
         let failedTask = null;
         for (const sub of pendingTasks) {
           try {
+            freshBatch();
             await observed('stream-recovery', 'restart.late', () => handleLateDelegated({ io, db, incident: recoveryIncident, threadId, sub, dryRun, progress, save }));
             assertRecoveryActive(io);
             if (!dryRun) progress.lateFailures = 0;
@@ -477,6 +486,7 @@ async function restartScanImpl({ db, state, now, sinceIso, floorMs, dryRun = fal
       let res;
       const progress = entry.threads[threadId] ??= {};
       try {
+        freshBatch();
         res = await handleThread({ io, db, incident: recoveryIncident, threadId, subs: list, getActive, dryRun, now, windowStart, progress, save });
         assertRecoveryActive(io);
         if (res?.ok && !res.deferred && !dryRun) {
@@ -530,7 +540,7 @@ async function restartScanImpl({ db, state, now, sinceIso, floorMs, dryRun = fal
       }
     }
     assertRecoveryActive(io);
-    io.assertReplicaFresh(db);
+    freshBatch();
     const summary = buildRestartSummary({ incident, results: all });
     // Archiving several threads at once also cancels their subagents; that is
     // not worth a ping.

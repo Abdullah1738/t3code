@@ -5,6 +5,7 @@ Owner rule (nightly 2026-10-24): before asking about a charge, look for its rece
 threads around the charge, and when it's a merchant he already pays, wait for the receipt ("Wait for
 the email", 24 Oct). Only a charge none of these explain goes to him.
 """
+import contextvars
 import datetime as dt
 from decimal import Decimal, InvalidOperation
 import http.client
@@ -119,9 +120,17 @@ OWNER_BUDGET = 4
 MSGS_BUDGET = 2
 
 
+TIMING_STATS = contextvars.ContextVar('money_cases_timing_stats', default=None)
+_TIMING_STACK = contextvars.ContextVar('money_cases_timing_stack', default=())
+
+
 @contextmanager
 def step_timing(stats, name, deadline=None):
+    stats = stats if stats is not None else TIMING_STATS.get()
     started = time.monotonic()
+    stack = _TIMING_STACK.get()
+    frame = {'stats': stats, 'children': 0.0}
+    token = _TIMING_STACK.set((*stack, frame))
     alarm = signal.getitimer(signal.ITIMER_REAL)[0]
     if alarm:
         enclosing = time.time() + alarm
@@ -133,12 +142,18 @@ def step_timing(stats, name, deadline=None):
         error = exc
         raise
     finally:
+        elapsed = (time.monotonic() - started) * 1000
+        _TIMING_STACK.reset(token)
+        if stack and stack[-1]['stats'] is stats:
+            stack[-1]['children'] += elapsed
         if stats is not None:
-            elapsed = round((time.monotonic() - started) * 1000)
+            # Nested source/storage steps own their time; the parent records only
+            # its remaining work so the follow buckets can be summed.
+            exclusive = round(max(0, elapsed - frame['children']))
             key = name + '_ms'
-            stats[key] = stats.get(key, 0) + elapsed
+            stats[key] = stats.get(key, 0) + exclusive
             if name == 'msgs':
-                stats['msgs_max_ms'] = max(stats.get('msgs_max_ms', 0), elapsed)
+                stats['msgs_max_ms'] = max(stats.get('msgs_max_ms', 0), round(elapsed))
             if deadline is not None and time.time() >= deadline:
                 stats['starved_by'] = name
                 if error is not None and not hasattr(error, '_money_cases_step'):

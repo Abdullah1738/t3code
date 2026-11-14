@@ -107,6 +107,8 @@ export class LegacyV1ThreadImportError extends Schema.TaggedError<LegacyV1Thread
   }
 }
 
+const isImportError = Schema.is(LegacyV1ThreadImportError);
+
 export interface LegacyV1ThreadImporterShape {
   readonly pendingThreadCount: Effect.Effect<number, LegacyV1ThreadImportError>;
   readonly reconcileShells: Effect.Effect<LegacyV1ImportSummary, LegacyV1ThreadImportError>;
@@ -770,7 +772,17 @@ const make = Effect.gen(function* () {
           AND event.event_type = 'thread.created'
           AND event.event_id NOT LIKE ${`${IMPORT_EVENT_PREFIX}:%`}
         LIMIT 1
-      `.pipe(NodeSqliteClient.readOnly);
+      `.pipe(
+        NodeSqliteClient.readOnly,
+        Effect.mapError(
+          (cause) =>
+            new LegacyV1ThreadImportError({
+              operation: "check transcript readiness for",
+              threadId,
+              cause,
+            }),
+        ),
+      );
       const imported = imports[0];
       if (imported === undefined) {
         return { importedThreadCount: 0, importedMessageCount: 0 };
@@ -779,17 +791,22 @@ const make = Effect.gen(function* () {
         if (cacheConfirmation) confirmedTranscriptThreadIds.add(threadId);
         return { importedThreadCount: 0, importedMessageCount: 0 };
       }
-      return yield* ensureTranscriptBase(threadId, cacheConfirmation);
+      // Hydration can read the entire legacy transcript and write batches. Only
+      // the indexed readiness check above may inherit an interactive reader lane.
+      return yield* ensureTranscriptBase(threadId, cacheConfirmation).pipe(
+        NodeSqliteClient.backgroundReads,
+      );
     },
     (effect, threadId) =>
       effect.pipe(
-        Effect.mapError(
-          (cause) =>
-            new LegacyV1ThreadImportError({
-              operation: "hydrate transcript for",
-              threadId,
-              cause,
-            }),
+        Effect.mapError((cause) =>
+          isImportError(cause)
+            ? cause
+            : new LegacyV1ThreadImportError({
+                operation: "hydrate transcript for",
+                threadId,
+                cause,
+              }),
         ),
       ),
   );

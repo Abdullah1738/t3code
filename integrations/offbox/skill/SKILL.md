@@ -306,7 +306,7 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
   checks; nothing to switch by hand. `offbox status` shows which one is in use.
 - Marked up but not answering when your run starts (or while its box is being fetched): the run moves to Boat
   before it is sent, with one line (`... this run goes to Boat instead`). **Once the server accepted a run it
-  never moves**, so nothing runs twice.
+  never moves**, so nothing runs twice. A server that says it is starting is waited for (up to 600 s) instead of failing over.
 - A run naming `--base` saved only on home waits for home (exit **93** when the wait expires) and never runs on Boat's template.
 - The server restarts under an accepted run (power cut, reboot, boatd restart): the client reconnects for up to
   15 minutes and carries on from where the output stopped. If the machine itself restarted, the server runs the

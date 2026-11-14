@@ -44,7 +44,7 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as LargeReplyLog from "../observability/LargeReplyLog.ts";
 import * as McpReplySize from "../observability/McpReplySize.ts";
 import {
-  jsonExceedsBudget,
+  jsonBytesUpToLimit,
   MAX_REPLY_BYTES,
   REPLY_TOO_LARGE,
   ReplyTooLarge,
@@ -62,6 +62,7 @@ import {
 } from "../telemetry/ProviderDimensions.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
+import * as McpDeadline from "./McpDeadline.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import { PreviewControlsToolkit } from "./toolkits/previewControls/tools.ts";
 import * as PreviewControlsHandlers from "./toolkits/previewControls/handlers.ts";
@@ -1189,17 +1190,40 @@ const withToolAnalytics =
                 : options.tool.name === "list_scheduled_tasks"
                   ? controlReplyReady
                   : Effect.void;
+              const largeRead = LARGE_READ_TOOLS.has(options.tool.name);
+              let phase: "lane" | "readiness" | "handler" = "lane";
+              let phaseStarted = yield* Clock.monotonicTimeNanos;
+              const readStarted = phaseStarted;
+              const timings = { readinessWaitMs: 0, laneWaitMs: 0, handlerMs: 0 };
+              const phaseKey = {
+                lane: "laneWaitMs",
+                readiness: "readinessWaitMs",
+                handler: "handlerMs",
+              } as const;
+              // The tools/call span owns these timings, including an interrupted wait.
+              const advance = Effect.fnUntraced(function* (next: typeof phase) {
+                const now = yield* Clock.monotonicTimeNanos;
+                timings[phaseKey[phase]] += Number(now - phaseStarted) / 1e6;
+                phase = next;
+                phaseStarted = now;
+              });
               const result = readiness
+                .pipe(Effect.andThen(largeRead ? advance("handler") : Effect.void))
                 .pipe(Effect.andThen(options.handle(payload)))
                 .pipe(Effect.provideService(ReplyRejection, rejection));
               // Large reads run on their own "mcp" lane (whole call, so at most
               // PERMITS.mcp large results are built at once). They queue only behind
               // each other, never behind control polls, lists or snapshots (10 Nov
               // 2026: t3_thread_read held the shared agent lane up to 153 s).
+              let measuredResult: unknown;
+              let replyBytes = 0;
               const check = <A>(built: A): A | McpSchema.CallToolResult => {
                 // MCP repeats the result as text and structuredContent; leave envelope headroom.
-                if (!rejection.exceeded && !jsonExceedsBudget(built, MAX_REPLY_BYTES - 4096))
-                  return built;
+                if (!rejection.exceeded) {
+                  replyBytes = jsonBytesUpToLimit(built, MAX_REPLY_BYTES - 4096);
+                  measuredResult = built;
+                  if (replyBytes <= MAX_REPLY_BYTES - 4096) return built;
+                }
                 if (Option.isSome(largeRepliesForTools))
                   largeRepliesForTools.value.record({
                     kind: "mcp",
@@ -1214,8 +1238,11 @@ const withToolAnalytics =
               };
               const completed = result.pipe(
                 (call) =>
-                  LARGE_READ_TOOLS.has(options.tool.name)
-                    ? ReplyBuilders.bounded(Effect.map(call, check), "mcp")
+                  largeRead
+                    ? ReplyBuilders.bounded(
+                        advance("readiness").pipe(Effect.andThen(Effect.map(call, check))),
+                        "mcp",
+                      )
                     : Effect.map(call, check),
                 Effect.catchCauseIf(
                   (cause) =>
@@ -1240,9 +1267,71 @@ const withToolAnalytics =
                   },
                 ),
               );
+              // Reuse the bounded-read waiter so masked SQLite cleanup cannot hold the reply.
+              const boundedRead =
+                options.tool.name === "list_scheduled_tasks"
+                  ? McpDeadline.awaitInterruptibly(completed).pipe(
+                      Effect.timeoutOrElse({
+                        duration: "20 seconds",
+                        orElse: Effect.fn("McpHttpServer.scheduledReadBusy")(function* () {
+                          const now = yield* Clock.monotonicTimeNanos;
+                          return new McpSchema.CallToolResult({
+                            isError: true,
+                            content: [
+                              {
+                                type: "text",
+                                text: "Robob is busy; nothing was read. Retry the same call.",
+                              },
+                            ],
+                            structuredContent: {
+                              reason: "server_busy",
+                              phase,
+                              waitedMs: Number(now - readStarted) / 1e6,
+                            },
+                          });
+                        }),
+                      }),
+                    )
+                  : completed;
+              const measuredRead = largeRead
+                ? boundedRead.pipe(
+                    Effect.onExit((exit) =>
+                      Effect.gen(function* () {
+                        const now = yield* Clock.monotonicTimeNanos;
+                        const elapsed = { ...timings };
+                        elapsed[phaseKey[phase]] += Number(now - phaseStarted) / 1e6;
+                        const result = exit._tag === "Success" ? exit.value : undefined;
+                        const content =
+                          result !== undefined && "structuredContent" in result
+                            ? result.structuredContent
+                            : undefined;
+                        yield* Effect.annotateCurrentSpan({
+                          ...elapsed,
+                          replyBytes:
+                            result === undefined
+                              ? 0
+                              : result === measuredResult
+                                ? replyBytes
+                                : jsonBytesUpToLimit(result),
+                          ...(options.tool.name === "list_scheduled_tasks"
+                            ? {
+                                taskCount:
+                                  content !== null &&
+                                  typeof content === "object" &&
+                                  "tasks" in content &&
+                                  Array.isArray(content.tasks)
+                                    ? content.tasks.length
+                                    : 0,
+                              }
+                            : {}),
+                        });
+                      }),
+                    ),
+                  )
+                : boundedRead;
               const protectedCall = SavedBoardReply.TOOLS.has(options.tool.name)
-                ? SavedBoardReply.protect(completed, options.tool.name)
-                : completed;
+                ? SavedBoardReply.protect(measuredRead, options.tool.name)
+                : measuredRead;
               return yield* protectedCall.pipe(
                 Effect.provideService(McpCallAnalytics.McpCall, callState),
                 Effect.provideService(SavedWrite.observer, (receipt) => {
