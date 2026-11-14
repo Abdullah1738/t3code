@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import order_card
 from unittest.mock import patch
 
 import commerce_cli as cli
@@ -111,7 +112,7 @@ class MinutesIntegrationTests(unittest.TestCase):
         flow.flow_id='10000000-0000-4000-8000-000000000001'
         flow.review={'order':'IAEGA123','amount':1725}
         flow.current=c.m.Snapshot({'isCvvRequired':True,'paymentProviderCode':'NOON_PAY'}, {},time.time())
-        flow.card=c.m.SavedCard('synthetic-token','xxxx2342','mastercard')
+        flow.card=c.m.SavedCard('synthetic-token','xxxx' + order_card.LAST4,order_card.NETWORK)
         flow.client=Mock()
         flow.client.order_status.return_value=c.m.Snapshot({'orderTotal':17.25,
             'paymentIntentToken':'synthetic-intent','installmentCount':None,'paymentType':None,'idEmiPlan':None},
@@ -135,7 +136,7 @@ class MinutesIntegrationTests(unittest.TestCase):
         flow.flow_id='10000000-0000-4000-8000-000000000001'
         flow.review={'order':'IAEGA123','amount':1725}
         flow.current=c.m.Snapshot({'isCvvRequired':False,'paymentProviderCode':'NOON_PAY'},{},time.time())
-        flow.card=c.m.SavedCard('synthetic-token','xxxx2342','mastercard')
+        flow.card=c.m.SavedCard('synthetic-token','xxxx' + order_card.LAST4,order_card.NETWORK)
         flow.client=Mock()
         flow.client.order_status.return_value=c.m.Snapshot({'orderTotal':17.25,
             'paymentIntentToken':'synthetic-intent','placedAt':'2026-10-10T13:18:29',
@@ -194,7 +195,7 @@ def _empty_session_wire(cvv_required):
 
 def _saved_cards():
     # The saved card's id is the same token the session's paymentToken fingerprints to.
-    return {'data':[{'id':'synthetic-payment-token','ccMasked':'xxxx2342','ccType':'mastercard',
+    return {'data':[{'id':'synthetic-payment-token','ccMasked':'xxxx' + order_card.LAST4,'ccType':order_card.NETWORK,
                      'isDefault':True,'isDeleted':False}]}
 
 
@@ -693,7 +694,7 @@ class ResumeActiveTests(unittest.TestCase):
     def test_scope_digest_unchanged_without_extra_and_differs_with_extra(self):
         skus=[{'sku':'SYNTHETIC_SHAKE','qty':1,'modifiers':()}]
         home=fingerprint('home')
-        old=c.j.digest({'skus':skus,'home':home,'card':'2342','quiet':True,'extras':False})
+        old=c.j.digest({'skus':skus,'home':home,'card':order_card.LAST4,'quiet':True,'extras':False})
         self.assertEqual(c._scope_hash(skus,home,None),old)
         self.assertNotEqual(c._scope_hash(skus,home,'Gate 1'),old)
 
@@ -710,7 +711,7 @@ class ResumeActiveTests(unittest.TestCase):
         flow.driver_note=c.m.quiet_note()
         from unittest.mock import Mock
         flow.client=Mock()
-        with patch.object(c.m,'saved_order_card',return_value=c.m.SavedCard('synthetic-payment-token','xxxx 2342','mastercard')):
+        with patch.object(c.m,'saved_order_card',return_value=c.m.SavedCard('synthetic-payment-token','xxxx ' + order_card.LAST4,order_card.NETWORK)):
             review=flow.approve()
         self.assertEqual(review['quiet_codes_set'],['dont_ring_the_bell'])
         self.assertEqual(review['quiet_codes_not_offered'],['leave_it_at_my_door'])
