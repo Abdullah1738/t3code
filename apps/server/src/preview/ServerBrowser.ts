@@ -1498,6 +1498,7 @@ const make = Effect.gen(function* () {
         const firstFrame = await ServerBrowserPage.captureViewport(tab.cdp, {
           format: "jpeg",
           quality: RECORDING_SCREENCAST.quality,
+          keepPaintable: tab.desktop !== null,
         });
         await encoder.evaluate(
           ([data, width]) =>
@@ -2381,7 +2382,11 @@ const make = Effect.gen(function* () {
     pushFileChooser(tab);
     const pushStill = async () => {
       const data = await withCaptureLock(tab, () =>
-        ServerBrowserPage.captureViewport(session, { format: "jpeg", quality }),
+        ServerBrowserPage.captureViewport(session, {
+          format: "jpeg",
+          quality,
+          keepPaintable: tab.desktop !== null,
+        }),
       ).catch(() => null);
       if (data) viewer.push({ _tag: "frame", data: Buffer.from(data, "base64"), ack: Effect.void });
     };
