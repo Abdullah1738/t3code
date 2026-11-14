@@ -2909,6 +2909,42 @@ const make = Effect.gen(function* () {
         }
         workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
       }
+      const dispatchAccepted = yield* Deferred.make<void, OrchestratorMcpFailure>();
+      const upgradeCompletionWake = Effect.fn("OrchestratorMcpService.upgradeCompletionWake")(
+        (taskId: NodeId) =>
+          threadManagement
+            .dispatch({
+              type: "delegated_task.wake-policy",
+              commandId: stableCommandId({
+                scope,
+                requestKey: key,
+                operation: "delegate-task-wake-policy",
+              }),
+              parentThreadId: scope.thread.threadId,
+              taskId,
+              completionWake: "always",
+            })
+            .pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("orchestrator-mcp.delegate-task.wake-policy-failed", {
+                  taskId,
+                  outcome:
+                    error._tag === "OrchestratorCommandPreviouslyRejectedError"
+                      ? "previously_rejected"
+                      : "dispatch_failed",
+                  error,
+                }),
+              ),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("orchestrator-mcp.delegate-task.wake-policy-failed", {
+                  taskId,
+                  outcome: "defect",
+                  cause,
+                }),
+              ),
+              Effect.asVoid,
+            ),
+      );
       // ThreadManagementService.dispatch is the chokepoint for this command
       // type's own enablement check, using the same command id and its
       // receipt-replay exemption, so no separate assert runs here.
@@ -2974,7 +3010,24 @@ const make = Effect.gen(function* () {
                 return { result, preparation };
               }),
             ),
+          Effect.onExit((exit) =>
+            Deferred.done(
+              dispatchAccepted,
+              Exit.map(exit, () => undefined),
+            ),
+          ),
           (effect) => bounded("dispatch", effect, expectedTaskId),
+          Effect.onExit((exit) => {
+            if (input.mode !== "wait" || Exit.isSuccess(exit)) return Effect.void;
+            // The caller has no waiter after a dispatch timeout or disconnect.
+            // Await this create before upgrading, including when it already committed.
+            return Deferred.await(dispatchAccepted).pipe(
+              Effect.andThen(upgradeCompletionWake(expectedTaskId)),
+              Effect.catchCause(() => Effect.void),
+              Effect.forkIn(serviceScope, { uninterruptible: false }),
+              Effect.asVoid,
+            );
+          }),
         );
       const taskEvent = result.storedEvents.find(
         (stored) =>
@@ -3055,41 +3108,9 @@ const make = Effect.gen(function* () {
             ...(yield* Ref.get(snapshot)),
             waitTimedOut: input.mode === "wait",
           };
-      // Upgrading delivery cannot be on the response deadline: a slow writer
-      // must not hide the identity of an already accepted task.
+      // A slow writer must not hide the identity of an already accepted task.
       if (input.mode === "wait" && (answer.waitTimedOut || !isTerminalTaskStatus(answer.status))) {
-        yield* threadManagement
-          .dispatch({
-            type: "delegated_task.wake-policy",
-            commandId: stableCommandId({
-              scope,
-              requestKey: key,
-              operation: "delegate-task-wake-policy",
-            }),
-            parentThreadId: scope.thread.threadId,
-            taskId,
-            completionWake: "always",
-          })
-          .pipe(
-            Effect.catch((error) =>
-              Effect.logWarning("orchestrator-mcp.delegate-task.wake-policy-failed", {
-                taskId,
-                outcome:
-                  error._tag === "OrchestratorCommandPreviouslyRejectedError"
-                    ? "previously_rejected"
-                    : "dispatch_failed",
-                error,
-              }),
-            ),
-            Effect.catchCause((cause) =>
-              Effect.logWarning("orchestrator-mcp.delegate-task.wake-policy-failed", {
-                taskId,
-                outcome: "defect",
-                cause,
-              }),
-            ),
-            Effect.forkIn(serviceScope),
-          );
+        yield* upgradeCompletionWake(taskId).pipe(Effect.forkIn(serviceScope));
       }
       yield* Effect.annotateCurrentSpan({
         "t3.delegate.outcome": answer.waitTimedOut

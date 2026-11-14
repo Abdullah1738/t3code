@@ -3088,8 +3088,50 @@ describe("OrchestratorMcpService provider resolution", () => {
     { mode: "wait", legacy: false, dispatchTimeout: "before commit", worktree: true },
     { mode: "async", legacy: false, dispatchTimeout: "before commit", concurrentRetry: true },
     { mode: "async", legacy: true, dispatchTimeout: "before commit" },
+    { mode: "wait", legacy: false, dispatchTimeout: "before commit", noRetry: true },
+    {
+      mode: "wait",
+      legacy: false,
+      dispatchTimeout: "before commit",
+      noRetry: true,
+      worktree: true,
+    },
+    { mode: "wait", legacy: false, dispatchTimeout: "after commit", noRetry: true },
+    { mode: "wait", legacy: false, dispatchTimeout: "after commit", noRetry: true, worktree: true },
+    { mode: "async", legacy: false, dispatchTimeout: "before commit", noRetry: true },
+    {
+      mode: "async",
+      legacy: false,
+      dispatchTimeout: "before commit",
+      noRetry: true,
+      worktree: true,
+    },
+    { mode: "async", legacy: false, dispatchTimeout: "after commit", noRetry: true },
+    {
+      mode: "async",
+      legacy: false,
+      dispatchTimeout: "after commit",
+      noRetry: true,
+      worktree: true,
+    },
+    {
+      mode: "wait",
+      legacy: false,
+      dispatchTimeout: "after commit",
+      noRetry: true,
+      finishBeforeRelease: true,
+    },
+    {
+      mode: "wait",
+      legacy: false,
+      dispatchTimeout: "after commit",
+      noRetry: true,
+      finishBeforeRelease: true,
+      worktree: true,
+    },
+    { mode: "wait", legacy: true, dispatchTimeout: "before commit", noRetry: true },
   ] as const)(
-    "replays the same delegation across any namespace rebind ($mode, legacy=$legacy, stillRunning=$stillRunning, recoveryTimeout=$recoveryTimeout, dispatchTimeout=$dispatchTimeout, concurrentRetry=$concurrentRetry, worktree=$worktree)",
+    "replays the same delegation across any namespace rebind ($mode, legacy=$legacy, stillRunning=$stillRunning, recoveryTimeout=$recoveryTimeout, dispatchTimeout=$dispatchTimeout, concurrentRetry=$concurrentRetry, worktree=$worktree, noRetry=$noRetry, finishBeforeRelease=$finishBeforeRelease)",
     (testCase) => {
       const { mode, legacy } = testCase;
       const stillRunning = "stillRunning" in testCase;
@@ -3136,6 +3178,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           const dispatchEntered = yield* Deferred.make<void>();
           const dispatchRelease = yield* Deferred.make<void>();
           const dispatchFinished = yield* Deferred.make<void>();
+          const wakeUpgraded = yield* Deferred.make<void>();
           const prepared = yield* Deferred.make<void>();
           let blockDispatch = dispatchTimeout !== undefined;
           let blockRecovery = false;
@@ -3147,6 +3190,11 @@ describe("OrchestratorMcpService provider resolution", () => {
                 ...real,
                 dispatch: (command) =>
                   Effect.gen(function* () {
+                    if (command.type === "delegated_task.wake-policy") {
+                      return yield* real
+                        .dispatch(command)
+                        .pipe(Effect.tap(() => Deferred.succeed(wakeUpgraded, undefined)));
+                    }
                     if (command.type !== "delegated_task.request" || !blockDispatch)
                       return yield* real.dispatch(command);
                     blockDispatch = false;
@@ -3203,17 +3251,21 @@ describe("OrchestratorMcpService provider resolution", () => {
                     return {
                       ...mock,
                       prepareRun: (input) =>
-                        real
-                          .dispatch({
-                            type: "prepared-run.release",
-                            commandId: CommandId.make(`${input.commandId}:release`),
-                            threadId: input.threadId,
-                            runId: input.runId,
-                          })
-                          .pipe(
-                            Effect.orDie,
-                            Effect.andThen(Deferred.succeed(prepared, undefined)),
-                          ),
+                        Effect.gen(function* () {
+                          const projection = yield* real.getThreadProjection(input.threadId);
+                          if (
+                            projection.runs.find((run) => run.id === input.runId)?.status ===
+                            "preparing"
+                          ) {
+                            yield* real.dispatch({
+                              type: "prepared-run.release",
+                              commandId: CommandId.make(`${input.commandId}:release`),
+                              threadId: input.threadId,
+                              runId: input.runId,
+                            });
+                          }
+                          yield* Deferred.succeed(prepared, undefined);
+                        }).pipe(Effect.orDie),
                     } satisfies ThreadLaunchService.ThreadLaunchService["Service"];
                   }),
                 ).pipe(
@@ -3323,15 +3375,53 @@ describe("OrchestratorMcpService provider resolution", () => {
                 const concurrent = yield* service.delegateTask(scope, request);
                 assert.equal(concurrent.taskId, recoveringId);
               }
+              if ("finishBeforeRelease" in testCase) {
+                const early = yield* service.taskStatus(scope, recoveringId);
+                assert.isFalse(early.partial);
+                if (early.partial) return assert.fail("expected the committed child");
+                const child = yield* orchestrator.getThreadProjection(early.childThreadId);
+                yield* orchestrator.dispatch({
+                  type: "run.interrupt",
+                  commandId: CommandId.make("no-retry:finish-before-return"),
+                  threadId: early.childThreadId,
+                  runId: child.runs[0]!.id,
+                });
+                yield* orchestrator.recoverDelegatedTasks;
+              }
               yield* Deferred.succeed(dispatchRelease, undefined);
               yield* Deferred.await(dispatchFinished);
               if ("worktree" in testCase) yield* Deferred.await(prepared);
-              const recovered = yield* service.taskStatus(scope, recoveringId);
-              assert.equal(recovered.taskId, recoveringId);
-              if ("worktree" in testCase && !recovered.partial) {
-                const child = yield* orchestrator.getThreadProjection(recovered.childThreadId);
-                assert.notEqual(child.runs[0]!.status, "preparing");
+              if (!("finishBeforeRelease" in testCase)) {
+                const recovered = yield* service.taskStatus(scope, recoveringId);
+                assert.equal(recovered.taskId, recoveringId);
+                if ("worktree" in testCase && !recovered.partial) {
+                  const child = yield* orchestrator.getThreadProjection(recovered.childThreadId);
+                  assert.notEqual(child.runs[0]!.status, "preparing");
+                }
               }
+            }
+            if ("noRetry" in testCase && timeoutTaskId !== undefined) {
+              if (mode === "wait") yield* Deferred.await(wakeUpgraded);
+              const lateParent = yield* orchestrator.getThreadProjection(parentThreadId);
+              const lateTask = lateParent.subagents.find((task) => task.id === timeoutTaskId)!;
+              assert.isTrue(lateParent.runs.some(ThreadManagementService.isActiveRun));
+              assert.equal(lateParent.subagents.length, 1);
+              assert.equal(lateTask.completionWake, "always");
+              if (!("finishBeforeRelease" in testCase)) {
+                const child = yield* orchestrator.getThreadProjection(lateTask.childThreadId!);
+                yield* orchestrator.dispatch({
+                  type: "run.interrupt",
+                  commandId: CommandId.make("no-retry:finish-child"),
+                  threadId: lateTask.childThreadId!,
+                  runId: child.runs[0]!.id,
+                });
+                yield* orchestrator.recoverDelegatedTasks;
+              }
+              const after = yield* orchestrator.getThreadProjection(parentThreadId);
+              const finished = after.subagents.find((task) => task.id === timeoutTaskId)!;
+              assert.equal(finished.status, "interrupted");
+              assert.equal(finished.completionDelivery?.state, "claimed");
+              return;
             }
             const firstCall = yield* service.delegateTask(scope, request).pipe(Effect.forkScoped);
             if (mode === "wait") {
