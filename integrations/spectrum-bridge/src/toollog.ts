@@ -69,12 +69,38 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   return line;
 }
 
+function logSources(dir: string): Record<string, number> {
+  return Object.fromEntries(readdirSync(dir).filter(file => /^\d{4}-\d{2}-\d{2}\.ndjson$/.test(file)).sort()
+    .map(file => [file.slice(0, 10), statSync(join(dir, file)).size]));
+}
+
+async function* records(dir: string, sources: Record<string, number>): AsyncGenerator<LogLine> {
+  for (const [day, bytes] of Object.entries(sources)) {
+    if (!bytes) continue;
+    // Fixed byte ranges keep appends during a build visible as a stale dependency snapshot.
+    const input = createReadStream(join(dir, `${day}.ndjson`), { encoding: "utf8", end: bytes - 1 });
+    const lines = createInterface({ input, crlfDelay: Infinity });
+    try {
+      for await (const text of lines) {
+        try {
+          const parsed = JSON.parse(text);
+          const line = clean(parsed, typeof parsed.ts === "string" ? parsed.ts : "");
+          if (line) yield line;
+        } catch { /* Interrupted or malformed row. */ }
+      }
+    } finally { lines.close(); input.destroy(); }
+  }
+}
+
+function chainSources(sources: Record<string, number>, day: string): Record<string, number> {
+  return { [day]: sources[day] ?? 0, ...Object.fromEntries(Object.entries(sources).filter(([date]) => date > day)) };
+}
+
 export function createToolLog(options: { root?: string; now?: () => number; capBytes?: number; defer?: boolean } = {}) {
   const root = () => options.root ?? logDirectory("imessage");
   const now = options.now ?? Date.now;
   let maintainedDay = "";
   let maintainedRoot = "";
-  let rolledDay = "";
   let rolling = false;
   let rolledHour = -1;
   const calls = createCallAggregation(processRunId);
@@ -133,6 +159,9 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       if (!line) return;
       for (const record of calls.accept(line, entry.ids?.runId !== undefined)) enqueue(record);
       if (entry.name === "turn.end") void scheduleRollup(line.ts.slice(0, 10));
+      if (["turn.start", "reply.sent"].includes(line.name) && line.ids?.chat && line.ids.inboundId) {
+        refreshChains(`${line.ids.chat}\0${line.ids.inboundId}`);
+      }
     } catch { /* Optional logging never affects the caller. */ }
   }
   async function buildRollup(requestedDay?: string) {
@@ -144,20 +173,11 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       const dir = root();
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       chmodSync(dir, 0o700);
-      const source = join(dir, `${day}.ndjson`);
-      const sourceBytes = existsSync(source) ? statSync(source).size : 0;
-      async function* records(): AsyncGenerator<LogLine> {
-        if (!sourceBytes) return;
-        // Read a fixed snapshot so concurrent appends cannot make a cached rollup look current.
-        const input = createReadStream(source, { encoding: "utf8", end: sourceBytes - 1 });
-        const lines = createInterface({ input, crlfDelay: Infinity });
-        try {
-          for await (const text of lines) {
-            try { const parsed = JSON.parse(text); const line = clean(parsed, typeof parsed.ts === "string" ? parsed.ts : ""); if (line) yield line; } catch { /* Interrupted or malformed row. */ }
-          }
-        } finally { lines.close(); input.destroy(); }
-      }
-      const result = { day, tool: "imessage", sourceBytes, ...await summarizeLog(records()) };
+      const sources = chainSources(logSources(dir), day);
+      const sourceBytes = sources[day] ?? 0;
+      const later = Object.fromEntries(Object.entries(sources).filter(([date]) => date > day));
+      const result = { day, tool: "imessage", sourceBytes, chainSources: sources,
+        ...await summarizeLog(records(dir, { [day]: sourceBytes }), records(dir, later)) };
       const path = join(dir, `rollup-${day}.json`);
       const temporary = join(dir, `.rollup-${day}-${randomUUID()}.tmp`);
       try {
@@ -185,13 +205,50 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
     jobs.set(day, job);
     return job;
   }
+  const pendingChains = new Set<string>();
+  const receiptDays = new Map<string, string>();
+  const indexedSources = new Map<string, number>();
+  let indexedRoot = "";
+  let refreshingChains: Promise<void> | undefined;
+  function refreshChains(key: string): void {
+    pendingChains.add(key);
+    refreshingChains ??= (async () => {
+      // Deferred writes must reach disk before indexing their receipt or follow-up.
+      await Promise.resolve();
+      while (pendingChains.size) {
+        const keys = [...pendingChains]; pendingChains.clear();
+        const dir = root();
+        if (indexedRoot !== dir) { receiptDays.clear(); indexedSources.clear(); indexedRoot = dir; }
+        const sources = logSources(dir);
+        for (const [id, day] of receiptDays) if (!(day in sources)) receiptDays.delete(id);
+        for (const day of indexedSources.keys()) if (!(day in sources)) indexedSources.delete(day);
+        if (keys.some(id => !receiptDays.has(id))) {
+          const changed = Object.fromEntries(Object.entries(sources).filter(([day, bytes]) => indexedSources.get(day) !== bytes));
+          for await (const line of records(dir, changed)) {
+            if (line.name !== "msg.received" || !line.ids?.chat || !line.ids.messageId) continue;
+            const id = `${line.ids.chat}\0${line.ids.messageId}`;
+            const day = line.ts.slice(0, 10);
+            const previous = receiptDays.get(id);
+            if (!previous || day < previous) receiptDays.set(id, day);
+          }
+          for (const [day, bytes] of Object.entries(changed)) indexedSources.set(day, bytes);
+        }
+        const days = new Set(keys.map(id => receiptDays.get(id)).filter(day => day !== undefined));
+        await Promise.all([...days].map(scheduleRollup));
+      }
+    })().catch(() => {}).finally(() => {
+      refreshingChains = undefined;
+      const pending = pendingChains.values().next().value;
+      if (pending !== undefined) refreshChains(pending);
+    });
+  }
   function flushAll(): void {
     for (const line of calls.flush()) enqueue(line);
     flush();
   }
   async function settled(): Promise<void> {
     await Promise.resolve();
-    while (jobs.size) await Promise.all([...jobs.values()]);
+    while (jobs.size || refreshingChains) await Promise.all([...jobs.values(), ...(refreshingChains ? [refreshingChains] : [])]);
   }
   async function rollup(requestedDay?: string) {
     try {
@@ -207,22 +264,36 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       rolling = true;
       try {
         const hour = Math.floor(at / 3_600_000);
-        if (hour !== rolledHour) {
+        const hourly = hour !== rolledHour;
+        if (hourly) {
           flushAll();
           const today = new Date(at).toISOString().slice(0, 10);
           if (existsSync(join(root(), `${today}.ndjson`))) await scheduleRollup(today);
           rolledHour = hour;
         }
         const day = new Date(at - 86400_000).toISOString().slice(0, 10);
-        if (at % 86400_000 >= 5 * 60_000 && rolledDay !== day) {
+        const checkDays = new Set<string>();
+        if (at % 86400_000 >= 5 * 60_000) checkDays.add(day);
+        if (hourly) {
+          // A writer may have exited after appending a late reply but before refreshing its old receipt day.
+          const dir = root();
+          const cutoff = new Date(at - 30 * 86400_000).toISOString().slice(0, 10);
+          if (existsSync(dir)) for (const file of readdirSync(dir)) {
+            const cachedDay = /^rollup-(\d{4}-\d{2}-\d{2})\.json$/.exec(file)?.[1];
+            if (cachedDay && cachedDay >= cutoff && cachedDay < new Date(at).toISOString().slice(0, 10)
+              && existsSync(join(dir, `${cachedDay}.ndjson`))) checkDays.add(cachedDay);
+          }
+        }
+        for (const checkDay of checkDays) {
           let fresh = false;
           try {
-            const saved = JSON.parse(await readFile(join(root(), `rollup-${day}.json`), "utf8"));
-            const source = join(root(), `${day}.ndjson`);
-            fresh = saved?.day === day && saved.tool === "imessage" && saved.sourceBytes === (existsSync(source) ? statSync(source).size : 0)
+            const saved = JSON.parse(await readFile(join(root(), `rollup-${checkDay}.json`), "utf8"));
+            const sources = chainSources(logSources(root()), checkDay);
+            fresh = saved?.day === checkDay && saved.tool === "imessage" && saved.sourceBytes === sources[checkDay]
+              && JSON.stringify(saved.chainSources) === JSON.stringify(sources)
               && Number.isSafeInteger(saved.total) && saved.total >= 0 && saved.byComponent && saved.chains && Array.isArray(saved.topErrorTags);
           } catch { /* Missing, stale or interrupted rollups are rebuilt. */ }
-          if (fresh || await scheduleRollup(day)) rolledDay = day;
+          if (!fresh) await scheduleRollup(checkDay);
         }
         await settled();
       } finally { rolling = false; }

@@ -1,7 +1,7 @@
 import type { LogLine } from "./toollog.ts";
 import { callName, percentiles } from "./log-calls.ts";
 
-export async function summarizeLog(lines: AsyncIterable<LogLine>) {
+export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: AsyncIterable<LogLine>) {
   const countsByName: Record<string, number> = Object.create(null);
   const countsByKind: Record<string, number> = { event: 0, perf: 0, error: 0 };
   const durations = new Map<string, Map<number, number>>();
@@ -65,6 +65,11 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>) {
       }
     } else if (line.name === "turn.robob_call" && line.kind === "perf") individualCalls.push(line);
     else consume(line);
+  }
+  // Later days complete this day's receipts without moving their event counts into this day.
+  if (laterLines) for await (const line of laterLines) {
+    if ((line.name === "turn.start" || line.name === "reply.sent") && line.ids?.chat && line.ids.inboundId
+      && chainsById.has(`${line.ids.chat}\0${line.ids.inboundId}`)) chain(line);
   }
   // Slow/failed rows remain readable, but their batch histogram already counts them.
   for (const line of individualCalls) if (!line.ids?.callBatchId || !represented.has(`${line.ids.callBatchId}\0${callName(line)}`)) consume(line);
