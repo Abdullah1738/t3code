@@ -1,11 +1,14 @@
 """Window proofs, source limits and sanitized persistent detail caching."""
 import datetime as dt
+import fcntl
 import importlib.util
 import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -94,14 +97,19 @@ class Reader(unittest.TestCase):
 import threading
 from pathlib import Path
 ROOT=Path(__file__).parent
-def orders(app, service, timeout, page=1):
+def orders(app, service, timeout, page=1, cursor=None):
     with (ROOT/'pages.log').open('a') as f:f.write(service+':'+str(page)+'\\n')
     data=json.loads((ROOT/'fixture.json').read_text())
     if threading.current_thread() is not threading.main_thread():raise ValueError('main thread required')
     if service in data.get('list_fail',[]):raise TimeoutError('list timeout')
+    if page in data.get('page_fail',{}).get(service,[]):raise TimeoutError('page timeout')
     rows=data.get(service,{}).get(str(page),[])
     coverage=({'page':page,'total_pages':len(data.get(service,{'1':[]}))} if service=='minutes'
               else {'exhaustive':service not in data})
+    if service in data.get('paging',[]):
+        coverage={'page':page,'total_pages':len(data[service]),'paging_verified':True,
+                  'ordered_by_placed_at':service!='marketplace',
+                  'exhaustive':page==len(data[service]),'next_cursor':'cursor-'+str(page)}
     coverage=data.get('coverage_override',{}).get(service,coverage)
     return dict(ok=True,orders=rows,coverage={service:coverage})
 ''')
@@ -138,6 +146,270 @@ def details(oid, service, timeout):
 
     def native(self, since=None):
         return lookup.native('noon', str(self.root), since=since)
+
+    def test_verified_vertical_pages_cross_ties_and_skip_old_details(self):
+        for service in ('food', 'nownow'):
+            with self.subTest(service=service):
+                self.fixture(**{service: {'1': [row('A', -15)], '2': [row('B', -15)],
+                                         '3': [row('C', -16)], '4': [row('D', -20)]},
+                                'paging': [service]})
+                result = lookup.native('noon', str(self.root), since=AT.isoformat(), services=(service,))
+                lane = result['lanes'][service]
+                self.assertEqual(lane['pages'], 3)
+                self.assertEqual(lane['fetched'], 2)
+                self.assertEqual(lane['covered_from'], row('C', -16)['placed_at'])
+                self.assertIsNone(lane['limit'])
+                self.assertFalse(lane['exhaustive'])
+
+    def test_repeated_page_cannot_claim_exhaustive_history(self):
+        for service in ('food', 'nownow', 'marketplace'):
+            with self.subTest(service=service):
+                self.fixture(**{service: {'1': [row('A')], '2': [row('A')]}, 'paging': [service]})
+                result = lookup.native('noon', str(self.root), services=(service,))
+                self.assertFalse(result['lanes'][service]['exhaustive'])
+
+    def test_repeated_scoped_status_updates_invalidate_positive_matches(self):
+        for status, raw_status in (
+            ('cancelled', 'cancelled'), ('cancelled', 'canceled'), ('unknown', 'failed'),
+            ('unknown', 'future_status'), ('out for delivery', 'out_for_delivery'),
+            ('delivered', 'cancelled'), ('unknown', 'delivered'), ('delivered', 'delivered'),
+        ):
+            with self.subTest(status=status, raw_status=raw_status):
+                first = {**row('A'), 'item_id': 'A-1', 'shipment_id': 'A-S1', 'total': CHARGE['amount']}
+                second = {**first, 'status': status, 'raw_status': raw_status}
+                other = {**row('B'), 'item_id': 'B-1', 'shipment_id': 'B-S1', 'total': '99.00'}
+                self.fixture(marketplace={'1': [first, other], '2': [second, other]}, paging=['marketplace'])
+                result = lookup.native('noon', str(self.root), services=('marketplace',))
+                self.assertFalse(result['lanes']['marketplace']['exhaustive'])
+                self.assertIsNone(result['lanes']['marketplace']['covered_from'])
+                if status == raw_status == 'delivered':
+                    self.assertEqual(charges.order_receipt(CHARGE, AT, AT,
+                        lookup=lambda *a, **kw: result)['verdict'], 'receipt')
+                else:
+                    with self.assertRaises(charges.Lookup):
+                        charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: result)
+                    self.assertEqual([r['order'] for r in result['orders']], ['B'])
+
+    def test_persistent_cache_invalidation_survives_next_read_page_timeout(self):
+        cached = {**row('N1'), 'service': 'marketplace', 'total': CHARGE['amount'],
+                  'currency': 'AED', 'whole_order_complete': True}
+        unrelated = {**cached, 'order': 'N2', 'total': '98.00'}
+        for status, raw_status in (
+            ('cancelled', 'cancelled'), ('cancelled', 'canceled'), ('unknown', 'failed'),
+            ('unknown', 'future_status'), ('out for delivery', 'out_for_delivery'),
+            ('delivered', 'cancelled'), ('unknown', 'delivered'), ('delivered', 'delivered'),
+        ):
+            for item in ('N1-1', 'N1-2'):
+                with self.subTest(status=status, raw_status=raw_status, item=item):
+                    self.cache.write_text(json.dumps([cached, unrelated]))
+                    first = {**row('N1'), 'item_id': 'N1-1', 'shipment_id': 'N1-S1', 'total': '99.00'}
+                    second = {**first, 'item_id': item, 'status': status, 'raw_status': raw_status}
+                    self.fixture(marketplace={'1': [first], '2': [second]}, paging=['marketplace'])
+                    observed = lookup.read('noon', cache_path=self.cache)
+                    after_invalidation = lookup.load_cache(self.cache)
+                    self.fixture(marketplace={'1': [first], '2': [first]}, paging=['marketplace'],
+                                 page_fail={'marketplace': [2]})
+                    result = lookup.read('noon', cache_path=self.cache)
+                    if status == raw_status == 'delivered':
+                        self.assertEqual(charges.order_receipt(CHARGE, AT, AT,
+                            lookup=lambda *a, **kw: result)['verdict'], 'receipt')
+                        self.assertEqual(result['lanes']['marketplace']['cached'], 1)
+                    else:
+                        with self.assertRaises(charges.Lookup):
+                            charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: result)
+                        self.assertEqual(observed['orders'], [])
+                        self.assertEqual(observed['invalidated'], [{'service': 'marketplace', 'order': 'N1'}])
+                        self.assertEqual([r['order'] for r in after_invalidation], ['N2'])
+                        self.assertEqual(result['orders'][0]['total'], '99.00')
+                        self.assertEqual(result['lanes']['marketplace']['cached'], 0)
+                    self.assertIn('N2', {r['order'] for r in lookup.load_cache(self.cache)})
+
+    def test_first_page_contradiction_evicts_cache_even_when_detail_fails(self):
+        cached = {**row('N1'), 'service': 'marketplace', 'total': CHARGE['amount'],
+                  'currency': 'AED', 'whole_order_complete': True}
+        for status in ('cancelled', 'failed', 'out for delivery', 'unknown'):
+            with self.subTest(status=status):
+                self.cache.write_text(json.dumps([cached]))
+                self.fixture(marketplace={'1': [row('N1', status=status)]}, fail=['N1'])
+                result = lookup.read('noon', cache_path=self.cache)
+                self.assertEqual(result['invalidated'], [{'service': 'marketplace', 'order': 'N1'}])
+                self.assertEqual(lookup.load_cache(self.cache), [])
+                self.assertEqual(result['orders'], [])
+
+    def test_cache_invalidation_write_failure_is_not_silent(self):
+        self.cache.write_text(json.dumps([{**row('N1'), 'service': 'marketplace',
+            'total': CHARGE['amount'], 'currency': 'AED', 'whole_order_complete': True}]))
+        self.fixture(marketplace={'1': [row('N1', status='cancelled')]})
+        with patch('state_json.write_json', side_effect=OSError('write failed')):
+            with self.assertRaisesRegex(ValueError, 'order lookup unavailable'):
+                lookup.read('noon', cache_path=self.cache)
+
+    def test_overlapping_cache_readers_cannot_restore_cancelled_receipt(self):
+        cached = {**row('N1'), 'service': 'marketplace', 'total': CHARGE['amount'],
+                  'currency': 'AED', 'whole_order_complete': True}
+        fresh = {**cached, 'total': '99.00', 'whole_order_complete': False}
+        self.cache.write_text(json.dumps([cached]))
+        a_loading, allow_a, a_done = threading.Event(), threading.Event(), threading.Event()
+        results, errors, snapshots, sizes = {}, [], [], [1]
+        original_load, original_flock = lookup.load_cache, fcntl.flock
+
+        def load(path):
+            name = threading.current_thread().name
+            if name == 'reader-a':
+                a_loading.set()
+                if not allow_a.wait(5):
+                    raise AssertionError('reader B did not reach the transaction')
+            value = original_load(path)
+            if name == 'reader-b':
+                snapshots.append(value)
+                # Before the fix, B can load before A evicts. With the lock,
+                # B instead releases A through the contention hook below.
+                allow_a.set()
+            return value
+
+        def flock(fd, operation):
+            try:
+                return original_flock(fd, operation)
+            except BlockingIOError:
+                if threading.current_thread().name == 'reader-b':
+                    allow_a.set()
+                raise
+
+        def reader_process(args, **kwargs):
+            if threading.current_thread().name == 'reader-a':
+                result = {'orders': [], 'complete': False,
+                          'invalidated': [{'service': 'marketplace', 'order': 'N1'}]}
+            else:
+                if not a_done.wait(5):
+                    raise AssertionError('cancellation eviction did not complete')
+                snapshot = json.loads(kwargs['input'])['cache']
+                result = {'orders': snapshot or [fresh], 'complete': False}
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(result), stderr='')
+
+        def run(name):
+            try:
+                results[name] = lookup.read('noon', cache_path=self.cache)
+                sizes.append(len(original_load(self.cache)))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                if name == 'reader-a':
+                    a_done.set()
+
+        a = threading.Thread(target=run, args=('reader-a',), name='reader-a')
+        b = threading.Thread(target=run, args=('reader-b',), name='reader-b')
+        with patch.object(lookup, 'load_cache', side_effect=load), \
+                patch.object(fcntl, 'flock', side_effect=flock), \
+                patch.object(lookup.subprocess, 'run', side_effect=reader_process):
+            try:
+                a.start()
+                self.assertTrue(a_loading.wait(5))
+                b.start()
+                a.join(5)
+                b.join(5)
+                self.assertFalse(a.is_alive() or b.is_alive())
+            finally:
+                allow_a.set()
+                a_done.set()
+                a.join(5)
+                if b.ident is not None:
+                    b.join(5)
+        self.assertEqual(errors, [])
+        first = {**row('N1'), 'item_id': 'N1-1', 'shipment_id': 'N1-S1', 'total': '99.00'}
+        self.fixture(marketplace={'1': [first], '2': [first]}, paging=['marketplace'],
+                     page_fail={'marketplace': [2]})
+        result = lookup.read('noon', cache_path=self.cache)
+        with self.assertRaises(charges.Lookup):
+            charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: result)
+        with self.assertRaises(charges.Lookup):
+            charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: results['reader-b'])
+        self.assertEqual(sizes, [1, 0, 0])
+        self.assertEqual(snapshots, [[]])
+        self.assertEqual(self.cache.with_suffix('.lock').read_bytes(), b'')
+
+    def test_cache_lock_contention_exhausts_budget_before_loading(self):
+        clock = [100.0]
+        def advance(seconds):
+            clock[0] += seconds
+        with self.cache.with_suffix('.lock').open('a') as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(lookup.time, 'time', return_value=100.0), \
+                    patch.object(lookup.time, 'monotonic', side_effect=lambda: clock[0]), \
+                    patch.object(lookup.time, 'sleep', side_effect=advance), \
+                    patch.object(lookup, 'load_cache') as load, \
+                    patch.object(lookup.subprocess, 'run') as process:
+                with self.assertRaises(ValueError):
+                    lookup.read('noon', deadline=102.1, cache_path=self.cache)
+                load.assert_not_called()
+                process.assert_not_called()
+        self.assertGreater(clock[0], 100)
+        self.assertLessEqual(clock[0], 102)
+        self.assertEqual(self.cache.with_suffix('.lock').read_bytes(), b'')
+
+    def test_cache_lock_wait_reduces_subprocess_timeout(self):
+        clock, attempts = [100.0], [0]
+        original_flock = fcntl.flock
+        def flock(fd, operation):
+            attempts[0] += 1
+            if attempts[0] == 1:
+                raise BlockingIOError('busy')
+            return original_flock(fd, operation)
+        def advance(_seconds):
+            clock[0] += 2.5
+        with patch.object(fcntl, 'flock', side_effect=flock), \
+                patch.object(lookup.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(lookup.time, 'sleep', side_effect=advance), \
+                patch.object(lookup.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=json.dumps({'orders': [], 'complete': False}), stderr='')) as process:
+            lookup.read('noon', cache_path=self.cache)
+        self.assertAlmostEqual(process.call_args.kwargs['timeout'], 7.5)
+        self.assertEqual(self.cache.with_suffix('.lock').read_bytes(), b'')
+
+    def test_cache_transaction_releases_lock_on_subprocess_and_validation_errors(self):
+        for outcome in (subprocess.TimeoutExpired('reader', 1),
+                        subprocess.CompletedProcess([], 0, stdout='invalid json', stderr=''),
+                        subprocess.CompletedProcess([], 0, stdout='{}', stderr='')):
+            with self.subTest(outcome=type(outcome).__name__):
+                options = {'side_effect': outcome} if isinstance(outcome, Exception) else {'return_value': outcome}
+                with patch.object(lookup.subprocess, 'run', **options), self.assertRaises(ValueError):
+                    lookup.read('noon', cache_path=self.cache)
+                with self.cache.with_suffix('.lock').open('a') as check:
+                    fcntl.flock(check, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertEqual(self.cache.with_suffix('.lock').read_bytes(), b'')
+
+    def test_unverified_reader_retains_page_one_limit(self):
+        self.fixture(food={'1': [row('A')], '2': [row('B', -60)]},
+                     coverage_override={'food': {'paging_verified': True, 'default_page_only': True}})
+        result = lookup.native('noon', str(self.root), services=('food',))
+        self.assertEqual(result['lanes']['food']['pages'], 1)
+        self.assertEqual(result['lanes']['food']['limit'], 'page-1 history only')
+
+    def test_marketplace_history_exhaustion_without_creation_order_assumption(self):
+        self.fixture(marketplace={'1': [row('A', -60)], '2': [row('B')]}, paging=['marketplace'])
+        result = lookup.native('noon', str(self.root), services=('marketplace',))
+        lane = result['lanes']['marketplace']
+        self.assertTrue(lane['exhaustive'])
+        self.assertEqual(lane['pages'], 2)
+        self.assertIsNone(lane['covered_from'])
+
+    def test_later_cancelled_shipment_stays_unread_even_for_seen_order(self):
+        for status in ('cancelled', 'canceled', 'failed', 'unknown', 'out for delivery'):
+            with self.subTest(status=status):
+                first = {**row('A'), 'item_id': 'A-1'}
+                second = {**row('A', status=status), 'item_id': 'A-2'}
+                self.fixture(marketplace={'1': [first], '2': [second]}, paging=['marketplace'])
+                result = lookup.native('noon', str(self.root), services=('marketplace',))
+                self.assertEqual(result['orders'], [])
+                self.assertFalse(result['lanes']['marketplace']['exhaustive'])
+                self.assertIsNone(result['lanes']['marketplace']['covered_from'])
+
+    def test_marketplace_cache_requires_whole_order_delivery(self):
+        base = {**row('N1'), 'service': 'marketplace', 'total': 12.34, 'currency': 'AED'}
+        for status, complete, expected in (('delivered', True, 1), ('delivered', False, 0),
+                                            ('cancelled', True, 0), ('failed', True, 0)):
+            with self.subTest(status=status, complete=complete):
+                self.cache.write_text(json.dumps([{**base, 'status': status, 'whole_order_complete': complete}]))
+                self.assertEqual(len(lookup.load_cache(self.cache)), expected)
 
     def test_failed_lane_cannot_starve_other_main_thread_readers(self):
         self.fixture(minutes={'1': []}, food={'1': [row('F1')]}, list_fail=['minutes'])
@@ -271,8 +543,10 @@ def details(oid, service, timeout):
             with self.subTest(code=code):
                 (self.root / 'careem_http_orders.py').write_text(
                     "def orders():raise ValueError(" + repr(code) + ")\n")
-                with self.assertRaises(ValueError) as exc:
+                with patch.object(fcntl, 'flock') as lock, self.assertRaises(ValueError) as exc:
                     lookup.read('careem', cache_path=self.cache)
+                lock.assert_not_called()
+                self.assertFalse(self.cache.with_suffix('.lock').exists())
                 if code == lookup.BINDING_LIMIT:
                     self.assertIsInstance(exc.exception, lookup.SourceLimit)
                     self.assertEqual(exc.exception.code, code)
