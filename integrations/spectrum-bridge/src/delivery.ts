@@ -10,6 +10,7 @@ export { classifySendFailure } from "./photon.ts";
 
 type Options = {
   projectScope: string;
+  chat?: string;
   chatGuid: () => string | undefined;
   enabled: () => boolean;
   beforeSend?: (item: OutboxRecord) => Promise<"send" | "wait" | "cancel">;
@@ -105,7 +106,7 @@ export class Delivery {
       const inbound = item?.replyTo ? this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(item.replyTo) : undefined;
       const receivedAt = this.store.get<number>(`log-inbound-at:${id}`) ?? (inbound ? (JSON.parse(inbound.payload) as { receivedAt?: number }).receivedAt : undefined);
       toolLog.capture(() => toolLog.write({ component: "delivery", kind: "perf", name: "reply.sent", ok: true,
-        durationMs: Math.max(0, at - (receivedAt ?? queuedAt)), ids: { operationId: id, ...(item?.sessionId ? { threadId: item.sessionId } : {}) },
+        durationMs: Math.max(0, at - (receivedAt ?? queuedAt)), ids: this.logIds(id, item),
         props: { inboundKnown: receivedAt !== undefined, outboxDelayMs: Math.max(0, at - queuedAt), parts: item ? splitFormatted(formatText(item.text), BUBBLE_CHARS).length : 0, files: item?.attachment ? 1 : 0 } }));
       const kind = item?.app ? cardKind(item.app.url) : item?.attachment ? cardKind(item.attachment.name) : "other";
       if (item?.app || kind !== "other") toolLog.capture(() => toolLog.write({ component: "cards", kind: "event", name: "card.sent", ok: true, ids: { operationId: id }, props: { cardKind: kind } }));
@@ -133,8 +134,14 @@ export class Delivery {
     return true;
   }
 
-  private error(code: string): void {
-    toolLog.capture(() => toolLog.write({ component: "delivery", kind: "error", name: "reply.failed", ok: false, error: { tag: code, message: "" } }));
+  private logIds(id: string, item?: OutboxRecord) {
+    const inboundId = this.store.get<string>(`log-inbound-id:${id}`) ?? item?.replyTo;
+    return { chat: this.options.chat ?? "owner", operationId: id,
+      ...(item?.sessionId ? { threadId: item.sessionId } : {}), ...(inboundId ? { inboundId } : {}) };
+  }
+
+  private error(code: string, item: OutboxRecord): void {
+    toolLog.capture(() => toolLog.write({ component: "delivery", kind: "error", name: "reply.failed", ok: false, ids: this.logIds(item.id, item), error: { tag: code, message: "" } }));
     this.lastError = code;
     this.options.log?.("outbound-failed", code);
   }
@@ -161,7 +168,7 @@ export class Delivery {
         : { ...health, last: now, code: failure.code, failures: health.failures + 1 } satisfies Health);
     }).immediate();
     toolLog.capture(() => toolLog.write({ component: "delivery", kind: "error", name: "reply.failed", ok: false,
-      ids: { operationId: item.id, ...(item.sessionId ? { threadId: item.sessionId } : {}) }, error: { tag: failure.code, cause } }));
+      ids: this.logIds(item.id, item), error: { tag: failure.code, cause } }));
     this.lastError = failure.code;
     this.options.log?.("outbound-failed", failure.code);
   }
@@ -340,19 +347,19 @@ export class Delivery {
       if (!item || !this.current(item, "pending")) continue;
       if (!item.text.trim() && !item.attachment && !item.poll && !item.app) {
         this.store.outboxState(item.id, "failed");
-        this.error("emptyContent");
+        this.error("emptyContent", item);
         continue;
       }
       if ([item.attachment, item.poll, item.app].filter(Boolean).length > 1
         || (item.effect !== undefined && !isEffect(item.effect))) {
         this.store.outboxState(item.id, "failed");
-        this.error("invalidContent");
+        this.error("invalidContent", item);
         continue;
       }
       if ((item.attachment && (!this.photon.uploadAttachment || !this.photon.sendAttachment))
         || (item.poll && !this.photon.sendPoll) || (item.app && !this.photon.sendApp)) {
         this.store.outboxState(item.id, "failed");
-        this.error("unsupported");
+        this.error("unsupported", item);
         continue;
       }
       if (!backlogDue && (this.store.get<number>(`retry:${item.id}`) ?? 0) > Date.now()) continue;
@@ -385,14 +392,14 @@ export class Delivery {
         const firstAttempt = this.store.get<unknown>(`firstAttempt:${item.id}`);
         if ((item.attempts > 0 || firstAttempt !== undefined) && !this.withinRetryWindow(item.id)) {
           this.store.outboxState(item.id, "uncertain");
-          this.error("retryWindowExpired");
+          this.error("retryWindowExpired", item);
           continue operations;
         }
         const ambiguityKey = `sendAmbiguous:${item.id}`;
         const wasAmbiguous = this.store.get<boolean>(ambiguityKey) ?? item.attempts > 0;
         if (state === "pending" && item.attempts >= MAX_ATTEMPTS) {
           this.store.outboxState(item.id, wasAmbiguous ? "uncertain" : "failed");
-          this.error("retryLimitReached");
+          this.error("retryLimitReached", item);
           continue operations;
         }
         // Freeze the destination as well as the Store's immutable content and reply target.
@@ -400,7 +407,7 @@ export class Delivery {
         const chatGuid = this.store.get<string>(destinationKey) ?? availableChat;
         if (chatGuid !== availableChat) {
           this.store.outboxState(item.id, "uncertain");
-          this.error("chatChanged");
+          this.error("chatChanged", item);
           continue operations;
         }
         const id = `bridge-${createHash("sha256").update(`${this.options.projectScope}:${item.id}:${index}`).digest("hex")}`;
@@ -410,7 +417,7 @@ export class Delivery {
         if (attachment && (upload !== undefined || wasAmbiguous)) {
           if (!upload || upload.sha256 !== attachment.sha256 || typeof upload.guid !== "string" || !upload.guid.trim()) {
             this.store.outboxState(item.id, wasAmbiguous ? "uncertain" : "failed");
-            this.error("invalidAttachment");
+            this.error("invalidAttachment", item);
             continue operations;
           }
         }
@@ -423,7 +430,7 @@ export class Delivery {
             }
           } catch (caughtError) { toolError("delivery", "delivery.catch5", caughtError);
             this.store.outboxState(item.id, "failed");
-            this.error("invalidAttachment");
+            this.error("invalidAttachment", item);
             continue operations;
           }
           this.store.db.transaction(() => {
@@ -490,7 +497,7 @@ export class Delivery {
         }
         if (this.store.get(`firstAttempt:${item.id}`) !== undefined && !this.withinRetryWindow(item.id)) {
           this.store.outboxState(item.id, wasAmbiguous ? "uncertain" : "failed");
-          this.error("retryWindowExpired");
+          this.error("retryWindowExpired", item);
           continue operations;
         }
         this.store.db.transaction(() => {

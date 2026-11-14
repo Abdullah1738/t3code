@@ -95,7 +95,12 @@ export async function runIngress(deps: IngressDeps, signal: AbortSignal): Promis
   const now = deps.now ?? Date.now;
   let pending: Promise<number> | undefined;
   // Periodic and id-only triggers share a fetch so slow backfills cannot overlap.
-  const refresh = () => pending ??= backfill(deps, now, signal).finally(() => { pending = undefined; });
+  // Hydrating an id-only live notification must not turn it into a historical receipt.
+  const liveHandles = new Set<string>();
+  const refresh = (liveHandle?: string) => {
+    if (liveHandle) liveHandles.add(liveHandle);
+    return pending ??= backfill(deps, now, signal, liveHandles).finally(() => { pending = undefined; liveHandles.clear(); });
+  };
   let backoff = 2_000;
   while (!signal.aborted) {
     try {
@@ -116,7 +121,7 @@ export async function runIngress(deps: IngressDeps, signal: AbortSignal): Promis
           if (event.type === "message") {
             // The live stream sends only ids for a received message; the full row comes from the message list.
             if (!event.message.from) {
-              await refresh().catch((caughtError) => { toolError("sb-ingress", "sb-ingress.catch1", caughtError); return deps.log?.("ingress-backfill-failed"); });
+              await refresh(event.message.handle).catch((caughtError) => { toolError("sb-ingress", "sb-ingress.catch1", caughtError); return deps.log?.("ingress-backfill-failed"); });
               continue;
             }
             await handleInbound(deps, event.message).catch((caughtError) => { toolError("sb-ingress", "sb-ingress.catch2", caughtError); return deps.log?.("ingress-message-failed"); });
@@ -139,13 +144,13 @@ export async function runIngress(deps: IngressDeps, signal: AbortSignal): Promis
   }
 }
 
-export async function backfill(deps: IngressDeps, now: () => number, signal?: AbortSignal): Promise<number> {
+export async function backfill(deps: IngressDeps, now: () => number, signal?: AbortSignal, liveHandles?: ReadonlySet<string>): Promise<number> {
   const cursor = deps.ownerStore.get<number>("sendblueCursor") ?? now() - CURSOR_OVERLAP_MS;
   const messages = await deps.line.backfill(Math.max(0, cursor - CURSOR_OVERLAP_MS));
   for (const message of messages) {
     if (signal?.aborted) break;
     const arrivedAt = now();
-    const accepted = await handleInbound(deps, message, "backfill").catch((caughtError) => { toolError("sb-ingress", "sb-ingress.catch4", caughtError); return deps.log?.("ingress-backfill-failed"); });
+    const accepted = await handleInbound(deps, message, liveHandles?.has(message.handle) ? "live" : "backfill").catch((caughtError) => { toolError("sb-ingress", "sb-ingress.catch4", caughtError); return deps.log?.("ingress-backfill-failed"); });
     advanceCursor(deps.ownerStore, message.sentAt);
     if (accepted && arrivedAt - message.sentAt > INGRESS_GAP_MS) {
       deps.log?.("ingress-backfill-gap", `${Math.floor((arrivedAt - message.sentAt) / 1000)}s`);

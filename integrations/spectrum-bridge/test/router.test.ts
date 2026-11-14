@@ -9228,3 +9228,20 @@ test.each(["expired", "answered"])("steering: a live backend question overrides 
   expect(steers).toHaveLength(0);
   expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("pending");
 });
+
+test("batched turn logging uses the first inbound row and preserves the backend message id", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const h = setup();
+  const logs = await captureLogs(async () => {
+    h.input("batch-first-log", "PRIVATE_FIRST");
+    h.input("batch-last-log", "PRIVATE_LAST");
+    await h.router.tick();
+    h.backend.final("PRIVATE_REPLY");
+    await h.router.tick();
+  });
+  expect(logs.find(l => l.name === "msg.batched")?.props?.batchSize).toBe(2);
+  for (const name of ["turn.start", "turn.end"]) {
+    expect(logs.find(l => l.name === name)?.ids).toMatchObject({ inboundId: "batch-first-log", messageId: messageId("batch-first-log") });
+  }
+  expect(logs.find(l => l.name === "turn.start")?.props?.batchSize).toBe(2);
+});

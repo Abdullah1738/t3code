@@ -22,7 +22,7 @@ const processRunId = randomUUID();
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
-const ID_KEYS = new Set(["chat", "messageId", "threadId", "operationId", "formId", "runId", "callBatchId"]);
+const ID_KEYS = new Set(["chat", "messageId", "inboundId", "threadId", "operationId", "formId", "runId", "callBatchId"]);
 const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels"]);
 const ENUMS: Record<string, readonly string[]> = {
   replyMode: ["final", "tool"], reason: ["background", "no_text", "already_folded", "exit", "stdout", "hook"],
@@ -153,7 +153,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         const lines = createInterface({ input, crlfDelay: Infinity });
         try {
           for await (const text of lines) {
-            try { const line = clean(JSON.parse(text), ""); if (line) yield line; } catch { /* Interrupted or malformed row. */ }
+            try { const parsed = JSON.parse(text); const line = clean(parsed, typeof parsed.ts === "string" ? parsed.ts : ""); if (line) yield line; } catch { /* Interrupted or malformed row. */ }
           }
         } finally { lines.close(); input.destroy(); }
       }
@@ -220,7 +220,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
             const saved = JSON.parse(await readFile(join(root(), `rollup-${day}.json`), "utf8"));
             const source = join(root(), `${day}.ndjson`);
             fresh = saved?.day === day && saved.tool === "imessage" && saved.sourceBytes === (existsSync(source) ? statSync(source).size : 0)
-              && Number.isSafeInteger(saved.total) && saved.total >= 0 && saved.byComponent && Array.isArray(saved.topErrorTags);
+              && Number.isSafeInteger(saved.total) && saved.total >= 0 && saved.byComponent && saved.chains && Array.isArray(saved.topErrorTags);
           } catch { /* Missing, stale or interrupted rollups are rebuilt. */ }
           if (fresh || await scheduleRollup(day)) rolledDay = day;
         }
