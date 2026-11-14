@@ -15,6 +15,7 @@ import {
   askGateWarning,
   inferGate,
   isNegativeOption,
+  secretKindApprovalWarning,
 } from "./subtasks.ts";
 import { makeFake, owner, testLayer, toyBoard } from "./askFlows.testkit.ts";
 
@@ -1521,6 +1522,62 @@ it.each([
 it.each(["done", "skipped"] as const)("a %s gate needs no ask warning", (state) => {
   const card = { ...relevanceCard([]), subtasks: [{ ...mergeSubtask, state }] };
   assert.isUndefined(askGateWarning(card, relevanceAsk({ text: "Close the card?" })));
+});
+
+it.each([
+  { kind: "secret", state: "open", gate: "secret", warning: true },
+  { kind: "decision", state: "open", gate: "secret", warning: false },
+  { kind: "action", state: "open", gate: "secret", warning: false },
+  { kind: "secret", state: "done", gate: "secret", warning: false },
+  { kind: "secret", state: "skipped", gate: "secret", warning: false },
+  { kind: "secret", state: "open", gate: undefined, warning: false },
+  { kind: "secret", state: "open", gate: "deploy", warning: false },
+] as const)(
+  "secret-kind approval warning: $kind / $state / $gate",
+  ({ kind, state, gate, warning }) => {
+    const card = {
+      subtasks: [{ ...relevanceSubtask, id: "s3", text: "Check access", gate, state }],
+    };
+    const note = secretKindApprovalWarning(card, relevanceAsk({ kind, text: "Approve s3" }));
+    assert.strictEqual(note !== undefined, warning);
+    if (warning)
+      assert.strictEqual(
+        note,
+        'Kind "secret" asks Abdullah to type a secret value. To approve s3, ask a decision naming s3 instead.',
+      );
+  },
+);
+
+it("a real secret request on an ungated card needs no warning", () => {
+  assert.isUndefined(secretKindApprovalWarning({ subtasks: [] }, relevanceAsk({ kind: "secret" })));
+});
+
+it("a secret-kind warning lists only open secret-gated ids", () => {
+  const card = {
+    subtasks: [
+      { ...relevanceSubtask, id: "s3" },
+      { ...relevanceSubtask, id: "s4", state: "done" as const },
+      { ...relevanceSubtask, id: "s7" },
+      mergeSubtask,
+    ],
+  };
+  assert.strictEqual(
+    secretKindApprovalWarning(card, relevanceAsk({ kind: "secret", text: "Approve s3 and s7" })),
+    'Kind "secret" asks Abdullah to type a secret value. To approve s3, s7, ask a decision naming the intended subtask id instead.',
+  );
+});
+
+it.each(["work", "review"] as const)("a stored secret gate on $owner needs no warning", (owner) => {
+  const card = { subtasks: [{ ...relevanceSubtask, owner }] };
+  assert.isUndefined(secretKindApprovalWarning(card, relevanceAsk({ kind: "secret" })));
+});
+
+it("a secret-kind warning respects enabled inferred gates and explicit gates", () => {
+  const ask = relevanceAsk({ kind: "secret" });
+  const card = { subtasks: [{ ...relevanceSubtask, gate: undefined }] };
+  assert.isDefined(secretKindApprovalWarning(card, ask, ["secret"]));
+  assert.isUndefined(secretKindApprovalWarning(card, ask, []));
+  assert.isDefined(secretKindApprovalWarning({ subtasks: [relevanceSubtask] }, ask, []));
 });
 
 it("ambiguous inferred wording warns and naming one gate avoids the warning", () => {

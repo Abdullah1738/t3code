@@ -29,7 +29,7 @@ import * as ThreadManagementService from "../../../orchestration-v2/ThreadManage
 import type { EvaluatorPurpose } from "../engine/briefs.ts";
 import { modelSelectionResult } from "../engine/defaults.ts";
 import * as Asks from "../engine/asks.ts";
-import { askGateWarning } from "../engine/subtasks.ts";
+import { askGateWarning, secretKindApprovalWarning } from "../engine/subtasks.ts";
 import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
 import { cardMatches, isCardNumber } from "../engine/cardSearch.ts";
 import { textProblem } from "../engine/text.ts";
@@ -663,10 +663,17 @@ const handlers = {
           isCardThread(caller) ? "cardThread" : "evaluator",
         );
         const ask = asked.asks.at(-1);
-        const note = ask && askGateWarning(asked, ask, board?.guessedGates);
+        const note = ask
+          ? [
+              askGateWarning(asked, ask, board?.guessedGates),
+              secretKindApprovalWarning(asked, ask, board?.guessedGates),
+            ]
+              .filter((warning) => warning !== undefined)
+              .join(" ")
+          : "";
         return {
           card: Asks.askSummary(asked, ask?.id ?? ""),
-          ...(note === undefined ? {} : { note }),
+          ...(note ? { note } : {}),
         };
       }),
     ),
