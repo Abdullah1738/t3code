@@ -43,12 +43,12 @@ vi.mock("node:worker_threads", async (importOriginal) => {
   };
   class CheckpointProxy extends EventEmitter {
     threadId: number;
-    constructor(
-      readonly writer: NodeWorkerThreads.Worker,
-      readonly childId: number,
-      threadId: number,
-    ) {
+    readonly writer: NodeWorkerThreads.Worker;
+    readonly childId: number;
+    constructor(writer: NodeWorkerThreads.Worker, childId: number, threadId: number) {
       super();
+      this.writer = writer;
+      this.childId = childId;
       this.threadId = threadId;
       // Native Workers retain an error listener even when a test only awaits exit.
       this.on("error", () => {});
