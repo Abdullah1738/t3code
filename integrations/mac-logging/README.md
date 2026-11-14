@@ -183,6 +183,11 @@ exit code is available), and `elapsedMs`. Budget-exhausted roots get their own
 timeout line without launching another command. Confirmed missing inventory
 paths retain a zero total without a source error.
 
+`disk.inventory` also reports `rootsOk`, `rootsPartial`, `rootsTimeout`,
+`rootsDenied` and `scanMs`. Timeout/denial counts include affected children and
+can overlap the partial count. Daily `diskInventory` rollups sum those counts
+and scan time across `scans`; lock-skipped hourly runs are excluded.
+
 Only these source errors accept a diagnostic `error.message`: the first stderr
 or filesystem-error line, trimmed to 300 characters with credential-like text
 redacted. No du stdout, unified log messages, report contents or arbitrary

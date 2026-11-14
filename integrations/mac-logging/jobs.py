@@ -120,6 +120,7 @@ def source_error(component, name, source, started, exc, props=None):
          props=dict(source=str(source), failure=failure, exitCode=code,
                     elapsedMs=max(0, (time.monotonic()-started)*1000), **(props or {})),
          error_tag=component+'.source_unavailable', error_message=message)
+    return failure
 
 
 def confirmed_absent(path, exc):
@@ -164,7 +165,7 @@ def du_total(path, run, timeout):
     raise SourceFailure(failure, message or 'du did not print a root total', result.returncode)
 
 
-def inventory_listing(path, deadline):
+def inventory_listing(path, deadline, source_failures=None):
     entries, listed = [], False
     started = time.monotonic()
     try:
@@ -172,7 +173,9 @@ def inventory_listing(path, deadline):
             deadline_call(deadline, entries.extend, listing)
         listed = True
     except (OSError, SourceFailure) as exc:
-        source_error('disk', 'disk.inventory.source', path, started, exc)
+        failure = source_error('disk', 'disk.inventory.source', path, started, exc)
+        if source_failures is not None:
+            source_failures.add(failure)
     return entries, listed
 
 
@@ -381,7 +384,7 @@ def inventory_skipped_logs(roots, previous, reason):
 def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_only=False, refresh_only=False,
                        deep=False, checkpoint=None, attempted=None, max_batches=None, single_paths=None,
                        parts_mode=False, metrics=None, turn_seconds=None, part_work=None,
-                       due_at=None, descend=True, inventory_log=None):
+                       due_at=None, descend=True, inventory_log=None, source_failures=None):
     cache = {} if cache is None else cache
     inventory_log = inventory_log if inventory_log is not None else InventoryLog(path, cache)
     single_paths = set() if single_paths is None else single_paths
@@ -394,7 +397,8 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
     # directory attribution and permission diagnostics;
     # slow/limited record only this hourly scanner's 15/60 s timeout policy.
     inventory_clean_cache(cache, now)
-    entries, listed = inventory_listing(path, deadline) if listing is None else listing
+    entries, listed = (inventory_listing(path, deadline) if source_failures is None else
+                       inventory_listing(path, deadline, source_failures)) if listing is None else listing
     present = {entry.path for entry in entries}
     if listed:
         for key in set(cache)-present:
@@ -548,7 +552,9 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
                     if allowance == 60:
                         value['limited'] = True
             inventory_log.timing(unfinished.path, max(0, (time.monotonic()-started)*1000))
-            source_error('disk', 'disk.inventory.source', unfinished.path, started, exc)
+            failure = source_error('disk', 'disk.inventory.source', unfinished.path, started, exc)
+            if source_failures is not None:
+                source_failures.add(failure)
         finally:
             if attempted is not None:
                 attempted.update(done)
@@ -711,6 +717,7 @@ def _directory_inventory(paths=None, run=subprocess.run, deadline=None):
     attempts = previous.get('attemptedAt', {})
     attempts = dict(attempts) if isinstance(attempts, dict) else {}
     roots = list(DIRECTORY_ROOTS if paths is None else paths)
+    source_failures = {str(path): set() for path in roots}
     child_state, migrated = inventory_child_state(previous, roots)
     old_sizes = previous.get('sizes', {})
     old_sizes = old_sizes if isinstance(old_sizes, dict) else {}
@@ -726,16 +733,16 @@ def _directory_inventory(paths=None, run=subprocess.run, deadline=None):
             # leave time for healthy roots before any du work starts.
             source_deadline = min(deadline, time.monotonic()+2)
             deadline_call(source_deadline, path.stat)
-            listings[key] = inventory_listing(path, source_deadline)
+            listings[key] = inventory_listing(path, source_deadline, source_failures[key])
         except FileNotFoundError as exc:
             if confirmed_absent(path, exc):
                 sizes[key], children[key], listings[key], child_state[key] = 0, {}, ([], True), {}
             else:
                 listings[key] = ([], False)
-                source_error('disk', 'disk.inventory.source', path, started, exc)
+                source_failures[key].add(source_error('disk', 'disk.inventory.source', path, started, exc))
         except Exception as exc:
             listings[key] = ([], False)
-            source_error('disk', 'disk.inventory.source', path, started, exc)
+            source_failures[key].add(source_error('disk', 'disk.inventory.source', path, started, exc))
     roots.sort(key=lambda p: (attempts[str(p)], len(listings[str(p)][0])))
     inventory_logs = {str(path): InventoryLog(path, child_state[str(path)]) for path in roots}
     def scan(path, stop, pending_only=False, refresh_only=False):
@@ -743,7 +750,7 @@ def _directory_inventory(paths=None, run=subprocess.run, deadline=None):
         scan_started = time.monotonic()
         try:
             total, status, measured = big_root_inventory(path, run, stop, child_state[key], listings[key],
-                pending_only, refresh_only, inventory_log=inventory_logs[key])
+                pending_only, refresh_only, inventory_log=inventory_logs[key], source_failures=source_failures[key])
         finally:
             inventory_logs[key].elapsed_ms += max(0, (time.monotonic()-scan_started)*1000)
         flags[key], children[key] = status, measured
@@ -818,9 +825,24 @@ def _directory_inventory(paths=None, run=subprocess.run, deadline=None):
     save_state('disk-inventory',dict(previous, at=time.time(),duMode='links',sizes=sizes,partials=partials,children=children,
         sourceErrors=errors,attemptedAt=attempts,childState=child_state))
     cached = [v for cache in child_state.values() for v in cache.values() if 'bytes' in v]
+    scan_ms = (time.monotonic()-started)*1000
+    denied_roots = {key for key, failures in source_failures.items() if 'permission' in failures}
+    for key, cache in child_state.items():
+        pending = list(cache.values())
+        while pending:
+            value = pending.pop()
+            if not isinstance(value, dict):
+                continue
+            if number(value.get('deniedCount')) and value['deniedCount'] > 0:
+                denied_roots.add(key)
+                break
+            if isinstance(value.get('parts'), dict):
+                pending.extend(value['parts'].values())
     emit('disk','error' if errors else 'perf','disk.inventory',ok=not errors,
-         duration_ms=(time.monotonic()-started)*1000,
+         duration_ms=scan_ms,
          props=dict(duMode='links',count=len(sizes),sourceErrors=errors,rootsComplete=len(roots)-len(partials),
+                    rootsOk=len(roots)-len(partials),rootsTimeout=sum('timeout' in v for v in source_failures.values()),
+                    rootsDenied=len(denied_roots),scanMs=scan_ms,
                     rootsPartial=len(partials),childrenCached=len(cached),
                     oldestChildAgeS=max((max(0,now-v['at']) for v in cached),default=0)),
          error_tag='disk.inventory_failed' if errors else None)

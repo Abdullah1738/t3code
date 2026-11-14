@@ -16,6 +16,7 @@ def rollup(day, root=None):
     root = Path(root) if root else directory()
     names, kinds, durations, tags, samples = Counter(), Counter(), defaultdict(list), Counter(), {}
     disk = dict(probes=0, timeouts=0, maxDurationMs=None, latestBlockedIn=None)
+    inventory = dict(scans=0, rootsOk=0, rootsPartial=0, rootsTimeout=0, rootsDenied=0, scanMs=0)
     backup = {key: dict.fromkeys(('memory', 'health', 'other'), 0)
               for key in ('skipped_runs', 'ok_runs', 'failed_runs')}
     latest_blocked_at = ''
@@ -63,6 +64,13 @@ def rollup(day, root=None):
                         stamp = row.get('ts', '')
                         if blocked in ('SKHelperClient', 'SKManager', 'DiskArbitration', 'DASession', 'unknown') and stamp >= latest_blocked_at:
                             disk['latestBlockedIn'], latest_blocked_at = blocked, stamp
+                    if name == 'disk.inventory' and not row.get('props', {}).get('skipReason'):
+                        inventory['scans'] += 1
+                        props = safe_fields(row.get('props'))
+                        for key in ('rootsOk', 'rootsPartial', 'rootsTimeout', 'rootsDenied', 'scanMs'):
+                            value = props.get(key)
+                            if type(value) in (int, float) and value >= 0:
+                                inventory[key] += value
                     if name == 'proc.disk_wait':
                         raw = row.get('props', {})
                         props = safe_fields(raw, name)
@@ -95,7 +103,7 @@ def rollup(day, root=None):
     for name, values in durations.items():
         values.sort()
         stats[name] = {key: values[max(0, math.ceil(len(values) * pct) - 1)] for key, pct in [('p50', .5), ('p95', .95), ('max', 1)]}
-    result = dict(day=day, tool='mac', backup=backup, diskTooling=disk, diskWait=waits, total=total, countsByName=dict(names), countsByKind=dict(kinds),
+    result = dict(day=day, tool='mac', backup=backup, diskTooling=disk, diskWait=waits, diskInventory=inventory, total=total, countsByName=dict(names), countsByKind=dict(kinds),
                   outcomes=outcomes, okRate=oks / outcomes if outcomes else None,
                   errorRate=kinds['error'] / total if total else None,
                   failedRate=failed / outcomes if outcomes else None, durationMs=stats, malformed=malformed,
