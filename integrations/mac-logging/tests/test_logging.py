@@ -233,18 +233,28 @@ class LoggingTests(unittest.TestCase):
         from types import SimpleNamespace
         cache=self.root/'cache';cache.mkdir()
         worktree=self.root/'worktree';worktree.mkdir()
+        for root in (cache,worktree):
+            (root/'child').mkdir()
+        def make_due():
+            state=jobs.read_state('disk-inventory')
+            for children in state.get('childState',{}).values():
+                for value in children.values():
+                    value['at']-=3600
+            jobs.save_state('disk-inventory',state)
         value=[100]
         def run(cmd,**kwargs):
-            self.assertEqual(cmd[:2],['/usr/bin/du','-sk'])
+            self.assertEqual(cmd[:2],['/usr/bin/du','-skl'])
             return SimpleNamespace(returncode=0,stdout=str(value[0])+'\t'+cmd[-1])
         jobs.directory_inventory([cache,worktree],run)
         jobs.disk_sample(self.root,self.root,volumes=(self.root,self.root),paths=[])
         value[0]=200
+        make_due()
         jobs.directory_inventory([cache,worktree],run)
         jobs.disk_sample(self.root,self.root,volumes=(self.root,self.root),paths=[])
         row=self.rows()[-1]
         self.assertEqual(row['props']['count'],2)
         self.assertGreater(row['props']['grower1DeltaGb'],0)
+        make_due()
         jobs.directory_inventory([cache],lambda *a,**kw: SimpleNamespace(returncode=1,stdout='private error'))
         self.assertFalse(self.rows()[-1]['ok'])
         self.assertEqual(self.rows()[-1]['name'],'disk.inventory')
