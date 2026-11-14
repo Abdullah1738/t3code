@@ -403,6 +403,73 @@ const negatedGateCases = [
 ];
 
 const resourceReleaseCases = [
+  ...[
+    "session released.",
+    "Session released",
+    "Table on the card, session released.",
+    "Both sims released when done.",
+    "The Run Cloud session was released.",
+    "session B released.",
+    "phone hold released; notes on the card.",
+    "Sessions are now released.",
+    ...[
+      "sessions",
+      "emulator",
+      "emulators",
+      "sim",
+      "sims",
+      "simulator",
+      "simulators",
+      "box",
+      "boxes",
+      "device",
+      "devices",
+      "phone",
+      "phones",
+      "phone holds",
+      "phone lock",
+      "phone locks",
+      "phone hold/lock",
+      "hold",
+      "holds",
+      "lock",
+      "locks",
+      "slot",
+      "slots",
+    ].map((resource) => `${resource} released.`),
+    ...["the", "both", "all", "each", "Run Cloud"].map((prefix) => `${prefix} session released.`),
+    ...["A", "Z", "0", "2", "12"].map((label) => `sim ${label} released.`),
+    ...["is", "are", "was", "were", "got", "been", "now", "both", "all"].map(
+      (word) => `sessions ${word} released.`,
+    ),
+    "sim 2 was now released after the run.",
+    ...[".", ";", ",", "!", "?", ")"].map(
+      (punctuation) => `session released${punctuation} Notes on the card.`,
+    ),
+  ].map((text) => [text, undefined] as const),
+  ...[
+    "v0.1.12 released.",
+    "Robob released to both clients.",
+    "Build released",
+    "sessions released to production",
+    "session data released publicly",
+    "Release the build, session released.",
+    "release v2; session released.",
+    "sessions release.",
+    "session releases.",
+    "session b released.",
+    "session AB released.",
+    "session 2b released.",
+    "session v2 released.",
+    "session was all now released.",
+    "session: released.",
+    "session was, released.",
+    "session data released.",
+    "session released when done shipping software.",
+    "session released after the run to production.",
+    "session released.publicly",
+    "session released,publicly",
+  ].map((text) => [text, "deploy"] as const),
   ["Release the device software to production", "deploy"],
   ["Release the phone's firmware to production", "deploy"],
   ["Release the phone’s firmware to production", "deploy"],
@@ -437,6 +504,13 @@ const resourceReleaseCases = [
 ] as const;
 
 describe("inferGate", () => {
+  it("does not infer deploy for the exact Agent Tools #94 s8 cleanup", () => {
+    const s8 =
+      "Masked-field probe (session B in the packet): a Settings password field with a public dummy onion, routes type-text / type-text+back / per-char press-key / paste, read back through show-password. Table on the card, session released.";
+    // #1421 removes the separate secret guess; whichever lands second asserts undefined.
+    expect(inferGate(s8)).not.toBe("deploy");
+  });
+
   it.each(repeatedNegationCases)("counts repeated negation: $text", ({ text, gate }) => {
     expect(inferGate(text)).toBe(gate);
   });
@@ -917,6 +991,18 @@ describe("approvalProblem", () => {
     closedAt: at,
     answer: { verdict: "approved", by: owner, at },
   });
+
+  it.each(resourceReleaseCases.filter(([, gate]) => gate === undefined))(
+    "does not bind a cleanup ask to an unrelated deployment: %s",
+    (text) => {
+      const action = deploy("s4");
+      expect(
+        approvalProblem({ ...card, subtasks: [action], asks: [approvedAsk(text)] }, action),
+      ).toContain(
+        'q1 was approved but doesn\'t name s4; ask again naming the subtask id (e.g. "Approve s4")',
+      );
+    },
+  );
 
   it.each([
     ...negativeCredentialPhrases,
@@ -2029,7 +2115,12 @@ describe("standing deploy approvals", () => {
           intent,
         );
         if (allowed) expect(result).toBeNull();
-        else expect(result).toContain("subtask id");
+        else {
+          expect(result).toContain(
+            intent === "skip" ? "needs Abdullah's answer" : "needs Abdullah's approval",
+          );
+          expect(result).toContain(`Approve ${subtask.id}`);
+        }
       }
     });
   });
