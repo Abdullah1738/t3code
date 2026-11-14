@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 
 const [root, main, command, ...args] = process.argv.slice(2);
+const originalCwd = process.cwd();
 const hint = `run offbox run -- vp ${[command, ...args].filter(Boolean).join(" ")}`;
 function refuse(reason) {
   throw new Error(`${reason}; ${hint}`);
@@ -77,7 +78,6 @@ const switches = new Set([
 
 function argv() {
   const result = [];
-  const exclusions = [];
   let paths = 0;
   let positional = false;
   let stdin = false;
@@ -103,9 +103,11 @@ function argv() {
     } else {
       const negative = command === "fmt" && arg.startsWith("!");
       const target = absolute(negative ? arg.slice(1) : arg);
-      if (negative) {
-        // Oxfmt cannot match absolute positional exclusions outside cwd; config patterns use root.
-        exclusions.push(path.relative(root, target));
+      if (command === "fmt") {
+        // Literal file lists bypass Oxfmt's nested ignores and use different glob semantics.
+        // Keep patterns relative to their original cwd so Oxfmt owns discovery, including no matches.
+        result.push(arg);
+        if (!negative) paths++;
       } else if (/[*?{[]/.test(arg)) {
         const matches = fs.globSync(arg);
         if (!matches.length) refuse(`no files match ${arg}`);
@@ -121,7 +123,7 @@ function argv() {
     const separator = result.indexOf("--");
     result.splice(separator < 0 ? result.length : separator, 0, root);
   }
-  return { forwarded: result, exclusions };
+  return result;
 }
 
 function checkConfig() {
@@ -157,7 +159,7 @@ function sameConfig(a, b, label) {
 let temporary;
 try {
   if (command !== "fmt" && command !== "lint") refuse("no node_modules in this worktree");
-  const { forwarded, exclusions } = argv();
+  const forwarded = argv();
   checkConfig();
   process.chdir(main);
   const requireMain = createRequire(path.join(main, "package.json"));
@@ -194,9 +196,9 @@ try {
     }
   }
   // Both tools anchor ignores and overrides to the config directory, not the file arguments.
-  // Keep the snapshot at the worktree root while running main's vp from main for plugin resolution.
+  // Keep the snapshot at the worktree root; fmt also needs its original cwd for native glob discovery.
   temporary = path.join(root, `.vp-worktree-${randomUUID()}.json`);
-  config.ignorePatterns = [...(config.ignorePatterns ?? []), ".vp-worktree-*.json", ...exclusions];
+  config.ignorePatterns = [...(config.ignorePatterns ?? []), ".vp-worktree-*.json"];
   fs.writeFileSync(temporary, JSON.stringify(config), { flag: "wx", mode: 0o600 });
   const defaults = command === "fmt" ? [".gitignore", ".prettierignore"] : [".eslintignore"];
   const ignores = args.some((arg) => arg === "--ignore-path" || arg.startsWith("--ignore-path="))
@@ -205,13 +207,15 @@ try {
         .filter((name) => fs.existsSync(path.join(root, name)))
         .map((name) => `--ignore-path=${path.join(root, name)}`);
   console.error(
-    `vp: no node_modules in this worktree; running ${command} from ${main} with absolute paths`,
+    command === "fmt"
+      ? `vp: no node_modules in this worktree; running fmt with ${main}'s dependencies and the worktree config`
+      : `vp: no node_modules in this worktree; running lint from ${main} with absolute paths`,
   );
   const child = spawnSync(
     path.join(main, "node_modules/.bin/vp"),
     [command, "--config", temporary, ...ignores, ...forwarded],
     {
-      cwd: main,
+      cwd: command === "fmt" ? originalCwd : main,
       stdio: "inherit",
     },
   );

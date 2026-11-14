@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 
 const shim = fileURLToPath(new URL("../bin/vp", import.meta.url));
-function fixture(t) {
+function fixture(t, nativeModules) {
   const temporary = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "vp-worktree-")));
   t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
   const main = path.join(temporary, "main");
@@ -19,7 +19,7 @@ function fixture(t) {
   };
   git("init", "-q");
   for (const [name, content] of Object.entries({
-    "vite.config.ts": "export default {};\n",
+    "vite.config.ts": 'export default {fmt:{ignorePatterns:["dist/**"]},lint:{}};\n',
     "package.json": "{}\n",
     ".gitignore": "dist/\n",
   }))
@@ -27,6 +27,16 @@ function fixture(t) {
   git("add", ".");
   git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture");
   git("worktree", "add", "-q", "--detach", wt);
+  if (nativeModules) {
+    fs.symlinkSync(nativeModules, path.join(main, "node_modules"));
+    return {
+      main,
+      wt,
+      run: (args, cwd = wt) => spawnSync(shim, args, { cwd, encoding: "utf8" }),
+      native: (args, cwd = main) =>
+        spawnSync(path.join(main, "node_modules/.bin/vp"), args, { cwd, encoding: "utf8" }),
+    };
+  }
   fs.mkdirSync(path.join(main, "node_modules/.bin"), { recursive: true });
   fs.mkdirSync(path.join(main, "node_modules/vite-plus"));
   fs.writeFileSync(
@@ -66,7 +76,7 @@ function fixture(t) {
     const r = run(args, cwd);
     assert.equal(r.status, 0, r.stderr);
     const result = JSON.parse(r.stdout);
-    assert.equal(result.cwd, main);
+    assert.equal(result.cwd, args[0] === "fmt" ? cwd : main);
     assert.match(r.stderr, /no node_modules in this worktree; running/);
     assert.equal(path.dirname(result.args[2]), wt);
     assert.equal(fs.existsSync(result.args[2]), false, "temporary config cleaned up");
@@ -75,13 +85,13 @@ function fixture(t) {
   return { main, wt, run, routed, fake };
 }
 
-test("fmt and lint use main cwd, absolute paths, config rooted at the worktree", (t) => {
+test("fmt preserves caller cwd and paths; lint uses main cwd and absolute paths", (t) => {
   const f = fixture(t);
   for (const command of ["fmt", "lint"]) {
     const r = f.routed([command, "--check", "src/a b.ts", path.join(f.wt, "other.ts")]);
     assert.deepEqual(r.args.slice(-3), [
       "--check",
-      path.join(f.wt, "src/a b.ts"),
+      command === "fmt" ? "src/a b.ts" : path.join(f.wt, "src/a b.ts"),
       path.join(f.wt, "other.ts"),
     ]);
     assert.deepEqual(r.config.ignorePatterns, ["dist/**", ".vp-worktree-*.json"]);
@@ -97,6 +107,7 @@ test("no paths means the worktree root, including from a nested cwd", (t) => {
     assert.ok(f.routed(args, nested).args.includes(f.wt));
   }
   assert.equal(f.routed(["lint", "src/a.ts"], nested).args.at(-1), path.join(nested, "src/a.ts"));
+  assert.equal(f.routed(["fmt", "a.ts"], nested).args.at(-1), "a.ts");
 });
 
 test("argument classes: spaced/equals values, paths, globs, exclusions, separator", (t) => {
@@ -104,47 +115,154 @@ test("argument classes: spaced/equals values, paths, globs, exclusions, separato
   const rows = [
     [
       ["--threads", "1", "a.ts"],
-      ["--threads=1", path.join(f.wt, "a.ts")],
+      ["--threads=1", "a.ts"],
     ],
     [
       ["--threads=1", "a.ts"],
-      ["--threads=1", path.join(f.wt, "a.ts")],
+      ["--threads=1", "a.ts"],
     ],
     [
       ["-D", "no-debugger", "a.ts"],
-      ["-D=no-debugger", path.join(f.wt, "a.ts")],
+      ["-D=no-debugger", "a.ts"],
     ],
     [
       ["--format", "json", "a.ts"],
-      ["--format=json", path.join(f.wt, "a.ts")],
+      ["--format=json", "a.ts"],
     ],
     [
       ["--tsconfig=tsconfig.json", "a.ts"],
-      [`--tsconfig=${f.wt}/tsconfig.json`, `${f.wt}/a.ts`],
+      [`--tsconfig=${f.wt}/tsconfig.json`, "a.ts"],
     ],
     [
       ["--ignore-path", ".gitignore", "a.ts"],
-      [`--ignore-path=${f.wt}/.gitignore`, `${f.wt}/a.ts`],
+      [`--ignore-path=${f.wt}/.gitignore`, "a.ts"],
     ],
     [
       ["--", "-dash.ts"],
-      ["--", `${f.wt}/-dash.ts`],
+      ["--", "-dash.ts"],
     ],
   ];
   for (const [input, expected] of rows)
     assert.deepEqual(f.routed(["fmt", ...input]).args.slice(-expected.length), expected);
 });
 
-test("quoted globs expand in original cwd; exclusions stay relative to worktree config", (t) => {
+test("fmt delegates globs, exclusions and empty selections unchanged to Oxfmt", (t) => {
   const f = fixture(t);
-  fs.mkdirSync(path.join(f.wt, "src"));
-  for (const name of ["a.ts", "skip.ts"])
-    fs.writeFileSync(path.join(f.wt, "src", name), "export {};\n");
   const result = f.routed(["fmt", "src/*.ts", "!src/skip.ts"]);
-  assert.deepEqual(result.args.slice(-2).sort(), [`${f.wt}/src/a.ts`, `${f.wt}/src/skip.ts`]);
-  assert.equal(result.config.ignorePatterns.at(-1), "src/skip.ts");
-  assert.match(f.run(["fmt", "missing/*.ts"]).stderr, /no files match.*offbox/);
+  assert.deepEqual(result.args.slice(-2), ["src/*.ts", "!src/skip.ts"]);
+  for (const flags of [[], ["--no-error-on-unmatched-pattern"]]) {
+    const unmatched = f.routed(["fmt", ...flags, "missing/*.ts"]);
+    assert.equal(unmatched.args.at(-1), "missing/*.ts");
+    assert.equal(unmatched.args.includes(f.wt), false);
+  }
 });
+
+// Compare the selected files and writes with the pinned tool, not a second JS glob implementation.
+const selectionCases = [
+  { name: "star includes dotfiles", paths: ["src/*.ts"] },
+  { name: "recursive star", paths: ["src/**/*.ts"] },
+  { name: "brace extensions", paths: ["src/*.{ts,tsx}"] },
+  { name: "question mark", paths: ["src/o?.ts"] },
+  { name: "character class", paths: ["src/[o]*.ts"] },
+  { name: "directory discovery", paths: ["src"] },
+  { name: "absolute explicit file", paths: ["$ROOT/src/.hidden.ts"] },
+  { name: "negative glob", paths: ["src/*.ts", "!src/.*.ts"] },
+  { name: "nested cwd", paths: ["*.ts"], cwd: "src" },
+  { name: "unmatched glob errors", paths: ["missing/*.ts"] },
+  {
+    name: "unmatched glob permitted",
+    paths: ["missing/*.ts"],
+    flags: ["--no-error-on-unmatched-pattern"],
+  },
+  {
+    name: "unmatched literal permitted",
+    paths: ["missing.ts"],
+    flags: ["--no-error-on-unmatched-pattern"],
+  },
+  {
+    name: "mixed matched and unmatched",
+    paths: ["missing/*.ts", "src/ok.ts"],
+    flags: ["--no-error-on-unmatched-pattern"],
+  },
+  { name: "nested gitignore write", paths: ["src/*.ts"], write: true },
+  { name: "nested cwd gitignore write", paths: ["*.ts"], cwd: "src", write: true },
+  { name: "explicit ignored file write", paths: ["src/ignored.ts"], write: true },
+  {
+    name: "custom ignore path write",
+    paths: ["src/*.ts"],
+    flags: ["--ignore-path", "$ROOT/custom.ignore"],
+    write: true,
+  },
+];
+
+for (const row of selectionCases) {
+  test(
+    `pinned Oxfmt selection: ${row.name}`,
+    {
+      skip:
+        !process.env.VP_TEST_NODE_MODULES &&
+        "set VP_TEST_NODE_MODULES to the pinned checkout's node_modules",
+    },
+    (t) => {
+      const f = fixture(t, process.env.VP_TEST_NODE_MODULES);
+      const bodies = {
+        "src/ok.ts": "export const ok = 1;\n",
+        "src/.hidden.ts": "export const hidden={a:1}\n",
+        "src/nested/deep.ts": "export const deep={a:1}\n",
+        "src/ignored.ts": "export const ignored={a:1}\n",
+        "src/.gitignore": "ignored.ts\n",
+        "custom.ignore": "src/.hidden.ts\n",
+        "unselected.ts": "export const unselected={a:1}\n",
+      };
+      for (const base of [f.main, f.wt])
+        for (const [name, body] of Object.entries(bodies)) {
+          fs.mkdirSync(path.dirname(path.join(base, name)), { recursive: true });
+          fs.writeFileSync(path.join(base, name), body);
+        }
+      const args = (base) =>
+        [
+          "fmt",
+          row.write ? "--write" : "--check",
+          "--threads=1",
+          ...(row.flags ?? []),
+          ...row.paths,
+        ].map((value) => value.replaceAll("$ROOT", base));
+      const native = f.native(args(f.main), path.join(f.main, row.cwd ?? ""));
+      const routed = f.run(args(f.wt), path.join(f.wt, row.cwd ?? ""));
+      assert.equal(
+        routed.status,
+        native.status,
+        `native: ${native.stdout}${native.stderr}\nshim: ${routed.stdout}${routed.stderr}`,
+      );
+      for (const name of Object.keys(bodies)) {
+        assert.equal(
+          fs.readFileSync(path.join(f.wt, name), "utf8"),
+          fs.readFileSync(path.join(f.main, name), "utf8"),
+          name,
+        );
+      }
+      const count = (output) => /on (\d+) files/.exec(output)?.[1];
+      assert.equal(count(routed.stdout), count(native.stdout), "same number of checked files");
+      if (row.name === "star includes dotfiles") {
+        assert.equal(routed.status, 1);
+        assert.match(routed.stdout, /\.hidden\.ts/);
+      }
+      if (row.name === "nested gitignore write")
+        assert.equal(
+          fs.readFileSync(path.join(f.wt, "src/ignored.ts"), "utf8"),
+          bodies["src/ignored.ts"],
+        );
+      if (row.name === "unmatched glob permitted") {
+        assert.equal(routed.status, 0);
+        assert.equal(count(routed.stdout), "0");
+      }
+      assert.deepEqual(
+        fs.readdirSync(f.wt).filter((name) => name.startsWith(".vp-worktree-")),
+        [],
+      );
+    },
+  );
+}
 
 test("config drift, addition and deletion all refuse without running vp", (t) => {
   const f = fixture(t);
