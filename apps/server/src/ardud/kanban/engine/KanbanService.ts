@@ -119,7 +119,7 @@ import * as Pages from "./messagePages.ts";
 import { wikiOutline, wikiSection } from "./wikiSections.ts";
 import * as BoardReplies from "./boardReplies.ts";
 import * as ReplyBuilders from "../../http/ReplyBuilders.ts";
-import { KanbanThreads, KanbanThreadError, type KanbanThreadView } from "./threads.ts";
+import { KanbanThreads, KanbanThreadError, queuedWakes, type KanbanThreadView } from "./threads.ts";
 import { KanbanModels, isListed } from "./models.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
 import { planCutoverCardRestore, type RestoreCutoverCardInput } from "./cutoverCards.ts";
@@ -1496,6 +1496,8 @@ const make = Effect.gen(function* () {
     else yield* recordServerAnalytics(analytics.value, recorded);
   });
   const analyticsActors = new WeakMap<KanbanCard, KanbanActor>();
+  const preparedTransitions = new WeakSet<KanbanCard>();
+  const scopedWakeSends = new Map<ThreadId, Set<{ scope: string; stale: boolean }>>();
   const poolHours = new Map<string, number>();
   const failedRuns = new Set<string>();
   const stoppedRunCards = new Map<
@@ -1887,12 +1889,111 @@ const make = Effect.gen(function* () {
     "KanbanLaunchReconcile",
     { defaultValue: () => undefined },
   );
+  const discardWake = Effect.fn("KanbanService.discardWake")(
+    function* (threadId: ThreadId, runId: string | void, wakeMessageId?: string) {
+      if (runId === undefined && wakeMessageId === undefined) return;
+      const wake = queuedWakes(yield* threadIo.queuedRuns(threadId)).find((run) =>
+        runId === undefined ? run.userMessageId === wakeMessageId : run.id === runId,
+      );
+      if (wake !== undefined) yield* touching(threadId, threadIo.cancelQueued(threadId, wake.id));
+    },
+    Effect.retry({ times: 1 }),
+    Effect.tapError((error) => Effect.logWarning("kanban stale wake withdrawal failed", { error })),
+  );
+
+  const sendThread = Effect.fn("KanbanService.sendThread")(function* (
+    input: Parameters<typeof threadIo.send>[0],
+    acknowledge?: { failed: boolean },
+  ) {
+    const key = yield* ownerDeliveryKey;
+    const delivered = yield* ownerDelivered;
+    const answer = input.key === undefined;
+    if (answer && delivered?.has(input.threadId)) return;
+    const wake =
+      input.coalesce !== undefined && input.model === undefined && input.mode !== "steer"
+        ? { scope: input.coalesce, stale: false }
+        : undefined;
+    if (wake !== undefined) {
+      let pending = scopedWakeSends.get(input.threadId);
+      if (pending === undefined) scopedWakeSends.set(input.threadId, (pending = new Set()));
+      pending.add(wake);
+    }
+    const sent = touching(
+      input.threadId,
+      threadIo
+        .send({
+          ...input,
+          ...(wake === undefined
+            ? {}
+            : { isStale: () => wake.stale || input.isStale?.() === true }),
+          ...(key === undefined
+            ? {}
+            : { key: `${key}:${input.threadId}:${input.key ?? "answer"}` }),
+        })
+        .pipe(
+          Effect.tapError((error) =>
+            wake?.stale ? discardWake(input.threadId, undefined, error.wakeMessageId) : Effect.void,
+          ),
+          Effect.flatMap((runId) =>
+            wake?.stale
+              ? discardWake(input.threadId, runId).pipe(Effect.asVoid)
+              : Effect.succeed(runId),
+          ),
+        ),
+    );
+    const delivery = Effect.andThen(
+      runPendingStops(input.threadId),
+      input.model === undefined ? sent : withThreadModel(input.threadId, sent),
+    ).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          if (answer && !wake?.stale) delivered?.add(input.threadId);
+        }),
+      ),
+    );
+    return yield* trackSend(
+      input.threadId,
+      locks.outside(
+        acknowledge
+          ? delivery.pipe(
+              Effect.catchCause(() =>
+                Effect.sync(() => {
+                  acknowledge.failed = true;
+                }),
+              ),
+            )
+          : delivery,
+        wake === undefined
+          ? undefined
+          : (runId) =>
+              wake.stale
+                ? discardWake(input.threadId, runId).pipe(
+                    Effect.catchCause((cause) =>
+                      Effect.logWarning("kanban abandoned wake withdrawal failed", { cause }),
+                    ),
+                  )
+                : Effect.void,
+        false,
+        acknowledge ? Effect.succeed(true) : undefined,
+      ),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (wake === undefined) return;
+          const pending = scopedWakeSends.get(input.threadId);
+          pending?.delete(wake);
+          if (pending?.size === 0) scopedWakeSends.delete(input.threadId);
+        }),
+      ),
+    );
+  });
   const threads: typeof threadIo = {
     pendingUserInputs: (id) =>
       TickTimings.measure(
         "thread_status",
         locks.outside(threadIo.pendingUserInputs(id), undefined, true),
       ),
+    queuedRuns: (id) => locks.outside(threadIo.queuedRuns(id), undefined, true),
     view: (id) => threadRead("view", id, threadIo.view(id)),
     find: (id) => threadRead("find", id, threadIo.find(id)),
     model: (id, activeRun = false) =>
@@ -1974,38 +2075,7 @@ const make = Effect.gen(function* () {
             Effect.tap((id) => locks.launched(id, abandonLaunch(input, id))),
           );
       }),
-    send: Effect.fn("KanbanService.sendThread")(function* (
-      input: Parameters<typeof threadIo.send>[0],
-    ) {
-      const key = yield* ownerDeliveryKey;
-      const delivered = yield* ownerDelivered;
-      const answer = input.key === undefined;
-      if (answer && delivered?.has(input.threadId)) return;
-      const sent = touching(
-        input.threadId,
-        threadIo.send({
-          ...input,
-          ...(key === undefined
-            ? {}
-            : { key: `${key}:${input.threadId}:${input.key ?? "answer"}` }),
-        }),
-      );
-      return yield* trackSend(
-        input.threadId,
-        locks.outside(
-          Effect.andThen(
-            runPendingStops(input.threadId),
-            input.model === undefined ? sent : withThreadModel(input.threadId, sent),
-          ).pipe(
-            Effect.tap(() =>
-              Effect.sync(() => {
-                if (answer) delivered?.add(input.threadId);
-              }),
-            ),
-          ),
-        ),
-      );
-    }),
+    send: sendThread,
     withdraw: (input) => locks.outside(touching(input.threadId, threadIo.withdraw(input))),
     setModel: (id, model) =>
       locks.outside(withThreadModel(id, touching(id, threadIo.setModel(id, model)))),
@@ -2565,6 +2635,26 @@ const make = Effect.gen(function* () {
     } satisfies KanbanBoardSnapshot;
   });
 
+  const prepareTransition = Effect.fn("KanbanService.prepareTransition")(function* (
+    card: KanbanCard,
+  ) {
+    if (preparedTransitions.has(card)) return;
+    const before = yield* store.card(card.id);
+    if (
+      before !== null &&
+      ((before.activeThreadId !== null && before.activeThreadId !== card.activeThreadId) ||
+        (before.stage !== card.stage &&
+          !KANBAN_THREAD_STAGES.includes(card.stage) &&
+          ["working", "in_review", "needs_review"].includes(before.stage)))
+    ) {
+      for (const id of new Set([before.activeThreadId, before.workThreadId])) {
+        if (id !== null) yield* pruneWakes(id, card.id, card.discussionId);
+      }
+    }
+    // The event and card write share this immutable candidate; never re-read a fallible queue between them.
+    preparedTransitions.add(card);
+  });
+
   // Callers hold the lock, and log a card's event before saving it: clients
   // re-read the card's history when its change is published.
 
@@ -2574,6 +2664,7 @@ const make = Effect.gen(function* () {
     by?: KanbanActor,
     dispatchMetadata = false,
   ) {
+    yield* prepareTransition(incoming);
     const actor: KanbanActor = analyticsActors.get(incoming) ??
       by ?? { _tag: "system", component: "dispatcher" };
     let card = incoming;
@@ -2627,8 +2718,12 @@ const make = Effect.gen(function* () {
             Rules.reviewThreadToReuse(yield* boardOf(card.boardId), card) === card.reviewThreadId;
           if (!active && !queued) yield* endReviewLink(card.reviewThreadId);
         }
-        let before = Option.isSome(analytics) ? yield* store.card(card.id) : null;
-        if (before !== null && before.analyticsStageEnteredAt === undefined) {
+        let before = yield* store.card(card.id);
+        if (
+          Option.isSome(analytics) &&
+          before !== null &&
+          before.analyticsStageEnteredAt === undefined
+        ) {
           // Seed old cards from their actual transition history, since queue age may predate it.
           const stage = before.stage;
           const entered = (yield* store.cardEvents(card.id)).findLast(
@@ -2673,8 +2768,11 @@ const make = Effect.gen(function* () {
       readonly body?: string | null;
       readonly head?: string | null;
       readonly instructionApplication?: InstructionApplication;
+      readonly undoAssignment?: true;
     } = {},
   ) {
+    if (extra.undoAssignment) preparedTransitions.add(card);
+    else yield* prepareTransition(card);
     analyticsActors.set(card, actor);
     const write = store.addCardEvent(
       {
@@ -2860,6 +2958,28 @@ const make = Effect.gen(function* () {
     const link = known ?? (yield* store.threadLink(threadId));
     if (link?.role !== "review" || link.endedAt !== null) return;
     yield* store.putThreadLink({ ...link, endedAt: at ?? (yield* nowIso) });
+  });
+
+  const pruneWakes = Effect.fn("KanbanService.pruneWakes")(function* (
+    threadId: ThreadId,
+    cardId: string,
+    discussionId: string | null,
+  ) {
+    const scopes = [
+      "nudge",
+      `step:${cardId}`,
+      `plan:${cardId}`,
+      `owner:${cardId}`,
+      ...(discussionId === null ? [] : [`owner:${discussionId}`]),
+    ];
+    // A send outside the gate can enqueue after this scan; it must withdraw its own stale result.
+    for (const pending of scopedWakeSends.get(threadId) ?? []) {
+      if (scopes.includes(pending.scope)) pending.stale = true;
+    }
+    // Keep the transition gate so a new assignment cannot overtake cleanup.
+    for (const wake of queuedWakes(yield* threadIo.queuedRuns(threadId), Infinity, scopes)) {
+      yield* touching(threadId, threadIo.cancelQueued(threadId, wake.id));
+    }
   });
 
   /**
@@ -6669,6 +6789,7 @@ const make = Effect.gen(function* () {
         .send({
           threadId,
           text: Briefs.nudgeDiscussionText(discussion.id),
+          coalesce: `owner:${discussion.cardId ?? discussion.id}`,
           ...(participant.deferred
             ? {
                 key: `discussion:${participant.deferredKey ?? `${discussion.id}:${threadId}:${participant.lastReadSeq}`}`,
@@ -6796,6 +6917,7 @@ const make = Effect.gen(function* () {
       discussionId: current.discussionId,
       updatedAt: yield* nowIso,
     };
+    if (preparedTransitions.has(card)) preparedTransitions.add(saved);
     yield* saveCard(saved);
     return saved;
   });
@@ -7200,6 +7322,8 @@ const make = Effect.gen(function* () {
                     fromStage: current.stage,
                     toStage: restored.stage,
                     body: "Assignment wake did not complete",
+                    // No consumer owns this claim; interrupted rollback cannot wait on thread I/O.
+                    undoAssignment: true,
                   });
                   destination.expectedCard = yield* saveDispatchCard(restored);
                 }
@@ -8005,17 +8129,27 @@ const make = Effect.gen(function* () {
     cards: ReadonlyArray<KanbanCard>,
     text: string,
   ) {
+    if (
+      (yield* threads.queuedRuns(threadId)).some(
+        (run) => !run.userMessageId.startsWith("kanban:wake:"),
+      )
+    ) {
+      yield* Effect.logDebug("kanban nudge skipped: unread message queued", { threadId });
+      return;
+    }
     // The send is accepted before the gate resumes. Acknowledge it on current rows,
     // like discussion delivery, so a concurrent edit cannot replay the same nudge.
-    const sent = yield* locks.outside(
-      threads.send({ threadId, text, coalesce: "nudge" }).pipe(
-        Effect.as(true),
-        Effect.catchCause(() => Effect.succeed(false)),
+    // Errors can follow acceptance; a skipped send must leave the nudge attempt available.
+    const attempt = { failed: false };
+    const runId = yield* sendThread({ threadId, text, coalesce: "nudge" }, attempt).pipe(
+      Effect.catchCause(() =>
+        Effect.sync(() => {
+          attempt.failed = true;
+        }),
       ),
-      undefined,
-      false,
-      Effect.succeed(true),
     );
+    if (runId === undefined && !attempt.failed) return;
+    const sent = runId !== undefined;
     const at = yield* nowIso;
     for (const card of cards) {
       const current = yield* store.card(card.id);
@@ -10375,6 +10509,7 @@ const make = Effect.gen(function* () {
                         .send({
                           threadId: evaluatorId,
                           text: Briefs.ownerWaitingText(discussion, minutes),
+                          coalesce: `owner:${discussion.cardId ?? discussion.id}`,
                         })
                         .pipe(
                           Effect.as(true),

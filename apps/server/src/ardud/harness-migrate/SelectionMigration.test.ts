@@ -67,6 +67,7 @@ const inertThreads = Layer.succeed(
     send: () => Effect.die("the board tests send to no thread"),
     setModel: () => Effect.die("the board tests change no thread model"),
     withdraw: () => Effect.die("the board tests withdraw no assignment"),
+    queuedRuns: () => Effect.succeed([]),
     cancelQueued: () => Effect.succeed(false),
     interrupt: () => Effect.void,
   }),

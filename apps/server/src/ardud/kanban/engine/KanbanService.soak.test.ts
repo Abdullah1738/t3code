@@ -581,6 +581,7 @@ const makeThreads = (watch: Watch) => {
           const thread = threads.get(threadId);
           if (thread) thread.model = model;
         }),
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: (threadId) =>
         Effect.gen(function* () {
