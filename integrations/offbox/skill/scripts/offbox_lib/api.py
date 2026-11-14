@@ -918,7 +918,7 @@ def _supply_refusal(s: dict, st: str | None, since: float | None, stale_error: s
 
 
 def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7, since: float | None = None,
-               stale_error: str | None = None, on_state=None) -> dict:
+               stale_error: str | None = None, on_state=None, read_budget=None, observe_state=None) -> dict:
     """since: when this attempt started (a resume). stale_error: the box's error read just before it."""
     from . import home
     if _DEADLINE is not None:
@@ -929,7 +929,8 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
         if time.time() >= deadline:
             raise BudgetExpired(f"box {box_id} did not become ready within {timeout:g}s; nothing ran")
         try:
-            s = readiness_get(box_id)
+            options = {} if read_budget is None else {"deadline": time.time() + read_budget()}
+            s = readiness_get(box_id, **options)
         except NetworkError:
             network_failures += 1
             if not home.may_fail_over() or network_failures >= HOME_NETWORK_FAILURES:
@@ -940,6 +941,8 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
         if s is None:
             raise OffboxError(f"box {box_id} disappeared")
         st = s.get("state")
+        if observe_state is not None:
+            observe_state(s)
         if st in want:
             return s
         m = SUPPLY_OUT.search(s.get("error") or "")

@@ -169,8 +169,8 @@ def fail_over(reason: str, argv: list[str], run_id: str = "") -> bool:
         _forward_background(queued)
     elapsed = max(0, time.monotonic() - WAIT_STARTED)*1000 if WAIT_STARTED is not None else 0
     toollog.emit("backend", "backend.failover", duration_ms=elapsed, ok=True, ids={"run": run_id},
-                 props={"from": "home", "to": "boat", "reason": "unreachable", "waitMs": elapsed})
-    say(f"home offbox server not reachable ({reason[:160]}); this run goes to Boat instead")
+                 props={"from": "home", "to": "boat", "reason": reason, "waitMs": elapsed})
+    say(f"home offbox could not prepare this run ({reason}); this run goes to Boat instead")
     log(f"failover to boat: {reason[:300]}")
     env = dict(os.environ, OFFBOX_BACKEND="boat")
     env[FAILOVER_ENV] = reason[:200]
