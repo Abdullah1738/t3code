@@ -14,7 +14,7 @@ _TOKEN = re.compile(r'[a-zA-Z][a-zA-Z0-9_.-]{0,79}')
 _NAME = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}')
 _DATED = re.compile(r'(?:rollup-)?(\d{4}-\d{2}-\d{2})(?:\.ndjson|\.json|\.cap)')
 _IDS = frozenset(('watcher', 'run', 'thread', 'chat', 'key', 'operation', 'reminder', 'update', 'item', 'helper'))
-_NUMERIC = frozenset(('exitCode', 'attempt', 'count', 'bytes', 'queuedMs'))
+_NUMERIC = frozenset(('exitCode', 'attempt', 'count', 'bytes', 'queuedMs', 'failedSources', 'totalSources'))
 _BOOLEAN = frozenset(('deduped', 'accepted', 'timedOut'))
 _ERRNO = frozenset(errno.errorcode.values()) | {'UNKNOWN'}
 _SIGNALS = frozenset(s.name for s in signal.Signals)
@@ -26,17 +26,20 @@ _VALUES = {
     'class': ('urgent', 'today', 'info', 'noise', 'candidate', 'charge', 'bank', 'security', 'otp', 'unknown', 'fail_open', 'deduped'),
     'action': ('create', 'queue', 'cancel', 'snooze', 'sent', 'retry', 'check', 'wake', 'notify', 'send', 'coalesce', 'conflict', 'expire', 'pause', 'remove', 'cap', 'resume'),
     'state': ('pending', 'sending', 'sent', 'uncertain', 'cancelled', 'failed', 'scheduled', 'queued', 'done', 'expired', 'paused', 'active'),
-    'stderrClass': ('usage_error', 'missing_file', 'permission', 'timeout', 'python_traceback', 'unknown'),
+    'stderrClass': ('usage_error', 'missing_file', 'permission', 'timeout', 'python_traceback', 'auth', 'connect', 'json', 'unknown'),
     'triggerKind': ('file', 'wal'),
 }
 _initialized = set()
 
 # Same order and normalization as src/cause.ts; classification never retains text in a log.
 _PATTERNS = tuple((name, re.compile(pattern, re.I)) for name, pattern in (
-    ('usage_error', r'(?:^|\n)\s*usage:|unrecognized arguments?|unknown (?:option|argument)|invalid (?:option|choice)|argument .*required|not (?:an exact trip UUID|a bridge chat slug)|no bridge chat|unsafe display name'),
-    ('missing_file', r'no such file or directory|filenotfounderror|\bENOENT\b'),
+    ('usage_error', r'(?:^|\n)\s*usage:|unrecognized arguments?|unknown (?:option|argument)|invalid (?:option|choice)|argument .*required|not (?:an exact trip UUID|a bridge chat slug)|no bridge chat|unsafe display name|invalid command arguments|duplicate command option|unexpected positional arguments|--[a-z-]+ (?:is required|must be)'),
+    ('missing_file', r'no such file or directory|filenotfounderror|\bENOENT\b|command not found|cannot find module|modulenotfounderror'),
     ('permission', r'permission denied|operation not permitted|permissionerror|\b(?:EACCES|EPERM)\b'),
     ('timeout', r'timed? out|timeoutexpired|timeouterror|\bETIMEDOUT\b'),
+    ('auth', r'authentication[ _-]*failed|invalid credentials|invalid[_ -]grant|login failed|unauthori[sz]ed|forbidden|HTTP[ :]+(?:401|403)\b'),
+    ('connect', r'connection[ _-]*(?:refused|reset|aborted)|\b(?:ECONNREFUSED|ECONNRESET|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN)\b|network is (?:unreachable|down)|no route to host|temporary failure in name resolution|bridge socket is unavailable|bridge request failed'),
+    ('json', r'jsondecodeerror|invalid json|json (?:parse|decode) error|unexpected (?:token|end).*json'),
     ('python_traceback', r'traceback \(most recent call last\):'),
 ))
 _PATHS = re.compile(r'''"(?:[A-Za-z]:\\|/|\.\.?/|~/)[^"]*"|'(?:[A-Za-z]:\\|/|\.\.?/|~/)[^']*'|(?:[A-Za-z]:\\|/|\.\.?/|~/)[^\s'"<>]*''')

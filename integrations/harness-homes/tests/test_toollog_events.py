@@ -14,6 +14,16 @@ import check as mcp_check
 
 
 class HomeLogEvents(unittest.TestCase):
+    def test_request_props_survive_canonical_allowlist(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT': temp+'/logs'}):
+            props = {'method': 'http:DELETE', 'httpMethod': 'DELETE', 'ttfbMs': 2.5,
+                     'reason': '{"error":"bad request"}', 'arguments': 'DO_NOT_LOG',
+                     'unknown': 'DO_NOT_LOG'}
+            gh.toollog.emit('shared-mcp', 'perf', 'mcp.request', props=props)
+            row, = self.rows(temp)
+            self.assertEqual(row['props'], {k: v for k, v in props.items() if k not in {'arguments', 'unknown'}})
+            self.assertNotIn('DO_NOT_LOG', json.dumps(row))
+
     def test_generate_success_and_plan_failure(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT':temp+'/logs'}):
             with patch.object(gh, 'plan_all', return_value=({'skillRoots':[]}, {}, [], [], {})), patch.object(gh, 'warn_mcp_parity'), contextlib.redirect_stdout(io.StringIO()):

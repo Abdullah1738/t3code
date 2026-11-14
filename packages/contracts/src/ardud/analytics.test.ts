@@ -16,6 +16,33 @@ const decode = Schema.decodeUnknownSync(AnalyticsIngestInput);
 const decodeEvent = Schema.decodeUnknownSync(AnalyticsEvent);
 const decodeRead = Schema.decodeUnknownSync(AnalyticsReadInput);
 describe("analytics ingest contract", () => {
+  it("preserves typed board metadata and excludes text", () => {
+    const input = {
+      ...event,
+      kind: "kanban.card_move",
+      surface: "server",
+      cardId: "card-1",
+      props: {
+        number: 1,
+        from: "todo",
+        to: "working",
+        actor: "owner",
+        msInPrevStage: 100,
+        blocking: true,
+        round: 1,
+        verdict: "clear",
+        head: "abcdef1",
+        used: 1,
+        slots: 2,
+        waiting: 0,
+      },
+    };
+    expect(decodeEvent(input)).toEqual(input);
+    expect(() =>
+      decodeEvent({ ...input, props: { ...input.props, actor: "private words" } }),
+    ).toThrow();
+    expect(() => decodeEvent({ ...input, props: { ...input.props, head: "private" } })).toThrow();
+  });
   it("accepts MCP filters and rejects unhashed request ids", () => {
     const call = { ...event, kind: "mcp.call", clientRequestId: "a".repeat(64) };
     expect(decodeEvent(call).clientRequestId).toBe("a".repeat(64));

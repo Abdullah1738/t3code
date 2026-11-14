@@ -58,7 +58,9 @@ class Logging(Base):
                           ('case.update', 'DEADLINE_REASON_REQUIRED'),
                           ('case.corroborate', 'CORROBORATE_MISMATCH')]:
             row = next(r for r in self.rows(name) if r['kind'] == 'error')
-            self.assertEqual(row['error'], {'tag': tag, 'message': tag})
+            self.assertEqual(row['error'], {'tag': tag, 'message': tag, 'cause': {
+                'httpStatus': None, 'endpoint': None, 'attempt': None, 'retryable': False,
+                'upstreamCode': None, 'exceptionClass': None}})
             self.assertFalse(row['ok'])
         for private in (cid, 'Secret Merchant', 'Other Merchant', 'private-reference', 'private-state',
                         'private-note', 'private-outcome', 'private-message-id', 'private-observation', '120.50', 'AED'):

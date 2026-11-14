@@ -1,0 +1,24 @@
+#!/bin/sh
+# Local Android emulators are blocked on this Mac (owner rule 2026-10-09).
+# Refuses to install the emulator or system images; everything else
+# (platforms, build-tools, ndk, platform-tools, --list, --licenses) passes through.
+REAL=/opt/homebrew/share/android-commandlinetools/cmdline-tools/latest/bin/sdkmanager
+if [ -z "$RCSIM_ALLOW_LOCAL_SIM" ]; then
+  uninstall=""
+  for a in "$@"; do [ "$a" = "--uninstall" ] && uninstall=1; done
+  if [ -z "$uninstall" ]; then
+    for a in "$@"; do
+      case "$a" in
+        emulator|emulator\;*|system-images\;*)
+          cat >&2 <<'EOF'
+sdkmanager: installing the Android emulator or system images is disabled on this Mac.
+Emulators run on Run Cloud: load the run-cloud skill and use
+  rcsim create android --name "<what>" --purpose "<why>" [--install app-debug.apk]
+Building APKs with Gradle needs only platforms/build-tools, which still install fine.
+EOF
+          exit 69 ;;
+      esac
+    done
+  fi
+fi
+exec "$REAL" "$@"

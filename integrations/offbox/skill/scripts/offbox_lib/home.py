@@ -163,6 +163,10 @@ def fail_over(reason: str, argv: list[str], run_id: str = "") -> bool:
     if api.probe_backend("boat", PROBE_TIMEOUT_S):
         say("Boat's API is unavailable too; keeping this run on home")
         return False
+    from .runs import BACKGROUND_RUN_ENV
+    queued = os.environ.get(BACKGROUND_RUN_ENV)
+    if queued:
+        _forward_background(queued)
     elapsed = max(0, time.monotonic() - WAIT_STARTED)*1000 if WAIT_STARTED is not None else 0
     toollog.emit("backend", "backend.failover", duration_ms=elapsed, ok=True, ids={"run": run_id},
                  props={"from": "home", "to": "boat", "reason": "unreachable", "waitMs": elapsed})
@@ -170,9 +174,34 @@ def fail_over(reason: str, argv: list[str], run_id: str = "") -> bool:
     log(f"failover to boat: {reason[:300]}")
     env = dict(os.environ, OFFBOX_BACKEND="boat")
     env[FAILOVER_ENV] = reason[:200]
+    if queued:
+        from .runs import forward_background
+        forward_background(env)
     sys.stdout.flush()
     sys.stderr.flush()
     os.execve(sys.executable, [sys.executable, os.path.realpath(sys.argv[0]), *argv], env)
+
+
+def _forward_background(run_id: str) -> None:
+    """Publish the same queued ID on Boat before retiring its home row; existing waiters can follow the handoff."""
+    source = common.db()
+    target = None
+    try:
+        row = source.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+        if not row or row['status'] != 'starting' or row['box_id'] or row['process_id']:
+            raise OffboxError(f'{run_id}: refusing failover after a possible start', started=True)
+        target = sqlite3.connect(common.db_path_for('boat'), isolation_level=None)
+        common.ensure_schema(target)
+        names = list(row.keys())
+        with common.write(target):
+            target.execute('INSERT INTO runs (' + ','.join(names) + ') VALUES (' + ','.join('?' for _ in names) + ')', tuple(row))
+            target.execute("INSERT INTO kv(k,v) VALUES (?, '1')", ('start_claim:' + run_id,))
+        source.execute("UPDATE runs SET status='forwarded',error='boat',end_at=? WHERE run_id=? "
+                       "AND status='starting' AND box_id IS NULL AND process_id IS NULL", (common.now(), run_id))
+    finally:
+        source.close()
+        if target is not None:
+            target.close()
 
 
 def only_on_home(table: str, where: str, args: tuple) -> bool:

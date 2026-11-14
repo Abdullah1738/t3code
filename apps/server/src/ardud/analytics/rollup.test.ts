@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
-import type { AnalyticsEvent } from "@t3tools/contracts";
+import { LONG_TASK_HISTOGRAM_RATIO, type AnalyticsEvent } from "@t3tools/contracts";
 
+import { sampleMix } from "./samples.ts";
 import { accumulate, boundedLines, finishRollup, makeAccumulator } from "./rollup.ts";
 
 const ts = "2026-11-13T12:00:00.000Z";
@@ -13,6 +14,151 @@ const event = (input: Partial<AnalyticsEvent> = {}): AnalyticsEvent => ({
 });
 
 describe("analytics rollups", () => {
+  it("rolls server tick phases up independently by board and phase, including idle phases", () => {
+    const accumulator = makeAccumulator();
+    const phase = (boardId: string, phase: string, durationMs: number) =>
+      event({
+        kind: "kanban.tick_phase",
+        boardId,
+        durationMs,
+        props: { phase, count: 2, tickId: "tick-1" },
+      });
+    for (const duration of [10, 20, 90])
+      accumulate(accumulator, phase("a", "thread_status", duration));
+    accumulate(accumulator, phase("a", "event_persistence", 0));
+    accumulate(accumulator, phase("b", "thread_status", 1_000));
+    // Older ticks and overlaps have no phase sample; incomplete and client-shaped rows don't invent one.
+    accumulate(accumulator, event({ kind: "kanban.tick", boardId: "a", durationMs: 900_000 }));
+    accumulate(accumulator, event({ kind: "kanban.tick_overlap", boardId: "a" }));
+    accumulate(accumulator, event({ kind: "kanban.tick_phase", boardId: "a", durationMs: 10 }));
+    accumulate(
+      accumulator,
+      event({ kind: "kanban.tick_phase", boardId: "a", props: { phase: "thread_status" } }),
+    );
+    accumulate(accumulator, { ...phase("a", "thread_status", 10_000), surface: "web" });
+    const rollup = finishRollup(accumulator, "2026-11-13", ts);
+    assert.deepEqual(rollup.tickPhases, [
+      {
+        boardId: "a",
+        phase: "event_persistence",
+        count: 1,
+        p50Ms: 0,
+        p95Ms: 0,
+        maxMs: 0,
+        approximate: false,
+      },
+      {
+        boardId: "a",
+        phase: "thread_status",
+        count: 3,
+        p50Ms: 20,
+        p95Ms: 90,
+        maxMs: 90,
+        approximate: false,
+      },
+      {
+        boardId: "b",
+        phase: "thread_status",
+        count: 1,
+        p50Ms: 1_000,
+        p95Ms: 1_000,
+        maxMs: 1_000,
+        approximate: false,
+      },
+    ]);
+    assert.equal(rollup.kindCounts["kanban.tick_overlap"], 1);
+  });
+
+  it("separates restart interruptions by boot and tool", () => {
+    const accumulator = makeAccumulator();
+    for (const [bootId, tool] of [
+      ["boot-a", "delegate_task"],
+      ["boot-b", "delegate_task"],
+      ["boot-a", "card_update"],
+      ["boot-a", "delegate_task"],
+    ] as const) {
+      accumulate(
+        accumulator,
+        event({ kind: "mcp.call", bootId, tool, outcome: "interrupted_by_shutdown" }),
+      );
+    }
+    assert.deepEqual(
+      finishRollup(accumulator, "2026-11-13", ts).mcpCalls.map(({ bootId, tool, outcomes }) => ({
+        bootId,
+        tool,
+        outcomes,
+      })),
+      [
+        { bootId: "boot-a", tool: "card_update", outcomes: { interrupted_by_shutdown: 1 } },
+        { bootId: "boot-a", tool: "delegate_task", outcomes: { interrupted_by_shutdown: 2 } },
+        { bootId: "boot-b", tool: "delegate_task", outcomes: { interrupted_by_shutdown: 1 } },
+      ],
+    );
+  });
+
+  it("merges long-task histograms by route and surface without counting individual samples twice", () => {
+    const accumulator = makeAccumulator();
+    const bucket = (ms: number) => Math.ceil(Math.log(ms) / Math.log(LONG_TASK_HISTOGRAM_RATIO));
+    const summary = (
+      props: NonNullable<AnalyticsEvent["props"]>,
+      surface: AnalyticsEvent["surface"] = "desktop",
+    ) => event({ kind: "performance.long-task-summary", route: "board", surface, props });
+    accumulate(
+      accumulator,
+      summary({
+        count: 99,
+        totalMs: 9900,
+        maxMs: 100,
+        wallTimeMs: 60_000,
+        histogram: [[bucket(100), 99]],
+      }),
+    );
+    accumulate(
+      accumulator,
+      summary({
+        count: 1,
+        totalMs: 500,
+        maxMs: 500,
+        wallTimeMs: 60_000,
+        histogram: [[bucket(500), 1]],
+      }),
+    );
+    accumulate(
+      accumulator,
+      summary({ count: 0, totalMs: 0, maxMs: 0, wallTimeMs: 60_000, histogram: [] }),
+    );
+    accumulate(
+      accumulator,
+      event({ kind: "performance.long-task", surface: "desktop", route: "board", durationMs: 500 }),
+    );
+    accumulate(
+      accumulator,
+      summary(
+        { count: 1, totalMs: 800, maxMs: 800, wallTimeMs: 10_000, histogram: [[bucket(800), 1]] },
+        "web",
+      ),
+    );
+    // An inconsistent distribution must not create a misleading percentile.
+    accumulate(
+      accumulator,
+      summary({ count: 1000, totalMs: 10, maxMs: 10, wallTimeMs: 60_000, histogram: [[0, 1]] }),
+    );
+    const rows = finishRollup(accumulator, "2026-11-13", ts).longTasksByRoute;
+    assert.lengthOf(rows, 2);
+    assert.deepInclude(rows[0], {
+      route: "board",
+      surface: "desktop",
+      count: 100,
+      totalMs: 10_400,
+      maxMs: 500,
+      wallTimeMs: 180_000,
+      wallTimeShare: 10_400 / 180_000,
+      approximate: true,
+    });
+    assert.isAtLeast(rows[0]!.p95Ms!, 100);
+    assert.isBelow(rows[0]!.p95Ms!, 102);
+    assert.equal(rows[1]!.p95Ms, 800);
+  });
   it("rolls MCP calls up by tool/hour/build and correlates adjacent retries across hours and builds", () => {
     const accumulator = makeAccumulator();
     const call = (input: Partial<AnalyticsEvent>): AnalyticsEvent =>
@@ -146,10 +292,26 @@ describe("analytics rollups", () => {
         event({ kind: `kind.${index}`, props: { errorTag: `error.${index}` } }),
       );
       accumulate(accumulator, event({ durationMs: index, props: { method: `method.${index}` } }));
+      accumulate(
+        accumulator,
+        event({
+          kind: "kanban.tick_phase",
+          boardId: `board-${index}`,
+          durationMs: index,
+          props: { phase: "thread_status" },
+        }),
+      );
     }
     assert.isAtMost(accumulator.kinds.size, 129);
     assert.isAtMost(accumulator.errors.size, 129);
     assert.isAtMost(accumulator.rpcs.size, 129);
+    assert.isAtMost(accumulator.tickPhases.size, 129);
+    assert.equal(
+      finishRollup(accumulator, "2026-11-13", ts).tickPhases!.find(
+        (group) => group.phase === "__other__",
+      )!.count,
+      872,
+    );
     assert.isAtMost(finishRollup(accumulator, "2026-11-13", ts).topSlowRpcs.length, 20);
   });
 
@@ -175,4 +337,258 @@ describe("analytics rollups", () => {
     assert.isAtLeast(timings.p50Ms!, 0.25);
     assert.isBelow(timings.p50Ms!, 0.255);
   });
+});
+
+describe("board analytics", () => {
+  it("rolls up metadata, durations, cross-day asks and pool snapshots out of order", () => {
+    const acc = makeAccumulator();
+    const boardId = "board-crpko";
+    const rows: Partial<AnalyticsEvent>[] = [
+      {
+        kind: "kanban.card_move",
+        cardId: "a",
+        props: { from: "todo", to: "working", msInPrevStage: 100 },
+      },
+      {
+        kind: "kanban.card_move",
+        cardId: "b",
+        props: { from: "todo", to: "working", msInPrevStage: 1000 },
+      },
+      {
+        kind: "kanban.review_verdict",
+        cardId: "a",
+        durationMs: 30,
+        props: { round: 2, chain: "sol", verdict: "clear", head: "abcdef1" },
+      },
+      {
+        kind: "kanban.review_verdict",
+        cardId: "a",
+        durationMs: 90,
+        props: { round: 1, chain: "sol", verdict: "feedback", head: "abcdef2" },
+      },
+      { kind: "kanban.stall", props: { action: "set", reasonClass: "timeout", ageMs: 0 } },
+      { kind: "kanban.stall", props: { action: "clear", reasonClass: "timeout", ageMs: 300 } },
+      {
+        kind: "kanban.worker_failed",
+        props: { errorClass: "variant_unavailable", poolKey: "sol" },
+      },
+      { kind: "kanban.worker_restarted", props: { phase: "fresh" } },
+      { kind: "kanban.ask_snapshot", props: { count: 1 } },
+      {
+        kind: "kanban.ask_pending",
+        cardId: "a",
+        props: {
+          key: "q1",
+          createdAt: "2026-11-12T12:00:00.000Z",
+          kind: "approval",
+          blocking: true,
+        },
+      },
+      { kind: "ask.answered", cardId: "b", props: { key: "q1", createdAt: ts } },
+      { kind: "kanban.ask_opened", cardId: "b", props: { key: "q1", createdAt: ts } },
+      { kind: "kanban.ask_closed", cardId: "c", props: { key: "q1", createdAt: ts } },
+      { kind: "kanban.pool_usage", props: { poolKey: "sol", used: 2, slots: 4, waiting: 3 } },
+      { kind: "kanban.pool_usage", props: { poolKey: "sol", used: 4, slots: 4, waiting: 1 } },
+      { kind: "kanban.pool_usage", props: { poolKey: "paused", used: 0, slots: 0, waiting: 1 } },
+    ];
+    for (const row of rows.toReversed()) accumulate(acc, event({ ...row, boardId }));
+    accumulate(
+      acc,
+      event({ kind: "kanban.worker_failed", boardId: "other", props: { errorClass: "other" } }),
+    );
+    const result = finishRollup(acc, "2026-11-13", ts);
+    const board = result.boards.find((b) => b.boardId === boardId)!;
+    assert.deepEqual(board.moves, [{ from: "todo", to: "working", count: 2 }]);
+    assert.deepInclude(board.timeInStage[0], { stage: "todo", p50Ms: 100, p95Ms: 1000 });
+    assert.deepEqual(board.reviewRounds, [{ cardId: "a", rounds: 2, verdicts: 2 }]);
+    assert.deepEqual(board.verdictCounts, { feedback: 1, clear: 1 });
+    assert.deepInclude(board.stalls[0], { sets: 1, clears: 1, p50Ms: 300 });
+    assert.deepEqual(board.failureCounts, { variant_unavailable: 1 });
+    assert.equal(board.restarts, 1);
+    assert.lengthOf(board.openAsks, 1);
+    assert.deepInclude(board.openAsks[0], {
+      cardId: "a",
+      key: "q1",
+      ageMs: 86_400_000,
+      blocking: true,
+    });
+    assert.deepInclude(
+      board.poolUtilisation.find((p) => p.poolKey === "sol"),
+      { used: 3, slots: 4, waiting: 2, utilisation: 0.75, samples: 2 },
+    );
+    assert.isNull(board.poolUtilisation.find((p) => p.poolKey === "paused")!.utilisation);
+    assert.equal(result.boards.length, 2);
+  });
+  it("mixes rare board kinds before UI noise, caps each kind and uses timestamps across segments", () => {
+    const mix = sampleMix(100);
+    for (let i = 0; i < 500; i++) mix.add(event({ kind: "performance.long-task" }));
+    for (let i = 0; i < 100; i++) mix.add(event({ kind: "kanban.queue_depth" }));
+    mix.add(event({ kind: "kanban.card_move" }));
+    mix.add(event({ kind: "kanban.review_verdict" }));
+    const rows = mix.finish();
+    assert.isTrue(rows.slice(0, 3).some((row) => row.kind === "kanban.card_move"));
+    assert.isTrue(rows.slice(0, 3).some((row) => row.kind === "kanban.review_verdict"));
+    assert.equal(rows.filter((row) => row.kind === "kanban.queue_depth").length, 50);
+    const exact = sampleMix(1, "server.rpc");
+    exact.add(event({ ts: "2026-11-13T13:00:00.000Z" }));
+    exact.add(event({ ts }));
+    assert.equal(exact.finish()[0]?.ts, "2026-11-13T13:00:00.000Z");
+  });
+});
+
+it("retains the last complete backlog when a newer snapshot loses rows", () => {
+  const acc = makeAccumulator();
+  const boardId = "board-crpko";
+  const emit = (kind: string, at: string, cardId?: string, props?: AnalyticsEvent["props"]) =>
+    accumulate(
+      acc,
+      event({ boardId, kind, ts: at, ...(cardId ? { cardId } : {}), ...(props ? { props } : {}) }),
+    );
+  const earlier = "2026-11-13T11:00:00.000Z";
+  emit("kanban.ask_pending", earlier, "a", { key: "q1", createdAt: earlier });
+  emit("kanban.ask_snapshot", earlier, undefined, { count: 1 });
+  emit("kanban.ask_snapshot", ts, undefined, { count: 2 });
+  emit("kanban.ask_pending", ts, "b", { key: "q1", createdAt: earlier });
+  let board = finishRollup(acc, "2026-11-13", ts).boards[0]!;
+  assert.equal(board.openAsksAsOf, earlier);
+  assert.equal(board.incompleteAskSnapshots, 1);
+  assert.deepEqual(
+    board.openAsks.map((ask) => ask.cardId),
+    ["a"],
+  );
+  emit("kanban.ask_opened", ts, "c", {
+    key: "q1",
+    kind: "question",
+    blocking: false,
+    createdAt: ts,
+  });
+  emit("kanban.ask_updated", ts, "c", {
+    key: "q1",
+    kind: "approval",
+    blocking: true,
+    createdAt: ts,
+  });
+  board = finishRollup(acc, "2026-11-13", ts).boards[0]!;
+  assert.deepInclude(
+    board.openAsks.find((ask) => ask.cardId === "c"),
+    { kind: "approval", blocking: true },
+  );
+  emit("kanban.ask_snapshot", "2026-11-13T13:00:00.000Z", undefined, { count: 0 });
+  assert.lengthOf(
+    finishRollup(acc, "2026-11-13", "2026-11-13T13:00:00.000Z").boards[0]!.openAsks,
+    0,
+  );
+});
+
+it("groups error routes, MCP codes and DB spans with bounded, lossless overflow", () => {
+  const target = makeAccumulator();
+  for (let i = 0; i < 40; i++) {
+    for (const durationMs of [10, 100]) {
+      accumulate(
+        target,
+        event({
+          kind: "server.http",
+          route: `route.${i}`,
+          durationMs,
+          props: { method: "POST", status: 503, errorTag: "Http5xx" },
+        }),
+      );
+      accumulate(
+        target,
+        event({
+          kind: "mcp.call",
+          tool: `tool.${i}`,
+          durationMs,
+          outcome: "error",
+          props: { code: "caller_unresolved" },
+        }),
+      );
+      accumulate(
+        target,
+        event({
+          kind: "server.mcp.error",
+          durationMs,
+          props: { method: `tool.${i}`, code: "caller_unresolved", errorTag: "McpToolError" },
+        }),
+      );
+      accumulate(
+        target,
+        event({
+          kind: "db.slow",
+          durationMs,
+          props: { span: `Service.${i}`, key: "reader", phase: "read", waitMs: 3 },
+        }),
+      );
+    }
+  }
+  const rollup = finishRollup(target, "2026-11-13", ts);
+  for (const rows of [rollup.errorsByRoute, rollup.mcpErrorsByCode, rollup.dbSlowBySpan]) {
+    assert.lengthOf(rows, 25);
+    assert.isTrue(rows.every((row) => row.p95Ms === 100));
+  }
+  assert.equal(
+    rollup.errorsByRoute.reduce((sum, row) => sum + row.count, 0),
+    160,
+  );
+  assert.equal(
+    rollup.mcpErrorsByCode.reduce((sum, row) => sum + row.count, 0),
+    80,
+  );
+  assert.equal(
+    rollup.dbSlowBySpan.reduce((sum, row) => sum + row.count, 0),
+    80,
+  );
+  assert.deepInclude(
+    rollup.dbSlowBySpan.find((row) => row.span === "other")!,
+    { count: 32, totalWaitMs: 96, maxMs: 100 },
+  );
+  assert.equal(
+    rollup.dbSlowBySpan.reduce((sum, row) => sum + row.totalWaitMs, 0),
+    240,
+  );
+});
+
+it("keeps HTTP method/status/tag and DB connection/phase distinct", () => {
+  const target = makeAccumulator();
+  for (const method of ["GET", "POST"])
+    for (const status of [400, 500])
+      for (const errorTag of ["Interrupted", "Failure"]) {
+        accumulate(
+          target,
+          event({ kind: "server.http", durationMs: 17, props: { method, status, errorTag } }),
+        );
+      }
+  for (const key of ["reader", "writer"])
+    for (const phase of ["read", "write"]) {
+      accumulate(
+        target,
+        event({ kind: "db.slow", durationMs: 500, props: { span: "Service.read", key, phase } }),
+      );
+    }
+  const rollup = finishRollup(target, "2026-11-13", ts);
+  assert.lengthOf(rollup.errorsByRoute, 8);
+  assert.lengthOf(rollup.dbSlowBySpan, 4);
+  assert.isTrue(rollup.dbSlowBySpan.every((row) => row.totalWaitMs === 0));
+});
+
+it("preserves all 25 groups until overflow requires an other row", () => {
+  const target = makeAccumulator();
+  for (let i = 0; i < 25; i++)
+    accumulate(
+      target,
+      event({ kind: "db.slow", durationMs: i, props: { span: `Service.${i}`, waitMs: 2 } }),
+    );
+  const exact = finishRollup(target, "2026-11-13", ts).dbSlowBySpan;
+  assert.lengthOf(exact, 25);
+  assert.isFalse(exact.some((row) => row.span === "other"));
+  accumulate(
+    target,
+    event({ kind: "db.slow", durationMs: 99, props: { span: "Service.25", waitMs: 3 } }),
+  );
+  const overflow = finishRollup(target, "2026-11-13", ts).dbSlowBySpan;
+  assert.lengthOf(overflow, 25);
+  assert.deepInclude(
+    overflow.find((row) => row.span === "other")!,
+    { count: 2, totalWaitMs: 5, p95Ms: 99, maxMs: 99 },
+  );
 });

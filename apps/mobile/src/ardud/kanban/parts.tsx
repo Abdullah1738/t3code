@@ -2,6 +2,7 @@ import type { AvatarKind, CardView, GoalProgress } from "@t3tools/client-runtime
 import type { ReactNode } from "react";
 import { Pressable, ScrollView, View } from "react-native";
 
+import { AskTiming } from "./needsYou/useAskTiming";
 import { AppText as Text } from "../../components/ui/AppText";
 import { cn } from "../../lib/cn";
 import { cardGlyph, type GlyphKind, prGlyph, priorityFill } from "./logic";
@@ -234,6 +235,13 @@ export function CardTile(props: {
   readonly hideGoal?: boolean;
 }) {
   const { view } = props;
+  const shownAsk =
+    view.flag?.kind === "ask"
+      ? view.card.asks.findLast(
+          (ask) =>
+            ask.closedAt === null && (view.card.question ? ask.text === view.card.question : true),
+        )
+      : undefined;
   return (
     <Pressable
       accessibilityRole="button"
@@ -264,6 +272,7 @@ export function CardTile(props: {
       <Text numberOfLines={2} className="text-[15px] font-t3-medium leading-5 text-foreground">
         {view.title}
       </Text>
+      {shownAsk ? <AskTiming cardId={view.id} askId={shownAsk.id} /> : null}
       <FlagLine flag={view.flag} />
       {(view.goal && !props.hideGoal) || view.pr || view.subtasks || view.model.letter ? (
         <View className="flex-row flex-wrap items-center gap-1.5">

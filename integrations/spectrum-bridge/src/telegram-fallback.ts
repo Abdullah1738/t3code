@@ -45,7 +45,7 @@ export function socketPost(socketPath: string, timeoutMs = 20_000): Post {
       });
       req.on("error", () => finish(undefined));
       req.end(payload);
-    } catch { toolError("telegram-fallback", "telegram-fallback.catch1");
+    } catch (caughtError) { toolError("telegram-fallback", "telegram-fallback.catch1", caughtError);
       finish(undefined);
     }
   });
@@ -94,7 +94,7 @@ export function telegramOutlet(outlet: Outlet) {
       let data: Uint8Array;
       try {
         data = outlet.blob(attachment.sha256);
-      } catch { toolError("telegram-fallback", "telegram-fallback.catch2");
+      } catch (caughtError) { toolError("telegram-fallback", "telegram-fallback.catch2", caughtError);
         return "skip";
       }
       if (data.byteLength !== attachment.size || createHash("sha256").update(data).digest("hex") !== attachment.sha256) return "skip";
@@ -109,7 +109,7 @@ export function telegramOutlet(outlet: Outlet) {
     let url: URL;
     try {
       url = new URL(item.app.url);
-    } catch { toolError("telegram-fallback", "telegram-fallback.catch3");
+    } catch (caughtError) { toolError("telegram-fallback", "telegram-fallback.catch3", caughtError);
       return "skip";
     }
     // Secure forms carry a one-time secret link; they stay on iMessage only.
@@ -118,7 +118,7 @@ export function telegramOutlet(outlet: Outlet) {
     let file: Awaited<ReturnType<typeof appFile>>;
     try {
       file = await appFile(url);
-    } catch { toolError("telegram-fallback", "telegram-fallback.catch4");
+    } catch (caughtError) { toolError("telegram-fallback", "telegram-fallback.catch4", caughtError);
       file = undefined;
     }
     if (!file) return outcome(await outlet.post("/notify", { source: SOURCE, severity: "info", text: caption, dedupeKey: key }));

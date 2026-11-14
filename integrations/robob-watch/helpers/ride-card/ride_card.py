@@ -1181,12 +1181,12 @@ def standing(uuid, who, r, planned):
 
 def deliver(uuid, recipient, p, session, to, key):
     if p["mode"] == "card":
-        args = ["app", "--url", p["url"], "--caption", p["caption"], "--summary", p["summary"],
+        args = ["app", "--url", p["url"], f"--caption={p['caption']}", f"--summary={p['summary']}",
                 "--session", session, "--key", key]
         if p.get("subcaption"):
-            args += ["--subcaption", p["subcaption"]]
+            args += [f"--subcaption={p['subcaption']}"]
     else:
-        args = ["send", "--text", p["text"], "--session", session, "--key", key]
+        args = ["send", f"--text={p['text']}", "--session", session, "--key", key]
     if to:
         args += ["--to", to]
     return bridge(*args)

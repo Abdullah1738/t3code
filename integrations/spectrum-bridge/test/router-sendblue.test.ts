@@ -3,6 +3,7 @@ import type { ChatContext, ChatInfo, Role } from "../src/chats.ts";
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import { JudgeError, type GroupJudge, type JudgeState } from "../src/group-judge.ts";
 import { Router, sendblueContextPrompt } from "../src/router.ts";
+import { MAX_INCOMING_BYTES } from "../src/inbound-files.ts";
 import { Store } from "../src/store.ts";
 import type { Swipes, SwipeTarget } from "../src/swipe.ts";
 import { OpenChamber, type MessageRecord, type PermissionRequest, type QuestionRequest, type SessionRecord } from "../src/openchamber.ts";
@@ -11,6 +12,18 @@ import { OpenChamber, type MessageRecord, type PermissionRequest, type QuestionR
 // The backend is a minimal recorder; the Photon-mode suite covers the rest of the router.
 const DM_KEY = "dm:+971585933213";
 const GROUP_KEY = "group:abc123def456";
+
+test("history guidance appears in every foreground chat, with only permitted cross-chat scope", () => {
+  for (const kind of ["owner", "dm", "group"] as const) {
+    const prompt = sendblueContextPrompt(context(kind), false, []);
+    expect(prompt).toContain("messages --session CURRENT_SESSION_ID");
+    expect(prompt.includes("for another chat")).toBe(kind === "owner");
+    expect(prompt.includes("for a group she has written in")).toBe(kind === "dm");
+    expect(sendblueContextPrompt(context(kind), false, [], true)).not.toContain("messages --session CURRENT_SESSION_ID");
+  }
+  const guest = context("dm", { roleOf: () => ({ name: "Guest", role: "guest" }) });
+  expect(sendblueContextPrompt(guest, false, [])).not.toContain("for a group she has written in");
+});
 
 type Prompt = { id: string; text: string; system?: string };
 
@@ -71,7 +84,7 @@ function setup(ctx: ReturnType<typeof context>, overrides: { quietMs?: number; g
     owner: "+15555550123", timezone: "Asia/Dubai", chatGuid: ctx.chat.key,
     skillPath: "/private/test/notification-skill/SKILL.md", alertSkillPath: "/private/test/telegram-skill/SKILL.md",
     alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent/opencode-config",
-    context: ctx, ...overrides,
+    context: ctx, medsFold: false, ...overrides,
   });
   const input = (id: string, text: string, sender: string, extra: Partial<NormalizedInbound> = {}) =>
     store.acceptInbound(id, { id, text, sender, attachments: [], isAudioMessage: false, receivedAt: Date.now(), ...extra } satisfies NormalizedInbound);
@@ -80,6 +93,29 @@ function setup(ctx: ReturnType<typeof context>, overrides: { quietMs?: number; g
 
 const stores: Store[] = [];
 afterEach(() => { for (const store of stores.splice(0)) store.db.close(); });
+
+test.each(["owner", "dm", "group"] as const)("%s skips an oversized file without directing non-owner files to the Mac", async kind => {
+  const h = setup(context(kind), { quietMs: 0 });
+  const name = 'private"\nfile.heic';
+  h.input("file", kind === "group" ? "Robob, read this" : "Read this", kind === "owner" ? "owner" : DM_KEY, { attachments: [{
+    guid: "guid", fileName: name, mimeType: "image/heic", totalBytes: MAX_INCOMING_BYTES + 1,
+    transferState: "finished", uti: "", isHidden: false, isOutgoing: false, isSticker: false,
+  }] });
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  const system = h.backend.prompts[0]!.system!;
+  expect(system).toContain(JSON.stringify(name));
+  expect(system).toContain("0 of 1 files were taken in; 1 were not");
+  if (kind === "owner") {
+    expect(system).toContain("imsg chats");
+    expect(system).toContain("may not match Messages");
+  } else {
+    expect(system).toContain("existing permissions and privacy rules");
+    expect(system).toContain("do not assume it is in this Mac's Messages");
+    expect(system).not.toContain("match transfer_name to the file name");
+  }
+  expect(h.store.pendingOutbox().filter(op => op.kind === "control")).toEqual([]);
+});
 
 test("sendblue debounce waits 2 s of quiet after the latest member, not 15 s", async () => {
   const start = Date.parse("2026-10-21T10:00:00Z");
@@ -484,7 +520,7 @@ test("location guidance points at the Sendblue commands, never Find My, and only
   expect(owner).toContain("location --session CURRENT_SESSION_ID` (add `--chat moni`");
   expect(owner).toContain("Never use Find My");
   expect(moni).toContain("location-request --session CURRENT_SESSION_ID --key UNIQUE_KEY`, say you've asked");
-  expect(moni).not.toContain("--chat");
+  expect(moni.split("\n").find(line => line.startsWith("Location,"))).not.toContain("--chat");
   expect(group).toContain("Location: not available in groups");
 });
 
@@ -1583,7 +1619,8 @@ test.each(["dm", "group"] as const)("late accepted steer in %s forwards its own 
   expect(h.store.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([
     ["Original answer", "first"], ["Follow-up answer", "followup"],
   ]);
-  expect(steers).toHaveLength(1);
+  expect(new Set(steers.map(call => call.messageId))).toEqual(new Set([original.messageId]));
+  expect(h.backend.records.filter(record => record.type === "user" && record.id === original.messageId)).toHaveLength(1);
   expect(h.backend.prompts).toHaveLength(1);
 });
 
@@ -1700,4 +1737,53 @@ test("router logs batch, turn start and terminal success/failure without prompt 
   expect(logs.filter(l => l.name === "turn.start")).toHaveLength(2);
   expect(logs.filter(l => l.name === "turn.end").map(l => l.props?.outcome)).toEqual(["replied", "failed"]);
   expect(JSON.stringify(logs)).not.toContain("PRIVATE_");
+});
+
+test.each(["dm", "group"].flatMap(kind => [false, true].flatMap(modelError => ["empty", "tools"].map(finalKind => ({ kind: kind as "dm" | "group", modelError, finalKind })))))("earlier successful reply survives $finalKind final failure in $kind (modelError=$modelError)", async ({ kind, modelError, finalKind }) => {
+  const start = Date.now();
+  setSystemTime(start);
+  const h = live(context(kind));
+  const steers: { messageId: string; text: string }[] = [];
+  Object.assign(h.backend, { async steer(_id: string, _dir: string, messageId: string, text: string) {
+    steers.push({ messageId, text });
+    throw new Error("lost response");
+  } });
+  h.input("first", "robob original question", "+971585933213");
+  await h.router.tick();
+  h.input("second", "robob second question", "+971585933213");
+  h.input("second-member", "robob another successful part", "+447700900123");
+  await h.router.tick();
+  h.input("third", "robob third question", "+971585933213");
+  await h.router.tick();
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  let exposed = false;
+  h.backend.promptAccepted = async (id, dir, messageId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && !exposed && messageId === steers[0]!.messageId) {
+      exposed = true;
+      const accepted = [...new Map(steers.map(call => [call.messageId, call])).values()];
+      for (const [index, call] of accepted.entries()) {
+        h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+        if (index === 0) h.backend.final("Second successful answer");
+        else {
+          if (finalKind === "tools") h.backend.records.push({
+            id: "failed-tools", type: "assistant", finish: "tool-calls",
+            content: [{ type: "tool", id: "tool_1", name: "read", state: { status: "completed" } }],
+            time: { created: Date.now(), completed: Date.now() },
+          });
+          h.backend.records.push({ id: "failed-idle", type: "idle", outcome: "failed", modelError, time: { created: Date.now() } });
+        }
+      }
+    }
+    return read(id, dir, messageId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.store.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([
+    ["Original answer", "first"], ["Second successful answer", "second"],
+  ]);
+  expect(h.store.db.query<{ state: string }, []>("SELECT state FROM inbound WHERE id IN ('second', 'second-member')").all().map(row => row.state)).toEqual(["done", "done"]);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(new Set(steers.map(call => call.messageId)).size).toBe(2);
 });

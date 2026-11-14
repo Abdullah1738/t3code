@@ -64,7 +64,7 @@ export function flightyDb(path = FLIGHTY_DB, user = FLIGHTY_OWNER): FlightSource
       db = new Database(path, { readonly: true });
       db.exec("PRAGMA busy_timeout = 3000");
       return work(db);
-    } catch { toolError("guest-flight", "guest-flight.catch1"); return "unavailable"; } finally { db?.close(); }
+    } catch (caughtError) { toolError("guest-flight", "guest-flight.catch1", caughtError); return "unavailable"; } finally { db?.close(); }
   };
   return {
     flights: since => read(db => db.query<FlightRow, [string, number]>(SQL).all(user, since)),

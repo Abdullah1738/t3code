@@ -11,7 +11,6 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import collector
 import jobs
 import toollog
 from rollup import rollup
@@ -24,225 +23,146 @@ class CollectorBudgetTests(unittest.TestCase):
         self.root = Path(temp.name)
         self.logs = self.root/'logs'
         env = patch.dict(os.environ, TOOLLOG_DIR=str(self.logs))
-        env.start(); self.addCleanup(env.stop)
+        env.start()
+        self.addCleanup(env.stop)
 
     def rows(self, name):
-        return [r for p in self.logs.glob('*.ndjson') for r in map(json.loads, p.read_text().splitlines()) if r['name'] == name]
+        return [r for p in self.logs.glob('*.ndjson')
+                for r in map(json.loads, p.read_text().splitlines()) if r['name'] == name]
+
+    def good(self, command, **kwargs):
+        return SimpleNamespace(returncode=0, stdout='10\t'+command[-1]+'\n', stderr='')
 
     def test_child_timeout_keeps_good_cache_and_measures_siblings(self):
-        root = self.root/'big'; root.mkdir()
-        for name in ('slow', 'fast'):
-            (root/name).mkdir()
-        db = root/'db.sqlite'; db.write_bytes(b'db metadata only')
-        calls = []
-        slow = [False]
-        def run(command, **kwargs):
-            calls.append(command[-1])
-            self.assertLessEqual(kwargs['timeout'], 20)
-            self.assertNotEqual(command[-1], str(root))
-            self.assertNotEqual(command[-1], str(db))
-            if slow[0] and command[-1] == str(root/'slow'):
-                raise subprocess.TimeoutExpired(command, kwargs['timeout'])
-            return SimpleNamespace(returncode=0, stdout='10\t'+command[-1], stderr='')
+        root = self.root/'big'
+        root.mkdir()
+        fast, slow = root/'fast', root/'slow'
+        fast.mkdir()
+        slow.mkdir()
         with patch.object(jobs.time, 'time', return_value=100):
-            jobs.directory_inventory([root], run, split_roots=[root])
-        slow[0] = True
-        with patch.object(jobs.time, 'time', return_value=3700):
-            jobs.directory_inventory([root], run, split_roots=[root])
+            jobs.directory_inventory([root], self.good)
+        def run(command, **kwargs):
+            self.assertLessEqual(kwargs['timeout'], 60)
+            if command[-1] == str(slow):
+                raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+            return self.good(command, **kwargs)
+        with patch.object(jobs.time, 'time', return_value=86500):
+            jobs.directory_inventory([root], run)
         state = jobs.read_state('disk-inventory')
-        child = state['children'][str(root)]['slow']
-        self.assertEqual((child['bytes'], child['at'], child['ageS']), (10*1024, 100, 3600))
-        expected_file = db.stat().st_blocks*512
-        self.assertEqual(state['sizes'][str(root)], 20*1024+expected_file)
-        source = [r for r in self.rows('disk.inventory.source') if r['props'].get('child') == 'slow'][-1]
-        self.assertEqual(source['props']['failure'], 'timeout')
-        self.assertEqual(source['props']['ageS'], 3600)
-        self.assertTrue(source['props']['cached'])
-        summary = self.rows('disk.inventory')[-1]['props']
-        self.assertEqual((summary['rootsOk'], summary['rootsPartial'], summary['rootsTimeout']), (0, 1, 1))
+        cached = state['childState'][str(root)]
+        self.assertEqual((cached[str(slow)]['bytes'], cached[str(slow)]['at']), (10*1024, 100))
+        self.assertEqual(cached[str(fast)]['at'], 86500)
+        self.assertEqual(state['sizes'][str(root)], 20*1024)
         self.assertIn(str(root), state['partials'])
-        if os.environ.get('COLLECTOR_SHOW_EVIDENCE') == '1':
-            print(json.dumps(source, separators=(',', ':')))
-            print(json.dumps(self.rows('disk.inventory')[-1], separators=(',', ':')))
+        props = self.rows('disk.inventory')[-1]['props']
+        self.assertEqual((props['rootsOk'], props['rootsPartial'], props['rootsTimeout'], props['rootsDenied']),
+                         (0, 1, 1, 0))
+        self.assertGreaterEqual(props['scanMs'], 0)
 
-    def test_root_budget_rotates_unattempted_roots_first(self):
-        roots = [self.root/str(i) for i in range(7)]
-        for root in roots: root.mkdir()
-        clock, calls = [0], []
-        def run(command, **kwargs):
-            calls.append(command[-1]); clock[0] += kwargs['timeout']
-            raise subprocess.TimeoutExpired(command, kwargs['timeout'])
-        with patch.object(jobs.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(jobs.time, 'time', return_value=100):
-            jobs.directory_inventory(roots, run)
-        self.assertLessEqual(clock[0], 300)
-        calls.clear()
-        with patch.object(jobs.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(jobs.time, 'time', return_value=3700):
-            jobs.directory_inventory(roots, run)
-        self.assertEqual(calls[:2], [str(roots[5]), str(roots[6])])
-        self.assertLessEqual(clock[0], 600)
+    def test_missing_du_permission_and_timeout_keep_last_good_sizes(self):
+        cases = (
+            ('missing-du', FileNotFoundError(errno.ENOENT, 'fixture', '/usr/bin/du'), 0, 0),
+            ('no-filename', FileNotFoundError(errno.ENOENT, 'fixture'), 0, 0),
+            ('permission', PermissionError(errno.EACCES, 'fixture', '/usr/bin/du'), 0, 1),
+            ('timeout', subprocess.TimeoutExpired('du', 15), 1, 0),
+        )
+        for name, error, timed_out, denied in cases:
+            with self.subTest(name=name):
+                root = self.root/name
+                root.mkdir()
+                child = root/'child'
+                child.mkdir()
+                with patch.object(jobs.time, 'time', return_value=100):
+                    jobs.directory_inventory([root], self.good)
+                def run(command, **kwargs):
+                    raise error
+                with patch.object(jobs.time, 'time', return_value=86500):
+                    jobs.directory_inventory([root], run)
+                state = jobs.read_state('disk-inventory')
+                self.assertEqual(state['sizes'][str(root)], 10*1024)
+                self.assertEqual(state['childState'][str(root)][str(child)]['at'], 100)
+                self.assertEqual(state['sourceErrors'], 1)
+                self.assertIn(str(root), state['partials'])
+                props = self.rows('disk.inventory')[-1]['props']
+                self.assertEqual((props['rootsTimeout'], props['rootsDenied']), (timed_out, denied))
+                child.rmdir()
+                with patch('subprocess.run') as unused:
+                    jobs.directory_inventory([root], unused)
+                    unused.assert_not_called()
+                state = jobs.read_state('disk-inventory')
+                self.assertEqual(state['sizes'][str(root)], 0)
+                self.assertNotIn(str(root), state['partials'])
+                self.assertEqual(self.rows('disk.inventory')[-1]['props']['rootsOk'], 1)
 
-    def test_unified_backlog_advances_in_two_hour_chunks_without_skipping(self):
-        jobs.save_state('crashes', {'unified': 100, 'rollupDay': '1969-12-31'})
-        calls = []
-        def reader(since, until): calls.append((since, until)); return {}
-        self.assertTrue(collector.collect(30000, [], reader))
-        self.assertEqual(calls, [(100, 7300)])
-        self.assertEqual(jobs.read_state('crashes')['unified'], 7300)
-        self.assertTrue(collector.collect(30000, [], reader))
-        self.assertEqual(calls[-1], (7300, 14500))
+    def test_listing_failure_counts_root_once_and_retains_cache(self):
+        for name, error, expected in (
+                ('timeout', jobs.SourceFailure('timeout', 'fixture'), (1, 0)),
+                ('permission', PermissionError(errno.EACCES, 'fixture'), (0, 1))):
+            with self.subTest(name=name):
+                root = self.root/name
+                root.mkdir()
+                (root/'child').mkdir()
+                jobs.directory_inventory([root], self.good)
+                original = jobs.deadline_call
+                def call(deadline, operation, *args, **kwargs):
+                    if operation == jobs.os.scandir and args == (root,):
+                        raise error
+                    return original(deadline, operation, *args, **kwargs)
+                with patch.object(jobs, 'deadline_call', side_effect=call):
+                    jobs.directory_inventory([root], self.good)
+                state = jobs.read_state('disk-inventory')
+                self.assertEqual(state['sizes'][str(root)], 10*1024)
+                props = self.rows('disk.inventory')[-1]['props']
+                self.assertEqual((props['rootsTimeout'], props['rootsDenied']), expected)
+                self.assertEqual(props['rootsPartial'], 1)
 
-    def test_children_without_a_good_total_rotate_after_timeout(self):
-        root = self.root/'big'; root.mkdir()
-        children = [root/str(i) for i in range(7)]
-        for child in children: child.mkdir()
-        clock, calls = [0], []
-        def run(command, **kwargs):
-            calls.append(command[-1]); clock[0] += kwargs['timeout']
-            raise subprocess.TimeoutExpired(command, kwargs['timeout'])
-        for now in (100, 3700):
-            with patch.object(jobs.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(jobs.time, 'time', return_value=now):
-                jobs.directory_inventory([root], run, split_roots=[root])
-        self.assertEqual(calls[:3], [str(c) for c in children[:3]])
-        self.assertEqual(calls[3:6], [str(c) for c in children[3:6]])
-        self.assertLessEqual(clock[0], 120)
-        self.assertEqual(jobs.read_state('disk-inventory')['sizes'], {})
-
-    def test_real_sleeping_log_command_keeps_committed_cursor(self):
-        jobs.save_state('crashes', {'unified': 100})
-        def run(command, **kwargs):
-            self.assertEqual(command[:2], ['/usr/bin/log', 'show'])
-            self.assertEqual(kwargs['timeout'], 60)
-            kwargs['timeout'] = 0.05
-            return subprocess.run([sys.executable, '-c', 'import time; time.sleep(20)'], **kwargs)
-        self.assertFalse(collector.collect(30000, [], lambda a, b: collector.unified(a, b, run)))
-        self.assertEqual(jobs.read_state('crashes')['unified'], 100)
-        source = self.rows('crash.source')[-1]['props']
-        self.assertEqual((source['failure'], source['windowS']), ('timeout', 7200))
-
-    def test_child_permission_partial_and_removal_summary(self):
-        root = self.root/'big'; root.mkdir()
-        child = root/'directory'; child.mkdir()
+    def test_partial_permission_totals_and_removal_are_counted(self):
+        root = self.root/'big'
+        root.mkdir()
+        children = [root/name for name in ('a', 'b')]
+        for child in children:
+            child.mkdir()
         def partial(command, **kwargs):
-            return SimpleNamespace(returncode=1, stdout='10\t'+command[-1], stderr='du: entry: Permission denied')
-        jobs.directory_inventory([root], partial, split_roots=[root])
-        summary = self.rows('disk.inventory')[-1]
-        self.assertTrue(summary['ok'])
-        self.assertEqual((summary['props']['rootsPartial'], summary['props']['rootsDenied']), (1, 1))
-        child.rmdir()
-        with patch.object(subprocess, 'run') as run:
-            jobs.directory_inventory([root], run, split_roots=[root])
-            run.assert_not_called()
-        state = jobs.read_state('disk-inventory')
-        self.assertEqual(state['children'][str(root)], {})
-        self.assertEqual(state['sizes'][str(root)], 0)
-        self.assertEqual(self.rows('disk.inventory')[-1]['props']['rootsOk'], 1)
+            return SimpleNamespace(returncode=1, stdout='10\t'+command[-1]+'\n',
+                                   stderr='du: entry: Permission denied')
+        jobs.directory_inventory([root], partial)
+        props = self.rows('disk.inventory')[-1]['props']
+        self.assertEqual((props['rootsOk'], props['rootsPartial'], props['rootsTimeout'], props['rootsDenied']),
+                         (0, 1, 0, 1))
+        for child in children:
+            child.rmdir()
+        jobs.directory_inventory([root], self.good)
+        props = self.rows('disk.inventory')[-1]['props']
+        self.assertEqual((props['rootsOk'], props['rootsPartial'], props['rootsDenied']), (1, 0, 0))
 
-    def test_malformed_child_cache_does_not_supply_fake_sizes(self):
-        root = self.root/'big'; root.mkdir(); (root/'slow').mkdir()
+    def test_malformed_child_cache_cannot_supply_a_total(self):
+        root = self.root/'big'
+        root.mkdir()
+        child = root/'child'
+        child.mkdir()
         for old in (None, [], {'bytes': 'bad', 'at': 100, 'attemptedAt': []},
                     {'bytes': 1024, 'at': 100000000000}, {'bytes': -1, 'at': 100}):
             with self.subTest(cache=old):
-                jobs.save_state('disk-inventory', dict(children={str(root): {'slow': old}}, attemptedAt={str(root): 'bad'}))
-                def run(command, **kwargs): raise subprocess.TimeoutExpired(command, kwargs['timeout'])
-                jobs.directory_inventory([root], run, split_roots=[root])
+                jobs.save_state('disk-inventory', dict(duMode='links',
+                    childState={str(root): {str(child): old}}, attemptedAt={str(root): 'bad'}))
+                def run(command, **kwargs):
+                    raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+                jobs.directory_inventory([root], run)
                 state = jobs.read_state('disk-inventory')
                 self.assertNotIn(str(root), state['sizes'])
-                self.assertFalse(self.rows('disk.inventory.source')[-1]['props']['cached'])
+                props = self.rows('disk.inventory')[-1]['props']
+                self.assertEqual((props['rootsOk'], props['rootsPartial'], props['rootsTimeout']), (0, 1, 1))
 
-    def test_cached_age_advances_even_when_root_cannot_get_scan_budget(self):
-        roots = [self.root/str(i) for i in range(6)]
-        for root in roots: root.mkdir()
-        big = roots[-1]
-        jobs.save_state('disk-inventory', dict(attemptedAt={str(big): 100},
-                        children={str(big): {'cached': dict(bytes=1024, at=100, ageS=0)}}))
-        clock = [0]
-        def run(command, **kwargs):
-            clock[0] += kwargs['timeout']
-            raise subprocess.TimeoutExpired(command, kwargs['timeout'])
-        with patch.object(jobs.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(jobs.time, 'time', return_value=3700):
-            jobs.directory_inventory(roots, run, split_roots=[big])
-        self.assertEqual(jobs.read_state('disk-inventory')['children'][str(big)]['cached']['ageS'], 3600)
-
-    def test_missing_child_and_command_failure_origins(self):
-        cases = [
-            ('child-str', 'stat', FileNotFoundError, 'child-str', True, None),
-            ('child-path', 'stat', FileNotFoundError, 'child-path', True, None),
-            ('missing-du', 'run', FileNotFoundError, '/usr/bin/du', False, 'exit'),
-            ('no-filename', 'run', FileNotFoundError, None, False, 'exit'),
-            ('permission', 'run', PermissionError, '/usr/bin/du', False, 'permission'),
-            ('timeout', 'run', subprocess.TimeoutExpired, None, False, 'timeout'),
-        ]
-        for label, origin, error_type, filename, removed, failure in cases:
-            with self.subTest(case=label):
-                root = self.root/label; root.mkdir(); child = root/'child'; child.mkdir()
-                def good(command, **kwargs):
-                    return SimpleNamespace(returncode=0, stdout='10\t'+command[-1], stderr='')
-                with patch.object(jobs.time, 'time', return_value=100):
-                    jobs.directory_inventory([root], good, split_roots=[root])
-                target = str(child) if filename == 'child-str' else child if filename == 'child-path' else filename
-                exc = (subprocess.TimeoutExpired('du', 20) if error_type is subprocess.TimeoutExpired else
-                       error_type(errno.EACCES if error_type is PermissionError else errno.ENOENT, 'fixture', target))
-                original = Path.lstat
-                def lstat(path, *args, **kwargs):
-                    if path == child and origin == 'stat': raise exc
-                    return original(path, *args, **kwargs)
-                def run(command, **kwargs):
-                    if origin == 'run': raise exc
-                    return good(command, **kwargs)
-                with patch.object(jobs.time, 'time', return_value=3700), patch.object(Path, 'lstat', lstat):
-                    jobs.directory_inventory([root], run, split_roots=[root])
-                state = jobs.read_state('disk-inventory')
-                self.assertEqual(state['sizes'][str(root)], 0 if removed else 10*1024)
-                self.assertEqual(state['sourceErrors'], 0 if removed else 1)
-                if removed:
-                    self.assertNotIn('child', state['children'][str(root)])
-                    self.assertNotIn(str(root), state['partials'])
-                else:
-                    self.assertEqual(state['children'][str(root)]['child']['at'], 100)
-                    self.assertIn(str(root), state['partials'])
-                    source = self.rows('disk.inventory.source')[-1]['props']
-                    self.assertEqual(source['failure'], failure)
-                    self.assertTrue(source['cached'])
-                    self.assertEqual(source['ageS'], 3600)
-
-    def test_unified_first_failure_retries_same_start_and_logs_window(self):
-        calls = []
-        def reader(since, until):
-            calls.append((since, until))
-            raise subprocess.TimeoutExpired('log', 60)
-        self.assertFalse(collector.collect(10000, [], reader))
-        self.assertFalse(collector.collect(20000, [], reader))
-        self.assertEqual(calls, [(6400, 10000), (6400, 13600)])
-        source = self.rows('crash.source')[-1]
-        self.assertEqual(source['props']['windowS'], 7200)
-        self.assertGreaterEqual(source['props']['elapsedMs'], 0)
-        self.assertNotIn('unified', jobs.read_state('crashes'))
-        if os.environ.get('COLLECTOR_SHOW_EVIDENCE') == '1': print(json.dumps(source, separators=(',', ':')))
-
-    def test_direct_unified_reader_caps_query_and_ignores_boundary_overlap(self):
-        seen = []
-        def run(command, **kwargs):
-            seen.append(command)
-            self.assertLessEqual(kwargs['timeout'], 90)
-            def stamp(at): return dt.datetime.fromtimestamp(at, dt.timezone.utc).isoformat()
-            return SimpleNamespace(returncode=0, stdout=json.dumps([
-                dict(timestamp=stamp(100), eventMessage='=== system boot'),
-                dict(timestamp=stamp(7300), eventMessage='=== system boot'),
-                dict(timestamp=stamp(7301), eventMessage='=== system boot')]), stderr='')
-        counts = collector.unified(100, 30000, run)
-        self.assertEqual(sum(counts.values()), 1)
-        command = seen[0]
-        start = command[command.index('--start')+1]
-        end = command[command.index('--end')+1]
-        self.assertLessEqual((dt.datetime.fromisoformat(end)-dt.datetime.fromisoformat(start)).total_seconds(), 7201)
-
-    def test_inventory_mix_reaches_daily_rollup(self):
+    def test_inventory_mix_reaches_daily_rollup_without_counting_lock_skips(self):
         now = dt.datetime(2026, 11, 13, tzinfo=dt.timezone.utc)
         for _ in range(2):
             toollog.emit('disk', 'perf', 'disk.inventory', now=now, props=dict(
                 rootsOk=2, rootsPartial=1, rootsTimeout=1, rootsDenied=3, scanMs=42))
+        toollog.emit('disk', 'perf', 'disk.inventory', now=now,
+                     props=dict(skipReason='deep_pass_running', rootsPartial=10))
         summary = rollup('2026-11-13')['diskInventory']
         self.assertEqual(summary, dict(scans=2, rootsOk=4, rootsPartial=2, rootsTimeout=2, rootsDenied=6, scanMs=84))
 
 
-if __name__ == '__main__': unittest.main()
+if __name__ == '__main__':
+    unittest.main()

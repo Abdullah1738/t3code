@@ -3,6 +3,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -63,6 +64,36 @@ esac
 exit 0
 """)
         os.chmod(self.lctl, 0o755)
+        self.fake_bin = os.path.join(self.home, "fake-bin")
+        os.makedirs(self.fake_bin)
+        # Keep the macOS installer unchanged while exercising its checks on Linux.
+        if sys.platform != "darwin" or shutil.which("plutil", path="/usr/bin:/bin:/usr/sbin") is None:
+            self.fake_tool("plutil", '''import plistlib, sys
+args = sys.argv[1:]
+if not (len(args) == 2 and args[0] == '-lint' or
+        len(args) == 4 and args[0] == '-extract' and args[2] == 'raw'):
+    sys.exit(2)
+try:
+    with open(args[-1], 'rb') as source:
+        value = plistlib.load(source)
+    if args[0] == '-extract':
+        print(value[args[1]])
+except (OSError, ValueError, KeyError, plistlib.InvalidFileException) as error:
+    print(error, file=sys.stderr)
+    sys.exit(1)
+''')
+        if sys.platform != "darwin":
+            self.fake_tool("stat", '''import os, stat, sys
+if len(sys.argv) != 4 or sys.argv[1:3] != ['-f', '%Lp']:
+    sys.exit(2)
+print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
+''')
+
+    def fake_tool(self, name, body):
+        path = os.path.join(self.fake_bin, name)
+        with open(path, "w") as out:
+            out.write(f"#!{sys.executable}\n" + body)
+        os.chmod(path, 0o755)
 
     def tearDown(self):
         shutil.rmtree(self.home, ignore_errors=True)
@@ -72,15 +103,12 @@ exit 0
                         *args], check=True, capture_output=True)
 
     def argv_env(self, args, allow=True, lock_wait=None, stamp=None, **fake):
-        env = {"HOME": self.home, "PATH": "/usr/bin:/bin:/usr/sbin", "LANG": "en_US.UTF-8",
+        env = {"HOME": self.home, "PATH": f"{self.fake_bin}:/usr/bin:/bin:/usr/sbin", "LANG": "en_US.UTF-8",
                "LOCAL_HELPERS_LAUNCHCTL": self.lctl, "FAKE_CALLS": self.calls, "FAKE_STATE": self.loaded}
         if stamp:  # a date that always answers this stamp, as if every run started in the same second
-            fake_bin = os.path.join(self.home, "fake-bin")
-            os.makedirs(fake_bin, exist_ok=True)
-            with open(os.path.join(fake_bin, "date"), "w") as fh:
+            with open(os.path.join(self.fake_bin, "date"), "w") as fh:
                 fh.write(f"#!/bin/sh\necho {stamp}\n")
-            os.chmod(os.path.join(fake_bin, "date"), 0o755)
-            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            os.chmod(os.path.join(self.fake_bin, "date"), 0o755)
         if lock_wait is not None:
             env["LOCAL_HELPERS_LOCK_WAIT"] = str(lock_wait)
         env.update({f"FAKE_{k.upper()}": v for k, v in fake.items()})
@@ -170,6 +198,22 @@ exit 0
         self.assertIn("deploy that integration first", err)
         self.assertNotIn("differs", err)
         self.assertNotIn("not loaded", err)
+
+    def test_invalid_plist_fails_smoke(self):
+        plist = os.path.join(self.pkg, "launchd/com.ardud.opencode-web.plist")
+        with open(plist, "w") as out:
+            out.write("not a plist\n")
+        rc, _, err = self.run_install()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("smoke failed: plutil -lint", err)
+        self.assertIn("com.ardud.opencode-web.plist", err)
+
+    def test_plutil_extract_rejects_missing_key(self):
+        _, env = self.argv_env([])
+        plist = os.path.join(self.pkg, "launchd/com.ardud.opencode-web.plist")
+        result = subprocess.run(["plutil", "-extract", "MissingKey", "raw", plist],
+                                env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
 
     def ready(self):
         """Everything --check wants beyond the payload: deployed helpers and an nvm Uber CLI."""
@@ -375,11 +419,12 @@ exit 0
 
     def test_log_dirs_exist_before_agents_load(self):
         plist_dir = os.path.join(self.pkg, "launchd")
+        _, env = self.argv_env([])
         logs = set()
         for f in os.listdir(plist_dir):
             for key in ("StandardOutPath", "StandardErrorPath"):
                 r = subprocess.run(["plutil", "-extract", key, "raw", os.path.join(plist_dir, f)],
-                                   capture_output=True, text=True)
+                                   env=env, capture_output=True, text=True)
                 if r.returncode == 0:
                     logs.add(os.path.dirname(r.stdout.strip()))
         self.assertTrue(logs)
@@ -488,6 +533,26 @@ exit 0
         self.assertIn("someone else's file", err)
         with open(uber) as fh:
             self.assertEqual(fh.read(), "#!/bin/sh\necho mine\n")
+
+    def test_quint_guard_link_is_idempotent_and_check_reports_drift(self):
+        self.ready()
+        guard = self.live(".local/share/quint-guard/bin/quint")
+        target = self.live(".local/bin/quint")
+        self.assertEqual(self.run_install("--dry-run")[0], 0)
+        self.assertFalse(os.path.lexists(guard))
+        rc, _, err = self.run_install()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(os.readlink(guard), target)
+        self.assertEqual(os.listdir(os.path.dirname(guard)), ["quint"])
+        self.assertEqual(self.run_install("--check")[0], 0)
+        self.assertEqual(self.run_install()[0], 0)
+        os.unlink(guard)
+        os.symlink("/missing/quint", guard)
+        rc, _, err = self.run_install("--check")
+        self.assertEqual(rc, 1)
+        self.assertIn("is not a link to " + target, err)
+        self.assertEqual(self.run_install()[0], 0)
+        self.assertEqual(os.readlink(guard), target)
 
     def test_links_point_at_deployed_helpers_but_never_replace_a_real_file(self):
         helpers = self.live(".local/share/robob-watch/helpers")

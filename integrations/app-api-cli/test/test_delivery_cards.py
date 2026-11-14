@@ -134,6 +134,33 @@ class CardTests(unittest.TestCase):
         self.assertEqual(c.eta({**d,'eta_text':'1 hr 5 min'}, {})[0], '13:05')
         self.assertIsNone(c.eta({'eta_text':'in 8 min'}, {})[2])
 
+    def test_careem_live_stages_and_journal_health(self):
+        for vertical in ('food', 'quik'):
+            cfg = dict(self.cfg, app='careem', vertical=vertical)
+            for status, label, idx in [('preparing', 'Preparing' if vertical == 'food' else 'Packing', 1),
+                                       ('out for delivery', 'On the way' if vertical == 'food' else 'Out for delivery', 3 if vertical == 'food' else 2),
+                                       ('nearby', 'Almost here', 3 if vertical == 'food' else 2),
+                                       ('delivered', 'Delivered', 4 if vertical == 'food' else 3)]:
+                with self.subTest(vertical=vertical, status=status):
+                    data = dict(self.data, status=status, errors=['native_account_capture_required_guest_catalog_only'], live_source_ok=True)
+                    v = c.view(cfg, data, {})
+                    self.assertEqual((v['stage'], v['index']), (label, idx))
+                    self.assertEqual(v['steps'][idx], label)
+                    self.assertFalse(v['unavailable'])
+                    self.assertEqual(v['terminal'], status == 'delivered')
+                    self.assertTrue(c.view(cfg, {**data, 'live_source_ok': False}, {})['unavailable'])
+        self.assertEqual(c.view(dict(self.cfg, app='careem', vertical='box'),
+                                dict(self.data, status='nearby'), {})['stage'], 'Out for delivery')
+        stale = dict(self.data, status='unknown', last_confirmed_status='nearby', errors=['notification_collector_stale'])
+        v = c.view(dict(self.cfg, app='careem', vertical='food'), stale, {})
+        self.assertEqual(v['stage'], 'Almost here')
+        self.assertTrue(v['unavailable'])
+
+    def test_careem_notification_eta_takes_precedence(self):
+        cfg = dict(self.cfg, app='careem', eta='2026-11-11T15:15:00+04:00')
+        data = dict(self.data, eta='2026-11-11T15:05:50+04:00', eta_source='careem_notification', eta_text='in 20 min')
+        self.assertEqual(c.eta(data, cfg)[0], '15:05')
+
     def test_label_reads_before_the_time_and_no_estimate_is_a_word(self):
         d = {'checked_at':'2026-10-22T08:00:00Z','eta_text':'Arrives in 25-35 mins'}
         v = c.view(self.cfg, d, self.cfg['card_meta'])

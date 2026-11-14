@@ -1408,7 +1408,7 @@ describe("batches, hand-over and snooze", () => {
       );
       await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
       await collector.flush();
-      const answered = events.filter((event) => event.kind === "ask.answered");
+      const answered = events.filter((event) => event.kind === "ask.answer_sent");
       expect(answered).toHaveLength(2);
       expect(
         answered.map((event) => [event.cardId, event.durationMs, event.props?.createdAt]),
@@ -1440,7 +1440,7 @@ describe("batches, hand-over and snooze", () => {
     try {
       h.store.noteAskAnswered(ask, { verdict: "approved" }, "Approved");
       await collector.flush();
-      expect(events.filter((event) => event.kind === "ask.answered")).toEqual([
+      expect(events.filter((event) => event.kind === "ask.answer_sent")).toEqual([
         expect.objectContaining({
           cardId: "c1",
           durationMs: expect.any(Number),

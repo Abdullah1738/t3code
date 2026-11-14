@@ -102,6 +102,46 @@ The installed system finds the marker on its next boot, points the firmware at t
   and never restart the machine.
 - `offbox-status` prints the state of all of that in a dozen lines.
 
+## Box scratch space
+
+The `offbox` Incus profile mounts an executable tmpfs at `/tmp` when a box starts: mode `1777`,
+`nosuid,nodev`, capped at 8 GiB. The ZFS rootfs uses `normalization=formD`: a legal NFC filename can expand
+beyond 255 bytes during comparison and fail with `ENOTSUP`. tmpfs accepts those names without migrating
+datasets. `$HOME`, its caches and the checkout remain on ZFS and retain that limitation.
+
+8 GiB is a ceiling, not reserved RAM. Written pages count against the box's memory limit and swap is
+disabled. Normal home sizes have 16/24/48 GiB RAM; a small box has 8 GiB, so a job must leave room for its
+own processes too. npm, Go, pip and uv caches already live under `$HOME`; Terraform working directories
+and provider caches remain on disk. For scratch larger than the available memory or the cap, create a
+private disk-backed directory with `mktemp -d "$HOME/scratch.XXXXXX"` and set `TMPDIR` (also `GOTMPDIR`
+for Go). That disk-backed directory still has ZFS's filename limitation. Docker storage is unaffected.
+`/tmp` contents disappear at every box stop and are not saved in snapshots or clones.
+
+Full host provisioning configures this automatically. To update an existing host without upgrades,
+service restarts or a base-image rebuild, copy the reviewed `../install-host.sh` to
+`/root/offbox-server/install-host.sh`, then run on the host:
+
+```sh
+# Keep the pre-change value once; retain this backup until rollout and rollback are settled.
+if ! test -f /root/offbox-tmp-before-67.raw.lxc; then
+  previous=$(incus profile get offbox raw.lxc) || exit
+  printf '%s\n' "$previous" > /root/offbox-tmp-before-67.raw.lxc
+fi
+bash /root/offbox-server/install-host.sh tmp-profile
+incus profile get offbox raw.lxc
+```
+
+`raw.lxc` changes take effect only at the next start. Running boxes keep their current `/tmp`; new boxes
+and existing boxes resumed after a normal stop get tmpfs. Do not hot-mount over a running job's `/tmp` or
+restart boxes to accelerate rollout. Old files underneath the mount remain on disk but are hidden after
+the next start. The command preserves other `raw.lxc` settings and refuses existing mounts at `/tmp` or
+any of its descendants, which a later parent mount would hide.
+Per-instance `raw.lxc` overrides take precedence over the profile; reconcile those separately if present.
+
+Rollback on the host: `incus profile set offbox raw.lxc "$(cat /root/offbox-tmp-before-67.raw.lxc)"`.
+This also takes effect at future starts; current mounts stay in place until boxes stop naturally.
+Revert the provisioning change too if future host installs must retain the rollback.
+
 ## VPN (Mullvad)
 
 Owner, 12 Nov 2026: Mullvad on the box, permanently on. `mullvad.sh` (copied to the server as

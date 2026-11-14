@@ -8,11 +8,13 @@ import { registerRuntimeAnalytics } from "@t3tools/client-runtime/state/analytic
 import {
   activeAnalytics,
   analyticsForEnvironment,
+  analyticsForLongTask,
   analyticsWebScreen,
   analyticsErrorTag,
   sampleAnalyticsFrames,
   setActiveAnalyticsEnvironment,
   flushEnvironmentAnalytics,
+  registerAnalyticsLongTaskObserver,
 } from "@t3tools/client-runtime/ardud/analytics";
 import { environmentCatalog } from "../connection/catalog";
 import { connectionAtomRuntime } from "../connection/runtime";
@@ -77,12 +79,17 @@ export function AnalyticsCoordinator() {
   useEffect(() => {
     const screen = analyticsWebScreen(pathname);
     const environmentId = screen.environmentId ?? primary;
-    setActiveAnalyticsEnvironment(environmentId);
+    setActiveAnalyticsEnvironment(environmentId, performance.timeOrigin + performance.now());
     const enabled: ReadonlyArray<string> = JSON.parse(environmentKey);
     if (environmentId === null || !enabled.includes(environmentId)) return;
     const collector = analyticsForEnvironment(environmentId);
     if (!collector) return;
-    collector.setRoute(screen.details);
+    collector.setRoute(screen.details, document.visibilityState !== "hidden");
+    if (
+      typeof PerformanceObserver !== "undefined" &&
+      PerformanceObserver.supportedEntryTypes.includes("longtask")
+    )
+      collector.enableLongTasks();
     const started = performance.now();
     let frame = requestAnimationFrame(() => {
       frame = requestAnimationFrame(() =>
@@ -127,16 +134,30 @@ export function AnalyticsCoordinator() {
     window.addEventListener("error", uncaught);
     window.addEventListener("unhandledrejection", rejection);
     let observer: PerformanceObserver | undefined;
+    let unregisterObserver: (() => void) | undefined;
     if (
       typeof PerformanceObserver !== "undefined" &&
       PerformanceObserver.supportedEntryTypes.includes("longtask")
     ) {
-      observer = new PerformanceObserver((entries) => {
-        const collector = activeAnalytics();
-        for (const entry of entries.getEntries().slice(0, 20))
-          collector?.record("performance.long-task", { durationMs: entry.duration });
-      });
+      const receive = (entries: ReadonlyArray<PerformanceEntry>) => {
+        for (const entry of entries) {
+          const startedAt = performance.timeOrigin + entry.startTime;
+          analyticsForLongTask(startedAt)?.recordLongTask({
+            duration: entry.duration,
+            startedAt,
+            attribution: (
+              entry as PerformanceEntry & {
+                attribution?: ReadonlyArray<{ containerType?: string; containerName?: string }>;
+              }
+            ).attribution,
+          });
+        }
+      };
+      observer = new PerformanceObserver((entries) => receive(entries.getEntries()));
       observer.observe({ type: "longtask" });
+      unregisterObserver = registerAnalyticsLongTaskObserver(() =>
+        receive(observer!.takeRecords()),
+      );
     }
     return () => {
       document.removeEventListener("visibilitychange", visibility);
@@ -144,6 +165,7 @@ export function AnalyticsCoordinator() {
       window.removeEventListener("error", uncaught);
       window.removeEventListener("unhandledrejection", rejection);
       observer?.disconnect();
+      unregisterObserver?.();
       setActiveAnalyticsEnvironment(null);
     };
   }, []);

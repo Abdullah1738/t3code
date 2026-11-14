@@ -1,3 +1,5 @@
+import { AskTimingScrollView } from "./AskTimingScrollView";
+import { AskTiming } from "./useAskTiming";
 import type { StaticScreenProps } from "@react-navigation/native";
 import {
   ASK_BATCH_MAX,
@@ -10,7 +12,7 @@ import {
 } from "@t3tools/client-runtime/ardud/kanban";
 import { kanbanAskResponse, type KanbanAskFeedItem } from "@t3tools/contracts";
 import { type ReactNode, useState } from "react";
-import { Platform, Pressable, ScrollView, View } from "react-native";
+import { Platform, Pressable, View } from "react-native";
 
 import type { AppBarMenuItem } from "../../../components/ui/AppBar.types";
 import { AppText as Text } from "../../../components/ui/AppText";
@@ -225,7 +227,7 @@ function OpenBatch(props: {
         ? { menus: [{ title: "More", icon: "ellipsis.circle" as const, items: more }] }
         : {})}
     >
-      <ScrollView
+      <AskTimingScrollView
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="interactive"
         contentContainerClassName="gap-5 px-4 pb-8 pt-4"
@@ -382,7 +384,7 @@ function OpenBatch(props: {
             </View>
           </View>
         ) : null}
-      </ScrollView>
+      </AskTimingScrollView>
 
       {count > 0 && shape !== null ? (
         <View
@@ -464,6 +466,7 @@ function AskList(props: {
               (index > 0 || (left && props.entries.length > 1)) && "border-t border-border",
             )}
           >
+            <AskTiming cardId={entry.cardId} askId={entry.ask.id} />
             {left && onToggle ? (
               <Pressable
                 accessibilityRole="checkbox"

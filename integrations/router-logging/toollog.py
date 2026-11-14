@@ -9,7 +9,7 @@ import re
 
 CAP = 50 * 1024 * 1024
 _seen = set()
-PROPS = {'model', 'size', 'count', 'status', 'enabled', 'locked', 'limited', 'reloginNeeded', 'state', 'action', 'tag', 'dryRun', 'complete', 'cost', 'hour', 'exitCode', 'attempt', 'source', 'failed', 'total', 'fourxx', 'fivexx'}
+PROPS = {'endpoint', 'model', 'size', 'count', 'status', 'enabled', 'locked', 'limited', 'reloginNeeded', 'state', 'action', 'tag', 'dryRun', 'complete', 'cost', 'hour', 'exitCode', 'attempt', 'source', 'failed', 'total', 'fourxx', 'fivexx'}
 IDS = {'account', 'connection', 'thread', 'incident', 'request', 'session'}
 
 def directory():

@@ -733,6 +733,11 @@ class CrpkoSetupTests(unittest.TestCase):
         self.assertNotIn('curl ',self.calls())
         self.assertNotIn('USER_COMMAND',result.stdout)
 
+    def test_repo_environment_does_not_prepend_a_box_node_path(self):
+        result = self.run_setup(command='echo USER_COMMAND; printf "PATH=%s\\n" "$PATH"')
+        self.assert_ok(result)
+        self.assertIn('PATH=' + self.env['PATH'], result.stdout.splitlines())
+
     def test_missing_unzip_is_installed(self):
         self.env['PATH']=str(self.bin)
         for tool in ('bash','cat','mkdir','mv','rm','mktemp'):

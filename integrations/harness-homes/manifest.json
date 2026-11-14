@@ -17,8 +17,8 @@
     {"id": "betterstack", "url": "https://mcp.betterstack.com", "toolTimeoutSec": 120, "startupTimeoutSec": 30},
     {"id": "recall", "url": "http://127.0.0.1:18765/mcp", "toolTimeoutSec": 120, "startupTimeoutSec": 30},
     {"id": "perplexity", "command": "/Users/ardud/bin/perplexity-mcp", "args": [], "env": {}, "toolTimeoutSec": 660, "startupTimeoutSec": 30},
-    {"id": "inbody", "url": "http://127.0.0.1:18767/mcp", "toolTimeoutSec": 120, "startupTimeoutSec": 30},
-    {"id": "flighty", "url": "http://127.0.0.1:18766/mcp", "toolTimeoutSec": 120, "startupTimeoutSec": 30},
+    {"id": "inbody", "url": "http://127.0.0.1:18767/mcp", "toolTimeoutSec": 120, "startupTimeoutSec": 30, "opencodeTimeoutMs": 120000},
+    {"id": "flighty", "url": "http://127.0.0.1:18766/mcp", "toolTimeoutSec": 120, "startupTimeoutSec": 30, "opencodeTimeoutMs": 120000},
     {"id": "cua-driver", "command": "/Users/ardud/.local/bin/cua-driver", "args": ["mcp"], "env": {}, "toolTimeoutSec": 120, "startupTimeoutSec": 30},
     {"id": "dia", "command": "/Users/ardud/.nvm/versions/node/v26.2.0/bin/node", "args": ["/Users/ardud/.config/opencode/dia-agent-bridge/src/server.js"], "env": {"DIA_CDP_ENDPOINT": "http://127.0.0.1:9222"}, "toolTimeoutSec": 120, "startupTimeoutSec": 30}
   ],
@@ -28,7 +28,7 @@
   },
   "shellPathPrefix": [
     "/Users/ardud/.config/opencode/skills/remote-compute/scripts/blockers",
-    "/Users/ardud/.local/share/harness-hooks/coord-blockers"
+    "/Users/ardud/.local/share/quint-guard/bin"
   ],
   "shellPath": ["/Users/ardud/.bun/bin", "/Users/ardud/.nvm/versions/node/v26.2.0/bin", "/Users/ardud/.cargo/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin", "/Users/ardud/.local/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"],
   "hooks": [
@@ -76,6 +76,18 @@
         "installed": "~/.config/opencode/plugin/rootwide-search-guard.ts"
       }
     ],
+    "quint-verify": [
+      "../harness-hooks/src/quint_verify_guard.py",
+      {
+        "source": "../local-helpers/libexec/repo-node-pin/select.py",
+        "installed": "~/.local/libexec/repo-node-pin/select.py"
+      },
+      "../harness-hooks/src/engine.py",
+      {
+        "source": "../opencode-plugins/plugin/quint-verify-guard.ts",
+        "installed": "~/.config/opencode/plugin/quint-verify-guard.ts"
+      }
+    ],
     "live-database": [
       "../harness-hooks/src/statev2_guard.py",
       "../harness-hooks/src/engine.py",
@@ -115,10 +127,6 @@
         "installed": "~/.config/opencode/plugin/betterstack-scope.ts"
       }
     ],
-    "coord-haiku": [
-      "../harness-hooks/src/engine.py",
-      "../harness-hooks/src/coord_shim.py"
-    ],
     "desktop-lease": [
       "../harness-hooks/src/desktop_lease.py"
     ],
@@ -149,6 +157,7 @@
     "autoCompactTokenLimit": 450000
   },
   "claude": {
+    "mcpTimeoutMs": 15000,
     "autoCompactWindow": "500000",
     "cleanupPeriodDays": 36500,
     "subagentDepth": 1000000

@@ -152,7 +152,7 @@ async function privateDir(stateRoot: string): Promise<string> {
 }
 
 async function removeValues(stateRoot: string, token: string): Promise<void> {
-  await unlink(valuesPath(stateRoot, token)).catch((error: NodeJS.ErrnoException) => { toolError("secrets", "secrets.catch1");
+  await unlink(valuesPath(stateRoot, token)).catch((error: NodeJS.ErrnoException) => { toolError("secrets", "secrets.catch1", error);
     if (error.code !== "ENOENT") throw error;
   });
 }
@@ -183,7 +183,7 @@ export async function submitSecret(deps: SecretDeps, token: string, form: URLSea
   try {
     // Exclusive creation also settles concurrent submissions: only one writer wins.
     handle = await open(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-  } catch (error) { toolError("secrets", "secrets.catch2");
+  } catch (error) { toolError("secrets", "secrets.catch2", error);
     if ((error as NodeJS.ErrnoException).code === "EEXIST") return { status: "gone" };
     throw error;
   }
@@ -191,9 +191,9 @@ export async function submitSecret(deps: SecretDeps, token: string, form: URLSea
     await handle.chmod(0o600);
     await handle.writeFile(JSON.stringify({ values }));
     await handle.sync();
-  } catch (error) { toolError("secrets", "secrets.catch3");
-    await handle.close().catch(() => { toolError("secrets", "secrets.catch4");});
-    await unlink(path).catch(() => { toolError("secrets", "secrets.catch5");});
+  } catch (error) { toolError("secrets", "secrets.catch3", error);
+    await handle.close().catch((caughtError) => { toolError("secrets", "secrets.catch4", caughtError);});
+    await unlink(path).catch((caughtError) => { toolError("secrets", "secrets.catch5", caughtError);});
     throw error;
   }
   await handle.close();
@@ -212,7 +212,7 @@ export async function submitSecret(deps: SecretDeps, token: string, form: URLSea
       return true;
     }).immediate();
   } finally {
-    if (!accepted) await unlink(path).catch(() => { toolError("secrets", "secrets.catch6");});
+    if (!accepted) await unlink(path).catch((caughtError) => { toolError("secrets", "secrets.catch6", caughtError);});
   }
   toolLog.capture(() => toolLog.write({ component: "forms", kind: "event", name: accepted ? "form.submit" : "form.fail", ok: accepted, ids: { formId: tokenHash(token), threadId: request.sessionId } }));
   return accepted ? { status: "ok" } : { status: "gone" };
@@ -222,7 +222,7 @@ async function readValues(stateRoot: string, token: string): Promise<Record<stri
   let handle;
   try {
     handle = await open(valuesPath(stateRoot, token), constants.O_RDONLY | constants.O_NOFOLLOW);
-  } catch { toolError("secrets", "secrets.catch7");
+  } catch (caughtError) { toolError("secrets", "secrets.catch7", caughtError);
     throw new SecretError(410);
   }
   try {
@@ -231,7 +231,7 @@ async function readValues(stateRoot: string, token: string): Promise<Record<stri
     const parsed = JSON.parse(await handle.readFile("utf8")) as { values?: unknown };
     if (!parsed.values || typeof parsed.values !== "object" || Array.isArray(parsed.values)) throw new SecretError(410);
     return parsed.values as Record<string, string>;
-  } catch (error) { toolError("secrets", "secrets.catch8");
+  } catch (error) { toolError("secrets", "secrets.catch8", error);
     throw error instanceof SecretError ? error : new SecretError(410);
   } finally {
     await handle.close();
@@ -291,13 +291,13 @@ export async function sweepSecrets(deps: SecretDeps): Promise<void> {
     }
   }
   let names: string[];
-  try { names = await readdir(secretsDir(deps.stateRoot)); } catch { toolError("secrets", "secrets.catch9"); return; }
+  try { names = await readdir(secretsDir(deps.stateRoot)); } catch (caughtError) { toolError("secrets", "secrets.catch9", caughtError); return; }
   for (const name of names) {
     // A crash between writing values and recording the submission leaves an orphan; never keep it.
     if (!/^[a-f0-9]{64}\.json$/.test(name) || live.has(name)) continue;
     const path = join(secretsDir(deps.stateRoot), name);
-    const info = await lstat(path).catch(() => { toolError("secrets", "secrets.catch10"); return undefined; });
-    if (info && Date.now() - info.mtimeMs >= ORPHAN_GRACE_MS) await unlink(path).catch(() => { toolError("secrets", "secrets.catch11");});
+    const info = await lstat(path).catch((caughtError) => { toolError("secrets", "secrets.catch10", caughtError); return undefined; });
+    if (info && Date.now() - info.mtimeMs >= ORPHAN_GRACE_MS) await unlink(path).catch((caughtError) => { toolError("secrets", "secrets.catch11", caughtError);});
   }
 }
 
@@ -373,7 +373,7 @@ async function readForm(request: Request): Promise<URLSearchParams | number> {
   if (request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/x-www-form-urlencoded") return 415;
   const length = request.headers.get("content-length");
   if (length !== null && (!/^\d+$/.test(length) || Number(length) > MAX_SECRET_FORM_BYTES)) {
-    void request.body?.cancel().catch(() => { toolError("secrets", "secrets.catch12");});
+    void request.body?.cancel().catch((caughtError) => { toolError("secrets", "secrets.catch12", caughtError);});
     return 413;
   }
   if (!request.body) return new URLSearchParams();
@@ -387,14 +387,14 @@ async function readForm(request: Request): Promise<URLSearchParams | number> {
       if (done) break;
       size += value.byteLength;
       if (size > MAX_SECRET_FORM_BYTES) {
-        void reader.cancel().catch(() => { toolError("secrets", "secrets.catch13");});
+        void reader.cancel().catch((caughtError) => { toolError("secrets", "secrets.catch13", caughtError);});
         return 413;
       }
       text += decoder.decode(value, { stream: true });
     }
     text += decoder.decode();
     return new URLSearchParams(text);
-  } catch { toolError("secrets", "secrets.catch14");
+  } catch (caughtError) { toolError("secrets", "secrets.catch14", caughtError);
     return 400;
   } finally {
     reader.releaseLock();
@@ -415,11 +415,11 @@ export function createSecretHandler(deps: SecretDeps): (request: Request, token:
     const now = deps.now?.() ?? Date.now();
     const current = getSecretRequest(deps.store, token);
     if (!current) {
-      void request.body?.cancel().catch(() => { toolError("secrets", "secrets.catch15");});
+      void request.body?.cancel().catch((caughtError) => { toolError("secrets", "secrets.catch15", caughtError);});
       return missing(head);
     }
     if (!isOpen(current, now)) {
-      void request.body?.cancel().catch(() => { toolError("secrets", "secrets.catch16");});
+      void request.body?.cancel().catch((caughtError) => { toolError("secrets", "secrets.catch16", caughtError);});
       return gone(head);
     }
     if (request.method !== "POST") {
@@ -437,7 +437,7 @@ export function createSecretHandler(deps: SecretDeps): (request: Request, token:
     }
     if (current.encryption) {
       try { form = await decryptForm(current.encryption, form); }
-      catch { toolError("secrets", "secrets.catch17"); return html(renderSecretMessage("Could not send", "Please try again."), 400); }
+      catch (caughtError) { toolError("secrets", "secrets.catch17", caughtError); return html(renderSecretMessage("Could not send", "Please try again."), 400); }
     }
     const result = await submitSecret(deps, token, form);
     if (result.status === "gone") return gone();
@@ -451,8 +451,8 @@ export function createSecretHandler(deps: SecretDeps): (request: Request, token:
       if (response.status >= 400) toolLog.capture(() => toolLog.write({ component: "forms", kind: "error", name: "form.fail", ok: false,
         ids: { formId: tokenHash(token) }, props: { status: response.status }, error: { tag: "form.http", message: "" } }));
       return response;
-    } catch (error) { toolError("secrets", "secrets.catch18");
-      toolLog.capture(() => toolLog.write({ component: "forms", kind: "error", name: "form.fail", ok: false, ids: { formId: tokenHash(token) }, error: { tag: "form.storage", message: "" } }));
+    } catch (error) { toolError("secrets", "secrets.catch18", error);
+      toolLog.capture(() => toolLog.write({ component: "forms", kind: "error", name: "form.fail", ok: false, ids: { formId: tokenHash(token) }, error: { tag: "form.storage", cause: error } }));
       throw error;
     }
   };

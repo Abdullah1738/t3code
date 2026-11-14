@@ -157,6 +157,7 @@ export function evaluatePullRequestWatch(
     next: {
       startedAt: watch.startedAt,
       headSha: checksSettling ? watch.headSha : headSha,
+      observedHeadSha: detail.headBranchSha ?? headSha,
       failedChecks,
       passed,
       passedChecks,

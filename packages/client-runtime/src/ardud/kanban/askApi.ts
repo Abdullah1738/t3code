@@ -254,6 +254,12 @@ export interface AskApi {
   }) => Promise<AskFeedRead>;
   /** One ask with its big blocks whole. */
   readonly detail: (cardRef: string, askId: string) => Promise<AskDetail>;
+  readonly seen?: (
+    cardRef: string,
+    askId: string,
+    surface: "web" | "desktop" | "mobile",
+  ) => Promise<unknown>;
+  readonly notified?: (cardRef: string, askId: string) => Promise<unknown>;
   /** One answer. `revision` is the ask as he read it; the server refuses an answer to another one. */
   readonly answer: (
     cardRef: string,
@@ -380,6 +386,27 @@ const cardPath = (cardRef: string, askId: string) =>
   `/cards/${encodeURIComponent(cardRef)}/asks/${encodeURIComponent(askId)}`;
 
 export function createAskApi(host: AskApiHost): AskApi {
+  const receipts = new Map<string, Promise<unknown>>();
+  async function receipt(
+    cardRef: string,
+    askId: string,
+    type: "seen" | "notified",
+    surface?: "web" | "desktop" | "mobile",
+  ) {
+    const key = JSON.stringify([host.target().environmentId, cardRef, askId, type, surface]);
+    const prior = receipts.get(key);
+    if (prior) return prior;
+    const pending = call("POST", `${cardPath(cardRef, askId)}/${type}`, {
+      // @effect-diagnostics-next-line globalDate:off - A client render timestamp, retained if its receipt arrives after the answer.
+      body: type === "seen" ? { surface, at: new Date().toISOString() } : { channel: "in_app" },
+    }).catch((error: unknown) => {
+      receipts.delete(key);
+      throw error;
+    });
+    if (receipts.size >= 4096) receipts.delete(receipts.keys().next().value!);
+    receipts.set(key, pending);
+    return pending;
+  }
   async function call<T>(
     method: "GET" | "POST",
     path: string,
@@ -432,7 +459,7 @@ export function createAskApi(host: AskApiHost): AskApi {
         typeof error?.reason === "string" ? error.reason : null,
       );
     }
-    if (method === "POST" && analytics) {
+    if (method === "POST" && analytics && !path.endsWith("/seen") && !path.endsWith("/notified")) {
       const action = path.endsWith("/answer")
         ? "asks.answer"
         : path.endsWith("/reply")
@@ -553,6 +580,8 @@ export function createAskApi(host: AskApiHost): AskApi {
     },
     detail: async (cardRef, askId) =>
       readDetail(await call<unknown>("GET", cardPath(cardRef, askId))),
+    seen: (cardRef, askId, surface) => receipt(cardRef, askId, "seen", surface),
+    notified: (cardRef, askId) => receipt(cardRef, askId, "notified"),
     answer: (cardRef, askId, body, revision, keepalive = false) =>
       call<AskAnswered>("POST", `${cardPath(cardRef, askId)}/answer`, {
         body: { ...body, revision },

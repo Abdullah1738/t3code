@@ -253,6 +253,7 @@ it.effect("claims every allowed control type and no start, restart, continuation
       { type: "runtime-request.respond", providerSessionId: sessionId, requestId: RuntimeRequestId.make("request:test") },
       { type: "delegated-tasks.stop" },
       { type: "provider-session.detach", providerSessionId: sessionId },
+      { type: "provider-session.stop-background-work", throughRunOrdinal: 1, runAttempts: [], backgroundThreads: [], onlyIfCancelled: false },
       { type: "mcp-credential.revoke-thread" },
       { type: "checkpoint.capture", runId, scopeId: CheckpointScopeId.make("scope:test") },
       { type: "scheduled-tasks.cleanup" },

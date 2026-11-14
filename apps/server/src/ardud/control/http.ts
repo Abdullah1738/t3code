@@ -93,9 +93,6 @@ const MAX_LIST_LIMIT = 500;
 const DEFAULT_MESSAGE_LIMIT = 50;
 const MAX_WAIT_MS = 60 * 60 * 1000;
 
-// ---------------------------------------------------------------------------
-// Errors and responses
-// ---------------------------------------------------------------------------
 
 type ControlErrorCode =
   | "unauthorized"
@@ -188,9 +185,6 @@ const errorResponse = (error: ControlError) => {
     : response;
 };
 
-// ---------------------------------------------------------------------------
-// Request helpers
-// ---------------------------------------------------------------------------
 
 type Scope = typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope;
 
@@ -200,33 +194,35 @@ const searchParams = Effect.gen(function* () {
   return Option.isSome(url) ? url.value.searchParams : new URLSearchParams();
 });
 
-const param = (name: string) =>
-  Effect.gen(function* () {
-    const params = yield* HttpRouter.params;
-    const value = params[name];
-    if (value === undefined || value.length === 0) {
-      return yield* fail("invalid_request", `Missing path parameter ${name}.`);
-    }
-    // The router already percent-decodes path parameters.
-    return value;
-  });
+const param = Effect.fn("ControlHttp.param")(function* (name: string) {
+  const params = yield* HttpRouter.params;
+  const value = params[name];
+  if (value === undefined || value.length === 0) {
+    return yield* fail("invalid_request", `Missing path parameter ${name}.`);
+  }
+  // The router already percent-decodes path parameters.
+  return value;
+});
 
-const decodeBody = <A>(decode: (input: unknown) => Effect.Effect<A, Schema.SchemaError>) =>
-  Effect.gen(function* () {
-    const request = yield* HttpServerRequest.HttpServerRequest;
-    const text = yield* request.text.pipe(
-      Effect.mapError(() => fail("invalid_request", "Unable to read the request body.")),
-    );
-    const raw =
-      text.trim().length === 0
-        ? {}
-        : yield* decodeJsonText(text).pipe(
-            Effect.mapError(() => fail("invalid_request", "The request body is not valid JSON.")),
-          );
-    return yield* decode(raw).pipe(
-      Effect.mapError((error) => fail("invalid_request", error.message)),
-    );
-  });
+const decodeBody = Effect.fn("ControlHttp.decodeBody")(function* <A>(
+  decode: (input: unknown) => Effect.Effect<A, Schema.SchemaError>,
+) {
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  const text = yield* request.text.pipe(
+    Effect.mapError(() => fail("invalid_request", "Unable to read the request body.")),
+  );
+  const raw =
+    text.trim().length === 0
+      ? {}
+      : yield* decodeJsonText(text).pipe(
+          Effect.mapError(() =>
+            fail("invalid_request", "The request body is not valid JSON."),
+          ),
+        );
+  return yield* decode(raw).pipe(
+    Effect.mapError((error) => fail("invalid_request", error.message)),
+  );
+});
 
 const clampInt = (raw: string | null, fallback: number, max: number) => {
   const value = raw === null ? Number.NaN : Number(raw);
@@ -236,9 +232,6 @@ const clampInt = (raw: string | null, fallback: number, max: number) => {
 const boolParam = (raw: string | null): boolean | undefined =>
   raw === null ? undefined : raw === "" || raw === "1" || raw === "true";
 
-// ---------------------------------------------------------------------------
-// Bodies
-// ---------------------------------------------------------------------------
 
 const OptionalString = Schema.optional(Schema.String);
 const ModelOptions = Schema.optional(Schema.Array(ProviderOptionSelection));
@@ -363,9 +356,6 @@ const DECISIONS: Record<string, ProviderApprovalDecision> = {
   always: "acceptForSession",
 };
 
-// ---------------------------------------------------------------------------
-// Event projection for SSE
-// ---------------------------------------------------------------------------
 
 export type ControlEvent =
   | {
@@ -462,9 +452,6 @@ const encodeEventJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
 const sseFrame = (sequence: number, event: ControlEvent & { readonly origin?: string | null }) =>
   `id: ${sequence}\nevent: ${event.type}\ndata: ${encodeEventJson(event)}\n\n`;
 
-// ---------------------------------------------------------------------------
-// Routes
-// ---------------------------------------------------------------------------
 
 const makeRoutes = Effect.gen(function* () {
   const candidateBuildCommit = (yield* ServerConfig.ServerConfig).robobBuildCommit;
@@ -545,29 +532,28 @@ const makeRoutes = Effect.gen(function* () {
     return selection;
   });
 
-  const authenticate = (scope: Scope) =>
-    Effect.gen(function* () {
-      const request = yield* HttpServerRequest.HttpServerRequest;
-      const session = yield* auth.authenticateHttpRequest(request).pipe(
-        // A session read the auth lane never ran is retried once; a busy lane is
-        // "retry shortly" (503), not an internal error.
-        Effect.retry({
-          times: 1,
-          while: (error) => NodeSqliteClient.readerLaneFailure(error) === "retryable",
-        }),
-        Effect.mapError((error) =>
-          EnvironmentAuth.isServerAuthCredentialError(error)
-            ? fail("unauthorized", "A valid bearer token is required.")
-            : NodeSqliteClient.readerLaneFailure(error) !== undefined
-              ? fail("unavailable", READER_BUSY_MESSAGE)
-              : fail("internal", "Authentication failed."),
-        ),
-      );
-      if (!session.scopes.includes(scope)) {
-        return yield* fail("forbidden", `This token lacks the ${scope} scope.`);
-      }
-      return session;
-    });
+  const authenticate = Effect.fn("ControlHttp.authenticate")(function* (scope: Scope) {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const session = yield* auth.authenticateHttpRequest(request).pipe(
+      // A session read the auth lane never ran is retried once; a busy lane is
+      // "retry shortly" (503), not an internal error.
+      Effect.retry({
+        times: 1,
+        while: (error) => NodeSqliteClient.readerLaneFailure(error) === "retryable",
+      }),
+      Effect.mapError((error) =>
+        EnvironmentAuth.isServerAuthCredentialError(error)
+          ? fail("unauthorized", "A valid bearer token is required.")
+          : NodeSqliteClient.readerLaneFailure(error) !== undefined
+            ? fail("unavailable", READER_BUSY_MESSAGE)
+            : fail("internal", "Authentication failed."),
+      ),
+    );
+    if (!session.scopes.includes(scope)) {
+      return yield* fail("forbidden", `This token lacks the ${scope} scope.`);
+    }
+    return session;
+  });
 
   const uuid = crypto.randomUUIDv4().pipe(Effect.orDie);
   const commandIdFor = (operation: string, clientRequestId: string | undefined) =>
@@ -645,62 +631,61 @@ const makeRoutes = Effect.gen(function* () {
       .getThreadRecords(ThreadId.make(threadId), ["messages"])
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
 
-  const summarize = (shells: ReadonlyArray<OrchestrationV2ThreadShell>) =>
-    Effect.gen(function* () {
-      const ids = shells.map((shell) => shell.id);
-      const [origins, natives, bindings] = yield* Effect.all([
-        store.getOrigins(ids),
-        store.nativeSessionIds(ids),
-        store.nativeBindings(ids),
-      ]).pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-      // Children inherit the root's origin.
-      const rootIds = shells
-        .map((shell) => shell.lineage.rootThreadId)
-        .filter((rootId) => !origins.has(rootId));
-      const rootOrigins =
-        rootIds.length === 0
-          ? new Map<string, string>()
-          : yield* store
-              .getOrigins(rootIds)
-              .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-      return shells.map((shell) => ({
-        ...shellSummary(shell, {
-          origin:
-            origins.get(shell.id) ??
-            origins.get(shell.lineage.rootThreadId) ??
-            rootOrigins.get(shell.lineage.rootThreadId) ??
-            null,
-          nativeSessionId: natives.get(shell.id) ?? null,
-        }),
-        native: bindings.get(shell.id) ?? null,
-      }));
-    });
+  const summarize = Effect.fn("ControlHttp.summarize")(function* (
+    shells: ReadonlyArray<OrchestrationV2ThreadShell>,
+  ) {
+    const ids = shells.map((shell) => shell.id);
+    const [origins, natives, bindings] = yield* Effect.all([
+      store.getOrigins(ids),
+      store.nativeSessionIds(ids),
+      store.nativeBindings(ids),
+    ]).pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    // Children inherit the root's origin.
+    const rootIds = shells
+      .map((shell) => shell.lineage.rootThreadId)
+      .filter((rootId) => !origins.has(rootId));
+    const rootOrigins =
+      rootIds.length === 0
+        ? new Map<string, string>()
+        : yield* store
+            .getOrigins(rootIds)
+            .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    return shells.map((shell) => ({
+      ...shellSummary(shell, {
+        origin:
+          origins.get(shell.id) ??
+          origins.get(shell.lineage.rootThreadId) ??
+          rootOrigins.get(shell.lineage.rootThreadId) ??
+          null,
+        nativeSessionId: natives.get(shell.id) ?? null,
+      }),
+      native: bindings.get(shell.id) ?? null,
+    }));
+  });
 
-  const threadDetail = (threadId: string) =>
-    Effect.gen(function* () {
-      const shell = yield* getShell(threadId);
-      // ardud: the detail reports the current run and the newest five. Reading every
-      // run the thread ever had made this the slowest call on the iMessage reply path
-      // (p50 14.4 s on 11 Nov 2026, most aborted by the bridge's 15 s timeout).
-      const records = yield* readRecords(threadId, { recentRunLimit: THREAD_DETAIL_RECENT_RUNS });
-      const pending = records.runtimeRequests.filter((request) => request.status === "pending");
-      const { state, run } = stateFromRuns(records.runs, pending.length > 0);
-      const [summary] = yield* summarize([shell]);
-      return {
-        ...summary!,
-        state,
-        status: run?.status ?? "idle",
-        run: run === null ? null : runSummary(run),
-        recentRuns: runsNewestFirst(records.runs)
-          .slice(0, THREAD_DETAIL_RECENT_RUNS)
-          .map(runSummary),
-        pendingRequests: pending.map((request) =>
-          pendingRequestSummary(request, records.turnItems),
-        ),
-      };
-    });
+  const threadDetail = Effect.fn("ControlHttp.threadDetail")(function* (threadId: string) {
+    const shell = yield* getShell(threadId);
+    // ardud: the detail reports the current run and the newest five. Reading every
+    // run the thread ever had made this the slowest call on the iMessage reply path
+    // (p50 14.4 s on 11 Nov 2026, most aborted by the bridge's 15 s timeout).
+    const records = yield* readRecords(threadId, { recentRunLimit: THREAD_DETAIL_RECENT_RUNS });
+    const pending = records.runtimeRequests.filter((request) => request.status === "pending");
+    const { state, run } = stateFromRuns(records.runs, pending.length > 0);
+    const [summary] = yield* summarize([shell]);
+    return {
+      ...summary!,
+      state,
+      status: run?.status ?? "idle",
+      run: run === null ? null : runSummary(run),
+      recentRuns: runsNewestFirst(records.runs)
+        .slice(0, THREAD_DETAIL_RECENT_RUNS)
+        .map(runSummary),
+      pendingRequests: pending.map((request) =>
+        pendingRequestSummary(request, records.turnItems),
+      ),
+    };
+  });
 
-  // -- projects -------------------------------------------------------------
 
   const listUsage = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
@@ -780,71 +765,74 @@ const makeRoutes = Effect.gen(function* () {
     });
   });
 
-  // -- threads --------------------------------------------------------------
 
-  const resolveProject = (body: typeof CreateThreadBody.Type) =>
-    Effect.gen(function* () {
-      const chosen = [
-        body.projectId,
-        body.directory,
-        body.scratch === true ? "scratch" : undefined,
-      ].filter((value) => value !== undefined).length;
-      if (chosen > 1) {
-        return yield* fail("invalid_request", "Pass only one of projectId, directory or scratch.");
-      }
-      if (body.projectId !== undefined) {
-        const project = yield* projects
-          .getById(ProjectId.make(body.projectId))
-          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-        if (Option.isNone(project)) {
-          return yield* fail("not_found", `Project ${body.projectId} was not found.`);
-        }
-        return { projectId: project.value.id, workspaceStrategy: { type: "root" as const } };
-      }
-      if (body.directory !== undefined) {
-        const directory = body.directory.replace(/\/+$/, "") || "/";
-        if (!directory.startsWith("/")) {
-          return yield* fail("invalid_request", "directory must be an absolute path.");
-        }
-        // A registered project root runs at its root; a folder inside one runs
-        // there as its own worktree; anything else becomes a project of its own.
-        const all = yield* projects
-          .listShells()
-          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-        const exact = all.find((project) => project.workspaceRoot === directory);
-        if (exact !== undefined) {
-          return { projectId: exact.id, workspaceStrategy: { type: "root" as const } };
-        }
-        const parent = all
-          .filter((project) => directory.startsWith(`${project.workspaceRoot}/`))
-          .toSorted((left, right) => right.workspaceRoot.length - left.workspaceRoot.length)[0];
-        if (parent !== undefined) {
-          // Chat folders under a registered root (iMessage, Telegram) are made on demand.
-          yield* fileSystem
-            .makeDirectory(directory, { recursive: true })
-            .pipe(Effect.mapError((cause) => fail("invalid_request", errorDetail(cause))));
-          return {
-            projectId: parent.id,
-            workspaceStrategy: { type: "existing_worktree" as const, worktreePath: directory },
-          };
-        }
-        const id = yield* uuid;
-        const created = yield* projects
-          .bootstrap({
-            commandId: CommandId.make(`ardud-control:project:${id}`),
-            projectId: ProjectId.make(id),
-            title: directory.slice(directory.lastIndexOf("/") + 1) || directory,
-            workspaceRoot: directory,
-            createWorkspaceRootIfMissing: true,
-          })
-          .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
-        return { projectId: created.project.id, workspaceStrategy: { type: "root" as const } };
-      }
-      const scratch = yield* folders.ensureScratchProject.pipe(
-        Effect.mapError((cause) => fail("unavailable", errorDetail(cause))),
+  const resolveProject = Effect.fn("ControlHttp.resolveProject")(function* (
+    body: typeof CreateThreadBody.Type,
+  ) {
+    const chosen = [
+      body.projectId,
+      body.directory,
+      body.scratch === true ? "scratch" : undefined,
+    ].filter((value) => value !== undefined).length;
+    if (chosen > 1) {
+      return yield* fail(
+        "invalid_request",
+        "Pass only one of projectId, directory or scratch.",
       );
-      return { projectId: scratch.projectId, workspaceStrategy: { type: "root" as const } };
-    });
+    }
+    if (body.projectId !== undefined) {
+      const project = yield* projects
+        .getById(ProjectId.make(body.projectId))
+        .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+      if (Option.isNone(project)) {
+        return yield* fail("not_found", `Project ${body.projectId} was not found.`);
+      }
+      return { projectId: project.value.id, workspaceStrategy: { type: "root" as const } };
+    }
+    if (body.directory !== undefined) {
+      const directory = body.directory.replace(/\/+$/, "") || "/";
+      if (!directory.startsWith("/")) {
+        return yield* fail("invalid_request", "directory must be an absolute path.");
+      }
+      // A registered project root runs at its root; a folder inside one runs
+      // there as its own worktree; anything else becomes a project of its own.
+      const all = yield* projects
+        .listShells()
+        .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+      const exact = all.find((project) => project.workspaceRoot === directory);
+      if (exact !== undefined) {
+        return { projectId: exact.id, workspaceStrategy: { type: "root" as const } };
+      }
+      const parent = all
+        .filter((project) => directory.startsWith(`${project.workspaceRoot}/`))
+        .toSorted((left, right) => right.workspaceRoot.length - left.workspaceRoot.length)[0];
+      if (parent !== undefined) {
+        // Chat folders under a registered root (iMessage, Telegram) are made on demand.
+        yield* fileSystem
+          .makeDirectory(directory, { recursive: true })
+          .pipe(Effect.mapError((cause) => fail("invalid_request", errorDetail(cause))));
+        return {
+          projectId: parent.id,
+          workspaceStrategy: { type: "existing_worktree" as const, worktreePath: directory },
+        };
+      }
+      const id = yield* uuid;
+      const created = yield* projects
+        .bootstrap({
+          commandId: CommandId.make(`ardud-control:project:${id}`),
+          projectId: ProjectId.make(id),
+          title: directory.slice(directory.lastIndexOf("/") + 1) || directory,
+          workspaceRoot: directory,
+          createWorkspaceRootIfMissing: true,
+        })
+        .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+      return { projectId: created.project.id, workspaceStrategy: { type: "root" as const } };
+    }
+    const scratch = yield* folders.ensureScratchProject.pipe(
+      Effect.mapError((cause) => fail("unavailable", errorDetail(cause))),
+    );
+    return { projectId: scratch.projectId, workspaceStrategy: { type: "root" as const } };
+  });
 
   const createThread = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationOperateScope);
@@ -968,100 +956,93 @@ const makeRoutes = Effect.gen(function* () {
     return json({ ok: true, threads: page.threads, nextCursor: page.nextCursor });
   });
 
-  /**
-   * `updatedSince` listings (agents' `t3ctl threads --since`, the dev-resource janitor). They
-   * used to build every thread's shell and filter afterwards, which held the single statev2
-   * reader for over two minutes on 9 Nov. Now the changed range comes from
-   * ardud_v2_threads_updated_idx, the light filters run on those rows, and shells are built
-   * only for the threads returned (or for the changed range when a state filter needs them).
-   * Same filters, order and exact `total` as the full listing.
-   */
-  const listUpdatedSince = Effect.fn("ControlApi.listUpdatedSince")(function* (input: {
-    readonly location: "active" | "archive";
-    /** `null`: no time filter (a parentThreadId listing without updatedSince). */
-    readonly since: number | null;
-    readonly active: boolean | undefined;
-    readonly states: ReadonlyArray<string> | undefined;
-    readonly projectId: string | null;
-    readonly includeSubagents: boolean;
-    readonly parentThreadId: string | null;
-    readonly creationSources: ReadonlyArray<string> | undefined;
-    readonly origin: string | null;
-    readonly limit: number;
-  }) {
+  const listCandidates = Effect.fn("ControlApi.listCandidates")(function* (
+    input: ControlStore.ThreadCandidateFilter & {
+      readonly active: boolean | undefined;
+      readonly states: ReadonlyArray<string> | undefined;
+      readonly origin: string | null;
+      readonly limit: number;
+    },
+  ) {
     const { location, since, active, states, projectId, parentThreadId, origin, limit } = input;
-    // updated_at is an ISO string; widen by a second so precision differences can't drop a
-    // row at the edge, then compare instants exactly.
-    const rows = yield* store
-      .threadsUpdatedSince(
-        since === null ? null : DateTime.formatIso(DateTime.makeUnsafe(since - 1_000)),
-      )
-      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-    let matched = rows.filter(
-      (row) =>
-        row.archived === (location === "archive") &&
-        (since === null || Date.parse(row.updatedAt) > since) &&
-        (input.includeSubagents ||
-          parentThreadId !== null ||
-          row.relationshipToParent !== "subagent") &&
-        (parentThreadId === null || row.parentThreadId === parentThreadId) &&
-        (projectId === null || row.projectId === projectId) &&
-        (input.creationSources === undefined ||
-          (row.creationSource !== null && input.creationSources.includes(row.creationSource))),
-    );
-    if (origin !== null) {
-      const origins = yield* store
-        .getOrigins(matched.flatMap((row) => [row.threadId, row.rootThreadId ?? row.threadId]))
-        .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-      matched = matched.filter((row) => {
-        const value =
-          origins.get(row.threadId) ?? origins.get(row.rootThreadId ?? row.threadId) ?? null;
-        return origin === "none" ? value === null : value === origin;
-      });
-    }
     const needsState = active !== undefined || states !== undefined;
-    // Shells are re-read, so a thread that moved since the range read is filtered again.
-    const stillMatches = (shell: OrchestrationV2ThreadShell) =>
-      (since === null || DateTime.toEpochMillis(shell.updatedAt) > since) &&
-      (input.includeSubagents ||
-        parentThreadId !== null ||
-        shell.lineage.relationshipToParent !== "subagent") &&
-      (parentThreadId === null || shell.lineage.parentThreadId === parentThreadId) &&
-      (projectId === null || shell.projectId === projectId) &&
-      (input.creationSources === undefined || input.creationSources.includes(shell.creationSource));
-    let shells: Array<OrchestrationV2ThreadShell> = [];
-    // Candidates archived, deleted or moved between the two reads drop out of the page and of
-    // total; the next candidates refill the page.
-    let dropped = 0;
-    let offset = 0;
-    // With a state filter every candidate is loaded: the state decides what the page holds.
-    const wanted = needsState ? Number.POSITIVE_INFINITY : limit;
-    while (offset < matched.length && shells.length < wanted) {
-      const batch = matched.slice(offset, offset + wanted - shells.length);
-      offset += batch.length;
-      const loaded = (yield* shellsFor(
-        batch.map((row) => row.threadId),
-        location,
-      )).filter(stillMatches);
-      dropped += batch.length - loaded.length;
-      shells.push(...loaded);
+    const scanAll = needsState || origin !== null;
+    let total = scanAll
+      ? 0
+      : yield* store
+          .threadCandidateCount(input)
+          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    const shells: Array<OrchestrationV2ThreadShell> = [];
+    let after: ControlStore.ThreadCandidateCursor | undefined;
+    while (scanAll || shells.length < limit) {
+      const pageLimit = scanAll ? 128 : Math.min(128, limit - shells.length);
+      const page = yield* store
+        .threadCandidatePage({
+          ...input,
+          ...(after === undefined ? {} : { after }),
+          limit: pageLimit,
+        })
+        .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+      const last = page.at(-1);
+      if (last === undefined) break;
+      let matched = page;
+      if (origin !== null) {
+        const origins = yield* store
+          .getOrigins(page.flatMap((row) => [row.threadId, row.rootThreadId ?? row.threadId]))
+          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+        matched = page.filter((row) => {
+          const value =
+            origins.get(row.threadId) ?? origins.get(row.rootThreadId ?? row.threadId) ?? null;
+          return origin === "none" ? value === null : value === origin;
+        });
+      }
+      if (!needsState && origin !== null) total += matched.length;
+      let consumed = 0;
+      // A shell can disappear after candidate selection; refill from this page
+      // before moving its cursor past eligible rows we have not tried.
+      while (consumed < matched.length && (needsState || shells.length < limit)) {
+        const batch = matched.slice(
+          consumed,
+          needsState ? matched.length : consumed + limit - shells.length,
+        );
+        consumed += batch.length;
+        const loaded = (yield* shellsFor(
+          batch.map((row) => row.threadId),
+          location,
+        )).filter(
+          (shell) =>
+            (since === null || DateTime.toEpochMillis(shell.updatedAt) > since) &&
+            (input.includeSubagents ||
+              parentThreadId !== null ||
+              shell.lineage.relationshipToParent !== "subagent") &&
+            (parentThreadId === null || shell.lineage.parentThreadId === parentThreadId) &&
+            (projectId === null || shell.projectId === projectId) &&
+            (input.creationSources === undefined ||
+              input.creationSources.includes(shell.creationSource)),
+        );
+        if (needsState) {
+          const filtered = loaded.filter(
+            (shell) =>
+              (active === undefined || (stateFromShell(shell) !== "idle") === active) &&
+              (states === undefined || states.includes(stateFromShell(shell))),
+          );
+          total += filtered.length;
+          shells.push(...filtered.slice(0, limit - shells.length));
+        } else {
+          total -= batch.length - loaded.length;
+          shells.push(...loaded);
+        }
+      }
+      after = { updatedAt: last.updatedAt, threadId: last.threadId };
+      if (page.length < pageLimit) break;
     }
-    if (active !== undefined) {
-      shells = shells.filter((shell) => (stateFromShell(shell) !== "idle") === active);
-    }
-    if (states !== undefined) {
-      shells = shells.filter((shell) => states.includes(stateFromShell(shell)));
-    }
-    shells = shells.toSorted(
-      (left, right) =>
-        DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
+    const summaries = yield* summarize(
+      shells.toSorted(
+        (left, right) =>
+          DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
+      ),
     );
-    const summaries = yield* summarize(needsState ? shells : shells.slice(0, limit));
-    return yield* encoded({
-      ok: true,
-      total: needsState ? shells.length : matched.length - dropped,
-      threads: summaries.slice(0, limit),
-    });
+    return yield* encoded({ ok: true, total, threads: summaries });
   });
 
   const listThreads = Effect.gen(function* () {
@@ -1085,13 +1066,9 @@ const makeRoutes = Effect.gen(function* () {
     const liveOnly = active === true || (states !== undefined && !states.includes("idle"));
     const origin = params.get("origin");
     const limit = clampInt(params.get("limit"), DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
-    // ardud: a parentThreadId listing (an agent polling its children) used to build every
-    // shell ever made inside one background reader transaction: 54-89 s on 11 Nov 2026.
-    // That snapshot pinned the WAL, the checkpoint worker hit its backpressure ceiling and
-    // held every writer BEGIN until the read ended (56-87 s writer holds). The range read
-    // takes the light rows in one statement and builds shells only for the children.
-    if ((since !== undefined || parentThreadId !== null) && !liveOnly && ids === undefined) {
-      return yield* listUpdatedSince({
+    // Filter light thread rows before loading shells, including the health probe.
+    if (!liveOnly && ids === undefined) {
+      return yield* listCandidates({
         location,
         since: since ?? null,
         active,
@@ -1099,28 +1076,17 @@ const makeRoutes = Effect.gen(function* () {
         projectId,
         includeSubagents,
         parentThreadId,
-        creationSources,
+        ...(creationSources === undefined ? {} : { creationSources }),
         origin,
         limit,
       });
     }
-    const candidates = liveOnly
-      ? yield* shellsFor(
-          yield* store
-            .liveThreadIds()
-            .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause)))),
-          location,
-        )
-      : // Every shell ever made: a heavy build, admitted like the HTTP snapshot routes.
-        yield* ReplyBuilders.bounded(
-          threads.getShellSnapshot({ location }).pipe(
-            Effect.map((snapshot) =>
-              location === "archive" ? snapshot.archivedThreads : snapshot.threads,
-            ),
-            Effect.mapError((cause) => fail("internal", errorDetail(cause))),
-          ),
-          "snapshot",
-        );
+    const candidateIds =
+      ids ??
+      (yield* store
+        .liveThreadIds()
+        .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause)))));
+    const candidates = yield* shellsFor(candidateIds, location);
     let shells = candidates.filter(
       (shell) =>
         shell.deletedAt === null &&
@@ -1154,7 +1120,7 @@ const makeRoutes = Effect.gen(function* () {
       total: summaries.length,
       threads: summaries.slice(0, limit),
     });
-  });
+  }).pipe(NodeSqliteClient.foregroundReads);
 
   const getThread = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
@@ -1767,9 +1733,8 @@ const makeRoutes = Effect.gen(function* () {
       .toSorted((left, right) => (left.createdAt ?? "").localeCompare(right.createdAt ?? ""));
     yield* Effect.annotateCurrentSpan("control.returned_count", requests.length);
     return json({ ok: true, requests });
-  });
+  }, NodeSqliteClient.foregroundReads);
 
-  // -- events ---------------------------------------------------------------
 
   const events = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);

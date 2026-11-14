@@ -38,7 +38,7 @@ function withDb<T>(path: string, work: (db: Database) => T, shared = false, atte
     try {
       db = open(path, shared);
       return work(db);
-    } catch (error) { toolError("guest-evidence", "guest-evidence.catch1");
+    } catch (error) { toolError("guest-evidence", "guest-evidence.catch1", error);
       if (attempt >= attempts) throw error;
       Bun.sleepSync(300 * attempt);
     } finally { db?.close(); }
@@ -92,7 +92,7 @@ export function findEvidence(address: string, lineNumber: string, now = Date.now
       }
       return [...found.filter(entry => entry.strong), ...found.filter(entry => !entry.strong)].slice(0, 5);
     }, true);
-  } catch { toolError("guest-evidence", "guest-evidence.catch2"); return "unavailable"; }
+  } catch (caughtError) { toolError("guest-evidence", "guest-evidence.catch2", caughtError); return "unavailable"; }
 }
 
 /**
@@ -110,7 +110,7 @@ export function verifyArchiveEvidence(ref: string, address: string, path = ARCHI
       ).get(Number(match[1]), ...clause.params);
       return row ? { source: row.source, at: row.ts * 1000, snippet: (row.body ?? "").slice(0, 600) } : undefined;
     }, true);
-  } catch { toolError("guest-evidence", "guest-evidence.catch3"); return undefined; }
+  } catch (caughtError) { toolError("guest-evidence", "guest-evidence.catch3", caughtError); return undefined; }
 }
 
 /** Contact name for an address, undefined when not found, "unavailable" when Contacts can't be read. */
@@ -119,7 +119,7 @@ export function contactName(address: string, root = ADDRESSBOOK): string | undef
   let dbs: string[];
   try {
     dbs = readdirSync(sources).map(dir => join(sources, dir, "AddressBook-v22.abcddb")).filter(file => existsSync(file));
-  } catch { toolError("guest-evidence", "guest-evidence.catch4"); return "unavailable"; }
+  } catch (caughtError) { toolError("guest-evidence", "guest-evidence.catch4", caughtError); return "unavailable"; }
   if (!dbs.length) return "unavailable";
   const email = address.includes("@") ? address.trim().toLowerCase() : undefined;
   const tail = email ? "" : digitsOf(address).slice(-9);
@@ -139,7 +139,7 @@ export function contactName(address: string, root = ADDRESSBOOK): string | undef
         return row ? [row.f, row.l].filter(Boolean).join(" ") || row.o || "(unnamed contact)" : undefined;
       });
       if (name) return name;
-    } catch { toolError("guest-evidence", "guest-evidence.catch5"); /* try the next source */ }
+    } catch (caughtError) { toolError("guest-evidence", "guest-evidence.catch5", caughtError); /* try the next source */ }
   }
   return readable ? undefined : "unavailable";
 }

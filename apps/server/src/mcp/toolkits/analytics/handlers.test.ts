@@ -30,6 +30,7 @@ it.effect("reads a filtered day's rollup through the MCP service boundary", () =
     const service = Layer.succeed(
       Analytics.Analytics,
       Analytics.Analytics.of({
+        flush: Effect.void,
         record: () => Effect.void,
         ingest: () => Effect.void,
         read: (input) =>

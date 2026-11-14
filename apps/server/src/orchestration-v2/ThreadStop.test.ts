@@ -1247,6 +1247,113 @@ it.effect("thread.stop marks a turn it cannot interrupt so a late agent watch is
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect.each(["direct", "delayed"] as const)(
+  "records the %s interrupt reason when the provider session is gone",
+  (route) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = ThreadId.make("thread:missing-session-reason");
+      yield* createWatchingThread(threadId, 11);
+      yield* send(threadId, "work", "start_immediately");
+      const before = yield* orchestrator.getThreadProjection(threadId);
+      const run = before.runs[0]!;
+      const attempt = before.attempts.find((row) => row.id === run.activeAttemptId)!;
+      const root = before.nodes.find((row) => row.id === run.rootNodeId)!;
+      const now = yield* DateTime.now;
+      yield* projections.apply({
+        id: EventId.make("missing-session:run"),
+        type: "run.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: { ...run, status: "running", startedAt: now },
+      });
+      yield* projections.apply({
+        id: EventId.make("missing-session:attempt"),
+        type: "run-attempt.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: { ...attempt, status: "running", startedAt: now },
+      });
+      yield* projections.apply({
+        id: EventId.make("missing-session:root"),
+        type: "node.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: { ...root, status: "running", startedAt: now },
+      });
+      yield* projections.apply({
+        id: EventId.make("missing-session:turn"),
+        type: "provider-turn.updated",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: ProviderTurnId.make("provider-turn:missing-session"),
+          providerThreadId: run.providerThreadId!,
+          nodeId: root.id,
+          runAttemptId: attempt.id,
+          nativeTurnRef: null,
+          ordinal: 1,
+          status: "running",
+          startedAt: now,
+          completedAt: null,
+        },
+      });
+      if (route === "direct") {
+        yield* orchestrator.dispatch({
+          type: "run.interrupt",
+          commandId: CommandId.make("stop-missing-session-reason"),
+          threadId,
+          runId: run.id,
+          reason: "Stopped by server maintenance",
+        });
+      } else {
+        yield* projections.apply({
+          id: EventId.make("missing-session:request"),
+          type: "turn-item.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make("missing-session:request"),
+            threadId,
+            runId: run.id,
+            nodeId: root.id,
+            providerThreadId: run.providerThreadId!,
+            providerTurnId: ProviderTurnId.make("provider-turn:missing-session"),
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            type: "run_interrupt_request",
+            status: "completed",
+            title: "Interrupt requested",
+            message: "Stopped by server maintenance",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+          },
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.background-work.settle",
+          commandId: CommandId.make("delayed-stop-reason"),
+          threadId,
+          providerThreadId: run.providerThreadId!,
+          providerTurnId: ProviderTurnId.make("provider-turn:missing-session"),
+        });
+      }
+      const stopped = yield* orchestrator.getThreadProjection(threadId);
+      const result = stopped.turnItems.find((item) => item.type === "run_interrupt_result");
+      assert.equal(
+        result?.type === "run_interrupt_result" ? result.message : null,
+        "Run interrupted: Stopped by server maintenance",
+      );
+      assert.equal(stopped.runs[0]?.status, "interrupted");
+    }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect.each(["missing session", "completed", "failed", "cancelled"] as const)(
   "a native child Stop only settles a confirmed %s outcome and preserves its owner and sibling",
   (providerState) =>

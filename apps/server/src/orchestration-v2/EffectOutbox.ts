@@ -28,6 +28,10 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import { forkParked } from "../serverActivation.ts";
 
+const StoppedRunAttempts = Schema.Array(
+  Schema.Struct({ runId: RunId, attemptId: Schema.NullOr(RunAttemptId) }),
+);
+
 export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("provider-runtime.continue"),
@@ -39,6 +43,19 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     providerSessionId: ProviderSessionId,
     detail: Schema.optional(Schema.String),
     revokeMcpCredential: Schema.optional(Schema.Boolean),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("provider-session.stop-background-work"),
+    throughRunOrdinal: Schema.Number,
+    runAttempts: StoppedRunAttempts,
+    backgroundThreads: Schema.Array(
+      Schema.Struct({
+        providerSessionId: ProviderSessionId,
+        providerThreadId: ProviderThreadId,
+        providerTurnId: ProviderTurnId,
+      }),
+    ),
+    onlyIfCancelled: Schema.Boolean,
   }),
   Schema.Struct({
     type: Schema.Literal("mcp-credential.revoke-thread"),
@@ -54,6 +71,8 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
     subagent: Schema.optional(Schema.Struct({ id: NodeId, nativeTaskId: Schema.String })),
+    stopThroughRunOrdinal: Schema.optional(Schema.Number),
+    stopRunAttempts: Schema.optional(StoppedRunAttempts),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.steer"),
@@ -134,6 +153,7 @@ export const CONTROL_LANE_EFFECT_TYPES = [
   "runtime-request.respond",
   "delegated-tasks.stop",
   "provider-session.detach",
+  "provider-session.stop-background-work",
   "mcp-credential.revoke-thread",
   "checkpoint.capture",
   "scheduled-tasks.cleanup",
@@ -145,6 +165,7 @@ export const CONTROL_LANE_EFFECT_TYPES = [
 export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
   "provider-runtime.continue",
   "provider-session.detach",
+  "provider-session.stop-background-work",
   "mcp-credential.revoke-thread",
   "provider-thread.rollback",
   "checkpoint.capture",

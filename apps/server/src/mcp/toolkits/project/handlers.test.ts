@@ -43,6 +43,7 @@ it.effect("attributes a launched thread's first message to the calling thread", 
       runtimeMode: "full-access",
       interactionMode: "default",
       activeRunId: "active-run",
+      forkedFrom: null,
       archivedAt: null,
       deletedAt: null,
     } as OrchestrationV2ThreadShell;
@@ -116,6 +117,7 @@ it.effect("launches a scratch thread into the Scratch project", () =>
       runtimeMode: "full-access",
       interactionMode: "default",
       activeRunId: "active-run",
+      forkedFrom: null,
       archivedAt: null,
       deletedAt: null,
     } as OrchestrationV2ThreadShell;
@@ -204,6 +206,7 @@ it.effect("starts a project from just a title when workspaceRoot is omitted", ()
       runtimeMode: "full-access",
       interactionMode: "default",
       activeRunId: "active-run",
+      forkedFrom: null,
       archivedAt: null,
       deletedAt: null,
     } as OrchestrationV2ThreadShell;

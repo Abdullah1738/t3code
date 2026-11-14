@@ -39,7 +39,7 @@ export function chatDbSwipes(path = join(homedir(), "Library/Messages/chat.db"))
       const files = db.query<{ name: string }, [string]>(FILES).all(row.guid).map(file => file.name);
       return { guid: row.guid, fromMe: row.fromMe === 1, sender: row.fromMe === 1 ? "" : row.sender ?? "", text, at: appleTime(row.date ?? 0),
         ...(files.length ? { files } : {}) };
-    } catch (error) { toolError("swipe", "swipe.catch1");
+    } catch (error) { toolError("swipe", "swipe.catch1", error);
       db?.close();
       db = undefined;
       throw error;
@@ -67,7 +67,7 @@ export function attributedText(blob: Uint8Array): string {
     if (length === 0x81) [length, start] = [view.getUint16(plus + 2, true), plus + 4];
     else if (length === 0x82) [length, start] = [view.getUint32(plus + 2, true), plus + 6];
     else if (length === 0x83) [length, start] = [Number(view.getBigUint64(plus + 2, true)), plus + 10];
-  } catch { toolError("swipe", "swipe.catch2");
+  } catch (caughtError) { toolError("swipe", "swipe.catch2", caughtError);
     return "";
   }
   return new TextDecoder().decode(blob.subarray(start, start + length));

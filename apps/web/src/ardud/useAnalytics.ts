@@ -4,6 +4,23 @@ import {
   trackAnalyticsScreen,
 } from "@t3tools/client-runtime/ardud/analytics";
 
+export function useAnalyticsCounts(
+  environmentId: string | null,
+  screen: string,
+  visibleCardCount: number,
+  visibleThreadCount = 0,
+) {
+  useEffect(
+    () =>
+      analyticsForEnvironment(environmentId)?.trackLongTaskView({
+        screen,
+        visibleCardCount,
+        visibleThreadCount,
+      }),
+    [environmentId, screen, visibleCardCount, visibleThreadCount],
+  );
+}
+
 export function useAnalyticsScreen(
   environmentId: string | null,
   route: string,

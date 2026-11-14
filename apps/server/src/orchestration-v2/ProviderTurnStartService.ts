@@ -1758,6 +1758,21 @@ export const layer: Layer.Layer<
         loadRecoveryAdmission: runControls.loadRecoveryAdmission,
         shouldFinalizeRun: runControls.shouldFinalizeRun,
         hasUnpairedRunInterruptRequest: runControls.hasUnpairedRunInterruptRequest,
+        loadRunInterruptReason: () =>
+          projectionStore
+            .getThreadRecords(input.threadId, ["turnItems"], {
+              turnItemRunIds: [run.id],
+              turnItemTypes: ["run_interrupt_request"],
+            })
+            .pipe(
+              Effect.map(({ turnItems }) => {
+                const reason = turnItems.find(
+                  (item) => item.type === "run_interrupt_request",
+                )?.message;
+                return reason === "Interrupt requested" ? undefined : reason;
+              }),
+              Effect.catchCause(() => Effect.succeed(undefined)),
+            ),
         message: {
           messageId: message.id,
           text:
