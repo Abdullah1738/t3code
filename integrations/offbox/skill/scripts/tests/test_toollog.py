@@ -30,6 +30,14 @@ class Logs(unittest.TestCase):
     def rows(self):
         return [json.loads(line) for path in self.root.glob('*.ndjson') for line in path.read_text().splitlines()]
 
+    def test_command_transport_fields_survive_serialization(self):
+        for mode in ('argv', 'file'):
+            for name in ('run.start', 'run.command'):
+                toollog.emit('run', name, props={'cmd_bytes': 140111, 'cmd_via': mode, 'step_count': 39})
+        self.assertEqual([row['props'] for row in self.rows()],
+                         [{'cmd_bytes': 140111, 'cmd_via': mode, 'step_count': 39}
+                          for mode in ('argv', 'file') for name in ('run.start', 'run.command')])
+
     def test_format_private_modes_and_only_allowed_metadata(self):
         secret = 'password=secret-1234567890123456'
         toollog.emit('run', 'run.request', ok=True, duration_ms=1.2345,
