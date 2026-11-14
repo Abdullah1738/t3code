@@ -21,7 +21,8 @@ REPORT_DIRS = [Path('/Library/Logs/DiagnosticReports'), Path('/Library/Logs/Diag
                Path.home() / 'Library/Logs/DiagnosticReports']
 
 
-UNIFIED_WINDOW_S = 3600
+# launchd's hourly interval also accrues runtime, sleep and coalescing drift.
+UNIFIED_WINDOW_S = 5400
 UNIFIED_CHUNK_S = 900
 UNIFIED_BUDGET_S = 135
 

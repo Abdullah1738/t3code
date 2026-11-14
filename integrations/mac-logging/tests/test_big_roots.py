@@ -174,8 +174,8 @@ class BigRootTests(unittest.TestCase):
         self.assertFalse(collector.collect(now, [], fail))
         self.assertEqual(jobs.read_state('crashes')['unified'], now-86400)
         row = self.rows('crash.source')[-1]
-        self.assertEqual(row['props']['windowS'], 3600)
-        self.assertEqual(row['props']['skippedS'], 82800)
+        self.assertEqual(row['props']['windowS'], 5400)
+        self.assertEqual(row['props']['skippedS'], 81000)
         self.assertEqual(row['props']['windowEnd'], now)
         def success(a,b):
             windows.append((a,b))
@@ -183,7 +183,7 @@ class BigRootTests(unittest.TestCase):
         self.assertTrue(collector.collect(now+7200, [], success))
         self.assertEqual(windows[0], windows[1])
         self.assertEqual(jobs.read_state('crashes')['unified'], now+7200)
-        self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'],3600)
+        self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'],1800)
         self.assertTrue(collector.collect(now+10800, [], success))
         self.assertEqual(jobs.read_state('crashes')['unified'], now+10800)
         row = self.rows('crash.source')[-1]
@@ -197,4 +197,4 @@ class BigRootTests(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout='[]', stderr='')
         collector.unified(0, 10000, run)
         cmd = commands[0]
-        self.assertEqual(cmd[cmd.index('--start')+1], '1970-01-01 01:46:40')
+        self.assertEqual(cmd[cmd.index('--start')+1], '1970-01-01 01:16:40')
