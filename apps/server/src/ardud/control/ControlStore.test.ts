@@ -508,3 +508,372 @@ it.effect("candidate cursor pages handle tied dates, filters and a capped page s
     }),
   ),
 );
+
+describe("ControlStore message pages", () => {
+  it.effect("filters before newest-N paging and keeps totals and lastAssistant independent", () =>
+    run(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* ControlStore.ControlStore;
+        const at = "2026-03-01T00:00:00.000Z";
+        const rows = [
+          {
+            id: "m01",
+            role: "assistant",
+            runId: "r1",
+            text: "older answer",
+            createdAt: at,
+            updatedAt: at,
+          },
+          { id: "m02", role: "system", runId: "r1", text: "hidden", createdAt: at, updatedAt: at },
+          {
+            id: "m03",
+            role: "user",
+            runId: "r1",
+            text: "updated prompt",
+            createdAt: at,
+            updatedAt: "2026-03-02T00:00:00.000Z",
+          },
+          {
+            id: "m04",
+            role: "assistant",
+            runId: "r2",
+            text: "latest answer",
+            createdAt: "2026-03-02T00:00:00Z",
+            updatedAt: "2026-03-02T00:00:00Z",
+          },
+          {
+            id: "m05",
+            role: "user",
+            runId: null,
+            text: "newest prompt",
+            createdAt: "2026-03-02T00:00:00.000Z",
+            updatedAt: "2026-03-02T00:00:00.000Z",
+          },
+          {
+            id: "m06",
+            role: "assistant",
+            runId: "r2",
+            text: "\u2003\n",
+            createdAt: "2026-03-03T00:00:00Z",
+            updatedAt: "2026-03-03T00:00:00Z",
+          },
+        ];
+        for (const row of rows) {
+          yield* sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert({
+            message_id: row.id,
+            thread_id: "t-moved",
+            run_id: row.runId,
+            node_id: null,
+            role: row.role,
+            streaming: 0,
+            created_at: row.createdAt,
+            updated_at: row.updatedAt,
+            payload_json: JSON.stringify({
+              id: row.id,
+              threadId: "t-moved",
+              runId: row.runId,
+              nodeId: null,
+              role: row.role,
+              text: row.text,
+              phase: "answer",
+              attachments: [],
+              streaming: false,
+              createdBy: "user",
+              creationSource: "web",
+              createdAt: row.createdAt,
+              updatedAt: row.updatedAt,
+            }),
+          })}`;
+        }
+        // Cursor ids from another thread must behave like an unknown cursor.
+        yield* sql`INSERT INTO orchestration_v2_projection_messages
+        SELECT 'foreign', 'other', run_id, node_id, role, streaming, created_at, updated_at, payload_json
+        FROM orchestration_v2_projection_messages WHERE message_id = 'm06'`;
+        const base = {
+          threadId: "t-moved",
+          role: null,
+          runId: null,
+          since: undefined,
+          afterMessageId: null,
+          limit: 2,
+        };
+        const cases = [
+          { input: {}, ids: ["m05", "m06"], total: 5 },
+          { input: { limit: null }, ids: ["m01", "m03", "m04", "m05", "m06"], total: 5 },
+          { input: { role: "user", limit: 1 }, ids: ["m05"], total: 2 },
+          { input: { role: "all" }, ids: ["m05", "m06"], total: 5 },
+          { input: { role: "system" }, ids: [], total: 0 },
+          { input: { role: "unknown" }, ids: [], total: 0 },
+          { input: { runId: "r1" }, ids: ["m01", "m03"], total: 2 },
+          { input: { runId: "missing" }, ids: [], total: 0 },
+          {
+            input: { since: Date.parse(at), limit: null },
+            ids: ["m03", "m04", "m05", "m06"],
+            total: 4,
+          },
+          { input: { since: Date.parse("2026-03-02T00:00:00Z") }, ids: ["m06"], total: 1 },
+          {
+            input: { afterMessageId: "m02", limit: null },
+            ids: ["m03", "m04", "m05", "m06"],
+            total: 4,
+          },
+          { input: { afterMessageId: "m04" }, ids: ["m05", "m06"], total: 2 },
+          { input: { afterMessageId: "m06" }, ids: [], total: 0 },
+          { input: { afterMessageId: "missing" }, ids: ["m05", "m06"], total: 5 },
+          { input: { afterMessageId: "foreign" }, ids: ["m05", "m06"], total: 5 },
+          {
+            input: {
+              afterMessageId: "m01",
+              since: Date.parse(at),
+              role: "user",
+              runId: "r1",
+              limit: 1,
+            },
+            ids: ["m03"],
+            total: 1,
+          },
+        ];
+        for (const row of cases) {
+          const page = yield* store.messagePage({ ...base, ...row.input });
+          assert.deepStrictEqual(
+            page.messages.map((message) => message.id),
+            row.ids,
+            JSON.stringify(row.input),
+          );
+          assert.equal(page.total, row.total);
+          assert.equal(
+            page.lastAssistant?.messageId ?? null,
+            row.input.runId === "missing" ? null : row.input.runId === "r1" ? "m01" : "m04",
+          );
+          assert.equal(page.state, "idle");
+        }
+      }),
+    ),
+  );
+
+  it.effect("decodes only the selected page, even with unrelated invalid historical payloads", () =>
+    run(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* ControlStore.ControlStore;
+        const at = "2026-03-01T00:00:00.000Z";
+        for (const id of ["old", "new"]) {
+          yield* sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert({
+            message_id: id,
+            thread_id: "t-moved",
+            run_id: null,
+            node_id: null,
+            role: "user",
+            streaming: 0,
+            created_at: id === "old" ? "2026-02-01T00:00:00Z" : at,
+            updated_at: at,
+            payload_json:
+              id === "old"
+                ? JSON.stringify({})
+                : JSON.stringify({
+                    id,
+                    threadId: "t-moved",
+                    runId: null,
+                    nodeId: null,
+                    role: "user",
+                    text: "new",
+                    attachments: [],
+                    streaming: false,
+                    createdBy: "user",
+                    creationSource: "web",
+                    createdAt: at,
+                    updatedAt: at,
+                  }),
+          })}`;
+        }
+        const page = yield* store.messagePage({
+          threadId: "t-moved",
+          role: "user",
+          runId: null,
+          since: undefined,
+          afterMessageId: null,
+          limit: 1,
+        });
+        assert.equal(page.total, 2);
+        assert.deepStrictEqual(
+          page.messages.map((message) => message.id),
+          ["new"],
+        );
+        assert.isNull(page.lastAssistant);
+      }),
+    ),
+  );
+
+  it.effect("preserves locale ordering for cursor and page boundary ties", () =>
+    run(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* ControlStore.ControlStore;
+        const at = "2026-03-01T00:00:00.000Z";
+        const expected = ["msg_a", "msg_B", "msg_e", "msg_é", "msg_Z", "msg-a", "msg:a"];
+        for (const id of expected.toReversed()) {
+          yield* sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert({
+            message_id: id,
+            thread_id: "t-moved",
+            run_id: null,
+            node_id: null,
+            role: "user",
+            streaming: 0,
+            created_at: at,
+            updated_at: at,
+            payload_json: JSON.stringify({
+              id,
+              threadId: "t-moved",
+              runId: null,
+              nodeId: null,
+              role: "user",
+              text: id,
+              attachments: [],
+              streaming: false,
+              createdBy: "user",
+              creationSource: "web",
+              createdAt: at,
+              updatedAt: at,
+            }),
+          })}`;
+        }
+        const input = {
+          threadId: "t-moved",
+          role: "user",
+          runId: null,
+          since: undefined,
+          afterMessageId: null,
+          limit: null,
+        };
+        for (const limit of [null, 1, 3]) {
+          const page = yield* store.messagePage({ ...input, limit });
+          assert.deepStrictEqual(
+            page.messages.map((m) => m.id),
+            limit === null ? expected : expected.slice(-limit),
+          );
+          assert.equal(page.total, 7);
+        }
+        for (let i = 0; i < expected.length; i++) {
+          const page = yield* store.messagePage({ ...input, afterMessageId: expected[i]! });
+          assert.deepStrictEqual(
+            page.messages.map((m) => m.id),
+            expected.slice(i + 1),
+          );
+          assert.equal(page.total, expected.length - i - 1);
+        }
+      }),
+    ),
+  );
+
+  it.effect("selects the locale-newest assistant across a 32-message tie boundary", () =>
+    run(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* ControlStore.ControlStore;
+        const at = "2026-03-01T00:00:00.000Z";
+        for (const id of [
+          ...Array.from({ length: 32 }, (_, i) => `msg_a${String(i).padStart(2, "0")}`),
+          "msg_Z",
+        ]) {
+          yield* sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert({
+            message_id: id,
+            thread_id: "t-moved",
+            run_id: "answer-run",
+            node_id: null,
+            role: "assistant",
+            streaming: 0,
+            created_at: at,
+            updated_at: at,
+            payload_json: JSON.stringify({
+              id,
+              threadId: "t-moved",
+              runId: "answer-run",
+              nodeId: null,
+              role: "assistant",
+              text: id,
+              phase: "answer",
+              attachments: [],
+              streaming: false,
+              createdBy: "agent",
+              creationSource: "provider",
+              createdAt: at,
+              updatedAt: at,
+            }),
+          })}`;
+        }
+        const page = yield* store.messagePage({
+          threadId: "t-moved",
+          role: "user",
+          runId: "answer-run",
+          since: Date.parse(at),
+          afterMessageId: null,
+          limit: 1,
+        });
+        assert.equal(page.total, 0);
+        assert.deepStrictEqual(page.lastAssistant, {
+          messageId: "msg_Z",
+          runId: "answer-run",
+          text: "msg_Z",
+        });
+      }),
+    ),
+  );
+
+  it.effect("matches run priority and pending request state without decoding history", () =>
+    run(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* ControlStore.ControlStore;
+        const input = {
+          threadId: "t-moved",
+          role: null,
+          runId: null,
+          since: undefined,
+          afterMessageId: null,
+          limit: 1,
+        };
+        for (const [ordinal, status] of [
+          [1, "running"],
+          [2, "waiting"],
+          [3, "queued"],
+          [4, "completed"],
+        ] as const) {
+          yield* sql`INSERT INTO orchestration_v2_projection_runs ${sql.insert({
+            run_id: `state-${ordinal}`,
+            thread_id: input.threadId,
+            ordinal,
+            provider: "codex",
+            status,
+            requested_at: "2026-01-01",
+            completed_at: null,
+            payload_json: "invalid unused payload",
+          })}`;
+        }
+        for (const [id, state] of [
+          ["state-1", "running"],
+          ["state-2", "waiting"],
+          ["state-3", "queued"],
+          ["state-4", "idle"],
+        ]) {
+          const page = yield* store.messagePage(input);
+          assert.equal(page.runId, id);
+          assert.equal(page.state, state);
+          yield* sql`DELETE FROM orchestration_v2_projection_runs WHERE run_id = ${id}`;
+        }
+        yield* sql`INSERT INTO orchestration_v2_projection_runtime_requests ${sql.insert({
+          runtime_request_id: "pending",
+          thread_id: input.threadId,
+          node_id: "node",
+          provider_turn_id: null,
+          kind: "user_input",
+          status: "pending",
+          created_at: "2026-01-01",
+          resolved_at: null,
+          payload_json: "invalid unused payload",
+        })}`;
+        assert.equal((yield* store.messagePage(input)).state, "needs-input");
+      }),
+    ),
+  );
+});
