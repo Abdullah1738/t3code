@@ -30,7 +30,7 @@ class RawOutput {
 }
 
 const COMMANDS_HELP = "Expected health, send, cancel-send, send-file, poll, app, react, wake, secret-request, secret, publish, unpublish, ban, unban, or bans."
-  + " Sendblue mode adds location-request, location, ask-owner, chats, allow, allow-group,"
+  + " Sendblue mode adds location-request, location, messages, ask-owner, chats, allow, allow-group,"
   + " guest-allow, guest-revoke, guests, guest-send, and share-contact."
   + " Logs: log-rollup [--day YYYY-MM-DD]."
   + " Public links: share, unshare, and shares."
@@ -70,6 +70,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   wake: ["text", "source", "key", "chat", "session"],
   "location-request": ["session", "key", "chat"],
   location: ["session", "chat"],
+  messages: ["session", "chat", "limit", "before", "id"],
   "ask-owner": ["text", "session", "key"],
   chats: ["session"],
   allow: ["address", "name", "admin", "session"],
@@ -324,6 +325,22 @@ export function parseCommand(args: string[]): Command {
     case "location-request":
       return { method: "POST", path: "/location-request",
         body: { ...session(), ...(values.chat === undefined ? {} : { chat: chatSlug(values.chat) }) } };
+    case "messages": {
+      const body: Body = { sessionId: sessionOnly(values.session)! };
+      if (values.chat !== undefined) body.chat = chatSlug(values.chat);
+      if (values.limit !== undefined) {
+        if (!/^\d{1,3}$/.test(values.limit) || Number(values.limit) < 1 || Number(values.limit) > 100) throw new CliError("--limit must be 1 to 100");
+        body.limit = Number(values.limit);
+      }
+      for (const key of ["before", "id"] as const) {
+        const value = values[key];
+        if (value === undefined) continue;
+        if (!value.trim() || value.length > 200 || control.test(value)) throw new CliError(`Invalid --${key}`);
+        body[key] = value;
+      }
+      if (values.before !== undefined && values.id !== undefined) throw new CliError("--id and --before cannot be used together");
+      return { method: "POST", path: "/messages", body };
+    }
     case "location":
       return { method: "POST", path: "/location",
         body: { sessionId: sessionOnly(values.session)!, ...(values.chat === undefined ? {} : { chat: chatSlug(values.chat) }) } };
