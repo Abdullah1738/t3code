@@ -11861,7 +11861,8 @@ const make = Effect.gen(function* () {
             yield* releaseModel;
           }),
         );
-        yield* laterEvaluatorTurn(card, saved, actor);
+        // Review settlement already queued its evaluator step; only later changes need a handoff.
+        yield* laterEvaluatorTurn(evaluatorTurnDue(next, settled) ? settled : card, saved, actor);
         if (patch.prompt?.trim() && patch.prompt.trim() !== card.prompt && !patch.title) {
           yield* forkWriter(card.id, { title: true, description: !patch.description });
         }

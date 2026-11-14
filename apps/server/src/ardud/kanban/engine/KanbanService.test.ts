@@ -5718,6 +5718,117 @@ it.effect.each(
 );
 
 it.effect.each([
+  { existing: false, pr: false },
+  { existing: true, pr: false },
+  { existing: false, pr: true },
+  { existing: true, pr: true },
+])(
+  "#1387 card chain switch delivers one evaluator handoff (existing=$existing, PR=$pr)",
+  ({ existing, pr }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board, card, store, reviewThread } = yield* chainEditFixture;
+        if (existing) {
+          const discussion = yield* kanban.cardDiscussion(card.id);
+          const evaluator = yield* kanban.startEvaluator(board.id, {
+            kind: "request",
+            text: "Follow this card",
+          });
+          yield* store.putDiscussion({ ...discussion, evaluatorThreadId: evaluator });
+        }
+        const current = (yield* kanban.card(card.id)).card;
+        const review = {
+          id: "s1",
+          step: 1,
+          text: "Check behavior",
+          owner: "review" as const,
+          state: "open" as const,
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        };
+        yield* store.putCard({
+          ...current,
+          subtasks: [
+            review,
+            { ...review, id: "s2", step: 2, text: "Next action", owner: "evaluator" },
+          ],
+          subtaskSeq: 2,
+          links: pr
+            ? [
+                {
+                  kind: "pr",
+                  url: "https://github.com/a/b/pull/1",
+                  label: null,
+                  state: "open",
+                  checkedAt: null,
+                },
+              ]
+            : [],
+        });
+        const evaluatorIds = [...(yield* Ref.get(fake.threads)).entries()]
+          .filter(([, thread]) => thread.title.startsWith("Evaluator"))
+          .map(([id]) => id);
+        assert.lengthOf(evaluatorIds, existing ? 1 : 0);
+        const edited = yield* kanban.editCard(card.id, { reviewChain: "One" }, owner);
+        assert.strictEqual(edited.stage, pr ? "in_review" : "completed");
+        assert.strictEqual(edited.reviewStep, 2);
+        assert.strictEqual(edited.subtasks[0]!.state, "done");
+        assert.strictEqual(edited.subtasks[1]!.state, "open");
+        assert.isNull(edited.activeThreadId);
+        assert.isNotNull((yield* store.threadLink(reviewThread))!.endedAt);
+        const evaluators = [...(yield* Ref.get(fake.threads)).entries()].filter(([, thread]) =>
+          thread.title.startsWith("Evaluator"),
+        );
+        assert.lengthOf(evaluators, 1);
+        if (existing) assert.strictEqual(evaluators[0]![0], evaluatorIds[0]);
+        assert.lengthOf(
+          evaluators[0]![1].messages.filter((text) =>
+            text.includes(Briefs.evaluatorStepText(edited)),
+          ),
+          1,
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each([false, true])(
+  "#1387 ordinary plan edits still deliver one evaluator handoff (existing=%s)",
+  (existing) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(
+          board.id,
+          { title: "Plan edit", prompt: "Plan edit" },
+          owner,
+        );
+        if (existing) {
+          const discussion = yield* kanban.cardDiscussion(card.id);
+          yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Follow this card" }]);
+        }
+        const edited = yield* kanban.editCard(
+          card.id,
+          {
+            subtasks: [{ step: 1, owner: "evaluator", text: "Write the packet" }],
+          },
+          owner,
+        );
+        const evaluators = [...(yield* Ref.get(fake.threads)).values()].filter((thread) =>
+          thread.title.startsWith("Evaluator"),
+        );
+        assert.lengthOf(evaluators, 1);
+        assert.lengthOf(
+          evaluators[0]!.messages.filter((text) => text.includes(Briefs.evaluatorStepText(edited))),
+          1,
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each([
   "unchanged",
   "same length",
   "longer",
