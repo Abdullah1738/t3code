@@ -34,6 +34,11 @@ const torsshReview =
   "Review (single GPT-6 Astra xhigh, design chain): torrc injection impossible, token fresh per launch and never logged, only the policy FD inherited, no bridge fallback on PT failure/relaunch, snowflake consent rechecked, #30/#36/#56 lyrebird gates unchanged";
 const mergeOnly =
   "Merge into main-dev after clear review at exact head with green CI (test-only, no deploy)";
+const typingRouteSteps = [
+  "Masked-field probe (session B in the packet): a Settings password field with a public dummy onion, routes type-text / type-text+back / per-char press-key / paste, read back through show-password. Table on the card, session released.",
+  "Once #91 is merged: edit the Android typing note in integrations/run-cloud/skill/SKILL.md (paste route if verified, secret-input rule, the press-key evidence corrected to say alphanumeric only). Push the branch, open a PR against main and link it.",
+  "Tell TorSSH #84 lane 1 thread f82df753 whether long plain text truncates under type-text, and which route works (paste / per-char press-key), plus that the skill note is live. Stable clientRequestId, send once.",
+] as const;
 const repeatedNegationCases = [1, 2, 3, 4].flatMap((count) =>
   [
     ["deploy agent-bridges", "deploy"],
@@ -508,11 +513,50 @@ const resourceReleaseCases = [
 ] as const;
 
 describe("inferGate", () => {
-  it("does not infer deploy for the exact Agent Tools #94 s8 cleanup", () => {
-    const s8 =
-      "Masked-field probe (session B in the packet): a Settings password field with a public dummy onion, routes type-text / type-text+back / per-char press-key / paste, read back through show-password. Table on the card, session released.";
-    // #1421 removes the separate secret guess; whichever lands second asserts undefined.
-    expect(inferGate(s8)).not.toBe("deploy");
+  it("does not infer a gate for the exact Agent Tools #94 s8 cleanup", () => {
+    const s8 = typingRouteSteps[0];
+    expect(inferGate(s8)).toBeUndefined();
+  });
+
+  it.each([
+    typingRouteSteps[1],
+    typingRouteSteps[2],
+    "paste, read back through show-password",
+    "Press the key combo ctrl+v",
+    "Paste the key-value pairs into the form",
+    ...[
+      "secret",
+      "secrets",
+      "password",
+      "passwords",
+      "credential",
+      "credentials",
+      "token",
+      "tokens",
+      "key",
+      "keys",
+    ].flatMap((noun) => [
+      `Paste command-${noun} into the note`,
+      `Paste ${noun}-command into the note`,
+      `Paste command-${noun}-name into the note`,
+    ]),
+  ])("ignores hyphenated command names and typing routes: %s", (text) => {
+    expect(inferGate(text)).toBeUndefined();
+  });
+
+  it.each([
+    "Paste the API key into the env file",
+    "Enter the password on the login screen",
+    "Rotate the signing key and store it in Keychain",
+    "Share the token with the CI job",
+    "Set the SSH key on the box",
+    "Store the private key in Keychain",
+    "Paste credentials into the form",
+    "Share the secret with CI",
+    "Paste 'token' into the form",
+    "Paste (password) into the form",
+  ])("keeps standalone secret nouns gated: %s", (text) => {
+    expect(inferGate(text)).toBe("secret");
   });
 
   it.each(repeatedNegationCases)("counts repeated negation: $text", ({ text, gate }) => {
@@ -755,6 +799,10 @@ describe("price and resource-release wording", () => {
 });
 
 describe("board gate guessing", () => {
+  it("does not guess a secret gate for an evaluator reporting a paste route", () => {
+    expect(gateOf({ owner: "evaluator", text: typingRouteSteps[2] }, ["secret"])).toBeUndefined();
+  });
+
   const cases = [
     ["Tag the main-dev tip and dev-deploy it", "deploy"],
     ["Pay the invoice", "money"],
