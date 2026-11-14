@@ -249,6 +249,17 @@ const makeFake = Effect.gen(function* () {
             return all.get(threadId)?.model ?? null;
           }),
         ),
+      claimContext: (threadId) =>
+        read(threadId).pipe(
+          Effect.flatMap((view) =>
+            Ref.get(threads).pipe(
+              Effect.map((all) => {
+                const model = all.get(threadId)?.model;
+                return view && model ? { projectId: view.projectId, model } : null;
+              }),
+            ),
+          ),
+        ),
       // Like production, view answers null when the read fails.
       view: (threadId) =>
         Effect.suspend(() => viewControl.beforeRead?.(threadId) ?? Effect.void).pipe(
@@ -28228,6 +28239,19 @@ it.effect.each([
       );
       assert.equal(flagged.activeThreadId, null);
       assert.deepEqual(fake.interrupted, [thread]);
+      if (kind === "stale promotion") {
+        // The queued run can still start after the sweep releases its card.
+        yield* setRunning(fake, thread, true);
+        assert.equal((yield* kanban.caller(thread))?.role, "work");
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: thread,
+        });
+        fake.viewControl.beforeRead = () => Effect.die("card_next loaded thread activity");
+        const next = yield* kanban.agentCall(thread, kanban.nextCards(thread));
+        assert.deepEqual(next.carrying, []);
+        assert.isArray(next.candidates);
+      }
     }).pipe(
       Effect.ensuring(Deferred.succeed(delivered, undefined)),
       Effect.provide(testLayer(layer)),
@@ -32792,4 +32816,134 @@ it.effect.each(
         );
       }).pipe(Effect.provide(inlineTestLayer(wrapped)));
     }).pipe(Effect.provide(unstartedLifecycleLayer())),
+);
+
+it.effect("card_next skips the board and activity when a released worker's pool is full", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    let checking = false;
+    const observed = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) =>
+        KanbanStore.KanbanStore.of({
+          ...real,
+          cards: (id) => (checking ? Effect.die("full board scan") : real.cards(id)),
+          groups: (id) => (checking ? Effect.die("group scan") : real.groups(id)),
+          schedulingCards: (id) =>
+            checking ? Effect.die("ranking scan") : real.schedulingCards(id),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const card = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const started = (yield* store.card(card.id))!;
+      const thread = started.workThreadId!;
+      yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: thread,
+      });
+      yield* setRunning(fake, thread, false);
+      yield* kanban.turnEnded(thread);
+      // 1,400 cards of settled history must never be decoded for this read.
+      for (let i = 0; i < 1400; i++)
+        yield* store.putCard({
+          ...started,
+          id: KanbanCardId.make(`history-${i}`),
+          number: 10000 + i,
+          stage: "completed",
+          activeThreadId: null,
+          activeRole: null,
+          activePool: null,
+        });
+      yield* store.putCard({
+        ...started,
+        id: KanbanCardId.make("occupied"),
+        number: 20000,
+        activeThreadId: ThreadId.make("other"),
+      });
+      fake.viewControl.beforeRead = () => Effect.die("thread activity read");
+      checking = true;
+      const next = yield* kanban.agentCall(thread, kanban.nextCards(thread));
+      assert.deepEqual(next, { carrying: [], candidates: [], holdsSlot: false });
+    }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, observed)));
+  }),
+);
+
+it.effect.each([
+  { role: "work", gate: "event" },
+  { role: "work", gate: "save" },
+  { role: "review", gate: "event" },
+  { role: "review", gate: "save" },
+] as const)(
+  "rollback refuses a late $role consumer during $gate without exposing its claim",
+  ({ role, gate }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const beginRead = yield* Deferred.make<void>();
+      const readDone = yield* Deferred.make<void>();
+      let armed = false;
+      let triggered = false;
+      let exposed = false;
+      const pause = Effect.suspend(() => {
+        if (!armed || triggered) return Effect.void;
+        triggered = true;
+        return Deferred.succeed(beginRead, undefined).pipe(
+          Effect.andThen(Deferred.await(readDone)),
+        );
+      });
+      const observed = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            addCardEvent: (event, application) =>
+              (gate === "event" && event.body === "Assignment wake did not complete"
+                ? pause
+                : Effect.void
+              ).pipe(Effect.andThen(real.addCardEvent(event, application))),
+            putCard: (card) =>
+              (gate === "save" && card.activeThreadId === null ? pause : Effect.void).pipe(
+                Effect.andThen(real.putCard(card)),
+              ),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, card, thread } = yield* reuseDeliveryFixture(role);
+        armed = true;
+        const consumer = yield* Deferred.await(beginRead).pipe(
+          Effect.andThen(
+            kanban.agentCall(
+              thread,
+              kanban.card(card.id).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    exposed = true;
+                  }),
+                ),
+              ),
+            ),
+          ),
+          Effect.result,
+          Effect.ensuring(Deferred.succeed(readDone, undefined)),
+          Effect.forkChild,
+        );
+        fake.conclusiveReject.add(thread);
+        yield* kanban.dispatchNow;
+        const result = yield* Fiber.join(consumer);
+        assert.isTrue(triggered);
+        assert.isFalse(exposed);
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") assert.include(result.failure.detail, "being rolled back");
+        const after = (yield* kanban.card(card.id)).card;
+        assert.isNull(after.activeThreadId);
+        assert.equal(after.stage, role === "work" ? "todo" : "needs_review");
+        // Refused admission leaves no counter or barrier behind after cleanup.
+        const read = yield* kanban.agentCall(thread, kanban.card(card.id));
+        assert.isNull(read.card.activeThreadId);
+      }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, observed)));
+    }),
 );

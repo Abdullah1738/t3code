@@ -55,6 +55,7 @@ const inertThreads = Layer.succeed(
   KanbanThreads.KanbanThreads,
   KanbanThreads.KanbanThreads.of({
     pendingUserInputs: () => Effect.succeed([]),
+    claimContext: () => Effect.succeed(null),
     view: () => Effect.succeed(null),
     find: () => Effect.succeed(null),
     model: () => Effect.succeed(null),

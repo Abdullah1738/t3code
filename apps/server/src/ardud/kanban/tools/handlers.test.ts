@@ -121,6 +121,7 @@ const fakeThreads = (
   const callerControl = { beforeRead: (): Effect.Effect<void> => Effect.void };
   const storeControl: {
     afterBoardWrite?: () => Effect.Effect<void>;
+    beforeThreadLink?: () => Effect.Effect<void>;
     beforeCardEvent?: (
       event: KanbanStore.NewCardEvent,
     ) => Effect.Effect<void, KanbanStore.KanbanStoreError>;
@@ -131,6 +132,10 @@ const fakeThreads = (
       const store = yield* KanbanStore.KanbanStore;
       return KanbanStore.KanbanStore.of({
         ...store,
+        threadLink: (id) =>
+          Effect.suspend(() => storeControl.beforeThreadLink?.() ?? Effect.void).pipe(
+            Effect.andThen(store.threadLink(id)),
+          ),
         putBoardWithPools: (...args) =>
           store
             .putBoardWithPools(...args)
@@ -172,6 +177,11 @@ const fakeThreads = (
     KanbanThreads,
     KanbanThreads.of({
       pendingUserInputs: () => Effect.succeed([]),
+      claimContext: (threadId) =>
+        Effect.sync(() => ({
+          projectId: ProjectId.make("project-1"),
+          model: models.get(threadId)!,
+        })),
       view,
       find: delivery?.findExisting ? view : () => Effect.succeed(null),
       lastFailure: () => Effect.succeed(null),
@@ -6114,4 +6124,75 @@ it.effect(
       }
     }).pipe(Effect.provide(layer));
   },
+);
+
+it.effect.each(["normal", "released"] as const)(
+  "card_next answers after a %s worker moves to review",
+  (state) =>
+    Effect.gen(function* () {
+      const { layer, running, viewControl } = fakeThreads();
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const store = yield* KanbanStore.KanbanStore;
+        const board = yield* kanban.ensureBoard({
+          slug: "next",
+          name: "Next",
+          defaultProjectId: ProjectId.make("project-1"),
+        });
+        yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+        const card = yield* kanban.createCard(
+          board.id,
+          { title: "Finish", prompt: "Finish" },
+          { _tag: "owner" },
+        );
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(card.id)).card.workThreadId!;
+        if (state === "released") {
+          yield* store.putCard({
+            ...(yield* store.card(card.id))!,
+            stage: "todo",
+            activeThreadId: null,
+            activeRole: null,
+            activePool: null,
+            stalled: {
+              by: { _tag: "system", component: "dispatcher" },
+              reason: "Stale queued runs on the thread",
+              at: "2026-11-14T05:17:40.565Z",
+            },
+          });
+        }
+        running.add(thread);
+        const moved = yield* call(thread, "card_move", { card: card.id, to: "needs_review" });
+        assert.isFalse(moved.isError, moved.text);
+        viewControl.beforeRead = () => Effect.die("card_next must not read thread activity");
+        const next = yield* call(thread, "card_next", {});
+        assert.isFalse(next.isError, next.text);
+        assert.deepEqual(next.structured.carrying, []);
+        assert.isArray(next.structured.candidates);
+        assert.equal(typeof next.structured.holdsSlot, "boolean");
+      }).pipe(Effect.provide(layer));
+    }),
+);
+
+it.effect("card_next refuses a stalled caller lookup within its deadline", () =>
+  Effect.gen(function* () {
+    const { layer, storeControl } = fakeThreads();
+    const entered = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      storeControl.beforeThreadLink = () =>
+        Effect.gen(function* () {
+          assert.equal(yield* NodeSqliteClient.ReaderLane, "foreground");
+          yield* Deferred.succeed(entered, undefined);
+          return yield* Effect.never;
+        });
+      const request = yield* call(ThreadId.make("blocked-caller"), "card_next", {}).pipe(
+        Effect.forkChild,
+      );
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("2 seconds");
+      const result = yield* Fiber.join(request);
+      assert.isTrue(result.isError);
+      assert.include(result.text, "card_next is busy");
+    }).pipe(Effect.provide(layer));
+  }),
 );

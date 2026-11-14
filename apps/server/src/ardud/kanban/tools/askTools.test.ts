@@ -80,6 +80,7 @@ const testLayer = () => {
     KanbanThreads,
     KanbanThreads.of({
       pendingUserInputs: () => Effect.succeed([]),
+      claimContext: () => Effect.succeed(null),
       view: (threadId) =>
         Effect.succeed({
           threadId,
