@@ -31,6 +31,12 @@ class RetryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        lock = ph.phonelock
+        for name, value in [('LOCK_DIR', Path(self.tmp.name)/'locks'),
+                            ('HOLD', Path(self.tmp.name)/'locks/priority-hold'),
+                            ('LEASE', Path(self.tmp.name)/'locks/lease.json')]:
+            p = patch.object(lock, name, value)
+            p.start(); self.addCleanup(p.stop)
         self.device = Mock()
         self.device.dump_hierarchy.return_value = TREE
         self.calls = []

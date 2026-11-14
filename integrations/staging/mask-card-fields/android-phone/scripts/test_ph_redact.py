@@ -6,6 +6,25 @@ ph = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ph)  # module import only; no phone is contacted
 
 
+def setUpModule():
+    from unittest.mock import patch
+    import contextlib, tempfile
+    from pathlib import Path
+    global _isolation, _telemetry
+    _isolation = contextlib.ExitStack()
+    tmp = _isolation.enter_context(tempfile.TemporaryDirectory())
+    for name, value in [('LOCK_DIR', Path(tmp)), ('HOLD', Path(tmp)/'priority-hold'),
+                        ('LEASE', Path(tmp)/'lease.json')]:
+        _isolation.enter_context(patch.object(ph.phonelock, name, value))
+    _telemetry = patch.object(ph, "lock_event")
+    _telemetry.start()
+
+
+def tearDownModule():
+    _telemetry.stop()
+    _isolation.close()
+
+
 class RedactTests(unittest.TestCase):
     def test_luhn_card_masked_to_last_four(self):
         self.assertEqual(ph.redact("card 4111 1111 1111 1111 saved"), "card •••• 1111 saved")
@@ -62,11 +81,6 @@ if __name__ == "__main__":
 
 
 class FieldContextTests(unittest.TestCase):
-    def setUp(self):
-        from unittest.mock import patch
-        p = patch.object(ph, "lock_event")
-        p.start(); self.addCleanup(p.stop)
-
     """Synthetic nodes with generic or absent IDs: the label/content-desc alone must carry the context."""
 
     def _node(self, t, c, rid, x=1, y=2):

@@ -82,6 +82,54 @@ class PhoneLockTests(unittest.TestCase):
         lock.release('holder')
         self.assertFalse(lock.LEASE.exists())
 
+    def test_exclusive_runner_claim_class(self):
+        for owner in ('holder', 'other'):
+            with self.subTest(existing='live', caller=owner):
+                self.claim()
+                with self.assertRaises(lock.Busy): lock.acquire(owner, 'runner', exclusive=True)
+                self.assertEqual(lock.status()['lease_owner'], 'holder')
+                lock.release('holder')
+        for owner in ('holder', 'other'):
+            with self.subTest(existing='expired', caller=owner):
+                lease = self.claim()
+                lease['acquired_at'] = (lock.now()-dt.timedelta(minutes=30)).isoformat()
+                lease['expires_at'] = (lock.now()-dt.timedelta(minutes=10)).isoformat()
+                lock.LEASE.write_text(json.dumps(lease))
+                lock.acquire(owner, 'runner', exclusive=True)
+                self.assertEqual(lock.status()['lease_owner'], owner)
+                lock.release(owner)
+
+    def test_wrapper_instance_cannot_refresh_or_release_same_owner_successor(self):
+        lease = self.claim()
+        first_id = lease['lease_id']
+        refreshed = self.claim()
+        self.assertEqual(refreshed['lease_id'], first_id)
+        lease['acquired_at'] = (lock.now()-dt.timedelta(minutes=30)).isoformat()
+        lease['expires_at'] = (lock.now()-dt.timedelta(minutes=10)).isoformat()
+        lock.LEASE.write_text(json.dumps(lease))
+        successor = self.claim()
+        self.assertNotEqual(successor['lease_id'], first_id)
+        for mutate in (lock.release, lock.refresh):
+            with self.subTest(operation=mutate.__name__), self.assertRaises(lock.Busy):
+                mutate('holder', lease_id=first_id)
+        self.assertEqual(lock.status()['lease']['lease_id'], successor['lease_id'])
+        lock.release('holder', lease_id=successor['lease_id'])
+
+    def test_recent_and_expired_corruption_class(self):
+        for raw in ['', '{"owner":', '{}', '{"owner":5}', '{"expires_at":"invalid"}']:
+            with self.subTest(raw=raw):
+                lock.LEASE.write_text(raw)
+                self.assertFalse(lock.check(True)[0])
+                with self.assertRaises(lock.Busy): self.claim('other')
+                with self.assertRaises(lock.Busy): lock.release('unknown')
+                old = time.time()-lock.MAX_TTL-1
+                os.utime(lock.LEASE, (old, old))
+                self.assertTrue(lock.check(True)[0])
+                self.claim('other')
+                self.assertEqual(lock.status()['lease_owner'], 'other')
+                self.assertEqual(self.events()[-1]['event'], 'lease_expired_takeover')
+                lock.release('other')
+
     def test_twenty_multiprocess_races(self):
         ctx = mp.get_context('spawn')
         for _ in range(20):
@@ -176,7 +224,7 @@ class PhoneLockTests(unittest.TestCase):
 
     def test_local_commands_work_under_hold(self):
         lock.HOLD.write_text(HOLD_TOKEN)
-        for args in [('help',), ('log',), ('lease', 'status', '--json'),
+        for args in [('help',), ('-h',), ('log',), ('lease', 'status', '--json'),
                      ('note-drop', '--source', 'fixture', '--cmd', 'read', '--exc', 'ConnectionError')]:
             self.assertEqual(self.cli(*args)[0], 0)
         ph.d.assert_not_called(); ph._run.assert_not_called()
@@ -225,6 +273,26 @@ class PhoneLockTests(unittest.TestCase):
         self.assertEqual(self.cli('open', 'dev.example')[0], 5)
         self.device.app_start.assert_not_called()
 
+    def test_doctor_cannot_restart_adb_under_foreign_lease(self):
+        self.claim()
+        probes = []
+        def adb(args, **kwargs):
+            probes.append(args)
+            return f'List of devices attached\n{ph.SERIAL} offline\n'
+        with patch.object(ph, '_run', side_effect=adb):
+            self.assertEqual(self.cli('doctor')[0], 5)
+        self.assertEqual(probes, [['adb', 'devices', '-l']])
+        self.assertEqual(self.events()[-1]['reason'], 'lease')
+
+    def test_adb_restart_class_is_guarded_at_subprocess_boundary(self):
+        self.claim()
+        for verb in ('kill-server', 'start-server'):
+            with self.subTest(verb=verb):
+                with self.assertRaises(ph.PhoneBusy): PhoneLockTests.real_run(['adb', verb])
+        ph.subprocess.run.assert_not_called()
+
+    real_run = staticmethod(ph._run)
+
     def test_read_under_foreign_lease_succeeds_but_failure_never_resets(self):
         self.claim()
         self.assertEqual(self.cli('ui')[0], 0)
@@ -269,28 +337,36 @@ class PhoneLockTests(unittest.TestCase):
     def test_owner_and_ttl_input_class(self):
         for owner in ['', 'a'*81, 'has space', 'a/b', 'a\n', '#21']:
             with self.subTest(owner=owner), self.assertRaises(ValueError): self.claim(owner)
-        for ttl in ['0', '-1', '121m', 'nan', 'inf', '20x']:
+        for ttl in ['0', '-1', '0.001s', '0.5s', '121m', 'nan', 'inf', '20x']:
             with self.subTest(ttl=ttl), self.assertRaises(ValueError): self.claim(ttl=ttl)
         self.claim('a._:-Z9', '120m')
 
     def test_purpose_redaction(self):
         lock.acquire('holder', 'CVV 123; card 4111111111111111')
-        raw = lock.LEASE.read_text()
-        self.assertNotIn('123', raw); self.assertNotIn('4111111111111111', raw)
-        self.assertLessEqual(len(json.loads(raw)['purpose']), 80)
+        purpose = json.loads(lock.LEASE.read_text())['purpose']
+        self.assertNotIn('123', purpose); self.assertNotIn('4111111111111111', purpose)
+        self.assertLessEqual(len(purpose), 80)
 
     def test_caller_chain_comm_only_and_bounded(self):
-        with patch.object(ph.subprocess, 'run') as run:
+        with patch.object(ph, 'process_comm', side_effect=['zsh', 'parent']), patch.object(ph.subprocess, 'run') as run:
             run.side_effect = [subprocess.CompletedProcess([], 0, '42 /bin/zsh\n'),
                                subprocess.CompletedProcess([], 0, '0 /usr/bin/parent\n'),
                                subprocess.CompletedProcess([], 0, 'p42\nn/Users/a/projects/fixture\n')]
             rows = PhoneLockTests.real_chain()
         self.assertEqual([r['comm'] for r in rows], ['zsh', 'parent'])
-        self.assertIsNone(rows[0]['cwd_tail'])
-        self.assertEqual(rows[-1]['cwd_tail'], 'projects/fixture')
+        self.assertIsNone(rows[-1]['cwd_tail'])
+        self.assertEqual(rows[0]['cwd_tail'], 'projects/fixture')
         for call in run.call_args_list:
             self.assertEqual(call.kwargs['timeout'], 1)
             self.assertNotIn('args=', call.args[0])
+
+    def test_kernel_name_ignores_rewritten_argv_zero(self):
+        self.assertNotIn('private argument', ph.process_comm(os.getpid()))
+        if sys.platform != 'darwin':
+            with patch.object(os, 'readlink', return_value='/usr/bin/python3'):
+                self.assertEqual(ph.process_comm(1), 'python3')
+        with patch.object(os, 'readlink', side_effect=OSError):
+            if sys.platform != 'darwin': self.assertEqual(ph.process_comm(1), 'unknown')
 
     def test_jevrun_priority_and_import_from_other_cwd(self):
         source = Path(__file__).with_name('jevrun.py').read_text()
@@ -346,6 +422,24 @@ class LeaseRunTests(unittest.TestCase):
             if child.poll() is None:
                 child.kill(); child.wait()
 
+    def test_lost_claim_returns_busy_even_if_child_handles_term_cleanly(self):
+        ready = self.root/'ready'
+        code = ('import pathlib,signal,time,sys; signal.signal(signal.SIGTERM,lambda *a:sys.exit(0)); '
+                f'pathlib.Path({str(ready)!r}).touch(); time.sleep(30)')
+        child = subprocess.Popen(self.command(code), env=self.env, cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic()+10
+            while not ready.exists() and time.monotonic()<deadline: time.sleep(.01)
+            self.assertTrue(ready.exists())
+            (self.root/'priority-hold').write_text(HOLD_TOKEN)
+            out, err = child.communicate(timeout=10)
+            self.assertEqual(child.returncode, 5, (out, err))
+            self.assertIn(b'PHONE_BUSY:', out)
+            self.assertNotIn(HOLD_TOKEN.encode(), out)
+            self.assertFalse((self.root/'lease.json').exists())
+        finally:
+            if child.poll() is None: child.kill(); child.wait()
+
     def test_sigint_releases_with_ignoring_child(self):
         ready = self.root/'ready'
         code = ('import pathlib,signal,time; signal.signal(signal.SIGINT, signal.SIG_IGN); '
@@ -361,6 +455,34 @@ class LeaseRunTests(unittest.TestCase):
             self.assertFalse((self.root/'lease.json').exists())
         finally:
             if child.poll() is None: child.kill(); child.wait()
+
+    def test_duplicate_runner_cannot_release_another_runner(self):
+        ready = self.root/'ready'
+        code = f'import pathlib,time; pathlib.Path({str(ready)!r}).touch(); time.sleep(30)'
+        child = subprocess.Popen(self.command(code), env=self.env, cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic()+10
+            while not ready.exists() and time.monotonic()<deadline: time.sleep(.01)
+            self.assertTrue(ready.exists())
+            duplicate = subprocess.run(self.command('pass'), env=self.env, cwd=self.root, capture_output=True, timeout=10)
+            self.assertEqual(duplicate.returncode, 5, duplicate.stderr)
+            self.assertTrue((self.root/'lease.json').exists())
+            child.send_signal(signal.SIGTERM)
+            child.communicate(timeout=10)
+            self.assertFalse((self.root/'lease.json').exists())
+        finally:
+            if child.poll() is None: child.kill(); child.wait()
+
+    def test_rewritten_argv_zero_is_not_logged_as_a_process_name(self):
+        code = (f'import sys,os; sys.path.insert(0,{str(Path(__file__).resolve().parent)!r}); '
+                'import ph; print(ph.process_comm(os.getpid()))')
+        result = subprocess.run(['/bin/bash', '-c', 'exec -a "PRIVATE_ARGV_CANARY private input" "$@"',
+                                 'fixture', sys.executable, '-I', '-c', code], env=self.env,
+                                cwd=self.root, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('PRIVATE_ARGV_CANARY', result.stdout)
+        self.assertNotIn('private input', result.stdout)
+        self.assertNotIn('unknown', result.stdout)
 
     def test_jevrun_subprocess_from_other_cwd(self):
         (self.root/'priority-hold').write_text(HOLD_TOKEN)

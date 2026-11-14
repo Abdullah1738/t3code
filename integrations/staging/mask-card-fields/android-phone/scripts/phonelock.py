@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import uuid
 
 LOCK_DIR = Path(os.environ.get('PH_LOCK_DIR', '~/.local/share/phone-lock')).expanduser()
 HOLD = LOCK_DIR / 'priority-hold'
@@ -41,8 +42,8 @@ def ttl_seconds(ttl):
         if not match:
             raise ValueError('ttl must be seconds or a duration such as 20m')
         ttl = float(match[1]) * {'': 1, 's': 1, 'm': 60, 'h': 3600}[match[2]]
-    if not 0 < ttl <= MAX_TTL:
-        raise ValueError('ttl must be positive and at most 120m')
+    if not 1 <= ttl <= MAX_TTL:
+        raise ValueError('ttl must be between 1s and 120m')
     return float(ttl)
 
 
@@ -80,6 +81,13 @@ def read_lease():
         lease['purpose'] = safe_purpose(lease['purpose'])
         return lease, raw
     except (ValueError, TypeError, KeyError):
+        # Even a damaged claim cannot be live beyond the maximum lease lifetime
+        # after its last write. Recent corruption stays busy, never stolen.
+        modified = dt.datetime.fromtimestamp(LEASE.stat().st_mtime, dt.timezone.utc)
+        expires = modified + dt.timedelta(seconds=MAX_TTL)
+        if expires <= now():
+            return dict(owner='unknown', purpose='expired unreadable lease', acquired_at=modified.isoformat(),
+                        expires_at=expires.isoformat(), pid=None, invalid=True), raw
         raise Busy('lease metadata unavailable') from None
 
 
@@ -102,6 +110,8 @@ def write_temp(lease):
     try:
         with os.fdopen(fd, 'w') as out:
             json.dump(lease, out)
+            out.flush()
+            os.fsync(out.fileno())
         return Path(path)
     except BaseException:
         os.unlink(path)
@@ -118,7 +128,7 @@ def replace_checked(lease, raw):
         path.unlink(missing_ok=True)
 
 
-def acquire(owner, purpose, ttl=DEFAULT_TTL):
+def acquire(owner, purpose, ttl=DEFAULT_TTL, *, exclusive=False):
     owner_token(owner)
     ttl = ttl_seconds(ttl)
     purpose = safe_purpose(purpose)
@@ -127,11 +137,12 @@ def acquire(owner, purpose, ttl=DEFAULT_TTL):
         if hold_state()[0]:
             raise Busy(HOLD_REASON)
         old, raw = read_lease()
-        if live(old) and old['owner'] != owner:
+        if live(old) and (exclusive or old['owner'] != owner):
             raise Busy(lease_reason(old))
         start = now()
         lease = dict(owner=owner, purpose=purpose, acquired_at=start.isoformat(),
-                     expires_at=(start + dt.timedelta(seconds=ttl)).isoformat(), pid=os.getpid())
+                     expires_at=(start + dt.timedelta(seconds=ttl)).isoformat(), pid=os.getpid(),
+                     lease_id=old.get("lease_id") if live(old) and old.get("lease_id") else uuid.uuid4().hex)
         if old:
             expired = not live(old)
             replace_checked(lease, raw)
@@ -150,14 +161,14 @@ def acquire(owner, purpose, ttl=DEFAULT_TTL):
     return lease
 
 
-def refresh(owner):
+def refresh(owner, *, lease_id=None):
     owner_token(owner)
     with metadata_lock():
         present, own = hold_state()
         if present and not own:
             raise Busy(HOLD_REASON)
         lease, raw = read_lease()
-        if not lease or lease['owner'] != owner:
+        if not lease or lease.get('invalid') or lease['owner'] != owner or (lease_id is not None and lease.get('lease_id') != lease_id):
             raise Busy('lease is not yours')
         ttl = (dt.datetime.fromisoformat(lease['expires_at']) - dt.datetime.fromisoformat(lease['acquired_at'])).total_seconds()
         start = now()
@@ -166,13 +177,13 @@ def refresh(owner):
         return lease
 
 
-def release(owner):
+def release(owner, *, lease_id=None):
     owner_token(owner)
     with metadata_lock():
         lease, raw = read_lease()
         if not lease:
             return
-        if lease['owner'] != owner:
+        if lease.get('invalid') or lease['owner'] != owner or (lease_id is not None and lease.get('lease_id') != lease_id):
             raise Busy('lease is not yours')
         if LEASE.read_text() != raw:
             raise Busy('lease changed; yield')
@@ -208,7 +219,7 @@ def check(action):
         ttl = (dt.datetime.fromisoformat(lease['expires_at']) - dt.datetime.fromisoformat(lease['acquired_at'])).total_seconds()
         if state['seconds_left'] < ttl / 2:
             try:
-                refresh(lease['owner'])
+                refresh(lease['owner'], lease_id=lease.get('lease_id'))
             except (Busy, OSError):
                 return False, 'lease changed; yield'
     # The hold may have been created while reading or refreshing the lease.

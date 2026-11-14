@@ -66,7 +66,8 @@ def adb(*a):
     guard_phone(False)
     return subprocess.run(["adb", "-s", SERIAL, *a], capture_output=True, text=True, check=True).stdout
 def _run(args, t=5, strict=False):
-    if args and args[0] == "adb": guard_phone(False)
+    if args and args[0] == "adb":
+        guard_phone(len(args) > 1 and args[1] in ("kill-server", "start-server"))
     try: return subprocess.run(args, capture_output=True, text=True, timeout=t, check=strict).stdout
     except TimeoutError: raise
     except Exception:
@@ -78,7 +79,11 @@ def doctor(as_json):
     devs = _run(["adb", "devices", "-l"])
     state = {p[0]: p[1] for p in (l.split() for l in devs.splitlines()[1:]) if len(p) > 1}
     if state.get(SERIAL) == "offline":
-        _run(["adb", "kill-server"]); time.sleep(1); _run(["adb", "start-server"], t=15)
+        guard_phone(True)
+        _run(["adb", "kill-server"])
+        time.sleep(1)
+        guard_phone(True)
+        _run(["adb", "start-server"], t=15)
         devs = _run(["adb", "devices", "-l"])
         state = {p[0]: p[1] for p in (l.split() for l in devs.splitlines()[1:]) if len(p) > 1}
     s = state.get(SERIAL)
@@ -431,6 +436,24 @@ class PhoneBusy(Exception):
     pass
 
 
+def process_comm(pid):
+    # macOS ps comm is argv[0], which a caller can rewrite to contain input.
+    # The kernel's executable path supplies a name without trusting that string.
+    try:
+        if sys.platform == "darwin":
+            import ctypes
+            lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+            buf = ctypes.create_string_buffer(4096)
+            if lib.proc_pidpath(pid, buf, len(buf)) <= 0: return "unknown"
+            path = buf.value.decode()
+        else:
+            path = os.readlink(f"/proc/{pid}/exe")
+        name = Path(path).name
+        return name if re.fullmatch(r"[A-Za-z0-9_.+-]{1,80}", name) else "unknown"
+    except Exception:
+        return "unknown"
+
+
 def caller_chain():
     chain, pid = [], os.getppid()
     for _ in range(6):
@@ -439,15 +462,15 @@ def caller_chain():
             result = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)],
                                     capture_output=True, text=True, timeout=1, check=True)
             parent, comm = result.stdout.strip().split(None, 1)
-            chain.append(dict(pid=pid, comm=Path(comm).name, cwd_tail=None))
+            chain.append(dict(pid=pid, comm=process_comm(pid), cwd_tail=None))
             pid = int(parent)
         except Exception: break
     if chain:
         try:
-            result = subprocess.run(["lsof", "-a", "-d", "cwd", "-p", str(chain[-1]["pid"]), "-Fn"],
+            result = subprocess.run(["lsof", "-a", "-d", "cwd", "-p", str(chain[0]["pid"]), "-Fn"],
                                     capture_output=True, text=True, timeout=1, check=True)
             path = next(line[1:] for line in result.stdout.splitlines() if line.startswith("n/"))
-            chain[-1]["cwd_tail"] = "/".join(Path(path).parts[-2:])
+            chain[0]["cwd_tail"] = "/".join(Path(path).parts[-2:])
         except Exception: pass
     return chain
 
@@ -522,6 +545,8 @@ def lease_run(owner, purpose, ttl, args):
     handlers = {}
     received = []
     acquired = False
+    lost_claim = []
+    lease_id = None
     def forward(signum, _frame):
         received.append((signum, time.monotonic()))
         if child is not None:
@@ -529,15 +554,17 @@ def lease_run(owner, purpose, ttl, args):
             except ProcessLookupError: pass
     def heartbeat():
         while not stop.wait(ttl / 3):
-            try: phonelock.refresh(owner)
-            except (phonelock.Busy, OSError):
+            try: phonelock.refresh(owner, lease_id=lease_id)
+            except (phonelock.Busy, OSError) as exc:
+                lost_claim.append(str(exc) if isinstance(exc, phonelock.Busy) else "lease metadata unavailable")
                 # Loss of the claim must stop even direct-adb/u2 children.
                 forward(signal.SIGTERM, None)
                 return
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
             handlers[sig] = signal.signal(sig, forward)
-        phonelock.acquire(owner, purpose, ttl)
+        lease = phonelock.acquire(owner, purpose, ttl, exclusive=True)
+        lease_id = lease["lease_id"]
         acquired = True
         if received: return 128 + received[-1][0]
         child = subprocess.Popen(args, env={**os.environ, "PH_LEASE_OWNER": owner}, start_new_session=True)
@@ -552,6 +579,9 @@ def lease_run(owner, purpose, ttl, args):
                 if received and time.monotonic() - received[0][1] >= 2:
                     try: os.killpg(child.pid, signal.SIGKILL)
                     except ProcessLookupError: pass
+        if lost_claim:
+            refuse(lost_claim[0])
+            return 5
         return code if code >= 0 else 128 - code
     finally:
         stop.set()
@@ -565,7 +595,7 @@ def lease_run(owner, purpose, ttl, args):
                 except ProcessLookupError: pass
                 child.wait()
         if acquired:
-            try: phonelock.release(owner)
+            try: phonelock.release(owner, lease_id=lease_id)
             except (phonelock.Busy, OSError): pass
         for sig, handler in handlers.items(): signal.signal(sig, handler)
 
@@ -603,7 +633,7 @@ def run(argv):
     # These local diagnostics have their own bounded adb calls and must never reset u2.
     if cmd == "lease":
         return lease_cli(argv[1:])
-    if cmd in ("log", "note-drop", "help"):
+    if cmd in ("log", "note-drop", "help") or argv[0] == "-h":
         main(argv)
         return 0
     previous = signal.signal(signal.SIGALRM, _alarm)
