@@ -49,6 +49,7 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
 
   let body: React.ReactNode;
   if (boardId === "") body = <EmptyLine label="This link does not open a board." />;
+  else if (state?.board.archivedAt != null) body = <EmptyLine label="This link does not open a board." />;
   else if (state === undefined)
     body = feed.failure ? (
       <FeedError what="the board" feed={feed} nowMs={nowMs} />
@@ -107,11 +108,11 @@ function BoardScreen({ route }: StaticScreenProps<KanbanBoardParams | undefined>
   return (
     <View collapsable={false} className="flex-1 bg-screen" style={{ paddingTop: headerInset }}>
       <AppBar
-        title={state?.board.name ?? "Board"}
+        title={state?.board.archivedAt === null ? state.board.name : "Board"}
         sidebar={false}
         onBack={() => navigation.goBack()}
         actions={
-          state
+          state?.board.archivedAt === null
             ? [
                 {
                   accessibilityLabel: unread > 0 ? `Discussions, ${unread} unread` : "Discussions",
