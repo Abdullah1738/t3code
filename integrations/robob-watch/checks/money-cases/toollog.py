@@ -40,7 +40,8 @@ _ENUMS = {
     'kind': {'refund', 'dispute', 'decline', 'unasked_charge', 'charge', 'hold',
              'payment_deadline', 'autopay_expected', 'merchant_card'},
     'starved_by': {'none', 'owner_threads', 'msgs', 'lookups', 'census', 'receipt',
-                   'reconcile', 'follow', 'attention', 'build_write'},
+                   'reconcile', 'follow', 'attention', 'build_write', 'merchants', 'order_charges',
+                   'payments', 'questions', 'refunds', 'order_screen', 'loads', 'writes', 'locks'},
     'slowestPhase': {'reconcile', 'follow', 'attention', 'build_write'},
     'state': {'unknown', 'placed', 'ordered', 'shipped', 'preparing', 'picked up', 'out for delivery',
               'nearby', 'delivered', 'cancelled', 'pending confirmation'},
@@ -48,6 +49,8 @@ _ENUMS = {
 _ENUMS['from'] = _ENUMS['to'] = _ENUMS['state']
 _BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered'}
 _NUMBERS = {'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
+            'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
+            'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'locks_ms', 'follow_ms', 'untimed_ms',
             'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms'}
 _CASE_FIELDS = {'merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline',
                 'due', 'why', 'who', 'watchers', 'note', 'because', 'reply', 'source'}
@@ -57,6 +60,8 @@ _MONEY_PROPS = {
     'case.close': {'kind', 'ageDays'},
     'question.ask': {'outcome'},
     'check.run': {'budgetHit', 'openCases', 'fired', 'slowestPhase', 'sourceLimits', 'limitKinds', 'orderCoverage', 'chargeCensus',
+                  'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
+                  'order_screen_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'locks_ms', 'follow_ms', 'untimed_ms',
                   'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms', 'starved_by'},
 }
 _COMMANDS = {'test-talabat-shops', 'capabilities', 'restaurant-cart-contract', 'item-options', 'cart',
