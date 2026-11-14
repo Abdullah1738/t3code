@@ -131,9 +131,12 @@ export class ControlClient {
     return data;
   }
 
-  /** Checks the token and returns the latest event sequence. */
-  health() {
-    return this.request("GET", "/health");
+  /**
+   * Checks the token and returns the latest event sequence.
+   * @param {{ timeoutMs?: number, signal?: AbortSignal }} [options]
+   */
+  health(options) {
+    return this.request("GET", "/health", undefined, options);
   }
 
   /**
