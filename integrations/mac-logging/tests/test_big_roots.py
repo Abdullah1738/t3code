@@ -73,7 +73,7 @@ class BigRootTests(unittest.TestCase):
             (self.big/child).mkdir()
         jobs.directory_inventory([self.big], run)
         self.assertEqual(jobs.read_state('disk-inventory')['sizes'][str(self.big)], 84*1024)
-        self.assertTrue(self.rows('disk.inventory.source')[-1]['ok'])
+        self.assertFalse(self.rows('disk.inventory.root')[-1]['props']['partial'])
 
     def test_partial_coverage_cannot_become_a_grower(self):
         for value, partial in [(1, True), (100, False), (200, True), (300, False), (400, False)]:

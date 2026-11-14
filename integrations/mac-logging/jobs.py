@@ -308,11 +308,82 @@ def inventory_status(cache, entries, listed, now, completed=0, failures=0, fresh
         ageS=max((now-value['at'] for value in cached), default=0)), children
 
 
+class InventoryLog:
+    def __init__(self, root, cache=None):
+        self.previous_sizes = {}
+        pending = list((cache or {}).items())
+        while pending:
+            key, value = pending.pop()
+            if not isinstance(value, dict):
+                continue
+            if number(value.get('bytes')):
+                self.previous_sizes[key] = value['bytes']
+            if isinstance(value.get('parts'), dict):
+                pending.extend(value['parts'].items())
+        self.root = str(root)
+        self.measured = set()
+        self.elapsed_ms = 0
+        self.slowest_ms = 0
+        self.slowest_path = None
+
+    def timing(self, key, elapsed_ms):
+        if self.slowest_path is None or elapsed_ms > self.slowest_ms:
+            self.slowest_ms, self.slowest_path = elapsed_ms, key
+
+    def child(self, key, size, previous, elapsed_ms, partial=False, denied=0, code=0):
+        # Diagnostics are never sampled, including legacy ok=true partial rows.
+        # Batch timing is amortized: du does not report individual durations.
+        try:
+            if str(Path(key).parent) == self.root:
+                self.measured.add(key)
+            self.timing(key, elapsed_ms)
+            # Expiry/decomposition can discard bytes before the refresh ends.
+            old = self.previous_sizes.get(key, previous.get('bytes') if isinstance(previous, dict) else None)
+            changed = (abs(size-old) >= 1024**3 or abs(size-old)*5 >= old) if number(old) and old > 0 else (
+                size > 0 if old == 0 else size >= 1024**3)
+            if partial or denied or changed or elapsed_ms >= 10000:
+                emit('disk', 'event', 'disk.inventory.source', ok=True,
+                     props=dict(source=key, bytes=size, partial=partial, deniedCount=denied,
+                                exitCode=code, elapsedMs=elapsed_ms))
+        except Exception:
+            pass
+
+    def root_event(self, cache, total, status, skip_reason=None):
+        try:
+            props = dict(root=self.root, source=self.root, childrenMeasured=len(self.measured),
+                         childrenCached=sum(number(v.get('bytes')) for v in cache.values()),
+                         childrenPartial=sum(v.get('partial') is not False or bool(v.get('limited'))
+                                             for v in cache.values()),
+                         unmeasuredCount=status['unmeasuredCount'], partial=status['partial'],
+                         elapsedMs=self.elapsed_ms, slowestChildMs=self.slowest_ms)
+            if skip_reason is not None:
+                props['skipReason'] = skip_reason
+            if self.slowest_path is not None:
+                props['slowestChildPath'] = self.slowest_path
+            if any(number(v.get('bytes')) for v in cache.values()) or not status['partial']:
+                props['bytes'] = total
+            emit('disk', 'event', 'disk.inventory.root', props=props)
+        except Exception:
+            pass
+
+
+def inventory_skipped_logs(roots, previous, reason):
+    for root in roots:
+        try:
+            cache = previous.get('childState', {}).get(str(root), {})
+            inventory_clean_cache(cache, time.time())
+            total, status, _ = inventory_status(cache, [], False, time.time())
+            InventoryLog(root, cache).root_event(cache, total, status, reason)
+        except Exception:
+            pass
+
+
 def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_only=False, refresh_only=False,
                        deep=False, checkpoint=None, attempted=None, max_batches=None, single_paths=None,
                        parts_mode=False, metrics=None, turn_seconds=None, part_work=None,
-                       due_at=None, descend=True):
+                       due_at=None, descend=True, inventory_log=None):
     cache = {} if cache is None else cache
+    inventory_log = inventory_log if inventory_log is not None else InventoryLog(path, cache)
     single_paths = set() if single_paths is None else single_paths
     part_work = {} if part_work is None else part_work
     now = time.time()
@@ -367,7 +438,7 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
             if not descend:
                 selected = selected[1:]
                 continue
-            more = inventory_parts(first, run, deadline, cache, checkpoint, entries, listed, metrics, part_work)
+            more = inventory_parts(first, run, deadline, cache, checkpoint, entries, listed, metrics, part_work, inventory_log)
             if attempted is not None and not more:
                 attempted.add(first.path)
             selected = selected[1:]
@@ -436,14 +507,14 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
                 partial = bool(denied or uncertain or kind(entry) is None)
                 hints = {k: cache[key][k] for k in ('slow', 'limited') if partial and k in cache.get(key, {})}
                 hints.update({k: cache[key][k] for k in ('timeouts', 'lastTimeoutAt') if k in cache.get(key, {})})
+                previous_value = cache.get(key, {})
                 cache[key] = dict(bytes=size, at=time.time(), attemptedAt=time.time(), partial=partial,
                                   deniedCount=denied if key == values[0][0] else 0, isDirectory=kind(entry),
                                   **({'elapsedMs': (time.monotonic()-started)*1000/len(batch)} if deep else {}), **hints)
                 done.add(key)
                 completed += 1
-                emit('disk', 'event', 'disk.inventory.source', ok=True,
-                     props=dict(source=key, bytes=size, partial=partial, deniedCount=denied,
-                                exitCode=code, elapsedMs=(time.monotonic()-started)*1000))
+                inventory_log.child(key, size, previous_value, (time.monotonic()-started)*1000/(1 if partial else len(batch)),
+                                    partial, denied, code)
             if len(done) != len(batch):
                 raise SourceFailure('timeout' if code is None else 'missing-total',
                                     'source command timed out' if code is None else 'du did not print a child total', code)
@@ -476,6 +547,7 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
                     value['slow'] = True
                     if allowance == 60:
                         value['limited'] = True
+            inventory_log.timing(unfinished.path, max(0, (time.monotonic()-started)*1000))
             source_error('disk', 'disk.inventory.source', unfinished.path, started, exc)
         finally:
             if attempted is not None:
@@ -512,8 +584,10 @@ def big_root_inventory(path, run, deadline, cache=None, listing=None, pending_on
     return inventory_status(cache, entries, listed, time.time(), completed, failures, freshness_s)
 
 
-def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, metrics, part_work):
+def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, metrics, part_work, inventory_log=None):
+    inventory_log = inventory_log if inventory_log is not None else InventoryLog(Path(entry.path).parent, cache)
     value = cache[entry.path]
+    previous_value = dict(value)
     value.update(partial=True, attemptedAt=time.time())
     # A previous whole-child measurement must not masquerade as the sum of an
     # unfinished decomposition, even when the process dies at the next command.
@@ -531,6 +605,7 @@ def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, me
     try:
         own = deadline_call(deadline, os.lstat, entry.path)
     except Exception as exc:
+        inventory_log.timing(entry.path, max(0, (time.monotonic()-started)*1000))
         source_error('disk', 'disk.inventory.source', entry.path, started, exc)
         if checkpoint:
             checkpoint(*inventory_status(cache, entries, listed, time.time()))
@@ -540,6 +615,7 @@ def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, me
             total, denied, code = du_total(Path(entry.path), run, max(0, deadline-time.monotonic()))
             if not denied:
                 value.update(bytes=total, at=time.time(), partial=False, isDirectory=False, deniedCount=0)
+                inventory_log.child(entry.path, total, previous_value, (time.monotonic()-started)*1000)
                 value.pop('limited', None)
                 value.pop('slow', None)
                 for field in ('parts', 'partsDone', 'partsTotal'):
@@ -552,10 +628,12 @@ def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, me
                     metrics['timeouts'] += 1
                     metrics['secondsInTimeouts'] += time.monotonic()-started
             source_error('disk', 'disk.inventory.source', entry.path, started, exc)
+        inventory_log.timing(entry.path, max(0, (time.monotonic()-started)*1000))
         if checkpoint:
             checkpoint(*inventory_status(cache, entries, listed, time.time()))
         return False
     part_entries, part_listed = inventory_listing(entry.path, min(deadline, time.monotonic()+2))
+    inventory_log.timing(entry.path, max(0, (time.monotonic()-started)*1000))
     if part_listed:
         present = {part.path for part in part_entries}
         for key in set(parts)-present:
@@ -580,9 +658,10 @@ def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, me
     try:
         big_root_inventory(Path(entry.path), run, deadline, parts, (part_entries, True),
             deep=True, checkpoint=save_parts, max_batches=1, parts_mode=True, metrics=metrics,
-            attempted=work['attempted'], single_paths=work['singles'])
+            attempted=work['attempted'], single_paths=work['singles'], inventory_log=inventory_log)
     finally:
         work['seconds'] += time.monotonic()-started
+        inventory_log.timing(entry.path, work['seconds']*1000)
         if metrics is not None:
             metrics['partsMeasured'] += sum(v.get('at') != before.get(key) and number(v.get('at'))
                                             for key, v in parts.items())
@@ -598,6 +677,7 @@ def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, me
         # Aggregation can expire this total during sibling work before the
         # scheduler sees it; retain the completion milestone for requeueing.
         work['completed'] = True
+        inventory_log.child(entry.path, total, previous_value, work['seconds']*1000)
         value.pop('limited', None)
         value.pop('slow', None)
     except Exception as exc:
@@ -616,6 +696,7 @@ def directory_inventory(paths=None, run=subprocess.run, deadline=None):
         previous = read_state('disk-inventory')
         roots = list(DIRECTORY_ROOTS if paths is None else paths)
         sizes, partials = previous.get('sizes', {}), previous.get('partials', {})
+        inventory_skipped_logs(roots, previous, 'deep_pass_running')
         emit('disk', 'perf', 'disk.inventory', duration_ms=(time.monotonic()-started)*1000,
              props=dict(duMode=previous.get('duMode'), skipReason='deep_pass_running',
                         count=len(sizes), bytes=sum(sizes.values()),
@@ -656,13 +737,15 @@ def _directory_inventory(paths=None, run=subprocess.run, deadline=None):
             listings[key] = ([], False)
             source_error('disk', 'disk.inventory.source', path, started, exc)
     roots.sort(key=lambda p: (attempts[str(p)], len(listings[str(p)][0])))
-    turn = 0
+    inventory_logs = {str(path): InventoryLog(path, child_state[str(path)]) for path in roots}
     def scan(path, stop, pending_only=False, refresh_only=False):
-        nonlocal turn
         key = str(path)
-        turn += 1
-        emit('disk', 'event', 'disk.inventory.turn', props=dict(source=key, turn=turn))
-        total, status, measured = big_root_inventory(path, run, stop, child_state[key], listings[key], pending_only, refresh_only)
+        scan_started = time.monotonic()
+        try:
+            total, status, measured = big_root_inventory(path, run, stop, child_state[key], listings[key],
+                pending_only, refresh_only, inventory_log=inventory_logs[key])
+        finally:
+            inventory_logs[key].elapsed_ms += max(0, (time.monotonic()-scan_started)*1000)
         flags[key], children[key] = status, measured
         if measured or not status['partial']:
             sizes[key] = total
@@ -729,8 +812,9 @@ def _directory_inventory(paths=None, run=subprocess.run, deadline=None):
             source_error('disk','disk.inventory.source',path,started,
                          SourceFailure('partial','directory total is incomplete'),
                          dict(status, **({'bytes': sizes[key]} if key in sizes else {})))
-        else:
+        elif status['partial']:
             emit('disk','event','disk.inventory.source',ok=True,props=dict(source=key,bytes=sizes[key],**status))
+        inventory_logs[key].root_event(child_state[key], total, status)
     save_state('disk-inventory',dict(previous, at=time.time(),duMode='links',sizes=sizes,partials=partials,children=children,
         sourceErrors=errors,attemptedAt=attempts,childState=child_state))
     cached = [v for cache in child_state.values() for v in cache.values() if 'bytes' in v]
