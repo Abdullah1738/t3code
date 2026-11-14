@@ -1036,6 +1036,19 @@ const EVALUATOR_ERRORS_TITLE = "Evaluator errors";
 // gets its evaluator woken once: a card made by an evaluator wakes nobody else.
 const STEP_WAIT_P1_MS = 15 * 60_000;
 const STEP_WAIT_MS = 60 * 60_000;
+const waitingOnSystemStall = (card: KanbanCard) =>
+  card.stalled?.by._tag === "system" &&
+  card.activeThreadId === null &&
+  card.settledAt === null &&
+  card.priority !== KANBAN_BACKLOG &&
+  !Waits.waitSkipsNudge(card) &&
+  !Waits.decidingHolds(card);
+const stallWakeMarker = (at: string) => `System stall surfaced to evaluator (flagged ${at})`;
+const STALL_WAKE_PREFIX = "kanban-stall:";
+const stallWakeKey = (card: KanbanCard) => `${STALL_WAKE_PREFIX}${card.id}:${card.stalled!.at}`;
+const systemStallDue = (card: KanbanCard, now: number) =>
+  waitingOnSystemStall(card) &&
+  now - Date.parse(card.stalled!.at) >= (card.priority === 1 ? STEP_WAIT_P1_MS : STEP_WAIT_MS);
 const waitingOnEvaluatorStep = (card: KanbanCard) =>
   card.stage === "todo" &&
   !kanbanWorkStep(card) &&
@@ -4496,11 +4509,17 @@ const make = Effect.gen(function* () {
         return yield* failWith("invalid", "the evaluator discussion must be on this board");
     }
     const key = extra.key ?? (yield* ownerDeliveryKey) ?? uuid();
-    if (purpose.kind === "discussion" && extra.answer === undefined) {
+    // A stall wake has its own eligibility and delivery key; never merge it into an owner job.
+    if (
+      purpose.kind === "discussion" &&
+      extra.answer === undefined &&
+      !key.startsWith(STALL_WAKE_PREFIX)
+    ) {
       const pending =
         (yield* tickSql<EvaluatorQueueRow>`SELECT * FROM ardud_kanban_evaluator_queue WHERE board_id = ${board.id}
           AND ((${extra.cardId ?? null} IS NOT NULL AND card_id = ${extra.cardId ?? null}) OR
             (json_extract(json, '$.purpose.kind') = 'discussion' AND json_extract(json, '$.purpose.discussionId') = ${purpose.discussionId}))
+          AND job_key NOT LIKE 'kanban-stall:%'
           AND done_at IS NULL AND started_at IS NULL AND json_extract(json, '$.extra.answer') IS NULL ORDER BY id LIMIT 1`)[0];
       if (pending && pending.job_key !== key) {
         // @effect-diagnostics-next-line preferSchemaOverJson:off -- queue rows are written by this method.
@@ -4636,6 +4655,35 @@ const make = Effect.gen(function* () {
       // Deliver its retained text there before considering another spawn.
       // @effect-diagnostics-next-line preferSchemaOverJson:off -- only written by admitEvaluator.
       const job = JSON.parse(row.json) as EvaluatorJob;
+      if (row.job_key.startsWith(STALL_WAKE_PREFIX)) {
+        const card = row.card_id ? yield* store.card(KanbanCardId.make(row.card_id)) : null;
+        const discussion =
+          job.purpose.kind === "discussion"
+            ? yield* store.discussion(KanbanDiscussionId.make(job.purpose.discussionId))
+            : null;
+        if (
+          !card ||
+          card.stalled?.by._tag !== "system" ||
+          card.settledAt !== null ||
+          stallWakeKey(card) !== row.job_key
+        ) {
+          yield* locks.access(
+            boardId,
+            tickSql`UPDATE ardud_kanban_evaluator_queue SET done_at = ${yield* nowIso} WHERE id = ${row.id}`,
+            true,
+            "evaluator-queue",
+          );
+          continue;
+        }
+        if (!discussion || discussion.settledAt !== null || discussion.archivedAt !== null)
+          continue;
+        const board = yield* boardOf(boardId);
+        if (
+          !systemStallDue(card, yield* nowMillis) ||
+          (board.pause && !board.pause.keep.includes(card.id))
+        )
+          continue;
+      }
       if (job.extra.answer) {
         const expected = job.extra.answer;
         const message = yield* store.message(expected.discussionId, expected.seq);
@@ -10884,7 +10932,7 @@ const make = Effect.gen(function* () {
             // flag means it is waiting outside the board, so there is nothing to do until the
             // flag clears; the in-memory woken bit would otherwise be lost on a restart.
             for (const initial of yield* cardsForPlan) {
-              if (!waitingOnEvaluatorStep(initial)) {
+              if (!waitingOnSystemStall(initial) && !waitingOnEvaluatorStep(initial)) {
                 yield* forgetStepWait(initial.id);
                 continue;
               }
@@ -10894,31 +10942,60 @@ const make = Effect.gen(function* () {
                   const card = yield* store.card(initial.id);
                   if (!card) return;
 
-                  if (!waitingOnEvaluatorStep(card)) {
+                  const stalled = waitingOnSystemStall(card);
+                  if (!stalled && !waitingOnEvaluatorStep(card)) {
                     yield* forgetStepWait(card.id);
                     return;
                   }
-                  const key = Subtasks.subtaskIds(kanbanStepSubtasks(card, "evaluator"));
-                  const wait = (yield* Ref.get(stepWaits)).get(card.id);
-                  if (wait === undefined || wait.key !== key) {
-                    yield* Ref.update(stepWaits, (all) =>
-                      new Map(all).set(card.id, { key, since: now, woken: false }),
-                    );
-                    return;
+                  if (stalled && board.pause && !board.pause.keep.includes(card.id)) return;
+                  const key = stalled
+                    ? `stall:${card.stalled!.at}`
+                    : Subtasks.subtaskIds(kanbanStepSubtasks(card, "evaluator"));
+                  const previousWait = (yield* Ref.get(stepWaits)).get(card.id);
+                  // Stall age survives restarts; a recorded wake also survives temporary waits.
+                  const wait =
+                    previousWait?.key === key
+                      ? previousWait
+                      : {
+                          key,
+                          since: stalled ? Date.parse(card.stalled!.at) : now,
+                          woken:
+                            stalled &&
+                            (yield* store.cardEvents(card.id)).some(
+                              (event) =>
+                                event.kind === "comment" &&
+                                event.body?.startsWith(stallWakeMarker(card.stalled!.at)),
+                            ),
+                        };
+                  if (wait !== previousWait) {
+                    yield* Ref.update(stepWaits, (all) => new Map(all).set(card.id, wait));
+                    if (!stalled) return;
                   }
                   const limit = card.priority === 1 ? STEP_WAIT_P1_MS : STEP_WAIT_MS;
                   if (wait.woken || now - wait.since < limit) return;
                   const current = yield* store.card(card.id);
                   const currentWait = (yield* Ref.get(stepWaits)).get(card.id);
-                  if (current !== null && !waitingOnEvaluatorStep(current)) {
+                  if (
+                    current !== null &&
+                    !(stalled ? waitingOnSystemStall(current) : waitingOnEvaluatorStep(current))
+                  ) {
                     yield* forgetStepWait(card.id);
                     return;
                   }
                   if (
                     current === null ||
-                    Subtasks.subtaskIds(kanbanStepSubtasks(current, "evaluator")) !== key ||
+                    (stalled
+                      ? `stall:${current.stalled!.at}`
+                      : Subtasks.subtaskIds(kanbanStepSubtasks(current, "evaluator"))) !== key ||
                     currentWait !== wait ||
                     now - wait.since < (current.priority === 1 ? STEP_WAIT_P1_MS : STEP_WAIT_MS)
+                  )
+                    return;
+                  const currentBoard = yield* boardOf(current.boardId);
+                  if (
+                    stalled &&
+                    currentBoard.pause &&
+                    !currentBoard.pause.keep.includes(current.id)
                   )
                     return;
                   const minutes = Math.round((now - wait.since) / 60_000);
@@ -10931,12 +11008,29 @@ const make = Effect.gen(function* () {
                         ? Effect.succeed(false)
                         : toEvaluator(
                             discussion,
-                            Briefs.evaluatorStepWaitingText(current, minutes),
+                            stalled
+                              ? `Card #${current.number} has been system-stalled for ${minutes} minutes with no thread or wait: ${current.stalled!.reason}. Check the blocker and clear the flag or park the card with card_wait.`
+                              : Briefs.evaluatorStepWaitingText(current, minutes),
                             true,
                             undefined,
-                            undefined,
-                            undefined,
-                            `step:${current.id}`,
+                            stalled ? stallWakeKey(current) : undefined,
+                            stalled
+                              ? Effect.gen(function* () {
+                                  const latest = yield* store.card(current.id);
+                                  const board = yield* boardOf(current.boardId);
+                                  const talk = yield* store.discussion(discussion.id);
+                                  return (
+                                    talk !== null &&
+                                    talk.settledAt === null &&
+                                    talk.archivedAt === null &&
+                                    latest !== null &&
+                                    systemStallDue(latest, yield* nowMillis) &&
+                                    stallWakeKey(latest) === stallWakeKey(current) &&
+                                    (!board.pause || board.pause.keep.includes(latest.id))
+                                  );
+                                })
+                              : undefined,
+                            stalled ? undefined : `step:${current.id}`,
                           ).pipe(Effect.as(true)),
                     ),
                     Effect.catchCause((cause) =>
@@ -10953,6 +11047,16 @@ const make = Effect.gen(function* () {
                     ),
                   );
                   if (woke) {
+                    if (stalled) {
+                      yield* logEvent(
+                        current,
+                        { _tag: "system", component: "dispatcher" },
+                        "comment",
+                        {
+                          body: `${stallWakeMarker(current.stalled!.at)}: #${current.number}, ${minutes} minutes; ${current.stalled!.reason}`,
+                        },
+                      );
+                    }
                     yield* Ref.update(stepWaits, (all) =>
                       new Map(all).set(card.id, { ...wait, woken: true }),
                     );
@@ -13438,6 +13542,21 @@ const make = Effect.gen(function* () {
         const ownReviewHandoff =
           role === "cardThread" &&
           isUnattachedOwnThread(card, actor, ["in_review", "completed", "needs_review"]);
+        const answeredRunStall =
+          to === "needs_review" &&
+          role === "cardThread" &&
+          actor._tag === "thread" &&
+          card.workThreadId === actor.threadId &&
+          // A queued review's system flag belongs to its reviewer, not the old worker.
+          (card.stage === "todo" || card.stage === "working") &&
+          (card.activeThreadId === null ||
+            (card.activeThreadId === actor.threadId && card.activeRole === "work")) &&
+          card.stalled?.by._tag === "system" &&
+          card.stalled.by.component === "dispatcher" &&
+          ["Stale queued runs on the thread", "Run went silent twice"].includes(
+            card.stalled.reason,
+          );
+        const clearNote = `Cleared system stall: ${card.stalled?.reason}; the card's own work thread submitted it for review.`;
         if (role === "cardThread") {
           if (actor._tag !== "thread" || card.activeThreadId !== actor.threadId) {
             if (
@@ -13548,6 +13667,11 @@ const make = Effect.gen(function* () {
             ...moveOptions,
             note: `${options!.note!.trim()}\nThe earlier clear${reviewed ? ` at ${reviewed}` : ""} no longer counts; review restarted.`,
           };
+        }
+        if (answeredRunStall) {
+          source = { ...source, stalled: null };
+          yield* logEvent(source, actor, "flagged", { body: "Cleared" });
+          yield* logEvent(source, actor, "comment", { body: clearNote });
         }
         const moved = yield* moveUnlocked(source, to, role, actor, moveOptions);
         const deferred = yield* effectSink;
