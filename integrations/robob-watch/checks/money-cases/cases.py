@@ -3001,9 +3001,13 @@ def payment_entries(cases, now, sent, pending=False):
 
 @log_scope
 def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
-    diagnostic = {'budgetHit': False, 'openCases': 0, 'fired': 0, 'ok': False, 'slowest': 'reconcile'}
+    diagnostic = {'budgetHit': False, 'openCases': 0, 'fired': 0, 'ok': False,
+                  'slowest': 'reconcile', 'started': time.time()}
     try:
-        return _run_check(wd, run, data, root, now, find, said, diagnostic=diagnostic)
+        event = _run_check(wd, run, data, root, now, find, said, diagnostic=diagnostic)
+        # Exceptions and incomplete work (lookup/lock timeouts, follow-up errors or an unsaved outbox) are not ok.
+        diagnostic['ok'] = diagnostic.get('complete', True)
+        return event
     finally:
         try:
             # The check owns the start and timing samples; logging adds no second timer.
@@ -3018,8 +3022,7 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
 
 
 def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *, diagnostic):
-    started = time.time()
-    diagnostic['started'] = started
+    started = diagnostic['started']
     end = started + CHECK_BUDGET
     # Reserve a second for the final save, which still has the whole-check deadline.
     work_end = end - 1
@@ -3213,7 +3216,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
         # The old pings file is intact; never emit an event without its committed outbox.
         event = ''
     result = timing()
-    diagnostic.update(result, ok=saved and not state.get('question_errors', {}).get('errors'),
+    diagnostic.update(result, complete=saved and not state.get('question_errors', {}).get('errors'),
                       fired=int(bool(event)))
     if not saved or result['total_s'] > 20:
         print('money-cases timing: ' + json.dumps({**result, 'pings_saved': saved}, sort_keys=True), file=sys.stderr)
