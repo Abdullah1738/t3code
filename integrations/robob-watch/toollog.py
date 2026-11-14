@@ -186,23 +186,56 @@ def _retention(root, today):
             pass
 
 
+def _repair_tail(fd):
+    # Called under the exclusive log lock: an interrupted row must not absorb the next one.
+    size = os.fstat(fd).st_size
+    if size and os.pread(fd, 1, size - 1) != b'\n':
+        end = size
+        while end:
+            start = max(0, end - 4096)
+            block = os.pread(fd, end - start, start)
+            if len(block) != end - start:
+                raise OSError('incomplete log tail read')
+            newline = block.rfind(b'\n')
+            if newline >= 0:
+                end = start + newline + 1
+                break
+            end = start
+        os.ftruncate(fd, end)
+        size = end
+    return size
+
+
+def _append_row(fd, row):
+    size = os.fstat(fd).st_size
+    complete = False
+    try:
+        complete = os.write(fd, row) == len(row)
+        return complete
+    finally:
+        # Keep complete rows intact on short writes, exceptions and interruptions.
+        if not complete:
+            os.ftruncate(fd, size)
+
+
 def emit(component, name, kind='event', duration_ms=None, ok=None, props=None, tag=None, run_id=None, rejected=None):
+    """Return whether the requested row was fully appended; logging never raises."""
     try:
         if component not in COMPONENTS or name not in SCHEMAS or kind not in ('event', 'perf', 'error'):
-            return
+            return False
         now = utcnow()
         root = log_dir()
         if root is None:
-            return
+            return False
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         root.chmod(0o700)
         path = root / (now.date().isoformat() + '.ndjson')
-        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
         try:
             os.fchmod(fd, 0o600)
             # Never wait for another writer, and never lock across tool work.
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            size = os.fstat(fd).st_size
+            size = _repair_tail(fd)
             if size == 0:
                 _retention(root, now.date())
             if size >= CAP_BYTES:
@@ -212,14 +245,16 @@ def emit(component, name, kind='event', duration_ms=None, ok=None, props=None, t
                     pass
                 else:
                     os.close(marker)
-                    os.write(fd, _line(component, 'log.cap', 'error', None, False, {}, 'cap_reached', None, now))
+                    if not _append_row(fd, _line(component, 'log.cap', 'error', None, False, {}, 'cap_reached', None, now)):
+                        return False
                 if kind != 'error':
-                    return
-            os.write(fd, _line(component, name, kind, duration_ms, ok, props, tag, run_id, now, rejected))
+                    return False
+            row = _line(component, name, kind, duration_ms, ok, props, tag, run_id, now, rejected)
+            return _append_row(fd, row)
         finally:
             os.close(fd)
     except BaseException:
-        pass
+        return False
 
 
 class Span:
@@ -285,6 +320,23 @@ def run(component, argv=None, name='cli.run'):
         return Span(component, name, props)
     except BaseException:
         return contextlib.nullcontext()
+
+
+def snoozed(component, count, state, now):
+    """Record count changes and a Dubai-day heartbeat; caller persists its state."""
+    try:
+        if component not in {'meds-nag', 'gym-nudge', 'nutrition-nudge'} or type(count) is not int or not 0 <= count <= 10**9:
+            return False
+        day = now.astimezone(dt.timezone(dt.timedelta(hours=4))).date().isoformat()
+        marker = {'day': day, 'count': count}
+        if state.get('_toollogSnoozed') == marker:
+            return False
+        if not emit(component, 'nag.snoozed', props={'count': count}):
+            return False
+        state['_toollogSnoozed'] = marker
+        return True
+    except BaseException:
+        return False
 
 
 def conflicts(rows):
