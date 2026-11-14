@@ -5,6 +5,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as SavedWrite from "../engine/savedWrite.ts";
 
 import {
   KanbanAutomation,
@@ -362,9 +363,7 @@ const make = Effect.gen(function* () {
   };
 
   yield* BoardsDatabase.initialize(
-    initializeKanbanSchema(sql).pipe(
-      Effect.andThen(ensureKanbanCacheVersions(sql)),
-    ),
+    initializeKanbanSchema(sql).pipe(Effect.andThen(ensureKanbanCacheVersions(sql))),
   ).pipe(Effect.mapError(fail("create tables")));
 
   const readCounters = Context.Reference<
@@ -474,7 +473,7 @@ const make = Effect.gen(function* () {
       operation,
       Effect.suspend(() => {
         const counters: Record<string, { hits: number; misses: number; evictions: number }> = {};
-        return NodeSqliteClient.readOnly(effect).pipe(
+        return SavedWrite.stage(NodeSqliteClient.readOnly(effect), "read").pipe(
           Effect.provideService(readCounters, counters),
           Effect.ensuring(
             Effect.suspend(() =>
