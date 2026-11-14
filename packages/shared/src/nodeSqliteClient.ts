@@ -1265,6 +1265,7 @@ interface WriterSetupStatement {
 }
 interface WriterAttachment extends WriterSetupStatement {
   readonly schema: string;
+  readonly filename: string;
 }
 interface WriterPragma {
   readonly schema: string;
@@ -1362,10 +1363,16 @@ let schemaDirty = false;
 let attachmentsDirty = false;
 let pendingAttachment;
 let openingFailed = false;
+let unsupportedConfiguration = false;
+let availablePragmas;
+const pendingPragmas = new Set();
 const attachmentStatements = new Map((workerData.attachments ?? []).map(entry => [entry.schema, entry]));
 const setupPragmas = new Set(["busy_timeout", "foreign_keys", "defer_foreign_keys", "synchronous",
   "fullfsync", "checkpoint_fullfsync", "journal_size_limit", "cache_size", "temp_store", "mmap_size",
-  "wal_autocheckpoint", "query_only", "recursive_triggers", "trusted_schema", "locking_mode"]);
+  "wal_autocheckpoint", "query_only", "recursive_triggers", "trusted_schema", "locking_mode",
+  "ignore_check_constraints", "automatic_index", "reverse_unordered_selects", "read_uncommitted",
+  "count_changes", "short_column_names", "full_column_names", "cell_size_check", "legacy_alter_table",
+  "cache_spill", "secure_delete", "analysis_limit", "threads", "max_page_count", "journal_mode"]);
 const setupActions = [constants.SQLITE_CREATE_TEMP_TABLE, constants.SQLITE_CREATE_TEMP_INDEX,
   constants.SQLITE_CREATE_TEMP_TRIGGER, constants.SQLITE_CREATE_TEMP_VIEW,
   constants.SQLITE_DROP_TEMP_TABLE, constants.SQLITE_DROP_TEMP_INDEX,
@@ -1374,7 +1381,10 @@ const memorySchemaActions = [constants.SQLITE_CREATE_TABLE, constants.SQLITE_CRE
   constants.SQLITE_CREATE_TRIGGER, constants.SQLITE_CREATE_VIEW,
   constants.SQLITE_DROP_TABLE, constants.SQLITE_DROP_INDEX, constants.SQLITE_DROP_TRIGGER, constants.SQLITE_DROP_VIEW,
   constants.SQLITE_CREATE_VTABLE, constants.SQLITE_DROP_VTABLE];
-const localPragmas = new Set(["application_id", "auto_vacuum", "journal_mode", "schema_version", "user_version"]);
+const localPragmas = new Set(["application_id", "auto_vacuum", "encoding", "page_size", "journal_mode", "schema_version", "user_version"]);
+const argumentPragmas = new Set(["table_info", "table_xinfo", "table_list", "index_info", "index_xinfo",
+  "index_list", "foreign_key_list", "foreign_key_check", "integrity_check", "quick_check",
+  "optimize", "incremental_vacuum", "wal_checkpoint"]);
 const errorReply = (id, error, operation, extra = {}) => parentPort.postMessage({ id, ...extra, error: {
   operation, message: String(error.message || error), code: error.code,
   errcode: error.errcode, errstr: error.errstr,
@@ -1397,6 +1407,9 @@ try {
     } else if (code === constants.SQLITE_PRAGMA) {
       const name = action?.toLowerCase();
       activeClassification.configuration ||= argument !== null && setupPragmas.has(name);
+      if (argument !== null && !setupPragmas.has(name) && !localPragmas.has(name) && !argumentPragmas.has(name)) {
+        (activeClassification.unknownPragmas ??= new Set()).add(name);
+      }
       activeClassification.schema ||= name === "temp_store" && argument !== null;
       activeClassification.journalMode ||= name === "journal_mode" && argument !== null;
       activeClassification.write ||= name === "optimize" || name === "incremental_vacuum" ||
@@ -1412,6 +1425,10 @@ try {
     statement.setReadBigInts(true);
     if (statement.columns().length) statement.all(...entry.params);
     else statement.run(...entry.params);
+    if (entry.filename !== undefined) {
+      const attached = db.prepare("PRAGMA database_list").all().find(row => row.name === entry.schema);
+      if (attached?.file !== entry.filename) throw new Error("SQLite attachment identity changed during recovery");
+    }
   }
   if (workerData.setup?.length) {
     memorySchemas = new Set(db.prepare("PRAGMA database_list").all()
@@ -1442,7 +1459,7 @@ const volatileSchema = () => {
     const quoted = quoteIdentifier(schema);
     const shadows = new Set(db.prepare("PRAGMA " + quoted + ".table_list").all()
       .filter(entry => entry.type === "shadow").map(entry => entry.name));
-    const rows = db.prepare("SELECT name, type, sql FROM " + quoted + ".sqlite_schema WHERE sql IS NOT NULL ORDER BY rowid").all();
+    const rows = db.prepare("SELECT name AS name, type AS type, sql AS sql FROM " + quoted + ".sqlite_schema WHERE sql IS NOT NULL ORDER BY rowid").all();
     for (const row of rows) {
       if (row.name.startsWith("sqlite_") || shadows.has(row.name)) continue;
       // sqlite_schema stores CREATE statements without their schema qualifier.
@@ -1460,7 +1477,7 @@ const observeConnectionState = () => {
     const present = new Set(current.filter(entry => entry.name !== "main" && entry.name !== "temp").map(entry => entry.name));
     for (const name of attachmentStatements.keys()) if (!present.has(name)) attachmentStatements.delete(name);
     if (pendingAttachment) for (const name of present) {
-      if (!attachmentStatements.has(name)) attachmentStatements.set(name, { schema: name, ...pendingAttachment });
+      if (!attachmentStatements.has(name)) attachmentStatements.set(name, { schema: name, filename: current.find(entry => entry.name === name).file, ...pendingAttachment });
     }
     pendingAttachment = undefined;
     attachmentsDirty = false;
@@ -1488,6 +1505,7 @@ const observeConnectionState = () => {
 let recoveryFailureReported = false;
 let recoveryFailureCause;
 const recoverySnapshot = (classification, sql, params) => {
+  for (const name of classification?.unknownPragmas ?? []) pendingPragmas.add(name);
   if (classification?.attachment || typeof db.setAuthorizer !== "function") {
     attachmentsDirty = true;
     const head = sql?.replace(/^(?:[;\\s]|--[^\\n]*(?:\\n|$)|\\/\\*[\\s\\S]*?\\*\\/)+/, "");
@@ -1497,14 +1515,20 @@ const recoverySnapshot = (classification, sql, params) => {
   // stood after the user's SQL, rather than letting metadata reads consume it.
   let deferBefore;
   try {
+    if (pendingPragmas.size) {
+      availablePragmas ??= new Set(db.prepare("PRAGMA pragma_list").all().map(row => row.name));
+      for (const name of pendingPragmas) if (availablePragmas.has(name)) unsupportedConfiguration = true;
+      pendingPragmas.clear();
+    }
     if (deferredForeignKeys || configurationDirty)
       deferBefore = Boolean(db.prepare("PRAGMA defer_foreign_keys").get().defer_foreign_keys);
     const snapshot = observeConnectionState();
     if (deferBefore !== undefined && snapshot.settings) snapshot.settings = snapshot.settings.map(entry =>
       entry.name === "defer_foreign_keys" ? { ...entry, value: deferBefore ? 1 : 0 } : entry);
-    const ready = !attachmentsDirty && (!recoveryFailureReported || (!configurationDirty && !schemaDirty));
-    if (ready) { recoveryFailureReported = false; recoveryFailureCause = undefined; }
-    return { ...snapshot, recoveryReady: ready };
+    const observed = !attachmentsDirty && (!recoveryFailureReported || (!configurationDirty && !schemaDirty));
+    if (observed) { recoveryFailureReported = false; recoveryFailureCause = undefined; }
+    // Unreadable settings and missing classification cannot be reconstructed safely.
+    return { ...snapshot, recoveryReady: observed && !unsupportedConfiguration && typeof db.setAuthorizer === "function" };
   } catch (cause) {
     // Metadata failure must not turn a successful COMMIT into a failed write.
     if (!recoveryFailureReported) parentPort.postMessage({ type: "recovery-error", error: {

@@ -105,7 +105,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
             sqlitePrototype.prepare = function(sql, ...args) {
               if (virtualClock !== undefined) {
                 if (sql === timedSql) virtualClock += 100;
-                if (sql.startsWith("SELECT name, type, sql FROM ")) virtualClock += 5000;
+                if (sql.startsWith("SELECT name AS name, type AS type, sql AS sql FROM ")) virtualClock += 5000;
               }
               if (attachmentDeferralFailures > 0 && sql === "PRAGMA defer_foreign_keys") {
                 attachmentDeferralFailures--;
@@ -115,7 +115,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
                 attachmentMetadataFailures--;
                 throw new Error("test attachment metadata failure");
               }
-              if (metadataFailures > 0 && sql.startsWith("SELECT name, type, sql FROM ")) {
+              if (metadataFailures > 0 && sql.startsWith("SELECT name AS name, type AS type, sql AS sql FROM ")) {
                 metadataFailures--;
                 throw new Error("test metadata read failure");
               }
@@ -2415,6 +2415,11 @@ it.effect("keeps automatic checkpoints when mutation classification is unavailab
           yield* sql`CREATE TABLE fallback(value INTEGER)`;
           yield* sql.withTransaction(sql`INSERT INTO fallback VALUES (1)`);
           assert.deepEqual(yield* sql`SELECT value FROM fallback`, [{ value: 1 }]);
+          const count = writerWorkers.length;
+          yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+          const failed = yield* sql`SELECT value FROM fallback`.pipe(Effect.flip);
+          assert.include(String(failed.reason.cause), "connection state could not be observed");
+          assert.equal(writerWorkers.length, count);
         }),
       ),
     (descriptor) =>
@@ -4130,6 +4135,167 @@ it.effect.each([-1, 0, 1048576, 9007199254740993n])(
     ),
 );
 
+it.effect.each([false, true])(
+  "checks the acknowledged identity of a computed attachment during recovery (bound=%s)",
+  (bound) =>
+    withFileClient((sql, filename) =>
+      Effect.gen(function* () {
+        const a = `${filename}.a`;
+        const b = `${filename}.b`;
+        for (const [path, value] of [
+          [a, "A"],
+          [b, "B"],
+        ] as const) {
+          const native = yield* openDatabase(path);
+          native.exec(`CREATE TABLE entries(value TEXT); INSERT INTO entries VALUES ('${value}')`);
+        }
+        yield* sql`CREATE TABLE locations(id INTEGER, path TEXT)`;
+        yield* sql`INSERT INTO locations VALUES (1, ${a})`;
+        yield* sql.unsafe(
+          bound
+            ? "ATTACH DATABASE (SELECT path FROM locations WHERE id=?) AS archive"
+            : "ATTACH DATABASE (SELECT path FROM locations WHERE id=1) AS archive",
+          bound ? [1] : [],
+        );
+        yield* sql`UPDATE locations SET path=${b}`;
+        assert.deepEqual(yield* sql`SELECT value FROM archive.entries`.values, [["A"]]);
+        yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+        const failed = yield* sql`SELECT value FROM archive.entries`.pipe(Effect.flip);
+        assert.equal(failed.reason.operation, "open");
+        assert.include(String(failed.reason.cause), "attachment identity changed");
+        const main = yield* openDatabase(filename);
+        main.prepare("UPDATE locations SET path=?").run(a);
+        assert.deepEqual(yield* sql`SELECT value FROM archive.entries`.values, [["A"]]);
+      }),
+    ),
+);
+
+it.effect("preserves a read-only URI attachment when its identity is verified", () =>
+  withFileClient((sql, filename) =>
+    Effect.gen(function* () {
+      const path = `${filename}.archive`;
+      const native = yield* openDatabase(path);
+      native.exec("CREATE TABLE entries(value INTEGER); INSERT INTO entries VALUES (1)");
+      yield* sql`ATTACH DATABASE ${`file:${path}?mode=ro`} AS archive`;
+      const before = yield* sql`INSERT INTO archive.entries VALUES (2)`.pipe(Effect.flip);
+      assert.include(String(before.reason.cause), "readonly");
+      yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+      assert.deepEqual(yield* sql`SELECT value FROM archive.entries`.values, [[1]]);
+      const after = yield* sql`INSERT INTO archive.entries VALUES (2)`.pipe(Effect.flip);
+      assert.include(String(after.reason.cause), "readonly");
+    }),
+  ),
+);
+
+it.effect("preserves effective CHECK constraint enforcement through writer recovery", () =>
+  withFileClient((sql) =>
+    Effect.gen(function* () {
+      yield* sql`PRAGMA ignore_check_constraints=ON`;
+      yield* sql`CREATE TABLE positive(value INTEGER CHECK(value>0))`;
+      yield* sql`INSERT INTO positive VALUES (-1)`;
+      yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+      assert.deepEqual(yield* sql`PRAGMA ignore_check_constraints`.values, [[1]]);
+      yield* sql`INSERT INTO positive VALUES (-2)`;
+      yield* sql`PRAGMA ignore_check_constraints=OFF`;
+      const failed = yield* sql`INSERT INTO positive VALUES (-3)`.pipe(Effect.flip);
+      assert.equal(failed.reason._tag, "ConstraintError");
+      yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+      assert.deepEqual(yield* sql`PRAGMA ignore_check_constraints`.values, [[0]]);
+      assert.deepEqual(yield* sql`SELECT value FROM positive ORDER BY value`.values, [[-2], [-1]]);
+    }),
+  ),
+);
+
+it.effect.each([
+  ["automatic_index", 0],
+  ["reverse_unordered_selects", 1],
+  ["read_uncommitted", 1],
+  ["count_changes", 1],
+  ["short_column_names", 0],
+  ["full_column_names", 1],
+  ["cell_size_check", 1],
+  ["legacy_alter_table", 1],
+  ["cache_spill", 0],
+  ["secure_delete", 1],
+  ["analysis_limit", 37],
+  ["threads", 2],
+  ["max_page_count", 1000],
+] as const)("restores effective connection pragma %s=%s", (name, value) =>
+  withFileClient(
+    (sql) =>
+      Effect.gen(function* () {
+        yield* sql.unsafe(`PRAGMA ${name}=${value}`);
+        const before = yield* sql.unsafe(`PRAGMA ${name}`).values;
+        assert.isNotEmpty(before);
+        yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+        assert.deepEqual(yield* sql.unsafe(`PRAGMA ${name}`).values, before);
+      }),
+    { readerWorker: false },
+  ),
+);
+
+it.effect.each(["delete", "truncate", "persist", "memory", "off", "wal"] as const)(
+  "restores effective file journal mode %s",
+  (mode) =>
+    withFileClient(
+      (sql) =>
+        Effect.gen(function* () {
+          yield* sql.unsafe(`PRAGMA journal_mode=${mode}`);
+          const before = yield* sql`PRAGMA journal_mode`.values;
+          yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+          assert.deepEqual(yield* sql`PRAGMA journal_mode`.values, before);
+        }),
+      { readerWorker: false },
+    ),
+);
+
+it.effect.each(["temp", "scratch"] as const)(
+  "keeps recovery metadata stable with full qualified column names (%s)",
+  (schema) =>
+    withFileClient((sql) =>
+      Effect.gen(function* () {
+        if (schema === "scratch") yield* sql`ATTACH DATABASE ':memory:' AS scratch`;
+        yield* sql`PRAGMA short_column_names=OFF`;
+        yield* sql`PRAGMA full_column_names=ON`;
+        yield* sql.unsafe(`CREATE TABLE ${schema}.entries(value INTEGER)`);
+        yield* sql.unsafe(`INSERT INTO ${schema}.entries VALUES (1)`);
+        yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+        assert.deepEqual(yield* sql`PRAGMA short_column_names`.values, [[0]]);
+        assert.deepEqual(yield* sql`PRAGMA full_column_names`.values, [[1]]);
+        yield* sql.unsafe(`INSERT INTO ${schema}.entries VALUES (2)`);
+        assert.deepEqual(yield* sql.unsafe(`SELECT value FROM ${schema}.entries`).values, [[2]]);
+      }),
+    ),
+);
+
+it.effect("refuses recovery after a supported setting whose effective value cannot be read", () =>
+  withFileClient((sql) =>
+    Effect.gen(function* () {
+      yield* sql`PRAGMA case_sensitive_like=ON`;
+      assert.deepEqual(yield* sql`SELECT 'a' LIKE 'A' AS value`.values, [[0]]);
+      const count = writerWorkers.length;
+      yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+      const failed = yield* sql`SELECT 'a' LIKE 'A' AS value`.pipe(Effect.flip);
+      assert.include(String(failed.reason.cause), "connection state could not be observed");
+      assert.equal(writerWorkers.length, count);
+    }),
+  ),
+);
+
+it.effect(
+  "keeps recovery available after ignored pragmas and argument-bearing metadata reads",
+  () =>
+    withFileClient((sql) =>
+      Effect.gen(function* () {
+        yield* sql`CREATE TABLE pragma_entries(value INTEGER)`;
+        yield* sql`PRAGMA unknown_test_setting=ON`;
+        yield* sql`PRAGMA table_info(pragma_entries)`;
+        yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+        assert.deepEqual(yield* sql`SELECT COUNT(*) AS count FROM pragma_entries`.values, [[0]]);
+      }),
+    ),
+);
+
 it.effect.each(
   (["scratch", "aux"] as const).flatMap((target) =>
     (["scratch first", "aux first"] as const).flatMap((order) =>
@@ -4170,7 +4336,8 @@ it.effect.each([
   "db.commit.boundary",
 ])("keeps worker acknowledgement and errors intact when %s annotation throws", (attribute) => {
   let enabled = false;
-  let thrown = 0;
+  let committing = false;
+  let commitThrows = 0;
   let commits = 0;
   const tracer = Tracer.make({
     span: (options) => {
@@ -4179,7 +4346,7 @@ it.effect.each([
       span.attribute = (key, value) => {
         annotate(key, value);
         if (enabled && key === attribute) {
-          thrown++;
+          if (committing) commitThrows++;
           throw new Error("test annotation failure");
         }
       };
@@ -4191,16 +4358,31 @@ it.effect.each([
       Effect.gen(function* () {
         yield* sql`CREATE TABLE annotation_entries(value INTEGER UNIQUE)`;
         enabled = true;
-        yield* sql.withTransaction(sql`INSERT INTO annotation_entries VALUES (1)`).pipe(
-          Effect.provideService(SqliteClient.TransactionCommitObserver, () => {
-            commits++;
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const connection = yield* sql.reserve;
+            const execute = (statement: string) =>
+              connection
+                .executeUnprepared(statement, [], undefined)
+                .pipe(Effect.withSpan("annotation-statement"));
+            yield* execute("BEGIN");
+            yield* execute("INSERT INTO annotation_entries VALUES (1)");
+            committing = true;
+            yield* execute("COMMIT").pipe(
+              Effect.provideService(SqliteClient.TransactionCommitObserver, () => {
+                commits++;
+              }),
+            );
+            committing = false;
+            assert.equal(commits, 1);
+            assert.isAbove(commitThrows, 0);
+            const failed = yield* execute("INSERT INTO annotation_entries VALUES (1)").pipe(
+              Effect.flip,
+            );
+            assert.equal(failed.reason._tag, "UniqueViolation");
+            yield* execute("INSERT INTO annotation_entries VALUES (2)");
           }),
         );
-        assert.equal(commits, 1);
-        assert.isAbove(thrown, 0);
-        const failed = yield* sql`INSERT INTO annotation_entries VALUES (1)`.pipe(Effect.flip);
-        assert.equal(failed.reason._tag, "ConstraintError");
-        yield* sql`INSERT INTO annotation_entries VALUES (2)`;
         enabled = false;
         yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
         assert.deepEqual(yield* sql`SELECT value FROM annotation_entries ORDER BY value`.values, [
