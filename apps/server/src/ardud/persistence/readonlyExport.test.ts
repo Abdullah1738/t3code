@@ -4,6 +4,7 @@ import * as NodePath from "node:path";
 import * as NodeOS from "node:os";
 import * as NodeSqlite from "node:sqlite";
 import * as NodeWorkerThreads from "node:worker_threads";
+import * as NodeChildProcess from "node:child_process";
 import { afterEach, expect, test, vi } from "vite-plus/test";
 import { createReadonlyReplica } from "./readonlyExport.ts";
 import { resolveHistoryBasePath } from "./historySourceFiles.ts";
@@ -14,7 +15,7 @@ afterEach(() => {
   for (const cleanup of cleanups.splice(0).toReversed()) cleanup();
 });
 
-function fixture(batchSize = 2) {
+function fixture(batchSize = 2, setup?: (source: NodeSqlite.DatabaseSync) => void) {
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "readonly-export-"));
   cleanups.push(() => NodeFS.rmSync(dir, { recursive: true, force: true }));
   const sourcePath = NodePath.join(dir, "source.sqlite");
@@ -44,6 +45,7 @@ function fixture(batchSize = 2) {
   cleanups.push(() => {
     if (source.isOpen) source.close();
   });
+  setup?.(source);
   const options = { sourcePath, replicaPath, batchSize };
   let exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, options);
   cleanups.push(() => exporter.close());
@@ -299,6 +301,9 @@ for (const mode of ["reopen", "staging", "catchup"] as const) {
         )
         .all();
       const events = out.prepare("SELECT * FROM orchestration_events ORDER BY sequence").all();
+      const auxiliaryRows = out.prepare(`SELECT * FROM ${name}`).all();
+      const auxiliarySchema = metaValue(out, `schema:${name}`);
+      const lastRefresh = metaValue(out, "last_aux_schema_refresh");
       const revision = metaValue(out, "lineage_repair_revision");
       const rebuild = metaValue(out, "last_rebuild_reason");
       const generation = Number(metaValue(out, "generation"));
@@ -344,14 +349,21 @@ for (const mode of ["reopen", "staging", "catchup"] as const) {
           .prepare("SELECT * FROM ardud_readonly_meta WHERE key LIKE 'identity_%' ORDER BY key")
           .all(),
       ).toEqual(identity);
-      expect(JSON.parse(String(metaValue(out, "last_aux_schema_refresh"))).tables).toEqual([name]);
+      expect(metaValue(out, "last_aux_schema_refresh")).toBe(lastRefresh);
+      expect(metaValue(out, `schema:${name}`)).toBe(auxiliarySchema);
+      expect(out.prepare(`SELECT * FROM ${name}`).all()).toEqual(auxiliaryRows);
       let steps = 0;
       while (f.exporter.step()) {
         expect(metaValue(out, "ready")).toBe("1");
         expect(Number(metaValue(out, "generation"))).toBe(currentGeneration);
         expect(metaValue(out, "lineage_repair_revision")).toBe(revision);
+        expect(out.prepare(`SELECT * FROM ${name}`).all()).toEqual(auxiliaryRows);
+        expect(metaValue(out, `schema:${name}`)).toBe(auxiliarySchema);
+        expect(metaValue(out, "last_aux_schema_refresh")).toBe(lastRefresh);
         if (++steps > 500) throw new Error("export did not converge");
       }
+      expect(JSON.parse(String(metaValue(out, "last_aux_schema_refresh"))).tables).toEqual([name]);
+      expect(metaValue(out, `schema:${name}`)).toContain("cache_version");
       expect(out.prepare(`SELECT ${key}, cache_version FROM ${name}`).all()).toEqual([
         { [key]: "task", cache_version: 7 },
       ]);
@@ -369,6 +381,147 @@ for (const mode of ["reopen", "staging", "catchup"] as const) {
     },
   );
 }
+
+test.each(["bootstrap", "reset"])(
+  "auxiliary schema changes publish atomically during %s recovery",
+  (mode) => {
+    const f = fixture();
+    if (mode === "reset") f.finish();
+    for (const { name, row } of auxiliaryTables) {
+      f.source.exec(`INSERT INTO ${name} VALUES (${row});
+        ALTER TABLE ${name} ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 0;
+        UPDATE ${name} SET cache_version=7`);
+    }
+    if (mode === "reset")
+      f.source.exec(
+        "INSERT INTO orchestration_events VALUES (4,'thread.metadata-updated','a','{}')",
+      );
+    expect(f.exporter.step()).toBe(true);
+    const out = f.connect();
+    expect(metaValue(out, "ready")).toBe("0");
+    // Pending schemas must also survive reopening an incomplete publication.
+    f.restart();
+    let steps = 0;
+    while (f.exporter.step()) {
+      expect(metaValue(out, "ready")).toBe("0");
+      if (++steps > 500) throw new Error("export did not converge");
+    }
+    expect(metaValue(out, "ready")).toBe("1");
+    expect(metaValue(out, "last_rebuild_reason")).toBeUndefined();
+    for (const { name } of auxiliaryTables)
+      expect(out.prepare(`SELECT cache_version FROM ${name}`).all()).toEqual([
+        { cache_version: 7 },
+      ]);
+  },
+);
+
+const reaperProtections = (replicaPath: string) => {
+  const reader = NodeChildProcess.spawnSync(
+    "/usr/bin/python3",
+    [
+      "-I",
+      "-c",
+      `
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import backend, robob_readonly
+with robob_readonly.state_ro(sys.argv[2]) as con:
+    robob_readonly.ready_generation(con)
+    print(json.dumps({
+        "scheduled": sorted(backend.scheduled_task_session_ids(con)),
+        "kanban": sorted(backend.kanban_session_ids(con)),
+    }))
+`,
+      NodePath.resolve(import.meta.dirname, "../../../../../integrations/memory-system/src"),
+      replicaPath,
+    ],
+    { encoding: "utf8", timeout: 5000 },
+  );
+  if (reader.error) throw reader.error;
+  if (reader.status !== 0) throw new Error(reader.stderr);
+  return JSON.parse(reader.stdout);
+};
+
+test.each(["reopen", "midrun", "restart", "failed_publish"])(
+  "real reaper readers retain task/card/thread/import protections during schema refresh (%s)",
+  (mode) => {
+    const f = fixture(2, (source) =>
+      source.exec(`
+      ALTER TABLE orchestration_v2_projection_messages ADD COLUMN role TEXT;
+      ALTER TABLE orchestration_v2_projection_messages ADD COLUMN created_at TEXT;
+      ALTER TABLE orchestration_v2_projection_messages ADD COLUMN thread_id TEXT;
+      INSERT INTO scheduled_tasks VALUES ('task','a');
+      INSERT INTO ardud_opencode_import VALUES ('ses_import','a');
+      INSERT INTO ardud_kanban_cards VALUES ('card','b','{"workThreadId":"b","settledAt":null}');
+      INSERT INTO ardud_kanban_threads VALUES ('c',0);
+      INSERT INTO orchestration_v2_projection_provider_threads VALUES ('p-b','{"nativeThreadRef":{"nativeId":"ses_card"}}','b');
+      INSERT INTO orchestration_v2_projection_provider_threads VALUES ('p-c','{"nativeThreadRef":{"nativeId":"ses_link"}}','c');
+    `),
+    );
+    f.finish();
+    const out = f.connect();
+    const expected = { scheduled: ["ses_import"], kanban: ["ses_card", "ses_link"] };
+    const checkReader = () => {
+      expect(metaValue(out, "ready")).toBe("1");
+      expect(reaperProtections(f.options.replicaPath)).toEqual(expected);
+    };
+    checkReader();
+    // A reader holding a WAL snapshot keeps its complete old schema and rows.
+    const snapshot = f.connect();
+    snapshot.exec("BEGIN");
+    const oldTasks = snapshot.prepare("SELECT * FROM scheduled_tasks").all();
+    for (const { name } of auxiliaryTables)
+      f.source.exec(`ALTER TABLE ${name} ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 0;
+        UPDATE ${name} SET cache_version=7`);
+    if (mode === "reopen") f.restart();
+    else f.exporter.pollIdentities();
+    checkReader();
+    if (mode === "restart") {
+      f.exporter.step();
+      f.restart();
+      checkReader();
+    }
+    if (mode === "failed_publish") {
+      const writable = new NodeSqlite.DatabaseSync(f.options.replicaPath);
+      cleanups.push(() => writable.close());
+      writable.exec(`CREATE TRIGGER reject_publication BEFORE INSERT ON orchestration_events
+        BEGIN SELECT RAISE(ABORT, 'blocked publication'); END`);
+      expect(() => f.finish()).toThrow("blocked publication");
+      checkReader();
+      expect(metaValue(out, "last_aux_schema_refresh")).toBeUndefined();
+      expect(
+        out
+          .prepare("PRAGMA table_info(scheduled_tasks)")
+          .all()
+          .map((row) => row.name),
+      ).not.toContain("cache_version");
+      writable.exec("DROP TRIGGER reject_publication");
+      f.restart();
+      checkReader();
+    }
+    let steps = 0;
+    while (f.exporter.step()) {
+      checkReader();
+      if (++steps > 500) throw new Error("export did not converge");
+    }
+    checkReader();
+    for (const { name } of auxiliaryTables)
+      expect(out.prepare(`SELECT cache_version FROM ${name}`).all()).toEqual([
+        { cache_version: 7 },
+      ]);
+    expect(snapshot.prepare("SELECT * FROM scheduled_tasks").all()).toEqual(oldTasks);
+    expect(
+      snapshot
+        .prepare("PRAGMA table_info(scheduled_tasks)")
+        .all()
+        .map((row) => row.name),
+    ).not.toContain("cache_version");
+    snapshot.exec("ROLLBACK");
+    expect(snapshot.prepare("SELECT cache_version FROM scheduled_tasks").get()?.cache_version).toBe(
+      7,
+    );
+  },
+);
 
 test("auxiliary schemas in the split boards database refresh without a main schema change", () => {
   const f = fixture();
@@ -400,11 +553,15 @@ test("auxiliary schemas in the split boards database refresh without a main sche
   expect(metaValue(out, "generation")).toBe(generation);
   expect(metaValue(out, "lineage_repair_revision")).toBe(revision);
   expect(f.source.prepare("PRAGMA schema_version").get()).toEqual(mainVersion);
+  expect(metaValue(out, "last_aux_schema_refresh")).toBeUndefined();
+  expect(out.prepare("SELECT * FROM ardud_kanban_cards").all()).toEqual([
+    { id: "card", active_thread_id: "a", json: "{}" },
+  ]);
+  drive(exporter);
   expect(JSON.parse(String(metaValue(out, "last_aux_schema_refresh"))).tables).toEqual([
     "ardud_kanban_cards",
     "ardud_kanban_threads",
   ]);
-  drive(exporter);
   expect(out.prepare("SELECT id,cache_version FROM ardud_kanban_cards").all()).toEqual([
     { id: "card", cache_version: 3 },
   ]);

@@ -465,18 +465,18 @@ export function createReadonlyReplica(
         );
       }
     };
+    const pendingAuxiliarySchemas = new Map<string, (typeof sourceTables)[number]>();
     const refreshAuxiliarySchemas = (changed: typeof sourceTables) => {
-      transaction(() => {
-        for (const table of changed) {
-          out.exec(`DROP TABLE IF EXISTS ${q(table.name)}`);
-          createExportedTable(table);
-          meta(`schema:${table.name}`, table.schema);
-        }
-        meta(
-          "last_aux_schema_refresh",
-          JSON.stringify({ tables: changed.map(({ name }) => name), at: new Date().toISOString() }),
-        );
-      });
+      // applyAuxiliary runs inside the publication transaction, including first bootstrap.
+      for (const table of changed) {
+        out.exec(`DROP TABLE IF EXISTS ${q(table.name)}`);
+        createExportedTable(table);
+        meta(`schema:${table.name}`, table.schema);
+      }
+      meta(
+        "last_aux_schema_refresh",
+        JSON.stringify({ tables: changed.map(({ name }) => name), at: new Date().toISOString() }),
+      );
     };
     // A replaced source, a changed projection or a regressed event history cannot be
     // caught up incrementally. Rebuild in place instead of refusing every open
@@ -555,7 +555,7 @@ export function createReadonlyReplica(
           .run();
       });
     } else {
-      if (changedTables.length) refreshAuxiliarySchemas(changedTables);
+      for (const table of changedTables) pendingAuxiliarySchemas.set(table.name, table);
       if (storedSource !== undefined && storedSource !== identity) meta("source", identity);
     }
     if (!getMeta("sequence"))
@@ -581,7 +581,7 @@ export function createReadonlyReplica(
         db: NodeSqlite.DatabaseSync;
         columns: string[];
         primary: string;
-        upsert: NodeSqlite.StatementSync;
+        upsert: NodeSqlite.StatementSync | undefined;
       }
     >();
     const sourceSchemas = new Map<string, string>();
@@ -616,9 +616,13 @@ export function createReadonlyReplica(
       // Journal fences must include events already moved out of main, too.
       Math.max(...threadEventSources.map((statement) => Number(statement.get(threadId)?.n ?? 0)));
     const configureTable = ({ name, db, schema }: (typeof sourceTables)[number]) => {
-      meta(`schema:${name}`, schema);
       sourceSchemas.set(name, schema);
-      createExportedTable({ name, db, schema });
+      // Keep the previous complete auxiliary table and schema marker visible
+      // until its replacement rows publish; reapers trust those rows while ready=1.
+      if (!pendingAuxiliarySchemas.has(name)) {
+        meta(`schema:${name}`, schema);
+        createExportedTable({ name, db, schema });
+      }
       const info = db.prepare(`PRAGMA table_info(${q(name)})`).all();
       const columns = info.map((row) => String(row.name));
       const primary = String(info.find((row) => row.pk === 1)?.name ?? "");
@@ -629,14 +633,17 @@ export function createReadonlyReplica(
         db,
         columns,
         primary,
-        // Identical rows are left alone: each cycle re-reads the small tables
-        // (75 MB of kanban card JSON on 10 Nov), and rewriting every unchanged
-        // row turned that into 75 MB of replica WAL per cycle.
-        upsert: out.prepare(
-          `INSERT INTO ${q(name)} (${columns.map(q).join(",")}) VALUES (${columns.map(() => "?").join(",")}) ON CONFLICT(${q(primary)}) DO UPDATE SET ${values
-            .map((c) => `${q(c)}=excluded.${q(c)}`)
-            .join(",")} WHERE ${values.map((c) => `${q(c)} IS NOT excluded.${q(c)}`).join(" OR ")}`,
-        ),
+        // Auxiliary rows go through staging, so their new columns need not
+        // exist in main until the publication transaction swaps the table.
+        upsert: auxiliary.includes(name)
+          ? undefined
+          : out.prepare(
+              `INSERT INTO ${q(name)} (${columns.map(q).join(",")}) VALUES (${columns.map(() => "?").join(",")}) ON CONFLICT(${q(primary)}) DO UPDATE SET ${values
+                .map((c) => `${q(c)}=excluded.${q(c)}`)
+                .join(
+                  ",",
+                )} WHERE ${values.map((c) => `${q(c)} IS NOT excluded.${q(c)}`).join(" OR ")}`,
+            ),
       });
     };
     for (const table of sourceTables) configureTable(table);
@@ -650,7 +657,7 @@ export function createReadonlyReplica(
           .prepare(`DELETE FROM ${q(name)} WHERE ${q(table.primary)}=?`)
           .run(row[table.primary]!).changes;
       } else {
-        const changes = table.upsert.run(...table.columns.map((c) => row[c]!)).changes;
+        const changes = table.upsert!.run(...table.columns.map((c) => row[c]!)).changes;
         if (name.endsWith("_turn_items"))
           out
             .prepare(
@@ -729,6 +736,8 @@ export function createReadonlyReplica(
     };
     const auxiliaryStages = new Map(auxiliary.map((name) => [name, createAuxiliaryStage(name)]));
     const applyAuxiliary = () => {
+      if (pendingAuxiliarySchemas.size)
+        refreshAuxiliarySchemas([...pendingAuxiliarySchemas.values()]);
       for (const name of auxiliary) {
         const { stage } = auxiliaryStages.get(name)!;
         const { primary, columns } = tables.get(name)!;
@@ -1063,8 +1072,8 @@ export function createReadonlyReplica(
           // Discard pending diffs before changing their table shapes. The last
           // published projections and lineage stay readable while auxiliary pages refill.
           abortCycle();
-          refreshAuxiliarySchemas(changed);
           for (const table of changed) {
+            pendingAuxiliarySchemas.set(table.name, table);
             configureTable(table);
             out.exec(`DROP TABLE temp.${q(auxiliaryStages.get(table.name)!.stage)}`);
             auxiliaryStages.set(table.name, createAuxiliaryStage(table.name));
@@ -1431,6 +1440,7 @@ export function createReadonlyReplica(
       if (cycleTransaction) {
         commitCycle();
       }
+      pendingAuxiliarySchemas.clear();
       identitySequence = Math.max(identitySequence, cycleTarget!);
       cycleTarget = undefined;
       auxiliaryIndex = 0;
