@@ -140,7 +140,8 @@ class ToolLogTests(unittest.TestCase):
         self.assertEqual(result['okRate'], .99)
         self.assertEqual(result['errorRate'], .01)
         self.assertEqual(result['durationMs']['cli.run'], {'p50': 50, 'p95': 95, 'max': 100})
-        self.assertEqual(result['topErrors'], [{'tag': 'io_error', 'count': 1, 'sampleId': 'a' * 32}])
+        self.assertEqual(result['topErrors'], [{'tag': 'io_error', 'count': 1, 'sampleId': 'a' * 32,
+                                              'exceptionClass': None, 'exitCode': None}])
         self.assertEqual(result['malformedCount'], 1)
         self.assertEqual(stat.S_IMODE(next(self.root.glob('rollup-*.json')).stat().st_mode), 0o600)
 
