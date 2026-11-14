@@ -144,6 +144,95 @@ class ToolLogTests(unittest.TestCase):
         self.assertEqual(result['malformedCount'], 1)
         self.assertEqual(stat.S_IMODE(next(self.root.glob('rollup-*.json')).stat().st_mode), 0o600)
 
+    def test_nag_outcome_schema_and_daily_rollup(self):
+        now = dt.datetime(2026, 11, 13, 20, 1, tzinfo=dt.timezone.utc)
+        with mock.patch.object(log, 'utcnow', return_value=now):
+            for latency in range(1, 101):
+                log.emit('took', 'nag.resolved', props={'slotKind': 'morning', 'nagCount': 3,
+                    'firstNagToTookSeconds': latency, 'snoozeCount': 1, 'lateMinutes': 5,
+                    'med': 'PRIVATE_MED', 'dose': 'PRIVATE_DOSE', 'site': 'PRIVATE_SITE'}, run_id='a' * 32)
+            log.emit('meds-nag', 'nag.day_end', props={
+                'slotsDue': 5, 'slotsTaken': 3, 'slotsOpen': 2, 'nagsSent': 4})
+            log.emit('took', 'nag.resolved', props={'slotKind': 'PRIVATE_MED',
+                'nagCount': True, 'firstNagToTookSeconds': -1, 'snoozeCount': '3', 'lateMinutes': 1.5})
+            result = log.rollup('2026-11-13')
+        self.assertEqual(result['nag'], {'firstNagToTookSeconds': {
+            'median': 50.5, 'p95': 95, 'samples': 100}, 'openSlotsByDay': {'2026-11-13': 2}})
+        raw = ''.join(p.read_text() for p in self.root.iterdir())
+        for secret in ('PRIVATE_MED', 'PRIVATE_DOSE', 'PRIVATE_SITE'):
+            self.assertNotIn(secret, raw)
+        self.assertNotIn('props', self.rows()[-1])
+
+    def test_cadence_and_nag_rollups_coexist_for_all_day_shapes(self):
+        intervals = {'meds-nag': 300, 'gym-nudge': 300, 'nutrition-nudge': 300,
+                     'nutrition-checkin': 300, 'whoop-sync': 3600, 'forge-workouts': 600}
+        config = Path(self.temp.name) / 'expected.json'
+        config.write_text(json.dumps({'expected': intervals}))
+        start = dt.datetime(2026, 11, 13, tzinfo=dt.timezone.utc)
+        def row(seconds, component, name, props=None):
+            return {'ts': (start + dt.timedelta(seconds=seconds)).isoformat(), 'tool': 'health',
+                    'component': component, 'kind': 'event', 'name': name, 'props': props or {}}
+        outcomes = [row(72010, 'took', 'nag.resolved', {'firstNagToTookSeconds': value})
+                    for value in (30, 90)]
+        outcomes.append(row(72060, 'meds-nag', 'nag.day_end',
+                            {'slotsDue': 3, 'slotsTaken': 1, 'slotsOpen': 2, 'nagsSent': 4}))
+        hole = [row(t, 'meds-nag', 'watcher.run') for t in range(0, 86400, 300)
+                if not 3600 < t < 14400]
+        steady = [row(t, 'gym-nudge', 'watcher.run') for t in range(0, 86400, 300)]
+        scenarios = [('hole_and_steady', hole + steady + outcomes, 86400),
+                     ('single_run', [row(43200, 'meds-nag', 'watcher.run')] + outcomes, 86400),
+                     ('empty', [], 86400), ('absent', None, 86400),
+                     ('current_day', [row(0, 'meds-nag', 'watcher.run')], 3600)]
+        for name, rows, elapsed in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / 'logs'
+                if rows is not None:
+                    root.mkdir()
+                    (root / '2026-11-13.ndjson').write_text(
+                        ''.join(json.dumps(value) + '\n' for value in rows))
+                with mock.patch.object(log, 'EXPECTED_PATH', config), \
+                     mock.patch.object(log, 'utcnow', return_value=start + dt.timedelta(seconds=elapsed)), \
+                     mock.patch.dict(os.environ, HEALTH_TOOLLOG_DIR=str(root)):
+                    result = log.rollup('2026-11-13')
+                self.assertIsNotNone(result)
+                components = result['components']
+                self.assertEqual(set(components), set(intervals))
+                for component, interval in intervals.items():
+                    summary = components[component]
+                    self.assertEqual(set(summary), {'runs', 'firstRunTs', 'lastRunTs',
+                        'medianGapSeconds', 'maxGapSeconds', 'gapsOver', 'expectedRuns', 'missedRuns'})
+                    self.assertEqual(summary['expectedRuns'], elapsed // interval)
+                    self.assertEqual(summary['missedRuns'], max(0, elapsed // interval - summary['runs']))
+                if name == 'hole_and_steady':
+                    self.assertEqual(components['meds-nag'], {'runs': 253,
+                        'firstRunTs': '2026-11-13T00:00:00Z', 'lastRunTs': '2026-11-13T23:55:00Z',
+                        'medianGapSeconds': 300, 'maxGapSeconds': 10800,
+                        'gapsOver': [{'startTs': '2026-11-13T01:00:00Z', 'seconds': 10800}],
+                        'expectedRuns': 288, 'missedRuns': 35})
+                    self.assertEqual((components['gym-nudge']['runs'], components['gym-nudge']['gapsOver']), (288, []))
+                elif name == 'single_run':
+                    self.assertEqual((components['meds-nag']['runs'], components['meds-nag']['maxGapSeconds'],
+                                      components['meds-nag']['medianGapSeconds']), (1, 43200, None))
+                elif name in ('empty', 'absent'):
+                    self.assertEqual(result['total'], 0)
+                    self.assertTrue(all(value['maxGapSeconds'] == 86400 for value in components.values()))
+                if name in ('hole_and_steady', 'single_run'):
+                    self.assertEqual(result['nag'], {'firstNagToTookSeconds': {
+                        'median': 60.0, 'p95': 90, 'samples': 2}, 'openSlotsByDay': {'2026-11-13': 2}})
+                else:
+                    self.assertEqual(result['nag'], {'firstNagToTookSeconds': {
+                        'median': None, 'p95': None, 'samples': 0}, 'openSlotsByDay': {}})
+                for component in set(intervals) - {'meds-nag', 'gym-nudge'}:
+                    self.assertEqual(components[component]['runs'], 0)
+                    self.assertEqual(components[component]['maxGapSeconds'], elapsed)
+                self.assertTrue((root / 'rollup-2026-11-13.json').exists())
+
+    def test_nag_rollup_without_outcomes(self):
+        log.emit('took', 'cli.run')
+        result = log.rollup(log.utcnow().date().isoformat())
+        self.assertEqual(result['nag'], {'firstNagToTookSeconds': {
+            'median': None, 'p95': None, 'samples': 0}, 'openSlotsByDay': {}})
+
     def test_rollup_after_0005_only_once_and_gap(self):
         now = dt.datetime(2026, 11, 13, 0, 4, tzinfo=dt.timezone.utc)
         with mock.patch.object(log, 'utcnow', return_value=now), mock.patch.object(log, 'rollup') as roll:
