@@ -3774,7 +3774,10 @@ const make = Effect.gen(function* () {
       return yield* SendAcknowledgement.bounded(
         (clientRequestId) =>
           Effect.gen(function* () {
-            const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId);
+            const { parent, limits, target } = yield* SendAcknowledgement.waitingOn(
+              loadScopedThread(scope, input.threadId),
+              `target thread read for thread ${input.threadId}`,
+            );
             yield* assertLiveCallerForOtherThread(scope, parent, target);
             yield* resolveRuntimeMode(limits.runtimeMode, target.thread.runtimeMode);
             yield* resolveInteractionMode(limits.interactionMode, target.thread.interactionMode);
@@ -3785,12 +3788,15 @@ const make = Effect.gen(function* () {
             const messages =
               scope.thread === undefined
                 ? []
-                : (yield* threadManagement
-                    .getThreadRecords(input.threadId, ["messages"], {
-                      messageRoles: ["user"],
-                      turnItemTypes: [],
-                    })
-                    .pipe(Effect.mapError(threadManagementFailure))).messages;
+                : (yield* SendAcknowledgement.waitingOn(
+                    threadManagement
+                      .getThreadRecords(input.threadId, ["messages"], {
+                        messageRoles: ["user"],
+                        turnItemTypes: [],
+                      })
+                      .pipe(Effect.mapError(threadManagementFailure)),
+                    `prior send read for thread ${input.threadId}`,
+                  )).messages;
             const prior =
               scope.thread === undefined
                 ? undefined
@@ -3818,29 +3824,32 @@ const make = Effect.gen(function* () {
                 : CommandId.make(
                     `command:mcp:${prior.id.split(":")[2]}:thread-send:${stablePart(key)}`,
                   );
-            const result = yield* threadManagement
-              .sendToThread({
-                projectId: target.thread.projectId,
-                commandId,
-                threadId: input.threadId,
-                ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
-                messageId,
-                text: input.message,
-                attachments: [],
-                mode,
-                createdBy: "agent",
-                creationSource: "mcp",
-              })
-              .pipe(
-                Effect.mapError((error) =>
-                  isThreadManagementError(error)
-                    ? threadManagementFailure(error)
-                    : failure(
-                        "orchestration_error",
-                        `Unable to send to thread ${input.threadId}: ${errorMessage(error)}`,
-                      ),
+            const result = yield* SendAcknowledgement.waitingOn(
+              threadManagement
+                .sendToThread({
+                  projectId: target.thread.projectId,
+                  commandId,
+                  threadId: input.threadId,
+                  ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
+                  messageId,
+                  text: input.message,
+                  attachments: [],
+                  mode,
+                  createdBy: "agent",
+                  creationSource: "mcp",
+                })
+                .pipe(
+                  Effect.mapError((error) =>
+                    isThreadManagementError(error)
+                      ? threadManagementFailure(error)
+                      : failure(
+                          "orchestration_error",
+                          `Unable to send to thread ${input.threadId}: ${errorMessage(error)}`,
+                        ),
+                  ),
                 ),
-              );
+              `message dispatch for thread ${input.threadId}`,
+            );
             // Delivery is the committed route, not provider acceptance. Claude's priority-next
             // steer may wait for a tool boundary; that wait must never hold the MCP reply.
             return {
