@@ -4,6 +4,8 @@ import {
   CheckpointId,
   CheckpointScopeId,
   CommandId,
+  DEFAULT_SERVER_SETTINGS,
+  ServerSettingsError,
   MessageId,
   ProviderInstanceId,
   standardModelSelection,
@@ -63,6 +65,7 @@ const providerThreadId = ProviderThreadId.make("provider-thread:effect-worker-re
 const providerTurnId = ProviderTurnId.make("provider-turn:effect-worker-restart");
 const attemptId = RunAttemptId.make("run-attempt:effect-worker-restart");
 const runId = RunId.make("run:effect-worker-restart");
+const decodeProjection = Schema.decodeUnknownEffect(OrchestrationV2ThreadProjection);
 
 function restartEffect(
   now: DateTime.Utc,
@@ -264,7 +267,16 @@ function layerExecutorFor(input: {
           getThreadRecords: () => Effect.sync(() => ({ runs: [restartRun] }) as never),
           ...input.projections,
         }),
-        input.pacing ?? RestartPacingTestkit.layer,
+        input.pacing ??
+          RestartPacingTestkit.layer.pipe(
+            Layer.provide(
+              ServerSettings.layerTest(
+                input.continueAfterRestart === true
+                  ? { continueThreadsAfterServerUpdate: true }
+                  : {},
+              ),
+            ),
+          ),
         input.mcpRegistry ?? McpSessionRegistryTestkit.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)(input.threads ?? {}),
         ServerSettings.layerTest(
@@ -1175,13 +1187,23 @@ it.effect.each([
               ...(queued ? { queued: true } : {}),
             },
     };
+    let admissions = 0;
+    const expire = Effect.sync(() => {
+      admissions++;
+    }).pipe(
+      Effect.andThen(
+        Effect.fail(new RestartPacing.RestartAdmissionTimeoutError({ deadline: now })),
+      ),
+    );
     const layer = layerExecutorFor({
       events,
       pacing: Layer.mock(RestartPacing.RestartPacing)({
-        acquireRun: () =>
-          Effect.fail(new RestartPacing.RestartAdmissionTimeoutError({ deadline: now })),
-        acquire: () =>
-          Effect.fail(new RestartPacing.RestartAdmissionTimeoutError({ deadline: now })),
+        settingsSnapshot: Effect.succeed({
+          ...DEFAULT_SERVER_SETTINGS,
+          continueThreadsAfterServerUpdate: true,
+        }),
+        acquireRun: () => expire,
+        acquire: () => expire,
         dispatched: () => Effect.void,
         release: () => Effect.void,
         releaseRun: () => Effect.void,
@@ -1200,6 +1222,35 @@ it.effect.each([
           } as never),
       },
       threads: {
+        getThreadRecords: () =>
+          Effect.succeed({
+            ...queuedProjection,
+            runs: [
+              {
+                ...queuedProjection.runs[0]!,
+                status: queued ? "queued" : "cancelled",
+                queueHeld: type === "held queued continuation",
+                startedAt: queued ? null : now,
+                completedAt: queued ? null : now,
+              },
+            ],
+            messages: [
+              {
+                id: queuedProjection.runs[0]!.userMessageId,
+                threadId,
+                runId,
+                nodeId: null,
+                role: "user",
+                text: "Work",
+                attachments: [],
+                streaming: false,
+                createdAt: now,
+                updatedAt: now,
+                createdBy: "user",
+                creationSource: "web",
+              },
+            ],
+          } as typeof queuedProjection),
         dispatch: (command) =>
           Effect.sync(() => {
             commands.push(command);
@@ -1214,8 +1265,11 @@ it.effect.each([
     );
     assert.deepEqual(
       yield* Ref.get(events),
-      type !== "provider-runtime.continue" ? [] : ["recover-delegation"],
+      type === "provider-runtime.continue" || type === "held queued continuation"
+        ? ["recover-delegation"]
+        : [],
     );
+    assert.equal(admissions, type === "held queued continuation" ? 0 : 1);
     if (type !== "provider-runtime.continue" && type !== "held queued continuation")
       assert.deepEqual(commands, [
         {
@@ -1588,5 +1642,198 @@ it.effect("long preparation does not discard an admitted provider start's retry"
       assert.equal(starts, 2, "the admitted retry must reach ProviderTurnStartService");
       assert.deepEqual(commands, []);
     }).pipe(Effect.provide(Layer.merge(executorLayer, slotPacing)));
+  }),
+);
+
+it.effect.each([
+  "reset",
+  "interrupted",
+  "superseded",
+  "provider-changed",
+  "valid",
+  "settings-failed",
+] as const)("a %s continuation retires before restart admission when it cannot dispatch", (kind) =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const source = {
+      id: runId,
+      threadId,
+      ordinal: 1,
+      providerInstanceId: "codex",
+      modelSelection: { instanceId: "codex", model: "gpt-6.1-sol" },
+      providerThreadId,
+      userMessageId: "message:source",
+      rootNodeId: "node:source",
+      activeAttemptId: attemptId,
+      status: "cancelled",
+      requestedAt: now,
+      startedAt: now,
+      completedAt: now,
+      checkpointId: null,
+      contextHandoffId: null,
+    };
+    let projection = yield* decodeProjection({
+      thread: {
+        id: threadId,
+        projectId: "project:source",
+        title: "Source",
+        providerInstanceId: "codex",
+        modelSelection: source.modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        activeProviderThreadId: null,
+        lineage: { parentThreadId: null, rootThreadId: threadId, relationshipToParent: null },
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+        archivedAt: null,
+        deletedAt: null,
+        createdBy: "user",
+        creationSource: "web",
+      },
+      runs: kind === "reset" ? [] : [source],
+      attempts: [],
+      nodes: [],
+      subagents: [],
+      providerSessions: [],
+      providerThreads: [],
+      providerTurns: [],
+      runtimeRequests: [],
+      messages: [
+        {
+          id: source.userMessageId,
+          threadId,
+          runId,
+          nodeId: null,
+          role: "user",
+          text: "Work",
+          attachments: [],
+          streaming: false,
+          createdAt: now,
+          updatedAt: now,
+          createdBy: "user",
+          creationSource: "web",
+        },
+      ],
+      plans: [],
+      turnItems: [],
+      checkpointScopes: [],
+      checkpoints: [],
+      contextHandoffs: [],
+      contextTransfers: [],
+      visibleTurnItems: [],
+      updatedAt: now,
+    });
+    if (kind === "interrupted")
+      projection = {
+        ...projection,
+        turnItems: [{ runId, type: "run_interrupt_request" } as never],
+      };
+    if (kind === "superseded")
+      projection = {
+        ...projection,
+        runs: [
+          ...projection.runs,
+          {
+            ...projection.runs[0]!,
+            id: RunId.make("run:newer"),
+            ordinal: 2,
+            status: "completed",
+            startedAt: DateTime.add(now, { seconds: 1 }),
+          },
+        ],
+      };
+    if (kind === "provider-changed")
+      projection = {
+        ...projection,
+        thread: {
+          ...projection.thread,
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        },
+      };
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    let settingsReads = 0;
+    let dispatches = 0;
+    let settingsUnavailable = kind === "settings-failed";
+    const executor = layerExecutorFor({
+      events,
+      continueAfterRestart: true,
+      threads: {
+        getThreadRecords: () => Effect.succeed(projection),
+        recoverDelegatedTask: () => Effect.void,
+        dispatch: () =>
+          kind === "settings-failed"
+            ? Effect.sync(() => {
+                dispatches++;
+                return {} as never;
+              })
+            : Effect.die("admission is held"),
+      },
+      pacing: Layer.succeed(RestartPacing.RestartPacing, {
+        settingsSnapshot: Effect.suspend(() => {
+          settingsReads++;
+          return settingsUnavailable
+            ? Effect.fail(
+                new ServerSettingsError({
+                  settingsPath: "fixture",
+                  operation: "read-file",
+                  cause: "transient read failure",
+                }),
+              )
+            : Effect.succeed({
+                ...DEFAULT_SERVER_SETTINGS,
+                continueThreadsAfterServerUpdate: true,
+              });
+        }),
+        register: () => Effect.void,
+        release: () => Effect.void,
+        releaseRun: () => Effect.void,
+        dispatched: () => Effect.void,
+        acquireRun: () => Effect.succeed(0),
+        acquire: () => Effect.succeed(kind === "settings-failed" ? 0 : 15000),
+      }),
+    });
+    yield* Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      yield* outbox.enqueue([
+        {
+          id: "effect:stale-continuation",
+          commandId: CommandId.make("command:stale-continuation"),
+          threadId,
+          request: { type: "provider-runtime.continue", sourceRunId: runId },
+        },
+      ]);
+      assert.isTrue(yield* outbox.hasPendingRunContinuation(threadId));
+      yield* worker.drain();
+      const pending = kind === "valid" || kind === "settings-failed";
+      assert.equal(yield* outbox.hasPendingRunContinuation(threadId), pending);
+      assert.equal(
+        Option.getOrThrow(yield* outbox.get("effect:stale-continuation")).status,
+        pending ? "pending" : "succeeded",
+      );
+      if (kind === "settings-failed") {
+        assert.equal(settingsReads, 1);
+        assert.equal(dispatches, 0);
+        settingsUnavailable = false;
+        yield* TestClock.adjust("100 millis");
+        yield* worker.drain();
+        assert.equal(dispatches, 1);
+        assert.isFalse(yield* outbox.hasPendingRunContinuation(threadId));
+        assert.equal(
+          Option.getOrThrow(yield* outbox.get("effect:stale-continuation")).status,
+          "succeeded",
+        );
+      }
+    }).pipe(
+      Effect.provide(
+        EffectWorker.layer.pipe(
+          Layer.provide(executor),
+          Layer.provideMerge(EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory))),
+        ),
+      ),
+    );
   }),
 );
