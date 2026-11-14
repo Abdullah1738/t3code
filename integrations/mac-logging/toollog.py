@@ -22,11 +22,14 @@ NUMBERS.update(('lockAgeS', 'lockPid', 'completedCount', 'failedCount',
                 'windowStart', 'windowEnd', 'windowS', 'skippedS', 'chunks', 'chunksDone', 'observedAt'))
 NUMBERS.update(('lockHolderPpid', 'lockHolderStartedAgoS', 'lastGoodSnapshotAgeS',
                 'backup.skipped_runs.memory', 'backup.skipped_runs.health', 'backup.skipped_runs.other',
-                'backup.ok_runs.memory', 'backup.ok_runs.health', 'backup.ok_runs.other'))
+                'backup.ok_runs.memory', 'backup.ok_runs.health', 'backup.ok_runs.other',
+                'backup.failed_runs.memory', 'backup.failed_runs.health', 'backup.failed_runs.other'))
 for prefix in ('internal', 'external'):
     NUMBERS.update(prefix+field for field in ('FreeGbDelta', 'PurgeableGb', 'LocalSnapshotCount'))
     NUMBERS.add(prefix+'DeltaWindowS')
 SKIP_REASONS = {'lock_held', 'stale_lock', 'no_repo_access', 'password_unavailable', 'source_missing', 'dry_run', 'other', 'load_deferred', 'boot_grace'}
+BACKUP_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'files',
+                 'restic', 'vault', 'dropbox', 'manifest', 'unknown', 'other'}
 NUMBERS.update(('loadPerCore', 'lastSuccessAgeS', 'deferredCount'))
 BACKUP_PROGRAMS = {'bash', 'zsh', 'sh', 'python', 'python3', 'restic', 'launchd',
                    'Robob', 'codex', 'claude', 'opencode', 'node', 'sleep', 'unknown'}
@@ -107,6 +110,12 @@ def safe_fields(values, event=None):
             if key != 'trigger' or value != 'agent':
                 result[key] = value
         elif key == 'lastGoodSnapshotError' and value in ('password_unavailable', 'timeout', 'exit', 'parse', 'unavailable', 'no_snapshots'):
+            result[key] = value
+        elif key == 'lastGoodSnapshotSource' and value in ('restic', 'status_file'):
+            result[key] = value
+        elif key == 'failedStage' and isinstance(value, str) and value in BACKUP_STAGES:
+            result[key] = value
+        elif key == 'failReason' and value in ('password_unavailable', 'no_repo_access', 'source_missing', 'other'):
             result[key] = value
         elif key == 'duMode' and value == 'links':
             result[key] = value

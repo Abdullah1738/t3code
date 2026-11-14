@@ -17,7 +17,7 @@ def rollup(day, root=None):
     names, kinds, durations, tags, samples = Counter(), Counter(), defaultdict(list), Counter(), {}
     disk = dict(probes=0, timeouts=0, maxDurationMs=None, latestBlockedIn=None)
     backup = {key: dict.fromkeys(('memory', 'health', 'other'), 0)
-              for key in ('skipped_runs', 'ok_runs')}
+              for key in ('skipped_runs', 'ok_runs', 'failed_runs')}
     latest_blocked_at = ''
     waits = dict(runs=0, maxAgeS=None, latestStuckUnmountMountPoint=None)
     latest_unmount_at = ''
@@ -46,6 +46,8 @@ def rollup(day, root=None):
                                 backup['skipped_runs'][target] += 1
                             elif props.get('skipped') == 0 and row.get('ok') is True:
                                 backup['ok_runs'][target] += 1
+                            elif props.get('skipped') == 0 and row.get('ok') is False:
+                                backup['failed_runs'][target] += 1
                     value = row.get('durationMs')
                     if type(value) in (int, float) and math.isfinite(value) and value >= 0:
                         durations[name].append(value)

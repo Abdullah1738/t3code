@@ -288,7 +288,8 @@ class BackupDiagnosticsTests(unittest.TestCase):
                 toollog.emit('backup', 'perf', 'backup.run', ok=ok, props=dict(target=target, skipped=skipped))
         result = rollup(day, self.logs)
         self.assertEqual(result['backup'], {'skipped_runs': {'memory': 2, 'health': 2, 'other': 0},
-                                            'ok_runs': {'memory': 1, 'health': 1, 'other': 0}})
+                                            'ok_runs': {'memory': 1, 'health': 1, 'other': 0},
+                                            'failed_runs': {'memory': 1, 'health': 1, 'other': 0}})
 
 
 if __name__ == '__main__':
