@@ -16,6 +16,7 @@ import {
   kanbanDeciding,
   kanbanWaiting,
   kanbanWaitsOnEvaluator,
+  kanbanReviewAlreadyDone,
   type KanbanBoard,
   type KanbanCard,
   type KanbanDiscussion,
@@ -102,7 +103,16 @@ const no = (reason: string): MoveCheck => ({ ok: false, reason });
 export function checkMove(role: MoveRole, card: KanbanCard, to: KanbanStage): MoveCheck {
   const from = card.stage;
   if (from === to) return no(`card is already in ${to}`);
-  if (KANBAN_THREAD_STAGES.includes(to) && role !== "dispatcher") {
+  if (
+    KANBAN_THREAD_STAGES.includes(to) &&
+    role !== "dispatcher" &&
+    !(
+      role === "system" &&
+      from === "needs_review" &&
+      to === "in_review" &&
+      card.activeThreadId === null
+    )
+  ) {
     return no(`only the dispatcher moves a card into ${to}; move it to todo or needs_review`);
   }
   switch (role) {
@@ -122,8 +132,13 @@ export function checkMove(role: MoveRole, card: KanbanCard, to: KanbanStage): Mo
         `a card thread can move working -> needs_review or needs_owner, not ${from} -> ${to}`,
       );
     case "system":
-      // Review results and PR merges.
-      if (from === "in_review" && (to === "todo" || to === "completed")) return ok;
+      // A finished review can wait in in_review for its PRs without taking a thread slot.
+      if (from === "needs_review" && to === "in_review" && card.activeThreadId === null) return ok;
+      if (
+        (from === "in_review" || from === "needs_review") &&
+        (to === "todo" || to === "completed")
+      )
+        return ok;
       return no(`system cannot move ${from} -> ${to}`);
     case "script":
       if (card.settledAt !== null) return no("card is settled");
@@ -551,6 +566,8 @@ export function poolThreads(
  * are measured against. The dispatcher passes the real time. Left out (tests, a
  * caller with no clock) it is the board's newest card stamp (kanbanBoardClock).
  */
+export type ReviewEvidence = NonNullable<Parameters<typeof kanbanReviewAlreadyDone>[1]>;
+
 export function planDispatch(
   board: KanbanBoard,
   cards: ReadonlyArray<KanbanCard>,
@@ -559,6 +576,7 @@ export function planDispatch(
   pick: (count: number) => number = () => 0,
   nowMs?: number,
   attempted: ReadonlySet<string> = new Set(),
+  reviews: ReadonlyMap<string, ReviewEvidence> = new Map(),
 ): ReadonlyArray<Dispatch> {
   // A board's first setup holds all card work and review until the setup evaluator ends it.
   if (board.setup?.status === "running") return [];
@@ -585,14 +603,15 @@ export function planDispatch(
       card.priority !== KANBAN_BACKLOG &&
       !heldForRetry(card, clock) &&
       // A step that's only the evaluator's is done by an evaluator, not a new thread.
-      // Reviews still go: a review never waits on the evaluator's step.
+      // An unfinished review can still run before an evaluator step.
       !kanbanWaitsOnEvaluator(card) &&
+      !kanbanReviewAlreadyDone(card, reviews.get(card.id)) &&
       // Parked on a wait: the tick wakes it when the wait ends.
       !kanbanWaiting(card) &&
       // Its wait ended and its evaluator decides what it does next.
       !kanbanDeciding(card, clock),
   );
-  const reviews = waiting
+  const reviewQueue = waiting
     .filter((card) => card.stage === "needs_review")
     .map((card) => ({ card, role: "review" as const }));
   const ranking = kanbanSchedule(cards, { nowMs: clock });
@@ -600,9 +619,9 @@ export function planDispatch(
   const todos = waiting
     .filter((card) => card.stage === "todo" && !isBlocked(card, byId))
     .map((card) => ({ card, role: "work" as const }));
-  const priority = ({ card }: (typeof reviews)[number] | (typeof todos)[number]) =>
+  const priority = ({ card }: (typeof reviewQueue)[number] | (typeof todos)[number]) =>
     ranking.get(card.id)?.rank ?? card.priority;
-  const queue = [...reviews, ...todos].toSorted(
+  const queue = [...reviewQueue, ...todos].toSorted(
     (a, b) =>
       priority(a) - priority(b) ||
       (a.role !== b.role ? (a.role === "review" ? -1 : 1) : pickOrder(a.card, b.card)),

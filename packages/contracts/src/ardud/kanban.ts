@@ -1314,6 +1314,35 @@ export const kanbanWaitsOnEvaluator = (
   card: Pick<KanbanCard, "stage" | "wakeNote" | "subtasks" | "reviewFindingsPending">,
 ): boolean => card.stage === "todo" && !kanbanWorkStep(card);
 
+/** A finished planned review, unless a known head or a fresh review request invalidates it. */
+export const kanbanReviewAlreadyDone = (
+  card: Pick<KanbanCard, "stage" | "subtasks" | "reviewFindingsPending">,
+  evidence?: {
+    readonly heads: ReadonlyArray<string>;
+    readonly verdict: Pick<KanbanCardEvent, "body" | "head"> | null;
+    readonly requested: boolean;
+  },
+): boolean => {
+  if (card.stage !== "needs_review" || card.reviewFindingsPending || evidence?.requested)
+    return false;
+  const step = kanbanOpenStep(card);
+  // A future review belongs to future work, not to this completed review step.
+  const reviews = card.subtasks.filter(
+    (subtask) => subtask.owner === "review" && (step === null || subtask.step <= step),
+  );
+  if (reviews.length === 0 || reviews.some((subtask) => subtask.state === "open")) return false;
+  if (evidence === undefined || evidence.heads.length === 0) return true;
+  const reviewed = evidence.verdict?.head?.toLowerCase();
+  return (
+    evidence.verdict?.body === "clear" &&
+    reviewed != null &&
+    evidence.heads.every((head) => {
+      const current = head.toLowerCase();
+      return current.startsWith(reviewed) || reviewed.startsWith(current);
+    })
+  );
+};
+
 /** Stages past the work: a card here no longer blocks anything or waits on anything. */
 export const KANBAN_DONE_STAGES: ReadonlySet<KanbanStage> = new Set([
   "completed",
