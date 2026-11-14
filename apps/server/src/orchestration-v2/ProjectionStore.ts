@@ -5796,8 +5796,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       threadId,
       fields,
       filter,
-    ) =>
-      sql.withTransaction(readCanonicalProjection(threadId, undefined, fields, filter)).pipe(
+    ) => {
+      const read = readCanonicalProjection(threadId, undefined, fields, filter);
+      // A metadata-only read is one SELECT and already has an atomic snapshot.
+      return (fields.length === 0 ? read : sql.withTransaction(read)).pipe(
         Effect.map(
           (projection) =>
             Object.fromEntries([
@@ -5807,6 +5809,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         ),
         Effect.mapError(controlReadError(threadId)),
       );
+    };
 
     const getThreadSnapshot: ProjectionStoreV2Shape["getThreadSnapshot"] = (threadId) =>
       sql

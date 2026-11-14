@@ -377,6 +377,128 @@ it.effect("an owner thread registered last starts before evaluators and board wo
   }).pipe(Effect.provide(h.layer));
 });
 
+it.effect("holder checks grow linearly across dispatch and native reservation transfer", () => {
+  const h = harness({ maxActive: 1000, spacingMs: 0 });
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    for (let id = 0; id < 150; id++) {
+      const input = { ...source(id), effectId: `continue:${id}` };
+      h.runSources.set(input.sourceRunId, input);
+      assert.equal(yield* pacing.acquire(input), 0);
+      h.running.add(input.sourceRunId);
+      yield* pacing.dispatched(input);
+      assert.equal(yield* pacing.acquireRun(input.threadId, input.sourceRunId, `start:${id}`), 0);
+    }
+    assert.equal(h.reads.active, 150);
+    h.running.delete(source(0).sourceRunId);
+    yield* TestClock.adjust("10 seconds");
+    assert.equal(yield* pacing.acquire(source(150)), 0);
+    assert.equal(h.reads.active, 300, "periodic scans still check every retained holder");
+  }).pipe(Effect.provide(h.layer));
+});
+
+it.effect.each(["provider-runtime.continue", "provider-turn.start"] as const)(
+  "%s drains out-of-order claims in priority order without a resource backoff",
+  (type) => {
+    const h = harness({ maxActive: 1000, spacingMs: 0 });
+    h.priorities.set(source(0).sourceRunId, 0);
+    const starts: string[] = [];
+    const outboxLayer = EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory));
+    const executorLayer = Layer.effect(
+      EffectWorker.OrchestrationEffectExecutorV2,
+      Effect.gen(function* () {
+        const pacing = yield* RestartPacing.RestartPacing;
+        return EffectWorker.OrchestrationEffectExecutorV2.of({
+          execute: (effect) =>
+            Effect.gen(function* () {
+              const input = source(Number(effect.id.split(":")[1]));
+              const delay = yield* type === "provider-runtime.continue"
+                ? pacing.acquire({ ...input, effectId: effect.id })
+                : pacing.acquireRun(input.threadId, input.sourceRunId, effect.id);
+              if (delay > 0)
+                return yield* new EffectWorker.OrchestrationEffectExecutionError({
+                  effectId: effect.id,
+                  effectType: type,
+                  deferMs: delay,
+                });
+              starts.push(input.sourceRunId);
+              h.running.add(input.sourceRunId);
+            }).pipe(
+              Effect.mapError((cause) =>
+                EffectWorker.isOrchestrationEffectExecutionError(cause)
+                  ? cause
+                  : new EffectWorker.OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: type,
+                      cause,
+                    }),
+              ),
+            ),
+        });
+      }),
+    ).pipe(Layer.provideMerge(h.layer));
+    return Effect.gen(function* () {
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const pacing = yield* RestartPacing.RestartPacing;
+      for (let id = 0; id < 5; id++) {
+        const input = source(id);
+        h.runSources.set(input.sourceRunId, input);
+        yield* pacing.register({ ...input, effectId: `effect:${id}` });
+        yield* outbox.enqueue([
+          {
+            id: `effect:${id}`,
+            commandId: CommandId.make(`command:${id}`),
+            threadId: input.threadId,
+            request:
+              type === "provider-runtime.continue"
+                ? { type, sourceRunId: input.sourceRunId }
+                : { type, runId: input.sourceRunId },
+          },
+        ]);
+      }
+      yield* worker.drain();
+      for (let pass = 0; pass < 4; pass++) {
+        yield* TestClock.adjust(1);
+        yield* worker.drain();
+      }
+      assert.deepEqual(
+        starts,
+        [0, 4, 3, 2, 1].map((id) => source(id).sourceRunId),
+      );
+      for (let id = 0; id < 5; id++) {
+        const effect = Option.getOrThrow(yield* outbox.get(`effect:${id}`));
+        assert.equal(effect.status, "succeeded");
+        assert.equal(effect.attemptCount, 1);
+      }
+    }).pipe(
+      Effect.provide(
+        EffectWorker.layer.pipe(Layer.provideMerge(Layer.merge(outboxLayer, executorLayer))),
+      ),
+    );
+  },
+);
+
+it.effect("backs off an unchanged priority head and resets when that head advances", () => {
+  const h = harness({ maxActive: 1000, spacingMs: 0 });
+  h.priorities.set(source(0).sourceRunId, 0);
+  h.priorities.set(source(2).sourceRunId, 1);
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    for (const id of [0, 1, 2]) yield* pacing.register(source(id));
+    const retries = yield* Effect.forEach(Array.from({ length: 20 }), () =>
+      pacing.acquire(source(1)),
+    );
+    assert.equal(retries[0], 1);
+    assert.equal(retries.at(-1), 100);
+    assert.isFalse(h.positions.some(({ position }) => position !== null));
+    h.cancelled.add(source(0).sourceRunId);
+    assert.equal(yield* pacing.acquire(source(1)), 1);
+    h.cancelled.add(source(2).sourceRunId);
+    assert.equal(yield* pacing.acquire(source(1)), 0);
+  }).pipe(Effect.provide(h.layer));
+});
+
 it.effect.each([false, true])(
   "a replacement start restores its waiting position when the old effect settled: %s",
   (settled) => {
@@ -1150,7 +1272,10 @@ it.effect.each(["deferred", "pruned"] as const)(
         h.cancelled.delete("start:waiting");
       } else yield* pacing.releaseRun(first.threadId, first.sourceRunId, "start:waiting", true);
       yield* TestClock.adjust("16 minutes");
-      assert.instanceOf(yield* acquire.pipe(Effect.flip), RestartPacing.RestartAdmissionTimeoutError);
+      assert.instanceOf(
+        yield* acquire.pipe(Effect.flip),
+        RestartPacing.RestartAdmissionTimeoutError,
+      );
     }).pipe(Effect.provide(h.layer));
   },
 );
