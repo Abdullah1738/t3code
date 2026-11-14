@@ -44,6 +44,7 @@ interface BoardLock {
 }
 
 interface Held {
+  readonly acquiredAtMs: number;
   readonly boardId: string;
   readonly board: BoardLock;
   readonly cardId: string | undefined;
@@ -98,6 +99,10 @@ export class BoardStateChanged {
     this.committed = committed;
   }
 }
+
+// A budget miss gives the next writer a turn instead of immediately retrying the start.
+export class DispatchReadBudgetExceeded extends BoardStateChanged {}
+const DISPATCH_READ_HOLD_MS = 2_000;
 
 export const MAY_HAVE_APPLIED =
   "Board changed after this call started work; it may have been applied. Check t3_thread_list / card_get before retrying.";
@@ -358,6 +363,21 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         );
       }),
     );
+  // Shares the caller's span: this check runs on every scoped dispatch read.
+  const dispatchRead = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
+    const op = yield* operation;
+    const held = op?.held;
+    if (!op || !held || !op.scopes.has(held.boardId)) return yield* effect;
+    const remaining = held.acquiredAtMs + DISPATCH_READ_HOLD_MS - (yield* Clock.currentTimeMillis);
+    const result =
+      remaining <= 0
+        ? Option.none<A>()
+        : yield* effect.pipe(Effect.interruptible, Effect.timeoutOption(remaining));
+    if (Option.isSome(result)) return result.value;
+    op.stale = true;
+    return yield* Effect.die(new DispatchReadBudgetExceeded(op.committed));
+  });
+
   const release = Effect.fn("KanbanBoardLocks.release")(function* (op: Operation) {
     const held = op.held;
     if (!held) return;
@@ -392,7 +412,15 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
             Effect.forEach(releases.toReversed(), (release) => release, { discard: true }),
           ),
         );
-        const held: Held = { boardId, board, cardId, mutex, permits, releases };
+        const held: Held = {
+          boardId,
+          board,
+          cardId,
+          mutex,
+          permits,
+          releases,
+          acquiredAtMs: yield* Clock.currentTimeMillis,
+        };
         op.held = held;
         const seen = versions.get(op)!;
         const expected = seen.get(boardId);
@@ -406,7 +434,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           // The explicit continuation validates its inputs under this new snapshot.
           op.dependencies.delete(boardId);
         }
-        if (scoped && !(yield* scoped.valid)) op.stale = true;
+        if (scoped && !(yield* dispatchRead(scoped.valid))) op.stale = true;
         if (!scoped && (expected !== undefined || !op.dependencies.has(boardId)))
           seen.set(boardId, version(held));
         yield* check(op);
@@ -467,19 +495,21 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
               ),
             ),
           ),
-          Effect.catchDefect((defect) =>
-            defect instanceof BoardStateChanged &&
-            !defect.committed &&
-            !op.committed &&
-            !op.sideEffect &&
-            attempt < policy.reruns
+          Effect.catchCause((cause) => {
+            const defect = cause.reasons.find((reason) => reason._tag === "Die")?.defect;
+            return defect instanceof BoardStateChanged &&
+              !(defect instanceof DispatchReadBudgetExceeded) &&
+              !defect.committed &&
+              !op.committed &&
+              !op.sideEffect &&
+              attempt < policy.reruns
               ? restore(
                   policy.backoffMs > 0
                     ? Effect.sleep(policy.backoffMs * 2 ** attempt)
                     : Effect.void,
                 ).pipe(Effect.andThen(run(effect, cardId, attempt + 1, replay, policy, op.label)))
-              : Effect.die(defect),
-          ),
+              : Effect.failCause(cause);
+          }),
         );
       }),
     );
@@ -517,7 +547,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         // while a transaction or its cleanup can still apply the write.
         const result = yield* write
           ? SavedWrite.stage(SavedWrite.committing.pipe(Effect.andThen(effect)), "commit")
-          : restore(effect);
+          : restore(dispatchRead(effect));
         if (write) {
           op.committed = true;
           const held = op.held!;
@@ -718,7 +748,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           }),
         ),
       );
-      if (!(yield* valid)) {
+      if (!(yield* dispatchRead(valid))) {
         op.stale = true;
         yield* check(op);
       }
@@ -742,6 +772,8 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     // Compensation must run without permits even after the snapshot became stale.
     unlock: Effect.flatMap(operation, (op) => (op ? release(op) : Effect.void)),
     outsideRead,
+    // Lock-location lookups must share the start's read budget too.
+    dispatchRead,
     launched: Effect.fn("KanbanBoardLocks.launched")(function* (
       id: string,
       cleanup: Effect.Effect<void>,

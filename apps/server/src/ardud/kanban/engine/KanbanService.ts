@@ -70,6 +70,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Schedule from "effect/Schedule";
@@ -1957,11 +1958,14 @@ const make = Effect.gen(function* () {
           .pipe(
             // Resource fences still revoke successful launches; a failed launch
             // must reach the assignment-aware start handler with its typed error.
-            Effect.catchDefect((defect) =>
-              defect instanceof BoardLocks.BoardStateChanged && launchFailure !== undefined
-                ? Effect.fail(launchFailure)
-                : Effect.die(defect),
-            ),
+            Effect.catchDefect((defect) => {
+              if (!(defect instanceof BoardLocks.BoardStateChanged) || launchFailure === undefined)
+                return Effect.die(defect);
+              // Compensation needs the refusal; board deferral needs the exhausted budget too.
+              return defect instanceof BoardLocks.DispatchReadBudgetExceeded
+                ? Effect.failCause(Cause.combine(Cause.fail(launchFailure), Cause.die(defect)))
+                : Effect.fail(launchFailure);
+            }),
             Effect.flatMap((result) =>
               Result.isSuccess(result)
                 ? Effect.succeed(result.success)
@@ -6801,6 +6805,7 @@ const make = Effect.gen(function* () {
   const dispatchCardPass = (boardId: KanbanBoardId, changed: Set<KanbanCardId>) => {
     let rows: Map<string, KanbanCard | null> | undefined;
     let snapshot: ReadonlyArray<KanbanCard> = [];
+    let dirty = true;
     const candidate = (card: KanbanCard) =>
       card.settledAt === null &&
       (["todo", "working", "needs_review", "in_review"].includes(card.stage) ||
@@ -6813,13 +6818,21 @@ const make = Effect.gen(function* () {
         const loaded = rows !== undefined;
         if (rows === undefined)
           rows = new Map((yield* rawStore.dispatchCards(boardId)).map((card) => [card.id, card]));
-        if (loaded && changed.size === 0) return snapshot;
+        if (loaded && changed.size === 0 && !dirty) return snapshot;
+        // Row refresh and dependency expansion must both finish before reusing the snapshot.
+        dirty = true;
         while (changed.size > 0) {
           const ids = [...changed];
           changed.clear();
           // A write notification may precede its enclosing transaction's commit.
           // Taking the writer waits for that commit (or rollback) before refreshing.
           const fresh = yield* tickTransaction(Effect.forEach(ids, (id) => rawStore.card(id))).pipe(
+            // A cancelled refresh must not lose the writes the next plan needs to see.
+            Effect.onError(() =>
+              Effect.sync(() => {
+                for (const id of ids) changed.add(id);
+              }),
+            ),
             Effect.mapError(
               (cause) => new KanbanStoreError({ operation: "refresh dispatch cards", cause }),
             ),
@@ -6844,6 +6857,7 @@ const make = Effect.gen(function* () {
           }
         }
         snapshot = [...cards.values()].sort((a, b) => a.number - b.number);
+        dirty = false;
         return snapshot;
       }),
     );
@@ -7487,6 +7501,12 @@ const make = Effect.gen(function* () {
                     dispatch.fresh ||
                     (dispatch.role === "work" ? card.workThreadId : card.reviewThreadId) === null,
                 };
+                // Preparation reads may wait on the background reader. Take the
+                // card lock only after they finish; scopeDispatch confirms them again.
+                const board = yield* boardOf(boardId);
+                const pool = (yield* store.pools(board.id)).find(
+                  (entry) => entry.key === dispatch.pool,
+                );
                 starting.set(key, {
                   cardId: card.id,
                   pool: dispatch.pool,
@@ -7498,18 +7518,14 @@ const make = Effect.gen(function* () {
                       : card.reviewThreadId,
                 });
                 // The scope belongs to this start, not the planning pass or its siblings.
-                yield* locks
+                const continuePass = yield* locks
                   .run(
                     Effect.gen(function* () {
-                      const board = yield* boardOf(boardId);
                       const wakeThreadId = destination.newThread
                         ? null
                         : dispatch.role === "work"
                           ? card.workThreadId
                           : card.reviewThreadId;
-                      const pool = (yield* store.pools(board.id)).find(
-                        (entry) => entry.key === dispatch.pool,
-                      );
                       const assignmentState = ({
                         links,
                         updatedAt: _updatedAt,
@@ -7678,6 +7694,7 @@ const make = Effect.gen(function* () {
                             ),
                           ),
                     ),
+                    Effect.as(true),
                     Effect.catchCause((cause) =>
                       Effect.logWarning("kanban dispatch failed", {
                         cardId: dispatch.cardId,
@@ -7690,11 +7707,19 @@ const make = Effect.gen(function* () {
                               : reason._tag === "Die" && Schema.is(KanbanStoreError)(reason.defect),
                           )
                             ? Effect.failCause(cause)
-                            : Effect.void,
+                            : Effect.succeed(
+                                !cause.reasons.some(
+                                  (reason) =>
+                                    reason._tag === "Die" &&
+                                    reason.defect instanceof BoardLocks.DispatchReadBudgetExceeded,
+                                ),
+                              ),
                         ),
                       ),
                     ),
                   );
+                // The reader may still be stalled; don't immediately retake the planning gate.
+                if (!continuePass) break;
               }
             }).pipe(Effect.scoped),
             false,
