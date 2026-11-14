@@ -270,7 +270,14 @@ def _run_with_retries(a, me) -> int:
                             reprobed = True
                             if api.probe_backend("server", home.PROBE_TIMEOUT_S) is None:
                                 continue
-                        home.fail_over(str(e), getattr(a, "argv", None) or sys.argv[1:])
+                        phase = home.error_phase(e)
+                        if phase:
+                            why = home.wait_while_starting(phase, e.run_id or "", checkpoint="post", box=e.box)
+                            if why is None:
+                                continue
+                        else:
+                            why = str(e)
+                        home.fail_over(why, getattr(a, "argv", None) or sys.argv[1:], e.run_id or "")
                     if common.person():
                         raise OffboxError(f"the home offbox server is down ({e}); {common.person()}'s tasks wait "
                                           "until it is back. Nothing ran and nothing was sent to Boat",

@@ -11,7 +11,7 @@ import traceback
 from pathlib import Path
 import time
 
-from . import common, capacity, prepare
+from . import common, capacity, prepare, home
 from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_LOCAL, RUN_TTL_S, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
                      busy, db_retry, iso, kv_get, kv_set, local_error, log, now, say, write)
 from .common import backend, owner_scoped, token_owner
@@ -912,6 +912,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                             f"offbox release {row['box_id']} --delete). Trying other pool boxes, then a fresh lease.")
                         continue
                     except OffboxError as e:
+                        if isinstance(e, home.StartWaitFailed):
+                            raise
                         if isinstance(e, api.BudgetExpired) and con.execute("SELECT 1 FROM kv WHERE k IN (?,?)",
                                 (f"resume_unanswered:{row['box_id']}", f"resume_provision:{row['box_id']}")).fetchone():
                             raise
@@ -1091,6 +1093,8 @@ def try_warm(me, size, source, exclude, run_id):
                         if ready.returncode != 0:
                             return None
                 except common.SshHostKeyMismatch:
+                    raise
+                except home.StartWaitFailed:
                     raise
                 except Exception:  # noqa: BLE001 - malformed API responses also make this optional peer unusable
                     return None

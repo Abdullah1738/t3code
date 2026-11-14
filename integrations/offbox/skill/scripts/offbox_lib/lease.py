@@ -400,6 +400,10 @@ def ensure_ttl(box_id: str, ttl: int, s: dict | None = None) -> bool:
         api.set_ttl(box_id, ttl)
         return True
     except OffboxError as e:
+        from .home import StartWaitFailed
+        if isinstance(e, StartWaitFailed) or (api.BACKEND == "server" and getattr(e, 'status', None) == 503
+                and getattr(e, 'api_code', None) in ('server_not_ready', 'server_starting')):
+            raise
         say(f"warning: could not set auto-stop on {box_id}: {e}")
         return False
 

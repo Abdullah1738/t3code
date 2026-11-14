@@ -3,6 +3,7 @@
 Rules (owner, 12 Nov 2026):
 - Home marked up: the run goes home. If the server cannot be reached before the run is accepted (no command
   started there yet), this one run goes to Boat instead and the failure is recorded for the health monitor.
+- An answering server that is starting is waited for up to 600 s, keeping its box and queue place.
 - After the run was accepted there is no failover, ever: it would run twice. The client reconnects (runs.follow).
 - Home marked down by the monitor: new runs go straight to Boat. It comes back by itself after three good checks.
 - Person-box work (OFFBOX_THREAD=person:<name>) never goes to Boat: it fails fast with EXIT_HOME_DOWN.
@@ -10,6 +11,8 @@ With no home server configured none of this code does anything."""
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import os
 import sqlite3
@@ -23,7 +26,11 @@ import toollog
 from . import common
 from .common import EXIT_HOME_DOWN, EXIT_INFRA, OffboxError, log, say
 
+from .startup_health import START_WAIT_S, starting_phase, wait_seconds
+
 PROBE_TIMEOUT_S = 3.0
+HOME_START_WAIT_S = START_WAIT_S
+PRE_START = contextvars.ContextVar("home_pre_start", default=None)
 FAILOVER_ENV = "OFFBOX_FAILOVER"      # set in the re-executed process: why this run is on Boat ("unreachable: ...")
 MAX_FAILURE_LINES = 200
 RECENT_FAILURE_S = 180
@@ -52,8 +59,79 @@ def probe(timeout: float = PROBE_TIMEOUT_S) -> str | None:
         return result
 
 
+class StartWaitFailed(OffboxError):
+    """The server explicitly refused the request before executing it."""
+    def __init__(self, reason, run_id="", box=None):
+        super().__init__(reason, outage=True, run_id=run_id, box=box)
+
+
+@contextlib.contextmanager
+def pre_start(run_id):
+    token = PRE_START.set(run_id)
+    try:
+        yield
+    finally:
+        PRE_START.reset(token)
+
+
+def error_phase(error):
+    if getattr(error, "status", None) != 503 or getattr(error, "api_code", "") not in (
+            "server_not_ready", "server_starting"):
+        return None
+    return starting_phase({"message": error.message, "starting": getattr(error, "starting", False),
+                           "phase": getattr(error, "phase", None)})
+
+
+def wait_while_starting(reason, run_id="", *, checkpoint="probe", box=None,
+                        clock=None, sleep=None, read=None, deadline=None):
+    clock, sleep, read = clock or time.monotonic, sleep or time.sleep, read or _health
+    phase = reason if isinstance(reason, str) else starting_phase(reason)
+    limit = wait_seconds()
+    start = clock()
+    end = start + limit if deadline is None else deadline
+    say(f"home offbox server is starting ({phase}); waiting up to {limit:g} s, "
+        + (f"keeping {box} and the queue place" if box else "keeping the queue place"))
+    outcome = "failover"
+    from . import prepare
+    with prepare.pause_for_home_start():
+        try:
+            while True:
+                left = end - clock()
+                if left <= 0:
+                    return f"home still starting after {limit:g} s ({phase})"
+                sleep(min(5, left))
+                data = read(min(PROBE_TIMEOUT_S, max(.001, end - clock())))
+                if isinstance(data, dict) and data.get("ok") is True:
+                    outcome = "ready"
+                    return None
+                next_phase = starting_phase(data)
+                if not next_phase:
+                    return _health_reason(data)
+                phase = next_phase
+        finally:
+            toollog.emit("backend", "backend.start_wait", duration_ms=(clock()-start)*1000,
+                         ids={"run": run_id, "box": box},
+                         props={"phase": phase, "checkpoint": checkpoint, "outcome": outcome})
+
+
+def _health_reason(data):
+    if isinstance(data, str):
+        return data
+    why = "; ".join(str(x) for x in (data.get("reasons") or [])[:2]) if isinstance(data, dict) else ""
+    return f"server says it cannot take runs ({why or 'not ready'})"
+
+
 def _probe(timeout: float = PROBE_TIMEOUT_S) -> str | None:
-    """One GET /health (no token). None = the server takes runs; else a short reason why not."""
+    data = _health(timeout)
+    phase = starting_phase(data)
+    if phase:
+        return wait_while_starting(phase, os.environ.get("OFFBOX_BACKGROUND_RUN", ""),
+                                   checkpoint="person" if common.person() else "probe")
+    return None if isinstance(data, dict) and data.get("ok") is True else _health_reason(data)
+
+
+def _health(timeout: float = PROBE_TIMEOUT_S):
+    """One GET /health (no token): its JSON body or a short transport failure reason."""
     url = health_url()
     if not url:
         return "no home server configured"
@@ -65,10 +143,7 @@ def _probe(timeout: float = PROBE_TIMEOUT_S) -> str | None:
         return f"health answered HTTP {e.code}"
     except (OSError, ValueError) as e:
         return f"no answer ({type(e).__name__})"
-    if not isinstance(d, dict) or not d.get("ok"):
-        why = "; ".join(str(x) for x in (d.get("reasons") or [])[:2]) if isinstance(d, dict) else ""
-        return f"server says it cannot take runs ({why or 'not ready'})"
-    return None
+    return d
 
 
 def record_failure(reason: str, run_id: str = "") -> None:
@@ -115,11 +190,12 @@ def before_run(argv: list[str]) -> None:
     health_ok = not recent and why is None
     if recent or health_ok or (why or "").startswith("no answer"):
         # /health can stay green while authenticated allocation reads stop answering.
-        why = api.probe_backend("server", PROBE_TIMEOUT_S)
-        if why and health_ok:
+        with pre_start(os.environ.get("OFFBOX_BACKGROUND_RUN", "")):
             why = api.probe_backend("server", PROBE_TIMEOUT_S)
+            if why and health_ok and not why.startswith("home still starting after "):
+                why = api.probe_backend("server", PROBE_TIMEOUT_S)
     if why:
-        fail_over(why, argv)
+        fail_over(why, argv, os.environ.get("OFFBOX_BACKGROUND_RUN", ""))
 
 
 def person_gate() -> None:
@@ -130,7 +206,10 @@ def person_gate() -> None:
     st = common.home_state()
     why = None
     if st.get("state") == "home_down":
-        why = st.get("reason") or "marked down by the health monitor"
+        data = _health()
+        phase = starting_phase(data)
+        why = wait_while_starting(phase, checkpoint="person") if phase else (
+            st.get("reason") or "marked down by the health monitor")
     else:
         why = probe()
     if why:
@@ -163,6 +242,9 @@ def fail_over(reason: str, argv: list[str], run_id: str = "") -> bool:
     if api.probe_backend("boat", PROBE_TIMEOUT_S):
         say("Boat's API is unavailable too; keeping this run on home")
         return False
+    if run_id:
+        with contextlib.closing(common.db()) as con:
+            con.execute("DELETE FROM prune_holds WHERE run_id=?", (run_id,))
     from .runs import BACKGROUND_RUN_ENV
     queued = os.environ.get(BACKGROUND_RUN_ENV)
     if queued:

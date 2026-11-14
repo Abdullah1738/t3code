@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
+from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
 from . import command_usage, common, containers, prune, prepare, userns
 from . import resources
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
@@ -1565,7 +1565,14 @@ class Runner:
             r = api.cmd_start(self.box, exit_recording_command(script, self.run_id, claim_id=claim),
                               meta={"repo": me.get("repo_key"), "kind": run_kind(cmd_text), "run_id": self.run_id},
                               retry_interrupted=retry_interrupted(a))
+        except home.StartWaitFailed:
+            self.started = False
+            raise
         except (api.ApiError, api.NetworkError) as e:
+            if api.BACKEND == "server" and getattr(e, 'status', None) == 503 and e.api_code in (
+                    'server_not_ready', 'server_starting'):
+                self.started = False
+                raise
             # A 4xx answer (400 E2BIG, 409 not ready, 429 rate limit) means boat refused it: nothing ran.
             # Without this the run sat "starting" for an hour and held the box until it stopped.
             # Cloudflare 521-526 except 524 never reached boat, so nothing ran; 520, 524 and network errors stay started.
@@ -2773,7 +2780,7 @@ def _run_attempt(a, me: dict) -> int:
         return _run_remote(a, rn)
     except OffboxError as e:
         e.started = e.started or rn.started
-        e.run_id, e.box = rn.run_id, rn.box
+        e.run_id, e.box = rn.run_id, rn.box or e.box
         raise
     except KeyboardInterrupt:
         if not rn.started:
@@ -2867,7 +2874,8 @@ def _run_remote(a, rn) -> int:
     old = {s: signal.signal(s, on_sig) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     try:
         try:
-            rn.start()
+            with home.pre_start(rn.run_id):
+                rn.start()
         except OffboxError as e:
             if not rn.started:
                 if e.code == EXIT_LOCAL:

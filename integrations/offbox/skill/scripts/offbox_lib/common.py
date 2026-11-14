@@ -67,7 +67,7 @@ def home_state() -> dict:
         s = json.loads(BACKEND_STATE.read_text())
     except (OSError, ValueError):
         return {"state": "home_up"}
-    return s if isinstance(s, dict) and s.get("state") in ("home_up", "home_down") else {"state": "home_up"}
+    return s if isinstance(s, dict) and s.get("state") in ("home_up", "home_down", "home_starting") else {"state": "home_up"}
 
 
 def person() -> str | None:

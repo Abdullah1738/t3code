@@ -21,7 +21,7 @@ import urllib.request
 import weakref
 
 from .common import (OffboxError, EXIT_INFRA, SERVER_CFG, backend, db, iso_ts, log, owner_scoped, require_mine,
-                     token_owner)
+                     token_owner, person)
 from . import capacity
 
 BACKEND = backend()
@@ -85,7 +85,10 @@ def probe_backend(name: str, timeout: float = 3) -> str | None:
                 with _open(req, timeout=max(.001, end - time.time())) as response:
                     json.loads(_read_response(response, end))
         return None
-    except (OffboxError, OSError, ValueError, subprocess.TimeoutExpired, http.client.HTTPException):
+    except (OffboxError, OSError, ValueError, subprocess.TimeoutExpired, http.client.HTTPException) as error:
+        from .home import StartWaitFailed
+        if isinstance(error, StartWaitFailed):
+            return str(error)
         return "authenticated API did not answer successfully"
 
 
@@ -111,7 +114,7 @@ class ApiError(OffboxError):
             message = f"Cloudflare could not reach boat.dev ({CF_OUTAGE[status]})"
         # server_not_ready: our server is up but still importing its pool or reconciling after a restart.
         super().__init__(f"{NAME} API {status} {code}: {message}", EXIT_INFRA,
-                         outage=status in CF_OUTAGE or code == "server_not_ready")
+                         outage=status in CF_OUTAGE or code in ("server_not_ready", "server_starting"))
         self.status, self.api_code, self.retryable = status, code, retryable
         self.message = message
 
@@ -335,10 +338,12 @@ def budget(seconds: float):
     prev = _DEADLINE
     mine = time.time() + seconds
     _DEADLINE = mine if prev is None else min(prev, mine)
+    initial = _DEADLINE
     try:
         yield
     finally:
-        _DEADLINE = prev
+        paused = max(0, _DEADLINE - initial) if _DEADLINE is not None else 0
+        _DEADLINE = None if prev is None else prev + paused
 
 
 def left() -> float | None:
@@ -447,10 +452,36 @@ def _own_box(path: str) -> None:
 
 def _call(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
          retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
+    global _DEADLINE
     _own_box(path)
+    from . import home
     scope = _REQUEST_SCOPE.get()
     with scope.request() if scope is not None else contextlib.nullcontext():
-        return _request(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
+        wait_end = None
+        while True:
+            try:
+                return _request(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
+            except ApiError as error:
+                phase = home.error_phase(error)
+                if BACKEND != "server" or home.PRE_START.get() is None or not phase:
+                    raise
+                box = path.split("/")[2] if path.startswith("/sandboxes/") else None
+                checkpoint = "person" if person() else (
+                    "post" if path.endswith("/commands") else "autostop" if method == "PATCH" else "probe")
+                if wait_end is None:
+                    wait_end = time.monotonic() + home.wait_seconds()
+                began = time.monotonic()
+                why = home.wait_while_starting(phase, home.PRE_START.get(), checkpoint=checkpoint, box=box,
+                                               deadline=wait_end)
+                if why:
+                    raise home.StartWaitFailed(why, home.PRE_START.get(), box) from error
+                elapsed = time.monotonic() - began
+                if deadline is not None:
+                    deadline += elapsed
+                if _DEADLINE is not None:
+                    _DEADLINE += elapsed
+                if scope is not None:
+                    scope.end += elapsed
 
 
 def _log_request_error(method: str, path: str, detail: str) -> None:
@@ -603,6 +634,10 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             retryable = bool((err.get("details") or {}).get("retryable")) or code in (
                 "sandbox_starting", "boat_starting", "idempotency_in_progress", "ssh_host_key_unavailable",
                 "rate_limited") or msg == "sandbox_restoring"
+            if BACKEND == "server" and e.code == 503 and code in ("server_not_ready", "server_starting"):
+                failure = ApiError(e.code, code, msg, retryable)
+                failure.starting, failure.phase = d.get("starting") is True, d.get("phase")
+                raise failure
             if e.code == 404 and ok404:
                 return None
             safe_method = method in ("GET", "DELETE", "PATCH") or "Idempotency-Key" in h

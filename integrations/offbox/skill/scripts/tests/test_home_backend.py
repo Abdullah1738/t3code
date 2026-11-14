@@ -425,15 +425,19 @@ class Failover(HomeFiles):
         with patch("urllib.request.urlopen", side_effect=OSError("timed out")):
             self.assertIn("no answer", home.probe())
 
-    def test_unreachable_before_the_command_was_sent_also_fails_over(self):
+    def test_unreachable_fails_over_but_starting_waits_at_home(self):
         gone = api.NetworkError("offbox server API unreachable (POST /sandboxes): timed out")
         with patch.object(home, "probe", return_value=None), patch.object(runs, "run_remote", side_effect=gone):
             rc, _ = self.run_cmd("--", "make", "test")
         self.assertEqual(rc, "exec")
         self.assertEqual(len(self.failures()), 1)
         starting = api.ApiError(503, "server_not_ready", "reconciling runs and boxes after start")
-        with patch.object(home, "probe", return_value=None), patch.object(runs, "run_remote", side_effect=starting):
-            self.assertEqual(self.run_cmd("--", "make", "test")[0], "exec")
+        before = len(self.failures())
+        with patch.object(home, "probe", return_value=None), patch.object(runs, "run_remote", side_effect=[starting, 0]), \
+                patch.object(home, "_health", side_effect=[{"ok": False, "reasons": [starting.message]}, {"ok": True}]), \
+                patch.object(home.time, "sleep"):
+            self.assertEqual(self.run_cmd("--", "make", "test")[0], 0)
+        self.assertEqual(len(self.failures()), before)
 
     def test_once_the_run_was_accepted_it_never_moves(self):
         lost = api.NetworkError("offbox server API unreachable")
@@ -1292,9 +1296,9 @@ class PersonNeverOnBoat(HomeFiles):
         self.stack.enter_context(patch.dict(os.environ, {"OFFBOX_THREAD": "person:moni"}))
         self.stack.enter_context(patch.object(os, "execve", side_effect=AssertionError("her work never goes to Boat")))
 
-    def test_marked_down_fails_fast_without_touching_the_network(self):
+    def test_marked_down_without_a_starting_answer_fails_fast(self):
         self.monitor_says("home_down", reason="no answer for 2 checks")
-        with patch("urllib.request.urlopen", side_effect=AssertionError("no network call")):
+        with patch.object(home, "_health", return_value="no answer (TimeoutError)"):
             with self.assertRaises(common.OffboxError) as cm:
                 home.person_gate()
         self.assertEqual(cm.exception.code, 93)
