@@ -212,7 +212,7 @@ test("secret errors retain redacted external frames without the original paths",
   const fail = spyOn(fs, "readdir").mockRejectedValueOnce(cause);
   try { await sweepSecrets(deps()); } finally { fail.mockRestore(); }
   const logged = await lines();
-  expect(logged[0]?.error).toEqual({ tag: "secrets.catch9", name: "Error", message: "[redacted]", stack: ["<external>:12", "<external>:34"] });
+  expect(logged[0]?.error).toEqual({ tag: "secrets.catch9", name: "Error", message: "[redacted]", causeKey: "callsite_failure", stack: ["<external>:12", "<external>:34"] });
   for (const value of [secret, "PRIVATE_PATH_SENTINEL", "one.js", "two.js"]) expect(JSON.stringify(logged)).not.toContain(value);
 });
 
