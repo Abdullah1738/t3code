@@ -188,7 +188,7 @@ class RepoKeyTests(Isolated):
 
     def test_non_crpko_node_repo_keeps_the_neutral_node_template(self):
         (self.root / 'package.json').write_text('{}')
-        self.assertEqual(lease.pick_template(self.root, self.good()), 'crpko-node')
+        self.assertEqual(lease.pick_template(self.root, self.good()), ('crpko-node', 'package.json'))
 
 
 class SplitPoolTests(Isolated):

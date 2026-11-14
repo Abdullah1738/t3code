@@ -1,3 +1,8 @@
+if __package__:
+    from . import test_environment
+else:
+    import test_environment
+
 import hashlib
 import hmac
 import json
@@ -11,7 +16,10 @@ import unittest
 from http.server import ThreadingHTTPServer
 from unittest.mock import patch
 
-import test_engine
+if __package__:
+    from . import test_engine
+else:
+    import test_engine
 
 
 SRC = Path(__file__).resolve().parents[1] / "src"

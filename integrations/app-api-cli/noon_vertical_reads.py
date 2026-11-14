@@ -52,9 +52,12 @@ def _headers(service, deadline):
     return headers
 
 
-def _read(route, headers, deadline, order=None):
+def _read(route, headers, deadline, order=None, *, page=None):
     """Literal read allowlist; arbitrary URLs, payloads and redirects forbidden."""
     body = None
+    if page is not None and (route not in ('food_orders', 'nownow_orders')
+                            or type(page) is not int or not 1 <= page <= 100):
+        raise NoonError('INVALID_READ_PAGE')
     if route == 'marketplace_manifest' and isinstance(order, str) and MARKETPLACE_ORDER.fullmatch(order):
         host, path = 'api-app.noon.com', '/_svc/order-v2/order/' + order
     elif route == 'food_track' and isinstance(order, str) and FOOD_ORDER.fullmatch(order):
@@ -64,7 +67,7 @@ def _read(route, headers, deadline, order=None):
         body = json.dumps({'orderNr': order}).encode()
     elif route == 'food_orders' and order is None:
         host, path = 'api-app-fd.noon.com', '/_svc/mp-food-api-mpnoon/order/orders'
-        body = b'{}'
+        body = json.dumps({'page': page, 'limit': 10}).encode() if page is not None else b'{}'
     elif route in ('nownow_track', 'nownow_detail') and isinstance(order, str) and NOWNOW_ORDER.fullmatch(order):
         host = 'api-app-fd.noon.com'
         path = '/_svc/mp-shop-api-mpnoon/v1/order/'
@@ -75,40 +78,45 @@ def _read(route, headers, deadline, order=None):
             body = json.dumps({'orderNr': order}).encode()
     elif route == 'nownow_orders' and order is None:
         host, path = 'api-app-fd.noon.com', '/_svc/mp-shop-api-mpnoon/v1/order/history'
-        body = b'{}'
+        body = json.dumps({'page': page, 'limit': 10}).encode() if page is not None else b'{}'
     else:
         raise NoonError('ENDPOINT_OR_ORDER_DENIED')
     headers = dict(headers)
     headers.update({'content-type': 'application/json', 'accept': 'application/json', 'accept-encoding': 'identity'})
-    try:
-        req = urllib.request.Request('https://' + host + path, headers=headers,
-                                     method='POST' if body is not None else 'GET', data=body)
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), core.NoRedirect())
-        with core.read_deadline(deadline) as left:
-            with opener.open(req, timeout=left) as response:
-                raw = response.read(core.MAX_BYTES + 1)
-            if len(raw) > core.MAX_BYTES:
-                raise NoonError('RESPONSE_TOO_LARGE')
-            if raw[:2] == b'\x1f\x8b':
-                decoder = zlib.decompressobj(31)
-                raw = decoder.decompress(raw, core.MAX_BYTES + 1)
-                if len(raw) > core.MAX_BYTES or decoder.unconsumed_tail:
+    with toollog.request(path):
+        try:
+            req = urllib.request.Request('https://' + host + path, headers=headers,
+                                         method='POST' if body is not None else 'GET', data=body)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), core.NoRedirect())
+            with core.read_deadline(deadline) as left:
+                with toollog.phase('fetch'):
+                    with opener.open(req, timeout=left) as response:
+                        raw = response.read(core.MAX_BYTES + 1)
+                toollog.response(getattr(response, 'code', None), None)
+                if len(raw) > core.MAX_BYTES:
                     raise NoonError('RESPONSE_TOO_LARGE')
-                if not decoder.eof:
-                    raise NoonError('NATIVE_READ_FAILED')
-            data = json.loads(raw, object_pairs_hook=_unique_object)
-            if not isinstance(data, dict):
-                raise NoonError('SCHEMA_CHANGED')
-        return data
-    except urllib.error.HTTPError as exc:
-        code = exc.code
-        exc.close()
-        raise NoonError({401: 'AUTH_EXPIRED', 403: 'AUTH_FORBIDDEN', 404: 'ORDER_NOT_FOUND',
-                         429: 'RATE_LIMITED'}.get(code, 'HTTP_' + str(code))) from None
-    except TimeoutError:
-        raise NoonError('NATIVE_READ_TIMEOUT') from None
-    except (urllib.error.URLError, http.client.HTTPException, ValueError, OSError, zlib.error):
-        raise NoonError('NATIVE_READ_FAILED') from None
+                if raw[:2] == b'\x1f\x8b':
+                    decoder = zlib.decompressobj(31)
+                    raw = decoder.decompress(raw, core.MAX_BYTES + 1)
+                    if len(raw) > core.MAX_BYTES or decoder.unconsumed_tail:
+                        raise NoonError('RESPONSE_TOO_LARGE')
+                    if not decoder.eof:
+                        raise NoonError('NATIVE_READ_FAILED')
+                with toollog.phase('parse'):
+                    data = json.loads(raw, object_pairs_hook=_unique_object)
+                if not isinstance(data, dict):
+                    raise NoonError('SCHEMA_CHANGED')
+            toollog.response(getattr(response, 'code', None), data)
+            return data
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+            exc.close()
+            raise NoonError({401: 'AUTH_EXPIRED', 403: 'AUTH_FORBIDDEN', 404: 'ORDER_NOT_FOUND',
+                             429: 'RATE_LIMITED'}.get(code, 'HTTP_' + str(code))) from None
+        except TimeoutError:
+            raise NoonError('NATIVE_READ_TIMEOUT') from None
+        except (urllib.error.URLError, http.client.HTTPException, ValueError, OSError, zlib.error):
+            raise NoonError('NATIVE_READ_FAILED') from None
 
 
 def _unique_object(pairs):
@@ -327,11 +335,44 @@ def track(order, service, timeout=10, *, deadline=None):
     return out
 
 
-@toollog.timed("noon", "provider.orders")
-def food_orders(timeout=10):
+def placed_time(row):
+    """These two legacy order APIs carry local wall time plus a separate offset."""
+    value = row.get('createdAt') or row.get('placedAt')
+    if not isinstance(value, str) or not re.fullmatch(
+            r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?', value):
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if parsed.tzinfo is None:
+            # Only the independently corroborated UAE offset is certified.
+            if row.get('timeZone') != '+04:00':
+                return None
+            parsed = parsed.replace(tzinfo=core.DUBAI)
+        return parsed.isoformat()
+    except ValueError:
+        return None
+
+
+def list_coverage(data, page, count):
+    pages = data.get('pages')
+    if page is None:
+        return {'default_page_only': True, 'exhaustive': False,
+                'reported_pages': pages if type(pages) is int else None}
+    if (type(pages) is not int or pages < 1 or count > 10
+            or (page < pages and count != 10) or (page > pages and count != 0)):
+        raise NoonError('PAGINATION_SCHEMA_CHANGED')
+    return {'default_page_only': False, 'paging_verified': True, 'page': page,
+            'total_pages': pages, 'reported_pages': pages,
+            'exhaustive': page >= pages, 'ordered_by_placed_at': True}
+
+
+@toollog.timed("noon", "provider.orders", lane="food")
+def food_orders(timeout=10, *, page=None):
+    if page is not None and (type(page) is not int or not 1 <= page <= 100):
+        raise NoonError('INVALID_READ_PAGE')
     deadline = _deadline(timeout)
     headers = _headers('food', deadline)
-    data = _food_data(_read('food_orders', headers, deadline))
+    data = _food_data(_read('food_orders', headers, deadline, page=page))
     if not isinstance(data.get('orders'), list):
         raise NoonError('SCHEMA_CHANGED')
     rows, seen = [], set()
@@ -346,19 +387,20 @@ def food_orders(timeout=10):
         out = core.base(order, 'food', True)
         delivered = raw == 'delivered' and row.get('isDelivered') is True and row.get('logisticsStatusCode') == 'delivered'
         out.update(raw_status=raw, status='delivered' if delivered else 'unknown', scope='order',
-                   coverage='native_food_default_list_page')
+                   coverage='native_food_list_page', placed_at=placed_time(row))
         rows.append(out)
     core.remaining(deadline)
     return {'ok': True, 'app': 'noon', 'source': 'native_order_api', 'orders': rows,
-            'coverage': {'food': {'default_page_only': True, 'exhaustive': False,
-                                  'reported_pages': data.get('pages') if type(data.get('pages')) is int else None}}}
+            'coverage': {'food': list_coverage(data, page, len(rows))}}
 
 
-@toollog.timed("noon", "provider.orders")
-def nownow_orders(timeout=10):
+@toollog.timed("noon", "provider.orders", lane="nownow")
+def nownow_orders(timeout=10, *, page=None):
+    if page is not None and (type(page) is not int or not 1 <= page <= 100):
+        raise NoonError('INVALID_READ_PAGE')
     deadline = _deadline(timeout)
     headers = _headers('nownow', deadline)
-    data = _nownow_data(_read('nownow_orders', headers, deadline))
+    data = _nownow_data(_read('nownow_orders', headers, deadline, page=page))
     if not isinstance(data.get('orders'), list):
         raise NoonError('SCHEMA_CHANGED')
     rows, seen = [], set()
@@ -375,9 +417,8 @@ def nownow_orders(timeout=10):
         agreement = row.get('logisticsStatusCode') == raw == row.get('customerStatusCode')
         out = core.base(order, 'nownow', True)
         out.update(raw_status=raw, status=NOWNOW_STAGES.get(raw, 'unknown') if agreement else 'unknown',
-                   scope='order', coverage='native_nownow_default_list_page')
+                   scope='order', coverage='native_nownow_list_page', placed_at=placed_time(row))
         rows.append(out)
     core.remaining(deadline)
     return {'ok': True, 'app': 'noon', 'source': 'native_order_api', 'orders': rows,
-            'coverage': {'nownow': {'default_page_only': True, 'exhaustive': False,
-                                  'reported_pages': data.get('pages') if type(data.get('pages')) is int else None}}}
+            'coverage': {'nownow': list_coverage(data, page, len(rows))}}

@@ -147,7 +147,7 @@ export class GuestBook {
     try {
       appendFileSync(this.auditPath, JSON.stringify({ at: new Date(this.now()).toISOString(), address, event, ...detail }) + "\n", { mode: 0o600 });
       chmodSync(this.auditPath, 0o600);
-    } catch { toolError("guests", "guests.catch1"); /* The audit log is best effort; it never blocks a message. */ }
+    } catch (caughtError) { toolError("guests", "guests.catch1", caughtError); /* The audit log is best effort; it never blocks a message. */ }
   }
 }
 

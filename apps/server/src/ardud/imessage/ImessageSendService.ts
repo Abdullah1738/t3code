@@ -153,7 +153,7 @@ const make = Effect.gen(function* () {
         "The iMessage bridge CLI returned an unexpected reply; the message may still have been queued.",
       );
     }
-    return { id: ack.id, created: ack.created, chat: input.to ?? "owner" };
+    return { id: ack.id, created: ack.created, chat: ack.chat ?? input.to ?? "unknown" };
   });
 
   return ImessageSendService.of({ send });

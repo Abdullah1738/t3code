@@ -35,9 +35,26 @@ def active() -> bool:
     return common.backend() == "server"
 
 
-def may_fail_over() -> bool:
+def base_needs_home(explicit_base: str | None) -> bool:
+    from . import base_catalog
+    return bool(explicit_base and not any(r['name'] == explicit_base for r in base_catalog.rows('boat')))
+
+
+def base_down_error(base: str, reason: str) -> OffboxError:
+    return OffboxError(f"saved base '{base}' lives on the home offbox server, which is down ({reason}); "
+                      "runs that name a base wait for it. Nothing ran and nothing was sent to Boat. "
+                      "Retry when home is back, or drop --base to run on the repo template.", code=EXIT_HOME_DOWN)
+
+
+def failover_decision(decision: str, reason: str, base: str | None = None, run_id: str = '') -> None:
+    toollog.emit('home', 'home.failover_decision', ids={'run': run_id},
+                 props={'decision': decision, 'base': base, 'reason': reason})
+
+
+def may_fail_over(explicit_base: str | None = None) -> bool:
     """The home server was picked automatically for ordinary work: Boat may take this run instead."""
-    return active() and common.backend_pinned() is None and common.person() is None
+    return (active() and common.backend_pinned() is None and common.person() is None
+            and not base_needs_home(explicit_base))
 
 
 def health_url() -> str | None:
@@ -71,7 +88,7 @@ def _probe(timeout: float = PROBE_TIMEOUT_S) -> str | None:
     return None
 
 
-def record_failure(reason: str, run_id: str = "") -> None:
+def record_failure(reason: str, run_id: str = "", *, base: str | None = None, base_kept: bool = False) -> None:
     """One line for the health monitor: a run could not reach home before it was accepted."""
     try:
         common.HOME_FAILURES.parent.mkdir(parents=True, exist_ok=True)
@@ -79,7 +96,8 @@ def record_failure(reason: str, run_id: str = "") -> None:
             lines = common.HOME_FAILURES.read_text().splitlines()[-(MAX_FAILURE_LINES - 1):]
         except OSError:
             lines = []
-        lines.append(json.dumps({"ts": time.time(), "reason": reason[:300], "run": run_id}))
+        lines.append(json.dumps({"ts": time.time(), "reason": reason[:300], "run": run_id,
+                                 "base": base, "base_kept": base_kept}))
         tmp = common.HOME_FAILURES.with_name(common.HOME_FAILURES.name + f".{os.getpid()}.tmp")
         tmp.write_text("\n".join(lines) + "\n")
         os.replace(tmp, common.HOME_FAILURES)
@@ -106,9 +124,7 @@ def recent_failure() -> bool:
     return False
 
 
-def before_run(argv: list[str]) -> None:
-    if not may_fail_over():
-        return
+def preflight_reason() -> str | None:
     from . import api
     recent = recent_failure()
     why = None if recent else probe()
@@ -118,8 +134,18 @@ def before_run(argv: list[str]) -> None:
         why = api.probe_backend("server", PROBE_TIMEOUT_S)
         if why and health_ok:
             why = api.probe_backend("server", PROBE_TIMEOUT_S)
+    return why
+
+
+def before_run(argv: list[str], *, explicit_base: str | None = None) -> None:
+    wait_for_base = active() and common.person() is None and base_needs_home(explicit_base)
+    if not may_fail_over(explicit_base) and not wait_for_base:
+        return
+    why = preflight_reason()
     if why:
-        fail_over(why, argv)
+        if wait_for_base:
+            raise OffboxError(f"home offbox server not reachable ({why})", outage=True)
+        fail_over(why, argv, explicit_base=explicit_base)
 
 
 def person_gate() -> None:
@@ -134,6 +160,7 @@ def person_gate() -> None:
     else:
         why = probe()
     if why:
+        failover_decision('wait_person', 'home_down')
         raise OffboxError(f"the home offbox server is down ({why}); {who}'s tasks wait until it is back. "
                           "Nothing ran and nothing was sent to Boat", code=EXIT_HOME_DOWN)
 
@@ -156,13 +183,19 @@ def network_failure(error: OffboxError) -> bool:
     return False
 
 
-def fail_over(reason: str, argv: list[str], run_id: str = "") -> bool:
+def fail_over(reason: str, argv: list[str], run_id: str = "", *, explicit_base: str | None = None) -> bool:
     """Exec onto an answering Boat, or return False to keep waiting on home. Only before command start."""
     from . import api
-    record_failure(reason, run_id)
+    from .runs import BACKGROUND_RUN_ENV
+    run_id = run_id or os.environ.get(BACKGROUND_RUN_ENV, '')
+    failover_decision('boat', 'unreachable', explicit_base, run_id)
+    record_failure(reason, run_id, base=explicit_base, base_kept=explicit_base is not None)
     if api.probe_backend("boat", PROBE_TIMEOUT_S):
         say("Boat's API is unavailable too; keeping this run on home")
         return False
+    queued = os.environ.get(BACKGROUND_RUN_ENV)
+    if queued:
+        _forward_background(queued)
     elapsed = max(0, time.monotonic() - WAIT_STARTED)*1000 if WAIT_STARTED is not None else 0
     toollog.emit("backend", "backend.failover", duration_ms=elapsed, ok=True, ids={"run": run_id},
                  props={"from": "home", "to": "boat", "reason": "unreachable", "waitMs": elapsed})
@@ -170,9 +203,34 @@ def fail_over(reason: str, argv: list[str], run_id: str = "") -> bool:
     log(f"failover to boat: {reason[:300]}")
     env = dict(os.environ, OFFBOX_BACKEND="boat")
     env[FAILOVER_ENV] = reason[:200]
+    if queued:
+        from .runs import forward_background
+        forward_background(env)
     sys.stdout.flush()
     sys.stderr.flush()
     os.execve(sys.executable, [sys.executable, os.path.realpath(sys.argv[0]), *argv], env)
+
+
+def _forward_background(run_id: str) -> None:
+    """Publish the same queued ID on Boat before retiring its home row; existing waiters can follow the handoff."""
+    source = common.db()
+    target = None
+    try:
+        row = source.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+        if not row or row['status'] != 'starting' or row['box_id'] or row['process_id']:
+            raise OffboxError(f'{run_id}: refusing failover after a possible start', started=True)
+        target = sqlite3.connect(common.db_path_for('boat'), isolation_level=None)
+        common.ensure_schema(target)
+        names = list(row.keys())
+        with common.write(target):
+            target.execute('INSERT INTO runs (' + ','.join(names) + ') VALUES (' + ','.join('?' for _ in names) + ')', tuple(row))
+            target.execute("INSERT INTO kv(k,v) VALUES (?, '1')", ('start_claim:' + run_id,))
+        source.execute("UPDATE runs SET status='forwarded',error='boat',end_at=? WHERE run_id=? "
+                       "AND status='starting' AND box_id IS NULL AND process_id IS NULL", (common.now(), run_id))
+    finally:
+        source.close()
+        if target is not None:
+            target.close()
 
 
 def only_on_home(table: str, where: str, args: tuple) -> bool:

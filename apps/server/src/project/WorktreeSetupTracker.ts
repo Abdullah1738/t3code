@@ -1,3 +1,4 @@
+import { AnalyticsInterruptCause } from "../observability/analyticsInterruption.ts";
 import type {
   ThreadId,
   WorktreeSetupSnapshot,
@@ -293,7 +294,7 @@ export const make = Effect.gen(function* () {
     if (!tracked || tracked.snapshot.phase !== "running" || !tracked.fiber) {
       return false;
     }
-    yield* Fiber.interrupt(tracked.fiber);
+    yield* Fiber.interruptAs(tracked.fiber, undefined, AnalyticsInterruptCause.context("stop"));
     return true;
   });
 

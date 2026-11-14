@@ -61,6 +61,54 @@ class OrderCharges(unittest.TestCase):
         self.follow(30)
         self.assertEqual(mc.load(self.data)['cases'], [])
 
+    def test_merchant_metadata_forms_label_and_confirm_the_order_case(self):
+        forms = (
+            ('native', {'app': 'noon'}, 'noon'),
+            ('receipt', {'app': 'acme', 'merchant': 'Acme'}, 'Acme'),
+            ('web', {'app': 'web', 'merchant_name': 'Fabrique'}, 'Fabrique'),
+            ('web-empty-merchant', {'app': 'web', 'merchant': '', 'merchant_name': 'Fabrique'}, 'Fabrique'),
+            ('web-null-merchant', {'app': 'web', 'merchant': None, 'merchant_name': 'Fabrique'}, 'Fabrique'),
+            ('explicit-priority', {'app': 'web', 'merchant': 'Acme', 'merchant_name': 'Fabrique'}, 'Acme'),
+            ('empty-name', {'app': 'noon', 'merchant_name': ''}, 'noon'),
+            ('null-name', {'app': 'noon', 'merchant_name': None}, 'noon'),
+        )
+        for label, metadata, merchant in forms:
+            with self.subTest(form=label):
+                cfg = {key: value for key, value in self.cfg.items() if key != 'merchant'}
+                cfg.update(metadata)
+                self.path.write_text(json.dumps(cfg))
+                self.data = self.root / label
+                self.follow(15)
+                self.assertEqual(mc.load(self.data)['cases'][0]['merchant'], merchant)
+                alert = self.alert(body=self.alert()['body'].replace('ACME', merchant.upper()))
+                self.follow(16, [alert])
+                self.assertEqual(mc.load(self.data)['cases'][0]['status'], 'closed')
+                self.data = self.root / (label + '-confirmed-first')
+                self.follow(15, [alert])
+                self.assertEqual(mc.load(self.data)['cases'], [])
+
+    def test_web_merchant_identity_disambiguates_competing_orders(self):
+        for source in ('web', 'receipt'):
+            for same_merchant in (True, False):
+                with self.subTest(peer_source=source, same_merchant=same_merchant):
+                    self.data = self.root / f'peers-{source}-{same_merchant}'
+                    cfg = {key: value for key, value in self.cfg.items() if key != 'merchant'}
+                    cfg.update(app='web', merchant_name='Fabrique')
+                    self.path.write_text(json.dumps(cfg))
+                    other = dict(cfg, watcher='order-peer-456', order='456')
+                    name = 'Fabrique' if same_merchant else 'Other'
+                    if source == 'web':
+                        other['merchant_name'] = name
+                    else:
+                        other.update(app=name.lower(), merchant=name)
+                        other.pop('merchant_name')
+                    (self.registry / 'orders' / 'other.json').write_text(json.dumps(other))
+                    self.follow(15)
+                    self.follow(16, [self.alert(body=self.alert()['body'].replace('ACME', 'FABRIQUE'))])
+                    cases = {case['reference']: case for case in mc.load(self.data)['cases']}
+                    self.assertEqual(cases['123']['status'], 'open' if same_merchant else 'closed')
+                    self.assertEqual(cases['456']['status'], 'open')
+
     def test_bank_alert_input_class_requires_matching_identity(self):
         rows = [self.alert(body=self.alert()['body'].replace('81.15', '81.16')),
                 self.alert(body=self.alert()['body'].replace('AED', 'USD')),

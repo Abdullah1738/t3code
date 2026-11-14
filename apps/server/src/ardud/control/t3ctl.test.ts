@@ -11,6 +11,82 @@ import { test } from "@effect/vitest";
 // @ts-expect-error plain ESM module without declarations
 import { checkLive, ignoreMacosTypeOfServiceEinval } from "./t3ctl.mjs";
 
+test("live bounds health even when it ignores abort", async () => {
+  const start = performance.now();
+  let guard: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      checkLive("HEAD", { health: () => new Promise(() => {}), timeoutMs: 25 }),
+      new Promise((_, reject) => {
+        guard = setTimeout(() => reject(new Error("live never returned")), 500);
+      }),
+    ]);
+    NodeAssert.equal(result.live, null);
+    NodeAssert.match(result.reason, /health.*timed out/);
+    NodeAssert.equal(result.stages.health.status, "timeout");
+    NodeAssert.ok(performance.now() - start < 400);
+  } finally {
+    clearTimeout(guard);
+  }
+});
+
+test.each(["target", "build", "ancestry", "shallow"])(
+  "live bounds an injected %s git stage",
+  async (slowStage) => {
+    const started: string[] = [];
+    const start = performance.now();
+    const result = await checkLive("HEAD", {
+      timeoutMs: 40,
+      health: async () => ({ ok: true, status: "healthy", buildCommit: "abcdef012345" }),
+      onStage: (name: string) => started.push(name),
+      git: async (args: string[]) => {
+        if (started.at(-1) === slowStage) return new Promise(() => {});
+        return {
+          status: args[0] === "merge-base" ? 1 : 0,
+          stdout: args[0] === "cat-file" ? "commit" : "abcdef012345",
+        };
+      },
+    });
+    NodeAssert.equal(result.live, null);
+    NodeAssert.match(result.reason, new RegExp(`${slowStage}.*timed out`));
+    NodeAssert.equal(result.stages[slowStage].status, "timeout");
+    NodeAssert.ok(performance.now() - start < 400);
+  },
+);
+
+test("live fast paths keep the answer fields and add stage timings", async () => {
+  for (const live of [true, false]) {
+    const result = await checkLive("HEAD", {
+      health: async () => ({ ok: true, status: "healthy", buildCommit: "abcdef012345" }),
+      git: async (args: string[]) => ({
+        status: args[0] === "merge-base" && !live ? 1 : 0,
+        stdout:
+          args[0] === "cat-file"
+            ? "commit"
+            : args.includes("--is-shallow-repository")
+              ? "false"
+              : "abcdef012345",
+      }),
+    });
+    NodeAssert.equal(result.commit, "HEAD");
+    NodeAssert.equal(result.buildCommit, "abcdef012345");
+    NodeAssert.equal(result.live, live);
+    NodeAssert.equal(result.reason, live ? "ancestor of build" : "not ancestor of build");
+    NodeAssert.ok(result.elapsedMs >= 0);
+    NodeAssert.deepEqual(Object.keys(result.stages), [
+      "health",
+      "target",
+      "build",
+      "ancestry",
+      ...(live ? [] : ["shallow"]),
+    ]);
+    for (const stage of Object.values(result.stages) as { status: string; ms: number }[]) {
+      NodeAssert.equal(stage.status, "ok");
+      NodeAssert.ok(stage.ms >= 0);
+    }
+  }
+});
+
 test("the macOS QoS guard swallows only Error EINVAL and preserves socket calls", () => {
   let error: unknown = Object.assign(new Error("setTypeOfService EINVAL"), { code: "EINVAL" });
   const socket = new NodeNet.Socket();
@@ -121,7 +197,13 @@ test("live checks the running build's ancestry and exits for each outcome", asyn
     buildCommit,
   });
 
-  NodeAssert.deepEqual(await checkLive(older, { repo, health: health(newer.slice(0, 12)) }), {
+  const { stages, elapsedMs, ...answer } = await checkLive(older, {
+    repo,
+    health: health(newer.slice(0, 12)),
+  });
+  NodeAssert.ok(stages.health.ms >= 0);
+  NodeAssert.ok(elapsedMs >= 0);
+  NodeAssert.deepEqual(answer, {
     commit: older,
     buildCommit: newer.slice(0, 12),
     live: true,
@@ -248,4 +330,198 @@ test("live checks the running build's ancestry and exits for each outcome", asyn
     { encoding: "utf8" },
   );
   NodeAssert.equal(imported.status, 0);
+});
+
+test("threads forwards the opaque cursor and prints the next cursor", async ({
+  onTestFinished,
+}) => {
+  const { createServer } = await import("node:http");
+  let requested: string | undefined;
+  const server = createServer((request, response) => {
+    requested = request.url;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, threads: [], total: 510, nextCursor: "next-page" }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  onTestFinished(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("no test server address");
+  const result = await new Promise<{ code: number | null; stdout: string }>((resolve, reject) => {
+    const child = NodeChildProcess.spawn(
+      process.execPath,
+      [
+        NodeURL.fileURLToPath(new URL("./t3ctl.mjs", import.meta.url)),
+        "threads",
+        "--limit",
+        "500",
+        "--cursor",
+        "opaque-cursor",
+      ],
+      {
+        env: {
+          ...process.env,
+          T3_CONTROL_URL: `http://127.0.0.1:${address.port}`,
+          T3_CONTROL_TOKEN: "test",
+        },
+      },
+    );
+    let stdout = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, stdout }));
+  });
+  NodeAssert.equal(result.code, 0);
+  NodeAssert.equal(requested, "/api/ardud/control/threads?cursor=opaque-cursor&limit=500");
+  NodeAssert.equal(JSON.parse(result.stdout).nextCursor, "next-page");
+});
+
+test("live shares one budget across health and every git invocation", async () => {
+  const timeouts: number[] = [];
+  const killSignals: string[] = [];
+  const signals: AbortSignal[] = [];
+  const result = await checkLive("abcdef012345", {
+    timeoutMs: 100,
+    health: async (options: { timeoutMs: number; signal: AbortSignal }) => {
+      NodeAssert.ok(options.timeoutMs <= 100);
+      signals.push(options.signal);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { ok: true, status: "healthy", buildCommit: "abcdef012345" };
+    },
+    git: async (
+      args: string[],
+      options: { timeout: number; killSignal: string; signal: AbortSignal },
+    ) => {
+      killSignals.push(options.killSignal);
+      timeouts.push(options.timeout);
+      signals.push(options.signal);
+      if (timeouts.length === 3) return new Promise(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return { status: 0, stdout: args[0] === "cat-file" ? "commit" : "abcdef012345" };
+    },
+  });
+  NodeAssert.equal(result.live, null);
+  NodeAssert.match(result.reason, /build.*timed out/);
+  NodeAssert.ok(timeouts[0]! <= 85);
+  for (let i = 1; i < timeouts.length; i++) NodeAssert.ok(timeouts[i]! < timeouts[i - 1]!);
+  NodeAssert.ok(killSignals.every((signal) => signal === "SIGKILL"));
+  NodeAssert.ok(signals.every((signal) => signal.aborted));
+  NodeAssert.ok(result.elapsedMs < 500);
+});
+
+test("live caps health at ten seconds of its default budget", async () => {
+  let healthTimeout = 0;
+  const result = await checkLive("HEAD", {
+    health: async (options: { timeoutMs: number }) => {
+      healthTimeout = options.timeoutMs;
+      throw new Error("secret in server error");
+    },
+  });
+  NodeAssert.equal(healthTimeout, 10_000);
+  NodeAssert.equal(result.reason, "health unavailable");
+  NodeAssert.equal(result.stages.health.status, "error");
+  NodeAssert.doesNotMatch(JSON.stringify(result), /secret/);
+});
+
+test("live CLI bounds a blackhole health request and validates --timeout", async ({
+  onTestFinished,
+}) => {
+  const sockets = new Set<NodeNet.Socket>();
+  const server = NodeNet.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  onTestFinished(() => {
+    for (const socket of sockets) socket.destroy();
+    return new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("no test server address");
+  const cli = NodeURL.fileURLToPath(new URL("./t3ctl.mjs", import.meta.url));
+  const invoke = (timeout: string) =>
+    new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      NodeChildProcess.execFile(
+        process.execPath,
+        [cli, "live", "HEAD", `--timeout=${timeout}`],
+        {
+          timeout: 3000,
+          killSignal: "SIGKILL",
+          env: {
+            ...process.env,
+            T3_CONTROL_URL: `http://127.0.0.1:${address.port}`,
+            T3_CONTROL_TOKEN: "test-secret-not-for-output",
+          },
+        },
+        (error, stdout, stderr) =>
+          resolve({ code: error ? Number(error.code) : 0, stdout, stderr }),
+      ).on("error", reject);
+    });
+  const start = performance.now();
+  const result = await invoke("0.5");
+  NodeAssert.equal(result.code, 2);
+  NodeAssert.match(JSON.parse(result.stdout).reason, /health.*timed out/);
+  NodeAssert.equal(JSON.parse(result.stdout).stages.health.status, "timeout");
+  NodeAssert.ok(performance.now() - start < 2000);
+  NodeAssert.doesNotMatch(result.stdout + result.stderr, /test-secret-not-for-output/);
+  for (const timeout of ["0", "-1", "NaN", "Infinity", "", "2147484"]) {
+    const invalid = await invoke(timeout);
+    NodeAssert.equal(invalid.code, 2);
+    NodeAssert.match(invalid.stderr, /--timeout must be a positive number/);
+  }
+});
+
+test("live kills a real git process that ignores SIGTERM", async ({ onTestFinished }) => {
+  // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone Node CLI test uses a POSIX executable fixture.
+  if (NodeOS.platform() === "win32") return;
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3ctl-slow-git-"));
+  const marker = NodePath.join(dir, "pid");
+  NodeFS.writeFileSync(
+    NodePath.join(dir, "git"),
+    `#!/bin/sh\ntrap '' TERM\necho $$ > '${marker}'\nexec /bin/sleep 60\n`,
+    { mode: 0o755 },
+  );
+  onTestFinished(() => {
+    if (NodeFS.existsSync(marker)) {
+      const pid = Number(NodeFS.readFileSync(marker, "utf8").trim());
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+    }
+    NodeFS.rmSync(dir, { recursive: true, force: true });
+  });
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${dir}:${previousPath}`;
+  try {
+    const start = performance.now();
+    const result = await checkLive("HEAD", {
+      repo: dir,
+      timeoutMs: 200,
+      health: async () => ({ ok: true, status: "healthy", buildCommit: "abcdef012345" }),
+    });
+    NodeAssert.equal(result.live, null);
+    NodeAssert.match(result.reason, /target.*timed out/);
+    NodeAssert.equal(result.stages.target.status, "timeout");
+    NodeAssert.ok(performance.now() - start < 1500);
+    const pid = Number(NodeFS.readFileSync(marker, "utf8").trim());
+    const state = await new Promise<string>((resolve, reject) => {
+      NodeChildProcess.execFile(
+        "ps",
+        ["-p", String(pid), "-o", "stat="],
+        { timeout: 1000 },
+        (error, stdout) => {
+          if (error && error.code !== 1) reject(error);
+          else resolve(stdout.trim());
+        },
+      );
+    });
+    // A zombie is already dead and only awaits the parent's close notification.
+    NodeAssert.match(state, /^(Z.*)?$/);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+  }
 });

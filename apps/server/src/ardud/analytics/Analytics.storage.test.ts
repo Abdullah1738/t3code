@@ -17,6 +17,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../../config.ts";
 import * as Analytics from "./Analytics.ts";
+import * as McpCallLedger from "./McpCallLedger.ts";
 
 const day = "2026-11-13";
 const ts = `${day}T12:00:00.000Z`;
@@ -261,6 +262,22 @@ describe("Analytics storage failures", () => {
     Effect.gen(function* () {
       const setup = yield* fixture;
       const failed = yield* Deferred.make<void>();
+      const second = yield* Deferred.make<void>();
+      const exhausted = yield* Deferred.make<void>();
+      const dropped = yield* Deferred.make<void>();
+      const logger = Logger.make(({ message }) => {
+        const values = Array.isArray(message) ? message : [message];
+        if (
+          values.some(
+            (value) =>
+              typeof value === "object" &&
+              value !== null &&
+              "reason" in value &&
+              value.reason === "retry-limit",
+          )
+        )
+          Deferred.doneUnsafe(dropped, Effect.void);
+      });
       let broken = true;
       let attempts = 0;
       const fs = FileSystem.FileSystem.of({
@@ -270,14 +287,22 @@ describe("Analytics storage failures", () => {
             ? Effect.gen(function* () {
                 attempts++;
                 yield* Deferred.succeed(failed, undefined);
+                if (attempts === 2) yield* Deferred.succeed(second, undefined);
+                if (attempts === 3) yield* Deferred.succeed(exhausted, undefined);
                 return yield* failure("stat", file);
               })
             : setup.fs.stat(file),
       });
-      const analytics = yield* open(setup, fs, { queueCapacity: 2 });
+      const analytics = yield* open(setup, fs, { queueCapacity: 2 }).pipe(
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      );
       yield* analytics.ingest({ events: [event("item.0"), event("item.1")] });
       yield* Deferred.await(failed);
-      yield* TestClock.adjust("10 seconds");
+      yield* TestClock.adjust("5 seconds");
+      yield* Deferred.await(second);
+      yield* TestClock.adjust("5 seconds");
+      yield* Deferred.await(exhausted);
+      yield* Deferred.await(dropped);
       assert.equal(attempts, 3);
       assert.equal(yield* counter("t3_analytics_dropped_events_total", "retry-limit"), 2);
       yield* TestClock.adjust("1 minute");
@@ -445,3 +470,106 @@ describe("Analytics storage failures", () => {
     },
   );
 });
+
+const seedLine = JSON.stringify(event("seed"));
+const restartTails = [
+  { name: "empty", contents: "", total: 1, invalid: 0 },
+  { name: "LF", contents: `${seedLine}\n`, total: 2, invalid: 0 },
+  { name: "CRLF", contents: `${seedLine}\r\n`, total: 2, invalid: 0 },
+  { name: "CR only", contents: `${seedLine}\r`, total: 2, invalid: 0 },
+  { name: "complete JSON without LF", contents: seedLine, total: 2, invalid: 0 },
+  { name: "partial JSON", contents: `${seedLine}\n{"ts":`, total: 2, invalid: 1 },
+  { name: "garbage", contents: `${seedLine}\nbroken`, total: 2, invalid: 1 },
+  { name: "oversized partial", contents: `${seedLine}\n${"x".repeat(9000)}`, total: 2, invalid: 1 },
+];
+it.effect.each(restartTails)(
+  "restart tail $name keeps warm and cold counts equal after append",
+  (row) =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      yield* setup.fs.writeFileString(setup.active, row.contents);
+      const warm = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const analytics = yield* open(setup);
+          yield* analytics.read({ day });
+          yield* analytics.record(event("appended"));
+          return yield* analytics.read({ day });
+        }),
+      );
+      const cold = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const analytics = yield* open(setup);
+          return yield* analytics.read({ day });
+        }),
+      );
+      assert.equal(warm.rollup.total, row.total);
+      assert.equal(cold.rollup.total, row.total);
+      assert.deepEqual(cold.rollup.kindCounts, warm.rollup.kindCounts);
+      assert.equal(cold.rollup.invalidLines, row.invalid);
+      assert.equal(warm.rollup.invalidLines, row.invalid);
+      assert.equal(cold.rollup.kindCounts.appended, 1);
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each([1, 2])(
+  "rotates an unterminated tail with %s retained segments at the exact event size",
+  (maxSegmentsPerDay) =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      yield* setup.fs.writeFileString(setup.active, seedLine);
+      const appended = event("appended");
+      const maxFileBytes = new TextEncoder().encode(`${JSON.stringify(appended)}\n`).byteLength;
+      const analytics = yield* open(setup, setup.fs, { maxSegmentsPerDay, maxFileBytes });
+      yield* analytics.record(appended);
+      const result = yield* analytics.read({ day });
+      assert.equal(result.rollup.total, maxSegmentsPerDay);
+      assert.equal(result.rollup.kindCounts.appended, 1);
+      assert.equal(result.rollup.invalidLines, 0);
+      for (const file of (yield* setup.fs.readDirectory(setup.directory)).filter((name) =>
+        name.endsWith(".ndjson"),
+      )) {
+        assert.isAtMost(
+          Number((yield* setup.fs.stat(`${setup.directory}/${file}`)).size),
+          maxFileBytes,
+        );
+      }
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("scope shutdown persists the in-flight MCP ledger before returning", () =>
+  Effect.gen(function* () {
+    const setup = yield* fixture;
+    const analytics = yield* open(setup);
+    yield* Effect.gen(function* () {
+      const ledger = yield* McpCallLedger.McpCallLedger;
+      yield* ledger.begin(() =>
+        Effect.succeed({
+          ts,
+          startedAt: ts,
+          kind: "mcp.call",
+          surface: "server",
+          route: "mcp",
+          bootId: "boot-storage",
+          tool: "delegate_task",
+          outcome: "interrupted_by_shutdown",
+          clientRequestId: "c".repeat(64),
+          committed: true,
+          taskId: "node:delegated-task:review(1338)",
+        }),
+      );
+    }).pipe(
+      Effect.provide(McpCallLedger.layer),
+      Effect.provideService(Analytics.Analytics, analytics),
+    );
+    const rows = (yield* setup.fs.readFileString(setup.active))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.lengthOf(rows, 1);
+    assert.include(rows[0], {
+      outcome: "interrupted_by_shutdown",
+      committed: true,
+      taskId: "node:delegated-task:review(1338)",
+    });
+  }).pipe(Effect.provide(NodeServices.layer)),
+);

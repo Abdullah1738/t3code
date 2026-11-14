@@ -10,7 +10,12 @@ import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
+import * as Deferred from "effect/Deferred";
 import { runMigrations } from "./Migrations.ts";
+import {
+  runBootMigrations,
+  ShellRunLookupMigration,
+} from "../ardud/persistence/shellRunLookupMigration.ts";
 import { initializeV2Database } from "./initializeV2Database.ts";
 import { ensureShellLookupIndexes } from "../ardud/persistence/shellIndexes.ts";
 import * as ServerConfig from "../config.ts";
@@ -21,6 +26,7 @@ import { archiveCheckpointLayer } from "../ardud/persistence/archiveCheckpoint.t
 import { ArchiveSnapshotGate } from "../ardud/persistence/archiveSnapshotGate.ts";
 import { readerLaneOptions, STATEV2_READER_LANES } from "../ardud/persistence/readerLanes.ts";
 import * as Semaphore from "effect/Semaphore";
+import { ServerActivation } from "../serverActivation.ts";
 // Reads only a tiny installation marker before constructing reader workers.
 import * as NodeSqlite from "node:sqlite";
 
@@ -73,7 +79,15 @@ const layerSetup = Layer.effectDiscard(
           yield* sql`PRAGMA cache_size = -65536;`;
         }),
       );
-      yield* runSqliteSetupPhases(runMigrations(), ensureShellLookupIndexes());
+      const lookupMigration = yield* ShellRunLookupMigration;
+      const migrations =
+        lookupMigration === undefined
+          ? runMigrations()
+          : runBootMigrations(
+              (yield* sql<{ file: string }>`PRAGMA database_list`)[0]!.file,
+              lookupMigration,
+            );
+      yield* runSqliteSetupPhases(migrations, ensureShellLookupIndexes());
       const baseFilename = yield* withStartupPhase(
         "sqlite.archive-marker",
         Effect.gen(function* () {
@@ -126,6 +140,8 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
   yield* fs.makeDirectory(path.dirname(dbPath), { recursive: true });
   const observer = yield* ErrorObserver;
   const snapshotGate = yield* Semaphore.make(1);
+  const checkpointWorkerStart = yield* ServerActivation;
+  const lookupMigration = yield* Deferred.make<void>();
   const baseFilename = yield* withStartupPhase(
     "sqlite.marker",
     Effect.gen(function* () {
@@ -177,8 +193,12 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
 
   return Layer.provideMerge(
     Layer.mergeAll(
-      Layer.provideMerge(archiveCheckpointLayer(dbPath), layerSetup),
+      Layer.provideMerge(
+        archiveCheckpointLayer(dbPath),
+        Layer.provide(layerSetup, Layer.succeed(ShellRunLookupMigration, lookupMigration)),
+      ),
       Layer.succeed(ArchiveSnapshotGate, snapshotGate),
+      Layer.succeed(ShellRunLookupMigration, lookupMigration),
     ),
     Layer.effectContext(
       withStartupPhase(
@@ -197,9 +217,10 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
               "SELECT rootpage FROM ardud_base.sqlite_schema LIMIT 1",
             ],
             readerSnapshotLock: snapshotGate,
-            // Checkpoints sync the database, with F_FULLFSYNC on macOS. Run them off
-            // the event loop so a slow flush cannot stall clients.
+            // Keep checkpoint fsyncs off the event loop. On APFS their writes can
+            // also stall cold reads, so routine checkpoints wait for activation.
             checkpointWorker: true,
+            checkpointWorkerStart,
             spanAttributes: {
               "db.name": path.basename(dbPath),
               "service.name": "t3code-server",

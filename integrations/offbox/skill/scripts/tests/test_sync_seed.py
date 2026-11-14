@@ -86,6 +86,20 @@ class SyncSeedTests(Isolated):
         self.push()
         self.assertFalse(any(a.startswith("--copy-dest") for a in self.rsyncs[0]))
 
+    def test_seed_same_size_same_second_different_content_is_not_reused(self):
+        sibling = self.box_home / self.sibling
+        sibling.mkdir()
+        src, basis = self.src / "tracked.txt", sibling / "tracked.txt"
+        src.write_text("pin=721dcbf6\n")
+        basis.write_text("pin=0366b5ae\n")
+        os.utime(src, ns=(1794618566083649423, 1794618566083649423))
+        os.utime(basis, ns=(1794618566083434298, 1794618566083434298))
+        self.add_run(self.sibling)
+        self.push()
+        self.assertEqual((self.box_home / self.current / "tracked.txt").read_bytes(), src.read_bytes())
+        self.assertEqual(basis.read_text(), "pin=0366b5ae\n")
+        self.assertIn("--checksum", self.rsyncs[0])
+
     def test_wrong_box_repo_and_invalid_names_are_ignored(self):
         other = self.base / "other"
         other.mkdir()

@@ -9,7 +9,7 @@ const calls = join(sandbox, "calls.log");
 const stub = (name: string, failOn: string) => {
   const path = join(sandbox, `${name}.ts`);
   writeFileSync(path, `import { appendFileSync, existsSync } from "node:fs";
-const args = process.argv.slice(2);
+const args = process.argv.slice(2).flatMap(a => { const i = a.indexOf("="); return a.startsWith("--") && i > 0 ? [a.slice(0, i), a.slice(i + 1)] : [a]; });
 appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ cli: ${JSON.stringify(name)}, args }) + "\\n");
 if (existsSync(${JSON.stringify(join(sandbox, "fail-"))} + args[0])) { console.error("stub failure"); process.exit(1); }
 console.log(JSON.stringify({ id: "x", created: true }));
@@ -18,7 +18,7 @@ void ${JSON.stringify(failOn)};`);
 };
 const db = join(sandbox, "bridge.sqlite");
 Bun.spawnSync(["/usr/bin/sqlite3", db, `create table kv (key text primary key, value text); create table inbound (id text primary key, payload text, state text); insert into kv values ('route', '{"id":"ses_live123","generation":1}');`]);
-const env = { ...process.env, ROBOB_WATCH_LOAD_OVERRIDE: "0.1", ROBOB_WATCH_ROOT: join(sandbox, "root"), TOOLLOG_DIR: join(sandbox, "logs"), ROBOB_WATCH_SPECTRUM_CLI: stub("spectrum", ""),
+const env = { ...process.env, ROBOB_WATCH_LOAD_OVERRIDE: "0.1", ROBOB_WATCH_TEST_BATCH_MS: "0", ROBOB_WATCH_ROOT: join(sandbox, "root"), TOOLLOG_DIR: join(sandbox, "logs"), ROBOB_WATCH_SPECTRUM_CLI: stub("spectrum", ""),
   ROBOB_WATCH_TELEGRAM_CLI: stub("telegram", ""), ROBOB_WATCH_BRIDGE_DB: db,
   ROBOB_WATCH_HEADSUP_MS: "1000", WACLI_STORE_DIR: join(sandbox, "wacli") };
 // Checks put the sandbox helpers first on PATH: a logging-only wa there keeps any check that drafts away from the real one.
@@ -370,7 +370,7 @@ test("a trigger file runs the check within a couple of seconds, long before its 
   expect(readCalls().some(call => call.args.includes("robob-watch trig"))).toBe(true);
 }, 20_000);
 
-test("timeouts alert into the burst immediately but pause only after ten minutes, with fast retry", async () => {
+test("timeouts hold notices and pause until ten minutes, with fast retry", async () => {
   writeFileSync(calls, "");
   for (const name of ["wake", "send", "notify"]) rmSync(join(sandbox, `fail-${name}`), { force: true });
   const slowEnv = { ...env, ROBOB_WATCH_CHECK_TIMEOUT_MS: "300" };
@@ -386,17 +386,18 @@ test("timeouts alert into the burst immediately but pause only after ten minutes
   writeFileSync(file, JSON.stringify({ status: "active", fires: 0, consecutive_failures: 4, failure_alerted: false,
     failing_since: new Date(Date.now() - 120_000).toISOString() }));
   await runSlow(2_000);
-  expect(state("slow")).toMatchObject({ consecutive_failures: 5, failure_alerted: true });
+  expect(state("slow")).toMatchObject({ consecutive_failures: 5, failure_alerted: false });
   expect(state("slow").failure_paused_at).toBeUndefined();
   expect(events("watch.run", "slow")).toContainEqual(expect.objectContaining({ props: expect.objectContaining({ outcome: "timeout", exitCode: null, signal: "SIGKILL", timedOut: true }), ok: false }));
   expect(state("slow").next_at - Date.now()).toBeLessThanOrEqual(120_000);
-  expect(readCalls().filter(call => call.cli === "telegram")).toHaveLength(1);
+  expect(readCalls().filter(call => call.cli === "telegram")).toHaveLength(0);
+  expect(events("watch.failure_notice_held", "slow")).toEqual([expect.objectContaining({ props: { count: 5, threshold: 2, timedOut: true } })]);
   writeFileSync(file, JSON.stringify({ ...state("slow"), next_at: 0, failing_since: new Date(Date.now() - 11 * 60_000).toISOString() }));
   await runSlow(2_000);
   expect(state("slow")).toMatchObject({ consecutive_failures: 6, failure_alerted: true });
   expect(state("slow").failure_paused_at).toBeString();
   const notices = readCalls().filter(call => call.cli === "telegram");
-  expect(notices).toHaveLength(2);
+  expect(notices).toHaveLength(1);
   expect(notices.every(call => call.args[call.args.indexOf("--burst-key") + 1] === "watcher-failure:slow")).toBe(true);
 }, 20_000);
 
@@ -515,7 +516,7 @@ test("watchers from before relays that mention wa sends are listed and fire owne
   // Once it names its relays (here: nobody), it drops off the list.
   writeFileSync(join(dir, "watcher.json"), JSON.stringify({ ...JSON.parse(readFileSync(join(dir, "watcher.json"), "utf8")), relays: [] }));
   expect(cli("unscoped").stdout.toString()).toContain("No watchers mention");
-  for (const id of ["old-ek", "old-plain"]) cli("remove", id);
+  for (const id of ["old-ek", "old-plain"]) cli("remove", id, "--now");
 }, 20_000);
 
 test("an old watcher whose check runs wa draft runs as before: no hold, no held notice", async () => {
@@ -537,7 +538,7 @@ test("an old watcher whose check runs wa draft runs as before: no hold, no held 
   const notices = readCalls().slice(before).filter(call => call.args.some(arg => arg.includes("robob-watch:old-sender:held")));
   expect(notices).toHaveLength(0);
   expect(state("old-sender").held_alerted).toBeUndefined();
-  cli("remove", "old-sender");
+  cli("remove", "old-sender", "--now");
 }, 25_000);
 
 test("relays: a person's @lid and phone jid are one contact, and concurrent checks take one ETA slot", async () => {

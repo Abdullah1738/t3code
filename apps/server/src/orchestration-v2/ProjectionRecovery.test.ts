@@ -1260,6 +1260,7 @@ it.effect(
   () => {
     const registered: string[] = [];
     const registry = Layer.succeed(RestartPacing.RestartPacing, {
+      settingsSnapshot: Effect.die("unused settings snapshot"),
       register: (input) =>
         Effect.sync(() => {
           registered.push(input.sourceRunId);
@@ -1267,6 +1268,8 @@ it.effect(
       acquire: () => Effect.succeed(0),
       acquireRun: () => Effect.succeed(0),
       dispatched: () => Effect.void,
+      release: () => Effect.void,
+      releaseRun: () => Effect.void,
     });
     return Effect.gen(function* () {
       const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;

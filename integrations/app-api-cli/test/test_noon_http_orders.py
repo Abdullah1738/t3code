@@ -46,7 +46,7 @@ SHIPMENT_NEARBY = {
         {'key': 'delivered', 'text': 'Delivered', 'status': None},
     ],
 }
-MARKET_DELIVERED_HISTORY = {'data': [{'orderNr': MARKET_ID, 'shipmentNr': SHIPMENT_ID,
+MARKET_DELIVERED_HISTORY = {'pagination': {'hasMore': False, 'nextCursor': None}, 'data': [{'orderNr': MARKET_ID, 'shipmentNr': SHIPMENT_ID,
     'itemNr': MARKET_ID + '-1', 'status': {'highStatusCode': 'delivered'}}]}
 ITEM_DELIVERED = {'orderNr': MARKET_ID, 'itemNr': MARKET_ID + '-1',
     'item': {'itemNr': MARKET_ID + '-1', 'shipmentNr': SHIPMENT_ID},

@@ -11,6 +11,24 @@ import order_tracker as t
 
 
 class DeliveryTests(unittest.TestCase):
+    def test_rows_are_bounded_sorted_and_read_only(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(s, 'ROOT', Path(d)):
+            self.assertEqual(s.rows('careem', 10, 30), ([], ['notification_collector_stale']))
+            self.assertFalse((s.ROOT / 'delivery.sqlite').exists())
+            with s.connect() as db:
+                db.execute('INSERT INTO health VALUES (?,?,?,?)', ('phone', time.time(), 1, 'ok'))
+                for key, app, posted in [('one', 'careem', 30), ('two', 'careem', 10),
+                                         ('three', 'careem', 31), ('four', 'noon', 20)]:
+                    db.execute('INSERT INTO pushes VALUES (?,?,?,?,?,?)', (key, app, posted, posted+1, key, '[]'))
+            with patch.object(s, 'connect', side_effect=AssertionError('read must not initialize journal')):
+                rows, errors = s.rows('careem', 10, 30)
+            self.assertEqual(errors, [])
+            self.assertEqual(rows, [{'posted': 10, 'detected': 11, 'text': 'two'},
+                                    {'posted': 30, 'detected': 31, 'text': 'one'}])
+            with s.connect() as db:
+                db.execute('UPDATE health SET ok=0, detail="priority_hold"')
+            self.assertEqual(s.rows('careem', 10, 30)[1], ['notifications_priority_hold'])
+
     def test_real_talabat_wording_and_journal_survives_clear(self):
         with tempfile.TemporaryDirectory() as d, patch.object(s, 'ROOT', Path(d)):
             now = time.time()

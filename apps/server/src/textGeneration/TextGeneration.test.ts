@@ -1,6 +1,11 @@
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as PubSub from "effect/PubSub";
+import * as Schema from "effect/Schema";
+import type { AnalyticsEvent } from "@t3tools/contracts";
+import { TextGenerationError } from "@t3tools/contracts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
+import * as TextGenerationAnalytics from "./TextGenerationAnalytics.ts";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import { describe, expect } from "vite-plus/test";
@@ -62,6 +67,123 @@ const makeStubRegistry = (
 };
 
 describe("TextGeneration.make", () => {
+  it.effect.each(["claudeAgent", "codex", "opencode", "grok", "antigravity"])(
+    "records operations for %s without inventing child launches",
+    (provider) =>
+      Effect.gen(function* () {
+        const events: AnalyticsEvent[] = [];
+        const id = ProviderInstanceId.make(provider);
+        const metadata: Array<{ operation: string; boardId?: string | undefined } | undefined> = [];
+        const instance = makeStubInstance(
+          id,
+          makeStubTextGeneration({
+            generateJson: (input) =>
+              Effect.gen(function* () {
+                metadata.push(yield* TextGenerationAnalytics.job);
+                // oxlint-disable-next-line t3code/no-inline-schema-compile -- The stub decodes the caller's generic schema.
+                return yield* Schema.decodeUnknownEffect(input.outputSchema)({ answer: "ok" }).pipe(
+                  Effect.orDie,
+                );
+              }),
+          }),
+        );
+        const generation = yield* TextGeneration.make.pipe(
+          Effect.provideService(
+            ProviderInstanceRegistry.ProviderInstanceRegistry,
+            makeStubRegistry([instance]),
+          ),
+          Effect.provide(
+            Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
+              resolveLink: () => Effect.die("unused"),
+            }),
+          ),
+        );
+        yield* generation.generateJson!({
+          cwd: "/unused",
+          prompt: "private prompt never recorded",
+          outputSchema: Schema.Struct({ answer: Schema.String }),
+          modelSelection: createModelSelection(id, "test"),
+          operationLabel: "writeGroups",
+          boardId: "board-robob",
+        }).pipe(
+          Effect.provideService(
+            Analytics.Analytics,
+            Analytics.Analytics.of({
+              record: (event) =>
+                Effect.sync(() => {
+                  events.push(event);
+                }),
+              flush: Effect.void,
+              ingest: () => Effect.void,
+              read: () => Effect.die("unused"),
+            }),
+          ),
+        );
+        expect(metadata).toEqual([
+          { operation: "generateJson:writeGroups", provider, boardId: "board-robob" },
+        ]);
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({
+          kind: "text-generation.operation",
+          boardId: "board-robob",
+          outcome: "ok",
+          props: { provider, operation: "generateJson:writeGroups", count: 1 },
+        });
+        expect(JSON.stringify(events)).not.toContain("private prompt");
+        expect(yield* TextGenerationAnalytics.job).toBeUndefined();
+      }),
+  );
+
+  it.effect("records failed operations and preserves their error", () =>
+    Effect.gen(function* () {
+      const events: AnalyticsEvent[] = [];
+      const id = ProviderInstanceId.make("claudeAgent");
+      const error = new TextGenerationError({ operation: "generateThreadTitle", detail: "failed" });
+      const generation = yield* TextGeneration.make.pipe(
+        Effect.provideService(
+          ProviderInstanceRegistry.ProviderInstanceRegistry,
+          makeStubRegistry([
+            makeStubInstance(
+              id,
+              makeStubTextGeneration({ generateThreadTitle: () => Effect.fail(error) }),
+            ),
+          ]),
+        ),
+        Effect.provide(
+          Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
+            resolveLink: () => Effect.die("unused"),
+          }),
+        ),
+        Effect.provideService(
+          Analytics.Analytics,
+          Analytics.Analytics.of({
+            record: (event) =>
+              Effect.sync(() => {
+                events.push(event);
+              }),
+            flush: Effect.void,
+            ingest: () => Effect.void,
+            read: () => Effect.die("unused"),
+          }),
+        ),
+      );
+      const failure = yield* generation
+        .generateThreadTitle({
+          cwd: "/unused",
+          message: "title",
+          linkedContext: "",
+          modelSelection: createModelSelection(id, "test"),
+        })
+        .pipe(Effect.flip);
+      expect(failure).toBe(error);
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        outcome: "error",
+        props: { operation: "generateThreadTitle" },
+      });
+    }),
+  );
+
   it.effect("retains supplied subject context in the provider prompt", () =>
     Effect.gen(function* () {
       const instanceId = ProviderInstanceId.make("codex");

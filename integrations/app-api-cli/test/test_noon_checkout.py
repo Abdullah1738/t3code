@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import noon_checkout as n
+import order_card
 
 
 def home_payload():
@@ -28,7 +29,7 @@ def sample(service='minutes'):
                   2, 1295, 2590)
     quiet = n.Quiet('selected', 'selected', 'selected', True, n.QUIET_NOTE, True,
                     n.fingerprint('quiet-schema-and-readback'))
-    payment = n.Payment('saved_card', '2342', 'mastercard', n.fingerprint('card-A'), 0, 3390, 'none')
+    payment = n.Payment('saved_card', order_card.LAST4, order_card.NETWORK, n.fingerprint('card-A'), 0, 3390, 'none')
     quote = n.Quote(service, home.account_ref, home.address_ref, n.fingerprint('cart-A'),
                     n.fingerprint('revision-A'), 1000, 1060, 'AED', (line,), True,
                     (('delivery', 800),), True, 3390, payment, quiet,
@@ -258,7 +259,8 @@ class QuoteSafetyTests(unittest.TestCase):
         self.check(adjustments=(('delivery', 900), ('discount', -100)))
 
     def test_saved_order_card_exact_network_and_allocation(self):
-        for update in ({'last4': '1111'}, {'last4': '****2342'}, {'network': 'visa'},
+        for update in ({'last4': '1111'}, {'last4': '****' + order_card.LAST4},
+                       {'network': 'mastercard' if order_card.NETWORK == 'visa' else 'visa'},
                        {'method': 'cash'}, {'selected_card_ref': ''}):
             self.fails('CARD_MISMATCH', payment=replace(self.quote.payment, **update))
         for update in ({'credits_minor': 1}, {'credits_minor': False}, {'card_charge_minor': 1}):

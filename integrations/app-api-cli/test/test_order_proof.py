@@ -362,6 +362,7 @@ class OrderProof(unittest.TestCase):
                 '--amount', '600', '--card', '2342', '--requester', 'moni']
         with patch.object(tracker, 'run', watch), patch.object(receipt, 'fetch', side_effect=lambda *a: dict(result)), \
                 patch.object(tracker.delivery_cards, 'safe_sync', return_value={}), \
+                patch.object(tracker.order_bank_charge, 'load_charges') as native_bank, \
                 patch.object(tracker.subprocess, 'run', send), patch.object(fcntl, 'flock', nonblocking_flock), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(tracker.main(argv), 0)
@@ -392,6 +393,7 @@ class OrderProof(unittest.TestCase):
             self.assertEqual(len(attempts), 2)
             self.assertEqual(removed, [wid])
             self.assertFalse(tracker.read(config_path)['active'])
+            native_bank.assert_not_called()
 
     def test_amazon_cancelled_item_uses_requester_drop_path(self):
         import amazon_email_orders as amazon

@@ -990,3 +990,147 @@ it.effect.each(["Runtime.evaluate", "Runtime.callFunctionOn"])(
       }),
     ),
 );
+
+it.effect.each(["disable", "detach", "release", "turn end"])(
+  "holds painting across the paint/copy gap and releases on %s",
+  (ending) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const host = yield* DesktopBrowserHost.make;
+        const debuggee = makeDebuggee();
+        host.attach(key, debuggee.tab);
+        const replies = yield* watchReplies(host);
+        const painting = yield* watchPainting(host);
+        const raw = (message: Record<string, unknown>) =>
+          host.handleCommandLine(encodeJson({ type: "cdp", ...key, message: encodeJson(message) }));
+        yield* raw({ id: 1, method: "Target.attachToTarget", params: { targetId: "GUEST" } });
+        yield* Queue.take(replies);
+        const sessionId = "t3-preview-page-1";
+        yield* raw({
+          id: 2,
+          method: "Emulation.setFocusEmulationEnabled",
+          params: { enabled: true },
+          sessionId,
+        });
+        yield* Queue.take(replies);
+        yield* settle;
+        yield* raw({ id: 3, method: "Runtime.evaluate", sessionId });
+        yield* settle;
+        debuggee.release();
+        yield* Queue.take(replies);
+        yield* settle;
+        yield* TestClock.adjust("1 minute");
+        expect(painting).toEqual([true]);
+        expect(debuggee.focusEmulation).toEqual([true]);
+        yield* raw({ id: 30, method: "Page.captureScreenshot", sessionId });
+        yield* settle;
+        if (ending === "disable") {
+          yield* raw({
+            id: 4,
+            method: "Emulation.setFocusEmulationEnabled",
+            params: { enabled: false },
+            sessionId,
+          });
+          yield* Queue.take(replies);
+        } else if (ending === "detach") {
+          yield* raw({ id: 4, method: "Target.detachFromTarget", params: { sessionId } });
+          yield* Queue.take(replies);
+        } else if (ending === "release") {
+          yield* host.handleCommandLine(encodeJson({ type: "release", ...key }));
+        } else
+          yield* host.handleCommandLine(
+            encodeJson({ type: "turn", threadId: key.threadId, active: false }),
+          );
+        yield* settle;
+        yield* TestClock.adjust("1 minute");
+        expect(painting).toEqual([true, false]);
+        expect(debuggee.focusEmulation).toEqual([true, false]);
+      }),
+    ),
+);
+
+it.effect("drops a queued copy from an ended paint scope before starting the next scope", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      const replies = yield* watchReplies(host);
+      const raw = (id: number, method: string, params: Record<string, unknown> = {}) =>
+        host.handleCommandLine(
+          encodeJson({
+            type: "cdp",
+            ...key,
+            message: encodeJson({
+              id,
+              method,
+              params: { id, ...params },
+              sessionId: method === "Target.attachToTarget" ? undefined : "t3-preview-page-1",
+            }),
+          }),
+        );
+      yield* raw(1, "Target.attachToTarget", { targetId: "GUEST" });
+      yield* Queue.take(replies);
+      yield* raw(2, "Emulation.setFocusEmulationEnabled", { enabled: true });
+      yield* Queue.take(replies);
+      yield* raw(3, "Page.captureScreenshot");
+      yield* raw(4, "Page.captureScreenshot");
+      yield* settle;
+      yield* raw(5, "Emulation.setFocusEmulationEnabled", { enabled: false });
+      yield* Queue.take(replies);
+      yield* raw(6, "Emulation.setFocusEmulationEnabled", { enabled: true });
+      yield* Queue.take(replies);
+      yield* raw(7, "Page.captureScreenshot");
+      debuggee.releaseFirst();
+      yield* settle;
+      expect(debuggee.sent).toEqual([3, 7]);
+      debuggee.release();
+      yield* settle;
+      yield* raw(8, "Emulation.setFocusEmulationEnabled", { enabled: false });
+      yield* settle;
+      yield* TestClock.adjust("1 minute");
+      expect(debuggee.focusEmulation).toEqual([true, false]);
+    }),
+  ),
+);
+
+it.effect("keeps an earlier evaluation's paint hold when a capture scope ends", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      const replies = yield* watchReplies(host);
+      const painting = yield* watchPainting(host);
+      const raw = (id: number, method: string, params: Record<string, unknown> = {}) =>
+        host.handleCommandLine(
+          encodeJson({
+            type: "cdp",
+            ...key,
+            message: encodeJson({
+              id,
+              method,
+              params,
+              sessionId: method === "Target.attachToTarget" ? undefined : "t3-preview-page-1",
+            }),
+          }),
+        );
+      yield* raw(1, "Target.attachToTarget", { targetId: "GUEST" });
+      yield* Queue.take(replies);
+      yield* raw(2, "Runtime.evaluate");
+      yield* settle;
+      yield* raw(3, "Emulation.setFocusEmulationEnabled", { enabled: true });
+      yield* Queue.take(replies);
+      yield* raw(4, "Emulation.setFocusEmulationEnabled", { enabled: false });
+      yield* Queue.take(replies);
+      yield* settle;
+      yield* TestClock.adjust("1 minute");
+      expect(painting).toEqual([true]);
+      debuggee.release();
+      yield* settle;
+      yield* TestClock.adjust("1 minute");
+      expect(painting).toEqual([true, false]);
+      expect(debuggee.focusEmulation).toEqual([true, false]);
+    }),
+  ),
+);

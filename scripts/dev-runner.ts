@@ -40,8 +40,8 @@ const FETCH_BAD_PORTS = new Set([
   995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668,
   6669, 6679, 6697, 10080,
 ]);
-// Dev servers bind loopback, so loopback is the only interface whose
-// availability decides whether we can use a port.
+// On macOS a loopback bind can succeed alongside a wildcard listener, so
+// connect-probe both loopback addresses before checking bind availability.
 const DEV_PORT_PROBE_HOSTS = ["127.0.0.1", "::1"] as const;
 
 /**
@@ -428,11 +428,16 @@ export function devPortProbeHosts(configuredHost: string | undefined): ReadonlyA
   return [...DEV_PORT_PROBE_HOSTS, host];
 }
 
-const makeDefaultCheckPortAvailability =
+export const makeDefaultCheckPortAvailability =
   (configuredHost: string | undefined): PortAvailabilityCheck<NetService.NetService> =>
   (port, role) =>
     Effect.gen(function* () {
       const net = yield* NetService.NetService;
+      for (const host of DEV_PORT_PROBE_HOSTS) {
+        if (yield* net.hasListenerOnHost(port, host)) {
+          return false;
+        }
+      }
       const hosts = role === "web" ? DEV_PORT_PROBE_HOSTS : devPortProbeHosts(configuredHost);
       return yield* checkPortAvailabilityOnHosts(port, hosts, (candidatePort, host) =>
         net.canListenOnHost(candidatePort, host),

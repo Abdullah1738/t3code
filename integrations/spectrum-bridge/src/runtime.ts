@@ -1,3 +1,4 @@
+import { messageLengthError } from "./message-length.ts";
 import { toolError, toolLog } from "./toollog.ts";
 /**
  * Sendblue mode: one shared line, one Store + Router + Delivery per chat. The owner's chat keeps
@@ -9,6 +10,8 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { chatInfo, personFor, roleOf, slugFor } from "./access.ts";
 import { appContent } from "./api.ts";
+import { speakerName } from "./group-judge.ts";
+import { chatHistory } from "./history.ts";
 import type { Access, ChatContext, ChatInfo } from "./chats.ts";
 import { chatKey, GROUP_APP_REFUSAL, LineError, type ChatKey, type Line } from "./line.ts";
 import { askOwner, editAccess, location, locationRequest, type SbApiDeps, type SbApiResult } from "./sb-api.ts";
@@ -236,7 +239,7 @@ function parseBody(raw: Uint8Array): Record<string, unknown> | undefined {
   try {
     const value: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
     return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-  } catch { toolError("runtime", "runtime.catch1"); return undefined; }
+  } catch (caughtError) { toolError("runtime", "runtime.catch1", caughtError); return undefined; }
 }
 
 const askText = (from: ChatInfo, question: string) =>
@@ -264,7 +267,12 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
       if (request.method !== "POST") return reply(404, { error: "Not found" });
       const raw = new Uint8Array(await request.arrayBuffer());
       const body = parseBody(raw);
-      const forward = (chat: Chat<P>) => chat.parts.api(new Request(request.url, { method: "POST", headers: request.headers, body: raw }));
+      const forward = async (chat: Chat<P>) => {
+        const response = await chat.parts.api(new Request(request.url, { method: "POST", headers: request.headers, body: raw }));
+        if (!response.ok || (path !== "/send" && path !== "/files")) return response;
+        const ack = await response.json() as Record<string, unknown>;
+        return Response.json({ ...ack, chat: chat.info.slug }, { status: response.status, headers: response.headers });
+      };
       const sessionId = typeof body?.sessionId === "string" ? body.sessionId : undefined;
       const caller = sessionId === undefined ? undefined : registry.forSession(sessionId);
 
@@ -319,7 +327,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
       switch (path) {
         case "/app": {
           if (request.headers.has("origin")) throw new HttpError(403, "Forbidden");
-          only(body, ["url", "caption", "subcaption", "trailingCaption", "trailingSubcaption", "summary", "to", "dedupeKey", "sessionId"]);
+          only(body, ["url", "caption", "subcaption", "trailingCaption", "trailingSubcaption", "summary", "updateOf", "previewPage", "to", "dedupeKey", "sessionId"]);
           ownerOnly(false);
           live();
           const { to, dedupeKey } = body;
@@ -334,7 +342,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           let created: boolean;
           // Like send --to, this is an owner-authorized relay, not a reply in the recipient's session.
           try { created = target.store.enqueue({ id, kind: "conversation", text: "", app }); }
-          catch { toolError("runtime", "runtime.catch2"); throw new HttpError(409, "Operation could not be completed"); }
+          catch (caughtError) { toolError("runtime", "runtime.catch2", caughtError); throw new HttpError(409, "Operation could not be completed"); }
           return reply(created ? 202 : 200, { id, created });
         }
         case "/send": {
@@ -342,20 +350,22 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           if (!adminGroup(typeof body.to === "string" ? registry.bySlugName(body.to) : undefined)) ownerOnly(false);
           live();
           const { to, dedupeKey } = body;
+          if (typeof body.text === "string" && body.text.length > 12_000) throw new HttpError(400, messageLengthError(body.text, 12_000));
           if (!text(body.text, 12_000) || !text(to, 100) || !text(dedupeKey, 200)) throw new HttpError(400, "Invalid request");
           const target = registry.bySlugName(to);
           if (!target) throw new HttpError(404, "Unknown chat");
           const id = `send:${hash(`${target.info.slug}:${dedupeKey}`)}`;
           let created: boolean;
           try { created = target.store.enqueue({ id, kind: "conversation", text: body.text }); }
-          catch { toolError("runtime", "runtime.catch3"); throw new HttpError(409, "Operation could not be completed"); }
-          return reply(created ? 202 : 200, { id, created });
+          catch (caughtError) { toolError("runtime", "runtime.catch3", caughtError); throw new HttpError(409, "Operation could not be completed"); }
+          return reply(created ? 202 : 200, { id, created, chat: target.info.slug });
         }
         case "/wake": {
           only(body, ["text", "chat", "source", "dedupeKey", "sessionId"]);
           ownerOnly(false);
           live();
           const { chat, dedupeKey } = body;
+          if (typeof body.text === "string" && body.text.length > 12_000) throw new HttpError(400, messageLengthError(body.text, 12_000));
           if (!text(body.text, 12_000) || !text(chat, 100) || !text(dedupeKey, 200)
             || (body.source !== undefined && !text(body.source, 100))) throw new HttpError(400, "Invalid request");
           const target = registry.bySlugName(chat);
@@ -391,9 +401,33 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           if (!sessionId) throw new HttpError(400, "Invalid request");
           return result(await location(deps(), sessionId, locationTarget(body.chat)));
         }
+        case "/messages": {
+          only(body, ["sessionId", "chat", "limit", "before", "id"]);
+          if (!sessionId) throw new HttpError(400, "Invalid request");
+          if (!caller) throw new HttpError(409, "No chat for this session");
+          let chat = caller;
+          if (body.chat !== undefined) {
+            if (!text(body.chat, 100) || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(body.chat)) throw new HttpError(400, "Invalid request");
+            const target = registry.bySlugName(body.chat);
+            if (!adminGroup(target)) ownerOnly(false);
+            if (!target) throw new HttpError(404, "Unknown chat");
+            chat = target;
+          }
+          const limit = body.limit === undefined ? 20 : body.limit;
+          const messageId = (value: unknown) => text(value, 200) && !/[\x00-\x1f\x7f-\x9f]/.test(value);
+          if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 100
+            || (body.before !== undefined && !messageId(body.before)) || (body.id !== undefined && !messageId(body.id))
+            || (body.before !== undefined && body.id !== undefined)) throw new HttpError(400, "Invalid request");
+          const history = chatHistory(chat.store, address => speakerName(chat.context.roleOf(address), address),
+            chatKey.target(registry.ownerKey), typeof body.id === "string" ? { id: body.id }
+              : { limit, ...(typeof body.before === "string" ? { before: body.before } : {}) }, chat.info.kind === "owner");
+          if (!history) throw new HttpError(404, "Unknown message");
+          return reply(200, { chat: chat.info.slug, ...history });
+        }
         case "/ask-owner": {
           only(body, ["text", "sessionId", "dedupeKey"]);
           live();
+          if (typeof body.text === "string" && body.text.length > 12_000) throw new HttpError(400, messageLengthError(body.text, 12_000));
           if (!sessionId || !text(body.text, 12_000) || !text(body.dedupeKey, 200)) throw new HttpError(400, "Invalid request");
           return result(askOwner(deps(caller?.info), sessionId, body.text, body.dedupeKey));
         }
@@ -451,6 +485,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           ownerOnly(false);
           live();
           if (!options.guests) throw new HttpError(503, "Guests unavailable");
+          if (typeof body.text === "string" && body.text.length > 2_000) throw new HttpError(400, messageLengthError(body.text, 2_000));
           if (!text(body.address, 200) || !text(body.text, 2_000) || !text(body.dedupeKey, 200)) throw new HttpError(400, "Invalid request");
           return result(await options.guests.send(body.address, body.text, body.dedupeKey));
         }
@@ -480,7 +515,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
         default:
           return reply(404, { error: "Not found" });
       }
-    } catch (error) { toolError("runtime", "runtime.catch4");
+    } catch (error) { toolError("runtime", "runtime.catch4", error);
       if (error instanceof HttpError) return reply(error.status, { error: error.message });
       if (error instanceof LineError) return reply(502, { error: "Sendblue request failed" });
       return reply(500, { error: "Internal error" });

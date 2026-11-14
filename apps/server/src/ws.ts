@@ -1,3 +1,4 @@
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { AnalyticsError } from "@t3tools/contracts";
 import * as OwnerAnalytics from "./ardud/analytics/Analytics.ts";
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
@@ -1034,6 +1035,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       const base = buildActiveShellSnapshot(
         yield* loadShellSnapshotParts({
           sql,
+          bounded: input.acceptShellPages === true,
           readThreads: threadManagement.readShellSnapshot({
             location: "active",
             ...(input.omitIdleSubagents === true ? { omitIdleSubagents: true } : {}),
@@ -1972,7 +1974,8 @@ export const layerWsRpc = (
           threads: threads.archivedThreads,
         } as const;
       }).pipe(
-        ReplyBuilders.interactive,
+        NodeSqliteClient.backgroundReads,
+        (effect) => ReplyBuilders.bounded(effect, "snapshot"),
         Effect.flatMap((snapshot) =>
           enrichProjectShells(snapshot.projects).pipe(
             Effect.map(({ projects }) => ({ ...snapshot, projects })),

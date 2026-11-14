@@ -9,6 +9,10 @@ import re
 import time
 
 
+def merchant(cfg):
+    return cfg.get('merchant') or cfg.get('merchant_name') or cfg['app']
+
+
 def registrations(root):
     rows = []
     for path in (root / 'orders').glob('*.json'):
@@ -29,7 +33,7 @@ def matching_charge(cfg, now, source, read, deadline, charges, peers=()):
     query = ' OR '.join('"' + value + '"' for value in charges.amounts(cfg))
     rows = source(query, since=charges.day(placed - dt.timedelta(minutes=5)),
                   until=charges.day(now + dt.timedelta(days=1)), n=60, deadline=deadline)
-    expected = charges.words(cfg.get('merchant') or cfg['app'])
+    expected = charges.words(merchant(cfg))
     for row in rows[:60]:
         if row.get('from_me') or row.get('source') not in ('email', 'mail', 'imessage', 'sms'):
             continue
@@ -54,7 +58,7 @@ def matching_charge(cfg, now, source, read, deadline, charges, peers=()):
                          and other.get('card_last4') == cfg['card_last4']
                          and Decimal(other['amount']) == Decimal(cfg['amount'])
                          and other.get('currency', 'AED') == cfg.get('currency', 'AED')
-                         and set(charges.words(other.get('merchant') or other['app'])) & set(charges.words(charge['merchant']))
+                         and set(charges.words(merchant(other))) & set(charges.words(charge['merchant']))
                          and dt.datetime.fromisoformat(other['placed_at'].replace('Z', '+00:00')) - dt.timedelta(minutes=5)
                          <= observed]
             if competing:

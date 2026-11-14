@@ -177,7 +177,7 @@ class ResumeAndCreate(Isolated):
         self.box("bx_a", state="stopped", member=True, size="large", source="template:crpko-go")
         self.box("bx_b", state="stopped", member=True, size="large", source="template:crpko-go")
         ok = {"box_id": "bx_b", "remote_dir": "w/x", "size": "large", "state": "running", "repo_key": "repo",
-              "repo_root": "/checkout/repo"}
+              "repo_root": "/checkout/repo", "source": "template:crpko-go"}
 
         def fake_reuse(con, row, size, skip_archiving=False, before_grow=None):
             if row["box_id"] == "bx_a":

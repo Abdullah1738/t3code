@@ -194,6 +194,7 @@ export function runOrchestratorV2ProviderReplayScenario<
       SqlClient.SqlClient,
       MigrationError | PlatformError.PlatformError | SqlError
     >;
+    readonly afterProviderEvent?: Effect.Effect<void>;
     readonly runEffectWorker?: boolean;
     readonly runContinuationWorker?: boolean;
     readonly recoverOnStartup?: boolean;
@@ -236,6 +237,7 @@ export function layerProviderReplay<Transcript extends ProviderReplayTranscript,
       SqlClient.SqlClient,
       MigrationError | PlatformError.PlatformError | SqlError
     >;
+    readonly afterProviderEvent?: Effect.Effect<void>;
     readonly runEffectWorker?: boolean;
     readonly runContinuationWorker?: boolean;
     readonly recoverOnStartup?: boolean;
@@ -269,6 +271,7 @@ export function layerWithRegistry<Error>(
       SqlClient.SqlClient,
       MigrationError | PlatformError.PlatformError | SqlError
     >;
+    readonly afterProviderEvent?: Effect.Effect<void>;
     readonly runEffectWorker?: boolean;
     readonly runContinuationWorker?: boolean;
     readonly recoverOnStartup?: boolean;
@@ -324,7 +327,7 @@ export function layerWithRegistry<Error>(
   const layerCommandReceiptStoreProvided = CommandReceiptStore.layer.pipe(
     Layer.provide(layerDatabase),
   );
-  const layerProviderEventIngestorProvided = ProviderEventIngestor.layer.pipe(
+  const layerProviderEventIngestorBase = ProviderEventIngestor.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
         layerStores,
@@ -338,6 +341,22 @@ export function layerWithRegistry<Error>(
       ),
     ),
   );
+  const layerProviderEventIngestorProvided =
+    options.afterProviderEvent === undefined
+      ? layerProviderEventIngestorBase
+      : Layer.effect(
+          ProviderEventIngestor.ProviderEventIngestorV2,
+          Effect.gen(function* () {
+            const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+            return {
+              ...ingestor,
+              ingestNormalized: (input: ProviderEventIngestor.ProviderEventIngestInput) =>
+                ingestor
+                  .ingestNormalized(input)
+                  .pipe(Effect.tap(() => options.afterProviderEvent!)),
+            };
+          }),
+        ).pipe(Layer.provide(layerProviderEventIngestorBase));
   const layerVcsDriverRegistry = VcsDriverRegistry.layer.pipe(
     Layer.provide(VcsProcess.layer),
     Layer.provide(layerServerConfig),

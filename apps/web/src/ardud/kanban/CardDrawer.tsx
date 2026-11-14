@@ -1,3 +1,4 @@
+import { askTimingRef } from "./needsYou/useAskTiming";
 import { Link } from "@tanstack/react-router";
 import {
   ArrowRightIcon,
@@ -791,6 +792,12 @@ function Subtasks(props: { card: KanbanCard }) {
                     >
                       {subtask.text}
                     </span>
+                    {(subtask.gate || subtask.ownerOnly) && (
+                      <span className="ml-1 inline-flex flex-wrap gap-1 align-middle">
+                        {subtask.gate && <Chip>{subtask.gate}</Chip>}
+                        {subtask.ownerOnly && <Chip>owner only</Chip>}
+                      </span>
+                    )}
                     <span className="block text-xs text-(--m-muted)">
                       {subtaskOwnerLabel(subtask)}
                       {subtask.note ? ` · ${subtask.note}` : ""}
@@ -843,7 +850,11 @@ function OwnerAsks(props: { card: KanbanCard; nowMs: number; onAnswer: () => voi
   return (
     <ul className="mb-3.5 flex max-h-[30vh] shrink-0 flex-col gap-1 overflow-y-auto overscroll-contain rounded-xl bg-(--m-warnband) py-1.5">
       {asks.map((ask) => (
-        <li key={ask.id} className="flex items-start gap-2 px-3 py-1 text-sm leading-snug">
+        <li
+          ref={askTimingRef(card.id, ask.id)}
+          key={ask.id}
+          className="flex items-start gap-2 px-3 py-1 text-sm leading-snug"
+        >
           <Glyph kind={ask.blocking ? "wait" : "ask"} className="mt-1" />
           <span className="min-w-0 flex-1">
             <span className="line-clamp-3 break-words">{ask.text}</span>

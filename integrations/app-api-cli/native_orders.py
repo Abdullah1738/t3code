@@ -132,7 +132,9 @@ def marketplace_list(data):
     return out
 
 
-def orders(app, service='all', page=1, timeout=10, pages=1, limit=20, with_addresses=False):
+def orders(app, service='all', page=1, timeout=10, pages=1, limit=20, with_addresses=False, *, cursor=None):
+    if cursor is not None and (app != 'noon' or service != 'marketplace'):
+        raise OrderError('INVALID_HISTORY_CURSOR')
     if app == 'talabat':
         from talabat_http_list import list_orders
         from talabat_http_orders import TalabatError
@@ -146,11 +148,9 @@ def orders(app, service='all', page=1, timeout=10, pages=1, limit=20, with_addre
     from noon_http_orders import orders as noon_orders, NoonError
     try:
         if service in {'food', 'nownow'}:
-            if page != 1:
-                raise OrderError(service.upper() + '_PAGINATION_NOT_VERIFIED')
             from noon_vertical_reads import food_orders, nownow_orders
-            return (food_orders if service == 'food' else nownow_orders)(timeout)
-        return noon_orders(service, page, timeout)
+            return (food_orders if service == 'food' else nownow_orders)(timeout, page=page)
+        return noon_orders(service, page, timeout, **({'cursor': cursor} if cursor is not None else {}))
     except NoonError as exc:
         raise OrderError(str(exc)) from None
 

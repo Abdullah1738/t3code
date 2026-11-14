@@ -82,7 +82,7 @@ def guard_checkout_notices(row):
 
 
 def saved_card(client, *, timeout=25):
-    """Unique live default Mastercard (order_card.LAST4) from the account paymentcards read.
+    """Unique live card matching order_card.LAST4 and NETWORK from the account paymentcards read.
 
     The card token is the same numeric id edit-payment sends as paymentToken
     (captured live: numeric paymentcard id == edit-payment paymentToken).

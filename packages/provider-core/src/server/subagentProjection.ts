@@ -284,6 +284,7 @@ export function delegatedTaskProgress(projection: {
     .filter((run) => terminal(run.status) && (run.startedAt !== null || run.ordinal === 1))
     .toSorted((a, b) => (runRanAfter(a, b) ? -1 : runRanAfter(b, a) ? 1 : 0))[0];
   return {
+    hasPendingWork: active || children,
     state:
       active || resultRun === undefined
         ? ("working" as const)
@@ -296,7 +297,7 @@ export function delegatedTaskProgress(projection: {
 
 function writtenIds(
   emitted: ReadonlyArray<OrchestrationV2DomainEvent>,
-  type: "subagent.updated" | "node.updated" | "turn-item.updated",
+  type: "subagent.updated" | "node.updated" | "turn-item.updated" | "provider-turn.updated",
 ): ReadonlySet<string> {
   return new Set(emitted.flatMap((event) => (event.type === type ? [event.payload.id] : [])));
 }
@@ -379,12 +380,64 @@ export const endOrphanedNativeSubagent = Effect.fn("subagentProjection.endOrphan
   },
 );
 
+export const endRunlessProviderTurns = Effect.fn("subagentProjection.endRunlessProviderTurns")(
+  function* <E>(input: {
+    readonly threadId: ThreadId;
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly projection: Pick<OrchestrationV2ThreadProjection, "nodes" | "providerTurns">;
+    readonly now: DateTime.Utc;
+    readonly emitted: ReadonlyArray<OrchestrationV2DomainEvent>;
+    readonly allocateEventId: () => Effect.Effect<EventId, E>;
+  }) {
+    const written = writtenIds(input.emitted, "provider-turn.updated");
+    // Earlier events in the same stop/recovery batch are newer than the projection.
+    const roots = new Map(input.projection.nodes.map((node) => [node.id, node]));
+    for (const event of input.emitted) {
+      if (event.type === "node.updated" && event.threadId === input.threadId) {
+        roots.set(event.payload.id, event.payload);
+      }
+    }
+    const events: Array<OrchestrationV2DomainEvent> = [];
+    for (const turn of input.projection.providerTurns) {
+      if (
+        turn.runAttemptId !== null ||
+        written.has(turn.id) ||
+        (turn.status !== "pending" && turn.status !== "running")
+      )
+        continue;
+      const node = roots.get(turn.nodeId);
+      if (
+        node?.kind !== "root_turn" ||
+        node.runId !== null ||
+        (node.status !== "completed" &&
+          node.status !== "failed" &&
+          node.status !== "interrupted" &&
+          node.status !== "cancelled")
+      )
+        continue;
+      events.push({
+        id: yield* input.allocateEventId(),
+        type: "provider-turn.updated",
+        threadId: input.threadId,
+        nodeId: node.id,
+        providerInstanceId: input.providerInstanceId,
+        occurredAt: input.now,
+        payload: { ...turn, status: node.status, completedAt: node.completedAt ?? input.now },
+      });
+    }
+    return events;
+  },
+);
+
 export const endRunlessRootTurns = Effect.fn("subagentProjection.endRunlessRootTurns")(function* <
   E,
 >(input: {
   readonly threadId: ThreadId;
   readonly providerInstanceId: ProviderInstanceId;
-  readonly projection: Pick<OrchestrationV2ThreadProjection, "nodes" | "turnItems">;
+  readonly projection: Pick<
+    OrchestrationV2ThreadProjection,
+    "nodes" | "turnItems" | "providerTurns"
+  >;
   readonly status: "completed" | "failed" | "interrupted" | "cancelled";
   readonly completedAt?: DateTime.Utc;
   readonly now: DateTime.Utc;
@@ -447,5 +500,11 @@ export const endRunlessRootTurns = Effect.fn("subagentProjection.endRunlessRootT
       });
     }
   }
+  events.push(
+    ...(yield* endRunlessProviderTurns({
+      ...input,
+      emitted: [...input.emitted, ...events],
+    })),
+  );
   return events;
 });

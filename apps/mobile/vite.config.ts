@@ -6,6 +6,7 @@ const reactTests = [
   "src/ardud/common/AttachmentVideoPreview.test.tsx",
   "src/ardud/kanban/needsYou/askUpload.test.tsx",
   "src/ardud/kanban/needsYou/askReply.test.tsx",
+  "src/ardud/kanban/needsYou/askTiming.test.tsx",
   "src/components/ui/Dialog.android.test.tsx",
   "src/features/home/home-route-visibility.test.tsx",
   "src/features/settings/SettingsServerControlsRouteScreen.test.tsx",

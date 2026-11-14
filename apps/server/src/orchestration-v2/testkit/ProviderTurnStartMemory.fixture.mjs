@@ -5,6 +5,7 @@ import * as NodeAssert from "node:assert/strict";
 const root = process.argv[2];
 const mode = process.argv[3];
 const withHandoff = mode.startsWith("handoff") || mode === "subagent-result";
+const compact = mode.endsWith("-compact");
 const require = NodeModule.createRequire(root + "/apps/server/package.json");
 const load = (name) => import(NodeURL.pathToFileURL(require.resolve("effect/" + name)));
 const [Effect, Layer, FileSystem, Path] = await Promise.all([
@@ -30,6 +31,8 @@ const [
   Auth,
   Config,
   Settings,
+  Adapter,
+  InstallReport,
 ] = await Promise.all([
   app("orchestration-v2/ProviderTurnStartService"),
   app("orchestration-v2/ProjectionStore"),
@@ -44,10 +47,25 @@ const [
   app("provider/ProviderAuthService"),
   app("config"),
   app("serverSettings"),
+  providerCore("ProviderAdapter"),
+  app("ardud/fast-install/report"),
 ]);
 let current;
 let fullReads = 0;
 let threadReads = 0;
+let interruptReasonReads = 0;
+let interruptReason;
+let interruptReadFails = false;
+const interruptReasonCases = [
+  { message: undefined, expected: undefined },
+  { message: "Interrupt requested", expected: undefined },
+  { message: "Parent task cancelled", expected: "Parent task cancelled" },
+  { message: "", expected: "" },
+  { message: "Unavailable", readFails: true, expected: undefined },
+];
+let nativeStarts = 0;
+let nativeCompactions = 0;
+const handoffWrites = [];
 const liveRuns = [];
 const refs = [];
 const checkpoints = [];
@@ -57,9 +75,26 @@ const session = {
   driver: "codex",
   providerSession: { id: "session", driver: "codex" },
   resumeThread: ({ providerThread }) => Effect.succeed(providerThread),
-  startTurn: () =>
-    mode === "handoff-failure" ? Effect.fail("Synthetic startup failure") : Effect.void,
-  compactThread: () => Effect.void,
+  startTurn: (input) =>
+    Effect.suspend(() => {
+      nativeStarts++;
+      NodeAssert.equal(
+        input.message.text.includes("Synthetic summary"),
+        mode === "handoff" || mode === "handoff-failure",
+      );
+      return mode === "handoff-failure"
+        ? Effect.fail(
+            new Adapter.ProviderAdapterTurnStartError({
+              driver: "codex",
+              threadId: input.threadId,
+              providerThreadId: input.providerThread.id,
+              runId: input.runId,
+              cause: "Synthetic startup failure",
+            }),
+          )
+        : Effect.void;
+    }),
+  compactThread: () => Effect.sync(() => nativeCompactions++),
 };
 const dependencies = Layer.mergeAll(
   Layer.mock(Handoff.ContextHandoffServiceV2)({}),
@@ -78,9 +113,24 @@ const dependencies = Layer.mergeAll(
         throw new Error("full transcript read");
       }),
     hasUnpairedRunInterruptRequest: () => Effect.succeed(false),
-    getThreadRecords: (threadId, fields) =>
+    getThreadRecords: (threadId, fields, filter) =>
       Effect.sync(() => {
         NodeAssert.equal(threadId, current.thread.id);
+        if (fields.includes("turnItems")) {
+          interruptReasonReads++;
+          NodeAssert.deepEqual(fields, ["turnItems"]);
+          NodeAssert.deepEqual(filter, {
+            turnItemRunIds: [current.runs[0].id],
+            turnItemTypes: ["run_interrupt_request"],
+          });
+          if (interruptReadFails) throw new Error("Synthetic interrupt read failure");
+          return {
+            turnItems:
+              interruptReason === undefined
+                ? []
+                : [{ type: "run_interrupt_request", message: interruptReason }],
+          };
+        }
         NodeAssert.deepEqual(fields, []);
         threadReads++;
         return { thread: current.thread };
@@ -107,20 +157,41 @@ const dependencies = Layer.mergeAll(
       Effect.succeed({ cwd: "/synthetic", interactionMode: "default", runtimeMode: "full-access" }),
   }),
   Layer.mock(Run.RunExecutionServiceV2)({
+    prepareUsageBeforeStart: () => Effect.succeed(() => Effect.void),
     startRootRun: (input) =>
       Effect.gen(function* () {
         liveRuns.push(input);
-        const turnInput = { ...input, message: input.message };
-        const result = yield* Effect.exit(
-          mode === "handoff-compact"
-            ? input.session.compactThread(turnInput)
-            : input.session.startTurn(turnInput),
+        const turnInput = {
+          appThread: input.appThread,
+          threadId: input.run.threadId,
+          runId: input.run.id,
+          runOrdinal: input.run.ordinal,
+          providerTurnOrdinal: input.providerTurnOrdinal,
+          attemptId: input.attemptId,
+          rootNodeId: input.rootNode.id,
+          providerThread: input.providerThread,
+          message: input.message,
+          modelSelection: input.modelSelection,
+          runtimePolicy: input.runtimePolicy,
+        };
+        const result = yield* Effect.result(
+          compact ? input.session.compactThread(turnInput) : input.session.startTurn(turnInput),
         );
         NodeAssert.equal(result._tag, mode === "handoff-failure" ? "Failure" : "Success");
+        if (result._tag === "Failure") {
+          NodeAssert.equal(result.failure._tag, "ProviderAdapterTurnStartError");
+          NodeAssert.equal(result.failure.cause, "Synthetic startup failure");
+        }
       }),
   }),
   Layer.mock(Sink.EventSinkV2)({
-    write: () => Effect.succeed([]),
+    write: ({ events }) =>
+      Effect.sync(() => {
+        for (const event of events)
+          if (event.type === "context-handoff.updated")
+            handoffWrites.push(event.payload.delivery?.status);
+        return [];
+      }),
     writeIfRunCurrent: ({ events }) =>
       Effect.sync(() => {
         for (const event of events)
@@ -207,6 +278,7 @@ await Effect.runPromise(
     const service = yield* Start.ProviderTurnStartServiceV2;
     for (let i = 0; i < count; i++) {
       current = fixture(i);
+      if (mode.startsWith("restart")) InstallReport.markQueuedRunRecovered("run:" + i);
       yield* service.start({ threadId: "thread", runId: "run:" + i });
       const controls = liveRuns.at(-1);
       current = { ...current, turnItems: [] };
@@ -222,6 +294,12 @@ await Effect.runPromise(
       NodeAssert.equal(fullReads, i + 1);
       NodeAssert.equal(threadReads, i + 1);
       NodeAssert.equal(yield* controls.hasUnpairedRunInterruptRequest(), false);
+      for (const testCase of interruptReasonCases) {
+        interruptReason = testCase.message;
+        interruptReadFails = testCase.readFails ?? false;
+        NodeAssert.equal(yield* controls.loadRunInterruptReason(), testCase.expected);
+      }
+      interruptReadFails = false;
       NodeAssert.equal(fullReads, i + 1);
       NodeAssert.equal(threadReads, i + 1);
       current = null;
@@ -242,4 +320,15 @@ await Effect.runPromise(
     }
   }).pipe(Effect.provide(Start.layer.pipe(Layer.provide(dependencies)))),
 );
+NodeAssert.equal(nativeStarts, compact ? 0 : count);
+NodeAssert.equal(nativeCompactions, compact ? count : 0);
+NodeAssert.equal(interruptReasonReads, count * interruptReasonCases.length);
+NodeAssert.deepEqual(
+  handoffWrites,
+  Array.from({ length: count }, () =>
+    mode === "handoff" ? ["pending", "inline"] : mode === "handoff-failure" ? ["pending"] : [],
+  ).flat(),
+);
+if (mode.startsWith("restart"))
+  NodeAssert.notEqual(InstallReport.continuationReport().firstResumedProviderRequestAt, null);
 console.log(JSON.stringify({ checkpoints }));

@@ -20,8 +20,11 @@ const snapshotAt = Config.schema(
   Schema.Number.check(Schema.isFinite(), Schema.isBetween({ minimum: 0, maximum: 1 })),
   "T3CODE_HEAP_SNAPSHOT_AT",
 ).pipe(Config.withDefault(0.7));
-const MAX_TRIGGER_BYTES = 1.4 * 1024 ** 3;
+// Normal boot recovery has reached about 2.3 GB; leave headroom below the 4 GiB limit.
+const MAX_TRIGGER_BYTES = 2.5 * 1024 ** 3;
+const REQUIRED_HIGH_CHECKS = 3;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+const MAX_SNAPSHOTS = 2;
 
 export const writeHeapSnapshot = Effect.fn("server.heapSnapshot", { root: true })(
   function* (logsDir: string, heap: HeapStats = NodeV8.getHeapStatistics()) {
@@ -32,6 +35,7 @@ export const writeHeapSnapshot = Effect.fn("server.heapSnapshot", { root: true }
     yield* Effect.try(() => NodeV8.writeHeapSnapshot(path)).pipe(
       Effect.tapError(() => fs.remove(path, { force: true }).pipe(Effect.ignore)),
     );
+    yield* cleanup(logsDir);
     yield* Effect.logInfo("Wrote heap snapshot.", {
       heapUsedBytes: heap.used_heap_size,
       heapLimitBytes: heap.heap_size_limit,
@@ -46,23 +50,34 @@ const cleanup = Effect.fn("server.heapSnapshot.cleanup")(
   function* (logsDir: string) {
     const fs = yield* FileSystem.FileSystem;
     const cutoff = DateTime.toEpochMillis(yield* DateTime.now) - RETENTION_MS;
+    const snapshots: Array<{ path: string; modified: number }> = [];
     for (const name of yield* fs.readDirectory(logsDir)) {
       if (!name.startsWith("server-") || !name.endsWith(".heapsnapshot")) continue;
       const path = NodePath.join(logsDir, name);
       yield* Effect.gen(function* () {
         const info = yield* fs.stat(path);
-        if (
-          info.type === "File" &&
-          Option.isSome(info.mtime) &&
-          info.mtime.value.getTime() < cutoff
-        ) {
-          yield* fs.remove(path);
+        if (info.type === "File") {
+          snapshots.push({
+            path,
+            modified: Option.isSome(info.mtime) ? info.mtime.value.getTime() : 0,
+          });
         }
       }).pipe(
         Effect.catch((cause) =>
           Effect.logWarning("Failed to remove old heap snapshot.", { path, cause }),
         ),
       );
+    }
+    snapshots.sort((a, b) => b.modified - a.modified || b.path.localeCompare(a.path));
+    for (const [index, { path, modified }] of snapshots.entries()) {
+      if (index < MAX_SNAPSHOTS && modified >= cutoff) continue;
+      yield* fs
+        .remove(path)
+        .pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("Failed to remove old heap snapshot.", { path, cause }),
+          ),
+        );
     }
   },
   Effect.catch((cause) => Effect.logWarning("Failed to clean up heap snapshots.", { cause })),
@@ -88,6 +103,7 @@ export const layerWith = (
       );
       let attempted = false;
       let lowDiskLogged = false;
+      let highChecks = 0;
       // A snapshot blocks the event loop for seconds; acceptable once per process
       // for automatic diagnostics. Manual SIGUSR2 requests remain available.
       const snapshot = Effect.fn("server.heapSnapshot.capture")(function* (heap: HeapStats) {
@@ -97,9 +113,13 @@ export const layerWith = (
       const tick = Effect.gen(function* () {
         if (attempted) return;
         const heap = yield* Effect.try(readHeapStats);
-        // Real huge-string OOMs occur well below V8's nominal 4 GiB limit.
-        if (heap.used_heap_size < Math.min(MAX_TRIGGER_BYTES, threshold * heap.heap_size_limit))
+        if (heap.used_heap_size < Math.min(MAX_TRIGGER_BYTES, threshold * heap.heap_size_limit)) {
+          highChecks = 0;
           return;
+        }
+        // Avoid turning a short allocation spike into a blocking snapshot.
+        highChecks = Math.min(highChecks + 1, REQUIRED_HIGH_CHECKS);
+        if (highChecks < REQUIRED_HIGH_CHECKS) return;
         const availableBytes = yield* freeBytes(logsDir);
         if (availableBytes < 2 * heap.used_heap_size) {
           if (!lowDiskLogged) {
@@ -116,9 +136,10 @@ export const layerWith = (
         // A manual signal may have captured while statfs was in flight.
         if (!attempted) yield* snapshot(heap);
       }).pipe(
-        Effect.catch((cause) =>
-          Effect.logWarning("Failed to check heap snapshot threshold.", { cause }),
-        ),
+        Effect.catch((cause) => {
+          highChecks = 0;
+          return Effect.logWarning("Failed to check heap snapshot threshold.", { cause });
+        }),
       );
       if (threshold > 0) {
         yield* Effect.sleep("30 seconds").pipe(

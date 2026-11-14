@@ -117,6 +117,45 @@ describe("CDP relay", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it("scopes explicit paint holds to extra sessions and releases a detached owner", async () => {
+    const setPaintHold = vi.fn(async () => ({}));
+    const sessionDetached = vi.fn();
+    const written: Array<Record<string, unknown>> = [];
+    const relay = createCdpRelayConnection(
+      { ...makeTarget(vi.fn()), setPaintHold, sessionDetached },
+      (raw) => written.push(JSON.parse(raw)),
+    );
+    relay.receive(
+      JSON.stringify({
+        id: 1,
+        method: "Target.attachToTarget",
+        params: { targetId: "GUEST-TARGET" },
+      }),
+    );
+    await settle();
+    const sessionId = (written[0]!["result"] as { sessionId: string }).sessionId;
+    for (const enabled of [true, false]) {
+      relay.receive(
+        JSON.stringify({
+          id: 2,
+          method: "Emulation.setFocusEmulationEnabled",
+          params: { enabled },
+          sessionId,
+        }),
+      );
+      await settle();
+    }
+    expect(setPaintHold.mock.calls).toEqual([
+      [sessionId, true],
+      [sessionId, false],
+    ]);
+    relay.receive(
+      JSON.stringify({ id: 3, method: "Target.detachFromTarget", params: { sessionId } }),
+    );
+    await settle();
+    expect(sessionDetached).toHaveBeenCalledWith(sessionId);
+  });
+
   it("routes tab events to the page session once the page is announced", async () => {
     const written: Array<Record<string, unknown>> = [];
     const relay = createCdpRelayConnection(makeTarget(vi.fn()), (raw) =>

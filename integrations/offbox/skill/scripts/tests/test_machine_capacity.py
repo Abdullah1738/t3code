@@ -333,13 +333,16 @@ class ResumeTests(Isolated):
                 patch.object(lease, "time", clock.time), \
                 patch.object(lease, "_bring_up", return_value={"state": "running", "type": "large"}), \
                 patch.object(lease, "acquire_private") as create, \
-                contextlib.redirect_stderr(io.StringIO()):
+                contextlib.redirect_stderr(io.StringIO()) as err:
             got = pool.acquire(self.me)
             pool.release_guard(got)
         self.assertEqual(got["box_id"], "cold")
         resume.assert_called_once()
         create.assert_not_called()
         self.assertIn("resume_unanswered cold", common.LOG_PATH.read_text())
+        self.assertIn("template_pick repo_key=repo template=crpko-go reason=reuse:template:crpko-go",
+                      common.LOG_PATH.read_text())
+        self.assertIn("offbox: template crpko-go (reuse:template:crpko-go; --template to override)", err.getvalue())
 
     def test_still_stopped_retries_resume_only_once_after_confirmation(self):
         self.box("cold", "stopped", member=True)

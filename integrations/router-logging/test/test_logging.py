@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 import urllib.error
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -105,6 +105,39 @@ class LoggingTests(unittest.TestCase):
         output = subprocess.check_output([sys.executable, '-I', str(ROOT / 'run.py'), 'rollup', '--day', '2026-11-12'])
         self.assertEqual(json.loads(output)['total'], 101)
         self.assertEqual(stat.S_IMODE((self.root / 'rollup-2026-11-12.json').stat().st_mode), 0o600)
+
+    def test_endpoint_perf_includes_http_and_transport_failures_without_secrets(self):
+        cases = [('ok', 200, True), ('http', 503, False), ('timeout', 0, False), ('json', 200, False), ('large', 200, False)]
+        for case, expected_status, expected_ok in cases:
+            with self.subTest(case=case):
+                router = object.__new__(poller.Router)
+                router.auth = 'sk-private-auth'
+                router.opener = MagicMock()
+                response = router.opener.open.return_value.__enter__.return_value
+                response.status = 200
+                response.read.return_value = b'{}'
+                if case == 'http':
+                    router.opener.open.side_effect = urllib.error.HTTPError('private-url', 503, 'private body', {}, None)
+                elif case == 'timeout':
+                    router.opener.open.side_effect = TimeoutError('private body')
+                elif case == 'json':
+                    response.read.return_value = b'private body'
+                elif case == 'large':
+                    response.read.return_value = b'x' * (4 * 1024 * 1024 + 1)
+                with patch.object(poller.time, 'monotonic', side_effect=[10, 10.125]):
+                    if expected_ok:
+                        self.assertEqual(router.get('/api/usage/stats?period=today'), {})
+                    else:
+                        with self.assertRaises(Exception):
+                            router.get('/api/usage/stats?period=today')
+                event = self.rows()[-1]
+                self.assertEqual((event['name'], event['kind'], event['durationMs'], event['ok']), ('endpoint.get', 'perf', 125, expected_ok))
+                self.assertEqual(event['props'], {'endpoint': '/api/usage/stats', 'status': expected_status})
+                self.assertNotIn('private', json.dumps(event))
+                self.assertNotIn('sk-', json.dumps(event))
+        with self.assertRaises(ValueError):
+            router.get('/api/providers/test')
+        self.assertEqual(len([r for r in self.rows() if r['name'] == 'endpoint.get']), len(cases))
 
     def test_poller_gets_only_recorded_metadata_dedupes_and_rolls_over(self):
         calls = []

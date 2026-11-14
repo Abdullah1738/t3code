@@ -223,7 +223,7 @@ export function jevJudge(deps: JevDeps = {}): GroupJudge {
     if (!states.length) return [];
     const keyFile = deps.keyFile ?? join(homedir(), ".config/opencode/openrouter-key");
     let key: string;
-    try { key = (await readFile(keyFile, "utf8")).trim(); } catch { toolError("group-judge", "group-judge.catch1"); throw new JudgeError("keyUnavailable"); }
+    try { key = (await readFile(keyFile, "utf8")).trim(); } catch (caughtError) { toolError("group-judge", "group-judge.catch1", caughtError); throw new JudgeError("keyUnavailable"); }
     if (!key || /[\s\x00-\x1f\x7f]/.test(key)) throw new JudgeError("keyUnavailable");
     const keys = states.map((_, index) => `m${index}`);
     const body = JSON.stringify({
@@ -241,19 +241,19 @@ export function jevJudge(deps: JevDeps = {}): GroupJudge {
             method: "POST", body, redirect: "error", signal,
             headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json", "X-OpenRouter-Title": "spectrum-bridge group gate" },
           });
-        } catch { toolError("group-judge", "group-judge.catch2"); throw new JudgeError(signal.aborted ? "timeout" : "network"); }
+        } catch (caughtError) { toolError("group-judge", "group-judge.catch2", caughtError); throw new JudgeError(signal.aborted ? "timeout" : "network"); }
         if (!response.ok) {
-          await response.body?.cancel().catch(() => { toolError("group-judge", "group-judge.catch3");});
+          await response.body?.cancel().catch((caughtError) => { toolError("group-judge", "group-judge.catch3", caughtError);});
           throw new JudgeError(`http${response.status}`);
         }
         let result: { answers?: Record<string, { noul?: unknown }> };
-        try { result = await response.json() as typeof result; } catch { toolError("group-judge", "group-judge.catch4"); throw new JudgeError(signal.aborted ? "timeout" : "invalidResponse"); }
+        try { result = await response.json() as typeof result; } catch (caughtError) { toolError("group-judge", "group-judge.catch4", caughtError); throw new JudgeError(signal.aborted ? "timeout" : "invalidResponse"); }
         return keys.map(k => {
           const p = result.answers?.[k]?.noul;
           if (typeof p !== "number" || !(p >= 0 && p <= 1)) throw new JudgeError("invalidResponse");
           return p;
         });
-      } catch (error) { toolError("group-judge", "group-judge.catch5");
+      } catch (error) { toolError("group-judge", "group-judge.catch5", error);
         failure = error instanceof JudgeError ? error : new JudgeError("jevFailed");
       }
     }

@@ -1,3 +1,10 @@
+if __package__:
+    from . import test_environment
+else:
+    import test_environment
+
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -13,6 +20,8 @@ import engine
 import statev2_guard as guard
 import code_mode_fixture
 import isolated_source_cases
+import claude
+import codex
 
 LIVE = "/Users/x/.robob/userdata/statev2.sqlite"
 READ = "live-database-read"
@@ -22,7 +31,7 @@ UNRESOLVED = "live-database-script-unresolved"
 
 class GuardTests(unittest.TestCase):
     def setUp(self):
-        clean = patch.dict(os.environ, isolated_source_cases.fixture_environment())
+        clean = isolated_source_cases.fixture_environment_patch()
         clean.start()
         self.addCleanup(clean.stop)
         self.temp = tempfile.TemporaryDirectory()
@@ -52,6 +61,305 @@ class GuardTests(unittest.TestCase):
         path.write_text(source)
         return path
 
+    def heredoc(self, target, body):
+        return 'cat > ' + target + " <<'GUARD_BODY'\n" + body.rstrip() + '\nGUARD_BODY\n'
+
+    def reporter_body(self, name):
+        return (Path(__file__).with_name('fixtures') / 'heredoc-rerun' / name).read_text()
+
+    def adapters(self, command, expected=None):
+        for harness, adapter, tool, field in [('claude', claude, 'Bash', 'command'), ('codex', codex, 'exec_command', 'cmd')]:
+            event = {'hook_event_name': 'PreToolUse', 'cwd': str(self.root), 'tool_name': tool,
+                     'tool_input': {field: command}}
+            with self.subTest(harness=harness), patch.object(engine, '_log'), patch.object(engine, '_tool_log'), \
+                    patch.object(engine, '_offbox_mode', return_value='off'), \
+                    patch.object(engine, '_native', return_value=(None, None, None)), \
+                    patch.dict(os.environ, {name: '' for name in (engine.COMMAND_IDENTITY_ENV, 'AGENT_GUARD_APPROVED', 'HARNESS_COORD_APPROVED')}):
+                result = engine.decide(event, harness)
+                self.assertEqual(result['decision'], 'deny' if expected else 'allow', result)
+                if expected:
+                    self.assertEqual(result['context']['rule'], expected)
+                with patch.object(sys, 'stdin', io.StringIO(json.dumps(event))), redirect_stdout(io.StringIO()) as output:
+                    adapter.main()
+                if expected:
+                    self.assertEqual(json.loads(output.getvalue())['hookSpecificOutput']['permissionDecision'], 'deny')
+                else:
+                    self.assertEqual(output.getvalue(), '')
+
+    def test_same_call_unproved_python_operations(self):
+        rows = {
+            'download': "import urllib.request\nurllib.request.urlretrieve('https://example.test/replacement.py', __file__)",
+            'download alias': "from urllib.request import urlretrieve as fetch\nfetch('https://example.test/replacement.py', __file__)",
+            'archive': "import zipfile\nzipfile.ZipFile('payload.zip').extractall('.')",
+            'archive alias': "from zipfile import ZipFile as Archive\nArchive('payload.zip').extractall('.')",
+            'local import': 'import updater',
+            'local call': 'import updater\nupdater.update()',
+            'local member': 'from updater import update\nupdate()',
+            'unknown method': "import pathlib\npathlib.Path('x.py').touch()",
+            'callback': "import json\nfrom urllib.request import urlretrieve\njson.dumps(object, default=urlretrieve)",
+        }
+        self.write('updater.py', 'print(1)')
+        for label, body in rows.items():
+            for interpreter in ['python3', 'python3 -I']:
+                command = self.heredoc('tmp/x.py', body) + interpreter + ' tmp/x.py\n' + interpreter + ' tmp/x.py'
+                with self.subTest(label=label, interpreter=interpreter):
+                    self.assertEqual(self.classify(command), UNRESOLVED)
+                    self.adapters(command, UNRESOLVED)
+                    reason = guard.refusal_reason(*guard.classify_detail(command, str(self.root)), str(self.root))
+                    self.assertIn('intervening command', reason)
+                    self.assertNotIn('literal absolute', reason)
+
+    def test_same_call_unittest_main_module_selection(self):
+        # Source bytes only: neither the proposed runner nor this import-time
+        # writer is executed by the classifier/adapter checks.
+        self.write('updater.py', self.reporter_body('unittest-updater.py'))
+        target = str(self.root / 'x.py')
+        imports = [
+            ('import unittest', 'unittest.main'),
+            ('import unittest as tests', 'tests.main'),
+            ('from unittest import main as run', 'run'),
+        ]
+        arguments = [
+            ('', None),
+            ("'__main__'", None),
+            ("'updater'", UNRESOLVED),
+            ("module='updater'", UNRESOLVED),
+            ("module='__main__'", UNRESOLVED),
+            ('None', UNRESOLVED),
+            ('__name__', UNRESOLVED),
+            ("*['updater']", UNRESOLVED),
+            ("**{'module': 'updater'}", UNRESOLVED),
+            ("'__main__', 'updater'", UNRESOLVED),
+            ("'__main__', argv=['x.py', 'discover']", UNRESOLVED),
+            ("'__main__', testLoader=unittest.defaultTestLoader", UNRESOLVED),
+        ]
+        for source_import, function in imports:
+            for args, expected in arguments:
+                body = source_import + '\n' + function + '(' + args + ')'
+                for interpreter in ['python3', 'python3 -I']:
+                    for setup, script in [('', target), ('d=$(mktemp -d)\n', '"$d/x.py"')]:
+                        command = setup + self.heredoc(script, body) + interpreter + ' ' + script + '\n' + interpreter + ' ' + script
+                        with self.subTest(function=function, args=args, interpreter=interpreter, script=script):
+                            self.assertEqual(self.classify(command), expected)
+                            self.adapters(command, expected)
+            for options in ['discover', 'updater', '-v']:
+                body = source_import + '\n' + function + '()'
+                run = 'python3 -I ' + target
+                command = self.heredoc(target, body) + run + ' ' + options + '\n' + run
+                with self.subTest(function=function, options=options):
+                    self.assertEqual(self.classify(command), UNRESOLVED)
+                    self.adapters(command, UNRESOLVED)
+
+    def test_same_call_copy_replaces_opaque_source(self):
+        seed = self.write('source/readback.ndjson', 'print(2)')
+        for write_root in ['$d', '${d}']:
+            for copy_root in ['$d', '${d}']:
+                for destination in ['', 'readback.ndjson', './readback.ndjson', 'sibling.ndjson']:
+                    for order in ['before', 'after']:
+                        target = '"' + write_root + '/readback.ndjson"'
+                        write = self.heredoc(target, 'print(1)')
+                        copy = f'cp {seed} "{copy_root}/{destination}"\n'
+                        command = 'd=$(mktemp -d)\n' + (copy + write if order == 'before' else write + copy) + 'python3 -I ' + target
+                        expected = UNRESOLVED
+                        with self.subTest(write_root=write_root, copy_root=copy_root, destination=destination, order=order):
+                            self.assertEqual(self.classify(command), expected)
+                            self.adapters(command, expected)
+                            if destination in {'', 'readback.ndjson'}:
+                                rule, cause = guard.classify_detail(command, str(self.root))
+                                self.assertIn('unchecked copy', cause)
+                                self.assertNotIn('literal absolute', guard.refusal_reason(rule, cause, str(self.root)))
+
+    def test_same_call_checked_test_runners(self):
+        target = str(self.root / 'skip.test.mjs')
+        body = "import test from 'node:test'; test.skip('skip output', () => {});"
+        run = f'bun test {target} 2>&1 | tail -2; node --test {target} 2>&1 | tail -1'
+        command = self.heredoc(target, body) + run
+        self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        self.adapters(command)
+        for body in [body.replace("'node:test'", "'./unchecked.mjs'"), body + '\nimport "./unchecked.mjs";',
+                     body.replace('() => {}', '() => { process.exit(1); }'), body + '\nprocess.dlopen({});']:
+            command = self.heredoc(target, body) + run
+            with self.subTest(body=body):
+                self.assertEqual(self.classify(command), UNRESOLVED)
+                self.adapters(command, UNRESOLVED)
+        command = self.heredoc(target, "import fs from 'node:fs'; fs.readFileSync(" + repr(LIVE) + ");") + run
+        self.assertEqual(self.classify(command), SCRIPT)
+        self.adapters(command, SCRIPT)
+        for runner in [f'node --test --import tmp/hook.mjs {target}', f'bun test --preload tmp/hook.mjs {target}']:
+            command = self.heredoc(target, "import test from 'node:test'; test.skip('skip output', () => {});") + runner + '\nnode --test ' + target
+            self.assertEqual(self.classify(command), UNRESOLVED)
+            self.adapters(command, UNRESOLVED)
+
+    def test_same_call_two_test_files(self):
+        command = self.heredoc('test_one.py', 'import unittest\nclass T(unittest.TestCase):\n def test_one(self): self.assertTrue(True)')
+        command += self.heredoc('test_two.py', 'import unittest\nclass U(unittest.TestCase):\n def test_two(self): self.assertTrue(True)')
+        command += 'python3 -m unittest discover'
+        self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        self.adapters(command)
+
+    def test_same_call_watchers47(self):
+        command = self.reporter_body('watchers47.sh')
+        self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        self.adapters(command)
+
+    def test_same_call_literal_reporters(self):
+        script = self.root / 'tmp/replay.py'
+        replay = self.heredoc(str(script), self.reporter_body('replay.py'))
+        run = f'python3 -I {script} {self.root}/tmp/before {self.root}/tmp/result'
+        batches = {
+            'A single': replay + run + ' > tmp/before.json',
+            'checked rerun': self.heredoc(str(script), 'import json\nprint(json.dumps(dict(count=1)))') + run + '\n' + run,
+            'A sibling': replay + 'git show HEAD:src/tool.py > tmp/sibling.py\n' + run,
+            'A copy to sibling': replay + f'cp {script} tmp/sibling.py\n' + run,
+            'A reconstructed': 'mkdir tmp/before\ngit show HEAD:src/tool.py > tmp/before/tool.py\n' + replay + 'git show HEAD:src/reader.py > tmp/sibling.py\n' + run + ' > tmp/before.json',
+            'D2 single': self.heredoc(str(self.root / 'tmp/report.py'), self.reporter_body('report.py')) + 'unset BUN_INSPECT\npython3 -I tmp/report.py tmp/credential.json',
+        }
+        for label, command in batches.items():
+            with self.subTest(label=label):
+                self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        # DB-safe is not a source-preservation proof for unchecked imports.
+        self.assertEqual(self.classify(replay + run + '\n' + run), UNRESOLVED)
+        for interpreter in ['bun', 'node']:
+            prefix = self.heredoc('tmp/readback.ts', self.reporter_body('readback.ts'))
+            run = interpreter + ' tmp/readback.ts tmp/some.ndjson'
+            self.assertEqual(guard.classify_detail(prefix + run + '\n' + run, str(self.root)), (None, None))
+
+    def test_same_call_fresh_reporters(self):
+        for variable in ['$d', '${d}']:
+            for separator in ['\n', '; ']:
+                for setup in ['', 'set -euo pipefail\n']:
+                    for binary, filename in [('bun', 'readback.ts'), ('node', 'readback.ts'), ('python3', 'report.py'), ('python3 -I', 'report.py')]:
+                        target = '"' + variable + '/' + filename + '"'
+                        body = self.reporter_body(filename)
+                        prefix = setup + 'd=$(mktemp -d)' + separator + 'cp /fixtures/some.ndjson "' + variable + '/"' + separator
+                        run = binary + ' ' + target + ' tmp/credential.json'
+                        command = prefix + self.heredoc(target, body) + run + separator + run
+                        with self.subTest(variable=variable, separator=separator, setup=setup, binary=binary):
+                            self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        # Quoting is required: IFS and glob expansion are not proved by mktemp.
+        command = 'd=$(mktemp -d); ' + self.heredoc('"$d/report.py"', self.reporter_body('report.py')) + 'python3 -I $d/report.py'
+        self.assertEqual(self.classify(command), UNRESOLVED)
+
+    def test_same_call_unittest_reporters(self):
+        for relative, filename in [('integrations/robob-watch/checks/money-cases', 'test_order_charges.py'), ('integrations/memory-system/tests', 'test_state_lineage_logging.py')]:
+            for absolute_write in [False, True]:
+                target = relative + '/' + filename
+                if absolute_write:
+                    target = str(self.root / target)
+                prefix = self.heredoc(target, self.reporter_body(filename))
+                runners = [
+                    f'python3 -m unittest discover -s {relative}',
+                    f'python3 -I -m unittest discover -s {relative} -p \'test_*.py\' -t . -v',
+                    f'cd {relative} && python3 -m unittest discover',
+                    f'python3 {self.root / relative / filename}',
+                ]
+                if filename == 'test_state_lineage_logging.py':
+                    runners.append('cd integrations/memory-system && python3 -m unittest discover -s tests')
+                for runner in runners:
+                    for preparation in ['', 'unset BUN_INSPECT\n']:
+                        command = prefix + preparation + runner
+                        with self.subTest(target=target, runner=runner, preparation=preparation):
+                            self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        simple = 'import tempfile, unittest\nclass Fixture(unittest.TestCase):\n def test_fixture(self):\n  with tempfile.TemporaryDirectory() as root:\n   self.assertTrue(root)\n'
+        prefix = self.heredoc('tmp/test_fixture.py', simple)
+        run = 'python3 -m unittest discover -s tmp'
+        self.assertEqual(guard.classify_detail(prefix + run + '\n' + run, str(self.root)), (None, None))
+
+    def test_same_call_offbox_reporter(self):
+        relative = 'integrations/memory-system/tests/benchmark_recall_storage.py'
+        for destination in [relative, str(self.root / relative)]:
+            for target in [relative, str(self.root / relative)]:
+                for binary in ['python3', 'python3 -I']:
+                    for wrapper in ['', 'offbox run -- ', 'offbox run --bg --size xlarge -- ']:
+                        prefix = self.heredoc(destination, self.reporter_body('benchmark_recall_storage.py'))
+                        command = prefix + 'git show HEAD:src/storage.py > tmp/baseline.py\n' + wrapper + binary + ' ' + target
+                        with self.subTest(destination=destination, target=target, binary=binary, wrapper=wrapper):
+                            self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        body = 'import os, sqlite3, tempfile\nwith tempfile.TemporaryDirectory() as tmp:\n sqlite3.connect(os.path.join(tmp, "bench.db"))\n'
+        self.assertEqual(guard.classify_detail(self.heredoc(relative, body) + 'offbox run -- python3 ' + relative, str(self.root)), (None, None))
+
+    def test_same_call_still_refuses_rewrites(self):
+        target = str(self.root / 'tmp/replay.py')
+        prefix = self.heredoc(target, 'print(1)')
+        changes = [
+            f'echo {shlex.quote("import sqlite3; sqlite3.connect(" + repr(LIVE) + ")")} >> {target}',
+            f'cp /other/evil.py {target}', f'sed -i s/1/2/ {target}',
+            f'curl -o {target} https://example.test/x', f'curl https://example.test/x > {target}',
+            f'git show HEAD:other.py > {target}', f'cat /other/evil.py >> {target}',
+            'python3 -I tmp/other.py', 'python3 -m some_local_module',
+            'offbox run -- python3 -I tmp/other.py', 'offbox run -- unknown-program',
+        ]
+        for change in changes:
+            with self.subTest(change=change):
+                self.assertIsNotNone(self.classify(prefix + change + '\npython3 -I ' + target))
+        for body in ['from pathlib import Path\nPath(__file__).write_text("print(2)")', 'open(__file__, "w").write("print(2)")', 'import sys\nopen(sys.argv[0], "w").write("print(2)")']:
+            command = self.heredoc(target, body) + f'python3 -I {target}\npython3 -I {target}'
+            with self.subTest(body=body):
+                self.assertEqual(self.classify(command), UNRESOLVED)
+        for body in ['writer = open\nwriter(__file__, "w").write("print(2)")', 'from io import open as writer\nwriter(__file__, "w").write("print(2)")', 'from pathlib import Path\nPath(sys.argv[1]).write_text("print(2)")']:
+            command = self.heredoc(target, body) + f'python3 -I {target}\npython3 -I {target}'
+            self.assertEqual(self.classify(command), UNRESOLVED)
+        relative = 'integrations/memory-system/tests/test_state_lineage_logging.py'
+        for change in [f'sed -i s/1/2/ {relative}', f'cat /other/evil.py >> {relative}', 'python3 -m some_local_module']:
+            command = self.heredoc(relative, 'print(1)') + change + '\npython3 -m unittest discover -s integrations/memory-system/tests'
+            self.assertEqual(self.classify(command), UNRESOLVED)
+
+    def test_same_call_fresh_fail_closed(self):
+        for setup in ['d=$(mktemp -d)', '[ -n "$x" ] && d=$(mktemp -d)', 'd=$(mktemp -d); d=$OTHER']:
+            for binary, filename in [('bun', 'readback.ts'), ('python3 -I', 'report.py')]:
+                run = binary + ' "$d/' + filename + '"'
+                with self.subTest(setup=setup, binary=binary):
+                    self.assertEqual(self.classify(setup + '; ' + run), UNRESOLVED)
+                    self.assertEqual(self.classify(setup + '; cp /abs/unchecked.ts "$d/' + filename + '"; ' + run), UNRESOLVED)
+                    if setup != 'd=$(mktemp -d)':
+                        self.assertEqual(self.classify(setup + '; ' + self.heredoc('"$d/' + filename + '"', 'print(1)') + run), UNRESOLVED)
+        for filename, run in [('report.py', 'python3 -I'), ('readback.ts', 'bun')]:
+            command = 'd=$(mktemp -d); ' + self.heredoc('"$d/' + filename + '"', 'import sqlite3; sqlite3.connect(' + repr(LIVE) + ')') + run + ' "$d/' + filename + '"'
+            self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_same_call_review_writer_forms(self):
+        bodies = {
+            'import alias': "from os import rename as f\nf('unchecked.py', 'tmp/x.py')",
+            'dynamic callable': "import operator\nf=operator.methodcaller('write_text', 'print(2)')\nf(target)",
+            'conditional binding': "from pathlib import Path\np=Path('tmp/x.py')\nif False:\n p=Path('tmp/data')\np.write_text('print(2)')",
+            'annotated binding': "from pathlib import Path\np=Path('tmp/data')\np: object=Path('tmp/x.py')\np.write_text('print(2)')",
+            'parameter shadow': "from pathlib import Path\np=Path('tmp/data')\ndef edit(p):\n p.write_text('print(2)')\nedit(Path('tmp/x.py'))",
+            'annotated alias': "writer: object = open\nwriter(__file__, 'w').write('print(2)')",
+            'walrus alias': "(writer := open)(__file__, 'w').write('print(2)')",
+            'unpacked alias': "writer, = [open]\nwriter(__file__, 'w').write('print(2)')",
+            'chained alias': "writer = other = open\nwriter(__file__, 'w').write('print(2)')",
+            'dunder alias': "from io import open as writer\nwriter.__call__(__file__, 'w').write('print(2)')",
+        }
+        for label, body in bodies.items():
+            command = self.heredoc('tmp/x.py', body) + 'python3 -I tmp/x.py\npython3 -I tmp/x.py'
+            with self.subTest(label=label):
+                self.assertEqual(self.classify(command), UNRESOLVED)
+        bodies = [
+            "const trim=process.getBuiltinModule; const split=trim('fs').copyFileSync; split(process.argv[2],process.argv[1]);",
+            "readFileSync = process.dlopen; readFileSync(process.argv[2]);",
+        ]
+        for body in bodies:
+            command = 'd=$(mktemp -d); ' + self.heredoc('"$d/x.js"', body) + 'node "$d/x.js" unchecked.js\nnode "$d/x.js"'
+            self.assertEqual(self.classify(command), UNRESOLVED)
+        seed = self.write('tmp/seed.ndjson', 'print(2)')
+        seed.chmod(0o444)
+        for variable in ['$d', '${d}']:
+            for name in ['seed.ndjson', './seed.ndjson', 'nested/../seed.ndjson', 'sibling.py']:
+                target = '"' + variable + '/' + name + '"'
+                prefix = 'd=$(mktemp -d); cp ' + str(seed) + ' "' + variable + '/"; '
+                command = prefix + self.heredoc(target, 'print(1)') + 'python3 -I ' + target
+                with self.subTest(variable=variable, name=name):
+                    self.assertEqual(self.classify(command), None if name == 'sibling.py' else UNRESOLVED)
+        command = 'd=$(mktemp -d /Users/x/.robob/userdata/scratch.XXXXXX); ' + self.heredoc('"$d/report.py"', 'print(1)') + 'python3 -I "$d/report.py"'
+        self.assertEqual(self.classify(command), UNRESOLVED)
+        for relative, runner in [
+            ('integrations/robob-watch/checks/money-cases/test_order_charges.py', 'python3 -m unittest discover -s integrations/robob-watch/checks/money-cases'),
+            ('integrations/memory-system/tests/test_state_lineage_logging.py', 'python3 -m unittest discover -s integrations/memory-system/tests'),
+            ('integrations/memory-system/tests/benchmark_recall_storage.py', 'offbox run -- python3 integrations/memory-system/tests/benchmark_recall_storage.py'),
+        ]:
+            command = self.heredoc(relative, 'import sqlite3; sqlite3.connect(' + repr(LIVE) + ')') + runner
+            self.assertEqual(self.classify(command), SCRIPT)
+
     def classify(self, command):
         return guard.classify(command, str(self.root))
 
@@ -59,6 +367,408 @@ class GuardTests(unittest.TestCase):
         for command, expected in rows:
             with self.subTest(command=command):
                 self.assertEqual(self.classify(command), expected)
+
+    def test_readonly_replica_scripts_and_live_near_misses(self):
+        rows = [
+            (".robob/userdata/readonly/state.sqlite", None),
+            (".robob/userdata/readonly/state.sqlite-wal", None),
+            (".robob/userdata/readonly/state.sqlite-shm", None),
+            (".robob/userdata/readonly/opencode.sqlite", None),
+            (".robob/userdata/statev2.sqlite", SCRIPT),
+            (".robob/userdata/statev2.sqlite-wal", SCRIPT),
+            (".robob/userdata/statev2.sqlite-shm", SCRIPT),
+            (".robob/userdata/statev2.sqlite-journal", SCRIPT),
+            ("/Volumes/ExternalSSD/robob-data/userdata/statev2.sqlite", SCRIPT),
+            (".robob/userdata/state.sqlite", SCRIPT),
+            (".local/share/opencode/opencode.db", SCRIPT),
+            (".t3/userdata/statev2.sqlite", SCRIPT),
+            (".robob/userdata/readonly-x/state.sqlite", SCRIPT),
+            (".robob/userdata/readonly/../state.sqlite", SCRIPT),
+            (".robob/userdata/readonly/state.sqlite/../state.sqlite", SCRIPT),
+            (".robob/userdata/readonly/state.sqlite-journal", SCRIPT),
+            (".robob/userdata/readonly/state.sqlite.bak", SCRIPT),
+        ]
+        for relative, expected in rows:
+            python = ("from pathlib import Path\nimport sqlite3\n"
+                      f"path = Path.home() / {relative!r}\n"
+                      "sqlite3.connect(f'file:{path}?mode=ro', uri=True)\n")
+            node = ('import * as NodeOS from "node:os";\n'
+                    'import * as NodePath from "node:path";\n'
+                    'import * as NodeSqlite from "node:sqlite";\n'
+                    f'const path = NodePath.join(NodeOS.homedir(), "{relative}");\n'
+                    'new NodeSqlite.DatabaseSync(path, { readOnly: true });\n')
+            shell_path = relative if relative.startswith('/') else '~/' + relative
+            shell = f"sqlite3 -readonly {shell_path} 'select 1'\n"
+            for extension, interpreter, stdin_flags, source in [
+                ('py', 'python3 -I', '-', python),
+                ('ts', 'node', '--input-type=module', node),
+                ('mjs', 'node', '--input-type=module', node),
+                ('sh', 'bash', '', shell),
+            ]:
+                with self.subTest(path=relative, extension=extension):
+                    script = self.write('tmp/replica-probe.' + extension, source)
+                    self.assertEqual(self.classify(f'{interpreter} {shlex.quote(str(script))} --thread-id x'), expected)
+                    inline = f"{interpreter} {stdin_flags} <<'PROBE'\n{source}PROBE\n"
+                    self.assertEqual(self.classify(inline), READ if expected else None)
+            with self.subTest(path=relative, entry='sqlite3'):
+                self.assertEqual(self.classify(shell), READ if expected else None)
+
+    def test_readonly_replica_python_split_path_parts(self):
+        for parts, expected in [
+            (['.robob', 'userdata', 'readonly', 'state.sqlite'], None),
+            (['.robob', 'userdata', 'state.sqlite'], SCRIPT),
+            (['.robob', 'userdata', 'readonly', '..', 'state.sqlite'], SCRIPT),
+            (['.robob', 'userdata', 'readonly-x', 'state.sqlite'], SCRIPT),
+            (['.robob', 'userdata', 'statev2.sqlite'], SCRIPT),
+            (['.local', 'share', 'opencode', 'opencode.db'], SCRIPT),
+            (['.t3', 'userdata', 'statev2.sqlite'], SCRIPT),
+        ]:
+            # Every grouping of adjacent segments: one suffix, all split, and
+            # partial suffixes such as '.robob/userdata' / 'readonly' / name.
+            for boundaries in range(1 << (len(parts) - 1)):
+                grouped = [parts[0]]
+                for index, part in enumerate(parts[1:]):
+                    if boundaries & (1 << index):
+                        grouped.append(part)
+                    else:
+                        grouped[-1] += '/' + part
+                with self.subTest(parts=grouped):
+                    expression = 'Path.home() / ' + ' / '.join(repr(part) for part in grouped)
+                    source = ('from pathlib import Path\nimport sqlite3\n'
+                              f'path = {expression}\n'
+                              "sqlite3.connect(f'file:{path}?mode=ro', uri=True)\n")
+                    script = self.write('tmp/split-replica.py', source)
+                    self.assertEqual(self.classify(f'python3 -I {script}'), expected)
+                    self.assertEqual(self.classify("python3 -I - <<'PY'\n" + source + 'PY\n'),
+                                     READ if expected else None)
+
+        script = self.write('tmp/split-name.py',
+                            'from pathlib import Path\nimport sqlite3\n'
+                            'path = Path.home() / ".robob" / "userdata" / ("statev2" + ".sqlite")\n'
+                            'sqlite3.connect(str(path))\n')
+        self.assertEqual(self.classify(f'python3 -I {script}'), SCRIPT)
+
+    def test_replica_does_not_hide_another_database(self):
+        for other in ['statev2.sqlite', 'opencode.db', 'userdata/state.sqlite']:
+            for extension, interpreter, source in [
+                ('mjs', 'node',
+                 'const replica = ".robob/userdata/readonly/state.sqlite";\n'
+                 f'new Database("{other}");\n'),
+                ('py', 'python3 -I',
+                 'import sqlite3\nreplica = ".robob/userdata/readonly/state.sqlite"\n'
+                 f'sqlite3.connect({other!r})\n'),
+            ]:
+                with self.subTest(other=other, extension=extension):
+                    script = self.write('tmp/mixed-replica.' + extension, source)
+                    self.assertEqual(self.classify(f'{interpreter} {script}'), SCRIPT)
+
+    def test_database_reference_skips_replica_and_keeps_source_offset(self):
+        source = 'const replica = ".robob/userdata/readonly/state.sqlite";\nnew Database("statev2.sqlite");'
+        match = guard._database_reference(source)
+        self.assertEqual(match[0], 'statev2.sqlite')
+        self.assertEqual(match.start(), source.index('statev2.sqlite'))
+
+    def test_replica_paths_cannot_be_transformed_before_opening(self):
+        node_replica = '(process.env.HOME + "/.robob/userdata/readonly/state.sqlite")'
+        node_rows = [
+            ('exact', 'replica', None),
+            ('replace-directory', 'replica.replace("/readonly/", "/")', SCRIPT),
+            ('replace-name', 'replica.replace("/readonly/", "/").replace("state", "statev2")', SCRIPT),
+            ('replace-all', 'replica.replaceAll("/readonly/", "/")', SCRIPT),
+            ('join-traversal', 'path.join(replica, "../..", path.basename(replica))', SCRIPT),
+            ('resolve-traversal', 'path.resolve(replica, "../..", path.basename(replica))', SCRIPT),
+            ('dirname', 'path.join(path.dirname(path.dirname(replica)), path.basename(replica))', SCRIPT),
+            ('helper', 'rewrite(replica)', SCRIPT),
+        ]
+        for name, expression, expected in node_rows:
+            for assigned in (False, True):
+                target = expression
+                source = ('import { DatabaseSync } from "node:sqlite";\n'
+                          'import path from "node:path";\n')
+                if assigned:
+                    source += f'const replica = {node_replica};\n'
+                else:
+                    target = expression.replace('replica', node_replica)
+                source += f'new DatabaseSync({target}, {{readOnly: true}});\n'
+                with self.subTest(language='node', operation=name, assigned=assigned):
+                    script = self.write('tmp/derived-replica.mjs', source)
+                    self.assertEqual(self.classify(f'node {script}'), expected)
+                    self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'),
+                                     READ if expected else None)
+
+        python_rows = [
+            ('exact', 'str(replica)', None),
+            ('replace-directory', 'str(replica).replace("/readonly/", "/")', SCRIPT),
+            ('replace-name', 'str(replica).replace("/readonly/", "/").replace("state", "statev2")', SCRIPT),
+            ('join-traversal', 'os.path.join(str(replica), "../..", replica.name)', SCRIPT),
+            ('parent', 'replica.parent.parent / replica.name', SCRIPT),
+            ('with-name', 'replica.parent.parent / "statev2.sqlite"', SCRIPT),
+            ('helper', 'rewrite(replica)', SCRIPT),
+        ]
+        for name, expression, expected in python_rows:
+            for suffix in ['".robob/userdata/readonly/state.sqlite"',
+                           '".robob/userdata" / "readonly" / "state.sqlite"']:
+                source = ('from pathlib import Path\nimport sqlite3\nimport os\n'
+                          f'replica = Path.home() / {suffix}\n'
+                          f'p = {expression}\n'
+                          'sqlite3.connect("file:" + str(p) + "?mode=ro", uri=True)\n')
+                with self.subTest(language='python', operation=name, suffix=suffix):
+                    script = self.write('tmp/derived-replica.py', source)
+                    self.assertEqual(self.classify(f'python3 -I {script}'), expected)
+                    self.assertEqual(self.classify("python3 -I - <<'PY'\n" + source + 'PY\n'),
+                                     READ if expected else None)
+
+    def test_original_replica_probe_is_allowed(self):
+        source = Path(__file__).resolve().parents[3] / 'scripts/probe-readonly-identity.ts'
+        original = source.read_text()
+        for expression, expected in [
+            ('values.replica', None),
+            ('values.replica.replace("/readonly/", "/")', SCRIPT),
+            ('values.replica.replace("/readonly/", "/").replace("state", "statev2")', SCRIPT),
+            ('NodePath.join(values.replica, "../..", NodePath.basename(values.replica))', SCRIPT),
+            ('rewrite(values.replica)', SCRIPT),
+        ]:
+            with self.subTest(expression=expression):
+                content = original.replace('DatabaseSync(values.replica,', f'DatabaseSync({expression},')
+                script = self.write('tmp/original-probe.ts', content)
+                self.assertEqual(self.classify(f'node {script} --thread-id x'), expected)
+        script = self.write('tmp/eval-probe.ts', original.replace(
+            'const db = new', 'eval(\'values.replica = values.replica.replace("/readonly/", "/")\');\nconst db = new'))
+        self.assertEqual(self.classify(f'node {script} --thread-id x'), SCRIPT)
+
+    def test_replica_default_requires_builtin_parser(self):
+        rewrite = 'function parseArgs(input) { return {values: {replica: input.options.replica.default.replace("/readonly/", "/")}}; }\n'
+        self.write('tmp/custom-parser-lib.mjs', 'export ' + rewrite + 'export default {parseArgs};\n')
+        options = '{options: {replica: {type: "string", default: process.env.HOME + "/.robob/userdata/readonly/state.sqlite"}}}'
+        rows = [
+            ('builtin', 'import * as NodeUtil from "node:util";\n', 'NodeUtil.parseArgs', None),
+            ('builtin-alias', 'import * as utility from "node:util";\n', 'utility.parseArgs', None),
+            ('local-function', rewrite, 'parseArgs', SCRIPT),
+            ('local-object', rewrite + 'const NodeUtil = {parseArgs};\n', 'NodeUtil.parseArgs', SCRIPT),
+            ('custom-namespace', 'import * as NodeUtil from "./custom-parser-lib.mjs";\n', 'NodeUtil.parseArgs', SCRIPT),
+            ('custom-default', 'import NodeUtil from "./custom-parser-lib.mjs";\n', 'NodeUtil.parseArgs', SCRIPT),
+            ('custom-named', 'import {parseArgs} from "./custom-parser-lib.mjs";\n', 'parseArgs', SCRIPT),
+            ('comment-import', '// import * as NodeUtil from "node:util";\n' + rewrite + 'const NodeUtil = {parseArgs};\n', 'NodeUtil.parseArgs', SCRIPT),
+            ('string-import', 'const prose = \'import * as NodeUtil from "node:util";\';\n' + rewrite + 'const NodeUtil = {parseArgs};\n', 'NodeUtil.parseArgs', SCRIPT),
+            ('mutated-builtin', 'import * as NodeUtil from "node:util";\n' + rewrite + 'NodeUtil.parseArgs = parseArgs;\n', 'NodeUtil.parseArgs', SCRIPT),
+        ]
+        for name, setup, parser, expected in rows:
+            source = ('import {DatabaseSync} from "node:sqlite";\n' + setup +
+                      f'const {{ values }} = {parser}({options});\n'
+                      'new DatabaseSync(values.replica, {readOnly:true});\n')
+            with self.subTest(parser=name):
+                script = self.write('tmp/parser-probe.mjs', source)
+                self.assertEqual(self.classify(f'node {script}'), expected)
+                self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ if expected else None)
+
+    def test_replica_default_cannot_hide_parser_argument_overrides(self):
+        replica = '{type:"string", default:process.env.HOME + "/.robob/userdata/readonly/state.sqlite"}'
+        options = '{replica:' + replica + '}'
+        live = 'process.env.HOME + "/.robob/userdata/" + ["statev2", "sqlite"].join(".")'
+        prefix = ('import {DatabaseSync} from "node:sqlite";\nimport * as NodeUtil from "node:util";\n'
+                  f'const liveArgs = ["--replica", {live}];\nconst args = liveArgs;\nconst overrides = {{args:liveArgs}};\n')
+        rows = [
+            ('args-after', '', '{options:' + options + ', args:liveArgs}'),
+            ('args-before', '', '{args:liveArgs, options:' + options + '}'),
+            ('quoted', '', '{options:' + options + ', "args":liveArgs}'),
+            ('computed', '', '{options:' + options + ', ["args"]:liveArgs}'),
+            ('escaped', '', '{options:' + options + r', "\u0061rgs":liveArgs}'),
+            ('shorthand', '', '{options:' + options + ', args}'),
+            ('getter', '', '{options:' + options + ', get args() {return liveArgs;}}'),
+            ('prototype', '', '{options:' + options + ', __proto__:{args:liveArgs}}'),
+            ('spread', '', '{options:' + options + ', ...overrides}'),
+            ('extra-argument', '', '{options:' + options + '}, overrides'),
+            ('argv-write', 'process.argv = ["node", "probe", ...liveArgs];\n', '{options:' + options + '}'),
+            ('argv-splice', 'process.argv.splice(2, Infinity, ...liveArgs);\n', '{options:' + options + '}'),
+            ('argv-computed', 'process["argv"] = ["node", "probe", ...liveArgs];\n', '{options:' + options + '}'),
+            ('argv-alias', 'const proc = process; proc.argv = ["node", "probe", ...liveArgs];\n', '{options:' + options + '}'),
+        ]
+        for key in ['replica', '"replica"', '["replica"]', r'"\u0072eplica"']:
+            rows.append(('duplicate-option-' + key, '', '{options:{replica:' + replica + ', ' + key + ':{type:"string", default:' + live + '}}}'))
+        for name, setup, config in rows:
+            source = prefix + setup + f'const {{ values }} = NodeUtil.parseArgs({config});\nnew DatabaseSync(values.replica, {{readOnly:true}});\n'
+            with self.subTest(override=name):
+                script = self.write('tmp/args-probe.mjs', source)
+                self.assertEqual(self.classify(f'node {script}'), SCRIPT)
+                self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+        for module in ['node:process', 'process', r'node:\u0070rocess']:
+            for setup in [
+                f'import {{argv}} from "{module}";\nargv.splice(2, Infinity, ...liveArgs);\n',
+                f'import {{argv as input}} from "{module}";\ninput.splice(2, Infinity, ...liveArgs);\n',
+                f'import runtime from "{module}";\nruntime.argv.splice(2, Infinity, ...liveArgs);\n',
+                f'import * as runtime from "{module}";\nruntime.argv.splice(2, Infinity, ...liveArgs);\n',
+            ]:
+                source = prefix + setup + f'const {{ values }} = NodeUtil.parseArgs({{options:{options}}});\nnew DatabaseSync(values.replica);\n'
+                with self.subTest(module=module, setup=setup):
+                    script = self.write('tmp/imported-argv.mjs', source)
+                    self.assertEqual(self.classify(f'node {script}'), SCRIPT)
+                    self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+        for access in ['globalThis.process', 'globalThis["process"]', 'global.process', 'global["process"]',
+                       '(await import("node:process")).default', 'require("node:process")']:
+            source = prefix + access + '.argv.splice(2, Infinity, ...liveArgs);\n' + f'const {{ values }} = NodeUtil.parseArgs({{options:{options}}});\nnew DatabaseSync(values.replica);\n'
+            with self.subTest(access=access):
+                script = self.write('tmp/global-argv.mjs', source)
+                self.assertEqual(self.classify(f'node {script}'), SCRIPT)
+                self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+        original = (Path(__file__).resolve().parents[3] / 'scripts/probe-readonly-identity.ts').read_text()
+        source = original.replace('  },\n});\nif', '  },\n  args: ["--thread-id", "x", "--replica", ' + live + '],\n});\nif', 1)
+        self.assertNotEqual(source, original)
+        script = self.write('tmp/original-probe-args.ts', source)
+        self.assertEqual(self.classify(f'node {script} --thread-id x'), SCRIPT)
+        self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+
+    def test_replica_default_rejects_untracked_argument_capabilities(self):
+        self.write('tmp/unproven-runtime.mjs', 'export {default as runtime} from "node:process";\n')
+        prefix = ('import {DatabaseSync} from "node:sqlite";\nimport * as NodeUtil from "node:util";\n'
+                  'const liveArgs = ["--replica",process.env.HOME+"/.robob/userdata/"+["statev2","sqlite"].join(".")];\n')
+        rows = [
+            ('computed-constructor', '', '({})["constructor"]["constructor"]("return process")()'),
+            ('optional-computed', '', '({})?.["constructor"]?.["constructor"]("return process")()'),
+            ('optional-first', '', '({})?.["constructor"]["constructor"]("return process")()'),
+            ('optional-last', '', '({})["constructor"]?.["constructor"]("return process")()'),
+            ('optional-spaced', '', '({}) ?. ["constructor"] ?. ["constructor"]("return process")()'),
+            ('optional-aliased', 'const key = ["constr","uctor"].join("");\n', '({})?.[key]?.[key]("return process")()'),
+            ('quoted-destructure', 'const {"constructor": make} = Number;\n', 'make("return process")()'),
+            ('escaped-destructure', 'const {"constr\\u0075ctor": make} = Number;\n', 'make("return process")()'),
+            ('computed-destructure', 'const {["constructor"]: make} = Number;\n', 'make("return process")()'),
+            ('aliased-destructure', 'const key = ["constr","uctor"].join("");\nconst {[key]: make} = Number;\n', 'make("return process")()'),
+            ('computed-alias', 'const key = ["constr","uctor"].join("");\n', '({})[key][key]("return process")()'),
+            ('object-descriptor', 'import * as OtherUtil from "node:util";\n', 'Object.getOwnPropertyDescriptor(Object.getPrototypeOf(OtherUtil.parseArgs),"constructor").value("return process")()'),
+            ('vm', 'import * as VM from "node:vm";\n', 'VM.runInThisContext("process")'),
+            ('custom-import', 'import {runtime as importedRuntime} from "./unproven-runtime.mjs";\n', 'importedRuntime'),
+        ]
+        for name, setup, runtime in rows:
+            source = (prefix + setup + f'const runtime = {runtime};\nruntime.argv.splice(2,Infinity,...liveArgs);\n'
+                      'const { values } = NodeUtil.parseArgs({options:{replica:{type:"string",default:process.env.HOME+"/.robob/userdata/readonly/state.sqlite"}}});\n'
+                      'new DatabaseSync(values.replica);\n')
+            with self.subTest(capability=name):
+                script = self.write('tmp/argument-capability.mjs', source)
+                self.assertEqual(self.classify(f'node {script}'), SCRIPT)
+                self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+
+    def test_replica_path_builders_must_be_builtin_imports(self):
+        for operation in ['join', 'resolve']:
+            for declaration, callee in [
+                (f'const {operation} = (h, s) => (h + s).replace("/readonly/", "/");', operation),
+                (f'const fake = {{ {operation}: (h, s) => (h + s).replace("/readonly/", "/") }};', 'fake.' + operation),
+                (f'// import * as fake from "node:path";\nconst fake = {{ {operation}: (h, s) => (h + s).replace("/readonly/", "/") }};', 'fake.' + operation),
+                (f'const prose = \'import * as fake from "node:path";\';\nconst fake = {{ {operation}: (h, s) => (h + s).replace("/readonly/", "/") }};', 'fake.' + operation),
+            ]:
+                source = ('import { DatabaseSync } from "node:sqlite";\n' + declaration + '\n'
+                          f'new DatabaseSync({callee}(process.env.HOME, "/.robob/userdata/readonly/state.sqlite"), {{readOnly:true}});\n')
+                with self.subTest(operation=operation, declaration=declaration):
+                    script = self.write('tmp/custom-builder.mjs', source)
+                    self.assertEqual(self.classify(f'node {script}'), SCRIPT)
+                    self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+
+    def test_replica_option_property_spellings_cannot_hide_transforms(self):
+        source = (Path(__file__).resolve().parents[3] / 'scripts/probe-readonly-identity.ts').read_text()
+        for property_name in ['replica', r'\u0072eplica', r'\x72eplica', r'\u{72}eplica', r'rep\u006cica']:
+            for quote in ["'", '"']:
+                for rename in ['', '.replace("state", "statev2")']:
+                    access = f'values[{quote}{property_name}{quote}].replace("/readonly/", "/")' + rename
+                    content = source.replace('DatabaseSync(values.replica,', f'DatabaseSync({access},')
+                    with self.subTest(access=access):
+                        script = self.write('tmp/escaped-option.ts', content)
+                        self.assertEqual(self.classify(f'node {script} --thread-id x'), SCRIPT)
+                        self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + content + 'JS\n'), READ)
+
+    def test_replica_readers_must_be_builtin_imports(self):
+        for declaration, reader in [
+            ('class DatabaseSync { constructor(p) { return new Sqlite.DatabaseSync(p.replace("/readonly/", "/")); } }', 'DatabaseSync'),
+            ('const fake = { DatabaseSync: class { constructor(p) { return new Sqlite.DatabaseSync(p.replace("/readonly/", "/")); } } };', 'fake.DatabaseSync'),
+            ('// import { DatabaseSync } from "node:sqlite";\nclass DatabaseSync { constructor(p) { return new Sqlite.DatabaseSync(p.replace("/readonly/", "/")); } }', 'DatabaseSync'),
+        ]:
+            source = ('import * as Sqlite from "node:sqlite";\n' + declaration + '\n'
+                      f'new {reader}(process.env.HOME + "/.robob/userdata/readonly/state.sqlite", {{readOnly:true}});\n')
+            with self.subTest(reader=reader, declaration=declaration):
+                script = self.write('tmp/custom-reader.mjs', source)
+                self.assertEqual(self.classify(f'node {script}'), SCRIPT)
+                self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+        source = ('from pathlib import Path\nimport sqlite3\nfrom custom import connect_legacy\n'
+                  'class sqlite3:\n    connect = connect_legacy\n'
+                  'path = Path.home() / ".robob/userdata/readonly/state.sqlite"\n'
+                  'sqlite3.connect(f"file:{path}?mode=ro", uri=True)\n')
+        script = self.write('tmp/custom-reader.py', source)
+        self.assertEqual(self.classify(f'python3 -I {script}'), SCRIPT)
+        self.assertEqual(self.classify("python3 -I - <<'PY'\n" + source + 'PY\n'), READ)
+
+    def test_escaped_identifiers_cannot_hide_replica_transforms(self):
+        for parameter in [r'Node\u0050ath', r'Node\u{50}ath', r'\u004eodePath', r'NodePat\u0068']:
+            source = ('import * as NodePath from "node:path";\n'
+                      'import { DatabaseSync } from "node:sqlite";\n'
+                      f'function probe({parameter}) {{\n'
+                      '  new DatabaseSync(NodePath.join(process.env.HOME, "/.robob/userdata/readonly/state.sqlite"));\n'
+                      '}\nprobe({join: (h, s) => (h + s).replace("/readonly/", "/")});\n')
+            with self.subTest(parameter=parameter):
+                script = self.write('tmp/escaped-shadow.mjs', source)
+                self.assertEqual(self.classify(f'node {script}'), SCRIPT)
+                self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+
+    def test_python_replica_import_bindings_must_be_unambiguous(self):
+        prefix = ('from pathlib import Path\nimport sqlite3\n'
+                  'from custom import connect_legacy, reader\n'
+                  'class E(Exception):\n    connect = staticmethod(connect_legacy)\n'
+                  'path = Path.home() / ".robob/userdata/readonly/state.sqlite"\n')
+        call = 'sqlite3.connect(str(path))\n'
+        for name, source in [
+            ('except', prefix + 'try:\n    raise E()\nexcept Exception as sqlite3:\n    ' + call),
+            ('except-star', prefix + 'try:\n    raise E()\nexcept* Exception as sqlite3:\n    ' + call),
+            ('conditional-import', 'from pathlib import Path\nfrom custom import sqlite3\nif False:\n    import sqlite3\n'
+             'sqlite3.connect(str(Path.home() / ".robob/userdata/readonly/state.sqlite"))\n'),
+            ('star-import', prefix + 'from custom import *\n' + call),
+            ('match-as', prefix + 'match reader:\n    case sqlite3:\n        ' + call),
+            ('match-star', prefix + 'match [reader]:\n    case [*sqlite3]:\n        ' + call),
+            ('match-rest', prefix + 'match {"connect": connect_legacy}:\n    case {**sqlite3}:\n        ' + call),
+            ('with', prefix + 'with reader as sqlite3:\n    ' + call),
+            ('for', prefix + 'for sqlite3 in [reader]:\n    ' + call),
+            ('assignment', prefix + 'sqlite3 = reader\n' + call),
+            ('globals', prefix + 'globals()["sqlite3"] = reader\n' + call),
+            ('locals', prefix + 'locals()["sqlite3"] = reader\n' + call),
+            ('vars', prefix + 'vars()["sqlite3"] = reader\n' + call),
+            ('module-attribute', prefix + 'import sys\nsys.modules[__name__].sqlite3 = reader\n' + call),
+            ('module-dict', prefix + 'import sys\nsys.modules[__name__].__dict__["sqlite3"] = reader\n' + call),
+            ('module-import', prefix + 'from sys import modules as registry\nregistry[__name__].sqlite3 = reader\n' + call),
+            ('function-globals', prefix + 'def binding(): pass\nbinding.__globals__["sqlite3"] = reader\n' + call),
+            ('path-shadow', prefix + 'class Path:\n    home = staticmethod(reader.home)\n'
+             'sqlite3.connect(str(Path.home() / ".robob/userdata/readonly/state.sqlite"))\n'),
+            ('builder-mutation', prefix + 'import os\nos.path.join = reader\n'
+             'sqlite3.connect(os.path.join(str(Path.home()), ".robob/userdata/readonly/state.sqlite"))\n'),
+        ]:
+            with self.subTest(binding=name):
+                script = self.write('tmp/rebound-reader.py', source)
+                self.assertEqual(self.classify(f'python3 -I {script}'), SCRIPT)
+                self.assertEqual(self.classify("python3 -I - <<'PY'\n" + source + 'PY\n'), READ)
+
+    def test_python_replica_namespace_alias_mutations_are_refused(self):
+        for alias in ['p = os.path', 'q = os.path\np = q', 'p = [os.path][0]',
+                      'p = {"path": os.path}["path"]', 'p = (lambda: os.path)()']:
+            for rename in ['', '.replace("state", "statev2")']:
+                source = ('import os, sqlite3\n' + alias + '\n'
+                          'p.join = lambda h, s: h + "/" + s.replace("/readonly/", "/")' + rename + '\n'
+                          'sqlite3.connect(os.path.join(os.path.expanduser("~"), ".robob/userdata/readonly/state.sqlite"))\n')
+                with self.subTest(alias=alias, rename=rename):
+                    script = self.write('tmp/namespace-alias.py', source)
+                    self.assertEqual(self.classify(f'python3 -I {script}'), SCRIPT)
+                    self.assertEqual(self.classify("python3 -I - <<'PY'\n" + source + 'PY\n'), READ)
+
+    def test_escaped_probe_option_references_cannot_hide_transforms(self):
+        original = (Path(__file__).resolve().parents[3] / 'scripts/probe-readonly-identity.ts').read_text()
+        for identifier in [r'v\u0061lues', r'v\u{61}lues', r'\u0076alues', r'value\u0073']:
+            for rename in ['', '.replace("state", "statev2")']:
+                expression = identifier + '.replica.replace("/readonly/", "/")' + rename
+                source = original.replace('DatabaseSync(values.replica,', f'DatabaseSync({expression},')
+                with self.subTest(identifier=identifier, rename=rename):
+                    script = self.write('tmp/escaped-values.ts', source)
+                    self.assertEqual(self.classify(f'node {script} --thread-id x'), SCRIPT)
+                    self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
+        for line_end in ['\r', '\r\n', '\u2028', '\u2029']:
+            source = original.replace('const db = new', '// comment' + line_end +
+                                      'values.replica = values.replica.replace("/readonly/", "/");\nconst db = new')
+            with self.subTest(line_end=repr(line_end)):
+                script = self.write('tmp/comment-option.ts', source)
+                self.assertEqual(self.classify(f'node {script} --thread-id x'), SCRIPT)
+                self.assertEqual(self.classify("node --input-type=module <<'JS'\n" + source + 'JS\n'), READ)
 
     def test_heredoc_delimiters_follow_shell_quote_removal(self):
         rows = [
@@ -703,6 +1413,540 @@ class GuardTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.classify('bash tmp/fixture.sh'), expected)
 
+    def test_mktemp_fixture_plain_subpaths(self):
+        backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        original = backup.read_text()
+        path = 'tmp/fixture.sh'
+        commands = ('bash ' + path, '/bin/bash ' + str(self.root / path),
+                    'offbox run --bg -- bash ' + path)
+        for directory in ('fixture-live/userdata', 'fixture', 'fixture_2/a.b-c_0/7'):
+            for database in ('statev2', 'statev2.sqlite', 'statev2.sqlite-wal',
+                             'statev2.sqlite-shm', 'statev2.sqlite-journal', 'statev2-wal'):
+                source = original.replace('/.robob/userdata/statev2.sqlite', '/' + directory + '/' + database)
+                self.write(path, source)
+                for command in commands:
+                    with self.subTest(directory=directory, database=database, command=command):
+                        self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+
+    def test_mktemp_fixture_plain_subpath_near_misses(self):
+        backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        original = backup.read_text().replace('/.robob/userdata/statev2.sqlite', '/fixture-live/userdata/statev2.sqlite')
+        path = 'tmp/fixture.sh'
+        variants = [(assignment, original.replace('T=$(mktemp -d "$TOP/case.XXXXXX")', assignment))
+                    for assignment in ('T=tmp', 'T=$HOME', 'T="$ROBOB_HOME"')]
+        for suffix in ('../../.robob/userdata/statev2.sqlite', './fixture/statev2.sqlite',
+                       'fixture/../userdata/statev2.sqlite', '$X/statev2.sqlite',
+                       'fixture*/statev2.sqlite', 'fixture?/statev2.sqlite',
+                       'fixture[ab]/statev2.sqlite', r'fixt\ure/statev2.sqlite',
+                       'fixt"ure"/statev2.sqlite', "fixt'ure'/statev2.sqlite",
+                       'fixture/statev2.sqlite/../../real', 'fixture/statev2.sqlite$X',
+                       'fixture/statev2.sqlite*', 'fixture/statev2.sqlite.backup'):
+            variants.append((suffix, original.replace('fixture-live/userdata/statev2.sqlite', suffix)))
+        for statement in ('cat ~/.robob/userdata/statev2.sqlite',
+                          'cat "$HOME/.ro""bob/userdata/state""v2.sqlite"',
+                          'grep needle "$HOME/robob-""data/userdata/state""v2.sqlite"',
+                          'cat "$HOME/.local/share/open""code/open""code.db"',
+                          'sqlite3 "$HOME/.robob/userdata/statev2.sqlite"',
+                          'cat "$T/fixture-live/userdata/statev2.sqlite"'):
+            variants.append(('after-reset-lifetime:' + statement, original + '\n' + statement + '\n'))
+        live = '"$HOME/.ro""bob/userdata/state""v2.sqlite"'
+        for statement in ('cat "$(cat ' + live + ')"',
+                          'cat `cat ' + live + '`',
+                          'cat "${UNSET:-$(cat ' + live + ')}"',
+                          'cat "${UNSET:-$HOME/.ro""bob/userdata/state""v2.sqlite}"',
+                          'cat harmless#suffix ' + live,
+                          'cat harmless\\#suffix ' + live,
+                          'cat harmless\\ #suffix "$(cat ' + live + ')"'):
+            variants.append(('split-live-expression:' + statement, original + '\n' + statement + '\n'))
+        for statement in ('X=\ncat "$HOME/.ro${X}bob/userdata/state""v2.sqlite"',
+                          'X=\ngrep needle "$HOME/.ro${X}bob/userdata/state""v2.sqlite"',
+                          'X="$HOME/.ro""bob"\ncat "${X}/userdata/state""v2.sqlite"',
+                          'cat "$(printf \'%b\' \'\\057Users\\057x\\057.ro\\142ob\\057userdata\\057statev2.sqli\\164e\')"',
+                          '"$PYTHON" -c \'import sys; open(sys.argv[1]).read()\' ' + live,
+                          'X=\n"$PYTHON" - "$HOME/.ro${X}bob/userdata/state""v2.sqlite" <<\'PY\'\nimport sys\nopen(sys.argv[1]).read()\nPY'):
+            variants.append(('unproved-reader:' + statement, original + '\n' + statement + '\n'))
+        for statement in ('cat "$HOME/.ro""bob/userdata/state\\\nv2.sqlite"',
+                          'cat "$HOME/.ro""bob/userdata/"$\'statev2.sqli\\x74e\'',
+                          'cat "$HOME/.ro""bob/userdata/"$"statev2.sqlite"'):
+            variants.append(('bash-quoting:' + statement, original + '\n' + statement + '\n'))
+        for program in ('open("/Users/x/.ro" + "bob/userdata/state" + "v2.sqlite").read()',
+                        'open(b"/Users/x/.ro" + b"bob/userdata/state" + b"v2.sqlite").read()',
+                        'open(f"/Users/x/.{\"ro\"}{\"bob\"}/user{\"data\"}/state{\"v2\"}.sqli{\"te\"}").read()',
+                        'open("".join(["/Users/x/.", "ro", "bob/user", "data/state", "v2.sqli", "te"])).read()'):
+            for statement in ('"$PYTHON" -c ' + shlex.quote(program),
+                              '"$PYTHON" - <<\'PY\'\n' + program + '\nPY'):
+                variants.append(('python-built-target:' + statement, original + '\n' + statement + '\n'))
+        for update in ('p += segment', 'p = p + segment'):
+            program = ('p = ""\nfor segment in ["/Users/synthetic/.", "ro", "bob/user", "data/state", "v2.sqli", "te"]:\n'
+                       '    ' + update + '\nopen(p).read()')
+            for statement in ('"$PYTHON" -c ' + shlex.quote(program),
+                              '"$PYTHON" - <<\'PY\'\n' + program + '\nPY'):
+                variants.append(('python-accumulated-target:' + update, original + '\n' + statement + '\n'))
+            if update == 'p = p + segment':
+                statement = ('"$PYTHON" - "$HERE/src" <<\'PY\'\nimport sys\nsys.path.insert(0, sys.argv[1])\n'
+                             'import transcript_backup_manifest as tbm\n' + program + '\nPY')
+                variants.append(('manifest-string-accumulation', original + '\n' + statement + '\n'))
+                spoofed = ('for directory, p, segment in os.walk(sys.argv[2]):\n    pass\n' + program)
+                statement = ('"$PYTHON" - "$HERE/src" "$T" <<\'PY\'\nimport os, sys\nsys.path.insert(0, sys.argv[1])\n'
+                             'import transcript_backup_manifest as tbm\n' + spoofed + '\nPY')
+                variants.append(('manifest-list-binding-reassigned', original + '\n' + statement + '\n'))
+        for program in ('p = "etilqs.2vetats/atadresu/bobor./citehtnys/sresU/"[::-1]\nopen(p).read()',
+                        'p = sys.argv[2][::-1]\nopen(p).read()',
+                        'p = os.path.join(sys.argv[2], "etilqs.2vetats/atadresu/bobor./citehtnys/sresU/"[::-1])\nopen(p).read()',
+                        'p = json.loads(' + repr('"' + ''.join('\\u%04x' % ord(char) for char in '/Users/synthetic/.robob/userdata/statev2.sqlite') + '"') + ')\nopen(p).read()'):
+            statement = ('"$PYTHON" - "$HERE/src" "$T" <<\'PY\'\nimport os, sys, json\nsys.path.insert(0, sys.argv[1])\n'
+                         'import transcript_backup_manifest as tbm\n' + program + '\nPY')
+            variants.append(('manifest-unproved-read-target', original + '\n' + statement + '\n'))
+        for value in ('$HOME', '$T/restore$HOME/stage', '$T/restore$T/../../stage'):
+            variants.append(('snapshot-root:' + value, original.replace('SNAPROOT="$T/restore$T/stage"', 'SNAPROOT="' + value + '"')))
+        # A heredoc body run as a child script has no mktemp root: an empty $T
+        # turns a plain subpath into an absolute one.
+        for target in ('$T/Volumes/ExternalSSD/robob-data/userdata/statev2.sqlite',
+                       '${T}/Volumes/ExternalSSD/robob-data/userdata/statev2.sqlite',
+                       '$T/Users/synthetic/robob-data/userdata/statev2.sqlite-wal'):
+            body = '/bin/cat "' + target + '" > "$HOME/leak"\n'
+            variants.append(('heredoc-quoted-body:' + target, original.replace(
+                'echo "$$" > "$HOME/sync-pid"\n', 'echo "$$" > "$HOME/sync-pid"\n' + body, 1)))
+            variants.append(('heredoc-unquoted-body:' + target, original.replace(
+                '"$REAL_RSYNC" "\\$@" || exit \\$?\n', '"$REAL_RSYNC" "\\$@" || exit \\$?\n' + body.replace('$T', '\\$T'), 1)))
+            variants.append(('heredoc-tab-body:' + target, original + "\ncat > \"$R/bin/extra\" <<-'SH'\n\t#!/bin/bash\n\t" + body + "\tSH\n"))
+        # Discounting one root's main-shell words must not shift where the
+        # heredoc bodies are when another root's words are checked.
+        opener = 'cat > "$R/bin/sqlite3_rsync" <<\'SH\'\n#!/bin/bash\necho "$$" > "$HOME/sync-pid"\n'
+        for padding in ('echo "$TOP/fixture/statev2.sqlite" "$T/fixture/statev2.sqlite"\n',
+                        'echo "$T/fixture/statev2.sqlite" "$TOP/fixture/statev2.sqlite"\n',
+                        'echo "$TOP/fixture/statev2.sqlite"\n', 'echo "$T/fixture/statev2.sqlite"\n'):
+            for count in (1, 10, 100):
+                for reader in ('T', 'TOP'):
+                    body = '/bin/cat "$' + reader + '/Volumes/ExternalSSD/robob-data/userdata/statev2.sqlite" > "$HOME/leak"\n'
+                    variants.append(('heredoc-after-discounts:%s:%d:%s' % (padding.strip(), count, reader),
+                                     original.replace(opener, padding * count + opener + body, 1)))
+        variants.append(('before-setup', original.replace('# 1. sync', 'cat "$T/fixture-live/userdata/statev2.sqlite"\n# 1. sync')))
+        variants.append(('quote-concatenated-tail', original.replace(
+            '"$T/fixture-live/userdata/statev2.sqlite"', '"$T/fixture-live/userdata/statev2.sqlite"/../../real')))
+        variants.append(('string-built-home', original + "\n/opt/homebrew/bin/python3 - <<'PY'\nimport os\nroot = os.path.join(os.environ['HOME'], '.ro' + 'bob', 'userdata', 'statev2.sqlite')\nopen(root).read()\nPY\n"))
+        for label, source in variants:
+            self.assertNotEqual(source, original, label)
+            self.write(path, source)
+            for command in ('bash ' + path, '/bin/bash ' + str(self.root / path),
+                            'offbox run --bg -- bash ' + path):
+                with self.subTest(case=label, command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+        self.write(path, original)
+        for command in ('sed -i "s/mktemp/echo/g" ' + path + '; bash ' + path,
+                        'BASH_ENV=/tmp/preload.sh bash ' + path,
+                        'BASH_ENV=/tmp/preload.sh offbox run --bg -- bash ' + path):
+            with self.subTest(command=command):
+                self.assertEqual(self.classify(command), SCRIPT)
+        # offbox can fall back to a local run, so its payload inherits the
+        # caller's startup bindings however they were set.
+        for wrapper in ('offbox run -- ', 'offbox run --bg -- ', 'offbox run --remote --no-fallback -- '):
+            for prefix in ('BASH_ENV=/tmp/preload.sh ', 'ENV=/tmp/preload.sh ', 'env BASH_ENV=/tmp/preload.sh ',
+                           'export BASH_ENV=/tmp/preload.sh; ', 'BASH_ENV=/tmp/preload.sh; export BASH_ENV; ',
+                           'PATH=/tmp/shadow:$PATH ', 'SHELLOPTS=xtrace '):
+                command = prefix + wrapper + 'bash ' + path
+                with self.subTest(command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+            with self.subTest(command=wrapper + 'bash ' + path):
+                self.assertIsNone(self.classify(wrapper + 'bash ' + path))
+        with patch.dict(os.environ, {'BASH_FUNC_mktemp%%': '() { echo "$HOME"; }'}):
+            self.assertEqual(self.classify('bash ' + path), SCRIPT)
+            self.assertEqual(self.classify('offbox run --bg -- bash ' + path), SCRIPT)
+        # The snapshot root repeats $T, so an inherited temp prefix with parent
+        # segments (or one the script reassigns) must void the fixture proof.
+        commands = ('bash ' + path, '/bin/bash ' + str(self.root / path), 'offbox run --bg -- bash ' + path)
+        for prefix in ('relative/tmp', '/tmp/../..', '/tmp/x/../../Users'):
+            with patch.dict(os.environ, {'TMPDIR': prefix}):
+                for command in commands:
+                    with self.subTest(tmpdir=prefix, command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+        self.write(path, 'TMPDIR=/tmp/../..\n' + original)
+        for command in commands:
+            with self.subTest(case='script-assigns-tmpdir', command=command):
+                self.assertEqual(self.classify(command), SCRIPT)
+
+    def repo_node_pin(self, init=None, select=None, wrapper=None):
+        """A temp HOME carrying a repo-node-pin chain shaped like the fork's."""
+        source = Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin'
+        home = self.root / 'home'
+        helper = home / '.local/libexec/repo-node-pin'
+        (helper / 'pnpm-bin').mkdir(parents=True, exist_ok=True)
+        (helper / 'pnpm-bin/pnpm').write_text('#!/bin/sh\n')
+        (helper / 'bash-env.sh').write_text((source / 'bash-env.sh').read_text() if wrapper is None else wrapper)
+        (helper / 'init.sh').write_text((source / 'init.sh').read_text() if init is None else init)
+        (helper / 'select.py').write_text((source / 'select.py').read_text() if select is None else select)
+        (home / '.nvm/versions/node/v26.0.0/bin').mkdir(parents=True, exist_ok=True)
+        (home / '.nvm/versions/node/v26.0.0/bin/node').write_text('')
+        environment = {'HOME': str(home), 'BASH_ENV': str(helper / 'bash-env.sh'),
+                       'ROBOB_REPO_PREVIOUS_BASH_ENV': '', 'ROBOB_REPO_NODE_HELPER': '',
+                       'ROBOB_REPO_NODE_PYTHON': '', 'NVM_DIR': str(home / '.nvm'), '_repo_node_added_node': '', 'ZDOTDIR': ''}
+        return home, helper, environment
+
+    def write_plain_subpath_fixture(self):
+        backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        self.write('tmp/fixture.sh', backup.read_text().replace('/.robob/userdata/statev2.sqlite', '/fixture-live/userdata/statev2.sqlite'))
+        return ('bash tmp/fixture.sh', '/bin/bash ' + str(self.root / 'tmp/fixture.sh'),
+                'offbox run --bg -- bash tmp/fixture.sh')
+
+    def test_inherited_repo_node_pin_bash_env_keeps_fixture_proof(self):
+        commands = self.write_plain_subpath_fixture()
+        home, helper, environment = self.repo_node_pin()
+        with patch.dict(os.environ, environment):
+            for command in commands:
+                with self.subTest(command=command):
+                    self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+            # The previous BASH_ENV may equal this one (init.sh's own guard).
+            with patch.dict(os.environ, {'ROBOB_REPO_PREVIOUS_BASH_ENV': environment['BASH_ENV'],
+                                         'ROBOB_REPO_NODE_HELPER': str(helper),
+                                         'ROBOB_REPO_NODE_PYTHON': '/opt/homebrew/bin/python3'}):
+                self.assertIsNone(self.classify(commands[0]))
+            self.assertIsNone(self.classify('bash -n tmp/fixture.sh'))
+            # Bindings the command sets are never inherited.
+            for prefix in ('BASH_ENV=/tmp/preload.sh ', 'BASH_ENV=' + environment['BASH_ENV'] + ' ',
+                           'ENV=/tmp/preload.sh ', 'export BASH_ENV=/tmp/preload.sh; ', 'env BASH_ENV=/tmp/preload.sh ',
+                           'PATH=/tmp/shadow:$PATH ', 'SHELLOPTS=xtrace ', 'HOME=/tmp/elsewhere ',
+                           'export HOME=/tmp/elsewhere; ', 'ROBOB_REPO_PREVIOUS_BASH_ENV=/tmp/preload.sh ',
+                           'ROBOB_REPO_NODE_HELPER=/tmp/helper ', 'ROBOB_REPO_NODE_PYTHON=/tmp/python ',
+                           'NVM_DIR=/tmp/nvm ', '_repo_node_added_node=/usr/bin ', 'unset HOME; ', 'env -u HOME '):
+                for wrapper in ('', 'offbox run -- ', 'offbox run --bg -- '):
+                    command = prefix + wrapper + 'bash tmp/fixture.sh'
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+            # A command that rewrites the chain before running the fixture.
+            for writer in ("cat > " + str(helper / 'init.sh') + " <<'SH'\n:\nSH\n",
+                           "cp /tmp/evil.sh ~/.local/libexec/repo-node-pin/init.sh; ",
+                           "cp /tmp/evil.py " + str(home / '.nvm/versions/node/v26.0.0/bin/cat') + "; "):
+                with self.subTest(writer=writer):
+                    self.assertEqual(self.classify(writer + 'bash tmp/fixture.sh'), SCRIPT)
+
+    def test_inherited_bash_env_refusals(self):
+        commands = self.write_plain_subpath_fixture()
+        live_read = 'cat "' + LIVE + '"\n'
+        refusals = []
+
+        def chain(label, *, init=None, select=None, wrapper=None, environment=None, setup=None):
+            refusals.append((label, dict(init=init, select=select, wrapper=wrapper), environment or {}, setup))
+
+        chain('init-live-read', init=live_read)
+        real_init = (Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin/init.sh').read_text()
+        real_select = (Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin/select.py').read_text()
+        reader = lambda home, helper: (home / 'reader.sh').write_text(live_read)
+        chain('init-runs-live-reader', init=real_init + 'bash "$HOME/reader.sh"\n', setup=reader)
+        chain('init-only-runs-live-reader', init='bash "$HOME/reader.sh"\n', setup=reader)
+        chain('init-runs-unresolved', init='bash "$UNRESOLVED"\n')
+        chain('init-redefines-mktemp', init='mktemp() { printf "%s\\n" "$HOME"; }\n')
+        chain('init-exports-mktemp', init=real_init + 'mktemp() { printf "%s\\n" "$HOME"; }; export -f mktemp\n')
+        chain('init-comment-drift', init=real_init + '# reviewed?\n')
+        chain('select-runs-live-reader', select='import os, subprocess\nsubprocess.run(["bash", os.environ["HOME"] + "/reader.sh"])\n', setup=reader)
+        chain('select-appends-reader', select=real_select + '\nimport os\nos.system("bash $HOME/reader.sh")\n', setup=reader)
+        chain('wrapper-whitespace-drift', wrapper=(Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin/bash-env.sh').read_text() + '\n')
+        chain('init-split-live-read', init='cat "$HOME/.ro""bob/userdata/state""v2.sqlite"\n')
+        chain('select-live-read', select='open(' + repr(LIVE) + ').read()\n')
+        chain('init-sources-live-reader', init='. "$HOME/reader.sh"\n',
+              setup=lambda home, helper: (home / 'reader.sh').write_text(live_read))
+        chain('init-sources-clean-file', init='if true; then source "$HOME/clean.sh"; fi\n',
+              setup=lambda home, helper: (home / 'clean.sh').write_text(':\n'))
+        chain('init-sources-unresolved', init='. "$UNRESOLVED"\n')
+        chain('wrapper-sources-unresolved', wrapper='. "$UNRESOLVED"\n')
+        chain('wrapper-extra-source', wrapper=(Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin/bash-env.sh').read_text() + '. "$HOME/x.sh"\n')
+        chain('wrapper-live-read', wrapper=live_read)
+        chain('previous-bash-env-live', environment={'ROBOB_REPO_PREVIOUS_BASH_ENV': '{home}/previous.sh'},
+              setup=lambda home, helper: (home / 'previous.sh').write_text(live_read))
+        chain('previous-bash-env-clean', environment={'ROBOB_REPO_PREVIOUS_BASH_ENV': '{home}/previous.sh'},
+              setup=lambda home, helper: (home / 'previous.sh').write_text(':\n'))
+        chain('bash-env-missing', setup=lambda home, helper: (helper / 'bash-env.sh').unlink())
+        chain('bash-env-directory', setup=lambda home, helper: ((helper / 'bash-env.sh').unlink(), (helper / 'bash-env.sh').mkdir()))
+        chain('init-missing', setup=lambda home, helper: (helper / 'init.sh').unlink())
+        chain('select-missing', setup=lambda home, helper: (helper / 'select.py').unlink())
+        if os.geteuid() != 0:
+            chain('bash-env-unreadable', setup=lambda home, helper: (helper / 'bash-env.sh').chmod(0))
+        chain('bash-env-elsewhere', environment={'BASH_ENV': '{home}/bash-env.sh'},
+              setup=lambda home, helper: (home / 'bash-env.sh').write_text((helper / 'bash-env.sh').read_text()))
+        chain('bash-env-unexpanded', environment={'BASH_ENV': '$HOME/.local/libexec/repo-node-pin/bash-env.sh'})
+        chain('bash-env-relative', environment={'BASH_ENV': 'home/.local/libexec/repo-node-pin/bash-env.sh'})
+        chain('node-helper-elsewhere', environment={'ROBOB_REPO_NODE_HELPER': '{home}'})
+        chain('node-python-elsewhere', environment={'ROBOB_REPO_NODE_PYTHON': '/tmp/python3'})
+        chain('nvm-shadows-cat', setup=lambda home, helper: (home / '.nvm/versions/node/v26.0.0/bin/cat').write_text(''))
+        chain('nvm-dir-shadows-mktemp', environment={'NVM_DIR': '{home}/other-nvm'},
+              setup=lambda home, helper: ((home / 'other-nvm/versions/node/v1.0.0/bin').mkdir(parents=True),
+                                          (home / 'other-nvm/versions/node/v1.0.0/bin/mktemp').write_text('')))
+        chain('pnpm-bin-shadows-rm', setup=lambda home, helper: (helper / 'pnpm-bin/rm').write_text(''))
+        chain('added-node-shadows-cp', environment={'_repo_node_added_node': '{home}/added'},
+              setup=lambda home, helper: ((home / 'added').mkdir(), (home / 'added/cp').write_text('')))
+        chain('managed-dir-shadows-cat', setup=lambda home, helper: ((home / '.local/share/quint-guard/bin').mkdir(parents=True),
+                                                                      (home / '.local/share/quint-guard/bin/cat').write_text('')))
+        chain('helper-module-hijack', setup=lambda home, helper: (helper / 'json.py').write_text(''))
+        chain('helper-package-hijack', setup=lambda home, helper: ((helper / 're').mkdir(), (helper / 're/__init__.py').write_text('')))
+        chain('python-startup', environment={'PYTHONPATH': '/tmp'})
+        chain('env-also-set', environment={'ENV': '/tmp/preload.sh'})
+        chain('zdotdir-set', environment={'ZDOTDIR': '/tmp'})
+        chain('exported-function', environment={'BASH_FUNC_cd%%': '() { :; }'})
+        for label, files, extra, setup in refusals:
+            shutil_root = self.root / 'home'
+            if shutil_root.exists():
+                for path in sorted(shutil_root.rglob('*'), reverse=True):
+                    path.chmod(0o700) if path.is_dir() else path.chmod(0o600)
+                    path.rmdir() if path.is_dir() and not path.is_symlink() else path.unlink()
+            home, helper, environment = self.repo_node_pin(**files)
+            if setup:
+                setup(home, helper)
+            environment.update({name: value.replace('{home}', str(home)) for name, value in extra.items()})
+            with patch.dict(os.environ, environment):
+                for command in commands:
+                    with self.subTest(case=label, command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_inherited_bash_env_selector_inputs(self):
+        # select.py opens these before the script runs (repo files from the
+        # cwd up to the repo root, NVM aliases, pnpm package.json files).
+        commands = self.write_plain_subpath_fixture()
+        home, helper, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        plain = self.write('marker/plain.json', '{}')
+        nvm = home / '.nvm'
+        corepack = home / 'corepack'
+        environment['COREPACK_HOME'] = str(corepack)
+        made = []
+
+        def link(path, target):
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.symlink_to(target)
+            made.append(path)
+
+        def hard(path, target):
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.link(target, path)
+            made.append(path)
+
+        def fifo(path):
+            os.mkfifo(path)
+            made.append(Path(path))
+
+        def regular(path, text='{}'):
+            made.append(self.write(path, text) if not os.path.isabs(path) else Path(path))
+            if os.path.isabs(path):
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).write_text(text)
+
+        pnpm_root = home / 'pnpm-install/lib/node_modules/pnpm'
+        rows = [
+            ('cwd-package-json-live', lambda: link(self.root / 'package.json', marker), SCRIPT),
+            ('cwd-nvmrc-live', lambda: link(self.root / '.nvmrc', marker), SCRIPT),
+            ('cwd-node-version-live', lambda: link(self.root / '.node-version', marker), SCRIPT),
+            ('cwd-pnpm-lock-live', lambda: link(self.root / 'pnpm-lock.yaml', marker), SCRIPT),
+            ('script-dir-package-json-live', lambda: link(self.root / 'tmp/package.json', marker), None),
+            ('cwd-package-json-dangling-live', lambda: link(self.root / 'package.json', str(marker) + '-wal'), SCRIPT),
+            ('cwd-package-json-hard-link', lambda: hard(self.root / 'package.json', marker), SCRIPT),
+            ('cwd-package-json-fifo', lambda: fifo(self.root / 'package.json'), SCRIPT),
+            ('nvm-alias-live', lambda: link(nvm / 'alias/default', marker), SCRIPT),
+            ('nvm-pnpm-package-live', lambda: link(nvm / 'versions/node/v26.0.0/lib/node_modules/pnpm/package.json', marker), SCRIPT),
+            ('corepack-package-live', lambda: link(corepack / 'v1/pnpm/10.0.0/package.json', marker), SCRIPT),
+            ('path-pnpm-root-package-live', lambda: (regular(str(pnpm_root / 'bin/pnpm.cjs'), ''),
+                                                    link(home / '.local/share/quint-guard/bin/pnpm', pnpm_root / 'bin/pnpm.cjs'),
+                                                    link(pnpm_root / 'package.json', marker)), SCRIPT),
+            ('cwd-package-json-regular', lambda: regular('package.json'), None),
+            ('cwd-package-json-plain-link', lambda: link(self.root / 'package.json', plain), None),
+            ('nvm-alias-directory', lambda: (nvm / 'alias/lts').mkdir(parents=True, exist_ok=True), None),
+        ]
+        for label, setup, expected in rows:
+            setup()
+            try:
+                with patch.dict(os.environ, environment):
+                    for command in commands:
+                        with self.subTest(case=label, command=command):
+                            self.assertEqual(self.classify(command), expected)
+            finally:
+                for path in reversed(made):
+                    if path.is_symlink() or path.exists():
+                        path.unlink()
+                made.clear()
+        # The selector walks from each cwd (here deep/a/b and its HERE, deep/a)
+        # up to the repo root.
+        deep = self.root / 'deep/a/b'
+        self.write('deep/a/b/fixture.sh', (self.root / 'tmp/fixture.sh').read_text())
+        with patch.dict(os.environ, environment):
+            self.assertIsNone(guard.classify('bash fixture.sh', str(deep)))
+            link(self.root / 'deep/package.json', marker)
+            try:
+                self.assertEqual(guard.classify('bash fixture.sh', str(deep)), SCRIPT)
+                (deep / '.git').mkdir()
+                (deep.parent / '.git').mkdir()
+                # Repo roots below the link stop both walks before it.
+                self.assertIsNone(guard.classify('bash fixture.sh', str(deep)))
+            finally:
+                made.pop().unlink()
+                (deep / '.git').rmdir()
+                (deep.parent / '.git').rmdir()
+        # The command must not create selector inputs on the way in.
+        with patch.dict(os.environ, environment):
+            for command in ('ln -s x package.json; bash tmp/fixture.sh', 'cp a .nvmrc && bash tmp/fixture.sh',
+                            'COREPACK_HOME=/tmp/c bash tmp/fixture.sh'):
+                with self.subTest(command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_inherited_bash_env_selector_inputs_round_two(self):
+        commands = self.write_plain_subpath_fixture()
+        home, helper, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        # The pinned cd wrapper refreshes in "$(dirname "$0")/..", the fixture's HERE.
+        nested = self.write('nested/tests/fixture.sh', (self.root / 'tmp/fixture.sh').read_text())
+        nested_commands = ('bash nested/tests/fixture.sh', '/bin/bash ' + str(nested),
+                           'offbox run --bg -- bash nested/tests/fixture.sh')
+        with patch.dict(os.environ, environment):
+            for command in nested_commands:
+                with self.subTest(case='nested-clean', command=command):
+                    self.assertIsNone(self.classify(command))
+            (self.root / 'nested/.nvmrc').symlink_to(marker)
+            try:
+                for command in nested_commands:
+                    with self.subTest(case='nested-here-nvmrc-live', command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+                # Run from inside the script dir too: HERE is then the cwd's parent.
+                with self.subTest(case='nested-here-from-tests'):
+                    self.assertEqual(guard.classify('bash fixture.sh', str(self.root / 'nested/tests')), SCRIPT)
+            finally:
+                (self.root / 'nested/.nvmrc').unlink()
+        # select.py uses get(name, default), so empty or relative roots follow the cwd.
+        (self.root / 'alias').mkdir()
+        (self.root / 'alias/default').symlink_to(marker)
+        (self.root / 'rel/alias').mkdir(parents=True)
+        (self.root / 'rel/alias/default').symlink_to(marker)
+        (self.root / 'v1/pnpm/10.0.0').mkdir(parents=True)
+        (self.root / 'v1/pnpm/10.0.0/package.json').symlink_to(marker)
+        (self.root / 'rel/v1/pnpm/10.0.0').mkdir(parents=True)
+        (self.root / 'rel/v1/pnpm/10.0.0/package.json').symlink_to(marker)
+        for name in ('NVM_DIR', 'COREPACK_HOME'):
+            for value in ('', 'rel', './rel'):
+                with patch.dict(os.environ, {**environment, name: value}):
+                    for command in commands:
+                        with self.subTest(name=name, value=value, command=command):
+                            self.assertEqual(self.classify(command), SCRIPT)
+        # Lookups by name still work in a directory that cannot be listed.
+        if os.geteuid() != 0:
+            alias = home / '.nvm/alias'
+            alias.mkdir(parents=True)
+            (alias / 'default').symlink_to(marker)
+            alias.chmod(0o111)
+            try:
+                with patch.dict(os.environ, environment):
+                    for command in commands:
+                        with self.subTest(case='unlistable-alias', command=command):
+                            self.assertEqual(self.classify(command), SCRIPT)
+            finally:
+                alias.chmod(0o755)
+            (alias / 'default').unlink()
+            (alias / 'default').write_text('v26\n')
+            with patch.dict(os.environ, environment):
+                for command in commands:
+                    with self.subTest(case='listable-alias-clean', command=command):
+                        self.assertIsNone(self.classify(command))
+
+    def test_inherited_bash_env_fixture_cwd_changes(self):
+        # Each cd refreshes the selector in its target; only the HERE subshell
+        # from the starting cwd, without CDPATH or a changed $0, is proven.
+        self.write_plain_subpath_fixture()
+        original = (self.root / 'tmp/fixture.sh').read_text()
+        home, helper, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        for directory in ('nested/nested', 'elsewhere/nested'):
+            (self.root / directory).mkdir(parents=True)
+            (self.root / directory / '.nvmrc').symlink_to(marker)
+        commands = ('bash nested/tests/fixture.sh', '/bin/bash ' + str(self.root / 'nested/tests/fixture.sh'),
+                    'offbox run --bg -- bash nested/tests/fixture.sh')
+        here = 'HERE="$(cd "$(dirname "$0")/.." && pwd)"\n'
+        rows = [
+            ('unchanged', original, {}, None),
+            ('unchanged-empty-cdpath', original, {'CDPATH': ''}, None),
+            ('extra-top-level-cd', original.replace('set -u\n', 'set -u\ncd "$(dirname "$0")/.."\n', 1), {}, SCRIPT),
+            ('repeated-here-cd', original.replace(here, here + 'X="$(cd "$(dirname "$0")/.." && pwd)"\n', 1), {}, SCRIPT),
+            ('pushd', original.replace('set -u\n', 'set -u\npushd "$(dirname "$0")/.." >/dev/null\n', 1), {}, SCRIPT),
+            ('heredoc-cd', original.replace('src="${@: -2:1}"', 'cd /tmp\nsrc="${@: -2:1}"', 1), {}, SCRIPT),
+            ('inherited-cdpath', original, {'CDPATH': str(self.root / 'elsewhere')}, SCRIPT),
+            ('fixture-cdpath', original.replace('set -u\n', 'set -u\nCDPATH=' + str(self.root / 'elsewhere') + '\n', 1), {'CDPATH': ''}, SCRIPT),
+            ('fixture-exported-cdpath', original.replace('set -u\n', 'set -u\nexport CDPATH=' + str(self.root / 'elsewhere') + '\n', 1), {}, SCRIPT),
+            ('fixture-argv0', original.replace('set -u\n', 'set -u\nBASH_ARGV0=' + str(self.root / 'nested/nested/tests/x.sh') + '\n', 1), {}, SCRIPT),
+        ]
+        # Every other cd form, wherever it sits, and every CDPATH mention.
+        for statement in ('cd -', 'f() { cd "$(dirname "$0")/.."; }; f', '( cd "$(dirname "$0")/.." )',
+                          'declare CDPATH=' + str(self.root / 'elsewhere'), 'read -r CDPATH < /dev/null'):
+            rows.append(('fixture-' + statement, original.replace('set -u\n', 'set -u\n' + statement + '\n', 1), {}, SCRIPT))
+        # Bash drops quotes, escapes and continuations from command words.
+        for statement in ('c""d "$(dirname "$0")/.."', "c'd' \"$(dirname \"$0\")/..\"", "c''d \"$(dirname \"$0\")/..\"",
+                          'c\\d "$(dirname "$0")/.."', 'c\\\nd "$(dirname "$0")/.."', '"cd" "$(dirname "$0")/.."',
+                          'pu""shd "$(dirname "$0")/.." >/dev/null', 'CD""PATH=' + str(self.root / 'elsewhere'),
+                          'P""WD=' + str(self.root / 'elsewhere'), 'sh""opt -s cdable_vars'):
+            rows.append(('fixture-split-' + statement, original.replace('set -u\n', 'set -u\n' + statement + '\n', 1), {}, SCRIPT))
+        # Logical cd joins $PWD; physical mode and cdable_vars change targets.
+        for statement in ('PWD=' + str(self.root / 'elsewhere'), 'export PWD=' + str(self.root / 'elsewhere'),
+                          'OLDPWD=/tmp', 'unset PWD', 'read -r PWD < /dev/null', 'shopt -s cdable_vars',
+                          'set -P', 'set -eP', 'set -o physical'):
+            rows.append(('fixture-' + statement, original.replace('set -u\n', 'set -u\n' + statement + '\n', 1), {}, SCRIPT))
+        for label, source, extra, expected in rows:
+            self.assertTrue(label.startswith('unchanged') or source != original or extra, label)
+            self.write('nested/tests/fixture.sh', source)
+            with patch.dict(os.environ, {**environment, **extra}):
+                for command in commands:
+                    with self.subTest(case=label, command=command):
+                        self.assertEqual(self.classify(command), expected)
+        with patch.dict(os.environ, environment):
+            for command in ('CDPATH=/tmp bash nested/tests/fixture.sh', 'export CDPATH=/tmp; bash nested/tests/fixture.sh'):
+                with self.subTest(command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_repo_node_pin_hashes_cover_fork_helpers(self):
+        # Editing local-helpers' repo-node-pin turns the fixture proof off
+        # until the guard reviews and pins the new bytes.
+        import hashlib
+        source = Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin'
+        for part, hashes in guard.REPO_NODE_PIN_HASHES.items():
+            with self.subTest(part=part):
+                self.assertIn(hashlib.sha256((source / part).read_bytes()).hexdigest(), hashes)
+
+    def test_real_repo_node_pin_bash_env_keeps_fixture_proof(self):
+        # Drift in this Mac's installed chain should show up here first.
+        helper = Path.home() / '.local/libexec/repo-node-pin'
+        if not (helper / 'bash-env.sh').is_file():
+            self.skipTest('repo-node-pin is not installed')
+        commands = self.write_plain_subpath_fixture()
+        environment = {'BASH_ENV': str(helper / 'bash-env.sh'), 'ROBOB_REPO_PREVIOUS_BASH_ENV': '',
+                       'ROBOB_REPO_NODE_HELPER': '', 'ROBOB_REPO_NODE_PYTHON': '', 'ZDOTDIR': ''}
+        with patch.dict(os.environ, environment):
+            for command in commands:
+                with self.subTest(command=command):
+                    self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+
+    def test_mktemp_fixture_plain_subpath_straight_line(self):
+        for root in ('$T', '${T}'):
+            # Keep a live-root marker so both cases exercise the source fallback.
+            source = '# .robob\nT=$(mktemp -d)\ncat "' + root + '/fixture-live/userdata/statev2.sqlite"\n'
+            self.write('tmp/fixture.sh', source)
+            self.assertIsNone(self.classify('bash tmp/fixture.sh'))
+            self.write('tmp/fixture.sh', 'cat "' + root + '/fixture-live/userdata/statev2.sqlite"\n' + source)
+            self.assertEqual(self.classify('bash tmp/fixture.sh'), SCRIPT)
+            self.write('tmp/fixture.sh', source.replace('"' + root + '/fixture-live/userdata/statev2.sqlite"',
+                                                       "'" + root + "/fixture-live/userdata/statev2.sqlite'"))
+            for command in ('bash tmp/fixture.sh', '/bin/bash ' + str(self.root / 'tmp/fixture.sh'),
+                            'offbox run --bg -- bash tmp/fixture.sh'):
+                with self.subTest(root=root, command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_mktemp_fixture_quoted_traversal_tails(self):
+        rows = [('"', separator) for separator in (')', '(', ' ', '\t', '\n', '\r', '\v', '\f', ';', '&', '|', '<', '>')]
+        rows += [('', separator) for separator in ('\r', '\v', '\f', '\u00a0', '\u2028')]
+        for quote, separator in rows:
+            source = ('TOP=$(mktemp -d "${TMPDIR:-/tmp}/fixture.XXXXXX") || exit 1\n'
+                      'setup() {\n  T=$(mktemp -d "$TOP/case.XXXXXX")\n'
+                      '  mkdir -p "$T/.robob" ' + quote + '$T/fixture/statev2.sqlite' + separator + quote + '\n}\n'
+                      'setup fake\ncat ' + quote + '$T/fixture/statev2.sqlite' + separator + '/'
+                      + '../' * 32 + '$HOME/.ro""bob/userdata/state""v2.sqlite' + quote + '\n')
+            self.write('tmp/fixture.sh', source)
+            for command in ('bash tmp/fixture.sh', '/bin/bash ' + str(self.root / 'tmp/fixture.sh'),
+                            'offbox run --bg -- bash tmp/fixture.sh'):
+                with self.subTest(quote=quote, separator=separator, command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
     def test_mktemp_fixture_tool_identity(self):
         backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
         self.write('tmp/backup.sh', backup.read_text())
@@ -736,6 +1980,8 @@ class GuardTests(unittest.TestCase):
         command = ['/opt/homebrew/opt/sqlite/bin/sqlite3', '-safe', '-noinit', '--', ':memory:']
         dump = "CREATE TABLE scheduled_tasks(name); INSERT INTO scheduled_tasks VALUES ('it''s 7');\nCREATE TABLE ardud_mission_events(id); INSERT INTO ardud_mission_events VALUES ('m');"
         result = subprocess.run(command + [dump, 'SELECT name FROM scheduled_tasks', 'SELECT id FROM ardud_mission_events'], capture_output=True, text=True)
+        if result.returncode and 'unknown option: -noinit' in result.stderr:
+            self.skipTest('requires SQLite CLI with -noinit support')
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "it's 7\nm\n", ''))
         fixture = self.write('fixture.sql', 'SELECT 1;')
         for sql in ('.read ' + str(fixture), "SELECT readfile('" + str(fixture) + "');"):
@@ -1626,7 +2872,7 @@ class LiveDatabaseGuardTests(unittest.TestCase):
         with patch.object(Path, "open", side_effect=AssertionError("must not read database symlink")):
             self.assertEqual(guard.classify("python3 linked.py", str(self.root)), "live-database-read")
 
-    def test_policy_runs_before_identity_offbox_or_coord_and_does_not_log_sql(self):
+    def test_policy_runs_before_identity_or_offbox_and_does_not_log_sql(self):
         command = "sqlite3 ~/.robob/userdata/statev2.sqlite 'select private_sql'"
         for harness in ("claude", "codex"):
             for tool in ("Bash", "bash", "shell", "exec_command", "shell_command", "mcp__test__exec_command", "mcp__test__shell"):

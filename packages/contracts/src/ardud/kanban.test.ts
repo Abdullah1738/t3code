@@ -6,6 +6,7 @@ import {
   KANBAN_BACKLOG,
   KanbanAnswer,
   KanbanBoard,
+  KanbanStandingApproval,
   KanbanNightlyReview,
   KanbanCard,
   KanbanCardEvent,
@@ -22,6 +23,7 @@ import {
   kanbanSchedule,
   kanbanScriptStep,
   kanbanWaitsOnEvaluator,
+  kanbanWorkStep,
   KANBAN_AGING_STEP_MS,
   KANBAN_RETRY_BACKOFF_MS,
   KanbanBoardIconImage,
@@ -620,6 +622,7 @@ describe("kanbanBoardIcon", () => {
     expect(kanbanBoardIcon(decodeBoard({ ...stored, icon: "retired" }))).toBeNull();
     expect(decodeBoard(stored).iconImage).toBeNull();
     expect(decodeBoard(stored).nightlyReview).toBeNull();
+    expect(decodeBoard(stored).standingApprovals).toEqual([]);
   });
 
   it("takes only small inline pictures as a board image", () => {
@@ -1072,6 +1075,21 @@ describe("KanbanCard wait", () => {
     );
   });
 
+  it("round-trips optional wait target metadata and still reads old waits", () => {
+    const original = card("stored", { wait: wait({ on: "card", card: "foreign" as never }) });
+    const roundTrip = (value: KanbanCard) =>
+      Schema.decodeUnknownSync(KanbanCard)(Schema.encodeSync(KanbanCard)(value));
+    expect(roundTrip(original).wait?.cardTarget).toBeUndefined();
+    const cardTarget = {
+      id: "foreign" as never,
+      number: 73,
+      boardId: "board-foreign" as never,
+      boardName: "Foreign",
+    };
+    const shown = { ...original, wait: { ...original.wait!, cardTarget } };
+    expect(roundTrip(shown).wait?.cardTarget).toEqual(cardTarget);
+  });
+
   it("drops the wait key, not sets it to undefined", () => {
     const cleared = kanbanWithoutWait(card("w", { wait: wait() }));
     expect("wait" in cleared).toBe(false);
@@ -1127,38 +1145,27 @@ describe("worker dispatch uses the current step", () => {
   });
 });
 
-it("pending findings survive note consumption but never bypass evaluator or script steps", () => {
-  expect(
-    kanbanWaitsOnEvaluator({
-      stage: "todo",
-      wakeNote: null,
-      reviewFindingsPending: true,
-      subtasks: [scriptSubtask("s2", 2, "Review", "review")],
-    }),
-  ).toBe(false);
-  expect(
-    kanbanWaitsOnEvaluator({
-      stage: "todo",
-      wakeNote: null,
-      reviewFindingsPending: true,
-      subtasks: [
-        scriptSubtask("s3", 3, "Hold", "evaluator"),
-        scriptSubtask("s4", 4, "Review", "review"),
-      ],
-    }),
-  ).toBe(true);
-  expect(
-    kanbanWaitsOnEvaluator({
-      stage: "todo",
-      wakeNote: null,
-      reviewFindingsPending: true,
-      subtasks: [
-        scriptSubtask("s3", 3, "Hold", "script"),
-        scriptSubtask("s4", 4, "Review", "review"),
-      ],
-    }),
-  ).toBe(true);
-});
+it.each([["evaluator"], ["evaluator", "script"], ["script"], ["review"]] as const)(
+  "pending findings are worker work on a %j step",
+  (...owners) => {
+    for (const reviewFindingsPending of [false, true]) {
+      for (const wakeNote of [null, "Review findings (round 1): old words"]) {
+        const input = {
+          stage: "todo" as const,
+          wakeNote,
+          reviewFindingsPending,
+          subtasks: [
+            { ...scriptSubtask("s1", 1, "Build", "work"), state: "done" as const },
+            ...owners.map((owner, index) => scriptSubtask(`s${index + 2}`, 2, "Hold", owner)),
+            scriptSubtask("s4", 3, "Review", "review"),
+          ],
+        };
+        expect(kanbanWorkStep(input)).toBe(reviewFindingsPending);
+        expect(kanbanWaitsOnEvaluator(input)).toBe(!reviewFindingsPending);
+      }
+    }
+  },
+);
 
 it.each([false, true])(
   "an explicit pending-findings verdict %s overrides a legacy header",
@@ -1201,4 +1208,49 @@ describe("nightly review configuration", () => {
   it("rejects a zone that cannot be scheduled", () => {
     expect(() => decode({ enabled: true, timeZone: "Not/AZone" })).toThrow();
   });
+});
+
+const decodeStandingApproval = Schema.decodeUnknownSync(KanbanStandingApproval);
+
+it("old standing approvals decode with a four-hour interval", () => {
+  const record = {
+    id: "sa-old",
+    gate: "deploy",
+    quote: "Boards may release",
+    sourceThreadId: "owner-thread",
+    saidAt: "2026-11-13T17:25:00.000Z",
+    approvedAsk: { cardId: "card-one", askId: "q1" },
+    recordedAt: "2026-11-13T18:00:00.000Z",
+    recordedBy: "evaluator",
+    revokedAt: null,
+    revokedBy: null,
+    revokeReason: null,
+  };
+  expect(decodeStandingApproval(record).minIntervalHours).toBe(4);
+  expect(decodeStandingApproval({ ...record, minIntervalHours: 6 }).minIntervalHours).toBe(6);
+});
+
+it("stored subtasks decode with or without a gate skip record", () => {
+  const legacy = {
+    id: "s3",
+    step: 3,
+    text: "Edit fork source",
+    owner: "evaluator",
+    gate: "deploy",
+    gateSource: "set",
+    state: "skipped",
+    note: "Only edits fork code",
+    doneBy: { _tag: "owner" },
+    doneAt: "2026-11-14T00:00:00.000Z",
+  };
+  const decode = Schema.decodeUnknownSync(KanbanSubtask);
+  expect(decode(legacy).gateSkipped).toBeUndefined();
+  const gateSkipped = {
+    gate: "deploy",
+    reason: "Only edits fork code",
+    by: { _tag: "evaluator", threadId: "evaluator" },
+    at: "2026-11-14T00:00:00.000Z",
+    text: legacy.text,
+  };
+  expect(decode({ ...legacy, gateSkipped }).gateSkipped).toEqual(gateSkipped);
 });

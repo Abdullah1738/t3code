@@ -1,6 +1,7 @@
 """boatd (the offbox server): restart reconcile, persistent queue, tokens per owner, health, retention.
 
 Runs anywhere: Incus, systemd, ZFS and /proc are replaced by fakes; SQLite and the HTTP handler are real."""
+import contextlib
 import io
 import importlib.util
 import json
@@ -186,6 +187,25 @@ class ReconcileRuns(Base):
         self.assertEqual([s["kind"] for s in snaps], ["auto"])
         self.assertEqual(self.f.spawned, [])
 
+    def test_resource_host_counts_survive_result_recovery(self):
+        b = self.box()
+        self.box('bx_foreign1', owner='moni')
+        self.box('bx_archived', state='archived', running=False)
+        self.assertEqual(boatd.running_box_count(self.con), 2)
+        p = self.cmd(b)
+        boatd.write_json(boatd.result_path(b, p), {
+            'attempt': 1, 'status': 'exited', 'exit_code': 7, 'started_at': 100, 'ended_at': 120,
+            'host_boxes': {'start': 2, 'end': 3}})
+        boatd.settle_cmd(self.con, self.con.execute('SELECT * FROM commands WHERE box_id=? AND pid=?', (b, p)).fetchone())
+        status = boatd.cmd_status_json(self.con, b, p)
+        self.assertEqual(status['metrics']['host_boxes'], {'start': 2, 'end': 3})
+        self.assertEqual(status['exitCode'], 7)
+        with patch.object(boatd, 'db') as broken:
+            broken.execute.side_effect = RuntimeError('telemetry failed')
+            self.assertIsNone(boatd.running_box_count(broken))
+        for malformed in ('broken', 'null', '[]', '{"host_boxes":"private"}'):
+            self.assertEqual(boatd.host_box_metrics(malformed), {'host_boxes': None})
+
     def test_result_of_an_earlier_attempt_is_not_taken_for_this_one(self):
         b = self.box()
         p = self.cmd(b, attempt=2, retry=1)
@@ -305,7 +325,7 @@ class ReconcileBoxes(Base):
         # The base image has no host keys: sshd fails at first boot until systemd refuses to start it again.
         b = self.box()
         boatd._fresh_identity(b)
-        cmd = [c for c in self.f.calls if c[:1] == ("exec",)][-1][-1]
+        cmd = next(c[-1] for c in self.f.calls if c[:1] == ("exec",) and "ssh-keygen -A" in c[-1])
         self.assertLess(cmd.index("ssh-keygen -A"), cmd.index("systemctl reset-failed ssh.service ssh.socket"))
         self.assertLess(cmd.index("systemctl reset-failed"), cmd.index("systemctl restart ssh"))
 
@@ -353,6 +373,27 @@ class ReconcileBoxes(Base):
 
 
 class Queue(Base):
+    def test_sync_rows_never_block_fifo_or_consume_admission_capacity(self):
+        boatd.mem_available = lambda: 500 * 2**30
+        boatd.CFG["max_running"] = 1
+        b = self.box()
+        sync_queued = self.cmd(b, pid=1001, status="queued", age=200)
+        sync_running = self.cmd(b, pid=1002, age=0)
+        self.con.execute("UPDATE commands SET sync=1 WHERE box_id=?", (b,))
+        self.assertEqual(boatd.admitted_bytes(self.con), 0)
+        for pid in range(1003, 1006):
+            self.cmd(b, pid=pid, status="exited")
+            self.con.execute("UPDATE commands SET sync=1, metrics=? WHERE box_id=? AND pid=?",
+                             (json.dumps({"box_mem_peak": 100 * 2**30}), b, pid))
+        self.assertEqual(boatd.predicted_peak(self.con, "k"), int(boatd.CFG["default_peak_gb"] * 2**30))
+        detached = self.cmd(b, pid=1006, status="queued", age=100)
+        with patch.object(boatd.time, "sleep", side_effect=AssertionError("sync row blocked admission")):
+            boatd.admit(self.con, b, detached, "k", io.BytesIO())
+        self.assertEqual(self.status(b, sync_queued)["status"], "queued")
+        self.assertEqual(self.status(b, sync_running)["status"], "running")
+        self.assertEqual(self.status(b, detached)["status"], "running")
+        self.assertEqual(boatd.admitted_bytes(self.con), int(boatd.CFG["default_peak_gb"] * 2**30))
+
     def admit_now(self, bid, pid):
         """One admission round for a queued run: True if it was let in."""
         done = {}
@@ -504,6 +545,97 @@ class Http(Base):
         self.f.running.add(bid)
         return bid
 
+    def test_sync_exec_runs_while_own_or_other_box_run_is_waiting_for_admission(self):
+        for same_box in (False, True):
+            with self.subTest(same_box=same_box), contextlib.ExitStack() as stack:
+                b = self.box("bx_same" if same_box else "bx_exec")
+                queued_box = b if same_box else self.box("bx_queued")
+                queued_pid = self.cmd(queued_box, status="queued")
+                entered, release = threading.Event(), threading.Event()
+                errors = []
+                def hold_admission(_):
+                    entered.set()
+                    if not release.wait(10):
+                        raise RuntimeError("fixture admission was not released")
+                def wait_for_memory():
+                    con = boatd.db()
+                    try:
+                        boatd.admit(con, queued_box, queued_pid, "k", io.BytesIO())
+                    except Exception as error:
+                        errors.append(error)
+                    finally:
+                        con.close()
+                def process(args, **kw):
+                    kw["stdout"].write(b"ready\n")
+                    return subprocess.CompletedProcess(args, 0)
+                def spawn(bid, pid, attempt):
+                    boatd.run_cmd(bid, pid)
+                stack.enter_context(patch.object(boatd, "load_cfg"))
+                stack.enter_context(patch.object(boatd, "mem_available", return_value=0))
+                stack.enter_context(patch.object(boatd.time, "sleep", side_effect=hold_admission))
+                stack.enter_context(patch.object(boatd, "spawn_runner", side_effect=spawn))
+                stack.enter_context(patch.object(boatd, "ct_exec"))
+                stack.enter_context(patch.object(boatd.subprocess, "run", side_effect=process))
+                stack.enter_context(patch.object(boatd, "snapshot"))
+                stack.enter_context(patch.object(boatd, "prune_snaps"))
+                th = threading.Thread(target=wait_for_memory)
+                th.start()
+                try:
+                    self.assertTrue(entered.wait(10))
+                    st, data = self.call("ardud", "POST", f"/sandboxes/{b}/commands", {"command": "private command"})
+                    self.assertEqual(st, 200, data)
+                    self.assertEqual((data["stdout"], data["exitCode"], data["queuedMs"]), ("ready\n", 0, 0))
+                    self.assertGreaterEqual(data["runMs"], 0)
+                    self.assertEqual(self.status(queued_box, queued_pid)["status"], "queued")
+                    row = self.status(b, data["processId"])
+                    self.assertEqual((row["sync"], row["queued_s"], row["timeout_s"]), (1, 0, 60))
+                    self.assertIsNotNone(row["started_at"])
+                    self.assertIsNotNone(row["ended_at"])
+                    events = [json.loads(line) for p in (self.tmp / "shared-logs").glob("*.ndjson")
+                              for line in p.read_text().splitlines() if json.loads(line)["name"] == "exec.sync"]
+                    self.assertEqual(events[-1]["props"]["queueMs"], 0)
+                    self.assertFalse(events[-1]["props"]["killed"])
+                    self.assertNotIn("private command", json.dumps(events))
+                finally:
+                    (boatd.cmd_dir(queued_box) / f"{queued_pid}.kill").write_text("kill")
+                    release.set()
+                    th.join(10)
+                self.assertFalse(th.is_alive())
+                self.assertEqual(errors, [])
+
+    def test_sync_timeout_body_preserves_partial_streams_and_timings(self):
+        b = self.box()
+        def spawn(bid, pid, attempt):
+            con = boatd.db()
+            con.execute("UPDATE commands SET status='running', started_at=?, queued_s=0 WHERE box_id=? AND pid=?",
+                        (boatd.now(), bid, pid))
+            con.close()
+            (boatd.cmd_dir(bid) / f"{pid}.out").write_text("partial stdout\n")
+            (boatd.cmd_dir(bid) / f"{pid}.err").write_text("partial stderr\n")
+        real_kill = boatd.kill_cmd
+        def kill(con, bid, pid):
+            # Keep the real bookkeeping without a delayed systemctl stop in this fixture.
+            with patch.object(boatd.threading, "Thread"):
+                real_kill(con, bid, pid)
+        with patch.object(boatd, "spawn_runner", side_effect=spawn), patch.object(boatd, "kill_cmd", side_effect=kill):
+            st, data = self.call("ardud", "POST", f"/sandboxes/{b}/commands",
+                                 {"command": "private command", "timeoutSeconds": 1})
+        self.assertEqual((st, data["code"], data["processId"]), (408, "command_timeout", 1001))
+        self.assertFalse(data["ok"])
+        self.assertEqual((data["stdout"], data["stderr"]), ("partial stdout\n", "partial stderr\n"))
+        self.assertEqual(data["queuedMs"], 0)
+        self.assertGreaterEqual(data["runMs"], 1000)
+        self.assertTrue(data["killed"])
+        self.assertTrue(data["receivedAt"])
+        self.assertEqual(self.status(b, 1001)["timeout_s"], 1)
+
+    def test_detached_post_still_enters_admission(self):
+        b = self.box()
+        st, data = self.call("ardud", "POST", f"/sandboxes/{b}/commands", {"command": "true", "detached": True})
+        self.assertEqual(st, 200)
+        row = self.status(b, data["processId"])
+        self.assertEqual((row["status"], row["sync"], row["timeout_s"]), ("queued", 0, None))
+
     def test_health_needs_no_token_and_carries_no_box_or_owner_data(self):
         self.make_box("moni")
         st, d = self.call(None, "GET", "/health")
@@ -560,6 +692,27 @@ class Http(Base):
         self.assertEqual(self.call("moni", "GET", f"/sandboxes/{hers}/commands/{pid}")[1]["stdout"], "her output")
         self.assertEqual(self.call("ardud", "GET", f"/sandboxes/{hers}/commands/{pid}")[0], 404)
         self.assertEqual(self.call("ardud", "GET", f"/sandboxes/{hers}/command-history/{cid}/logs")[0], 404)
+
+    def test_history_logs_report_stream_byte_size_and_done_at_that_size(self):
+        bid = self.box()
+        streams = {"stdout": ("x" * (1 << 20) + "€tail\n").encode(), "stderr": "error é\n".encode()}
+        for pid, status in enumerate(("queued", "running", "exited"), start=1001):
+            self.cmd(bid, pid=pid, status=status)
+            for stream, content in streams.items():
+                ext = "out" if stream == "stdout" else "err"
+                (boatd.cmd_dir(bid) / f"{pid}.{ext}").write_bytes(content)
+            for stream, content in streams.items():
+                for offset in (0, len(content)):
+                    with self.subTest(status=status, stream=stream, offset=offset):
+                        st, page = self.call("ardud", "GET",
+                                             f"/sandboxes/{bid}/command-history/cmd_{pid}/logs"
+                                             f"?stream={stream}&offset={offset}")
+                        self.assertEqual(st, 200, page)
+                        self.assertEqual(page["size"], len(content))
+                        data = page["data"].encode()
+                        self.assertEqual(data, content[offset:offset + (1 << 20)])
+                        self.assertEqual(page["nextOffset"], offset + len(data))
+                        self.assertEqual(page["done"], status == "exited" and page["nextOffset"] >= page["size"])
 
     def test_saved_states_are_per_owner_even_with_the_same_name(self):
         hers, his = self.make_box("moni"), self.make_box("ardud")
@@ -624,6 +777,8 @@ class Http(Base):
         p = self.cmd(b, status="running")
         (boatd.cmd_dir(b) / f"{p}.out").write_text("before the cut\n")
         boatd.reconcile(self.con)
+        self.con.execute('UPDATE commands SET metrics=? WHERE box_id=? AND pid=?',
+                         (json.dumps({'host_boxes': {'start': 9, 'end': 14}}), b, p))
         req = urllib.request.Request(self.url + f"/sandboxes/{b}/commands/{p}/stream?stdoutOffset=7",
                                      headers={"Authorization": "Bearer " + self.tok["ardud"]})
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -632,6 +787,7 @@ class Http(Base):
         self.assertEqual((frames[0]["attempt"], frames[0]["bootId"]), (1, "boot-2"))
         out = "".join(f["data"] for f in frames if f["type"] == "stdout")
         self.assertEqual(out, "the cut\n", "resumes from the byte offset it was given")
+        self.assertEqual(frames[-1]['metrics']['host_boxes'], {'start': 9, 'end': 14})
         self.assertEqual((frames[-1]["type"], frames[-1]["status"], frames[-1]["exitCode"]), ("exit", "interrupted", None))
 
 

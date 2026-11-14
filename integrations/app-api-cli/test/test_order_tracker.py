@@ -4,10 +4,346 @@ import time
 import unittest
 import json
 import io
+import os
+import tempfile
+from types import SimpleNamespace
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import order_tracker as t
+
+
+class BankChargeTest(unittest.TestCase):
+    BODY = ('Your Mashreq noon Card ending with 9546 was used for a purchase of AED 2,997.59 '
+            'at Noon 80038888 AE on 08-NOV-2026 08:50 PM.')
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name)
+        self.root, self.watchers = base / 'tracker', base / 'watchers'
+        self.root.mkdir()
+        self.now = float(int(time.time()))
+        self.cfg = {'app': 'noon', 'order': 'FGB8NN4KUNY0L2A', 'watcher': 'order-noon-bank',
+                    'for': 'owner', 'chat': 'owner', 'total': 'AED 3,010.30', 'active': True,
+                    'placed_at': t.stamp(self.now - 3600), 'registered_at': t.stamp(self.now - 3600)}
+        self.folder = self.watchers / self.cfg['watcher']
+        self.folder.mkdir(parents=True)
+        self.record = self.root / 'orders' / (self.cfg['watcher'] + '.json')
+        t.write(self.record, self.cfg)
+        self.state_path = self.folder / 'order-tracker-state.json'
+        t.write(self.state_path, {'primed': True, 'status': 'preparing'})
+        source = Path(t.__file__).resolve().parents[1] / 'robob-watch/checks/money-cases/charges.py'
+        with mock.patch.dict(os.environ, ORDER_WATCH_CHARGES=str(source)):
+            parser = t.order_bank_charge.load_charges()
+        self.assertIsNotNone(parser)
+        self.row = {'id': 515561, 'source': 'email', 'sender': 'MashreqAlerts@mashreq.com',
+                    'ts': self.now - 3540}
+        self.charges = SimpleNamespace(BANKS=parser.BANKS, Lookup=parser.Lookup, parse=parser.parse,
+                                      iso=parser.iso, day=parser.day, alert_text=mock.Mock(side_effect=parser.alert_text),
+                                      search=mock.Mock(return_value=[self.row]), show=mock.Mock(return_value=self.BODY))
+        self.result = {'status': 'delivered', 'whole_order_complete': True, 'errors': []}
+        self.loader = t.order_bank_charge.load_charges
+        self.run = mock.Mock(return_value='')
+        for patch in (mock.patch.object(t, 'ROOT', self.root), mock.patch.object(t, 'WATCHERS', self.watchers),
+                      mock.patch.object(t, 'fetch', return_value=self.result),
+                      mock.patch.object(t.store, 'reconcile'), mock.patch.object(t, 'run', self.run),
+                      mock.patch.object(t.delivery_cards, 'safe_sync', return_value={'status': 'ready', 'link_health': 'ok'}),
+                      mock.patch.object(t.order_bank_charge, 'load_charges', return_value=self.charges)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def tick(self, cfg=None, folder=None, now=None, pending=False, main_checked=False,
+             run_id='scheduled-bank-fixture'):
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, WATCH_DIR=str(folder or self.folder), WATCH_RUN=run_id,
+                             WATCH_MAIN_CHECKED='1' if main_checked else '0'), \
+             mock.patch.object(t.time, 'time', return_value=now or self.now), redirect_stdout(output):
+            if pending:
+                t._check(cfg or self.cfg, pending_only=True)
+            else:
+                t.check(cfg or self.cfg)
+        return json.loads(output.getvalue()) if output.getvalue() else None
+
+    def test_exact_match_stored_without_gap(self):
+        self.cfg['total'] = 'AED 2,997.59'
+        t.write(self.record, self.cfg)
+        wake = self.tick()
+        bank = wake['bank_charge']
+        self.assertEqual(bank, {'bank_amount': 'AED 2,997.59', 'bank_card_last4': '9546',
+                                'bank_msg_id': '515561', 'bank_charged_at': self.charges.iso(
+                                    t.dt.datetime.fromtimestamp(self.row['ts'], t.dt.timezone.utc))})
+        self.assertEqual([e['kind'] for e in wake['events']], ['stage_change'])
+        for path in (self.record, self.state_path):
+            self.assertEqual({key: t.read(path)[key] for key in bank}, bank)
+        self.assertEqual(self.charges.search.call_args.args, ('noon',))
+        kwargs = self.charges.search.call_args.kwargs
+        self.assertEqual(kwargs['n'], 20)
+        self.assertLessEqual(kwargs['deadline'], self.now + 10)
+
+    def test_hamper_gap_sent_once(self):
+        wake = self.tick()
+        gap = next(e for e in wake['events'] if e['kind'] == 'bank_amount_gap')
+        self.assertEqual((gap['order_total'], gap['bank_amount'], gap['gap'], gap['card']),
+                         ('AED 3,010.30', 'AED 2,997.59', 'AED 12.71', '9546'))
+        self.assertEqual(gap['message'], 'Bank charged AED 2,997.59 on card 9546; order total was AED 3,010.30 '
+                         '(gap AED 12.71). Say both numbers once; this alone is not proof of an overcharge or refund.')
+        self.assertIsNone(self.tick(now=self.now + 601))
+        self.charges.search.assert_called_once()
+        self.assertTrue(t.read(self.state_path)['bank_gap_sent'])
+
+    def assert_late_bank_alert_recovers(self, lookup_error=False):
+        if lookup_error:
+            self.charges.search.side_effect = self.charges.Lookup('search unavailable')
+        else:
+            self.charges.search.return_value = []
+        wake = self.tick()
+        self.assertIsNone(wake['bank_charge'])
+        self.assertEqual([e['kind'] for e in wake['events']], ['stage_change'])
+        # Exercise real retirement through both callers while bank lookup is throttled.
+        for seconds, pending, main_checked in [(60, False, False), (120, True, False), (180, True, True)]:
+            with self.subTest(seconds=seconds, pending=pending, main_checked=main_checked):
+                self.assertIsNone(self.tick(now=self.now + seconds, pending=pending, main_checked=main_checked))
+                self.run.assert_not_called()
+                self.assertTrue(t.read(self.record)['active'])
+        self.assertIsNone(self.tick(now=self.now + 599))
+        self.charges.search.assert_called_once()
+        self.run.assert_not_called()
+        self.charges.search.side_effect = None
+        self.charges.search.return_value = [self.row]
+        wake = self.tick(now=self.now + 600)
+        self.assertEqual([e['kind'] for e in wake['events']], ['bank_amount_gap'])
+        self.assertEqual(t.read(self.record)['bank_msg_id'], '515561')
+        self.assertNotIn('bank_lookup_error', t.read(self.state_path))
+        self.assertEqual(self.charges.search.call_count, 2)
+        self.run.assert_not_called()
+        t.fetch.assert_called_once()
+        # Once matched, pending-check can retire without consuming another bank event.
+        self.assertIsNone(self.tick(now=self.now + 601, pending=True))
+        self.run.assert_called_once_with(['robob-watch', 'remove', self.cfg['watcher']])
+        self.assertFalse(t.read(self.record)['active'])
+
+    def test_empty_search_keeps_bank_only_retries_scheduled(self):
+        self.assert_late_bank_alert_recovers()
+
+    def test_lookup_error_keeps_bank_only_retries_scheduled(self):
+        self.assert_late_bank_alert_recovers(lookup_error=True)
+
+    def test_unmatched_bank_retry_retires_at_48_hour_cutoff(self):
+        self.charges.search.return_value = []
+        self.cfg['placed_at'] = t.stamp(self.now - 48 * 3600 + 600)
+        t.write(self.record, self.cfg)
+        self.tick()
+        for seconds, pending in [(60, False), (120, True), (599, False)]:
+            self.assertIsNone(self.tick(now=self.now + seconds, pending=pending))
+            self.run.assert_not_called()
+            self.assertTrue(t.read(self.record)['active'])
+        self.assertIsNone(self.tick(now=self.now + 600, pending=True))
+        self.run.assert_called_once_with(['robob-watch', 'remove', self.cfg['watcher']])
+        self.assertFalse(t.read(self.record)['active'])
+        self.charges.search.assert_called_once()
+        t.fetch.assert_called_once()
+
+    def test_unacceptable_bank_alerts(self):
+        cases = [('merchant', self.BODY.replace('Noon 80038888', 'Other 80038888'), self.row),
+                 ('decline', 'Transaction of AED 2,997.59 on your Card 9546 at Noon was declined', self.row),
+                 ('over two percent', self.BODY.replace('2,997.59', '2,900.00'), self.row),
+                 ('currency', self.BODY.replace('AED', 'USD'), self.row),
+                 ('sender', self.BODY, {**self.row, 'sender': 'noon@example.com'}),
+                 ('too early', self.BODY, {**self.row, 'ts': self.now - 4201}),
+                 ('too late', self.BODY, {**self.row, 'ts': self.now + 82801})]
+        for label, body, row in cases:
+            with self.subTest(label=label):
+                self.charges.search.return_value = [row]
+                self.charges.show.return_value = body
+                t.write(self.state_path, {'primed': True, 'status': 'preparing'})
+                self.assertIsNone(self.tick()['bank_charge'])
+                self.assertNotIn('bank_msg_id', t.read(self.record))
+
+    def test_one_alert_cannot_be_claimed_by_two_orders(self):
+        self.tick()
+        other = {**self.cfg, 'order': 'other', 'watcher': 'order-noon-other'}
+        for key in t.order_bank_charge.FIELDS:
+            other.pop(key, None)
+        folder = self.watchers / other['watcher']
+        folder.mkdir()
+        path = self.root / 'orders' / (other['watcher'] + '.json')
+        t.write(path, other)
+        t.write(folder / 'order-tracker-state.json', {'primed': True, 'status': 'preparing'})
+        self.assertIsNone(self.tick(other, folder)['bank_charge'])
+        self.assertNotIn('bank_msg_id', t.read(path))
+        self.charges.show.assert_called_once()
+
+    def test_scratch_watch_dir_updates_only_its_state(self):
+        scratch = Path(self.tmp.name) / 'scratch'
+        scratch.mkdir()
+        t.write(scratch / 'order-tracker-state.json', {'primed': True, 'status': 'preparing'})
+        before = self.record.read_bytes()
+        self.assertEqual(self.tick(folder=scratch)['bank_charge']['bank_msg_id'], '515561')
+        self.assertEqual(self.record.read_bytes(), before)
+        self.assertNotIn('bank_msg_id', self.cfg)
+        self.assertFalse((self.root / 'bank-charge.lock').exists())
+
+    def test_lookup_errors_and_missing_module_are_quiet(self):
+        for failure in ('missing', 'search', 'show'):
+            with self.subTest(failure=failure):
+                t.write(self.state_path, {'primed': True, 'status': 'preparing'})
+                self.charges.search.side_effect = self.charges.Lookup('search unavailable') if failure == 'search' else None
+                self.charges.show.side_effect = self.charges.Lookup('show unavailable') if failure == 'show' else None
+                with mock.patch.object(t.order_bank_charge, 'load_charges', return_value=None if failure == 'missing' else self.charges):
+                    wake = self.tick()
+                self.assertIsNone(wake['bank_charge'])
+                self.assertEqual([e['kind'] for e in wake['events']], ['stage_change'])
+                if failure != 'missing':
+                    self.assertIn('unavailable', t.read(self.state_path)['bank_lookup_error'])
+                self.assertNotIn('bank_msg_id', t.read(self.record))
+
+    def test_missing_or_broken_parser_import(self):
+        # Exercise the loader itself, rather than the stub used for the polls.
+        for contents in (None, 'raise RuntimeError("broken import")'):
+            path = Path(self.tmp.name) / ('absent.py' if contents is None else 'broken.py')
+            if contents:
+                path.write_text(contents)
+            before = sys.path[:]
+            with mock.patch.dict(os.environ, ORDER_WATCH_CHARGES=str(path)):
+                self.assertIsNone(self.loader())
+            self.assertEqual(sys.path, before)
+
+    def test_claim_lock_is_nonblocking(self):
+        with (self.root / 'bank-charge.lock').open('a') as lock:
+            t.fcntl.flock(lock, t.fcntl.LOCK_EX | t.fcntl.LOCK_NB)
+            self.assertIsNone(self.tick()['bank_charge'])
+        self.charges.search.assert_called_once()
+        self.assertNotIn('bank_msg_id', t.read(self.record))
+
+    def test_lookup_not_run_for_old_or_undelivered_order(self):
+        for status, age in [('preparing', 3600), ('delivered', 48 * 3600), ('cancelled', 3600)]:
+            with self.subTest(status=status, age=age):
+                self.cfg['placed_at'] = t.stamp(self.now - age)
+                self.result['status'] = status
+                t.write(self.state_path, {'primed': True, 'status': 'placed'})
+                self.tick()
+        self.charges.search.assert_not_called()
+
+    def test_small_gaps_are_recorded_without_an_event(self):
+        for total in ('AED 2,997.59', 'AED 2,998.59', 'AED 2,996.59'):
+            with self.subTest(total=total):
+                self.cfg['total'] = total
+                for key in t.order_bank_charge.FIELDS:
+                    self.cfg.pop(key, None)
+                t.write(self.record, self.cfg)
+                t.write(self.state_path, {'primed': True, 'status': 'preparing'})
+                wake = self.tick()
+                self.assertEqual(wake['bank_charge']['bank_amount'], 'AED 2,997.59')
+                self.assertEqual([e['kind'] for e in wake['events']], ['stage_change'])
+
+    def test_closest_amount_then_time_and_ties(self):
+        self.cfg['total'] = 'AED 100.00'
+        for amounts, times, expected in [(['99.00', '100.00'], [0, 60], '2'),
+                                         (['99.00', '99.00'], [60, 0], '2'),
+                                         (['99.00', '101.00'], [0, 0], None),
+                                         (['98.00', '97.99'], [0, 0], '1')]:
+            with self.subTest(amounts=amounts, times=times):
+                rows = [{**self.row, 'id': str(i + 1), 'ts': self.now - 3600 + delta}
+                        for i, delta in enumerate(times)]
+                self.charges.search.return_value = rows
+                self.charges.show.side_effect = [self.BODY.replace('2,997.59', amount) for amount in amounts]
+                match, error = t.order_bank_charge.find(self.cfg, t.Decimal('100'), set(), self.charges, self.now + 10)
+                self.assertIsNone(error)
+                self.assertEqual(match['bank_msg_id'] if match else None, expected)
+
+    def test_body_reads_bounded_and_chat_body_selected(self):
+        self.charges.search.return_value = [{**self.row, 'id': i + 1, 'source': 'sms'} for i in range(20)]
+        self.charges.show.return_value = '> 1 2026-11-08 20:51 Mashreq: ' + self.BODY
+        match, error = t.order_bank_charge.find(self.cfg, t.Decimal('3010.30'), set(), self.charges, self.now + 10)
+        self.assertIsNone(error)
+        self.assertIsNone(match)  # Same amount and time across six different alerts is ambiguous.
+        self.assertEqual(self.charges.show.call_count, 6)
+        self.assertEqual(self.charges.alert_text.call_count, 6)
+
+    def test_expired_budget_makes_no_lookup(self):
+        match, error = t.order_bank_charge.find(self.cfg, t.Decimal('3010.30'), set(), self.charges, self.now - 1)
+        self.assertIsNone(match)
+        self.assertIn('out of time', error)
+        self.charges.search.assert_not_called()
+
+    def test_provider_fetch_leaves_less_bank_budget(self):
+        # Fetch already spent 48 seconds of the poll's 60-second allowance.
+        with mock.patch.object(t.time, 'time', return_value=self.now + 48):
+            events = t.bank_charge_events(self.cfg, self.result, {'status': 'delivered'}, self.folder,
+                                         self.now, min(t.time.time() + 10, self.now + 50))
+        self.assertTrue(events)
+        self.assertEqual(self.charges.search.call_args.kwargs['deadline'], self.now + 50)
+
+    def test_registration_prime_defers_bank_claim_until_scheduled_check(self):
+        wake = self.tick(run_id='prime-fixture')
+        self.assertIsNone(wake['bank_charge'])
+        self.charges.search.assert_not_called()
+        self.assertNotIn('bank_msg_id', t.read(self.record))
+        wake = self.tick()
+        self.assertEqual([e['kind'] for e in wake['events']], ['bank_amount_gap'])
+
+    def test_saved_claim_recovers_gap_after_interrupted_state_save(self):
+        self.tick()
+        # The order record was saved, but this watcher state predates the claim.
+        t.write(self.state_path, {'primed': True, 'status': 'delivered'})
+        wake = self.tick(cfg=t.read(self.record))
+        self.assertEqual([e['kind'] for e in wake['events']], ['bank_amount_gap'])
+        self.assertIsNone(self.tick(cfg=t.read(self.record)))
+        self.charges.search.assert_called_once()
+
+    def test_retirement_preserves_claim_from_an_older_config_snapshot(self):
+        stale = dict(self.cfg)
+        self.tick()
+        with mock.patch.object(t, 'run', return_value=''):
+            t.retire(stale, self.record)
+        saved = t.read(self.record)
+        self.assertFalse(saved['active'])
+        self.assertEqual(saved['bank_msg_id'], '515561')
+        self.assertEqual(saved['bank_amount'], 'AED 2,997.59')
+
+    def test_claim_is_rechecked_after_lookup_before_saving(self):
+        def show(*args, **kwargs):
+            t.write(self.root / 'orders' / 'another-order.json', {'bank_msg_id': '515561'})
+            return self.BODY
+        self.charges.show.side_effect = show
+        self.assertIsNone(self.tick()['bank_charge'])
+        self.assertNotIn('bank_msg_id', t.read(self.record))
+
+    def test_date_search_covers_full_timestamp_window(self):
+        # msgs --until is exclusive midnight; the following date must be searched
+        # even when the order or the alert straddles Dubai midnight.
+        cases = [('2026-11-08T23:55:00+04:00', '2026-11-09T00:01:00+04:00'),
+                 ('2026-11-08T12:00:00+04:00', '2026-11-09T11:59:00+04:00'),
+                 ('2026-11-08T00:05:00+04:00', '2026-11-07T23:56:00+04:00'),
+                 ('2026-11-08T19:55:00Z', '2026-11-08T20:01:00Z')]
+        for placed, charged in cases:
+            with self.subTest(placed=placed, charged=charged):
+                row = {**self.row, 'ts': t.epoch(charged)}
+                def search(query, since, until, **kwargs):
+                    date = self.charges.day(t.dt.datetime.fromisoformat(charged.replace('Z', '+00:00')))
+                    return [row] if since <= date < until else []
+                self.charges.search.side_effect = search
+                match, error = t.order_bank_charge.find({**self.cfg, 'placed_at': placed}, t.Decimal('3010.30'),
+                                                        set(), self.charges, time.time() + 10)
+                self.assertIsNone(error)
+                self.assertEqual(match['bank_msg_id'], '515561')
+
+    def test_merchant_tokens_and_separators(self):
+        cases = [('noon', 'Noon 80038888 AE', True), ('noon', 'NOON.COM AE', True),
+                 ('noon', 'NOON*FOOD AE', True), ('noon', 'NOON-FOOD AE', True),
+                 ('noon', 'NOON_FOOD AE', True), ('noon', 'AFTERNOON CAFE AE', False),
+                 ('noon', 'NOONISH CAFE AE', False), ('noon', 'NOON2 CAFE AE', False),
+                 ('careem', 'CAREEM*FOOD AE', True), ('careem', 'MYCAREEM CAFE AE', False),
+                 ('amazon', 'AMAZON.AE', True), ('amazon', 'AMAZONIAN BOOKS AE', False),
+                 ('talabat', 'TALABAT.COM AE', True), ('talabat', 'TALABATI CAFE AE', False)]
+        for app, merchant, accepted in cases:
+            with self.subTest(app=app, merchant=merchant):
+                self.charges.show.return_value = self.BODY.replace('Noon 80038888 AE', merchant)
+                match, error = t.order_bank_charge.find({**self.cfg, 'app': app}, t.Decimal('3010.30'),
+                                                        set(), self.charges, time.time() + 10)
+                self.assertIsNone(error)
+                self.assertEqual(match is not None, accepted)
 
 
 class TrackerTest(unittest.TestCase):
@@ -758,7 +1094,7 @@ class RetireTest(unittest.TestCase):
         self.wid = self.cfg['watcher']
         self.live = Path.home() / '.local/share/robob-watch/watchers' / self.wid
 
-    def check(self, state, result, folder=None, run=None, card=None):
+    def check(self, state, result, folder=None, run=None, card=None, pending_only=False):
         output = io.StringIO()
         run = run or mock.Mock(return_value='')
         with mock.patch.dict(t.os.environ, WATCH_DIR=str(folder or self.live), WATCH_RUN=getattr(self, 'watch_run', 'scheduled-fixture')), \
@@ -770,14 +1106,100 @@ class RetireTest(unittest.TestCase):
              mock.patch.object(t.time, 'time', return_value=self.now), \
              mock.patch.object(t, 'fetch', return_value=result) as fetch, \
              mock.patch.object(t.store, 'reconcile') as reconcile, \
-             mock.patch.object(t.delivery_cards, 'safe_sync', return_value=card or {'status': 'ready', 'link_health': 'ok', 'rendered': True}) as sync, \
+             mock.patch.object(t.delivery_cards, 'safe_sync', side_effect=card if callable(card) else None,
+                               return_value=card or {'status': 'ready', 'link_health': 'ok', 'rendered': True}) as sync, \
              mock.patch.object(t, 'run', run), \
              redirect_stdout(output):
-            t.check(self.cfg)
+            if pending_only:
+                t._check(self.cfg, pending_only=True)
+            else:
+                t.check(self.cfg)
         self.fetch = fetch
         self.reconcile = reconcile
         self.sync = sync
         return run, write, output.getvalue()
+
+    def test_terminal_stage_enqueue_failure_retries_before_retiring(self):
+        self.cfg['delivery_card'] = {'ready': True}
+        state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 1801,
+                 'card_error': 'failed:BridgeError', 'last_result': {'status': 'delivered'}}
+        run, _, _ = self.check(state, {}, card={'status': 'sent', 'rendered': True, 'update_error': 'failed:BridgeError'})
+        run.assert_not_called()
+        self.assertTrue(state['card_error'])
+        run, _, _ = self.check(state, {}, card={'status': 'sent', 'rendered': True})
+        run.assert_called_once_with(['robob-watch', 'remove', self.wid])
+        self.assertNotIn('card_error', state)
+        self.fetch.assert_not_called()
+
+    def test_terminal_waiting_for_placement_does_not_retire(self):
+        self.cfg['delivery_card'] = {'ready': True}
+        state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 1801,
+                 'card_error': 'stage_waiting_for_placement', 'last_result': {'status': 'delivered'}}
+        run, _, _ = self.check(state, {}, card={'status': 'sent', 'rendered': True, 'update_pending': True})
+        run.assert_not_called()
+        run, _, _ = self.check(state, {}, card={'status': 'sent', 'rendered': True, 'update_pending': False})
+        run.assert_called_once_with(['robob-watch', 'remove', self.wid])
+        self.assertNotIn('card_error', state)
+        self.fetch.assert_not_called()
+
+    def test_terminal_reconciles_card_without_previous_error_after_reregistration(self):
+        self.cfg['delivery_card'] = {'ready': True}
+        state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 1801,
+                 'last_result': {'status': 'delivered'}}
+        run, _, _ = self.check(state, {}, card={'status': 'sent', 'rendered': True})
+        self.sync.assert_called_once_with(self.cfg, state['last_result'], send=False, update=True)
+        run.assert_called_once_with(['robob-watch', 'remove', self.wid])
+        self.fetch.assert_not_called()
+
+    def test_card_stage_normalization_preserves_retained_progress_and_terminal_proof(self):
+        self.cfg['delivery_card'] = {'ready': True}
+        cases = [
+            ('preparing', 'placed', 'preparing'), ('packed', 'placed', 'packed'),
+            ('packed', 'preparing', 'packed'),
+            ('picked up', 'preparing', 'picked up'), ('shipped', 'packed', 'shipped'),
+            ('out for delivery', 'picked_up', 'out for delivery'), ('nearby', 'out for delivery', 'nearby'),
+            ('out for delivery', 'preparing', 'out for delivery'), ('nearby', 'unknown', 'nearby'),
+            ('preparing', 'out for delivery', 'out for delivery'), ('nearby', 'delivered', 'delivered'),
+            ('out for delivery', 'cancelled', 'cancelled'),
+        ]
+        for confirmed, observed, expected in cases:
+            with self.subTest(confirmed=confirmed, observed=observed):
+                result = {'status': observed, 'whole_order_complete': observed in t.TERMINAL}
+                self.assertEqual(t.delivery_card_result(self.cfg, result, {'status': confirmed})['status'], expected)
+                self.assertEqual(result['status'], observed)
+
+    def test_pending_only_check_retains_card_progress_without_consuming_wake_cursor(self):
+        self.cfg.update(total='AED 600.00', delivery_card={'ready': True})
+        state = {'primed': True, 'status': 'placed'}
+        for observed in ('out for delivery', 'preparing', 'out for delivery'):
+            with self.subTest(observed=observed):
+                self.check(state, {'status': observed, 'errors': []}, pending_only=True)
+                self.assertEqual(self.sync.call_args.args[1]['status'], 'out for delivery')
+                self.assertEqual(state['status'], 'placed')
+
+    def test_card_cursor_requires_whole_order_terminal_proof(self):
+        self.cfg['delivery_card'] = {'ready': True}
+        for app, whole, valid in [('noon', False, False), ('noon', True, True),
+                                  ('amazon', None, False), ('amazon', True, True), ('web', True, False)]:
+            with self.subTest(app=app, whole=whole):
+                cfg = {**self.cfg, 'app': app}
+                state = {'status': 'placed'}
+                result = {'status': 'delivered', 'whole_order_complete': whole}
+                t.delivery_card_result(cfg, result, state)
+                self.assertEqual(state['card_result']['status'], 'delivered' if valid else 'placed')
+                later = t.delivery_card_result(cfg, {'status': 'preparing'}, state)
+                self.assertEqual(later['status'], 'delivered' if valid else 'preparing')
+
+    def test_pending_card_cursor_is_persisted_before_render_without_committing_the_wake(self):
+        self.cfg.update(total='AED 600.00', delivery_card={'ready': True})
+        state = {'primed': True, 'status': 'placed'}
+        def interrupted_render(*args, **kwargs):
+            saved = t.write.call_args.args[1]
+            self.assertEqual(saved['status'], 'placed')
+            self.assertEqual(saved['card_result']['status'], 'out for delivery')
+            raise RuntimeError('interrupted before card acknowledgement')
+        with self.assertRaisesRegex(RuntimeError, 'interrupted before card acknowledgement'):
+            self.check(state, {'status': 'out for delivery', 'errors': []}, pending_only=True, card=interrupted_render)
 
     def test_delivered_tracker_retires_without_polling(self):
         state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 1801}
@@ -1001,7 +1423,7 @@ class RetireTest(unittest.TestCase):
 
 
 class TerminalCardRenderTest(unittest.TestCase):
-    def scenario(self, failure, *, fail_render=False):
+    def scenario(self, failure, *, fail_render=False, bank_pending=False, pending_terminal=False):
         import tempfile
         cards = t.delivery_cards
         with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
@@ -1011,6 +1433,13 @@ class TerminalCardRenderTest(unittest.TestCase):
                    'watcher': 'order-noon-fixture', 'registered_at': t.stamp(time.time() - 60),
                    'delivery_card': {'ready': True}, 'card_meta': {'items': [{'name': 'Fixture', 'qty': 1}]},
                    'active': True}
+            if bank_pending:
+                now = float(int(time.time()))
+                clock = stack.enter_context(mock.patch.object(t.time, 'time', return_value=now))
+                cfg.update(placed_at=t.stamp(now - 60), total='AED 1,000.00')
+                charges = SimpleNamespace(Lookup=RuntimeError, search=mock.Mock(return_value=[]),
+                                          day=lambda value: value.astimezone(t.DUBAI).date().isoformat())
+                stack.enter_context(mock.patch.object(t.order_bank_charge, 'load_charges', return_value=charges))
             folder = watchers / cfg['watcher']
             folder.mkdir(parents=True)
             record = root / 'orders' / (cfg['watcher'] + '.json')
@@ -1021,7 +1450,8 @@ class TerminalCardRenderTest(unittest.TestCase):
                                      (cards, 'ROOT', root), (cards, 'APPS', root / 'apps')):
                 stack.enter_context(mock.patch.object(obj, name, value))
             stack.enter_context(mock.patch.object(t.toollog, 'root', return_value=root / 'logs'))
-            stack.enter_context(mock.patch.dict(t.os.environ, WATCH_DIR=str(folder), WATCH_RUN='scheduled-fixture'))
+            stack.enter_context(mock.patch.dict(t.os.environ, WATCH_DIR=str(folder), WATCH_RUN='scheduled-fixture',
+                                               WATCH_MAIN_CHECKED='0'))
             stack.enter_context(mock.patch.object(cards, 'preview', return_value=False))
             stack.enter_context(mock.patch.object(cards, 'route', return_value='fixture-session'))
             def bridge(args, **kwargs):
@@ -1062,13 +1492,32 @@ class TerminalCardRenderTest(unittest.TestCase):
                 if fail_render:
                     with mock.patch.object(cards, 'atomic', side_effect=atomic):
                         t.check(cfg)
-                        t.check(cfg)
+                        if not bank_pending:
+                            t.check(cfg)
                     removal.assert_not_called()
                     self.assertEqual(status_path.read_bytes(), before_status)
                 else:
                     t.check(cfg)
                     removal.assert_not_called()
                     self.assertEqual(cards.read(status_path)['stage'], 'Delivered')
+                if bank_pending:
+                    self.assertEqual(cards.read(status_path)['stage'], 'Packing')
+                    self.assertIn('card_error', t.read(folder / 'order-tracker-state.json'))
+                    terminal_check = (lambda: t._check(cfg, pending_only=True)) if pending_terminal else lambda: t.check(cfg)
+                    clock.return_value = now + 60
+                    terminal_check()
+                    state = t.read(folder / 'order-tracker-state.json')
+                    self.assertEqual(cards.read(status_path)['stage'], 'Delivered')
+                    self.assertNotIn('card_error', state)
+                    self.assertTrue(t.bank_match_pending(cfg, state['last_result'], state, clock.return_value))
+                    self.assertNotIn('bank_msg_id', t.read(record))
+                    self.assertTrue(t.read(record)['active'])
+                    removal.assert_not_called()
+                    clock.return_value = now + 3600
+                    terminal_check()
+                    self.assertEqual(cards.read(status_path)['stage'], 'Delivered')
+                    removal.assert_not_called()
+                    clock.return_value = now + 48 * 3600
                 t.check(cfg)
             fetch.assert_called_once()
             transport.assert_not_called()
@@ -1086,6 +1535,300 @@ class TerminalCardRenderTest(unittest.TestCase):
 
     def test_terminal_render_failure_retries_before_retiring_despite_placement_failure(self):
         self.scenario('publish_ack', fail_render=True)
+
+    def test_pending_bank_match_allows_terminal_card_render_recovery(self):
+        for pending in (False, True):
+            with self.subTest(pending_terminal=pending):
+                self.scenario('send_ack', fail_render=True, bank_pending=True, pending_terminal=pending)
+
+
+class CareemLiveTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        for obj, name, value in ((t, 'ROOT', root), (t.store, 'ROOT', root),
+                                 (t, 'WATCHERS', root / 'watchers')):
+            p = mock.patch.object(obj, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(t, 'mail_evidence', return_value=([], ['email_account_unavailable:fixture']))
+        p.start()
+        self.addCleanup(p.stop)
+        from native_orders import OrderError
+        p = mock.patch('native_orders.track', side_effect=OrderError('account_capture_required_guest_catalog_only'))
+        p.start()
+        self.addCleanup(p.stop)
+        self.cfg = {'app': 'careem', 'order': '177487014', 'for': 'owner',
+                    'placed_at': '2026-11-11T14:48:48+04:00',
+                    'registered_at': '2026-11-11T14:48:48+04:00',
+                    'eta': '2026-11-11T15:15:00+04:00',
+                    'label': 'Starbucks - JLT Drive Thru: Iced Shaken White Mocha',
+                    'vertical': 'food', 'single_active_order': True,
+                    'watcher': 'order-careem-177487014', 'active': True}
+        self.food = json.loads((Path(__file__).parent / 'fixture_careem_food_pushes.json').read_text())
+        self.register(self.cfg)
+
+    def register(self, cfg):
+        t.write(t.ROOT / 'orders' / (cfg['watcher'] + '.json'), cfg)
+        t.write(t.WATCHERS / cfg['watcher'] / 'watcher.json', {'enabled': True})
+
+    def load(self, rows, healthy=True):
+        with t.store.connect() as db:
+            db.execute('DELETE FROM pushes')
+            for i, row in enumerate(rows):
+                db.execute('INSERT INTO pushes VALUES (?,?,?,?,?,?)',
+                           (str(i), 'careem', row['posted'], row['detected'], row['text'],
+                            json.dumps(row.get('ids', []))))
+            db.execute('INSERT OR REPLACE INTO health VALUES (?,?,?,?)',
+                       ('phone', time.time() if healthy else time.time() - 600, 1, 'ok'))
+
+    def quik(self):
+        cfg = dict(self.cfg, vertical='quik', label='Careem Quik: Groceries',
+                   placed_at='2026-10-14T17:06:30+04:00', registered_at='2026-10-14T17:06:30+04:00',
+                   eta='2026-10-14T17:20:00+04:00')
+        literals = [
+            ('17:03:54', "Time for a restock! 🗓️ Your kitchen isn't complete without Apple Cinnamon Protein Porridge. Order on Quik to stay on track! ✅", 'unknown'),
+            ('17:06:37', 'Great picks! Your order is confirmed, and our team will have it ready ultra-fast ⚡', 'placed'),
+            ('17:06:38', 'Careem Quik 17:15-17:20', 'preparing'),
+            ('17:08:42', 'Your order’s on its way! Your captain has picked up your order and is on the way  🚗', 'picked up'),
+            ('17:08:42', 'Careem Quik 10 minutes', 'out for delivery'),
+            ('17:09:18', 'Careem Quik 6 minutes', 'out for delivery'),
+            ('17:11:19', 'Careem Quik 5 minutes', 'out for delivery'),
+            ('17:11:59', 'Careem Quik 4 minutes', 'out for delivery'),
+            ('17:13:19', 'Careem Quik 3 minutes', 'out for delivery'),
+            ('17:13:59', 'Careem Quik 2 minutes', 'out for delivery'),
+            ('17:14:39', 'Careem Quik 1 minute', 'nearby'),
+            ('17:14:46', "Your order's nearby Get ready to collect it from your Captain 🛍️", 'nearby'),
+            ('17:17:18', 'Careem Quik Delivered in 10 minutes', 'delivered'),
+            ('17:17:18', "Thank you for your order 💚 We hope you're pleased with it and can't wait to deliver your next order!", 'delivered'),
+        ]
+        rows = [{'posted': t.epoch('2026-10-14T' + at + '+04:00'),
+                 'detected': t.epoch('2026-10-14T' + at + '+04:00') + 1,
+                 'text': text, 'stage': stage} for at, text, stage in literals]
+        return cfg, rows
+
+    def test_every_live_text(self):
+        stages = ['preparing'] + ['out for delivery'] * 6 + ['unknown', 'nearby', 'nearby']
+        for row, expected in zip(self.food, stages, strict=True):
+            with self.subTest(text=row['text']):
+                self.assertEqual(t.careem_live_stage(row['text'], 'Starbucks - JLT Drive Thru')[0], expected)
+        _, rows = self.quik()
+        for row in rows:
+            with self.subTest(text=row['text']):
+                self.assertEqual(t.careem_live_stage(row['text'], 'Careem Quik')[0], row['stage'])
+
+    def test_foreign_merchant_and_box_wording_never_count(self):
+        for text in ('Burger King 5 minutes', 'Burger King Arrives 15:05-15:15',
+                     'Burger King Delivered in 10 minutes', 'Burger King Your order is confirmed',
+                     'Burger King Your order is cancelled', "Burger King Your order's nearby",
+                     'Careem Quik 5 minutes', 'Package will be delivered in 5 minutes Captain driving to Home',
+                     'Order delivered! Delivered at 15:00'):
+            with self.subTest(text=text):
+                self.assertEqual(t.careem_live_stage(text, 'Starbucks - JLT Drive Thru'), ('unknown', None))
+
+    def test_only_matching_order_updates_can_clear_tracking_failure(self):
+        at = t.epoch('2026-11-11T15:05:00+04:00')
+        for text in ('Burger King 5 minutes', 'Burger King Your order is cancelled',
+                     'Your Plus perks don\'t stop at food', '1 minute',
+                     'Arrives 15:05-15:15', 'Delivered in 10 minutes'):
+            with self.subTest(text=text):
+                self.load([{'posted': at - 10, 'detected': at - 9, 'text': text}])
+                result = t.fetch(self.cfg, {}, at)
+                self.assertEqual(result['status'], 'unknown')
+                self.assertNotIn('live_source_ok', result)
+                self.assertEqual(result['evidence'], [])
+                self.assertEqual(result['eta_source'], 'checkout_supplied')
+
+    def test_matching_cancellation_and_problem_are_preserved(self):
+        for text, expected in [('Starbucks - JLT Drive Thru Your order is cancelled', 'cancelled'),
+                               ('Your order is canceled', 'cancelled'),
+                               ('Starbucks - JLT Drive Thru Delivery failed', 'problem'),
+                               ('Your order is delayed', 'problem')]:
+            with self.subTest(text=text):
+                self.assertEqual(t.careem_live_stage(text, 'Starbucks - JLT Drive Thru'), (expected, None))
+
+    def test_food_fixture_stages_and_eta(self):
+        self.load(self.food)
+        for at, stage, eta in [('14:50:00', 'preparing', '15:15:00'),
+                               ('14:56:00', 'out for delivery', None),
+                               ('15:01:00', 'nearby', None),
+                               ('15:05:00', 'nearby', '15:05:50.587000')]:
+            with self.subTest(at=at):
+                result = t.fetch(self.cfg, {}, t.epoch('2026-11-11T' + at + '+04:00'))
+                self.assertEqual(result['status'], stage)
+                self.assertTrue(result['live_source_ok'])
+                self.assertEqual(result['eta_source'], 'careem_notification')
+                self.assertEqual(result['evidence'][0]['confidence'], 'careem_single_active')
+                self.assertNotIn('candidate', result)
+                if eta:
+                    self.assertAlmostEqual(t.epoch(result['eta']), t.epoch('2026-11-11T' + eta + '+04:00'), places=2)
+
+    def test_quik_lifecycle_and_terminal_retirement(self):
+        cfg, rows = self.quik()
+        self.load(rows)
+        at = t.epoch('2026-10-14T17:18:00+04:00')
+        result = t.fetch(cfg, {}, at)
+        self.assertEqual(result['status'], 'delivered')
+        self.assertNotEqual(result['eta_source'], 'careem_notification')
+        state = {'primed': True, 'status': 'nearby'}
+        events = t.transition(result, state, cfg, at)
+        self.assertEqual(state['terminal_at'], at)
+        self.assertIn({'kind': 'stage_change', 'status': 'delivered'}, events)
+        # Both terminal forms independently close the order.
+        for row in rows[-2:]:
+            self.load([row])
+            self.assertEqual(t.fetch(cfg, {}, at)['status'], 'delivered')
+
+    def test_second_active_careem_order_including_box_uses_candidates(self):
+        cfg, rows = self.quik()
+        self.load(rows)
+        for vertical in ('food', 'quik', 'box'):
+            other = dict(cfg, order='other', watcher='order-careem-other', vertical=vertical)
+            self.register(other)
+            self.assertFalse(t.single_allowed(cfg))
+            result = t.fetch(cfg, {}, t.epoch('2026-10-14T17:18:00+04:00'))
+            self.assertEqual(result['status'], 'unknown')
+            self.assertEqual(result['candidate']['confidence'], 'app_unassigned_unconfirmed')
+            self.assertNotIn('live_source_ok', result)
+
+    def test_overlapping_push_stays_ambiguous_after_other_tracker_retires(self):
+        posted = t.epoch('2026-11-11T14:59:00+04:00')
+        retired = t.epoch('2026-11-11T15:30:00+04:00')
+        for vertical in ('food', 'quik', 'box'):
+            for text in ("Thank you for your order, can't wait to deliver your next order!",
+                         'Your order is confirmed', 'Your captain has picked up your order',
+                         "Your order's nearby", 'Your order is cancelled', 'Your order is delayed',
+                         'Starbucks - JLT Drive Thru Arrives 15:05-15:15',
+                         'Starbucks - JLT Drive Thru 5 minutes',
+                         'Starbucks - JLT Drive Thru Delivered in 10 minutes'):
+                with self.subTest(vertical=vertical, text=text):
+                    other = dict(self.cfg, order='other', watcher='order-careem-other', vertical=vertical,
+                                 placed_at='2026-11-11T14:50:00+04:00')
+                    self.register(other)
+                    self.load([{'posted': posted, 'detected': posted + 1, 'text': text}])
+                    self.assertFalse(t.single_allowed(self.cfg))
+                    self.assertEqual(t.fetch(self.cfg, {}, posted + 60)['status'], 'unknown')
+                    with mock.patch.object(t, 'run', return_value=''), \
+                            mock.patch.object(t.time, 'time', return_value=retired):
+                        t.retire(other, t.ROOT / 'orders' / (other['watcher'] + '.json'))
+                    saved = t.read(t.ROOT / 'orders' / (other['watcher'] + '.json'))
+                    self.assertEqual(saved['retired_at'], t.stamp(retired))
+                    (t.WATCHERS / other['watcher'] / 'watcher.json').unlink()
+                    self.assertTrue(t.single_allowed(self.cfg))
+                    result = t.fetch(self.cfg, {}, retired + 1)
+                    state = {'primed': True, 'status': 'unknown'}
+                    events = t.transition(result, state, self.cfg, retired + 1)
+                    self.assertEqual(result['status'], 'unknown')
+                    self.assertEqual(result['evidence'], [])
+                    self.assertNotIn('live_source_ok', result)
+                    self.assertNotIn('terminal_at', state)
+                    self.assertFalse(any(e['kind'] == 'stage_change' for e in events))
+
+    def test_lifetime_boundaries_and_legacy_retired_trackers(self):
+        posted = t.epoch('2026-11-11T14:59:00+04:00')
+        at = t.epoch('2026-11-11T15:40:00+04:00')
+        cases = [
+            ('overlap', {}, False),
+            ('placed boundary', {'placed_at': t.stamp(posted)}, False),
+            ('retired boundary', {'retired_at': t.stamp(posted)}, False),
+            ('retired before push', {'retired_at': t.stamp(posted - 1)}, True),
+            ('placed after push', {'placed_at': t.stamp(posted + 1)}, True),
+            ('legacy overlap', {'retired_at': None}, False),
+            ('legacy retired before push', {'retired_at': None, 'mtime': posted - 1}, True),
+            ('orphaned active tracker past ETA', {'active': True, 'retired_at': None,
+                                                 'eta': t.stamp(posted - 60)}, False),
+            ('unknown placement', {'placed_at': None}, False),
+            ('invalid placement', {'placed_at': 'invalid'}, False),
+            ('invalid retirement', {'retired_at': 'invalid'}, False),
+            ('retirement before placement', {'retired_at': '2026-11-11T14:49:00+04:00'}, False),
+            ('other app', {'app': 'noon'}, True),
+            ('same order', {'order': self.cfg['order']}, True),
+        ]
+        for name, overrides, allowed in cases:
+            with self.subTest(name=name):
+                other = dict(self.cfg, order='other', watcher='order-careem-other', active=False,
+                             placed_at='2026-11-11T14:50:00+04:00', retired_at=t.stamp(at))
+                other.update(overrides)
+                mtime = other.pop('mtime', at)
+                self.register(other)
+                (t.WATCHERS / other['watcher'] / 'watcher.json').unlink()
+                path = t.ROOT / 'orders' / (other['watcher'] + '.json')
+                os.utime(path, (mtime, mtime))
+                self.load([{'posted': posted, 'detected': posted + 1,
+                            'text': "Thank you for your order, can't wait to deliver your next order!"}])
+                self.assertTrue(t.single_allowed(self.cfg))
+                result = t.fetch(self.cfg, {}, at)
+                self.assertEqual(result['status'], 'delivered' if allowed else 'unknown')
+                self.assertEqual(bool(result.get('live_source_ok')), allowed)
+
+    def test_new_push_after_retirement_can_advance_without_reusing_old_push(self):
+        retired = t.epoch('2026-11-11T15:30:00+04:00')
+        other = dict(self.cfg, order='other', watcher='order-careem-other', active=False,
+                     placed_at='2026-11-11T14:50:00+04:00', retired_at=t.stamp(retired))
+        self.register(other)
+        old = {'posted': t.epoch('2026-11-11T14:59:00+04:00'), 'detected': retired,
+               'text': "Thank you for your order, can't wait to deliver your next order!"}
+        new = {'posted': retired + 60, 'detected': retired + 61,
+               'text': 'Starbucks - JLT Drive Thru 1 minute'}
+        self.load([old, new])
+        result = t.fetch(self.cfg, {}, retired + 62)
+        state = {'primed': True, 'status': 'unknown', 'delay_sent': True}
+        events = t.transition(result, state, self.cfg, retired + 62)
+        self.assertEqual(result['status'], 'nearby')
+        self.assertEqual(t.epoch(result['eta']), new['posted'] + 60)
+        self.assertEqual(events, [{'kind': 'stage_change', 'status': 'nearby'}])
+        self.assertNotIn('terminal_at', state)
+
+    def test_non_single_and_box_keep_existing_evidence_path(self):
+        at = t.epoch('2026-11-11T15:05:00+04:00')
+        for cfg in (dict(self.cfg, single_active_order=False), dict(self.cfg, vertical='box')):
+            with mock.patch.object(t.store, 'evidence', return_value=([], [])) as evidence, \
+                    mock.patch.object(t.store, 'rows') as rows:
+                result = t.fetch(cfg, {}, at)
+                evidence.assert_called_once_with(cfg, t.classify, cfg['single_active_order'])
+                rows.assert_not_called()
+                self.assertEqual(result['status'], 'unknown')
+
+    def test_rows_outside_order_window_cannot_advance_or_close(self):
+        placed = t.epoch(self.cfg['placed_at'])
+        for text in ('Starbucks - JLT Drive Thru Delivered in 10 minutes',
+                     "Thank you for your order, can't wait to deliver your next order!",
+                     'Your order is confirmed', 'Starbucks - JLT Drive Thru 5 minutes',
+                     'Your order is cancelled'):
+            for posted in (placed - 1, t.epoch(self.cfg['eta']) + 3601):
+                with self.subTest(text=text, posted=posted):
+                    self.load([{'posted': posted, 'detected': posted + 1, 'text': text}])
+                    evidence, eta, errors = t.careem_live_evidence(self.cfg, placed + 5 * 3600)
+                    self.assertEqual((evidence, eta, errors), ([], None, []))
+
+    def test_late_preparing_does_not_regress_countdown_stage(self):
+        rows = self.food[:2] + [dict(self.food[0], posted=self.food[1]['posted'] + 1)]
+        self.load(rows)
+        result = t.fetch(self.cfg, {}, t.epoch('2026-11-11T15:05:00+04:00'))
+        self.assertEqual(result['status'], 'out for delivery')
+        self.assertEqual(t.epoch(result['eta']), t.epoch(self.cfg['eta']))
+
+    def test_eta_only_changes_do_not_wake(self):
+        cfg, rows = self.quik()
+        state = {'primed': True, 'status': 'out for delivery'}
+        etas = []
+        for row in rows[4:10]:
+            self.load([row])
+            at = row['posted'] + 2
+            result = t.fetch(cfg, {}, at)
+            self.assertEqual(t.transition(result, state, cfg, at), [])
+            etas.append(result['eta'])
+            self.assertEqual(state['known_eta'], result['eta'])
+        self.assertGreater(len(set(etas)), 1)
+        self.assertEqual(state['tracking_problem_streak'], 0)
+
+    def test_stale_journal_preserves_evidence_but_not_live_health(self):
+        self.load(self.food, healthy=False)
+        result = t.fetch(self.cfg, {}, t.epoch('2026-11-11T15:05:00+04:00'))
+        self.assertEqual(result['status'], 'nearby')
+        self.assertNotIn('live_source_ok', result)
+        self.assertIn('notification_collector_stale', result['errors'])
 
 
 if __name__ == '__main__':

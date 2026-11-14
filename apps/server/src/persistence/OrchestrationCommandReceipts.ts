@@ -6,6 +6,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import {
   toPersistenceSqlError,
@@ -191,6 +192,7 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
     input,
   ) =>
     findReceiptByCommandId(input).pipe(
+      NodeSqliteClient.readOnly,
       Effect.mapError(
         toPersistenceSqlError("OrchestrationCommandReceiptRepository.getByCommandId:query"),
       ),

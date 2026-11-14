@@ -11,6 +11,7 @@ it.effect("records safe server error context without exception or log text", () 
   Effect.gen(function* () {
     const recorded = yield* Deferred.make<AnalyticsEvent>();
     const analytics = Analytics.Analytics.of({
+      flush: Effect.void,
       record: (event) => Deferred.succeed(recorded, event).pipe(Effect.asVoid),
       ingest: () => Effect.void,
       read: () =>

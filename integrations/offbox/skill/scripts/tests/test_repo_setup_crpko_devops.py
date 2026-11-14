@@ -12,7 +12,6 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tests._env import clean_env
 from offbox_lib import bases, identity, runs
 from test_capacity import Isolated
 
@@ -176,12 +175,13 @@ elif name == 'terraform' and args[:2] == ['providers','mirror']:
         (target/f'terraform-provider-{source.split("/")[-1]}_{version}_{platform}.zip').write_text('authenticated zip '+version)
         (target/'index.json').write_text('{"stale":true}')
         (target/(version+'.json')).write_text('{"stale":true}')
-elif name in ('vector','aws','terraform','ruby'):
+elif name in ('vector','aws','terraform','ruby','gh'):
     version = state[name]
     if name == 'vector': print('vector '+version+' (linux)')
     if name == 'aws': print('aws-cli/'+version+' Python/3 Linux')
     if name == 'terraform': print(json.dumps({'terraform_version':version}))
     if name == 'ruby': print('ruby '+version)
+    if name == 'gh': print('gh version '+version)
 elif name == 'uname': print(state.get('arch','x86_64'))
 elif name == 'readlink': print(p(args[-1]).resolve())
 elif name == 'dpkg-query':
@@ -252,6 +252,7 @@ elif name == 'sudo':
         elif args[-1] in ('ruby','ruby3.3') and (not state.get('ruby_cached') or '--reinstall' in args): binary('ruby','3.3.0')
         if args[-1] == 'unzip': binary('unzip','installed')
         if args[-1] == 'time' and state.get('broken_tool') != 'time': binary('time','GNU')
+        if args[-1] == 'gh' and state.get('broken_tool') != 'gh': binary('gh','2.45.0')
     else: raise Exception(args)
 else: raise Exception(name)
 '''
@@ -271,7 +272,7 @@ class CrpkoSetupTests(unittest.TestCase):
         self.fake = self.home/'fake'
         self.fake.write_text('#!'+sys.executable+'\n'+FAKE)
         self.fake.chmod(0o755)
-        self.state = dict(vector='0.50.0', aws='2.99.0', terraform='1.16.1', ruby='3.3.0', time='GNU')
+        self.state = dict(vector='0.50.0', aws='2.99.0', terraform='1.16.1', ruby='3.3.0', time='GNU', gh='2.45.0')
         for tool in ('curl','sudo','tar','unzip','uname','readlink','dpkg-query','timeout','sleep',*self.state):
             shutil.copy(self.fake, self.bin/tool)
         (self.bin/'python3').symlink_to(sys.executable)
@@ -287,15 +288,21 @@ class CrpkoSetupTests(unittest.TestCase):
             target.write_text(source.read_text().replace('/usr/bin/ruby',str(self.bin/'ruby'))
                               .replace('/usr/local/bin',str(self.bin))
                               .replace('/usr/local/aws-cli',str(self.home/'aws-cli')))
-        self.env = clean_env(HOME=str(self.home), PATH=f'{self.bin}:/usr/bin:/bin',
+        # Hide any host gh while preserving real command lookup on the fixture PATH.
+        shared=self.recipes.parent/'tools/crpko.sh'
+        shared.write_text('command() {\n'
+            '  if [ "$1" = -v ] && [ "$2" = gh ]; then\n'
+            f'    PATH="{self.bin}" builtin command "$@"\n'
+            '  else builtin command "$@"; fi\n}\n'+shared.read_text())
+        # An enclosing offbox run exports shell functions and toolchain state as well as BASH_ENV.
+        self.env = dict(HOME=str(self.home), PATH=f'{self.bin}:/usr/bin:/bin',
                         OFFBOX_REPO_ROOT=str(self.root), OFFBOX_GNU_TIME=str(self.bin/'time'))
-        self.env.pop('BASH_ENV',None)
 
     def pin(self, version):
         self.workflow.write_text('steps:\n  - uses: hashicorp/setup-terraform@v3\n    with:\n'
                                  f'      terraform_version: "{version}"\n')
 
-    def run_setup(self, node='', command='echo USER_COMMAND; command -v terraform aws ruby vector', repo='w/repo'):
+    def run_setup(self, node='', command='echo USER_COMMAND; command -v terraform aws ruby vector gh', repo='w/repo'):
         (self.home/'state').write_text(json.dumps(self.state))
         with patch.object(runs,'REPO_RECIPES_DIR',self.recipes), \
              patch.object(runs,'DOCKER_REPAIR',':'), patch.object(runs,'LDCACHE_REPAIR',':'), \
@@ -340,7 +347,7 @@ class CrpkoSetupTests(unittest.TestCase):
 
     def test_each_ruby_install_form_refreshes_empty_lists(self):
         # All apt argument forms must survive the retry, including the dpkg owner.
-        for args in ('ruby','--reinstall ruby','--reinstall ruby3.3','unzip'):
+        for args in ('ruby','--reinstall ruby','--reinstall ruby3.3','unzip','gh'):
             with self.subTest(args=args):
                 self.state['apt_lists']=False
                 (self.home/'state').write_text(json.dumps(self.state))
@@ -403,6 +410,55 @@ class CrpkoSetupTests(unittest.TestCase):
         self.assert_ok(self.run_setup())
         self.assertEqual(self.run_check().returncode,0)
         self.assertNotIn('apt-get install -y -qq time',self.calls())
+
+    def test_missing_gh_repairs_box_with_matching_stamp(self):
+        self.assert_ok(self.run_setup())
+        stamp=self.home/f'.offbox/repo-setup-{KEY}.stamp'
+        before_stamp=stamp.read_text()
+        self.missing('gh')
+        self.assertNotEqual(self.run_check().returncode,0)
+        before=self.calls()
+        result=self.run_setup()
+        self.assert_ok(result)
+        self.assertIn('setting up crpko-devops toolchain',result.stderr)
+        self.assertIn('apt-get install -y -qq gh',self.calls()[len(before):])
+        self.assertNotIn('apt-get update',self.calls()[len(before):])
+        self.assertEqual(stamp.read_text(),before_stamp)
+        self.assertEqual(self.run_check().returncode,0)
+        before=self.calls()
+        result=self.run_setup()
+        self.assert_ok(result)
+        self.assertNotIn('setting up',result.stderr)
+        self.assertEqual(self.calls(),before)
+
+    def test_gh_install_without_executable_fails_setup(self):
+        self.missing('gh')
+        self.state['broken_tool']='gh'
+        result=self.run_setup()
+        self.assertEqual(result.returncode,98,result.stderr)
+        self.assertIn('offbox: gh install failed',result.stderr)
+        self.assertNotIn('USER_COMMAND',result.stdout)
+        self.assertNotIn('toolchain ready',result.stderr)
+        self.assertFalse((self.home/f'.offbox/repo-setup-{KEY}.stamp').exists())
+
+    def test_failed_gh_apt_install_stops_setup(self):
+        self.missing('gh')
+        self.state['apt_fails']='gh'
+        result=self.run_setup()
+        self.assertEqual(result.returncode,98,result.stderr)
+        self.assertIn('Unable to locate package gh',result.stderr)
+        self.assertNotIn('USER_COMMAND',result.stdout)
+        self.assertFalse((self.home/f'.offbox/repo-setup-{KEY}.stamp').exists())
+
+    def test_recipe_final_gate_requires_gh_after_shared_setup(self):
+        shared=self.recipes.parent/'tools/crpko.sh'
+        shared.write_text(shared.read_text()+
+            f'\noffbox_crpko_download_tools() {{ rm -f "{self.bin}/gh"; }}\n')
+        result=self.run_setup()
+        self.assertEqual(result.returncode,98,result.stderr)
+        self.assertIn('required tool missing on command PATH: gh',result.stderr)
+        self.assertNotIn('USER_COMMAND',result.stdout)
+        self.assertFalse((self.home/f'.offbox/repo-setup-{KEY}.stamp').exists())
 
     def test_time_install_without_executable_fails_setup(self):
         self.missing('time')
@@ -694,7 +750,7 @@ class CrpkoSetupTests(unittest.TestCase):
 
     def test_missing_and_wrong_versions_install_then_skip(self):
         for tool, versions in [('vector',(None,'0.49.0')),('aws',(None,'1.45.0')),
-                               ('terraform',(None,'1.15.0')),('ruby',(None,))]:
+                               ('terraform',(None,'1.15.0')),('ruby',(None,)),('gh',(None,))]:
             for version in versions:
                 with self.subTest(tool=tool,version=version):
                     if version is None: self.missing(tool)
@@ -707,7 +763,8 @@ class CrpkoSetupTests(unittest.TestCase):
                     self.assert_ok(self.run_setup())
                     calls=self.calls()[len(previous):]
                     expected = {'vector':'install -m 0755','terraform':'install -m 0755',
-                                'aws':'./aws/install --update','ruby':'apt-get install -y -qq ruby'}[tool]
+                                'aws':'./aws/install --update','ruby':'apt-get install -y -qq ruby',
+                                'gh':'apt-get install -y -qq gh'}[tool]
                     self.assertIn(expected,calls)
                     previous=self.calls()
                     self.assert_ok(self.run_setup())
@@ -732,6 +789,11 @@ class CrpkoSetupTests(unittest.TestCase):
         self.assertEqual(result.returncode,98,result.stderr)
         self.assertNotIn('curl ',self.calls())
         self.assertNotIn('USER_COMMAND',result.stdout)
+
+    def test_repo_environment_does_not_prepend_a_box_node_path(self):
+        result = self.run_setup(command='echo USER_COMMAND; printf "PATH=%s\\n" "$PATH"')
+        self.assert_ok(result)
+        self.assertIn('PATH=' + self.env['PATH'], result.stdout.splitlines())
 
     def test_missing_unzip_is_installed(self):
         self.env['PATH']=str(self.bin)
@@ -783,7 +845,7 @@ class CrpkoSetupTests(unittest.TestCase):
         self.assertNotIn('USER_COMMAND',result.stdout)
 
     def test_final_user_path_is_checked_after_node_selection(self):
-        for tool in ('terraform','aws','ruby','vector'):
+        for tool in ('terraform','aws','ruby','vector','gh'):
             with self.subTest(tool=tool):
                 result=self.run_setup(node=f'rm -f "{self.bin}/{tool}"; export PATH="{self.bin}"')
                 self.assertEqual(result.returncode,98,result.stderr)
@@ -848,6 +910,34 @@ class CrpkoSetupTests(unittest.TestCase):
         self.assertIn((TEMPLATES/'tools/crpko.sh').read_text(),body)
         self.assertEqual(body.count('OFFBOX_VECTOR_VERSION=0.50.0'),1)
         self.assertIn('offbox_crpko_tools\n',body)
+
+
+class RecipeFixtureEnvironmentTests(unittest.TestCase):
+    def test_enclosing_run_cannot_change_recipe_environment(self):
+        with tempfile.TemporaryDirectory() as outer:
+            startup = Path(outer) / 'bash-env'
+            startup.write_text('export PATH="$__offbox_toolchain_bin:$PATH"\n')
+            shim = str(Path(outer) / 'toolchain-commands')
+            inputs = {
+                'startup file': {'BASH_ENV': str(startup)},
+                'exported cd': {'BASH_FUNC_cd%%':
+                    '() { builtin cd "$@" && export PATH="$__offbox_toolchain_bin:$PATH"; }'},
+                'run state': {'OFFBOX_FIXTURE_AMBIENT': 'outer-run'},
+            }
+            for name, ambient in inputs.items():
+                with self.subTest(name=name), patch.dict(os.environ,
+                        dict(ambient, HOME=outer, __offbox_toolchain_bin=shim)):
+                    fixture = CrpkoSetupTests('test_repo_environment_does_not_prepend_a_box_node_path')
+                    try:
+                        fixture.setUp()
+                        fixture.test_repo_environment_does_not_prepend_a_box_node_path()
+                        result = fixture.run_setup(command='echo USER_COMMAND; '
+                            'printf "HOME=%s\\nAMBIENT=%s\\n" "$HOME" "${OFFBOX_FIXTURE_AMBIENT-}"')
+                        fixture.assert_ok(result)
+                        self.assertIn('HOME=' + str(fixture.home), result.stdout.splitlines())
+                        self.assertIn('AMBIENT=', result.stdout.splitlines())
+                    finally:
+                        fixture.doCleanups()
 
 
 class RepoKeyTests(Isolated):

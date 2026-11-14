@@ -91,7 +91,10 @@ it.effect("an unavailable foreground worker never queues a point transaction on 
 );
 
 // Records the lane/slot each read used, from its span attributes.
-const spanAttributes = <A, E>(effect: Effect.Effect<A, E>) =>
+const spanAttributes = <A, E>(
+  effect: Effect.Effect<A, E>,
+  onAttribute?: (key: string, value: unknown) => void,
+) =>
   Effect.gen(function* () {
     const spans: Array<Record<string, unknown>> = [];
     const tracer = Tracer.make({
@@ -103,6 +106,7 @@ const spanAttributes = <A, E>(effect: Effect.Effect<A, E>) =>
         span.attribute = (key, value) => {
           record[key] = value;
           attribute(key, value);
+          onAttribute?.(key, value);
         };
         span.end = (...args) => {
           spans.push({ ...record });
@@ -117,6 +121,108 @@ const spanAttributes = <A, E>(effect: Effect.Effect<A, E>) =>
     );
     return spans;
   });
+
+const statementLanes = (["foreground", "background", "writer", "checkpoint writer"] as const).map(
+  (lane) => {
+    const reader = lane === "foreground" || lane === "background";
+    const inLane = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      lane === "foreground"
+        ? foreground(effect)
+        : lane === "background"
+          ? background(effect)
+          : effect;
+    const config = { foregroundReaderSlots: 1, checkpointWorker: lane === "checkpoint writer" };
+    return { lane, reader, inLane, config };
+  },
+);
+
+it.effect.each(statementLanes)(
+  "a plain statement interrupted waiting for the $lane records its wait",
+  ({ lane, reader, inLane, config }) =>
+    withLanes(config, (sql) =>
+      Effect.gen(function* () {
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const queued = yield* Deferred.make<void>();
+        const holder = yield* inLane(
+          sql.withTransaction(
+            countEntries(sql).pipe(
+              Effect.andThen(Deferred.succeed(held, undefined)),
+              Effect.andThen(Deferred.await(release)),
+            ),
+          ),
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(held);
+        const spans = yield* spanAttributes(
+          Effect.gen(function* () {
+            const waiting = yield* inLane(
+              reader
+                ? countEntries(sql)
+                : Effect.as(sql`INSERT INTO entries VALUES ('cancelled')`, undefined),
+            ).pipe(Effect.forkChild);
+            yield* Deferred.await(queued);
+            // Advance measured wait only after routing; TestClock also waits for suspension.
+            yield* TestClock.adjust("1 second");
+            yield* Fiber.interrupt(waiting);
+          }),
+          (key, value) => {
+            if (key === "db.reader.acquire_stage" && value === "slot")
+              Deferred.doneUnsafe(queued, Effect.void);
+          },
+        );
+        assert.lengthOf(spans, 1);
+        const statement = spans[0]!;
+        assert.equal(statement.name, "sqlite");
+        assert.equal(statement["db.connection"], reader ? "reader" : "writer");
+        assert.equal(statement["db.reader.lane"], reader ? lane : undefined);
+        assert.equal(statement["db.reader.slot"], reader ? 0 : undefined);
+        assert.equal(statement["db.reader.waiting"], true);
+        assert.equal(statement["db.reader.wait_interrupted"], true);
+        assert.equal(statement["db.reader.acquired"], false);
+        assert.isNumber(statement["db.reader.wait_ms"]);
+        assert.equal(statement["db.reader.wait_ms"], statement["db.lock_wait_ms"]);
+        assert.isAbove(Number(statement["db.lock_wait_ms"]), 0);
+        assert.equal(statement["db.reader.acquire_wait_ms"], statement["db.lock_wait_ms"]);
+        assert.isUndefined(statement["db.reader.hold_ms"]);
+        assert.isUndefined(statement["db.statement.execution_ms"]);
+        assert.isUndefined(holder.pollUnsafe());
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(holder);
+        assert.equal(yield* inLane(countEntries(sql)), 1);
+      }),
+    ),
+);
+
+it.effect.each(statementLanes)(
+  "a plain statement acquiring the $lane keeps its acquired attributes",
+  ({ lane, reader, inLane, config }) =>
+    withLanes(config, (sql) =>
+      Effect.gen(function* () {
+        const spans = yield* spanAttributes(inLane(countEntries(sql)).pipe(Effect.orDie));
+        assert.lengthOf(spans, 1);
+        const statement = spans[0]!;
+        assert.equal(statement.name, "sqlite");
+        assert.equal(statement["db.connection"], reader ? "reader" : "writer");
+        assert.equal(statement["db.reader.lane"], reader ? lane : undefined);
+        assert.equal(statement["db.reader.slot"], reader ? 0 : undefined);
+        assert.equal(statement["db.reader.waiting"], false);
+        assert.equal(statement["db.reader.acquired"], true);
+        assert.isUndefined(statement["db.reader.wait_interrupted"]);
+        assert.isNumber(statement["db.lock_wait_ms"]);
+        assert.equal(
+          statement["db.reader.acquire_wait_ms"],
+          reader ? statement["db.lock_wait_ms"] : undefined,
+        );
+        assert.isNumber(statement["db.statement.execution_ms"]);
+        assert.isAtLeast(Number(statement["db.statement.execution_ms"]), 0);
+        if (reader) {
+          assert.isNumber(statement["db.reader.hold_ms"]);
+        } else {
+          assert.isUndefined(statement["db.reader.hold_ms"]);
+        }
+      }),
+    ),
+);
 
 it.effect(
   "a foreground read does not wait behind a long background read",
@@ -236,9 +342,21 @@ it.effect(
         assert.include(lanes, "background");
         for (const span of reads) {
           assert.isNumber(span["db.lock_wait_ms"]);
+          assert.equal(span["db.reader.acquire_wait_ms"], span["db.lock_wait_ms"]);
+          if (span.name === "sqlite") assert.isNumber(span["db.statement.execution_ms"]);
           assert.isNumber(span["db.reader.slot"]);
         }
         assert.isTrue(reads.some((span) => typeof span["db.reader.hold_ms"] === "number"));
+        const reserved = yield* spanAttributes(
+          Effect.all([
+            SqliteClient.authReadOnly(countEntries(sql)),
+            SqliteClient.identityReadOnly(countEntries(sql)),
+          ]).pipe(Effect.orDie),
+        );
+        for (const span of reserved.filter((span) => span.name === "sqlite")) {
+          assert.isNumber(span["db.reader.acquire_wait_ms"]);
+          assert.isNumber(span["db.statement.execution_ms"]);
+        }
         const transaction = spans.find((span) => span.name === "sql.transaction");
         assert.equal(transaction?.["db.reader.requested_lane"], "foreground");
         assert.equal(transaction?.["db.reader.effective_lane"], "foreground");

@@ -538,6 +538,13 @@ const makeThreads = (watch: Watch) => {
     KanbanThreads,
     KanbanThreads.of({
       pendingUserInputs: () => Effect.succeed([]),
+      claimContext: (threadId) =>
+        read(threadId).pipe(
+          Effect.map((view) => {
+            const model = threads.get(threadId)?.model;
+            return view && model ? { projectId: view.projectId, model } : null;
+          }),
+        ),
       view: read,
       find: read,
       model: (threadId) => Effect.sync(() => threads.get(threadId)?.model ?? null),
@@ -581,6 +588,7 @@ const makeThreads = (watch: Watch) => {
           const thread = threads.get(threadId);
           if (thread) thread.model = model;
         }),
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: (threadId) =>
         Effect.gen(function* () {

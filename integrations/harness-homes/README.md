@@ -90,11 +90,15 @@ Each parity manifest has schema version 1 and these fields:
   `settings.json`, `.claude.json`, `CLAUDE.md`, `overlay.md`; each Codex home
   covers `config.toml`, `hooks.json`, `AGENTS.md`, `models.json`. Hashes come
   from the generator's plan, never from potentially edited output files.
-  Only `.claude.json` has `format: "claude-owned-json"`: hash the projection
+  `.claude.json` has `format: "claude-owned-json"`: hash the projection
   `{mcpServers, hasCompletedOnboarding}` as recursively key-sorted compact JSON
   (`separators=(",", ":")`, UTF-8, `ensure_ascii=False`, no trailing newline).
   CLI-managed projects/counters remain preserved and do not invalidate parity.
-  All other artifacts omit `format` and retain raw-byte SHA-256.
+  Codex `config.toml` has `format: "codex-owned-json"`: hash the parsed config
+  with only `projects` removed, using the same sorted compact JSON encoding.
+  Codex manages those trust entries
+  at runtime; generation preserves them in each home. All other artifacts omit
+  `format` and retain raw-byte SHA-256.
 - `skills: [{name, source, sha256}]`, hashing the source `SKILL.md`.
 - `mcpServers`: the manifest's shared non-secret server specifications.
 - `runtimeMcpServers: ["t3-code"]`: injected per thread, not proven by home generation.

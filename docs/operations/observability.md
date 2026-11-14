@@ -116,8 +116,8 @@ on. The span time is when the sample ran, not when the stall happened.
 
 Each stall is also appended as one
 NDJSON line to `event-loop-stalls.ndjson`, next to the trace file. A line has `time` and the span
-attributes. The file keeps the last 1000 or more stalls, with one rotated backup
-(`event-loop-stalls.ndjson.1`). Use it to see how often a server stalls over days.
+attributes. Each file is capped at 256 KiB, with one rotated backup
+(`event-loop-stalls.ndjson.1`). Quiet samples and heap diagnostics share that budget.
 
 Some delay is not recorded:
 
@@ -683,13 +683,14 @@ Current high-value span and metric boundaries include:
 
 ## Heap Snapshots
 
-The server checks heap use every 30 seconds and attempts one automatic snapshot per process at
-`min(1.4 GiB, 0.70 × heap limit)`. It logs heap use, the limit and the saved path. The absolute cap
-captures huge-string allocation failures that occur below V8's nominal heap limit. Set
-`T3CODE_HEAP_SNAPSHOT_AT` to a fraction from 0 to 1 to change the relative threshold; the 1.4 GiB
+The server checks heap use every 30 seconds and attempts one automatic snapshot per process after
+three consecutive samples at or above `min(2.5 GiB, 0.70 × heap limit)`. This leaves room for normal
+boot recovery and skips short allocation spikes. It logs heap use, the limit and the saved path. Set
+`T3CODE_HEAP_SNAPSHOT_AT` to a fraction from 0 to 1 to change the relative threshold; the 2.5 GiB
 cap still applies. `0` disables automatic capture. Invalid values log a warning and use `0.70`.
 If available disk space is less than twice the used heap, capture waits for a later check.
-On startup, server snapshots older than seven days are removed from the logs dir.
+On startup and after each capture, server snapshots older than seven days are removed from the
+logs dir, and only the newest two are kept.
 
 To see what a long-running server holds in memory, send it `SIGUSR2`. The server writes a V8 heap
 snapshot to its logs dir and logs the path. This works for desktop, `npx t3`, and service installs
@@ -724,4 +725,4 @@ Before you take one:
 - The write needs about as much free memory as the heap uses. On a machine that is already
   swapping, it can make the problem worse or crash the server.
 - The file contains everything in server memory, including tokens, secrets, and thread content. Do
-  not share it publicly. Delete it when you are done if you need it removed before startup cleanup.
+  not share it publicly. Delete it when you are done if you need it removed before automatic cleanup.

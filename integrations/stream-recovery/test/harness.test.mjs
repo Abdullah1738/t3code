@@ -34,10 +34,25 @@ test('completed ownership suppresses old runs only, active ownership also covers
 });
 
 test('status errors and HTML fallback are never treated as no claims', () => {
-  for (const body of [null, {}, '<html>', { ok: true, cutover: {} }, { ok: true, cutover: status({ claimedRunIds: [1] }) }]) {
+  for (const body of [null, {}, '<html>', { ok: true, cutover: {} },
+    { ok: true, cutover: status({ claimedRunIds: [1] }) },
+    ...[
+      { threadClaimsIncluded: 'false' },
+      { threadClaimsIncluded: false, completed: false },
+      { threadClaimsIncluded: false, completed: true, active: true },
+    ].map((over) => ({ ok: true, cutover: status(over) })),
+  ]) {
     assert.throws(() => parseCutoverStatus(body), /invalid harness-cutover/);
   }
   assert.deepEqual(parseCutoverStatus({ ok: true, cutover: status() }), status());
+});
+
+test('compact completed status still reserves old runs and allows future recovery', () => {
+  const compact = parseCutoverStatus({ ok: true, cutover: status({ completed: true,
+    threadClaimsIncluded: false, claimedRuns: [{ threadId: 't', runId: 'old' }] }) });
+  assert.equal(cutoverOwns(compact, 't', ['old']), true);
+  assert.equal(cutoverOwns(compact, 't', ['future']), false);
+  assert.throws(() => planInstallerResume({ threads: [{ threadId: 't' }] }, compact), /requires full/);
 });
 
 test('all session-specific OpenCode routes reject native UUIDs before reading credentials or fetching', async () => {
