@@ -964,6 +964,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         last_error = e
                         break
                     except OffboxError as e:
+                        if isinstance(e, common.SourceGone):
+                            raise
                         if resume_stall is not None:
                             from . import home
                             refused = 400 <= (getattr(e, 'status', None) or 0) < 500

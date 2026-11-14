@@ -172,6 +172,48 @@ class SourceGoneTests(Isolated):
                     with pool._pool_lock('repo', self.clock.t + 120, 120):
                         self.fail('removed source must not enter pool selection')
 
+    def test_source_removed_during_replacement_allocation_keeps_type(self):
+        self.box('old', state='stopped', member=True)
+        with patch.object(lease, '_reuse', side_effect=lease.ResumeProvisionStalled('old stuck')), \
+                patch.object(lease, 'acquire_private', side_effect=common.SourceGone(self.root)):
+            with self.assertRaises(common.SourceGone):
+                pool.acquire(self.me)
+        self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_waiters').fetchone()[0], 0)
+        self.assertEqual(self.con.execute('SELECT COUNT(*) FROM pool_pending').fetchone()[0], 0)
+
+    def test_deleted_source_before_background_adoption(self):
+        for subdir in (False, True):
+            with self.subTest(subdir=subdir):
+                self.root.mkdir(exist_ok=True)
+                self.cwd.mkdir(exist_ok=True)
+                a = cli.parse_args(['run', '--bg', '--', 'true'])
+                with contextlib.chdir(self.cwd):
+                    rn = runs.Runner(a, self.me)
+                    rn.register_pending()
+                removed = self.cwd if subdir else self.root
+                shutil.rmtree(removed)
+                ready_r, ready_w = os.pipe()
+                accept_r, accept_w = os.pipe()
+                try:
+                    os.write(accept_w, b'1')
+                    payload = dict(args=vars(a), me=self.me, backend=common.backend(),
+                                   ready_fd=ready_w, accept_fd=accept_r, signal_mask=[])
+                    with patch.dict(os.environ, {}, clear=False), patch.object(pool, 'acquire') as acquire:
+                        self.assertEqual(runs.background_queue(rn.run_id, payload), 2)
+                    self.assertEqual(os.read(ready_r, 1), b'1')
+                    acquire.assert_not_called()
+                finally:
+                    for fd in (ready_r, ready_w, accept_r, accept_w):
+                        with contextlib.suppress(OSError):
+                            os.close(fd)
+                row = self.con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+                self.assertEqual((row['status'], row['exit_code']), ('source_gone', 2))
+                self.assertIn(str(removed), row['error'])
+                self.assertGreater(Path(row['log_path']).stat().st_size, 0)
+                self.assertIsNone(row['box_id'])
+                self.infra.assert_not_called()
+                self.failures.assert_not_called()
+
     def test_deleted_process_cwd_even_if_path_was_recreated(self):
         with contextlib.chdir(self.cwd):
             self.cwd.rmdir()

@@ -2649,7 +2649,8 @@ def _background(a, me: dict) -> int:
             # No preexec_fn: Python/CF code in a forked macOS child is unsafe even before urllib sends a request.
             child = subprocess.Popen([sys.executable, '-u', str(BG_ENTRY), '_bg-queue', rn.run_id],
                                      start_new_session=True, close_fds=True, pass_fds=(ready_w, accept_r),
-                                     stdin=subprocess.PIPE, stdout=dst, stderr=subprocess.STDOUT, env=boot_env)
+                                     stdin=subprocess.PIPE, stdout=dst, stderr=subprocess.STDOUT, env=boot_env,
+                                     cwd=str(rn.log_path.parent))
         # Until this publication the original caller remains the provable owner. No payload is sent before it.
         rn.record(client_pid=child.pid, start_at=now())
         os.close(ready_w)
@@ -2709,6 +2710,7 @@ def _background(a, me: dict) -> int:
 
 def background_queue(run_id: str, payload: dict) -> int:
     a, me = SimpleNamespace(**payload['args']), payload['me']
+    source_failure = None
     con = db()
     try:
         with write(con):
@@ -2718,15 +2720,22 @@ def background_queue(run_id: str, payload: dict) -> int:
                     or row['repo_root'] != me['repo_root'] or payload['backend'] != common.backend()):
                 raise OffboxError(f'{run_id}: queued run cannot be adopted', code=EXIT_LOCAL)
             con.execute('UPDATE runs SET client_pid=?,start_at=? WHERE run_id=?', (os.getpid(), now(), run_id))
-        os.chdir(row['local_cwd'] or row['cwd'])
+        cwd = Path(row['local_cwd'] or row['cwd'])
+        try:
+            _source_present(Path(me['repo_root']), cwd)
+            os.chdir(cwd)
+        except (common.SourceGone, FileNotFoundError, NotADirectoryError) as error:
+            error = error if isinstance(error, common.SourceGone) else common.SourceGone(cwd)
+            error.checkpoint = 'queued'
+            source_failure = (error, max(0, now() - row['start_at']))
     finally:
         con.close()
     os.environ[BACKGROUND_RUN_ENV] = run_id
     return background_client(a, me, ready=payload['ready_fd'], accept=payload['accept_fd'],
-                             signal_mask=payload['signal_mask'])
+                             signal_mask=payload['signal_mask'], source_failure=source_failure)
 
 
-def background_client(a, me: dict, ready=None, accept=None, signal_mask=None) -> int:
+def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, source_failure=None) -> int:
     global _background_context
     _background_context = (a, me)
     from . import cli
@@ -2753,6 +2762,14 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None) ->
             if accepted not in (b'1', b''):
                 finish(rid, EXIT_LOCAL, 'local_error')
                 return EXIT_LOCAL
+        if source_failure is not None:
+            error, queue_s = source_failure
+            rn = Runner(a, me)
+            rn.queue_s = queue_s
+            rn.source_gone(error)
+            say(str(error))
+            code = 2
+            return code
         code = cli._run_with_retries(a, me)
         return code
     except KeyboardInterrupt:
