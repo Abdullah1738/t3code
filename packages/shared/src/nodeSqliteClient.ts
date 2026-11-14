@@ -1671,6 +1671,8 @@ parentPort.on("message", (request) => {
   let observedWrite = false;
   let executionStarted;
   let elapsedMs;
+  let controlStarted;
+  let controlMs;
   try {
     if (close) {
       operation = "close";
@@ -1717,12 +1719,14 @@ parentPort.on("message", (request) => {
     statement.setReturnArrays(values);
     const start = performance.now();
     executionStarted = start;
+    if (/^\\s*(?:BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\\b/i.test(sql)) controlStarted = start;
     activeClassification = classifications.get(statement);
     const rows = statement.columns().length > 0 ? statement.all(...params) : (() => {
       const result = statement.run(...params);
       return raw ? result : [];
     })();
     elapsedMs += performance.now() - executionStarted;
+    if (controlStarted !== undefined) controlMs = performance.now() - controlStarted;
     executionStarted = undefined;
     activeClassification = undefined;
     observedWrite ||= Boolean(classifications.get(statement)?.write || classifications.get(statement)?.check);
@@ -1732,14 +1736,15 @@ parentPort.on("message", (request) => {
     }
     const committed = !db.isTransaction && /^\\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\\b/i.test(sql);
     const classification = classifications.get(statement);
-    parentPort.postMessage({ id, rows, committed, write: observedWrite, elapsedMs,
+    parentPort.postMessage({ id, rows, committed, write: observedWrite, elapsedMs, controlMs,
       inTransaction: db.isTransaction,
       ...recoverySnapshot(classification, sql, params) });
   } catch (error) {
     activeClassification = undefined;
     const statementElapsed = executionStarted === undefined ? elapsedMs : (elapsedMs ?? 0) + performance.now() - executionStarted;
+    if (controlStarted !== undefined && controlMs === undefined) controlMs = performance.now() - controlStarted;
     const snapshot = db ? recoverySnapshot(undefined, undefined, undefined) : {};
-    errorReply(id, error, operation, { ...snapshot, inTransaction: db?.isTransaction ?? false, write: observedWrite, elapsedMs: statementElapsed });
+    errorReply(id, error, operation, { ...snapshot, inTransaction: db?.isTransaction ?? false, write: observedWrite, elapsedMs: statementElapsed, controlMs });
   } finally {
     // Authorizer classification covers CTE/commented writes; transaction state
     // covers RELEASE/ROLLBACK. OR FAIL may persist rows despite throwing.
@@ -1794,6 +1799,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
     readonly id: number;
     readonly committed?: boolean;
     readonly elapsedMs?: number;
+    readonly controlMs?: number;
     readonly write?: boolean;
   } & (
       | { readonly rows: ReadonlyArray<any> }
@@ -1928,6 +1934,23 @@ const makeWriterSession = Effect.fnUntraced(function* (
             currentSpan.attribute("db.statement.execution_ms", reply.elapsedMs);
             currentSpan.attribute("db.execution.thread", "worker");
           }
+          if (reply.controlMs !== undefined && currentSpan?._tag === "Span")
+            try {
+              const control = /^\s*(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i
+                .exec(input.sql ?? "")?.[1]
+                ?.toLowerCase();
+              const prefix = `db.transaction.control.${control === "end" ? "commit" : control}`;
+              currentSpan.attribute(
+                `${prefix}_ms`,
+                Number(currentSpan.attributes.get(`${prefix}_ms`) ?? 0) + reply.controlMs,
+              );
+              currentSpan.attribute(
+                `${prefix}_count`,
+                Number(currentSpan.attributes.get(`${prefix}_count`) ?? 0) + 1,
+              );
+            } catch {
+              /* Timing must not change a transaction's outcome. */
+            }
           if ("error" in reply) {
             if (reply.inTransaction === false) setup.reset();
             setup.record(reply);
@@ -2404,8 +2427,6 @@ const make = Effect.fn("makeWithDatabase")(function* (
                 } catch {
                   /* Timing must not change a transaction's outcome. */
                 }
-              // OR FAIL may have committed earlier rows even when execution throws.
-              if (classification?.check) checkpoint?.check();
             }
             if (arrays) {
               try {

@@ -3085,6 +3085,47 @@ it.effect.each(walActivationStatements)(
   },
 );
 
+it.effect("retains transaction control timings on the caller span with a worker writer", () => {
+  const spans: Tracer.NativeSpan[] = [];
+  const tracer = Tracer.make({
+    span: (options) => {
+      const span = new Tracer.NativeSpan(options);
+      spans.push(span);
+      return span;
+    },
+  });
+  return withFileClient((sql) =>
+    Effect.gen(function* () {
+      for (const statement of [
+        "BEGIN",
+        "SAVEPOINT nested",
+        "RELEASE nested",
+        "END",
+        "BEGIN",
+        "ROLLBACK",
+      ])
+        yield* sql.unsafe(statement).unprepared;
+      const failed = yield* sql.unsafe("COMMIT").unprepared.pipe(Effect.result);
+      assert.equal(failed._tag, "Failure");
+      const span = yield* Effect.currentSpan;
+      for (const [operation, count] of [
+        ["begin", 2],
+        ["savepoint", 1],
+        ["release", 1],
+        ["commit", 2],
+        ["rollback", 1],
+      ] as const) {
+        assert.equal(span.attributes.get(`db.transaction.control.${operation}_count`), count);
+        assert.isAtLeast(Number(span.attributes.get(`db.transaction.control.${operation}_ms`)), 0);
+      }
+    }).pipe(
+      Effect.withSpan("worker-controls"),
+      Effect.withTracer(tracer),
+      Effect.provideService(Statement.SpanPropagationEnabled, false),
+    ),
+  );
+});
+
 it.effect("observes a commit only after the writer acknowledgement is delivered", () =>
   withFileClient((sql, filename) =>
     Effect.gen(function* () {
