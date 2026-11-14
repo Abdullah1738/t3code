@@ -1,6 +1,4 @@
 import * as NodeSqlite from "node:sqlite";
-// @effect-diagnostics-next-line nodeBuiltinImport:off -- SQLite connection selection reads only the file header without adding a FileSystem layer requirement.
-import * as NodeFSP from "node:fs/promises";
 import * as NodeUtil from "node:util";
 import * as NodeWorkerThreads from "node:worker_threads";
 
@@ -2162,26 +2160,6 @@ const makeWriter = Effect.fnUntraced(function* (
   });
 });
 
-// WAL intent is explicit for server stores, including their first empty open.
-// Other file clients retain their synchronous connection unless the file is WAL.
-const usesWalWriter = Effect.fnUntraced(function* (options: SqliteClientConfig) {
-  if (options.filename === ":memory:" || options.filename === "") return false;
-  if (options.readerWorker || options.checkpointWorker) return true;
-  return yield* Effect.promise(async () => {
-    let file;
-    try {
-      file = await NodeFSP.open(options.filename, "r");
-      const header = new Uint8Array(20);
-      const { bytesRead } = await file.read(header, 0, header.length, 0);
-      return bytesRead === 20 && header[18] === 2 && header[19] === 2;
-    } catch {
-      return false;
-    } finally {
-      await file?.close();
-    }
-  });
-});
-
 const make = Effect.fn("makeWithDatabase")(function* (
   options: SqliteClientConfig,
 ): Effect.fn.Return<Client.SqlClient, SqlError, Scope.Scope | Reactivity.Reactivity> {
@@ -2206,9 +2184,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
     ? Statement.defaultTransforms(options.transformResultNames).array
     : undefined;
 
-  const workerWriter = yield* usesWalWriter(options);
   const makeConnection = Effect.gen(function* () {
-    if (workerWriter) return yield* makeWriter(options, statementObserver, statementMetrics);
+    if (isFileDatabase) return yield* makeWriter(options, statementObserver, statementMetrics);
     const scope = yield* Effect.scope;
     const db = yield* Effect.try({
       try: () =>

@@ -2921,7 +2921,7 @@ it.effect(
     }),
 );
 
-it.effect("keeps an ordinary file on its local connection until a WAL client opens it", () => {
+it.effect("starts an ordinary file in a writer worker before WAL is enabled", () => {
   const writersBefore = writerWorkers.length;
   return withFileClient(
     (sql) =>
@@ -2930,7 +2930,7 @@ it.effect("keeps an ordinary file on its local connection until a WAL client ope
         yield* sql.withTransaction(sql`INSERT INTO local_state VALUES (1)`);
         assert.deepEqual(yield* sql`SELECT value FROM local_state`, [{ value: 1 }]);
         assert.deepEqual(yield* sql`PRAGMA journal_mode`, [{ journal_mode: "delete" }]);
-        assert.equal(writerWorkers.length, writersBefore);
+        assert.equal(writerWorkers.length, writersBefore + 1);
       }),
     { readerWorker: false },
   );
@@ -2944,7 +2944,7 @@ const walActivationStatements = [
 ] as const;
 
 it.effect.each(walActivationStatements)(
-  "hands a plain file client to a writer worker when WAL is enabled (%s)",
+  "preserves a plain file's writer connection when WAL is enabled (%s)",
   (pragma) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -2963,9 +2963,10 @@ it.effect.each(walActivationStatements)(
         yield* sql`PRAGMA busy_timeout=1234`;
         yield* sql`ATTACH DATABASE ${archivePath} AS archive`;
         yield* sql`CREATE TEMP TABLE local_buffer(value INTEGER)`;
+        yield* sql`INSERT INTO temp.local_buffer VALUES (7)`;
         yield* sql`CREATE TEMP VIEW all_entries AS
           SELECT value FROM main.entries UNION ALL SELECT value FROM archive.entries`;
-        assert.equal(writerWorkers.length, count);
+        assert.equal(writerWorkers.length, count + 1);
         assert.deepEqual(yield* sql`PRAGMA journal_mode`, [{ journal_mode: "delete" }]);
         yield* sql.unsafe(pragma).unprepared;
         assert.equal(writerWorkers.length, count + 1);
@@ -2973,8 +2974,9 @@ it.effect.each(walActivationStatements)(
         assert.deepEqual(yield* sql`PRAGMA foreign_keys`, [{ foreign_keys: 1 }]);
         assert.deepEqual(yield* sql`PRAGMA busy_timeout`, [{ timeout: 1234 }]);
         assert.deepEqual(yield* sql`SELECT COUNT(*) AS count FROM temp.local_buffer`, [
-          { count: 0 },
+          { count: 1 },
         ]);
+        assert.deepEqual(yield* sql`SELECT value FROM temp.local_buffer`.values, [[7]]);
         assert.deepEqual(yield* sql`SELECT value FROM all_entries ORDER BY value`.values, [
           [1],
           [2],
