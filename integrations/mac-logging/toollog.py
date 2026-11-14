@@ -79,21 +79,51 @@ def directory():
     return Path(os.environ.get('TOOLLOG_DIR', str(Path.home() / '.robob/logs/tools/mac')))
 
 
-def process_fields(values):
+def process_fields(values, busy=False):
     result = []
+    numeric = ('pid', 'processAgeS', 'cpuDeltaS') if busy else ('pid', 'ppid', 'processAgeS', 'stuckForS')
+    texts = ('comm',) if busy else ('stat', 'comm', 'args', 'cpuTime')
+    sample_key = 'statSamples' if busy else 'samples'
     for proc in values[:10]:
         if not isinstance(proc, dict):
             continue
-        if any(type(proc.get(k)) is not int or proc[k] < 0 for k in ('pid', 'ppid', 'ageS')):
+        if any(type(proc.get(k)) not in (int, float) or not math.isfinite(proc[k]) or proc[k] < 0 for k in numeric):
             continue
-        if not all(isinstance(proc.get(k), str) for k in ('stat', 'comm', 'args')):
+        if any(type(proc[k]) is not int for k in numeric if k != 'cpuDeltaS'):
             continue
-        clean = {k: proc[k] for k in ('pid', 'ppid', 'ageS')}
-        for key, limit in (('stat', 16), ('comm', 300), ('args', 300)):
-            value = proc[key][:limit]
+        if not all(isinstance(proc.get(k), str) for k in texts):
+            continue
+        samples = proc.get(sample_key)
+        if not isinstance(samples, list) or not all(isinstance(v, str) and re.fullmatch(r'[A-Za-z+<>-]{1,16}', v) for v in samples):
+            continue
+        if not busy and not re.fullmatch(r'(?:\d+-)?\d+(?::[0-5]\d){1,2}(?:\.\d+)?', proc['cpuTime']):
+            continue
+        clean = {k: proc[k] for k in numeric}
+        clean[sample_key] = samples[:6]
+        for key in texts:
+            value = proc[key][:16 if key == 'stat' else 64 if key == 'cpuTime' else 300]
             clean[key] = '[redacted]' if SECRET.search(value) else ''.join(
                 c if c.isprintable() else ' ' for c in value)
         result.append(clean)
+    return result
+
+
+def disk_wait_fields(values):
+    result = {}
+    for key, value in (values or {}).items():
+        if key in ('count', 'busyCount', 'sampleCount') and type(value) is int and value >= 0:
+            result[key] = min(value, 6) if key == 'sampleCount' else value
+        elif key in ('procs', 'busy') and isinstance(value, list):
+            result[key] = process_fields(value, busy=key == 'busy')
+        elif key == 'stuckUnmount' and type(value) is bool:
+            result[key] = value
+        elif key == 'sampling' and value in ('full', 'partial'):
+            result[key] = value
+        elif key == 'failure' and value in ('timeout', 'exit', 'parse', 'unavailable'):
+            result[key] = value
+        elif key == 'mountPoint' and isinstance(value, str):
+            result[key] = '[redacted]' if SECRET.search(value) else ''.join(
+                c if c.isprintable() else ' ' for c in value[:300])
     return result
 
 
@@ -164,18 +194,13 @@ def memory_fields(values, event):
 
 
 def safe_fields(values, event=None):
+    if event == 'proc.disk_wait':
+        return disk_wait_fields(values)
     if event in ('memory.sample', 'memory.alert'):
         return memory_fields(values, event)
     result = {}
     for key, value in (values or {}).items():
-        if event == 'proc.disk_wait' and key == 'procs' and isinstance(value, list):
-            result[key] = process_fields(value)
-        elif event == 'proc.disk_wait' and key == 'stuckUnmount' and type(value) is bool:
-            result[key] = value
-        elif event == 'proc.disk_wait' and key == 'mountPoint' and isinstance(value, str):
-            result[key] = '[redacted]' if SECRET.search(value) else ''.join(
-                c if c.isprintable() else ' ' for c in value[:300])
-        elif key == 'lockHolderCmd' and backup_command(value):
+        if key == 'lockHolderCmd' and backup_command(value):
             result[key] = value
         elif key in ('trigger', 'lockHolderTrigger') and value in ('launchd', 'manual', 'installer', 'unknown', 'agent'):
             if key != 'trigger' or value != 'agent':
