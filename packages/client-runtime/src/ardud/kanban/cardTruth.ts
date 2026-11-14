@@ -110,11 +110,19 @@ function untilLabel(untilIso: string, nowMs: number, timeZone?: string): string 
   return clock === time ? time : `${clock} ${time}`;
 }
 
+export function waitCardLabel(wait: KanbanWait, state: KanbanBoardState): string | null {
+  const hint = wait.cardTarget?.id === wait.card ? wait.cardTarget : undefined;
+  const target = (wait.card === null ? undefined : state.cards.get(wait.card)) ?? hint;
+  if (target == null) return null;
+  const boardName = target.boardId === state.board.id ? null : (hint?.boardName ?? target.boardId);
+  return `#${target.number}${boardName === null ? "" : ` (${boardName})`}`;
+}
+
 function waitLabel(
   on: KanbanWaitKind,
   detail: {
     readonly pr: string | null;
-    readonly cardNumber: number | null;
+    readonly cardLabel: string | null;
     readonly until: string | null;
     readonly ask: string | null;
     readonly script?: string | null;
@@ -134,9 +142,7 @@ function waitLabel(
         ? "Held for the owner's go"
         : `Held for the owner's go (${detail.ask})`;
     case "card":
-      return detail.cardNumber === null
-        ? "Held for another card"
-        : `Held for #${detail.cardNumber}`;
+      return detail.cardLabel === null ? "Held for another card" : `Held for ${detail.cardLabel}`;
     case "time":
       return detail.until === null
         ? "Held for a recheck"
@@ -164,12 +170,11 @@ function fromWait(
   nowMs: number,
   timeZone?: string,
 ): CardTruth {
-  const target = wait.card === null ? undefined : state.cards.get(wait.card);
   const label = waitLabel(
     wait.on,
     {
       pr: wait.pr,
-      cardNumber: target?.number ?? null,
+      cardLabel: waitCardLabel(wait, state),
       until: wait.until,
       ask: wait.ask,
       script: wait.script,
@@ -202,7 +207,12 @@ function fromGuess(
 ): CardTruth {
   const label = waitLabel(
     guess.on,
-    { pr: null, cardNumber: guess.cardNumber, until: null, ask: null },
+    {
+      pr: null,
+      cardLabel: guess.cardNumber === null ? null : `#${guess.cardNumber}`,
+      until: null,
+      ask: null,
+    },
     nowMs,
     timeZone,
   );

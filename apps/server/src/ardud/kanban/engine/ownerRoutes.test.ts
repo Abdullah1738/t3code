@@ -61,6 +61,7 @@ const OWNER_WRITES: ReadonlySet<string> = new Set([
   "POST /cards/:card/asks/:ask/reply",
   "POST /cards/:card/asks/:ask/hand",
   "POST /cards/:card/asks/:ask/snooze",
+  "POST /cards/:card/asks/:ask/seen",
   "POST /asks/answer",
   "POST /asks/hand",
   "POST /asks/snooze",

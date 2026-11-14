@@ -588,6 +588,94 @@ describe("inferGate", () => {
   ] as const)("%s → %s", (text, gate) => expect(inferGate(text)).toBe(gate));
 });
 
+describe("price and resource-release wording", () => {
+  it.each([
+    ...["$0.28", "€5", "£12", "$ 5"].map((amount) => `Approve ${amount} total`),
+    ...["USD", "AED", "EUR", "GBP", "dirham", "dirhams", "dollar", "dollars"].flatMap(
+      (currency) => [
+        `Approve ${currency} 45 order`,
+        `Approve 12 ${currency}`,
+        `Approve 0.02 ${currency}/min`,
+        `Approve ${currency}0.28 total`,
+      ],
+    ),
+    "spend up to $5",
+    "Approve spending on probes",
+    "The sessions are billed per minute",
+    "Approve billing for the probes",
+  ])("recognizes money: %s", (text) => expect(inferGate(text)).toBe("money"));
+
+  it.each([
+    "no spend, dry run only",
+    "No spending",
+    "No billing",
+    "Without paying",
+    "No $5 payment",
+    "Without AED 45",
+    "No 12 USD",
+    "Prepare a cost study",
+    "Note the session minutes on the card",
+    "Note USD rates and 7 session minutes",
+    "Record 12 USDT",
+  ])("keeps harmless wording ungated: %s", (text) => expect(inferGate(text)).toBeUndefined());
+
+  it.each(
+    [
+      "session",
+      "sessions",
+      "emulator",
+      "emulators",
+      "sim",
+      "sims",
+      "simulator",
+      "simulators",
+      "box",
+      "boxes",
+      "device",
+      "devices",
+      "phone",
+      "phones",
+      "hold",
+      "holds",
+      "lock",
+      "locks",
+      "slot",
+      "slots",
+    ].flatMap((resource) =>
+      ["both", "them", "each", "all", "it"].flatMap((reference) =>
+        ["", " when done", ` ${resource}`, ` ${resource} when done`].map(
+          (suffix) => `Use the ${resource}, then release ${reference}${suffix}`,
+        ),
+      ),
+    ),
+  )("recognizes a resource reference: %s", (text) => expect(inferGate(text)).toBeUndefined());
+
+  it.each([
+    "Release v0.1.12 to both clients",
+    "Build it, then release them",
+    ...["both", "them", "each", "all", "it"].flatMap((reference) => [
+      `Release ${reference}`,
+      `Release ${reference} when done`,
+      `Release ${reference} sessions`,
+      `Release ${reference}, then use two sessions`,
+      `Use two sessions, then release ${reference} to production`,
+      `Use two sessions, then release ${reference} apps`,
+      `Use two sessions, then release ${reference} sessions software`,
+    ]),
+    "Use two sessions and release both; release v0.1.12",
+  ])("preserves deploy wording: %s", (text) => expect(inferGate(text)).toBe("deploy"));
+
+  it("recognizes the reported resource cleanup", () => {
+    expect(inferGate("Create two sessions and release both")).toBeUndefined();
+  });
+
+  it.each(["evaluator", "script"] as const)("keeps minutes ungated for %s steps", (owner) => {
+    expect(
+      gateOf({ owner, text: "Note the session minutes on the card" }, ["money", "deploy"]),
+    ).toBeUndefined();
+  });
+});
+
 describe("board gate guessing", () => {
   const cases = [
     ["Tag the main-dev tip and dev-deploy it", "deploy"],

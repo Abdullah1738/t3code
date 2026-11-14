@@ -28,6 +28,7 @@ import * as ThreadManagementService from "../../../orchestration-v2/ThreadManage
 import type { EvaluatorPurpose } from "../engine/briefs.ts";
 import { modelSelectionResult } from "../engine/defaults.ts";
 import * as Asks from "../engine/asks.ts";
+import { askGateWarning } from "../engine/subtasks.ts";
 import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
 import { cardMatches, isCardNumber } from "../engine/cardSearch.ts";
 import { textProblem } from "../engine/text.ts";
@@ -595,10 +596,27 @@ const handlers = {
               Effect.catchTags({ KanbanError: () => Effect.succeed(null) }),
             )
           : null;
+        const dependencyBoard =
+          dependency !== null && dependency.boardId !== card.boardId
+            ? ((yield* service.boards).find((board) => board.id === dependency.boardId)?.name ??
+              dependency.boardId)
+            : undefined;
+        const waitTargets =
+          dependency === null
+            ? undefined
+            : new Map([
+                [
+                  dependency.id as string,
+                  {
+                    ...dependency,
+                    ...(dependencyBoard === undefined ? {} : { boardName: dependencyBoard }),
+                  },
+                ],
+              ]);
         const waitMessage =
           card.wait !== undefined &&
           (moved.stage !== card.stage || moved.movedAt !== card.movedAt || moved.wait === undefined)
-            ? `Wait ${waitingFor(card.wait, dependency === null ? undefined : new Map([[dependency.id as string, dependency]]))} ${
+            ? `Wait ${waitingFor(card.wait, waitTargets)} ${
                 moved.wait === undefined
                   ? "cleared by this move; set it again with card_wait or pass keepWait"
                   : "kept"
@@ -640,9 +658,11 @@ const handlers = {
         // The newest ask is the one just added.
         const ask = asked.asks.at(-1);
         const warning = ask ? Asks.approvalWarning(asked, ask, board.guessedGates) : undefined;
+        const note = ask && askGateWarning(asked, ask, board.guessedGates);
         return {
           card: Asks.askSummary(asked, ask?.id ?? ""),
           ...(warning === undefined ? {} : { warning }),
+          ...(note === undefined ? {} : { note }),
         };
       }),
     ),
