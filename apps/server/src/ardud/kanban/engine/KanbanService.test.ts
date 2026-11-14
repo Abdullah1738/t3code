@@ -640,6 +640,90 @@ it.effect(
     }),
 );
 
+it.effect("attributes history reads on a seeded board", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const events: AnalyticsEvent[] = [];
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const template = yield* kanban.createCard(board.id, { title: "Seed", prompt: "Seed" }, owner);
+      const at = template.createdAt;
+      yield* sql.withTransaction(
+        Effect.forEach(
+          Array.from({ length: 500 }, (_, i) => i),
+          (i) =>
+            Effect.gen(function* () {
+              const id = KanbanCardId.make(`history-${i}`);
+              const threadId = ThreadId.make(`history-work-${i}`);
+              yield* store.putCard({
+                ...template,
+                id,
+                number: i + 2,
+                stage: "verified",
+                settledAt: at,
+                workThreadId: threadId,
+              });
+              for (const role of ["work", "evaluator"] as const) {
+                const tid = role === "work" ? threadId : ThreadId.make(`history-evaluator-${i}`);
+                yield* Ref.update(fake.threads, (all) =>
+                  new Map(all).set(tid, {
+                    title: "History",
+                    model: board.defaultCardModel,
+                    messages: [],
+                    running: false,
+                    archived: false,
+                  }),
+                );
+                yield* store.putThreadLink({
+                  threadId: tid,
+                  boardId: board.id,
+                  cardId: id,
+                  role,
+                  purpose: null,
+                  discussionId: null,
+                  model: board.defaultCardModel,
+                  startedAt: at,
+                  endedAt: role === "work" ? at : null,
+                  paused: null,
+                });
+              }
+            }),
+          { discard: true },
+        ),
+      );
+      events.length = 0;
+      yield* kanban.tick;
+      const phase = events.find(
+        (event) => event.kind === "kanban.tick_phase" && event.props?.phase === "thread_status",
+      )!;
+      const tick = events.find((event) => event.kind === "kanban.tick")!;
+      yield* Effect.logInfo("SEEDED_TICK", { phase: phase.props, tick: tick.props });
+      assert.isDefined(phase.props?.byRead);
+      assert.isDefined(phase.props?.byStep);
+      assert.equal(
+        Object.values(phase.props!.byRead!).reduce((sum, row) => sum + row.count, 0),
+        phase.props?.count,
+      );
+      yield* decodeAnalyticsEvent(phase);
+    }).pipe(
+      Effect.provide(
+        testLayer(fake.layer).pipe(
+          Layer.provide(
+            Layer.mock(Analytics.Analytics)({
+              record: (event) =>
+                Effect.sync(() => {
+                  events.push(event);
+                }),
+            }),
+          ),
+        ),
+      ),
+    );
+  }),
+);
+
 it.effect("records tick queues and phases during overlaps without blocking local waits", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

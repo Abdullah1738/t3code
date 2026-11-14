@@ -1884,8 +1884,8 @@ const make = Effect.gen(function* () {
           ),
     );
   const threadRead = <A, E, R>(read: string, threadId: string, effect: Effect.Effect<A, E, R>) =>
-    TickTimings.measure(
-      "thread_status",
+    TickTimings.threadRead(
+      read,
       replayReads
         ? locks.outsideRead(`${read}:${threadId}`, () => threadFences.get(threadId) ?? 0, effect)
         : locks.outside(effect, undefined, true),
@@ -2126,8 +2126,8 @@ const make = Effect.gen(function* () {
   const threads: typeof threadIo = {
     claimContext: (id) => threadRead("claimContext", id, threadIo.claimContext(id)),
     pendingUserInputs: (id) =>
-      TickTimings.measure(
-        "thread_status",
+      TickTimings.threadRead(
+        "pendingUserInputs",
         locks.outside(threadIo.pendingUserInputs(id), undefined, true),
       ),
     queuedRuns: (id) => locks.outside(threadIo.queuedRuns(id), undefined, true),
@@ -2140,8 +2140,8 @@ const make = Effect.gen(function* () {
     latestRun: (id) => threadRead("latestRun", id, threadIo.latestRun(id)),
     compactRun: (id, run) => locks.outside(touching(id, threadIo.compactRun(id, run))),
     runSettled: (id, run) =>
-      TickTimings.measure(
-        "thread_status",
+      TickTimings.threadRead(
+        "runSettled",
         locks.outside(threadIo.runSettled(id, run), undefined, true),
       ),
     launch: (input) =>
@@ -9720,6 +9720,7 @@ const make = Effect.gen(function* () {
             ? "dependency_checks"
             : "card_evaluation",
       locks.step(effect, cardId, `KanbanService.tickStep:${step}`).pipe(
+        Effect.provideService(TickTimings.step, step),
         Effect.map(Option.some),
         Effect.catchDefect((defect) =>
           Effect.gen(function* () {
@@ -10799,7 +10800,9 @@ const make = Effect.gen(function* () {
               // Most open links are idle reusable evaluators or card workers.
               // Plan before taking the gate; only an ask or cleanup needs a step
               // and its fresh link/thread checks. Never cache this across ticks.
-              const planned = yield* planFind(initial.threadId);
+              const planned = yield* planFind(initial.threadId).pipe(
+                Effect.provideService(TickTimings.step, "evaluatorStatusPlan"),
+              );
               if (Option.isNone(planned)) continue;
               const view = planned.value;
               const asked = (yield* Ref.get(statusAsked)).get(initial.threadId);
@@ -11502,7 +11505,9 @@ const make = Effect.gen(function* () {
       Effect.andThen(
         busy
           ? Effect.suspend(() => (kicks.asked ? kick : Effect.void))
-          : dispatchUnlocked(boardId, kicks.stoppedCards),
+          : dispatchUnlocked(boardId, kicks.stoppedCards).pipe(
+              Effect.provideService(TickTimings.step, "dispatch"),
+            ),
       ),
       Effect.onExit((exit) =>
         Effect.suspend(() => (Exit.isSuccess(exit) || !kicks.asked ? Effect.void : kick)),
@@ -11517,7 +11522,14 @@ const make = Effect.gen(function* () {
               kind: "kanban.tick_phase",
               boardId,
               durationMs: phase.durationMs,
-              props: { tickId, phase: phase.phase, count: phase.count },
+              props: {
+                tickId,
+                phase: phase.phase,
+                count: phase.count,
+                ...(phase.phase === "thread_status"
+                  ? { byRead: summary.byRead, byStep: summary.byStep }
+                  : {}),
+              },
             });
           yield* recordAnalytics({
             kind: "kanban.tick",
