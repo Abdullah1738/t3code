@@ -1,3 +1,5 @@
+import * as DateTime from "effect/DateTime";
+import * as Schema from "effect/Schema";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -13,6 +15,13 @@ const RECHECK_MS = 15_000;
 const MAX_RECHECK_MS = 60_000;
 const PASS_MS = 10_000;
 const MAX_LOAD_HOLD_MS = 20 * 60_000;
+// Allow the full load hold plus ten minutes for admission, but never let an
+// old restart registration silently block a new resume for hours.
+export const RESTART_ADMISSION_TIMEOUT_MS = 30 * 60_000;
+export class RestartAdmissionTimeoutError extends Schema.TaggedError<RestartAdmissionTimeoutError>()(
+  "RestartAdmissionTimeoutError",
+  { deadline: Schema.DateTimeUtc },
+) {}
 
 export class RestartLoad extends Context.Reference<() => number>("t3/ardud/RestartLoad", {
   defaultValue: makeRestartLoad,
@@ -25,9 +34,11 @@ export class RestartPacing extends Context.Service<
       threadId: ThreadId,
       runId: RunId,
       effectId?: string,
-    ) => Effect.Effect<number, RestartPacingStateError>;
+    ) => Effect.Effect<number, RestartPacingStateError | RestartAdmissionTimeoutError>;
     readonly register: (source: RestartSource) => Effect.Effect<void, RestartPacingStateError>;
-    readonly acquire: (source: RestartSource) => Effect.Effect<number, RestartPacingStateError>;
+    readonly acquire: (
+      source: RestartSource,
+    ) => Effect.Effect<number, RestartPacingStateError | RestartAdmissionTimeoutError>;
     readonly dispatched: (source: RestartSource) => Effect.Effect<void, RestartPacingStateError>;
   }
 >()("t3/ardud/restart-pacing/RestartPacing") {}
@@ -46,6 +57,7 @@ const make = Effect.gen(function* () {
   const pending = new Map<
     string,
     RestartSource & {
+      registeredAt: number;
       priority: number;
       activityAt: number;
       loadHoldMs: number;
@@ -59,7 +71,13 @@ const make = Effect.gen(function* () {
   // across pruning until a replacement effect registers it again.
   const requeuedHolds = new Map<
     string,
-    { loadHoldMs: number; checkedAt: number; wasLoaded: boolean }
+    {
+      registeredAt: number;
+      loadHoldMs: number;
+      checkedAt: number;
+      wasLoaded: boolean;
+      expiredEffectId?: string;
+    }
   >();
   const active = new Map<string, { source: RestartSource; dispatching: boolean }>();
   let lastStartAt: number | undefined;
@@ -83,14 +101,20 @@ const make = Effect.gen(function* () {
     }
     if (active.has(key(source))) return;
     const description = yield* state.describe(source);
+    const retained = requeuedHolds.get(key(source));
+    const hold =
+      retained?.expiredEffectId !== undefined && retained.expiredEffectId !== source.effectId
+        ? undefined
+        : retained;
     pending.set(key(source), {
       ...source,
       ...description,
+      registeredAt: yield* Clock.currentTimeMillis,
       loadHoldMs: 0,
       checkedAt: yield* Clock.currentTimeMillis,
       wasLoaded: false,
       retryMs: RECHECK_MS,
-      ...requeuedHolds.get(key(source)),
+      ...hold,
     });
     requeuedHolds.delete(key(source));
   });
@@ -141,6 +165,7 @@ const make = Effect.gen(function* () {
         if (!(yield* state.status(stale, null))) break;
         queue.shift();
         requeuedHolds.set(key(stale), {
+          registeredAt: stale.registeredAt,
           loadHoldMs: stale.loadHoldMs,
           checkedAt: stale.checkedAt,
           wasLoaded: stale.wasLoaded,
@@ -153,6 +178,25 @@ const make = Effect.gen(function* () {
       const entry = pending.get(key(source));
       if (entry === undefined) return 0;
       const position = queue.indexOf(entry) + 1;
+      if (now - entry.registeredAt >= RESTART_ADMISSION_TIMEOUT_MS) {
+        yield* state.status(source, null);
+        pending.delete(key(source));
+        // A failed expiry commit retries this effect immediately; a new resume
+        // gets its own allowance instead of inheriting the retired registration.
+        requeuedHolds.set(key(source), {
+          registeredAt: entry.registeredAt,
+          loadHoldMs: entry.loadHoldMs,
+          checkedAt: entry.checkedAt,
+          wasLoaded: entry.wasLoaded,
+          ...(source.effectId === undefined ? {} : { expiredEffectId: source.effectId }),
+        });
+        for (const [runKey, runSource] of runSources) {
+          if (key(runSource) === key(source)) runSources.delete(runKey);
+        }
+        return yield* new RestartAdmissionTimeoutError({
+          deadline: DateTime.makeUnsafe(entry.registeredAt + RESTART_ADMISSION_TIMEOUT_MS),
+        });
+      }
       if (
         position !== 1 ||
         active.size >= config.maxActive ||
@@ -171,8 +215,10 @@ const make = Effect.gen(function* () {
           });
         }
         const remainingHold = MAX_LOAD_HOLD_MS - entry.loadHoldMs;
-        const retryMs =
-          loaded && remainingHold > 0 ? Math.min(entry.retryMs, remainingHold) : entry.retryMs;
+        const retryMs = Math.min(
+          loaded && remainingHold > 0 ? Math.min(entry.retryMs, remainingHold) : entry.retryMs,
+          RESTART_ADMISSION_TIMEOUT_MS - (now - entry.registeredAt),
+        );
         entry.retryMs = Math.min(MAX_RECHECK_MS, retryMs * 2);
         return spacing > 0 && !loaded && position === 1 && active.size < config.maxActive
           ? Math.min(retryMs, spacing)

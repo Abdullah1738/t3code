@@ -837,13 +837,19 @@ export interface KanbanServiceShape {
   /** Runs dispatch for every board now. */
   readonly dispatchNow: Effect.Effect<void, KanbanError>;
   /** Handles a finished turn of a board thread now. */
-  readonly turnEnded: (threadId: ThreadId) => Effect.Effect<void, KanbanError>;
+  readonly turnEnded: (
+    threadId: ThreadId,
+    startTimeout?: StartTimeout,
+  ) => Effect.Effect<void, KanbanError>;
   /** Periodic upkeep: typing heartbeat, PR states, dispatch. */
   readonly tick: Effect.Effect<void, KanbanError>;
   /** Probes the models paused threads wait on and wakes them when one answers. */
   readonly probeOutages: Effect.Effect<void, KanbanError>;
   /** Queues a finished turn for the worker. */
-  readonly notifyTurnEnded: (threadId: ThreadId) => Effect.Effect<void>;
+  readonly notifyTurnEnded: (
+    threadId: ThreadId,
+    startTimeout?: StartTimeout,
+  ) => Effect.Effect<void>;
   /**
    * Something changed a thread (a run, a message, a request), from the board or
    * anywhere else: stale reruns read it again instead of replaying.
@@ -859,7 +865,13 @@ export class KanbanService extends Context.Service<KanbanService, KanbanServiceS
   "t3/ardud/kanban/engine/KanbanService",
 ) {}
 
-type Job = { readonly _tag: "kick" } | { readonly _tag: "turnEnd"; readonly threadId: ThreadId };
+interface StartTimeout {
+  readonly runId: string;
+  readonly reason: string;
+}
+type Job =
+  | { readonly _tag: "kick" }
+  | { readonly _tag: "turnEnd"; readonly threadId: ThreadId; readonly startTimeout?: StartTimeout };
 
 /** A slot a work thread keeps between cards (see `holds`). */
 interface Hold {
@@ -7643,10 +7655,11 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
     expectedFailedWorkRunId?: string,
     fromTick = false,
+    startTimeout?: StartTimeout,
   ) {
     yield* Effect.annotateCurrentSpan("kanban.thread_id", threadId);
     // The previous turn can end after the next assignment saves but before its wake lands.
-    if (waking(threadId)) {
+    if (waking(threadId) && startTimeout === undefined) {
       yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
       return;
     }
@@ -7655,6 +7668,44 @@ const make = Effect.gen(function* () {
     yield* Effect.annotateCurrentSpan("kanban.board_id", link.boardId);
     if (link.cardId !== null) yield* Effect.annotateCurrentSpan("kanban.card_id", link.cardId);
     const at = yield* nowIso;
+    // Queue promotion can already have replaced this failed run. Its deadline
+    // still belongs to cards on this thread, including cards with no pool slot.
+    if (startTimeout !== undefined) {
+      const ids =
+        link.role === "work"
+          ? yield* store.threadCards(threadId)
+          : link.cardId
+            ? [link.cardId]
+            : [];
+      for (const id of ids) {
+        const current = yield* store.card(id);
+        if (
+          current === null ||
+          current.stalled !== null ||
+          (current.activeThreadId !== null && current.activeThreadId !== threadId) ||
+          !(link.role === "work"
+            ? current.workThreadId === threadId && ["todo", "working"].includes(current.stage)
+            : link.role === "review" &&
+              current.reviewThreadId === threadId &&
+              ["needs_review", "in_review"].includes(current.stage))
+        )
+          continue;
+        const by: KanbanActor = { _tag: "system", component: "dispatcher" };
+        const reason = `Run failed: ${startTimeout.reason}`;
+        const next = releaseStalled(
+          { ...Retries.withoutRetries(current), stalled: { reason, by, at } },
+          at,
+        );
+        yield* logEvent(next, by, "flagged", {
+          fromStage: current.stage,
+          toStage: next.stage,
+          body: `${reason}\nRun: ${startTimeout.runId}`,
+        });
+        yield* saveCard(next);
+      }
+      yield* kick;
+      return;
+    }
     // Every board-thread turn end is announced, so the Threads view rereads the run
     // as finished even when the dispatcher leaves the card as it is (a worker that
     // moved to needs_owner, a one-shot evaluator, and so on).
@@ -8255,8 +8306,13 @@ const make = Effect.gen(function* () {
       });
   });
 
-  const turnEndedUnlocked = (threadId: ThreadId, runId?: string, retry = false) =>
-    serial(turnEnding, threadId, finishTurn(threadId, runId, retry)).pipe(
+  const turnEndedUnlocked = (
+    threadId: ThreadId,
+    runId?: string,
+    retry = false,
+    startTimeout?: StartTimeout,
+  ) =>
+    serial(turnEnding, threadId, finishTurn(threadId, runId, retry, startTimeout)).pipe(
       Effect.catchDefect((defect) =>
         Effect.gen(function* () {
           if (defect instanceof BoardLocks.BoardStateChanged)
@@ -13524,7 +13580,11 @@ const make = Effect.gen(function* () {
   }
 
   const runJob = (job: Job) =>
-    read(job._tag === "kick" ? dispatchUnlocked() : turnEndedUnlocked(job.threadId)).pipe(
+    read(
+      job._tag === "kick"
+        ? dispatchUnlocked()
+        : turnEndedUnlocked(job.threadId, undefined, false, job.startTimeout),
+    ).pipe(
       NodeSqliteClient.backgroundReads,
       Effect.catchCause((cause) =>
         Effect.logWarning("kanban job failed", { job: job._tag, cause }),
@@ -14065,12 +14125,17 @@ const make = Effect.gen(function* () {
     createForThread,
     nextCards,
     dispatchNow: read(dispatchUnlocked()).pipe(NodeSqliteClient.backgroundReads),
-    turnEnded: (threadId) => guard(turnEndedUnlocked(threadId)),
+    turnEnded: (threadId, startTimeout) =>
+      guard(turnEndedUnlocked(threadId, undefined, false, startTimeout)),
     tick: read(tickUnlocked()).pipe(NodeSqliteClient.backgroundReads),
     probeOutages: read(probeOutagesNow()),
     threadEvent: (threadId) => Effect.sync(() => touch(threadId)),
-    notifyTurnEnded: (threadId) =>
-      Queue.offer(jobs, { _tag: "turnEnd", threadId }).pipe(Effect.asVoid),
+    notifyTurnEnded: (threadId, startTimeout) =>
+      Queue.offer(jobs, {
+        _tag: "turnEnd",
+        threadId,
+        ...(startTimeout === undefined ? {} : { startTimeout }),
+      }).pipe(Effect.asVoid),
     notifyThreadChanged: (threadId) =>
       read(
         Effect.gen(function* () {

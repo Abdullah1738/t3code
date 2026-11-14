@@ -1,3 +1,8 @@
+import {
+  PROVIDER_START_CLEANUP_TIMEOUT_MS,
+  PROVIDER_START_TIMEOUT_MS,
+  withoutProviderStartDeadline,
+} from "./providerStartDeadlinePolicy.ts";
 import { isAutomaticClaudeRecovery } from "./launchRecovery.ts";
 import { isRecoveredQueueRun, markInstallLifecycle } from "../ardud/fast-install/report.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
@@ -310,10 +315,14 @@ export const layer: Layer.Layer<
           return yield* result.failure;
         }
         if (!(yield* incomingIsCurrent)) return;
-        yield* liveSession.interruptTurn({
-          providerThread: turnInput.providerThread,
-          providerTurnId: stale.providerTurnId,
-        });
+        yield* liveSession
+          .interruptTurn({
+            providerThread: turnInput.providerThread,
+            providerTurnId: stale.providerTurnId,
+            requestRuntimeRestart: false,
+            stopBackgroundWork: false,
+          })
+          .pipe(Effect.timeout(PROVIDER_START_CLEANUP_TIMEOUT_MS), Effect.mapError(readFailure));
         if (!(yield* incomingIsCurrent)) return;
         // Exactly one retry: another refusal belongs to normal start-failure handling.
         yield* start(turnInput);
@@ -719,6 +728,31 @@ export const layer: Layer.Layer<
         inheritedBackgroundTurnItems,
       });
       const { isCurrentAttemptInStatus } = runControls;
+
+      if (run.providerRestartCleanup?.completed === false) return;
+
+      const providerStartDeadlineAt =
+        run.providerStartDeadlineAt ??
+        DateTime.makeUnsafe(
+          DateTime.toEpochMillis(yield* DateTime.now) + PROVIDER_START_TIMEOUT_MS,
+        );
+      const admitted = yield* eventSink.writeIfRunCurrent({
+        threadId: projection.thread.id,
+        runId: run.id,
+        activeAttemptId: attempt.id,
+        expectedStatus: "starting",
+        events: [
+          {
+            id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+            type: "run.updated",
+            threadId: projection.thread.id,
+            runId: run.id,
+            occurredAt: yield* DateTime.now,
+            payload: { ...withoutProviderStartDeadline(run), providerStartDeadlineAt },
+          },
+        ],
+      });
+      if (!admitted.committed) return;
 
       const resolvedRuntimePolicy = yield* runtimePolicy.resolve({
         thread: projection.thread,
@@ -1477,6 +1511,7 @@ export const layer: Layer.Layer<
       };
       const runningRun: OrchestrationV2Run = {
         ...run,
+        providerStartDeadlineAt,
         status: "running",
         startedAt: now,
       };

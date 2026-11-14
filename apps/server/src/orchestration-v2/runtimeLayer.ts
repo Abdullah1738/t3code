@@ -1,7 +1,10 @@
+import * as RunStartDeadline from "./RunStartDeadline.ts";
 import * as DelegatedTaskProgressGuard from "./DelegatedTaskProgressGuard.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Layer from "effect/Layer";
+import * as Effect from "effect/Effect";
+import type { ThreadId } from "@t3tools/contracts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as OrchestrationCommandReceipts from "../persistence/OrchestrationCommandReceipts.ts";
 import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
@@ -47,6 +50,11 @@ import * as RestartPacing from "../ardud/restart-pacing/RestartPacing.ts";
 import * as RestartPacingState from "../ardud/restart-pacing/RestartPacingState.ts";
 import * as ControlStore from "../ardud/control/ControlStore.ts";
 import * as KanbanStore from "../ardud/kanban/store/KanbanStore.ts";
+import {
+  StartTimeoutQueueOwner,
+  StartTimeoutQueueOwnerError,
+} from "./providerStartDeadlinePolicy.ts";
+import * as BoardsDatabase from "../ardud/persistence/BoardsDatabase.ts";
 import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
@@ -242,6 +250,51 @@ const layerOrchestratorProvided = Orchestrator.layer.pipe(
       layerProviderSwitchServiceProvided,
       layerRunExecutionServiceProvided,
       ThreadForkService.layer,
+      Layer.effect(
+        StartTimeoutQueueOwner,
+        Effect.gen(function* () {
+          const boards = yield* KanbanStore.KanbanStore;
+          const boardSql = yield* BoardsDatabase.client;
+          const allowed = Effect.fn("StartTimeoutQueueOwner.check")(function* (threadId: ThreadId) {
+            const link = yield* boards.threadLink(threadId);
+            if (link?.role !== "work" && link?.role !== "review") return true;
+            const ids =
+              link.role === "work"
+                ? yield* boards.threadCards(threadId)
+                : link.cardId
+                  ? [link.cardId]
+                  : [];
+            for (const id of ids) {
+              const card = yield* boards.card(id);
+              if (
+                card !== null &&
+                (link.role === "work"
+                  ? card.workThreadId === threadId
+                  : card.reviewThreadId === threadId) &&
+                !["completed", "deployed", "verified"].includes(card.stage)
+              )
+                return true;
+            }
+            return false;
+          });
+          // The boards writer, rather than the core writer, excludes resets.
+          // Acquire it before the core promotion transaction and keep it until
+          // that commit completes; board operations dispatch outside their writes.
+          return Effect.fn("StartTimeoutQueueOwner.protect")(
+            function* (
+              threadId: ThreadId,
+              commit: Effect.Effect<void, StartTimeoutQueueOwnerError>,
+            ) {
+              yield* boardSql.withTransaction(
+                Effect.gen(function* () {
+                  if (yield* allowed(threadId)) yield* commit;
+                }),
+              );
+            },
+            Effect.mapError((cause) => new StartTimeoutQueueOwnerError({ cause })),
+          );
+        }),
+      ).pipe(Layer.provide(KanbanStore.layer)),
     ),
   ),
 );
@@ -396,6 +449,7 @@ export const layer = Layer.mergeAll(
   DelegatedTaskProgressGuard.layer.pipe(
     Layer.provide(Layer.mergeAll(layerOrchestratorProvided, layerThreadManagementProvided)),
   ),
+  RunStartDeadline.layer.pipe(Layer.provide(layerOrchestratorProvided)),
   layerEffectWorkerProvided,
   layerProviderSessionManagerProvided,
   layerProviderAuthServiceProvided,

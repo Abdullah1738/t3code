@@ -1,8 +1,15 @@
+import { PROVIDER_START_CLEANUP_TIMEOUT_MS } from "./providerStartDeadlinePolicy.ts";
+import * as Fiber from "effect/Fiber";
+import * as RestartPacing from "../ardud/restart-pacing/RestartPacing.ts";
 import { assert, it } from "@effect/vitest";
 import {
   CheckpointId,
   CheckpointScopeId,
   CommandId,
+  MessageId,
+  ProviderInstanceId,
+  standardModelSelection,
+  type OrchestrationV2Run,
   NodeId,
   ProviderSessionId,
   ProviderThreadId,
@@ -86,15 +93,72 @@ function restartEffect(
   };
 }
 
+it.effect("delivers deadline cleanup to the exact turn after its start effect settled", () =>
+  Effect.gen(function* () {
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const stopped: Array<
+      Parameters<ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"]>[0]
+    > = [];
+    const now = yield* DateTime.now;
+    const effect: EffectOutbox.OrchestrationEffectV2 = {
+      ...restartEffect(now, { type: "detach" }),
+      request: {
+        type: "provider-turn.interrupt",
+        startTimeout: true,
+        providerSessionId: oldSessionId,
+        providerThreadId,
+        providerTurnId,
+      },
+    };
+    const layer = layerExecutorFor({
+      events,
+      interrupt: (input) =>
+        Effect.sync(() => {
+          stopped.push(input);
+        }),
+    });
+    yield* (yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(Effect.provide(layer))).execute(
+      effect,
+    );
+    assert.lengthOf(stopped, 1);
+    assert.equal(stopped[0]?.providerTurnId, providerTurnId);
+    assert.isFalse(stopped[0]?.stopBackgroundWork);
+  }),
+);
+
 function layerExecutorFor(input: {
   readonly events: Ref.Ref<ReadonlyArray<string>>;
   readonly failFirstStart?: Ref.Ref<boolean>;
+  readonly restartInterrupt?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interruptAndAwaitTerminal"];
+  readonly detach?: ProviderSessionManager.ProviderSessionManagerV2["Service"]["detach"];
   readonly threads?: Partial<ThreadManagementService.ThreadManagementService["Service"]>;
   readonly continueAfterRestart?: boolean;
   readonly interrupt?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"];
   readonly rollback?: CheckpointRollbackService.CheckpointRollbackServiceV2Shape["execute"];
   readonly mcpRegistry?: Layer.Layer<McpSessionRegistry.McpSessionRegistry>;
+  readonly pacing?: Layer.Layer<RestartPacing.RestartPacing>;
+  readonly projections?: Partial<ProjectionStore.ProjectionStoreV2Shape>;
 }) {
+  let restartRun: OrchestrationV2Run = {
+    id: runId,
+    threadId,
+    ordinal: 1,
+    providerInstanceId: ProviderInstanceId.make("test"),
+    modelSelection: standardModelSelection({
+      instanceId: ProviderInstanceId.make("test"),
+      model: "test",
+    }),
+    providerThreadId,
+    userMessageId: MessageId.make("test-message"),
+    rootNodeId: NodeId.make("test-root"),
+    activeAttemptId: attemptId,
+    status: "starting",
+    requestedAt: DateTime.makeUnsafe(0),
+    startedAt: null,
+    completedAt: null,
+    checkpointId: null,
+    contextHandoffId: null,
+  };
   const record = (event: string) => Ref.update(input.events, (events) => [...events, event]);
   const layerDependencies = Layer.mergeAll(
     Layer.succeed(
@@ -102,12 +166,14 @@ function layerExecutorFor(input: {
       ProviderTurnControlService.ProviderTurnControlServiceV2.of({
         interrupt: input.interrupt ?? (() => Effect.void),
         steer: () => Effect.void,
-        interruptAndAwaitTerminal: (request) =>
-          record(
-            request.replacementProviderSessionId === undefined
-              ? "interrupt"
-              : `interrupt:${request.replacementProviderSessionId}`,
-          ),
+        interruptAndAwaitTerminal:
+          input.restartInterrupt ??
+          ((request) =>
+            record(
+              request.replacementProviderSessionId === undefined
+                ? "interrupt"
+                : `interrupt:${request.replacementProviderSessionId}`,
+            )),
       }),
     ),
     Layer.succeed(
@@ -123,7 +189,7 @@ function layerExecutorFor(input: {
         close: () => Effect.void,
         closeInstance: () => Effect.void,
         release: () => record("release"),
-        detach: () => record("detach"),
+        detach: input.detach ?? (() => record("detach")),
       }),
     ),
     Layer.succeed(
@@ -169,9 +235,24 @@ function layerExecutorFor(input: {
     Layer.provide(
       Layer.mergeAll(
         layerDependencies,
-        Layer.mock(EventSink.EventSinkV2)({}),
-        Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
-        RestartPacingTestkit.layer,
+        Layer.mock(EventSink.EventSinkV2)({
+          writeIfRunCurrent: (input) =>
+            Effect.sync(() => {
+              if (
+                restartRun.activeAttemptId !== input.activeAttemptId ||
+                restartRun.status !== input.expectedStatus
+              )
+                return { committed: false, storedEvents: [] };
+              for (const event of input.events)
+                if (event.type === "run.updated") restartRun = event.payload;
+              return { committed: true, storedEvents: [] };
+            }),
+        }),
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getThreadRecords: () => Effect.sync(() => ({ runs: [restartRun] }) as never),
+          ...input.projections,
+        }),
+        input.pacing ?? RestartPacingTestkit.layer,
         input.mcpRegistry ?? McpSessionRegistryTestkit.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)(input.threads ?? {}),
         ServerSettings.layerTest(
@@ -940,8 +1021,6 @@ it.effect("safely retries after replacement cleanup succeeds and start fails", (
       `interrupt:${replacementSessionId}`,
       "detach",
       "start",
-      `interrupt:${replacementSessionId}`,
-      "detach",
       "start",
     ]);
   }),
@@ -1057,4 +1136,124 @@ it.effect.each(["confirmed", "unconfirmed", "failed"] as const)(
         outcome === "confirmed" ? ["stop-child", "settle-child"] : ["stop-child"],
       );
     }),
+);
+
+it.effect.each([
+  "provider-turn.start",
+  "provider-runtime.continue",
+  "queued continuation",
+  "held queued continuation",
+] as const)("settles an expired restart admission for %s without offering native work", (type) =>
+  Effect.gen(function* () {
+    const queued = type === "queued continuation" || type === "held queued continuation";
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const commands: Parameters<
+      ThreadManagementService.ThreadManagementService["Service"]["dispatch"]
+    >[0][] = [];
+    const now = yield* DateTime.now;
+    const base = restartEffect(now, { type: "detach" });
+    const effect = {
+      ...base,
+      request:
+        type === "provider-turn.start"
+          ? { type, runId }
+          : {
+              type: "provider-runtime.continue" as const,
+              sourceRunId: runId,
+              ...(queued ? { queued: true } : {}),
+            },
+    };
+    const layer = layerExecutorFor({
+      events,
+      pacing: Layer.mock(RestartPacing.RestartPacing)({
+        acquireRun: () =>
+          Effect.fail(new RestartPacing.RestartAdmissionTimeoutError({ deadline: now })),
+        acquire: () =>
+          Effect.fail(new RestartPacing.RestartAdmissionTimeoutError({ deadline: now })),
+        dispatched: () => Effect.void,
+      }),
+      projections: {
+        getThreadRecords: () =>
+          Effect.succeed({
+            runs: [
+              {
+                id: runId,
+                activeAttemptId: attemptId,
+                status: queued ? "queued" : "starting",
+                queueHeld: type === "held queued continuation",
+              },
+            ],
+          } as never),
+      },
+      threads: {
+        dispatch: (command) =>
+          Effect.sync(() => {
+            commands.push(command);
+            return { sequence: 0, storedEvents: [] };
+          }),
+        recoverDelegatedTask: () =>
+          Ref.update(events, (events) => [...events, "recover-delegation"]),
+      },
+    });
+    yield* (yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(Effect.provide(layer))).execute(
+      effect,
+    );
+    assert.deepEqual(
+      yield* Ref.get(events),
+      type !== "provider-runtime.continue" ? [] : ["recover-delegation"],
+    );
+    if (type !== "provider-runtime.continue" && type !== "held queued continuation")
+      assert.deepEqual(commands, [
+        {
+          type: "run.start-expire",
+          phase: "restart_admission",
+          commandId: CommandId.make(
+            `${effect.id}:${type === "queued continuation" ? "queued-admission-expired" : "admission-expired"}`,
+          ),
+          threadId,
+          runId,
+          expectedAttemptId: attemptId,
+          deadline: now,
+        },
+      ]);
+    else assert.deepEqual(commands, []);
+  }),
+);
+
+it.effect.each(["interrupt", "detach"] as const)(
+  "bounds the compound restart before native admission when %s never answers",
+  (stage) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const events = yield* Ref.make<ReadonlyArray<string>>([]);
+      const expired: Array<
+        Parameters<ThreadManagementService.ThreadManagementService["Service"]["dispatch"]>[0]
+      > = [];
+      const layer = layerExecutorFor({
+        events,
+        restartInterrupt: () =>
+          stage === "interrupt"
+            ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+            : Effect.void,
+        detach: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        threads: {
+          dispatch: (command) =>
+            Effect.sync(() => {
+              expired.push(command);
+              return { sequence: 1, storedEvents: [] };
+            }),
+        },
+      });
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(
+        Effect.provide(layer),
+      );
+      const execution = yield* executor
+        .execute(restartEffect(yield* DateTime.now, { type: "detach" }))
+        .pipe(Effect.result, Effect.forkScoped);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(PROVIDER_START_CLEANUP_TIMEOUT_MS);
+      assert.equal((yield* Fiber.join(execution))._tag, "Failure");
+      assert.deepEqual(yield* Ref.get(events), []);
+      assert.deepEqual(expired, []);
+    }).pipe(Effect.scoped),
 );

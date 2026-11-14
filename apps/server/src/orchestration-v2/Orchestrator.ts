@@ -1,3 +1,12 @@
+import * as NodeUtil from "node:util";
+import {
+  PROVIDER_START_TIMEOUT_CODE,
+  PROVIDER_START_TIMEOUT_MS,
+  withoutProviderStartDeadline,
+  providerStartAccepted,
+  StartTimeoutQueueOwner,
+  StartTimeoutQueueOwnerError,
+} from "./providerStartDeadlinePolicy.ts";
 import {
   claudeRecoveryResult,
   continuedLaunchRecovery,
@@ -533,6 +542,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "prepared-run.fail":
     case "prepared-run.retry":
     case "subagent.stop":
+    case "run.start-expire":
     case "run.interrupt":
     case "queued-message.promote-to-steer":
     case "queue.resume":
@@ -910,6 +920,7 @@ function lastDeliveredRunForProviderThread(
 }
 
 const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(function* () {
+  const startTimeoutQueueOwner = yield* StartTimeoutQueueOwner;
   const sql = yield* SqlClient.SqlClient;
   const checkpointService = yield* CheckpointServiceV2;
   const commandPolicy = yield* CommandPolicyV2;
@@ -1167,7 +1178,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     Effect.fnUntraced(function* (
       events: ReadonlyArray<Omit<OrchestrationV2DomainEvent, "id">>,
       effects: ReadonlyArray<PendingOrchestrationEffectV2> = [],
-      options: { readonly updateDelegatedCompletionOnly?: boolean } = {},
+      options: {
+        readonly updateDelegatedCompletionOnly?: boolean;
+      } = {},
     ) {
       const withIds = yield* Effect.forEach(events, (event) =>
         makeSystemEvent(event as Omit<OrchestrationV2DomainEvent, "id">),
@@ -1503,9 +1516,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           : machineInstance !== undefined && !resolveProviderInstanceEnabled(machineInstance);
       };
       const instanceDisabledForProject = disabledForProject(nextRun.providerInstanceId);
+      const startTimedOut =
+        latestRootProviderFailure(failedRun ?? null, projection.turnItems)?.code ===
+        PROVIDER_START_TIMEOUT_CODE;
       const failureHolds =
         failureClass !== undefined &&
         failureClass !== "validation_error" &&
+        latestRootProviderFailure(failedRun!, projection.turnItems)?.code !==
+          PROVIDER_START_TIMEOUT_CODE &&
         failedRun?.providerInstanceId === nextRun.providerInstanceId;
       // ardud: a context-reset note starts a fresh provider thread, so the
       // failure that ended the old one is no reason to hold it. It runs next;
@@ -1889,7 +1907,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         updatedAt: now,
       };
       const startingRun: OrchestrationV2Run = {
-        ...queuedRun,
+        ...withoutProviderStartDeadline(queuedRun),
         providerThreadId: queuedProviderThread.id,
         ordinal,
         status: "starting",
@@ -2009,7 +2027,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           session.status !== "stopped" &&
           session.status !== "error",
       );
-      yield* writeSystemEvents(
+      const promote = writeSystemEvents(
         [
           ...(selectionChanged
             ? [
@@ -2219,6 +2237,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           },
         ],
       );
+      yield* startTimedOut
+        ? startTimeoutQueueOwner(
+            threadId,
+            promote.pipe(Effect.mapError((cause) => new StartTimeoutQueueOwnerError({ cause }))),
+          ).pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })))
+        : promote;
     },
     (effect, threadId, _options?) =>
       effect.pipe(Effect.catch((cause) => failQueuedRunStart(threadId, cause))),
@@ -4795,7 +4819,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ),
     );
     const restartedRun: OrchestrationV2Run = {
-      ...targetRun,
+      ...withoutProviderStartDeadline(targetRun),
+      providerRestartCleanup: {
+        providerSessionId,
+        providerThreadId: providerThread.id,
+        providerTurnId: providerTurn.id,
+        completed: false,
+        ...(restartSessionTransition?.type === "replace"
+          ? { replacementProviderSessionId: restartSessionTransition.replacementProviderSessionId }
+          : {}),
+      },
       providerInstanceId: input.modelSelection.instanceId,
       modelSelection: input.modelSelection,
       providerThreadId: restartProviderThread.id,
@@ -4962,6 +4995,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         threadId: input.command.threadId,
         request: {
           type: "provider-turn.restart",
+          expectedAttemptId: nextAttemptId,
           providerSessionId,
           providerThreadId: providerThread.id,
           providerTurnId: providerTurn.id,
@@ -9088,7 +9122,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   });
 
   const loadProjectionForCommand = <K extends ProjectionRecordField>(
-    command: OrchestrationV2Command,
+    command: OrchestrationV2ServerCommand,
     fields: ReadonlyArray<K>,
     filter?: ProjectionRecordFilter,
   ) =>
@@ -9365,6 +9399,187 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       occurredAt: now,
       payload: { ...state.run, status: "failed", completedAt: now },
     });
+  });
+
+  const startExpiryState = Effect.fn("Orchestrator.startExpiryState")(function* (
+    command: Extract<OrchestrationV2ServerCommand, { readonly type: "run.start-expire" }>,
+  ) {
+    const projection = yield* loadProjectionForCommand(command, [
+      "runs",
+      "attempts",
+      "nodes",
+      "providerTurns",
+      "turnItems",
+      "providerThreads",
+    ]);
+    const run = projection.runs.find((run) => run.id === command.runId);
+    if (
+      run === undefined ||
+      (run.status !== "starting" &&
+        run.status !== "running" &&
+        !(
+          command.phase === "restart_admission" &&
+          run.status === "queued" &&
+          run.queueHeld !== true
+        )) ||
+      run.activeAttemptId !== command.expectedAttemptId ||
+      (command.phase === "provider" &&
+        (run.providerRestartCleanup?.completed === false ||
+          run.providerStartDeadlineAt === undefined ||
+          DateTime.toEpochMillis(run.providerStartDeadlineAt) !==
+            DateTime.toEpochMillis(command.deadline))) ||
+      (command.phase === "restart_admission" &&
+        ((run.status !== "starting" && run.status !== "queued") ||
+          run.providerRestartCleanup !== undefined ||
+          run.providerStartDeadlineAt !== undefined)) ||
+      (command.phase === "restart_cleanup" &&
+        (run.status !== "starting" ||
+          run.providerRestartCleanup?.completed !== false ||
+          run.providerStartDeadlineAt === undefined ||
+          DateTime.toEpochMillis(run.providerStartDeadlineAt) !==
+            DateTime.toEpochMillis(command.deadline))) ||
+      DateTime.toEpochMillis(yield* DateTime.now) < DateTime.toEpochMillis(command.deadline) ||
+      (command.phase !== "restart_cleanup" &&
+        providerStartAccepted(run, projection.providerTurns, projection.turnItems))
+    )
+      return;
+    return { projection, run };
+  });
+
+  const startExpiryCleanupTargets = (
+    projection: Pick<OrchestrationV2ThreadProjection, "providerTurns" | "providerThreads">,
+    run: OrchestrationV2Run,
+  ) => {
+    const targets: Array<
+      Omit<NonNullable<OrchestrationV2Run["providerRestartCleanup"]>, "completed">
+    > = projection.providerTurns.flatMap((turn) => {
+      if (run.activeAttemptId === null || turn.runAttemptId !== run.activeAttemptId) return [];
+      const owner = projection.providerThreads.find(
+        (thread) => thread.id === turn.providerThreadId,
+      );
+      return owner?.providerSessionId == null
+        ? []
+        : [
+            {
+              providerTurnId: turn.id,
+              providerThreadId: owner.id,
+              providerSessionId: owner.providerSessionId,
+            },
+          ];
+    });
+    if (run.providerRestartCleanup?.completed === false) {
+      const { completed: _completed, ...target } = run.providerRestartCleanup;
+      if (!targets.some((existing) => existing.providerTurnId === target.providerTurnId))
+        targets.push(target);
+    }
+    return targets;
+  };
+
+  const dispatchRunStartExpire = Effect.fn("Orchestrator.dispatchRunStartExpire")(function* (
+    command: Extract<OrchestrationV2ServerCommand, { readonly type: "run.start-expire" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+  ) {
+    const state = yield* startExpiryState(command);
+    if (state === undefined) return;
+    const { projection, run } = state;
+    const now = yield* DateTime.now;
+    const emitEvent = emit(events, command);
+    const message =
+      command.phase === "restart_admission"
+        ? "The restart admission queue never released this run (waited 30 min)."
+        : command.phase === "restart_cleanup"
+          ? "Provider restart cleanup did not finish (waited 30 sec). The replacement was not sent."
+          : `The provider never started this run (waited ${PROVIDER_START_TIMEOUT_MS / 60_000} min).`;
+    for (const turn of projection.providerTurns.filter(
+      (turn) => run.activeAttemptId !== null && turn.runAttemptId === run.activeAttemptId,
+    )) {
+      yield* emitEvent({
+        type: "provider-turn.updated",
+        threadId: command.threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: { ...turn, status: "failed", completedAt: now },
+      });
+    }
+    for (const target of startExpiryCleanupTargets(projection, run)) {
+      yield* Ref.update(effects, (current) => [
+        ...current,
+        {
+          id: `effect:${command.commandId}:start-timeout-stop:${target.providerTurnId}`,
+          commandId: command.commandId,
+          threadId: command.threadId,
+          request: {
+            type: "provider-turn.interrupt",
+            startTimeout: true,
+            ...target,
+          },
+        } satisfies PendingOrchestrationEffectV2,
+      ]);
+    }
+    for (const attempt of projection.attempts.filter(
+      (attempt) => attempt.id === run.activeAttemptId,
+    )) {
+      yield* emitEvent({
+        type: "run-attempt.updated",
+        threadId: command.threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: { ...attempt, status: "failed", completedAt: now },
+      });
+    }
+    for (const node of projection.nodes.filter((node) => node.id === run.rootNodeId)) {
+      yield* emitEvent({
+        type: "node.updated",
+        threadId: command.threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: { ...node, status: "failed", completedAt: now },
+      });
+    }
+    yield* emitEvent({
+      type: "turn-item.updated",
+      threadId: command.threadId,
+      runId: run.id,
+      occurredAt: now,
+      payload: {
+        id: idAllocator.derive.runSignalTurnItem({
+          runId: run.id,
+          signal: "provider-start-timeout",
+        }),
+        threadId: command.threadId,
+        runId: run.id,
+        nodeId: run.rootNodeId,
+        providerThreadId: run.providerThreadId,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: yield* nextTurnItemOrdinal(projection),
+        status: "failed",
+        type: "error",
+        title: "Provider did not start",
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        failure: makeProviderFailure({
+          class: "provider_error",
+          code: PROVIDER_START_TIMEOUT_CODE,
+          message,
+        }),
+      },
+    });
+    yield* emitEvent({
+      type: "run.updated",
+      threadId: command.threadId,
+      runId: run.id,
+      occurredAt: now,
+      payload: { ...run, status: "failed", completedAt: now },
+    });
+    return {
+      effectTypes: ["provider-turn.start", "provider-turn.restart"] as const,
+      runId: run.id,
+      reason: message,
+    };
   });
 
   const dispatchPreparedRunRetry = Effect.fn("Orchestrator.dispatchPreparedRunRetry")(function* (
@@ -12299,6 +12514,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
       readonly effects: ReadonlyArray<PendingOrchestrationEffectV2>;
       readonly cancelUnsettledEffects?: {
+        readonly runId?: RunId;
         readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
         readonly reason: string;
       };
@@ -12315,6 +12531,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const effects = yield* Ref.make<Array<PendingOrchestrationEffectV2>>([]);
     let cancelUnsettledEffects:
       | {
+          readonly runId?: RunId;
           readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
           readonly reason: string;
         }
@@ -12450,6 +12667,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "prepared-run.fail":
         yield* dispatchPreparedRunFail(command, events);
+        break;
+      case "run.start-expire":
+        cancelUnsettledEffects = yield* dispatchRunStartExpire(command, events, effects);
         break;
       case "prepared-run.retry":
         yield* dispatchPreparedRunRetry(command, events);
@@ -12785,6 +13005,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const plan = yield* dispatchOnce(command).pipe(
       Effect.flatMap((planned) =>
         planned.events.length > 0 ||
+        command.type === "run.start-expire" ||
         command.type === "thread.background-work.settle" ||
         command.type === "thread.stop" ||
         command.type === "subagent.stop"
@@ -12926,7 +13147,45 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const commitRecheck =
       command.type === "run.interrupt" && plannedStall?.type === "run.updated"
         ? recheckDelegatedTaskStall(command, plannedStall.payload)
-        : recheck;
+        : command.type === "run.start-expire"
+          ? Effect.gen(function* () {
+              const current = yield* startExpiryState(command);
+              const changed = new OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause:
+                  "The provider started or its cleanup target changed before the start deadline committed.",
+              });
+              if (current === undefined) return yield* changed;
+              const plannedStops = plan.effects
+                .flatMap((effect) =>
+                  effect.request.type === "provider-turn.interrupt" &&
+                  effect.request.startTimeout === true
+                    ? [
+                        [
+                          effect.request.providerTurnId,
+                          effect.request.providerThreadId,
+                          effect.request.providerSessionId,
+                          effect.request.replacementProviderSessionId ?? null,
+                        ] as const,
+                      ]
+                    : [],
+                )
+                .sort(([left], [right]) => left.localeCompare(right));
+              const currentStops = startExpiryCleanupTargets(current.projection, current.run)
+                .map(
+                  (target) =>
+                    [
+                      target.providerTurnId,
+                      target.providerThreadId,
+                      target.providerSessionId,
+                      target.replacementProviderSessionId ?? null,
+                    ] as const,
+                )
+                .sort(([left], [right]) => left.localeCompare(right));
+              if (!NodeUtil.isDeepStrictEqual(plannedStops, currentStops)) return yield* changed;
+            })
+          : recheck;
     const committed = yield* eventSink
       .commitCommand({
         commandId: command.commandId,

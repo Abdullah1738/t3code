@@ -773,3 +773,71 @@ it.effect("a failed post-dispatch read cannot leave an in-flight reservation for
     assert.equal(yield* pacing.acquire(source(2)), 0);
   }).pipe(Effect.provide(h.layer));
 });
+
+it.effect.each(["active capacity", "load"])(
+  "bounds a restart admission blocked by %s",
+  (holder) => {
+    const h = harness({ maxActive: 1, spacingMs: 0 });
+    const first = source(1);
+    const waiter = source(2);
+    h.runSources.set(first.sourceRunId, first);
+    h.runSources.set(waiter.sourceRunId, waiter);
+    h.running.add(first.sourceRunId);
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      assert.equal(yield* pacing.acquireRun(first.threadId, first.sourceRunId), 0);
+      if (holder === "load") {
+        h.running.clear();
+        h.setLoad(2);
+        yield* TestClock.adjust("10 seconds");
+      }
+      assert.isAbove(yield* pacing.acquireRun(waiter.threadId, waiter.sourceRunId), 0);
+      yield* TestClock.adjust(`${RestartPacing.RESTART_ADMISSION_TIMEOUT_MS} millis`);
+      const failure = yield* pacing
+        .acquireRun(waiter.threadId, waiter.sourceRunId)
+        .pipe(Effect.flip);
+      assert.instanceOf(failure, RestartPacing.RestartAdmissionTimeoutError);
+      assert.equal(h.positions.at(-1)?.position, null);
+      // A caller-requested fresh resume without a restart marker cannot inherit the retired registration.
+      h.runSources.delete(waiter.sourceRunId);
+      assert.equal(yield* pacing.acquireRun(waiter.threadId, waiter.sourceRunId), 0);
+    }).pipe(Effect.provide(h.layer));
+  },
+);
+
+it.effect(
+  "an expiry commit retry keeps its deadline but a new resume gets a fresh allowance",
+  () => {
+    const h = harness({ maxActive: 1, spacingMs: 0 });
+    const first = source(1);
+    const waiter = source(2);
+    h.running.add(first.sourceRunId);
+    h.runSources.set(first.sourceRunId, first);
+    h.runSources.set(waiter.sourceRunId, waiter);
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      yield* pacing.acquireRun(first.threadId, first.sourceRunId, "effect:first");
+      assert.isAbove(
+        yield* pacing.acquireRun(waiter.threadId, waiter.sourceRunId, "effect:waiter"),
+        0,
+      );
+      yield* TestClock.adjust(`${RestartPacing.RESTART_ADMISSION_TIMEOUT_MS} millis`);
+      assert.instanceOf(
+        yield* pacing
+          .acquireRun(waiter.threadId, waiter.sourceRunId, "effect:waiter")
+          .pipe(Effect.flip),
+        RestartPacing.RestartAdmissionTimeoutError,
+      );
+      assert.instanceOf(
+        yield* pacing
+          .acquireRun(waiter.threadId, waiter.sourceRunId, "effect:waiter")
+          .pipe(Effect.flip),
+        RestartPacing.RestartAdmissionTimeoutError,
+      );
+      assert.isAbove(
+        yield* pacing.acquireRun(waiter.threadId, waiter.sourceRunId, "effect:new-resume"),
+        0,
+      );
+    }).pipe(Effect.provide(h.layer));
+  },
+);

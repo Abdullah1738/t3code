@@ -487,6 +487,9 @@ export interface ClaudeAgentSdkQuerySession {
   readonly retryMcp?: Effect.Effect<void>;
   readonly messages: Stream.Stream<SDKMessage, ClaudeAgentSdkQueryRunnerError>;
   readonly offer: (message: SDKUserMessage) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
+  readonly cancelPendingPrompt?: (
+    uuid: string,
+  ) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly setModel: (model: string) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly applyFlagSettings: (
     settings: ClaudeFlagSettings,
@@ -845,6 +848,36 @@ const forkClaudeSessionInWorker = Effect.fn("forkClaudeSessionInWorker")(functio
   return yield* decodeClaudeHistoryFork(result.stdout);
 });
 
+export const cancelClaudePendingPrompt = Effect.fn("ClaudeAgentSdkQueryRunner.cancelPendingPrompt")(
+  function* (
+    queryRuntime: Pick<ClaudeQuery, "interrupt"> & {
+      readonly cancelAsyncMessage?: (uuid: string) => Promise<boolean>;
+    },
+    promptQueue: Queue.Queue<SDKUserMessage>,
+    uuid: string,
+  ) {
+    const pending = yield* Queue.takeAll(promptQueue);
+    yield* Queue.offerAll(
+      promptQueue,
+      pending.filter((message) => message.uuid !== uuid),
+    );
+    if (pending.some((message) => message.uuid === uuid)) return;
+    yield* Effect.tryPromise({
+      try: async () => {
+        // The pinned SDK implements this targeted control before its public
+        // Query declaration includes the method. Never clear other native input.
+        if (queryRuntime.cancelAsyncMessage === undefined)
+          throw new Error("Claude does not support cancelling the timed-out queued prompt.");
+        if (await queryRuntime.cancelAsyncMessage(uuid)) return;
+        const receipt = await queryRuntime.interrupt();
+        if (receipt?.still_queued.includes(uuid))
+          throw new Error("Claude did not cancel the timed-out queued prompt.");
+      },
+      catch: (cause) => queryRunnerError(cause, "cancelPendingPrompt"),
+    });
+  },
+);
+
 export const layerQueryRunner: Layer.Layer<
   ClaudeAgentSdkQueryRunner,
   never,
@@ -1102,6 +1135,7 @@ export const layerQueryRunner: Layer.Layer<
                 }),
               ),
             ),
+          cancelPendingPrompt: (uuid) => cancelClaudePendingPrompt(queryRuntime, promptQueue, uuid),
           setModel: (model) =>
             Effect.tryPromise({
               try: () => queryRuntime.setModel(model),
@@ -3530,6 +3564,7 @@ interface ActiveClaudeTurnContext {
   promptEcho: "pending" | "confirmed";
   promptStarted: boolean;
   promptAcceptedAt: DateTime.Utc | undefined;
+  preserveBackgroundWorkOnInterrupt?: boolean;
   nativeWakeStarted: boolean;
   gatedFramesBeforeEcho: number;
   readonly heldRootFrames: Array<SDKMessage>;
@@ -6681,7 +6716,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               });
             }
             input.context.compaction = null;
-            if (input.status !== "completed") {
+            if (
+              input.status !== "completed" &&
+              input.context.preserveBackgroundWorkOnInterrupt !== true
+            ) {
               const liveQuery = yield* Ref.get(queryContext);
               for (const [taskId, subagent] of yield* Ref.get(sessionSubagentsByTaskId)) {
                 if (
@@ -6711,6 +6749,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               [...(yield* Ref.get(sessionSubagentsByTaskId)).values()].flatMap((subagent) =>
                 subagent.task.status === "running" &&
                 (input.status === "completed" ||
+                  input.context.preserveBackgroundWorkOnInterrupt === true ||
                   (liveQuery !== null && subagent.task.runId !== input.context.input.runId)) &&
                 liveQuery?.subagentsFromEarlierProcesses.has(subagent) !== true
                   ? [subagent.childThreadId]
@@ -6871,7 +6910,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 const nativeThreadId =
                   input.context.input.providerThread.nativeThreadRef?.nativeId ?? null;
                 if (nativeThreadId !== null) {
-                  if (input.status !== "completed") {
+                  if (
+                    input.status !== "completed" &&
+                    input.context.preserveBackgroundWorkOnInterrupt !== true
+                  ) {
                     yield* clearPendingBackgroundTasksForNativeThread(nativeThreadId);
                     yield* clearNativeThreadTaskIdSet(
                       wakeEligibleBackgroundTasksByNativeThread,
@@ -6960,7 +7002,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           );
           if (input.status === "completed") {
             settledTurnByNativeThread.set(input.context.nativeThreadId, input.context);
-          } else {
+          } else if (input.context.preserveBackgroundWorkOnInterrupt !== true) {
             settledTurnByNativeThread.delete(input.context.nativeThreadId);
           }
           yield* Ref.update(interruptedTurns, (current) => {
@@ -10403,6 +10445,21 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               next.add(turnInput.providerTurnId);
               return next;
             });
+            currentTurn.preserveBackgroundWorkOnInterrupt = turnInput.stopBackgroundWork === false;
+            if (turnInput.stopBackgroundWork === false) {
+              yield* (
+                currentTurn.promptUuid !== null && existing.query.cancelPendingPrompt !== undefined
+                  ? existing.query.cancelPendingPrompt(currentTurn.promptUuid)
+                  : existing.query.interrupt
+              ).pipe(Effect.timeout(CLAUDE_INTERRUPT_SETTLE_TIMEOUT));
+              if ((yield* Ref.get(activeTurn)) === currentTurn)
+                yield* finalizeActiveTurn({
+                  context: currentTurn,
+                  status: "interrupted",
+                  completedAt: yield* DateTime.now,
+                });
+              return;
+            }
             existing.stopping = true;
             yield* existing.query.interrupt.pipe(
               Effect.timeout(CLAUDE_INTERRUPT_SETTLE_TIMEOUT),
@@ -10892,6 +10949,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             yield* interruptTurn({
               providerThread: runInput.providerThread,
               providerTurnId: current.providerTurnId,
+              ...(runInput.stopBackgroundWork === false ? { stopBackgroundWork: false } : {}),
             });
           }, turnControlLock.withPermits(1)),
           stopSubagent: Effect.fn("ClaudeAdapterV2.stopSubagent")(function* (input) {

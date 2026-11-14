@@ -581,6 +581,16 @@ export const OrchestrationV2Run = Schema.Struct({
   restartContinuationOfRunId: Schema.optional(RunId),
   delegatedTaskId: Schema.optional(NodeId),
   delegatedTaskStall: Schema.optional(OrchestrationV2DelegatedTaskStall),
+  providerStartDeadlineAt: Schema.optional(Schema.DateTimeUtc),
+  providerRestartCleanup: Schema.optional(
+    Schema.Struct({
+      providerSessionId: ProviderSessionId,
+      providerThreadId: ProviderThreadId,
+      providerTurnId: ProviderTurnId,
+      replacementProviderSessionId: Schema.optional(ProviderSessionId),
+      completed: Schema.Boolean,
+    }),
+  ),
   workStartedAt: Schema.optional(Schema.DateTimeUtc),
   lastActivityAt: Schema.optional(Schema.DateTimeUtc),
   restartCancelledBackgroundWork: Schema.optional(
@@ -2131,6 +2141,7 @@ export const OrchestrationV2RunJson = OrchestrationV2Run.mapFields((fields) => (
   requestedAt: Schema.DateTimeUtcFromString,
   startedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   completedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
+  providerStartDeadlineAt: Schema.optional(Schema.DateTimeUtcFromString),
   workStartedAt: Schema.optional(Schema.DateTimeUtcFromString),
   lastActivityAt: Schema.optional(Schema.DateTimeUtcFromString),
   // ardud: the restart work list is stored as JSON, so the child's start time is a string there.
@@ -3224,6 +3235,16 @@ export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
  * send them.
  */
 const OrchestrationV2InternalCommand = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("run.start-expire"),
+    phase: Schema.Literals(["provider", "restart_admission", "restart_cleanup"]),
+    commandId: CommandId,
+    threadId: ThreadId,
+    runId: RunId,
+    expectedAttemptId: Schema.NullOr(RunAttemptId),
+    deadline: Schema.DateTimeUtc,
+  }),
+
   Schema.Struct({
     type: Schema.Literal("queue.cutover-release"),
     commandId: CommandId,

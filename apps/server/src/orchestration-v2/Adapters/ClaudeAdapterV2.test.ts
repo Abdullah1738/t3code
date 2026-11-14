@@ -237,6 +237,56 @@ function makeClaudeTestTurnInput(input: {
 }
 
 describe("ClaudeAdapterV2 runtime query policy", () => {
+  it.effect.each(["local", "native", "retained"] as const)(
+    "cancels a timed-out queued prompt without closing the query, placement=%s",
+    (placement) =>
+      Effect.gen(function* () {
+        const queue = yield* Queue.unbounded<SDKUserMessage>();
+        const expired = "00000000-0000-4000-8000-000000000901";
+        const next = "00000000-0000-4000-8000-000000000902";
+        const prompt = (uuid: NonNullable<SDKUserMessage["uuid"]>): SDKUserMessage => ({
+          type: "user",
+          uuid,
+          session_id: "session",
+          parent_tool_use_id: null,
+          message: { role: "user", content: uuid ?? "" },
+        });
+        yield* Queue.offerAll(queue, [
+          ...(placement === "local" ? [prompt(expired)] : []),
+          prompt(next),
+        ]);
+        const requests: Array<unknown> = [];
+        const query = {
+          cancelAsyncMessage: async (uuid: string) => {
+            requests.push({ cancel: uuid });
+            return placement === "native";
+          },
+          interrupt: async () => {
+            requests.push("interrupt");
+            return {
+              still_queued: placement === "retained" ? [expired] : [],
+            };
+          },
+        };
+        const result = yield* ClaudeAdapterV2.cancelClaudePendingPrompt(query, queue, expired).pipe(
+          Effect.result,
+        );
+        assert.equal(result._tag, placement === "retained" ? "Failure" : "Success");
+        assert.deepEqual(
+          requests,
+          placement === "local"
+            ? []
+            : placement === "native"
+              ? [{ cancel: expired }]
+              : [{ cancel: expired }, "interrupt"],
+        );
+        assert.deepEqual(
+          (yield* Queue.takeAll(queue)).map((message) => message.uuid),
+          [next],
+        );
+      }),
+  );
+
   it("overrides fast options, SDK settings and launch flags with standard mode", () => {
     const options = ClaudeAdapterV2.makeClaudeQueryOptions({
       modelSelection: {
@@ -2980,6 +3030,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     });
 
   const makeWakeHarnessWithOptions = (options?: {
+    readonly cancelPendingPrompt?: (
+      uuid: string,
+    ) => Effect.Effect<void, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
     readonly close?: (sdkMessages: Queue.Queue<SDKMessage>) => Effect.Effect<void>;
     readonly interrupt?: Effect.Effect<void, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
     readonly offer?: (
@@ -3054,6 +3107,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         yield* Queue.unbounded<
           Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "plan.updated" }>
         >();
+      const providerTurnReceipts =
+        yield* Queue.unbounded<
+          Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "provider_turn.updated" }>
+        >();
       const providerThreadReceipts =
         yield* Queue.unbounded<
           Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "provider_thread.updated" }>
@@ -3122,6 +3179,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                   Effect.sync(() => {
                     offeredMessages.push(message);
                   }).pipe(Effect.andThen(options?.offer?.(message) ?? Effect.void)),
+                ...(options?.cancelPendingPrompt === undefined
+                  ? {}
+                  : { cancelPendingPrompt: options.cancelPendingPrompt }),
                 setModel: (model) =>
                   Effect.sync(() => {
                     liveSelectionChanges.push({ model });
@@ -3163,6 +3223,8 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         Stream.runForEach((event) =>
           Effect.gen(function* () {
             events.push(event);
+            if (event.type === "provider_turn.updated")
+              yield* Queue.offer(providerTurnReceipts, event);
             if (event.type === "provider_thread.updated") {
               yield* Queue.offer(providerThreadReceipts, event);
             }
@@ -3225,6 +3287,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         runtimeRequestReceipts,
         planReceipts,
         providerThreadReceipts,
+        providerTurnReceipts,
         getOpenedOptions: () => openedOptions,
         terminalEvents,
         hasPendingBackgroundWork,
@@ -10242,6 +10305,111 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         ),
       ),
     ),
+  );
+
+  it.effect.each(
+    ([false, true] as const).flatMap((nativeResult) =>
+      [false, true].map((pendingDelivery) => ({ nativeResult, pendingDelivery })),
+    ),
+  )(
+    "timeout cleanup preserves inherited Claude background work: $nativeResult/$pendingDelivery",
+    ({ nativeResult, pendingDelivery }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let closes = 0;
+          const cancelled: string[] = [];
+          let onCancel: (uuid: string) => Effect.Effect<void> = () => Effect.void;
+          let offers = 0;
+          const deliveryEntered = yield* Deferred.make<void>();
+          const harness = yield* makeWakeHarnessWithOptions({
+            offer: () =>
+              Effect.suspend(() =>
+                ++offers === 2 && pendingDelivery
+                  ? Deferred.succeed(deliveryEntered, undefined).pipe(Effect.andThen(Effect.never))
+                  : Effect.void,
+              ),
+            close: (sdkMessages) =>
+              Effect.sync(() => {
+                closes++;
+              }).pipe(Effect.andThen(Queue.shutdown(sdkMessages))),
+            cancelPendingPrompt: (uuid) =>
+              Effect.sync(() => {
+                cancelled.push(uuid);
+              }).pipe(Effect.andThen(Effect.suspend(() => onCancel(uuid)))),
+          });
+          if (nativeResult)
+            onCancel = (uuid) =>
+              harness.offerAndWait(
+                claudeSdkFrame({
+                  ...makeResultFrame({
+                    uuid: "00000000-0000-4000-8000-000000000905",
+                    result: "Interrupted",
+                  }),
+                  user_message_uuid: uuid,
+                }),
+              );
+          const now = yield* DateTime.now;
+          yield* harness.runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now,
+              attemptId: RunAttemptId.make("background-source"),
+              text: "Start background work",
+              attachments: [],
+            }),
+          );
+          yield* harness.offerAndWait(wakeTaskStarted);
+          yield* harness.offerAndWait(turnOneResult);
+          yield* Queue.take(harness.terminalReceipts);
+          assert.isTrue(yield* harness.hasPendingBackgroundWork);
+          const nextInput = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("unaccepted-input"),
+            text: "New input",
+            attachments: [],
+            providerTurnOrdinal: 2,
+          });
+          const delivery = yield* harness.runtime.startTurn(nextInput).pipe(Effect.forkScoped);
+          if (pendingDelivery) yield* Deferred.await(deliveryEntered);
+          else yield* Fiber.join(delivery);
+          let turn = yield* Queue.take(harness.providerTurnReceipts);
+          while (turn.providerTurn.ordinal !== 2)
+            turn = yield* Queue.take(harness.providerTurnReceipts);
+          assert.isDefined(turn);
+          if (turn?.type !== "provider_turn.updated") return;
+          assert.isUndefined(turn.providerTurn.promptAcceptedAt);
+          if (pendingDelivery) {
+            yield* Fiber.interrupt(delivery);
+            yield* harness.runtime.interruptStartingRun!({
+              providerThread: harness.providerThread,
+              runId: nextInput.runId,
+              attemptId: nextInput.attemptId,
+              stopBackgroundWork: false,
+            });
+          } else
+            yield* harness.runtime.interruptTurn({
+              providerThread: harness.providerThread,
+              providerTurnId: turn.providerTurn.id,
+              requestRuntimeRestart: false,
+              stopBackgroundWork: false,
+            });
+          const terminal = yield* Queue.take(harness.terminalReceipts);
+          assert.equal(terminal.providerTurnId, turn.providerTurn.id);
+          assert.equal(terminal.status, "interrupted");
+          assert.deepEqual(cancelled, [harness.promptUuid(1)]);
+          assert.equal(closes, 0);
+          assert.isTrue(yield* harness.hasPendingBackgroundWork);
+          yield* harness.offerAndWait(wakeNotification);
+          assert.equal(closes, 0);
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
   );
 
   it.effect("preserves settled background work until an explicit stop", () =>

@@ -1,3 +1,4 @@
+import * as RunStartDeadline from "./orchestration-v2/RunStartDeadline.ts";
 import * as ThreadRedaction from "./ardud/redaction/ThreadRedaction.ts";
 import * as ThreadCommandExecutor from "./orchestration-v2/ThreadCommandExecutor.ts";
 import { redactionRouteLayer } from "./ardud/redaction/http.ts";
@@ -613,6 +614,9 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ),
   layerThreadPullRequestWorker,
   DelegatedTaskAnalytics.layer,
+  Layer.effectDiscard(
+    Effect.flatMap(RunStartDeadline.RunStartDeadline, (service) => service.start()),
+  ),
   Layer.effectDiscard(
     Effect.flatMap(DelegatedTaskProgressGuard.DelegatedTaskProgressGuard, (service) =>
       service.start(),
