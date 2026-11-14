@@ -1303,22 +1303,15 @@ export const kanbanScriptStep = (card: Pick<KanbanCard, "subtasks">): boolean =>
 
 /**
  * Unplanned cards retain the legacy workflow. Planned work uses the same open
- * step as subtask_done; a note never grants work on a later step. Findings
- * leave the review subtask open, so that review-only step is the one exception.
- * Its durable verdict bit survives note consumption, retries and fresh threads;
+ * step as subtask_done. Pending review findings are worker work on any step.
+ * The durable verdict bit survives note consumption, retries and fresh threads;
  * notes alone never grant eligibility; older verdicts are upgraded by the server.
  */
 export const kanbanWorkStep = (
   card: Pick<KanbanCard, "wakeNote" | "subtasks" | "reviewFindingsPending">,
 ): boolean => {
   if (card.subtasks.length === 0) return true;
-  const open = kanbanStepSubtasks(card);
-  return (
-    open.some((subtask) => subtask.owner === "work") ||
-    (open.length > 0 &&
-      open.every((subtask) => subtask.owner === "review") &&
-      card.reviewFindingsPending === true)
-  );
+  return card.reviewFindingsPending === true || kanbanStepSubtasks(card, "work").length > 0;
 };
 
 /** A todo card whose current step cannot be assigned to a worker. */
