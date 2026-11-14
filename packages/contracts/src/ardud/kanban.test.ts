@@ -6,6 +6,7 @@ import {
   KANBAN_BACKLOG,
   KanbanAnswer,
   KanbanBoard,
+  KanbanStandingApproval,
   KanbanNightlyReview,
   KanbanCard,
   KanbanCardEvent,
@@ -1202,4 +1203,24 @@ describe("nightly review configuration", () => {
   it("rejects a zone that cannot be scheduled", () => {
     expect(() => decode({ enabled: true, timeZone: "Not/AZone" })).toThrow();
   });
+});
+
+const decodeStandingApproval = Schema.decodeUnknownSync(KanbanStandingApproval);
+
+it("old standing approvals decode with a four-hour interval", () => {
+  const record = {
+    id: "sa-old",
+    gate: "deploy",
+    quote: "Boards may release",
+    sourceThreadId: "owner-thread",
+    saidAt: "2026-11-13T17:25:00.000Z",
+    approvedAsk: { cardId: "card-one", askId: "q1" },
+    recordedAt: "2026-11-13T18:00:00.000Z",
+    recordedBy: "evaluator",
+    revokedAt: null,
+    revokedBy: null,
+    revokeReason: null,
+  };
+  expect(decodeStandingApproval(record).minIntervalHours).toBe(4);
+  expect(decodeStandingApproval({ ...record, minIntervalHours: 6 }).minIntervalHours).toBe(6);
 });

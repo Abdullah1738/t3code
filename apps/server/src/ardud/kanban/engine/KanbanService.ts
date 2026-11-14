@@ -2700,6 +2700,7 @@ const make = Effect.gen(function* () {
     incoming: KanbanCard,
     by?: KanbanActor,
     dispatchMetadata = false,
+    releaseBoard?: KanbanBoard,
   ) {
     yield* prepareTransition(incoming);
     const actor: KanbanActor = analyticsActors.get(incoming) ??
@@ -2780,7 +2781,12 @@ const make = Effect.gen(function* () {
                 ? yield* nowIso
                 : (before.analyticsStageEnteredAt ?? before.movedAt),
           };
-        const write = store.putCard(card);
+        // A release completion and its pacing receipt must survive the same restart.
+        const write = releaseBoard
+          ? boardSql.withTransaction(
+              store.putBoard(releaseBoard).pipe(Effect.andThen(store.putCard(card))),
+            )
+          : store.putCard(card);
         yield* dispatchMetadata ? locks.dispatchMetadata(write) : write;
         yield* SavedWrite.record({ kind: "card", card });
         for (const event of BoardAnalytics.cardEvents(before, card, actor))
@@ -2788,6 +2794,11 @@ const make = Effect.gen(function* () {
         if (card.stalled?.by._tag === "evaluator") yield* forgetStepWait(card.id);
       }),
     );
+    if (releaseBoard)
+      yield* SavedWrite.bestEffort(
+        publish(card.boardId, { _tag: "board", board: releaseBoard }),
+        undefined,
+      );
     yield* SavedWrite.bestEffort(
       publish(card.boardId, by === undefined ? { _tag: "card", card } : { _tag: "card", card, by }),
       undefined,
@@ -2906,6 +2917,7 @@ const make = Effect.gen(function* () {
 
   const upgradeFindings = Effect.fn("KanbanService.upgradeFindings")(function* (
     cards: ReadonlyArray<KanbanCard>,
+    persist = true,
   ) {
     return yield* Effect.forEach(cards, (card) =>
       Effect.gen(function* () {
@@ -2924,8 +2936,10 @@ const make = Effect.gen(function* () {
           ...card,
           reviewFindingsPending: verdict?.toStage === "todo" && verdict.body !== "clear",
         };
-        yield* saveCard(next);
-        yield* kick;
+        if (persist) {
+          yield* saveCard(next);
+          yield* kick;
+        }
         return next;
       }),
     );
@@ -11991,9 +12005,14 @@ const make = Effect.gen(function* () {
     const models = input.models ? yield* cardModels(boardId, input.models) : [];
     if (
       actor._tag !== "evaluator" &&
-      input.subtasks?.some((entry) => entry.ownerOnly !== undefined)
+      input.subtasks?.some(
+        (entry) => entry.ownerOnly !== undefined || entry.interrupting !== undefined,
+      )
     )
-      return yield* failWith("denied", "only evaluators may set or clear ownerOnly");
+      return yield* failWith(
+        "denied",
+        "only evaluators may set or clear ownerOnly or interrupting",
+      );
     const plan = Subtasks.planSubtasks([], input.subtasks ?? [], 0, at, board.guessedGates);
     if (!plan.ok) return yield* failWith("invalid", plan.reason);
     yield* checkScriptNames(boardId, plan.subtasks);
@@ -12501,9 +12520,14 @@ const make = Effect.gen(function* () {
         const board = yield* boardOf(card.boardId);
         if (
           actor._tag !== "evaluator" &&
-          patch.subtasks?.some((entry) => entry.ownerOnly !== undefined)
+          patch.subtasks?.some(
+            (entry) => entry.ownerOnly !== undefined || entry.interrupting !== undefined,
+          )
         )
-          return yield* failWith("denied", "only evaluators may set or clear ownerOnly");
+          return yield* failWith(
+            "denied",
+            "only evaluators may set or clear ownerOnly or interrupting",
+          );
         const plan = patch.subtasks
           ? Subtasks.planSubtasks(
               card.subtasks,
@@ -13987,18 +14011,25 @@ const make = Effect.gen(function* () {
         if (!check.ok) return yield* failWith("denied", check.reason);
         const board = yield* boardOf(card.boardId);
         const gated = card.subtasks.find((subtask) => subtask.id === subtaskId);
+        const at = yield* nowIso;
+        const standing = {
+          approvals: board.standingApprovals,
+          ledger: board.releaseLedger ?? [],
+          boardId: board.id,
+          at,
+          note,
+        };
         const missing =
           gated && state !== "open"
             ? Subtasks.approvalProblem(
                 card,
                 gated,
-                board.standingApprovals,
+                standing,
                 board.guessedGates,
                 state === "skipped" ? "skip" : "do",
               )
             : null;
         if (actor._tag !== "owner" && missing) return yield* failWith("denied", missing);
-        const at = yield* nowIso;
         const cleared =
           gated &&
           state === "done" &&
@@ -14019,14 +14050,18 @@ const make = Effect.gen(function* () {
           actor,
           at,
         );
-        const marked = (yield* upgradeFindings([
-          {
-            ...card,
-            subtasks,
-            wakeNote: Subtasks.pendingWakeNote({ ...card, subtasks }),
-            updatedAt: at,
-          },
-        ]))[0]!;
+        // The completed candidate is saved only with its release receipt below.
+        const marked = (yield* upgradeFindings(
+          [
+            {
+              ...card,
+              subtasks,
+              wakeNote: Subtasks.pendingWakeNote({ ...card, subtasks }),
+              updatedAt: at,
+            },
+          ],
+          false,
+        ))[0]!;
         const text = card.subtasks.find((subtask) => subtask.id === subtaskId)?.text ?? "";
         yield* logEvent(marked, actor, "subtask", {
           body: `${subtaskId} ${state}: ${text}${completionNote?.trim() ? ` (${completionNote.trim()})` : ""}`,
@@ -14073,7 +14108,30 @@ const make = Effect.gen(function* () {
         }
         analyticsActors.set(next, actor);
         // The actor goes with the save: a card a script's subtask moved is a move by that script.
-        yield* saveCard(next, to !== null && card.stage !== to ? actor : undefined);
+        const releaseBoard =
+          gated?.interrupting && state === "done"
+            ? {
+                ...board,
+                releaseLedger: [
+                  ...(board.releaseLedger ?? []),
+                  {
+                    boardId: board.id,
+                    cardId: card.id,
+                    cardNumber: card.number,
+                    subtaskId,
+                    at,
+                    critical: Subtasks.criticalReleaseReason(note),
+                    approvalId: cleared?.id ?? null,
+                  },
+                ].slice(-200),
+              }
+            : undefined;
+        yield* saveCard(
+          next,
+          to !== null && card.stage !== to ? actor : undefined,
+          false,
+          releaseBoard,
+        );
         yield* laterEvaluatorTurn(card, next, actor);
         yield* kick;
         return next;

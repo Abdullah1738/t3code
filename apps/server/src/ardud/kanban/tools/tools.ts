@@ -125,6 +125,12 @@ const SubtasksInput = describe(
         ),
       ),
       gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
+      interrupting: Schema.optional(
+        describe(
+          Schema.Boolean,
+          "Evaluator only: set on the install or restart subtask that interrupts running work; omit to preserve, false clears.",
+        ),
+      ),
       ownerOnly: Schema.optional(
         describe(
           Schema.Boolean,

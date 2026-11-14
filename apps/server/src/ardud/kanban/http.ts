@@ -424,7 +424,11 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         const hasMore = snapshot.cards.length > limit;
         const cards = snapshot.cards.slice(0, limit);
         return {
-          ...BoardReplies.compactBoard({ ...snapshot, cards }),
+          ...BoardReplies.compactBoard(
+            { ...snapshot, cards },
+            undefined,
+            DateTime.formatIso(yield* DateTime.now),
+          ),
           page: { limit, hasMore, nextAfter: hasMore ? cards.at(-1)!.number : null },
         };
       }),
