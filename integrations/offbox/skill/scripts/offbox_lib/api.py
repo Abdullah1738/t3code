@@ -64,7 +64,7 @@ def box_boot_failure(box_id, state, *, since=None):
     if not home.active() or state.get('state') not in (*STOPPED_STATES, 'error', 'cancelled'):
         return None
     reason = state.get('error') or ''
-    match = re.match(r'^(5\d{2})\s+(\w+):', reason)
+    match = re.match(r'^(5\d{2})\s+(\w+)(?::|\s|$)', reason)
     if not match:
         return None
     fresh = since is not None and (iso_ts(state.get('updatedAt')) or 0) >= since - .001
@@ -1053,6 +1053,8 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
                          and (iso_ts(s.get("updatedAt")) or 0) >= since - .001)
         failure = box_boot_failure(box_id, s, since=since)
         if failure and (failed_resume or since is None or st in ('error', 'cancelled')):
+            # Fresh allocation keeps its existing failover policy; lease reuse isolates the box against health.
+            failure.outage = (st == 'error' or failed_resume) and home.may_fail_over()
             raise failure
         if st in ("error", "cancelled") or failed_resume:
             failed_start = server_error and (st == "error" or failed_resume)

@@ -328,3 +328,21 @@ class BootPinsTests(Isolated):
                     self.assertEqual(self.take()['box_id'], 'warm')
                 self.assertTrue(all(c.args[1]['box_id'] == 'warm' for c in reuse.call_args_list))
                 self.assertEqual(common.kv_get(self.con, 'pin_owner:old'), 'A')
+
+    def test_terminal_server_reason_forms(self):
+        for reason, expected in (
+            ('500 boot_timeout: sshd in 120s', True),
+            ('500 boot_timeout', True),
+            ('500 boot_timeout sshd in 120s', True),
+            ('500 incus_failed: proxy failed', True),
+            ('500 port_in_use', True),
+            ('5000 boot_timeout', False),
+            ('400 boot_timeout: bad input', False),
+            ('500 unrelated: old error', False),
+            (None, False),
+        ):
+            with self.subTest(reason=reason):
+                failure = api.box_boot_failure('old', {'state': 'archived', 'error': reason})
+                self.assertEqual(failure is not None, expected)
+                if failure:
+                    self.assertEqual(failure.reason, reason)
