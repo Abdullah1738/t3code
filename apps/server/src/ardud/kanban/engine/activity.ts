@@ -10,6 +10,7 @@ import {
   kanbanWithoutDeciding,
   kanbanRetryNotBefore,
   KANBAN_DECIDE_MS,
+  type KanbanBoard,
   type KanbanCard,
   type KanbanCardEvent,
   type KanbanOwnerAsk,
@@ -385,6 +386,7 @@ const capped = <T>(items: ReadonlyArray<T>, max: number) =>
 
 export interface RollupInput {
   readonly window: ActivityWindow;
+  readonly board?: Pick<KanbanBoard, "pause" | "setup" | "archivedAt"> | null;
   readonly cards: ReadonlyArray<KanbanCard>;
   readonly events: ReadonlyArray<KanbanCardEvent>;
   readonly threads: ReadonlyArray<KanbanThreadLink>;
@@ -506,8 +508,10 @@ const ledgerUsage = (
     });
   const configured = new Map(pools.map((pool) => [pool.key, pool.slots]));
   const queued = (from: number, to: number) => {
+    if (input.board?.archivedAt != null || input.board?.setup?.status === "running") return;
     for (const { span, flags, waits, routes, dependencies } of todoSpans) {
       const card = span.card;
+      if (input.board?.pause && !input.board.pause.keep.includes(card.id)) continue;
       if (
         time(span.from) > from ||
         time(span.to ?? window.until) <= from ||
@@ -617,7 +621,7 @@ const ledgerUsage = (
     slotHours: values(slotHours),
     queueWait: values(queueWait),
     queueWaitBasis:
-      "Ready todo card-hours while every routed pool was full; recorded stages/waits/flags, current routing, capacities, priority, subtasks and retry/evaluator holds. Multi-model cards count once on their highest-weight enabled route.",
+      "Ready todo card-hours while every routed pool was full; recorded stages/waits/flags, current board policy, routing, capacities, priority, subtasks and retry/evaluator holds. Multi-model cards count once on their highest-weight enabled route.",
   };
 };
 

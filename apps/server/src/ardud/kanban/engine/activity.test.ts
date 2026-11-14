@@ -947,6 +947,23 @@ describe("ledger pool activity", () => {
     expect(result.queueWaitBasis).toContain("card-hours");
   });
 
+  it("excludes cards outside the current board pause keep list", () => {
+    const full = [slot(1, "take", "t1", before), slot(2, "take", "t2", before)];
+    const ready = card("ready");
+    const board = {
+      archivedAt: null,
+      setup: null,
+      pause: { keep: [], reason: "Wait", by: "owner", at: before },
+    };
+    expect(run(full, { cards: [ready], board }).queueWait).toEqual({});
+    expect(
+      run(full, {
+        cards: [ready],
+        board: { ...board, pause: { ...board.pause, keep: [ready.id] } },
+      }).queueWait[pool],
+    ).toEqual([1, 1, 1]);
+  });
+
   it("splits queue wait on recorded waits, flags, owner answers and blocker completion", () => {
     const events = [slot(1, "take", "t1", before), slot(2, "take", "t2", before)];
     const waiting = card("w");
