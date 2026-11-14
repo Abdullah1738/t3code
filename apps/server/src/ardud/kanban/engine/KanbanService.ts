@@ -6793,6 +6793,7 @@ const make = Effect.gen(function* () {
   const dispatchCardPass = (boardId: KanbanBoardId, changed: Set<KanbanCardId>) => {
     let rows: Map<string, KanbanCard | null> | undefined;
     let snapshot: ReadonlyArray<KanbanCard> = [];
+    let dirty = true;
     const candidate = (card: KanbanCard) =>
       card.settledAt === null &&
       (["todo", "working", "needs_review", "in_review"].includes(card.stage) ||
@@ -6805,13 +6806,21 @@ const make = Effect.gen(function* () {
         const loaded = rows !== undefined;
         if (rows === undefined)
           rows = new Map((yield* rawStore.dispatchCards(boardId)).map((card) => [card.id, card]));
-        if (loaded && changed.size === 0) return snapshot;
+        if (loaded && changed.size === 0 && !dirty) return snapshot;
+        // Row refresh and dependency expansion must both finish before reusing the snapshot.
+        dirty = true;
         while (changed.size > 0) {
           const ids = [...changed];
           changed.clear();
           // A write notification may precede its enclosing transaction's commit.
           // Taking the writer waits for that commit (or rollback) before refreshing.
           const fresh = yield* tickTransaction(Effect.forEach(ids, (id) => rawStore.card(id))).pipe(
+            // A cancelled refresh must not lose the writes the next plan needs to see.
+            Effect.onError(() =>
+              Effect.sync(() => {
+                for (const id of ids) changed.add(id);
+              }),
+            ),
             Effect.mapError(
               (cause) => new KanbanStoreError({ operation: "refresh dispatch cards", cause }),
             ),
@@ -6836,6 +6845,7 @@ const make = Effect.gen(function* () {
           }
         }
         snapshot = [...cards.values()].sort((a, b) => a.number - b.number);
+        dirty = false;
         return snapshot;
       }),
     );
@@ -7479,6 +7489,12 @@ const make = Effect.gen(function* () {
                     dispatch.fresh ||
                     (dispatch.role === "work" ? card.workThreadId : card.reviewThreadId) === null,
                 };
+                // Preparation reads may wait on the background reader. Take the
+                // card lock only after they finish; scopeDispatch confirms them again.
+                const board = yield* boardOf(boardId);
+                const pool = (yield* store.pools(board.id)).find(
+                  (entry) => entry.key === dispatch.pool,
+                );
                 starting.set(key, {
                   cardId: card.id,
                   pool: dispatch.pool,
@@ -7493,15 +7509,11 @@ const make = Effect.gen(function* () {
                 yield* locks
                   .run(
                     Effect.gen(function* () {
-                      const board = yield* boardOf(boardId);
                       const wakeThreadId = destination.newThread
                         ? null
                         : dispatch.role === "work"
                           ? card.workThreadId
                           : card.reviewThreadId;
-                      const pool = (yield* store.pools(board.id)).find(
-                        (entry) => entry.key === dispatch.pool,
-                      );
                       const assignmentState = ({
                         links,
                         updatedAt: _updatedAt,
