@@ -1814,6 +1814,7 @@ class Runner:
             _safe(err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout, terminal_identity=home)
             if err and isinstance(err[0], common.SshHostKeyMismatch):
                 raise err[0]
+        self.check_source('push')
         # A dead mount may have failed either transfer; prefer that over an ordinary error from the other.
         for e in (push_exc, err[0] if err else None):
             reason = ssh_sync.dead_mount(str(e)) if e is not None else None
@@ -2953,6 +2954,11 @@ def _run_remote(a, rn) -> int:
             rn.start()
         except OffboxError as e:
             if not rn.started:
+                if not isinstance(e, common.SourceGone):
+                    try:
+                        rn.check_source('push' if rn.box else 'queued')
+                    except common.SourceGone as source_error:
+                        e = source_error
                 if isinstance(e, common.SourceGone):
                     rn.source_gone(e)
                 elif e.code == EXIT_LOCAL:
@@ -2961,7 +2967,7 @@ def _run_remote(a, rn) -> int:
                     finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
             if not isinstance(e, common.SourceGone):
                 rn.record(error=str(e)[:500])
-            raise
+            raise e
         if a.bg and rn.recovered_code is not None:
             from . import start_check
             con = db()

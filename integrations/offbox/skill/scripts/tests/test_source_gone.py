@@ -34,17 +34,31 @@ class SourceGoneTests(Isolated):
         self.stack.enter_context(patch.object(lease, 'touch'))
         self.stack.enter_context(patch.object(runs.Runner, '_log_pool'))
         self.stack.enter_context(patch.object(runs, '_keep_ttl', return_value=contextlib.nullcontext()))
-        self.stack.enter_context(patch.object(ssh_sync, 'put_file'))
+        self.upload = self.stack.enter_context(patch.object(ssh_sync, 'put_file'))
         self.starts = self.stack.enter_context(patch.object(api, 'cmd_start'))
         self.infra = self.stack.enter_context(patch.object(fallback, 'note_infra_failure'))
         self.failures = self.stack.enter_context(patch.object(home, 'record_failure'))
         self.quarantine = self.stack.enter_context(patch.object(lease, 'quarantine'))
         self.err = self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
 
-    def simulate(self, checkpoint, *, subdir=False, bg=False, steps=False, rsync_race=False, transfer_outcome=None):
+    def simulate(self, checkpoint, *, subdir=False, bg=False, steps=False, rsync_race=False, transfer_outcome=None,
+                 upload_stage=None, upload_fails=False):
         self.box('A', member=True)
         self.box('B', member=True)
         removed = self.cwd if subdir else self.root
+        if upload_stage is not None:
+            self.stack.enter_context(patch.object(api, 'BACKEND', 'server'))
+            attempts = 0
+            def upload(*args, **kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == upload_stage:
+                    shutil.rmtree(removed)
+                    if upload_fails:
+                        raise common.OffboxError('env upload failed')
+                elif attempts < upload_stage:
+                    raise common.OffboxError('retry this upload')
+            self.upload.side_effect = upload
         if checkpoint == 'queued':
             self.busy('A')
             self.busy('B')
@@ -60,7 +74,7 @@ class SourceGoneTests(Isolated):
             return dict(row)
 
         def checked(*args):
-            if checkpoint == 'push' and not rsync_race and transfer_outcome is None:
+            if checkpoint == 'push' and not rsync_race and transfer_outcome is None and upload_stage is None:
                 shutil.rmtree(removed)
 
         def transfer(*args, **kwargs):
@@ -83,7 +97,8 @@ class SourceGoneTests(Isolated):
                 patch.object(lease, '_reuse', side_effect=reuse) as reused, \
                 patch.object(lease, 'acquire_private') as created, \
                 patch.object(runs.Runner, '_check_box', side_effect=checked) as check_box, \
-                patch.object(ssh_sync, 'push', side_effect=transfer if rsync_race or transfer_outcome else None) as push:
+                patch.object(ssh_sync, 'push', return_value={},
+                             side_effect=transfer if rsync_race or transfer_outcome else None) as push:
             code = runs.background_client(a, self.me) if bg else cli._run_with_retries(a, self.me)
         self.assertEqual(code, 2, self.err.getvalue())
         row = self.con.execute("SELECT * FROM runs WHERE cmd IS NOT NULL ORDER BY start_at DESC LIMIT 1").fetchone()
@@ -104,7 +119,7 @@ class SourceGoneTests(Isolated):
         detail = self.con.execute("SELECT detail FROM events WHERE kind='run_source_gone'").fetchone()[0]
         self.assertIn(f'checkpoint={checkpoint}', detail)
         self.starts.assert_not_called()
-        if rsync_race or transfer_outcome:
+        if rsync_race or transfer_outcome or upload_stage == 2:
             push.assert_called_once()
         else:
             push.assert_not_called()
@@ -167,6 +182,18 @@ class SourceGoneTests(Isolated):
 
     def test_subdir_removed_during_failed_transfer(self):
         self.simulate('push', subdir=True, transfer_outcome='error')
+
+    def test_subdir_removed_during_initial_upload_success(self):
+        self.simulate('push', subdir=True, upload_stage=1)
+
+    def test_subdir_removed_during_initial_upload_failure(self):
+        self.simulate('push', subdir=True, upload_stage=1, upload_fails=True)
+
+    def test_subdir_removed_during_upload_retry_success(self):
+        self.simulate('push', subdir=True, upload_stage=2)
+
+    def test_subdir_removed_during_upload_retry_failure(self):
+        self.simulate('push', subdir=True, upload_stage=2, upload_fails=True)
 
     def test_source_removed_while_waiting_for_pool_lock(self):
         @contextlib.contextmanager
