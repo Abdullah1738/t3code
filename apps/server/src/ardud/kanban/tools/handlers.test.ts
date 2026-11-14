@@ -3211,6 +3211,359 @@ it.effect("board_instructions_set refuses work and review threads", () => {
   }).pipe(Effect.provide(layer));
 });
 
+const settingsFixture = Effect.fn("settingsFixture")(function* (
+  input: {
+    label?: string;
+    before?: string;
+    after?: string;
+    changes?: ReadonlyArray<KanbanAskChange>;
+  } = {},
+) {
+  return yield* instructionFixture({
+    slug: "crpko",
+    name: "Crpko",
+    label: "Crpko guessed gates",
+    before: "(unset)",
+    after: "money, secret",
+    ...input,
+  });
+});
+
+it.effect.each([false, true])(
+  "board_settings_set applies an approved change and retries idempotently: legacy=%s",
+  (legacy) => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const { kanban, board, evaluator, card } = yield* settingsFixture();
+      if (legacy) {
+        const store = yield* KanbanStore.KanbanStore;
+        const fresh = (yield* kanban.card(card.id)).card;
+        yield* store.putCard({
+          ...fresh,
+          asks: fresh.asks.map((ask) => ({ ...ask, change: ask.changes![0], changes: undefined })),
+        });
+      }
+      const input = {
+        card: `#${card.number}`,
+        ask: "q1",
+        setting: "guessedGates",
+        value: ["secret", "money"],
+      };
+      const result = yield* call(evaluator, "board_settings_set", input);
+      assert.isFalse(result.isError, result.text);
+      assert.strictEqual(result.structured.applied, true);
+      assert.deepStrictEqual((yield* kanban.snapshot(board.id)).board.guessedGates, [
+        "money",
+        "secret",
+      ]);
+      const readback = yield* call(evaluator, "board_get", {});
+      assert.deepStrictEqual(
+        (readback.structured.board as { board: KanbanBoard }).board.guessedGates,
+        ["money", "secret"],
+      );
+      const events = (yield* kanban.card(card.id)).events;
+      assert.lengthOf(
+        events.filter(
+          (event) => event.body === `Applied guessedGates on board crpko from q1 (by ${evaluator})`,
+        ),
+        1,
+      );
+      const retry = yield* call(evaluator, "board_settings_set", input);
+      assert.isFalse(retry.isError, retry.text);
+      assert.strictEqual(retry.structured.applied, false);
+      assert.strictEqual(retry.structured.reason, "already set");
+      assert.deepStrictEqual((yield* kanban.card(card.id)).events, events);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect.each([
+  { state: "open", message: "still open" },
+  { state: "dropped", message: "dropped" },
+  { state: "rejected", message: "rejected" },
+  { state: "picked", message: "does not have the owner's approval" },
+  { state: "non-owner", message: "not answered by the owner" },
+  { state: "no-answer", message: "not answered by the owner" },
+  { state: "missing-ask", message: "ask q9" },
+  { state: "wrong-after", message: "approved after" },
+  { state: "changed-before", message: "the board's setting changed since he approved it" },
+  { state: "wrong-board", message: "no change entry labelled" },
+  { state: "wrong-setting", message: "no change entry labelled" },
+] as const)("board_settings_set refuses $state without writing", ({ state, message }) => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const { kanban, board, evaluator, card } = yield* settingsFixture();
+    const store = yield* KanbanStore.KanbanStore;
+    const fresh = (yield* kanban.card(card.id)).card;
+    const ask = fresh.asks[0]!;
+    yield* store.putCard({
+      ...fresh,
+      asks: [
+        {
+          ...ask,
+          ...(state === "open" ? { closedAt: null } : {}),
+          ...(state === "no-answer" ? { answer: undefined } : {}),
+          ...(["dropped", "rejected", "picked"].includes(state)
+            ? { answer: { ...ask.answer!, verdict: state } }
+            : {}),
+          ...(state === "non-owner"
+            ? { answer: { ...ask.answer!, by: { _tag: "evaluator", threadId: evaluator } } }
+            : {}),
+          ...(["wrong-board", "wrong-setting"].includes(state)
+            ? {
+                changes: ask.changes!.map((entry) => ({
+                  ...entry,
+                  label: state === "wrong-board" ? "Robob guessed gates" : "Crpko escalation",
+                })),
+              }
+            : {}),
+        },
+      ],
+    });
+    if (state === "changed-before")
+      yield* kanban.updateBoard(board.id, { guessedGates: ["deploy", "money", "secret"] });
+    const before = yield* kanban.card(card.id);
+    const settings = (yield* kanban.snapshot(board.id)).board.guessedGates;
+    const result = yield* call(evaluator, "board_settings_set", {
+      card: card.id,
+      ask: state === "missing-ask" ? "q9" : "q1",
+      setting: "guessedGates",
+      value: state === "wrong-after" ? ["deploy"] : ["money", "secret"],
+    });
+    assert.isTrue(result.isError, result.text);
+    assert.include(result.text, message);
+    assert.deepStrictEqual((yield* kanban.snapshot(board.id)).board.guessedGates, settings);
+    assert.deepStrictEqual(yield* kanban.card(card.id), before);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect.each([
+  { label: "Crpko guessed gates", ok: true },
+  { label: "CRPKO guessedGates", ok: true },
+  { label: "(crpko)/guessedGates", ok: true },
+  { label: "precrpko guessed gates", ok: false },
+  { label: "crpko2 guessed gates", ok: false },
+  { label: "crpko_extra guessed gates", ok: false },
+  { label: "écrpko guessed gates", ok: false },
+  { label: "Crpko guessedGatesExtra", ok: false },
+  { label: "Crpko guessed gates_extra", ok: false },
+] as const)(
+  "board_settings_set matches whole board and setting labels: $label",
+  ({ label, ok }) => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const { kanban, board, evaluator, card } = yield* settingsFixture({ label });
+      const result = yield* call(evaluator, "board_settings_set", {
+        card: card.id,
+        ask: "q1",
+        setting: "guessedGates",
+        value: ["money", "secret"],
+      });
+      assert.strictEqual(result.isError, !ok, result.text);
+      assert.deepStrictEqual(
+        (yield* kanban.snapshot(board.id)).board.guessedGates,
+        ok ? ["money", "secret"] : undefined,
+      );
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect.each([
+  {
+    before: "deploy, money, secret",
+    after: "money, secret",
+    current: ["secret", "deploy", "money"],
+    value: ["secret", "money"],
+    ok: true,
+  },
+  {
+    before: "  (unset)\r\n",
+    after: " money, secret\r\n",
+    current: undefined,
+    value: ["money", "secret"],
+    ok: true,
+  },
+  { before: "money, secret", after: "", current: ["money", "secret"], value: [], ok: true },
+  { before: "", after: "money, secret", current: [], value: ["money", "secret"], ok: true },
+  {
+    before: "(unset)",
+    after: "money,secret",
+    current: undefined,
+    value: ["money", "secret"],
+    ok: false,
+  },
+  {
+    before: "(unset)",
+    after: "secret, money",
+    current: undefined,
+    value: ["money", "secret"],
+    ok: false,
+  },
+  { before: "(unset)", after: "money, secret", current: [], value: ["money", "secret"], ok: false },
+] as const)("board_settings_set compares canonical values: before=$before after=$after", (row) => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const { kanban, board, evaluator, card } = yield* settingsFixture({
+      before: row.before,
+      after: row.after,
+    });
+    if (row.current !== undefined)
+      yield* kanban.updateBoard(board.id, { guessedGates: row.current });
+    const result = yield* call(evaluator, "board_settings_set", {
+      card: card.id,
+      ask: "q1",
+      setting: "guessedGates",
+      value: row.value,
+    });
+    assert.strictEqual(result.isError, !row.ok, result.text);
+    assert.deepStrictEqual(
+      (yield* kanban.snapshot(board.id)).board.guessedGates,
+      row.ok ? [...row.value].sort() : row.current,
+    );
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect(
+  "board_settings_set requires approval when the value is already set and refuses non-evaluators",
+  () => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const { kanban, board, evaluator, card } = yield* settingsFixture();
+      yield* kanban.updateBoard(board.id, { guessedGates: ["money", "secret"] });
+      const store = yield* KanbanStore.KanbanStore;
+      const fresh = (yield* kanban.card(card.id)).card;
+      yield* store.putCard({
+        ...fresh,
+        asks: fresh.asks.map((ask) => ({ ...ask, closedAt: null })),
+      });
+      const input = {
+        card: card.id,
+        ask: "q1",
+        setting: "guessedGates",
+        value: ["money", "secret"],
+      };
+      const denied = yield* call(evaluator, "board_settings_set", input);
+      assert.isTrue(denied.isError, denied.text);
+      assert.include(denied.text, "still open");
+      const link = (yield* kanban.caller(evaluator))!;
+      for (const role of ["work", "review"] as const) {
+        yield* store.putThreadLink({ ...link, role, cardId: card.id });
+        const result = yield* call(evaluator, "board_settings_set", input);
+        assert.isTrue(result.isError, result.text);
+        assert.include(result.text, "Only evaluators");
+        const direct = yield* kanban
+          .applyApprovedSettings(board.id, "guessedGates", ["money", "secret"], card.id, "q1", {
+            _tag: "thread",
+            threadId: evaluator,
+          })
+          .pipe(Effect.result);
+        assert.isTrue(Result.isFailure(direct));
+      }
+      assert.deepStrictEqual((yield* kanban.snapshot(board.id)).board.guessedGates, [
+        "money",
+        "secret",
+      ]);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect.each([false, true])(
+  "board_settings_set recovers failed audits and reapplications: crossBoard=%s",
+  (crossBoard) => {
+    const { layer, storeControl } = fakeThreads();
+    return Effect.gen(function* () {
+      const { kanban, board, evaluator, card } = yield* settingsFixture();
+      const store = yield* KanbanStore.KanbanStore;
+      const target = crossBoard
+        ? yield* kanban.ensureBoard({
+            slug: "target",
+            name: "Target",
+            defaultProjectId: ProjectId.make("project-1"),
+          })
+        : board;
+      if (crossBoard) {
+        const fresh = (yield* kanban.card(card.id)).card;
+        yield* store.putCard({
+          ...fresh,
+          asks: fresh.asks.map((ask) => ({
+            ...ask,
+            changes: ask.changes!.map((entry) => ({ ...entry, label: "Target guessed gates" })),
+          })),
+        });
+      }
+      storeControl.beforeCardEvent = (event) => {
+        if (!event.body?.startsWith("Applied ")) return Effect.void;
+        delete storeControl.beforeCardEvent;
+        return Effect.fail(
+          new KanbanStore.KanbanStoreError({ operation: "settings audit", cause: "unavailable" }),
+        );
+      };
+      const input = {
+        boardId: target.id,
+        card: card.id,
+        ask: "q1",
+        setting: "guessedGates",
+        value: ["money", "secret"],
+      };
+      const first = yield* call(evaluator, "board_settings_set", input);
+      assert.isTrue(first.isError, first.text);
+      assert.deepStrictEqual((yield* kanban.snapshot(target.id)).board.guessedGates, [
+        "money",
+        "secret",
+      ]);
+      assert.lengthOf(
+        yield* store.pendingInstructionApplications(card.id, target.id, "guessedGates", "q1"),
+        1,
+      );
+      const retry = yield* call(evaluator, "board_settings_set", input);
+      assert.isFalse(retry.isError, retry.text);
+      assert.strictEqual(retry.structured.applied, false);
+      yield* kanban.updateBoard(target.id, { guessedGates: undefined });
+      const reapplied = yield* call(evaluator, "board_settings_set", input);
+      assert.isFalse(reapplied.isError, reapplied.text);
+      assert.strictEqual(reapplied.structured.applied, true);
+      assert.lengthOf(
+        yield* store.pendingInstructionApplications(card.id, target.id, "guessedGates", "q1"),
+        0,
+      );
+      const events = (yield* kanban.card(card.id)).events.filter((event) =>
+        event.body?.startsWith(`Applied guessedGates on board ${target.slug} from q1`),
+      );
+      assert.lengthOf(events, 2);
+      assert.deepStrictEqual(
+        events.map((event) => event.actor),
+        [
+          { _tag: "evaluator", threadId: evaluator },
+          { _tag: "evaluator", threadId: evaluator },
+        ],
+      );
+      if (crossBoard) assert.isUndefined((yield* kanban.snapshot(board.id)).board.guessedGates);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect("board_settings_set commits the application receipt atomically with the board", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const { kanban, board, evaluator, card } = yield* settingsFixture();
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`CREATE TRIGGER fail_settings_receipt BEFORE INSERT ON ardud_kanban_instruction_applications BEGIN SELECT RAISE(ABORT, 'receipt unavailable'); END`;
+    const result = yield* call(evaluator, "board_settings_set", {
+      card: card.id,
+      ask: "q1",
+      setting: "guessedGates",
+      value: ["money", "secret"],
+    });
+    assert.isTrue(result.isError, result.text);
+    assert.isUndefined((yield* kanban.snapshot(board.id)).board.guessedGates);
+    const store = yield* KanbanStore.KanbanStore;
+    assert.lengthOf(
+      yield* store.pendingInstructionApplications(card.id, board.id, "guessedGates", "q1"),
+      0,
+    );
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("board model inputs preserve native options and reject conflicting levels", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {
@@ -5275,7 +5628,7 @@ it.effect(
         boardId: "tools",
         title: "Different words",
         evidence: "run-1 failed",
-        cardHint: `#${bug.number}`,
+        cardHint: `${tools.slug}#${bug.number}`,
       };
       const appended = yield* call(reporter, "report_bug", input);
       assert.isFalse(appended.isError, appended.text);
