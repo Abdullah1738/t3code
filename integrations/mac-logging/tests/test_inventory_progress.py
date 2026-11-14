@@ -85,7 +85,7 @@ class InventoryProgressTests(unittest.TestCase):
         self.assertEqual(jobs.read_state('crashes')['unified'],13600)
         self.assertEqual(self.rows('crash.source')[-1]['props']['lagS'],125)
 
-    def test_six_hours_slow_chunks_have_bounded_lag_and_exact_gaps(self):
+    def test_twelve_hours_slow_chunks_have_bounded_lag_and_exact_gaps(self):
         for cost in (30,60):
             with self.subTest(cost=cost),patch.dict(os.environ,TOOLLOG_DIR=str(self.root/str(cost))):
                 jobs.save_state('crashes',dict(unified=6400))
@@ -98,13 +98,13 @@ class InventoryProgressTests(unittest.TestCase):
                     covered.append((a,b))
                     return {}
                 with patch.object(collector.time,'monotonic',side_effect=lambda: clock[0]):
-                    for hour in range(6):
+                    for hour in range(12):
                         clock[0] = 0
                         now = 10000+hour*3600
                         collector.collect(now,[],reader,deadline=290)
                         self.assertLessEqual(clock[0],135)
                         state = jobs.read_state('crashes')
-                        self.assertLessEqual(now-state['unified'],7200)
+                        self.assertLessEqual(now-state['unified'],2*collector.UNIFIED_WINDOW_S)
                 rows=[r for p in (self.root/str(cost)).glob('*.ndjson')
                       for r in map(json.loads,p.read_text().splitlines()) if r['name']=='crash.source']
                 skipped=sum(r['props']['skippedS'] for r in rows)
@@ -309,17 +309,32 @@ class InventoryProgressTests(unittest.TestCase):
                     self.assertLessEqual(clock[0],150)
 
     def test_interruption_in_fresh_query_does_not_replay_reported_gap(self):
-        jobs.save_state('crashes',dict(unified=9100,unifiedRetry=dict(windowStart=9100,windowEnd=10000,skippedS=82800)))
-        def interrupt(a,b):
-            if a>=13600:
-                raise SystemExit('fresh query interrupted')
-            return {}
-        with self.assertRaises(SystemExit):
-            collector.collect(17200,[],interrupt)
-        self.assertNotIn('unifiedRetry',jobs.read_state('crashes'))
-        collector.collect(17200,[],lambda a,b:{})
-        sources=[r for r in self.rows('crash.source') if r['props']['source']=='unified']
-        self.assertEqual([r['props']['skippedS'] for r in sources],[82800,3600])
+        for interrupted_at in (11800,12700,13600,14500,15400,16300):
+            with self.subTest(interrupted_at=interrupted_at), \
+                 patch.dict(os.environ,TOOLLOG_DIR=str(self.root/str(interrupted_at))):
+                jobs.save_state('crashes',dict(unified=9100,unifiedRetry=dict(windowStart=9100,windowEnd=10000,skippedS=82800)))
+                completed=[]
+                def success(a,b):
+                    completed.append((a,b))
+                    return {}
+                def interrupt(a,b):
+                    if a>=interrupted_at:
+                        raise SystemExit('fresh query interrupted')
+                    return success(a,b)
+                with self.assertRaises(SystemExit):
+                    collector.collect(17200,[],interrupt)
+                state=jobs.read_state('crashes')
+                if interrupted_at==11800:
+                    self.assertNotIn('unifiedRetry',state)
+                else:
+                    self.assertEqual(state['unifiedRetry'],dict(windowStart=interrupted_at,windowEnd=17200,skippedS=1800))
+                collector.collect(17200,[],success)
+                rows=[r for p in (self.root/str(interrupted_at)).glob('*.ndjson')
+                      for r in map(json.loads,p.read_text().splitlines()) if r['name']=='crash.source']
+                self.assertEqual([r['props']['skippedS'] for r in rows],[82800,1800])
+                self.assertEqual(completed,[(9100,10000),(11800,12700),(12700,13600),
+                                            (13600,14500),(14500,15400),(15400,16300),(16300,17200)])
+                self.assertNotIn('unifiedRetry',jobs.read_state('crashes'))
 
     def test_limited_child_is_excluded_from_every_batch_position(self):
         root=self.root/'limited-batch'
