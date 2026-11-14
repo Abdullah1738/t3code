@@ -23,6 +23,19 @@ OWNER = {'thread': {'threadId': 'owner', 'state': 'idle', 'status': 'completed',
 DETAILS = dict(cwd='/private/tmp/benchmark-deleted', cwd_exists=False,
                listeners=['192.168.1.209:8765'], tcp_states=['LISTEN'],
                binding={'CLAUDE_CODE_SESSION_ID': 'native-owner'})
+OPAQUE_RELATIVE_TOKENS = [
+    'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    'wJalrXUtnFEMI/K7MDENGbPxRfiCYEXAMPLEKEY',
+    'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY=',
+    'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY==',
+    'wJalrXUtnFEMI_K7MDENG/bPxRfiCYEXAMPLEKEY',
+    'wJalrXUtnFEMI-K7MDENG/bPxRfiCYEXAMPLEKEY',
+    'AbC+/012' * 5,
+    'abcdefghijklmnopqrst/uvwxyzabcdefghijklm',
+    '0123456789abcdef/0123456789abcdef/01234567',
+    'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.signature/opaque',
+    'project/packages/server/scripts/serve',
+]
 
 
 class ProcessTests(unittest.TestCase):
@@ -162,7 +175,8 @@ class ProcessTests(unittest.TestCase):
             '~/projects/long-project-directory/scripts/serve.py',
             './projects/long-project-directory/scripts/serve.py',
             'node_modules/.bin/long-development-server',
-            'project/packages/server/scripts/serve',
+            './project/packages/server/scripts/serve',
+            'project/.cache/scripts/development-server',
             'scripts/' + 'long-script-name-' * 3 + '.py',
             'a+b/long-module-directory/development-entrypoint.js',
             'project/a+b/scripts/development-entrypoint.js',
@@ -186,6 +200,39 @@ class ProcessTests(unittest.TestCase):
                 with self.subTest(token=token, quote=quote):
                     self.assertEqual(lp.redact(f'node tool.js {quote}{token}{quote}'),
                                      f'node tool.js {quote}[REDACTED]{quote}')
+
+    def test_ambiguous_relative_tokens_still_redact(self):
+        for token in OPAQUE_RELATIVE_TOKENS:
+            for quote in ('', '"', "'"):
+                with self.subTest(token=token, quote=quote):
+                    self.assertEqual(lp.redact(f'node tool.js {quote}{token}{quote}'),
+                                     f'node tool.js {quote}[REDACTED]{quote}')
+
+    def test_saved_report_redacts_ambiguous_tokens_in_inventory_and_ancestors(self):
+        import dev_janitor
+        for token in OPAQUE_RELATIVE_TOKENS:
+            for quote in ('', '"', "'"):
+                with self.subTest(token=token, quote=quote):
+                    rows = lp.parse_ps(PS)
+                    child = rows[91129]
+                    child.update(ppid=10, tty='ttys001', args=f'node tool.js {quote}{token}{quote}')
+                    rows[10] = dict(pid=10, ppid=1, start=child['start'], tty='ttys001',
+                                    args=f'/bin/sh -c "node tool.js {quote}{token}{quote}"')
+                    report = lp.detect(rows, lp.parse_top(TOP), {}, ROSTER)
+                    item = report['inventory'][0]
+                    self.assertEqual(item['command'], f'node tool.js {quote}[REDACTED]{quote}')
+                    self.assertEqual(item['parent_chain'][0]['command'],
+                                     f'/bin/sh -c "node tool.js {quote}[REDACTED]{quote}"')
+                    with tempfile.TemporaryDirectory() as tmp, \
+                            patch.object(dev_janitor, 'LOG_DIR', tmp), \
+                            patch.object(dev_janitor, 'LAST', str(Path(tmp) / 'last.json')), \
+                            patch.object(dev_janitor, 'AUDIT', str(Path(tmp) / 'audit.jsonl')):
+                        dev_janitor.record_report(dict(ts=1, liveness_unavailable=None, processes=report))
+                        for name in ('last.json', 'audit.jsonl'):
+                            saved = (Path(tmp) / name).read_text()
+                            self.assertNotIn(token, saved)
+                            if name == 'last.json':
+                                self.assertIn('[REDACTED]', saved)
 
     def test_explicit_credentials_win_over_path_shape(self):
         values = ['a' * 40, '/Users/ardud/.local/share/credential-file',

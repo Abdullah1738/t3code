@@ -24,8 +24,9 @@ def redact_opaque_token(match):
     segments = token.split("/")
     if (len(segments) > 1
             and re.fullmatch(r'[\w.@+~-]+(?:/[\w.@+~-]+)+/?', token)
-            # A bare base64 alphabet with + and / needs more path evidence.
-            and ('+' not in token or re.search(r'[._~@-]', token))
+            # Slash-separated opaque credentials also have short segments.
+            and (any(segment.startswith('.') for segment in segments)
+                 or re.search(r'\.[a-zA-Z][a-zA-Z0-9]{0,9}$', segments[-1]))
             and all(len(segment) < 32 or re.search(r'\.[a-zA-Z][a-zA-Z0-9]{0,9}$', segment)
                     for segment in segments)):
         return token
