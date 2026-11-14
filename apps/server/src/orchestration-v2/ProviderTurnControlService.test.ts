@@ -224,6 +224,7 @@ it.effect(
           listCutoverCandidates: () => Effect.die("unused listCutoverCandidates"),
           getLiveSharedProviderSessions: () => Effect.die("unused getLiveSharedProviderSessions"),
           getLimitRecoveryCandidates: () => Effect.die("unused getLimitRecoveryCandidates"),
+          listActiveThreadIds: () => Effect.die("unused listActiveThreadIds"),
           getShellSnapshot: () => Effect.die("unused getShellSnapshot"),
           readShellSnapshot: () => Effect.die("unused readShellSnapshot"),
           getThreadListCandidates: () => Effect.die("unused getThreadListCandidates"),
