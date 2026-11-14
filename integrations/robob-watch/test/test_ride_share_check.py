@@ -28,6 +28,13 @@ args = [a for a in sys.argv[1:] if a != "--json"]
 with open(os.environ["FAKE_UBER_STATE"] + ".calls", "a") as f:
     f.write(" ".join(args) + "\\n")
 if args[:2] == ["rides", "status"]:
+    if state.get("status_responses"):
+        out = state["status_responses"].pop(0)
+        with open(os.environ["FAKE_UBER_STATE"], "w") as f:
+            json.dump(state, f)
+        if isinstance(out, str):
+            print(out); sys.exit(0)
+        print(json.dumps(out)); sys.exit(0 if out.get("ok") else 1)
     out = {"ok": True, "result": {"trip": state.get("trip")}}
 elif args[:2] == ["trips", "get"]:
     t = state.get("history", {}).get(args[2])
@@ -312,6 +319,156 @@ class Base(unittest.TestCase):
     def mark_sent(self, uuid):
         self.set_state(trip(uuid, "Accepted"), {})
         self.card_cli("send", "--trip", uuid, "--session", "thread-1@3")
+
+
+class SessionRecoveryTest(Base):
+    stale = {"ok": False, "error": {"code": "runtime", "message":
+             "Unexpected token '<', \"<html>\r\n<h\"... is not valid JSON", "retryable": False}}
+    idle = {"ok": True, "result": {"trip": None}}
+
+    def setUp(self):
+        super().setUp()
+        self.browser_log = os.path.join(self.dir, "browser.calls")
+        self.browser = self._exe("agent-browser", """#!/usr/bin/python3
+import json, os, sys, time
+with open(os.environ['FAKE_BROWSER_LOG'], 'a') as f:
+    f.write(json.dumps(sys.argv[1:]) + '\\n')
+if os.environ.get('FAKE_BROWSER_HANG'):
+    time.sleep(30)
+sys.exit(int(os.environ.get('FAKE_BROWSER_EXIT', '0')))
+""")
+        self.env.update(UBER_AGENT_BROWSER=self.browser, FAKE_BROWSER_LOG=self.browser_log)
+
+    def responses(self, *responses):
+        with open(self.fixture, "w") as f:
+            json.dump({"status_responses": responses}, f)
+
+    def browser_calls(self):
+        if not os.path.exists(self.browser_log):
+            return []
+        with open(self.browser_log) as f:
+            return [json.loads(line) for line in f]
+
+    def status_calls(self, count):
+        with open(self.fixture + ".calls") as f:
+            # Any booking/change/cancellation command would fail this assertion.
+            self.assertEqual(f.read().splitlines(), ["rides status"] * count)
+
+    def check_failed(self, **extra):
+        with open(self.state, "w") as f:
+            json.dump({"fail_since": 100}, f)
+        p = subprocess.run([sys.executable, HELPER], capture_output=True, text=True,
+                           env=dict(self.env, RIDE_SHARE_NOW="1000", **extra), timeout=25)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertEqual(p.stdout, "")
+        with open(self.state) as f:
+            self.assertEqual(json.load(f)["fail_since"], 100)
+        return p
+
+    def test_healthy_status_never_opens_browser(self):
+        self.assertEqual(self.run_check(1000), [])
+        self.assertEqual(self.browser_calls(), [])
+        self.status_calls(1)
+
+    def test_reopen_saved_profile_once_then_clear_failure_streak(self):
+        with open(self.state, "w") as f:
+            json.dump({"fail_since": 100}, f)
+        self.responses(self.stale, self.idle)
+        p = self.run_check_result(1000)
+        self.assertEqual(p.stdout, "")
+        self.status_calls(2)
+        self.assertEqual(self.browser_calls(), [["--session", "uber-cli-default", "--profile",
+                         os.path.expanduser("~/Library/Application Support/uber/profiles/default/browser"),
+                         "--headed", "open", "https://m.uber.com/go/home"]])
+        with open(self.state) as f:
+            self.assertIsNone(json.load(f)["fail_since"])
+
+    def test_recovered_active_trip_still_updates_card(self):
+        self.responses(self.stale, {"ok": True, "result": {"trip": trip(A, "Accepted")}})
+        self.assertEqual(self.run_check(1000), [])
+        self.assertEqual(self.card(A)["state"], "assigned")
+        self.status_calls(2)
+        self.assertEqual(len(self.browser_calls()), 1)
+
+    def test_second_stale_response_is_failure_without_another_reopen(self):
+        self.responses(self.stale, self.stale, self.idle)
+        self.check_failed()
+        self.status_calls(2)
+        self.assertEqual(len(self.browser_calls()), 1)
+
+    def test_retry_other_error_still_fails(self):
+        self.responses(self.stale, {"ok": False, "error": {"code": "network", "message": "offline"}})
+        self.check_failed()
+        self.status_calls(2)
+        self.assertEqual(len(self.browser_calls()), 1)
+
+    def test_malformed_retry_still_fails(self):
+        self.responses(self.stale, "not JSON")
+        self.check_failed()
+        self.status_calls(2)
+        self.assertEqual(len(self.browser_calls()), 1)
+
+    def test_malformed_initial_response_never_opens_browser(self):
+        self.responses("not JSON")
+        self.check_failed()
+        self.status_calls(1)
+        self.assertEqual(self.browser_calls(), [])
+
+    def test_failed_reopen_is_failure_without_retry(self):
+        self.responses(self.stale, self.idle)
+        self.check_failed(FAKE_BROWSER_EXIT="1")
+        self.status_calls(1)
+        self.assertEqual(len(self.browser_calls()), 1)
+
+    def test_missing_browser_still_fails(self):
+        self.responses(self.stale)
+        self.check_failed(UBER_AGENT_BROWSER=os.path.join(self.dir, "missing-browser"))
+        self.status_calls(1)
+
+    def test_reopen_timeout_is_bounded_and_preserves_failure(self):
+        import contextlib
+        import importlib.util
+        import io
+        with unittest.mock.patch.dict(os.environ, dict(self.env, FAKE_BROWSER_HANG="1", RIDE_SHARE_NOW="1000")):
+            spec = importlib.util.spec_from_file_location("recovery_test", HELPER)
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)
+            real_run = subprocess.run
+            attempts = []
+            def run(args, **kwargs):
+                self.assertEqual(kwargs["timeout"], 15)
+                if args[0] == self.browser:
+                    attempts.append(args)
+                    kwargs["timeout"] = 0.1
+                return real_run(args, **kwargs)
+            self.responses(self.stale)
+            with open(self.state, "w") as f:
+                json.dump({"fail_since": 100}, f)
+            with unittest.mock.patch.object(m.subprocess, "run", side_effect=run), \
+                    contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as exited:
+                m.main()
+            self.assertEqual(exited.exception.code, 1)
+            self.assertIn("timed out", err.getvalue())
+            self.status_calls(1)
+            self.assertEqual(len(attempts), 1)
+            with open(self.state) as f:
+                self.assertEqual(json.load(f)["fail_since"], 100)
+
+    def test_unrelated_errors_never_reopen(self):
+        errors = [
+            {"code": "network", "message": "offline"},
+            {"code": "auth.expired", "message": "sign in required"},
+            {"code": "runtime", "message": "Unexpected token 'x', not valid JSON"},
+            {"code": "runtime", "message": "upstream returned 500"},
+            {"code": "runtime", "message": None},
+            "not found",
+        ]
+        for i, error in enumerate(errors):
+            with self.subTest(error=error):
+                self.responses({"ok": False, "error": error})
+                self.check_failed()
+                self.assertEqual(self.browser_calls(), [])
+                self.status_calls(i + 1)
 
 
 class WatcherTest(Base):

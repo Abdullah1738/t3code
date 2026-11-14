@@ -212,7 +212,9 @@ const BoardActivity = tool(
   "A board's activity in a window (default the last 24 hours, at most 72): every ask answered in the window with asked/answered times and minutes to answer (p50/p90/max), open asks and asks open over 6 hours, review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls and how long they lasted, run failures (stalled, retried, fresh thread, reviewer without verdict) by kind and model, threads started, restarts and evaluator wakes, cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. Card numbers only, no titles or text. Read from the cards' stored history; long lists other than the answered asks are cut and say how many more.",
   {
     boardId: BoardRef,
-    since: Schema.optional(describe(TrimmedNonEmptyString, "ISO start; default 24 hours before until.")),
+    since: Schema.optional(
+      describe(TrimmedNonEmptyString, "ISO start; default 24 hours before until."),
+    ),
     until: Schema.optional(describe(TrimmedNonEmptyString, "ISO end; default now.")),
   },
   { activity: Record },
@@ -484,14 +486,14 @@ const CardAsk = tool(
     blocking: Schema.optional(Schema.Boolean),
     ...AskFieldsInput,
   },
-  { card: Record },
+  { card: Record, note: Schema.optional(Schema.String) },
   { readonly: false },
 );
 
 const CardAskChange = tool(
   "card_ask_change",
   "Change an open ask",
-  'Change an open ask (q1, q2... on the card). Pass the fields to replace (question, title, context, options, draft, action, changes, respond...) with revisionNote saying what changed: he sees it as updated and it is his turn again. blocks replaces the evidence shown with it ([] removes it). Do this when he replied that the ask was unclear. Or pass action: "block" makes an async ask blocking, "drop" removes one no longer needed, "return" (evaluators) gives an ask that is with you back to him. A work thread changes only its own card\'s asks; while no thread is attached, its own work thread may drop asks in todo and block or drop asks in needs_owner.',
+  'Change an open ask (q1, q2... on the card). Pass the fields to replace (question, title, context, options, draft, action, changes, respond...) with revisionNote saying what changed: he sees it as updated and it is his turn again. blocks replaces the evidence shown with it ([] removes it). Do this when he replied that the ask was unclear. Or pass action: "block" makes an async ask blocking, "drop" removes one no longer needed, "return" (evaluators) gives an ask that is with you back to him. A work thread changes only its own card\'s asks; while no thread is attached, its own work thread may block or drop asks in todo (blocking moves the card to Needs Owner) and needs_owner.',
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -698,7 +700,10 @@ const DiscussionRead = tool(
     afterSeq: Schema.optional(NonNegativeInt),
     beforeSeq: Schema.optional(NonNegativeInt),
     limit: Schema.optional(
-      describe(PositiveInt, "At most this many messages (max 200), within about 50,000 characters."),
+      describe(
+        PositiveInt,
+        "At most this many messages (max 200), within about 50,000 characters.",
+      ),
     ),
     seq: Schema.optional(describe(PositiveInt, "Read only this message, in full.")),
   },
@@ -829,7 +834,7 @@ const CardEdit = tool(
 const SubtaskDone = tool(
   "subtask_done",
   "Mark a subtask",
-  "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent. With a standing approval live, keep deploy steps worded honestly; don't reword them to dodge the gate.",
+  "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent. Unless standing deploy approval covers it, a gated subtask needs the owner's answer on an ask naming its id; a refusal says which ask is missing. With a standing approval live, keep deploy steps worded honestly; don't reword them to dodge the gate.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -985,12 +990,17 @@ const BoardOpen = tool(
 const ReportBug = tool(
   "report_bug",
   "Report a bug",
-  "Report a tooling bug from any thread. Pass cardHint (e.g. #722) when you already know its card (any stage until it is settled). A hint or strong title match appends a sighting without starting an evaluator; weak matches start a request evaluator, or queue it when the board's spawn limit is full. Identical evidence from this thread on the same card is deduped for 30 minutes. Search matches return up to three candidates, best first.",
+  "Report a tooling bug from any thread. Pass cardHint (e.g. #722, a card on boardId's board) when you already know its card there (any stage until it is settled). A hint or strong title match appends a sighting without starting an evaluator; weak matches start a request evaluator, or queue it when the board's spawn limit is full. Identical evidence from this thread on the same card is deduped for 30 minutes. Search matches return up to three candidates, best first.",
   {
     boardId: describe(TrimmedNonEmptyString, "Destination board id or slug."),
     title: describe(TrimmedNonEmptyString, "Short bug title to search for."),
     evidence: describe(TrimmedNonEmptyString, "What broke, with errors, run ids or log paths."),
-    cardHint: Schema.optional(describe(TrimmedNonEmptyString, "Known card number, e.g. #722.")),
+    cardHint: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        "A card on the destination board: its number (#722), boardslug#722, or its card id. Never your own card's number from another board.",
+      ),
+    ),
   },
   {
     appendedTo: Schema.optional(TrimmedNonEmptyString),

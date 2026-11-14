@@ -5265,7 +5265,7 @@ const make = Effect.gen(function* () {
         stage,
         question: null,
         stalled: null,
-        wakeNote: wake ? text : next.wakeNote,
+        wakeNote: wake ? [next.wakeNote, text].filter(Boolean).join("\n\n") : next.wakeNote,
         movedAt: at,
         updatedAt: at,
       };
@@ -12730,7 +12730,7 @@ const make = Effect.gen(function* () {
               if (ownReviewHandoff) yield* checkCardThread(card, actor, role, true);
               return yield* failWith(
                 "denied",
-                `card #${card.number} has no thread attached: you can only move it to needs_review; ask without blocking for anything else`,
+                `card #${card.number} has no thread attached: you can only move it to needs_review; use card_ask for an owner question`,
               );
             }
           }
@@ -13033,17 +13033,6 @@ const make = Effect.gen(function* () {
         ]);
         const card = yield* cardOf(cardId);
         if (!isUnattachedOwnThread(card, actor)) yield* checkCardThread(card, actor, role);
-        if (
-          role === "cardThread" &&
-          isUnattachedOwnThread(card, actor) &&
-          input.blocking &&
-          card.stage === "todo"
-        ) {
-          return yield* failWith(
-            "denied",
-            `card #${card.number} has no thread attached; a blocking ask needs the card in Working. Ask without blocking, or wait for the dispatcher to attach you.`,
-          );
-        }
         const question = input.question.trim();
         if (!question) return yield* failWith("invalid", "an ask needs the question");
         const written = Asks.askFields(input, { blocking: input.blocking });
@@ -13121,12 +13110,6 @@ const make = Effect.gen(function* () {
           return result.card;
         }
         if (ask.blocking) return yield* failWith("invalid", `${ask.id} already blocks the card`);
-        if (role === "cardThread" && isUnattachedOwnThread(card, actor) && card.stage === "todo") {
-          return yield* failWith(
-            "denied",
-            `card #${card.number} has no thread attached; a blocking ask needs the card in Working. Ask without blocking, or wait for the dispatcher to attach you.`,
-          );
-        }
         const blocking = Asks.updateAsk(card, ask.id, { blocking: true });
         if (card.stage === "needs_owner") {
           const question = Asks.openBlockingAsk(blocking)?.text ?? ask.text;
@@ -15727,11 +15710,23 @@ const make = Effect.gen(function* () {
     const evidence = input.evidence.trim();
     if (!title || !evidence)
       return yield* failWith("invalid", "A bug report needs title and evidence.");
-    const board = (yield* readDb(store.boards)).find(
+    const boards = yield* readDb(store.boards);
+    const board = boards.find(
       (board) => board.id === input.boardId.trim() || board.slug === input.boardId.trim(),
     );
     if (!board) return yield* failWith("invalid", `No Missions board "${input.boardId}".`);
     yield* resolvedContext({ boardId: board.id });
+    const source = yield* readDb(store.threadLink(input.threadId));
+    const reporter =
+      source && (source.role === "work" || source.role === "review")
+        ? yield* Effect.gen(function* () {
+            const sourceBoard = yield* readDb(boardOf(source.boardId));
+            const cards = [...(yield* readDb(store.cardsByThread(input.threadId)))];
+            if (source.cardId && !cards.some((card) => card.id === source.cardId))
+              cards.push(yield* readDb(cardOf(source.cardId)));
+            return { role: source.role, board: sourceBoard, card: cards[0] ?? null, cards };
+          })
+        : undefined;
     const body = `sighting\n\n${evidence}`;
     const actor: KanbanActor = { _tag: "thread", threadId: input.threadId };
     // Recover a committed append if publishing the card change races another board write.
@@ -15742,7 +15737,7 @@ const make = Effect.gen(function* () {
           candidates?: Array<{ id: KanbanCardId; number: number; title: string; score: number }>;
         }
       | undefined;
-    let missedHint: number | undefined;
+    let missedHint: string | undefined;
     const result = yield* SavedWrite.recover(
       guard(
         "bug.report",
@@ -15752,13 +15747,37 @@ const make = Effect.gen(function* () {
           );
           const open = unsettled.filter((card) => !KANBAN_DONE_STAGES.has(card.stage));
           const hint = input.cardHint?.trim();
+          const qualified = hint?.match(/^([^#\s]+)#(\d+)$/);
           const hintNumber =
             hint && /^#?\d+$/.test(hint) ? Number(hint.replace(/^#/, "")) : undefined;
-          const hinted =
-            hintNumber === undefined
-              ? undefined
-              : unsettled.find((card) => card.number === hintNumber);
-          if (hintNumber !== undefined && !hinted) missedHint = hintNumber;
+          let hinted = unsettled.find((card) => card.id.toLowerCase() === hint?.toLowerCase());
+          missedHint = undefined;
+          if (qualified) {
+            const boardPart = qualified[1]!.toLowerCase();
+            const hintBoard = boards.find(
+              (candidate) =>
+                candidate.id.toLowerCase() === boardPart ||
+                candidate.slug.toLowerCase() === boardPart,
+            );
+            if (hintBoard?.id === board.id) {
+              hinted = unsettled.find((card) => card.number === Number(qualified[2]));
+            } else if (hintBoard) {
+              missedHint = `cardHint ${hint} names a card on another board; ignored.`;
+            }
+          } else if (hintNumber !== undefined) {
+            const ownCard = reporter?.cards.find(
+              (card) => card.boardId !== board.id && card.number === hintNumber,
+            );
+            if (ownCard && reporter) {
+              missedHint = `cardHint #${hintNumber} is the reporter's own card on the "${reporter.board.name}" board, not a card on this board; ignored.`;
+            } else {
+              hinted = unsettled.find((card) => card.number === hintNumber);
+            }
+            if (!hinted)
+              missedHint ??= `cardHint #${hintNumber} matched no unsettled card on this board.`;
+          }
+          if (hint && !hinted)
+            missedHint ??= `cardHint ${hint} matched no unsettled card on this board.`;
           const matches = hinted ? [] : bugMatches(open, title);
           const best = matches[0];
           const ambiguous = best && !best.exact && matches[1]?.score === best.score;
@@ -15799,20 +15818,15 @@ const make = Effect.gen(function* () {
     );
     if (result) return result;
     let text = `${title}\n\n${evidence}`;
-    const source = yield* readDb(store.threadLink(input.threadId));
-    if (source && (source.role === "work" || source.role === "review")) {
-      const sourceBoard = yield* readDb(boardOf(source.boardId));
-      const [carried] = yield* readDb(store.cardsByThread(input.threadId));
-      const sourceCard = carried ?? (source.cardId ? yield* readDb(cardOf(source.cardId)) : null);
-      const cardPart = sourceCard
-        ? `, card [#${sourceCard.number} ${sourceCard.title}](t3-context://v1/kanban-card/${sourceCard.id})`
+    if (reporter) {
+      const cardPart = reporter.card
+        ? `, card [#${reporter.card.number} ${reporter.card.title}](t3-context://v1/kanban-card/${reporter.card.id})`
         : "";
-      text = `Handed on by a ${source.role} thread on the "${sourceBoard.name}" board${cardPart}, thread [${input.threadId}](t3-thread://v1/${input.threadId}).\n\n${text}`;
+      text = `Handed on by a ${reporter.role} thread on the "${reporter.board.name}" board${cardPart}, thread [${input.threadId}](t3-thread://v1/${input.threadId}).\n\n${text}`;
     } else {
       text = `Reported by thread [${input.threadId}](t3-thread://v1/${input.threadId}).\n\n${text}`;
     }
-    if (missedHint !== undefined)
-      text = `cardHint #${missedHint} matched no unsettled card on this board.\n\n${text}`;
+    if (missedHint !== undefined) text = `${missedHint}\n\n${text}`;
     const key = uuid();
     // reportBug has already resolved its matches. Caller provenance in the
     // stamped text must not associate a novel report with the caller's own card.
