@@ -1496,6 +1496,7 @@ const make = Effect.gen(function* () {
   });
   const analyticsActors = new WeakMap<KanbanCard, KanbanActor>();
   const preparedTransitions = new WeakSet<KanbanCard>();
+  const scopedWakeSends = new Map<ThreadId, Set<{ scope: string; stale: boolean }>>();
   const poolHours = new Map<string, number>();
   const failedRuns = new Set<string>();
   const stoppedRunCards = new Map<
@@ -1887,6 +1888,19 @@ const make = Effect.gen(function* () {
     "KanbanLaunchReconcile",
     { defaultValue: () => undefined },
   );
+  const discardWake = Effect.fn("KanbanService.discardWake")(
+    function* (threadId: ThreadId, runId: string | void) {
+      if (runId === undefined) return;
+      const wake = queuedWakes(yield* threadIo.queuedRuns(threadId)).find(
+        (run) => run.id === runId,
+      );
+      if (wake !== undefined) yield* touching(threadId, threadIo.cancelQueued(threadId, wake.id));
+    },
+    Effect.catchCause((cause) =>
+      Effect.logWarning("kanban stale wake withdrawal failed", { cause }),
+    ),
+  );
+
   const threads: typeof threadIo = {
     pendingUserInputs: (id) =>
       TickTimings.measure(
@@ -1979,14 +1993,31 @@ const make = Effect.gen(function* () {
       const delivered = yield* ownerDelivered;
       const answer = input.key === undefined;
       if (answer && delivered?.has(input.threadId)) return;
+      const wake =
+        input.coalesce !== undefined && input.model === undefined && input.mode !== "steer"
+          ? { scope: input.coalesce, stale: false }
+          : undefined;
+      if (wake !== undefined) {
+        let pending = scopedWakeSends.get(input.threadId);
+        if (pending === undefined) scopedWakeSends.set(input.threadId, (pending = new Set()));
+        pending.add(wake);
+      }
       const sent = touching(
         input.threadId,
-        threadIo.send({
-          ...input,
-          ...(key === undefined
-            ? {}
-            : { key: `${key}:${input.threadId}:${input.key ?? "answer"}` }),
-        }),
+        threadIo
+          .send({
+            ...input,
+            ...(key === undefined
+              ? {}
+              : { key: `${key}:${input.threadId}:${input.key ?? "answer"}` }),
+          })
+          .pipe(
+            Effect.flatMap((runId) =>
+              wake?.stale
+                ? discardWake(input.threadId, runId).pipe(Effect.asVoid)
+                : Effect.succeed(runId),
+            ),
+          ),
       );
       return yield* trackSend(
         input.threadId,
@@ -1997,10 +2028,20 @@ const make = Effect.gen(function* () {
           ).pipe(
             Effect.tap(() =>
               Effect.sync(() => {
-                if (answer) delivered?.add(input.threadId);
+                if (answer && !wake?.stale) delivered?.add(input.threadId);
               }),
             ),
           ),
+          wake === undefined ? undefined : (runId) => discardWake(input.threadId, runId),
+        ),
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (wake === undefined) return;
+            const pending = scopedWakeSends.get(input.threadId);
+            pending?.delete(wake);
+            if (pending?.size === 0) scopedWakeSends.delete(input.threadId);
+          }),
         ),
       );
     }),
@@ -2899,6 +2940,10 @@ const make = Effect.gen(function* () {
       `owner:${cardId}`,
       ...(discussionId === null ? [] : [`owner:${discussionId}`]),
     ];
+    // A send outside the gate can enqueue after this scan; it must withdraw its own stale result.
+    for (const pending of scopedWakeSends.get(threadId) ?? []) {
+      if (scopes.includes(pending.scope)) pending.stale = true;
+    }
     // Keep the transition gate so a new assignment cannot overtake cleanup.
     for (const wake of queuedWakes(yield* threadIo.queuedRuns(threadId), Infinity, scopes)) {
       yield* touching(threadId, threadIo.cancelQueued(threadId, wake.id));

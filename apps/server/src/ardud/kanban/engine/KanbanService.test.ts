@@ -31782,3 +31782,102 @@ it.effect.each(
       }).pipe(Effect.provide(inlineTestLayer(failing)));
     }),
 );
+
+it.effect.each(
+  (["owner", "nudge"] as const).flatMap((kind) =>
+    (["before enqueue", "after enqueue"] as const).map((gate) => ({ kind, gate })),
+  ),
+)("#1394 $kind wake delayed $gate is withdrawn after departure", ({ kind, gate }) =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const lifecycle = yield* KanbanThreads.pipe(Effect.provide(KanbanThreadLifecycle.layer));
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let work: ThreadId | undefined;
+    let oldWake: string | void;
+    let armed = false;
+    const wrapped = Layer.succeed(
+      KanbanThreads,
+      KanbanThreads.of({
+        ...(yield* KanbanThreads.pipe(Effect.provide(fake.layer))),
+        queuedRuns: (id) => (id === work ? lifecycle.queuedRuns(id) : Effect.succeed([])),
+        cancelQueued: lifecycle.cancelQueued,
+        send: (input) =>
+          Effect.gen(function* () {
+            if (input.threadId !== work) return;
+            const { model: _model, ...message } = input;
+            const delayed =
+              armed &&
+              (kind === "owner"
+                ? input.coalesce?.startsWith("owner:")
+                : input.coalesce === "nudge");
+            if (!delayed) return yield* lifecycle.send(message);
+            armed = false;
+            if (gate === "after enqueue") oldWake = yield* lifecycle.send(message);
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(resume);
+            if (gate === "before enqueue") oldWake = yield* lifecycle.send(message);
+            return oldWake;
+          }),
+      }),
+    );
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const created = yield* kanban.createCard(
+        board.id,
+        { title: "Late wake", prompt: "Work" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      work = (yield* kanban.card(created.id)).card.workThreadId!;
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("late-wake:create"),
+        threadId: work,
+        projectId: ProjectId.make("project-1"),
+        title: "Late wake",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "system",
+        creationSource: "server",
+      });
+      yield* lifecycle.send({ threadId: work, text: "Unstarted active run" });
+      if (kind === "owner") {
+        const discussion = yield* kanban.cardDiscussion(created.id);
+        yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Please reply" }]);
+      }
+      armed = true;
+      const pending = yield* Effect.forkChild(Effect.exit(kanban.turnEnded(work)));
+      yield* Deferred.await(entered);
+      yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: work,
+      });
+      yield* kanban.dispatchNow;
+      const review = (yield* kanban.card(created.id)).card.activeThreadId!;
+      assert.equal((yield* kanban.card(created.id)).card.stage, "in_review");
+      yield* kanban.reviewResult(review, "findings", ["Apply findings"]);
+      yield* kanban.claimCard(work, created.id);
+      if (kind === "nudge") yield* lifecycle.interrupt(work, "Finished initial test run");
+      const fresh = yield* lifecycle.send({ threadId: work, text: "Fresh assignment" });
+      yield* Deferred.succeed(resume, undefined);
+      yield* Fiber.join(pending);
+      assert.isString(oldWake);
+      const records = yield* orchestrator.getThreadRecords(work, ["runs"]);
+      assert.equal(records.runs.find((run) => run.id === oldWake)!.status, "cancelled");
+      assert.equal(
+        records.runs.find((run) => run.id === fresh)!.status,
+        kind === "nudge" ? "starting" : "queued",
+      );
+      assert.equal((yield* kanban.card(created.id)).card.stage, "working");
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(resume, undefined)),
+      Effect.provide(inlineTestLayer(wrapped)),
+    );
+  }).pipe(Effect.provide(unstartedLifecycleLayer())),
+);
