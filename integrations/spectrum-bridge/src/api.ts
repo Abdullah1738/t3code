@@ -68,7 +68,7 @@ async function readBody(request: Request, maxBytes: number): Promise<Record<stri
   const length = request.headers.get("content-length");
   if (length !== null && (!/^\d+$/.test(length) || !Number.isSafeInteger(Number(length)))) throw new ApiError(400);
   if (length !== null && Number(length) > maxBytes) {
-    void request.body?.cancel().catch(() => { toolError("api", "api.catch1");});
+    void request.body?.cancel().catch((caughtError) => { toolError("api", "api.catch1", caughtError);});
     throw new ApiError(413);
   }
   if (!request.body) return {};
@@ -84,7 +84,7 @@ async function readBody(request: Request, maxBytes: number): Promise<Record<stri
       size += value.byteLength;
       if (size > maxBytes) {
         // Do not wait for an untrusted stream's cancellation callback.
-        void reader.cancel().catch(() => { toolError("api", "api.catch2");});
+        void reader.cancel().catch((caughtError) => { toolError("api", "api.catch2", caughtError);});
         throw new ApiError(413);
       }
       text += decoder.decode(value, { stream: true });
@@ -93,7 +93,7 @@ async function readBody(request: Request, maxBytes: number): Promise<Record<stri
     const body: unknown = JSON.parse(text);
     if (!body || typeof body !== "object" || Array.isArray(body)) throw new ApiError(400);
     return body as Record<string, unknown>;
-  } catch (error) { toolError("api", "api.catch3");
+  } catch (error) { toolError("api", "api.catch3", error);
     throw error instanceof ApiError ? error : new ApiError(400);
   } finally {
     reader.releaseLock();
@@ -259,7 +259,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
             return json({ forgotten: true });
           }
           return json({ value: await readSecret(deps, token, field as string) });
-        } catch (error) { toolError("api", "api.catch4");
+        } catch (error) { toolError("api", "api.catch4", error);
           if (error instanceof SecretError) throw new ApiError(error.status);
           throw error;
         }
@@ -420,7 +420,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const earlier = replay();
         if (earlier) return json(earlier, 200);
         let base: string;
-        try { base = await secrets.publishApps(); } catch { toolError("api", "api.catch5"); throw new ApiError(502); }
+        try { base = await secrets.publishApps(); } catch (caughtError) { toolError("api", "api.catch5", caughtError); throw new ApiError(502); }
         if (!validAppUrl(base)) throw new ApiError(502);
         const encryption = secrets.publicForm ? await newFormKeys() : undefined;
         const token = newToken();
@@ -457,7 +457,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
       }
 
       throw new ApiError(404);
-    } catch (error) { toolError("api", "api.catch6");
+    } catch (error) { toolError("api", "api.catch6", error);
       const status = error instanceof ApiError ? error.status : 409;
       return json({ error: errors[status] }, status);
     }

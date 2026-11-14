@@ -97,7 +97,7 @@ export class Store {
       this.db.exec("CREATE INDEX IF NOT EXISTS inbound_failed ON inbound(state) WHERE state = 'failed'");
       // A provider may have accepted these sends before the process stopped.
       this.db.query("UPDATE outbox SET state = 'uncertain' WHERE state = 'sending'").run();
-    } catch (error) { toolError("store", "store.catch1");
+    } catch (error) { toolError("store", "store.catch1", error);
       this.db.close();
       throw error;
     }

@@ -37,7 +37,7 @@ test("an entire message/error fixture cannot leak text, secrets, health values o
   const raw = readFileSync(join(root, `${day}.ndjson`), "utf8");
   for (const secret of [message.text, message.prompt, message.token, message.otp, "83.7", "PASSWORD_SENTINEL", "4111111111111111", "EMAIL_BODY_SENTINEL", "PRIVATE_CAPTION"]) expect(raw).not.toContain(secret);
   expect(JSON.parse(raw).props).toEqual({ count: 2 });
-  expect(JSON.parse(raw).error).toEqual({ tag: "fixture.failed", message: "Operation failed" });
+  expect(JSON.parse(raw).error).toEqual({ tag: "fixture.failed", name: "UnknownError", message: "[redacted]" });
 });
 
 test("retention runs on the first write of each UTC day and touches only old log artifacts", () => {

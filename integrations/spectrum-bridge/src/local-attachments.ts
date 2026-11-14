@@ -91,7 +91,7 @@ function jsonLines<T>(text: string): T[] {
   const out: T[] = [];
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
-    try { out.push(JSON.parse(line) as T); } catch { toolError("local-attachments", "local-attachments.catch1"); /* Skip log noise. */ }
+    try { out.push(JSON.parse(line) as T); } catch (caughtError) { toolError("local-attachments", "local-attachments.catch1", caughtError); /* Skip log noise. */ }
   }
   return out;
 }
@@ -100,7 +100,7 @@ function parseJson(text: string): Record<string, unknown> | undefined {
   try {
     const value = JSON.parse(text);
     return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-  } catch { toolError("local-attachments", "local-attachments.catch2"); return; }
+  } catch (caughtError) { toolError("local-attachments", "local-attachments.catch2", caughtError); return; }
 }
 
 export function createAttachmentRecovery(deps: RecoveryDeps = {}): Recover {
@@ -156,7 +156,7 @@ export function createAttachmentRecovery(deps: RecoveryDeps = {}): Recover {
       ...active.filter(chat => chat.id !== known),
     ].slice(0, 6);
     for (const chat of ordered) {
-      const match = await findIn(chat, request).catch(() => { toolError("local-attachments", "local-attachments.catch3"); return undefined; });
+      const match = await findIn(chat, request).catch((caughtError) => { toolError("local-attachments", "local-attachments.catch3", caughtError); return undefined; });
       if (match) {
         remembered = match.chatId;
         if (match.chatId !== known) deps.rememberedChat?.set(match.chatId);
@@ -172,13 +172,13 @@ export function createAttachmentRecovery(deps: RecoveryDeps = {}): Recover {
     try {
       const [root, real] = await Promise.all([realpath(attachmentsRoot), realpath(expanded)]);
       return real.startsWith(root + sep) ? real : undefined;
-    } catch { toolError("local-attachments", "local-attachments.catch4"); return; }
+    } catch (caughtError) { toolError("local-attachments", "local-attachments.catch4", caughtError); return; }
   };
 
   const ready = async (match: Match, request: RecoveryRequest): Promise<string | undefined> => {
     const path = await safePath(match.attachment.original_path);
     if (!path) return;
-    const info = await stat(path).catch(() => { toolError("local-attachments", "local-attachments.catch5"); return undefined; });
+    const info = await stat(path).catch((caughtError) => { toolError("local-attachments", "local-attachments.catch5", caughtError); return undefined; });
     if (!info?.isFile()) return;
     const expected = match.attachment.total_bytes || request.totalBytes;
     return !expected || info.size === expected ? path : undefined;
@@ -204,7 +204,7 @@ export function createAttachmentRecovery(deps: RecoveryDeps = {}): Recover {
     for (const window of candidates) {
       const state = await cuaCall("get_window_state", {
         pid, window_id: window.window_id, include_screenshot: false, query: request.fileName,
-      }).catch(() => { toolError("local-attachments", "local-attachments.catch6"); return undefined; });
+      }).catch((caughtError) => { toolError("local-attachments", "local-attachments.catch6", caughtError); return undefined; });
       const elements = (Array.isArray(state?.elements) ? state.elements : []) as {
         role?: string; label?: string; element_token?: string; actions?: string[];
       }[];
@@ -219,7 +219,7 @@ export function createAttachmentRecovery(deps: RecoveryDeps = {}): Recover {
 
   return async request => {
     let match: Match | undefined;
-    try { match = await locate(request); } catch { toolError("local-attachments", "local-attachments.catch7"); return { detail: { reason: "imsgUnavailable" } }; }
+    try { match = await locate(request); } catch (caughtError) { toolError("local-attachments", "local-attachments.catch7", caughtError); return { detail: { reason: "imsgUnavailable" } }; }
     if (!match) return { detail: { reason: "notFoundInMessages" } };
     const detail: RecoveryDetail = {
       chatId: match.chatId,
@@ -231,7 +231,7 @@ export function createAttachmentRecovery(deps: RecoveryDeps = {}): Recover {
     let path = await ready(match, request);
     if (!path) {
       let triggered: string;
-      try { triggered = await triggerDownload(match, request); } catch { toolError("local-attachments", "local-attachments.catch8"); triggered = "cuaDriverFailed"; }
+      try { triggered = await triggerDownload(match, request); } catch (caughtError) { toolError("local-attachments", "local-attachments.catch8", caughtError); triggered = "cuaDriverFailed"; }
       if (triggered !== "pressed") return { detail: { ...detail, reason: triggered } };
       const deadline = now() + waitMs;
       while (!path && now() < deadline) {

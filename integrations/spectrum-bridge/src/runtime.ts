@@ -236,7 +236,7 @@ function parseBody(raw: Uint8Array): Record<string, unknown> | undefined {
   try {
     const value: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
     return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-  } catch { toolError("runtime", "runtime.catch1"); return undefined; }
+  } catch (caughtError) { toolError("runtime", "runtime.catch1", caughtError); return undefined; }
 }
 
 const askText = (from: ChatInfo, question: string) =>
@@ -334,7 +334,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           let created: boolean;
           // Like send --to, this is an owner-authorized relay, not a reply in the recipient's session.
           try { created = target.store.enqueue({ id, kind: "conversation", text: "", app }); }
-          catch { toolError("runtime", "runtime.catch2"); throw new HttpError(409, "Operation could not be completed"); }
+          catch (caughtError) { toolError("runtime", "runtime.catch2", caughtError); throw new HttpError(409, "Operation could not be completed"); }
           return reply(created ? 202 : 200, { id, created });
         }
         case "/send": {
@@ -348,7 +348,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           const id = `send:${hash(`${target.info.slug}:${dedupeKey}`)}`;
           let created: boolean;
           try { created = target.store.enqueue({ id, kind: "conversation", text: body.text }); }
-          catch { toolError("runtime", "runtime.catch3"); throw new HttpError(409, "Operation could not be completed"); }
+          catch (caughtError) { toolError("runtime", "runtime.catch3", caughtError); throw new HttpError(409, "Operation could not be completed"); }
           return reply(created ? 202 : 200, { id, created });
         }
         case "/wake": {
@@ -480,7 +480,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
         default:
           return reply(404, { error: "Not found" });
       }
-    } catch (error) { toolError("runtime", "runtime.catch4");
+    } catch (error) { toolError("runtime", "runtime.catch4", error);
       if (error instanceof HttpError) return reply(error.status, { error: error.message });
       if (error instanceof LineError) return reply(502, { error: "Sendblue request failed" });
       return reply(500, { error: "Internal error" });

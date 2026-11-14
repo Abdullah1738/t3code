@@ -15,6 +15,9 @@ import sys
 import tempfile
 from functools import lru_cache
 
+# Keep iMessage class names in sync with spectrum-bridge/src/log-error.ts.
+_IMESSAGE_ERROR_NAMES = frozenset('Error TypeError RangeError ReferenceError SyntaxError URIError EvalError AggregateError IMessageError APIError FetchError HTTPError NetworkError ZodError AbortError TimeoutError SystemError SQLiteError SqliteError DOMException JudgeError TransportError PublishError CliError SttError SecretError ShareError HttpError ApiError ControlError LineError SendblueError ValidationError UnknownError'.split())
+
 CAP_BYTES = 50 * 1024 * 1024
 HOOKS_CAP_BYTES = 35 * 1024 * 1024
 HOOK_SAMPLE_RATE = 128
@@ -493,11 +496,17 @@ def rollup(board, day, top_n=20):
                 item['count'] += weight
         tag = (row.get('error') or {}).get('tag')
         if isinstance(tag, str):
-            tags[tag] += weight
-            references.setdefault(tag, {'file': day + '.ndjson', 'line': line_number, 'ts': row.get('ts')})
+            key = tag
+            if board == 'imessage':
+                error_name = (row.get('error') or {}).get('name')
+                if not isinstance(error_name, str) or error_name not in _IMESSAGE_ERROR_NAMES:
+                    error_name = 'UnknownError'
+                key = (tag, error_name)
+            tags[key] += weight
+            references.setdefault(key, {'file': day + '.ndjson', 'line': line_number, 'ts': row.get('ts')})
             identity = row.get('ids')
             if isinstance(identity, dict) and identity:
-                samples.setdefault(tag, identity)
+                samples.setdefault(key, identity)
     def percentiles(values):
         values.sort()
         count = sum(weight for _, weight in values)
@@ -542,8 +551,9 @@ def rollup(board, day, top_n=20):
                                      sorted(threads.items(), key=lambda x: (-x[1], x[0]))[:top_n]]
                                  for rule, threads in sorted(threads_by_rule.items())},
             'repeatLoops': loops,
-            'topErrorTags': [{'tag': tag, 'count': count, 'sampleId': samples.get(tag, references[tag])}
-                             for tag, count in sorted(tags.items(), key=lambda x: (-x[1], x[0]))[:20]]}
+            'topErrorTags': [{**({'tag': key[0], 'name': key[1]} if board == 'imessage' else {'tag': key}),
+                              'count': count, 'sampleId': samples.get(key, references[key])}
+                             for key, count in sorted(tags.items(), key=lambda x: (-x[1], x[0]))[:20]]}
     if board == 'orders':
         result['durationsMs'] = {name: dict(values) for name, values in result['durationMsByName'].items()}
         if order_polls:

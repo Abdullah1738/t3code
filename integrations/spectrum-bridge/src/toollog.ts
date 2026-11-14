@@ -8,14 +8,16 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { cleanCalls, createCallAggregation, type CallSummary } from "./log-calls.ts";
 import { summarizeLog } from "./log-rollup.ts";
+import { cleanSite, errorDetail, logSite, type ErrorDetail } from "./log-error.ts";
 
 export type LogLine = {
   ts: string; tool: "imessage"; component: string; kind: "event" | "perf" | "error"; name: string;
   durationMs?: number; ok?: boolean; ids?: Record<string, string>; props?: Record<string, string | number | boolean>;
-  error?: { tag: string; message: string };
+  site?: string;
+  error?: { tag: string } & ErrorDetail;
   calls?: CallSummary;
 };
-type Entry = Omit<LogLine, "ts" | "tool">;
+type Entry = Omit<LogLine, "ts" | "tool" | "error"> & { error?: { tag: string; cause?: unknown } & Partial<ErrorDetail> };
 const processRunId = randomUUID();
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
@@ -29,7 +31,7 @@ const ENUMS: Record<string, readonly string[]> = {
   method: ["GET", "POST", "PUT", "DELETE", "PATCH"],
 };
 
-// Deliberately do not serialize input objects or Error.message: either can contain a whole prompt or credential.
+// Only reduced diagnostics cross this boundary; input objects can contain prompts or credentials.
 function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (!LABEL.test(entry.component) || !LABEL.test(entry.name) || !["event", "perf", "error"].includes(entry.kind)) return;
   const line: LogLine = { ts, tool: "imessage", component: entry.component, kind: entry.kind, name: entry.name };
@@ -55,7 +57,14 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
     let tag = entry.error?.tag ?? "";
     if (/^http_[1-5]\d{2}/.test(tag)) tag = safeLineFailureCode(tag);
     else if (tag.startsWith("sendblue.")) tag = `sendblue.${sendblueErrorKey(tag.slice(9)) ?? "async_failure"}`;
-    line.error = { tag: TAG.test(tag) ? tag : "operation.failed", message: "Operation failed" };
+    const status = /^http_([1-5]\d{2})/.exec(tag)?.[1];
+    const name = tag.startsWith("form.") ? "ValidationError" : tag.startsWith("sendblue.") ? "SendblueError" : status ? "HttpError" : "UnknownError";
+    line.error = { tag: TAG.test(tag) ? tag : "operation.failed", ...errorDetail(entry.error?.cause, {
+      name, ...entry.error, status: entry.error?.status ?? (status ? Number(status) : typeof props.status === "number" ? props.status : undefined),
+      code: entry.error?.code ?? (status ? safeLineFailureCode(tag) : undefined),
+    }) };
+    const site = cleanSite(entry.site);
+    if (site) line.site = site;
   }
   return line;
 }
@@ -118,6 +127,8 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   }
   function write(entry: Entry): void {
     try {
+      if (entry.kind === "error" || entry.name === "form.fail") entry = { ...entry, site: entry.site ?? logSite() };
+      if (entry.name === "form.fail" && entry.kind !== "error") entry = { ...entry, kind: "error", error: entry.error ?? { tag: "form.gone" } };
       const line = clean(entry, new Date(now()).toISOString(), processRunId);
       if (!line) return;
       for (const record of calls.accept(line, entry.ids?.runId !== undefined)) enqueue(record);
@@ -228,8 +239,8 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
 }
 
 export const toolLog = createToolLog({ defer: true });
-export function toolError(component: string, tag: string, ids?: LogLine["ids"]): void {
-  toolLog.write({ component, kind: "error", name: "bridge.catch", ok: false, ids, error: { tag, message: "" } });
+export function toolError(component: string, tag: string, cause: unknown, ids?: LogLine["ids"]): void {
+  toolLog.write({ component, kind: "error", name: "bridge.catch", ok: false, ids, error: { tag, cause } });
 }
 export function cardKind(value: string): string {
   // Generator names only; captions, query values and health data never enter the log.
