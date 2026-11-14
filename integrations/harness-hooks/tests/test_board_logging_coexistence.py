@@ -1,4 +1,9 @@
 """Both hook consumers keep their own event, once per guard decision."""
+if __package__:
+    from . import test_environment
+else:
+    import test_environment
+
 import contextlib
 import json
 import os

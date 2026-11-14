@@ -1,4 +1,9 @@
 """Reporter inputs are classified, never executed or resolved on old mounts."""
+if __package__:
+    from . import test_environment
+else:
+    import test_environment
+
 from contextlib import redirect_stdout
 import hashlib
 import io

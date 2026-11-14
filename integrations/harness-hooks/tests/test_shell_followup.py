@@ -1,3 +1,8 @@
+if __package__:
+    from . import test_environment
+else:
+    import test_environment
+
 import os
 from pathlib import Path
 import subprocess

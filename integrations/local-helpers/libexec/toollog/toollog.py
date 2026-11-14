@@ -321,6 +321,10 @@ def read(board, day, kind=None, name=None):
         yield row
 
 
+_UUID = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
+_ROBOB_THREAD = re.compile(rf'(?:(?:mcp:|ardud-control:thread:)?{_UUID}|thread:project:[A-Za-z0-9_.:%-]+:{_UUID})\Z')
+
+
 def _hook_attempt(row):
     if row.get('name') != 'hook.decision':
         return None
@@ -328,13 +332,29 @@ def _hook_attempt(row):
     if not isinstance(props, dict) or not isinstance(ids, dict):
         return None
     thread, rule, ts = ids.get('threadId'), props.get('rule'), row.get('ts')
-    if not isinstance(thread, str) or not isinstance(rule, str) or thread.startswith('unknown:'):
+    if not isinstance(thread, str) or not isinstance(rule, str):
+        return None
+    decision = props.get('decision')
+    if 'decision' not in props and (row.get('kind') == 'error' or row.get('ok') is False):
+        decision = 'denied'
+    if decision not in ('denied', 'rewritten'):
         return None
     try:
         at = datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() if isinstance(ts, str) else None
     except (ValueError, TypeError):
         at = None
-    return thread, rule, at
+    return thread, rule, decision, at
+
+
+def _hook_weight(row):
+    # Refusals normally have no sampling. Preserve unexpected estimates and
+    # label them, even on error rows; the general totals retain their old rules.
+    rate = row['props'].get('sampleRate')
+    return rate if type(rate) is int and 1 <= rate <= 2**53 - 1 else 1
+
+
+def _attributed_thread(thread):
+    return bool(thread.startswith('native:') and thread[7:] or _ROBOB_THREAD.fullmatch(thread))
 
 
 def _sample_rate(row):
@@ -419,6 +439,9 @@ def rollup(board, day, top_n=20):
     component_totals, component_errors = Counter(), defaultdict(Counter)
     component_samples, component_durations = defaultdict(dict), defaultdict(list)
     threads_by_rule, attempts = defaultdict(Counter), defaultdict(list)
+    thread_decisions, unattributed = defaultdict(Counter), defaultdict(Counter)
+    sampled_threads, sampled_attempts, sampled_unknown = set(), set(), set()
+    unrecognized = 0
     caps = []
     recorded = 0
     last_record = None
@@ -447,10 +470,23 @@ def rollup(board, day, top_n=20):
         counts_kind[kind] += weight
         attempt = _hook_attempt(row)
         if attempt:
-            thread, rule, at = attempt
-            threads_by_rule[rule][thread] += weight
-            if at is not None and start <= at < start + 86400:
-                attempts[(thread, rule)].append((at, _sample_rate(row)))
+            thread, rule, decision, at = attempt
+            refusal_weight = _hook_weight(row)
+            if thread.startswith('unknown:'):
+                unattributed[(rule, thread)][decision] += refusal_weight
+                if refusal_weight > 1:
+                    sampled_unknown.add((rule, thread))
+            elif _attributed_thread(thread):
+                threads_by_rule[rule][thread] += refusal_weight
+                thread_decisions[(rule, thread)][decision] += refusal_weight
+                if refusal_weight > 1:
+                    sampled_threads.add((rule, thread))
+                if at is not None and start <= at < start + 86400:
+                    attempts[(thread, rule, decision)].append((at, refusal_weight))
+                    if refusal_weight > 1:
+                        sampled_attempts.add((thread, rule, decision))
+            else:
+                unrecognized += refusal_weight
         row_ok = row['_rollup_ok'] if aggregate else weight * (row.get('ok') is True)
         row_failed = row['_rollup_failed'] if aggregate else weight * (row.get('ok') is False)
         observed += row_ok + row_failed
@@ -527,12 +563,15 @@ def rollup(board, day, top_n=20):
     for _, row in _read_records(board, (day_start - timedelta(days=1)).strftime('%Y-%m-%d')):
         attempt = _hook_attempt(row)
         if attempt:
-            thread, rule, at = attempt
-            if (thread, rule) in attempts and at is not None and start - 3600 <= at < start:
-                weight = _sample_rate(row)
+            thread, rule, decision, at = attempt
+            key = (thread, rule, decision)
+            if key in attempts and at is not None and start - 3600 <= at < start:
+                weight = _hook_weight(row)
                 sampled |= weight > 1
-                attempts[(thread, rule)].append((at, weight))
-    for (thread, rule), timestamps in sorted(attempts.items()):
+                attempts[key].append((at, weight))
+                if weight > 1:
+                    sampled_attempts.add(key)
+    for (thread, rule, decision), timestamps in sorted(attempts.items()):
         timestamps.sort()
         left = peak = window_count = 0
         for at, weight in timestamps:
@@ -543,17 +582,29 @@ def rollup(board, day, top_n=20):
             if at >= start:
                 peak = max(peak, window_count)
         if peak > 20:
-            loops.append({'threadId': thread, 'rule': rule, 'maxCountInHour': peak, 'repeatLoop': True})
+            loops.append({'threadId': thread, 'rule': rule, 'decision': decision,
+                          'maxCountInHour': peak, 'repeatLoop': True,
+                          'sampled': (thread, rule, decision) in sampled_attempts})
     result = {'schemaVersion': 1, 'tool': board, 'day': day, 'total': total,
             'recordedRows': recorded, 'sampled': sampled, 'logCaps': caps,
             'countsByName': dict(counts_name), 'countsByKind': dict(counts_kind),
             'okCount': oks, 'failedCount': failed, 'okRate': oks / observed if observed else None,
             'errorRate': errors / total if total else 0,
             'durationMsByName': {name: percentiles(values) for name, values in sorted(durations.items())},
-            'topThreadsByRule': {rule: [{'threadId': thread, 'count': count} for thread, count in
+            'topThreadsByRule': {rule: [{'threadId': thread, 'count': count, 'attributed': True,
+                                      'denied': thread_decisions[(rule, thread)]['denied'],
+                                      'rewritten': thread_decisions[(rule, thread)]['rewritten'],
+                                      'sampled': (rule, thread) in sampled_threads} for thread, count in
                                      sorted(threads.items(), key=lambda x: (-x[1], x[0]))[:top_n]]
                                  for rule, threads in sorted(threads_by_rule.items())},
             'repeatLoops': loops,
+            'unattributedByRule': {rule: [
+                {'threadId': thread, 'count': sum(counts.values()), 'attributed': False,
+                 'denied': counts['denied'], 'rewritten': counts['rewritten'],
+                 'sampled': (rule, thread) in sampled_unknown}
+                for (entry_rule, thread), counts in sorted(unattributed.items()) if entry_rule == rule]
+                for rule in sorted({rule for rule, _ in unattributed})},
+            'unrecognizedThreadIds': unrecognized,
             'topErrorTags': [{**({'tag': key[0], 'name': key[1]} if board == 'imessage' else {'tag': key}),
                               'count': count, 'sampleId': samples.get(key, references[key])}
                              for key, count in sorted(tags.items(), key=lambda x: (-x[1], x[0]))[:20]]}

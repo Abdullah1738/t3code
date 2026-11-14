@@ -230,11 +230,17 @@ budget, including older markers as `component: all`.
 Allowed/rewritten non-error decisions are sampled 1-in-128 and omit default
 optional props. Missing `repeatCount` means 1, `cwdClass` means `other`, and
 `matchedRoot`/`argv0Class` mean `none`. Rollup weights counts, rates, duration
-percentiles and loop windows by `sampleRate`; `sampled: true` marks estimates,
+percentiles by `sampleRate`; `sampled: true` marks estimates,
 while `recordedRows` reports the stored count. Denials and other hook errors
 keep every row and all their context.
 Hook rollups include `topThreadsByRule` (`--top N`, default 20) and `repeatLoops`
-for a thread/rule appearing more than 20 times in a sliding hour. Loop windows
+for attributed threads refused more than 20 times in a sliding hour. Rankings
+exclude allowed decisions and split denied/rewritten counts; loops also split
+by decision. Legacy rows without a decision count only when `kind: error` or
+`ok: false`. Unexpected sampled refusals retain their weight and are marked
+`sampled: true`. `unattributedByRule` keeps `unknown:*` refusal buckets visible
+outside thread rankings and loops. `unrecognizedThreadIds` counts refusals with
+IDs outside the native or Robob thread formats, including test fixtures. Loop windows
 can include the previous UTC day's last hour; daily totals stay local.
 `threadIdSource` distinguishes a resolved Robob ID from a native session fallback
 or missing identity. `repeatCount` tracks matching session/rule/first-word retries
