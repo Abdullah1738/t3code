@@ -107,14 +107,15 @@ test.each(["forgotten", "expired", "deadline"])("sweep ENOENT stays quiet after 
   request();
   await submitSecret(deps(), token, new URLSearchParams({ password: secret }));
   const readdir = fs.readdir;
-  const race = spyOn(fs, "readdir").mockImplementationOnce(async (...args) => {
+  const race = spyOn(fs, "readdir").mockImplementationOnce(async () => {
     if (state === "forgotten") await forgetSecret(deps(), token);
     else {
       clock += SECRET_VALUE_TTL_MS;
       if (state === "expired") await expect(readSecret(deps(), token, "password")).rejects.toMatchObject({ status: 410 });
     }
     await fs.rm(join(root, "secrets"), { recursive: true });
-    return readdir(...args);
+    await readdir(join(root, "secrets"));
+    throw new Error("Expected the directory to be missing");
   });
   try { await sweepSecrets(deps()); } finally { race.mockRestore(); }
   expect(getSecretRequest(store, token)?.state).toBe(state === "deadline" ? "submitted" : state);
@@ -142,10 +143,11 @@ test("sweep still reports missing values when one submission is forgotten and an
   await submitSecret(deps(), token, new URLSearchParams({ password: secret }));
   await submitSecret(deps(), other, new URLSearchParams({ password: secret }));
   const readdir = fs.readdir;
-  const race = spyOn(fs, "readdir").mockImplementationOnce(async (...args) => {
+  const race = spyOn(fs, "readdir").mockImplementationOnce(async () => {
     await forgetSecret(deps(), token);
     await fs.rm(join(root, "secrets"), { recursive: true });
-    return readdir(...args);
+    await readdir(join(root, "secrets"));
+    throw new Error("Expected the directory to be missing");
   });
   try { await sweepSecrets(deps()); } finally { race.mockRestore(); }
   expect(getSecretRequest(store, token)?.state).toBe("forgotten");
