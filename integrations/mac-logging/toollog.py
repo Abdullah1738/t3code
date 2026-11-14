@@ -360,7 +360,8 @@ def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=No
                 if kind != 'error' and not coverage_gap:
                     return
             append(fd, row)
+            return True
         finally:
             os.close(fd)
     except Exception:
-        pass
+        return False
