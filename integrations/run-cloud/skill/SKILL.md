@@ -135,10 +135,15 @@ don't retry them. `simulator_capacity_unavailable` means retry later.
 Android typing: `completed` and `characterCount` acknowledge injection, not the
 field's value. With CLI 0.2.183, a 62-character onion arrived as `vwxy` (4 chars)
 in Settings search. Confirm focus before input and check the field and screen
-afterward. Read non-secure fields from the accessibility tree (AX);
-values containing `"` can read as null even when visible (#113), so also check
-a screenshot. For secure fields, use the app's validator or a Show password
-toggle (confirm masking is off before reading AX).
+afterward. Read non-secure fields from the accessibility tree (AX).
+TorSSH captures lost `"`-bearing values, labels and `contentDescription`; the
+wrapper/CLI/SDK preserve these strings. Later Settings probes preserved quotes,
+so check nulls against screenshots or app code before filing an app-label defect.
+For secure fields, use the app's validator or a Show password toggle (confirm
+masking is off before reading AX).
+Ctrl+A lost focus without selecting in Settings and reportedly dismissed TorSSH
+D17. Prefer touch Select all/Paste for public text; touch Paste matched six short
+Settings probes (including quotes/JSON), without proving a secure-field route.
 SDK paste: one unverified reporter success in TorSSH #15's app, using
 `setClipboard(text)` + `pressKey('v', control)`. CLI Ctrl-V paste
 (`set-clipboard` then `press-key v --control`) did not work in the 2026-11-14
