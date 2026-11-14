@@ -620,6 +620,7 @@ describe("kanbanBoardIcon", () => {
     expect(kanbanBoardIcon(decodeBoard({ ...stored, icon: "retired" }))).toBeNull();
     expect(decodeBoard(stored).iconImage).toBeNull();
     expect(decodeBoard(stored).nightlyReview).toBeNull();
+    expect(decodeBoard(stored).standingApprovals).toEqual([]);
   });
 
   it("takes only small inline pictures as a board image", () => {

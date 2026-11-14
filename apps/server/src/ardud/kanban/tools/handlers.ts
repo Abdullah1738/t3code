@@ -21,6 +21,8 @@ import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as McpDeadline from "../../../mcp/McpDeadline.ts";
 import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import type { EvaluatorPurpose } from "../engine/briefs.ts";
@@ -763,6 +765,35 @@ const handlers = {
     ),
   ),
 
+  board_standing_approval: McpToolAccess.actsAsCaller((input) =>
+    withCaller((service, caller) =>
+      Effect.gen(function* () {
+        if (caller.link?.role !== "evaluator")
+          return yield* refuse("Only evaluators grant or revoke standing approvals.");
+        const board = yield* boardFor(service, caller, input.boardId);
+        const card =
+          input.action === "grant" && input.card
+            ? yield* cardFor(service, caller, input.card, input.boardId)
+            : undefined;
+        return yield* service.standingApproval(
+          board.id,
+          {
+            action: input.action,
+            boards: input.boards,
+            quote: input.quote,
+            sourceThreadId: input.sourceThreadId,
+            saidAt: input.saidAt,
+            cardId: card?.id,
+            ask: input.ask,
+            id: input.id,
+            reason: input.reason,
+          },
+          caller.actor,
+        );
+      }),
+    ),
+  ),
+
   card_wait: McpToolAccess.actsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
@@ -1067,6 +1098,13 @@ const handlers = {
           })),
           holdsSlot: next.holdsSlot,
         };
+      }),
+    ).pipe(
+      NodeSqliteClient.foregroundReads,
+      McpDeadline.awaitInterruptibly,
+      Effect.timeoutOrElse({
+        duration: "2 seconds",
+        orElse: () => invalid("card_next is busy; retry shortly."),
       }),
     ),
   ),

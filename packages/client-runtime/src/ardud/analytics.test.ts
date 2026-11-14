@@ -732,6 +732,7 @@ const kanbanMethodClasses = {
   wiki: "read",
   boardCreate: "mutation",
   boardUpdate: "mutation",
+  standingApprovalRevoke: "mutation",
   setupStart: "mutation",
   setupEnd: "mutation",
   boardPause: "mutation",

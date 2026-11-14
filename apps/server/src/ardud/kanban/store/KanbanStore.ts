@@ -22,6 +22,7 @@ import {
   KanbanThreadLink,
   KanbanWikiPage,
   type KanbanActor,
+  type KanbanScheduleCard,
   KanbanBoardId,
   ThreadId,
   KanbanCardId,
@@ -56,6 +57,22 @@ const codec = <S extends Schema.Top>(schema: S) => {
 const Board = codec(KanbanBoard);
 const Card = codec(KanbanCard);
 const Summary = codec(SummaryCard);
+const SchedulingCard = codec(
+  Schema.Struct({
+    id: KanbanCard.fields.id,
+    number: KanbanCard.fields.number,
+    stage: KanbanCard.fields.stage,
+    settledAt: KanbanCard.fields.settledAt,
+    priority: KanbanCard.fields.priority,
+    blockedBy: KanbanCard.fields.blockedBy,
+    updatedAt: KanbanCard.fields.updatedAt,
+    movedAt: KanbanCard.fields.movedAt,
+    activeThreadId: KanbanCard.fields.activeThreadId,
+    subtasks: KanbanCard.fields.subtasks,
+    wait: KanbanCard.fields.wait,
+    deciding: KanbanCard.fields.deciding,
+  }),
+);
 const CardEvent = codec(
   KanbanCardEvent.mapFields((fields) => ({ ...fields, id: Schema.optionalKey(fields.id) })),
 );
@@ -128,6 +145,13 @@ export interface KanbanStoreShape {
   readonly cards: (
     boardId: KanbanBoardId,
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
+  readonly schedulingCards: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<ReadonlyArray<KanbanScheduleCard>, KanbanStoreError>;
+  readonly claimCards: (
+    boardId: KanbanBoardId,
+    seeds: ReadonlyArray<string>,
+  ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
   readonly watchCardWrites: (
     boardId: KanbanBoardId,
   ) => Effect.Effect<Set<KanbanCardId>, never, Scope.Scope>;
@@ -158,6 +182,10 @@ export interface KanbanStoreShape {
   readonly cardsByThread: (
     threadId: string,
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
+  readonly poolThreadIds: (
+    boardId: KanbanBoardId,
+    pool: string,
+  ) => Effect.Effect<ReadonlyArray<string>, KanbanStoreError>;
   readonly cardsInStage: (
     stage: KanbanStage,
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
@@ -409,6 +437,7 @@ const make = Effect.gen(function* () {
     board: cached("board", Board.decode, rowKey),
     card: cached("card", Card.decode, rowKey),
     feed: cached("feed", Card.decode, rowKey),
+    scheduling: cached("scheduling", SchedulingCard.decode, rowKey),
     summary: cached("summary", Summary.decode, rowKey),
     goal: cached("goal", Goal.decode, rowKey),
     goalFeed: cached("goalFeed", Goal.decode, rowKey),
@@ -710,6 +739,66 @@ const make = Effect.gen(function* () {
       Effect.flatMap(
         sql<KeyedJsonRow>`SELECT id, board_id, cache_version, json FROM ardud_kanban_cards WHERE board_id = ${boardId} AND number = ${number}`,
         (rows) => Effect.map(decodeAll(rows, decoders.card), first),
+      ),
+    );
+  const schedulingCards = (boardId: KanbanBoardId) =>
+    runRead(
+      "read scheduling cards",
+      Effect.gen(function* () {
+        const rows = yield* sql<KeyedJsonRow>`
+        SELECT id, board_id, cache_version, json_patch(json_object(
+          'id', id, 'number', number, 'stage', stage,
+          'settledAt', json_extract(json, '$.settledAt'),
+          'priority', json_extract(json, '$.priority'),
+          'blockedBy', json_extract(json, '$.blockedBy'),
+          'updatedAt', json_extract(json, '$.updatedAt'),
+          'movedAt', json_extract(json, '$.movedAt'),
+          'activeThreadId', active_thread_id,
+          'subtasks', CASE WHEN json_type(json, '$.subtasks') IS NULL THEN json('[]')
+              ELSE json_extract(json, '$.subtasks') END
+        ), json_object(
+          'wait', json_extract(json, '$.wait'),
+          'deciding', json_extract(json, '$.deciding')
+        )) AS json
+        FROM ardud_kanban_cards WHERE board_id = ${boardId} ORDER BY number
+      `;
+        yield* decoders.scheduling.reconcile(boardId, new Set(rows.map((row) => row.id)));
+        return yield* decodeAll(rows, decoders.scheduling);
+      }),
+    );
+  const claimCards: KanbanStoreShape["claimCards"] = (boardId, seeds) =>
+    runRead(
+      "read claim cards",
+      Effect.flatMap(
+        sql<KeyedJsonRow>`
+        WITH RECURSIVE relevant(id) AS (
+          SELECT id FROM ardud_kanban_cards WHERE board_id = ${boardId} AND stage = 'todo'
+          UNION
+          SELECT id FROM ardud_kanban_cards
+          WHERE board_id = ${boardId} AND id IN (SELECT value FROM json_each(${JSON.stringify(seeds)}))
+          UNION
+          SELECT blocker.value FROM relevant
+          JOIN ardud_kanban_cards AS card ON card.id = relevant.id AND card.board_id = ${boardId}
+          JOIN json_each(card.json, '$.blockedBy') AS blocker
+        )
+        SELECT id, board_id, cache_version, json FROM ardud_kanban_cards
+        WHERE board_id = ${boardId} AND id IN (SELECT id FROM relevant)
+        ORDER BY number
+      `,
+        (rows) => decodeAll(rows, decoders.card),
+      ),
+    );
+  const poolThreadIds: KanbanStoreShape["poolThreadIds"] = (boardId, pool) =>
+    runRead(
+      "read pool thread ids",
+      Effect.map(
+        sql<{ readonly thread_id: string }>`
+        SELECT DISTINCT active_thread_id AS thread_id
+        FROM ardud_kanban_cards INDEXED BY ardud_kanban_cards_dispatch
+        WHERE board_id = ${boardId} AND active_thread_id IS NOT NULL
+          AND json_extract(json, '$.activePool') = ${pool}
+      `,
+        (rows) => rows.map((row) => row.thread_id),
       ),
     );
   const cardsByThread = (threadId: string) =>
@@ -1429,6 +1518,9 @@ const make = Effect.gen(function* () {
     card,
     cardByNumber,
     cardsByThread,
+    poolThreadIds,
+    claimCards,
+    schedulingCards,
     cardsInStage,
     nextCardNumber,
     putCard,

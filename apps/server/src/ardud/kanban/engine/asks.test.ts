@@ -950,3 +950,99 @@ describe("subtask approval options", () => {
     );
   });
 });
+
+it.each(
+  ["Deploy the pause worker", "Deploy the delay queue"].flatMap((label) =>
+    (["create", "revise"] as const).map((operation) => ({ label, operation })),
+  ),
+)("round 3 review regression: positive action name $operation $label", ({ label, operation }) => {
+  const target = {
+    number: 1325,
+    subtasks: [
+      {
+        id: "s4",
+        text: label,
+        step: 1,
+        owner: "evaluator" as const,
+        gate: "deploy" as const,
+        state: "open" as const,
+        note: null,
+        doneBy: null,
+        doneAt: null,
+      },
+    ],
+  };
+  const input = { options: [{ label, approves: ["s4"] }, "Wait"] };
+  const result =
+    operation === "create"
+      ? Asks.askFields(input, { blocking: false, card: target })
+      : Asks.reviseAsk(ask({ options: ["Approve", "Wait"] }), input, LATER, target);
+  assert.isFalse(Asks.isAskProblem(result), JSON.stringify(result));
+});
+
+it("round 3 review check: Recall #8 Close it choice warns about the money-gated step", () => {
+  const target = {
+    subtasks: [
+      {
+        id: "s6",
+        text: "Read back the saved result",
+        step: 6,
+        owner: "evaluator" as const,
+        gate: "money" as const,
+        state: "open" as const,
+        note: null,
+        doneBy: null,
+        doneAt: null,
+      },
+    ],
+  };
+  const closing = ask(
+    {
+      kind: "decision",
+      title: "Close #8: the old copy stays",
+      options: ["Close it", "Redact after all"],
+    },
+    "Can I close #8's last check? New results are masked; the old copy stays, as you chose.",
+  );
+  assert.include(Asks.approvalWarning(target, closing)!, "s6 (money steps)");
+  assert.isUndefined(Asks.approvalWarning(target, { ...closing, text: "Skip s6 on #8?" }));
+});
+
+it.each(
+  ["decline", "refuse", "deny", "defer", "postpone", "delay", "pause", "suspend", "abort"]
+    .flatMap((name) => [
+      { label: `Deploy the ${name} worker`, gate: "deploy" as const },
+      { label: `Purchase the ${name} service`, gate: "money" as const },
+      { label: `Use the ${name} secret`, gate: "secret" as const },
+    ])
+    .flatMap((entry) =>
+      (["create", "revise"] as const).map((operation) => ({ ...entry, operation })),
+    ),
+)(
+  "exact positive target names remain valid on $operation: $label",
+  ({ label, gate, operation }) => {
+    const target = {
+      number: 1325,
+      subtasks: [
+        {
+          id: "s4",
+          text: label,
+          step: 1,
+          owner: "evaluator" as const,
+          gate,
+          state: "open" as const,
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        },
+      ],
+    };
+    const input = { options: [{ label, approves: ["s4"] }, "Wait"] };
+    const result =
+      operation === "create"
+        ? Asks.askFields(input, { blocking: false, card: target })
+        : Asks.reviseAsk(ask({ options: ["Approve", "Wait"] }), input, LATER, target);
+    if (Asks.isAskProblem(result)) throw new Error(result.detail);
+    assert.deepStrictEqual(result.options?.[0]?.approves, ["s4"]);
+  },
+);

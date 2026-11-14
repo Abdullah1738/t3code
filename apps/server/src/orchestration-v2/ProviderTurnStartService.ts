@@ -439,6 +439,25 @@ export const layer: Layer.Layer<
           cause: `Run ${runId} is missing its execution projection state.`,
         });
       }
+      const finishUsage = yield* runExecution.prepareUsageBeforeStart({
+        appThread: projection.thread,
+        run,
+        attempt,
+        providerThread,
+        modelSelection: run.modelSelection,
+      });
+      // Stop may have committed before registration observed its event.
+      const registeredRun = yield* projectionStore
+        .getRunControlState(projection.thread.id, run.id)
+        .pipe(Effect.option);
+      if (Option.isSome(registeredRun) && registeredRun.value !== null) {
+        const current = registeredRun.value;
+        if (current.status === "interrupted" || current.status === "cancelled") {
+          yield* finishUsage(current.status);
+          return;
+        }
+        if (current.activeAttemptId !== attempt.id || current.status !== "starting") return;
+      }
       const settleRunBeforeStart = Effect.fn("orchestrationV2.providerTurnStart.settleBeforeStart")(
         function* (input: {
           readonly signal: string;
@@ -523,13 +542,16 @@ export const layer: Layer.Layer<
               } satisfies OrchestrationV2DomainEvent;
             }),
           );
-          yield* eventSink.writeIfRunCurrent({
-            threadId: projection.thread.id,
-            runId,
-            activeAttemptId: attempt.id,
-            expectedStatus: "starting",
-            events,
-          });
+          yield* Effect.gen(function* () {
+            const settled = yield* eventSink.writeIfRunCurrent({
+              threadId: projection.thread.id,
+              runId,
+              activeAttemptId: attempt.id,
+              expectedStatus: "starting",
+              events,
+            });
+            if (settled.committed) yield* finishUsage(status);
+          }).pipe(Effect.uninterruptible);
         },
       );
       if (

@@ -287,8 +287,9 @@ request share one check. On GitHub, a check first asks whether anything changed 
 request only when it did, which keeps
 watching inside GitHub's rate limit. Comments from your own account do not wake it. Watching ends
 when the pull request merges or closes, after 10 wakes in a row that bring only comments, after 8
-unsuccessful reads in a row, or when you press Stop on the thread. Rate limits and mismatched head
-revisions delay evaluation; if they persist for eight reads, watching ends with a message explaining why.
+unsuccessful reads in a row, or when you press Stop on the thread. Rate limits delay evaluation;
+if they persist for eight reads, watching ends with a message explaining why. When revision reads
+disagree, watching continues and reports checks only for the current branch tip.
 Settling or archiving a thread also ends all its watches. Unsettle the thread before starting a new
 watch. Watching a pull request again does not repeat check or conflict news its last
 watch already reported; unlinking the pull request clears that. Subagents cannot watch pull requests; the thread that delegated to them does. To start or stop

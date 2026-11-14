@@ -29,6 +29,8 @@ from .common import CM_DIR, KEY_PATH, SSH_DIR, OffboxError, ensure_dirs, log
 RSYNC = "/opt/homebrew/bin/rsync" if Path("/opt/homebrew/bin/rsync").exists() else "rsync"
 STALL_S = capacity.setting("OFFBOX_SYNC_STALL_S", 180)
 SYNC_PROGRESS_S = 60
+MAX_TRACKED_INCLUDE_FILES = 200
+MAX_INCLUDE_FILTER_BYTES = 512 * 1024
 RETRY_PAUSES = (5, 15, 45)
 CHECKOUT_DIR = re.compile(r"^w/[A-Za-z0-9._-]{1,40}-[0-9a-f]{6}$")
 _HOME_PORTS: dict[str, tuple[str, int]] = {}
@@ -363,20 +365,30 @@ def _soft_partial(stderr: str) -> list[str] | None:
     return bad or None
 
 
+INCLUDE_WORKAROUND = ("Create a dot-directory at the checkout root (mktemp -d ./.scratch.XXXX), "
+                      "put the script there and --include that path, or use a committed or included file in the repo.")
+
+
 def _include_refused(inc: str) -> OffboxError:
     return OffboxError(f"cannot sync --include {inc!r}: offbox couldn't tell what else sits beside it, "
-                       "so it won't send it (local filter inspection failed)", code=2)
+                       f"so it won't send it (local filter inspection failed). {INCLUDE_WORKAROUND}", code=2)
+
+
+def _include_alias_refused(inc: str, path: str, real: str) -> OffboxError:
+    return OffboxError(f"cannot sync --include {inc!r}: {path!r} has disk spelling {real!r}; "
+                       f"offbox can't safely guard aliased paths. {INCLUDE_WORKAROUND}", code=2)
 
 
 def _ignored_include_tops(root: Path, includes: list[str] | None) -> list[str]:
     """For each --include, its shortest ancestor dir that git ignores (tmp for tmp/a/b.sh), once each."""
+    # Ignore rules must protect box-only siblings even when the index tracks files below this top.
     tops: list[str] = []
     for inc in includes or []:
         parts = inc.strip("/").split("/")
         for i in range(1, len(parts)):
             anc = "/".join(parts[:i])
             try:
-                p = subprocess.run(["git", "-C", str(root), "check-ignore", "-q", "--", anc + "/"],
+                p = subprocess.run(["git", "-C", str(root), "check-ignore", "--no-index", "-q", "--", anc + "/"],
                                    capture_output=True, timeout=10)
             except (OSError, subprocess.TimeoutExpired) as e:
                 raise _include_refused(inc) from e
@@ -451,20 +463,31 @@ def _visible_include_ancestors(root: Path, ancestors: set[str], inc: str) -> set
         raise _include_refused(inc) from e
 
 
+def _literal_filter_path(path: str, *, wildcard: bool = False) -> str:
+    # Rsync only interprets backslash escapes in rules containing wildcard syntax.
+    if not wildcard and not any(char in path for char in "*?["):
+        return path
+    return re.sub(r"([\\*?\[])", r"\\\1", path)
+
+
 def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) -> list[str]:
     # --git uses a separate portable export. Never send a raw git-dir or pointer,
     # even when --include .git is supplied, or copy private config/hooks/worktrees.
     f = ["--filter=- /.git"]
     ancestors: set[str] = set()
+    names: dict[str, list[str]] = {}
     for inc in includes or []:      # explicit opt-in (e.g. committed test certs); wins over every exclude
         inc = inc.strip("/")
+        real = _disk_path(root, inc, names)
+        if real is not None and real != inc:
+            raise _include_alias_refused(inc, inc, real)
         parts = inc.split("/")
         for i in range(1, len(parts)):
             anc = "/".join(parts[:i])
             ancestors.add(anc)
-            f.append(f"--filter=+ /{anc}/")
-        f.append(f"--filter=+ /{inc}")
-        f.append(f"--filter=+ /{inc}/**")
+            f.append(f"--filter=+ /{_literal_filter_path(anc)}/")
+        f.append(f"--filter=+ /{_literal_filter_path(inc)}")
+        f.append(f"--filter=+ /{_literal_filter_path(inc, wildcard=True)}/**")
     is_git = False
     if includes:
         try:
@@ -474,9 +497,10 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
         except (OSError, subprocess.TimeoutExpired):
             pass  # No Git index: guard every opened ancestor.
     guarded = ancestors.copy()
+    tracked: set[str] = set()
     if is_git and ancestors:
         try:
-            p = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", *sorted(ancestors)],
+            p = subprocess.run(["git", "--literal-pathspecs", "-C", str(root), "ls-files", "-z", "--", *sorted(ancestors)],
                                capture_output=True, timeout=20)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise _include_refused(includes[0]) from e
@@ -484,13 +508,16 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
             raise _include_refused(includes[0])
         for raw in p.stdout.split(b"\0"):
             if raw:
-                parts = os.fsdecode(raw).split("/")
+                path = os.fsdecode(raw)
+                tracked.add(path)
+                parts = path.split("/")
                 for i in range(1, len(parts)):
                     guarded.discard("/".join(parts[:i]))
     # A whole-directory include already authorizes these siblings, even with redundant child includes.
     unchecked = {anc for anc in ancestors - guarded
                  if not any(anc == i.strip("/") or anc.startswith(i.strip("/") + "/") for i in includes)}
     visible = _visible_include_ancestors(root, unchecked, includes[0]) if unchecked else set()
+    reopen: set[str] = set()
     for anc in sorted(unchecked):
         inc = next(i for i in includes if i.strip("/").startswith(anc + "/"))
         try:
@@ -507,19 +534,46 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
             anc == pat or anc.endswith("/" + pat)
             for pat in SECRET_EXCLUDES + HEAVY_EXCLUDES if "/" in pat.rstrip("/")
         )
-        if p.returncode == 0 or excluded or anc not in visible:
+        if excluded:
             raise OffboxError(f"cannot sync --include {inc!r}: excluded ancestor {anc!r} contains tracked files; "
-                              "offbox can't send only the named path there. Pass the script inline in argv or "
-                              "with --step, or move it out of the excluded directory", code=2)
-    # Opening an ignored ancestor bypasses its ignore rule. Close its other children after all includes,
-    # so rsync never walks unrelated scratch trees; tracked ancestors retain the normal sync behavior.
+                              f"offbox can't send only the named path there. {INCLUDE_WORKAROUND}", code=2)
+        if p.returncode == 0 or anc not in visible:
+            descendants = {path for path in tracked if path.startswith(anc + "/")}
+            if len(descendants) > MAX_TRACKED_INCLUDE_FILES:
+                raise OffboxError(f"cannot sync --include {inc!r}: excluded ancestor {anc!r} contains "
+                                  f"{len(descendants)} tracked files (limit {MAX_TRACKED_INCLUDE_FILES}); "
+                                  f"offbox can't send only the named path there. {INCLUDE_WORKAROUND}", code=2)
+            guarded.add(anc)
+            reopen.update(descendants)
+    # Plain sync sends ignored tracked files in pass 2. Reopen the same eligible files here,
+    # closing every intermediate directory so their untracked siblings are never traversed.
+    reopened_dirs: set[str] = set()
+    for path in sorted(reopen):
+        real = _disk_path(root, path, names)
+        if real is None or _offbox_skips(path) or _offbox_skips(real):
+            continue
+        if real != path:
+            # Mixing index/include aliases with disk spellings bypasses rsync's case-sensitive guards.
+            raise _include_alias_refused(includes[0], path, real)
+        if not (root / real).is_symlink() and (root / real).is_dir():
+            continue  # A submodule must not authorize its whole working tree.
+        parts = real.split("/")
+        for i in range(1, len(parts)):
+            parent = "/".join(parts[:i])
+            if parent not in reopened_dirs:
+                f.append(f"--filter=+ /{_literal_filter_path(parent)}/")
+                reopened_dirs.add(parent)
+            if any(parent == anc or parent.startswith(anc + "/") for anc in guarded):
+                guarded.add(parent)
+        f.append(f"--filter=+ /{_literal_filter_path(real)}")
+    # Close only after all requested and tracked paths have been opened (rsync's first match wins).
     for anc in sorted(guarded, key=lambda a: (-a.count("/"), a)):
-        f.append(f"--filter=- /{anc}/*")
+        f.append(f"--filter=- /{_literal_filter_path(anc, wildcard=True)}/*")
     # An include under an ignored dir (tmp/) makes rsync walk that dir, and --delete would then remove the box's own
     # files there (31 Oct: root-owned tmp/localstack, written by the LocalStack container, failed the sync with 23).
     # Protect the rest of that dir on the box; the included path itself still mirrors.
     for top in _ignored_include_tops(root, includes) if is_git else []:
-        f.append(f"--filter=P /{top}/**")
+        f.append(f"--filter=P /{_literal_filter_path(top, wildcard=True)}/**")
     for t in SAFE_ENV_TEMPLATES:
         f.append(f"--filter=+ {t}")
     for x in SECRET_EXCLUDES:
@@ -528,6 +582,11 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
         f.append(f"--filter=- {x}")
     f.append("--filter=:- .gitignore")
     f += _gitinfo_exclude(root)
+    # A file count alone cannot bound argv when tracked files have distinct deep parents.
+    # Leave half of macOS ARG_MAX for the environment and rsync's other arguments.
+    if includes and (size := sum(len(os.fsencode(arg)) + 1 for arg in f)) > MAX_INCLUDE_FILTER_BYTES:
+        raise OffboxError(f"cannot sync --include {includes[0]!r}: include filters need {size} bytes "
+                          f"(limit {MAX_INCLUDE_FILTER_BYTES}). {INCLUDE_WORKAROUND}", code=2)
     return f
 
 

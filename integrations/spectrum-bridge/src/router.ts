@@ -62,6 +62,8 @@ type Turn = Route & {
   steeredAt?: number;
   /** A person's text was steered into this watcher turn, so it owes them an answer like a typed turn does. */
   typed?: boolean;
+  /** First human message admitted into a watcher turn, whose synthetic root stays unchanged. */
+  replyInboundId?: string;
   /** The first reply already queued while this turn was still running, including a matching /send. */
   earlySent?: string;
   earlyText?: string;
@@ -71,7 +73,7 @@ type Turn = Route & {
   outbox?: number;
 };
 /** Older persisted steer attempts contain only their route. */
-type SteerAttempt = Route & { text?: string; guidance?: string; parts?: FilePart[]; fileGuidance?: string; startedAt?: number; outbox?: number };
+type SteerAttempt = Route & { inboundId?: string; text?: string; guidance?: string; parts?: FilePart[]; fileGuidance?: string; startedAt?: number; outbox?: number };
 /** The sealed prompt body, retained until delivery is confirmed. */
 type ResendBody = {
   inboundId: string; text: string; system: string; parts: FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string };
@@ -1722,6 +1724,10 @@ export class Router {
       if (!this.current(attempt) || (state !== "processing" && !queued)) return;
       const messageId = `msg_${hash(id)}`;
       const turn = this.store.get<Turn | null>("activeTurn");
+      const sourceAttempt = this.store.get<SteerAttempt | null>(`steer-attempt:${id}`);
+      if (!synthetic(id) && sourceAttempt?.outbox !== undefined && this.current(sourceAttempt)) {
+        this.store.attributeSteeredReplies(id, sourceAttempt.id, sourceAttempt.generation, sourceAttempt.outbox, sourceAttempt.inboundId);
+      }
       if (!turn || !this.current(turn) || turn.phase === "failed") {
         const adopted: Turn = {
           id: attempt.id, directory: attempt.directory, generation: attempt.generation,
@@ -1737,7 +1743,7 @@ export class Router {
       // A person's text confirmed inside a watcher turn: that turn now owes them an answer.
       const typed = !turn.typed && turn.inboundId !== undefined && synthetic(turn.inboundId) && !synthetic(id);
       if (add || typed) this.setTurn({
-        ...turn, ...(add ? { steered: [...turn.steered ?? [], messageId], steeredAt: Date.now() } : {}), ...(typed ? { typed: true } : {}),
+        ...turn, ...(add ? { steered: [...turn.steered ?? [], messageId], steeredAt: Date.now() } : {}), ...(typed ? { typed: true, replyInboundId: id } : {}),
       });
       this.delivered(id);
       this.store.set(`steer-attempt:${id}`, null);
@@ -1860,7 +1866,8 @@ export class Router {
       return true;
     };
     if (attempt?.text === undefined && !await admission()) return;
-    const sent: SteerAttempt = { id: turn.id, directory: turn.directory, generation: turn.generation, text: body, guidance, ...(parts ? { parts, fileGuidance } : {}), startedAt: attempt?.startedAt ?? Date.now(), outbox: attempt?.outbox ?? this.outboxMark() };
+    // A different wake can own the turn by the time an uncertain steer is retried.
+    const sent: SteerAttempt = { id: turn.id, inboundId: attempt ? attempt.inboundId : turn.inboundId, directory: turn.directory, generation: turn.generation, text: body, guidance, ...(parts ? { parts, fileGuidance } : {}), startedAt: attempt?.startedAt ?? Date.now(), outbox: attempt?.outbox ?? this.outboxMark() };
     this.store.db.transaction(() => {
       this.store.set(`steer-attempt:${row.id}`, sent);
       this.store.set(`failed-delivery:${row.id}`, { ...turn, inboundId: row.id, messageId });

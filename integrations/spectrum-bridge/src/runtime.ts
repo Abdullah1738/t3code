@@ -266,7 +266,12 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
       if (request.method !== "POST") return reply(404, { error: "Not found" });
       const raw = new Uint8Array(await request.arrayBuffer());
       const body = parseBody(raw);
-      const forward = (chat: Chat<P>) => chat.parts.api(new Request(request.url, { method: "POST", headers: request.headers, body: raw }));
+      const forward = async (chat: Chat<P>) => {
+        const response = await chat.parts.api(new Request(request.url, { method: "POST", headers: request.headers, body: raw }));
+        if (!response.ok || (path !== "/send" && path !== "/files")) return response;
+        const ack = await response.json() as Record<string, unknown>;
+        return Response.json({ ...ack, chat: chat.info.slug }, { status: response.status, headers: response.headers });
+      };
       const sessionId = typeof body?.sessionId === "string" ? body.sessionId : undefined;
       const caller = sessionId === undefined ? undefined : registry.forSession(sessionId);
 
@@ -351,7 +356,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           let created: boolean;
           try { created = target.store.enqueue({ id, kind: "conversation", text: body.text }); }
           catch (caughtError) { toolError("runtime", "runtime.catch3", caughtError); throw new HttpError(409, "Operation could not be completed"); }
-          return reply(created ? 202 : 200, { id, created });
+          return reply(created ? 202 : 200, { id, created, chat: target.info.slug });
         }
         case "/wake": {
           only(body, ["text", "chat", "source", "dedupeKey", "sessionId"]);

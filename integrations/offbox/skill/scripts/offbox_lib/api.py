@@ -926,8 +926,6 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
     deadline = time.time() + timeout
     network_failures = 0
     while True:
-        if time.time() >= deadline:
-            raise BudgetExpired(f"box {box_id} did not become ready within {timeout:g}s; nothing ran")
         try:
             s = readiness_get(box_id)
         except NetworkError:
@@ -964,7 +962,7 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
         if time.time() > deadline:
             raise BudgetExpired(f"box {box_id} did not become ready within {timeout:g}s "
                                 f"(last state {st}); nothing ran")
-        time.sleep(min(poll, max(0, deadline - time.time())))
+        time.sleep(poll)
 
 
 # ---------------------------------------------------------------- commands

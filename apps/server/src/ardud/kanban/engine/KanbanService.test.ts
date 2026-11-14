@@ -249,6 +249,17 @@ const makeFake = Effect.gen(function* () {
             return all.get(threadId)?.model ?? null;
           }),
         ),
+      claimContext: (threadId) =>
+        read(threadId).pipe(
+          Effect.flatMap((view) =>
+            Ref.get(threads).pipe(
+              Effect.map((all) => {
+                const model = all.get(threadId)?.model;
+                return view && model ? { projectId: view.projectId, model } : null;
+              }),
+            ),
+          ),
+        ),
       // Like production, view answers null when the read fails.
       view: (threadId) =>
         Effect.suspend(() => viewControl.beforeRead?.(threadId) ?? Effect.void).pipe(
@@ -351,7 +362,7 @@ const makeFake = Effect.gen(function* () {
               );
             }
             sendControl.afterSend?.(input.threadId, input.text);
-            return Effect.void;
+            return Effect.succeed(`fake-send-${sends.length}`);
           }),
         ),
       withdraw: (input) =>
@@ -413,6 +424,7 @@ const makeFake = Effect.gen(function* () {
       latestRun: (threadId) => Effect.succeed(lastRuns.get(threadId) ?? null),
       runSettled: () => Effect.succeed(true),
       compactRun: (_threadId, runId) => Effect.succeed(runHistory.get(runId) ?? null),
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: (threadId) => Effect.sync(() => void interrupted.push(threadId)),
     }),
@@ -28227,6 +28239,19 @@ it.effect.each([
       );
       assert.equal(flagged.activeThreadId, null);
       assert.deepEqual(fake.interrupted, [thread]);
+      if (kind === "stale promotion") {
+        // The queued run can still start after the sweep releases its card.
+        yield* setRunning(fake, thread, true);
+        assert.equal((yield* kanban.caller(thread))?.role, "work");
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: thread,
+        });
+        fake.viewControl.beforeRead = () => Effect.die("card_next loaded thread activity");
+        const next = yield* kanban.agentCall(thread, kanban.nextCards(thread));
+        assert.deepEqual(next.carrying, []);
+        assert.isArray(next.candidates);
+      }
     }).pipe(
       Effect.ensuring(Deferred.succeed(delivered, undefined)),
       Effect.provide(testLayer(layer)),
@@ -31857,5 +31882,1068 @@ it.effect(
           }
         }
       }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(
+  (["steer", "review to todo", "release", "flag"] as const).flatMap((action) =>
+    (
+      [
+        "inline",
+        "deferred",
+        ...(action === "review to todo" ? ["delayed cleanup" as const] : []),
+        ...(action === "release"
+          ? ([
+              "cancel read failure",
+              "cancel dispatch failure",
+              "cancel verification failure",
+            ] as const)
+          : []),
+      ] as const
+    ).map((mode) => ({ action, mode })),
+  ),
+)("#1394 disposable wakes: $action preserves real queued messages ($mode)", ({ action, mode }) =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const management = yield* ThreadManagementService.ThreadManagementService;
+    let cancelling = false;
+    let cancelReads = 0;
+    let cancellationFailed = false;
+    const fallible = Layer.succeed(ThreadManagementService.ThreadManagementService, {
+      ...management,
+      getThreadRecords: (id, sections, options) =>
+        Effect.gen(function* () {
+          if (cancelling) cancelReads += 1;
+          if (
+            cancelling &&
+            !cancellationFailed &&
+            ((mode === "cancel read failure" && cancelReads === 1) ||
+              (mode === "cancel verification failure" && cancelReads === 2))
+          ) {
+            cancellationFailed = true;
+            return yield* new Orchestrator.OrchestratorProjectionError({
+              threadId: id,
+              cause: "cancel read failed once",
+            });
+          }
+          return yield* management.getThreadRecords(id, sections, options);
+        }),
+      dispatch: (command) =>
+        Effect.gen(function* () {
+          if (
+            cancelling &&
+            !cancellationFailed &&
+            mode === "cancel dispatch failure" &&
+            command.type === "queued-run.cancel"
+          ) {
+            cancellationFailed = true;
+            return yield* new Orchestrator.OrchestratorProjectionError({
+              threadId: command.threadId,
+              cause: "cancel dispatch failed once",
+            });
+          }
+          return yield* management.dispatch(command);
+        }),
+    });
+    const lifecycle = yield* KanbanThreads.pipe(
+      Effect.provide(KanbanThreadLifecycle.layer.pipe(Layer.provide(fallible))),
+    );
+    const fake = yield* makeFake;
+    let work: ThreadId | undefined;
+    let expectedCancellations = Infinity;
+    let cancellations = 0;
+    const pruned = yield* Deferred.make<void>();
+    const cleanupEntered = yield* Deferred.make<void>();
+    const releaseCleanup = yield* Deferred.make<void>();
+    const initialCleaned = yield* Deferred.make<void>();
+    const wrapped = Layer.succeed(
+      KanbanThreads,
+      KanbanThreads.of({
+        ...(yield* KanbanThreads.pipe(Effect.provide(fake.layer))),
+        queuedRuns: (id) =>
+          id === work
+            ? lifecycle
+                .queuedRuns(id)
+                .pipe(Effect.tap(() => Deferred.succeed(initialCleaned, undefined)))
+            : Effect.succeed([]),
+        cancelQueued: (id, run) =>
+          Effect.gen(function* () {
+            if (mode === "delayed cleanup") {
+              yield* Deferred.succeed(cleanupEntered, undefined);
+              yield* Deferred.await(releaseCleanup);
+            }
+            cancelling = true;
+            cancelReads = 0;
+            return yield* lifecycle.cancelQueued(id, run).pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  cancelling = false;
+                }),
+              ),
+            );
+          }).pipe(
+            Effect.tap(() => {
+              cancellations += 1;
+              return cancellations === expectedCancellations
+                ? Deferred.succeed(pruned, undefined)
+                : Effect.void;
+            }),
+          ),
+        send: (input) => {
+          if (input.threadId !== work) return Effect.void;
+          const { model: _model, ...message } = input;
+          return lifecycle.send(message);
+        },
+      }),
+    );
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const created = yield* kanban.createCard(
+        board.id,
+        { title: "Queue ordering", prompt: "Work" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      let card = (yield* kanban.card(created.id)).card;
+      work = card.workThreadId!;
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("1394:create"),
+        threadId: work,
+        projectId: ProjectId.make("project-1"),
+        title: "Queue ordering",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "system",
+        creationSource: "server",
+      });
+      yield* lifecycle.send({ threadId: work, text: "Unstarted active run" });
+      if (action === "steer") {
+        yield* kanban.turnEnded(work);
+        const wake = (yield* lifecycle.queuedRuns(work))[0]!;
+        assert.isTrue(wake.userMessageId.startsWith("kanban:wake:nudge:"));
+        yield* kanban.cardThread(card.id, "steer", "Apply round-2 findings", owner);
+        const queued = yield* lifecycle.queuedRuns(work);
+        assert.lengthOf(queued, 1);
+        let records = yield* orchestrator.getThreadRecords(work, ["runs", "messages"]);
+        assert.equal(records.runs.find((run) => run.id === wake.id)!.status, "cancelled");
+        assert.equal(
+          records.messages.find((message) => message.id === queued[0]!.userMessageId)!.text,
+          "Apply round-2 findings",
+        );
+        const before = records.runs.length;
+        const nudgedAt = (yield* kanban.card(card.id)).card.nudgedAt;
+        yield* kanban.turnEnded(work);
+        records = yield* orchestrator.getThreadRecords(work, ["runs", "messages"]);
+        assert.lengthOf(records.runs, before);
+        assert.equal((yield* kanban.card(card.id)).card.nudgedAt, nudgedAt);
+        yield* lifecycle.send({ threadId: work, text: "Owner relay", key: "1394:relay" });
+        assert.deepEqual(
+          (yield* lifecycle.queuedRuns(work)).map((run) => run.id).slice(0, 1),
+          queued.map((run) => run.id),
+        );
+        return;
+      }
+      if (action === "review to todo") {
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: work,
+        });
+        yield* Deferred.await(initialCleaned);
+        yield* kanban.turnEnded(work);
+        yield* kanban.dispatchNow;
+        assert.equal((yield* kanban.card(card.id)).card.stage, "in_review");
+        card = (yield* kanban.card(card.id)).card;
+      }
+      // Simulate a discussion reminder queued after the worker's own move to review.
+      yield* lifecycle.send({ threadId: work, text: "Owner relay", key: "1394:relay" });
+      const scopes = [
+        "nudge",
+        `step:${card.id}`,
+        `plan:${card.id}`,
+        `owner:${card.id}`,
+        "step:other-card",
+      ];
+      for (const scope of scopes)
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`1394:seed:${scope}`),
+          threadId: work,
+          messageId: MessageId.make(`kanban:wake:${scope}:1394`),
+          text: scope,
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "system",
+          creationSource: "server",
+        });
+      const before = yield* lifecycle.queuedRuns(work);
+      expectedCancellations = cancellations + 4;
+      if (mode === "delayed cleanup") {
+        const workerId = work;
+        return yield* Effect.gen(function* () {
+          const departure = yield* Effect.forkChild(
+            kanban.reviewResult(card.activeThreadId!, "findings", ["Fix queue ordering"]),
+          );
+          yield* Deferred.await(cleanupEntered);
+          assert.equal((yield* kanban.card(card.id)).card.stage, "in_review");
+          const editStarted = yield* Deferred.make<void>();
+          const edit = yield* Effect.forkChild(
+            Deferred.succeed(editStarted, undefined).pipe(
+              Effect.andThen(
+                kanban.editCard(card.id, { description: "Concurrent edit during cleanup" }, owner),
+              ),
+            ),
+          );
+          yield* Deferred.await(editStarted);
+          yield* Effect.yieldNow;
+          assert.isUndefined(edit.pollUnsafe());
+          yield* Deferred.succeed(releaseCleanup, undefined);
+          yield* Fiber.join(departure);
+          yield* Fiber.join(edit);
+          const departed = yield* kanban.card(card.id);
+          assert.equal(departed.card.stage, "todo");
+          assert.equal(departed.card.description, "Concurrent edit during cleanup");
+          assert.lengthOf(
+            departed.events.filter((event) => event.kind === "review"),
+            1,
+          );
+          yield* kanban.claimCard(workerId, card.id);
+          assert.equal((yield* kanban.card(card.id)).card.stage, "working");
+          const fresh = yield* lifecycle.send({
+            threadId: workerId,
+            text: "Fresh owner reminder",
+            coalesce: `owner:${card.id}`,
+          });
+          assert.isTrue((yield* lifecycle.queuedRuns(workerId)).some((run) => run.id === fresh));
+        }).pipe(Effect.ensuring(Deferred.succeed(releaseCleanup, undefined)));
+      }
+      if (action === "review to todo") {
+        yield* kanban.reviewResult(card.activeThreadId!, "findings", ["Fix queue ordering"]);
+        assert.equal((yield* kanban.card(card.id)).card.stage, "todo");
+      } else if (action === "flag") {
+        yield* kanban.flagCard(card.id, "Work blocked", { _tag: "thread", threadId: work });
+      } else {
+        if (mode.startsWith("cancel ")) {
+          const failed = yield* Effect.exit(
+            kanban.moveCard(card.id, "needs_review", "cardThread", {
+              _tag: "thread",
+              threadId: work,
+            }),
+          );
+          assert.isTrue(Exit.isFailure(failed));
+          assert.isTrue(cancellationFailed);
+          const unchanged = yield* kanban.card(card.id);
+          assert.equal(unchanged.card.stage, "working");
+          assert.equal(unchanged.card.activeThreadId, work);
+          assert.lengthOf(
+            unchanged.events.filter((event) => event.toStage === "needs_review"),
+            0,
+          );
+          expectedCancellations =
+            cancellations +
+            KanbanThreadLifecycle.queuedWakes(
+              yield* lifecycle.queuedRuns(work),
+              Infinity,
+              scopes.slice(0, -1),
+            ).length;
+        }
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: work,
+        });
+      }
+      yield* Deferred.await(pruned);
+      const queued = yield* lifecycle.queuedRuns(work);
+      assert.deepEqual(
+        queued.map((run) => run.id),
+        [before[0]!.id, before.at(-1)!.id],
+      );
+      assert.equal(
+        (yield* orchestrator.getThreadRecords(work, ["runs"])).runs[0]!.status,
+        "starting",
+      );
+      if (action === "review to todo") {
+        yield* kanban.dispatchNow;
+        assert.equal((yield* kanban.card(card.id)).card.activeThreadId, work);
+        const fresh = yield* lifecycle.send({ threadId: work, text: "Fresh assignment" });
+        assert.deepEqual(
+          (yield* lifecycle.queuedRuns(work)).map((run) => run.id),
+          [before[0]!.id, fresh],
+        );
+      }
+    }).pipe(Effect.provide(mode === "inline" ? inlineTestLayer(wrapped) : testLayer(wrapped)));
+  }).pipe(Effect.provide(unstartedLifecycleLayer())),
+);
+
+it.effect("#1394 the turn-end owner discussion reminder has a card wake scope", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { title: "Reminder", prompt: "Work" }, owner);
+      yield* kanban.dispatchNow;
+      const work = (yield* kanban.card(card.id)).card.workThreadId!;
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Please reply" }]);
+      yield* kanban.turnEnded(work);
+      const reminder = fake.sends.find(
+        (send) => send.threadId === work && send.text === Briefs.nudgeDiscussionText(discussion.id),
+      );
+      assert.isDefined(reminder);
+      assert.equal(reminder!.coalesce, `owner:${card.id}`);
+    }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+  }),
+);
+
+it.effect.each(
+  (["findings", "clear"] as const).flatMap((verdict) =>
+    (["review", "work"] as const).map((target) => ({ verdict, target })),
+  ),
+)(
+  "#1394 $verdict queue read failure on $target leaves the verdict retryable",
+  ({ verdict, target }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      let failingThread: ThreadId | undefined;
+      let oncePerTransition = false;
+      const reads = new Map<ThreadId, number>();
+      const failing = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            queuedRuns: (id) =>
+              Effect.suspend(() => {
+                const count = (reads.get(id) ?? 0) + 1;
+                reads.set(id, count);
+                return id === failingThread || (oncePerTransition && count > 1)
+                  ? Effect.fail(
+                      new KanbanThreadError({
+                        operation: "queue",
+                        detail: "queue projection unavailable",
+                      }),
+                    )
+                  : real.queuedRuns(id);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const created = yield* kanban.createCard(
+          board.id,
+          { title: "Queue failure", prompt: "Work" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const work = (yield* kanban.card(created.id)).card.workThreadId!;
+        yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: work,
+        });
+        yield* kanban.turnEnded(work);
+        yield* kanban.dispatchNow;
+        const before = (yield* kanban.card(created.id)).card;
+        const review = before.activeThreadId!;
+        assert.equal(before.stage, "in_review");
+        failingThread = target === "review" ? review : work;
+        const failed = yield* Effect.exit(
+          kanban.reviewResult(review, verdict, ["Fix queue ordering"], "f202e471a2"),
+        );
+        assert.isTrue(Exit.isFailure(failed));
+        const detail = yield* kanban.card(created.id);
+        assert.equal(detail.card.stage, before.stage);
+        assert.equal(detail.card.activeThreadId, review);
+        assert.equal(detail.card.reviewRound, before.reviewRound);
+        assert.equal(detail.card.reviewStep, before.reviewStep);
+        assert.lengthOf(
+          detail.events.filter((event) => event.kind === "review"),
+          0,
+        );
+
+        failingThread = undefined;
+        reads.clear();
+        oncePerTransition = true;
+        const retried = yield* kanban.reviewResult(
+          review,
+          verdict,
+          ["Fix queue ordering"],
+          "f202e471a2",
+        );
+        assert.isTrue(retried.recorded);
+        const saved = yield* kanban.card(created.id);
+        assert.equal(saved.card.stage, verdict === "findings" ? "todo" : "completed");
+        assert.isNull(saved.card.activeThreadId);
+        assert.lengthOf(
+          saved.events.filter((event) => event.kind === "review"),
+          1,
+        );
+        assert.equal(reads.get(review), 1);
+        assert.equal(reads.get(work), 1);
+      }).pipe(Effect.provide(inlineTestLayer(failing)));
+    }),
+);
+
+it.effect.each(
+  [
+    ...(["owner", "nudge"] as const).flatMap((kind) =>
+      (["before coalesce", "during coalesce", "before enqueue", "after enqueue"] as const).map(
+        (gate) => ({
+          kind,
+          gate,
+          sibling: false,
+        }),
+      ),
+    ),
+    { kind: "owner", gate: "before enqueue", sibling: true } as const,
+    { kind: "nudge", gate: "after release", sibling: false } as const,
+  ].flatMap((row) =>
+    [false, true].flatMap((acceptedError) =>
+      (row.kind === "nudge" && row.gate === "before enqueue"
+        ? (["none", "check", "cancel"] as const)
+        : (["none"] as const)
+      ).map((postReadError) => ({ ...row, acceptedError, postReadError })),
+    ),
+  ),
+)(
+  "#1394 $kind wake delayed $gate respects departure scope (sibling=$sibling, acceptedError=$acceptedError, postReadError=$postReadError)",
+  ({ kind, gate, sibling, acceptedError, postReadError }) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      let work: ThreadId | undefined;
+      let oldWake: string | void;
+      let armed = false;
+      let rejectNext = false;
+      let delayDispatch = false;
+      let delayCoalesce = false;
+      let failNudgeRead = 0;
+      const management = yield* ThreadManagementService.ThreadManagementService;
+      const failing = Layer.succeed(ThreadManagementService.ThreadManagementService, {
+        ...management,
+        getThreadRecords: (id, sections, options) =>
+          Effect.gen(function* () {
+            if (failNudgeRead > 0 && --failNudgeRead === 0) {
+              return yield* new Orchestrator.OrchestratorProjectionError({
+                threadId: id,
+                cause: "post-dispatch queue read unavailable once",
+              });
+            }
+            if (delayCoalesce && sections?.some((section) => section === "messages")) {
+              delayCoalesce = false;
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(resume);
+              rejectNext = acceptedError;
+            }
+            return yield* management.getThreadRecords(id, sections, options);
+          }),
+        sendToThread: (input) =>
+          Effect.gen(function* () {
+            const delayed = delayDispatch;
+            if (delayed) {
+              delayDispatch = false;
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(resume);
+            }
+            const result = yield* management.sendToThread(input);
+            if (delayed && postReadError !== "none") {
+              failNudgeRead = postReadError === "check" ? 1 : 3;
+              oldWake = result.run.id;
+            }
+            if (rejectNext || (delayed && acceptedError)) {
+              rejectNext = false;
+              oldWake = result.run.id;
+              return yield* new ThreadManagementService.ThreadManagementDurableRunProjectionError({
+                threadId: input.threadId,
+                messageId: input.messageId,
+              });
+            }
+            return result;
+          }),
+        dispatch: (command) =>
+          management.dispatch(command).pipe(
+            Effect.flatMap((result) => {
+              if (!rejectNext || command.type !== "queued-run.edit") return Effect.succeed(result);
+              rejectNext = false;
+              return Effect.fail(
+                new Orchestrator.OrchestratorProjectionError({
+                  threadId: command.threadId,
+                  cause: "projection unavailable after accepted edit",
+                }),
+              );
+            }),
+          ),
+      });
+      const lifecycle = yield* KanbanThreads.pipe(
+        Effect.provide(KanbanThreadLifecycle.layer.pipe(Layer.provide(failing))),
+      );
+      const originalLocks = BoardLocks.make;
+      const gateSpy =
+        gate === "after release"
+          ? vi.spyOn(BoardLocks, "make").mockImplementation(() =>
+              originalLocks().pipe(
+                Effect.map((locks) => {
+                  const outside: typeof locks.outside = (
+                    effect,
+                    abandoned,
+                    readOnly,
+                    reconcile,
+                  ) => {
+                    if (!armed || readOnly || reconcile === undefined)
+                      return locks.outside(effect, abandoned, readOnly, reconcile);
+                    armed = false;
+                    return locks.outside(
+                      Deferred.succeed(entered, undefined).pipe(
+                        Effect.andThen(Deferred.await(resume)),
+                        Effect.andThen(effect),
+                      ),
+                      abandoned,
+                      readOnly,
+                      reconcile,
+                    );
+                  };
+                  return { ...locks, outside };
+                }),
+              ),
+            )
+          : undefined;
+      const wrapped = Layer.succeed(
+        KanbanThreads,
+        KanbanThreads.of({
+          ...(yield* KanbanThreads.pipe(Effect.provide(fake.layer))),
+          queuedRuns: (id) => (id === work ? lifecycle.queuedRuns(id) : Effect.succeed([])),
+          cancelQueued: lifecycle.cancelQueued,
+          send: (input) =>
+            Effect.gen(function* () {
+              if (input.threadId !== work) return;
+              const { model: _model, ...message } = input;
+              const delayed =
+                armed &&
+                (kind === "owner"
+                  ? input.coalesce?.startsWith("owner:")
+                  : input.coalesce === "nudge");
+              if (!delayed) {
+                if (gate === "after release" && input.coalesce === "nudge" && oldWake === undefined)
+                  rejectNext = acceptedError;
+                const result = yield* lifecycle.send(message);
+                if (gate === "after release" && input.coalesce === "nudge" && oldWake === undefined)
+                  oldWake = result;
+                return result;
+              }
+              armed = false;
+              if (gate === "before enqueue") {
+                delayDispatch = true;
+                oldWake = yield* lifecycle.send(message);
+                return oldWake;
+              }
+              if (gate === "during coalesce") {
+                delayCoalesce = true;
+                oldWake = yield* lifecycle.send(message);
+                return oldWake;
+              }
+              if (gate === "after enqueue") oldWake = yield* lifecycle.send(message);
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(resume);
+              if (gate === "before coalesce") {
+                rejectNext = acceptedError;
+                oldWake = yield* lifecycle.send(message);
+              }
+              if (gate === "after enqueue" && acceptedError) {
+                const records = yield* orchestrator
+                  .getThreadRecords(work!, ["runs"])
+                  .pipe(Effect.orDie);
+                return yield* new KanbanThreadError({
+                  operation: "send",
+                  detail: "projection unavailable after acceptance",
+                  wakeMessageId: records.runs.find((run) => run.id === oldWake)!.userMessageId,
+                });
+              }
+              return oldWake;
+            }),
+        }),
+      );
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+        const created = yield* kanban.createCard(
+          board.id,
+          { title: "Late wake", prompt: "Work" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        work = (yield* kanban.card(created.id)).card.workThreadId!;
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("late-wake:create"),
+          threadId: work,
+          projectId: ProjectId.make("project-1"),
+          title: "Late wake",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "system",
+          creationSource: "server",
+        });
+        yield* lifecycle.send({ threadId: work, text: "Unstarted active run" });
+        const departing = sibling
+          ? (yield* kanban.createForThread(work, { title: "Sibling", prompt: "Sibling work" })).card
+          : created;
+        if (kind === "owner") {
+          const discussion = yield* kanban.cardDiscussion(created.id);
+          yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Please reply" }]);
+        }
+        armed = true;
+        const pending = yield* Effect.forkChild(Effect.exit(kanban.turnEnded(work)));
+        yield* Deferred.await(entered);
+        yield* kanban.moveCard(departing.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: work,
+        });
+        yield* kanban.dispatchNow;
+        const review = (yield* kanban.card(departing.id)).card.activeThreadId!;
+        assert.equal((yield* kanban.card(departing.id)).card.stage, "in_review");
+        yield* kanban.reviewResult(review, "findings", ["Apply findings"]);
+        yield* kanban.claimCard(work, departing.id);
+        if (kind === "nudge") yield* lifecycle.interrupt(work, "Finished initial test run");
+        const fresh = yield* lifecycle.send({ threadId: work, text: "Fresh assignment" });
+        const freshWake = yield* lifecycle.send({
+          threadId: work,
+          text: "Fresh plan reminder",
+          coalesce: `plan:${departing.id}`,
+        });
+        const freshSameScope = yield* lifecycle.send({
+          threadId: work,
+          text: "Fresh reminder in the old scope",
+          coalesce: kind === "owner" ? `owner:${created.id}` : "nudge",
+        });
+        const runsBeforeResume = (yield* orchestrator.getThreadRecords(work, ["runs"])).runs.length;
+        yield* Deferred.succeed(resume, undefined);
+        yield* Fiber.join(pending);
+        const records = yield* orchestrator.getThreadRecords(work, ["runs", "messages"]);
+        if (
+          !sibling &&
+          (gate === "before coalesce" || gate === "during coalesce" || gate === "after release")
+        ) {
+          assert.isUndefined(oldWake);
+          assert.lengthOf(records.runs, runsBeforeResume);
+        } else {
+          assert.isString(oldWake);
+          assert.equal(
+            records.runs.find((run) => run.id === oldWake)!.status,
+            sibling ? "queued" : "cancelled",
+          );
+        }
+        assert.equal(
+          records.runs.find((run) => run.id === fresh)!.status,
+          kind === "nudge" ? "starting" : "queued",
+        );
+        assert.equal(records.runs.find((run) => run.id === freshWake)!.status, "queued");
+        assert.equal(records.runs.find((run) => run.id === freshSameScope)!.status, "queued");
+        if (!sibling) {
+          const messageId = records.runs.find((run) => run.id === freshSameScope)!.userMessageId;
+          assert.equal(
+            records.messages.find((message) => message.id === messageId)!.text,
+            "Fresh reminder in the old scope",
+          );
+        }
+        assert.equal((yield* kanban.card(created.id)).card.stage, "working");
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(resume, undefined)),
+        Effect.provide(inlineTestLayer(wrapped)),
+        Effect.ensuring(Effect.sync(() => gateSpy?.mockRestore())),
+      );
+    }).pipe(Effect.provide(unstartedLifecycleLayer())),
+);
+
+it.effect.each(
+  [false, true].flatMap((relay) =>
+    (
+      ["none", "selection read", "cancel read", "cancel dispatch", "cancel verification"] as const
+    ).map((cleanupFault) => ({ relay, cleanupFault })),
+  ),
+)(
+  "#1394 accepted real-send error prunes earlier wakes and repairs replay (relay=$relay, cleanupFault=$cleanupFault)",
+  ({ relay, cleanupFault }) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const base = yield* KanbanThreads.pipe(Effect.provide(KanbanThreadLifecycle.layer));
+      const management = yield* ThreadManagementService.ThreadManagementService;
+      const target = ThreadId.make("real-send-error");
+      let failSend = true;
+      let failCleanup = false;
+      let cleanupReads = 0;
+      const observed = Layer.succeed(ThreadManagementService.ThreadManagementService, {
+        ...management,
+        getThreadRecords: (id, sections, options) =>
+          Effect.gen(function* () {
+            if (failCleanup) cleanupReads += 1;
+            if (
+              failCleanup &&
+              cleanupReads ===
+                (cleanupFault === "selection read"
+                  ? 1
+                  : cleanupFault === "cancel read"
+                    ? 2
+                    : cleanupFault === "cancel verification"
+                      ? 3
+                      : Infinity)
+            ) {
+              failCleanup = false;
+              return yield* new Orchestrator.OrchestratorProjectionError({
+                threadId: id,
+                cause: "queue unavailable once",
+              });
+            }
+            return yield* management.getThreadRecords(id, sections, options);
+          }),
+        sendToThread: (input) =>
+          Effect.gen(function* () {
+            const result = yield* management.sendToThread(input);
+            if (!failSend || input.text !== "Late real") return result;
+            failSend = false;
+            yield* base
+              .send({ threadId: target, text: "Future wake", coalesce: "plan:future" })
+              .pipe(Effect.orDie);
+            failCleanup = cleanupFault !== "none";
+            return yield* new ThreadManagementService.ThreadManagementDurableRunProjectionError({
+              threadId: target,
+              messageId: input.messageId,
+            });
+          }),
+        dispatch: (command) =>
+          Effect.gen(function* () {
+            if (
+              failCleanup &&
+              cleanupFault === "cancel dispatch" &&
+              command.type === "queued-run.cancel"
+            ) {
+              failCleanup = false;
+              return yield* new Orchestrator.OrchestratorProjectionError({
+                threadId: command.threadId,
+                cause: "cancel unavailable once",
+              });
+            }
+            return yield* management.dispatch(command);
+          }),
+      });
+      const lifecycle = yield* KanbanThreads.pipe(
+        Effect.provide(KanbanThreadLifecycle.layer.pipe(Layer.provide(observed))),
+      );
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("real-error:create"),
+        threadId: target,
+        projectId: ProjectId.make("project-1"),
+        title: "Real send error",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "system",
+        creationSource: "server",
+      });
+      yield* base.send({ threadId: target, text: "Unstarted active" });
+      const earlier = yield* base.send({ threadId: target, text: "Owner first" });
+      const wake = yield* base.send({ threadId: target, text: "Old snapshot", coalesce: "step:A" });
+      const input = {
+        threadId: target,
+        text: "Late real",
+        key: "late-real",
+        ...(relay ? { keyAcrossThreads: true } : {}),
+      };
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(lifecycle.send(input))));
+      const first = yield* orchestrator.getThreadRecords(target, ["runs"]);
+      assert.equal(
+        first.runs.find((run) => run.id === wake)!.status,
+        cleanupFault === "none" || cleanupFault === "cancel verification" ? "cancelled" : "queued",
+      );
+      yield* lifecycle.send(input);
+      const records = yield* orchestrator.getThreadRecords(target, ["runs", "messages"]);
+      assert.equal(records.runs.find((run) => run.id === wake)!.status, "cancelled");
+      assert.equal(records.runs.find((run) => run.id === earlier)!.status, "queued");
+      assert.lengthOf(
+        records.messages.filter((message) => message.text === "Late real"),
+        1,
+      );
+      assert.deepEqual(
+        records.runs
+          .filter((run) => run.status === "queued")
+          .map((run) => records.messages.find((message) => message.id === run.userMessageId)!.text),
+        ["Owner first", "Late real", "Future wake"],
+      );
+    }).pipe(Effect.provide(unstartedLifecycleLayer())),
+);
+
+it.effect.each(
+  (["work", "review"] as const).flatMap((role) =>
+    (["service", "coalesce", "dispatch"] as const).flatMap((gate) =>
+      [false, true].map((acceptedError) => ({ role, gate, acceptedError })),
+    ),
+  ),
+)(
+  "#1394 unread steer suppresses a racing $role nudge without consuming an attempt ($gate, acceptedError=$acceptedError)",
+  ({ role, gate, acceptedError }) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const base = yield* KanbanThreads.pipe(Effect.provide(KanbanThreadLifecycle.layer));
+      const management = yield* ThreadManagementService.ThreadManagementService;
+      const fake = yield* makeFake;
+      let target: ThreadId | undefined;
+      let armed = false;
+      const queueReal = () =>
+        base
+          .send({ threadId: target!, text: "Unread steer", key: "racing-real" })
+          .pipe(Effect.orDie);
+      const observed = Layer.succeed(ThreadManagementService.ThreadManagementService, {
+        ...management,
+        getThreadRecords: (id, sections, options) =>
+          Effect.gen(function* () {
+            if (
+              armed &&
+              gate === "coalesce" &&
+              id === target &&
+              sections?.some((section) => section === "messages")
+            ) {
+              armed = false;
+              yield* queueReal();
+            }
+            return yield* management.getThreadRecords(id, sections, options);
+          }),
+        sendToThread: (input) =>
+          Effect.gen(function* () {
+            const race =
+              armed &&
+              gate === "dispatch" &&
+              input.threadId === target &&
+              input.messageId.startsWith("kanban:wake:nudge:");
+            if (race) {
+              armed = false;
+              yield* queueReal();
+            }
+            const result = yield* management.sendToThread(input);
+            if (race && acceptedError)
+              return yield* new ThreadManagementService.ThreadManagementDurableRunProjectionError({
+                threadId: input.threadId,
+                messageId: input.messageId,
+              });
+            return result;
+          }),
+      });
+      const lifecycle = yield* KanbanThreads.pipe(
+        Effect.provide(KanbanThreadLifecycle.layer.pipe(Layer.provide(observed))),
+      );
+      const wrapped = Layer.succeed(
+        KanbanThreads,
+        KanbanThreads.of({
+          ...(yield* KanbanThreads.pipe(Effect.provide(fake.layer))),
+          queuedRuns: (id) => (id === target ? lifecycle.queuedRuns(id) : Effect.succeed([])),
+          cancelQueued: lifecycle.cancelQueued,
+          send: (input) =>
+            Effect.gen(function* () {
+              if (input.threadId !== target) return;
+              if (armed && gate === "service" && input.coalesce === "nudge") {
+                armed = false;
+                yield* queueReal();
+              }
+              const { model: _model, ...message } = input;
+              return yield* lifecycle.send(message);
+            }),
+        }),
+      );
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const created = yield* kanban.createCard(
+          board.id,
+          { title: "Racing nudge", prompt: "Work" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const work = (yield* kanban.card(created.id)).card.workThreadId!;
+        if (role === "review") {
+          yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
+            _tag: "thread",
+            threadId: work,
+          });
+          yield* kanban.turnEnded(work);
+          yield* kanban.dispatchNow;
+        }
+        target = (yield* kanban.card(created.id)).card.activeThreadId!;
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("racing-nudge:create"),
+          threadId: target,
+          projectId: ProjectId.make("project-1"),
+          title: "Racing nudge",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "system",
+          creationSource: "server",
+        });
+        yield* base.send({ threadId: target, text: "Unstarted active" });
+        armed = true;
+        yield* kanban.turnEnded(target);
+        const skipped = (yield* kanban.card(created.id)).card;
+        assert.isNull(skipped.nudgedAt);
+        const queued = yield* base.queuedRuns(target);
+        assert.lengthOf(queued, 1);
+        assert.isFalse(queued[0]!.userMessageId.startsWith("kanban:wake:"));
+        yield* base.cancelQueued(target, queued[0]!.id);
+        yield* base.interrupt(target, "Real turn finished");
+        yield* kanban.turnEnded(target);
+        const nudged = (yield* kanban.card(created.id)).card;
+        assert.equal(nudged.stage, role === "review" ? "in_review" : "working");
+        assert.equal(nudged.activeThreadId, target);
+        assert.isNotNull(nudged.nudgedAt);
+        const records = yield* orchestrator.getThreadRecords(target, ["runs"]);
+        assert.lengthOf(
+          records.runs.filter(
+            (run) =>
+              run.userMessageId.startsWith("kanban:wake:nudge:") && run.status !== "cancelled",
+          ),
+          1,
+        );
+      }).pipe(Effect.provide(inlineTestLayer(wrapped)));
+    }).pipe(Effect.provide(unstartedLifecycleLayer())),
+);
+
+it.effect("card_next skips the board and activity when a released worker's pool is full", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    let checking = false;
+    const observed = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) =>
+        KanbanStore.KanbanStore.of({
+          ...real,
+          cards: (id) => (checking ? Effect.die("full board scan") : real.cards(id)),
+          groups: (id) => (checking ? Effect.die("group scan") : real.groups(id)),
+          schedulingCards: (id) =>
+            checking ? Effect.die("ranking scan") : real.schedulingCards(id),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const card = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const started = (yield* store.card(card.id))!;
+      const thread = started.workThreadId!;
+      yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: thread,
+      });
+      yield* setRunning(fake, thread, false);
+      yield* kanban.turnEnded(thread);
+      // 1,400 cards of settled history must never be decoded for this read.
+      for (let i = 0; i < 1400; i++)
+        yield* store.putCard({
+          ...started,
+          id: KanbanCardId.make(`history-${i}`),
+          number: 10000 + i,
+          stage: "completed",
+          activeThreadId: null,
+          activeRole: null,
+          activePool: null,
+        });
+      yield* store.putCard({
+        ...started,
+        id: KanbanCardId.make("occupied"),
+        number: 20000,
+        activeThreadId: ThreadId.make("other"),
+      });
+      fake.viewControl.beforeRead = () => Effect.die("thread activity read");
+      checking = true;
+      const next = yield* kanban.agentCall(thread, kanban.nextCards(thread));
+      assert.deepEqual(next, { carrying: [], candidates: [], holdsSlot: false });
+    }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, observed)));
+  }),
+);
+
+it.effect.each([
+  { role: "work", gate: "event" },
+  { role: "work", gate: "save" },
+  { role: "review", gate: "event" },
+  { role: "review", gate: "save" },
+] as const)(
+  "rollback refuses a late $role consumer during $gate without exposing its claim",
+  ({ role, gate }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const beginRead = yield* Deferred.make<void>();
+      const readDone = yield* Deferred.make<void>();
+      let armed = false;
+      let triggered = false;
+      let exposed = false;
+      const pause = Effect.suspend(() => {
+        if (!armed || triggered) return Effect.void;
+        triggered = true;
+        return Deferred.succeed(beginRead, undefined).pipe(
+          Effect.andThen(Deferred.await(readDone)),
+        );
+      });
+      const observed = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            addCardEvent: (event, application) =>
+              (gate === "event" && event.body === "Assignment wake did not complete"
+                ? pause
+                : Effect.void
+              ).pipe(Effect.andThen(real.addCardEvent(event, application))),
+            putCard: (card) =>
+              (gate === "save" && card.activeThreadId === null ? pause : Effect.void).pipe(
+                Effect.andThen(real.putCard(card)),
+              ),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, card, thread } = yield* reuseDeliveryFixture(role);
+        armed = true;
+        const consumer = yield* Deferred.await(beginRead).pipe(
+          Effect.andThen(
+            kanban.agentCall(
+              thread,
+              kanban.card(card.id).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    exposed = true;
+                  }),
+                ),
+              ),
+            ),
+          ),
+          Effect.result,
+          Effect.ensuring(Deferred.succeed(readDone, undefined)),
+          Effect.forkChild,
+        );
+        fake.conclusiveReject.add(thread);
+        yield* kanban.dispatchNow;
+        const result = yield* Fiber.join(consumer);
+        assert.isTrue(triggered);
+        assert.isFalse(exposed);
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") assert.include(result.failure.detail, "being rolled back");
+        const after = (yield* kanban.card(card.id)).card;
+        assert.isNull(after.activeThreadId);
+        assert.equal(after.stage, role === "work" ? "todo" : "needs_review");
+        // Refused admission leaves no counter or barrier behind after cleanup.
+        const read = yield* kanban.agentCall(thread, kanban.card(card.id));
+        assert.isNull(read.card.activeThreadId);
+      }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, observed)));
     }),
 );

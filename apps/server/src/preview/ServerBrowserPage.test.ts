@@ -855,3 +855,163 @@ it("names a missing desktop fill acknowledgment instead of accepting the previou
     vi.useRealTimers();
   }
 });
+
+describe("desktop paint scope", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it.each(["success", "failure", "abort"])("releases the capture hold after %s", async (ending) => {
+    const controller = new AbortController();
+    const screenshot = Promise.withResolvers<{ data: string }>();
+    const started = Promise.withResolvers<void>();
+    let held = false;
+    const holds: boolean[] = [];
+    const cdp = {
+      send: async (method: string, params?: { enabled?: boolean }) => {
+        if (method === "Emulation.setFocusEmulationEnabled") {
+          held = params?.enabled === true;
+          holds.push(held);
+          return {};
+        }
+        if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
+        if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+        if (method === "Runtime.evaluate") {
+          expect(held).toBe(true);
+          return { result: { value: true } };
+        }
+        expect(held).toBe(true);
+        started.resolve();
+        return screenshot.promise;
+      },
+    } as unknown as CDPSession;
+    const pending = ServerBrowserPage.captureViewport(
+      cdp,
+      { format: "png", keepPaintable: true },
+      controller.signal,
+    ).catch((error) => error);
+    await started.promise;
+    if (ending === "success") screenshot.resolve({ data: "pixels" });
+    else if (ending === "failure") screenshot.reject(new Error("copy failed"));
+    else controller.abort(new Error("cancelled"));
+    const result = await pending;
+    expect(holds).toEqual([true, false]);
+    if (ending === "success") expect(result).toBe("pixels");
+    else expect(result.message).toBe(ending === "failure" ? "copy failed" : "cancelled");
+  });
+
+  it("keeps an overlapping capture painting when the first is aborted", async () => {
+    const controller = new AbortController();
+    const bothStarted = Promise.withResolvers<void>();
+    const copy = Promise.withResolvers<{ data: string }>();
+    const holds: boolean[] = [];
+    let copies = 0;
+    const cdp = {
+      send: async (method: string, params?: { enabled?: boolean }) => {
+        if (method === "Emulation.setFocusEmulationEnabled") {
+          holds.push(params?.enabled === true);
+          return {};
+        }
+        if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
+        if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+        if (method === "Runtime.evaluate") return { result: { value: true } };
+        if (++copies === 2) bothStarted.resolve();
+        return copy.promise;
+      },
+    } as unknown as CDPSession;
+    const first = ServerBrowserPage.captureViewport(
+      cdp,
+      { format: "png", keepPaintable: true },
+      controller.signal,
+    ).catch((error) => error);
+    const second = ServerBrowserPage.captureViewport(cdp, { format: "png", keepPaintable: true });
+    await bothStarted.promise;
+    controller.abort(new Error("cancelled"));
+    await first;
+    expect(holds).toEqual([true]);
+    copy.resolve({ data: "pixels" });
+    expect(await second).toBe("pixels");
+    expect(holds).toEqual([true, false]);
+  });
+
+  it("releases a stalled copy even when its caller has no abort signal", async () => {
+    vi.useFakeTimers();
+    const holds: boolean[] = [];
+    const cdp = {
+      send: async (method: string, params?: { enabled?: boolean }) => {
+        if (method === "Emulation.setFocusEmulationEnabled") {
+          holds.push(params?.enabled === true);
+          return {};
+        }
+        if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
+        if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+        if (method === "Runtime.evaluate") return { result: { value: true } };
+        return new Promise(() => {});
+      },
+    } as unknown as CDPSession;
+    const pending = ServerBrowserPage.captureViewport(cdp, {
+      format: "png",
+      keepPaintable: true,
+    }).catch((error) => error);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect((await pending).message).toContain("Snapshot pixels did not arrive");
+    expect(holds).toEqual([true, false]);
+  });
+
+  it("releases an unanswered paint wake and never starts a late copy", async () => {
+    vi.useFakeTimers();
+    const wake = Promise.withResolvers<object>();
+    const methods: string[] = [];
+    const cdp = {
+      send: (method: string, params?: { enabled?: boolean }) => {
+        methods.push(method);
+        return method === "Emulation.setFocusEmulationEnabled" && params?.enabled
+          ? wake.promise
+          : Promise.resolve({});
+      },
+    } as unknown as CDPSession;
+    const pending = ServerBrowserPage.captureViewport(cdp, {
+      format: "png",
+      keepPaintable: true,
+    }).catch((error) => error);
+    await vi.advanceTimersByTimeAsync(500);
+    expect((await pending).message).toContain("paint wake did not answer");
+    expect(methods).toEqual([
+      "Emulation.setFocusEmulationEnabled",
+      "Emulation.setFocusEmulationEnabled",
+    ]);
+    wake.resolve({});
+    await vi.advanceTimersByTimeAsync(0);
+    expect(methods).not.toContain("Page.captureScreenshot");
+  });
+
+  it.each([false, true])(
+    "names resize paint stalls and releases its desktop wake (desktop=%s)",
+    async (desktop) => {
+      vi.useFakeTimers();
+      const holds: boolean[] = [];
+      const cdp = {
+        send: async (method: string, params?: { expression?: string; enabled?: boolean }) => {
+          if (method === "Emulation.setFocusEmulationEnabled") {
+            holds.push(params?.enabled === true);
+            return {};
+          }
+          if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
+          if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+          if (method === "Page.getLayoutMetrics")
+            return {
+              cssVisualViewport: { zoom: 1 },
+              ...(desktop ? { t3Viewport: { mode: "freeform", width: 390, height: 844 } } : {}),
+            };
+          if (params?.expression?.startsWith("new Promise")) return new Promise(() => {});
+          return { result: { value: { ratio: 1, width: 390, height: 844 } } };
+        },
+      } as unknown as CDPSession;
+      const pending = ServerBrowserPage.waitForViewport(cdp, { width: 390, height: 844 }).catch(
+        (error) => error,
+      );
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect((await pending).message).toContain("No fresh paint");
+      expect((await pending).detail).toEqual({ timeoutMs: 1_000 });
+      expect(holds).toEqual(desktop ? [true, false] : []);
+    },
+  );
+});

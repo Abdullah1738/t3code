@@ -27,9 +27,12 @@ NUMBERS.update(('lockHolderPpid', 'lockHolderStartedAgoS', 'lastGoodSnapshotAgeS
 for prefix in ('internal', 'external'):
     NUMBERS.update(prefix+field for field in ('FreeGbDelta', 'PurgeableGb', 'LocalSnapshotCount'))
     NUMBERS.add(prefix+'DeltaWindowS')
-SKIP_REASONS = {'lock_held', 'stale_lock', 'no_repo_access', 'password_unavailable', 'source_missing', 'dry_run', 'other', 'load_deferred', 'boot_grace'}
+SKIP_REASONS = {'deep_pass_running', 'lock_held', 'stale_lock', 'no_repo_access', 'password_unavailable', 'source_missing', 'dry_run', 'other', 'load_deferred', 'boot_grace'}
 BACKUP_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'files',
-                 'restic', 'vault', 'dropbox', 'manifest', 'unknown', 'other'}
+                 'restic', 'prune', 'vault', 'dropbox', 'manifest', 'unknown', 'other'}
+FAILURE_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'files',
+                  'restic', 'prune', 'dropbox', 'manifest', 'unknown'}
+NUMBERS.update(('durationMs', 'childrenMeasured', 'childrenPartial', 'childrenRemaining', 'bytesMeasured'))
 NUMBERS.update(('loadPerCore', 'lastSuccessAgeS', 'deferredCount'))
 BACKUP_PROGRAMS = {'bash', 'zsh', 'sh', 'python', 'python3', 'restic', 'launchd',
                    'Robob', 'codex', 'claude', 'opencode', 'node', 'sleep', 'unknown'}
@@ -94,7 +97,75 @@ def process_fields(values):
     return result
 
 
+MEMORY_ERRORS = {'timeout', 'unavailable', 'exit', 'parse', 'baseline', 'gone'}
+
+
+def memory_command(value):
+    # top's command column is a name, never argv; reject paths and secret shapes.
+    if not isinstance(value, str) or '/' in value or SECRET.search(value):
+        return '[redacted]'
+    return ''.join(c if c.isprintable() else ' ' for c in value[:40])
+
+
+def memory_fields(values, event):
+    result = {}
+    if not isinstance(values, dict):
+        return result
+    if event == 'memory.alert':
+        if values.get('reason') in ('swap', 'pressure', 'footprint', 'fseventsd'):
+            result['reason'] = values['reason']
+        if values.get('notifyError') is None or values.get('notifyError') in MEMORY_ERRORS:
+            result['notifyError'] = values.get('notifyError')
+        return result
+    numbers = {'pageSize', 'freePages', 'activePages', 'inactivePages', 'wiredPages',
+               'speculativePages', 'purgeablePages', 'compressorPages', 'totalMb', 'usedMb',
+               'mbPerS', 'tps', 'pid', 'memMb', 'cmprsMb', 'cpu', 'count', 'ppid1Count'}
+
+    def numeric(value):
+        return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+    def row(value, keys):
+        if not isinstance(value, dict):
+            return {}
+        clean = {}
+        for key in keys:
+            item = value.get(key)
+            if key in numbers and (item is None or numeric(item)):
+                clean[key] = item
+            elif key == 'command' and isinstance(item, str):
+                clean[key] = memory_command(item)
+            elif key == 'etime' and isinstance(item, str) and re.fullmatch(r'\d+(?:-\d+)?(?::\d+){1,2}', item):
+                clean[key] = item
+            elif key == 'error' and (item is None or item in MEMORY_ERRORS):
+                clean[key] = item
+        return clean
+
+    for key, value in values.items():
+        if key in ('swap', 'vm', 'io'):
+            keys = {'swap': ('totalMb', 'usedMb'), 'io': ('tps', 'mbPerS'),
+                    'vm': ('pageSize', 'freePages', 'activePages', 'inactivePages',
+                           'wiredPages', 'speculativePages', 'purgeablePages', 'compressorPages')}[key]
+            result[key] = None if value is None else row(value, keys)
+        elif key in ('top', 'watched', 'counts') and (value is None or isinstance(value, list)):
+            keys = ('command', 'count', 'ppid1Count') if key == 'counts' else ('pid', 'command', 'memMb', 'cmprsMb', 'cpu')
+            if key == 'watched':
+                keys += ('etime', 'error')
+            result[key] = None if value is None else [row(p, keys) for p in value[:{'top': 15, 'watched': 512, 'counts': 5}[key]]]
+        elif key == 'load' and (value is None or isinstance(value, list)):
+            result[key] = None if value is None else [n for n in value[:3] if numeric(n)]
+        elif key in ('pressure', 'freePercent', 'boot', 'swapinsDelta', 'swapoutsDelta',
+                     'deltaWindowS', 'processCount', 'ppid1Count', 'watchedOmitted', 'criticalSamples') and (value is None or numeric(value)):
+            result[key] = value
+        elif key in {n+'Error' for n in ('swap', 'vm', 'pressure', 'freePercent', 'boot',
+                                       'top', 'counts', 'io', 'load', 'delta', 'watched')}:
+            if value is None or (isinstance(value, str) and value in MEMORY_ERRORS):
+                result[key] = value
+    return result
+
+
 def safe_fields(values, event=None):
+    if event in ('memory.sample', 'memory.alert'):
+        return memory_fields(values, event)
     result = {}
     for key, value in (values or {}).items():
         if event == 'proc.disk_wait' and key == 'procs' and isinstance(value, list):
@@ -115,7 +186,11 @@ def safe_fields(values, event=None):
             result[key] = value
         elif key == 'failedStage' and isinstance(value, str) and value in BACKUP_STAGES:
             result[key] = value
+        elif event == 'backup.run' and key == 'failureStage' and isinstance(value, str):
+            result[key] = value if value in FAILURE_STAGES else 'unknown'
         elif key == 'failReason' and value in ('password_unavailable', 'no_repo_access', 'source_missing', 'other'):
+            result[key] = value
+        elif key == 'stopReason' and value in ('done', 'budget', 'killed'):
             result[key] = value
         elif key == 'duMode' and value == 'links':
             result[key] = value
