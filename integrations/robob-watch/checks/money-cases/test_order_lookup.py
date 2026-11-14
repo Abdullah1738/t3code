@@ -164,6 +164,28 @@ def details(oid, service, timeout):
                 result = lookup.native('noon', str(self.root), services=(service,))
                 self.assertFalse(result['lanes'][service]['exhaustive'])
 
+    def test_repeated_scoped_status_updates_invalidate_positive_matches(self):
+        for status, raw_status in (
+            ('cancelled', 'cancelled'), ('cancelled', 'canceled'), ('unknown', 'failed'),
+            ('unknown', 'future_status'), ('out for delivery', 'out_for_delivery'),
+            ('delivered', 'cancelled'), ('unknown', 'delivered'), ('delivered', 'delivered'),
+        ):
+            with self.subTest(status=status, raw_status=raw_status):
+                first = {**row('A'), 'item_id': 'A-1', 'shipment_id': 'A-S1', 'total': CHARGE['amount']}
+                second = {**first, 'status': status, 'raw_status': raw_status}
+                other = {**row('B'), 'item_id': 'B-1', 'shipment_id': 'B-S1', 'total': '99.00'}
+                self.fixture(marketplace={'1': [first, other], '2': [second, other]}, paging=['marketplace'])
+                result = lookup.native('noon', str(self.root), services=('marketplace',))
+                self.assertFalse(result['lanes']['marketplace']['exhaustive'])
+                self.assertIsNone(result['lanes']['marketplace']['covered_from'])
+                if status == raw_status == 'delivered':
+                    self.assertEqual(charges.order_receipt(CHARGE, AT, AT,
+                        lookup=lambda *a, **kw: result)['verdict'], 'receipt')
+                else:
+                    with self.assertRaises(charges.Lookup):
+                        charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: result)
+                    self.assertEqual([r['order'] for r in result['orders']], ['B'])
+
     def test_unverified_reader_retains_page_one_limit(self):
         self.fixture(food={'1': [row('A')], '2': [row('B', -60)]},
                      coverage_override={'food': {'paging_verified': True, 'default_page_only': True}})

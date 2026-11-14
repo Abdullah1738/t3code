@@ -1,5 +1,8 @@
 """Synthetic history contracts; no account, network or Keychain access."""
+import datetime as dt
 import json
+from pathlib import Path
+import sys
 import time
 import unittest
 import urllib.parse
@@ -11,6 +14,61 @@ import noon_vertical_reads as vertical
 
 
 class History(unittest.TestCase):
+    def test_changed_status_on_repeated_scoped_card_cannot_corroborate_charge(self):
+        source = Path(__file__).resolve().parents[2] / 'robob-watch/checks/money-cases'
+        with patch.object(sys, 'path', [str(source), *sys.path]):
+            import charges
+            import order_lookup
+        order = 'NTEST1'
+        at = dt.datetime(2026, 11, 1, 12, tzinfo=dt.timezone.utc)
+        charge = {'merchant': 'noon', 'amount': '12.34', 'currency': 'AED'}
+        manifest = {'orderNr': order, 'createdAt': at.isoformat(),
+                    'shippingAddress': {}, 'trackActions': {}, 'shippingPreferences': {},
+                    'metadata': {'pageRefreshSec': None}, 'payment': {},
+                    'invoice': {'sections': [{'entries': [{'title': 'Subtotal (1 item)'},
+                                {'title': 'Total (inc. VAT)', 'amount': '12.34'}],
+                                'groups': [{'entries': [{'title': 'Subtotal (1 item)'}]}]}]},
+                    'itemGroups': [{'orderNr': order, 'itemNr': order+'-1', 'shipmentNr': order+'-S1',
+                                    'subStatus': {'highStatusCode': 'delivered'},
+                                    'items': [{'itemNr': order+'-1', 'shipmentNr': order+'-S1', 'quantity': 1}]}]}
+        cached = {'service': 'marketplace', 'order': order, 'total': '12.34', 'currency': 'AED',
+                  'placed_at': at.isoformat(), 'status': 'delivered', 'raw_status': 'delivered',
+                  'whole_order_complete': True}
+        for raw in ('cancelled', 'canceled', 'failed', 'CANCELLED', ' Failed ',
+                    'processing', 'confirmed', 'packed', 'shipped',
+                    'out_for_delivery', 'out-for-delivery', 'out for delivery',
+                    'unknown', 'future_status', 'Delivered', 'delivered'):
+            for use_cache in (False, True):
+                for scope in ('item', 'shipment'):
+                    with self.subTest(raw=raw, cached=use_cache, scope=scope):
+                        first = self.page(order, True, 'cursor-one')
+                        second = self.page(order, False, None)
+                        second['data'][0]['status']['highStatusCode'] = raw
+                        if scope == 'shipment':
+                            del first['data'][0]['itemNr']
+                            del second['data'][0]['itemNr']
+                        with patch.object(core, 'verified_session', return_value={}), \
+                                patch.object(core, 'request', side_effect=[{'data': []}, first, second]), \
+                                patch.object(vertical, '_headers', return_value={}), \
+                                patch.object(vertical, '_read', return_value=manifest), \
+                                patch.object(core, 'load', side_effect=AssertionError('unexpected Keychain read')), \
+                                patch.object(core.urllib.request, 'build_opener',
+                                             side_effect=AssertionError('unexpected network read')):
+                            result = order_lookup.native('noon', str(Path(__file__).resolve().parents[1]),
+                                                         services=('marketplace',), cache=[cached] if use_cache else [])
+                        lane = result['lanes']['marketplace']
+                        self.assertEqual((lane['pages'], lane['fetched'], lane['cached']),
+                                         (2, 0 if use_cache else 1, 1 if use_cache else 0))
+                        self.assertFalse(lane['exhaustive'])
+                        self.assertIsNone(lane['covered_from'])
+                        if raw == 'delivered':
+                            self.assertEqual(charges.order_receipt(charge, at, at,
+                                lookup=lambda *a, **kw: result)['verdict'], 'receipt')
+                        else:
+                            with self.assertRaises(charges.Lookup):
+                                charges.order_receipt(charge, at, at, lookup=lambda *a, **kw: result)
+                            self.assertEqual(result['orders'], [])
+
     def test_separate_zone_is_required_for_legacy_wall_time(self):
         for value, zone, expected in (
             ('2026-11-01T10:20:30', '+04:00', '2026-11-01T10:20:30+04:00'),

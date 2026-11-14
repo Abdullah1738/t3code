@@ -206,8 +206,9 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                 if not isinstance(listed, list):
                     raise ValueError('invalid list')
                 identities = {(o['order'], o.get('item_id'), o.get('shipment_id')) for o in listed}
-                if page > 1 and listed and not identities - page_ids:
-                    break
+                # Repeated identities can carry changed statuses that invalidate
+                # retained matches. Reconcile them before stopping pagination.
+                repeated_page = page > 1 and bool(listed) and not identities - page_ids
                 page_ids.update(identities)
                 page_done = True
                 shipment_cancellations = {o.get('order') for o in listed if isinstance(o, dict)
@@ -288,7 +289,7 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                             lane['covered_from'] = None
                 if unordered:
                     lane['covered_from'] = None
-                if not page_done or broken or unordered:
+                if not page_done or broken or unordered or repeated_page:
                     break
                 if paging and service != 'marketplace':
                     pages = coverage.get('total_pages')
