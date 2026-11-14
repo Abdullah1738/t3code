@@ -455,6 +455,12 @@ class CheckEntry(Base):
     def test_check_runs_in_runner_environment_with_fake_msgs_and_temp_state(self):
         home = self.tmp / 'home'
         home.mkdir()
+        helpers = home / '.local/bin'
+        helpers.mkdir(parents=True)
+        card_status = helpers / 'card-status'
+        card_status.write_text('#!/usr/bin/python3\nimport sys\n'
+                               'assert sys.argv[1:] == ["merchant", "dead", "--json"]\nprint("[]")\n')
+        card_status.chmod(0o700)
         trace = self.tmp / 'msgs-calls'
         now = mc.now_dubai()
         book = {'version': 1, 'questions': []}
@@ -472,7 +478,7 @@ class CheckEntry(Base):
                                 '/bin', '/usr/sbin', '/sbin'])
         env = {'HOME': str(home), 'PATH': runner_path, 'LANG': 'en_US.UTF-8', 'WATCH_DIR': str(self.wd),
                'WATCH_ID': 'money-cases', 'MONEY_CASES_DIR': str(self.data),
-               'MONEY_CASES_MSGS': str(fake)}
+               'MONEY_CASES_MSGS': str(fake), 'ROBOB_TOOL_LOG_DIR': str(self.tmp / 'runner-logs')}
         started = time.monotonic()
         with ControlServer() as server:
             env['T3_CONTROL_TOKEN_FILE'] = str(server.credentials)
@@ -487,6 +493,49 @@ class CheckEntry(Base):
         self.assertEqual(trace.read_text().splitlines(), ['search', 'show'])
         questions = json.loads((self.wd / 'scratch-books/questions.json').read_text())['questions']
         self.assertEqual(questions[0]['status'], 'closed')
+        rows = [json.loads(line) for path in (self.tmp / 'runner-logs/orders').glob('*.ndjson')
+                for line in path.read_text().splitlines()]
+        row, = [row for row in rows if row['name'] == 'check.run']
+        self.assertIs(row['ok'], True)
+        self.assertEqual(row['props']['fired'], int(bool(done.stdout)))
+
+    def test_check_records_success_after_a_normal_return(self):
+        with patch.object(mc, '_run_check', return_value=''), patch.object(mc, 'record_event') as record:
+            self.assertEqual(mc.run_check(self.wd, 'normal', self.data, self.root), '')
+        record.assert_called_once()
+        self.assertEqual(record.call_args.args, ('check.run',))
+        self.assertIs(record.call_args.kwargs['ok'], True)
+
+    def test_check_records_failure_and_propagates_the_original_exception(self):
+        failure = RuntimeError('fixture check failed')
+        with patch.object(mc, '_run_check', side_effect=failure), patch.object(mc, 'record_event') as record:
+            with self.assertRaises(RuntimeError) as raised:
+                mc.run_check(self.wd, 'failure', self.data, self.root)
+        self.assertIs(raised.exception, failure)
+        record.assert_called_once()
+        self.assertEqual(record.call_args.args, ('check.run',))
+        self.assertIs(record.call_args.kwargs['ok'], False)
+        self.assertEqual(record.call_args.kwargs['props']['fired'], 0)
+
+    def test_check_records_fired_event_and_success_when_nothing_is_due(self):
+        self.case()
+        now = at('2026-10-24T10:00')
+        with patch.object(mc, 'record_event') as record:
+            event = mc.run_check(self.wd, 'due', self.data, self.root, now, finder(), nobody)
+            self.assertTrue(event)
+            self.assertIs(record.call_args.kwargs['ok'], True)
+            self.assertEqual(record.call_args.kwargs['props']['fired'], 1)
+            self.assertEqual(mc.run_check(self.wd, 'nothing-new', self.data, self.root, now, finder(), nobody), '')
+            self.assertIs(record.call_args.kwargs['ok'], True)
+            self.assertEqual(record.call_args.kwargs['props']['fired'], 0)
+
+    def test_check_records_incomplete_follow_up_as_failure(self):
+        with patch.object(mc, 'follow', return_value=['fixture lookup error']), \
+                patch.object(mc, 'record_event') as record:
+            self.assertEqual(mc.run_check(self.wd, 'partial', self.data, self.root,
+                                         at('2026-10-24T10:00'), finder(), nobody), '')
+        self.assertIs(record.call_args.kwargs['ok'], False)
+        self.assertEqual(record.call_args.kwargs['props']['fired'], 0)
 
 
 class Rules(Base):
