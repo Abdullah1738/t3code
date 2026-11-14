@@ -9,6 +9,7 @@ import {
   type KanbanThreadLink,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
 
 import * as Activity from "./activity.ts";
 import * as Rules from "./rules.ts";
@@ -916,18 +917,89 @@ describe("parseWindow", () => {
     expect(Activity.parseWindow(undefined, window.until, now)).toEqual(window);
   });
   it.each([
-    ["not a time", undefined, "since must be an ISO time."],
-    [undefined, "nope", "until must be an ISO time."],
-    ["2026-11-13T01:00:00Z", undefined, "since must be before until."],
+    ["not a time", undefined, "since must be an ISO time or a relative time like now-24h or 24h."],
+    [undefined, "nope", "until must be an ISO time or a relative time like now-24h or 24h."],
+    [
+      "2026-11-13T01:00:00Z",
+      undefined,
+      "since 2026-11-13T01:00:00.000Z is not before until 2026-11-13T00:00:00.000Z (now, server clock, UTC).",
+    ],
     ["2026-11-01T00:00:00Z", undefined, "The window is at most 72 hours."],
+    ["now-73h", undefined, "The window is at most 72 hours."],
+    ["7d", undefined, "The window is at most 72 hours."],
   ])("refuses since=%s until=%s", (since, until, message) => {
     expect(Activity.parseWindow(since, until, now)).toBe(message);
+  });
+  it.each(["now-24h", "24h", " NOW-24H ", "\t24H\n", "now-1d", "1D", "1440m"])(
+    "resolves %s to the last 24 hours",
+    (since) => {
+      expect(Activity.parseWindow(since, "now", now)).toEqual(
+        Activity.parseWindow(undefined, "now", now),
+      );
+      expect(Activity.parseWindow(since, undefined, now)).toEqual({
+        since: window.since,
+        until: "2026-11-13T00:00:00.001Z",
+      });
+    },
+  );
+  it.each(["now-90m", "90m", " NOW-90M "])("resolves %s from the server clock", (since) => {
+    expect(Activity.parseWindow(since, undefined, now)).toEqual({
+      since: "2026-11-12T22:30:00.000Z",
+      until: "2026-11-13T00:00:00.001Z",
+    });
+  });
+  it.each(["now-24h", "24h", " NOW-24H "])("resolves until=%s from now too", (until) => {
+    expect(Activity.parseWindow("now-48h", until, now)).toEqual({
+      since: "2026-11-11T00:00:00.000Z",
+      until: window.since,
+    });
+    expect(Activity.parseWindow(undefined, until, now)).toEqual({
+      since: "2026-11-11T00:00:00.000Z",
+      until: window.since,
+    });
+  });
+  it.each(["now", "now-0h", "0h", "0m", "now-0d"])("refuses zero duration %s", (since) => {
+    expect(Activity.parseWindow(since, undefined, now)).toBe(
+      "since 2026-11-13T00:00:00.000Z is not before until 2026-11-13T00:00:00.000Z (now, server clock, UTC).",
+    );
+  });
+  it.each(["now-24x", "24x", "yesterday", "now-10000m", "10000h", "now-1.5h", "now+1h"])(
+    "refuses invalid time %s for either bound",
+    (value) => {
+      expect(Activity.parseWindow(value, undefined, now)).toBe(
+        "since must be an ISO time or a relative time like now-24h or 24h.",
+      );
+      expect(Activity.parseWindow(undefined, value, now)).toBe(
+        "until must be an ISO time or a relative time like now-24h or 24h.",
+      );
+    },
+  );
+  it("identifies an explicit until in reversed-window errors", () => {
+    expect(Activity.parseWindow("now-24h", "now-48h", now)).toBe(
+      "since 2026-11-12T00:00:00.000Z is not before until 2026-11-11T00:00:00.000Z (explicit until, UTC).",
+    );
+  });
+  it("normalizes offset timestamps to UTC", () => {
+    expect(Activity.parseWindow("2026-11-12T04:00:00+04:00", "now", now)).toEqual(window);
+  });
+  it("keeps Date.parse behavior for timestamps without an offset", () => {
+    const since = "2026-11-12T04:00:00";
+    expect(Activity.parseWindow(since, "now", now)).toEqual({
+      since: DateTime.formatIso(DateTime.makeUnsafe(Date.parse(since))),
+      until: window.until,
+    });
   });
   it("accepts a 72 hour window", () => {
     expect(Activity.parseWindow("2026-11-10T00:00:00Z", window.until, now)).toEqual({
       since: "2026-11-10T00:00:00.000Z",
       until: window.until,
     });
+    for (const since of ["now-72h", "72h", "3d", "4320m"]) {
+      expect(Activity.parseWindow(since, "now", now)).toEqual({
+        since: "2026-11-10T00:00:00.000Z",
+        until: window.until,
+      });
+    }
   });
 });
 

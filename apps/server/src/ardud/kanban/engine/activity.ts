@@ -899,18 +899,35 @@ export const pageCardEvents = (
   };
 };
 
-/** Parses since/until into a bounded window ending no later than now. */
+const parseTime = (value: string, now: number) => {
+  const trimmed = value.trim();
+  if (/^now$/i.test(trimmed)) return now;
+  const relative = /^(?:now-)?(\d{1,4})([mhd])$/i.exec(trimmed);
+  if (relative !== null) {
+    const unit = relative[2]!.toLowerCase();
+    const scale = unit === "m" ? MINUTE : unit === "h" ? HOUR : 24 * HOUR;
+    return now - Number(relative[1]) * scale;
+  }
+  return Date.parse(value);
+};
+
+/** Parses since/until into a window of at most 72 hours. */
 export const parseWindow = (
   since: string | undefined,
   until: string | undefined,
   now: number,
 ): ActivityWindow | string => {
+  const end = until === undefined ? now : parseTime(until, now);
+  if (!Number.isFinite(end))
+    return "until must be an ISO time or a relative time like now-24h or 24h.";
   // `until` is exclusive; by default it includes an event written in the same millisecond.
-  const end = until === undefined ? now + 1 : Date.parse(until);
-  if (!Number.isFinite(end)) return "until must be an ISO time.";
-  const start = since === undefined ? end - ACTIVITY_DEFAULT_WINDOW_MS : Date.parse(since);
-  if (!Number.isFinite(start)) return "since must be an ISO time.";
-  if (start >= end) return "since must be before until.";
-  if (end - start > ACTIVITY_MAX_WINDOW_MS) return "The window is at most 72 hours.";
-  return { since: isoOf(start), until: isoOf(end) };
+  const exclusiveEnd = until === undefined ? end + 1 : end;
+  const start =
+    since === undefined ? exclusiveEnd - ACTIVITY_DEFAULT_WINDOW_MS : parseTime(since, now);
+  if (!Number.isFinite(start))
+    return "since must be an ISO time or a relative time like now-24h or 24h.";
+  if (start >= end)
+    return `since ${isoOf(start)} is not before until ${isoOf(end)} (${until === undefined ? "now, server clock, UTC" : "explicit until, UTC"}).`;
+  if (exclusiveEnd - start > ACTIVITY_MAX_WINDOW_MS) return "The window is at most 72 hours.";
+  return { since: isoOf(start), until: isoOf(exclusiveEnd) };
 };
