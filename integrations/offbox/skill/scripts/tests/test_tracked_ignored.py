@@ -49,7 +49,11 @@ class TrackedIgnoredTests(unittest.TestCase):
         stack.enter_context(patch.object(ssh_sync, "_progress_args", return_value=()))
 
         stack.enter_context(patch.object(ssh_sync.subprocess, "run", side_effect=self.run_local))
-        stack.enter_context(patch.object(ssh_sync, "ssh", side_effect=AssertionError("no ssh expected")))
+        stack.enter_context(patch.object(ssh_sync, "ssh", side_effect=self.ssh_local))
+
+    def ssh_local(self, box, command, input=None, timeout=120, check=False):
+        return self.real_run(["sh", "-c", command], input=input, capture_output=True,
+                             timeout=timeout, check=check)
 
     def write(self, rel, text):
         p = self.src / rel

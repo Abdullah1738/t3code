@@ -1709,7 +1709,9 @@ class Runner:
                                        seed_candidates=candidates, run_id=self.run_id)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
-                    f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
+                    f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s; "
+                    f"verified {st.get('verified', 0)} tracked files"
+                    f"{', repaired ' + str(st['repaired']) if st.get('repaired') else ''})")
                 note = ssh_sync.tracked_ignored_note(st)
                 if note:
                     say(note)

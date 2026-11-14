@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import hashlib
+import json
 import os
+import stat
 import signal
 from functools import lru_cache
 import re
@@ -675,11 +678,160 @@ def _push(box_id: str, root: Path, remote_dir: str, with_git: bool = False, time
             extra = _push_git(box_id, gitdir, remote_dir, timeout, run_id=run_id)
             for key, value in extra.items():
                 st[key] = st.get(key, 0) + value
+        verified = _verify_content(box_id, root, remote_dir, _tracked_content(root, includes), timeout, run_id)
+        for key, value in verified.items():
+            st[key] = st.get(key, 0) + value
     st["seconds"] = round(time.time() - t, 2)
     st["secret_skips"] = tracked_secret_matches(root, includes)
     st["skipped"] = len(st["secret_skips"])
     log(f"push {box_id} {root} -> {remote_dir} {st}")
     return st
+
+
+def _content_signature(path: Path) -> tuple[str, str]:
+    try:
+        info = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return ("missing", "")
+    if stat.S_ISLNK(info.st_mode):
+        data = os.fsencode(os.readlink(path))
+        return ("link", hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest())
+    if stat.S_ISDIR(info.st_mode):
+        return ("dir", "")
+    if not stat.S_ISREG(info.st_mode):
+        return ("other", "")
+    h = hashlib.sha1(b"blob " + str(info.st_size).encode() + b"\0")
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(chunk)
+    return ("file", h.hexdigest())
+
+
+def _tracked_content(root: Path, includes: list[str] | None) -> dict[str, tuple[str, str]]:
+    p = subprocess.run(["git", "-C", str(root), "ls-files", "--stage", "-z"], capture_output=True,
+                       env=git_snapshot._git_env(), timeout=30)
+    if p.returncode:
+        # Plain directories are supported too. A broken index in a repository must fail closed.
+        probe = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-dir"],
+                               capture_output=True, env=git_snapshot._git_env(), timeout=30)
+        if probe.returncode and not os.path.lexists(root / ".git"):
+            return {}
+        raise OffboxError("cannot list tracked content for sync; nothing ran")
+    entries = [raw for raw in p.stdout.split(b"\0") if raw]
+    deleted = subprocess.run(["git", "-C", str(root), "diff", "--cached", "--raw", "-z",
+                              "--diff-filter=D", "--no-renames"], capture_output=True,
+                             env=git_snapshot._git_env(), timeout=30)
+    if deleted.returncode:
+        raise OffboxError("cannot list staged deletions for sync; nothing ran")
+    rows = deleted.stdout.split(b"\0")
+    for meta, raw_path in zip(rows[::2], rows[1::2]):
+        # A file merely untracked with git rm --cached still exists and stays outside verification.
+        if not os.path.lexists(root / os.fsdecode(raw_path)):
+            entries.append(meta[1:7] + b" \t" + raw_path)
+    names, result = {}, {}
+    inc = [i.strip("/") for i in includes or []]
+    for raw in entries:
+        entry, _, raw_path = raw.partition(b"\t")
+        if entry.startswith(b"160000 "):
+            continue
+        path = os.fsdecode(raw_path)
+        real = _disk_path(root, path, names)
+        if real is None:
+            # Do not inspect descendants hidden behind a symlinked parent.
+            if any((root / Path(path).parents[i]).is_symlink() for i in range(len(Path(path).parents) - 1)):
+                continue
+            real = path
+        if real == ".git" or real.startswith(".git/"):
+            continue
+        included = any(real == i or real.startswith(i + "/") for i in inc)
+        if (_offbox_skips(path) or _offbox_skips(real)) and not included:
+            continue
+        try:
+            sig = _content_signature(root / real)
+        except OSError as e:
+            raise OffboxError(f"cannot hash tracked file {real!r}; nothing ran") from e
+        if sig[0] == "other":
+            raise OffboxError(f"unsupported tracked file type {real!r}; nothing ran")
+        result[real] = sig
+    return result
+
+
+# Run the same raw Git-blob hash on both hosts: no git installation, filters, index or history needed remotely.
+_CONTENT_CHECK = '''import hashlib,json,os,stat,sys
+def signature(path):
+    try:
+        if any(os.path.islink(os.path.join(*path.split('/')[:i])) for i in range(1,len(path.split('/')))):
+            return ('other','')
+        info=os.lstat(path)
+        if stat.S_ISLNK(info.st_mode):
+            data=os.fsencode(os.readlink(path))
+            return ('link',hashlib.sha1(b'blob '+str(len(data)).encode()+b'\\0'+data).hexdigest())
+        if stat.S_ISDIR(info.st_mode): return ('dir','')
+        if not stat.S_ISREG(info.st_mode): return ('other','')
+        h=hashlib.sha1(b'blob '+str(info.st_size).encode()+b'\\0')
+        with open(path,'rb') as stream:
+            for chunk in iter(lambda:stream.read(1024*1024),b''): h.update(chunk)
+        return ('file',h.hexdigest())
+    except (FileNotFoundError,NotADirectoryError): return ('missing','')
+    except OSError: return ('unreadable','')
+rows=json.load(sys.stdin)
+print(json.dumps([p for p,want in rows.items() if list(signature(p))!=want]))
+'''
+
+
+def _content_mismatches(box_id: str, remote_dir: str, expected: dict, timeout: float) -> list[str]:
+    command = f'cd -- {shlex.quote(remote_dir)} && python3 -I -c {shlex.quote(_CONTENT_CHECK)}'
+    p = ssh(box_id, command, input=json.dumps(expected).encode(), timeout=min(timeout, 120), check=True)
+    try:
+        bad = json.loads(p.stdout)
+        if not isinstance(bad, list) or any(not isinstance(x, str) or x not in expected for x in bad):
+            raise ValueError("unexpected paths")
+        return bad
+    except (ValueError, TypeError) as e:
+        raise OffboxError("invalid tracked-content verification response; nothing ran") from e
+
+
+def _content_event(box_id: str, paths: list[str], repaired: bool, run_id: str | None) -> None:
+    con = common.db()
+    try:
+        common.event(con, box_id, "sync_content_mismatch", json.dumps(
+            {"run_id": run_id, "path_count": len(paths), "repaired": repaired,
+             "paths": [p[:200] for p in paths[:5]]}, ensure_ascii=False))
+    finally:
+        con.close()
+
+
+def _verify_content(box_id: str, root: Path, remote_dir: str, expected: dict, timeout: float,
+                    run_id: str | None) -> dict:
+    if not expected:
+        return {"verified": 0, "repaired": 0}
+    t = time.monotonic()
+    bad = _content_mismatches(box_id, remote_dir, expected, timeout)
+    result = {"verified": len(expected), "repaired": 0}
+    if bad:
+        repaired = False
+        try:
+            cmd = [RSYNC, "-az", "--checksum", "--from0", "--files-from=-", "--delete-missing-args",
+                   "--no-o", "--no-g", "--omit-dir-times", "--stats", "--timeout=120",
+                   "-e", " ".join(shlex.quote(x) for x in ssh_base(box_id)),
+                   f"{root}/", f"{box_id}:{remote_dir}/"]
+            extra = _stats(_rsync(box_id, remote_dir, cmd, timeout, files="\0".join(bad) + "\0",
+                                  source=root, phase="content-repair", run_id=run_id))
+            for key in ("sent", "received", "files", "xfer"):
+                result[key] = extra.get(key, 0)
+            remaining = _content_mismatches(box_id, remote_dir, expected, timeout)
+            if remaining:
+                raise OffboxError(f"tracked content differs after checksum repair: {remaining[:20]!r}; nothing ran")
+            repaired = True
+            result["repaired"] = len(bad)
+        except common.SshHostKeyMismatch:
+            raise
+        except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
+            raise OffboxError(f"tracked content repair failed for {bad[:20]!r}: {e}; nothing ran") from e
+        finally:
+            _content_event(box_id, bad, repaired, run_id)
+    result["verify_seconds"] = round(time.monotonic() - t, 3)
+    return result
 
 
 class BoxStoppedDuringPush(OffboxError):
@@ -1080,6 +1232,8 @@ def _push_file_passes(box_id: str, root: Path, remote_dir: str, with_git: bool, 
     cmd = [RSYNC, "-az", "--delete", "--mkpath", "--no-o", "--no-g", "--omit-dir-times", "--stats",
            "--timeout=120", "-e", ssh_cmd, "-ii", "-8", f"--out-format={ITEM}%i %n"]
     if sibling:
+        # --copy-dest otherwise trusts size + whole-second mtime across different working trees.
+        cmd.append("--checksum")
         cmd.append(f"--copy-dest=../{sibling.split('/')[-1]}")
     cmd += push_filters(root, with_git, includes)
     cmd += [f"{root}/", f"{box_id}:{remote_dir}/"]
