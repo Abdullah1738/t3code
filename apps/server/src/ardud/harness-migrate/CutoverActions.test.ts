@@ -64,6 +64,7 @@ import * as Rules from "../kanban/engine/rules.ts";
 import * as BoardStore from "../kanban/store/KanbanStore.ts";
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 import { kanbanDDL } from "../persistence/kanbanSchema.ts";
+import { ensureKanbanCacheVersions } from "../persistence/kanbanCacheVersions.ts";
 import { readBlockRetry, writeBlockRetry, type BlockRetry } from "../schedules/runFollow.ts";
 import * as Actions from "./CutoverActions.ts";
 import * as CutoverEngine from "./CutoverEngine.ts";
@@ -113,6 +114,33 @@ const board: KanbanBoard = {
   defaultCardModel: opus,
   reviewChains: [{ name: "review", steps: [sol, terra] }],
   defaultReviewChain: "review",
+  standingApprovals: [
+    {
+      id: "standing-deploy",
+      gate: "deploy",
+      minIntervalHours: 4,
+      quote: "This board may release every four hours",
+      sourceThreadId: "approval-thread",
+      saidAt: at,
+      approvedAsk: { cardId: "approval-card", askId: "q1" },
+      recordedAt: at,
+      recordedBy: "evaluator",
+      revokedAt: null,
+      revokedBy: null,
+      revokeReason: null,
+    },
+  ],
+  releaseLedger: [
+    {
+      boardId: KanbanBoardId.make("board:cutover-fixture"),
+      cardId: KanbanCardId.make("previous-release"),
+      cardNumber: 1,
+      subtaskId: "s1",
+      at,
+      critical: null,
+      approvalId: "standing-deploy",
+    },
+  ],
   instructions: {
     modelRouting: "Keep routing",
     reviewerRouting: "Keep review",
@@ -500,6 +528,7 @@ const splitDatabase = Layer.unwrap(
     const boardContext = yield* Layer.build(NodeSqliteClient.layer({ filename: ":memory:" }));
     const sql = yield* SqlClient.SqlClient.pipe(Effect.provide(boardContext));
     for (const ddl of kanbanDDL) yield* sql.unsafe(ddl);
+    yield* ensureKanbanCacheVersions(sql);
     return Layer.mergeAll(
       BoardStore.layer,
       CutoverStore.layerWithOptions({ snapshotPath: path.join(directory, "plan.json") }),

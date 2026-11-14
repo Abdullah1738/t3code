@@ -1,3 +1,4 @@
+import { AskTimingScrollView } from "./needsYou/AskTimingScrollView";
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/reactivity";
 import {
@@ -335,7 +336,7 @@ function TabsBoard(props: {
   const shownOwner = allOwner ? owner : owner.slice(0, OWNER_PREVIEW);
 
   return (
-    <ScrollView
+    <AskTimingScrollView
       className="flex-1"
       contentContainerStyle={{ paddingBottom: props.bottomInset + 16 }}
       // The filter and Needs Owner scroll away; the stage tabs stay.
@@ -401,7 +402,7 @@ function TabsBoard(props: {
           </View>
         </>
       )}
-    </ScrollView>
+    </AskTimingScrollView>
   );
 }
 
@@ -823,14 +824,14 @@ function ColumnsBoard(props: {
       {props.mode === "threads" ? null : (
         <View className="flex-1 flex-row" style={{ gap: COLUMN_GAP }}>
           {layout.scrolls ? (
-            <ScrollView
+            <AskTimingScrollView
               horizontal
               className="flex-1"
               showsHorizontalScrollIndicator={false}
               contentContainerStyle={{ paddingLeft: BOARD_PAD }}
             >
               {stages}
-            </ScrollView>
+            </AskTimingScrollView>
           ) : (
             <View className="flex-1" style={{ paddingLeft: BOARD_PAD }}>
               {stages}
@@ -922,14 +923,14 @@ function columnMenuActions(
 
 function ColumnScroll(props: { readonly bottomInset: number; readonly children: React.ReactNode }) {
   return (
-    <ScrollView
+    <AskTimingScrollView
       className="flex-1"
       showsVerticalScrollIndicator={false}
       contentContainerClassName="gap-2 pt-1"
       contentContainerStyle={{ paddingBottom: props.bottomInset + 16 }}
     >
       {props.children}
-    </ScrollView>
+    </AskTimingScrollView>
   );
 }
 

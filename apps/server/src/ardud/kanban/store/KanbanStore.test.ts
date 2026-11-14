@@ -2,6 +2,8 @@
 import * as NodeCrypto from "node:crypto";
 import * as NodeV8 from "node:v8";
 import * as NodeVM from "node:vm";
+import * as NodeWorkerThreads from "node:worker_threads";
+import * as Schema from "effect/Schema";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -28,8 +30,8 @@ import {
   ThreadId,
   type KanbanAutomation,
   type KanbanBoard,
-  type KanbanCard,
-  type KanbanDiscussion,
+  KanbanCard,
+  KanbanDiscussion,
   type KanbanGoal,
   type KanbanGroup,
   type KanbanMessage,
@@ -37,13 +39,17 @@ import {
   type KanbanScript,
   type KanbanThreadLink,
   type KanbanWikiPage,
+  kanbanPickOrder,
+  kanbanSchedule,
 } from "@t3tools/contracts";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import { kanbanDDL } from "../../persistence/kanbanSchema.ts";
+import { ensureKanbanCacheVersions } from "../../persistence/kanbanCacheVersions.ts";
 import { summaries, tallyBoards } from "../engine/summaries.ts";
 import * as KanbanStore from "./KanbanStore.ts";
+import * as Rules from "../engine/rules.ts";
 
 const TestLayer = KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory));
 
@@ -63,6 +69,8 @@ const board: KanbanBoard = {
   defaultCardModel: model,
   reviewChains: [],
   defaultReviewChain: null,
+  standingApprovals: [],
+  releaseLedger: [],
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   createdAt: at,
   setup: null,
@@ -159,6 +167,7 @@ it.effect("loads open review links with their cards, including missing cards, in
 
 const withFileStore = <A, E>(
   effect: Effect.Effect<A, E, KanbanStore.KanbanStore | SqlClient.SqlClient>,
+  timeoutMs = 15_000,
 ) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -167,7 +176,7 @@ const withFileStore = <A, E>(
     const layer = KanbanStore.layer.pipe(
       Layer.provideMerge(Sqlite.layerFromPath(path.join(dir, "kanban.sqlite"))),
     );
-    return yield* effect.pipe(Effect.timeout("15 seconds"), Effect.provide(layer));
+    return yield* effect.pipe(Effect.timeout(timeoutMs), Effect.provide(layer));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 it.effect("compact pages read the split boards database, not orchestration storage", () =>
@@ -176,6 +185,7 @@ it.effect("compact pages read the split boards database, not orchestration stora
     const context = yield* Layer.build(NodeSqliteClient.layer({ filename: ":memory:" }));
     const sql = Context.get(context, SqlClient.SqlClient);
     yield* Effect.forEach(kanbanDDL, (ddl) => sql.unsafe(ddl), { discard: true });
+    yield* ensureKanbanCacheVersions(sql);
     const split = BoardsDatabase.BoardsDatabase.of({ sql, ready: Effect.void, path: ":memory:" });
     yield* Effect.gen(function* () {
       const store = yield* KanbanStore.KanbanStore;
@@ -633,6 +643,15 @@ it.live(
 );
 
 it.layer(TestLayer)("kanban store", (it) => {
+  it.effect("reads old board rows with no standing approvals as an empty history", () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      yield* store.putBoard(board);
+      yield* sql`UPDATE ardud_kanban_boards SET json = json_remove(json, '$.standingApprovals') WHERE id = ${board.id}`;
+      assert.deepStrictEqual((yield* store.board(board.id))?.standingApprovals, []);
+    }),
+  );
   it.effect("round-trips boards, cards, events, messages and script runs", () =>
     Effect.gen(function* () {
       const store = yield* KanbanStore.KanbanStore;
@@ -707,64 +726,72 @@ it.layer(TestLayer)("kanban store", (it) => {
 });
 
 it.layer(TestLayer)("kanban store: activity reads", (it) => {
-  it.effect("reads a board's events in a time window and each card's last stage change before it", () =>
-    Effect.gen(function* () {
-      const store = yield* KanbanStore.KanbanStore;
-      yield* store.putBoard(board);
-      yield* store.putCard(card(1, "todo"));
-      yield* store.putCard(card(2, "working"));
-      const cardOne = KanbanCardId.make("card-1");
-      const cardTwo = KanbanCardId.make("card-2");
-      const add = (
-        cardId: typeof cardOne,
-        when: string,
-        kind: "created" | "moved" | "comment" | "flagged",
-        fromStage: "todo" | "working" | null,
-        toStage: "todo" | "working" | "needs_review" | null,
-      ) =>
-        store.addCardEvent({
-          cardId,
-          at: when,
-          actor: { _tag: "owner" },
-          kind,
-          fromStage,
-          toStage,
-          body: null,
-          head: null,
-        });
-      yield* add(cardOne, "2026-11-10T00:00:00.000Z", "created", null, "todo");
-      const started = yield* add(cardOne, "2026-11-11T00:00:00.000Z", "moved", "todo", "working");
-      // Not stage changes: a comment, and a flag that leaves it where it was.
-      yield* add(cardOne, "2026-11-11T06:00:00.000Z", "comment", null, null);
-      yield* add(cardOne, "2026-11-11T07:00:00.000Z", "flagged", "working", "working");
-      const inWindow = yield* add(cardOne, "2026-11-12T02:00:00.000Z", "moved", "working", "needs_review");
-      const otherCard = yield* add(cardTwo, "2026-11-12T03:00:00.000Z", "comment", null, null);
-      yield* add(cardOne, "2026-11-13T05:00:00.000Z", "comment", null, null);
+  it.effect(
+    "reads a board's events in a time window and each card's last stage change before it",
+    () =>
+      Effect.gen(function* () {
+        const store = yield* KanbanStore.KanbanStore;
+        yield* store.putBoard(board);
+        yield* store.putCard(card(1, "todo"));
+        yield* store.putCard(card(2, "working"));
+        const cardOne = KanbanCardId.make("card-1");
+        const cardTwo = KanbanCardId.make("card-2");
+        const add = (
+          cardId: typeof cardOne,
+          when: string,
+          kind: "created" | "moved" | "comment" | "flagged",
+          fromStage: "todo" | "working" | null,
+          toStage: "todo" | "working" | "needs_review" | null,
+        ) =>
+          store.addCardEvent({
+            cardId,
+            at: when,
+            actor: { _tag: "owner" },
+            kind,
+            fromStage,
+            toStage,
+            body: null,
+            head: null,
+          });
+        yield* add(cardOne, "2026-11-10T00:00:00.000Z", "created", null, "todo");
+        const started = yield* add(cardOne, "2026-11-11T00:00:00.000Z", "moved", "todo", "working");
+        // Not stage changes: a comment, and a flag that leaves it where it was.
+        yield* add(cardOne, "2026-11-11T06:00:00.000Z", "comment", null, null);
+        yield* add(cardOne, "2026-11-11T07:00:00.000Z", "flagged", "working", "working");
+        const inWindow = yield* add(
+          cardOne,
+          "2026-11-12T02:00:00.000Z",
+          "moved",
+          "working",
+          "needs_review",
+        );
+        const otherCard = yield* add(cardTwo, "2026-11-12T03:00:00.000Z", "comment", null, null);
+        yield* add(cardOne, "2026-11-13T05:00:00.000Z", "comment", null, null);
 
-      const events = yield* store.boardEvents(
-        boardId,
-        "2026-11-12T00:00:00.000Z",
-        "2026-11-13T00:00:00.000Z",
-      );
-      assert.deepStrictEqual(
-        events.map((event) => event.id),
-        [inWindow.id, otherCard.id],
-      );
-      assert.deepStrictEqual(
-        yield* store.boardEvents(
-          KanbanBoardId.make("board-other"),
+        const events = yield* store.boardEvents(
+          boardId,
           "2026-11-12T00:00:00.000Z",
           "2026-11-13T00:00:00.000Z",
-        ),
-        [],
-      );
-      const prior = yield* store.lastTransitions(boardId, [cardOne, cardTwo], inWindow.id);
-      assert.deepStrictEqual(
-        prior.map((event) => event.id),
-        [started.id],
-      );
-      assert.deepStrictEqual(yield* store.lastTransitions(boardId, [], inWindow.id), []);
-    }),
+        );
+        assert.deepStrictEqual(
+          events.map((event) => event.id),
+          [inWindow.id, otherCard.id],
+        );
+        assert.deepStrictEqual(
+          yield* store.boardEvents(
+            KanbanBoardId.make("board-other"),
+            "2026-11-12T00:00:00.000Z",
+            "2026-11-13T00:00:00.000Z",
+          ),
+          [],
+        );
+        const prior = yield* store.lastTransitions(boardId, [cardOne, cardTwo], inWindow.id);
+        assert.deepStrictEqual(
+          prior.map((event) => event.id),
+          [started.id],
+        );
+        assert.deepStrictEqual(yield* store.lastTransitions(boardId, [], inWindow.id), []);
+      }),
   );
 });
 
@@ -1125,6 +1152,277 @@ const discussion = (number: number, home = boardId): KanbanDiscussion => ({
   pinnedAt: null,
   reopenedAt: null,
 });
+
+const decodeFullCard = Schema.decodeEffect(Schema.fromJsonString(KanbanCard));
+const decodeFullDiscussion = Schema.decodeEffect(Schema.fromJsonString(KanbanDiscussion));
+
+// Observe the store's public read span, rather than inferring transfer from cache statistics.
+const tracedRead = Effect.fnUntraced(function* <A, E>(read: Effect.Effect<A, E>) {
+  const spans: Tracer.Span[] = [];
+  const tracer = Tracer.make({
+    span: (options) => {
+      const span = new Tracer.NativeSpan(options);
+      spans.push(span);
+      return span;
+    },
+  });
+  const value = yield* read.pipe(Effect.withTracer(tracer));
+  const span = spans.find((span) => span.name === "KanbanStore.read")!;
+  return {
+    value,
+    rows: span.attributes.get("jsonRowsFetched"),
+    bytes: span.attributes.get("jsonBytesFetched"),
+  };
+});
+
+it.live(
+  "collection reads fetch only changed JSON and match full decodes across mutations",
+  () =>
+    withFileStore(
+      Effect.gen(function* () {
+        const store = yield* KanbanStore.KanbanStore;
+        const sql = yield* SqlClient.SqlClient;
+        yield* store.putCard(card(1, "todo"));
+        yield* store.putDiscussion(discussion(1));
+        const fullCards = Effect.flatMap(
+          NodeSqliteClient.readOnly(
+            sql<{
+              json: string;
+            }>`SELECT json FROM ardud_kanban_cards WHERE board_id = ${boardId} ORDER BY number`,
+          ),
+          (rows) => Effect.forEach(rows, (row) => decodeFullCard(row.json)),
+        );
+        const fullDiscussions = Effect.flatMap(
+          NodeSqliteClient.readOnly(
+            sql<{
+              json: string;
+            }>`SELECT json FROM ardud_kanban_discussions WHERE board_id = ${boardId} ORDER BY rowid`,
+          ),
+          (rows) => Effect.forEach(rows, (row) => decodeFullDiscussion(row.json)),
+        );
+        const check = Effect.gen(function* () {
+          const cards = yield* fullCards;
+          for (const read of [
+            store.cards(boardId),
+            store.openCards(boardId),
+            store.dispatchCards(boardId),
+            store.cardPage(boardId, { after: 0, limit: 10, open: true }),
+            store.claimCards(boardId, []),
+            store.cardsInStage("todo"),
+          ])
+            assert.deepStrictEqual(yield* read, cards);
+          assert.deepStrictEqual(yield* store.discussions(boardId), yield* fullDiscussions);
+          assert.deepStrictEqual(yield* store.openDiscussions(boardId), yield* fullDiscussions);
+        });
+        yield* check;
+        for (const read of [
+          store.openCards(boardId),
+          store.discussions(boardId),
+          store.dispatchCards(boardId),
+        ]) {
+          const warm = yield* tracedRead<unknown, KanbanStore.KanbanStoreError>(read);
+          assert.strictEqual(warm.rows, 0);
+          assert.strictEqual(warm.bytes, 0);
+        }
+        // Same length and unchanged timestamps; these writes bypass all store notifications.
+        const edit = (text: string) =>
+          Effect.all([
+            sql`UPDATE ardud_kanban_cards SET json = json_set(json, '$.title', ${text}) WHERE id = 'card-1'`,
+            sql`UPDATE ardud_kanban_discussions SET json = json_set(json, '$.title', ${text}) WHERE id = 'cache-discussion-1'`,
+          ]);
+        yield* edit("Edited");
+        const changedCard = yield* tracedRead(store.openCards(boardId));
+        const changedDiscussion = yield* tracedRead(store.discussions(boardId));
+        assert.strictEqual(changedCard.rows, 1);
+        assert.strictEqual(changedDiscussion.rows, 1);
+        assert.strictEqual(changedCard.bytes, JSON.stringify(changedCard.value[0]).length);
+        yield* check;
+        yield* edit("Second");
+        assert.strictEqual((yield* tracedRead(store.openCards(boardId))).rows, 1);
+        assert.strictEqual((yield* tracedRead(store.discussions(boardId))).rows, 1);
+        yield* check;
+        // Even the same committed version must bypass shared entries in a caller transaction.
+        yield* sql.withTransaction(check);
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* edit("Rolled");
+              yield* check;
+              return yield* Effect.fail("rollback");
+            }),
+          )
+          .pipe(Effect.flip);
+        yield* check;
+        yield* edit("Reused");
+        yield* check;
+        yield* store.putCard(card(2, "todo"));
+        yield* store.putDiscussion(discussion(2));
+        assert.strictEqual((yield* tracedRead(store.openCards(boardId))).rows, 1);
+        assert.strictEqual((yield* tracedRead(store.discussions(boardId))).rows, 1);
+        yield* check;
+        yield* sql`DELETE FROM ardud_kanban_cards WHERE id = 'card-1'`;
+        yield* sql`DELETE FROM ardud_kanban_discussions WHERE id = 'cache-discussion-1'`;
+        yield* check;
+        assert.strictEqual((yield* store.decodeCacheStats).card!.entries, 1);
+        assert.strictEqual((yield* store.decodeCacheStats).discussion!.entries, 1);
+      }),
+    ),
+  30_000,
+);
+
+it.live(
+  "collection phases keep one reader snapshot across external commits",
+  () =>
+    withFileStore(
+      Effect.gen(function* () {
+        const store = yield* KanbanStore.KanbanStore;
+        const sql = yield* SqlClient.SqlClient;
+        const original = card(1, "todo");
+        const channel = discussion(1);
+        yield* store.putCard(original);
+        yield* store.putDiscussion(channel);
+        // The transform runs immediately before phase two. The independent writer
+        // commits updates, a deletion and inserts after phase one's snapshot is established.
+        for (const table of ["ardud_kanban_cards", "ardud_kanban_discussions"] as const) {
+          let commits = 0;
+          const startWrite = yield* Deferred.make<void>();
+          // Fork before entering the read transaction so the writer cannot inherit its connection.
+          const writer = yield* Effect.gen(function* () {
+            yield* Deferred.await(startWrite);
+            yield* sql.withTransaction(
+              Effect.gen(function* () {
+                if (table === "ardud_kanban_cards") {
+                  yield* store.putCard({ ...original, title: "Committed during read" });
+                  yield* sql`DELETE FROM ardud_kanban_cards WHERE id = ${original.id}`;
+                  yield* store.putCard(card(2, "todo"));
+                } else {
+                  yield* store.putDiscussion({ ...channel, title: "Committed during read" });
+                  yield* sql`DELETE FROM ardud_kanban_discussions WHERE id = ${channel.id}`;
+                  yield* store.putDiscussion(discussion(2));
+                }
+              }),
+            );
+          }).pipe(Effect.forkChild);
+          const transform: Statement.Transformer = (statement) => {
+            const [query] = statement.compile();
+            if (!query.includes(`FROM "${table}"`) || !query.includes("cache_version, json"))
+              return Effect.succeed(statement);
+            commits++;
+            return Deferred.succeed(startWrite, undefined).pipe(
+              Effect.andThen(Fiber.join(writer)),
+              Effect.as(statement),
+              Effect.orDie,
+            );
+          };
+          if (table === "ardud_kanban_cards") {
+            assert.deepStrictEqual(
+              yield* store
+                .openCards(boardId)
+                .pipe(Effect.provideService(Statement.CurrentTransformer, transform)),
+              [original],
+            );
+            assert.deepStrictEqual(yield* store.openCards(boardId), [card(2, "todo")]);
+          } else {
+            assert.deepStrictEqual(
+              yield* store
+                .discussions(boardId)
+                .pipe(Effect.provideService(Statement.CurrentTransformer, transform)),
+              [channel],
+            );
+            assert.deepStrictEqual(yield* store.discussions(boardId), [discussion(2)]);
+          }
+          assert.strictEqual(commits, 1);
+        }
+      }),
+    ),
+  30_000,
+);
+
+it.live(
+  "warm synthetic board reads cut serialized worker reply bytes by at least 90 percent",
+  () =>
+    withFileStore(
+      Effect.gen(function* () {
+        const store = yield* KanbanStore.KanbanStore;
+        const sql = yield* SqlClient.SqlClient;
+        const cards = Array.from({ length: 4000 }, (_, i) => ({
+          ...card(i + 1, "todo"),
+          prompt: "x".repeat(8192),
+        }));
+        const discussions = Array.from({ length: 3000 }, (_, i) => ({
+          ...discussion(i + 1),
+          title: "d".repeat(2048),
+        }));
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`INSERT INTO ardud_kanban_cards (id, board_id, number, stage, json)
+        SELECT json_extract(value, '$.id'), ${boardId}, json_extract(value, '$.number'), 'todo', value FROM json_each(${JSON.stringify(cards)})`;
+            yield* sql`INSERT INTO ardud_kanban_discussions (id, board_id, json)
+        SELECT json_extract(value, '$.id'), ${boardId}, value FROM json_each(${JSON.stringify(discussions)})`;
+          }),
+        );
+        const messages = vi.spyOn(NodeWorkerThreads.Worker.prototype, "emit");
+        try {
+          const measure = Effect.fnUntraced(function* <A, E>(read: Effect.Effect<A, E>) {
+            messages.mockClear();
+            const value = yield* read;
+            const replies = messages.mock.calls.flatMap(([event, reply]) =>
+              event === "message" ? [reply] : [],
+            );
+            const rowReplies = replies.filter(
+              (reply) => reply && typeof reply === "object" && "rows" in reply,
+            ).length;
+            return {
+              value,
+              bytes: replies.reduce((sum, reply) => sum + NodeV8.serialize(reply).byteLength, 0),
+              rowReplies,
+            };
+          });
+          const baseline = yield* measure(
+            NodeSqliteClient.readOnly(
+              Effect.all([
+                sql`SELECT id, board_id, cache_version, json FROM ardud_kanban_cards WHERE board_id = ${boardId} ORDER BY number`,
+                sql`SELECT id, board_id, cache_version, json FROM ardud_kanban_discussions WHERE board_id = ${boardId} ORDER BY rowid`,
+                sql`SELECT id, board_id, cache_version, json, number FROM ardud_kanban_cards WHERE board_id = ${boardId} AND stage = 'todo' AND json_extract(json, '$.settledAt') IS NULL ORDER BY number`,
+              ]),
+            ),
+          );
+          assert.strictEqual(baseline.rowReplies, 3);
+          assert.strictEqual((yield* tracedRead(store.openCards(boardId))).rows, 4000);
+          assert.strictEqual((yield* tracedRead(store.discussions(boardId))).rows, 3000);
+          const warm = yield* measure(
+            Effect.all([
+              tracedRead(store.openCards(boardId)),
+              tracedRead(store.discussions(boardId)),
+              tracedRead(store.dispatchCards(boardId)),
+            ]),
+          );
+          for (const read of warm.value) {
+            assert.strictEqual(read.rows, 0);
+            assert.strictEqual(read.bytes, 0);
+          }
+          assert.deepStrictEqual(warm.value[0]!.value, cards);
+          assert.deepStrictEqual(warm.value[1]!.value, discussions);
+          assert.isAbove(warm.bytes, 0);
+          assert.isBelow(warm.bytes, baseline.bytes * 0.1);
+          yield* Effect.logInfo("KANBAN_WORKER_REPLY_BYTES", {
+            cards: cards.length,
+            discussions: discussions.length,
+            operations: ["openCards", "discussions", "dispatchCards"],
+            before: baseline.bytes,
+            after: warm.bytes,
+            reduction: 1 - warm.bytes / baseline.bytes,
+            serialization:
+              "node:v8 serialize of actual Worker message replies, including transaction control replies",
+          });
+        } finally {
+          messages.mockRestore();
+        }
+      }),
+      45_000,
+    ),
+  60_000,
+);
 
 it.live(
   "keeps more than 2048 discussions across boards, subsets and row versions",
@@ -1596,6 +1894,64 @@ it.effect("invalidates same-length row text with unchanged timestamps", () =>
   }).pipe(Effect.provide(TestLayer)),
 );
 
+it.effect(
+  "invalidates large cards and discussions on rewrites, replacements and rollback revision reuse",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const originalCard = { ...card(1, "todo"), prompt: "a".repeat(8192) };
+      const originalDiscussion = { ...discussion(1), title: "a".repeat(8192) };
+      yield* store.putCard(originalCard);
+      yield* store.putDiscussion(originalDiscussion);
+      const read = Effect.all({
+        card: store.card(originalCard.id),
+        discussion: store.discussion(originalDiscussion.id),
+      });
+      const write = (text: string) =>
+        Effect.all([
+          sql`UPDATE ardud_kanban_cards SET json = ${JSON.stringify({ ...originalCard, prompt: text })} WHERE id = ${originalCard.id}`,
+          sql`UPDATE ardud_kanban_discussions SET json = ${JSON.stringify({ ...originalDiscussion, title: text })} WHERE id = ${originalDiscussion.id}`,
+        ]);
+      const before = yield* read;
+      // Every case keeps serialized length and timestamps, including rewriting old text.
+      for (const text of ["b".repeat(8192), originalCard.prompt]) {
+        yield* write(text);
+        const changed = yield* read;
+        assert.deepStrictEqual(changed.card, { ...originalCard, prompt: text });
+        assert.deepStrictEqual(changed.discussion, { ...originalDiscussion, title: text });
+        const warm = yield* read;
+        assert.strictEqual(warm.card, changed.card);
+        assert.strictEqual(warm.discussion, changed.discussion);
+      }
+      yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* write("c".repeat(8192));
+            assert.strictEqual((yield* read).card!.prompt, "c".repeat(8192));
+            return yield* Effect.fail("rollback");
+          }),
+        )
+        .pipe(Effect.flip);
+      // These writes reuse the rolled-back revisions, with different text.
+      yield* write("d".repeat(8192));
+      assert.strictEqual((yield* read).card!.prompt, "d".repeat(8192));
+      assert.strictEqual((yield* read).discussion!.title, "d".repeat(8192));
+      yield* sql`DELETE FROM ardud_kanban_cards WHERE id = ${originalCard.id}`;
+      yield* sql`DELETE FROM ardud_kanban_discussions WHERE id = ${originalDiscussion.id}`;
+      yield* store.putCard(originalCard);
+      yield* store.putDiscussion(originalDiscussion);
+      const replaced = yield* read;
+      assert.deepStrictEqual(replaced, before);
+      yield* sql`INSERT OR REPLACE INTO ardud_kanban_cards (id, board_id, number, stage, json)
+      VALUES (${originalCard.id}, ${boardId}, 1, 'todo', ${JSON.stringify({ ...originalCard, prompt: "e".repeat(8192) })})`;
+      yield* sql`INSERT OR REPLACE INTO ardud_kanban_discussions (id, board_id, json)
+      VALUES (${originalDiscussion.id}, ${boardId}, ${JSON.stringify({ ...originalDiscussion, title: "e".repeat(8192) })})`;
+      assert.strictEqual((yield* read).card!.prompt, "e".repeat(8192));
+      assert.strictEqual((yield* read).discussion!.title, "e".repeat(8192));
+    }).pipe(Effect.provide(TestLayer)),
+);
+
 it.effect("replaces a row version and drops deleted card and thread entries", () =>
   Effect.gen(function* () {
     const store = yield* KanbanStore.KanbanStore;
@@ -1770,7 +2126,25 @@ it.effect(
         card(11, "needs_owner"),
         { ...card(12, "todo"), settledAt: at },
       ];
-      yield* Effect.forEach(rows, (row) => store.putCard(row), { discard: true });
+      const exceptions = (["completed", "deployed", "verified", "needs_owner"] as const).flatMap(
+        (stage, index) => {
+          const base = 20 + index * 10;
+          return [
+            { ...card(base, stage), wait },
+            { ...card(base + 1, stage), deciding: { since: at, why: "Pending", toldAt: null } },
+            { ...card(base + 2, stage), activeThreadId: ThreadId.make(`held-${stage}`), wait },
+          ];
+        },
+      );
+      const settled = [...rows, ...exceptions].map((row, index) => ({
+        ...row,
+        id: KanbanCardId.make(`settled-${index}`),
+        number: 100 + index,
+        settledAt: at,
+      }));
+      yield* Effect.forEach([...rows, ...exceptions, ...settled], (row) => store.putCard(row), {
+        discard: true,
+      });
       const queries: string[] = [];
       const observe: Statement.Transformer = (statement) => {
         queries.push(statement.compile()[0]);
@@ -1780,17 +2154,20 @@ it.effect(
         yield* store
           .dispatchCards(boardId)
           .pipe(Effect.provideService(Statement.CurrentTransformer, observe)),
-        rows.slice(0, 7),
+        [...rows.slice(0, 7), ...exceptions],
       );
       const plan = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${queries[0]}`, [
         boardId,
+        boardId,
       ]);
       assert.isTrue(plan.some((row) => row.detail.includes("ardud_kanban_cards_dispatch")));
+      assert.isTrue(plan.some((row) => row.detail.includes("ardud_kanban_cards_open")));
+      assert.isFalse(plan.some((row) => /SCAN |TEMP B-TREE/.test(row.detail)));
       yield* store.putCard({ ...rows[7]!, stage: "todo" });
       yield* store.putCard({ ...rows[0]!, stage: "verified" });
       assert.deepStrictEqual(
         (yield* store.dispatchCards(boardId)).map((row) => row.number),
-        [2, 3, 4, 5, 6, 7, 8],
+        [2, 3, 4, 5, 6, 7, 8, ...exceptions.map((row) => row.number)],
       );
     }).pipe(Effect.provide(TestLayer)),
 );
@@ -1836,5 +2213,153 @@ it.effect("card write watches cover raw and bulk writers and end with their pass
         assert.deepStrictEqual([...fresh], [row.id]);
       }),
     );
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect(
+  "poolThreadIds counts distinct active threads across work and review without decoding history",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      for (const [index, pool, thread, role] of [
+        [1, "pool", "worker", "work"],
+        [2, "pool", "worker", "work"],
+        [3, "pool", "reviewer", "review"],
+        [4, "other-pool", "elsewhere", "work"],
+        [5, "pool", null, null],
+      ] as const)
+        yield* store.putCard({
+          ...card(index, "working"),
+          activePool: pool,
+          activeThreadId: thread === null ? null : ThreadId.make(thread),
+          activeRole: role,
+        });
+      assert.sameMembers(
+        [...(yield* store.poolThreadIds(boardId, "pool"))],
+        ["worker", "reviewer"],
+      );
+      assert.deepEqual(yield* store.poolThreadIds(boardId, "missing"), []);
+    }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect(
+  "claimCards keeps seeds and recursive blockers while omitting unrelated history and ending cycles",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const seed = card(1, "needs_review");
+      const todo = { ...card(2, "todo"), blockedBy: [card(3, "completed").id] };
+      const blocker = { ...card(3, "completed"), blockedBy: [card(4, "needs_owner").id] };
+      const ancestor = { ...card(4, "needs_owner"), blockedBy: [blocker.id] };
+      for (const row of [seed, todo, blocker, ancestor, card(5, "completed"), card(6, "deployed")])
+        yield* store.putCard(row);
+      assert.deepEqual(
+        (yield* store.claimCards(boardId, [seed.id])).map((row) => row.id),
+        [seed.id, todo.id, blocker.id, ancestor.id],
+      );
+    }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect.each([
+  "urgency",
+  "fanout",
+  "aging",
+  "waiting",
+  "deciding",
+  "completed blocker",
+  "legacy",
+  "cycle",
+] as const)("compact claim ranking matches the whole board for %s", (kind) =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const threadId = ThreadId.make("worker");
+    const seed = { ...card(1, "needs_review"), workThreadId: threadId };
+    const blocker = { ...card(2, "todo"), priority: 4, movedAt: "2026-10-24T13:00:00.000Z" };
+    const rivals = [3, 4, 5, 6].map((n) => ({ ...card(n, "todo"), priority: 2 }));
+    const waiter = { ...card(7, "needs_owner"), priority: 1, blockedBy: [blocker.id] };
+    const history = {
+      ...card(8, "verified"),
+      updatedAt: "2026-11-05T13:00:00.000Z",
+      prompt: "x".repeat(10000),
+      description: "x".repeat(10000),
+    };
+    const cards = [seed, blocker, ...rivals, history];
+    if (kind === "urgency") cards.push(waiter);
+    if (kind === "fanout") {
+      blocker.priority = 3;
+      for (let n = 10; n < 21; n++)
+        cards.push({ ...card(n, "needs_owner"), priority: 3, blockedBy: [blocker.id] });
+    }
+    if (kind === "waiting")
+      Object.assign(blocker, {
+        wait: {
+          on: "time",
+          until: "2026-12-01T00:00:00.000Z",
+          at,
+          note: "Wait",
+          by: { _tag: "owner" },
+          script: null,
+          args: null,
+          pr: null,
+          card: null,
+          ask: null,
+          sinceHead: null,
+          wakeRole: null,
+          expiredAt: null,
+          status: null,
+          lastCheckedAt: null,
+          failures: 0,
+          problem: null,
+        },
+      });
+    if (kind === "deciding")
+      Object.assign(blocker, { deciding: { since: at, why: "Wake", toldAt: null } });
+    if (kind === "completed blocker") {
+      const completed = { ...card(9, "completed"), movedAt: "2026-11-05T13:00:00.000Z" };
+      blocker.blockedBy = [completed.id];
+      cards.push(completed);
+    }
+    if (kind === "cycle") {
+      blocker.blockedBy = [waiter.id];
+      cards.push(waiter);
+    }
+    for (const row of cards) yield* store.putCard(row);
+    if (kind === "legacy") {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE ardud_kanban_cards SET json = json_remove(json, '$.subtasks') WHERE board_id = ${boardId}`;
+    }
+    const scoped = yield* store.claimCards(boardId, [seed.id]);
+    const metadata = yield* store.schedulingCards(boardId);
+    const base = {
+      board,
+      groups: [
+        {
+          id: "related",
+          name: "related",
+          summary: "",
+          updatedAt: at,
+          cardIds: [seed.id, blocker.id, ...rivals.map((row) => row.id)],
+        },
+      ],
+      seeds: [seed],
+      threadId,
+      pool: Rules.poolKey(model),
+      projectId: null,
+      carrying: 0,
+      slots: 1,
+    };
+    const expected = Rules.relatedCandidates({ ...base, cards }).map(({ card }) => card.id);
+    const actual = Rules.relatedCandidates({ ...base, cards: scoped, rankingCards: metadata }).map(
+      ({ card }) => card.id,
+    );
+    assert.deepEqual(actual, expected);
+    assert.deepEqual(kanbanSchedule(metadata), kanbanSchedule(cards));
+    assert.deepEqual(
+      [...cards].sort(kanbanPickOrder(metadata)),
+      [...cards].sort(kanbanPickOrder(cards)),
+    );
+    assert.notInclude(JSON.stringify(metadata), "prompt");
+    assert.notInclude(JSON.stringify(metadata), "description");
+    if (kind === "urgency") assert.equal(actual[0], blocker.id);
   }).pipe(Effect.provide(TestLayer)),
 );

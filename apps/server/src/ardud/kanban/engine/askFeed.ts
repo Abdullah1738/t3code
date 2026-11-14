@@ -74,19 +74,22 @@ export const readAskFeed = Effect.fn("KanbanAskFeed.read")(function* (
       input.boardId === undefined
         ? sql`(board_id, number) > (${boardAfter}, ${numberAfter})`
         : sql`board_id = ${input.boardId} AND number > ${numberAfter}`;
+    const liveBoard = sql`board_id IN (
+      SELECT id FROM ardud_kanban_boards WHERE json_extract(json, '$.archivedAt') IS NULL
+    )`;
     // Literal predicates match the partial indexes in kanbanDDL. UNION merges
     // their ordered ranges and deduplicates cards that have both kinds of ask.
     // Pin each range so SQLite cannot choose the full board/number index.
     const cardRows = yield* sql<{ boardId: string; number: number; json: string }>`
       WITH page AS MATERIALIZED (
         SELECT id, board_id, number FROM ardud_kanban_cards INDEXED BY ardud_kanban_cards_open_asks
-        WHERE instr(json, '"closedAt":null') > 0 AND ${after}
+        WHERE instr(json, '"closedAt":null') > 0 AND ${after} AND ${liveBoard}
         ${
           since === null
             ? sql``
             : sql`UNION
                 SELECT id, board_id, number FROM ardud_kanban_cards INDEXED BY ardud_kanban_cards_closed_asks
-                WHERE instr(json, '"closedAt":"') > 0 AND ${after}`
+                WHERE instr(json, '"closedAt":"') > 0 AND ${after} AND ${liveBoard}`
         }
         ORDER BY board_id, number LIMIT 64
       )

@@ -26,6 +26,52 @@ class DailyList(Base):
             self.assertEqual(mc.main(list(args)), 0)
         return out.getvalue()
 
+    def test_empty_error_source_limits_block_every_ask_entry_point(self):
+        limited = dict(verdict='unverified', why='source limit; do not ask', errors=[],
+                       limits=[{'why': 'binding unverified', 'kinds': ['ORDER_LIST_HOST_BINDING_UNVERIFIED']}])
+        for entry in ('ask', 'daily list', 'screen'):
+            with self.subTest(entry=entry), patch.object(mc, 'explain_charge', return_value=limited):
+                self.data = self.tmp / entry
+                qid = self.seed()
+                if entry == 'ask':
+                    rc, _ = mc.ask(self.data, 'yours?', qid=qid, now=at('2026-11-13T10:00'))
+                    self.assertEqual(rc, 4)
+                elif entry == 'daily list':
+                    self.assertEqual(self.ask_list(), 'No charges ready to ask about.')
+                else:
+                    result = mc.screen(ALERT, BANK, at('2026-11-10T09:00'), at('2026-11-13T10:00'),
+                                       data=self.data, find=finder(), said=nobody)
+                    self.assertEqual(result['verdict'], 'unverified')
+                    self.assertTrue(result['limits'])
+                self.assertTrue(all(not q['asks'] for q in mc.load_questions(self.data)['questions']))
+                self.assertEqual(mc.load(self.data)['cases'], [])
+
+    def test_fresh_source_limit_beats_saved_question_and_alias_waits(self):
+        for form in ('same question', 'alias'):
+            with self.subTest(form=form):
+                self.data = self.tmp / form
+                limit = mc.charges.order_lookup.SourceLimit('ORDER_LIST_HOST_BINDING_UNVERIFIED')
+                now = at('2026-11-10T12:00')
+                with patch.object(mc.charges.order_lookup, 'read', side_effect=limit), \
+                        patch.object(mc.charges, 'receipt', return_value=None):
+                    qid = self.seed(merchant='Careem')
+                    with mc.Locked(self.data, 'questions') as book:
+                        q = book['questions'][0]
+                        target = q
+                        if form == 'alias':
+                            target = dict(q, id='q-alias', merchant='Other')
+                            book['questions'].append(target)
+                        target['wait_until'] = '2026-11-11T12:00:00+04:00'
+                    q = mc.find_question(mc.load_questions(self.data), qid)
+                    result = mc.explain_charge(self.data, mc.charge_of(q), mc.parse_time(q['at']), now,
+                                               find=finder(), said=nobody, qid=qid)
+                self.assertEqual(result['verdict'], 'unverified')
+                self.assertTrue(result['limits'])
+                self.assertEqual(result['errors'], [])
+                q['explanation'] = {'verdict': 'receipt', 'why': 'verified receipt', 'errors': []}
+                evidence = mc.alert_verdicts([q], now, {qid: result})
+                self.assertEqual(mc.alert_verdict(evidence, q, now)['verdict'], 'receipt')
+
     def test_daily_event_ignores_three_awaiting_questions_and_only_new_items_follow(self):
         for n in range(3):
             qid = self.seed(str(20+n))

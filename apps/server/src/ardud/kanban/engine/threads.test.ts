@@ -38,12 +38,15 @@ import * as ThreadManagementService from "../../../orchestration-v2/ThreadManage
 import {
   backgroundWorkOf,
   coalesceTarget,
+  queuedWakes,
   KanbanThreadError,
   KanbanThreads,
   layer,
   prWatchesOf,
   viewStateOf,
 } from "./threads.ts";
+
+import { liveThreadShell } from "../../../mcp/McpToolAccess.testkit.ts";
 
 const at = (iso: string) => DateTime.makeUnsafe(iso);
 const QUESTION_AT = "2026-10-25T00:10:00.000Z";
@@ -341,6 +344,92 @@ it.effect.each(["first", "second", "missing", "completed", "none"] as const)(
     }),
 );
 
+it.effect.each(
+  (["queued", "running", "completed", "missing"] as const).flatMap((status) =>
+    (["run", "unscoped message", "scoped message"] as const).map((mode) => ({ status, mode })),
+  ),
+)(
+  "$mode cleanup leaves a restored run and its queue alone (old run: $status)",
+  ({ status, mode }) =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("restored-thread");
+      const stopped: Array<string | undefined> = [];
+      const cancelled: Array<string> = [];
+      let restoredRunning = true;
+      let oldCancelled = false;
+      const messageId = mode === "scoped message" ? "kanban:wake:nudge:old" : "kanban:old";
+      const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadShell: () =>
+          Effect.succeed({
+            projectId: ProjectId.make("project-1"),
+            deletedAt: null,
+            activeRunId: "restored-run",
+          } as never),
+        getThreadRecords: () =>
+          Effect.succeed({
+            runs: [
+              ...(status === "missing"
+                ? []
+                : [
+                    {
+                      id: RunId.make("old-run"),
+                      userMessageId: messageId,
+                      status: oldCancelled ? "cancelled" : status,
+                    },
+                  ]),
+              { id: RunId.make("restored-run"), status: "running" },
+              { id: RunId.make("restored-queue"), status: "queued" },
+            ],
+          } as never),
+        interruptThread: (input) =>
+          Effect.sync(() => {
+            stopped.push(input.runId);
+            if (input.runId === undefined || input.runId === "restored-run")
+              restoredRunning = false;
+          }).pipe(
+            Effect.andThen(
+              status === "missing"
+                ? Effect.fail(
+                    new ThreadManagementService.ThreadManagementRunNotFoundError({
+                      threadId,
+                      runId: RunId.make("old-run"),
+                    }),
+                  )
+                : Effect.succeed({ type: "no_active_run" } as never),
+            ),
+          ),
+        dispatch: (input) =>
+          Effect.sync(() => {
+            if (input.type === "thread.stop") restoredRunning = false;
+            if (input.type === "queued-run.cancel") {
+              cancelled.push(input.runId);
+              if (input.runId === "old-run") oldCancelled = true;
+            }
+            return { storedEvents: [] } as never;
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* KanbanThreads;
+        if (mode === "run") {
+          yield* threads.cancelQueued(threadId, "old-run");
+          yield* threads.interrupt(threadId, "Late archived send", false, "old-run");
+        } else
+          yield* threads.interrupt(threadId, "Late archived send", false, undefined, messageId);
+        expect(restoredRunning).toBe(true);
+        expect(stopped).toEqual(status === "missing" && mode !== "run" ? [] : ["old-run"]);
+        expect(cancelled).toEqual(status === "queued" ? ["old-run"] : []);
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provide(management),
+            Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+            Layer.provide(Sqlite.layerMemory),
+          ),
+        ),
+      );
+    }),
+);
+
 it.effect("interrupt fails on a failed shell read and treats a missing thread as stopped", () =>
   Effect.gen(function* () {
     const failedId = ThreadId.make("thread-stop-read-failed");
@@ -363,6 +452,9 @@ it.effect("interrupt fails on a failed shell read and treats a missing thread as
         expect(result.failure.operation).toBe("interrupt");
       }
       yield* threads.interrupt(missingId, "Card moved");
+      expect(
+        yield* threads.interrupt(missingId, "Old send", false, undefined, "kanban:old"),
+      ).toEqual({ outcome: "noop" });
     }).pipe(
       Effect.provide(
         layer.pipe(
@@ -479,6 +571,7 @@ it.effect.each([
       const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
         getThreadShell: () =>
           Effect.succeed({ projectId: ProjectId.make("project-1"), deletedAt: null } as never),
+        getThreadRecords: () => Effect.succeed({ runs: [] } as never),
         sendToThread: (input) =>
           Effect.sync(() => {
             sent.push(input.commandId);
@@ -548,6 +641,13 @@ it.effect("a keyed send passes stable command and message ids to thread manageme
     });
     yield* Effect.gen(function* () {
       const threads = yield* KanbanThreads;
+      yield* threads.send({
+        threadId,
+        text: "Deleted board",
+        key: "stale-unscoped",
+        isStale: () => true,
+      });
+      expect(sent).toHaveLength(0);
       yield* threads.send({ threadId, text: "Back", key: "wake:abc" });
       yield* threads.send({ threadId, text: "Back", key: "wake:abc" });
       yield* threads.send({ threadId, text: "Unkeyed" });
@@ -572,6 +672,159 @@ it.effect("a keyed send passes stable command and message ids to thread manageme
       ),
     );
   }),
+);
+
+it.effect.each([
+  "prune read",
+  "prune cancel",
+  "nudge check",
+  "edit check",
+  "steer validation",
+] as const)("post-enqueue %s failure retains the accepted message and run", (failure) =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("post-enqueue");
+    let accepted = false;
+    let messageId = "kanban:accepted";
+    const projectionError = new Orchestrator.OrchestratorProjectionError({
+      threadId,
+      cause: "Post-enqueue projection unavailable",
+    });
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: () =>
+        Effect.succeed({ projectId: ProjectId.make("project-1"), deletedAt: null } as never),
+      getThreadRecords: () =>
+        accepted && failure !== "prune cancel"
+          ? Effect.fail(projectionError)
+          : Effect.succeed({
+              runs: [
+                ...(failure === "edit check"
+                  ? [
+                      {
+                        id: RunId.make("accepted-run"),
+                        status: "queued",
+                        ordinal: 2,
+                        userMessageId: "kanban:wake:nudge:prior",
+                      },
+                    ]
+                  : []),
+                ...(accepted
+                  ? [
+                      {
+                        id: RunId.make("accepted-run"),
+                        status: "queued",
+                        ordinal: 3,
+                        userMessageId: messageId,
+                      },
+                      {
+                        id: RunId.make("old-wake"),
+                        status: "queued",
+                        ordinal: 1,
+                        userMessageId: "kanban:wake:nudge:old",
+                      },
+                    ]
+                  : []),
+              ],
+              messages: [],
+            } as never),
+      sendToThread: (input) =>
+        Effect.sync(() => {
+          accepted = true;
+          messageId = input.messageId;
+          return { delivery: "queued", run: { id: RunId.make("accepted-run") } } as never;
+        }),
+      dispatch: (input) =>
+        input.type === "queued-run.edit"
+          ? Effect.sync(() => {
+              accepted = true;
+              messageId = "kanban:wake:nudge:prior";
+              return { storedEvents: [] } as never;
+            })
+          : Effect.fail(projectionError),
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      const error = yield* threads
+        .send({
+          threadId,
+          text: "Accepted message",
+          key: "accepted",
+          ...(["nudge check", "edit check"].includes(failure) ? { coalesce: "nudge" } : {}),
+          ...(failure === "steer validation" ? { mode: "steer" as const } : {}),
+        })
+        .pipe(Effect.flip);
+      expect(error.wakeMessageId).toBe(messageId);
+      expect(error.sentRunId).toBe("accepted-run");
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  }),
+);
+
+it.effect.each([0, 1, 2])(
+  "a revoked send with a lost response retains its identity after %s read failures",
+  (readFailures) =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("late-send");
+      let revoked = false;
+      let remainingFailures = readFailures;
+      const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadShell: () =>
+          Effect.succeed({ projectId: ProjectId.make("project-1"), deletedAt: null } as never),
+        getThreadRecords: () =>
+          Effect.suspend(() =>
+            remainingFailures-- > 0
+              ? Effect.fail(
+                  new Orchestrator.OrchestratorProjectionError({ threadId, cause: "Read failed" }),
+                )
+              : Effect.succeed({
+                  runs: [
+                    {
+                      id: RunId.make("old-send"),
+                      userMessageId: MessageId.make("kanban:owned-send"),
+                      status: "running",
+                    },
+                    {
+                      id: RunId.make("restored-run"),
+                      userMessageId: MessageId.make("other"),
+                      status: "running",
+                    },
+                  ],
+                } as never),
+          ),
+        sendToThread: () =>
+          Effect.sync(() => {
+            revoked = true;
+          }).pipe(
+            Effect.andThen(
+              Effect.fail(
+                new Orchestrator.OrchestratorProjectionError({ threadId, cause: "Response lost" }),
+              ),
+            ),
+          ),
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* KanbanThreads;
+        const error = yield* threads
+          .send({ threadId, text: "Old board message", key: "owned-send", isStale: () => revoked })
+          .pipe(Effect.flip);
+        expect(error.sentRunId).toBe(readFailures < 2 ? "old-send" : undefined);
+        expect(error.wakeMessageId).toBe("kanban:owned-send");
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provide(management),
+            Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+            Layer.provide(Sqlite.layerMemory),
+          ),
+        ),
+      );
+    }),
 );
 
 it.effect("a keyed send fails closed when its receipt can't be read", () =>
@@ -1301,6 +1554,10 @@ it.effect.each([false, true])(
           runId: run.id,
         });
         expect(yield* threads.runSettled(threadId, run.id)).toBe(true);
+        expect(
+          yield* threads.interrupt(threadId, "Pruned target", false, "missing-old-run"),
+        ).toEqual({ outcome: "noop" });
+        expect(yield* threads.runSettled(threadId, "missing-old-run")).toBe(true);
         if (cancelQueued) {
           expect(
             (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.at(-1)?.status,
@@ -1448,8 +1705,8 @@ it.effect.each([
         text: "First snapshot",
         key: "coalesce:first",
       };
-      const first = yield* threads.send(wake);
       yield* threads.send({ threadId, text: "Owner message", key: "owner" });
+      const first = yield* threads.send(wake);
       yield* threads.send({ threadId, text: "Other card", coalesce: "step:B", key: "other" });
       yield* threads.send({ threadId, text: "Plan", coalesce: "plan:A", key: "plan" });
       let records = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
@@ -1498,8 +1755,8 @@ it.effect.each([
         expect(updated).toBe(first);
         expect(texts).toEqual([
           "Unstarted active run",
-          "Newest snapshot",
           "Owner message",
+          "Newest snapshot",
           "Other card",
           "Plan",
         ]);
@@ -1521,6 +1778,11 @@ it.effect.each([
             (message) => message.id === target.userMessageId,
           )?.text,
         ).toBe(latest.text);
+        // A rejection other than the start race must never become a new send.
+        const empty = yield* Effect.result(threads.send({ ...latest, text: "", key: "empty" }));
+        expect(Result.isFailure(empty)).toBe(true);
+        if (Result.isFailure(empty)) expect(empty.failure.wakeMessageId).toBe(target.userMessageId);
+        expect((yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs).toHaveLength(5);
         yield* threads.send({
           ...latest,
           key: "new-model",
@@ -1528,10 +1790,6 @@ it.effect.each([
         });
         const modelRun = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.at(-1)!;
         expect(modelRun.userMessageId).toBe("kanban:new-model");
-        // A rejection other than the start race must never become a new send.
-        const empty = yield* Effect.result(threads.send({ ...latest, text: "", key: "empty" }));
-        expect(Result.isFailure(empty)).toBe(true);
-        expect((yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs).toHaveLength(6);
         yield* projections
           .apply({
             id: EventId.make("coalesce:same-started"),
@@ -1548,8 +1806,8 @@ it.effect.each([
         expect(updated).not.toBe(first);
         expect(texts).toEqual([
           "Unstarted active run",
-          "First snapshot",
           "Owner message",
+          "First snapshot",
           "Other card",
           "Plan",
           "Newest snapshot",
@@ -1639,6 +1897,72 @@ it.effect.each([
           Layer.provide(management),
           Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
           Layer.provideMerge(CommandReceipts.layer),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  }),
+);
+
+describe("queuedWakes", () => {
+  const run = (
+    ordinal: number,
+    userMessageId: string,
+    status: "queued" | "running" | "completed" | "cancelled" = "queued",
+  ) => ({ ordinal, userMessageId: MessageId.make(userMessageId), status });
+  it("selects only queued snapshots older than the new message, in order", () => {
+    const first = run(2, "kanban:wake:nudge:old");
+    const second = run(4, "kanban:wake:owner:A:old");
+    expect(
+      queuedWakes(
+        [
+          second,
+          run(1, "kanban:steer"),
+          run(3, "owner:relay"),
+          first,
+          run(5, "kanban:wake:nudge:same"),
+          run(6, "kanban:wake:nudge:new"),
+          ...(["running", "completed", "cancelled"] as const).map((status) =>
+            run(1, "kanban:wake:nudge:active", status),
+          ),
+        ],
+        5,
+      ),
+    ).toEqual([first, second]);
+  });
+  it.each(["step:A", "plan:A", "owner:A", "owner:discussion-A", "nudge"])(
+    "matches exact scope %s",
+    (scope) => {
+      const target = run(1, `kanban:wake:${scope}:id`);
+      expect(
+        queuedWakes([target, run(2, `kanban:wake:${scope}B:id`), run(3, "kanban:real")], Infinity, [
+          scope,
+        ]),
+      ).toEqual([target]);
+    },
+  );
+});
+
+it.effect("claimContext loads only caller identity, without thread shell or run history", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("claim-caller");
+    const row = liveThreadShell(threadId);
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getCallerRow: () => Effect.succeed(row),
+      getThreadShell: () => Effect.die("thread shell read"),
+      getThreadRecords: () => Effect.die("run history read"),
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      expect(yield* threads.claimContext(threadId)).toEqual({
+        projectId: row.projectId,
+        model: row.modelSelection,
+      });
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
           Layer.provide(Sqlite.layerMemory),
         ),
       ),

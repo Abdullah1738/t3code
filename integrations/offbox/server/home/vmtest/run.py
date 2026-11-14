@@ -896,7 +896,7 @@ def c10(c):
     c.check(sshv(vm, "offbox-status | sed -n 's/.*booted_image=//p' | cut -d' ' -f1") == good, "next boot uses the promoted kernel by default")
 
 
-HOST_FILES = ("../skill/scripts/toollog.py", "boatd.py", "boatd-wrap", "base-image.sh", "boatd.service", "install-host.sh",
+HOST_FILES = ("../skill/scripts/toollog.py", "../skill/scripts/offbox_disk_space.py", "boatd.py", "boatd-wrap", "base-image.sh", "boatd.service", "install-host.sh",
               "../skill/templates/home/offbox-mgmt-ssh.service", "../skill/templates/home/offbox_mgmt_sshd_config",
               "../skill/templates/home/offbox-ssh-runtime.conf")
 

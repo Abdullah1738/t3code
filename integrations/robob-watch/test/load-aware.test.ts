@@ -11,7 +11,7 @@ function fixture(options: Record<string, string> = {}) {
   const root = join(sandbox, "root"), calls = join(sandbox, "calls"), stub = join(sandbox, "bridge.ts");
   writeFileSync(stub, `import {appendFileSync} from "node:fs";
 appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) + "\\n"); console.log('{"created":true}');`);
-  const env: Record<string, string | undefined> = { ...process.env, BUN_INSPECT: undefined, ROBOB_WATCH_ROOT: root,
+  const env: Record<string, string | undefined> = { ...process.env, BUN_INSPECT: undefined, ROBOB_WATCH_TEST_BATCH_MS: "0", ROBOB_WATCH_ROOT: root,
     ROBOB_WATCH_TELEGRAM_CLI: stub, ROBOB_WATCH_SPECTRUM_CLI: stub,
     ROBOB_WATCH_BRIDGE_DB: join(sandbox, "absent.sqlite"), WACLI_STORE_DIR: join(sandbox, "wacli"),
     ROBOB_WATCH_LOAD_OVERRIDE: "0.1", ROBOB_WATCH_CHECK_TIMEOUT_MS: "40", ...options };
@@ -55,9 +55,10 @@ test.each(["0.1", "9"])("timeout clears the previous source summary at load %s",
   const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: load });
   f.add("stale-source");
   f.save("stale-source", { ...f.state("stale-source"), last_error: 'source failure: {"outlook":"timeout"}', last_error_sources: ["outlook"] });
-  await f.run("stale-source", s => load === "9" ? s.load_timeouts === 1 : s.consecutive_failures === 1 && s.failure_alerted);
+  await f.run("stale-source", s => load === "9" ? s.load_timeouts === 1 : s.consecutive_failures === 1 && !s.failure_alerted);
   expect(f.state("stale-source").last_error_sources).toBeUndefined();
   expect(f.state("stale-source").last_error).toContain("timed out");
+  expect(f.calls()).toHaveLength(0);
 });
 
 test("a: per-watcher timeout overrides the default and reports the actual timeout", async () => {

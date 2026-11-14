@@ -71,7 +71,7 @@ import Migration0064 from "./Migrations/064_CanonicalizeThreadPullRequestLinks.t
 import Migration0065 from "./Migrations/065_CodexUsageNativeTurnIndex.ts";
 import Migration0066 from "./Migrations/066_CallerActiveRunIndex.ts";
 import Migration0067 from "./Migrations/067_EffectOutboxSettledIndex.ts";
-import Migration0068 from "./Migrations/068_ShellRunLookupIndexes.ts";
+import Migration0068, { warmShellRunLookupPages } from "./Migrations/068_ShellRunLookupIndexes.ts";
 
 export const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -203,16 +203,24 @@ const run = Migrator.make({});
 
 export interface RunMigrationsOptions {
   readonly toMigrationInclusive?: number | undefined;
+  readonly skipShellRunLookupPreparation?: boolean | undefined;
 }
 
 export const runMigrations = Effect.fn("runMigrations")(function* ({
   toMigrationInclusive,
+  skipShellRunLookupPreparation = false,
 }: RunMigrationsOptions = {}) {
   const includesV2 =
     toMigrationInclusive === undefined || toMigrationInclusive >= FIRST_V2_MIGRATION_ID;
   const previewMigrations = includesV2 ? yield* reconcileV2PreviewMigration() : [];
   if (includesV2) {
     yield* assertV2MigrationsCanRun(toMigrationInclusive);
+  }
+  if (
+    !skipShellRunLookupPreparation &&
+    (toMigrationInclusive === undefined || toMigrationInclusive >= 68)
+  ) {
+    yield* warmShellRunLookupPages();
   }
   const executedMigrations = [
     ...previewMigrations,

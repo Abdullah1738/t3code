@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 import time
 import traceback
+import order_identity
 from urllib.parse import urlparse
 
 APPS = Path.home() / '.local/share/imessage-apps'
@@ -30,15 +31,15 @@ BUN = str(Path.home() / '.bun/bin/bun')
 BRIDGE = str(Path.home() / '.local/share/spectrum-bridge/src/cli.ts')
 DUBAI = dt.timezone(dt.timedelta(hours=4))
 THEMES = {'noon': ('#feee00', '#16160f'), 'talabat': ('#ff5a00', '#201006'),
-          'careem': ('#00df72', '#062c1b'), 'amazon': ('#ffb347', '#202326')}
+          'careem': ('#00df72', '#062c1b'), 'amazon': ('#ffb347', '#202326'), 'web': ('#d7dce2', '#202326')}
 LANES = {'noon': ('minutes', 'nownow', 'supermall', 'main', 'food', 'marketplace'),
          'talabat': ('restaurants', 'mart', 'shops'), 'careem': ('food', 'quik', 'shops', 'box'),
-         'amazon': ('same-day',)}
-NAMES = {'noon': 'noon', 'talabat': 'Talabat', 'careem': 'Careem', 'amazon': 'Amazon'}
+         'amazon': ('same-day',), 'web': ('web',)}
+NAMES = {'noon': 'noon', 'talabat': 'Talabat', 'careem': 'Careem', 'amazon': 'Amazon', 'web': 'Website'}
 LABELS = {'minutes': 'Minutes', 'nownow': 'NowNow', 'supermall': 'Supermall', 'main': 'Main',
           'marketplace': 'Marketplace',
           'restaurants': 'Food', 'mart': 'Mart', 'shops': 'Shops', 'food': 'Food',
-          'quik': 'Quik', 'box': 'Box', 'same-day': 'Same-day'}
+          'quik': 'Quik', 'box': 'Box', 'same-day': 'Same-day', 'web': ''}
 
 
 def read(path, default=None):
@@ -85,6 +86,11 @@ def instant(value):
 def slug(app, order):
     base = re.sub('[^a-z0-9-]', '-', f'delivery-{app}-{order}'.lower())
     return base if len(base) <= 64 else base[:49] + '-' + hashlib.sha256(base.encode()).hexdigest()[:14]
+
+
+def card_slug(cfg):
+    identity = order_identity.tracker_id(cfg['app'], cfg['order'], cfg.get('merchant_domain'))
+    return slug('web', identity.removeprefix('order-web-')) if cfg['app'] == 'web' else slug(cfg['app'], cfg['order'])
 
 
 def image_url(value):
@@ -322,7 +328,7 @@ def lane(cfg, meta):
         order = cfg['order'].upper()
         return 'nownow' if order.startswith('NN') else 'food' if order.startswith('F') else 'marketplace' if order.startswith('N') else 'minutes'
     # Unknown Careem/Talabat vertical must not invent a food/grocery stage.
-    return 'same-day' if app == 'amazon' else ''
+    return 'web' if app == 'web' else 'same-day' if app == 'amazon' else ''
 
 
 def stage(data, food=False, nearby_label=None):
@@ -387,15 +393,26 @@ def eta(data, cfg):
 
 
 def view(cfg, data, meta):
+    if cfg['app'] == 'web':
+        data = {**data, 'whole_order_complete': False}
     vertical = lane(cfg, meta)
     food = vertical in ('food', 'restaurants')
     nearby_label = 'Almost here' if cfg['app'] == 'careem' and vertical in ('food', 'quik') else None
     steps, idx, label, terminal = stage(data, food, nearby_label)
+    if cfg['app'] == 'web':
+        current = data.get('status') or 'unknown'
+        if current in ('unknown', 'delivered', 'cancelled'):
+            current = data.get('last_confirmed_status', 'unknown')
+        if current in ('delivered', 'cancelled'):
+            current = 'unknown'
+        steps = ['Ordered', 'Shipped', 'Out for delivery', 'Delivered']
+        idx = {'ordered': 0, 'shipped': 1, 'out for delivery': 2, 'delivered': 3}.get(current, -1)
+        label = 'Cancelled' if current == 'cancelled' else steps[idx] if idx >= 0 else 'Tracking pending'
     big, sub, at = eta(data, cfg)
     if terminal:
         big, sub, at = label, '', None
     app = cfg['app']
-    brand = NAMES[app] + (' ' + LABELS[vertical] if vertical else '')
+    brand = (text(cfg.get('merchant_name')) or NAMES[app]) if app == 'web' else NAMES[app] + (' ' + LABELS[vertical] if vertical else '')
     store = text(meta.get('store') or cfg.get('store') or data.get('vendor_name'))
     if not store and ':' in cfg.get('label', ''):
         store = text(cfg['label'].split(':', 1)[0])
@@ -569,7 +586,7 @@ def build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
 
 
 def _build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
-    folder = Path(outdir) if outdir else APPS / slug(cfg['app'], cfg['order'])
+    folder = Path(outdir) if outdir else APPS / card_slug(cfg)
     folder.mkdir(parents=True, exist_ok=True)
     metadata = {**({} if public else read(folder / 'items.json')), **cfg.get('card_meta', {}), **(meta or {})}
     v = view(cfg, data, {**metadata, 'public':public})
@@ -585,7 +602,7 @@ def _build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
             atomic(folder / 'preview-state.json', {'hash': fingerprint})
             atomic(folder / 'index.html', page(v, url))
     return {'slug': folder.name, 'dir': str(folder), 'stage': v['stage'], 'items': v['count'],
-            'has_preview': bool(current)}
+            'has_preview': bool(current), 'stage_known': v['index'] >= 0 or v['stage'] == 'Cancelled'}
 
 
 def route():
@@ -845,7 +862,55 @@ def share_days(cfg):
     return min(30, max(1, days))
 
 
-def sync(cfg, data, *, send=False, recover=False):
+def stage_preview(folder, url, stage):
+    """Retain the image for this stage while the bridge queues or retries its upload."""
+    token = hashlib.sha256(stage.encode()).hexdigest()[:24]
+    snapshot = folder / 'stages' / token
+    snapshot.mkdir(parents=True, exist_ok=True)
+    image = snapshot / 'preview.png'
+    if not image.exists():
+        tmp = snapshot / f'preview.{os.getpid()}.tmp'
+        tmp.write_bytes((folder / 'preview.png').read_bytes())
+        tmp.replace(image)
+    atomic(snapshot / 'index.html', '<meta property="og:image" content="preview.png">')
+    return url.rstrip('/') + '/stages/' + token + '/'
+
+
+def stage_update(state, rendered, folder, save):
+    stage = rendered['stage']
+    if not rendered.get('stage_known'):
+        return
+    # Existing cards adopt the current stage without back-messaging old orders.
+    if 'placement_stage' not in state:
+        state['placement_stage'] = stage
+        return
+    updates = state.setdefault('stage_updates', {})
+    if stage == state['placement_stage'] or updates.get(stage, {}).get('queued'):
+        return
+    if not rendered['has_preview'] or not state.get('bridge_id'):
+        state['update_error'] = 'stage_preview_or_original_missing'
+        return
+    update = updates.setdefault(stage, {})
+    if 'args' not in update:
+        preview_page = stage_preview(folder, state['url'], stage)
+        original = state['send_args']
+        key = original[original.index('--key') + 1] + ':stage:' + hashlib.sha256(stage.encode()).hexdigest()[:24]
+        update['args'] = ['app', '--url', state['url'], '--caption', 'Delivery tracking', '--summary', stage,
+                          '--update-id', state['bridge_id'], '--preview-page', preview_page,
+                          '--key', key, '--session', route(), '--to', 'owner']
+    save()
+    try:
+        # A lost acknowledgement retries this exact operation; never rotate its key.
+        ack = bridge(live_session(update['args']))
+        if not isinstance(ack.get('id'), str) or not isinstance(ack.get('created'), bool):
+            raise ValueError('card_update_bad_ack')
+        update.update(queued=True, bridge_id=ack['id'])
+        state.pop('update_error', None)
+    except (OSError, ValueError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
+        state['update_error'] = 'failed:' + type(exc).__name__
+
+
+def sync(cfg, data, *, send=False, recover=False, update=False):
     settings = cfg.get('delivery_card')
     if not isinstance(settings, dict):
         return {'status': 'legacy_not_enrolled', 'rendered': False}
@@ -858,7 +923,7 @@ def sync(cfg, data, *, send=False, recover=False):
         recipient = settings.get('chat') or cfg.get('chat') or cfg['for']
         # Public shares get a separate allowlisted directory. Legacy items.json
         # and arbitrary files must never become public through directory reuse.
-        public_slug = slug(cfg['app'], cfg['order'])
+        public_slug = card_slug(cfg)
         if recipient != 'owner':
             public_slug = public_slug[:48] + '-' + hashlib.sha256((key + ':public-v1').encode()).hexdigest()[:12]
         folder = APPS / public_slug
@@ -873,13 +938,16 @@ def sync(cfg, data, *, send=False, recover=False):
         state.update(rendered)
         if rendered['stage'] in ('Delivered', 'Cancelled'):
             state.setdefault('terminal_at', time.time())
-        if state.get('status') == 'sent' and state.get('send_args') and not state.get('bridge_confirmed'):
+        if state.get('status') == 'sent' and state.get('send_args') and (not state.get('bridge_confirmed') or not state.get('bridge_id')):
             # The bridge took the send; until its outbox shows it out, a route rotation or a
             # refusal can still drop it, and then it must be sendable again.
             try:
                 _, seen = ops(state['send_args'])
                 if seen and {st for _, st in seen.values()} & {'sent', 'fallback'}:
                     state['bridge_confirmed'] = True
+                    native = [oid for oid, (_, st) in seen.items() if st == 'sent']
+                    if not state.get('bridge_id') and len(native) == 1:
+                        state['bridge_id'] = native[0]
                 elif (seen and {kind for kind, _ in seen.values()} == {'dead'} and mine(state['send_args']) in seen
                       and not waiting(state, 'send_args')):
                     state['status'] = 'failed:dropped_by_bridge'
@@ -922,7 +990,11 @@ def sync(cfg, data, *, send=False, recover=False):
                         session = route()
                         dedupe = 'delivery-card:' + key
                         if recipient == 'owner':
-                            state['send_args'] = owner_to(['app', '--url', state['url'], '--caption', 'Delivery tracking', '--summary', 'Open your order', '--session', session, '--key', dedupe], state)
+                            args = ['app', '--url', state['url'], '--caption', 'Delivery tracking', '--summary', 'Open your order', '--session', session, '--key', dedupe]
+                            if rendered['has_preview']:
+                                args += ['--preview-page', stage_preview(folder, state['url'], rendered['stage'])]
+                            state['send_args'] = owner_to(args, state)
+                            state['placement_stage'] = rendered['stage']
                         else:
                             # A public rich link also works for recipients who
                             # have not installed Robob Cards.
@@ -940,6 +1012,13 @@ def sync(cfg, data, *, send=False, recover=False):
                         state['status'] = attempt(state, 'send_args', lambda: atomic(statepath, state))
                 except (OSError, ValueError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
                     state['status'] = 'failed:' + (str(exc) if isinstance(exc, ValueError) else type(exc).__name__)
+        state.pop('update_pending', None)
+        if (update and recipient == 'owner' and state.get('status') == 'sent'
+                and not settings.get('held') and not settings.get('skip_send') and settings.get('ready') is not False):
+            if state.get('bridge_confirmed'):
+                stage_update(state, rendered, folder, lambda: atomic(statepath, state))
+            elif rendered.get('stage_known') and rendered['stage'] != state.get('placement_stage'):
+                state['update_pending'] = True
         # Quick-tunnel links can change after bridge restart. Report a broken
         # original link for repair, without sending another progress message.
         if state.get('status') == 'sent' and recipient != 'owner' and not state.get('unshared') and time.time() - state.get('link_checked_at', 0) > 300:
@@ -954,7 +1033,7 @@ def sync(cfg, data, *, send=False, recover=False):
         atomic(statepath, state)
         statepath.chmod(0o600)
         # Placement failures remain retryable even when this refresh rendered successfully.
-        return {**{k: state.get(k) for k in ('status', 'slug', 'url', 'link_health')}, 'rendered': True}
+        return {**{k: state.get(k) for k in ('status', 'slug', 'url', 'link_health', 'update_error', 'update_pending')}, 'rendered': True}
 
 
 def repair_link(cfg, data):
@@ -1004,9 +1083,9 @@ def repair_link(cfg, data):
         return {'status':'sent','url':state['url']}
 
 
-def safe_sync(cfg, data, *, send=False, recover=False):
+def safe_sync(cfg, data, *, send=False, recover=False, update=False):
     try:
-        return sync(cfg, data, send=send, recover=recover)
+        return sync(cfg, data, send=send, recover=recover, update=update)
     except Exception as exc:
         # Card failures must not suppress tracker evidence or financial receipts.
         traceback.print_exc()
@@ -1017,6 +1096,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--app', required=True, choices=THEMES)
     ap.add_argument('--order', required=True)
+    ap.add_argument('--merchant-domain', help='web: registered merchant hostname')
     ap.add_argument('--dir')
     ap.add_argument('--items-file')
     ap.add_argument('--data-file', help='fixture/status JSON; never contacts a provider')
@@ -1027,10 +1107,15 @@ def main(argv=None):
     ap.add_argument('--loop', type=int, default=0, help='legacy compatibility; watcher hooks are preferred')
     ap.add_argument('--hours', type=float, default=4)
     a = ap.parse_args(argv)
-    if not re.fullmatch('[A-Za-z0-9_-]{1,80}', a.order):
-        ap.error('Invalid order ID')
-    cfg = read(ROOT / 'orders' / f'order-{a.app}-{a.order.lower()}.json')
+    try:
+        a.order = order_identity.order_id(a.app, a.order)
+        key = order_identity.tracker_id(a.app, a.order, a.merchant_domain)
+    except ValueError as exc:
+        ap.error(str(exc))
+    cfg = read(ROOT / 'orders' / (key + '.json'))
     cfg.update(app=a.app, order=a.order)
+    if a.app == 'web':
+        cfg.setdefault('merchant_domain', a.merchant_domain)
     if (a.send or a.recover_send or a.repair_link) and (a.data_file or a.dir or not cfg.get('delivery_card')):
         ap.error('--send requires a registered, enrolled order; no fixture or custom directory')
     if sum((a.send, a.recover_send, a.repair_link)) > 1:
@@ -1045,7 +1130,9 @@ def main(argv=None):
         if a.data_file:
             data = read(a.data_file)
         else:
-            p = subprocess.run([str(Path.home() / '.local/bin/order-watch'), 'status', '--app', a.app, '--order', a.order], capture_output=True, text=True, timeout=240)
+            domain_args = ['--merchant-domain', a.merchant_domain] if a.app == 'web' else []
+            p = subprocess.run([str(Path.home() / '.local/bin/order-watch'), 'status', '--app', a.app, '--order', a.order,
+                                *domain_args], capture_output=True, text=True, timeout=240)
             if p.returncode:
                 raise SystemExit('order-watch status failed')
             data = json.loads(p.stdout)

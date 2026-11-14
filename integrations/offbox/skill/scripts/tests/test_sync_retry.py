@@ -72,7 +72,8 @@ class SyncRetryTests(unittest.TestCase):
         return self.real_run(cmd, **kwargs)
 
     def ssh_local(self, box, command, **kwargs):
-        return self.real_run(['sh', '-c', command], capture_output=True, check=kwargs.get('check', False))
+        return self.real_run(['sh', '-c', command], input=kwargs.get('input'), capture_output=True,
+                             check=kwargs.get('check', False))
 
     def push(self):
         return ssh_sync.push('testbox', self.src, str(self.remote))

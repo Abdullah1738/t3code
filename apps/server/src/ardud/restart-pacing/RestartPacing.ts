@@ -1,3 +1,5 @@
+import * as DateTime from "effect/DateTime";
+import * as Schema from "effect/Schema";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -6,17 +8,38 @@ import * as Semaphore from "effect/Semaphore";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as RestartPacingState from "./RestartPacingState.ts";
 import { makeRestartLoad } from "./RestartLoad.ts";
-import type { RunId, ThreadId, ServerSettings as Settings } from "@t3tools/contracts";
+import type {
+  RunId,
+  ThreadId,
+  ServerSettings as Settings,
+  ServerSettingsError,
+} from "@t3tools/contracts";
 import { RestartPacingStateError, type RestartSource } from "./RestartPacingState.ts";
 
 const RECHECK_MS = 15_000;
 const MAX_RECHECK_MS = 60_000;
+const MAX_ORDER_RECHECK_MS = 100;
 const PASS_MS = 10_000;
 const MAX_LOAD_HOLD_MS = 20 * 60_000;
+// Allow the full load hold plus ten minutes for admission, but never let an
+// old restart registration silently block a new resume for hours.
+export const RESTART_ADMISSION_TIMEOUT_MS = 30 * 60_000;
+export class RestartAdmissionTimeoutError extends Schema.TaggedError<RestartAdmissionTimeoutError>()(
+  "RestartAdmissionTimeoutError",
+  { deadline: Schema.DateTimeUtc },
+) {}
 const DISPATCH_GRACE_MS = 2 * 60_000;
 const STUCK_MS = 10 * 60_000;
 
-type LoadHold = { loadHoldMs: number; checkedAt: number; wasLoaded: boolean };
+type LoadHold = {
+  loadHoldMs: number;
+  checkedAt: number;
+  wasLoaded: boolean;
+};
+type WaitingHold = LoadHold & {
+  registeredAt?: number;
+  expiredEffectId?: string;
+};
 
 export class RestartLoad extends Context.Reference<() => number>("t3/ardud/RestartLoad", {
   defaultValue: makeRestartLoad,
@@ -25,13 +48,16 @@ export class RestartLoad extends Context.Reference<() => number>("t3/ardud/Resta
 export class RestartPacing extends Context.Service<
   RestartPacing,
   {
+    readonly settingsSnapshot: Effect.Effect<Settings, ServerSettingsError>;
     readonly acquireRun: (
       threadId: ThreadId,
       runId: RunId,
       effectId?: string,
-    ) => Effect.Effect<number, RestartPacingStateError>;
+    ) => Effect.Effect<number, RestartPacingStateError | RestartAdmissionTimeoutError>;
     readonly register: (source: RestartSource) => Effect.Effect<void, RestartPacingStateError>;
-    readonly acquire: (source: RestartSource) => Effect.Effect<number, RestartPacingStateError>;
+    readonly acquire: (
+      source: RestartSource,
+    ) => Effect.Effect<number, RestartPacingStateError | RestartAdmissionTimeoutError>;
     readonly release: (source: RestartSource) => Effect.Effect<void>;
     readonly releaseRun: (
       threadId: ThreadId,
@@ -39,7 +65,10 @@ export class RestartPacing extends Context.Service<
       effectId?: string,
       retrying?: boolean,
     ) => Effect.Effect<void>;
-    readonly dispatched: (source: RestartSource) => Effect.Effect<void, RestartPacingStateError>;
+    readonly dispatched: (
+      source: RestartSource,
+      declined?: boolean,
+    ) => Effect.Effect<void, RestartPacingStateError>;
   }
 >()("t3/ardud/restart-pacing/RestartPacing") {}
 
@@ -54,9 +83,24 @@ const make = Effect.gen(function* () {
     Effect.forkScoped,
   );
   const mutex = yield* Semaphore.make(1);
+  const settingsMutex = yield* Semaphore.make(1);
+  let snapshot: { at: number; value: Settings } | undefined;
+  const readSettingsSnapshot = Effect.fn("RestartPacing.settingsSnapshot")(
+    function* () {
+      const now = yield* Clock.currentTimeMillis;
+      if (snapshot === undefined || now - snapshot.at >= PASS_MS) {
+        const value = yield* settings.getSettings;
+        snapshot = { at: now, value };
+      }
+      return snapshot.value;
+    },
+    (effect) => settingsMutex.withPermits(1)(effect),
+  );
+  const settingsSnapshot = Effect.suspend(readSettingsSnapshot);
   const pending = new Map<
     string,
     RestartSource & {
+      registeredAt: number;
       priority: number;
       activityAt: number;
       loadHoldMs: number;
@@ -64,11 +108,13 @@ const make = Effect.gen(function* () {
       wasLoaded: boolean;
       retryMs: number;
       position?: number;
+      waitKey?: string;
+      orderWait?: { head: string; retryMs: number };
     }
   >();
   // A requeued run can outlive its settled start effect. Keep its load budget
   // across pruning until a replacement effect registers it again.
-  const requeuedHolds = new Map<string, LoadHold>();
+  const requeuedHolds = new Map<string, WaitingHold>();
   const active = new Map<
     string,
     { source: RestartSource; dispatching: boolean; admittedAt: number; hold: LoadHold }
@@ -124,7 +170,6 @@ const make = Effect.gen(function* () {
       admitted: true,
       hold: reservation.hold,
     });
-    activeCheckedAt = undefined;
   };
   const register = Effect.fn("RestartPacing.register")(function* (source: RestartSource) {
     const existing = pending.get(key(source));
@@ -134,6 +179,8 @@ const make = Effect.gen(function* () {
         // Fresh input can requeue this run and complete its waiting note. The
         // next promotion owns a new effect, but retains its elapsed load hold.
         delete replacement.position;
+        delete replacement.waitKey;
+        delete replacement.orderWait;
         replacement.retryMs = RECHECK_MS;
         pending.set(key(source), replacement);
       }
@@ -141,14 +188,20 @@ const make = Effect.gen(function* () {
     }
     if (active.has(key(source))) return;
     const description = yield* state.describe(source);
+    const retained = requeuedHolds.get(key(source));
+    const hold =
+      retained?.expiredEffectId !== undefined && retained.expiredEffectId !== source.effectId
+        ? undefined
+        : retained;
     pending.set(key(source), {
       ...source,
       ...description,
+      registeredAt: yield* Clock.currentTimeMillis,
       loadHoldMs: 0,
       checkedAt: yield* Clock.currentTimeMillis,
       wasLoaded: false,
       retryMs: RECHECK_MS,
-      ...requeuedHolds.get(key(source)),
+      ...hold,
     });
     requeuedHolds.delete(key(source));
   });
@@ -163,7 +216,7 @@ const make = Effect.gen(function* () {
       yield* register(source);
       const now = yield* Clock.currentTimeMillis;
       if (pass === undefined || now - pass.at >= PASS_MS) {
-        const config = (yield* settings.getSettings.pipe(
+        const config = (yield* settingsSnapshot.pipe(
           Effect.mapError((cause) => new RestartPacingStateError({ cause })),
         )).restartPacing;
         pass = { at: now, config, loaded: load() > 1 };
@@ -238,6 +291,7 @@ const make = Effect.gen(function* () {
         // Preserve the replacement's note and budget without blocking other starts.
         if (!(yield* state.status(stale, null))) continue;
         requeuedHolds.set(key(stale), {
+          registeredAt: stale.registeredAt,
           loadHoldMs: stale.loadHoldMs,
           checkedAt: stale.checkedAt,
           wasLoaded: stale.wasLoaded,
@@ -250,27 +304,90 @@ const make = Effect.gen(function* () {
       const entry = pending.get(key(source));
       if (entry === undefined) return 0;
       const position = queue.indexOf(entry) + 1;
+      if (now - entry.registeredAt >= RESTART_ADMISSION_TIMEOUT_MS) {
+        yield* state.status(source, null);
+        pending.delete(key(source));
+        // A failed expiry commit retries this effect immediately; a new resume
+        // gets its own allowance instead of inheriting the retired registration.
+        requeuedHolds.set(key(source), {
+          registeredAt: entry.registeredAt,
+          loadHoldMs: entry.loadHoldMs,
+          checkedAt: entry.checkedAt,
+          wasLoaded: entry.wasLoaded,
+          ...(source.effectId === undefined ? {} : { expiredEffectId: source.effectId }),
+        });
+        for (const [runKey, runSource] of runSources) {
+          if (key(runSource) === key(source)) runSources.delete(runKey);
+        }
+        return yield* new RestartAdmissionTimeoutError({
+          deadline: DateTime.makeUnsafe(entry.registeredAt + RESTART_ADMISSION_TIMEOUT_MS),
+        });
+      }
       if (position === 0) return RECHECK_MS;
+      // Async persistence lets claims reach the gate out of priority order.
+      // Retry promptly when that head advances, but back off if it stays stuck.
+      if (
+        position !== 1 &&
+        active.size < config.maxActive &&
+        spacing === 0 &&
+        (!loaded || entry.loadHoldMs >= MAX_LOAD_HOLD_MS)
+      ) {
+        const head = key(queue[0]!);
+        const retryMs =
+          entry.orderWait?.head === head
+            ? Math.min(MAX_ORDER_RECHECK_MS, entry.orderWait.retryMs * 2)
+            : 1;
+        entry.orderWait = { head, retryMs };
+        return retryMs;
+      }
       if (
         position !== 1 ||
         active.size >= config.maxActive ||
         spacing > 0 ||
         (loaded && entry.loadHoldMs < MAX_LOAD_HOLD_MS)
       ) {
-        if (entry.position !== position) {
-          yield* state.status(source, position);
+        delete entry.orderWait;
+        const wait = {
+          total: queue.length,
+          active: active.size,
+          maxActive: config.maxActive,
+          spacingMs: spacing,
+          loadHoldElapsedMs: entry.loadHoldMs,
+          loadHoldRemainingMs: loaded ? Math.max(0, MAX_LOAD_HOLD_MS - entry.loadHoldMs) : 0,
+        };
+        // Publish gate transitions, not every durable retry tick.
+        const waitKey = [
+          position,
+          wait.total,
+          wait.active,
+          wait.maxActive,
+          spacing > 0,
+          wait.loadHoldRemainingMs > 0,
+        ].join(":");
+        if (entry.waitKey !== waitKey) {
+          yield* state.status(source, position, wait);
           entry.position = position;
+          entry.waitKey = waitKey;
           yield* Effect.logInfo("restart-pacing.waiting", {
             threadId: source.threadId,
             sourceRunId: source.sourceRunId,
             position,
-            active: active.size,
             loaded,
+            classification: source.classification ?? "continuation",
+            reasons: [
+              ...(position > 1 ? ["queue"] : []),
+              ...(active.size >= config.maxActive ? ["maxActive"] : []),
+              ...(spacing > 0 ? ["spacing"] : []),
+              ...(wait.loadHoldRemainingMs > 0 ? ["load"] : []),
+            ],
+            ...wait,
           });
         }
         const remainingHold = MAX_LOAD_HOLD_MS - entry.loadHoldMs;
-        const retryMs =
-          loaded && remainingHold > 0 ? Math.min(entry.retryMs, remainingHold) : entry.retryMs;
+        const retryMs = Math.min(
+          loaded && remainingHold > 0 ? Math.min(entry.retryMs, remainingHold) : entry.retryMs,
+          RESTART_ADMISSION_TIMEOUT_MS - (now - entry.registeredAt),
+        );
         entry.retryMs = Math.min(MAX_RECHECK_MS, retryMs * 2);
         return spacing > 0 &&
           (!loaded || remainingHold <= 0) &&
@@ -294,7 +411,12 @@ const make = Effect.gen(function* () {
         source,
         dispatching: true,
         admittedAt: now,
-        hold: { loadHoldMs: entry.loadHoldMs, checkedAt: now, wasLoaded: loaded },
+        hold: {
+          // Admission ends this clock; retries retain only spent load credit.
+          loadHoldMs: entry.loadHoldMs,
+          checkedAt: now,
+          wasLoaded: loaded,
+        },
       });
       pending.delete(key(source));
       lastStartAt = now;
@@ -305,20 +427,39 @@ const make = Effect.gen(function* () {
         sourceRunId: source.sourceRunId,
         active: active.size,
         loadHoldMs: entry.loadHoldMs,
+        classification: source.classification ?? "continuation",
       });
       return 0;
     },
     (effect) => mutex.withPermits(1)(effect),
   );
   const dispatched = Effect.fn("RestartPacing.dispatched")(
-    function* (source: RestartSource) {
+    function* (source: RestartSource, declined = false) {
       const reservation = active.get(key(source));
+      if (declined && reservation === undefined) {
+        const entry = pending.get(key(source));
+        if (entry !== undefined && entry.effectId !== source.effectId) return;
+        if (!(yield* state.status(source, null))) return;
+        pending.delete(key(source));
+        requeuedHolds.delete(key(source));
+        for (const [runKey, cached] of runSources) {
+          if (key(cached) === key(source)) runSources.delete(runKey);
+        }
+      }
       if (reservation === undefined || reservation.source.effectId !== source.effectId) return;
       // Dispatch has finished even if its settlement read temporarily fails.
       // Later admissions must be able to re-check this reservation.
       reservation.dispatching = false;
-      activeCheckedAt = undefined;
-      if (!(yield* state.active(source))) {
+      // Successful per-holder progress must not make a burst rescan every
+      // earlier reservation. A failed check still needs a fresh global pass.
+      const stillStarting = yield* state.active(source).pipe(
+        Effect.onError(() =>
+          Effect.sync(() => {
+            activeCheckedAt = undefined;
+          }),
+        ),
+      );
+      if (!stillStarting) {
         releaseReservation(source, yield* Clock.currentTimeMillis);
       }
     },
@@ -337,6 +478,14 @@ const make = Effect.gen(function* () {
     if (delay === 0 && !runSources.get(runKey)?.admitted) runSources.delete(runKey);
     return delay;
   });
-  return RestartPacing.of({ register, acquire, acquireRun, dispatched, release, releaseRun });
+  return RestartPacing.of({
+    settingsSnapshot,
+    register,
+    acquire,
+    acquireRun,
+    dispatched,
+    release,
+    releaseRun,
+  });
 });
 export const layer = Layer.effect(RestartPacing, make);

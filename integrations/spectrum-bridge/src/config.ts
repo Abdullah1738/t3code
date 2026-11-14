@@ -127,7 +127,7 @@ export function appsConfig(raw: Partial<Pick<Config, "appsRoot" | "appsPort">>):
 /** Mini-app settings for the CLI, which cannot read the private bridge config. */
 export async function loadAppsConfig(root = stateRoot): Promise<Pick<Config, "appsRoot" | "appsPort">> {
   let raw: Record<string, unknown> = {};
-  try { raw = JSON.parse(await readFile(join(root, "config.json"), "utf8")); } catch (error) { toolError("config", "config.catch1");
+  try { raw = JSON.parse(await readFile(join(root, "config.json"), "utf8")); } catch (error) { toolError("config", "config.catch1", error);
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("Invalid bridge configuration");
   }
   return appsConfig({

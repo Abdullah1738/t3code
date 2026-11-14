@@ -170,8 +170,9 @@ under `~/.config/spectrum-bridge/`.
   state other than `pending`.
 - A sealed batch with no prompt acceptance gets one retry after 60 seconds,
   using the same prompt ID. Acceptance is reconciled before retrying; a failed
-  read holds the batch. After another minute without acceptance, each chat
-  gets one technical-problem notice for that outage. The original batch stays
+  read holds the batch. A held batch still undelivered ten minutes after receipt
+  gets one technical-problem notice for that outage. Earlier acceptance sends no
+  notice and logs `outage-notice-deferred` once. The original batch stays
   held ahead of later messages, including across a bridge restart. A healthy
   backend probe replays it with its original ID and a note giving the sent time;
   a late acceptance instead adopts it without another send. Failed recovery sends are retried at most once a minute under the same ID
@@ -334,6 +335,18 @@ in the `x-opencode-directory` header, percent-encoded; answers come wrapped in
 The operational setup and private credential handling remain in the local
 `imessage-notifications` skill. Use `bun run check` and `bun test` from this
 directory when changing the bridge.
+
+Tool-log rollups refresh at turn end, hourly, and after the UTC day changes.
+Read today's saved rollup with:
+
+```sh
+jq . "$HOME/.robob/logs/tools/imessage/rollup-$(date -u +%F).json"
+```
+
+`total` includes calls represented by turn summaries; `recordedRows` counts disk
+records. Call percentiles merge millisecond histograms, including slow and failed
+calls that also retain individual rows. `byComponent` includes each call name.
+After 50 MB, `log.degraded` marks errors-and-turns logging for the rest of the day.
 
 ## Upstream
 

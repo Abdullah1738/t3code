@@ -209,7 +209,7 @@ it.effect.each(
             Effect.gen(function* () {
               assert.equal(
                 yield* SqliteClient.ReaderLane,
-                operation === "status" ? "foreground" : "background",
+                operation === "board" ? "background" : "foreground",
               );
               yield* Deferred.succeed(recordEntered, undefined);
               yield* sql
@@ -289,7 +289,7 @@ it.effect.each(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-it.effect.each(["ended", "archived", "fork", "other-provider"] as const)(
+it.effect.each(["ended", "fork"] as const)(
   "%s caller uses the exact background shell fallback",
   (state) =>
     Effect.gen(function* () {
@@ -297,14 +297,10 @@ it.effect.each(["ended", "archived", "fork", "other-provider"] as const)(
       const shell = {
         ...base,
         activeRunId: state === "ended" ? null : base.activeRunId,
-        archivedAt: state === "archived" ? base.createdAt : null,
         forkedFrom:
           state === "fork"
             ? { type: "run" as const, threadId: callerId, runId: base.activeRunId! }
             : null,
-        providerInstanceId: ProviderInstanceId.make(
-          state === "other-provider" ? "claude" : "codex",
-        ),
         pendingBackgroundTasks: [
           {
             taskId: "native-task",
@@ -321,7 +317,7 @@ it.effect.each(["ended", "archived", "fork", "other-provider"] as const)(
           getCallerRow: () =>
             Effect.gen(function* () {
               assert.equal(yield* SqliteClient.ReaderLane, "foreground");
-              return shell;
+              return { ...shell, pendingBackgroundTasks: undefined };
             }),
           getThreadShell: () =>
             Effect.gen(function* () {
@@ -381,8 +377,8 @@ it.effect.each(["ended", "archived", "other-provider", "background-subagent"] as
         ),
         Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
       );
-      assert.equal(fallbackReads, 1);
-      assert.strictEqual(caller.caller, shell);
+      assert.equal(fallbackReads, 0);
+      assert.equal(caller.caller?.id, shell.id);
       if (state === "background-subagent") yield* ThreadAccess.assertLiveCaller(caller);
       else
         assert.equal(

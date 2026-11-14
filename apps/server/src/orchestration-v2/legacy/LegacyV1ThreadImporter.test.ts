@@ -828,6 +828,10 @@ it.layer(layerTest)("LegacyV1ThreadImporter", (it) => {
         [threadId],
       );
       const shellSnapshot = yield* projections.getShellSnapshot();
+      assert.deepStrictEqual(
+        yield* projections.listActiveThreadIds(),
+        shellSnapshot.threads.map((thread) => thread.id),
+      );
       assert.equal(
         shellSnapshot.threads.find((thread) => thread.id === threadId)?.historyOrigin,
         "v1_import",

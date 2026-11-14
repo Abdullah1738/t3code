@@ -24,6 +24,7 @@ SESSION_DB = os.path.join(STORE, "session.db")
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from redact import redact
+from watch_admission import admitted_check
 
 
 def die(msg, code=1):
@@ -320,6 +321,7 @@ def legacy_seen_keys(wdir):
     return keys, newest
 
 
+@admitted_check
 def cmd_new(args):
     if not args:
         die("usage: wa-db new JID [--from NAME]", 2)
@@ -349,7 +351,7 @@ def cmd_new(args):
             ob = {}
         okid = open(os.path.join(wdir, ".run-ok")).read().strip() if os.path.exists(os.path.join(wdir, ".run-ok")) else ""
         fresh_ob = time.time() - float(ob.get("at", 0)) < OUTBOX_TTL and int(ob.get("replays", 0)) < OUTBOX_MAX_REPLAYS
-        if run and ob.get("run") == run:
+        if run and ob.get("run") == run and ob.get("attempt") == os.environ.get("WATCH_ATTEMPT"):
             # Same run already printed these (phone JID and LID share this cursor): don't print them twice.
             outbox_same_run = True
         elif run and ob.get("run") != okid and fresh_ob:
@@ -436,7 +438,7 @@ def emit(lines, run, outbox, replays=0):
                 prev_at = float(json.load(open(outbox)).get("at", prev_at))
             except Exception:
                 pass
-        json.dump({"run": run, "lines": lines, "at": prev_at, "replays": replays}, open(outbox + ".tmp", "w"))
+        json.dump({"run": run, "attempt": os.environ.get("WATCH_ATTEMPT"), "lines": lines, "at": prev_at, "replays": replays}, open(outbox + ".tmp", "w"))
         os.replace(outbox + ".tmp", outbox)
     elif os.path.exists(outbox):
         os.remove(outbox)

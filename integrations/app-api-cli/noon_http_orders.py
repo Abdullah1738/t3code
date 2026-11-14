@@ -142,7 +142,7 @@ def session(service):
         'if-modified-since', 'baggage', 'sentry-trace'}}
 
 
-def request(route, headers, deadline, payload=None, shipment=None, item=None):
+def request(route, headers, deadline, payload=None, shipment=None, item=None, *, cursor=None):
     remaining(deadline)
     if route == 'whoami':
         method, host, path = WHOAMI
@@ -158,6 +158,10 @@ def request(route, headers, deadline, payload=None, shipment=None, item=None):
         method, host, path = ROUTES[route]
     else:
         raise NoonError('ENDPOINT_DENIED')
+    if cursor is not None:
+        if route != 'marketplace_history' or not isinstance(cursor, str) or len(cursor) > 2048:
+            raise NoonError('INVALID_HISTORY_CURSOR')
+        path += '?' + urllib.parse.urlencode({'limit': 10, **({'cursor': cursor} if cursor else {})})
     if method == 'POST':
         if route == 'minutes_list':
             valid = (isinstance(payload, dict) and set(payload) == {'pageNr'}
@@ -171,34 +175,39 @@ def request(route, headers, deadline, payload=None, shipment=None, item=None):
         raise NoonError('INVALID_READ_PAYLOAD')
     h = dict(headers)
     h.update({'content-type': 'application/json', 'accept': 'application/json', 'accept-encoding': 'identity'})
-    try:
-        req = urllib.request.Request('https://' + host + path, headers=h, method=method,
-                                     data=json.dumps(payload).encode() if payload is not None else None)
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        with read_deadline(deadline) as left:
-            with opener.open(req, timeout=left) as response:
-                raw = response.read(MAX_BYTES + 1)
-            if len(raw) > MAX_BYTES:
-                raise NoonError('RESPONSE_TOO_LARGE')
-            if raw[:2] == b'\x1f\x8b':
-                decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
-                raw = decoder.decompress(raw, MAX_BYTES + 1)
-                if len(raw) > MAX_BYTES or decoder.unconsumed_tail:
+    with toollog.request(path):
+        try:
+            req = urllib.request.Request('https://' + host + path, headers=h, method=method,
+                                         data=json.dumps(payload).encode() if payload is not None else None)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+            with read_deadline(deadline) as left:
+                with toollog.phase('fetch'):
+                    with opener.open(req, timeout=left) as response:
+                        raw = response.read(MAX_BYTES + 1)
+                toollog.response(getattr(response, 'code', None), None)
+                if len(raw) > MAX_BYTES:
                     raise NoonError('RESPONSE_TOO_LARGE')
-                if not decoder.eof:
-                    raise NoonError('NATIVE_READ_FAILED')
-            data = json.loads(raw)
-            if not isinstance(data, dict):
-                raise NoonError('SCHEMA_CHANGED')
-        return data
-    except urllib.error.HTTPError as exc:
-        exc.close()
-        raise NoonError({401: 'AUTH_EXPIRED', 403: 'AUTH_FORBIDDEN', 404: 'ORDER_NOT_FOUND',
-                         429: 'RATE_LIMITED'}.get(exc.code, 'HTTP_' + str(exc.code))) from None
-    except TimeoutError:
-        raise NoonError('NATIVE_READ_TIMEOUT') from None
-    except (urllib.error.URLError, http.client.HTTPException, ValueError, OSError, zlib.error):
-        raise NoonError('NATIVE_READ_FAILED') from None
+                if raw[:2] == b'\x1f\x8b':
+                    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    raw = decoder.decompress(raw, MAX_BYTES + 1)
+                    if len(raw) > MAX_BYTES or decoder.unconsumed_tail:
+                        raise NoonError('RESPONSE_TOO_LARGE')
+                    if not decoder.eof:
+                        raise NoonError('NATIVE_READ_FAILED')
+                with toollog.phase('parse'):
+                    data = json.loads(raw)
+                if not isinstance(data, dict):
+                    raise NoonError('SCHEMA_CHANGED')
+            toollog.response(getattr(response, 'code', None), data)
+            return data
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            raise NoonError({401: 'AUTH_EXPIRED', 403: 'AUTH_FORBIDDEN', 404: 'ORDER_NOT_FOUND',
+                             429: 'RATE_LIMITED'}.get(exc.code, 'HTTP_' + str(exc.code))) from None
+        except TimeoutError:
+            raise NoonError('NATIVE_READ_TIMEOUT') from None
+        except (urllib.error.URLError, http.client.HTTPException, ValueError, OSError, zlib.error):
+            raise NoonError('NATIVE_READ_FAILED') from None
 
 
 def verify_home(data, headers):
@@ -537,9 +546,14 @@ def track(order, timeout=10, *, deadline=None):
 
 
 @toollog.timed("noon", "provider.orders")
-def orders(service='all', page=1, timeout=10):
+def orders(service='all', page=None, timeout=10, *, cursor=None):
+    default_read = page is None
+    page = 1 if default_read else page
     if service not in {'all', 'minutes', 'marketplace'} or type(page) is not int or not 1 <= page <= 100:
         raise NoonError('INVALID_ORDER_LIST_OPTIONS')
+    if cursor is not None and (service != 'marketplace' or page == 1
+            or not isinstance(cursor, str) or not cursor or len(cursor) > 2048):
+        raise NoonError('INVALID_HISTORY_CURSOR')
     if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 60:
         raise NoonError('INVALID_TIMEOUT')
     deadline = time.monotonic() + timeout
@@ -560,13 +574,57 @@ def orders(service='all', page=1, timeout=10):
             reads.skip('minutes_list', 'SESSION_UNAVAILABLE')
     if service in {'all', 'marketplace'}:
         h = reads.run('marketplace_session', lambda: verified_session('marketplace', deadline))
+        history_coverage = {'history_first_page_only': True, 'whole_order_completion_verified': False}
         if h is not None:
-            out['orders'].extend(_merge_cards(_marketplace_pages(h, reads), reads))
+            if default_read:
+                out['orders'].extend(_merge_cards(_marketplace_pages(h, reads), reads))
+            else:
+                cards = []
+                if page == 1:
+                    active = reads.run('marketplace_active', lambda: marketplace_cards(request('marketplace_active', h, deadline)))
+                    if active is not None:
+                        cards.extend(active)
+                def history_page():
+                    current = cursor or ''
+                    seen_cursors, seen_cards = set(), set()
+                    # Standalone page=N calls replay the opaque chain; consumers can
+                    # pass the returned cursor to stay within one request per page.
+                    count = 1 if cursor is not None else page
+                    for index in range(count):
+                        if current in seen_cursors:
+                            raise NoonError('HISTORY_PAGE_REPEATED')
+                        seen_cursors.add(current)
+                        data = request('marketplace_history', h, deadline, cursor=current)
+                        rows = marketplace_cards(data)
+                        identities = {(r['order'], r.get('item_id'), r.get('shipment_id')) for r in rows}
+                        pagination = data.get('pagination')
+                        if not isinstance(pagination, dict):
+                            raise NoonError('PAGINATION_SCHEMA_CHANGED')
+                        more, nxt = pagination.get('hasMore'), pagination.get('nextCursor')
+                        if type(more) is not bool or (more and (not isinstance(nxt, str) or not nxt or nxt == current)):
+                            raise NoonError('PAGINATION_SCHEMA_CHANGED')
+                        if seen_cards and not (identities - seen_cards):
+                            raise NoonError('HISTORY_PAGE_REPEATED')
+                        seen_cards.update(identities)
+                        if not more:
+                            if index + 1 < count:
+                                raise NoonError('HISTORY_PAGE_OUT_OF_RANGE')
+                            break
+                        current = nxt
+                    return rows, {'history_first_page_only': False, 'paging_verified': True,
+                                  'page': page, 'next_cursor': nxt if more else None,
+                                  'exhaustive': not more, 'ordered_by_placed_at': False,
+                                  'whole_order_completion_verified': False}
+                history = reads.run('marketplace_history', history_page)
+                if history is not None:
+                    rows, history_coverage = history
+                    cards.extend(rows)
+                out['orders'].extend(_merge_cards(cards, reads))
         else:
             for route in ('marketplace_active', 'marketplace_history'):
                 reads.skip(route, 'SESSION_UNAVAILABLE')
         out['coverage']['marketplace'] = {
-            'history_first_page_only': True, 'whole_order_completion_verified': False,
+            **history_coverage,
             'active_fetched': 'marketplace_active' in reads.coverage['completed'],
             'history_fetched': 'marketplace_history' in reads.coverage['completed']}
     if not any(route in reads.coverage['completed'] for route in (

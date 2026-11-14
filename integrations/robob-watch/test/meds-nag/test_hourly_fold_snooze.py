@@ -38,7 +38,9 @@ class HourlyFoldSnoozeTest(unittest.TestCase):
         (self.root / (name + ".json")).write_text(json.dumps(value))
 
     def read(self, name):
-        return json.loads((self.root / (name + ".json")).read_text())
+        value = json.loads((self.root / (name + ".json")).read_text())
+        if name == "nagstate": value.pop("outcomes", None)
+        return value
 
     def run_script(self, script, *args, ok=True):
         env = dict(self.env, MEDS_NOW=self.now)

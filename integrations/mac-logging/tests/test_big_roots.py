@@ -49,6 +49,11 @@ class BigRootTests(unittest.TestCase):
         self.assertFalse(root['ok'])
         self.assertEqual(root['props']['failure'], 'partial')
         self.assertEqual(root['props']['failedCount'], 1)
+        self.assertEqual((root['props']['deniedCount'], root['props']['partialChildCount']), (0, 1))
+        summary = self.rows('disk.inventory.root')[-1]['props']
+        self.assertEqual((summary['deniedCount'], summary['partialChildCount']), (0, 1))
+        self.assertTrue(summary['partial'])
+        self.assertEqual(self.rows('disk.inventory')[-1]['props']['rootsDenied'], 0)
         child = [r for r in self.rows('disk.inventory.source') if r['props']['source'].endswith('/slow')][0]
         self.assertEqual(child['props']['failure'], 'timeout')
         self.assertNotIn('private', json.dumps(self.rows('disk.inventory.source')))
@@ -73,7 +78,7 @@ class BigRootTests(unittest.TestCase):
             (self.big/child).mkdir()
         jobs.directory_inventory([self.big], run)
         self.assertEqual(jobs.read_state('disk-inventory')['sizes'][str(self.big)], 84*1024)
-        self.assertTrue(self.rows('disk.inventory.source')[-1]['ok'])
+        self.assertFalse(self.rows('disk.inventory.root')[-1]['props']['partial'])
 
     def test_partial_coverage_cannot_become_a_grower(self):
         for value, partial in [(1, True), (100, False), (200, True), (300, False), (400, False)]:
@@ -88,6 +93,7 @@ class BigRootTests(unittest.TestCase):
         for i in range(9):
             root = self.root/str(i)
             root.mkdir()
+            (root/'slow').mkdir()
             roots.append(root)
         for i in range(100):
             (self.big/str(i)).mkdir()
@@ -103,6 +109,7 @@ class BigRootTests(unittest.TestCase):
         def crashes(**kw):
             return collect(10000, [], lambda a,b: collector.unified(a,b,run), **kw)
         with patch.object(jobs.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(collector, 'disk_wait'), \
              patch.object(collector, 'disk_tooling_probe', side_effect=probe), \
              patch.object(collector, 'directory_inventory', side_effect=lambda **kw: inventory([self.big]+roots, run, **kw)), \
              patch.object(collector, 'collect', side_effect=crashes):
@@ -122,7 +129,7 @@ class BigRootTests(unittest.TestCase):
                     def __exit__(inner, *args):
                         return False
                     def __iter__(inner):
-                        yield SimpleNamespace(path=str(self.big/'fast'))
+                        yield SimpleNamespace(path=str(self.big/'fast'), is_dir=lambda **kwargs: True)
                         raise failure
                 def run(cmd, **kw):
                     return SimpleNamespace(returncode=0, stdout='42\t'+cmd[-1], stderr='')
@@ -170,21 +177,23 @@ class BigRootTests(unittest.TestCase):
             windows.append((a,b))
             raise subprocess.TimeoutExpired('log',60)
         self.assertFalse(collector.collect(now, [], fail))
-        self.assertEqual(jobs.read_state('crashes')['unified'], now-86400)
+        self.assertEqual(jobs.read_state('crashes')['unified'], now-5400)
         row = self.rows('crash.source')[-1]
-        self.assertEqual(row['props']['windowS'], 3600)
-        self.assertEqual(row['props']['skippedS'], 82800)
+        self.assertEqual(row['props']['windowS'], 5400)
+        self.assertEqual(row['props']['skippedS'], 81000)
         self.assertEqual(row['props']['windowEnd'], now)
         def success(a,b):
             windows.append((a,b))
             return {}
         self.assertTrue(collector.collect(now+7200, [], success))
-        self.assertEqual(windows[0], windows[1])
-        self.assertEqual(jobs.read_state('crashes')['unified'], now)
+        self.assertEqual(windows[1][0], now+1800)
+        self.assertEqual(self.rows('crash.unified.skip')[-1]['props']['skippedS'], 7200)
+        self.assertEqual(jobs.read_state('crashes')['unified'], now+7200)
+        self.assertEqual(sum(r['props']['skippedS'] for r in self.rows('crash.source')[1:]),7200)
         self.assertTrue(collector.collect(now+10800, [], success))
         self.assertEqual(jobs.read_state('crashes')['unified'], now+10800)
         row = self.rows('crash.source')[-1]
-        self.assertEqual(row['props']['skippedS'], 7200)
+        self.assertEqual(row['props']['skippedS'], 0)
         self.assertEqual(row['props']['windowS'], 3600)
 
     def test_direct_unified_call_is_also_capped(self):
@@ -194,4 +203,4 @@ class BigRootTests(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout='[]', stderr='')
         collector.unified(0, 10000, run)
         cmd = commands[0]
-        self.assertEqual(cmd[cmd.index('--start')+1], '1970-01-01 01:46:40')
+        self.assertEqual(cmd[cmd.index('--start')+1], '1970-01-01 01:16:40')

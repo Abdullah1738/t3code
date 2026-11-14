@@ -87,7 +87,8 @@ export function toOutbound(message: Json): LineOutbound {
     chat: chatOf(message, false),
     text: str(message.content) ?? "",
     mediaUrl: str(message.media_url),
-    ...(isObject(message.app_card) && str(message.app_card.url) ? { card: { url: str(message.app_card.url)!, layout: storedLayout(message.app_card.layout) } } : {}),
+    ...(isObject(message.app_card) && str(message.app_card.url) ? { card: { url: str(message.app_card.url)!, layout: storedLayout(message.app_card.layout),
+      sessionIdentifier: str(message.app_card.sessionIdentifier), updateMessageHandle: str(message.app_card.updateMessageHandle) } } : {}),
     sentAt: timeMs(message.date_sent) ?? Date.now(),
     status: str(message.status) ?? "",
   };
@@ -201,7 +202,7 @@ export class Sendblue implements Line {
 
   /**
    * `send` marks requests that create a message: a network failure or a 5xx
-   * after the request left may still have sent it (no idempotency key), so the
+   * after the request left may still have sent it, so the
    * error is flagged uncertain for the caller's reconciliation.
    */
   async #call(method: "GET" | "POST" | "DELETE", path: string, options: { query?: Record<string, string>; json?: Json; form?: FormData; send?: boolean; allow404?: boolean } = {}): Promise<unknown> {
@@ -219,15 +220,15 @@ export class Sendblue implements Line {
     let response: Response;
     try {
       response = await this.#fetch(url, { method, headers, body, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-    } catch (error) { toolError("sendblue", "sendblue.catch1");
+    } catch (error) { toolError("sendblue", "sendblue.catch1", error);
       throw new LineError(`Sendblue ${method} ${path} failed: ${describe(error)}`, "network", true, send);
     }
 
-    const text = await response.text().catch(() => { toolError("sendblue", "sendblue.catch2"); return ""; });
+    const text = await response.text().catch((caughtError) => { toolError("sendblue", "sendblue.catch2", caughtError); return ""; });
     let parsed: unknown;
     try {
       parsed = text ? JSON.parse(text) : undefined;
-    } catch { toolError("sendblue", "sendblue.catch3");
+    } catch (caughtError) { toolError("sendblue", "sendblue.catch3", caughtError);
       parsed = undefined;
     }
     if (response.status === 404 && options.allow404) return undefined;
@@ -268,7 +269,7 @@ export class Sendblue implements Line {
           const event = this.#toEvent(frame, seen);
           if (event) yield event;
         }
-      } catch { toolError("sendblue", "sendblue.catch4");
+      } catch (caughtError) { toolError("sendblue", "sendblue.catch4", caughtError);
         // Stream errors and stall aborts both end in a reconnect below; only the caller's signal stops the loop.
       } finally {
         clearTimeout(stall);
@@ -284,7 +285,7 @@ export class Sendblue implements Line {
     let envelope: unknown;
     try {
       envelope = JSON.parse(frame.data);
-    } catch { toolError("sendblue", "sendblue.catch5");
+    } catch (caughtError) { toolError("sendblue", "sendblue.catch5", caughtError);
       return undefined;
     }
     if (!isObject(envelope)) return undefined;
@@ -414,6 +415,23 @@ export class Sendblue implements Line {
     return { handle: handleOf(response) };
   }
 
+  async updateApp(originalHandle: string, card: LineAppCard, key: string): Promise<{ handle: string }> {
+    const text = cardLayout(card);
+    if (!text || !card.imageUrl || !key || key.length > 255) throw new LineError("Invalid app continuation", "invalid_app_card", false, false);
+    try {
+      const response = await this.#call("POST", `/api/messages/${encodeURIComponent(originalHandle)}/update-app-card`, {
+        json: { url: card.url, interactive: false, layout: { ...text, imageUrl: card.imageUrl }, idempotency_key: key }, send: true,
+      });
+      return { handle: handleOf(response) };
+    } catch (error) {
+      // The provider deduplicates continuations by original handle + key, including a lost response.
+      if (error instanceof LineError && (error.code.startsWith("http_409") || error.code.startsWith("http_408"))) {
+        throw new LineError("App continuation is not ready", error.code, true, error.uncertain);
+      }
+      throw error;
+    }
+  }
+
   async react(handle: string, reaction: string): Promise<void> {
     const at = performance.now();
     let ok = false;
@@ -434,7 +452,7 @@ export class Sendblue implements Line {
     };
     try {
       await this.#call("POST", "/api/send-typing-indicator", { json });
-    } catch (error) { toolError("sendblue", "sendblue.catch6");
+    } catch (error) { toolError("sendblue", "sendblue.catch6", error);
       // Workers without typing-v2 firmware 503 on state/duration; the legacy start always works.
       if (!v2 || options.state === "stop" || !(error instanceof LineError) || !error.code.startsWith("http_503")) throw error;
       await this.#call("POST", "/api/send-typing-indicator", { json: base });
@@ -486,7 +504,7 @@ export class Sendblue implements Line {
       let response: Response;
       try {
         response = await this.#fetch(url, { signal: controller.signal });
-      } catch (error) { toolError("sendblue", "sendblue.catch7");
+      } catch (error) { toolError("sendblue", "sendblue.catch7", error);
         throw new LineError(`download failed: ${describe(error)}`, "download_failed", true, false);
       }
       if (!response.ok) throw new LineError(`download returned ${response.status}`, `http_${response.status}`, response.status === 429 || response.status >= 500, false);
@@ -510,7 +528,7 @@ export class Sendblue implements Line {
           }
           chunks.push(value);
         }
-      } catch (error) { toolError("sendblue", "sendblue.catch8");
+      } catch (error) { toolError("sendblue", "sendblue.catch8", error);
         if (error instanceof LineError) throw error;
         throw new LineError(`download aborted: ${describe(error)}`, "download_failed", true, false);
       }
@@ -536,7 +554,7 @@ export class Sendblue implements Line {
 function safeDecode(value: string): string {
   try {
     return decodeURIComponent(value);
-  } catch { toolError("sendblue", "sendblue.catch9");
+  } catch (caughtError) { toolError("sendblue", "sendblue.catch9", caughtError);
     return value;
   }
 }

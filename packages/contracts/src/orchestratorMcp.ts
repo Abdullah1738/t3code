@@ -36,6 +36,7 @@ import { ThreadTitleRegeneration } from "./threadTitle.ts";
 import {
   OrchestrationV2Actor,
   OrchestrationV2CreationSource,
+  OrchestrationV2ProviderFailureCategory,
   OrchestrationV2RunStatus,
   OrchestrationV2TurnItemStatus,
 } from "./orchestrationV2.ts";
@@ -211,6 +212,19 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   currentRunId: Schema.optional(Schema.NullOr(RunId)),
   currentRunStatus: Schema.optional(Schema.NullOr(OrchestrationV2RunStatus)),
   status: OrchestratorMcpDelegatedTaskStatus,
+  failure: Schema.optional(
+    Schema.NullOr(
+      Schema.Struct({
+        category: OrchestrationV2ProviderFailureCategory,
+        code: Schema.NullOr(Schema.String),
+        message: Schema.String.check(Schema.isMaxLength(2_000)),
+        retryable: Schema.NullOr(Schema.Boolean),
+      }),
+    ),
+  ).annotate({
+    description:
+      "Why the latest run failed, normalized across providers. content_filter means the provider refused the content: re-dispatch on another model instead of retrying the same one.",
+  }),
   startedAt: Schema.optional(Schema.NullOr(Schema.String)).annotate({
     description:
       "The original child run's start time in ISO format, or null if it has not started.",
@@ -756,6 +770,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "run_not_found",
       "thread_not_sendable",
       "send_timeout",
+      "lookup_timeout",
       "thread_not_interruptible",
       "invalid_request",
       "orchestration_error",

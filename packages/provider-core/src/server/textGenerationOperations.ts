@@ -23,6 +23,8 @@ export type Operation = keyof ProviderTextGeneration;
 
 export interface Request<S extends Schema.Top> {
   readonly operation: Operation;
+  readonly operationLabel?: string | undefined;
+  readonly boardId?: string | undefined;
   readonly cwd: string;
   readonly prompt: string;
   readonly outputSchema: S;
@@ -157,6 +159,7 @@ export function fromRunner(name: string, run: Runner): ProviderTextGeneration {
   )(function* (input) {
     const generated = yield* run({
       operation: "generateThreadTitle",
+      boardId: input.boardId,
       cwd: input.cwd,
       modelSelection: input.modelSelection,
       attachments: input.attachments,
