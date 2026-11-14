@@ -4,6 +4,13 @@
 # then runs /run/boatd/<pid>.sh as `user` through bash, like boat.dev did. stdout/stderr pass straight through.
 set -u
 pid="$1"; cwd="${2:-/home/user}"
+receipt="/run/boatd/$pid.receipt"
+# The claim survives every host-client disconnect. Never replace a command's receipts.
+mkdir -m 700 "$receipt" || exit 98
+trap '' HUP PIPE
+printf '%s %s\n' "$$" "$(awk '{print $22}' /proc/$$/stat)" > "$receipt/pid"
+exec > "$receipt/out" 2> "$receipt/err"
+trap 'rc=$?; printf "%s\n" "$rc" > "$receipt/exit.tmp"; mv "$receipt/exit.tmp" "$receipt/exit"' EXIT
 cg=/sys/fs/cgroup/boatd
 if [ -w /sys/fs/cgroup ]; then
   mkdir -p "$cg" 2>/dev/null && {
@@ -22,7 +29,9 @@ done < /etc/environment 2>/dev/null
 # boatd wrote a root-only file. Keep the command in that file across the uid drop:
 # re-inlining it here hits Linux's 128 KiB per-argument limit after client quoting.
 chown 1000:1000 "/run/boatd/$pid.sh" || exit 126
-exec env -i "${envs[@]}" HOME=/home/user USER=user LOGNAME=user SHELL=/bin/bash LANG=C.UTF-8 TERM=dumb \
+env -i "${envs[@]}" HOME=/home/user USER=user LOGNAME=user SHELL=/bin/bash LANG=C.UTF-8 TERM=dumb \
   PATH=/usr/local/go/bin:/home/user/go/bin:/home/user/.local/bin:/home/user/.local/share/pnpm:/home/user/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   setpriv --reuid=1000 --regid=1000 --init-groups -- /bin/bash -c \
   '__boatd_script=$1; shift; . "$__boatd_script"' /bin/bash "/run/boatd/$pid.sh"
+rc=$?
+exit "$rc"

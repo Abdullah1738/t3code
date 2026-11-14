@@ -19,14 +19,15 @@ admin token opens /admin/* only. Config: /etc/boatd/config.json (see DEFAULTS).
 
 Restarts are normal here (no UPS). Every start reconciles before the API answers anything but /health:
 a run whose unit is still active is followed, one that finished while boatd was down is finalized from its result
-file, one whose unit is gone with no result is `interrupted` (queued again once if it was submitted with
-retry_interrupted), queued runs start by themselves, containers are brought to the state the database expects, and
+file, one whose unit is gone follows the guest receipt or becomes `interrupted` when the process is gone.
+Started commands are never retried; queued runs start by themselves, containers return to the expected state, and
 half-created boxes and half-made saved states are cleaned up. Without its pool boatd serves /health only and says why.
 Stdlib only (Python 3.12, Ubuntu 24.04)."""
 
 from __future__ import annotations
 
 import datetime as dt
+import base64
 import fcntl
 import hashlib
 import hmac
@@ -76,7 +77,6 @@ STARTED = time.time()
 # the newest `run_keep` are kept plus the last one of each day for `run_daily_days` days. Boxes of the owners in
 # `person_owners` also get timer snapshots (boatd-snap-{hourly,daily,weekly}.timer), newest N kept per kind.
 RETENTION = {"run_keep": 20, "run_daily_days": 14, "person_hourly": 48, "person_daily": 30, "person_weekly": 12}
-MAX_ATTEMPTS = 2                      # an interrupted run is queued again at most once
 
 DEFAULTS = {
     "listen": "127.0.0.1", "port": 8443,
@@ -895,11 +895,15 @@ def start_cmd(con, box_id: str, body: dict, owner: str | None = None) -> dict:
     if not command:
         raise Fail(400, "invalid_command", "command is empty")
     meta = body.get("meta") or {}
+    if body.get('detached') and meta.get('run_id') and commands_busy(con, box_id):
+        raise Fail(409, 'commands_busy', f'{box_id} still has an unsettled or live command')
     con.execute("BEGIN IMMEDIATE")
+    if body.get('detached') and meta.get('run_id') and con.execute("SELECT 1 FROM commands WHERE box_id=? AND status IN ('queued','running') LIMIT 1", (box_id,)).fetchone():
+        con.execute('ROLLBACK')
+        raise Fail(409, 'commands_busy', f'{box_id} still has an unsettled command')
     pid = (con.execute("SELECT MAX(pid) FROM commands WHERE box_id=?", (box_id,)).fetchone()[0] or 1000) + 1
     cid = "cmd_" + secrets.token_hex(8)
-    # retry_interrupted: if the host dies under this run, queue it again once (same id, next attempt). Only the
-    # caller knows whether running it twice is safe, so the default is no.
+    # Retained for old clients; started commands are never retried, regardless of this preference.
     retry = 1 if body.get("retry_interrupted") is True else 0
     sync = not bool(body.get("detached"))
     timeout_s = int(body.get("timeoutSeconds") or 60) if sync else None
@@ -1171,14 +1175,41 @@ def disk_preflight(con, row, errf):
 
 
 def run_cmd(box_id: str, pid: int) -> int:
+    # systemd and startup reconciliation can race. Only one runner may own this command.
+    with open(cmd_dir(box_id) / f"{pid}.runner.lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        return _run_cmd(box_id, pid)
+
+
+def _run_cmd(box_id: str, pid: int) -> int:
     load_cfg()
     con = db()
     r = cmd_row(con, box_id, pid)
+    if r['status'] not in ('queued', 'running'):
+        con.close()
+        return 0
+    if command_was_started(r):
+        try:
+            follow_guest(con, r)
+        finally:
+            con.close()
+        return 0
+    # A stale queued row is not proof of non-execution. Check the guest claim before touching its script.
+    guest = guest_command(r)
+    if guest['state'] != 'absent' or (r['attempt'] or 1) > 1:
+        try:
+            record_guest(con, r, guest)
+            if guest['state'] == 'alive':
+                follow_guest(con, cmd_row(con, box_id, pid))
+            return 0
+        finally:
+            con.close()
     attempt = r["attempt"] or 1
     d = cmd_dir(box_id)
     outf = open(d / f"{pid}.out", "ab", buffering=0)
     errf = open(d / f"{pid}.err", "ab", buffering=0)
     out_offset, err_offset = outf.tell(), errf.tell()
+    write_json(d / f'{pid}.output-start.json', [out_offset, err_offset])
     errf.write((offbox_disk_space.MARKER + json.dumps(dict(phase='attempt', attempt=attempt)) + '\n').encode())
     if r["sync"]:
         # Control commands must remain available while detached runs wait for host capacity.
@@ -1190,6 +1221,8 @@ def run_cmd(box_id: str, pid: int) -> int:
     code, sig = None, None
     t0 = now()
     host_boxes = {"start": running_box_count(con), "end": None}
+    write_json(d / f'{pid}.context.json', {'host_boxes': host_boxes})
+    dispatched = False
     try:
         if (d / f"{pid}.kill").exists():
             code, sig = 143, "SIGTERM"
@@ -1198,12 +1231,28 @@ def run_cmd(box_id: str, pid: int) -> int:
         else:
             ct_exec(box_id, f"mkdir -p /run/boatd && cat > /run/boatd/{pid}.sh && chmod 600 /run/boatd/{pid}.sh",
                     input=r["command"].encode(), timeout=60)
-            p = subprocess.run(["incus", "exec", ct(box_id), "--", "/usr/local/sbin/boatd-wrap", str(pid),
-                                r["cwd"] or "/home/user"], stdin=subprocess.DEVNULL, stdout=outf, stderr=errf)
-            code = p.returncode
-            if code is not None and code < 0:
-                sig, code = signal.Signals(-code).name, 128 - code
+            # Saved and already-running boxes retain old image files. Atomic replacement leaves live wrappers alone.
+            wrapper_tmp = f'/usr/local/sbin/.boatd-wrap-{pid}.tmp'
+            ct_exec(box_id, f'cat > {wrapper_tmp} && chmod 755 {wrapper_tmp} && mv -f {wrapper_tmp} /usr/local/sbin/boatd-wrap',
+                    input=SELF.with_name('boatd-wrap').read_bytes(), timeout=60)
+            # The guest owns output and the exit receipt; the Incus client is only a launcher.
+            launch = ('nohup /usr/local/sbin/boatd-wrap ' + str(pid) + ' ' +
+                      shlex.quote(r['cwd'] or '/home/user') + ' </dev/null >/dev/null 2>&1 &')
+            dispatched = True
+            try:
+                ct_exec(box_id, launch, timeout=60)
+            except Exception as e:
+                # An unanswered launch may already have executed. Never turn it into a failed start.
+                _note(box_id, pid, f'launch response unavailable; checking the existing command: {e}')
+            follow_guest(con, cmd_row(con, box_id, pid), launching=True)
+            con.close()
+            outf.close()
+            errf.close()
+            return 0
     except Exception as e:  # noqa: BLE001
+        if dispatched:
+            # Recovery/bookkeeping failures after the send cannot replace the guest's real exit.
+            raise
         errf.write(f"\noffbox-server: command failed to start: {e}\n".encode())
         code = 125
     t1 = now()
@@ -1243,10 +1292,211 @@ def run_cmd(box_id: str, pid: int) -> int:
     if ct_running(box_id):
         snapshot(con, box_id, "auto")
         prune_snaps(con, box_id)
+    con.close()
+    outf.close()
+    errf.close()
     return 0
 
 
 # ---------------------------------------------------------------- reconcile (every start, and for orphans later)
+
+# This probe runs in the guest. PID start ticks prevent a reused PID from proving liveness.
+GUEST_PROBE = r'''
+import base64,json,sys
+from pathlib import Path
+pid,oo,eo=sys.argv[1],int(sys.argv[2]),int(sys.argv[3])
+run=sys.argv[4]
+d=Path('/run/boatd')/(pid+'.receipt')
+r={'state':'absent','stdout':'','stderr':''}
+if sys.argv[5]=='fence' and not d.exists():
+    try:
+        d.mkdir(mode=0o700)
+        (d/'fenced').touch()
+    except FileExistsError: pass
+if d.is_dir():
+    r['state']='gone' if (d/'pid').exists() or (d/'fenced').exists() else 'unknown'
+    try:
+        p,t=(d/'pid').read_text().split()
+        stat=Path('/proc')/p/'stat'
+        fields=stat.read_text().rsplit(')',1)[1].split()
+        if fields[0]!='Z' and fields[19]==t: r['state']='alive'
+    except FileNotFoundError: pass
+    if (d/'exit').exists():
+        r.update(state='exited',exit_code=int((d/'exit').read_text()),ended_at=(d/'exit').stat().st_mtime)
+    for name,off,key in [('out',oo,'stdout'),('err',eo,'stderr')]:
+        try:
+            with (d/name).open('rb') as f:
+                f.seek(off); r[key]=base64.b64encode(f.read(262144)).decode()
+        except FileNotFoundError: pass
+if run and (not d.is_dir() or (d/'fenced').exists()):
+    legacy=Path('/home/user/.offbox/exit')/run
+    marker=legacy.with_suffix('.pid')
+    if marker.exists():
+        p=marker.read_text().strip()
+        if Path('/proc',p).exists(): r.update(state='alive',legacy=True)
+    exit_file=legacy.with_suffix('.rc')
+    if exit_file.exists(): r.update(state='exited',exit_code=int(exit_file.read_text()),ended_at=exit_file.stat().st_mtime)
+print(json.dumps(r))
+'''
+
+
+def guest_command(c, fence=None) -> dict:
+    box_id, pid = c['box_id'], c['pid']
+    state = incus('query', f'/1.0/instances/{ct(box_id)}/state', timeout=30)
+    status = json.loads(state.stdout)['status'].lower()
+    if status == 'stopped':
+        return {'state': 'absent' if c['status'] == 'queued' and c['started_at'] is None else 'gone'}
+    if status != 'running':
+        raise Fail(503, 'command_probe_pending', f'{box_id} is {status}')
+    cursor = cmd_dir(box_id) / f'{pid}.cursor.json'
+    offsets = json.loads(cursor.read_text()) if cursor.exists() else [0, 0]
+    run = c['run_id'] or ''
+    run = run if re.fullmatch(r'[A-Za-z0-9_-]{1,120}', run) else ''
+    if fence is None:
+        fence = command_was_started(c)
+    probe = ct_exec(box_id, 'python3 -I -c ' + shlex.quote(GUEST_PROBE) +
+                    f' {pid} {offsets[0]} {offsets[1]} ' + shlex.quote(run) + (' fence' if fence else 'check'), timeout=30)
+    result = json.loads(probe.stdout)
+    if result['state'] == 'unknown':
+        raise Fail(503, 'command_probe_pending', f'{box_id}/{pid} guest claim is still being initialized')
+    for i, key in enumerate(('stdout', 'stderr')):
+        data = base64.b64decode(result.get(key, ''), validate=True)
+        if data:
+            with open(cmd_dir(box_id) / f"{pid}.{'out' if i == 0 else 'err'}", 'ab') as f:
+                f.write(data)
+            offsets[i] += len(data)
+    write_json(cursor, offsets)
+    # Legacy wrappers have no receipt, but their cgroup still identifies the live command.
+    if result['state'] in ('absent', 'gone') and _cg_pids(box_id, pid):
+        result['state'] = 'alive'
+        result['legacy'] = True
+    # Drain all saved output before publishing the exit.
+    result['_more'] = any(len(base64.b64decode(result.get(k, ''))) == 262144 for k in ('stdout', 'stderr'))
+    if result['state'] == 'exited' and result['_more']:
+        result['state'] = 'alive'
+    return result
+
+
+def reconcile_event(c, outcome, code=None) -> None:
+    toollog.emit('boatd', 'reconcile.command', ids={'box': c['box_id'], 'run': c['run_id']},
+                 props={'pid': c['pid'], 'outcome': outcome, 'exitCode': code,
+                        'age': max(0, now()-c['created_at'])})
+
+
+def command_was_started(c) -> bool:
+    if c['status'] == 'running' or c['started_at'] is not None or (c['attempt'] or 1) > 1:
+        return True
+    for ext in ('out', 'err'):
+        path = cmd_dir(c['box_id']) / f"{c['pid']}.{ext}"
+        if path.exists():
+            with path.open('rb') as f:
+                if any(b'offbox-command-started:' in line for line in f):
+                    return True
+    return False
+
+
+def record_guest(con, c, result) -> str:
+    box_id, pid, t = c['box_id'], c['pid'], now()
+    alive = result['state'] == 'alive'
+    outcome = 'reattached' if alive else 'exited-while-down' if result['state'] == 'exited' else 'gone'
+    code = None if alive else result.get('exit_code', 94)
+    if alive:
+        con.execute("UPDATE commands SET status='running', started_at=COALESCE(started_at,created_at) WHERE box_id=? AND pid=?", (box_id, pid))
+    else:
+        if outcome == 'gone':
+            _note(box_id, pid, f'interrupted by server restart at {iso(STARTED)}; process gone; exit unknown; nothing was re-run')
+        status = 'exited' if outcome != 'gone' else 'interrupted'
+        d = cmd_dir(box_id)
+        end = result.get('ended_at') or t
+        context = d / f'{pid}.context.json'
+        host_boxes = (json.loads(context.read_text()) if context.exists() else {}).get('host_boxes')
+        if host_boxes is not None:
+            host_boxes['end'] = running_box_count(con)
+        metrics = read_cg(cg_path(box_id) / 'boatd' / str(pid))
+        start = d / f'{pid}.output-start.json'
+        offsets = json.loads(start.read_text()) if start.exists() else [0, 0]
+        disk = offbox_disk_space.command_result(d / f'{pid}.out', d / f'{pid}.err', code,
+                                              stdout_offset=offsets[0], stderr_offset=offsets[1])
+        metrics.update(disk)
+        metrics.update(wall_s=max(0, end-(c['started_at'] or end)), queued_s=c['queued_s'], recovered=True, host_boxes=host_boxes)
+        if status == 'exited':
+            metrics.update(box_window(con, box_id, c['started_at'] or end, end))
+        with open(d / f'{pid}.err', 'ab') as f:
+            f.write((offbox_disk_space.MARKER + json.dumps(dict(phase='result', attempt=c['attempt'] or 1, record=disk)) + '\n').encode())
+        write_json(result_path(box_id, pid), dict(attempt=c['attempt'] or 1, status=status,
+                   exit_code=code, started_at=c['started_at'], ended_at=end, host_boxes=host_boxes))
+        con.execute("UPDATE commands SET status=?, exit_code=?, ended_at=?, interrupted_at=?, metrics=? WHERE box_id=? AND pid=?",
+                    (status, code, end, STARTED if status == 'interrupted' else None, json.dumps(metrics) if status == 'exited' else None, box_id, pid))
+        toollog.emit('boatd', 'run.command', ok=code == 0, ids={'box': box_id, 'run': c['run_id']},
+                     props={'exitCode': code, 'attempt': c['attempt'] or 1, 'backend': 'home'})
+        if status == 'exited':
+            try:
+                snapshot(con, box_id, 'auto')
+                prune_snaps(con, box_id)
+            except Exception as e:
+                log(f'snapshot after recovered command {box_id}/{pid}: {e}')
+    reconcile_event(c, outcome, code)
+    return outcome
+
+
+def commands_busy(con, box_id: str) -> bool:
+    if con.execute("SELECT 1 FROM commands WHERE box_id=? AND status IN ('queued','running') LIMIT 1", (box_id,)).fetchone():
+        return True
+    if any(_cg_pids(box_id, r['pid']) for r in con.execute('SELECT pid FROM commands WHERE box_id=?', (box_id,))):
+        return True
+    state = incus('query', f'/1.0/instances/{ct(box_id)}/state', timeout=30)
+    status = json.loads(state.stdout)['status'].lower()
+    if status == 'stopped':
+        return False
+    if status != 'running':
+        raise Fail(503, 'command_probe_pending', f'{box_id} is {status}')
+    runs = [r['run_id'] for r in con.execute('SELECT run_id FROM commands WHERE box_id=?', (box_id,))
+            if r['run_id'] and re.fullmatch(r'[A-Za-z0-9_-]{1,120}', r['run_id'])]
+    probe = ct_exec(box_id, 'python3 -I -c ' + shlex.quote(GUEST_BUSY), input=json.dumps(runs).encode(), timeout=30)
+    return json.loads(probe.stdout)['busy']
+
+
+GUEST_BUSY = r'''
+import json,sys
+from pathlib import Path
+busy=False
+for marker in Path('/run/boatd').glob('*.receipt/pid'):
+    try:
+        p,t=marker.read_text().split()
+        fields=(Path('/proc')/p/'stat').read_text().rsplit(')',1)[1].split()
+        if fields[0]!='Z' and fields[19]==t: busy=True
+    except FileNotFoundError: pass
+for receipt in Path('/run/boatd').glob('*.receipt'):
+    if not any((receipt/name).exists() for name in ('pid','exit','fenced')): busy=True
+for run in json.load(sys.stdin):
+    marker=Path('/home/user/.offbox/exit')/(run+'.pid')
+    if marker.with_suffix('.rc').exists(): continue
+    try:
+        p=marker.read_text().strip()
+        if Path('/proc',p).exists(): busy=True
+    except FileNotFoundError: pass
+print(json.dumps({'busy':busy}))
+'''
+
+
+def follow_guest(con, c, launching=False) -> None:
+    # Only a fresh launch gets a grace period for the wrapper to create its receipt.
+    deadline = now() + 60 if launching else 0
+    while cmd_row(con, c['box_id'], c['pid'])['status'] in ('queued', 'running'):
+        try:
+            result = guest_command(c, fence=not launching or now() >= deadline)
+            if result['state'] == 'absent' and now() < deadline:
+                time.sleep(1)
+                continue
+            if result['state'] != 'alive':
+                record_guest(con, c, result)
+                return
+            if result.get('_more'):
+                continue
+        except Exception as e:
+            # Incus shutdowns and read failures are uncertainty, never proof of process exit.
+            log(f"following {c['box_id']}/{c['pid']}: probe pending: {e}")
+        time.sleep(1)
 
 def _note(box_id: str, pid: int, text: str) -> None:
     try:
@@ -1257,13 +1507,27 @@ def _note(box_id: str, pid: int, text: str) -> None:
 
 
 def settle_cmd(con, c) -> str:
+    with open(cmd_dir(c['box_id']) / f"{c['pid']}.runner.lock", 'w') as lk:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            reconcile_event(c, 'reattached')
+            return 'following'
+        act = _settle_cmd(con, cmd_row(con, c['box_id'], c['pid']))
+        if act in ('following', 'finalized', 'killed', 'requeue'):
+            outcome = {'following':'reattached', 'finalized':'exited-while-down', 'killed':'gone', 'requeue':'queued'}[act]
+            reconcile_event(c, outcome, cmd_row(con, c['box_id'], c['pid'])['exit_code'])
+        return act
+
+
+def _settle_cmd(con, c) -> str:
     """One command the database calls queued or running. Returns what was done:
     following   its unit is alive (boatd alone restarted): nothing to do, its output keeps landing in the files
     finalized   the unit ended while nobody recorded it: exit code from its result file, snapshot taken
     killed      it was being killed when its unit went away
     requeue     it never started: still queued, needs a runner again
-    retry       it was running, the unit is gone with no result, and it may be retried: queued again, next attempt
-    interrupted same, but not to be retried (or already retried once): final"""
+    reattached  the guest is still running: follow its receipts without executing again
+    interrupted the guest is gone and its exit is unknown: final, never retried"""
     box_id, pid, attempt = c["box_id"], c["pid"], c["attempt"] or 1
     if unit_active(unit_name(box_id, pid, attempt)):
         return "following"
@@ -1281,23 +1545,28 @@ def settle_cmd(con, c) -> str:
             snapshot(con, box_id, "auto")
             prune_snaps(con, box_id)
         return "finalized"
+    # A missing host unit says nothing about the guest. Even a queued row may have reached exec.
+    guest = guest_command(c)
+    if guest['state'] == 'alive':
+        if guest.get('legacy'):
+            _note(box_id, pid, 'following legacy command; its wrapper did not retain output after the disconnect; waiting for its existing exit receipt')
+        record_guest(con, c, guest)
+        err = spawn_runner(box_id, pid, attempt)
+        if err:
+            raise Fail(503, 'follow_spawn_pending', err)
+        return 'reattached'
+    if guest['state'] == 'exited':
+        record_guest(con, c, guest)
+        return 'exited-while-down'
     kf = cmd_dir(box_id) / f"{pid}.kill"
     if kf.exists():
         lost = kf.read_text().strip() == "lost"
         con.execute("UPDATE commands SET status=?, signal=COALESCE(signal,'SIGTERM'), exit_code=COALESCE(exit_code,143), "
                     "ended_at=? WHERE box_id=? AND pid=?", ("lost" if lost else "exited", t, box_id, pid))
         return "killed"
-    if c["status"] == "queued":
+    if not command_was_started(c) and guest['state'] == 'absent':
         return "requeue"
-    if c["retry_interrupted"] and attempt < MAX_ATTEMPTS:
-        _note(box_id, pid, f"the server restarted while this run was going (attempt {attempt} is lost); "
-                           f"it is queued again as attempt {attempt + 1}")
-        con.execute("UPDATE commands SET status='queued', attempt=?, started_at=NULL, queued_s=NULL, boot_id=NULL, "
-                    "interrupted_at=? WHERE box_id=? AND pid=?", (attempt + 1, t, box_id, pid))
-        return "retry"
-    _note(box_id, pid, "the server restarted while this run was going; it did not finish and is not run again")
-    con.execute("UPDATE commands SET status='interrupted', ended_at=?, interrupted_at=? WHERE box_id=? AND pid=?",
-                (t, t, box_id, pid))
+    record_guest(con, c, guest)
     return "interrupted"
 
 
@@ -1357,7 +1626,7 @@ def reconcile(con) -> dict:
     """Run at every boatd start, before the API answers. Brings database, systemd units and containers back in
     line after a boatd restart or a host crash. Safe to run twice."""
     out = {"following": 0, "finalized": 0, "killed": 0, "requeue": 0, "retry": 0, "interrupted": 0,
-           "boxes_started": 0, "boxes_failed": 0, "cleaned": []}
+           "reattached": 0, "exited-while-down": 0, "gone": 0, "boxes_started": 0, "boxes_failed": 0, "cleaned": []}
     boxes = {r["id"]: r for r in con.execute("SELECT * FROM boxes WHERE deleted_at IS NULL").fetchall()}
     # 1. A box whose creation was cut short: nothing useful is in it. Remove the half-made container; the row
     # stays as an error so the client that asked for it gets a clear answer.
@@ -1380,7 +1649,9 @@ def reconcile(con) -> dict:
                          "pid").fetchall():
         act = settle_cmd(con, c)
         out[act] += 1
-        if act in ("requeue", "retry"):
+        if act == 'interrupted':
+            out['gone'] += 1
+        if act == "requeue":
             spawn.append((c["box_id"], c["pid"]))
     # 4. Containers: what the database calls live runs; a stop that was under way is finished; stopped stays stopped.
     boxes = {r["id"]: r for r in con.execute("SELECT * FROM boxes WHERE deleted_at IS NULL").fetchall()}
@@ -1488,6 +1759,9 @@ def reap_once(con) -> None:
                 continue
             if r["ttl"] and t > (r["last_active"] or r["updated_at"]) + r["ttl"]:
                 try:
+                    if commands_busy(con, bid):
+                        set_box(con, bid, last_active=t)
+                        continue
                     stop_box(con, bid, "idle ttl")
                     toollog.emit("boatd", "reaper.action", ok=True, ids={"box": bid}, props={"action": "stop"})
                 except Exception as e:  # noqa: BLE001
@@ -1513,8 +1787,12 @@ def reap_once(con) -> None:
     # Commands whose runner went away without recording an exit: same rules as at start-up.
     for c in con.execute("SELECT * FROM commands WHERE status IN ('queued','running') AND created_at < ? AND "
                          "COALESCE(interrupted_at, 0) < ?", (t - 30, t - 30)).fetchall():
-        act = settle_cmd(con, c)
-        if act in ("requeue", "retry"):
+        try:
+            act = settle_cmd(con, c)
+        except Exception as e:
+            log(f"reconcile pending {c['box_id']}/{c['pid']}: {e}")
+            continue
+        if act == "requeue":
             b = con.execute("SELECT state FROM boxes WHERE id=? AND deleted_at IS NULL", (c["box_id"],)).fetchone()
             cur = cmd_row(con, c["box_id"], c["pid"])
             if not b or b["state"] not in LIVE:
@@ -1892,6 +2170,8 @@ class Handler(BaseHTTPRequestHandler):
                 "sshUser": "user", "managementSshEndpoint": f"{CFG['ssh_host']}:{mgmt_port}"}
 
     def _commands(self, con, method: str, bid: str, rest: list[str], q: dict):
+        if rest == ['busy'] and method == 'GET':
+            return {'ok': True, 'busy': commands_busy(con, bid)}
         if not rest and method == "POST":
             b = self._body()
             if b.get("detached"):

@@ -61,44 +61,27 @@ class Wire(Isolated):
     def test_the_retry_flag_reaches_the_server_only_when_asked(self):
         box = self.srv.make_box("ardud")
         a = api.cmd_start(box, "make test", meta={"repo": "r", "kind": "make test", "run_id": "run-1"}, retry_interrupted=True)
-        b = api.cmd_start(box, "make deploy")
-        rows = {r["pid"]: r for r in self.srv.con.execute("SELECT * FROM commands WHERE box_id=?", (box,))}
-        self.assertEqual((rows[a["processId"]]["retry_interrupted"], rows[b["processId"]]["retry_interrupted"]), (1, 0))
+        b = api.cmd_start(self.srv.make_box("ardud"), "make deploy")
+        rows = list(self.srv.con.execute("SELECT * FROM commands ORDER BY rowid"))
+        self.assertEqual((rows[0]["retry_interrupted"], rows[1]["retry_interrupted"]), (1, 0))
         st = api.cmd_status(box, a["processId"])
         self.assertEqual((st["attempt"], st["retryInterrupted"], st["bootId"]), (1, True, "boot-2"))
 
-    def test_a_run_the_server_retried_is_followed_to_its_end_with_both_attempts_output(self):
-        box = self.srv.box(running=False)                 # the machine restarted: its container is down too
+    def test_reattached_run_keeps_waiting_and_returns_real_exit(self):
+        box = self.srv.box()
         pid = self.srv.cmd(box, retry=1)
-        out = boatd.cmd_dir(box) / f"{pid}.out"
-        out.write_text("one\n")
-        self.assertEqual(boatd.reconcile(self.srv.con)["retry"], 1)
-        with out.open("a") as f:
-            f.write("one\ntwo\n")
-        self.end(box, pid, 0)
-        rc, _ = self.follow(box, pid)
-        self.assertEqual(rc, 0)
-        text = self.log.read_text()
-        self.assertEqual(text.replace("\n", " ").count("one"), 2)
-        self.assertIn("two", text)
-        self.assertIn("queued again as attempt 2", text)
-        self.assertEqual(api.cmd_status(box, pid)["attempt"], 2)
-
-    def test_a_client_that_was_at_byte_4_of_attempt_one_gets_only_what_is_new_and_is_told_of_the_retry(self):
-        box = self.srv.box(running=False)
-        pid = self.srv.cmd(box, retry=1)
-        out = boatd.cmd_dir(box) / f"{pid}.out"
-        out.write_text("one\n")
-        boatd.reconcile(self.srv.con)
-        with out.open("a") as f:
-            f.write("ONE\nTWO\n")
-        self.end(box, pid, 7)
-        self.log.write_text("one\n")
-        rc, _ = self.follow(box, pid, start_offsets=(4, 0))
-        self.assertEqual(rc, 7, "the retried attempt's real exit code")
-        text = self.log.read_text()
-        self.assertEqual(text.count("one\n"), 1, "nothing it already had is sent twice")
-        self.assertIn("ONE\nTWO\n", text)
+        self.srv.f.guests[(box,pid)] = {'state':'alive'}
+        out = boatd.cmd_dir(box) / f'{pid}.out'
+        out.write_text('one\n')
+        self.assertEqual(boatd.reconcile(self.srv.con)['reattached'], 1)
+        self.assertTrue(api.cmd_status(box,pid)['running'])
+        self.assertTrue(api.call('GET', f'/sandboxes/{box}/commands/busy')['busy'])
+        with out.open('a') as f: f.write('two\n')
+        self.end(box,pid,7)
+        rc, _ = self.follow(box,pid)
+        self.assertEqual(rc,7)
+        self.assertEqual(self.log.read_text(),'one\ntwo\n')
+        self.assertEqual(api.cmd_status(box,pid)['attempt'],1)
 
     def test_a_run_that_was_not_retried_ends_as_interrupted(self):
         box = self.srv.box()
@@ -110,6 +93,8 @@ class Wire(Isolated):
         self.assertEqual(e.code, common.EXIT_INTERRUPTED)
         self.assertIn("half", self.log.read_text())
         self.assertEqual(api.cmd_status(box, pid)["status"], "interrupted")
+        self.assertEqual(self.log.read_text().count('interrupted by server restart at'), 1)
+        self.assertIn('nothing was re-run', self.log.read_text())
 
     def test_restart_settlement_does_not_count_downtime_as_execution(self):
         cases=[('interrupted',None,None),('lost','lost',None),('killed','kill',None),('recovered',None,10000)]
@@ -141,7 +126,7 @@ class Wire(Isolated):
                             bookkeeping=False)
                 records=[json.loads(line) for p in (self.srv.tmp/'shared-logs').glob('*.ndjson')
                          for line in p.read_text().splitlines()]
-                command=[r for r in records if r['name']=='run.command' and r['ids']['run']==rid]
+                command=[r for r in records if r['name']=='run.command' and r.get('ids',{}).get('run')==rid]
                 self.assertEqual(len(command),1)
                 self.assertEqual(command[0].get('durationMs'),duration)
 
@@ -156,7 +141,8 @@ class Wire(Isolated):
                 pid = self.srv.cmd(box, retry=1)
                 err_file = boatd.cmd_dir(box) / f'{pid}.err'
                 err_file.write_text(first)
-                self.assertEqual(boatd.reconcile(self.srv.con)['retry'], 1)
+                err_file.write_text(first + 'offbox-server: the server restarted while this run was going (attempt 1 is lost); it is queued again as attempt 2\n')
+                self.srv.con.execute("UPDATE commands SET attempt=2 WHERE box_id=? AND pid=?", (box,pid))
                 with err_file.open('a') as f:
                     f.write(second)
                 self.end(box, pid, 0)
