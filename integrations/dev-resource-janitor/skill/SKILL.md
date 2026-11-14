@@ -1,6 +1,6 @@
 ---
 name: dev-resource-janitor
-description: Use to find/stop leftover iOS simulators, Expo/Metro servers, Docker containers, LocalStack, or Docker Desktop that agents left running. Runs hourly as a scheduled Sonnet agent.
+description: Use to find/stop leftover iOS simulators, Expo/Metro servers, Docker containers, LocalStack, or Docker Desktop that agents left running. Runs hourly through robob-watch.
 ---
 
 # Dev resource janitor
@@ -53,8 +53,13 @@ use their worktree or project workspace. No roster absence proves an ended owner
 (nightly 2026-10-15) Now a robob-watch watcher `dev-janitor` (mode notify, hourly), not an LLM run. Check script
 `scripts/janitor_watch.sh` starts a detached, locked worker for scan and apply --ids. The worker re-scans before
 each action, can run beyond the watcher's 60-second check deadline, and records its result for the next check.
-An overlapping check doesn't start a second worker. A failed, interrupted, or four-hour-overdue worker is reported
-on the next check. The old scheduled task "Dev resource janitor (hourly)" (cron `17 * * * *`, Asia/Dubai) is retired and should be disabled.
+An overlapping check doesn't start a second worker. Checks never print to stdout (robob-watch would forward it
+to iMessage). Failed, lost or four-hour-overdue workers, spawn failures and tmpdir-prune failures go to Telegram
+with `dev-janitor:<kind>` keys and an audit `alert` entry, including whether Telegram accepted the request.
+Identical kind/text attempts are suppressed for six hours using `hourly/alerts.json`, separate from worker state.
+Telegram failures are audited without printing; check stderr goes to `~/.local/share/dev-janitor/watch.err`.
+Report-only findings and liveness problems stay in `audit.jsonl` as `report` entries and never alert.
+The old scheduled task "Dev resource janitor (hourly)" (cron `17 * * * *`, Asia/Dubai) is retired and should be disabled.
 
 ## $TMPDIR prune (hourly, same watcher, 2026-10-22)
 
@@ -67,7 +72,7 @@ crpko-devops guard-test mkdtemp dirs (`coord-scope-*`, `crpko-fdb-plan-guard-*`,
 only reported (`opencode_stale` in `~/.local/share/dev-janitor/tmpdir-audit.jsonl`);
 deleting it stays manual because Crpko review checkouts live there. `scan --list`
 previews. Paths in `~/.config/opencode/dev-janitor-keep.txt` are never touched. A
-crashed prune shows up as one line on the next hourly run.
+crashed prune raises a Telegram alert on the next hourly run.
 
 Previous flow (kept for reference), run as the Robob scheduled task "Dev resource janitor (hourly)" (cron
 `17 * * * *`, Asia/Dubai), imported from OpenChamber.
@@ -113,7 +118,7 @@ Process candidates are separate from resource ids: `apply --ids` cannot act on
 them. The reporter sends no signals and deletes no files.
 
 The exact candidate list (identity, evidence, MEM/CMPRS) and failure reasons are
-written to the report and one audit line; the next hourly check prints them.
+written to the report and one audit line; hourly checks stay silent.
 Pass candidates to the evaluator for an exact TERM approval. Any KILL needs a
 separate exact-PID ask; this reporter implements neither action.
 
