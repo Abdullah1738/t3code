@@ -2032,7 +2032,9 @@ const make = Effect.gen(function* () {
               }),
             ),
           ),
-          wake === undefined ? undefined : (runId) => discardWake(input.threadId, runId),
+          wake === undefined
+            ? undefined
+            : (runId) => (wake.stale ? discardWake(input.threadId, runId) : Effect.void),
         ),
       ).pipe(
         Effect.ensuring(
