@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -48,13 +49,13 @@ class Base(unittest.TestCase):
         fields.update(extra)
         return mc.add(self.data, case_id, at=when, root=self.root, **fields)
 
-    def check(self, now, run='r1', ack=True, delivered_at=None):
+    def check(self, now, run='r1', ack=True, delivered_at=None, find=None):
         """One runner tick: build the event, ack the run, then deliver it.
 
         The runner delivers at `delivered_at` (default: the same moment), so a test can delay delivery. A
         delivered event raises `fires` and sets `last_fire_at` in state.json, which is what the check reads.
         With ack=False nothing is delivered (the runner never took the event)."""
-        event = mc.run_check(self.wd, run, self.data, self.root, at(now))
+        event = mc.run_check(self.wd, run, self.data, self.root, at(now), find=find or finder())
         if ack and event:
             (self.wd / '.run-ok').write_text(run)
             self.deliver(delivered_at or now)
@@ -1112,9 +1113,25 @@ HISTORY = {'id': 1, 'ts': at('2026-09-01T12:00').timestamp(), 'sender': BANK, 's
            'body': 'Purchase of EUR 9.99 with Credit Card ending 1111 at ACME * EATS PENDING, Amsterdam. Avl Cr. Limit'}
 RECEIPT = {'id': 2, 'ts': at('2026-10-24T10:47').timestamp(), 'sender': 'Acme <noreply@acme.example>',
            'subject': 'Your Acme order', 'body': 'Thanks for ordering. Total €12.34', 'source': 'email', 'from_me': 0}
+DECLINED = ('Transaction of AED 775.01 on your Credit Card ending 1111 at ANTHROPIC* CLAUDE SUB '
+            'was declined due to insufficient limit')
+PAID = ('Purchase of AED 775.01 with Credit Card ending 1111 at ANTHROPIC* CLAUDE SUB, Amsterdam. '
+        'Avl Cr. Limit is AED 1')
+REFUND = {'id': 301, 'ts': at('2026-11-06T22:47').timestamp(), 'source': 'email', 'from_me': 0,
+          'sender': 'DigiCert Accounts Receivable <ar@digicert.com>',
+          'subject': 'RE: Fifth follow-up - final notice before card dispute: Refund request',
+          'body': 'we have manually processed the request and initiated refund from our end. '
+                  'The amount should be credited back to your card within the next few days.\n'
+                  '> If the refund hasn\'t been issued by Tuesday 10 November, I will dispute the charge'}
+NO_REFUND = dict(REFUND, id=302, sender='Dean Lewis <Dean.Lewis@digicert.com>',
+                 body='I am not able to provide any answers to your questions around the refund, '
+                      'as this falls out of my jurisdiction.')
 
 
 def read(row, deadline=None, **_):
+    if row.get('source') == 'email':
+        return (f"Account: fixture   Folder: INBOX\nDate: fixture\nFrom: {row.get('sender', '')}\n"
+                f"To: owner@example.test\nSubject: {row.get('subject', '')}\nFile: -\n\n{row.get('body', '')}")
     return f"{row.get('subject', '')}\n{row.get('body', '')}"
 
 
@@ -1150,6 +1167,823 @@ class Questions(Base):
             (self.wd / '.run-ok').write_text(run)
             self.deliver(now)
         return event
+
+    def test_paid_after_decline_closes_and_reports_once(self):
+        decline = self.screen(DECLINED, BANK, '2026-11-06T23:07', '2026-11-06T23:08', 'imsg:decline')
+        mc.triaged(self.data, [(decline['id'], 'imsg:decline', True)], at('2026-11-06T23:08'))
+        charge = self.screen(PAID, BANK, '2026-11-06T23:12', '2026-11-06T23:13', 'imsg:charge')
+        with mc.Locked(self.data, 'questions') as book:
+            mc.settle(mc.find_question(book, charge['id']), 'receipt', 'ask', at('2026-11-06T23:14'))
+        self.assertEqual(self.follow('2026-11-06T23:20', finder()), '')
+        q = mc.find_question(mc.load_questions(self.data), decline['id'])
+        self.assertEqual((q['status'], q['by']), ('closed', 'check'))
+        self.assertIn('paid after decline: declined 23:07, charged 23:12', q['outcome'])
+        event = self.follow('2026-11-07T08:00', finder(), 'r2')
+        self.assertEqual(event.count('explained now:'), 1)
+        self.assertEqual(self.follow('2026-11-07T08:15', finder(), 'r3'), '')
+
+    def test_paid_decline_does_not_explain_its_unmatched_charge(self):
+        decline = self.screen(DECLINED, BANK, '2026-11-06T23:07', '2026-11-06T23:08', 'imsg:decline')
+        mc.triaged(self.data, [(decline['id'], 'imsg:decline', True)], at('2026-11-06T23:08'))
+        charge = self.screen(PAID, BANK, '2026-11-06T23:12', '2026-11-06T23:13', 'imsg:charge')
+        event = self.follow('2026-11-07T08:00', finder())
+        declined = mc.find_question(mc.load_questions(self.data), decline['id'])
+        charged = mc.find_question(mc.load_questions(self.data), charge['id'])
+        self.assertEqual((declined['status'], declined['by']), ('closed', 'check'))
+        self.assertIn('paid after decline', declined['outcome'])
+        self.assertEqual(charged['status'], 'open')
+        cases = mc.load(self.data)['cases']
+        self.assertEqual(len(cases), 1)
+        self.assertEqual((cases[0]['id'], cases[0]['merchant']), (charged['case_opened'], mc.UNMATCHED))
+        self.assertEqual(event.count('explained now:'), 1)
+        self.assertNotIn('explained now:', self.follow('2026-11-07T08:15', finder(), 'r2'))
+        self.assertEqual(mc.load(self.data)['cases'], cases)
+
+    def test_decline_only_matches_exact_charge_after_it_within_an_hour(self):
+        rows = [
+            ('boundary', PAID, '2026-11-07T00:07', True),
+            ('late', PAID, '2026-11-07T00:08', False),
+            ('same-time', PAID, '2026-11-06T23:07', False),
+            ('earlier', PAID, '2026-11-06T23:06', False),
+            ('amount', PAID.replace('775.01', '775.02'), '2026-11-06T23:12', False),
+            ('currency', PAID.replace('AED 775', 'USD 775'), '2026-11-06T23:12', False),
+            ('card', PAID.replace('1111', '2222'), '2026-11-06T23:12', False),
+            ('merchant', PAID.replace('ANTHROPIC* CLAUDE SUB', 'OTHER MERCHANT'), '2026-11-06T23:12', False),
+        ]
+        for label, alert, charged, closes in rows:
+            with self.subTest(label=label):
+                self.data = self.tmp / label
+                decline = self.screen(DECLINED, BANK, '2026-11-06T23:07', '2026-11-06T23:08', 'imsg:decline')
+                self.screen(alert, BANK, charged, '2026-11-07T00:10', 'imsg:charge')
+                mc.follow(self.data, at('2026-11-07T00:20'), find=finder(), said=nobody)
+                q = mc.find_question(mc.load_questions(self.data), decline['id'])
+                self.assertEqual(q['status'], 'closed' if closes else 'open')
+
+    def test_paid_decline_closes_only_untouched_linked_cases(self):
+        for edited in (False, True):
+            with self.subTest(edited=edited):
+                self.data = self.tmp / str(edited)
+                decline = self.screen(DECLINED, BANK, '2026-11-06T23:07', '2026-11-06T23:08', 'imsg:decline')
+                with mc.Locked(self.data, 'questions') as book:
+                    cid = mc.case_from(self.data, book['questions'][0], at('2026-11-06T23:09'), 'check')
+                if edited:
+                    mc.update(self.data, cid, {'state': 'owner working on it'}, at=at('2026-11-06T23:10'))
+                self.screen(PAID, BANK, '2026-11-06T23:12', '2026-11-06T23:13', 'imsg:charge')
+                mc.follow(self.data, at('2026-11-06T23:20'), find=finder(), said=nobody)
+                q = mc.find_question(mc.load_questions(self.data), decline['id'])
+                self.assertEqual(q['status'], 'closed')
+                self.assertEqual(mc.find(mc.load(self.data), cid)['status'], 'open' if edited else 'closed')
+
+    def refund_case(self, **kw):
+        return self.case('digicert-refund', merchant='DigiCert', amount='864', currency='USD',
+                         deadline=kw.pop('deadline', '2026-11-10'), when=at('2026-11-06T14:25'), **kw)
+
+    def test_refund_mail_holds_dispute_with_sourced_history_and_one_ping(self):
+        self.refund_case()
+        event = self.follow('2026-11-06T22:50', finder(REFUND))
+        case = mc.load(self.data)['cases'][0]
+        self.assertEqual(mc.deadline_of(case), at('2026-11-13T22:47'))
+        self.assertIn('refund promised', case['state'])
+        self.assertTrue(case['next'].startswith('held: watch the card for the credit; then '))
+        self.assertEqual(case['refund_mail'], {'id': 301, 'at': mc.stamp(at('2026-11-06T22:47'))})
+        self.assertEqual(len(case['history']), 2)
+        self.assertIn('because: merchant mail 301 says the refund was processed; dispute step held', case['history'][-1]['text'])
+        self.assertEqual(case['history'][-1]['source'], 'mail:301')
+        self.assertEqual(event.count('mailed Fri 6 Nov 22:47'), 1)
+        self.assertEqual(self.follow('2026-11-06T22:55', finder(REFUND), 'r2'), '')
+        self.assertEqual(self.follow('2026-11-07T09:00', finder(REFUND), 'r3'), '')
+        self.assertEqual(mc.load(self.data)['cases'][0], case)
+
+    def test_identified_automatic_case_reports_refund_once_without_asking(self):
+        for status in ('open', 'awaiting_answer'):
+            with self.subTest(status=status):
+                self.data = self.tmp / status
+                self.wd = self.tmp / ('wd-' + status)
+                self.wd.mkdir()
+                cid = 'identified-refund'
+                self.case(cid, merchant=None, unmatched=True, amount='864', currency='USD',
+                          deadline='2026-11-06T14:00', when=at('2026-11-06T14:25'),
+                          next_action='owner: which order is this?',
+                          alert_at=mc.stamp(at('2026-11-06T12:00')))
+                mc.update(self.data, cid, {'merchant': 'DigiCert', 'state': 'refund requested'},
+                          source='mail:identified', at=at('2026-11-06T14:26'))
+                with mc.Locked(self.data) as book:
+                    book['cases'][0]['status'] = status
+                before = mc.load(self.data)['cases'][0]
+                self.assertFalse(mc.owner_answered(before))
+                self.assertEqual(self.follow('2026-11-06T14:30', finder(), 'before'), '')
+                event = self.follow('2026-11-06T22:50', finder(REFUND))
+                case = mc.load(self.data)['cases'][0]
+                self.assertEqual(mc.deadline_of(case), at('2026-11-13T22:47'))
+                self.assertEqual(case['refund_mail'], {'id': 301, 'at': mc.stamp(at('2026-11-06T22:47'))})
+                self.assertIn('refund promised', case['state'])
+                self.assertFalse(mc.owner_answered(case))
+                self.assertEqual(event.count('mailed Fri 6 Nov 22:47'), 1)
+                self.assertNotIn('which order is this?', event)
+                self.assertNotIn(mc.ASK, event)
+                key = f'{cid}|refund|301'
+                state = json.loads((self.wd / 'pings.json').read_text())
+                self.assertEqual(state['outbox']['keys'], [key])
+                self.assertEqual(self.follow('2026-11-06T22:55', finder(REFUND), 'r2'), '')
+                self.assertEqual(mc.load(self.data)['cases'][0], case)
+                clock = {cid: {'answer': mc.answered_at(case).isoformat(),
+                               'at': mc.stamp(at('2026-11-06T14:30'))}}
+                future = at('2026-11-14T09:00')
+                due = mc.attention([case], future, {}, self.root, clock)
+                self.assertEqual([k for _, items, _, _ in due for k, _ in items], [key])
+                self.assertEqual(due[0][2], '')
+                self.assertEqual(mc.attention([case], future, {key}, self.root, clock), [])
+                day = f'{cid}|day|2026-11-14'
+                self.assertEqual(mc.attention([case], future, {day}, self.root, clock), [])
+
+    def test_refund_mail_never_shortens_deadline_or_changes_unrelated_next(self):
+        self.refund_case(deadline='2026-11-20', next_action='watch for the credit')
+        self.follow('2026-11-06T22:50', finder(REFUND))
+        case = mc.load(self.data)['cases'][0]
+        self.assertEqual((case['deadline'], case['rev'], case['next']), ('2026-11-20', 0, 'watch for the credit'))
+
+    def test_refund_mail_still_holds_a_case_awaiting_his_answer(self):
+        self.refund_case()
+        with mc.Locked(self.data) as book:
+            book['cases'][0]['status'] = 'awaiting_answer'
+        event = self.follow('2026-11-06T22:50', finder(REFUND))
+        case = mc.load(self.data)['cases'][0]
+        self.assertEqual((case['status'], mc.deadline_of(case)), ('awaiting_answer', at('2026-11-13T22:47')))
+        self.assertIn('mailed Fri 6 Nov 22:47', event)
+
+    def test_refund_lookup_searches_all_accepted_credit_wording(self):
+        rows = [
+            ('refund', dict(REFUND, body='Your refund was processed.')),
+            ('credit', dict(REFUND, subject='Credit confirmation', body='USD 864 was credited back to your card.')),
+            ('account', dict(REFUND, subject='Credit confirmation', body='USD 864 was credited back to your account.')),
+        ]
+        for label, row in rows:
+            with self.subTest(label=label):
+                self.data = self.tmp / label
+                self.refund_case()
+                def search(query, since, **kw):
+                    text = (row['subject'] + ' ' + row['body']).lower().split()
+                    return [row] if any(term in query.split() and term in text for term in ('refund', 'credited')) else []
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, search)
+                self.assertEqual(mc.load(self.data)['cases'][0]['refund_mail']['id'], row['id'])
+
+    def test_refund_ping_waits_for_daily_cap_and_survives_key_pruning(self):
+        self.refund_case()
+        now = at('2026-11-06T22:50')
+        case = mc.load(self.data)['cases'][0]
+        ask_key = f"digicert-refund|ask|{mc.answered_at(case).isoformat()}"
+        mc.write_json(self.wd / 'pings.json', {'sent': {ask_key: mc.stamp(now),
+                      'digicert-refund|day|2026-11-06': mc.stamp(now)}})
+        self.assertEqual(self.follow('2026-11-06T22:50', finder(REFUND)), '')
+        event = self.follow('2026-11-07T09:00', finder(REFUND), 'r2')
+        self.assertEqual(event.count('mailed Fri 6 Nov 22:47'), 1)
+        self.assertNotIn('mailed', self.follow('2027-02-01T09:00', finder(REFUND), 'r3'))
+        state = json.loads((self.wd / 'pings.json').read_text())
+        self.assertIn('digicert-refund|refund|301', state['built'])
+
+    def test_reopening_does_not_replay_the_previous_refund_mail(self):
+        self.refund_case()
+        self.follow('2026-11-06T22:50', finder(REFUND))
+        mc.close(self.data, 'digicert-refund', 'refund landed', at=at('2026-11-08T10:00'))
+        self.follow('2027-02-01T09:00', finder(REFUND), 'r2')
+        mc.reopen(self.data, 'digicert-refund', '2027-03-01', 'refund reversed', at=at('2027-02-01T10:00'))
+        self.assertNotIn('refund_mail', mc.load(self.data)['cases'][0])
+        self.assertNotIn('mailed', self.follow('2027-02-01T11:00', finder(REFUND), 'r3'))
+
+    def test_refund_mail_rejects_quotes_negations_senders_and_old_mail(self):
+        rows = [
+            ('dean', NO_REFUND),
+            ('own', dict(REFUND, from_me=1)),
+            ('other', dict(REFUND, sender='Other <ar@other.example>')),
+            ('bank', dict(REFUND, sender='Wio DigiCert alert')),
+            ('sms', dict(REFUND, source='imessage')),
+            ('old', dict(REFUND, ts=at('2026-11-06T14:24').timestamp())),
+            ('same-time', dict(REFUND, ts=at('2026-11-06T14:25').timestamp())),
+            ('later-edit', REFUND),
+        ]
+        for marker in ('> ', '-----Original Message-----\n', 'On Fri, 6 Nov someone wrote:\n'):
+            rows.append(('quoted-' + str(len(rows)), dict(REFUND, body='No update yet.\n' + marker + 'Refund was issued.')))
+        rows.append(('own-negated-quote', dict(REFUND, body="No update yet.\n> If the refund hasn't been issued, I will dispute it.")))
+        for negation in ("not", "can't", "cannot", "unable", "won't", "isn't", 'never'):
+            rows.append(('negation-' + negation, dict(REFUND, body=f'We are {negation} confirming your refund was processed.')))
+        rows.append(('wrapped-negation', dict(REFUND, body='We cannot\nconfirm your refund was issued.')))
+        for label, row in rows:
+            with self.subTest(label=label):
+                self.data = self.tmp / label
+                self.wd = self.tmp / ('wd-' + label)
+                self.wd.mkdir()
+                self.refund_case()
+                if label == 'later-edit':
+                    mc.update(self.data, 'digicert-refund', {'state': 'already handled'}, at=at('2026-11-07T01:35'))
+                before = mc.load(self.data)
+                event = self.follow('2026-11-07T09:00', finder(row))
+                self.assertEqual(mc.load(self.data), before)
+                self.assertNotIn('mailed', event)
+
+    def test_refund_done_wording_and_newest_mail(self):
+        forms = ('Refund processed', 'refund has been issued', 'refund was initiated', 'refund is credited',
+                 'refund refunded', 'refund sent', 'processed the refund', 'issued your refund',
+                 'initiated refund', 'credited back to your card', 'credited back to your account',
+                 'We processed the refund. Have you received it?',
+                 'Your refund was processed by Example Inc. Have you received it?',
+                 'We have initiated refund. Have you received it?',
+                 'We confirm that your refund was processed.',
+                 'Kindly note that your refund was processed.',
+                 'We can confirm that your refund was processed.',
+                 'We have initiated refund. The amount should be credited back to your card within a few days.',
+                 'Your refund was processed. We will send a confirmation email.',
+                 'Your refund was processed by Mr. Smith. Is there anything else we can help with?')
+        for i, body in enumerate(forms):
+            with self.subTest(body=body):
+                self.data = self.tmp / str(i)
+                self.refund_case()
+                newest = dict(REFUND, id=303, ts=at('2026-11-06T22:48').timestamp(), body=body)
+                self.assertEqual(mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8,
+                                               finder(REFUND, newest)), [])
+                self.assertEqual(mc.load(self.data)['cases'][0]['refund_mail']['id'], 303)
+
+    def test_refund_negation_survives_money_number_and_wrapped_line_formats(self):
+        amounts = ('USD 864.00', 'USD 1,864.00', 'USD 864,00', 'USD 1.864,00',
+                   'USD 0.50', 'USD 864.5', '$864.00', '864.00 USD', 'USD 864.00\n')
+        for i, amount in enumerate(amounts):
+            with self.subTest(amount=amount):
+                self.data = self.tmp / f'negative-amount-{i}'
+                self.refund_case()
+                before = mc.load(self.data)
+                row = dict(REFUND, body=f'We cannot confirm whether the {amount} refund was processed.')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertEqual(mc.load(self.data), before)
+
+    def test_refund_completion_requires_authored_body_not_mail_headers(self):
+        pending = 'Your request is still pending. We will contact you when there is an update.'
+        subject = 'RE: Refund processed?'
+        rows = [
+            ('archive', read(dict(REFUND, subject=subject, body=pending)), False),
+            ('header-only', f'Subject: {subject}\n\n{pending}', False),
+            ('folded-subject', f'Subject: RE:\n Refund processed?\n\n{pending}', False),
+            ('crlf', read(dict(REFUND, subject=subject, body=pending)).replace('\n', '\r\n'), False),
+            ('no-body', f'Subject: {subject}', False),
+            ('other-header', f'From: Refund processed <ar@digicert.com>\nSubject: Update\n\n{pending}', False),
+            ('affirmative-body', read(dict(REFUND, subject=subject, body='Your refund was processed.')), True),
+            ('question-body', read(dict(REFUND, subject='Status', body='Was your refund processed?')), False),
+            ('bare-body', 'Your refund was processed.', True),
+        ]
+        for label, shown, matches in rows:
+            with self.subTest(label=label):
+                self.data = self.tmp / ('header-' + label)
+                self.refund_case()
+                before = mc.load(self.data)
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(REFUND),
+                                read=lambda row, deadline: shown)
+                case = mc.load(self.data)['cases'][0]
+                if matches:
+                    self.assertEqual(case['refund_mail']['id'], REFUND['id'])
+                else:
+                    self.assertEqual(mc.load(self.data), before)
+
+    def test_refund_questions_with_abbreviations_leave_case_and_notice_unchanged(self):
+        bodies = (
+            'Was your refund processed by Mr. Smith?',
+            'Is your refund processed by Dr. Smith?',
+            'Was your refund processed by Mr. I. Smith of Example Inc.?',
+            'Did Mr. Smith confirm that your refund was processed?',
+            'Could you confirm that Mr. Smith processed the refund?',
+            'What shows that your refund was processed by Mr. Smith?',
+            'Your refund was processed by Mr. Smith?',
+            'Your refund was processed by Mr. Will Smith?',
+            'Refund processed by Mr. Smith?',
+            'Hello, was your refund processed by Mr. Smith?',
+            'Hello,\nWas your refund processed by Mr. Smith?',
+            'Please confirm whether your refund was processed by Mr. Smith.',
+            'Let us know if your refund was processed by Mr. Smith.',
+            'Our agent asks if your refund was processed by Mr. Smith.',
+            'We are wondering if your refund was processed by Mr. Smith.',
+            'Please advise if your refund was processed by Mr. Smith.',
+            'Was your refund processed by Mr. Smith? Have you received it?',
+            'Was your refund processed by Mr. Smith. Have you received it?',
+            'Have you received it?',
+            'Your request is pending. Have you received it?',
+        )
+        for i, body in enumerate(bodies):
+            with self.subTest(row=i):
+                self.data = self.tmp / f'question-{i}'
+                self.wd = self.tmp / f'question-wd-{i}'
+                self.wd.mkdir()
+                self.refund_case()
+                before = mc.load(self.data)
+                event = self.follow('2026-11-06T22:50', finder(dict(REFUND, body=body)))
+                self.assertEqual(mc.load(self.data), before)
+                self.assertNotIn('mailed', event)
+
+    def test_refund_confirmation_requests_leave_case_and_notice_unchanged(self):
+        requests = (
+            'Kindly confirm that your refund was processed.',
+            'Confirm that your refund was processed.',
+            'Please kindly confirm that your refund was processed.',
+            'Kindly verify that your refund was processed.',
+            'Kindly\nverify that your refund was processed.',
+            'Verify that your refund was processed.',
+            'Check that your refund was processed.',
+            'Dear customer, kindly confirm that your refund was processed.',
+            'Dear customer,\nKindly confirm that your refund was processed.',
+            'Kindly provide confirmation that your refund was processed.',
+            'Send confirmation that your refund was processed.',
+            'Share confirmation that your refund was processed.',
+            'We ask you to please confirm that your refund was processed.',
+            'We ask you to confirm that your refund was processed.',
+            'You are requested to verify that your refund was processed.',
+            'Please just confirm that your refund was processed.',
+            'Kindly urgently confirm that your refund was processed.',
+            'Please let us know that your refund was processed.',
+            'Please can you confirm that your refund was processed.',
+            'Reconfirm that your refund was processed.',
+        )
+        self.assert_refund_mail_ignored(requests, 'request')
+
+    def test_future_or_conditional_refund_leaves_case_and_notice_unchanged(self):
+        bodies = (
+            'We will send a confirmation email once your refund is processed.',
+            'Once your refund is processed, a confirmation email will follow.',
+            'We send a confirmation email when your refund is processed.',
+            'After your refund has been issued, you will receive a confirmation email.',
+            'If approved, your refund is processed.',
+            'Your refund is processed only if the request is approved.',
+            'Your refund is processed provided that approval is received.',
+            'Your refund is processed provided\nthat approval is received.',
+            'Your refund is processed as long as approval is received.',
+            'Your refund is processed subject to approval.',
+            'We would confirm that your refund was processed.',
+            'We may confirm that your refund was processed.',
+            'We might confirm that your refund was processed.',
+            "We'll ensure that your refund is processed.",
+            "We'd confirm that your refund was processed.",
+            'We are going to ensure that your refund is processed.',
+            'We are about to ensure that your refund is processed.',
+            'We can get your refund processed.',
+            'We can ensure that your refund is processed.',
+            'We are working to ensure that your refund is processed.',
+            'We are trying to ensure that your refund is processed.',
+            'We are hoping that your refund was processed.',
+            'We expect that your refund was processed.',
+            'We hope that your refund was processed.',
+            'The amount should be credited back to your card within a few days.',
+            'The amount will be credited back to your card.',
+            'Your refund is processed tomorrow.',
+            'Your refund is processed next week.',
+            'Your refund is processed next\nweek.',
+            'Your refund is processed after approval.',
+            'Your refund is processed before the cutoff.',
+            'Your refund is processed upon approval.',
+            'Your refund is processed once approved.',
+            'Your refund is processed when approved.',
+        )
+        bodies += tuple(f'The amount {tense}credited back to your {destination} {timing}.'
+                        for tense in ('is ', 'is being ', '')
+                        for destination in ('card', 'account')
+                        for timing in ('after approval', 'before the cutoff', 'upon approval',
+                                       'once approved', 'when approved'))
+        bodies += tuple(f'The amount {tense}credited back to your {destination}{separator}'
+                        f'this will happen only {condition}.'
+                        for tense in ('is ', 'is being ', '')
+                        for destination in ('card', 'account')
+                        for separator in ('; ', '.\n')
+                        for condition in ('after approval', 'if approval is received'))
+        self.assert_refund_mail_ignored(bodies, 'future')
+
+    def test_completed_refund_keeps_past_timing_and_later_credit_estimates(self):
+        bodies = (
+            'We have initiated refund. The amount should be credited back to your card next week.',
+            'We have initiated refund. The amount should be credited back to your card next\nweek.',
+            'We have initiated refund. The amount should be credited back to your card tomorrow.',
+            'We have initiated refund. The amount should be credited back to your card soon.',
+            'Your refund was processed after approval.',
+            'Your refund has been processed after approval.',
+            'We processed the refund after approval.',
+            'Your refund was processed before the cutoff.',
+            'Your refund was processed upon approval.',
+            'Your refund was processed once approval was received.',
+            'Your refund was processed when approval was received.',
+        )
+        bodies += tuple(f'The amount {tense} credited back to your {destination} {timing}.'
+                        for tense in ('was', 'has been')
+                        for destination in ('card', 'account')
+                        for timing in ('after approval', 'before the cutoff', 'upon approval',
+                                       'once approval was received', 'when approval was received'))
+        bodies += (
+            'Your refund was processed. Confirmation will be sent.',
+            'After approval, your refund was processed. Confirmation will be sent.',
+            'Your refund was processed. Confirmation is required for our records.',
+            'We have initiated refund. The amount should be credited next week. Confirmation will follow.',
+            'After approval, confirmation: your refund was processed.',
+            'Your refund was processed. Confirmation from your bank that your refund was processed will be sent.',
+            'After approval, your refund was processed. Confirmation from your bank is required for our records.',
+            'Confirmation: your refund was processed. The amount should be credited next week.',
+            'Confirmation: your refund was processed. The amount will have been credited by Friday.',
+            'Your refund was processed. Confirmation must be obtained for our records.',
+            'Your refund was processed by Will Smith.',
+            'After approval, we confirm that your refund was processed.',
+            'Once approval was received, we can confirm that we processed the refund.',
+            'After approval, kindly note that your refund was processed.',
+            'After approval, DigiCert processed the refund.',
+            'After approval, the bank processed the refund.',
+            'After approval, your USD 864.00 refund was processed.',
+            'Once approval was received, the amount was credited back to your account.',
+            'After approval, ' + REFUND['body'],
+            'Confirmation: we confirm that your refund was processed. The amount should be credited next week.',
+            'After approval, confirmation: we can confirm that your refund was processed. The amount will be credited next week.',
+            'Your refund was processed. Confirmation needs the bank to verify it for our records.',
+            'Confirmation: we confirm that your refund was processed. The amount is expected to be credited next week.',
+            'After approval, confirmation: we confirm that your refund was processed. The amount is expected to have been credited by Friday.',
+            'Confirmation: we confirm that your refund was processed. The amount is expected to already be credited next week.',
+            'Confirmation: we confirm that your refund was processed. The amount is expected to be promptly credited next week.',
+            "Confirmation: we confirm that your refund was processed. It'll be credited next week.",
+            'Confirmation: we confirm that your refund was processed. It’ll be credited next week.',
+        )
+        self.assert_refund_mail_holds(bodies, 'completed-timing')
+
+    def test_past_timing_prefixes_preserve_completed_refund_and_one_notice(self):
+        prefixes = ('After approval', 'After the approval', 'Upon approval', 'Before the cutoff',
+                    'Once approval was received', 'Once approval has been received',
+                    'Once approval had been received', 'When approval was received',
+                    'Once the approval was received', 'After approval was granted',
+                    'Before approval was received')
+        completions = ('your refund was processed.', 'we processed the refund.',
+                       'the amount was credited back to your card.')
+        bodies = tuple(prefix + separator + completion
+                       for prefix in prefixes for separator in (', ', ',\n')
+                       for completion in completions)
+        self.assert_refund_mail_holds(bodies, 'past-prefix')
+
+    def test_unresolved_timing_prefixes_leave_case_and_notice_unchanged(self):
+        prefixes = ('After approval is received', 'Once approval is received',
+                    'Once approval has to be received', 'When approval is received',
+                    'Before approval is received', 'After your refund has been issued')
+        completions = ('your refund was processed.', 'we processed the refund.',
+                       'the amount was credited back to your card.')
+        bodies = tuple(prefix + separator + completion
+                       for prefix in prefixes for separator in (', ', ',\n')
+                       for completion in completions)
+        bodies += tuple(prefix + ', ' + completion
+                        for prefix in ('After approval', 'Once approval was received',
+                                       'When approval was received')
+                        for completion in ('your refund is processed.',
+                                           'your refund will be processed.',
+                                           'kindly confirm that your refund was processed.',
+                                           'was your refund processed by Mr. Smith?'))
+        self.assert_refund_mail_ignored(bodies, 'unresolved-prefix')
+
+    def test_past_prefix_cannot_authorize_a_request_for_confirmation(self):
+        requests = tuple(f'After approval, please {verb} {recipient} confirmation '
+                         'that your refund was processed.'
+                         for verb in ('provide', 'send', 'share', 'give')
+                         for recipient in ('me', 'us', 'him', 'her', 'them', 'you'))
+        requests += (
+            'After approval, please provide us with confirmation that your refund was processed.',
+            'After approval, please send to us confirmation that your refund was processed.',
+            'After approval, please share with us confirmation that your refund was processed.',
+            'Once approval was received, kindly send us confirmation that your refund was processed.',
+            'When approval was received, send us confirmation that your refund was processed.',
+            'After approval,\nplease send\nus confirmation that your refund was processed.',
+            'We ask you to please send us confirmation that your refund was processed.',
+            'Kindly provide me with confirmation that your refund was processed.',
+            'Send us confirmation that your refund was processed.',
+            'After approval, please send your bank confirmation that your refund was processed.',
+            'After approval, please provide the support team with confirmation that your refund was processed.',
+        )
+        self.assert_refund_mail_ignored(requests, 'recipient-request')
+
+    def test_nominal_confirmation_requests_leave_case_and_notice_unchanged(self):
+        requests = ('we request', 'our team requests', 'we requested', 'we are requesting',
+                    'we ask for', 'our team asks for', 'we asked for', 'we are asking for',
+                    'we need', 'our team needs', 'we needed', 'we are needing',
+                    'we want', 'our team wants', 'we wanted', 'we are wanting',
+                    'we require', 'our team requires', 'we required', 'we are requiring',
+                    'we seek', 'our team seeks', 'we sought', 'we are seeking')
+        bodies = tuple(f'After approval, {request} confirmation that your refund was processed.'
+                       for request in requests)
+        bodies += tuple(f'After approval, we request {noun} that your refund was processed.'
+                        for noun in ('a confirmation', 'the confirmation', 'your confirmation',
+                                     'written confirmation', 'a written confirmation'))
+        bodies += (
+            'Once approval was received, we request confirmation that your refund was processed.',
+            'When approval was received, we need confirmation that your refund was processed.',
+            'After approval, we request\nconfirmation that your refund was processed.',
+            'We request confirmation that your refund was processed.',
+            'After approval, we request written confirmations that your refund was processed.',
+            'After approval, we ask for a written confirmation that your refund was processed.',
+        )
+        self.assert_refund_mail_ignored(bodies, 'nominal-request')
+
+    def test_request_complements_leave_case_and_notice_unchanged(self):
+        requests = ('you need', 'our team needs', 'we needed', 'we are needing',
+                    'we request', 'our team requests', 'we requested', 'we are requesting',
+                    'we ask', 'our team asks', 'we asked', 'we are asking',
+                    'we want', 'our team wants', 'we wanted', 'we are wanting',
+                    'we require', 'our team requires', 'we required', 'we are requiring',
+                    'we seek', 'our team seeks', 'we sought', 'we are seeking')
+        bodies = tuple(f'After approval, {request} to confirm that your refund was processed.'
+                       for request in requests)
+        bodies += tuple(f'After approval, you need to {action} that your refund was processed.'
+                        for action in ('verify', 'check', 'reconfirm', 'provide confirmation',
+                                       'send us confirmation', 'obtain confirmation', 'please confirm'))
+        bodies += tuple(f'Once approval was received, we need {person} to confirm '
+                        'that your refund was processed.'
+                        for person in ('you', 'me', 'us', 'him', 'her', 'them'))
+        bodies += tuple(f'After approval, we ask for {person} to confirm '
+                        'that your refund was processed.'
+                        for person in ('you', 'me', 'us', 'him', 'her', 'them'))
+        bodies += tuple(f'After approval, we request that {person} confirm '
+                        'that your refund was processed.'
+                        for person in ('i', 'we', 'you', 'he', 'she'))
+        bodies += tuple(f'After approval, we {verb} {recipient} to confirm '
+                        'that your refund was processed.'
+                        for verb in ('need', 'request', 'ask', 'want', 'require', 'seek')
+                        for recipient in ('the bank', 'your bank', 'the support team',
+                                          'the finance department', 'Mr. I. Smith',
+                                          'the U.S. IT team', 'DigiCert Accounts Receivable',
+                                          'the representative handling your account at the bank'))
+        bodies += tuple(f'After approval, we {verb} that {subject} confirm '
+                        'that your refund was processed.'
+                        for verb in ('need', 'request', 'ask', 'want', 'require', 'seek')
+                        for subject in ('the bank', 'your bank', 'the support team',
+                                        'the finance department', 'Mr. I. Smith',
+                                        'the U.S. IT team', 'DigiCert Accounts Receivable',
+                                        'the representative handling your account at the bank'))
+        bodies += (
+            'After approval, you need\nto confirm that your refund was processed.',
+            'When approval was received, you need to confirm that your refund was processed.',
+            'You need to confirm that your refund was processed.',
+            'After approval, we request that they confirm that your refund was processed.',
+            'Once approval was received, we need the bank to verify that your refund was processed.',
+            'When approval was received, we need the bank to check that your refund was processed.',
+            'We need the bank to confirm that your refund was processed.',
+            'After approval, we need the bank\nto confirm that your refund was processed.',
+            'After approval, we need\nthe bank to confirm that your refund was processed.',
+            'After approval, we need the bank to obtain proof that your refund was processed.',
+            'Once approval was received, we request that the bank verify that your refund was processed.',
+            'When approval was received, we request that the bank check that your refund was processed.',
+            'We request that the bank confirm that your refund was processed.',
+            'After approval, we request\nthat the bank confirm that your refund was processed.',
+            'After approval, we request that\nthe bank confirm that your refund was processed.',
+            'After approval, we request that the bank provide confirmation that your refund was processed.',
+        )
+        self.assert_refund_mail_ignored(bodies, 'infinitive-request')
+
+    def test_passive_confirmation_requirements_leave_case_and_notice_unchanged(self):
+        prefixes = ('', 'After approval, ', 'Once approval was received, ')
+        bodies = tuple(f'{prefix}{noun} that your refund was processed is {predicate}.'
+                       for prefix in prefixes
+                       for noun in ('confirmation', 'a confirmation', 'written confirmation')
+                       for predicate in ('required', 'needed', 'requested', 'wanted', 'sought',
+                                         'awaited', 'expected', 'necessary', 'mandatory', 'essential'))
+        bodies += tuple(f'{prefix}confirmation that your refund was processed {predicate}.'
+                        for prefix in prefixes
+                        for predicate in ('will be sent', 'should be obtained',
+                                          'must be provided', 'can be requested'))
+        bodies += tuple(f'{prefix}confirmations that your refund was processed are required.'
+                        for prefix in prefixes)
+        bodies += (
+            'After approval, confirmation\nthat your refund was processed is still required.',
+            'After approval, confirmation that your refund was processed\nis required.',
+        )
+        bodies += tuple(f'After approval, {noun} that your refund was processed is required.'
+                        for noun in ('verification', 'proof', 'evidence', 'assurance'))
+        bodies += tuple(f'After approval, {noun} {qualifier} that your refund was processed is {predicate}.'
+                        for noun in ('confirmation', 'verification', 'proof', 'evidence', 'assurance')
+                        for qualifier in ('from your bank', 'from the support team',
+                                          'from Mr. I. Smith', 'from the U.S. IT team',
+                                          'from DigiCert Accounts Receivable', 'in writing',
+                                          'from the representative handling your account at the bank',
+                                          'from your\nbank')
+                        for predicate in ('required', 'needed'))
+        bodies += (
+            'Once approval was received, confirmation from your bank that your refund was processed is required.',
+            'When approval was received, confirmation from your bank that your refund was processed is required.',
+            'Confirmation from your bank that your refund was processed is required.',
+            'After approval, confirmation from your bank\nthat your refund was processed is required.',
+            'After approval, confirmation from your bank that your refund was processed\nis required.',
+        )
+        bodies += tuple(re.sub(r'\bthat\s+', '', body, count=1) for body in bodies)
+        bodies += (
+            'After approval, acknowledgement your refund was processed is required.',
+            'Acknowledgement your refund was processed is required.',
+            'After approval, confirmation: your refund was processed is required.',
+            'Confirmation: your refund was processed is required.',
+            'After approval, we need a response confirming your refund was processed.',
+            'We need a response confirming your refund was processed.',
+            'After approval, it is necessary to confirm that your refund was processed.',
+            'It is necessary to confirm that your refund was processed.',
+        )
+        self.assert_refund_mail_ignored(bodies, 'passive-confirmation')
+
+    def test_labelled_proof_modal_requirements_leave_case_and_notice_unchanged(self):
+        modals = ('must', 'will', 'would', 'shall', 'should', 'can', 'could', 'may', 'might')
+        bodies = tuple(f'After approval, confirmation: your refund was processed{qualifier} '
+                       f'{modal} be {predicate}.'
+                       for modal in modals
+                       for qualifier in ('', ' by Mr. I. Smith')
+                       for predicate in ('obtained from your bank', 'verified by the support team', 'appreciated'))
+        bodies += tuple(f'After approval, {noun}: your refund was processed must be obtained from your bank.'
+                        for noun in ('verification', 'proof', 'evidence', 'assurance'))
+        bodies += tuple(f'After approval, confirmation: your refund was processed {modal} {action}.'
+                        for modal in modals
+                        for action in ('come from your bank', 'originate at your bank', 'follow',
+                                       'help resolve verification', 'require proof'))
+        bodies += tuple(f'After approval, confirmation: your refund was processed {request}.'
+                        for request in ('needs the bank to verify it', 'requires independent bank verification',
+                                        'wants the support team to verify it', 'seeks independent bank verification',
+                                        'asks the bank for verification', 'requests independent bank verification'))
+        bodies += tuple(f'After approval, confirmation: your refund was processed. '
+                        f'{person}{quote}{ending} obtain confirmation from your bank.'
+                        for person in ('We', 'I', 'You', 'They', 'He', 'She', 'It')
+                        for quote in ("'", '’') for ending in ('ll', 'd'))
+        bodies += (
+            'Once approval was received, confirmation: your refund was processed must be obtained from your bank.',
+            'When approval was received, confirmation: your refund was processed must be obtained from your bank.',
+            'Confirmation: your refund was processed must be obtained from your bank.',
+            'After approval, confirmation: your refund was processed must\nbe obtained from your bank.',
+            'After approval, confirmation: your refund was processed must be\nobtained from your bank.',
+            'After approval, confirmation: your refund was processed may have been obtained from your bank.',
+            'After approval, confirmation: your refund was processed must urgently be obtained from your bank.',
+            'After approval, confirmation: your refund was processed must first be obtained from your bank.',
+            'Confirmation: your refund was processed. Confirmation from your bank that your refund was processed will be sent.',
+            'After approval, confirmation: your refund was processed has to be obtained from your bank.',
+            'After approval, confirmations: your refund was processed have to be obtained from your bank.',
+            'After approval, confirmation: your refund was processed had to be obtained from your bank.',
+            'After approval, confirmation: your refund was processed ought to be obtained from your bank.',
+            'Confirmation: your refund was processed by Will Smith.',
+            'Confirmation: your refund was processed by Mr. Will Smith.',
+            "Once approval was received, confirmation: your refund was processed. We'll obtain confirmation from your bank.",
+            "When approval was received, confirmation: your refund was processed. We'd obtain confirmation from your bank.",
+            "Confirmation: your refund was processed. We'll obtain confirmation from your bank.",
+            "After approval, confirmation: your refund was processed. We'll\nobtain confirmation from your bank.",
+        )
+        # Deliberate: a proof-labelled claim plus pending proof is insufficient for a hold.
+        self.assert_refund_mail_ignored(bodies, 'proof-modal')
+
+    def test_labelled_refund_pending_proof_leaves_case_and_notice_unchanged(self):
+        pending = (
+            'We await confirmation from your bank.',
+            'Our team awaits confirmation from your bank.',
+            'We are awaiting confirmation from your bank.',
+            'We awaited confirmation from your bank.',
+            'We expect confirmation from your bank.',
+            'Our team expects confirmation from your bank.',
+            'We are expecting confirmation from your bank.',
+            'We hope to obtain confirmation from your bank.',
+            'We are hoping to obtain confirmation from your bank.',
+            'We plan to obtain confirmation from your bank.',
+            'We are planning to obtain confirmation from your bank.',
+            'We anticipate confirmation from your bank.',
+            'We are anticipating confirmation from your bank.',
+            'We intend to obtain confirmation from your bank.',
+            'We are intending to obtain confirmation from your bank.',
+            'We aim to obtain confirmation from your bank.',
+            'We are scheduled to obtain confirmation from your bank.',
+            'We are going to obtain confirmation from your bank.',
+            'We are about to obtain confirmation from your bank.',
+            'We are trying to obtain confirmation from your bank.',
+            'We are attempting to obtain confirmation from your bank.',
+            'We are working to obtain confirmation from your bank.',
+            'We are working on obtaining confirmation from your bank.',
+        )
+        bodies = tuple(f'{prefix}Confirmation: your refund was processed.{separator}{tail}'
+                       for prefix in ('', 'After approval, ', 'Once approval was received, ')
+                       for separator in (' ', '\n') for tail in pending)
+        # Deliberate: a proof-labelled claim plus pending proof is insufficient for a hold.
+        self.assert_refund_mail_ignored(bodies, 'pending-proof')
+
+    def assert_refund_mail_holds(self, bodies, label):
+        for i, body in enumerate(bodies):
+            with self.subTest(row=i):
+                self.data = self.tmp / f'{label}-{i}'
+                self.wd = self.tmp / f'{label}-wd-{i}'
+                self.wd.mkdir()
+                self.refund_case()
+                row = dict(REFUND, body=body)
+                event = self.follow('2026-11-06T22:50', finder(row))
+                case = mc.load(self.data)['cases'][0]
+                self.assertEqual(mc.deadline_of(case), at('2026-11-13T22:47'))
+                self.assertEqual(case['refund_mail']['id'], row['id'])
+                self.assertIn('refund promised', case['state'])
+                self.assertEqual(event.count('mailed Fri 6 Nov 22:47'), 1)
+                self.assertEqual(self.follow('2026-11-06T22:55', finder(row), 'r2'), '')
+                self.assertEqual(mc.load(self.data)['cases'][0], case)
+
+    def assert_refund_mail_ignored(self, bodies, label):
+        for i, body in enumerate(bodies):
+            with self.subTest(row=i):
+                self.data = self.tmp / f'{label}-{i}'
+                self.wd = self.tmp / f'{label}-wd-{i}'
+                self.wd.mkdir()
+                self.refund_case()
+                before = mc.load(self.data)
+                event = self.follow('2026-11-06T22:50', finder(dict(REFUND, body=body)))
+                self.assertEqual(mc.load(self.data), before)
+                self.assertNotIn('mailed', event)
+
+    def test_refund_negation_blocks_a_later_affirmation_across_punctuation(self):
+        # Deliberate: any negation in the merchant's own text blocks the hold.
+        for i, punctuation in enumerate(('.', '!', '?', ';')):
+            with self.subTest(punctuation=punctuation):
+                self.data = self.tmp / f'positive-sentence-{i}'
+                self.refund_case()
+                before = mc.load(self.data)
+                row = dict(REFUND, body=f'We cannot provide an exact arrival date{punctuation} '
+                                       'Your refund was processed.')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertEqual(mc.load(self.data), before)
+
+    def test_refund_negation_survives_abbreviations(self):
+        actors = (
+            ('company', 'Example Inc.'), ('company-lower', 'Example inc.'),
+            ('company-upper', 'EXAMPLE INC.'), ('limited', 'Example Ltd.'),
+            ('corporation', 'Example Corp.'), ('company-short', 'Example Co.'),
+            ('dotted-company', 'Example L.L.C.'),
+            ('country', 'its U.S. team'), ('country-lower', 'its u.s. team'),
+            ('country-upper-next', 'its U.S. Operations team'), ('country-uk', 'its U.K. team'),
+            ('country-it', 'its U.S. IT team'), ('country-it-operations', 'its U.S. IT Operations team'),
+            ('country-uae', 'its U.A.E. team'), ('spaced-initials', 'its U. S. team'),
+            ('title', 'Dr. Example'), ('title-mr', 'Mr. Example'), ('title-ms', 'Ms. Example'),
+            ('title-initial-i', 'Mr. I. Smith'),
+            ('initial', 'J. Example'), ('initials', 'J. R. Example'),
+            ('dotted-initials', 'J.R. Example'), ('department', 'its billing dept.'),
+            ('example', 'its agent, e.g. Example'), ('clarification', 'its agent, i.e. Example'),
+            ('reference', 'the team named in ref. 301'), ('number', 'the team on invoice no. 301'),
+            ('wrapped-company', 'Example Inc.\n'),
+        )
+        for label, actor in actors:
+            with self.subTest(label=label):
+                self.data = self.tmp / ('abbreviation-' + label)
+                self.refund_case()
+                before = mc.load(self.data)
+                row = dict(REFUND, body=f'We cannot confirm that {actor} processed the refund.')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertEqual(mc.load(self.data), before)
+
+    def test_refund_negation_blocks_a_later_affirmation_after_abbreviation(self):
+        # Deliberate: any negation in the merchant's own text blocks the hold.
+        for i, statement in enumerate(('Your refund was processed.', 'The refund was issued.',
+                                        'We processed the refund.', 'Our refund was initiated.')):
+            with self.subTest(statement=statement):
+                self.data = self.tmp / f'new-statement-abbreviation-{i}'
+                self.refund_case()
+                before = mc.load(self.data)
+                row = dict(REFUND, body=f'We cannot give an arrival date for Example Inc. {statement}')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertEqual(mc.load(self.data), before)
+
+    def test_refund_negation_after_affirmation_leaves_case_and_ping_unchanged(self):
+        self.refund_case()
+        before = mc.load(self.data)
+        row = dict(REFUND, body='Your refund was processed. We cannot confirm when it will arrive.')
+        event = self.follow('2026-11-06T22:50', finder(row))
+        self.assertEqual(mc.load(self.data), before)
+        self.assertNotIn('mailed', event)
+
+    def test_embedded_questions_after_abbreviations_keep_negation(self):
+        for i, clause in enumerate(('when we', 'how our team', 'why our team', 'where our team', 'what team')):
+            with self.subTest(clause=clause):
+                self.data = self.tmp / f'embedded-question-{i}'
+                self.refund_case()
+                before = mc.load(self.data)
+                row = dict(REFUND, body=f'We cannot confirm, e.g. {clause} processed the refund.')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertEqual(mc.load(self.data), before)
+
+    def test_refund_lookup_cannot_overwrite_concurrent_case_edit(self):
+        self.refund_case()
+        def edited(row, deadline):
+            mc.update(self.data, 'digicert-refund', {'deadline': '2026-11-25'}, source='mail:other',
+                      at=at('2026-11-06T22:49'))
+            return read(row)
+        mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(REFUND), edited)
+        case = mc.load(self.data)['cases'][0]
+        self.assertEqual(case['deadline'], '2026-11-25')
+        self.assertNotIn('refund_mail', case)
+
+    def test_refund_errors_are_recorded_and_budget_stops_remaining_cases(self):
+        self.refund_case()
+        for error in (mc.charges.Lookup('archive unavailable'), TimeoutError('read timed out')):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(mc.charges, 'show', side_effect=error):
+                    self.follow('2026-11-06T22:50', finder(REFUND))
+                state = json.loads((self.wd / 'pings.json').read_text())
+                self.assertIn(str(error), str(state['question_errors']))
+        self.case('other')
+        with patch.object(mc.time, 'time', return_value=100), patch.object(mc.charges, 'search') as find:
+            errors = mc.refund_mails(self.data, at('2026-11-06T22:50'), 99)
+        find.assert_not_called()
+        self.assertIn('out of time', errors[0])
+
+    def test_refund_lookup_skips_closed_holds_and_unmatched_cases(self):
+        self.refund_case(kind='hold')
+        self.case('unknown', merchant=None, unmatched=True)
+        self.case('closed')
+        mc.close(self.data, 'closed', 'done')
+        with patch.object(mc.charges, 'search') as find:
+            self.assertEqual(mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8), [])
+        find.assert_not_called()
 
     def test_a_merchant_he_pays_waits_then_two_asks_at_most_then_a_money_case(self):
         known = finder(HISTORY)
@@ -3131,24 +3965,26 @@ class PaymentDeadlines(Base):
 
     def test_owner_closes_both_rows(self):
         parent = self.notice('Autopay of AED 3,532.73 is due tonight at 18:00', '2026-11-07T09:09', 'scheduled')
-        with patch.object(mc.charges, 'search', return_value=[]):
-            self.check('2026-11-07T19:00')
+        with patch.object(mc.charges, 'search', return_value=[]) as search:
+            self.check('2026-11-07T19:00', find=search)
         child = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'payment_deadline')
         mc.close(self.data, child['id'], 'paid', at('2026-11-07T19:30'))
         self.assertEqual({c['status'] for c in mc.load(self.data)['cases']}, {'closed'})
         with patch.object(mc.charges, 'search') as search:
-            self.assertEqual('', self.check('2026-11-08T09:00'))
+            self.assertEqual('', self.check('2026-11-08T09:00', find=search))
             search.assert_not_called()
         self.assertEqual(mc.find(mc.load(self.data), parent)['status'], 'closed')
 
     def test_expected_missing_confirmation_escalates_at_due_plus_one(self):
         self.notice('Autopay of AED 3,532.73 is scheduled today at 18:00', '2026-11-07T09:09', 'scheduled')
         with patch.object(mc.charges, 'search', return_value=[]) as search:
-            self.assertEqual('', self.check('2026-11-07T18:59'))
-            search.assert_not_called()
-            self.assertIn('Wio', self.check('2026-11-07T19:00'))
-            self.assertIsNotNone(search.call_args.kwargs['deadline'])
-            event = self.check('2026-11-07T20:00')
+            self.assertEqual('', self.check('2026-11-07T18:59', find=search))
+            self.assertTrue(all(call.args[0].endswith(' refund OR credited') for call in search.call_args_list))
+            self.assertIn('Wio', self.check('2026-11-07T19:00', find=search))
+            payment_calls = [call for call in search.call_args_list if not call.args[0].endswith(' refund OR credited')]
+            self.assertEqual(len(payment_calls), 1)
+            self.assertIsNotNone(payment_calls[0].kwargs['deadline'])
+            event = self.check('2026-11-07T20:00', find=search)
         self.assertIn('Wio', event)
         cases = mc.load(self.data)['cases']
         self.assertEqual(len(cases), 2)
@@ -3157,8 +3993,8 @@ class PaymentDeadlines(Base):
     def test_expected_uses_stated_repayment_deadline(self):
         self.notice('Autopay of AED 3,532.73 is scheduled today at 18:00; repay before midnight if it fails',
                     '2026-11-07T09:09', 'scheduled')
-        with patch.object(mc.charges, 'search', return_value=[]):
-            self.check('2026-11-07T19:00')
+        with patch.object(mc.charges, 'search', return_value=[]) as search:
+            self.check('2026-11-07T19:00', find=search)
         self.assertEqual(mc.load(self.data)['cases'][1]['deadline'], '2026-11-07T23:59:00+04:00')
 
     def test_search_success_requires_bank_amount_currency_and_time(self):
@@ -3177,8 +4013,9 @@ class PaymentDeadlines(Base):
 
     def test_archive_timeout_still_tracks_an_unconfirmed_payment(self):
         self.notice('Autopay of AED 3,532.73 due today at 18:00', '2026-11-07T09:00', 'scheduled')
-        with patch.object(mc.charges, 'search', side_effect=mc.charges.Lookup('archive unavailable')):
-            self.check('2026-11-07T20:00')
+        with patch.object(mc.charges, 'search', side_effect=mc.charges.Lookup('archive unavailable')) as search:
+            self.check('2026-11-07T20:00', find=search)
+            search.assert_called()
         cases = mc.load(self.data)['cases']
         self.assertEqual(len(cases), 2)
         self.assertIn('confirmation', cases[1]['state'])
@@ -3221,20 +4058,22 @@ class PaymentDeadlines(Base):
         def slow_archive(*args, **kwargs):
             clock[0] = kwargs['deadline'] + .01
             raise mc.charges.Lookup('lookup budget exhausted')
-        with patch.object(mc.time, 'time', side_effect=lambda: clock[0]), patch.object(mc.charges, 'search', side_effect=slow_archive):
-            event = self.check('2026-11-07T20:00')
+        with patch.object(mc.time, 'time', side_effect=lambda: clock[0]), \
+                patch.object(mc.charges, 'search', side_effect=slow_archive) as search:
+            event = self.check('2026-11-07T20:00', find=search)
+            search.assert_called()
         self.assertIn('Wio', event)
         self.assertEqual(sum(c['kind'] == 'payment_deadline' for c in mc.load(self.data)['cases']), 2)
 
     def test_bank_deadline_supersedes_fallback(self):
         self.notice('Autopay of AED 100.00 scheduled today at 18:00', '2026-11-07T09:00', 'scheduled')
-        with patch.object(mc.charges, 'search', return_value=[]):
-            self.check('2026-11-07T19:00', 'missing')
+        with patch.object(mc.charges, 'search', return_value=[]) as search:
+            self.check('2026-11-07T19:00', 'missing', find=search)
         fallback = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'payment_deadline')
         bank = self.notice('Autopay of AED 100.00 failed; repay before midnight', '2026-11-07T20:00', 'bank')
         self.assertEqual(mc.find(mc.load(self.data), fallback['id'])['status'], 'closed')
-        with patch.object(mc.charges, 'search', return_value=[]):
-            event = self.check('2026-11-07T21:00', 'bank-alert')
+        with patch.object(mc.charges, 'search', return_value=[]) as search:
+            event = self.check('2026-11-07T21:00', 'bank-alert', find=search)
         self.assertIn(bank, event)
         self.assertNotIn(fallback['id'], event)
         self.assertNotIn('21:00', event)
