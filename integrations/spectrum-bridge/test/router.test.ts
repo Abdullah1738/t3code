@@ -9766,3 +9766,25 @@ test.each([["wake:intervening", 2], ["secret:intervening", 1]] as const)("a reta
   expect(h.store.get<string>(`log-inbound-id:${proactive}`)).toBe(intervening);
   expect(h.store.get(`reply-gap-recheck:${proactive}`)).toBeUndefined();
 });
+
+test.each([
+  { kind: "question", text: '/answer q_child [["A"]]' },
+  { kind: "question", text: "A" },
+  { kind: "question", text: "1" },
+  { kind: "permission", text: "/approve p_child once" },
+  { kind: "permission", text: "yes" },
+])("a ready root completion cannot consume child $kind answer $text", async ({ kind, text }) => {
+  const h = setup(); h.input("first", "Ask me"); await h.router.tick();
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/ses_child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
+  h.backend.states = { ses_child: { type: "busy", root: "ses_1" } };
+  if (kind === "question") h.backend.questionRequests = [{ ...question({ custom: false }, "q_child"), sessionID: "ses_child" }];
+  else h.backend.permissionRequests = [permission("p_child", "ses_child")];
+  await h.router.tick(); deliver(h.store);
+  h.backend.final("Root complete"); await h.router.checkCompletion();
+  h.input("answer", text); await h.router.tick(); await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("done");
+  if (kind === "question") expect(h.backend.questionReplies).toEqual([["q_child", "/Chats/ses_child", [["A"]]]]);
+  else expect(h.backend.permissionReplies).toEqual([["p_child", "/Chats/ses_child", "once"]]);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.controls().some(item => item.text.includes("Couldn't check that question"))).toBeFalse();
+});

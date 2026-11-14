@@ -6,7 +6,8 @@ import { Store } from "../src/store.ts";
 import type { ChatContext } from "../src/chats.ts";
 import type { NormalizedInbound } from "../src/photon.ts";
 import { toolLog } from "../src/toollog.ts";
-import { completionChecked, tickRead, timeTick } from "../src/tick-timing.ts";
+import { captureReadTiming, completionChecked, includeReadTiming, startTickRead, tickRead, timeTick } from "../src/tick-timing.ts";
+import { ControlClient } from "../src/control.ts";
 
 const hash = (id: string) => `msg_${createHash("sha256").update(id).digest("hex")}`;
 const now = Date.parse("2026-11-13T10:00:00Z");
@@ -640,4 +641,99 @@ test.each([false, true])("completion keeps uncertain steer readback and same-id 
   expect(h.states()).toEqual(["done", "done"]);
   expect(h.backend.prompts.filter(id => id === hash("followup"))).toHaveLength(accepted ? 0 : 1);
   expect(h.backend.records.filter(record => record.type === "user" && record.id === hash("followup"))).toHaveLength(1);
+});
+
+test.each([false, true])("uncertain steer with held acceptance notices and replies to the original once, late acceptance=%s", async lateAccepted => {
+  const h = setup(); h.input("first", 0); await h.router.tick();
+  h.backend.messages = async () => [...h.backend.records];
+  h.backend.sessionBusy = async () => true;
+  let steers = 0;
+  h.backend.steer = async () => { steers++; throw new Error("POST outcome unknown"); };
+  h.input("followup", 0); await h.router.tick();
+  expect(h.store.get("steer-attempt:followup")).toBeDefined();
+  const entered = Promise.withResolvers<void>(), receipt = Promise.withResolvers<boolean>();
+  const replied = Promise.withResolvers<void>();
+  const options = (h.router as unknown as { options: { log: (event: string, code?: string) => void } }).options;
+  const log = options.log;
+  options.log = (event, code) => { log(event, code); if (event === "reply-enqueued") replied.resolve(); };
+  const accepted = h.backend.promptAccepted.bind(h.backend);
+  let readbacks = 0;
+  h.backend.promptAccepted = async (id, directory, prompt) => {
+    if (prompt === hash("followup")) { readbacks++; entered.resolve(); return receipt.promise; }
+    return accepted(id, directory, prompt);
+  };
+  const tick = h.router.tick();
+  try {
+    await entered.promise;
+    setSystemTime(now + 1_000);
+    h.backend.records.push(
+      { id: "original-answer", type: "assistant", content: [{ type: "text", text: "First answer" }], finish: "stop", time: { created: now, completed: now + 1_000 } },
+      { id: "original-idle", type: "idle", outcome: "succeeded", completedAt: now + 1_000, time: { created: now + 1_000 } });
+    await h.router.checkCompletion();
+    await replied.promise;
+    expect(h.logs.filter(line => line.startsWith("run-completed-seen"))).toHaveLength(1);
+    expect(h.store.getOperation("reply:1:original-answer")?.state).toBe("pending");
+    expect(h.store.get("steer-attempt:followup")).toBeDefined();
+    expect(h.states()).toEqual(["done", "processing"]);
+    expect(h.backend.prompts).toEqual([hash("first")]);
+    expect(steers).toBe(1);
+    expect(readbacks).toBe(1);
+  } finally {
+    h.backend.sessionBusy = async () => false;
+    if (lateAccepted) h.backend.records.push({ id: hash("followup"), type: "user", text: "followup", time: { created: now + 1_000 } });
+    receipt.resolve(lateAccepted); await tick;
+  }
+  await h.router.tick();
+  expect(h.backend.prompts.filter(id => id === hash("followup"))).toHaveLength(lateAccepted ? 0 : 1);
+  expect(h.states()).toEqual(["done", "done"]);
+  h.backend.records.push(
+    { id: "followup-answer", type: "assistant", content: [{ type: "text", text: "Followup answer" }], finish: "stop", time: { created: now + 1_000, completed: now + 1_000 } },
+    { id: "followup-idle", type: "idle", outcome: "succeeded", time: { created: now + 1_000 } });
+  await h.router.tick(); await h.router.tick();
+  expect(h.store.getOperation("reply:1:followup-answer")?.state).toBe("pending");
+  expect(h.logs.filter(line => line.startsWith("run-completed-seen"))).toHaveLength(2);
+  expect(h.backend.records.filter(record => record.id === hash("followup"))).toHaveLength(1);
+  expect(steers).toBe(1);
+});
+
+test.each([true, false])("independent completion GET timing reaches its consuming tick, ok=%s", async ok => {
+  const h = setup(); h.input("first", 0); await h.router.tick();
+  h.backend.records.push(
+    { id: "answer", type: "assistant", content: [{ type: "text", text: "Answer" }], finish: "stop", time: { created: now, completed: now } },
+    { id: "idle", type: "idle", outcome: "succeeded", time: { created: now } });
+  const response = Promise.withResolvers<Response>(), entered = Promise.withResolvers<void>();
+  const client = new ControlClient({ url: "http://127.0.0.1:1", token: "test-token" });
+  let ms = 0;
+  const clock = spyOn(performance, "now").mockImplementation(() => ms);
+  const fetchResponse = Object.assign(() => { entered.resolve(); return response.promise; }, { preconnect: globalThis.fetch.preconnect });
+  const fetch = spyOn(globalThis, "fetch").mockImplementation(fetchResponse);
+  const write = spyOn(toolLog, "write").mockImplementation(() => {});
+  h.backend.messages = async () => { await client.request("GET", "/threads/test/messages"); return [...h.backend.records]; };
+  try {
+    const producer = h.router.checkCompletion();
+    await entered.promise;
+    const tick = h.router.tick();
+    ms = 6_001;
+    response.resolve(Response.json({ ok }, { status: ok ? 200 : 503 }));
+    await producer; await tick;
+    const timing = write.mock.calls.map(([entry]) => entry).find(entry => entry.name === "turn.tick_timing");
+    expect(timing).toMatchObject({ durationMs: 6_001,
+      props: { route: "/threads/:id/messages", slowestReadMs: 6_001, completionCheck: ok ? "after" : "unchecked" } });
+  } finally { write.mockRestore(); fetch.mockRestore(); clock.mockRestore(); }
+});
+
+test("a pending independent completion read is included when the consuming tick yields", async () => {
+  let ms = 0;
+  const clock = spyOn(performance, "now").mockImplementation(() => ms);
+  const write = spyOn(toolLog, "write").mockImplementation(() => {});
+  const pending = Promise.withResolvers<void>();
+  const producer = captureReadTiming(async () => {
+    const finish = startTickRead("/threads/:id", performance.now());
+    try { await pending.promise; } finally { finish(); }
+  });
+  try {
+    await timeTick({ chat: "owner" }, async () => { includeReadTiming(producer.timing); ms = 6_001; });
+    expect(write.mock.calls.map(([entry]) => entry).find(entry => entry.name === "turn.tick_timing"))
+      .toMatchObject({ props: { route: "/threads/:id", slowestReadMs: 6_001, completionCheck: "unchecked" } });
+  } finally { pending.resolve(); await producer.result; write.mockRestore(); clock.mockRestore(); }
 });

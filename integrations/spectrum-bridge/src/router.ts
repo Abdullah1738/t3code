@@ -1,6 +1,6 @@
 import { toolLog as watcherLog } from "./watcherlog.ts";
 import { completionReady, toolError, toolLog } from "./toollog.ts";
-import { completionChecked, timeTick } from "./tick-timing.ts";
+import { captureReadTiming, completionChecked, includeReadTiming, timeTick, type ReadTiming } from "./tick-timing.ts";
 import { appendFold, foldMedsLine, foldSkipped, type FoldOptions } from "./meds-fold.ts";
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
@@ -669,10 +669,41 @@ async function bounded<T>(operation: Promise<T>, timeout = 10_000): Promise<T> {
 }
 
 export class Router {
-  private completionRead?: { key: string; result: Promise<MessageRecord[]>; records?: MessageRecord[]; at?: number };
+  private completionRead?: { key: string; result: Promise<MessageRecord[]>; timing: ReadTiming; records?: MessageRecord[]; at?: number };
   private completionTargetKey?: string;
   private completionWake = Promise.withResolvers<void>();
   private applyingCompletion = false;
+  private steerReadbacks = new Map<string, Promise<boolean>>();
+
+  private unresolvedSteers(turn: Turn, records: MessageRecord[]): Set<string> {
+    const start = records.findIndex(record => record.id === turn.messageId);
+    if (start < 0 || !records.slice(start + 1).some(record => record.type === "idle")) return new Set();
+    return new Set(this.store.pendingInbound().flatMap(row => {
+      const prompt = `msg_${hash(row.id)}`;
+      const attempt = this.store.get<SteerAttempt | null>(`steer-attempt:${row.id}`);
+      // Retire only the proven original run. The sealed attempt still owns readback and same-id replay.
+      return attempt && this.current(attempt) && turn.steered?.includes(prompt)
+        && (this.steering(row.id) || this.store.get(`batch-phase:${row.id}`) === "queued-steer")
+        && !records.some(record => record.id === prompt) ? [prompt] : [];
+    }));
+  }
+
+  private async steerAccepted(route: Route, prompt: string): Promise<boolean> {
+    const key = JSON.stringify([route.id, route.directory, route.generation, prompt]);
+    let read = this.steerReadbacks.get(key);
+    if (!read) {
+      read = this.backend.promptAccepted(route.id, route.directory, prompt);
+      this.steerReadbacks.set(key, read);
+    }
+    try {
+      const accepted = await this.reading(read);
+      if (this.steerReadbacks.get(key) === read) this.steerReadbacks.delete(key);
+      return accepted;
+    } catch (error) {
+      if (error !== completionReady && this.steerReadbacks.get(key) === read) this.steerReadbacks.delete(key);
+      throw error;
+    }
+  }
 
   private completionKey(turn: Turn): string {
     return JSON.stringify([turn.id, turn.directory, turn.generation, turn.messageId, turn.startedAt,
@@ -683,7 +714,8 @@ export class Router {
     const turn = this.store.get<Turn | null>("activeTurn");
     const read = this.completionRead;
     if (!turn || !this.current(turn) || read?.key !== this.completionKey(turn) || !read.records) return false;
-    const prompts = [turn.messageId, ...turn.steered ?? []];
+    const deferred = this.unresolvedSteers(turn, read.records);
+    const prompts = [turn.messageId, ...turn.steered ?? []].filter(id => !deferred.has(id));
     if (prompts.some(id => !read.records!.some(record => record.id === id))) return false;
     let last = -1;
     read.records.forEach((record, i) => { if (prompts.includes(record.id)) last = i; });
@@ -703,8 +735,8 @@ export class Router {
       || Date.now() - this.completionRead.at! < 1_000)) return this.completionRead.result.then(() => {}, () => {});
     const mark = this.store.get<Watermark | null>("watermark");
     const read: NonNullable<Router["completionRead"]> = { key,
-      result: this.backend.messages(turn.id, turn.directory, turn.background ? { until: turn.messageId, limit: 20 }
-        : mark?.sessionId === turn.id ? { until: mark.id } : { until: turn.messageId, since: turn.startedAt - 60_000 }),
+      ...captureReadTiming(() => this.backend.messages(turn.id, turn.directory, turn.background ? { until: turn.messageId, limit: 20 }
+        : mark?.sessionId === turn.id ? { until: mark.id } : { until: turn.messageId, since: turn.startedAt - 60_000 })),
     };
     this.completionRead = read;
     return read.result.then(records => {
@@ -1832,7 +1864,7 @@ export class Router {
     const attempt: SteerAttempt | undefined = this.store.get<SteerAttempt | null>(`steer-attempt:${row.id}`)
       ?? (turn?.steered?.includes(messageId) ? turn : undefined);
     if (attempt) {
-      const accepted = await this.reading(this.backend.promptAccepted(attempt.id, attempt.directory, messageId)).catch((caughtError) => { toolError("router", "router.catch7", caughtError); return undefined; });
+      const accepted = await this.steerAccepted(attempt, messageId).catch((caughtError) => { toolError("router", "router.catch7", caughtError); return undefined; });
       if (accepted === undefined) {
         this.options.log?.("steer-readback-unknown", `id=${row.id}`);
         return;
@@ -1949,7 +1981,7 @@ export class Router {
     } finally { abort.abort(); }
     if (delivery === "refused") {
       // A replayed send can be refused after its first try landed; only then is the text already in.
-      const accepted = await this.reading(this.backend.promptAccepted(turn.id, turn.directory, messageId)).catch((caughtError) => { toolError("router", "router.catch10", caughtError); return undefined; });
+      const accepted = await this.steerAccepted(turn, messageId).catch((caughtError) => { toolError("router", "router.catch10", caughtError); return undefined; });
       if (accepted === undefined) return;
       if (accepted) this.consumeSteer(row.id, sent);
       else {
@@ -4207,6 +4239,7 @@ export class Router {
       void this.checkCompletion();
       const read = this.completionRead;
       if (!read || read.key !== this.completionKey(turn)) return;
+      includeReadTiming(read.timing);
       let messages = await bounded(read.result, READ_WAIT_MS);
       if (read.key !== this.completionKey(turn)) return;
       this.applyingCompletion = this.completedSnapshot();
@@ -4220,7 +4253,8 @@ export class Router {
         if (!accepted || accepted.phase !== "running" || !this.current(accepted)) return;
         turn = accepted;
       }
-      const ownedPrompts = new Set([turn.messageId, ...turn.steered ?? []]);
+      const deferredSteers = this.unresolvedSteers(turn, messages);
+      const ownedPrompts = new Set([turn.messageId, ...turn.steered ?? []].filter(id => !deferredSteers.has(id)));
       let lastPrompt = -1;
       messages.forEach((record, index) => {
         if (ownedPrompts.has(record.id) && (turn!.background || record.type === "user")) lastPrompt = index;
@@ -4254,6 +4288,7 @@ export class Router {
       let expansionHeld = false;
       try {
         for (const id of [turn.messageId, ...turn.steered ?? []]) {
+          if (deferredSteers.has(id)) continue;
           if (messages.some(record => record.id === id)) continue;
           const extended = await this.reading(this.backend.messages(turn.id, turn.directory, { until: id, since: turn.startedAt - 60_000 }));
           if (!this.current(turn)) return;
@@ -4291,7 +4326,7 @@ export class Router {
       // A steered text that landed after the run ended starts a run of its own; the turn waits for that one too.
       let steered = -1;
       after.forEach((m, index) => { if (m.type === "user" && ownedPrompts.has(m.id)) steered = index; });
-      const missing = (turn.steered ?? []).some(id => !messages.slice(Math.max(start, 0)).some(m => m.type === "user" && m.id === id))
+      const missing = (turn.steered ?? []).some(id => !deferredSteers.has(id) && !messages.slice(Math.max(start, 0)).some(m => m.type === "user" && m.id === id))
         && Date.now() - (turn.steeredAt ?? 0) < STEER_SETTLE_MS;
       const found = after.slice(steered + 1).findIndex(m => m.type === "idle");
       const end = missing || found < 0 ? -1 : steered + 1 + found;
