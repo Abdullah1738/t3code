@@ -4,7 +4,10 @@ import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Logger from "effect/Logger";
+import * as References from "effect/References";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
 import { McpSchema } from "effect/ai";
@@ -12,6 +15,7 @@ import { McpSchema } from "effect/ai";
 import * as BoardLocks from "../engine/boardLocks.ts";
 import * as SavedWrite from "../engine/savedWrite.ts";
 import * as SavedReply from "./savedReply.ts";
+import { McpCall } from "../../analytics/McpCall.ts";
 
 const reply = new McpSchema.CallToolResult({ content: [] });
 const callResult = Schema.decodeUnknownSync(McpSchema.CallToolResult);
@@ -34,6 +38,142 @@ const captureTrace = () => {
   });
   return { spans, tracer };
 };
+
+it.effect("a completed follow-up read does not replace a foreground admission stage", () =>
+  Effect.gen(function* () {
+    const scope = yield* Scope.Scope;
+    const { spans, tracer } = captureTrace();
+    const locks = yield* BoardLocks.make();
+    const held = yield* Deferred.make<void>();
+    const readStarted = yield* Deferred.make<void>();
+    const finishRead = yield* Deferred.make<void>();
+    const readDone = yield* Deferred.make<void>();
+    const warnings: Array<unknown> = [];
+    const logger = Logger.make(({ message }) => {
+      warnings.push(message);
+    });
+    const callState: McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "foreground",
+      phase: "handler",
+      saved: "unknown",
+    };
+    const holder = yield* Effect.forkChild(
+      locks.board("a", Deferred.succeed(held, undefined).pipe(Effect.andThen(Effect.never))),
+    );
+    yield* Deferred.await(held);
+    const call = yield* Effect.forkChild(
+      SavedReply.protect(
+        SavedWrite.mutating(
+          Effect.gen(function* () {
+            yield* SavedWrite.stage(
+              Deferred.succeed(readStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(finishRead)),
+              ),
+              "read",
+            ).pipe(Effect.andThen(Deferred.succeed(readDone, undefined)), Effect.forkIn(scope));
+            yield* Deferred.await(readStarted);
+            return yield* locks.board("a", Effect.succeed(reply));
+          }),
+        ).pipe(Effect.provideService(BoardLocks.writeWaitMs, 60_000)),
+        "card_edit",
+      ).pipe(
+        Effect.withTracer(tracer),
+        Effect.provideService(McpCall, callState),
+        Effect.provideService(References.MinimumLogLevel, "Warn"),
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      ),
+    );
+    yield* TestClock.adjust(1_000);
+    yield* Deferred.succeed(finishRead, undefined);
+    yield* Deferred.await(readDone);
+    yield* TestClock.adjust(24_000);
+    yield* Fiber.join(call);
+    const span = spans.find((span) => span.name === "KanbanTools.savedReply")!;
+    yield* Fiber.interrupt(holder);
+    assert.strictEqual(span.attributes.get("kanban.reply.stage_at_timeout"), "admission");
+    assert.strictEqual(span.attributes.get("kanban.reply.stage_ms.admission"), 25_000);
+    assert.strictEqual(span.attributes.get("kanban.reply.stage_ms.mutate"), 0);
+    assert.strictEqual(callState.replyStage, "admission");
+    assert.deepInclude(warnings, [
+      "kanban saved write reply unavailable",
+      {
+        timedOut: true,
+        saved: false,
+        commitStarted: false,
+        ...Object.fromEntries(
+          [...span.attributes].filter(
+            ([key]) => key.startsWith("kanban.reply.") && !key.startsWith("kanban.reply.stage_ms."),
+          ),
+        ),
+      },
+    ]);
+  }).pipe(Effect.scoped),
+);
+
+it.effect.each(["read", "commit"] as const)(
+  "a detached %s cannot replace admission and keeps existing commit evidence",
+  (name) =>
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope;
+      const { spans, tracer } = captureTrace();
+      const locks = yield* BoardLocks.make();
+      const held = yield* Deferred.make<void>();
+      const begin = yield* Deferred.make<void>();
+      const entered = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const done = yield* Deferred.make<void>();
+      const holder = yield* Effect.forkChild(
+        locks.board("a", Deferred.succeed(held, undefined).pipe(Effect.andThen(Effect.never))),
+      );
+      yield* Deferred.await(held);
+      const call = yield* Effect.forkChild(
+        SavedReply.protect(
+          SavedWrite.mutating(
+            Effect.gen(function* () {
+              const stalled = Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(finish)),
+              );
+              yield* Deferred.await(begin).pipe(
+                Effect.andThen(
+                  SavedWrite.stage(
+                    name === "commit"
+                      ? SavedWrite.committing.pipe(Effect.andThen(stalled))
+                      : stalled,
+                    name,
+                  ),
+                ),
+                SavedWrite.background,
+                Effect.andThen(Deferred.succeed(done, undefined)),
+                Effect.forkIn(scope),
+              );
+              return yield* locks.board("a", Effect.succeed(reply));
+            }),
+          ).pipe(Effect.provideService(BoardLocks.writeWaitMs, 60_000)),
+          "card_update",
+        ).pipe(Effect.withTracer(tracer)),
+      );
+      yield* TestClock.adjust(1_000);
+      yield* Deferred.succeed(begin, undefined);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(24_000);
+      const result = callResult(yield* Fiber.join(call));
+      const span = spans.find((span) => span.name === "KanbanTools.savedReply")!;
+      assert.strictEqual(span.attributes.get("kanban.reply.stage_at_timeout"), "admission");
+      assert.strictEqual(span.attributes.get("kanban.reply.stage_ms.admission"), 25_000);
+      assert.strictEqual(span.attributes.get("kanban.reply.commit_started"), name === "commit");
+      assert.strictEqual(
+        replyData(result.structuredContent).saved,
+        name === "commit" ? null : false,
+      );
+      const attributes = Object.fromEntries(span.attributes);
+      yield* Deferred.succeed(finish, undefined);
+      yield* Deferred.await(done);
+      assert.deepStrictEqual(Object.fromEntries(span.attributes), attributes);
+      yield* Fiber.interrupt(holder);
+    }).pipe(Effect.scoped),
+);
 
 it.effect("an ungranted admission identifies the stage and an unsaved write", () =>
   Effect.gen(function* () {

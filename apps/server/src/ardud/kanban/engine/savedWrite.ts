@@ -8,7 +8,8 @@ export type Stage = "caller" | "admission" | "read" | "mutate" | "commit";
 export const traceObserver = Context.Reference<
   | {
       readonly span: Tracer.Span;
-      readonly enter: (stage: Stage) => () => void;
+      readonly enter: (stage: Stage, fiberId: number) => () => void;
+      readonly mark: (stage: Stage, fiberId: number) => void;
     }
   | undefined
 >("KanbanSavedWriteTrace", { defaultValue: () => undefined });
@@ -20,8 +21,9 @@ export const stage = Effect.fnUntraced(function* <A, E, R>(
 ) {
   const trace = yield* traceObserver;
   if (trace === undefined) return yield* effect;
+  const fiberId = yield* Effect.fiberId;
   return yield* Effect.acquireUseRelease(
-    Effect.sync(() => trace.enter(name)),
+    Effect.sync(() => trace.enter(name, fiberId)),
     () =>
       effect.pipe(
         Effect.withSpan("KanbanSavedWrite.stage", { attributes: { "kanban.reply.stage": name } }),
@@ -34,8 +36,13 @@ export const stage = Effect.fnUntraced(function* <A, E, R>(
 export const mutating = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
   const trace = yield* traceObserver;
   if (trace === undefined) return yield* effect;
-  trace.enter("mutate");
+  trace.mark("mutate", yield* Effect.fiberId);
   return yield* effect.pipe(Effect.withSpan("KanbanSavedWrite.mutate"));
+});
+
+// Detached work keeps commit/receipt evidence, but cannot advance the reply's stage.
+export const background = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
+  return yield* effect.pipe(Effect.provideService(traceObserver, undefined));
 });
 
 // MCP's toolkit restores its registration context, including ParentSpan. Link the
@@ -64,7 +71,11 @@ export const commitObserver = Context.Reference<() => void>("KanbanSavedWriteCom
 });
 
 // Runs at every store write; the enclosing lock operation already supplies its span.
-export const committing = Effect.flatMap(commitObserver, (observe) => Effect.sync(observe));
+export const committing = Effect.gen(function* () {
+  const trace = yield* traceObserver;
+  trace?.mark("commit", yield* Effect.fiberId);
+  (yield* commitObserver)();
+});
 
 export const record = Effect.fn("KanbanSavedWrite.record")(function* (saved: Saved) {
   (yield* observer)(saved);

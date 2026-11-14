@@ -32,22 +32,40 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   const clock = yield* Clock.Clock;
   const started = clock.monotonicTimeNanosUnsafe();
   const elapsed = () => Number(clock.monotonicTimeNanosUnsafe() - started) / 1_000_000;
+  let baseStage: SavedWrite.Stage = "caller";
+  const scopes = new Map<symbol, { stage: SavedWrite.Stage; fiberId: number }>();
   let stage: SavedWrite.Stage = "caller";
   let stageSince = 0;
   const totals = new Map<SavedWrite.Stage, number>();
   let stageAtTimeout: SavedWrite.Stage | null = null;
   let timerLatenessMs: number | null = null;
-  const enter = (next: SavedWrite.Stage) => {
+  let closed = false;
+  const updateStage = () => {
+    if (closed) return;
     const now = elapsed();
     const total = (totals.get(stage) ?? 0) + now - stageSince;
     totals.set(stage, total);
     span.attribute(`kanban.reply.stage_ms.${stage}`, total);
-    const previous = stage;
-    stage = next;
+    stage = [...scopes.values()].at(-1)?.stage ?? baseStage;
     stageSince = now;
+  };
+  // Parallel scopes can end in either order. Removing only this token preserves
+  // the newest scope still running instead of resurrecting a captured stage.
+  const enter = (next: SavedWrite.Stage, fiberId: number) => {
+    if (closed) return () => {};
+    const token = Symbol();
+    scopes.set(token, { stage: next, fiberId });
+    updateStage();
     return () => {
-      enter(previous);
+      if (scopes.delete(token)) updateStage();
     };
+  };
+  const mark = (next: SavedWrite.Stage, fiberId: number) => {
+    if (closed) return;
+    const scope = [...scopes.values()].findLast((scope) => scope.fiberId === fiberId);
+    if (scope === undefined) baseStage = next;
+    else scope.stage = next;
+    updateStage();
   };
   const parent = yield* SavedWrite.observer;
   const parentCommitting = yield* SavedWrite.commitObserver;
@@ -121,11 +139,10 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     );
   };
   const work = effect.pipe(
-    Effect.provideService(SavedWrite.traceObserver, { span, enter }),
+    Effect.provideService(SavedWrite.traceObserver, { span, enter, mark }),
     Effect.provideService(BoardLocks.writeWaitMs, ADMISSION_BUDGET_MS),
     Effect.provideService(SavedWrite.commitObserver, () => {
       commitStarted = true;
-      enter("commit");
       parentCommitting();
     }),
     Effect.provideService(SavedWrite.observer, (saved) => {
@@ -186,7 +203,8 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     ),
     Effect.ensuring(
       Effect.sync(() => {
-        enter(stage);
+        updateStage();
+        closed = true;
         for (const [key, value] of Object.entries(attributes())) span.attribute(key, value);
       }),
     ),
