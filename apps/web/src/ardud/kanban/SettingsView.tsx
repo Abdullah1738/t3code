@@ -292,6 +292,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
   const canEdit = useKanbanPermission(KANBAN_WS_METHODS.boardUpdate);
   const canPool = useKanbanPermission(KANBAN_WS_METHODS.poolSet);
   const canRevoke = useKanbanPermission(KANBAN_WS_METHODS.standingApprovalRevoke);
+  const lastRelease = board.releaseLedger?.at(-1);
   // The level "Add model" gives a new pool; null when every level of it is pooled.
   const addLevel = (instanceId: ProviderInstanceId, model: string) =>
     boardPoolAddition(instanceId, model, instanceEntries, pools, apply);
@@ -314,6 +315,13 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
       </Section>
       {board.standingApprovals.some((entry) => entry.revokedAt === null) && (
         <Section title="Standing deploy approval">
+          {lastRelease && (
+            <p className="break-words text-sm text-(--m-muted)">
+              Last interrupting release: #{lastRelease.cardNumber} at{" "}
+              <time dateTime={lastRelease.at}>{new Date(lastRelease.at).toLocaleString()}</time>
+              {lastRelease.critical ? ` (critical: ${lastRelease.critical})` : ""}
+            </p>
+          )}
           {board.standingApprovals
             .filter((entry) => entry.revokedAt === null)
             .map((entry) => (

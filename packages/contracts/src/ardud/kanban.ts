@@ -139,6 +139,7 @@ export const KanbanSubtask = Schema.Struct({
   owner: KanbanSubtaskOwner,
   gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
   ownerOnly: Schema.optional(Schema.Boolean),
+  interrupting: Schema.optional(Schema.Boolean),
   createdAt: Schema.optional(IsoDateTime),
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   script: Schema.optional(Schema.String),
@@ -2037,6 +2038,9 @@ export type KanbanNightlyReview = typeof KanbanNightlyReview.Type;
 export const KanbanStandingApproval = Schema.Struct({
   id: TrimmedNonEmptyString,
   gate: Schema.Literal("deploy"),
+  minIntervalHours: Schema.optional(Schema.Number).pipe(
+    Schema.withDecodingDefault(Effect.succeed(4)),
+  ),
   quote: TrimmedNonEmptyString,
   sourceThreadId: TrimmedNonEmptyString,
   saidAt: IsoDateTime,
@@ -2048,6 +2052,17 @@ export const KanbanStandingApproval = Schema.Struct({
   revokeReason: Schema.NullOr(Schema.String),
 });
 export type KanbanStandingApproval = typeof KanbanStandingApproval.Type;
+
+export const KanbanRelease = Schema.Struct({
+  boardId: KanbanBoardId,
+  cardId: KanbanCardId,
+  cardNumber: Schema.Number,
+  subtaskId: TrimmedNonEmptyString,
+  at: IsoDateTime,
+  critical: Schema.NullOr(Schema.String),
+  approvalId: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type KanbanRelease = typeof KanbanRelease.Type;
 
 export const KanbanBoard = Schema.Struct({
   id: KanbanBoardId,
@@ -2065,6 +2080,9 @@ export const KanbanBoard = Schema.Struct({
   reviewChains: Schema.Array(KanbanReviewChain),
   defaultReviewChain: Schema.NullOr(TrimmedNonEmptyString),
   guessedGates: Schema.optional(Schema.Array(Schema.Literals(["deploy", "money", "secret"]))),
+  releaseLedger: Schema.optional(Schema.Array(KanbanRelease)).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
   standingApprovals: Schema.Array(KanbanStandingApproval).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),

@@ -18,6 +18,7 @@ import {
 } from "@t3tools/contracts";
 import { resolvedContext } from "../../analytics/McpCall.ts";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
@@ -451,10 +452,12 @@ const handlers = {
           const rows = Activity.activeCards(read.cards, byCard, window).map((card) =>
             Activity.compactRow(card, byCard.get(card.id) ?? [], window),
           );
+          const at = DateTime.formatIso(yield* DateTime.now);
           return Activity.pageRowsInReply(rows, input.after ?? 0, limit, (cards, cursor) => ({
             board: {
               id: board.id,
               name: board.name,
+              ...BoardReplies.boardReleaseSummary(board, at),
               window,
               legend: Activity.COMPACT_LEGEND,
               activeCards: rows.length,
@@ -473,7 +476,11 @@ const handlers = {
         const cards = snapshot.cards.slice(0, limit);
         return {
           board: {
-            ...BoardReplies.compactBoard({ ...snapshot, cards }),
+            ...BoardReplies.compactBoard(
+              { ...snapshot, cards },
+              undefined,
+              DateTime.formatIso(yield* DateTime.now),
+            ),
             page: { limit, hasMore, nextAfter: hasMore ? cards.at(-1)!.number : null },
           },
           prompts: "omitted; card_get returns a card's prompt",
