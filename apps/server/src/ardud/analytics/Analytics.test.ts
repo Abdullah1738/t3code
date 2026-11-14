@@ -535,6 +535,10 @@ describe("Analytics", () => {
             tool: "card_update",
             outcome: "ok",
             durationMs: 1,
+            saved: true,
+            responseDelivery: "closed",
+            responseElapsedMs: 25,
+            responseCloseReason: "peer_end",
           }),
         );
         yield* analytics.record(
@@ -564,6 +568,18 @@ describe("Analytics", () => {
         );
         assert.equal(full.total, 3);
         assert.lengthOf(full.mcpCalls, 2);
+        const filter = { day, kind: "mcp.call", responseDelivery: "closed" as const };
+        const dropped = yield* analytics.read(filter);
+        assert.equal(dropped.rollup.total, 1);
+        assert.deepInclude(dropped.samples[0], {
+          saved: true,
+          responseDelivery: "closed",
+          responseCloseReason: "peer_end",
+        });
+        const cached = yield* analytics.read(filter);
+        assert.deepEqual(cached.samples, dropped.samples);
+        const cold = yield* open(setup);
+        assert.deepEqual((yield* cold.read(filter)).samples, dropped.samples);
       }).pipe(Effect.provide(NodeServices.layer)),
   );
   it.effect("flushes before reads, filters samples, and atomically saves the full rollup", () =>

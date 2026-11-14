@@ -1,5 +1,6 @@
 import * as OwnerAnalytics from "../ardud/analytics/Analytics.ts";
 import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
+import * as McpResponseDelivery from "../ardud/http/McpResponseDelivery.ts";
 import * as StartupPhaseLog from "../ardud/observability/StartupPhaseLog.ts";
 import { bootId } from "../ardud/fast-install/report.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
@@ -248,7 +249,11 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
       name: undefined,
       threadId: invocation.thread?.threadId,
     };
+    const delivery = McpResponseDelivery.forRequest(request.source);
     return yield* httpEffect.pipe(
+      delivery === undefined
+        ? (effect) => effect
+        : Effect.provideService(McpResponseDelivery.McpResponseDelivery, delivery),
       Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
       Effect.provideService(McpReplyCapture, capture),
       Effect.map(normalizeMcpHttpResponse),
@@ -1039,6 +1044,11 @@ const withToolAnalytics =
               });
               const startedAt = yield* Clock.currentTimeMillis;
               const started = yield* Clock.monotonicTimeNanos;
+              const delivery = yield* Effect.serviceOption(McpResponseDelivery.McpResponseDelivery);
+              if (Option.isSome(delivery)) {
+                delivery.value.tool = options.tool.name;
+                if (invocation?.thread) delivery.value.callerThreadId = invocation.thread.threadId;
+              }
               const callState: McpCallAnalytics.McpCall["Service"] = {
                 callerResolved: false,
                 callerResolveMs: 0,
@@ -1046,6 +1056,7 @@ const withToolAnalytics =
                 phase: "handler",
                 saved: "unknown",
               };
+              let handlerEnded: bigint | undefined;
               const parentSaved = yield* SavedWrite.observer;
               const parentCommitting = yield* SavedWrite.commitObserver;
               const identifiers = McpCallAnalytics.callIdentifiers(
@@ -1056,7 +1067,7 @@ const withToolAnalytics =
               const row = Effect.fnUntraced(function* (
                 outcome: ReturnType<typeof McpCallAnalytics.callOutcome>,
               ) {
-                const ended = yield* Clock.monotonicTimeNanos;
+                const ended = handlerEnded ?? (yield* Clock.monotonicTimeNanos);
                 const interrupted =
                   outcome.outcome === "interrupted" ||
                   outcome.outcome === "interrupted_by_shutdown";
@@ -1102,6 +1113,7 @@ const withToolAnalytics =
                     : { waitLookupMs: callState.waitLookupMs }),
                   durationMs: Math.max(0, Number(ended - started) / 1e6),
                   ...outcome,
+                  ...(Option.isSome(delivery) ? delivery.value.snapshot() : {}),
                   props: {
                     ...outcome.props,
                     ...(callState.boardId ? { boardId: callState.boardId } : {}),
@@ -1221,6 +1233,7 @@ const withToolAnalytics =
                   // Handoff tools look up threads to record; the response must not wait on them.
                   return Effect.gen(function* () {
                     const endedAt = yield* Clock.currentTimeMillis;
+                    handlerEnded = yield* Clock.monotonicTimeNanos;
                     const resolved = {
                       ...(identifiers.boardId ? { boardId: identifiers.boardId } : {}),
                       ...(callState.boardId ? { boardId: callState.boardId } : {}),
@@ -1233,9 +1246,17 @@ const withToolAnalytics =
                         durationMs: Math.max(0, endedAt - startedAt),
                         outcome: outcome.outcome,
                       });
-                    yield* complete
+                    // Waiting here would prevent the response from being written. Keep the
+                    // ledger entry pending until Node finishes or loses the response instead.
+                    const writeRow = complete
                       .value(row(outcome))
                       .pipe(Effect.interruptible, Effect.timeout("1 second"), Effect.ignoreCause);
+                    if (Option.isSome(delivery))
+                      yield* delivery.value.settled.pipe(
+                        Effect.andThen(writeRow),
+                        Effect.forkDetach,
+                      );
+                    else yield* writeRow;
                     yield* Effect.gen(function* () {
                       // The anonymous analytics event counts the completed input retry only.
                       if (result instanceof McpSchema.InputRequired) return;
