@@ -6,7 +6,6 @@ import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 
 const [root, main, command, ...args] = process.argv.slice(2);
-const originalCwd = process.cwd();
 const hint = `run offbox run -- vp ${[command, ...args].filter(Boolean).join(" ")}`;
 function refuse(reason) {
   throw new Error(`${reason}; ${hint}`);
@@ -102,11 +101,22 @@ function argv() {
       }
     } else {
       const negative = command === "fmt" && arg.startsWith("!");
-      const target = absolute(negative ? arg.slice(1) : arg);
+      const pattern = negative ? arg.slice(1) : arg;
+      const target = absolute(pattern);
       if (command === "fmt") {
-        // Literal file lists bypass Oxfmt's nested ignores and use different glob semantics.
-        // Keep patterns relative to their original cwd so Oxfmt owns discovery, including no matches.
-        result.push(arg);
+        // Oxfmt rejects '..' paths and skips absolute globs. Root patterns at the worktree,
+        // while leaving discovery to Oxfmt so dotfiles and nested ignores keep their semantics.
+        let relative = path.relative(root, target) || ".";
+        // A basename-only glob matches recursively; adding the cwd prefix must preserve that.
+        if (
+          !fs.existsSync(target) &&
+          path.dirname(path.normalize(pattern)) === "." &&
+          /[*?{[]/.test(pattern) &&
+          path.dirname(relative) !== "."
+        ) {
+          relative = path.join(path.dirname(relative), "**", path.basename(relative));
+        }
+        result.push(`${negative ? "!" : ""}${relative}`);
         if (!negative) paths++;
       } else if (/[*?{[]/.test(arg)) {
         const matches = fs.globSync(arg);
@@ -196,7 +206,7 @@ try {
     }
   }
   // Both tools anchor ignores and overrides to the config directory, not the file arguments.
-  // Keep the snapshot at the worktree root; fmt also needs its original cwd for native glob discovery.
+  // Keep both the snapshot and fmt's native glob discovery rooted at the worktree.
   temporary = path.join(root, `.vp-worktree-${randomUUID()}.json`);
   config.ignorePatterns = [...(config.ignorePatterns ?? []), ".vp-worktree-*.json"];
   fs.writeFileSync(temporary, JSON.stringify(config), { flag: "wx", mode: 0o600 });
@@ -215,7 +225,7 @@ try {
     path.join(main, "node_modules/.bin/vp"),
     [command, "--config", temporary, ...ignores, ...forwarded],
     {
-      cwd: command === "fmt" ? originalCwd : main,
+      cwd: command === "fmt" ? root : main,
       stdio: "inherit",
     },
   );

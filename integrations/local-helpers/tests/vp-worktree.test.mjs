@@ -76,7 +76,7 @@ function fixture(t, nativeModules) {
     const r = run(args, cwd);
     assert.equal(r.status, 0, r.stderr);
     const result = JSON.parse(r.stdout);
-    assert.equal(result.cwd, args[0] === "fmt" ? cwd : main);
+    assert.equal(result.cwd, args[0] === "fmt" ? wt : main);
     assert.match(r.stderr, /no node_modules in this worktree; running/);
     assert.equal(path.dirname(result.args[2]), wt);
     assert.equal(fs.existsSync(result.args[2]), false, "temporary config cleaned up");
@@ -85,14 +85,14 @@ function fixture(t, nativeModules) {
   return { main, wt, run, routed, fake };
 }
 
-test("fmt preserves caller cwd and paths; lint uses main cwd and absolute paths", (t) => {
+test("fmt uses worktree-root patterns; lint uses main cwd and absolute paths", (t) => {
   const f = fixture(t);
   for (const command of ["fmt", "lint"]) {
     const r = f.routed([command, "--check", "src/a b.ts", path.join(f.wt, "other.ts")]);
     assert.deepEqual(r.args.slice(-3), [
       "--check",
       command === "fmt" ? "src/a b.ts" : path.join(f.wt, "src/a b.ts"),
-      path.join(f.wt, "other.ts"),
+      command === "fmt" ? "other.ts" : path.join(f.wt, "other.ts"),
     ]);
     assert.deepEqual(r.config.ignorePatterns, ["dist/**", ".vp-worktree-*.json"]);
   }
@@ -107,7 +107,7 @@ test("no paths means the worktree root, including from a nested cwd", (t) => {
     assert.ok(f.routed(args, nested).args.includes(f.wt));
   }
   assert.equal(f.routed(["lint", "src/a.ts"], nested).args.at(-1), path.join(nested, "src/a.ts"));
-  assert.equal(f.routed(["fmt", "a.ts"], nested).args.at(-1), "a.ts");
+  assert.equal(f.routed(["fmt", "a.ts"], nested).args.at(-1), "apps/server/a.ts");
 });
 
 test("argument classes: spaced/equals values, paths, globs, exclusions, separator", (t) => {
@@ -157,6 +157,34 @@ test("fmt delegates globs, exclusions and empty selections unchanged to Oxfmt", 
   }
 });
 
+test("fmt normalizes nested cwd, parent segments, absolute globs, and exclusions without expanding", (t) => {
+  const f = fixture(t);
+  const nested = path.join(f.wt, "src");
+  fs.mkdirSync(nested);
+  const rows = [
+    ["../shared/ok.ts", "shared/ok.ts"],
+    ["../shared/./bad.ts", "shared/bad.ts"],
+    ["./local/../ok.ts", "src/ok.ts"],
+    [path.join(f.wt, "shared/*.ts"), "shared/*.ts"],
+    ["../shared/**/*.ts", "shared/**/*.ts"],
+    ["!../shared/ignored.ts", "!shared/ignored.ts"],
+    ["../shared dir/*.ts", "shared dir/*.ts"],
+    ["*.ts", "src/**/*.ts"],
+    ["./*.ts", "src/**/*.ts"],
+    ["!d*.ts", "!src/**/d*.ts"],
+  ];
+  for (const [input, expected] of rows) {
+    assert.deepEqual(f.routed(["fmt", input, "ok.ts"], nested).args.slice(-2), [
+      expected,
+      "src/ok.ts",
+    ]);
+  }
+  assert.deepEqual(f.routed(["fmt", "--", "../-dash.ts"], nested).args.slice(-2), [
+    "--",
+    "-dash.ts",
+  ]);
+});
+
 // Compare the selected files and writes with the pinned tool, not a second JS glob implementation.
 const selectionCases = [
   { name: "star includes dotfiles", paths: ["src/*.ts"] },
@@ -193,6 +221,132 @@ const selectionCases = [
     flags: ["--ignore-path", "$ROOT/custom.ignore"],
     write: true,
   },
+  {
+    name: "parent-relative clean file",
+    cwd: "src",
+    paths: ["../shared/ok.ts"],
+    nativePaths: ["shared/ok.ts"],
+    expectedCount: "1",
+    expectedStatus: 0,
+  },
+  {
+    name: "parent-relative bad file",
+    cwd: "src",
+    paths: ["../shared/bad.ts"],
+    nativePaths: ["shared/bad.ts"],
+    expectedCount: "1",
+    expectedStatus: 1,
+  },
+  { name: "parent-relative directory", cwd: "src", paths: ["../shared"], nativePaths: ["shared"] },
+  {
+    name: "parent-relative glob",
+    cwd: "src",
+    paths: ["../shared/*.ts"],
+    nativePaths: ["shared/*.ts"],
+  },
+  {
+    name: "absolute sibling glob",
+    cwd: "src",
+    paths: ["$ROOT/shared/*.ts"],
+    nativePaths: ["shared/*.ts"],
+  },
+  {
+    name: "absolute sibling glob with unmatched permitted",
+    cwd: "src",
+    paths: ["$ROOT/shared/*.ts"],
+    nativePaths: ["shared/*.ts"],
+    flags: ["--no-error-on-unmatched-pattern"],
+    expectedCount: "3",
+    expectedStatus: 1,
+  },
+  {
+    name: "absolute sibling recursive glob",
+    cwd: "src",
+    paths: ["$ROOT/shared/**/*.ts"],
+    nativePaths: ["shared/**/*.ts"],
+  },
+  {
+    name: "absolute sibling file",
+    cwd: "src",
+    paths: ["$ROOT/shared/bad.ts"],
+    nativePaths: ["shared/bad.ts"],
+  },
+  {
+    name: "parent glob and exclusion",
+    cwd: "src",
+    paths: ["../shared/*.ts", "!../shared/.*.ts"],
+    nativePaths: ["shared/*.ts", "!shared/.*.ts"],
+  },
+  {
+    name: "absolute glob and exclusion",
+    cwd: "src",
+    paths: ["$ROOT/shared/*.ts", "!$ROOT/shared/.*.ts"],
+    nativePaths: ["shared/*.ts", "!shared/.*.ts"],
+  },
+  {
+    name: "parent directory with spaces",
+    cwd: "src",
+    paths: ["../shared dir/*.ts"],
+    nativePaths: ["shared dir/*.ts"],
+  },
+  {
+    name: "mixed local and sibling globs",
+    cwd: "src",
+    paths: ["*.ts", "../shared/*.ts"],
+    nativePaths: ["src/**/*.ts", "shared/*.ts"],
+  },
+  {
+    name: "parent glob nested ignore write",
+    cwd: "src",
+    paths: ["../shared/*.ts"],
+    nativePaths: ["shared/*.ts"],
+    write: true,
+  },
+  {
+    name: "absolute glob nested ignore write",
+    cwd: "src",
+    paths: ["$ROOT/shared/*.ts"],
+    nativePaths: ["shared/*.ts"],
+    write: true,
+  },
+  {
+    name: "absolute unmatched sibling glob",
+    cwd: "src",
+    paths: ["$ROOT/missing/*.ts"],
+    nativePaths: ["missing/*.ts"],
+    flags: ["--no-error-on-unmatched-pattern"],
+    expectedCount: "0",
+    expectedStatus: 0,
+  },
+  {
+    name: "parent unmatched sibling glob",
+    cwd: "src",
+    paths: ["../missing/*.ts"],
+    nativePaths: ["missing/*.ts"],
+    flags: ["--no-error-on-unmatched-pattern"],
+    expectedCount: "0",
+    expectedStatus: 0,
+  },
+  { name: "nested dot-prefixed basename glob", cwd: "src", paths: ["./*.ts"] },
+  { name: "nested basename question mark", cwd: "src", paths: ["o?.ts"] },
+  { name: "nested basename brace", cwd: "src", paths: ["{ok,deep}.ts"] },
+  { name: "nested basename character class", cwd: "src", paths: ["[od]*.ts"] },
+  { name: "nested basename exclusion", cwd: "src", paths: ["*.ts", "!d*.ts"] },
+  {
+    name: "nested unmatched basename glob",
+    cwd: "src",
+    paths: ["missing*.ts"],
+    flags: ["--no-error-on-unmatched-pattern"],
+    expectedCount: "0",
+    expectedStatus: 0,
+  },
+  {
+    name: "nested normalized basename glob",
+    cwd: "src",
+    paths: ["./local/../*.ts"],
+    nativePaths: ["src/**/*.ts"],
+  },
+  { name: "nested literal metacharacter filename", cwd: "src", paths: ["literal[1].ts"] },
 ];
 
 for (const row of selectionCases) {
@@ -211,6 +365,14 @@ for (const row of selectionCases) {
         "src/nested/deep.ts": "export const deep={a:1}\n",
         "src/ignored.ts": "export const ignored={a:1}\n",
         "src/.gitignore": "ignored.ts\n",
+        "src/literal[1].ts": "export const literal = 1;\n",
+        "shared/ok.ts": "export const ok = 1;\n",
+        "shared/bad.ts": "export const bad={a:1}\n",
+        "shared/.hidden.ts": "export const hidden={a:1}\n",
+        "shared/nested/deep.ts": "export const deep={a:1}\n",
+        "shared/ignored.ts": "export const ignored={a:1}\n",
+        "shared/.gitignore": "ignored.ts\n",
+        "shared dir/bad.ts": "export const bad={a:1}\n",
         "custom.ignore": "src/.hidden.ts\n",
         "unselected.ts": "export const unselected={a:1}\n",
       };
@@ -219,15 +381,18 @@ for (const row of selectionCases) {
           fs.mkdirSync(path.dirname(path.join(base, name)), { recursive: true });
           fs.writeFileSync(path.join(base, name), body);
         }
-      const args = (base) =>
+      const args = (base, paths = row.paths) =>
         [
           "fmt",
           row.write ? "--write" : "--check",
           "--threads=1",
           ...(row.flags ?? []),
-          ...row.paths,
+          ...paths,
         ].map((value) => value.replaceAll("$ROOT", base));
-      const native = f.native(args(f.main), path.join(f.main, row.cwd ?? ""));
+      const native = f.native(
+        args(f.main, row.nativePaths),
+        path.join(f.main, row.nativePaths ? "" : (row.cwd ?? "")),
+      );
       const routed = f.run(args(f.wt), path.join(f.wt, row.cwd ?? ""));
       assert.equal(
         routed.status,
@@ -243,6 +408,8 @@ for (const row of selectionCases) {
       }
       const count = (output) => /on (\d+) files/.exec(output)?.[1];
       assert.equal(count(routed.stdout), count(native.stdout), "same number of checked files");
+      if (row.expectedCount !== undefined) assert.equal(count(routed.stdout), row.expectedCount);
+      if (row.expectedStatus !== undefined) assert.equal(routed.status, row.expectedStatus);
       if (row.name === "star includes dotfiles") {
         assert.equal(routed.status, 1);
         assert.match(routed.stdout, /\.hidden\.ts/);
