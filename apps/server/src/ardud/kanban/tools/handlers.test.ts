@@ -6432,7 +6432,15 @@ it.effect(
                       ? { seq: seed.seq }
                       : {}),
               });
-              assert.equal(result.isError, operation === "ask" && caller === worker, result.text);
+              const denied =
+                caller === worker &&
+                discussion.cardId !== null &&
+                (operation === "post" || operation === "ask");
+              assert.equal(result.isError, denied, result.text);
+              if (denied) {
+                assert.include(result.text, "capability_denied");
+                assert.include(result.text, `can't change card #${card.number}`);
+              }
               for (const row of [
                 yield* Deferred.await(pending.ledger),
                 yield* Deferred.await(pending.generic),
