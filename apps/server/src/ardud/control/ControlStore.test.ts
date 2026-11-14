@@ -377,7 +377,7 @@ it.effect(
               const query = span.attributes.get("db.query.text");
               if (
                 typeof query === "string" &&
-                query.includes("ardud_control_thread_candidates_idx")
+                query.includes("ardud_control_thread_candidates_desc_idx")
               )
                 statements.push(query);
             };
@@ -420,7 +420,7 @@ it.effect(
             bindings,
           );
           assert.isTrue(
-            plan.some((row) => row.detail.includes("ardud_control_thread_candidates_idx")),
+            plan.some((row) => row.detail.includes("ardud_control_thread_candidates_desc_idx")),
           );
           assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")));
           const code = yield* sql.unsafe<{ opcode: string; p1: number; p2: number; p3: number }>(
@@ -503,8 +503,8 @@ it.effect("candidate cursor pages handle tied dates, filters and a capped page s
       } while (after !== undefined);
       assert.lengthOf(ids, 270);
       assert.equal(new Set(ids).size, 270);
-      assert.equal(ids[0], "page-000");
-      assert.equal(ids.at(-1), "page-269");
+      assert.equal(ids[0], "page-269");
+      assert.equal(ids.at(-1), "page-000");
     }),
   ),
 );

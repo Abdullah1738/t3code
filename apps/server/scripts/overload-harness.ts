@@ -309,6 +309,7 @@ const threads = Layer.effect(
       } satisfies KanbanThreadView;
     });
     return KanbanThreads.of({
+      claimContext: () => Effect.succeed(null),
       view,
       find: view,
       model: () => Effect.succeed(model),
