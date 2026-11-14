@@ -21,6 +21,8 @@ import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as McpDeadline from "../../../mcp/McpDeadline.ts";
 import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import type { EvaluatorPurpose } from "../engine/briefs.ts";
@@ -1050,6 +1052,13 @@ const handlers = {
           })),
           holdsSlot: next.holdsSlot,
         };
+      }),
+    ).pipe(
+      NodeSqliteClient.foregroundReads,
+      McpDeadline.awaitInterruptibly,
+      Effect.timeoutOrElse({
+        duration: "2 seconds",
+        orElse: () => invalid("card_next is busy; retry shortly."),
       }),
     ),
   ),

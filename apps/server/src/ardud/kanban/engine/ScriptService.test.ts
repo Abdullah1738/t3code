@@ -63,6 +63,7 @@ const threads = Layer.succeed(
   KanbanThreads,
   KanbanThreads.of({
     pendingUserInputs: () => Effect.succeed([]),
+    claimContext: () => Effect.succeed(null),
     view: () => Effect.succeed(null),
     find: () => Effect.succeed(null),
     lastFailure: () => Effect.succeed(null),
@@ -956,6 +957,7 @@ it.effect(
       KanbanThreads,
       KanbanThreads.of({
         pendingUserInputs: () => Effect.succeed([]),
+        claimContext: () => Effect.succeed(null),
         view: () => Effect.succeed(null),
         find: () => Effect.succeed(null),
         lastFailure: () => Effect.succeed(null),

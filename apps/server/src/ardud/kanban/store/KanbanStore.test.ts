@@ -1919,3 +1919,44 @@ it.effect("card write watches cover raw and bulk writers and end with their pass
     );
   }).pipe(Effect.provide(TestLayer)),
 );
+
+it.effect(
+  "poolThreadIds counts distinct active threads across work and review without decoding history",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      for (const [index, pool, thread, role] of [
+        [1, "pool", "worker", "work"],
+        [2, "pool", "worker", "work"],
+        [3, "pool", "reviewer", "review"],
+        [4, "other-pool", "elsewhere", "work"],
+        [5, "pool", null, null],
+      ] as const)
+        yield* store.putCard({
+          ...card(index, "working"),
+          activePool: pool,
+          activeThreadId: thread === null ? null : ThreadId.make(thread),
+          activeRole: role,
+        });
+      assert.sameMembers([...(yield* store.poolThreadIds(boardId, "pool"))], ["worker", "reviewer"]);
+      assert.deepEqual(yield* store.poolThreadIds(boardId, "missing"), []);
+    }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect(
+  "claimCards keeps seeds and recursive blockers while omitting unrelated history and ending cycles",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const seed = card(1, "needs_review");
+      const todo = { ...card(2, "todo"), blockedBy: [card(3, "completed").id] };
+      const blocker = { ...card(3, "completed"), blockedBy: [card(4, "needs_owner").id] };
+      const ancestor = { ...card(4, "needs_owner"), blockedBy: [blocker.id] };
+      for (const row of [seed, todo, blocker, ancestor, card(5, "completed"), card(6, "deployed")])
+        yield* store.putCard(row);
+      assert.deepEqual(
+        (yield* store.claimCards(boardId, [seed.id])).map((row) => row.id),
+        [seed.id, todo.id, blocker.id, ancestor.id],
+      );
+    }).pipe(Effect.provide(TestLayer)),
+);

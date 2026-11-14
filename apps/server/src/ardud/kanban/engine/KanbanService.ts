@@ -1888,6 +1888,7 @@ const make = Effect.gen(function* () {
     { defaultValue: () => undefined },
   );
   const threads: typeof threadIo = {
+    claimContext: (id) => threadRead("claimContext", id, threadIo.claimContext(id)),
     pendingUserInputs: (id) =>
       TickTimings.measure(
         "thread_status",
@@ -11153,17 +11154,13 @@ const make = Effect.gen(function* () {
   const agentCall: KanbanServiceShape["agentCall"] = Effect.fn("KanbanService.agentCall")(
     function* <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) {
       return yield* Effect.acquireUseRelease(
-        guard(
-          "agentCall",
-          Effect.gen(function* () {
-            yield* store.threadLink(threadId);
-            // Track the whole request: it can expose a claim through a read or a no-op mutation.
-            agentCalls.set(threadId, (agentCalls.get(threadId) ?? 0) + 1);
-            for (const pending of delivering.values()) {
-              if (pending.threadId === threadId) pending.touched = true;
-            }
-          }).pipe(NodeSqliteClient.readOnly),
-        ),
+        // These in-memory markers must be atomic with delivery/rollback, but need no board lock or I/O.
+        Effect.sync(() => {
+          agentCalls.set(threadId, (agentCalls.get(threadId) ?? 0) + 1);
+          for (const pending of delivering.values()) {
+            if (pending.threadId === threadId) pending.touched = true;
+          }
+        }),
         () => effect,
         () =>
           Effect.sync(() => {
@@ -11694,25 +11691,32 @@ const make = Effect.gen(function* () {
    * Where a work thread stands: its board, pool, project, the cards it carries
    * and the card it started on, whose review chain and goal new cards inherit.
    */
-  const workThreadOf = Effect.fn("KanbanService.workThreadOf")(function* (threadId: ThreadId) {
-    const link = yield* store.threadLink(threadId);
+  const workThreadOf = Effect.fn("KanbanService.workThreadOf")(function* (
+    threadId: ThreadId,
+    compact = false,
+  ) {
+    const reader = compact ? rawStore : store;
+    const link = yield* reader.threadLink(threadId);
     if (!link || link.role !== "work") {
       return yield* failWith("denied", "only a card's work thread takes cards");
     }
     const board = yield* boardOf(link.boardId);
-    const view = yield* threads.view(threadId);
+    const context = compact ? yield* threads.claimContext(threadId) : null;
+    const view = compact ? context : yield* threads.view(threadId);
     if (!view) return yield* failWith("not-found", `thread ${threadId}`);
-    const carried = yield* store.cardsByThread(threadId);
+    const carried = yield* reader.cardsByThread(threadId);
     const held = (yield* Ref.get(holds)).get(threadId);
     // Past the last card and the hold, the thread's own model still names its pool.
     const pool =
       carried[0]?.activePool ??
       held?.pool ??
       Rules.poolOf(
-        yield* store.pools(board.id),
-        (yield* threads.model(threadId)) ?? link.model ?? board.defaultCardModel,
+        yield* reader.pools(board.id),
+        context?.model ?? (yield* threads.model(threadId)) ?? link.model ?? board.defaultCardModel,
       );
-    const origin = carried[0] ?? (link.cardId ? yield* store.card(link.cardId) : null);
+    const origin = compact
+      ? null
+      : (carried[0] ?? (link.cardId ? yield* store.card(link.cardId) : null));
     return {
       link,
       board,
@@ -11722,22 +11726,6 @@ const make = Effect.gen(function* () {
       pool,
       holdsSlot: carried.length > 0 || held !== undefined,
     };
-  });
-
-  /**
-   * Cards this thread carried that are still its own: one that moved to
-   * another thread no longer counts as this thread's work.
-   */
-  const ownCards = Effect.fn("KanbanService.ownCards")(function* (
-    threadId: ThreadId,
-    cards: ReadonlyArray<KanbanCard>,
-  ) {
-    const carried = yield* carriedIds(threadId);
-    return new Set<string>(
-      cards
-        .filter((card) => carried.has(card.id) && card.workThreadId === threadId)
-        .map((card) => card.id),
-    );
   });
 
   /** Every card a thread has carried, owned now or not. */
@@ -11964,39 +11952,57 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const nextCards: KanbanServiceShape["nextCards"] = (threadId) =>
-    read(
-      Effect.gen(function* () {
-        const thread = yield* workThreadOf(threadId);
-        const cards = yield* store.cards(thread.board.id);
-        const mine = yield* ownCards(threadId, cards);
-        const pools = yield* store.pools(thread.board.id);
-        const slots = pools.find((pool) => pool.key === thread.pool)?.slots ?? 0;
-        // Without a slot of its own the thread can only claim while the pool has room.
-        const full =
-          !thread.holdsSlot &&
-          (Rules.poolThreads(cards, yield* boardHolds(thread.board.id)).get(thread.pool)?.size ??
-            0) >= slots;
-        return {
-          carrying: thread.carried,
-          candidates: full
-            ? []
-            : Rules.relatedCandidates({
-                board: thread.board,
-                cards,
-                groups: yield* store.groups(thread.board.id),
-                seeds: cards.filter((card) => mine.has(card.id)),
-                threadId,
-                pool: thread.pool,
-                projectId: thread.projectId,
-                carrying: thread.carried.length,
-                slots,
-                pools,
-              }),
-          holdsSlot: thread.holdsSlot,
-        } satisfies NextCards;
-      }),
-    );
+  const nextCards: KanbanServiceShape["nextCards"] = Effect.fn("KanbanService.nextCards")(
+    function* (threadId) {
+      yield* Effect.annotateCurrentSpan("kanban.thread_id", threadId);
+      return yield* readDb(
+        Effect.gen(function* () {
+          const thread = yield* workThreadOf(threadId, true);
+          const pools = yield* store.pools(thread.board.id);
+          const slots = pools.find((pool) => pool.key === thread.pool)?.slots ?? 0;
+          const empty = {
+            carrying: thread.carried,
+            candidates: [],
+            holdsSlot: thread.holdsSlot,
+          } satisfies NextCards;
+          if (slots <= 0 || thread.carried.length >= Rules.MAX_BATCH) return empty;
+          // Occupancy needs ids only; a released worker in a full pool cannot take more work.
+          if (!thread.holdsSlot) {
+            const occupied = new Set(yield* store.poolThreadIds(thread.board.id, thread.pool));
+            for (const [id, pool] of yield* boardHolds(thread.board.id)) {
+              if (pool === thread.pool) occupied.add(id);
+            }
+            if (occupied.size >= slots) return empty;
+          }
+          const carried = yield* carriedIds(threadId);
+          if (carried.size === 0) return empty;
+          // Include every blocker recursively: omitting an ancestor would make a held card look claimable.
+          const cards = yield* store.claimCards(thread.board.id, [...carried]);
+          const mine = new Set(
+            cards
+              .filter((card) => carried.has(card.id) && card.workThreadId === threadId)
+              .map((card) => card.id),
+          );
+          return {
+            carrying: thread.carried,
+            candidates: Rules.relatedCandidates({
+              board: thread.board,
+              cards,
+              groups: yield* store.groups(thread.board.id),
+              seeds: cards.filter((card) => mine.has(card.id)),
+              threadId,
+              pool: thread.pool,
+              projectId: thread.projectId,
+              carrying: thread.carried.length,
+              slots,
+              pools,
+            }),
+            holdsSlot: thread.holdsSlot,
+          } satisfies NextCards;
+        }),
+      ).pipe(NodeSqliteClient.foregroundReads);
+    },
+  );
 
   /**
    * A card moved to the backlog while a thread has it is paused: the thread

@@ -73,6 +73,7 @@ export const makeFake = Effect.gen(function* () {
     KanbanThreads,
     KanbanThreads.of({
       pendingUserInputs: () => Effect.succeed([]),
+      claimContext: () => Effect.succeed(null),
       view,
       find: view,
       launch: (input) =>

@@ -231,6 +231,7 @@ const makeWorld = (
     KanbanThreads,
     KanbanThreads.of({
       pendingUserInputs: () => Effect.succeed([]),
+      claimContext: () => Effect.succeed(null),
       view,
       find: view,
       lastFailure: () => Effect.succeed(null),

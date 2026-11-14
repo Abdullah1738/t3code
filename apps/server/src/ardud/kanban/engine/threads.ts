@@ -121,6 +121,12 @@ export interface KanbanThreadsShape {
     }>,
     KanbanThreadError
   >;
+  readonly claimContext: (
+    threadId: ThreadId,
+  ) => Effect.Effect<
+    { readonly projectId: ProjectId; readonly model: ModelSelection } | null,
+    KanbanThreadError
+  >;
   readonly view: (threadId: ThreadId) => Effect.Effect<KanbanThreadView | null>;
   /** Like view, but a failed read fails: null means the thread is gone. */
   readonly find: (threadId: ThreadId) => Effect.Effect<KanbanThreadView | null, KanbanThreadError>;
@@ -311,6 +317,17 @@ const make = Effect.gen(function* () {
     },
     Effect.mapError(
       (error) => new KanbanThreadError({ operation: "view", detail: detailOf(error) }),
+    ),
+  );
+
+  const claimContext = Effect.fn("KanbanThreads.claimContext")(
+    function* (threadId: ThreadId) {
+      // Claim eligibility needs neither thread history nor activity/shell aggregation.
+      const row = yield* threads.getCallerRow(threadId);
+      return row === null ? null : { projectId: row.projectId, model: row.modelSelection };
+    },
+    Effect.mapError(
+      (error) => new KanbanThreadError({ operation: "claimContext", detail: detailOf(error) }),
     ),
   );
 
@@ -800,6 +817,7 @@ const make = Effect.gen(function* () {
 
   return KanbanThreads.of({
     pendingUserInputs,
+    claimContext,
     view,
     find,
     model,
