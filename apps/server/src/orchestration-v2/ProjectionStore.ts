@@ -190,7 +190,8 @@ export type ProjectionRecoveryKind =
   | "interrupted-runs"
   | "runtime"
   | "subagent-results"
-  | "delegated-completions";
+  | "delegated-completions"
+  | "runless-provider-turns";
 
 export type ProjectionLimitRecoveryCandidate = Pick<
   OrchestrationV2ThreadShell,
@@ -803,6 +804,19 @@ function needsRecovery(
         projection.thread.archivedAt === null &&
         projection.runs.some((run) => run.status === "running") &&
         projection.runs.some((run) => run.status === "queued")
+      );
+    case "runless-provider-turns":
+      return projection.providerTurns.some(
+        (turn) =>
+          turn.runAttemptId === null &&
+          (turn.status === "pending" || turn.status === "running") &&
+          projection.nodes.some(
+            (node) =>
+              node.id === turn.nodeId &&
+              node.kind === "root_turn" &&
+              node.runId === null &&
+              ["completed", "failed", "interrupted", "cancelled"].includes(node.status),
+          ),
       );
     case "interrupted-runs":
       return projection.runs.some((run) =>
@@ -4297,6 +4311,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                       AND active.status = 'running' AND active.thread_id = queued.thread_id
                   )
               `;
+            case "runless-provider-turns":
+              return sql`
+                SELECT turn.thread_id
+                FROM orchestration_v2_projection_provider_turns AS turn
+                  INDEXED BY ardud_runless_provider_turns_live_idx
+                CROSS JOIN orchestration_v2_projection_nodes AS node ON node.node_id = turn.node_id
+                WHERE turn.run_attempt_id IS NULL AND turn.status IN ('pending', 'running')
+                  AND node.thread_id = turn.thread_id
+                  AND node.kind = 'root_turn' AND node.run_id IS NULL
+                  AND node.status IN ('completed', 'failed', 'interrupted', 'cancelled')
+              `;
             case "interrupted-runs":
               return sql`
                 SELECT thread_id FROM orchestration_v2_projection_runs
@@ -4447,7 +4472,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       (effect, kind) =>
         kind === "subagent-results" ||
         kind === "delegated-completions" ||
-        kind === "running-queued-runs"
+        kind === "running-queued-runs" ||
+        kind === "runless-provider-turns"
           ? effect.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads)
           : effect,
     );
@@ -4980,7 +5006,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               FROM orchestration_v2_projection_provider_turns AS provider_turn
               WHERE provider_turn.thread_id = ${threadId}
                 AND provider_turn.status IN ('pending', 'starting', 'running', 'waiting')
-                AND provider_turn.run_attempt_id IN (
+                AND (provider_turn.run_attempt_id IS NULL OR provider_turn.run_attempt_id IN (
                   SELECT attempt_id FROM orchestration_v2_projection_run_attempts
                   WHERE thread_id = ${threadId}
                     AND run_id IN (
@@ -4988,6 +5014,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                       WHERE thread_id = ${threadId}
                         AND status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
                     )
+                )
                 )
               ORDER BY provider_turn.provider_thread_id ASC, provider_turn.ordinal ASC
             `,

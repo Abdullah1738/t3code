@@ -121,6 +121,7 @@ it.effect("parks automatic pull until activation without delaying command readin
           reconcile: () => Effect.succeed(recovery),
         }),
         Layer.mock(Orchestrator.OrchestratorV2)({
+          repairRunlessProviderTurns: Effect.succeed({ candidates: 0, turnsEnded: 0 }),
           recoverDelegatedTasks: Effect.succeed(emptyDelegatedRecoveryCounts),
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ shutdown: Effect.void }),

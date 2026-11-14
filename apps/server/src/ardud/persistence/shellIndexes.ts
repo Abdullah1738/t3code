@@ -60,6 +60,12 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
       Effect.logWarning("Could not prepare the threads-with-pull-requests index", { cause }),
     ),
   );
+  // Startup repair scans only active runless turns, then probes roots by primary key.
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_runless_provider_turns_live_idx
+    ON orchestration_v2_projection_provider_turns(thread_id, node_id)
+    WHERE run_attempt_id IS NULL AND status IN ('pending', 'running')
+  `;
   // Only unfinished running turns need the second range scan.
   yield* sql`
     CREATE INDEX IF NOT EXISTS ardud_provider_turns_running_started_idx
