@@ -388,7 +388,12 @@ const makeHarness = (
                   enqueueCommand: (effect) => effect,
                 }),
                 Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({
-                  latestAgentSequence: () => Effect.succeed(42),
+                  latestAgentSequence: () =>
+                    sql`SELECT 42 AS sequence`.pipe(
+                      NodeSqliteClient.readOnly,
+                      Effect.map((rows) => Number(rows[0]!.sequence)),
+                      Effect.orDie,
+                    ),
                 }),
                 Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
                 Layer.mock(ServerSecretStore.ServerSecretStore)({}),
@@ -490,13 +495,15 @@ describe("control listings", () => {
           VALUES ('ses_owner', 'live-running', '2026-11-14')`;
         const held = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
-        const holder = yield* sql.withTransaction(
-          Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
-        ).pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
+        const holder = yield* sql
+          .withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          )
+          .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
         yield* Deferred.await(held);
-        const response = yield* h.get("/threads/by-native/ses_owner?view=owner").pipe(
-          Effect.timeout("5 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)),
-        );
+        const response = yield* h
+          .get("/threads/by-native/ses_owner?view=owner")
+          .pipe(Effect.timeout("5 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
         yield* Fiber.join(holder);
         assert.strictEqual(response.status, 200);
         assert.strictEqual(response.body.thread.threadId, "live-running");
@@ -527,8 +534,11 @@ describe("control listings", () => {
         const detail = yield* get("/threads/live-running");
         assert.strictEqual(JSON.stringify(full.body.thread), JSON.stringify(detail.body.thread));
         for (const view of ["", "invalid", "full", "OWNER", "owner "]) {
-        assert.strictEqual((yield* get(`/threads/by-native/ses_owner?view=${encodeURIComponent(view)}`)).status, 400);
-      }
+          assert.strictEqual(
+            (yield* get(`/threads/by-native/ses_owner?view=${encodeURIComponent(view)}`)).status,
+            400,
+          );
+        }
         assert.strictEqual((yield* get("/threads/by-native/unknown?view=owner")).status, 404);
         assert.strictEqual(
           (yield* get("/threads/by-native/ses_owner?driver=codex&view=owner")).status,
@@ -1015,6 +1025,41 @@ describe("control listings", () => {
       heldConnection,
       suffix,
     })),
+  );
+  it.live.each(["/health", "/projects"])(
+    "GET %s completes while the background reader is held",
+    (endpoint) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "control-health-latency-" });
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const harness = yield* makeHarness();
+          const expected = yield* harness.get(endpoint);
+          assert.equal(expected.status, 200);
+          const entered = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const holder = yield* sql
+            .withTransaction(
+              Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+            )
+            .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
+          yield* Deferred.await(entered);
+          yield* Effect.gen(function* () {
+            const response = yield* harness.get(endpoint);
+            assert.equal(response.status, 200);
+            if (endpoint === "/health") assert.equal(response.body.sequence, 42);
+            else assert.deepEqual(response.body.projects, expected.body.projects);
+            assert.equal(response.body.ok, true);
+            assert.isUndefined(holder.pollUnsafe());
+          }).pipe(
+            Effect.timeout("500 millis"),
+            Effect.ensuring(Deferred.succeed(release, undefined)),
+          );
+          yield* Fiber.join(holder);
+        }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
   it.live.each(requestHoldCases)(
     "GET requests$suffix completes while the $heldConnection is held",

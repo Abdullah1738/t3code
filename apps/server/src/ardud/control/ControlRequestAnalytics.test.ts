@@ -1,5 +1,5 @@
 import { assert, it } from "@effect/vitest";
-import type { AnalyticsEvent } from "@t3tools/contracts";
+import { AnalyticsEvent } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
@@ -7,9 +7,73 @@ import * as Fiber from "effect/Fiber";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
+import * as Tracer from "effect/Tracer";
+import * as Stream from "effect/Stream";
+import * as Schema from "effect/Schema";
 import * as Analytics from "../analytics/Analytics.ts";
 import { accumulate, finishRollup, makeAccumulator } from "../analytics/rollup.ts";
 import { observe, sendMode } from "./ControlRequestAnalytics.ts";
+
+const decodeAnalyticsEvent = Schema.decodeUnknownSync(AnalyticsEvent, {
+  onExcessProperty: "error",
+});
+
+it.effect(
+  "records canonical routes, response status and setup duration in spans and hourly analytics",
+  () =>
+    Effect.gen(function* () {
+      const samples: AnalyticsEvent[] = [];
+      const spans: Tracer.NativeSpan[] = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          spans.push(span);
+          return span;
+        },
+      });
+      yield* observe(
+        "control.events",
+        TestClock.adjust("25 millis").pipe(
+          Effect.as(HttpServerResponse.stream(Stream.never, { status: 200 })),
+        ),
+        { path: "/api/ardud/control/events", method: "GET" },
+      ).pipe(
+        Effect.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              Effect.sync(() => {
+                samples.push(event);
+              }),
+          }),
+        ),
+        Effect.withTracer(tracer),
+      );
+      assert.equal(samples.length, 1);
+      assert.deepEqual(decodeAnalyticsEvent(samples[0]), samples[0]);
+      assert.equal(samples[0]!.durationMs, 25);
+      assert.equal(samples[0]!.route, "control.events");
+      assert.equal(samples[0]!.props!.httpRoute, "/api/ardud/control/events");
+      assert.equal(samples[0]!.props!.httpMethod, "GET");
+      assert.equal(samples[0]!.props!.status, 200);
+      const span = spans.find((span) => span.name === "ArdudControl.request")!;
+      assert.deepInclude(Object.fromEntries(span.attributes), {
+        "http.route": "/api/ardud/control/events",
+        "http.request.method": "GET",
+        "http.response.status_code": 200,
+        "control.duration_ms": 25,
+      });
+      const accumulator = makeAccumulator();
+      for (const sample of samples) accumulate(accumulator, sample);
+      const rows = finishRollup(
+        accumulator,
+        "2026-01-01",
+        "2026-01-01T00:00:00.000Z",
+      ).controlRoutes!;
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0]!.p95Ms, 25);
+      assert.deepEqual(rows[0]!.statuses, { "200": 1 });
+    }),
+);
 
 it.effect(
   "rolls up identity, dispatch, steer and request reads with total, reader wait and outcome",

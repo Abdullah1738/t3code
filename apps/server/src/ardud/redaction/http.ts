@@ -4,6 +4,7 @@ import * as Schema from "effect/Schema";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as ThreadRedaction from "./ThreadRedaction.ts";
+import * as ControlRequestAnalytics from "../control/ControlRequestAnalytics.ts";
 
 const decode = Schema.decodeUnknownEffect(ThreadRedactionInput);
 const makeRoutes = Effect.gen(function* () {
@@ -38,4 +39,6 @@ const makeRoutes = Effect.gen(function* () {
   );
   return [HttpRouter.route("POST", "/api/ardud/control/threads/redact-item", handle)];
 });
-export const redactionRouteLayer = HttpRouter.addAll(makeRoutes);
+export const redactionRouteLayer = HttpRouter.addAll(
+  makeRoutes.pipe(Effect.flatMap(ControlRequestAnalytics.observeRoutes)),
+);
