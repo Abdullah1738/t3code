@@ -135,10 +135,12 @@ export interface WaitFacts {
    * the same readings builds it once; without it each card scans `prs`.
    */
   readonly prsByKey?: ReadonlyMap<string, WaitPrFacts> | undefined;
-  /** The board's cards by id. A card not in the map is gone. */
+  /** The board's cards and named wait targets by id. A card not in the map is gone. */
   readonly cards: ReadonlyMap<
     string,
-    Pick<KanbanCard, "id" | "number" | "stage" | "settledAt" | "subtasks">
+    Pick<KanbanCard, "id" | "number" | "stage" | "settledAt" | "subtasks"> & {
+      readonly boardName?: string;
+    }
   >;
 }
 
@@ -262,8 +264,14 @@ export function waitTarget(wait: KanbanWait, cards?: WaitFacts["cards"]): string
     case "owner_go":
       return `the owner's answer${wait.ask === null ? "" : ` to ${wait.ask}`}`;
     case "card": {
-      const target = wait.card === null ? undefined : cards?.get(wait.card);
-      return target ? `card #${target.number}` : "another card";
+      const target =
+        wait.card === null
+          ? undefined
+          : (cards?.get(wait.card) ??
+            (wait.cardTarget?.id === wait.card ? wait.cardTarget : undefined));
+      return target
+        ? `card #${target.number}${target.boardName ? ` (${target.boardName})` : ""}`
+        : "another card";
     }
     case "time":
       return wait.until === null ? "a set time" : `${wait.until}`;
@@ -302,6 +310,7 @@ export interface WaitCheckInput {
     readonly cards: ReadonlyArray<{
       readonly id: string;
       readonly number: number;
+      readonly boardName?: string;
       readonly stage: KanbanStage;
       /** Settled, or in a done stage with no merge left open. */
       readonly done: boolean;
@@ -455,7 +464,9 @@ const cardCheck: WaitChecker = ({ wait, facts }) => {
   if (wait.card === null) return HOLD;
   const target = facts.cards.find((entry) => entry.id === wait.card);
   if (target === undefined) return wake("The card it waited on is gone", { to: "evaluator" });
-  return target.done ? wake(`Card #${target.number} is done`) : HOLD;
+  return target.done
+    ? wake(`Card #${target.number}${target.boardName ? ` (${target.boardName})` : ""} is done`)
+    : HOLD;
 };
 
 const timeCheck: WaitChecker = ({ wait, facts }) => {
@@ -572,6 +583,22 @@ export const waitingFor = (wait: KanbanWait, cards?: WaitFacts["cards"]): string
 /** A wait that ended, with why: "Wait ended: trading-core#544 merged". */
 export const waitEndedBody = (reason: string) => `Wait ended: ${reason}`;
 
+/**
+ * Whether a stored event set or ended a wait, in either form it is stored under
+ * (its own kind, or the plain edit used while `WAIT_EVENT_KINDS_LIVE` is off).
+ */
+export const waitEventOf = (
+  event: Pick<KanbanCardEvent, "kind" | "body">,
+): "set" | "end" | null => {
+  if (event.kind === "wait_set") return "set";
+  if (event.kind === "wait_cleared" || event.kind === "wait_expired") return "end";
+  if (event.kind !== "edited" || event.body === null) return null;
+  if (event.body.startsWith("Waiting ")) return "set";
+  if (event.body.startsWith("Wait ended: ") || event.body.startsWith("Wait expired: "))
+    return "end";
+  return null;
+};
+
 /** A wait someone cleared with card_wait clear. */
 export const waitClearedBody = (wait: KanbanWait, cards?: WaitFacts["cards"]) =>
   waitEndedBody(`cleared by hand (was waiting ${waitingFor(wait, cards)})`);
@@ -605,16 +632,17 @@ const reviewFinished = (card: Pick<KanbanCard, "reviewStep">, chainLength: numbe
 
 /**
  * Who acts next on a card in its stage: the worker in To-Do (unless the step
- * is the evaluator's or a script's), the reviewer for a card in or awaiting
+ * is the evaluator's or a script's and no findings are pending), the reviewer for a card in or awaiting
  * review whose chain hasn't passed, the evaluator for everything else.
  */
 export function nextActor(
-  card: Pick<KanbanCard, "stage" | "reviewStep" | "subtasks">,
+  card: Pick<KanbanCard, "stage" | "reviewStep" | "subtasks" | "reviewFindingsPending">,
   ctx: WaitContext,
 ): WaitRole {
   switch (card.stage) {
     case "todo":
     case "working":
+      if (card.reviewFindingsPending === true) return "work";
       return kanbanEvaluatorStep(card) || kanbanScriptStep(card) ? "evaluator" : "work";
     case "needs_review":
       return "review";
@@ -689,6 +717,7 @@ export function checkInput(
               {
                 id: target.id,
                 number: target.number,
+                ...(target.boardName === undefined ? {} : { boardName: target.boardName }),
                 stage: target.stage,
                 done:
                   target.settledAt !== null ||
@@ -933,20 +962,19 @@ export function resolveWait(
   checks: ReadonlyMap<string, WaitChecker> = WAIT_CHECKS,
 ): WaitStep {
   if (card.wait !== undefined && card.activeThreadId === null && kanbanWaitStale(card)) {
-    // Someone moved the card after the wait was set: they have it now.
-    return {
-      _tag: "end",
-      card: { ...kanbanWithoutWait(card), updatedAt: at },
-      event: {
-        kind: waitEventKind("wait_cleared"),
-        body: waitEndedBody(
-          `the card was moved to ${card.stage} while it waited ${waitingFor(card.wait, facts.cards)}`,
-        ),
-        fromStage: null,
-        toStage: null,
+    // Use the normal wake path so its note, dispatch stage and evaluator hold are saved too.
+    const ended = endWait(
+      card,
+      {
+        result: "wake",
+        to: card.wait.wakeRole ?? "none",
+        note: `the card was moved to ${card.stage} while it waited ${waitingFor(card.wait, facts.cards)}`,
       },
-      wake: { to: "none", why: "whoever moved the card has it" },
-    };
+      facts,
+      ctx,
+      at,
+    );
+    return { _tag: "end", ...ended };
   }
   const input = kanbanWaiting(card) ? checkInput(card, facts, ctx) : null;
   if (input === null) return { _tag: "none" };
@@ -1175,6 +1203,7 @@ export function checkWait(
   actor: KanbanActor,
   nowMs: number,
   wired: boolean = WAITS_ENGINE_WIRED,
+  activeThreadRunning = true,
 ): WaitCheck {
   const n = `card #${card.number}`;
   if (card.settledAt !== null) return denied(`${n} is settled`);
@@ -1192,9 +1221,11 @@ export function checkWait(
           : "This card is yours and you are running, so the board can't park it. Ask your board evaluator to set this wait (card_ask with to: evaluator, giving on, until or target, and the note), then end your turn; the evaluator sets it once your run has ended.",
       );
     }
-    return denied(
-      `${n} has a running thread, so it isn't waiting. Set the wait once the thread has handed the card on`,
-    );
+    if (activeThreadRunning) {
+      return denied(
+        `${n} has a running thread, so it isn't waiting. Set the wait once the thread has handed the card on`,
+      );
+    }
   }
   // A wait takes over a stalled flag, but only one its setter could clear (the card_flag rule).
   if (!mayClearFlag(card, actor)) {

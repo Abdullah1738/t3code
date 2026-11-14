@@ -1,43 +1,43 @@
 #!/usr/bin/env node
-import fs from "node:fs";
-import path from "node:path";
-import readline from "node:readline";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+import * as NodeReadline from "node:readline";
 const home = process.env.CODEX_HOME;
-if (!home || !fs.existsSync(path.join(home, ".crash-sandbox")))
+if (!home || !NodeFS.existsSync(NodePath.join(home, ".crash-sandbox")))
   throw Error("Expected marked synthetic home");
-const log = path.join(home, "provider-requests.ndjson");
-const stat = fs.readFileSync("/proc/self/stat", "utf8");
-fs.appendFileSync(
-  path.join(home, "processes.ndjson"),
+const log = NodePath.join(home, "provider-requests.ndjson");
+const stat = NodeFS.readFileSync("/proc/self/stat", "utf8");
+NodeFS.appendFileSync(
+  NodePath.join(home, "processes.ndjson"),
   JSON.stringify({
     pid: process.pid,
     startTime: stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/)[19],
-    executable: fs.readlinkSync("/proc/self/exe"),
+    executable: NodeFS.readlinkSync("/proc/self/exe"),
   }) + "\n",
 );
 let sequence = 0;
 function nextNative(kind) {
-  const file = path.join(home, kind + "-sequence");
+  const file = NodePath.join(home, kind + "-sequence");
   let n = 0;
   try {
-    n = Number(fs.readFileSync(file, "utf8"));
+    n = Number(NodeFS.readFileSync(file, "utf8"));
   } catch {}
-  fs.writeFileSync(file, String(n + 1));
+  NodeFS.writeFileSync(file, String(n + 1));
   return `${kind}-${n + 1}`;
 }
 let mcp;
 // The pool may give the child a fresh process instead of reusing the root's.
 // Keep this scenario boundary shared so either process follows the same plan.
-const delegationStarted = path.join(home, ".delegation-started");
-const hasDelegated = () => fs.existsSync(delegationStarted);
+const delegationStarted = NodePath.join(home, ".delegation-started");
+const hasDelegated = () => NodeFS.existsSync(delegationStarted);
 const mode = () => {
   try {
-    return JSON.parse(fs.readFileSync(path.join(home, ".crash-plan"), "utf8")).mode;
+    return JSON.parse(NodeFS.readFileSync(NodePath.join(home, ".crash-plan"), "utf8")).mode;
   } catch {
     return null;
   }
 };
-const boundary = (name) => fs.writeFileSync(path.join(home, ".boundary"), name);
+const boundary = (name) => NodeFS.writeFileSync(NodePath.join(home, ".boundary"), name);
 async function delegate() {
   const base = {
     method: "POST",
@@ -86,10 +86,10 @@ async function delegate() {
     }),
   });
   const result = await res.text();
-  fs.writeFileSync(path.join(home, "delegation-result.log"), result);
+  NodeFS.writeFileSync(NodePath.join(home, "delegation-result.log"), result);
 }
 const reply = (id, result) => process.stdout.write(JSON.stringify({ id, result }) + "\n");
-for await (const line of readline.createInterface({ input: process.stdin })) {
+for await (const line of NodeReadline.createInterface({ input: process.stdin })) {
   const m = JSON.parse(line);
   if (m.id === undefined) continue;
   const redacted = JSON.parse(
@@ -97,7 +97,7 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
       key.toLowerCase() === "http_headers" ? "[redacted]" : value,
     ),
   );
-  fs.appendFileSync(
+  NodeFS.appendFileSync(
     log,
     JSON.stringify({ at: Date.now(), pid: process.pid, method: m.method, params: redacted }) + "\n",
   );
@@ -165,9 +165,9 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
       if (mode() === "running") boundary("running");
       if (mode() === "awaiting" || mode() === "child") {
         if (!hasDelegated()) {
-          fs.writeFileSync(delegationStarted, "1\n");
+          NodeFS.writeFileSync(delegationStarted, "1\n");
           void delegate().catch((e) =>
-            fs.writeFileSync(path.join(home, "delegation-error.log"), String(e)),
+            NodeFS.writeFileSync(NodePath.join(home, "delegation-error.log"), String(e)),
           );
         } else boundary(mode());
       }

@@ -60,6 +60,7 @@ export interface BoardTileView {
   /** When it entered its stage; the tile's age counts from here. */
   readonly movedAt: string;
   readonly flag: CardFlag | null;
+  readonly askId?: string;
   /** Set with a stalled flag: the tile shows how long ago. */
   readonly flagSince: string | null;
   readonly goal: { readonly id: string; readonly name: string } | null;
@@ -497,7 +498,14 @@ export function createBoardView(): BoardViewEngine {
     const place = tilePlace(card, state, nowMs, kept, cardTruth(card, state, nowMs));
     const pr = card.links.find((link) => link.kind === "pr");
     const finished = card.subtasks.filter((subtask) => subtask.state !== "open").length;
+    const shownAsk =
+      flag?.kind === "ask"
+        ? card.stage === "needs_owner"
+          ? asks.findLast((ask) => ask.blocking && ask.text === card.question)
+          : openAsk
+        : undefined;
     const view: BoardTileView = {
+      ...(shownAsk ? { askId: shownAsk.id } : {}),
       id: card.id,
       number: card.number,
       title: card.title,

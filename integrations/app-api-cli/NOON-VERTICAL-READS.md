@@ -80,7 +80,8 @@ Static evidence: Hermes `getOrders` uses `FoodApi.post`; `getOrderTracking`
 uses `FoodApi.get`, the tracking path, exact order argument, and `/info` suffix.
 Use existing `noon` session with `x-mp=food`, `x-experience=food`, and revalidate
 whoami/Home. The list's four optional positional argument names/pagination
-contract were not fully decoded, so only the live-verified empty body is allowed.
+contract were not fully decoded in October. The explicit page contract is now
+verified below; callers omitting a page retain this original empty-body read.
 
 Live default list returned `status=success`, `data.pages=1`, 21 own orders.
 All 21 had agreement among `orderStatusCode=delivered`,
@@ -147,7 +148,9 @@ and a current-order ETA/rider-display contract remain unverified.
 - `track(order, service='food'|'marketplace'|'nownow', timeout=10, *, deadline=None)`;
   service is required. `deadline` is an internal absolute monotonic budget,
   inherited unchanged when the marketplace aggregator calls both readers.
-- `food_orders(timeout=10)` and `nownow_orders(timeout=10)`.
+- `food_orders(timeout=10, *, page=None)` and `nownow_orders(timeout=10, *, page=None)`.
+  An explicit page uses the verified ten-row request; omitted pages retain the
+  original default list and non-exhaustive coverage.
 - Raises the existing `NoonError` with sanitized codes.
 
 Parent may route explicit Food requests / validated `F...` order IDs here,
@@ -224,3 +227,104 @@ Relevant functions: NNMPBaseUrl/getUrl around disassembly line 4046257,
 NowNow config construction 1164956, orderDetails/trackOrder/orderHistory 2920578,
 getOrderDetailsV2 2555386, order screen getOrder 5079510, and item-group inventory
 consumption 5077760. These are APK facts, not remote configuration guesses.
+
+## History and placement-time proof (14 November 2026)
+
+Re-extracted the installed APK read-only. Hermes HBC98 source hash:
+`5b3d2a34efdc976ed0775abe14f49a8fd9c69cb8`. The following are line anchors in
+`hermesc -b -dump-bytecode`, not offsets in the older October bundle.
+
+### Food and NowNow local wall times
+
+The legacy Food order card `render` at 5511553 reads `createdAt` and formats it
+with `dayjs(value).format('DD MMM YYYY')` at 5511598, without UTC conversion.
+`FoodMyOrderDetailsScreen.render` reads the exact order's `createdAt` at 5574186
+and passes it to `formatDateTime`. NowNow `NNOrderInfoSection` at 3645390 and
+`NNOrderHistoryCardHeader` at 3656830 both pass `createdAt` to `formatTo12Hours`
+(3622154), which constructs `Date(value)` and uses `toLocaleDateString`.
+These are local-wall-time consumers. The separate Nano formatter at 5271644
+uses `dayjs.utc(...).local()`; it is **not** evidence that the legacy API returns
+UTC. Do not apply its convention to these routes.
+
+All 33 Food and 34 NowNow live list rows carried `timeZone='+04:00'`.
+Exact details for three orders in each lane echoed both the list creation time
+and that separate offset. Independent same-amount noon bank alerts established
+the following deltas (alert minus order, after applying the response offset):
+
+| Lane | Order wall time | Independent zoned charge time | Delta |
+|---|---|---|---:|
+| Food | 2026-11-12 17:26:39 | 2026-11-12T17:27:18+04:00 | 39 s |
+| Food | 2026-11-09 18:40:28 | 2026-11-09T18:40:47+04:00 | 19 s |
+| Food | 2026-11-07 17:14:47 | 2026-11-07T17:15:06+04:00 | 19 s |
+| NowNow | 2026-10-15 19:24:46 | 2026-10-15T15:32:14+00:00 | 448 s |
+| NowNow | 2026-10-14 11:33:58 | 2026-10-14T07:41:13+00:00 | 435 s |
+| NowNow | 2026-10-11 16:00:04 | 2026-10-11T12:08:11+00:00 | 487 s |
+
+Food corroboration used copied money-cases state; NowNow used local archived
+bank-alert timestamps, with message bodies only parsed in memory. No UTC
+interpretation matched these samples; no contrary match was found. These alerts
+corroborate the time zone, not exact payment-processing latency. Confirmation
+mail searches for the initial sample did not yield order confirmations.
+
+`placed_time` accepts an already zoned ISO timestamp, or a strict ISO wall time
+with the independently verified separate `+04:00` offset. Missing/malformed
+times and other separate offsets stay unknown. It never inserts a zone merely
+because the service is Food or NowNow. Lists and details share this parser.
+
+### Food and NowNow numbered pages
+
+Food `getOrders` at 2739881 constructs shape 22125. Object-key buffer file
+offset 9404404, shape offset 425286, four uint16 string IDs decode, in argument
+order, to **year, page, limit, customerCode**. The only enabled body is
+`{"page":N,"limit":10}`; year/customer filters remain unused.
+
+NowNow `orderHistory` at 3593048 passes its argument unchanged to
+`POST v1/order/history`. Its `useNNOrderHistory` continuation at 7810166 calls
+that method, tests `page`, and its reload paths at 7810006/7810069/7810121
+construct shape 24108 (**page, limit**). The response consumer at 7809950
+extracts `data.data.orders` and treats empty orders as the end.
+
+Live full traversal with that body:
+
+| Lane | Page 1 | Page 2 | Page 3 | Page 4 | Page 5 | Reported pages |
+|---|---:|---:|---:|---:|---:|---:|
+| Food | 10 | 10 | 10 | 3 | 0 | 4 |
+| NowNow | 10 | 10 | 10 | 4 | 0 | 4 |
+
+All IDs were distinct within and across pages; all normalized creation times
+were newest-first. The histories reached January and March 2024 respectively.
+Explicit numbered reads report `paging_verified`, `page`, `total_pages`,
+`ordered_by_placed_at`, and end-of-history `exhaustive`. This last flag describes
+the final page: a consumer must traverse the preceding pages before claiming
+an exhaustive lane. Repeated pages, missing page metadata and timestamp ties
+are tested at the money-cases boundary. Omitted-page reads remain unverified.
+
+### Marketplace cursors and whole-order evidence
+
+`getOrdersHistory` at 3016057 uses `ORDERS_HISTORY`, URL.search with `cursor`
+(shape 23861, offset 444652) and `limit` (shape 23862, offset 444660), then
+`api.get`. No numeric page parameter exists on this route. Live read-only
+`GET /_svc/order-v2/orders/history?limit=10&cursor=...` traversed **20 pages,
+197 distinct item/shipment cards**, ending with seven cards and `hasMore=false`.
+Every page added distinct cards. Orders can straddle pages because cards are
+item/shipment-scoped; repeated order IDs alone do not mean a repeated page.
+
+The cursor follows `pagination.nextCursor`; `hasMore` must be boolean and a
+continuation must have a nonempty, advancing cursor. The native reader accepts
+an optional cursor to avoid replaying prior requests; a standalone numbered
+page replays the chain within its existing deadline. Exact tracking keeps its
+original bounded active/history reads. Direct callers omitting `page` also keep
+their original request and first-page-only flags (including order discovery).
+History's `header.date` describes the
+terminal shipment event, **not order placement**, so no creation-time prefix
+coverage is claimed from Marketplace ordering.
+
+The exact full-order route continues to provide zoned `createdAt` (for example,
+the sampled third-page order returned `2026-10-22T10:33:08+04:00`). Its view
+`children` at 7354109 reads `createdAt`, `invoice`, and `itemGroups` from the
+same full-order object. Whole-order delivery still requires the existing
+independent invoice-count/complete-manifest proof described above. Details now
+expose that proof for cache eligibility. Cancellation/failure remains scoped
+and unproven for the whole order; neither freezes cached totals nor establishes
+a clean negative. Active rows without known placement times still block
+coverage until read, and Marketplace must exhaust history to prove absence.

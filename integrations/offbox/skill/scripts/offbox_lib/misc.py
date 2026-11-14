@@ -20,7 +20,7 @@ from pathlib import Path
 from time import monotonic, sleep
 
 from . import api, capacity, lease, outage, pool, ssh_sync
-from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
+from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_NOT_STARTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
                      OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, is_silenced, log, month_key, now,
                      delivered_bytes, offsets_path, out, read_json, record_delivery, require_mine, say, silence)
 from .common import mine as token_mine  # release() has its own `mine` flag
@@ -224,6 +224,10 @@ def _cancel_before_start(r):
     sent = False
     while True:
         r = _run_row(rid)
+        if r['status'] == 'forwarded':
+            return r, _follow_forwarded(r, 'kill')
+        if (r['client_pid'], r['start_at']) != (client, start_at):
+            return _cancel_before_start(r)
         if r["status"] not in ("starting", "running"):
             if r["status"] == "killed":
                 where = f"box {r['box_id']} returned to the pool" if r["box_id"] else "queued, no box used"
@@ -263,10 +267,11 @@ def _cancel_before_start(r):
             # including evidence the client records between our read and this write.
             changed = con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=? "
                                   "AND process_id IS NULL AND status IN ('starting','running') "
+                                  "AND client_pid IS ? AND start_at IS ? "
                                   "AND (box_id IS NULL OR (COALESCE(error,'')='' AND command_id IS NULL "
                                   "AND NOT EXISTS (SELECT 1 FROM kv WHERE k IN (?,?,?))))"
                                   + (" AND box_id IS NULL" if not r["box_id"] else ""),
-                                  (now(), error, rid, *start_keys)).rowcount
+                                  (now(), error, rid, client, start_at, *start_keys)).rowcount
             con.commit()
             if not changed:
                 alive = False
@@ -289,6 +294,8 @@ def kill_run(run_id: str, me: dict | None = None) -> int:
         require_proven(me, "kill")
         if r["owner"] != me["owner"]:
             raise OffboxError(f"run {rid} belongs to another caller; only its owner can kill it", code=2)
+    if r['status'] == 'forwarded':
+        return _follow_forwarded(r, 'kill')
     if r["status"] not in ("starting", "running"):
         raise OffboxError(f"run {rid} is already {r['status']}; nothing to kill", code=2)
     if r["mode"] == "local":
@@ -538,6 +545,8 @@ def _run_row(run_id: str):
     if not r:
         raise OffboxError(f"no run {run_id}", code=2)
     _require_my_run(r)
+    if r['status'] == 'forwarded':
+        return r  # The shared receipt now belongs to the destination backend, not this forwarding row.
     from .runs import finish, restore_run_state, terminal_result
     from . import start_check
     recovered = restore_run_state(r)
@@ -724,6 +733,9 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
                     data = (page.get('data') or '').encode()
                     nxt = page.get('nextOffset')
                     nxt = offsets[i] + len(data) if nxt is None else int(nxt)
+                    # Older home servers omit size; an empty live page can mean the command is quiet.
+                    if live and not data and nxt == offsets[i] and not page.get('done') and page.get('size') is None:
+                        break
                     if nxt <= offsets[i] and not page.get('done') and not (live and snapshot is not None and nxt >= snapshot):
                         if not live and r['mode'] == 'bg' and not length and not data and nxt == offsets[i] and empty_pages < 2:
                             empty_pages += 1
@@ -785,6 +797,8 @@ def _catch_up_finished(con, run_id, budget: float = 10) -> None:
         if planned_steps(r):
             return
         result = _catch_up_log(r, budget=min(10, budget), locked=True)
+        from . import resources
+        resources.finalize(r)
         if result == 'n/a' or result.startswith('incomplete:'):
             reason = result.split(':', 1)[1] if ':' in result else 'run log lock held'
             event(con, r['box_id'], 'log_catchup_failed', f"{run_id} {reason}")
@@ -793,6 +807,8 @@ def _catch_up_finished(con, run_id, budget: float = 10) -> None:
 
 
 def _incomplete_log(r, result) -> None:
+    if r['status'] == 'source_gone':
+        return
     settled = r['status'] not in ('starting', 'running')
     p = LOGS_DIR / f"{r['run_id']}.log"
     size = p.stat().st_size if p.exists() else 0
@@ -826,6 +842,9 @@ def _refresh_running_ttl(r, until=None) -> None:
 
 
 def _validated_step_row(r, code):
+    import offbox_disk_space
+    if dict(r).get('mode') != 'local' and offbox_disk_space.result(LOGS_DIR / f"{r['run_id']}.log", code).get('infra_failure'):
+        return dict(r, status='infra', exit_code=code)
     from .runs import planned_steps
     if not planned_steps(r):
         return r
@@ -837,9 +856,58 @@ def _validated_step_row(r, code):
     return dict(r, status=status, exit_code=code)
 
 
+def _follow_forwarded(r, command, *, timeout=None, follow=False) -> int:
+    env = dict(os.environ, OFFBOX_BACKEND=r['error'])
+    env.pop('OFFBOX_BACKGROUND_RUN', None)
+    args = [sys.executable, str(Path(__file__).resolve().parents[1] / 'offbox.py'), command, r['run_id']]
+    if timeout is not None:
+        args += ['--timeout', str(max(0, timeout))]
+    if follow:
+        args += ['--follow']
+    return subprocess.call(args, env=env)
+
+
+def _never_started(r) -> bool:
+    if r['mode'] == 'local':
+        return False
+    if r['status'] == 'killed':
+        return not r['box_id'] and not r['process_id']
+    return (r['status'] == 'lost' and r['exit_code'] is None
+            and (r['error'] == 'client ended before it got a box' or
+                 (not r['box_id'] and not r['process_id'])))
+
+
+def _report_never_started(r) -> int:
+    if r['status'] == 'killed':
+        say(f"{r['run_id']}: killed while queued; never started; nothing ran, safe to rerun")
+        return 130
+    client_log = LOGS_DIR / f"{r['run_id']}.client.log"
+    try:
+        with client_log.open('rb') as stream:
+            stream.seek(max(0, client_log.stat().st_size - 16384))
+            tail = stream.read().decode(errors='replace').splitlines()[-20:]
+    except OSError:
+        tail = []
+    guess = '' if client_log.exists() else ' (caller interrupted?)'
+    say(f"{r['run_id']}: never started: the offbox client that queued it ended before it got a box"
+        f"{guess}; nothing ran, safe to rerun")
+    if tail:
+        say(f"client log: {client_log}")
+        for line in tail:
+            say(line)
+    return EXIT_NOT_STARTED
+
+
 def logs(run_id: str, do_follow: bool) -> int:
     r = _run_row(run_id)
     _require_my_run(r)
+    if r['status'] == 'source_gone':
+        say(r['error'])
+        return 2
+    if r['status'] == 'forwarded':
+        return _follow_forwarded(r, 'logs', follow=do_follow)
+    if _never_started(r):
+        return _report_never_started(r)
     p = LOGS_DIR / f"{r['run_id']}.log"
     if r['status'] == 'lost' and r['exit_code'] is None and r['box_id']:
         if do_follow:
@@ -870,6 +938,8 @@ def logs(run_id: str, do_follow: bool) -> int:
                 f"or `offbox wait {r['run_id']} --timeout <s>` for current output.")
         return 0
     result = _catch_up_log(r, lock_wait=LOG_READ_WAIT_S)
+    from . import resources
+    resources.finalize(r)
     _tail(p, 0, True)
     from .runs import settled_steps_code, planned_steps
     code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
@@ -877,6 +947,12 @@ def logs(run_id: str, do_follow: bool) -> int:
     if code is None:
         from .run_evidence import report
         report(dict(r), p)
+    from .runs import space_result
+    effective = space_result(r['run_id'], code, p, report=True)
+    import offbox_disk_space
+    if (offbox_disk_space.result(p, code).get('infra_failure') or
+            read_json(LOGS_DIR / f"{r['run_id']}.state.json", {}).get('infra_failure')):
+        return EXIT_INFRA
     if planned_steps(r) and code is None:
         return EXIT_INFRA
     if r['mode'] == 'bg' and not _has_data(p):
@@ -893,15 +969,25 @@ def wait(run_id: str, timeout: float | None) -> int:
     unknown = r['status'] == 'infra' and start_check.recovery_marked(db(), r)
     if (r["status"] not in ("starting", "running", "lost") and not unknown) or (r['status'] == 'lost' and (r['exit_code'] is not None or not r['box_id'])):
         return _settled(r, show_failure=True, until=None if timeout is None else now() + timeout)
-    return _wait_locked(r, echo=False, timeout=timeout)
+    return _wait_locked(r, echo=False, timeout=timeout, show_failure=True)
 
 
 def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=False) -> int:
+    if r['status'] == 'source_gone':
+        say(r['error'])
+        return 2
+    if r['status'] == 'forwarded':
+        return _follow_forwarded(r, 'logs' if echo else 'wait', follow=echo,
+                                 timeout=None if echo or until is None else until-now())
+    if _never_started(r):
+        return _report_never_started(r)
     from .runs import repo_setup_failed, settled_steps_code, planned_steps
     budget = None if until is None else max(0, until-now())
     result = _catch_up_log(r, budget=budget, lock_wait=LOG_READ_WAIT_S)
     code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
     checked = _validated_step_row(r, code)
+    from . import resources
+    resources.finalize(r)
     if until is not None and now() >= until:
         _incomplete_log(checked, result)
         raise _wait_timeout(checked)
@@ -929,14 +1015,18 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
                 con.commit()
             finally:
                 con.close()
-    out(f"{r['run_id']}: {status} exit={code}")
+    if not echo and code == 0:
+        resources.display(r['run_id'])
+    out(f"{r['run_id']}: {status} exit={code}" + resources.failure_suffix(r['run_id'], code))
     if code is None:
         from .run_evidence import report
         report(dict(r), LOGS_DIR / f"{r['run_id']}.log", until=until)
     if code is None and r['box_id']:
         from .start_check import hint
         say(r['error'] or f"exit unknown; check: {hint(r['box_id'], r['run_id'])}")
-    return code if code is not None else 90
+    from .runs import space_result
+    effective = space_result(r['run_id'], code, report=True) if r['mode'] != 'local' else code
+    return effective if effective is not None else 90
 
 
 def _failure_tail(path) -> None:
@@ -1002,7 +1092,7 @@ def _truncate(path, size: int) -> None:
             pass
 
 
-def _wait_locked(r, echo, timeout=None):
+def _wait_locked(r, echo, timeout=None, *, show_failure=False):
     """A foreground `offbox run` holds its box lock until it has recorded the run's end, so while another process
     holds the lock, poll the run row (and tail the local log) instead of failing on the lock.
     `pos` is the local-log byte count already delivered (printed when echoing). While the run may still be taken
@@ -1012,7 +1102,7 @@ def _wait_locked(r, echo, timeout=None):
     deadline = None if timeout is None else now() + timeout
     log_path = LOGS_DIR / f"{r['run_id']}.log"
     if r['status'] == 'lost' and r['exit_code'] is not None:
-        return _settled(r, echo=echo, until=deadline)
+        return _settled(r, echo=echo, until=deadline, show_failure=show_failure)
     from . import start_check
     if start_check.recovery_marked(db(), r) and not start_check.api_pid(db(), r):
         r = _wait_start_receipt(r, deadline)
@@ -1020,9 +1110,9 @@ def _wait_locked(r, echo, timeout=None):
         r = _wait_for_start(r, deadline)
     if (r['status'] == 'lost' and db().execute(
             "SELECT 1 FROM kv WHERE k=? AND v='fenced'", (f"lost_confirmed:{r['run_id']}",)).fetchone()):
-        return _settled(r, echo=echo, until=deadline)
+        return _settled(r, echo=echo, until=deadline, show_failure=show_failure)
     if r['status'] not in ('starting', 'running', 'lost') or not r['box_id']:
-        return _settled(r, echo=echo, until=deadline)
+        return _settled(r, echo=echo, until=deadline, show_failure=show_failure)
     _refresh_running_ttl(r, deadline)
     pos, said = 0, False
     polled, ended_at = None, None
@@ -1044,7 +1134,7 @@ def _wait_locked(r, echo, timeout=None):
                 if cur['status'] not in ('starting', 'running'):
                     # The holder wrote its last output, recorded the end and released the lock between two polls.
                     # Nothing will be replayed now, so drain the whole rest of the log.
-                    return _settled(cur, echo=echo, pos=pos, locked=True, until=deadline)
+                    return _settled(cur, echo=echo, pos=pos, locked=True, until=deadline, show_failure=show_failure)
                 ck = checkpoint(log_path)
                 # Nothing below may touch the original log before the replay is confirmed. A deadline that has already
                 # passed ends the wait here, with the log and its checkpoint exactly as they were.
@@ -1059,7 +1149,8 @@ def _wait_locked(r, echo, timeout=None):
                 else:
                     # Its bytes can't be mapped to stream offsets and none were delivered: replay the run from the start.
                     start, keep = (0, 0), 0
-                return _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=ck is not None)
+                return _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=ck is not None,
+                                        show_failure=show_failure)
             finally:
                 guard.__exit__(None, None, None)
         ck = checkpoint(log_path)
@@ -1070,7 +1161,7 @@ def _wait_locked(r, echo, timeout=None):
                 cur['exit_code'] is not None or db().execute(
                     'SELECT 1 FROM kv WHERE k=?', (f"lost_confirmed:{cur['run_id']}",)).fetchone())):
             # Settled: nothing will be replayed, so drain the whole rest of the log.
-            return _settled(cur, echo=echo, pos=pos, until=deadline)
+            return _settled(cur, echo=echo, pos=pos, until=deadline, show_failure=show_failure)
         if deadline is not None and now() >= deadline:
             raise OffboxError(f"--timeout reached; {r['run_id']} keeps running on {r['box_id']} (nothing was stopped). "
                               f"Wait again: offbox wait {r['run_id']}", code=EXIT_WAIT_TIMEOUT)
@@ -1094,7 +1185,7 @@ def _wait_locked(r, echo, timeout=None):
             else:
                 ended_at = (ended_at or now()) if st else None
             if st and ended_at is not None and now() - ended_at >= _grace(cur):
-                return _holder_stuck(cur, st, log_path, pos, echo, deadline)
+                return _holder_stuck(cur, st, log_path, pos, echo, deadline, show_failure=show_failure)
         if not said:
             say(f"{r['run_id']} is still followed by another offbox process (its own `offbox run` or another wait); "
                 f"waiting for it to record the end")
@@ -1111,7 +1202,7 @@ def _grace(r) -> int:
     return PULL_GRACE_S if pulls else HOLDER_GRACE_S
 
 
-def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None) -> int:
+def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None, *, show_failure=False) -> int:
     """boat says the process ended, but the client holding the box lock never recorded it. Report boat's exit code
     instead of waiting on that client for ever. The row is left to its holder (or the reaper once the holder is gone).
     A lost process's recovery reads the box, so it is bounded by the caller's deadline like the rest of the wait."""
@@ -1121,15 +1212,22 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None) -> int:
         code, how = _recover_by(r, log_path, deadline)
     receipt_code = code
     code = settled_steps_code(r, code, log_path=log_path, until=deadline)
+    from . import resources
+    resources.finalize(r)
     _tail(log_path, pos, echo)
+    failure = show_failure and not echo and r['mode'] == 'bg' and code not in (0, None)
+    if failure:
+        _failure_tail(log_path)
     say(f"{r['run_id']} ended on {r['box_id']} over {_grace(r)}s ago, but the offbox process following it has not "
         f"recorded the end (it looks stuck); exit {code} taken from {how}. Full output: offbox logs {r['run_id']}")
-    out(f"{r['run_id']}: exit={code}")
+    out(f"{r['run_id']}: {'failed ' if failure else ''}exit={code}" + resources.failure_suffix(r['run_id'], code))
     if code is None:
         from .run_evidence import report
         report(dict(r), log_path, until=deadline, receipt_code=receipt_code)
         say(f"exit unknown; inspect with offbox ssh {r['box_id']}")
-    return 90 if code is None else code
+    from .runs import space_result
+    effective = space_result(r['run_id'], code, log_path, report=True)
+    return 90 if effective is None else effective
 
 
 def _recover_by(r, log_path, deadline):
@@ -1254,11 +1352,9 @@ def _wait_for_start(r, deadline):
             if not cur['box_id']:
                 con = db()
                 con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=? AND box_id IS NULL "
-                            "AND status IN ('starting','running')",
-                            (now(), "client ended before it got a box", cur['run_id']))
+                            "AND status IN ('starting','running') AND client_pid IS ? AND start_at IS ?",
+                            (now(), "client ended before it got a box", cur['run_id'], pid, cur['start_at']))
                 con.commit()
-                say(f"{cur['run_id']}: its offbox client (pid {pid}) ended before it got a box; never started, "
-                    "nothing ran")
                 continue
             return _wait_start_receipt(cur, deadline)
         if deadline is not None and now() >= deadline:
@@ -1282,7 +1378,7 @@ def _has_data(log_path) -> bool:
         return False
 
 
-def _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=False):
+def _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=False, *, show_failure=False):
     """Take over a run's follow without touching the original local log until the replay is confirmed.
 
     The temp file beside the log starts as the committed prefix (`keep` bytes); the replay appends the bytes the remote
@@ -1294,10 +1390,11 @@ def _replay_takeover(cur, echo, deadline, start, log_path, keep, has_checkpoint=
         if ck is not None:
             start, keep = (ck['stdoutOffset'], ck['stderrOffset']), ck['logBytes']
             has_checkpoint = True
-        return _replay_takeover_locked(cur, echo, deadline, start, log_path, keep, has_checkpoint)
+        return _replay_takeover_locked(cur, echo, deadline, start, log_path, keep, has_checkpoint,
+                                        show_failure=show_failure)
 
 
-def _replay_takeover_locked(cur, echo, deadline, start, log_path, keep, has_checkpoint):
+def _replay_takeover_locked(cur, echo, deadline, start, log_path, keep, has_checkpoint, *, show_failure=False):
     tmp = log_path.with_name(log_path.name + ".takeover")
     tmp_ck = offsets_path(tmp)
     try:
@@ -1318,13 +1415,13 @@ def _replay_takeover_locked(cur, echo, deadline, start, log_path, keep, has_chec
             if confirmed:
                 tmp.unlink(missing_ok=True)
                 tmp_ck.unlink(missing_ok=True)
-                return _finalize(cur, code, log_path, until=deadline, echo=echo)
+                return _finalize(cur, code, log_path, until=deadline, echo=echo, show_failure=show_failure)
             raise OffboxError(f"takeover of {cur['run_id']} ended without a known exit; the original log is kept")
         # Publish the replacement log and checkpoint before the run is recorded as settled.
         os.replace(tmp, log_path)
         if os.path.exists(tmp_ck):
             os.replace(tmp_ck, offsets_path(log_path))
-        return _finalize(cur, code, log_path, until=deadline, echo=echo)
+        return _finalize(cur, code, log_path, until=deadline, echo=echo, show_failure=show_failure)
     except BaseException:
         for p in (tmp, tmp_ck):
             try:
@@ -1366,11 +1463,12 @@ def _report_deps_hint(r, code, log_path) -> None:
             say(hint)
 
 
-def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
+def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) -> int:
     """Record a known end: pulls, the settled row (finish), std-tree hint and the exit line. Only after the log that
     describes this run is in its final place, so a concurrent follower never sees 'settled' with an old log."""
     from .runs import (do_pulls, finish, go_std_glitch, repo_setup_failed,
                        settle_box_wedged, wedged_message, settled_steps_code)
+    show_failure = show_failure and not echo and dict(r).get('mode') == 'bg'
     receipt_code = code
     delivered = delivered_bytes(log_path)
     try:
@@ -1382,16 +1480,21 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
         finish(r['run_id'], EXIT_INFRA, 'infra', until=until)
         if echo:
             _tail(log_path, delivered, True)
+        elif show_failure:
+            _failure_tail(log_path)
         say('repo toolchain setup failed (exit 98), not your command')
         return EXIT_INFRA
     from .runs import state_warning
     quarantine_pending = code == 97
+    failure_tail_shown = False
     try:
         con = db()
         with contextlib.nullcontext() if until is None else api.budget(max(0, until-now())):
             wedged = settle_box_wedged(con, r, code)
         quarantine_pending = False
         if wedged:
+            if show_failure:
+                _failure_tail(log_path)
             say(wedged_message(r['box_id'], *wedged))
             return EXIT_INFRA
         pulls = json.loads(r["pulls"] or "[]")
@@ -1402,7 +1505,8 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
             do_pulls(r["box_id"], row, pulls, until=until)
         if until is not None and now() >= until:
             raise _wait_timeout(r)
-        code = settled_steps_code(r, code, log_path=log_path, locked=True, until=until)
+        code = settled_steps_code(r, code, log_path=log_path, locked=True, until=until,
+                                  report_start_failure=False)
         code = finish(r['run_id'], code, until=until, report=True, run=r)
         if dict(r).get('mode') == 'bg' and not _has_data(log_path):
             settled = _run_row(r['run_id'])
@@ -1417,28 +1521,40 @@ def _finalize(r, code, log_path, until=None, *, echo=False) -> int:
         # Catch-up must also drain bytes whose stream echo failed before recording later bytes as delivered.
         if echo:
             _tail(log_path, delivered, True)
+        elif show_failure and code not in (0, None):
+            _failure_tail(log_path)
+            failure_tail_shown = True
         go_std_glitch(r["box_id"], r["run_id"], log_path, code)
         _report_deps_hint(r, code, log_path)
     except sqlite3.Error as error:
         if not quarantine_pending:
             code = finish(r['run_id'], code, until=until, run=r)
         state_warning(r['run_id'], code, error)
-    out(f"{r['run_id']}: exit={code}")
+    failure = show_failure and code not in (0, None)
+    if failure and not failure_tail_shown:
+        _failure_tail(log_path)
+    from . import resources
+    resources.finalize(r)
+    if not echo and code == 0:
+        resources.display(r['run_id'])
+    out(f"{r['run_id']}: {'failed ' if failure else ''}exit={code}" + resources.failure_suffix(r['run_id'], code))
     if code is None:
         from .run_evidence import report
         report(dict(r), log_path, until=until, receipt_code=receipt_code)
         say(f"exit unknown; inspect with offbox ssh {r['box_id']}")
-    return 90 if code is None else code
+    from .runs import space_result
+    effective = space_result(r['run_id'], code, log_path, report=True)
+    return 90 if effective is None else effective
 
 
-def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None):
+def _wait_run(r, echo, until=None, start_offsets=(0, 0), replay_path=None, *, show_failure=False):
     """Non-takeover wait (the lock was free, or this process holds it): follow, then record the end."""
     from .runs import follow  # noqa: F401  (kept so the module-level patch points stay valid)
     if r['status'] not in ('starting','running'):
-        return _settled(r, echo=echo, locked=True, until=until)
+        return _settled(r, echo=echo, locked=True, until=until, show_failure=show_failure)
     log_path = LOGS_DIR / f"{r['run_id']}.log"
     code = _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=echo)
-    return _finalize(r, code, log_path, until=until, echo=echo)
+    return _finalize(r, code, log_path, until=until, echo=echo, show_failure=show_failure)
 
 
 def stats(days: float, as_json: bool) -> None:

@@ -74,15 +74,39 @@ def collect():
             db.execute('INSERT OR REPLACE INTO health VALUES (?,?,?,?)', ('phone', now, 0, type(e).__name__))
 
 
+def journal_errors(db):
+    health = db.execute('SELECT * FROM health WHERE source="phone"').fetchone()
+    if not health or time.time() - health['checked'] > 90:
+        return ['notification_collector_stale']
+    if not health['ok']:
+        return ['notifications_' + health['detail']]
+    return []
+
+
+def rows(app, since, until):
+    path = ROOT / 'delivery.sqlite'
+    if not path.exists():
+        return [], ['notification_collector_stale']
+    try:
+        db = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=10)
+        db.row_factory = sqlite3.Row
+        try:
+            errors = journal_errors(db)
+            found = db.execute('SELECT posted, detected, text FROM pushes '
+                               'WHERE app=? AND posted>=? AND posted<=? ORDER BY posted',
+                               (app, since, until))
+            return [dict(row) for row in found], errors
+        finally:
+            db.close()
+    except sqlite3.Error as exc:
+        return [], ['notifications_' + type(exc).__name__]
+
+
 def evidence(cfg, classifier, single=False):
     placed = dt.datetime.fromisoformat(cfg['placed_at'].replace('Z', '+00:00')).timestamp()
     out, errors = [], []
     with connect() as db:
-        health = db.execute('SELECT * FROM health WHERE source="phone"').fetchone()
-        if not health or time.time() - health['checked'] > 90:
-            errors.append('notification_collector_stale')
-        elif not health['ok']:
-            errors.append('notifications_' + health['detail'])
+        errors.extend(journal_errors(db))
         for row in db.execute('SELECT * FROM pushes WHERE app=? AND posted>=? ORDER BY posted', (cfg['app'], placed)):
             exact = cfg['order'] in json.loads(row['ids'])
             stage = classifier(row['text'])
@@ -102,18 +126,19 @@ def evidence(cfg, classifier, single=False):
 
 
 def reconcile(cfg, detected=None, source=None, evidence_time=None, reported=None, note=None, asked=None):
+    order = cfg['merchant_domain'] + ':' + cfg['order'] if cfg['app'] == 'web' else cfg['order']
     with connect() as db:
         db.execute('INSERT OR IGNORE INTO reconciliation(app,order_id,placed) VALUES (?,?,?)',
-                   (cfg['app'], cfg['order'], cfg['placed_at']))
+                   (cfg['app'], order, cfg['placed_at']))
         for key, value in [('detected', detected), ('source', source), ('evidence_time', evidence_time),
                            ('reported', reported), ('report_note', note), ('asked', asked)]:
             if value is not None:
                 # Preserve the first machine detection. Human corrections can replace reports.
                 expr = f'COALESCE({key},?)' if key in ('detected', 'source', 'evidence_time', 'asked') else '?'
                 db.execute(f'UPDATE reconciliation SET {key}={expr} WHERE app=? AND order_id=?',
-                           (value, cfg['app'], cfg['order']))
+                           (value, cfg['app'], order))
         row = dict(db.execute('SELECT * FROM reconciliation WHERE app=? AND order_id=?',
-                              (cfg['app'], cfg['order'])).fetchone())
+                              (cfg['app'], order)).fetchone())
     row['gap_seconds'] = ((dt.datetime.fromisoformat(row['detected']) - dt.datetime.fromisoformat(row['reported'])).total_seconds()
                           if row['detected'] and row['reported'] else None)
     return row

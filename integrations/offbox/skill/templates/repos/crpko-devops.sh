@@ -219,7 +219,7 @@ PY
   sudo install -m 0755 "$stage/terraform" /usr/local/bin/terraform
 fi
 hash -r
-for tool in vector aws terraform ruby; do
+for tool in vector aws terraform ruby gh; do
   command -v "$tool" >/dev/null || { echo "offbox: required tool missing on command PATH: $tool" >&2; exit 98; }
 done
 [ -x /usr/bin/ruby ] || { echo 'offbox: required tool missing: /usr/bin/ruby' >&2; exit 98; }
@@ -257,7 +257,6 @@ env.mkdir(parents=True, exist_ok=True)
 fd, tmp = tempfile.mkstemp(prefix='.crpko-devops-', dir=env)
 try:
     with os.fdopen(fd, 'w') as stream:
-        stream.write('export PATH="/usr/local/bin:$PATH"\n')
         if sys.argv[2] == 'true':
             stream.write('export TERRAFORM_PROVIDER_MIRROR="$HOME/.offbox/tf-provider-mirror"\n')
         else:

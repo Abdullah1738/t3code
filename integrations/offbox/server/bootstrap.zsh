@@ -79,7 +79,8 @@ EOF
     host)
       r 'mkdir -p /root/offbox-server'
       scp -q $SSHO $HERE/{boatd.py,boatd-wrap,base-image.sh,boatd.service,install-host.sh} root@$IP:/root/offbox-server/
-      scp -q $SSHO $HERE/../skill/scripts/toollog.py root@$IP:/root/offbox-server/toollog.py
+      scp -q $SSHO $HERE/../skill/scripts/{toollog,offbox_disk_space}.py root@$IP:/root/offbox-server/
+      scp -q $SSHO $HERE/../skill/templates/home/{offbox-mgmt-ssh.service,offbox_mgmt_sshd_config,offbox-ssh-runtime.conf} root@$IP:/root/offbox-server/
       r 'bash /root/offbox-server/install-host.sh' 2>&1 | tail -40
       ;;
     client)

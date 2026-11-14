@@ -41,7 +41,7 @@ class StatusTests(unittest.TestCase):
 
     def seed(self, overrides=None):
         for key in status.CADENCES:
-            at = (overrides or {}).get(key, NOW - dt.timedelta(minutes=20))
+            at = (overrides or {}).get(key, NOW - dt.timedelta(minutes=5))
             if at is not None:
                 self.write(key, at)
 
@@ -205,7 +205,7 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(cli.returncode, 0, cli.stderr)
         result = json.loads(cli.stdout)
         self.assertEqual(result['malformed'], len(overflowing))
-        self.assertEqual(len(result['jobs']), 7)
+        self.assertEqual(set(result['jobs']), set(status.CADENCES))
         self.assertEqual(result['missingJobs'], [])
 
     def test_malformed_inputs_are_counted_and_skipped(self):
@@ -277,6 +277,11 @@ class StatusTests(unittest.TestCase):
                    countsByKind={'perf': 1}, outcomes=1, okRate=1, errorRate=0, failedRate=0,
                    durationMs={'disk.sample': dict(p50=42, p95=42, max=42)}, malformed=1,
                    topErrors=[], diskTooling=dict(probes=0, timeouts=0, maxDurationMs=None, latestBlockedIn=None))
+        old.update(backup={key: dict(memory=0, health=0, other=0)
+                           for key in ('skipped_runs', 'ok_runs', 'failed_runs')},
+                   diskInventory=dict(scans=0, rootsOk=0, rootsPartial=0, rootsTimeout=0, rootsDenied=0, scanMs=0),
+                   diskWait=dict(runs=0, maxStuckForS=None, latestStuckUnmountMountPoint=None,
+                                 busyRuns=0, topBusyComms=[]))
         self.assertEqual({k: v for k, v in result.items() if k not in ('jobs', 'missingJobs')}, old)
         health = result['jobs']['backup.run:health']
         self.assertEqual(health['lastSeen'], '2026-11-14T16:00:00.000Z')
@@ -285,6 +290,74 @@ class StatusTests(unittest.TestCase):
         self.assertIn('backup.run:health', result['missingJobs'])
         self.assertEqual(json.loads((self.root / 'rollup-2026-11-15.json').read_text()), result)
         self.assertEqual(rollup('2026-11-12', self.root)['missingJobs'], [])
+
+    def test_replica_failure_fixture_is_a_run_in_status_cli_and_rollup(self):
+        source = HERE / 'tests/fixtures/status/backup-failed-replica.ndjson'
+        (self.root / '2026-11-14.ndjson').write_bytes(source.read_bytes())
+        cli = subprocess.run([sys.executable, str(HERE / 'status.py'), '--json',
+                              '--now', '2026-11-14T19:29:00Z'], capture_output=True, text=True)
+        self.assertEqual(cli.returncode, 0, cli.stderr)
+        result = json.loads(cli.stdout)
+        daily = rollup('2026-11-14', self.root)
+        for jobs_view in (result, daily):
+            row = jobs_view['jobs']['backup.run:memory']
+            self.assertEqual(row['lastSeen'], '2026-11-14T19:28:00.000Z')
+            self.assertFalse(row['lastOk'])
+            self.assertEqual(row['lines'], 1)
+            self.assertEqual(row['status'], 'OK')
+            self.assertNotIn('backup.run:memory', jobs_view['missingJobs'])
+        self.assertEqual(daily['backup']['failed_runs']['memory'], daily['jobs']['backup.run:memory']['lines'])
+        self.assertEqual(daily['backup']['ok_runs']['memory'], 0)
+        self.assertEqual(daily['backup']['skipped_runs']['memory'], 0)
+
+    def test_failure_stage_forms_are_seen_without_becoming_skips(self):
+        stages = ('admission', 'stage', 'repo', 'disk', 'replica', 'verify',
+                  'files', 'restic', 'prune', 'dropbox', 'manifest', 'unknown')
+        at = NOW.replace(hour=23, minute=55)
+        for target in ('memory', 'health'):
+            for field in ('failureStage', 'failedStage'):
+                for stage in stages:
+                    with self.subTest(target=target, field=field, stage=stage):
+                        root = self.root / (target + '-' + field + '-' + stage)
+                        root.mkdir()
+                        props = dict(target=target, exitCode=1, skipped=0, **{field: stage})
+                        with patch.dict(os.environ, TOOLLOG_DIR=str(root)):
+                            toollog.emit('backup', 'error', 'backup.run', now=at, ok=False,
+                                         props=props, error_tag='backup.failed_' + stage)
+                        logged = json.loads((root / '2026-11-15.ndjson').read_text())
+                        self.assertEqual(logged['props'][field], stage)
+                        self.assertEqual(logged['props']['skipped'], 0)
+                        self.assertNotIn('skipReason', logged['props'])
+                        self.assertEqual(logged['error']['tag'], 'backup.failed_' + stage)
+                        current = status.report(at + dt.timedelta(minutes=1), root)
+                        daily = rollup('2026-11-15', root)
+                        for view in (current, daily):
+                            row = view['jobs']['backup.run:' + target]
+                            self.assertEqual(row['lastSeen'], status.stamp(at))
+                            self.assertFalse(row['lastOk'])
+                            self.assertEqual(row['lines'], 1)
+                            self.assertEqual(row['status'], 'OK')
+                        self.assertEqual(daily['backup']['failed_runs'][target], 1)
+                        self.assertEqual(daily['backup']['ok_runs'][target], 0)
+                        self.assertEqual(daily['backup']['skipped_runs'][target], 0)
+
+    def test_new_periodic_jobs_and_daily_event_without_outcome(self):
+        self.seed()
+        # The nightly end event omits ok; it still proves the pass finished.
+        self.write('disk.deep.end', NOW - dt.timedelta(minutes=1))
+        path = self.root / '2026-11-15.ndjson'
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[-1].pop('ok')
+        path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        result = self.report()
+        self.assertEqual(result['missingJobs'], [])
+        self.assertIsNone(result['jobs']['disk.deep.end']['lastOk'])
+        self.assertEqual(result['jobs']['disk.deep.end']['status'], 'OK')
+        self.assertEqual(result['jobs']['memory.sample']['gapMaxMin'], 15)
+        # Only memory becomes late after its three-sample allowance.
+        later = self.report(NOW + dt.timedelta(minutes=11))
+        self.assertEqual(later['missingJobs'], ['memory.sample'])
+        self.assertEqual(later['jobs']['memory.sample']['status'], 'LATE')
 
     def test_missing_day_emitted_once_daily_before_any_jobs(self):
         collector.missing_day(NOW)
@@ -302,7 +375,8 @@ class StatusTests(unittest.TestCase):
             collector.missing_day(NOW)
         with patch.object(collector, 'missing_day') as check, \
              patch.object(collector, 'disk_tooling_probe', side_effect=lambda: self.assertTrue(check.called)), \
-             patch.object(collector, 'directory_inventory'), patch.object(collector, 'collect'):
+             patch.object(collector, 'directory_inventory'), patch.object(collector, 'collect'), \
+             patch.object(collector, 'disk_wait'):
             collector.main()
 
     def test_missing_yesterday_detected_when_today_exists(self):
@@ -313,3 +387,25 @@ class StatusTests(unittest.TestCase):
         # No false missing day before the instrumentation was introduced.
         collector.missing_day(dt.datetime(2026, 11, 12, tzinfo=UTC))
         self.assertFalse((self.root / '2026-11-12.ndjson').exists())
+
+    def test_missing_day_retries_failed_append_even_if_it_created_the_file(self):
+        for failure in (BlockingIOError, OSError):
+            with self.subTest(failure=failure.__name__):
+                root = self.root / failure.__name__
+                root.mkdir()
+                (root / '2026-11-14.ndjson').touch()
+                with patch.dict(os.environ, TOOLLOG_DIR=str(root)):
+                    target = toollog.fcntl if failure is BlockingIOError else toollog
+                    method = 'flock' if failure is BlockingIOError else 'append'
+                    with patch.object(target, method, side_effect=failure):
+                        collector.missing_day(NOW)
+                    self.assertEqual((root / '2026-11-15.ndjson').read_text(), '')
+                    pending = json.loads((root / 'state/missing-day.json').read_text())
+                    self.assertNotIn('reportedDay', pending)
+                    self.assertEqual(pending['missingDates'], ['2026-11-15'])
+                    collector.missing_day(NOW)
+                    collector.missing_day(NOW)
+                lines = (root / '2026-11-15.ndjson').read_text().splitlines()
+                self.assertEqual(len(lines), 1)
+                self.assertEqual(json.loads(lines[0])['name'], 'log.missing_day')
+                self.assertEqual(json.loads(lines[0])['props']['source'], '2026-11-15')

@@ -1,3 +1,4 @@
+import { messageLengthError } from "./message-length.ts";
 import { toolError } from "./toollog.ts";
 import { newFormKeys } from "./secret-crypto.ts";
 import { createHash } from "node:crypto";
@@ -31,6 +32,7 @@ type Options = {
   shares?: Shares;
   /** Standing chat-rule check on agent sends; absent where no rules apply. */
   replyCheck?: (text: string) => { rule: string; reason: string } | undefined;
+  foldText?: (text: string, operationId: string) => Promise<string>;
   /** Receives rule names only, never message text. */
   log?: (event: string, code?: string) => void;
 };
@@ -49,7 +51,7 @@ const errors = {
   502: "Tailnet publish failed", 503: "Bridge is not ready",
 } as const;
 class ApiError extends Error {
-  constructor(readonly status: keyof typeof errors) { super(errors[status]); }
+  constructor(readonly status: keyof typeof errors, message: string = errors[status]) { super(message); }
 }
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const string = (value: unknown, max: number): value is string =>
@@ -67,7 +69,7 @@ async function readBody(request: Request, maxBytes: number): Promise<Record<stri
   const length = request.headers.get("content-length");
   if (length !== null && (!/^\d+$/.test(length) || !Number.isSafeInteger(Number(length)))) throw new ApiError(400);
   if (length !== null && Number(length) > maxBytes) {
-    void request.body?.cancel().catch(() => { toolError("api", "api.catch1");});
+    void request.body?.cancel().catch((caughtError) => { toolError("api", "api.catch1", caughtError);});
     throw new ApiError(413);
   }
   if (!request.body) return {};
@@ -83,7 +85,7 @@ async function readBody(request: Request, maxBytes: number): Promise<Record<stri
       size += value.byteLength;
       if (size > maxBytes) {
         // Do not wait for an untrusted stream's cancellation callback.
-        void reader.cancel().catch(() => { toolError("api", "api.catch2");});
+        void reader.cancel().catch((caughtError) => { toolError("api", "api.catch2", caughtError);});
         throw new ApiError(413);
       }
       text += decoder.decode(value, { stream: true });
@@ -92,7 +94,7 @@ async function readBody(request: Request, maxBytes: number): Promise<Record<stri
     const body: unknown = JSON.parse(text);
     if (!body || typeof body !== "object" || Array.isArray(body)) throw new ApiError(400);
     return body as Record<string, unknown>;
-  } catch (error) { toolError("api", "api.catch3");
+  } catch (error) { toolError("api", "api.catch3", error);
     throw error instanceof ApiError ? error : new ApiError(400);
   } finally {
     reader.releaseLock();
@@ -109,10 +111,12 @@ const validSession = (value: unknown): value is string => string(value, 200) && 
 
 /** Shared card validation for session sends and owner-authorized cross-chat sends. */
 export function appContent(body: Record<string, unknown>): OutboxApp | undefined {
-  const { url, caption, subcaption, trailingCaption, trailingSubcaption, summary } = body;
+  const { url, caption, subcaption, trailingCaption, trailingSubcaption, summary, updateOf, previewPage } = body;
   if (!validAppUrl(url) || !line(caption, 200) || !optionalLine(subcaption, 200) || !optionalLine(trailingCaption, 200)
-    || !optionalLine(trailingSubcaption, 200) || !optionalLine(summary, 500)) return;
-  const optional = { subcaption, trailingCaption, trailingSubcaption, summary } as Record<string, string | undefined>;
+    || !optionalLine(trailingSubcaption, 200) || !optionalLine(summary, 500)
+    || (updateOf !== undefined && (typeof updateOf !== "string" || !/^app:[a-f0-9]{64}$/.test(updateOf)))
+    || (previewPage !== undefined && (!validAppUrl(previewPage) || new URL(previewPage).origin !== new URL(url).origin))) return;
+  const optional = { subcaption, trailingCaption, trailingSubcaption, summary, updateOf, previewPage } as Record<string, string | undefined>;
   return { url, caption, ...Object.fromEntries(Object.entries(optional).filter(([, value]) => value !== undefined)) };
 }
 
@@ -124,7 +128,7 @@ type SessionContent = Omit<OutboxOperation, "id" | "kind" | "sessionId" | "gener
 
 /** Session-bound, idempotent enqueue shared by every agent-authored conversation route. */
 function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId: string,
-  content: SessionContent, prepare?: () => void): { id: string; created: boolean } {
+  content: SessionContent, prepare?: () => void, output: SessionContent = content, attribution?: { inboundId?: string }): { id: string; created: boolean } {
   const id = `${prefix}:${hash(dedupeKey)}`;
   const created = store.db.transaction(() => {
     const route = store.get<{ id: string; generation: number } | null>("route");
@@ -136,8 +140,10 @@ function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId
     const spec = JSON.stringify(operation);
     const saved = store.get<{ spec: string; queuedAt?: number }>(key);
     if (saved && saved.spec !== spec) throw new ApiError(409);
+    // Concurrent callers may finish folding after the turn has closed; the accepted original spec owns its stored text.
+    if (saved && store.getOperation(id)) return false;
     prepare?.();
-    const created = store.enqueue(operation);
+    const created = store.enqueue({ ...operation, ...output }, attribution);
     store.set(key, { spec, ...(prefix === "send" ? { queuedAt: saved?.queuedAt ?? Date.now() } : {}) });
     return created;
   }).immediate();
@@ -194,7 +200,7 @@ function sendConflict(store: Store, dedupeKey: string, route: { id: string; gene
 }
 
 /** Fetch-compatible handler only; socket ownership and listening belong to main. */
-export function createApi({ store, photon, router, chatGuid, enabled, health, secrets, shares, replyCheck, log }: Options): (request: Request) => Promise<Response> {
+export function createApi({ store, photon, router, chatGuid, enabled, health, secrets, shares, replyCheck, foldText, log }: Options): (request: Request) => Promise<Response> {
   const pairedChat = () => {
     const guid = chatGuid();
     // Photon chat guids, or Sendblue chat keys (dm:<address> | group:<id>).
@@ -256,7 +262,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
             return json({ forgotten: true });
           }
           return json({ value: await readSecret(deps, token, field as string) });
-        } catch (error) { toolError("api", "api.catch4");
+        } catch (error) { toolError("api", "api.catch4", error);
           if (error instanceof SecretError) throw new ApiError(error.status);
           throw error;
         }
@@ -295,6 +301,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         fields(body, ["base64", "name", "mimeType", "text", "dedupeKey", "sessionId"]);
         const { base64, name, mimeType, dedupeKey, sessionId } = body;
         const text = body.text === undefined ? "" : body.text;
+        if (typeof text === "string" && text.length > 12_000) throw new ApiError(400, messageLengthError(text, 12_000));
         // One-time notification attachments moved to the telegram bridge; only
         // interactive session-bound sends remain here.
         if (sessionId === undefined) throw new ApiError(400);
@@ -310,12 +317,13 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const attachment = { sha256: createHash("sha256").update(data).digest("hex"), name, mimeType, size: data.length };
         const { id, created } = queueSession(store, "file", dedupeKey, sessionId, { text, attachment }, () => store.putBlob(data));
         // Durable queue acceptance only; upload and delivery happen outside this handler.
-        return json({ id, created }, created ? 202 : 200);
+        return json({ id, created, chat: "owner" }, created ? 202 : 200);
       }
 
       if (path === "/send") {
         fields(body, ["text", "effect", "subject", "dedupeKey", "sessionId"]);
         const { text, effect, subject, dedupeKey, sessionId } = body;
+        if (typeof text === "string" && text.length > 12_000) throw new ApiError(400, messageLengthError(text, 12_000));
         if (!string(text, 12_000) || !string(dedupeKey, 200) || !validSession(sessionId)
           || (effect !== undefined && !isEffect(effect)) || !optionalLine(subject, 256)) throw new ApiError(400);
         const turnKey = store.get<{ messageId: string } | undefined>("activeTurn")?.messageId ?? "idle";
@@ -326,26 +334,36 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         // stale or conflicting request, keep their existing answer and never touch bounce state.
         const route = liveSendRoute(store, sessionId);
         const existing = sendReplay(store, dedupeKey, route, content);
-        if (existing) return json({ id: existing, created: false }, 200);
+        if (existing) return json({ id: existing, created: false, chat: "owner" }, 200);
         // A stored key with different content is a conflict, reported before any rule is applied.
         if (sendConflict(store, dedupeKey, route, content)) throw new ApiError(409);
         const early = reuseEarlyReply(store, dedupeKey, route, content);
-        if (early) return json({ id: early, created: false }, 200);
+        if (early) return json({ id: early, created: false, chat: "owner" }, 200);
         const hit = replyCheck?.(text);
         if (hit && mayBounce(store, turnKey)) {
           noteBounce(store, turnKey);
           log?.("reply-bounced", hit.rule);
           return json({ error: `Nothing was sent: ${hit.reason}. Rewrite and send again.` }, 422);
         }
-        const { id, created } = queueSession(store, "send", dedupeKey, sessionId, content);
+        const operationId = `send:${hash(dedupeKey)}`;
+        if (store.get<boolean>(`cancelledSend:${operationId}`)) throw new ApiError(409);
+        // Folding can outlive this turn or overlap its replacement in the same session.
+        const turn = store.get<{ id: string; generation: number; inboundId?: string; replyInboundId?: string } | null>("activeTurn");
+        const attribution = { inboundId: turn?.id === route.id && turn.generation === route.generation ? turn.replyInboundId ?? turn.inboundId : undefined };
+        let folded = text;
+        try { folded = await foldText?.(text, operationId) ?? text; } catch { /* Optional folds never block a send. */ }
+        const { id, created } = queueSession(store, "send", dedupeKey, sessionId, content, () => {
+          if (liveSendRoute(store, sessionId).generation !== route.generation) throw new ApiError(409);
+        }, { ...content, text: folded }, attribution);
         if (created) noteSent(store, turnKey, text);
-        return json({ id, created }, created ? 202 : 200);
+        return json({ id, created, chat: "owner" }, created ? 202 : 200);
       }
 
       if (path === "/wake") {
         // Watchers wake whichever session is live, so this route is deliberately not session-bound.
         fields(body, ["text", "source", "dedupeKey"]);
         const { text, source, dedupeKey } = body;
+        if (typeof text === "string" && text.length > 12_000) throw new ApiError(400, messageLengthError(text, 12_000));
         if (!string(text, 12_000) || !line(source, 100) || !string(dedupeKey, 200)) throw new ApiError(400);
         const id = `wake:${hash(dedupeKey)}`;
         const created = store.db.transaction(() => {
@@ -374,7 +392,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
       }
 
       if (path === "/app") {
-        fields(body, ["url", "caption", "subcaption", "trailingCaption", "trailingSubcaption", "summary", "dedupeKey", "sessionId"]);
+        fields(body, ["url", "caption", "subcaption", "trailingCaption", "trailingSubcaption", "summary", "updateOf", "previewPage", "dedupeKey", "sessionId"]);
         const { dedupeKey, sessionId } = body;
         const app = appContent(body);
         if (!app || !string(dedupeKey, 200) || !validSession(sessionId)) throw new ApiError(400);
@@ -411,7 +429,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const earlier = replay();
         if (earlier) return json(earlier, 200);
         let base: string;
-        try { base = await secrets.publishApps(); } catch { toolError("api", "api.catch5"); throw new ApiError(502); }
+        try { base = await secrets.publishApps(); } catch (caughtError) { toolError("api", "api.catch5", caughtError); throw new ApiError(502); }
         if (!validAppUrl(base)) throw new ApiError(502);
         const encryption = secrets.publicForm ? await newFormKeys() : undefined;
         const token = newToken();
@@ -448,9 +466,9 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
       }
 
       throw new ApiError(404);
-    } catch (error) { toolError("api", "api.catch6");
+    } catch (error) { toolError("api", "api.catch6", error);
       const status = error instanceof ApiError ? error.status : 409;
-      return json({ error: errors[status] }, status);
+      return json({ error: error instanceof ApiError ? error.message : errors[status] }, status);
     }
   };
 }

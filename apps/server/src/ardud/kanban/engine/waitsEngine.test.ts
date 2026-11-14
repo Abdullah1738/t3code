@@ -11,6 +11,10 @@ import * as NodePath from "node:path";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
+import * as Context from "effect/Context";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as Analytics from "../../analytics/Analytics.ts";
+import type { AnalyticsEvent } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -27,6 +31,8 @@ import * as Tracer from "effect/Tracer";
 
 import {
   KANBAN_BACKLOG,
+  KanbanBoardId,
+  KanbanCardId,
   KanbanCard,
   KanbanCardDetail,
   KanbanCardEvent,
@@ -79,8 +85,19 @@ interface FakeThread {
 }
 
 /** One test's outside world: its threads, the PRs they track and what the host says about PRs. */
-const makeWorld = (options: { readonly reader?: boolean } = {}) => {
+const makeWorld = (
+  options: {
+    readonly reader?: boolean;
+    readonly failCommit?: { armed: boolean; failures: number };
+    readonly analytics?: AnalyticsEvent[];
+  } = {},
+) => {
+  const transactionWrites = Context.Reference<{ written: boolean } | null>(
+    "wait-test/transaction-writes",
+    { defaultValue: () => null },
+  );
   const threads = new Map<string, FakeThread>();
+  const rejectedAssignments = new Set<string>();
   /** The PRs a work thread tracks, as its view reports them. */
   const prs = new Map<string, ReadonlyArray<KanbanThreadPr>>();
   /** What the host answers when the wait PR reader asks. A PR not listed could not be read. */
@@ -122,6 +139,11 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     ended: { id: string; done: Deferred.Deferred<void> } | null;
   } = { fail: null, failAttached: null, ended: null };
   const toldWaiters = new Map<string, Deferred.Deferred<void>>();
+  const ticking: { board: string | null; cardReads: string[]; listedBoards: string[] } = {
+    board: null,
+    cardReads: [],
+    listedBoards: [],
+  };
   const waitForTold = (id: KanbanCard["id"]) =>
     Effect.gen(function* () {
       const done = yield* Deferred.make<void>();
@@ -177,6 +199,11 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
               )
             : store.putCard(card).pipe(
                 Effect.tap(() =>
+                  Effect.map(transactionWrites, (pending) => {
+                    if (pending !== null) pending.written = true;
+                  }),
+                ),
+                Effect.tap(() =>
                   card.wait === undefined && saving.ended?.id === card.id
                     ? Deferred.succeed(saving.ended.done, undefined)
                     : Effect.void,
@@ -187,7 +214,20 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
                     : Effect.void,
                 ),
               ),
-        boards: beforeRead(true).pipe(Effect.andThen(store.boards)),
+        card: (id) =>
+          Effect.sync(() => ticking.cardReads.push(id)).pipe(Effect.andThen(store.card(id))),
+        cards: (id) =>
+          Effect.sync(() => ticking.listedBoards.push(id)).pipe(Effect.andThen(store.cards(id))),
+        openCards: (id) =>
+          Effect.sync(() => ticking.listedBoards.push(id)).pipe(
+            Effect.andThen(store.openCards(id)),
+          ),
+        boards: beforeRead(true).pipe(
+          Effect.andThen(store.boards),
+          Effect.map((boards) =>
+            ticking.board === null ? boards : boards.filter((board) => board.id === ticking.board),
+          ),
+        ),
         board: (id) => beforeRead(false).pipe(Effect.andThen(store.board(id))),
       });
     }),
@@ -220,6 +260,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     KanbanThreads,
     KanbanThreads.of({
       pendingUserInputs: () => Effect.succeed([]),
+      claimContext: () => Effect.succeed(null),
       view,
       find: view,
       lastFailure: () => Effect.succeed(null),
@@ -249,7 +290,13 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
           return threadId;
         }),
       send: (input) =>
-        Effect.sync(() => void threads.get(input.threadId)?.messages.push(input.text)),
+        Effect.suspend(() =>
+          input.key && rejectedAssignments.delete(input.threadId)
+            ? Effect.fail(
+                new KanbanThreadError({ operation: "send", detail: "rejected", rejected: true }),
+              )
+            : Effect.sync(() => void threads.get(input.threadId)?.messages.push(input.text)),
+        ),
       model: (threadId) => Effect.sync(() => threads.get(threadId)?.model ?? null),
       withdraw: () => Effect.void,
       setModel: (threadId, model) =>
@@ -257,6 +304,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
           const thread = threads.get(threadId);
           if (thread) threads.set(threadId, { ...thread, model });
         }),
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
@@ -290,6 +338,45 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
         ),
     }),
   );
+  const depth = Context.Reference<number>("TestWaitTransactionDepth", { defaultValue: () => 0 });
+  const database =
+    options.failCommit === undefined
+      ? Sqlite.layerMemory
+      : Layer.effect(
+          SqlClient.SqlClient,
+          Effect.map(
+            SqlClient.SqlClient,
+            (sql) =>
+              new Proxy(sql, {
+                get(target, property, receiver) {
+                  if (property !== "withTransaction")
+                    return Reflect.get(target, property, receiver);
+                  return <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+                    Effect.gen(function* () {
+                      const nesting = yield* depth;
+                      const pending = (yield* transactionWrites) ?? { written: false };
+                      return yield* sql.withTransaction(
+                        effect.pipe(
+                          Effect.provideService(depth, nesting + 1),
+                          Effect.provideService(transactionWrites, pending),
+                          // Collection reads now open snapshot transactions too. Fail only
+                          // the outer transaction that actually persisted the wait change.
+                          Effect.tap(() =>
+                            nesting === 0 && pending.written && options.failCommit?.armed
+                              ? Effect.sync(() => {
+                                  options.failCommit!.failures++;
+                                }).pipe(
+                                  Effect.andThen(Effect.die("injected outer transaction failure")),
+                                )
+                              : Effect.void,
+                          ),
+                        ),
+                      );
+                    });
+                },
+              }),
+          ),
+        ).pipe(Layer.provideMerge(Sqlite.layerMemory));
   const layer = ScriptService.layer.pipe(
     Layer.provideMerge(KanbanService.layer),
     Layer.provideMerge(KanbanModels.layerTest(null)),
@@ -297,7 +384,17 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     // The reader is provided around the board's layers, the way server.ts does it.
     Layer.provideMerge(options.reader === false ? Layer.empty : readerLayer),
     Layer.provideMerge(storeLayer),
-    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(database),
+    Layer.provideMerge(
+      options.analytics === undefined
+        ? Layer.empty
+        : Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              Effect.sync(() => {
+                options.analytics!.push(event);
+              }),
+          }),
+    ),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
     Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
@@ -315,12 +412,14 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
       .filter((message) => message.includes(text)).length;
   return {
     threads,
+    rejectedAssignments,
     prs,
     host,
     gate,
     reading,
     closing,
     saving,
+    ticking,
     waitForTold,
     layer,
     /** Messages anywhere that include `text`. */
@@ -637,6 +736,163 @@ it.effect("card: the worker starts when the card it waited on is done", () =>
       assert.include(briefOf(world, woken), `Card #${first.number} is done`);
     }),
   ),
+);
+
+it.effect.each(["work", "review", "evaluator"] as const)(
+  "cross-board card waits hold and wake %s",
+  (wakeRole) =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, store, board } = yield* setup;
+        const foreign = yield* kanban.ensureBoard({
+          slug: "foreign",
+          name: "Foreign",
+          defaultProjectId: null,
+        });
+        world.ticking.board = board.id;
+        const target = yield* placed(foreign, "Foreign dependency", { stage: "in_review" });
+        const dependent = yield* placed(board, "Waiting worker");
+        // Seed the persisted wait to exercise planning independently of waitCard's guard.
+        yield* store.putCard({
+          ...dependent,
+          wait: Waits.newWait(
+            { on: "card", card: target, note: "foreign dependency", wakeRole },
+            owner,
+            iso(T0),
+          ),
+        });
+        const sibling = yield* placed(board, "Same foreign dependency");
+        yield* store.putCard({ ...sibling, wait: (yield* cardOf(dependent.id)).wait! });
+        world.ticking.cardReads = [];
+        world.ticking.listedBoards = [];
+        yield* kanban.tick;
+        // LockedStore.card reads ownership, then the guarded row: two raw reads for one lookup.
+        assert.strictEqual(world.ticking.cardReads.filter((id) => id === target.id).length, 2);
+        assert.isTrue(world.ticking.listedBoards.every((id) => id === board.id));
+        assert.isDefined((yield* cardOf(dependent.id)).wait);
+        assert.strictEqual(world.cardThreads(), 0);
+
+        yield* store.putCard({ ...(yield* cardOf(target.id)), stage: "completed" });
+        yield* kanban.tick;
+        const woken = yield* cardOf(dependent.id);
+        assert.isUndefined(woken.wait);
+        if (wakeRole === "evaluator") {
+          yield* world.waitForTold(dependent.id);
+          assert.isAbove(world.toldEvaluator(`Card #${target.number}`), 0);
+          assert.strictEqual(woken.boardId, board.id);
+        } else {
+          assert.strictEqual(woken.activeRole, wakeRole);
+          assert.include(briefOf(world, woken), `Card #${target.number}`);
+        }
+        assert.isTrue(
+          (yield* eventsOf(dependent.id)).some(
+            (event) => Waits.waitEventOf(event) === "end" && event.body?.includes("is done"),
+          ),
+        );
+      }),
+    ),
+);
+
+it.effect("waitCard accepts a cross-board target and refuses a nonexistent target", () =>
+  inWorld(() =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      const foreign = yield* kanban.ensureBoard({
+        slug: "foreign",
+        name: "Foreign",
+        defaultProjectId: null,
+      });
+      const target = yield* placed(foreign, "Foreign dependency", { stage: "in_review" });
+      const dependent = yield* placed(board, "Dependent");
+      const waiting = yield* kanban.waitCard(
+        dependent.id,
+        { on: "card", card: target.id, note: "foreign dependency", wakeRole: "work" },
+        owner,
+      );
+      assert.strictEqual(waiting.wait?.card, target.id);
+      assert.strictEqual((yield* cardOf(dependent.id)).wait?.wakeRole, "work");
+      const missing = yield* Effect.result(
+        kanban.waitCard(
+          dependent.id,
+          { on: "card", card: KanbanCardId.make("missing-card"), note: "missing" },
+          owner,
+        ),
+      );
+      assert.isTrue(Result.isFailure(missing));
+      assert.strictEqual((yield* cardOf(dependent.id)).wait?.card, target.id);
+    }),
+  ),
+);
+
+it.effect("card changes carry foreign wait target metadata without persisting it", () =>
+  inWorld(() =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      const foreign = yield* kanban.ensureBoard({
+        slug: "foreign",
+        name: "Foreign",
+        defaultProjectId: null,
+      });
+      const target = yield* placed(foreign, "Dependency", { stage: "in_review" });
+      const dependent = yield* placed(board, "Dependent");
+      const changes = yield* kanban.changes;
+      yield* kanban.waitCard(
+        dependent.id,
+        { on: "card", card: target.id, note: "dependency" },
+        owner,
+      );
+      const changed = yield* Stream.runHead(
+        changes.pipe(
+          Stream.filter(
+            ({ change }) =>
+              change._tag === "card" &&
+              change.card.id === dependent.id &&
+              change.card.wait?.on === "card",
+          ),
+        ),
+      );
+      assert.isTrue(Option.isSome(changed));
+      if (Option.isSome(changed) && changed.value.change._tag === "card") {
+        assert.deepStrictEqual(changed.value.change.card.wait?.cardTarget, {
+          id: target.id,
+          number: target.number,
+          boardId: foreign.id,
+          boardName: "Foreign",
+        });
+      }
+      assert.isUndefined((yield* store.card(dependent.id))?.wait?.cardTarget);
+    }).pipe(Effect.scoped),
+  ),
+);
+
+it.effect.each(["archived", "deleted"] as const)(
+  "waitCard refuses a target on an %s board",
+  (state) =>
+    inWorld(() =>
+      Effect.gen(function* () {
+        const { kanban, store, board } = yield* setup;
+        const foreign = yield* kanban.ensureBoard({
+          slug: "foreign",
+          name: "Foreign",
+          defaultProjectId: null,
+        });
+        const target = yield* placed(foreign, "Foreign dependency", { stage: "in_review" });
+        const dependent = yield* placed(board, "Dependent");
+        if (state === "archived")
+          yield* store.putBoard({ ...foreign, archivedAt: iso(T0) as never });
+        else yield* store.putCard({ ...target, boardId: KanbanBoardId.make("deleted-board") });
+        const result = yield* Effect.result(
+          kanban.waitCard(
+            dependent.id,
+            { on: "card", card: target.id, note: "foreign dependency" },
+            owner,
+          ),
+        );
+        assert.isTrue(Result.isFailure(result));
+        if (Result.isFailure(result)) assert.include(result.failure.message, state);
+        assert.isUndefined((yield* cardOf(dependent.id)).wait);
+      }),
+    ),
 );
 
 it.effect.each(["thread", "pr"] as const)("local waits end before a stalled %s read", (blockedAt) =>
@@ -2282,36 +2538,34 @@ const wakingTick = Effect.gen(function* () {
   return { kanban, parked, worker, started: turns(5_000, startedOf(parked.id)) };
 });
 
-for (const read of ["candidate", "planning", "confirmation"] as const) {
-  it.effect(
-    `a tick whose closing dispatch fails still gets the dispatch its steps asked for (${read})`,
-    () =>
-      inWorld((world) =>
-        Effect.gen(function* () {
-          const { kanban, parked, worker, started } = yield* wakingTick;
-          world.closing.read = read;
-          // The steps end the wait and note a kick; the closing dispatch fails once
-          // at the selected read, including confirmation after planning.
-          let failed = 0;
-          world.closing.before = Effect.suspend(() => {
-            world.closing.before = null;
-            failed += 1;
-            return Effect.fail(
-              new KanbanStore.KanbanStoreError({ operation: "boards", cause: "disk busy (test)" }),
-            );
-          });
-          const ticked = yield* Effect.exit(kanban.tick);
-          assert.strictEqual(failed, 1, "the closing dispatch failed");
-          assert.isTrue(Exit.isFailure(ticked), "the tick reports the failure");
-          assert.isUndefined((yield* cardOf(parked.id)).wait, "the tick's steps ended the wait");
-          // No second tick: the kick is queued and the worker dispatches.
-          assert.isTrue(yield* started, "the woken card was started without another tick");
-          assert.strictEqual((yield* cardOf(parked.id)).activeRole, "work");
-          yield* Fiber.interrupt(worker);
-        }),
-      ),
-  );
-}
+it.effect.each(["candidate", "planning", "confirmation"] as const)(
+  "a tick whose closing dispatch fails still gets the dispatch its steps asked for (%s)",
+  (read) =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, parked, worker, started } = yield* wakingTick;
+        world.closing.read = read;
+        // The steps end the wait and note a kick; the closing dispatch fails once
+        // at the selected read, including confirmation after planning.
+        let failed = 0;
+        world.closing.before = Effect.suspend(() => {
+          world.closing.before = null;
+          failed += 1;
+          return Effect.fail(
+            new KanbanStore.KanbanStoreError({ operation: "boards", cause: "disk busy (test)" }),
+          );
+        });
+        const ticked = yield* Effect.exit(kanban.tick);
+        assert.strictEqual(failed, 1, "the closing dispatch failed");
+        assert.isTrue(Exit.isFailure(ticked), "the tick reports the failure");
+        assert.isUndefined((yield* cardOf(parked.id)).wait, "the tick's steps ended the wait");
+        // No second tick: the kick is queued and the worker dispatches.
+        assert.isTrue(yield* started, "the woken card was started without another tick");
+        assert.strictEqual((yield* cardOf(parked.id)).activeRole, "work");
+        yield* Fiber.interrupt(worker);
+      }),
+    ),
+);
 
 it.effect(
   "a tick interrupted in its closing dispatch still gets the dispatch its steps asked for",
@@ -2335,3 +2589,300 @@ it.effect(
       }),
     ),
 );
+
+it.effect.each(["completed", "deployed"] as const)(
+  "a move to %s keeps an evaluator's card wait through restart and wakes it when the dependency completes",
+  (to) =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, store, board } = yield* setup;
+        const dependency = yield* placed(board, "Dependency", {
+          stage: "in_review",
+          reviewStep: 1,
+          links: [tracked(PR)],
+        });
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Evaluator gate",
+            prompt: "Evaluator gate",
+            description: "Explicit",
+            subtasks: [{ step: 1, owner: "evaluator", text: "Run after dependency" }],
+          },
+          owner,
+        );
+        yield* store.putCard({ ...card, stage: "in_review", reviewStep: 1 });
+        const evaluator: KanbanActor = {
+          _tag: "evaluator",
+          threadId: ThreadId.make("moving-evaluator"),
+        };
+        const waiting = yield* kanban.waitCard(
+          card.id,
+          {
+            on: "card",
+            card: dependency.id,
+            wakeRole: "evaluator",
+            note: "dependency first",
+          },
+          evaluator,
+        );
+        yield* TestClock.adjust(MINUTE);
+        const moved = yield* kanban.moveCard(card.id, to, "evaluator", evaluator);
+        assert.deepStrictEqual(moved.wait, { ...waiting.wait, at: moved.movedAt });
+        assert.strictEqual(moved.wait?.at, iso(T0 + MINUTE));
+        assert.isTrue(kanbanWaiting(moved));
+        yield* kanban.tick;
+        assert.isTrue(kanbanWaiting(yield* cardOf(card.id)));
+        assert.isFalse(
+          (yield* eventsOf(card.id)).some((event) => event.body?.startsWith("Wait ended:")),
+        );
+        yield* TestClock.adjust(MINUTE);
+        yield* Effect.gen(function* () {
+          const restarted = yield* KanbanService.KanbanService;
+          yield* restarted.tick;
+        }).pipe(Effect.provide(KanbanService.layer));
+        assert.deepStrictEqual((yield* store.card(card.id))?.wait, moved.wait);
+        yield* store.putCard({ ...(yield* cardOf(dependency.id)), stage: "completed" });
+        yield* kanban.tick;
+        yield* world.waitForTold(card.id);
+        assert.isUndefined((yield* cardOf(card.id)).wait);
+        assert.strictEqual(world.toldEvaluator("no longer waiting"), 1);
+      }),
+    ),
+);
+
+it.effect.each([
+  { owner: "evaluator", state: "open", kept: true },
+  { owner: "script", state: "open", kept: true },
+  { owner: "evaluator", state: "done", kept: false },
+  { owner: "script", state: "skipped", kept: false },
+  { owner: "work", state: "open", kept: false },
+  { owner: "review", state: "open", kept: false },
+] as const)("completed move wait policy: $owner $state", ({ owner: taskOwner, state, kept }) =>
+  inWorld(() =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Wait policy",
+          prompt: "Wait policy",
+          description: "Explicit",
+          subtasks: [{ step: 1, owner: taskOwner, text: "Remaining gate" }],
+        },
+        owner,
+      );
+      yield* store.putCard({
+        ...card,
+        stage: "in_review",
+        reviewStep: 1,
+        subtasks: card.subtasks.map((task) => ({ ...task, state })),
+      });
+      yield* kanban.waitCard(card.id, { on: "time", until: iso(T0 + HOUR), note: "later" }, owner);
+      yield* TestClock.adjust(MINUTE);
+      const moved = yield* kanban.moveCard(card.id, "completed", "owner", owner);
+      assert.strictEqual(kanbanWaiting(moved), kept);
+      assert.strictEqual(kanbanWaiting(yield* cardOf(card.id)), kept);
+      const events = (yield* eventsOf(card.id)).filter((event) =>
+        event.body?.startsWith("Wait ended:"),
+      );
+      assert.lengthOf(events, kept ? 0 : 1);
+      if (!kept) {
+        assert.isUndefined(moved.wait);
+        assert.strictEqual(events[0]?.kind, Waits.waitEventKind("wait_cleared"));
+        assert.strictEqual(
+          events[0]?.body,
+          `Wait ended: the card was moved to completed; it was waiting until ${iso(T0 + HOUR)}`,
+        );
+        assert.strictEqual(events[0]?.at, moved.movedAt);
+      }
+    }),
+  ),
+);
+
+it.effect(
+  "keepWait explicitly preserves a wait on a move to todo; a normal move clears it immediately",
+  () =>
+    inWorld(() =>
+      Effect.gen(function* () {
+        const { kanban, board } = yield* setup;
+        const card = yield* placed(board, "Explicit keep", { stage: "in_review", reviewStep: 1 });
+        const waiting = yield* kanban.waitCard(
+          card.id,
+          { on: "time", until: iso(T0 + HOUR), note: "later" },
+          owner,
+        );
+        yield* TestClock.adjust(MINUTE);
+        const kept = yield* kanban.moveCard(card.id, "todo", "owner", owner, { keepWait: true });
+        assert.deepStrictEqual(kept.wait, { ...waiting.wait, at: kept.movedAt });
+        assert.isTrue(kanbanWaiting(kept));
+        yield* TestClock.adjust(MINUTE);
+        const cleared = yield* kanban.moveCard(card.id, "completed", "owner", owner);
+        assert.isUndefined(cleared.wait);
+        assert.isUndefined((yield* cardOf(card.id)).wait);
+        assert.isTrue(
+          (yield* eventsOf(card.id)).some(
+            (event) =>
+              event.kind === Waits.waitEventKind("wait_cleared") &&
+              event.body?.includes("moved to completed"),
+          ),
+        );
+      }),
+    ),
+);
+
+it.effect("restart reconciliation releases a missing thread without voiding its live wait", () =>
+  inWorld(() =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      const card = yield* placed(board, "Recover parked card");
+      const waiting = yield* kanban.waitCard(
+        card.id,
+        { on: "time", until: iso(T0 + HOUR), note: "later" },
+        owner,
+      );
+      const missing = ThreadId.make("missing-after-restart");
+      yield* store.putCard({
+        ...waiting,
+        stage: "working",
+        activeRole: "work",
+        activeThreadId: missing,
+        activePool: "missing-pool",
+        workThreadId: missing,
+      });
+      yield* TestClock.adjust(MINUTE);
+      yield* Effect.gen(function* () {
+        const restarted = yield* KanbanService.KanbanService;
+        yield* restarted.tick;
+        yield* restarted.tick;
+        yield* restarted.tick;
+      }).pipe(Effect.provide(KanbanService.layer));
+      const recovered = yield* cardOf(card.id);
+      assert.isNull(recovered.activeThreadId);
+      assert.strictEqual(recovered.stage, "todo");
+      assert.strictEqual(recovered.movedAt, waiting.movedAt);
+      assert.deepStrictEqual(recovered.wait, waiting.wait);
+      assert.isTrue(kanbanWaiting(recovered));
+    }),
+  ),
+);
+
+it.effect("the stale safety net delivers the wake to the evaluator", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      const card = yield* placed(board, "Stale gate", { stage: "completed" });
+      const waiting = yield* kanban.waitCard(
+        card.id,
+        { on: "time", until: iso(T0 + HOUR), wakeRole: "evaluator", note: "later" },
+        owner,
+      );
+      yield* TestClock.adjust(MINUTE);
+      yield* store.putCard({ ...waiting, movedAt: iso(T0 + MINUTE) });
+      yield* kanban.tick;
+      yield* world.waitForTold(card.id);
+      assert.isUndefined((yield* cardOf(card.id)).wait);
+      assert.strictEqual(world.toldEvaluator("moved to completed while it waited"), 1);
+    }),
+  ),
+);
+
+it.effect("a preserved wait suppresses the evaluator step notification after an owner move", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Parked evaluator step",
+          prompt: "Parked evaluator step",
+          description: "Explicit",
+          subtasks: [{ owner: "evaluator", step: 1, text: "Do after the wait" }],
+        },
+        owner,
+      );
+      yield* store.putCard({ ...(yield* cardOf(card.id)), stage: "needs_owner" });
+      yield* kanban.waitCard(
+        card.id,
+        { on: "time", until: iso(T0 + HOUR), wakeRole: "evaluator", note: "later" },
+        owner,
+      );
+      const before = world.said("Do them");
+      yield* TestClock.adjust(MINUTE);
+      const moved = yield* kanban.moveCard(card.id, "completed", "owner", owner);
+      yield* kanban.tick;
+      assert.isTrue(kanbanWaiting(moved));
+      assert.strictEqual(world.said("Do them"), before);
+    }),
+  ),
+);
+
+it.effect(
+  "rejected reused assignment restores a stale wait so its requested wake is delivered",
+  () =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, store, board } = yield* setup;
+        const card = yield* placed(board, "Rejected assignment");
+        yield* kanban.dispatchNow;
+        const thread = (yield* cardOf(card.id)).activeThreadId!;
+        yield* kanban.moveCard(card.id, "todo", "owner", owner);
+        const waiting = yield* kanban.waitCard(
+          card.id,
+          { on: "time", until: iso(T0 + HOUR), wakeRole: "evaluator", note: "later" },
+          owner,
+        );
+        yield* TestClock.adjust(MINUTE);
+        yield* store.putCard({ ...waiting, movedAt: iso(T0 + MINUTE) });
+        world.rejectedAssignments.add(thread);
+        yield* kanban.dispatchNow;
+        const rolledBack = yield* cardOf(card.id);
+        assert.isNull(rolledBack.activeThreadId);
+        assert.deepStrictEqual(rolledBack.wait, waiting.wait);
+        assert.strictEqual(rolledBack.movedAt, iso(T0 + MINUTE));
+        yield* kanban.tick;
+        yield* world.waitForTold(card.id);
+        assert.isUndefined((yield* cardOf(card.id)).wait);
+        assert.strictEqual(world.toldEvaluator("moved to todo while it waited"), 1);
+      }),
+    ),
+);
+
+it.effect("a rolled-back local wait emits no lifecycle analytics", () => {
+  const failCommit = { armed: false, failures: 0 };
+  const events: AnalyticsEvent[] = [];
+  const world = makeWorld({ failCommit, analytics: events });
+  return Effect.gen(function* () {
+    yield* TestClock.setTime(T0);
+    const { kanban, board } = yield* setup;
+    yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+    const card = yield* placed(board, "Wait", { stage: "needs_review" });
+    yield* kanban.waitCard(
+      card.id,
+      { on: "time", until: iso(T0 + MINUTE), wakeRole: "work", note: "Continue" },
+      owner,
+    );
+    events.length = 0;
+    yield* TestClock.setTime(T0 + 2 * MINUTE);
+    failCommit.armed = true;
+    yield* kanban.tick;
+    assert.strictEqual(failCommit.failures, 1);
+    assert.equal((yield* cardOf(card.id)).stage, "needs_review");
+    assert.isDefined((yield* cardOf(card.id)).wait);
+    assert.isFalse(
+      events.some((event) => event.cardId === card.id && event.kind === "kanban.card_move"),
+    );
+    failCommit.armed = false;
+    yield* kanban.tick;
+    assert.equal((yield* cardOf(card.id)).stage, "todo");
+    assert.lengthOf(
+      events.filter(
+        (event) =>
+          event.cardId === card.id &&
+          event.kind === "kanban.card_move" &&
+          event.props?.to === "todo",
+      ),
+      1,
+    );
+  }).pipe(Effect.provide(world.layer));
+});

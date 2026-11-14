@@ -1,6 +1,6 @@
-import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, mkdtempSync, openSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { constants } from "node:os";
 
@@ -11,8 +11,8 @@ export type LogEntry = {
 };
 const token = /^[a-zA-Z][a-zA-Z0-9_.-]{0,79}$/;
 const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper"]);
-const numeric = new Set(["exitCode", "attempt", "count", "bytes", "queuedMs"]);
-const boolean = new Set(["deduped", "accepted", "timedOut"]);
+const numeric = new Set(["exitCode", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources", "events", "waitMs", "spanMs", "graceMs", "relays"]);
+const boolean = new Set(["deduped", "accepted", "timedOut", "notified", "batched", "urgent", "closing", "archived", "frozenContext", "batchOpen", "grace"]);
 const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
 const values: Record<string, readonly string[]> = {
@@ -21,10 +21,22 @@ const values: Record<string, readonly string[]> = {
   class: ["urgent", "today", "info", "noise", "candidate", "charge", "bank", "security", "otp", "unknown", "fail_open", "deduped"],
   action: ["create", "queue", "cancel", "snooze", "sent", "retry", "check", "wake", "notify", "send", "coalesce", "conflict", "expire", "pause", "remove", "cap", "resume"],
   state: ["pending", "sending", "sent", "uncertain", "cancelled", "failed", "scheduled", "queued", "done", "expired", "paused", "active"],
-  stderrClass: ["usage_error", "missing_file", "permission", "timeout", "python_traceback", "unknown"],
+  stderrClass: ["usage_error", "missing_file", "permission", "timeout", "python_traceback", "auth", "connect", "json", "unknown"],
   triggerKind: ["file", "wal"],
+  step: ["native", "status"],
+  route: ["person", "owner", "group", "creator", "other"],
+  via: ["wake", "thread", "imessage-send", "telegram", "none"],
 };
-export const logDirectory = () => process.env.TOOLLOG_DIR ?? join(homedir(), ".robob/logs/tools/watchers");
+let testRoot: string | undefined;
+export const logDirectory = () => {
+  if (process.env.TOOLLOG_DIR) return process.env.TOOLLOG_DIR;
+  const bunTest = process.versions.bun && /(?:\.(?:test|spec)|_(?:test|spec))\.[cm]?[jt]sx?$/.test(process.argv[1] ?? "");
+  if (process.env.ROBOB_TEST || process.env.NODE_ENV === "test" || process.env.PYTEST_CURRENT_TEST || bunTest) {
+    testRoot ??= mkdtempSync(join(tmpdir(), "watchers-test-logs-"));
+    return process.env.TOOLLOG_DIR = testRoot;
+  }
+  return join(homedir(), ".robob/logs/tools/watchers");
+};
 const initialized = new Set<string>();
 const CAP = 50 * 1024 * 1024;
 
@@ -45,6 +57,12 @@ function fields(entry: LogEntry, at: Date) {
     else if (key === "stderrHash" && typeof value === "string" && /^[a-f0-9]{16}$/.test(value)) props[key] = value;
     else if (key === "errnoCode" && typeof value === "string" && (errnoCodes.has(value) || value === "UNKNOWN")) props[key] = value;
     else if (key === "signal" && typeof value === "string" && signals.has(value)) props[key] = value;
+    else if ((entry.name === "watch.grace_ended" || entry.name === "watch.removed") && key === "reason" && typeof value === "string"
+      && ["expired", "resume", "now", "paused", "no_inflight_check"].includes(value)) props[key] = value;
+    else if (entry.name === "wake.creator_fallback" && key === "reason" && typeof value === "string"
+      && /^(?:timeout|invalid|archived|exit:\d{1,3})$/.test(value)) props[key] = value;
+    else if (entry.name === "wake.creator_fallback" && key === "durationMs" && typeof value === "number"
+      && Number.isFinite(value) && value >= 0) props[key] = value;
     else if (numeric.has(key) && typeof value === "number" && Number.isFinite(value)) props[key] = value;
     else if (boolean.has(key) && typeof value === "boolean") props[key] = value;
     else if (typeof value === "string" && values[key]?.includes(value)) props[key] = value;

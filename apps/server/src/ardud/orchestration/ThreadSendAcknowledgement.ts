@@ -14,15 +14,26 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import type * as Scope from "effect/Scope";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 interface Lease {
   readonly requestId: string;
   readonly check: () => boolean;
   readonly accept: (result: OrchestratorMcpThreadSendResult) => void;
+  readonly waitingOn: (wait: string) => () => void;
 }
 
 const lease = Context.Reference<Lease | undefined>("ardud/ThreadSendAcknowledgement/lease", {
   defaultValue: () => undefined,
+});
+
+// The send deadline owns the span; these labels identify its pending operation.
+export const waitingOn = Effect.fnUntraced(function* <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  wait: string,
+) {
+  const restore = (yield* lease)?.waitingOn(wait);
+  return yield* effect.pipe(Effect.ensuring(Effect.sync(() => restore?.())));
 });
 
 interface Command {
@@ -141,13 +152,23 @@ export const bounded = Effect.fn("ThreadSendAcknowledgement.bounded")(function* 
   const crypto = yield* Crypto.Crypto;
   const requestId = clientRequestId ?? (yield* crypto.randomUUIDv4().pipe(Effect.orDie));
   const reply = yield* Deferred.make<OrchestratorMcpThreadSendResult, E | OrchestratorMcpFailure>();
-  const timeout = new OrchestratorMcpFailure({
-    code: "send_timeout",
-    message: `This attempt did not save a new message. Retry with the same clientRequestId: ${requestId}. An earlier attempt with that id may already have been saved.`,
-  });
+  let wait = "send preflight";
+  const timeout = () =>
+    new OrchestratorMcpFailure({
+      code: "send_timeout",
+      message: `Thread send timed out waiting for ${wait}. This attempt did not save a new message. Retry with the same clientRequestId: ${requestId}. An earlier attempt with that id may already have been saved.`,
+    });
   let state: "pending" | "accepted" | "expired" | "finished" = "pending";
   const pending: Lease = {
     requestId,
+    waitingOn: (next) => {
+      const previous = wait;
+      wait = next;
+      return () => {
+        // Keep the expired operation if its absolute fence wins before the timer runs.
+        if (clock.monotonicTimeNanosUnsafe() - started < 15_000_000_000n) wait = previous;
+      };
+    },
     check: () =>
       state === "pending" && clock.monotonicTimeNanosUnsafe() - started < 15_000_000_000n,
     accept: (result) => {
@@ -159,6 +180,9 @@ export const bounded = Effect.fn("ThreadSendAcknowledgement.bounded")(function* 
     },
   };
   const worker = effect(requestId).pipe(
+    // Access checks and dispatch both read before COMMIT. Background sweeps must
+    // not consume the send's entire commit lease while these reads wait for a slot.
+    NodeSqliteClient.foregroundReads,
     Effect.provideService(lease, pending),
     Effect.onExit((exit) =>
       state === "accepted" && exit._tag === "Failure"
@@ -168,7 +192,7 @@ export const bounded = Effect.fn("ThreadSendAcknowledgement.bounded")(function* 
             // The absolute fence can expire before the timer gets scheduled.
             if (clock.monotonicTimeNanosUnsafe() - started >= 15_000_000_000n) {
               state = "expired";
-              Deferred.doneUnsafe(reply, Effect.fail(timeout));
+              Deferred.doneUnsafe(reply, Effect.fail(timeout()));
               return;
             }
             state = "finished";
@@ -199,7 +223,8 @@ export const bounded = Effect.fn("ThreadSendAcknowledgement.bounded")(function* 
           orElse: () =>
             Effect.suspend(() => {
               if (state === "accepted" || state === "finished") return Deferred.await(reply);
-              return abandon(worker).pipe(Effect.andThen(Effect.fail(timeout)));
+              const error = timeout();
+              return abandon(worker).pipe(Effect.andThen(Effect.fail(error)));
             }),
         }),
       ),

@@ -101,13 +101,9 @@ const layerFor = (
     currentNative: () => Effect.succeed(new Map()),
   });
   const threads = Layer.mock(ThreadManagementService.ThreadManagementService)({
-    getShellSnapshot: () =>
-      Effect.succeed({
-        schemaVersion: 1,
-        snapshotSequence: 1,
-        threads: [...fixture.shells.values()],
-        archivedThreads: [],
-      } as never),
+    listActiveThreadIds: () =>
+      Effect.succeed([...fixture.shells.keys()].map((id) => ThreadId.make(id))),
+    getShellSnapshot: () => Effect.die("recovery must not build shell snapshots"),
     getThreadShell: (id) => Effect.succeed(fixture.shells.get(id) ?? null),
   });
   const orchestrator = Layer.mock(Orchestrator.OrchestratorV2)({
@@ -156,13 +152,8 @@ describe("RecoverySnapshot", () => {
     const hydrated: Array<string> = [];
     const orchestrator = Layer.mock(Orchestrator.OrchestratorV2)({
       getThreadShell: () => Effect.succeed(shell),
-      getShellSnapshot: () =>
-        Effect.succeed({
-          schemaVersion: 1,
-          snapshotSequence: 1,
-          threads: [shell],
-          archivedThreads: [],
-        } as never),
+      listActiveThreadIds: () => Effect.succeed([targetId]),
+      getShellSnapshot: () => Effect.die("recovery must not build shell snapshots"),
       getThreadRecords: (id) =>
         Effect.succeed({
           runs: [runFor(id, "running")],
@@ -205,6 +196,10 @@ describe("RecoverySnapshot", () => {
       const managementService = yield* ThreadManagementService.ThreadManagementService;
       yield* managementService.getThreadRecords(controlId, ["runs"]);
       assert.deepStrictEqual(hydrated, [controlId]);
+      assert.deepStrictEqual(
+        yield* managementService.listActiveThreadIds().pipe(NodeSqliteClient.readOnly),
+        [targetId],
+      );
       const snapshot = yield* RecoverySnapshot.RecoverySnapshot;
       for (const active of [true, false]) {
         const page = yield* snapshot
@@ -251,6 +246,41 @@ describe("RecoverySnapshot", () => {
       assert.strictEqual(new Set(seen).size, 1200);
       assert.deepStrictEqual(seen, [...fixture.liveIds]);
       assert.strictEqual(pages.third.nextCursor, null);
+    }),
+  );
+
+  it.effect("keeps cursor pages for live and active IDs without reading a shell snapshot", () =>
+    Effect.gen(function* () {
+      const ids = ["thread-z", "thread-9", "thread-A", "thread-a", "thread-0"];
+      const fixture: Fixture = {
+        ...liveFixture(0),
+        liveIds: [ids[0]!, ids[1]!, ids[0]!, ids[2]!],
+        shells: new Map(ids.map((id) => [id, shellFor(id)])),
+      };
+      const layer = layerFor(
+        fixture,
+        sessionsWith(() => Effect.succeed(Option.none())),
+      );
+      yield* snapshotOf(layer, (snapshot) =>
+        Effect.gen(function* () {
+          for (const active of [true, false]) {
+            // The old shell path fed these same explicit IDs into pageIds.
+            const expected = [...new Set(active ? fixture.liveIds : ids)].sort();
+            let cursor: string | null = null;
+            for (let offset = 0; offset < expected.length; offset += 2) {
+              const page = yield* snapshot.page({ active, cursor, limit: 2 });
+              assert.deepStrictEqual(
+                page.threads.map((entry) => entry.threadId),
+                expected.slice(offset, offset + 2),
+              );
+              cursor = offset + 2 < expected.length ? expected[offset + 1]! : null;
+              assert.strictEqual(page.nextCursor, cursor);
+            }
+            const exhausted = yield* snapshot.page({ active, cursor: "zzzz", limit: 2 });
+            assert.deepStrictEqual(exhausted, { threads: [], nextCursor: null });
+          }
+        }),
+      );
     }),
   );
 

@@ -1,3 +1,5 @@
+import { DeletedBoardsDialog } from "./BoardDeletion";
+import { askNotificationsRef } from "./needsYou/useAskTiming";
 import { Link, useMatchRoute, useParams, useSearch } from "@tanstack/react-router";
 import * as Schema from "effect/Schema";
 import { CircleHelpIcon, InboxIcon, MessageCircleIcon } from "lucide-react";
@@ -69,6 +71,7 @@ export function BoardsSidebarGroup() {
         </button>
         <NewBoardDialog open={creating} onOpenChange={setCreating} />
       </div>
+      <DeletedBoardsDialog />
       {live.length > 0 ? <NeedsYouRow onNavigate={onNavigate} /> : null}
       {expanded && live.length > 0 ? (
         <ul className="flex flex-col gap-0.5 pb-3.5">
@@ -112,8 +115,19 @@ function NeedsYouRow(props: { onNavigate: () => void }) {
   const error = useAskStore((state) => state.error);
   const nowMs = useNowMs();
   const shown = askRowFigure(askQueueFigures({ feed, status, error }), count, nowMs);
+  const hidden = useAskStore((state) => state.hidden);
   return (
     <Link
+      ref={askNotificationsRef(
+        (shown.count === null ? [] : (feed?.open ?? [])).filter(
+          (entry) =>
+            entry.waitsOn === "owner" &&
+            !entry.expired &&
+            !entry.snoozed &&
+            entry.ask.respond?.ack !== true &&
+            hidden[askKey(entry)] === undefined,
+        ),
+      )}
       to="/needs-you"
       search={{}}
       onClick={props.onNavigate}

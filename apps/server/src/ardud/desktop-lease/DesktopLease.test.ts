@@ -3,6 +3,7 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
 import * as NodeWorkerThreads from "node:worker_threads";
+import * as DateTime from "effect/DateTime";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
 import {
@@ -71,6 +72,98 @@ const conflict = (operation: () => unknown) => {
 };
 
 describe("desktop lease", () => {
+  it("refreshes the deadline on admitted call-start and call-end", () => {
+    const { open, addTime } = setup();
+    const store = open();
+    const first = store.acquire(caller("1"), request("1"));
+    expect(first.status.lease).toMatchObject({
+      staleAfterMs: STALE_MS,
+      heartbeatBy: DateTime.formatIso(DateTime.makeUnsafe(1_750_000_000_000 + STALE_MS)),
+    });
+    addTime(100_000);
+    const started = store.callStart(caller("1"), "active-call").lease!;
+    expect(started.heartbeatBy).toBe(
+      DateTime.formatIso(DateTime.makeUnsafe(1_750_000_100_000 + STALE_MS)),
+    );
+    addTime(STALE_MS - 1);
+    expect(store.status().lease?.state).toBe("held");
+    const ended = store.callEnd("active-call", "completed").lease!;
+    expect(ended.heartbeatBy).toBe(
+      DateTime.formatIso(
+        DateTime.add(DateTime.makeUnsafe(ended.heartbeatAt), { milliseconds: STALE_MS }),
+      ),
+    );
+    addTime(STALE_MS - 1);
+    expect(store.status().lease?.state).toBe("held");
+    addTime(1);
+    const stopped = store.status().lease!;
+    expect(stopped.state).toBe("stopping");
+    expect(stopped).not.toHaveProperty("staleAfterMs");
+    expect(stopped).not.toHaveProperty("heartbeatBy");
+  });
+
+  it("rejects call-start at the stale deadline without refreshing the holder", () => {
+    const { open, addTime } = setup();
+    const store = open();
+    const initial = store.acquire(caller("1"), request("1")).status.lease!;
+    addTime(STALE_MS);
+    expect(() => store.callStart(caller("1"), "too-late")).toThrow(
+      "Only the current lease holder may start desktop work.",
+    );
+    expect(store.status().lease).toMatchObject({
+      state: "stopping",
+      heartbeatAt: initial.heartbeatAt,
+    });
+  });
+
+  it("touches only a matching held holder and does not advance the lease", () => {
+    const { open, addTime } = setup();
+    const store = open();
+    expect(store.currentLease()).toBeNull();
+    store.touchHolder("child-1");
+    const initial = store.acquire(caller("1"), request("1")).status.lease!;
+    addTime(STALE_MS * 3);
+    store.touchHolder("child-2");
+    store.touchHolder("child-1", "different-ticket");
+    expect(store.currentLease()).toEqual(initial);
+    store.touchHolder("child-1", initial.ticket);
+    const touched = store.status().lease!;
+    expect(touched.state).toBe("held");
+    expect(touched.heartbeatAt).not.toBe(initial.heartbeatAt);
+    addTime(STALE_MS);
+    expect(store.status().lease?.state).toBe("stopping");
+    store.touchHolder("child-1");
+    expect(store.currentLease()).toMatchObject({
+      state: "stopping",
+      heartbeatAt: touched.heartbeatAt,
+    });
+    addTime(QUIET_MS - 1);
+    expect(store.status().lease?.state).toBe("stopping");
+    addTime(1);
+    expect(store.status().lease).toBeNull();
+    store.touchHolder("child-1");
+    expect(store.currentLease()).toBeNull();
+  });
+
+  it("does not touch a manually stopping or quarantined holder", () => {
+    const { open, addTime } = setup();
+    const store = open();
+    const first = store.acquire(caller("1"), request("1"));
+    store.callStart(caller("1"), "hung-touch");
+    const stopped = store.release(caller("1"), first.ticket).lease!;
+    addTime(100_000);
+    store.touchHolder("child-1");
+    expect(store.currentLease()).toEqual(stopped);
+    addTime(QUIET_MS - 100_000);
+    const quarantined = store.status().lease!;
+    expect(quarantined.state).toBe("quarantined");
+    expect(quarantined).not.toHaveProperty("staleAfterMs");
+    expect(quarantined).not.toHaveProperty("heartbeatBy");
+    addTime(100_000);
+    store.touchHolder("child-1");
+    expect(store.currentLease()).toEqual(quarantined);
+  });
+
   it("serializes connections, preserves FIFO, and grants the head only on its retry", () => {
     const { open } = setup();
     const a = open();
@@ -378,6 +471,7 @@ describe("desktop lease", () => {
     expect(store.callEnd("old-call", "failed").lease).toMatchObject({
       ticket: second.ticket,
       state: "held",
+      heartbeatAt: second.status.lease!.heartbeatAt,
     });
     expect(store.callEnd("old-call", "failed").lease).toMatchObject({
       ticket: second.ticket,

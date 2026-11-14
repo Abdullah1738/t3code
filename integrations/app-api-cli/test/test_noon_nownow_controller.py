@@ -1,5 +1,6 @@
 import time
 import unittest
+import order_card
 import hashlib
 from noon_checkout import AccountHome,fingerprint
 from noon_minutes_checkout import _json
@@ -9,8 +10,8 @@ import noon_nownow_controller as c
 
 class NativeControllerTests(unittest.TestCase):
     def setUp(self):
-        self.row={'id':'native-token','ccMasked':'xxxx2342','ccType':'MASTERCARD','isDeleted':False}
-        self.card=SavedCard('native-token','xxxx2342','mastercard')
+        self.row={'id':'native-token','ccMasked':'xxxx' + order_card.LAST4,'ccType':order_card.NETWORK.upper(),'isDeleted':False}
+        self.card=SavedCard('native-token','xxxx' + order_card.LAST4,order_card.NETWORK)
         self.home=AccountHome('nownow','1'*64,'2'*64,time.time())
 
     def test_native_instrument_to_context_exact_five_keys_no_wallet(self):
@@ -25,7 +26,7 @@ class NativeControllerTests(unittest.TestCase):
     def test_sync_binding_uses_real_request_receipt_not_basket_echo(self):
         digest=hashlib.sha256(_json(payment_payload('SESSION',self.card))).hexdigest()
         response={'data':{'checkoutSessionCode':'SESSION','paymentMethodCode':'prepaid',
-            'creditCardMask':'xxxx2342','orderWalletAmount':0,
+            'creditCardMask':'xxxx' + order_card.LAST4,'orderWalletAmount':0,
             'prepaidPaymentMisc':{'prepaidPaymentMethodCode':'cc_noonpay'}}}
         receipt={'service':'nownow','operation':'payment','request_sha256':digest,
             'outcome':'RESPONSE_RECEIVED','http_status':200,'evidence_hash':'3'*64}

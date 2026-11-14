@@ -317,6 +317,7 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
                 archivedAt: null,
                 activeRunId: RunId.make("mcp-core-run"),
                 providerInstanceId: ProviderInstanceId.make("codex"),
+                forkedFrom: null,
               } as OrchestrationV2ThreadShell),
             getThreadShell: () =>
               Effect.succeed({
@@ -325,6 +326,7 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
                 archivedAt: null,
                 activeRunId: RunId.make("mcp-core-run"),
                 providerInstanceId: ProviderInstanceId.make("codex"),
+                forkedFrom: null,
               } as OrchestrationV2ThreadShell),
             // No run in the projection, so the tool result alone carries the page.
             getThreadRecords: () => Effect.succeed({ runs: [] } as never),
@@ -405,6 +407,7 @@ it.effect("records the calling agent and the agent a tool acted on", () => {
       archivedAt: null,
       deletedAt: null,
       activeRunId: "mcp-core-run",
+      forkedFrom: null,
       createdBy: "agent",
       creationSource: "mcp",
       lineage: {

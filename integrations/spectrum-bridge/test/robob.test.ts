@@ -1,11 +1,11 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test";
+import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { backendKind } from "../src/backend.ts";
-import { discoverControlConfig, parseSse, questionFrom, type ControlMessage, type PendingRequest } from "../src/control.ts";
+import { ControlClient, discoverControlConfig, parseSse, questionFrom, type ControlMessage, type PendingRequest } from "../src/control.ts";
 import type { NormalizedInbound, Photon } from "../src/photon.ts";
 import { GUIDANCE_END, GUIDANCE_START, recordsFromThread, retireUnresolvedRoute, RobobBackend, SELECTED_MODEL_ISSUE, sentMessagePrefix, withoutGuidance } from "../src/robob.ts";
 import { opencodeRunEvidence } from "../src/opencode-steps.ts";
@@ -320,7 +320,8 @@ test.each(["owner", "forChat"])("%s first-turn failures send one attention alert
   expect(store.pendingOutbox().filter(item => item.kind === "control").map(item => item.text)).toEqual([
     "The chat's model isn't available, so I couldn't process that message. Resending it won't fix this.",
   ]);
-  expect(inbounds(store)).toEqual([{ id: "first", state: "failed" }]);
+  expect(inbounds(store)).toEqual([{ id: "first", state: "done" }]);
+  expect(store.inboundFailure("first")).toMatchObject({ stage: "execution" });
   expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(1);
 });
 
@@ -1119,7 +1120,7 @@ async function failedWake(path: string, session: string, base: number, offsetsMs
     await router.tick();
     states.push(inbounds(store).find(row => row.id === wake)?.state ?? "missing");
   }
-  return { control, store, router, states, sends: () => control.calls.filter(call => call.path.endsWith("/send")).length };
+  return { control, store, router, wake, states, sends: () => control.calls.filter(call => call.path.endsWith("/send")).length };
 }
 
 test("an errored step classified between OpenCode's commits, before the native idle marker, is never retried, even when execution later completes a tool", async () => {
@@ -1134,7 +1135,8 @@ test("an errored step classified between OpenCode's commits, before the native i
   db.close();
   const first = await failedWake(path, "ses_between", base, []);
   // No idle marker yet: the run is between OpenCode's commits, so it is unsettled and the wake is not retried.
-  expect(first.states).toEqual(["failed"]);
+  expect(first.states).toEqual(["done"]);
+  expect(first.store.inboundFailure(first.wake)).toMatchObject({ stage: "execution" });
   expect(first.sends()).toBe(1);
   // Execution carries on: retry.scheduled lands, then a tool completes, then the run settles idle.
   const later = new Database(path);
@@ -1153,7 +1155,8 @@ test("an error step with a pending native retry is never retried, even when that
   // OpenCode recorded the first call as an error with text and a pending retry: the execution is not settled.
   const { path, base } = nativeDb("ses_retry_run", [["msg_retry", { finish: "error", content: [{ type: "text", text: "partial" }], retry: { attempt: 2, at: Date.now() + 120_000 }, error: { type: "provider.internal" } }]]);
   const first = await failedWake(path, "ses_retry_run", base, []);
-  expect(first.states).toEqual(["failed"]);
+  expect(first.states).toEqual(["done"]);
+  expect(first.store.inboundFailure(first.wake)).toMatchObject({ stage: "execution" });
   expect(first.sends()).toBe(1);
   // During the backoff the same execution carries on and completes a tool. A terminal step does not prove it stopped.
   const db = new Database(path);
@@ -1171,7 +1174,8 @@ test("an unfinished native step is never retried, even when that run later compl
   const { path, base } = nativeDb("ses_cont_run", [["msg_open", { content: [] }]]);
   const first = await failedWake(path, "ses_cont_run", base, []);
   // Robob failed the run, but the native row is unfinished: the wake is reported and not retried.
-  expect(first.states).toEqual(["failed"]);
+  expect(first.states).toEqual(["done"]);
+  expect(first.store.inboundFailure(first.wake)).toMatchObject({ stage: "execution" });
   expect(first.sends()).toBe(1);
   // The same native row keeps running and finishes with a tool call. The router must still not send again.
   const db = new Database(path);
@@ -1187,7 +1191,8 @@ test("an unfinished native step is never retried, even when that run later compl
 test("a new chat's first-call error with text is reported without replaying the wake", async () => {
   const { path, base } = nativeDb("ses_text_400", [["msg_text", { finish: "error", content: [{ type: "text", text: "partial" }], error: { type: "aborted" } }]]);
   const run = await failedWake(path, "ses_text_400", base, [120_000]);
-  expect(run.states).toEqual(["failed", "failed"]);
+  expect(run.states).toEqual(["done", "done"]);
+  expect(run.store.inboundFailure(run.wake)).toMatchObject({ stage: "execution" });
   expect(run.sends()).toBe(1);
   expect(run.store.pendingOutbox().filter(item => item.kind === "control").map(item => item.text)).toEqual([
     "I couldn't process that message because this chat hit a system error. Please don't resend it yet.",
@@ -1197,7 +1202,8 @@ test("a new chat's first-call error with text is reported without replaying the 
 test("a new chat's first-call error with reasoning is reported without replaying the wake", async () => {
   const { path, base } = nativeDb("ses_reason_400", [["msg_reason", { finish: "error", content: [{ type: "reasoning", text: "thinking" }], error: { type: "aborted" } }]]);
   const run = await failedWake(path, "ses_reason_400", base, [120_000]);
-  expect(run.states).toEqual(["failed", "failed"]);
+  expect(run.states).toEqual(["done", "done"]);
+  expect(run.store.inboundFailure(run.wake)).toMatchObject({ stage: "execution" });
   expect(run.sends()).toBe(1);
 });
 
@@ -1236,7 +1242,8 @@ test("a run whose tool call sits past a truncated scan is never retried, through
   thread.nativeSessionId = "ses_native_long";
   thread.runs.at(-1)!.status = "interrupted";
   await router.tick();
-  expect(inbounds(store).find(row => row.id === wake)?.state).toBe("failed");
+  expect(inbounds(store).find(row => row.id === wake)?.state).toBe("done");
+  expect(store.inboundFailure(wake)).toMatchObject({ stage: "synthetic" });
   setSystemTime(start + 120_000);
   await router.tick();
   expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(1);
@@ -1574,15 +1581,106 @@ test.each([false, true])("an older busy run finishing without a later wake frees
   expect(inbounds(store)).toContainEqual({ id: "next", state: "done" });
 });
 
-test("control calls log method/duration on success and failure, with no bodies or query data", async () => {
+test("control calls aggregate success timing and retain failed method/duration, with no bodies or query data", async () => {
   const { captureLogs } = await import("./log-fixture.ts");
   const { ControlClient } = await import("../src/control.ts");
+  const { toolLog } = await import("../src/toollog.ts");
+  toolLog.flush();
+  await toolLog.settled();
   const logs = await captureLogs(async () => {
     const control = fakeControl();
     const client = new ControlClient({ url: control.url, token: "test-token" });
     await client.request("GET", "/health?private=PRIVATE_QUERY");
     await expect(client.request("POST", "/missing", { text: "PRIVATE_BODY", token: "PRIVATE_TOKEN" })).rejects.toThrow();
+    toolLog.flush();
   });
-  expect(logs.filter(l => l.name === "turn.robob_call").map(l => [l.ok, l.props?.method])).toEqual([[true, "GET"], [false, "POST"]]);
+  const summary = logs.find(l => l.name === "turn.robob_calls")!;
+  expect(summary.calls?.health).toMatchObject({ count: 1, ok: 1, failed: 0 });
+  expect(summary.calls?.health.p50).toBeGreaterThanOrEqual(0);
+  const failed = logs.filter(l => l.name === "turn.robob_call" && l.ok === false);
+  expect(failed).toHaveLength(1);
+  expect(failed[0]).toMatchObject({ props: { method: "POST", route: "/missing" } });
+  expect(failed[0]!.error?.tag).toBe("control.request_failed");
+  expect(failed[0]!.durationMs).toBeGreaterThanOrEqual(0);
   for (const value of ["PRIVATE_", "test-token"]) expect(JSON.stringify(logs)).not.toContain(value);
+});
+
+
+test("steering files: images accompany strict same-id sends without a second prompt", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  await backend.prompt(id, directory, `msg_${"a".repeat(64)}`, "Work");
+  const bytes = new Uint8Array([1, 2, 3]);
+  const uploaded: unknown[] = [];
+  const attachment = { attachmentId: "image-1", type: "image" as const, name: "flight.png", mimeType: "image/png", sizeBytes: bytes.length };
+  const upload = spyOn(ControlClient.prototype, "upload").mockImplementation(async file => { uploaded.push(file); return attachment; });
+  try {
+    const requestId = `msg_${"d".repeat(64)}`;
+    const files = [{ type: "file" as const, mime: "image/png", filename: "flight.png", url: "data:image/png;base64,AQID" }];
+    expect(await backend.steer(id, directory, requestId, "Add these flights", "File guidance", files)).toBe("steered");
+    expect(await backend.steer(id, directory, requestId, "Add these flights", "File guidance", files)).toBe("started");
+    expect(uploaded).toEqual([1, 2].map(() => ({ name: "flight.png", mimeType: "image/png", bytes })));
+    expect(control.calls.filter(call => call.body?.clientRequestId === requestId).map(call => call.body)).toEqual([1, 2].map(() => ({
+      text: "Add these flights", guidance: "File guidance", mode: "steer", clientRequestId: requestId, attachments: [attachment],
+    })));
+    expect(control.threads.get(id)!.messages).toHaveLength(2);
+    expect(await backend.promptAccepted(id, directory, requestId)).toBe(true);
+  } finally { upload.mockRestore(); }
+});
+
+
+test.each(["question", "cancel"])("steering files: %s during upload prevents the later POST", async kind => {
+  const control = fakeControl(); const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  await backend.prompt(id, directory, `msg_${"a".repeat(64)}`, "Work");
+  const entered = Promise.withResolvers<void>();
+  const uploaded = Promise.withResolvers<{ attachmentId: string; type: "image"; name: string; mimeType: string; sizeBytes: number }>();
+  const abort = new AbortController();
+  let blocked = false, checks = 0;
+  const upload = spyOn(ControlClient.prototype, "upload").mockImplementation(async (_file, signal) => {
+    expect(signal).toBe(abort.signal); entered.resolve(); return uploaded.promise;
+  });
+  try {
+    const requestId = `msg_${"e".repeat(64)}`;
+    const sending = backend.steer(id, directory, requestId, "These flights", "guidance", [{ type: "file", mime: "image/png", url: "data:image/png;base64,AQID" }], {
+      signal: abort.signal, beforeSend: async () => { checks++; return !blocked; },
+    });
+    await entered.promise;
+    blocked = true;
+    if (kind === "cancel") abort.abort();
+    uploaded.resolve({ attachmentId: "image-2", type: "image", name: "flight.png", mimeType: "image/png", sizeBytes: 3 });
+    expect(await sending).toBe("refused");
+    expect(checks).toBe(kind === "question" ? 1 : 0);
+    expect(control.calls.filter(call => call.body?.clientRequestId === requestId)).toEqual([]);
+    expect(control.threads.get(id)!.messages).toHaveLength(1);
+  } finally { upload.mockRestore(); }
+});
+
+test("steering files: cancellation aborts an upload already in flight", async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<Response>();
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    if (new URL(request.url).pathname === "/api/ardud/control/attachments") return Response.json({ ok: true, attachmentId: "file-1", relativeUrl: "/upload" });
+    entered.resolve(); return release.promise;
+  } });
+  servers.push(server);
+  const client = new ControlClient({ url: server.url.origin, token: "test-token" });
+  const abort = new AbortController();
+  const uploading = client.upload({ name: "file.bin", mimeType: "application/octet-stream", bytes: new Uint8Array([1]) }, abort.signal);
+  await entered.promise; abort.abort();
+  try { await expect(uploading).rejects.toThrow("Robob control request failed"); }
+  finally { release.resolve(new Response("")); }
+});
+
+
+test("steering files: incomplete family lists are unknown to admission", async () => {
+  const control = fakeControl(); const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  const list = spyOn(ControlClient.prototype, "listThreads").mockResolvedValue({ total: 501, threads: [] });
+  try {
+    await expect(backend.statuses(true)).rejects.toThrow("Incomplete active family discovery");
+    await expect(backend.children(id, directory, true)).rejects.toThrow("Incomplete child discovery");
+    expect(await backend.statuses()).toEqual({});
+    expect(await backend.children(id, directory)).toEqual([]);
+  } finally { list.mockRestore(); }
 });

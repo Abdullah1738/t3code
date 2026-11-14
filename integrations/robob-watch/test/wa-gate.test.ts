@@ -238,8 +238,9 @@ test("an id retired while a drafter waits for its lock is not reused", async () 
   const id = idFrom(wa("draft", BOB, "racy offer").out);
   for (const f of [`${id}.json`]) rmSync(join(draftDir, f));
   const lock = join(draftDir, "locks", id);
+  // zsystem flock uses POSIX record locks; BSD flock is independent on Linux.
   const holder = Bun.spawn(["/usr/bin/python3", "-c",
-    "import fcntl,sys,time\nf=open(sys.argv[1],'a')\nfcntl.flock(f,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(3)", lock],
+    "import fcntl,sys,time\nf=open(sys.argv[1],'a')\nfcntl.lockf(f,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(3)", lock],
     { stdout: "pipe" });
   const reader = holder.stdout.getReader();
   await reader.read();

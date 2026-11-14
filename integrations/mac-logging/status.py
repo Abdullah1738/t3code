@@ -18,6 +18,19 @@ CADENCES = {
     # allow one missed hourly collection for inventory and crashes.
     'disk.inventory': dict(name='disk.inventory', target=None, gapHours=2, since='2026-11-13'),
     'crash.collect': dict(name='crash.collect', target=None, gapHours=2, since='2026-11-13'),
+    # Same hourly collector plist; both probes run from collector.main().
+    'disk.tooling_probe': dict(name='disk.tooling_probe', target=None, gapHours=2, since='2026-11-13'),
+    'proc.disk_wait': dict(name='proc.disk_wait', target=None, gapHours=2, since='2026-11-13'),
+    # collector.disk_wait() calls clone_wait() on each hourly process snapshot;
+    # first live disk.clone_wedge event was 2026-11-14 UTC.
+    'disk.clone_wedge': dict(name='disk.clone_wedge', target=None, gapHours=2, since='2026-11-14'),
+    # launchd/com.abdullah.mac-memory.plist: StartInterval=300 (five minutes);
+    # allow two missed samples (15 minutes). Emitter: memory.sample(), live 14 Nov.
+    'memory.sample': dict(name='memory.sample', target=None, gapHours=.25, since='2026-11-14'),
+    # launchd/com.abdullah.mac-deep-inventory.plist: daily 03:30 local
+    # (Asia/Dubai = previous day 23:30 UTC); allow daily plus two hours.
+    # deep_inventory.run_pass() emits disk.deep.end; first live completion 14 Nov.
+    'disk.deep.end': dict(name='disk.deep.end', target=None, gapHours=26, since='2026-11-14'),
     # ~/.local/share/robob-watch/watchers/dev-janitor/watcher.json:
     # interval_s=3600; allow one missed hourly run.
     'janitor.run': dict(name='janitor.run', target=None, gapHours=2, since='2026-11-13'),

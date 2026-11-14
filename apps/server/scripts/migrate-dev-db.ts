@@ -18,6 +18,12 @@ import { Command, Flag } from "effect/cli";
 import * as ProjectionStore from "../src/orchestration-v2/ProjectionStore.ts";
 import { migrationManifest, runMigrations } from "../src/persistence/Migrations.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import {
+  archiveFilename,
+  HISTORY_TABLES,
+  liveColumns,
+} from "../src/ardud/persistence/historyArchiveSql.ts";
+import { resolveHistoryBasePath } from "../src/ardud/persistence/historySourceFiles.ts";
 
 export class MigrateDevDbNotInWorktreeError extends Schema.TaggedError<MigrateDevDbNotInWorktreeError>()(
   "MigrateDevDbNotInWorktreeError",
@@ -99,6 +105,18 @@ export class MigrateDevDbDestinationBusyError extends Schema.TaggedError<Migrate
   }
 }
 
+export class MigrateDevDbDestinationArchiveError extends Schema.TaggedError<MigrateDevDbDestinationArchiveError>()(
+  "MigrateDevDbDestinationArchiveError",
+  {
+    databasePath: Schema.String,
+    archivePath: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Dev database '${this.databasePath}' has an existing history archive file '${this.archivePath}'. Use a new --base-dir to preserve the existing dev history.`;
+  }
+}
+
 export class MigrateDevDbSlotCollisionError extends Schema.TaggedError<MigrateDevDbSlotCollisionError>()(
   "MigrateDevDbSlotCollisionError",
   {
@@ -109,6 +127,25 @@ export class MigrateDevDbSlotCollisionError extends Schema.TaggedError<MigrateDe
 ) {
   override get message(): string {
     return `Migration slot collision at ${this.slot}: this checkout registers '${this.codeName}' but the database already applied '${this.appliedName}' in that slot. Renumber the new migration to a free slot.`;
+  }
+}
+
+export class MigrateDevDbHistoryArchiveError extends Schema.TaggedError<MigrateDevDbHistoryArchiveError>()(
+  "MigrateDevDbHistoryArchiveError",
+  {
+    sourcePath: Schema.String,
+    archivePath: Schema.String,
+    reason: Schema.Literals(["missing", "identity-mismatch", "invalid-base"]),
+  },
+) {
+  override get message(): string {
+    const detail =
+      this.reason === "missing"
+        ? "is missing"
+        : this.reason === "identity-mismatch"
+          ? "does not match the source database"
+          : "contains an invalid base archive filename";
+    return `Cannot seed '${this.sourcePath}': history file '${this.archivePath}' ${detail}. Restore the matching history files before retrying.`;
   }
 }
 
@@ -209,6 +246,20 @@ const ensureNotInUse = Effect.fn("ensureDevDbNotInUse")(function* (databasePath:
   }
 });
 
+const ensureNoDestinationArchive = Effect.fn("ensureDevDbHasNoHistoryArchive")(function* (
+  databasePath: string,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  // Clearing the binding would let server boot adopt a previous seed's cold rows.
+  // Orphaned sidecars must not be replayed against its fresh archive either.
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const archivePath = `${archiveFilename(databasePath)}${suffix}`;
+    if (yield* fs.exists(archivePath)) {
+      return yield* new MigrateDevDbDestinationArchiveError({ databasePath, archivePath });
+    }
+  }
+});
+
 const RECOVERY_KINDS: ReadonlyArray<ProjectionStore.ProjectionRecoveryKind> = [
   "queued-runs",
   "runtime",
@@ -216,7 +267,7 @@ const RECOVERY_KINDS: ReadonlyArray<ProjectionStore.ProjectionRecoveryKind> = [
   "delegated-completions",
 ];
 
-const CLEARED_TABLES: ReadonlyArray<string> = [
+const CLEARED_TABLES = new Set([
   "scheduled_tasks",
   "orchestration_v2_effect_outbox",
   "orchestration_v2_thread_launch_workflows",
@@ -224,7 +275,16 @@ const CLEARED_TABLES: ReadonlyArray<string> = [
   "provider_session_runtime",
   "auth_sessions",
   "auth_pairing_links",
-];
+  "ardud_history_archive_identity",
+  "ardud_history_archive_state",
+  "ardud_history_base_archive",
+  "ardud_history_archive_cursor",
+  "ardud_history_archive_progress",
+  "ardud_history_archive_deletions",
+  // The count summary's ready/base marker describes the old hot/archive union.
+  "ardud_shell_item_count_state",
+  "ardud_shell_item_counts",
+]);
 
 const PROVIDER_SESSIONS_TABLE = "orchestration_v2_projection_provider_sessions";
 
@@ -241,23 +301,97 @@ const rootIsVisible = (sql: SqlClient.SqlClient) => sql`
 const copySourceSlice = Effect.fn("copyDevDbSourceSlice")(function* (sourcePath: string) {
   const sql = yield* SqlClient.SqlClient;
   yield* sql`ATTACH DATABASE ${`${NodeURL.pathToFileURL(sourcePath).href}?mode=ro`} AS src`;
-  const schema = yield* sql<{ type: string; name: string; sql: string }>`
-    SELECT type, name, sql FROM src.sqlite_master
-    WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'`;
-  const tables = schema.filter((entry) => entry.type === "table");
-  if (tables.length === 0) {
-    return yield* new MigrateDevDbSourceEmptyError({ sourcePath });
-  }
-  const sequenceTables = yield* sql`
-    SELECT name FROM src.sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'`;
-  const threadColumns = yield* sql<{ name: string; notnull: number }>`
-    SELECT m.name, c."notnull" FROM src.sqlite_master m, pragma_table_info(m.name, 'src') c
-    WHERE m.type = 'table' AND c.name = 'thread_id'`;
-  const threadIdNullable = new Map(threadColumns.map((row) => [row.name, row.notnull === 0]));
-  const filtered = tables.some((table) => table.name === "orchestration_v2_projection_threads");
-
   yield* sql.withTransaction(
     Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const schema = yield* sql<{ type: string; name: string; sql: string }>`
+        SELECT type, name, sql FROM src.sqlite_master
+        WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'`;
+      const tables = schema.filter((entry) => entry.type === "table");
+      if (tables.length === 0) return yield* new MigrateDevDbSourceEmptyError({ sourcePath });
+      const hasTable = (name: string) => tables.some((table) => table.name === name);
+      const sequenceTables = yield* sql`
+        SELECT name FROM src.sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'`;
+      const threadColumns = yield* sql<{ name: string; notnull: number }>`
+        SELECT m.name, c."notnull" FROM src.sqlite_master m, pragma_table_info(m.name, 'src') c
+        WHERE m.type = 'table' AND c.name = 'thread_id'`;
+      const threadIdNullable = new Map(threadColumns.map((row) => [row.name, row.notnull === 0]));
+      const filtered = hasTable("orchestration_v2_projection_threads");
+      const baseRows = hasTable("ardud_history_base_archive")
+        ? yield* sql<{
+            filename: string;
+          }>`SELECT filename FROM src.ardud_history_base_archive LIMIT 2`
+        : [];
+      const basePath = yield* Effect.try({
+        try: () => resolveHistoryBasePath(path, sourcePath, baseRows),
+        catch: () =>
+          new MigrateDevDbHistoryArchiveError({
+            sourcePath,
+            archivePath: sourcePath,
+            reason: "invalid-base",
+          }),
+      });
+      const coldState = hasTable("ardud_history_archive_state")
+        ? yield* sql<{
+            has_cold_rows: number;
+          }>`SELECT has_cold_rows FROM src.ardud_history_archive_state WHERE singleton = 1`
+        : [];
+      const identities = hasTable("ardud_history_archive_identity")
+        ? yield* sql<{
+            identity: string;
+          }>`SELECT identity FROM src.ardud_history_archive_identity LIMIT 1`
+        : [];
+      const archivePath = archiveFilename(sourcePath);
+      const hasArchive = yield* fs.exists(archivePath);
+      if (!hasArchive && (coldState[0]?.has_cold_rows === 1 || identities.length > 0)) {
+        return yield* new MigrateDevDbHistoryArchiveError({
+          sourcePath,
+          archivePath,
+          reason: "missing",
+        });
+      }
+      if (hasArchive) {
+        yield* sql`ATTACH DATABASE ${`${NodeURL.pathToFileURL(archivePath).href}?mode=ro`} AS cold`;
+        const archiveIdentityTable =
+          yield* sql`SELECT 1 FROM cold.sqlite_master WHERE name = 'ardud_identity'`;
+        const archiveIdentities =
+          archiveIdentityTable.length > 0
+            ? yield* sql<{ identity: string }>`SELECT identity FROM cold.ardud_identity LIMIT 1`
+            : [];
+        if (
+          identities[0] === undefined ||
+          identities[0].identity !== archiveIdentities[0]?.identity
+        ) {
+          return yield* new MigrateDevDbHistoryArchiveError({
+            sourcePath,
+            archivePath,
+            reason: "identity-mismatch",
+          });
+        }
+      }
+      if (basePath !== undefined) {
+        if (!(yield* fs.exists(basePath))) {
+          return yield* new MigrateDevDbHistoryArchiveError({
+            sourcePath,
+            archivePath: basePath,
+            reason: "missing",
+          });
+        }
+        yield* sql`ATTACH DATABASE ${`${NodeURL.pathToFileURL(basePath).href}?mode=ro`} AS base`;
+      }
+      const filterFor = (name: string) => {
+        const nullable = threadIdNullable.get(name);
+        return !filtered
+          ? ""
+          : name === "orchestration_events"
+            ? // Two ranges let SQLite seek the aggregate/stream index.
+              `(aggregate_kind = 'thread' AND stream_id IN (SELECT thread_id FROM copied_threads))
+                OR aggregate_kind < 'thread' OR aggregate_kind > 'thread'`
+            : nullable === undefined || name === PROVIDER_SESSIONS_TABLE
+              ? ""
+              : `thread_id IN (SELECT thread_id FROM copied_threads)${nullable ? " OR thread_id IS NULL" : ""}`;
+      };
       for (const table of tables) yield* sql.unsafe(table.sql).unprepared;
       if (filtered) {
         yield* sql`CREATE TEMP TABLE copied_threads (thread_id TEXT PRIMARY KEY)`;
@@ -268,31 +402,51 @@ const copySourceSlice = Effect.fn("copyDevDbSourceSlice")(function* (sourcePath:
           WHERE ${rootIsVisible(sql)}`;
       }
       for (const { name } of tables) {
-        if (CLEARED_TABLES.includes(name)) continue;
-        const nullable = threadIdNullable.get(name);
-        const filter = !filtered
-          ? ""
-          : name === "orchestration_events"
-            ? // Two ranges rather than `<>`, so SQLite seeks the (aggregate_kind, stream_id)
-              // index instead of scanning every event.
-              `WHERE (aggregate_kind = 'thread' AND stream_id IN (SELECT thread_id FROM copied_threads))
-                OR aggregate_kind < 'thread' OR aggregate_kind > 'thread'`
-            : nullable === undefined || name === PROVIDER_SESSIONS_TABLE
-              ? ""
-              : `WHERE thread_id IN (SELECT thread_id FROM copied_threads)${nullable ? " OR thread_id IS NULL" : ""}`;
-        yield* sql.unsafe(`INSERT INTO main."${name}" SELECT * FROM src."${name}" ${filter}`)
-          .unprepared;
+        if (CLEARED_TABLES.has(name)) continue;
+        const filter = filterFor(name);
+        yield* sql.unsafe(
+          `INSERT INTO main."${name}" SELECT * FROM src."${name}" ${filter ? `WHERE ${filter}` : ""}`,
+        ).unprepared;
       }
       if (sequenceTables.length > 0) {
         yield* sql`DELETE FROM main.sqlite_sequence`;
         yield* sql`INSERT INTO main.sqlite_sequence SELECT name, seq FROM src.sqlite_sequence`;
+      }
+      for (const table of HISTORY_TABLES) {
+        if (!hasTable(table.live)) continue;
+        const columns = liveColumns(table.live);
+        const filter = filterFor(table.live);
+        for (const store of [
+          ...(hasArchive ? [{ schema: "cold", name: table.archive }] : []),
+          ...(basePath !== undefined ? [{ schema: "base", name: table.live }] : []),
+        ]) {
+          // Match the history views even when the winning row belongs to a dropped thread.
+          yield* sql.unsafe(`INSERT INTO main.${table.live} (${columns})
+            SELECT ${columns} FROM ${store.schema}.${store.name} AS history
+            WHERE ${filter ? `(${filter}) AND ` : ""}
+              NOT EXISTS (SELECT 1 FROM src.${table.live} AS hot WHERE hot.${table.key} = history.${table.key})
+              ${
+                store.schema === "base" && hasArchive
+                  ? `AND NOT EXISTS (SELECT 1 FROM cold.${table.archive} AS delta WHERE delta.${table.key} = history.${table.key})`
+                  : ""
+              }
+            ON CONFLICT (${table.key}) DO NOTHING`).unprepared;
+        }
+      }
+      if (hasTable("orchestration_events") && sequenceTables.length > 0) {
+        yield* sql`UPDATE main.sqlite_sequence SET seq = MAX(seq,
+          (SELECT COALESCE(MAX(sequence), 0) FROM main.orchestration_events))
+          WHERE name = 'orchestration_events'`;
       }
       for (const entry of schema) {
         if (entry.type !== "table") yield* sql.unsafe(entry.sql).unprepared;
       }
     }),
   );
-  yield* sql`DETACH DATABASE src`;
+  const attached = yield* sql<{ name: string }>`PRAGMA database_list`;
+  for (const name of ["base", "cold", "src"]) {
+    if (attached.some((entry) => entry.name === name)) yield* sql`DETACH DATABASE ${sql(name)}`;
+  }
 });
 
 const pruneSnapshot = Effect.fn("pruneDevDbSnapshot")(function* (input: RunMigrateDevDbInput) {
@@ -391,8 +545,11 @@ const pruneSnapshot = Effect.fn("pruneDevDbSnapshot")(function* (input: RunMigra
             AND stream_id NOT IN (SELECT thread_id FROM kept_threads))
            OR (aggregate_kind = 'project'
             AND stream_id NOT IN (SELECT project_id FROM kept_projects))`;
-      for (const table of CLEARED_TABLES) {
-        yield* sql`DELETE FROM ${sql(table)}`;
+      const existingTables = yield* sql<{
+        name: string;
+      }>`SELECT name FROM sqlite_master WHERE type = 'table'`;
+      for (const { name } of existingTables) {
+        if (CLEARED_TABLES.has(name)) yield* sql`DELETE FROM ${sql(name)}`;
       }
     }),
   );
@@ -483,6 +640,7 @@ export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
   }
 
   yield* fs.makeDirectory(stateDir, { recursive: true });
+  yield* ensureNoDestinationArchive(databasePath);
   yield* ensureNotInUse(databasePath);
 
   const wrapPhase =
@@ -549,6 +707,7 @@ export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
     // Re-check right before the swap: a dev server started while the
     // snapshot was migrating and pruning must not lose its database.
     yield* ensureNotInUse(databasePath);
+    yield* ensureNoDestinationArchive(databasePath);
     yield* removeDatabaseFiles(databasePath);
     yield* Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;

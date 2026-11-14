@@ -78,7 +78,14 @@ def queue_left():
     return max(0, state['end'] - pool.time.monotonic())
 
 
+def check_source():
+    state = _QUEUE.get()
+    if state is not None and state.get('check_source') is not None:
+        state['check_source']()
+
+
 def check_queue():
+    check_source()
     if queue_left() == 0:
         from .pool import PoolBusyError
         raise PoolBusyError("allocation queue timed out; nothing ran")

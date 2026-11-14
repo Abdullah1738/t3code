@@ -30,6 +30,7 @@ it.effect("reads a filtered day's rollup through the MCP service boundary", () =
     const service = Layer.succeed(
       Analytics.Analytics,
       Analytics.Analytics.of({
+        flush: Effect.void,
         record: () => Effect.void,
         ingest: () => Effect.void,
         read: (input) =>
@@ -48,7 +49,13 @@ it.effect("reads a filtered day's rollup through the MCP service boundary", () =
     const run = Effect.gen(function* () {
       const toolkit = yield* AnalyticsToolkit;
       return yield* toolkit
-        .handle("analytics_read", { day: "2026-11-13", boardId: "board-robob", limit: 10 })
+        .handle("analytics_read", {
+          day: "2026-11-13",
+          kind: "run.usage",
+          boardId: "board-robob",
+          cardId: "card:one",
+          limit: 10,
+        })
         .pipe(Stream.unwrap, Stream.runCollect);
     });
     const result = yield* run.pipe(
@@ -63,7 +70,15 @@ it.effect("reads a filtered day's rollup through the MCP service boundary", () =
       rollup: { kindCounts: { "ask.answered": 2 } },
       samples: [],
     });
-    expect(calls).toEqual([{ day: "2026-11-13", boardId: "board-robob", limit: 10 }]);
+    expect(calls).toEqual([
+      {
+        day: "2026-11-13",
+        kind: "run.usage",
+        boardId: "board-robob",
+        cardId: "card:one",
+        limit: 10,
+      },
+    ]);
     const denied = yield* run.pipe(
       Effect.provide(
         McpToolAccess.HandlersLayer.layer(Handlers.layer).pipe(

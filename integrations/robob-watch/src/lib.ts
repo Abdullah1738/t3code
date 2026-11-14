@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export const HOME = homedir();
 export const ROOT = process.env.ROBOB_WATCH_ROOT ?? join(HOME, ".local/share/robob-watch");
@@ -17,11 +17,20 @@ export const WA_LOCK = join(ROOT, "wa.lock");
 /** wacli's store (kept live by `wacli sync --follow`); its WAL grows/changes whenever a message is stored. */
 export const WACLI_STORE = process.env.WACLI_STORE_DIR ?? join(homedir(), ".wacli");
 export const WA_TRIGGERS = [join(WACLI_STORE, "wacli.db-wal"), join(WACLI_STORE, "wacli.db")];
-export const BUN = join(HOME, ".bun/bin/bun");
+function resolveBun(): string {
+  if (process.env.ROBOB_WATCH_BUN) return process.env.ROBOB_WATCH_BUN;
+  const installed = join(HOME, ".bun/bin/bun");
+  if (existsSync(installed)) return installed;
+  if (process.versions.bun) return process.execPath;
+  const found = Bun.which("bun");
+  if (found) return found;
+  throw new Error("Could not locate Bun; set ROBOB_WATCH_BUN to its executable path");
+}
+export const BUN = resolveBun();
 export const SPECTRUM_CLI = process.env.ROBOB_WATCH_SPECTRUM_CLI ?? join(HOME, ".local/share/spectrum-bridge/src/cli.ts");
 export const TELEGRAM_CLI = process.env.ROBOB_WATCH_TELEGRAM_CLI ?? join(HOME, ".local/share/telegram-bridge/src/cli.ts");
 export const BRIDGE_DB = process.env.ROBOB_WATCH_BRIDGE_DB ?? join(HOME, ".config/spectrum-bridge/state.sqlite");
-export const PATH = [HELPERS, join(HOME, ".local/bin"), join(HOME, ".bun/bin"), "/opt/homebrew/bin", "/usr/local/bin",
+export const PATH = [HELPERS, join(HOME, ".local/bin"), dirname(BUN), "/opt/homebrew/bin", "/usr/local/bin",
   "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":");
 
 export const MIN_INTERVAL = 5;
@@ -30,6 +39,8 @@ export const CHECK_TIMEOUT_MS = Number(process.env.ROBOB_WATCH_CHECK_TIMEOUT_MS 
 /** After SIGKILL, stop waiting for the process to report exit (a throttled process can take minutes to be reaped). */
 export const KILL_GRACE_MS = 5_000;
 export const FAILURE_ALERT_AFTER = 5;
+/** One failed tick that recovers is noise; the second in a row notifies. */
+export const FAILURE_NOTICE_AFTER = 2;
 /** Timeouts are transient (load spikes): no alert until the watcher has been failing at least this long. */
 export const TIMEOUT_ALERT_AFTER_MS = 10 * 60_000;
 /** Timeouts retry at most this far apart, so a watcher catches up soon after a load spike. */
@@ -77,6 +88,8 @@ export type Watcher = {
   id: string;
   title: string;
   check: string;
+  /** Read-only poll for replies to existing outreach; the only check allowed during removal grace. */
+  inflight_check?: string;
   /** Side-effect-only check after a committed run or while delivery is pending; it must not consume ordinary events. */
   pending_check?: string;
   interval_s: number;
@@ -91,6 +104,8 @@ export type Watcher = {
   paused: boolean;
   /** 0 keeps retrying with backoff; otherwise pause after this many failures (default 5). */
   max_consecutive_failures?: number;
+  /** Failures in a row before the per-run failure notice; default 2, 1 = every failure. */
+  failure_notice_after?: number;
   depends?: Dependency[];
   /** Opt-in: text the owner a short heads-up when a wake sits queued behind a busy turn. Off by default. */
   headsup?: boolean;
@@ -116,7 +131,17 @@ export type Watcher = {
   created_by_session: string | null;
 };
 export type State = {
-  status: "active" | "done" | "expired";
+  status: "active" | "closing" | "done" | "expired";
+  closing_until?: number;
+  closing_relays?: number;
+  closing_from?: "active" | "done" | "expired";
+  closing_watcher?: Watcher;
+  admitted_run?: { run: string; attempt: string; watcher: Watcher; accepted?: true };
+  reply_handoff?: { run: string; watcher: Watcher; accepted_run?: string };
+  discarded_run?: string;
+  closing_final_started?: boolean;
+  closing_final_check?: boolean;
+  batch?: { at: number; events: string[]; watcher?: Watcher; frozen_context?: true; healthRuns?: string[] };
   fires: number;
   last_run_at?: string;
   last_fire_at?: string;
@@ -136,7 +161,7 @@ export type State = {
   /** Wall time of the last check run, in ms. */
   last_run_ms?: number;
   /** An event whose delivery has not succeeded yet; retried verbatim with the same key. */
-  pending?: { key: string; event: string; at: string };
+  pending?: { key: string; event: string; at: string; count?: number; urgent?: boolean; route?: WakeRoute; watcher?: Watcher; context_file?: string; healthRun?: string; healthRuns?: string[] };
   last_delivery?: string;
   /** Delivered wakes whose bridge inbound row may still be queued behind a busy agent turn. */
   wakes?: TrackedWake[];
@@ -144,6 +169,221 @@ export type State = {
   trigger_sig?: string;
 };
 export type TrackedWake = { inbound: string; key: string; event: string; delivered_at: number; attempts?: number };
+
+export const PERSON_BATCH_MS = 150_000;
+export const REMOVAL_GRACE_MS = 15 * 60_000;
+export type WakeRoute = "person" | "owner" | "group" | "creator" | "other";
+function chatRoute(watcher: Watcher): WakeRoute {
+  if (!watcher.chat) return "owner";
+  if (watcher.mode !== "wake") return "other";
+  let db: Database | undefined;
+  try {
+    // The bridge registry owns chat identity; names and slug prefixes cannot distinguish a DM from a group.
+    // A busy or unavailable registry keeps existing immediate timing rather than delaying an unknown target.
+    db = new Database(BRIDGE_DB, { readonly: true });
+    db.exec("PRAGMA busy_timeout = 0");
+    const row = db.query<{ value: string }, [string]>("SELECT value FROM kv WHERE key = ?").get("sbChats");
+    const saved: unknown = row ? JSON.parse(row.value) : undefined;
+    if (!jsonObject(saved)) return "other";
+    const matches = Object.entries(saved).filter(([, entry]) => jsonObject(entry) && entry.slug === watcher.chat);
+    if (matches.length > 0 && matches.every(([key]) => key.startsWith("dm:"))) return "person";
+    if (matches.length > 0 && matches.every(([key]) => key.startsWith("group:"))) return "group";
+    return "other";
+  } catch {
+    return "other";
+  } finally {
+    db?.close();
+  }
+}
+export const personChat = (watcher: Watcher) => chatRoute(watcher) === "person";
+export const sameDestination = (a: Watcher, b: Watcher) => a.mode === b.mode && a.chat === b.chat
+  && (a.mode !== "wake" || !!a.chat || a.created_by_session === b.created_by_session);
+export const checking = (state: State) => state.status === "active" || (state.status === "closing" && !!state.closing_watcher);
+export function pollingWatcher(watcher: Watcher, state: State) {
+  const admitted = state.reply_handoff?.watcher ?? (state.status === "closing" ? state.closing_watcher
+    : state.admitted_run && !state.admitted_run.accepted ? state.admitted_run.watcher : watcher);
+  if (!admitted || admitted === watcher) return admitted;
+  // Repairs change how checks run; their unaccepted output keeps its original destination and authority.
+  return { ...watcher, id: admitted.id, title: admitted.title, check: admitted.check,
+    inflight_check: admitted.inflight_check, mode: admitted.mode, context: admitted.context,
+    chat: admitted.chat, trip: admitted.trip, relays: admitted.relays,
+    created_at: admitted.created_at, created_by_session: admitted.created_by_session };
+}
+
+export function watcherInstance(id: string): string | undefined {
+  try {
+    // Removal renames this directory into archive; reusing the ID creates a different directory.
+    const stat = statSync(watcherDir(id));
+    return `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+  } catch { return undefined; }
+}
+
+export function retiredWatcher(id: string): boolean {
+  return existsSync(join(ARCHIVE, "retired", `${id}.json`));
+}
+
+export function archiveWatcher(id: string, reason?: "expired" | "now" | "paused" | "no_inflight_check"): string {
+  const target = join(ARCHIVE, `${id}-${now()}`);
+  const retired = join(ARCHIVE, "retired");
+  mkdirSync(retired, { recursive: true, mode: 0o700 });
+  writeJson(join(retired, `${id}.json`), { archived: target, at: iso() });
+  log(id, "removed");
+  const state = loadState(id);
+  const closing = state.status === "closing";
+  const relays = state.closing_relays ?? 0;
+  if (state.status === "closing" && state.closing_from) {
+    state.status = state.closing_from;
+    delete state.closing_from;
+    delete state.closing_until;
+    delete state.closing_watcher;
+    delete state.admitted_run;
+    delete state.reply_handoff;
+    delete state.closing_final_started;
+    delete state.closing_final_check;
+    saveState(id, state);
+  }
+  renameSync(watcherDir(id), target);
+  if (reason) {
+    if (closing) toolLog({ component: reason === "expired" ? "runner" : "cli", kind: "event", name: "watch.grace_ended", ids: { watcher: id }, props: { reason: reason === "expired" ? "expired" : "now", relays } });
+    if (reason !== "expired") toolLog({ component: "cli", kind: "event", name: "watch.removed", ids: { watcher: id }, props: { grace: false, reason } });
+  }
+  return target;
+}
+
+export function finalizeClosing(id: string): boolean {
+  return withRelayLock(() => {
+    const state = loadState(id);
+    const watcher = loadWatcher(id);
+    if (!watcher || state.status !== "closing" || now() < state.closing_until!
+      || (!watcher.paused && (!state.closing_final_check || state.pending || state.batch))) return false;
+    archiveWatcher(id, "expired");
+    return true;
+  });
+}
+
+export function removeWatcher(id: string, immediately = false): { archived?: string; closing_until?: number } {
+  return withRelayLock(() => {
+    if (immediately) return { archived: archiveWatcher(id, "now") };
+    const watcher = loadWatcher(id);
+    if (!watcher) throw new Error(`Unknown watcher ${id}`);
+    if (!watcher.inflight_check || watcher.paused) return { archived: archiveWatcher(id, watcher.paused ? "paused" : "no_inflight_check") };
+    const state = loadState(id);
+    const started = state.status !== "closing";
+    if (state.status !== "closing") {
+      state.closing_relays = 0;
+      state.closing_from = state.status;
+      state.closing_until = now() + REMOVAL_GRACE_MS;
+      state.closing_watcher = { ...watcher, check: watcher.inflight_check };
+      delete state.closing_final_started;
+      delete state.closing_final_check;
+    }
+    state.status = "closing";
+    state.next_at = 0;
+    delete state.failure_paused_at;
+    saveState(id, state);
+    if (started) toolLog({ component: "cli", kind: "event", name: "watch.grace_started", ids: { watcher: id }, props: { graceMs: REMOVAL_GRACE_MS } });
+    log(id, `closing until ${iso(state.closing_until!)}`);
+    return { closing_until: state.closing_until };
+  });
+}
+
+export function editWatcher(id: string, change: (watcher: Watcher) => Watcher): Watcher {
+  return withRelayLock(() => {
+    const watcher = loadWatcher(id);
+    if (!watcher) throw new Error(`Unknown watcher ${id}`);
+    const next = normalize(change(watcher));
+    writeJson(join(watcherDir(id), "watcher.json"), next);
+    return next;
+  });
+}
+
+export function checkEvent(output: string): { event: string; urgent: boolean } {
+  const event = output.trim();
+  try {
+    const value = JSON.parse(event);
+    return { event, urgent: value?.urgent === true };
+  } catch { return { event, urgent: false }; }
+}
+
+function contextSnapshot(context: string): string {
+  const dir = join(ARCHIVE, "contexts");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const file = join(dir, `${hash(context)}.json`);
+  if (!existsSync(file)) writeJson(file, { context });
+  return file;
+}
+
+export function queueEvent(watcher: Watcher, state: State, event: string, urgent: boolean, preserveContext = false): void {
+  const route = chatRoute(watcher);
+  if (route === "person" && !urgent) {
+    if (!state.batch) {
+      state.batch = { at: now(), events: [], watcher };
+      toolLog({ component: "wakes", kind: "event", name: "wake.batch_opened", ids: { watcher: watcher.id } });
+    }
+    state.batch.events.push(event);
+    if (preserveContext) {
+      state.batch.watcher = watcher;
+      state.batch.frozen_context = true;
+    }
+  } else {
+    if (route === "person" && urgent) toolLog({ component: "wakes", kind: "event", name: "wake.urgent", ids: { watcher: watcher.id }, props: { batchOpen: !!state.batch } });
+    state.pending = { urgent, route, key: `robob-watch:${watcher.id}:${state.fires + 1}:${hash(event).slice(0, 16)}`, event, at: iso(), watcher, context_file: watcher.mode === "wake" ? contextSnapshot(watcher.context) : undefined };
+  }
+}
+
+export function sealBatch(watcher: Watcher, state: State): void {
+  const batch = state.batch!;
+  const accepted = batch.watcher ?? watcher;
+  const destination = !batch.frozen_context && sameDestination(accepted, watcher) ? { ...accepted, context: watcher.context } : accepted;
+  const key = `robob-watch:${watcher.id}:batch:${hash(JSON.stringify(batch)).slice(0, 32)}`;
+  const events = batch.events.length === 1 ? batch.events[0]! : batch.events.map((event, i) => `${i + 1}. ${event}`).join("\n\n");
+  // A large burst must survive the bridge's text cap. Keep the complete batch for the woken agent to read.
+  const file = join(ARCHIVE, "batches", `${watcher.id}-${hash(key).slice(0, 32)}.json`);
+  if (events.length > MAX_EVENT) {
+    mkdirSync(join(ARCHIVE, "batches"), { recursive: true, mode: 0o700 });
+    writeJson(file, { ...batch, context: destination.context });
+  }
+  const event = events.length <= MAX_EVENT ? events : `${batch.events.length} events, oldest first. Read the complete batch before replying: ${file}`;
+  state.pending = { key, event, route: "person", count: batch.events.length, at: iso(batch.at), watcher: destination, context_file: contextSnapshot(destination.context), ...(batch.healthRuns ? { healthRuns: batch.healthRuns } : {}) };
+  delete state.batch;
+  toolLog({ component: "wakes", kind: "event", name: "wake.batch_sealed", ids: { watcher: watcher.id }, props: { events: batch.events.length, spanMs: now() - batch.at, archived: events.length > MAX_EVENT, frozenContext: !!batch.frozen_context } });
+}
+
+function jsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function mergeContext(previous: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...previous };
+  for (const [key, value] of Object.entries(patch)) {
+    const old = previous[key];
+    Object.defineProperty(result, key, { enumerable: true, configurable: true, writable: true,
+      value: Array.isArray(old) && Array.isArray(value) ? [...old, ...value]
+        : jsonObject(old) && jsonObject(value) ? mergeContext(old, value) : value });
+  }
+  return result;
+}
+
+export function editContext(id: string, patch: string, replace = false): string {
+  return withRelayLock(() => {
+    const watcher = loadWatcher(id);
+    if (!watcher) throw new Error(`Unknown watcher ${id}`);
+    let context = patch;
+    if (!replace) {
+      let before: unknown, after: unknown;
+      try { before = JSON.parse(watcher.context); } catch { /* legacy prose */ }
+      try { after = JSON.parse(patch); } catch { /* prose append */ }
+      if (jsonObject(after)) {
+        context = JSON.stringify(mergeContext(jsonObject(before) ? before : { instructions: watcher.context }, after));
+      } else if (jsonObject(before)) {
+        context = JSON.stringify({ ...before, notes: [...(Array.isArray(before.notes) ? before.notes : before.notes === undefined ? [] : [before.notes]), patch] });
+      } else context = [watcher.context, patch].filter(Boolean).join("\n");
+    }
+    const next = normalize({ ...watcher, context });
+    writeJson(join(watcherDir(id), "watcher.json"), next);
+    return next.context;
+  });
+}
 
 export const HEADSUP_MS = Number(process.env.ROBOB_WATCH_HEADSUP_MS ?? 120_000);
 /** Tracking is dropped after this long even if the row state could never be read. */
@@ -237,6 +477,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (!validId(input.id)) errors.push("id must be 1-48 chars of a-z, 0-9, - (starting alphanumeric)");
   if (typeof input.title !== "string" || !input.title.trim() || input.title.length > 200 || /[\x00-\x1f]/.test(input.title)) errors.push("title must be one line, 1-200 chars");
   if (typeof input.check !== "string" || !input.check.trim()) errors.push("check command is required");
+  if (input.inflight_check !== undefined && (typeof input.inflight_check !== "string" || !input.inflight_check.trim())) errors.push("inflight_check must be a nonempty read-only reply check command");
   if (input.pending_check !== undefined && (typeof input.pending_check !== "string" || !input.pending_check.trim())) errors.push("pending_check must be a nonempty command");
   const interval = input.interval_s === undefined ? DEFAULT_INTERVAL : Number(input.interval_s);
   if (!Number.isInteger(interval) || interval < MIN_INTERVAL) errors.push(`interval_s must be an integer >= ${MIN_INTERVAL}`);
@@ -260,6 +501,8 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (!Number.isInteger(maxFires) || maxFires < 0) errors.push("max_fires must be an integer >= 0 (0 = unlimited)");
   const maxFailures = input.max_consecutive_failures;
   if (maxFailures !== undefined && (!Number.isInteger(maxFailures) || maxFailures < 0)) errors.push("max_consecutive_failures must be an integer >= 0 (0 = never pause)");
+  const noticeAfter = input.failure_notice_after;
+  if (noticeAfter !== undefined && (!Number.isInteger(noticeAfter) || noticeAfter < 1)) errors.push("failure_notice_after must be an integer >= 1 (1 = every failure)");
   const depends = input.depends;
   if (depends !== undefined && !validDepends(depends)) errors.push('depends must be an array of "ssd" or "phone"');
   const quiet = input.quiet;
@@ -282,9 +525,11 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     // Only checks that drive the old whatscli TUI need the shared lock; whatsapp-new-message reads a DB now.
     max_fires: maxFires, serial: input.serial === true || /(^|[\s;|&(`$])wa\s+(tui|screen)\b/.test(input.check!),
     paused: input.paused === true,
+    ...(input.inflight_check !== undefined ? { inflight_check: input.inflight_check.trim() } : {}),
     ...(input.pending_check !== undefined ? { pending_check: input.pending_check } : {}),
     ...(timeout !== undefined ? { timeout_s: timeout } : {}),
     ...(maxFailures !== undefined ? { max_consecutive_failures: maxFailures } : {}),
+    ...(noticeAfter !== undefined ? { failure_notice_after: noticeAfter } : {}),
     ...(depends !== undefined ? { depends: [...new Set(depends)] } : {}),
     ...(triggers.length ? { triggers: (triggers as string[]).map(t => t.trim().replace(/^~(?=\/)/, HOME)) } : {}),
     ...(input.headsup === true ? { headsup: true } : {}),
@@ -303,6 +548,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
 }
 
 export function loadWatcher(id: string): Watcher | undefined {
+  if (retiredWatcher(id)) return undefined;
   return readJson<Watcher>(join(watcherDir(id), "watcher.json"));
 }
 
@@ -316,7 +562,7 @@ export function saveState(id: string, state: State): void {
 
 export function listIds(): string[] {
   if (!existsSync(WATCHERS)) return [];
-  return readdirSync(WATCHERS).filter(name => validId(name) && existsSync(join(WATCHERS, name, "watcher.json"))).sort();
+  return readdirSync(WATCHERS).filter(name => validId(name) && !!loadWatcher(name)).sort();
 }
 
 export function log(id: string | null, message: string): void {
@@ -341,7 +587,7 @@ export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; 
  * than KILL_GRACE_MS past the timeout: a SIGKILLed process that the scheduler has not reaped yet must not keep
  * its watcher blocked (3 Oct 2026: killed checks lingered 9+ minutes and their watchers never re-ran).
  */
-export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000): Promise<CheckResult> {
+export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000, instance = watcherInstance(watcher.id)): Promise<CheckResult> {
   const shell = watcher.serial ? ["/usr/bin/lockf", "-k", "-t", "120", WA_LOCK, "/bin/zsh", "-c", watcher.check] : ["/bin/zsh", "-c", watcher.check];
   const started = now();
   return new Promise(resolve => {
@@ -361,10 +607,21 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
       toolLog({ component: "helpers", kind: code === 0 && !timedOut ? "perf" : "error", name: "helper.run", durationMs: ms, ok: code === 0 && !timedOut, ids: { watcher: watcher.id, helper: watcher.id }, props: { exitCode: code, signal, timedOut, ...(code === 0 && !timedOut ? {} : cause.props(timedOut)) }, ...(code === 0 && !timedOut ? {} : { error: { tag: timedOut ? "helper.timeout" : "helper.exit_failed" } }) });
       resolve({ code, signal, stdout, stderr: stderr + extra, timedOut, ms });
     };
-    const child = spawn(shell[0]!, shell.slice(1), {
+    const spawnChild = (closing = extraEnv.WATCH_CLOSING ?? (loadState(watcher.id).status === "closing" ? "1" : "0")) => spawn(shell[0]!, shell.slice(1), {
       cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { HOME, PATH, ...(process.env.TOOLLOG_DIR ? { TOOLLOG_DIR: process.env.TOOLLOG_DIR } : {}), LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
+      env: { HOME, PATH, ...(process.env.TOOLLOG_DIR ? { TOOLLOG_DIR: process.env.TOOLLOG_DIR } : {}), ...(process.env.HEALTH_TOOLLOG_DIR ? { HEALTH_TOOLLOG_DIR: process.env.HEALTH_TOOLLOG_DIR } : {}), LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv, WATCH_CLOSING: closing },
     });
+    // Admission shares the removal lock; a stale callback must never start canceled outreach.
+    const child = dir === watcherDir(watcher.id) ? withRelayLock(() => {
+      if (retiredWatcher(watcher.id) || !instance || watcherInstance(watcher.id) !== instance) throw new Error("Watcher removed before check admission");
+      const state = loadState(watcher.id);
+      const definition = loadWatcher(watcher.id);
+      const current = definition && pollingWatcher(definition, state);
+      const pending = extraEnv.WATCH_PENDING === "1" && state.status !== "closing" && !state.reply_handoff
+        && definition?.pending_check === watcher.check;
+      if (!current || current.paused || (extraEnv.WATCH_PENDING === "1" ? !pending : !checking(state) || current.check !== watcher.check)) throw new Error("Watcher check changed before admission");
+      return spawnChild(state.status === "closing" || state.reply_handoff ? "1" : "0");
+    }) : spawnChild();
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr!.setEncoding("utf8");
     child.stderr!.on("data", (chunk: string) => { cause.add(chunk); if (stderr.length < 20_000) stderr += chunk; });
@@ -381,13 +638,13 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
   });
 }
 
-async function run(args: string[], timeoutMs = 20_000): Promise<{ ok: boolean; out: string }> {
+async function run(args: string[], timeoutMs = 20_000, maxOutput = 500): Promise<{ ok: boolean; out: string; code: number; signal: NodeJS.Signals | null }> {
   const started = now();
   try {
     const child = Bun.spawn(args, { env: { HOME, PATH, ...testEnv() }, stdout: "pipe", stderr: "pipe", timeout: timeoutMs, killSignal: "SIGKILL" });
     const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
     toolLog({ component: "helpers", kind: code === 0 ? "perf" : "error", name: "helper.run", durationMs: now() - started, ok: code === 0, ids: { helper: args[1]?.endsWith(".ts") ? args[1]!.split("/").at(-2) : args[0]?.split("/").at(-1) }, props: { exitCode: code, ...(code === 0 ? {} : stderrCause(stderr)) }, ...(code === 0 ? {} : { error: { tag: "helper.exit_failed" } }) });
-    return { ok: code === 0, out: `${stdout}${stderr}`.trim().slice(0, 500) };
+    return { ok: code === 0, out: `${stdout}${stderr}`.trim().slice(0, maxOutput), code, signal: child.signalCode };
   } catch (error) {
     toolLog({ component: "helpers", kind: "error", name: "helper.run", durationMs: now() - started, ok: false, props: stderrCause(error instanceof Error ? error.message : ""), error: { tag: "helper.spawn_failed" } });
     throw error;
@@ -434,10 +691,101 @@ export function underTest(): boolean {
 const refused = (what: string) => ({ ok: false, out: `refused: test run; ${what} would reach a real app` });
 const spectrumCli = () => process.env.ROBOB_WATCH_SPECTRUM_CLI ?? join(HOME, ".local/share/spectrum-bridge/src/cli.ts");
 const telegramCli = () => process.env.ROBOB_WATCH_TELEGRAM_CLI ?? join(HOME, ".local/share/telegram-bridge/src/cli.ts");
+const t3ctlCli = () => process.env.ROBOB_WATCH_T3CTL ?? join(HOME, ".local/bin/t3ctl");
+
+type CreatorRoute = { kind: "owner" } | { kind: "native_failed" } | { kind: "thread"; thread: string }
+  | { kind: "unreachable"; thread: string; reason: string } | { kind: "refused"; reason: string };
+const creatorRoutes = new Map<string, { session: string; cli: string; until: number; route: Promise<CreatorRoute> }>();
+const CREATOR_CACHE_MS = 3 * 60_000;
+const CREATOR_FAILURE_CACHE_MS = 30_000;
+const shortThread = (id: string) => id.split(":").at(-1)!.slice(0, 8);
+
+function creatorTimeout(): number {
+  const override = Number(process.env.ROBOB_WATCH_TEST_CREATOR_TIMEOUT_MS);
+  return underTest() && process.env.ROBOB_WATCH_T3CTL && Number.isInteger(override) && override > 0 && override < 10_000 ? override : 10_000;
+}
+
+async function creatorRoute(watcher: Watcher, session: string, cli: string): Promise<CreatorRoute> {
+  const failed = (step: "native" | "status", reason: string, started: number) => {
+    const durationMs = Math.max(0, now() - started);
+    log(null, `creator lookup failed watcher=${watcher.id} session=${session.slice(0, 12)} reason=${reason}`);
+    toolLog({ component: "wakes", kind: "error", name: "wake.creator_fallback", ok: false, ids: { watcher: watcher.id },
+      durationMs, props: { step, reason, durationMs } });
+  };
+  const exitReason = (result: { code: number; signal: NodeJS.Signals | null }) => result.signal === "SIGKILL" ? "timeout" : `exit:${result.code}`;
+  let thread = session;
+  if (session.startsWith("ses_")) {
+    const started = now();
+    try {
+      const result = await run([cli, "native", session], creatorTimeout(), 100_000);
+      if (!result.ok) {
+        failed("native", exitReason(result), started);
+        return { kind: "native_failed" };
+      }
+      try {
+        const value: unknown = JSON.parse(result.out);
+        if (!jsonObject(value) || !jsonObject(value.thread) || typeof value.thread.threadId !== "string" || !value.thread.threadId.trim()) throw new Error("invalid native thread");
+        thread = value.thread.threadId;
+      } catch {
+        failed("native", "invalid", started);
+        return { kind: "native_failed" };
+      }
+    } catch {
+      failed("native", "exit:127", started);
+      return { kind: "native_failed" };
+    }
+  }
+  let started = now();
+  const unreachable = (reason: string, detail: string): CreatorRoute => {
+    failed("status", reason, started);
+    return { kind: "unreachable", thread, reason: detail };
+  };
+  try {
+    if (thread === await liveSession()) return { kind: "owner" };
+    started = now();
+    // Thread status includes recent runs and can be much larger than a delivery receipt.
+    const result = await run([cli, "status", thread], creatorTimeout(), 100_000);
+    if (!result.ok) return unreachable(exitReason(result), `status: ${result.out}`);
+    let value: unknown;
+    try { value = JSON.parse(result.out); }
+    catch { return unreachable("invalid", "invalid thread status"); }
+    if (!jsonObject(value) || !jsonObject(value.thread) || value.thread.threadId !== thread
+      || typeof value.thread.archived !== "boolean") return unreachable("invalid", "invalid thread status");
+    const status = value.thread;
+    const project = typeof status.projectId === "string" ? status.projectId : "";
+    if (status.origin === "imessage" || /(?:^|[/:])imessage\/?$/i.test(project)) return { kind: "owner" };
+    return status.archived ? unreachable("archived", "thread is archived") : { kind: "thread", thread };
+  } catch (error) {
+    return unreachable("exit:127", `status: ${String(error).slice(0, 500)}`);
+  }
+}
+
+function resolveCreator(watcher: Watcher, cli: string): Promise<CreatorRoute> {
+  const session = watcher.created_by_session?.trim();
+  if (!session) return Promise.resolve({ kind: "owner" });
+  if (underTest() && !process.env.ROBOB_WATCH_T3CTL) return Promise.resolve({ kind: "refused", reason: refused("t3ctl").out });
+  const at = now();
+  for (const [id, entry] of creatorRoutes) if (entry.until <= at) creatorRoutes.delete(id);
+  const cached = creatorRoutes.get(watcher.id);
+  if (cached?.session === session && cached.cli === cli) return cached.route;
+  const entry = { session, cli, until: at + CREATOR_CACHE_MS, route: creatorRoute(watcher, session, cli) };
+  // Log once per lookup; deliveries sharing a cached failure do not repeat the diagnostic.
+  entry.route = entry.route.then(route => {
+    if (route.kind === "native_failed" || route.kind === "unreachable") entry.until = now() + CREATOR_FAILURE_CACHE_MS;
+    return route;
+  });
+  creatorRoutes.set(watcher.id, entry);
+  return entry.route;
+}
+
+function wakeThread(cli: string, thread: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
+  if (underTest() && !process.env.ROBOB_WATCH_T3CTL) return Promise.resolve(refused("t3ctl send"));
+  return run([cli, "send", thread, clip(text, MAX_WAKE), "--request-id", key, "--mode", "queue"], 20_000);
+}
 
 export function wake(source: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return Promise.resolve(refused("wake"));
-  return run([BUN, spectrumCli(), "wake", "--source", source.slice(0, 100), "--text", clip(text, MAX_WAKE), "--key", key]);
+  return run([BUN, spectrumCli(), "wake", `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--key=${key}`]);
 }
 
 /**
@@ -449,7 +797,7 @@ export async function wakeChat(chat: string, source: string, text: string, key: 
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("wake --chat");
   const session = await liveSession();
   if (!session) return { ok: false, out: "no live route session" };
-  return run([BUN, cli, "wake", "--chat", chat, "--source", source.slice(0, 100), "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
+  return run([BUN, cli, "wake", `--chat=${chat}`, `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
 }
 
 export async function imessage(text: string, key: string): Promise<{ ok: boolean; out: string }> {
@@ -458,20 +806,20 @@ export async function imessage(text: string, key: string): Promise<{ ok: boolean
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("imessage send");
   const session = await liveSession();
   if (!session) return { ok: false, out: "no live route session" };
-  return run([BUN, cli, "send", "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
+  return run([BUN, cli, "send", `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
 }
 
 export function telegram(source: string, text: string, key: string, severity = "info", burstKey?: string): Promise<{ ok: boolean; out: string }> {
   if (underTest() && !process.env.ROBOB_WATCH_TELEGRAM_CLI) return Promise.resolve(refused("telegram notify"));
-  return run([BUN, telegramCli(), "notify", "--source", telegramSource(source), "--severity", severity, "--text", clip(text, MAX_WAKE), "--key", key, ...(burstKey ? ["--burst-key", burstKey] : [])]);
+  return run([BUN, telegramCli(), "notify", `--source=${telegramSource(source)}`, `--severity=${severity}`, `--text=${clip(text, MAX_WAKE)}`, `--key=${key}`, ...(burstKey ? [`--burst-key=${burstKey}`] : [])]);
 }
 
 /** Env a check child gets: its own inputs plus, under a test run, the test markers and every stub override,
  * so a check that runs a helper (wa, mailsend, the bridge CLIs) hits the same guard the test set up. */
 const TEST_ENV_KEYS = ["ROBOB_TEST", "NODE_ENV", "PYTEST_CURRENT_TEST", "WA_WACLI", "WA_DRAFT_DIR", "MAILSEND_HIMALAYA",
   "MAILSEND_DRAFT_DIR", "MAILSEND_SEND_APPROVAL", "RIDE_CARD_BRIDGE", "CONVO_CARD_BRIDGE", "ROBOB_WATCH_SPECTRUM_CLI",
-  "ROBOB_WATCH_TELEGRAM_CLI", "WACLI_STORE_DIR", "SEND_APPROVAL_BRIDGE_DIR", "SEND_APPROVAL_STATE_DB",
-  "ROBOB_READONLY_DB", "MONEY_CASES_STATE_DB", "TOOLLOG_DIR", "ROBOB_HOME", "T3CODE_HOME", "XDG_DATA_HOME"];
+  "ROBOB_WATCH_TELEGRAM_CLI", "ROBOB_WATCH_T3CTL", "WACLI_STORE_DIR", "SEND_APPROVAL_BRIDGE_DIR", "SEND_APPROVAL_STATE_DB",
+  "ROBOB_READONLY_DB", "MONEY_CASES_STATE_DB", "TOOLLOG_DIR", "HEALTH_TOOLLOG_DIR", "ROBOB_HOME", "T3CODE_HOME", "XDG_DATA_HOME"];
 export function testEnv(): Record<string, string> {
   const out: Record<string, string> = {};
   for (const k of TEST_ENV_KEYS) if (process.env[k] !== undefined) out[k] = process.env[k]!;
@@ -565,13 +913,17 @@ export function relayCheck(given: Watcher, to: string, eta?: number, at = now())
  * Relay checks, stops and replacements run one at a time across processes, so two fires can't both take one ETA
  * slot or miss a stop written meanwhile. A SQLite write lock: the OS drops it if the holder dies.
  */
+// Runner admission calls the library's spawn guard while holding the same process's lock.
+let relayLockDepth = 0;
 export function withRelayLock<T>(fn: () => T): T {
+  if (relayLockDepth) return fn();
   mkdirSync(ROOT, { recursive: true, mode: 0o700 });
   const db = new Database(join(ROOT, "relay-lock.sqlite"));
   try {
     db.exec("PRAGMA busy_timeout = 15000");
     db.exec("BEGIN IMMEDIATE");
-    try { return fn(); } finally { db.exec("COMMIT"); }
+    relayLockDepth++;
+    try { return fn(); } finally { relayLockDepth--; db.exec("COMMIT"); }
   } finally { db.close(); }
 }
 
@@ -611,13 +963,14 @@ function relayVerdict(watcher: Watcher, to: string, eta: number | undefined, at:
 /** Wakes repeat the saved context on every fire; this is the start that carries the action, the rest is a pointer. */
 export const CONTEXT_PREVIEW = 280;
 
-export function contextPreview(w: Watcher): string {
+export function contextPreview(w: Watcher, snapshot?: string): string {
   const context = w.context || "";
   if (!context) return "(none)";
   if (context.length <= CONTEXT_PREVIEW) return context;
   const head = context.slice(0, CONTEXT_PREVIEW);
   const cut = Math.max(head.lastIndexOf(" "), head.lastIndexOf("\n"));
-  return `${(cut > 0 ? head.slice(0, cut) : head).trimEnd()}…\nFull rules: \`robob-watch context ${w.id}\` (read them before acting on anything beyond the lines above).`;
+  const pointer = snapshot ? `read saved context at \`${snapshot}\`` : `\`robob-watch context ${w.id}\``;
+  return `${(cut > 0 ? head.slice(0, cut) : head).trimEnd()}…\nFull rules: ${pointer} (read them before acting on anything beyond the lines above).`;
 }
 
 /** The first fire of each Dubai day (or of the watcher's quiet-hours zone) carries the whole context; decided from state so a retried key keeps its text. */
@@ -629,8 +982,10 @@ function firstFireToday(watcher: Watcher, state: State): boolean {
 }
 
 export function wakeText(watcher: Watcher, event: string, state: State, test = false): string {
-  const fires = watcher.max_fires === 0 ? `fire ${state.fires + 1}, unlimited` : `fire ${state.fires + 1} of ${watcher.max_fires}`;
-  const after = watcher.max_fires !== 0 && state.fires + 1 >= watcher.max_fires
+  const count = state.pending?.count ?? 1;
+  const label = count === 1 ? `fire ${state.fires + 1}` : `fires ${state.fires + 1}–${state.fires + count}`;
+  const fires = watcher.max_fires === 0 ? `${label}, unlimited` : `${label} of ${watcher.max_fires}`;
+  const after = watcher.max_fires !== 0 && state.fires + count >= watcher.max_fires
     ? "This watcher is now finished and disabled. If the owner still wants it watched, add a fresh one."
     : "The watcher keeps running; manage it with robob-watch show/pause/remove " + watcher.id + ".";
   return [
@@ -642,37 +997,70 @@ export function wakeText(watcher: Watcher, event: string, state: State, test = f
     "Event:",
     clip(event.trim(), MAX_EVENT),
     "",
-    "Context saved when this watcher was set up (written by the agent that set it up; the owner's instructions for this event):",
-    firstFireToday(watcher, state) ? watcher.context || "(none)" : contextPreview(watcher),
+    `Context saved when this watcher was set up (written by the agent that set it up; the owner's instructions for this event)${firstFireToday(watcher, state) && state.pending?.context_file ? `; full snapshot: ${state.pending.context_file}` : ""}:`,
+    firstFireToday(watcher, state) ? watcher.context || "(none)" : contextPreview(watcher, state.pending?.context_file),
     "",
     `Watcher ${watcher.id} (${fires}). ${after}`,
   ].join("\n");
 }
 
-export type Delivery = { ok: boolean; via: string; detail: string };
+export type Delivery = { ok: boolean; via: string; detail: string; route?: WakeRoute };
 
 /** Delivers one event; each channel is idempotent under the same key. */
 export async function deliver(watcher: Watcher, event: string, key: string, state: State, test = false): Promise<Delivery> {
-  const tried: string[] = [];
-  const plain = `${test ? "[Watcher test] " : ""}${watcher.title}\n${clip(event.trim(), MAX_EVENT)}`;
-  if (watcher.chat) {
-    // Someone else's data: only her chat may see it. A failed wake stays pending and is retried with the same key.
-    const text = `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this chat.]\n${wakeText(watcher, event, state, test)}`;
-    const result = await wakeChat(watcher.chat, `robob-watch ${watcher.id}`, text, key);
-    return result.ok ? { ok: true, via: `wake:${watcher.chat}`, detail: result.out } : { ok: false, via: "none", detail: `wake --chat ${watcher.chat}: ${result.out}` };
+  const started = now();
+  const pending = state.pending?.key === key ? state.pending : undefined;
+  // queueEvent already read the registry; legacy/direct calls have no recorded chat classification.
+  let route: WakeRoute = watcher.chat ? pending?.route ?? "other" : "owner";
+  let delivery: Delivery | undefined;
+  const finish = (result: Delivery) => delivery = { ...result, route };
+  try {
+    const tried: string[] = [];
+    const plain = `${test ? "[Watcher test] " : ""}${watcher.title}\n${clip(event.trim(), MAX_EVENT)}`;
+    if (watcher.chat) {
+      // Someone else's data: only her chat may see it. A failed wake stays pending and is retried with the same key.
+      const text = `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this chat.]\n${wakeText(watcher, event, state, test)}`;
+      const result = await wakeChat(watcher.chat, `robob-watch ${watcher.id}`, text, key);
+      return finish(result.ok ? { ok: true, via: `wake:${watcher.chat}`, detail: result.out } : { ok: false, via: "none", detail: `wake --chat ${watcher.chat}: ${result.out}` });
+    }
+    if (watcher.mode === "wake") {
+      // Capture the override before awaiting resolution, so a removed test stub cannot open the live path.
+      const cli = t3ctlCli();
+      const creator = await resolveCreator(watcher, cli);
+      if (creator.kind === "refused") return finish({ ok: false, via: "none", detail: creator.reason });
+      let text = wakeText(watcher, event, state, test);
+      let missed: { thread: string; reason: string } | undefined;
+      if (creator.kind === "thread") {
+        const prefix = `[Watcher event from robob-watch ${watcher.id}, not typed by anyone in this thread.]`;
+        try {
+          const result = await wakeThread(cli, creator.thread, `${prefix}\n${text}`, key);
+          if (result.ok) { route = "creator"; return finish({ ok: true, via: `thread:${shortThread(creator.thread)}`, detail: result.out }); }
+          missed = { thread: creator.thread, reason: `send: ${result.out}` };
+        } catch (error) { missed = { thread: creator.thread, reason: `send: ${String(error).slice(0, 500)}` }; }
+      } else if (creator.kind === "unreachable") missed = creator;
+      if (missed) {
+        text = `(meant for thread ${shortThread(missed.thread)}, which could not be reached)\n${text}`;
+        log(watcher.id, `creator wake fallback thread=${missed.thread} ${missed.reason}`);
+        tried.push(`thread:${shortThread(missed.thread)}: ${missed.reason}`);
+      }
+      const result = await wake(`robob-watch ${watcher.id}`, text, key);
+      if (result.ok) return finish({ ok: true, via: "wake", detail: result.out });
+      tried.push(`wake: ${result.out}`);
+    }
+    const sent = await imessage(plain, key);
+    if (sent.ok) return finish({ ok: true, via: "imessage-send", detail: [...tried, sent.out].join(" | ") });
+    tried.push(`send: ${sent.out}`);
+    const notified = await telegram(`Watcher ${watcher.id}`, plain, key);
+    if (notified.ok) return finish({ ok: true, via: "telegram", detail: [...tried, notified.out].join(" | ") });
+    tried.push(`telegram: ${notified.out}`);
+    return finish({ ok: false, via: "none", detail: tried.join(" | ") });
+  } finally {
+    const via = delivery?.via ?? "none";
+    toolLog({ component: "wakes", kind: delivery?.ok ? "perf" : "error", name: "wake.sent", ok: delivery?.ok ?? false,
+      durationMs: Math.max(0, now() - started), ids: { watcher: watcher.id, chat: route, key: wakeInboundId(key) },
+      props: { via: via.startsWith("wake:") ? "wake" : via.startsWith("thread:") ? "thread" : via, events: pending?.count ?? 1 },
+      ...(delivery?.ok ? {} : { error: { tag: "wake.delivery_failed" } }) });
   }
-  if (watcher.mode === "wake") {
-    const result = await wake(`robob-watch ${watcher.id}`, wakeText(watcher, event, state, test), key);
-    if (result.ok) return { ok: true, via: "wake", detail: result.out };
-    tried.push(`wake: ${result.out}`);
-  }
-  const sent = await imessage(plain, key);
-  if (sent.ok) return { ok: true, via: "imessage-send", detail: [...tried, sent.out].join(" | ") };
-  tried.push(`send: ${sent.out}`);
-  const notified = await telegram(`Watcher ${watcher.id}`, plain, key);
-  if (notified.ok) return { ok: true, via: "telegram", detail: [...tried, notified.out].join(" | ") };
-  tried.push(`telegram: ${notified.out}`);
-  return { ok: false, via: "none", detail: tried.join(" | ") };
 }
 
 /** Housekeeping notices (failures, expiry) go to the alert channel first, iMessage second. */
@@ -682,6 +1070,11 @@ export async function alert(watcher: Watcher, text: string, key: string, severit
   if (notified.ok) return { ok: true, via: "telegram", detail: notified.out };
   const sent = await imessage(`${watcher.title}: ${text}`, key);
   return sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${notified.out} | ${sent.out}` };
+}
+
+export function shouldNotifyFailure(watcher: Watcher, state: State, timedOut: boolean, t = now()): boolean {
+  return state.consecutive_failures >= (watcher.failure_notice_after ?? FAILURE_NOTICE_AFTER)
+    && (!timedOut || t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS);
 }
 
 export function shouldPause(watcher: Watcher, state: State, timedOut: boolean, t = now()): boolean {

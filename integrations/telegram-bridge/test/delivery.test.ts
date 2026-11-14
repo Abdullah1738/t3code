@@ -61,6 +61,26 @@ test("sends single messages once, records the provider id, and marks the operati
   expect(h.store.get<boolean>("sendAmbiguous:op")).toBe(false);
 });
 
+test("reports accepted ask notifications, retaining failed receipts without sending twice", async () => {
+  const h = setup();
+  enqueueNotice(h.store, { id: "ask", source: "Robob board", text: "#1380 q1 needs your OK", severity: "attention", askKey: "robob:1380:q1" });
+  const receipts: { key: string; at: number }[] = [];
+  let fail = true;
+  const delivery = new Delivery(h.store, h.transport, { chatId: () => 100, enabled: () => true, sleep: async () => {},
+    askNotified: async (key, at) => { if (fail) throw new Error("offline"); receipts.push({ key, at }); },
+  });
+  await delivery.tick();
+  expect(receipts).toHaveLength(0);
+  await delivery.tick();
+  expect(h.store.get<{ key: string; at: number }>("ask-timing-pending:ask")).toEqual({ key: "robob:1380:q1", at: now });
+  fail = false;
+  await delivery.tick();
+  await delivery.tick();
+  expect(receipts).toEqual([{ key: "robob:1380:q1", at: now }]);
+  expect(h.calls.sends).toHaveLength(1);
+  expect(h.store.get("ask-timing-pending:ask")).toBeUndefined();
+});
+
 test("queued legacy up notices are cancelled and all other queued text is redacted before chunking", async () => {
   const h = setup();
   h.store.enqueue({ id: "up", kind: "notification", text: "[run.cloud] Run Cloud iOS simulator up: test\nhttps://example.test?token=private" });

@@ -35,7 +35,75 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as EventStore from "../../orchestration-v2/EventStore.ts";
 import * as Executor from "../../orchestration-v2/ThreadCommandExecutor.ts";
+import * as LegacyV1ThreadImporter from "../../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
 import * as ThreadRedaction from "./ThreadRedaction.ts";
+import * as ServerLogFile from "../observability/serverLogFile.ts";
+
+const writerHooks = vi.hoisted(() => ({
+  before: undefined as ((sql: string) => void) | undefined,
+  after: undefined as
+    | ((sql: string, fiber: ReturnType<typeof Fiber.getCurrent>) => void)
+    | undefined,
+  fullFsync: undefined as ((value: number) => void) | undefined,
+}));
+
+vi.mock("node:worker_threads", async (importOriginal) => {
+  const actual = await importOriginal<typeof NodeWorkerThreads>();
+  class ObservedWorker extends actual.Worker {
+    readonly writer: boolean;
+    readonly statements = new Map<
+      number,
+      { sql: string; fiber: ReturnType<typeof Fiber.getCurrent> }
+    >();
+    constructor(...args: ConstructorParameters<typeof actual.Worker>) {
+      const writer = args[1]?.workerData?.cancelled !== undefined;
+      if (writer && typeof args[0] === "string") {
+        args[0] = args[0].replace(
+          "const entry = cached ? statements.get(sql) : undefined;",
+          `if (request.testRedactionFsync) parentPort.postMessage({ testRedactionFsync: Number(db.prepare("PRAGMA fullfsync").get().fullfsync) });
+const entry = cached ? statements.get(sql) : undefined;`,
+        );
+      }
+      super(...args);
+      this.writer = writer;
+    }
+    override postMessage(...args: Parameters<NodeWorkerThreads.Worker["postMessage"]>) {
+      const [request] = args;
+      if (this.writer && typeof request?.id === "number" && typeof request.sql === "string") {
+        writerHooks.before?.(request.sql);
+        this.statements.set(request.id, { sql: request.sql, fiber: Fiber.getCurrent() });
+        if (
+          writerHooks.fullFsync &&
+          request.sql.startsWith("INSERT INTO ardud_thread_redaction_recovery")
+        )
+          args[0] = { ...request, testRedactionFsync: true };
+      }
+      super.postMessage(...args);
+    }
+    override emit(event: string | symbol, ...args: unknown[]): boolean {
+      const reply = args[0];
+      if (this.writer && event === "message" && typeof reply === "object" && reply !== null) {
+        if ("testRedactionFsync" in reply && typeof reply.testRedactionFsync === "number") {
+          writerHooks.fullFsync?.(reply.testRedactionFsync);
+          return false;
+        }
+        if ("id" in reply && typeof reply.id === "number") {
+          const statement = this.statements.get(reply.id);
+          this.statements.delete(reply.id);
+          if (statement && "rows" in reply) writerHooks.after?.(statement.sql, statement.fiber);
+        }
+      }
+      return super.emit(event, ...args);
+    }
+  }
+  return { ...actual, Worker: ObservedWorker };
+});
+
+const installWriterHooks = (hooks: Partial<typeof writerHooks>) => {
+  const previous = { ...writerHooks };
+  Object.assign(writerHooks, hooks);
+  return () => Object.assign(writerHooks, previous);
+};
 
 const filesystemFault = vi.hoisted(() => ({
   failMode: false,
@@ -157,6 +225,55 @@ it.effect(
         expect(other[0]!.text).toBe("untouched");
       }),
     ),
+);
+
+it.effect("scrubs retained V1 transcript rows and their imported V2 copies", () =>
+  run(
+    Effect.gen(function* () {
+      yield* seed;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id, project_id, title, model_selection_json, runtime_mode,
+          interaction_mode, created_at, updated_at
+        ) VALUES (
+          ${threadId}, 'fixture', 'Legacy thread',
+          '{"instanceId":"codex","model":"gpt-6.1-sol"}', 'full-access', 'default',
+          '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+        )
+      `;
+      const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter.pipe(
+        Effect.provide(LegacyV1ThreadImporter.layer),
+      );
+      yield* importer.reconcileShells;
+      yield* importer.ensureTranscript(threadId);
+      const copies = () =>
+        Effect.all([
+          sql`SELECT text FROM projection_thread_messages WHERE message_id = 'quote'`,
+          sql`SELECT payload_json FROM orchestration_v2_projection_messages WHERE message_id = 'quote'`,
+          sql`SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE turn_item_id = 'migration:v1:turn-item:quote'`,
+          sql`SELECT payload_json FROM orchestration_events WHERE event_id = 'migration:v1:message:quote'`,
+        ]);
+      const before = yield* copies();
+      for (const rows of before) {
+        expect(rows).toHaveLength(1);
+        expect(JSON.stringify(rows)).toContain(fake);
+      }
+      const service = yield* ThreadRedaction.ThreadRedaction;
+      const result = yield* service.redactItem({
+        threadId,
+        itemId: "call-fixture",
+        reason: "fixture",
+        compact: true,
+      });
+      expect(result.stores.every((store) => store.remainingAfter === 0)).toBe(true);
+      for (const rows of yield* copies()) {
+        expect(rows).toHaveLength(1);
+        expect(JSON.stringify(rows)).not.toContain(fake);
+        expect(JSON.stringify(rows)).toContain("[redacted ");
+      }
+    }),
+  ),
 );
 
 it.effect.each(["missing", "ambiguous", "running"])("refuses %s before any rewrite", (kind) =>
@@ -560,6 +677,72 @@ it.effect(
     ),
 );
 
+it.effect("drains the buffered server log before redaction and keeps later flushes clean", () =>
+  run(
+    Effect.gen(function* () {
+      yield* seed;
+      const config = yield* Config.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      const sql = yield* SqlClient.SqlClient;
+      const providerRoot = NodePath.join(
+        config.baseDir,
+        "harness-homes",
+        "claude",
+        "projects",
+        "fixture",
+      );
+      yield* fs.makeDirectory(providerRoot, { recursive: true });
+      yield* fs.writeFileString(
+        NodePath.join(providerRoot, "session-fixture.jsonl"),
+        JSON.stringify({ type: "tool_result", tool_use_id: "call-fixture", content: fake }) + "\n",
+      );
+      yield* sql`INSERT INTO projection_thread_sessions(thread_id,status,provider_name,provider_session_id,updated_at) VALUES (${threadId},'stopped','claudeAgent','session-fixture','2026-01-01')`;
+      const filePath = NodePath.join(config.logsDir, "server.log");
+      const fileLog = yield* ServerLogFile.make({ filePath });
+      yield* Effect.logInfo("redaction fixture", { output: fake }).pipe(
+        Effect.provide(Logger.layer([fileLog.logger], { mergeWithExisting: false })),
+      );
+      const service = yield* ThreadRedaction.ThreadRedaction.pipe(
+        Effect.provide(
+          Layer.fresh(ThreadRedaction.layer).pipe(
+            Layer.provide(
+              Layer.succeed(ServerLogFile.Maintenance, {
+                withMaintenance: fileLog.withMaintenance,
+              }),
+            ),
+            Layer.provide(
+              Layer.succeed(
+                ProviderEventLoggers.ProviderEventLoggers,
+                ProviderEventLoggers.NoOpProviderEventLoggers,
+              ),
+            ),
+            Layer.provide(
+              Layer.succeed(
+                SharedObservability.TraceStorageMaintenance,
+                SharedObservability.NoOpTraceStorageMaintenance,
+              ),
+            ),
+            Layer.provide(
+              Layer.mock(CommandOutputHub.CommandOutputHub)({ forgetThread: () => Effect.void }),
+            ),
+          ),
+        ),
+      );
+      const result = yield* service.redactItem({
+        threadId,
+        itemId: "call-fixture",
+        reason: "fixture",
+        compact: true,
+      });
+      expect(result.verify).toBe(true);
+      yield* TestClock.adjust(1_000);
+      const contents = yield* fs.readFileString(filePath);
+      expect(contents.includes(fake)).toBe(false);
+      expect(contents.includes("redaction fixture")).toBe(true);
+    }),
+  ),
+);
+
 const extendedStores = (distinct = true) =>
   Effect.gen(function* () {
     yield* seed;
@@ -804,10 +987,8 @@ it.effect.each(["detach", "durability", "mode", "fullfsync"])(
         const config = yield* Config.ServerConfig;
         const service = yield* ThreadRedaction.ThreadRedaction;
         let broken = true;
-        const originalPrepare = NodeSqlite.DatabaseSync.prototype.prepare;
-        const preparation = vi
-          .spyOn(NodeSqlite.DatabaseSync.prototype, "prepare")
-          .mockImplementation(function (this: NodeSqlite.DatabaseSync, statement: string) {
+        const restore = installWriterHooks({
+          before(statement) {
             if (
               broken &&
               ((phase === "detach" && statement === "DETACH DATABASE ardud_redaction_base") ||
@@ -815,12 +996,12 @@ it.effect.each(["detach", "durability", "mode", "fullfsync"])(
                 (phase === "fullfsync" && /^PRAGMA fullfsync=\d/.test(statement)))
             )
               throw new Error("Fixture cleanup failure");
-            return originalPrepare.call(this, statement);
-          });
+          },
+        });
         yield* Effect.addFinalizer(() =>
           Effect.sync(() => {
             broken = false;
-            preparation.mockRestore();
+            restore();
             filesystemFault.failMode = false;
             filesystemFault.path = "";
           }),
@@ -1247,36 +1428,22 @@ it.effect("publication completes when cancellation arrives in the actual COMMIT"
           Effect.forkScoped,
         );
       yield* Deferred.await(ready);
-      const original = NodeSqlite.DatabaseSync.prototype.prepare;
       let injected = false;
-      const prepare = vi
-        .spyOn(NodeSqlite.DatabaseSync.prototype, "prepare")
-        .mockImplementation(function (this: NodeSqlite.DatabaseSync, source: string) {
-          const statement = original.call(this, source);
-          if (source.trim() !== "COMMIT") return statement;
-          return new Proxy(statement, {
-            get(target, key) {
-              const value = Reflect.get(target, key, target);
-              if (key === "run")
-                return (...args: Parameters<typeof statement.run>) => {
-                  const result = target.run(...args);
-                  if (!injected) {
-                    injected = true;
-                    Fiber.getCurrent()?.interruptUnsafe();
-                  }
-                  return result;
-                };
-              return typeof value === "function" ? value.bind(target) : value;
-            },
-          });
-        });
-      yield* Effect.addFinalizer(() => Effect.sync(() => prepare.mockRestore()));
+      const restore = installWriterHooks({
+        after(source, fiber) {
+          if (source.trim() === "COMMIT" && !injected) {
+            injected = true;
+            fiber?.interruptUnsafe();
+          }
+        },
+      });
+      yield* Effect.addFinalizer(() => Effect.sync(restore));
       const operation = yield* Effect.forkScoped(
         service.redactItem({ threadId, itemId: "item-fixture", reason: "fixture", compact: true }),
         { startImmediately: true },
       );
       yield* Fiber.await(operation);
-      prepare.mockRestore();
+      restore();
       expect(injected).toBe(true);
       const events = yield* Fiber.join(received);
       expect(events[1]!.event.type).toBe("thread.item-redacted");
@@ -1697,30 +1864,16 @@ it.effect.each(["ardud_redaction_base", "ardud_redaction_replica"])(
         yield* extendedStores(false);
         const service = yield* ThreadRedaction.ThreadRedaction;
         const sql = yield* SqlClient.SqlClient;
-        const original = NodeSqlite.DatabaseSync.prototype.prepare;
         let injected = false;
-        const prepare = vi
-          .spyOn(NodeSqlite.DatabaseSync.prototype, "prepare")
-          .mockImplementation(function (this: NodeSqlite.DatabaseSync, source: string) {
-            const statement = original.call(this, source);
-            if (!source.startsWith("ATTACH DATABASE") || !source.endsWith(alias)) return statement;
-            return new Proxy(statement, {
-              get(target, key) {
-                const value = Reflect.get(target, key, target);
-                if (key === "run")
-                  return (...args: Parameters<typeof statement.run>) => {
-                    const result = target.run(...args);
-                    if (!injected) {
-                      injected = true;
-                      Fiber.getCurrent()?.interruptUnsafe();
-                    }
-                    return result;
-                  };
-                return typeof value === "function" ? value.bind(target) : value;
-              },
-            });
-          });
-        yield* Effect.addFinalizer(() => Effect.sync(() => prepare.mockRestore()));
+        const restore = installWriterHooks({
+          after(source, fiber) {
+            if (source.startsWith("ATTACH DATABASE") && source.endsWith(alias) && !injected) {
+              injected = true;
+              fiber?.interruptUnsafe();
+            }
+          },
+        });
+        yield* Effect.addFinalizer(() => Effect.sync(restore));
         const task = yield* Effect.forkScoped(
           service.redactItem({
             threadId,
@@ -1731,7 +1884,7 @@ it.effect.each(["ardud_redaction_base", "ardud_redaction_replica"])(
           { startImmediately: true },
         );
         yield* Fiber.await(task);
-        prepare.mockRestore();
+        restore();
         expect(injected).toBe(true);
         const databases = yield* sql<{ name: string }>`PRAGMA database_list`;
         expect(databases.some((d) => d.name.startsWith("ardud_redaction_"))).toBe(false);
@@ -1756,10 +1909,8 @@ it.effect.each(["detach", "durability", "mode", "fullfsync"])(
         const service = yield* ThreadRedaction.ThreadRedaction;
         const sql = yield* SqlClient.SqlClient;
         let broken = true;
-        const original = NodeSqlite.DatabaseSync.prototype.prepare;
-        const prepare = vi
-          .spyOn(NodeSqlite.DatabaseSync.prototype, "prepare")
-          .mockImplementation(function (this: NodeSqlite.DatabaseSync, source: string) {
+        const restore = installWriterHooks({
+          before(source) {
             if (
               broken &&
               ((phase === "detach" && source === "DETACH DATABASE ardud_redaction_base") ||
@@ -1767,11 +1918,11 @@ it.effect.each(["detach", "durability", "mode", "fullfsync"])(
                 (phase === "fullfsync" && /^PRAGMA fullfsync=\d/.test(source)))
             )
               throw new Error("Fixture cleanup failure");
-            return original.call(this, source);
-          });
+          },
+        });
         yield* Effect.addFinalizer(() =>
           Effect.sync(() => {
-            prepare.mockRestore();
+            restore();
             filesystemFault.failMode = false;
             filesystemFault.inventory = undefined;
             filesystemFault.path = "";
@@ -3046,15 +3197,8 @@ it.effect.each([0, 1].flatMap((original) => [false, true].map((failed) => ({ ori
         if (failed)
           yield* sql`CREATE TRIGGER fixture_sync_failure BEFORE INSERT ON orchestration_events WHEN NEW.event_type='thread.item-redacted' BEGIN SELECT RAISE(ABORT,'fixture'); END`;
         const observed: number[] = [];
-        const prepare = NodeSqlite.DatabaseSync.prototype.prepare;
-        const spy = vi
-          .spyOn(NodeSqlite.DatabaseSync.prototype, "prepare")
-          .mockImplementation(function (this: NodeSqlite.DatabaseSync, source: string) {
-            if (source.startsWith("INSERT INTO ardud_thread_redaction_recovery"))
-              observed.push(Number(prepare.call(this, "PRAGMA fullfsync").get()!.fullfsync));
-            return prepare.call(this, source);
-          });
-        yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+        const restore = installWriterHooks({ fullFsync: (value) => observed.push(value) });
+        yield* Effect.addFinalizer(() => Effect.sync(restore));
         const service = yield* ThreadRedaction.ThreadRedaction;
         const result = yield* service
           .redactItem({ threadId, itemId: "item-fixture", reason: "fixture", compact: true })

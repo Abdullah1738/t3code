@@ -78,6 +78,7 @@ check "python syntax" pyc
 unit() { python3 vmtest/test_plan.py 2>&1 | tail -3 | tr '\n' ' '; return "${PIPESTATUS[0]}"; }
 check "plan.py unit tests (disk decision, wipe scope, storage layout)" unit
 check "box userns persistence and acceptance regression" python3 ../../tests/test_userns.py
+check "box tmpfs profile regression" python3 ../../tests/test_tmp_profile.py
 
 # ---- yaml / cloud-init / netplan / grub
 if need yamllint; then

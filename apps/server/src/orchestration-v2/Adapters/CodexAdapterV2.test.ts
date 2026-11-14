@@ -56,6 +56,7 @@ import { MCP_APP_OUTPUT_KEY, readMcpAppReference } from "@t3tools/shared/mcpApp"
 import { resolveAttachmentPathById } from "../../attachmentStore.ts";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
@@ -2893,6 +2894,239 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
   );
 
+  for (const resumed of [false, true]) {
+    it.effect.each([
+      { initial: "connected", recovered: true, reloadFails: false },
+      { initial: "missing", recovered: true, reloadFails: false },
+      { initial: "failed", recovered: true, reloadFails: false },
+      { initial: "starting", recovered: true, reloadFails: false },
+      { initial: "authenticationRequired", recovered: false, reloadFails: false },
+      { initial: "failed", recovered: false, reloadFails: true },
+    ] as const)(
+      `checks T3 MCP on ${resumed ? "resumed" : "first"} turn: $initial / recovered=$recovered / reloadFails=$reloadFails`,
+      (testCase) => {
+        const logs: Array<unknown> = [];
+        const logger = Logger.make(({ message }) => {
+          logs.push(message);
+        });
+        return Effect.gen(function* () {
+          const scenario = `wake-mcp-${resumed}-${testCase.initial}-${testCase.recovered}-${testCase.reloadFails}`;
+          const threadId = ThreadId.make(`thread-${scenario}`);
+          const nativeThreadId = `native-${scenario}`;
+          yield* (yield* McpProviderSessions.McpProviderSessions).set({
+            environmentId: EnvironmentId.make("environment-codex-mcp"),
+            threadId,
+            providerSessionId: `provider-session-${scenario}`,
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            endpoint: "http://127.0.0.1:43123/mcp",
+            authorizationHeader: "Bearer secret-codex-token",
+            browserToolsAvailable: true,
+          });
+          const status = (state: string) => ({
+            data:
+              state === "missing"
+                ? []
+                : [
+                    {
+                      name: "t3-code",
+                      authStatus: "unsupported",
+                      runtimeStatus: state,
+                      tools:
+                        state === "connected"
+                          ? { card_get: { name: "card_get", inputSchema: {} } }
+                          : {},
+                      resources: [],
+                      resourceTemplates: [],
+                      toolsError:
+                        state === "connected" ? null : "Authorization: Bearer secret-codex-token",
+                    },
+                  ],
+            nextCursor: null,
+          });
+          const entries = codexReplayPreamble({
+            nativeThreadId,
+            nativeTurnId: "wake-turn",
+            prompt: "wake",
+          });
+          const requests: Array<{ method: string; params: unknown }> = [];
+          const checkEntries: Array<CodexReplay.CodexAppServerReplayEntry> = [];
+          let id = 3;
+          if (resumed) {
+            checkEntries.push(
+              {
+                type: "expect_outbound",
+                frame: {
+                  id,
+                  method: "thread/resume",
+                  params: {
+                    threadId: nativeThreadId,
+                    excludeTurns: true,
+                    config: CodexAdapterV2.CODEX_THREAD_CONFIG,
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                frame: { id, result: { thread: { id: nativeThreadId, updatedAt: 1782622450 } } },
+              },
+            );
+            id++;
+          }
+          const check = (state: string) => {
+            checkEntries.push(
+              {
+                type: "expect_outbound",
+                frame: {
+                  id,
+                  method: "mcpServerStatus/list",
+                  params: {
+                    threadId: nativeThreadId,
+                    serverName: "t3-code",
+                    detail: "toolsAndAuthOnly",
+                  },
+                },
+              },
+              { type: "emit_inbound", frame: { id, result: status(state) } },
+            );
+            id++;
+          };
+          check(testCase.initial);
+          if (testCase.initial !== "connected") {
+            checkEntries.push(
+              { type: "expect_outbound", frame: { id, method: "config/mcpServer/reload" } },
+              {
+                type: "emit_inbound",
+                frame: testCase.reloadFails
+                  ? {
+                      id,
+                      error: { code: -32603, message: "Authorization: Bearer secret-codex-token" },
+                    }
+                  : { id, result: {} },
+              },
+            );
+            id++;
+            if (!testCase.reloadFails) check(testCase.recovered ? "connected" : testCase.initial);
+          }
+          const params = yield* CodexAdapterV2.buildCodexTurnStartParams({
+            nativeThreadId,
+            codexInput: [{ type: "text", text: "wake" }],
+            runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+            modelSelection: CODEX_TEST_MODEL_SELECTION,
+            hasT3Mcp: testCase.recovered,
+          });
+          const harness = yield* makeCodexReplayHarness(
+            makeCodexReplayTranscript({
+              scenario,
+              entries: [
+                ...entries.slice(0, 5),
+                ...checkEntries,
+                { type: "expect_outbound", frame: { id, method: "turn/start", params } },
+                withReplayRequestId(entries[6]!, id),
+              ],
+            }),
+            () => Effect.void,
+            (method, params) =>
+              Effect.sync(() => {
+                requests.push({ method, params });
+              }),
+          );
+          if (resumed)
+            yield* harness.runtime.resumeThread({ providerThread: harness.providerThread });
+          yield* harness.runtime.startTurn({
+            ...makeCodexTestTurnInput({
+              threadId,
+              providerThread: harness.providerThread,
+              now: DateTime.makeUnsafe("2026-11-14T10:51:43Z"),
+              attemptId: RunAttemptId.make("wake-attempt"),
+              text: "wake",
+            }),
+            runOrdinal: resumed ? 29 : 1,
+          });
+          const sent = requests.find((request) => request.method === "turn/start")?.params;
+          assert.isDefined(sent);
+          const rendered = JSON.stringify(sent);
+          assert.equal(rendered.includes("T3 Code orchestration"), testCase.recovered);
+          assert.equal(rendered.includes("t3_code_tools"), testCase.recovered);
+          assert.equal(
+            requests.filter((request) => request.method === "config/mcpServer/reload").length,
+            testCase.initial === "connected" ? 0 : 1,
+          );
+          assert.equal(
+            requests.filter((request) => request.method === "mcpServerStatus/list").length,
+            testCase.initial === "connected" || testCase.reloadFails ? 1 : 2,
+          );
+          const warnings = logs.filter((message) =>
+            JSON.stringify(message).includes("codex-t3-mcp-unavailable"),
+          );
+          assert.equal(warnings.length, testCase.recovered ? 0 : 1);
+          assert.notInclude(JSON.stringify(logs), "secret-codex-token");
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              Logger.layer([logger], { mergeWithExisting: false }),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  it.effect("logs a missing MCP session once and starts without T3 instructions", () => {
+    const logs: Array<unknown> = [];
+    const logger = Logger.make(({ message }) => {
+      logs.push(message);
+    });
+    return Effect.gen(function* () {
+      const requests: Array<{ method: string; params: unknown }> = [];
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "missing-mcp-session",
+          entries: codexReplayPreamble({
+            nativeThreadId: "missing-session",
+            nativeTurnId: "turn",
+            prompt: "work",
+          }).slice(0, 7),
+        }),
+        () => Effect.void,
+        (method, params) =>
+          Effect.sync(() => {
+            requests.push({ method, params });
+          }),
+      );
+      yield* harness.runtime.startTurn(
+        makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("missing-mcp-session"),
+          text: "work",
+        }),
+      );
+      const params = requests.find((entry) => entry.method === "turn/start")?.params;
+      assert.isDefined(params);
+      assert.notInclude(JSON.stringify(params), "t3_code_orchestration");
+      const warnings = logs.filter((message) =>
+        JSON.stringify(message).includes("codex-t3-mcp-unavailable"),
+      );
+      assert.lengthOf(warnings, 1);
+      assert.include(JSON.stringify(warnings), "session-unavailable");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          Logger.layer([logger], { mergeWithExisting: false }),
+        ),
+      ),
+    );
+  });
+
   it.effect("adds the session MCP server without replacing launch-argument servers", () =>
     Effect.gen(function* () {
       const scenario = "launch-mcp-servers";
@@ -4725,10 +4959,49 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             ...entries.slice(0, 5),
             {
               type: "expect_outbound",
-              label: "context turn",
-              frame: { id: 3, method: "turn/start", params },
+              frame: {
+                id: 3,
+                method: "mcpServerStatus/list",
+                params: {
+                  threadId: nativeThreadId,
+                  serverName: "t3-code",
+                  detail: "toolsAndAuthOnly",
+                },
+              },
             },
-            ...entries.slice(6),
+            {
+              type: "emit_inbound",
+              frame: {
+                id: 3,
+                result: {
+                  data: [
+                    {
+                      name: "t3-code",
+                      runtimeStatus: "connected",
+                      authStatus: "unsupported",
+                      tools: { card_get: { name: "card_get", inputSchema: {} } },
+                      resources: [],
+                      resourceTemplates: [],
+                    },
+                  ],
+                  nextCursor: null,
+                },
+              },
+            },
+            {
+              type: "expect_outbound",
+              label: "context turn",
+              frame: { id: 4, method: "turn/start", params },
+            },
+            ...entries
+              .slice(6)
+              .map((entry) =>
+                entry.type !== "runtime_exit" &&
+                Predicate.isObject(entry.frame) &&
+                "id" in entry.frame
+                  ? withReplayRequestId(entry, 4)
+                  : entry,
+              ),
             {
               type: "emit_inbound",
               label: "compacted",
@@ -4745,7 +5018,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
               type: "expect_outbound",
               label: "restore context",
               frame: {
-                id: 4,
+                id: 5,
                 method: "thread/inject_items",
                 params: {
                   threadId: nativeThreadId,
@@ -4757,7 +5030,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                 },
               },
             },
-            { type: "emit_inbound", label: "restored", frame: { id: 4, result: {} } },
+            { type: "emit_inbound", label: "restored", frame: { id: 5, result: {} } },
             {
               type: "emit_inbound",
               label: "done",

@@ -495,8 +495,9 @@ it.effect("stops an idle shared session once without reading any bound thread", 
 );
 
 // ardud: an already-failed shared provider session must not block every thread.
-for (const status of ["ready", "error"] as const)
-  it.effect(`queues continuations for two running threads with a ${status} shared session`, () =>
+it.effect.each(["ready", "error"] as const)(
+  "queues continuations for two running threads with a %s shared session",
+  (status) =>
     Effect.gen(function* () {
       const driver = ProviderDriverKind.make("opencode");
       const providerInstanceId = ProviderInstanceId.make("opencode");
@@ -660,7 +661,7 @@ for (const status of ["ready", "error"] as const)
         },
       ]);
     }),
-  );
+);
 
 it.effect("reads recovery projections only for threads that need runtime recovery", () => {
   const settledThreadIds = Array.from({ length: 1_000 }, (_, index) =>
@@ -744,6 +745,7 @@ it.effect("expires orphaned runtime requests before command readiness", () => {
     ],
     providerSessions: [],
     providerThreads: [],
+    providerTurns: [],
     runs: [],
     nodes: [],
   } as unknown as OrchestrationV2ThreadProjection;
@@ -795,6 +797,7 @@ it.effect("preserves async questions across startup and shutdown", () => {
     ],
     providerSessions: [],
     providerThreads: [],
+    providerTurns: [],
     runs: [],
     nodes: [],
     turnItems: [],
@@ -846,6 +849,7 @@ it.effect("uses the same reconciliation path to cancel runtime requests during s
     ],
     providerSessions: [],
     providerThreads: [],
+    providerTurns: [],
     runs: [],
     nodes: [],
   } as unknown as OrchestrationV2ThreadProjection;
@@ -906,6 +910,7 @@ it.effect(
       thread: { id: threadId },
       runtimeRequests: [],
       providerSessions: [],
+      providerTurns: [],
       providerThreads: [
         {
           id: providerThreadId,

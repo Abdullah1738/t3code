@@ -9,7 +9,7 @@ import tempfile
 import threading
 import unittest
 import zlib
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,6 +19,7 @@ sys.path.insert(0, str(SRC))
 
 import health_check
 import location_reaper
+import config_drift
 import recall_core
 import robob_readonly
 import session_reaper
@@ -290,6 +291,48 @@ class NativeExportConsumersTest(unittest.TestCase):
         with closing(robob_readonly.native_ro(self.target, require_destructive=True)) as native:
             _, busy = session_reaper.load_sessions(native)
             self.assertIn("ses_root", busy)
+
+    def test_config_recovery_checks_live_inbox_after_idle_export(self):
+        import urllib.parse
+        self.src.execute("DELETE FROM session_inbox")
+        self.src.execute("DELETE FROM session_pending")
+        self.finish()
+        with patch.object(location_reaper, "OC_DB", self.target):
+            last, sid_dir = location_reaper.last_activity_by_dir()
+            self.assertEqual(last["/fixture"], 1)
+            # No new export: published metadata is still marked idle/ready.
+            self.src.execute("INSERT INTO session_inbox VALUES ('late','ses_root','{}')")
+            evictions = []
+
+            def api(method, path):
+                route, _, query = path.partition("?")
+                directory = urllib.parse.parse_qs(query).get("location[directory]", [None])[0]
+                if method == "DELETE":
+                    if directory == "/fixture":
+                        evictions.append(directory)
+                    return 204, None
+                if route == "/api/config":
+                    return 200, []
+                if route == "/api/session/active":
+                    return 200, {"data": {}}
+                if route == "/api/session":
+                    rows = self.src.execute("SELECT id,directory FROM session_v2").fetchall()
+                    return 200, {"data": [{"id": sid, "location": {"directory": d},
+                                            "time": {"created": 1, "updated": 1}}
+                                           for sid, d in rows], "cursor": {}}
+                if route.startswith("/api/session/") and route.endswith("/inbox"):
+                    rows = self.src.execute("SELECT id FROM session_inbox WHERE session_id=?",
+                                            (route.split("/")[3],)).fetchall()
+                    return 200, {"data": [{"id": row[0]} for row in rows]}
+                if route in ("/api/form", "/api/permission/request", "/api/shell"):
+                    return 200, {"data": []}
+                raise AssertionError((method, path))
+
+            with patch.object(location_reaper, "api", side_effect=api), redirect_stdout(io.StringIO()):
+                status = config_drift.run(["/fixture"], last, sid_dir, set(),
+                                          logs=self.root / "drift-logs", home=self.root / "home")
+        self.assertEqual(status["deferred_busy"], 1)
+        self.assertEqual(evictions, [])
 
     def prepare_reaper_archive(self):
         self.src.executescript("""

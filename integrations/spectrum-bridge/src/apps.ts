@@ -26,13 +26,13 @@ export function contentType(path: string): string {
 /** Resolves a URL path to a regular file strictly inside root, or undefined. */
 export async function resolveAppFile(root: string, pathname: string): Promise<string | undefined> {
   let decoded: string;
-  try { decoded = decodeURIComponent(pathname); } catch { toolError("apps", "apps.catch1"); return; }
+  try { decoded = decodeURIComponent(pathname); } catch (caughtError) { toolError("apps", "apps.catch1", caughtError); return; }
   if (!decoded.startsWith("/") || /[\x00-\x1f\x7f\\]/.test(decoded)) return;
   const segments = decoded.split("/").filter(Boolean);
   // Dot segments cover both traversal and hidden files such as .env or .git.
   if (segments.some(segment => segment.startsWith("."))) return;
   let base: string;
-  try { base = await realpath(root); } catch { toolError("apps", "apps.catch2"); return; }
+  try { base = await realpath(root); } catch (caughtError) { toolError("apps", "apps.catch2", caughtError); return; }
   let candidate = resolve(base, ...segments);
   if (candidate !== base && !candidate.startsWith(base + sep)) return;
   try {
@@ -46,7 +46,7 @@ export async function resolveAppFile(root: string, pathname: string): Promise<st
       info = await stat(real);
     }
     return info.isFile() ? real : undefined;
-  } catch { toolError("apps", "apps.catch3");
+  } catch (caughtError) { toolError("apps", "apps.catch3", caughtError);
     return;
   }
 }
@@ -69,7 +69,7 @@ export function absoluteMeta(html: string, pageUrl: string): string {
       if (!ABSOLUTE_META.has(metaKey(element))) return;
       const content = element.getAttribute("content")?.trim();
       if (!content || /^https?:\/\//i.test(content)) return;
-      try { element.setAttribute("content", new URL(content, pageUrl).href); } catch { toolError("apps", "apps.catch4"); /* left as written */ }
+      try { element.setAttribute("content", new URL(content, pageUrl).href); } catch (caughtError) { toolError("apps", "apps.catch4", caughtError); /* left as written */ }
     },
   }).transform(html);
 }
@@ -127,7 +127,7 @@ export function createAppsHandler(root: string, secrets?: AppsSecrets): (request
       const token = pathname.slice(SECRET_PREFIX.length);
       const secretHandler = validToken(token) ? handlerFor(token) : undefined;
       if (!secretHandler || !validToken(token)) {
-        void request.body?.cancel().catch(() => { toolError("apps", "apps.catch5");});
+        void request.body?.cancel().catch((caughtError) => { toolError("apps", "apps.catch5", caughtError);});
         return new Response(renderSecretMessage("Not found", "This form is no longer available."), { status: 404, headers: SECRET_PAGE_HEADERS });
       }
       return secretHandler(request, token);

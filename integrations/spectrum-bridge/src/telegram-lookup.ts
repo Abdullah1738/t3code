@@ -45,14 +45,14 @@ export function telegramNotificationLookup(socketPath: string, id: string, timeo
             const body = JSON.parse(Buffer.concat(chunks, size).toString("utf8")) as { id?: unknown; text?: unknown };
             if (typeof body.id !== "string" || body.id !== id || typeof body.text !== "string") return finish(undefined);
             finish({ id: body.id, kind: "notification", text: body.text.slice(0, 12_000) });
-          } catch { toolError("telegram-lookup", "telegram-lookup.catch1");
+          } catch (caughtError) { toolError("telegram-lookup", "telegram-lookup.catch1", caughtError);
             finish(undefined);
           }
         });
       });
       req.on("error", () => finish(undefined));
       req.end();
-    } catch { toolError("telegram-lookup", "telegram-lookup.catch2");
+    } catch (caughtError) { toolError("telegram-lookup", "telegram-lookup.catch2", caughtError);
       finish(undefined);
     }
   });

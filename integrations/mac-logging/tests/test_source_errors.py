@@ -25,6 +25,9 @@ class SourceTests(unittest.TestCase):
         env = patch.dict(os.environ, TOOLLOG_DIR=str(self.logs))
         env.start()
         self.addCleanup(env.stop)
+        probes = patch.object(jobs, 'storage_probes', return_value={})
+        probes.start()
+        self.addCleanup(probes.stop)
 
     def rows(self, name):
         return [row for path in self.logs.glob('*.ndjson')
@@ -46,8 +49,10 @@ class SourceTests(unittest.TestCase):
             with self.subTest(i=i):
                 root = self.root / str(i)
                 root.mkdir()
+                child=root/'child'
+                child.mkdir()
                 run = lambda *a, **kw: SimpleNamespace(returncode=rc,
-                    stdout=output.format(root=root), stderr=stderr.format(root=root))
+                    stdout=output.format(root=child), stderr=stderr.format(root=child))
                 jobs.directory_inventory([root], run)
                 state = jobs.read_state('disk-inventory')
                 summary = self.rows('disk.inventory')[-1]
@@ -62,8 +67,8 @@ class SourceTests(unittest.TestCase):
                     self.assertEqual(row['props']['deniedCount'], denied)
                     self.assertEqual(row['props']['bytes'], 42*1024)
                 if failure:
-                    row = self.rows('disk.inventory.source')[-1]
-                    self.assertEqual(row['props']['source'], str(root))
+                    row = [r for r in self.rows('disk.inventory.source') if r['props']['source']==str(child)][-1]
+                    self.assertEqual(row['props']['source'], str(child))
                     self.assertEqual(row['props']['failure'], failure)
                     self.assertEqual(row['props']['exitCode'], rc)
                     self.assertGreaterEqual(row['props']['elapsedMs'], 0)
@@ -87,6 +92,7 @@ class SourceTests(unittest.TestCase):
         for i in range(7):
             root = self.root / str(i)
             root.mkdir()
+            (root/'child').mkdir()
             roots.append(root)
         def run(cmd, **kwargs):
             budget = kwargs['timeout']
@@ -96,10 +102,10 @@ class SourceTests(unittest.TestCase):
         with patch.object(jobs.time, 'monotonic', side_effect=lambda: clock[0]):
             jobs.directory_inventory([self.root/'missing'] + roots, run)
         self.assertLessEqual(sum(calls), 300)
-        self.assertGreater(calls[0], 15)
-        rows = self.rows('disk.inventory.source')
+        self.assertLessEqual(max(calls), 60)
+        rows = [r for r in self.rows('disk.inventory.source') if r['props']['source'] in set(map(str,roots))]
         self.assertEqual(len(rows), len(roots))
-        self.assertTrue(all(row['props']['failure'] == 'timeout' for row in rows))
+        self.assertTrue(all(row['props']['failure'] == 'partial' for row in rows))
         self.assertEqual(jobs.read_state('disk-inventory')['sourceErrors'], len(roots))
 
     def test_crash_unified_command_failure_forms_and_cursor(self):

@@ -7,6 +7,7 @@ import threading
 import time
 
 import common
+import timing
 
 
 class FairLock:
@@ -37,8 +38,7 @@ WRITE = FairLock()
 @contextlib.contextmanager
 def writing(db):
     """One write transaction, serialized with the other threads in this process. Commits on exit."""
-    WRITE.acquire()
-    try:
+    with timing.write_lock(WRITE):
         if db.in_transaction:
             db.commit()
         # Take the write lock up front: a deferred transaction that upgrades from a stale read
@@ -50,8 +50,6 @@ def writing(db):
         except BaseException:
             db.rollback()
             raise
-    finally:
-        WRITE.release()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -121,19 +119,20 @@ def connect(readonly=False):
         db = sqlite3.connect(f"file:{common.DB_PATH}?mode=ro", uri=True, timeout=30)
     else:
         common.require_volume()
-        db = sqlite3.connect(common.DB_PATH, timeout=60)
+        db = sqlite3.connect(common.DB_PATH, timeout=60, factory=timing.Connection)
         db.execute("PRAGMA busy_timeout=60000")
         # FTS5 segment merges reread big parts of the index; the 2 MB default cache turns every
         # merge into a stream of small reads and spills on the USB disk.
         db.execute("PRAGMA cache_size=-131072")
         db.execute("PRAGMA mmap_size=1073741824")
-        WRITE.acquire()
-        try:
+        with timing.write_lock(WRITE):
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=NORMAL")
             db.executescript(SCHEMA)
-        finally:
-            WRITE.release()
+            # The unique key covers known IDs, but checking deleted_at through it fetches
+            # every message row in an account while all other sync threads wait.
+            db.execute("CREATE INDEX IF NOT EXISTS items_deleted ON items(source, account, ext_id) "
+                       "WHERE deleted_at IS NOT NULL")
     db.execute("PRAGMA busy_timeout=60000")
     db.row_factory = sqlite3.Row
     return db

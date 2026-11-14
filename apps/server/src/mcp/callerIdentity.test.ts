@@ -22,10 +22,94 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as OrchestratorMcp from "./OrchestratorMcpService.ts";
 import * as ThreadAccess from "./threadAccess.ts";
+import { OrchestratorProjectionError } from "../orchestration-v2/Orchestrator.ts";
 import { readCallerIdentity } from "./callerIdentity.ts";
 import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
 
 const callerId = ThreadId.make("caller:foreground");
+
+it.effect.each(["board", "send", "status", "delegate"] as const)(
+  "%s fails safely with an unavailable foreground caller reader and background held",
+  (operation) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "caller-unavailable-" });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`PRAGMA journal_mode = WAL`;
+        yield* sql`CREATE TABLE entries(value INTEGER)`;
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const holder = yield* sql
+          .withTransaction(
+            sql`SELECT * FROM entries`.pipe(
+              Effect.andThen(Deferred.succeed(held, undefined)),
+              Effect.andThen(Deferred.await(release)),
+            ),
+          )
+          .pipe(SqliteClient.readOnly, Effect.forkChild);
+        yield* Deferred.await(held);
+        const threads = yield* ThreadManagement.ThreadManagementService.pipe(
+          Effect.provide(
+            Layer.mock(ThreadManagement.ThreadManagementService)({
+              getCallerRow: (threadId) =>
+                sql.withTransaction(sql`SELECT * FROM entries`).pipe(
+                  SqliteClient.readOnly,
+                  Effect.as(liveThreadShell(threadId)),
+                  Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+                ),
+              getThreadShell: () => Effect.die("must not fall back to a shell after lane failure"),
+            }),
+          ),
+        );
+        const deps = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.succeed(ThreadManagement.ThreadManagementService, threads),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTasks.ScheduledTaskService)({}),
+          Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
+          Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+        );
+        const error = yield* Effect.gen(function* () {
+          if (operation === "board") return yield* ThreadAccess.loadCaller();
+          const mcp = yield* OrchestratorMcp.OrchestratorMcpService;
+          if (operation === "status")
+            return yield* mcp.taskStatus(scope, NodeId.make("task:unavailable"));
+          if (operation === "delegate")
+            return yield* mcp.delegateTask(scope, { task: "test", clientRequestId: "same-key" });
+          return yield* mcp.sendToThread(scope, { threadId: callerId, message: "test" });
+        }).pipe(
+          Effect.provide(OrchestratorMcp.layer.pipe(Layer.provideMerge(deps))),
+          Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+          Effect.flip,
+        );
+        assert.equal(error._tag, "OrchestratorMcpFailure");
+        assert.include(error.message, "Nothing was saved; retry the same call.");
+        if (error._tag === "OrchestratorMcpFailure") assert.equal(error.code, "caller_unresolved");
+        if (operation === "delegate")
+          assert.include(error.message, "Retry only with the same clientRequestId: same-key.");
+        assert.isUndefined(holder.pollUnsafe());
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(holder);
+      }).pipe(
+        Effect.provide(
+          SqliteClient.layer({
+            filename: path.join(directory, "state.sqlite"),
+            readerWorker: true,
+            foregroundReaderSlots: 1,
+            foregroundReaderInitializationSql: ["SELECT * FROM missing_init_table"],
+          }),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
 const scope: McpInvocationContext.McpInvocationScope = {
   environmentId: EnvironmentId.make("environment:foreground"),
   requestNamespace: "caller-foreground",
@@ -123,7 +207,10 @@ it.effect.each(
           getThreadShell: () => Effect.die("active caller must not load its full shell"),
           getThreadRecords: () =>
             Effect.gen(function* () {
-              assert.equal(yield* SqliteClient.ReaderLane, "background");
+              assert.equal(
+                yield* SqliteClient.ReaderLane,
+                operation === "board" ? "background" : "foreground",
+              );
               yield* Deferred.succeed(recordEntered, undefined);
               yield* sql
                 .withTransaction(sql`SELECT * FROM entries`)
@@ -202,7 +289,7 @@ it.effect.each(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-it.effect.each(["ended", "archived", "fork", "other-provider"] as const)(
+it.effect.each(["ended", "fork"] as const)(
   "%s caller uses the exact background shell fallback",
   (state) =>
     Effect.gen(function* () {
@@ -210,14 +297,10 @@ it.effect.each(["ended", "archived", "fork", "other-provider"] as const)(
       const shell = {
         ...base,
         activeRunId: state === "ended" ? null : base.activeRunId,
-        archivedAt: state === "archived" ? base.createdAt : null,
         forkedFrom:
           state === "fork"
             ? { type: "run" as const, threadId: callerId, runId: base.activeRunId! }
             : null,
-        providerInstanceId: ProviderInstanceId.make(
-          state === "other-provider" ? "claude" : "codex",
-        ),
         pendingBackgroundTasks: [
           {
             taskId: "native-task",
@@ -234,7 +317,7 @@ it.effect.each(["ended", "archived", "fork", "other-provider"] as const)(
           getCallerRow: () =>
             Effect.gen(function* () {
               assert.equal(yield* SqliteClient.ReaderLane, "foreground");
-              return shell;
+              return { ...shell, pendingBackgroundTasks: undefined };
             }),
           getThreadShell: () =>
             Effect.gen(function* () {
@@ -294,8 +377,8 @@ it.effect.each(["ended", "archived", "other-provider", "background-subagent"] as
         ),
         Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
       );
-      assert.equal(fallbackReads, 1);
-      assert.strictEqual(caller.caller, shell);
+      assert.equal(fallbackReads, 0);
+      assert.equal(caller.caller?.id, shell.id);
       if (state === "background-subagent") yield* ThreadAccess.assertLiveCaller(caller);
       else
         assert.equal(

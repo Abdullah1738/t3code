@@ -1,6 +1,7 @@
 """Offline regression tests: remote exit-code fidelity and pool-busy queueing (no boat calls)."""
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -43,6 +44,89 @@ class ExitFidelityTests(Isolated):
             rc, last = self.run_cli(['go', 'test', './...'], code)
             self.assertEqual(rc, code)
             self.assertEqual(last, f'offbox: remote exit {code}')
+
+    def test_enospc_returns_infra_but_preserves_the_command_exit(self):
+        def start(runner):
+            fake_start(runner)
+            runner.log_path.write_text('OSError: [Errno 28] No space left on device\n')
+        a = cli.build_parser().parse_args(['run', '--', 'python', '-m', 'unittest'])
+        err = io.StringIO()
+        with patch.object(runs.Runner, 'start', start), patch.object(runs, 'follow', return_value=2), \
+                contextlib.redirect_stderr(err):
+            code = cli.cmd_run(a, self.me)
+        self.assertEqual(code, 90)
+        self.assertIn('test results from this run are not valid', err.getvalue())
+        import json
+        state_path = next(runs.LOGS_DIR.glob('*.state.json'))
+        state = json.loads(state_path.read_text())
+        self.assertEqual(state['command_exit_code'], 2)
+        self.assertEqual(state['infra_failure'], 'enospc')
+        run_id = state_path.name.removesuffix('.state.json')
+        self.con.execute("INSERT INTO runs(run_id,status,mode) VALUES (?,'running','bg')", (run_id,))
+        self.con.commit()
+        self.assertEqual(runs.finish(run_id, 2, bookkeeping=False), 2)
+        row = self.con.execute('SELECT * FROM runs').fetchone()
+        self.assertEqual((row['status'], row['exit_code']), ('infra', 2))
+        from offbox_lib import misc
+        with patch.object(misc, '_catch_up_log', return_value='complete'), \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(misc.wait(row['run_id'], None), 90)
+            self.assertEqual(misc.logs(row['run_id'], False), 90)
+        (runs.LOGS_DIR / f'{run_id}.log').unlink()
+        self.assertEqual(runs.space_result(run_id, 2), 90)
+        saved = json.loads(state_path.read_text())
+        self.assertEqual(saved['infra_failure'], 'enospc')
+
+    def test_enospc_before_stderr_probes_returns_infra_from_run_wait_and_logs(self):
+        import offbox_disk_space as disk
+        space = dict(tmp=dict(path='/tmp', free_bytes=2*disk.GIB, size_bytes=8*disk.GIB, fstype='tmpfs'))
+        probes = [disk.MARKER+json.dumps(dict(phase=phase, space=space))+'\n'
+                  for phase in ('server_start', 'start', 'end')]
+        # The display log can merge stdout before, between or after the stderr chunks.
+        for position in range(4):
+            with self.subTest(position=position):
+                lines = probes.copy()
+                lines.insert(position, 'OSError: [Errno 28] No space left on device\n')
+                self.assert_disk_readers(''.join(lines), True)
+
+    def assert_disk_readers(self, text, infra, *, prior=False):
+        from offbox_lib import misc
+        paths = []
+        def start(runner):
+            fake_start(runner)
+            runner.log_path.write_text(text)
+            if prior is not False:
+                runner.log_path.with_suffix('.state.json').write_text(json.dumps(
+                    dict(disk_space={}, wrapper_exit_code=2, infra_failure=prior)))
+            paths.append(runner.log_path)
+        a = cli.build_parser().parse_args(['run', '--', 'python', '-m', 'unittest'])
+        with patch.object(runs.Runner, 'start', start), patch.object(runs, 'follow', return_value=2), \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.cmd_run(a, self.me), 90 if infra else 2)
+        run_id = paths[0].stem
+        state = json.loads(paths[0].with_suffix('.state.json').read_text())
+        self.assertEqual((state['command_exit_code'], state['infra_failure']), (2, 'enospc' if infra else None))
+        self.con.execute("INSERT INTO runs(run_id,status,mode) VALUES (?,'running','bg')", (run_id,))
+        self.con.commit()
+        self.assertEqual(runs.finish(run_id, 2, bookkeeping=False), 2)
+        with patch.object(misc, '_catch_up_log', return_value='complete'), \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(misc.wait(run_id, None), 90 if infra else 2)
+            self.assertEqual(misc.logs(run_id, False), 90 if infra else 0)
+
+    def test_run_wait_logs_use_the_explicit_final_attempt_even_when_disk_was_freed(self):
+        import offbox_disk_space as disk
+        space = dict(tmp=dict(path='/tmp', free_bytes=2*disk.GIB, size_bytes=8*disk.GIB, fstype='tmpfs'))
+        for infra in (False, True):
+            for empty in (False, True):
+                with self.subTest(infra=infra, empty=empty):
+                    phases = {} if empty else dict(start=space, end=space)
+                    record = dict(disk_space=phases, infra_failure='enospc' if infra else None)
+                    summary = disk.MARKER+json.dumps(dict(phase='result', attempt=2, record=record))+'\n'
+                    self.assert_disk_readers(summary+'ENOSPC from stdout\n', infra, prior='enospc')
+
+    def test_late_error_evidence_replaces_an_earlier_clean_state(self):
+        self.assert_disk_readers('ENOSPC from stdout\n', True, prior=None)
 
     def test_zero_from_trailing_echo_is_flagged(self):
         rc, last = self.run_cli(['set -o pipefail; go test -count=1 -v ./... 2>&1; echo EXIT=$?'], 0)

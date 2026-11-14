@@ -96,6 +96,19 @@ describe("parseBridgeAck", () => {
     });
   });
 
+  it("keeps actual owner, Moni and group slugs and rejects malformed recipients", () => {
+    for (const chat of ["owner", "moni", "group-family-123"]) {
+      expect(
+        parseBridgeAck(JSON.stringify({ id: `send:${hex}`, created: false, chat }), "send"),
+      ).toEqual({ id: `send:${hex}`, created: false, chat });
+    }
+    for (const chat of ["", "../moni", "+15555550123", "Moni", "x".repeat(101), 5, null]) {
+      expect(
+        parseBridgeAck(JSON.stringify({ id: `send:${hex}`, created: true, chat }), "send"),
+      ).toBeUndefined();
+    }
+  });
+
   it("refuses anything else", () => {
     expect(parseBridgeAck(`{"id":"file:${hex}","created":true}`, "send")).toBeUndefined();
     expect(parseBridgeAck(`{"id":"send:abc","created":true}`, "send")).toBeUndefined();

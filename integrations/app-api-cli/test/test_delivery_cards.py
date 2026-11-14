@@ -17,6 +17,146 @@ import order_tracker as t
 
 
 class CardTests(unittest.TestCase):
+    def owner_placement(self, app='noon', vertical='food'):
+        self.cfg.update(app=app, order='FTESTSTAGE1404', vertical=vertical, **{'for':'owner'})
+        self.cfg['delivery_card']['chat'] = 'owner'
+        self.data['status'] = 'confirmed'
+        c.sync(self.cfg, self.data, send=True)
+        return c.ROOT / 'cards' / (self.cfg['watcher'] + '.json')
+
+    def test_stage_changes_enqueue_one_session_update_each_with_immutable_previews(self):
+        path = self.owner_placement()
+        before = c.read(path)
+        for status in ('preparing', 'preparing', 'picked_up', 'out_for_delivery', 'delivered', 'delivered'):
+            self.data['status'] = status
+            c.sync(self.cfg, self.data, update=True)
+        updates = [args for args in self.calls if '--update-id' in args]
+        self.assertEqual(len(updates), 4)
+        for args in updates:
+            self.assertEqual(args[args.index('--update-id') + 1], before['bridge_id'])
+            self.assertEqual(args[args.index('--url') + 1], before['url'])
+            self.assertIn('/stages/', args[args.index('--preview-page') + 1])
+        self.assertEqual(len({args[args.index('--key') + 1] for args in updates}), 4)
+        image = c.APPS / before['slug'] / 'stages' / hashlib.sha256(b'Preparing').hexdigest()[:24] / 'preview.png'
+        original = image.read_bytes()
+        (c.APPS / before['slug'] / 'preview.png').write_bytes(b'newer stage')
+        c.stage_preview(c.APPS / before['slug'], before['url'], 'Preparing')
+        self.assertEqual(image.read_bytes(), original)
+
+    def test_stage_update_lost_ack_reuses_exact_key_and_payload(self):
+        path = self.owner_placement()
+        self.data['status'] = 'preparing'
+        self.fail_send, self.queue_on_fail = True, 'sent'
+        c.sync(self.cfg, self.data, update=True)
+        first = [args for args in self.calls if '--update-id' in args][-1]
+        self.assertTrue(c.read(path)['update_error'])
+        self.fail_send = False
+        c.sync(self.cfg, self.data, update=True)
+        second = [args for args in self.calls if '--update-id' in args][-1]
+        self.assertEqual(first, second)
+        self.assertNotIn('update_error', c.read(path))
+        self.assertEqual(len(self.ops('owner')), 2)
+
+    def test_terminal_stage_waits_for_pending_original_then_continues(self):
+        for n, pending in enumerate(('pending', 'sending', 'uncertain')):
+            with self.subTest(placement=pending):
+                self.cfg['watcher'] = 'order-noon-pending-' + str(n)
+                self.ack_state = pending
+                path = self.owner_placement()
+                self.data['status'] = 'delivered'
+                result = c.sync(self.cfg, self.data, update=True)
+                self.assertTrue(result['update_pending'])
+                original = c.read(path)['bridge_id']
+                with sqlite3.connect(self.db('owner')) as con:
+                    con.execute("update outbox set state='sent' where id=?", (original,))
+                before = len([a for a in self.calls if '--update-id' in a])
+                result = c.sync(self.cfg, self.data, update=True)
+                self.assertFalse(result['update_pending'])
+                self.assertEqual(len([a for a in self.calls if '--update-id' in a]), before + 1)
+                self.assertTrue(c.read(path)['stage_updates']['Delivered']['queued'])
+
+    def test_retained_tracker_progress_prevents_old_picture_replacing_current_stage(self):
+        cases = [('noon', 'food', 'out for delivery', 'preparing', 'On the way'),
+                 ('noon', 'minutes', 'packed', 'preparing', 'Packed'),
+                 ('careem', 'quik', 'nearby', 'out for delivery', 'Almost here')]
+        for n, (app, vertical, advanced, stale, label) in enumerate(cases):
+            with self.subTest(app=app, vertical=vertical):
+                self.cfg['watcher'] = 'order-stage-regression-' + str(n)
+                self.owner_placement(app=app, vertical=vertical)
+                before = len([args for args in self.calls if '--update-id' in args])
+                state = {'status': 'placed'}
+                for observed in (advanced, stale, advanced):
+                    self.data['status'] = observed
+                    t.transition(self.data, state, self.cfg, time.time())
+                    c.sync(self.cfg, t.delivery_card_result(self.cfg, self.data, state), update=True)
+                updates = [args for args in self.calls if '--update-id' in args]
+                self.assertEqual(len(updates), before + 1)
+                self.assertEqual(updates[-1][updates[-1].index('--summary') + 1], label)
+
+    def test_pending_checks_retain_card_progress_without_advancing_the_wake_cursor(self):
+        cases = [('food', 'out for delivery', 'On the way'), ('minutes', 'packed', 'Packed'),
+                 ('food', 'delivered', 'Delivered'), ('food', 'cancelled', 'Cancelled')]
+        for n, (vertical, advanced, label) in enumerate(cases):
+            with self.subTest(vertical=vertical, advanced=advanced):
+                self.cfg['watcher'] = 'order-card-pending-cursor-' + str(n)
+                self.owner_placement(vertical=vertical)
+                before = len([a for a in self.calls if '--update-id' in a])
+                state = {'status': 'placed'}
+                observations = [advanced, 'preparing', advanced]
+                if advanced in t.TERMINAL:
+                    observations += ['cancelled' if advanced == 'delivered' else 'delivered']
+                for observed in observations:
+                    data = {**self.data, 'status': observed, 'whole_order_complete': observed in t.TERMINAL}
+                    c.sync(self.cfg, t.delivery_card_result(self.cfg, data, state), update=True)
+                self.assertEqual(state['status'], 'placed')
+                self.assertEqual(state['card_result']['status'], advanced)
+                updates = [a for a in self.calls if '--update-id' in a]
+                self.assertEqual(len(updates), before + 1)
+                self.assertEqual(updates[-1][updates[-1].index('--summary') + 1], label)
+
+    def test_reregistration_readiness_defers_terminal_stage_until_reconciled(self):
+        for n, terminal in enumerate(('delivered', 'cancelled')):
+            with self.subTest(terminal=terminal):
+                self.cfg['watcher'] = 'order-stage-reregistration-' + str(n)
+                self.owner_placement()
+                before = len([args for args in self.calls if '--update-id' in args])
+                self.cfg['delivery_card']['ready'] = False
+                self.data['status'] = terminal
+                c.sync(self.cfg, self.data, update=True)
+                self.assertEqual(len([args for args in self.calls if '--update-id' in args]), before)
+                self.cfg['delivery_card']['ready'] = True
+                c.sync(self.cfg, self.data, update=True)
+                updates = [args for args in self.calls if '--update-id' in args]
+                self.assertEqual(len(updates), before + 1)
+                self.assertEqual(updates[-1][updates[-1].index('--summary') + 1], terminal.title())
+
+    def test_stage_update_scope_and_suppression(self):
+        path = self.owner_placement()
+        self.data['status'] = 'preparing'
+        for flag in ('held', 'skip_send'):
+            with self.subTest(flag=flag):
+                self.cfg['delivery_card'][flag] = True
+                c.sync(self.cfg, self.data, update=True)
+                self.cfg['delivery_card'].pop(flag)
+        c.sync(self.cfg, self.data)  # --no-card-send/render-only path
+        self.assertFalse(any('--update-id' in args for args in self.calls))
+        legacy = c.read(path)
+        legacy.pop('placement_stage')
+        c.atomic(path, legacy)
+        c.sync(self.cfg, self.data, update=True)
+        self.assertFalse(any('--update-id' in args for args in self.calls))
+        self.assertEqual(c.read(path)['placement_stage'], 'Preparing')
+
+    def test_unproven_status_and_failed_preview_do_not_send_updates(self):
+        self.owner_placement()
+        self.data['status'] = 'unknown'
+        self.data['status_text'] = 'Please wait'
+        c.sync(self.cfg, self.data, update=True)
+        self.data['status'] = 'preparing'
+        with patch.object(c, 'preview', return_value=False):
+            c.sync(self.cfg, self.data, update=True)
+        self.assertFalse(any('--update-id' in args for args in self.calls))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -133,6 +273,33 @@ class CardTests(unittest.TestCase):
         self.assertEqual(c.eta({**d,'eta_text':'in 8 min'}, {})[0], '12:08')
         self.assertEqual(c.eta({**d,'eta_text':'1 hr 5 min'}, {})[0], '13:05')
         self.assertIsNone(c.eta({'eta_text':'in 8 min'}, {})[2])
+
+    def test_careem_live_stages_and_journal_health(self):
+        for vertical in ('food', 'quik'):
+            cfg = dict(self.cfg, app='careem', vertical=vertical)
+            for status, label, idx in [('preparing', 'Preparing' if vertical == 'food' else 'Packing', 1),
+                                       ('out for delivery', 'On the way' if vertical == 'food' else 'Out for delivery', 3 if vertical == 'food' else 2),
+                                       ('nearby', 'Almost here', 3 if vertical == 'food' else 2),
+                                       ('delivered', 'Delivered', 4 if vertical == 'food' else 3)]:
+                with self.subTest(vertical=vertical, status=status):
+                    data = dict(self.data, status=status, errors=['native_account_capture_required_guest_catalog_only'], live_source_ok=True)
+                    v = c.view(cfg, data, {})
+                    self.assertEqual((v['stage'], v['index']), (label, idx))
+                    self.assertEqual(v['steps'][idx], label)
+                    self.assertFalse(v['unavailable'])
+                    self.assertEqual(v['terminal'], status == 'delivered')
+                    self.assertTrue(c.view(cfg, {**data, 'live_source_ok': False}, {})['unavailable'])
+        self.assertEqual(c.view(dict(self.cfg, app='careem', vertical='box'),
+                                dict(self.data, status='nearby'), {})['stage'], 'Out for delivery')
+        stale = dict(self.data, status='unknown', last_confirmed_status='nearby', errors=['notification_collector_stale'])
+        v = c.view(dict(self.cfg, app='careem', vertical='food'), stale, {})
+        self.assertEqual(v['stage'], 'Almost here')
+        self.assertTrue(v['unavailable'])
+
+    def test_careem_notification_eta_takes_precedence(self):
+        cfg = dict(self.cfg, app='careem', eta='2026-11-11T15:15:00+04:00')
+        data = dict(self.data, eta='2026-11-11T15:05:50+04:00', eta_source='careem_notification', eta_text='in 20 min')
+        self.assertEqual(c.eta(data, cfg)[0], '15:05')
 
     def test_label_reads_before_the_time_and_no_estimate_is_a_word(self):
         d = {'checked_at':'2026-10-22T08:00:00Z','eta_text':'Arrives in 25-35 mins'}

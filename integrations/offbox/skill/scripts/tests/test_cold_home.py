@@ -8,12 +8,13 @@ from pathlib import Path
 import subprocess
 import sys
 import unittest
+import urllib.error
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tests._env import clean_env
-from offbox_lib import allocation, api, cli, common, lease, pool, prune, runs, ssh_sync
+from offbox_lib import allocation, api, cli, common, home, lease, pool, prune, runs, ssh_sync
 from test_capacity import Isolated
 
 
@@ -35,6 +36,7 @@ class ColdHomeTests(Isolated):
         self.stack.enter_context(patch.object(ssh_sync, 'tracked_secret_matches', return_value=[]))
         self.stack.enter_context(patch.object(runs, 'new_checkout_hint'))
         self.image_wait = self.stack.enter_context(patch.object(runs, 'needs_image_wait', return_value=False))
+        self.real_ensure_ttl = lease.ensure_ttl
         self.ttl = self.stack.enter_context(patch.object(lease, 'ensure_ttl', return_value=True))
         self.peer = self.stack.enter_context(patch.object(api, 'get', return_value={'state': 'ready', 'type': 'large'}))
         self.peer_ssh = completed()
@@ -215,6 +217,34 @@ class ColdHomeTests(Isolated):
         with common.file_lock('box-b', timeout=0):
             pass
         self.assertIn('5-25 min', self.output.getvalue())
+
+    def test_startup_bound_on_warm_peer_releases_both_boxes_before_sync(self):
+        self.box('b', member=True)
+        args = cli.build_parser().parse_args(['run', '--', 'true'])
+        runner = runs.Runner(args, self.me)
+        def reply(request, **kwargs):
+            if request.full_url.endswith('/sandboxes/b'):
+                raise urllib.error.HTTPError('http://fixture', 503, 'starting', {}, io.BytesIO(json.dumps({
+                    'code': 'server_not_ready', 'message': 'waiting for incus'}).encode()))
+            return io.BytesIO(b'{}')
+        with patch.object(lease, 'ensure_ttl', self.real_ensure_ttl), \
+                patch.object(api, 'BACKEND', 'server'), patch.object(api, '_own_box'), \
+                patch.object(api, '_key', return_value='fixture'), patch.object(api, 'call', api._call), \
+                patch.object(api, '_open', side_effect=reply) as send, \
+                patch.dict(os.environ, OFFBOX_HOME_START_WAIT_S='0'), \
+                patch.object(runs, 'Runner', return_value=runner), patch.object(runner, 'stream', return_value=0):
+            with self.assertRaises(home.StartWaitFailed) as raised:
+                runs._run_attempt(args, self.me)
+        self.assertEqual(raised.exception.box, 'a')
+        self.assertFalse(raised.exception.started)
+        self.assertTrue(home.unreachable(raised.exception))
+        self.assertEqual([call.args[0].full_url.rsplit('/', 1)[-1] for call in send.call_args_list], ['b', 'a'])
+        self.push.assert_not_called()
+        api.cmd_start.assert_not_called()
+        self.assertEqual(lease.active_runs(self.con, 'a'), 0)
+        self.guard.__exit__.assert_called_once()
+        with common.file_lock('box-b', timeout=0):
+            pass
 
     def assert_stayed_on_original(self, rn, row):
         self.assertEqual(row['box_id'], 'a')

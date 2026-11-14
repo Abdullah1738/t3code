@@ -35,8 +35,8 @@ class QuintTest(unittest.TestCase):
                 entry = tarfile.TarInfo(name)
                 entry.size, entry.mode = len(data), mode
                 bundle.addfile(entry, io.BytesIO(data))
-        source = source.replace('b4fc81998dd20d0b55a48c16d1caed1045e324bbbfe45ee7f625f6aaf70caf6f', hashlib.sha256(self.archive.read_bytes()).hexdigest())
-        source = source.replace('cb6a7d689b2937b00be5e7e30e9bb1925cde7c8ce47aaafddb1cf21c8c167593', hashlib.sha256(b'patched-jar').hexdigest())
+        source = source.replace('51e0e9832eb589d346370b54377850697a597e3dfc23dd49246a02df421c9174', hashlib.sha256(self.archive.read_bytes()).hexdigest())
+        source = source.replace('a90f5802b6cfdb59c548513f0be2725ebd7c53a79cb96277cb349e48ea0b8f66', hashlib.sha256(b'patched-jar').hexdigest())
         self.script(self.wrapper, source)
         self.script(self.probe, "#!/bin/sh\nexit 1\n")
         self.jdk(self.brew)
@@ -161,22 +161,22 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         args = ("verify", "model with spaces.qnt", "--invariant", "ok", "--max-steps", "5")
         data = self.result(*args)
         forwarded = data["argv"]
-        self.assertEqual(forwarded[1], "--server-endpoint")
-        host, port = forwarded[2].split(":")
-        self.assertEqual(host, "localhost")
+        self.assertEqual(forwarded[0], "--server-endpoint")
+        host, port = forwarded[1].split(":")
+        self.assertEqual(host, "127.0.0.1")
         self.assertGreater(int(port), 0)
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", int(port)))
-        self.assertEqual([forwarded[0], *forwarded[3:]], list(args))
+        self.assertEqual(forwarded[2:], list(args))
 
-    def test_explicit_endpoint_forms_unchanged(self):
+    def test_explicit_endpoint_forms_use_ipv4(self):
         for endpoint in (("--server-endpoint", "localhost:9123"),
                          ("--server-endpoint=localhost:9123",),
                          ("--serverEndpoint", "localhost:9123"),
                          ("--serverEndpoint=localhost:9123",)):
             with self.subTest(endpoint=endpoint):
                 args = ["verify", "a.qnt", *endpoint]
-                self.assertEqual(self.result(*args)["argv"], args)
+                self.assertEqual(self.result(*args)["argv"], ["verify", "a.qnt", "--server-endpoint", "127.0.0.1:9123"])
 
     def test_leading_option_forms(self):
         for prefix in (["--verbosity=0"], ["--verbosity", "0"],
@@ -190,9 +190,9 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
             with self.subTest(prefix=prefix):
                 args = [*prefix, "verify", "a.qnt"]
                 forwarded = self.result(*args)["argv"]
-                insert = len(prefix) + 1
+                insert = len(prefix)
                 self.assertEqual(forwarded[insert], "--server-endpoint")
-                self.assertTrue(forwarded[insert + 1].startswith("localhost:"))
+                self.assertTrue(forwarded[insert + 1].startswith("127.0.0.1:"))
                 self.assertEqual(forwarded[:insert] + forwarded[insert + 2:], args)
 
     def test_negated_scalar_options_do_not_consume_the_command(self):
@@ -203,18 +203,18 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
                        "--no-outItf", "--no-backend", "--no-tlc-config", "--no-tlcConfig"):
             with self.subTest(prefix=prefix):
                 forwarded = self.result(prefix, "verify", "a.qnt")["argv"]
-                self.assertEqual(forwarded[:3], [prefix, "verify", "--server-endpoint"])
-                self.assertTrue(forwarded[3].startswith("localhost:"))
-                self.assertEqual(forwarded[4:], ["a.qnt"])
+                self.assertEqual(forwarded[:2], [prefix, "--server-endpoint"])
+                self.assertTrue(forwarded[2].startswith("127.0.0.1:"))
+                self.assertEqual(forwarded[3:], ["verify", "a.qnt"])
 
-    def test_leading_explicit_endpoint_aliases_unchanged(self):
+    def test_leading_explicit_endpoint_aliases_use_ipv4(self):
         for endpoint in (["--server-endpoint", "localhost:9123"],
                          ["--server-endpoint=localhost:9123"],
                          ["--serverEndpoint", "localhost:9123"],
                          ["--serverEndpoint=localhost:9123"]):
             with self.subTest(endpoint=endpoint):
                 args = [*endpoint, "verify", "a.qnt"]
-                self.assertEqual(self.result(*args)["argv"], args)
+                self.assertEqual(self.result(*args)["argv"], ["--server-endpoint", "127.0.0.1:9123", "verify", "a.qnt"])
 
     def test_leading_invariant_arrays_preserve_command_shaped_values(self):
         for prefix in (["--invariants", "inv1", "verify", "inv3", "--max-steps=1"],
@@ -227,9 +227,9 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
             with self.subTest(prefix=prefix):
                 args = [*prefix, "verify", "a.qnt"]
                 forwarded = self.result(*args)["argv"]
-                insert = len(prefix) + 1
+                insert = len(prefix)
                 self.assertEqual(forwarded[insert], "--server-endpoint")
-                self.assertTrue(forwarded[insert + 1].startswith("localhost:"))
+                self.assertTrue(forwarded[insert + 1].startswith("127.0.0.1:"))
                 self.assertEqual(forwarded[:insert] + forwarded[insert + 2:], args)
 
     def test_invariant_array_consuming_all_positionals_is_not_a_command(self):
@@ -247,7 +247,7 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
 
     def test_option_inserted_before_delimiter(self):
         args = self.result("verify", "--", "--server-endpoint")["argv"]
-        self.assertEqual(args[1], "--server-endpoint")
+        self.assertEqual(args[0], "--server-endpoint")
         self.assertEqual(args[3:], ["--", "--server-endpoint"])
 
     def test_other_commands_unchanged(self):
@@ -481,6 +481,68 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
                 self.assertIn('unsafe protobuf override', r.stderr)
         self.assertFalse((self.root / 'server.json').exists())
 
+    def test_readiness_requires_owned_ipv4_loopback_listener(self):
+        self.wrapper.write_text(self.wrapper.read_text().replace(
+            'time.monotonic() + 30', 'time.monotonic() + .3'))
+        lsof = self.root / 'fake-tools/lsof'
+        self.script(lsof, """#!/usr/bin/python3
+import os, sys
+pid = sys.argv[sys.argv.index('-p') + 1]
+port = next(a.split(':')[1] for a in sys.argv if a.startswith('-iTCP:'))
+print('p' + (pid if os.environ['LISTEN_HOST'] != 'wrong-pid' else '1'))
+host = os.environ['LISTEN_HOST']
+print('n' + ('127.0.0.1' if host == 'wrong-pid' else host) + ':' + port)
+""")
+        for host in ('*', '[::]', '[::1]', '192.168.1.2', 'wrong-pid'):
+            with self.subTest(host=host):
+                r = self.run_cli('verify', 'a.qnt', LISTEN_HOST=host,
+                                 PATH=str(lsof.parent)+':'+self.env['PATH'])
+                self.assertNotEqual(r.returncode, 0, r.stderr)
+                self.assertIn('did not listen', r.stderr)
+                self.assertEqual(r.stdout, '')
+                self.server_stopped()
+
+    def test_endpoint_aliases_become_one_ipv4_option(self):
+        for key in ('--server-endpoint', '--serverEndpoint'):
+            for host in ('localhost', '127.0.0.1'):
+                for form in ((key, host+':9123'), (key+'='+host+':9123',)):
+                    with self.subTest(form=form):
+                        data = self.result('verify', 'a.qnt', *form)
+                        self.assertEqual(data['argv'],
+                                         ['verify', 'a.qnt', '--server-endpoint', '127.0.0.1:9123'])
+                        self.server_stopped()
+    def test_single_backend_options_keep_invariant_array_boundary(self):
+        forms = (
+            ('--server-endpoint', 'localhost:9123'),
+            ('--server-endpoint=127.0.0.1:9123',),
+            ('--serverEndpoint', '127.0.0.1:9123'),
+            ('--serverEndpoint=localhost:9123',),
+            ('--apalache-version', '0.62.4'),
+            ('--apalache-version=0.62.4',),
+            ('--apalacheVersion', '0.62.4'),
+            ('--apalacheVersion=0.62.4',),
+        )
+        for form in forms:
+            for position in ('before-command', 'after-command'):
+                args = ['--invariants', 'inv1', *form, 'verify', 'a.qnt'] if position == 'before-command' else ['verify', '--invariants', 'inv1', *form, 'a.qnt']
+                with self.subTest(form=form, position=position):
+                    raw = self.result(*args)['raw_argv']
+                    boundary = raw[raw.index('inv1')+1]
+                    self.assertTrue(boundary.startswith('--server-endpoint' if 'server' in form[0] else '--apalache-version'))
+                    self.server_stopped()
+
+    def test_repeated_backend_options_are_refused_before_java(self):
+        for first, second, family in (
+            ('--server-endpoint=localhost:9123', '--serverEndpoint=localhost:9123', 'server-endpoint'),
+            ('--apalache-version=0.62.4', '--apalacheVersion=0.62.4', 'apalache-version'),
+        ):
+            with self.subTest(family=family):
+                r = self.run_cli(first, 'verify', '--invariants', 'inv1', second, 'a.qnt')
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn('repeated --'+family, r.stderr)
+                self.assertIn('pass this option only once', r.stderr)
+                self.assertFalse((self.root / 'server.json').exists())
+
     def test_endpoint_and_version_input_class(self):
         for option in ('--server-endpoint', '--serverEndpoint'):
             for value in ('', 'remote:9123', 'localhost:0', 'localhost:65536', 'localhost:nope'):
@@ -493,10 +555,10 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         for option in ('--no-server-endpoint', '--no-serverEndpoint', '--no-apalache-version', '--no-apalacheVersion'):
             self.assertNotEqual(self.run_cli('verify', 'a.qnt', option).returncode, 0)
 
-    def test_version_spellings_and_repetition_become_one_pinned_option(self):
+    def test_single_version_spellings_become_one_pinned_option(self):
         forms = [('--apalache-version', '0.62.4'), ('--apalache-version=0.62.4',),
                  ('--apalacheVersion', '0.62.4'), ('--apalacheVersion=0.62.4',)]
-        for form in forms + [forms[0] + forms[3]]:
+        for form in forms:
             data = self.result('verify', 'a.qnt', *form)
             options = [arg for arg in data['raw_argv'] if arg.startswith(('--apalache-version', '--apalacheVersion'))]
             self.assertEqual(options, ['--apalache-version=0.62.4'])

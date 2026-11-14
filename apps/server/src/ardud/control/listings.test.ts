@@ -9,12 +9,16 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { assert, describe, it } from "@effect/vitest";
 import {
   AuthSessionId,
+  OrchestrationV2AppThreadJson,
+  type AnalyticsEvent,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
+  ProjectId,
   RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -23,10 +27,12 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
 import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
@@ -37,6 +43,7 @@ import * as ThreadLaunchService from "../../orchestration-v2/ThreadLaunchService
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
@@ -46,9 +53,14 @@ import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "./http.ts";
+import * as Analytics from "../analytics/Analytics.ts";
+import { accumulate, finishRollup, makeAccumulator } from "../analytics/rollup.ts";
 import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
 
 const askedAt = DateTime.makeUnsafe("2026-01-01T00:05:00.000Z");
+const encodeThreadPayload = Schema.encodeEffect(
+  Schema.fromJsonString(OrchestrationV2AppThreadJson),
+);
 
 const shell = (
   id: string,
@@ -184,6 +196,7 @@ const seedRows = Effect.gen(function* () {
   for (const [providerThreadId, driver, nativeId, updatedAt] of [
     ["pt-migrated-claude", "claudeAgent", "claude-session-uuid", "2026-01-01T00:00:00.000Z"],
     ["pt-migrated-oc", "opencode", "ses_migrated_old", "2026-01-02T00:00:00.000Z"],
+    ["pt-migrated-codex", "codex", "codex-session-uuid", "2026-01-01T00:00:00.000Z"],
   ] as const) {
     yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert({
       provider_thread_id: providerThreadId,
@@ -232,14 +245,17 @@ const makeHarness = (
   vanished: ReadonlySet<string> = new Set(),
   // Failures the session check returns, in order, before it succeeds.
   authFailures: Array<unknown> = [],
+  realSnapshots = false,
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const projects = yield* ProjectStore.make;
-    yield* seedRows;
-    // Extra shells are real projection rows too, as in production: updatedSince listings read
-    // the changed range from the table and only build shells for what they return.
-    for (const extra of extraShells) {
+    if (!realSnapshots) yield* seedRows;
+    const projection = realSnapshots
+      ? yield* ProjectionStore.ProjectionStoreV2.pipe(Effect.provide(ProjectionStore.layer))
+      : undefined;
+    // Light-row listings and shell reads must see the same persisted threads.
+    for (const extra of [...shells, ...extraShells]) {
       yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert({
         thread_id: extra.id,
         project_id: extra.projectId,
@@ -253,14 +269,13 @@ const makeHarness = (
         archived_at: extra.archivedAt === null ? null : DateTime.formatIso(extra.archivedAt),
         deleted_at: extra.deletedAt === null ? null : DateTime.formatIso(extra.deletedAt),
         provider_instance_id: "codex",
-        payload_json: JSON.stringify({
-          lineage: extra.lineage,
-          creationSource: extra.creationSource,
-          archivedAt: extra.archivedAt === null ? null : DateTime.formatIso(extra.archivedAt),
-          updatedAt: DateTime.formatIso(extra.updatedAt),
-        }),
-      })}`;
+        payload_json: yield* encodeThreadPayload(idleThreadProjection(extra).thread).pipe(
+          Effect.orDie,
+        ),
+      })} ON CONFLICT(thread_id) DO UPDATE SET updated_at = excluded.updated_at`;
     }
+    const statements: Array<readonly [string, ReadonlyArray<unknown>]> = [];
+    const analyticsEvents: AnalyticsEvent[] = [];
     const snapshotReads = yield* Ref.make(0);
     // Targeted (threadIds) shell reads and one-thread shell reads, counted apart.
     const targetedReads = yield* Ref.make<Array<ReadonlyArray<string>>>([]);
@@ -277,6 +292,13 @@ const makeHarness = (
     const threads = Layer.mock(ThreadManagementService.ThreadManagementService)({
       getShellSnapshot: (options) => {
         const ids = options?.threadIds;
+        if (projection !== undefined) {
+          return (
+            ids === undefined
+              ? Ref.update(snapshotReads, (count) => count + 1)
+              : Ref.update(targetedReads, (reads) => [...reads, ids])
+          ).pipe(Effect.andThen(projection.getShellSnapshot(options)), Effect.orDie);
+        }
         if (ids !== undefined) {
           const full = snapshotFor(options?.location ?? "active", extraShells);
           const keep = (candidate: OrchestrationV2ThreadShell) =>
@@ -327,7 +349,7 @@ const makeHarness = (
                             }),
                           )
                         : sql`SELECT 1`.pipe(
-                            NodeSqliteClient.readOnly,
+                            NodeSqliteClient.authReadOnly,
                             Effect.orDie,
                             Effect.as({
                               sessionId: AuthSessionId.make("session-cli"),
@@ -376,6 +398,12 @@ const makeHarness = (
                 }),
                 Layer.succeed(SqlClient.SqlClient, sql),
                 Layer.succeed(StartupPhaseLog.StartupPhaseLog, startupLog),
+                Layer.mock(Analytics.Analytics)({
+                  record: (event) =>
+                    Effect.sync(() => {
+                      analyticsEvents.push(event);
+                    }),
+                }),
               ).pipe(Layer.provideMerge(NodeServices.layer)),
             ),
             Layer.provide(
@@ -385,7 +413,16 @@ const makeHarness = (
               ),
             ),
           ),
-          { disableLogger: true },
+          {
+            disableLogger: true,
+            middleware: (effect) =>
+              effect.pipe(
+                Effect.provideService(Statement.CurrentTransformer, (statement) => {
+                  statements.push(statement.compile());
+                  return Effect.succeed(statement);
+                }),
+              ),
+          },
         ),
       ),
       (handler) => Effect.promise(() => handler.dispose()),
@@ -416,7 +453,9 @@ const makeHarness = (
       get,
       threadIds,
       snapshotReads,
+      analyticsEvents,
       targetedReads,
+      statements,
       shellReads,
       recordReads,
       startupLog,
@@ -439,6 +478,404 @@ const run = <A, E>(
   ).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("control listings", () => {
+  it.live("by-native owner reads complete while the background reader holds a transaction", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "control-native-owner-lane-" });
+      yield* Effect.gen(function* () {
+        const h = yield* makeHarness();
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`INSERT INTO ardud_opencode_import (native_session_id, thread_id, imported_at)
+          VALUES ('ses_owner', 'live-running', '2026-11-14')`;
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const holder = yield* sql.withTransaction(
+          Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        ).pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
+        yield* Deferred.await(held);
+        const response = yield* h.get("/threads/by-native/ses_owner?view=owner").pipe(
+          Effect.timeout("5 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)),
+        );
+        yield* Fiber.join(holder);
+        assert.strictEqual(response.status, 200);
+        assert.strictEqual(response.body.thread.threadId, "live-running");
+      }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+  it.effect("by-native defaults to full detail and offers a history-free owner view", () =>
+    run(({ get, sql, recordReads, shellReads }) =>
+      Effect.gen(function* () {
+        yield* sql`INSERT INTO ardud_opencode_import (native_session_id, thread_id, imported_at)
+        VALUES ('ses_owner', 'live-running', '2026-11-14')`;
+        const owner = yield* get("/threads/by-native/ses_owner?view=owner");
+        assert.strictEqual(owner.status, 200);
+        assert.deepStrictEqual(Object.keys(owner.body.thread), [
+          "id",
+          "threadId",
+          "title",
+          "projectId",
+          "state",
+          "status",
+          "archived",
+          "deleted",
+        ]);
+        assert.strictEqual(owner.body.thread.threadId, "live-running");
+        assert.strictEqual(yield* Ref.get(recordReads), 0);
+        assert.strictEqual(yield* Ref.get(shellReads), 0);
+        const full = yield* get("/threads/by-native/ses_owner");
+        const detail = yield* get("/threads/live-running");
+        assert.strictEqual(JSON.stringify(full.body.thread), JSON.stringify(detail.body.thread));
+        for (const view of ["", "invalid", "full", "OWNER", "owner "]) {
+        assert.strictEqual((yield* get(`/threads/by-native/ses_owner?view=${encodeURIComponent(view)}`)).status, 400);
+      }
+        assert.strictEqual((yield* get("/threads/by-native/unknown?view=owner")).status, 404);
+        assert.strictEqual(
+          (yield* get("/threads/by-native/ses_owner?driver=codex&view=owner")).status,
+          404,
+        );
+      }),
+    ),
+  );
+
+  const pagedShells = Array.from({ length: 507 }, (_, i) => {
+    const id = `cursor-${String(i).padStart(4, "0")}`;
+    return shell(id, {
+      ...idle,
+      updatedAt: DateTime.makeUnsafe(1_800_000_000_000 + Math.floor(i / 3) * 1_000),
+      lineage: {
+        rootThreadId: ThreadId.make(id),
+        parentThreadId: null,
+        relationshipToParent: null,
+      },
+    });
+  });
+
+  it.live("serves a global 24-hour updatedSince page of 500 with the full total", () =>
+    run(
+      ({ get }) =>
+        Effect.gen(function* () {
+          const since = DateTime.toEpochMillis(pagedShells.at(-1)!.updatedAt) - 86_400_000;
+          for (const value of [String(since), DateTime.formatIso(DateTime.makeUnsafe(since))]) {
+            const response = yield* get(
+              `/threads?updatedSince=${encodeURIComponent(value)}&limit=500`,
+            );
+            assert.equal(response.status, 200);
+            assert.equal(response.body.total, 507);
+            assert.lengthOf(response.body.threads, 500);
+            assert.equal(response.body.threads[0].threadId, "cursor-0506");
+            assert.isString(response.body.nextCursor);
+          }
+        }),
+      undefined,
+      pagedShells,
+    ),
+  );
+
+  it.live("pages messages through the HTTP filters and retains the wire shape", () =>
+    run(({ get, sql, recordReads }) =>
+      Effect.gen(function* () {
+        const at = "2026-03-01T00:00:00.000Z";
+        for (const [id, role] of [
+          ["a", "assistant"],
+          ["b", "user"],
+          ["c", "user"],
+        ]) {
+          yield* sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert({
+            message_id: id,
+            thread_id: "quiet",
+            run_id: "run-page",
+            node_id: null,
+            role,
+            streaming: 0,
+            created_at: at,
+            updated_at: at,
+            payload_json: JSON.stringify({
+              id,
+              threadId: "quiet",
+              runId: "run-page",
+              nodeId: null,
+              role,
+              text: id,
+              phase: "answer",
+              attachments: [],
+              streaming: false,
+              createdBy: "user",
+              creationSource: "web",
+              createdAt: at,
+              updatedAt: at,
+            }),
+          })}`;
+        }
+        const response = yield* get(
+          `/threads/quiet/messages?role=user&runId=run-page&since=${Date.parse(at) - 1}&afterMessageId=a&limit=1`,
+        );
+        assert.equal(response.status, 200);
+        assert.equal(response.body.total, 2);
+        assert.deepStrictEqual(
+          response.body.messages.map((message: { messageId: string }) => message.messageId),
+          ["c"],
+        );
+        assert.equal(response.body.lastAssistant.messageId, "a");
+        assert.equal(response.body.state, "idle");
+        assert.equal(response.body.status, "completed");
+        assert.equal(response.body.runId, "run:quiet:1");
+        assert.equal(yield* Ref.get(recordReads), 1);
+        const all = yield* get("/threads/quiet/messages?role=user&all=true&limit=1");
+        assert.lengthOf(all.body.messages, 2);
+        assert.equal((yield* get("/threads/missing/messages")).status, 404);
+      }),
+    ),
+  );
+
+  it.live(
+    "pages beyond 500 in descending time/id order with a full total on every page",
+    () =>
+      run(
+        ({ get }) =>
+          Effect.gen(function* () {
+            const ids: string[] = [];
+            let cursor: string | null = null;
+            do {
+              const response: Effect.Success<ReturnType<Harness["get"]>> = yield* get(
+                `/threads?updatedSince=1800000000000&includeSubagents=true&limit=500${cursor === null ? "" : `&cursor=${cursor}`}`,
+              );
+              assert.equal(response.status, 200);
+              assert.equal(response.body.total, 504);
+              ids.push(...response.body.threads.map((row: { threadId: string }) => row.threadId));
+              cursor = response.body.nextCursor;
+            } while (cursor !== null);
+            assert.deepEqual(
+              ids,
+              pagedShells
+                .slice(3)
+                .map((row) => row.id)
+                .reverse(),
+            );
+            assert.equal(new Set(ids).size, 504);
+          }),
+        undefined,
+        pagedShells,
+      ),
+    { timeout: 30_000 },
+  );
+
+  it.effect.each([
+    "",
+    "&active=false",
+    "&ids=cursor-0000,cursor-0001,cursor-0002,cursor-0003,cursor-0004,cursor-0005",
+    "&state=idle",
+  ])("pages tied timestamps on every listing path: %s", (query) =>
+    run(
+      ({ get }) =>
+        Effect.gen(function* () {
+          const ids: string[] = [];
+          let cursor: string | null = null;
+          do {
+            const response: Effect.Success<ReturnType<Harness["get"]>> = yield* get(
+              `/threads?updatedSince=1799999999999&limit=2${query}${cursor === null ? "" : `&cursor=${cursor}`}`,
+            );
+            assert.equal(response.status, 200);
+            assert.equal(response.body.total, 6);
+            ids.push(...response.body.threads.map((row: { threadId: string }) => row.threadId));
+            cursor = response.body.nextCursor;
+          } while (cursor !== null);
+          assert.deepEqual(
+            ids,
+            pagedShells
+              .slice(0, 6)
+              .map((row) => row.id)
+              .reverse(),
+          );
+        }),
+      undefined,
+      pagedShells.slice(0, 6),
+    ),
+  );
+
+  it.effect("cursor ordering uses epoch milliseconds across ISO timestamp spellings", () => {
+    const rows = [
+      ["iso-z", "2027-01-15T08:00:00Z"],
+      ["iso-y", "2027-01-15T08:00:00.000Z"],
+      ["iso-q", "2027-01-15T12:00:00.000+04:00"],
+      ["iso-p", "2027-01-15T03:00:00.000-05:00"],
+      ["iso-x", "2027-01-15T08:00:00.001Z"],
+      ["iso-w", "2027-01-15T08:00:00.01Z"],
+      ["iso-v", "2027-01-15T08:00:00.100Z"],
+    ] as const;
+    return run(
+      ({ get, sql }) =>
+        Effect.gen(function* () {
+          for (const [id, at] of rows)
+            yield* sql`UPDATE orchestration_v2_projection_threads SET updated_at = ${at} WHERE thread_id = ${id}`;
+          let cursor: string | null = null;
+          const ids: string[] = [];
+          do {
+            const response: Effect.Success<ReturnType<Harness["get"]>> = yield* get(
+              `/threads?updatedSince=1799999999999&limit=1${cursor === null ? "" : `&cursor=${cursor}`}`,
+            );
+            assert.equal(response.status, 200);
+            assert.equal(response.body.total, rows.length);
+            ids.push(...response.body.threads.map((row: { threadId: string }) => row.threadId));
+            cursor = response.body.nextCursor;
+          } while (cursor !== null);
+          assert.deepEqual(ids, ["iso-v", "iso-w", "iso-x", "iso-z", "iso-y", "iso-q", "iso-p"]);
+        }),
+      undefined,
+      rows.map(([id, at]) => shell(id, { ...idle, updatedAt: DateTime.makeUnsafe(at) })),
+    );
+  });
+
+  it.effect("combines archived, project and updatedSince filters with a cursor", () => {
+    const archived = pagedShells.slice(0, 6).map((row) => ({ ...row, archivedAt: askedAt }));
+    return run(
+      ({ get }) =>
+        Effect.gen(function* () {
+          const query =
+            "/threads?archived=true&projectId=project:mcp-test&updatedSince=1799999999999&limit=3";
+          const first = yield* get(query);
+          const second = yield* get(`${query}&cursor=${first.body.nextCursor}`);
+          assert.equal(first.body.total, 6);
+          assert.equal(second.body.total, 6);
+          assert.deepEqual(
+            [...first.body.threads, ...second.body.threads].map((row) => row.threadId),
+            archived.map((row) => row.id).reverse(),
+          );
+          assert.isNull(second.body.nextCursor);
+          assert.isTrue(second.body.threads[0].archived);
+          assert.equal(second.body.threads[0].archivedAt, DateTime.formatIso(askedAt));
+          assert.isNull((yield* get("/threads?ids=quiet")).body.threads[0].archivedAt);
+        }),
+      undefined,
+      [
+        ...archived,
+        { ...pagedShells[6]!, projectId: ProjectId.make("other"), archivedAt: askedAt },
+      ],
+    );
+  });
+
+  it.effect.each([
+    "",
+    "&ids=cursor-0000,cursor-0001,cursor-0002,cursor-0003,cursor-0004,cursor-0005",
+    "&active=false",
+  ])("origin cursors keep full totals and inherited origins: %s", (query) =>
+    run(
+      ({ get, sql }) =>
+        Effect.gen(function* () {
+          yield* sql`INSERT INTO ardud_thread_origin (thread_id, origin, created_at) VALUES ('cursor-0000', 'imessage', '2026-01-01')`;
+          for (const origin of ["imessage", "none"]) {
+            const ids: string[] = [];
+            let cursor: string | null = null;
+            do {
+              const response: Effect.Success<ReturnType<Harness["get"]>> = yield* get(
+                `/threads?includeSubagents=true&updatedSince=1799999999999&origin=${origin}&limit=1${query}${cursor === null ? "" : `&cursor=${cursor}`}`,
+              );
+              assert.equal(response.status, 200);
+              assert.equal(response.body.total, origin === "imessage" ? 4 : 2);
+              ids.push(...response.body.threads.map((row: { threadId: string }) => row.threadId));
+              cursor = response.body.nextCursor;
+            } while (cursor !== null);
+            assert.deepEqual(
+              ids,
+              origin === "imessage"
+                ? ["cursor-0003", "cursor-0002", "cursor-0001", "cursor-0000"]
+                : ["cursor-0005", "cursor-0004"],
+            );
+          }
+        }),
+      undefined,
+      pagedShells.slice(0, 6).map((row, i) =>
+        i > 0 && i < 4
+          ? {
+              ...row,
+              lineage: {
+                rootThreadId: ThreadId.make("cursor-0000"),
+                parentThreadId: ThreadId.make("cursor-0000"),
+                relationshipToParent: "subagent",
+              },
+            }
+          : row,
+      ),
+    ),
+  );
+
+  it.effect.each([
+    "",
+    "&ids=cursor-0000,cursor-0001,cursor-0002,cursor-0003,cursor-0004,cursor-0005",
+    "&active=false",
+  ])("enriches only the returned page: %s", (query) =>
+    run(
+      ({ get, statements }) =>
+        Effect.gen(function* () {
+          const response: Effect.Success<ReturnType<Harness["get"]>> = yield* get(
+            `/threads?updatedSince=1799999999999&limit=2${query}`,
+          );
+          assert.equal(response.status, 200);
+          const expected = response.body.threads.map((row: { threadId: string }) => row.threadId);
+          const enrichment = statements.filter(
+            ([text]) =>
+              text.includes("FROM ardud_thread_origin WHERE thread_id IN") ||
+              text.includes("WHERE t.thread_id IN"),
+          );
+          assert.isAtLeast(enrichment.length, 3);
+          for (const [, ids] of enrichment) assert.sameMembers([...ids], expected);
+        }),
+      undefined,
+      pagedShells.slice(0, 6),
+    ),
+  );
+
+  const cursorJson = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  it.effect.each([
+    "",
+    "!",
+    "e30=",
+    "a",
+    Buffer.from("not-json").toString("base64url"),
+    ...[
+      null,
+      true,
+      1,
+      "x",
+      [],
+      {},
+      { u: null, id: "x" },
+      { u: 1, id: "x", extra: true },
+      { u: 1, id: " " },
+      { u: 1 },
+      { u: 1, id: "" },
+      { u: "1", id: "x" },
+      { u: 1.5, id: "x" },
+      { u: 9e15, id: "x" },
+      { u: 1, id: 2 },
+    ].map(cursorJson),
+  ])("rejects malformed cursor %s as invalid_request", (cursor) =>
+    run(({ get, targetedReads }) =>
+      Effect.gen(function* () {
+        const response: Effect.Success<ReturnType<Harness["get"]>> = yield* get(
+          `/threads?cursor=${encodeURIComponent(cursor)}`,
+        );
+        assert.equal(response.status, 400);
+        assert.equal(response.body.error.code, "invalid_request");
+        assert.deepEqual(yield* Ref.get(targetedReads), []);
+      }),
+    ),
+  );
+
+  it.effect("a valid cursor past the end keeps total and returns an empty final page", () =>
+    run(({ get }) =>
+      Effect.gen(function* () {
+        const response: Effect.Success<ReturnType<Harness["get"]>> = yield* get(
+          `/threads?cursor=${cursorJson({ u: -1, id: "absent" })}`,
+        );
+        assert.equal(response.status, 200);
+        assert.isAbove(response.body.total, 0);
+        assert.deepEqual(response.body.threads, []);
+        assert.isNull(response.body.nextCursor);
+      }),
+    ),
+  );
+
   it.effect("includes current boot phase timings in the authenticated install report", () =>
     run(({ get, startupLog }) =>
       Effect.gen(function* () {
@@ -573,6 +1010,145 @@ describe("control listings", () => {
       }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
+  const requestHoldCases = (["background reader", "writer"] as const).flatMap((heldConnection) =>
+    ["", "?origin=none", "?origin=automation", "?origin=missing"].map((suffix) => ({
+      heldConnection,
+      suffix,
+    })),
+  );
+  it.live.each(requestHoldCases)(
+    "GET requests$suffix completes while the $heldConnection is held",
+    ({ heldConnection, suffix }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "control-requests-latency-" });
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const inherited = shell("asks-inherited", {
+            ...idle,
+            ...waiting("request-inherited"),
+            lineage: {
+              rootThreadId: ThreadId.make("live-running"),
+              parentThreadId: ThreadId.make("live-running"),
+              relationshipToParent: "subagent",
+            },
+          });
+          const harness = yield* makeHarness(undefined, [inherited]);
+          assert.equal((yield* harness.get("/requests")).status, 200);
+          yield* sql`INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
+            VALUES ('live-running', 'automation', '2026-01-01T00:00:00.000Z')`;
+          yield* sql`INSERT INTO orchestration_v2_projection_runtime_requests
+            (runtime_request_id, thread_id, node_id, provider_turn_id, kind, status,
+              created_at, resolved_at, payload_json)
+            SELECT 'request-inherited', 'asks-inherited', node_id, provider_turn_id, kind,
+              status, '2026-01-01T00:06:00.000Z', resolved_at,
+              json_set(payload_json, '$.id', 'request-inherited',
+                '$.createdAt', '2026-01-01T00:06:00.000Z')
+            FROM orchestration_v2_projection_runtime_requests
+            WHERE runtime_request_id = 'request-waiting'`;
+          const expected = yield* harness.get(`/requests${suffix}`);
+          assert.equal(expected.status, 200);
+          assert.deepEqual(
+            expected.body.requests.map((row: { requestId: string }) => row.requestId),
+            suffix === "?origin=missing"
+              ? []
+              : suffix === "?origin=automation"
+                ? ["request-inherited"]
+                : suffix === "?origin=none"
+                  ? ["request-waiting"]
+                  : ["request-waiting", "request-inherited"],
+          );
+          const held = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const hold = sql.withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          );
+          const holder = yield* (
+            heldConnection === "background reader"
+              ? hold.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads)
+              : hold
+          ).pipe(Effect.forkChild);
+          yield* Deferred.await(held);
+          yield* Effect.gen(function* () {
+            for (let index = 0; index < 2; index += 1) {
+              const response = yield* harness.get(`/requests${suffix}`);
+              assert.equal(response.status, 200);
+              assert.deepEqual(response.body, expected.body);
+            }
+            assert.isUndefined(holder.pollUnsafe());
+            assert.equal(yield* Ref.get(harness.recordReads), 0);
+            assert.equal(yield* Ref.get(harness.snapshotReads), 0);
+          }).pipe(
+            Effect.timeout("500 millis"),
+            Effect.ensuring(Deferred.succeed(release, undefined)),
+          );
+          yield* Fiber.join(holder);
+        }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // All listing forms must keep candidate reads AND summary enrichment on the request lane.
+  it.live.each([
+    "limit=1",
+    "limit=1&active=true",
+    "limit=1&ids=quiet",
+    "limit=1&ids=quiet&active=false",
+    "limit=1&state=idle",
+    "limit=1&updatedSince=2025-01-01T00:00:00.000Z",
+    "limit=1&origin=none",
+    "limit=1&archived=true",
+    "limit=1&includeSubagents=true",
+  ])("GET threads %s completes during a long candidate scan and a writer", (query) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "control-list-latency-" });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const harness = yield* makeHarness();
+        assert.equal((yield* harness.get(`/threads?${query}`)).status, 200);
+        const readerHeld = yield* Deferred.make<void>();
+        const writerHeld = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const hold = (signal: Deferred.Deferred<void>) =>
+          Deferred.succeed(signal, undefined).pipe(Effect.andThen(Deferred.await(release)));
+        // Model the old unbounded candidate scan's held snapshot, without a sleep.
+        const reader = yield* sql
+          .withTransaction(
+            sql`SELECT thread_id, json_extract(payload_json, '$.lineage.parentThreadId')
+                FROM orchestration_v2_projection_threads WHERE deleted_at IS NULL`.pipe(
+              Effect.andThen(hold(readerHeld)),
+            ),
+          )
+          .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
+        const writer = yield* sql.withTransaction(hold(writerHeld)).pipe(Effect.forkChild);
+        yield* Deferred.await(readerHeld);
+        yield* Deferred.await(writerHeld);
+        yield* Effect.gen(function* () {
+          const responses = yield* Effect.all(
+            [harness.get(`/threads?${query}`), harness.get(`/threads?${query}`)],
+            { concurrency: 2 },
+          );
+          for (const response of responses) {
+            assert.equal(response.status, 200);
+            assert.lengthOf(response.body.threads, 1);
+          }
+          yield* sql`SELECT 1`.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.foregroundReads);
+          assert.isUndefined(reader.pollUnsafe());
+          assert.isUndefined(writer.pollUnsafe());
+          assert.equal(yield* Ref.get(harness.snapshotReads), 0);
+          assert.isTrue((yield* Ref.get(harness.targetedReads)).every((ids) => ids.length <= 128));
+        }).pipe(
+          Effect.timeout("500 millis"),
+          Effect.ensuring(Deferred.succeed(release, undefined)),
+        );
+        yield* Fiber.join(reader);
+        yield* Fiber.join(writer);
+      }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("lists active threads from live rows without the shell snapshot", () =>
     run(({ threadIds, snapshotReads, targetedReads, shellReads }) =>
       Effect.gen(function* () {
@@ -603,7 +1179,20 @@ describe("control listings", () => {
     ),
   );
 
-  it.effect("keeps the shell snapshot for lists that include idle threads", () =>
+  it.effect("explicit and empty ids load only their requested shells", () =>
+    run(({ threadIds, snapshotReads, targetedReads }) =>
+      Effect.gen(function* () {
+        assert.deepStrictEqual(yield* threadIds("/threads?ids=quiet"), ["quiet"]);
+        assert.deepStrictEqual(yield* threadIds("/threads?ids=quiet&active=true"), []);
+        assert.deepStrictEqual(yield* threadIds("/threads?ids="), []);
+        assert.deepStrictEqual(yield* threadIds("/threads?ids=missing"), []);
+        assert.equal(yield* Ref.get(snapshotReads), 0);
+        assert.deepStrictEqual(yield* Ref.get(targetedReads), [["quiet"], ["quiet"], ["missing"]]);
+      }),
+    ),
+  );
+
+  it.effect("loads only matching shells for lists that include idle threads", () =>
     run(({ threadIds, snapshotReads }) =>
       Effect.gen(function* () {
         assert.deepStrictEqual(yield* threadIds("/threads?active=false"), [
@@ -622,9 +1211,100 @@ describe("control listings", () => {
         assert.deepStrictEqual(yield* threadIds("/threads?archived=true&state=idle,running"), [
           "live-archived",
         ]);
-        assert.strictEqual(yield* Ref.get(snapshotReads), 3);
+        assert.strictEqual(yield* Ref.get(snapshotReads), 0);
       }),
     ),
+  );
+
+  it.live(
+    "pages default listings with the full listing's fields, filters and total",
+    () => {
+      const extra = Array.from({ length: 2_500 }, (_, index) =>
+        shell(`page-${String(index).padStart(4, "0")}`, {
+          ...idle,
+          updatedAt: DateTime.makeUnsafe(1_800_000_000_000 + Math.floor(index / 2) * 1_000),
+          ...(index % 7 === 0 ? { creationSource: "mobile" as const } : {}),
+          ...(index % 11 === 0 ? { projectId: ProjectId.make("other") } : {}),
+          ...(index % 13 === 0 ? { archivedAt: askedAt } : {}),
+          ...(index % 17 === 0 ? { deletedAt: askedAt } : {}),
+          ...(index % 19 === 0
+            ? {
+                lineage: {
+                  rootThreadId: ThreadId.make("quiet"),
+                  parentThreadId: ThreadId.make("quiet"),
+                  relationshipToParent: "subagent" as const,
+                },
+              }
+            : {}),
+        }),
+      );
+      return Effect.scoped(
+        Effect.gen(function* () {
+          const { get, snapshotReads, targetedReads, sql } = yield* makeHarness(
+            undefined,
+            extra,
+            new Set(),
+            [],
+            true,
+          );
+          yield* sql`INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
+          VALUES ('quiet', 'imessage', '2026-01-01T00:00:00.000Z'),
+                 ('page-2498', 'telegram', '2026-01-01T00:00:00.000Z')`;
+          // Selecting every fixture id supplies an independent reference for candidate paging.
+          // Both paths use the real projection store against the same seeded database.
+          const ids = [...shells, ...extra].map((row) => row.id).join(",");
+          for (const query of [
+            "",
+            "limit=1",
+            "limit=2",
+            "limit=0",
+            "limit=9000",
+            "limit=invalid",
+            "archived=true&limit=1",
+            "includeSubagents=true&limit=2",
+            "creationSource=mobile,provider&includeSubagents=true&limit=1",
+            "creationSource=",
+            "projectId=other&limit=1",
+            "projectId=missing",
+            "origin=none&limit=1",
+            "origin=imessage&includeSubagents=true&limit=2",
+            "origin=telegram&limit=1",
+            "origin=missing",
+            "origin=",
+          ]) {
+            const beforeStart = yield* Clock.currentTimeMillis;
+            const previous = yield* get(`/threads?ids=${ids}&${query}`);
+            const beforeMs = (yield* Clock.currentTimeMillis) - beforeStart;
+            assert.strictEqual(previous.status, 200);
+            yield* Ref.set(snapshotReads, 0);
+            yield* Ref.set(targetedReads, []);
+            const afterStart = yield* Clock.currentTimeMillis;
+            const current = yield* get(`/threads?${query}`);
+            const afterMs = (yield* Clock.currentTimeMillis) - afterStart;
+            assert.strictEqual(current.status, 200);
+            assert.deepStrictEqual(current.body, previous.body, query);
+            assert.strictEqual(yield* Ref.get(snapshotReads), 0, query);
+            const pages = yield* Ref.get(targetedReads);
+            assert.isAtMost(
+              pages.flat().length,
+              (current.body.threads as ReadonlyArray<unknown>).length + 1,
+              `only the page and one lookahead shell are built: ${query}`,
+            );
+            if (query === "" || query === "limit=1") {
+              yield* Effect.logInfo("control listing seeded parity", {
+                query,
+                seededThreads: shells.length + extra.length,
+                beforeMs,
+                afterMs,
+                total: current.body.total,
+                builtShells: pages.flat().length,
+              });
+            }
+          }
+        }),
+      ).pipe(Effect.provide(Sqlite.layerMemory));
+    },
+    { timeout: 60_000 },
   );
 
   it.effect("filters /threads by creationSource, with includeSubagents and updatedSince", () => {
@@ -804,6 +1484,95 @@ describe("control listings", () => {
     );
   });
 
+  it.effect(
+    "bounds the imessage origin listing to matching shells in a 2,510-thread fixture",
+    () => {
+      const extra = Array.from({ length: 2510 }, (_, i) =>
+        shell(`origin-${String(i).padStart(4, "0")}`),
+      );
+      return run(
+        ({ get, sql, snapshotReads, targetedReads }) =>
+          Effect.gen(function* () {
+            yield* sql.withTransaction(
+              Effect.gen(function* () {
+                for (let i = 0; i < extra.length; i += 10) {
+                  yield* sql`INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
+            VALUES (${extra[i]!.id}, 'imessage', '2026-03-01T00:00:00.000Z')`;
+                }
+              }),
+            );
+            const response = yield* get("/threads?origin=imessage&limit=500");
+            assert.equal(response.status, 200);
+            assert.equal(response.body.total, 251);
+            assert.lengthOf(response.body.threads, 251);
+            assert.equal(yield* Ref.get(snapshotReads), 0);
+            const pages = yield* Ref.get(targetedReads);
+            assert.equal(
+              pages.reduce((sum, page) => sum + page.length, 0),
+              251,
+            );
+            assert.isTrue(pages.every((page) => page.length <= 128));
+          }),
+        undefined,
+        extra,
+      );
+    },
+  );
+
+  it.effect("candidate pages preserve totals and limits across state and origin filters", () => {
+    const extra = Array.from({ length: 270 }, (_, i) =>
+      shell(`batch-${String(i).padStart(3, "0")}`, {
+        ...(i % 2 === 0 ? idle : {}),
+        updatedAt: DateTime.makeUnsafe("2026-03-01T00:00:00.000Z"),
+      }),
+    );
+    return run(
+      ({ get, sql }) =>
+        Effect.gen(function* () {
+          for (let i = 0; i < extra.length; i += 3) {
+            yield* sql`INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
+          VALUES (${extra[i]!.id}, 'imessage', '2026-03-01T00:00:00.000Z')`;
+          }
+          const cases = [
+            { suffix: "&limit=200", total: 270, length: 200, first: ["batch-269", "batch-268"] },
+            {
+              suffix: "&state=idle&limit=2",
+              total: 135,
+              length: 2,
+              first: ["batch-268", "batch-266"],
+            },
+            {
+              suffix: "&origin=imessage&limit=2",
+              total: 90,
+              length: 2,
+              first: ["batch-267", "batch-264"],
+            },
+            {
+              suffix: "&state=idle&origin=imessage&limit=2",
+              total: 45,
+              length: 2,
+              first: ["batch-264", "batch-258"],
+            },
+          ];
+          for (const row of cases) {
+            const response = yield* get(
+              `/threads?updatedSince=2026-02-01T00:00:00.000Z${row.suffix}`,
+            );
+            assert.equal(response.status, 200);
+            assert.equal(response.body.total, row.total, row.suffix);
+            const ids = (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
+              (thread) => thread.threadId,
+            );
+            assert.lengthOf(ids, row.length);
+            assert.equal(new Set(ids).size, row.length);
+            assert.deepEqual(ids.slice(0, 2), row.first);
+          }
+        }),
+      undefined,
+      extra,
+    );
+  });
+
   it.effect("lists /threads?parentThreadId children without the shell snapshot", () => {
     const at = (iso: string) => DateTime.makeUnsafe(iso);
     const child = (id: string, iso: string, parent: string, overrides = {}) =>
@@ -892,8 +1661,8 @@ describe("control listings", () => {
       return run(
         ({ get }) =>
           Effect.gen(function* () {
-            const page = (limit: number) =>
-              get(`/threads?updatedSince=${since}&limit=${limit}`).pipe(
+            const page = (limit: number, suffix = "") =>
+              get(`/threads?updatedSince=${since}&limit=${limit}${suffix}`).pipe(
                 Effect.map((response) => ({
                   total: response.body.total as number,
                   ids: (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
@@ -901,17 +1670,152 @@ describe("control listings", () => {
                   ),
                 })),
               );
-            // Equal timestamps keep the full listing's thread id order; tie-a vanished after
-            // the range read, so tie-b fills its place and total drops it.
-            assert.deepStrictEqual(yield* page(1), { total: 2, ids: ["tie-b"] });
-            assert.deepStrictEqual(yield* page(5), { total: 2, ids: ["tie-b", "tie-c"] });
+            // Equal timestamps keep the full listing's thread id order; tie-z vanished after
+            // the range read, so tie-c fills its place and total drops it.
+            assert.deepStrictEqual(yield* page(1), { total: 2, ids: ["tie-c"] });
+            assert.deepStrictEqual(yield* page(5), { total: 2, ids: ["tie-c", "tie-b"] });
+            assert.deepStrictEqual(yield* page(1, "&origin=none"), { total: 2, ids: ["tie-c"] });
+            assert.deepStrictEqual(yield* page(5, "&origin=none"), {
+              total: 2,
+              ids: ["tie-c", "tie-b"],
+            });
           }),
         undefined,
-        [tied("tie-c"), tied("tie-a"), tied("tie-b")],
-        new Set(["tie-a"]),
+        [tied("tie-c"), tied("tie-z"), tied("tie-b")],
+        new Set(["tie-z"]),
       );
     },
   );
+
+  const staleAt = DateTime.makeUnsafe("2026-03-01T00:00:01.000Z");
+  const staleSince = Date.parse("2026-03-01T00:00:00.000Z");
+  const unavailableCandidates: ReadonlyArray<{
+    name: string;
+    changed: Partial<OrchestrationV2ThreadShell>;
+    query: string;
+  }> = [
+    { name: "missing", changed: {}, query: "" },
+    { name: "archived", changed: { archivedAt: staleAt }, query: "" },
+    { name: "deleted", changed: { deletedAt: staleAt }, query: "" },
+    {
+      name: "older date",
+      changed: { updatedAt: DateTime.subtract(staleAt, { seconds: 2 }) },
+      query: "",
+    },
+    {
+      name: "other project",
+      changed: { projectId: ProjectId.make("moved") },
+      query: "&projectId=project:mcp-test",
+    },
+    { name: "other source", changed: { creationSource: "provider" }, query: "&creationSource=web" },
+    {
+      name: "other parent",
+      changed: {
+        lineage: {
+          rootThreadId: ThreadId.make("tie-z"),
+          parentThreadId: ThreadId.make("moved"),
+          relationshipToParent: null,
+        },
+      },
+      query: "&parentThreadId=original-parent",
+    },
+    {
+      name: "subagent",
+      changed: {
+        lineage: {
+          rootThreadId: ThreadId.make("tie-z"),
+          parentThreadId: ThreadId.make("original-parent"),
+          relationshipToParent: "subagent",
+        },
+      },
+      query: "",
+    },
+  ];
+  it.effect.each(
+    unavailableCandidates.flatMap((row) =>
+      (["none", "direct", "inherited"] as const).map((origin) => ({ row, origin })),
+    ),
+  )("refills $origin origin results after a candidate is $row.name", ({ row, origin }) => {
+    const candidates = ["tie-z", "tie-b", "tie-c"].map((id) => {
+      const candidate = shell(id, {
+        ...idle,
+        updatedAt: staleAt,
+        lineage: {
+          rootThreadId: ThreadId.make(id),
+          parentThreadId: ThreadId.make("original-parent"),
+          relationshipToParent: null,
+        },
+        ...(id === "tie-z" ? row.changed : {}),
+      });
+      return origin === "inherited"
+        ? {
+            ...candidate,
+            lineage: { ...candidate.lineage, rootThreadId: ThreadId.make("origin-root") },
+          }
+        : candidate;
+    });
+    return run(
+      ({ get, sql }) =>
+        Effect.gen(function* () {
+          // Candidate metadata is the earlier version; the shell read observes the change.
+          yield* sql`UPDATE orchestration_v2_projection_threads
+            SET deleted_at = NULL, project_id = 'project:mcp-test', updated_at = ${DateTime.formatIso(staleAt)},
+              payload_json = json_set(payload_json, '$.archivedAt', NULL,
+                '$.lineage.relationshipToParent', NULL, '$.lineage.parentThreadId', 'original-parent', '$.creationSource', 'web')
+            WHERE thread_id = 'tie-z'`;
+          if (origin !== "none") {
+            for (const id of origin === "inherited"
+              ? ["origin-root"]
+              : ["tie-z", "tie-b", "tie-c"]) {
+              yield* sql`INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
+                VALUES (${id}, 'imessage', '2026-03-01T00:00:00.000Z')`;
+            }
+          }
+          for (const limit of [1, 2, 5]) {
+            const response = yield* get(
+              `/threads?updatedSince=${staleSince}&origin=${origin === "none" ? "none" : "imessage"}&limit=${limit}${row.query}`,
+            );
+            assert.equal(response.status, 200);
+            assert.equal(response.body.total, 2);
+            assert.deepEqual(
+              (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
+                (thread) => thread.threadId,
+              ),
+              ["tie-c", "tie-b"].slice(0, limit),
+            );
+          }
+        }),
+      undefined,
+      candidates,
+      row.name === "missing" ? new Set(["tie-z"]) : new Set(),
+    );
+  });
+
+  it.effect("refills across a whole unavailable origin-filtered candidate page", () => {
+    const ids = Array.from({ length: 130 }, (_, i) => `refill-${String(i).padStart(3, "0")}`);
+    const candidates = ids.map((id) => shell(id, { ...idle, updatedAt: staleAt }));
+    return run(
+      ({ get }) =>
+        Effect.gen(function* () {
+          for (const limit of [1, 2]) {
+            const response = yield* get(
+              `/threads?updatedSince=${staleSince}&origin=none&limit=${limit}`,
+            );
+            assert.equal(response.status, 200);
+            assert.equal(response.body.total, 2);
+            assert.deepEqual(
+              (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
+                (thread) => thread.threadId,
+              ),
+              ids.slice(0, 2).reverse().slice(0, limit),
+            );
+          }
+        }),
+      undefined,
+      candidates,
+      new Set(ids.slice(2)),
+    );
+  });
 
   it.effect("orders /threads?updatedSince ties by thread id like the full listing", () => {
     const at = DateTime.makeUnsafe("2026-03-01T00:00:01.000Z");
@@ -934,7 +1838,7 @@ describe("control listings", () => {
             (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
               (thread) => thread.threadId,
             ),
-            ["tie-a", "tie-b"],
+            ["tie-c", "tie-b"],
           );
           assert.strictEqual(response.body.total, 3);
         }),
@@ -1158,39 +2062,58 @@ describe("control listings", () => {
     ),
   );
 
-  it.live("authenticates and resolves identity while a shell snapshot holds the reader", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-control-identity-reader-" });
-      yield* Effect.gen(function* () {
-        const sql = yield* SqlClient.SqlClient;
-        const harness = yield* makeHarness();
-        const url = "/identity/resolve?nativeId=claude-session-uuid&driver=claudeAgent";
-        assert.strictEqual((yield* harness.get(url)).status, 200);
-        const held = yield* Deferred.make<void>();
-        const release = yield* Deferred.make<void>();
-        const reader = yield* Effect.forkChild(
-          sql
-            .withTransaction(
-              Effect.gen(function* () {
-                yield* sql`SELECT 1`;
-                yield* Deferred.succeed(held, undefined);
-                yield* Deferred.await(release);
-              }),
-            )
-            .pipe(NodeSqliteClient.readOnly),
-        );
-        yield* Deferred.await(held);
-        const response = yield* harness
-          .get(url)
-          .pipe(Effect.timeout("2 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
-        yield* Fiber.join(reader);
-        assert.strictEqual(response.status, 200);
-        assert.strictEqual(response.body.identity.resolution, "resolved");
-        assert.strictEqual(response.body.identity.robobThreadId, "migrated");
-      }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  it.live.each([
+    { driver: "claudeAgent", nativeId: "claude-session-uuid" },
+    { driver: "codex", nativeId: "codex-session-uuid" },
+    { driver: "opencode", nativeId: "ses_migrated_old" },
+  ])(
+    "authenticates and resolves $driver while a shell snapshot holds the reader",
+    ({ driver, nativeId }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-control-identity-reader-" });
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const harness = yield* makeHarness();
+          const url = `/identity/resolve?nativeId=${nativeId}&driver=${driver}`;
+          assert.strictEqual((yield* harness.get(url)).status, 200);
+          const held = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const reader = yield* Effect.forkChild(
+            sql
+              .withTransaction(
+                Effect.gen(function* () {
+                  yield* sql`SELECT 1`;
+                  yield* Deferred.succeed(held, undefined);
+                  yield* Deferred.await(release);
+                }),
+              )
+              .pipe(NodeSqliteClient.readOnly),
+          );
+          yield* Deferred.await(held);
+          const response = yield* harness
+            .get(url)
+            .pipe(
+              Effect.timeout("2 seconds"),
+              Effect.ensuring(Deferred.succeed(release, undefined)),
+            );
+          yield* Fiber.join(reader);
+          assert.strictEqual(response.status, 200);
+          assert.strictEqual(response.body.identity.resolution, "resolved");
+          assert.strictEqual(response.body.identity.robobThreadId, "migrated");
+          const event = harness.analyticsEvents.at(-1)!;
+          assert.equal(event.route, "control.identity.resolve");
+          assert.equal(event.outcome, "ok");
+          assert.isAtLeast(event.props!.waitMs!, 0);
+          const rollup = makeAccumulator();
+          for (const sample of harness.analyticsEvents) accumulate(rollup, sample);
+          assert.equal(
+            finishRollup(rollup, "2026-01-01", "2026-01-01T00:00:00.000Z").topSlowRpcs[0]?.method,
+            "control.identity.resolve",
+          );
+        }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   // A lane that never ran the session read (process replaced, admission queue full).
@@ -1231,7 +2154,7 @@ describe("control listings", () => {
           for (const path of [
             "/identity/resolve?nativeId=claude-session-uuid&driver=claudeAgent",
             "/identity/resolve?nativeId=claude-session-uuid&driver=claudeAgent",
-            "/threads/migrated",
+            "/threads",
           ]) {
             const response = yield* get(path);
             assert.strictEqual(response.status, 503);

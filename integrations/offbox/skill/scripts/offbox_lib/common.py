@@ -28,6 +28,7 @@ CAP_PATH = STATE / "cap.json"
 LOCAL_SEM = STATE / "local.sem"
 SKILL_DIR = HOME / ".config/opencode/skills/remote-compute"
 TEMPLATES_DIR = SKILL_DIR / "templates"
+MGMT_PORT = 2222                     # guest loopback; boatd allocates a separate host proxy port per box
 TZ = ZoneInfo("Asia/Dubai")
 
 # Backend: "boat" = boat.dev, "server" = our own offbox server at home (boatd, integrations/offbox/server).
@@ -44,6 +45,7 @@ BACKEND_STATE = _HOME_STATE / "backend-state.json"
 HOME_FAILURES = _HOME_STATE / "home-failures.jsonl"
 PERSON_PREFIX = "person:"          # OFFBOX_THREAD=person:<name>, set by offbox-person for someone's own box
 DEFAULT_OWNER = "ardud"
+_BACKEND_REASON: str | None = None
 _BACKEND: str | None = None        # set by select_backend(); None = decide from the files and the environment
 
 
@@ -65,7 +67,7 @@ def home_state() -> dict:
         s = json.loads(BACKEND_STATE.read_text())
     except (OSError, ValueError):
         return {"state": "home_up"}
-    return s if isinstance(s, dict) and s.get("state") in ("home_up", "home_down") else {"state": "home_up"}
+    return s if isinstance(s, dict) and s.get("state") in ("home_up", "home_down", "home_starting") else {"state": "home_up"}
 
 
 def person() -> str | None:
@@ -147,6 +149,12 @@ def owner_of_root(repo_root: str | None) -> str:
     return DEFAULT_OWNER
 
 
+def base_owner(created_by: str | None) -> str:
+    by = created_by or ""
+    name = by[len(PERSON_PREFIX):] if by.startswith(PERSON_PREFIX) else ""
+    return name if _owner_name(name) else DEFAULT_OWNER
+
+
 def backend_pinned() -> str | None:
     """A backend somebody chose on purpose (environment or the pin file); automatic choice and failover are off."""
     b = os.environ.get("OFFBOX_BACKEND") or ""
@@ -185,8 +193,7 @@ def db_path_for(name: str) -> Path:
 
 
 def select_backend(name: str) -> str:
-    """Fix this process's backend. Call it before any other offbox_lib module is imported: api and capacity
-    read the backend once, at import."""
+    """Fix this process's backend before importing api or capacity, which bind it at import time."""
     global _BACKEND, DB_PATH
     if name not in ("server", "boat"):
         raise ValueError(name)
@@ -202,7 +209,9 @@ _ENTRY_VALUE_OPTIONS = {"--timeout", "--local", "--box"}
 def entry_backend(argv: list[str]) -> str:
     """The backend for one `offbox ...` call. Without a home server: boat, with no lookups at all.
     Otherwise: spend is Boat's meter and stats is the home server's; a command that names a run or a box goes to
-    the backend that run or box lives on; everything else follows default_backend()."""
+    the backend that run or box lives on. An unpinned Boat-only base uses Boat; other runs follow default_backend()."""
+    global _BACKEND_REASON
+    _BACKEND_REASON = None
     pin = backend_pinned()
     if pin:
         return pin
@@ -214,9 +223,29 @@ def entry_backend(argv: list[str]) -> str:
     if sub == "stats":
         return "server"
     first = default_backend()
-    if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep"):
+    if sub == "run" and person() is None:
+        # The CLI parser has no backend-bound imports. Use it so equals, abbreviations, repeated options and
+        # command arguments have exactly the same meaning here as when the run starts.
+        from .cli import build_parser
+        a = build_parser().parse_args(argv)
+        if a.base and not a.fresh:
+            from . import base_catalog
+            from .identity import repo_key, repo_root
+            full = a.base if ":" in a.base else base_catalog.full_name(a.base, repo_key(repo_root()))
+            on_boat = any(r["name"] == full for r in base_catalog.rows("boat"))
+            on_home = any(r["name"] == full for r in base_catalog.rows("server"))
+            if on_home and not on_boat:
+                return "server"
+            if first == "server" and on_boat and not on_home:
+                _BACKEND_REASON = "boat-only-base"
+                return "boat"
+    if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep", "exec"):
         named = [x for x in argv if x.startswith(("run-", "bx_"))]
-        if sub in ("logs", "wait", "kill"):
+        if sub == "exec":
+            from .cli import parse_args
+            a = parse_args(argv)
+            named = a.cmd[:1] if a.cmd and a.cmd[0].startswith("bx_") else []
+        elif sub in ("logs", "wait", "kill"):
             named = []
             args = iter(argv[argv.index(sub) + 1:])
             for arg in args:
@@ -260,7 +289,8 @@ def _known(name: str, ident: str, *, suffix: bool) -> bool:
                     return False  # Box IDs only support exact lookup.
                 return con.execute("SELECT 1 FROM leases WHERE box_id=?", (ident,)).fetchone() is not None
             op, value = ("LIKE", f"%{ident}") if suffix else ("=", ident)
-            return con.execute(f"SELECT 1 FROM runs WHERE run_id {op} ?", (value,)).fetchone() is not None
+            return con.execute(f"SELECT 1 FROM runs WHERE run_id {op} ? AND COALESCE(status,'')!='forwarded'",
+                               (value,)).fetchone() is not None
         finally:
             con.close()
     except sqlite3.Error:
@@ -282,6 +312,7 @@ EXIT_INTERRUPTED = 94          # the home server restarted under the run and the
 EXIT_DETACHED = 95             # the Robob client went away; the remote run is still running
 EXIT_LOCAL = 96                # local state failure; never automatic local fallback
 EXIT_TOOLCHAIN = 99            # repo Node/pnpm could not be provisioned; user command never started
+EXIT_NOT_STARTED = 100         # queued client died before acquiring a box; nothing ran, safe to rerun
 EXIT_WAIT_TIMEOUT = 124        # `offbox wait --timeout` ran out; the run keeps going on its box
 
 IDLE_STOP_S = 20 * 60          # a lease with no run for this long is stopped (boat ttl + reaper)
@@ -420,6 +451,23 @@ class OffboxError(Exception):
         self.outage = outage     # boat.dev's own API was unreachable (Cloudflare 52x or no answer)
 
 
+class SourceGone(OffboxError):
+    """The caller removed its source before the remote command started."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.checkpoint = 'push'
+        super().__init__(f"source checkout {path} was removed while the run was queued; nothing ran on the box",
+                         code=2, started=False)
+
+
+class SshHostKeyMismatch(OffboxError):
+    """A terminal SSH identity failure: never replace a box or fall back to local execution."""
+
+    def __init__(self, msg: str):
+        super().__init__(msg, code=2)
+
+
 class NotYours(OffboxError):
     """The box belongs to another owner on the home server (see require_mine)."""
 
@@ -512,7 +560,7 @@ CAPACITY_SCHEMA = """
 """
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DB_TIMEOUT = 30
 
 
@@ -588,7 +636,7 @@ def _migrate(con):
             con.execute(statement)
     have = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
     for col in ("pulls TEXT", "rel_cwd TEXT", "remote_dir TEXT", "local_cwd TEXT", "docker INTEGER",
-                "client_pid INTEGER", "wrapper_pid INTEGER", "step_count INTEGER DEFAULT 0", "known_exit_code INTEGER", "command_at REAL", "logged_end_at REAL"):
+                "client_pid INTEGER", "wrapper_pid INTEGER", "step_count INTEGER DEFAULT 0", "known_exit_code INTEGER", "command_at REAL", "logged_end_at REAL", "cmd_bytes INTEGER", "cmd_via TEXT"):
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE runs ADD COLUMN {col}")
     if 'wrapper_pid' not in have:
@@ -655,10 +703,8 @@ def _owner_columns(con) -> None:
         con.executemany("UPDATE leases SET token_owner=? WHERE box_id=? AND token_owner IS NULL",
                         [(owner_of_root(r["repo_root"]), r["box_id"]) for r in leases])
         for r in bases:
-            by = r["created_by"] or ""
-            name = by[len(PERSON_PREFIX):] if by.startswith(PERSON_PREFIX) else ""
             con.execute("UPDATE bases SET token_owner=? WHERE name=? AND token_owner IS NULL",
-                        (name if _owner_name(name) else DEFAULT_OWNER, r["name"]))
+                        (base_owner(r["created_by"]), r["name"]))
         con.execute("UPDATE templates SET token_owner=? WHERE token_owner IS NULL", (DEFAULT_OWNER,))
         con.commit()
     except sqlite3.OperationalError as e:

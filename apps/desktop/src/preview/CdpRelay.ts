@@ -11,6 +11,8 @@ export interface CdpRelayTarget {
     /** The extra session that sent it, such as a viewer's; the main connection has none. */
     owner?: string,
   ) => Promise<unknown>;
+  /** Explicit capture scopes on extra sessions; Playwright’s main-session setup is ignored. */
+  readonly setPaintHold?: (owner: string, enabled: boolean) => Promise<unknown>;
   readonly sessionDetached?: (owner: string) => void;
   /** The page's own CDP target id; Playwright keys the main frame by it. */
   readonly targetId: () => Promise<string>;
@@ -160,7 +162,11 @@ export function createCdpRelayConnection(
       return Promise.resolve({});
     }
     // Playwright asks for this on every page; the host emulates focus only while it is in use.
-    if (command.method === "Emulation.setFocusEmulationEnabled") return Promise.resolve({});
+    if (command.method === "Emulation.setFocusEmulationEnabled") {
+      return owner !== undefined && target.setPaintHold
+        ? target.setPaintHold(owner, command.params?.["enabled"] === true)
+        : Promise.resolve({});
+    }
     const result = target.send(command.method, command.params ?? {}, child, owner);
     if (command.method === "Page.getLayoutMetrics" && child === undefined && target.viewport) {
       // Guest animation frames cannot acknowledge an asynchronously published host layout.

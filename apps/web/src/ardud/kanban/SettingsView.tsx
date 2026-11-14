@@ -1,9 +1,11 @@
+import { DeleteBoard, DeletedBoards } from "./BoardDeletion";
 import { ImageUpIcon, MinusIcon, PlusIcon, RepeatIcon, Trash2Icon } from "lucide-react";
 import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useAtomValue } from "@effect/atom-react";
 
 import {
   boardModelSelection,
+  boardRenameValue,
   modelName,
   poolAddLevel,
   poolListed,
@@ -40,6 +42,7 @@ import {
 import type { UnifiedSettings } from "@t3tools/contracts/settings";
 
 import * as Schema from "effect/Schema";
+import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Link } from "@tanstack/react-router";
 import { Switch } from "../../components/ui/switch";
@@ -289,6 +292,8 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
     void runAction("Couldn't save", () => kanban.updateBoard({ boardId: board.id, ...input }));
   const canEdit = useKanbanPermission(KANBAN_WS_METHODS.boardUpdate);
   const canPool = useKanbanPermission(KANBAN_WS_METHODS.poolSet);
+  const canRevoke = useKanbanPermission(KANBAN_WS_METHODS.standingApprovalRevoke);
+  const lastRelease = board.releaseLedger?.at(-1);
   // The level "Add model" gives a new pool; null when every level of it is pooled.
   const addLevel = (instanceId: ProviderInstanceId, model: string) =>
     boardPoolAddition(instanceId, model, instanceEntries, pools, apply);
@@ -297,6 +302,9 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
 
   return (
     <div className="flex max-w-225 flex-col gap-5.5 pb-12">
+      <Section title="Name">
+        <BoardNameInput key={board.id} board={board} disabled={!canEdit} editNote={editNote} />
+      </Section>
       <Section title="Icon">
         <IconPicker
           board={board}
@@ -306,6 +314,41 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
           onImage={(iconImage) => update({ iconImage })}
         />
       </Section>
+      {board.standingApprovals.some((entry) => entry.revokedAt === null) && (
+        <Section title="Standing deploy approval">
+          {lastRelease && (
+            <p className="break-words text-sm text-(--m-muted)">
+              Last interrupting release: #{lastRelease.cardNumber} at{" "}
+              <time dateTime={lastRelease.at}>{new Date(lastRelease.at).toLocaleString()}</time>
+              {lastRelease.critical ? ` (critical: ${lastRelease.critical})` : ""}
+            </p>
+          )}
+          {board.standingApprovals
+            .filter((entry) => entry.revokedAt === null)
+            .map((entry) => (
+              <div key={entry.id} className="flex min-w-0 items-center gap-3 py-2">
+                <p className="min-w-0 flex-1 break-words text-sm">
+                  {entry.quote}{" "}
+                  <time dateTime={entry.saidAt} className="text-(--m-muted)">
+                    {new Date(entry.saidAt).toLocaleString()}
+                  </time>
+                </p>
+                <Button
+                  variant="outline"
+                  disabled={!canRevoke}
+                  aria-label={`Revoke standing deploy approval from ${new Date(entry.saidAt).toLocaleString()}`}
+                  onClick={() =>
+                    void runAction("Couldn't revoke approval", () =>
+                      kanban.revokeStandingApproval(board.id, entry.id),
+                    )
+                  }
+                >
+                  Revoke
+                </Button>
+              </div>
+            ))}
+        </Section>
+      )}
       <Section title="Nightly review">
         <NightlyReviewSettings key={board.id} board={board} disabled={!canEdit} />
       </Section>
@@ -429,7 +472,6 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                   type="button"
                   disabled={changingLevel}
                   aria-label={`Remove ${pool.name} pool`}
-                  title="Remove pool"
                   onClick={() =>
                     void runAction("Couldn't remove the pool", () =>
                       kanban.removePool(board.id, pool.model, { replaces: pool.key }),
@@ -513,6 +555,9 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
           disabledReason={editNote}
           onChange={(defaultCardModel) => update({ defaultCardModel })}
         />
+      </Section>
+      <Section title="Guess approval gates">
+        <GuessedGateSettings board={board} disabled={!canEdit} disabledReason={editNote} />
       </Section>
       <Section title="Review">
         {board.reviewChains.map((chain, chainIndex) => {
@@ -601,7 +646,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                 <button
                   type="button"
                   disabled={!canEdit}
-                  title={editNote}
+                  aria-description={editNote}
                   onClick={() => update({ defaultReviewChain: chain.name })}
                   className="h-7 rounded-full px-2.5 text-sm font-medium text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
                 >
@@ -620,6 +665,8 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
           onSave={(instructions) => update({ instructions })}
         />
       </Section>
+      <Section title="Deleted boards"><DeletedBoards /></Section>
+      <Section title="Delete board"><DeleteBoard board={board} /></Section>
     </div>
   );
 }
@@ -659,6 +706,51 @@ async function boardImage(file: File): Promise<string | null> {
   return null;
 }
 
+function BoardNameInput(props: {
+  board: KanbanBoard;
+  disabled: boolean;
+  editNote: string | undefined;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const cancelled = useRef(false);
+  const save = (value: string) => {
+    const name = boardRenameValue(value, props.board.name);
+    if (cancelled.current || props.disabled || saving || name === null) {
+      cancelled.current = false;
+      setDraft(null);
+      return;
+    }
+    setDraft(name);
+    setSaving(true);
+    void runAction("Couldn't rename board", () =>
+      kanban.updateBoard({ boardId: props.board.id, name }),
+    ).then(() => {
+      setDraft(null);
+      setSaving(false);
+    });
+  };
+  return (
+    <Input
+      aria-label="Name"
+      name="board-name"
+      autoComplete="off"
+      title={props.editNote}
+      disabled={props.disabled || saving}
+      value={draft ?? props.board.name}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={(event) => save(event.currentTarget.value)}
+      onKeyDown={(event) => {
+        if (event.nativeEvent.isComposing) return;
+        if (event.key !== "Enter" && event.key !== "Escape") return;
+        event.preventDefault();
+        cancelled.current = event.key === "Escape";
+        event.currentTarget.blur();
+      }}
+    />
+  );
+}
+
 function IconPicker(props: {
   board: KanbanBoard;
   disabled: boolean;
@@ -676,7 +768,7 @@ function IconPicker(props: {
       aria-label={label}
       aria-pressed={current === icon}
       disabled={props.disabled}
-      title={props.disabledReason}
+      aria-description={props.disabledReason}
       onClick={() => {
         if (current !== icon) props.onChange(icon);
       }}
@@ -706,7 +798,7 @@ function IconPicker(props: {
         aria-label={image ? "Change the picture" : "Upload a picture"}
         aria-pressed={image !== null}
         disabled={props.disabled}
-        title={props.disabledReason}
+        aria-description={props.disabledReason}
         onClick={() => fileInput.current?.click()}
         className={cn(
           "grid size-9 place-items-center rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
@@ -723,7 +815,7 @@ function IconPicker(props: {
         <button
           type="button"
           disabled={props.disabled}
-          title={props.disabledReason}
+          aria-description={props.disabledReason}
           onClick={() => props.onImage(null)}
           className="h-9 rounded-lg px-2.5 text-sm font-medium text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
         >
@@ -803,7 +895,7 @@ function Stepper(props: {
     <span
       role="group"
       aria-label={props.label}
-      title={props.disabledReason}
+      aria-description={props.disabledReason}
       className="inline-flex items-center gap-0.5 rounded-full bg-(--m-raised) p-0.5"
     >
       <button
@@ -978,7 +1070,7 @@ function InstructionBlock(props: {
       <textarea
         value={draft}
         disabled={props.disabled}
-        title={props.disabledReason}
+        aria-description={props.disabledReason}
         onChange={(event) => setDraft(event.target.value)}
         onBlur={() => {
           if (draft !== props.value) props.onSave(draft);
@@ -1083,7 +1175,7 @@ function NightlyReviewSettings(props: { board: KanbanBoard; disabled: boolean })
               to="/boards/$boardId"
               params={{ boardId: board.id }}
               search={{ view: "discussions", discussion: saved.lastDiscussionId }}
-              className="rounded text-(--m-accent-text) underline underline-offset-4 outline-none focus-visible:ring-2 focus-visible:ring-(--m-accent)"
+              className="rounded text-(--m-accent-text) underline underline-offset-4 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
             >
               View review
             </Link>
@@ -1092,4 +1184,47 @@ function NightlyReviewSettings(props: { board: KanbanBoard; disabled: boolean })
       ) : null}
     </div>
   );
+}
+
+function GuessedGateSettings(props: {
+  board: KanbanBoard;
+  disabled: boolean;
+  disabledReason?: string | undefined;
+}) {
+  const gates = ["deploy", "money", "secret"] as const;
+  const selected = props.board.guessedGates ?? gates;
+  const [pending, setPending] = useState(false);
+  const save = async (gate: (typeof gates)[number], checked: boolean) => {
+    setPending(true);
+    try {
+      await runAction("Couldn't save approval gates", () =>
+        kanban.updateBoard({
+          boardId: props.board.id,
+          guessedGates: gates.filter((kind) => (kind === gate ? checked : selected.includes(kind))),
+        }),
+      );
+    } finally {
+      setPending(false);
+    }
+  };
+  return gates.map((gate) => (
+    <label
+      key={gate}
+      htmlFor={`guess-${props.board.id}-${gate}`}
+      className="flex min-h-12 items-center justify-between gap-4 not-last:border-b not-last:border-(--m-rule)"
+    >
+      <span className="font-medium">
+        {{ deploy: "Deploy", money: "Money", secret: "Secret" }[gate]}
+      </span>
+      <Switch
+        id={`guess-${props.board.id}-${gate}`}
+        name={`guess-${gate}`}
+        aria-label={`Guess ${gate} approval gates from wording`}
+        checked={selected.includes(gate)}
+        disabled={props.disabled || pending}
+        aria-description={props.disabledReason}
+        onCheckedChange={(checked) => void save(gate, checked)}
+      />
+    </label>
+  ));
 }

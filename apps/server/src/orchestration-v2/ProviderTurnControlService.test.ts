@@ -23,7 +23,11 @@ import {
   serializeAssistantCitation,
 } from "@t3tools/shared/assistantCitations";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
+import { PROVIDER_START_CLEANUP_TIMEOUT_MS } from "./providerStartDeadlinePolicy.ts";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -220,14 +224,17 @@ it.effect(
           listCutoverCandidates: () => Effect.die("unused listCutoverCandidates"),
           getLiveSharedProviderSessions: () => Effect.die("unused getLiveSharedProviderSessions"),
           getLimitRecoveryCandidates: () => Effect.die("unused getLimitRecoveryCandidates"),
+          listActiveThreadIds: () => Effect.die("unused listActiveThreadIds"),
           getShellSnapshot: () => Effect.die("unused getShellSnapshot"),
           readShellSnapshot: () => Effect.die("unused readShellSnapshot"),
+          getThreadListCandidates: () => Effect.die("unused getThreadListCandidates"),
           getCallerRow: () => Effect.die("unused getCallerRow"),
           getThreadShell: () => Effect.die("unused getThreadShell"),
           getThread: () => Ref.get(projection).pipe(Effect.map((state) => state.thread)),
           getSettlementCandidates: () => Effect.die("unused getSettlementCandidates"),
           getThreadsWithPullRequests: () => Effect.die("unused getThreadsWithPullRequests"),
           getThreadWorktreePaths: () => Effect.die("unused getThreadWorktreePaths"),
+          getThreadIdsForWorktree: () => Effect.die("unused getThreadIdsForWorktree"),
           getThreadProjection: () => Effect.die("control effects must not load transcript"),
           getTurnStartContext: () => Effect.die("unused"),
           getTurnStartHistory: () => Effect.die("unused"),
@@ -278,6 +285,7 @@ it.effect(
       const layerSessionManager = Layer.succeed(
         ProviderSessionManager.ProviderSessionManagerV2,
         ProviderSessionManager.ProviderSessionManagerV2.of({
+          stopBackgroundWork: () => Effect.succeed([]),
           shutdown: Effect.void,
           sweepOrphanedThreads: () => Effect.void,
           observeThreadSessionUpdates: () => Effect.void,
@@ -342,7 +350,137 @@ it.effect(
       assert.equal(interrupted?.providerSessionId, oldSessionId);
       assert.equal(interrupted?.id, providerThreadId);
       assert.equal(interrupted?.nativeThreadRef?.nativeId, "native-thread:restart-session");
+      yield* Ref.set(interruptedThread, null);
+      yield* Ref.update(projection, (state) => ({
+        ...state,
+        providerTurns: state.providerTurns.map((turn) => ({
+          ...turn,
+          status: "running" as const,
+          completedAt: null,
+        })),
+      }));
+      yield* Effect.gen(function* () {
+        const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
+        const unrelated = yield* control
+          .interrupt({
+            threadId,
+            providerSessionId: oldSessionId,
+            replacementProviderSessionId: unrelatedSessionId,
+            providerThreadId,
+            providerTurnId,
+            stopBackgroundWork: false,
+          })
+          .pipe(Effect.result);
+        assert.equal(unrelated._tag, "Failure");
+        assert.isNull(yield* Ref.get(interruptedThread));
+        yield* control.interrupt({
+          threadId,
+          providerSessionId: oldSessionId,
+          replacementProviderSessionId: replacementSessionId,
+          providerThreadId,
+          providerTurnId,
+          stopBackgroundWork: false,
+        });
+      }).pipe(Effect.provide(layerControl));
+      assert.equal((yield* Ref.get(interruptedThread))?.providerSessionId, oldSessionId);
     }),
+);
+
+it.effect.each(["confirmed", "unanswered"] as const)(
+  "bounds targeted parked-turn cleanup without stopping inherited work: %s",
+  (cleanup) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("expired-parked");
+      const sessionId = ProviderSessionId.make("expired-parked-session");
+      const turnId = ProviderTurnId.make("expired-parked-turn");
+      const providerThread: OrchestrationV2ProviderThread = {
+        id: ProviderThreadId.make("expired-parked-thread"),
+        driver,
+        providerInstanceId,
+        providerSessionId: sessionId,
+        appThreadId: threadId,
+        ownerNodeId: null,
+        nativeThreadRef: null,
+        nativeConversationHeadRef: null,
+        status: "idle",
+        firstRunOrdinal: 1,
+        lastRunOrdinal: 1,
+        handoffIds: [],
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const projection = makeProjection({
+        now,
+        threadId,
+        providerThread,
+        providerTurnId: turnId,
+        attemptId: RunAttemptId.make("expired-parked-attempt"),
+      });
+      const requests: Array<
+        Parameters<ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"]>[0]
+      > = [];
+      const entered = yield* Deferred.make<void>();
+      const runtime = {
+        interruptTurn: (request: (typeof requests)[number]) =>
+          Effect.sync(() => {
+            requests.push(request);
+          }).pipe(
+            Effect.andThen(Deferred.succeed(entered, undefined)),
+            Effect.andThen(cleanup === "unanswered" ? Effect.never : Effect.void),
+          ),
+      };
+      yield* Effect.gen(function* () {
+        const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
+        const stopping = yield* control
+          .interrupt({
+            threadId,
+            providerSessionId: sessionId,
+            providerThreadId: providerThread.id,
+            providerTurnId: turnId,
+            stopBackgroundWork: false,
+          })
+          .pipe(Effect.result, Effect.forkScoped);
+        yield* Deferred.await(entered);
+        if (cleanup === "unanswered") yield* TestClock.adjust(PROVIDER_START_CLEANUP_TIMEOUT_MS);
+        assert.equal(
+          (yield* Fiber.join(stopping))._tag,
+          cleanup === "confirmed" ? "Success" : "Failure",
+        );
+      }).pipe(
+        Effect.provide(
+          ProviderTurnControlService.layer.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                Layer.mock(ProjectionStore.ProjectionStoreV2)({
+                  getProviderControlContext: () =>
+                    Effect.succeed({
+                      providerThread,
+                      providerTurn: {
+                        ...projection.providerTurns[0]!,
+                        status: "failed",
+                        completedAt: now,
+                      },
+                      attempt: projection.attempts[0],
+                    } as never),
+                }),
+                Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+                  get: () =>
+                    Effect.succeedSome(
+                      runtime as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
+                    ),
+                }),
+              ),
+            ),
+          ),
+        ),
+      );
+      assert.lengthOf(requests, 1);
+      assert.equal(requests[0]?.providerTurnId, turnId);
+      assert.isFalse(requests[0]?.requestRuntimeRestart);
+      assert.isFalse(requests[0]?.stopBackgroundWork);
+    }).pipe(Effect.scoped),
 );
 
 it.effect("steers with cited assistant quotes expanded for the provider", () =>

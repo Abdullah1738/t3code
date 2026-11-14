@@ -43,7 +43,7 @@ def food(row, order):
                       'image_url':'https://f.nooncdn.com/food_production/'+image if isinstance(image,str) and image.startswith('food/') else None})
     return {'ok':True,'app':'noon','order':order,'vertical':'food',
             'vendor_name':core.text((row.get('outletInfo') or {}).get('name')),
-            'placed_at':row.get('createdAt') or row.get('placedAt'),
+            'placed_at':vertical.placed_time(row),
             'items':lines,'total':number(row.get('orderTotal')),'currency':'AED',
             'card_last4':str(row.get('creditCardMask') or '')[-4:] or None,
             'notes':row.get('notes') if isinstance(row.get('notes'),str) else None,
@@ -85,16 +85,23 @@ def details(order, service, timeout=12):
         if not isinstance(groups,list):raise core.NoonError('ORDER_ITEM_SCHEMA_CHANGED')
         raw=[i for g in groups for i in g.get('items',[])];store='noon'
         count=vertical._invoice_count(row.get('invoice'))
+        try:
+            manifest=vertical.manifest_projection(row,order)
+        except core.NoonError:
+            manifest={}
+        delivered=(manifest.get('whole_order_complete') is True and manifest.get('status')=='delivered')
         active_groups=[g for g in groups if core.marketplace_stage((g.get('subStatus') or {}).get('highStatusCode')) not in ('delivered','cancelled')]
         estimates=list(dict.fromkeys(core.text(g.get('text')) for g in active_groups
                     if isinstance(g.get('text'),str) and g['text'].startswith('Arriving ')))
         all_estimated=bool(active_groups) and all(isinstance(g.get('text'),str) and g['text'].startswith('Arriving ') for g in active_groups)
         extra={'declared_item_units':count,'observed_item_units':sum(i.get('quantity',0) for i in raw),
+               'whole_order_complete':delivered,
+               'status':'delivered' if delivered else 'unknown',
                'eta_text':estimates[0] if all_estimated and len(estimates)==1 else None,
                'eta_observed_at':dt.datetime.now(dt.timezone.utc).isoformat(),
-               'status_text':' / '.join(dict.fromkeys(core.text((g.get('subStatus') or {}).get('highStatus'))
+               'status_text':' / '.join(filter(None,dict.fromkeys(core.text((g.get('subStatus') or {}).get('highStatus'))
                     if (g.get('subStatus') or {}).get('highStatusCode') in ('cancelled','canceled','delivered')
-                    else core.text(g.get('subText')) for g in groups)) or None}
+                    else core.text(g.get('subText')) for g in groups))) or None}
         totals=[]
         for section in (row.get('invoice') or {}).get('sections',[]):
             for entry in section.get('entries',[]):
@@ -123,7 +130,7 @@ def details(order, service, timeout=12):
                       'detail':detail,'options':None,'image_url':image,
                       'options_coverage':'native_display_label' if choices else 'not_exposed'})
     return {'ok':True,'app':'noon','order':order,'vertical':service,'vendor_name':store,
-            'placed_at':row.get('createdAt') or row.get('placedAt'),
+            'placed_at':vertical.placed_time(row) if service=='nownow' else row.get('createdAt') or row.get('placedAt'),
             'items':lines,'total':number(row.get('orderTotal')),'currency':'AED',
             'card_last4':str(row.get('creditCardMask') or '')[-4:] or None,
             'items_complete':not extra or extra['declared_item_units']==extra['observed_item_units'],

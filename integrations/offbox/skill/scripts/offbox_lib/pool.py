@@ -11,7 +11,7 @@ import traceback
 from pathlib import Path
 import time
 
-from . import capacity, prepare
+from . import common, capacity, prepare, home
 from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_LOCAL, RUN_TTL_S, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
                      busy, db_retry, iso, kv_get, kv_set, local_error, log, now, say, write)
 from .common import backend, owner_scoped, token_owner
@@ -229,15 +229,22 @@ def lock_name(key: str) -> str:
 
 @contextlib.contextmanager
 def _pool_lock(key: str, deadline: float, wait: int, *, prepare_end: float | None = None,
-               box_id: str = "repository pool"):
+               box_id: str = "repository pool", check_home=None):
     """Queue expiry means busy; a selected box's readiness deadline also bounds its claim."""
+    from . import allocation
     continuation = prepare.guard(box_id, prepare_end) if prepare_end is not None else contextlib.nullcontext()
     with continuation:
         acquired = False
         try:
             while not acquired:
+                allocation.check_source()
+                if check_home is not None:
+                    check_home()
                 started = time.monotonic()
                 timeout = min(LOCK_WAIT_S, max(0, deadline - started))
+                queue = allocation._QUEUE.get()
+                if queue is not None and queue.get('check_source') is not None:
+                    timeout = min(2, timeout)
                 lk = file_lock(lock_name(key), timeout=timeout)
                 try:
                     with prepare.guard(box_id), prepare.phase("lock_wait", box_id):
@@ -248,6 +255,8 @@ def _pool_lock(key: str, deadline: float, wait: int, *, prepare_end: float | Non
                 except OffboxError as e:
                     if time.monotonic() < deadline:
                         continue
+                    if check_home is not None and wait > 0:
+                        check_home(force=True)
                     if timeout >= LOCK_WAIT_S and time.monotonic() - started >= LOCK_WAIT_S:
                         detail = f"other offbox runs kept its pool lock for {LOCK_WAIT_S}s"
                     else:
@@ -256,6 +265,7 @@ def _pool_lock(key: str, deadline: float, wait: int, *, prepare_end: float | Non
                             f"retry, or raise OFFBOX_POOL_WAIT_SECONDS (max {wait_max()})")
                     raise PoolBusyError(f"repository pool busy/full for {key}: {detail}. "
                                         f"Nothing ran (exit {EXIT_BUSY}): {hint}") from e
+            allocation.check_source()
             yield
         finally:
             if acquired:
@@ -389,6 +399,8 @@ class _QueuePoll:
                     if not busy(error):
                         raise
                     self.con.rollback()
+                    from . import allocation
+                    allocation.check_source()
                     log(f"pool queue {self.run_id or '-'} poll failed:\n" + traceback.format_exc())
                     left = self.deadline - time.monotonic()
                     if left <= 0:
@@ -413,12 +425,12 @@ def _clear_queue_rows(con, me, run_id):
     db_retry(clear)
 
 
-def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, exclude=None):
+def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, exclude=None, check_source=None):
     import toollog
     with toollog.span("pool", "run.lease", ids={"run": run_id}, tag="lease_failed") as data:
         started = time.monotonic()
         try:
-            row = _acquire_logged(me, size, template, base, fresh, run_id, exclude)
+            row = _acquire_logged(me, size, template, base, fresh, run_id, exclude, check_source)
         except BaseException:
             toollog.emit("pool", "run.queue", kind="error", ok=False, duration_ms=(time.monotonic()-started)*1000,
                          ids={"run": run_id}, props={"queued": True, "waitMs": (time.monotonic()-started)*1000}, tag="queue_failed")
@@ -426,10 +438,13 @@ def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, e
         data["ids"] = {"run": run_id, "box": row["box_id"]}
         data["props"]["leaseKind"] = row.pop("_log_lease_kind", "reused")
         data["props"]["size"] = row.get("size")
+        if data["props"]["leaseKind"] == "reused":
+            from . import lease
+            lease.report_reused_template(me, row, template)
         return row
 
 
-def _acquire_logged(me, size=None, template=None, base=None, fresh=False, run_id=None, exclude=None):
+def _acquire_logged(me, size=None, template=None, base=None, fresh=False, run_id=None, exclude=None, check_source=None):
     from . import allocation
     con = db()
     token = new_id('waiter')
@@ -440,6 +455,7 @@ def _acquire_logged(me, size=None, template=None, base=None, fresh=False, run_id
     try:
         with allocation.scope(key), allocation.queue(), prepare.attempts():
             queue = allocation._QUEUE.get()
+            queue['check_source'] = check_source
             queue["log_setup_ms"] = 0
             poll = _QueuePoll(con, queue['wait'], run_id, deadline=queue['end'])
             poll.call(lambda: capacity.schema(con))
@@ -528,7 +544,7 @@ def _reuse_prepared(con, row, *args, **kwargs):
 
 
 def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=None):
-    from . import allocation, api, lease, outage
+    from . import allocation, api, home, lease, outage
     from .identity import require_proven
     # A pooled box is mapped to the caller's owner string. An unproven caller's string is shared, so it can't take one.
     require_proven(me, "run")
@@ -542,6 +558,20 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
     poll.call(lambda: capacity.schema(con))
     poll.call(lambda: allocation.recover_resumes(con, key))
     started = deadline - wait
+    protected_base = bool(base and not fresh and home.active() and home.base_needs_home(source[5:]))
+    next_home_probe = time.monotonic() + outage.PROBE_EVERY_S
+
+    def check_home(*, force=False):
+        nonlocal next_home_probe
+        if not protected_base or (not force and time.monotonic() < next_home_probe):
+            return
+        # Foreground pool holders never reach _refresh_background's API checks. Probe without a pool lock.
+        why = home.preflight_reason()
+        next_home_probe = time.monotonic() + outage.PROBE_EVERY_S
+        if why:
+            raise OffboxError(f"home offbox server not reachable ({why})", outage=True, run_id=run_id)
+
+    lock_options = {'check_home': check_home} if protected_base else {}
     said, last_error = False, None
     next_refresh = 0
     next_progress = 0
@@ -579,6 +609,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
         say(f"could not prepare your box {bid} ({error}); trying other pool boxes")
 
     while True:
+        allocation.check_source()
         lease.cap_check()
         pending = poll.call(lambda: con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
                               f"WHERE l.repo_key=? AND {token_mine('l')} AND l.state IN ('running','stopped') "
@@ -594,7 +625,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
             acquired = False
             try:
                 bid = pending["box_id"]
-                with _pool_lock(key, deadline, wait):
+                with _pool_lock(key, deadline, wait, **lock_options):
                     con.execute("UPDATE pool_waiters SET reserved=0 WHERE token=?", (waiter,))
                     con.commit()
                     alternatives = candidates(con, key, size, source, me)[0] if not _matches(pending, source) else []
@@ -701,7 +732,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                 try:
                     row = guard = token = None
                     wait_own = False
-                    with _pool_lock(key, deadline, wait):
+                    with _pool_lock(key, deadline, wait, **lock_options):
                         con.execute("UPDATE pool_waiters SET reserved=0 WHERE token=?", (waiter,))
                         con.commit()
                         rows, can_create = candidates(con, key, size, source, me)
@@ -839,8 +870,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         if wait_for_own:
                             needs_start = grow or row['state'] != 'running'
                             budget = max(0, min(AFFINITY_WAIT_S, deadline - time.monotonic()))
-                            if time.monotonic() < affinity_deadline:
-                                budget = min(budget, affinity_deadline - time.monotonic())
+                            # Affinity bounds waiting for our box; a selected box gets its own readiness window.
+                            # Resize stops yield to the queue, so their wait is excluded on the resume attempt.
                             if not wait and not needs_start:
                                 budget = AFFINITY_WAIT_S  # a zero queue wait still permits a ready box's health check
                             with api.budget(budget):
@@ -909,6 +940,11 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                             f"offbox release {row['box_id']} --delete). Trying other pool boxes, then a fresh lease.")
                         continue
                     except OffboxError as e:
+                        if isinstance(e, home.StartWaitFailed):
+                            raise
+                        if isinstance(e, api.BudgetExpired) and con.execute("SELECT 1 FROM kv WHERE k IN (?,?)",
+                                (f"resume_unanswered:{row['box_id']}", f"resume_provision:{row['box_id']}")).fetchone():
+                            raise
                         if (row['state'] == 'running' and not wait_for_own) or e.code != EXIT_INFRA:
                             raise
                         # A stopped box failed to resume: a running box later in the list may still be free.
@@ -948,8 +984,9 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         last_error = e
                         break
                     except OffboxError as e:
+                        if isinstance(e, (common.SourceGone, home.StartWaitFailed)):
+                            raise
                         if resume_stall is not None:
-                            from . import home
                             refused = 400 <= (getattr(e, 'status', None) or 0) < 500
                             wrapped = OffboxError(f"{resume_stall}. Replacement allocation failed: {e}; nothing ran",
                                                   code=e.code, started=e.started or resume_stall.started,
@@ -966,7 +1003,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                     try:
                         # The member row and the slot's removal happen in one step under the pool lock, so a
                         # selection never sees the box as neither a member nor a pending slot.
-                        with _pool_lock(key, deadline, wait, prepare_end=got['_prepare_end'], box_id=got['box_id']):
+                        with _pool_lock(key, deadline, wait, prepare_end=got['_prepare_end'], box_id=got['box_id'], **lock_options):
                             _claim(con, me, got, run_id, pending_token=token)
                             token = None
                     except BaseException:
@@ -990,6 +1027,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
         t = time.monotonic()
         if last_error and not isinstance(last_error, (api.SupplyOut, api.BoatAtCapacity)):
             raise last_error
+        check_home(force=wait > 0 and t >= deadline)
         if t >= deadline:
             if last_error:
                 raise last_error
@@ -1084,14 +1122,23 @@ def try_warm(me, size, source, exclude, run_id):
                         ready = ssh_sync.ssh(got['box_id'], 'true', timeout=min(10, left) if left is not None else 10)
                         if ready.returncode != 0:
                             return None
+                except common.SshHostKeyMismatch:
+                    raise
+                except home.StartWaitFailed:
+                    raise
                 except Exception:  # noqa: BLE001 - malformed API responses also make this optional peer unusable
                     return None
                 _claim(con, me, got, run_id)
                 claimed = True
+                lease.report_reused_template(me, got)
                 return got
             finally:
                 if not claimed:
                     release_guard(got)
+    except common.SshHostKeyMismatch:
+        raise
+    except home.StartWaitFailed:
+        raise
     except OffboxError:
         # A contended pool is optional here: keep the already-held cold box.
         return None
@@ -1124,6 +1171,8 @@ def _recheck_prune_holds(con, key) -> bool:
                 kv_set(con, check_key, now())
                 checks += 1
                 released = prune.recheck(con, bid, row['run_id'], deadline - time.monotonic()) or released
+        except common.SshHostKeyMismatch:
+            raise
         except OffboxError:
             pass
     return released

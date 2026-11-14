@@ -1,8 +1,10 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import {
   CommandId,
   EnvironmentId,
+  EventId,
   MessageId,
   NodeId,
   ProjectId,
@@ -10,6 +12,7 @@ import {
   ProviderInstanceId,
   ProviderThreadId,
   ProviderTurnId,
+  RunId,
   ThreadId,
   TurnItemId,
   type OrchestrationV2DomainEvent,
@@ -23,6 +26,12 @@ import * as Stream from "effect/Stream";
 
 import { ClaudeProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
+import { continueRestartedRun } from "../orchestration-v2/RestartContinuation.ts";
+import * as EventSink from "../orchestration-v2/EventSink.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
+import * as ProviderRuntimeRecovery from "../orchestration-v2/ProviderRuntimeRecoveryService.ts";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -53,7 +62,24 @@ const modelSelection = { instanceId, model: "claude-test" };
 // A delegated Claude child ends its turn while a background native subagent it
 // started keeps running (#17154).
 
-it.effect("task_cancel ends a delegated child's background native subagent", () =>
+it.effect.each([
+  "native_background",
+  "external_interrupt",
+  "restart_without_result",
+  "restart_failed_without_result",
+  "shutdown_narration",
+  "startup_narration",
+  "restart_narration_only",
+  "restart_missing_spawn_target_narration",
+  "restart_narration_item_only",
+  "restart_answer_with_narration",
+  "restart_unknown_phase_result",
+  "restart_unstarted_followup",
+  "restart_legacy_without_result",
+  "restart_legacy_continuation_with_result",
+  "restart_disposed_queue",
+  "restart_with_result",
+] as const)("task status and cancellation settle %s", (scenario) =>
   Effect.scoped(
     Effect.gen(function* () {
       const cwd = yield* checkpointWorkspace("task-cancel-native-subagent");
@@ -140,8 +166,20 @@ it.effect("task_cancel ends a delegated child's background native subagent", () 
         layerAdapters,
         { runEffectWorker: false },
       );
-      const layerOrchestration = Layer.merge(
+      const layerRecovery = ProviderRuntimeRecovery.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            layerOrchestrator,
+            ProjectionStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+            EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+            IdAllocator.layer,
+            ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+          ),
+        ),
+      );
+      const layerOrchestration = Layer.mergeAll(
         layerOrchestrator,
+        layerRecovery,
         ThreadManagementService.layer.pipe(
           Layer.provide(layerOrchestrator),
           Layer.provide(ServerSettings.layerTest()),
@@ -233,6 +271,442 @@ it.effect("task_cancel ends a delegated child's background native subagent", () 
         const childTurn = (yield* orchestrator.getThreadProjection(task.childThreadId!))
           .providerTurns[0]!;
 
+        const scope: McpInvocationScope = {
+          environmentId: EnvironmentId.make("environment:task-cancel"),
+          requestNamespace: "provider-session:task-cancel",
+          thread: {
+            threadId: parentThreadId,
+            providerSessionId: "provider-session:task-cancel",
+            providerInstanceId: instanceId,
+          },
+          client: undefined,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        };
+        if (scenario !== "native_background") {
+          const sink = yield* EventSink.EventSinkV2;
+          const before = yield* orchestrator.getThreadProjection(task.childThreadId!);
+          const run = before.runs[0]!;
+          const now = yield* DateTime.now;
+          const terminalStatus =
+            scenario === "restart_failed_without_result" ? "failed" : "cancelled";
+          const hasResult =
+            scenario === "restart_with_result" ||
+            scenario === "restart_answer_with_narration" ||
+            scenario === "restart_unknown_phase_result" ||
+            scenario === "restart_disposed_queue" ||
+            scenario === "restart_legacy_continuation_with_result";
+          if (scenario === "external_interrupt") {
+            const settled = yield* watch(
+              (event) =>
+                event.type === "subagent.updated" &&
+                event.payload.id === task.id &&
+                event.payload.status === "interrupted",
+            );
+            yield* orchestrator.dispatch({
+              type: "run.interrupt",
+              commandId: CommandId.make("external-stop"),
+              threadId: task.childThreadId!,
+              runId: run.id,
+              reason: "Stopped by server maintenance",
+            });
+            yield* Queue.offer(child.events, {
+              type: "turn.terminal",
+              driver,
+              providerThreadId: childTurn.providerThreadId,
+              providerTurnId: childTurn.id,
+              runOrdinal: run.ordinal,
+              status: "interrupted",
+              failure: null,
+              threadDisposition: "reusable",
+            });
+            yield* Fiber.join(settled);
+            yield* worker.drain();
+            const ended = yield* orchestrator.getThreadProjection(task.childThreadId!);
+            const interrupt = ended.turnItems.find((item) => item.type === "run_interrupt_result");
+            assert.equal(
+              interrupt?.type === "run_interrupt_result" ? interrupt.message : null,
+              "Run interrupted: Stopped by server maintenance",
+            );
+          } else {
+            const commandId = CommandId.make("command:runtime-reconcile:shutdown:test-child");
+            const cutRun = { ...run };
+            const unstartedFollowup = scenario === "restart_unstarted_followup";
+            if (unstartedFollowup) {
+              cutRun.ordinal = 2;
+              cutRun.startedAt = null;
+            }
+            if (
+              scenario === "restart_legacy_without_result" ||
+              scenario === "restart_missing_spawn_target_narration" ||
+              scenario === "restart_legacy_continuation_with_result"
+            )
+              delete cutRun.delegatedTaskId;
+            if (scenario === "restart_missing_spawn_target_narration") {
+              const spawn = before.contextTransfers.find(
+                (transfer) => transfer.type === "subagent_spawn",
+              );
+              assert.isDefined(spawn);
+              yield* sink.write({
+                events: [
+                  {
+                    id: EventId.make("legacy:missing-spawn-target"),
+                    type: "context-transfer.updated",
+                    threadId: task.childThreadId!,
+                    occurredAt: now,
+                    payload: { ...spawn!, targetRunId: null },
+                  },
+                ],
+              });
+            }
+            const resultRunId =
+              scenario === "restart_legacy_continuation_with_result"
+                ? RunId.make("run:legacy-continuation")
+                : run.id;
+            if (scenario === "shutdown_narration" || scenario === "startup_narration") {
+              yield* sink.write({
+                events: [
+                  {
+                    id: EventId.make("recovery:narration"),
+                    type: "message.updated",
+                    threadId: task.childThreadId!,
+                    runId: run.id,
+                    occurredAt: now,
+                    payload: {
+                      id: MessageId.make("message:recovery-narration"),
+                      threadId: task.childThreadId!,
+                      runId: run.id,
+                      nodeId: run.rootNodeId,
+                      role: "assistant",
+                      createdBy: "agent",
+                      creationSource: "provider",
+                      phase: "narration",
+                      text: "I am checking the remaining edge cases.",
+                      attachments: [],
+                      streaming: false,
+                      createdAt: now,
+                      updatedAt: now,
+                    },
+                  },
+                ],
+              });
+              const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+              const summary = yield* recovery.reconcile(
+                scenario === "shutdown_narration" ? "shutdown" : "startup",
+              );
+              assert.equal(summary.terminalizedRuns, 2);
+              yield* recovery.reconcile("startup");
+              assert.equal(
+                (yield* orchestrator.getThreadProjection(task.childThreadId!)).runs[0]!.status,
+                "cancelled",
+              );
+              const resumedParent = yield* turnRunning();
+              yield* orchestrator.dispatch({
+                type: "message.dispatch",
+                commandId: CommandId.make("resume-parent"),
+                threadId: parentThreadId,
+                messageId: MessageId.make("message:resume-parent"),
+                text: "Check the child after restart.",
+                attachments: [],
+                dispatchMode: { type: "start_immediately" },
+                createdBy: "user",
+                creationSource: "web",
+              });
+              yield* worker.drain();
+              yield* Fiber.join(resumedParent);
+            } else
+              yield* sink.writeWithEffects({
+                commandId,
+                events: [
+                  {
+                    id: EventId.make("restart-cancelled-turn"),
+                    type: "provider-turn.updated",
+                    threadId: task.childThreadId!,
+                    runId: run.id,
+                    occurredAt: now,
+                    payload: { ...childTurn, status: "cancelled", completedAt: now },
+                  },
+                  {
+                    id: EventId.make("restart-cancelled-child"),
+                    type: "run.updated",
+                    threadId: task.childThreadId!,
+                    runId: run.id,
+                    occurredAt: now,
+                    payload: {
+                      ...cutRun,
+                      status: terminalStatus,
+                      completedAt: now,
+                    },
+                  },
+                  ...(unstartedFollowup
+                    ? [
+                        {
+                          id: EventId.make("unstarted-followup:origin"),
+                          type: "thread.metadata-updated" as const,
+                          threadId: task.childThreadId!,
+                          occurredAt: now,
+                          payload: {
+                            ...before.thread,
+                            forkedFrom: {
+                              type: "node" as const,
+                              nodeId: NodeId.make("node:previous-task"),
+                            },
+                          },
+                        },
+                        {
+                          id: EventId.make("unstarted-followup:previous-run"),
+                          type: "run.created" as const,
+                          threadId: task.childThreadId!,
+                          occurredAt: now,
+                          payload: {
+                            ...run,
+                            id: RunId.make("run:previous-task"),
+                            status: "completed" as const,
+                            delegatedTaskId: NodeId.make("node:previous-task"),
+                            completedAt: now,
+                          },
+                        },
+                      ]
+                    : []),
+                  ...(scenario === "restart_legacy_continuation_with_result"
+                    ? [
+                        {
+                          id: EventId.make("legacy-continuation-cancelled"),
+                          type: "run.updated" as const,
+                          threadId: task.childThreadId!,
+                          occurredAt: now,
+                          payload: {
+                            ...cutRun,
+                            id: resultRunId,
+                            ordinal: 2,
+                            status: "cancelled" as const,
+                            restartContinuationOfRunId: run.id,
+                            completedAt: now,
+                          },
+                        },
+                      ]
+                    : []),
+                  ...(scenario === "restart_narration_item_only" ||
+                  scenario === "restart_answer_with_narration"
+                    ? [
+                        {
+                          id: EventId.make("narration-item"),
+                          type: "turn-item.updated" as const,
+                          threadId: task.childThreadId!,
+                          runId: resultRunId,
+                          occurredAt: now,
+                          payload: {
+                            id: TurnItemId.make("turn-item:narration"),
+                            threadId: task.childThreadId!,
+                            runId: resultRunId,
+                            nodeId: run.rootNodeId,
+                            providerThreadId: childTurn.providerThreadId,
+                            providerTurnId: childTurn.id,
+                            nativeItemRef: null,
+                            parentItemId: null,
+                            ordinal: 999,
+                            status: "completed" as const,
+                            title: null,
+                            startedAt: now,
+                            completedAt: now,
+                            updatedAt: now,
+                            messageId: MessageId.make("message:narration"),
+                            type: "assistant_message" as const,
+                            text: "I am checking the remaining edge cases.",
+                            phase: "narration" as const,
+                            streaming: false,
+                          },
+                        },
+                      ]
+                    : []),
+                  ...(hasResult ||
+                  scenario === "restart_narration_only" ||
+                  scenario === "restart_missing_spawn_target_narration"
+                    ? [
+                        {
+                          id: EventId.make("child-result"),
+                          type: "message.updated" as const,
+                          threadId: task.childThreadId!,
+                          runId: resultRunId,
+                          occurredAt: now,
+                          payload: {
+                            id: MessageId.make("message:child-result"),
+                            threadId: task.childThreadId!,
+                            runId: resultRunId,
+                            nodeId: run.rootNodeId,
+                            role: "assistant" as const,
+                            createdBy: "agent" as const,
+                            creationSource: "provider" as const,
+                            text: "Partial review before restart",
+                            phase:
+                              scenario === "restart_unknown_phase_result"
+                                ? undefined
+                                : scenario === "restart_narration_only" ||
+                                    scenario === "restart_missing_spawn_target_narration"
+                                  ? ("narration" as const)
+                                  : ("answer" as const),
+                            attachments: [],
+                            streaming: false,
+                            createdAt: now,
+                            updatedAt: now,
+                          },
+                        },
+                      ]
+                    : []),
+                ],
+                effects: [
+                  {
+                    id: `effect:restart-continuation:${resultRunId}`,
+                    commandId,
+                    threadId: task.childThreadId!,
+                    request: { type: "provider-runtime.continue", sourceRunId: resultRunId },
+                  },
+                ],
+              });
+            const firstPoll = yield* service.taskStatus(scope, task.id);
+            assert.equal(firstPoll.status, hasResult ? "running" : terminalStatus);
+            assert.equal(firstPoll.workState, hasResult ? "working" : "result_available");
+            if (scenario === "restart_missing_spawn_target_narration")
+              assert.isNull(firstPoll.childRunId);
+            if (!hasResult) {
+              // The status was exposed before recovery published the task row.
+              // A delayed restart must fence publication and decline admission.
+              yield* continueRestartedRun({
+                threadId: task.childThreadId!,
+                sourceRunId: run.id,
+              }).pipe(
+                Effect.provide(
+                  ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+                ),
+              );
+              assert.lengthOf(
+                (yield* orchestrator.getThreadProjection(task.childThreadId!)).runs,
+                unstartedFollowup ? 2 : 1,
+              );
+            }
+            if (scenario === "restart_disposed_queue") {
+              yield* orchestrator.dispatch({
+                type: "delegated_task.completion-delivery.dispose",
+                commandId: CommandId.make("dispose-before-cancel"),
+                parentThreadId,
+                taskId: task.id,
+              });
+              yield* sink.write({
+                events: [
+                  {
+                    id: EventId.make("held-later-run"),
+                    type: "run.updated",
+                    threadId: task.childThreadId!,
+                    occurredAt: now,
+                    payload: {
+                      ...run,
+                      id: RunId.make("run:held-later"),
+                      ordinal: 2,
+                      status: "queued",
+                      queueHeld: true,
+                      queuePosition: 1,
+                      startedAt: null,
+                      completedAt: null,
+                      delegatedTaskId: NodeId.make("node:later-task"),
+                    },
+                  },
+                ],
+              });
+            }
+            // Recovery must settle a resultless cancellation even while its old
+            // continuation effect is still pending; a real result stays held.
+            yield* orchestrator.recoverDelegatedTasks;
+            if (!hasResult) {
+              const recoveredTask = (yield* orchestrator.getThreadProjection(
+                parentThreadId,
+              )).subagents.find((entry) => entry.id === task.id)!;
+              assert.equal(recoveredTask.status, terminalStatus);
+              assert.isNotNull(recoveredTask.result);
+            }
+          }
+          const status = yield* service.taskStatus(scope, task.id);
+          const held = hasResult;
+          assert.equal(
+            status.status,
+            held ? "running" : scenario === "external_interrupt" ? "interrupted" : terminalStatus,
+          );
+          assert.equal(status.workState, held ? "working" : "result_available");
+          assert.isNull(status.currentRunId);
+          assert.isFalse(status.hasPendingChildRuns);
+          assert.equal(
+            status.latestTerminalStatus,
+            scenario === "external_interrupt" ? "interrupted" : terminalStatus,
+          );
+          if (held) assert.isNull(status.summary);
+          if (scenario === "restart_failed_without_result") return;
+          if (scenario === "restart_without_result") {
+            yield* continueRestartedRun({
+              threadId: task.childThreadId!,
+              sourceRunId: run.id,
+            }).pipe(
+              Effect.provide(ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true })),
+            );
+            const recovered = yield* orchestrator.getThreadProjection(task.childThreadId!);
+            assert.lengthOf(recovered.runs, 1);
+          }
+          const write = sink.writeWithEffects;
+          let failedSettlement = false;
+          const settlement =
+            scenario === "restart_disposed_queue"
+              ? vi.spyOn(sink, "writeWithEffects").mockImplementation((input) => {
+                  if (
+                    !failedSettlement &&
+                    input.events.some(
+                      (event) =>
+                        event.type === "subagent.updated" &&
+                        event.payload.id === task.id &&
+                        event.payload.status === "cancelled",
+                    )
+                  ) {
+                    failedSettlement = true;
+                    return Effect.fail(
+                      new EventSink.EventSinkWriteError({ eventCount: input.events.length }),
+                    );
+                  }
+                  return write(input);
+                })
+              : undefined;
+          const cancel = service.cancelTask(scope, {
+            taskId: task.id,
+            clientRequestId: "cancel-ended-task",
+          });
+          if (scenario === "restart_disposed_queue") {
+            const failed = yield* cancel.pipe(
+              Effect.flip,
+              Effect.ensuring(Effect.sync(() => settlement?.mockRestore())),
+            );
+            assert.equal(failed.code, "task_not_cancellable");
+            assert.isTrue(failedSettlement);
+            const unsettled = (yield* orchestrator.getThreadProjection(
+              parentThreadId,
+            )).subagents.find((row) => row.id === task.id)!;
+            assert.equal(unsettled.status, "running");
+            assert.isNull(unsettled.result);
+          }
+          // Replaying Stop must still settle a failed result write, independently
+          // of its command receipt and already-disposed completion delivery.
+          const cancelled = yield* cancel.pipe(
+            Effect.ensuring(Effect.sync(() => settlement?.mockRestore())),
+          );
+          assert.equal(
+            cancelled.status,
+            scenario === "external_interrupt" ? "interrupted" : "cancelled",
+          );
+          const parentAfter = yield* orchestrator.getThreadProjection(parentThreadId);
+          const settledTask = parentAfter.subagents.find((row) => row.id === task.id)!;
+          assert.equal(
+            settledTask.status,
+            scenario === "external_interrupt" ? "interrupted" : "cancelled",
+          );
+          assert.isNotNull(settledTask.result);
+          assert.equal(settledTask.completionDelivery?.state, "disposed");
+          return;
+        }
         const now = yield* DateTime.now;
         const subagentId = NodeId.make("node:native-subagent");
         const native = {
@@ -327,18 +801,6 @@ it.effect("task_cancel ends a delegated child's background native subagent", () 
         yield* Fiber.join(waiting);
         yield* worker.drain();
 
-        const scope: McpInvocationScope = {
-          environmentId: EnvironmentId.make("environment:task-cancel"),
-          requestNamespace: "provider-session:task-cancel",
-          thread: {
-            threadId: parentThreadId,
-            providerSessionId: "provider-session:task-cancel",
-            providerInstanceId: instanceId,
-          },
-          client: undefined,
-          capabilities: new Set(["orchestration"]),
-          issuedAt: 1,
-        };
         const before = yield* service.taskStatus(scope, task.id);
         assert.equal(before.status, "running");
         assert.equal(before.workState, "waiting_for_children");
@@ -347,7 +809,7 @@ it.effect("task_cancel ends a delegated child's background native subagent", () 
           taskId: task.id,
           clientRequestId: "cancel-task",
         });
-        assert.equal(cancelled.status, "cancel_requested");
+        assert.include(["cancel_requested", "completed"], cancelled.status);
         yield* worker.drain();
 
         const childAfter = yield* orchestrator.getThreadProjection(task.childThreadId!);

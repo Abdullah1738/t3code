@@ -58,7 +58,9 @@ class Logging(Base):
                           ('case.update', 'DEADLINE_REASON_REQUIRED'),
                           ('case.corroborate', 'CORROBORATE_MISMATCH')]:
             row = next(r for r in self.rows(name) if r['kind'] == 'error')
-            self.assertEqual(row['error'], {'tag': tag, 'message': tag})
+            self.assertEqual(row['error'], {'tag': tag, 'message': tag, 'cause': {
+                'httpStatus': None, 'endpoint': None, 'attempt': None, 'retryable': False,
+                'upstreamCode': None, 'exceptionClass': None}})
             self.assertFalse(row['ok'])
         for private in (cid, 'Secret Merchant', 'Other Merchant', 'private-reference', 'private-state',
                         'private-note', 'private-outcome', 'private-message-id', 'private-observation', '120.50', 'AED'):
@@ -182,6 +184,23 @@ class Logging(Base):
         self.assertFalse(self.rows('check.run')[-1]['ok'])
         self.assertEqual(self.rows('check.run')[-1]['props']['fired'], 0)
 
+    def test_known_source_limits_alone_complete_ok_and_bad_reason_is_dropped(self):
+        def limited(*args, stats, **kw):
+            stats['question_limits'] = [{'why': 'private fixture',
+                'kinds': ['ORDER_LIST_HOST_BINDING_UNVERIFIED']}]
+            return []
+        with patch.object(mc, 'follow', side_effect=limited):
+            mc.run_check(self.wd, 'limit', self.data, self.root, at('2026-11-14T10:00'), finder(), nobody)
+        row = self.rows('check.run')[-1]
+        self.assertTrue(row['ok'])
+        self.assertEqual(row['props']['sourceLimits'], 1)
+        for bad in ('PRIVATE9999', ['PRIVATE9999'], {'private': 'PRIVATE9999'}):
+            mc.toollog.emit('money-cases', 'check.run', ok=True, props={
+                'orderCoverage': {'noon': {'food': {'stop_reason': bad}}}})
+            row = self.rows('check.run')[-1]
+            self.assertNotIn('stop_reason', row['props']['orderCoverage']['noon']['food'])
+            self.assertNotIn('PRIVATE', json.dumps(row))
+
     def test_raising_logger_preserves_commands_and_refusals(self):
         with patch.object(mc.toollog, 'emit', side_effect=OSError('disk full')):
             self.case()
@@ -213,7 +232,9 @@ class Logging(Base):
         row, = self.rows('check.run')
         self.assertFalse(row['ok'])
         self.assertEqual(row['durationMs'], 40000)
-        self.assertEqual(row['props'], {'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow'})
+        self.assertEqual(row['props'], {'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}, 'chargeCensus': {},
+            'owner_threads_ms': 0, 'msgs_ms': 0, 'msgs_max_ms': 0, 'lookups_ms': 0, 'census_ms': 0,
+            'starved_by': 'follow'})
 
     def test_check_distinguishes_short_lock_timeout_from_work_deadline(self):
         self.case()
@@ -384,6 +405,114 @@ class Logging(Base):
         self.assertNotIn('private', json.dumps(self.rows()))
         self.assertNotIn('amountMinor', json.dumps(self.rows()))
         self.assertNotIn('last4', json.dumps(self.rows()))
+
+    def test_order_coverage_and_source_limit_logs_drop_private_fields(self):
+        mc.toollog.emit('money-cases', 'check.run', ok=True, props={
+            'sourceLimits': 2, 'limitKinds': ['food_page_1', 'PRIVATE9999'],
+            'chargeCensus': {'noon': {'open': 5, 'matched': 1, 'proven_clean': 1, 'limited': 2,
+                'error': 1, 'not_checked': 1, 'PRIVATE9999': 7}, 'PRIVATE9999': {'open': 1}},
+            'orderCoverage': {'noon': {'food': {'covered_from': '2026-11-10T12:00:00+00:00',
+                'pages': 1, 'fetched': 3, 'cached': 2, 'ms': 1000, 'exhaustive': False,
+                'limit': 'page-1 history only', 'stop_reason': 'detail_error', 'coverage_cleared_rows': 2,
+                'address': 'PRIVATE9999', 'card': '9999'}},
+                'PRIVATE9999': {'food': {'covered_from': 'PRIVATE9999'}}},
+            'card': '9999', 'address': 'PRIVATE9999'})
+        run, = self.rows('check.run')
+        self.assertEqual(run['props']['sourceLimits'], 2)
+        self.assertEqual(run['props']['chargeCensus'], {'noon': {'open': 5, 'matched': 1,
+            'proven_clean': 1, 'limited': 2, 'error': 1, 'not_checked': 1}})
+        self.assertEqual(run['props']['limitKinds'], ['food_page_1'])
+        lane = run['props']['orderCoverage']['noon']['food']
+        self.assertEqual(lane['covered_from'], '2026-11-10T12:00:00+00:00')
+        self.assertEqual((lane['fetched'], lane['cached']), (3, 2))
+        self.assertEqual(lane['stop_reason'], 'detail_error')
+        self.assertEqual(lane['coverage_cleared_rows'], 2)
+        self.assertNotIn('PRIVATE', json.dumps(run))
+        self.assertNotIn('9999', json.dumps(run))
+
+    def test_current_whole_check_expiry_replaces_prior_source_slice_timeout(self):
+        for prior in ('receipt', 'msgs', 'owner_threads'):
+            for target in ('attention', 'build_write', 'lookups'):
+                with self.subTest(prior=prior, target=target):
+                    clock = [1000.0]
+                    def follow(*args, stats, **kwargs):
+                        stats['starved_by'] = prior
+                        if target == 'lookups':
+                            with mc.charges.step_timing(stats, 'lookups', 1100):
+                                clock[0] += 40
+                                raise mc.CheckTimeout('current source expired')
+                        return []
+                    def attention(*args, **kwargs):
+                        if target == 'attention':
+                            clock[0] += 40
+                            raise mc.CheckTimeout('attention expired')
+                        return []
+                    def write(*args, **kwargs):
+                        if target == 'build_write':
+                            clock[0] += 40
+                        raise mc.CheckTimeout('save expired')
+                    with patch.object(mc.time, 'time', lambda: clock[0]), \
+                            patch.object(mc, 'follow', follow), patch.object(mc, 'attention', attention), \
+                            patch.object(mc, 'write_json', write), contextlib.redirect_stderr(io.StringIO()):
+                        mc.run_check(self.wd, 'expiry', self.data, self.root,
+                                     at('2026-11-14T12:00'), finder(), nobody)
+                    props = self.rows('check.run')[-1]['props']
+                    self.assertTrue(props['budgetHit'])
+                    self.assertEqual(props['starved_by'], target)
+
+    def test_merchant_history_msgs_are_included_in_step_totals(self):
+        stats = {'msgs_calls': 0}
+        clock = [1000.0]
+        def empty(argv, **kwargs):
+            clock[0] += 0.1
+            return subprocess.CompletedProcess(argv, 0, '', '')
+        with patch.object(mc.charges.subprocess, 'run', empty), \
+                patch.object(mc.time, 'monotonic', lambda: clock[0]):
+            mc.charges.known(mc.charges.parse(ALERT, BANK), at('2026-11-14T12:00'), stats=stats)
+        self.assertEqual(stats['msgs_calls'], 2)
+        self.assertEqual(stats['msgs_ms'], 200)
+        self.assertEqual(stats['msgs_max_ms'], 100)
+
+    def test_step_timing_names_source_when_enclosing_budget_expires_first(self):
+        from threading import Event
+        stats = {}
+        with self.assertRaises(mc.CheckTimeout):
+            with mc.within(time.time() + 0.02, mc.CheckTimeout('fixture')):
+                with mc.charges.step_timing(stats, 'lookups', time.time() + 10):
+                    Event().wait(1)
+        self.assertEqual(stats['starved_by'], 'lookups')
+        self.assertGreaterEqual(stats['lookups_ms'], 10)
+
+    def test_step_timing_is_logged_and_private_values_are_rejected(self):
+        keys = ('owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms')
+        stats = {}
+        clock = [1000.0]
+        with patch.object(mc.time, 'monotonic', lambda: clock[0]), \
+                patch.object(mc.time, 'time', lambda: clock[0]):
+            for name in ('owner_threads', 'msgs', 'msgs', 'lookups', 'census'):
+                with mc.charges.step_timing(stats, name, 1001):
+                    clock[0] += 0.25
+        self.assertEqual(stats['msgs_ms'], 500)
+        self.assertEqual(stats['msgs_max_ms'], 250)
+        self.assertEqual(stats['starved_by'], 'census')
+        def follow(*args, stats, **kwargs):
+            stats.update({key: 250 for key in keys}, starved_by='msgs')
+            return []
+        with patch.object(mc, 'follow', follow):
+            mc.run_check(self.wd, 'steps', self.data, self.root, at('2026-11-14T12:00'), finder(), nobody)
+        props = self.rows('check.run')[-1]['props']
+        self.assertEqual({key: props[key] for key in keys}, dict.fromkeys(keys, 250))
+        self.assertEqual(props['starved_by'], 'msgs')
+        for value in ('PRIVATE9999', -1, True, 1.5, 10**13):
+            with self.subTest(value=value):
+                fields = {key: value for key in keys}
+                fields['starved_by'] = 'PRIVATE9999'
+                mc.toollog.emit('money-cases', 'check.run', props=fields)
+                props = self.rows('check.run')[-1]['props']
+                self.assertEqual(props, {})
+        other = HERE.parents[2] / 'app-api-cli/toollog.py'
+        if other.exists():
+            self.assertEqual((HERE / 'toollog.py').read_bytes(), other.read_bytes())
 
     def test_production_modules_never_import_test_runners(self):
         for path in HERE.glob('*.py'):

@@ -148,6 +148,11 @@ with allocation.scope('repo'), allocation.guard():
 class ResumeQueueTests(Isolated):
     def setUp(self):
         super().setUp()
+        # Pool interleavings need the mocked clock/API in this process; real detachment has separate coverage.
+        def inline_background(a, me):
+            with patch.dict(os.environ, {runs.BACKGROUND_RUN_ENV: common.new_id('run')}):
+                return runs.background_client(a, me)
+        self.stack.enter_context(patch.object(runs, '_background', side_effect=inline_background))
         self.clock = FakeClock()
         self.stack.enter_context(patch.object(pool, 'time', self.clock.time))
         self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_BACKEND':'server','OFFBOX_POOL_WAIT_SECONDS':'12'}))
@@ -641,19 +646,21 @@ class ResumeQueueTests(Isolated):
                 self.take()
         self.assertEqual(resume.call_count,2)
 
-    def test_owned_grow_status_timeout_crossing_affinity_cutoff_queues(self):
+    def test_owned_grow_status_timeout_spends_fresh_attempt_budget_then_queues(self):
         self.box('owned','running',member=True)
         self.con.execute('INSERT INTO pool_callers VALUES (?,?,?,?)',
                          (self.me['owner'],self.me['repo_root'],'owned','w/owned'))
         self.con.commit()
         self.clock.time.time=lambda:self.clock.t
         stopped, timed_out, sent = [], [], []
+        read_ends = []
         def get(*a,**k):
             if not stopped:
                 return {'state':'running','type':'large'}
             if not timed_out and self.clock.t >= 1058:
-                self.assertLessEqual(api.left(),2)
-                self.clock.t += 2.1
+                self.assertEqual(api.left(), pool.AFFINITY_WAIT_S)
+                read_ends.append(self.clock.t + api.left())
+                self.clock.t += api.left() + .1
                 timed_out.append(True)
                 raise api.NetworkError('status response exceeded affinity budget')
             return {'state':'archived' if timed_out else 'stopping','type':'large'}
@@ -666,8 +673,8 @@ class ResumeQueueTests(Isolated):
             self.assertEqual(self.take(size='xlarge')['box_id'],'owned')
         self.assertEqual(timed_out,[True])
         self.assertEqual(len(sent),1)
-        self.assertGreater(sent[0],1060)
-        self.assertLess(self.clock.t,1070)
+        self.assertGreater(sent[0],read_ends[0])
+        self.assertLess(self.clock.t,read_ends[0] + 10)
 
     def test_pending_confirmation_cannot_open_retry_past_queue_deadline(self):
         self.box('cold','stopped',member=True)

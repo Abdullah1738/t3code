@@ -12,3 +12,10 @@ An explicit `delivery_cards.py --app APP --order ID --recover-send` can recover
 a suppressed or expired enrolled card after checking the original notice and
 outbox; it does not bypass a payment hold and uses the retained delivery-card key.
 Ordinary `--send` still respects suppression and the six-hour expiry.
+
+Delivered checks match AED totals to money-cases bank alerts within 2% of the order total.
+Matches retain `bank_amount`, `bank_card_last4`, `bank_msg_id` and `bank_charged_at`;
+wakes include those fields in `bank_charge`, or null when no charge is matched.
+`bank_amount_gap` reports a gap over AED 1 once; it does not establish an overcharge or refund.
+Eligible delivered orders retain bank-only retries, at most once per 10 minutes, until matched or
+48 hours after placement; normal and pending checks both preserve that retry window.

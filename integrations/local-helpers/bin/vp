@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+
+if [ "${REPO_VP_SHIM_ACTIVE:-}" = 1 ]; then
+  echo 'vp: recursive shim; run offbox run -- vp instead' >&2
+  exit 127
+fi
+export REPO_VP_SHIM_ACTIVE=1
+
+root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+dir=$(pwd -P)
+while :; do
+  candidate=$dir/node_modules/.bin/vp
+  if [ -x "$candidate" ] && ! [ "$candidate" -ef "$0" ]; then
+    exec "$candidate" "$@"
+  fi
+  [ "$dir" = / ] && break
+  [ "$dir" = "$root" ] && break
+  dir=${dir%/*}
+  [ -n "$dir" ] || dir=/
+done
+
+if [ -n "$root" ] && [ ! -e "$root/node_modules" ]; then
+  common=$(git rev-parse --path-format=absolute --git-common-dir)
+  main=${common%/.git}
+  toolchain=$(git config --get vp.toolchain || true)
+  here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+  have_candidates=0
+  if [ "$main" != "$root" ] && [ -x "$main/node_modules/.bin/vp" ]; then
+    set -- "--candidate=main checkout" "$main" -- "$@"
+    have_candidates=1
+  fi
+  if [ -n "$toolchain" ] && [ -d "$toolchain" ] && [ -x "$toolchain/node_modules/.bin/vp" ] && ! [ "$toolchain" -ef "$root" ]; then
+    [ "$have_candidates" = 1 ] || set -- -- "$@"
+    set -- "--candidate=toolchain copy" "$toolchain" "$@"
+  fi
+  case "${1:-}" in
+    --candidate=*) exec node "$here/../libexec/vp/worktree.mjs" "$root" "$@" ;;
+  esac
+fi
+echo "vp: no checkout-local node_modules/.bin/vp; run offbox run -- vp $*" >&2
+exit 127

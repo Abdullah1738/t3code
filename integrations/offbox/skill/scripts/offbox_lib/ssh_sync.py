@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import hashlib
+import json
 import os
+import stat
 import signal
 from functools import lru_cache
 import re
@@ -22,12 +25,16 @@ import toollog
 
 from . import api, capacity, common, git_snapshot
 from .common import CM_DIR, KEY_PATH, SSH_DIR, OffboxError, ensure_dirs, log
+from .home import StartWaitFailed
 
 RSYNC = "/opt/homebrew/bin/rsync" if Path("/opt/homebrew/bin/rsync").exists() else "rsync"
 STALL_S = capacity.setting("OFFBOX_SYNC_STALL_S", 180)
 SYNC_PROGRESS_S = 60
+MAX_TRACKED_INCLUDE_FILES = 200
+MAX_INCLUDE_FILTER_BYTES = 512 * 1024
 RETRY_PAUSES = (5, 15, 45)
 CHECKOUT_DIR = re.compile(r"^w/[A-Za-z0-9._-]{1,40}-[0-9a-f]{6}$")
+_HOME_PORTS: dict[str, tuple[str, int]] = {}
 
 # Never sent to a box. Excluded paths are also protected from --delete on the box, so remote-only
 # installs (node_modules, .terraform, caches, build output) survive between runs and resumes.
@@ -54,21 +61,46 @@ def cfg_path(box_id: str) -> Path:
     return SSH_DIR / f"config_{box_id}"
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + ".", suffix=".tmp",
+                                         delete=False, mode="w") as f:
+            tmp = Path(f.name)
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
 @toollog.observed("ssh", "ssh.setup", "ssh_setup")
 def setup(box_id: str) -> Path:
     """Authorize our key on the box's current machine and pin its host key. Needed after every create/resume/fork."""
+    from . import prepare
     ensure_dirs()
     last = None
     for attempt in range(8):
         try:
             r = api.sshkey(box_id, pubkey())
+            prepare.observe_outage()
             break
         except api.ApiError as e:
+            prepare.observe_outage(e)
             if not (e.api_code in ("machine_not_running", "sandbox_starting", "boat_starting", "ssh_host_key_unavailable")
                     or e.status in (409, 502, 503) or api.gateway_timeout(e)):
                 raise
             last = e
+        except StartWaitFailed:
+            raise
+        except api.BudgetExpired as error:
+            if last is not None and last.outage:
+                raise last from error
+            raise
         except OffboxError as e:
+            prepare.observe_outage(e)
             if not e.outage:
                 raise
             last = e
@@ -90,11 +122,17 @@ def setup(box_id: str) -> Path:
         host, port = r.get("machineIp"), "22"
     if not host or not r.get("hostKey"):
         raise OffboxError(f"no ssh endpoint/host key for {box_id}")
+    home_ports = ""
+    if api.BACKEND == "server" and r.get("managementSshEndpoint"):
+        mgmt_host, mgmt_port = r["managementSshEndpoint"].rsplit(":", 1)
+        if mgmt_host != host:
+            raise OffboxError(f"management SSH host differs from legacy SSH host for {box_id}")
+        # Both are allocated host proxy ports, not the guest's 2222/22 listeners.
+        home_ports = f"# offbox-home-ports {int(mgmt_port)} {int(port)}\n"
     kh = SSH_DIR / f"known_hosts_{box_id}"
-    kh.write_text(f"{box_id} {r['hostKey']}\n")
+    _atomic_write_text(kh, f"{box_id} {r['hostKey']}\n")
     cfg = cfg_path(box_id)
-    tmp = cfg.with_suffix(".tmp")
-    tmp.write_text(f"""Host {box_id}
+    _atomic_write_text(cfg, f"""Host {box_id}
   HostName {host}
   Port {port}
   User {r.get('sshUser') or 'user'}
@@ -111,18 +149,64 @@ def setup(box_id: str) -> Path:
   ControlPath {CM_DIR}/%C
   ControlPersist 600
   LogLevel ERROR
-""")
-    os.replace(tmp, cfg)
+""" + home_ports)
     log(f"ssh setup {box_id} endpoint={host}:{port}")
     return cfg
 
 
-def ssh_base(box_id: str) -> list[str]:
-    return ["ssh", "-F", str(cfg_path(box_id))]
+def _host_key_error(stderr: bytes) -> bool:
+    return any(s in stderr for s in (b"Host key verification failed", b"REMOTE HOST IDENTIFICATION",
+                                     b"Offending ", b"host key has changed"))
+
+
+def _management_unreachable(box_id: str) -> common.SshHostKeyMismatch:
+    return common.SshHostKeyMismatch(f"management SSH unreachable for {box_id}: host key mismatch; "
+                       "use `offbox exec` through the home control API (#95); leave known_hosts unchanged")
+
+
+def check_host_key(box_id: str, stderr: bytes) -> None:
+    if api.BACKEND == "server" and _host_key_error(stderr):
+        raise _management_unreachable(box_id)
+
+
+def ssh_base(box_id: str, *, probe: bool = True) -> list[str]:
+    base = ["ssh", "-F", str(cfg_path(box_id))]
+    if api.BACKEND != "server":
+        return base
+    try:
+        config = cfg_path(box_id).read_text()
+    except OSError:
+        return base
+    ports = re.search(r"^# offbox-home-ports (\d+) (\d+)$", config, re.M)
+    if not ports:
+        return base  # pre-upgrade daemon: only its legacy endpoint is known
+    cached = _HOME_PORTS.get(box_id)
+    if cached and cached[0] == config:
+        return base + ["-p", str(cached[1])]
+    if not probe:
+        return base
+    for port in ports.groups():
+        left = api.left()
+        timeout = 5 if left is None else min(5, max(0, left))
+        if timeout <= 0:
+            raise subprocess.TimeoutExpired(base, timeout)
+        try:
+            p = subprocess.run(base + ["-p", port, "-o", "ConnectTimeout=3", "-o", "ControlPath=none",
+                                      box_id, "true"], capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            continue
+        check_host_key(box_id, p.stderr)
+        if p.returncode == 0:
+            _HOME_PORTS[box_id] = (config, int(port))
+            return base + ["-p", port]
+    raise OffboxError(f"management SSH unreachable for {box_id} on management and legacy endpoints; "
+                       "use the home control API (`offbox exec`, #95)")
 
 
 def ssh(box_id: str, command: str, input: bytes | None = None, timeout: float = 120, check: bool = False):
     p = subprocess.run(ssh_base(box_id) + [box_id, command], input=input, capture_output=True, timeout=timeout)
+    if p.returncode == 255:
+        check_host_key(box_id, p.stderr)
     if p.returncode == 255:
         toollog.emit("ssh", "ssh.drop", kind="error", ok=False, ids={"box": box_id}, tag="ssh_drop", props={"exitCode": 255})
     if check and p.returncode != 0:
@@ -133,7 +217,9 @@ def ssh(box_id: str, command: str, input: bytes | None = None, timeout: float = 
 @toollog.observed("ssh", "ssh.readiness", "readiness")
 def wait_ssh(box_id: str, timeout: float = 90) -> None:
     left = api.left()
-    deadline = time.time() + (timeout if left is None else max(0, min(timeout, left)))
+    window = timeout if left is None else max(0, min(timeout, left))
+    client_limited = left is not None and left < timeout
+    deadline = time.time() + window
     err = ""
     while time.time() < deadline:
         try:
@@ -141,11 +227,21 @@ def wait_ssh(box_id: str, timeout: float = 90) -> None:
             if p.returncode == 0:
                 return
             err = p.stderr.decode(errors="replace")[-300:]
-            if "Host key verification failed" in err or "REMOTE HOST IDENTIFICATION" in err:
+            if _host_key_error(p.stderr):
+                if api.BACKEND == "server":
+                    raise _management_unreachable(box_id)
                 setup(box_id)
         except subprocess.TimeoutExpired:
             err = "timeout"
+        except common.SshHostKeyMismatch:
+            raise
+        except OffboxError as error:
+            if error.outage or not client_limited or time.time() < deadline:
+                raise
+            err = str(error)
         time.sleep(max(0, min(1, deadline - time.time())))
+    if client_limited:
+        raise api.BudgetExpired(f"ssh to {box_id} not ready within {window:g}s client budget: {err}")
     raise OffboxError(f"ssh to {box_id} not ready after {int(timeout)}s: {err}")
 
 
@@ -158,7 +254,7 @@ def close_master(box_id: str) -> None:
         timeout = 2 if left is None else min(2, max(0, left))
         if timeout > 0:
             # Resolve %C before exit can exhaust the budget, without connecting to the remote machine.
-            config = subprocess.run(ssh_base(box_id) + ["-G", box_id], capture_output=True, text=True, timeout=timeout)
+            config = subprocess.run(ssh_base(box_id, probe=False) + ["-G", box_id], capture_output=True, text=True, timeout=timeout)
             if config.returncode == 0:
                 for line in config.stdout.splitlines():
                     if line.startswith("controlpath "):
@@ -172,7 +268,7 @@ def close_master(box_id: str) -> None:
         left = api.left()
         timeout = 10 if left is None else min(10, max(0, left))
         if timeout > 0:
-            subprocess.run(ssh_base(box_id) + ["-O", "exit", box_id], capture_output=True, timeout=timeout)
+            subprocess.run(ssh_base(box_id, probe=False) + ["-O", "exit", box_id], capture_output=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         pass  # closing a cached connection must not undo a confirmed box stop
     try:
@@ -238,7 +334,7 @@ def _gitinfo_exclude(root: Path) -> list[str]:
     cands = [root / ".git" / "info" / "exclude"]
     try:
         p = subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10, cwd=str(root))
         if p.returncode == 0 and p.stdout.strip():
             cands.insert(0, Path(p.stdout.strip()) / "info" / "exclude")
     except Exception:  # noqa: BLE001
@@ -272,21 +368,31 @@ def _soft_partial(stderr: str) -> list[str] | None:
     return bad or None
 
 
+INCLUDE_WORKAROUND = ("Create a dot-directory at the checkout root (mktemp -d ./.scratch.XXXX), "
+                      "put the script there and --include that path, or use a committed or included file in the repo.")
+
+
 def _include_refused(inc: str) -> OffboxError:
     return OffboxError(f"cannot sync --include {inc!r}: offbox couldn't tell what else sits beside it, "
-                       "so it won't send it (local filter inspection failed)", code=2)
+                       f"so it won't send it (local filter inspection failed). {INCLUDE_WORKAROUND}", code=2)
+
+
+def _include_alias_refused(inc: str, path: str, real: str) -> OffboxError:
+    return OffboxError(f"cannot sync --include {inc!r}: {path!r} has disk spelling {real!r}; "
+                       f"offbox can't safely guard aliased paths. {INCLUDE_WORKAROUND}", code=2)
 
 
 def _ignored_include_tops(root: Path, includes: list[str] | None) -> list[str]:
     """For each --include, its shortest ancestor dir that git ignores (tmp for tmp/a/b.sh), once each."""
+    # Ignore rules must protect box-only siblings even when the index tracks files below this top.
     tops: list[str] = []
     for inc in includes or []:
         parts = inc.strip("/").split("/")
         for i in range(1, len(parts)):
             anc = "/".join(parts[:i])
             try:
-                p = subprocess.run(["git", "-C", str(root), "check-ignore", "-q", "--", anc + "/"],
-                                   capture_output=True, timeout=10)
+                p = subprocess.run(["git", "-C", str(root), "check-ignore", "--no-index", "-q", "--", anc + "/"],
+                                   capture_output=True, timeout=10, cwd=str(root))
             except (OSError, subprocess.TimeoutExpired) as e:
                 raise _include_refused(inc) from e
             if p.returncode not in (0, 1):
@@ -360,53 +466,68 @@ def _visible_include_ancestors(root: Path, ancestors: set[str], inc: str) -> set
         raise _include_refused(inc) from e
 
 
+def _literal_filter_path(path: str, *, wildcard: bool = False) -> str:
+    # Rsync only interprets backslash escapes in rules containing wildcard syntax.
+    if not wildcard and not any(char in path for char in "*?["):
+        return path
+    return re.sub(r"([\\*?\[])", r"\\\1", path)
+
+
 def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) -> list[str]:
     # --git uses a separate portable export. Never send a raw git-dir or pointer,
     # even when --include .git is supplied, or copy private config/hooks/worktrees.
     f = ["--filter=- /.git"]
     ancestors: set[str] = set()
+    names: dict[str, list[str]] = {}
     for inc in includes or []:      # explicit opt-in (e.g. committed test certs); wins over every exclude
         inc = inc.strip("/")
+        real = _disk_path(root, inc, names)
+        if real is not None and real != inc:
+            raise _include_alias_refused(inc, inc, real)
         parts = inc.split("/")
         for i in range(1, len(parts)):
             anc = "/".join(parts[:i])
             ancestors.add(anc)
-            f.append(f"--filter=+ /{anc}/")
-        f.append(f"--filter=+ /{inc}")
-        f.append(f"--filter=+ /{inc}/**")
+            f.append(f"--filter=+ /{_literal_filter_path(anc)}/")
+        f.append(f"--filter=+ /{_literal_filter_path(inc)}")
+        f.append(f"--filter=+ /{_literal_filter_path(inc, wildcard=True)}/**")
     is_git = False
     if includes:
         try:
             p = subprocess.run(["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
-                               capture_output=True, timeout=10)
+                               capture_output=True, timeout=10, cwd=str(root))
             is_git = p.returncode == 0 and p.stdout.strip() == b"true"
         except (OSError, subprocess.TimeoutExpired):
             pass  # No Git index: guard every opened ancestor.
     guarded = ancestors.copy()
+    tracked: set[str] = set()
     if is_git and ancestors:
         try:
-            p = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", *sorted(ancestors)],
-                               capture_output=True, timeout=20)
+            p = subprocess.run(["git", "--literal-pathspecs", "-C", str(root), "ls-files", "-z", "--", *sorted(ancestors)],
+                               capture_output=True, timeout=20, cwd=str(root))
         except (OSError, subprocess.TimeoutExpired) as e:
             raise _include_refused(includes[0]) from e
         if p.returncode != 0:
             raise _include_refused(includes[0])
         for raw in p.stdout.split(b"\0"):
             if raw:
-                parts = os.fsdecode(raw).split("/")
+                path = os.fsdecode(raw)
+                tracked.add(path)
+                parts = path.split("/")
                 for i in range(1, len(parts)):
                     guarded.discard("/".join(parts[:i]))
     # A whole-directory include already authorizes these siblings, even with redundant child includes.
     unchecked = {anc for anc in ancestors - guarded
                  if not any(anc == i.strip("/") or anc.startswith(i.strip("/") + "/") for i in includes)}
     visible = _visible_include_ancestors(root, unchecked, includes[0]) if unchecked else set()
+    reopen: set[str] = set()
     for anc in sorted(unchecked):
         inc = next(i for i in includes if i.strip("/").startswith(anc + "/"))
         try:
             # Bypass the index to see ignored dirs with tracked descendants. No trailing slash: tmp/*
             # matches tmp/'s empty child in check-ignore, but does not ignore tmp itself.
             p = subprocess.run(["git", "-C", str(root), "check-ignore", "--no-index", "-q", "--", anc],
-                               capture_output=True, timeout=10)
+                               capture_output=True, timeout=10, cwd=str(root))
         except (OSError, subprocess.TimeoutExpired) as e:
             raise _include_refused(inc) from e
         if p.returncode not in (0, 1):
@@ -416,19 +537,46 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
             anc == pat or anc.endswith("/" + pat)
             for pat in SECRET_EXCLUDES + HEAVY_EXCLUDES if "/" in pat.rstrip("/")
         )
-        if p.returncode == 0 or excluded or anc not in visible:
+        if excluded:
             raise OffboxError(f"cannot sync --include {inc!r}: excluded ancestor {anc!r} contains tracked files; "
-                              "offbox can't send only the named path there. Pass the script inline in argv or "
-                              "with --step, or move it out of the excluded directory", code=2)
-    # Opening an ignored ancestor bypasses its ignore rule. Close its other children after all includes,
-    # so rsync never walks unrelated scratch trees; tracked ancestors retain the normal sync behavior.
+                              f"offbox can't send only the named path there. {INCLUDE_WORKAROUND}", code=2)
+        if p.returncode == 0 or anc not in visible:
+            descendants = {path for path in tracked if path.startswith(anc + "/")}
+            if len(descendants) > MAX_TRACKED_INCLUDE_FILES:
+                raise OffboxError(f"cannot sync --include {inc!r}: excluded ancestor {anc!r} contains "
+                                  f"{len(descendants)} tracked files (limit {MAX_TRACKED_INCLUDE_FILES}); "
+                                  f"offbox can't send only the named path there. {INCLUDE_WORKAROUND}", code=2)
+            guarded.add(anc)
+            reopen.update(descendants)
+    # Plain sync sends ignored tracked files in pass 2. Reopen the same eligible files here,
+    # closing every intermediate directory so their untracked siblings are never traversed.
+    reopened_dirs: set[str] = set()
+    for path in sorted(reopen):
+        real = _disk_path(root, path, names)
+        if real is None or _offbox_skips(path) or _offbox_skips(real):
+            continue
+        if real != path:
+            # Mixing index/include aliases with disk spellings bypasses rsync's case-sensitive guards.
+            raise _include_alias_refused(includes[0], path, real)
+        if not (root / real).is_symlink() and (root / real).is_dir():
+            continue  # A submodule must not authorize its whole working tree.
+        parts = real.split("/")
+        for i in range(1, len(parts)):
+            parent = "/".join(parts[:i])
+            if parent not in reopened_dirs:
+                f.append(f"--filter=+ /{_literal_filter_path(parent)}/")
+                reopened_dirs.add(parent)
+            if any(parent == anc or parent.startswith(anc + "/") for anc in guarded):
+                guarded.add(parent)
+        f.append(f"--filter=+ /{_literal_filter_path(real)}")
+    # Close only after all requested and tracked paths have been opened (rsync's first match wins).
     for anc in sorted(guarded, key=lambda a: (-a.count("/"), a)):
-        f.append(f"--filter=- /{anc}/*")
+        f.append(f"--filter=- /{_literal_filter_path(anc, wildcard=True)}/*")
     # An include under an ignored dir (tmp/) makes rsync walk that dir, and --delete would then remove the box's own
     # files there (31 Oct: root-owned tmp/localstack, written by the LocalStack container, failed the sync with 23).
     # Protect the rest of that dir on the box; the included path itself still mirrors.
     for top in _ignored_include_tops(root, includes) if is_git else []:
-        f.append(f"--filter=P /{top}/**")
+        f.append(f"--filter=P /{_literal_filter_path(top, wildcard=True)}/**")
     for t in SAFE_ENV_TEMPLATES:
         f.append(f"--filter=+ {t}")
     for x in SECRET_EXCLUDES:
@@ -437,6 +585,11 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
         f.append(f"--filter=- {x}")
     f.append("--filter=:- .gitignore")
     f += _gitinfo_exclude(root)
+    # A file count alone cannot bound argv when tracked files have distinct deep parents.
+    # Leave half of macOS ARG_MAX for the environment and rsync's other arguments.
+    if includes and (size := sum(len(os.fsencode(arg)) + 1 for arg in f)) > MAX_INCLUDE_FILTER_BYTES:
+        raise OffboxError(f"cannot sync --include {includes[0]!r}: include filters need {size} bytes "
+                          f"(limit {MAX_INCLUDE_FILTER_BYTES}). {INCLUDE_WORKAROUND}", code=2)
     return f
 
 
@@ -444,7 +597,7 @@ def tracked_secret_matches(root: Path, includes: list[str] | None) -> list[str]:
     """Git-tracked files the secret filters skip (e.g. a committed sample configs/.env). Shown as a hint only."""
     import fnmatch
     try:
-        p = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=20)
+        p = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=20, cwd=str(root))
     except Exception:  # noqa: BLE001
         return []
     if p.returncode != 0:
@@ -481,6 +634,13 @@ def _seen(out: str) -> set[str]:
     return seen
 
 
+@lru_cache(maxsize=8)
+def _skip_component_pattern(patterns: tuple[str, ...]) -> re.Pattern:
+    import fnmatch
+    # One compiled match avoids a Python fnmatch loop over every rule for every path component.
+    return re.compile("|".join(fnmatch.translate(os.path.normcase(p)) for p in patterns))
+
+
 def _offbox_skips(path: str) -> bool:
     """True when the secret or heavy excludes cover the path (a dir rule covers everything below it)."""
     import fnmatch
@@ -488,7 +648,8 @@ def _offbox_skips(path: str) -> bool:
     if any(fnmatch.fnmatch(parts[-1], t) for t in SAFE_ENV_TEMPLATES):
         parts = parts[:-1]
     pats = [x.rstrip("/") for x in SECRET_EXCLUDES + HEAVY_EXCLUDES]
-    if any(fnmatch.fnmatch(seg, pat) for seg in parts for pat in pats if "/" not in pat):
+    pattern = _skip_component_pattern(tuple(p for p in pats if "/" not in p))
+    if any(pattern.match(os.path.normcase(seg)) for seg in parts):
         return True
     joined = "/" + "/".join(parts)
     return any(joined.endswith("/" + pat) or ("/" + pat + "/") in joined for pat in pats if "/" in pat)
@@ -537,7 +698,7 @@ def _tracked_skipped(root: Path, seen: set[str]) -> list[str]:
     """Git-tracked files pass 1 left out, other than secret/heavy ones. Those are .gitignore matches (a tracked
     package-lock.json, 31 Oct) or rsync reading .gitignore more broadly than git (`test/*`, `!` lines)."""
     try:
-        p = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=20)
+        p = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=20, cwd=str(root))
     except Exception:  # noqa: BLE001 - no git: pass 1 is the whole sync, as before
         return []
     if p.returncode != 0:
@@ -586,7 +747,12 @@ def push(box_id: str, root: Path, remote_dir: str, with_git: bool = False, timeo
          includes: list[str] | None = None, seed_candidates: list[str] | None = None,
          run_id: str | None = None) -> dict:
     with toollog.span("sync", "run.sync", ids={"run": run_id, "box": box_id}, tag="sync_failed") as data:
-        result = _push(box_id, root, remote_dir, with_git, timeout, includes, seed_candidates, run_id)
+        try:
+            result = _push(box_id, root, remote_dir, with_git, timeout, includes, seed_candidates, run_id)
+        except (OffboxError, OSError) as error:
+            if not root.is_dir():
+                raise common.SourceGone(root) from error
+            raise
         data["props"].update(bytes=result.get("sent", 0), files=result.get("files", 0),
                              skipped=result.get("skipped", 0))
         return result
@@ -605,11 +771,160 @@ def _push(box_id: str, root: Path, remote_dir: str, with_git: bool = False, time
             extra = _push_git(box_id, gitdir, remote_dir, timeout, run_id=run_id)
             for key, value in extra.items():
                 st[key] = st.get(key, 0) + value
+        verified = _verify_content(box_id, root, remote_dir, _tracked_content(root, includes), timeout, run_id)
+        for key, value in verified.items():
+            st[key] = st.get(key, 0) + value
     st["seconds"] = round(time.time() - t, 2)
     st["secret_skips"] = tracked_secret_matches(root, includes)
     st["skipped"] = len(st["secret_skips"])
     log(f"push {box_id} {root} -> {remote_dir} {st}")
     return st
+
+
+def _content_signature(path: Path) -> tuple[str, str]:
+    try:
+        info = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return ("missing", "")
+    if stat.S_ISLNK(info.st_mode):
+        data = os.fsencode(os.readlink(path))
+        return ("link", hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest())
+    if stat.S_ISDIR(info.st_mode):
+        return ("dir", "")
+    if not stat.S_ISREG(info.st_mode):
+        return ("other", "")
+    h = hashlib.sha1(b"blob " + str(info.st_size).encode() + b"\0")
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(chunk)
+    return ("file", h.hexdigest())
+
+
+def _tracked_content(root: Path, includes: list[str] | None) -> dict[str, tuple[str, str]]:
+    p = subprocess.run(["git", "-C", str(root), "ls-files", "--stage", "-z"], capture_output=True,
+                       env=git_snapshot._git_env(), timeout=30, cwd=str(root))
+    if p.returncode:
+        # Plain directories are supported too. A broken index in a repository must fail closed.
+        probe = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-dir"],
+                               capture_output=True, env=git_snapshot._git_env(), timeout=30, cwd=str(root))
+        if probe.returncode and not os.path.lexists(root / ".git"):
+            return {}
+        raise OffboxError("cannot list tracked content for sync; nothing ran")
+    entries = [raw for raw in p.stdout.split(b"\0") if raw]
+    deleted = subprocess.run(["git", "-C", str(root), "diff", "--cached", "--raw", "-z",
+                              "--diff-filter=D", "--no-renames"], capture_output=True,
+                             env=git_snapshot._git_env(), timeout=30, cwd=str(root))
+    if deleted.returncode:
+        raise OffboxError("cannot list staged deletions for sync; nothing ran")
+    rows = deleted.stdout.split(b"\0")
+    for meta, raw_path in zip(rows[::2], rows[1::2]):
+        # A file merely untracked with git rm --cached still exists and stays outside verification.
+        if not os.path.lexists(root / os.fsdecode(raw_path)):
+            entries.append(meta[1:7] + b" \t" + raw_path)
+    names, result = {}, {}
+    inc = [i.strip("/") for i in includes or []]
+    for raw in entries:
+        entry, _, raw_path = raw.partition(b"\t")
+        if entry.startswith(b"160000 "):
+            continue
+        path = os.fsdecode(raw_path)
+        real = _disk_path(root, path, names)
+        if real is None:
+            # Do not inspect descendants hidden behind a symlinked parent.
+            if any((root / Path(path).parents[i]).is_symlink() for i in range(len(Path(path).parents) - 1)):
+                continue
+            real = path
+        if real == ".git" or real.startswith(".git/"):
+            continue
+        included = any(real == i or real.startswith(i + "/") for i in inc)
+        if not included and (_offbox_skips(path) or (real != path and _offbox_skips(real))):
+            continue
+        try:
+            sig = _content_signature(root / real)
+        except OSError as e:
+            raise OffboxError(f"cannot hash tracked file {real!r}; nothing ran") from e
+        if sig[0] == "other":
+            raise OffboxError(f"unsupported tracked file type {real!r}; nothing ran")
+        result[real] = sig
+    return result
+
+
+# Run the same raw Git-blob hash on both hosts: no git installation, filters, index or history needed remotely.
+_CONTENT_CHECK = '''import hashlib,json,os,stat,sys
+def signature(path):
+    try:
+        if any(os.path.islink(os.path.join(*path.split('/')[:i])) for i in range(1,len(path.split('/')))):
+            return ('other','')
+        info=os.lstat(path)
+        if stat.S_ISLNK(info.st_mode):
+            data=os.fsencode(os.readlink(path))
+            return ('link',hashlib.sha1(b'blob '+str(len(data)).encode()+b'\\0'+data).hexdigest())
+        if stat.S_ISDIR(info.st_mode): return ('dir','')
+        if not stat.S_ISREG(info.st_mode): return ('other','')
+        h=hashlib.sha1(b'blob '+str(info.st_size).encode()+b'\\0')
+        with open(path,'rb') as stream:
+            for chunk in iter(lambda:stream.read(1024*1024),b''): h.update(chunk)
+        return ('file',h.hexdigest())
+    except (FileNotFoundError,NotADirectoryError): return ('missing','')
+    except OSError: return ('unreadable','')
+rows=json.load(sys.stdin)
+print(json.dumps([p for p,want in rows.items() if list(signature(p))!=want]))
+'''
+
+
+def _content_mismatches(box_id: str, remote_dir: str, expected: dict, timeout: float) -> list[str]:
+    command = f'cd -- {shlex.quote(remote_dir)} && python3 -I -c {shlex.quote(_CONTENT_CHECK)}'
+    p = ssh(box_id, command, input=json.dumps(expected).encode(), timeout=min(timeout, 120), check=True)
+    try:
+        bad = json.loads(p.stdout)
+        if not isinstance(bad, list) or any(not isinstance(x, str) or x not in expected for x in bad):
+            raise ValueError("unexpected paths")
+        return bad
+    except (ValueError, TypeError) as e:
+        raise OffboxError("invalid tracked-content verification response; nothing ran") from e
+
+
+def _content_event(box_id: str, paths: list[str], repaired: bool, run_id: str | None) -> None:
+    con = common.db()
+    try:
+        common.event(con, box_id, "sync_content_mismatch", json.dumps(
+            {"run_id": run_id, "path_count": len(paths), "repaired": repaired,
+             "paths": [p[:200] for p in paths[:5]]}, ensure_ascii=False))
+    finally:
+        con.close()
+
+
+def _verify_content(box_id: str, root: Path, remote_dir: str, expected: dict, timeout: float,
+                    run_id: str | None) -> dict:
+    if not expected:
+        return {"verified": 0, "repaired": 0}
+    t = time.monotonic()
+    bad = _content_mismatches(box_id, remote_dir, expected, timeout)
+    result = {"verified": len(expected), "repaired": 0}
+    if bad:
+        repaired = False
+        try:
+            cmd = [RSYNC, "-az", "--checksum", "--from0", "--files-from=-", "--delete-missing-args",
+                   "--no-o", "--no-g", "--omit-dir-times", "--stats", "--timeout=120",
+                   "-e", " ".join(shlex.quote(x) for x in ssh_base(box_id)),
+                   f"{root}/", f"{box_id}:{remote_dir}/"]
+            extra = _stats(_rsync(box_id, remote_dir, cmd, timeout, files="\0".join(bad) + "\0",
+                                  source=root, phase="content-repair", run_id=run_id))
+            for key in ("sent", "received", "files", "xfer"):
+                result[key] = extra.get(key, 0)
+            remaining = _content_mismatches(box_id, remote_dir, expected, timeout)
+            if remaining:
+                raise OffboxError(f"tracked content differs after checksum repair: {remaining[:20]!r}; nothing ran")
+            repaired = True
+            result["repaired"] = len(bad)
+        except (common.SshHostKeyMismatch, StartWaitFailed):
+            raise
+        except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
+            raise OffboxError(f"tracked content repair failed for {bad[:20]!r}: {e}; nothing ran") from e
+        finally:
+            _content_event(box_id, bad, repaired, run_id)
+    result["verify_seconds"] = round(time.monotonic() - t, 3)
+    return result
 
 
 class BoxStoppedDuringPush(OffboxError):
@@ -670,7 +985,7 @@ def _kill_rsync(proc) -> None:
         pass
 
 
-def _watch_rsync(cmd, timeout, input=None, *, on_stall=None, on_progress=None):
+def _watch_rsync(cmd, timeout, input=None, *, on_stall=None, on_progress=None, cwd=None):
     """One attempt with independent pipe draining and a wall/idle bound, reusable by artifact pulls."""
     started = last = time.monotonic()
     chunks = [[], []]
@@ -678,7 +993,7 @@ def _watch_rsync(cmd, timeout, input=None, *, on_stall=None, on_progress=None):
     lock = threading.Lock()
     changed = threading.Event()
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True, cwd=cwd)
 
     def read(stream, index):
         nonlocal last, count, sent, source_sent
@@ -752,22 +1067,33 @@ def _watch_rsync(cmd, timeout, input=None, *, on_stall=None, on_progress=None):
     return subprocess.CompletedProcess(cmd, proc.returncode, _without_progress(out), err)
 
 
-def _bounded_command(cmd, timeout, *, stdout=None):
+def _bounded_command(cmd, timeout, *, stdout=None, capture_stderr=False):
     # A pipe's communicate()/wait() cleanup can itself hang after SIGKILL on an uninterruptible filesystem call.
     # A temporary file lets us abandon an unreaped helper without waiting for EOF or blocking a reader thread.
-    with tempfile.TemporaryFile() if stdout is None else nullcontext(stdout) as output:
-        proc = subprocess.Popen(cmd, stdout=output, stderr=subprocess.DEVNULL, start_new_session=True)
+    with (tempfile.TemporaryFile() if stdout is None else nullcontext(stdout)) as output, \
+            (tempfile.TemporaryFile() if capture_stderr else nullcontext(None)) as errors:
+        proc = subprocess.Popen(cmd, stdout=output, stderr=errors if capture_stderr else subprocess.DEVNULL,
+                                start_new_session=True)
         try:
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
+                if capture_stderr:
+                    errors.seek(0)
+                    stderr = errors.read()
+                    if _host_key_error(stderr):
+                        return subprocess.CompletedProcess(cmd, 255, b"", stderr)
                 return None
             if stdout is None:
                 output.seek(0)
                 data = output.read()
             else:
                 data = b""
-            return subprocess.CompletedProcess(cmd, proc.returncode, data, b"")
+            stderr = b""
+            if capture_stderr:
+                errors.seek(0)
+                stderr = errors.read()
+            return subprocess.CompletedProcess(cmd, proc.returncode, data, stderr)
         finally:
             if proc.poll() is None:
                 try:
@@ -799,11 +1125,14 @@ def _remote_stall(box_id: str, timeout: float) -> tuple[str, str | None]:
         # A separate connection must not wait behind the stalled multiplexed session.
         cmd = ssh_base(box_id) + ["-o", "ControlMaster=no", "-o", "ControlPath=none", box_id,
                                   "ps -eo pid,ppid,stat,wchan:32,etime,comm,args"]
-        p = _bounded_command(cmd, timeout)
+        p = _bounded_command(cmd, timeout, capture_stderr=api.BACKEND == "server")
         if p is None:
             return "remote_probe=unavailable", None
         if p.returncode:
+            check_host_key(box_id, p.stderr)
             return "remote_probe=failed", None
+    except (common.SshHostKeyMismatch, StartWaitFailed):
+        raise
     except (OffboxError, OSError, subprocess.TimeoutExpired):
         return "remote_probe=unavailable", None
     states, prune, blocked = [], [], None
@@ -861,6 +1190,8 @@ def _refresh_master(box_id, *, close=True, refresh=True):
     for action in ([close_master] if close else []) + ([setup] if refresh else []):
         try:
             action(box_id)
+        except StartWaitFailed:
+            raise
         except (OffboxError, OSError, subprocess.TimeoutExpired):
             pass
 
@@ -885,7 +1216,16 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
                        f"{_sync_wait(source_sent)}")
 
         try:
-            p = _watch_rsync(cmd, left, input=input, on_stall=stalled, on_progress=progress)
+            if api.BACKEND == "server" and "-e" in cmd:
+                # setup can change the proxy endpoint between rsync attempts.
+                with api.budget(left):
+                    cmd[cmd.index("-e") + 1] = shlex.join(ssh_base(box_id))
+            p = _watch_rsync(cmd, left, input=input, on_stall=stalled, on_progress=progress,
+                             cwd=str(source) if source is not None else None)
+        except FileNotFoundError:
+            if source is not None and not source.is_dir():
+                raise common.SourceGone(source) from None
+            raise
         except SyncStalled:
             with api.budget(max(0, deadline - time.monotonic())):
                 _refresh_master(box_id, refresh=False)
@@ -905,6 +1245,11 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
                 _refresh_master(box_id, close=False)
             stalls += 1
             continue
+        if (p.returncode == 3 and source is not None and not source.is_dir()
+                and re.search(r'(?:getcwd\(\)|change_dir)[^\n]*No such file', p.stderr)):
+            raise common.SourceGone(source)
+        if p.returncode:
+            check_host_key(box_id, p.stderr.encode(errors="replace"))
         if p.returncode not in (255, 12):
             return p
         old = _endpoint(box_id)
@@ -915,6 +1260,8 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
         try:
             with api.budget(max(0, deadline - time.monotonic())):
                 state = (api.get(box_id) or {}).get("state")
+        except StartWaitFailed:
+            raise
         except (OffboxError, OSError, subprocess.TimeoutExpired):
             state = None
         if state and state not in api.LIVE_STATES:
@@ -950,6 +1297,8 @@ def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float, *, run
     finally:
         try:
             ssh(box_id, f"rm -rf -- {qstage}", check=True, timeout=5)
+        except (common.SshHostKeyMismatch, StartWaitFailed):
+            raise
         except (OffboxError, OSError, subprocess.TimeoutExpired):
             log(f"push_git cleanup failed {box_id} {staging}")
 
@@ -988,6 +1337,8 @@ def _push_file_passes(box_id: str, root: Path, remote_dir: str, with_git: bool, 
     cmd = [RSYNC, "-az", "--delete", "--mkpath", "--no-o", "--no-g", "--omit-dir-times", "--stats",
            "--timeout=120", "-e", ssh_cmd, "-ii", "-8", f"--out-format={ITEM}%i %n"]
     if sibling:
+        # --copy-dest otherwise trusts size + whole-second mtime across different working trees.
+        cmd.append("--checksum")
         cmd.append(f"--copy-dest=../{sibling.split('/')[-1]}")
     cmd += push_filters(root, with_git, includes)
     cmd += [f"{root}/", f"{box_id}:{remote_dir}/"]
@@ -1079,6 +1430,8 @@ def _pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path
     cmd = [RSYNC, "-az", "--no-o", "--no-g", "--stats", "-e", " ".join(shlex.quote(x) for x in ssh_base(box_id)),
            f"{box_id}:{rbase}/{path}", f"{dest}/"]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if p.returncode:
+        check_host_key(box_id, p.stderr.encode(errors="replace"))
     st = _stats(p.stdout)
     st["ok"] = p.returncode == 0
     if p.returncode != 0:

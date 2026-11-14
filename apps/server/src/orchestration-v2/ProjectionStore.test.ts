@@ -38,6 +38,7 @@ import * as Tracer from "effect/Tracer";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
 import { projectThreadAwarenessV2 } from "@t3tools/shared/agentAwareness";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { liveColumns } from "../ardud/persistence/historyArchiveSql.ts";
@@ -1308,6 +1309,116 @@ const threadWorktreePathsIncludeArchivedOnRequest = Effect.gen(function* () {
   ]);
 });
 
+it.effect.each([
+  ["memory", ProjectionStore.layerMemory],
+  ["SQL", layerTest],
+] as const)(
+  "%s worktree IDs match the exact path and branch across active and archived threads",
+  ([implementation, layer]) =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const worktreePath = "/worktrees/feature's checkout";
+      const branch = "t3/abcd1234";
+      const create = (
+        id: string,
+        input: {
+          worktreePath: string | null;
+          branch: string | null;
+          archived?: boolean;
+          projectId?: ProjectId;
+        },
+      ) => {
+        const threadId = ThreadId.make(`thread:worktree-ids:${id}`);
+        const thread = {
+          createdBy: "user" as const,
+          creationSource: "web" as const,
+          id: threadId,
+          projectId: input.projectId ?? ProjectId.make("project:worktree-ids"),
+          title: id,
+          providerInstanceId,
+          modelSelection,
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          branch: input.branch,
+          worktreePath: input.worktreePath,
+          activeProviderThreadId: null,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: input.archived === true ? now : null,
+          settledOverride: null,
+          settledAt: null,
+          lastVisitedAt: null,
+          deletedAt: null,
+        };
+        return store
+          .apply({
+            id: EventId.make(`event:${threadId}:created`),
+            type: "thread.created",
+            threadId,
+            occurredAt: now,
+            payload: thread,
+          })
+          .pipe(Effect.as(thread));
+      };
+      const active = yield* create("z-active", { worktreePath, branch });
+      const archived = yield* create("a-archived", { worktreePath, branch, archived: true });
+      const otherProject = yield* create("other-project", {
+        worktreePath,
+        branch,
+        projectId: ProjectId.make("project:other-worktree-ids"),
+      });
+      yield* create("other-branch", { worktreePath, branch: "feature/other" });
+      yield* create("other-path", { worktreePath: "/worktrees/other", branch });
+      yield* create("child-path", { worktreePath: `${worktreePath}/child`, branch });
+      yield* create("path-case", { worktreePath: worktreePath.toUpperCase(), branch });
+      yield* create("branch-case", { worktreePath, branch: branch.toUpperCase() });
+      yield* create("no-branch", { worktreePath, branch: null });
+      yield* create("no-worktree", { worktreePath: null, branch });
+      const deleted = yield* create("deleted", { worktreePath, branch });
+      yield* store.apply({
+        id: EventId.make("event:worktree-ids:deleted"),
+        type: "thread.deleted",
+        threadId: deleted.id,
+        occurredAt: now,
+        payload: { ...deleted, deletedAt: now },
+      });
+
+      const { statements, tracer } = traceSqlStatements();
+      assert.deepEqual(
+        yield* store
+          .getThreadIdsForWorktree({ worktreePath, branch })
+          .pipe(Effect.withTracer(tracer)),
+        [archived.id, otherProject.id, active.id],
+      );
+      if (implementation === "SQL") {
+        assert.lengthOf(statements, 1);
+        assert.match(statements[0]!, /SELECT thread_id\s+FROM orchestration_v2_projection_threads/);
+      }
+      assert.deepEqual(
+        yield* store.getThreadIdsForWorktree({ worktreePath: "/worktrees/missing", branch }),
+        [],
+      );
+      yield* store.apply({
+        id: EventId.make("event:worktree-ids:renamed"),
+        type: "thread.metadata-updated",
+        threadId: active.id,
+        occurredAt: now,
+        payload: { ...active, branch: "feature/renamed" },
+      });
+      assert.deepEqual(yield* store.getThreadIdsForWorktree({ worktreePath, branch }), [
+        archived.id,
+        otherProject.id,
+      ]);
+      assert.deepEqual(
+        yield* store.getThreadIdsForWorktree({ worktreePath, branch: "feature/renamed" }),
+        [active.id],
+      );
+    }).pipe(Effect.provide(layer)),
+);
+
 const commandReadsSkipSettledLeafNodes = Effect.gen(function* () {
   const store = yield* ProjectionStore.ProjectionStoreV2;
   const now = yield* DateTime.now;
@@ -1585,11 +1696,12 @@ it.effect("memory recovery selects unfinished runless native subagents", () =>
   runlessNativeSubagentNeedsRecovery.pipe(Effect.provide(ProjectionStore.layerMemory)),
 );
 
-for (const [name, layer] of [
+it.effect.each([
   ["memory", ProjectionStore.layerMemory],
   ["SQL", layerTest],
-] as const) {
-  it.effect(`${name} excludes shared bindings but retains dedicated sessions for recovery`, () =>
+] as const)(
+  "%s excludes shared bindings but retains dedicated sessions for recovery",
+  ([, layer]) =>
     Effect.gen(function* () {
       const store = yield* ProjectionStore.ProjectionStoreV2;
       const threadId = yield* addRolledBackRecoveryCandidate("shared-session-selection");
@@ -1655,8 +1767,7 @@ for (const [name, layer] of [
       }
       assert.isEmpty(yield* store.getLiveSharedProviderSessions());
     }).pipe(Effect.provide(layer)),
-  );
-}
+);
 
 const assertProjectScopedShells = Effect.fn("assertProjectScopedShells")(function* (
   suffix: string,
@@ -2134,6 +2245,28 @@ it.effect("one shared session update carrier survives SQL rebuild and memory rep
 });
 
 it.layer(layerTest)("ProjectionStoreV2", (it) => {
+  it.effect("metadata-only record reads do not open a writer transaction", () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate("metadata-only");
+      let commits = 0;
+      const read = yield* store.getThreadRecords(threadId, []).pipe(
+        Effect.provideService(NodeSqliteClient.TransactionCommitObserver, () => {
+          commits++;
+        }),
+      );
+      assert.deepEqual(read, { thread: yield* store.getThread(threadId) });
+      assert.equal(commits, 0);
+      const records = yield* store.getThreadRecords(threadId, ["runs"]).pipe(
+        Effect.provideService(NodeSqliteClient.TransactionCommitObserver, () => {
+          commits++;
+        }),
+      );
+      assert.isNotEmpty(records.runs);
+      assert.equal(commits, 1);
+    }),
+  );
+
   it.effect("returns a typed read error for malformed stored plan JSON", () =>
     Effect.gen(function* () {
       const store = yield* ProjectionStore.ProjectionStoreV2;
@@ -2241,6 +2374,13 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       // The unfinished first run stays; of the finished ones only the newest two.
       assert.deepEqual(yield* ordinals({ recentRunLimit: 2 }), [1, 4, 5]);
       assert.deepEqual(yield* ordinals({ recentRunLimit: 10 }), [1, 2, 3, 4, 5]);
+      assert.deepEqual(yield* ordinals({ latestRunOnly: true }), [5]);
+      assert.deepEqual(yield* ordinals({ latestRunOnly: true, runIds: [first.id] }), []);
+      assert.deepEqual(yield* ordinals({ latestRunOnly: true, runIds: [] }), []);
+      assert.deepEqual(
+        yield* ordinals({ latestRunOnly: true, runIds: [RunId.make("run:recent-run-limit:5")] }),
+        [5],
+      );
       assert.deepEqual(yield* ordinals({}), [1, 2, 3, 4, 5]);
     }),
   );

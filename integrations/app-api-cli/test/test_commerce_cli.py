@@ -350,7 +350,7 @@ class MinutesOrderTests(unittest.TestCase):
             self.assertEqual(c.cvv_from_keychain(),b'007')
         command=run.call_args.args[0]
         self.assertEqual(command,['security','find-generic-password','-s','robob-card',
-                                   '-a','Marriott.card_cvc','-w'])
+                                   '-a',c.order_card.CVV_ACCOUNT,'-w'])
         # stdout/stderr are captured pipes; the CVV never becomes an argument.
         self.assertTrue(run.call_args.kwargs['stdout'] is not None)
         for bad in (Mock(returncode=1,stdout=b''),Mock(returncode=0,stdout=b'12x\n'),

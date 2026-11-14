@@ -27,6 +27,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from offbox_lib.startup_health import starting_phase, wait_seconds
+
 HOME = Path.home()
 
 DOWN_AFTER = 2            # failed checks in a row, with the Mac online, before home is down
@@ -166,7 +168,9 @@ def health_facts(data):
     return {"mode": clean(data.get("mode"), 20), "reasons": [clean(r) for r in reasons[:8]],
             "pool": clean(pool.get("state"), 20), "mdraid": clean(mdraid.get("state"), 20),
             "boot_id": clean(data.get("boot_id"), 64), "version": clean(data.get("version"), 40),
-            "uptime_s": number("uptime_s"), "boatd_uptime_s": number("boatd_uptime_s")}
+            "uptime_s": number("uptime_s"), "boatd_uptime_s": number("boatd_uptime_s"),
+            "starting": bool(starting_phase(data)), "phase": clean(starting_phase(data)),
+            "startedAt": number("startedAt")}
 
 
 def check_health(url):
@@ -340,7 +344,7 @@ def fresh_state(now):
 def load_state(sdir, now):
     state = fresh_state(now)
     saved = read_json(Path(sdir) / "home-monitor.json", None)
-    if isinstance(saved, dict) and saved.get("state") in ("home_up", "home_down"):
+    if isinstance(saved, dict) and saved.get("state") in ("home_up", "home_down", "home_starting"):
         state.update(saved)
     return state
 
@@ -389,6 +393,31 @@ def step(state, obs, now):
     if started is not None and 0 <= now - started < MIN_SPACING_S:
         return "indeterminate", ["skipped: too soon after the last check"]
     state["last_start"] = now
+
+    health = check.get("health") or {}
+    phase = starting_phase(health)
+    if not check["ok"] and phase:
+        observed = state.get("starting_since")
+        process_start = health.get("startedAt")
+        if isinstance(process_start, (int, float)) and not isinstance(process_start, bool) and 0 < process_start <= now:
+            observed = min(observed, process_start) if observed is not None else process_start
+        if observed is None:
+            observed = now
+        state["starting_since"] = observed
+        duration = now - observed
+        if duration < wait_seconds():
+            if state["state"] == "home_down":
+                state["starting_from_down"] = True
+            state.update(state="home_starting", reason="", bad_streak=0, good_streak=0, last_check=now)
+            return "starting", [f"state=home_starting phase={clean(phase)} duration_s={duration:.1f}"]
+        check = dict(check, error="not_ok", health=dict(health, reasons=[
+            f"home still starting after {wait_seconds():g} s ({phase})"]))
+    elif check["ok"] and state.get("starting_since") is not None:
+        events.append(f"startup_ready duration_s={now - state.pop('starting_since'):.1f}")
+    else:
+        state.pop("starting_since", None)
+    if not phase and state["state"] == "home_starting":
+        state.update(state="home_down" if state.pop("starting_from_down", False) else "home_up", since=now)
 
     if check["ok"]:
         verdict = "good"
@@ -707,6 +736,8 @@ def _tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac
             log(sdir, f"check-good good_streak={state['good_streak']} state={state['state']}"
                       + (" degraded" if state["degraded"] else ""))
         for event in events:
+            if event.startswith(("state=home_starting", "startup_ready")):
+                log(sdir, event)
             if event in ("down", "up"):
                 log(sdir, f"state={state['state']} outage={outage_id} "
                           f"down_count={(state.get('outage') or {}).get('down_count', 0)}")

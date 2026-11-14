@@ -221,43 +221,49 @@ export const configuredConnection = (
  * The OpenCode server to read: the opencode provider's configured server URL
  * and password, else the local shared service's `service.json`.
  */
-export const resolveConnection = (input: {
+export const resolveConnection = Effect.fn("OpenCodeHttp.resolveConnection")(function* (input: {
   readonly settings: Option.Option<ServerSettings.ServerSettingsService["Service"]>;
   readonly homeDir: string;
-}) =>
-  Effect.gen(function* () {
-    if (Option.isSome(input.settings)) {
-      const settings = yield* input.settings.value.getSettings.pipe(Effect.option);
-      if (Option.isSome(settings)) {
-        const opencode = openCodeServerConfig(settings.value.providerInstances);
-        if (opencode !== undefined) {
-          return {
-            baseUrl: opencode.serverUrl.replace(/\/+$/, ""),
-            authorization: basic(opencode.serverPassword),
-          } satisfies OpenCodeConnection;
-        }
+}) {
+  if (Option.isSome(input.settings)) {
+    const settings = yield* input.settings.value.getSettings.pipe(Effect.option);
+    if (Option.isSome(settings)) {
+      const opencode = openCodeServerConfig(settings.value.providerInstances);
+      if (opencode !== undefined) {
+        return {
+          baseUrl: opencode.serverUrl.replace(/\/+$/, ""),
+          authorization: basic(opencode.serverPassword),
+        } satisfies OpenCodeConnection;
       }
     }
-    const fs = yield* FileSystem.FileSystem;
-    const path = yield* Path.Path;
-    const file = path.join(input.homeDir, ".local", "state", "opencode", "service.json");
-    const service = yield* fs.readFileString(file).pipe(
-      Effect.flatMap(decodeServiceFile),
-      Effect.mapError((cause) => new OpenCodeHttpError({ operation: "read service file", cause })),
-    );
-    return {
-      baseUrl: service.url.replace(/\/+$/, ""),
-      authorization: basic(service.password),
-    } satisfies OpenCodeConnection;
-  });
+  }
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const file = path.join(input.homeDir, ".local", "state", "opencode", "service.json");
+  const service = yield* fs.readFileString(file).pipe(
+    Effect.flatMap(decodeServiceFile),
+    Effect.mapError(
+      (cause) => new OpenCodeHttpError({ operation: "read service file", cause }),
+    ),
+  );
+  return {
+    baseUrl: service.url.replace(/\/+$/, ""),
+    authorization: basic(service.password),
+  } satisfies OpenCodeConnection;
+});
 
-const getJson = <A>(
+const getJson: <A>(
   connection: OpenCodeConnection,
   path: string,
   operation: string,
   decode: (input: unknown) => Effect.Effect<A, Schema.SchemaError>,
-) =>
-  Effect.gen(function* () {
+) => Effect.Effect<A, OpenCodeHttpError> = Effect.fn("OpenCodeHttp.getJson")(
+  function* <A>(
+    connection: OpenCodeConnection,
+    path: string,
+    operation: string,
+    decode: (input: unknown) => Effect.Effect<A, Schema.SchemaError>,
+  ) {
     const client = yield* HttpClient.HttpClient;
     const response = yield* client.execute(
       HttpClientRequest.get(`${connection.baseUrl}${path}`).pipe(
@@ -269,20 +275,24 @@ const getJson = <A>(
       return yield* new OpenCodeHttpError({ operation, status: response.status });
     }
     return yield* decode(yield* response.json);
-  }).pipe(
-    Effect.timeoutOrElse({
-      duration: "60 seconds",
-      orElse: () => Effect.fail(new OpenCodeHttpError({ operation: `${operation} (timed out)` })),
-    }),
-    Effect.mapError((cause) =>
-      isOpenCodeHttpError(cause) ? cause : new OpenCodeHttpError({ operation, cause }),
+  },
+  (effect, _connection, _path, operation, _decode) =>
+    effect.pipe(
+      Effect.timeoutOrElse({
+        duration: "60 seconds",
+        orElse: () =>
+          Effect.fail(new OpenCodeHttpError({ operation: `${operation} (timed out)` })),
+      }),
+      Effect.mapError((cause) =>
+        isOpenCodeHttpError(cause) ? cause : new OpenCodeHttpError({ operation, cause }),
+      ),
+      Effect.provide(FetchHttpClient.layer),
     ),
-    Effect.provide(FetchHttpClient.layer),
-  );
+);
 
 // ardud: abort only needs the status, not the response body.
-const post = (connection: OpenCodeConnection, path: string, operation: string) =>
-  Effect.gen(function* () {
+const post = Effect.fn("OpenCodeHttp.post")(
+  function* (connection: OpenCodeConnection, path: string, operation: string) {
     const client = yield* HttpClient.HttpClient;
     const response = yield* client.execute(
       HttpClientRequest.post(`${connection.baseUrl}${path}`).pipe(
@@ -293,12 +303,15 @@ const post = (connection: OpenCodeConnection, path: string, operation: string) =
     if (response.status < 200 || response.status >= 300) {
       return yield* new OpenCodeHttpError({ operation, status: response.status });
     }
-  }).pipe(
-    Effect.mapError((cause) =>
-      isOpenCodeHttpError(cause) ? cause : new OpenCodeHttpError({ operation, cause }),
+  },
+  (effect, _connection, _path, operation) =>
+    effect.pipe(
+      Effect.mapError((cause) =>
+        isOpenCodeHttpError(cause) ? cause : new OpenCodeHttpError({ operation, cause }),
+      ),
+      Effect.provide(FetchHttpClient.layer),
     ),
-    Effect.provide(FetchHttpClient.layer),
-  );
+);
 
 const query = (params: Record<string, string | number | undefined>) => {
   const search = new URLSearchParams();
@@ -316,7 +329,7 @@ export const abortSession = (connection: OpenCodeConnection, sessionId: string) 
  * Pages a list newest first. `keepGoing` sees each page and can stop early;
  * later requests send only the cursor, which carries the original filters.
  */
-const pageNewestFirst = <A>(input: {
+const pageNewestFirst = Effect.fn("OpenCodeHttp.pageNewestFirst")(function* <A>(input: {
   readonly connection: OpenCodeConnection;
   readonly path: string;
   readonly first: Record<string, string | number | undefined>;
@@ -329,28 +342,27 @@ const pageNewestFirst = <A>(input: {
     Schema.SchemaError
   >;
   readonly keepGoing: (page: ReadonlyArray<A>, collected: number) => boolean;
-}) =>
-  Effect.gen(function* () {
-    const items: Array<A> = [];
-    let cursor: string | undefined;
-    for (;;) {
-      const page = yield* getJson(
-        input.connection,
-        `${input.path}?${query(cursor === undefined ? input.first : { limit: input.first.limit, cursor })}`,
-        input.operation,
-        input.decode,
-      );
-      items.push(...page.data);
-      cursor = page.cursor?.next ?? undefined;
-      if (
-        page.data.length === 0 ||
-        cursor === undefined ||
-        !input.keepGoing(page.data, items.length)
-      ) {
-        return items;
-      }
+}) {
+  const items: Array<A> = [];
+  let cursor: string | undefined;
+  for (;;) {
+    const page = yield* getJson(
+      input.connection,
+      `${input.path}?${query(cursor === undefined ? input.first : { limit: input.first.limit, cursor })}`,
+      input.operation,
+      input.decode,
+    );
+    items.push(...page.data);
+    cursor = page.cursor?.next ?? undefined;
+    if (
+      page.data.length === 0 ||
+      cursor === undefined ||
+      !input.keepGoing(page.data, items.length)
+    ) {
+      return items;
     }
-  });
+  }
+});
 
 /** Root sessions, newest first. `updatedSince` stops paging once pages get older. */
 export const listRootSessions = (
@@ -398,27 +410,27 @@ export const listModelSlugs = (connection: OpenCodeConnection, directory: string
  * Up to `limit` of the session's newest messages, oldest first, stopping at
  * `afterId` when given. `truncated` means older messages were left out.
  */
-export const listRecentMessages = (
+export const listRecentMessages = Effect.fn("OpenCodeHttp.listRecentMessages")(function* (
   connection: OpenCodeConnection,
   sessionId: string,
   options: { readonly limit: number; readonly afterId?: string },
-) =>
-  Effect.gen(function* () {
-    const fetched = yield* pageNewestFirst({
-      connection,
-      path: `/api/session/${encodeURIComponent(sessionId)}/message`,
-      first: { limit: Math.min(100, options.limit + 1), order: "desc" },
-      operation: "list messages",
-      decode: decodeMessagePage,
-      keepGoing: (page, collected) =>
-        collected <= options.limit &&
-        (options.afterId === undefined || !page.some((message) => message.id === options.afterId)),
-    });
-    const afterIndex =
-      options.afterId === undefined
-        ? -1
-        : fetched.findIndex((message) => message.id === options.afterId);
-    const newer = afterIndex >= 0 ? fetched.slice(0, afterIndex) : fetched;
-    const kept = newer.slice(0, options.limit);
-    return { messages: kept.toReversed(), truncated: newer.length > kept.length };
+) {
+  const fetched = yield* pageNewestFirst({
+    connection,
+    path: `/api/session/${encodeURIComponent(sessionId)}/message`,
+    first: { limit: Math.min(100, options.limit + 1), order: "desc" },
+    operation: "list messages",
+    decode: decodeMessagePage,
+    keepGoing: (page, collected) =>
+      collected <= options.limit &&
+      (options.afterId === undefined ||
+        !page.some((message) => message.id === options.afterId)),
   });
+  const afterIndex =
+    options.afterId === undefined
+      ? -1
+      : fetched.findIndex((message) => message.id === options.afterId);
+  const newer = afterIndex >= 0 ? fetched.slice(0, afterIndex) : fetched;
+  const kept = newer.slice(0, options.limit);
+  return { messages: kept.toReversed(), truncated: newer.length > kept.length };
+});
