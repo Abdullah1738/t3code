@@ -212,9 +212,11 @@ class AlertText(unittest.TestCase):
         import subprocess
         charge = dict(kind='charge', currency='AED', amount='1.00', card='1111', merchant='noon')
         now = dt.datetime(2026, 10, 24, tzinfo=TZ)
-        result = {'orders': [{'order': 'N1', 'total': '1.00', 'currency': 'AED',
+        result = {'orders': [{'service': 'minutes', 'order': 'N1', 'total': '1.00', 'currency': 'AED',
                               'placed_at': now.isoformat()}], 'complete': True}
-        memo = {}
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        memo = {('orders_cache',): Path(cache_dir.name) / 'cache.json'}
         with patch.object(ch.time, 'time', return_value=1000), \
                 patch.object(ch, 'receipt', return_value=None), \
                 patch.object(ch, 'card_owner', return_value='abdullah'), \

@@ -1154,7 +1154,7 @@ def read(row, deadline=None, **_):
 
 def finder(*rows):
     """A fake msgs search; charges.py itself keeps rows by time, sender and source."""
-    def find(query, since, until=None, source=None, n=20, deadline=None):
+    def find(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None):
         return [r for r in rows if source is None or r['source'] == source]
     return find
 
@@ -2151,7 +2151,7 @@ class Questions(Base):
                           f'Subject: Usage notice\nFile: /m/{nid}.emlx\n\nYour card 1111 was used for AED 12.34 at Acme. Avl limit.')
         reads = []
 
-        def find(query, since, until=None, source=None, n=20, deadline=None):
+        def find(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None):
             return sorted([receipt] + notices, key=lambda r: -r['ts'])[:n]
 
         def read(row, deadline=None, **_):
@@ -2823,6 +2823,32 @@ class CheckBudget(Base):
             q['id'] = f'q-budget{n}'
         mc.write_json(self.data / 'questions.json', book)
         return book
+
+    def test_limit_only_check_saves_limits_and_never_asks(self):
+        now = at('2026-11-10T12:00')
+        book = self.seed([now - dt.timedelta(days=3)])
+        book['questions'][0]['merchant'] = 'careem'
+        mc.write_json(self.data / 'questions.json', book)
+        limit = mc.charges.order_lookup.SourceLimit('ORDER_LIST_HOST_BINDING_UNVERIFIED')
+        # Use the native source-limit path, with all other evidence readable and empty.
+        with patch.object(mc.charges, 'receipt', return_value=None), \
+                patch.object(mc.charges.order_lookup, 'read', side_effect=limit), \
+                patch.object(mc.charges, 'card_owner', return_value='abdullah'):
+            event = mc.run_check(self.wd, 'limited', self.data, self.root, now, finder(), nobody)
+        state = json.loads((self.wd / 'pings.json').read_text())
+        self.assertFalse(state.get('question_errors'))
+        self.assertEqual(len(state['question_limits']['limits']), 1)
+        q = self.questions()[0]
+        self.assertTrue(q['unverified'])
+        self.assertEqual(q['asks'], [])
+        self.assertFalse(q.get('case_opened'))
+        self.assertEqual(event, '')
+        logs = list((self.tmp / 'tool-logs' / 'orders').glob('*.ndjson'))
+        rows = [json.loads(line) for path in logs for line in path.read_text().splitlines()]
+        run = next(r for r in rows if r['name'] == 'check.run')
+        self.assertTrue(run['ok'])
+        self.assertEqual(run['props']['sourceLimits'], 1)
+        self.assertEqual(run['props']['limitKinds'], ['ORDER_LIST_HOST_BINDING_UNVERIFIED'])
 
     def test_slow_lookups_leave_time_for_due_case_event(self):
         self.case()
