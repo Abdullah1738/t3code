@@ -210,7 +210,9 @@ const makeWorld = (
         cards: (id) =>
           Effect.sync(() => ticking.listedBoards.push(id)).pipe(Effect.andThen(store.cards(id))),
         openCards: (id) =>
-          Effect.sync(() => ticking.listedBoards.push(id)).pipe(Effect.andThen(store.openCards(id))),
+          Effect.sync(() => ticking.listedBoards.push(id)).pipe(
+            Effect.andThen(store.openCards(id)),
+          ),
         boards: beforeRead(true).pipe(
           Effect.andThen(store.boards),
           Effect.map((boards) =>
@@ -800,6 +802,47 @@ it.effect("waitCard accepts a cross-board target and refuses a nonexistent targe
       assert.isTrue(Result.isFailure(missing));
       assert.strictEqual((yield* cardOf(dependent.id)).wait?.card, target.id);
     }),
+  ),
+);
+
+it.effect("card changes carry foreign wait target metadata without persisting it", () =>
+  inWorld(() =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      const foreign = yield* kanban.ensureBoard({
+        slug: "foreign",
+        name: "Foreign",
+        defaultProjectId: null,
+      });
+      const target = yield* placed(foreign, "Dependency", { stage: "in_review" });
+      const dependent = yield* placed(board, "Dependent");
+      const changes = yield* kanban.changes;
+      yield* kanban.waitCard(
+        dependent.id,
+        { on: "card", card: target.id, note: "dependency" },
+        owner,
+      );
+      const changed = yield* Stream.runHead(
+        changes.pipe(
+          Stream.filter(
+            ({ change }) =>
+              change._tag === "card" &&
+              change.card.id === dependent.id &&
+              change.card.wait?.on === "card",
+          ),
+        ),
+      );
+      assert.isTrue(Option.isSome(changed));
+      if (Option.isSome(changed) && changed.value.change._tag === "card") {
+        assert.deepStrictEqual(changed.value.change.card.wait?.cardTarget, {
+          id: target.id,
+          number: target.number,
+          boardId: foreign.id,
+          boardName: "Foreign",
+        });
+      }
+      assert.isUndefined((yield* store.card(dependent.id))?.wait?.cardTarget);
+    }).pipe(Effect.scoped),
   ),
 );
 
@@ -2579,7 +2622,7 @@ it.effect.each(["completed", "deployed"] as const)(
           const restarted = yield* KanbanService.KanbanService;
           yield* restarted.tick;
         }).pipe(Effect.provide(KanbanService.layer));
-        assert.deepStrictEqual((yield* cardOf(card.id)).wait, moved.wait);
+        assert.deepStrictEqual((yield* store.card(card.id))?.wait, moved.wait);
         yield* store.putCard({ ...(yield* cardOf(dependency.id)), stage: "completed" });
         yield* kanban.tick;
         yield* world.waitForTold(card.id);

@@ -432,6 +432,27 @@ describe("tilePlace", () => {
     ]);
   });
 
+  it.each([
+    ["foreign", "board-foreign", "Foreign", "foreign", "#73 (Foreign)"],
+    ["same board outside page", "board-toy", null, "foreign", "#73"],
+    ["missing metadata", null, null, "foreign", null],
+    ["stale metadata", "board-foreign", "Foreign", "old-target", null],
+  ] as const)("names a card wait with %s metadata", (_name, boardId, boardName, hintId, label) => {
+    const waiting = card(1, {
+      stage: "in_review",
+      movedAt: ago(20 * DAY),
+      wait: wait("card", {
+        card: "foreign",
+        ...(boardId === null ? {} : { cardTarget: { id: hintId, number: 73, boardId, boardName } }),
+      }),
+    });
+    expect(say(placed(waiting, [card(73)]))).toEqual(
+      label === null
+        ? ["Held behind another card", "Wakes itself when that card is done"]
+        : [`Held behind ${label}`, `Wakes itself when ${label} is done`],
+    );
+  });
+
   it("marks a wait guessed from the card's notes as a guess", () => {
     const guessed = placed(
       card(1, {

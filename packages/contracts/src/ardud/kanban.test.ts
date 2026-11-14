@@ -1072,6 +1072,21 @@ describe("KanbanCard wait", () => {
     );
   });
 
+  it("round-trips optional wait target metadata and still reads old waits", () => {
+    const original = card("stored", { wait: wait({ on: "card", card: "foreign" as never }) });
+    const roundTrip = (value: KanbanCard) =>
+      Schema.decodeUnknownSync(KanbanCard)(Schema.encodeSync(KanbanCard)(value));
+    expect(roundTrip(original).wait?.cardTarget).toBeUndefined();
+    const cardTarget = {
+      id: "foreign" as never,
+      number: 73,
+      boardId: "board-foreign" as never,
+      boardName: "Foreign",
+    };
+    const shown = { ...original, wait: { ...original.wait!, cardTarget } };
+    expect(roundTrip(shown).wait?.cardTarget).toEqual(cardTarget);
+  });
+
   it("drops the wait key, not sets it to undefined", () => {
     const cleared = kanbanWithoutWait(card("w", { wait: wait() }));
     expect("wait" in cleared).toBe(false);

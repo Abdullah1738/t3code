@@ -2309,10 +2309,62 @@ const make = Effect.gen(function* () {
 
   const nowIso = DateTime.now.pipe(Effect.map(DateTime.formatIso));
   const nowMillis = DateTime.now.pipe(Effect.map(DateTime.toEpochMillis));
+  const withWaitTargets = Effect.fn("KanbanService.withWaitTargets")(function* (
+    cards: ReadonlyArray<KanbanCard>,
+  ) {
+    const targets = new Map<string, KanbanCard | null>(cards.map((card) => [card.id, card]));
+    const names = new Map<KanbanBoardId, string>();
+    for (const id of new Set(
+      cards.flatMap((card) =>
+        card.wait?.on === "card" && card.wait.card !== null ? [card.wait.card] : [],
+      ),
+    )) {
+      if (!targets.has(id)) targets.set(id, yield* rawStore.card(KanbanCardId.make(id)));
+    }
+    return yield* Effect.forEach(cards, (card) =>
+      Effect.gen(function* () {
+        const wait = card.wait;
+        if (wait?.on !== "card" || wait.card === null) return card;
+        const target = targets.get(wait.card);
+        if (!target) return { ...card, wait: { ...wait, cardTarget: null } };
+        let boardName: string | null = null;
+        if (target.boardId !== card.boardId) {
+          boardName =
+            names.get(target.boardId) ??
+            (yield* rawStore.board(target.boardId))?.name ??
+            target.boardId;
+          names.set(target.boardId, boardName);
+        }
+        return {
+          ...card,
+          wait: {
+            ...wait,
+            cardTarget: {
+              id: target.id,
+              number: target.number,
+              boardId: target.boardId,
+              boardName,
+            },
+          },
+        };
+      }),
+    );
+  });
   const publish = (boardId: KanbanBoard["id"], change: KanbanChange) =>
     Effect.flatMap(publicationSink, (sink) => {
       if (sink === undefined)
-        return PubSub.publish(changes, { boardId, change }).pipe(Effect.asVoid);
+        return Effect.gen(function* () {
+          const shown =
+            change._tag === "card"
+              ? {
+                  ...change,
+                  card: (yield* withWaitTargets([change.card]).pipe(
+                    Effect.catchCause(() => Effect.succeed([change.card])),
+                  ))[0]!,
+                }
+              : change;
+          yield* PubSub.publish(changes, { boardId, change: shown });
+        });
       sink.push({ boardId, change });
       return Effect.void;
     });
@@ -2540,7 +2592,9 @@ const make = Effect.gen(function* () {
     deferThreads = false,
   ) {
     const board = yield* boardOf(boardId);
-    const cards = yield* feed ? store.feedCards(boardId, page) : store.cards(boardId);
+    const cards = yield* withWaitTargets(
+      yield* feed ? store.feedCards(boardId, page) : store.cards(boardId),
+    );
     const live = liveThreadIds(cards);
     const states = deferThreads ? [] : yield* Effect.forEach(live, threadState, { concurrency: 8 });
     const discussions = yield* store.discussions(boardId);
@@ -15516,7 +15570,13 @@ const make = Effect.gen(function* () {
         return yield* failWith("invalid", `fields must be KanbanCard keys: ${valid.join(",")}`);
       const keys = new Set(["id", "number", "updatedAt", ...fields]);
       const rows = yield* readDb(
-        rawStore.cardPage(input.board, { after, limit: limit + 1, open: input.open ?? false }),
+        rawStore
+          .cardPage(input.board, { after, limit: limit + 1, open: input.open ?? false })
+          .pipe(
+            Effect.flatMap((rows) =>
+              keys.has("wait") ? withWaitTargets(rows) : Effect.succeed(rows),
+            ),
+          ),
       );
       const cards: Array<Partial<KanbanCard>> = [];
       let bytes = 0;
@@ -15546,7 +15606,7 @@ const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const card = yield* cardOf(cardId);
           return {
-            card,
+            card: (yield* withWaitTargets([card]))[0]!,
             events: yield* store.cardEvents(cardId),
             threads: yield* store.threadLinks({ cardId }),
           } satisfies CardDetail;
@@ -15576,7 +15636,11 @@ const make = Effect.gen(function* () {
       ),
     cardByNumber: (boardId, number) => readDb(store.cardByNumber(boardId, number)),
     cards: (boardId, options) =>
-      readDb(options?.includeSettled === false ? store.openCards(boardId) : store.cards(boardId)),
+      readDb(
+        (options?.includeSettled === false ? store.openCards(boardId) : store.cards(boardId)).pipe(
+          Effect.flatMap(withWaitTargets),
+        ),
+      ),
     createCard,
     editCard,
     moveCard,

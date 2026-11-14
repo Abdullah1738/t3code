@@ -908,6 +908,17 @@ export const KanbanWait = Schema.Struct({
   pr: Schema.NullOr(TrimmedNonEmptyString).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   /** card: the card it waits on. */
   card: Schema.NullOr(KanbanCardId).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** Read-time identity for targets outside the board's card list; never used to decide a wake. */
+  cardTarget: Schema.optionalKey(
+    Schema.NullOr(
+      Schema.Struct({
+        id: KanbanCardId,
+        number: PositiveInt,
+        boardId: KanbanBoardId,
+        boardName: Schema.NullOr(TrimmedNonEmptyString),
+      }),
+    ),
+  ),
   /** owner_go: the open ask (q1, q2...) whose answer ends it. */
   ask: Schema.NullOr(TrimmedNonEmptyString).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   /** time: when it ends. Any other kind: when it counts as stuck, instead of the kind's default. */

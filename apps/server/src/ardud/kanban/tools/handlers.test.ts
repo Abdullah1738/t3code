@@ -4169,7 +4169,7 @@ it.effect("card_wait sets a push wait from the card's last review, logs it and c
 it.effect("card_wait accepts a cross-board waitsOn id", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {
-    const { kanban, card } = yield* waitFixture;
+    const { kanban, store, card } = yield* waitFixture;
     const foreign = yield* kanban.ensureBoard({
       slug: "foreign",
       name: "Foreign",
@@ -4191,6 +4191,26 @@ it.effect("card_wait accepts a cross-board waitsOn id", () => {
     const detail = yield* kanban.card(card.id);
     assert.deepInclude(detail.card.wait, { on: "card", card: target.id, wakeRole: "evaluator" });
     assert.include(detail.events.at(-1)?.body ?? "", `#${target.number} (Foreign)`);
+    const summary = yield* call(evaluatorThread, "board_get", { boardId: card.boardId });
+    assert.isFalse(summary.isError, summary.text);
+    assert.include(JSON.stringify(summary.structured), `Waiting for card #${target.number} (Foreign)`);
+    const paged = yield* call(evaluatorThread, "board_get", { boardId: card.boardId, limit: 1 });
+    assert.include(JSON.stringify(paged.structured), `Waiting for card #${target.number} (Foreign)`);
+    const expectedTarget = { id: target.id, number: target.number, boardId: foreign.id, boardName: "Foreign" };
+    assert.deepStrictEqual(detail.card.wait?.cardTarget, expectedTarget);
+    const read = yield* call(evaluatorThread, "card_get", { card: card.id });
+    assert.include(JSON.stringify(read.structured), `"boardName":"Foreign"`);
+    const apiPage = yield* kanban.cardPage({ board: card.boardId, fields: ["wait"], limit: 1 });
+    assert.deepStrictEqual(apiPage.cards[0]?.wait?.cardTarget, expectedTarget);
+    assert.deepStrictEqual((yield* kanban.cards(card.boardId)).find((entry) => entry.id === card.id)?.wait?.cardTarget, expectedTarget);
+    for (const snapshot of [yield* kanban.snapshot(card.boardId), yield* kanban.replySnapshot(card.boardId)]) {
+      assert.isFalse(snapshot.cards.some((entry) => entry.id === target.id));
+      assert.deepStrictEqual(snapshot.cards.find((entry) => entry.id === card.id)?.wait?.cardTarget, expectedTarget);
+    }
+    assert.isUndefined((yield* store.card(card.id))?.wait?.cardTarget, "display metadata is not persisted");
+    yield* kanban.updateBoard(foreign.id, { name: "Renamed foreign" });
+    assert.strictEqual((yield* kanban.card(card.id)).card.wait?.cardTarget?.boardName, "Renamed foreign");
+    yield* kanban.updateBoard(foreign.id, { name: "Foreign" });
     const moved = yield* call(evaluatorThread, "card_move", { card: card.id, to: "todo" });
     assert.isFalse(moved.isError, moved.text);
     assert.include(String(moved.structured.message), `#${target.number} (Foreign)`);

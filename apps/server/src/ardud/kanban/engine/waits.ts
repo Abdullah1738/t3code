@@ -264,7 +264,11 @@ export function waitTarget(wait: KanbanWait, cards?: WaitFacts["cards"]): string
     case "owner_go":
       return `the owner's answer${wait.ask === null ? "" : ` to ${wait.ask}`}`;
     case "card": {
-      const target = wait.card === null ? undefined : cards?.get(wait.card);
+      const target =
+        wait.card === null
+          ? undefined
+          : (cards?.get(wait.card) ??
+            (wait.cardTarget?.id === wait.card ? wait.cardTarget : undefined));
       return target
         ? `card #${target.number}${target.boardName ? ` (${target.boardName})` : ""}`
         : "another card";
@@ -590,7 +594,8 @@ export const waitEventOf = (
   if (event.kind === "wait_cleared" || event.kind === "wait_expired") return "end";
   if (event.kind !== "edited" || event.body === null) return null;
   if (event.body.startsWith("Waiting ")) return "set";
-  if (event.body.startsWith("Wait ended: ") || event.body.startsWith("Wait expired: ")) return "end";
+  if (event.body.startsWith("Wait ended: ") || event.body.startsWith("Wait expired: "))
+    return "end";
   return null;
 };
 
