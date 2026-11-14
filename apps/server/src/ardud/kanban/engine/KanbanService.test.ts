@@ -22586,16 +22586,6 @@ it.live("a quiet tick reads the board without waiting for the SQLite writer", ()
         },
       });
       const run = tick.pipe(
-        // Snapshot transactions acquire once; observe each statement's actual
-        // connection even when its trace has no separate acquisition span.
-        Effect.provideService(NodeSqliteClient.StatementObserver, {
-          slowThresholdMs: 0,
-          record: (observation) =>
-            Effect.gen(function* () {
-              const span = yield* Effect.currentSpan;
-              span.attribute("db.connection", observation.connection);
-            }).pipe(Effect.orDie),
-        }),
         Effect.provideService(Statement.SpanPropagationEnabled, true),
         Effect.withTracer(tracer),
       );

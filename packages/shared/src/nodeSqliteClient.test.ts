@@ -934,6 +934,126 @@ it.effect("keeps read-only work inside a write transaction on the writer", () =>
   ),
 );
 
+it.effect.each(["reader", "writer", "writer worker"] as const)(
+  "labels each transaction statement on the %s without changing borrower attributes",
+  (connection) => {
+    const spans: Tracer.NativeSpan[] = [];
+    const writes = new Map<Tracer.NativeSpan, Array<[string, unknown]>>();
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        const recorded: Array<[string, unknown]> = [];
+        writes.set(span, recorded);
+        const attribute = span.attribute.bind(span);
+        span.attribute = (key, value) => {
+          recorded.push([key, value]);
+          attribute(key, value);
+        };
+        spans.push(span);
+        return span;
+      },
+    });
+    const run = (sql: SqlClient.SqlClient) =>
+      Effect.gen(function* () {
+        const transaction = sql.withTransaction(
+          Effect.gen(function* () {
+            assert.deepEqual(yield* sql`SELECT 1 AS value`, [{ value: 1 }]);
+            assert.deepEqual(yield* sql`SELECT 2 AS value`.values, [[2]]);
+          }),
+        );
+        yield* connection === "reader" ? transaction.pipe(SqliteClient.readOnly) : transaction;
+        yield* connection === "reader" ? sql`SELECT 3`.pipe(SqliteClient.readOnly) : sql`SELECT 3`;
+      }).pipe(
+        Effect.provideService(Statement.SpanPropagationEnabled, true),
+        Effect.withTracer(tracer),
+        Effect.map(() => {
+          assert.deepEqual(
+            spans.map((span) => span.name),
+            ["sql.transaction", "sqlite", "sqlite", "sqlite"],
+          );
+          const statements = spans.filter((span) => span.name === "sqlite");
+          const expected = connection === "reader" ? "reader" : "writer";
+          for (const span of statements) {
+            assert.equal(span.attributes.get("db.connection"), expected);
+            assert.equal(
+              span.attributes.get("db.reader.lane"),
+              connection === "reader" ? "background" : undefined,
+            );
+          }
+          for (const span of statements.slice(0, 2)) {
+            assert.deepEqual(
+              [...span.attributes].filter(
+                ([key]) => key.startsWith("db.reader.") || key === "db.lock_wait_ms",
+              ),
+              connection === "reader" ? [["db.reader.lane", "background"]] : [],
+            );
+            assert.deepEqual(
+              writes.get(span)!.filter(([key]) => key === "db.connection"),
+              [["db.connection", expected]],
+            );
+          }
+          const plain = statements[2]!;
+          assert.equal(plain.attributes.get("db.lock_wait_ms"), 0);
+          assert.equal(plain.attributes.get("db.reader.acquired"), true);
+          assert.equal(plain.attributes.get("db.reader.waiting"), false);
+          assert.equal(plain.attributes.get("db.reader.acquire_stage"), "slot");
+          assert.deepEqual(
+            writes
+              .get(plain)!
+              .filter(([key]) => key === "db.connection" || key === "db.reader.lane"),
+            connection === "reader"
+              ? [
+                  ["db.connection", "reader"],
+                  ["db.reader.lane", "background"],
+                  ["db.connection", "reader"],
+                  ["db.reader.lane", "background"],
+                ]
+              : [
+                  ["db.connection", "writer"],
+                  ["db.connection", "writer"],
+                ],
+          );
+        }),
+      );
+    return connection === "writer"
+      ? Effect.flatMap(SqlClient.SqlClient, run).pipe(
+          Effect.provide(SqliteClient.layer({ filename: ":memory:" })),
+        )
+      : withReaderClient(run);
+  },
+);
+
+it.effect.each(["tracer", "propagation"] as const)(
+  "leaves the parent span alone when statement %s is disabled",
+  (gate) => {
+    const spans: Tracer.NativeSpan[] = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    return Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* gate === "tracer"
+        ? sql`SELECT 1`.pipe(Effect.withTracerEnabled(false))
+        : sql`SELECT 1`.pipe(Effect.provideService(Statement.SpanPropagationEnabled, false));
+    }).pipe(
+      Effect.withSpan("sqlite"),
+      Effect.provide(SqliteClient.layer({ filename: ":memory:" })),
+      Effect.provideService(Statement.SpanPropagationEnabled, true),
+      Effect.withTracer(tracer),
+      Effect.map(() => {
+        const parent = spans.find((span) => span.name === "sqlite")!;
+        assert.isDefined(parent);
+        assert.isFalse(parent.attributes.has("db.connection"));
+        assert.isFalse(parent.attributes.has("db.reader.lane"));
+      }),
+    );
+  },
+);
+
 it.effect("labels SQL spans with their connection and how long they waited for its lock", () => {
   const spans: Array<Tracer.NativeSpan> = [];
   const tracer = Tracer.make({
@@ -979,7 +1099,9 @@ it.effect("labels SQL spans with their connection and how long they waited for i
         ["sql.transaction", "writer", 0],
         ["sqlite", "writer", 25],
         ["sql.transaction", "writer", 25],
+        ["sqlite", "writer", undefined],
         ["sql.transaction", "reader", 0],
+        ["sqlite", "reader", undefined],
       ]);
     }),
   );
