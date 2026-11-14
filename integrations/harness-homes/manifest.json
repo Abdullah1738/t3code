@@ -89,6 +89,9 @@
       }
     ],
     "live-database": [
+      "../harness-hooks/bin/live-db-snapshot",
+      "../harness-hooks/src/live_db_snapshot.py",
+      "../harness-hooks/src/snapshot_guard.py",
       "../harness-hooks/src/statev2_guard.py",
       "../harness-hooks/src/engine.py",
       {
