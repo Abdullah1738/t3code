@@ -51,3 +51,30 @@ for (const publishing of [true, false]) test(`slow scan with replica publishing=
   }
   assert.deepEqual(state.handled, {});
 });
+
+for (const lane of ['restart', 'stream']) test(`${lane} resolves each slow ancestry traversal in its own snapshot`, async t => {
+  fixture(t);
+  let clock = Date.now();
+  const now = clock, ended = new Date(now - 120_000).toISOString();
+  t.mock.method(Date, 'now', () => clock);
+  const check = db => {
+    if (clock - db.at > 45_000) throw Object.assign(new Error('stale ancestry snapshot'), {code:'REPLICA_UNAVAILABLE'});
+  };
+  const subs = [0, 1, 2].map(i => ({subagent_id:`sub:${i}`,run_id:`run:${i}`,
+    thread_id:`thread:provider:fixture:native-thread:ses_${i}`,completed_at:ended,result:null}));
+  let traversals = 0;
+  const io = {
+    PATHS:{db:'fixture'}, openDb:() => ({at:clock,close(){}}), assertReplicaFresh:check,
+    serverRuntime:() => null, openCodeRuntime:() => null,
+    cancelledSubagentsSince:() => lane === 'restart' ? subs : [],
+    cancelledDelegatedTasksSince:() => [], restartRunsSince:() => [],
+    failedRunsSince:() => lane === 'stream' ? [{run_id:'failed',thread_id:'parent',completed_at:ended,
+      error:'The OpenCode event stream was lost and could not reconnect.'}] : [],
+    failedSubagentsSince:() => lane === 'stream' ? subs : [],
+    subagentParent:db => {check(db);clock+=30_000;traversals++;return 'parent';},
+    threadRoot:db => {check(db);return null;}, activeSessions:async () => new Set(), getThread:async () => null,
+    sendToThread:() => assert.fail('must not send'), telegram:() => assert.fail('must not notify'),
+  };
+  await recoveryScan({opts:{dryRun:true,maxAgeHours:6},state:{handled:{},servers:[]},now},io);
+  assert.equal(traversals,3);
+});

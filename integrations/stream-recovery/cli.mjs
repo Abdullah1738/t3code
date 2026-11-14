@@ -286,8 +286,10 @@ export async function recoveryScan({ opts, state, now }, io = realIo) {
         log(`${incident.id}: seeded (no action)`);
         continue;
       }
-      refreshDb();
-      for (const s of incident.subagents) s.parentThreadId = topParent(io, db, s.thread_id);
+      for (const s of incident.subagents) {
+        refreshDb();
+        s.parentThreadId = topParent(io, db, s.thread_id);
+      }
       const threadIds = [...new Set([
         ...incident.runs.map((r) => r.thread_id),
         ...incident.subagents.map((s) => s.parentThreadId).filter(Boolean),
