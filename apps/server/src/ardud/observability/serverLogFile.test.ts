@@ -6,6 +6,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Redactable from "effect/Redactable";
 import * as Redacted from "effect/Redacted";
 import * as TestClock from "effect/testing/TestClock";
@@ -13,6 +14,90 @@ import * as TestClock from "effect/testing/TestClock";
 import * as ServerLogFile from "./serverLogFile.ts";
 
 it.layer(NodeServices.layer)("server file logger", (it) => {
+  // Every asynchronous filesystem step that can fail while reopening must let
+  // subsequent timer and shutdown flushes initialize a fresh sink.
+  it.effect.each([
+    { operation: "makeDirectory", flush: "timer" },
+    { operation: "makeDirectory", flush: "shutdown" },
+    { operation: "readDirectory", flush: "timer" },
+    { operation: "readDirectory", flush: "shutdown" },
+    { operation: "stat", flush: "timer" },
+    { operation: "stat", flush: "shutdown" },
+  ] as const)(
+    "recovers from maintenance $operation failure on $flush flush",
+    ({ operation, flush }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "server-log-reopen-" });
+        const filePath = path.join(root, "server.log");
+        const written = yield* Deferred.make<void>();
+        let failReopen = false;
+        const failure = PlatformError.systemError({
+          _tag: "PermissionDenied",
+          module: "FileSystem",
+          method: operation,
+        });
+        yield* Effect.gen(function* () {
+          const { logger, withMaintenance } = yield* ServerLogFile.make({
+            filePath,
+            maxBytes: 1024,
+          });
+          const log = (text: string) =>
+            Effect.logInfo(text).pipe(
+              Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+            );
+          yield* log("before-maintenance" + "x".repeat(600));
+          const result = yield* withMaintenance(
+            Effect.gen(function* () {
+              assert.include(yield* fs.readFileString(filePath), "before-maintenance");
+              yield* log("during-maintenance");
+              yield* fs.writeFileString(filePath, "{}\n");
+              failReopen = true;
+            }),
+          ).pipe(Effect.exit);
+          assert.equal(result._tag, "Failure");
+          failReopen = false;
+          yield* log("after-disk-recovered" + "x".repeat(300));
+          if (flush === "timer") {
+            yield* TestClock.adjust("1 second");
+            yield* Deferred.await(written);
+            assert.include(yield* fs.readFileString(filePath), "after-disk-recovered");
+          }
+        }).pipe(
+          Effect.scoped,
+          Effect.provideService(FileSystem.FileSystem, {
+            ...fs,
+            makeDirectory: (target, options) =>
+              failReopen && operation === "makeDirectory"
+                ? Effect.fail(failure)
+                : fs.makeDirectory(target, options),
+            readDirectory: (target) =>
+              failReopen && operation === "readDirectory"
+                ? Effect.fail(failure)
+                : fs.readDirectory(target),
+            stat: (target) =>
+              failReopen && operation === "stat" ? Effect.fail(failure) : fs.stat(target),
+            writeFile: (target, data, options) =>
+              fs
+                .writeFile(target, data, options)
+                .pipe(
+                  Effect.tap(() =>
+                    Buffer.from(data).includes("after-disk-recovered")
+                      ? Deferred.succeed(written, undefined)
+                      : Effect.void,
+                  ),
+                ),
+          }),
+        );
+        const text = yield* fs.readFileString(filePath);
+        assert.include(text, "after-disk-recovered");
+        assert.notInclude(text, "before-maintenance");
+        assert.notInclude(text, "during-maintenance");
+        assert.deepEqual(yield* fs.readDirectory(root), ["server.log"]);
+      }),
+  );
+
   it.effect("flushes while the server is alive and drains the tail on shutdown", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

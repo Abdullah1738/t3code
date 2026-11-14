@@ -159,7 +159,13 @@ export const make = Effect.fn("serverLogFile.make")(function* (options: {
               Effect.provideService(Path.Path, path),
               Effect.exit,
             );
-            if (Exit.isFailure(reopened)) return yield* new TraceMaintenanceError({});
+            if (Exit.isFailure(reopened)) {
+              // The rewrite may have changed file size. Accept later logs, but
+              // reinitialize before appending so the old sink cannot rotate them.
+              repairTail = true;
+              paused = false;
+              return yield* new TraceMaintenanceError({});
+            }
             sink = reopened.value;
             paused = false;
             if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause);
