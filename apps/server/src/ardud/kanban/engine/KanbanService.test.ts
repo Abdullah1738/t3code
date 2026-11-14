@@ -31602,6 +31602,7 @@ it.effect.each(
       const before = yield* lifecycle.queuedRuns(work);
       expectedCancellations = cancellations + 4;
       if (mode === "delayed cleanup") {
+        const workerId = work;
         return yield* Effect.gen(function* () {
           const departure = yield* Effect.forkChild(
             kanban.reviewResult(card.activeThreadId!, "findings", ["Fix queue ordering"]),
@@ -31629,14 +31630,14 @@ it.effect.each(
             departed.events.filter((event) => event.kind === "review"),
             1,
           );
-          yield* kanban.claimCard(work, card.id);
+          yield* kanban.claimCard(workerId, card.id);
           assert.equal((yield* kanban.card(card.id)).card.stage, "working");
           const fresh = yield* lifecycle.send({
-            threadId: work,
+            threadId: workerId,
             text: "Fresh owner reminder",
             coalesce: `owner:${card.id}`,
           });
-          assert.isTrue((yield* lifecycle.queuedRuns(work)).some((run) => run.id === fresh));
+          assert.isTrue((yield* lifecycle.queuedRuns(workerId)).some((run) => run.id === fresh));
         }).pipe(Effect.ensuring(Deferred.succeed(releaseCleanup, undefined)));
       }
       if (action === "review to todo") {
