@@ -239,7 +239,7 @@ class LoggingTests(unittest.TestCase):
             state=jobs.read_state('disk-inventory')
             for children in state.get('childState',{}).values():
                 for value in children.values():
-                    value['at']-=3600
+                    value['at']-=86400
             jobs.save_state('disk-inventory',state)
         value=[100]
         def run(cmd,**kwargs):

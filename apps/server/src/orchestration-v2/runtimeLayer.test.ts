@@ -84,7 +84,11 @@ import * as ProviderRuntimeRecoveryService from "./ProviderRuntimeRecoveryServic
 import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as PullRequestWatchReactor from "./PullRequestWatchReactor.ts";
-import { PULL_REQUEST_WATCH_WAKE_LIMIT } from "./pullRequestWatch.ts";
+import {
+  PULL_REQUEST_WATCH_WAKE_LIMIT,
+  evaluatePullRequestWatch,
+  pullRequestWatchMessage,
+} from "./pullRequestWatch.ts";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as ProjectStore from "./ProjectStore.ts";
@@ -3185,11 +3189,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
-  it.effect("drops a conflict wake when its stored head moves during the read", () =>
+  it.effect.each(["conflict", "checks"])("drops a %s wake after a push", (kind) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const threadId = ThreadId.make("runtime-pr-watch-stale-conflict");
-      const projectId = ProjectId.make("pr-watch-stale-conflict-project");
+      const threadId = ThreadId.make(`runtime-pr-watch-stale-${kind}`);
+      const projectId = ProjectId.make(`pr-watch-stale-${kind}-project`);
       yield* seedProject({
         projectId,
         title: "Conflict watch",
@@ -3201,7 +3205,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         type: "thread.create",
         createdBy: "user",
         creationSource: "web",
-        commandId: CommandId.make("stale-conflict-create"),
+        commandId: CommandId.make(`stale-${kind}-create`),
         threadId,
         projectId,
         title: "Conflict watch",
@@ -3214,7 +3218,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const watch = (watching: boolean, id: string) =>
         orchestrator.dispatch({
           type: "thread.pull-request.watch",
-          commandId: CommandId.make(`stale-conflict-${id}`),
+          commandId: CommandId.make(`stale-${kind}-${id}`),
           threadId,
           host: "github.com",
           repository: "pingdotgg/t3code",
@@ -3238,7 +3242,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
                 assert.isDefined(current);
                 yield* orchestrator.dispatch({
                   type: "thread.pull-request-watch.sync",
-                  commandId: CommandId.make("stale-conflict-move"),
+                  commandId: CommandId.make(`stale-${kind}-move`),
                   threadId,
                   host: "github.com",
                   repository: "pingdotgg/t3code",
@@ -3260,7 +3264,17 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
                 }),
                 headSha: "aaaaaaaaaa",
                 baseSha: "f77c1992e5e9",
-                checks: [],
+                checks:
+                  kind === "checks" && moveDuringRead
+                    ? [
+                        {
+                          name: "aggregate",
+                          status: "failure" as const,
+                          description: null,
+                          url: null,
+                        },
+                      ]
+                    : [],
                 mergeability,
               };
             }).pipe(Effect.orDie),
@@ -9127,4 +9141,507 @@ it.effect.each([
       assert.equal(admittedWait?.status, "completed");
     }).pipe(Effect.provide(layerRestartPacingTest(() => load)));
   },
+);
+
+it.effect.each([
+  {
+    mode: "failure",
+    legacy: false,
+    moveAtStart: false,
+    returnToHeadA: false,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "passed",
+    legacy: true,
+    moveAtStart: false,
+    returnToHeadA: false,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "failure",
+    legacy: true,
+    moveAtStart: true,
+    returnToHeadA: false,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "mixed",
+    legacy: false,
+    moveAtStart: false,
+    returnToHeadA: false,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "mixed",
+    legacy: true,
+    moveAtStart: true,
+    returnToHeadA: false,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "remarks",
+    legacy: false,
+    moveAtStart: false,
+    returnToHeadA: false,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "failure",
+    legacy: false,
+    moveAtStart: false,
+    returnToHeadA: true,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "failure",
+    legacy: true,
+    moveAtStart: false,
+    returnToHeadA: true,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "passed",
+    legacy: false,
+    moveAtStart: false,
+    returnToHeadA: true,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "mixed",
+    legacy: true,
+    moveAtStart: false,
+    returnToHeadA: true,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "failure",
+    legacy: false,
+    moveAtStart: true,
+    returnToHeadA: false,
+    multiPush: true,
+    returnLag: false,
+  },
+  {
+    mode: "failure",
+    legacy: true,
+    moveAtStart: true,
+    returnToHeadA: false,
+    multiPush: true,
+    returnLag: false,
+  },
+  {
+    mode: "failure",
+    legacy: false,
+    moveAtStart: false,
+    returnToHeadA: true,
+    multiPush: false,
+    returnLag: true,
+  },
+  {
+    mode: "mixed",
+    legacy: true,
+    moveAtStart: false,
+    returnToHeadA: true,
+    multiPush: false,
+    returnLag: true,
+  },
+  {
+    mode: "idle",
+    legacy: false,
+    moveAtStart: false,
+    returnToHeadA: false,
+    multiPush: false,
+    returnLag: false,
+  },
+])(
+  "refreshes queued PR verdicts after a head move ($mode, legacy=$legacy, start=$moveAtStart, return=$returnToHeadA, multi=$multiPush, lag=$returnLag)",
+  ({ mode, legacy, moveAtStart, returnToHeadA, multiPush, returnLag }) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+      const threadId = ThreadId.make("obsolete-pr-watch");
+      const key = { host: "github.com", repository: "pingdotgg/t3code", number: 1283 };
+      const url = "https://github.com/pingdotgg/t3code/pull/1283";
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("obsolete-create"),
+        threadId,
+        projectId: ProjectId.make("obsolete-project"),
+        title: "Watch",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+        createdBy: "user",
+        creationSource: "web",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: CommandId.make("obsolete-watch"),
+        threadId,
+        ...key,
+        watching: true,
+        link: { url, source: "agent" },
+      });
+      const initial = (yield* orchestrator.getThreadShell(threadId))!.pullRequests![0]!.watch!;
+      if (mode !== "idle")
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("obsolete-active"),
+          threadId,
+          messageId: MessageId.make("obsolete-active"),
+          text: "Working",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+      const active = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs[0]!;
+      // Acknowledge only the external provider start; orchestration effects still run through drain.
+      const acknowledgeStart = Effect.gen(function* () {
+        const effect = yield* outbox.claimNext({
+          workerId: "pr-watch-test",
+          leaseDurationMs: 30_000,
+          threadId,
+          onlyEffectTypes: ["provider-turn.start"],
+        });
+        if (Option.isSome(effect))
+          yield* outbox.succeed({ effectId: effect.value.id, workerId: "pr-watch-test" });
+      });
+      yield* acknowledgeStart;
+      const headA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+      const headB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+      const failed = {
+        name: "aggregate",
+        status: "failure" as const,
+        description: null,
+        url: null,
+        required: true,
+      };
+      const remarks: PullRequestComment[] =
+        mode === "remarks" || mode === "mixed"
+          ? [
+              {
+                id: "remark",
+                kind: "issue-comment",
+                author: { login: "reviewer", name: null, avatarUrl: null },
+                body: "Keep this comment",
+                createdAt: "2099-01-01T00:00:00.000Z",
+                url: null,
+                path: null,
+                reviewState: null,
+              },
+            ]
+          : [];
+      const report = evaluatePullRequestWatch(
+        initial,
+        {
+          headSha: headA,
+          checks:
+            mode === "remarks"
+              ? []
+              : [{ ...failed, status: mode === "passed" ? "success" : "failure" }],
+          mergeability: "mergeable",
+          author: null,
+        },
+        remarks,
+      );
+      const wake = pullRequestWatchMessage({
+        number: key.number,
+        url,
+        baseBranch: "main",
+        headSha: headA,
+        report,
+      });
+      if (legacy) {
+        const notification = { ...wake.notification };
+        delete notification.pullRequestWatch;
+        Object.assign(wake, { notification });
+      }
+      const messageId = MessageId.make("message:pr-watch:obsolete");
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request-watch.sync",
+        commandId: CommandId.make("obsolete-enqueue"),
+        threadId,
+        ...key,
+        startedAt: initial.startedAt,
+        watch: report.next,
+        wake: { messageId, ...wake },
+      });
+      const queued = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.find(
+        (run) => run.userMessageId === messageId,
+      )!;
+      if (mode === "idle") {
+        yield* acknowledgeStart;
+        yield* worker.drain();
+        assert.equal(queued.status, "starting");
+        const delivered = yield* orchestrator.getThreadProjection(threadId);
+        assert.lengthOf(delivered.runs, 1);
+        assert.isTrue(
+          delivered.turnItems.some(
+            (item) => item.runId === queued.id && item.type === "notification",
+          ),
+        );
+        assert.deepEqual(
+          evaluatePullRequestWatch(
+            report.next,
+            { headSha: headA, checks: [failed], mergeability: "mergeable", author: null },
+            [],
+          ).changes,
+          [],
+        );
+        return;
+      }
+      assert.equal(queued.status, "queued");
+      const moved = evaluatePullRequestWatch(
+        report.next,
+        {
+          headSha: headA,
+          headBranchSha: headB,
+          checksHeadSha: headA,
+          checks: [],
+          mergeability: "mergeable",
+          author: null,
+        },
+        [],
+      ).next;
+      assert.equal(moved.headSha, headA);
+      if (moveAtStart) {
+        const link = (yield* orchestrator.getThreadShell(threadId))!.pullRequests![0]!;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("obsolete-move-direct"),
+              type: "thread.pull-request-link-updated",
+              threadId,
+              occurredAt: yield* DateTime.now,
+              payload: {
+                ...link,
+                watch: multiPush
+                  ? {
+                      ...moved,
+                      headSha: headB,
+                      failedChecks: [],
+                      passed: false,
+                      passedChecks: [],
+                      passedPending: [],
+                    }
+                  : moved,
+              },
+            },
+          ],
+        });
+      } else {
+        yield* orchestrator.dispatch({
+          type: "thread.pull-request-watch.sync",
+          commandId: CommandId.make("obsolete-move"),
+          threadId,
+          ...key,
+          startedAt: initial.startedAt,
+          watch: moved,
+        });
+      }
+      if (multiPush) {
+        const link = (yield* orchestrator.getThreadShell(threadId))!.pullRequests![0]!;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("obsolete-second-push"),
+              type: "thread.pull-request-link-updated",
+              threadId,
+              occurredAt: yield* DateTime.now,
+              payload: {
+                ...link,
+                watch: {
+                  ...link.watch!,
+                  headSha: "cccccccccccccccccccccccccccccccccccccccc",
+                  observedHeadSha: "cccccccccccccccccccccccccccccccccccccccc",
+                },
+              },
+            },
+          ],
+        });
+        const retained = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.find(
+          (run) => run.id === queued.id,
+        )!;
+        assert.equal(retained.status, "queued");
+        assert.equal(
+          (yield* orchestrator.getThreadShell(threadId))!.pullRequests![0]!.watch!.headSha,
+          "cccccccccccccccccccccccccccccccccccccccc",
+        );
+      }
+      if (returnLag) {
+        const watch = (yield* orchestrator.getThreadShell(threadId))!.pullRequests![0]!.watch!;
+        const lagged = evaluatePullRequestWatch(
+          watch,
+          {
+            headSha: headB,
+            headBranchSha: headA,
+            checksHeadSha: headA,
+            checks: [failed],
+            mergeability: "mergeable",
+            author: null,
+          },
+          [],
+        );
+        assert.deepEqual(lagged.changes, []);
+        yield* orchestrator.dispatch({
+          type: "thread.pull-request-watch.sync",
+          commandId: CommandId.make("obsolete-return-lag"),
+          threadId,
+          ...key,
+          startedAt: initial.startedAt,
+          watch: lagged.next,
+        });
+      }
+      const returning = returnToHeadA;
+      if ((mode === "failure" && !moveAtStart) || returning) {
+        const current = evaluatePullRequestWatch(
+          (yield* orchestrator.getThreadShell(threadId))!.pullRequests![0]!.watch!,
+          {
+            headSha: returnToHeadA ? headA : headB,
+            checks: [{ ...failed, status: mode === "passed" ? "success" : "failure" }],
+            mergeability: "mergeable",
+            author: null,
+          },
+          [],
+        );
+        const nextWake = pullRequestWatchMessage({
+          number: key.number,
+          url,
+          baseBranch: "main",
+          headSha: returnToHeadA ? headA : headB,
+          report: current,
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.pull-request-watch.sync",
+          commandId: CommandId.make("obsolete-current-failure"),
+          threadId,
+          ...key,
+          startedAt: initial.startedAt,
+          watch: current.next,
+          ...(current.changes.length > 0
+            ? { wake: { messageId: MessageId.make("message:pr-watch:current"), ...nextWake } }
+            : {}),
+        });
+        const repeated = evaluatePullRequestWatch(
+          current.next,
+          {
+            headSha: returnToHeadA ? headA : headB,
+            checks: [{ ...failed, status: mode === "passed" ? "success" : "failure" }],
+            mergeability: "mergeable",
+            author: null,
+          },
+          [],
+        );
+        assert.deepEqual(repeated.changes, []);
+      }
+      const now = yield* DateTime.now;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("obsolete-finish"),
+            type: "run.updated",
+            threadId,
+            runId: active.id,
+            occurredAt: now,
+            payload: { ...active, status: "completed", completedAt: now },
+          },
+        ],
+      });
+      yield* orchestrator.dispatch({
+        type: "queue.resume",
+        commandId: CommandId.make("obsolete-resume"),
+        threadId,
+      });
+      yield* acknowledgeStart;
+      yield* worker.drain();
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      const result = after.runs.find((run) => run.id === queued.id)!;
+      if (mode === "failure" || mode === "passed") {
+        assert.equal(result.status, "cancelled");
+        assert.equal(
+          after.nodes.find((node) => node.id === result.rootNodeId)?.status,
+          "cancelled",
+        );
+        assert.equal(
+          after.attempts.find((attempt) => attempt.id === result.activeAttemptId)?.status,
+          "cancelled",
+        );
+        assert.isFalse(
+          after.turnItems.some((item) => item.runId === result.id && item.type === "notification"),
+        );
+      } else {
+        assert.equal(result.status, "starting");
+        const message = after.messages.find((entry) => entry.id === messageId)!;
+        assert.include(message.text, "Keep this comment");
+        assert.notInclude(message.text, "Checks failed");
+        assert.equal(message.notification?.summary, "#1283: new comments");
+      }
+      if ((mode === "failure" && !moveAtStart) || returning) {
+        const currentRuns = after.runs.filter(
+          (run) => run.userMessageId === "message:pr-watch:current",
+        );
+        assert.lengthOf(currentRuns, 1);
+        const expected = returning ? headA : headB;
+        const message = after.messages.find(
+          (message) => message.id === "message:pr-watch:current",
+        )!;
+        assert.equal(
+          message.notification?.summary,
+          mode === "passed" ? "#1283: checks passed" : "#1283: checks failed",
+        );
+        assert.include(message.text, expected.slice(0, 7));
+        if (mode === "mixed") {
+          // The retained remark was first in the queue. Finish it to deliver the current verdict.
+          const now = yield* DateTime.now;
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("obsolete-remark-finish"),
+                type: "run.updated",
+                threadId,
+                runId: result.id,
+                occurredAt: now,
+                payload: { ...result, status: "completed", completedAt: now },
+              },
+            ],
+          });
+          yield* orchestrator.dispatch({
+            type: "queue.resume",
+            commandId: CommandId.make("obsolete-remark-resume"),
+            threadId,
+          });
+          yield* acknowledgeStart;
+          yield* worker.drain();
+        }
+        const delivered = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(
+          delivered.runs.find((run) => run.id === currentRuns[0]!.id)?.status,
+          "starting",
+        );
+        assert.lengthOf(
+          delivered.turnItems.filter(
+            (item) => item.runId === currentRuns[0]!.id && item.type === "notification",
+          ),
+          1,
+        );
+      }
+      assert.isTrue((yield* maintenance.rebuild).valid);
+    }).pipe(Effect.provide(Layer.fresh(layerTest))),
 );

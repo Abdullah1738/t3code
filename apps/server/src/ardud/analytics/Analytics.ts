@@ -165,10 +165,18 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     (filter?.boardId === undefined || event.kind !== "performance.long-task") &&
     (filter?.kind === undefined || filter.kind === event.kind) &&
     (filter?.boardId === undefined || filter.boardId === event.boardId) &&
+    (filter?.cardId === undefined || filter.cardId === event.cardId) &&
     (filter?.tool === undefined || filter.tool === event.tool) &&
     (filter?.outcome === undefined || filter.outcome === event.outcome);
   const viewKey = (day: string, filter?: AnalyticsReadInput) =>
-    JSON.stringify([day, filter?.kind, filter?.boardId, filter?.tool, filter?.outcome]);
+    JSON.stringify([
+      day,
+      filter?.kind,
+      filter?.boardId,
+      filter?.cardId,
+      filter?.tool,
+      filter?.outcome,
+    ]);
   const invalidate = (day: string) => {
     for (const [key, view] of views) if (view.day === day) views.delete(key);
   };
@@ -603,15 +611,17 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
           const view = yield* getView(input.day, files, input);
           const full = yield* getView(input.day, files);
           const generatedAt = DateTime.formatIso(yield* DateTime.now);
-          const withAskLatency = (rollup: AnalyticsRollup, boardId?: string) =>
+          const withAskLatency = (rollup: AnalyticsRollup, filter?: AnalyticsReadInput) =>
             storedRows === undefined
               ? rollup
               : {
                   ...rollup,
                   askLatency: askLatencyRollup(
-                    boardId === undefined
-                      ? storedRows
-                      : storedRows.filter((row) => row.boardId === boardId),
+                    storedRows.filter(
+                      (row) =>
+                        (filter?.boardId === undefined || row.boardId === filter.boardId) &&
+                        (filter?.cardId === undefined || row.cardId === filter.cardId),
+                    ),
                     input.day,
                     generatedAt,
                   ),
@@ -623,7 +633,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
           return {
             rollup: withAskLatency(
               finishRollup(view.accumulator, input.day, generatedAt),
-              input.boardId,
+              input,
             ),
             samples: view.samples.slice(0, input.limit ?? 100).map((sample) => sample.event),
           };

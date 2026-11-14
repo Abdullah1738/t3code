@@ -75,6 +75,7 @@ const inertThreads = Layer.succeed(
     send: () => Effect.die("split migration tests send to no thread"),
     setModel: () => Effect.die("split migration tests change no thread model"),
     withdraw: () => Effect.die("the board tests withdraw no assignment"),
+    queuedRuns: () => Effect.succeed([]),
     cancelQueued: () => Effect.succeed(false),
     interrupt: () => Effect.void,
   }),

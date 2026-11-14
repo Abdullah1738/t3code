@@ -19,14 +19,30 @@ its own state, day logs, rollups and probe samples, and never changes crash evid
 
 Disk samples use `statvfs`, sizes of the known Robob/OpenCode/recall database
 and WAL files (metadata only), the guard's cached TMPDIR measurement, and an hourly cached directory inventory of worktrees, caches and backup repositories.
-The collector gathers directory sizes with read-only du calls outside the guard,
-allowing up to 60 s per root under a shared 210 s scan budget. The two big
-roots (`~/.local/share` and `~/.robob`) scan one first-level child at a
-time with a 15 s child timeout. Roots rotate by their last attempt, and each
-gets at most 60 s. The collector
-also limits the scan to the time remaining in its five-minute run budget,
-running crash collection first (at most 165 s), then disk-wait collection, the disk tooling probe and
-inventory with the remaining time. Inventory keeps its own 210 s maximum. Samples expose
+The collector scans immediate children independently with `du -skl`, in batches
+of at most 128 paths / 32 KiB of arguments. Its 15 s allowance grows to 60 s
+for slow children. Completed children stay cached for 24 hours; missing and
+stale children get the hourly inventory's remaining time, up to 210 s within
+the collector's 290 s deadline. Crash collection runs first.
+
+A separate `com.abdullah.mac-deep-inventory` LaunchAgent runs daily at 03:30
+local time (Asia/Dubai on this Mac). It visits the four SSD worktree farms first,
+then the other inventory roots, one bounded batch per root turn and oldest
+children first. Missing, partial,
+limited and 24-hour-old entries are eligible. Each command has at most ten
+minutes within a 45-minute pass, under nice 10 and background I/O policy.
+Every completed batch checkpoints the shared state atomically. Termination
+keeps completed rows; unfinished children remain explicit partials.
+Both entry points acquire `state/disk-inventory.lock` non-blocking. A busy
+daily pass exits cleanly; a busy hourly scan logs `skipReason=deep_pass_running`
+and cached totals while crash collection continues. `disk.deep.start`,
+`disk.deep.root` and `disk.deep.end` record coverage, ages and stop reason.
+`childrenRemaining` counts known eligible children; `rootsPartial` on pass
+summaries counts roots whose listing was unavailable, so zero remaining with
+unlisted roots is not complete coverage. All totals count hardlink occurrences,
+can exceed physical use, and are not freeable-space estimates.
+
+Samples expose
 `inventorySourceErrors`, `inventoryAgeS` (null if absent), and `inventoryStale`
 (absent or older than two hours). These do not affect the sample's own success.
 The five largest positive deltas in that tracked set are flattened as
@@ -54,6 +70,7 @@ Nonzero exits are failures with `failedStage` and `failReason`, including failur
 reasons passed through the legacy skip argument. Lock and load/boot deferrals
 retain their skip behavior. Memory failure stages use only fresh status metadata;
 unavailable stages are `unknown` and unrecognized stages are `other`.
+The memory-backup emitter sends `failureStage` on `backup.run`: `admission`, `stage`, `repo`, `disk`, `replica`, `verify`, `files`, `restic`, `prune`, `dropbox`, `manifest`, or `unknown`; other strings become `unknown` and non-strings are omitted.
 Daily rollups count `backup.skipped_runs`, `backup.ok_runs` and `backup.failed_runs` by target;
 `log.rollup` flattens them as e.g. `backup.skipped_runs.memory`. Healthy lock
 skips count only as skips.
@@ -100,6 +117,35 @@ Partial inventories and older snapshots without that evidence remain unknown.
 An unknown directory baseline also makes the event incomplete.
 These events never alert or launch extra scans.
 
+## Memory samples
+
+`com.abdullah.mac-memory` runs `memory.py` every 300 seconds independently of
+inventory, through `/bin/zsh` for launchd file access. `memory.sample` contains
+swap MB, VM page counts and page size, pressure/free percentage, load averages,
+the top 15 footprints with compressed MB, watched daemons with elapsed time,
+process/parent-1 counts, and disk0's second iostat sample. MB/GB use powers of
+1024. `top` MEM already includes compressed pages. A filtered second top reads
+watched PIDs outside the first 15. At most 512 watched PIDs are queried; excess
+is explicit in `watchedOmitted` and makes the sample partial. Each subprocess,
+including notifications, has a ten-second timeout. Failed probes are null with
+fixed `…Error` codes; watched PID failures retain null metrics per PID.
+
+`state/memory.json` retains swap counter baselines and alert receipts under a
+separate nonblocking lock. `swapinsDelta`/`swapoutsDelta` compare successful reads
+on the same boot, with `deltaWindowS`; first reads, resets, gaps over an hour and
+clock rollback establish a null baseline. Missing/failed probes remain unknown.
+No process arguments, command output or notification text enter the day log.
+
+Swap above 16 GB, critical pressure in two consecutive samples, a footprint
+above 8 GB, or fseventsd above 4 GB queues a Telegram notification and writes
+`memory.alert`. Critical means `vm.memory_pressure >= 2` or free percentage
+below 15; unavailable/healthy samples or gaps over ten minutes reset the streak. Each reason has a six-hour cooldown
+across day boundaries. Keys start `mac-memory:<reason>:<YYYYMMDD>` with a time
+suffix so another alert can be queued after six hours on the same day. An
+unconfirmed send retains its exact key/text for idempotent retry. For a diagnostic
+sample without notifications, run `TOOLLOG_DIR=<private-temp-dir> /usr/bin/python3
+integrations/mac-logging/memory.py --no-alert`.
+
 ## Source events
 
 `disk.inventory` and `crash.collect` retain `count` and `sourceErrors` summary
@@ -126,7 +172,7 @@ Big roots emit child source events with `bytes`, `exitCode`, `elapsedMs`,
 `partial`, and `deniedCount`, plus a root aggregate with `completedCount` and
 `failedCount`. Child timeouts/errors remain named source errors. An incomplete
 root emits an error with `failure=partial`, `partial=true`, and the available
-children's `bytes`. Cached sizes make that aggregate an estimate. `failedCount` includes one additional
+children's `bytes`. The aggregate includes only recorded child measurements. `failedCount` includes one additional
 incomplete remainder when the root deadline stops enumeration; it is not a
 count of every unvisited child. Summing child du totals does not deduplicate
 hard links across children and excludes the root directory's own blocks.
@@ -135,8 +181,8 @@ ones. Budget-skipped roots retain their place; full failed attempts rotate too.
 Shortened failed attempts keep priority for a full allowance on the next run.
 `disk.inventory.turn` identifies each attempted root's `source` and `turn`.
 Child attempts rotate the same way. A failed child retains its last good size
-and timestamp in `childState`; a root containing cached or unreadable children
-remains partial. `cachedCount` and `ageS` describe retained measurements.
+and timestamp in `childState`; missing, stale or unreadable children keep the
+root partial. `cachedCount` and `ageS` describe retained measurements.
 If every child fails without a last-good measurement, the root has no size.
 Inventory state retains child sizes in `children` and aggregate flags in `partials`.
 Summary `sourceErrors` counts affected roots, not their child error lines.
@@ -247,7 +293,8 @@ it and never changes mounts or restarts the Mac.
 
 ## Install after review and owner approval
 
-All scripts refuse dirty upkeep source or HEAD absent from origin/main. No
+Installation and checks refuse dirty upkeep source or HEAD absent from origin/main.
+`--dry-run` can describe a proposed branch without installing it. No
 installer starts or restarts any service. Install the helper first:
 
 ```sh
@@ -263,7 +310,8 @@ Memory-system belongs to the Recall board and is deployed from
 `robob/recall-golive`; send changes there as port requests. This installer
 refuses targets under `~/.local/share/memory-system`.
 The helper installer writes the proposed
-`com.abdullah.mac-log-collector.plist`; the evaluator must separately load it
+`com.abdullah.mac-log-collector.plist` and
+`com.abdullah.mac-deep-inventory.plist`; the evaluator separately loads them
 after approval. Existing job schedules and backup LaunchAgents stay in place.
 The collector starts via `/bin/zsh` because launchd attributes Full Disk Access to the job's own program.
 The jobs fail open if the helper is missing.

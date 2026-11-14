@@ -40,6 +40,7 @@ import {
 import type { UnifiedSettings } from "@t3tools/contracts/settings";
 
 import * as Schema from "effect/Schema";
+import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Link } from "@tanstack/react-router";
 import { Switch } from "../../components/ui/switch";
@@ -289,6 +290,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
     void runAction("Couldn't save", () => kanban.updateBoard({ boardId: board.id, ...input }));
   const canEdit = useKanbanPermission(KANBAN_WS_METHODS.boardUpdate);
   const canPool = useKanbanPermission(KANBAN_WS_METHODS.poolSet);
+  const canRevoke = useKanbanPermission(KANBAN_WS_METHODS.standingApprovalRevoke);
   // The level "Add model" gives a new pool; null when every level of it is pooled.
   const addLevel = (instanceId: ProviderInstanceId, model: string) =>
     boardPoolAddition(instanceId, model, instanceEntries, pools, apply);
@@ -306,6 +308,34 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
           onImage={(iconImage) => update({ iconImage })}
         />
       </Section>
+      {board.standingApprovals.some((entry) => entry.revokedAt === null) && (
+        <Section title="Standing deploy approval">
+          {board.standingApprovals
+            .filter((entry) => entry.revokedAt === null)
+            .map((entry) => (
+              <div key={entry.id} className="flex min-w-0 items-center gap-3 py-2">
+                <p className="min-w-0 flex-1 break-words text-sm">
+                  {entry.quote}{" "}
+                  <time dateTime={entry.saidAt} className="text-(--m-muted)">
+                    {new Date(entry.saidAt).toLocaleString()}
+                  </time>
+                </p>
+                <Button
+                  variant="outline"
+                  disabled={!canRevoke}
+                  aria-label={`Revoke standing deploy approval from ${new Date(entry.saidAt).toLocaleString()}`}
+                  onClick={() =>
+                    void runAction("Couldn't revoke approval", () =>
+                      kanban.revokeStandingApproval(board.id, entry.id),
+                    )
+                  }
+                >
+                  Revoke
+                </Button>
+              </div>
+            ))}
+        </Section>
+      )}
       <Section title="Nightly review">
         <NightlyReviewSettings key={board.id} board={board} disabled={!canEdit} />
       </Section>

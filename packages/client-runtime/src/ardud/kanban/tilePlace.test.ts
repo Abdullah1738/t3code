@@ -117,6 +117,7 @@ function stateOf(
       setup: null,
       reviewChains: [],
       defaultReviewChain: null,
+      standingApprovals: [],
       ...options.board,
     },
     cards,

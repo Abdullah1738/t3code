@@ -620,8 +620,13 @@ async function sendCommand(command: Command): Promise<unknown> {
                 : "Bridge returned an invalid acknowledgement"));
               return;
             }
+            const chat = "chat" in data ? data.chat : undefined;
+            if (chat !== undefined && (typeof chat !== "string" || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(chat))) {
+              reject(new CliError("Bridge returned an invalid acknowledgement"));
+              return;
+            }
             // Queue acknowledgement only, not proof of upload or delivery. Never print echoed file contents.
-            resolve({ id: data.id, created: data.created });
+            resolve({ id: data.id, created: data.created, ...(chat === undefined ? {} : { chat }) });
             return;
           }
           const record = data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : {};

@@ -35,15 +35,13 @@ class BoardLoggingCoexistence(unittest.TestCase):
             stack.enter_context(patch.dict(os.environ, {
                 'TOOLLOG_ROOT': str(root/'logs'), 'OFFBOX_TOOL_LOG_DIR': str(root/'logs/offbox'),
                 'HARNESS_HOOKS_STATE_DIR': str(root/'state'), 'HARNESS_HOOKS_COMMAND_IDENTITY': '',
-                'AGENT_GUARD_APPROVED': '', 'HARNESS_COORD_APPROVED': '',
+
             }))
             stack.enter_context(patch.object(engine, 'resolve_identity', return_value={
                 'resolution': 'resolved', 'robobThreadId': 'thread-fixture'}))
             stack.enter_context(patch.object(engine, '_command_identity', return_value=None))
             stack.enter_context(patch.object(engine, '_offbox_available', return_value=True))
             stack.enter_context(patch.object(engine, '_offbox_state', return_value=root/'offbox-state'))
-            stack.enter_context(patch.object(engine, 'decide_coord', return_value={
-                'decision': 'allow', 'reason': '', 'context': {'rule': 'no-policy'}}))
 
             def records(board):
                 return [json.loads(line) for path in (root/'logs'/board).glob('*.ndjson')

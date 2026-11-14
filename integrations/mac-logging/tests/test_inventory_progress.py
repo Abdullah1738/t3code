@@ -188,7 +188,7 @@ class InventoryProgressTests(unittest.TestCase):
                         with patch.object(jobs.time,'time',return_value=10001):
                             total,flags,_=jobs.big_root_inventory(root,lambda *a,**k:self.fail('fresh cache'),jobs.time.monotonic()+2,cache)
                         self.assertEqual(total,1024)
-                        self.assertEqual(flags['partial'],partial or bool(denied))
+                        self.assertEqual(flags['partial'],partial or bool(denied) or limited)
 
     def test_failed_child_type_lookup_does_not_abort_other_roots(self):
         bad,good=self.root/'bad',self.root/'good'
@@ -289,9 +289,9 @@ class InventoryProgressTests(unittest.TestCase):
                 with self.subTest(overhead=overhead,cached=cached),patch.dict(os.environ,TOOLLOG_DIR=str(self.root/(str(overhead)+str(cached)))):
                     value=dict(slow=True,attemptedAt=0)
                     if cached:
-                        value.update(bytes=1024,at=6400,partial=False)
+                        value.update(bytes=1024,at=13600,partial=False)
                     jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{str(child):value}}))
-                    clock,now,budgets=[0],[10000],[]
+                    clock,now,budgets=[0],[100000],[]
                     original=jobs.big_root_inventory
                     def setup(*args,**kw):
                         clock[0]+=overhead
@@ -397,16 +397,25 @@ class InventoryProgressTests(unittest.TestCase):
                 first=paths[0]
                 second=first if placement=='same_child' else paths[1 if placement=='same_batch' else 128]
                 data=first/'data'
-                data.write_bytes(b'0123456789abcdef'*(size//16))
+                with data.open('wb') as stream:
+                    stream.write(os.urandom(size))
+                    stream.flush()
+                    os.fsync(stream.fileno())
                 os.link(data,second/'alias')
+                allocated=data.stat().st_blocks*512
+                metadata=max(first.stat().st_blocks,second.stat().st_blocks)*512
+                if not allocated or allocated <= metadata:
+                    self.skipTest('filesystem reports no physical allocation for fixture data')
                 cache={}
                 total,flags,_=jobs.big_root_inventory(root,subprocess.run,jobs.time.monotonic()+30,cache)
                 self.assertFalse(flags['partial'])
-                self.assertGreaterEqual(cache[str(second)]['bytes'],size*(2 if first==second else 1))
+                self.assertGreaterEqual(cache[str(first)]['bytes'],allocated*(2 if first==second else 1))
+                self.assertGreaterEqual(cache[str(second)]['bytes'],allocated*(2 if first==second else 1))
+                self.assertGreaterEqual(sum(cache[str(p)]['bytes'] for p in {first,second}),2*allocated)
                 first_bytes=cache[str(first)]['bytes']
                 # Refreshing only the alias child must use exactly the same
                 # accounting as its row in the multi-child command.
-                cache[str(second)]['at']-=3600
+                cache[str(second)]['at']-=86400
                 refreshed,flags,_=jobs.big_root_inventory(root,subprocess.run,jobs.time.monotonic()+30,cache)
                 self.assertFalse(flags['partial'])
                 self.assertEqual(refreshed,total)
@@ -414,11 +423,11 @@ class InventoryProgressTests(unittest.TestCase):
                 if first!=second:
                     first.rmdir()
                 else:
-                    cache[str(first)]['at']-=3600
+                    cache[str(first)]['at']-=86400
                 after,flags,_=jobs.big_root_inventory(root,subprocess.run,jobs.time.monotonic()+30,cache)
                 self.assertFalse(flags['partial'])
-                self.assertGreaterEqual(cache[str(second)]['bytes'],size)
-                self.assertEqual(after,total-first_bytes if first!=second else total-size)
+                self.assertGreaterEqual(cache[str(second)]['bytes'],allocated)
+                self.assertEqual(after,total-first_bytes if first!=second else total-allocated)
 
     def test_old_hardlink_accounting_migrates_without_reporting_growth(self):
         root=self.root/'migration'

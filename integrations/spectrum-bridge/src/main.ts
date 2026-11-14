@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { createApi } from "./api.ts";
 import { startAppsServer } from "./apps.ts";
 import { Delivery } from "./delivery.ts";
+import { ReplyGapMonitor } from "./reply-gap.ts";
 import { alertSkillPath, loadConfig, skillPath, stateRoot, telegramBridgeSocket, transportKind } from "./config.ts";
 import { ingest } from "./ingress.ts";
 import { acquireLock } from "./lock.ts";
@@ -207,6 +208,7 @@ async function main(): Promise<void> {
     appsUrl: () => store.get<{ port: number; url: string } | null>("appsPublished")?.url,
     blob: sha256 => store.getBlob(sha256),
   });
+  const replyGap = new ReplyGapMonitor(store, { chat: "owner", notify: outlet.notify });
   const delivery = new Delivery(store, photon, { projectScope, chatGuid: () => chatGuid,
     beforeSend: async item => router?.beforeSend(item) ?? "send",
     enabled: () => ready() && !controlsPending && !stopping, log,
@@ -287,6 +289,7 @@ async function main(): Promise<void> {
   let routerBusy = false;
   const timer = setInterval(() => {
     void delivery.tick().catch((caughtError) => { toolError("main", "main.catch12", caughtError); return log("sender-failed"); });
+    if (ready()) void replyGap.tick().catch((caughtError) => { toolError("main", "reply-gap.check", caughtError); });
     if (ready()) void router?.checkInboundLatency().catch((caughtError) => { toolError("main", "main.catch13", caughtError); return log("inbound-latency-check-failed"); });
     if (ready() && router && !routerBusy) {
       routerBusy = true;

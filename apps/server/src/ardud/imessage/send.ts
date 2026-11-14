@@ -94,13 +94,15 @@ const parseRecord = (line: string | undefined): Record<string, unknown> | undefi
 export const parseBridgeAck = (
   stdout: string,
   kind: "send" | "file",
-): { readonly id: string; readonly created: boolean } | undefined => {
+): { readonly id: string; readonly created: boolean; readonly chat?: string } | undefined => {
   const record = parseRecord(lastLine(stdout));
   if (record === undefined) return undefined;
-  const { id, created } = record;
+  const { id, created, chat } = record;
   if (typeof id !== "string" || !new RegExp(`^${kind}:[a-f0-9]{64}$`).test(id)) return undefined;
   if (typeof created !== "boolean") return undefined;
-  return { id, created };
+  if (chat !== undefined && (typeof chat !== "string" || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(chat)))
+    return undefined;
+  return { id, created, ...(typeof chat === "string" ? { chat } : {}) };
 };
 
 const sanitize = (text: string) =>
