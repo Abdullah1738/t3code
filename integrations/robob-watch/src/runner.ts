@@ -70,7 +70,6 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
   const accepted = pending.watcher ?? watcher;
   const delivery = await deliver(accepted, pending.event, pending.key, state);
   for (const run of pending.healthRuns ?? [pending.healthRun]) await recordHealthDelivery(watcher.id, run, delivery);
-  toolLog({ component: "wakes", kind: delivery.ok ? "perf" : "error", name: "wake.sent", durationMs: Math.max(0, now() - Date.parse(pending.at)), ok: delivery.ok, ids: { watcher: watcher.id, chat: accepted.chat ?? "owner", key: wakeInboundId(pending.key) }, ...(delivery.ok ? {} : { error: { tag: "wake.delivery_failed" } }) });
   if (watcherInstance(watcher.id) !== instance) return false;
   log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via} ${delivery.detail}`);
   const definition = loadWatcher(watcher.id);
@@ -80,7 +79,8 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
   state = current;
   if (!delivery.ok) return false;
   state.fires += pending.count ?? 1;
-  toolLog({ component: "runner", kind: "event", name: "watch.fire", ok: true, ids: { watcher: watcher.id, key: wakeInboundId(pending.key) }, props: { count: state.fires } });
+  if (state.status === "closing") state.closing_relays = (state.closing_relays ?? 0) + (pending.count ?? 1);
+  toolLog({ component: "runner", kind: "event", name: "watch.fire", ok: true, ids: { watcher: watcher.id, key: wakeInboundId(pending.key) }, props: { count: state.fires, events: pending.count ?? 1, batched: pending.key.includes(":batch:"), urgent: pending.urgent === true, route: delivery.route ?? "other", waitMs: now() - Date.parse(pending.at), closing: state.status === "closing" } });
   state.last_fire_at = iso();
   state.last_delivery = delivery.via;
   if (delivery.via === "wake") {

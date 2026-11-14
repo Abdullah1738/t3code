@@ -88,6 +88,9 @@ console.log(JSON.stringify(await (async () => (${body}))()));`;
     const lines = stdout.trim().split("\n");
     const logsDir = join(dir, "logs");
     return { result: JSON.parse(lines.pop()!) as Delivery & { state: State; held: State; same: boolean; env: string; deliveries: Delivery[] },
+      sentLogs: existsSync(logsDir) ? readdirSync(logsDir).filter(file => file.endsWith(".ndjson"))
+        .flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line) as LogEntry))
+        .filter(row => row.name === "wake.sent") : [],
       runnerLog: lines.join("\n"),
       fallbacks: existsSync(logsDir) ? readdirSync(logsDir).filter(file => file.endsWith(".ndjson"))
         .flatMap(file => readFileSync(join(logsDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line) as LogEntry))
@@ -335,4 +338,18 @@ test("the runner records thread delivery without adding a spectrum heads-up row"
 test("the t3ctl stub override is forwarded to child helpers", async () => {
   const { result } = await fixture({}, "({ env: testEnv().ROBOB_WATCH_T3CTL })");
   expect(result.env).toEndWith("/t3ctl.ts");
+});
+
+
+test("direct creator and owner fallback deliveries log one attempt each", async () => {
+  for (const sendError of [false, true]) {
+    const { result, sentLogs } = await fixture({ sendError });
+    expect(result.route).toBe(sendError ? "owner" : "creator");
+    expect(sentLogs).toHaveLength(1);
+    expect(sentLogs[0]).toMatchObject({ component: "wakes", kind: "perf", ok: true,
+      ids: { watcher: "route-test" }, props: { via: sendError ? "wake" : "thread", events: 1 } });
+    expect(sentLogs[0]!.durationMs).toBeGreaterThanOrEqual(0);
+    expect(JSON.stringify(sentLogs)).not.toContain("event happened");
+    expect(JSON.stringify(sentLogs)).not.toContain("Handle this event");
+  }
 });

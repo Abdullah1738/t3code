@@ -227,3 +227,18 @@ test("error helper emits only a stable tag for each component", () => {
   expect(rows(dir).every(row => row.kind === "error" && row.ok === false && row.error.message === "fixture.failed")).toBe(true);
   if (process.env.TOOLLOG_SAMPLES) for (const row of rows(dir)) console.log("LOG_SAMPLE " + JSON.stringify(row));
 });
+
+test("relay metadata keeps bounded values and rejects text in every new field", () => {
+  const dir = fixture();
+  const secret = "private event and context must never be logged";
+  const numeric = { events: 6, waitMs: 150000, spanMs: 150000, graceMs: 900000, relays: 1 };
+  const flags = { batched: true, urgent: false, closing: true, archived: false, frozenContext: true, batchOpen: false, grace: false };
+  toolLog({ component: "wakes", kind: "event", name: "wake.batch_sealed", props: { ...numeric, ...flags, route: "person", via: "wake" } });
+  toolLog({ component: "cli", kind: "event", name: "watch.grace_ended", props: { reason: "resume", relays: 1 } });
+  const props = Object.fromEntries([...Object.keys(numeric), ...Object.keys(flags), "route", "via", "reason"].map(key => [key, secret]));
+  toolLog({ component: "wakes", kind: "event", name: "wake.sent", props });
+  expect(rows(dir)[0].props).toEqual({ ...numeric, ...flags, route: "person", via: "wake" });
+  expect(rows(dir)[1].props).toEqual({ reason: "resume", relays: 1 });
+  expect(rows(dir)[2].props).toBeUndefined();
+  expect(JSON.stringify(rows(dir))).not.toContain(secret);
+});

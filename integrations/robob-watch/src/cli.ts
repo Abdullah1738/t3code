@@ -289,12 +289,14 @@ async function main(argv: string[]): Promise<void> {
         if (command === "resume" && values.expires !== undefined) w.expires_at = duration(values.expires);
         writeJson(join(watcherDir(w.id), "watcher.json"), w);
         const s: State = loadState(w.id);
+        const endedGrace = command === "resume" && s.status === "closing" ? s.closing_relays ?? 0 : undefined;
         if (command === "resume" && s.status !== "active") {
           if (w.expires_at && Date.parse(w.expires_at) <= Date.now()) throw new CliError("Watcher is expired; pass --expires to re-arm it");
           const rearm = s.status !== "closing" || s.closing_from === "done" || s.closing_from === "expired"
             || (w.max_fires !== 0 && s.fires >= w.max_fires);
           if (rearm) s.fires = 0;
           s.status = "active";
+          delete s.closing_relays;
           delete s.closing_until;
           delete s.closing_from;
           delete s.closing_watcher;
@@ -314,6 +316,7 @@ async function main(argv: string[]): Promise<void> {
         }
         s.next_at = 0;
         saveState(w.id, s);
+        if (endedGrace !== undefined) toolLog({ component: "cli", kind: "event", name: "watch.grace_ended", ids: { watcher: w.id }, props: { reason: "resume", relays: endedGrace } });
         return { w, s };
       });
       log(w.id, command);
