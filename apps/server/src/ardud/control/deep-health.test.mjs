@@ -22,8 +22,19 @@ function fixture(severe = [], options = {}) {
     time: new Date(now - (20 - i) * 30_000).toISOString(),
     kind: "sample",
     rssMb: 3600,
+    gcTotalMs: 75,
+    gcMajorMaxMs: 50,
   }));
-  for (const [i, delay] of severe) rows[i] = { ...rows[i], delayMaxMs: delay };
+  for (const [i, delay] of severe)
+    rows[i] = {
+      ...rows[i],
+      delayMaxMs: delay,
+      gcCount: 2,
+      gcMaxMs: 50,
+      gcMajorCount: 1,
+      heapUsedMb: 1500,
+      heapUsedMbPrev: 2100,
+    };
   return {
     text:
       rows
