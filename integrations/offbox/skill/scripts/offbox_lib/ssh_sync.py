@@ -25,6 +25,7 @@ import toollog
 
 from . import api, capacity, common, git_snapshot
 from .common import CM_DIR, KEY_PATH, SSH_DIR, OffboxError, ensure_dirs, log
+from .home import StartWaitFailed
 
 RSYNC = "/opt/homebrew/bin/rsync" if Path("/opt/homebrew/bin/rsync").exists() else "rsync"
 STALL_S = capacity.setting("OFFBOX_SYNC_STALL_S", 180)
@@ -92,6 +93,8 @@ def setup(box_id: str) -> Path:
                     or e.status in (409, 502, 503) or api.gateway_timeout(e)):
                 raise
             last = e
+        except StartWaitFailed:
+            raise
         except api.BudgetExpired as error:
             if last is not None and last.outage:
                 raise last from error
@@ -914,7 +917,7 @@ def _verify_content(box_id: str, root: Path, remote_dir: str, expected: dict, ti
                 raise OffboxError(f"tracked content differs after checksum repair: {remaining[:20]!r}; nothing ran")
             repaired = True
             result["repaired"] = len(bad)
-        except common.SshHostKeyMismatch:
+        except (common.SshHostKeyMismatch, StartWaitFailed):
             raise
         except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
             raise OffboxError(f"tracked content repair failed for {bad[:20]!r}: {e}; nothing ran") from e
@@ -1128,7 +1131,7 @@ def _remote_stall(box_id: str, timeout: float) -> tuple[str, str | None]:
         if p.returncode:
             check_host_key(box_id, p.stderr)
             return "remote_probe=failed", None
-    except common.SshHostKeyMismatch:
+    except (common.SshHostKeyMismatch, StartWaitFailed):
         raise
     except (OffboxError, OSError, subprocess.TimeoutExpired):
         return "remote_probe=unavailable", None
@@ -1187,6 +1190,8 @@ def _refresh_master(box_id, *, close=True, refresh=True):
     for action in ([close_master] if close else []) + ([setup] if refresh else []):
         try:
             action(box_id)
+        except StartWaitFailed:
+            raise
         except (OffboxError, OSError, subprocess.TimeoutExpired):
             pass
 
@@ -1255,6 +1260,8 @@ def _run_rsync(box_id: str, cmd: list[str], timeout: float, input: str | None = 
         try:
             with api.budget(max(0, deadline - time.monotonic())):
                 state = (api.get(box_id) or {}).get("state")
+        except StartWaitFailed:
+            raise
         except (OffboxError, OSError, subprocess.TimeoutExpired):
             state = None
         if state and state not in api.LIVE_STATES:
@@ -1290,7 +1297,7 @@ def _push_git(box_id: str, gitdir: Path, remote_dir: str, timeout: float, *, run
     finally:
         try:
             ssh(box_id, f"rm -rf -- {qstage}", check=True, timeout=5)
-        except common.SshHostKeyMismatch:
+        except (common.SshHostKeyMismatch, StartWaitFailed):
             raise
         except (OffboxError, OSError, subprocess.TimeoutExpired):
             log(f"push_git cleanup failed {box_id} {staging}")

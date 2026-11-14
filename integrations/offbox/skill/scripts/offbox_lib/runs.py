@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
+from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
 from . import command_usage, common, containers, prune, prepare, userns
 from . import resources
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
@@ -1722,7 +1722,14 @@ class Runner:
             r = api.cmd_start(self.box, command,
                               meta={"repo": me.get("repo_key"), "kind": run_kind(cmd_text), "run_id": self.run_id},
                               retry_interrupted=retry_interrupted(a))
+        except home.StartWaitFailed:
+            self.started = False
+            raise
         except (api.ApiError, api.NetworkError) as e:
+            if api.BACKEND == "server" and getattr(e, 'status', None) == 503 and e.api_code in (
+                    'server_not_ready', 'server_starting'):
+                self.started = False
+                raise
             # A 4xx answer (400 E2BIG, 409 not ready, 429 rate limit) means boat refused it: nothing ran.
             # Without this the run sat "starting" for an hour and held the box until it stopped.
             # Cloudflare 521-526 except 524 never reached boat, so nothing ran; 520, 524 and network errors stay started.
@@ -1811,7 +1818,7 @@ class Runner:
                         resumed = lease._reuse(con, row, row['size'])
                         if resumed is None:
                             raise OffboxError(f"lease {self.box} is no longer available")
-                    except common.SshHostKeyMismatch:
+                    except (common.SshHostKeyMismatch, home.StartWaitFailed):
                         raise
                     except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
                         raise OffboxError(f"{e}; box stopped during push: {self.box}") from e
@@ -1981,6 +1988,8 @@ def _safe(err: list, fn, *args, terminal_identity=False):
     try:
         fn(*args)
     except Exception as e:  # noqa: BLE001
+        if isinstance(e, home.StartWaitFailed):
+            raise
         if terminal_identity and isinstance(e, common.SshHostKeyMismatch):
             raise
         err.append(e if isinstance(e, OffboxError) else OffboxError(f"{type(e).__name__}: {e}"))
@@ -2769,6 +2778,7 @@ def _background(a, me: dict) -> int:
         ready_r, ready_w = os.pipe()
         accept_r, accept_w = os.pipe()
         payload = json.dumps(dict(args=vars(a), me=me, env=dict(os.environ), backend=common.backend(),
+                                  home_wait_deadline=home.wait_budget_end(),
                                   ready_fd=ready_w, accept_fd=accept_r, signal_mask=list(mask))).encode()
         boot_env = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR')}
         with open(client_log, 'ab', opener=lambda p, f: os.open(p, f, 0o600)) as dst:
@@ -2857,8 +2867,9 @@ def background_queue(run_id: str, payload: dict) -> int:
     finally:
         con.close()
     os.environ[BACKGROUND_RUN_ENV] = run_id
-    return background_client(a, me, ready=payload['ready_fd'], accept=payload['accept_fd'],
-                             signal_mask=payload['signal_mask'], source_failure=source_failure)
+    with home.wait_budget(payload.get('home_wait_deadline')):
+        return background_client(a, me, ready=payload['ready_fd'], accept=payload['accept_fd'],
+                                 signal_mask=payload['signal_mask'], source_failure=source_failure)
 
 
 def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, source_failure=None) -> int:
@@ -2974,7 +2985,7 @@ def _run_attempt(a, me: dict) -> int:
         return _run_remote(a, rn)
     except OffboxError as e:
         e.started = e.started or rn.started
-        e.run_id, e.box = rn.run_id, rn.box
+        e.run_id, e.box = rn.run_id, rn.box or e.box
         raise
     except KeyboardInterrupt:
         if not rn.started:
@@ -3068,7 +3079,8 @@ def _run_remote(a, rn) -> int:
     old = {s: signal.signal(s, on_sig) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     try:
         try:
-            rn.start()
+            with home.pre_start(rn.run_id):
+                rn.start()
         except OffboxError as e:
             if not rn.started:
                 if not isinstance(e, common.SourceGone):

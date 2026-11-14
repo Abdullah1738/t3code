@@ -14,6 +14,7 @@ from . import api, capacity, common, ssh_sync
 from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, EXIT_INFRA, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
                      SshHostKeyMismatch, file_lock, iso, kv_get, kv_set, log, mine, new_id, now, read_json, say, token_owner, write)
 from .identity import remote_dir_for
+from .home import StartWaitFailed
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
 ARCHIVING_WAIT_S = 120
@@ -400,6 +401,9 @@ def ensure_ttl(box_id: str, ttl: int, s: dict | None = None) -> bool:
         api.set_ttl(box_id, ttl)
         return True
     except OffboxError as e:
+        if isinstance(e, StartWaitFailed) or (api.BACKEND == "server" and getattr(e, 'status', None) == 503
+                and getattr(e, 'api_code', None) in ('server_not_ready', 'server_starting')):
+            raise
         say(f"warning: could not set auto-stop on {box_id}: {e}")
         return False
 
@@ -621,7 +625,7 @@ def run_recipe(box_id: str, name: str, box_held: bool = False) -> None:
             pid = r["processId"]
             event(db(), box_id, "lease_recipe_pid", str(pid))
             code = _follow_bounded(box_id, pid, log_path, RECIPE_TIMEOUT_S)
-    except SshHostKeyMismatch:
+    except (SshHostKeyMismatch, StartWaitFailed):
         raise
     except Exception as e:  # noqa: BLE001 - an upload/start/follow error is a failed recipe like any other
         code = f"error: {e}"
@@ -681,7 +685,7 @@ def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_h
         try:
             ssh_sync.setup(box_id)
             ssh_sync.wait_ssh(box_id)
-        except (capacity.CapacityError, SshHostKeyMismatch):
+        except (capacity.CapacityError, SshHostKeyMismatch, StartWaitFailed):
             raise
         except OffboxError as e:
             raise BoxNotReady(box_id, s, e) from e
@@ -850,11 +854,13 @@ def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_he
                   recipe=source.split(":", 1)[1] if is_recipe else None, box_held=box_held, since=since)
         try:
             api.rename(box_id, box_name(me, me["repo_key"]))
+        except StartWaitFailed:
+            raise
         except OffboxError:
             pass
         if relocating:
             _relocate_base_checkout(con, box_id, base_dir, rdir, box_held=box_held)
-    except SshHostKeyMismatch:
+    except (SshHostKeyMismatch, StartWaitFailed):
         raise
     except api.SupplyOut as e:
         # boat never gave the box a machine: a plain box is dropped from our records; a recipe box is retired below.
@@ -1017,7 +1023,7 @@ def _wait_unanswered_resume(con, box_id):
                                              "nothing ran; set aside and trying a new box")
             try:
                 state = api.readiness_get(box_id, deadline=time.time() + left)
-            except api.BudgetExpired:
+            except (api.BudgetExpired, StartWaitFailed):
                 raise
             except OffboxError as error:
                 network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
@@ -1103,7 +1109,7 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
                 break
             try:
                 last = api.readiness_get(box_id, deadline=time.time() + left)
-            except api.BudgetExpired:
+            except (api.BudgetExpired, StartWaitFailed):
                 raise
             except OffboxError as error:
                 network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
@@ -1249,7 +1255,8 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
     except (allocation.Busy, allocation.Fenced) as error:
         error.resume_retry_box = box_id
         raise
-    except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled, BoxNotReady, SshHostKeyMismatch):
+    except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled, BoxNotReady,
+            SshHostKeyMismatch, StartWaitFailed):
         raise
     except OffboxError as e:
         if isinstance(e, common.SourceGone):
@@ -1388,6 +1395,8 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         # archiving, or a box that bounces back to idle, must not hold the caller for 15 minutes.
         try:
             s = api.wait_state(box_id, api.STOPPED_STATES, timeout=ARCHIVING_WAIT_S)
+        except StartWaitFailed:
+            raise
         except OffboxError:
             s = api.get(box_id)
             st = s and s.get("state")
@@ -1467,7 +1476,7 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
     elif st in api.LIVE_STATES or st in api.STARTING_STATES:
         try:
             _bring_up(box_id)
-        except (BoxNotReady, SshHostKeyMismatch):
+        except (BoxNotReady, SshHostKeyMismatch, StartWaitFailed):
             raise
         except OffboxError as e:
             raise ResumeUnresolved(f"{box_id} did not become ready; nothing ran: {e}", e) from e

@@ -168,3 +168,25 @@ def observe_outage(error=None):
     if budget is None or error is not None and api.client_budget_expired(error):
         return
     budget.outage_cause = error if error is not None and error.outage else None
+
+
+@contextlib.contextmanager
+def pause_for_home_start():
+    """An answering home server's startup has its own bound, outside box preparation time."""
+    budget = _ACTIVE.get()
+    if budget is None:
+        yield
+        return
+    began = time.monotonic()
+    main = threading.current_thread() is threading.main_thread()
+    timer = signal.setitimer(signal.ITIMER_REAL, 0) if main else None
+    token = _ACTIVE.set(None)
+    try:
+        yield
+    finally:
+        elapsed = time.monotonic() - began
+        for field in ('start', 'end', 'total_start', 'phase_start', 'next_progress'):
+            setattr(budget, field, getattr(budget, field) + elapsed)
+        _ACTIVE.reset(token)
+        if timer is not None:
+            signal.setitimer(signal.ITIMER_REAL, *timer)
