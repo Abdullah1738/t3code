@@ -8,10 +8,13 @@ import copy
 import fcntl
 import hashlib
 import json
+import math
 import os
 import tempfile
 import time
 import urllib.error
+import urllib.parse
+from datetime import datetime
 from pathlib import Path
 
 import location_reaper as reaper
@@ -99,6 +102,9 @@ def busy(directory, sid_dir, last, keep, now):
         # seen ID in this first snapshot must still have a known directory.
         if any(s not in sid_dir or sid_dir[s] == directory for s in active["data"]):
             return "running-session"
+    reason = live_queued_work(directory, now)
+    if reason:
+        return reason
     for route in ("/api/form", "/api/permission/request", "/api/shell"):
         if items(route, directory):
             return route.rsplit("/", 1)[-1]
@@ -107,23 +113,60 @@ def busy(directory, sid_dir, last, keep, now):
     return "running-session" if directory in running or unknown else None
 
 
-def globally_idle(loaded, last, keep, now):
-    """Fallback has no session-mapping assumption: any active ID blocks it."""
-    def active():
-        body = get("/api/session/active", dict)
-        if not isinstance(body.get("data"), dict):
-            raise ValueError("invalid active sessions")
-        return bool(body["data"])
+def live_queued_work(directory, now):
+    """The export can lag new inbox items; ask the owning service before evicting.
 
-    if active():
-        return False
-    for directory in loaded:
-        if directory in keep or now * 1000 - last.get(directory, 0) < reaper.ACTIVE_MIN * 60000:
-            return False
-        for route in ("/api/form", "/api/permission/request", "/api/shell"):
-            if items(route, directory):
-                return False
-    return not active()
+    Session listing is global and filtered by directory; it does not boot a
+    location. Visit every page, including children and archived sessions.
+    """
+    query = {"directory": directory, "order": "desc", "limit": 100}
+    first_path = "/api/session?" + urllib.parse.urlencode(query)
+    path, cursors, first_ids = first_path, set(), None
+    for _ in range(1000):
+        page = get(path, dict)
+        sessions, cursor = page.get("data"), page.get("cursor")
+        if not isinstance(sessions, list) or not isinstance(cursor, dict):
+            raise ValueError("invalid session page")
+        ids = []
+        for session in sessions:
+            sid = session["id"]
+            if not isinstance(sid, str) or not sid.startswith("ses_") or session["location"]["directory"] != directory:
+                raise ValueError("invalid session location")
+            ids.append(sid)
+            times = session["time"]
+            for key in ("created", "updated", "viewed"):
+                value = times.get(key)
+                if value is not None:
+                    if isinstance(value, str):
+                        at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                        if at.tzinfo is None:
+                            raise ValueError("session timestamp lacks timezone")
+                        ms = at.timestamp() * 1000
+                    else:
+                        ms = value
+                    if isinstance(ms, bool) or not isinstance(ms, (int, float)) or not math.isfinite(ms):
+                        raise ValueError("invalid session timestamp")
+                    if now * 1000 - ms < reaper.ACTIVE_MIN * 60000:
+                        return "recent-session"
+            inbox = get("/api/session/" + urllib.parse.quote(sid, safe="") + "/inbox", dict)
+            if not isinstance(inbox.get("data"), list):
+                raise ValueError("invalid session inbox")
+            if inbox["data"]:
+                return "queued-work"
+        if first_ids is None:
+            first_ids = ids
+        next_cursor = cursor.get("next")
+        if next_cursor is None:
+            # A session admitted during pagination is also work to defer to.
+            latest = get(first_path, dict)
+            if not isinstance(latest.get("data"), list):
+                raise ValueError("invalid session readback")
+            return "sessions-changed" if [s["id"] for s in latest["data"]] != first_ids else None
+        if not isinstance(next_cursor, str) or next_cursor in cursors:
+            raise ValueError("invalid session cursor")
+        cursors.add(next_cursor)
+        path = "/api/session?" + urllib.parse.urlencode({"cursor": next_cursor, "limit": 100})
+    raise ValueError("session page budget exhausted")
 
 
 def documents(entries, config):
@@ -239,9 +282,15 @@ def run(loaded, last, sid_dir, keep, *, dry_run=False, logs=None, home=None, con
                              if e.get("type") == "document" and e.get("path"))
                 version = version_for(paths)
                 previous = ledger.get(directory, {})
+                resolved = digest(observed_entries)
                 if previous.get("version") == version and previous.get("done"):
-                    st["unchanged"] += 1
-                    continue
+                    if previous.get("verified") is None or previous["verified"] == resolved:
+                        # A 204 is saved before warming the replacement. If that
+                        # readback failed, this first successful read completes it.
+                        previous["verified"] = resolved
+                        save()
+                        st["unchanged"] += 1
+                        continue
                 decision("stale-detected", directory, version=version)
                 reason = busy(directory, sid_dir, last, keep, now)
                 if reason:
@@ -264,7 +313,7 @@ def run(loaded, last, sid_dir, keep, *, dry_run=False, logs=None, home=None, con
                     # ambiguous send applied. Plugin-only changes have no such
                     # readback; leave those uncertain rather than guessing.
                     if previous.get("resolved_mismatch") and not mismatch:
-                        ledger[directory] = {"version": version, "done": True}
+                        ledger[directory] = {"version": version, "done": True, "verified": resolved}
                         save()
                         decision("reconciled", directory, version=version)
                         continue
@@ -296,51 +345,19 @@ def run(loaded, last, sid_dir, keep, *, dry_run=False, logs=None, home=None, con
                     # A definitive HTTP failure can be retried next cadence.
                     ledger[directory]["pending"] = False
                     save()
-                    if e.code == 405:
-                        # Only an explicit unsupported method allows fallback.
-                        # A missing/racing location (404) must never cause one.
-                        if state.get("global_attempt_at", 0) > now - 600:
-                            decision("retry-later", directory, reason="global-cooldown")
-                            continue
-                        current = get("/api/debug/location", list)
-                        dirs = [row["directory"] for row in current]
-                        if any(row.get("workspaceID") for row in current):
-                            raise ValueError("workspace location cannot be safely refreshed")
-                        versions = {}
-                        for d in dirs:
-                            entries = get("/api/config?" + reaper.loc_q(d), list)
-                            roots = inputs(d, home, config)
-                            roots.update(Path(e["path"]) for e in entries
-                                         if e.get("type") == "document" and e.get("path"))
-                            versions[d] = version_for(roots)
-                        if content_hash(shared_roots) != shared:
-                            raise ValueError("config changed before fallback")
-                        latest_last, latest_dirs = reaper.last_activity_by_dir()
-                        sid_dir.update(latest_dirs)
-                        if not globally_idle(dirs, latest_last, keep, now):
-                            decision("deferred-busy", directory, reason="global-fallback")
-                            continue
-                        state["global_attempt_at"] = now
-                        for d, v in versions.items():
-                            ledger[d] = {"version": v, "pending": True, "attempt_at": now,
-                                         "resolved_mismatch": False}
-                        save()
-                        status, _ = reaper.api("POST", "/api/location/reload")
-                        if status != 204:
-                            raise ValueError("global reload did not return 204")
-                        for d, v in versions.items():
-                            ledger[d] = {"version": v, "done": True}
-                        save()
-                        decision("reloaded", directory, version=version, scope="global")
-                        break
+                    # 2.0.22 has per-location eviction. Never broaden a failed
+                    # request into a global shutdown of unrelated locations.
                     raise
                 ledger[directory] = {"version": version, "done": True}
                 save()
                 decision("reloaded", directory, version=version, resolved_mismatch=mismatch)
                 # Boot fresh services now, particularly for the HOME model probe.
-                get("/api/config?" + reaper.loc_q(directory), list)
+                ledger[directory]["verified"] = digest(get("/api/config?" + reaper.loc_q(directory), list))
+                save()
             except Exception as e:
                 # HTTPError strings omit response payloads/config credentials.
+                if isinstance(e, urllib.error.HTTPError):
+                    e.close()
                 decision("failed", directory, error=type(e).__name__)
         save()
     except Exception as e:

@@ -43,6 +43,13 @@ class ConfigDrift(unittest.TestCase):
         self.global_calls = 0
         self.on_forms = None
         self.stale = set(self.loaded)
+        self.sessions = {d: [{"id": sid, "location": {"directory": d},
+                              "time": {"created": 1, "updated": 1}}]
+                         for sid, d in self.sid_dir.items()}
+        self.inboxes = {}
+        self.pages = {}
+        self.cursors = {}
+        self.models = {}
         self.last = {}
         self.keep = set()
         self.api_patch = mock.patch.object(reaper, "api", side_effect=self.api)
@@ -55,7 +62,8 @@ class ConfigDrift(unittest.TestCase):
 
     def entries(self, directory):
         return [{"type": "document", "path": str(self.file),
-                 "info": {"model": "stale"} if directory in self.stale else json.loads(self.file.read_text())}]
+                 "info": {"model": self.models[directory]} if directory in self.models else
+                         {"model": "stale"} if directory in self.stale else json.loads(self.file.read_text())}]
 
     def api(self, method, path):
         route, _, query = path.partition("?")
@@ -68,19 +76,35 @@ class ConfigDrift(unittest.TestCase):
                 return 200, {"data": self.active.copy()}
             if route == "/api/config":
                 return 200, self.entries(directory)
+            if route == "/api/session":
+                qs = urllib.parse.parse_qs(query)
+                directory = qs.get("directory", [None])[0]
+                index = 0
+                if "cursor" in qs:
+                    directory, index = self.cursors[qs["cursor"][0]]
+                pages = self.pages.get(directory, [self.sessions.get(directory, [])])
+                cursor = {}
+                if index + 1 < len(pages):
+                    key = directory + "#" + str(index + 1)
+                    self.cursors[key] = (directory, index + 1)
+                    cursor["next"] = key
+                return 200, {"data": pages[index], "cursor": cursor}
+            if route.startswith("/api/session/") and route.endswith("/inbox"):
+                return 200, {"data": self.inboxes.get(route.split("/")[3], [])}
             if route in ("/api/form", "/api/permission/request", "/api/shell"):
                 if route == "/api/form" and self.on_forms:
                     self.on_forms()
                 return 200, {"data": self.pending.get((route, directory), [])}
         if method == "DELETE" and route == "/api/debug/location":
-            if directory not in self.loaded:  # fresh reference probe cleanup
-                return 204, None
             if self.unsupported:
                 raise urllib.error.HTTPError("http://fake", 405, "unsupported", {}, None)
+            if directory not in self.loaded:  # fresh reference probe cleanup
+                return 204, None
             self.evictions.append(directory)
             if self.fail:
                 raise self.fail
             self.stale.discard(directory)
+            self.models.pop(directory, None)
             return 204, None
         if method == "POST" and route == "/api/location/reload":
             self.global_calls += 1
@@ -160,6 +184,51 @@ class ConfigDrift(unittest.TestCase):
             self.assertEqual(self.run_pass()["deferred_busy"], 2)
         self.assertEqual(self.evictions, [])
 
+    def test_live_inbox_types_and_session_positions_override_idle_export(self):
+        # Whole input class: four inbox item kinds in old root, child,
+        # archived, and later-page sessions, absent from the published export.
+        directory = str(self.home)
+        for kind in ("user", "synthetic", "compaction", "move"):
+            for position in ("root", "child", "archived", "later-page"):
+                with self.subTest(kind=kind, position=position):
+                    row = {"id": "ses_queued", "location": {"directory": directory},
+                           "time": {"created": 1, "updated": 1}}
+                    if position == "child":
+                        row["parentID"] = "ses_home"
+                    if position == "archived":
+                        row["time"]["archived"] = 1
+                    self.pages[directory] = [[row]] if position != "later-page" else [self.sessions[directory], [row]]
+                    self.inboxes["ses_queued"] = [{"type": kind}]
+                    self.run_pass()
+                    self.assertNotIn(directory, self.evictions)
+
+    def test_bad_live_session_pages_and_inbox_fail_closed(self):
+        original = self.api
+        for route, payload in [("/api/session?", {}),
+                               ("/api/session?", {"data": [], "cursor": "bad"}),
+                               ("/api/session/", {})]:
+            with self.subTest(route=route, payload=payload):
+                def malformed(method, path):
+                    return (200, payload) if path.startswith(route) else original(method, path)
+                with mock.patch.object(reaper, "api", side_effect=malformed):
+                    self.assertEqual(self.run_pass()["failed"], 2)
+                self.assertEqual(self.evictions, [])
+
+    def test_session_timestamp_shapes(self):
+        directory = str(self.home)
+        for value, expected in [(1, None), ("1970-01-01T00:00:00Z", None),
+                                (10000000, "recent-session"),
+                                ("1970-01-01T02:46:40+00:00", "recent-session"),
+                                (float("nan"), ValueError), (True, ValueError),
+                                ("1970-01-01T00:00:00", ValueError), ("bad", ValueError)]:
+            with self.subTest(value=value):
+                self.sessions[directory][0]["time"]["updated"] = value
+                if expected is ValueError:
+                    with self.assertRaises(ValueError):
+                        drift.live_queued_work(directory, 10000)
+                else:
+                    self.assertEqual(drift.live_queued_work(directory, 10000), expected)
+
     def test_malformed_safety_response_fails_closed(self):
         original = self.api
         def malformed(method, path):
@@ -196,13 +265,27 @@ class ConfigDrift(unittest.TestCase):
         self.assertEqual(self.run_pass(now=10301)["reconciled"], 2)
         self.assertEqual(len(self.evictions), 2)
 
-    def test_global_fallback_blocks_any_active_session(self):
+    def test_successful_eviction_with_failed_warmup_is_not_repeated(self):
+        original = self.api
+        failed = set()
+        def fail_warmup(method, path):
+            directory = urllib.parse.parse_qs(path.partition("?")[2]).get("location[directory]", [None])[0]
+            if path.startswith("/api/config?") and directory in self.evictions and directory not in failed:
+                failed.add(directory)
+                raise TimeoutError()
+            return original(method, path)
+        with mock.patch.object(reaper, "api", side_effect=fail_warmup):
+            self.assertEqual(self.run_pass()["reloaded"], 2)
+        self.assertEqual(self.run_pass(now=10301)["reloaded"], 0)
+        self.assertEqual(len(self.evictions), 2)
+
+    def test_unsupported_delete_never_reloads_global_with_active_session(self):
         self.unsupported = True
         self.active = {"ses_other": {}}
         self.run_pass()
         self.assertEqual(self.global_calls, 0)
 
-    def test_global_fallback_checks_all_forms_and_shells(self):
+    def test_unsupported_delete_never_reloads_global_with_forms_or_shells(self):
         self.unsupported = True
         for route in ("/api/form", "/api/permission/request", "/api/shell"):
             with self.subTest(route=route):
@@ -210,16 +293,41 @@ class ConfigDrift(unittest.TestCase):
                 self.run_pass()
                 self.assertEqual(self.global_calls, 0)
 
-    def test_global_fallback_once_and_ten_minute_cooldown(self):
+    def test_genuinely_unsupported_delete_fails_closed_even_when_idle(self):
         self.unsupported = True
-        self.assertEqual(self.run_pass()["reloaded"], 1)
-        self.run_pass(now=10301)
-        self.assertEqual(self.global_calls, 1)
+        self.assertEqual(self.run_pass()["failed"], 2)
+        self.assertEqual(self.global_calls, 0)
+        self.assertEqual(self.evictions, [])
+
+    def test_reverted_disk_edit_with_cached_intermediate_config_is_recovered(self):
+        self.run_pass()
+        self.evictions.clear()
         self.file.write_text('{"model":"two"}')
-        self.run_pass(now=10302)
-        self.assertEqual(self.global_calls, 1)
-        self.run_pass(now=10603)
-        self.assertEqual(self.global_calls, 2)
+        # Watcher observed B, then missed the revert to A between job runs.
+        self.models[str(self.home)] = "two"
+        self.file.write_text('{"model":"one"}')
+        self.assertEqual(self.run_pass(now=10301)["reloaded"], 1)
+        self.assertEqual(self.evictions, [str(self.home)])
+        self.assertEqual(self.run_pass(now=10602)["reloaded"], 0)
+
+    def test_local_edit_never_reloads_completed_home_version(self):
+        self.run_pass()
+        self.evictions.clear()
+        (self.other / "opencode.jsonc").write_text('{"model":"project"}')
+        self.run_pass(now=10601)
+        self.assertEqual(self.evictions, [str(self.other)])
+        self.assertEqual(self.global_calls, 0)
+
+    def test_new_location_with_pending_form_cannot_trigger_global_shutdown(self):
+        self.unsupported = True
+        def appear():
+            directory = str(self.root / "new-location")
+            if directory not in self.loaded:
+                self.loaded.append(directory)
+                self.pending[("/api/form", directory)] = [{}]
+        self.on_forms = appear
+        self.run_pass()
+        self.assertEqual(self.global_calls, 0)
 
     def test_404_never_triggers_global_reload(self):
         self.fail = urllib.error.HTTPError("http://fake", 404, "gone", {}, None)
