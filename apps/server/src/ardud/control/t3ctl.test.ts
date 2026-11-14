@@ -459,7 +459,7 @@ test("live CLI bounds a blackhole health request and validates --timeout", async
       ).on("error", reject);
     });
   const start = performance.now();
-  const result = await invoke("0.05");
+  const result = await invoke("0.5");
   NodeAssert.equal(result.code, 2);
   NodeAssert.match(JSON.parse(result.stdout).reason, /health.*timed out/);
   NodeAssert.equal(JSON.parse(result.stdout).stages.health.status, "timeout");
