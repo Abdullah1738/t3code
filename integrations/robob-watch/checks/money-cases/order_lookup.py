@@ -10,10 +10,15 @@ import time
 from zoneinfo import ZoneInfo
 
 
+class OutOfTime(ValueError):
+    """The caller had no budget to start a lookup."""
+
+
 def read(app, deadline=None):
-    remaining = 10 if deadline is None else min(10, deadline - time.time())
+    # Let subprocess.run reap the reader before the enclosing question alarm fires.
+    remaining = 10 if deadline is None else min(10, deadline - time.time() - 0.1)
     if remaining < 1:
-        raise ValueError('order lookup out of time')
+        raise OutOfTime('order lookup out of time')
     python = Path('~/.local/share/uv/tools/mitmproxy/bin/python').expanduser()
     root = Path(os.environ.get('MONEY_CASES_APP_API', '~/.local/share/app-api-cli')).expanduser()
     try:

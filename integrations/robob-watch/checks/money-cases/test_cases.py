@@ -2690,6 +2690,128 @@ class UnmatchedCharges(Base):
 
 
 class CheckBudget(Base):
+    def test_follow_rotates_across_budgeted_runs_even_with_the_same_timestamp(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(days=3, hours=n) for n in range(5)])
+        visited, clock = [], [1000.0]
+
+        def slow(charge, when, *a, **kw):
+            visited.append(when)
+            clock[0] += 3
+            return {'verdict': 'unverified', 'why': 'fixture unavailable', 'errors': ['fixture unavailable']}
+
+        with patch.object(mc.time, 'time', lambda: clock[0]), patch.object(mc, 'FOLLOW_EACH', 3), \
+                patch.object(mc.charges, 'explain', slow):
+            for _ in range(5):
+                mc.follow(self.data, now, self.root, clock[0] + 5, finder(), nobody)
+        self.assertEqual(len(set(visited)), 5)
+        self.assertEqual(len(visited), 5)
+
+    def test_tail_question_gets_a_full_slice_on_the_next_run(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(days=3, hours=n) for n in range(4)])
+        visited, clock = [], [1000.0]
+
+        def slow(charge, when, at_now, deadline, *a, **kw):
+            self.assertEqual(deadline - clock[0], mc.FOLLOW_EACH)
+            visited.append(when)
+            clock[0] += 5.5 if when == now - dt.timedelta(days=3) else 5
+            return {'verdict': 'unverified', 'why': 'fixture unavailable', 'errors': ['fixture unavailable']}
+
+        with patch.object(mc.time, 'time', lambda: clock[0]), patch.object(mc.charges, 'explain', slow):
+            for _ in range(2):
+                mc.follow(self.data, now, self.root, clock[0] + 20, finder(), nobody)
+        self.assertEqual(len(set(visited)), 4)
+
+    def test_follow_persists_cursor_before_an_interrupted_lookup(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(days=3, hours=n) for n in range(3)])
+        visited = []
+
+        def interrupted(charge, when, *a, **kw):
+            visited.append(when)
+            raise mc.CheckTimeout('whole check interrupted')
+
+        with patch.object(mc.charges, 'explain', interrupted):
+            for _ in range(3):
+                with self.assertRaises(mc.CheckTimeout):
+                    mc.follow(self.data, now, self.root, time.time() + 10, finder(), nobody)
+        self.assertEqual(len(set(visited)), 3)
+
+    def test_cursor_save_cannot_shorten_the_question_slice(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(days=3)])
+        clock, visited = [1000.0], []
+        write = mc.write_json
+
+        def slow_write(*args, **kw):
+            write(*args, **kw)
+            clock[0] += 1
+
+        def source(charge, when, at_now, deadline, *a, **kw):
+            visited.append(when)
+            self.assertEqual(deadline - clock[0], mc.FOLLOW_EACH)
+            clock[0] += 5.9
+            return {'verdict': 'unverified', 'why': 'fixture unavailable', 'errors': ['fixture unavailable']}
+
+        with patch.object(mc.time, 'time', lambda: clock[0]), patch.object(mc, 'write_json', slow_write), \
+                patch.object(mc.charges, 'explain', source):
+            mc.follow(self.data, now, self.root, 1006.5, finder(), nobody, end=1039)
+        self.assertEqual(len(visited), 1)
+
+    def test_cursor_commit_timeout_leaves_full_slice_before_outer_alarm(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(days=3)])
+        start = time.time()
+        with patch.object(mc, 'FOLLOW_EACH', 0.06), \
+                patch.object(mc.fcntl, 'flock', side_effect=lambda *a: time.sleep(0.2)), \
+                patch.object(mc.charges, 'explain') as source:
+            with self.assertRaisesRegex(mc.CheckTimeout, 'cursor commit'):
+                with mc.within(start + 0.2, mc.CheckTimeout('whole check out of time')):
+                    mc.follow(self.data, now, self.root, start + 0.1, finder(), nobody, end=start + 0.2)
+        self.assertNotIn('follow_cursor', mc.load_questions(self.data))
+        source.assert_not_called()
+
+    def test_follow_resumes_after_a_removed_cursor_question(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(days=3, hours=n) for n in range(3)])
+        visited = []
+
+        def interrupted(charge, when, *a, **kw):
+            visited.append(when)
+            raise mc.CheckTimeout('whole check interrupted')
+
+        with patch.object(mc.charges, 'explain', interrupted):
+            with self.assertRaises(mc.CheckTimeout):
+                mc.follow(self.data, now, self.root, time.time() + 10, finder(), nobody)
+            book = mc.load_questions(self.data)
+            book['questions'] = [q for q in book['questions'] if q['id'] != book['follow_cursor']['id']]
+            mc.write_json(self.data / 'questions.json', book)
+            with self.assertRaises(mc.CheckTimeout):
+                mc.follow(self.data, now, self.root, time.time() + 10, finder(), nobody)
+        self.assertNotEqual(visited[0], visited[1])
+
+    def test_owner_prefetch_leaves_budget_for_questions(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(hours=n) for n in range(3)])
+
+        def unavailable(*args, deadline=None):
+            self.assertEqual(deadline, 1004)
+            raise mc.LookupTimeout('out of time')
+
+        with patch.object(mc.time, 'time', return_value=1000):
+            mc.follow(self.data, now, self.root, 1020, finder(), unavailable)
+        self.assertTrue(all(q['checked'] and q['unverified'] for q in self.questions()))
+
+    def test_failed_owner_source_is_attempted_once_for_old_questions_per_run(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(days=3, hours=n) for n in range(3)])
+        with patch.object(mc.charges, 'owner_texts', side_effect=mc.charges.Lookup('Robob control: request failed or timed out')) as source:
+            errors = mc.follow(self.data, now, self.root, time.time() + 10, finder())
+        self.assertEqual(source.call_count, 1)
+        self.assertTrue(all(q['checked'] and q['unverified'] for q in self.questions()))
+        self.assertTrue(errors)
+
     def questions(self):
         return mc.load_questions(self.data)["questions"]
 
@@ -2771,13 +2893,13 @@ class CheckBudget(Base):
                 with patch.object(mc.os, 'replace', interrupted_replace):
                     with self.assertRaises(mc.CheckTimeout):
                         if action == 'close':
-                            mc.follow(self.data, now, self.root, time.time() + 5, finder(), owner)
+                            mc.follow(self.data, now, self.root, time.time() + 10, finder(), owner)
                         else:
                             with mc.Locked(self.data, 'questions') as book:
                                 mc.case_from(self.data, book['questions'][0], now, 'check', self.root)
                 self.assertEqual(self.questions()[0]['status'], 'case' if action == 'close' else 'open')
                 self.assertEqual(len(mc.load(self.data)['cases']), 1)
-                mc.follow(self.data, now, self.root, time.time() + 5, finder(), owner)
+                mc.follow(self.data, now, self.root, time.time() + 10, finder(), owner)
                 q = self.questions()[0]
                 self.assertEqual(q['status'], 'closed')
                 self.assertTrue(q['case_closed'])
@@ -2828,7 +2950,7 @@ class CheckBudget(Base):
                 if entry not in ('answered', 'readonly'):
                     self.assertEqual((q['status'], q['case']), ('case', cid))
                 self.assertEqual(mc.load(self.data)['cases'][0]['status'], 'open')
-                mc.follow(self.data, now, self.root, time.time() + 5, finder(), nobody)
+                mc.follow(self.data, now, self.root, time.time() + 10, finder(), nobody)
                 self.assertEqual(len(mc.load(self.data)['cases']), 1)
 
     def test_slow_run_logs_phase_times_and_counts(self):

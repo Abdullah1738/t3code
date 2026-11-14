@@ -390,5 +390,5 @@ class Accuracy(Base):
                     [], 0, json.dumps(result), '')) as run:
             self.assertEqual(lookup.read('noon', deadline=1003.0), result)
         argv = run.call_args.args[0]
-        self.assertEqual(float(argv[-1]), 1002.5)
-        self.assertEqual(run.call_args.kwargs['timeout'], 3.0)
+        self.assertEqual(float(argv[-1]), 1002.4)
+        self.assertEqual(run.call_args.kwargs['timeout'], 2.9)

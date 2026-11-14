@@ -2601,11 +2601,12 @@ def answered(data, qid, note, now=None):
 def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, stats=None):
     """Close questions a receipt or his words now explain, including ones already turned into money
     cases (FOLLOW_CASE). Asked questions remain awaiting_answer indefinitely. Least recently checked
-    first, at most FOLLOW_EACH seconds each, so one slow
-    question doesn't starve the rest. Lookups run outside the lock; returns lookup errors."""
+    first initially, then round robin. Persist the cursor before lookups so an interrupted
+    run cannot keep retrying its head. Lookups run outside the lock; returns lookup errors."""
     errors, hits, verdicts, looked, failed = [], {}, {}, set(), set()
     todo = []
-    questions = load_questions(data)['questions']
+    question_book = load_questions(data)
+    questions = question_book['questions']
     transactions = alert_verdicts(questions, now)
     cases, repaired = load(data)['cases'], set()
     for q in questions:
@@ -2636,14 +2637,27 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             todo.append((q.get('checked') or '', at, q))
     stats = stats if stats is not None else {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
     memo = {}
-    source = said or (lambda *a, **kw: charges.owner_texts(*a, **kw, stats=stats))
+    owner_source = said or (lambda *a, **kw: charges.owner_texts(*a, **kw, stats=stats))
+    source_error = None
+
+    def source(*args, **kwargs):
+        nonlocal source_error
+        if source_error is not None:
+            raise source_error
+        try:
+            return owner_source(*args, **kwargs)
+        except charges.Lookup as exc:
+            if str(exc) != 'out of time':
+                source_error = exc
+            raise
     charge_times = [at for _, at, q in todo if q.get('kind') == 'charge']
     owner_rows = None
     owner_error = None
     if charge_times and now - (min(charge_times) - charges.OWNER_AROUND) <= dt.timedelta(days=2):
         try:
-            with within(deadline, LookupTimeout('out of time')):
-                owner_rows = source(min(charge_times) - charges.OWNER_AROUND, now, deadline=deadline)
+            owner_end = min(deadline, time.time() + 4) if deadline is not None else time.time() + 4
+            with within(owner_end, LookupTimeout('out of time')):
+                owner_rows = source(min(charge_times) - charges.OWNER_AROUND, now, deadline=owner_end)
         except (charges.Lookup, LookupTimeout) as e:
             owner_error = f'his threads: {e}'
             errors.append(owner_error)
@@ -2654,15 +2668,32 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
             return source(since, until, deadline=deadline)
         return [row for row in owner_rows if since <= parse_time(row[0]) <= until]
 
-    for _, at, q in sorted(todo, key=lambda x: x[0]):
-        if deadline is not None and deadline - time.time() < 2:
+    ordered = sorted(todo, key=lambda x: (x[1], x[2]['id']))
+    cursor = question_book.get('follow_cursor')
+    if cursor:
+        previous = (parse_time(cursor['at']), cursor['id'])
+        ordered = [item for item in ordered if (item[1], item[2]['id']) > previous] + \
+                  [item for item in ordered if (item[1], item[2]['id']) <= previous]
+    else:
+        ordered.sort(key=lambda x: x[0])
+    for _, at, q in ordered:
+        # A shortened tail attempt can fail at the same point every cycle.
+        if deadline is not None and deadline - time.time() < FOLLOW_EACH:
             errors.append('out of time; the rest next check')
             break
+        commit_end = deadline
+        if end is not None:
+            latest = end - FOLLOW_EACH - 0.1
+            commit_end = min(commit_end, latest) if commit_end is not None else latest
+        with within(commit_end, CheckTimeout('cursor commit out of time; the rest next check')):
+            with Locked(data, 'questions', wait=lock_wait(commit_end)) as book:
+                book['follow_cursor'] = {'at': stamp(at), 'id': q['id']}
         looked.add(q['id'])
         before_errors = len(errors)
         if q.get('kind') == 'charge':
+            # Start the full slice after the cursor commit. The phase deadline admits
+            # work; the enclosing whole-check alarm still bounds storage and lookups.
             each = time.time() + FOLLOW_EACH
-            each = each if deadline is None else min(deadline, each)
             stats['lookups'] += 1
             try:
                 with within(each, LookupTimeout('out of time')):
