@@ -881,6 +881,46 @@ it.effect("discussion_post repeated returns the same message", () => {
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("a work thread is directed to its own discussion without creating another card's", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "post-guidance",
+      name: "Post guidance",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const own = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+    yield* kanban.dispatchNow;
+    const thread = (yield* kanban.card(own.id)).card.activeThreadId!;
+    const other = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
+
+    const refused = yield* call(thread, "discussion_post", {
+      card: `#${other.number}`,
+      text: "For the other card",
+    });
+    assert.isTrue(refused.isError, refused.text);
+    assert.include(refused.text, "capability_denied");
+    assert.include(
+      refused.text,
+      `This thread works on other cards; it can't post on card #${other.number}. Post it in your own card's discussion; the board's evaluator carries it over.`,
+    );
+    assert.isNull((yield* kanban.card(other.id)).card.discussionId);
+
+    const posted = yield* call(thread, "discussion_post", {
+      card: `#${own.number}`,
+      text: "For the evaluator to carry over",
+    });
+    assert.isFalse(posted.isError, posted.text);
+    const message = yield* decodeMessage(posted.structured.message);
+    const discussionId = (yield* kanban.card(own.id)).card.discussionId;
+    assert.strictEqual(discussionId, message.discussionId);
+    assert.deepStrictEqual(yield* kanban.messages(message.discussionId), [message]);
+    assert.isNull((yield* kanban.card(other.id)).card.discussionId);
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("a work thread reads another card's discussion but cannot post to that card", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {
@@ -915,7 +955,7 @@ it.effect("a work thread reads another card's discussion but cannot post to that
       assert.isTrue(posted.isError);
       assert.include(
         posted.text,
-        `This thread works on other cards; it can't change card #${other.number}.`,
+        `This thread works on other cards; it can't post on card #${other.number}. Post it in your own card's discussion; the board's evaluator carries it over.`,
       );
     }
     assert.lengthOf(yield* kanban.messages(discussion.id), 2);
@@ -958,7 +998,10 @@ it.effect.each(["work", "review"] as const)(
       });
       assert.isTrue(posted.isError, posted.text);
       assert.include(posted.text, "capability_denied");
-      assert.include(posted.text, `can't change card #${other.number}`);
+      assert.include(
+        posted.text,
+        `This thread works on other cards; it can't post on card #${other.number}. Post it in your own card's discussion; the board's evaluator carries it over.`,
+      );
       assert.deepStrictEqual(yield* kanban.discussion(discussion.id), before);
       assert.deepStrictEqual(yield* kanban.messages(discussion.id), messages);
 
@@ -1157,8 +1200,8 @@ it.effect(
         text: "Not mine",
       });
       assert.isTrue(theirs.isError);
-      assert.include(theirs.text, `can't change card #${other.number}`);
-      assert.include(theirs.text, "card_create");
+      assert.include(theirs.text, `can't post on card #${other.number}`);
+      assert.include(theirs.text, "your own card's discussion");
       for (const [index, ref] of [`#${other.number}`, String(other.number), other.id].entries()) {
         waiting = yield* Deferred.make<AnalyticsEvent>();
         waitingTool = "card_create";
@@ -6655,7 +6698,12 @@ it.effect(
               assert.equal(result.isError, denied, result.text);
               if (denied) {
                 assert.include(result.text, "capability_denied");
-                assert.include(result.text, `can't change card #${card.number}`);
+                assert.include(
+                  result.text,
+                  operation === "post"
+                    ? `can't post on card #${card.number}`
+                    : `can't change card #${card.number}`,
+                );
               }
               for (const row of [
                 yield* Deferred.await(pending.ledger),
