@@ -10,6 +10,7 @@ import {
   type KanbanCardEvent,
   type KanbanOwnerAsk,
   type KanbanPool,
+  type KanbanPoolChange,
   type KanbanStage,
   type KanbanThreadLink,
 } from "@t3tools/contracts";
@@ -458,6 +459,7 @@ export interface RollupInput {
   readonly events: ReadonlyArray<KanbanCardEvent>;
   readonly threads: ReadonlyArray<KanbanThreadLink>;
   readonly pools: ReadonlyArray<KanbanPool>;
+  readonly poolChanges?: ReadonlyArray<KanbanPoolChange> | undefined;
   /** Each active card's last stage change before the window (see stageSpans). */
   readonly prior?: ReadonlyArray<KanbanCardEvent> | undefined;
 }
@@ -818,6 +820,10 @@ export const rollup = (input: RollupInput) => {
         [`cardsWith${EVALUATOR_WAKES_LISTED}OrMore`]: capped(evaluatorWakes, max),
       },
     },
+    poolChanges: capped(
+      (input.poolChanges ?? []).filter((row) => inWindow(row.at, window)),
+      max,
+    ),
     pools: {
       slots: Object.fromEntries(input.pools.map((pool) => [pool.key, pool.slots])),
       hours: hourStarts.map((start) => `${isoOf(start).slice(0, 13)}Z`),

@@ -42,6 +42,23 @@ const McpOutcome = Schema.Literals([
   "interrupted_by_shutdown",
 ]);
 const McpPhase = Schema.Literals(["caller", "dispatch", "result", "handler"]);
+// Pool identities include custom model slugs and provider suffixes such as [1m].
+const PoolKey = Schema.String.check(
+  Schema.isMaxLength(4608),
+  Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+!~'()*\[\],=-]*$/),
+);
+const PoolChangeFields = {
+  poolKey: PoolKey,
+  fromPoolKey: Schema.optionalKey(PoolKey),
+  fromSlots: Schema.NullOr(Measurement),
+  toSlots: Schema.NullOr(Measurement),
+  op: Schema.Literals(["set", "add", "remove", "replace", "auto_zero"]),
+  actorKind: Schema.Literals(["evaluator", "owner", "script", "system"]),
+  actorId: Schema.NullOr(DerivedId),
+};
+export const KanbanPoolChange = Schema.Struct({ at: Timestamp, ...PoolChangeFields });
+export type KanbanPoolChange = typeof KanbanPoolChange.Type;
+
 const GeneralEvent = Schema.Struct({
   ts: Timestamp,
   kind: Label.check(Schema.makeFilter((kind) => kind !== "run.usage")),
@@ -111,7 +128,13 @@ const GeneralEvent = Schema.Struct({
       ),
       waitMs: Schema.optionalKey(Measurement),
       originKind: Schema.optionalKey(Label),
-      poolKey: Schema.optionalKey(Label),
+      poolKey: Schema.optionalKey(PoolKey),
+      fromPoolKey: Schema.optionalKey(PoolKey),
+      fromSlots: Schema.optionalKey(PoolChangeFields.fromSlots),
+      toSlots: Schema.optionalKey(PoolChangeFields.toSlots),
+      op: Schema.optionalKey(PoolChangeFields.op),
+      actorKind: Schema.optionalKey(PoolChangeFields.actorKind),
+      actorId: Schema.optionalKey(PoolChangeFields.actorId),
       key: Schema.optionalKey(Label),
       reason: Schema.optionalKey(Label),
       phase: Schema.optionalKey(Label),
@@ -378,10 +401,11 @@ export const AnalyticsRollup = Schema.Struct({
       ),
       openAsksAsOf: Schema.NullOr(Timestamp),
       incompleteAskSnapshots: Measurement,
+      poolChanges: Schema.optionalKey(Schema.Array(KanbanPoolChange)),
       poolUtilisation: Schema.Array(
         Schema.Struct({
           hour: Label,
-          poolKey: Label,
+          poolKey: PoolKey,
           samples: Measurement,
           used: Measurement,
           slots: Measurement,

@@ -52,6 +52,7 @@ import {
   type KanbanOwnerAsk,
   type KanbanParticipant,
   type KanbanPool,
+  type KanbanPoolChange,
   type KanbanStage,
   type KanbanThreadLink,
   type KanbanWait,
@@ -508,6 +509,7 @@ export interface KanbanServiceShape {
       readonly events: ReadonlyArray<KanbanCardEvent>;
       readonly threads: ReadonlyArray<KanbanThreadLink>;
       readonly pools: ReadonlyArray<KanbanPool>;
+      readonly poolChanges: ReadonlyArray<KanbanPoolChange>;
       /** Each card with an event in the window: its last stage change before it. */
       readonly prior: ReadonlyArray<KanbanCardEvent>;
     },
@@ -765,12 +767,12 @@ export interface KanbanServiceShape {
     boardId: KanbanBoard["id"],
     model: ModelSelection,
     slots: number | undefined,
-    options?: { readonly replaces?: string | undefined },
+    options?: { readonly replaces?: string | undefined; readonly actor?: PoolActor },
   ) => Effect.Effect<ReadonlyArray<KanbanPool>, KanbanError>;
   readonly removePool: (
     boardId: KanbanBoard["id"],
     model: ModelSelection,
-    options?: { readonly replaces?: string | undefined },
+    options?: { readonly replaces?: string | undefined; readonly actor?: PoolActor },
   ) => Effect.Effect<ReadonlyArray<KanbanPool>, KanbanError>;
   readonly setGoal: (
     boardId: KanbanBoard["id"],
@@ -1547,6 +1549,9 @@ const ownerRouteAsks = Context.Reference<ReadonlySet<string> | undefined>("Kanba
   defaultValue: () => undefined,
 });
 
+type PoolActor = Pick<KanbanPoolChange, "actorKind" | "actorId">;
+const SYSTEM_POOL_ACTOR: PoolActor = { actorKind: "system", actorId: null };
+
 const make = Effect.gen(function* () {
   const analytics = yield* Effect.serviceOption(Analytics.Analytics);
   // Measurements run inside the board operation's existing spans.
@@ -1566,6 +1571,45 @@ const make = Effect.gen(function* () {
     const buffered = yield* analyticsSink;
     if (buffered !== undefined) buffered.push(recorded);
     else yield* recordServerAnalytics(analytics.value, recorded);
+  });
+  const commitPoolChanges = Effect.fn("KanbanService.commitPoolChanges")(function* <A, E, R>(
+    boardId: KanbanBoardId,
+    changes: ReadonlyArray<{ before: KanbanPool | null; after: KanbanPool | null }>,
+    actor: PoolActor,
+    write: Effect.Effect<A, E, R>,
+    op?: "auto_zero",
+  ) {
+    return yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        const result = yield* write;
+        const at = yield* nowIso;
+        for (const { before, after } of changes) {
+          if (before?.key === after?.key && before?.slots === after?.slots) continue;
+          yield* recordAnalytics({
+            kind: "kanban.pool_change",
+            boardId,
+            ts: at,
+            props: {
+              poolKey: (after ?? before)!.key,
+              ...(before && after && before.key !== after.key ? { fromPoolKey: before.key } : {}),
+              fromSlots: before?.slots ?? null,
+              toSlots: after?.slots ?? null,
+              op:
+                op ??
+                (before === null
+                  ? "add"
+                  : after === null
+                    ? "remove"
+                    : before.key !== after.key
+                      ? "replace"
+                      : "set"),
+              ...actor,
+            },
+          });
+        }
+        return result;
+      }),
+    );
   });
   const analyticsActors = new WeakMap<KanbanCard, KanbanActor>();
   const preparedTransitions = new WeakSet<KanbanCard>();
@@ -11429,21 +11473,21 @@ const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const board = yield* tickBoardOf;
           if (board.archivedAt !== null) return;
-          let zeroed = false;
           for (const pool of yield* store.pools(board.id)) {
             if (pool.slots === 0 || isListed(listed, pool.model) !== false) continue;
             const id = `${board.id}:${pool.key}`;
             unlistedNow.add(id);
             if (!unlistedBefore.has(id)) continue;
-            yield* store.putPool(board.id, { ...pool, slots: 0 });
+            yield* setPoolUnlocked(
+              board.id,
+              pool.model,
+              0,
+              { actor: SYSTEM_POOL_ACTOR },
+              "auto_zero",
+            );
             yield* Effect.logInfo(
               `board ${board.slug}: pool ${pool.key} left the model list, now 0 slots`,
             );
-            zeroed = true;
-          }
-          if (zeroed) {
-            yield* publish(board.id, { _tag: "pools", pools: yield* store.pools(board.id) });
-            yield* kick;
           }
         }),
       );
@@ -11929,7 +11973,13 @@ const make = Effect.gen(function* () {
       createdAt: yield* nowIso,
       archivedAt: null,
     };
-    yield* store.putBoardWithPools(board, missingPools([], boardModels(board)));
+    const pools = missingPools([], boardModels(board));
+    yield* commitPoolChanges(
+      board.id,
+      pools.map((after) => ({ before: null, after })),
+      SYSTEM_POOL_ACTOR,
+      store.putBoardWithPools(board, pools),
+    );
     yield* publish(board.id, { _tag: "board", board });
     return board;
   });
@@ -12078,7 +12128,16 @@ const make = Effect.gen(function* () {
       // The timestamp, releases and stop obligations must survive or roll back together.
       yield* tickTransaction(
         Effect.gen(function* () {
-          yield* store.putBoardWithPools(next, pools, application);
+          yield* commitPoolChanges(
+            board.id,
+            pools.map((after) => ({ before: null, after })),
+            actor?._tag === "owner"
+              ? { actorKind: "owner", actorId: null }
+              : actor?._tag === "evaluator"
+                ? { actorKind: "evaluator", actorId: actor.threadId }
+                : SYSTEM_POOL_ACTOR,
+            store.putBoardWithPools(next, pools, application),
+          );
           for (const stop of stops) {
             yield* saveOwnerRoute(board.id, KanbanDiscussionId.make(stop.lane), stop.key, {
               kind: "effect",
@@ -12128,7 +12187,16 @@ const make = Effect.gen(function* () {
       for (const publication of publications)
         yield* publish(publication.boardId, publication.change);
     } else {
-      yield* store.putBoardWithPools(next, pools, application);
+      yield* commitPoolChanges(
+        board.id,
+        pools.map((after) => ({ before: null, after })),
+        actor?._tag === "owner"
+          ? { actorKind: "owner", actorId: null }
+          : actor?._tag === "evaluator"
+            ? { actorKind: "evaluator", actorId: actor.threadId }
+            : SYSTEM_POOL_ACTOR,
+        store.putBoardWithPools(next, pools, application),
+      );
     }
     if (pools.length > 0) {
       yield* publish(board.id, { _tag: "pools", pools: yield* store.pools(board.id) });
@@ -15583,6 +15651,7 @@ const make = Effect.gen(function* () {
     pools: ReadonlyArray<KanbanPool>,
     from: KanbanPool,
     to: KanbanPool,
+    poolActor: PoolActor,
   ) {
     const at = yield* nowIso;
     // `pools` is read before the move: a card is on `from` when its model resolves to it now.
@@ -15614,10 +15683,15 @@ const make = Effect.gen(function* () {
         work,
       });
     }
-    yield* store.rekeyBoard(
+    yield* commitPoolChanges(
       board.id,
-      [{ from: from.key, pool: to }],
-      moved.map((entry) => entry.card),
+      [{ before: from, after: to }],
+      poolActor,
+      store.rekeyBoard(
+        board.id,
+        [{ from: from.key, pool: to }],
+        moved.map((entry) => entry.card),
+      ),
     );
     const actor: KanbanActor = { _tag: "system", component: "pools" };
     const level = Rules.modelLevel(to.model) ?? "default";
@@ -15675,6 +15749,7 @@ const make = Effect.gen(function* () {
     model: ModelSelection,
     slots: number | undefined,
     replaces: string,
+    actor: PoolActor,
   ) {
     const pools = yield* store.pools(board.id);
     const from = pools.find((pool) => pool.key === replaces);
@@ -15703,7 +15778,13 @@ const make = Effect.gen(function* () {
     }
     if (key === from.key) {
       if (count === from.slots) return pools;
-      yield* store.putPool(board.id, { ...from, slots: count });
+      const after = { ...from, slots: count };
+      yield* commitPoolChanges(
+        board.id,
+        [{ before: from, after }],
+        actor,
+        store.putPool(board.id, after),
+      );
       return yield* store.pools(board.id);
     }
     if (pools.some((pool) => pool.key === key)) {
@@ -15712,60 +15793,70 @@ const make = Effect.gen(function* () {
         `${model.model} already has a pool at ${Rules.modelLevel(model) ?? "no level"}`,
       );
     }
-    yield* movePoolLevel(board, pools, from, { key, model, slots: count });
+    yield* movePoolLevel(board, pools, from, { key, model, slots: count }, actor);
     return yield* store.pools(board.id);
   });
 
-  const setPool: KanbanServiceShape["setPool"] = (boardId, model, slots, options) =>
-    guard(
-      "pool.set",
-      Effect.gen(function* () {
-        model = yield* canonicalModel(model);
-        const board = yield* boardOf(boardId);
-        if (options?.replaces !== undefined) {
-          const changed = yield* changePoolLevel(board, model, slots, options.replaces);
-          yield* publish(boardId, { _tag: "pools", pools: changed });
-          yield* kick;
-          return changed;
-        }
-        if (slots === undefined) return yield* failWith("invalid", "slots is required");
-        const count = Math.max(0, Math.round(slots));
-        const pools = yield* store.pools(board.id);
-        const same = pools.filter((pool) => Rules.modelKey(pool.model) === Rules.modelKey(model));
-        const offered = Result.isSuccess(yield* Effect.result(checkModel(model)));
-        // A pause at a level the provider doesn't offer pauses the model's only pool.
-        const existing =
-          (yield* namedPool(pools, model)) ??
-          (count === 0 && !offered && same.length === 1 ? same[0] : undefined);
-        // Pausing an existing pool must always work, even when its model has left the
-        // provider's catalog: the pool is being stopped, not started.
-        const pausing = count === 0 && existing !== undefined;
-        // A resize that names no level, or a pause at an unoffered level, keeps the pool's
-        // stored model, so a pool's level is never dropped or replaced by an unoffered one.
-        const stored =
-          existing !== undefined && (Rules.modelLevel(model) === null || (pausing && !offered))
-            ? existing.model
-            : model;
-        if (!pausing) yield* checkModel(stored);
-        // Unknown (null) never blocks; only a model the composer is known not to offer does.
-        const listed = isListed(yield* models.listed, stored);
-        if (listed === false && !pausing) {
-          return yield* failWith(
-            "invalid",
-            `${Rules.poolKey(stored)} isn't in the model list; pick a model the composer offers`,
-          );
-        }
-        yield* store.putPool(boardId, {
-          key: existing?.key ?? Rules.poolKey(stored),
-          model: stored,
-          slots: count,
-        });
-        const saved = yield* store.pools(boardId);
-        yield* publish(boardId, { _tag: "pools", pools: saved });
-        yield* kick;
-        return saved;
-      }),
+  const setPoolUnlocked = Effect.fn("KanbanService.setPoolUnlocked")(function* (
+    boardId: KanbanBoardId,
+    model: ModelSelection,
+    slots: number | undefined,
+    options?: Parameters<KanbanServiceShape["setPool"]>[3],
+    op?: "auto_zero",
+  ) {
+    const actor = options?.actor ?? SYSTEM_POOL_ACTOR;
+    // Automatic pauses target the stored selection even during a harness migration.
+    if (op !== "auto_zero") model = yield* canonicalModel(model);
+    const board = yield* boardOf(boardId);
+    if (options?.replaces !== undefined) {
+      const changed = yield* changePoolLevel(board, model, slots, options.replaces, actor);
+      yield* publish(boardId, { _tag: "pools", pools: changed });
+      yield* kick;
+      return changed;
+    }
+    if (slots === undefined) return yield* failWith("invalid", "slots is required");
+    const count = Math.max(0, Math.round(slots));
+    const pools = yield* store.pools(board.id);
+    const same = pools.filter((pool) => Rules.modelKey(pool.model) === Rules.modelKey(model));
+    const offered = Result.isSuccess(yield* Effect.result(checkModel(model)));
+    // A pause at a level the provider doesn't offer pauses the model's only pool.
+    const existing =
+      (yield* namedPool(pools, model)) ??
+      (count === 0 && !offered && same.length === 1 ? same[0] : undefined);
+    // Pausing an existing pool must always work, even when its model has left the
+    // provider's catalog: the pool is being stopped, not started.
+    const pausing = count === 0 && existing !== undefined;
+    // A resize that names no level, or a pause at an unoffered level, keeps the pool's
+    // stored model, so a pool's level is never dropped or replaced by an unoffered one.
+    const stored =
+      existing !== undefined && (Rules.modelLevel(model) === null || (pausing && !offered))
+        ? existing.model
+        : model;
+    if (!pausing) yield* checkModel(stored);
+    // Unknown (null) never blocks; only a model the composer is known not to offer does.
+    const listed = isListed(yield* models.listed, stored);
+    if (listed === false && !pausing) {
+      return yield* failWith(
+        "invalid",
+        `${Rules.poolKey(stored)} isn't in the model list; pick a model the composer offers`,
+      );
+    }
+    const after = { key: existing?.key ?? Rules.poolKey(stored), model: stored, slots: count };
+    yield* commitPoolChanges(
+      boardId,
+      [{ before: existing ?? null, after }],
+      actor,
+      store.putPool(boardId, after),
+      op,
     );
+    const saved = yield* store.pools(boardId);
+    yield* publish(boardId, { _tag: "pools", pools: saved });
+    yield* kick;
+    return saved;
+  });
+
+  const setPool: KanbanServiceShape["setPool"] = (boardId, model, slots, options) =>
+    guard("pool.set", setPoolUnlocked(boardId, model, slots, options));
 
   const removePool: KanbanServiceShape["removePool"] = (boardId, model, options) =>
     guard(
@@ -15814,7 +15905,12 @@ const make = Effect.gen(function* () {
             return yield* failWith("invalid", `card #${card.number} uses ${key}`);
           }
         }
-        yield* store.removePool(board.id, key);
+        yield* commitPoolChanges(
+          board.id,
+          [{ before: pool, after: null }],
+          options?.actor ?? SYSTEM_POOL_ACTOR,
+          store.removePool(board.id, key),
+        );
         const left = yield* store.pools(board.id);
         yield* publish(boardId, { _tag: "pools", pools: left });
         yield* kick;
@@ -16412,7 +16508,15 @@ const make = Effect.gen(function* () {
       const rekeyed = pools
         .filter((pool) => moves.has(pool.key))
         .map((pool) => ({ from: pool.key, pool: { ...pool, key: moves.get(pool.key)! } }));
-      yield* store.rekeyBoard(board.id, rekeyed, cards);
+      yield* commitPoolChanges(
+        board.id,
+        rekeyed.map(({ from, pool }) => ({
+          before: pools.find((old) => old.key === from)!,
+          after: pool,
+        })),
+        SYSTEM_POOL_ACTOR,
+        store.rekeyBoard(board.id, rekeyed, cards),
+      );
       for (const { from, pool } of rekeyed) {
         yield* Effect.logInfo(`board ${board.slug}: pool ${from} is now ${pool.key}`);
       }
@@ -16706,6 +16810,45 @@ const make = Effect.gen(function* () {
     );
   }, Effect.mapError(toKanbanError));
 
+  const migrationPools = Effect.fn("KanbanService.migrationPools")(
+    function* () {
+      const pools = new Map<KanbanBoardId, ReadonlyArray<KanbanPool>>();
+      for (const board of yield* rawStore.boards)
+        pools.set(board.id, yield* rawStore.pools(board.id));
+      return pools;
+    },
+    Effect.catchCause((cause) =>
+      Effect.logWarning("kanban migration pool audit read failed", { cause }).pipe(
+        Effect.as(new Map<KanbanBoardId, ReadonlyArray<KanbanPool>>()),
+      ),
+    ),
+  );
+  const auditPoolMigration = Effect.fn("KanbanService.auditPoolMigration")(function* <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+  ) {
+    return yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        const before = yield* migrationPools();
+        const outcome = yield* Effect.exit(effect);
+        const after = yield* migrationPools();
+        for (const [boardId, previous] of before) {
+          const next = after.get(boardId);
+          if (next === undefined) continue;
+          // Selection migrations retain pool row order, including when their keys change.
+          const changes = Array.from(
+            { length: Math.max(previous.length, next.length) },
+            (_, index) => ({
+              before: previous[index] ?? null,
+              after: next[index] ?? null,
+            }),
+          );
+          yield* commitPoolChanges(boardId, changes, SYSTEM_POOL_ACTOR, Effect.void);
+        }
+        return Exit.isSuccess(outcome) ? outcome.value : yield* Effect.failCause(outcome.cause);
+      }),
+    );
+  });
+
   return KanbanService.of({
     ready: Deferred.await(startupReady),
     boards: readDb(store.boards),
@@ -16713,7 +16856,7 @@ const make = Effect.gen(function* () {
       Deferred.await(startupReady).pipe(
         Effect.andThen(
           locks
-            .exclusive(effect)
+            .exclusive(auditPoolMigration(effect))
             .pipe(Effect.provideService(BoardLocks.operationName, "selectionMigration")),
         ),
       ),
@@ -16861,6 +17004,37 @@ const make = Effect.gen(function* () {
                 );
           return { ...read, prior };
         }),
+      ).pipe(
+        Effect.flatMap((read) =>
+          Effect.gen(function* () {
+            const poolChanges: KanbanPoolChange[] = [];
+            if (Option.isSome(analytics)) {
+              yield* analytics.value.flush;
+              const end = Date.parse(window.until);
+              for (
+                let at = Math.floor(Date.parse(window.since) / 86_400_000) * 86_400_000;
+                at < end;
+                at += 86_400_000
+              ) {
+                const result = yield* analytics.value.read({
+                  day: DateTime.formatIsoDateUtc(DateTime.makeUnsafe(at)),
+                  boardId,
+                  kind: "kanban.pool_change",
+                  limit: 1,
+                });
+                for (const board of result.rollup.boards)
+                  if (board.boardId === boardId)
+                    poolChanges.push(
+                      ...(board.poolChanges ?? []).filter(
+                        (row) => row.at >= window.since && row.at < window.until,
+                      ),
+                    );
+              }
+            }
+            return { ...read, poolChanges };
+          }),
+        ),
+        Effect.mapError(toKanbanError),
       ),
     cardByNumber: (boardId, number) => readDb(store.cardByNumber(boardId, number)),
     cards: (boardId, options) =>
