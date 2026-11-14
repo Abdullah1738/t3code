@@ -168,6 +168,7 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
                     ".local/libexec/card-preview/cardpreview.py", ".local/libexec/qcard/render.py",
                     ".local/bin/toollog", ".local/libexec/toollog/toollog.py",
                     ".local/bin/qcard", ".local/bin/quint", ".local/bin/himalaya-heal", ".local/bin/mailsearch",
+                    ".local/bin/timeout",
                     "Library/LaunchAgents/local.ardud.otp-idle.plist",
                     "Library/LaunchAgents/com.ardud.9router-log-poll.plist",
                     ".local/bin/robob-read-watchdog",
@@ -178,6 +179,7 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
             self.assertTrue(os.path.isfile(self.live(rel)), rel)
         self.assertTrue(os.access(self.live(".local/bin/qcard"), os.X_OK))
         self.assertTrue(os.access(self.live(".local/bin/quint"), os.X_OK))
+        self.assertTrue(os.access(self.live(".local/bin/timeout"), os.X_OK))
         loads = [c for c in self.calls_log() if c.startswith("bootstrap")]
         self.assertEqual(len(loads), 14, self.calls_log())
         self.assertTrue(os.access(self.live(".local/bin/mirage-beacon-keepalive"), os.X_OK))

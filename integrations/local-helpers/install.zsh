@@ -387,7 +387,7 @@ for label marker in "${(@kv)restarts}"; do
   fi
 done
 
-# Smoke test the installed copy (offline: parses, imports, plist lint, a qcard sample, the uber wrapper).
+# Smoke test the installed copy (offline: parses, imports, plist lint, a qcard sample, timeout, the uber wrapper).
 fail=0
 smoke() { "$@" >/dev/null 2>&1 || { print -u2 "local-helpers: smoke failed: $*"; fail=1 } }
 lib="$HOME/.local/libexec"
@@ -411,6 +411,7 @@ smoke zsh -n "$HOME/.local/share/lydia-ticks/tunnel.sh"
 for f in power-unplug-telegram.sh battery-low-telegram.sh cards-tunnel cards-tunnel-setup cards-health robob-read-watchdog quint; do
   smoke zsh -n "$HOME/.local/bin/$f"
 done
+smoke env -i PATH=/usr/bin:/bin "$HOME/.local/bin/timeout" 5 /usr/bin/true
 # The way the watchers run it: bare PATH, no nvm.
 if uber_ours; then
   smoke env -i HOME="$HOME" PATH=/usr/bin:/bin /usr/bin/perl -e 'alarm 20; exec @ARGV or die "exec failed: $!\n"' "$uber" --version
