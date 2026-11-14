@@ -25120,13 +25120,16 @@ it.live("an owner move of a working card replies before its thread is let go", (
       assert.notInclude(fake.interrupted, threadId);
       assert.deepStrictEqual(
         (yield* effectRows).map((row) => [row.kind, row.done_at]),
-        [["interrupt", null]],
+        [
+          ["interrupt", null],
+          ["pruneWakes", null],
+        ],
       );
       yield* Deferred.succeed(release, undefined);
       const rows = yield* eventually(effectRows, (all) => all.every((row) => row.done_at !== null));
       assert.deepStrictEqual(
         rows.map((row) => row.outcome),
-        ["delivered"],
+        ["delivered", "delivered"],
       );
       assert.strictEqual(fake.interrupted.filter((id) => id === threadId).length, 1);
     }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
@@ -25255,7 +25258,10 @@ it.live("a saved follow-on cut by a stop is run once after the restart", () =>
       );
       assert.deepStrictEqual(
         rows.map((row) => [row.kind, row.outcome]),
-        [["interrupt", "delivered"]],
+        [
+          ["interrupt", "delivered"],
+          ["pruneWakes", "delivered"],
+        ],
       );
       assert.strictEqual(fake.interrupted.filter((id) => id === threadId).length, 1);
       assert.strictEqual((yield* kanban.card(cardId)).card.stage, "todo");
@@ -25378,7 +25384,7 @@ it.live.each(
         assert.deepStrictEqual(order.slice(from), [`interrupt ${threadId}`, `send ${threadId}`]);
         assert.deepStrictEqual(
           (yield* effectRows).map((row) => row.outcome),
-          ["delivered"],
+          ["delivered", "delivered"],
         );
       }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
     }),
@@ -25768,7 +25774,10 @@ it.effect(
         }
         assert.deepStrictEqual(
           rows.map((row) => [row.kind, row.outcome]),
-          [["interrupt", "undeliverable"]],
+          [
+            ["interrupt", "undeliverable"],
+            ["pruneWakes", "delivered"],
+          ],
         );
         const events = (yield* kanban.card(card.id)).events;
         assert.isTrue(
@@ -26056,7 +26065,9 @@ it.live(
           rows.map((row) => [row.kind, row.outcome]),
           [
             ["release", "superseded"],
+            ["pruneWakes", "delivered"],
             ["interrupt", "delivered"],
+            ["pruneWakes", "delivered"],
           ],
         );
         yield* Effect.sleep("100 millis");
