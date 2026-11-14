@@ -128,6 +128,7 @@ import { KanbanModels, isListed } from "./models.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
 import { planCutoverCardRestore, type RestoreCutoverCardInput } from "./cutoverCards.ts";
 import * as BoardLocks from "./boardLocks.ts";
+import * as ThreadCommandExecutor from "../../../orchestration-v2/ThreadCommandExecutor.ts";
 import * as LockedStore from "./lockedStore.ts";
 import * as TickTimings from "./tickTimings.ts";
 import * as SavedWrite from "./savedWrite.ts";
@@ -1619,6 +1620,7 @@ const make = Effect.gen(function* () {
     TickTimings.measure("event_persistence", boardSql.withTransaction(effect), true);
   const store = LockedStore.wrap(rawStore, locks);
   const threadIo = yield* KanbanThreads;
+  const turnAdmission = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const inFlightSends = new Map<ThreadId, number>();
   const delivering = new Map<
     KanbanCard["id"],
@@ -14131,10 +14133,10 @@ const make = Effect.gen(function* () {
     io: typeof threadIo,
   ) {
     if (card.activeThreadId === null) return false;
+    const queued = yield* io.queuedRuns(card.activeThreadId);
     const view = yield* io.view(card.activeThreadId);
     // A missing/failed read cannot prove the owner is idle. PR watches alone may park.
-    if (view?.state !== "idle" || view.backgroundWork > 0) return true;
-    return (yield* io.queuedRuns(card.activeThreadId)).length > 0;
+    return queued.length > 0 || view?.state !== "idle" || view.backgroundWork > 0;
   });
 
   const waitCard: KanbanServiceShape["waitCard"] = (cardId, input, actor) =>
@@ -14245,20 +14247,27 @@ const make = Effect.gen(function* () {
           target === null
             ? undefined
             : new Map([[target.id as string, yield* waitTargetFacts(target, card.boardId)]]);
-        // The preliminary read releases the board gate. Re-read without replay or
-        // releasing it before the first write, so a newly live turn keeps its card.
-        if (yield* activeWaitThreadRunning(card, threadIo)) {
-          const live = Waits.checkWait(card, request, actor, yield* nowMillis);
-          if (!live.ok) return yield* failWith(live.code, live.reason);
-        }
-        yield* logEvent(next, actor, Waits.waitEventKind("wait_set"), {
-          fromStage: card.stage === next.stage ? null : card.stage,
-          toStage: card.stage === next.stage ? null : next.stage,
-          body:
-            Waits.waitSetBody(wait, known) +
-            (card.stalled !== null ? ` (replaces the stalled flag: ${card.stalled.reason})` : ""),
+        // Cleanup may cancel queued wakes through turn admission, so finish it
+        // before taking that non-reentrant lock. Logging/saving reuse this candidate.
+        yield* prepareTransition(next);
+        const park = Effect.gen(function* () {
+          if (yield* activeWaitThreadRunning(card, threadIo)) {
+            const live = Waits.checkWait(card, request, actor, yield* nowMillis);
+            if (!live.ok) return yield* failWith(live.code, live.reason);
+          }
+          yield* logEvent(next, actor, Waits.waitEventKind("wait_set"), {
+            fromStage: card.stage === next.stage ? null : card.stage,
+            toStage: card.stage === next.stage ? null : next.stage,
+            body:
+              Waits.waitSetBody(wait, known) +
+              (card.stalled !== null ? ` (replaces the stalled flag: ${card.stalled.reason})` : ""),
+          });
+          yield* saveCard(next);
         });
-        yield* saveCard(next);
+        // The board gate alone cannot order this write against new turns.
+        yield* card.activeThreadId === null
+          ? park
+          : turnAdmission.withLock(card.activeThreadId, park);
         if (card.activeThreadId !== null) yield* kick;
         return next;
       }),
@@ -16959,4 +16968,6 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(KanbanService, make);
+export const layer = Layer.effect(KanbanService, make).pipe(
+  Layer.provide(ThreadCommandExecutor.layer),
+);

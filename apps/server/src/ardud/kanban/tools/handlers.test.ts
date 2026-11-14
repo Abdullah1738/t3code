@@ -39,6 +39,7 @@ import * as McpHttpServer from "../../../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import { liveThreadShell } from "../../../mcp/McpToolAccess.testkit.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as ThreadCommandExecutor from "../../../orchestration-v2/ThreadCommandExecutor.ts";
 import { OrchestratorProjectionError } from "../../../orchestration-v2/Orchestrator.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as ServerConfig from "../../../config.ts";
@@ -360,6 +361,7 @@ const fakeThreads = (
       }),
     ),
     Layer.provideMerge(serviceLayer),
+    Layer.provideMerge(ThreadCommandExecutor.layer),
     Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(threads),
     Layer.provideMerge(storeLayer),
@@ -4848,6 +4850,85 @@ it.effect.each(["running", "queued", "race"] as const)(
       assert.strictEqual(after.card.stage, "working");
       assert.deepStrictEqual(after.events, before.events);
       if (state === "race") assert.strictEqual(reads, 2);
+    }).pipe(Effect.provide(fake.layer));
+  },
+);
+
+it.effect.each([2, 3])(
+  "#1462 refuses a turn starting during queue read %s",
+  (startAtRead) => {
+    const fake = fakeThreads();
+    return Effect.gen(function* () {
+      const { kanban, owned, worker } = yield* ownedWaitFixture;
+      let queueReads = 0;
+      fake.queued.has = (id) => {
+        if (id === worker && ++queueReads === startAtRead) fake.running.add(worker);
+        return false;
+      };
+      const result = yield* call(evaluatorThread, "card_wait", {
+        card: owned.id,
+        on: "time",
+        until: "1970-01-01T01:00:00.000Z",
+        note: "retry the deployment",
+        wakeRole: "work",
+      });
+      const after = (yield* kanban.card(owned.id)).card;
+      assert.isTrue(fake.running.has(worker), "the new turn started before the wait write");
+      assert.isTrue(
+        result.isError,
+        `accepted a live turn: stage=${after.stage}, activeThreadId=${after.activeThreadId}, wait=${after.wait?.on}`,
+      );
+      assert.isUndefined(after.wait);
+      assert.strictEqual(after.activeThreadId, worker);
+    }).pipe(Effect.provide(fake.layer));
+  },
+);
+
+it.effect.each(["event", "card"] as const)(
+  "#1462 turn admission waits through the %s write",
+  (boundary) => {
+    const fake = fakeThreads();
+    return Effect.gen(function* () {
+      const { store, owned, worker } = yield* ownedWaitFixture;
+      const admission = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+      const writing = yield* Deferred.make<void>();
+      const commit = yield* Deferred.make<void>();
+      const attempting = yield* Deferred.make<void>();
+      const holdCommit = Deferred.succeed(writing, undefined).pipe(
+        Effect.andThen(Deferred.await(commit)),
+      );
+      if (boundary === "event") {
+        fake.storeControl.beforeCardEvent = (event) =>
+          event.cardId === owned.id && event.body?.startsWith("Waiting ") ? holdCommit : Effect.void;
+      } else {
+        fake.storeControl.beforeCardWrite = () => holdCommit;
+      }
+      const parking = yield* call(evaluatorThread, "card_wait", {
+        card: owned.id,
+        on: "time",
+        until: "1970-01-01T01:00:00.000Z",
+        note: "retry the deployment",
+        wakeRole: "work",
+      }).pipe(Effect.forkChild);
+      yield* Deferred.await(writing);
+      const starting = yield* Deferred.succeed(attempting, undefined).pipe(
+        Effect.andThen(
+          admission.withLock(worker, Effect.gen(function* () {
+            const parked = yield* store.card(owned.id);
+            assert.strictEqual(parked?.wait?.on, "time");
+            assert.isNull(parked?.activeThreadId);
+            fake.running.add(worker);
+          })),
+        ),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(attempting);
+      assert.isFalse(fake.running.has(worker));
+      yield* Deferred.succeed(commit, undefined);
+      const result = yield* Fiber.join(parking);
+      assert.isFalse(result.isError, result.text);
+      yield* Fiber.join(starting);
+      assert.isTrue(fake.running.has(worker));
     }).pipe(Effect.provide(fake.layer));
   },
 );
