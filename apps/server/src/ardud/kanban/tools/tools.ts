@@ -124,7 +124,13 @@ const SubtasksInput = describe(
           "Who does it: the worker, the reviewer (ticked when the review passes), an evaluator, or a board script (the script ticks it from its output; the evaluator hears about it only if the script hands it back). Required for a new subtask; omitted on an existing open id, keeps its owner. Done and skipped subtasks keep their owner.",
         ),
       ),
-      gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
+      gate: Schema.optional(Schema.NullOr(Schema.Literals(["deploy", "money", "secret"]))),
+      clearGate: Schema.optional(
+        describe(
+          TrimmedNonEmptyString,
+          "Evaluators: remove a gate the board guessed on this existing subtask, with the reason it is wrong. Abdullah gets a notice. A gate set on purpose can't be cleared this way; ask him naming the subtask id.",
+        ),
+      ),
       interrupting: Schema.optional(
         describe(
           Schema.Boolean,
@@ -749,6 +755,17 @@ const WikiRead = tool(
   { readonly: true },
 );
 
+const GatedResult = {
+  gated: Schema.Array(
+    Schema.Struct({
+      id: Schema.String,
+      gate: Schema.Literals(["deploy", "money", "secret"]),
+      source: Schema.Literals(["guessed"]),
+    }),
+  ),
+  message: Schema.optional(Schema.String),
+};
+
 const CardCreate = tool(
   "card_create",
   "Create a card",
@@ -783,7 +800,7 @@ const CardCreate = tool(
     ),
     subtasks: Schema.optional(SubtasksInput),
   },
-  { card: Record, brief: Schema.optional(Schema.String) },
+  { card: Record, brief: Schema.optional(Schema.String), ...GatedResult },
   { readonly: false },
 );
 
@@ -833,7 +850,7 @@ const CardEdit = tool(
     subtasks: Schema.optional(SubtasksInput),
     comment: Schema.optional(Schema.String),
   },
-  { card: Record },
+  { card: Record, ...GatedResult },
   { readonly: false },
 );
 
