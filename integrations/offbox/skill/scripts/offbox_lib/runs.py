@@ -10,6 +10,7 @@ import re
 import select
 import shlex
 import signal
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -1361,6 +1362,21 @@ done''' if repo_key == "crpko-devops" else ':'),
     return "\n".join(lines)
 
 
+def _source_present(root: Path, cwd: Path) -> None:
+    for path in (root, cwd):
+        try:
+            present = stat.S_ISDIR(path.stat().st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            present = False
+        if not present:
+            raise common.SourceGone(path)
+    try:
+        os.getcwd()
+    except FileNotFoundError:
+        # A path can have been recreated while this process still holds its deleted inode.
+        raise common.SourceGone(cwd) from None
+
+
 class Runner:
     def __init__(self, a, me: dict):
         self.a, self.me = a, me
@@ -1372,6 +1388,7 @@ class Runner:
         except ValueError:
             self.rel = "."
         self.box = None
+        self.queue_s = 0.0
         self.pid = None
         self.started = False
         self.registered = False
@@ -1384,6 +1401,30 @@ class Runner:
         self.push_resumed = False
         self.wait_images = False
         self.log_path = LOGS_DIR / f"{self.run_id}.log"
+
+    def check_source(self, checkpoint):
+        try:
+            _source_present(self.root, self.cwd)
+        except common.SourceGone as error:
+            error.checkpoint = checkpoint
+            raise
+
+    def source_gone(self, error):
+        message = f"{error} (queued {self.queue_s:.1f}s; box {self.box or 'none'})"
+        error.args = (message,)
+        with log_lock(self.run_id):
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open('ab') as stream:
+                stream.write(f"offbox: {message}\n".encode())
+                length = stream.tell()
+            _commit(self.log_path, 0, 0, length)
+        self.record(error=message)
+        with contextlib.closing(db()) as con:
+            with write(con):
+                con.execute('DELETE FROM pool_cap_callers WHERE run_id=?', (self.run_id,))
+            event(con, self.box, 'run_source_gone',
+                  f'{self.run_id} checkpoint={error.checkpoint} queue_s={self.queue_s:.1f} box={self.box or "none"} {message}')
+        finish(self.run_id, 2, 'source_gone', catch_up=False, bookkeeping=False)
 
     def _log_pool(self, con):
         import toollog
@@ -1489,11 +1530,17 @@ class Runner:
         replacement = None
         while True:
             options = {'exclude': self.cold_boxes} if self.cold_boxes else {}
-            row = replacement or pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh,
-                                              run_id=self.run_id, **options)
+            queued_at = time.monotonic()
+            try:
+                row = replacement or pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh,
+                                                  run_id=self.run_id, check_source=lambda: self.check_source('queued'),
+                                                  **options)
+            finally:
+                self.queue_s += time.monotonic() - queued_at
             replacement = None
             self.lease_row = row
             self.box = row["box_id"]
+            self.check_source('slot')
             rdir = row["remote_dir"]
             self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
                         docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
@@ -1703,6 +1750,7 @@ class Runner:
         return None
 
     def _sync_box(self, con, a, rdir, env_file, body):
+        self.check_source('push')
         # Env values go through a 0600 file (never the command text, which boat keeps 90 days in history).
         err: list = []
         left = api.left()
@@ -1721,6 +1769,7 @@ class Runner:
             if not a.no_sync:
                 with prepare.phase("push", self.box):
                     candidates = _seed_candidates(con, self.box, rdir, self.me["repo_key"])
+                    self.check_source('push')
                     st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None),
                                        seed_candidates=candidates, run_id=self.run_id)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
@@ -1743,6 +1792,8 @@ class Runner:
             if tw is not None:
                 left = api.left()
                 tw.join(timeout=max(0, left) if left is not None else None)
+        if isinstance(push_exc, common.SourceGone):
+            raise push_exc
         # Identity failures take precedence over transfer recovery, even if the other transfer saw a dead mount.
         for e in (push_exc, err[0] if err else None):
             if isinstance(e, common.SshHostKeyMismatch):
@@ -2486,6 +2537,8 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
     st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
     def prepare_result():
         nonlocal code, st
+        if status == 'source_gone':
+            return  # No command or step ran; only the caller's source check failed.
         prior = run
         if prior is None:
             with contextlib.closing(db()) as before:
@@ -2870,11 +2923,14 @@ def _run_remote(a, rn) -> int:
             rn.start()
         except OffboxError as e:
             if not rn.started:
-                if e.code == EXIT_LOCAL:
+                if isinstance(e, common.SourceGone):
+                    rn.source_gone(e)
+                elif e.code == EXIT_LOCAL:
                     finish(rn.run_id, EXIT_LOCAL, "local_error")
                 elif not os.environ.get(BACKGROUND_RUN_ENV):
                     finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
-            rn.record(error=str(e)[:500])
+            if not isinstance(e, common.SourceGone):
+                rn.record(error=str(e)[:500])
             raise
         if a.bg and rn.recovered_code is not None:
             from . import start_check

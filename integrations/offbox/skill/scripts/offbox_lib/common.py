@@ -448,6 +448,16 @@ class OffboxError(Exception):
         self.outage = outage     # boat.dev's own API was unreachable (Cloudflare 52x or no answer)
 
 
+class SourceGone(OffboxError):
+    """The caller removed its source before the remote command started."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.checkpoint = 'push'
+        super().__init__(f"source checkout {path} was removed while the run was queued; nothing ran on the box",
+                         code=2, started=False)
+
+
 class SshHostKeyMismatch(OffboxError):
     """A terminal SSH identity failure: never replace a box or fall back to local execution."""
 
