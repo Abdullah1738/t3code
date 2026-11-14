@@ -92,6 +92,16 @@ class LoggingTests(unittest.TestCase):
         self.assertNotIn('fixture.dropped', tail)
         self.assertIn('fixture.error', tail)
 
+    def test_operational_messages_match_js_without_retaining_arbitrary_text(self):
+        for message in ('Robob replica is stale; recovery deferred',
+                        'Bearer opaque /home/user@example.invalid/key sk-private', 'private prompt'):
+            toollog.emit('test', 'fixture.failure', kind='error',
+                         error={'tag': 'REPLICA_UNAVAILABLE', 'message': message})
+        rows = self.rows()
+        self.assertEqual(rows[0]['error']['message'], 'Robob replica is stale; recovery deferred')
+        self.assertEqual(rows[1]['error']['message'], 'REPLICA_UNAVAILABLE')
+        self.assertEqual(rows[2]['error']['message'], 'REPLICA_UNAVAILABLE')
+
     def test_rollup_fixture_and_cli(self):
         self.root.mkdir()
         rows = [dict(tool='9router', name='img.result', kind='perf', ok=True, durationMs=n) for n in range(1, 101)]
