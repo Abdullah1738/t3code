@@ -22,7 +22,7 @@ class Socket extends NodeEvents.EventEmitter {
   writableEnded = false;
   writable = true;
   destroyed = false;
-  _httpMessage?: { headersSent: boolean };
+  _httpMessage?: { _headerSent: boolean };
   write = vi.fn();
   destroy(_error?: Error) {
     if (!this.destroyed) {
@@ -120,7 +120,7 @@ describe("HTTP socket telemetry", () => {
 
   it("does not append an error response to a started response or take over another handler", () => {
     const t = setup();
-    t.socket._httpMessage = { headersSent: true };
+    t.socket._httpMessage = { _headerSent: true };
     t.server.emit("clientError", new Error(), t.socket);
     expect(t.socket.write).not.toHaveBeenCalled();
     const other = setup();
@@ -139,6 +139,7 @@ describe("HTTP socket telemetry", () => {
     t.socket.bytesRead++;
     vi.runAllTimers();
     expect(t.socket.destroyed).toBe(false);
+    t.respond();
     t.server.emit("timeout", t.socket);
     vi.runAllTimers();
     expect(t.socket.destroyed).toBe(true);
@@ -169,7 +170,10 @@ describe("HTTP socket telemetry", () => {
     t.advance(1);
     t.socket.emit("error", Object.assign(new Error(), { code: "ECONNRESET" }));
     expect(t.records.at(-1)?.fields.recentReset).toBe(false);
+    expect(t.socket.listenerCount("data")).toBe(0);
     t.socket.writableEnded = true;
+    t.socket.emit("finish");
+    expect(t.socket.listenerCount("data")).toBe(1);
     t.socket.emit("data", Buffer.from("private bytes"));
     t.socket.readableLength = 7;
     t.socket.destroy();
@@ -192,7 +196,7 @@ describe("HTTP socket telemetry", () => {
     t.sample();
     expect(t.records.pop()?.fields.idleSockets).toBe(1);
     t.socket.bytesRead++;
-    t.socket.emit("data", Buffer.from("P"));
+    expect(t.socket.listenerCount("data")).toBe(0);
     t.sample();
     expect(t.records.pop()?.fields.idleSockets).toBe(0);
   });
@@ -203,6 +207,9 @@ describe("HTTP socket telemetry", () => {
     t.server.emit("upgrade", {}, t.socket);
     expect(t.socket.listenerCount("data")).toBe(0);
     expect(t.socket.listenerCount("error")).toBe(0);
+    t.socket.writableEnded = true;
+    t.socket.emit("finish");
+    expect(t.socket.listenerCount("data")).toBe(0);
     t.socket.readableLength = 7;
     t.socket.destroy();
     t.advance(60_000);
@@ -273,6 +280,158 @@ describe("HTTP socket telemetry", () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+
+  it("keeps the native parser consumed on healthy connections, responses and reuse", async () => {
+    const telemetry = makeHttpSocketTelemetry(() => {});
+    const server = telemetry.instrument(NodeHttp.createServer());
+    const sockets = new Set<NodeNet.Socket>();
+    const consumed: Array<boolean | undefined> = [];
+    const observe = (socket: NodeNet.Socket) => {
+      consumed.push(
+        (socket as NodeNet.Socket & { parser?: { _consumed: boolean } }).parser?._consumed,
+      );
+    };
+    server.on("connection", (socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+      observe(socket);
+    });
+    server.on("request", (request, response) => {
+      observe(request.socket);
+      response.on("finish", () => observe(request.socket));
+      request.resume();
+      response.end("ok");
+    });
+    const agent = new NodeHttp.Agent({ keepAlive: true, maxSockets: 1 });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("Expected TCP listener");
+    const post = () =>
+      new Promise<boolean>((resolve, reject) => {
+        const request = NodeHttp.request(
+          { host: "127.0.0.1", port: address.port, method: "POST", agent },
+          (response) => {
+            response.resume();
+            response.on("end", () => resolve(request.reusedSocket));
+          },
+        );
+        request.on("error", reject);
+        request.end("body");
+      });
+    try {
+      expect(await post()).toBe(false);
+      expect(await post()).toBe(true);
+      expect(consumed).toEqual([true, true, true, true, true]);
+    } finally {
+      agent.destroy();
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  // The complete response-state class: no response, unprepared, prepared,
+  // flushed headers and a body write. Only bytes already written suppress 400.
+  it.each([
+    {
+      name: "no request dispatched",
+      prepare: (_response: NodeHttp.ServerResponse) => {},
+      request: "INVALID\r\n\r\n",
+      status: 400,
+    },
+    {
+      name: "headers unprepared",
+      prepare: (_response: NodeHttp.ServerResponse) => {},
+      status: 400,
+    },
+    {
+      name: "writeHead only",
+      prepare: (response: NodeHttp.ServerResponse) => {
+        response.writeHead(200);
+      },
+      status: 400,
+    },
+    {
+      name: "headers flushed",
+      prepare: (response: NodeHttp.ServerResponse) => {
+        response.writeHead(200);
+        response.flushHeaders();
+      },
+      status: 200,
+      readyBytes: "\r\n\r\n",
+    },
+    {
+      name: "body written",
+      prepare: (response: NodeHttp.ServerResponse) => {
+        response.write("ok");
+      },
+      status: 200,
+      readyBytes: "ok",
+    },
+  ])(
+    "matches Node's malformed-request wire response with $name",
+    async ({ prepare, request, status, readyBytes }) => {
+      const exchange = async (instrumented: boolean) => {
+        const raw = NodeHttp.createServer();
+        const server = instrumented ? makeHttpSocketTelemetry(() => {}).instrument(raw) : raw;
+        const sockets = new Set<NodeNet.Socket>();
+        server.on("connection", (socket) => {
+          sockets.add(socket);
+          socket.on("close", () => sockets.delete(socket));
+        });
+        const prepared = Promise.withResolvers<void>();
+        server.on("request", (incoming, response) => {
+          incoming.on("error", () => {});
+          response.sendDate = false;
+          prepare(response);
+          prepared.resolve();
+        });
+        await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+        const address = server.address();
+        if (address === null || typeof address === "string")
+          throw new Error("Expected TCP listener");
+        const client = NodeNet.connect(address.port, "127.0.0.1");
+        let received = "";
+        const receivedBytes = Promise.withResolvers<void>();
+        try {
+          const closed = new Promise<void>((resolve, reject) => {
+            client.on("data", (chunk) => {
+              received += chunk.toString();
+              if (readyBytes !== undefined && received.includes(readyBytes))
+                receivedBytes.resolve();
+            });
+            client.on("error", (error) => {
+              prepared.reject(error);
+              receivedBytes.reject(error);
+              reject(error);
+            });
+            client.on("close", () => resolve());
+          });
+          await new Promise<void>((resolve, reject) => {
+            client.once("connect", resolve);
+            client.once("error", reject);
+          });
+          client.write(
+            request ??
+              "POST /mcp HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n",
+          );
+          if (request === undefined) {
+            await prepared.promise;
+            if (readyBytes !== undefined) await receivedBytes.promise;
+            client.write("Z\r\n");
+          }
+          await closed;
+          return received;
+        } finally {
+          client.destroy();
+          for (const socket of sockets) socket.destroy();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+      };
+      const native = await exchange(false);
+      expect(native).toMatch(new RegExp(`^HTTP/1\\.1 ${status} `));
+      expect(await exchange(true)).toBe(native);
+    },
+  );
 
   it.effect("writes diagnostics through the Effect tracer", () =>
     Effect.gen(function* () {

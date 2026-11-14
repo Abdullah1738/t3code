@@ -13,6 +13,7 @@ export type SocketRecord = Readonly<Record<string, string | number | boolean>>;
 type Report = (name: string, fields: SocketRecord) => void;
 
 interface SocketState {
+  socket: NodeNet.Socket;
   idle: boolean;
   upgraded: boolean;
   requests: number;
@@ -26,9 +27,7 @@ interface SocketState {
 // State and handlers are allocated per connection; requests only update the state and
 // attach the same finish handler to the response object Node already owns.
 export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
-  const states = new WeakMap<NodeStream.Duplex, SocketState>();
-  let idleSockets = 0;
-  let openSockets = 0;
+  const states = new Map<NodeStream.Duplex, SocketState>();
   let idleCloses = 0;
   let rescued = 0;
   let destroysWithUnreadBytes = 0;
@@ -36,10 +35,14 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
   let recentResets = 0;
   let summaryAt = now();
 
-  function setIdle(state: SocketState, idle: boolean) {
-    if (state.idle === idle) return;
-    idleSockets += idle ? 1 : -1;
-    state.idle = idle;
+  function isIdle(state: SocketState | undefined) {
+    return (
+      state !== undefined &&
+      state.idle &&
+      !state.socket.destroyed &&
+      !state.socket.writableEnded &&
+      state.socket.bytesRead === state.lastResponseBytesRead
+    );
   }
 
   function fields(socket: NodeNet.Socket, state = states.get(socket)): SocketRecord {
@@ -48,7 +51,7 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
       bytesWritten: socket.bytesWritten,
       localPort: state?.localPort ?? socket.localPort ?? 0,
       remotePort: state?.remotePort ?? socket.remotePort ?? 0,
-      idleKeepAlive: state?.idle ?? false,
+      idleKeepAlive: isIdle(state),
       readableLength: socket.readableLength,
       serverEnded: socket.writableEnded,
       upgraded: state?.upgraded ?? false,
@@ -63,10 +66,7 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
     state.requests--;
     state.lastResponseAt = now();
     state.lastResponseBytesRead = socket.bytesRead;
-    setIdle(
-      state,
-      state.requests === 0 && this.shouldKeepAlive && !socket.destroyed && !socket.writableEnded,
-    );
+    state.idle = state.requests === 0 && this.shouldKeepAlive;
   }
 
   function instrument<T extends NodeHttp.Server>(server: T): T {
@@ -76,6 +76,7 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
     server.headersTimeout = 100_000;
     server.on("connection", (socket: NodeNet.Socket) => {
       const state: SocketState = {
+        socket,
         idle: false,
         upgraded: false,
         requests: 0,
@@ -86,17 +87,15 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
         remotePort: socket.remotePort ?? 0,
       };
       states.set(socket, state);
-      openSockets++;
-      socket.on("close", () => {
-        setIdle(state, false);
-        openSockets--;
-      });
-      const onData = () => {
-        if (state.upgraded) return;
-        // Node's parser runs first; incomplete headers also make a socket non-idle.
-        if (state.requests > 0 || socket.bytesRead !== state.lastResponseBytesRead)
-          setIdle(state, false);
+      socket.on("close", () => states.delete(socket));
+      const onLateData = () => {
         if (socket.writableEnded) dataAfterEnd++;
+      };
+      // A data/readable listener unconsumes Node's native HTTP parser. Observe
+      // late bytes only after the server's writable side has finished.
+      const onFinish = () => {
+        state.idle = false;
+        if (!socket.destroyed) socket.on("data", onLateData);
       };
       const onError = (error: NodeJS.ErrnoException) => {
         if (state.upgraded) return;
@@ -111,7 +110,7 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
           recentReset,
         });
       };
-      socket.on("data", onData);
+      socket.on("finish", onFinish);
       socket.on("error", onError);
       const destroy = socket.destroy;
       socket.destroy = function (error) {
@@ -120,7 +119,8 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
         return destroy.call(this, error);
       };
       state.detachHttp = () => {
-        socket.off("data", onData);
+        socket.off("finish", onFinish);
+        socket.off("data", onLateData);
         socket.off("error", onError);
         socket.destroy = destroy;
       };
@@ -128,14 +128,14 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
     server.on("request", (request, response) => {
       const state = states.get(request.socket);
       if (!state) return;
-      setIdle(state, false);
+      state.idle = false;
       state.requests++;
       response.on("finish", responseFinished);
     });
     server.on("upgrade", (_request, socket) => {
       const state = states.get(socket);
       if (!state) return;
-      setIdle(state, false);
+      state.idle = false;
       state.upgraded = true;
       state.detachHttp();
     });
@@ -148,9 +148,10 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
       // Match Node 24: never append HTTP bytes to an already-started response.
       // Respect any additional error handler installed by the server's caller.
       if (server.listenerCount("clientError") > 1) return;
-      const active = (socket as NodeNet.Socket & { _httpMessage?: NodeHttp.ServerResponse })
+      const active = (socket as NodeNet.Socket & { _httpMessage?: { _headerSent: boolean } })
         ._httpMessage;
-      if (socket.writable && !active?.headersSent) {
+      // writeHead() prepares headers; only _headerSent tracks Node's wire state.
+      if (socket.writable && !active?._headerSent) {
         const status =
           error.code === "HPE_HEADER_OVERFLOW"
             ? "431 Request Header Fields Too Large"
@@ -165,12 +166,16 @@ export function makeHttpSocketTelemetry(report: Report, now = Date.now) {
     });
     return deferIdleSocketClose(server, (socket, outcome) => {
       if (outcome === "rescued") rescued++;
-      else if (states.get(socket)?.idle) idleCloses++;
+      else if (isIdle(states.get(socket))) idleCloses++;
     });
   }
 
   function sample() {
-    report("server.http.socket.sample", { openSockets, idleSockets });
+    // Read native byte counters at the telemetry cadence, without installing a
+    // healthy-socket data listener just to notice an unfinished next request.
+    let idleSockets = 0;
+    for (const state of states.values()) if (isIdle(state)) idleSockets++;
+    report("server.http.socket.sample", { openSockets: states.size, idleSockets });
     const at = now();
     if (at - summaryAt < 60_000) return;
     report("server.http.socket.summary", {
