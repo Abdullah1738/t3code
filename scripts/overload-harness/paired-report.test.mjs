@@ -9,6 +9,7 @@ import {
   IDLE_RULE_EPOCH_MS,
   batchValidity,
   hostEvidenceFailures,
+  clarifiedHostFailures,
   selectAttempts,
   storageFailures,
   measurementFailures,
@@ -889,6 +890,19 @@ const cliEvidence = async (change = async () => {}) => {
         jobSnapshots: samples,
         armRunIds: runs.map((r) => r.offboxRunId),
       };
+      if (batch >= 5) {
+        host.samplingSchema = 2;
+        host.samplingIntervalMs = 30000;
+        for (const sample of samples) {
+          sample.samplingSchema = 2;
+          sample.samplingIntervalMs = 30000;
+          sample.scheduledAtMs = sample.collectedAtMs;
+          sample.collectionStartedAtMs = sample.collectedAtMs;
+          sample.sourceLocalRowCount = sample.jobs.length;
+          sample.signedDelta = { running: 0, queued: 0 };
+          sample.opaque = [];
+        }
+      }
       const pre = {
         classificationPolicyHash: hash,
         coverageVerified: true,
@@ -1001,3 +1015,79 @@ it.each([
   },
   15000,
 );
+
+describe("clarified co-load evidence from batch5", () => {
+  const fixture = () => {
+    const stamp = LOADED_TEST_EPOCH;
+    const runs = ["A", "B", "C"].map((arm, i) => ({
+      offboxRunId: `fixture-${arm}`,
+      offboxBoxId: `fixture-box-${arm}`,
+      startedAt: new Date(stamp + 45000).toISOString(),
+      wallMs: 600000,
+      pairedMeasurement: { steadyEpochMs: stamp + 165000 },
+      suiteExecution: { batch: 5, arm },
+    }));
+    const samples = Array.from({ length: 23 }, (_, i) => ({
+      samplingSchema: 2,
+      samplingIntervalMs: 30000,
+      scheduledAtMs: stamp + 150000 + i * 30000,
+      collectionStartedAtMs: stamp + 150000 + i * 30000,
+      collectedAtMs: stamp + 150100 + i * 30000,
+      host: { ts: (stamp + 150000 + i * 30000) / 1000, running_cmds: 4, queued_cmds: 0 },
+      jobs: [
+        {
+          runId: "fixture-error",
+          running: null,
+          queued: null,
+          apiVerified: false,
+          error: { type: "TimeoutError" },
+        },
+      ],
+      sourceLocalRowCount: 1,
+      signedDelta: { running: 4, queued: 0 },
+      opaque: [{ kind: "opaque", state: "running", count: 4 }],
+    }));
+    const host = {
+      samplingSchema: 2,
+      samplingIntervalMs: 30000,
+      fromEpochMs: stamp + 165000,
+      toEpochMs: stamp + 765000,
+      armRunIds: runs.map((r) => r.offboxRunId),
+      samples,
+    };
+    const pre = {
+      condition: "loaded",
+      ruleStartedAtMs: IDLE_RULE_EPOCH_MS,
+      exclusiveArmBoxes: true,
+      otherJobs: [],
+      armedRunIds: runs.map((r) => r.offboxRunId),
+      checkedAtMs: stamp,
+      launchAtMs: stamp + 45000,
+    };
+    return { runs, host, pre };
+  };
+  const LOADED_TEST_EPOCH = Date.parse("2026-11-14T05:00:00Z");
+  it("records exposed view errors and signed mismatches without invalidating", () => {
+    const { runs, host, pre } = fixture();
+    expect(clarifiedHostFailures(host, pre, runs)).toEqual([]);
+    expect(hostEvidenceFailures(host, pre, runs)).toEqual([]);
+  });
+  it.each(["timeout", "reset"])("retains %s status errors as context", (kind) => {
+    const { runs, host, pre } = fixture();
+    host.samples[0].jobs[0].error.type =
+      kind === "timeout" ? "TimeoutError" : "ConnectionResetError";
+    expect(clarifiedHostFailures(host, pre, runs)).toEqual([]);
+  });
+  it.each([
+    ["missed schedule", (h) => h.samples.splice(4, 1)],
+    ["sampler crash", (h) => (h.samples[4].snapshotError = { type: "TimeoutError" })],
+    ["dropped local row", (h) => (h.samples[4].sourceLocalRowCount = 2)],
+    ["delta missing", (h) => delete h.samples[4].signedDelta],
+    ["opaque count missing", (h) => (h.samples[4].opaque = [])],
+    ["long gap", (h) => (h.samples[4].collectionStartedAtMs += 70000)],
+  ])("invalidates %s", (_, change) => {
+    const { runs, host, pre } = fixture();
+    change(host);
+    expect(clarifiedHostFailures(host, pre, runs).length).toBeGreaterThan(0);
+  });
+});

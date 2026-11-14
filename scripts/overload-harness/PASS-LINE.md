@@ -202,6 +202,10 @@ A loaded batch counts on the same terms (no Warn-level stalls), plus one extra c
 
 Land R8's fixes before batch 3, and launch on the reviewed tree. There's no need to wait for me after that. Go on the rule above.
 
+> "Clarification 14 Nov ~08:45 Dubai (evaluator, #1352, before batch 4 results): host co-load evidence. The co-load condition is met when (a) the sampler took a host snapshot at every scheduled interval across the steady window, with no gap over 2× the interval, and (b) each snapshot lists every job offbox shows, by run id where offbox exposes one and as a counted 'opaque' entry where it doesn't, and records offbox's running/queued counters next to the listed entries with any mismatch recorded as a signed delta. Missing identities and counter mismatches that come from offbox's own view are recorded, not failed. A batch is INVALID on co-load only if (a) fails, or the sampler crashed or returned nothing for an interval. The own-cgroup pressure |A−C| ≤ 2.0 pp check, box exclusivity, storage and placement proofs, and the no-Warn-stall rule are unchanged."
+
+Evaluator follow-up: "If 5 and 6 are both INVALID, stop and report before using 7 and 8." Batch4 retains the old sampler/wording because the worker confirmed its read race; the corrected sampler and clarification apply from5.
+
 Evaluator q4, verbatim:
 
 Pressure is required (revision 0). A zero throttled_usec under cpu.max=unlimited can't show contention, because nothing can throttle. A zero steal in /proc/stat on Incus is the host's view, and on bare metal steal is always 0. Both counters read zero whatever happens, so they don't count as available for the gate.

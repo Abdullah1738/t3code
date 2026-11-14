@@ -323,7 +323,106 @@ export const batchValidity = (runs) => {
   return failures;
 };
 
+export const clarifiedHostFailures = (host, preflight, runs) => {
+  const failures = [];
+  const from = Math.min(...runs.map((r) => r.pairedMeasurement?.steadyEpochMs));
+  const to = Math.max(...runs.map((r) => r.pairedMeasurement?.steadyEpochMs + r.wallMs));
+  const ids = runs
+    .map((r) => r.offboxRunId)
+    .sort()
+    .join();
+  if (
+    host?.samplingSchema !== 2 ||
+    host?.samplingIntervalMs !== 30000 ||
+    !finite(host?.fromEpochMs) ||
+    !finite(host?.toEpochMs) ||
+    host.fromEpochMs > from ||
+    host.toEpochMs < to ||
+    !Array.isArray(host.armRunIds) ||
+    host.armRunIds.slice().sort().join() !== ids
+  )
+    failures.push("clarified host window/schema/arm evidence missing");
+  const samples = host?.samples;
+  if (
+    !Array.isArray(samples) ||
+    samples.length < 2 ||
+    samples[0]?.collectionStartedAtMs > from ||
+    samples.at(-1)?.collectedAtMs < to
+  )
+    failures.push("clarified host samples do not cover steady window");
+  else
+    for (const [i, x] of samples.entries()) {
+      if (!x || !x.host) {
+        failures.push("clarified host scheduled interval returned no snapshot");
+        continue;
+      }
+      if (
+        x?.samplingSchema !== 2 ||
+        x.samplingIntervalMs !== 30000 ||
+        x.snapshotError ||
+        !x.host ||
+        !finite(x.scheduledAtMs) ||
+        !finite(x.collectionStartedAtMs) ||
+        !finite(x.collectedAtMs) ||
+        x.collectionStartedAtMs < x.scheduledAtMs ||
+        x.collectedAtMs < x.collectionStartedAtMs ||
+        x.collectedAtMs - x.collectionStartedAtMs > 60000 ||
+        (i > 0 &&
+          (Math.abs(x.scheduledAtMs - samples[i - 1].scheduledAtMs - 30000) > 1 ||
+            x.collectionStartedAtMs - samples[i - 1].collectionStartedAtMs > 60000 ||
+            x.collectedAtMs - samples[i - 1].collectedAtMs > 60000))
+      )
+        failures.push("clarified host scheduled interval missed or sampler returned nothing");
+      if (
+        !Array.isArray(x.jobs) ||
+        x.jobs.length !== x.sourceLocalRowCount ||
+        new Set(x.jobs.map((j) => j?.runId)).size !== x.jobs.length ||
+        x.jobs.some((j) => !j || typeof j.runId !== "string" || (!j.apiVerified && !j.error))
+      )
+        failures.push("clarified host sampler dropped a local row or its error");
+      else {
+        const running = x.jobs.filter((j) => j.running === true).length,
+          queued = x.jobs.filter((j) => j.queued === true).length;
+        if (
+          x.signedDelta?.running !== x.host.running_cmds - running ||
+          x.signedDelta?.queued !== x.host.queued_cmds - queued ||
+          !Array.isArray(x.opaque) ||
+          ["running", "queued"].some(
+            (state) =>
+              x.opaque
+                .filter((o) => o.state === state && o.kind === "opaque")
+                .reduce((n, o) => n + o.count, 0) !== Math.max(0, x.signedDelta[state]),
+          )
+        )
+          failures.push("clarified host signed delta/opaque context missing or wrong");
+      }
+    }
+  const boxes = runs.map((r) => r.offboxBoxId);
+  if (
+    preflight?.ruleStartedAtMs !== IDLE_RULE_EPOCH_MS ||
+    preflight?.exclusiveArmBoxes !== true ||
+    !Array.isArray(preflight?.otherJobs) ||
+    preflight.otherJobs.some((j) => boxes.includes(j.boxId)) ||
+    preflight?.armedRunIds?.slice().sort().join() !== ids ||
+    !finite(preflight?.checkedAtMs) ||
+    !finite(preflight?.launchAtMs) ||
+    preflight.launchAtMs < preflight.checkedAtMs ||
+    preflight.launchAtMs - preflight.checkedAtMs > 60000 ||
+    !["idle", "quiet-enough", "loaded"].includes(preflight.condition) ||
+    (preflight.condition === "loaded" && preflight.checkedAtMs < LOADED_AT_MS) ||
+    runs.some(
+      (r) =>
+        Date.parse(r.startedAt) < preflight.checkedAtMs - 1000 ||
+        Date.parse(r.startedAt) > preflight.launchAtMs + 60000,
+    )
+  )
+    failures.push("clarified host launch/exclusive-box proof missing");
+  return failures;
+};
+
 export const hostEvidenceFailures = (host, preflight, runs) => {
+  if (runs.some((r) => r.suiteExecution?.batch >= 5))
+    return clarifiedHostFailures(host, preflight, runs);
   const failures = [];
   const from = Math.min(...runs.map((x) => x.pairedMeasurement?.steadyEpochMs));
   const to = Math.max(...runs.map((x) => x.pairedMeasurement?.steadyEpochMs + x.wallMs));
@@ -853,6 +952,7 @@ const main = async () => {
     "",
     "The old bases and batches1/2 are information only. Count the first three valid attempts among3–8; retain numerical FAILs. All arms require explicit tmpfs at both steady boundaries. Launch after full idle, or quiet-enough after the evaluator’s45-minute wait. No Warn-level stalls. Original relative thresholds, q1 substitution, required telemetry and no-backlog checks remain unchanged.",
     `Counted batches: ${selection.counted.join(", ") || "none"}. ${selection.invalid.join("; ")}`,
+    "Co-load policy: attempts3/4 retain the original strict sampler wording. From5, explicit30s scheduling, every local row/error, opaque counter slots and signed differences follow the14 Nov08:45 Dubai clarification. If5 and6 are both INVALID, stop before7/8.",
     "Each measured run has a fresh Node process and wiped tmpfs directory. Three real parent offbox jobs retain the boxes; measured identities include parent id, batch/arm, process start and steady window. Only OS state remains warm between batches. Lease start/end/release records are retained in paired-verdict.json. Loaded-tier fairness gates own-cgroup CPU pressure, not unlimited-quota throttling or shared-host steal.",
     "Batches 1 and 2 show a 9–10 pp swing between batches against C−A margins of −0.12 and −1.02 pp, which is why the verdict is paired. The absolute busy level is not proven to be the same as at calibration. Live APFS/fsync fidelity is a separate question; tmpfs understates disk costs.",
     "",
