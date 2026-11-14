@@ -1775,7 +1775,7 @@ class Runner:
                         resumed = lease._reuse(con, row, row['size'])
                         if resumed is None:
                             raise OffboxError(f"lease {self.box} is no longer available")
-                    except common.SshHostKeyMismatch:
+                    except (common.SshHostKeyMismatch, home.StartWaitFailed):
                         raise
                     except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
                         raise OffboxError(f"{e}; box stopped during push: {self.box}") from e
@@ -1945,6 +1945,8 @@ def _safe(err: list, fn, *args, terminal_identity=False):
     try:
         fn(*args)
     except Exception as e:  # noqa: BLE001
+        if isinstance(e, home.StartWaitFailed):
+            raise
         if terminal_identity and isinstance(e, common.SshHostKeyMismatch):
             raise
         err.append(e if isinstance(e, OffboxError) else OffboxError(f"{type(e).__name__}: {e}"))

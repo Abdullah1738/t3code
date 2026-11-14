@@ -966,7 +966,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         last_error = e
                         break
                     except OffboxError as e:
-                        if isinstance(e, common.SourceGone):
+                        if isinstance(e, (common.SourceGone, home.StartWaitFailed)):
                             raise
                         if resume_stall is not None:
                             refused = 400 <= (getattr(e, 'status', None) or 0) < 500
