@@ -338,14 +338,34 @@ const optionScopeIds = (
   return ids.filter((id) => card.subtasks.some((subtask) => subtask.id === id));
 };
 
+const refusalWord = /\b(?:decline|refuse|deny|defer|postpone|delay|pause|suspend|abort)\b/i;
+
 export const optionApprovalIds = (
   card: Pick<KanbanCard, "subtasks">,
   option: Pick<KanbanAskOption, "label" | "approves">,
 ): ReadonlyArray<string> | undefined => {
-  if (option.approves !== undefined) return option.approves;
-  // Label shorthand accepts a direct id list, never additional clauses or qualifications.
   if (
     isNegativeOption(option.label) ||
+    refusalWord.test(option.label) ||
+    /\b(?:if|unless|after|before|once|when|pending|first|then|not|no|[a-z]+n[’']t|dont|never|cannot|without|except|only|instead)\b/i.test(
+      option.label,
+    )
+  )
+    return undefined;
+  if (option.approves !== undefined) {
+    if (!isNegativeChoice(option.label)) return option.approves;
+    // Exact action targets can contain refusal words, such as an "on-hold build".
+    return option.approves.length > 0 &&
+      option.approves.every((id) => {
+        const subtask = card.subtasks.find((candidate) => candidate.id === id);
+        const gate = subtask && gateOf(subtask);
+        return subtask && gate && approvesGate(option.label, gate, subtask.text, []);
+      })
+      ? option.approves
+      : undefined;
+  }
+  // Label shorthand accepts a direct id list, never additional clauses or qualifications.
+  if (
     !/^(?:yes|ok|approve|approved|go\s+ahead)\b[\s,.:;–—-]+(?:(?:tick|clear|do|approve)\s+)?s\d+(?:(?:\s*[,;/&+]\s*(?:and\s+)?|\s+(?:and\s+)?)s\d+)*(?:\s+now)?[.!]*$/i.test(
       option.label.trim(),
     )
@@ -354,15 +374,14 @@ export const optionApprovalIds = (
   return optionScopeIds(card, option);
 };
 
-const isNegativeChoice = (label: string): boolean =>
-  isNegativeOption(
-    label
-      .trim()
-      .replace(
-        /^(?:(?:yes|ok|okay|please|approve|approved|authorize|go\s+ahead(?:\s+and)?)(?:\s*[,.:;–—-]\s*|\s+))+/i,
-        "",
-      ),
-  );
+const isNegativeChoice = (label: string): boolean => {
+  if (refusalWord.test(label)) return true;
+  // Polite prefixes and object-first phrasing must not hide a refusal from the broad fallback.
+  for (const word of label.matchAll(/\b\w/g)) {
+    if (isNegativeOption(label.slice(word.index))) return true;
+  }
+  return false;
+};
 
 /** Legacy plans have no timestamps: their card's creation is the earliest safe bound. */
 export const approvalProblem = (
@@ -447,8 +466,9 @@ export const approvalProblem = (
           const option = latest?.options?.find((entry) => entry.id === id);
           return (
             option !== undefined &&
-            !isNegativeChoice(option.label) &&
-            approvesGate(option.label, gate, subtask.text, others)
+            (approvesGate(option.label, gate, subtask.text, []) ||
+              (!isNegativeChoice(option.label) &&
+                approvesGate(option.label, gate, subtask.text, others)))
           );
         }));
   if (approved) return null;

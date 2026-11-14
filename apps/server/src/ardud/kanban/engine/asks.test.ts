@@ -814,6 +814,52 @@ describe("subtask approval options", () => {
     },
     { label: "Drop it", approves: ["s4"], reason: "hold or no option" },
     { label: "Wait for #73, then run install.zsh", approves: ["s4"], reason: "hold or no option" },
+    ...[
+      "Yes, let's hold the deployment",
+      "Yes, let’s hold the deployment",
+      "Yes, put the deployment on hold",
+      "Yes! Hold the deployment",
+      "Yes, let's cancel the purchase",
+      "We should keep the purchase on hold",
+    ].map((label) => ({ label, approves: ["s4"], reason: "hold or no option" })),
+    ...[
+      "Yes, do not approve s4",
+      "Yes, don't approve s4",
+      "Yes, don’t approve s4",
+      "Approve s1, not s4",
+      "Approve s1 but not s4",
+      "Approve s1 except s4",
+      "Approve s1 without s4",
+      "Yes, no approval for s4",
+      "Yes, never approve s4",
+      "Yes, we won't approve s4",
+      "Yes, we can’t approve s4",
+      "Yes, we cannot approve s4",
+      "Approve s4 after the review",
+      "Approve s4 before the review",
+      "Approve s4 if reviewed",
+      "Approve s4 unless review fails",
+      "Approve s4 once reviewed",
+      "Approve s4 when reviewed",
+      "Approve s4 pending review",
+      "Approve s4, first review",
+      "Approve s4, then review",
+      "Approve s4 later",
+      "Approve s4 tomorrow",
+      "Approve s4 next week",
+      "Approve s4 next month",
+      "Approve s1; reject s4",
+      "Approve s1; hold s4",
+      "Approve s1; wait for s4",
+      "Approve s1, cancel s4",
+      "Approve s1, skip s4",
+      "Approve s1; decline s4",
+      "Yes, approve s4 only if needed",
+      "Approve s4 after review",
+      ...["refuse", "deny", "defer", "postpone", "delay", "pause", "suspend", "abort"].map(
+        (verb) => `Yes, we ${verb} approval for s4`,
+      ),
+    ].map((label) => ({ label, approves: ["s4"], reason: "hold or no option" })),
     { label: "Approve", approves: [" "], reason: "non-empty subtask ids" },
   ])("refuses $label / $approves on create and revise", ({ label, approves, reason }) => {
     const input = { options: [{ label, approves }, "Change"] };
@@ -823,6 +869,20 @@ describe("subtask approval options", () => {
     );
     assert.include(problem(Asks.reviseAsk(diaAsk(), input, LATER, target)).detail, reason);
   });
+
+  it.each(["Deploy the on-hold build", "Purchase the hold service"])(
+    "keeps explicit approval for the exact action target: %s",
+    (label) => {
+      const exact = { ...target, subtasks: [{ ...s4, text: label }] };
+      const input = { options: [{ label, approves: ["s4"] }, "Wait"] };
+      const created = Asks.askFields(input, { blocking: false, card: exact });
+      if (Asks.isAskProblem(created)) throw new Error(created.detail);
+      assert.deepStrictEqual(created.options?.[0]?.approves, ["s4"]);
+      const revised = Asks.reviseAsk(diaAsk(), input, LATER, exact);
+      if (Asks.isAskProblem(revised)) throw new Error(revised.detail);
+      assert.deepStrictEqual(revised.options?.[0]?.approves, ["s4"]);
+    },
+  );
 
   it("warns on the Dia #18 shape, including after revision", () => {
     const expected =

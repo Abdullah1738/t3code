@@ -1034,7 +1034,10 @@ export const askFields = (
       return invalid(`option id "${id}" is used twice`);
     }
     const approves = option.approves?.map((sid) => sid.trim());
-    if (approves !== undefined && isNegativeOption(label)) {
+    if (
+      approves !== undefined &&
+      optionApprovalIds(rules.card ?? { subtasks: [] }, { label, approves }) === undefined
+    ) {
       return invalid(`option ${id} is a hold or no option and can't carry approves`);
     }
     if (approves?.some((sid) => sid === "")) {

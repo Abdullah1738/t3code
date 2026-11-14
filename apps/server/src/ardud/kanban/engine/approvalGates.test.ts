@@ -1480,6 +1480,10 @@ it.each([
   "Approve s1, skip s4",
   "Approve s1; decline s4",
   "Yes, approve s4 only if needed",
+  "Approve s4 after review",
+  ...["refuse", "deny", "defer", "postpone", "delay", "pause", "suspend", "abort"].map(
+    (verb) => `Yes, we ${verb} approval for s4`,
+  ),
 ])("a qualified label cannot grant any explicit scope: %s", (label) => {
   const s1 = gatedStep("s1");
   const s4 = gatedStep("s4");
@@ -1501,14 +1505,19 @@ it.each([
   };
   assert.include(approvalProblem(approvalCard([s1, s4], [earlier, later]), s4)!, "q6");
   for (const verdict of ["picked", "approved"] as const) {
-    const signoff = {
-      ...ask,
-      id: "q7",
-      kind: "signoff",
-      answer: { verdict, optionIds: ["o1"], by: owner, at: laterDecisionAt },
-    };
-    const result = approvalProblem(approvalCard([s1, s4], [earlier, signoff]), s4);
-    assert.include(result!, "the latest decision, q7");
+    for (const scoped of [false, true]) {
+      const signoff = {
+        ...ask,
+        id: "q7",
+        kind: "signoff",
+        options: ask.options.map((option) =>
+          scoped && option.id === "o1" ? { ...option, approves: ["s1", "s4"] } : option,
+        ),
+        answer: { verdict, optionIds: ["o1"], by: owner, at: laterDecisionAt },
+      };
+      const result = approvalProblem(approvalCard([s1, s4], [earlier, signoff]), s4);
+      assert.include(result!, "the latest decision, q7");
+    }
   }
 });
 
@@ -1903,5 +1912,133 @@ it.each([
   for (const verdict of ["picked", "approved"] as const) {
     const ask = { ...base.asks[0]!, answer: { ...base.asks[0]!.answer!, verdict } };
     assert.isNotNull(approvalProblem({ ...base, asks: [ask] }, subtask));
+  }
+});
+
+it.each(
+  (
+    [
+      { label: "Yes! Hold the deployment", text: "Deploy the release", gate: "deploy" },
+      { label: "Yes, let's hold the deployment", text: "Deploy the release", gate: "deploy" },
+      { label: "Yes, put the deployment on hold", text: "Deploy the release", gate: "deploy" },
+      { label: "Yes, let's cancel the purchase", text: "Purchase the license", gate: "money" },
+    ] as const
+  ).flatMap((entry) => (["picked", "approved"] as const).map((verdict) => ({ ...entry, verdict }))),
+)("merge review regression: $verdict $label", ({ label, text, gate, verdict }) => {
+  const subtask = { ...goChoiceSubtask, text, gate };
+  const base = goChoiceCard([label, "Wait"], ["o1"], subtask);
+  const ask = { ...base.asks[0]!, answer: { ...base.asks[0]!.answer!, verdict } };
+  assert.isNotNull(approvalProblem({ ...base, asks: [ask] }, subtask));
+});
+
+it.each(
+  [
+    "Yes, let's ",
+    "Yes, let’s ",
+    "Yes, let us ",
+    "Yes! ",
+    "Yes? Please ",
+    "We should ",
+    "Please, let's ",
+  ].flatMap((prefix) =>
+    [
+      "hold",
+      "cancel",
+      "wait for",
+      "stop",
+      "skip",
+      "drop",
+      "reject",
+      "decline",
+      "refuse",
+      "deny",
+      "defer",
+      "postpone",
+      "delay",
+      "pause",
+      "suspend",
+      "abort",
+    ].flatMap((verb) => [
+      {
+        label: `${prefix}${verb} the deployment`,
+        text: "Deploy the release",
+        gate: "deploy" as const,
+      },
+      {
+        label: `${prefix}${verb} the purchase`,
+        text: "Purchase the license",
+        gate: "money" as const,
+      },
+    ]),
+  ),
+)(
+  "fallback refusal cannot hide behind arbitrary consent wording: $label",
+  ({ label, text, gate }) => {
+    const subtask = { ...goChoiceSubtask, text, gate };
+    const base = goChoiceCard([label, "Wait"], ["o1"], subtask);
+    for (const scoped of [false, true]) {
+      for (const verdict of ["picked", "approved"] as const) {
+        const ask = {
+          ...base.asks[0]!,
+          options: base.asks[0]!.options!.map((option) =>
+            scoped && option.id === "o1" ? { ...option, approves: [subtask.id] } : option,
+          ),
+          answer: { ...base.asks[0]!.answer!, verdict },
+        };
+        assert.isNotNull(approvalProblem({ ...base, asks: [ask] }, subtask));
+      }
+    }
+  },
+);
+
+it.each(
+  ["Yes, ", "Yes! ", "Yes, let's ", "We should "].flatMap((prefix) =>
+    ["put", "keep", "place"].flatMap((verb) => [
+      {
+        label: `${prefix}${verb} the deployment on hold`,
+        text: "Deploy the release",
+        gate: "deploy" as const,
+      },
+      {
+        label: `${prefix}${verb} the purchase on hold`,
+        text: "Purchase the license",
+        gate: "money" as const,
+      },
+    ]),
+  ),
+)("fallback refuses object-first hold choice: $label", ({ label, text, gate }) => {
+  const subtask = { ...goChoiceSubtask, text, gate };
+  const base = goChoiceCard([label, "Wait"], ["o1"], subtask);
+  for (const scoped of [false, true]) {
+    for (const verdict of ["picked", "approved"] as const) {
+      const ask = {
+        ...base.asks[0]!,
+        options: base.asks[0]!.options!.map((option) =>
+          scoped && option.id === "o1" ? { ...option, approves: [subtask.id] } : option,
+        ),
+        answer: { ...base.asks[0]!.answer!, verdict },
+      };
+      assert.isNotNull(approvalProblem({ ...base, asks: [ask] }, subtask));
+    }
+  }
+});
+
+it.each([
+  { label: "Deploy the on-hold build", text: "Deploy the on-hold build", gate: "deploy" },
+  { label: "Purchase the hold service", text: "Purchase the hold service", gate: "money" },
+] as const)("strict action matching keeps the target name: $label", ({ label, text, gate }) => {
+  const subtask = { ...goChoiceSubtask, text, gate };
+  const base = goChoiceCard([label, "Wait"], ["o1"], subtask);
+  for (const scoped of [false, true]) {
+    for (const verdict of ["picked", "approved"] as const) {
+      const ask = {
+        ...base.asks[0]!,
+        options: base.asks[0]!.options!.map((option) =>
+          scoped && option.id === "o1" ? { ...option, approves: [subtask.id] } : option,
+        ),
+        answer: { ...base.asks[0]!.answer!, verdict },
+      };
+      assert.isNull(approvalProblem({ ...base, asks: [ask] }, subtask));
+    }
   }
 });
