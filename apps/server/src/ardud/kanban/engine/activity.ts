@@ -456,6 +456,7 @@ const ledgerUsage = (
   for (const card of input.cards) {
     for (const at of [
       card.createdAt,
+      card.movedAt,
       card.stalled?.at,
       card.wait?.at,
       card.wait?.expiredAt,
