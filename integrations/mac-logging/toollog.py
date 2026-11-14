@@ -253,6 +253,13 @@ def safe_fields(values, event=None):
             result[key] = value if value in FAILURE_STAGES else 'unknown'
         elif key == 'failReason' and value in ('password_unavailable', 'no_repo_access', 'source_missing', 'other'):
             result[key] = value
+        elif event in ('crash.collect', 'crash.source', 'crash.unified.chunk') and key in ('stopReason', 'outcome') and value in (
+                'start', 'done', 'deadline', 'timeout', 'permission', 'exit', 'parse', 'error'):
+            result[key] = value
+        elif event in ('crash.collect', 'crash.source', 'crash.unified.skip') and key in ('skipReason', 'reason') and value == 'lag_ceiling':
+            result[key] = value
+        elif event == 'crash.unified.chunk' and key in ('chunk', 'timeoutS') and type(value) in (int, float) and math.isfinite(value) and value >= 0:
+            result[key] = value
         elif key == 'stopReason' and value in ('done', 'budget', 'killed'):
             result[key] = value
         elif key == 'duMode' and value == 'links':
@@ -345,7 +352,12 @@ def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=No
                 else:
                     os.close(capfd)
                     append(fd, record('logger', 'error', 'log.cap', now, ok=False, error_tag='log.cap'))
-                if kind != 'error':
+                # A coverage gap must survive the cap before its checkpoint
+                # retires it. Ordinary crash summaries remain capped.
+                coverage_gap = (component == 'crashes' and name in (
+                    'crash.unified.skip', 'crash.source', 'crash.collect') and
+                    row.get('props', {}).get('skippedS', 0) > 0)
+                if kind != 'error' and not coverage_gap:
                     return
             append(fd, row)
         finally:
