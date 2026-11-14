@@ -121,11 +121,14 @@ These events never alert or launch extra scans.
 
 `com.abdullah.mac-memory` runs `memory.py` every 300 seconds independently of
 inventory, through `/bin/zsh` for launchd file access. `memory.sample` contains
-swap MB, VM page counts and page size, pressure/free percentage, load averages,
+swap MB, VM page counts and page size, raw pressure counter/level and free percentage,
+load averages,
 the top 15 footprints with compressed MB, watched daemons with elapsed time,
 process/parent-1 counts, and disk0's second iostat sample. MB/GB use powers of
-1024. `top` MEM already includes compressed pages. A filtered second top reads
-watched PIDs outside the first 15. At most 512 watched PIDs are queried; excess
+1024. `top` MEM already includes compressed pages. One full, memory-sorted top snapshot
+supplies both the first15 holders and watched PIDs, including those below15.
+ps supplies exact command names/elapsed time and matches the snapshot by PID.
+At most512 watched PIDs are retained; excess
 is explicit in `watchedOmitted` and makes the sample partial. Each subprocess,
 including notifications, has a ten-second timeout. Failed probes are null with
 fixed `…Error` codes; watched PID failures retain null metrics per PID.
@@ -137,9 +140,21 @@ clock rollback establish a null baseline. Missing/failed probes remain unknown.
 No process arguments, command output or notification text enter the day log.
 
 Swap above 16 GB, critical pressure in two consecutive samples, a footprint
-above 8 GB, or fseventsd above 4 GB queues a Telegram notification and writes
-`memory.alert`. Critical means `vm.memory_pressure >= 2` or free percentage
-below 15; unavailable/healthy samples or gaps over ten minutes reset the streak. Each reason has a six-hour cooldown
+above 8 GB, or fseventsd above 2 GiB queues a Telegram notification and writes
+`memory.alert`. Critical means `kern.memorystatus_vm_pressure_level == 4` or
+free percentage below 15; unavailable/healthy samples or gaps over ten minutes reset the streak.
+`pressureLevel` logs that level (1 normal, 2 warning, 4 critical); `pressure` keeps
+`vm.memory_pressure` as a raw counter and never determines an alert. The level
+streak starts fresh when upgrading from the old counter-based implementation.
+
+A separate `fseventsd_growth` reason warns on footprint growth above 100 MiB/h
+for three consecutive intervals spanning at least 15 minutes. A baseline plus
+three five-minute samples is required; one jump does not qualify. Samples log
+`fseventsdGrowthMbPerHour`, `fseventsdGrowthSamples`, `fseventsdGrowthPid` and
+`fseventsdGrowthWindowS`. State follows each watched PID on the same boot;
+missing measurements, elapsed-age discontinuities, a flat/falling reading or
+a gap over ten minutes reset its streak. The growth check needs no new subprocess.
+Each reason has a six-hour cooldown
 across day boundaries. Keys start `mac-memory:<reason>:<YYYYMMDD>` with a time
 suffix so another alert can be queued after six hours on the same day. An
 unconfirmed send retains its exact key/text for idempotent retry. For a diagnostic
