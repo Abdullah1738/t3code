@@ -11,6 +11,7 @@ import json
 import math
 import os
 import shutil
+import socket
 import tempfile
 import time
 import urllib.error
@@ -395,6 +396,15 @@ def run(loaded, last, sid_dir, keep, *, dry_run=False, logs=None, home=None, con
                     save()
                     # 2.0.22 has per-location eviction. Never broaden a failed
                     # request into a global shutdown of unrelated locations.
+                    raise
+                except (urllib.error.URLError, ConnectionRefusedError, socket.gaierror) as e:
+                    reason = e.reason if isinstance(e, urllib.error.URLError) else e
+                    # Refused connections and DNS failures happen before HTTP
+                    # is sent. Timeouts/resets do not prove that; keep their
+                    # write-ahead uncertainty instead of repeating an eviction.
+                    if isinstance(reason, (ConnectionRefusedError, socket.gaierror)):
+                        ledger[directory]["pending"] = False
+                        save()
                     raise
                 ledger[directory] = {"version": version, "done": True}
                 save()

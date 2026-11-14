@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import socket
 from pathlib import Path
 import sys
 import tempfile
@@ -274,6 +275,72 @@ class ConfigDrift(unittest.TestCase):
         self.fail = None
         self.assertEqual(self.run_pass(now=10301)["reloaded"], 2)
         self.assertEqual(self.run_pass(now=10602)["reloaded"], 0)
+
+    def test_plugin_edit_recovers_after_pre_send_failure_without_another_edit(self):
+        self.run_pass()
+        self.evictions.clear()
+        plugin = self.config / "plugin/test.ts"
+        plugin.parent.mkdir()
+        plugin.write_text("changed plugin")
+        self.fail = urllib.error.URLError(ConnectionRefusedError("refused"))
+        self.assertEqual(self.run_pass(now=10301)["failed"], 2)
+        ledger = self.state()["locations"]
+        self.assertTrue(all(not row["pending"] and not row["resolved_mismatch"]
+                            for row in ledger.values()))
+        self.run_pass(now=10302)
+        self.assertEqual(len(self.evictions), 2)
+        self.fail = None
+        self.active = {"ses_home": {}}
+        self.assertEqual(self.run_pass(now=10602)["reloaded"], 1)
+        self.assertEqual(self.evictions, [str(self.home), str(self.other), str(self.other)])
+        self.active.clear()
+        self.assertEqual(self.run_pass(now=10903)["reloaded"], 1)
+        self.assertEqual(self.run_pass(now=11204)["reloaded"], 0)
+        self.assertEqual(self.run_pass(now=11505)["reloaded"], 0)
+        self.assertEqual(len(self.evictions), 4)
+
+    def test_pre_send_failure_shapes_are_retryable_for_project_changes(self):
+        failures = [ConnectionRefusedError("refused"),
+                    urllib.error.URLError(ConnectionRefusedError("refused")),
+                    socket.gaierror(socket.EAI_NONAME, "no address"),
+                    urllib.error.URLError(socket.gaierror(socket.EAI_NONAME, "no address"))]
+        self.run_pass()
+        project_config = self.other / "opencode.jsonc"
+        for index, failure in enumerate(failures):
+            with self.subTest(failure=failure):
+                self.evictions.clear()
+                now = 10301 + index * 1000
+                project_config.write_text(json.dumps({"model": str(index)}))
+                self.fail = failure
+                self.assertEqual(self.run_pass(now=now)["failed"], 1)
+                row = self.state()["locations"][str(self.other)]
+                self.assertFalse(row["pending"])
+                self.assertFalse(row["resolved_mismatch"])
+                self.fail = None
+                self.assertEqual(self.run_pass(now=now + 301)["reloaded"], 1)
+                self.assertEqual(self.run_pass(now=now + 602)["reloaded"], 0)
+                self.assertEqual(self.evictions, [str(self.other), str(self.other)])
+
+    def test_ambiguous_transport_failure_shapes_never_blindly_retry(self):
+        failures = [TimeoutError(), urllib.error.URLError(TimeoutError()),
+                    ConnectionResetError(), urllib.error.URLError(ConnectionResetError()),
+                    BrokenPipeError(), urllib.error.URLError(BrokenPipeError()),
+                    urllib.error.URLError("unknown failure")]
+        self.run_pass()
+        plugin = self.config / "plugin/test.ts"
+        plugin.parent.mkdir()
+        for index, failure in enumerate(failures):
+            with self.subTest(failure=failure):
+                self.evictions.clear()
+                now = 10301 + index * 1000
+                plugin.write_text(str(index))
+                self.fail = failure
+                self.assertEqual(self.run_pass(now=now)["failed"], 2)
+                self.assertTrue(all(row["pending"] for row in self.state()["locations"].values()))
+                self.fail = None
+                self.run_pass(now=now + 301)
+                self.run_pass(now=now + 602)
+                self.assertEqual(len(self.evictions), 2)
 
     def test_ambiguous_eviction_is_reconciled_without_repeat(self):
         self.fail = TimeoutError()
