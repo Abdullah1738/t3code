@@ -4138,6 +4138,7 @@ it.effect.each([-1, 0, 1048576, 9007199254740993n])(
 it.effect.each([
   { name: "plain object", make: () => ({}) },
   { name: "null prototype", make: () => Object.create(null) as object },
+  // @effect-diagnostics-next-line globalDate:off -- Native SQLite binding compatibility requires a Date instance.
   { name: "Date", make: () => new Date(0) },
   { name: "Map", make: () => new Map() },
   { name: "Set", make: () => new Set() },
