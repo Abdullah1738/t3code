@@ -364,7 +364,8 @@ const waitIntervals = (
   const wait = card.wait;
   if (wait !== undefined) {
     const at = time(wait.at);
-    if (marks.length === 0 || marks.every((mark) => mark.at < at)) marks.push({ mark: "set", at });
+    if (!marks.some((mark) => mark.mark === "set" && mark.at === at))
+      marks.push({ mark: "set", at });
     const end = Math.min(
       time(wait.expiredAt ?? until),
       card.movedAt > wait.at ? time(card.movedAt) : time(until),
@@ -531,8 +532,12 @@ const ledgerUsage = (
       )
         continue;
       const last = flags.findLast((event) => time(event.at) <= from);
+      const snapshot = card.stalled;
       const stalled =
-        last !== undefined ? isStall(last) : card.stalled !== null && time(card.stalled.at) <= from;
+        (snapshot !== null &&
+          time(snapshot.at) <= from &&
+          (last === undefined || snapshot.at > last.at)) ||
+        (last !== undefined && isStall(last));
       if (
         stalled ||
         waits.some(([a, b]) => a <= from && b > from) ||

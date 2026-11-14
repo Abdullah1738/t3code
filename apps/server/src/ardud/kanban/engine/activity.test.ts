@@ -1183,6 +1183,60 @@ describe("ledger pool activity", () => {
     },
   );
 
+  it.each([
+    {
+      name: "wait snapshot set after a prior end",
+      kind: "wait",
+      clear: false,
+      expected: [0.5, 0, 0],
+    },
+    {
+      name: "wait snapshot followed by a recorded end",
+      kind: "wait",
+      clear: true,
+      expected: [0.5, 1, 1],
+    },
+    {
+      name: "stall snapshot set after a prior clear",
+      kind: "stall",
+      clear: false,
+      expected: [0.5, 0, 0],
+    },
+    {
+      name: "stall snapshot followed by a recorded clear",
+      kind: "stall",
+      clear: true,
+      expected: [0.5, 1, 1],
+    },
+  ] as const)("merges a persisted $name with recorded markers", ({ kind, clear, expected }) => {
+    const prior = event(
+      "s",
+      before,
+      kind === "wait" ? "wait_cleared" : "flagged",
+      null,
+      null,
+      "Cleared",
+    );
+    const ended = event(
+      "s",
+      t("01:00"),
+      kind === "wait" ? "wait_cleared" : "flagged",
+      null,
+      null,
+      "Cleared",
+    );
+    const snapshot =
+      kind === "wait"
+        ? { wait: { ...waitOn, at: t("00:30") } }
+        : { stalled: { reason: "flag", by: { _tag: "owner" as const }, at: t("00:30") } };
+    const result = run([slot(1, "take", "t1", before), slot(2, "take", "t2", before)], {
+      cards: [card("s", snapshot)],
+      readinessBefore: [prior],
+      events: clear ? [ended] : [],
+    });
+    expect(result.queueWait[pool]).toEqual(expected);
+  });
+
   it("counts weighted alternatives once only when every enabled route is full", () => {
     const other = Rules.poolKey(sonnet);
     const weighted = card("weighted", {
