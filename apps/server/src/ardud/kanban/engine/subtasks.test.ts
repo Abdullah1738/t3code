@@ -847,7 +847,9 @@ describe("approvalProblem", () => {
     };
     expect(
       approvalProblem({ ...card, subtasks: [action], asks: [approvedAsk(`${text}?`)] }, action),
-    ).toContain("no owner answer");
+    ).toContain(
+      'q1 was approved but doesn\'t name s4; ask again naming the subtask id (e.g. "Approve s4")',
+    );
   });
 
   it.each([
@@ -882,7 +884,7 @@ describe("approvalProblem", () => {
     const action = { ...subtask, owner: "evaluator" as const, text: "Do it", gate };
     const gatedCard = { ...card, subtasks: [action] };
     expect(approvalProblem({ ...gatedCard, asks: [approvedAsk(negative)] }, action)).toContain(
-      "no owner answer",
+      'q1 was approved but doesn\'t name s4; ask again naming the subtask id (e.g. "Approve s4")',
     );
     expect(approvalProblem({ ...gatedCard, asks: [approvedAsk(positive)] }, action)).toBeNull();
   });
@@ -904,7 +906,9 @@ describe("approvalProblem", () => {
         const action = { ...subtask, owner: "evaluator" as const, text: "Do it", gate };
         expect(
           approvalProblem({ ...card, subtasks: [action], asks: [approvedAsk(`${text}?`)] }, action),
-        ).toContain("no owner answer");
+        ).toContain(
+          'q1 was approved but doesn\'t name s4; ask again naming the subtask id (e.g. "Approve s4")',
+        );
         expect(inferGate(`${text}; ${verb} ${object}`)).toBe(gate);
       }
     }
@@ -925,7 +929,9 @@ describe("approvalProblem", () => {
             { ...card, subtasks: [explicit], asks: [approvedAsk(`${text}?`)] },
             explicit,
           ),
-        ).toContain("no owner answer");
+        ).toContain(
+          `q1 was approved but doesn't name ${explicit.id}; ask again naming the subtask id (e.g. "Approve ${explicit.id}")`,
+        );
       }
     },
   );
@@ -967,7 +973,7 @@ describe("approvalProblem", () => {
     expect(approvalProblem({ ...card, subtasks: [s5], asks }, s5)).toBeNull();
     for (const subtask of [s5, s7]) {
       expect(approvalProblem({ ...card, subtasks: [s5, s7], asks }, subtask)).toContain(
-        "name the subtask id (e.g. s7) in the ask",
+        `q1 was approved but doesn't name ${subtask.id}; ask again naming the subtask id (e.g. "Approve ${subtask.id}")`,
       );
     }
     const named = { ...card, subtasks: [s5, s7], asks: [approvedAsk("Approve s5")] };
@@ -1041,7 +1047,7 @@ describe("approvalProblem", () => {
           asks: [
             {
               id: "q1",
-              text: "Restart agent-bridges?",
+              text: "Restart agent-bridges for s4?",
               blocking: false,
               by: owner,
               at,

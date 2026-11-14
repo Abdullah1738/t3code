@@ -8,6 +8,7 @@ import {
   type KanbanActor,
   type KanbanCard,
   type KanbanBoard,
+  type KanbanOwnerAsk,
   type KanbanSubtask,
 } from "@t3tools/contracts";
 
@@ -326,6 +327,29 @@ const approvesGate = (
   );
 };
 
+const askWording = (ask: KanbanOwnerAsk) =>
+  `${ask.text} ${ask.title ?? ""} ${ask.action?.summary ?? ""}`;
+
+const askConcerns = (
+  card: Pick<KanbanCard, "createdAt" | "subtasks">,
+  ask: KanbanOwnerAsk,
+  subtask: KanbanSubtask,
+  gate: NonNullable<KanbanSubtask["gate"]>,
+  guessedGates: KanbanBoard["guessedGates"],
+  answerAt: string,
+): boolean => {
+  const wording = askWording(ask);
+  const ids = new Set(wording.match(/\bs\d+\b/g) ?? []);
+  if (ids.size > 0) return ids.has(subtask.id);
+  const candidates = card.subtasks.filter(
+    (entry) =>
+      gateOf(entry, guessedGates) === gate &&
+      entry.state !== "skipped" &&
+      (entry.createdAt ?? card.createdAt) <= answerAt,
+  );
+  return inferGate(wording) === gate && candidates.length === 1 && candidates[0]?.id === subtask.id;
+};
+
 /** Legacy plans have no timestamps: their card's creation is the earliest safe bound. */
 export const approvalProblem = (
   card: Pick<KanbanCard, "number" | "asks" | "createdAt" | "subtasks">,
@@ -340,31 +364,40 @@ export const approvalProblem = (
     .filter((ask) => {
       const answer = ask.answer;
       if (!ask.closedAt || !answer || answer.at < since) return false;
+      if (!askConcerns(card, ask, subtask, gate, guessedGates, answer.at)) return false;
       if (answer.verdict === "dropped") return true;
       if (answer.by._tag !== "owner" || (ask.revisedAt ?? ask.at) < since) return false;
       if (ask.draft) return false;
-      const wording = `${ask.text} ${ask.title ?? ""} ${ask.action?.summary ?? ""}`;
-      const ids = new Set(wording.match(/\bs\d+\b/g) ?? []);
-      if (ids.size > 0) return ids.has(subtask.id);
-      const candidates = card.subtasks.filter(
-        (entry) =>
-          gateOf(entry, guessedGates) === gate &&
-          entry.state !== "skipped" &&
-          (entry.createdAt ?? card.createdAt) <= answer.at,
-      );
-      return (
-        inferGate(wording) === gate && candidates.length === 1 && candidates[0]?.id === subtask.id
-      );
+      return true;
     })
     .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at));
   const latest = decisions.at(-1);
   const answer = latest?.answer;
+  const unnamedApproval = latest
+    ? undefined
+    : card.asks
+        .filter(
+          (ask) =>
+            ask.closedAt &&
+            ask.answer?.verdict === "approved" &&
+            ask.answer.by._tag === "owner" &&
+            ask.answer.at >= since &&
+            (ask.revisedAt ?? ask.at) >= since &&
+            !ask.draft &&
+            !/\bs\d+\b/.test(askWording(ask)) &&
+            !askConcerns(card, ask, subtask, gate, guessedGates, ask.answer.at),
+        )
+        .toSorted((a, b) => a.answer!.at.localeCompare(b.answer!.at))
+        .at(-1);
+  const noDecisionReason = unnamedApproval
+    ? `${unnamedApproval.id} was approved but doesn't name ${subtask.id}; ask again naming the subtask id (e.g. "Approve ${subtask.id}")`
+    : `no owner answer on a ${gate} ask since ${since}; name the subtask id (e.g. s7) in the ask`;
   if (intent === "skip") {
     if (answer && answer.verdict !== "dropped" && answer.by._tag === "owner") return null;
     const reason =
       answer?.verdict === "dropped"
         ? `the latest decision, ${latest!.id}, was dropped (a dropped ask is not approval)`
-        : `no owner answer on a ${gate} ask since ${since}; name the subtask id (e.g. s7) in the ask`;
+        : noDecisionReason;
     return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's answer before it can be skipped: ${reason}`.replace(
       /[\r\n]+/g,
       " ",
@@ -388,7 +421,7 @@ export const approvalProblem = (
   if (approved) return null;
   let reason: string;
   if (!latest || !answer) {
-    reason = `no owner answer on a ${gate} ask since ${since}; name the subtask id (e.g. s7) in the ask`;
+    reason = noDecisionReason;
   } else if (answer.verdict === "dropped") {
     reason = `the latest decision, ${latest.id}, was dropped (a dropped ask is not approval)`;
   } else if (answer.verdict === "picked") {
