@@ -46,10 +46,10 @@ export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* 
   );
   if (row === null || row.deletedAt !== null) return null;
   if (
-    row.archivedAt === null &&
-    row.providerInstanceId === providerInstanceId &&
-    (row.forkedFrom === null || row.forkedFrom.type === "node") &&
-    row.activeRunId !== null
+    row.pendingBackgroundTasks !== undefined ||
+    row.archivedAt !== null ||
+    row.providerInstanceId !== providerInstanceId ||
+    ((row.forkedFrom === null || row.forkedFrom.type === "node") && row.activeRunId !== null)
   ) {
     if (call._tag === "Some") {
       call.value.callerResolved = true;
@@ -57,9 +57,12 @@ export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* 
       call.value.callerResolveMs += Number((yield* Clock.monotonicTimeNanos) - started) / 1e6;
       delete call.value.callerStarted;
     }
-    return { ...row, pendingBackgroundTasks: [] } satisfies CallerIdentity;
+    return {
+      ...row,
+      pendingBackgroundTasks: row.pendingBackgroundTasks ?? [],
+    } satisfies CallerIdentity;
   }
-  // Without an active run, native background subagents need the full shell's liveness facts.
+  // Only fork history or work exceeding the caller caps needs the exact shell.
   if (call._tag === "Some") call.value.readerLane = "background";
   const shell = yield* McpDeadline.waitingOn(
     threads.getThreadShell(threadId).pipe(NodeSqliteClient.backgroundReads),
