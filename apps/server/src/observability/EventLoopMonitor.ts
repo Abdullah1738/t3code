@@ -12,6 +12,7 @@ import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
 import * as ServerConfig from "../config.ts";
+import * as HttpSocketTelemetry from "../ardud/http/HttpSocketTelemetry.ts";
 import * as Metrics from "./Metrics.ts";
 
 // Node's delay histogram wakes a native timer every RESOLUTION_MS and records the
@@ -126,6 +127,7 @@ export const layerWith = (
   stallLog: StallLogOptions,
   readHeapSpaces: typeof NodeV8.getHeapSpaceStatistics = NodeV8.getHeapSpaceStatistics,
   heapLimitBytes: number = NodeV8.getHeapStatistics().heap_size_limit,
+  sampleSockets: Effect.Effect<void> = Effect.void,
 ) =>
   Layer.effectDiscard(
     Effect.gen(function* () {
@@ -148,6 +150,7 @@ export const layerWith = (
       const tick = Effect.gen(function* () {
         const readings = yield* sample;
         yield* recordGauges(readings);
+        yield* sampleSockets;
         if (
           readings.heapUsedBytes > Math.min(HIGH_HEAP_BYTES, heapLimitBytes * HIGH_HEAP_RATIO) &&
           stallSink !== undefined
@@ -239,9 +242,16 @@ export const layer = Layer.unwrap(
   Effect.gen(function* () {
     const { serverTracePath } = yield* ServerConfig.ServerConfig;
     const path = yield* Path.Path;
-    return layerWith(makeNodeSampler, {
-      filePath: path.join(path.dirname(serverTracePath), "event-loop-stalls.ndjson"),
-      maxBytes: STALL_LOG_MAX_BYTES,
-    });
+    const sockets = yield* HttpSocketTelemetry.HttpSocketTelemetry;
+    return layerWith(
+      makeNodeSampler,
+      {
+        filePath: path.join(path.dirname(serverTracePath), "event-loop-stalls.ndjson"),
+        maxBytes: STALL_LOG_MAX_BYTES,
+      },
+      undefined,
+      undefined,
+      sockets.sample,
+    );
   }),
 );
