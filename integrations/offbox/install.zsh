@@ -53,6 +53,7 @@ if [[ $mode == check ]]; then
   # Content and modes only: mtimes differ after every install and mean nothing here.
   out="$(rsync -rlp --checksum --dry-run --delete --itemize-changes "${excludes[@]}" "$here/skill/" "$skill/")"
   [[ -z "$out" ]] || { print -u2 "offbox: live skill differs from the repo:"; print -u2 -r -- "$out"; rc=1 }
+  cmp -s "$here/lib/toollog.ts" "$HOME/.config/opencode/lib/toollog.ts" || { print -u2 "offbox: toollog helper differs"; rc=1 }
   cmp -s "$here/plugin/offbox-gate.ts" "$plugin" || { print -u2 "offbox: $plugin differs"; rc=1 }
   cmp -s "$here/bin/boat" "$boat" || { print -u2 "offbox: $boat differs"; rc=1 }
   cmp -s "$here/launchd/$label.plist" "$plist" || { print -u2 "offbox: $plist differs"; rc=1 }
@@ -72,7 +73,7 @@ fi
 # --delete keeps removed files from lingering; excluded files (tmp/, .bak, caches) on the live side are kept.
 rsync -a --delete --itemize-changes "${dry[@]}" "${excludes[@]}" "$here/skill/" "$skill/"
 home_plist_changed=0
-for pair in "plugin/offbox-gate.ts:$plugin" "bin/boat:$boat" "launchd/$label.plist:$plist" \
+for pair in "lib/toollog.ts:$HOME/.config/opencode/lib/toollog.ts" "plugin/offbox-gate.ts:$plugin" "bin/boat:$boat" "launchd/$label.plist:$plist" \
             "launchd/$home_label.plist:$home_plist"; do
   src="$here/${pair%%:*}"
   dst="${pair#*:}"

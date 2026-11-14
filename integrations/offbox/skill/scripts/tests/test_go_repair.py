@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from unittest.mock import patch
 from offbox_lib import runs
 from offbox_lib.runs import GO_REPAIR, remote_script
@@ -26,7 +27,7 @@ class RepairFixture:
         self.toolchain(self.root)
         self.script = GO_REPAIR.replace('/usr/local', str(self.local)).replace(
             '/tmp/offbox-go-repair.lock', str(self.home / 'repair.lock')) + '\necho USER_COMMAND\n'
-        self.env = dict(os.environ, HOME=str(self.home), PATH=f'{self.bins}:/usr/bin:/bin:/usr/sbin:/sbin',
+        self.env = clean_env(HOME=str(self.home), PATH=f'{self.bins}:/usr/bin:/bin:/usr/sbin:/sbin',
                         FAKE_GOROOT=str(self.root), CALLS=str(self.calls), FIXTURE=str(self.home))
         self.tool('go', '#!/bin/bash\nexec "$FAKE_GOROOT/bin/go" "$@"\n')
         self.tool('sudo', '#!/bin/bash\nshift; exec "$@"\n')
@@ -424,10 +425,11 @@ class GoRepairTests(unittest.TestCase):
             sudo.write_text('#!/bin/bash\n' + ('shift; exec "$@"\n' if sudo_ok else 'exit 1\n'))
             sudo.chmod(0o755)
             (home / 'w').mkdir()
-            env = dict(os.environ, HOME=tmp, PATH=f'{bins}:/usr/bin:/bin', FAKE_GOROOT=str(root))
+            (home / 'w/go.mod').write_text('module repair-fixture\n')
+            env = clean_env(HOME=tmp, PATH=f'{bins}:/usr/bin:/bin', FAKE_GOROOT=str(root))
             with patch.object(runs, 'DOCKER_REPAIR', ':'), patch.object(runs, 'LDCACHE_REPAIR', ':'), \
                     patch.object(runs.userns, 'setup', return_value=':'):
-                script = remote_script('w', '.', ['echo USER_COMMAND'], None, 'test')
+                script = remote_script('w', '.', ['echo USER_COMMAND'], None, 'test', repo_root=home / 'w')
             script = script.replace(
                 '/tmp/offbox-go-repair.lock', str(home / 'repair.lock')).replace('/usr/local', str(home / 'usr/local'))
             result = subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True)
@@ -480,3 +482,57 @@ class GoRepairTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NonGoRepairTests(unittest.TestCase):
+    def test_failed_download_and_timeout_respect_command_needs(self):
+        for curl_code in (22, 28):
+            for manifest, cmd, go in (('', 'pnpm install && vp test run x.test.ts', False),
+                                      ('', 'corepack pnpm@11.7.0 install && vp test run x.test.ts', False),
+                                      ('go.mod', 'pnpm install && vp test run x.test.ts', True),
+                                      ('go.work', 'pnpm install && vp test run x.test.ts', True),
+                                      ('sub/go.mod', 'uv run --directory sub node --test x.test.mjs', True),
+                                      ('', 'go test ./pkg', True),
+                                      ('', 'uv run go test ./pkg', True),
+                                      ('', 'uv run --no-group python go version', True),
+                                      ('', 'uv run --only-group python go version', True),
+                                      ('', 'uv run --unknown-option python go version', True),
+                                      ('', 'node -v\ngo test ./pkg', True),
+                                      ('', 'test "$(go env GOOS)" = linux', True),
+                                      ('', 'python3 -V # check\ngo version', True),
+                                      ('', 'true&&(go version);', True),
+                                      ('', 'pnpm exec /usr/local/go/bin/go version', True)):
+                with self.subTest(curl=curl_code, manifest=manifest, cmd=cmd), tempfile.TemporaryDirectory() as home:
+                    fx = RepairFixture(home)
+                    fx.broken()
+                    repo = Path(home) / 'w/repo'
+                    repo.mkdir(parents=True)
+                    (repo / 'package.json').write_text('{"devDependencies":{"vite-plus":"1"}}')
+                    if manifest:
+                        (repo / manifest).parent.mkdir(parents=True, exist_ok=True)
+                        (repo / manifest).touch()
+                    fx.tool('curl', f'#!/bin/bash\nexit {curl_code}\n')
+                    fx.tool('pnpm', '#!/bin/bash\necho INSTALL_RAN\n')
+                    fx.tool('corepack', '#!/bin/bash\nexec "${1%%@*}" "${@:2}"\n')
+                    fx.tool('vp', '#!/bin/bash\necho USER_COMMAND\nexit 3\n')
+                    repair = GO_REPAIR.replace('/usr/local', str(fx.local)).replace(
+                        '/tmp/offbox-go-repair.lock', str(fx.home / 'repair.lock'))
+                    with patch.object(runs, 'GO_REPAIR', repair), patch.object(runs, 'DOCKER_REPAIR', ':'), \
+                         patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs, 'WATCH_REPAIR', ':'), \
+                         patch.object(runs.userns, 'setup', return_value=':'), \
+             patch.object(runs.containers, 'script', return_value=':'), \
+                         patch.object(runs.node_tools, 'block', return_value=':'):
+                        fx.script = remote_script('w/repo', '.', [cmd], None, 'test', repo_root=repo)
+                    result = fx.run()
+                    self.assertEqual(result.returncode, 97 if go else 3, result.stderr)
+                    self.assertEqual('USER_COMMAND' in result.stdout, not go)
+                    self.assertEqual(runs.SETUP_FAILED_MARKER in result.stderr, go)
+                    self.assertNotIn(runs.NO_NODE_MODULES_MARKER, result.stderr)
+                    if not go:
+                        self.assertIn("offbox: Go repair failed (official archive download failed); continuing because this run doesn't use Go", result.stderr)
+
+    def test_archive_curl_has_stall_only_bounds(self):
+        script = remote_script('w/repo', '.', ['go test ./pkg'], None, 'test')
+        curl = next(line for line in script.splitlines() if 'curl -fsSL --retry 3' in line)
+        self.assertIn('--connect-timeout 20 --speed-limit 10240 --speed-time 60 --max-time 900', curl)
+        self.assertIn('https://go.dev/dl/${_offbox_version}.linux-', curl)

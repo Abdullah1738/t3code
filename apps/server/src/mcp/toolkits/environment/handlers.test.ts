@@ -83,6 +83,7 @@ it.effect("updates preferences for a thread caller through the /mcp registration
         Layer.provideMerge(McpServer.McpServer.layer),
         Layer.provide(
           Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
             getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
           }),
         ),
@@ -113,6 +114,8 @@ it.effect("refuses a preferences update when the caller's turn ends while it wai
         issuedAt: 0,
       }),
       Layer.mock(ThreadManagement.ThreadManagementService)({
+        getCallerRow: () =>
+          Ref.get(caller).pipe(Effect.tap(() => Deferred.succeed(checked, undefined))),
         getThreadShell: () =>
           Ref.get(caller).pipe(Effect.tap(() => Deferred.succeed(checked, undefined))),
       }),

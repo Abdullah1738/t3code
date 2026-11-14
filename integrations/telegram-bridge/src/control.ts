@@ -6,7 +6,7 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PermissionRequest, QuestionRequest } from "./openchamber.ts";
-import { toolError } from "./toollog.ts";
+import { errorCause, toolError, type ErrorCause } from "./toollog.ts";
 
 const COMPONENT = "telegram-bridge";
 const PREFIX = "/api/ardud/control";
@@ -94,7 +94,7 @@ export interface ControlEventFrame {
 }
 
 export class ControlError extends Error {
-  constructor(readonly status: number, readonly code = "") {
+  constructor(readonly status: number, readonly code = "", readonly causeClass: ErrorCause = status || "unknown") {
     // Never carry response bodies, URLs or tokens into errors.
     super(`Robob control request failed (HTTP ${status})`);
     this.name = "ControlError";
@@ -142,12 +142,12 @@ export class ControlClient {
     this.token = token;
   }
 
-  async request<T>(method: string, path: string, body?: unknown, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<T> {
+  async request<T>(method: string, path: string, body?: unknown, options: { timeoutMs?: number; signal?: AbortSignal; kanban?: boolean } = {}): Promise<T> {
     const timeout = AbortSignal.timeout(options.timeoutMs ?? 15_000);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
     let response: Response;
     try {
-      response = await fetch(`${this.url}${PREFIX}${path}`, {
+      response = await fetch(`${this.url}${options.kanban ? "/api/ardud/kanban" : PREFIX}${path}`, {
         method,
         headers: {
           authorization: `Bearer ${this.token}`,
@@ -160,18 +160,35 @@ export class ControlClient {
         proxy: "",
         verbose: false,
       });
-    } catch {
-      toolError("telegram", "tg.control.request");
-      throw new ControlError(0);
+    } catch (error) {
+      toolError("telegram", "tg.control.request", undefined, signal.aborted ? signal.reason : error);
+      throw new ControlError(0, "", errorCause(signal.aborted ? signal.reason : error));
     }
     let data: { ok?: unknown; error?: { code?: unknown } } | undefined;
     try {
       data = await response.json() as typeof data;
-    } catch { toolError("telegram", "tg.control.responseJson"); }
-    if (!response.ok || data?.ok !== true) {
-      throw new ControlError(response.status || 0, typeof data?.error?.code === "string" ? data.error.code : "");
+    } catch (error) {
+      const causeClass = signal.aborted ? errorCause(signal.reason) : !response.ok ? response.status : errorCause(error);
+      const failure = new ControlError(response.status, "", causeClass);
+      toolError("telegram", "tg.control.responseJson", undefined, failure);
+      throw failure;
+    }
+    if (!response.ok || (!options.kanban && data?.ok !== true)) {
+      throw new ControlError(response.status || 0, typeof data?.error?.code === "string" ? data.error.code : "", response.ok ? "decode" : response.status);
     }
     return data as T;
+  }
+
+  async askNotified(key: string, at: number): Promise<void> {
+    const match = /^([a-z0-9-]+):(\d+):(q\d+)$/.exec(key);
+    if (!match) return;
+    try {
+      await this.request("POST", `/cards/${encodeURIComponent(`${match[1]}:${match[2]}`)}/asks/${match[3]}/notified`,
+        { channel: "telegram", at: new Date(at).toISOString() }, { kanban: true, timeoutMs: 5_000 });
+    } catch (error) {
+      if (error instanceof ControlError && error.status === 404) return;
+      throw error;
+    }
   }
 
   thread(threadId: string): Promise<{ thread: ThreadDetail }> {
@@ -222,11 +239,11 @@ export class ControlClient {
         proxy: "",
         verbose: false,
       });
-    } catch {
-      toolError("telegram", "tg.control.upload");
-      throw new ControlError(0, "upload_failed");
+    } catch (error) {
+      toolError("telegram", "tg.control.upload", undefined, error);
+      throw new ControlError(0, "upload_failed", errorCause(error));
     }
-    await response.body?.cancel().catch(() => { toolError("telegram", "tg.control.uploadBodyCancel"); });
+    await response.body?.cancel().catch(error => { toolError("telegram", "tg.control.uploadBodyCancel", undefined, error); });
     if (!response.ok) throw new ControlError(response.status, "upload_failed");
     return { attachmentId: issued.attachmentId, type, name: file.name, mimeType: file.mimeType, sizeBytes: file.bytes.byteLength };
   }
@@ -251,12 +268,12 @@ export class ControlClient {
         proxy: "",
         verbose: false,
       });
-    } catch {
-      toolError("telegram", "tg.control.events");
-      throw new ControlError(0);
+    } catch (error) {
+      toolError("telegram", "tg.control.events", undefined, error);
+      throw new ControlError(0, "", errorCause(options.signal.aborted ? options.signal.reason : error));
     }
     if (!response.ok || !response.body || response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "text/event-stream") {
-      await response.body?.cancel().catch(() => { toolError("telegram", "tg.control.eventBodyCancel"); });
+      await response.body?.cancel().catch(error => { toolError("telegram", "tg.control.eventBodyCancel", undefined, error); });
       throw new ControlError(response.status);
     }
     yield* parseSse(response.body, options.signal);
@@ -282,7 +299,7 @@ export async function* parseSse(body: ReadableStream<Uint8Array>, signal?: Abort
         if (line === "") {
           if (data.length) {
             let parsed: unknown;
-            try { parsed = JSON.parse(data.join("\n")); } catch { toolError("telegram", "tg.control.eventJson"); parsed = undefined; }
+            try { parsed = JSON.parse(data.join("\n")); } catch (error) { toolError("telegram", "tg.control.eventJson", undefined, error); parsed = undefined; }
             if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
               yield { ...frame, data: parsed as Record<string, unknown> };
             }
@@ -302,7 +319,7 @@ export async function* parseSse(body: ReadableStream<Uint8Array>, signal?: Abort
       if (done) return;
     }
   } finally {
-    await reader.cancel().catch(() => { toolError("telegram", "tg.control.eventReaderCancel"); });
+    await reader.cancel().catch(error => { toolError("telegram", "tg.control.eventReaderCancel", undefined, error); });
     reader.releaseLock();
   }
 }

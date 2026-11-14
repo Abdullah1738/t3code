@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from offbox_lib import runs
 
 
@@ -68,7 +69,7 @@ fi
 [ -z "${FAIL_SHUTDOWN:-}" ]
 ''')
         self.script = runs.WATCH_REPAIR.replace('/etc/sysctl.d/90-offbox-inotify.conf', str(self.config))
-        self.env = dict(os.environ, PATH=str(self.bins), FIX=str(self.root),
+        self.env = clean_env(PATH=str(self.bins), FIX=str(self.root),
                         OFFBOX_INOTIFY_PROC_DIR=str(self.proc), WATCH_OUTPUT=watchman or '')
 
     def tool(self, name, body):

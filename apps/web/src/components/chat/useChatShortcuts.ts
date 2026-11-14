@@ -1,5 +1,6 @@
 import type { KeybindingCommand, ResolvedKeybindingsConfig } from "@t3tools/contracts";
 import { useEffect, useLayoutEffect, useRef } from "react";
+import { prepareShortcutRecording } from "../../ardud/keybindingAnalytics";
 import { isCommandPaletteOpen } from "../../commandPaletteBus";
 import { resolveChatShortcutCommand, type ShortcutMatchContext } from "../../keybindings";
 import { isTerminalCloseConfirmPending } from "../../lib/terminalCloseConfirm";
@@ -10,7 +11,7 @@ import {
 import { getTerminalFocusOwner, type TerminalFocusOwner } from "../../lib/terminalFocus";
 import { shouldTypeToFocusComposer } from "./composerFocusRedirect";
 
-/** Runs a command. Returning false lets the key event through untouched. */
+/** False leaves the event untouched; true records execution; void only claims the event. */
 export type ChatShortcutHandler = (context: {
   readonly event: KeyboardEvent;
   readonly terminalFocusOwner: TerminalFocusOwner | null;
@@ -76,7 +77,11 @@ export function useChatShortcuts(input: ChatShortcutsInput) {
       });
       if (!command) return;
       const run = current.commands[command] ?? current.fallback(command);
-      if (!run || run({ event, terminalFocusOwner }) === false) return;
+      if (!run) return;
+      const record = prepareShortcutRecording(event, command);
+      const executed = run({ event, terminalFocusOwner });
+      if (executed === false) return;
+      if (executed === true) record();
       event.preventDefault();
       event.stopPropagation();
     };

@@ -6,6 +6,7 @@ from pathlib import Path
 import shlex
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -30,12 +31,10 @@ class SelectionTest(unittest.TestCase):
         self.brew.mkdir(parents=True)
         self.exe(self.brew / 'node', 'if [ "$1" = -v ]; then echo v26.2.0; else exec /bin/sh "$@"; fi')
         self.exe(self.brew / 'pnpm', 'echo 11.10.0')
-        self.env = dict(os.environ, HOME=str(self.home), NVM_DIR=str(self.home / '.nvm'),
+        # Exported shell functions (including offbox's node/cd wrappers) override our fake binaries.
+        self.env = dict(HOME=str(self.home), NVM_DIR=str(self.home / '.nvm'),
                         PATH=f'{self.brew}:/usr/bin:/bin',
-                        ROBOB_REPO_NODE_HELPER=str(HELPER), ROBOB_REPO_NODE_PYTHON='/opt/homebrew/bin/python3')
-        for key in ['BASH_ENV', 'ROBOB_REPO_PREVIOUS_BASH_ENV', 'COREPACK_HOME',
-                    'ZDOTDIR', '_REPO_NODE_WARNED']:
-            self.env.pop(key, None)
+                        ROBOB_REPO_NODE_HELPER=str(HELPER), ROBOB_REPO_NODE_PYTHON=sys.executable)
         for v in ['22.13.1', '22.23.2', '24.21.0', '26.2.0']:
             root = self.home / f'.nvm/versions/node/v{v}'
             # Fake Node prints its version, or executes our fake pnpm script.
@@ -74,6 +73,31 @@ class SelectionTest(unittest.TestCase):
                 self.assertEqual(r.stdout.splitlines(), ['v22.23.2', '10.26.2', '1'])
                 self.assertEqual(len(r.stderr.splitlines()), 1, r.stderr)
                 self.assertIn('v20 unavailable', r.stderr)
+
+    def test_pins_preserve_quint_guard_and_blocker_prefix(self):
+        (self.repo / '.nvmrc').write_text('22')
+        self.pkg(packageManager='pnpm@10')
+        self.pnpm()
+        prefix = [self.home / rel for rel in [
+            '.config/opencode/skills/remote-compute/scripts/blockers',
+            '.local/share/harness-hooks/coord-blockers',
+            '.local/share/quint-guard/bin',
+        ]]
+        wrapper = self.home / '.local/bin/quint'
+        self.exe(wrapper, 'echo guarded')
+        prefix[-1].mkdir(parents=True)
+        (prefix[-1] / 'quint').symlink_to(wrapper)
+        self.exe(self.home / '.nvm/versions/node/v22.23.2/bin/quint', 'echo raw')
+        self.env['PATH'] = ':'.join(map(str, prefix)) + ':' + self.env['PATH']
+        for shell in ['/bin/zsh', '/bin/bash']:
+            with self.subTest(shell=shell):
+                r = self.run_shell('command -v quint; quint typecheck; node -v; pnpm -v; printf "%s\\n" "$PATH"', shell)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                lines = r.stdout.splitlines()
+                self.assertEqual(lines[:4], [str(prefix[-1] / 'quint'), 'guarded', 'v22.23.2', '10.26.2'])
+                self.assertEqual(lines[4].split(':')[:3], list(map(str, prefix)))
+                r = self.run_shell('cd ' + shlex.quote(str(self.plain)) + '; cd ' + shlex.quote(str(self.repo)) + '; command -v quint; node -v', shell)
+                self.assertEqual(r.stdout.splitlines(), [str(prefix[-1] / 'quint'), 'v22.23.2'], r.stderr)
 
     def test_no_pin_is_unchanged(self):
         for shell in ['/bin/zsh', '/bin/bash']:
@@ -289,12 +313,12 @@ class SelectionTest(unittest.TestCase):
             for functions in ['', 'cd() { builtin cd "$@"; }']:
                 for selector_fails in [False, True]:
                     with self.subTest(shell=shell, functions=functions, selector_fails=selector_fails):
-                        self.env['ROBOB_REPO_NODE_PYTHON'] = '/bin/false' if selector_fails else '/opt/homebrew/bin/python3'
+                        self.env['ROBOB_REPO_NODE_PYTHON'] = '/bin/false' if selector_fails else sys.executable
                         r = self.run_shell('node -v; echo survived', shell, before='set -eu; ' + functions)
                         expected = 'v26.2.0' if selector_fails else 'v22.23.2'
                         self.assertEqual(r.returncode, 0, r.stderr)
                         self.assertEqual(r.stdout.splitlines(), [expected, 'survived'], r.stderr)
-        self.env['ROBOB_REPO_NODE_PYTHON'] = '/opt/homebrew/bin/python3'
+        self.env['ROBOB_REPO_NODE_PYTHON'] = sys.executable
 
     def startup_shell(self, body, shell='/bin/bash', cwd=None, script=False, before=''):
         # zsh -f + source misses preexec calls between lines of a script loaded via zshenv.
@@ -363,7 +387,7 @@ class SelectionTest(unittest.TestCase):
     def test_refresh_failures_do_not_exit_strict_shells(self):
         for directory in self.directory_cases():
             for shell in ['/bin/bash', '/bin/zsh']:
-                for selector in ['/opt/homebrew/bin/python3', '/bin/false', str(self.home / 'eval-fails')]:
+                for selector in [sys.executable, '/bin/false', str(self.home / 'eval-fails')]:
                     with self.subTest(directory=directory.name, shell=shell, selector=selector):
                         self.exe(self.home / 'eval-fails', "printf 'false\\n'")
                         self.env['ROBOB_REPO_NODE_PYTHON'] = selector

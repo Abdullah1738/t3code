@@ -9,9 +9,12 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skill/scripts'
-sys.path[:0] = [str(SCRIPTS), str(SCRIPTS / 'tests')]
+sys.path.insert(0, str(SCRIPTS))
 from offbox_lib import api, common, containers, home, lease, misc, pool, reap, runs, start_check
-from test_capacity import Isolated
+if __package__:
+    from .client_fixtures import Isolated
+else:
+    from client_fixtures import Isolated
 
 
 class DatabaseMerge(Isolated):

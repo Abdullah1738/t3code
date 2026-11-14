@@ -1,3 +1,4 @@
+import { recordConsumedShortcut } from "../ardud/keybindingAnalytics";
 import { pullRequestHostOf, type SourceControlProviderKind } from "@t3tools/contracts";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
 import { useProjects, useServerConfigs, useThreadShells } from "~/state/entities";
@@ -990,6 +991,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
     if (!event.repeat) {
       addSurfaceTriggerRef.current?.focus();
       setAddSurfaceMenuOpen(true);
+      if (!addSurfaceMenuOpen) recordConsumedShortcut(event, "rightPanel.new");
     }
   });
   useEffect(() => {

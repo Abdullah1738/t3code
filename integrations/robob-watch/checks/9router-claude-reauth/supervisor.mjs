@@ -516,7 +516,7 @@ export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_
   let previousStall;
   try {
     const old = JSON.parse(previous ?? readFileSync(path, 'utf8'));
-    if (typeof old.phase === 'string' && /^[a-z:-]{1,80}$/.test(old.phase) && Number.isFinite(old.t) && old.phase !== 'done') {
+    if (typeof old.phase === 'string' && /^[a-z:-]{1,80}$/.test(old.phase) && Number.isFinite(old.t) && old.phase !== 'done' && old.phase !== 'failed') {
       previousStall = `previous run stalled in ${old.phase} (${Math.max(0, (Date.now() - old.t) / 1000).toFixed(1)}s)`;
       stderr(previousStall);
     }
@@ -540,6 +540,7 @@ export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_
       // The runner keeps only the last 500 stderr characters on failure.
       if (previousStall) stderr(previousStall);
       stderr(`9router Claude detector: ${phase} ${reason}`);
+      try { writeFileSync(path, JSON.stringify({ phase: 'failed', at: phase, t: Date.now() }) + '\n', { mode: 0o600 }); } catch { /* observability must not change detector safety */ }
     },
   };
 }

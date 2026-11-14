@@ -46,6 +46,7 @@ class InstallTests(unittest.TestCase):
             self.assertEqual((live / 'check.lock').stat().st_ino, inode)
             for name in installer.SOURCE_FILES:
                 self.assertEqual((live / name).read_bytes(), (installer.SOURCE / name).read_bytes())
+            self.assertIn('toollog.py', installer.SOURCE_FILES)
             self.assertTrue(os.access(live / 'check.sh', os.X_OK))
             self.assertEqual(os.readlink(link), str(live / 'cases.py'))
 

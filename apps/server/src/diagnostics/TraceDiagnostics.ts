@@ -1,3 +1,8 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeStream from "@effect/platform-node/NodeStream";
+import * as NodeFS from "node:fs";
+import * as NodeZlib from "node:zlib";
+import { isSpanSummaryRecord } from "@t3tools/shared/observability";
 import type {
   ServerTraceDiagnosticsErrorKind,
   ServerTraceDiagnosticsFailureSummary,
@@ -13,7 +18,6 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import * as PlatformError from "effect/PlatformError";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -159,10 +163,6 @@ function makeEmptyDiagnostics(input: {
   };
 }
 
-function isNotFoundError(error: PlatformError.PlatformError): boolean {
-  return error.reason._tag === "NotFound";
-}
-
 function insertBounded<A>(
   items: A[],
   item: A,
@@ -232,6 +232,27 @@ export function makeTraceDiagnosticsAggregator(
       return;
     }
 
+    if (isSpanSummaryRecord(parsed)) {
+      for (const [name, stats] of Object.entries(parsed.spans)) {
+        if (stats.count < 1 || stats.totalMs < 0 || stats.maxMs < 0) continue;
+        const span = spansByName.get(name) ?? {
+          count: 0,
+          failureCount: 0,
+          totalDurationMs: 0,
+          maxDurationMs: 0,
+        };
+        span.count += stats.count;
+        span.totalDurationMs += stats.totalMs;
+        span.maxDurationMs = Math.max(span.maxDurationMs, stats.maxMs);
+        spansByName.set(name, span);
+        recordCount += stats.count;
+      }
+      const start = Option.getOrNull(DateTime.make(parsed.windowStart));
+      const end = Option.getOrNull(DateTime.make(parsed.windowEnd));
+      if (start && (!firstSpanAt || DateTime.isLessThan(start, firstSpanAt))) firstSpanAt = start;
+      if (end && (!lastSpanAt || DateTime.isGreaterThan(end, lastSpanAt))) lastSpanAt = end;
+      return;
+    }
     const name = toStringValue(parsed.name);
     const traceId = toStringValue(parsed.traceId);
     const spanId = toStringValue(parsed.spanId);
@@ -384,22 +405,51 @@ export function streamTraceFileLines(
   path: string,
   onLine: (line: string) => void,
 ): Effect.Effect<boolean, TraceFileReadError> {
-  return fileSystem.stream(path).pipe(
-    Stream.decodeText,
-    Stream.splitLines,
-    Stream.runForEachArray((lines) => Effect.sync(() => lines.forEach(onLine))),
-    Effect.as(true),
-    Effect.catchTags({
-      PlatformError: (cause) =>
-        isNotFoundError(cause)
-          ? Effect.succeed(false)
-          : Effect.fail(
-              new TraceFileReadError({
-                traceFilePath: path,
-                causeTag: cause.reason._tag,
-                cause,
-              }),
+  const read = (file: string): Effect.Effect<boolean, TraceFileReadError> => {
+    const bytes = file.endsWith(".gz")
+      ? NodeStream.fromReadable<Uint8Array, TraceFileReadError>({
+          evaluate: () => {
+            const source = NodeFS.createReadStream(file);
+            const unzip = NodeZlib.createGunzip();
+            source.on("error", (error) => unzip.destroy(error));
+            unzip.on("close", () => source.destroy());
+            return source.pipe(unzip);
+          },
+          onError: (cause) =>
+            new TraceFileReadError({ traceFilePath: file, causeTag: "GzipRead", cause }),
+        })
+      : fileSystem
+          .stream(file)
+          .pipe(
+            Stream.mapError(
+              (cause) =>
+                new TraceFileReadError({ traceFilePath: file, causeTag: cause.reason._tag, cause }),
             ),
+          );
+    return bytes.pipe(
+      Stream.decodeText,
+      Stream.splitLines,
+      Stream.runForEachArray((lines) => Effect.sync(() => lines.forEach(onLine))),
+      Effect.as(true),
+    );
+  };
+  // A live rotation can rename a probed file. ENOENT is handled exactly like a missing plain backup.
+  return read(path).pipe(
+    Effect.catch((error) => {
+      const cause = error.cause;
+      const missing =
+        error.causeTag === "NotFound" ||
+        (cause instanceof Error && "code" in cause && cause.code === "ENOENT");
+      if (!missing) return Effect.fail(error);
+      if (path.endsWith(".gz")) return Effect.succeed(false);
+      return read(`${path}.gz`).pipe(
+        Effect.catch((gzError) => {
+          const gzCause = gzError.cause;
+          return gzCause instanceof Error && "code" in gzCause && gzCause.code === "ENOENT"
+            ? Effect.succeed(false)
+            : Effect.fail(gzError);
+        }),
+      );
     }),
   );
 }

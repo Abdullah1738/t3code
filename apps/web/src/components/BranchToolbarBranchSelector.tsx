@@ -70,7 +70,7 @@ import { BranchPicker, BranchPickerRefItem } from "./BranchPicker";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 
 export interface BranchToolbarBranchSelectorHandle {
-  open: () => void;
+  open: () => boolean | void;
 }
 
 interface BranchToolbarBranchSelectorProps {
@@ -518,9 +518,10 @@ export function BranchToolbarBranchSelector({
       open: () => {
         if (isInitialBranchesLoadPending || isBranchActionPending) return;
         handleOpenChange(true);
+        if (!isBranchMenuOpen) return true;
       },
     }),
-    [handleOpenChange, isBranchActionPending, isInitialBranchesLoadPending],
+    [handleOpenChange, isBranchActionPending, isInitialBranchesLoadPending, isBranchMenuOpen],
   );
 
   const triggerLabel = resolveBranchTriggerLabel({

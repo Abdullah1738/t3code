@@ -1,9 +1,11 @@
+import { ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import { DesktopLease, DesktopLeaseError, type LeaseRequest } from "./DesktopLease.ts";
 
 export class DesktopLeaseServiceError extends Schema.TaggedError<DesktopLeaseServiceError>()(
@@ -67,18 +69,37 @@ export class DesktopLeaseService extends Context.Service<
 
 const make = Effect.fn("DesktopLeaseService.make")(function* (options: StoreOptions = {}) {
   const identity = yield* ExecutionIdentity.ExecutionIdentity;
+  const projection = yield* ProjectionStore.ProjectionStoreV2;
   const { factory = (storeOptions) => new DesktopLease(storeOptions), ...storeOptions } = options;
   let store: DesktopLease | undefined;
 
   // Opening is synchronous, so concurrent calls cannot construct two stores in this layer.
-  const withStore = <A>(operation: (store: DesktopLease) => A) =>
-    Effect.try({
+  const withStore = Effect.fn("DesktopLease.withStore")(function* <A>(
+    operation: (store: DesktopLease) => A,
+  ) {
+    const current = yield* Effect.try({
       try: () => {
         store ??= factory(storeOptions);
-        return operation(store);
+        return { store, lease: store.currentLease() };
       },
       catch: failure,
     });
+    const { lease } = current;
+    const running =
+      lease?.state === "held"
+        ? yield* projection.getRunningTurnContext(ThreadId.make(lease.childThreadId)).pipe(
+            Effect.map((context) => context.run?.status === "running"),
+            Effect.orElseSucceed(() => false),
+          )
+        : false;
+    return yield* Effect.try({
+      try: () => {
+        if (running && lease) current.store.touchHolder(lease.childThreadId, lease.ticket);
+        return operation(current.store);
+      },
+      catch: failure,
+    });
+  });
 
   yield* Effect.addFinalizer(() => Effect.sync(() => store?.close()));
 

@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests._env import clean_env
 from offbox_lib import api, cli, common, lease, pool, runs, ssh_sync
 from offbox_lib.common import OffboxError
 from test_box_owned_files import DENIED
@@ -25,7 +26,7 @@ class SyncRetryTests(unittest.TestCase):
         self.src.mkdir()
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
-        env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        env = {k: v for k, v in clean_env().items() if not k.startswith('GIT_')}
         env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
         self.stack.enter_context(patch.dict(os.environ, env, clear=True))
         subprocess.run(['git', '-C', str(self.src), 'init', '-q', '--template='], check=True)
@@ -71,7 +72,8 @@ class SyncRetryTests(unittest.TestCase):
         return self.real_run(cmd, **kwargs)
 
     def ssh_local(self, box, command, **kwargs):
-        return self.real_run(['sh', '-c', command], capture_output=True, check=kwargs.get('check', False))
+        return self.real_run(['sh', '-c', command], input=kwargs.get('input'), capture_output=True,
+                             check=kwargs.get('check', False))
 
     def push(self):
         return ssh_sync.push('testbox', self.src, str(self.remote))

@@ -972,6 +972,8 @@ export const OrchestrationV2ProviderThread = Schema.Struct({
   pendingBackgroundTasks: Schema.optional(Schema.Array(OrchestrationV2PendingBackgroundTask)).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
+  // An ordered idle update follows the output of native background work, including child follow-ups.
+  pendingBackgroundWork: Schema.optional(Schema.Boolean),
   contextUsage: Schema.optional(Schema.NullOr(ThreadTokenUsageSnapshot)).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
@@ -1163,6 +1165,7 @@ export type OrchestrationV2NotificationSource = typeof OrchestrationV2Notificati
 
 export const OrchestrationV2Notification = Schema.Struct({
   source: OrchestrationV2NotificationSource,
+  pullRequestWatch: Schema.optional(Schema.Struct({ url: Schema.String, headSha: Schema.String })),
   outcome: Schema.Literals(["completed", "failed", "cancelled", "updated", "unknown"]),
   summary: TrimmedNonEmptyString,
   detail: Schema.optional(Schema.String),
@@ -3267,6 +3270,8 @@ const OrchestrationV2InternalCommand = Schema.Union([
     threadId: ThreadId,
     ...ThreadPullRequestKey.fields,
     startedAt: IsoDateTime,
+    expectedHeadSha: Schema.optional(Schema.NullOr(Schema.String)),
+    expectedObservedHeadSha: Schema.optional(Schema.NullOr(Schema.String)),
     watch: Schema.NullOr(ThreadPullRequestWatch),
     /** With `watch: null`, the state the ended watch keeps instead of its last saved one. */
     endedWatch: Schema.optional(ThreadPullRequestWatch),

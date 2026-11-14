@@ -80,10 +80,11 @@ const liveProcess = Effect.acquireRelease(
 it.layer(NodeServices.layer)("cli config resolution", (it) => {
   const defaultObservabilityConfig = {
     traceMinLevel: "Info",
+    traceFileMinDurationMs: 2,
     traceTimingEnabled: true,
     traceBatchWindowMs: 1_000,
-    traceMaxBytes: 32 * 1024 * 1024,
-    traceMaxFiles: 24,
+    traceMaxBytes: 64 * 1024 * 1024,
+    traceMaxFiles: 128,
     otlpTracesUrl: undefined,
     otlpMetricsUrl: undefined,
     otlpLogsUrl: undefined,

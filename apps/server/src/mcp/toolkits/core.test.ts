@@ -1,3 +1,4 @@
+import { AnalyticsToolkit } from "./analytics/tools.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
@@ -96,6 +97,7 @@ const layerThreadToolkit = McpHttpServer.layerThreadToolkit.pipe(
 it("publishes unique tool names with reference-free object-root inputs", () => {
   const names = new Set<string>();
   for (const toolkit of [
+    AnalyticsToolkit,
     OrchestratorToolkit,
     PreviewToolkit,
     WorktreeToolkit,
@@ -221,6 +223,13 @@ it.effect("returns a bounded public failure without serializing storage causes",
         Layer.provide(NodeCrypto.layer),
         Layer.provide(
           Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: () =>
+              Effect.fail(
+                new OrchestratorProjectionError({
+                  threadId,
+                  cause: new Error("private-storage-path"),
+                }),
+              ),
             getThreadShell: () =>
               Effect.fail(
                 new OrchestratorProjectionError({
@@ -301,6 +310,15 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
         Layer.provide(FetchHttpClient.layer),
         Layer.provide(
           Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: () =>
+              Effect.succeed({
+                id: threadId,
+                deletedAt: null,
+                archivedAt: null,
+                activeRunId: RunId.make("mcp-core-run"),
+                providerInstanceId: ProviderInstanceId.make("codex"),
+                forkedFrom: null,
+              } as OrchestrationV2ThreadShell),
             getThreadShell: () =>
               Effect.succeed({
                 id: threadId,
@@ -308,6 +326,7 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
                 archivedAt: null,
                 activeRunId: RunId.make("mcp-core-run"),
                 providerInstanceId: ProviderInstanceId.make("codex"),
+                forkedFrom: null,
               } as OrchestrationV2ThreadShell),
             // No run in the projection, so the tool result alone carries the page.
             getThreadRecords: () => Effect.succeed({ runs: [] } as never),
@@ -361,6 +380,7 @@ it.effect("keeps unexpected handler defects private through the production regis
         Layer.provide(NodeCrypto.layer),
         Layer.provide(
           Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: () => Effect.die(new Error("private-storage-path")),
             getThreadShell: () => Effect.die(new Error("private-storage-path")),
           }),
         ),
@@ -387,6 +407,7 @@ it.effect("records the calling agent and the agent a tool acted on", () => {
       archivedAt: null,
       deletedAt: null,
       activeRunId: "mcp-core-run",
+      forkedFrom: null,
       createdBy: "agent",
       creationSource: "mcp",
       lineage: {
@@ -448,6 +469,12 @@ it.effect("records the calling agent and the agent a tool acted on", () => {
         Layer.provide(NodeCrypto.layer),
         Layer.provide(
           Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: (id) =>
+              Effect.succeed(
+                id === threadId
+                  ? shell(threadId, "codex", "gpt-5.5")
+                  : shell(id, "claudeAgent", "claude-opus-5-5"),
+              ),
             getThreadShell: (id) =>
               Effect.succeed(
                 id === threadId
@@ -800,6 +827,7 @@ function scheduledTask(id: string, runtimeMode: "auto" | "full-access"): never {
     lastRunAt: null,
     lastRunThreadId: null,
     lastRunError: null,
+    missedRuns: [],
     runCount: 0,
     createdAt: "2026-10-01T00:00:00.000Z",
     updatedAt: "2026-10-01T00:00:00.000Z",
@@ -935,6 +963,7 @@ it.effect("discovers workflow stop targets and requires orchestration capability
         Layer.provide(NodeCrypto.layer),
         Layer.provide(
           Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: (id) => Effect.succeed(McpToolAccessTestkit.liveThreadShell(id)),
             getThreadShell: (id) => Effect.succeed(McpToolAccessTestkit.liveThreadShell(id)),
             getProjectThreadRecords: () =>
               Effect.succeed(McpToolAccessTestkit.idleThreadProjection(shell)),

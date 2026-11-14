@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tests._env import clean_env
 from offbox_lib import cli, lease, misc, runs  # noqa: E402
 from offbox_lib.common import EXIT_INFRA, OffboxError  # noqa: E402
 from offbox_lib.runs import GO_STD_GLITCH  # noqa: E402
@@ -96,6 +97,12 @@ class StepScriptTests(unittest.TestCase):
         self.assertNotEqual(p.returncode, 0)
 
 
+def with_dependencies(text):
+    manifest = json.loads(text)
+    manifest.setdefault('devDependencies', {})['fixture'] = '1'
+    return json.dumps(manifest)
+
+
 class MissingDepsTests(unittest.TestCase):
 
     def test_install_selection(self):
@@ -121,7 +128,7 @@ class MissingDepsTests(unittest.TestCase):
         for files, manager, install in cases:
             with self.subTest(files=files, manager=manager), tempfile.TemporaryDirectory() as d:
                 root = Path(d)
-                (root / 'package.json').write_text(json.dumps({'packageManager': manager}))
+                (root / 'package.json').write_text(with_dependencies(json.dumps({'packageManager': manager})))
                 for name in files:
                     (root / name).write_text("lockfileVersion: '9.0'\n" if name == 'pnpm-lock.yaml' else '')
                 hint = runs.missing_deps_hint(root)
@@ -129,7 +136,8 @@ class MissingDepsTests(unittest.TestCase):
                 self.assertIn('offbox save --default', hint)
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                 self.assertIn(f'with {install} &&', err.getvalue())
 
     def test_package_manager_pin_suffixes_keep_precedence(self):
@@ -137,13 +145,14 @@ class MissingDepsTests(unittest.TestCase):
             with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as d:
                 root = Path(d)
                 pin = 'yarn@4.0.0' + suffix
-                (root / 'package.json').write_text(json.dumps({'packageManager': pin}))
+                (root / 'package.json').write_text(with_dependencies(json.dumps({'packageManager': pin})))
                 (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 expected = f'corepack {pin} install --immutable'
                 self.assertIn(expected, runs.missing_deps_hint(root))
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                 self.assertIn(expected, err.getvalue())
 
     def test_ci_action_mapping_order_and_quotes(self):
@@ -190,12 +199,13 @@ class MissingDepsTests(unittest.TestCase):
         for pin in ('npm@10.8.2', 'bun@1.3.0'):
             with self.subTest(pin=pin), tempfile.TemporaryDirectory() as d:
                 root = Path(d)
-                (root / 'package.json').write_text(json.dumps({'packageManager': pin}))
+                (root / 'package.json').write_text(with_dependencies(json.dumps({'packageManager': pin})))
                 manager, version = pin.split('@')
                 self.assertIn(f'Use {manager} {version} from package.json', runs.missing_deps_hint(root))
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                 self.assertIn(f'Use {manager} {version} from package.json', err.getvalue())
 
     def test_ci_inline_mapping_and_step_spacing(self):
@@ -217,8 +227,8 @@ class MissingDepsTests(unittest.TestCase):
         for manager in ('yarn', 'pnpm', 'npm', 'bun'):
             with self.subTest(manager=manager), tempfile.TemporaryDirectory() as d:
                 root = Path(d)
-                (root / 'package.json').write_text(json.dumps({
-                    'packageManager': manager + '@https://example.invalid/manager.js#sha224.abcdef'}))
+                (root / 'package.json').write_text(with_dependencies(json.dumps({
+                    'packageManager': manager + '@https://example.invalid/manager.js#sha224.abcdef'})))
                 (root / ('yarn.lock' if manager == 'pnpm' else 'pnpm-lock.yaml')).touch()
                 hint = runs.missing_deps_hint(root)
                 self.assertIn(f'packageManager declares {manager} with a non-numeric descriptor', hint)
@@ -227,7 +237,8 @@ class MissingDepsTests(unittest.TestCase):
                 self.assertNotIn('https://', hint)
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                 self.assertIn(f'packageManager declares {manager} with a non-numeric descriptor', err.getvalue())
 
     def test_multiline_quoted_shell_content_is_not_config(self):
@@ -385,12 +396,13 @@ class MissingDepsTests(unittest.TestCase):
                              ('yarn@4.9.2', 'corepack yarn@4.9.2 install --immutable')):
             with self.subTest(pin=pin), tempfile.TemporaryDirectory() as d:
                 root = Path(d)
-                (root / 'package.json').write_text(json.dumps({
-                    'packageManager': pin, 'devDependencies': {'vite-plus': '1.0.0'}}))
+                (root / 'package.json').write_text(with_dependencies(json.dumps({
+                    'packageManager': pin, 'devDependencies': {'vite-plus': '1.0.0'}})))
                 self.assertIn(f"offbox run -- '{command} &&", runs.missing_deps_hint(root))
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                 self.assertIn(f'with {command} &&', err.getvalue())
                 self.assertNotIn('vp i &&', err.getvalue())
 
@@ -406,7 +418,7 @@ class MissingDepsTests(unittest.TestCase):
                 root = Path(d)
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yaml').write_text(workflow)
-                (root / 'package.json').write_text(json.dumps({'engines': {'node': '^20.19.0 || >=22.12.0 <23'}}))
+                (root / 'package.json').write_text(with_dependencies(json.dumps({'engines': {'node': '^20.19.0 || >=22.12.0 <23'}})))
                 (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 hint = runs.missing_deps_hint(root)
                 pin = '10.18.0' if '10.18.0' in workflow else '10'
@@ -418,9 +430,10 @@ class MissingDepsTests(unittest.TestCase):
                 self.assertEqual(selected, 22023002)
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                 self.assertIn(f'corepack pnpm@{pin} install --frozen-lockfile', err.getvalue())
-                (root / 'package.json').write_text('{"packageManager":"pnpm@11.7.0"}')
+                (root / 'package.json').write_text(with_dependencies('{"packageManager":"pnpm@11.7.0"}'))
                 self.assertIn('corepack pnpm@11.7.0 ', runs.missing_deps_hint(root))
 
     def test_ci_setup_expressions_defer_both_hints(self):
@@ -441,23 +454,25 @@ class MissingDepsTests(unittest.TestCase):
                                 '    steps:\n      - uses: pnpm/action-setup@v4\n' +
                                 ''.join('    ' + line for line in settings.splitlines(keepends=True)))
                     (root / '.github/workflows/ci.yml').write_text(workflow)
-                    (root / 'package.json').write_text('{}')
+                    (root / 'package.json').write_text(with_dependencies('{}'))
                     (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                     log = root / 'run.log'
                     log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                     err = io.StringIO()
                     with contextlib.redirect_stderr(err):
-                        runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                        runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                     for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
                         self.assertIn('<repo-install>', hint)
                         self.assertIn('CI pnpm version is ambiguous', hint)
                         self.assertIn('inspect', hint)
                         self.assertNotIn('corepack pnpm', hint)
                     # A repository-owned pin still outranks dynamic CI configuration.
-                    (root / 'package.json').write_text('{"packageManager":"pnpm@10.18.0"}')
+                    (root / 'package.json').write_text(with_dependencies('{"packageManager":"pnpm@10.18.0"}'))
                     err = io.StringIO()
                     with contextlib.redirect_stderr(err):
-                        runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                        runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                     for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
                         self.assertIn('corepack pnpm@10.18.0 install', hint)
                         self.assertNotIn('CI pnpm version is ambiguous', hint)
@@ -474,13 +489,14 @@ class MissingDepsTests(unittest.TestCase):
                 root = Path(d)
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text(workflow)
-                (root / 'package.json').write_text('{}')
+                (root / 'package.json').write_text(with_dependencies('{}'))
                 (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                 for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
                     self.assertIn('<repo-install>' if inspect else 'corepack pnpm@10 install', hint)
                     self.assertEqual('CI pnpm version is ambiguous' in hint, inspect)
@@ -494,19 +510,20 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows/ci.yml').write_text("env:\n  PNPM_VERSION: '10'\n")
                 (root / '.github/workflows/check.yaml').write_text(
                     'steps:\n  - uses: pnpm/action-setup@v4\n    with:\n      ' + dynamic + '\n')
-                (root / 'package.json').write_text('{}')
+                (root / 'package.json').write_text(with_dependencies('{}'))
                 (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                 for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
                     self.assertIn('CI pnpm version is ambiguous', hint)
                     self.assertIn('<repo-install>', hint)
                     self.assertNotIn('corepack pnpm', hint)
                 # The repo bootstrap cannot hide an unresolved version requirement.
-                (root / 'package.json').write_text('{"devDependencies":{"vite-plus":"1.0.0"}}')
+                (root / 'package.json').write_text(with_dependencies('{"devDependencies":{"vite-plus":"1.0.0"}}'))
                 self.assertIn('<repo-install>', runs.box_deps_hint(root, log))
 
     def test_flow_setup_steps_and_inline_env_keep_unresolved_candidates(self):
@@ -524,13 +541,14 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text(
                     "env:\n  PNPM_VERSION: '10'\nsteps:\n" + steps)
-                (root / 'package.json').write_text('{}')
+                (root / 'package.json').write_text(with_dependencies('{}'))
                 (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                 for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
                     self.assertIn('<repo-install>', hint)
                     self.assertIn('CI pnpm version is ambiguous', hint)
@@ -552,13 +570,14 @@ class MissingDepsTests(unittest.TestCase):
                     (root / '.github/workflows/ci.yml').write_text(
                         "env:\n  PNPM_VERSION: '10'\nsteps:\n  - uses: pnpm/action-setup@v4\n    " +
                         key + ': ' + quote + value + quote + '\n')
-                    (root / 'package.json').write_text('{}')
+                    (root / 'package.json').write_text(with_dependencies('{}'))
                     (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                     log = root / 'run.log'
                     log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                     err = io.StringIO()
                     with contextlib.redirect_stderr(err):
-                        runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                        runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                     for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
                         self.assertIn('<repo-install>', hint)
                         self.assertIn('CI pnpm version is ambiguous', hint)
@@ -573,13 +592,14 @@ class MissingDepsTests(unittest.TestCase):
                     "env:\n  PNPM_VERSION: '10'\njobs:\n  checks:\n    " + key +
                     ": {PNPM_VERSION: '${{ matrix.pnpm }}'}\n    strategy:\n      matrix:\n        pnpm: [11]\n"
                     "    steps:\n      - run: corepack pnpm@${{ env.PNPM_VERSION }} install --frozen-lockfile\n")
-                (root / 'package.json').write_text('{}')
+                (root / 'package.json').write_text(with_dependencies('{}'))
                 (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                 for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
                     self.assertIn('<repo-install>', hint)
                     self.assertIn('CI pnpm version is ambiguous', hint)
@@ -608,13 +628,14 @@ class MissingDepsTests(unittest.TestCase):
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text(
                     "env:\n  PNPM_VERSION: '10'\nsteps:\n" + steps)
-                (root / 'package.json').write_text('{}')
+                (root / 'package.json').write_text(with_dependencies('{}'))
                 (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                 for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
                     self.assertIn('<repo-install>', hint)
                     self.assertIn('CI pnpm version is ambiguous', hint)
@@ -643,13 +664,14 @@ class MissingDepsTests(unittest.TestCase):
                 root = Path(d)
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text("env:\n  PNPM_VERSION: '10'\n" + container)
-                (root / 'package.json').write_text('{}')
+                (root / 'package.json').write_text(with_dependencies('{}'))
                 (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                 for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
                     self.assertIn('<repo-install>', hint)
                     self.assertIn('CI pnpm version is ambiguous', hint)
@@ -665,13 +687,14 @@ class MissingDepsTests(unittest.TestCase):
                     (root / '.github/workflows/ci.yml').write_text(
                         "env:\n  PNPM_VERSION: '10'\nsteps:\n  - uses: pnpm/action-setup@v4\n    " +
                         key + ':\n      ' + value + '\n')
-                    (root / 'package.json').write_text('{}')
+                    (root / 'package.json').write_text(with_dependencies('{}'))
                     (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                     log = root / 'run.log'
                     log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                     err = io.StringIO()
                     with contextlib.redirect_stderr(err):
-                        runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                        runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                     for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
                         self.assertIn('<repo-install>', hint)
                         self.assertIn('CI pnpm version is ambiguous', hint)
@@ -709,13 +732,14 @@ class MissingDepsTests(unittest.TestCase):
                 root = Path(d)
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text("env:\n  PNPM_VERSION: '10'\n" + config)
-                (root / 'package.json').write_text('{}')
+                (root / 'package.json').write_text(with_dependencies('{}'))
                 (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                 for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
                     self.assertIn('<repo-install>', hint)
                     self.assertIn('CI pnpm version is ambiguous', hint)
@@ -740,13 +764,14 @@ class MissingDepsTests(unittest.TestCase):
                 root = Path(d)
                 (root / '.github/workflows').mkdir(parents=True)
                 (root / '.github/workflows/ci.yml').write_text("env:\n  PNPM_VERSION: '10'\n" + config)
-                (root / 'package.json').write_text('{}')
+                (root / 'package.json').write_text(with_dependencies('{}'))
                 (root / 'pnpm-lock.yaml').write_text("lockfileVersion: '9.0'\n")
                 log = root / 'run.log'
                 log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
-                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root)
+                    runs.new_checkout_hint({'_new_checkout': True, 'box_id': 'B'}, root,
+                                           runs.command_usage.inspect(root, '.', ['node']))
                 for hint in (err.getvalue(), runs.box_deps_hint(root, log)):
                     self.assertIn('corepack pnpm@10 install', hint)
                     self.assertNotIn('CI pnpm version is ambiguous', hint)
@@ -788,7 +813,7 @@ class MissingDepsTests(unittest.TestCase):
                     root = Path(home) / 'w/repo'
                     (root / 'sub').mkdir(parents=True)
                     if state != 'no-package':
-                        (root / 'package.json').write_text('{}')
+                        (root / 'package.json').write_text('{"devDependencies":{"vitest":"1"}}')
                     if state == 'present':
                         (root / 'node_modules').mkdir()
                     elif state == 'nested-only':
@@ -797,8 +822,8 @@ class MissingDepsTests(unittest.TestCase):
                         (root / 'node_modules').symlink_to(root / 'sub', target_is_directory=True)
                     with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
                             patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
-                        script = runs.remote_script('w/repo', 'sub', [f'cd /; printf partial >&2; exit {code}'], None, 'r')
-                    p = subprocess.run(['bash', '-c', script], env=dict(os.environ, HOME=home),
+                        script = runs.remote_script('w/repo', 'sub', [f'node -e \"process.exit({code})\"; cd /; exit {code}'], None, 'r', repo_root=root)
+                    p = subprocess.run(['bash', '-c', script], env=clean_env(HOME=home),
                                        capture_output=True, text=True, timeout=10)
                     self.assertEqual(p.returncode, code)
                     self.assertEqual(p.stderr.splitlines().count(runs.NO_NODE_MODULES_MARKER),
@@ -808,11 +833,11 @@ class MissingDepsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             root = Path(home) / 'w/repo'
             root.mkdir(parents=True)
-            (root / 'package.json').write_text('{}')
+            (root / 'package.json').write_text('{"devDependencies":{"vitest":"1"}}')
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
                     patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
-                script = runs.remote_script('w/repo', '.', [], None, 'r', steps=['exit 127', 'true'])
-            p = subprocess.run(['bash', '-c', script], env=dict(os.environ, HOME=home),
+                script = runs.remote_script('w/repo', '.', [], None, 'r', steps=['node -e \"process.exit(127)\"', 'true'], repo_root=root)
+            p = subprocess.run(['bash', '-c', script], env=clean_env(HOME=home),
                                capture_output=True, text=True, timeout=10)
             self.assertEqual(p.returncode, 127)
             self.assertEqual(p.stderr.splitlines().count(runs.NO_NODE_MODULES_MARKER), 1)
@@ -894,9 +919,6 @@ class SummaryAndHintTests(unittest.TestCase):
             log.write_text('FAIL TestX\n')
             self.assertFalse(runs.setup_failed(log))
 
-    def test_go_repair_preamble_prints_marker_on_97(self):
-        self.assertIn('offbox-setup-failed', runs.GO_REPAIR)
-        self.assertTrue(runs.GO_REPAIR.rstrip().endswith("|| { echo offbox-setup-failed >&2; exit 97; }"))
 
 
 class CliStepTests(Isolated):

@@ -162,3 +162,6 @@ Two short reference scripts, not installed on any board:
   owner's own login; the script holds no token.
 - [`board-wait-checks/pr-ready.py`](board-wait-checks/pr-ready.py): a pull
   request leaves draft. No network call: it reads `facts.prs`.
+- [`board-wait-checks/file-sha256.py`](board-wait-checks/file-sha256.py): a local
+  file's sha256 reaches a given value (an install landed). No network; reads
+  the file, prints only hashes.

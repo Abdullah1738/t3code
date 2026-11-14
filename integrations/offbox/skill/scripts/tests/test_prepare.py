@@ -12,8 +12,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_capacity import Isolated
+from tests._env import clean_env
 from test_exit_and_queue import FakeClock
-from offbox_lib import api, cli, common, lease, pool, prepare, runs
+from offbox_lib import api, cli, common, home, lease, pool, prepare, runs
 
 
 class PrepareTests(Isolated):
@@ -23,6 +24,21 @@ class PrepareTests(Isolated):
         self.stack.enter_context(patch.object(lease, 'cap_check'))
         self.stack.enter_context(patch.object(pool, '_refresh_background'))
         self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
+
+    def test_stalled_keeps_box_and_failure_metadata(self):
+        for phase in ('lock_wait', 'bring_up', 'push'):
+            for may_fail_over in (False, True):
+                with self.subTest(phase=phase, may_fail_over=may_fail_over), \
+                        patch.object(home, 'may_fail_over', return_value=may_fail_over):
+                    error = prepare.Stalled('new-1', phase, 1.5)
+                    self.assertEqual(error.box, 'new-1')
+                    self.assertEqual(error.phase, phase)
+                    self.assertIsNone(error.run_id)
+                    self.assertEqual(error.code, common.EXIT_INFRA)
+                    self.assertFalse(error.started)
+                    self.assertFalse(error.outage)
+                    self.assertEqual(str(error), f'could not get a box ready in 1.5s '
+                                                f'(stuck in {phase} on new-1); nothing ran')
 
     def create_and_claim(self, lock_seconds, replacement=False):
         clock = FakeClock()
@@ -330,7 +346,7 @@ with patch.object(bases, 'recipe', return_value=('true', 'sha')), \\
         print('bounded cleanup')
 '''
         result = subprocess.run([sys.executable, '-c', code], cwd=Path(__file__).resolve().parents[1],
-                                env=dict(os.environ, OFFBOX_PREPARE_DEADLINE_SECONDS='1'),
+                                env=clean_env(OFFBOX_PREPARE_DEADLINE_SECONDS='1'),
                                 capture_output=True, text=True, timeout=4)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('bounded cleanup', result.stdout)

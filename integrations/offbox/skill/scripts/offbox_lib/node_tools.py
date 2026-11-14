@@ -1,10 +1,31 @@
 """Repo-local Node executables and package-manager bootstrap advice."""
 
+import os
 import shlex
 from pathlib import Path
 
 from . import package_manager
 from .common import read_json
+
+
+def install_root(package: Path, root: Path | None = None) -> Path:
+    package = package.resolve()
+    root = root.resolve() if root else None
+    if root and package != root:
+        manifest = read_json(root / 'package.json', {})
+        if (root / 'pnpm-workspace.yaml').exists() or (isinstance(manifest, dict) and manifest.get('workspaces')):
+            package = root
+    return package
+
+
+def install_from(package: Path, cwd: Path, root: Path | None = None) -> str:
+    package = install_root(package, root)
+    install = package_manager.install_command(package)
+    relative = os.path.relpath(package, cwd.resolve())
+    return install if relative == '.' else f'(cd {shlex.quote(relative)} && {install})'
+
+
+REPO_LOCAL_TOOLS = {"vp": "vite-plus", "tsc-rs": "tsc-rs"}
 
 
 # Include absent bin directories and disable hashing so installs cannot leave a
@@ -116,7 +137,7 @@ fi'''
 def block(rdir: str, root: Path | None = None) -> str:
     manifest = read_json(root / "package.json", {}) if root else {}
     cases = []
-    for tool, package in (("vp", "vite-plus"), ("tsc-rs", "tsc-rs")):
+    for tool, package in REPO_LOCAL_TOOLS.items():
         if isinstance(manifest, dict) and any(isinstance(manifest.get(key), dict) and package in manifest[key]
                                               for key in ("dependencies", "devDependencies")):
             message = (f"offbox: {tool} is a repo-local tool ({package}) and node_modules isn't installed on this box yet. "

@@ -30,10 +30,12 @@ money-cases close ID --outcome "refund landed 27 Oct"
 money-cases reopen ID --deadline 2026-11-01 --note "..."
 money-cases card-dead 5542 --note "cancelled 30 Oct, replaced by 2342"
 money-cases cards      # list dead cards
-money-cases brief      # one line for the morning brief, nothing when no case is open
+money-cases brief      # one line for the morning brief, including closed cases with running watchers
 ```
 
 A deadline is a date (meaning 09:00 Dubai that day) or an ISO time. Every open case needs one. Setting a new deadline re-arms the ping. Every change is kept in the case's `history`.
+
+Use `add --due DATE` to record the real due date separately from the follow-up deadline. `update --due DATE` needs `--because TEXT` or `--reply ID`. The brief sorts and judges overdue cases by due when set and shows the follow-up date too; cases without due use deadline. Pings still follow deadline.
 
 Rules added 2026-10-30 (money-cases fixes, card #10):
 - **No self-moved deadlines.** A deadline change needs `--source mail:<id>`, `sms:<id>`, `imessage:<id>`, `statement:<path>#<line>`, or `--reply` (his reply id). `--because` is an optional reason and cannot move a deadline alone. The source is kept in the history text and its `source` field; it can also be recorded without a deadline change. Only his reply counts as an owner answer.
@@ -123,7 +125,7 @@ Card numbers and labelled codes or passwords (`OTP code 482913`, `OTP is 482 913
 ## Verify
 
 ```sh
-/usr/bin/python3 -B -m unittest -v test_accuracy.py test_cases.py test_charges.py test_install.py
+ROBOB_TEST=1 /usr/bin/python3 -B -m unittest -v test_accuracy.py test_cases.py test_charges.py test_install.py
 unset BUN_INSPECT
 robob-watch test money-cases
 ```
@@ -146,6 +148,12 @@ Use `--asked-by moni` for her purchases. This records the request, not a payment
 
 ## Daily unasked list
 
-The first non-quiet check each Dubai day raises one daily list when unasked charges older than 24 hours remain. Awaiting answers do not hold it. Run `money-cases unasked` (or `--json`) to inspect candidates without writing; on the daily event, run `money-cases unasked --ask` and send its output as one message, never individual asks.
+The check records an Abdullah-owned charge as an `unmatched` case once it is at least two hours old and still has verdict `ask`. It stores `case_opened` on the question and opens only one case per card ending, amount, currency and alert time. Receipt waits, explained charges, unreadable sources, declines and Moni's charges do not open one. This records the case without asking him: the linked question keeps its original alert time for the daily list, and the case adds no separate prompt while it awaits his answer.
+
+The first non-quiet check each Dubai day raises one daily list when unasked charges older than 24 hours remain. Awaiting answers do not hold it. Run `money-cases unasked` (or `--json`) to inspect candidates without writing; add `--all` to see excluded items and their reasons; on the daily event, run `money-cases unasked --ask` and send its output as one message, never individual asks.
 
 The command screens receipts, orders, purchase notes and subscriptions before listing each charge, oldest first, then summarizes explanations it settled. Listed charges become `awaiting_answer`; reruns cannot list them again. Moni's charges stay held. Failed screens rotate behind untouched items so later charges get checked. Unreadable or unscreened items stay for a later run: the command has a 40-second total budget and a 6-second limit per item. Cases without a known card or charge time stay held for inspection. Quiet hours, overdue bills and payment deadlines keep their existing behavior.
+
+After installing this fix, run `money-cases migrate-legacy-asks --dry-run`, review the list, then run `money-cases migrate-legacy-asks` once. It seeds the existing ask marker on open non-bill cases from the original daily list whose current cycle started before 13 Nov 2026 04:25Z, plus four verified legacy cases. Age and receipt-wait eligibility are frozen at that cutoff. It preserves their status; historical notifications do not become pending questions. Repeating it makes no further changes. Existing asks and answered state prevent another daily first ask, including linked questions and structured owner answers.
+
+Declined daily items retain a reason until their revision, cycle or charge evidence changes. Receipt waits resume at their expiry; timeouts and unreadable lookups can be retried. Cases without usable card evidence or a matching charge date are excluded from the daily count.

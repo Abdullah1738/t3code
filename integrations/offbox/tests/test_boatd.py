@@ -186,6 +186,25 @@ class ReconcileRuns(Base):
         self.assertEqual([s["kind"] for s in snaps], ["auto"])
         self.assertEqual(self.f.spawned, [])
 
+    def test_resource_host_counts_survive_result_recovery(self):
+        b = self.box()
+        self.box('bx_foreign1', owner='moni')
+        self.box('bx_archived', state='archived', running=False)
+        self.assertEqual(boatd.running_box_count(self.con), 2)
+        p = self.cmd(b)
+        boatd.write_json(boatd.result_path(b, p), {
+            'attempt': 1, 'status': 'exited', 'exit_code': 7, 'started_at': 100, 'ended_at': 120,
+            'host_boxes': {'start': 2, 'end': 3}})
+        boatd.settle_cmd(self.con, self.con.execute('SELECT * FROM commands WHERE box_id=? AND pid=?', (b, p)).fetchone())
+        status = boatd.cmd_status_json(self.con, b, p)
+        self.assertEqual(status['metrics']['host_boxes'], {'start': 2, 'end': 3})
+        self.assertEqual(status['exitCode'], 7)
+        with patch.object(boatd, 'db') as broken:
+            broken.execute.side_effect = RuntimeError('telemetry failed')
+            self.assertIsNone(boatd.running_box_count(broken))
+        for malformed in ('broken', 'null', '[]', '{"host_boxes":"private"}'):
+            self.assertEqual(boatd.host_box_metrics(malformed), {'host_boxes': None})
+
     def test_result_of_an_earlier_attempt_is_not_taken_for_this_one(self):
         b = self.box()
         p = self.cmd(b, attempt=2, retry=1)
@@ -305,7 +324,7 @@ class ReconcileBoxes(Base):
         # The base image has no host keys: sshd fails at first boot until systemd refuses to start it again.
         b = self.box()
         boatd._fresh_identity(b)
-        cmd = [c for c in self.f.calls if c[:1] == ("exec",)][-1][-1]
+        cmd = next(c[-1] for c in self.f.calls if c[:1] == ("exec",) and "ssh-keygen -A" in c[-1])
         self.assertLess(cmd.index("ssh-keygen -A"), cmd.index("systemctl reset-failed ssh.service ssh.socket"))
         self.assertLess(cmd.index("systemctl reset-failed"), cmd.index("systemctl restart ssh"))
 
@@ -561,6 +580,27 @@ class Http(Base):
         self.assertEqual(self.call("ardud", "GET", f"/sandboxes/{hers}/commands/{pid}")[0], 404)
         self.assertEqual(self.call("ardud", "GET", f"/sandboxes/{hers}/command-history/{cid}/logs")[0], 404)
 
+    def test_history_logs_report_stream_byte_size_and_done_at_that_size(self):
+        bid = self.box()
+        streams = {"stdout": ("x" * (1 << 20) + "€tail\n").encode(), "stderr": "error é\n".encode()}
+        for pid, status in enumerate(("queued", "running", "exited"), start=1001):
+            self.cmd(bid, pid=pid, status=status)
+            for stream, content in streams.items():
+                ext = "out" if stream == "stdout" else "err"
+                (boatd.cmd_dir(bid) / f"{pid}.{ext}").write_bytes(content)
+            for stream, content in streams.items():
+                for offset in (0, len(content)):
+                    with self.subTest(status=status, stream=stream, offset=offset):
+                        st, page = self.call("ardud", "GET",
+                                             f"/sandboxes/{bid}/command-history/cmd_{pid}/logs"
+                                             f"?stream={stream}&offset={offset}")
+                        self.assertEqual(st, 200, page)
+                        self.assertEqual(page["size"], len(content))
+                        data = page["data"].encode()
+                        self.assertEqual(data, content[offset:offset + (1 << 20)])
+                        self.assertEqual(page["nextOffset"], offset + len(data))
+                        self.assertEqual(page["done"], status == "exited" and page["nextOffset"] >= page["size"])
+
     def test_saved_states_are_per_owner_even_with_the_same_name(self):
         hers, his = self.make_box("moni"), self.make_box("ardud")
         self.assertEqual(self.call("moni", "POST", "/saved-snapshots", {"name": "base", "sandboxId": hers})[0], 200)
@@ -624,6 +664,8 @@ class Http(Base):
         p = self.cmd(b, status="running")
         (boatd.cmd_dir(b) / f"{p}.out").write_text("before the cut\n")
         boatd.reconcile(self.con)
+        self.con.execute('UPDATE commands SET metrics=? WHERE box_id=? AND pid=?',
+                         (json.dumps({'host_boxes': {'start': 9, 'end': 14}}), b, p))
         req = urllib.request.Request(self.url + f"/sandboxes/{b}/commands/{p}/stream?stdoutOffset=7",
                                      headers={"Authorization": "Bearer " + self.tok["ardud"]})
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -632,6 +674,7 @@ class Http(Base):
         self.assertEqual((frames[0]["attempt"], frames[0]["bootId"]), (1, "boot-2"))
         out = "".join(f["data"] for f in frames if f["type"] == "stdout")
         self.assertEqual(out, "the cut\n", "resumes from the byte offset it was given")
+        self.assertEqual(frames[-1]['metrics']['host_boxes'], {'start': 9, 'end': 14})
         self.assertEqual((frames[-1]["type"], frames[-1]["status"], frames[-1]["exitCode"]), ("exit", "interrupted", None))
 
 

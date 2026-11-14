@@ -17,6 +17,9 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Request from "effect/Request";
+import * as RequestResolver from "effect/RequestResolver";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -227,6 +230,18 @@ export class EventSinkV2 extends Context.Service<EventSinkV2, EventSinkV2Shape>(
   "t3/orchestration-v2/EventSink/EventSinkV2",
 ) {}
 
+// Only ordinary writes join a batch. Conditional and acknowledged commands keep
+// their own transaction, and callers already in a transaction stay on its connection.
+const WriteBatch = Context.Reference<
+  { readonly publications: Array<Effect.Effect<void>> } | undefined
+>("t3/orchestration-v2/EventSink/WriteBatch", { defaultValue: () => undefined });
+
+interface QueuedWrite extends Request.Request<ReadonlyArray<OrchestrationV2StoredEvent>, unknown> {
+  readonly isCancelled: () => boolean;
+  readonly input: Parameters<EventSinkV2Shape["writeWithEffects"]>[0];
+}
+const QueuedWrite = Request.of<QueuedWrite>();
+
 type WritePhase = "normalize" | "append" | "project" | "outbox" | "lane_wait";
 
 interface WriteTiming {
@@ -294,6 +309,7 @@ const layerBase: Layer.Layer<
         readonly prepare: (value: A) => () => void;
       },
     ) {
+      const batch = yield* WriteBatch;
       const clock = yield* Clock.Clock;
       const now = () => clock.monotonicTimeNanosUnsafe();
       const elapsed = (start: bigint) => Number(now() - start) / 1_000_000;
@@ -369,54 +385,57 @@ const layerBase: Layer.Layer<
       });
       const started = performance.now();
       let accepted: (() => void) | undefined;
-      return yield* sql
-        .withTransaction(
-          Effect.suspend(() => {
-            txStart = now();
-            return transaction(timing).pipe(
-              Effect.tap(() => takeLane),
-              Effect.tap((value) =>
-                Effect.suspend(() => {
-                  // The lane wait is masked. A timed-out sender must roll back when it resumes.
-                  if (acceptance !== undefined && !acceptance.check()) return Effect.interrupt;
-                  return Effect.sync(() => {
-                    accepted = acceptance?.prepare(value);
-                  });
-                }),
-              ),
-            );
-          }),
-        )
-        .pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              // Capture before restoring scheduler yields, so a descheduled reporter cannot
-              // inflate the writer hold. db.lock_wait_ms already records acquisition.
-              txMs = txStart === undefined ? 0 : elapsed(txStart);
+      const body = Effect.suspend(() => {
+        txStart = now();
+        return transaction(timing).pipe(
+          Effect.tap(() => (batch === undefined ? takeLane : Effect.void)),
+          Effect.tap((value) =>
+            Effect.suspend(() => {
+              // The lane wait is masked. A timed-out sender must roll back when it resumes.
+              if (acceptance !== undefined && !acceptance.check()) return Effect.interrupt;
+              return Effect.sync(() => {
+                accepted = acceptance?.prepare(value);
+              });
             }),
           ),
-          // Keep synchronous writer work from yielding behind the saturated run queue.
-          // A real wait (including the publish lane) still suspends.
-          Effect.provideService(Scheduler.PreventSchedulerYield, true),
-          Effect.provideService(
-            NodeSqliteClient.TransactionCommitObserver,
-            acceptance === undefined
-              ? undefined
-              : () => {
-                  accepted?.();
-                },
-          ),
-          Effect.tap(() =>
-            Effect.annotateCurrentSpan(
-              "orchestration_v2.transaction_ms",
-              Math.round(performance.now() - started),
-            ),
-          ),
-          // Diagnostics must not suppress publication after a successful commit.
-          Effect.ensuring(report.pipe(Effect.ignoreCause)),
-          Effect.tap(publish),
-          Effect.ensuring(Effect.suspend(() => (holdsLane ? publishLane.release(1) : Effect.void))),
         );
+      });
+      return yield* (batch === undefined ? sql.withTransaction(body) : body).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            // Capture before restoring scheduler yields, so a descheduled reporter cannot
+            // inflate the writer hold. db.lock_wait_ms already records acquisition.
+            txMs = txStart === undefined ? 0 : elapsed(txStart);
+          }),
+        ),
+        // Keep synchronous writer work from yielding behind the saturated run queue.
+        // A real wait (including the publish lane) still suspends.
+        Effect.provideService(Scheduler.PreventSchedulerYield, true),
+        Effect.provideService(
+          NodeSqliteClient.TransactionCommitObserver,
+          acceptance === undefined
+            ? undefined
+            : () => {
+                accepted?.();
+              },
+        ),
+        Effect.tap(() =>
+          Effect.annotateCurrentSpan(
+            "orchestration_v2.transaction_ms",
+            Math.round(performance.now() - started),
+          ),
+        ),
+        // Diagnostics must not suppress publication after a successful commit.
+        Effect.ensuring(report.pipe(Effect.ignoreCause)),
+        Effect.tap((value) =>
+          batch === undefined
+            ? publish(value)
+            : Effect.sync(() => {
+                batch.publications.push(publish(value));
+              }),
+        ),
+        Effect.ensuring(Effect.suspend(() => (holdsLane ? publishLane.release(1) : Effect.void))),
+      );
     });
 
     // A user can answer after terminal normalization reads the pending request.
@@ -585,8 +604,9 @@ const layerBase: Layer.Layer<
         }
       });
 
-    const writeEffect = Effect.fn("orchestrationV2.EventSink.write")(function* (
+    const writeDirect = Effect.fn("orchestrationV2.EventSink.write")(function* (
       input: Parameters<EventSinkV2Shape["writeWithEffects"]>[0],
+      isCancelled?: () => boolean,
     ) {
       yield* Effect.annotateCurrentSpan({
         "orchestration_v2.command_id": input.commandId ?? null,
@@ -739,6 +759,112 @@ const layerBase: Layer.Layer<
             }
             yield* publishStoredEvents(storedEvents);
           }),
+        isCancelled === undefined
+          ? undefined
+          : {
+              check: () => !isCancelled(),
+              prepare: () => () => {},
+            },
+      );
+    });
+
+    const writeResolver = RequestResolver.makeWith<QueuedWrite>({
+      batchKey: () => undefined,
+      // A real event-loop turn collects independent fibers without a wall-clock
+      // delay or a TestClock dependency. Serial callers still await durability.
+      delay: Effect.callback<void>((resume) => {
+        const handle = setImmediate(() => resume(Effect.void));
+        return Effect.sync(() => clearImmediate(handle));
+      }),
+      collectWhile: (entries) => entries.size < 100,
+      runAll: (entries) => {
+        const direct = (entry: Request.Entry<QueuedWrite>) =>
+          (entry.request.isCancelled()
+            ? Effect.interrupt
+            : writeDirect(entry.request.input, entry.request.isCancelled)
+          ).pipe(Effect.provideContext(entry.context));
+        if (entries.length === 1)
+          return Effect.exit(direct(entries[0]!)).pipe(
+            Effect.tap((exit) => Effect.sync(() => entries[0]!.completeUnsafe(exit))),
+            Effect.asVoid,
+          );
+        return Effect.gen(function* () {
+          const publications: Array<Effect.Effect<void>> = [];
+          let holdsLane = false;
+          const committed = yield* sql
+            .withTransaction(
+              Effect.gen(function* () {
+                const transactionContext = yield* Effect.context<never>();
+                const connection = Context.getUnsafe(transactionContext, sql.transactionService);
+                const results = yield* Effect.forEach(entries, (entry) =>
+                  writeDirect(entry.request.input, entry.request.isCancelled).pipe(
+                    // Keep the transaction's private savepoint semaphore while restoring
+                    // caller references. Every statement stays on this batch's writer.
+                    Effect.provideContext(
+                      Context.add(
+                        Context.add(
+                          Context.merge(transactionContext, entry.context),
+                          sql.transactionService,
+                          connection,
+                        ),
+                        WriteBatch,
+                        { publications },
+                      ),
+                    ),
+                  ),
+                );
+                yield* publishLane.take(1);
+                holdsLane = true;
+                if (entries.some((entry) => entry.request.isCancelled()))
+                  return yield* Effect.interrupt;
+                return results;
+              }),
+            )
+            .pipe(Effect.provideService(Scheduler.PreventSchedulerYield, true), Effect.exit);
+          if (Exit.isFailure(committed)) {
+            if (holdsLane) yield* publishLane.release(1);
+            // The whole speculative batch rolled back. Retry in admission order,
+            // giving each caller its own error and retaining later successful writes.
+            for (const entry of entries) entry.completeUnsafe(yield* Effect.exit(direct(entry)));
+            return;
+          }
+          yield* Effect.forEach(entries, (entry, index) =>
+            Effect.gen(function* () {
+              const published = yield* Effect.exit(publications[index]!);
+              entry.completeUnsafe(
+                Exit.isFailure(published)
+                  ? Exit.failCause(published.cause)
+                  : Exit.succeed(committed.value[index]!),
+              );
+            }),
+          ).pipe(Effect.ensuring(publishLane.release(1)));
+        }).pipe(
+          Effect.withSpan("orchestrationV2.EventSink.batch", {
+            attributes: { "orchestration_v2.batch_size": entries.length },
+          }),
+          // Once admitted, a caller leaving must not strand committed publication
+          // or cancel the other callers sharing its transaction.
+          Effect.uninterruptible,
+        );
+      },
+    });
+    // The direct operation owns the per-write phase span.
+    const writeEffect = Effect.fnUntraced(function* (
+      input: Parameters<EventSinkV2Shape["writeWithEffects"]>[0],
+    ) {
+      if (Option.isSome(yield* Effect.serviceOption(sql.transactionService))) {
+        return yield* writeDirect(input);
+      }
+      let cancelled = false;
+      return yield* Effect.request(
+        QueuedWrite({ input, isCancelled: () => cancelled }),
+        writeResolver,
+      ).pipe(
+        Effect.onInterrupt(() =>
+          Effect.sync(() => {
+            cancelled = true;
+          }),
+        ),
       );
     });
 

@@ -1798,6 +1798,52 @@ describe("MuseAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.effect.each(["running", "completed"] as const)(
+    "keeps %s background work current when a new turn receives a stale snapshot",
+    (status) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeMuse();
+        const harness = yield* makeHarness(fake);
+        const { nativeId } = yield* startConversation(harness, fake);
+        const workflow = {
+          itemId: "wf-stale",
+          kind: "workflow",
+          revision: 1,
+          status: "inProgress",
+          turnId: nativeId,
+          entryId: "Background workflow",
+          children: [],
+        };
+        yield* fake.emit("item/started", { turnId: nativeId, item: workflow });
+        const running = yield* harness.takeEvent(
+          "provider_thread.updated",
+          (event) => event.providerThread.pendingBackgroundTasks?.length === 1,
+        );
+        yield* fake.emit("turn/completed", { turnId: nativeId, terminal: "completed" });
+        yield* harness.takeEvent("turn.terminal");
+        if (status === "completed") {
+          yield* fake.emit("item/completed", {
+            turnId: nativeId,
+            item: { ...workflow, revision: 2, status: "completed" },
+          });
+          yield* harness.takeEvent(
+            "provider_thread.updated",
+            (event) => event.providerThread.pendingBackgroundTasks?.length === 0,
+          );
+        }
+        const stale = status === "completed" ? running.providerThread : harness.providerThread;
+        yield* harness.runtime.startTurn(yield* turnInput(stale, 2));
+        const active = yield* harness.takeEvent(
+          "provider_thread.updated",
+          (event) => event.providerThread.status === "active",
+        );
+        assert.deepEqual(
+          active.providerThread.pendingBackgroundTasks?.map((task) => task.taskId) ?? [],
+          status === "completed" ? [] : [workflow.itemId],
+        );
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.effect("keeps a workflow child's first label after later revisions drop it", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeMuse();

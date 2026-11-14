@@ -12,7 +12,11 @@ import * as Fiber from "effect/Fiber";
 
 import * as ServerConfig from "../../config.ts";
 import { forkParked } from "../../serverActivation.ts";
-import { createReadonlyReplica, type ReadonlyReplicaOptions } from "./readonlyExport.ts";
+import {
+  createReadonlyReplica,
+  type ReadonlyReplicaOptions,
+  type ReadonlyExportMetrics,
+} from "./readonlyExport.ts";
 
 export class ReadonlyReplicaMaintenanceError extends Schema.TaggedError<ReadonlyReplicaMaintenanceError>()(
   "ReadonlyReplicaMaintenanceError",
@@ -44,6 +48,7 @@ export class ReadonlyExportUnavailable extends Schema.TaggedError<ReadonlyExport
 
 /** Messages the export worker posts to its supervisor. */
 type WorkerMessage =
+  | { readonly type: "metrics"; readonly metrics: ReadonlyExportMetrics }
   | { readonly type: "opened" | "step" }
   | { readonly type: "published"; readonly cycleMs?: number }
   | {
@@ -106,6 +111,7 @@ const { parentPort, workerData } = require('node:worker_threads');
 const describe = (error) => String((error && error.message) || error).slice(0, 2000);
 let replica;
 let lastBeat = 0;
+let lastMetrics = 0;
 let cycleStarted = Date.now();
 const beat = (type) => {
   const now = Date.now();
@@ -115,6 +121,11 @@ const beat = (type) => {
   } else if (type !== 'step' || now - lastBeat >= ${HEARTBEAT_MS}) {
     lastBeat = now;
     parentPort.postMessage({ type });
+  }
+  if (now - lastMetrics >= ${HEARTBEAT_MS}) {
+    lastMetrics = now;
+    const metrics = replica?.takeMetrics?.();
+    if (metrics) parentPort.postMessage({ type: 'metrics', metrics });
   }
 };
 const fail = (stage, error) => {
@@ -136,8 +147,21 @@ try {
     try {
       const more = replica.step();
       beat(more ? 'step' : 'published');
-      if (!more) cycleStarted = Date.now() + ${idleMs};
-      setTimeout(step, more ? 10 : ${idleMs});
+      if (more) setTimeout(step, 10);
+      else {
+        const idleUntil = Date.now() + ${idleMs};
+        const idle = () => {
+          try {
+            const woke = replica.pollIdentities?.() === true;
+            beat('step');
+            if (woke || Date.now() >= idleUntil) {
+              cycleStarted = Date.now();
+              step();
+            } else setTimeout(idle, Math.min(1000, idleUntil - Date.now()));
+          } catch (error) { fail('idle', error); }
+        };
+        setTimeout(idle, Math.min(1000, ${idleMs}));
+      }
     } catch (error) {
       fail('step', error);
     }
@@ -163,6 +187,15 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
   const slowMs = Duration.toMillis(
     Duration.fromInputUnsafe(options.slowCycle ?? defaultSupervisorOptions.slowCycle!),
   );
+  let metrics: ReadonlyExportMetrics = {
+    lineageRepairCounts: {},
+    lineageRepairs: [],
+    phaseMs: {},
+    phaseSteps: {},
+    identityRows: 0,
+    identityLagMaxMs: 0,
+  };
+  let metricsLoggedAt = Number.NEGATIVE_INFINITY;
   let slowCycleMs: number | undefined;
   let slowLoggedAt = Number.NEGATIVE_INFINITY;
   const signal = (worker: ExportWorker) =>
@@ -201,6 +234,24 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
           );
         } else {
           lastBeat = clock.currentTimeMillisUnsafe();
+          if (message?.type === "metrics") {
+            for (const [cause, count] of Object.entries(message.metrics.lineageRepairCounts))
+              metrics.lineageRepairCounts[cause] =
+                (metrics.lineageRepairCounts[cause] ?? 0) + count;
+            metrics.lineageRepairs.push(...message.metrics.lineageRepairs);
+            for (const [phase, ms] of Object.entries(message.metrics.phaseMs))
+              metrics.phaseMs[phase] = (metrics.phaseMs[phase] ?? 0) + ms;
+            for (const [phase, steps] of Object.entries(message.metrics.phaseSteps))
+              metrics.phaseSteps[phase] = (metrics.phaseSteps[phase] ?? 0) + steps;
+            metrics = {
+              ...metrics,
+              identityRows: metrics.identityRows + message.metrics.identityRows,
+              identityLagMaxMs: Math.max(
+                metrics.identityLagMaxMs,
+                message.metrics.identityLagMaxMs,
+              ),
+            };
+          }
           if (message?.type === "published" && (message.cycleMs ?? 0) > slowMs)
             slowCycleMs = Math.max(slowCycleMs ?? 0, message.cycleMs!);
         }
@@ -230,6 +281,11 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
     while (true) {
       yield* Effect.sleep(Duration.millis(Math.max(10, Math.min(stallMs / 4, 30_000))));
       const now = clock.currentTimeMillisUnsafe();
+      for (const bump of metrics.lineageRepairs.splice(0))
+        yield* Effect.logInfo("Readonly lineage repair revision bumped").pipe(
+          Effect.annotateLogs({ ...bump }),
+          Effect.withSpan("ardud.readonlyExport.lineageRepair"),
+        );
       if (slowCycleMs !== undefined && now - slowLoggedAt >= SLOW_CYCLE_LOG_INTERVAL_MS) {
         // Its own span: the worker span stays open while the worker is healthy.
         yield* Effect.logWarning(
@@ -240,6 +296,30 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
         );
         slowLoggedAt = now;
         slowCycleMs = undefined;
+      }
+      if (Object.keys(metrics.phaseSteps).length && now - metricsLoggedAt >= 60_000) {
+        yield* Effect.logInfo("Readonly export phase timings").pipe(
+          Effect.annotateLogs({
+            phaseMs: metrics.phaseMs,
+            phaseSteps: metrics.phaseSteps,
+            lineageRepairCounts: metrics.lineageRepairCounts,
+          }),
+          Effect.withSpan("ardud.readonlyExport.cyclePhases"),
+        );
+        if (metrics.identityRows)
+          yield* Effect.logInfo("Readonly identity publication lag").pipe(
+            Effect.annotateLogs({ rows: metrics.identityRows, maxLagMs: metrics.identityLagMaxMs }),
+            Effect.withSpan("ardud.readonlyExport.identityPublishLag"),
+          );
+        metrics = {
+          lineageRepairCounts: {},
+          lineageRepairs: [],
+          phaseMs: {},
+          phaseSteps: {},
+          identityRows: 0,
+          identityLagMaxMs: 0,
+        };
+        metricsLoggedAt = now;
       }
       const silent = now - lastBeat;
       if (silent > stallMs) {

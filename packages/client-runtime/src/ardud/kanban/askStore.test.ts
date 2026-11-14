@@ -5,11 +5,17 @@ import {
   type KanbanOwnerAsk,
 } from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import * as DateTime from "effect/DateTime";
 
 import { AskApiError, type AskApi, type AskFeedRead, type AskUnreadable } from "./askApi.ts";
 import { askHistoryFigures, askQueueFigures } from "./askFigures.ts";
 import { ASK_NOT_OWNER_DEVICE_TEXT } from "./askSecrets.ts";
 import { ASK_UNDO_MS } from "./askSendQueue.ts";
+import {
+  createAnalyticsCollector,
+  registerEnvironmentAnalytics,
+  type ClientAnalyticsEvent,
+} from "../analytics.ts";
 import {
   ASK_AUTO_RETRY_MAX,
   ASK_CLOSED_CHECK_MS,
@@ -75,8 +81,9 @@ const lost = (number: number, patch: Partial<AskUnreadable> = {}): AskUnreadable
   ...patch,
 });
 
-function harness() {
+function harness(analyticsEnvironmentId?: string) {
   let feed: AskFeedRead = feedOf([]);
+  let visible = true;
   const boards = new Set<() => void>();
   const foreground = new Set<() => void>();
   const calls: Array<{ readonly name: string; readonly args: ReadonlyArray<unknown> }> = [];
@@ -93,7 +100,7 @@ function harness() {
     feed: async (...args: ReadonlyArray<unknown>) => {
       calls.push({ name: "feed", args });
       if (fail.feed !== undefined) throw fail.feed;
-      return feed;
+      return (results.feed as AskFeedRead | undefined) ?? feed;
     },
     detail: call("detail", {}),
     answer: call("answer", { card: {}, ask: null }),
@@ -108,6 +115,7 @@ function harness() {
   } as unknown as AskApi;
   const cell = createAskStateCell();
   const store = createAskStore({
+    ...(analyticsEnvironmentId ? { analyticsEnvironmentId: () => analyticsEnvironmentId } : {}),
     api,
     cell,
     watch: {
@@ -119,7 +127,7 @@ function harness() {
         foreground.add(run);
         return () => void foreground.delete(run);
       },
-      isForeground: () => true,
+      isForeground: () => visible,
     },
   });
   return {
@@ -130,6 +138,9 @@ function harness() {
     results,
     boards,
     foreground,
+    setVisible: (value: boolean) => {
+      visible = value;
+    },
     named: (name: string) => calls.filter((entry) => entry.name === name),
     setFeed: (open: ReadonlyArray<KanbanAskFeedItem>) => {
       feed = feedOf(open);
@@ -1268,26 +1279,179 @@ describe("the feed", () => {
     expect(h.cell.getState().error).toBe("Robob did not answer.");
   });
 
-  it("is read again when a board changes or the app comes back, until nothing watches", async () => {
+  it("coalesces board pushes and foreground signals into one shared 30-second poll", async () => {
     const h = harness();
+    const sidebar = h.store.watchAsks(false);
+    const page = h.store.watchAsks(true);
+    const otherPage = h.store.watchAsks(true);
+    await settle();
+    expect(h.named("feed")).toHaveLength(1);
+    expect(h.boards.size).toBe(1);
+    expect(h.foreground.size).toBe(1);
+    for (let second = 0; second < 29; second++) {
+      for (const run of h.boards) run();
+      for (const run of h.foreground) run();
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    expect(h.named("feed")).toHaveLength(1);
+    page();
+    page(); // Stopping the same consumer twice cannot stop another one's poll.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.named("feed")).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(h.named("feed")).toHaveLength(3);
+    otherPage();
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(h.named("feed")).toHaveLength(3);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.named("feed")).toHaveLength(4);
+    sidebar();
+    expect(h.boards.size + h.foreground.size).toBe(0);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(h.named("feed")).toHaveLength(4);
+  });
+
+  it("pauses initial, timed and pushed reads while hidden and refreshes on return", async () => {
+    const h = harness();
+    h.setVisible(false);
     const stop = h.store.watchAsks(true);
+    for (const run of h.boards) run();
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(h.named("feed")).toHaveLength(0);
+    h.setVisible(true);
+    for (const run of h.foreground) run();
     await settle();
     expect(h.named("feed")).toHaveLength(1);
     for (const run of h.boards) run();
+    h.setVisible(false);
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(h.named("feed")).toHaveLength(1);
+    h.setVisible(true);
     for (const run of h.foreground) run();
-    await vi.advanceTimersByTimeAsync(400);
+    await settle();
     expect(h.named("feed")).toHaveLength(2);
-    await vi.advanceTimersByTimeAsync(15_000);
+    stop();
+  });
+
+  it("keeps explicit action refreshes immediate without a second passive read", async () => {
+    const h = harness();
+    const stop = h.store.watchAsks(true);
+    await settle();
+    await vi.advanceTimersByTimeAsync(25_000);
+    await h.store.refreshAsks();
+    expect(h.named("feed")).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(h.named("feed")).toHaveLength(2);
+    for (const run of h.boards) run();
+    await vi.advanceTimersByTimeAsync(25_000);
     expect(h.named("feed")).toHaveLength(3);
     stop();
-    expect(h.boards.size).toBe(0);
-    expect(h.foreground.size).toBe(0);
-    await vi.advanceTimersByTimeAsync(120_000);
-    expect(h.named("feed")).toHaveLength(3);
+  });
+
+  it("does not queue another passive read behind a slow request", async () => {
+    const h = harness();
+    let finish!: (feed: AskFeedRead) => void;
+    h.results.feed = new Promise<AskFeedRead>((resolve) => {
+      finish = resolve;
+    });
+    const stop = h.store.watchAsks(true);
+    await vi.advanceTimersByTimeAsync(90_000);
+    for (const run of h.boards) run();
+    await settle();
+    expect(h.named("feed")).toHaveLength(1);
+    stop();
+    finish(feedOf([]));
+    await settle();
+    expect(h.named("feed")).toHaveLength(1);
   });
 });
 
 describe("batches, hand-over and snooze", () => {
+  it("records actual creation-to-answer latency once for each accepted batch ref", async () => {
+    vi.setSystemTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-13T12:00:00.000Z")));
+    const events: ClientAnalyticsEvent[] = [];
+    const collector = createAnalyticsCollector({
+      surface: "mobile",
+      send: async (batch) => {
+        events.push(...batch);
+      },
+    });
+    const unregister = registerEnvironmentAnalytics("latency-test", collector);
+    const h = harness("latency-test");
+    const asks = [
+      entry(1, { at: "2026-11-13T11:59:00.000Z" }),
+      entry(2),
+      entry(3, { at: "2026-11-13T11:58:00.000Z" }),
+    ];
+    try {
+      h.setFeed(asks);
+      await h.store.refreshAsks();
+      h.results.answerBatch = {
+        answered: 2,
+        results: [
+          { card: asks[0]!.cardRef, askId: "q1", ok: true, stage: "ready" },
+          {
+            card: asks[1]!.cardRef,
+            askId: "q1",
+            ok: false,
+            error: { code: "conflict", message: "private refusal", revision: 1 },
+          },
+          { card: asks[2]!.cardRef, askId: "q1", ok: true, stage: "ready" },
+        ],
+      };
+      h.store.answerAskBatch(
+        asks,
+        "batch:b1:k",
+        { verdict: "approved", note: "private answer" },
+        "Approved",
+        "Private title",
+      );
+      await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+      await collector.flush();
+      const answered = events.filter((event) => event.kind === "ask.answer_sent");
+      expect(answered).toHaveLength(2);
+      expect(
+        answered.map((event) => [event.cardId, event.durationMs, event.props?.createdAt]),
+      ).toEqual([
+        ["c1", 60_000 + ASK_UNDO_MS, asks[0]!.ask.at],
+        ["c3", 120_000 + ASK_UNDO_MS, asks[2]!.ask.at],
+      ]);
+      expect(
+        answered.every((event) => event.props?.phase === "ask" && event.surface === "mobile"),
+      ).toBe(true);
+      expect(JSON.stringify(events)).not.toContain("private");
+    } finally {
+      h.store.dispose();
+      unregister();
+    }
+  });
+
+  it("records a confirmed secret answer through the same store boundary", async () => {
+    const events: ClientAnalyticsEvent[] = [];
+    const collector = createAnalyticsCollector({
+      surface: "web",
+      send: async (batch) => {
+        events.push(...batch);
+      },
+    });
+    const unregister = registerEnvironmentAnalytics("secret-latency-test", collector);
+    const h = harness("secret-latency-test");
+    const ask = entry(1);
+    try {
+      h.store.noteAskAnswered(ask, { verdict: "approved" }, "Approved");
+      await collector.flush();
+      expect(events.filter((event) => event.kind === "ask.answer_sent")).toEqual([
+        expect.objectContaining({
+          cardId: "c1",
+          durationMs: expect.any(Number),
+          props: expect.objectContaining({ createdAt: ask.ask.at, phase: "ask" }),
+        }),
+      ]);
+    } finally {
+      h.store.dispose();
+      unregister();
+    }
+  });
   it("a batch gives back the asks the server refused, each for its own reason", async () => {
     const h = harness();
     const asks = [entry(1), entry(2), entry(3)];

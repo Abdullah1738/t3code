@@ -728,6 +728,7 @@ class CanaryTests(FakeCliTestCase):
         super().setUp()
         self.gen = self.homes_pkg / "generate_homes.py"
         shutil.copy(PKG.parent / "harness-homes" / "generate_homes.py", self.gen)
+        shutil.copy(PKG.parent / "harness-homes" / "toollog.py", self.homes_pkg / "toollog.py")
         shutil.copytree(PKG.parent / "harness-homes" / "vendor", self.homes_pkg / "vendor")
         shutil.copy(PKG.parent / "harness-homes" / "manifest.json", self.homes_pkg / "manifest.json")
         shutil.copytree(PKG.parent / "harness-homes" / "overlays", self.homes_pkg / "overlays")
@@ -1991,15 +1992,24 @@ class InstallScriptTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="harness-cli-install-"))
         self.pkg = self.tmp / "pkg"
         self.pkg.mkdir()
-        for name in ("harness_cli.py", "model-manifest.json", "install.zsh"):
+        for name in ("harness_cli.py", "toollog.py", "model-manifest.json", "install.zsh", "test.sh"):
             shutil.copy2(PKG / name, self.pkg / name)
         for name in ("launchd", "vendor"):
             if (PKG / name).is_dir():
                 shutil.copytree(PKG / name, self.pkg / name, ignore=shutil.ignore_patterns("__pycache__"))
         (self.pkg / "tests").mkdir()
-        # The installer refuses a package whose own tests fail; this stands in for the real suite.
+        # Check isolation through the same pre-deploy runner without recursively running this suite.
         (self.pkg / "tests" / "test_ok.py").write_text(
-            "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): pass\n", encoding="utf-8")
+            "import os\nfrom pathlib import Path\nimport unittest\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_isolation(self):\n"
+            "        root = Path(os.environ['HOME']).parent\n"
+            "        self.assertEqual(Path(os.environ['TOOLLOG_ROOT']), root / 'tools')\n"
+            "        self.assertEqual(Path(os.environ['TMPDIR']), root / 'tmp')\n"
+            "        self.assertFalse(list(Path.home().iterdir()))\n"
+            "        for key in ('CODEX_HOME', 'HARNESS_CLI_HOME', 'HARNESS_CLI_SOURCE_HOME',\n"
+            "                    'HARNESS_HOMES_PKG', 'PYTHONPATH', 'NINEROUTER_KEY'):\n"
+            "            self.assertNotIn(key, os.environ)\n", encoding="utf-8")
         self.home = self.tmp / "home"
         self.home.mkdir()
         self.log = self.tmp / "launchctl.log"
@@ -2021,12 +2031,27 @@ class InstallScriptTests(unittest.TestCase):
 
     def run_install(self, *args: str) -> subprocess.CompletedProcess:
         env = {"HOME": str(self.home), "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-               "HARNESS_CLI_LAUNCHCTL": str(self.tmp / "launchctl")}
+               "HARNESS_CLI_LAUNCHCTL": str(self.tmp / "launchctl"),
+               "CODEX_HOME": str(self.home / "codex"), "TOOLLOG_ROOT": str(self.home / "tools"),
+               "HARNESS_CLI_HOME": str(self.home / "pins"),
+               "HARNESS_HOMES_PKG": str(self.home / "homes-pkg"),
+               "HARNESS_CLI_SOURCE_HOME": str(self.home / "source"),
+               "PYTHONPATH": str(self.home / "python"), "NINEROUTER_KEY": "fixture-only"}
         return subprocess.run(["/bin/zsh", "-f", str(self.pkg / "install.zsh"), *args], env=env,
                               capture_output=True, text=True, timeout=120)
 
     def calls(self) -> list[str]:
         return self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
+
+    def test_failed_self_tests_abort_before_copy_or_launchctl(self) -> None:
+        (self.pkg / "tests" / "test_ok.py").write_text(
+            "import unittest\nclass T(unittest.TestCase):\n"
+            "    def test_fail(self): self.fail('fixture failure')\n", encoding="utf-8")
+        result = self.run_install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fixture failure", result.stderr)
+        self.assertFalse((self.home / ".local/share/harness-cli").exists())
+        self.assertEqual(self.calls(), [])
 
     def test_default_install_loads_the_daily_agent(self) -> None:
         result = self.run_install()
@@ -2308,6 +2333,7 @@ class ManifestLocationTests(FakeCliTestCase):
         installed = self.tmp / "installed"
         installed.mkdir()
         shutil.copy(PKG / "harness_cli.py", installed / "harness_cli.py")
+        shutil.copy(PKG / "toollog.py", installed / "toollog.py")
         shutil.copy(PKG / "model-manifest.json", installed / "model-manifest.json")
         env = {k: v for k, v in os.environ.items() if k != "HARNESS_CLI_MODEL_MANIFEST"}
         code = (

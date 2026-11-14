@@ -169,12 +169,12 @@ class Unanswered(Base):
         self.assertEqual(len(mc.find_question(mc.load_questions(self.data), second)['asks']), 1)
 
     def test_explicit_never_asked_charge_case_joins_daily_list(self):
-        self.case('charge', when=at('2026-11-10T09:00'), deadline='2026-12-01')
+        self.case('charge', when=at('2026-11-10T09:00'), deadline='2026-12-01', reference='card ending 1111')
         self.assertIn('unasked charges', self.fire())
         self.assertEqual(self.fire(n=1), '')
 
     def test_unasked_age_class_always_uses_daily_list(self):
-        # age in days | expected: daily first ask, never a conversion/third-question message
+        # age in days | one recorded case, daily first ask, no conversion/third-question message
         for age in (2, 8, 70):
             with self.subTest(age=age):
                 self.data = self.tmp / f'age-{age}'
@@ -185,7 +185,12 @@ class Unanswered(Base):
                 event = self.fire()
                 self.assertIn('money-cases unasked --ask', event)
                 self.assertNotIn("he didn't answer", event)
-                self.assertEqual(mc.load(self.data)['cases'], [])
+                cases = mc.load(self.data)['cases']
+                self.assertEqual(len(cases), 1)
+                self.assertEqual(cases[0]['merchant'], mc.UNMATCHED)
+                q = mc.find_question(mc.load_questions(self.data), qid)
+                self.assertEqual(q['case_opened'], cases[0]['id'])
+                self.assertEqual(q['asks'], [])
                 self.assertEqual(self.fire(n=1), '')
 
     def test_purchase_note_binds_charge_identity_across_input_channels(self):
@@ -452,7 +457,10 @@ class Unanswered(Base):
             self.assertIn('awaiting answer', self.cli('brief'))
         mc.answered(self.data, qid, 'mine', now=at('2027-02-01T11:00'))
         self.assertNotIn(qid, self.cli('questions', '--json'))
-        self.assertNotIn(qid, self.cli('list', '--json'))
+        parent = mc.find(mc.load(self.data), q['case_opened'])
+        self.assertEqual(parent['status'], 'open')
+        self.assertTrue(parent['history'][-1].get('owner'))
+        self.assertIn(parent['id'], self.cli('list', '--json'))
 
     def test_legacy_asked_rows_are_migrated_and_moni_is_not_queued(self):
         qid = self.seed()

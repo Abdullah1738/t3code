@@ -49,16 +49,44 @@ STOPPING_STATES = ("stopping",)
 REDACT_KEYS = ("url", "desktopUrl", "viewerUrl", "signedUrl")
 
 
-def _key() -> str:
+def _key(timeout: float | None = None) -> str:
     global _KEY
     if _KEY is None:
         p = subprocess.run(["security", "find-generic-password", "-s", KEY_SERVICE, "-a", KEY_ACCOUNT, "-w"],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, timeout=timeout)
         k = p.stdout.strip()
         if p.returncode != 0 or not k:
             raise OffboxError(f"API key missing from Keychain ({KEY_SERVICE}/{KEY_ACCOUNT})")
         _KEY = k
     return _KEY
+
+
+def probe_backend(name: str, timeout: float = 3) -> str | None:
+    """An authenticated /limits must succeed before moving new work onto a backend."""
+    end = time.time() + timeout
+    try:
+        if name == BACKEND:
+            _key(timeout=timeout)
+            with RequestScope(max(.001, end - time.time())).active():
+                call("GET", "/limits", retries=0, connect_retries=0, timeout=timeout, deadline=end)
+        else:
+            service = "offbox-server-api" if name == "server" else "boat-api"
+            account = token_owner() if name == "server" else "ardud"
+            key = subprocess.run(["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+                                 capture_output=True, text=True, timeout=timeout)
+            if key.returncode or not key.stdout.strip():
+                return "API key unavailable"
+            url = _server_url() if name == "server" else os.environ.get("OFFBOX_BOAT_API") or "https://boat.dev/api/v1"
+            req = urllib.request.Request(url + "/limits", headers={"Authorization": "Bearer " + key.stdout.strip(),
+                                                                  "Accept": "application/json"})
+            _check_deadline(end, "GET", "/limits")
+            scope = RequestScope(max(.001, end - time.time()))
+            with scope.active(), scope.request():
+                with _open(req, timeout=max(.001, end - time.time())) as response:
+                    json.loads(_read_response(response, end))
+        return None
+    except (OffboxError, OSError, ValueError, subprocess.TimeoutExpired, http.client.HTTPException):
+        return "authenticated API did not answer successfully"
 
 
 def redact(obj):
@@ -98,6 +126,23 @@ class NetworkError(OffboxError):
 
     def __init__(self, message: str):
         super().__init__(message, outage=True)
+
+
+class BudgetExpired(OffboxError):
+    """A local readiness or request budget expired."""
+
+
+def client_budget_expired(error: OffboxError) -> bool:
+    # A wrapper may carry a real outage from an earlier attempt as well as the latest client timeout.
+    if error.outage:
+        return False
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, BudgetExpired):
+            return True
+        error = error.__cause__
+    return False
 
 
 class BoatAtCapacity(capacity.CapacityError):
@@ -142,6 +187,8 @@ def _refused(e: "ApiError", box_id: str | None):
 
 
 CONNECT_RETRIES = 5
+HOME_START_TIMEOUT_S = 5
+HOME_NETWORK_FAILURES = 2
 _PRE_DELIVERY = re.compile(r"^connect (EADDRNOTAVAIL|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EADDRINUSE)\b")
 
 
@@ -160,10 +207,11 @@ _REQUEST_SCOPE = contextvars.ContextVar('boat_request_scope', default=None)
 class RequestScope:
     """Cancel a worker's requests without changing another thread's API budget."""
 
-    def __init__(self, seconds: float, parent=None):
+    def __init__(self, seconds: float, parent=None, network_timeout=False):
         self.seconds = seconds
         self.end = time.time() + seconds
         self.parent = parent
+        self.network_timeout = network_timeout or bool(parent and parent.network_timeout)
         self.stopped = threading.Event()
         self.lock = threading.Lock()
         self.sockets = weakref.WeakSet()
@@ -176,6 +224,9 @@ class RequestScope:
         if self.parent is not None:
             self.parent.check()
         if self.stopped.is_set():
+            if self.network_timeout:
+                # Resume callers must retain their unanswered-send marker when a deadline aborts the response.
+                raise NetworkError('API request deadline passed')
             raise OffboxError('boat API worker cancelled')
 
     def attach(self, sock):
@@ -306,7 +357,7 @@ def _in_deadline(deadline: float | None, pause: float) -> bool:
 
 def _check_deadline(deadline: float, method: str, path: str) -> None:
     if time.time() >= deadline:
-        raise OffboxError(f"deadline passed before {method} {path}")
+        raise BudgetExpired(f"client deadline passed before {method} {path}")
 
 
 def _read_response(response, deadline):
@@ -402,6 +453,14 @@ def _call(method: str, path: str, body=None, headers: dict | None = None, timeou
         return _request(method, path, body, headers, timeout, retries, ok404, connect_retries, deadline)
 
 
+def _log_request_error(method: str, path: str, detail: str) -> None:
+    # A command endpoint may echo its input in an error. Keep shell text and secrets out of offbox.log.
+    if method == "POST" and path.endswith("/commands"):
+        log(f"api {method} {path} -> command request failed (details omitted)")
+    else:
+        log(f"api {method} {path} -> {detail}")
+
+
 def _request(method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
              retries: int = 2, ok404: bool = False, connect_retries: int | None = None, deadline: float | None = None):
     """JSON request. Retries only idempotent-safe failures (network, 5xx on GET/DELETE, explicit retryable).
@@ -458,7 +517,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             # Recomputed on every attempt: a slow failure plus the retry pause has used part of the budget.
             room = _DEADLINE - time.time()
             if room <= 0:
-                raise OffboxError(f"boat API budget spent before {method} {path}")
+                raise BudgetExpired(f"boat API budget spent before {method} {path}")
             req_timeout = min(timeout, max(1.0, room))
         if deadline is not None:
             _check_deadline(deadline, method, path)
@@ -482,14 +541,14 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             if room <= 0:
                 if request_id:
                     capacity.complete(request_id, "not_sent")
-                raise OffboxError(f"boat API budget spent before sending {method} {path}")
+                raise BudgetExpired(f"boat API budget spent before sending {method} {path}")
             req_timeout = min(timeout, max(1.0, room))
         if deadline is not None:
             room = deadline - time.time()
             if room <= 0:
                 if request_id:
                     capacity.complete(request_id, "not_sent")
-                raise OffboxError(f"deadline passed before sending {method} {path}")
+                raise BudgetExpired(f"deadline passed before sending {method} {path}")
             req_timeout = min(req_timeout, max(0.001, room))
         try:
             if scope is not None:
@@ -530,7 +589,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
                 uncertain_start = True
             if is_start and is_capacity_outage(e.code, code, msg):
                 # This is an explicit refusal, not an ambiguous create. Retry only after the outer wait.
-                log(f"api {method} {path} -> {e.code} {code} {msg[:200]}")
+                _log_request_error(method, path, f"{e.code} {code} {msg[:200]}")
                 if uncertain_start:
                     raise OffboxError("a previous create/fork was unanswered; boat's later capacity refusal "
                                       "does not prove it failed. Nothing ran; check boat before retrying")
@@ -560,15 +619,15 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             if _never_delivered(e.code, code, msg) and not start_not_delivered \
                     and attempt <= max(retries, max_connect) \
                     and _room(min(2.0 * attempt, 8)) and _in_deadline(deadline, min(2.0 * attempt, 8)):
-                log(f"api {method} {path} -> {e.code} {code} {msg[:120]} (not delivered; retry {attempt})")
+                _log_request_error(method, path, f"{e.code} {code} {msg[:120]} (not delivered; retry {attempt})")
                 time.sleep(min(2.0 * attempt, 8))
                 continue
-            log(f"api {method} {path} -> {e.code} {code} {msg[:200]}")
+            _log_request_error(method, path, f"{e.code} {code} {msg[:200]}")
             if is_start and uncertain_start and "Idempotency-Key" in h:
                 raise OffboxError("create/fork was unanswered and may have been accepted; "
                                   "nothing ran. Check boat before retrying")
             raise ApiError(e.code, code, msg, retryable)
-        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError, OSError) as e:
+        except (NetworkError, urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError, OSError) as e:
             if request_id:
                 capacity.complete(request_id, "uncertain")
                 uncertain_start = True
@@ -582,7 +641,7 @@ def _request(method: str, path: str, body=None, headers: dict | None = None, tim
             if deadline is not None and time.time() >= deadline:
                 # Still a network failure (boat silent): keep the outage classification the caller's clock needs.
                 raise NetworkError(f"deadline passed during {method} {path}: {e}")
-            log(f"api {method} {path} -> network {e}")
+            _log_request_error(method, path, f"network {e}")
             raise NetworkError(f"{NAME} API unreachable ({method} {path}): {e}")
 
 
@@ -695,6 +754,26 @@ def get(box_id: str, *, deadline: float | None = None) -> dict | None:
     return None if d is None else d.get("sandbox")
 
 
+def readiness_get(box_id: str, *, deadline: float | None = None) -> dict | None:
+    from . import home
+    caller_ends = [end for end in (_DEADLINE, deadline) if end is not None]
+    caller_end = min(caller_ends, default=None)
+    caller_left = None if caller_end is None else caller_end - time.time()
+    if home.may_fail_over():
+        end = time.time() + HOME_START_TIMEOUT_S
+        deadline = end if deadline is None else min(end, deadline)
+        client_limited = caller_end is not None and caller_end < end
+        try:
+            with RequestScope(max(.001, deadline - time.time()), parent=_REQUEST_SCOPE.get(), network_timeout=True).active():
+                return get(box_id, deadline=deadline)
+        except NetworkError as error:
+            if client_limited and time.time() >= caller_end:
+                raise BudgetExpired(f"{box_id} readiness check exhausted its client budget "
+                                    f"({caller_left:g}s remaining); nothing ran") from error
+            raise
+    return get(box_id) if deadline is None else get(box_id, deadline=deadline)
+
+
 def list_boxes(state: str | None = None) -> list[dict]:
     out, cursor = [], None
     while True:
@@ -763,11 +842,16 @@ def fork(src: str, ttl: int, idem: str, size: str | None = None) -> dict:
 
 
 def resume(box_id: str, ttl: int, size: str | None = None) -> dict:
+    from . import home
     body = {"ttlSeconds": ttl}
     if size:
         body["type"] = size
     try:
-        return call("POST", f"/sandboxes/{box_id}/resume", body, retries=0)
+        options = {"timeout": HOME_START_TIMEOUT_S, "connect_retries": 0,
+                   "deadline": time.time() + HOME_START_TIMEOUT_S} if home.may_fail_over() else {}
+        scope = RequestScope(HOME_START_TIMEOUT_S, parent=_REQUEST_SCOPE.get(), network_timeout=True).active() if options else contextlib.nullcontext()
+        with scope:
+            return call("POST", f"/sandboxes/{box_id}/resume", body, retries=0, **options)
     except ApiError as e:
         if e.api_code in ("sandbox_resuming",):
             return {}
@@ -800,7 +884,16 @@ def limits() -> dict:
 
 
 def sshkey(box_id: str, pubkey: str) -> dict:
-    return call("POST", f"/sandboxes/{box_id}/sshkey", {"key": pubkey}, retries=6)
+    timeout = 60
+    caller_end = _DEADLINE
+    client_limited = caller_end is not None and caller_end - time.time() < timeout
+    try:
+        return call("POST", f"/sandboxes/{box_id}/sshkey", {"key": pubkey}, timeout=timeout, retries=6)
+    except NetworkError as error:
+        # Re-authorizing the same key is repeatable, so a shorter caller cap is not outage evidence.
+        if client_limited and time.time() >= caller_end:
+            raise BudgetExpired(f"SSH key authorization for {box_id} exhausted its client budget") from error
+        raise
 
 
 def latest_snapshot(box_id: str) -> dict | None:
@@ -831,8 +924,19 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
     if _DEADLINE is not None:
         timeout = max(0.0, min(timeout, _DEADLINE - time.time()))
     deadline = time.time() + timeout
+    network_failures = 0
     while True:
-        s = get(box_id)
+        if time.time() >= deadline:
+            raise BudgetExpired(f"box {box_id} did not become ready within {timeout:g}s; nothing ran")
+        try:
+            s = readiness_get(box_id)
+        except NetworkError:
+            network_failures += 1
+            if not home.may_fail_over() or network_failures >= HOME_NETWORK_FAILURES:
+                raise
+            time.sleep(poll)
+            continue
+        network_failures = 0
         if s is None:
             raise OffboxError(f"box {box_id} disappeared")
         st = s.get("state")
@@ -858,14 +962,16 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
         if on_state is not None:
             on_state(s)
         if time.time() > deadline:
-            raise OffboxError(f"box {box_id} stuck in {st} after {int(timeout)}s")
-        time.sleep(poll)
+            raise BudgetExpired(f"box {box_id} did not become ready within {timeout:g}s "
+                                f"(last state {st}); nothing ran")
+        time.sleep(min(poll, max(0, deadline - time.time())))
 
 
 # ---------------------------------------------------------------- commands
 
 # Only retain durations observed in responses already needed by the caller. Logging never fetches a status.
 _COMMAND_DURATIONS = {}
+_COMMAND_HOST_BOXES = {}
 
 
 def execution_ms(status):
@@ -895,6 +1001,19 @@ def remember_execution(box_id, status, *, pid=None, command_id=None):
         data = status['command'] if isinstance(status, dict) and isinstance(status.get('command'), dict) else status
         if isinstance(data, dict) and (data.get('running') or data.get('status') in ('queued', 'running')):
             _forget_execution(box_id, pid if pid is not None else data.get('processId'), command_id or data.get('commandId'))
+        if isinstance(data, dict) and not data.get('running') and data.get('status') not in ('queued', 'running'):
+            host = (data.get('metrics') or {}).get('host_boxes')
+            cid = command_id or data.get('commandId')
+            if isinstance(host, dict) and cid:
+                counts = {
+                    k: host.get(k) if type(host.get(k)) is int and host[k] >= 0 else None
+                    for k in ('start', 'end')}
+                _COMMAND_HOST_BOXES[(box_id, 'command', cid)] = (cid, counts)
+                observed_pid = pid if pid is not None else data.get('processId')
+                if observed_pid is not None:
+                    _COMMAND_HOST_BOXES[(box_id, 'pid', observed_pid)] = (cid, counts)
+                while len(_COMMAND_HOST_BOXES) > 256:
+                    _COMMAND_HOST_BOXES.pop(next(iter(_COMMAND_HOST_BOXES)))
         duration = execution_ms(data)
         if duration is None:
             return
@@ -913,9 +1032,11 @@ def remember_execution(box_id, status, *, pid=None, command_id=None):
 def _forget_execution(box_id, pid, command_id=None):
     try:
         prior = _COMMAND_DURATIONS.pop((box_id, 'pid', pid), None)
-        for identity in (command_id, prior[0] if prior else None):
+        host_prior = _COMMAND_HOST_BOXES.pop((box_id, 'pid', pid), None)
+        for identity in (command_id, prior[0] if prior else None, host_prior[0] if host_prior else None):
             if identity:
                 _COMMAND_DURATIONS.pop((box_id, 'command', identity), None)
+                _COMMAND_HOST_BOXES.pop((box_id, 'command', identity), None)
     except Exception:
         pass
 
@@ -931,6 +1052,11 @@ def command_execution_ms(box_id, pid, command_id):
     except Exception:
         pass
     return None
+
+
+def command_host_boxes(box_id, pid, command_id):
+    found = _COMMAND_HOST_BOXES.get((box_id, 'command', command_id))
+    return found[1] if found else None
 
 
 def _execution_frames(box_id, pid, frames):
@@ -995,7 +1121,9 @@ def cmd_attach(box_id: str, pid: int, out_off: int = 0, err_off: int = 0, timeou
 def history_logs(box_id: str, command_id: str, which: str, offset: int = 0,
                  *, deadline: float | None = None) -> dict:
     qs = urllib.parse.urlencode({"stream": which, "offset": offset})
-    return call("GET", f"/sandboxes/{box_id}/command-history/{command_id}/logs?{qs}", deadline=deadline)
+    result = call("GET", f"/sandboxes/{box_id}/command-history/{command_id}/logs?{qs}", deadline=deadline)
+    remember_execution(box_id, result, command_id=command_id)
+    return result
 
 
 def history_get(box_id: str, command_id: str) -> dict:

@@ -9,7 +9,7 @@ export type LogEntry = {
   error?: { tag: string; message?: string };
 };
 const token = /^[a-zA-Z][a-zA-Z0-9_.-]{0,79}$/;
-const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper"]);
+const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper", "directory"]);
 const numeric = new Set(["exitCode", "attempt", "count", "bytes", "queuedMs"]);
 const boolean = new Set(["deduped", "accepted"]);
 const values: Record<string, readonly string[]> = {
@@ -36,6 +36,7 @@ function fields(entry: LogEntry, at: Date) {
   const props: Record<string, string | number | boolean | null> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
     if (key === "exitCode" && value === null) props[key] = null;
+    else if (key === "cause" && safeCause(value)) props[key] = value;
     else if (numeric.has(key) && typeof value === "number" && Number.isFinite(value)) props[key] = value;
     else if (boolean.has(key) && typeof value === "boolean") props[key] = value;
     else if (typeof value === "string" && values[key]?.includes(value)) props[key] = value;
@@ -86,8 +87,33 @@ export function toolLog(entry: LogEntry): void {
   } catch { /* Logging cannot affect the caller. */ }
 }
 
-export function toolError(component: string, tag: string, ids?: Record<string, unknown>): void {
-  toolLog({ component, kind: "error", name: `${component}.error`, ok: false, ids, error: { tag } });
+// Only code-owned classes and known errno values are safe; arbitrary error codes can be secrets.
+const causeCodes = new Set(["unknown", "abort", "timeout", "decode", "ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "ENOENT", "ENOTDIR", "EACCES", "EPERM", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN", "EPIPE", "ENETUNREACH", "EHOSTUNREACH"]);
+export type ErrorCause = string | number;
+function safeCause(value: unknown): value is ErrorCause {
+  return typeof value === "number" ? Number.isInteger(value) && value >= 100 && value <= 599
+    : typeof value === "string" && causeCodes.has(value);
+}
+
+export function errorCause(error: unknown): ErrorCause {
+  try {
+    let current = error;
+    for (let depth = 0; depth < 4 && current && typeof current === "object"; depth++) {
+      const row = current as { causeClass?: unknown; status?: unknown; code?: unknown; name?: unknown; cause?: unknown };
+      if (safeCause(row.causeClass)) return row.causeClass;
+      if (row.name === "TimeoutError") return "timeout";
+      if (row.name === "AbortError") return "abort";
+      if (row.name === "SyntaxError" || row.name === "AssertionError" || row.name === "URIError") return "decode";
+      if (typeof row.status === "number" && safeCause(row.status)) return row.status;
+      if (typeof row.code === "string" && causeCodes.has(row.code)) return row.code;
+      current = row.cause;
+    }
+  } catch { /* Error properties need not be safe to read. */ }
+  return "unknown";
+}
+
+export function toolError(component: string, tag: string, ids?: Record<string, unknown>, error?: unknown): void {
+  toolLog({ component, kind: "error", name: `${component}.error`, ok: false, ids, props: { cause: errorCause(error) }, error: { tag } });
 }
 
 export async function rollup(day: string, dir = logDirectory()) {
@@ -99,7 +125,15 @@ export async function rollup(day: string, dir = logDirectory()) {
     const durations: Record<string, number[]> = Object.create(null);
     const errors: Record<string, { count: number; sampleId?: string }> = Object.create(null);
     let total = 0, ok = 0, failed = 0, withOk = 0;
-    const lines = createInterface({ input: createReadStream(join(dir, `${day}.ndjson`)), crlfDelay: Infinity });
+    const source = join(dir, `${day}.ndjson`);
+    let sourceExists = true;
+    try { statSync(source); }
+    catch (error) {
+      if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "ENOENT") throw error;
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      sourceExists = false;
+    }
+    const lines = sourceExists ? createInterface({ input: createReadStream(source), crlfDelay: Infinity }) : [];
     for await (const line of lines) {
       let row; try { row = JSON.parse(line); } catch { continue; }
       if (!row || row.tool !== "watchers" || !token.test(row.name) || !["event", "perf", "error"].includes(row.kind)) continue;

@@ -37,7 +37,7 @@ if not (REDACT_HELPERS / 'redact.py').is_file():
 sys.path.insert(0, str(REDACT_HELPERS))
 from redact import redact as redact_credentials, redact_fields
 try:
-    from toollog import tool_error, tool_log
+    from toollog import tool_error, tool_log, stderr_cause
 except ImportError:
     # A scratch watcher can outlive the installed helpers during a rolling update.
     def tool_log(*_args, **_kwargs):
@@ -45,6 +45,9 @@ except ImportError:
 
     def tool_error(*_args, **_kwargs):
         pass
+
+    def stderr_cause(*_args, **_kwargs):
+        return {}
 
 HOME = Path.home()
 LIVE = HOME / '.local/share/robob-watch/watchers/inbox-triage'
@@ -61,6 +64,7 @@ DUBAI = dt.timezone(dt.timedelta(hours=4))
 # A source is reported once it fails 3 runs in a row or 5 times in an hour, then at most
 # every 6 hours while it stays broken. Over 19-25 Oct 2026 that was 4 alerts.
 HEALTH_STREAK, HEALTH_FAILS, HEALTH_WINDOW, HEALTH_REALERT = 3, 5, 3600, 6 * 3600
+HEALTH_TRANSIENT_ESCALATE = 3 * 3600
 # The runner kills a check at 60 s. Seconds into a run by which the first chat follow-up
 # check starts its last item, the classifier must answer, and the late check starts its last
 # item. One item can still wait ~7 s on a locked store (WhatsApp's LID lookup has a 5 s busy
@@ -135,8 +139,11 @@ def log_drop(item, reason):
     log_decision(item, category, 'ignored', source=source, deduped=deduped)
 
 
-def log_failure(tag, item=None):
-    tool_error('triage', tag, log_ids(item))
+def log_failure(tag, item=None, *, watcher=None):
+    ids = log_ids(item)
+    if watcher is not None:
+        ids['watcher'] = watcher
+    tool_error('triage', tag, ids)
 
 
 def trace_run(name):
@@ -158,23 +165,34 @@ def trace_run(name):
     return decorate
 
 
-def run_helper(name, command, **kwargs):
+def run_helper(name, command, failure_state=None, **kwargs):
     started = time.perf_counter()
     ids = {**log_ids(), 'helper': name}
+
+    def failed(tag, cause):
+        status = {'tag': tag, **cause}
+        if failure_state is None or failure_state.get(name) != status:
+            tool_error('triage', tag, ids, cause)
+        if failure_state is not None:
+            failure_state[name] = status
+
     try:
         result = subprocess.run(command, **kwargs)
     except Exception as error:
         timeout = isinstance(error, subprocess.TimeoutExpired)
-        tool_error('triage', 'helper.timeout' if timeout else 'helper.launch_failed', ids)
+        cause = stderr_cause(error.stderr if timeout else str(error), timeout)
+        failed('helper.timeout' if timeout else 'helper.launch_failed', cause)
         tool_log({'component': 'triage', 'kind': 'perf', 'name': 'helper.run', 'ids': ids, 'ok': False,
                   'durationMs': (time.perf_counter() - started) * 1000,
-                  'props': {'outcome': 'timeout' if timeout else 'fail'}})
+                  'props': {'outcome': 'timeout' if timeout else 'fail', **cause}})
         raise
     tool_log({'component': 'triage', 'kind': 'perf', 'name': 'helper.run', 'ids': ids,
               'durationMs': (time.perf_counter() - started) * 1000, 'ok': result.returncode == 0,
-              'props': {'exitCode': result.returncode}})
+              'props': {'exitCode': result.returncode, **(stderr_cause(result.stderr) if result.returncode else {})}})
     if result.returncode:
-        tool_error('triage', 'helper.exit_failed', ids)
+        failed('helper.exit_failed', stderr_cause(result.stderr))
+    elif failure_state is not None and failure_state.pop(name, None) is not None:
+        tool_log({'component': 'triage', 'kind': 'event', 'name': 'helper.recovered', 'ids': ids, 'ok': True})
     return result
 
 
@@ -270,8 +288,39 @@ def active_watchers(now):
     return result
 
 
-def exclusions(watchers):
+def watcher_command_text(command):
+    # shlex's comment mode also strips literal # inside shell words (booking#123).
+    text, quote, escaped, word, comment = [], None, False, False, False
+    for char in command:
+        if comment:
+            if char != '\n':
+                continue
+            comment = False
+        if escaped:
+            escaped = False
+            if char == '\n':
+                text.pop()  # Shell line continuation, including inside double quotes.
+                continue
+            word = True
+        elif char == '\\' and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            quote, word = char, True
+        elif char == '#' and not word:
+            comment = True
+            continue
+        else:
+            word = not (char.isspace() or char in ';&|()<>')
+        text.append(char)
+    return ''.join(text)
+
+
+def exclusions(watchers, state):
     jids, mail_seen = set(), {a: set() for a in ACCOUNTS}
+    invalid = state.setdefault('watcher_command_invalid', {})
     for w in watchers:
         if not w['_healthy']:
             continue
@@ -281,13 +330,34 @@ def exclusions(watchers):
             command += '\n' + script.read_text()
         if 'whatsapp-new-message' in command:
             jids.update(re.findall(r'\b\d+@(?:s\.whatsapp\.net|lid|g\.us)\b', command))
+        watcher = w.get('id') or Path(w['_dir']).name
+        text = watcher_command_text(command)
+        try:
+            shlex.split(text)
+        except ValueError:
+            digest = hashlib.sha256(command.encode()).hexdigest()[:16]
+            if invalid.get(watcher) != digest:
+                log_failure('watcher.command_invalid', watcher=watcher)
+                invalid[watcher] = digest
+            groups = []
+            for line in text.splitlines():
+                try:
+                    groups.append(shlex.split(line))
+                except ValueError:
+                    continue
+        else:
+            invalid.pop(watcher, None)
+            # Keep command boundaries for the optional mailbox, joining quoted lines.
+            groups, pending = [], ''
+            for line in text.splitlines(keepends=True):
+                pending += line
+                try:
+                    groups.append(shlex.split(pending))
+                except ValueError:
+                    continue
+                pending = ''
         # Only exact already-seen IDs, never a guessed broad sender blacklist.
-        for line in command.splitlines():
-            try:
-                tokens = shlex.split(line)
-            except ValueError:
-                log_failure('watcher.command_invalid')
-                continue
+        for tokens in groups:
             for i, token in enumerate(tokens):
                 if token != 'email-new-message' or i + 2 >= len(tokens):
                     continue
@@ -812,7 +882,7 @@ def mail_worker(account, request):
                 log_failure('mail.record_failed')
                 if not completed:
                     raise
-                partial = type(e).__name__ + '; completed prefix saved'
+                partial = f'{type(e).__name__}: {clean(str(e), 160)}; completed prefix saved'
                 break
             if reason:
                 drops[reason] += 1
@@ -1458,11 +1528,11 @@ def send_urgent(item_id, text, channel, now, seconds=4):
             elif status:
                 raise RuntimeError('iMessage queued or unresolved; awaiting transport confirmation')
         if channel == 'telegram':
-            command = [str(BUN), stub or str(TELEGRAM_CLI), 'notify', '--source', 'Inbox triage',
-                       '--severity', 'attention', '--text', entry[text_key], '--key', key]
+            command = [str(BUN), stub or str(TELEGRAM_CLI), 'notify', '--source=Inbox triage',
+                       '--severity=attention', f'--text={entry[text_key]}', f'--key={key}']
         else:
-            command = [str(BUN), stub or str(SPECTRUM_CLI), 'send', '--text', entry[text_key],
-                       '--session', owner_route(), '--key', key]
+            command = [str(BUN), stub or str(SPECTRUM_CLI), 'send', f'--text={entry[text_key]}',
+                       f'--session={owner_route()}', f'--key={key}']
         out = run_helper('telegram-bridge' if channel == 'telegram' else 'spectrum-bridge', command,
                          capture_output=True, text=True, timeout=seconds,
                          env={k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'})
@@ -1502,6 +1572,8 @@ def run_fast(args):
     results, errors = collect(state, now, [], [], now - args.dry_run_hours * 3600 if dry else None,
                               baseline=baseline,
                               fast={'actions': actions, 'rates': config.get('fastpath_aed_rates', {})})
+    source_errors = dict(errors)
+    state['read_sources'] = sorted(set(results) - set(errors))
     actions = read_json(DATA / 'inflight-actions.json', [])
     for source, result in results.items():
         state['cursors'][source] = result['cursor']
@@ -1526,7 +1598,7 @@ def run_fast(args):
     live = wd.resolve() == (LIVE.parent / 'inbox-triage-fastpath').resolve()
     if dry or not live:
         print(json.dumps({'fastpath_would_send': list(state['pending']), 'source_errors': errors}))
-        return 0
+        return 0 if dry else source_exit(results, source_errors, 'inbox-triage-fastpath')
     # Commit collection and sanitized pending alerts before either external send.
     atomic(wd / 'cursor.json', state)
     cursors = state.setdefault('delivery_cursor', {})
@@ -1561,7 +1633,7 @@ def run_fast(args):
                  'ms': round((time.time() - now) * 1000), 'cost_usd': 0})
     # Never print a wake: that can sit behind a turn or duplicate the direct notification.
     # One failed mailbox/channel must not back off or pause the other security sources.
-    return 0
+    return source_exit(results, source_errors, 'inbox-triage-fastpath')
 
 
 def urgent_alerts(state, report, wd, now, dry=False, deadline=None):
@@ -1711,28 +1783,48 @@ def replay_outbox(state, wd, run):
     return out['event']
 
 
+def transient_error(error):
+    # Auth and parse failures need repair even if their text also mentions a timeout.
+    if re.search(r'auth|oauth|login|credential|password|parse|invalid.?grant|certificate.verify', error, re.I):
+        return False
+    return bool(re.search(r'TimeoutExpired|TimeoutError|timed?\s*out|timeout|time budget|(?:TLS|SSL).*handshake|handshake.*(?:TLS|SSL)'
+                          r'|connection\s+(?:reset|refused)|ConnectionResetError|ConnectionRefusedError|ECONNRESET|ECONNREFUSED'
+                          r'|temporary (?:failure.*(?:name|DNS)|DNS)|EAI_AGAIN', error, re.I))
+
+
 def track_health(state, errors, now):
-    """Counts each source's failures across runs and returns the ones due an alert. The
-    runner only alerts after 5 failed runs in a row, and a run with a hit from another
-    source counts as a success, so a source that keeps failing went unreported (23 Oct)."""
+    """Keep rolling failure counts, but time escalation from the continuous outage."""
     health = state.setdefault('source_health', {})
     due = []
     for source in sorted(set(health) | set(errors)):
         h = health.get(source, {})
+        for field in ('alerted_at', 'escalated_at'):
+            if field in h:
+                h['last_notice_at'] = max(h.get('last_notice_at', h[field]), h[field])
         fails = [ts for ts in h.get('fails', []) if now - ts < HEALTH_WINDOW]
         if source in errors:
-            if not fails:
+            if not h.get('streak'):
                 h['since'] = now
+                h.pop('escalated_at', None)
+                h.pop('recovered_at', None)
+                h.pop('alerted_at', None)
             h['streak'] = h.get('streak', 0) + 1
             h['last_error'] = clean(errors[source], 200)
+            h['transient'] = transient_error(errors[source])
             fails.append(now)
         else:
+            if h.get('streak'):
+                h['recovered_at'] = now
             h['streak'] = 0
         h['fails'] = fails
-        quiet = 'alerted_at' not in h or now - h['alerted_at'] >= HEALTH_REALERT
-        if source in errors and (h['streak'] >= HEALTH_STREAK or len(fails) >= HEALTH_FAILS) and quiet:
+        quiet = 'last_notice_at' not in h or now - h['last_notice_at'] >= HEALTH_REALERT
+        escalate = (h['streak'] and h.get('transient')
+                    and 'escalated_at' not in h and now - h['since'] >= HEALTH_TRANSIENT_ESCALATE)
+        recover = not h['streak'] and ('alerted_at' in h or 'notified_since' in h)
+        if recover or escalate or (source in errors and (h['streak'] >= HEALTH_STREAK or len(fails) >= HEALTH_FAILS)
+                                  and quiet and (not h.get('transient') or 'alerted_at' not in h)):
             due.append(source)
-        if not h['streak'] and not fails and quiet:
+        if not h['streak'] and not fails and not recover and quiet and source not in state.get('health_pending', {}).get('sources', []):
             health.pop(source, None)
         else:
             health[source] = h
@@ -1750,11 +1842,27 @@ def health_alert(state, due, now):
     if not due:
         return None
     health = state['source_health']
-    lines = ['Inbox triage keeps failing to read:'] + [
-        f'- {s}: {health[s]["streak"]} run(s) in a row, {len(health[s]["fails"])} in the last hour. Last error: {health[s]["last_error"]}'
-        for s in due] + ['Failed sources keep their cursors, so nothing is skipped once they read again.']
+    notices, lines = {}, []
+    for s in due:
+        h = health[s]
+        notice_since = h.get('notified_since', h['since']) if not h['streak'] else h['since']
+        mins = round((h.get('recovered_at', now) - notice_since) / 60)
+        if not h['streak']:
+            kind = 'recovery'
+            lines.append(f'{s} reading again after {mins} min.')
+        elif h.get('transient') and now - h['since'] >= HEALTH_TRANSIENT_ESCALATE:
+            kind = 'escalation'
+            lines.append(f'{s} still failing after {mins} min: provider/network problem. Needs attention. Its cursor holds. Last error: {h["last_error"]}')
+        else:
+            kind = 'outage'
+            lines.append(f'- {s}: {h["streak"]} run(s) in a row, {len(h["fails"])} in the last hour. Last error: {h["last_error"]}')
+            if h.get('transient'):
+                other = 'Other sources are still being read.' if state.get('read_sources') else 'Other sources retry independently.'
+                lines.append(f'{s}: provider/network problem. {other} Its cursor holds.')
+        notices[s] = {'kind': kind, 'since': notice_since}
+    lines.append('Failed sources keep their cursors, so nothing is skipped once they read again.')
     key = 'inbox-triage:source-health:' + hashlib.sha256(f'{",".join(due)}|{now}'.encode()).hexdigest()[:16]
-    state['health_pending'] = {'key': key, 'text': '\n'.join(lines), 'sources': due, 'at': now}
+    state['health_pending'] = {'key': key, 'text': '\n'.join(lines), 'sources': due, 'at': now, 'notices': notices}
     return state['health_pending']
 
 
@@ -1770,19 +1878,44 @@ def send_health(state, due, wd, now):
     stub = os.environ.get('ROBOB_WATCH_TELEGRAM_CLI')
     if (os.environ.get('ROBOB_TEST') or os.environ.get('NODE_ENV') == 'test' or os.environ.get('PYTEST_CURRENT_TEST')) and not stub:
         return {'health_alert_error': 'refused: test run; telegram notify would reach a real app'}
+    failures = state.setdefault('health_delivery_failures', {})
+    previous = failures.get('telegram-bridge')
     try:
-        out = run_helper('telegram-bridge', [str(BUN), stub or str(TELEGRAM_CLI), 'notify', '--source', 'Inbox triage', '--severity', 'attention',
-                          '--text', pending['text'], '--key', pending['key']], capture_output=True, text=True, timeout=4,
+        out = run_helper('telegram-bridge', [str(BUN), stub or str(TELEGRAM_CLI), 'notify', '--source=Inbox triage', '--severity=attention',
+                          f'--text={pending["text"]}', f'--key={pending["key"]}'], capture_output=True, text=True, timeout=4,
+                         failure_state=failures,
                          env={k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'})
         if out.returncode:
-            raise RuntimeError((out.stderr or out.stdout).strip()[:160] or f'exit {out.returncode}')
-    except Exception as e:
-        log_failure('health.delivery_failed')
-        return {'health_alert_error': f'{type(e).__name__}: {str(e)[:160]}'}
+            raise RuntimeError('telegram-bridge notify failed: ' + stderr_cause(out.stderr)['stderrClass'])
+    except Exception:
+        cause = {k: v for k, v in failures.get('telegram-bridge', {}).items() if k != 'tag'}
+        if previous != failures.get('telegram-bridge'):
+            tool_error('triage', 'health.delivery_failed', {**log_ids(), 'helper': 'telegram-bridge'}, cause)
+        return {'health_alert_error': 'telegram-bridge notify failed: ' + cause.get('stderrClass', 'unknown')}
     health = state.setdefault('source_health', {})
     for s in pending['sources']:
         if s in health:
-            health[s]['alerted_at'], health[s]['alerts'] = now, health[s].get('alerts', 0) + 1
+            h = health[s]
+            notice = pending.get('notices', {}).get(s, {'kind': 'outage', 'since': min(h['since'], pending.get('at', h['since']))})
+            if notice['kind'] == 'recovery':
+                if notice['since'] == h.get('notified_since', h['since']):
+                    h.pop('notified_since', None)
+                    if not h['streak']:
+                        h.pop('alerted_at', None)
+                        h.pop('escalated_at', None)
+            elif notice['kind'] == 'escalation':
+                h['last_notice_at'] = now
+                h['notified_since'] = min(h.get('notified_since', notice['since']), notice['since'])
+                if notice['since'] == h['since']:
+                    h['escalated_at'] = h['alerted_at'] = now
+            elif notice['kind'] == 'outage':
+                # A delivered old notice still needs a recovery, even if a new outage
+                # began while its send was pending. It does not acknowledge the new one.
+                h['notified_since'] = min(h.get('notified_since', notice['since']), notice['since'])
+                h['alerts'] = h.get('alerts', 0) + 1
+                h['last_notice_at'] = now
+                if notice['since'] == h['since']:
+                    h['alerted_at'] = now
     del state['health_pending']
     return {'health_alerts': pending['sources']}
 
@@ -1811,7 +1944,7 @@ def replay_pages(collect_page):
 
 
 def collect(state, now, watchers, rules, since=None, baseline=False, fast=None):
-    jids, seen = exclusions(watchers)
+    jids, seen = exclusions(watchers, state)
     tasks = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=7) as pool:
         for account in ACCOUNTS:
@@ -1829,18 +1962,34 @@ def collect(state, now, watchers, rules, since=None, baseline=False, fast=None):
             if fast is None:
                 tasks[pool.submit(replay_pages, lambda cursor: collect_whatsapp(cursor, now, jids, cutoff, since))] = 'whatsapp'
             tasks[pool.submit(replay_pages, lambda cursor: collect_imessage(cursor, now, cutoff, since, fast=fast))] = 'imessage'
-        results, errors = {}, {}
+        results, errors, causes = {}, {}, {}
         for f in concurrent.futures.as_completed(tasks):
             source = tasks[f]
             try:
                 results[source] = f.result()
                 if results[source].get('partial'):
-                    log_failure('collection.partial')
                     errors[source] = results[source]['partial']
+                    causes[source] = ('collection.partial', stderr_cause(errors[source]))
             except Exception as e:
-                log_failure('collection.failed')
                 errors[source] = f'{type(e).__name__}: {str(e)[:160]}'
+                causes[source] = ('collection.failed', stderr_cause(f'{type(e).__name__}: {e}'))
+        for source, (tag, cause) in causes.items():
+            helper = 'mail-worker' if source in ACCOUNTS else source
+            tool_error('triage', tag, {**log_ids(), 'helper': helper},
+                       {**cause, 'failedSources': len(errors), 'totalSources': len(tasks)})
     return results, errors
+
+
+def source_exit(results, errors, label='inbox-triage'):
+    readable = set(results) - set(errors)
+    if errors and readable:
+        detail = '; '.join(f'{s}: {clean(str(e), 160)}' for s, e in sorted(errors.items()))
+        print(f'{label} degraded: {detail}', file=sys.stderr)
+        return 0
+    if not readable:
+        print(f'{label} source failure: ' + json.dumps(errors or {'sources': 'nothing could be read'}), file=sys.stderr)
+        return 1
+    return 0
 
 
 @trace_run('triage.run')
@@ -1940,6 +2089,7 @@ def run(args):
                          source='bank' if item.get('payment_notice') else 'charge', action='queue')
     state['queue'] = kept
     state['source_errors'] = errors
+    state['read_sources'] = sorted(set(results) - set(errors))
     health = {}
     if not dry:
         due = track_health(state, errors, now)
@@ -2046,10 +2196,7 @@ def run(args):
                  'ms': round((time.time() - now) * 1000), **meta})
     if event:
         print(redact_credentials(event), flush=True)
-    elif errors:
-        print('inbox-triage source failure: ' + json.dumps(errors), file=sys.stderr)
-        return 1
-    return 0
+    return source_exit(results, errors)
 
 
 def main():

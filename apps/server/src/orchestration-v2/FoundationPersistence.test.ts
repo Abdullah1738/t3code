@@ -277,7 +277,7 @@ it.live.each([true, false])(
           }
           if (
             !seenReplay &&
-            /FROM "?ardud_history_events"?/.test(query) &&
+            /FROM "?ardud_thread_history_events"?/.test(query) &&
             query.includes("payload_json")
           ) {
             seenReplay = true;
@@ -1161,7 +1161,7 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
             if (
               (phase === "high-water"
                 ? query.includes("FROM orchestration_events")
-                : /FROM "?ardud_history_events"?/.test(query)) &&
+                : /FROM "?ardud_thread_history_events"?/.test(query)) &&
               query.includes("MAX(sequence)") === (phase === "high-water")
             ) {
               return Deferred.succeed(readStarted, undefined).pipe(

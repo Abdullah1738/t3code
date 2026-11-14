@@ -97,6 +97,7 @@ it.effect(
         >;
       }> = [
         { route: "shell.runs", run: ShellQueries.selectShellRunRows(sql, ids) },
+        { route: "shell.archive", run: projection.getShellSnapshot({ location: "archive" }) },
         { route: "shell.counts", run: ShellQueries.selectShellRunItemCounts(sql, ids) },
         {
           route: "shell.providers.large",
@@ -164,7 +165,14 @@ it.effect(
         {
           // Control /threads?updatedSince: the changed range only, never every shell.
           route: "control.threads-updated-since",
-          run: control.threadsUpdatedSince("2026-01-01T00:00:00.000Z"),
+          run: control.threadCandidatePage({
+            since: Date.parse("2026-01-01T00:00:00.000Z"),
+            location: "active",
+            includeSubagents: false,
+            parentThreadId: null,
+            projectId: null,
+            limit: 50,
+          }),
         },
         {
           route: "board.thread-state",
@@ -222,7 +230,11 @@ it.effect(
               "discussion.messages",
             ].includes(entry.route)
           )
-            assert.isAtMost((statement.match(/\?/g) ?? []).length, 2, `${entry.route} bind count`);
+            assert.isAtMost(
+              (statement.match(/\?/g) ?? []).length,
+              entry.route === "control.threads-updated-since" ? 4 : 2,
+              `${entry.route} bind count`,
+            );
           const plan = yield* sql.unsafe<{ detail: string }>(
             `EXPLAIN QUERY PLAN ${statement}`,
             Array.from({ length: (statement.match(/\?/g) ?? []).length }, () => null),
@@ -236,6 +248,18 @@ it.effect(
               ),
               entry.route,
             );
+          }
+          if (entry.route === "shell.archive") {
+            const details = plan.map((row) => row.detail).join("\n");
+            assert.notMatch(
+              details,
+              /MATERIALIZE shell_runs|SCAN orchestration_v2_projection_runs/,
+            );
+            if (statement.includes("WITH shell_runs")) {
+              assert.match(details, /USING INDEX ardud_shell_executed_run_idx/);
+              assert.match(details, /USING INDEX ardud_shell_activity_run_idx/);
+            }
+            continue;
           }
           const findings = violations(query, plan);
           console.log(

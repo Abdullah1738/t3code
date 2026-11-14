@@ -1,10 +1,19 @@
 """Commands to classify only; none of these shell strings may be executed."""
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 
 def fixture_environment():
     return {name: '' for name in os.environ if name.startswith(('BASH_FUNC_', 'PYTHON', 'LD_', 'DYLD_')) or name in {'BASH_ENV', 'ENV', 'BASHOPTS', 'SHELLOPTS'}}
+
+
+def fixture_environment_patch():
+    # The guard refuses any exported function by name, empty or not, and
+    # offbox boxes export several; drop them instead of blanking.
+    kept = {name: value for name, value in os.environ.items() if not name.startswith('BASH_FUNC_')}
+    blanked = {name: value for name, value in fixture_environment().items() if not name.startswith('BASH_FUNC_')}
+    return patch.dict(os.environ, {**kept, **blanked}, clear=True)
 
 
 def cases(root):
@@ -338,6 +347,38 @@ cat "$T/.robob/userdata/statev2.sqlite"
     for copy in ('cp -as "$HOME" "$T"', 'cp "$HOME" "$T"', 'tar -xf /tmp/tree.tar -C "$T"'):
         cases.append(('tree-replacement', original.replace('  R="$T/.local/share/memory-system"', '  ' + copy + '\n  R="$T/.local/share/memory-system"'), 'live-database-script'))
     return cases
+
+
+def database_name_sources():
+    """Bare names are data until the same source also names a live root."""
+    names = ('statev2.sqlite', 'state.sqlite', 'opencode.db',
+             'statev2.pre-shrink-20261105234934246.sqlite',
+             'statev2.sqlite-wal', 'statev2.sqlite-shm', 'state.sqlite-journal', 'opencode.db-wal')
+    roots = (
+        'join(homedir(), ".t3", "userdata", NAME)',
+        '"~/.robob/userdata/" + NAME',
+        'process.env.HOME + "/.t3/userdata/" + NAME',
+        'join(process.env.T3CODE_HOME, "userdata", NAME)',
+        'join(os.homedir(), ".local/share/opencode", NAME)',
+        'process.chdir(join(homedir(), ".t3/userdata"))',
+        'process.chdir("~/.robob/userdata")',
+        'process.chdir("$HOME/.t3/userdata")',
+        'process.chdir("${HOME}/.t3/userdata")',
+        'join(Path.home(), "userdata", NAME)',
+        'join(homedir(), "userdata", NAME)',
+        'join(process.env.HOME, "userdata", NAME)',
+        'join("robob-data", "userdata", NAME)',
+        'join("opencode-data", NAME)',
+        'join(os.homedir(), ".local", "share", "opencode", NAME)',
+    )
+    for name in names:
+        source = ('import { test } from "node:test";\n'
+                  'const bundle = "com.ardud.robob";\n'
+                  'const names = [' + repr(name) + '];\n')
+        yield 'bare-' + name, source, None
+        for root in roots:
+            yield root + ':' + name, source + root.replace('NAME', repr(name)) + ';\n', 'live-database-script'
+    yield 'literal-live', 'import { test } from "node:test";\nconst db = "~/.robob/userdata/statev2.sqlite";\n', 'live-database-script'
 
 
 def migration_mutations(original):

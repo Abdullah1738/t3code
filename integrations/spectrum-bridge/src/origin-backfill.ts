@@ -1,3 +1,4 @@
+import { toolError } from "./toollog.ts";
 import type { ChatBackend } from "./openchamber.ts";
 import type { Store } from "./store.ts";
 
@@ -57,7 +58,7 @@ export async function backfillOrigins(
       const outcome = await backend.markImessageOrigin(session.id, session.directory);
       result[outcome]++;
       if (outcome !== "marked") store.set(doneKey(session.id), true);
-    } catch (error) {
+    } catch (error) { toolError("origin-backfill", "origin-backfill.catch1", error);
       const status = (error as { status?: unknown }).status;
       if (typeof status !== "number" || status === 0 || status >= 500) {
         result.pending += todo.length - index;
@@ -102,7 +103,7 @@ export class OriginBackfill {
       if (result.pending && result.marked + result.already + result.missing === 0) throw new Error("no progress");
       this.backoff = this.options.initialBackoffMs ?? 30_000;
       this.dueAt = result.marked || result.pending ? now() + (this.options.nextPassMs ?? 60_000) : Infinity;
-    }).catch(() => {
+    }).catch((caughtError) => { toolError("origin-backfill", "origin-backfill.catch2", caughtError);
       this.log("origin-backfill-failed");
       this.dueAt = now() + this.backoff;
       this.backoff = Math.min(this.options.maxBackoffMs ?? 30 * 60_000, this.backoff * 2);

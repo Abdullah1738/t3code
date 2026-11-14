@@ -127,6 +127,7 @@ export const KanbanBoardUpdateInput = Schema.Struct({
   defaultCardModel: Schema.optional(ModelSelection),
   reviewChains: Schema.optional(Schema.Array(KanbanReviewChain)),
   defaultReviewChain: Schema.optional(Schema.NullOr(Schema.String)),
+  guessedGates: Schema.optional(Schema.Array(Schema.Literals(["deploy", "money", "secret"]))),
   instructions: Schema.optional(KanbanInstructions),
   nightlyReview: Schema.optional(Schema.NullOr(KanbanNightlyReviewSettings)),
 });

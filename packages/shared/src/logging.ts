@@ -1,5 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
+import * as HostProcess from "./HostProcess.ts";
+import { CompressedFileSink } from "./compressedFileSink.ts";
 import * as NodePath from "node:path";
 import * as Schema from "effect/Schema";
 import * as Effect from "effect/Effect";
@@ -12,6 +14,8 @@ export interface RotatingFileSinkOptions {
   readonly maxBytes: number;
   readonly maxFiles: number;
   readonly throwOnError?: boolean;
+  readonly compressBackups?: boolean;
+  readonly maxTotalBytes?: number;
 }
 
 export class RotatingFileSinkConfigurationError extends Schema.TaggedError<RotatingFileSinkConfigurationError>()(
@@ -204,6 +208,31 @@ export const makeAsyncRotatingFileSink = Effect.fnUntraced(function* (
     });
   const failure = (operation: RotatingFileSinkError["operation"]) => (cause: unknown) =>
     new RotatingFileSinkError({ operation, filePath: options.filePath, cause });
+  if (options.compressBackups) {
+    const compressed = new CompressedFileSink({
+      platform: yield* HostProcess.Platform,
+      filePath: options.filePath,
+      maxBytes: options.maxBytes,
+      maxFiles: options.maxFiles,
+      maxTotalBytes: options.maxTotalBytes ?? options.maxBytes * (options.maxFiles + 1),
+    });
+    yield* Effect.tryPromise({ try: () => compressed.initialize(), catch: failure("initialize") });
+    const semaphore = yield* Semaphore.make(1);
+    return {
+      write: (chunk: string | Buffer) =>
+        semaphore
+          .withPermit(
+            Effect.tryPromise({
+              try: () => compressed.write(typeof chunk === "string" ? Buffer.from(chunk) : chunk),
+              catch: failure("write"),
+            }),
+          )
+          .pipe(Effect.uninterruptible),
+      flush: Effect.tryPromise({ try: () => compressed.flush(), catch: failure("write") }).pipe(
+        Effect.uninterruptible,
+      ),
+    };
+  }
   const directory = path.dirname(options.filePath);
   const basename = path.basename(options.filePath);
   yield* fs
@@ -260,5 +289,5 @@ export const makeAsyncRotatingFileSink = Effect.fnUntraced(function* (
         ),
       )
       .pipe(Effect.uninterruptible);
-  return { write };
+  return { write, flush: Effect.void };
 });

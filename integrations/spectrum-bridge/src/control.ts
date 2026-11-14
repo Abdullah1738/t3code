@@ -1,3 +1,4 @@
+import { toolError, toolLog } from "./toollog.ts";
 // Client for Robob's local control API (/api/ardud/control/*), plus the
 // mapping from its thread and request shapes onto the bridge vocabulary.
 // telegram-bridge carries its own variant of this file, since each package is
@@ -153,6 +154,14 @@ export class ControlClient {
   }
 
   async request<T>(method: string, path: string, body?: unknown, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<T> {
+    const loggingAt = performance.now();
+    let loggingIds: Record<string, string> | undefined;
+    toolLog.capture(() => {
+      const encoded = /^\/threads\/(?!by-native(?:\/|$))([^/?]+)/.exec(path)?.[1];
+      loggingIds = toolLog.runIds(encoded ? decodeURIComponent(encoded) : undefined);
+    });
+    let loggingOk = false;
+    try {
     // Reads get 25 s: Robob under load answers in seconds to tens of seconds, and giving up early only looks like an outage.
     const timeout = AbortSignal.timeout(options.timeoutMs ?? 25_000);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
@@ -171,17 +180,25 @@ export class ControlClient {
         proxy: "",
         verbose: false,
       });
-    } catch {
+    } catch (caughtError) { toolError("control", "control.catch1", caughtError);
       throw new ControlError(0);
     }
     let data: { ok?: unknown; error?: { code?: unknown } } | undefined;
     try {
       data = await response.json() as typeof data;
-    } catch { /* Non-JSON bodies only come from proxies or crashes. */ }
+    } catch (caughtError) { toolError("control", "control.catch2", caughtError); /* Non-JSON bodies only come from proxies or crashes. */ }
     if (!response.ok || data?.ok !== true) {
       throw new ControlError(response.status || 0, typeof data?.error?.code === "string" ? data.error.code : "");
     }
+    loggingOk = true;
     return data as T;
+    } finally {
+      toolLog.capture(() => {
+      const route = path.split("?", 1)[0]!.replace(/(\/threads\/)(?!by-native(?:\/|$))[^/]+/, "$1:id").replace(/(\/by-native\/)[^/]+/, "$1:id").replace(/(\/(?:runs|requests)\/)[^/]+/g, "$1:id");
+      toolLog.capture(() => toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: performance.now() - loggingAt,
+        ok: loggingOk, ids: loggingIds, props: { method, route } }));
+      });
+    }
   }
 
   thread(threadId: string): Promise<{ thread: ThreadDetail }> {
@@ -222,11 +239,11 @@ export class ControlClient {
   }
 
   /** Uploads one file through a signed URL and returns the attachment reference for send. */
-  async upload(file: { name: string; mimeType: string; bytes: Uint8Array }) {
+  async upload(file: { name: string; mimeType: string; bytes: Uint8Array }, signal?: AbortSignal) {
     const type = file.mimeType.startsWith("image/") ? "image" as const : "file" as const;
     const issued = await this.request<{ attachmentId: string; relativeUrl: string }>("POST", "/attachments", {
       type, name: file.name, mimeType: file.mimeType, sizeBytes: file.bytes.byteLength,
-    });
+    }, { signal });
     if (typeof issued.relativeUrl !== "string" || !issued.relativeUrl.startsWith("/") || issued.relativeUrl.startsWith("//")) {
       throw new ControlError(0, "upload_url");
     }
@@ -236,15 +253,15 @@ export class ControlClient {
         method: "POST",
         headers: { "content-length": String(file.bytes.byteLength) },
         body: new Blob([file.bytes as Uint8Array<ArrayBuffer>]),
-        signal: AbortSignal.timeout(120_000),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(120_000)]) : AbortSignal.timeout(120_000),
         redirect: "manual",
         proxy: "",
         verbose: false,
       });
-    } catch {
+    } catch (caughtError) { toolError("control", "control.catch3", caughtError);
       throw new ControlError(0, "upload_failed");
     }
-    await response.body?.cancel().catch(() => {});
+    await response.body?.cancel().catch((caughtError) => { toolError("control", "control.catch4", caughtError);});
     if (!response.ok) throw new ControlError(response.status, "upload_failed");
     return { attachmentId: issued.attachmentId, type, name: file.name, mimeType: file.mimeType, sizeBytes: file.bytes.byteLength };
   }
@@ -269,11 +286,11 @@ export class ControlClient {
         proxy: "",
         verbose: false,
       });
-    } catch {
+    } catch (caughtError) { toolError("control", "control.catch5", caughtError);
       throw new ControlError(0);
     }
     if (!response.ok || !response.body || response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "text/event-stream") {
-      await response.body?.cancel().catch(() => {});
+      await response.body?.cancel().catch((caughtError) => { toolError("control", "control.catch6", caughtError);});
       throw new ControlError(response.status);
     }
     yield* parseSse(response.body, options.signal);
@@ -299,7 +316,7 @@ export async function* parseSse(body: ReadableStream<Uint8Array>, signal?: Abort
         if (line === "") {
           if (data.length) {
             let parsed: unknown;
-            try { parsed = JSON.parse(data.join("\n")); } catch { parsed = undefined; }
+            try { parsed = JSON.parse(data.join("\n")); } catch (caughtError) { toolError("control", "control.catch7", caughtError); parsed = undefined; }
             if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
               yield { ...frame, data: parsed as Record<string, unknown> };
             }
@@ -319,7 +336,7 @@ export async function* parseSse(body: ReadableStream<Uint8Array>, signal?: Abort
       if (done) return;
     }
   } finally {
-    await reader.cancel().catch(() => {});
+    await reader.cancel().catch((caughtError) => { toolError("control", "control.catch8", caughtError);});
     reader.releaseLock();
   }
 }

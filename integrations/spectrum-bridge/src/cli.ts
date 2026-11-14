@@ -1,3 +1,4 @@
+import { cardKind, toolError, toolLog } from "./toollog.ts";
 import { constants } from "node:fs";
 import { lstat, open, stat } from "node:fs/promises";
 import { request } from "node:http";
@@ -14,6 +15,8 @@ type Body = Record<string, string | number | boolean | string[] | SecretField[]>
 type Command = { method: "GET" | "POST"; path: string; body?: Body };
 /** Tailnet publishing runs in the CLI process itself; it never goes through the bridge socket. */
 export type LocalCommand =
+  | { command: "log-rollup"; day?: string }
+  | { command: "log-card-render"; kind: string; durationMs: number; ok: boolean }
   | { command: "publish"; localPort: number }
   | { command: "publish"; app: string }
   | { command: "unpublish"; port: number }
@@ -27,11 +30,12 @@ class RawOutput {
 }
 
 const COMMANDS_HELP = "Expected health, send, cancel-send, send-file, poll, app, react, wake, secret-request, secret, publish, unpublish, ban, unban, or bans."
-  + " Sendblue mode adds location-request, location, ask-owner, chats, allow, allow-group,"
+  + " Sendblue mode adds location-request, location, messages, ask-owner, chats, allow, allow-group,"
   + " guest-allow, guest-revoke, guests, guest-send, and share-contact."
+  + " Logs: log-rollup [--day YYYY-MM-DD]."
   + " Public links: share, unshare, and shares."
   + " Alerts and reminders moved to the telegram bridge CLI.";
-const LOCAL_COMMANDS = ["publish", "unpublish", "ban", "unban", "bans"];
+const LOCAL_COMMANDS = ["log-card-render", "log-rollup", "publish", "unpublish", "ban", "unban", "bans"];
 
 // Mirrors photon.ts EFFECTS; the CLI must not load the SDK just to validate arguments.
 export const EFFECT_NAMES = ["slam", "loud", "gentle", "invisible", "confetti", "fireworks", "balloons", "heart",
@@ -50,11 +54,13 @@ export const validAppUrl = (value: unknown): value is string => {
   try {
     const url = new URL(value);
     return url.protocol === "https:" && url.hostname.length > 0 && !url.username && !url.password;
-  } catch { return false; }
+  } catch (caughtError) { toolError("cli", "cli.catch1", caughtError); return false; }
 };
 const control = /[\x00-\x1f\x7f-\x9f]/;
 
 const OPTIONS_BY_COMMAND: Record<string, string[]> = {
+  "log-card-render": ["kind", "ms", "ok"],
+  "log-rollup": ["day"],
   health: [],
   "send-file": ["file", "key", "text", "session", "mime"],
   react: ["target", "kind"],
@@ -64,6 +70,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   wake: ["text", "source", "key", "chat", "session"],
   "location-request": ["session", "key", "chat"],
   location: ["session", "chat"],
+  messages: ["session", "chat", "limit", "before", "id"],
   "ask-owner": ["text", "session", "key"],
   chats: ["session"],
   allow: ["address", "name", "admin", "session"],
@@ -103,7 +110,7 @@ function parseOptions(args: string[]) {
       allowPositionals: true,
       tokens: true,
     });
-  } catch {
+  } catch (caughtError) { toolError("cli", "cli.catch2", caughtError);
     // parseArgs errors can quote arbitrary argument values.
     throw new CliError("Invalid command arguments");
   }
@@ -143,6 +150,16 @@ export const isLocalCommand = (args: string[]): boolean => LOCAL_COMMANDS.includ
 export function parseLocalCommand(args: string[]): LocalCommand {
   if (!isLocalCommand(args)) throw new CliError(COMMANDS_HELP);
   const { command, values } = parseOptions(args);
+  if (command === "log-card-render") {
+    const durationMs = Number(values.ms);
+    if (!["quick", "delivery", "ride", "nutrition"].includes(values.kind ?? "") || !values.ms || !Number.isFinite(durationMs) || durationMs < 0 || !["true", "false"].includes(values.ok ?? "")) throw new CliError("Invalid render log");
+    return { command, kind: values.kind!, durationMs, ok: values.ok === "true" };
+  }
+  if (command === "log-rollup") {
+    const day = values.day;
+    if (day !== undefined && (typeof day !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(day) || !Number.isFinite(Date.parse(`${day}T00:00:00Z`)) || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day)) throw new CliError("--day needs YYYY-MM-DD (UTC)");
+    return { command, ...(day ? { day } : {}) };
+  }
   if (command === "ban" || command === "unban") {
     const slug = required(values.chat, "--chat");
     if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(slug)) throw new CliError("Invalid chat slug; list them with chats");
@@ -183,6 +200,15 @@ function runRulesCommand(command: RulesCommand, rulesPath: string): Promise<unkn
 }
 
 export async function runLocalCommand(command: LocalCommand, options: { exec?: Exec; apps?: () => Promise<{ appsRoot: string; appsPort: number }>; rulesPath?: string } = {}): Promise<unknown> {
+  if (command.command === "log-card-render") {
+    toolLog.capture(() => toolLog.write({ component: `${command.kind}-renderer`, kind: "perf", name: "card.render", durationMs: command.durationMs, ok: command.ok, props: { cardKind: command.kind } }));
+    return { logged: true };
+  }
+  if (command.command === "log-rollup") {
+    const result = await toolLog.rollup(command.day);
+    if (!result) throw new CliError("Log rollup unavailable");
+    return result;
+  }
   const deps = options.exec ? { exec: options.exec } : {};
   if (isRulesCommand(command)) return runRulesCommand(command, options.rulesPath ?? join(stateRoot, "reply-rules.json"));
   try {
@@ -196,7 +222,7 @@ export async function runLocalCommand(command: LocalCommand, options: { exec?: E
     if (!index) throw new CliError(`No app at ${appsRoot}/${command.app}/index.html`);
     const { url, port, created } = await publish(appsPort, deps);
     return { url: `${url}/${command.app}/`, port, created, metadataWarnings: metadataWarnings(await Bun.file(index).text()) };
-  } catch (error) {
+  } catch (error) { toolError("cli", "cli.catch3", error);
     if (error instanceof CliError) throw error;
     throw new CliError(error instanceof PublishError ? error.message : "Tailnet publish failed");
   }
@@ -299,6 +325,22 @@ export function parseCommand(args: string[]): Command {
     case "location-request":
       return { method: "POST", path: "/location-request",
         body: { ...session(), ...(values.chat === undefined ? {} : { chat: chatSlug(values.chat) }) } };
+    case "messages": {
+      const body: Body = { sessionId: sessionOnly(values.session)! };
+      if (values.chat !== undefined) body.chat = chatSlug(values.chat);
+      if (values.limit !== undefined) {
+        if (!/^\d{1,3}$/.test(values.limit) || Number(values.limit) < 1 || Number(values.limit) > 100) throw new CliError("--limit must be 1 to 100");
+        body.limit = Number(values.limit);
+      }
+      for (const key of ["before", "id"] as const) {
+        const value = values[key];
+        if (value === undefined) continue;
+        if (!value.trim() || value.length > 200 || control.test(value)) throw new CliError(`Invalid --${key}`);
+        body[key] = value;
+      }
+      if (values.before !== undefined && values.id !== undefined) throw new CliError("--id and --before cannot be used together");
+      return { method: "POST", path: "/messages", body };
+    }
     case "location":
       return { method: "POST", path: "/location",
         body: { sessionId: sessionOnly(values.session)!, ...(values.chat === undefined ? {} : { chat: chatSlug(values.chat) }) } };
@@ -396,7 +438,7 @@ export function parseCommand(args: string[]): Command {
       const card = flags.card ? CARD_FIELDS.map(field => ({ ...field })) : [];
       if (specs.length + card.length < 1 || specs.length + card.length > 8) throw new CliError("--field must be given 1 to 8 times (--card counts as 4)");
       const fields = [...card, ...specs.map(spec => {
-        try { return parseFieldSpec(spec); } catch (error) {
+        try { return parseFieldSpec(spec); } catch (error) { toolError("cli", "cli.catch4", error);
           throw new CliError(`--field must be name:Label[:type]. ${(error as Error).message}; type is ${SECRET_FIELD_TYPES.join(", ")}`);
         }
       })];
@@ -442,6 +484,8 @@ export async function loadCommandPayload(command: Command): Promise<Body | undef
     throw new CliError("--file must be an absolute path with a valid filename");
   }
   const name = basename(file);
+  const preparedAt = performance.now();
+  let prepared = false;
   const mimeTypes: Record<string, string> = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
     ".webp": "image/webp", ".heic": "image/heic", ".heif": "image/heif", ".svg": "image/svg+xml",
@@ -462,7 +506,7 @@ export async function loadCommandPayload(command: Command): Promise<Body | undef
     if (before.size === 0n || before.size > BigInt(MAX_FILE_BYTES)) throw new CliError("Attachment must contain 1 byte to 20 MiB");
     // Check identities too: a hard link, case alias, or parent symlink must not bypass the fixed exclusions.
     for (const path of protectedPaths) {
-      const secret = await stat(path, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
+      const secret = await stat(path, { bigint: true }).catch((error: NodeJS.ErrnoException) => { toolError("cli", "cli.catch5", error);
         if (error.code !== "ENOENT") throw error;
       });
       if (secret && secret.dev === before.dev && secret.ino === before.ino) throw new CliError("Bridge credentials and state cannot be attached");
@@ -481,13 +525,19 @@ export async function loadCommandPayload(command: Command): Promise<Body | undef
     }
     if (size !== Number(before.size) || !unchanged(await handle.stat({ bigint: true }))
       || !unchanged(await lstat(file, { bigint: true }))) throw new CliError("Attachment changed while reading");
+    prepared = true;
     return { base64: data.subarray(0, size).toString("base64"), name,
       mimeType: mimeType ?? mimeTypes[extname(name).toLowerCase()] ?? "application/octet-stream",
       text, dedupeKey, ...(sessionId === undefined ? {} : { sessionId }) };
-  } catch (error) {
+  } catch (error) { toolError("cli", "cli.catch6", error);
     throw error instanceof CliError ? error : new CliError("Attachment could not be read safely");
   } finally {
-    await handle?.close().catch(() => {});
+    await handle?.close().catch((caughtError) => { toolError("cli", "cli.catch7", caughtError);});
+    toolLog.capture(() => {
+      const kind = cardKind(name);
+      if (kind !== "other") toolLog.write({ component: "card-file", kind: "perf", name: "card.render", ok: prepared,
+        durationMs: performance.now() - preparedAt, props: { cardKind: kind } });
+    });
   }
 }
 
@@ -497,7 +547,7 @@ async function sendCommand(command: Command): Promise<unknown> {
   try {
     if (!isAbsolute(socketPath) || socketPath.includes("\0")) throw new Error();
     socket = await lstat(socketPath);
-  } catch {
+  } catch (caughtError) { toolError("cli", "cli.catch8", caughtError);
     throw new CliError("Bridge socket is unavailable");
   }
   // The daemon owns the private parent directory; never follow a socket symlink.
@@ -541,7 +591,7 @@ async function sendCommand(command: Command): Promise<unknown> {
           let data: unknown;
           try {
             data = JSON.parse(Buffer.concat(chunks, size).toString("utf8"));
-          } catch {
+          } catch (caughtError) { toolError("cli", "cli.catch9", caughtError);
             reject(new CliError(ok ? "Bridge returned invalid JSON" : `Bridge request failed (HTTP ${status})`));
             return;
           }
@@ -561,8 +611,13 @@ async function sendCommand(command: Command): Promise<unknown> {
                 : "Bridge returned an invalid acknowledgement"));
               return;
             }
+            const chat = "chat" in data ? data.chat : undefined;
+            if (chat !== undefined && (typeof chat !== "string" || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(chat))) {
+              reject(new CliError("Bridge returned an invalid acknowledgement"));
+              return;
+            }
             // Queue acknowledgement only, not proof of upload or delivery. Never print echoed file contents.
-            resolve({ id: data.id, created: data.created });
+            resolve({ id: data.id, created: data.created, ...(chat === undefined ? {} : { chat }) });
             return;
           }
           const record = data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : {};
@@ -600,7 +655,7 @@ if (import.meta.main) {
     const result = isLocalCommand(args) ? await runLocalCommand(parseLocalCommand(args)) : await sendCommand(parseCommand(args));
     if (result instanceof RawOutput) process.stdout.write(result.value);
     else console.log(JSON.stringify(result));
-  } catch (error) {
+  } catch (error) { toolError("cli", "cli.catch10", error);
     console.error(JSON.stringify({ error: error instanceof CliError ? error.message : "Bridge request failed" }));
     process.exitCode = 1;
   }

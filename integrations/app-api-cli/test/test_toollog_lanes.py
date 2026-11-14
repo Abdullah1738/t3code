@@ -2,22 +2,34 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-import toollog
 
 
 class LaneLogs(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name)
+        env = patch.dict(os.environ, {'ROBOB_TOOL_LOG_DIR': str(self.base)})
+        env.start()
+        self.addCleanup(env.stop)
+
     def replay(self, name):
-        with tempfile.TemporaryDirectory() as temp, patch.object(toollog,'root',return_value=Path(temp)):
+        with tempfile.TemporaryDirectory(dir=self.base) as temp, patch.dict(os.environ,{'ROBOB_TOOL_LOG_DIR':temp}):
             suite=unittest.defaultTestLoader.loadTestsFromName(name)
             result=unittest.TestResult()
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 suite.run(result)
             self.assertEqual(result.errors+result.failures,[],name)
-            return [json.loads(line) for p in Path(temp).glob('*.ndjson') for line in p.read_text().splitlines()]
+            rows = [json.loads(line) for p in (Path(temp)/'orders').glob('*.ndjson') for line in p.read_text().splitlines()]
+            for row in rows:
+                if row['name'].startswith(('provider.', 'track.')):
+                    self.assertIn(row['props']['merchant'], {'noon', 'careem', 'amazon', 'uber', 'other', 'unknown'})
+            return rows
 
     def test_lane_success_and_refusal_diagnostics(self):
         cases=[
@@ -71,11 +83,11 @@ class LaneLogs(unittest.TestCase):
         fixture=AddNoticeTests('test_slow_first_check_still_sends_and_registers')
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
-        with tempfile.TemporaryDirectory() as temp, patch.object(toollog,'root',return_value=Path(temp)):
+        with tempfile.TemporaryDirectory(dir=self.base) as temp, patch.dict(os.environ,{'ROBOB_TOOL_LOG_DIR':temp}):
             for source,order in [('phone','3999004005'),('email','3999004006')]:
                 code,_=fixture.add('--source',source,order=order,who='owner')
                 self.assertEqual(code,0)
-            rows=[json.loads(line) for p in Path(temp).glob('*.ndjson') for line in p.read_text().splitlines()]
+            rows=[json.loads(line) for p in (Path(temp)/'orders').glob('*.ndjson') for line in p.read_text().splitlines()]
             self.assertEqual([r['props']['source'] for r in rows if r['name']=='track.add'],['phone','email'])
 
     def test_provider_reads_success_and_failure(self):

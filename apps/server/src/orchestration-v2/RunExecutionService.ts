@@ -47,6 +47,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Schedule from "effect/Schedule";
@@ -73,6 +74,9 @@ import {
 } from "../ardud/durability/transientSqliteRead.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
+import * as KanbanStore from "../ardud/kanban/store/KanbanStore.ts";
+import { recordServerAnalytics } from "../observability/RpcInstrumentation.ts";
 
 export interface ProviderEventRoutingState {
   readonly ownedThreadIds: ReadonlySet<ThreadId>;
@@ -602,6 +606,7 @@ export interface RunExecutionServiceV2StartRootRunInput {
   readonly shouldFinalizeRun?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
   readonly loadDelegatedTask?: DelegatedTaskRecoveryService.LoadDelegatedTask;
   readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
+  readonly loadRunInterruptReason?: () => Effect.Effect<string | undefined>;
   readonly message: ProviderAdapter.ProviderAdapterV2TurnMessage;
   readonly modelSelection: ModelSelection;
   readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
@@ -617,6 +622,70 @@ export class RunExecutionServiceV2 extends Context.Service<
   RunExecutionServiceV2,
   RunExecutionServiceV2Shape
 >()("t3/orchestration-v2/RunExecutionService/RunExecutionServiceV2") {}
+
+// The provider consumer owns the span. This observer runs before text filtering or writes.
+export const makeFirstTokenObserver = Effect.fnUntraced(function* (
+  run: Pick<OrchestrationV2Run, "id" | "threadId" | "startedAt">,
+  attemptId: RunAttemptId,
+) {
+  const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+  const kanban = yield* Effect.serviceOption(KanbanStore.KanbanStore);
+  let seen = false;
+  return Effect.fnUntraced(function* (event: ProviderAdapter.ProviderAdapterV2Event) {
+    if (seen || Option.isNone(analytics)) return;
+    const hasToken =
+      event.type === "message.updated"
+        ? event.message.threadId === run.threadId &&
+          event.message.runId === run.id &&
+          event.message.role === "assistant" &&
+          event.message.text.length > 0
+        : event.type === "turn_item.updated" &&
+          event.turnItem.threadId === run.threadId &&
+          event.turnItem.runId === run.id &&
+          (event.turnItem.type === "assistant_message" || event.turnItem.type === "reasoning") &&
+          event.turnItem.text.length > 0;
+    if (!hasToken) return;
+    seen = true;
+    const now = yield* DateTime.now;
+    // Attribution can wait for the boards database; provider output must keep flowing.
+    yield* Effect.gen(function* () {
+      const link = Option.isSome(kanban)
+        ? yield* kanban.value.threadLink(run.threadId).pipe(
+            Effect.timeoutOption("2 seconds"),
+            Effect.map((value) => Option.getOrElse(value, () => null)),
+            Effect.catchCause(() => Effect.succeed(null)),
+          )
+        : null;
+      yield* recordServerAnalytics(analytics.value, {
+        ts: DateTime.formatIso(now),
+        kind: "provider.first_token",
+        surface: "server",
+        route: "provider",
+        threadId: run.threadId,
+        ...(link === null
+          ? {}
+          : {
+              boardId: link.boardId,
+              ...(link.cardId === null ? {} : { cardId: link.cardId }),
+              ...(link.discussionId === null ? {} : { discussionId: link.discussionId }),
+            }),
+        ...(run.startedAt === null
+          ? {}
+          : {
+              durationMs: Math.max(
+                0,
+                DateTime.toEpochMillis(now) - DateTime.toEpochMillis(run.startedAt),
+              ),
+            }),
+        props: {
+          phase: link?.role === "work" ? "worker" : (link?.role ?? "agent"),
+          key: attemptId,
+          span: "RunExecutionService.startRootRun",
+        },
+      });
+    }).pipe(Effect.forkDetach);
+  });
+});
 
 export const layer: Layer.Layer<
   RunExecutionServiceV2,
@@ -642,6 +711,7 @@ export const layer: Layer.Layer<
     const previewAgentActivity = yield* PreviewAgentActivity.PreviewAgentActivity;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
     const finalizationObserver = yield* RunFinalizationService.RunFinalizationObserver;
+    const analyticsContext = yield* Effect.context<never>();
 
     const writeFinalRunEvents = Effect.fn("RunExecutionService.writeFinalRunEvents")(
       function* (input: {
@@ -652,6 +722,7 @@ export const layer: Layer.Layer<
         readonly attempt: OrchestrationV2RunAttempt;
         readonly shouldFinalizeRun?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
         readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
+        readonly loadRunInterruptReason?: () => Effect.Effect<string | undefined>;
         readonly openRunOwnedSubagents?: OpenRunOwnedSubagentProjection;
         readonly terminal: ProviderTerminalEvent;
         readonly failureItemPersisted: boolean;
@@ -662,6 +733,10 @@ export const layer: Layer.Layer<
         };
       }) {
         const completedAt = yield* DateTime.now;
+        const interruptReason =
+          input.terminal.status === "interrupted"
+            ? yield* input.loadRunInterruptReason?.() ?? Effect.succeed(undefined)
+            : undefined;
         const finalizedAttempt: OrchestrationV2RunAttempt | null = {
           ...input.attempt,
           status: input.terminal.status,
@@ -706,6 +781,7 @@ export const layer: Layer.Layer<
                       rootNode: input.rootNode,
                       providerThread: input.providerThread,
                       completedAt,
+                      reason: interruptReason,
                     }),
                   },
                 ],
@@ -816,6 +892,7 @@ export const layer: Layer.Layer<
                       rootNode: input.rootNode,
                       providerThread: input.providerThread,
                       completedAt,
+                      reason: interruptReason,
                     }),
                   },
                 ]
@@ -895,6 +972,9 @@ export const layer: Layer.Layer<
 
     return RunExecutionServiceV2.of({
       startRootRun: Effect.fn("RunExecutionService.startRootRun")(function* (input) {
+        const observeFirstToken = yield* makeFirstTokenObserver(input.run, input.attempt.id).pipe(
+          Effect.provideContext(analyticsContext),
+        );
         // Startup failure and stream shutdown can report the same attempt.
         const refreshAfterTurn = yield* Effect.cached(
           finalizationObserver.refreshAfterTurn(input.appThread.projectId).pipe(
@@ -1230,6 +1310,9 @@ export const layer: Layer.Layer<
               : {
                   hasUnpairedRunInterruptRequest: input.hasUnpairedRunInterruptRequest,
                 }),
+            ...(input.loadRunInterruptReason === undefined
+              ? {}
+              : { loadRunInterruptReason: input.loadRunInterruptReason }),
             openRunOwnedSubagents: openSubagents,
             terminal,
             failureItemPersisted:
@@ -1441,6 +1524,15 @@ export const layer: Layer.Layer<
           // thread-scoped probe: session-wide pending work (siblings, wake
           // buffers, session subagents) must not pin this root subscription.
           const latestProviderThreadSnapshot = yield* Ref.get(latestProviderThread);
+          // The live adapter can already be idle while its output is still queued.
+          // Failed ingestion uses native termination evidence: the clearing snapshot may not persist.
+          if (
+            latestProviderThreadSnapshot.pendingBackgroundWork === true &&
+            (yield* Ref.get(ingestionFailure)) === null &&
+            !(yield* Ref.get(startupFailurePending))
+          ) {
+            return false;
+          }
           if (input.session.hasPendingBackgroundWorkForThread !== undefined) {
             const hasPendingWork = yield* input.session
               .hasPendingBackgroundWorkForThread(latestProviderThreadSnapshot)
@@ -1599,6 +1691,7 @@ export const layer: Layer.Layer<
           Stream.tap(({ event, accepted }) =>
             Effect.gen(function* () {
               if (!accepted) return;
+              yield* observeFirstToken(event);
               yield* observeNativeLifecycle(event);
               const rootTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
               if (event.type === "provider_turn.updated" && event.providerTurn.id === rootTurnId) {
@@ -1777,12 +1870,13 @@ export const layer: Layer.Layer<
             }),
           ),
           Stream.takeUntilEffect(() => shouldStopProviderEventIngestion),
-          Stream.interruptWhen(
+          Stream.runDrain,
+          // Interrupt a blocked write as well as a blocked event pull when cleanup expires.
+          Effect.raceFirst(
             Deferred.await(shutdownCleanupDeadline).pipe(
               Effect.flatMap((cause) => Effect.failCause(cause).pipe(Effect.delay("10 seconds"))),
             ),
           ),
-          Stream.runDrain,
           Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
           Effect.flatMap(() =>
             Effect.gen(function* () {
@@ -1837,6 +1931,9 @@ export const layer: Layer.Layer<
                     activeAttemptId: input.attempt.id,
                     expectedStatus: "running",
                   },
+                  ...(input.loadRunInterruptReason === undefined
+                    ? {}
+                    : { loadRunInterruptReason: input.loadRunInterruptReason }),
                   openRunOwnedSubagents: openSubagents,
                   terminal: makeFailedTerminalEvent(
                     makeProviderFailure({
@@ -2088,6 +2185,9 @@ export const layer: Layer.Layer<
                                 activeAttemptId: input.attempt.id,
                                 expectedStatus: "running",
                               },
+                              ...(input.loadRunInterruptReason === undefined
+                                ? {}
+                                : { loadRunInterruptReason: input.loadRunInterruptReason }),
                               openRunOwnedSubagents: openSubagents,
                               terminal: makeFailedTerminalEvent(
                                 makeProviderFailure({
@@ -2126,6 +2226,7 @@ export function makeInterruptResultTurnItem(input: {
   readonly rootNode: OrchestrationV2ExecutionNode;
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly completedAt: DateTime.Utc;
+  readonly reason?: string | undefined;
 }): OrchestrationV2TurnItem {
   return {
     id: input.idAllocator.derive.runSignalTurnItem({
@@ -2149,6 +2250,6 @@ export function makeInterruptResultTurnItem(input: {
     completedAt: input.completedAt,
     updatedAt: input.completedAt,
     type: "run_interrupt_result",
-    message: "Run interrupted by user",
+    message: input.reason === undefined ? "Run interrupted" : `Run interrupted: ${input.reason}`,
   };
 }

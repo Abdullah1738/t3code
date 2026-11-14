@@ -163,7 +163,9 @@ export const layerExecutor: Layer.Layer<
                       })
                     : threads.recoverDelegatedTask(effect.threadId, sourceRunId),
               }),
-              Effect.ensuring(finishDispatch),
+              Effect.onExit((exit) =>
+                Exit.isFailure(exit) ? pacing.release(source) : finishDispatch,
+              ),
               Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
               Effect.provideService(ServerSettings.ServerSettingsService, settings),
               Effect.tapError((cause) =>
@@ -258,6 +260,14 @@ export const layerExecutor: Layer.Layer<
                     });
                   }),
               }),
+              Effect.onExit((exit) =>
+                pacing.releaseRun(
+                  effect.threadId,
+                  startRequest.runId,
+                  effect.id,
+                  Exit.isFailure(exit),
+                ),
+              ),
               Effect.delay(Duration.millis(effect.request.retryDelayMs ?? 0)),
               Effect.mapError((cause) =>
                 isOrchestrationEffectExecutionError(cause)
@@ -330,6 +340,36 @@ export const layerExecutor: Layer.Layer<
                         providerTurnId: request.providerTurnId,
                       }),
                 ),
+                Effect.tap(() =>
+                  Effect.gen(function* () {
+                    if (request.stopThroughRunOrdinal === undefined) return;
+                    yield* providerSessions.stopBackgroundWork({
+                      threadId: effect.threadId,
+                      throughRunOrdinal: request.stopThroughRunOrdinal,
+                      ...(request.stopRunAttempts === undefined
+                        ? {}
+                        : { runAttempts: request.stopRunAttempts }),
+                      onlyIfCancelled: false,
+                    });
+                    const stopped = yield* projections.getThreadRecords(effect.threadId, [
+                      "providerThreads",
+                    ]);
+                    if (
+                      stopped.providerThreads.some(
+                        (thread) =>
+                          thread.id === request.providerThreadId && thread.driver === "claudeAgent",
+                      ) &&
+                      !(yield* providerSessions.isLive(request.providerSessionId))
+                    )
+                      yield* threads.dispatch({
+                        type: "thread.background-work.settle",
+                        commandId: CommandId.make(`${effect.id}:background-work-released`),
+                        threadId: effect.threadId,
+                        providerThreadId: request.providerThreadId,
+                        providerTurnId: request.providerTurnId,
+                      });
+                  }),
+                ),
                 Effect.mapError(
                   (cause) =>
                     new OrchestrationEffectExecutionError({
@@ -339,6 +379,34 @@ export const layerExecutor: Layer.Layer<
                     }),
                 ),
               );
+          }
+          case "provider-session.stop-background-work": {
+            const request = effect.request;
+            return Effect.gen(function* () {
+              yield* providerSessions.stopBackgroundWork({
+                threadId: effect.threadId,
+                ...request,
+              });
+              for (const target of request.backgroundThreads) {
+                if (yield* providerSessions.isLive(target.providerSessionId)) continue;
+                yield* threads.dispatch({
+                  type: "thread.background-work.settle",
+                  commandId: CommandId.make(`${effect.id}:settle:${target.providerThreadId}`),
+                  threadId: effect.threadId,
+                  providerThreadId: target.providerThreadId,
+                  providerTurnId: target.providerTurnId,
+                });
+              }
+            }).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationEffectExecutionError({
+                    effectId: effect.id,
+                    effectType: effect.request.type,
+                    cause,
+                  }),
+              ),
+            );
           }
           case "provider-turn.steer": {
             const request = effect.request;

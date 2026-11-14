@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import shlex
 import subprocess
@@ -16,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import api, capacity, lease, ssh_sync
+from . import api, base_catalog, capacity, common, lease, ssh_sync
 from .identity import require_proven
 from .common import (BASES_SOFT_LIMIT, DATA_KEEP_S, DEFAULT_OWNER, RUN_TTL_S, TEMPLATES, TEMPLATES_DIR, OffboxError,
                      ago, db, event, file_lock, iso, iso_ts, kv_get, kv_set, mine, new_id, now, owner_scoped, say,
@@ -252,7 +253,7 @@ def _add_status(rows: list[dict]) -> None:
             # Not ours to ask about: to our token the box does not exist, which would read as GONE.
             r["status"], r["data_until"] = "other", None
             continue
-        if not r["saved"] and not r["expired_at"]:
+        if not r["saved"] and r["expired_at"] is None:
             if failed is None:
                 try:
                     box = api.get(r["box_id"])
@@ -283,10 +284,12 @@ def keep_status(row, box) -> tuple[str, float | None]:
     """-> (saved | box | expired | gone | unknown, epoch boat deletes/deleted the data or None)."""
     if row["saved"]:
         return "saved", None
+    if row["expired_at"] is not None:
+        return "expired", row["expired_at"]
     if isinstance(box, str):
         return "unknown", None
-    if row["expired_at"] or (box and box.get("dataExpiredAt")):
-        return "expired", row["expired_at"] or iso_ts(box.get("dataExpiredAt"))
+    if box and box.get("dataExpiredAt"):
+        return "expired", iso_ts(box.get("dataExpiredAt"))
     if box is None:
         return "gone", None
     if box.get("state") in api.STOPPED_STATES and box.get("stoppedAt"):
@@ -303,10 +306,50 @@ def _status_text(st: str, until: float | None, fix: str) -> str:
             "unknown": "status unknown (boat API failed)"}[st]
 
 
-def list_bases(as_json: bool) -> None:
-    con = db()
-    rows = [dict(r) for r in con.execute("SELECT * FROM bases ORDER BY repo_key, is_default DESC, created_at DESC")]
-    _add_status(rows)
+def _local_base_rows(include_expired: bool) -> list[dict]:
+    rows = base_catalog.rows(common.backend(), include_expired=include_expired, include_other_owners=True)
+    with api.budget(10):
+        _add_status(rows)
+    return [{**r, "backend": base_catalog.backend_label(common.backend())} for r in rows
+            if include_expired or r["status"] != "expired"]
+
+
+def _other_base_rows(include_expired: bool) -> list[dict]:
+    other = "boat" if common.backend() == "server" else "server"
+    cached = base_catalog.rows(other, include_expired=include_expired, include_other_owners=True)
+    if not cached or (other == "boat" and common.person()):
+        return []
+    # API and credentials are fixed at import. Status probes must run in that backend's own process.
+    env = dict(os.environ, OFFBOX_BACKEND=other, OFFBOX_BASES_CHILD="1")
+    try:
+        result = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / "offbox.py"),
+                                 "bases", "--json", *(["--all"] if include_expired else [])],
+                                env=env, capture_output=True, text=True, timeout=15)
+        if result.returncode:
+            raise ValueError(f"listing exited {result.returncode}")
+        rows = json.loads(result.stdout)
+        required = {"name", "repo_key", "created_at", "is_default", "backend", "status", "data_until",
+                    "box_id", "size", "size_bytes", "note"}
+        if not isinstance(rows, list) or not all(isinstance(r, dict) and required <= r.keys() for r in rows):
+            raise ValueError("invalid base listing")
+        return rows
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        say(f"could not check {base_catalog.backend_label(other)} base status ({error}); showing saved metadata")
+        rows = []
+        for r in cached:
+            who = r.get("token_owner") or DEFAULT_OWNER
+            status, until = keep_status(r, "status not checked")
+            if other == "server" and who != token_owner():
+                status, until = "other", None
+            rows.append({**r, "backend": base_catalog.backend_label(other), "status": status, "data_until": until})
+        return rows
+
+
+def list_bases(as_json: bool, *, include_expired: bool = False) -> None:
+    rows = _local_base_rows(include_expired)
+    if not os.environ.get("OFFBOX_BASES_CHILD"):
+        rows += _other_base_rows(include_expired)
+    rows.sort(key=lambda r: (r["repo_key"], -bool(r["is_default"]), -(r["created_at"] or 0), r["backend"]))
     if as_json:
         print(json.dumps(rows, indent=1))
         return
@@ -317,7 +360,7 @@ def list_bases(as_json: bool) -> None:
         fix = f"`offbox base rm {r['name']}` and save again"
         print(f"{r['name']:<40} {'*default' if r['is_default'] else '':<9} {r['box_id']:<12} {r['size'] or '':<8} "
               f"{sz:<7} {ago(r['created_at']):>6} ago  {_status_text(r['status'], r['data_until'], fix)}"
-              f"{'  ' + r['note'] if r['note'] else ''}")
+              f"{'  ' + r['note'] if r['note'] else ''}  {r['backend']}")
 
 
 def rm_base(me: dict, name: str) -> None:

@@ -52,11 +52,11 @@ if [[ "$mode" == check ]]; then
 fi
 
 # Refuse to install a copy that fails its own tests.
-(cd "$pkg" && "$py" -m unittest discover -s tests >/dev/null)
+/bin/sh "$pkg/test.sh" "$py"
 
 mkdir -p "$dst" "$HOME/.robob/harness-cli/logs"
-rsync -a --itemize-changes \
-  --exclude __pycache__ --exclude tests --exclude README.md --exclude install.zsh \
+rsync --copy-unsafe-links -a --itemize-changes \
+  --exclude __pycache__ --exclude tests --exclude README.md --exclude install.zsh --exclude test.sh \
   --exclude launchd --exclude '*.bak*' \
   "$pkg/" "$dst/"
 

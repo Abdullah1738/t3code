@@ -30,6 +30,15 @@ MaxStartups 64:30:128
 C
 systemctl enable ssh >/dev/null 2>&1 || true
 
+# Kept outside openssh-server's conffiles and guest sshd includes.
+install -m 0644 /root/offbox-mgmt-ssh.service /etc/systemd/system/offbox-mgmt-ssh.service
+install -m 0600 /root/offbox_mgmt_sshd_config /etc/ssh/offbox_mgmt_sshd_config
+install -d /etc/systemd/system/ssh.service.d
+install -m 0644 /root/offbox-ssh-runtime.conf /etc/systemd/system/ssh.service.d/10-offbox-runtime.conf
+systemctl daemon-reload
+systemctl enable offbox-mgmt-ssh.service
+rm -f /root/offbox-mgmt-ssh.service /root/offbox_mgmt_sshd_config /root/offbox-ssh-runtime.conf
+
 # Docker CE.
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc

@@ -51,6 +51,16 @@ afterEach(async () => {
   }
 });
 
+test.each(["0.1", "9"])("timeout clears the previous source summary at load %s", async (load) => {
+  const f = fixture({ ROBOB_WATCH_LOAD_OVERRIDE: load });
+  f.add("stale-source");
+  f.save("stale-source", { ...f.state("stale-source"), last_error: 'source failure: {"outlook":"timeout"}', last_error_sources: ["outlook"] });
+  await f.run("stale-source", s => load === "9" ? s.load_timeouts === 1 : s.consecutive_failures === 1 && !s.failure_alerted);
+  expect(f.state("stale-source").last_error_sources).toBeUndefined();
+  expect(f.state("stale-source").last_error).toContain("timed out");
+  expect(f.calls()).toHaveLength(0);
+});
+
 test("a: per-watcher timeout overrides the default and reports the actual timeout", async () => {
   const f = fixture(); f.add("short", { timeout_s: 1 }); f.add("long", { timeout_s: 5 });
   const child = f.start(); await until(() => f.state("short").consecutive_failures === 1 && existsSync(f.path("long", ".run-ok"))); await f.stop(child);

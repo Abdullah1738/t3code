@@ -169,6 +169,7 @@ const layerProviderAuthServiceProvided = ProviderAuthService.layer.pipe(
 const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
+      KanbanStore.layer,
       McpAppModelContext.layer,
       PreviewAgentActivity.layer,
       layerCheckpointServiceProvided,

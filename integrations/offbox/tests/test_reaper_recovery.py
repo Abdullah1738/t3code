@@ -6,9 +6,12 @@ import sys
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skill/scripts'
-sys.path[:0] = [str(SCRIPTS), str(SCRIPTS / 'tests')]
+sys.path.insert(0, str(SCRIPTS))
 from offbox_lib import api, common, lease, misc, reap, runs
-from test_capacity import Isolated
+if __package__:
+    from .client_fixtures import Isolated
+else:
+    from client_fixtures import Isolated
 
 
 RESULTS = [('done', 0), ('failed', 17), ('local_error', 96), ('killed', 130), ('infra', 90), ('busy', 92)]
@@ -77,7 +80,8 @@ class ReaperRecovery(Isolated):
                         if reader == 'wait':
                             self.assertEqual(misc.wait(rid, None), code)
                         elif reader == 'logs':
-                            self.assertEqual(misc.logs(rid, False), 0)
+                            # #84 s8: no box/process means killed while queued, even after saved-state repair.
+                            self.assertEqual(misc.logs(rid, False), 130 if status == 'killed' else 0)
                         else:
                             with patch.object(api, 'list_boxes', return_value=[]):
                                 reap._reap(self.con, False, [])

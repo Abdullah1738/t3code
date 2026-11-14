@@ -10,6 +10,24 @@ import { loadCommandPayload, MAX_FILE_BYTES, parseCommand } from "../src/cli.ts"
 const sendFile = ["send-file", "--file", "/nonexistent/report.pdf", "--key", "file-1", "--session", "session-1"];
 
 describe("parseCommand", () => {
+  test("messages reads recent, earlier, or individual messages", () => {
+    expect(parseCommand(["messages", "--session", "ses_1"])).toEqual({ method: "POST", path: "/messages", body: { sessionId: "ses_1" } });
+    expect(parseCommand(["messages", "--session", "ses_1", "--chat", "moni", "--limit", "5", "--before", "X"]).body)
+      .toEqual({ sessionId: "ses_1", chat: "moni", limit: 5, before: "X" });
+    expect(parseCommand(["messages", "--session", "ses_1", "--id", "X"]).body).toEqual({ sessionId: "ses_1", id: "X" });
+    expect(() => parseCommand(["messages"])).toThrow("--session");
+    expect(() => parseCommand(["messages", "--session", "ses_1", "--id", "X", "--before", "Y"])).toThrow("--id and --before");
+    for (const limit of ["0", "101", "abc", "1.5", "-1", "1e2", " 2", "1000"]) {
+      expect(() => parseCommand(["messages", "--session", "ses_1", `--limit=${limit}`])).toThrow("--limit must be 1 to 100");
+    }
+    for (const limit of ["1", "100", "005"]) expect(parseCommand(["messages", "--session", "ses_1", "--limit", limit]).body?.limit).toBe(Number(limit));
+    for (const key of ["id", "before"]) {
+      for (const value of ["", " ", "x".repeat(201), "x\ny", "x\x00y", "x\x7fy", "x\x85y"]) {
+        expect(() => parseCommand(["messages", "--session", "ses_1", `--${key}`, value])).toThrow(`Invalid --${key}`);
+      }
+      expect(parseCommand(["messages", "--session", "ses_1", `--${key}`, "x".repeat(200)]).body?.[key]).toBe("x".repeat(200));
+    }
+  });
   test("parses health without a body", () => {
     expect(parseCommand(["health"])).toEqual({ method: "GET", path: "/health" });
   });
@@ -317,7 +335,7 @@ describe("local file payloads (temporary fixtures only)", () => {
         if (outcome === "invalid-ack") { status = 200; reply = { id: "PRIVATE_ID", created: true }; }
         if (outcome === "control-ack") { status = 200; reply = { id: id + "\n", created: true }; }
         const child = Bun.spawn([process.execPath, "run", cli, "send-file", `--file=${path}`, "--key=k", "--session=s", "--text=Caption"], {
-          env: { HOME: home, SPECTRUM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe",
+          env: { NODE_ENV: "test", TOOLLOG_DIR: process.env.TOOLLOG_DIR, HOME: home, SPECTRUM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe",
         });
         const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
         expect(exitCode).toBe(outcome === "accepted" ? 0 : 1);
@@ -347,7 +365,7 @@ describe("CLI entry point (no live socket)", () => {
     { args: ["health"], socket: `${cli}/missing-private-socket`, error: "Bridge socket is unavailable" },
   ] as { args: string[]; socket: string; error: string }[])("emits only sanitized JSON for %j", async ({ args, socket, error }) => {
     const child = Bun.spawn([process.execPath, "run", cli, ...args], {
-      env: { SPECTRUM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe",
+      env: { NODE_ENV: "test", TOOLLOG_DIR: process.env.TOOLLOG_DIR, SPECTRUM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe",
     });
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
@@ -368,4 +386,36 @@ describe("guest-allow", () => {
     expect(() => parseCommand(["guest-allow", "--address", "+447700900123", "--name", "A", "--purpose", "p", "--fact", "nokey", "--evidence", "msgs:1", "--session", "ses_1"])).toThrow();
     expect(() => parseCommand(["guest-allow", "--address", "+447700900123", "--name", "A", "--purpose", "p", "--session", "ses_1"])).toThrow();
   });
+});
+
+test("log-rollup is local, validates UTC dates and rolls up fixture input", async () => {
+  const { parseLocalCommand, runLocalCommand, isLocalCommand } = await import("../src/cli.ts");
+  const { captureLogs } = await import("./log-fixture.ts");
+  const { toolLog } = await import("../src/toollog.ts");
+  expect(isLocalCommand(["log-rollup"])).toBe(true);
+  for (const day of ["../x", "2026-02-30", "2026-11-13T12:00Z", "13-11-2026", ""]) expect(() => parseLocalCommand(["log-rollup", "--day", day])).toThrow();
+  await captureLogs(async () => {
+    toolLog.write({ component: "cli-fixture", kind: "event", name: "msg.received" });
+    const day = new Date().toISOString().slice(0, 10);
+    expect(await runLocalCommand(parseLocalCommand(["log-rollup", "--day", day]))).toMatchObject({ total: 1, day });
+    for (const kind of ["quick", "delivery", "ride", "nutrition"]) {
+      await runLocalCommand(parseLocalCommand(["log-card-render", "--kind", kind, "--ms", "1.5", "--ok", "true"]));
+    }
+  });
+  for (const ms of ["-1", "NaN", "Infinity", ""]) expect(() => parseLocalCommand(["log-card-render", "--kind", "quick", "--ms", ms, "--ok", "true"])).toThrow();
+});
+
+test("nutrition's live-only renderer is observed at file preparation, on success and failure", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const root = await fs.mkdtemp(join(os.tmpdir(), "nutrition-log-fixture-"));
+  try {
+    const path = join(root, "nutrition.png");
+    await fs.writeFile(path, "PRIVATE_HEALTH_IMAGE");
+    const logs = await captureLogs(async () => {
+      await loadCommandPayload(parseCommand(["send-file", "--file", path, "--session", "fixture-session", "--key", "nutrition-fixture"]));
+      await expect(loadCommandPayload(parseCommand(["send-file", "--file", join(root, "nutrition-missing.png"), "--session", "fixture-session", "--key", "missing-fixture"]))).rejects.toThrow();
+    });
+    expect(logs.filter(l => l.name === "card.render").map(l => [l.component, l.ok, l.props?.cardKind])).toEqual([["card-file", true, "nutrition"], ["card-file", false, "nutrition"]]);
+    expect(JSON.stringify(logs)).not.toContain("PRIVATE_HEALTH_IMAGE");
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
 });

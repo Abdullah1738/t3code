@@ -1,4 +1,5 @@
 import { toolLog, toolError } from "./toollog.ts";
+import { StderrCause, stderrCause } from "./cause.ts";
 import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -29,6 +30,8 @@ export const CHECK_TIMEOUT_MS = Number(process.env.ROBOB_WATCH_CHECK_TIMEOUT_MS 
 /** After SIGKILL, stop waiting for the process to report exit (a throttled process can take minutes to be reaped). */
 export const KILL_GRACE_MS = 5_000;
 export const FAILURE_ALERT_AFTER = 5;
+/** One failed tick that recovers is noise; the second in a row notifies. */
+export const FAILURE_NOTICE_AFTER = 2;
 /** Timeouts are transient (load spikes): no alert until the watcher has been failing at least this long. */
 export const TIMEOUT_ALERT_AFTER_MS = 10 * 60_000;
 /** Timeouts retry at most this far apart, so a watcher catches up soon after a load spike. */
@@ -76,6 +79,8 @@ export type Watcher = {
   id: string;
   title: string;
   check: string;
+  /** Side-effect-only check after a committed run or while delivery is pending; it must not consume ordinary events. */
+  pending_check?: string;
   interval_s: number;
   timeout_s?: number;
   mode: Mode;
@@ -88,6 +93,8 @@ export type Watcher = {
   paused: boolean;
   /** 0 keeps retrying with backoff; otherwise pause after this many failures (default 5). */
   max_consecutive_failures?: number;
+  /** Failures in a row before the per-run failure notice; default 2, 1 = every failure. */
+  failure_notice_after?: number;
   depends?: Dependency[];
   /** Opt-in: text the owner a short heads-up when a wake sits queued behind a busy turn. Off by default. */
   headsup?: boolean;
@@ -124,6 +131,8 @@ export type State = {
   load_timeout_since?: string;
   failure_paused_at?: string;
   last_error?: string;
+  /** Source names parsed before stderr is clipped for storage. */
+  last_error_sources?: string[];
   /** When the current run of consecutive failures started. */
   failing_since?: string;
   /** The agent was woken about the current run of failures (see shouldEscalate). */
@@ -131,7 +140,7 @@ export type State = {
   /** Wall time of the last check run, in ms. */
   last_run_ms?: number;
   /** An event whose delivery has not succeeded yet; retried verbatim with the same key. */
-  pending?: { key: string; event: string; at: string };
+  pending?: { key: string; event: string; at: string; healthRun?: string };
   last_delivery?: string;
   /** Delivered wakes whose bridge inbound row may still be queued behind a busy agent turn. */
   wakes?: TrackedWake[];
@@ -207,7 +216,12 @@ export const watcherDir = (id: string) => join(WATCHERS, id);
 export function triggerSig(watcher: Watcher): string | undefined {
   if (!watcher.triggers?.length) return undefined;
   return watcher.triggers.map(path => {
-    try { const st = statSync(path); return `${st.mtimeMs}:${st.size}`; } catch { toolError("runner", "watch.trigger_stat_failed"); return "missing"; }
+    try { const st = statSync(path); return `${st.mtimeMs}:${st.size}`; } catch (error) {
+      toolError("runner", "watch.trigger_stat_failed", { watcher: watcher.id }, {
+        errnoCode: (error as NodeJS.ErrnoException).code ?? "UNKNOWN", triggerKind: path.endsWith("-wal") ? "wal" : "file",
+      });
+      return "missing";
+    }
   }).join("|");
 }
 
@@ -227,6 +241,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (!validId(input.id)) errors.push("id must be 1-48 chars of a-z, 0-9, - (starting alphanumeric)");
   if (typeof input.title !== "string" || !input.title.trim() || input.title.length > 200 || /[\x00-\x1f]/.test(input.title)) errors.push("title must be one line, 1-200 chars");
   if (typeof input.check !== "string" || !input.check.trim()) errors.push("check command is required");
+  if (input.pending_check !== undefined && (typeof input.pending_check !== "string" || !input.pending_check.trim())) errors.push("pending_check must be a nonempty command");
   const interval = input.interval_s === undefined ? DEFAULT_INTERVAL : Number(input.interval_s);
   if (!Number.isInteger(interval) || interval < MIN_INTERVAL) errors.push(`interval_s must be an integer >= ${MIN_INTERVAL}`);
   const timeout = input.timeout_s;
@@ -249,6 +264,8 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (!Number.isInteger(maxFires) || maxFires < 0) errors.push("max_fires must be an integer >= 0 (0 = unlimited)");
   const maxFailures = input.max_consecutive_failures;
   if (maxFailures !== undefined && (!Number.isInteger(maxFailures) || maxFailures < 0)) errors.push("max_consecutive_failures must be an integer >= 0 (0 = never pause)");
+  const noticeAfter = input.failure_notice_after;
+  if (noticeAfter !== undefined && (!Number.isInteger(noticeAfter) || noticeAfter < 1)) errors.push("failure_notice_after must be an integer >= 1 (1 = every failure)");
   const depends = input.depends;
   if (depends !== undefined && !validDepends(depends)) errors.push('depends must be an array of "ssd" or "phone"');
   const quiet = input.quiet;
@@ -271,8 +288,10 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     // Only checks that drive the old whatscli TUI need the shared lock; whatsapp-new-message reads a DB now.
     max_fires: maxFires, serial: input.serial === true || /(^|[\s;|&(`$])wa\s+(tui|screen)\b/.test(input.check!),
     paused: input.paused === true,
+    ...(input.pending_check !== undefined ? { pending_check: input.pending_check } : {}),
     ...(timeout !== undefined ? { timeout_s: timeout } : {}),
     ...(maxFailures !== undefined ? { max_consecutive_failures: maxFailures } : {}),
+    ...(noticeAfter !== undefined ? { failure_notice_after: noticeAfter } : {}),
     ...(depends !== undefined ? { depends: [...new Set(depends)] } : {}),
     ...(triggers.length ? { triggers: (triggers as string[]).map(t => t.trim().replace(/^~(?=\/)/, HOME)) } : {}),
     ...(input.headsup === true ? { headsup: true } : {}),
@@ -322,7 +341,7 @@ export function log(id: string | null, message: string): void {
 
 export const clip = (text: string, max: number) => text.length <= max ? text : `${text.slice(0, max - 20)}\n...[truncated]`;
 
-export type CheckResult = { code: number | null; stdout: string; stderr: string; timedOut: boolean; ms: number };
+export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; timedOut: boolean; ms: number };
 
 /**
  * Runs a check in its own process group so a timeout kills everything it started. The result never waits more
@@ -337,32 +356,35 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    const cause = new StderrCause();
     let grace: ReturnType<typeof setTimeout> | undefined;
-    const finish = (code: number | null, extra = "") => {
+    const finish = (code: number | null, signal: NodeJS.Signals | null, extra = "") => {
       if (done) return;
       done = true;
       clearTimeout(timer);
       clearTimeout(grace);
       const ms = now() - started;
-      toolLog({ component: "helpers", kind: code === 0 && !timedOut ? "perf" : "error", name: "helper.run", durationMs: ms, ok: code === 0 && !timedOut, ids: { watcher: watcher.id, helper: watcher.id }, props: { exitCode: code }, ...(code === 0 && !timedOut ? {} : { error: { tag: timedOut ? "helper.timeout" : "helper.exit_failed" } }) });
-      resolve({ code, stdout, stderr: stderr + extra, timedOut, ms });
+      cause.add(extra);
+      toolLog({ component: "helpers", kind: code === 0 && !timedOut ? "perf" : "error", name: "helper.run", durationMs: ms, ok: code === 0 && !timedOut, ids: { watcher: watcher.id, helper: watcher.id }, props: { exitCode: code, signal, timedOut, ...(code === 0 && !timedOut ? {} : cause.props(timedOut)) }, ...(code === 0 && !timedOut ? {} : { error: { tag: timedOut ? "helper.timeout" : "helper.exit_failed" } }) });
+      resolve({ code, signal, stdout, stderr: stderr + extra, timedOut, ms });
     };
     const child = spawn(shell[0]!, shell.slice(1), {
       cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { HOME, PATH, ...(process.env.TOOLLOG_DIR ? { TOOLLOG_DIR: process.env.TOOLLOG_DIR } : {}), LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
+      env: { HOME, PATH, ...(process.env.TOOLLOG_DIR ? { TOOLLOG_DIR: process.env.TOOLLOG_DIR } : {}), ...(process.env.HEALTH_TOOLLOG_DIR ? { HEALTH_TOOLLOG_DIR: process.env.HEALTH_TOOLLOG_DIR } : {}), LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
     });
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
-    child.stderr!.on("data", chunk => { if (stderr.length < 20_000) stderr += chunk; });
+    child.stderr!.setEncoding("utf8");
+    child.stderr!.on("data", (chunk: string) => { cause.add(chunk); if (stderr.length < 20_000) stderr += chunk; });
     const timer = setTimeout(() => {
       timedOut = true;
       try { process.kill(-child.pid!, "SIGKILL"); } catch { toolError("runner", "watch.kill_failed", { watcher: watcher.id }); }
       grace = setTimeout(() => {
         try { child.stdout!.destroy(); child.stderr!.destroy(); child.unref(); } catch { toolError("runner", "watch.pipe_cleanup_failed", { watcher: watcher.id }); }
-        finish(child.exitCode, `\n[robob-watch] process group ${child.pid} not reaped ${KILL_GRACE_MS / 1000}s after SIGKILL`);
+        finish(child.exitCode, child.signalCode, `\n[robob-watch] process group ${child.pid} not reaped ${KILL_GRACE_MS / 1000}s after SIGKILL`);
       }, KILL_GRACE_MS);
     }, timeoutMs);
-    child.on("close", code => finish(code));
-    child.on("error", error => finish(127, String(error)));
+    child.on("close", (code, signal) => finish(code, signal));
+    child.on("error", error => finish(127, null, String(error)));
   });
 }
 
@@ -371,10 +393,10 @@ async function run(args: string[], timeoutMs = 20_000): Promise<{ ok: boolean; o
   try {
     const child = Bun.spawn(args, { env: { HOME, PATH, ...testEnv() }, stdout: "pipe", stderr: "pipe", timeout: timeoutMs, killSignal: "SIGKILL" });
     const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-    toolLog({ component: "helpers", kind: code === 0 ? "perf" : "error", name: "helper.run", durationMs: now() - started, ok: code === 0, ids: { helper: args[1]?.endsWith(".ts") ? args[1]!.split("/").at(-2) : args[0]?.split("/").at(-1) }, props: { exitCode: code }, ...(code === 0 ? {} : { error: { tag: "helper.exit_failed" } }) });
+    toolLog({ component: "helpers", kind: code === 0 ? "perf" : "error", name: "helper.run", durationMs: now() - started, ok: code === 0, ids: { helper: args[1]?.endsWith(".ts") ? args[1]!.split("/").at(-2) : args[0]?.split("/").at(-1) }, props: { exitCode: code, ...(code === 0 ? {} : stderrCause(stderr)) }, ...(code === 0 ? {} : { error: { tag: "helper.exit_failed" } }) });
     return { ok: code === 0, out: `${stdout}${stderr}`.trim().slice(0, 500) };
   } catch (error) {
-    toolLog({ component: "helpers", kind: "error", name: "helper.run", durationMs: now() - started, ok: false, error: { tag: "helper.spawn_failed" } });
+    toolLog({ component: "helpers", kind: "error", name: "helper.run", durationMs: now() - started, ok: false, props: stderrCause(error instanceof Error ? error.message : ""), error: { tag: "helper.spawn_failed" } });
     throw error;
   }
 }
@@ -422,7 +444,7 @@ const telegramCli = () => process.env.ROBOB_WATCH_TELEGRAM_CLI ?? join(HOME, ".l
 
 export function wake(source: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return Promise.resolve(refused("wake"));
-  return run([BUN, spectrumCli(), "wake", "--source", source.slice(0, 100), "--text", clip(text, MAX_WAKE), "--key", key]);
+  return run([BUN, spectrumCli(), "wake", `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--key=${key}`]);
 }
 
 /**
@@ -434,7 +456,7 @@ export async function wakeChat(chat: string, source: string, text: string, key: 
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("wake --chat");
   const session = await liveSession();
   if (!session) return { ok: false, out: "no live route session" };
-  return run([BUN, cli, "wake", "--chat", chat, "--source", source.slice(0, 100), "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
+  return run([BUN, cli, "wake", `--chat=${chat}`, `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
 }
 
 export async function imessage(text: string, key: string): Promise<{ ok: boolean; out: string }> {
@@ -443,12 +465,12 @@ export async function imessage(text: string, key: string): Promise<{ ok: boolean
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("imessage send");
   const session = await liveSession();
   if (!session) return { ok: false, out: "no live route session" };
-  return run([BUN, cli, "send", "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
+  return run([BUN, cli, "send", `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
 }
 
 export function telegram(source: string, text: string, key: string, severity = "info", burstKey?: string): Promise<{ ok: boolean; out: string }> {
   if (underTest() && !process.env.ROBOB_WATCH_TELEGRAM_CLI) return Promise.resolve(refused("telegram notify"));
-  return run([BUN, telegramCli(), "notify", "--source", telegramSource(source), "--severity", severity, "--text", clip(text, MAX_WAKE), "--key", key, ...(burstKey ? ["--burst-key", burstKey] : [])]);
+  return run([BUN, telegramCli(), "notify", `--source=${telegramSource(source)}`, `--severity=${severity}`, `--text=${clip(text, MAX_WAKE)}`, `--key=${key}`, ...(burstKey ? [`--burst-key=${burstKey}`] : [])]);
 }
 
 /** Env a check child gets: its own inputs plus, under a test run, the test markers and every stub override,
@@ -456,7 +478,7 @@ export function telegram(source: string, text: string, key: string, severity = "
 const TEST_ENV_KEYS = ["ROBOB_TEST", "NODE_ENV", "PYTEST_CURRENT_TEST", "WA_WACLI", "WA_DRAFT_DIR", "MAILSEND_HIMALAYA",
   "MAILSEND_DRAFT_DIR", "MAILSEND_SEND_APPROVAL", "RIDE_CARD_BRIDGE", "CONVO_CARD_BRIDGE", "ROBOB_WATCH_SPECTRUM_CLI",
   "ROBOB_WATCH_TELEGRAM_CLI", "WACLI_STORE_DIR", "SEND_APPROVAL_BRIDGE_DIR", "SEND_APPROVAL_STATE_DB",
-  "ROBOB_READONLY_DB", "MONEY_CASES_STATE_DB", "TOOLLOG_DIR", "ROBOB_HOME", "T3CODE_HOME", "XDG_DATA_HOME"];
+  "ROBOB_READONLY_DB", "MONEY_CASES_STATE_DB", "TOOLLOG_DIR", "HEALTH_TOOLLOG_DIR", "ROBOB_HOME", "T3CODE_HOME", "XDG_DATA_HOME"];
 export function testEnv(): Record<string, string> {
   const out: Record<string, string> = {};
   for (const k of TEST_ENV_KEYS) if (process.env[k] !== undefined) out[k] = process.env[k]!;
@@ -669,6 +691,11 @@ export async function alert(watcher: Watcher, text: string, key: string, severit
   return sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${notified.out} | ${sent.out}` };
 }
 
+export function shouldNotifyFailure(watcher: Watcher, state: State, timedOut: boolean, t = now()): boolean {
+  return state.consecutive_failures >= (watcher.failure_notice_after ?? FAILURE_NOTICE_AFTER)
+    && (!timedOut || t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS);
+}
+
 export function shouldPause(watcher: Watcher, state: State, timedOut: boolean, t = now()): boolean {
   const threshold = watcher.max_consecutive_failures ?? FAILURE_ALERT_AFTER;
   return threshold > 0 && state.consecutive_failures >= threshold
@@ -676,7 +703,7 @@ export function shouldPause(watcher: Watcher, state: State, timedOut: boolean, t
 }
 
 /**
- * A wake watcher that keeps failing is blind, and a Telegram alert alone went unanswered for 2.5h (4 Oct 2026,
+ * A Telegram alert alone went unanswered for 2.5h (4 Oct 2026,
  * wacli daemon booted out). After ESCALATE_AFTER_MS of failing, wake the agent (iMessage text as fallback) once
  * per failure run so it can repair the cause.
  */
@@ -689,7 +716,7 @@ export function shouldEscalate(watcher: Watcher, state: State, t = now()): boole
 
 export function escalationText(watcher: Watcher, state: State, mins: number): string {
   return [
-    `Watcher ${watcher.id} ("${watcher.title}") has been FAILING for ${mins} min (${state.consecutive_failures} runs) and is blind until fixed.`,
+    `Watcher ${watcher.id} ("${watcher.title}") has been FAILING for ${mins} min (${state.consecutive_failures} runs); ${failureSummary(state)}.`,
     ...(state.failure_paused_at ? ["It is paused and will not check again until resumed."] : []),
     `Last error: ${(state.last_error ?? "").slice(0, 500)}`,
     "",
@@ -701,6 +728,27 @@ export function escalationText(watcher: Watcher, state: State, mins: number): st
   ].join("\n");
 }
 
+export function failureSources(error = ""): string[] {
+  const object = error.match(/\{[\s\S]*\}/)?.[0];
+  if (object) {
+    try {
+      const parsed: unknown = JSON.parse(object);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const entries = Object.entries(parsed);
+        if (entries.length && entries.every(([source, value]) => source.trim() && typeof value === "string")) {
+          return entries.slice(0, 16).map(([source]) => source.trim().slice(0, 64));
+        }
+      }
+    } catch { /* Truncated or non-JSON stderr still gets a useful generic summary. */ }
+  }
+  return [];
+}
+
+function failureSummary(state: State): string {
+  const sources = state.last_error_sources ?? failureSources(state.last_error);
+  return sources.length ? `failing sources: ${sources.join(", ")}` : "its check is failing";
+}
+
 export async function escalate(watcher: Watcher, state: State, key: string): Promise<Delivery> {
   const started = now();
   let delivery: Delivery | undefined;
@@ -710,7 +758,7 @@ export async function escalate(watcher: Watcher, state: State, key: string): Pro
     const woke = await wake(`robob-watch ${watcher.id} failing`, text, key);
     if (woke.ok) delivery = { ok: true, via: "wake", detail: woke.out };
     else {
-      const sent = await imessage(`Watcher "${watcher.title}" has been failing for ${mins} min: ${(state.last_error ?? "").slice(0, 300)}`, key);
+      const sent = await imessage(`Watcher "${watcher.title}" has been failing for ${mins} min; ${failureSummary(state)}. Last error: ${(state.last_error ?? "").slice(0, 300)}`, key);
       delivery = sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
     }
     return delivery;

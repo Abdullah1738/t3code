@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import re
+import select
 import shlex
 import signal
 import sqlite3
@@ -16,12 +17,14 @@ import threading
 import traceback
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
-from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync
-from . import common, containers, prune, prepare, userns
+from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
+from . import command_usage, common, containers, prune, prepare, userns
+from . import resources
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
-                     offsets_path, person, read_json, say, silence, write)
+                     is_silenced, offsets_path, person, read_json, record_delivery, say, silence, write)
 
 
 def _source_stamp():
@@ -46,7 +49,13 @@ def _log_source_change(run_id):
     except Exception:
         pass
 
+
+
 BG_TTL_S = ORPHAN_RUN_MAX_S
+BACKGROUND_RUN_ENV = 'OFFBOX_BACKGROUND_RUN'
+_background_context = None
+BG_ENTRY = Path(__file__).resolve().parents[1] / 'offbox.py'
+BG_READY_TIMEOUT_S = 20
 RESTART_MARKER = Path(os.environ.get('T3CODE_HOME') or Path.home() / '.robob') / 'userdata/restarting'
 RESTART_MARKER_MAX_S = 300
 # cmd_start answers that prove boat refused the command (nothing ran). Other 4xx and network errors stay ambiguous.
@@ -296,9 +305,18 @@ def clickhouse_suite_warning(repo_key: str, size: str, cmd: str) -> str | None:
     return None
 
 
+GO_ARCHIVE_CURL_LIMITS = "--connect-timeout 20 --speed-limit 10240 --speed-time 60 --max-time 900"
+
 GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can overlap pooled runs.
 (
-  _offbox_fail() { echo "offbox: Go repair: $*" >&2; exit 97; }
+  _offbox_fail() {
+    if [ "${_offbox_needs_go:-1}" = 1 ]; then
+      echo "offbox: Go repair: $*" >&2
+    else
+      echo "offbox: Go repair failed ($*); continuing because this run doesn't use Go" >&2
+    fi
+    exit 97
+  }
   exec 9>/tmp/offbox-go-repair.lock || _offbox_fail 'cannot open repair lock'
   flock -x -w 300 9 || _offbox_fail 'cannot acquire repair lock within 300s'
   _offbox_stale=()
@@ -417,7 +435,7 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
     trap 'exit 97' HUP INT TERM
     sudo -n chown "$(id -u):$(id -g)" "$_offbox_stage" || _offbox_fail 'cannot prepare staging directory'
     echo "offbox: replacing $_offbox_reason $_offbox_version GOROOT from official archive" >&2
-    curl -fsSL --retry 3 "https://go.dev/dl/${_offbox_version}.linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" -o "$_offbox_stage/go.tgz" || _offbox_fail 'official archive download failed'
+    curl -fsSL --retry 3 @GO_ARCHIVE_CURL_LIMITS@ "https://go.dev/dl/${_offbox_version}.linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" -o "$_offbox_stage/go.tgz" || _offbox_fail 'official archive download failed'
     tar -xzf "$_offbox_stage/go.tgz" -C "$_offbox_stage" || _offbox_fail 'official archive extraction failed'
     _offbox_manifest=$(_offbox_inventory "$_offbox_stage/go") || _offbox_fail 'archive inventory failed'
     printf 'offbox-go-tree-v1 %s %s\n' "$_offbox_version" "$_offbox_manifest" > "$_offbox_stage/go/.offbox-manifest" || _offbox_fail 'cannot write official tree manifest'
@@ -439,7 +457,9 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
   for _offbox_dir in "${_offbox_stale[@]}"; do
     sudo -n rm -rf -- "$_offbox_dir" || _offbox_fail "cannot remove stale staging directory $_offbox_dir"
   done
-) || { echo offbox-setup-failed >&2; exit 97; }'''
+) || {
+  if [ "${_offbox_needs_go:-1}" = 1 ]; then echo offbox-setup-failed >&2; exit 97; fi
+}'''.replace('@GO_ARCHIVE_CURL_LIMITS@', GO_ARCHIVE_CURL_LIMITS)
 
 # boat.dev (28 Oct 2026) runs /usr/local/bin/sync-docker-firewall after dockerd starts (docker.service.d drop-in).
 # Boxes resumed from older snapshots can lack it, and systemd then kills dockerd (203/EXEC). Never fails the run.
@@ -688,13 +708,18 @@ def last_stage_is_grep(cmd: str) -> bool:
 
 def steps_block(steps: list[str]) -> str:
     """Each step runs in its own subshell with pipefail; a failing step does not stop the next one."""
-    lines = ["__offbox_first=0", "__offbox_completed=0",
+    lines = [run_evidence.shell(BOUNDED_PROCESS),
+             f'__offbox_evidence begin pid=$$ planned={len(steps)}',
+             "__offbox_first=0", "__offbox_completed=0", "__offbox_current=0",
              # A graceful early exit must not look like a fully completed step run.
              "trap '[ \"$__offbox_completed\" -eq " + str(len(steps)) + " ] || exit 90' EXIT",
-             "trap 'exit 90' HUP INT TERM"]
+             *[f"trap '__offbox_evidence signal={name} step=$__offbox_current; exit 90' {name}"
+               for name in ("HUP", "INT", "TERM")]]
     for n, step in enumerate(steps, 1):
         label = " ".join(step.split())[:60]
-        lines += ["(", "set -o pipefail", step, ")", "__offbox_rc=$?",
+        lines += [f'__offbox_current={n}', f'__offbox_evidence start step={n}',
+                  "(", "set -o pipefail", step, ")", "__offbox_rc=$?",
+                  f'__offbox_evidence end step={n} rc=$__offbox_rc',
                   f'echo "offbox step {n} rc=$__offbox_rc: "{shlex.quote(label)} >&2 || exit 90',
                   f'__offbox_completed={n}',
                   '[ "$__offbox_rc" -eq 0 ] || [ "$__offbox_first" -ne 0 ] || __offbox_first=$__offbox_rc']
@@ -793,26 +818,41 @@ def setup_failed(log_path: Path | None) -> bool:
 
 
 NO_NODE_MODULES_MARKER = "OFFBOX_NO_NODE_MODULES"
+DEPS_CONTEXT_MARKER = "offbox-missing-deps-context: "
 
 
-def missing_deps_hint(root: Path) -> str:
-    install = package_manager.install_command(root)
-    node = node_version.want(root, root)
-    requirement = (f" Use Node matching {node[1]}." if node else "") + package_manager.version_note(root)
+def missing_deps_hint(root: Path, *, cwd: Path | None = None, repo_root: Path | None = None) -> str:
+    target = node_tools.install_root(root, repo_root)
+    install = node_tools.install_from(root, cwd or root, repo_root)
+    node = node_version.want(repo_root or root, root)
+    requirement = (f" Use Node matching {node[1]}." if node else "") + package_manager.version_note(target)
     return ("no node_modules on this box yet (fresh or pruned box). Install deps and run the command in the same call: "
-            f"offbox run -- '{install} && <command>'; offbox save --default afterwards keeps them."
+            f"offbox run -- {shlex.quote(install + ' && <command>')}; offbox save --default afterwards keeps them."
             + requirement + " Check the repo's CI install flags and manager version before running.")
 
 
 def box_deps_hint(root: Path, log_path: Path | None) -> str:
     # Only the remote marker proves absence: the Mac's node_modules is never synced.
     try:
-        marked = bool(log_path) and NO_NODE_MODULES_MARKER in log_path.read_text(errors="replace").splitlines()
+        lines = log_path.read_text(errors="replace").splitlines() if log_path else []
+        marked = NO_NODE_MODULES_MARKER in lines
     except OSError:
         marked = False
     if not marked:
         return ""
-    return missing_deps_hint(root)
+    package, cwd = root, root
+    for line in lines:
+        if not line.startswith(DEPS_CONTEXT_MARKER):
+            continue
+        try:
+            package_rel, cwd_rel = json.loads(line[len(DEPS_CONTEXT_MARKER):])
+            candidate = (root / package_rel).resolve()
+            command_cwd = (root / cwd_rel).resolve()
+            if candidate.is_relative_to(root.resolve()) and command_cwd.is_relative_to(root.resolve()):
+                package, cwd = candidate, command_cwd
+        except (ValueError, TypeError, OSError):
+            pass
+    return missing_deps_hint(package, cwd=cwd, repo_root=root)
 
 
 def repo_setup_failed(code: int | None, log_path: Path | None) -> bool:
@@ -891,7 +931,7 @@ def scope_failed(log_path: Path | None) -> bool:
     return bool(lines) and all(SCOPE_FAILED.match(ln) for ln in lines)
 
 
-def exit_recording_command(script: str, run_id: str) -> str:
+def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = None) -> str:
     """Run the remote script under a parent shell that writes its exit code to ~/.offbox/exit/<run>.rc,
     so a run boat later reports as lost still has its real status on the box."""
     f = f'"$HOME/.offbox/exit/{run_id}.rc"'
@@ -900,17 +940,18 @@ def exit_recording_command(script: str, run_id: str) -> str:
         'mkdir -p "$HOME/.offbox/exit" || exit 1',
         f'printf "%s\\n" "$1" > {f}.tmp && mv -f {f}.tmp {f}',
         'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" -o -name "*.pid" '
-        '-o -name "*.containers.json" -o -name "*.containers.tmp" \\) -mtime +2 -delete',
+        '-o -name "*.trace" -o -name "*.containers.json" -o -name "*.containers.tmp" \\) -mtime +2 -delete',
     ])
     # Filesystem calls after the preamble are just as capable of wedging as restore's flock/load. The helper
     # owns no run output descriptors and is abandoned at its deadline even if its children cannot be killed.
     persist_block = ('python3 - "$__offbox_rc" <<\'OFFBOX_EXIT_RECORD\'\n' + BOUNDED_PROCESS
                      + f"\nbounded(['bash', '-c', {persist!r}, 'offbox-exit-record', sys.argv[1]], 2)\n"
                      + 'OFFBOX_EXIT_RECORD')
+    claim_id = claim_id or run_id
     marker = ('mkdir -p "$HOME/.offbox/claim" || exit 97; '
-              f'mkdir "$HOME/.offbox/claim/{run_id}" 2>/dev/null || exit 98; '
-              f'printf "%s\\n" "$1" > "$HOME/.offbox/claim/{run_id}/pid" || exit 97; '
-              f'date +%s > "$HOME/.offbox/claim/{run_id}/epoch" || exit 97; '
+              f'mkdir "$HOME/.offbox/claim/{claim_id}" 2>/dev/null || exit 98; '
+              f'printf "%s\\n" "$1" > "$HOME/.offbox/claim/{claim_id}/pid" || exit 97; '
+              f'date +%s > "$HOME/.offbox/claim/{claim_id}/epoch" || exit 97; '
               'mkdir -p "$HOME/.offbox/exit" && '
               f'printf "%s\\n" "$1" > "$HOME/.offbox/exit/{run_id}.pid"')
     # Pass the wrapper's PID: the supervised writer has a different PID and may outlive its deadline.
@@ -918,16 +959,28 @@ def exit_recording_command(script: str, run_id: str) -> str:
                     + f"\nrc, _ = bounded(['bash', '-c', {marker!r}, 'offbox-pid-record', sys.argv[1]], 2)\n"
                     + 'sys.exit(rc)\nOFFBOX_PID_RECORD')
     outer = "\n".join([
+        f'export OFFBOX_RUN_ID={shlex.quote(run_id)}',
+        run_evidence.shell(BOUNDED_PROCESS),
+        "__offbox_signal() {",
+        '__offbox_evidence "signal=$1"',
+        '__offbox_rc=$2',
+        persist_block,
+        'exit "$__offbox_rc"',
+        "}",
         marker_block,
         '__offbox_rc=$?',
         'if [ "$__offbox_rc" = 98 ]; then',
-        f'  rm -f "$HOME/.offbox/env/{run_id}.env"; echo offbox-claim-refused >&2; exit 98',
+        f'  rm -f "$HOME/.offbox/env/{claim_id}.env"; echo offbox-claim-refused >&2; exit 98',
         'fi',
         'if [ "$__offbox_rc" -ne 0 ]; then',
         '  echo "offbox-box-wedged: run marker setup failed or did not finish in 2s (exit directory/PID write)" >&2',
         '  __offbox_rc=97',
         'else',
+        # A duplicate/unconfirmed claimant must never write the owner's receipt from a signal handler.
+        *[f"trap '__offbox_signal {name} {code}' {name}"
+          for name, code in (("HUP", 129), ("INT", 130), ("TERM", 143))],
         '__offbox_t0=$(date +%s)',
+        '__offbox_evidence wrapper pid=$$',
         'bash -lc "$0"',
         '__offbox_rc=$?',
         'fi',
@@ -1243,16 +1296,43 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
 def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, run_id: str,
                   steps: list[str] | None = None, node: str = "", wait_images: bool = False,
                   image_wait: int = 180, repo_key: str = "", repo_root: Path | None = None,
-                  preserve_containers: str = 'private lease', box_id: str = "<box>") -> str:
+                  preserve_containers: str = 'private lease', box_id: str = "<box>",
+                  usage: command_usage.Usage | None = None) -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
+    if api.BACKEND == 'server':
+        try:
+            cmd = resources.wrap(cmd, BOUNDED_PROCESS)
+        except Exception:
+            pass
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
     root = '"$HOME"/' + shlex.quote(rdir)
-    deps_check = (f'__offbox_exit=$?; if [ "$__offbox_exit" -ne 0 ] && [ -f {root}/package.json ] '
-                  f'&& [ ! -e {root}/node_modules ]; then printf "\\n%s\\n" {NO_NODE_MODULES_MARKER} >&2; fi; '
+    usage = usage or command_usage.inspect(repo_root or Path.cwd(), rel, argv, steps)
+    packages = usage.packages
+    local_root = (repo_root or Path.cwd()).resolve()
+    missing = ' '.join(
+        f'{"if" if index == 0 else "elif"} '
+        f'[ -f {root}/{shlex.quote(str(package.relative_to(local_root)))}/package.json ] && '
+        f'[ ! -e {root}/{shlex.quote(str(package.relative_to(local_root)))}/node_modules ]; then '
+        f'__offbox_deps_context={shlex.quote(json.dumps([str(package.relative_to(local_root)), str(usage.cwd.relative_to(local_root))]))};'
+        for index, package in enumerate(packages))
+    missing = missing + ' fi' if packages else ':'
+    if usage.install:
+        advice = ('printf "\\n%s\\n" "offbox: command exited $__offbox_exit and node_modules is still missing; "'
+                  + shlex.quote(f"its own install step ({usage.install}) didn't run or didn't finish. The failing line is above.")
+                  + ' >&2')
+    else:
+        advice = (f'printf "\\n%s%s\\n%s\\n" {shlex.quote(DEPS_CONTEXT_MARKER)} '
+                  f'"$__offbox_deps_context" {NO_NODE_MODULES_MARKER} >&2')
+    deps_check = (f'__offbox_exit=$?; if [ "${{__offbox_command_started:-0}}" = 1 ] '
+                  f'&& [ "$__offbox_exit" -ne 0 ] && [ {int(usage.uses_js)} = 1 ] '
+                  f'&& [ -f {root}/package.json ] && [ ! -e {root}/node_modules ] '
+                  f'; then __offbox_deps_context=; {missing}; '
+                  f'if [ -n "$__offbox_deps_context" ]; then {advice}; fi; fi; '
                   'if [ -n "${__offbox_bash_env:-}" ]; then rm -f -- "$__offbox_bash_env"; fi; exit "$__offbox_exit"')
     lines = ["set -a", f'[ -f "{env_file}" ] && . "{env_file}"; rm -f "{env_file}"' if env_file else ":", "set +a",
              f'export OFFBOX_RUN_ID={run_id}',
+              '__offbox_command_started=0',
               'trap ' + shlex.quote(deps_check) + ' EXIT',
               userns.setup(api.BACKEND, box_id),
               DOCKER_REPAIR,
@@ -1264,7 +1344,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               containers.script(run_id, BOUNDED_PROCESS, preserve=preserve_containers),
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
               repo_setup_block(repo_key, rdir),
-              GO_REPAIR,
+              f"_offbox_needs_go={int(usage.needs_go)}\n{GO_REPAIR}",
               node,
               node_tools.block(rdir, repo_root),
               ('''for _offbox_tool in terraform aws ruby vector; do
@@ -1274,6 +1354,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
     exit 98
   }
 done''' if repo_key == "crpko-devops" else ':'),
+              '__offbox_command_started=1',
               f'echo "{COMMAND_STARTED_MARKER} {run_id}" >&2',
               # Keep caller cd/exit/traps inside a subshell so the root check always runs.
               "(\n" + cmd + "\n)"]
@@ -1283,7 +1364,7 @@ done''' if repo_key == "crpko-devops" else ':'),
 class Runner:
     def __init__(self, a, me: dict):
         self.a, self.me = a, me
-        self.run_id = new_id("run")
+        self.run_id = os.environ.get(BACKGROUND_RUN_ENV) or new_id("run")
         self.root = Path(me["repo_root"])
         self.cwd = Path(os.getcwd()).resolve()
         try:
@@ -1343,17 +1424,23 @@ class Runner:
                 con.close()
         db_retry(update)
 
-    def start(self) -> dict:
+    def register_pending(self) -> None:
+        if self.registered:
+            return
         a, me = self.a, self.me
         con = db()
-        self._log_pool(con)
+        existing = con.execute('SELECT client_pid,mode FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
+        if existing:
+            con.close()
+            if not a.bg or existing['mode'] != 'bg' or existing['client_pid'] != os.getpid():
+                raise OffboxError(f'{self.run_id}: queued run belongs to another client', code=EXIT_LOCAL)
+            self.registered = True
+            return
         steps = getattr(a, "steps", None) or []
         if steps:
             cmd_text = " ; ".join(steps)
         else:
             cmd_text = " ".join(shlex.quote(x) for x in a.cmd) if len(a.cmd) > 1 else a.cmd[0]
-        wait_images = needs_image_wait(cmd_text, me["repo_root"])
-        self.wait_images = wait_images
         # client_pid: `offbox wait` on a run still queued for a box can tell a live client from one that died.
         def register():
             with write(con):
@@ -1363,20 +1450,40 @@ class Runner:
                              cmd_text[:4000], "bg" if a.bg else "fg", now(), str(self.log_path),
                              json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid(), len(steps)))
                 con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_claim:{self.run_id}', '1'))
-        db_retry(register)
-        self.registered = True
-        if a.bg:
-            with log_lock(self.run_id):
-                self.log_path.parent.mkdir(parents=True, exist_ok=True)
-                self.log_path.touch()
-        say(f"pending run {self.run_id}; wait: offbox wait {self.run_id}; kill: offbox kill {self.run_id}")
-        event(con, None, "run_pending", self.run_id)
+        try:
+            db_retry(register)
+            self.registered = True
+            try:
+                save_run_state(self.run_id, resources=resources.unavailable(
+                    'not_started' if api.BACKEND == 'server' else 'boat'))
+            except Exception:
+                pass
+            if a.bg:
+                with log_lock(self.run_id):
+                    self.log_path.parent.mkdir(parents=True, exist_ok=True)
+                    self.log_path.touch()
+            say(f"pending run {self.run_id}; wait: offbox wait {self.run_id}; kill: offbox kill {self.run_id}")
+            event(con, None, "run_pending", self.run_id)
+        finally:
+            con.close()
+
+    def start(self) -> dict:
+        self.register_pending()
+        a, me = self.a, self.me
+        con = db()
+        self._log_pool(con)
+        self.require_pending(con)
+        steps = getattr(a, "steps", None) or []
+        cmd_text = " ; ".join(steps) if steps else (shlex.join(a.cmd) if len(a.cmd) > 1 else a.cmd[0])
+        self.wait_images = wait_images = needs_image_wait(cmd_text, me["repo_root"])
         t0 = now()
         size, why = lease.auto_size(con, cmd_text, me, a.size)
         if why:
             say(why)
         env, explicit = build_env(a.env or [])
-        env_file = f"/home/user/.offbox/env/{self.run_id}.env"
+        from . import start_check
+        claim = start_check.claim_id(con, self.run_id)
+        env_file = f"/home/user/.offbox/env/{claim}.env"
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()
         dead_attempts = 0
         replacement = None
@@ -1431,25 +1538,31 @@ class Runner:
                     self.record(box_id=None)  # finish must not assign an idle TTL to a fenced box
                 raise
         w = node_version.want(self.root, self.cwd)
-        node_block = node_version.block(w) if w else ""
+        node_block = node_version.block(w)
         pm = pnpm_version.want(self.root, self.cwd)
         if pm:
             node_block += "\n" + pnpm_version.block(pm)
-        new_checkout_hint(row, self.root)
+        usage = command_usage.inspect(self.root, self.rel, a.cmd, steps)
+        new_checkout_hint(row, self.root, usage)
         warning = clickhouse_suite_warning(me['repo_key'], row['size'], cmd_text)
         if warning:
             say(warning)
         script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
                                node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
                                repo_key=me["repo_key"], repo_root=self.root,
-                               preserve_containers=containers.preserve_reason(con, row), box_id=self.box)
+                               preserve_containers=containers.preserve_reason(con, row), box_id=self.box, usage=usage)
         con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', ('containers_expected:' + self.run_id, '1'))
         con.commit()
-        from . import start_check
+        self.require_pending(con)
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:
-            r = api.cmd_start(self.box, exit_recording_command(script, self.run_id),
+            save_run_state(self.run_id, resources=resources.unavailable(
+                'pending' if api.BACKEND == 'server' else 'boat'))
+        except Exception:
+            pass
+        try:
+            r = api.cmd_start(self.box, exit_recording_command(script, self.run_id, claim_id=claim),
                               meta={"repo": me.get("repo_key"), "kind": run_kind(cmd_text), "run_id": self.run_id},
                               retry_interrupted=retry_interrupted(a))
         except (api.ApiError, api.NetworkError) as e:
@@ -1513,6 +1626,11 @@ class Runner:
             state_warning(self.run_id, None, error)
         return row
 
+    def require_pending(self, con) -> None:
+        row = con.execute('SELECT status FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
+        if not row or row['status'] != 'starting':
+            raise OffboxError(f'{self.run_id}: settled before the command started; nothing ran', code=130)
+
     def _prepare_box(self, con, a, rdir, env_file, body) -> dict | None:
         """Everything before the command starts. Raises lease.DeadMount when the box's filesystem is dead."""
         with prepare.guard(self.box, self.lease_row.get('_prepare_end')):
@@ -1535,6 +1653,8 @@ class Runner:
                         resumed = lease._reuse(con, row, row['size'])
                         if resumed is None:
                             raise OffboxError(f"lease {self.box} is no longer available")
+                    except common.SshHostKeyMismatch:
+                        raise
                     except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
                         raise OffboxError(f"{e}; box stopped during push: {self.box}") from e
                     log(f"push_box_stopped_resumed {self.box}")
@@ -1587,9 +1707,15 @@ class Runner:
         err: list = []
         left = api.left()
         upload_timeout = 120 if left is None else max(.001, min(120, left))
-        tw = threading.Thread(target=_safe,
-                              args=(err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout), daemon=True)
-        tw.start()
+        upload = (err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout)
+        tw = None
+        home = api.BACKEND == "server"
+        if home:
+            # A terminal identity failure must reach this thread before bulk sync can retry or hit its deadline.
+            _safe(*upload, terminal_identity=True)
+        else:
+            tw = threading.Thread(target=_safe, args=upload, daemon=True)
+            tw.start()
         push_exc = None
         try:
             if not a.no_sync:
@@ -1599,7 +1725,9 @@ class Runner:
                                        seed_candidates=candidates, run_id=self.run_id)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
-                    f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
+                    f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s; "
+                    f"verified {st.get('verified', 0)} tracked files"
+                    f"{', repaired ' + str(st['repaired']) if st.get('repaired') else ''})")
                 note = ssh_sync.tracked_ignored_note(st)
                 if note:
                     say(note)
@@ -1607,17 +1735,26 @@ class Runner:
                 if skipped:
                     say(f"not synced (secret filter) though tracked by git: {', '.join(skipped[:5])}"
                         f"{' ...' if len(skipped) > 5 else ''}. If tests need them: --include <path>")
+        except common.SshHostKeyMismatch:
+            raise
         except Exception as e:  # noqa: BLE001 - held until the env upload has finished, then re-raised
             push_exc = e
         finally:
-            left = api.left()
-            tw.join(timeout=max(0, left) if left is not None else None)
+            if tw is not None:
+                left = api.left()
+                tw.join(timeout=max(0, left) if left is not None else None)
+        # Identity failures take precedence over transfer recovery, even if the other transfer saw a dead mount.
+        for e in (push_exc, err[0] if err else None):
+            if isinstance(e, common.SshHostKeyMismatch):
+                raise e
         if not a.no_sync and push_exc is None and err and not ssh_sync.dead_mount(str(err[0])):
             # Resetting SSH can interrupt the parallel upload even when the file push recovers.
             err.clear()
             left = api.left()
             upload_timeout = 120 if left is None else max(.001, min(120, left))
-            _safe(err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout)
+            _safe(err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout, terminal_identity=home)
+            if err and isinstance(err[0], common.SshHostKeyMismatch):
+                raise err[0]
         # A dead mount may have failed either transfer; prefer that over an ordinary error from the other.
         for e in (push_exc, err[0] if err else None):
             reason = ssh_sync.dead_mount(str(e)) if e is not None else None
@@ -1672,10 +1809,12 @@ def _seed_candidates(con, box_id: str, current: str, repo_key: str) -> list[str]
     return out
 
 
-def _safe(err: list, fn, *args):
+def _safe(err: list, fn, *args, terminal_identity=False):
     try:
         fn(*args)
     except Exception as e:  # noqa: BLE001
+        if terminal_identity and isinstance(e, common.SshHostKeyMismatch):
+            raise
         err.append(e if isinstance(e, OffboxError) else OffboxError(f"{type(e).__name__}: {e}"))
 
 
@@ -1743,6 +1882,8 @@ def _echo(stream, b: bytes) -> bool:
     """Echo a chunk to the caller. Any failure to write there stops the echo only; the log keeps the output. Not just a
     closed pipe: a redirect to a file on a volume that went away fails with EIO (31 Oct, run-1031-140118-88ca), and
     letting that reach follow()'s stream retry replayed the same chunk forever."""
+    if is_silenced(stream):
+        return False
     try:
         stream.buffer.write(b)
         stream.flush()
@@ -1938,6 +2079,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
     # append (never truncated) so that prefix survives, and its checkpoint starts at the length it already holds.
     target = replay_path or log_path
     lf = open(target, "ab") if target else None
+    delivered = 0
     # A takeover also mirrors every committed chunk into the original log (`mirror_path`), so a lock-blocked
     # `logs --follow` sees the new output while the owner runs. The mirror is opened for append, never truncated.
     # Never truncated: the original keeps its committed prefix, and readers only trust bytes up to its checkpoint.
@@ -2082,6 +2224,8 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                             lf.flush()
                             # Commit after the flush: a holder dying in between leaves this chunk past logBytes.
                             _commit(target, out_off, err_off, lf.tell())
+                            if echo:
+                                delivered = lf.tell()
                             if mf:
                                 mf.write(b)
                                 mf.flush()
@@ -2198,13 +2342,17 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
             lf.close()
         if mf:
             mf.close()
+        if delivered and log_path:
+            record_delivery(mirror_path or log_path, delivered)
 
 
-def new_checkout_hint(row: dict, root: Path) -> None:
-    if not row.get("_new_checkout") or not (root / "package.json").exists():
+def new_checkout_hint(row: dict, root: Path, usage: command_usage.Usage) -> None:
+    if (not row.get("_new_checkout") or not (root / "package.json").exists()
+            or not usage.uses_js or not usage.packages or usage.install):
         return
-    install = package_manager.install_command(root)
-    say(f"node_modules missing on new box {row['box_id']}; prefix your command with {install} &&" + package_manager.version_note(root))
+    target = node_tools.install_root(usage.packages[0], root)
+    install = node_tools.install_from(usage.packages[0], usage.cwd, root)
+    say(f"node_modules missing on new box {row['box_id']}; prefix your command with {install} &&" + package_manager.version_note(target))
 
 
 def do_pulls(box_id: str, row: dict, pulls: list[str], *, until: float | None = None) -> None:
@@ -2388,6 +2536,7 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
     if log_row is not None:
         emit_terminal(log_row)
     if not r["box_id"] or not bookkeeping:
+        resources.finalize(r)
         return code
     # No transaction is open while Docker/TTL calls reach the box or boat.
     con = None
@@ -2410,12 +2559,194 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
     finally:
         if con:
             con.close()
+    resources.finalize(r)
     return code
 
 
 def run_remote(a, me: dict) -> int:
+    if a.bg and not os.environ.get(BACKGROUND_RUN_ENV):
+        return _background(a, me)
     with prepare.attempts():
         return _run_prepared(a, me)
+
+
+def _background(a, me: dict) -> int:
+    if not a.no_sync and getattr(a, "include", None):
+        ssh_sync.push_filters(Path(me["repo_root"]), a.git, a.include)
+    rn = Runner(a, me)
+    rn.register_pending()
+    client_log = rn.log_path.with_suffix('.client.log')
+    ready_r = ready_w = accept_r = accept_w = None
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGINT, signal.SIGTERM, signal.SIGHUP))
+    interrupted = False
+    def defer_interrupt(signum, frame):
+        nonlocal interrupted
+        interrupted = True
+    # Other caller threads can still receive SIGINT and schedule its Python handler on main.
+    # Defer that handler too, so caller interruption cannot reject a transferred worker.
+    old_sigint = signal.signal(signal.SIGINT, defer_interrupt)
+    child = None
+    try:
+        ready_r, ready_w = os.pipe()
+        accept_r, accept_w = os.pipe()
+        payload = json.dumps(dict(args=vars(a), me=me, env=dict(os.environ), backend=common.backend(),
+                                  ready_fd=ready_w, accept_fd=accept_r, signal_mask=list(mask))).encode()
+        boot_env = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR')}
+        with open(client_log, 'ab', opener=lambda p, f: os.open(p, f, 0o600)) as dst:
+            # No preexec_fn: Python/CF code in a forked macOS child is unsafe even before urllib sends a request.
+            child = subprocess.Popen([sys.executable, '-u', str(BG_ENTRY), '_bg-queue', rn.run_id],
+                                     start_new_session=True, close_fds=True, pass_fds=(ready_w, accept_r),
+                                     stdin=subprocess.PIPE, stdout=dst, stderr=subprocess.STDOUT, env=boot_env)
+        # Until this publication the original caller remains the provable owner. No payload is sent before it.
+        rn.record(client_pid=child.pid, start_at=now())
+        os.close(ready_w)
+        ready_w = None
+        os.close(accept_r)
+        accept_r = None
+        errors = []
+        def send():
+            try:
+                with child.stdin:
+                    child.stdin.write(payload)
+            except (OSError, ValueError) as error:
+                errors.append(error)
+        # A large command/env must not fill the pipe and block the readiness deadline.
+        sender = threading.Thread(target=send, daemon=True)
+        sender.start()
+        readable, _, _ = select.select([ready_r], [], [], BG_READY_TIMEOUT_S)
+        ready = os.read(ready_r, 1) if readable else b''
+        if ready != b'1' or errors:
+            raise OffboxError(f"{rn.run_id}: background client could not detach; check {client_log}", code=EXIT_LOCAL)
+        os.write(accept_w, b'1')
+    except BaseException as error:
+        if accept_w is not None:
+            try:
+                os.write(accept_w, b'0')
+            except OSError:
+                pass
+        if child is not None and child.poll() is None:
+            # This PID came from our own spawn. Never leave an unacknowledged worker able to start later.
+            child.kill()
+            child.wait()
+        finish(rn.run_id, EXIT_LOCAL, 'local_error')
+        if isinstance(error, OffboxError):
+            raise
+        if isinstance(error, KeyboardInterrupt):
+            raise
+        raise OffboxError(f"{rn.run_id}: background client could not detach; check {client_log}", code=EXIT_LOCAL) from error
+    finally:
+        if ready_r is not None:
+            os.close(ready_r)
+        if ready_w is not None:
+            os.close(ready_w)
+        if accept_r is not None:
+            os.close(accept_r)
+        if accept_w is not None:
+            os.close(accept_w)
+        # Deliver caller interruptions after handoff; they must not cancel the acknowledged detached worker.
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        if interrupted:
+            os.kill(os.getpid(), signal.SIGINT)
+    print(rn.run_id, flush=True)
+    say(f"queued in background. Follow: offbox logs {rn.run_id} --follow ; wait: offbox wait {rn.run_id}; "
+        f"client log: {client_log}")
+    return 0
+
+
+def background_queue(run_id: str, payload: dict) -> int:
+    a, me = SimpleNamespace(**payload['args']), payload['me']
+    con = db()
+    try:
+        with write(con):
+            row = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+            if (not row or row['mode'] != 'bg' or row['status'] != 'starting' or row['box_id'] or row['process_id']
+                    or row['client_pid'] != os.getpid() or row['owner'] != me['owner']
+                    or row['repo_root'] != me['repo_root'] or payload['backend'] != common.backend()):
+                raise OffboxError(f'{run_id}: queued run cannot be adopted', code=EXIT_LOCAL)
+            con.execute('UPDATE runs SET client_pid=?,start_at=? WHERE run_id=?', (os.getpid(), now(), run_id))
+        os.chdir(row['local_cwd'] or row['cwd'])
+    finally:
+        con.close()
+    os.environ[BACKGROUND_RUN_ENV] = run_id
+    return background_client(a, me, ready=payload['ready_fd'], accept=payload['accept_fd'],
+                             signal_mask=payload['signal_mask'])
+
+
+def background_client(a, me: dict, ready=None, accept=None, signal_mask=None) -> int:
+    global _background_context
+    _background_context = (a, me)
+    from . import cli
+    rid = os.environ[BACKGROUND_RUN_ENV]
+    def interrupted(signum, frame):
+        raise _ClientSignal
+    old = {s: signal.signal(s, interrupted) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    code = EXIT_LOCAL
+    try:
+        if ready:
+            fd = ready
+            signal.pthread_sigmask(signal.SIG_SETMASK, signal_mask)
+            try:
+                os.write(fd, b'1')
+            except BrokenPipeError:
+                pass  # The caller can die during handoff; the detached client still owns the queued run.
+            finally:
+                os.close(fd)
+            try:
+                # EOF means the caller died after transferring the payload. An explicit rejection fences a timeout.
+                accepted = os.read(accept, 1)
+            finally:
+                os.close(accept)
+            if accepted not in (b'1', b''):
+                finish(rid, EXIT_LOCAL, 'local_error')
+                return EXIT_LOCAL
+        code = cli._run_with_retries(a, me)
+        return code
+    except KeyboardInterrupt:
+        code = 130
+        return code
+    finally:
+        try:
+            with contextlib.closing(db()) as con:
+                row = con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
+                if (row and row['client_pid'] == os.getpid() and row['status'] == 'starting'
+                        and not row['box_id'] and not row['process_id']):
+                    finish(rid, code, 'killed' if code == 130 else 'infra')
+        except sqlite3.Error as error:
+            # The runner already saved any known result; cleanup cannot replace it or mask an active error.
+            saved = read_json(LOGS_DIR / f'{rid}.state.json', {})
+            with contextlib.suppress(OSError):
+                state_warning(rid, saved.get('exit_code') if isinstance(saved, dict) else None, error)
+        finally:
+            for s, handler in old.items():
+                signal.signal(s, handler)
+
+
+def forward_background(env: dict) -> None:
+    if _background_context is None:
+        raise OffboxError('background failover has no queued run context', code=EXIT_LOCAL)
+    # Reuse the stdin protocol on failover too: an exec of the original argv would expose --env values.
+    common.select_backend('boat')
+    os.environ.clear()
+    os.environ.update(env)
+    raise SystemExit(_background(*_background_context))
+
+
+def retry_background(error) -> None:
+    rid = os.environ.get(BACKGROUND_RUN_ENV)
+    if rid and not error.started:
+        con = db()
+        try:
+            with write(con):
+                fenced = con.execute("SELECT 1 FROM kv WHERE k=? AND v='fenced'", ('lost_confirmed:' + rid,)).fetchone()
+                if fenced:
+                    # Keep the old fence forever: a late delivery must still lose its original claim.
+                    con.execute('UPDATE kv SET v=? WHERE k=?', (new_id('claim'), 'start_claim:' + rid))
+                    con.execute('DELETE FROM kv WHERE k=?', ('lost_confirmed:' + rid,))
+                con.execute("UPDATE runs SET box_id=NULL, error=?, end_at=NULL WHERE run_id=? "
+                            "AND status='starting' AND process_id IS NULL", (str(error)[:500], rid))
+        finally:
+            con.close()
 
 
 def _run_prepared(a, me: dict) -> int:
@@ -2541,7 +2872,7 @@ def _run_remote(a, rn) -> int:
             if not rn.started:
                 if e.code == EXIT_LOCAL:
                     finish(rn.run_id, EXIT_LOCAL, "local_error")
-                else:
+                elif not os.environ.get(BACKGROUND_RUN_ENV):
                     finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
             rn.record(error=str(e)[:500])
             raise
@@ -2651,6 +2982,7 @@ def _run_remote(a, rn) -> int:
     go_std_glitch(rn.box, rn.run_id, rn.log_path, code)
     if code is None:
         say("remote process was lost (box restarted?); treating as infra failure")
+    resources.display(rn.run_id)
     steps = getattr(a, "steps", None) or []
     deps_hint = box_deps_hint(rn.root, rn.log_path)
     if steps:

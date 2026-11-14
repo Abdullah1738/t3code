@@ -1,0 +1,211 @@
+{
+  "cases": [
+    {
+      "id": "yalla-tph-mandate",
+      "merchant": "Yalla Maids / TPH Group (TPH CENTER)",
+      "amount": "1205",
+      "kind": "charge",
+      "charged": "2026-11-02",
+      "currency": "AED",
+      "reference": "card 2342 registered for monthly auto-debit via TPH card-registration link 2 Nov 14:07",
+      "state": "Active monthly auto-debit on 2342. Moni said 2 Nov Lydia has left; agency had said last day 31 Dec. Owner asked keep/cancel on 4 Nov (02:17 and 08:21), no answer yet",
+      "next": "Already asked him twice (4 Nov 02:17, 08:21). Don't raise again before ~20 Nov unless a new fact arrives; then one reminder before the ~1 Dec debit. To cancel: TPH/Yalla mandate + stored card removal (needs his OK).",
+      "deadline": "2026-11-25",
+      "why": "recurring mandate; Lydia gone so it may be unneeded",
+      "who": "owner decides; assistant messages TPH only with his OK",
+      "watchers": [],
+      "status": "open",
+      "rev": 0,
+      "cycle": 0,
+      "opened": "2026-11-04T02:04:41+04:00",
+      "updated": "2026-11-05T02:39:12+04:00",
+      "closed": null,
+      "outcome": null,
+      "history": [
+        {
+          "at": "2026-11-04T02:04:41+04:00",
+          "text": "opened"
+        },
+        {
+          "at": "2026-11-05T02:39:06+04:00",
+          "text": "next: Already asked him twice (4 Nov 02:17, 08:21). Don't raise again before ~20 Nov unless a new fact arrives; then one reminder before the ~1 Dec debit. To cancel: TPH/Yalla mandate + stored card removal (needs his OK).; because: nightly 4 Nov: ask once, then wait"
+        },
+        {
+          "at": "2026-11-05T02:39:12+04:00",
+          "text": "state: Active monthly auto-debit on 2342. Moni said 2 Nov Lydia has left; agency had said last day 31 Dec. Owner asked keep/cancel on 4 Nov (02:17 and 08:21), no answer yet; because: state text was stale"
+        }
+      ]
+    },
+    {
+      "id": "logic-utilities-nov",
+      "merchant": "Logic Utilities",
+      "amount": "973.63",
+      "kind": "charge",
+      "charged": "2026-11-07",
+      "currency": "AED",
+      "reference": "invoice 5 Nov, due 19 Nov",
+      "state": "7 Nov 10:1x: owner 'both are fine' (ack, no explicit pay go). Don't ask again; pay only if he says pay.",
+      "next": "wait for owner's go to pay on 2342 (1 Nov bill rule); may appear once in a summary as 'still open (asked 5 Nov)'",
+      "deadline": "2026-11-19",
+      "why": "",
+      "who": "owner decides; assistant pays on 2342 with his go",
+      "watchers": [],
+      "status": "open",
+      "rev": 0,
+      "cycle": 0,
+      "opened": "2026-11-07T01:35:38+04:00",
+      "updated": "2026-11-07T10:05:34+04:00",
+      "closed": null,
+      "outcome": null,
+      "history": [
+        {
+          "at": "2026-11-07T01:35:38+04:00",
+          "text": "opened"
+        },
+        {
+          "at": "2026-11-07T10:05:34+04:00",
+          "text": "state: 7 Nov 10:1x: owner 'both are fine' (ack, no explicit pay go). Don't ask again; pay only if he says pay."
+        }
+      ]
+    },
+    {
+      "id": "charge-26dc3e4c",
+      "merchant": "Justlife",
+      "amount": "80.90",
+      "kind": "charge",
+      "charged": "2026-11-08",
+      "currency": "AED",
+      "reference": "card ending 2342",
+      "state": "told owner once 8 Nov, awaiting optional answer",
+      "next": "told once 8 Nov; never ask again; act only if he answers; review at month-end close",
+      "deadline": "2026-11-30T10:00:00+04:00",
+      "why": "charge question q-26dc3e4c",
+      "who": "Abdullah",
+      "watchers": [],
+      "status": "open",
+      "rev": 1,
+      "cycle": 0,
+      "opened": "2026-11-08T14:23:07+04:00",
+      "updated": "2026-11-09T09:27:46+04:00",
+      "closed": null,
+      "outcome": null,
+      "history": [
+        {
+          "at": "2026-11-08T14:23:07+04:00",
+          "text": "opened"
+        },
+        {
+          "at": "2026-11-08T15:27:05+04:00",
+          "text": "state: told owner once 8 Nov, awaiting optional answer; next: told him once with options (his/dispute/block); never ask again; act only on his answer"
+        },
+        {
+          "at": "2026-11-09T09:12:21+04:00",
+          "text": "he answered about charge question q-26dc3e4c: resolved/settled (see case)"
+        },
+        {
+          "at": "2026-11-09T09:27:46+04:00",
+          "text": "next: told once 8 Nov; never ask again; act only if he answers; review at month-end close; deadline: 2026-11-30T10:00:00+04:00; because: already told once; stop repeat pings"
+        }
+      ]
+    },
+    {
+      "id": "refund-noon-fgb9nne277t50va",
+      "merchant": "noon Food (Just Fit Food)",
+      "amount": "58.35",
+      "kind": "charge",
+      "charged": "2026-11-09",
+      "currency": "AED",
+      "reference": "order FGB9NNE277T50VA, card 9546",
+      "state": "owner cancelled the CLI test omelette order ~18:50 on 9 Nov after it was paid on Mashreq 9546; refund expected to 9546",
+      "next": "watch for noon cancellation/refund email or Mashreq credit; tell him once when refunded or if nothing by deadline",
+      "deadline": "2026-11-23",
+      "why": "cancelled paid order",
+      "who": "Abdullah",
+      "watchers": [],
+      "status": "open",
+      "rev": 0,
+      "cycle": 0,
+      "opened": "2026-11-09T18:48:56+04:00",
+      "updated": "2026-11-09T18:48:56+04:00",
+      "closed": null,
+      "outcome": null,
+      "history": [
+        {
+          "at": "2026-11-09T18:48:56+04:00",
+          "text": "opened"
+        }
+      ]
+    }
+  ],
+  "questions": [
+    {
+      "id": "q-26dc3e4c",
+      "kind": "charge",
+      "card": "2342",
+      "currency": "AED",
+      "amount": "80.90",
+      "merchant": "Justlife",
+      "pending": false,
+      "mkey": "justlife",
+      "at": "2026-11-01T13:30:33+04:00",
+      "alerts": [
+        {
+          "channel": "sms",
+          "at": "2026-11-01T13:30:33+04:00",
+          "item": "imsg:195227"
+        }
+      ],
+      "status": "closed",
+      "wait_until": null,
+      "asks": [],
+      "passed": true,
+      "item": "imsg:195227",
+      "why": "no receipt, nothing he wrote, and nothing to wait for",
+      "case": "charge-26dc3e4c",
+      "by": "answered",
+      "outcome": "resolved/settled (see case)",
+      "checked": "2026-11-09T09:11:33+04:00",
+      "opened": "2026-11-01T13:33:37+04:00",
+      "updated": "2026-11-09T09:12:21+04:00",
+      "closed": "2026-11-09T09:12:21+04:00",
+      "was_case": "charge-26dc3e4c",
+      "owner": "abdullah"
+    },
+    {
+      "id": "q-bcc74f3f",
+      "kind": "charge",
+      "owner": "abdullah",
+      "card": "2342",
+      "currency": "AED",
+      "amount": "80.90",
+      "merchant": "Justlife",
+      "pending": false,
+      "mkey": "justlife",
+      "at": "2026-11-08T14:23:07+04:00",
+      "subscription_dated": true,
+      "alerts": [
+        {
+          "channel": "case",
+          "at": "2026-11-08T14:23:07+04:00",
+          "item": "charge-26dc3e4c|c0"
+        }
+      ],
+      "status": "case",
+      "wait_until": null,
+      "asks": [],
+      "passed": false,
+      "item": null,
+      "why": "sources unreadable; do not ask",
+      "case": "charge-26dc3e4c",
+      "by": "daily",
+      "outcome": null,
+      "checked": "2026-11-13T15:55:14.640065+04:00",
+      "opened": "2026-11-13T15:43:15.118994+04:00",
+      "updated": "2026-11-13T15:43:15.118994+04:00",
+      "closed": null,
+      "case_cycle": 0,
+      "daily_checked": "2026-11-13T15:43:15.118994+04:00",
+      "unverified": true
+    }
+  ]
+}

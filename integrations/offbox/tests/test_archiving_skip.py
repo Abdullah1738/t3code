@@ -14,10 +14,11 @@ from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skill' / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
-sys.path.insert(0, str(SCRIPTS / 'tests'))
 from offbox_lib import api, common, lease, pool  # noqa: E402
-from test_capacity import Isolated  # noqa: E402
-from test_exit_and_queue import FakeClock  # noqa: E402
+if __package__:
+    from .client_fixtures import Isolated, FakeClock
+else:
+    from client_fixtures import Isolated, FakeClock
 
 
 class FakeBoats:

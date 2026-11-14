@@ -1,11 +1,11 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test";
+import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { backendKind } from "../src/backend.ts";
-import { discoverControlConfig, parseSse, questionFrom, type ControlMessage, type PendingRequest } from "../src/control.ts";
+import { ControlClient, discoverControlConfig, parseSse, questionFrom, type ControlMessage, type PendingRequest } from "../src/control.ts";
 import type { NormalizedInbound, Photon } from "../src/photon.ts";
 import { GUIDANCE_END, GUIDANCE_START, recordsFromThread, retireUnresolvedRoute, RobobBackend, SELECTED_MODEL_ISSUE, sentMessagePrefix, withoutGuidance } from "../src/robob.ts";
 import { opencodeRunEvidence } from "../src/opencode-steps.ts";
@@ -1572,4 +1572,97 @@ test.each([false, true])("an older busy run finishing without a later wake frees
   await router.tick();
   expect(control.calls.filter(call => call.path.endsWith("/send")).map(call => call.body.text)).toEqual(["Did it go through?", "Next question"]);
   expect(inbounds(store)).toContainEqual({ id: "next", state: "done" });
+});
+
+test("control calls log method/duration on success and failure, with no bodies or query data", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const { ControlClient } = await import("../src/control.ts");
+  const logs = await captureLogs(async () => {
+    const control = fakeControl();
+    const client = new ControlClient({ url: control.url, token: "test-token" });
+    await client.request("GET", "/health?private=PRIVATE_QUERY");
+    await expect(client.request("POST", "/missing", { text: "PRIVATE_BODY", token: "PRIVATE_TOKEN" })).rejects.toThrow();
+  });
+  expect(logs.filter(l => l.name === "turn.robob_call").map(l => [l.ok, l.props?.method])).toEqual([[true, "GET"], [false, "POST"]]);
+  for (const value of ["PRIVATE_", "test-token"]) expect(JSON.stringify(logs)).not.toContain(value);
+});
+
+
+test("steering files: images accompany strict same-id sends without a second prompt", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  await backend.prompt(id, directory, `msg_${"a".repeat(64)}`, "Work");
+  const bytes = new Uint8Array([1, 2, 3]);
+  const uploaded: unknown[] = [];
+  const attachment = { attachmentId: "image-1", type: "image" as const, name: "flight.png", mimeType: "image/png", sizeBytes: bytes.length };
+  const upload = spyOn(ControlClient.prototype, "upload").mockImplementation(async file => { uploaded.push(file); return attachment; });
+  try {
+    const requestId = `msg_${"d".repeat(64)}`;
+    const files = [{ type: "file" as const, mime: "image/png", filename: "flight.png", url: "data:image/png;base64,AQID" }];
+    expect(await backend.steer(id, directory, requestId, "Add these flights", "File guidance", files)).toBe("steered");
+    expect(await backend.steer(id, directory, requestId, "Add these flights", "File guidance", files)).toBe("started");
+    expect(uploaded).toEqual([1, 2].map(() => ({ name: "flight.png", mimeType: "image/png", bytes })));
+    expect(control.calls.filter(call => call.body?.clientRequestId === requestId).map(call => call.body)).toEqual([1, 2].map(() => ({
+      text: "Add these flights", guidance: "File guidance", mode: "steer", clientRequestId: requestId, attachments: [attachment],
+    })));
+    expect(control.threads.get(id)!.messages).toHaveLength(2);
+    expect(await backend.promptAccepted(id, directory, requestId)).toBe(true);
+  } finally { upload.mockRestore(); }
+});
+
+
+test.each(["question", "cancel"])("steering files: %s during upload prevents the later POST", async kind => {
+  const control = fakeControl(); const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  await backend.prompt(id, directory, `msg_${"a".repeat(64)}`, "Work");
+  const entered = Promise.withResolvers<void>();
+  const uploaded = Promise.withResolvers<{ attachmentId: string; type: "image"; name: string; mimeType: string; sizeBytes: number }>();
+  const abort = new AbortController();
+  let blocked = false, checks = 0;
+  const upload = spyOn(ControlClient.prototype, "upload").mockImplementation(async (_file, signal) => {
+    expect(signal).toBe(abort.signal); entered.resolve(); return uploaded.promise;
+  });
+  try {
+    const requestId = `msg_${"e".repeat(64)}`;
+    const sending = backend.steer(id, directory, requestId, "These flights", "guidance", [{ type: "file", mime: "image/png", url: "data:image/png;base64,AQID" }], {
+      signal: abort.signal, beforeSend: async () => { checks++; return !blocked; },
+    });
+    await entered.promise;
+    blocked = true;
+    if (kind === "cancel") abort.abort();
+    uploaded.resolve({ attachmentId: "image-2", type: "image", name: "flight.png", mimeType: "image/png", sizeBytes: 3 });
+    expect(await sending).toBe("refused");
+    expect(checks).toBe(kind === "question" ? 1 : 0);
+    expect(control.calls.filter(call => call.body?.clientRequestId === requestId)).toEqual([]);
+    expect(control.threads.get(id)!.messages).toHaveLength(1);
+  } finally { upload.mockRestore(); }
+});
+
+test("steering files: cancellation aborts an upload already in flight", async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<Response>();
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    if (new URL(request.url).pathname === "/api/ardud/control/attachments") return Response.json({ ok: true, attachmentId: "file-1", relativeUrl: "/upload" });
+    entered.resolve(); return release.promise;
+  } });
+  servers.push(server);
+  const client = new ControlClient({ url: server.url.origin, token: "test-token" });
+  const abort = new AbortController();
+  const uploading = client.upload({ name: "file.bin", mimeType: "application/octet-stream", bytes: new Uint8Array([1]) }, abort.signal);
+  await entered.promise; abort.abort();
+  try { await expect(uploading).rejects.toThrow("Robob control request failed"); }
+  finally { release.resolve(new Response("")); }
+});
+
+
+test("steering files: incomplete family lists are unknown to admission", async () => {
+  const control = fakeControl(); const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  const list = spyOn(ControlClient.prototype, "listThreads").mockResolvedValue({ total: 501, threads: [] });
+  try {
+    await expect(backend.statuses(true)).rejects.toThrow("Incomplete active family discovery");
+    await expect(backend.children(id, directory, true)).rejects.toThrow("Incomplete child discovery");
+    expect(await backend.statuses()).toEqual({});
+    expect(await backend.children(id, directory)).toEqual([]);
+  } finally { list.mockRestore(); }
 });

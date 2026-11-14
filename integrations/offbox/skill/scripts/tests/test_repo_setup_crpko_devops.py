@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tests._env import clean_env
 from offbox_lib import bases, identity, runs
 from test_capacity import Isolated
 
@@ -286,7 +287,7 @@ class CrpkoSetupTests(unittest.TestCase):
             target.write_text(source.read_text().replace('/usr/bin/ruby',str(self.bin/'ruby'))
                               .replace('/usr/local/bin',str(self.bin))
                               .replace('/usr/local/aws-cli',str(self.home/'aws-cli')))
-        self.env = dict(os.environ, HOME=str(self.home), PATH=f'{self.bin}:/usr/bin:/bin',
+        self.env = clean_env(HOME=str(self.home), PATH=f'{self.bin}:/usr/bin:/bin',
                         OFFBOX_REPO_ROOT=str(self.root), OFFBOX_GNU_TIME=str(self.bin/'time'))
         self.env.pop('BASH_ENV',None)
 
@@ -731,6 +732,11 @@ class CrpkoSetupTests(unittest.TestCase):
         self.assertEqual(result.returncode,98,result.stderr)
         self.assertNotIn('curl ',self.calls())
         self.assertNotIn('USER_COMMAND',result.stdout)
+
+    def test_repo_environment_does_not_prepend_a_box_node_path(self):
+        result = self.run_setup(command='echo USER_COMMAND; printf "PATH=%s\\n" "$PATH"')
+        self.assert_ok(result)
+        self.assertIn('PATH=' + self.env['PATH'], result.stdout.splitlines())
 
     def test_missing_unzip_is_installed(self):
         self.env['PATH']=str(self.bin)

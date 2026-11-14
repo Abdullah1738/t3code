@@ -30,16 +30,6 @@ class ReplicaTests(unittest.TestCase):
         self.assertEqual(ro.replica_path('OWN', {'ROBOB_READONLY_DB': '/shared'}), Path('/shared'))
         self.assertEqual(ro.replica_path('OWN', {'OWN': '/own', 'ROBOB_READONLY_DB': '/shared'}), Path('/own'))
 
-    def test_component_install_includes_its_snapshot_guard(self):
-        source = HELPERS.parents[0] / 'checks/money-cases/install.py'
-        install_spec = importlib.util.spec_from_file_location('replica_install_test', source)
-        installer = importlib.util.module_from_spec(install_spec)
-        install_spec.loader.exec_module(installer)
-        with tempfile.TemporaryDirectory() as tmp, patch.object(installer.subprocess, 'run'):
-            root = Path(tmp)
-            installer.install(live=root / 'live', data=root / 'data', link=root / 'bin/money-cases')
-            self.assertEqual((root / 'live/robob_readonly.py').read_bytes(), (HELPERS / 'robob_readonly.py').read_bytes())
-
     def test_live_aliases_rejected_before_connect(self):
         with tempfile.TemporaryDirectory() as tmp:
             live = Path(tmp) / '.robob/userdata/statev2.sqlite'

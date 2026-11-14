@@ -112,7 +112,12 @@ export function checkMove(role: MoveRole, card: KanbanCard, to: KanbanStage): Mo
       return no(`dispatcher cannot move ${from} -> ${to}`);
     case "cardThread":
       if (from === "working" && (to === "needs_review" || to === "needs_owner")) return ok;
-      if (from === "todo" && card.activeThreadId === null && to === "needs_review") return ok;
+      if (
+        (from === "todo" || from === "in_review" || from === "completed") &&
+        card.activeThreadId === null &&
+        to === "needs_review"
+      )
+        return ok;
       return no(
         `a card thread can move working -> needs_review or needs_owner, not ${from} -> ${to}`,
       );
@@ -189,6 +194,14 @@ export function applyReviewResult(
 
 export const reviewFinished = (card: KanbanCard, chainLength: number) =>
   card.reviewStep >= Math.max(chainLength, 1);
+
+/** A queued review keeps its thread identity, including between chain steps. */
+export const reviewThreadToReuse = (board: KanbanBoard, card: KanbanCard) =>
+  card.settledAt === null &&
+  card.stage === "needs_review" &&
+  !reviewFinished(card, chainFor(board, card)?.steps.length ?? 1)
+    ? card.reviewThreadId
+    : null;
 
 /** Why a card can't be completed or deployed yet, or null. */
 export function reviewGate(card: KanbanCard, chainLength: number): string | null {

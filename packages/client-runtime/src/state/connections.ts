@@ -9,6 +9,7 @@ import * as EnvironmentRegistry from "../connection/registry.ts";
 import type { ConnectionCatalogEntry } from "../connection/catalog.ts";
 import { AVAILABLE_CONNECTION_STATE } from "../connection/model.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
+import { recordAnalytics } from "../ardud/analytics.ts";
 import {
   GitHubRoutingPermissions,
   type GitHubRoutingPermission,
@@ -182,7 +183,10 @@ export function createEnvironmentCatalogAtoms<R, E>(
     scheduler: commandScheduler,
     concurrency: serial,
     execute: (environmentId: EnvironmentIdType) =>
-      EnvironmentRegistry.EnvironmentRegistry.pipe(
+      Effect.sync(() =>
+        recordAnalytics(environmentId, "client.retry", { props: { reason: "retry" } }),
+      ).pipe(
+        Effect.andThen(EnvironmentRegistry.EnvironmentRegistry),
         Effect.flatMap((registry) => registry.retryNow(environmentId)),
       ),
   });

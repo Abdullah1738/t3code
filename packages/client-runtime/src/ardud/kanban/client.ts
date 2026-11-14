@@ -142,6 +142,7 @@ export interface KanbanClient {
     blockId: string,
     choice: ReadonlyArray<string>,
     text?: string | null,
+    analytics?: { readonly createdAt: string; readonly phase: "pick" | "poll" },
   ): Promise<void>;
   setScriptEnabled(scriptId: string, enabled: boolean): Promise<void>;
   /** Starts a run now; it shows up in the runs store as it opens and ends. */
@@ -915,7 +916,23 @@ export function createKanbanClient(
       await transport.request(M.cardSettle, { cardId: cardId as never });
     },
     async changeAsk(cardId, askId, action) {
-      await transport.request(M.cardAsk, { cardId: cardId as never, askId, action });
+      const analytics = transport.analytics?.();
+      const result = await transport.request(M.cardAsk, { cardId: cardId as never, askId, action });
+      if (action === "drop") {
+        const ask = result.asks.find((entry) => entry.id === askId);
+        analytics?.record("ask.dropped", {
+          boardId: result.boardId,
+          cardId,
+          ...(result.discussionId ? { discussionId: result.discussionId } : {}),
+          props: {
+            key: askId,
+            phase: ask?.options?.length ? "pick" : "ask",
+            reason: "closed",
+            ...(ask ? { createdAt: ask.at } : {}),
+            count: 1,
+          },
+        });
+      }
     },
     async stopCard(cardId) {
       await transport.request(M.cardStop, { cardId: cardId as never });
@@ -997,7 +1014,8 @@ export function createKanbanClient(
     async post(_boardId, discussionId, blocks) {
       await transport.request(M.messagePost, { discussionId: discussionId as never, blocks });
     },
-    async answer(_boardId, discussionId, seq, blockId, choice, text) {
+    async answer(boardId, discussionId, seq, blockId, choice, text, metadata) {
+      const analytics = transport.analytics?.();
       await transport.request(M.answer, {
         discussionId: discussionId as never,
         seq,
@@ -1005,6 +1023,16 @@ export function createKanbanClient(
         choice,
         ...(text ? { text } : {}),
       });
+      if (metadata) {
+        // @effect-diagnostics-next-line globalDate:off - A client interaction, measured from the server's creation timestamp.
+        const durationMs = Date.now() - Date.parse(metadata.createdAt);
+        analytics?.record("ask.answer_sent", {
+          boardId,
+          discussionId,
+          ...(Number.isFinite(durationMs) && durationMs >= 0 ? { durationMs } : {}),
+          props: { createdAt: metadata.createdAt, phase: metadata.phase, key: blockId, count: 1 },
+        });
+      }
     },
     async setScriptEnabled(scriptId, enabled) {
       await transport.request(M.scriptEnable, { scriptId: scriptId as never, enabled });

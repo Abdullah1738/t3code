@@ -6,14 +6,18 @@ import math
 import os
 from pathlib import Path
 import re
+import errno
+import signal
 
 CAP = 50 * 1024 * 1024
 _TOKEN = re.compile(r'[a-zA-Z][a-zA-Z0-9_.-]{0,79}')
 _NAME = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}')
 _DATED = re.compile(r'(?:rollup-)?(\d{4}-\d{2}-\d{2})(?:\.ndjson|\.json|\.cap)')
 _IDS = frozenset(('watcher', 'run', 'thread', 'chat', 'key', 'operation', 'reminder', 'update', 'item', 'helper'))
-_NUMERIC = frozenset(('exitCode', 'attempt', 'count', 'bytes', 'queuedMs'))
-_BOOLEAN = frozenset(('deduped', 'accepted'))
+_NUMERIC = frozenset(('exitCode', 'attempt', 'count', 'bytes', 'queuedMs', 'failedSources', 'totalSources'))
+_BOOLEAN = frozenset(('deduped', 'accepted', 'timedOut'))
+_ERRNO = frozenset(errno.errorcode.values()) | {'UNKNOWN'}
+_SIGNALS = frozenset(s.name for s in signal.Signals)
 _VALUES = {
     'severity': ('info', 'attention', 'error'),
     'outcome': ('fire', 'no_change', 'fail', 'timeout'),
@@ -22,8 +26,124 @@ _VALUES = {
     'class': ('urgent', 'today', 'info', 'noise', 'candidate', 'charge', 'bank', 'security', 'otp', 'unknown', 'fail_open', 'deduped'),
     'action': ('create', 'queue', 'cancel', 'snooze', 'sent', 'retry', 'check', 'wake', 'notify', 'send', 'coalesce', 'conflict', 'expire', 'pause', 'remove', 'cap', 'resume'),
     'state': ('pending', 'sending', 'sent', 'uncertain', 'cancelled', 'failed', 'scheduled', 'queued', 'done', 'expired', 'paused', 'active'),
+    'stderrClass': ('usage_error', 'missing_file', 'permission', 'timeout', 'python_traceback', 'auth', 'connect', 'json', 'unknown'),
+    'triggerKind': ('file', 'wal'),
 }
 _initialized = set()
+
+# Same order and normalization as src/cause.ts; classification never retains text in a log.
+_PATTERNS = tuple((name, re.compile(pattern, re.I)) for name, pattern in (
+    ('usage_error', r'(?:^|\n)\s*usage:|unrecognized arguments?|unknown (?:option|argument)|invalid (?:option|choice)|argument .*required|not (?:an exact trip UUID|a bridge chat slug)|no bridge chat|unsafe display name|invalid command arguments|duplicate command option|unexpected positional arguments|--[a-z-]+ (?:is required|must be)'),
+    ('missing_file', r'no such file or directory|filenotfounderror|\bENOENT\b|command not found|cannot find module|modulenotfounderror'),
+    ('permission', r'permission denied|operation not permitted|permissionerror|\b(?:EACCES|EPERM)\b'),
+    ('timeout', r'timed? out|timeoutexpired|timeouterror|\bETIMEDOUT\b'),
+    ('auth', r'authentication[ _-]*failed|invalid credentials|invalid[_ -]grant|login failed|unauthori[sz]ed|forbidden|HTTP[ :]+(?:401|403)\b'),
+    ('connect', r'connection[ _-]*(?:refused|reset|aborted)|\b(?:ECONNREFUSED|ECONNRESET|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN)\b|network is (?:unreachable|down)|no route to host|temporary failure in name resolution|bridge socket is unavailable|bridge request failed'),
+    ('json', r'jsondecodeerror|invalid json|json (?:parse|decode) error|unexpected (?:token|end).*json'),
+    ('python_traceback', r'traceback \(most recent call last\):'),
+))
+_PATHS = re.compile(r'''"(?:[A-Za-z]:\\|/|\.\.?/|~/)[^"]*"|'(?:[A-Za-z]:\\|/|\.\.?/|~/)[^']*'|(?:[A-Za-z]:\\|/|\.\.?/|~/)[^\s'"<>]*''')
+
+
+class StderrCause:
+    def __init__(self):
+        self.line, self.last, self.lines, self.rank = '', '', 0, len(_PATTERNS)
+
+    def add(self, text):
+        parts = text.split('\n')
+        for i, part in enumerate(parts):
+            text = self.line + part
+            for rank, (_, pattern) in enumerate(_PATTERNS):
+                if pattern.search(text):
+                    self.rank = min(self.rank, rank)
+            self.line = text
+            if i < len(parts) - 1:
+                self.lines += 1
+                self.last, self.line = self.line.removesuffix('\r'), ''
+
+    def props(self, timed_out=False):
+        normalized = re.sub(r'\d+', '#', _PATHS.sub('<path>', self.line or self.last))
+        return {'stderrClass': 'timeout' if timed_out else _PATTERNS[self.rank][0] if self.rank < len(_PATTERNS) else 'unknown',
+                'stderrLines': self.lines + int(bool(self.line)),
+                'stderrHash': hashlib.sha256(normalized.encode('utf-8', errors='replace')).hexdigest()[:16]}
+
+
+def stderr_cause(text, timed_out=False):
+    cause = StderrCause()
+    cause.add(text.decode('utf-8', errors='replace') if isinstance(text, bytes) else text or '')
+    return cause.props(timed_out)
+
+
+def _capture_stderr(cause):
+    """Observe fd 2 as well as Python writes, including inherited subprocess stderr."""
+    import codecs
+    import select
+    import sys
+    import threading
+    from contextlib import contextmanager
+
+    @contextmanager
+    def capture():
+        saved, sink, reader, writer = None, None, None, None
+        try:
+            sys.stderr.flush()
+            saved = os.dup(2)
+            sink = os.dup(saved)
+            reader, writer = os.pipe()
+        except OSError:
+            for fd in (saved, sink, reader, writer):
+                if fd is not None:
+                    os.close(fd)
+            yield
+            return
+        stopped = threading.Event()
+
+        def copy():
+            decode = codecs.getincrementaldecoder('utf-8')('replace')
+            try:
+                while True:
+                    ready, _, _ = select.select([reader], [], [], .01)
+                    if ready:
+                        chunk = os.read(reader, 8192)
+                        if not chunk:
+                            break
+                        try:
+                            cause.add(decode.decode(chunk))
+                        except Exception:
+                            pass
+                        view = memoryview(chunk)
+                        while view:
+                            view = view[os.write(sink, view):]
+                    if stopped.is_set() and not ready:
+                        break
+                cause.add(decode.decode(b'', final=True))
+            except Exception:
+                pass
+            finally:
+                os.close(reader)
+                os.close(sink)
+
+        worker = threading.Thread(target=copy, daemon=True)
+        try:
+            worker.start()
+        except RuntimeError:
+            for fd in (saved, sink, reader, writer):
+                os.close(fd)
+            yield
+            return
+        try:
+            os.dup2(writer, 2)
+            os.close(writer)
+            yield
+        finally:
+            sys.stderr.flush()
+            os.dup2(saved, 2)
+            os.close(saved)
+            stopped.set()
+            # Detached descendants may keep fd 2 open. Never hold the helper open for them.
+            worker.join(timeout=.1)
+
+    return capture()
 
 
 def log_directory():
@@ -70,8 +190,16 @@ def _fields(entry, at):
         for key, value in entry['props'].items():
             if type(key) is not str:
                 continue
-            if key == 'exitCode' and value is None:
+            if key in ('exitCode', 'signal') and value is None:
                 props[key] = None
+            elif key == 'stderrLines' and type(value) is int and 0 <= value <= 2 ** 53 - 1:
+                props[key] = value
+            elif key == 'stderrHash' and type(value) is str and re.fullmatch(r'[a-f0-9]{16}', value):
+                props[key] = value
+            elif key == 'errnoCode' and type(value) is str and value in _ERRNO:
+                props[key] = value
+            elif key == 'signal' and type(value) is str and value in _SIGNALS:
+                props[key] = value
             elif key in _NUMERIC and _finite(value):
                 props[key] = value
             elif key in _BOOLEAN and type(value) is bool:
@@ -141,12 +269,12 @@ def tool_log(entry):
         pass  # Formatting, retention and filesystem failures must not affect a check.
 
 
-def tool_error(component, tag, ids=None):
+def tool_error(component, tag, ids=None, props=None):
     try:
         if not _token(component) or not _token(tag):
             return
         tool_log({'component': component, 'kind': 'error', 'name': component + '.error',
-                  'ok': False, 'ids': ids, 'error': {'tag': tag}})
+                  'ok': False, 'ids': ids, 'props': props, 'error': {'tag': tag}})
     except Exception:
         pass
 
@@ -154,27 +282,77 @@ def tool_error(component, tag, ids=None):
 def helper_main(name, fn, *args):
     """Keep each helper's result/exception intact while recording its process boundary."""
     import time
-    started, code = time.perf_counter(), 0
+    import sys
+    import traceback
+    started, code, cause = time.perf_counter(), 0, StderrCause()
     try:
-        result = fn(*args)
+        with _capture_stderr(cause):
+            result = fn(*args)
         if type(result) is int:
             code = result
         return result
     except SystemExit as error:
         code = error.code if type(error.code) is int else 0 if error.code is None else 1
+        if type(error.code) is str:
+            try:
+                cause.add(error.code + '\n')
+            except Exception:
+                pass
         raise
-    except BaseException:
+    except BaseException as error:
         code = 1
+        try:
+            cause.add(''.join(traceback.format_exception(type(error), error, error.__traceback__)))
+        except Exception:
+            pass
         raise
     finally:
-        tool_log({'component': 'helpers', 'kind': 'perf' if code == 0 else 'error', 'name': 'helper.run',
-                  'durationMs': (time.perf_counter() - started) * 1000, 'ok': code == 0,
-                  'ids': {'helper': name, 'watcher': os.environ.get('WATCH_ID')}, 'props': {'exitCode': code},
-                  **({'error': {'tag': 'helper.exit_failed'}} if code else {})})
+        try:
+            tool_log({'component': 'helpers', 'kind': 'perf' if code == 0 else 'error', 'name': 'helper.run',
+                      'durationMs': (time.perf_counter() - started) * 1000, 'ok': code == 0,
+                      'ids': {'helper': name, 'watcher': os.environ.get('WATCH_ID')},
+                      'props': {'exitCode': code, **(cause.props() if code else {})},
+                      **({'error': {'tag': 'helper.exit_failed'}} if code else {})})
+        except Exception:
+            pass
 
 
 def _main():
-    # Shell helpers send only a fixed basename, elapsed milliseconds and an exit code.
+    # Shell stderr stays in a pipe, never a scratch file or log. Stdout and stdin are inherited.
+    import sys
+    if len(sys.argv) > 3 and sys.argv[1] == '--shell-helper' and sys.argv[3] == '--':
+        import codecs
+        import subprocess
+        import time
+        name, cause, started = sys.argv[2], StderrCause(), time.perf_counter()
+        child = subprocess.Popen(['/bin/zsh', '-f', *sys.argv[4:]], stderr=subprocess.PIPE)
+        decode = codecs.getincrementaldecoder('utf-8')('replace')
+        while True:
+            chunk = os.read(child.stderr.fileno(), 8192)
+            if not chunk:
+                break
+            try:
+                cause.add(decode.decode(chunk))
+            except Exception:
+                pass
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.buffer.flush()
+        cause.add(decode.decode(b'', final=True))
+        code = child.wait()
+        try:
+            tool_log({'component': 'helpers', 'kind': 'perf' if code == 0 else 'error', 'name': 'helper.run',
+                      'durationMs': (time.perf_counter() - started) * 1000, 'ok': code == 0,
+                      'ids': {'helper': name, 'watcher': os.environ.get('WATCH_ID')},
+                      'props': {'exitCode': code, **(cause.props() if code else {})},
+                      **({'error': {'tag': 'helper.exit_failed'}} if code else {})})
+        except Exception:
+            pass
+        if code < 0:
+            if -code not in (signal.SIGKILL, signal.SIGSTOP):
+                signal.signal(-code, signal.SIG_DFL)
+            os.kill(os.getpid(), -code)
+        sys.exit(code)
+    # Legacy metadata-only caller; no stderr was supplied.
     try:
         import argparse
         class QuietParser(argparse.ArgumentParser):
@@ -190,7 +368,7 @@ def _main():
         tool_log({'component': 'helpers', 'kind': 'perf' if args.exit_code == 0 else 'error', 'name': 'helper.run',
                   'durationMs': max(0, args.duration_ms), 'ok': args.exit_code == 0,
                   'ids': {'helper': args.helper, 'watcher': os.environ.get('WATCH_ID')},
-                  'props': {'exitCode': args.exit_code},
+                  'props': {'exitCode': args.exit_code, **(stderr_cause('') if args.exit_code else {})},
                   **({'error': {'tag': 'helper.exit_failed'}} if args.exit_code else {})})
     except BaseException:
         pass

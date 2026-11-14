@@ -130,7 +130,11 @@ class RepoToolTests(unittest.TestCase):
                 self.assertIn('is a repo-local tool', p.stderr)
                 self.assertIn("Run: offbox run -- sh -c 'corepack pnpm@11.10.0 install --frozen-lockfile && <your command>'", p.stderr)
                 self.assertNotIn('vp i &&', p.stderr)
-                self.assertIn(runs.NO_NODE_MODULES_MARKER, p.stderr.splitlines())
+                if 'vp i' in ' '.join(command) or command == ['vp', 'i'] or steps:
+                    self.assertNotIn(runs.NO_NODE_MODULES_MARKER, p.stderr.splitlines())
+                    self.assertIn('its own install step (vp i)', p.stderr)
+                else:
+                    self.assertIn(runs.NO_NODE_MODULES_MARKER, p.stderr.splitlines())
                 self.assertFalse((self.root / 'node_modules').exists())
                 if steps:
                     self.assertIn('offbox step 2 rc=0', p.stderr)
@@ -416,7 +420,8 @@ class RepoToolTests(unittest.TestCase):
                     self.assertEqual(p.returncode, 127, p.stderr)
                     self.assertIn('vp is a repo-local tool (vite-plus)', p.stderr)
                     self.assertIn('corepack pnpm@11.10.0 install --frozen-lockfile', p.stderr)
-                    self.assertIn(runs.NO_NODE_MODULES_MARKER, p.stderr.splitlines())
+                    self.assertNotIn(runs.NO_NODE_MODULES_MARKER, p.stderr.splitlines())
+                    self.assertIn('its own install step (vp i)', p.stderr)
 
     def test_startup_bash_env_rewrites_keep_grandchild_initialization(self):
         self.tool(self.global_bin, 'vp', 'global')

@@ -73,7 +73,7 @@ const SourceDigest = Schema.Struct({
 });
 const ArtifactDigest = Schema.Struct({
   ...SourceDigest.fields,
-  format: Schema.optionalKey(Schema.Literal("claude-owned-json")),
+  format: Schema.optionalKey(Schema.Literals(["claude-owned-json", "codex-owned-json"])),
 });
 const decodeClaudeOwnedJson = Schema.decodeUnknownEffect(
   Schema.Struct({
@@ -331,25 +331,31 @@ const make = Effect.gen(function* () {
     artifact: typeof ArtifactDigest.Type,
   ) {
     const text = yield* readText(artifact.path);
-    const owned = path.basename(artifact.path) === ".claude.json";
+    const name = path.basename(artifact.path);
     if (
-      (owned && artifact.format !== "claude-owned-json") ||
-      (!owned && artifact.format !== undefined)
+      (name === ".claude.json" && artifact.format !== "claude-owned-json") ||
+      (artifact.format === "claude-owned-json" && name !== ".claude.json") ||
+      (artifact.format === "codex-owned-json" && name !== "config.toml")
     ) {
-      return yield* Effect.fail(
-        "Only .claude.json must use the claude-owned-json artifact format.",
-      );
+      return yield* Effect.fail("Owned artifact format does not match its generated file.");
     }
-    if (!owned) return yield* verifyDigest(artifact);
-    const value = yield* decodeJson(text).pipe(
-      Effect.flatMap(decodeClaudeOwnedJson),
-      Effect.mapError(() => "Claude generator-owned JSON fields are missing or invalid."),
-    );
+    if (artifact.format === undefined) return yield* verifyDigest(artifact);
+    const value =
+      artifact.format === "claude-owned-json"
+        ? yield* decodeJson(text).pipe(
+            Effect.flatMap(decodeClaudeOwnedJson),
+            Effect.mapError(() => "Claude generator-owned JSON fields are missing or invalid."),
+          )
+        : yield* Effect.try(() => Toml.parse(text)).pipe(
+            Effect.flatMap(Schema.decodeUnknownEffect(Schema.JsonObject)),
+            Effect.map(({ projects: _projects, ...owned }) => owned),
+            Effect.mapError(() => "Codex generator-owned TOML fields are missing or invalid."),
+          );
     const digest = NodeCrypto.createHash("sha256")
       .update(canonicalJson(value), "utf8")
       .digest("hex");
     if (digest !== artifact.sha256)
-      return yield* Effect.fail("Claude generator-owned JSON fields differ from expected output.");
+      return yield* Effect.fail("Generator-owned artifact fields differ from expected output.");
   });
   const sources = Effect.fn("CutoverReadiness.sources")(function* (cu: boolean) {
     const manifest = yield* readJson(

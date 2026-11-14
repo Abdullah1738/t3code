@@ -172,6 +172,8 @@ const make = Effect.gen(function* () {
         projection.runs.find(
           (candidate) => candidate.restartContinuationOfRunId === source.sourceRunId,
         ) ?? projection.runs.find((candidate) => candidate.id === source.sourceRunId);
+      // startedAt precedes native acceptance; the startup finalizer owns
+      // releasing live reservations.
       if (!run || !["preparing", "starting", "running"].includes(run.status)) return false;
       const turn = projection.providerTurns
         .filter(

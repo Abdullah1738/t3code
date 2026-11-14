@@ -3,7 +3,7 @@ import { useToolLogFixture } from "./toollog-fixture.ts";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { discoverControlConfig } from "../src/control.ts";
+import { ControlClient, discoverControlConfig } from "../src/control.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -51,4 +51,85 @@ test("control config takes env credentials before any file", () => {
     .toEqual({ url: "http://localhost:1", token: "env" });
 });
 
-useToolLogFixture();
+const logs = useToolLogFixture();
+
+test("ask receipts use the kanban route and contain only identity and time", async () => {
+  const original = globalThis.fetch;
+  const client = new ControlClient({ url: "http://127.0.0.1:1", token: "test-token" });
+  const calls: { url: string; body: unknown }[] = [];
+  try {
+    globalThis.fetch = Object.assign(async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+      return Response.json({ recorded: true });
+    }, { preconnect: original.preconnect });
+    await client.askNotified("robob:1380:q1", 0);
+    await client.askNotified("arbitrary private text", 0);
+    expect(calls).toEqual([{ url: "http://127.0.0.1:1/api/ardud/kanban/cards/robob%3A1380/asks/q1/notified", body: { channel: "telegram", at: "1970-01-01T00:00:00.000Z" } }]);
+    globalThis.fetch = Object.assign(async () => Response.json({ error: { code: "not-found" } }, { status: 404 }), { preconnect: original.preconnect });
+    await client.askNotified("robob:1380:q1", 0);
+  } finally { globalThis.fetch = original; }
+});
+
+
+test("control transport failures preserve only safe causes through the wrapper", async () => {
+  const original = globalThis.fetch;
+  const client = new ControlClient({ url: "http://127.0.0.1:1", token: "test-token" });
+  const secret = "https://private.invalid/path?token=private-token";
+  try {
+    for (const [failure, cause] of [[{ code: "ECONNREFUSED", message: secret }, "ECONNREFUSED"],
+      [new DOMException(secret, "TimeoutError"), "timeout"], [new DOMException(secret, "AbortError"), "abort"]] as const) {
+      globalThis.fetch = Object.assign(async () => { throw failure; }, { preconnect: original.preconnect });
+      let caught: unknown;
+      try { await client.request("GET", "/requests"); } catch (error) { caught = error; }
+      expect(caught).toMatchObject({ status: 0, causeClass: cause });
+      expect(String(caught)).not.toContain(secret);
+      expect(logs.entries().at(-1)?.props?.cause).toBe(cause);
+    }
+  } finally { globalThis.fetch = original; }
+  expect(logs.text()).not.toContain(secret);
+  expect(logs.text()).not.toContain("test-token");
+});
+
+test("control distinguishes invalid JSON from HTTP failure and keeps request bodies private", async () => {
+  const original = globalThis.fetch;
+  const client = new ControlClient({ url: "http://127.0.0.1:1", token: "test-token" });
+  try {
+    globalThis.fetch = Object.assign(async () => new Response("private non-JSON body"), { preconnect: original.preconnect });
+    await expect(client.request("GET", "/requests")).rejects.toMatchObject({ causeClass: "decode" });
+    expect(logs.entries().at(-1)?.props?.cause).toBe("decode");
+    globalThis.fetch = Object.assign(async () => Response.json({ ok: false }, { status: 403 }), { preconnect: original.preconnect });
+    await expect(client.request("GET", "/requests")).rejects.toMatchObject({ causeClass: 403 });
+  } finally { globalThis.fetch = original; }
+  expect(logs.text()).not.toContain("private non-JSON body");
+});
+
+
+test("JSON body failures preserve transport causes with signal and HTTP precedence", async () => {
+  const original = globalThis.fetch;
+  const client = new ControlClient({ url: "http://127.0.0.1:1", token: "test-token" });
+  const secret = "https://private.invalid/body?token=private-token";
+  const cases = [
+    { failure: new SyntaxError(secret), status: 200, cause: "decode" },
+    { failure: Object.assign(new Error(secret), { code: "ECONNRESET" }), status: 200, cause: "ECONNRESET" },
+    { failure: Object.assign(new Error(secret), { code: "ETIMEDOUT" }), status: 200, cause: "ETIMEDOUT" },
+    { failure: new DOMException(secret, "AbortError"), status: 200, cause: "abort" },
+    { failure: new Error(secret), status: 200, signal: AbortSignal.abort(new DOMException(secret, "TimeoutError")), cause: "timeout" },
+    { failure: Object.assign(new Error(secret), { code: "ECONNRESET" }), status: 503, cause: 503 },
+    { failure: new Error(secret), status: 503, signal: AbortSignal.abort(new DOMException(secret, "TimeoutError")), cause: "timeout" },
+    { failure: Object.assign(new Error(secret), { code: "PRIVATE_CODE" }), status: 200, cause: "unknown" },
+  ];
+  try {
+    for (const entry of cases) {
+      globalThis.fetch = Object.assign(async () => new Response(new ReadableStream({
+        start(controller) { controller.error(entry.failure); },
+      }), { status: entry.status }), { preconnect: original.preconnect });
+      await expect(client.request("GET", "/requests", undefined, { signal: entry.signal }))
+        .rejects.toMatchObject({ status: entry.status, causeClass: entry.cause });
+      expect(logs.entries().at(-1)?.props?.cause).toBe(entry.cause);
+    }
+  } finally { globalThis.fetch = original; }
+  expect(logs.entries()).toHaveLength(cases.length);
+  expect(logs.text()).not.toContain(secret);
+  expect(logs.text()).not.toContain("PRIVATE_CODE");
+  expect(logs.text()).not.toContain("test-token");
+});

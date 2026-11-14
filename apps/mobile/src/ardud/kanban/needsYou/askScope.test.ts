@@ -835,7 +835,9 @@ describe("a phone the session confirmed as his, when the connection goes", () =>
       "answerSecrets",
       "hand",
       "handBatch",
+      "notified",
       "reply",
+      "seen",
       "snooze",
       "snoozeBatch",
     ]);
@@ -1048,5 +1050,68 @@ describe("while the connection layer waits to try again", () => {
     const before = h.requests.length;
     await h.scopes.current().asks.refreshAsks();
     expect(h.requests).toHaveLength(before);
+  });
+});
+
+describe("receipt scope and owner gates", () => {
+  const cases = [
+    "owner",
+    "unread",
+    "notOwner",
+    "signedOut",
+    "waiting",
+    "down",
+    "refused",
+    "switched",
+    "closed",
+  ] as const;
+  it.each(cases)("seen and notified receipts: %s", async (state) => {
+    const h = harness();
+    const scope = h.scopes.current();
+    if (state === "unread") h.setSession("A", "out");
+    if (state === "notOwner") h.setSession("A", false);
+    if (state === "signedOut") h.setSession("A", "signedOut");
+    if (state === "waiting" || state === "down") h.setConnection("A", state);
+    if (state === "refused") scope.asks.noteAskNotOwner("Not the owner", true);
+    if (state === "switched") h.pair("B");
+    if (state === "closed") h.scopes.stop();
+    try {
+      if (state === "owner") {
+        await scope.api.seen!("c1", "q1", "mobile");
+        await scope.api.notified!("c1", "q1");
+        expect(h.answers()).toEqual([
+          { server: "A", method: "POST", path: "/api/ardud/kanban/cards/c1/asks/q1/seen" },
+          { server: "A", method: "POST", path: "/api/ardud/kanban/cards/c1/asks/q1/notified" },
+        ]);
+      } else {
+        await expect(scope.api.seen!("c1", "q1", "mobile")).rejects.toBeInstanceOf(AskApiError);
+        await expect(scope.api.notified!("c1", "q1")).rejects.toBeInstanceOf(AskApiError);
+        expect(h.answers()).toEqual([]);
+      }
+    } finally {
+      h.scopes.stop();
+    }
+  });
+
+  it("dedupes per environment and rechecks the gate even for cached receipts", async () => {
+    const h = harness();
+    const a = h.scopes.current();
+    try {
+      await a.api.seen!("c1", "q1", "mobile");
+      await a.api.notified!("c1", "q1");
+      await a.api.seen!("c1", "q1", "mobile");
+      await a.api.notified!("c1", "q1");
+      expect(h.answers("A")).toHaveLength(2);
+      h.pair("B");
+      await expect(a.api.seen!("c1", "q1", "mobile")).rejects.toBeInstanceOf(AskApiError);
+      await expect(a.api.notified!("c1", "q1")).rejects.toBeInstanceOf(AskApiError);
+      const b = h.scopes.current();
+      await b.api.seen!("c1", "q1", "mobile");
+      await b.api.notified!("c1", "q1");
+      expect(h.answers("A")).toHaveLength(2);
+      expect(h.answers("B")).toHaveLength(2);
+    } finally {
+      h.scopes.stop();
+    }
   });
 });

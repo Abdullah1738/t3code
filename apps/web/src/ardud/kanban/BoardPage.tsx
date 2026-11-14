@@ -78,6 +78,8 @@ import { AutomationsView, WikiView } from "./SideViews";
 import { ThreadsView } from "./ThreadsView";
 import "./tokens.css";
 import "./kanban.css";
+import { useAnalyticsCounts, useAnalyticsSearch } from "../useAnalytics";
+import { usePrimaryEnvironmentId } from "../../state/environments";
 
 /** Keys set to undefined are dropped from the URL. */
 type SearchPatch = { readonly [K in keyof BoardSearch]?: BoardSearch[K] | undefined };
@@ -152,6 +154,8 @@ export function BoardPage(props: {
       ? boardViewFor(boardId).model(state, boardClock, { filter, group, lens, groups })
       : null;
   const steps = model && drawerOpen && search.card ? boardSteps(model, group, search.card) : null;
+  useAnalyticsSearch(usePrimaryEnvironmentId(), "board", query.length, model?.total ?? 0, boardId);
+  useAnalyticsCounts(usePrimaryEnvironmentId(), view === "board" ? "board" : `board.${view}`, 0);
   const setLens = (next: BoardLens) => go({ lens: next === "stuck" ? "stuck" : undefined });
   const [lifting, setLifting] = useState(false);
   const liftPause = () => {

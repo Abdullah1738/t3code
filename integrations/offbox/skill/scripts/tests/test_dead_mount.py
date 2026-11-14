@@ -108,7 +108,7 @@ class DeadMountTests(Isolated):
         rsync_fail = subprocess.CompletedProcess([], 23, "", ENOTCONN_MKSTEMP)
         ok = subprocess.CompletedProcess([], 0, b"", b"")
         with patch.object(ssh_sync, "ssh", return_value=ok), \
-                patch.object(ssh_sync.subprocess, "run", return_value=rsync_fail):
+                patch.object(ssh_sync, "_run_rsync", return_value=rsync_fail):
             with self.assertRaises(OffboxError) as cm:
                 ssh_sync._push_git("bxA", Path(self.tmp.name), "w/r", 60)
         self.assertIn("Transport endpoint is not connected", str(cm.exception))

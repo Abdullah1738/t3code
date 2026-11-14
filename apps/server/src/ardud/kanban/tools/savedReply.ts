@@ -1,8 +1,11 @@
 import * as Effect from "effect/Effect";
+import * as Clock from "effect/Clock";
+import * as Option from "effect/Option";
 import { McpSchema } from "effect/ai";
 
 import * as BoardLocks from "../engine/boardLocks.ts";
 import * as SavedWrite from "../engine/savedWrite.ts";
+import { McpCall } from "../../analytics/McpCall.ts";
 
 export const REPLY_BUDGET_MS = 25_000;
 export const ADMISSION_BUDGET_MS = REPLY_BUDGET_MS - 5_000;
@@ -25,11 +28,62 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   effect: Effect.Effect<McpSchema.CallToolResult | McpSchema.InputRequired, E, R>,
   tool: string,
 ) {
+  const span = yield* Effect.currentSpan.pipe(Effect.orDie);
+  const clock = yield* Clock.Clock;
+  const started = clock.monotonicTimeNanosUnsafe();
+  const elapsed = () => Number(clock.monotonicTimeNanosUnsafe() - started) / 1_000_000;
+  let baseStage: SavedWrite.Stage = "caller";
+  const scopes = new Map<symbol, { stage: SavedWrite.Stage; fiberId: number }>();
+  let stage: SavedWrite.Stage = "caller";
+  let stageSince = 0;
+  const totals = new Map<SavedWrite.Stage, number>();
+  let stageAtTimeout: SavedWrite.Stage | null = null;
+  let timerLatenessMs: number | null = null;
+  let closed = false;
+  const updateStage = () => {
+    if (closed) return;
+    const now = elapsed();
+    const total = (totals.get(stage) ?? 0) + now - stageSince;
+    totals.set(stage, total);
+    span.attribute(`kanban.reply.stage_ms.${stage}`, total);
+    stage = [...scopes.values()].at(-1)?.stage ?? baseStage;
+    stageSince = now;
+  };
+  // Parallel scopes can end in either order. Removing only this token preserves
+  // the newest scope still running instead of resurrecting a captured stage.
+  const enter = (next: SavedWrite.Stage, fiberId: number) => {
+    if (closed) return () => {};
+    const token = Symbol();
+    scopes.set(token, { stage: next, fiberId });
+    updateStage();
+    return () => {
+      if (scopes.delete(token)) updateStage();
+    };
+  };
+  const mark = (next: SavedWrite.Stage, fiberId: number) => {
+    if (closed) return;
+    const scope = [...scopes.values()].findLast((scope) => scope.fiberId === fiberId);
+    if (scope === undefined) baseStage = next;
+    else scope.stage = next;
+    updateStage();
+  };
   const parent = yield* SavedWrite.observer;
   const parentCommitting = yield* SavedWrite.commitObserver;
+  const call = yield* Effect.serviceOption(McpCall);
   let commitStarted = false;
   let receipt: SavedWrite.Saved | undefined;
+  const attributes = () => ({
+    "kanban.reply.stage_at_timeout": stageAtTimeout,
+    "kanban.reply.timed_out": timerLatenessMs !== null,
+    "kanban.reply.saved": receipt !== undefined ? true : commitStarted ? null : false,
+    "kanban.reply.commit_started": commitStarted,
+    "kanban.reply.elapsed_ms": elapsed(),
+    "kanban.reply.budget_ms": REPLY_BUDGET_MS,
+    "kanban.reply.timer_lateness_ms": timerLatenessMs,
+  });
   const fallback = (timedOut = false) => {
+    if (call._tag === "Some") call.value.replyFailure = timedOut ? "reply_timeout" : "reply_error";
+    if (call._tag === "Some") call.value.replyStage = stageAtTimeout ?? stage;
     const details =
       receipt?.kind === "card"
         ? {
@@ -58,11 +112,16 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
             : receipt === undefined
               ? "Board write reply timed out; the write may have been saved. Read back with card_get (evaluator_start: check board threads) before retrying."
               : "Saved; card_get for details.";
-    return Effect.logWarning("kanban saved write reply unavailable", {
-      timedOut,
-      saved,
-      commitStarted,
-    }).pipe(
+    const fields = attributes();
+    return Effect.annotateCurrentSpan(fields).pipe(
+      Effect.andThen(
+        Effect.logWarning("kanban saved write reply unavailable", {
+          timedOut,
+          saved,
+          commitStarted,
+          ...fields,
+        }),
+      ),
       Effect.as(
         new McpSchema.CallToolResult({
           isError: receipt === undefined,
@@ -79,7 +138,8 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
       ),
     );
   };
-  return yield* effect.pipe(
+  const work = effect.pipe(
+    Effect.provideService(SavedWrite.traceObserver, { span, enter, mark }),
     Effect.provideService(BoardLocks.writeWaitMs, ADMISSION_BUDGET_MS),
     Effect.provideService(SavedWrite.commitObserver, () => {
       commitStarted = true;
@@ -119,8 +179,34 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
         : Effect.succeed(result),
     ),
     Effect.catchCause((cause) => (receipt === undefined ? Effect.failCause(cause) : fallback())),
-    // timeoutOrElse joins the interrupted effect, including finalizers, before
-    // fallback reads the commit state. Never detach the losing write fiber.
-    Effect.timeoutOrElse({ duration: REPLY_BUDGET_MS, orElse: () => fallback(true) }),
+  );
+  // Capture the firing time before raceFirst joins cancellation finalizers. The
+  // eventual reply can be late because of cleanup even when the timer was on time.
+  let scheduledAt = 0;
+  const timer = Effect.suspend(() => {
+    scheduledAt = elapsed();
+    return Effect.sleep(REPLY_BUDGET_MS);
+  }).pipe(
+    Effect.andThen(
+      Effect.sync(() => {
+        stageAtTimeout = stage;
+        timerLatenessMs = Math.max(0, elapsed() - scheduledAt - REPLY_BUDGET_MS);
+      }),
+    ),
+    Effect.as(Option.none()),
+  );
+  return yield* work.pipe(
+    Effect.map(Option.some),
+    Effect.raceFirst(timer),
+    Effect.flatMap((result) =>
+      Option.isSome(result) ? Effect.succeed(result.value) : fallback(true),
+    ),
+    Effect.ensuring(
+      Effect.sync(() => {
+        updateStage();
+        closed = true;
+        for (const [key, value] of Object.entries(attributes())) span.attribute(key, value);
+      }),
+    ),
   );
 });

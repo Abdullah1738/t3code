@@ -101,10 +101,10 @@ const make = (
       Effect.sync(() => HttpRouter.toWebHandler(routeLayer, { disableLogger: true })),
       (handler) => Effect.promise(() => handler.dispose()),
     );
-    const request = (action: "plan" | "run" | "status", token?: string) =>
+    const request = (action: "plan" | "run" | "status", token?: string, query = "") =>
       Effect.promise(async () => {
         const response = await web.handler(
-          new Request(`http://test.local/api/ardud/control/harness-cutover/${action}`, {
+          new Request(`http://test.local/api/ardud/control/harness-cutover/${action}${query}`, {
             method: action === "run" ? "POST" : "GET",
             headers: token ? { authorization: `Bearer ${token}` } : {},
             ...(action === "run" ? { body: "{}" } : {}),
@@ -230,3 +230,85 @@ it("summarizes status without payloads; per-item rows only on request", () => {
   assert.notProperty(rows.items![0]!, "payload");
   assert.ok(!JSON.stringify(rows).includes("xxxx"));
 });
+
+const manyThreads: Cutover.CutoverStatus = {
+  active: false,
+  completed: true,
+  claimedThreadIds: Array.from(
+    { length: 32_003 },
+    (_, i) => `thread:project:${"workspace".repeat(10)}:${i}`,
+  ),
+  claimedRuns: Array.from({ length: 13 }, (_, i) => ({
+    threadId: `interrupted:${i}`,
+    runId: `source-run:${i}`,
+  })),
+  items: Array.from({ length: 32_003 }, (_, i) => ({
+    ...rolledBack.items[0]!,
+    key: `thread:${i}`,
+    ref: `thread:project:${"workspace".repeat(10)}:${i}`,
+    state: "briefed",
+    reason: null,
+    rolledBack: false,
+    payload: { transcript: "private payload" },
+  })),
+  refusals: [],
+};
+
+it.effect("pins completed status and run replies below 50 KB with 32k thread claims", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { request } = yield* make({ state: manyThreads, prepared: Effect.succeed(claims) });
+      for (const action of ["status", "run"] as const) {
+        const response = yield* request(action, action === "run" ? "maintain" : "read");
+        assert.strictEqual(response.status, 200);
+        assert.isBelow(Buffer.byteLength(JSON.stringify(response.body)), 50_000);
+        assert.deepStrictEqual(
+          response.body,
+          success({
+            ...summarizeStatus(manyThreads),
+            threadClaimsIncluded: false,
+            claimedThreadIds: [],
+            claimedRuns: [
+              ...manyThreads.claimedRuns,
+              ...(action === "status" ? claims.interruptedThreads : []),
+            ],
+          }),
+        );
+      }
+    }),
+  ),
+);
+
+it.effect.each([
+  { query: "", completed: false, full: true, items: false },
+  { query: "?claims=1", completed: true, full: true, items: false },
+  { query: "?claims=0", completed: true, full: false, items: false },
+  { query: "?items=1", completed: true, full: false, items: true },
+  { query: "?items=1&claims=1", completed: true, full: true, items: true },
+])("keeps active claims and explicit historical claims; items stay independent (%j)", (row) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const state = { ...manyThreads, active: !row.completed, completed: row.completed };
+      const { request } = yield* make({ state, prepared: Effect.succeed(claims) });
+      for (const action of ["status", "run"] as const) {
+        const response = yield* request(action, action === "run" ? "maintain" : "read", row.query);
+        assert.strictEqual(response.status, 200);
+        assert.deepStrictEqual(
+          response.body,
+          success({
+            ...summarizeStatus(state, row.items, row.full),
+            threadClaimsIncluded: row.full,
+            claimedThreadIds: row.full
+              ? [...state.claimedThreadIds, ...(action === "status" ? ["interrupted"] : [])]
+              : [],
+            claimedRuns: [
+              ...state.claimedRuns,
+              ...(action === "status" ? claims.interruptedThreads : []),
+            ],
+          }),
+        );
+        assert.notInclude(JSON.stringify(response.body), "private payload");
+      }
+    }),
+  ),
+);

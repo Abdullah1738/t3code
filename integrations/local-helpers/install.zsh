@@ -67,6 +67,7 @@ take_lock() {
 
 # repo dir -> live dir. Only files git knows about: keys, tokens, caches and state stay on the live side.
 typeset -A live=(
+  libexec/toollog "$HOME/.local/libexec/toollog"
   libexec/image-generation "$HOME/.local/libexec/image-generation"
   libexec/mail "$HOME/.local/libexec/mail"
   libexec/card-preview "$HOME/.local/libexec/card-preview"
@@ -81,6 +82,7 @@ typeset -A live=(
 typeset -A private=(kc-read 1 kc-write 1 otp-watch.py 1 tunnel.sh 1)
 # ~/.local/bin entries that point into other deployed integrations.
 links=(
+  "$HOME/.local/share/quint-guard/bin/quint:$HOME/.local/bin/quint"
   "$HOME/.config/opencode/skills/image-generation/scripts/genimg.py:$HOME/.local/libexec/image-generation/genimg.py"
   "$HOME/.bun/bin/hcloud:$HOME/.local/bin/hcloud"
   "$HOME/.local/bin/wa:$HOME/.local/share/robob-watch/helpers/wa"

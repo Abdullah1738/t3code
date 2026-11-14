@@ -11,6 +11,10 @@ import * as NodePath from "node:path";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
+import * as Context from "effect/Context";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as Analytics from "../../analytics/Analytics.ts";
+import type { AnalyticsEvent } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -21,6 +25,7 @@ import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
 
@@ -34,6 +39,7 @@ import {
   ProjectId,
   ThreadId,
   type KanbanActor,
+  type KanbanChange,
   type KanbanBoard,
   type KanbanLink,
   type ModelSelection,
@@ -77,14 +83,26 @@ interface FakeThread {
 }
 
 /** One test's outside world: its threads, the PRs they track and what the host says about PRs. */
-const makeWorld = (options: { readonly reader?: boolean } = {}) => {
+const makeWorld = (
+  options: {
+    readonly reader?: boolean;
+    readonly failCommit?: { armed: boolean };
+    readonly analytics?: AnalyticsEvent[];
+  } = {},
+) => {
   const threads = new Map<string, FakeThread>();
+  const rejectedAssignments = new Set<string>();
   /** The PRs a work thread tracks, as its view reports them. */
   const prs = new Map<string, ReadonlyArray<KanbanThreadPr>>();
   /** What the host answers when the wait PR reader asks. A PR not listed could not be read. */
-  const host: { readings: Array<Waits.WaitPrFacts>; asked: Array<ReadonlyArray<string>> } = {
+  const host: {
+    readings: Array<Waits.WaitPrFacts>;
+    asked: Array<ReadonlyArray<string>>;
+    before: Effect.Effect<void> | null;
+  } = {
     readings: [],
     asked: [],
+    before: null,
   };
   /**
    * Holds an evaluator's start: `entered` is done when the board tries to start one,
@@ -103,17 +121,31 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     count: 0,
   };
   /**
-   * Runs before the tick's closing dispatch reads the boards (its first read), so a
-   * test can fail or hold that dispatch after the tick's steps are done.
+   * Fails or holds a selected closing-dispatch read after the tick's steps are done.
    */
-  const closing: { before: Effect.Effect<void, KanbanStore.KanbanStoreError> | null } = {
-    before: null,
-  };
+  const closing: {
+    before: Effect.Effect<void, KanbanStore.KanbanStoreError> | null;
+    read: "candidate" | "planning" | "confirmation";
+  } = { before: null, read: "confirmation" };
+  const saving: {
+    fail: string | null;
+    failAttached: string | null;
+    ended: { id: string; done: Deferred.Deferred<void> } | null;
+  } = { fail: null, failAttached: null, ended: null };
+  const toldWaiters = new Map<string, Deferred.Deferred<void>>();
+  const waitForTold = (id: KanbanCard["id"]) =>
+    Effect.gen(function* () {
+      const done = yield* Deferred.make<void>();
+      toldWaiters.set(id, done);
+      const store = yield* KanbanStore.KanbanStore;
+      if ((yield* store.card(id))?.deciding?.toldAt != null) return;
+      yield* Deferred.await(done);
+    });
   const storeLayer = Layer.effect(
     KanbanStore.KanbanStore,
     Effect.gen(function* () {
       const store = yield* KanbanStore.KanbanStore;
-      const inClosingDispatch = Effect.map(
+      const closingRead = Effect.map(
         Effect.currentSpan.pipe(Effect.orElseSucceed(() => null)),
         (span) => {
           const names: Array<string> = [];
@@ -122,24 +154,52 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
             names.push(at.name);
             at = Option.getOrUndefined(at.parent);
           }
-          return (
-            names.includes("KanbanService.dispatchUnlocked") &&
-            names.includes("KanbanService.tickUnlocked")
-          );
+          if (
+            !names.includes("KanbanService.dispatchUnlocked") ||
+            !names.includes("KanbanService.tickUnlocked")
+          )
+            return null;
+          return names.includes("KanbanService.boardOf") ? "planning" : "candidate";
         },
       );
+      const beforeRead = (all: boolean) =>
+        Effect.suspend(() =>
+          closing.before === null
+            ? Effect.void
+            : closingRead.pipe(
+                Effect.flatMap((point) =>
+                  point !== null && closing.read === (all ? "confirmation" : point)
+                    ? (closing.before ?? Effect.void)
+                    : Effect.void,
+                ),
+              ),
+        );
       return KanbanStore.KanbanStore.of({
         ...store,
-        boards: Effect.suspend(() =>
-          closing.before === null
-            ? store.boards
-            : inClosingDispatch.pipe(
-                Effect.flatMap((inside) =>
-                  inside ? (closing.before ?? Effect.void) : Effect.void,
+        putCard: (card) =>
+          card.wait === undefined &&
+          (saving.fail === card.id ||
+            (saving.failAttached === card.id && card.discussionId !== null))
+            ? Effect.fail(
+                new KanbanStore.KanbanStoreError({
+                  operation: "putCard",
+                  cause: new Error("write unavailable"),
+                }),
+              )
+            : store.putCard(card).pipe(
+                Effect.tap(() =>
+                  card.wait === undefined && saving.ended?.id === card.id
+                    ? Deferred.succeed(saving.ended.done, undefined)
+                    : Effect.void,
                 ),
-                Effect.andThen(store.boards),
+                Effect.tap(() =>
+                  card.deciding?.toldAt != null && toldWaiters.has(card.id)
+                    ? Deferred.succeed(toldWaiters.get(card.id)!, undefined)
+                    : Effect.void,
+                ),
               ),
-        ),
+        boards: beforeRead(true).pipe(Effect.andThen(store.boards)),
+        board: (id) => beforeRead(false).pipe(Effect.andThen(store.board(id))),
       });
     }),
   ).pipe(Layer.provide(KanbanStore.layer));
@@ -200,7 +260,13 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
           return threadId;
         }),
       send: (input) =>
-        Effect.sync(() => void threads.get(input.threadId)?.messages.push(input.text)),
+        Effect.suspend(() =>
+          input.key && rejectedAssignments.delete(input.threadId)
+            ? Effect.fail(
+                new KanbanThreadError({ operation: "send", detail: "rejected", rejected: true }),
+              )
+            : Effect.sync(() => void threads.get(input.threadId)?.messages.push(input.text)),
+        ),
       model: (threadId) => Effect.sync(() => threads.get(threadId)?.model ?? null),
       withdraw: () => Effect.void,
       setModel: (threadId, model) =>
@@ -208,6 +274,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
           const thread = threads.get(threadId);
           if (thread) threads.set(threadId, { ...thread, model });
         }),
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
@@ -217,26 +284,61 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     KanbanWaitPrs,
     KanbanWaitPrs.of({
       read: (requests) =>
-        Effect.sync(() => {
-          host.asked.push(requests.map((request) => request.url));
-          const wanted = new Set(requests.map((request) => Waits.prKey(request.url)));
-          const read = host.readings
-            .filter((reading) => wanted.has(Waits.prKey(reading.url)))
-            .map((reading) => ({ ...reading, failedChecks: reading.failedChecks ?? [] }));
-          return {
-            readings: Waits.mergePrReadings(
-              requests.flatMap((request) => (request.live === null ? [] : [request.live])),
-              read,
-            ),
-            read: read.map((reading) => reading.url),
-            failed: requests
-              .filter((request) => !read.some((reading) => reading.url === request.url))
-              .map((request) => request.url),
-            carried: [],
-          };
-        }),
+        Effect.suspend(() => host.before ?? Effect.void).pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              host.asked.push(requests.map((request) => request.url));
+              const wanted = new Set(requests.map((request) => Waits.prKey(request.url)));
+              const read = host.readings
+                .filter((reading) => wanted.has(Waits.prKey(reading.url)))
+                .map((reading) => ({ ...reading, failedChecks: reading.failedChecks ?? [] }));
+              return {
+                readings: Waits.mergePrReadings(
+                  requests.flatMap((request) => (request.live === null ? [] : [request.live])),
+                  read,
+                ),
+                read: read.map((reading) => reading.url),
+                failed: requests
+                  .filter((request) => !read.some((reading) => reading.url === request.url))
+                  .map((request) => request.url),
+                carried: [],
+              };
+            }),
+          ),
+        ),
     }),
   );
+  const depth = Context.Reference<number>("TestWaitTransactionDepth", { defaultValue: () => 0 });
+  const database =
+    options.failCommit === undefined
+      ? Sqlite.layerMemory
+      : Layer.effect(
+          SqlClient.SqlClient,
+          Effect.map(
+            SqlClient.SqlClient,
+            (sql) =>
+              new Proxy(sql, {
+                get(target, property, receiver) {
+                  if (property !== "withTransaction")
+                    return Reflect.get(target, property, receiver);
+                  return <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+                    Effect.gen(function* () {
+                      const nesting = yield* depth;
+                      return yield* sql.withTransaction(
+                        effect.pipe(
+                          Effect.provideService(depth, nesting + 1),
+                          Effect.tap(() =>
+                            nesting === 0 && options.failCommit?.armed
+                              ? Effect.die("injected outer transaction failure")
+                              : Effect.void,
+                          ),
+                        ),
+                      );
+                    });
+                },
+              }),
+          ),
+        ).pipe(Layer.provideMerge(Sqlite.layerMemory));
   const layer = ScriptService.layer.pipe(
     Layer.provideMerge(KanbanService.layer),
     Layer.provideMerge(KanbanModels.layerTest(null)),
@@ -244,7 +346,17 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     // The reader is provided around the board's layers, the way server.ts does it.
     Layer.provideMerge(options.reader === false ? Layer.empty : readerLayer),
     Layer.provideMerge(storeLayer),
-    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(database),
+    Layer.provideMerge(
+      options.analytics === undefined
+        ? Layer.empty
+        : Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              Effect.sync(() => {
+                options.analytics!.push(event);
+              }),
+          }),
+    ),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
     Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
@@ -262,11 +374,14 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
       .filter((message) => message.includes(text)).length;
   return {
     threads,
+    rejectedAssignments,
     prs,
     host,
     gate,
     reading,
     closing,
+    saving,
+    waitForTold,
     layer,
     /** Messages anywhere that include `text`. */
     said,
@@ -584,6 +699,297 @@ it.effect("card: the worker starts when the card it waited on is done", () =>
   ),
 );
 
+it.effect.each(["thread", "pr"] as const)("local waits end before a stalled %s read", (blockedAt) =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      const timed = yield* placed(board, "Approved send", { stage: "completed", reviewStep: 1 });
+      yield* kanban.waitCard(
+        timed.id,
+        {
+          on: "time",
+          until: iso(T0 + MINUTE),
+          wakeRole: "evaluator",
+          note: "send after the agreed time",
+        },
+        owner,
+      );
+      const dependency = yield* placed(board, "Dependency", { stage: "in_review" });
+      const dependent = yield* placed(board, "Wait for dependency", { stage: "completed" });
+      yield* kanban.waitCard(
+        dependent.id,
+        { on: "card", card: dependency.id, wakeRole: "evaluator", note: "dependency done" },
+        owner,
+      );
+      yield* store.putCard({ ...dependency, stage: "completed" });
+      const approved = yield* placed(board, "Owner go", { stage: "completed" });
+      yield* kanban.askOwner(
+        approved.id,
+        { question: "Proceed?", blocking: false },
+        owner,
+        "owner",
+      );
+      yield* kanban.waitCard(
+        approved.id,
+        { on: "owner_go", ask: "q1", wakeRole: "evaluator", note: "owner decision" },
+        owner,
+      );
+      const row = yield* cardOf(approved.id);
+      yield* store.putCard({
+        ...row,
+        asks: row.asks.map((ask) => ({ ...ask, closedAt: iso(T0) as never })),
+      });
+      const pr = yield* placed(board, "Unrelated PR", {
+        stage: "in_review",
+        links: [tracked(PR)],
+        workThreadId: blockedAt === "thread" ? ThreadId.make("slow-thread") : null,
+      });
+      yield* kanban.waitCard(pr.id, { on: "merge", pr: PR, note: "PR first" }, owner);
+      yield* TestClock.setTime(T0 + 2 * MINUTE);
+      const entered = yield* Deferred.make<void>();
+      const open = yield* Deferred.make<void>();
+      const hold = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(open)));
+      if (blockedAt === "thread")
+        world.reading.during = (id) => (id === "slow-thread" ? hold : Effect.void);
+      else world.host.before = hold;
+      const tick = yield* Effect.forkChild(kanban.tick);
+      yield* Effect.raceFirst(
+        Deferred.await(entered),
+        Fiber.join(tick).pipe(
+          Effect.andThen(Effect.die("tick ended before reaching the outside read")),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        for (const card of [timed, dependent, approved]) {
+          assert.isUndefined(
+            (yield* cardOf(card.id)).wait,
+            `#${card.number} ended before the outside read finished`,
+          );
+        }
+        assert.isDefined((yield* cardOf(pr.id)).wait, "unknown PR remains waiting");
+      }).pipe(Effect.ensuring(Deferred.succeed(open, undefined)));
+      yield* Fiber.join(tick);
+    }),
+  ),
+);
+
+it.effect("an overdue wait warns once, reports failed saves, and retries next tick", () => {
+  const messages: unknown[] = [];
+  const logger = Logger.make(({ message }) => messages.push(message));
+  return inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      const card = yield* placed(board, "Retry approved send", { stage: "completed" });
+      yield* kanban.waitCard(
+        card.id,
+        { on: "time", until: iso(T0 + MINUTE), wakeRole: "evaluator", note: "approved send" },
+        owner,
+      );
+      world.saving.fail = card.id;
+      yield* TestClock.setTime(T0 + 7 * MINUTE);
+      yield* kanban.tick;
+      yield* kanban.tick;
+      assert.isDefined((yield* cardOf(card.id)).wait);
+      const lines = messages.map((message) => JSON.stringify(message));
+      assert.strictEqual(
+        lines.filter((line) => line.includes("kanban time wait overdue")).length,
+        1,
+      );
+      assert.isTrue(
+        lines.some(
+          (line) =>
+            line.includes("kanban wait pass") &&
+            line.includes('"failed":1') &&
+            line.includes('"overdue":1'),
+        ),
+      );
+      world.saving.fail = null;
+      yield* kanban.tick;
+      assert.isUndefined((yield* cardOf(card.id)).wait);
+      yield* world.waitForTold(card.id);
+      assert.strictEqual(world.toldEvaluator("no longer waiting"), 1);
+      assert.isTrue(
+        messages.some((message) => {
+          const line = JSON.stringify(message);
+          return (
+            line.includes("kanban wait pass") &&
+            line.includes('"ended":1') &&
+            line.includes('"overdue":0')
+          );
+        }),
+      );
+    }).pipe(Effect.provide(Logger.layer([logger]))),
+  );
+});
+
+it.effect("a later tick ends time waits while the previous tick is still reading PRs", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      const timed = yield* placed(board, "Future approved send", { stage: "completed" });
+      yield* kanban.waitCard(
+        timed.id,
+        { on: "time", until: iso(T0 + MINUTE), wakeRole: "evaluator", note: "send later" },
+        owner,
+      );
+      const pr = yield* placed(board, "Slow PR", { stage: "in_review", links: [tracked(PR)] });
+      yield* kanban.waitCard(pr.id, { on: "merge", pr: PR, note: "merge first" }, owner);
+      const entered = yield* Deferred.make<void>();
+      const open = yield* Deferred.make<void>();
+      world.host.before = Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(Deferred.await(open)),
+      );
+      const first = yield* Effect.forkChild(kanban.tick);
+      yield* Deferred.await(entered);
+      yield* Effect.gen(function* () {
+        assert.isDefined((yield* cardOf(timed.id)).wait);
+        yield* TestClock.setTime(T0 + 2 * MINUTE);
+        yield* kanban.tick;
+        assert.isUndefined((yield* cardOf(timed.id)).wait);
+      }).pipe(Effect.ensuring(Deferred.succeed(open, undefined)));
+      yield* Fiber.join(first);
+    }),
+  ),
+);
+
+it.effect("a later time wait ends while evaluator delivery is blocked", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      const first = yield* placed(board, "Send first", { stage: "completed" });
+      const second = yield* placed(board, "Continue second");
+      for (const card of [first, second]) {
+        yield* kanban.waitCard(
+          card.id,
+          {
+            on: "time",
+            until: iso(T0 + (card.id === first.id ? MINUTE : 3 * MINUTE)),
+            wakeRole: card.id === first.id ? "evaluator" : "work",
+            note: "approved next step",
+          },
+          owner,
+        );
+      }
+      const saved = yield* Deferred.make<void>();
+      world.saving.ended = { id: second.id, done: saved };
+      const hold = { entered: yield* Deferred.make<void>(), open: yield* Deferred.make<void>() };
+      world.gate.hold = hold;
+      yield* TestClock.setTime(T0 + 2 * MINUTE);
+      const tick = yield* Effect.forkChild(kanban.tick);
+      yield* Deferred.await(hold.entered);
+      yield* Effect.gen(function* () {
+        assert.isFalse(yield* Deferred.isDone(saved), "the second wait is not due yet");
+        yield* TestClock.setTime(T0 + 4 * MINUTE);
+        const next = yield* Effect.forkChild(kanban.tick);
+        yield* Effect.raceFirst(Deferred.await(saved), Fiber.join(next));
+        assert.isTrue(
+          yield* Deferred.isDone(saved),
+          "the second wait committed while the first delivery is blocked",
+        );
+        yield* Fiber.interrupt(next);
+        yield* Fiber.interrupt(tick);
+      }).pipe(Effect.ensuring(Deferred.succeed(hold.open, undefined)));
+      yield* world.waitForTold(first.id);
+    }),
+  ),
+);
+
+it.effect("a rolled-back local wait publishes neither its card nor its discussion", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      const card = yield* placed(board, "Atomic approved send", { stage: "completed" });
+      yield* kanban.waitCard(
+        card.id,
+        { on: "time", until: iso(T0 + MINUTE), wakeRole: "evaluator", note: "approved send" },
+        owner,
+      );
+      assert.isNull((yield* cardOf(card.id)).discussionId);
+      const seen: Array<KanbanChange> = [];
+      const before = yield* Deferred.make<void>();
+      const after = yield* Deferred.make<void>();
+      const stream = yield* kanban.changes;
+      const observer = yield* Effect.forkChild(
+        Stream.runForEach(stream, ({ change }) => {
+          if (change._tag === "board" && change.board.name === "before barrier")
+            return Deferred.succeed(before, undefined);
+          if (change._tag === "board" && change.board.name === "after barrier")
+            return Deferred.succeed(after, undefined);
+          if (
+            (change._tag === "card" && change.card.id === card.id) ||
+            (change._tag === "discussion" && change.discussion.cardId === card.id)
+          )
+            seen.push(change);
+          return Effect.void;
+        }),
+      );
+      world.saving.failAttached = card.id;
+      yield* TestClock.setTime(T0 + 2 * MINUTE);
+      yield* kanban.tick;
+      yield* kanban.announce(board.id, {
+        _tag: "board",
+        board: { ...board, name: "before barrier" },
+      });
+      yield* Deferred.await(before);
+      assert.deepStrictEqual(seen, [], "no rolled-back state reached clients or scripts");
+      assert.isDefined((yield* cardOf(card.id)).wait);
+      assert.isNull((yield* cardOf(card.id)).discussionId);
+      world.saving.failAttached = null;
+      yield* kanban.tick;
+      yield* world.waitForTold(card.id);
+      yield* kanban.announce(board.id, {
+        _tag: "board",
+        board: { ...board, name: "after barrier" },
+      });
+      yield* Deferred.await(after);
+      const saved = yield* cardOf(card.id);
+      assert.isUndefined(saved.wait);
+      assert.isNotNull(saved.discussionId);
+      assert.isNotNull(yield* store.discussion(saved.discussionId!));
+      assert.isTrue(
+        seen.some((change) => change._tag === "card" && change.card.wait === undefined),
+      );
+      assert.isTrue(
+        seen.some(
+          (change) => change._tag === "discussion" && change.discussion.id === saved.discussionId,
+        ),
+      );
+      assert.strictEqual(
+        (yield* eventsOf(card.id)).filter((event) => event.body?.startsWith("Wait ended:")).length,
+        1,
+      );
+      yield* Fiber.interrupt(observer);
+    }).pipe(Effect.scoped),
+  ),
+);
+
+it.effect("a failed PR read cannot keep a due time wait pending", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      const timed = yield* placed(board, "Approved send despite host failure", {
+        stage: "completed",
+      });
+      yield* kanban.waitCard(
+        timed.id,
+        { on: "time", until: iso(T0 + MINUTE), wakeRole: "evaluator", note: "approved send" },
+        owner,
+      );
+      const pr = yield* placed(board, "Unavailable PR", {
+        stage: "in_review",
+        links: [tracked(PR)],
+      });
+      yield* kanban.waitCard(pr.id, { on: "merge", pr: PR, note: "merge first" }, owner);
+      world.host.before = Effect.die(new Error("PR host unavailable"));
+      yield* TestClock.setTime(T0 + 2 * MINUTE);
+      yield* kanban.tick;
+      assert.isUndefined((yield* cardOf(timed.id)).wait);
+      assert.isDefined((yield* cardOf(pr.id)).wait);
+      yield* world.waitForTold(timed.id);
+    }),
+  ),
+);
+
 it.effect("time: the card is held until the time set, then its worker starts", () =>
   inWorld((world) =>
     Effect.gen(function* () {
@@ -812,6 +1218,7 @@ it.effect(
         yield* kanban.tick;
         yield* kanban.tick;
         assert.isUndefined((yield* cardOf(created.id)).wait);
+        yield* world.waitForTold(created.id);
         assert.strictEqual(
           world.toldEvaluator("is no longer waiting: The time you set has passed"),
           1,
@@ -840,6 +1247,7 @@ it.effect(
         );
         yield* TestClock.adjust(HOUR + MINUTE);
         yield* kanban.tick;
+        yield* world.waitForTold(created.id);
         // The wait is over and the evaluator was asked. The same tick did not complete the card.
         let card = yield* cardOf(created.id);
         assert.isUndefined(card.wait);
@@ -884,6 +1292,7 @@ it.effect("an evaluator that parks the card again in its turn keeps it out of Co
       );
       yield* TestClock.adjust(HOUR + MINUTE);
       yield* kanban.tick;
+      yield* world.waitForTold(created.id);
       const evaluator = ThreadId.make(
         [...world.threads].find(([, thread]) => thread.title.startsWith("Evaluator"))![0],
       );
@@ -971,51 +1380,52 @@ it.effect(
     ),
 );
 
-it.effect(
-  "an ask that cannot be sent holds a pushed wake's card until the limit, and a tick's card not at all",
-  () =>
-    inWorld((world) =>
-      Effect.gen(function* () {
-        const { kanban, board } = yield* setup;
-        world.gate.fail = true;
-        // From a write: the drain keeps trying, and the card is held until the limit.
-        const pushed = yield* reviewedAndParked(board);
-        const answering = yield* Effect.forkChild(
-          kanban
-            .answerWait(
-              pushed.id,
-              { result: "wake", note: "The author replied on the PR" },
-              { script: null },
-              owner,
-            )
-            .pipe(Effect.exit),
-        );
-        yield* Effect.yieldNow;
-        yield* kanban.tick;
-        assert.isUndefined((yield* cardOf(pushed.id)).wait);
-        assert.strictEqual((yield* cardOf(pushed.id)).stage, "in_review");
-        yield* TestClock.adjust(Waits.WAIT_DECIDE_MS - MINUTE);
-        yield* kanban.tick;
-        assert.strictEqual((yield* cardOf(pushed.id)).stage, "in_review");
-        yield* TestClock.adjust(2 * MINUTE);
-        yield* kanban.tick;
-        assert.strictEqual((yield* cardOf(pushed.id)).stage, "completed");
-        assert.strictEqual(world.toldEvaluator("is no longer waiting"), 0);
-        // The history says the evaluator was never told, not that it took too long.
-        const lines = (yield* eventsOf(pushed.id)).map((event) => event.body);
-        assert.include(lines, Waits.DECIDING_NEVER_TOLD);
-        assert.notInclude(lines, Waits.DECIDING_RAN_OUT);
-        yield* Fiber.interrupt(answering);
+it.effect("an undelivered evaluator wake holds both pushed and tick waits until the limit", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      world.gate.fail = true;
+      // From a write: the drain keeps trying, and the card is held until the limit.
+      const pushed = yield* reviewedAndParked(board);
+      const answering = yield* Effect.forkChild(
+        kanban
+          .answerWait(
+            pushed.id,
+            { result: "wake", note: "The author replied on the PR" },
+            { script: null },
+            owner,
+          )
+          .pipe(Effect.exit),
+      );
+      yield* Effect.yieldNow;
+      yield* kanban.tick;
+      assert.isUndefined((yield* cardOf(pushed.id)).wait);
+      assert.strictEqual((yield* cardOf(pushed.id)).stage, "in_review");
+      yield* TestClock.adjust(Waits.WAIT_DECIDE_MS - MINUTE);
+      yield* kanban.tick;
+      assert.strictEqual((yield* cardOf(pushed.id)).stage, "in_review");
+      yield* TestClock.adjust(2 * MINUTE);
+      yield* kanban.tick;
+      assert.strictEqual((yield* cardOf(pushed.id)).stage, "completed");
+      assert.strictEqual(world.toldEvaluator("is no longer waiting"), 0);
+      // The history says the evaluator was never told, not that it took too long.
+      const lines = (yield* eventsOf(pushed.id)).map((event) => event.body);
+      assert.include(lines, Waits.DECIDING_NEVER_TOLD);
+      assert.notInclude(lines, Waits.DECIDING_RAN_OUT);
+      yield* Fiber.interrupt(answering);
 
-        // From the tick: the send fails then and there, nobody was told, so nothing holds it.
-        const ticked = yield* reviewedAndParked(board);
-        yield* TestClock.adjust(2 * HOUR);
-        yield* kanban.tick;
-        const done = yield* cardOf(ticked.id);
-        assert.isUndefined(done.wait);
-        assert.strictEqual(done.stage, "completed");
-      }),
-    ),
+      // Tick wakes use the same durable delivery and decision limit as pushed wakes.
+      const ticked = yield* reviewedAndParked(board);
+      yield* TestClock.adjust(2 * HOUR);
+      yield* kanban.tick;
+      const done = yield* cardOf(ticked.id);
+      assert.isUndefined(done.wait);
+      assert.strictEqual(done.stage, "in_review");
+      yield* TestClock.adjust(Waits.WAIT_DECIDE_MS + MINUTE);
+      yield* kanban.tick;
+      assert.strictEqual((yield* cardOf(ticked.id)).stage, "completed");
+    }),
+  ),
 );
 
 it.effect("an evaluator that never ends its turn cannot keep a reviewed card from completing", () =>
@@ -1035,6 +1445,7 @@ it.effect("an evaluator that never ends its turn cannot keep a reviewed card fro
       );
       yield* TestClock.adjust(HOUR + MINUTE);
       yield* kanban.tick;
+      yield* world.waitForTold(created.id);
       assert.strictEqual(world.toldEvaluator("is no longer waiting"), 1);
       yield* TestClock.adjust(Waits.WAIT_DECIDE_MS - 2 * MINUTE);
       yield* kanban.tick;
@@ -1167,6 +1578,7 @@ it.effect("the history says so when the evaluator did not decide in time", () =>
       const created = yield* reviewedAndParked(board);
       yield* TestClock.adjust(HOUR + MINUTE);
       yield* kanban.tick;
+      yield* world.waitForTold(created.id);
       assert.strictEqual(world.toldEvaluator("is no longer waiting"), 1);
       yield* TestClock.adjust(Waits.WAIT_DECIDE_MS + MINUTE);
       yield* kanban.tick;
@@ -1930,30 +2342,33 @@ const wakingTick = Effect.gen(function* () {
   return { kanban, parked, worker, started: turns(5_000, startedOf(parked.id)) };
 });
 
-it.effect("a tick whose closing dispatch fails still gets the dispatch its steps asked for", () =>
-  inWorld((world) =>
-    Effect.gen(function* () {
-      const { kanban, parked, worker, started } = yield* wakingTick;
-      // The steps end the wait and note a kick; then the dispatch that was to stand
-      // in for that kick fails on its first read, once.
-      let failed = 0;
-      world.closing.before = Effect.suspend(() => {
-        world.closing.before = null;
-        failed += 1;
-        return Effect.fail(
-          new KanbanStore.KanbanStoreError({ operation: "boards", cause: "disk busy (test)" }),
-        );
-      });
-      const ticked = yield* Effect.exit(kanban.tick);
-      assert.strictEqual(failed, 1, "the closing dispatch failed");
-      assert.isTrue(Exit.isFailure(ticked), "the tick reports the failure");
-      assert.isUndefined((yield* cardOf(parked.id)).wait, "the tick's steps ended the wait");
-      // No second tick: the kick is queued and the worker dispatches.
-      assert.isTrue(yield* started, "the woken card was started without another tick");
-      assert.strictEqual((yield* cardOf(parked.id)).activeRole, "work");
-      yield* Fiber.interrupt(worker);
-    }),
-  ),
+it.effect.each(["candidate", "planning", "confirmation"] as const)(
+  "a tick whose closing dispatch fails still gets the dispatch its steps asked for (%s)",
+  (read) =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, parked, worker, started } = yield* wakingTick;
+        world.closing.read = read;
+        // The steps end the wait and note a kick; the closing dispatch fails once
+        // at the selected read, including confirmation after planning.
+        let failed = 0;
+        world.closing.before = Effect.suspend(() => {
+          world.closing.before = null;
+          failed += 1;
+          return Effect.fail(
+            new KanbanStore.KanbanStoreError({ operation: "boards", cause: "disk busy (test)" }),
+          );
+        });
+        const ticked = yield* Effect.exit(kanban.tick);
+        assert.strictEqual(failed, 1, "the closing dispatch failed");
+        assert.isTrue(Exit.isFailure(ticked), "the tick reports the failure");
+        assert.isUndefined((yield* cardOf(parked.id)).wait, "the tick's steps ended the wait");
+        // No second tick: the kick is queued and the worker dispatches.
+        assert.isTrue(yield* started, "the woken card was started without another tick");
+        assert.strictEqual((yield* cardOf(parked.id)).activeRole, "work");
+        yield* Fiber.interrupt(worker);
+      }),
+    ),
 );
 
 it.effect(
@@ -1978,3 +2393,299 @@ it.effect(
       }),
     ),
 );
+
+it.effect.each(["completed", "deployed"] as const)(
+  "a move to %s keeps an evaluator's card wait through restart and wakes it when the dependency completes",
+  (to) =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, store, board } = yield* setup;
+        const dependency = yield* placed(board, "Dependency", {
+          stage: "in_review",
+          reviewStep: 1,
+          links: [tracked(PR)],
+        });
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Evaluator gate",
+            prompt: "Evaluator gate",
+            description: "Explicit",
+            subtasks: [{ step: 1, owner: "evaluator", text: "Run after dependency" }],
+          },
+          owner,
+        );
+        yield* store.putCard({ ...card, stage: "in_review", reviewStep: 1 });
+        const evaluator: KanbanActor = {
+          _tag: "evaluator",
+          threadId: ThreadId.make("moving-evaluator"),
+        };
+        const waiting = yield* kanban.waitCard(
+          card.id,
+          {
+            on: "card",
+            card: dependency.id,
+            wakeRole: "evaluator",
+            note: "dependency first",
+          },
+          evaluator,
+        );
+        yield* TestClock.adjust(MINUTE);
+        const moved = yield* kanban.moveCard(card.id, to, "evaluator", evaluator);
+        assert.deepStrictEqual(moved.wait, { ...waiting.wait, at: moved.movedAt });
+        assert.strictEqual(moved.wait?.at, iso(T0 + MINUTE));
+        assert.isTrue(kanbanWaiting(moved));
+        yield* kanban.tick;
+        assert.isTrue(kanbanWaiting(yield* cardOf(card.id)));
+        assert.isFalse(
+          (yield* eventsOf(card.id)).some((event) => event.body?.startsWith("Wait ended:")),
+        );
+        yield* TestClock.adjust(MINUTE);
+        yield* Effect.gen(function* () {
+          const restarted = yield* KanbanService.KanbanService;
+          yield* restarted.tick;
+        }).pipe(Effect.provide(KanbanService.layer));
+        assert.deepStrictEqual((yield* cardOf(card.id)).wait, moved.wait);
+        yield* store.putCard({ ...(yield* cardOf(dependency.id)), stage: "completed" });
+        yield* kanban.tick;
+        yield* world.waitForTold(card.id);
+        assert.isUndefined((yield* cardOf(card.id)).wait);
+        assert.strictEqual(world.toldEvaluator("no longer waiting"), 1);
+      }),
+    ),
+);
+
+it.effect.each([
+  { owner: "evaluator", state: "open", kept: true },
+  { owner: "script", state: "open", kept: true },
+  { owner: "evaluator", state: "done", kept: false },
+  { owner: "script", state: "skipped", kept: false },
+  { owner: "work", state: "open", kept: false },
+  { owner: "review", state: "open", kept: false },
+] as const)("completed move wait policy: $owner $state", ({ owner: taskOwner, state, kept }) =>
+  inWorld(() =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Wait policy",
+          prompt: "Wait policy",
+          description: "Explicit",
+          subtasks: [{ step: 1, owner: taskOwner, text: "Remaining gate" }],
+        },
+        owner,
+      );
+      yield* store.putCard({
+        ...card,
+        stage: "in_review",
+        reviewStep: 1,
+        subtasks: card.subtasks.map((task) => ({ ...task, state })),
+      });
+      yield* kanban.waitCard(card.id, { on: "time", until: iso(T0 + HOUR), note: "later" }, owner);
+      yield* TestClock.adjust(MINUTE);
+      const moved = yield* kanban.moveCard(card.id, "completed", "owner", owner);
+      assert.strictEqual(kanbanWaiting(moved), kept);
+      assert.strictEqual(kanbanWaiting(yield* cardOf(card.id)), kept);
+      const events = (yield* eventsOf(card.id)).filter((event) =>
+        event.body?.startsWith("Wait ended:"),
+      );
+      assert.lengthOf(events, kept ? 0 : 1);
+      if (!kept) {
+        assert.isUndefined(moved.wait);
+        assert.strictEqual(events[0]?.kind, Waits.waitEventKind("wait_cleared"));
+        assert.strictEqual(
+          events[0]?.body,
+          `Wait ended: the card was moved to completed; it was waiting until ${iso(T0 + HOUR)}`,
+        );
+        assert.strictEqual(events[0]?.at, moved.movedAt);
+      }
+    }),
+  ),
+);
+
+it.effect(
+  "keepWait explicitly preserves a wait on a move to todo; a normal move clears it immediately",
+  () =>
+    inWorld(() =>
+      Effect.gen(function* () {
+        const { kanban, board } = yield* setup;
+        const card = yield* placed(board, "Explicit keep", { stage: "in_review", reviewStep: 1 });
+        const waiting = yield* kanban.waitCard(
+          card.id,
+          { on: "time", until: iso(T0 + HOUR), note: "later" },
+          owner,
+        );
+        yield* TestClock.adjust(MINUTE);
+        const kept = yield* kanban.moveCard(card.id, "todo", "owner", owner, { keepWait: true });
+        assert.deepStrictEqual(kept.wait, { ...waiting.wait, at: kept.movedAt });
+        assert.isTrue(kanbanWaiting(kept));
+        yield* TestClock.adjust(MINUTE);
+        const cleared = yield* kanban.moveCard(card.id, "completed", "owner", owner);
+        assert.isUndefined(cleared.wait);
+        assert.isUndefined((yield* cardOf(card.id)).wait);
+        assert.isTrue(
+          (yield* eventsOf(card.id)).some(
+            (event) =>
+              event.kind === Waits.waitEventKind("wait_cleared") &&
+              event.body?.includes("moved to completed"),
+          ),
+        );
+      }),
+    ),
+);
+
+it.effect("restart reconciliation releases a missing thread without voiding its live wait", () =>
+  inWorld(() =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      const card = yield* placed(board, "Recover parked card");
+      const waiting = yield* kanban.waitCard(
+        card.id,
+        { on: "time", until: iso(T0 + HOUR), note: "later" },
+        owner,
+      );
+      const missing = ThreadId.make("missing-after-restart");
+      yield* store.putCard({
+        ...waiting,
+        stage: "working",
+        activeRole: "work",
+        activeThreadId: missing,
+        activePool: "missing-pool",
+        workThreadId: missing,
+      });
+      yield* TestClock.adjust(MINUTE);
+      yield* Effect.gen(function* () {
+        const restarted = yield* KanbanService.KanbanService;
+        yield* restarted.tick;
+        yield* restarted.tick;
+        yield* restarted.tick;
+      }).pipe(Effect.provide(KanbanService.layer));
+      const recovered = yield* cardOf(card.id);
+      assert.isNull(recovered.activeThreadId);
+      assert.strictEqual(recovered.stage, "todo");
+      assert.strictEqual(recovered.movedAt, waiting.movedAt);
+      assert.deepStrictEqual(recovered.wait, waiting.wait);
+      assert.isTrue(kanbanWaiting(recovered));
+    }),
+  ),
+);
+
+it.effect("the stale safety net delivers the wake to the evaluator", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      const card = yield* placed(board, "Stale gate", { stage: "completed" });
+      const waiting = yield* kanban.waitCard(
+        card.id,
+        { on: "time", until: iso(T0 + HOUR), wakeRole: "evaluator", note: "later" },
+        owner,
+      );
+      yield* TestClock.adjust(MINUTE);
+      yield* store.putCard({ ...waiting, movedAt: iso(T0 + MINUTE) });
+      yield* kanban.tick;
+      yield* world.waitForTold(card.id);
+      assert.isUndefined((yield* cardOf(card.id)).wait);
+      assert.strictEqual(world.toldEvaluator("moved to completed while it waited"), 1);
+    }),
+  ),
+);
+
+it.effect("a preserved wait suppresses the evaluator step notification after an owner move", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Parked evaluator step",
+          prompt: "Parked evaluator step",
+          description: "Explicit",
+          subtasks: [{ owner: "evaluator", step: 1, text: "Do after the wait" }],
+        },
+        owner,
+      );
+      yield* store.putCard({ ...(yield* cardOf(card.id)), stage: "needs_owner" });
+      yield* kanban.waitCard(
+        card.id,
+        { on: "time", until: iso(T0 + HOUR), wakeRole: "evaluator", note: "later" },
+        owner,
+      );
+      const before = world.said("Do them");
+      yield* TestClock.adjust(MINUTE);
+      const moved = yield* kanban.moveCard(card.id, "completed", "owner", owner);
+      yield* kanban.tick;
+      assert.isTrue(kanbanWaiting(moved));
+      assert.strictEqual(world.said("Do them"), before);
+    }),
+  ),
+);
+
+it.effect(
+  "rejected reused assignment restores a stale wait so its requested wake is delivered",
+  () =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, store, board } = yield* setup;
+        const card = yield* placed(board, "Rejected assignment");
+        yield* kanban.dispatchNow;
+        const thread = (yield* cardOf(card.id)).activeThreadId!;
+        yield* kanban.moveCard(card.id, "todo", "owner", owner);
+        const waiting = yield* kanban.waitCard(
+          card.id,
+          { on: "time", until: iso(T0 + HOUR), wakeRole: "evaluator", note: "later" },
+          owner,
+        );
+        yield* TestClock.adjust(MINUTE);
+        yield* store.putCard({ ...waiting, movedAt: iso(T0 + MINUTE) });
+        world.rejectedAssignments.add(thread);
+        yield* kanban.dispatchNow;
+        const rolledBack = yield* cardOf(card.id);
+        assert.isNull(rolledBack.activeThreadId);
+        assert.deepStrictEqual(rolledBack.wait, waiting.wait);
+        assert.strictEqual(rolledBack.movedAt, iso(T0 + MINUTE));
+        yield* kanban.tick;
+        yield* world.waitForTold(card.id);
+        assert.isUndefined((yield* cardOf(card.id)).wait);
+        assert.strictEqual(world.toldEvaluator("moved to todo while it waited"), 1);
+      }),
+    ),
+);
+
+it.effect("a rolled-back local wait emits no lifecycle analytics", () => {
+  const failCommit = { armed: false };
+  const events: AnalyticsEvent[] = [];
+  const world = makeWorld({ failCommit, analytics: events });
+  return Effect.gen(function* () {
+    yield* TestClock.setTime(T0);
+    const { kanban, board } = yield* setup;
+    yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+    const card = yield* placed(board, "Wait", { stage: "needs_review" });
+    yield* kanban.waitCard(
+      card.id,
+      { on: "time", until: iso(T0 + MINUTE), wakeRole: "work", note: "Continue" },
+      owner,
+    );
+    events.length = 0;
+    yield* TestClock.setTime(T0 + 2 * MINUTE);
+    failCommit.armed = true;
+    yield* kanban.tick;
+    assert.equal((yield* cardOf(card.id)).stage, "needs_review");
+    assert.isDefined((yield* cardOf(card.id)).wait);
+    assert.isFalse(
+      events.some((event) => event.cardId === card.id && event.kind === "kanban.card_move"),
+    );
+    failCommit.armed = false;
+    yield* kanban.tick;
+    assert.equal((yield* cardOf(card.id)).stage, "todo");
+    assert.lengthOf(
+      events.filter(
+        (event) =>
+          event.cardId === card.id &&
+          event.kind === "kanban.card_move" &&
+          event.props?.to === "todo",
+      ),
+      1,
+    );
+  }).pipe(Effect.provide(world.layer));
+});

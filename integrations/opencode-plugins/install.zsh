@@ -26,7 +26,7 @@ pushed() {
 }
 
 # The import stays outside plugin/: OpenCode auto-loads each plugin/*.ts file.
-files=("$here"/lib/*.mjs "$here"/plugin/*.ts)
+files=("$here"/lib/*.ts "$here"/lib/*.mjs "$here"/plugin/*.ts)
 rc=0
 stamp="$(date +%Y%m%d-%H%M%S)-$$"
 [[ $mode != install ]] || pushed

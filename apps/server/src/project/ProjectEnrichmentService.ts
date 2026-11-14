@@ -230,48 +230,49 @@ export const make = Effect.fn("ProjectEnrichmentService.make")(function* (
     }
   });
 
-  const peek: ProjectEnrichmentService["Service"]["peek"] = Effect.fn(
-    "ProjectEnrichmentService.peek",
-  )(function* (workspaceRoot) {
-    const [repositoryIdentity, faviconPath] = yield* Effect.all(
-      [
-        Cache.getSuccess(repositoryIdentityCache, workspaceRoot),
-        Cache.getSuccess(faviconCache, workspaceRoot),
-      ] as const,
-      { concurrency: "unbounded" },
-    );
-    return {
-      repositoryIdentity: availableValue(repositoryIdentity),
-      faviconPath: availableValue(faviconPath),
-      repositoryIdentityResolved: isSuccessfullyResolved(repositoryIdentity),
-    };
-  });
+  // Every project read checks these caches; requestLane traces the actual queued work.
+  const peek: ProjectEnrichmentService["Service"]["peek"] = Effect.fnUntraced(
+    function* (workspaceRoot) {
+      const [repositoryIdentity, faviconPath] = yield* Effect.all(
+        [
+          Cache.getSuccess(repositoryIdentityCache, workspaceRoot),
+          Cache.getSuccess(faviconCache, workspaceRoot),
+        ] as const,
+        { concurrency: "unbounded" },
+      );
+      return {
+        repositoryIdentity: availableValue(repositoryIdentity),
+        faviconPath: availableValue(faviconPath),
+        repositoryIdentityResolved: isSuccessfullyResolved(repositoryIdentity),
+      };
+    },
+  );
 
-  const request: ProjectEnrichmentService["Service"]["request"] = Effect.fn(
-    "ProjectEnrichmentService.request",
-  )(function* (workspaceRoot) {
-    const [hasRepositoryIdentity, hasFaviconPath] = yield* Effect.all(
-      [Cache.has(repositoryIdentityCache, workspaceRoot), Cache.has(faviconCache, workspaceRoot)],
-      { concurrency: "unbounded" },
-    );
-    yield* Effect.all(
-      [
-        hasRepositoryIdentity
-          ? Effect.void
-          : requestLane(repositoryIdentityLane, workspaceRoot, "repositoryIdentity"),
-        hasFaviconPath ? Effect.void : requestLane(faviconLane, workspaceRoot, "faviconPath"),
-      ],
-      { concurrency: "unbounded", discard: true },
-    );
-  });
+  const request: ProjectEnrichmentService["Service"]["request"] = Effect.fnUntraced(
+    function* (workspaceRoot) {
+      const [hasRepositoryIdentity, hasFaviconPath] = yield* Effect.all(
+        [Cache.has(repositoryIdentityCache, workspaceRoot), Cache.has(faviconCache, workspaceRoot)],
+        { concurrency: "unbounded" },
+      );
+      yield* Effect.all(
+        [
+          hasRepositoryIdentity
+            ? Effect.void
+            : requestLane(repositoryIdentityLane, workspaceRoot, "repositoryIdentity"),
+          hasFaviconPath ? Effect.void : requestLane(faviconLane, workspaceRoot, "faviconPath"),
+        ],
+        { concurrency: "unbounded", discard: true },
+      );
+    },
+  );
 
-  const getAvailable: ProjectEnrichmentService["Service"]["getAvailable"] = Effect.fn(
-    "ProjectEnrichmentService.getAvailable",
-  )(function* (workspaceRoot) {
-    const available = yield* peek(workspaceRoot);
-    yield* request(workspaceRoot);
-    return available;
-  });
+  const getAvailable: ProjectEnrichmentService["Service"]["getAvailable"] = Effect.fnUntraced(
+    function* (workspaceRoot) {
+      const available = yield* peek(workspaceRoot);
+      yield* request(workspaceRoot);
+      return available;
+    },
+  );
 
   const invalidate: ProjectEnrichmentService["Service"]["invalidate"] = Effect.fn(
     "ProjectEnrichmentService.invalidate",

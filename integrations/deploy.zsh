@@ -34,6 +34,10 @@ rsync "${flags[@]}" \
   --exclude 'verification*' --exclude bin --exclude .gitignore --exclude README.md --exclude docs \
   "$src" "$dst"
 
+if [[ "$name" == app-api-cli && "${1:-}" != --dry-run ]]; then
+  "$HOME/.local/share/uv/tools/mitmproxy/bin/python" "$dst/order_tracker.py" configure-problem-checks
+fi
+
 if [[ "$name" == robob-watch ]]; then
   # Watcher directories also contain private state: sync only this source allowlist.
   rsync "${flags[@]}" --relative \
@@ -41,6 +45,8 @@ if [[ "$name" == robob-watch ]]; then
     "$src"./watchers/meds-nag/took.py \
     "$src"./watchers/forge-workouts/check.py \
     "$src"./watchers/gym-nudge/check.py \
+    "$src"./watchers/activity-digest/check.sh \
+    "$src"./watchers/activity-digest/summarize.py \
     "$dst"
 fi
 

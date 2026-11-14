@@ -5,6 +5,7 @@ import {
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { describe, expect, it, vi } from "vite-plus/test";
+import { createAnalyticsCollector, registerEnvironmentAnalytics } from "../analytics.ts";
 
 import {
   ASK_FEEDS_KEPT,
@@ -70,6 +71,59 @@ describe("askRouteUrl", () => {
 });
 
 describe("createAskApi", () => {
+  it("does not count render and badge receipts as owner actions", async () => {
+    const collector = createAnalyticsCollector({ surface: "web", send: async () => {} });
+    const record = vi.spyOn(collector, "record");
+    const unregister = registerEnvironmentAnalytics("receipt-test", collector);
+    try {
+      const { api } = harness(
+        () => json(200, { recorded: true }),
+        undefined,
+        () => ({
+          environmentId: "receipt-test",
+          base: "https://robob.example",
+          headers: {},
+          cookies: true,
+        }),
+      );
+      await api.seen!("c1", "q1", "web");
+      await api.notified!("c1", "q1");
+      expect(record).not.toHaveBeenCalled();
+      await api.answer("c1", "q1", { verdict: "approved" }, 0);
+      expect(record).toHaveBeenCalledWith(
+        "owner.action",
+        expect.objectContaining({ props: { method: "asks.answer", count: 1 } }),
+      );
+    } finally {
+      unregister();
+    }
+  });
+  it("sends metadata-only receipts once per surface and retries failures", async () => {
+    let fail = true;
+    const { api, sent } = harness(() =>
+      fail
+        ? json(503, { error: { code: "failed", message: "later" } })
+        : json(200, { recorded: true }),
+    );
+    await expect(api.seen!("c1", "q1", "web")).rejects.toThrow();
+    fail = false;
+    await api.seen!("c1", "q1", "web");
+    await api.seen!("c1", "q1", "web");
+    await api.seen!("c1", "q1", "mobile");
+    await api.notified!("c1", "q1");
+    expect(sent).toHaveLength(4);
+    expect(
+      sent.map((entry) => {
+        const { at: _at, ...body } = JSON.parse(String(entry.init.body));
+        return body;
+      }),
+    ).toEqual([
+      { surface: "web" },
+      { surface: "web" },
+      { surface: "mobile" },
+      { channel: "in_app" },
+    ]);
+  });
   it("reads the feed with the connection's own proof and no cookies", async () => {
     const { api, sent } = harness(() => json(200, { at: "now", open: [], closed: [] }));
     await api.feed({ closed: "7d" });

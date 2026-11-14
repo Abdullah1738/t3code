@@ -1,0 +1,9 @@
+#!/bin/sh
+# Local Android emulators are blocked on this Mac (owner rule 2026-10-09).
+cat >&2 <<'EOF'
+emulator: local Android emulators are disabled on this Mac.
+Use Run Cloud instead: load the run-cloud skill, then
+  rcsim create android --name "<what>" --purpose "<why>" [--install app-debug.apk]
+Heartbeat with `rcsim heartbeat` every 15 min and `rcsim release` when done (billed per minute).
+EOF
+exit 69

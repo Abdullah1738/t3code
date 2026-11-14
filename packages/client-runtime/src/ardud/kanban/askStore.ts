@@ -37,6 +37,7 @@ import { askReplyProblem } from "./askReply.ts";
 import { ASK_NOT_OWNER_DEVICE_TEXT } from "./askSecrets.ts";
 import { createAskSendQueue, type HeldSend } from "./askSendQueue.ts";
 import type { NeedsYouMark } from "./needsYouQueue.ts";
+import { analyticsForEnvironment, recordAnalytics, type AnalyticsCollector } from "../analytics.ts";
 
 export const askKey = (entry: Pick<KanbanAskFeedItem, "cardId" | "ask">): string =>
   `${entry.cardId}:${entry.ask.id}`;
@@ -117,6 +118,12 @@ export interface AskSendRef {
   readonly cardRef: string;
   readonly askId: string;
   readonly revision: number;
+  readonly analytics?: {
+    readonly boardId: string;
+    readonly cardId: string;
+    readonly discussionId?: string;
+    readonly createdAt: string;
+  };
   /** The ask was put away when he answered it: its being put away is then nothing new. */
   readonly snoozed?: boolean;
 }
@@ -337,6 +344,7 @@ export interface AskWatchHost {
 }
 
 export interface AskStoreHost {
+  readonly analyticsEnvironmentId?: () => string | null;
   readonly api: AskApi;
   readonly cell: AskStateCell;
   readonly watch: AskWatchHost;
@@ -368,6 +376,12 @@ const refOf = (entry: KanbanAskFeedItem): AskSendRef => ({
   cardRef: entry.cardRef,
   askId: entry.ask.id,
   revision: kanbanAskRevision(entry.ask),
+  analytics: {
+    boardId: entry.boardId,
+    cardId: entry.cardId,
+    ...(entry.discussionId ? { discussionId: entry.discussionId } : {}),
+    createdAt: entry.ask.at,
+  },
   ...(entry.snoozed === true ? { snoozed: true } : {}),
 });
 
@@ -390,6 +404,27 @@ export type AskStore = ReturnType<typeof createAskStore>;
 export function createAskStore(host: AskStoreHost) {
   const { api: askApi } = host;
   const get = host.cell.getState;
+  const answered = (collector: AnalyticsCollector | undefined, refs: ReadonlyArray<AskSendRef>) => {
+    for (const ref of refs) {
+      if (!ref.analytics) continue;
+      const { createdAt, ...ids } = ref.analytics;
+      const durationMs = Date.now() - Date.parse(createdAt);
+      collector?.record("ask.answer_sent", {
+        ...ids,
+        ...(Number.isFinite(durationMs) && durationMs >= 0 ? { durationMs } : {}),
+        props: { createdAt, phase: "ask", key: ref.askId, count: 1 },
+      });
+    }
+  };
+  const drop = (
+    send: AskSend,
+    reason: "undo" | "closed" | "connection-change" | "superseded",
+    count = send.refs.length,
+  ) =>
+    recordAnalytics(host.analyticsEnvironmentId?.(), "ask.dropped", {
+      boardId: send.boardId,
+      props: { count, reason },
+    });
   /** Set by `dispose`: from then on nothing is sent, read or written. */
   let disposed = false;
   const set = (patch: Partial<AskState>) => {
@@ -401,6 +436,7 @@ export function createAskStore(host: AskStoreHost) {
 
   function showAskToast(toast: Omit<AskToast, "id">, ms = 4_200) {
     if (disposed) return;
+    recordAnalytics(host.analyticsEnvironmentId?.(), "toast.show");
     if (toastTimer !== null) clearTimeout(toastTimer);
     toastTimer = null;
     const id = ++toastId;
@@ -420,6 +456,7 @@ export function createAskStore(host: AskStoreHost) {
   };
 
   let inFlight: Promise<void> | null = null;
+  let lastRefreshAt: number | null = null;
   let again = false;
   /** History asked for its asks and has none yet: the next good read of the feed asks again. */
   let closedOwed = false;
@@ -617,6 +654,7 @@ export function createAskStore(host: AskStoreHost) {
       again = true;
       return inFlight;
     }
+    lastRefreshAt = Date.now();
     if (get().feed === null) set({ status: "loading" });
     inFlight = askApi
       .feed()
@@ -673,59 +711,62 @@ export function createAskStore(host: AskStoreHost) {
   }
 
   let watchers = 0;
+  let fastWatchers = 0;
   let stopWatching: (() => void) | null = null;
-  let pollMs = 60_000;
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
+  const pollMs = () => (fastWatchers > 0 ? 30_000 : 60_000);
 
-  const restartPoll = () => {
-    if (pollTimer !== null) clearInterval(pollTimer);
-    pollTimer = setInterval(() => {
-      if (host.watch.isForeground()) void refreshAsks();
-    }, pollMs);
+  const poll = () => {
+    pollTimer = null;
+    if (disposed || watchers === 0) return;
+    if (
+      host.watch.isForeground() &&
+      inFlight === null &&
+      (lastRefreshAt === null || Date.now() - lastRefreshAt >= pollMs())
+    )
+      void refreshAsks();
+    pollTimer = setTimeout(poll, pollMs());
+  };
+
+  const schedulePoll = () => {
+    if (pollTimer !== null) clearTimeout(pollTimer);
+    const elapsed = lastRefreshAt === null ? pollMs() : Date.now() - lastRefreshAt;
+    pollTimer = setTimeout(poll, Math.max(0, pollMs() - elapsed));
   };
 
   /**
-   * Keeps the feed current while anything shows it: it is read again when a
-   * board's counts change (the board list feed), when the window comes back,
-   * and on a slow timer for edits that change no count. `fast` is the page
-   * itself; the sidebar count alone polls slowly.
+   * One poll for the page and sidebar together. Board pushes and foreground
+   * signals share its cadence; explicit refreshes after owner actions stay immediate.
    */
   function watchAsks(fast: boolean): () => void {
     if (disposed) return () => undefined;
     watchers += 1;
-    if (fast) {
-      pollMs = 15_000;
-      if (stopWatching !== null) restartPoll();
-    }
+    if (fast) fastWatchers += 1;
     if (stopWatching === null) {
-      let debounce: ReturnType<typeof setTimeout> | null = null;
       const soon = () => {
-        if (debounce !== null) clearTimeout(debounce);
-        debounce = setTimeout(() => void refreshAsks(), 400);
+        if (host.watch.isForeground()) schedulePoll();
       };
       const offBoards = host.watch.onBoardsChange(soon);
       const offForeground = host.watch.onForeground(soon);
-      restartPoll();
-      void refreshAsks();
       stopWatching = () => {
         offBoards();
         offForeground();
-        if (debounce !== null) clearTimeout(debounce);
-        if (pollTimer !== null) clearInterval(pollTimer);
+        if (pollTimer !== null) clearTimeout(pollTimer);
         pollTimer = null;
       };
     }
+    if (host.watch.isForeground() && lastRefreshAt === null) void refreshAsks();
+    schedulePoll();
+    let stopped = false;
     return () => {
-      if (disposed) return;
+      if (disposed || stopped) return;
+      stopped = true;
       watchers -= 1;
-      if (fast) {
-        pollMs = 60_000;
-        if (watchers > 0) restartPoll();
-      }
+      if (fast) fastWatchers -= 1;
       if (watchers === 0) {
         stopWatching?.();
         stopWatching = null;
-      }
+      } else schedulePoll();
     };
   }
 
@@ -893,6 +934,8 @@ export function createAskStore(host: AskStoreHost) {
     sending.add(send.id);
     patchSend(send.id, { state: "sending" });
     const first = send.refs[0]!;
+    const analytics = analyticsForEnvironment(host.analyticsEnvironmentId?.());
+    let accepted: ReadonlyArray<AskSendRef> = [];
     let outcome: "sent" | "stale" | "invalid" | "failed" | "denied" = "sent";
     let refusedCount = 0;
     let evaluator: AskSend["evaluator"];
@@ -939,8 +982,14 @@ export function createAskStore(host: AskStoreHost) {
           leaving,
         );
         refusedCount = giveBackRefused(send, result.results);
+        accepted = send.refs.filter((ref) =>
+          result.results.some(
+            (item) => item.ok && item.card === ref.cardRef && item.askId === ref.askId,
+          ),
+        );
       } else {
         await askApi.answer(first.cardRef, first.askId, send.body, first.revision, leaving);
+        accepted = [first];
       }
     } catch (error) {
       outcome = "failed";
@@ -948,6 +997,7 @@ export function createAskStore(host: AskStoreHost) {
       refusedCount = send.refs.length;
     }
     sending.delete(send.id);
+    if (!disposed && send.kind !== "hand") answered(analytics, accepted);
 
     const state = get();
     if (refusedCount === send.refs.length) {
@@ -1180,6 +1230,7 @@ export function createAskStore(host: AskStoreHost) {
       return snoozed[0]!.key;
     }
     const state = get();
+    drop(send, "undo");
     set({
       hidden: without(
         state.hidden,
@@ -1219,6 +1270,13 @@ export function createAskStore(host: AskStoreHost) {
       refs.filter((ref) => now.get(ref.key) === what).map((ref) => ref.key);
     const moved = keysOf("moved");
     const closed = keysOf("closed");
+    if (closed.length) drop(failed.send, "closed", closed.length);
+    if (moved.length) drop(failed.send, "superseded", moved.length);
+    if (!auto)
+      recordAnalytics(host.analyticsEnvironmentId?.(), "client.retry", {
+        boardId: failed.send.boardId,
+        props: { reason: "retry" },
+      });
     const label = refLabel({ ...failed.send, refs });
     if (moved.length + closed.length > 0) {
       const state = get();
@@ -1390,6 +1448,8 @@ export function createAskStore(host: AskStoreHost) {
    * moves on.
    */
   function noteAskAnswered(entry: KanbanAskFeedItem, body: AskAnswerBody, label: string) {
+    if (disposed) return;
+    answered(analyticsForEnvironment(host.analyticsEnvironmentId?.()), [refOf(entry)]);
     const key = askKey(entry);
     const send: AskSend = {
       ...baseSend(entry, key),
@@ -1430,6 +1490,12 @@ export function createAskStore(host: AskStoreHost) {
    */
   function dispose() {
     if (disposed) return;
+    const held = get().held;
+    if (held) drop(held.payload, "connection-change");
+    const failedSends = new Map(
+      Object.values(get().failed).map((entry) => [entry.send.id, entry.send]),
+    );
+    for (const send of failedSends.values()) drop(send, "connection-change");
     // Forms first: they hold what he typed for that server.
     host.cell.setState({ forms: {}, tried: {}, refused: {} });
     // The held answer is dropped, not flushed.
@@ -1439,6 +1505,7 @@ export function createAskStore(host: AskStoreHost) {
     stopWatching?.();
     stopWatching = null;
     watchers = 0;
+    fastWatchers = 0;
     again = false;
     closedOwed = false;
     focusedKey = null;

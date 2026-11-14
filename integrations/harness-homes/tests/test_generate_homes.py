@@ -76,6 +76,46 @@ class HarnessTestCase(unittest.TestCase):
             self.assertEqual(rc, 0, out.getvalue())
             return out.getvalue()
 
+    def test_quint_guard_path_in_all_generated_homes(self) -> None:
+        self.run_gen()
+        paths = [json.loads((self.claude / "settings.json").read_text())["env"]["PATH"]]
+        for harness in ["codex", "codex-cu"]:
+            paths.append(tomllib.loads((self.root / harness / "config.toml").read_text())["shell_environment_policy"]["set"]["PATH"])
+        expected = ":".join(self.manifest()["shellPathPrefix"] + self.manifest()["shellPath"])
+        fixture = self.tmp / "path-fixture"
+        raw = fixture / ".nvm/versions/node/v26.2.0/bin/quint"
+        wrapper = fixture / ".local/bin/quint"
+        link = fixture / ".local/share/quint-guard/bin/quint"
+        for executable in [raw, wrapper]:
+            write(executable, "#!/bin/sh\nexit 0\n")
+            executable.chmod(0o755)
+        link.parent.mkdir(parents=True)
+        link.symlink_to(wrapper)
+        for path in paths:
+            self.assertEqual(shutil.which("quint", path=path.replace("/Users/ardud", str(fixture))), str(link))
+            self.assertEqual(path, expected)
+            entries = path.split(":")
+            self.assertEqual(entries[:2], [
+                "/Users/ardud/.config/opencode/skills/remote-compute/scripts/blockers",
+                "/Users/ardud/.local/share/quint-guard/bin",
+            ])
+            for i, entry in enumerate(entries):
+                if "/.nvm/" in entry:
+                    self.assertGreater(i, 1)
+                    self.assertLess(i, entries.index("/Users/ardud/.local/bin"))
+
+    def test_generated_shared_mcp_connect_headroom(self) -> None:
+        self.run_gen()
+        env = json.loads((self.claude / "settings.json").read_text())["env"]
+        self.assertEqual(env["MCP_TIMEOUT"], "15000")
+        self.assertEqual(env["MCP_CONNECT_TIMEOUT_MS"], "15000")
+        for harness in ("codex", "codex-cu"):
+            config = tomllib.loads((self.root / harness / "config.toml").read_text())
+            for name in ("flighty", "inbody"):
+                self.assertEqual(config["mcp_servers"][name]["startup_timeout_sec"], 30)
+        rc, output = self.run_check()
+        self.assertEqual(rc, 0, output)
+
     def run_check(self, manifest: dict | None = None) -> tuple[int, str]:
         with mock.patch.object(gh, "load_manifest", return_value=manifest or self.manifest()):
             out = io.StringIO()
@@ -974,7 +1014,7 @@ class ParityTests(HarnessTestCase):
             self.assertIn("recall", {server["id"] for server in parity["mcpServers"]})
             self.assertEqual(parity["runtimeMcpServers"], ["t3-code"])
             self.assertEqual({guard["id"] for guard in parity["guards"]},
-                             {"hook-adapters", "live-database", "rootwide-search", "offbox", "betterstack-scope", "coord-haiku", "desktop-lease", "recall"})
+                             {"hook-adapters", "live-database", "rootwide-search", "quint-verify", "offbox", "betterstack-scope", "desktop-lease", "recall", "toollog"})
             self.assertFalse(parity["compactSkillCatalog"]["required"])
             self.assertEqual(parity["instructions"]["canonical"]["path"], str(self.canonical))
             self.assertFalse((home / "src").exists())
@@ -987,6 +1027,9 @@ class ParityTests(HarnessTestCase):
                 if Path(artifact["path"]).name == ".claude.json":
                     self.assertEqual(artifact["format"], "claude-owned-json")
                     content = gh.claude_owned_json(content)
+                elif Path(artifact["path"]).name == "config.toml":
+                    self.assertEqual(artifact["format"], "codex-owned-json")
+                    content = gh.codex_owned_json(content)
                 else:
                     self.assertNotIn("format", artifact)
                 self.assertEqual(artifact["sha256"], hashlib.sha256(content).hexdigest())
@@ -1009,8 +1052,10 @@ class ParityTests(HarnessTestCase):
                     _, _, _, _, planned = gh.plan_all(str(self.root))
                 parity = json.loads(planned[str(home / gh.PARITY_MANIFEST)])
                 artifact = next(artifact for artifact in parity["artifacts"] if artifact["path"] == str(path))
-                expected_bytes = gh.claude_owned_json(original) if name == ".claude.json" else original
-                actual_bytes = gh.claude_owned_json(path.read_bytes()) if name == ".claude.json" else path.read_bytes()
+                normalize = (gh.claude_owned_json if name == ".claude.json" else
+                             gh.codex_owned_json if name == "config.toml" else lambda value: value)
+                expected_bytes = normalize(original)
+                actual_bytes = normalize(path.read_bytes())
                 self.assertEqual(artifact["sha256"], hashlib.sha256(expected_bytes).hexdigest())
                 self.assertNotEqual(artifact["sha256"], hashlib.sha256(actual_bytes).hexdigest())
                 self.assertEqual(self.json_check()[0], 1)
@@ -1037,6 +1082,49 @@ class ParityTests(HarnessTestCase):
         content = b'{"runtime":42,"mcpServers":{"z":{"b":2,"a":"\\u65e5"},"a":{}},"hasCompletedOnboarding":true}'
         expected = '{"hasCompletedOnboarding":true,"mcpServers":{"a":{},"z":{"a":"日","b":2}}}'.encode("utf-8")
         self.assertEqual(gh.claude_owned_json(content), expected)
+
+    def test_codex_runtime_projects_survive_generate_without_parity_drift(self):
+        self.run_gen()
+        for home in (self.codex, self.codex_cu):
+            with self.subTest(home=home.name):
+                path = home / "config.toml"
+                parity_path = home / gh.PARITY_MANIFEST
+                parity_before = parity_path.read_bytes()
+                for projects in (
+                    {"/work/project": {"trust_level": "trusted"}},
+                    {"/work/space and 日常": {"trust_level": "untrusted"},
+                     '/work/a.b"c': {"trust_level": "trusted"}},
+                    {},
+                ):
+                    with self.subTest(projects=projects):
+                        config = tomllib.loads(path.read_text())
+                        config["projects"] = projects
+                        path.write_text(gh.toml_dump(config))
+                        self.assertEqual(self.json_check()[0], 0)
+                        self.run_gen()
+                        self.assertEqual(tomllib.loads(path.read_text())["projects"], projects)
+                        self.assertEqual(parity_path.read_bytes(), parity_before)
+                config = tomllib.loads(path.read_text())
+                config["features"]["memories"] = True
+                path.write_text(gh.toml_dump(config))
+                rc, result = self.json_check()
+                self.assertEqual(rc, 1)
+                self.assertTrue(any(f"{home.name}/config.toml: differs in features" in failure
+                                    for failure in result["failures"]), result)
+                self.run_gen()
+
+    def test_missing_installed_parity_source_refuses_generate_and_check(self):
+        self.run_gen()
+        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        manifest = self.manifest()
+        manifest["paritySources"]["offbox"] = [{"source": "not-in-installed-package.py",
+                                                 "installed": str(self.tmp / "missing/toollog.py")}]
+        with mock.patch.object(gh, "load_manifest", return_value=manifest):
+            for command in ("generate", "check"):
+                with self.subTest(command=command), contextlib.redirect_stderr(io.StringIO()) as out:
+                    self.assertEqual(gh.main([command, "--home-root", str(self.root)]), 1)
+                    self.assertIn("parity source missing or unreadable", out.getvalue())
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
 
     def test_all_roots_and_new_skills_change_inventory_without_fixed_count(self):
         second = self.tmp / "second-root"

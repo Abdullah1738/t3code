@@ -81,6 +81,24 @@ class LogCatchupTests(Isolated):
         self.assertIn('failed exit=7', out)
         self.assertEqual(err, '')
 
+    def test_detached_recovery_places_setup_before_command_output(self):
+        preamble = b'offbox: node v24.22.1\noffbox: pnpm v11.10.0\noffbox-command-started: run-x\n'
+        stdout = b'pytest failure details\n20 failed, 3 passed\n'
+        stderr = preamble + b'command error\n'
+        self.path.write_bytes(b'')
+        common.offsets_path(self.path).unlink(missing_ok=True)
+        self.streams(stdout, stderr, page=7)
+        self.state('failed', 1)
+        code, output, errors = self.invoke(wait=True)
+        self.assertEqual(code, 1)
+        expected = preamble + stdout + b'command error\n'
+        self.assertEqual(self.path.read_bytes(), expected)
+        self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=len(stdout), stderrOffset=len(stderr),
+                                                           logBytes=len(expected)))
+        self.assertIn(expected.decode(), output)
+        self.assertEqual(errors, '')
+        self.assertNotIn('pytest failure details', self.invoke(wait=True)[1])
+
     def test_uncommitted_suffix_is_removed_before_appending(self):
         with self.path.open('ab') as f:
             f.write(b'rest\nuncommitted')
@@ -143,6 +161,35 @@ class LogCatchupTests(Isolated):
                 report = out.getvalue() + err.getvalue() + str(raised.exception)
                 self.assertNotIn('done exit=0', report)
                 self.assertNotIn('remote exit 0', report)
+
+    def test_wait_replays_failure_recovered_from_a_recorded_zero(self):
+        self.con.execute("UPDATE runs SET step_count=1 WHERE run_id='run-x'")
+        self.con.commit()
+        failure = b'actual failed assertion\noffbox step 1 rc=7: check\n'
+        self.prefix(failure)
+        self.streams(failure, b'')
+        code, output, errors = self.invoke(wait=True)
+        self.assertEqual(code, 7)
+        self.assertIn(failure.decode(), output)
+        self.assertIn('failed exit=7', output)
+        self.assertNotIn('actual failed assertion', self.invoke(wait=True)[1])
+
+    def test_failure_tail_stops_at_sampled_size_when_history_grows(self):
+        self.path.write_bytes(b'x' * 20000)
+        tail = misc._tail
+        def grow(*args, **kwargs):
+            with self.path.open('ab') as log:
+                log.write(b'late failure\n' * 2000)
+            return tail(*args, **kwargs)
+        output = io.StringIO()
+        with patch.object(misc, '_tail', side_effect=grow), contextlib.redirect_stdout(output):
+            misc._failure_tail(self.path)
+        self.assertEqual(output.getvalue(), 'x' * 16384)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            misc._failure_tail(self.path)
+        self.assertIn('late failure', output.getvalue())
+        self.assertLessEqual(len(output.getvalue()), 16384)
 
     def test_no_checkpoint_does_not_guess_stream_offsets(self):
         common.offsets_path(self.path).unlink()
@@ -448,6 +495,53 @@ class LogCatchupTests(Isolated):
         self.assertEqual(self.path.stat().st_ino, inode)
         self.assertEqual(common.checkpoint(self.path)['logBytes'], 7)
 
+    def test_running_quiet_history_without_size_is_caught_up(self):
+        self.state('running', None)
+        self.history.side_effect = lambda box, cmd, which, offset, **kw: dict(
+            data='', nextOffset=offset, done=False)
+        ck = common.offsets_path(self.path).read_bytes()
+        before = self.path.stat()
+        self.assertEqual(misc._catch_up_log(self.row(), live=True), 'complete')
+        with patch.object(misc, '_refresh_running_ttl'):
+            code, out, err = self.invoke()
+        self.assertEqual((code, out), (0, 'prefix\n'))
+        self.assertNotIn('incomplete', err)
+        self.assertEqual([c.args[2:4] for c in self.history.call_args_list],
+                         [('stdout', 7), ('stderr', 0)] * 2)
+        self.assertEqual(self.path.read_bytes(), b'prefix\n')
+        self.assertEqual(self.path.stat().st_mtime_ns, before.st_mtime_ns)
+        self.assertEqual(common.offsets_path(self.path).read_bytes(), ck)
+
+    def test_running_history_without_size_appends_and_advances_both_streams(self):
+        self.state('running', None)
+        streams = dict(stdout='prefix\nrest €\n'.encode(), stderr=b'error\n')
+        def history(box, cmd, which, offset, **kw):
+            data = streams[which][offset:]
+            return dict(data=data.decode(), nextOffset=offset + len(data), done=False)
+        self.history.side_effect = history
+        self.assertEqual(misc._catch_up_log(self.row(), live=True), 'caught_up')
+        expected = streams['stdout'] + streams['stderr']
+        self.assertEqual(self.path.read_bytes(), expected)
+        self.assertEqual(common.checkpoint(self.path),
+                         dict(stdoutOffset=len(streams['stdout']), stderrOffset=len(streams['stderr']),
+                              logBytes=len(expected)))
+        with patch.object(misc, '_refresh_running_ttl'):
+            code, out, err = self.invoke()
+        self.assertEqual((code, out), (0, expected.decode()))
+        self.assertNotIn('incomplete', err)
+
+    def test_running_quiet_history_without_size_cannot_hide_uncheckpointed_bytes(self):
+        self.state('running', None)
+        with self.path.open('ab') as log:
+            log.write(b'uncheckpointed\n')
+        original = self.path.read_bytes()
+        ck = common.offsets_path(self.path).read_bytes()
+        self.history.side_effect = lambda box, cmd, which, offset, **kw: dict(
+            data='', nextOffset=offset, done=False)
+        self.assertEqual(misc._catch_up_log(self.row(), live=True), 'incomplete:history behind local log')
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(common.offsets_path(self.path).read_bytes(), ck)
+
     def test_stderr_only_prefix_with_stdout_zero_and_stderr_tail(self):
         prefix = b'e' * 4082
         tail = b'\n' + b'x' * 53 + b'\noffbox step 2 rc=0\n'
@@ -505,9 +599,13 @@ class LogCatchupTests(Isolated):
 
     def test_no_progress_preserves_original(self):
         self.history.side_effect = None
-        self.history.return_value = dict(data='', nextOffset=7, done=False, size=100)
-        self.assertEqual(misc._catch_up_log(self.row()), 'incomplete:no progress')
-        self.assertEqual(self.path.read_bytes(), b'prefix\n')
+        ck = common.offsets_path(self.path).read_bytes()
+        for size in ({'size': 100}, {}):
+            with self.subTest(size=size):
+                self.history.return_value = dict(data='', nextOffset=7, done=False, **size)
+                self.assertEqual(misc._catch_up_log(self.row()), 'incomplete:no progress')
+                self.assertEqual(self.path.read_bytes(), b'prefix\n')
+                self.assertEqual(common.offsets_path(self.path).read_bytes(), ck)
 
     def test_partial_second_stream_error_does_not_publish_stdout_tail(self):
         original = self.history.side_effect

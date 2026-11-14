@@ -1,3 +1,4 @@
+import { toolError, toolLog } from "./toollog.ts";
 import { posix, win32 } from "node:path";
 import {
   createGrpcClient,
@@ -11,7 +12,7 @@ import {
 } from "@photon-ai/advanced-imessage/grpc";
 import type { SharedTokenData, TokenData } from "@spectrum-ts/core";
 import type { Format } from "./formatting.ts";
-import { LINE_FAILURE_CODE } from "./line.ts";
+import { safeLineFailureCode, LINE_FAILURE_CODE } from "./line.ts";
 
 export type { CatchUpEvent } from "@photon-ai/advanced-imessage/grpc";
 
@@ -43,15 +44,16 @@ export class TransportError extends Error {
 /** Unknown outcomes may only be retried with the original durable idempotency key. */
 export function classifySendFailure(error: unknown): { retryable: boolean; uncertain: boolean; code: string } {
   if (error instanceof TransportError) {
+    const code = /^http_[1-5]\d{2}/.test(error.code) ? safeLineFailureCode(error.code) : error.code;
     const knownCode = [
       "invalidCredentials", "endpointOverride", "closed", "tokenNetwork", "invalidTokenResponse",
       "sharedPlanRequired", "invalidTokenLifetime", "invalidOperationId", "invalidOwner", "invalidOwnerChat",
       "unauthorized", "invalidAttachmentLimit", "invalidAttachment", "attachmentTooLarge",
       "catchupTimeout", "catchupIncomplete", "attachmentTimeout", "invalidEffect", "invalidPoll", "invalidApp",
-    ].includes(error.code) || (error.code.length === 12 && /^tokenHttp[1-5]\d{2}$/.test(error.code))
+    ].includes(code) || (code.length === 12 && /^tokenHttp[1-5]\d{2}$/.test(code))
       // Sendblue line failures carry their own retry and uncertainty flags (sb-transport.ts).
-      || LINE_FAILURE_CODE.test(error.code);
-    if (knownCode) return { retryable: error.retryable, uncertain: error.ambiguous, code: error.code };
+      || LINE_FAILURE_CODE.test(code);
+    if (knownCode) return { retryable: error.retryable, uncertain: error.ambiguous, code };
   }
   if (error instanceof IMessageError) {
     const code = Object.values(ErrorCode).includes(error.code) ? error.code : "unknownSendFailure";
@@ -167,7 +169,7 @@ export class Photon {
         redirect: "error",
         signal: AbortSignal.any([this.#abort.signal, AbortSignal.timeout(15_000)]),
       });
-    } catch {
+    } catch (caughtError) { toolError("photon", "photon.catch1", caughtError);
       this.#ensureOpen();
       throw new TransportError("tokenNetwork", true);
     }
@@ -175,7 +177,7 @@ export class Photon {
       await response.body?.cancel();
       throw new TransportError(`tokenHttp${response.status}`, response.status === 429 || response.status >= 500);
     }
-    const json = await response.json().catch(() => { throw new TransportError("invalidTokenResponse"); }) as {
+    const json = await response.json().catch((caughtError) => { toolError("photon", "photon.catch2", caughtError); throw new TransportError("invalidTokenResponse"); }) as {
       succeed?: boolean; data?: TokenData;
     } | null;
     const data = json?.data;
@@ -219,7 +221,7 @@ export class Photon {
         ...(input.enableLinkPreview ? { enableLinkPreview: true } : {}),
       });
       return { providerId: message.guid };
-    } catch (error) {
+    } catch (error) { toolError("photon", "photon.catch3", error);
       if (error instanceof IMessageError && error.code === ErrorCode.duplicateMessage) return { duplicate: true };
       throw error;
     }
@@ -238,7 +240,7 @@ export class Photon {
         providerId: poll.pollMessageGuid,
         options: poll.options.map(option => ({ optionIdentifier: option.optionIdentifier, text: option.text })),
       };
-    } catch (error) {
+    } catch (error) { toolError("photon", "photon.catch4", error);
       if (error instanceof IMessageError && error.code === ErrorCode.duplicateMessage) return { duplicate: true };
       throw error;
     }
@@ -251,7 +253,7 @@ export class Photon {
     if (!input.id.trim()) throw new TransportError("invalidOperationId");
     const chatGuid = canonicalRpcChat(input.chatGuid);
     let url: URL;
-    try { url = new URL(input.url); } catch { throw new TransportError("invalidApp"); }
+    try { url = new URL(input.url); } catch (caughtError) { toolError("photon", "photon.catch5", caughtError); throw new TransportError("invalidApp"); }
     if (url.protocol !== "https:" || !input.caption.trim()) throw new TransportError("invalidApp");
     const layout = {
       caption: input.caption,
@@ -265,7 +267,7 @@ export class Photon {
         clientMessageId: input.id,
       });
       return { providerId: message.guid };
-    } catch (error) {
+    } catch (error) { toolError("photon", "photon.catch6", error);
       if (error instanceof IMessageError && error.code === ErrorCode.duplicateMessage) return { duplicate: true };
       throw error;
     }
@@ -295,7 +297,7 @@ export class Photon {
         ...(input.replyTo === undefined ? {} : { replyTo: input.replyTo }),
       });
       return { providerId: message.guid };
-    } catch (error) {
+    } catch (error) { toolError("photon", "photon.catch7", error);
       if (error instanceof IMessageError && error.code === ErrorCode.duplicateMessage) return { duplicate: true };
       throw error;
     }
@@ -321,16 +323,21 @@ export class Photon {
   }
 
   async react(chatGuid: string, messageId: string, kind: ReactionKind, operationId: string): Promise<void> {
+    const at = performance.now();
+    let ok = false;
+    try {
     if (!operationId.trim()) throw new TransportError("invalidOperationId");
     const canonical = canonicalRpcChat(chatGuid);
     try {
       await this.#getClient().messages.setReaction(canonical, messageId, { kind }, true, {
         clientMessageId: operationId,
       });
-    } catch (error) {
-      if (error instanceof IMessageError && error.code === ErrorCode.duplicateMessage) return;
+    } catch (error) { toolError("photon", "photon.catch8", error);
+      if (error instanceof IMessageError && error.code === ErrorCode.duplicateMessage) { ok = true; return; }
       throw error;
     }
+      ok = true;
+    } finally { toolLog.capture(() => toolLog.write({ component: "photon", kind: "perf", name: "reaction.sent", ok, durationMs: performance.now() - at, ids: { messageId } })); }
   }
 
   /** Raw lookup, not an authorization source. Authorize using the originating event. */
@@ -348,7 +355,7 @@ export class Photon {
     const timer = setTimeout(() => {
       timedOut = true;
       // Cancellation failures must not replace the timeout reported by the generator.
-      timeoutClose = stream.close().catch(() => undefined);
+      timeoutClose = stream.close().catch((caughtError) => { toolError("photon", "photon.catch9", caughtError); return undefined; });
     }, 30_000);
     try {
       // Forward even ignored events and catchup.complete for the caller's checkpoint.
@@ -388,7 +395,7 @@ export class Photon {
     // Closing the public stream aborts the SDK download, including a pending read.
     const timer = setTimeout(() => {
       timedOut = true;
-      timeoutClose = stream.close().catch(() => undefined);
+      timeoutClose = stream.close().catch((caughtError) => { toolError("photon", "photon.catch10", caughtError); return undefined; });
     }, timeoutMs);
     try {
       for await (const chunk of stream) {

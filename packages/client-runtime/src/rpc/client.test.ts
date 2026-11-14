@@ -16,6 +16,7 @@ import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as TestClock from "effect/testing/TestClock";
@@ -33,10 +34,27 @@ import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import {
   EnvironmentRpcRequestObserver,
   request,
+  requestGuarded,
   runStream,
   subscribe,
   subscribeDynamicWithSession,
 } from "./client.ts";
+import {
+  analyticsRpcSerialization,
+  createAnalyticsCollector,
+  registerEnvironmentAnalytics,
+  type ClientAnalyticsEvent,
+} from "../ardud/analytics.ts";
+
+const analyticsExitCodec = Schema.toCodecJson(
+  Schema.Exit(
+    Schema.Unknown,
+    Schema.Struct({ _tag: Schema.String, message: Schema.String }),
+    Schema.Defect(),
+  ),
+);
+const encodeAnalyticsExit = Schema.encodeSync(analyticsExitCodec);
+const decodeAnalyticsExit = Schema.decodeUnknownSync(analyticsExitCodec);
 
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
@@ -89,6 +107,156 @@ const makeHarness = Effect.fn("TestEnvironmentRpc.makeHarness")(function* () {
 });
 
 describe("environment RPC", () => {
+  it.effect.each([
+    {
+      name: "typed failure",
+      cause: () => Cause.fail({ _tag: "KanbanError", message: "private failure" }),
+      tag: "KanbanError",
+    },
+    { name: "defect", cause: () => Cause.die(new TypeError("private defect")), tag: "TypeError" },
+    ...[
+      { name: "Error defect", defect: () => new Error("private defect"), tag: "Error" },
+      {
+        name: "tagged Error defect",
+        defect: () => Object.assign(new Error("private defect"), { _tag: "KanbanError" }),
+        tag: "Error",
+      },
+      { name: "plain message defect", defect: () => ({ message: "private defect" }), tag: "Error" },
+      {
+        name: "named message defect",
+        defect: () => ({ name: "TypeError", message: "private defect" }),
+        tag: "TypeError",
+      },
+      {
+        name: "unknown named message defect",
+        defect: () => ({ name: "private-name", message: "private defect" }),
+        tag: "unknown",
+      },
+      {
+        name: "tagged message defect",
+        defect: () => ({ _tag: "KanbanError", message: "private defect" }),
+        tag: "Error",
+      },
+      {
+        name: "private tagged message defect",
+        defect: () => ({ _tag: "private-tag", message: "private defect" }),
+        tag: "Error",
+      },
+      {
+        name: "conflicting named/tagged message defect",
+        defect: () => ({ _tag: "KanbanError", name: "TypeError", message: "private defect" }),
+        tag: "TypeError",
+      },
+      {
+        name: "invalid name message defect",
+        defect: () => ({ name: 9, message: "private defect" }),
+        tag: "Error",
+      },
+      {
+        name: "non-string message defect",
+        defect: () => ({ _tag: "KanbanError", message: 9 }),
+        tag: "KanbanError",
+      },
+      {
+        name: "null message defect",
+        defect: () => ({ name: "TypeError", message: null }),
+        tag: "TypeError",
+      },
+      { name: "tag-only defect", defect: () => ({ _tag: "KanbanError" }), tag: "KanbanError" },
+      { name: "name-only defect", defect: () => ({ name: "TypeError" }), tag: "TypeError" },
+      { name: "empty object defect", defect: () => ({}), tag: "unknown" },
+      { name: "string defect", defect: () => "private defect", tag: "unknown" },
+      { name: "number defect", defect: () => 9, tag: "unknown" },
+      { name: "null defect", defect: () => null, tag: "unknown" },
+      { name: "undefined defect", defect: () => undefined, tag: "unknown" },
+      { name: "array defect", defect: () => ["private defect"], tag: "unknown" },
+      {
+        name: "nested cause defect",
+        defect: () => ({
+          message: "private outer",
+          cause: { name: "TypeError", message: "private inner" },
+        }),
+        tag: "Error",
+      },
+    ].map(({ name, defect, tag }) => ({ name, cause: () => Cause.die(defect()), tag })),
+    { name: "interruption", cause: () => Cause.interrupt(), tag: "Interrupted" },
+    { name: "empty cause", cause: () => Cause.empty, tag: "unknown" },
+    {
+      name: "interrupt then typed failure",
+      cause: () =>
+        Cause.combine(
+          Cause.interrupt(),
+          Cause.fail({ _tag: "KanbanError", message: "private failure" }),
+        ),
+      tag: "KanbanError",
+    },
+    {
+      name: "interrupt then defect",
+      cause: () => Cause.combine(Cause.interrupt(), Cause.die(new TypeError("private defect"))),
+      tag: "TypeError",
+    },
+    {
+      name: "unknown failure",
+      cause: () => Cause.fail({ _tag: "private-tag", message: "private failure" }),
+      tag: "unknown",
+    },
+  ])("merges wire bytes and guarded completion for $name", ({ cause, tag }) =>
+    Effect.gen(function* () {
+      const events: ClientAnalyticsEvent[] = [];
+      const analytics = createAnalyticsCollector({
+        surface: "desktop",
+        send: async (batch) => {
+          events.push(...batch);
+        },
+      });
+      const unregister = registerEnvironmentAnalytics(TARGET.environmentId, analytics);
+      yield* Effect.addFinalizer(() => Effect.sync(unregister));
+      analytics.setRoute({ route: "board", boardId: "board-a" });
+      const parser = analyticsRpcSerialization(TARGET.environmentId).makeUnsafe();
+      const encoded = encodeAnalyticsExit(Exit.failCause(cause()));
+      const raw = JSON.stringify({ _tag: "Exit", requestId: 1, exit: encoded });
+      const client = {
+        [WS_METHODS.cloudGetRelayClientStatus]: () =>
+          Effect.gen(function* () {
+            parser.encode({
+              _tag: "Request",
+              id: 1,
+              tag: WS_METHODS.cloudGetRelayClientStatus,
+              payload: {},
+            });
+            analytics.setRoute({ route: "board", boardId: "board-b" });
+            parser.decode(raw);
+            const decoded = decodeAnalyticsExit(encoded);
+            if (Exit.isFailure(decoded)) return yield* Effect.failCause(decoded.cause);
+            return decoded.value;
+          }),
+      } as unknown as WsRpcProtocolClient;
+      const { activeSession, supervisor } = yield* makeHarness();
+      yield* SubscriptionRef.set(activeSession, Option.some(session(client)));
+      const result = yield* requestGuarded(WS_METHODS.cloudGetRelayClientStatus, {}).pipe(
+        Effect.exit,
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+      );
+      expect(Exit.isFailure(result)).toBe(true);
+      yield* Effect.promise(() => analytics.flush());
+      const summaries = events.filter((event) => event.kind === "rpc.summary");
+      expect(summaries).toHaveLength(1);
+      expect(summaries[0]).toMatchObject({
+        surface: "desktop",
+        boardId: "board-a",
+        props: {
+          method: WS_METHODS.cloudGetRelayClientStatus,
+          errorTag: tag,
+          count: 1,
+          bytes: new TextEncoder().encode(raw).byteLength,
+        },
+      });
+      expect(summaries[0]!.props!.p50Ms).toBeGreaterThanOrEqual(0);
+      expect(summaries[0]!.props!.p95Ms).toBeGreaterThanOrEqual(0);
+      expect(JSON.stringify(summaries)).not.toContain("private");
+    }),
+  );
+
   it.effect("reuses the session config stream instead of opening a duplicate subscription", () =>
     Effect.gen(function* () {
       const event: ServerConfigStreamEvent = {

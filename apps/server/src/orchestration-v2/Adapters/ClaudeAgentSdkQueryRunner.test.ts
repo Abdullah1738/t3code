@@ -214,12 +214,12 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
   // The CLI stops the MCP servers it started, but not their children: a
   // plugin's `bun server.ts` outlives its `bun run` wrapper (#3089). The child
   // holds a FIFO open, so its death reads as end-of-file here, with no polling.
-  it.effect("stops what the CLI left running when the session closes", () =>
+  it.effect("stops background shells and their children when the session closes", () =>
     Effect.gen(function* () {
       const cli = fakeClaudeCli(
         [
           'dir=$(dirname "$0")',
-          'sleep 600 > "$dir/alive" &',
+          `sh -c 'sleep 600 > "$1/alive" & echo $! > "$1/grandchild.pid"; wait' sh "$dir" &`,
           'echo $! > "$dir/leftover.pid"',
           "cat > /dev/null",
         ].join("\n"),
@@ -228,9 +228,11 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
       NodeChildProcess.execFileSync("mkfifo", [NodePath.join(dir, "alive")]);
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
-          try {
-            process.kill(Number(NodeFS.readFileSync(NodePath.join(dir, "leftover.pid"), "utf8")));
-          } catch {}
+          for (const file of ["leftover.pid", "grandchild.pid"]) {
+            try {
+              process.kill(Number(NodeFS.readFileSync(NodePath.join(dir, file), "utf8")));
+            } catch {}
+          }
           NodeFS.rmSync(dir, { recursive: true, force: true });
         }),
       );

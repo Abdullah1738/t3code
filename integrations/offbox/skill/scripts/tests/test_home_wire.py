@@ -2,6 +2,7 @@
 server restarted under. boatd's host side (Incus, systemd, ZFS) is test_boatd's fakes; HTTP, SQLite and the
 client are real."""
 import contextlib
+import importlib.util
 import io
 import json
 from pathlib import Path
@@ -13,10 +14,15 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS / "tests"))
-sys.path.insert(0, str(SCRIPTS.parents[1] / "tests"))
 from offbox_lib import api, cli, common, lease, misc, reap, runs, ssh_sync  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
-import test_boatd  # noqa: E402
+
+# Keep server fixtures off sys.path: client discovery has same-named test modules.
+_spec = importlib.util.spec_from_file_location(
+    "offbox_server_test_boatd", SCRIPTS.parents[1] / "tests" / "test_boatd.py")
+test_boatd = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = test_boatd
+_spec.loader.exec_module(test_boatd)
 
 boatd = test_boatd.boatd
 

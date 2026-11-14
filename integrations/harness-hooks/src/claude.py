@@ -16,9 +16,8 @@ def session_start():
         return
     home = Path.home()
     offbox = os.environ.get("HARNESS_HOOKS_OFFBOX_BLOCKERS", str(home / ".config/opencode/skills/remote-compute/scripts/blockers"))
-    coord = os.environ.get("HARNESS_HOOKS_COORD_BLOCKERS", str(home / ".local/share/harness-hooks/coord-blockers"))
     with open(env_file, "a", encoding="utf-8") as f:
-        f.write("export PATH=" + shlex.quote(offbox + ":" + coord) + ':"$PATH"\n')
+        f.write("export PATH=" + shlex.quote(offbox + ":" + str(home / ".local/share/quint-guard/bin")) + ':"$PATH"\n')
         f.write("export OFFBOX_GATE=1\nexport ROBOB_HARNESS=claude\n")
 
 

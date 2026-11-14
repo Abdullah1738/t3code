@@ -16,6 +16,7 @@ import {
   type KanbanOwnerAsk,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+import { analyticsForEnvironment } from "../analytics.ts";
 
 import type { AskAnswerBody } from "./askAnswer.ts";
 import {
@@ -85,6 +86,7 @@ const revisionIn = (error: unknown): number | null => {
 
 /** Where the ask routes are and how this client proves who it is. */
 export interface AskApiTarget {
+  readonly environmentId?: string;
   readonly base: string;
   readonly headers: Readonly<Record<string, string>>;
   /** The session rides in a cookie (the web app on its own server). */
@@ -252,6 +254,12 @@ export interface AskApi {
   }) => Promise<AskFeedRead>;
   /** One ask with its big blocks whole. */
   readonly detail: (cardRef: string, askId: string) => Promise<AskDetail>;
+  readonly seen?: (
+    cardRef: string,
+    askId: string,
+    surface: "web" | "desktop" | "mobile",
+  ) => Promise<unknown>;
+  readonly notified?: (cardRef: string, askId: string) => Promise<unknown>;
   /** One answer. `revision` is the ask as he read it; the server refuses an answer to another one. */
   readonly answer: (
     cardRef: string,
@@ -378,12 +386,35 @@ const cardPath = (cardRef: string, askId: string) =>
   `/cards/${encodeURIComponent(cardRef)}/asks/${encodeURIComponent(askId)}`;
 
 export function createAskApi(host: AskApiHost): AskApi {
+  const receipts = new Map<string, Promise<unknown>>();
+  async function receipt(
+    cardRef: string,
+    askId: string,
+    type: "seen" | "notified",
+    surface?: "web" | "desktop" | "mobile",
+  ) {
+    const key = JSON.stringify([host.target().environmentId, cardRef, askId, type, surface]);
+    const prior = receipts.get(key);
+    if (prior) return prior;
+    const pending = call("POST", `${cardPath(cardRef, askId)}/${type}`, {
+      // @effect-diagnostics-next-line globalDate:off - A client render timestamp, retained if its receipt arrives after the answer.
+      body: type === "seen" ? { surface, at: new Date().toISOString() } : { channel: "in_app" },
+    }).catch((error: unknown) => {
+      receipts.delete(key);
+      throw error;
+    });
+    if (receipts.size >= 4096) receipts.delete(receipts.keys().next().value!);
+    receipts.set(key, pending);
+    return pending;
+  }
   async function call<T>(
     method: "GET" | "POST",
     path: string,
     options: CallOptions = {},
   ): Promise<T> {
-    const { base, headers, cookies } = host.target();
+    const { base, headers, cookies, environmentId } = host.target();
+    const analytics = analyticsForEnvironment(environmentId);
+    const context = analytics?.context();
     const send = host.fetch ?? fetch;
     let response: Response;
     try {
@@ -427,6 +458,28 @@ export function createAskApi(host: AskApiHost): AskApi {
         revisionIn(error),
         typeof error?.reason === "string" ? error.reason : null,
       );
+    }
+    if (method === "POST" && analytics && !path.endsWith("/seen") && !path.endsWith("/notified")) {
+      const action = path.endsWith("/answer")
+        ? "asks.answer"
+        : path.endsWith("/reply")
+          ? "asks.reply"
+          : path.endsWith("/hand")
+            ? "asks.hand"
+            : "asks.snooze";
+      const result = json as {
+        card?: { id?: string };
+        answered?: number;
+        discussionId?: string;
+      } | null;
+      const details = {
+        ...context,
+        ...(result?.card?.id ? { cardId: result.card.id } : {}),
+        ...(result?.discussionId ? { discussionId: result.discussionId } : {}),
+        props: { method: action, count: result?.answered ?? 1 },
+      };
+      analytics.record("owner.action", details);
+      if (action === "asks.reply") analytics.record("discussion.post", details);
     }
     return json as T;
   }
@@ -527,6 +580,8 @@ export function createAskApi(host: AskApiHost): AskApi {
     },
     detail: async (cardRef, askId) =>
       readDetail(await call<unknown>("GET", cardPath(cardRef, askId))),
+    seen: (cardRef, askId, surface) => receipt(cardRef, askId, "seen", surface),
+    notified: (cardRef, askId) => receipt(cardRef, askId, "notified"),
     answer: (cardRef, askId, body, revision, keepalive = false) =>
       call<AskAnswered>("POST", `${cardPath(cardRef, askId)}/answer`, {
         body: { ...body, revision },

@@ -2031,7 +2031,13 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           compact,
         };
         yield* Effect.gen(function* () {
-          thread = turnInput.providerThread;
+          // The queued turn can predate background updates already received by this host.
+          thread = {
+            ...turnInput.providerThread,
+            ...(thread?.id === turnInput.providerThread.id
+              ? { pendingBackgroundTasks: thread.pendingBackgroundTasks ?? [] }
+              : {}),
+          };
           active = turn;
           yield* emit({
             type: "provider_turn.updated",

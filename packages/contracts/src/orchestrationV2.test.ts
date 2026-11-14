@@ -1266,6 +1266,13 @@ describe("orchestration V2 contracts", () => {
     expect(providerThread.pendingBackgroundTasks).toEqual([]);
     expect(providerThread.contextUsage).toBeNull();
     expect(providerThread.nativeMetadata).toBeNull();
+    expect(providerThread.pendingBackgroundWork).toBeUndefined();
+    for (const pendingBackgroundWork of [true, false]) {
+      const updated = { ...providerThread, pendingBackgroundWork };
+      expect(
+        decodeOrchestrationV2ProviderThreadJson(encodeOrchestrationV2ProviderThreadJson(updated)),
+      ).toEqual(updated);
+    }
 
     const runtimeThread = decodeOrchestrationV2ProviderThread({
       id: "provider-thread-2",

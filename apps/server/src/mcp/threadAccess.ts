@@ -77,7 +77,7 @@ export const loadCaller = Effect.fn("mcp.loadCaller")(function* () {
   }
   const threadId = scope.thread.threadId;
   const caller = yield* readCallerIdentity(threads, threadId, scope.thread.providerInstanceId).pipe(
-    Effect.mapError(unavailable),
+    Effect.mapError((error) => (error._tag === "OrchestratorMcpFailure" ? error : unavailable())),
     (effect) =>
       McpDeadline.withDeadline(effect, {
         code: "caller_unresolved",

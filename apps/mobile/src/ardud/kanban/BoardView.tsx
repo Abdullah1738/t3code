@@ -1,3 +1,4 @@
+import { AskTimingScrollView } from "./needsYou/AskTimingScrollView";
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/reactivity";
 import {
@@ -30,6 +31,8 @@ import { ageView } from "@t3tools/client-runtime/ardud/common";
 import { Fragment, useEffect, useRef, useState } from "react";
 import { Pressable, ScrollView, type TextInputInstance, View } from "react-native";
 import { WorkspacePaneDivider } from "../../features/layout/workspace-pane-divider";
+import { useAnalyticsSearch } from "../useAnalytics";
+import { usePairedEnvironmentId } from "../common/environment";
 
 import { AppText as Text } from "../../components/ui/AppText";
 import { Menu } from "../../components/ui/Menu";
@@ -201,6 +204,7 @@ export function BoardView(props: {
   useEffect(() => publishBoardFilter(boardId, filter), [boardId, filter]);
   const pickedGoalIds = filter.goalIds ?? [];
   const board = stageBoard(props.state, props.nowMs, filter);
+  useAnalyticsSearch(usePairedEnvironmentId(), "board", query.length, board.total, boardId);
   const picked = activeFilterCount(prefs);
   // The route measures the board and passes its layout; columns need the saved prefs too.
   const columnsLayout = boardLayout(props.width, columnPrefs);
@@ -332,7 +336,7 @@ function TabsBoard(props: {
   const shownOwner = allOwner ? owner : owner.slice(0, OWNER_PREVIEW);
 
   return (
-    <ScrollView
+    <AskTimingScrollView
       className="flex-1"
       contentContainerStyle={{ paddingBottom: props.bottomInset + 16 }}
       // The filter and Needs Owner scroll away; the stage tabs stay.
@@ -398,7 +402,7 @@ function TabsBoard(props: {
           </View>
         </>
       )}
-    </ScrollView>
+    </AskTimingScrollView>
   );
 }
 
@@ -820,14 +824,14 @@ function ColumnsBoard(props: {
       {props.mode === "threads" ? null : (
         <View className="flex-1 flex-row" style={{ gap: COLUMN_GAP }}>
           {layout.scrolls ? (
-            <ScrollView
+            <AskTimingScrollView
               horizontal
               className="flex-1"
               showsHorizontalScrollIndicator={false}
               contentContainerStyle={{ paddingLeft: BOARD_PAD }}
             >
               {stages}
-            </ScrollView>
+            </AskTimingScrollView>
           ) : (
             <View className="flex-1" style={{ paddingLeft: BOARD_PAD }}>
               {stages}
@@ -919,14 +923,14 @@ function columnMenuActions(
 
 function ColumnScroll(props: { readonly bottomInset: number; readonly children: React.ReactNode }) {
   return (
-    <ScrollView
+    <AskTimingScrollView
       className="flex-1"
       showsVerticalScrollIndicator={false}
       contentContainerClassName="gap-2 pt-1"
       contentContainerStyle={{ paddingBottom: props.bottomInset + 16 }}
     >
       {props.children}
-    </ScrollView>
+    </AskTimingScrollView>
   );
 }
 

@@ -2,6 +2,7 @@
 import contextlib
 import io
 import multiprocessing
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -10,9 +11,12 @@ import unittest
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skill/scripts'
-sys.path[:0] = [str(SCRIPTS), str(SCRIPTS / 'tests')]
+sys.path.insert(0, str(SCRIPTS))
 from offbox_lib import api, capacity, cli, common, identity, lease, misc, pool, reap, runs
-from test_capacity import Isolated
+if __package__:
+    from .client_fixtures import Isolated
+else:
+    from client_fixtures import Isolated
 
 
 def startup(path, barrier, queue, n):
@@ -128,16 +132,40 @@ class DatabaseContention(Isolated):
     def test_prestart_lock_foreground_and_background_never_fallback(self):
         from offbox_lib import fallback
         for extra in ([], ['--bg'], ['--remote']):
+            args = self.args(*extra)
+            args.steps = []
+            if args.bg:
+                # #101 re-execs: run the adopted child with the fault installed in its process.
+                runner = runs.Runner(args, self.me)
+                runner.register_pending()
+                payload = dict(args=vars(args), me=self.me, backend=common.backend(),
+                               ready_fd=None, accept_fd=None, signal_mask=[])
             with self.subTest(extra=extra), patch.object(runs.Runner, 'start',
                     side_effect=sqlite3.OperationalError('database is locked')), \
+                    patch.dict(os.environ), patch.object(runs, '_background_context', None), \
                     patch.object(fallback, 'run_local') as local, \
                     patch.object(fallback, 'note_infra_failure') as infra, \
                     contextlib.redirect_stderr(io.StringIO()) as stderr:
-                self.assertEqual(cli.cmd_run(self.args(*extra), self.me), 96)
+                result = (runs.background_queue(runner.run_id, payload) if args.bg else
+                          cli.cmd_run(args, self.me))
+                self.assertEqual(result, 96)
                 self.assertIn('nothing ran, safe to retry', stderr.getvalue())
                 self.assertNotIn('remote run error', stderr.getvalue())
                 local.assert_not_called()
                 infra.assert_not_called()
+
+    def test_real_prestart_writer_lock_keeps_run_path_wording(self):
+        for extra in ([], ['--bg'], ['--remote']):
+            with self.subTest(extra=extra), patch.object(common, 'DB_TIMEOUT', .01), \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.con.execute('BEGIN IMMEDIATE')
+                try:
+                    self.assertEqual(cli.cmd_run(self.args(*extra), self.me), 96)
+                finally:
+                    self.con.rollback()
+                self.assertIn('nothing ran, safe to retry', stderr.getvalue())
+                self.assertNotIn('could not detach', stderr.getvalue())
+                self.assertEqual(self.con.execute('SELECT count(*) FROM runs').fetchone()[0], 0)
 
     def test_registered_prestart_failure_names_run_id(self):
         def failed(runner):

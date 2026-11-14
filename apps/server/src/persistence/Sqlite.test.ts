@@ -4,6 +4,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeSqlite from "node:sqlite";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
@@ -18,6 +19,7 @@ import * as SqlitePersistence from "./Sqlite.ts";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as StartupPhaseLog from "../ardud/observability/StartupPhaseLog.ts";
+import { ServerActivation } from "../serverActivation.ts";
 
 const lockHolderSource = `
 const { DatabaseSync } = require("node:sqlite");
@@ -114,12 +116,91 @@ it.effect("logs the actual SQLite open, setup, migration, index and archive boun
       records.filter(
         ({ phase, outcome }) => /^sqlite\.migration\.\d+$/.test(phase) && outcome === "success",
       ).length,
-      67,
+      68,
     );
   }).pipe(
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true }))),
   );
 });
+
+it.effect(
+  "boots existing shell counts with inherited WAL and a held write lock before activation",
+  () => {
+    const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-startup-wal-"));
+    const filename = NodePath.join(directory, "state.sqlite");
+    const persistence = SqlitePersistence.layerFromPath(filename).pipe(
+      Layer.provide(NodeServices.layer),
+    );
+    return Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        yield* SqlClient.SqlClient;
+      }).pipe(Effect.provide(persistence));
+      const seed = NodeChildProcess.spawnSync(
+        process.execPath,
+        [
+          "-e",
+          `const { DatabaseSync } = require('node:sqlite');
+         const db = new DatabaseSync(process.argv[1]);
+         db.exec('PRAGMA wal_autocheckpoint=0; CREATE TABLE startup_pages(payload BLOB)');
+         db.exec('WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1200) INSERT INTO startup_pages SELECT randomblob(4000) FROM n');
+         process.exit(0);`,
+          filename,
+        ],
+        { encoding: "utf8" },
+      );
+      assert.equal(seed.status, 0, seed.stderr);
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const holder = yield* Effect.acquireRelease(
+            Effect.sync(() => new NodeSqlite.DatabaseSync(filename)),
+            (db) => Effect.sync(() => db.close()),
+          );
+          const pending = holder.prepare("PRAGMA wal_checkpoint(NOOP)").get();
+          assert.isAbove(Number(pending?.log) - Number(pending?.checkpointed), 1000);
+          const log = StartupPhaseLog.makeStartupPhaseLog(directory);
+          const startupLog = {
+            ...log,
+            start: (...args: Parameters<typeof log.start>) => {
+              if (args[0] === "sqlite.archive-shell-counts") holder.exec("BEGIN IMMEDIATE");
+              return log.start(...args);
+            },
+          };
+          yield* Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            assert.isTrue(holder.isTransaction);
+            assert.deepEqual(yield* sql`SELECT ready FROM ardud_shell_item_count_state`, [
+              { ready: 1 },
+            ]);
+            assert.deepEqual(yield* sql`SELECT COUNT(*) AS count FROM startup_pages`, [
+              { count: 1200 },
+            ]);
+            assert.deepEqual((yield* sql`PRAGMA wal_checkpoint(NOOP)`)[0], pending);
+            holder.exec("ROLLBACK");
+            yield* sql`INSERT INTO orchestration_v2_projection_turn_items
+            (turn_item_id,thread_id,ordinal,type,status,updated_at,payload_json)
+            VALUES ('startup-item','startup-thread',0,'text','completed','now','{}')`;
+            assert.deepEqual(
+              yield* sql`SELECT thread_id, run_key, item_count FROM ardud_shell_item_counts`,
+              [{ thread_id: "startup-thread", run_key: "", item_count: 1 }],
+            );
+          }).pipe(
+            Effect.provide(
+              SqlitePersistence.layerFromPath(filename).pipe(
+                Layer.provide(NodeServices.layer),
+                Layer.provide(Layer.succeed(ServerActivation, Effect.never)),
+                Layer.provide(Layer.succeed(StartupPhaseLog.StartupPhaseLog, startupLog)),
+              ),
+            ),
+          );
+        }),
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+      ),
+    );
+  },
+);
 
 const spawnWriteLockHolder = (dbPath: string, holdMs: number) =>
   Effect.promise(
@@ -137,6 +218,182 @@ const spawnWriteLockHolder = (dbPath: string, holdMs: number) =>
         );
       }),
   );
+
+it.effect.each(["absent", "empty", "filename"] as const)(
+  "reads a %s archive marker without checkpointing the startup WAL",
+  (marker) => {
+    const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "sqlite-marker-wal-"));
+    const filename = NodePath.join(directory, "state.sqlite");
+    return Effect.gen(function* () {
+      if (marker === "filename") {
+        const identity = yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          return (yield* sql<{
+            identity: string;
+          }>`SELECT identity FROM ardud_history_archive_identity`)[0]!.identity;
+        }).pipe(
+          Effect.provide(
+            SqlitePersistence.layerFromPath(NodePath.join(directory, "base.sqlite")).pipe(
+              Layer.provide(NodeServices.layer),
+            ),
+          ),
+        );
+        NodeFS.writeFileSync(
+          NodePath.join(directory, "shell-item-count-seed.json"),
+          JSON.stringify({ baseFilename: "base.sqlite", sequence: 0, identity, counts: [] }),
+        );
+      }
+      // Exit without sqlite3_close so the next connection inherits committed WAL frames.
+      const seeded = NodeChildProcess.spawnSync(
+        process.execPath,
+        [
+          "-e",
+          `const { DatabaseSync } = require("node:sqlite");
+           const db = new DatabaseSync(process.argv[1]);
+           db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;");
+           db.exec("CREATE TABLE marker_probe(value TEXT); INSERT INTO marker_probe VALUES ('committed');");
+           if (process.argv[2] !== "absent") db.exec("CREATE TABLE ardud_history_base_archive(filename TEXT)");
+           if (process.argv[2] === "filename") db.exec("INSERT INTO ardud_history_base_archive VALUES ('base.sqlite')");
+           process.exit(0);`,
+          filename,
+          marker,
+        ],
+        { encoding: "utf8" },
+      );
+      assert.equal(seeded.status, 0, seeded.stderr);
+      const before = {
+        main: NodeFS.readFileSync(filename),
+        wal: NodeFS.readFileSync(`${filename}-wal`),
+      };
+      assert.isAbove(before.wal.length, 0);
+      let afterMarker: typeof before | undefined;
+      const logger = StartupPhaseLog.makeStartupPhaseLog(directory);
+      const startupLog = {
+        ...logger,
+        end: (...args: Parameters<typeof logger.end>) => {
+          logger.end(...args);
+          if (args[0] === "sqlite.marker" && args[3] === "success") {
+            afterMarker = {
+              main: NodeFS.readFileSync(filename),
+              wal: NodeFS.existsSync(`${filename}-wal`)
+                ? NodeFS.readFileSync(`${filename}-wal`)
+                : Buffer.alloc(0),
+            };
+          }
+        },
+      };
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        assert.deepEqual(afterMarker, before);
+        assert.deepEqual(
+          [...(yield* sql`SELECT value FROM marker_probe`)],
+          [{ value: "committed" }],
+        );
+        const bases = yield* sql<{ file: string; name: string }>`PRAGMA database_list`.pipe(
+          NodeSqliteClient.readOnly,
+        );
+        assert.equal(
+          bases.find((row) => row.name === "ardud_base")?.file,
+          marker === "filename" ? NodePath.join(directory, "base.sqlite") : "",
+        );
+      }).pipe(
+        Effect.provide(
+          SqlitePersistence.layerFromPath(filename).pipe(
+            Layer.provide(NodeServices.layer),
+            Layer.provide(Layer.succeed(StartupPhaseLog.StartupPhaseLog, startupLog)),
+          ),
+        ),
+      );
+      const reopened = new NodeSqlite.DatabaseSync(filename, { readOnly: true });
+      try {
+        assert.deepEqual(
+          { ...reopened.prepare("PRAGMA integrity_check").get() },
+          { integrity_check: "ok" },
+        );
+      } finally {
+        reopened.close();
+      }
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+      ),
+    );
+  },
+);
+
+it.effect.each([
+  { journal: "DELETE", interrupted: false },
+  { journal: "DELETE", interrupted: true },
+  { journal: "TRUNCATE", interrupted: false },
+  { journal: "TRUNCATE", interrupted: true },
+  { journal: "PERSIST", interrupted: false },
+  { journal: "PERSIST", interrupted: true },
+  { journal: "WAL", interrupted: false },
+  { journal: "WAL", interrupted: true },
+  { journal: "MEMORY", interrupted: false },
+  { journal: "OFF", interrupted: false },
+])(
+  "opens $journal databases with interrupted=$interrupted transactions",
+  ({ journal, interrupted }) => {
+    const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "sqlite-marker-recovery-"));
+    const filename = NodePath.join(directory, "state.sqlite");
+    return Effect.gen(function* () {
+      const seeded = NodeChildProcess.spawnSync(
+        process.execPath,
+        [
+          "-e",
+          `const { DatabaseSync } = require("node:sqlite");
+         const db = new DatabaseSync(process.argv[1]);
+         db.exec("PRAGMA journal_mode=" + process.argv[2]);
+         db.exec("PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=0; PRAGMA cache_size=1;");
+         db.exec("CREATE TABLE marker_probe(value TEXT); INSERT INTO marker_probe VALUES ('committed');");
+         if (process.argv[3] === "true") {
+           db.exec("BEGIN IMMEDIATE; UPDATE marker_probe SET value='uncommitted';");
+           db.exec("CREATE TABLE pending_probe(payload BLOB)");
+           db.exec("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<50) INSERT INTO pending_probe SELECT randomblob(4096) FROM n");
+         } else db.close();
+         process.exit(0);`,
+          filename,
+          journal,
+          String(interrupted),
+        ],
+        { encoding: "utf8" },
+      );
+      assert.equal(seeded.status, 0, seeded.stderr);
+      if (journal !== "WAL" && interrupted) {
+        const readonly = new NodeSqlite.DatabaseSync(filename, { readOnly: true });
+        try {
+          const failure = assert.throws(() =>
+            readonly.prepare("SELECT * FROM sqlite_schema").all(),
+          );
+          assert.equal(sqliteErrorDetails(failure)?.errcode, 776);
+        } finally {
+          readonly.close();
+        }
+      }
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        assert.deepEqual(
+          [...(yield* sql`SELECT value FROM marker_probe`)],
+          [{ value: "committed" }],
+        );
+        assert.deepEqual(
+          [...(yield* sql`SELECT name FROM sqlite_schema WHERE name='pending_probe'`)],
+          [],
+        );
+        assert.deepEqual([...(yield* sql`PRAGMA integrity_check`)], [{ integrity_check: "ok" }]);
+      }).pipe(
+        Effect.provide(
+          SqlitePersistence.layerFromPath(filename).pipe(Layer.provide(NodeServices.layer)),
+        ),
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+      ),
+    );
+  },
+);
 
 it.effect("waits out a concurrent writer instead of failing with SQLITE_BUSY", () => {
   const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-sqlite-busy-"));

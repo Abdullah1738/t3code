@@ -9,6 +9,9 @@
  */
 import { KanbanError, isPairedDeviceSubject } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
+import * as Analytics from "../analytics/Analytics.ts";
+import { recordServerAnalytics } from "../../observability/RpcInstrumentation.ts";
 
 import { isOwnerSession } from "../auth/provenance.ts";
 import type { SessionOrigin } from "../auth/SessionOrigins.ts";
@@ -56,7 +59,22 @@ export const notOwnerDeviceRefusal = (session: OwnerGateSession): KanbanError | 
 };
 
 /** Fails with the refusal unless the session is the owner's own. */
-export const requireOwner = (session: OwnerGateSession): Effect.Effect<void, KanbanError> => {
+export const requireOwner = Effect.fn("Kanban.requireOwner")(function* (session: OwnerGateSession) {
   const refusal = ownerRefusal(session);
-  return refusal === null ? Effect.void : Effect.fail(refusal);
-};
+  if (refusal === null) return;
+  const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+  if (analytics._tag === "Some")
+    yield* recordServerAnalytics(analytics.value, {
+      ts: DateTime.formatIso(yield* DateTime.now),
+      kind: "auth.denied",
+      surface: "server",
+      route: "kanban.owner",
+      props: {
+        errorTag: "KanbanError",
+        span: "Kanban.requireOwner",
+        originKind: session.origin?._tag ?? "unknown",
+        reason: refusal.reason ?? "owner_session_required",
+      },
+    });
+  return yield* refusal;
+});
