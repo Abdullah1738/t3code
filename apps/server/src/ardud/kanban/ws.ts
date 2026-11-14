@@ -51,7 +51,8 @@ export const makeKanbanWsHandlers = (
 
   const updateBoard = (input: KanbanBoardUpdateInput) => {
     const { boardId, ...patch } = input;
-    return service.updateBoard(boardId, definedOnly(patch) as BoardPatch);
+    const update = service.updateBoard(boardId, definedOnly(patch) as BoardPatch, OWNER);
+    return patch.archived === undefined ? update : asOwner(update);
   };
 
   return {

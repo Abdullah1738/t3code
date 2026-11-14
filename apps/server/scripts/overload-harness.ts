@@ -311,6 +311,10 @@ const threads = Layer.effect(
     return KanbanThreads.of({
       view,
       find: view,
+      claimContext: (threadId) =>
+        Effect.map(view(threadId), (thread) =>
+          thread ? { projectId: thread.projectId, model } : null,
+        ),
       model: () => Effect.succeed(model),
       pendingUserInputs: () => Effect.succeed([]),
       lastFailure: () => Effect.succeed(null),

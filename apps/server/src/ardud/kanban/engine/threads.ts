@@ -46,6 +46,7 @@ export class KanbanThreadError extends Schema.TaggedError<KanbanThreadError>()(
     detail: Schema.String,
     rejected: Schema.optional(Schema.Boolean),
     wakeMessageId: Schema.optional(Schema.String),
+    sentRunId: Schema.optional(Schema.String),
   },
 ) {}
 
@@ -211,6 +212,7 @@ export interface KanbanThreadsShape {
     reason: string,
     cancelQueued?: boolean,
     runId?: string,
+    messageId?: string,
   ) => Effect.Effect<KanbanInterruptResult | void, KanbanThreadError>;
 }
 
@@ -264,8 +266,9 @@ const commandId = (prefix: string) => CommandId.make(`kanban:${prefix}:${NodeCry
 const detailOf = (error: unknown) =>
   error instanceof Error ? error.message : typeof error === "string" ? error : String(error);
 
-const sendError = (error: unknown, wakeMessageId?: string) => {
-  if (isKanbanThreadError(error) && wakeMessageId === undefined) return error;
+const sendError = (error: unknown, wakeMessageId?: string, sentRunId?: string) => {
+  if (isKanbanThreadError(error) && wakeMessageId === undefined && sentRunId === undefined)
+    return error;
   return new KanbanThreadError({
     ...(isKanbanThreadError(error)
       ? error
@@ -275,6 +278,7 @@ const sendError = (error: unknown, wakeMessageId?: string) => {
           rejected: isCommandPreviouslyRejected(error),
         }),
     ...(wakeMessageId === undefined ? {} : { wakeMessageId }),
+    ...(sentRunId === undefined ? {} : { sentRunId }),
   });
 };
 
@@ -470,7 +474,7 @@ const make = Effect.gen(function* () {
         runIds: [RunId.make(runId)],
       });
       return (
-        runs[0] !== undefined &&
+        runs[0] === undefined ||
         ["completed", "interrupted", "failed", "cancelled", "rolled_back"].includes(runs[0].status)
       );
     },
@@ -684,128 +688,144 @@ const make = Effect.gen(function* () {
 
   const send: KanbanThreadsShape["send"] = Effect.fn("KanbanThreads.send")(
     function* (input) {
-      const scope =
-        input.mode === "steer" || input.model !== undefined ? undefined : input.coalesce;
-      if (scope !== undefined && input.isStale?.()) return;
-      const shell = yield* threads.getThreadShell(input.threadId);
-      if (shell === null || shell.deletedAt !== null) {
-        return yield* new KanbanThreadError({ operation: "send", detail: "thread not found" });
-      }
-      if (scope === "nudge" && (yield* nudgeBlocked(input.threadId))) return;
-      let id = yield* sendId(input, pruneMessageWakes);
-      if (id === undefined) return;
-      // Queue edits cannot change a run's model selection or steer a live turn.
-      if (scope !== undefined) {
-        const records = yield* threads.getThreadRecords(input.threadId, ["runs", "messages"]);
+      let acceptedMessageId: string | undefined;
+      let acceptedRunId: string | undefined;
+      return yield* Effect.gen(function* () {
+        const scope =
+          input.mode === "steer" || input.model !== undefined ? undefined : input.coalesce;
         if (input.isStale?.()) return;
-        if (scope === "nudge" && hasQueuedMessage(records.runs)) {
-          yield* Effect.logDebug("kanban nudge skipped: unread message queued", {
-            threadId: input.threadId,
-          });
-          return;
+        const shell = yield* threads.getThreadShell(input.threadId);
+        if (shell === null || shell.deletedAt !== null) {
+          return yield* new KanbanThreadError({ operation: "send", detail: "thread not found" });
         }
-        const target = coalesceTarget(records.runs, scope);
-        if (target !== undefined) {
-          const message = records.messages.find((row) => row.id === target.userMessageId);
-          // A keyed no-op still needs an edit receipt so its retry cannot restore stale text.
-          if (message?.text === input.text && input.key === undefined) return target.id;
-          const edited = yield* Effect.result(
-            threads.dispatch({
-              type: "queued-run.edit",
-              commandId: CommandId.make(`kanban:send:${id}`),
+        if (scope === "nudge" && (yield* nudgeBlocked(input.threadId))) return;
+        let id = yield* sendId(input, pruneMessageWakes);
+        if (id === undefined) return;
+        // Queue edits cannot change a run's model selection or steer a live turn.
+        if (scope !== undefined) {
+          const records = yield* threads.getThreadRecords(input.threadId, ["runs", "messages"]);
+          if (input.isStale?.()) return;
+          if (scope === "nudge" && hasQueuedMessage(records.runs)) {
+            yield* Effect.logDebug("kanban nudge skipped: unread message queued", {
               threadId: input.threadId,
-              runId: target.id,
+            });
+            return;
+          }
+          const target = coalesceTarget(records.runs, scope);
+          if (target !== undefined) {
+            const message = records.messages.find((row) => row.id === target.userMessageId);
+            // A keyed no-op still needs an edit receipt so its retry cannot restore stale text.
+            if (message?.text === input.text && input.key === undefined) return target.id;
+            acceptedMessageId = target.userMessageId;
+            const edited = yield* Effect.result(
+              threads.dispatch({
+                type: "queued-run.edit",
+                commandId: CommandId.make(`kanban:send:${id}`),
+                threadId: input.threadId,
+                runId: target.id,
+                text: input.text,
+              }),
+            );
+            if (Result.isSuccess(edited)) {
+              acceptedRunId = target.id;
+              if (
+                scope === "nudge" &&
+                (yield* nudgeBlocked(input.threadId, {
+                  runId: target.id,
+                  messageId: target.userMessageId,
+                }))
+              )
+                return;
+              return target.id;
+            }
+            if (
+              !isCommandRejected(edited.failure) ||
+              edited.failure.cause !== `Run ${target.id} is not queued.`
+            ) {
+              if (
+                scope === "nudge" &&
+                (yield* nudgeBlocked(input.threadId, {
+                  runId: target.id,
+                  messageId: target.userMessageId,
+                }))
+              )
+                return;
+              return yield* sendError(edited.failure, target.userMessageId);
+            }
+            // The rejected edit owns its command id. Walk its receipt before sending once.
+            id = yield* sendId({ ...input, key: input.key ?? id });
+            if (id === undefined) return;
+          }
+        }
+        const deliver = Effect.gen(function* () {
+          if (input.isStale?.()) return;
+          // A post-dispatch projection failure still needs an identity for stale-wake withdrawal.
+          const messageId = MessageId.make(
+            scope === undefined ? `kanban:${id}` : `kanban:wake:${scope}:${id}`,
+          );
+          acceptedMessageId = messageId;
+          acceptedRunId = undefined;
+          const result = yield* Effect.result(
+            threads.sendToThread({
+              projectId: shell.projectId,
+              commandId: CommandId.make(`kanban:send:${id}`),
+              messageId,
+              threadId: input.threadId,
               text: input.text,
+              attachments: [],
+              ...(input.model ? { modelSelection: input.model } : {}),
+              mode: input.mode ?? "auto",
+              ...(input.mode === "steer" ? { activeTurnOnly: true } : {}),
+              createdBy: "system",
+              creationSource: "server",
             }),
           );
-          if (Result.isSuccess(edited)) {
-            if (
-              scope === "nudge" &&
-              (yield* nudgeBlocked(input.threadId, {
-                runId: target.id,
-                messageId: target.userMessageId,
-              }))
-            )
-              return;
-            return target.id;
+          if (Result.isFailure(result)) {
+            if (input.isStale?.()) {
+              const sent = (yield* threads.getThreadRecords(input.threadId, ["runs"]).pipe(
+                Effect.retry({ times: 1 }),
+                Effect.mapError((error) => sendError(error, messageId)),
+              )).runs.find((run) => run.userMessageId === messageId);
+              return yield* sendError(result.failure, messageId, sent?.id);
+            }
+            if (scope === "nudge" && (yield* nudgeBlocked(input.threadId, { messageId }))) return;
+            if (scope === undefined && input.mode !== "steer") {
+              const receipt = yield* receipts.getByCommandId({
+                commandId: CommandId.make(`kanban:send:${id}`),
+              });
+              if (Option.isSome(receipt) && receipt.value.status === "accepted")
+                yield* pruneMessageWakes(input.threadId, messageId);
+            }
+            return yield* sendError(result.failure, scope === undefined ? undefined : messageId);
+          }
+          const sent = result.success;
+          acceptedRunId = sent.run.id;
+          if (input.mode === "steer" && sent.delivery !== "steered") {
+            return yield* new KanbanThreadError({
+              operation: "send",
+              detail: "withdrawal did not steer a live run",
+              rejected: true,
+            });
+          }
+          if (scope === undefined && sent.delivery === "queued") {
+            yield* pruneMessageWakes(input.threadId, messageId);
           }
           if (
-            !isCommandRejected(edited.failure) ||
-            edited.failure.cause !== `Run ${target.id} is not queued.`
-          ) {
-            if (
-              scope === "nudge" &&
-              (yield* nudgeBlocked(input.threadId, {
-                runId: target.id,
-                messageId: target.userMessageId,
-              }))
-            )
-              return;
-            return yield* sendError(edited.failure, target.userMessageId);
-          }
-          // The rejected edit owns its command id. Walk its receipt before sending once.
-          id = yield* sendId({ ...input, key: input.key ?? id });
-          if (id === undefined) return;
-        }
-      }
-      const deliver = Effect.gen(function* () {
-        if (scope !== undefined && input.isStale?.()) return;
-        // A post-dispatch projection failure still needs an identity for stale-wake withdrawal.
-        const messageId = MessageId.make(
-          scope === undefined ? `kanban:${id}` : `kanban:wake:${scope}:${id}`,
-        );
-        const result = yield* Effect.result(
-          threads.sendToThread({
-            projectId: shell.projectId,
-            commandId: CommandId.make(`kanban:send:${id}`),
-            messageId,
-            threadId: input.threadId,
-            text: input.text,
-            attachments: [],
-            ...(input.model ? { modelSelection: input.model } : {}),
-            mode: input.mode ?? "auto",
-            ...(input.mode === "steer" ? { activeTurnOnly: true } : {}),
-            createdBy: "system",
-            creationSource: "server",
-          }),
-        );
-        if (Result.isFailure(result)) {
-          if (scope === "nudge" && (yield* nudgeBlocked(input.threadId, { messageId }))) return;
-          if (scope === undefined && input.mode !== "steer") {
-            const receipt = yield* receipts.getByCommandId({
-              commandId: CommandId.make(`kanban:send:${id}`),
-            });
-            if (Option.isSome(receipt) && receipt.value.status === "accepted")
-              yield* pruneMessageWakes(input.threadId, messageId);
-          }
-          return yield* sendError(result.failure, scope === undefined ? undefined : messageId);
-        }
-        const sent = result.success;
-        if (input.mode === "steer" && sent.delivery !== "steered") {
-          return yield* new KanbanThreadError({
-            operation: "send",
-            detail: "withdrawal did not steer a live run",
-            rejected: true,
-          });
-        }
-        if (scope === undefined && sent.delivery === "queued") {
-          yield* pruneMessageWakes(input.threadId, messageId);
-        }
-        if (
-          scope === "nudge" &&
-          sent.delivery === "queued" &&
-          (yield* nudgeBlocked(input.threadId, { runId: sent.run.id, messageId }))
-        )
-          return;
-        return sent.run.id;
-      });
-      return yield* input.mode === "steer"
-        ? deliver.pipe(
-            Effect.onError(() =>
-              discardWithdrawal(shell.projectId, input.threadId, id).pipe(Effect.asVoid),
-            ),
+            scope === "nudge" &&
+            sent.delivery === "queued" &&
+            (yield* nudgeBlocked(input.threadId, { runId: sent.run.id, messageId }))
           )
-        : deliver;
+            return;
+          return sent.run.id;
+        });
+        return yield* input.mode === "steer"
+          ? deliver.pipe(
+              Effect.onError(() =>
+                discardWithdrawal(shell.projectId, input.threadId, id).pipe(Effect.asVoid),
+              ),
+            )
+          : deliver;
+      }).pipe(Effect.mapError((error) => sendError(error, acceptedMessageId, acceptedRunId)));
     },
     Effect.mapError((error) => sendError(error)),
   );
@@ -864,7 +884,9 @@ const make = Effect.gen(function* () {
     ),
   );
 
-  const cancelQueued: KanbanThreadsShape["cancelQueued"] = Effect.fn("KanbanThreads.cancelQueued")(
+  const cancelQueuedRun: KanbanThreadsShape["cancelQueued"] = Effect.fn(
+    "KanbanThreads.cancelQueued",
+  )(
     function* (threadId, runId) {
       const run = (yield* threads.getThreadRecords(threadId, ["runs"])).runs.find(
         (row) => row.id === runId,
@@ -903,18 +925,35 @@ const make = Effect.gen(function* () {
     ),
   );
 
+  const cancelQueued = cancelQueuedRun;
+
   const interrupt: KanbanThreadsShape["interrupt"] = Effect.fn("KanbanThreads.interrupt")(
-    function* (threadId, reason, cancelQueued = false, runId) {
+    function* (threadId, reason, cancelQueued = false, runId, messageId) {
       const shell = yield* threads.getThreadShell(threadId);
       if (shell === null) return { outcome: "noop" } as const;
+      if (messageId !== undefined) {
+        const target = (yield* threads.getThreadRecords(threadId, ["runs"])).runs.find(
+          (run) => run.userMessageId === messageId,
+        );
+        if (target === undefined) return { outcome: "noop" } as const;
+        yield* cancelQueuedRun(threadId, target.id);
+        return yield* interrupt(threadId, reason, false, target.id);
+      }
       if (!cancelQueued) {
-        const result = yield* threads.interruptThread({
-          projectId: shell.projectId,
-          commandId: commandId("stop"),
-          threadId,
-          reason,
-          ...(runId === undefined ? {} : { runId: RunId.make(runId) }),
-        });
+        const result = yield* threads
+          .interruptThread({
+            projectId: shell.projectId,
+            commandId: commandId("stop"),
+            threadId,
+            reason,
+            ...(runId === undefined ? {} : { runId: RunId.make(runId) }),
+          })
+          .pipe(
+            Effect.catchTags({
+              ThreadManagementRunNotFoundError: () =>
+                Effect.succeed({ type: "no_active_run" } as const),
+            }),
+          );
         return result.type === "interrupt_requested"
           ? ({ outcome: "requested", runId: result.run.id } as const)
           : ({ outcome: "noop" } as const);

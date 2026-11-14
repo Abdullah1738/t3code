@@ -156,6 +156,16 @@ const vote = {
 afterEach(() => tolerateUnknownKanbanBlocks(false));
 
 describe("createKanbanClient", () => {
+  it.each([true, false])("sends archived=%s through the existing board update", async (archived) => {
+    const fake = fakeTransport();
+    const client = createKanbanClient(fake.transport);
+    const updated = client.updateBoard({ boardId: "board-toy" as never, archived });
+    const request = fake.take("kanban.board.update");
+    expect(request.input).toEqual({ boardId: "board-toy", archived });
+    request.resolve({});
+    await updated;
+  });
+
   it("lets the app read a message that carries a block of a kind its build doesn't know", () => {
     const fromLater = {
       seq: 1,
