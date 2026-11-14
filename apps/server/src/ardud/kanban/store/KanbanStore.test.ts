@@ -1830,7 +1830,25 @@ it.effect(
         card(11, "needs_owner"),
         { ...card(12, "todo"), settledAt: at },
       ];
-      yield* Effect.forEach(rows, (row) => store.putCard(row), { discard: true });
+      const exceptions = (["completed", "deployed", "verified", "needs_owner"] as const).flatMap(
+        (stage, index) => {
+          const base = 20 + index * 10;
+          return [
+            { ...card(base, stage), wait },
+            { ...card(base + 1, stage), deciding: { since: at, why: "Pending", toldAt: null } },
+            { ...card(base + 2, stage), activeThreadId: ThreadId.make(`held-${stage}`), wait },
+          ];
+        },
+      );
+      const settled = [...rows, ...exceptions].map((row, index) => ({
+        ...row,
+        id: KanbanCardId.make(`settled-${index}`),
+        number: 100 + index,
+        settledAt: at,
+      }));
+      yield* Effect.forEach([...rows, ...exceptions, ...settled], (row) => store.putCard(row), {
+        discard: true,
+      });
       const queries: string[] = [];
       const observe: Statement.Transformer = (statement) => {
         queries.push(statement.compile()[0]);
@@ -1840,17 +1858,20 @@ it.effect(
         yield* store
           .dispatchCards(boardId)
           .pipe(Effect.provideService(Statement.CurrentTransformer, observe)),
-        rows.slice(0, 7),
+        [...rows.slice(0, 7), ...exceptions],
       );
       const plan = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${queries[0]}`, [
         boardId,
+        boardId,
       ]);
       assert.isTrue(plan.some((row) => row.detail.includes("ardud_kanban_cards_dispatch")));
+      assert.isTrue(plan.some((row) => row.detail.includes("ardud_kanban_cards_open")));
+      assert.isFalse(plan.some((row) => /SCAN |TEMP B-TREE/.test(row.detail)));
       yield* store.putCard({ ...rows[7]!, stage: "todo" });
       yield* store.putCard({ ...rows[0]!, stage: "verified" });
       assert.deepStrictEqual(
         (yield* store.dispatchCards(boardId)).map((row) => row.number),
-        [2, 3, 4, 5, 6, 7, 8],
+        [2, 3, 4, 5, 6, 7, 8, ...exceptions.map((row) => row.number)],
       );
     }).pipe(Effect.provide(TestLayer)),
 );

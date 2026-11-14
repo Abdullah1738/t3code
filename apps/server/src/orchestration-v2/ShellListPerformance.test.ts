@@ -129,7 +129,7 @@ it.effect(
         assert.include(candidateQuery, "LIMIT ?");
       }
       for (const statement of statements) {
-        const plan = yield* sql.unsafe<{ detail: string }>(
+        const plan = yield* sql.unsafe<{ parent: number; detail: string }>(
           `EXPLAIN QUERY PLAN ${statement}`,
           Array.from({ length: (statement.match(/\?/g) ?? []).length }, () => null),
         );
@@ -141,6 +141,13 @@ it.effect(
         );
         assert.match(details, /SEARCH .*USING INDEX ardud_shell_executed_run_idx/, details);
         assert.match(details, /SEARCH .*USING INDEX ardud_shell_activity_run_idx/, details);
+        if (statement !== statements[0]) {
+          assert.match(details, /SEARCH .*USING INDEX ardud_shell_project_threads_idx/, details);
+          assert.isFalse(
+            plan.some((row) => row.parent === 0 && /USE TEMP B-TREE/.test(row.detail)),
+            details,
+          );
+        }
       }
       const archiveQuery = statements[0]!;
       const bindings = Array.from({ length: (archiveQuery.match(/\?/g) ?? []).length }, () => null);

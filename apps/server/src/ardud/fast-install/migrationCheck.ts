@@ -10,6 +10,7 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeOS from "node:os";
 import { migrationManifest, runMigrations } from "../../persistence/Migrations.ts";
+import { warmShellRunLookupPages } from "../../persistence/Migrations/068_ShellRunLookupIndexes.ts";
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 
 export async function runMigrationCheck(directory: string) {
@@ -24,7 +25,10 @@ export async function runMigrationCheck(directory: string) {
   }
   for (const name of ["statev2.sqlite", "boards.sqlite"]) {
     const file = NodePath.join(root, name);
-    if (NodeFS.existsSync(file) && (NodeFS.lstatSync(file).isSymbolicLink() || NodeFS.realpathSync(file) !== file)) {
+    if (
+      NodeFS.existsSync(file) &&
+      (NodeFS.lstatSync(file).isSymbolicLink() || NodeFS.realpathSync(file) !== file)
+    ) {
       throw new Error("Migration clone files must not link outside their directory");
     }
   }
@@ -53,6 +57,18 @@ export async function runMigrationCheck(directory: string) {
         : [];
       assertMigrationCompatibility(rows, migrationManifest);
       const latest = Math.max(0, ...rows.map((row) => row.migration_id));
+      // Page reads happen before the migrator acquires its writer. Report them
+      // separately so the per-migration budget measures the warmed DDL path.
+      if (latest >= 55 && latest < 68) {
+        const start = performance.now();
+        yield* warmShellRunLookupPages();
+        console.log(
+          JSON.stringify({
+            phase: "migration-read-preparation",
+            durationMs: performance.now() - start,
+          }),
+        );
+      }
       for (const [id, name] of migrationManifest) {
         if (id > latest) yield* timed(name, runMigrations({ toMigrationInclusive: id }));
       }
@@ -65,7 +81,11 @@ export async function runMigrationCheck(directory: string) {
       Effect.gen(function* () {
         yield* (yield* BoardsDatabase.BoardsDatabase).ready;
       }).pipe(
-        Effect.provide(BoardsDatabase.layerFromPaths(NodePath.join(root, "boards.sqlite"), state).pipe(Layer.provide(NodeServices.layer))),
+        Effect.provide(
+          BoardsDatabase.layerFromPaths(NodePath.join(root, "boards.sqlite"), state).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
         Effect.scoped,
         Effect.timeout("20 seconds"),
       ),
