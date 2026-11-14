@@ -161,5 +161,80 @@ class ToolLogTests(unittest.TestCase):
         self.assertEqual([r['name'] for r in self.rows()], ['sync.gap'])
 
 
+
+class IsolationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.live = self.home / '.robob/logs/tools/health'
+        self.live.mkdir(parents=True)
+        self.day = log.utcnow().date().isoformat()
+        (self.live / (self.day + '.ndjson')).write_text('{}\n')
+        self.before = self.snapshot()
+
+    def snapshot(self):
+        return {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in self.live.iterdir()}
+
+    def test_each_marker_drops_all_write_paths_without_override(self):
+        for marker in ('HEALTH_VAULT_TEST_COPY', 'PYTEST_CURRENT_TEST', 'unittest'):
+            for value in ('1', ''):
+                with self.subTest(marker=marker, value=value), mock.patch.dict(os.environ, {'HOME': str(self.home)}, clear=True):
+                    # unittest is already loaded; remove it to prove each env marker independently.
+                    modules = dict(sys.modules)
+                    if marker != 'unittest':
+                        modules.pop('unittest', None)
+                        os.environ[marker] = value
+                    with mock.patch.dict(sys.modules, modules, clear=True):
+                        self.assertIsNone(log.log_dir())
+                        with log.run('food', ['today']):
+                            pass
+                        log.emit('food', 'cli.run')
+                        log.conflicts([('other', 1)])
+                        log.delivery('card', 'a' * 32)
+                        log.sync_gap(None)
+                        self.assertIsNone(log.rollup(self.day))
+                        log.rollup_previous()
+                    self.assertEqual(self.snapshot(), self.before)
+
+    def test_explicit_override_writes_under_all_markers(self):
+        target = self.home / 'isolated'
+        with mock.patch.dict(os.environ, {'HOME': str(self.home), 'HEALTH_TOOLLOG_DIR': str(target),
+                         'HEALTH_VAULT_TEST_COPY': '', 'PYTEST_CURRENT_TEST': ''}, clear=True):
+            log.emit('food', 'cli.run')
+            self.assertIsNotNone(log.rollup(self.day))
+        self.assertEqual(len(list(target.glob('*.ndjson'))), 1)
+        self.assertEqual(self.snapshot(), self.before)
+
+    def test_empty_override_does_not_enable_live_writes(self):
+        with mock.patch.dict(os.environ, {'HOME': str(self.home), 'HEALTH_TOOLLOG_DIR': ''}, clear=True):
+            log.emit('food', 'cli.run')
+            self.assertIsNone(log.rollup(self.day))
+        self.assertEqual(self.snapshot(), self.before)
+
+    def test_production_fallback_in_fresh_process(self):
+        import subprocess
+        code = ('import sys, runpy; from pathlib import Path; '
+                'm = runpy.run_path(sys.argv[1]); '
+                'assert "unittest" not in sys.modules; '
+                'assert m["log_dir"]() == Path.home()/".robob/logs/tools/health"; '
+                'm["emit"]("food", "cli.run"); '
+                'assert m["rollup"](sys.argv[2]) is not None')
+        result = subprocess.run([sys.executable, '-I', '-c', code, str(log.__file__), self.day],
+                                env={'HOME': str(self.home)}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(self.snapshot(), self.before)
+        self.assertIn('rollup-' + self.day + '.json', self.snapshot())
+
+    def test_guard_failures_still_never_raise_or_hide_original_error(self):
+        with mock.patch.object(log, 'log_dir', side_effect=RuntimeError('guard failure')):
+            log.emit('food', 'cli.run')
+            self.assertIsNone(log.rollup())
+            log.rollup_previous()
+            with self.assertRaisesRegex(ValueError, 'tool failure'):
+                with log.run('food'):
+                    raise ValueError('tool failure')
+
+
 if __name__ == '__main__':
     unittest.main()
