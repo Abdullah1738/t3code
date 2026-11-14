@@ -112,6 +112,54 @@ describe("evaluatePullRequestWatch", () => {
     );
   });
 
+  it.each(
+    (
+      [
+        { status: "failure", required: false },
+        { status: "cancelled", required: false },
+        { status: "action-required", required: false },
+        { status: "success", required: true },
+        { status: "success", required: false },
+      ] as const
+    ).flatMap((verdict) => [false, true].map((returnSettling) => ({ ...verdict, returnSettling }))),
+  )(
+    "reports $status again once when the observed head returns during settling (required=$required, lag=$returnSettling)",
+    ({ status, required, returnSettling }) => {
+      const checks = [{ ...check("aggregate", status), required }];
+      const settled = detail({
+        headSha: "aaaaaaaaaa",
+        headBranchSha: "aaaaaaaaaa",
+        checksHeadSha: "aaaaaaaaaa",
+        checks,
+      });
+      const initial = evaluatePullRequestWatch(watch(), settled, noRemarks).next;
+      const onA = evaluatePullRequestWatch(initial, settled, noRemarks).next;
+      const away = evaluatePullRequestWatch(
+        onA,
+        { ...settled, headBranchSha: "bbbbbbbbbb" },
+        noRemarks,
+      );
+      assert.deepEqual(away.changes, []);
+      assert.equal(away.next.headSha, onA.headSha);
+      const returned = evaluatePullRequestWatch(
+        away.next,
+        returnSettling ? { ...settled, headSha: "bbbbbbbbbb" } : settled,
+        noRemarks,
+      );
+      const confirmed = evaluatePullRequestWatch(returned.next, settled, noRemarks);
+      const next = evaluatePullRequestWatch(confirmed.next, settled, noRemarks);
+      const changes = [...returned.changes, ...confirmed.changes, ...next.changes];
+      if (returnSettling) assert.deepEqual(returned.changes, []);
+      assert.lengthOf(changes, 1);
+      assert.equal(changes[0]!.kind, status === "success" ? "checks-passed" : "checks-failed");
+      if (status === "success" && !required) {
+        assert.deepEqual(returned.changes, []);
+        assert.isFalse(returned.next.passed);
+      }
+      assert.deepEqual(evaluatePullRequestWatch(next.next, settled, noRemarks).changes, []);
+    },
+  );
+
   it("compares the full persisted head even when abbreviated SHAs collide", () => {
     const headA = "abcdef0123456789";
     const headB = "abcdef0987654321";

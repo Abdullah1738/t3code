@@ -73,10 +73,17 @@ export function evaluatePullRequestWatch(
     ? (detail.headBranchSha ?? detail.checksHeadSha ?? detail.headSha ?? null)
     : (detail.headSha ?? null);
   const headMoved = headSha !== watch.headSha;
+  const observedHeadSha = detail.headBranchSha ?? headSha;
+  const observedHeadMoved = observedHeadSha !== (watch.observedHeadSha ?? watch.headSha);
   // GitHub's PR record and rollup can lag its branch ref after a push. Preserve the
   // check watermark until these reads agree, so the settled head still gets its verdict.
   const checksSettling = !settlingExpired && pullRequestChecksSettling(detail);
-  const checkHeadMoved = headMoved && !checksSettling;
+  // A settling branch can return before its CI checkpoint moves, after its queued
+  // verdict was cancelled. Clear that watermark even if the return read still lags;
+  // check evaluation below must wait until the reads agree or settling expires.
+  const checkHeadMoved =
+    (headMoved && !checksSettling) ||
+    (observedHeadMoved && observedHeadSha !== null && observedHeadSha === watch.headSha);
   const checksMatchHead = detail.checksHeadSha == null || detail.checksHeadSha === headSha;
 
   // An empty list keeps the last state: a host can answer with one when its check read fails.
@@ -165,7 +172,7 @@ export function evaluatePullRequestWatch(
     next: {
       startedAt: watch.startedAt,
       headSha: checksSettling ? watch.headSha : headSha,
-      observedHeadSha: detail.headBranchSha ?? headSha,
+      observedHeadSha,
       failedChecks,
       passed,
       passedChecks,

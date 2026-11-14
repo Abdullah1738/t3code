@@ -9144,16 +9144,129 @@ it.effect.each([
 );
 
 it.effect.each([
-  { mode: "failure", legacy: false, moveAtStart: false },
-  { mode: "passed", legacy: true, moveAtStart: false },
-  { mode: "failure", legacy: true, moveAtStart: true },
-  { mode: "mixed", legacy: false, moveAtStart: false },
-  { mode: "mixed", legacy: true, moveAtStart: true },
-  { mode: "remarks", legacy: false, moveAtStart: false },
-  { mode: "idle", legacy: false, moveAtStart: false },
+  {
+    mode: "failure",
+    legacy: false,
+    moveAtStart: false,
+    returnToHeadA: false,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "passed",
+    legacy: true,
+    moveAtStart: false,
+    returnToHeadA: false,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "failure",
+    legacy: true,
+    moveAtStart: true,
+    returnToHeadA: false,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "mixed",
+    legacy: false,
+    moveAtStart: false,
+    returnToHeadA: false,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "mixed",
+    legacy: true,
+    moveAtStart: true,
+    returnToHeadA: false,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "remarks",
+    legacy: false,
+    moveAtStart: false,
+    returnToHeadA: false,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "failure",
+    legacy: false,
+    moveAtStart: false,
+    returnToHeadA: true,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "failure",
+    legacy: true,
+    moveAtStart: false,
+    returnToHeadA: true,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "passed",
+    legacy: false,
+    moveAtStart: false,
+    returnToHeadA: true,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "mixed",
+    legacy: true,
+    moveAtStart: false,
+    returnToHeadA: true,
+    multiPush: false,
+    returnLag: false,
+  },
+  {
+    mode: "failure",
+    legacy: false,
+    moveAtStart: true,
+    returnToHeadA: false,
+    multiPush: true,
+    returnLag: false,
+  },
+  {
+    mode: "failure",
+    legacy: true,
+    moveAtStart: true,
+    returnToHeadA: false,
+    multiPush: true,
+    returnLag: false,
+  },
+  {
+    mode: "failure",
+    legacy: false,
+    moveAtStart: false,
+    returnToHeadA: true,
+    multiPush: false,
+    returnLag: true,
+  },
+  {
+    mode: "mixed",
+    legacy: true,
+    moveAtStart: false,
+    returnToHeadA: true,
+    multiPush: false,
+    returnLag: true,
+  },
+  {
+    mode: "idle",
+    legacy: false,
+    moveAtStart: false,
+    returnToHeadA: false,
+    multiPush: false,
+    returnLag: false,
+  },
 ])(
-  "refreshes queued PR verdicts after a head move ($mode, legacy=$legacy, start=$moveAtStart)",
-  ({ mode, legacy, moveAtStart }) =>
+  "refreshes queued PR verdicts after a head move ($mode, legacy=$legacy, start=$moveAtStart, return=$returnToHeadA, multi=$multiPush, lag=$returnLag)",
+  ({ mode, legacy, moveAtStart, returnToHeadA, multiPush, returnLag }) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const sink = yield* EventSink.EventSinkV2;
@@ -9295,7 +9408,19 @@ it.effect.each([
         return;
       }
       assert.equal(queued.status, "queued");
-      const moved = { ...report.next, observedHeadSha: headB };
+      const moved = evaluatePullRequestWatch(
+        report.next,
+        {
+          headSha: headA,
+          headBranchSha: headB,
+          checksHeadSha: headA,
+          checks: [],
+          mergeability: "mergeable",
+          author: null,
+        },
+        [],
+      ).next;
+      assert.equal(moved.headSha, headA);
       if (moveAtStart) {
         const link = (yield* orchestrator.getThreadShell(threadId))!.pullRequests![0]!;
         yield* sink.write({
@@ -9305,7 +9430,19 @@ it.effect.each([
               type: "thread.pull-request-link-updated",
               threadId,
               occurredAt: yield* DateTime.now,
-              payload: { ...link, watch: moved },
+              payload: {
+                ...link,
+                watch: multiPush
+                  ? {
+                      ...moved,
+                      headSha: headB,
+                      failedChecks: [],
+                      passed: false,
+                      passedChecks: [],
+                      passedPending: [],
+                    }
+                  : moved,
+              },
             },
           ],
         });
@@ -9319,17 +9456,76 @@ it.effect.each([
           watch: moved,
         });
       }
-      if (mode === "failure" && !moveAtStart) {
+      if (multiPush) {
+        const link = (yield* orchestrator.getThreadShell(threadId))!.pullRequests![0]!;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("obsolete-second-push"),
+              type: "thread.pull-request-link-updated",
+              threadId,
+              occurredAt: yield* DateTime.now,
+              payload: {
+                ...link,
+                watch: {
+                  ...link.watch!,
+                  headSha: "cccccccccccccccccccccccccccccccccccccccc",
+                  observedHeadSha: "cccccccccccccccccccccccccccccccccccccccc",
+                },
+              },
+            },
+          ],
+        });
+        const retained = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.find(
+          (run) => run.id === queued.id,
+        )!;
+        assert.equal(retained.status, "queued");
+        assert.equal(
+          (yield* orchestrator.getThreadShell(threadId))!.pullRequests![0]!.watch!.headSha,
+          "cccccccccccccccccccccccccccccccccccccccc",
+        );
+      }
+      if (returnLag) {
+        const watch = (yield* orchestrator.getThreadShell(threadId))!.pullRequests![0]!.watch!;
+        const lagged = evaluatePullRequestWatch(
+          watch,
+          {
+            headSha: headB,
+            headBranchSha: headA,
+            checksHeadSha: headA,
+            checks: [failed],
+            mergeability: "mergeable",
+            author: null,
+          },
+          [],
+        );
+        assert.deepEqual(lagged.changes, []);
+        yield* orchestrator.dispatch({
+          type: "thread.pull-request-watch.sync",
+          commandId: CommandId.make("obsolete-return-lag"),
+          threadId,
+          ...key,
+          startedAt: initial.startedAt,
+          watch: lagged.next,
+        });
+      }
+      const returning = returnToHeadA;
+      if ((mode === "failure" && !moveAtStart) || returning) {
         const current = evaluatePullRequestWatch(
-          moved,
-          { headSha: headB, checks: [failed], mergeability: "mergeable", author: null },
+          (yield* orchestrator.getThreadShell(threadId))!.pullRequests![0]!.watch!,
+          {
+            headSha: returnToHeadA ? headA : headB,
+            checks: [{ ...failed, status: mode === "passed" ? "success" : "failure" }],
+            mergeability: "mergeable",
+            author: null,
+          },
           [],
         );
         const nextWake = pullRequestWatchMessage({
           number: key.number,
           url,
           baseBranch: "main",
-          headSha: headB,
+          headSha: returnToHeadA ? headA : headB,
           report: current,
         });
         yield* orchestrator.dispatch({
@@ -9339,11 +9535,18 @@ it.effect.each([
           ...key,
           startedAt: initial.startedAt,
           watch: current.next,
-          wake: { messageId: MessageId.make("message:pr-watch:current"), ...nextWake },
+          ...(current.changes.length > 0
+            ? { wake: { messageId: MessageId.make("message:pr-watch:current"), ...nextWake } }
+            : {}),
         });
         const repeated = evaluatePullRequestWatch(
           current.next,
-          { headSha: headB, checks: [failed], mergeability: "mergeable", author: null },
+          {
+            headSha: returnToHeadA ? headA : headB,
+            checks: [{ ...failed, status: mode === "passed" ? "success" : "failure" }],
+            mergeability: "mergeable",
+            author: null,
+          },
           [],
         );
         assert.deepEqual(repeated.changes, []);
@@ -9383,23 +9586,61 @@ it.effect.each([
         assert.isFalse(
           after.turnItems.some((item) => item.runId === result.id && item.type === "notification"),
         );
-        if (mode === "failure" && !moveAtStart) {
-          const currentRuns = after.runs.filter(
-            (run) => run.userMessageId === "message:pr-watch:current",
-          );
-          assert.lengthOf(currentRuns, 1);
-          assert.equal(currentRuns[0]!.status, "starting");
-          assert.include(
-            after.messages.find((message) => message.id === "message:pr-watch:current")!.text,
-            "Checks failed on bbbbbbb",
-          );
-        }
       } else {
         assert.equal(result.status, "starting");
         const message = after.messages.find((entry) => entry.id === messageId)!;
         assert.include(message.text, "Keep this comment");
         assert.notInclude(message.text, "Checks failed");
         assert.equal(message.notification?.summary, "#1283: new comments");
+      }
+      if ((mode === "failure" && !moveAtStart) || returning) {
+        const currentRuns = after.runs.filter(
+          (run) => run.userMessageId === "message:pr-watch:current",
+        );
+        assert.lengthOf(currentRuns, 1);
+        const expected = returning ? headA : headB;
+        const message = after.messages.find(
+          (message) => message.id === "message:pr-watch:current",
+        )!;
+        assert.equal(
+          message.notification?.summary,
+          mode === "passed" ? "#1283: checks passed" : "#1283: checks failed",
+        );
+        assert.include(message.text, expected.slice(0, 7));
+        if (mode === "mixed") {
+          // The retained remark was first in the queue. Finish it to deliver the current verdict.
+          const now = yield* DateTime.now;
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("obsolete-remark-finish"),
+                type: "run.updated",
+                threadId,
+                runId: result.id,
+                occurredAt: now,
+                payload: { ...result, status: "completed", completedAt: now },
+              },
+            ],
+          });
+          yield* orchestrator.dispatch({
+            type: "queue.resume",
+            commandId: CommandId.make("obsolete-remark-resume"),
+            threadId,
+          });
+          yield* acknowledgeStart;
+          yield* worker.drain();
+        }
+        const delivered = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(
+          delivered.runs.find((run) => run.id === currentRuns[0]!.id)?.status,
+          "starting",
+        );
+        assert.lengthOf(
+          delivered.turnItems.filter(
+            (item) => item.runId === currentRuns[0]!.id && item.type === "notification",
+          ),
+          1,
+        );
       }
       assert.isTrue((yield* maintenance.rebuild).valid);
     }).pipe(Effect.provide(Layer.fresh(layerTest))),
