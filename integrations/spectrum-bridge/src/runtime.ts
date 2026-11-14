@@ -327,7 +327,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
       switch (path) {
         case "/app": {
           if (request.headers.has("origin")) throw new HttpError(403, "Forbidden");
-          only(body, ["url", "caption", "subcaption", "trailingCaption", "trailingSubcaption", "summary", "to", "dedupeKey", "sessionId"]);
+          only(body, ["url", "caption", "subcaption", "trailingCaption", "trailingSubcaption", "summary", "updateOf", "previewPage", "to", "dedupeKey", "sessionId"]);
           ownerOnly(false);
           live();
           const { to, dedupeKey } = body;

@@ -63,7 +63,8 @@ TERMINAL = {'delivered', 'cancelled'}
 RECEIPT_ACCOUNTS = ('gmail',)
 RECEIPT_POLL_S = 45
 RECEIPT_SUBJECT = re.compile(r'\bservice charges receipt\b', re.I)
-RANK = {'unknown': -1, 'pending confirmation': 0, 'placed': 0, 'ordered': 0, 'shipped': 2, 'preparing': 1, 'packed':1, 'picked up': 2,
+# Packed must outrank packing so a late preparing read cannot undo it.
+RANK = {'unknown': -1, 'pending confirmation': 0, 'placed': 0, 'ordered': 0, 'shipped': 2, 'preparing': 1, 'packed':1.5, 'picked up': 2,
         'out for delivery': 3, 'nearby': 4, 'delivered': 5, 'cancelled': 5}
 TRACKING_PROBLEM_REPEAT_S = 86400
 WEB_PROOF_VERSION = 5
@@ -1484,6 +1485,29 @@ def check(cfg):
         _check(cfg)
 
 
+def delivery_card_result(cfg, result, state, *, persist=None):
+    # Pending-bank checks leave the wake cursor unchanged, so cards retain their own progress.
+    if not isinstance(cfg.get('delivery_card'), dict):
+        return result
+    observed = str(result.get('status', 'unknown')).lower().replace('_', ' ')
+    candidate = {**result, 'status': observed}
+    rank = RANK.get(observed, -1)
+    if observed in TERMINAL and not terminal_order(cfg, result, observed):
+        rank = -1
+    confirmed = state.get('status', 'unknown')
+    if confirmed not in TERMINAL and RANK.get(confirmed, -1) > rank:
+        candidate = {**result, 'status': confirmed}
+        rank = RANK[confirmed]
+    retained = state.get('card_result')
+    if isinstance(retained, dict) and (retained.get('status') in TERMINAL or RANK.get(retained.get('status'), -1) > rank):
+        return retained
+    if rank >= 0:
+        state['card_result'] = candidate
+        if persist:
+            persist(candidate)
+    return candidate
+
+
 @toollog.timed('order-watch', 'track.poll')
 def _check(cfg, pending_only=False):
     folder = Path(os.environ['WATCH_DIR'])
@@ -1491,6 +1515,7 @@ def _check(cfg, pending_only=False):
         fcntl.flock(lock, fcntl.LOCK_EX)
         path = folder / 'order-tracker-state.json'
         state = read(path)
+        committed = deepcopy(state)
         # The watcher never delivers prime output; web notices must wait for a real check.
         if cfg.get('app') == 'web' and os.environ.get('WATCH_RUN', '').startswith('prime-'):
             return {'ok': True}
@@ -1525,7 +1550,13 @@ def _check(cfg, pending_only=False):
             if not complete and eta_elapsed_due(cfg, state, now):
                 events.append({'kind': 'eta_elapsed', 'message': 'Checkout ETA passed; delivery is unconfirmed'})
             if folder.resolve() == (WATCHERS / cfg['watcher']).resolve():
-                card = delivery_cards.safe_sync(cfg, result, send=False)
+                card = delivery_cards.safe_sync(cfg, delivery_card_result(cfg, result, state,
+                    persist=lambda card: write(path, {**committed, 'card_result': card})), send=False,
+                                                update=not os.environ.get('WATCH_RUN', '').startswith('prime-'))
+                if card.get('update_error'):
+                    state['card_error'] = card['update_error']
+                elif card.get('update_pending'):
+                    state['card_error'] = 'stage_waiting_for_placement'
                 if card.get('link_health') == 'needs_repair':
                     events.append({'kind': 'card_link_problem', 'message': 'The delivery card link needs repair'})
             queue_problem_notices(cfg, result, alert_state, events, now)
@@ -1556,9 +1587,14 @@ def _check(cfg, pending_only=False):
         state['last_result'] = result
         # robob-watch test uses a scratch WATCH_DIR: no web writes or messages.
         if folder.resolve() == (WATCHERS / cfg['watcher']).resolve():
-            # Poll checks never publish/send: provider reads already consume most
-            # of their 60-second budget. Failed placement receipts are actionable.
-            card = delivery_cards.safe_sync(cfg, result, send=False)
+            # Only stage continuations enqueue here; placement publishing stays in registration.
+            card = delivery_cards.safe_sync(cfg, delivery_card_result(cfg, result, state,
+                persist=lambda card: write(path, {**committed, 'card_result': card})), send=False,
+                                            update=not os.environ.get('WATCH_RUN', '').startswith('prime-'))
+            if card.get('update_error'):
+                state['card_error'] = card['update_error']
+            elif card.get('update_pending'):
+                state['card_error'] = 'stage_waiting_for_placement'
             if card.get('status', '').startswith('failed'):
                 state['card_error'] = card['status']
             if card.get('link_health') == 'needs_repair' and not state.get('card_link_problem_sent'):
@@ -1588,11 +1624,12 @@ def retire_terminal(cfg, folder, path, state):
             or (cfg.get('delivery_card') or {}).get('ready') is False
             or read(folder / 'state.json').get('pending')):
         return
-    if state.get('card_error') and cfg.get('delivery_card'):
-        # Retry the terminal render from retained evidence, without provider I/O.
-        card = delivery_cards.safe_sync(cfg, state['last_result'], send=False)
-        if card.get('rendered') is not True:
-            state['card_error'] = card['status']
+    if cfg.get('delivery_card'):
+        # Re-registration can defer a stage without an error while ready=False.
+        # Reconcile it before retiring, using retained evidence without provider reads.
+        card = delivery_cards.safe_sync(cfg, delivery_card_result(cfg, state['last_result'], state), send=False, update=True)
+        if card.get('rendered') is not True or card.get('update_error') or card.get('update_pending'):
+            state['card_error'] = card.get('update_error') or ('stage_waiting_for_placement' if card.get('update_pending') else card['status'])
             write(path, state)
             return
         state.pop('card_error', None)

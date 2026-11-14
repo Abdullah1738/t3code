@@ -1094,7 +1094,7 @@ class RetireTest(unittest.TestCase):
         self.wid = self.cfg['watcher']
         self.live = Path.home() / '.local/share/robob-watch/watchers' / self.wid
 
-    def check(self, state, result, folder=None, run=None, card=None):
+    def check(self, state, result, folder=None, run=None, card=None, pending_only=False):
         output = io.StringIO()
         run = run or mock.Mock(return_value='')
         with mock.patch.dict(t.os.environ, WATCH_DIR=str(folder or self.live), WATCH_RUN=getattr(self, 'watch_run', 'scheduled-fixture')), \
@@ -1106,14 +1106,100 @@ class RetireTest(unittest.TestCase):
              mock.patch.object(t.time, 'time', return_value=self.now), \
              mock.patch.object(t, 'fetch', return_value=result) as fetch, \
              mock.patch.object(t.store, 'reconcile') as reconcile, \
-             mock.patch.object(t.delivery_cards, 'safe_sync', return_value=card or {'status': 'ready', 'link_health': 'ok', 'rendered': True}) as sync, \
+             mock.patch.object(t.delivery_cards, 'safe_sync', side_effect=card if callable(card) else None,
+                               return_value=card or {'status': 'ready', 'link_health': 'ok', 'rendered': True}) as sync, \
              mock.patch.object(t, 'run', run), \
              redirect_stdout(output):
-            t.check(self.cfg)
+            if pending_only:
+                t._check(self.cfg, pending_only=True)
+            else:
+                t.check(self.cfg)
         self.fetch = fetch
         self.reconcile = reconcile
         self.sync = sync
         return run, write, output.getvalue()
+
+    def test_terminal_stage_enqueue_failure_retries_before_retiring(self):
+        self.cfg['delivery_card'] = {'ready': True}
+        state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 1801,
+                 'card_error': 'failed:BridgeError', 'last_result': {'status': 'delivered'}}
+        run, _, _ = self.check(state, {}, card={'status': 'sent', 'rendered': True, 'update_error': 'failed:BridgeError'})
+        run.assert_not_called()
+        self.assertTrue(state['card_error'])
+        run, _, _ = self.check(state, {}, card={'status': 'sent', 'rendered': True})
+        run.assert_called_once_with(['robob-watch', 'remove', self.wid])
+        self.assertNotIn('card_error', state)
+        self.fetch.assert_not_called()
+
+    def test_terminal_waiting_for_placement_does_not_retire(self):
+        self.cfg['delivery_card'] = {'ready': True}
+        state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 1801,
+                 'card_error': 'stage_waiting_for_placement', 'last_result': {'status': 'delivered'}}
+        run, _, _ = self.check(state, {}, card={'status': 'sent', 'rendered': True, 'update_pending': True})
+        run.assert_not_called()
+        run, _, _ = self.check(state, {}, card={'status': 'sent', 'rendered': True, 'update_pending': False})
+        run.assert_called_once_with(['robob-watch', 'remove', self.wid])
+        self.assertNotIn('card_error', state)
+        self.fetch.assert_not_called()
+
+    def test_terminal_reconciles_card_without_previous_error_after_reregistration(self):
+        self.cfg['delivery_card'] = {'ready': True}
+        state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 1801,
+                 'last_result': {'status': 'delivered'}}
+        run, _, _ = self.check(state, {}, card={'status': 'sent', 'rendered': True})
+        self.sync.assert_called_once_with(self.cfg, state['last_result'], send=False, update=True)
+        run.assert_called_once_with(['robob-watch', 'remove', self.wid])
+        self.fetch.assert_not_called()
+
+    def test_card_stage_normalization_preserves_retained_progress_and_terminal_proof(self):
+        self.cfg['delivery_card'] = {'ready': True}
+        cases = [
+            ('preparing', 'placed', 'preparing'), ('packed', 'placed', 'packed'),
+            ('packed', 'preparing', 'packed'),
+            ('picked up', 'preparing', 'picked up'), ('shipped', 'packed', 'shipped'),
+            ('out for delivery', 'picked_up', 'out for delivery'), ('nearby', 'out for delivery', 'nearby'),
+            ('out for delivery', 'preparing', 'out for delivery'), ('nearby', 'unknown', 'nearby'),
+            ('preparing', 'out for delivery', 'out for delivery'), ('nearby', 'delivered', 'delivered'),
+            ('out for delivery', 'cancelled', 'cancelled'),
+        ]
+        for confirmed, observed, expected in cases:
+            with self.subTest(confirmed=confirmed, observed=observed):
+                result = {'status': observed, 'whole_order_complete': observed in t.TERMINAL}
+                self.assertEqual(t.delivery_card_result(self.cfg, result, {'status': confirmed})['status'], expected)
+                self.assertEqual(result['status'], observed)
+
+    def test_pending_only_check_retains_card_progress_without_consuming_wake_cursor(self):
+        self.cfg.update(total='AED 600.00', delivery_card={'ready': True})
+        state = {'primed': True, 'status': 'placed'}
+        for observed in ('out for delivery', 'preparing', 'out for delivery'):
+            with self.subTest(observed=observed):
+                self.check(state, {'status': observed, 'errors': []}, pending_only=True)
+                self.assertEqual(self.sync.call_args.args[1]['status'], 'out for delivery')
+                self.assertEqual(state['status'], 'placed')
+
+    def test_card_cursor_requires_whole_order_terminal_proof(self):
+        self.cfg['delivery_card'] = {'ready': True}
+        for app, whole, valid in [('noon', False, False), ('noon', True, True),
+                                  ('amazon', None, False), ('amazon', True, True), ('web', True, False)]:
+            with self.subTest(app=app, whole=whole):
+                cfg = {**self.cfg, 'app': app}
+                state = {'status': 'placed'}
+                result = {'status': 'delivered', 'whole_order_complete': whole}
+                t.delivery_card_result(cfg, result, state)
+                self.assertEqual(state['card_result']['status'], 'delivered' if valid else 'placed')
+                later = t.delivery_card_result(cfg, {'status': 'preparing'}, state)
+                self.assertEqual(later['status'], 'delivered' if valid else 'preparing')
+
+    def test_pending_card_cursor_is_persisted_before_render_without_committing_the_wake(self):
+        self.cfg.update(total='AED 600.00', delivery_card={'ready': True})
+        state = {'primed': True, 'status': 'placed'}
+        def interrupted_render(*args, **kwargs):
+            saved = t.write.call_args.args[1]
+            self.assertEqual(saved['status'], 'placed')
+            self.assertEqual(saved['card_result']['status'], 'out for delivery')
+            raise RuntimeError('interrupted before card acknowledgement')
+        with self.assertRaisesRegex(RuntimeError, 'interrupted before card acknowledgement'):
+            self.check(state, {'status': 'out for delivery', 'errors': []}, pending_only=True, card=interrupted_render)
 
     def test_delivered_tracker_retires_without_polling(self):
         state = {'primed': True, 'status': 'delivered', 'terminal_at': self.now - 1801}
