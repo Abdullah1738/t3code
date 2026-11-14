@@ -109,6 +109,7 @@ const makeThreads = Effect.gen(function* () {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      liveThreadIds: () => Effect.succeed([]),
       pendingUserInputs: () => Effect.succeed([]),
       claimContext: (threadId) =>
         read(threadId).pipe(

@@ -449,6 +449,7 @@ const makeHost = (watch: Watch) => {
                 head: pr.head,
                 headAt: at,
                 checks: pr.checks,
+                failedChecks: [],
               });
             }
             return { readings, read, failed: [], carried: [] };
@@ -537,6 +538,7 @@ const makeThreads = (watch: Watch) => {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      liveThreadIds: () => Effect.succeed([]),
       pendingUserInputs: () => Effect.succeed([]),
       claimContext: (threadId) =>
         read(threadId).pipe(

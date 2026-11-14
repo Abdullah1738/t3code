@@ -156,7 +156,10 @@ export const admission = <A, E, R>(
   });
 
 const storePhase = (key: string): Phase => {
-  if (/^(board|boards|cards|openCards|dispatchCards|summaryCards)$/.test(key)) return "board_load";
+  if (
+    /^(board|boards|cards|openCards|tickCards|goalStoryCards|dispatchCards|summaryCards)$/.test(key)
+  )
+    return "board_load";
   if (/Pool|^pools$/.test(key)) return "pool_accounting";
   if (/Event/.test(key)) return "event_persistence";
   if (/Discussion|discussion|Message|message|ownerWait/.test(key)) return "discussion_updates";
