@@ -155,6 +155,7 @@ class CollectorFairnessTests(unittest.TestCase):
             state = jobs.read_state('disk-inventory')
             self.assertEqual(state['sizes'][str(root)],4*42*1024)
             fail[0] = True
+            now[0] += 86400
             clock[0] = 0
             jobs.directory_inventory([root],run,deadline=15)
         state = jobs.read_state('disk-inventory')

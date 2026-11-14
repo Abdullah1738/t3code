@@ -53,7 +53,7 @@ class DiskSwingTests(unittest.TestCase):
         for cache in state.get('childState',{}).values():
             for value in cache.values():
                 if 'at' in value:
-                    value['at'] -= 3600
+                    value['at'] -= 86400
         jobs.save_state('disk-inventory',state)
 
     def test_baseline_small_positive_and_negative_swings(self):

@@ -19,14 +19,30 @@ its own state, day logs, rollups and probe samples, and never changes crash evid
 
 Disk samples use `statvfs`, sizes of the known Robob/OpenCode/recall database
 and WAL files (metadata only), the guard's cached TMPDIR measurement, and an hourly cached directory inventory of worktrees, caches and backup repositories.
-The collector gathers directory sizes with read-only du calls outside the guard,
-allowing up to 60 s per root under a shared 210 s scan budget. The two big
-roots (`~/.local/share` and `~/.robob`) scan one first-level child at a
-time with a 15 s child timeout. Roots rotate by their last attempt, and each
-gets at most 60 s. The collector
-also limits the scan to the time remaining in its five-minute run budget,
-running crash collection first (at most 165 s), then disk-wait collection, the disk tooling probe and
-inventory with the remaining time. Inventory keeps its own 210 s maximum. Samples expose
+The collector scans immediate children independently with `du -skl`, in batches
+of at most 128 paths / 32 KiB of arguments. Its 15 s allowance grows to 60 s
+for slow children. Completed children stay cached for 24 hours; missing and
+stale children get the hourly inventory's remaining time, up to 210 s within
+the collector's 290 s deadline. Crash collection runs first.
+
+A separate `com.abdullah.mac-deep-inventory` LaunchAgent runs daily at 03:30
+local time (Asia/Dubai on this Mac). It visits the four SSD worktree farms first,
+then the other inventory roots, one bounded batch per root turn and oldest
+children first. Missing, partial,
+limited and 24-hour-old entries are eligible. Each command has at most ten
+minutes within a 45-minute pass, under nice 10 and background I/O policy.
+Every completed batch checkpoints the shared state atomically. Termination
+keeps completed rows; unfinished children remain explicit partials.
+Both entry points acquire `state/disk-inventory.lock` non-blocking. A busy
+daily pass exits cleanly; a busy hourly scan logs `skipReason=deep_pass_running`
+and cached totals while crash collection continues. `disk.deep.start`,
+`disk.deep.root` and `disk.deep.end` record coverage, ages and stop reason.
+`childrenRemaining` counts known eligible children; `rootsPartial` on pass
+summaries counts roots whose listing was unavailable, so zero remaining with
+unlisted roots is not complete coverage. All totals count hardlink occurrences,
+can exceed physical use, and are not freeable-space estimates.
+
+Samples expose
 `inventorySourceErrors`, `inventoryAgeS` (null if absent), and `inventoryStale`
 (absent or older than two hours). These do not affect the sample's own success.
 The five largest positive deltas in that tracked set are flattened as
@@ -120,7 +136,7 @@ Big roots emit child source events with `bytes`, `exitCode`, `elapsedMs`,
 `partial`, and `deniedCount`, plus a root aggregate with `completedCount` and
 `failedCount`. Child timeouts/errors remain named source errors. An incomplete
 root emits an error with `failure=partial`, `partial=true`, and the available
-children's `bytes`. Cached sizes make that aggregate an estimate. `failedCount` includes one additional
+children's `bytes`. The aggregate includes only recorded child measurements. `failedCount` includes one additional
 incomplete remainder when the root deadline stops enumeration; it is not a
 count of every unvisited child. Summing child du totals does not deduplicate
 hard links across children and excludes the root directory's own blocks.
@@ -129,8 +145,8 @@ ones. Budget-skipped roots retain their place; full failed attempts rotate too.
 Shortened failed attempts keep priority for a full allowance on the next run.
 `disk.inventory.turn` identifies each attempted root's `source` and `turn`.
 Child attempts rotate the same way. A failed child retains its last good size
-and timestamp in `childState`; a root containing cached or unreadable children
-remains partial. `cachedCount` and `ageS` describe retained measurements.
+and timestamp in `childState`; missing, stale or unreadable children keep the
+root partial. `cachedCount` and `ageS` describe retained measurements.
 If every child fails without a last-good measurement, the root has no size.
 Inventory state retains child sizes in `children` and aggregate flags in `partials`.
 Summary `sourceErrors` counts affected roots, not their child error lines.
@@ -241,7 +257,8 @@ it and never changes mounts or restarts the Mac.
 
 ## Install after review and owner approval
 
-All scripts refuse dirty upkeep source or HEAD absent from origin/main. No
+Installation and checks refuse dirty upkeep source or HEAD absent from origin/main.
+`--dry-run` can describe a proposed branch without installing it. No
 installer starts or restarts any service. Install the helper first:
 
 ```sh
@@ -257,7 +274,8 @@ Memory-system belongs to the Recall board and is deployed from
 `robob/recall-golive`; send changes there as port requests. This installer
 refuses targets under `~/.local/share/memory-system`.
 The helper installer writes the proposed
-`com.abdullah.mac-log-collector.plist`; the evaluator must separately load it
+`com.abdullah.mac-log-collector.plist` and
+`com.abdullah.mac-deep-inventory.plist`; the evaluator separately loads them
 after approval. Existing job schedules and backup LaunchAgents stay in place.
 The collector starts via `/bin/zsh` because launchd attributes Full Disk Access to the job's own program.
 The jobs fail open if the helper is missing.
