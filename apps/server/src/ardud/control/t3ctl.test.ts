@@ -5,6 +5,7 @@ import * as NodeFS from "node:fs";
 import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeTimersPromises from "node:timers/promises";
 import * as NodeURL from "node:url";
 import { test } from "@effect/vitest";
 
@@ -13,20 +14,25 @@ import { checkLive, ignoreMacosTypeOfServiceEinval } from "./t3ctl.mjs";
 
 test("live bounds health even when it ignores abort", async () => {
   const start = performance.now();
-  let guard: ReturnType<typeof setTimeout> | undefined;
+  const guard = new AbortController();
   try {
     const result = await Promise.race([
       checkLive("HEAD", { health: () => new Promise(() => {}), timeoutMs: 25 }),
-      new Promise((_, reject) => {
-        guard = setTimeout(() => reject(new Error("live never returned")), 500);
-      }),
+      NodeTimersPromises.setTimeout(500, undefined, { signal: guard.signal })
+        .then(() => {
+          throw new Error("live never returned");
+        })
+        .catch((error: unknown) => {
+          if (guard.signal.aborted) return new Promise<never>(() => {});
+          throw error;
+        }),
     ]);
     NodeAssert.equal(result.live, null);
     NodeAssert.match(result.reason, /health.*timed out/);
     NodeAssert.equal(result.stages.health.status, "timeout");
     NodeAssert.ok(performance.now() - start < 400);
   } finally {
-    clearTimeout(guard);
+    guard.abort();
   }
 });
 
@@ -386,7 +392,7 @@ test("live shares one budget across health and every git invocation", async () =
     health: async (options: { timeoutMs: number; signal: AbortSignal }) => {
       NodeAssert.ok(options.timeoutMs <= 100);
       signals.push(options.signal);
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await NodeTimersPromises.setTimeout(20);
       return { ok: true, status: "healthy", buildCommit: "abcdef012345" };
     },
     git: async (
@@ -397,7 +403,7 @@ test("live shares one budget across health and every git invocation", async () =
       timeouts.push(options.timeout);
       signals.push(options.signal);
       if (timeouts.length === 3) return new Promise(() => {});
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await NodeTimersPromises.setTimeout(10);
       return { status: 0, stdout: args[0] === "cat-file" ? "commit" : "abcdef012345" };
     },
   });
