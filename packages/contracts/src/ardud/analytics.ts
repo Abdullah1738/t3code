@@ -105,6 +105,8 @@ const GeneralEvent = Schema.Struct({
       slots: Schema.optionalKey(Measurement),
       waiting: Schema.optionalKey(Measurement),
       method: Schema.optionalKey(Label),
+      httpMethod: Schema.optionalKey(Label),
+      httpRoute: Schema.optionalKey(Label),
       span: Schema.optionalKey(Label),
       errorTag: Schema.optionalKey(Label),
       code: Schema.optionalKey(Label),
@@ -298,6 +300,19 @@ export const AnalyticsRollup = Schema.Struct({
     ),
   ),
   errorCounts: Schema.Record(Label, Measurement),
+  controlRoutes: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        route: Label,
+        method: Label,
+        hour: Label,
+        statuses: Schema.Record(Label, Measurement),
+        totalWaitMs: Measurement,
+        deadlineExceeded: Measurement,
+        ...LatencyFields,
+      }),
+    ),
+  ),
   errorsByRoute: Schema.Array(
     Schema.Struct({
       route: Label,

@@ -1847,9 +1847,19 @@ const makeRoutes = Effect.gen(function* () {
     );
 
   const p = CONTROL_ROUTE_PREFIX;
+  const route = <R>(
+    method: "GET" | "POST" | "PATCH" | "PUT",
+    path: `/${string}`,
+    effect: Effect.Effect<HttpServerResponse.HttpServerResponse, never, R>,
+    operation = `control.${method}.${path
+      .slice(p.length + 1)
+      .replaceAll("/", ".")
+      .replaceAll(":", "")}`,
+  ) => HttpRouter.route(method, path, observeControl(operation, effect, { path, method }));
   return [
-    HttpRouter.route("GET", `${p}/health`, handle(health)),
-    HttpRouter.route(
+    // These bridge reads otherwise share the cleanup snapshot's background lane.
+    route("GET", `${p}/health`, handle(health.pipe(NodeSqliteClient.foregroundReads))),
+    route(
       "GET",
       `${p}/install-report`,
       handle(
@@ -1862,47 +1872,27 @@ const makeRoutes = Effect.gen(function* () {
         }),
       ),
     ),
-    HttpRouter.route(
-      "GET",
-      `${p}/requests`,
-      observeControl("control.requests", handle(listRequests())),
-    ),
-    HttpRouter.route("GET", `${p}/projects`, handle(listProjects)),
-    HttpRouter.route("GET", `${p}/models`, handle(listModels)),
-    HttpRouter.route("GET", `${p}/usage`, handle(listUsage)),
-    HttpRouter.route("GET", `${p}/threads`, handle(listThreads)),
-    HttpRouter.route("POST", `${p}/threads`, handle(createThread)),
-    HttpRouter.route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),
-    HttpRouter.route(
-      "GET",
-      `${p}/identity/resolve`,
-      observeControl("control.identity.resolve", handle(identityResolve)),
-    ),
-    HttpRouter.route("GET", `${p}/recovery/snapshot`, handle(recoverySnapshot)),
-    HttpRouter.route(
-      "GET",
-      `${p}/threads/:threadId`,
-      observeControl("control.thread", handle(getThread)),
-    ),
-    HttpRouter.route("PATCH", `${p}/threads/:threadId`, handle(patchThread)),
-    HttpRouter.route("POST", `${p}/threads/:threadId/archive-if-idle`, handle(archiveThreadIfIdle)),
-    HttpRouter.route(
-      "GET",
-      `${p}/threads/:threadId/messages`,
-      observeControl("control.messages", handle(getMessages)),
-    ),
-    HttpRouter.route("GET", `${p}/threads/:threadId/runs/:runId/evidence`, handle(getRunEvidence)),
-    HttpRouter.route("GET", `${p}/threads/:threadId/wait`, handle(wait)),
-    HttpRouter.route(
-      "POST",
-      `${p}/threads/:threadId/send`,
-      observeControl("control.send", handle(send)),
-    ),
-    HttpRouter.route("POST", `${p}/threads/:threadId/interrupt`, handle(interrupt)),
-    HttpRouter.route("POST", `${p}/threads/:threadId/requests/:requestId/respond`, handle(respond)),
-    HttpRouter.route("PUT", `${p}/threads/:threadId/origin`, handle(putOrigin)),
-    HttpRouter.route("POST", `${p}/attachments`, handle(upload)),
-    HttpRouter.route("GET", `${p}/events`, handle(events)),
+    route("GET", `${p}/requests`, handle(listRequests()), "control.requests"),
+    route("GET", `${p}/projects`, handle(listProjects.pipe(NodeSqliteClient.foregroundReads))),
+    route("GET", `${p}/models`, handle(listModels)),
+    route("GET", `${p}/usage`, handle(listUsage)),
+    route("GET", `${p}/threads`, handle(listThreads)),
+    route("POST", `${p}/threads`, handle(createThread)),
+    route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),
+    route("GET", `${p}/identity/resolve`, handle(identityResolve), "control.identity.resolve"),
+    route("GET", `${p}/recovery/snapshot`, handle(recoverySnapshot)),
+    route("GET", `${p}/threads/:threadId`, handle(getThread), "control.thread"),
+    route("PATCH", `${p}/threads/:threadId`, handle(patchThread)),
+    route("POST", `${p}/threads/:threadId/archive-if-idle`, handle(archiveThreadIfIdle)),
+    route("GET", `${p}/threads/:threadId/messages`, handle(getMessages), "control.messages"),
+    route("GET", `${p}/threads/:threadId/runs/:runId/evidence`, handle(getRunEvidence)),
+    route("GET", `${p}/threads/:threadId/wait`, handle(wait)),
+    route("POST", `${p}/threads/:threadId/send`, handle(send), "control.send"),
+    route("POST", `${p}/threads/:threadId/interrupt`, handle(interrupt)),
+    route("POST", `${p}/threads/:threadId/requests/:requestId/respond`, handle(respond)),
+    route("PUT", `${p}/threads/:threadId/origin`, handle(putOrigin)),
+    route("POST", `${p}/attachments`, handle(upload)),
+    route("GET", `${p}/events`, handle(events)),
   ] as const;
 }).pipe((effect) => StartupPhaseLog.withStartupPhase("http.control-routes", effect));
 
