@@ -138,7 +138,7 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
               (input.stage === "dispatch"
                 ? input.taskId === undefined
                   ? " Creation may still complete."
-                  : ` Task ${input.taskId} may still be created; check it with task_status.`
+                  : ` Task ${input.taskId} may still be created; use task_status to check whether it was saved.`
                 : input.taskId === undefined
                   ? ""
                   : ` Task ${input.taskId} was accepted; use task_status to recover it.`) +
