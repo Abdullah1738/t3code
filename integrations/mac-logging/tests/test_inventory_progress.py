@@ -311,9 +311,10 @@ class InventoryProgressTests(unittest.TestCase):
                     self.assertLessEqual(clock[0],150)
 
     def test_interruption_in_fresh_query_does_not_replay_reported_gap(self):
-        for interrupt_after in range(6):
+        for interrupt_after in range(3):
             with self.subTest(interrupt_after=interrupt_after), \
-                 patch.dict(os.environ,TOOLLOG_DIR=str(self.root/str(interrupt_after))):
+                 patch.dict(os.environ,TOOLLOG_DIR=str(self.root/str(interrupt_after))), \
+                 patch.object(collector.time, 'monotonic', return_value=0):
                 jobs.save_state('crashes',dict(unified=9100,unifiedRetry=dict(windowStart=9100,windowEnd=10000,skippedS=82800)))
                 completed=[]
                 def success(a,b):

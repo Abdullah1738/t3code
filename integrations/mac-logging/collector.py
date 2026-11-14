@@ -140,7 +140,7 @@ def unified_command(command, capture_output=True, text=True, timeout=60, env=Non
         raise
 
 
-def next_unified_chunk(size, elapsed, previous=None):
+def next_unified_chunk(size, elapsed, previous=None, limit=UNIFIED_CHUNK_S):
     # Two successful sizes distinguish fixed log-show startup cost from work
     # proportional to the window. A fixed cost must not pin every query at 60 s.
     if previous and abs(size-previous[0]) > .000001:
@@ -151,11 +151,11 @@ def next_unified_chunk(size, elapsed, previous=None):
         # into a large command. Timing noise gets a one-second margin.
         limit = UNIFIED_WINDOW_S if rate*UNIFIED_WINDOW_S <= max(1, overhead/10) else UNIFIED_CHUNK_S
         return max(UNIFIED_FIRST_CHUNK_S, min(limit,
-                   UNIFIED_TARGET_S/max(.001, rate)))
+                   UNIFIED_TARGET_S/max(.001, rate))), limit
     if previous:
-        return max(UNIFIED_FIRST_CHUNK_S, min(UNIFIED_WINDOW_S,
-                   size*max(UNIFIED_TARGET_S, previous[1])/max(.001, elapsed)))
-    return min(UNIFIED_CHUNK_S, max(UNIFIED_FIRST_CHUNK_S, size*2))
+        return max(UNIFIED_FIRST_CHUNK_S, min(limit,
+                   size*max(UNIFIED_TARGET_S, previous[1])/max(.001, elapsed))), limit
+    return min(limit, max(UNIFIED_FIRST_CHUNK_S, size*2)), limit
 
 
 def unified(since, until, run=unified_command, timeout=60):
@@ -266,6 +266,7 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
     stop_reason = 'done'
     chunk_size = UNIFIED_FIRST_CHUNK_S
     previous_chunk = None
+    chunk_limit = UNIFIED_CHUNK_S
     def lag():
         return max(0, now+time.monotonic()-started-state.get('unified', since))
 
@@ -312,7 +313,7 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
                 elapsed = time.monotonic()-chunk_started
                 emit('crashes', 'event', 'crash.unified.chunk', ok=True,
                      props=dict(chunk, outcome='done', elapsedMs=elapsed*1000))
-                chunk_size = next_unified_chunk(end-cursor, elapsed, previous_chunk)
+                chunk_size, chunk_limit = next_unified_chunk(end-cursor, elapsed, previous_chunk, chunk_limit)
                 previous_chunk = (end-cursor, elapsed)
                 counts.update(observed)
                 crash_observations(observed)

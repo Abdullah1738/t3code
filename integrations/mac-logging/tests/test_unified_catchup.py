@@ -108,6 +108,17 @@ class UnifiedCatchupTests(unittest.TestCase):
                 self.assertEqual(observed, [at for at in self.boots if 9100 < at <= now])
                 self.assertEqual(len(observed), len(set(observed)))
 
+    def test_equal_size_samples_preserve_learned_cap_across_twelve_runs(self):
+        jobs.save_state('crashes', {'unified': 6400, 'rollupDay': '1969-12-31'})
+        self.cost = lambda seconds: 1+seconds/300 if seconds <= 900 else 120
+        for i in range(12):
+            before = len(self.calls)
+            self.assertTrue(self.collect(10000+3870*i))
+            self.assertTrue(all(c[3] for c in self.calls[before:]))
+            self.assertTrue(all(end-start <= 900 for start,end,_,_ in self.calls[before:]))
+            self.assertEqual(self.rows('crash.collect')[-1]['props']['skippedS'], 0)
+            self.assertLessEqual(self.clock, 135)
+
     def test_nonlinear_window_costs_keep_the_nominal_chunk_cap(self):
         jobs.save_state('crashes', {'unified': 4600, 'rollupDay': '1969-12-31'})
         self.cost = lambda seconds: 12*(seconds/900)**2
