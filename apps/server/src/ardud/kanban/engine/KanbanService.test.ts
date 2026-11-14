@@ -33497,6 +33497,31 @@ it.effect(
             "evaluator",
           );
           yield* kanban.changeAsk(card.id, "q3", "drop", evaluator, "evaluator");
+          const skippedWithoutApproval = yield* kanban.markSubtask(
+            card.id,
+            "s6",
+            "skipped",
+            "Not needed",
+            evaluator,
+            "evaluator",
+          );
+          assert.strictEqual(skippedWithoutApproval.subtasks[5]!.state, "skipped");
+          assert.strictEqual(skippedWithoutApproval.subtasks[5]!.gateSkipped?.reason, "Not needed");
+          assert.strictEqual(skippedWithoutApproval.asks.at(-1)!.kind, "notice");
+          const reopened = yield* kanban.markSubtask(
+            card.id,
+            "s6",
+            "open",
+            null,
+            evaluator,
+            "evaluator",
+          );
+          assert.strictEqual(reopened.subtasks[5]!.state, "open");
+          assert.isUndefined(reopened.subtasks[5]!.gateSkipped);
+          const unapprovedDeploy = yield* kanban
+            .markSubtask(card.id, "s6", "done", "Deployed", evaluator, "evaluator")
+            .pipe(Effect.flip);
+          assert.include(unapprovedDeploy.detail, "the latest decision, q3, was dropped");
           yield* TestClock.adjust("1 second");
           yield* kanban.answerAsk(
             card.id,
@@ -33529,7 +33554,7 @@ it.effect(
           const verified = yield* kanban.moveCard(card.id, "verified", "evaluator", evaluator);
           assert.strictEqual(verified.stage, "verified");
           if (!removal) {
-            yield* kanban.askOwner(
+            const followup = yield* kanban.askOwner(
               card.id,
               { question: "Follow up status?", blocking: true },
               evaluator,
@@ -33537,7 +33562,7 @@ it.effect(
             );
             const returned = yield* kanban.answerAsk(
               card.id,
-              "q4",
+              followup.asks.at(-1)!.id,
               { verdict: "answered", revision: 0, text: "Recorded" },
               owner,
             );

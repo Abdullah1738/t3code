@@ -88,10 +88,14 @@ interface FakeThread {
 const makeWorld = (
   options: {
     readonly reader?: boolean;
-    readonly failCommit?: { armed: boolean };
+    readonly failCommit?: { armed: boolean; failures: number };
     readonly analytics?: AnalyticsEvent[];
   } = {},
 ) => {
+  const transactionWrites = Context.Reference<{ written: boolean } | null>(
+    "wait-test/transaction-writes",
+    { defaultValue: () => null },
+  );
   const threads = new Map<string, FakeThread>();
   const rejectedAssignments = new Set<string>();
   /** The PRs a work thread tracks, as its view reports them. */
@@ -194,6 +198,11 @@ const makeWorld = (
                 }),
               )
             : store.putCard(card).pipe(
+                Effect.tap(() =>
+                  Effect.map(transactionWrites, (pending) => {
+                    if (pending !== null) pending.written = true;
+                  }),
+                ),
                 Effect.tap(() =>
                   card.wait === undefined && saving.ended?.id === card.id
                     ? Deferred.succeed(saving.ended.done, undefined)
@@ -345,12 +354,20 @@ const makeWorld = (
                   return <A, E, R>(effect: Effect.Effect<A, E, R>) =>
                     Effect.gen(function* () {
                       const nesting = yield* depth;
+                      const pending = (yield* transactionWrites) ?? { written: false };
                       return yield* sql.withTransaction(
                         effect.pipe(
                           Effect.provideService(depth, nesting + 1),
+                          Effect.provideService(transactionWrites, pending),
+                          // Collection reads now open snapshot transactions too. Fail only
+                          // the outer transaction that actually persisted the wait change.
                           Effect.tap(() =>
-                            nesting === 0 && options.failCommit?.armed
-                              ? Effect.die("injected outer transaction failure")
+                            nesting === 0 && pending.written && options.failCommit?.armed
+                              ? Effect.sync(() => {
+                                  options.failCommit!.failures++;
+                                }).pipe(
+                                  Effect.andThen(Effect.die("injected outer transaction failure")),
+                                )
                               : Effect.void,
                           ),
                         ),
@@ -2832,7 +2849,7 @@ it.effect(
 );
 
 it.effect("a rolled-back local wait emits no lifecycle analytics", () => {
-  const failCommit = { armed: false };
+  const failCommit = { armed: false, failures: 0 };
   const events: AnalyticsEvent[] = [];
   const world = makeWorld({ failCommit, analytics: events });
   return Effect.gen(function* () {
@@ -2849,6 +2866,7 @@ it.effect("a rolled-back local wait emits no lifecycle analytics", () => {
     yield* TestClock.setTime(T0 + 2 * MINUTE);
     failCommit.armed = true;
     yield* kanban.tick;
+    assert.strictEqual(failCommit.failures, 1);
     assert.equal((yield* cardOf(card.id)).stage, "needs_review");
     assert.isDefined((yield* cardOf(card.id)).wait);
     assert.isFalse(
