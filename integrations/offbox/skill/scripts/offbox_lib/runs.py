@@ -1394,7 +1394,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               f"_offbox_needs_go={int(usage.needs_go)}\n{GO_REPAIR}",
               node,
               node_tools.block(rdir, repo_root),
-              ('''for _offbox_tool in terraform aws ruby vector; do
+              ('''for _offbox_tool in terraform aws ruby vector gh; do
   command -v "$_offbox_tool" >/dev/null || {
     echo "offbox: required tool missing on command PATH: $_offbox_tool" >&2
     echo offbox-repo-setup-failed >&2
