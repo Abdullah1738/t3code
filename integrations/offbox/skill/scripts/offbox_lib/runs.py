@@ -1607,6 +1607,7 @@ class Runner:
         con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', ('containers_expected:' + self.run_id, '1'))
         con.commit()
         self.require_pending(con)
+        self.check_source('push')
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:
@@ -1798,6 +1799,7 @@ class Runner:
             if tw is not None:
                 left = api.left()
                 tw.join(timeout=max(0, left) if left is not None else None)
+        self.check_source('push')
         if isinstance(push_exc, common.SourceGone):
             raise push_exc
         # Identity failures take precedence over transfer recovery, even if the other transfer saw a dead mount.

@@ -41,7 +41,7 @@ class SourceGoneTests(Isolated):
         self.quarantine = self.stack.enter_context(patch.object(lease, 'quarantine'))
         self.err = self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
 
-    def simulate(self, checkpoint, *, subdir=False, bg=False, steps=False, rsync_race=False):
+    def simulate(self, checkpoint, *, subdir=False, bg=False, steps=False, rsync_race=False, transfer_outcome=None):
         self.box('A', member=True)
         self.box('B', member=True)
         removed = self.cwd if subdir else self.root
@@ -60,11 +60,15 @@ class SourceGoneTests(Isolated):
             return dict(row)
 
         def checked(*args):
-            if checkpoint == 'push' and not rsync_race:
+            if checkpoint == 'push' and not rsync_race and transfer_outcome is None:
                 shutil.rmtree(removed)
 
         def transfer(*args, **kwargs):
             shutil.rmtree(removed)
+            if transfer_outcome == 'success':
+                return {}
+            if transfer_outcome == 'error':
+                raise common.OffboxError('transfer failed')
             result = subprocess.CompletedProcess([], 3, '', 'rsync: [Receiver] getcwd(): No such file or directory (2)')
             with patch.object(ssh_sync, '_watch_rsync', return_value=result), \
                     patch.object(ssh_sync, '_progress_args', return_value=[]):
@@ -79,7 +83,7 @@ class SourceGoneTests(Isolated):
                 patch.object(lease, '_reuse', side_effect=reuse) as reused, \
                 patch.object(lease, 'acquire_private') as created, \
                 patch.object(runs.Runner, '_check_box', side_effect=checked) as check_box, \
-                patch.object(ssh_sync, 'push', side_effect=transfer if rsync_race else None) as push:
+                patch.object(ssh_sync, 'push', side_effect=transfer if rsync_race or transfer_outcome else None) as push:
             code = runs.background_client(a, self.me) if bg else cli._run_with_retries(a, self.me)
         self.assertEqual(code, 2, self.err.getvalue())
         row = self.con.execute("SELECT * FROM runs WHERE cmd IS NOT NULL ORDER BY start_at DESC LIMIT 1").fetchone()
@@ -100,7 +104,7 @@ class SourceGoneTests(Isolated):
         detail = self.con.execute("SELECT detail FROM events WHERE kind='run_source_gone'").fetchone()[0]
         self.assertIn(f'checkpoint={checkpoint}', detail)
         self.starts.assert_not_called()
-        if rsync_race:
+        if rsync_race or transfer_outcome:
             push.assert_called_once()
         else:
             push.assert_not_called()
@@ -157,6 +161,12 @@ class SourceGoneTests(Isolated):
 
     def test_rsync_source_race_settles_without_infra_bookkeeping(self):
         self.simulate('push', bg=True, rsync_race=True)
+
+    def test_subdir_removed_during_successful_transfer(self):
+        self.simulate('push', bg=True, subdir=True, transfer_outcome='success')
+
+    def test_subdir_removed_during_failed_transfer(self):
+        self.simulate('push', subdir=True, transfer_outcome='error')
 
     def test_source_removed_while_waiting_for_pool_lock(self):
         @contextlib.contextmanager
