@@ -209,7 +209,7 @@ it.effect.each(
             Effect.gen(function* () {
               assert.equal(
                 yield* SqliteClient.ReaderLane,
-                operation === "status" ? "foreground" : "background",
+                operation === "board" ? "background" : "foreground",
               );
               yield* Deferred.succeed(recordEntered, undefined);
               yield* sql
