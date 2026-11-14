@@ -6,6 +6,7 @@ import {
   type KanbanActor,
   type KanbanCard,
   type KanbanOwnerAsk,
+  type KanbanStandingApproval,
   type KanbanSubtask,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -19,7 +20,7 @@ import {
   isNegativeOption,
   secretKindApprovalWarning,
 } from "./subtasks.ts";
-import { makeFake, owner, testLayer, toyBoard } from "./askFlows.testkit.ts";
+import { makeFake, owner, testLayer, toyBoard, workingCard } from "./askFlows.testkit.ts";
 
 const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("asker") };
 const worker: KanbanActor = { _tag: "thread", threadId: ThreadId.make("worker") };
@@ -2325,6 +2326,303 @@ it("#4319: a later unnamed picked approval keeps the naming hint", () => {
     "q2 (approved later) doesn't name s1",
   );
 });
+
+const handedAsk = (overrides: Partial<KanbanOwnerAsk> = {}): KanbanOwnerAsk =>
+  relevanceAsk({
+    text: "Can I drop this copy?",
+    answer: {
+      verdict: "handed",
+      decision: "answered",
+      text: "Skip s5 and s6 here as passed on",
+      by: evaluator,
+      at: "2026-11-13T14:03:00.000Z",
+    },
+    ...overrides,
+  });
+
+it.each(["field", "label"] as const)(
+  "handed skip requires a textual id despite an option's %s scope",
+  (scope) => {
+    const base = handedAsk();
+    const ask = handedAsk({
+      options: [
+        {
+          id: "o1",
+          label: scope === "label" ? "Approve s5" : "Approve",
+          ...(scope === "field" ? { approves: ["s5"] } : {}),
+        },
+        { id: "o2", label: "Don't" },
+      ],
+      answer: { ...base.answer!, decision: "picked", optionIds: ["o1"], text: "Skip this copy" },
+    });
+    const card = relevanceCard([ask]);
+    assert.isNotNull(approvalProblem(card, relevanceSubtask, [], undefined, "skip"));
+    const named = { ...card, asks: [{ ...ask, answer: { ...ask.answer!, text: "Skip s5" } }] };
+    assert.isNull(approvalProblem(named, relevanceSubtask, [], undefined, "skip"));
+    assert.isNotNull(approvalProblem(named, relevanceSubtask));
+  },
+);
+
+it.each(["s5", "s6"])("a later scoped drop for %s preserves handed targeting", (id) => {
+  const ask = relevanceAsk({
+    id: "q5",
+    text: "Deploy this copy?",
+    options: [{ id: "o1", label: "Approve", approves: [id] }],
+    answer: { verdict: "dropped", by: evaluator, at: "2026-11-13T14:04:00.000Z" },
+  });
+  const card = relevanceCard([handedAsk(), ask]);
+  const problem = approvalProblem(card, relevanceSubtask, [], undefined, "skip");
+  if (id === "s5") assert.include(problem!, "the latest decision, q5, was dropped");
+  else assert.isNull(problem);
+});
+
+it.each([{ kind: "notice" as const }, { respond: { ack: true } }])(
+  "a handed notice or acknowledgement does not clear a skip: %j",
+  (fields) => {
+    assert.isNotNull(
+      approvalProblem(relevanceCard([handedAsk(fields)]), relevanceSubtask, [], undefined, "skip"),
+    );
+  },
+);
+
+it.each(
+  (["text", "title", "summary"] as const).flatMap((field) =>
+    ["s6", "s50"].flatMap((id) =>
+      (["do", "skip"] as const).map((intent) => ({ field, id, intent })),
+    ),
+  ),
+)("owner-only $intent stays refused for $id in $field", ({ field, id, intent }) => {
+  const subtask = { ...goChoiceSubtask, id: "s5", ownerOnly: true };
+  const ask = relevanceAsk({
+    text: field === "text" ? `Approve ${id}` : "Approve this change?",
+    ...(field === "title" ? { title: `Approve ${id}` } : {}),
+    ...(field === "summary" ? { action: { summary: `Approve ${id}` } } : {}),
+  });
+  const card = { ...relevanceCard([ask]), subtasks: [subtask] };
+  const problem = approvalProblem(card, subtask, [], undefined, intent)!;
+  assert.include(problem, "or set approves: [s5] on the go option");
+  assert.include(problem, "(marked owner-only)");
+});
+
+const standingDeployApproval: KanbanStandingApproval = {
+  id: "sa-deploy",
+  gate: "deploy",
+  quote: "Tool boards may release",
+  sourceThreadId: "owner-thread",
+  saidAt: "2026-11-13T13:00:00.000Z",
+  approvedAsk: { cardId: "card-1", askId: "q1" },
+  recordedAt: "2026-11-13T13:01:00.000Z",
+  recordedBy: "evaluator",
+  revokedAt: null,
+  revokedBy: null,
+  revokeReason: null,
+};
+
+it.each(
+  (
+    [
+      { gate: "deploy", standing: "absent", ownerOnly: false, independentlyApproved: false },
+      { gate: "deploy", standing: "active", ownerOnly: false, independentlyApproved: true },
+      { gate: "deploy", standing: "revoked", ownerOnly: false, independentlyApproved: false },
+      { gate: "deploy", standing: "active", ownerOnly: true, independentlyApproved: false },
+      { gate: "money", standing: "active", ownerOnly: false, independentlyApproved: false },
+      { gate: "secret", standing: "active", ownerOnly: false, independentlyApproved: false },
+    ] as const
+  ).flatMap((entry) => [false, true].map((named) => ({ ...entry, named }))),
+)(
+  "handed $gate id=$named with $standing standing approval (ownerOnly=$ownerOnly)",
+  ({ gate, standing, ownerOnly, independentlyApproved, named }) => {
+    const subtask = { ...relevanceSubtask, gate, ownerOnly };
+    const base = handedAsk();
+    const ask = handedAsk({
+      answer: { ...base.answer!, decision: "approved", text: named ? "Skip s5" : "Skip this copy" },
+    });
+    const card = { ...relevanceCard([ask]), subtasks: [subtask] };
+    const approvals =
+      standing === "absent"
+        ? []
+        : [
+            {
+              ...standingDeployApproval,
+              revokedAt: standing === "revoked" ? "2026-11-13T14:00:00.000Z" : null,
+            },
+          ];
+    const skip = approvalProblem(card, subtask, approvals, undefined, "skip");
+    assert.strictEqual(skip === null, named || independentlyApproved);
+    assert.strictEqual(approvalProblem(card, subtask, approvals) === null, independentlyApproved);
+    if (!named && !independentlyApproved) {
+      assert.include(skip!, "a handed answer must name the subtask id");
+      if (gate === "deploy") {
+        assert.include(
+          skip!,
+          ownerOnly ? "(marked owner-only)" : "(this board has no standing deploy approval)",
+        );
+      }
+    }
+  },
+);
+
+it.each(
+  (["deploy", "money", "secret"] as const).flatMap((gate) =>
+    (["text", "title", "summary", "answer", "note"] as const).map((field) => ({ gate, field })),
+  ),
+)("an owner-handed $field id permits skipping $gate, never doing it", ({ gate, field }) => {
+  const base = handedAsk();
+  const ask = handedAsk({
+    ...(field === "text" ? { text: "Skip s5" } : {}),
+    ...(field === "title" ? { title: "Skip s5" } : {}),
+    ...(field === "summary" ? { action: { summary: "Skip s5" } } : {}),
+    answer: {
+      ...base.answer!,
+      decision: "approved",
+      text: field === "answer" ? "Skip s5/s6" : "Passed on",
+      ...(field === "note" ? { note: "Skip deploy-gated s5/s6" } : {}),
+    },
+  });
+  const subtask = { ...relevanceSubtask, gate };
+  const card = { ...relevanceCard([ask]), subtasks: [subtask, { ...subtask, id: "s6" }] };
+  assert.isNull(approvalProblem(card, subtask, [], undefined, "skip"));
+  assert.isNotNull(approvalProblem(card, subtask, [], undefined, "do"));
+});
+
+it.each(["Skip it", "Skip s6", "Skip s50", "Skip xs5", "Skip s5x", "Skip s5_copy"])(
+  "a handed answer needs the exact id: %s",
+  (text) => {
+    const base = handedAsk();
+    const ask = handedAsk({
+      text: "Deploy this copy?",
+      answer: { ...base.answer!, text },
+    });
+    // Even a single matching gate must not infer the target for a handed answer.
+    const subtask = { ...relevanceSubtask, text: "Deploy", gate: "deploy" as const };
+    const card = { ...relevanceCard([ask]), subtasks: [subtask] };
+    const problem = approvalProblem(card, subtask, [], undefined, "skip")!;
+    assert.include(problem, "a handed answer must name the subtask id");
+  },
+);
+
+it.each([
+  { label: "asked directly to evaluator", ask: handedAsk({ to: "evaluator" }) },
+  {
+    label: "ordinary evaluator answer",
+    ask: handedAsk({ answer: { ...handedAsk().answer!, verdict: "answered" } }),
+  },
+  {
+    label: "thread answer",
+    ask: handedAsk({
+      answer: { ...handedAsk().answer!, by: { _tag: "thread", threadId: ThreadId.make("worker") } },
+    }),
+  },
+  { label: "old ask", ask: handedAsk({ at: "2026-11-13T13:59:00.000Z" }) },
+  {
+    label: "old answer",
+    ask: handedAsk({ answer: { ...handedAsk().answer!, at: "2026-11-13T13:59:00.000Z" } }),
+  },
+  { label: "open ask", ask: handedAsk({ closedAt: null }) },
+  { label: "draft ask", ask: handedAsk({ draft: { text: "Skip s5", format: "text" } }) },
+])("a $label does not authorize a skip", ({ ask }) => {
+  assert.isNotNull(approvalProblem(relevanceCard([ask]), relevanceSubtask, [], undefined, "skip"));
+});
+
+it.each([owner, evaluator])("a later $_tag drop blocks a handed skip", (dropper) => {
+  const card = relevanceCard([
+    relevanceAsk({
+      id: "q5",
+      answer: { verdict: "dropped", by: dropper, at: "2026-11-13T14:04:00.000Z" },
+    }),
+    handedAsk(),
+  ]);
+  assert.include(
+    approvalProblem(card, relevanceSubtask, [], undefined, "skip")!,
+    "the latest decision, q5, was dropped",
+  );
+});
+
+it.effect.each([true, false])(
+  "a persisted evaluator answer clears a skip only after an owner handoff: %s",
+  (ownerHanded) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, card, worker } = yield* workingCard();
+        yield* kanban.editCard(
+          card.id,
+          {
+            subtasks: [
+              { text: "Deploy copy", owner: "evaluator", gate: "deploy" },
+              { text: "Restart copy", owner: "evaluator", gate: "deploy" },
+            ],
+          },
+          owner,
+        );
+        yield* kanban.askOwner(
+          card.id,
+          {
+            question: "Can I drop this copy?",
+            blocking: false,
+            ...(ownerHanded ? {} : { to: "evaluator" }),
+          },
+          worker,
+          "cardThread",
+        );
+        if (ownerHanded) yield* kanban.handAsk(card.id, "q1", "hand", owner);
+        const [started] = yield* fake.evaluators;
+        const actor: KanbanActor = { _tag: "evaluator", threadId: started!.threadId };
+        const answered = yield* kanban.answerAsk(
+          card.id,
+          "q1",
+          {
+            verdict: "answered",
+            text: "Drop this copy; skip s1/s2 here as passed on",
+            revision: 0,
+          },
+          actor,
+        );
+        assert.strictEqual(answered.card.asks[0]?.answer?.verdict, "handed");
+        assert.isUndefined(answered.card.asks[0]?.handedAt);
+        const denied = yield* kanban
+          .markSubtask(card.id, "s1", "done", "Deploy", actor, "evaluator")
+          .pipe(Effect.flip);
+        assert.include(denied.detail, "needs Abdullah's approval");
+        const problem = approvalProblem(
+          answered.card,
+          answered.card.subtasks[0]!,
+          [],
+          undefined,
+          "skip",
+        );
+        if (ownerHanded) {
+          assert.isNull(problem);
+          for (const id of ["s1", "s2"]) {
+            const skipped = yield* kanban.markSubtask(
+              card.id,
+              id,
+              "skipped",
+              "Passed on to the other board",
+              actor,
+              "evaluator",
+            );
+            assert.strictEqual(skipped.subtasks.find((entry) => entry.id === id)?.state, "skipped");
+            assert.isUndefined(skipped.subtasks.find((entry) => entry.id === id)?.gateSkipped);
+          }
+        } else {
+          assert.include(problem!, "a handed answer must name the subtask id");
+          const skipped = yield* kanban.markSubtask(
+            card.id,
+            "s1",
+            "skipped",
+            "Passed on to the other board",
+            actor,
+            "evaluator",
+          );
+          assert.strictEqual(
+            skipped.subtasks[0]?.gateSkipped?.reason,
+            "Passed on to the other board",
+          );
+        }
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
 
 it.each(
   ["2026-11-13T14:02:00.000Z", "2026-11-13T14:04:00.000Z"].flatMap((at) =>
