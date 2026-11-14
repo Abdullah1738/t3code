@@ -122,7 +122,15 @@ export type CallerRow = Pick<
   | "branch"
   | "worktreePath"
 >;
-export type CallerActiveRow = CallerRow & { readonly activeRunId: RunId | null };
+export type CallerActiveRow = CallerRow & {
+  readonly activeRunId: RunId | null;
+  // Absent when exact liveness needs fork history or exceeds the bounded caller read.
+  readonly pendingBackgroundTasks?: OrchestrationV2ThreadShell["pendingBackgroundTasks"];
+};
+
+const CALLER_WORK_ROW_LIMIT = 16;
+const CALLER_WORK_PAYLOAD_BYTES = 65536;
+type CallerWorkPayloadRow = { readonly payload_json: string | null };
 
 export class ProjectionStoreApplyEventError extends Schema.TaggedError<ProjectionStoreApplyEventError>()(
   "ProjectionStoreApplyEventError",
@@ -7110,9 +7118,102 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               WHERE thread_id = ${threadId} AND status IN ('preparing', 'starting', 'running')
               ORDER BY ordinal DESC, run_id DESC LIMIT 1
             `;
-            return {
+            const row = {
               ...thread,
               activeRunId: active[0] === undefined ? null : RunId.make(active[0].run_id),
+            };
+            if (thread.forkedFrom?.type === "run") return row;
+            if (row.activeRunId !== null || thread.archivedAt !== null)
+              return { ...row, pendingBackgroundTasks: [] };
+
+            // Caller liveness needs pending work, never shell counts or inherited history.
+            // Cap both row count and payload size before decoding on the foreground lane.
+            const latest = yield* sql<{
+              readonly run_id: string;
+              readonly ordinal: number;
+              readonly status: OrchestrationV2Run["status"];
+            }>`
+              SELECT run_id, ordinal, status
+              FROM orchestration_v2_projection_runs
+              WHERE thread_id = ${threadId} ORDER BY ordinal DESC, run_id DESC LIMIT 1
+            `;
+            if (latest[0] === undefined) return { ...row, pendingBackgroundTasks: [] };
+            const latestRun = {
+              id: RunId.make(latest[0].run_id),
+              ordinal: latest[0].ordinal,
+              status: latest[0].status,
+            };
+            // Held queues and rollback can change the shell's presented latest run.
+            if (latestRun.status === "queued" || latestRun.status === "rolled_back") return row;
+            const providers = yield* sql<CallerWorkPayloadRow>`
+              SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= ${CALLER_WORK_PAYLOAD_BYTES}
+                THEN payload_json ELSE NULL END AS payload_json
+              FROM orchestration_v2_projection_provider_threads
+              WHERE thread_id = ${threadId}
+                ${thread.activeProviderThreadId === null ? sql`` : sql`AND provider_thread_id = ${thread.activeProviderThreadId}`}
+              LIMIT ${CALLER_WORK_ROW_LIMIT + 1}
+            `;
+            const items = yield* sql<
+              CallerWorkPayloadRow & {
+                readonly owning_provider_instance_id: string | null;
+                readonly owning_run_status: string | null;
+                readonly owning_run_id: string | null;
+              }
+            >`
+              SELECT CASE WHEN length(CAST(i.payload_json AS BLOB)) <= ${CALLER_WORK_PAYLOAD_BYTES}
+                  THEN i.payload_json ELSE NULL END AS payload_json,
+                p.provider_instance_id AS owning_provider_instance_id, r.status AS owning_run_status,
+                i.run_id AS owning_run_id
+              FROM orchestration_v2_projection_turn_items i
+              LEFT JOIN orchestration_v2_projection_provider_threads p
+                ON p.provider_thread_id = i.provider_thread_id
+              LEFT JOIN orchestration_v2_projection_runs r ON r.run_id = i.run_id
+              WHERE i.thread_id = ${threadId}
+                AND i.type IN ('command_execution', 'dynamic_tool', 'subagent')
+                AND i.status NOT IN ('completed', 'interrupted', 'failed', 'cancelled')
+              LIMIT ${CALLER_WORK_ROW_LIMIT + 1}
+            `;
+            if (
+              providers.length > CALLER_WORK_ROW_LIMIT ||
+              items.length > CALLER_WORK_ROW_LIMIT ||
+              [...providers, ...items].some((entry) => entry.payload_json === null)
+            )
+              return row;
+            const providerThreads = yield* Effect.forEach(providers, (entry) =>
+              decodeProviderThreadPayload(entry.payload_json!),
+            );
+            const turnItems = yield* Effect.forEach(
+              items.filter(
+                (entry) =>
+                  entry.owning_run_id === null ||
+                  (entry.owning_run_status !== null && entry.owning_run_status !== "rolled_back"),
+              ),
+              (entry) =>
+                decodeTurnItemPayload(entry.payload_json!).pipe(
+                  Effect.map((item) => ({
+                    ...item,
+                    ...(entry.owning_provider_instance_id === null
+                      ? {}
+                      : {
+                          owningProviderInstanceId: ProviderInstanceId.make(
+                            entry.owning_provider_instance_id,
+                          ),
+                        }),
+                  })),
+                ),
+            );
+            return {
+              ...row,
+              pendingBackgroundTasks: [
+                ...derivePendingBackgroundWork({
+                  latestRun,
+                  providerThreads,
+                  turnItems,
+                  activeProviderThreadId: thread.activeProviderThreadId,
+                  hasActiveRun: false,
+                  pullRequests: thread.pullRequests,
+                }),
+              ],
             };
           }),
         )
@@ -7373,7 +7474,16 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
         const active = projection.runs
           .filter(isInterruptibleRunForShell)
           .toSorted((a, b) => b.ordinal - a.ordinal || String(b.id).localeCompare(String(a.id)))[0];
-        return { ...projection.thread, activeRunId: active?.id ?? null };
+        const shell = threadShellFromProjection(projection);
+        return {
+          ...projection.thread,
+          activeRunId: active?.id ?? null,
+          ...(projection.thread.forkedFrom?.type === "run"
+            ? {}
+            : {
+                pendingBackgroundTasks: shell.pendingBackgroundTasks,
+              }),
+        };
       }),
       getThreadShell: Effect.fn("ProjectionStore.getThreadShell")(function* (threadId) {
         const existing = (yield* Ref.get(replayState)).projections;
