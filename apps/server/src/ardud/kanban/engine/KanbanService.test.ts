@@ -8336,6 +8336,317 @@ const toyBoard = Effect.gen(function* () {
   return { kanban, board: chained };
 });
 
+const offbox16ReviewFixture = Effect.fn("offbox16ReviewFixture")(function* (
+  fake: Effect.Success<typeof makeFake>,
+) {
+  const { kanban, board } = yield* toyBoard;
+  const store = yield* KanbanStore.KanbanStore;
+  const created = yield* kanban.createCard(
+    board.id,
+    {
+      title: "Offbox #16 replay",
+      prompt: "Keep Node deterministic",
+      subtasks: [
+        { step: 1, owner: "work", text: "Implement Node selection" },
+        { step: 1, owner: "work", text: "Update explanation" },
+        { step: 2, owner: "work", text: "Prove selected version" },
+        { step: 3, owner: "review", text: "Review Node selection" },
+        { step: 4, owner: "evaluator", text: "Merge into main" },
+        { step: 5, owner: "evaluator", text: "Release", gate: "deploy" },
+      ],
+    },
+    owner,
+  );
+  yield* kanban.dispatchNow;
+  const working = (yield* kanban.card(created.id)).card;
+  yield* setRunning(fake, working.workThreadId!, false);
+  const card = {
+    ...working,
+    stage: "todo" as const,
+    activeThreadId: null,
+    activeRole: null,
+    activePool: null,
+    subtasks: working.subtasks.map((task) =>
+      ["s2", "s3", "s5"].includes(task.id) ? { ...task, state: "done" as const } : task,
+    ),
+  };
+  yield* store.putCard(card);
+  yield* store.addCardEvent({
+    cardId: card.id,
+    at: card.updatedAt,
+    actor: owner,
+    kind: "review",
+    fromStage: "in_review",
+    toStage: "todo",
+    body: "clear",
+    head: "b21f374b796ee1dfc70433d1fdc370c7bb00b52d",
+  });
+  return { kanban, board, store, card };
+});
+
+it.effect.each(["done", "skipped"] as const)(
+  "#1416 Offbox #16 replay: ticking s4 %s advances to s6 and wakes its evaluator once",
+  (state) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board, store, card } = yield* offbox16ReviewFixture(fake);
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        const own = yield* kanban.startEvaluator(board.id, {
+          kind: "discussion",
+          discussionId: discussion.id,
+          title: discussion.title,
+          cardNumber: card.number,
+        });
+        yield* store.putDiscussion({ ...discussion, evaluatorThreadId: own });
+        const evaluator: KanbanActor = {
+          _tag: "evaluator",
+          threadId: ThreadId.make("other-evaluator"),
+        };
+        const waiting = yield* kanban.markSubtask(
+          card.id,
+          "s1",
+          "done",
+          "Already reviewed",
+          evaluator,
+          "evaluator",
+        );
+        assert.strictEqual(waiting.stage, "needs_review");
+        assert.strictEqual(
+          (yield* kanban.card(card.id)).events.at(-1)?.body,
+          "Next step is the review",
+        );
+        const placed = yield* kanban.markSubtask(
+          card.id,
+          "s4",
+          state,
+          "Reuses the same-head clear",
+          evaluator,
+          "evaluator",
+        );
+        assert.strictEqual(placed.stage, "todo");
+        assert.isNull(placed.activeThreadId);
+        assert.isNull(placed.wakeNote);
+        assert.strictEqual(placed.subtasks[5]?.state, "open");
+        assert.strictEqual(placed.subtasks[5]?.gate, "deploy");
+        assert.isNull(Rules.reviewGate(placed, 1));
+        assert.include(
+          (yield* kanban.card(card.id)).events.at(-1)?.body ?? "",
+          "Review step already done (s4); next step is the evaluator's",
+        );
+        yield* kanban.dispatchNow;
+        assert.deepStrictEqual(
+          Rules.planDispatch(
+            board,
+            [(yield* kanban.card(card.id)).card],
+            yield* store.pools(board.id),
+          ),
+          [],
+        );
+        const notes = (yield* Ref.get(fake.threads))
+          .get(own)!
+          .messages.filter((text) => text.includes("waiting on your subtasks: s6"));
+        assert.strictEqual(notes.length, 1);
+      }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["same", "changed", "unknown", "findings"] as const)(
+  "#1416 dispatcher self-heals an old finished review with %s head evidence",
+  (head) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, store, card } = yield* offbox16ReviewFixture(fake);
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+        const waiting = yield* kanban.markSubtask(
+          card.id,
+          "s1",
+          "done",
+          "Already reviewed",
+          evaluator,
+          "evaluator",
+        );
+        yield* store.putCard({
+          ...waiting,
+          subtasks: waiting.subtasks.map((task) =>
+            task.id === "s4" ? { ...task, state: "done" } : task,
+          ),
+        });
+        if (head !== "unknown")
+          fake.prs.set(card.workThreadId!, [
+            {
+              url: "https://github.com/o/r/pull/16",
+              title: "Node",
+              state: "open",
+              head: "b21f374b796ee1dfc70433d1fdc370c7bb00b52d",
+              observedHead:
+                head === "changed"
+                  ? "ccccccc33333333333333333333333333333333333"
+                  : "b21f374b796ee1dfc70433d1fdc370c7bb00b52d",
+            },
+          ]);
+        if (head === "findings")
+          yield* store.addCardEvent({
+            cardId: card.id,
+            at: card.updatedAt,
+            actor: owner,
+            kind: "review",
+            fromStage: "in_review",
+            toStage: "todo",
+            body: "- Fix it",
+            head: "b21f374b796ee1dfc70433d1fdc370c7bb00b52d",
+          });
+        yield* kanban.tick;
+        const result = yield* kanban.card(card.id);
+        const needed = head === "changed" || head === "findings";
+        assert.strictEqual(result.card.stage, needed ? "in_review" : "todo");
+        assert.strictEqual(result.card.activeRole, needed ? "review" : null);
+        assert.strictEqual(
+          result.events.filter(
+            (event) => event.kind === "moved" && event.body?.startsWith("Review step already done"),
+          ).length,
+          needed ? 0 : 1,
+        );
+        if (!needed) {
+          yield* kanban.tick;
+          assert.strictEqual(
+            (yield* kanban.card(card.id)).events.filter(
+              (event) =>
+                event.kind === "moved" && event.body?.startsWith("Review step already done"),
+            ).length,
+            1,
+          );
+          const notes = [...(yield* Ref.get(fake.threads)).values()]
+            .flatMap((thread) => thread.messages)
+            .filter((text) => text.includes("waiting on your subtasks: s6"));
+          assert.strictEqual(notes.length, 1);
+        }
+      }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["work", "script", "completed", "landing"] as const)(
+  "#1416 a finished review advances to %s by the existing placement rule",
+  (next) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, store, card } = yield* offbox16ReviewFixture(fake);
+        const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+        const waiting = yield* kanban.markSubtask(
+          card.id,
+          "s1",
+          "done",
+          "Checked",
+          evaluator,
+          "evaluator",
+        );
+        const subtasks = waiting.subtasks.map((task) =>
+          task.id !== "s6"
+            ? task
+            : next === "completed" || next === "landing"
+              ? { ...task, state: "done" as const }
+              : { ...task, owner: next },
+        );
+        const links =
+          next === "landing"
+            ? [
+                {
+                  kind: "pr" as const,
+                  url: "https://github.com/o/r/pull/16",
+                  state: "open" as const,
+                  label: null,
+                  checkedAt: null,
+                },
+              ]
+            : waiting.links;
+        yield* store.putCard({ ...waiting, subtasks, links });
+        const placed = yield* kanban.markSubtask(
+          card.id,
+          "s4",
+          "done",
+          "Checked",
+          evaluator,
+          "evaluator",
+        );
+        assert.strictEqual(
+          placed.stage,
+          next === "completed" ? "completed" : next === "landing" ? "in_review" : "todo",
+        );
+        assert.isNull(placed.activeThreadId);
+        if (next === "work") assert.include(placed.wakeNote!, "The review passed");
+        else assert.isNull(placed.wakeNote);
+        if (next === "completed" || next === "landing") assert.strictEqual(placed.reviewStep, 1);
+      }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+    }),
+);
+
+it.effect("#1416 ticking one of two review subtasks leaves the review eligible", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, store, card } = yield* offbox16ReviewFixture(fake);
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      const waiting = yield* kanban.markSubtask(
+        card.id,
+        "s1",
+        "done",
+        "Checked",
+        evaluator,
+        "evaluator",
+      );
+      yield* store.putCard({
+        ...waiting,
+        subtasks: [...waiting.subtasks, { ...waiting.subtasks[3]!, id: "s7" }],
+        subtaskSeq: 7,
+      });
+      const partial = yield* kanban.markSubtask(
+        card.id,
+        "s4",
+        "done",
+        "Checked",
+        evaluator,
+        "evaluator",
+      );
+      assert.strictEqual(partial.stage, "needs_review");
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(card.id)).card.activeRole, "review");
+    }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+  }),
+);
+
+it.effect("#1416 ticking the last review subtask cannot clear a changed PR head", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, card } = yield* offbox16ReviewFixture(fake);
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
+      yield* kanban.markSubtask(card.id, "s1", "done", "Checked", evaluator, "evaluator");
+      fake.prs.set(card.workThreadId!, [
+        {
+          url: "https://github.com/o/r/pull/16",
+          title: "New work",
+          state: "open",
+          observedHead: "ccccccc33333333333333333333333333333333333",
+        },
+      ]);
+      const marked = yield* kanban.markSubtask(
+        card.id,
+        "s4",
+        "done",
+        "Old clear",
+        evaluator,
+        "evaluator",
+      );
+      assert.strictEqual(marked.stage, "needs_review");
+      assert.strictEqual(marked.subtasks[3]?.state, "done");
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(card.id)).card.activeRole, "review");
+    }).pipe(Effect.provide(inlineTestLayer(fake.layer)));
+  }),
+);
+
 const setBackground = (fake: Effect.Success<typeof makeFake>, threadId: string, count: number) =>
   Ref.update(fake.threads, (all) => {
     all.get(threadId)!.background = count;

@@ -547,6 +547,8 @@ export function poolThreads(
   return byPool;
 }
 
+export type ReviewEvidence = NonNullable<Parameters<typeof kanbanReviewAlreadyDone>[1]>;
+
 /**
  * Fill free pool slots by effective urgency, reviews before todos at the same rank.
  * Within each role, pick order uses rank, holds, then oldest first.
@@ -566,8 +568,6 @@ export function poolThreads(
  * are measured against. The dispatcher passes the real time. Left out (tests, a
  * caller with no clock) it is the board's newest card stamp (kanbanBoardClock).
  */
-export type ReviewEvidence = NonNullable<Parameters<typeof kanbanReviewAlreadyDone>[1]>;
-
 export function planDispatch(
   board: KanbanBoard,
   cards: ReadonlyArray<KanbanCard>,

@@ -3275,13 +3275,14 @@ const make = Effect.gen(function* () {
     actor: KanbanActor,
     ids: string,
   ) {
-    const to =
-      kanbanOpenStep(card) !== null ? "todo" : Rules.prsLanded(card) ? "completed" : "in_review";
+    const steps = Math.max(1, Rules.chainFor(board, card)?.steps.length ?? 1);
+    const cleared = Rules.applyReviewResult({ ...card, reviewStep: steps - 1 }, steps, "clear");
+    const to = kanbanOpenStep(card) !== null ? "todo" : cleared.stage;
     const at = yield* nowIso;
     const next: KanbanCard = {
       ...Retries.withoutRetries(release(yield* moveWait(card, to, at, actor))),
       stage: to,
-      reviewStep: to === "todo" ? 0 : (Rules.chainFor(board, card)?.steps.length ?? 1),
+      reviewStep: Subtasks.workAfterReview(card) ? 0 : cleared.reviewStep,
       reviewFindingsPending: false,
       wakeNote: Subtasks.workAfterReview(card)
         ? Subtasks.nextStepNote("The review passed. ")
@@ -3294,7 +3295,7 @@ const make = Effect.gen(function* () {
     yield* logEvent(next, actor, "moved", {
       fromStage: card.stage,
       toStage: to,
-      body: `Review step already done (${ids}); ${owner === undefined ? "plan completed" : `next step is the ${Subtasks.OWNER_NAMES[owner]}'s`}`,
+      body: `Review step already done (${ids}); ${owner === undefined ? (to === "completed" ? "plan completed" : "waiting for PRs to land") : `next step is the ${Subtasks.OWNER_NAMES[owner]}'s`}`,
     });
     yield* saveCard(next, actor);
     yield* laterEvaluatorTurn(card, next, actor);
@@ -7709,12 +7710,14 @@ const make = Effect.gen(function* () {
                           kanbanDeciding(card, yield* nowMillis)
                         )
                           continue;
-                        const evidence = yield* reviewEvidence(board, card);
+                        const synced = yield* syncPrs(card);
+                        cards[i] = synced;
+                        const evidence = yield* reviewEvidence(board, synced);
                         reviews.set(card.id, evidence);
-                        if (!kanbanReviewAlreadyDone(card, evidence)) continue;
+                        if (!kanbanReviewAlreadyDone(synced, evidence)) continue;
                         cards[i] = yield* placeFinishedReview(
                           board,
-                          card,
+                          synced,
                           { _tag: "system", component: "dispatcher" },
                           Subtasks.subtaskIds(
                             card.subtasks.filter((s) => s.owner === "review" && s.state !== "open"),
@@ -14139,10 +14142,17 @@ const make = Effect.gen(function* () {
           gated.step === kanbanOpenStep(card) &&
           marked.activeThreadId === null &&
           marked.settledAt === null &&
-          kanbanReviewAlreadyDone(marked) &&
-          kanbanReviewAlreadyDone(marked, yield* reviewEvidence(board, marked))
+          kanbanReviewAlreadyDone(marked)
         ) {
-          const next = yield* placeFinishedReview(board, marked, actor, subtaskId);
+          analyticsActors.set(marked, actor);
+          yield* saveCard(marked);
+          const synced = yield* syncPrs(marked);
+          const evidence = yield* reviewEvidence(board, synced);
+          // Ticking the review explicitly answers a pending review request, but
+          // cannot reuse a verdict for a different known head.
+          const next = kanbanReviewAlreadyDone(synced, { ...evidence, requested: false })
+            ? yield* placeFinishedReview(board, synced, actor, subtaskId)
+            : synced;
           yield* kick;
           return next;
         }

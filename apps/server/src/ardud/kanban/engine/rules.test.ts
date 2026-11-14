@@ -198,6 +198,21 @@ describe("checkMove", () => {
   });
 });
 
+it.each(["todo", "completed", "in_review"] as const)(
+  "#1416 the system can re-place an idle finished review in %s",
+  (stage) => {
+    expect(checkMove("system", card({ stage: "needs_review" }), stage).ok).toBe(true);
+    if (stage === "in_review")
+      expect(
+        checkMove(
+          "system",
+          card({ stage: "needs_review", activeThreadId: ThreadId.make("reviewer") }),
+          stage,
+        ).ok,
+      ).toBe(false);
+  },
+);
+
 describe("reviewGate", () => {
   const reviewSub = {
     id: "s2",
@@ -283,6 +298,118 @@ describe("applyReviewResult", () => {
 });
 
 describe("planDispatch", () => {
+  const reviewTask = (
+    state: "open" | "done" | "skipped",
+    step = 2,
+  ): KanbanCard["subtasks"][number] => ({
+    id: "s4",
+    step,
+    owner: "review",
+    text: "Review",
+    state,
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  });
+  it.each([
+    {
+      label: "same-head clear",
+      state: "done",
+      heads: ["b21f374b796ee1dfc70433d1fdc370c7bb00b52d"],
+      verdict: { body: "clear", head: "b21f374b" },
+      dispatch: false,
+    },
+    {
+      label: "skipped review, unknown head",
+      state: "skipped",
+      heads: [],
+      verdict: null,
+      dispatch: false,
+    },
+    {
+      label: "done review, unknown head",
+      state: "done",
+      heads: [],
+      verdict: null,
+      dispatch: false,
+    },
+    {
+      label: "open review",
+      state: "open",
+      heads: ["b21f374b"],
+      verdict: { body: "clear", head: "b21f374b" },
+      dispatch: true,
+    },
+    {
+      label: "changed head",
+      state: "done",
+      heads: ["ccccccc3"],
+      verdict: { body: "clear", head: "b21f374b" },
+      dispatch: true,
+    },
+    {
+      label: "one of several heads changed",
+      state: "done",
+      heads: ["b21f374b", "ccccccc3"],
+      verdict: { body: "clear", head: "b21f374b" },
+      dispatch: true,
+    },
+    {
+      label: "latest verdict is findings",
+      state: "done",
+      heads: ["b21f374b"],
+      verdict: { body: "- Fix it", head: "b21f374b" },
+      dispatch: true,
+    },
+    {
+      label: "known head without verdict",
+      state: "done",
+      heads: ["b21f374b"],
+      verdict: null,
+      dispatch: true,
+    },
+  ] as const)("#1416 $label", ({ state, heads, verdict, dispatch }) => {
+    const candidate = card({ stage: "needs_review", subtasks: [reviewTask(state)] });
+    const plan = planDispatch(
+      board,
+      [candidate],
+      pools([[opus, 1]]),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      new Map([[candidate.id, { heads, verdict, requested: false }]]),
+    );
+    expect(plan.map((entry) => entry.role)).toEqual(dispatch ? ["review"] : []);
+  });
+
+  it("#1416 keeps plain cards and future reviews eligible", () => {
+    const plain = card({ stage: "needs_review" });
+    const future = card({
+      stage: "needs_review",
+      subtasks: [{ ...reviewTask("open", 1), owner: "evaluator" }, reviewTask("open", 2)],
+    });
+    expect(
+      planDispatch(board, [plain, future], pools([[opus, 2]])).map((entry) => entry.cardId),
+    ).toEqual([plain.id, future.id]);
+  });
+
+  it("#1416 a fresh review request overrides completed subtasks", () => {
+    const candidate = card({ stage: "needs_review", subtasks: [reviewTask("done")] });
+    expect(
+      planDispatch(
+        board,
+        [candidate],
+        pools([[opus, 1]]),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        new Map([[candidate.id, { heads: [], verdict: null, requested: true }]]),
+      ),
+    ).toMatchObject([{ cardId: candidate.id, role: "review" }]);
+  });
+
   it("skips attempted candidates without losing their blockers or occupied slots", () => {
     const failed = card({ priority: 1 });
     const blocked = card({ blockedBy: [failed.id] });
