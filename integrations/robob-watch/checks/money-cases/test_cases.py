@@ -1182,6 +1182,23 @@ class Questions(Base):
         self.assertEqual(event.count('explained now:'), 1)
         self.assertEqual(self.follow('2026-11-07T08:15', finder(), 'r3'), '')
 
+    def test_paid_decline_does_not_explain_its_unmatched_charge(self):
+        decline = self.screen(DECLINED, BANK, '2026-11-06T23:07', '2026-11-06T23:08', 'imsg:decline')
+        mc.triaged(self.data, [(decline['id'], 'imsg:decline', True)], at('2026-11-06T23:08'))
+        charge = self.screen(PAID, BANK, '2026-11-06T23:12', '2026-11-06T23:13', 'imsg:charge')
+        event = self.follow('2026-11-07T08:00', finder())
+        declined = mc.find_question(mc.load_questions(self.data), decline['id'])
+        charged = mc.find_question(mc.load_questions(self.data), charge['id'])
+        self.assertEqual((declined['status'], declined['by']), ('closed', 'check'))
+        self.assertIn('paid after decline', declined['outcome'])
+        self.assertEqual(charged['status'], 'open')
+        cases = mc.load(self.data)['cases']
+        self.assertEqual(len(cases), 1)
+        self.assertEqual((cases[0]['id'], cases[0]['merchant']), (charged['case_opened'], mc.UNMATCHED))
+        self.assertEqual(event.count('explained now:'), 1)
+        self.assertNotIn('explained now:', self.follow('2026-11-07T08:15', finder(), 'r2'))
+        self.assertEqual(mc.load(self.data)['cases'], cases)
+
     def test_decline_only_matches_exact_charge_after_it_within_an_hour(self):
         rows = [
             ('boundary', PAID, '2026-11-07T00:07', True),
