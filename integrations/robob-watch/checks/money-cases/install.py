@@ -15,7 +15,7 @@ DATA = Path.home() / 'Documents/assistant/money-cases'
 BIN = Path.home() / '.local/bin/money-cases'
 SOURCE_FILES = ('payments.py', 'cases.py', 'charges.py', 'toollog.py', 'check.sh', 'install.py', 'test_cases.py', 'test_charges.py',
                 'daily_legacy.fixture.json', 'test_install.py', 'test_subscriptions.py', 'test_unanswered.py', 'test_daily_list.py', 'README.md', 'settings.json',
-                'order_lookup.py', 'state_json.py', 'test_order_lookup.py', 'test_accuracy.py')
+                'order_lookup.py', 'state_json.py', 'test_order_lookup.py', 'test_accuracy.py', 'order_charges.py', 'test_order_charges.py')
 EXECUTABLE = ('cases.py', 'check.sh', 'install.py')
 
 

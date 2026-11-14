@@ -417,7 +417,7 @@ def check_watcher(watcher_id, root=None):
 
 
 UNMATCHED = 'unmatched'
-KINDS = ('charge', 'hold', 'payment_deadline', 'autopay_expected')
+KINDS = ('charge', 'hold', 'payment_deadline', 'autopay_expected', 'charge_unconfirmed')
 # Sent once after 2 days of reminders with no answer. The case then stays quiet until he answers.
 ASK = ('no reply from you for 2 days. Yes or no: keep chasing this case, or close it? '
        'I stay quiet on it until you answer')
@@ -3274,6 +3274,70 @@ def payment_entries(cases, now, sent, pending=False):
     return entries
 
 
+def follow_order_charges(data, now, deadline, find=None, stats=None, end=None, registry=None, read=None):
+    import order_charges
+    registry = registry or Path(os.environ.get('ORDER_TRACKER_ROOT', '~/.local/state/order-tracker')).expanduser()
+    source = find or (lambda *args, **kwargs: charges.search(*args, **kwargs, stats=stats))
+    reader = read or (lambda *args, **kwargs: charges.show(*args, **kwargs, stats=stats))
+    book = load(data)
+    settled = book.get('order_charges', {})
+    orders = {cfg['watcher']: cfg for cfg in order_charges.registrations(registry)}
+    for case in book['cases']:
+        if case.get('kind') == 'charge_unconfirmed' and active(case) and case.get('order_registration'):
+            cfg = case['order_registration']
+            orders.setdefault(cfg['watcher'], cfg)
+    errors = []
+    # Rotate long lists so a noisy archive cannot starve the same older order forever.
+    for wid, cfg in sorted(orders.items(), key=lambda pair: settled.get(pair[0], {}).get('checked', '')):
+        prior = settled.get(wid, {})
+        placed = parse_time(cfg['placed_at'])
+        if prior.get('confirmed') or now < placed + dt.timedelta(minutes=15):
+            continue
+        cid = 'order-charge-' + hashlib.sha256(wid.encode()).hexdigest()[:20]
+        case = next((c for c in book['cases'] if c['id'] == cid), None)
+        if case and not active(case):
+            continue
+        if time.time() + 1 >= deadline:
+            break
+        proof = None
+        try:
+            each = min(deadline, time.time() + 4)
+            with within(each, LookupTimeout('order charge lookup out of time')):
+                peers = [dict(other, bank_confirmed_at=(settled.get(key, {}).get('confirmed') or {}).get('at'))
+                         for key, other in orders.items()]
+                proof = order_charges.matching_charge(cfg, now, source, reader, each, charges, peers)
+        except (charges.Lookup, LookupTimeout) as exc:
+            errors.append(f'{wid}: {exc}')
+        # One transaction owns both the per-order receipt and its case. Concurrent
+        # checks and repeated SMS/email copies cannot open a second case.
+        with Locked(data, wait=lock_wait(end or deadline + 2)) as current:
+            notes = current.setdefault('order_charges', {})
+            if notes.get(wid, {}).get('confirmed'):
+                continue
+            notes[wid] = {'checked': stamp(now), 'confirmed': proof}
+            settled[wid] = notes[wid]
+            live = next((c for c in current['cases'] if c['id'] == cid), None)
+            if proof:
+                if live and active(live):
+                    live.update(status='closed', closed=stamp(now), updated=stamp(now),
+                                outcome='bank charge confirmed')
+                    live['history'].append({'at': stamp(now), 'text': 'bank charge confirmed', 'source': proof['source']})
+            elif live is None:
+                merchant = check_text('merchant', order_charges.merchant(cfg))
+                current['cases'].append({
+                    'id': cid, 'kind': 'charge_unconfirmed', 'merchant': merchant,
+                    'amount': check_amount(cfg['amount']), 'currency': check_currency(cfg.get('currency', 'AED')),
+                    'card': cfg['card_last4'], 'reference': cfg['order'], 'charged': placed.date().isoformat(),
+                    'state': 'charge unconfirmed', 'next': 'Check bank evidence; do not pay or reorder again',
+                    'deadline': stamp(placed + dt.timedelta(minutes=15)),
+                    'why': 'No matching bank charge observed 15 minutes after order placement; this does not prove payment failed',
+                    'who': 'Moni' if cfg.get('for') == 'moni' else 'Abdullah', 'watchers': [], 'status': 'open',
+                    'asks': [], 'rev': 0, 'cycle': 0, 'opened': stamp(now), 'updated': stamp(now),
+                    'closed': None, 'outcome': None, 'history': [{'at': stamp(now), 'text': 'opened'}],
+                    'order_registration': cfg})
+    return errors
+
+
 @log_scope
 def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
     diagnostic = {'budgetHit': False, 'openCases': 0, 'fired': 0, 'ok': False,
@@ -3361,6 +3425,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
                 raise
             except CaseError as exc:
                 errors.append(str(exc))
+            errors += follow_order_charges(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
             errors += follow_payments(data or DATA, now, min(end - 28, time.time() + 6), find, stats, end=work_end)
             errors += follow(data or DATA, now, root, min(end - 8, time.time() + FOLLOW_BUDGET), find, said,
                             end=work_end, stats=stats)
