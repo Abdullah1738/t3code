@@ -304,6 +304,39 @@ class DiskSwingTests(unittest.TestCase):
                 self.assertNotIn('grower1Path', recovered['props'])
                 self.assertNotIn('topMover1Path', recovered['props'])
 
+    def test_main_state_without_inventory_at_migrates_without_invented_deltas(self):
+        for partial in (False, True):
+            case_logs = self.root/('partial-logs' if partial else 'complete-logs')
+            with self.subTest(partial=partial), patch.object(self, 'logs', case_logs), \
+                 patch.dict(os.environ, TOOLLOG_DIR=str(case_logs)):
+                path = str(self.paths[0])
+                jobs.save_state('disk', dict(sizes={path: GB},
+                    partials={path: dict(partial=True)} if partial else {}))
+                self.inventory([95])
+                swings_before = len(self.rows('disk.swing'))
+                first = self.sample(642)
+                self.assertTrue(first['ok'])
+                self.assertEqual(first['props']['baseline'], 0)
+                self.assertEqual(first['props']['count'], 0 if partial else 1)
+                if not partial:
+                    self.assertEqual(first['props']['grower1DeltaGb'], 94)
+                self.assertIsNone(first['props']['internalFreeGbDelta'])
+                self.assertIsNone(first['props']['externalFreeGbDelta'])
+                self.assertNotIn('topMover1Path', first['props'])
+                self.assertEqual(len(self.rows('disk.swing')), swings_before)
+                migrated = jobs.read_state('disk')
+                self.assertEqual(migrated['sizes'][path], 95*GB)
+                self.assertEqual(migrated['partials'], {})
+                self.assertEqual(migrated['inventoryAt'], self.at)
+                self.assertEqual(migrated['ts'], first['ts'])
+                self.inventory([121])
+                next_sample = self.sample(616)
+                self.assertEqual(next_sample['props']['topMover1Path'], path)
+                self.assertEqual(next_sample['props']['topMover1GbDelta'], 26)
+                self.assertEqual(next_sample['props']['externalFreeGbDelta'], -26)
+                self.assertEqual(len(self.rows('disk.swing')), swings_before+1)
+                self.assertEqual(self.rows('disk.swing')[-1]['props']['previousTs'], first['ts'])
+
     def test_big_root_partial_scan_recovery_and_deletion(self):
         root = self.root/'big-root'; root.mkdir()
         fast, slow = root/'fast', root/'slow'
