@@ -90,6 +90,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
     roots.sort(key=lambda p: (priorities.get(str(p), len(priorities)), str(p)))
     with jobs.inventory_lock() as lock_fd:
         if lock_fd is False:
+            jobs.inventory_skipped_logs(roots, jobs.read_state('disk-inventory'), 'lock_held')
             emit('disk', 'event', 'disk.deep.end', props=dict(duMode='links', skipReason='lock_held',
                  timeouts=0, secondsInTimeouts=0, childrenDescended=0, partsMeasured=0,
                  spawnPolicy='nice-10-utility'))
@@ -100,6 +101,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
             index = next(i for i, path in enumerate(roots) if str(path) == cursor)
             roots = roots[index:]+roots[:index]
         child_state, migrated = jobs.inventory_child_state(state, roots)
+        inventory_logs = {str(path): jobs.InventoryLog(path, child_state[str(path)]) for path in roots}
         state.update(duMode='links', childState=child_state)
         for field in ('sizes', 'children', 'partials', 'attemptedAt'):
             if not isinstance(state.get(field), dict):
@@ -205,14 +207,19 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                     if stopped() or time.time() >= wall_deadline:
                         raise PassStopped()
 
-                result = jobs.big_root_inventory(path, runner, deadline, child_state[key],
-                                                 listings[key], deep=True, checkpoint=checkpoint,
-                                                 attempted=attempted[key], max_batches=4, turn_seconds=60,
-                                                 single_paths=single_paths[key], metrics=metrics,
-                                                 part_work=part_work[key], due_at=wall_deadline,
-                                                 # One early parts turn preserves daily progress;
-                                                 # then ordinary work due this pass takes priority.
-                                                 descend=not any(part_work.values()) or not healthy_pending())
+                scan_started = time.monotonic()
+                try:
+                    result = jobs.big_root_inventory(path, runner, deadline, child_state[key],
+                                                     listings[key], deep=True, checkpoint=checkpoint,
+                                                     attempted=attempted[key], max_batches=4, turn_seconds=60,
+                                                     single_paths=single_paths[key], metrics=metrics,
+                                                     part_work=part_work[key], due_at=wall_deadline,
+                                                     # One early parts turn preserves daily progress;
+                                                     # then ordinary work due this pass takes priority.
+                                                     descend=not any(part_work.values()) or not healthy_pending(),
+                                                     inventory_log=inventory_logs[key])
+                finally:
+                    inventory_logs[key].elapsed_ms += max(0, (time.monotonic()-scan_started)*1000)
                 checkpoint(*result)
                 # Yield after 60 s or four cheap batches; an expensive parts
                 # command is capped at 600 s across this child for the pass.
@@ -250,7 +257,9 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                 entries, listed = listings[key]
                 # A root skipped early in the pass can cross its freshness
                 # boundary while another root is running. Recheck all roots.
-                store_root(key, *jobs.inventory_status(cache, entries, listed, time.time()))
+                total, status, children = jobs.inventory_status(cache, entries, listed, time.time())
+                store_root(key, total, status, children)
+                inventory_logs[key].root_event(cache, total, status)
                 complete = sum(not jobs.inventory_needs_measurement(cache.get(e.path), time.time()) for e in entries)
                 ages = [max(0, time.time()-v['at']) for v in cache.values() if jobs.number(v.get('at'))]
                 emit('disk', 'event', 'disk.deep.root', props=dict(duMode='links', source=key,

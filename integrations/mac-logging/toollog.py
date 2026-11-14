@@ -65,6 +65,8 @@ PROBE_ERRORS = {prefix+field for prefix in ('internal', 'external')
 TEXT.update('blockedIn samplePath skipped storagekitdStat diskarbitrationdStat'.split())
 TEXT.add('failure')
 TEXT.add('spawnPolicy')
+TEXT.update(('root', 'slowestChildPath'))
+NUMBERS.add('slowestChildMs')
 ATOM = re.compile(r'^[A-Za-z0-9_.:@/+ ()-]{1,180}$')
 SECRET = re.compile(r'(?i)(bearer |password|secret|token[=: ]|cookie|otp[=: ]|sk-[a-z0-9]|\b(?:\d[ -]?){13,19}\b)')
 

@@ -206,7 +206,11 @@ hard links across children and excludes the root directory's own blocks.
 Root attempts rotate oldest first, with never-attempted roots ahead of measured
 ones. Budget-skipped roots retain their place; full failed attempts rotate too.
 Shortened failed attempts keep priority for a full allowance on the next run.
-`disk.inventory.turn` identifies each attempted root's `source` and `turn`.
+`disk.inventory.root` summarizes each root once per run. Detailed child sizes stay
+in `state/disk-inventory.json` (`childState`); successful child lines are retained
+only for changes of at least 1 GiB or 20%, new children of at least 1 GiB,
+or measurements taking at least ten seconds. Partial and error diagnostics
+are always retained.
 Child attempts rotate the same way. A failed child retains its last good size
 and timestamp in `childState`; missing, stale or unreadable children keep the
 root partial. `cachedCount` and `ageS` describe retained measurements.
