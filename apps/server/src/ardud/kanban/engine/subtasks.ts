@@ -931,6 +931,13 @@ export function planSubtasks(
           : keepClear
             ? known.gateCleared
             : undefined;
+      // Cosmetic edits keep the approval's time bound, including its absence on legacy plans.
+      const inferred = text !== known.text ? inferGate(text) : undefined;
+      const approvalChanged =
+        gate !== previousGate ||
+        (gateSource === "set" && known.gateSource !== "set") ||
+        script !== known.script ||
+        (inferred !== undefined && inferred !== inferGate(known.text));
       planned.push({
         ...rest,
         step,
@@ -940,16 +947,7 @@ export function planSubtasks(
         ...(interrupting === undefined ? {} : { interrupting }),
         ...(gate === undefined || clearing ? {} : { gate, gateSource }),
         ...(gateCleared ? { gateCleared } : {}),
-        ...((text !== known.text ||
-          script !== known.script ||
-          ownerOnly !== known.ownerOnly ||
-          interrupting !== known.interrupting ||
-          gate !== previousGate ||
-          !previousGate) &&
-        gate &&
-        at
-          ? { createdAt: at }
-          : {}),
+        ...(approvalChanged && gate && !clearing && at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),
       });
     } else {

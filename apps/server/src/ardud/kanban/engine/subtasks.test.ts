@@ -1532,7 +1532,7 @@ describe("planSubtasks", () => {
       later,
     );
     if (!plan.ok) throw new Error(plan.reason);
-    expect(plan.subtasks[0]).toMatchObject({ gate: "deploy", createdAt: later });
+    expect(plan.subtasks[0]).toMatchObject({ gate: "deploy", createdAt: at });
   });
 
   it.each([undefined, "secret", "deploy", "money"] as const)(
@@ -1605,6 +1605,211 @@ describe("planSubtasks", () => {
       reason: "subtask s1 is listed twice",
     });
     expect(planSubtasks([], [{ text: "  ", owner: "work" }])).toMatchObject({ ok: false });
+  });
+});
+
+describe("planSubtasks approval clock", () => {
+  const before = "2026-11-13T16:00:00.000Z";
+  const answered = "2026-11-13T17:42:42.378Z";
+  const edited = "2026-11-13T19:23:07.123Z";
+  const readBack = "Owner read-back: board chat posts after a server stall without Cmd+R.";
+  const step: KanbanSubtask = {
+    id: "s4",
+    step: 5,
+    text: readBack,
+    owner: "evaluator",
+    gate: "deploy",
+    gateSource: "guessed",
+    createdAt: before,
+    state: "open",
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  };
+  const signoff: KanbanOwnerAsk = {
+    id: "q2",
+    kind: "signoff",
+    text: "Approve s4: close #621 as verified?",
+    blocking: false,
+    by: owner,
+    at: "2026-11-13T17:40:32.768Z",
+    seq: null,
+    closedAt: answered,
+    answer: { verdict: "approved", by: owner, at: answered },
+  };
+  const approvedCard = (subtask: KanbanSubtask) => ({
+    number: 621,
+    createdAt: before,
+    asks: [signoff],
+    subtasks: [subtask],
+  });
+  const replan = (known: KanbanSubtask, input: Parameters<typeof planSubtasks>[1][number]) => {
+    const plan = planSubtasks([known], [input], 4, edited);
+    if (!plan.ok) throw new Error(plan.reason);
+    return plan.subtasks[0]!;
+  };
+
+  it("replays #621's read-back reword and a same-text gate:null edit after signoff", () => {
+    const known = {
+      ...step,
+      text: "Owner read-back on the installed desktop build: post in a board chat after a server stall without Cmd+R.",
+    };
+    expect(approvalProblem(approvedCard(known), known)).toBeNull();
+    const reworded = replan(known, {
+      id: "s4",
+      text: readBack,
+      owner: "evaluator",
+      step: 5,
+      gate: null,
+    });
+    const relisted = replan(reworded, { id: "s4", text: readBack, gate: null });
+    expect(relisted.createdAt).toBe(before);
+    expect(relisted.gate).toBe("deploy");
+    expect(approvalProblem(approvedCard(relisted), relisted)).toBeNull();
+  });
+
+  it.each([
+    { id: "s4" },
+    { id: "s4", gate: null },
+    { id: "s4", text: readBack },
+    { id: "s4", text: readBack, gate: null },
+    { id: "s4", text: `  ${readBack}  ` },
+    { id: "s4", step: 7 },
+    { id: "s4", text: "Read back the board chat result." },
+  ])("preserves the clock and approval for an immaterial edit: %j", (input) => {
+    const saved = replan(step, input);
+    expect(saved.createdAt).toBe(before);
+    expect(approvalProblem(approvedCard(saved), saved)).toBeNull();
+  });
+
+  it.each([
+    ["deploy", "Deploy the helper after the read-back."],
+    ["restart", "Restart the helper after the read-back."],
+    ["money", "Pay the invoice after the read-back."],
+    ["secret", "Rotate the API key after the read-back."],
+  ])("restarts the clock when a reword adds %s wording", (_kind, text) => {
+    const saved = replan(step, { id: "s4", text });
+    expect(saved.createdAt).toBe(edited);
+    expect(approvalProblem(approvedCard(saved), saved)).toContain(`since ${edited}`);
+  });
+
+  it.each(["deploy", "money", "secret"] as const)(
+    "does not refresh an existing inferred %s gate for a cosmetic reword",
+    (gate) => {
+      const text = {
+        deploy: "Restart the helper",
+        money: "Pay the invoice",
+        secret: "Rotate the API key",
+      }[gate];
+      const known = { ...step, text, gate };
+      const saved = replan(known, { id: "s4", text: `${text}.` });
+      expect(saved.createdAt).toBe(before);
+    },
+  );
+
+  it("restarts the clock when rewording changes the inferred kind behind a stored gate", () => {
+    const known = { ...step, text: "Pay the invoice", gate: "money" as const };
+    const saved = replan(known, { id: "s4", text: "Rotate the API key" });
+    expect(saved.gate).toBe("money");
+    expect(saved.createdAt).toBe(edited);
+  });
+
+  it.each(["money", "secret"] as const)(
+    "restarts the clock for a gate-only upgrade to %s",
+    (gate) => {
+      const saved = replan({ ...step, interrupting: true, gateSource: "set" }, { id: "s4", gate });
+      expect(saved.gate).toBe(gate);
+      expect(saved.createdAt).toBe(edited);
+      expect(approvalProblem(approvedCard(saved), saved)).toContain(`since ${edited}`);
+    },
+  );
+
+  it.each([undefined, "guessed"] as const)(
+    "restarts the clock when a gate with source %s is deliberately set",
+    (gateSource) => {
+      const saved = replan({ ...step, gateSource }, { id: "s4", gate: "deploy" });
+      expect(saved.gateSource).toBe("set");
+      expect(saved.createdAt).toBe(edited);
+      expect(approvalProblem(approvedCard(saved), saved)).toContain(`since ${edited}`);
+    },
+  );
+
+  it("keeps the clock when re-listing a deliberate gate", () => {
+    const saved = replan({ ...step, gateSource: "set" }, { id: "s4", gate: "deploy" });
+    expect(saved.createdAt).toBe(before);
+    expect(approvalProblem(approvedCard(saved), saved)).toBeNull();
+  });
+
+  it("restarts the clock when an ungated step receives a gate", () => {
+    const { gate: _gate, gateSource: _source, ...known } = step;
+    const saved = replan(known, { id: "s4", gate: "deploy" });
+    expect(saved.createdAt).toBe(edited);
+  });
+
+  it.each([
+    { previous: undefined, script: "land" },
+    { previous: "land", script: "land-v2" },
+    { previous: "land", script: "" },
+  ])("restarts the clock for a script change: %j", ({ previous, script }) => {
+    const saved = replan({ ...step, owner: "script", script: previous }, { id: "s4", script });
+    expect(saved.createdAt).toBe(edited);
+    expect(approvalProblem(approvedCard(saved), saved)).toContain(`since ${edited}`);
+  });
+
+  it("keeps the clock for an unchanged script binding", () => {
+    const saved = replan(
+      { ...step, owner: "script", script: "land" },
+      { id: "s4", text: readBack, script: "land" },
+    );
+    expect(saved.createdAt).toBe(before);
+  });
+
+  it.each([
+    { id: "s4", gate: null },
+    { id: "s4", text: "Read back the result" },
+  ])("preserves an absent legacy createdAt: %j", (input) => {
+    const { createdAt: _createdAt, ...legacy } = step;
+    const saved = replan(legacy, input);
+    expect(saved).not.toHaveProperty("createdAt");
+    expect(approvalProblem(approvedCard(saved), saved)).toBeNull();
+  });
+
+  it("keeps the Offbox #133 approval through gate:null and a reword of read-back and tell-back steps", () => {
+    const tasks = ["s1", "s8", "s9"].map((id) => ({
+      ...step,
+      id,
+      text: "Read back after the install.",
+    }));
+    const asks: KanbanOwnerAsk[] = [
+      {
+        ...signoff,
+        text: "Approve s1, s8 and s9",
+        answer: { verdict: "approved", by: owner, at: answered },
+      },
+    ];
+    const sameText = planSubtasks(
+      tasks,
+      tasks.map((s) => ({ id: s.id, text: s.text, gate: null })),
+      9,
+      edited,
+    );
+    if (!sameText.ok) throw new Error(sameText.reason);
+    const reworded = planSubtasks(
+      sameText.subtasks,
+      tasks.map((s) => ({ id: s.id, text: "Read back the result." })),
+      9,
+      edited,
+    );
+    if (!reworded.ok) throw new Error(reworded.reason);
+    for (const saved of reworded.subtasks) {
+      expect(saved.createdAt).toBe(before);
+      expect(
+        approvalProblem(
+          { number: 133, createdAt: before, asks, subtasks: reworded.subtasks },
+          saved,
+        ),
+      ).toBeNull();
+    }
   });
 });
 
