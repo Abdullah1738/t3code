@@ -206,6 +206,7 @@ def _control_threads(query, timeout, label, traversal_timeout=CONTROL_TRAVERSAL_
             counts['retried'] = attempt == 1
             mapped, total, legacy = walk(query, legacy_allowed=attempt == 0)
             counts['total'] = total
+            catch_up_short = 0
             if not legacy:
                 # A row updated while walking can jump ahead of our cursor. Read
                 # that interval once more before judging coverage of this attempt.
@@ -215,11 +216,19 @@ def _control_threads(query, timeout, label, traversal_timeout=CONTROL_TRAVERSAL_
                 params.pop('cursor', None)
                 params['updatedSince'] = str(t0 - 5000)
                 catch_query = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(params)))
-                fresh, _, _ = walk(catch_query)
+                fresh, catch_up_total, _ = walk(catch_query)
+                counts['catch_up_unique_rows'] = len(fresh)
+                catch_up_short = max(0, catch_up_total - len(fresh))
                 mapped.update(fresh)
-            phase = 'completeness'
+            phase = 'catch-up' if catch_up_short else 'completeness'
             counts['unique_rows'] = len(mapped)
             check_deadline()
+            # The main roster can contain stale paths for rows missed by catch-up,
+            # and new ids can hide a missing row in the union's count.
+            if catch_up_short:
+                if attempt:
+                    raise ValueError(f'catch-up short by {catch_up_short} after retry')
+                continue
             # Total can grow through creation or shrink through archive/deletion.
             # Only coverage against the newest main page proves a count gap.
             if len(mapped) >= total:

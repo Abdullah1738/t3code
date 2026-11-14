@@ -663,13 +663,18 @@ class ControlPaginationTests(unittest.TestCase):
         self.assertEqual(parse_qs(urlparse(api.call_args_list[1].args[0]).query)['updatedSince'], ['95000'])
         self.assertEqual(parse_qs(urlparse(api.call_args_list[-1].args[0]).query)['updatedSince'], ['105000'])
 
-    def test_catch_up_totals_can_change_without_a_count_gap(self):
-        stats = {}
-        (rows, error), _ = self.read([self.page(['a'], 2), self.page(['b'], 2, 'next'),
-                                    self.page(['new'], 3)], stats=stats)
-        self.assertIsNone(error)
-        self.assertEqual(set(rows), {'a', 'b', 'new'})
-        self.assertEqual(stats['catch_up_totals'], dict(first=2, last=3, min=2, max=3))
+    def test_catch_up_total_churn_uses_last_total(self):
+        for last_rows, last_total, expected in [(['new'], 3, {'a', 'b', 'new'}), ([], 1, {'a', 'b'})]:
+            with self.subTest(last_total=last_total):
+                stats = {}
+                (rows, error), _ = self.read([self.page(['a'], 2), self.page(['a', 'b'], 2, 'next'),
+                                            self.page(last_rows, last_total)], stats=stats)
+                self.assertIsNone(error)
+                self.assertEqual(set(rows), expected)
+                self.assertEqual(stats['catch_up_unique_rows'], len(expected))
+                self.assertEqual(stats['catch_up_totals'], dict(first=2, last=last_total,
+                                                              min=min(2, last_total), max=max(2, last_total)))
+                self.assertFalse(stats['retried'])
 
     def test_retry_keeps_request_and_deadline_budgets_and_discards_first_partial_map(self):
         with patch.object(active, 'CONTROL_MAX_PAGES', 2):
@@ -696,6 +701,57 @@ class ControlPaginationTests(unittest.TestCase):
         self.assertEqual(set(rows), {'a', 'b', 'c'})
         self.assertEqual(stats['totals'], dict(first=2, last=3, min=2, max=4))
         self.assertFalse(stats['retried'])
+
+    def test_new_id_cannot_mask_incomplete_catch_up_and_retry_recovers_moving_row(self):
+        ids = [f'A{i:03}' for i in range(500)]
+        # B jumps ahead of the main cursor, then both B and C precede the catch-up cursor.
+        incomplete = [self.page(ids, 501, 'walk'), self.page([], 501),
+                      self.page(['C'] + ids[:499], 502, 'catch-up'), self.page(ids[499:], 502)]
+        for closes_gap in (False, True):
+            with self.subTest(closes_gap=closes_gap):
+                updated_b = self.row('B', '2026-11-15T00:00:00Z', worktreePath='/new')
+                retry = ([self.page(['B', 'C'] + ids[:498], 502, 'retry'),
+                          self.page(ids[498:], 502), self.page([updated_b])] if closes_gap else incomplete)
+                stats = {}
+                (rows, error), api = self.read(incomplete + retry, stats=stats)
+                self.assertTrue(stats['retried'])
+                if closes_gap:
+                    self.assertIsNone(error)
+                    self.assertEqual(set(rows), set(ids) | {'B', 'C'})
+                    self.assertEqual(rows['B']['worktreePath'], '/new')
+                    self.assertEqual(api.call_count, 7)
+                else:
+                    self.assertIsNone(rows)
+                    self.assertIn('catch-up short by 1 after retry', error)
+                    self.assertEqual(stats['failure_phase'], 'catch-up')
+                    self.assertEqual(stats['catch_up_unique_rows'], 501)
+                    self.assertEqual(api.call_count, 8)
+
+    def test_complete_main_cannot_hide_missing_or_duplicate_catch_up_ids(self):
+        for fresh in (['a'], ['a', 'a']):
+            with self.subTest(fresh=fresh):
+                attempt = [self.page(['a', 'b'], 2), self.page(fresh, 2)]
+                stats = {}
+                (rows, error), api = self.read(attempt * 2, stats=stats)
+                self.assertIsNone(rows)
+                self.assertIn('catch-up short by 1 after retry', error)
+                self.assertEqual(stats['unique_rows'], 2)
+                self.assertEqual(stats['catch_up_unique_rows'], 1)
+                self.assertTrue(stats['retried'])
+                self.assertEqual(api.call_count, 4)
+
+    def test_short_catch_up_retry_keeps_shared_budgets(self):
+        pages = [self.page(['a', 'b'], 2), self.page(['a'], 2)]
+        with patch.object(active, 'CONTROL_MAX_PAGES', 2):
+            (rows, error), api = self.read(pages)
+        self.assertIsNone(rows)
+        self.assertIn('page cap exceeded', error)
+        self.assertEqual(api.call_count, 2)
+        with patch.object(active.time, 'monotonic', side_effect=[0, 0, 0, 0, 0, 0, 181, 182]):
+            (rows, error), api = self.read(pages)
+        self.assertIsNone(rows)
+        self.assertIn('deadline exceeded', error)
+        self.assertEqual(api.call_count, 2)
 
     def test_legacy_server_behavior(self):
         cases = [(['a'], 2, '2 threads, only 1 returned (truncated)'),

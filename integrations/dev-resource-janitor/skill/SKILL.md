@@ -138,9 +138,11 @@ listing gets one paginated catch-up with `updatedSince` set to five seconds befo
 the walk started, covering rows that moved ahead of a cursor. Walks merge duplicate
 ids by newest `updatedAt`; the later catch-up row wins. The full match `total`
 may change as threads are created, archived, or deleted. The merged unique count
-must reach the total on the newest main-listing page. Short coverage retries that
-listing once from scratch with a new catch-up window; a remaining gap fails with
-`short by N after retry`. A page failure, malformed row/cursor, missing cursor
+must reach the total on the newest main-listing page. The catch-up must independently
+cover its own newest-page total with unique ids; a main row may have an old path,
+and new ids can hide a missed row in the union. Either gap retries the listing
+once from scratch with a new catch-up window. A remaining gap fails with
+`short by N after retry` or `catch-up short by N after retry`. A page failure, malformed row/cursor, missing cursor
 after page one, repeated cursor, more than 400 requests, or a 180-second traversal
 deadline keeps that repository report-only with `activity_history_unavailable` and its exact
 reason. The request budget and deadline cover both attempts, including catch-up;
@@ -163,7 +165,8 @@ pages and duration. Reaper status also includes `project_history_stats` per proj
 `pages`, raw `rows` (including duplicate and catch-up rows), `archived_rows`
 (the archived listing's raw rows), `catch_up_rows`, `seconds`, and per-listing
 counts or the exact failure. Each listing logs `totals` (first/last/min/max
-main-page totals), `catch_up_totals`, merged `unique_rows`, and `retried`.
+main-page totals), `catch_up_totals`, the last catch-up's `catch_up_unique_rows`,
+merged `unique_rows`, and `retried`.
 `repo_outcomes` records kept reason counts and would-remove paths per repository.
 A linked worktree is removed only when all of these hold:
 
