@@ -31,14 +31,17 @@ def emit_request(server, tools, body, status, duration_ms, load, http_method,
              "httpMethod": http_method, "status": status}
     if ttfb_ms is not None:
         props["ttfbMs"] = round(ttfb_ms, 3)
-    if reason:
-        props["reason"] = reason
+    # Error responses can reflect arbitrary parameters, including nested values
+    # and partial/escaped arguments. Only parameter-free requests permit raw text.
+    reason_safe = body == b""
     try:
-        rpc = None
+        rpc = json.loads(body) if body else None
+        if isinstance(rpc, dict):
+            reason_safe = (set(rpc) <= {"jsonrpc", "id", "method", "params"}
+                           and ("params" not in rpc or rpc["params"] == {}))
         if http_method == "POST" and body != b"":
             props["method"] = "unknown"
-            rpc = json.loads(body) if body is not None else None
-        if isinstance(rpc, dict):
+        if http_method == "POST" and isinstance(rpc, dict):
             method = rpc.get("method")
             props["method"] = method if isinstance(method, str) and method in METHODS else "unknown"
             params = rpc.get("params")
@@ -46,7 +49,10 @@ def emit_request(server, tools, body, status, duration_ms, load, http_method,
             if method == "tools/call" and isinstance(tool, str) and tool in tools:
                 props["toolName"] = tool
     except (ValueError, UnicodeError, RecursionError):
-        pass
+        if http_method == "POST":
+            props["method"] = "unknown"
+    if reason:
+        props["reason"] = reason if reason_safe else "response omitted: request data"
     if load is not None and not stream:
         props.update(zip(("load1", "load5", "load15"), load))
     toollog.emit("shared-mcp", "event" if stream else "perf",

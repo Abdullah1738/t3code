@@ -294,6 +294,34 @@ class RequestMetrics(unittest.IsolatedAsyncioTestCase):
         for row in rows:
             print('ISOLATED_SDK_' + version('mcp') + ' ' + json.dumps(row), file=sys.__stdout__)
 
+    async def test_error_responses_cannot_reflect_request_arguments(self):
+        cases = [
+            ('string', {'arguments': 'DO_NOT_LOG'}),
+            ('object', {'arguments': {'secret': 'DO_NOT_LOG'}}),
+            ('nested array', {'arguments': [{'secret': ['DO_NOT_LOG']}]}),
+            ('escaped unicode', {'arguments': {'secret': 'DO_NOT_LOG_é"\\'}}),
+            ('number', {'arguments': 971501234567}),
+            ('boolean', {'arguments': True}),
+            ('null', {'arguments': None}),
+            ('invalid params string', 'DO_NOT_LOG'),
+            ('invalid params array', ['DO_NOT_LOG']),
+            ('invalid params null', None),
+        ]
+        bodies = [(label, json.dumps({'method': 'tools/call', 'params': params}).encode())
+                  for label, params in cases]
+        bodies += [('malformed', b'{"secret":"DO_NOT_LOG"'),
+                   ('oversized', b' ' * 65536 + b'DO_NOT_LOG'),
+                   ('unexpected field', b'{"method":"tools/list","secret":"DO_NOT_LOG"}')]
+        for label, body in bodies:
+            with self.subTest(label=label):
+                await self.exchange('POST', 400, b'text/plain', [b'Invalid secret: DO_NOT_LOG'], body)
+                row = self.rows()[-1]
+                self.assertEqual(row['props']['reason'], 'response omitted: request data')
+                self.assertNotIn('DO_NOT_LOG', json.dumps(row))
+        # Even a non-POST body must not expose reflected data.
+        await self.exchange('GET', 400, b'application/json', [b'{"error":"DO_NOT_LOG"}'], bodies[1][1])
+        self.assertEqual(self.rows()[-1]['props']['reason'], 'response omitted: request data')
+
 
 if __name__ == '__main__':
     unittest.main()
