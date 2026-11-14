@@ -100,6 +100,7 @@ export interface KanbanLaunchInput {
 }
 
 export interface KanbanSendInput {
+  readonly flushQueued?: "wake" | "steer";
   readonly threadId: ThreadId;
   readonly text: string;
   /** Stable per logical send when a retry must not deliver a second message. */
@@ -695,6 +696,12 @@ const make = Effect.gen(function* () {
       let id = yield* sendId(input, pruneMessageWakes);
       if (id === undefined) return;
       // Queue edits cannot change a run's model selection or steer a live turn.
+      if (input.flushQueued !== undefined) {
+        yield* threads.promoteQueuedMessages(input.threadId, input.flushQueued, {
+          deferBoardWakes: input.text.trim().length > 0,
+        });
+        if (!input.text.trim()) return;
+      }
       if (scope !== undefined) {
         const records = yield* threads.getThreadRecords(input.threadId, ["runs", "messages"]);
         if (input.isStale?.()) return;

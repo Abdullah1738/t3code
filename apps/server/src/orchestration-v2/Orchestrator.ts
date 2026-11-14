@@ -17,6 +17,7 @@ import {
   type DelegatedRecoveryCounts,
 } from "../ardud/observability/StartupPhaseLog.ts";
 import * as Clock from "effect/Clock";
+import * as Crypto from "effect/Crypto";
 import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
 import { userFacingDispatchErrorMessage } from "./UserFacingErrors.ts";
 import type {
@@ -364,6 +365,11 @@ export interface OrchestratorV2DispatchResult {
 }
 
 export interface OrchestratorV2Shape {
+  readonly promoteQueuedMessages: (
+    threadId: ThreadId,
+    reason: "wake" | "steer" | "age",
+    options?: { readonly minWaitMs?: number; readonly deferBoardWakes?: boolean },
+  ) => Effect.Effect<number, OrchestratorV2Error>;
   readonly resumeQueuedRuns: Effect.Effect<number, OrchestratorV2Error>;
   readonly recoverDelegatedTasks: Effect.Effect<DelegatedRecoveryCounts>;
   readonly recoverDelegatedTask: (threadId: ThreadId, sourceRunId: RunId) => Effect.Effect<void>;
@@ -510,6 +516,20 @@ function isGoalCommand(message: {
   readonly attachments: ReadonlyArray<ChatAttachment>;
 }): boolean {
   return message.attachments.length === 0 && /^\/goal(?:\s|$)/u.test(message.text.trim());
+}
+
+function isBufferedCompletion(
+  message: Pick<
+    OrchestrationV2ConversationMessage,
+    "delegatedCompletion" | "notification" | "creationSource"
+  >,
+): boolean {
+  // Provider continuations already buffer their output. Server continuations
+  // carry message text that must reach the provider through normal delivery.
+  return (
+    message.delegatedCompletion !== undefined ||
+    (message.notification !== undefined && message.creationSource !== "server")
+  );
 }
 
 const threadPullRequestLinksEqual = Schema.toEquivalence(Schema.NullOr(ThreadLinkedPullRequest));
@@ -932,6 +952,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const startTimeoutQueueOwner = yield* StartTimeoutQueueOwner;
   const sql = yield* SqlClient.SqlClient;
   const checkpointService = yield* CheckpointServiceV2;
+  const crypto = yield* Crypto.Crypto;
   const commandPolicy = yield* CommandPolicyV2;
   const contextHandoffService = yield* ContextHandoffServiceV2;
   const eventSink = yield* EventSinkV2;
@@ -4380,6 +4401,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     readonly scheduledTaskId?: OrchestrationV2ConversationMessage["scheduledTaskId"];
     readonly senderThreadId?: OrchestrationV2ConversationMessage["senderThreadId"];
     readonly delegatedCompletion?: OrchestrationV2ConversationMessage["delegatedCompletion"];
+    readonly notification?: OrchestrationV2ConversationMessage["notification"];
     readonly forceRestart: boolean;
     readonly activeTurnOnly?: boolean;
   }) {
@@ -4530,6 +4552,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         const message: OrchestrationV2ConversationMessage = {
           createdBy: input.createdBy,
           creationSource: input.creationSource,
+          ...(input.notification === undefined ? {} : { notification: input.notification }),
           ...(input.delegatedCompletion === undefined
             ? {}
             : { delegatedCompletion: input.delegatedCompletion }),
@@ -4598,6 +4621,31 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           occurredAt: now,
           payload: notificationTurnItem(turnItem, message, input.projection.subagents),
         });
+        if (
+          input.command.type === "message.dispatch" &&
+          input.notification === undefined &&
+          input.delegatedCompletion === undefined &&
+          !input.messageId.startsWith("kanban:wake:")
+        ) {
+          // Commit snapshot disposal with its replacement, so rejected or empty
+          // board sends leave the latest coalesced snapshot available to flush.
+          for (const wake of input.projection.runs.filter(
+            (run) =>
+              run.status === "queued" &&
+              run.queueHeld !== true &&
+              run.userMessageId.startsWith("kanban:wake:"),
+          )) {
+            yield* dispatchQueuedRunCancel(
+              {
+                type: "queued-run.cancel",
+                commandId: input.command.commandId,
+                threadId: input.command.threadId,
+                runId: wake.id,
+              },
+              input.events,
+            );
+          }
+        }
       },
     );
 
@@ -8768,10 +8816,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: `Queued run ${queuedRun.id} is missing message or execution state.`,
       });
     }
-    if (
-      queuedMessage.delegatedCompletion !== undefined ||
-      queuedMessage.notification !== undefined
-    ) {
+    if (isBufferedCompletion(queuedMessage)) {
       return yield* new OrchestratorDispatchError({
         commandId: command.commandId,
         commandType: command.type,
@@ -8835,6 +8880,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ...(queuedMessage.context ? { context: queuedMessage.context } : {}),
       createdBy: queuedMessage.createdBy,
       creationSource: queuedMessage.creationSource,
+      ...(queuedMessage.notification === undefined
+        ? {}
+        : { notification: queuedMessage.notification }),
       ...(queuedMessage.scheduledTaskId === undefined
         ? {}
         : { scheduledTaskId: queuedMessage.scheduledTaskId }),
@@ -13571,6 +13619,101 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         );
   });
 
+  const promoteQueuedMessages = Effect.fn("Orchestrator.promoteQueuedMessages")(
+    (
+      threadId: ThreadId,
+      reason: "wake" | "steer" | "age",
+      options?: {
+        readonly minWaitMs?: number;
+        readonly deferBoardWakes?: boolean;
+      },
+    ) =>
+      threadDispatch.withLock(
+        threadId,
+        Effect.gen(function* () {
+          const records = yield* projectionStore
+            .getThreadRecords(threadId, ["runs"], { recentRunLimit: 0 })
+            .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+          if (records.thread.archivedAt !== null || records.thread.deletedAt !== null) return 0;
+          const active = records.runs.find((run) => run.status === "running");
+          if (active === undefined) return 0;
+          const queued = records.runs.filter(
+            (run) => run.status === "queued" && run.queueHeld !== true,
+          );
+          if (queued.length === 0) return 0;
+          const { messages } = yield* projectionStore
+            .getThreadRecords(threadId, ["messages"], {
+              messageIds: queued.map((run) => run.userMessageId),
+            })
+            .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+          const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+          const byMessageId = new Map(messages.map((message) => [message.id, message]));
+          const ordered = queuedRunsInDeliveryOrder({ runs: queued, messages }).filter((run) => {
+            const message = byMessageId.get(run.userMessageId);
+            return (
+              message !== undefined &&
+              !isBufferedCompletion(message) &&
+              !isNativeMaintenanceCommand(message) &&
+              !isGoalCommand(message)
+            );
+          });
+          // Preserve a user's queue order even if they moved fresh input ahead of
+          // an overdue notice: deliver the prefix through the last overdue input.
+          const through =
+            reason === "age"
+              ? ordered.findLastIndex(
+                  (run) =>
+                    nowMs - DateTime.toEpochMillis(run.requestedAt) > (options?.minWaitMs ?? 0),
+                )
+              : ordered.length - 1;
+          const latestRealOrdinal = Math.max(
+            0,
+            ...queued
+              .filter((run) => !run.userMessageId.startsWith("kanban:wake:"))
+              .map((run) => run.ordinal),
+          );
+          let promoted = 0;
+          for (const [index, run] of ordered.entries()) {
+            if (index > through) break;
+            const waitedMs = Math.max(0, nowMs - DateTime.toEpochMillis(run.requestedAt));
+            const attemptId = yield* crypto
+              .randomUUIDv4()
+              .pipe(
+                Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+              );
+            // Real board input supersedes earlier disposable snapshots (#1394).
+            // A coalesced wake with no later input is still one queue entry (#1296).
+            if (run.userMessageId.startsWith("kanban:wake:") && run.ordinal < latestRealOrdinal) {
+              yield* dispatchWithReceiptEffect({
+                type: "queued-run.cancel",
+                commandId: CommandId.make(`command:queue-steer:discard:${run.id}:${attemptId}`),
+                threadId,
+                runId: run.id,
+              });
+              continue;
+            }
+            if (options?.deferBoardWakes && run.userMessageId.startsWith("kanban:wake:")) continue;
+            // The queued row fences acceptance; a rejected plan needs a fresh receipt to retry.
+            yield* dispatchWithReceiptEffect({
+              type: "queued-message.promote-to-steer",
+              commandId: CommandId.make(`command:queue-steer:${run.id}:${attemptId}`),
+              threadId,
+              queuedRunId: run.id,
+              targetRunId: active.id,
+            });
+            promoted += 1;
+            yield* Effect.logInfo("queued-message.promoted", {
+              thread: threadId,
+              queuedRunId: run.id,
+              reason,
+              waitedMs,
+            });
+          }
+          return promoted;
+        }),
+      ),
+  );
+
   const handleRunUpdate = Effect.fn("Orchestrator.handleRunUpdate")(
     function* (stored: OrchestrationV2StoredEvent) {
       if (stored.event.type !== "run.updated") return;
@@ -13856,6 +13999,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     new OrchestratorProjectionError({ threadId: ThreadId.make("thread:shell"), cause });
 
   return OrchestratorV2.of({
+    promoteQueuedMessages,
     resumeQueuedRuns,
     recoverDelegatedTasks,
     recoverDelegatedTask,
@@ -14018,6 +14162,7 @@ export const layer: Layer.Layer<
   OrchestratorV2,
   never,
   | CheckpointServiceV2
+  | Crypto.Crypto
   | FileSystem.FileSystem
   | ServerConfig.ServerConfig
   | Path.Path
@@ -14043,6 +14188,7 @@ export const layer: Layer.Layer<
 const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
   OrchestratorV2,
   OrchestratorV2.of({
+    promoteQueuedMessages: () => Effect.succeed(0),
     resumeQueuedRuns: Effect.fail(
       new OrchestratorDispatchError({
         commandId: CommandId.make("command:system:resume-queued-runs"),
