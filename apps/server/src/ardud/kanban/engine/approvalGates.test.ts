@@ -1147,6 +1147,115 @@ it.each([
   }
 });
 
+const skippedDeploySubtask: KanbanSubtask = {
+  ...goChoiceSubtask,
+  id: "s6",
+  text: "Ask Abdullah to deploy",
+  state: "skipped",
+};
+
+const unnamedSkipDeployCard = (): Pick<
+  KanbanCard,
+  "number" | "createdAt" | "subtasks" | "asks"
+> => ({
+  number: 19,
+  createdAt: "2026-11-13T13:00:00.000Z",
+  subtasks: [skippedDeploySubtask],
+  asks: [
+    {
+      id: "q2",
+      text: 'Can I close 9router #19\'s deploy step as "not needed"?',
+      blocking: false,
+      by: evaluator,
+      at: "2026-11-13T17:00:00.000Z",
+      seq: null,
+      closedAt: "2026-11-13T18:23:01.000Z",
+      options: [
+        { id: "o1", label: "Skip deploy" },
+        { id: "o2", label: "Deploy anyway" },
+      ],
+      answer: {
+        verdict: "picked",
+        by: owner,
+        at: "2026-11-13T18:23:01.000Z",
+        optionIds: ["o1"],
+      },
+    },
+    {
+      id: "q3",
+      text: "OK to skip s6 (the deploy step)?",
+      blocking: false,
+      by: evaluator,
+      at: "2026-11-13T17:30:00.000Z",
+      seq: null,
+      closedAt: "2026-11-13T17:58:51.000Z",
+      answer: { verdict: "dropped", by: evaluator, at: "2026-11-13T17:58:51.000Z" },
+    },
+  ],
+});
+
+it.each(["open", "skipped"] as const)(
+  "9router #19: the unnamed owner answer permits s6 to stay %s under skip intent",
+  (state) => {
+    const subtask = { ...skippedDeploySubtask, state };
+    const card = { ...unnamedSkipDeployCard(), subtasks: [subtask] };
+    assert.isNull(approvalProblem(card, subtask, [], undefined, "skip"));
+  },
+);
+
+it("9router #19: the unnamed Skip deploy answer still refuses doing s6", () => {
+  const subtask = { ...skippedDeploySubtask, state: "done" as const };
+  const card = { ...unnamedSkipDeployCard(), subtasks: [subtask] };
+  assert.include(
+    approvalProblem(card, subtask, [], undefined, "do")!,
+    'q2, picked "Skip deploy", which doesn\'t read as approving deploy',
+  );
+});
+
+it.each(["dropped only", "no answer"])(
+  "9router #19: a skipped s6 with %s still needs the owner's answer",
+  (scenario) => {
+    const card = unnamedSkipDeployCard();
+    const asks = scenario === "dropped only" ? card.asks.filter(({ id }) => id === "q3") : [];
+    assert.include(
+      approvalProblem({ ...card, asks }, skippedDeploySubtask, [], undefined, "skip")!,
+      scenario === "dropped only"
+        ? "the latest decision, q3, was dropped (a dropped ask is not approval)"
+        : "no owner answer on a deploy ask since",
+    );
+  },
+);
+
+it.each(
+  (["open", "skipped"] as const).flatMap((state) =>
+    (["open", "done", "skipped"] as const).map((otherState) => ({ state, otherState })),
+  ),
+)(
+  "the unnamed skip answer for s6 ($state) ignores s5 only when skipped ($otherState)",
+  ({ state, otherState }) => {
+    const other = {
+      ...skippedDeploySubtask,
+      id: "s5",
+      text: "Deploy the earlier build",
+      state: otherState,
+    };
+    const subtask = { ...skippedDeploySubtask, state };
+    const card = {
+      ...unnamedSkipDeployCard(),
+      subtasks: [other, subtask],
+    };
+    assert.strictEqual(
+      approvalProblem(card, subtask, [], undefined, "skip") === null,
+      otherState === "skipped",
+    );
+    if (state === "open")
+      assert.include(
+        approvalProblem(card, other, [], undefined, "skip")!,
+        "no owner answer on a deploy ask since",
+      );
+  },
+);
+
 const relevanceSubtask: KanbanSubtask = {
   ...goChoiceSubtask,
   id: "s5",
@@ -1227,24 +1336,27 @@ it.each([
     reason:
       'picked "Wait", which doesn\'t read as approving money; ask again with an Approve option or an action ask',
   },
-] as const)("#4319: later unnamed approval explains refusal after q1 $verdict", ({ verdict, reason }) => {
-  const card = duplicateBillingCard();
-  const q1 = card.asks[0]!;
-  const q2 = card.asks[1]!;
-  const asks = [
-    {
-      ...q1,
-      options: [{ id: "wait", label: "Wait" }],
-      answer: { ...q1.answer!, verdict, optionIds: verdict === "picked" ? ["wait"] : [] },
-    },
-    q2,
-  ];
-  assert.strictEqual(inferGate(`${q2.text} ${q2.title}`), undefined);
-  assert.include(
-    approvalProblem({ ...card, asks }, billingSubtask)!,
-    `the latest decision, q1, ${reason}; q2 (approved later) doesn't name s1, so it doesn't count; ask again naming s1`,
-  );
-});
+] as const)(
+  "#4319: later unnamed approval explains refusal after q1 $verdict",
+  ({ verdict, reason }) => {
+    const card = duplicateBillingCard();
+    const q1 = card.asks[0]!;
+    const q2 = card.asks[1]!;
+    const asks = [
+      {
+        ...q1,
+        options: [{ id: "wait", label: "Wait" }],
+        answer: { ...q1.answer!, verdict, optionIds: verdict === "picked" ? ["wait"] : [] },
+      },
+      q2,
+    ];
+    assert.strictEqual(inferGate(`${q2.text} ${q2.title}`), undefined);
+    assert.include(
+      approvalProblem({ ...card, asks }, billingSubtask)!,
+      `the latest decision, q1, ${reason}; q2 (approved later) doesn't name s1, so it doesn't count; ask again naming s1`,
+    );
+  },
+);
 
 it("#4319: naming s1 makes the later approval count; skipping needs only q1's owner answer", () => {
   const card = duplicateBillingCard();

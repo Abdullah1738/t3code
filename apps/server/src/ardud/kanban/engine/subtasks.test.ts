@@ -1118,13 +1118,17 @@ describe("approvalProblem", () => {
     }
   });
 
-  it("does not apply an unnamed ask to a skipped gate even when another gate is the only candidate", () => {
+  it("keeps a skipped gate eligible only when it is the sole fallback candidate", () => {
     const s5 = { ...deploy("s5"), state: "skipped" as const };
     const s7 = deploy("s7");
     for (const subtasks of [[s5], [s5, s7]]) {
-      expect(
-        approvalProblem({ ...card, subtasks, asks: [approvedAsk("Restart Robob now?")] }, s5, []),
-      ).toContain("approval");
+      const problem = approvalProblem(
+        { ...card, subtasks, asks: [approvedAsk("Restart Robob now?")] },
+        s5,
+        [],
+      );
+      if (subtasks.length === 1) expect(problem).toBeNull();
+      else expect(problem).toContain("approval");
       expect(
         approvalProblem({ ...card, subtasks, asks: [approvedAsk("Approve s5")] }, s5, []),
       ).toBeNull();

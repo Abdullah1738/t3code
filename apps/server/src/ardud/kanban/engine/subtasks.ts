@@ -374,7 +374,7 @@ const askConcerns = (
   const candidates = card.subtasks.filter(
     (entry) =>
       gateOf(entry, guessedGates) === gate &&
-      entry.state !== "skipped" &&
+      (entry.state !== "skipped" || entry.id === subtask.id) &&
       (entry.createdAt ?? card.createdAt) <= answerAt,
   );
   return inferGate(wording) === gate && candidates.length === 1 && candidates[0]?.id === subtask.id;
