@@ -1482,7 +1482,7 @@ const connectionSettings = () => {
     statement.setReadBigInts(true);
     const row = statement.get();
     const observed = row && Object.values(row)[0];
-    const value = name === "cache_spill" && typeof observed === "number" ? (observed === 0 ? "OFF" : "ON") : observed;
+    const value = name === "cache_spill" && (typeof observed === "number" || typeof observed === "bigint") ? (Number(observed) === 0 ? "OFF" : "ON") : observed;
     if (typeof value === "number" || typeof value === "bigint" || typeof value === "string") settings.push({ schema, name, value });
   }
   deferredForeignKeys = Boolean(db.prepare("PRAGMA defer_foreign_keys").get().defer_foreign_keys);
