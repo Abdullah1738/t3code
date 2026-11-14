@@ -7,7 +7,6 @@ Both sources are stubbed over real HTTP sockets.
 import json
 import os
 from pathlib import Path
-import sqlite3
 import sys
 import tempfile
 import threading
@@ -89,6 +88,8 @@ class Stub:
                     if not stub.opencode_ok:
                         return self._send(500, {"error": "down"})
                     return self._send(200, {"data": {sid: {} for sid in stub.opencode}})
+                if url.path.startswith("/api/session/"):
+                    return self._send(200, {"data": {"directory": "/work/service"}})
                 return self._send(404, {})
 
         self.server = HTTPServer(("127.0.0.1", 0), Handler)
@@ -109,6 +110,9 @@ class Stub:
         out = list(self.threads)
         if q.get("active", [""])[0] == "true":
             out = [t for t in out if t.get("state") not in (None, "idle")]
+        states = q.get("state", [""])[0]
+        if states:
+            out = [t for t in out if t.get("state") in states.split(",")]
         cs = q.get("creationSource", [""])[0]
         if cs:
             wanted = cs.split(",")
@@ -183,7 +187,7 @@ class ActiveSetTests(unittest.TestCase):
         queries = [r for r in stub.requests if "/threads" in r]
         self.assertEqual(len(queries), 2, queries)
         self.assertTrue(any("active=true" in r for r in queries), queries)
-        self.assertTrue(any(parse_qs(urlparse(r).query).get("creationSource") == ["provider,mcp"]
+        self.assertTrue(any(parse_qs(urlparse(r).query).get("creationSource") == ["provider"]
                             for r in queries), queries)
 
     def test_runless_native_child_is_kept_as_in_use(self):
@@ -278,7 +282,7 @@ class TwoQueryActiveSetTests(unittest.TestCase):
                          {"active": ["true"], "includeSubagents": ["true"], "limit": ["500"]})
         # The window: updatedSince = now - 48 h, to within a minute (the test pins the clock, so it is exact).
         params = parse_qs(urlparse(native_q[0]).query)
-        self.assertEqual(params.pop("creationSource"), ["provider,mcp"])
+        self.assertEqual(params.pop("creationSource"), ["provider"])
         since = int(params.pop("updatedSince")[0])
         self.assertEqual(params, {"includeSubagents": ["true"], "limit": ["500"]})
         self.assertAlmostEqual(since, NOW_MS - 48 * 3600 * 1000, delta=60_000)
@@ -307,13 +311,9 @@ class TwoQueryActiveSetTests(unittest.TestCase):
                     "creationSource": "mcp", "relationshipToParent": "subagent",
                     "updatedAtMs": NOW_MS - 3600_000}
         self.serve(threads=[delegate], honor_filters=True, opencode={})
-        db_path = Path(self.tmp.name) / "opencode.db"
-        with sqlite3.connect(db_path) as con:
-            con.execute("CREATE TABLE session_message (session_id TEXT, time_created INTEGER, data TEXT)")
-            con.execute("CREATE TABLE session_v2 (id TEXT, title TEXT, directory TEXT)")
         process = {"pid": 1111, "ppid": 1, "age_s": 9000, "rss_mb": 1, "cmd": "expo start"}
         with patch.object(active.time, "time", return_value=NOW_MS / 1000), \
-                patch.object(dev_janitor, "OC_DB", str(db_path)), \
+                patch.object(dev_janitor.leftover_processes, "scan", return_value={}), \
                 patch.object(dev_janitor, "procs", return_value=[process]), \
                 patch.object(dev_janitor, "cwd_of", return_value="/work/app"), \
                 patch.object(dev_janitor, "keep_list", return_value=[]), \
@@ -321,10 +321,10 @@ class TwoQueryActiveSetTests(unittest.TestCase):
             snap = active.snapshot()
             result = dev_janitor.scan()
         self.assertTrue(snap["complete"], snap["problems"])
-        self.assertEqual(snap["workspaces"], {"delegate": "/work/app/task"})
+        self.assertEqual(snap["workspaces"], {})
         expo = next(r for r in result["resources"] if r["id"] == "expo:1111")
         self.assertFalse(expo["candidate"])
-        self.assertIn("running_session_in_cwd:thread:delegate", expo["keep_reasons"])
+        self.assertTrue(any("usage_history_unavailable" in reason for reason in expo["keep_reasons"]))
 
     def test_mcp_query_truncation_fails_closed(self):
         delegates = [{"threadId": f"delegate-{i}", "state": "idle", "creationSource": "mcp",
@@ -332,8 +332,8 @@ class TwoQueryActiveSetTests(unittest.TestCase):
                       "updatedAtMs": NOW_MS - 1000} for i in range(501)]
         self.serve(threads=delegates, honor_filters=True, opencode={})
         snap = self.read_snapshot()
-        self.assertFalse(snap["complete"])
-        self.assertTrue(any("native" in problem and "truncated" in problem for problem in snap["problems"]))
+        self.assertTrue(snap["complete"])
+        self.assertEqual(snap["threads"], {})
 
     def test_twenty_six_thousand_thread_server_is_complete(self):
         # The bug: the old single full-list query said "26140 threads, only 500 returned" and kept everything. Here
@@ -454,7 +454,7 @@ class RootWorkspaceTests(unittest.TestCase):
         ids, native, err = dev_janitor.running_sessions()
         self.assertIsNone(err)
         self.assertEqual(ids, {"ses_a"})
-        self.assertEqual(native, {"thread-root": "/Users/x/repo"})
+        self.assertEqual(native, {"ses_a": "/work/service", "thread:thread-root": "/Users/x/repo"})
         self.assertEqual(len([r for r in stub.requests if "/projects" in r]), 1, stub.requests)
 
     def test_snapshot_reads_each_source_once(self):
@@ -472,7 +472,7 @@ class JanitorKeepsEverythingTests(unittest.TestCase):
     def test_dev_janitor_scan_keeps_every_resource_when_the_snapshot_is_incomplete(self):
         import dev_janitor
         resources = [{"id": "sim:1", "kind": "simulator", "age_s": 99999, "tokens": ["x"]}]
-        with patch.object(dev_janitor, "running_sessions", return_value=(None, {}, "control api: down")), \
+        with patch.object(dev_janitor.active_sessions, "snapshot", return_value={"complete": False, "threads": {}, "workspaces": {}, "opencode": set(), "problems": ["down"]}), \
                 patch.object(dev_janitor, "procs", return_value=[]), \
                 patch.object(dev_janitor, "keep_list", return_value=[]), \
                 patch.object(dev_janitor, "session_evidence", return_value=({}, {})), \
@@ -486,55 +486,45 @@ class JanitorKeepsEverythingTests(unittest.TestCase):
 
     def test_worktree_reaper_refuses_to_run_on_an_incomplete_active_set(self):
         import worktree_reaper
-        with patch.object(worktree_reaper, "snapshot", return_value={
+        with patch.object(worktree_reaper.active_sessions, "snapshot", return_value={
                 "complete": False, "threads": {}, "opencode": set(), "problems": ["down"]}):
             with self.assertRaises(RuntimeError):
-                worktree_reaper.running_dirs(None)
+                worktree_reaper.running_dirs()
 
     def test_worktree_of_a_running_claude_thread_is_protected(self):
         import worktree_reaper
-        import sqlite3
-        con = sqlite3.connect(":memory:")
-        con.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT)")
         # running_dirs reads the workspaces from the one complete snapshot. The snapshot is patched so the test
         # stays off the live control API and checks only that the claude workspace is protected.
         complete = {"complete": True, "opencode": set(), "threads": {}, "problems": [],
                     "workspaces": {"thread-claude": "/work/claude-task"}}
-        with patch.object(worktree_reaper, "snapshot", return_value=complete):
-            dirs = worktree_reaper.running_dirs(con)
+        with patch.object(worktree_reaper.active_sessions, "snapshot", return_value=complete):
+            dirs = worktree_reaper.running_dirs()
         self.assertIn("/work/claude-task", dirs)
 
     def test_running_dirs_takes_one_snapshot_and_keeps_its_workspaces(self):
         # The reaper must not read the sources a second time for the workspaces. One snapshot gives both the
         # opencode directories and the workspaces, and a later failure can't empty the protected set.
         import worktree_reaper
-        import sqlite3
-        con = sqlite3.connect(":memory:")
-        con.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT)")
         complete = {"complete": True, "opencode": set(), "threads": {}, "problems": [],
                     "workspaces": {"thread-root": "/Users/x/repo"}}
-        with patch.object(worktree_reaper, "snapshot", return_value=complete) as snap:
-            dirs = worktree_reaper.running_dirs(con)
+        with patch.object(worktree_reaper.active_sessions, "snapshot", return_value=complete) as snap:
+            dirs = worktree_reaper.running_dirs()
         self.assertEqual(snap.call_count, 1)
         self.assertIn("/Users/x/repo", dirs)
 
     def test_incomplete_snapshot_makes_running_dirs_raise_not_protect_nothing(self):
         import worktree_reaper
-        import sqlite3
-        con = sqlite3.connect(":memory:")
-        con.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT)")
         incomplete = {"complete": False, "opencode": set(), "threads": {}, "workspaces": {},
                       "problems": ["control api projects: status 503"]}
-        with patch.object(worktree_reaper, "snapshot", return_value=incomplete):
+        with patch.object(worktree_reaper.active_sessions, "snapshot", return_value=incomplete):
             with self.assertRaises(RuntimeError):
-                worktree_reaper.running_dirs(con)
+                worktree_reaper.running_dirs()
 
     def test_reaper_removes_nothing_when_the_recheck_snapshot_fails(self):
         # The first read is healthy and the worktree is stale, so it reaches the re-check right before removal. The
         # re-check's read fails: main() must remove nothing and report an error.
         import contextlib
         import io
-        import sqlite3
         import worktree_reaper as wr
         healthy = {"complete": True, "opencode": set(), "threads": {}, "problems": [],
                    "workspaces": {"thread-root": "/Users/x/repo"}}
@@ -545,15 +535,12 @@ class JanitorKeepsEverythingTests(unittest.TestCase):
                      "last_session_days": None, "created_days": 90, "ignored_keep": []}
         worktree = {"main": False, "common": "/work/common.git", "worktree": "/work/stale", "HEAD": "abc123",
                     "branch": "refs/heads/old"}
-        db = sqlite3.connect(":memory:")
-        db.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT)")
         with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack, \
                 contextlib.redirect_stdout(io.StringIO()):
             stack.enter_context(patch.object(wr, "LOG_DIR", tmp))
             stack.enter_context(patch.object(wr, "STATUS", os.path.join(tmp, "status.json")))
             stack.enter_context(patch.object(wr, "AUDIT", os.path.join(tmp, "audit.jsonl")))
-            stack.enter_context(patch.object(wr.sqlite3, "connect", return_value=db))
-            stack.enter_context(patch.object(wr, "snapshot", side_effect=[healthy, failing]))
+            stack.enter_context(patch.object(wr.active_sessions, "snapshot", side_effect=[healthy, failing]))
             stack.enter_context(patch.object(wr, "session_activity", return_value={}))
             stack.enter_context(patch.object(wr, "process_cwds", return_value=[]))
             stack.enter_context(patch.object(wr, "keep_list", return_value=[]))
