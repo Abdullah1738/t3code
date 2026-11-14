@@ -64,6 +64,7 @@ export const KANBAN_WS_METHODS = {
   wiki: "kanban.wiki",
   boardCreate: "kanban.board.create",
   boardUpdate: "kanban.board.update",
+  standingApprovalRevoke: "kanban.board.standing-approval.revoke",
   setupStart: "kanban.setup.start",
   setupEnd: "kanban.setup.end",
   boardPause: "kanban.board.pause",
@@ -211,6 +212,15 @@ export const KanbanRpcs = RpcGroup.make(
   ),
   call(M.boardUpdate, KanbanBoardUpdateInput, KanbanBoard),
   call(
+    M.standingApprovalRevoke,
+    Schema.Struct({
+      boardId: KanbanBoardId,
+      id: TrimmedNonEmptyString,
+      reason: TrimmedNonEmptyString,
+    }),
+    KanbanBoard,
+  ),
+  call(
     M.setupStart,
     Schema.Struct({
       boardId: KanbanBoardId,
@@ -329,6 +339,7 @@ export const KANBAN_READ_SCOPES = {
 export const KANBAN_GUARDED_SCOPES = {
   [M.boardCreate]: AuthOrchestrationOperateScope,
   [M.boardUpdate]: AuthOrchestrationOperateScope,
+  [M.standingApprovalRevoke]: AuthOrchestrationOperateScope,
   [M.setupStart]: AuthOrchestrationOperateScope,
   [M.setupEnd]: AuthOrchestrationOperateScope,
   [M.boardPause]: AuthOrchestrationOperateScope,

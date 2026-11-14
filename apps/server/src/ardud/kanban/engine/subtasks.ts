@@ -10,6 +10,7 @@ import {
   type KanbanBoard,
   type KanbanOwnerAsk,
   type KanbanSubtask,
+  type KanbanStandingApproval,
 } from "@t3tools/contracts";
 
 // Unknown continuations need approval, including nouns and possessives after a resource name.
@@ -213,12 +214,13 @@ export const inferGate = (text: string): KanbanSubtask["gate"] => {
 };
 
 export const gateOf = (
-  subtask: Pick<KanbanSubtask, "owner" | "gate" | "text">,
+  subtask: Pick<KanbanSubtask, "owner" | "gate" | "text" | "ownerOnly">,
   guessedGates?: KanbanBoard["guessedGates"],
 ): KanbanSubtask["gate"] => {
   // Older plans stored inferred gates on coding and review checklists too.
   if (subtask.owner === "work" || subtask.owner === "review") return undefined;
   if (subtask.gate !== undefined) return subtask.gate;
+  if (subtask.ownerOnly) return "deploy";
   const guessed = inferGate(subtask.text);
   return guessed !== undefined && (guessedGates === undefined || guessedGates.includes(guessed))
     ? guessed
@@ -259,7 +261,7 @@ const harmlessFollowup = (task: string, target: string): boolean => {
   return !/(?:[.!]|\b(?:a|an|the))$/i.test(action) && approvalAction(action) === target;
 };
 
-const approvesGate = (
+export const approvesGate = (
   label: string,
   gate: NonNullable<KanbanSubtask["gate"]>,
   task: string,
@@ -341,6 +343,7 @@ const askConcerns = (
   const wording = askWording(ask);
   const ids = new Set(wording.match(/\bs\d+\b/g) ?? []);
   if (ids.size > 0) return ids.has(subtask.id);
+  if (subtask.ownerOnly) return false;
   const candidates = card.subtasks.filter(
     (entry) =>
       gateOf(entry, guessedGates) === gate &&
@@ -354,11 +357,20 @@ const askConcerns = (
 export const approvalProblem = (
   card: Pick<KanbanCard, "number" | "asks" | "createdAt" | "subtasks">,
   subtask: KanbanSubtask,
+  standing: ReadonlyArray<KanbanStandingApproval> = [],
   guessedGates?: KanbanBoard["guessedGates"],
   intent: "do" | "skip" = "do",
 ): string | null => {
   const gate = gateOf(subtask, guessedGates);
   if (gate === undefined) return null;
+  if (gate === "deploy" && !subtask.ownerOnly && standing.some((entry) => entry.revokedAt === null))
+    return null;
+  const standingReason =
+    gate !== "deploy"
+      ? ""
+      : subtask.ownerOnly
+        ? " (marked owner-only)"
+        : " (this board has no standing deploy approval)";
   const since = subtask.createdAt ?? card.createdAt;
   const decisions = card.asks
     .filter((ask) => {
@@ -398,7 +410,7 @@ export const approvalProblem = (
       answer?.verdict === "dropped"
         ? `the latest decision, ${latest!.id}, was dropped (a dropped ask is not approval)`
         : noDecisionReason;
-    return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's answer before it can be skipped: ${reason}`.replace(
+    return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's answer before it can be skipped: ${reason}${standingReason}`.replace(
       /[\r\n]+/g,
       " ",
     );
@@ -432,7 +444,7 @@ export const approvalProblem = (
   } else {
     reason = `the latest decision, ${latest.id}, was ${answer.verdict}`;
   }
-  return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's approval: ${reason}`.replace(
+  return `card #${card.number} subtask ${subtask.id} (${gate}: ${subtask.text}) needs Abdullah's approval: ${reason}${standingReason}`.replace(
     /[\r\n]+/g,
     " ",
   );
@@ -449,6 +461,7 @@ export interface SubtaskInput {
   readonly text?: string | undefined;
   readonly owner?: KanbanSubtask["owner"] | undefined;
   readonly gate?: KanbanSubtask["gate"] | null;
+  readonly ownerOnly?: boolean | undefined;
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   readonly script?: string | undefined;
 }
@@ -527,6 +540,7 @@ export function planSubtasks(
           input.owner === undefined &&
           input.step === undefined &&
           input.gate === undefined &&
+          input.ownerOnly === undefined &&
           input.script === undefined)
       ) {
         planned.push(known);
@@ -550,7 +564,14 @@ export function planSubtasks(
         reason: `subtask "${text}" is the worker's; a deploy, money or secret step must be owned by the evaluator or a script`,
       };
     }
-    const inputGate = gateOf({ owner, text, gate: input.gate ?? undefined }, guessedGates);
+    const ownerOnly = input.ownerOnly ?? known?.ownerOnly;
+    if (ownerOnly && (owner === "work" || owner === "review")) {
+      return { ok: false, reason: "an owner-only step must be owned by the evaluator or a script" };
+    }
+    const inputGate = gateOf(
+      { owner, text, gate: input.gate ?? undefined, ownerOnly },
+      guessedGates,
+    );
     const script = input.script?.trim() || undefined;
     if (script && owner !== "script") {
       return {
@@ -571,8 +592,14 @@ export function planSubtasks(
         step,
         text,
         owner,
+        ...(ownerOnly === undefined ? {} : { ownerOnly }),
         ...(gate === undefined ? {} : { gate }),
-        ...((text !== known.text || script !== known.script || !previousGate) && gate && at
+        ...((text !== known.text ||
+          script !== known.script ||
+          ownerOnly !== known.ownerOnly ||
+          !previousGate) &&
+        gate &&
+        at
           ? { createdAt: at }
           : {}),
         ...(script ? { script } : {}),
@@ -585,6 +612,7 @@ export function planSubtasks(
         step,
         text,
         owner,
+        ...(ownerOnly === undefined ? {} : { ownerOnly }),
         ...(gate === undefined ? {} : { gate }),
         ...(at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),

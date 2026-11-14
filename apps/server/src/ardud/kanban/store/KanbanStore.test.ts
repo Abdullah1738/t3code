@@ -64,6 +64,7 @@ const board: KanbanBoard = {
   defaultCardModel: model,
   reviewChains: [],
   defaultReviewChain: null,
+  standingApprovals: [],
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   createdAt: at,
   setup: null,
@@ -635,6 +636,15 @@ it.live(
 );
 
 it.layer(TestLayer)("kanban store", (it) => {
+  it.effect("reads old board rows with no standing approvals as an empty history", () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      yield* store.putBoard(board);
+      yield* sql`UPDATE ardud_kanban_boards SET json = json_remove(json, '$.standingApprovals') WHERE id = ${board.id}`;
+      assert.deepStrictEqual((yield* store.board(board.id))?.standingApprovals, []);
+    }),
+  );
   it.effect("round-trips boards, cards, events, messages and script runs", () =>
     Effect.gen(function* () {
       const store = yield* KanbanStore.KanbanStore;

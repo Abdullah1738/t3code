@@ -746,6 +746,35 @@ const handlers = {
     ),
   ),
 
+  board_standing_approval: McpToolAccess.actsAsCaller((input) =>
+    withCaller((service, caller) =>
+      Effect.gen(function* () {
+        if (caller.link?.role !== "evaluator")
+          return yield* refuse("Only evaluators grant or revoke standing approvals.");
+        const board = yield* boardFor(service, caller, input.boardId);
+        const card =
+          input.action === "grant" && input.card
+            ? yield* cardFor(service, caller, input.card, input.boardId)
+            : undefined;
+        return yield* service.standingApproval(
+          board.id,
+          {
+            action: input.action,
+            boards: input.boards,
+            quote: input.quote,
+            sourceThreadId: input.sourceThreadId,
+            saidAt: input.saidAt,
+            cardId: card?.id,
+            ask: input.ask,
+            id: input.id,
+            reason: input.reason,
+          },
+          caller.actor,
+        );
+      }),
+    ),
+  ),
+
   card_wait: McpToolAccess.actsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
