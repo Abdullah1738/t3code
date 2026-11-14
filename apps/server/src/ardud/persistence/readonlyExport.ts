@@ -2,6 +2,7 @@
 import type * as NodeSqlite from "node:sqlite";
 import type * as NodeFS from "node:fs";
 import type * as NodePath from "node:path";
+import { resolveHistoryBasePath } from "./historySourceFiles.ts";
 
 export interface ReadonlyReplicaOptions {
   readonly sourcePath: string;
@@ -42,6 +43,7 @@ export function createReadonlyReplica(
   fs: typeof NodeFS,
   path: typeof NodePath,
   options: ReadonlyReplicaOptions,
+  resolveBasePath = resolveHistoryBasePath,
 ) {
   const emptyMetrics = (): ReadonlyExportMetrics => ({
     lineageRepairCounts: {
@@ -170,25 +172,21 @@ export function createReadonlyReplica(
       }
     };
     assertRedactionComplete();
-    const baseFilename = () => {
+    const readBasePath = () => {
       if (
         !source.prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_history_base_archive'").get()
       )
         return undefined;
-      const rows = source.prepare("SELECT filename FROM ardud_history_base_archive LIMIT 2").all();
-      if (rows.length === 0) return undefined;
-      const filename = rows[0]!.filename;
-      if (
-        rows.length !== 1 ||
-        typeof filename !== "string" ||
-        !/^statev2\.pre-shrink-[^/\\]+\.sqlite$/.test(filename) ||
-        path.basename(filename) !== filename
-      )
-        throw new Error("Invalid readonly history base filename");
-      return filename;
+      return resolveBasePath(
+        path,
+        options.sourcePath,
+        source
+          .prepare("SELECT filename FROM ardud_history_base_archive LIMIT 2")
+          .all()
+          .map((row) => ({ filename: row.filename })),
+      );
     };
-    const baseName = baseFilename();
-    const basePath = baseName ? path.join(path.dirname(options.sourcePath), baseName) : undefined;
+    const basePath = readBasePath();
     if (basePath) {
       if (!fs.existsSync(basePath)) throw new Error("Readonly history base unavailable");
       baseArchive = open(basePath, { readOnly: true }, "primary");
@@ -1014,7 +1012,7 @@ export function createReadonlyReplica(
     const validate = () => {
       if (closed) throw new Error("Readonly exporter is closed");
       if (invalidated) throw new Error(invalidated);
-      if (baseFilename() !== baseName)
+      if (readBasePath() !== basePath)
         throw invalidate("History base changed; reopen readonly sources");
       if (options.archivePath && !archive && fs.existsSync(options.archivePath))
         throw invalidate("History archive appeared; reopen readonly sources");

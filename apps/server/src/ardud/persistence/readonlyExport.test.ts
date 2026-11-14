@@ -6,6 +6,7 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodeWorkerThreads from "node:worker_threads";
 import { afterEach, expect, test, vi } from "vite-plus/test";
 import { createReadonlyReplica } from "./readonlyExport.ts";
+import { resolveHistoryBasePath } from "./historySourceFiles.ts";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -832,7 +833,7 @@ test("the packaged worker function has no external runtime dependencies", async 
   const worker = new NodeWorkerThreads.Worker(
     `
     const {parentPort,workerData}=require('node:worker_threads');
-    const exporter=(${createReadonlyReplica.toString()})(require('node:sqlite'),require('node:fs'),require('node:path'),workerData);
+    const exporter=(${createReadonlyReplica.toString()})(require('node:sqlite'),require('node:fs'),require('node:path'),workerData,(${resolveHistoryBasePath.toString()}));
     exporter.step(); exporter.close(); parentPort.postMessage('ok');
   `,
     { eval: true, execArgv: [], workerData: f.options },
