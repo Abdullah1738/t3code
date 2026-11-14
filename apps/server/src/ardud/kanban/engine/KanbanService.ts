@@ -11490,6 +11490,9 @@ const make = Effect.gen(function* () {
     patch: BoardPatch,
     application?: InstructionApplication,
   ) {
+    if (patch.name !== undefined && patch.name.trim() === "") {
+      return yield* failWith("invalid", "A board needs a name");
+    }
     yield* checkText([
       ["name", patch.name],
       ["model routing", patch.instructions?.modelRouting],

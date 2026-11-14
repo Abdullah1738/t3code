@@ -18464,6 +18464,25 @@ it.effect("a board created with picked models uses them and pools exactly those"
   }),
 );
 
+it.effect("updateBoard renames without changing identity and refuses blank names", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const renamed = yield* kanban.updateBoard(board.id, { name: "Board work" });
+      assert.strictEqual(renamed.id, board.id);
+      assert.strictEqual(renamed.slug, board.slug);
+      assert.strictEqual(renamed.name, "Board work");
+      for (const name of ["", "   ", "\t\r\n", "\u00a0\u2003"]) {
+        const error = yield* kanban.updateBoard(board.id, { name }).pipe(Effect.flip);
+        assert.strictEqual(error.code, "invalid");
+        assert.strictEqual(error.detail, "A board needs a name");
+        assert.deepStrictEqual((yield* kanban.snapshot(board.id)).board, renamed);
+      }
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("updateBoard with a new evaluator model adds a 0-slot pool without resizing others", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

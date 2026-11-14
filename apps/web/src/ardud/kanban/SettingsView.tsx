@@ -4,6 +4,7 @@ import { useAtomValue } from "@effect/atom-react";
 
 import {
   boardModelSelection,
+  boardRenameValue,
   modelName,
   poolAddLevel,
   poolListed,
@@ -299,6 +300,9 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
 
   return (
     <div className="flex max-w-225 flex-col gap-5.5 pb-12">
+      <Section title="Name">
+        <BoardNameInput key={board.id} board={board} disabled={!canEdit} editNote={editNote} />
+      </Section>
       <Section title="Icon">
         <IconPicker
           board={board}
@@ -690,6 +694,51 @@ async function boardImage(file: File): Promise<string | null> {
     if (url.startsWith(`data:${type};`) && url.length <= KANBAN_BOARD_IMAGE_MAX) return url;
   }
   return null;
+}
+
+function BoardNameInput(props: {
+  board: KanbanBoard;
+  disabled: boolean;
+  editNote: string | undefined;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const cancelled = useRef(false);
+  const save = (value: string) => {
+    const name = boardRenameValue(value, props.board.name);
+    if (cancelled.current || props.disabled || saving || name === null) {
+      cancelled.current = false;
+      setDraft(null);
+      return;
+    }
+    setDraft(name);
+    setSaving(true);
+    void runAction("Couldn't rename board", () =>
+      kanban.updateBoard({ boardId: props.board.id, name }),
+    ).then(() => {
+      setDraft(null);
+      setSaving(false);
+    });
+  };
+  return (
+    <Input
+      aria-label="Name"
+      name="board-name"
+      autoComplete="off"
+      title={props.editNote}
+      disabled={props.disabled || saving}
+      value={draft ?? props.board.name}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={(event) => save(event.currentTarget.value)}
+      onKeyDown={(event) => {
+        if (event.nativeEvent.isComposing) return;
+        if (event.key !== "Enter" && event.key !== "Escape") return;
+        event.preventDefault();
+        cancelled.current = event.key === "Escape";
+        event.currentTarget.blur();
+      }}
+    />
+  );
 }
 
 function IconPicker(props: {
