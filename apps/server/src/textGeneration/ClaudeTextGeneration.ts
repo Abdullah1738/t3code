@@ -260,20 +260,22 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
         forceKillAfter: "1 second",
       });
 
-      const child = yield* commandSpawner
-        .spawn(command)
-        .pipe(
-          Effect.mapError((cause) =>
-            normalizeCliError("claude", operation, cause, "Failed to spawn Claude CLI process"),
-          ),
-        );
+      const { child, exitCode: childExitCode } = yield* TextGenerationAnalytics.spawnChild(
+        commandSpawner,
+        command,
+        "claude",
+        operation,
+      ).pipe(
+        Effect.mapError((cause) =>
+          normalizeCliError("claude", operation, cause, "Failed to spawn Claude CLI process"),
+        ),
+      );
 
-      const observedChild = yield* TextGenerationAnalytics.observeChild(child, "claude", operation);
       const [stdout, stderr, exitCode] = yield* Effect.all(
         [
           readStreamAsString(operation, child.stdout),
           readStreamAsString(operation, child.stderr),
-          observedChild.exitCode.pipe(
+          childExitCode.pipe(
             Effect.mapError((cause) =>
               normalizeCliError("claude", operation, cause, "Failed to read Claude CLI exit code"),
             ),

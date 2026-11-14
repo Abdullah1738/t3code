@@ -6,7 +6,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
-import type { ChildProcessSpawner } from "effect/process";
+import type { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import * as Analytics from "../ardud/analytics/Analytics.ts";
 import { recordServerAnalytics, safeAnalyticsLabel } from "../observability/RpcInstrumentation.ts";
@@ -61,7 +61,7 @@ export const observeOperation = Effect.fn("TextGeneration.observeOperation")(fun
   );
 });
 
-export const observeChild = Effect.fn("TextGeneration.observeChild")(function* (
+const observeChild = Effect.fn("TextGeneration.observeChild")(function* (
   child: ChildProcessSpawner.ChildProcessHandle,
   provider: string,
   fallbackOperation: string,
@@ -108,4 +108,18 @@ export const observeChild = Effect.fn("TextGeneration.observeChild")(function* (
       ),
     ),
   };
+});
+
+export const spawnChild = Effect.fn("TextGeneration.spawnChild")(function* (
+  spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
+  command: ChildProcess.Command,
+  provider: string,
+  operation: string,
+) {
+  // A pending interrupt must not land between acquiring the process and installing its counter.
+  return yield* Effect.gen(function* () {
+    const child = yield* spawner.spawn(command);
+    const observed = yield* observeChild(child, provider, operation);
+    return { child, exitCode: observed.exitCode };
+  }).pipe(Effect.uninterruptible);
 });
