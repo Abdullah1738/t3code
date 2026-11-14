@@ -1,3 +1,8 @@
+if __package__:
+    from . import test_environment
+else:
+    import test_environment
+
 import argparse
 from contextlib import ExitStack, closing
 from datetime import datetime, timedelta, timezone
