@@ -1,4 +1,5 @@
-import * as NodeTest from "node:test";
+// Support the repository runner and dependency-free CLI checks.
+const NodeTest = process.env.VITEST ? await import("vitest") : await import("node:test");
 import * as NodeAssert from "node:assert/strict";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -21,8 +22,19 @@ function fixture(severe = [], options = {}) {
     time: new Date(now - (20 - i) * 30_000).toISOString(),
     kind: "sample",
     rssMb: 3600,
+    gcTotalMs: 75,
+    gcMajorMaxMs: 50,
   }));
-  for (const [i, delay] of severe) rows[i] = { ...rows[i], delayMaxMs: delay };
+  for (const [i, delay] of severe)
+    rows[i] = {
+      ...rows[i],
+      delayMaxMs: delay,
+      gcCount: 2,
+      gcMaxMs: 50,
+      gcMajorCount: 1,
+      heapUsedMb: 1500,
+      heapUsedMbPrev: 2100,
+    };
   return {
     text:
       rows
@@ -105,7 +117,7 @@ NodeTest.test("threshold and exit-code matrix", () => {
   NodeAssert.equal(healthVerdict(lag, { ...ok, readiness: "degraded" }, ok).verdict, "degraded");
   NodeAssert.equal(summarizeLag(fixture([], { skip: [19] }), now).status, "complete");
 });
-NodeTest.test("50 MB log reads at most 2 MB by seeking, skips partial records", () => {
+NodeTest.test("50 MB log reads at most 2 MB by seeking, skips partial records", async () => {
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "deep-tail-"));
   try {
     const file = NodePath.join(dir, "lag");
@@ -119,13 +131,19 @@ NodeTest.test("50 MB log reads at most 2 MB by seeking, skips partial records", 
     NodeFS.closeSync(fd);
     let bytes = 0;
     let firstPosition;
-    const tail = readLagTail(file, {
-      ...NodeFS,
-      readSync(...args) {
-        firstPosition ??= args[4];
-        const n = NodeFS.readSync(...args);
-        bytes += n;
-        return n;
+    const tail = await readLagTail(file, {
+      async open(...args) {
+        const handle = await NodeFS.promises.open(...args);
+        return {
+          stat: () => handle.stat(),
+          close: () => handle.close(),
+          async read(...readArgs) {
+            firstPosition ??= readArgs[3];
+            const result = await handle.read(...readArgs);
+            bytes += result.bytesRead;
+            return result;
+          },
+        };
       },
     });
     NodeAssert.equal(bytes, TAIL_BYTES);
@@ -136,14 +154,14 @@ NodeTest.test("50 MB log reads at most 2 MB by seeking, skips partial records", 
     NodeFS.rmSync(dir, { recursive: true, force: true });
   }
 });
-NodeTest.test("rotation preserves the 10-minute window; partial append ignored", () => {
+NodeTest.test("rotation preserves the 10-minute window; partial append ignored", async () => {
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "deep-rotate-"));
   try {
     const file = NodePath.join(dir, "lag");
     const rows = fixture([[2, 6000]]).text.split("\n");
     NodeFS.writeFileSync(file + ".1", rows.slice(0, 10).join("\n") + "\n");
     NodeFS.writeFileSync(file, rows.slice(10).join("\n") + '{"time":');
-    const lag = summarizeLag(readLagTail(file), now);
+    const lag = summarizeLag(await readLagTail(file), now);
     NodeAssert.equal(lag.status, "complete");
     NodeAssert.equal(lag.stalls5s, 1);
   } finally {
@@ -257,7 +275,7 @@ NodeTest.test("a long sampler gap straddling the window boundary stays unknown",
   NodeAssert.equal(summarizeLag(tail, now).status, "unknown");
 });
 
-NodeTest.test("rotation never counts the same inode twice", () => {
+NodeTest.test("rotation never counts the same inode twice", async () => {
   const records = fixture([
     [4, 6000],
     [8, 6000],
@@ -265,15 +283,16 @@ NodeTest.test("rotation never counts the same inode twice", () => {
   const buffer = Buffer.from(records);
   let reads = 0;
   const io = {
-    openSync: () => 10,
-    closeSync() {},
-    fstatSync: () => ({ dev: 1, ino: 55, size: buffer.length, isFile: () => true }),
-    readSync(_fd, target, offset, length, position) {
-      reads++;
-      return buffer.copy(target, offset, position, position + length);
-    },
+    open: async () => ({
+      close: async () => {},
+      stat: async () => ({ dev: 1, ino: 55, size: buffer.length, isFile: () => true }),
+      async read(target, offset, length, position) {
+        reads++;
+        return { bytesRead: buffer.copy(target, offset, position, position + length) };
+      },
+    }),
   };
-  const lag = summarizeLag(readLagTail("rotating", io), now);
+  const lag = summarizeLag(await readLagTail("rotating", io), now);
   NodeAssert.equal(reads, 1);
   NodeAssert.equal(lag.stalls5s, 2);
   NodeAssert.equal(lag.status, "unknown");
@@ -366,22 +385,22 @@ for (const [name, output, owned] of [
   ["empty output", "", false],
   ["non-PID output", "lsof: unavailable\n", false],
 ])
-  NodeTest.test(`independent listener ownership: ${name}`, () => {
+  NodeTest.test(`independent listener ownership: ${name}`, async () => {
     NodeAssert.equal(
-      ownsListener({ pid: 123, port: 3773 }, (command, args, options) => {
+      await ownsListener({ pid: 123, port: 3773 }, (command, args, options, callback) => {
         NodeAssert.equal(NodePath.basename(command), "lsof");
         NodeAssert.deepEqual(args, ["-nP", "-iTCP:3773", "-sTCP:LISTEN", "-Fp"]);
-        NodeAssert.equal(options.timeout, 1000);
+        NodeAssert.equal(options.killSignal, "SIGKILL");
         NodeAssert.equal(options.maxBuffer, 64 * 1024);
-        return output;
+        callback(null, output);
       }),
       owned,
     );
   });
-NodeTest.test("listener command failure never authorizes local evidence", () => {
+NodeTest.test("listener command failure never authorizes local evidence", async () => {
   for (const error of ["timeout", "not installed", "permission denied"]) {
     NodeAssert.equal(
-      ownsListener({ pid: 123, port: 3773 }, () => {
+      await ownsListener({ pid: 123, port: 3773 }, () => {
         throw new Error(error);
       }),
       false,
@@ -394,11 +413,135 @@ for (const target of [
   { pid: 123, port: 0 },
   { pid: 123, port: 65536 },
 ])
-  NodeTest.test(`invalid listener identity ${JSON.stringify(target)}`, () => {
+  NodeTest.test(`invalid listener identity ${JSON.stringify(target)}`, async () => {
     NodeAssert.equal(
-      ownsListener(target, () => {
+      await ownsListener(target, () => {
         throw new Error("must not execute");
       }),
       false,
     );
   });
+
+const localRuntime = {
+  origin: "http://127.0.0.1:3773",
+  pid: process.pid,
+  startedAt: new Date(now).toISOString(),
+};
+const localClient = {
+  url: localRuntime.origin,
+  request: async (_method, route) =>
+    route === "/health"
+      ? { ok: true, status: "healthy", serverStartedAt: localRuntime.startedAt }
+      : { threads: [] },
+};
+NodeTest.test("both probes ignore abort: one shared budget still returns a report", async () => {
+  const start = performance.now();
+  const report = await deepHealth({
+    timeoutMs: 25,
+    client: { ...localClient, request: () => new Promise(() => {}) },
+  });
+  NodeAssert.ok(performance.now() - start < 250);
+  NodeAssert.equal(report.connection.status, "timeout");
+  NodeAssert.equal(report.roundTrip.status, "timeout");
+  NodeAssert.equal(report.stages.connection.status, "timeout");
+  NodeAssert.equal(report.stages.roundTrip.status, "timeout");
+  NodeAssert.ok(["ok", "error", "skipped"].includes(report.stages.runtime.status));
+  NodeAssert.match(report.summary, /timeout/);
+});
+NodeTest.test(
+  "listener ignoring abort cannot authorize local evidence or outlast the budget",
+  { timeout: 500 },
+  async () => {
+    const report = await deepHealth({
+      timeoutMs: 25,
+      client: {
+        ...localClient,
+        request: (_method, route) =>
+          route === "/health"
+            ? Promise.reject(new Error("unavailable"))
+            : Promise.resolve({ threads: [] }),
+      },
+      readRuntime: () => localRuntime,
+      checkListener: () => new Promise(() => {}),
+      readTail: () => {
+        throw new Error("must not read unverified lag");
+      },
+    });
+    NodeAssert.equal(report.stages.listener.status, "timeout");
+    NodeAssert.equal(report.lag.bytesRead, 0);
+    NodeAssert.match(report.summary, /unverified/);
+    NodeAssert.equal(report.status, "timeout");
+    NodeAssert.equal(report.stage, "listener");
+  },
+);
+for (const stage of ["runtime", "lagTail"]) {
+  for (const failure of ["throw", "reject", "hang"]) {
+    NodeTest.test(
+      `${stage} ${failure}: local I/O still returns a safe report`,
+      { timeout: 500 },
+      async () => {
+        const fail = () => {
+          const error = new Error("secret server body Bearer fixture-secret");
+          if (failure === "throw") throw error;
+          return failure === "reject" ? Promise.reject(error) : new Promise(() => {});
+        };
+        const report = await deepHealth({
+          timeoutMs: 25,
+          client: localClient,
+          readRuntime: stage === "runtime" ? fail : () => localRuntime,
+          readTail: stage === "lagTail" ? fail : () => fixture(),
+        });
+        NodeAssert.equal(report.stages[stage].status, failure === "hang" ? "timeout" : "error");
+        NodeAssert.equal(report.lag.status, "unknown");
+        NodeAssert.equal(report.lag.bytesRead, 0);
+        NodeAssert.doesNotMatch(JSON.stringify(report), /fixture-secret|secret server body/);
+      },
+    );
+  }
+}
+
+NodeTest.test("a listener child that never closes is SIGKILLed and detached", async () => {
+  const signals = [];
+  let detached = false;
+  let destroyed = 0;
+  await NodeAssert.rejects(
+    ownsListener({ pid: 123, port: 3773, timeoutMs: 10 }, () => ({
+      kill: (signal) => signals.push(signal),
+      unref: () => {
+        detached = true;
+      },
+      stdout: {
+        destroy: () => {
+          destroyed++;
+        },
+      },
+      stderr: {
+        destroy: () => {
+          destroyed++;
+        },
+      },
+    })),
+    { name: "TimeoutError" },
+  );
+  NodeAssert.deepEqual(signals, ["SIGKILL"]);
+  NodeAssert.equal(detached, true);
+  NodeAssert.equal(destroyed, 2);
+});
+
+NodeTest.test(
+  "invalid readiness metadata never echoes response bodies or credentials",
+  async () => {
+    const report = await deepHealth({
+      client: {
+        ...localClient,
+        request: async (_method, route) =>
+          route === "/health"
+            ? { ok: true, status: "Bearer fixture-secret", serverStartedAt: "fixture-secret" }
+            : { threads: [] },
+      },
+      readRuntime: () => localRuntime,
+    });
+    NodeAssert.equal(report.verdict, "unknown");
+    NodeAssert.doesNotMatch(JSON.stringify(report), /fixture-secret/);
+  },
+);

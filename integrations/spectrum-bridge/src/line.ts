@@ -71,7 +71,7 @@ export type LineAppCard = {
 export type LineOutbound = {
   handle: string; chat: ChatKey; text: string; mediaUrl?: string;
   /** An app card: its page and the text its bubble shows, as sendApp cleaned it. */
-  card?: { url: string; layout: CardText };
+  card?: { url: string; layout: CardText; sessionIdentifier?: string; updateMessageHandle?: string };
   sentAt: number; status: string;
 };
 
@@ -115,6 +115,7 @@ export interface Line {
   /** One message by handle (inbound or outbound), for reply context. */
   getMessage(handle: string): Promise<LineInbound | LineOutbound | undefined>;
   sendApp(chat: ChatKey, card: LineAppCard): Promise<{ handle: string }>;
+  updateApp?(originalHandle: string, card: LineAppCard, key: string): Promise<{ handle: string }>;
   /** Tapback name (love, like, dislike, laugh, emphasize, question) or a single emoji. Inbound messages only. */
   react(handle: string, reaction: string): Promise<void>;
   /** Shows (default) or clears our typing bubble. 1:1 only; a no-op for groups. */

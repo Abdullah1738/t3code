@@ -758,6 +758,12 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
       Effect.catchCause((cause) => Effect.logWarning("Delegated task recovery failed", { cause })),
       Effect.forkIn(startupScope),
     );
+    yield* orchestrator.repairRunlessProviderTurns.pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Runless provider turn repair failed", { cause }),
+      ),
+      Effect.forkIn(startupScope),
+    );
     yield* Effect.logDebug("startup phase: complete");
     yield* flushCompileCache;
   }).pipe(

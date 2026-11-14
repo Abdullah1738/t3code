@@ -1,6 +1,8 @@
-import type { AnalyticsEvent, AnalyticsRollup as ContractRollup } from "@t3tools/contracts";
+import type { AnalyticsEvent, AnalyticsRollup, RunUsageEvent } from "@t3tools/contracts";
 import { LONG_TASK_HISTOGRAM_RATIO } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+
+export type { AnalyticsRollup } from "@t3tools/contracts";
 
 const MAX_GROUPS = 128;
 const EXACT_DURATIONS = 512;
@@ -21,8 +23,6 @@ interface AnalyticsLatency {
   readonly maxMs: number | null;
   readonly approximate: boolean;
 }
-
-export type AnalyticsRollup = ContractRollup;
 
 interface McpGroup {
   tool: string;
@@ -114,11 +114,26 @@ export const makeAccumulator = () => ({
   total: 0,
   invalidLines: 0,
   kinds: new Map<string, number>(),
+  textGenerationOverflow: 0,
+  textGeneration: new Map<
+    string,
+    {
+      labels: {
+        hour: string;
+        provider: string;
+        operation: string;
+        boardId: string | null;
+        kind: "operation" | "child";
+        outcome: NonNullable<AnalyticsEvent["outcome"]>;
+      };
+      durations: Durations;
+    }
+  >(),
   errors: new Map<string, number>(),
   routes: new Map<string, Breakdown>(),
   mcpCodes: new Map<string, Breakdown>(),
   dbSpans: new Map<string, Breakdown>(),
-  rpcs: new Map<string, Durations>(),
+  rpcs: new Map<string, Durations & { totalWaitMs: number; outcomes: Map<string, number> }>(),
   longTasks: new Map<
     string,
     {
@@ -132,6 +147,7 @@ export const makeAccumulator = () => ({
     }
   >(),
   answers: durations(),
+  usage: makeUsageAccumulator(),
   boards: new Map<string, BoardGroup>(),
   tickPhases: new Map<string, { boardId: string; phase: string; durations: Durations }>(),
   mcp: new Map<string, McpGroup>(),
@@ -357,6 +373,30 @@ export function accumulate(
 ): void {
   boardAccumulate(target, event);
   target.total++;
+  if ("runId" in event) accumulateUsage(target.usage, event);
+  if (
+    event.surface === "server" &&
+    (event.kind === "text-generation.operation" || event.kind === "text-generation.child") &&
+    event.props?.provider &&
+    event.props.operation &&
+    event.durationMs !== undefined
+  ) {
+    const labels = {
+      hour: (event.startedAt ?? event.ts).slice(11, 13),
+      provider: event.props.provider,
+      operation: event.props.operation,
+      boardId: event.boardId ?? null,
+      kind: event.kind === "text-generation.child" ? ("child" as const) : ("operation" as const),
+      outcome: event.outcome ?? "error",
+    };
+    const key = JSON.stringify(labels);
+    // Bound all dimensions together. Overflow remains visible in kindCounts and raw day files.
+    if (target.textGeneration.has(key) || target.textGeneration.size < 4096) {
+      const group = target.textGeneration.get(key) ?? { labels, durations: durations() };
+      addDuration(group.durations, event.durationMs);
+      target.textGeneration.set(key, group);
+    } else target.textGenerationOverflow++;
+  }
   increment(target.kinds, event.kind);
   if (event.props?.errorTag) increment(target.errors, event.props.errorTag);
   else if (event.errorTag) increment(target.errors, event.errorTag);
@@ -466,10 +506,12 @@ export function accumulate(
     const key = boundedKey(target.rpcs, event.props.method);
     let summary = target.rpcs.get(key);
     if (!summary) {
-      summary = durations();
+      summary = { ...durations(), totalWaitMs: 0, outcomes: new Map() };
       target.rpcs.set(key, summary);
     }
     addDuration(summary, event.durationMs);
+    summary.totalWaitMs += event.props.waitMs ?? 0;
+    if (event.outcome !== undefined) increment(summary.outcomes, event.outcome);
   }
 
   if (
@@ -627,6 +669,10 @@ export function finishRollup(
     total: target.total,
     invalidLines: target.invalidLines,
     kindCounts: Object.fromEntries(target.kinds),
+    textGenerationOverflow: target.textGenerationOverflow,
+    textGeneration: [...target.textGeneration.values()]
+      .map((group) => ({ ...group.labels, ...summarize(group.durations) }))
+      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
     errorCounts: Object.fromEntries(target.errors),
     errorsByRoute: finishBreakdown(target.routes).map((row) => ({
       route: String(row.labels.route),
@@ -689,10 +735,16 @@ export function finishRollup(
           a.surface.localeCompare(b.surface),
       ),
     topSlowRpcs: [...target.rpcs]
-      .map(([method, values]) => ({ method, ...summarize(values) }))
+      .map(([method, values]) => ({
+        method,
+        ...summarize(values),
+        totalWaitMs: values.totalWaitMs,
+        outcomes: Object.fromEntries(values.outcomes),
+      }))
       .sort((a, b) => (b.p95Ms ?? 0) - (a.p95Ms ?? 0) || a.method.localeCompare(b.method))
       .slice(0, 20),
     askAnswerLatency: summarize(target.answers),
+    usage: finishUsage(target.usage),
     boards: [...target.boards].map(([boardId, board]) => ({
       boardId,
       moves: [...board.moves.values()],
@@ -788,5 +840,120 @@ export function boundedLines(maxLength: number) {
     finish(): ReadonlyArray<string | null> {
       return oversized ? [null] : pending.length === 0 ? [] : [pending];
     },
+  };
+}
+
+const usageTotals = () => ({
+  runs: 0,
+  inputTokens: null as number | null,
+  outputTokens: null as number | null,
+  cachedInputTokens: null as number | null,
+  reasoningTokens: null as number | null,
+  wallMs: null as number | null,
+  turnCount: 0,
+  completeRuns: 0,
+  partialRuns: 0,
+  unavailableRuns: 0,
+});
+type UsageTotals = ReturnType<typeof usageTotals>;
+const makeUsageAccumulator = () => ({
+  totals: usageTotals(),
+  models: new Map<string, { providerInstance: string; model: string; totals: UsageTotals }>(),
+  roles: new Map<RunUsageEvent["role"], UsageTotals>(),
+  boards: new Map<string, UsageTotals>(),
+  cards: new Map<
+    string,
+    {
+      boardId: string;
+      cardId: string;
+      totals: UsageTotals;
+      evaluatorWakes: number;
+      reviewRounds: Set<number>;
+    }
+  >(),
+  seen: new Set<string>(),
+});
+function addUsage(target: UsageTotals, event: RunUsageEvent): void {
+  target.runs++;
+  for (const key of [
+    "inputTokens",
+    "outputTokens",
+    "cachedInputTokens",
+    "reasoningTokens",
+    "wallMs",
+  ] as const) {
+    if (event[key] !== null) target[key] = (target[key] ?? 0) + event[key];
+  }
+  target.turnCount += event.turnCount;
+  target.completeRuns += Number(event.usageStatus === "complete");
+  target.partialRuns += Number(event.usageStatus === "partial");
+  target.unavailableRuns += Number(event.usageStatus === "unavailable");
+}
+function accumulateUsage(
+  target: ReturnType<typeof makeUsageAccumulator>,
+  event: RunUsageEvent,
+): void {
+  // The writer can replay an ambiguous append; a run is billed only once in the rollup.
+  if (target.seen.has(event.runId)) return;
+  target.seen.add(event.runId);
+  addUsage(target.totals, event);
+  const modelKey = JSON.stringify([event.providerInstance, event.model]);
+  const model = target.models.get(modelKey) ?? {
+    providerInstance: event.providerInstance,
+    model: event.model,
+    totals: usageTotals(),
+  };
+  addUsage(model.totals, event);
+  target.models.set(modelKey, model);
+  const role = target.roles.get(event.role) ?? usageTotals();
+  addUsage(role, event);
+  target.roles.set(event.role, role);
+  if (event.boardId !== undefined) {
+    const board = target.boards.get(event.boardId) ?? usageTotals();
+    addUsage(board, event);
+    target.boards.set(event.boardId, board);
+    if (event.cardId !== undefined) {
+      const key = JSON.stringify([event.boardId, event.cardId]);
+      const card = target.cards.get(key) ?? {
+        boardId: event.boardId,
+        cardId: event.cardId,
+        totals: usageTotals(),
+        evaluatorWakes: 0,
+        reviewRounds: new Set<number>(),
+      };
+      addUsage(card.totals, event);
+      card.evaluatorWakes += Number(event.role === "evaluator" || event.role === "discussion");
+      if (event.role === "review" && event.reviewRound !== null)
+        card.reviewRounds.add(event.reviewRound);
+      target.cards.set(key, card);
+    }
+  }
+}
+function finishUsage(target: ReturnType<typeof makeUsageAccumulator>): AnalyticsRollup["usage"] {
+  const cards = [...target.cards.values()].map(({ totals, reviewRounds, ...card }) => ({
+    ...card,
+    ...totals,
+    reviewRounds: reviewRounds.size,
+  }));
+  const tie = (a: (typeof cards)[number], b: (typeof cards)[number]) =>
+    a.boardId.localeCompare(b.boardId) || a.cardId.localeCompare(b.cardId);
+  return {
+    totals: target.totals,
+    perModel: [...target.models.values()].map(({ totals, ...model }) => ({ ...model, ...totals })),
+    perRole: [...target.roles].map(([role, totals]) => ({ role, ...totals })),
+    perBoard: [...target.boards].map(([boardId, totals]) => ({ boardId, ...totals })),
+    cards,
+    // Cache and reasoning are subsets of input and output, never added twice.
+    topCardsByTokens: cards
+      .toSorted(
+        (a, b) =>
+          (b.inputTokens ?? 0) +
+            (b.outputTokens ?? 0) -
+            ((a.inputTokens ?? 0) + (a.outputTokens ?? 0)) || tie(a, b),
+      )
+      .slice(0, 20),
+    topCardsByWallMs: cards
+      .toSorted((a, b) => (b.wallMs ?? 0) - (a.wallMs ?? 0) || tie(a, b))
+      .slice(0, 20),
   };
 }

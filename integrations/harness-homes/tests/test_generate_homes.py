@@ -95,14 +95,13 @@ class HarnessTestCase(unittest.TestCase):
             self.assertEqual(shutil.which("quint", path=path.replace("/Users/ardud", str(fixture))), str(link))
             self.assertEqual(path, expected)
             entries = path.split(":")
-            self.assertEqual(entries[:3], [
+            self.assertEqual(entries[:2], [
                 "/Users/ardud/.config/opencode/skills/remote-compute/scripts/blockers",
-                "/Users/ardud/.local/share/harness-hooks/coord-blockers",
                 "/Users/ardud/.local/share/quint-guard/bin",
             ])
             for i, entry in enumerate(entries):
                 if "/.nvm/" in entry:
-                    self.assertGreater(i, 2)
+                    self.assertGreater(i, 1)
                     self.assertLess(i, entries.index("/Users/ardud/.local/bin"))
 
     def test_generated_shared_mcp_connect_headroom(self) -> None:
@@ -1015,7 +1014,7 @@ class ParityTests(HarnessTestCase):
             self.assertIn("recall", {server["id"] for server in parity["mcpServers"]})
             self.assertEqual(parity["runtimeMcpServers"], ["t3-code"])
             self.assertEqual({guard["id"] for guard in parity["guards"]},
-                             {"hook-adapters", "live-database", "rootwide-search", "quint-verify", "offbox", "betterstack-scope", "coord-haiku", "desktop-lease", "recall", "toollog"})
+                             {"hook-adapters", "live-database", "rootwide-search", "quint-verify", "offbox", "betterstack-scope", "desktop-lease", "recall", "toollog"})
             self.assertFalse(parity["compactSkillCatalog"]["required"])
             self.assertEqual(parity["instructions"]["canonical"]["path"], str(self.canonical))
             self.assertFalse((home / "src").exists())

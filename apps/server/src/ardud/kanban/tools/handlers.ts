@@ -8,6 +8,7 @@ import {
   kanbanAskIsNotice,
   ProjectId,
   type KanbanActor,
+  type KanbanBoard,
   type KanbanBlock,
   type KanbanCard,
   type KanbanCardModel,
@@ -18,14 +19,23 @@ import {
 } from "@t3tools/contracts";
 import { resolvedContext } from "../../analytics/McpCall.ts";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as McpDeadline from "../../../mcp/McpDeadline.ts";
 import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import type { EvaluatorPurpose } from "../engine/briefs.ts";
 import { modelSelectionResult } from "../engine/defaults.ts";
 import * as Asks from "../engine/asks.ts";
+import {
+  askGateWarning,
+  gateOf,
+  secretKindApprovalWarning,
+  type SubtaskInput,
+} from "../engine/subtasks.ts";
 import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
 import { cardMatches, isCardNumber } from "../engine/cardSearch.ts";
 import { textProblem } from "../engine/text.ts";
@@ -41,6 +51,35 @@ import { KanbanToolkit, type ModelInput } from "./tools.ts";
 import * as BoardReplies from "../engine/boardReplies.ts";
 import * as Activity from "../engine/activity.ts";
 import * as SavedWrite from "../engine/savedWrite.ts";
+
+const gatedResult = (
+  card: KanbanCard,
+  inputs: ReadonlyArray<SubtaskInput> = [],
+  guessedGates?: KanbanBoard["guessedGates"],
+) => {
+  let nextId = card.subtaskSeq - inputs.filter((input) => !input.id?.trim()).length;
+  const gated = inputs.flatMap((input) => {
+    const id = input.id?.trim() || `s${++nextId}`;
+    const subtask = card.subtasks.find((entry) => entry.id === id);
+    const gate = subtask && gateOf(subtask, guessedGates);
+    return input.gate == null && gate && subtask && subtask.gateSource !== "set"
+      ? [{ id: subtask.id, gate, source: "guessed" as const }]
+      : [];
+  });
+  return {
+    gated,
+    ...(gated.length
+      ? {
+          message: gated
+            .map(
+              ({ id, gate }) =>
+                `${id} got a guessed ${gate} gate from its wording; if that's wrong, pass clearGate with a reason on this id`,
+            )
+            .join("\n"),
+        }
+      : {}),
+  };
+};
 
 const toolFailure = (error: KanbanError) =>
   new OrchestratorMcpFailure({
@@ -448,10 +487,12 @@ const handlers = {
           const rows = Activity.activeCards(read.cards, byCard, window).map((card) =>
             Activity.compactRow(card, byCard.get(card.id) ?? [], window),
           );
+          const at = DateTime.formatIso(yield* DateTime.now);
           return Activity.pageRowsInReply(rows, input.after ?? 0, limit, (cards, cursor) => ({
             board: {
               id: board.id,
               name: board.name,
+              ...BoardReplies.boardReleaseSummary(board, at),
               window,
               legend: Activity.COMPACT_LEGEND,
               activeCards: rows.length,
@@ -470,7 +511,11 @@ const handlers = {
         const cards = snapshot.cards.slice(0, limit);
         return {
           board: {
-            ...BoardReplies.compactBoard({ ...snapshot, cards }),
+            ...BoardReplies.compactBoard(
+              { ...snapshot, cards },
+              undefined,
+              DateTime.formatIso(yield* DateTime.now),
+            ),
             page: { limit, hasMore, nextAfter: hasMore ? cards.at(-1)!.number : null },
           },
           prompts: "omitted; card_get returns a card's prompt",
@@ -593,10 +638,27 @@ const handlers = {
               Effect.catchTags({ KanbanError: () => Effect.succeed(null) }),
             )
           : null;
+        const dependencyBoard =
+          dependency !== null && dependency.boardId !== card.boardId
+            ? ((yield* service.boards).find((board) => board.id === dependency.boardId)?.name ??
+              dependency.boardId)
+            : undefined;
+        const waitTargets =
+          dependency === null
+            ? undefined
+            : new Map([
+                [
+                  dependency.id as string,
+                  {
+                    ...dependency,
+                    ...(dependencyBoard === undefined ? {} : { boardName: dependencyBoard }),
+                  },
+                ],
+              ]);
         const waitMessage =
           card.wait !== undefined &&
           (moved.stage !== card.stage || moved.movedAt !== card.movedAt || moved.wait === undefined)
-            ? `Wait ${waitingFor(card.wait, dependency === null ? undefined : new Map([[dependency.id as string, dependency]]))} ${
+            ? `Wait ${waitingFor(card.wait, waitTargets)} ${
                 moved.wait === undefined
                   ? "cleared by this move; set it again with card_wait or pass keepWait"
                   : "kept"
@@ -628,14 +690,26 @@ const handlers = {
         if (caller.link?.role === "review") {
           return yield* refuse("Review threads put questions in their findings.");
         }
+        const board = (yield* service.boards).find((entry) => entry.id === card.boardId);
         const asked = yield* service.askOwner(
           card.id,
           { ...askFieldsOf(input), question: input.question, blocking: input.blocking ?? false },
           caller.actor,
           isCardThread(caller) ? "cardThread" : "evaluator",
         );
-        // The newest ask is the one just added.
-        return { card: Asks.askSummary(asked, asked.asks.at(-1)?.id ?? "") };
+        const ask = asked.asks.at(-1);
+        const note = ask
+          ? [
+              askGateWarning(asked, ask, board?.guessedGates),
+              secretKindApprovalWarning(asked, ask, board?.guessedGates),
+            ]
+              .filter((warning) => warning !== undefined)
+              .join(" ")
+          : "";
+        return {
+          card: Asks.askSummary(asked, ask?.id ?? ""),
+          ...(note ? { note } : {}),
+        };
       }),
     ),
   ),
@@ -742,6 +816,35 @@ const handlers = {
         yield* ownCard(caller, card);
         const reason = input.stalled ? input.reason?.trim() || "Stalled" : null;
         return { card: yield* service.flagCard(card.id, reason, caller.actor) };
+      }),
+    ),
+  ),
+
+  board_standing_approval: McpToolAccess.actsAsCaller((input) =>
+    withCaller((service, caller) =>
+      Effect.gen(function* () {
+        if (caller.link?.role !== "evaluator")
+          return yield* refuse("Only evaluators grant or revoke standing approvals.");
+        const board = yield* boardFor(service, caller, input.boardId);
+        const card =
+          input.action === "grant" && input.card
+            ? yield* cardFor(service, caller, input.card, input.boardId)
+            : undefined;
+        return yield* service.standingApproval(
+          board.id,
+          {
+            action: input.action,
+            boards: input.boards,
+            quote: input.quote,
+            sourceThreadId: input.sourceThreadId,
+            saidAt: input.saidAt,
+            cardId: card?.id,
+            ask: input.ask,
+            id: input.id,
+            reason: input.reason,
+          },
+          caller.actor,
+        );
       }),
     ),
   ),
@@ -1002,7 +1105,8 @@ const handlers = {
           subtasks: input.subtasks,
         };
         if (input.assignToSelf) {
-          return yield* service.createForThread(caller.threadId, fields);
+          const result = yield* service.createForThread(caller.threadId, fields);
+          return { ...result, ...gatedResult(result.card, input.subtasks, board.guessedGates) };
         }
         if (isWorker && input.stage === "needs_owner") {
           return yield* refuse("Work threads ask the owner with card_ask on their own card.");
@@ -1012,7 +1116,7 @@ const handlers = {
           { ...fields, stage: input.stage, question: input.question ?? null },
           caller.actor,
         );
-        return { card };
+        return { card, ...gatedResult(card, input.subtasks, board.guessedGates) };
       }),
     ),
   ),
@@ -1051,12 +1155,25 @@ const handlers = {
           holdsSlot: next.holdsSlot,
         };
       }),
+    ).pipe(
+      NodeSqliteClient.foregroundReads,
+      McpDeadline.awaitInterruptibly,
+      Effect.timeoutOrElse({
+        duration: "2 seconds",
+        orElse: () => invalid("card_next is busy; retry shortly."),
+      }),
     ),
   ),
 
   card_edit: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
+        if (
+          input.subtasks?.some((subtask) => subtask.clearGate !== undefined) &&
+          (yield* ancestorThreadIds(caller)).length > 0
+        ) {
+          return yield* refuse("only the board evaluator can clear a guessed gate");
+        }
         const card = yield* cardFor(service, caller, input.card, input.boardId);
         const blockedBy = yield* cardIds(service, caller, input.blockedBy, card.boardId);
         const model = input.model ? yield* modelOf(input.model, false) : undefined;
@@ -1086,7 +1203,8 @@ const handlers = {
           },
           caller.actor,
         );
-        return { card: edited };
+        const board = yield* boardFor(service, caller, card.boardId);
+        return { card: edited, ...gatedResult(edited, input.subtasks, board.guessedGates) };
       }),
     ),
   ),
@@ -1095,6 +1213,16 @@ const handlers = {
     withCaller((service, caller) =>
       Effect.gen(function* () {
         const card = yield* cardFor(service, caller, input.card, input.boardId);
+        if (input.state === "skipped" && caller.actor._tag !== "owner") {
+          const subtask = card.subtasks.find((entry) => entry.id === input.subtask);
+          const board = yield* boardFor(service, caller, card.boardId);
+          if (
+            subtask &&
+            gateOf(subtask, board.guessedGates) !== undefined &&
+            (yield* ancestorThreadIds(caller)).length > 0
+          )
+            return yield* refuse("only the board evaluator can skip a gated step");
+        }
         yield* boundCard(caller, card);
         const role =
           caller.link?.role === "work" || caller.link?.role === "review"
@@ -1149,6 +1277,23 @@ const handlers = {
           board.id,
           input.field,
           input.text,
+          card.id,
+          input.ask,
+          caller.actor,
+        );
+      }),
+    ),
+  ),
+
+  board_settings_set: McpToolAccess.actsAsCaller((input) =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const board = yield* boardFor(service, caller, input.boardId);
+        const card = yield* cardFor(service, caller, input.card);
+        return yield* service.applyApprovedSettings(
+          board.id,
+          input.setting,
+          input.value,
           card.id,
           input.ask,
           caller.actor,

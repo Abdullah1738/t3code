@@ -219,7 +219,7 @@ PY
   sudo install -m 0755 "$stage/terraform" /usr/local/bin/terraform
 fi
 hash -r
-for tool in vector aws terraform ruby; do
+for tool in vector aws terraform ruby gh; do
   command -v "$tool" >/dev/null || { echo "offbox: required tool missing on command PATH: $tool" >&2; exit 98; }
 done
 [ -x /usr/bin/ruby ] || { echo 'offbox: required tool missing: /usr/bin/ruby' >&2; exit 98; }

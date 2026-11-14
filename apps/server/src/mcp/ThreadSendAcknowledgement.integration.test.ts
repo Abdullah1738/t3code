@@ -21,10 +21,13 @@ import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
+import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
@@ -61,6 +64,9 @@ it.effect.each([
   "provider acceptance",
   "cross-target conflict",
   "run snapshot",
+  "background reader",
+  "background reader with paced continuation",
+  "receipt replay",
 ] as const)(
   "acknowledges idle sends and bounds a blocked %s without duplicating a retry",
   (blocked) =>
@@ -161,13 +167,17 @@ it.effect.each([
             }),
         };
         const registry = ProviderAdapterRegistry.layerSingle(adapter);
-        const database = Sqlite.layerMemory;
+        const database = blocked.startsWith("background reader")
+          ? Sqlite.layerFromPath(`${cwd}/send.sqlite`).pipe(Layer.provide(NodeServices.layer))
+          : Sqlite.layerMemory;
         const runtime = ProviderReplayHarness.layerWithRegistry(
           { name: `send-ack-${blocked}`, runtimePolicyOverride: { cwd } },
           registry,
           { databaseLayer: database, runEffectWorker: false },
         );
-        const settings = ServerSettings.layerTest();
+        const settings = ServerSettings.layerTest(
+          blocked === "receipt replay" ? { ardudHarnessMigration: { cutoverComplete: true } } : {},
+        );
         const dispatchRuntime = Layer.effect(
           Orchestrator.OrchestratorV2,
           Effect.gen(function* () {
@@ -189,10 +199,15 @@ it.effect.each([
         const threads = ThreadManagementService.layer.pipe(
           Layer.provideMerge(dispatchRuntime),
           Layer.provideMerge(settings),
-          Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(database))),
+          Layer.provideMerge(
+            Layer.mergeAll(CommandReceiptStore.layer, EffectOutbox.layer).pipe(
+              Layer.provide(database),
+            ),
+          ),
           Layer.provideMerge(ThreadCommandExecutor.layer),
         );
         const layer = OrchestratorMcpService.layer.pipe(
+          Layer.provideMerge(database),
           Layer.provideMerge(threads),
           Layer.provide(
             Layer.mergeAll(
@@ -227,6 +242,93 @@ it.effect.each([
             creationSource: "web",
           });
           const request = { threadId, message: "Start the idle child", clientRequestId: "idle" };
+          if (blocked.startsWith("background reader")) {
+            let expectedMessages = 1;
+            if (blocked === "background reader with paced continuation") {
+              const old = yield* service.sendToThread(scope, {
+                ...request,
+                clientRequestId: "before-restart",
+              });
+              yield* orchestrator.dispatch({
+                type: "run.interrupt",
+                commandId: CommandId.make("restart-cut"),
+                threadId,
+                runId: old.runId,
+                fenced: true,
+              });
+              const outbox = yield* EffectOutbox.EffectOutboxV2;
+              yield* outbox.enqueue([
+                {
+                  id: "leftover-paced-continuation",
+                  commandId: CommandId.make("restart-resume"),
+                  threadId,
+                  request: {
+                    type: "provider-runtime.continue",
+                    sourceRunId: old.runId,
+                  },
+                  availableAt: DateTime.add(yield* DateTime.now, { hours: 1 }),
+                },
+              ]);
+              assert.isTrue(yield* outbox.hasPendingRunContinuation(threadId));
+              assert.isUndefined(
+                ThreadManagementService.latestActiveRun(
+                  yield* orchestrator.getThreadProjection(threadId),
+                ),
+              );
+              expectedMessages += 1;
+            }
+            const sql = yield* SqlClient.SqlClient;
+            const held = yield* Deferred.make<void>();
+            const release = yield* Deferred.make<void>();
+            const holder = yield* sql
+              .withTransaction(
+                sql`SELECT 1`.pipe(
+                  Effect.andThen(Deferred.succeed(held, undefined)),
+                  Effect.andThen(Deferred.await(release)),
+                ),
+              )
+              .pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads, Effect.forkChild);
+            yield* Deferred.await(held);
+            // The background transaction stays open until the message is committed.
+            const result = yield* service.sendToThread(scope, { ...request, mode: "queue" });
+            assert.equal(result.delivery, "started");
+            const writerHeld = yield* Deferred.make<void>();
+            const releaseWriter = yield* Deferred.make<void>();
+            const writer = yield* sql
+              .withTransaction(
+                sql`SELECT 1`.pipe(
+                  Effect.andThen(Deferred.succeed(writerHeld, undefined)),
+                  Effect.andThen(Deferred.await(releaseWriter)),
+                ),
+              )
+              .pipe(Effect.forkChild);
+            yield* Deferred.await(writerHeld);
+            const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+            const receipt = yield* receipts
+              .getByCommandId(CommandId.make("command:mcp:send-ack-test:thread-send:idle"))
+              .pipe(NodeSqliteClient.foregroundReads);
+            assert.equal(receipt._tag, "Some");
+            yield* Deferred.succeed(releaseWriter, undefined);
+            yield* Fiber.join(writer);
+            if (receipt._tag === "Some") {
+              const ownCommand = CommandId.make("receipt-in-own-transaction");
+              yield* sql.withTransaction(
+                Effect.gen(function* () {
+                  yield* receipts.insertIfAbsent({ ...receipt.value, commandId: ownCommand });
+                  assert.equal((yield* receipts.getByCommandId(ownCommand))._tag, "Some");
+                }),
+              );
+            }
+            yield* Deferred.succeed(release, undefined);
+            yield* Fiber.join(holder);
+            yield* worker.drain();
+            assert.equal(starts, 1);
+            assert.lengthOf(
+              (yield* orchestrator.getThreadProjection(threadId)).messages,
+              expectedMessages,
+            );
+            return;
+          }
           if (blocked === "cross-target conflict") {
             const other = ThreadId.make("thread:other-send-target");
             yield* orchestrator.dispatch({
@@ -343,6 +445,33 @@ it.effect.each([
             assert.equal(replayed.messageId, steered.messageId);
             assert.lengthOf((yield* orchestrator.getThreadProjection(threadId)).messages, 2);
             return;
+          }
+          if (blocked === "receipt replay") {
+            const locks = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+            const held = yield* Deferred.make<void>();
+            const release = yield* Deferred.make<void>();
+            const holder = yield* locks
+              .withLock(
+                threadId,
+                Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+              )
+              .pipe(Effect.forkChild);
+            yield* Deferred.await(held);
+            const replay = yield* service
+              .sendToThread(scope, request)
+              .pipe(Effect.result, Effect.forkChild);
+            yield* TestClock.adjust("15 seconds");
+            const result = yield* Fiber.join(replay);
+            assert.equal(result._tag, "Failure");
+            if (result._tag === "Failure") {
+              assert.include(
+                result.failure.message,
+                `message replay dispatch for thread ${threadId}`,
+              );
+              assert.notInclude(result.failure.message, "receipt read");
+            }
+            yield* Deferred.succeed(release, undefined);
+            yield* Fiber.join(holder);
           }
           const repeated = yield* service.sendToThread(scope, request);
           assert.equal(repeated.messageId, started.messageId);

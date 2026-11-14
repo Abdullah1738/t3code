@@ -87,7 +87,8 @@ export function toOutbound(message: Json): LineOutbound {
     chat: chatOf(message, false),
     text: str(message.content) ?? "",
     mediaUrl: str(message.media_url),
-    ...(isObject(message.app_card) && str(message.app_card.url) ? { card: { url: str(message.app_card.url)!, layout: storedLayout(message.app_card.layout) } } : {}),
+    ...(isObject(message.app_card) && str(message.app_card.url) ? { card: { url: str(message.app_card.url)!, layout: storedLayout(message.app_card.layout),
+      sessionIdentifier: str(message.app_card.sessionIdentifier), updateMessageHandle: str(message.app_card.updateMessageHandle) } } : {}),
     sentAt: timeMs(message.date_sent) ?? Date.now(),
     status: str(message.status) ?? "",
   };
@@ -201,7 +202,7 @@ export class Sendblue implements Line {
 
   /**
    * `send` marks requests that create a message: a network failure or a 5xx
-   * after the request left may still have sent it (no idempotency key), so the
+   * after the request left may still have sent it, so the
    * error is flagged uncertain for the caller's reconciliation.
    */
   async #call(method: "GET" | "POST" | "DELETE", path: string, options: { query?: Record<string, string>; json?: Json; form?: FormData; send?: boolean; allow404?: boolean } = {}): Promise<unknown> {
@@ -412,6 +413,23 @@ export class Sendblue implements Line {
       send: true,
     });
     return { handle: handleOf(response) };
+  }
+
+  async updateApp(originalHandle: string, card: LineAppCard, key: string): Promise<{ handle: string }> {
+    const text = cardLayout(card);
+    if (!text || !card.imageUrl || !key || key.length > 255) throw new LineError("Invalid app continuation", "invalid_app_card", false, false);
+    try {
+      const response = await this.#call("POST", `/api/messages/${encodeURIComponent(originalHandle)}/update-app-card`, {
+        json: { url: card.url, interactive: false, layout: { ...text, imageUrl: card.imageUrl }, idempotency_key: key }, send: true,
+      });
+      return { handle: handleOf(response) };
+    } catch (error) {
+      // The provider deduplicates continuations by original handle + key, including a lost response.
+      if (error instanceof LineError && (error.code.startsWith("http_409") || error.code.startsWith("http_408"))) {
+        throw new LineError("App continuation is not ready", error.code, true, error.uncertain);
+      }
+      throw error;
+    }
   }
 
   async react(handle: string, reaction: string): Promise<void> {

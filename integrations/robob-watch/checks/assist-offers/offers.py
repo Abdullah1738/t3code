@@ -117,6 +117,15 @@ def read_json(path, default=None):
         return copy.deepcopy(default)
 
 
+if os.environ.get("WATCH_ATTEMPT"):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "helpers"))
+    from watch_admission import admitted_check
+else:
+    def admitted_check(fn):
+        return fn
+
+
+@admitted_check
 def atomic(path, obj):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

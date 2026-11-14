@@ -56,6 +56,17 @@ test("watcher and Telegram loggers share the same private, allowlisted format", 
   expect(statSync(join(dir, `${day()}.ndjson`)).mode & 0o777).toBe(0o600);
 });
 
+test("creator fallbacks retain stable lookup fields and discard arbitrary reasons", () => {
+  const dir = fixture();
+  for (const reason of ["timeout", "exit:1", "exit:127", "invalid", "archived", "private payload", "exit:1 secret"]) {
+    toolLog({ component: "wakes", kind: "error", name: "wake.creator_fallback", ok: false,
+      ids: { watcher: "fixture" }, props: { step: "native", reason, durationMs: 12 } });
+  }
+  const all = rows(dir);
+  expect(all.map(row => row.props.reason)).toEqual(["timeout", "exit:1", "exit:127", "invalid", "archived", undefined, undefined]);
+  expect(all.every(row => row.props.step === "native" && row.props.durationMs === 12)).toBe(true);
+});
+
 test("logging drops IO and serialization failures without raising", () => {
   const dir = fixture(); process.env.TOOLLOG_DIR = join(dir, "blocked"); writeFileSync(process.env.TOOLLOG_DIR, "file");
   expect(() => toolLog({ component: "runner", kind: "event", name: "watch.run" })).not.toThrow();
@@ -165,7 +176,25 @@ test.each(["read", "write", "symlink loop", "non-directory parent"])("rollup %s 
   expect(child.stderr.toString()).toContain("Could not roll up UTC day");
 });
 
-test.skipIf(process.getuid?.() === 0)("an unreadable day file still fails", async () => {
+function canReadMode000(kind: "file" | "directory"): boolean {
+  const root = mkdtempSync(join(tmpdir(), "toollog-permissions-"));
+  const parent = join(root, "parent"), file = join(parent, "probe");
+  mkdirSync(parent); writeFileSync(file, "probe");
+  const target = kind === "file" ? file : parent;
+  try {
+    chmodSync(target, 0o000);
+    try { readFileSync(file); return true; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EACCES") return false;
+      throw error;
+    }
+  } finally {
+    chmodSync(target, kind === "file" ? 0o600 : 0o700);
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test.skipIf(canReadMode000("file"))("an unreadable day file still fails", async () => {
   const dir = fixture(), fixtureDay = "2000-01-01", file = join(dir, `${fixtureDay}.ndjson`);
   writeFileSync(file, ""); chmodSync(file, 0o000);
   expect(await rollup(fixtureDay)).toBeUndefined();
@@ -176,7 +205,7 @@ test.skipIf(process.getuid?.() === 0)("an unreadable day file still fails", asyn
   expect(child.stderr.toString()).toContain("Could not roll up UTC day");
 });
 
-test.skipIf(process.getuid?.() === 0)("a missing log directory beneath an inaccessible parent still fails", async () => {
+test.skipIf(canReadMode000("directory"))("a missing log directory beneath an inaccessible parent still fails", async () => {
   const root = fixture(), parent = join(root, "blocked"), dir = join(parent, "logs"), emptyDay = "2000-01-01";
   mkdirSync(parent); chmodSync(parent, 0o000);
   try {

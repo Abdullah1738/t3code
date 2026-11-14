@@ -336,6 +336,7 @@ export type ThreadManagementError = typeof ThreadManagementError.Type;
 type ThreadManagementFailure = ThreadManagementError | Orchestrator.OrchestratorV2Error;
 
 export interface ThreadManagementServiceShape {
+  readonly promoteQueuedMessages: Orchestrator.OrchestratorV2["Service"]["promoteQueuedMessages"];
   readonly searchThreadStream: (
     input: OrchestrationV2SearchThreadInput,
   ) => Stream.Stream<OrchestrationV2SearchThreadResult, Orchestrator.OrchestratorV2Error>;
@@ -431,6 +432,12 @@ export interface ThreadManagementServiceShape {
    * just refuse a retry the project's settings no longer allow fresh.
    */
   readonly hasReceipt: (commandId: CommandId) => Effect.Effect<boolean>;
+  readonly getDelegationCommandState: (
+    commandId: CommandId,
+  ) => Effect.Effect<
+    CommandReceiptStore.CommandReceiptV2 | { readonly status: "pending" | "never_saved" },
+    CommandReceiptStore.CommandReceiptStoreV2Error
+  >;
   readonly getCommandReceipt: CommandReceiptStore.CommandReceiptStoreV2["Service"]["getByCommandId"];
   readonly findMcpThreadCreations: CommandReceiptStore.CommandReceiptStoreV2["Service"]["findMcpThreadCreations"];
   readonly waitForThread: (
@@ -558,6 +565,31 @@ const make = Effect.gen(function* () {
   // Orchestrator's lock is not reentrant. This separate lock covers the
   // preflight + selection update + send across callers of this service.
   const selectionDispatchLock = yield* KeyedLock.make<ThreadId>();
+  const delegationDispatchLock = yield* KeyedLock.make<CommandId>();
+  const pendingDelegations = yield* Ref.make<ReadonlyMap<CommandId, number>>(new Map());
+  const getDelegationCommandState = Effect.fn("ThreadManagementService.getDelegationCommandState")(
+    function* (commandId: CommandId) {
+      const receipt = yield* receipts.getByCommandId(commandId);
+      if (Option.isSome(receipt)) return receipt.value;
+      if ((yield* Ref.get(pendingDelegations)).has(commandId)) {
+        return { status: "pending" as const };
+      }
+      // Fence the second read against a create starting or finishing after the first read.
+      // The dispatch holds this key through commit and interruption cleanup.
+      return yield* delegationDispatchLock.withLock(
+        commandId,
+        Effect.gen(function* () {
+          const latest = yield* receipts.getByCommandId(commandId);
+          if (Option.isSome(latest)) return latest.value;
+          return {
+            status: (yield* Ref.get(pendingDelegations)).has(commandId)
+              ? ("pending" as const)
+              : ("never_saved" as const),
+          };
+        }),
+      );
+    },
+  );
 
   const assertProviderInstanceEnabled: ThreadManagementServiceShape["assertProviderInstanceEnabled"] =
     (input) =>
@@ -716,7 +748,14 @@ const make = Effect.gen(function* () {
   const dispatchUnchanged = (command: OrchestrationV2ServerCommand) =>
     ensureCommandTranscripts(command).pipe(
       Effect.andThen(assertDispatchTargetEnabled(command)),
-      Effect.andThen(orchestrator.dispatch(command)),
+      Effect.andThen(
+        SendAcknowledgement.waitingOn(
+          orchestrator.dispatch(command),
+          command.type === "message.dispatch"
+            ? `message command admission for thread ${command.threadId}`
+            : "command dispatch",
+        ),
+      ),
     );
 
   const dispatchWithSelectionMigration = Effect.fn(
@@ -740,12 +779,29 @@ const make = Effect.gen(function* () {
             }),
         ),
       );
-    const receipt = yield* readReceipt(receipts.getByCommandId(command.commandId));
-    if (Option.isSome(receipt)) return yield* orchestrator.dispatch(command);
-    const projectReceipt = yield* readReceipt(receipts.getProjectByCommandId(command.commandId));
-    if (Option.isSome(projectReceipt)) return yield* orchestrator.dispatch(command);
+    const receipt = yield* SendAcknowledgement.waitingOn(
+      readReceipt(receipts.getByCommandId(command.commandId)),
+      `command receipt read for thread ${command.threadId}`,
+    );
+    if (Option.isSome(receipt))
+      return yield* SendAcknowledgement.waitingOn(
+        orchestrator.dispatch(command),
+        `message replay dispatch for thread ${command.threadId}`,
+      );
+    const projectReceipt = yield* SendAcknowledgement.waitingOn(
+      readReceipt(receipts.getProjectByCommandId(command.commandId)),
+      `project command receipt read for thread ${command.threadId}`,
+    );
+    if (Option.isSome(projectReceipt))
+      return yield* SendAcknowledgement.waitingOn(
+        orchestrator.dispatch(command),
+        `message replay dispatch for thread ${command.threadId}`,
+      );
 
-    yield* ensureCommandTranscripts(command);
+    yield* SendAcknowledgement.waitingOn(
+      ensureCommandTranscripts(command),
+      `transcript readiness for thread ${command.threadId}`,
+    );
 
     if (options.cutoverComplete && command.modelSelection !== undefined) {
       const reason = postCutoverSelectionProblem(command.modelSelection);
@@ -768,7 +824,10 @@ const make = Effect.gen(function* () {
     }
     if (!options.migrate) return yield* dispatchUnchanged(command);
 
-    const projection = yield* orchestrator.getThreadRecords(command.threadId, []);
+    const projection = yield* SendAcknowledgement.waitingOn(
+      orchestrator.getThreadRecords(command.threadId, []),
+      `provider selection read for thread ${command.threadId}`,
+    );
     const stored = projection.thread.modelSelection;
     const requested = command.modelSelection ?? stored;
     const canonicalize = (selection: ModelSelection) => {
@@ -883,10 +942,31 @@ const make = Effect.gen(function* () {
     // Re-read the target after a selection update and check the actual send,
     // rather than allowing a disabled destination on an inherited command.
     yield* assertDispatchTargetEnabled(nextCommand);
-    return yield* orchestrator.dispatch(nextCommand);
+    return yield* SendAcknowledgement.waitingOn(
+      orchestrator.dispatch(nextCommand),
+      `message command admission for thread ${command.threadId}`,
+    );
   });
 
   const dispatch: ThreadManagementServiceShape["dispatch"] = (command) => {
+    if (command.type === "delegated_task.request") {
+      return Effect.acquireUseRelease(
+        Ref.update(pendingDelegations, (current) => {
+          const next = new Map(current);
+          next.set(command.commandId, (current.get(command.commandId) ?? 0) + 1);
+          return next;
+        }),
+        () => delegationDispatchLock.withLock(command.commandId, dispatchUnchanged(command)),
+        () =>
+          Ref.update(pendingDelegations, (current) => {
+            const next = new Map(current);
+            const remaining = (current.get(command.commandId) ?? 1) - 1;
+            if (remaining === 0) next.delete(command.commandId);
+            else next.set(command.commandId, remaining);
+            return next;
+          }),
+      );
+    }
     if (
       command.type !== "message.dispatch" &&
       command.type !== "thread.model-selection.set" &&
@@ -1497,6 +1577,7 @@ const make = Effect.gen(function* () {
   });
 
   return ThreadManagementService.of({
+    promoteQueuedMessages: orchestrator.promoteQueuedMessages,
     ensureLegacyTranscript,
     searchThreadStream: (input) =>
       Stream.unwrap(
@@ -1550,6 +1631,7 @@ const make = Effect.gen(function* () {
     assertProviderInstanceEnabled,
     isProviderInstanceEnabledForProject,
     hasReceipt,
+    getDelegationCommandState,
     findMcpThreadCreations: receipts.findMcpThreadCreations,
     getCommandReceipt: Effect.fn("ThreadManagementService.getCommandReceipt")(
       receipts.getByCommandId,

@@ -42,9 +42,9 @@ const McpOutcome = Schema.Literals([
   "interrupted_by_shutdown",
 ]);
 const McpPhase = Schema.Literals(["caller", "dispatch", "result", "handler"]);
-export const AnalyticsEvent = Schema.Struct({
+const GeneralEvent = Schema.Struct({
   ts: Timestamp,
-  kind: Label,
+  kind: Label.check(Schema.makeFilter((kind) => kind !== "run.usage")),
   surface: Schema.Literals(["web", "desktop", "mobile", "server"]),
   route: Label,
   boardId: Schema.optionalKey(Id),
@@ -85,6 +85,9 @@ export const AnalyticsEvent = Schema.Struct({
       reasonClass: Schema.optionalKey(Label),
       errorClass: Schema.optionalKey(Label),
       model: Schema.optionalKey(Label),
+      provider: Schema.optionalKey(Label),
+      operation: Schema.optionalKey(Label),
+      exitCode: Schema.optionalKey(Schema.Int),
       kind: Schema.optionalKey(Label),
       ageMs: Schema.optionalKey(Measurement),
       used: Schema.optionalKey(Measurement),
@@ -168,11 +171,37 @@ export const AnalyticsEvent = Schema.Struct({
     }),
   ),
 });
+const ModelId = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4096));
+const TokenCount = Schema.NullOr(
+  Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
+);
+export const RunUsageEvent = Schema.Struct({
+  ...GeneralEvent.fields,
+  kind: Schema.Literal("run.usage"),
+  surface: Schema.Literal("server"),
+  runId: DerivedId,
+  threadId: DerivedId,
+  role: Schema.Literals(["work", "review", "evaluator", "discussion", "delegated", "chat"]),
+  providerInstance: Label,
+  model: ModelId,
+  effort: Schema.NullOr(Label),
+  inputTokens: TokenCount,
+  outputTokens: TokenCount,
+  cachedInputTokens: TokenCount,
+  reasoningTokens: TokenCount,
+  wallMs: Schema.NullOr(Measurement),
+  turnCount: Measurement,
+  endReason: Schema.Literals(["completed", "failed", "interrupted", "cancelled"]),
+  usageStatus: Schema.Literals(["complete", "partial", "unavailable"]),
+  reviewRound: TokenCount,
+});
+export type RunUsageEvent = typeof RunUsageEvent.Type;
+export const AnalyticsEvent = Schema.Union([GeneralEvent, RunUsageEvent]);
 export type AnalyticsEvent = typeof AnalyticsEvent.Type;
 export const AnalyticsIngestInput = Schema.Struct({
   events: Schema.Array(
     Schema.Struct({
-      ...AnalyticsEvent.fields,
+      ...GeneralEvent.fields,
       surface: Schema.Literals(["web", "desktop", "mobile"]),
     }),
   ).check(Schema.isMinLength(1), Schema.isMaxLength(100)),
@@ -190,6 +219,7 @@ export const AnalyticsReadInput = Schema.Struct({
   day: Schema.String.check(Schema.isPattern(/^\d{4}-\d{2}-\d{2}$/)),
   kind: Schema.optionalKey(Label),
   boardId: Schema.optionalKey(Id),
+  cardId: Schema.optionalKey(Id),
   tool: Schema.optionalKey(Label),
   outcome: Schema.optionalKey(McpOutcome),
   limit: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 500 }))),
@@ -202,6 +232,25 @@ const LatencyFields = {
   maxMs: Schema.NullOr(Measurement),
   approximate: Schema.Boolean,
 };
+const UsageTotals = Schema.Struct({
+  runs: Measurement,
+  inputTokens: TokenCount,
+  outputTokens: TokenCount,
+  cachedInputTokens: TokenCount,
+  reasoningTokens: TokenCount,
+  wallMs: Schema.NullOr(Measurement),
+  turnCount: Measurement,
+  completeRuns: Measurement,
+  partialRuns: Measurement,
+  unavailableRuns: Measurement,
+});
+const CardUsage = Schema.Struct({
+  ...UsageTotals.fields,
+  boardId: Id,
+  cardId: Id,
+  evaluatorWakes: Measurement,
+  reviewRounds: Measurement,
+});
 export const AskLatencySplit = Schema.Struct({
   sentToSeen: Schema.Struct(LatencyFields),
   seenToAnswered: Schema.Struct(LatencyFields),
@@ -222,6 +271,20 @@ export const AnalyticsRollup = Schema.Struct({
   total: Measurement,
   invalidLines: Measurement,
   kindCounts: Schema.Record(Label, Measurement),
+  textGenerationOverflow: Schema.optionalKey(Measurement),
+  textGeneration: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        hour: Label,
+        provider: Label,
+        operation: Label,
+        boardId: Schema.NullOr(Id),
+        kind: Schema.Literals(["operation", "child"]),
+        outcome: McpOutcome,
+        ...LatencyFields,
+      }),
+    ),
+  ),
   errorCounts: Schema.Record(Label, Measurement),
   errorsByRoute: Schema.Array(
     Schema.Struct({
@@ -245,7 +308,7 @@ export const AnalyticsRollup = Schema.Struct({
   longTasksByRoute: Schema.Array(
     Schema.Struct({
       route: Label,
-      surface: AnalyticsEvent.fields.surface,
+      surface: GeneralEvent.fields.surface,
       count: Measurement,
       totalMs: Measurement,
       p95Ms: Schema.NullOr(Measurement),
@@ -255,8 +318,28 @@ export const AnalyticsRollup = Schema.Struct({
       approximate: Schema.Boolean,
     }),
   ),
-  topSlowRpcs: Schema.Array(Schema.Struct({ method: Label, ...LatencyFields })),
+  topSlowRpcs: Schema.Array(
+    Schema.Struct({
+      method: Label,
+      ...LatencyFields,
+      totalWaitMs: Schema.optionalKey(Measurement),
+      outcomes: Schema.optionalKey(Schema.Record(Label, Measurement)),
+    }),
+  ),
   askAnswerLatency: Schema.Struct(LatencyFields),
+  usage: Schema.Struct({
+    totals: UsageTotals,
+    perModel: Schema.Array(
+      Schema.Struct({ providerInstance: Label, model: ModelId, ...UsageTotals.fields }),
+    ),
+    perRole: Schema.Array(
+      Schema.Struct({ role: RunUsageEvent.fields.role, ...UsageTotals.fields }),
+    ),
+    perBoard: Schema.Array(Schema.Struct({ boardId: Id, ...UsageTotals.fields })),
+    cards: Schema.Array(CardUsage),
+    topCardsByTokens: Schema.Array(CardUsage),
+    topCardsByWallMs: Schema.Array(CardUsage),
+  }),
   boards: Schema.Array(
     Schema.Struct({
       boardId: Id,

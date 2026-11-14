@@ -110,9 +110,9 @@ class CollectorFairnessTests(unittest.TestCase):
         self.assertEqual(seen[0],str(roots[2]))
         self.assertEqual(set(seen),set(map(str,roots)))
         self.assertGreaterEqual(len(seen),len(roots))
-        turns = self.rows('disk.inventory.turn')
-        self.assertEqual(turns[0]['props']['source'],str(roots[2]))
-        self.assertEqual(turns[0]['props']['turn'],1)
+        summaries = self.rows('disk.inventory.root')
+        self.assertEqual(summaries[0]['props']['root'],str(roots[2]))
+        self.assertEqual(len(summaries),len(roots)**2)
 
     def test_failed_unmeasured_root_cannot_starve_other_unmeasured_roots(self):
         roots = self.inventory_roots()
@@ -155,6 +155,7 @@ class CollectorFairnessTests(unittest.TestCase):
             state = jobs.read_state('disk-inventory')
             self.assertEqual(state['sizes'][str(root)],4*42*1024)
             fail[0] = True
+            now[0] += 86400
             clock[0] = 0
             jobs.directory_inventory([root],run,deadline=15)
         state = jobs.read_state('disk-inventory')

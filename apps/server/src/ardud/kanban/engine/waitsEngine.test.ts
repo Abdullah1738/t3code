@@ -31,6 +31,8 @@ import * as Tracer from "effect/Tracer";
 
 import {
   KANBAN_BACKLOG,
+  KanbanBoardId,
+  KanbanCardId,
   KanbanCard,
   KanbanCardDetail,
   KanbanCardEvent,
@@ -133,6 +135,11 @@ const makeWorld = (
     ended: { id: string; done: Deferred.Deferred<void> } | null;
   } = { fail: null, failAttached: null, ended: null };
   const toldWaiters = new Map<string, Deferred.Deferred<void>>();
+  const ticking: { board: string | null; cardReads: string[]; listedBoards: string[] } = {
+    board: null,
+    cardReads: [],
+    listedBoards: [],
+  };
   const waitForTold = (id: KanbanCard["id"]) =>
     Effect.gen(function* () {
       const done = yield* Deferred.make<void>();
@@ -198,7 +205,20 @@ const makeWorld = (
                     : Effect.void,
                 ),
               ),
-        boards: beforeRead(true).pipe(Effect.andThen(store.boards)),
+        card: (id) =>
+          Effect.sync(() => ticking.cardReads.push(id)).pipe(Effect.andThen(store.card(id))),
+        cards: (id) =>
+          Effect.sync(() => ticking.listedBoards.push(id)).pipe(Effect.andThen(store.cards(id))),
+        openCards: (id) =>
+          Effect.sync(() => ticking.listedBoards.push(id)).pipe(
+            Effect.andThen(store.openCards(id)),
+          ),
+        boards: beforeRead(true).pipe(
+          Effect.andThen(store.boards),
+          Effect.map((boards) =>
+            ticking.board === null ? boards : boards.filter((board) => board.id === ticking.board),
+          ),
+        ),
         board: (id) => beforeRead(false).pipe(Effect.andThen(store.board(id))),
       });
     }),
@@ -231,6 +251,7 @@ const makeWorld = (
     KanbanThreads,
     KanbanThreads.of({
       pendingUserInputs: () => Effect.succeed([]),
+      claimContext: () => Effect.succeed(null),
       view,
       find: view,
       lastFailure: () => Effect.succeed(null),
@@ -274,6 +295,7 @@ const makeWorld = (
           const thread = threads.get(threadId);
           if (thread) threads.set(threadId, { ...thread, model });
         }),
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
@@ -380,6 +402,7 @@ const makeWorld = (
     reading,
     closing,
     saving,
+    ticking,
     waitForTold,
     layer,
     /** Messages anywhere that include `text`. */
@@ -696,6 +719,163 @@ it.effect("card: the worker starts when the card it waited on is done", () =>
       assert.include(briefOf(world, woken), `Card #${first.number} is done`);
     }),
   ),
+);
+
+it.effect.each(["work", "review", "evaluator"] as const)(
+  "cross-board card waits hold and wake %s",
+  (wakeRole) =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, store, board } = yield* setup;
+        const foreign = yield* kanban.ensureBoard({
+          slug: "foreign",
+          name: "Foreign",
+          defaultProjectId: null,
+        });
+        world.ticking.board = board.id;
+        const target = yield* placed(foreign, "Foreign dependency", { stage: "in_review" });
+        const dependent = yield* placed(board, "Waiting worker");
+        // Seed the persisted wait to exercise planning independently of waitCard's guard.
+        yield* store.putCard({
+          ...dependent,
+          wait: Waits.newWait(
+            { on: "card", card: target, note: "foreign dependency", wakeRole },
+            owner,
+            iso(T0),
+          ),
+        });
+        const sibling = yield* placed(board, "Same foreign dependency");
+        yield* store.putCard({ ...sibling, wait: (yield* cardOf(dependent.id)).wait! });
+        world.ticking.cardReads = [];
+        world.ticking.listedBoards = [];
+        yield* kanban.tick;
+        // LockedStore.card reads ownership, then the guarded row: two raw reads for one lookup.
+        assert.strictEqual(world.ticking.cardReads.filter((id) => id === target.id).length, 2);
+        assert.isTrue(world.ticking.listedBoards.every((id) => id === board.id));
+        assert.isDefined((yield* cardOf(dependent.id)).wait);
+        assert.strictEqual(world.cardThreads(), 0);
+
+        yield* store.putCard({ ...(yield* cardOf(target.id)), stage: "completed" });
+        yield* kanban.tick;
+        const woken = yield* cardOf(dependent.id);
+        assert.isUndefined(woken.wait);
+        if (wakeRole === "evaluator") {
+          yield* world.waitForTold(dependent.id);
+          assert.isAbove(world.toldEvaluator(`Card #${target.number}`), 0);
+          assert.strictEqual(woken.boardId, board.id);
+        } else {
+          assert.strictEqual(woken.activeRole, wakeRole);
+          assert.include(briefOf(world, woken), `Card #${target.number}`);
+        }
+        assert.isTrue(
+          (yield* eventsOf(dependent.id)).some(
+            (event) => Waits.waitEventOf(event) === "end" && event.body?.includes("is done"),
+          ),
+        );
+      }),
+    ),
+);
+
+it.effect("waitCard accepts a cross-board target and refuses a nonexistent target", () =>
+  inWorld(() =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      const foreign = yield* kanban.ensureBoard({
+        slug: "foreign",
+        name: "Foreign",
+        defaultProjectId: null,
+      });
+      const target = yield* placed(foreign, "Foreign dependency", { stage: "in_review" });
+      const dependent = yield* placed(board, "Dependent");
+      const waiting = yield* kanban.waitCard(
+        dependent.id,
+        { on: "card", card: target.id, note: "foreign dependency", wakeRole: "work" },
+        owner,
+      );
+      assert.strictEqual(waiting.wait?.card, target.id);
+      assert.strictEqual((yield* cardOf(dependent.id)).wait?.wakeRole, "work");
+      const missing = yield* Effect.result(
+        kanban.waitCard(
+          dependent.id,
+          { on: "card", card: KanbanCardId.make("missing-card"), note: "missing" },
+          owner,
+        ),
+      );
+      assert.isTrue(Result.isFailure(missing));
+      assert.strictEqual((yield* cardOf(dependent.id)).wait?.card, target.id);
+    }),
+  ),
+);
+
+it.effect("card changes carry foreign wait target metadata without persisting it", () =>
+  inWorld(() =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      const foreign = yield* kanban.ensureBoard({
+        slug: "foreign",
+        name: "Foreign",
+        defaultProjectId: null,
+      });
+      const target = yield* placed(foreign, "Dependency", { stage: "in_review" });
+      const dependent = yield* placed(board, "Dependent");
+      const changes = yield* kanban.changes;
+      yield* kanban.waitCard(
+        dependent.id,
+        { on: "card", card: target.id, note: "dependency" },
+        owner,
+      );
+      const changed = yield* Stream.runHead(
+        changes.pipe(
+          Stream.filter(
+            ({ change }) =>
+              change._tag === "card" &&
+              change.card.id === dependent.id &&
+              change.card.wait?.on === "card",
+          ),
+        ),
+      );
+      assert.isTrue(Option.isSome(changed));
+      if (Option.isSome(changed) && changed.value.change._tag === "card") {
+        assert.deepStrictEqual(changed.value.change.card.wait?.cardTarget, {
+          id: target.id,
+          number: target.number,
+          boardId: foreign.id,
+          boardName: "Foreign",
+        });
+      }
+      assert.isUndefined((yield* store.card(dependent.id))?.wait?.cardTarget);
+    }).pipe(Effect.scoped),
+  ),
+);
+
+it.effect.each(["archived", "deleted"] as const)(
+  "waitCard refuses a target on an %s board",
+  (state) =>
+    inWorld(() =>
+      Effect.gen(function* () {
+        const { kanban, store, board } = yield* setup;
+        const foreign = yield* kanban.ensureBoard({
+          slug: "foreign",
+          name: "Foreign",
+          defaultProjectId: null,
+        });
+        const target = yield* placed(foreign, "Foreign dependency", { stage: "in_review" });
+        const dependent = yield* placed(board, "Dependent");
+        if (state === "archived")
+          yield* store.putBoard({ ...foreign, archivedAt: iso(T0) as never });
+        else yield* store.putCard({ ...target, boardId: KanbanBoardId.make("deleted-board") });
+        const result = yield* Effect.result(
+          kanban.waitCard(
+            dependent.id,
+            { on: "card", card: target.id, note: "foreign dependency" },
+            owner,
+          ),
+        );
+        assert.isTrue(Result.isFailure(result));
+        if (Result.isFailure(result)) assert.include(result.failure.message, state);
+        assert.isUndefined((yield* cardOf(dependent.id)).wait);
+      }),
+    ),
 );
 
 it.effect.each(["thread", "pr"] as const)("local waits end before a stalled %s read", (blockedAt) =>
@@ -2444,7 +2624,7 @@ it.effect.each(["completed", "deployed"] as const)(
           const restarted = yield* KanbanService.KanbanService;
           yield* restarted.tick;
         }).pipe(Effect.provide(KanbanService.layer));
-        assert.deepStrictEqual((yield* cardOf(card.id)).wait, moved.wait);
+        assert.deepStrictEqual((yield* store.card(card.id))?.wait, moved.wait);
         yield* store.putCard({ ...(yield* cardOf(dependency.id)), stage: "completed" });
         yield* kanban.tick;
         yield* world.waitForTold(card.id);

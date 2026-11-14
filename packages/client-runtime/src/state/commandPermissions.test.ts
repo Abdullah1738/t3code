@@ -8,6 +8,8 @@ import { it } from "@effect/vitest";
 import { vi, afterEach, describe, expect } from "vite-plus/test";
 import {
   AuthOrchestrationOperateScope,
+  KANBAN_WS_METHODS,
+  KanbanBoardId,
   AuthPreviewOperateScope,
   AuthSettingsWriteScope,
   AuthSourceControlWriteScope,
@@ -71,6 +73,36 @@ const setup = Effect.gen(function* () {
 });
 
 describe("command permissions", () => {
+  it.effect(
+    "requires the destination grant to revoke a standing approval and rechecks revocation",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const registry = yield* setup;
+          const revoke = createCommandPermissions(
+            runtime,
+            KANBAN_WS_METHODS.standingApprovalRevoke,
+          );
+          const input = {
+            boardId: KanbanBoardId.make("board-toy"),
+            id: "sa-one",
+            reason: "Withdrawn",
+          };
+          registry.set(sessions(env), AsyncResult.success(grant(true)));
+          registry.set(sessions(other), AsyncResult.success(grant(false)));
+          expect(registry.get(revoke.permissionAtom(env, input))).toBe(true);
+          yield* revoke.authorize(registry, env, input);
+          expect(yield* revoke.authorize(registry, other, input).pipe(Effect.flip)).toMatchObject({
+            _tag: "EnvironmentAuthorizationError",
+          });
+          registry.set(sessions(env), AsyncResult.success(grant(false)));
+          expect(registry.get(revoke.permissionAtom(env, input))).toBe(false);
+          expect(yield* revoke.authorize(registry, env, input).pipe(Effect.flip)).toMatchObject({
+            _tag: "EnvironmentAuthorizationError",
+          });
+        }),
+      ),
+  );
   it.effect("requires analytics' destination grant and rechecks revocation", () =>
     Effect.scoped(
       Effect.gen(function* () {
