@@ -5844,6 +5844,131 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
                 with self.subTest(command=command):
                     self.assertEqual(self.classify(command), SCRIPT)
 
+    def fixture_wrapper_commands(self):
+        script, root = 'tmp/fixture.sh', str(self.root)
+        return (
+            f'bash {script} | tail -3', f'bash {script} 2>&1 | tail -n 3', f'bash {script} | tail -n3',
+            f'bash {script} 2>&1 | head -5', f'bash {script} | grep -v noise',
+            f'bash {script} 2>&1 | grep -Ei "pass|fail" | tail -5', f"bash {script} | grep -E 'ok|FAIL'",
+            f'bash {script}; echo "exit=$?"', f'bash {script}; echo $?', f'bash {script} && echo ok',
+            f'bash {script} 2>&1 | tail -5; echo "exit=$?"',
+            f'cd {root} && bash {script}', f'cd {root} && bash {script} 2>&1 | tail -3',
+            'cd ./tmp && bash fixture.sh | tail -3', f'cd ./tmp && bash {root}/{script} && echo ok',
+            # Quoted punctuation keeps a whole pattern literal, globs included.
+            f'bash {script} 2>&1 | grep -E "PASS|FAIL.*" | tail -5', f"bash {script} | grep -v '[x]|y*'",
+            f"bash {script} | grep 'files/*'", f'bash {script} | grep "files/[ab]"',
+            f'/bin/bash {root}/{script} 2>&1 | tail -3',
+            f'offbox run -- bash {script} 2>&1 | tail -3', f'offbox run --bg -- bash {script}; echo $?',
+        )
+
+    def test_fixture_wrappers_keep_fixture_proof(self):
+        # Agents pipe test runs into tail or cd first; the run is unchanged.
+        self.write_plain_subpath_fixture()
+        original = (self.root / 'tmp/fixture.sh').read_text()
+        _, _, inherited = self.repo_node_pin()
+        for label, environment in (('no-bash-env', {}), ('inherited-bash-env', inherited)):
+            with patch.dict(os.environ, environment):
+                self.write('tmp/fixture.sh', original)
+                for command in self.fixture_wrapper_commands():
+                    with self.subTest(case=label, command=command):
+                        self.assertIsNone(self.classify(command))
+                # The same wrappers never excuse a fixture that reads a live path.
+                self.write('tmp/fixture.sh', original + '\ncat "' + LIVE + '"\n')
+                for command in self.fixture_wrapper_commands():
+                    with self.subTest(case=label + ':live-fixture', command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_fixture_wrapper_refusals(self):
+        self.write_plain_subpath_fixture()
+        _, _, inherited = self.repo_node_pin()
+        run, root = 'bash tmp/fixture.sh', str(self.root)
+        live = '~/' + '.ro' + 'bob/userdata/' + 'state' + 'v2.sqlite'
+        rows = [
+            # Other stages, redirects, substitutions, background, statements.
+            run + ' | tee out', run + ' | sh', run + ' | xargs cat', run + ' > out', run + ' 2>&1 > out',
+            run + ' | tail -3 > out 2>&1', run + ' | grep -f file', run + ' | grep --file=file x',
+            run + ' | grep -e x', run + ' | grep -r x', run + ' | grep x file', run + ' | tail 3', run + ' | tail -f',
+            run + ' | head -c 5', run + ' | tail -3 | head -2 | grep x', run + ' |& tail -3', run + ' 2 >&1 | tail',
+            run + ' x | tail -3', run + ' &', run + ' | tail -3 &', run + ' | grep &', run + ' | grep -v ;',
+            '(' + run + ') | tail -3', run + ' || echo ok', run + '; echo ok', run + '; echo $HOME',
+            run + ' && echo $(id)', run + ' | grep "$(id)"', run + ' | grep "`id`"', run + ' | grep "$X"',
+            run + ' | grep "a|$X"', run + ' $(id) | tail -3',
+            run + ' | tail -3 # comment', run + ' | tail -3\nls', run + ' | tail -3; ls', 'ls; ' + run, 'ls tmp/; ' + run,
+            # Only one literal, anchored cd.
+            'cd "$X" && ' + run, 'cd - && ' + run, 'cd tmp && bash fixture.sh',
+            'cd ' + root + ' && cd ' + root + ' && ' + run, 'cd /tm* && ' + run, 'CDPATH=' + root + ' cd ./tmp && bash fixture.sh',
+            'cd ./tmp; bash fixture.sh', 'pushd ' + root + ' && ' + run, 'cd ' + root + ' && offbox run -- ' + run,
+            # `..` in a cd target: Bash's logical cd and the resolved path differ.
+            'cd ../' + self.root.name + ' && ' + run, 'cd ./tmp/.. && ' + run, 'cd ' + root + '/tmp/.. && ' + run,
+            # Unquoted expansion turns one pattern into pattern + file operands.
+            run + ' | grep files/*', run + ' 2>&1 | grep -v files/? | tail -3', run + ' | grep files/[ab]',
+            run + ' | grep {x,files/b}', run + ' | grep ~', run + ' | grep -E files/*',
+            "bash tmp/fixture.s? | tail -3", "bash tmp/{fixture.sh,x} | tail -3",
+            # Quoting only part of the pattern leaves the rest to expand.
+            run + ' | grep files/"*"x*', run + " | grep 'a'\"b\"*",
+            # A live read in a later stage is refused on its own.
+            run + ' | grep x ' + live, run + ' | tail -3; cat ' + live,
+        ]
+        # The glob's second match is a protected-path marker.
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        self.write('files/a', '')
+        (self.root / 'files/b').symlink_to(marker)
+        for label, environment in (('no-bash-env', {}), ('inherited-bash-env', inherited)):
+            with patch.dict(os.environ, environment):
+                for command in rows:
+                    with self.subTest(case=label, command=command):
+                        self.assertIsNotNone(self.classify(command))
+        # `~` follows HOME; point it at the fixture's parent so the cd lands.
+        tilde = 'cd ~/' + self.root.name + ' && ' + run
+        with patch.dict(os.environ, {'HOME': str(self.root.parent)}):
+            self.assertEqual(self.classify(tilde), SCRIPT)
+        rows.append(tilde)
+        # The grammar itself rejects each row, except where only the run
+        # check refuses: an extra script argument, and a cd before offbox,
+        # whose remote cwd the proof does not follow.
+        passes_grammar = {run + ' x | tail -3': (None, ['bash', 'tmp/fixture.sh', 'x']),
+                          'cd ' + root + ' && offbox run -- ' + run: (root, ['offbox', 'run', '--', 'bash', 'tmp/fixture.sh'])}
+        for command in rows + ['$(echo bash) tmp/fixture.sh | tail -3']:
+            with self.subTest(grammar=command):
+                self.assertEqual(guard._fixture_wrapped_invocation(command), passes_grammar.get(command))
+
+    def test_fixture_wrapper_cd_reproves_selector_inputs(self):
+        # A cd moves the selector walk; both the target and the caller's
+        # starting cwd must be clean.
+        self.write_plain_subpath_fixture()
+        _, _, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        for directory in ('good', 'bad'):
+            (self.root / directory).mkdir()
+        (self.root / 'bad/.nvmrc').symlink_to(marker)
+        good, bad = str(self.root / 'good'), str(self.root / 'bad')
+        with patch.dict(os.environ, environment):
+            self.assertIsNone(guard.classify(f'cd {good} && bash ../tmp/fixture.sh | tail -3', str(self.root)))
+            self.assertEqual(guard.classify(f'cd {bad} && bash ../tmp/fixture.sh | tail -3', str(self.root)), SCRIPT)
+            self.assertEqual(guard.classify(f'cd {good} && bash ../tmp/fixture.sh | tail -3', bad), SCRIPT)
+            self.assertEqual(guard.classify('bash ../tmp/fixture.sh | tail -3', bad), SCRIPT)
+        # Without BASH_ENV there is no selector, so the cd target is all that moves.
+        self.assertIsNone(guard.classify(f'cd {good} && bash ../tmp/fixture.sh | tail -3', bad))
+
+    def test_fixture_wrapper_cd_logical_parent(self):
+        # Bash's logical cd resolves `alias/..` to start/bad, not the parent of
+        # alias's physical target; start/bad's selector input must not be missed.
+        self.write_plain_subpath_fixture()
+        _, _, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        (self.root / 'physical/deep').mkdir(parents=True)
+        (self.root / 'start/bad').mkdir(parents=True)
+        (self.root / 'start/bad/alias').symlink_to(self.root / 'physical/deep')
+        (self.root / 'start/bad/.nvmrc').symlink_to(marker)
+        start, fixture = str(self.root / 'start'), str(self.root / 'tmp/fixture.sh')
+        with patch.dict(os.environ, environment):
+            for target in ('./bad/alias/..', start + '/bad/alias/..', './bad/alias/../alias/..'):
+                with self.subTest(target=target):
+                    self.assertEqual(guard.classify(f'cd {target} && bash {fixture} | tail -3', start), SCRIPT)
+            # A symlinked target is walked on both its logical and physical chains.
+            self.assertEqual(guard.classify(f'cd ./bad/alias && bash {fixture} | tail -3', start), SCRIPT)
+            self.assertIsNone(guard.classify(f'cd {self.root}/physical/deep && bash {fixture} | tail -3', start))
+
     def test_repo_node_pin_hashes_cover_fork_helpers(self):
         # Editing local-helpers' repo-node-pin turns the fixture proof off
         # until the guard reviews and pins the new bytes.

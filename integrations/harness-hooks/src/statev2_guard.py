@@ -3149,6 +3149,96 @@ def _attached_script_operand(word, binary):
     return value if equal and flag in options else word
 
 
+FIXTURE_STATUS_ECHOES = ([';', 'echo', 'exit=$?'], [';', 'echo', '$?'], ['&&', 'echo', 'ok'])
+# Unquoted, these expand to several words: `grep files/*` gains file operands.
+FIXTURE_EXPANSION = re.compile(r'[*?\[\]{}~]')
+
+
+def _fixture_output_filter(words, raws, quoted):
+    if words[0] in {'tail', 'head'}:
+        return (len(words) == 2 and re.fullmatch(r'-n?\d+', words[1]) is not None or
+                len(words) == 3 and words[1] == '-n' and words[2].isdigit())
+    if words[0] == 'grep' and len(words) >= 2:
+        *options, pattern = words[1:]
+        # Only one wholly quoted word stays literal; unquoted, `files/*` or
+        # `{a,b}` becomes a pattern plus file operands.
+        if pattern in quoted:
+            pattern = quoted[pattern]
+        elif not re.fullmatch(r"'[^']*'|\"[^\"$`]*\"", raws[-1]) and FIXTURE_EXPANSION.search(pattern):
+            return False
+        return (all(re.fullmatch(r'-[Eiv]+', option) for option in options) and
+                not pattern.startswith('-') and not re.search(r'[$`\0]', pattern) and
+                not re.fullmatch(r'[;&|(){}\n<>]+', pattern))
+    return False
+
+
+def _fixture_wrapped_invocation(command):
+    """Strip the closed set of wrappers agents put around a test run.
+
+    Accepted: one leading `cd <literal> &&` without `..`, a `2>&1` on the
+    run, up to two `| tail/head -N` or `| grep [-Eiv] <pattern>` stages that
+    take no file operand, and a trailing status echo. Returns (cd target or
+    None, run words). Anything else returns None: a substitution, escape,
+    comment, other operator, unquoted expansion, or quoted punctuation
+    outside a whole grep pattern. The walker still scans every stage on its
+    own, so this only decides whether the run is the command's whole effect.
+    """
+    if re.search(r'[\\#`\0\n\r]', command):
+        return None
+    masked, quoted = _quoted_punctuation(command)
+    if any(re.search(r'[$`]', value) for value in quoted.values()):
+        return None
+    # The non-POSIX pass keeps each word's quotes; both passes must agree on
+    # word boundaries for a quote to count.
+    lexed = []
+    for posix in (True, False):
+        lexer = shlex.shlex(masked, posix=posix, punctuation_chars=';&|(){}\n<>')
+        lexer.whitespace_split = True
+        lexer.commenters = ''
+        try:
+            lexed.append(list(lexer))
+        except ValueError:
+            return None
+    tokens, raws = lexed
+    if len(tokens) != len(raws):
+        return None
+    target = None
+    if tokens[:1] == ['cd']:
+        if len(tokens) < 4 or tokens[2] != '&&':
+            return None
+        target = tokens[1]
+        # Absolute or ./-anchored only: bare names follow CDPATH. Bash's
+        # logical cd drops `..` against $PWD, not the resolved directory.
+        if (not re.fullmatch(r'(?:/|\./)[^$`*?\[\]{}~\s\0]*', target) or
+                '..' in target.split('/')):
+            return None
+        tokens, raws = tokens[3:], raws[3:]
+    for suffix in FIXTURE_STATUS_ECHOES:
+        if tokens[-3:] == suffix:
+            tokens, raws = tokens[:-3], raws[:-3]
+            break
+    stages, stage = [], []
+    for token, raw in zip(tokens, raws):
+        if token == '|':
+            stages.append(stage)
+            stage = []
+        else:
+            stage.append((token, raw))
+    stages.append(stage)
+    run, filters = [word for word, _ in stages[0]], stages[1:]
+    if run[-3:] == ['2', '>&', '1']:
+        if masked.count('>&') != 1 or not re.search(r'(?<=[ \t])2>&1(?=[ \t]*(?:\||;|&&|$))', masked):
+            return None
+        run = run[:-3]
+    if len(filters) > 2 or not all(stage and _fixture_output_filter([word for word, _ in stage], [raw for _, raw in stage], quoted)
+                                   for stage in filters):
+        return None
+    if not run or any(re.fullmatch(r'[;&|(){}\n<>]+', word) or re.search(r'[$\0]', word) or
+                      FIXTURE_EXPANSION.search(word) for word in run):
+        return None
+    return target, run
+
+
 def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None, _environment=None, _opaque=None, _preservation=True, _budget=None, _glob_writes=None, _cwd_candidates=None) -> list[Path]:
     """Resolve bounded shell paths and inspect sources without executing them."""
     paths = []
@@ -4433,6 +4523,22 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 raise LiveRead('live-database-script', f"{path}:1 has an unsafe output redirect.")
             plain = proof_command[:redirect.start()] if redirect else proof_command
             invocation = _fixture_invocation(plain)
+            wrapped = None if redirect or invocation else _fixture_wrapped_invocation(plain)
+            if wrapped is not None:
+                target, run = wrapped
+                invocation = _fixture_invocation(shlex.join(run))
+                # The walker resolved this cd; the proof must run where it
+                # landed. select.py walks $PWD, which keeps a symlinked
+                # target's logical path, and the caller's shell started in cwd.
+                logical = os.path.normpath(os.path.join(str(cwd), target)) if cwd is not None and target is not None else None
+                if target is not None and (
+                        caller_command is not None or 'offbox' in map(os.path.basename, run) or
+                        cwd is None or directory is None or
+                        os.path.realpath(logical) != os.path.realpath(directory) or
+                        any(os.environ.get(name) and not (inherited_startup_safe(name, str(cwd)) and
+                                                          inherited_startup_safe(name, logical))
+                            for name in ('BASH_ENV', 'ENV'))):
+                    invocation = []
         except ValueError:
             invocation = []
         shell = (binary in {'bash', 'sh', 'zsh', 'dash', 'ksh'} and len(invocation) == 2 and
