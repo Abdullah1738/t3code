@@ -1,0 +1,117 @@
+#!/usr/bin/perl
+# GNU-style timeout(1) for macOS, which ships none: agents write `timeout 40 cmd` out of Linux habit.
+#   timeout [-s SIG] [-k DUR] [--preserve-status] [--foreground] [-v] DURATION CMD [ARG]...
+# DURATION is a number with an optional s/m/h/d suffix; 0 means no limit.
+# Exit: 124 timed out, 125 timeout failed, 126 CMD can't run, 127 CMD not found,
+# 137 CMD needed KILL (-s KILL or -k), else CMD's own status.
+use strict;
+use warnings;
+use Config;
+use Getopt::Long qw(GetOptionsFromArray);
+use POSIX qw(:sys_wait_h setpgid _exit);
+use Time::HiRes ();
+
+sub fail { print STDERR "timeout: $_[0]\n"; exit 125 }
+
+sub usage {
+  my $fh = $_[0] ? \*STDOUT : \*STDERR;
+  print $fh "usage: timeout [-s SIG] [-k DURATION] [--preserve-status] [--foreground] [-v] DURATION COMMAND [ARG]...\n";
+  exit($_[0] ? 0 : 125);
+}
+
+sub seconds {
+  my ($text) = @_;
+  $text =~ /^\s*(\d+(?:\.\d*)?|\.\d+)([smhd]?)\s*$/ or fail("invalid time interval '$text'");
+  my $n = $1 * { '' => 1, s => 1, m => 60, h => 3600, d => 86400 }->{$2};
+  # setitimer rejects more than 1e8 s on macOS; that is over three years anyway.
+  return $n > 1e8 ? 1e8 : $n;
+}
+
+my (%num, %name);
+{
+  my @names = split ' ', $Config{sig_name};
+  my @nums = split ' ', $Config{sig_num};
+  for my $i (0 .. $#names) {
+    $num{ $names[$i] } //= $nums[$i];
+    $name{ $nums[$i] } //= $names[$i];
+  }
+}
+
+sub signum {
+  my ($text) = @_;
+  return $text if $text =~ /^\d+$/ && exists $name{$text} && $text > 0;
+  (my $bare = uc $text) =~ s/^SIG//;
+  return $num{$bare} if $bare ne 'ZERO' && exists $num{$bare};
+  fail("invalid signal '$text'");
+}
+
+my %opt = (signal => 'TERM');
+Getopt::Long::Configure(qw(bundling require_order no_ignore_case no_auto_abbrev));
+GetOptionsFromArray(\@ARGV, \%opt,
+  's|signal=s', 'k|kill-after=s', 'preserve-status', 'foreground', 'v|verbose', 'help', 'version')
+  or usage(0);
+usage(1) if $opt{help};
+if ($opt{version}) { print "timeout (local-helpers shim) 1.0\n"; exit 0 }
+usage(0) if @ARGV < 2;
+
+my $sig = signum($opt{s} // $opt{signal});
+my $kill_after = defined $opt{k} ? seconds($opt{k}) : 0;
+my $limit = seconds(shift @ARGV);
+my @cmd = @ARGV;
+
+# Without --foreground the command gets its own process group and the signal goes to the whole group,
+# so a grandchild holding the caller's pipe dies too (GNU does the same).
+my $group = !$opt{foreground};
+my $pid = fork // fail("fork failed: $!");
+if ($pid == 0) {
+  setpgid(0, 0) if $group;
+  $SIG{$_} = 'DEFAULT' for qw(ALRM TERM INT HUP QUIT);
+  { no warnings 'exec'; exec { $cmd[0] } @cmd; }
+  my $err = $!;
+  print STDERR "timeout: failed to run command '$cmd[0]': $err\n";
+  _exit($!{ENOENT} ? 127 : 126);
+}
+# Also from this side: the alarm may fire before the child has run its own setpgid.
+setpgid($pid, $pid) if $group;
+
+my ($timed_out, $killing) = (0, 0);
+sub send_sig {
+  my ($s) = @_;
+  printf STDERR "timeout: sending signal %s to command '%s'\n", $name{$s}, $cmd[0] if $opt{v};
+  my $target = $group ? -$pid : $pid;
+  kill $s, $target;
+  # A stopped command only sees the signal once it is continued.
+  kill 'CONT', $target unless $s == $num{KILL} || $s == $num{CONT};
+}
+sub arm_kill {
+  return unless $kill_after > 0 && !$killing;
+  $killing = 1;
+  $SIG{ALRM} = sub { send_sig($num{KILL}) };
+  Time::HiRes::alarm($kill_after);
+}
+# Forward the signals a caller uses to stop us, so the command doesn't outlive timeout.
+for my $s (qw(TERM INT HUP QUIT)) {
+  $SIG{$s} = sub { send_sig($num{$s}); arm_kill() };
+}
+$SIG{ALRM} = sub { $timed_out = 1; send_sig($sig); arm_kill() };
+Time::HiRes::alarm($limit) if $limit > 0;
+
+my $got;
+do { $got = waitpid($pid, 0) } until $got == $pid || ($got == -1 && !$!{EINTR});
+fail("waitpid failed: $!") if $got != $pid;
+my $status = $?;
+Time::HiRes::alarm(0);
+$SIG{$_} = 'DEFAULT' for qw(ALRM TERM INT HUP QUIT);
+
+if (WIFEXITED($status)) {
+  exit($timed_out && !$opt{'preserve-status'} ? 124 : WEXITSTATUS($status));
+}
+my $died = WTERMSIG($status);
+exit 128 + $died if $timed_out && ($died == $num{KILL} || $opt{'preserve-status'});
+exit 124 if $timed_out;
+# The command died of a signal on its own: die of it too, like GNU, so callers see a signal death.
+unless (grep { $died == $num{$_} } qw(QUIT ILL TRAP ABRT EMT FPE BUS SEGV SYS XCPU XFSZ)) {
+  $SIG{ $name{$died} } = 'DEFAULT';
+  kill $died, $$;
+}
+exit 128 + $died;
