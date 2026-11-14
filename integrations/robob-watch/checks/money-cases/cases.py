@@ -2640,15 +2640,15 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
     census_outcomes = {}
 
     def counted(qid, outcome):
+        old = census_outcomes.get(qid)
+        census_outcomes[qid] = outcome
         app = census_questions.get(qid)
         if app is None:
             return
-        old = census_outcomes.get(qid)
         census[app][old or 'limited'] -= 1
         if old is None:
             census[app]['not_checked'] -= 1
         census[app][outcome] += 1
-        census_outcomes[qid] = outcome
 
     memo = {('orders_cache',): Path(data) / 'order-details.json'}
     for app in ('noon', 'careem'):
@@ -2826,12 +2826,22 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                         raise
                     except CaseError as e:
                         errors.append(f"{q['id']}: {e}")
-        # Shared alias evidence can settle a question whose own screen failed
-        # or was deferred. Count the successfully reconciled result, not that attempt.
+        # Reconcile from a snapshot: updating one alias must not propagate its
+        # outcome through another alias to a distinct same-descriptor question.
+        attempted = census_outcomes.copy()
         for q in book['questions']:
+            if q['id'] not in census_questions:
+                continue
             if q.get('status') == 'closed' and (q.get('explanation') or {}).get('verdict') in (
                     'receipt', 'owner', 'subscription'):
                 counted(q['id'], 'matched')
+            elif active(q) and q['id'] in attempted:
+                result = alert_verdict(transactions, q, now)
+                if result and result['verdict'] == 'unverified':
+                    peers = transactions.get(unmatched_id(q), [])
+                    failed_alias = any(attempted.get(source['id']) == 'error' and alert_alias(q, source)
+                                       for source, _ in peers)
+                    counted(q['id'], 'error' if failed_alias else 'limited')
         prune_questions(book, now)
     return errors
 

@@ -2875,6 +2875,107 @@ class CheckBudget(Base):
                 self.assertEqual(stats['charge_census']['noon'], dict(open=2, matched=2,
                     proven_clean=0, limited=0, error=0, not_checked=0))
 
+    def census_alias_check(self, label, merchants, outcomes, deferred=False):
+        now = at('2026-11-14T12:00')
+        self.data, self.wd = self.tmp / label, self.tmp / ('wd-' + label)
+        self.wd.mkdir()
+        self.seed([now - dt.timedelta(days=3)] * len(merchants))
+        with mc.Locked(self.data, 'questions') as book:
+            for q, merchant in zip(book['questions'], merchants):
+                q.update(merchant=merchant, mkey=mc.merchant_key(merchant))
+        clock, results = [1000.0], iter(outcomes)
+        def explain(*args, **kw):
+            if deferred:
+                clock[0] += 2
+            return next(results)
+        with patch.object(mc.time, 'time', side_effect=lambda: clock[0]), \
+                patch.object(mc, 'FOLLOW_BUDGET', 7 if deferred else mc.FOLLOW_BUDGET), \
+                patch.object(mc.charges, 'explain', side_effect=explain):
+            mc.run_check(self.wd, label, self.data, self.root, now, finder(), nobody)
+        rows = [json.loads(line) for path in (self.tmp / 'tool-logs/orders').glob('*.ndjson')
+                for line in path.read_text().splitlines()]
+        return self.questions(), [r for r in rows if r['name'] == 'check.run'][-1]
+
+    def test_check_census_reconciles_unverified_aliases(self):
+        for kind in ('limited', 'error'):
+            blocked = {'verdict': 'unverified', 'why': 'fixture blocked',
+                'errors': ['fixture source error'] if kind == 'error' else [],
+                'limits': [] if kind == 'error' else [{'why': 'fixture source limit',
+                                                     'kinds': ['food_page_1']}]}
+            for clean in ('ask', 'wait'):
+                clear = {'verdict': clean, 'why': 'fixture clean', 'errors': [],
+                         'until': at('2026-11-15T12:00').isoformat()}
+                for peer in ('noon food', 'careem', 'other vendor'):
+                    for reverse in (False, True):
+                        label = f'{kind}-{clean}-{peer.replace(" ", "-")}-{reverse}'
+                        with self.subTest(label=label):
+                            merchants = ['noon', peer]
+                            outcomes = [clear, blocked]
+                            if reverse:
+                                merchants.reverse()
+                                outcomes.reverse()
+                            questions, row = self.census_alias_check(label, merchants, outcomes)
+                            self.assertTrue(all(q['unverified'] for q in questions))
+                            self.assertTrue(all(q['status'] == 'open' and not q['asks'] for q in questions))
+                            census = row['props']['chargeCensus']
+                            for source, count in (('noon', 2 if peer == 'noon food' else 1),
+                                                  ('careem', 1 if peer == 'careem' else 0)):
+                                self.assertEqual(census[source], dict(open=count, matched=0,
+                                    proven_clean=0, limited=count if kind == 'limited' else 0,
+                                    error=count if kind == 'error' else 0, not_checked=0))
+                            self.assertEqual(row['ok'], kind == 'limited')
+                            self.assertNotIn('fixture', json.dumps(row))
+
+    def test_check_census_mixed_alias_errors_are_order_independent(self):
+        limited = {'verdict': 'unverified', 'why': 'fixture limit', 'errors': [],
+                   'limits': [{'why': 'fixture', 'kinds': ['food_page_1']}]}
+        failed = {'verdict': 'unverified', 'why': 'fixture error', 'errors': ['fixture']}
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                outcomes = [limited, failed] if not reverse else [failed, limited]
+                questions, row = self.census_alias_check('mixed-' + str(reverse),
+                    ['noon', 'noon food'], outcomes)
+                self.assertTrue(all(q['unverified'] for q in questions))
+                self.assertEqual(row['props']['chargeCensus']['noon'], dict(open=2, matched=0,
+                    proven_clean=0, limited=0, error=2, not_checked=0))
+                self.assertFalse(row['ok'])
+
+    def test_check_census_does_not_propagate_through_distinct_same_descriptor_questions(self):
+        failed = {'verdict': 'unverified', 'why': 'fixture error', 'errors': ['fixture']}
+        limited = {'verdict': 'unverified', 'why': 'fixture limit', 'errors': [],
+                   'limits': [{'why': 'fixture', 'kinds': ['food_page_1']}]}
+        clear = {'verdict': 'ask', 'why': 'fixture clean', 'errors': []}
+        questions, row = self.census_alias_check('non-transitive',
+            ['noon', 'noon food', 'noon'], [failed, limited, clear])
+        self.assertTrue(all(q['unverified'] for q in questions))
+        self.assertEqual(row['props']['chargeCensus']['noon'], dict(open=3, matched=0,
+            proven_clean=0, limited=1, error=2, not_checked=0))
+
+    def test_check_census_deferred_alias_retains_not_checked(self):
+        clear = {'verdict': 'ask', 'why': 'fixture clean', 'errors': []}
+        questions, row = self.census_alias_check('deferred-clean', ['noon', 'noon food'],
+                                               [clear], deferred=True)
+        self.assertTrue(questions[0]['unverified'])
+        self.assertFalse(questions[1].get('checked'))
+        self.assertEqual(row['props']['chargeCensus']['noon'], dict(open=2, matched=0,
+            proven_clean=0, limited=2, error=0, not_checked=1))
+        self.assertFalse(row['ok'])
+
+    def test_check_census_does_not_combine_identical_descriptors(self):
+        clear = {'verdict': 'ask', 'why': 'fixture clean', 'errors': []}
+        for kind in ('limited', 'error'):
+            blocked = {'verdict': 'unverified', 'why': 'fixture blocked',
+                'errors': ['fixture'] if kind == 'error' else [],
+                'limits': [] if kind == 'error' else [{'why': 'fixture', 'kinds': ['food_page_1']}]}
+            with self.subTest(kind=kind):
+                questions, row = self.census_alias_check('distinct-' + kind,
+                                                       ['noon', 'noon'], [clear, blocked])
+                self.assertEqual(row['props']['chargeCensus']['noon'], dict(open=2, matched=0,
+                    proven_clean=1, limited=1 if kind == 'limited' else 0,
+                    error=1 if kind == 'error' else 0, not_checked=0))
+                self.assertFalse(questions[0]['unverified'])
+                self.assertTrue(questions[1]['unverified'])
+
     def questions(self):
         return mc.load_questions(self.data)["questions"]
 
