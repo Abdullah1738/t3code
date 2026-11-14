@@ -53,6 +53,16 @@ const [
 let current;
 let fullReads = 0;
 let threadReads = 0;
+let interruptReasonReads = 0;
+let interruptReason;
+let interruptReadFails = false;
+const interruptReasonCases = [
+  { message: undefined, expected: undefined },
+  { message: "Interrupt requested", expected: undefined },
+  { message: "Parent task cancelled", expected: "Parent task cancelled" },
+  { message: "", expected: "" },
+  { message: "Unavailable", readFails: true, expected: undefined },
+];
 let nativeStarts = 0;
 let nativeCompactions = 0;
 const handoffWrites = [];
@@ -103,9 +113,24 @@ const dependencies = Layer.mergeAll(
         throw new Error("full transcript read");
       }),
     hasUnpairedRunInterruptRequest: () => Effect.succeed(false),
-    getThreadRecords: (threadId, fields) =>
+    getThreadRecords: (threadId, fields, filter) =>
       Effect.sync(() => {
         NodeAssert.equal(threadId, current.thread.id);
+        if (fields.includes("turnItems")) {
+          interruptReasonReads++;
+          NodeAssert.deepEqual(fields, ["turnItems"]);
+          NodeAssert.deepEqual(filter, {
+            turnItemRunIds: [current.runs[0].id],
+            turnItemTypes: ["run_interrupt_request"],
+          });
+          if (interruptReadFails) throw new Error("Synthetic interrupt read failure");
+          return {
+            turnItems:
+              interruptReason === undefined
+                ? []
+                : [{ type: "run_interrupt_request", message: interruptReason }],
+          };
+        }
         NodeAssert.deepEqual(fields, []);
         threadReads++;
         return { thread: current.thread };
@@ -269,6 +294,12 @@ await Effect.runPromise(
       NodeAssert.equal(fullReads, i + 1);
       NodeAssert.equal(threadReads, i + 1);
       NodeAssert.equal(yield* controls.hasUnpairedRunInterruptRequest(), false);
+      for (const testCase of interruptReasonCases) {
+        interruptReason = testCase.message;
+        interruptReadFails = testCase.readFails ?? false;
+        NodeAssert.equal(yield* controls.loadRunInterruptReason(), testCase.expected);
+      }
+      interruptReadFails = false;
       NodeAssert.equal(fullReads, i + 1);
       NodeAssert.equal(threadReads, i + 1);
       current = null;
@@ -291,6 +322,7 @@ await Effect.runPromise(
 );
 NodeAssert.equal(nativeStarts, compact ? 0 : count);
 NodeAssert.equal(nativeCompactions, compact ? count : 0);
+NodeAssert.equal(interruptReasonReads, count * interruptReasonCases.length);
 NodeAssert.deepEqual(
   handoffWrites,
   Array.from({ length: count }, () =>

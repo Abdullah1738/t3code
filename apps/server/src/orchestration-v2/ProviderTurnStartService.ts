@@ -235,6 +235,21 @@ export const layer: Layer.Layer<
             Effect.catchCause(() => Effect.succeed(input.inheritedBackgroundTurnItems)),
           ),
         shouldStartProviderTurn: () => isCurrentAttemptInStatus("running"),
+        loadRunInterruptReason: () =>
+          projectionStore
+            .getThreadRecords(input.threadId, ["turnItems"], {
+              turnItemRunIds: [input.runId],
+              turnItemTypes: ["run_interrupt_request"],
+            })
+            .pipe(
+              Effect.map(({ turnItems }) => {
+                const reason = turnItems.find(
+                  (item) => item.type === "run_interrupt_request",
+                )?.message;
+                return reason === "Interrupt requested" ? undefined : reason;
+              }),
+              Effect.catchCause(() => Effect.succeed(undefined)),
+            ),
         shouldFinalizeRun: () =>
           projectionStore
             .getRunControlState(input.threadId, input.runId)
@@ -1818,21 +1833,7 @@ export const layer: Layer.Layer<
         loadRecoveryAdmission: runControls.loadRecoveryAdmission,
         shouldFinalizeRun: runControls.shouldFinalizeRun,
         hasUnpairedRunInterruptRequest: runControls.hasUnpairedRunInterruptRequest,
-        loadRunInterruptReason: () =>
-          projectionStore
-            .getThreadRecords(input.threadId, ["turnItems"], {
-              turnItemRunIds: [run.id],
-              turnItemTypes: ["run_interrupt_request"],
-            })
-            .pipe(
-              Effect.map(({ turnItems }) => {
-                const reason = turnItems.find(
-                  (item) => item.type === "run_interrupt_request",
-                )?.message;
-                return reason === "Interrupt requested" ? undefined : reason;
-              }),
-              Effect.catchCause(() => Effect.succeed(undefined)),
-            ),
+        loadRunInterruptReason: runControls.loadRunInterruptReason,
         message: {
           messageId: message.id,
           text:
