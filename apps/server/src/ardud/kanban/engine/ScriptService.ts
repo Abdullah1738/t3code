@@ -977,7 +977,10 @@ const make = Effect.gen(function* () {
     done: Deferred.Deferred<void>,
     check: WaitBatch | null = null,
   ): Effect.Effect<KanbanScriptRun, KanbanError> =>
-    open(script, trigger).pipe(
+    io(store.board(script.boardId)).pipe(
+      Effect.flatMap((board) =>
+        board?.archivedAt != null ? fail("denied", "Board is deleted") : open(script, trigger),
+      ),
       Effect.tap((run) =>
         Effect.forkIn(SavedWrite.background(finish(script, run, event, done, check)), scope),
       ),

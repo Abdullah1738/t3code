@@ -137,6 +137,7 @@ export type ThreadManagementTerminalRunStatus = Extract<
 >;
 
 export interface ThreadManagementSendInput {
+  readonly isStale?: () => boolean;
   readonly projectId: ProjectId;
   readonly commandId: CommandId;
   readonly threadId: ThreadId;
@@ -348,6 +349,7 @@ export interface ThreadManagementServiceShape {
   ) => Effect.Effect<void, LegacyV1ThreadImporter.LegacyV1ThreadImportError>;
   readonly dispatch: (
     command: OrchestrationV2ServerCommand,
+    options?: Orchestrator.OrchestratorDispatchOptions,
   ) => Effect.Effect<
     Orchestrator.OrchestratorV2DispatchResult,
     Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
@@ -746,12 +748,15 @@ const make = Effect.gen(function* () {
     }
   };
 
-  const dispatchUnchanged = (command: OrchestrationV2ServerCommand) =>
+  const dispatchUnchanged = (
+    command: OrchestrationV2ServerCommand,
+    options?: Orchestrator.OrchestratorDispatchOptions,
+  ) =>
     ensureCommandTranscripts(command).pipe(
       Effect.andThen(assertDispatchTargetEnabled(command)),
       Effect.andThen(
         SendAcknowledgement.waitingOn(
-          orchestrator.dispatch(command),
+          orchestrator.dispatch(command, options),
           command.type === "message.dispatch"
             ? `message command admission for thread ${command.threadId}`
             : "command dispatch",
@@ -763,7 +768,10 @@ const make = Effect.gen(function* () {
     "orchestrationV2.threadManagement.dispatchWithSelectionMigration",
   )(function* (
     command: Extract<OrchestrationV2ServerCommand, { readonly type: "message.dispatch" }>,
-    options: { readonly migrate: boolean; readonly cutoverComplete: boolean },
+    options: {
+      readonly migrate: boolean;
+      readonly cutoverComplete: boolean;
+    } & Orchestrator.OrchestratorDispatchOptions,
   ) {
     // Neither an accepted nor a rejected command may acquire new side effects
     // on replay, including when its id belongs to a different aggregate.
@@ -786,7 +794,7 @@ const make = Effect.gen(function* () {
     );
     if (Option.isSome(receipt))
       return yield* SendAcknowledgement.waitingOn(
-        orchestrator.dispatch(command),
+        orchestrator.dispatch(command, options),
         `message replay dispatch for thread ${command.threadId}`,
       );
     const projectReceipt = yield* SendAcknowledgement.waitingOn(
@@ -795,7 +803,7 @@ const make = Effect.gen(function* () {
     );
     if (Option.isSome(projectReceipt))
       return yield* SendAcknowledgement.waitingOn(
-        orchestrator.dispatch(command),
+        orchestrator.dispatch(command, options),
         `message replay dispatch for thread ${command.threadId}`,
       );
 
@@ -823,7 +831,7 @@ const make = Effect.gen(function* () {
         });
       }
     }
-    if (!options.migrate) return yield* dispatchUnchanged(command);
+    if (!options.migrate) return yield* dispatchUnchanged(command, options);
 
     const projection = yield* SendAcknowledgement.waitingOn(
       orchestrator.getThreadRecords(command.threadId, []),
@@ -920,7 +928,7 @@ const make = Effect.gen(function* () {
       ) {
         // ardud: after cutover a busy thread keeps working where it is; this turn runs (or
         // queues) on its current harness and the thread moves on its first turn that starts idle.
-        if (options.cutoverComplete) return yield* dispatchUnchanged(command);
+        if (options.cutoverComplete) return yield* dispatchUnchanged(command, options);
         return yield* new Orchestrator.OrchestratorCommandRejectedError({
           commandId: command.commandId,
           commandType: command.type,
@@ -928,12 +936,15 @@ const make = Effect.gen(function* () {
             "Cannot migrate an archived or deleted thread, or one with active or queued runs, pending requests or background work.",
         });
       }
-      yield* orchestrator.dispatch({
-        type: "thread.model-selection.set",
-        commandId: CommandId.make(`command:ardud:harness-migration:${NodeCrypto.randomUUID()}`),
-        threadId: command.threadId,
-        modelSelection: resolvedStored.selection,
-      });
+      yield* orchestrator.dispatch(
+        {
+          type: "thread.model-selection.set",
+          commandId: CommandId.make(`command:ardud:harness-migration:${NodeCrypto.randomUUID()}`),
+          threadId: command.threadId,
+          modelSelection: resolvedStored.selection,
+        },
+        options,
+      );
     }
 
     const nextCommand =
@@ -944,12 +955,12 @@ const make = Effect.gen(function* () {
     // rather than allowing a disabled destination on an inherited command.
     yield* assertDispatchTargetEnabled(nextCommand);
     return yield* SendAcknowledgement.waitingOn(
-      orchestrator.dispatch(nextCommand),
+      orchestrator.dispatch(nextCommand, options),
       `message command admission for thread ${command.threadId}`,
     );
   });
 
-  const dispatch: ThreadManagementServiceShape["dispatch"] = (command) => {
+  const dispatch: ThreadManagementServiceShape["dispatch"] = (command, options) => {
     if (command.type === "delegated_task.request") {
       return Effect.acquireUseRelease(
         Ref.update(pendingDelegations, (current) => {
@@ -957,7 +968,8 @@ const make = Effect.gen(function* () {
           next.set(command.commandId, (current.get(command.commandId) ?? 0) + 1);
           return next;
         }),
-        () => delegationDispatchLock.withLock(command.commandId, dispatchUnchanged(command)),
+        () =>
+          delegationDispatchLock.withLock(command.commandId, dispatchUnchanged(command, options)),
         () =>
           Ref.update(pendingDelegations, (current) => {
             const next = new Map(current);
@@ -973,7 +985,7 @@ const make = Effect.gen(function* () {
       command.type !== "thread.model-selection.set" &&
       command.type !== "provider.switch"
     ) {
-      return dispatchUnchanged(command);
+      return dispatchUnchanged(command, options);
     }
     return serverSettings.getSettings.pipe(
       Effect.orDie,
@@ -983,13 +995,13 @@ const make = Effect.gen(function* () {
           settings.ardudHarnessMigration?.threadIds?.includes(command.threadId) === true;
         const cutoverComplete = settings.ardudHarnessMigration?.cutoverComplete === true;
         if (!migrate && !cutoverComplete) {
-          return dispatchUnchanged(command);
+          return dispatchUnchanged(command, options);
         }
         return selectionDispatchLock.withLock(
           command.threadId,
           command.type === "message.dispatch"
-            ? dispatchWithSelectionMigration(command, { migrate, cutoverComplete })
-            : dispatchUnchanged(command),
+            ? dispatchWithSelectionMigration(command, { ...options, migrate, cutoverComplete })
+            : dispatchUnchanged(command, options),
         );
       }),
     );
@@ -1087,6 +1099,7 @@ const make = Effect.gen(function* () {
   const sendToThread: ThreadManagementServiceShape["sendToThread"] = Effect.fn(
     "ThreadManagementService.sendToThread",
   )(function* (input) {
+    const guard = { isStale: () => input.isStale?.() === true };
     const target = yield* getProjectThreadRecords(
       input,
       input.mode === "restart"
@@ -1167,16 +1180,19 @@ const make = Effect.gen(function* () {
         capabilities.supportsInterrupt &&
         capabilities.supportsQueuedMessages
       ) {
-        yield* orchestrator.dispatch({
-          type: "run.interrupt",
-          commandId: interruptCommandId,
-          threadId: input.threadId,
-          runId: steerableRun.id,
-          fenced: true,
-          ...(steerableRun.activeAttemptId === null
-            ? {}
-            : { expectedAttemptId: steerableRun.activeAttemptId }),
-        });
+        yield* orchestrator.dispatch(
+          {
+            type: "run.interrupt",
+            commandId: interruptCommandId,
+            threadId: input.threadId,
+            runId: steerableRun.id,
+            fenced: true,
+            ...(steerableRun.activeAttemptId === null
+              ? {}
+              : { expectedAttemptId: steerableRun.activeAttemptId }),
+          },
+          guard,
+        );
         dispatchMode = { type: "queue_after_active" };
       } else {
         dispatchMode = {
@@ -1194,23 +1210,28 @@ const make = Effect.gen(function* () {
     }
 
     const dispatched = yield* SendAcknowledgement.observe(
-      dispatch({
-        type: "message.dispatch",
-        commandId: input.commandId,
-        threadId: input.threadId,
-        messageId: input.messageId,
-        ...(input.scheduledTaskId === undefined ? {} : { scheduledTaskId: input.scheduledTaskId }),
-        ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
-        text: input.text,
-        attachments: input.attachments,
-        ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
-        dispatchMode,
-        createdBy: input.createdBy,
-        creationSource: input.creationSource,
-        ...(input.contextReset === true ? { contextReset: true } : {}),
-        // ardud:
-        ...(input.context === undefined ? {} : { context: input.context }),
-      }),
+      dispatch(
+        {
+          type: "message.dispatch",
+          commandId: input.commandId,
+          threadId: input.threadId,
+          messageId: input.messageId,
+          ...(input.scheduledTaskId === undefined
+            ? {}
+            : { scheduledTaskId: input.scheduledTaskId }),
+          ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
+          text: input.text,
+          attachments: input.attachments,
+          ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+          dispatchMode,
+          createdBy: input.createdBy,
+          creationSource: input.creationSource,
+          ...(input.contextReset === true ? { contextReset: true } : {}),
+          // ardud:
+          ...(input.context === undefined ? {} : { context: input.context }),
+        },
+        guard,
+      ),
       input,
     );
     const projection = yield* getProjectThreadRecords(input, ["runs", "messages", "turnItems"], {

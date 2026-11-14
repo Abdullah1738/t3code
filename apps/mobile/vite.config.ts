@@ -2,6 +2,7 @@ import { defineConfig } from "vite-plus";
 import "vite-plus/test/config";
 
 const reactTests = [
+  "src/ardud/kanban/boardDeletion.test.tsx",
   "src/ardud/common/AttachmentFileScreen.test.tsx",
   "src/ardud/common/AttachmentVideoPreview.test.tsx",
   "src/ardud/kanban/needsYou/askUpload.test.tsx",
