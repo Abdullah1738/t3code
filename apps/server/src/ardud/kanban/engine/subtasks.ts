@@ -2,6 +2,8 @@
  * A card's subtasks: its flow as steps (write the PR, review, merge and
  * deploy, tell the reporter, read back). Pure rules; KanbanService applies them.
  */
+import * as DateTime from "effect/DateTime";
+
 import {
   kanbanOpenStep,
   kanbanStepSubtasks,
@@ -11,6 +13,7 @@ import {
   type KanbanOwnerAsk,
   type KanbanSubtask,
   type KanbanStandingApproval,
+  type KanbanRelease,
 } from "@t3tools/contracts";
 
 // Unknown continuations need approval, including nouns and possessives after a resource name.
@@ -241,7 +244,7 @@ export const inferGate = (text: string): KanbanSubtask["gate"] => {
 };
 
 export const gateOf = (
-  subtask: Pick<KanbanSubtask, "owner" | "gate" | "text" | "ownerOnly">,
+  subtask: Pick<KanbanSubtask, "owner" | "gate" | "text" | "ownerOnly" | "interrupting">,
   guessedGates?: KanbanBoard["guessedGates"],
 ): KanbanSubtask["gate"] => {
   // Older plans stored inferred gates on coding and review checklists too.
@@ -251,7 +254,9 @@ export const gateOf = (
   const guessed = inferGate(subtask.text);
   return guessed !== undefined && (guessedGates === undefined || guessedGates.includes(guessed))
     ? guessed
-    : undefined;
+    : subtask.interrupting
+      ? "deploy"
+      : undefined;
 };
 
 export const isNegativeOption = (label: string): boolean =>
@@ -409,6 +414,20 @@ export const askGateWarning = (
   return `This ask won't clear ${steps}. Name ${target} in the text if it should.`;
 };
 
+export const secretKindApprovalWarning = (
+  card: Pick<KanbanCard, "subtasks">,
+  ask: KanbanOwnerAsk,
+  guessedGates?: KanbanBoard["guessedGates"],
+): string | undefined => {
+  if (ask.kind !== "secret") return undefined;
+  const ids = card.subtasks
+    .filter((subtask) => subtask.state === "open" && gateOf(subtask, guessedGates) === "secret")
+    .map((subtask) => subtask.id);
+  if (ids.length === 0) return undefined;
+  const target = ids.length === 1 ? ids[0]! : "the intended subtask id";
+  return `Kind "secret" asks Abdullah to type a secret value. To approve ${ids.join(", ")}, ask a decision naming ${target} instead.`;
+};
+
 const approvingAnswer = (
   ask: KanbanOwnerAsk,
   gate: NonNullable<KanbanSubtask["gate"]>,
@@ -433,18 +452,51 @@ const approvingAnswer = (
   );
 };
 
+export interface StandingReleaseContext {
+  readonly approvals: ReadonlyArray<KanbanStandingApproval>;
+  readonly ledger: ReadonlyArray<KanbanRelease>;
+  readonly boardId: string;
+  readonly at: string;
+  readonly note: string | null;
+}
+
+export const criticalReleaseReason = (note: string | null): string | null => {
+  if (!note?.startsWith("critical:")) return null;
+  const reason = note.slice("critical:".length).trim();
+  return reason.length >= 10 ? reason : null;
+};
+
+export const releaseWindow = (
+  standing: Pick<StandingReleaseContext, "approvals" | "ledger" | "boardId" | "at">,
+) => {
+  const approval = standing.approvals.find((entry) => entry.revokedAt === null);
+  const last = standing.ledger
+    .filter((entry) => entry.boardId === standing.boardId)
+    .toSorted((a, b) => a.at.localeCompare(b.at))
+    .at(-1);
+  if (!approval || !last) return null;
+  const hours = approval.minIntervalHours ?? 4;
+  const next = DateTime.formatIso(DateTime.add(DateTime.makeUnsafe(last.at), { hours }));
+  return next > standing.at ? { last, next, hours } : null;
+};
+
 /** Legacy plans have no timestamps: their card's creation is the earliest safe bound. */
 export const approvalProblem = (
   card: Pick<KanbanCard, "number" | "asks" | "createdAt" | "subtasks">,
   subtask: KanbanSubtask,
-  standing: ReadonlyArray<KanbanStandingApproval> = [],
+  standing: ReadonlyArray<KanbanStandingApproval> | StandingReleaseContext = [],
   guessedGates?: KanbanBoard["guessedGates"],
   intent: "do" | "skip" = "do",
 ): string | null => {
   const gate = gateOf(subtask, guessedGates);
   if (gate === undefined) return null;
-  if (gate === "deploy" && !subtask.ownerOnly && standing.some((entry) => entry.revokedAt === null))
-    return null;
+  const context = "approvals" in standing ? standing : undefined;
+  const approvals = "approvals" in standing ? standing.approvals : standing;
+  const cleared =
+    gate === "deploy" && !subtask.ownerOnly && approvals.some((entry) => entry.revokedAt === null);
+  const window =
+    cleared && subtask.interrupting && context && intent === "do" ? releaseWindow(context) : null;
+  if (cleared && (!window || criticalReleaseReason(context?.note ?? null))) return null;
   const standingReason =
     gate !== "deploy"
       ? ""
@@ -497,7 +549,15 @@ export const approvalProblem = (
     );
   }
   const approved = latest !== undefined && approvingAnswer(latest, gate, subtask.text);
-  if (approved) return null;
+  if (
+    approved &&
+    (!window || (askWording(latest!).match(/\bs\d+\b/g) ?? []).some((id) => id === subtask.id))
+  )
+    return null;
+  if (window) {
+    const time = (at: string) => `${at.slice(11, 16)}Z`;
+    return `card #${card.number} ${subtask.id} (interrupting) is inside the ${window.hours} h release window: last release #${window.last.cardNumber} at ${time(window.last.at)}, next window ${time(window.next)}; write "critical: <reason>" in the done note to override`;
+  }
   let reason: string;
   if (!latest || !answer) {
     reason = noDecisionReason;
@@ -529,6 +589,7 @@ export interface SubtaskInput {
   readonly owner?: KanbanSubtask["owner"] | undefined;
   readonly gate?: KanbanSubtask["gate"] | null;
   readonly ownerOnly?: boolean | undefined;
+  readonly interrupting?: boolean | undefined;
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   readonly script?: string | undefined;
 }
@@ -608,6 +669,7 @@ export function planSubtasks(
           input.step === undefined &&
           input.gate === undefined &&
           input.ownerOnly === undefined &&
+          input.interrupting === undefined &&
           input.script === undefined)
       ) {
         planned.push(known);
@@ -631,12 +693,19 @@ export function planSubtasks(
         reason: `subtask "${text}" is the worker's; a deploy, money or secret step must be owned by the evaluator or a script`,
       };
     }
+    const interrupting = input.interrupting ?? known?.interrupting;
+    if (interrupting && (owner === "work" || owner === "review")) {
+      return {
+        ok: false,
+        reason: "an interrupting step must be owned by the evaluator or a script",
+      };
+    }
     const ownerOnly = input.ownerOnly ?? known?.ownerOnly;
     if (ownerOnly && (owner === "work" || owner === "review")) {
       return { ok: false, reason: "an owner-only step must be owned by the evaluator or a script" };
     }
     const inputGate = gateOf(
-      { owner, text, gate: input.gate ?? undefined, ownerOnly },
+      { owner, text, gate: input.gate ?? undefined, ownerOnly, interrupting },
       guessedGates,
     );
     const script = input.script?.trim() || undefined;
@@ -653,17 +722,27 @@ export function planSubtasks(
     if (known) {
       const { script: _old, gate: _oldGate, ...rest } = known;
       const previousGate = gateOf(known, guessedGates);
-      const gate = owner === "work" || owner === "review" ? undefined : (previousGate ?? inputGate);
+      const gate =
+        owner === "work" || owner === "review"
+          ? undefined
+          : previousGate === "deploy" &&
+              (known.interrupting || interrupting) &&
+              (inputGate === "money" || inputGate === "secret")
+            ? inputGate
+            : (previousGate ?? inputGate);
       planned.push({
         ...rest,
         step,
         text,
         owner,
         ...(ownerOnly === undefined ? {} : { ownerOnly }),
+        ...(interrupting === undefined ? {} : { interrupting }),
         ...(gate === undefined ? {} : { gate }),
         ...((text !== known.text ||
           script !== known.script ||
           ownerOnly !== known.ownerOnly ||
+          interrupting !== known.interrupting ||
+          gate !== previousGate ||
           !previousGate) &&
         gate &&
         at
@@ -680,6 +759,7 @@ export function planSubtasks(
         text,
         owner,
         ...(ownerOnly === undefined ? {} : { ownerOnly }),
+        ...(interrupting === undefined ? {} : { interrupting }),
         ...(gate === undefined ? {} : { gate }),
         ...(at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),

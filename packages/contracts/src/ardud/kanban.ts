@@ -139,6 +139,7 @@ export const KanbanSubtask = Schema.Struct({
   owner: KanbanSubtaskOwner,
   gate: Schema.optional(Schema.Literals(["deploy", "money", "secret"])),
   ownerOnly: Schema.optional(Schema.Boolean),
+  interrupting: Schema.optional(Schema.Boolean),
   createdAt: Schema.optional(IsoDateTime),
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   script: Schema.optional(Schema.String),
@@ -909,6 +910,17 @@ export const KanbanWait = Schema.Struct({
   pr: Schema.NullOr(TrimmedNonEmptyString).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   /** card: the card it waits on. */
   card: Schema.NullOr(KanbanCardId).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** Read-time identity for targets outside the board's card list; never used to decide a wake. */
+  cardTarget: Schema.optionalKey(
+    Schema.NullOr(
+      Schema.Struct({
+        id: KanbanCardId,
+        number: PositiveInt,
+        boardId: KanbanBoardId,
+        boardName: Schema.NullOr(TrimmedNonEmptyString),
+      }),
+    ),
+  ),
   /** owner_go: the open ask (q1, q2...) whose answer ends it. */
   ask: Schema.NullOr(TrimmedNonEmptyString).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   /** time: when it ends. Any other kind: when it counts as stuck, instead of the kind's default. */
@@ -1313,6 +1325,35 @@ export const kanbanWorkStep = (
 export const kanbanWaitsOnEvaluator = (
   card: Pick<KanbanCard, "stage" | "wakeNote" | "subtasks" | "reviewFindingsPending">,
 ): boolean => card.stage === "todo" && !kanbanWorkStep(card);
+
+/** A finished planned review, unless a known head or a fresh review request invalidates it. */
+export const kanbanReviewAlreadyDone = (
+  card: Pick<KanbanCard, "stage" | "subtasks" | "reviewFindingsPending">,
+  evidence?: {
+    readonly heads: ReadonlyArray<string>;
+    readonly verdict: Pick<KanbanCardEvent, "body" | "head"> | null;
+    readonly requested: boolean;
+  },
+): boolean => {
+  if (card.stage !== "needs_review" || card.reviewFindingsPending || evidence?.requested)
+    return false;
+  const step = kanbanOpenStep(card);
+  // A future review belongs to future work, not to this completed review step.
+  const reviews = card.subtasks.filter(
+    (subtask) => subtask.owner === "review" && (step === null || subtask.step <= step),
+  );
+  if (reviews.length === 0 || reviews.some((subtask) => subtask.state === "open")) return false;
+  if (evidence === undefined || evidence.heads.length === 0) return true;
+  const reviewed = evidence.verdict?.head?.toLowerCase();
+  return (
+    evidence.verdict?.body === "clear" &&
+    reviewed != null &&
+    evidence.heads.every((head) => {
+      const current = head.toLowerCase();
+      return current.startsWith(reviewed) || reviewed.startsWith(current);
+    })
+  );
+};
 
 /** Stages past the work: a card here no longer blocks anything or waits on anything. */
 export const KANBAN_DONE_STAGES: ReadonlySet<KanbanStage> = new Set([
@@ -1997,6 +2038,9 @@ export type KanbanNightlyReview = typeof KanbanNightlyReview.Type;
 export const KanbanStandingApproval = Schema.Struct({
   id: TrimmedNonEmptyString,
   gate: Schema.Literal("deploy"),
+  minIntervalHours: Schema.optional(Schema.Number).pipe(
+    Schema.withDecodingDefault(Effect.succeed(4)),
+  ),
   quote: TrimmedNonEmptyString,
   sourceThreadId: TrimmedNonEmptyString,
   saidAt: IsoDateTime,
@@ -2008,6 +2052,17 @@ export const KanbanStandingApproval = Schema.Struct({
   revokeReason: Schema.NullOr(Schema.String),
 });
 export type KanbanStandingApproval = typeof KanbanStandingApproval.Type;
+
+export const KanbanRelease = Schema.Struct({
+  boardId: KanbanBoardId,
+  cardId: KanbanCardId,
+  cardNumber: Schema.Number,
+  subtaskId: TrimmedNonEmptyString,
+  at: IsoDateTime,
+  critical: Schema.NullOr(Schema.String),
+  approvalId: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type KanbanRelease = typeof KanbanRelease.Type;
 
 export const KanbanBoard = Schema.Struct({
   id: KanbanBoardId,
@@ -2025,6 +2080,9 @@ export const KanbanBoard = Schema.Struct({
   reviewChains: Schema.Array(KanbanReviewChain),
   defaultReviewChain: Schema.NullOr(TrimmedNonEmptyString),
   guessedGates: Schema.optional(Schema.Array(Schema.Literals(["deploy", "money", "secret"]))),
+  releaseLedger: Schema.optional(Schema.Array(KanbanRelease)).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
   standingApprovals: Schema.Array(KanbanStandingApproval).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),

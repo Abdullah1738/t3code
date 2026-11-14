@@ -249,3 +249,48 @@ test("live checks the running build's ancestry and exits for each outcome", asyn
   );
   NodeAssert.equal(imported.status, 0);
 });
+
+test("threads forwards the opaque cursor and prints the next cursor", async ({
+  onTestFinished,
+}) => {
+  const { createServer } = await import("node:http");
+  let requested: string | undefined;
+  const server = createServer((request, response) => {
+    requested = request.url;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, threads: [], total: 510, nextCursor: "next-page" }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  onTestFinished(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("no test server address");
+  const result = await new Promise<{ code: number | null; stdout: string }>((resolve, reject) => {
+    const child = NodeChildProcess.spawn(
+      process.execPath,
+      [
+        NodeURL.fileURLToPath(new URL("./t3ctl.mjs", import.meta.url)),
+        "threads",
+        "--limit",
+        "500",
+        "--cursor",
+        "opaque-cursor",
+      ],
+      {
+        env: {
+          ...process.env,
+          T3_CONTROL_URL: `http://127.0.0.1:${address.port}`,
+          T3_CONTROL_TOKEN: "test",
+        },
+      },
+    );
+    let stdout = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, stdout }));
+  });
+  NodeAssert.equal(result.code, 0);
+  NodeAssert.equal(requested, "/api/ardud/control/threads?cursor=opaque-cursor&limit=500");
+  NodeAssert.equal(JSON.parse(result.stdout).nextCursor, "next-page");
+});

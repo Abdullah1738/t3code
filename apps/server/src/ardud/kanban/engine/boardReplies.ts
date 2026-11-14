@@ -3,7 +3,10 @@ import {
   type KanbanBoardSnapshot,
   type KanbanCard,
   type KanbanGoal,
+  type KanbanBoard,
 } from "@t3tools/contracts";
+
+import { releaseWindow } from "./subtasks.ts";
 
 import { waitSetBody } from "./waits.ts";
 
@@ -52,6 +55,7 @@ const compactWait = (card: KanbanCard, byId: ReadonlyMap<string, KanbanCard>) =>
       on: wait.on,
       pr: wait.pr,
       card: wait.card,
+      ...(wait.cardTarget === undefined ? {} : { cardTarget: wait.cardTarget }),
       script: wait.script,
       note: short(wait.note),
       status: wait.status,
@@ -61,13 +65,28 @@ const compactWait = (card: KanbanCard, byId: ReadonlyMap<string, KanbanCard>) =>
   };
 };
 
+export const boardReleaseSummary = (board: KanbanBoard, at?: string) => ({
+  releaseLedger: (board.releaseLedger ?? []).slice(-5),
+  nextReleaseWindowAt:
+    at === undefined
+      ? null
+      : (releaseWindow({
+          approvals: board.standingApprovals,
+          ledger: board.releaseLedger ?? [],
+          boardId: board.id,
+          at,
+        })?.next ?? null),
+});
+
 export const compactBoard = (
   snapshot: KanbanBoardSnapshot,
   byId = new Map(snapshot.cards.map((card) => [card.id as string, card])),
+  at?: string,
 ) => ({
   ...snapshot,
   board: {
     ...snapshot.board,
+    ...boardReleaseSummary(snapshot.board, at),
     standingApprovals: snapshot.board.standingApprovals.map((entry) => ({
       ...entry,
       quote: entry.quote.slice(0, 200),

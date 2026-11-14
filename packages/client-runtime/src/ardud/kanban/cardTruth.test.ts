@@ -382,6 +382,34 @@ describe("cardTruth: review", () => {
     );
   });
 
+  it.each([
+    ["foreign", "board-foreign", "Foreign", "foreign", "Held for #73 (Foreign)"],
+    ["same board outside page", "board-toy", null, "foreign", "Held for #73"],
+    ["missing", null, null, "foreign", "Held for another card"],
+    ["stale", "board-foreign", "Foreign", "old-target", "Held for another card"],
+  ] as const)(
+    "labels a wait with %s target metadata",
+    (_name, boardId, boardName, hintId, label) => {
+      const waiting = card(1, {
+        wait: wait({
+          on: "card",
+          card: "foreign" as never,
+          ...(boardId === null
+            ? {}
+            : {
+                cardTarget: {
+                  id: hintId as never,
+                  number: 73,
+                  boardId: boardId as never,
+                  boardName,
+                },
+              }),
+        }),
+      });
+      expect(truth(waiting, [card(73)]).label).toBe(label);
+    },
+  );
+
   it("shows a script wait by its script's name, with the check's latest status", () => {
     const script = (patch: Partial<KanbanWait> = {}) =>
       truth(
