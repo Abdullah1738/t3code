@@ -124,6 +124,8 @@ const makeFake = () => {
           Effect.andThen(
             Effect.sync(() => {
               threads.get(input.threadId)?.messages.push(input.text);
+              nextRun += 1;
+              return `run-${nextRun}`;
             }),
           ),
         ),
