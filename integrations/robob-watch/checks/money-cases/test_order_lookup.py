@@ -94,7 +94,7 @@ class Reader(unittest.TestCase):
 import threading
 from pathlib import Path
 ROOT=Path(__file__).parent
-def orders(app, service, timeout, page=1):
+def orders(app, service, timeout, page=1, cursor=None):
     with (ROOT/'pages.log').open('a') as f:f.write(service+':'+str(page)+'\\n')
     data=json.loads((ROOT/'fixture.json').read_text())
     if threading.current_thread() is not threading.main_thread():raise ValueError('main thread required')
@@ -102,6 +102,10 @@ def orders(app, service, timeout, page=1):
     rows=data.get(service,{}).get(str(page),[])
     coverage=({'page':page,'total_pages':len(data.get(service,{'1':[]}))} if service=='minutes'
               else {'exhaustive':service not in data})
+    if service in data.get('paging',[]):
+        coverage={'page':page,'total_pages':len(data[service]),'paging_verified':True,
+                  'ordered_by_placed_at':service!='marketplace',
+                  'exhaustive':page==len(data[service]),'next_cursor':'cursor-'+str(page)}
     coverage=data.get('coverage_override',{}).get(service,coverage)
     return dict(ok=True,orders=rows,coverage={service:coverage})
 ''')
@@ -138,6 +142,61 @@ def details(oid, service, timeout):
 
     def native(self, since=None):
         return lookup.native('noon', str(self.root), since=since)
+
+    def test_verified_vertical_pages_cross_ties_and_skip_old_details(self):
+        for service in ('food', 'nownow'):
+            with self.subTest(service=service):
+                self.fixture(**{service: {'1': [row('A', -15)], '2': [row('B', -15)],
+                                         '3': [row('C', -16)], '4': [row('D', -20)]},
+                                'paging': [service]})
+                result = lookup.native('noon', str(self.root), since=AT.isoformat(), services=(service,))
+                lane = result['lanes'][service]
+                self.assertEqual(lane['pages'], 3)
+                self.assertEqual(lane['fetched'], 2)
+                self.assertEqual(lane['covered_from'], row('C', -16)['placed_at'])
+                self.assertIsNone(lane['limit'])
+                self.assertFalse(lane['exhaustive'])
+
+    def test_repeated_page_cannot_claim_exhaustive_history(self):
+        for service in ('food', 'nownow', 'marketplace'):
+            with self.subTest(service=service):
+                self.fixture(**{service: {'1': [row('A')], '2': [row('A')]}, 'paging': [service]})
+                result = lookup.native('noon', str(self.root), services=(service,))
+                self.assertFalse(result['lanes'][service]['exhaustive'])
+
+    def test_unverified_reader_retains_page_one_limit(self):
+        self.fixture(food={'1': [row('A')], '2': [row('B', -60)]},
+                     coverage_override={'food': {'paging_verified': True, 'default_page_only': True}})
+        result = lookup.native('noon', str(self.root), services=('food',))
+        self.assertEqual(result['lanes']['food']['pages'], 1)
+        self.assertEqual(result['lanes']['food']['limit'], 'page-1 history only')
+
+    def test_marketplace_history_exhaustion_without_creation_order_assumption(self):
+        self.fixture(marketplace={'1': [row('A', -60)], '2': [row('B')]}, paging=['marketplace'])
+        result = lookup.native('noon', str(self.root), services=('marketplace',))
+        lane = result['lanes']['marketplace']
+        self.assertTrue(lane['exhaustive'])
+        self.assertEqual(lane['pages'], 2)
+        self.assertIsNone(lane['covered_from'])
+
+    def test_later_cancelled_shipment_stays_unread_even_for_seen_order(self):
+        for status in ('cancelled', 'canceled', 'failed', 'unknown', 'out for delivery'):
+            with self.subTest(status=status):
+                first = {**row('A'), 'item_id': 'A-1'}
+                second = {**row('A', status=status), 'item_id': 'A-2'}
+                self.fixture(marketplace={'1': [first], '2': [second]}, paging=['marketplace'])
+                result = lookup.native('noon', str(self.root), services=('marketplace',))
+                self.assertEqual(result['orders'], [])
+                self.assertFalse(result['lanes']['marketplace']['exhaustive'])
+                self.assertIsNone(result['lanes']['marketplace']['covered_from'])
+
+    def test_marketplace_cache_requires_whole_order_delivery(self):
+        base = {**row('N1'), 'service': 'marketplace', 'total': 12.34, 'currency': 'AED'}
+        for status, complete, expected in (('delivered', True, 1), ('delivered', False, 0),
+                                            ('cancelled', True, 0), ('failed', True, 0)):
+            with self.subTest(status=status, complete=complete):
+                self.cache.write_text(json.dumps([{**base, 'status': status, 'whole_order_complete': complete}]))
+                self.assertEqual(len(lookup.load_cache(self.cache)), expected)
 
     def test_failed_lane_cannot_starve_other_main_thread_readers(self):
         self.fixture(minutes={'1': []}, food={'1': [row('F1')]}, list_fail=['minutes'])

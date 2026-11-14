@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 LANES = ('minutes', 'marketplace', 'food', 'nownow')
 SAME_TIME = dt.timedelta(minutes=15)
 BINDING_LIMIT = 'ORDER_LIST_HOST_BINDING_UNVERIFIED'
-CACHE_FIELDS = ('service', 'order', 'total', 'currency', 'placed_at', 'status', 'raw_status', 'cached_at')
+CACHE_FIELDS = ('service', 'order', 'total', 'currency', 'placed_at', 'status', 'raw_status', 'cached_at', 'whole_order_complete')
 TERMINAL = {'delivered', 'cancelled', 'canceled', 'failed'}
 
 
@@ -40,12 +40,12 @@ def moment(value, service=None):
 
 
 def terminal(row):
+    if row.get('service') == 'marketplace':
+        return row.get('whole_order_complete') is True and row.get('status') == 'delivered'
     return any(row.get(k) in TERMINAL for k in ('status', 'raw_status'))
 
 
 def projection(row):
-    # Marketplace statuses describe shipments; the installed list cannot prove
-    # a whole order terminal. Its details are always refreshed.
     if row.get('service') not in LANES or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', str(row.get('order', ''))):
         raise ValueError('invalid order')
     if not Decimal(str(row.get('total'))).is_finite() or not re.fullmatch('[A-Z]{3}', str(row.get('currency', ''))):
@@ -60,7 +60,7 @@ def projection(row):
 def load_cache(path):
     try:
         rows = json.loads(path.read_text())
-        return [projection(row) for row in rows if terminal(row) and row.get('service') != 'marketplace'] if isinstance(rows, list) else []
+        return [projection(row) for row in rows if terminal(row)] if isinstance(rows, list) else []
     except (OSError, ValueError, TypeError, AttributeError, InvalidOperation):
         return []
 
@@ -98,7 +98,7 @@ def read(app, deadline=None, since=None, cache_path=None):
                 row = projection(row)
                 key = row['service'], row['order']
                 merged.pop(key, None)
-                if terminal(row) and row['service'] != 'marketplace':
+                if terminal(row):
                     merged[key] = {**row, 'cached_at': dt.datetime.now(dt.timezone.utc).isoformat()}
             try:
                 write_json(cache_path, sorted(merged.values(), key=lambda r: moment(r['placed_at']))[-1000:])
@@ -185,37 +185,54 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
         lane = {'exhaustive': False, 'covered_from': None, 'limit': None,
                 'fetched': 0, 'cached': 0, 'pages': 0, 'ms': 0}
         previous, seen, page, broken, unordered = None, set(), 1, False, False
+        cursor, page_ids, cursors = None, set(), set()
         try:
             while lane_end - time.monotonic() > 0.05:
                 result = native_orders.orders('noon', service=service, page=page,
-                                              timeout=lane_end - time.monotonic())
+                                              timeout=lane_end - time.monotonic(),
+                                              **({'cursor': cursor} if cursor is not None else {}))
                 if time.monotonic() >= lane_end or not result.get('ok') or result.get('partial'):
                     break
                 lane['pages'] += 1
                 coverage = (result.get('coverage') or {}).get(service) or {}
-                page_verified = (service != 'minutes' or
-                                 (coverage.get('page') == page and type(coverage.get('total_pages')) is int
-                                  and coverage['total_pages'] >= page))
+                paging = (service == 'minutes' or (coverage.get('paging_verified') is True
+                          and coverage.get('default_page_only') is not True
+                          and coverage.get('history_first_page_only') is not True))
+                page_verified = (not paging or (coverage.get('page') == page and
+                                 (service == 'marketplace' or (type(coverage.get('total_pages')) is int
+                                  and coverage['total_pages'] >= page))))
                 before = set(seen)
                 listed = result['orders']
                 if not isinstance(listed, list):
                     raise ValueError('invalid list')
+                identities = {(o['order'], o.get('item_id'), o.get('shipment_id')) for o in listed}
+                if page > 1 and listed and not identities - page_ids:
+                    break
+                page_ids.update(identities)
                 page_done = True
                 shipment_cancellations = {o.get('order') for o in listed if isinstance(o, dict)
                                           and any(o.get(k) in ('cancelled', 'canceled', 'failed')
                                                   for k in ('status', 'raw_status'))}
+                unsettled = {o['order'] for o in listed
+                             if o.get('status') != 'delivered' or o.get('raw_status') != 'delivered'}
                 for order in listed:
                     oid = order['order']
+                    if service == 'marketplace' and oid in shipment_cancellations:
+                        broken = True
+                        lane['covered_from'] = None
+                        rows[:] = [row for row in rows if row['order'] != oid]
+                        continue
                     if oid in seen:
+                        if service == 'marketplace' and oid in before and oid in unsettled:
+                            # A later scoped card can invalidate earlier terminal
+                            # evidence. Do not retain its total as a positive match.
+                            broken = True
+                            rows[:] = [row for row in rows if row['order'] != oid]
                         continue
                     seen.add(oid)
                     try:
-                        if service == 'marketplace' and oid in shipment_cancellations:
-                            # One cancelled shipment cannot exclude the whole order
-                            # from matching. Without whole-order proof, keep it unread.
-                            raise ValueError('whole-order cancellation unverified')
-                        list_time = moment(order['placed_at'], service) if service == 'minutes' else None
-                        # The native Minutes placement time alone excludes older rows.
+                        list_time = (moment(order['placed_at'], service) if service == 'minutes' or
+                                     (paging and coverage.get('ordered_by_placed_at') is True) else None)
                         older = since is not None and list_time is not None and list_time < since - SAME_TIME
                         if older:
                             placed = list_time
@@ -226,7 +243,9 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                                     lane['covered_from'] = None
                                 break
                             row = known.get((service, oid))
-                            if row is not None and service != 'marketplace' and terminal(order):
+                            if row is not None and terminal(row) and (
+                                    (service != 'marketplace' and terminal(order)) or
+                                    (service == 'marketplace' and oid not in unsettled)):
                                 row = projection(row)
                                 lane['cached'] += 1
                             else:
@@ -242,15 +261,19 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                                     raise ValueError('unverified detail')
                                 row = projection({**detail, 'service': service,
                                                   'placed_at': list_time.isoformat() if list_time else detail.get('placed_at'),
-                                                  'status': order.get('status'), 'raw_status': order.get('raw_status')})
+                                                  'status': detail.get('status') if service == 'marketplace' else order.get('status'),
+                                                  'raw_status': order.get('raw_status')})
+                                if service == 'marketplace' and oid in unsettled:
+                                    row['whole_order_complete'] = False
                             # Current list status takes precedence over a cached terminal status.
-                            row = {**row, 'status': order.get('status'), 'raw_status': order.get('raw_status')}
+                            row = {**row, 'status': row.get('status') if service == 'marketplace' else order.get('status'),
+                                   'raw_status': order.get('raw_status')}
                             placed = moment(row['placed_at'])
                             rows.append(row)
-                        if previous is not None and placed > previous:
+                        if service != 'marketplace' and previous is not None and placed > previous:
                             unordered = True
                         previous = placed
-                        if not broken and not unordered and page_verified:
+                        if service != 'marketplace' and not broken and not unordered and page_verified:
                             lane['covered_from'] = placed.isoformat()
                     except Exception:
                         # Preserve earlier proof and later positive evidence, never bridge a gap.
@@ -267,20 +290,29 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                     lane['covered_from'] = None
                 if not page_done or broken or unordered:
                     break
-                if service == 'minutes':
+                if paging and service != 'marketplace':
                     pages = coverage.get('total_pages')
                     valid = type(pages) is int and pages >= page and coverage.get('page') == page
                     lane['exhaustive'] = valid and page == pages and (page == 1 or bool(seen - before))
-                    if not valid or lane['exhaustive'] or (since and previous and previous < since):
+                    if not valid or lane['exhaustive'] or (since and previous and previous < since - SAME_TIME):
                         break
                     # An empty or repeated page cannot advance proof of history.
                     if not listed or not (seen - before):
                         break
                     page += 1
+                elif paging:
+                    if not page_verified:
+                        break
+                    lane['exhaustive'] = coverage.get('exhaustive') is True
+                    nxt = coverage.get('next_cursor')
+                    if lane['exhaustive'] or not isinstance(nxt, str) or not nxt or nxt in cursors:
+                        break
+                    cursors.add(nxt)
+                    cursor = nxt
+                    page += 1
                 else:
                     lane['exhaustive'] = coverage.get('exhaustive') is True
-                    # Marketplace's page argument was observed to repeat page 1 and
-                    # still declares history_first_page_only. Never use it as paging.
+                    # Older installed readers still expose only the default page.
                     if not lane['exhaustive'] and (since is None or previous is None or previous >= since):
                         lane['limit'] = 'page-1 history only'
                     break
