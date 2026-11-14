@@ -80,9 +80,20 @@ REASON = (
     "including sqlite3/python/node scripts and read-only SQL. They contend with the live writers.\n"
     "Use Robob tools/APIs (board_*/card_*, t3ctl, /api/ardud/control/*), recall for past sessions, "
     "or server traces instead. Work on an existing isolated copy. Creating a copy or VACUUM INTO "
-    "also reads the live file and needs Abdullah's approval first.\n"
+    "also reads the live file: ask Abdullah on your card (card_ask), then run "
+    "`live-db-snapshot --card <id> --ask <id> --db <path>` once he approves.\n"
     "If only the database can answer, report the exact queries and stop."
 )
+
+
+def protected_databases():
+    """Concrete live files for the snapshot helper; classifier patterns stay unchanged."""
+    home = Path.home()
+    return {(home / relative).resolve() for relative in (
+        ".robob/userdata/statev2.sqlite", ".robob/userdata/state.sqlite",
+        ".t3/userdata/statev2.sqlite", ".t3/userdata/state.sqlite",
+        ".local/share/opencode/opencode.db",
+    )}
 
 
 def _name(node):

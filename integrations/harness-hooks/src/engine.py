@@ -27,6 +27,7 @@ import urllib.request
 import card_mask
 import desktop_lease
 import statev2_guard
+import snapshot_guard
 import quint_verify_guard
 import rootwide_search_guard
 
@@ -79,6 +80,7 @@ _LOG_RULES = {
     "native-check-unavailable", "desktop-read-only", "desktop-admitted", "desktop-denied",
     "desktop-unavailable", "desktop-end", "desktop-end-error", "desktop-flush", "desktop-flush-none",
     "live-database-read", "live-database-script", "live-database-script-unresolved", "live-database-unavailable",
+    "live-database-snapshot",
     "rootwide-search", "quint-verify", "card-mask",
 }
 _LOG_ERRORS = {
@@ -806,7 +808,13 @@ def decide(event, harness):
             # The live DB rule is independent of native identity and offbox
             # availability, so a service outage cannot disable this local check.
             try:
+                if snapshot_guard.exact_invocation(command, command_cwd):
+                    result = {"decision": "allow", "reason": "",
+                              "context": {"rule": "live-database-snapshot"}}
+                    return result
                 hit, cause = statev2_guard.classify_detail(command, command_cwd)
+                if not hit and statev2_guard.LIVE.search(command) and snapshot_guard.snapshot_attempt(command):
+                    hit, cause = "live-database-snapshot", "Snapshot requests require the exact installed, pinned helper invocation."
             except Exception as error:
                 error_type = type(error).__name__
                 result = {"decision": "deny", "reason": "Live database guard unavailable; this shell command was NOT run. Retry after the guard is available; do not bypass it.",
