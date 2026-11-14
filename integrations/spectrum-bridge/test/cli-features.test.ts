@@ -132,3 +132,47 @@ describe("send, poll, and app commands", () => {
     }
   });
 });
+
+
+test("offline socket-to-CLI send and file results retain only actual recipient acknowledgements", async () => {
+  const home = await fs.mkdtemp(join(os.tmpdir(), "cli-recipient-"));
+  const cli = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+  const socket = join(home, "s.sock");
+  const file = join(home, "a.txt");
+  await fs.writeFile(file, "test");
+  let chat: unknown = "owner";
+  let created = true;
+  const server = createServer(async (req, res) => {
+    for await (const _ of req) { /* Consume the request before acknowledging it. */ }
+    res.writeHead(202, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ id: `${req.url === "/files" ? "file" : "send"}:${"a".repeat(64)}`, created, chat, body: "PRIVATE", token: "PRIVATE" }));
+  });
+  try {
+    await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, resolve); });
+    const run = async (kind: string) => {
+      const args = kind === "file" ? ["send-file", `--file=${file}`] : ["send", "--text=hello"];
+      const child = Bun.spawn([process.execPath, "run", cli, ...args, "--key=k", "--session=s"], {
+        env: { NODE_ENV: "test", TOOLLOG_DIR: process.env.TOOLLOG_DIR, HOME: home, SPECTRUM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      return { stdout, stderr, exitCode };
+    };
+    for (const recipient of ["owner", "moni", "group-family-123"]) for (const kind of ["send", "file"]) for (const replay of [false, true]) {
+      chat = recipient; created = !replay;
+      const result = await run(kind);
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(JSON.parse(result.stdout)).toEqual({ id: `${kind}:${"a".repeat(64)}`, created, chat: recipient });
+    }
+    for (const invalid of ["", "../moni", "+15555550123", "Moni", "x".repeat(101), 5, null]) {
+      chat = invalid;
+      const result = await run("send");
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).not.toContain("PRIVATE");
+    }
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});

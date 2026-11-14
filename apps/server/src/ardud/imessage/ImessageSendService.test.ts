@@ -52,7 +52,7 @@ interface Harness {
 const makeHarness = (): Harness => ({
   calls: [],
   reply: {
-    stdout: `{"id":"send:${HEX}","created":true}\n`,
+    stdout: `{"id":"send:${HEX}","created":true,"chat":"owner"}\n`,
     stderr: "",
     exitCode: 0,
     timedOut: false,
@@ -173,6 +173,39 @@ describe("imessage_send", () => {
     expect(Context.get(tool.annotations, Tool.OpenWorld)).toBe(true);
   });
 
+  it.effect.each(["owner", "moni", "group-family-123"])(
+    "reports actual %s recipient for implicit child sends and replays",
+    (recipient) => {
+      const harness = makeHarness();
+      harness.reply = {
+        ...harness.reply,
+        stdout: JSON.stringify({ id: `send:${HEX}`, created: false, chat: recipient }),
+      };
+      return run(
+        harness,
+        Effect.gen(function* () {
+          const result = yield* call(caller(grandchild), { text: "hello" });
+          expect(result.structured).toEqual({ id: `send:${HEX}`, created: false, chat: recipient });
+        }),
+      );
+    },
+  );
+
+  it.effect("does not invent owner when an old bridge omits the recipient", () => {
+    const harness = makeHarness();
+    harness.reply = {
+      ...harness.reply,
+      stdout: JSON.stringify({ id: `send:${HEX}`, created: true }),
+    };
+    return run(
+      harness,
+      Effect.gen(function* () {
+        const result = yield* call(caller(imessageRoot), { text: "hello" });
+        expect(result.structured).toMatchObject({ chat: "unknown" });
+      }),
+    );
+  });
+
   it.effect("texts the root thread's chat with a default session and key", () => {
     const harness = makeHarness();
     return run(
@@ -266,6 +299,10 @@ describe("imessage_send", () => {
     return run(
       harness,
       Effect.gen(function* () {
+        harness.reply = {
+          ...harness.reply,
+          stdout: `{"id":"send:${HEX}","created":true,"chat":"moni"}\n`,
+        };
         const toMoni = yield* call(caller(imessageRoot), {
           text: "hi Moni",
           to: "moni",
@@ -285,7 +322,7 @@ describe("imessage_send", () => {
         expect(option(harness.calls[1]!, "effect")).toBe("confetti");
 
         harness.reply = {
-          stdout: `{"id":"file:${HEX}","created":false}`,
+          stdout: `{"id":"file:${HEX}","created":false,"chat":"owner"}`,
           stderr: "",
           exitCode: 0,
           timedOut: false,

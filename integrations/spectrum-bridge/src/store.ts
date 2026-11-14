@@ -2,6 +2,9 @@ import { toolError, toolLog } from "./toollog.ts";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 
+const steerSourceKey = (sessionId: string, generation: number, inboundId: string) =>
+  `steer-reply-source:${createHash("sha256").update(JSON.stringify([sessionId, generation, inboundId])).digest("hex")}`;
+
 export type FileAttachment = { sha256: string; name: string; mimeType: string; size: number };
 export type OutboxPoll = { title: string; options: string[] };
 export type OutboxApp = {
@@ -177,10 +180,13 @@ export class Store {
       if (result.changes) {
         toolLog.capture(() => {
           this.set(`log-queued:${op.id}`, Date.now());
-          const turn = this.get<{ id: string; inboundId?: string } | null>("activeTurn");
+          const turn = this.get<{ id: string; inboundId?: string; replyInboundId?: string } | null>("activeTurn");
           // The quote may target a later batch member; correlation follows the turn that caused the send.
-          const inboundId = attribution ? attribution.inboundId
-            : (turn?.id === op.sessionId ? turn?.inboundId : undefined) ?? op.replyTo;
+          let inboundId = attribution ? attribution.inboundId
+            : (turn && turn.id === op.sessionId ? turn.replyInboundId ?? turn.inboundId : undefined) ?? op.replyTo;
+          if (inboundId && op.sessionId && op.generation !== undefined) {
+            inboundId = this.get<string>(steerSourceKey(op.sessionId, op.generation, inboundId)) ?? inboundId;
+          }
           if (inboundId) this.set(`log-inbound-id:${op.id}`, inboundId);
           const row = inboundId ? this.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(inboundId) : undefined;
           const receivedAt = row ? (JSON.parse(row.payload) as { receivedAt?: number }).receivedAt : undefined;
@@ -194,6 +200,27 @@ export class Store {
       if (existing.payload !== payload) throw new Error(`Outbox content mismatch: ${op.id}`);
       return false;
     }).immediate();
+  }
+
+  /** A steer can commit before its HTTP response, so its already queued replies need the confirmed human source. */
+  attributeSteeredReplies(inboundId: string, sessionId: string, generation: number, afterOutbox: number, rootInboundId?: string): void {
+    const input = this.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(inboundId);
+    if (!input || !rootInboundId || !/^(?:secret|wake|reset):/.test(rootInboundId)) return;
+    // An API fold may have captured the old source before confirmation and enqueue after this transaction.
+    const key = steerSourceKey(sessionId, generation, rootInboundId);
+    if (this.get(key) === undefined) this.set(key, inboundId);
+    const receivedAt = (JSON.parse(input.payload) as { receivedAt?: number }).receivedAt;
+    const rows = this.db.query<{ id: string; state: string }, [number, string, number]>(
+      "SELECT id, state FROM outbox WHERE rowid > ? AND json_extract(payload, '$.sessionId') = ? AND json_extract(payload, '$.generation') = ?",
+    ).all(afterOutbox, sessionId, generation);
+    for (const row of rows) {
+      const previous = this.get<string>(`log-inbound-id:${row.id}`);
+      if (previous !== rootInboundId) continue;
+      this.set(`log-inbound-id:${row.id}`, inboundId);
+      if (typeof receivedAt === "number" && Number.isFinite(receivedAt)) this.set(`log-inbound-at:${row.id}`, receivedAt);
+      // Health may have consumed the acceptance receipt while its source was still uncertain.
+      if (row.state === "sent") this.set(`reply-gap-recheck:${row.id}`, true);
+    }
   }
 
   pendingOutbox(): OutboxRecord[] {

@@ -14,6 +14,7 @@ import { backendKind, createBackend } from "./backend.ts";
 import type { Access } from "./chats.ts";
 import { alertSkillPath, skillPath, stateRoot, telegramBridgeSocket, type Config } from "./config.ts";
 import { Delivery } from "./delivery.ts";
+import { ReplyGapMonitor } from "./reply-gap.ts";
 import { checkReply, readReplyRules } from "./replyCheck.ts";
 import { sendblueErrorKey, type Line, type LineEvent } from "./line.ts";
 import { acquireLock } from "./lock.ts";
@@ -45,7 +46,7 @@ export type MainIo = {
   removeStaleSocket: (path: string) => Promise<void>;
 };
 
-type Parts = { router: Router; delivery: Delivery; api: (request: Request) => Promise<Response>; backend: ChatBackend; busy: boolean };
+type Parts = { router: Router; delivery: Delivery; replyGap: ReplyGapMonitor; api: (request: Request) => Promise<Response>; backend: ChatBackend; busy: boolean };
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -234,7 +235,8 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       foldText: (text, operationId) => router.foldToolText(text, operationId),
       log,
     });
-    return { router, delivery, api: chatApi, backend: chatBackend, busy: false };
+    const replyGap = new ReplyGapMonitor(chat.store, { chat: chat.info.slug, notify: outlet.notify });
+    return { router, delivery, replyGap, api: chatApi, backend: chatBackend, busy: false };
   };
   registry = new ChatRegistry<Parts>({ line, owner: config.owner, ownerStore, stateRoot, access: () => access, build });
   registry.restore();
@@ -330,6 +332,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const timer = setInterval(() => {
     for (const chat of chats.all()) {
       void chat.parts.delivery.tick().catch((caughtError) => { toolError("sb-main", "sb-main.catch13", caughtError); return log("sender-failed"); });
+      if (ready()) void chat.parts.replyGap.tick().catch((caughtError) => { toolError("sb-main", "reply-gap.check", caughtError); });
       if (ready()) void chat.parts.router.checkInboundLatency().catch((caughtError) => { toolError("sb-main", "sb-main.catch14", caughtError); return log("inbound-latency-check-failed"); });
       if (ready() && !chat.parts.busy) {
         chat.parts.busy = true;

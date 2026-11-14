@@ -579,3 +579,29 @@ test("late Sendblue failures retain the status code but never the provider's err
   expect(logs.filter(l => l.name === "reply.failed")).toHaveLength(1);
   expect(JSON.stringify(logs)).not.toContain("PRIVATE_PROVIDER_MESSAGE");
 });
+
+test("send and file acknowledgements name the routed recipient for owner, Moni, groups and retries", async () => {
+  const env = setup(true);
+  const chats = env.registry();
+  const targets = [chats.owner, chats.open(chatKey.dm(moni)), chats.open(chatKey.group("GRP-Allowed-123"), "Family Trip")];
+  const handler = createSbApi({ registry: chats, line: env.line, accessPath: join(env.stateRoot, "access.json"), enabled: () => true, health: () => ({}) });
+  const post = async (path: string, body: Record<string, unknown>) => {
+    const response = await handler(new Request(`http://bridge${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
+    return { status: response.status, body: await response.json() as Record<string, unknown> };
+  };
+  for (const [index, target] of targets.entries()) {
+    const sessionId = `session-${index}`;
+    target.store.set("route", { id: sessionId, generation: 1 });
+    for (const path of ["/send", "/files"]) {
+      const body = { sessionId, dedupeKey: `${path}-${index}`, text: "hello", ...(path === "/files" ? { base64: "aGk=", name: "a.txt", mimeType: "text/plain" } : {}) };
+      const first = await post(path, body);
+      expect(first).toMatchObject({ status: 202, body: { created: true, chat: target.info.slug } });
+      expect(await post(path, body)).toEqual({ status: 200, body: { ...first.body, created: false } });
+    }
+  }
+  for (const target of targets) {
+    const first = await post("/send", { text: "relay", to: target.info.slug, sessionId: "session-0", dedupeKey: `relay-${target.info.slug}` });
+    expect(first).toMatchObject({ status: 202, body: { chat: target.info.slug } });
+    expect((await post("/send", { text: "relay", to: target.info.slug, sessionId: "session-0", dedupeKey: `relay-${target.info.slug}` })).body).toMatchObject({ created: false, chat: target.info.slug });
+  }
+});
