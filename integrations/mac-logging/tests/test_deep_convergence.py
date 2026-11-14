@@ -590,3 +590,61 @@ deep_inventory.run_pass([Path(sys.argv[2])],run,budget=30)
         self.assertFalse(state['partials'])
         self.assertEqual([cmd[-1] for cmd,_ in calls],
                          [str(child/'b'),str(roots[1]/'0000'),str(child/'a')])
+
+    def test_parts_expiring_during_same_root_sibling_work_are_requeued(self):
+        root=self.roots([('same-root-expiry',2)])[0]
+        first,second=root/'0000',root/'0001'
+        for path in (first/'a',first/'b',second/'part'):
+            path.mkdir()
+        jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{
+            str(first):dict(timeouts=2,partial=True,parts={str(first/'a'):
+                dict(bytes=1024,at=self.now-jobs.INVENTORY_PARTS_FRESH_S+1,partial=False)}),
+            str(second):dict(timeouts=2,partial=True)}}))
+        calls=[]
+        deep.run_pass([root],self.runner(lambda p:2 if p==second/'part' else .1,calls),budget=5400)
+        self.assertEqual([cmd[-1] for cmd,_ in calls],
+                         [str(first/'b'),str(second/'part'),str(first/'a')])
+        state=jobs.read_state('disk-inventory')
+        self.assertFalse(state['partials'])
+        self.assertEqual(state['childState'][str(root)][str(first)]['partsDone'],2)
+        self.assertEqual(self.rows('disk.deep.end')[-1]['props']['childrenRemaining'],0)
+        self.assertAlmostEqual(self.clock[0],2.2)
+
+    def test_same_root_expiry_preserves_failed_part_and_budget_guards(self):
+        for failure in ('io','cap','listing'):
+            with self.subTest(failure=failure):
+                self.clock[0]=0
+                root=self.roots([('same-root-'+failure,2)])[0]
+                first,second=root/'0000',root/'0001'
+                for path in (first/'a',first/'b',second/'part'):
+                    path.mkdir()
+                jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{
+                    str(first):dict(timeouts=2,partial=True,parts={str(first/'a'):
+                        dict(bytes=1024,at=self.now-jobs.INVENTORY_PARTS_FRESH_S+1,partial=False)}),
+                    str(second):dict(timeouts=2,partial=True)}}))
+                calls=[]
+                normal=self.runner(lambda p:2 if p==second/'part' else 700
+                                   if failure=='cap' and p==first/'a' else .1,calls)
+                def run(command,**kwargs):
+                    result=normal(command,**kwargs)
+                    if failure=='io' and command[-1]==str(first/'a'):
+                        return SimpleNamespace(returncode=1,stdout=result.stdout,stderr='du: Input/output error')
+                    return result
+                original=jobs.inventory_listing
+                listings=[]
+                def listing(path,deadline):
+                    if Path(path)==first:
+                        listings.append(path)
+                        if len(listings)>2:
+                            self.fail('a failed or capped refresh must not spin')
+                        if failure=='listing' and len(listings)==2:
+                            return [],False
+                    return original(path,deadline)
+                with patch.object(jobs,'inventory_listing',side_effect=listing):
+                    deep.run_pass([root],run,budget=5400)
+                value=jobs.read_state('disk-inventory')['childState'][str(root)][str(first)]
+                self.assertTrue(value['partial'])
+                self.assertNotIn('bytes',value)
+                self.assertEqual(sum(cmd[-1]==str(first/'a') for cmd,_ in calls),int(failure!='listing'))
+                self.assertLessEqual(self.clock[0]-2,600.000001)
+                self.assertEqual(self.rows('disk.deep.end')[-1]['props']['childrenRemaining'],1)

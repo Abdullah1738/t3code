@@ -223,8 +223,12 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                     # Work that was fresh on the first turn may now be stale.
                     for root in roots:
                         for child, value in child_state[str(root)].items():
-                            if (isinstance(value.get('parts'), dict) and value.get('partial') is False
-                                    and jobs.inventory_needs_measurement(value, time.time())):
+                            work = part_work[str(root)].get(child, {})
+                            if (jobs.inventory_has_parts(value) and work.get('completed')
+                                    and work['seconds'] < jobs.DEEP_CHILD_CAP_S
+                                    and any(part not in work['attempted'] and jobs.inventory_needs_measurement(
+                                        saved, time.time(), jobs.INVENTORY_PARTS_FRESH_S)
+                                        for part, saved in value['parts'].items())):
                                 attempted[str(root)].discard(child)
                     queue = [root for root in roots if any(needs_work(str(root), e)
                         for e in listings[str(root)][0])]

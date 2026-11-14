@@ -523,6 +523,7 @@ def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, me
     value.setdefault('partsDone', 0)
     value.setdefault('partsTotal', len(parts))
     work = part_work.setdefault(entry.path, dict(attempted=set(), seconds=0, singles=set()))
+    work['completed'] = False
     if work['seconds'] >= DEEP_CHILD_CAP_S:
         return False
     deadline = min(deadline, time.monotonic()+DEEP_CHILD_CAP_S-work['seconds'])
@@ -594,6 +595,9 @@ def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, me
         total = sum(v['bytes'] for v in parts.values()) + ((own.st_blocks*512+1023)//1024)*1024
         value.update(bytes=total, at=min((v['at'] for v in parts.values()), default=time.time()),
                      partial=False, isDirectory=True, deniedCount=0)
+        # Aggregation can expire this total during sibling work before the
+        # scheduler sees it; retain the completion milestone for requeueing.
+        work['completed'] = True
         value.pop('limited', None)
         value.pop('slow', None)
     except Exception as exc:
