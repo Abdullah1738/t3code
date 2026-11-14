@@ -1,14 +1,18 @@
-import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { OpenChamber, type MessageRecord, type SessionRecord } from "../src/openchamber.ts";
 import { Router } from "../src/router.ts";
 import { Store } from "../src/store.ts";
 import type { ChatContext } from "../src/chats.ts";
 import type { NormalizedInbound } from "../src/photon.ts";
+import { toolLog } from "../src/toollog.ts";
+import { completionChecked, tickRead, timeTick } from "../src/tick-timing.ts";
 
 const hash = (id: string) => `msg_${createHash("sha256").update(id).digest("hex")}`;
 const now = Date.parse("2026-11-13T10:00:00Z");
 class Backend extends OpenChamber {
+  steer?: ConstructorParameters<typeof Router>[1]["steer"];
+  async sessionBusy() { return false; }
   prompts: string[] = [];
   targets: string[] = [];
   records: MessageRecord[] = [];
@@ -513,4 +517,127 @@ test.each(["owner", "moni"].flatMap(slug => ["/status", "/new"].map(command => (
   expect(h.backend.records.filter(r => r.type === "user")).toEqual([
     expect.objectContaining({ id: hash("recovered-a"), text: h.batch.text }),
   ]);
+});
+
+test.each(["none", "refused", "pending"] as const)("completion snapshot settles before a stalled status read with %s steer", async mode => {
+  const h = setup(); h.input("first", 0); await h.router.tick();
+  h.backend.messages = async () => [...h.backend.records];
+  const entered = Promise.withResolvers<void>();
+  const blocked = Promise.withResolvers<Record<string, never>>();
+  const replied = Promise.withResolvers<void>();
+  const log = h.router as unknown as { options: { log: (event: string, code?: string) => void } };
+  const previous = log.options.log;
+  log.options.log = (event, code) => { previous(event, code); if (event === "reply-enqueued") replied.resolve(); };
+  let reads = 0;
+  h.backend.sessionBusy = async () => {
+    if (++reads === 1) { entered.resolve(); await blocked.promise; }
+    return false;
+  };
+  if (mode !== "none") {
+    h.input("followup", 0);
+    h.backend.steer = async () => "refused";
+    if (mode === "refused") {
+      // A previous refusal leaves its sealed members queued during the cooldown.
+      (h.router as unknown as { steerRefusedAt: number }).steerRefusedAt = now;
+    }
+  }
+  const tick = h.router.tick();
+  try {
+    await entered.promise;
+    setSystemTime(now + 1_000);
+    h.backend.records = [...h.backend.records,
+      { id: "answer-first", type: "assistant", content: [{ type: "text", text: "First answer" }], finish: "stop", time: { created: now, completed: now + 1_000 } },
+      { id: "idle-first", type: "idle", outcome: "succeeded", completedAt: now + 1_000, time: { created: now + 1_000 } }];
+    await h.router.checkCompletion();
+    await replied.promise;
+    expect(h.store.getOperation("reply:1:answer-first")?.state).toBe("pending");
+    expect(h.logs.filter(line => line.startsWith("run-completed-seen"))).toHaveLength(1);
+    // Required prompt admission stays serialized, but optional watch/discovery does not precede it.
+    if (mode !== "none") {
+      const admitted = Promise.withResolvers<void>();
+      const prompt = h.backend.prompt.bind(h.backend);
+      h.backend.prompt = async (...args) => { await prompt(...args); admitted.resolve(); };
+      await admitted.promise;
+      expect(h.backend.prompts).toEqual([hash("first"), hash("followup")]);
+    }
+  } finally {
+    blocked.resolve({}); await tick;
+  }
+  await h.router.tick();
+  expect(h.logs.filter(line => line.startsWith("run-completed-seen"))).toHaveLength(1);
+  expect(h.backend.prompts.filter(id => id === hash("followup"))).toHaveLength(mode === "none" ? 0 : 1);
+});
+
+test("tick timing has a strict five-second threshold and records read order", async () => {
+  let ms = 0;
+  const clock = spyOn(performance, "now").mockImplementation(() => ms);
+  const write = spyOn(toolLog, "write").mockImplementation(() => {});
+  try {
+    await timeTick({ chat: "owner" }, async () => { ms = 5_000; });
+    expect(write).not.toHaveBeenCalled();
+    await timeTick({ chat: "owner" }, async () => {
+      completionChecked(); ms = 10_001; tickRead("/threads", 5_001);
+    });
+    expect(write.mock.calls[0]![0]).toMatchObject({ name: "turn.tick_timing", durationMs: 5_001,
+      props: { route: "/threads", slowestReadMs: 5_000, completionCheck: "before" } });
+    await timeTick({ chat: "owner" }, async () => {
+      ms = 16_002; tickRead("/threads/:id/messages", 10_001); completionChecked();
+    });
+    expect(write.mock.calls[1]![0]).toMatchObject({ props: { completionCheck: "after", slowestReadMs: 6_001 } });
+  } finally { write.mockRestore(); clock.mockRestore(); }
+});
+
+test("late completion snapshots after a route rotation cannot reply or change the new route", async () => {
+  const h = setup(); h.input("first", 0); await h.router.tick();
+  const read = Promise.withResolvers<MessageRecord[]>();
+  h.backend.messages = async () => read.promise;
+  const pending = h.router.checkCompletion();
+  const next = { id: "ses_2", directory: "/Chats/ses_2", generation: 2 };
+  h.store.set("route", next); h.store.set("activeTurn", null);
+  read.resolve([{ id: hash("first"), type: "user", text: "first", time: { created: now } },
+    { id: "late-answer", type: "assistant", content: [{ type: "text", text: "old" }], time: { created: now, completed: now } },
+    { id: "late-idle", type: "idle", outcome: "succeeded", time: { created: now } }]);
+  await pending;
+  expect(h.store.get<typeof next>("route")).toEqual(next);
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(h.logs.some(line => line.startsWith("run-completed-seen"))).toBeFalse();
+  expect(h.store.getOperation("reply:1:late-answer")).toBeUndefined();
+});
+
+test("run-completed-seen records backend completion lag exactly once", async () => {
+  const h = setup(); h.input("first", 0); await h.router.tick();
+  setSystemTime(now + 2_000);
+  h.backend.records.push({ id: "answer", type: "assistant", content: [{ type: "text", text: "Answer" }], finish: "stop", time: { created: now, completed: now + 500 } },
+    { id: "idle", type: "idle", outcome: "succeeded", completedAt: now + 500, time: { created: now + 500 } });
+  const write = spyOn(toolLog, "write").mockImplementation(() => {});
+  try {
+    await h.router.tick(); await h.router.tick();
+    const seen = write.mock.calls.map(([entry]) => entry).filter(entry => entry.name === "run-completed-seen");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ kind: "perf", props: { completionLagMs: 1_500 } });
+  } finally { write.mockRestore(); }
+});
+
+test.each([false, true])("completion keeps uncertain steer readback and same-id ownership, accepted=%s", async accepted => {
+  const h = setup(); h.input("first", 0); await h.router.tick();
+  h.backend.sessionBusy = async () => true;
+  let steerCalls = 0;
+  h.backend.steer = async (_id, _directory, id, text) => {
+    steerCalls++;
+    if (steerCalls > 1) return "refused";
+    if (accepted) h.backend.records.push({ id, type: "user", text, time: { created: now } });
+    throw new Error("reply lost after POST");
+  };
+  h.input("followup", 0); await h.router.tick();
+  h.backend.records = [...h.backend.records,
+    { id: "answer", type: "assistant", content: [{ type: "text", text: "Answer" }], finish: "stop", time: { created: now, completed: now } },
+    { id: "idle", type: "idle", outcome: "succeeded", time: { created: now } }];
+  h.backend.sessionBusy = async () => false;
+  await h.router.checkCompletion();
+  await h.router.tick(); await h.router.tick();
+  expect(h.store.getOperation("reply:1:answer")?.state).toBe("pending");
+  expect(h.logs.filter(line => line.startsWith("run-completed-seen"))).toHaveLength(1);
+  expect(h.states()).toEqual(["done", "done"]);
+  expect(h.backend.prompts.filter(id => id === hash("followup"))).toHaveLength(accepted ? 0 : 1);
+  expect(h.backend.records.filter(record => record.type === "user" && record.id === hash("followup"))).toHaveLength(1);
 });

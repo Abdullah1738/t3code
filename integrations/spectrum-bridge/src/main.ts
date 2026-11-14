@@ -289,6 +289,7 @@ async function main(): Promise<void> {
   let routerBusy = false;
   const timer = setInterval(() => {
     void delivery.tick().catch((caughtError) => { toolError("main", "main.catch12", caughtError); return log("sender-failed"); });
+    if (ready()) void router?.checkCompletion();
     if (ready()) void replyGap.tick().catch((caughtError) => { toolError("main", "reply-gap.check", caughtError); });
     if (ready()) void router?.checkInboundLatency().catch((caughtError) => { toolError("main", "main.catch13", caughtError); return log("inbound-latency-check-failed"); });
     if (ready() && router && !routerBusy) {

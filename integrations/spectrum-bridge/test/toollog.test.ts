@@ -217,3 +217,17 @@ test.each([
   expect(rollup?.topErrorTags[0]).toMatchObject({ tag: expected, count: 2, sampleId: "msg-fixture" });
   expect(JSON.stringify(rollup)).not.toContain("PRIVATE_MESSAGE");
 });
+
+test("failed control perf rows retain safe error detail and tick/completion measurements survive cleaning", () => {
+  const h = setup();
+  h.log.write({ component: "robob", kind: "perf", name: "turn.robob_call", ok: false, durationMs: 25_001,
+    props: { method: "GET", route: "/threads/:id/messages" }, error: { tag: "control.request_failed", cause: new DOMException("private response content", "TimeoutError") } });
+  h.log.write({ component: "router", kind: "perf", name: "turn.tick_timing", durationMs: 5_001,
+    props: { route: "/threads", slowestReadMs: 5_000, completionCheck: "before", secret: "must be cut" } });
+  h.log.write({ component: "router", kind: "perf", name: "run-completed-seen", props: { completionLagMs: 123 } });
+  const lines = h.lines();
+  expect(lines[0]!.error?.name).toBe("TimeoutError");
+  expect(JSON.stringify(lines)).not.toContain("private response content");
+  expect(lines[1]!.props).toEqual({ route: "/threads", slowestReadMs: 5_000, completionCheck: "before" });
+  expect(lines[2]!.props).toEqual({ completionLagMs: 123 });
+});

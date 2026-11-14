@@ -1,5 +1,6 @@
 import { toolLog as watcherLog } from "./watcherlog.ts";
-import { toolError, toolLog } from "./toollog.ts";
+import { completionReady, toolError, toolLog } from "./toollog.ts";
+import { completionChecked, timeTick } from "./tick-timing.ts";
 import { appendFold, foldMedsLine, foldSkipped, type FoldOptions } from "./meds-fold.ts";
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
@@ -668,6 +669,54 @@ async function bounded<T>(operation: Promise<T>, timeout = 10_000): Promise<T> {
 }
 
 export class Router {
+  private completionRead?: { key: string; result: Promise<MessageRecord[]>; records?: MessageRecord[]; at?: number };
+  private completionTargetKey?: string;
+  private completionWake = Promise.withResolvers<void>();
+  private applyingCompletion = false;
+
+  private completionKey(turn: Turn): string {
+    return JSON.stringify([turn.id, turn.directory, turn.generation, turn.messageId, turn.startedAt,
+      turn.steered, this.store.get<Watermark | null>("watermark")]);
+  }
+
+  private completedSnapshot(): boolean {
+    const turn = this.store.get<Turn | null>("activeTurn");
+    const read = this.completionRead;
+    if (!turn || !this.current(turn) || read?.key !== this.completionKey(turn) || !read.records) return false;
+    const prompts = [turn.messageId, ...turn.steered ?? []];
+    if (prompts.some(id => !read.records!.some(record => record.id === id))) return false;
+    let last = -1;
+    read.records.forEach((record, i) => { if (prompts.includes(record.id)) last = i; });
+    return read.records.slice(last + 1).some(record => record.type === "idle");
+  }
+
+  /** Read-only producer: the sender timer calls this even while a mutating tick is waiting. */
+  checkCompletion(): Promise<void> {
+    const turn = this.store.get<Turn | null>("activeTurn");
+    if (!turn || !this.current(turn) || turn.phase === "failed") return Promise.resolve();
+    const key = this.completionKey(turn);
+    if (this.completionTargetKey !== key) {
+      if (this.completionTargetKey !== undefined) this.completionWake = Promise.withResolvers<void>();
+      this.completionTargetKey = key;
+    }
+    if (this.completionRead?.key === key && (!this.completionRead.records || this.completedSnapshot()
+      || Date.now() - this.completionRead.at! < 1_000)) return this.completionRead.result.then(() => {}, () => {});
+    const mark = this.store.get<Watermark | null>("watermark");
+    const read: NonNullable<Router["completionRead"]> = { key,
+      result: this.backend.messages(turn.id, turn.directory, turn.background ? { until: turn.messageId, limit: 20 }
+        : mark?.sessionId === turn.id ? { until: mark.id } : { until: turn.messageId, since: turn.startedAt - 60_000 }),
+    };
+    this.completionRead = read;
+    return read.result.then(records => {
+      read.records = records;
+      read.at = Date.now();
+      if (this.completedSnapshot()) this.completionWake.resolve();
+    }, error => {
+      if (this.completionRead === read) this.completionRead = undefined;
+      toolError("router", "router.completion_read", error);
+    });
+  }
+
   private medsFolding = new Map<string, Promise<void>>();
 
   async foldToolText(text: string, operationId: string): Promise<string> {
@@ -764,7 +813,9 @@ export class Router {
   }
 
   tick(): Promise<void> {
-    return this.ticking ??= this.run().finally(() => { this.ticking = undefined; });
+    const turn = this.store.get<Turn | null>("activeTurn");
+    return this.ticking ??= timeTick({ chat: this.options.context?.chat.slug ?? "owner", ...(turn ? { threadId: turn.id } : {}) }, () => this.run())
+      .finally(() => { this.ticking = undefined; });
   }
 
   private checkingFailed?: Promise<void>;
@@ -1479,6 +1530,8 @@ export class Router {
       }
       const beforePoll = this.store.get<Turn | null>("activeTurn");
       await this.poll();
+      // A snapshot can finish while discovery from the previous snapshot is still waiting.
+      if (this.completedSnapshot()) await this.poll();
       this.flushOutageNotice();
       const afterPoll = this.store.get<Turn | null>("activeTurn");
       // A completion can expose a late acceptance or release a sealed steer for its own turn.
@@ -1487,7 +1540,7 @@ export class Router {
         for (const row of this.store.pendingInbound()) if (row.state === "processing" && this.steering(row.id)) await this.steer(row, preceding);
       }
       // A typed message already waiting gets a dispatch before optional background discovery.
-      const dispatchFirst = this.latencyDue();
+      const dispatchFirst = this.latencyDue() || !!beforePoll && afterPoll?.messageId !== beforePoll.messageId;
       if (dispatchFirst) await this.dispatch(preceding);
       const beforeWatch = this.store.get<Turn | null>("activeTurn");
       await this.watch();
@@ -1676,9 +1729,14 @@ export class Router {
    * control is waiting to be handled they fall back to the old ten seconds, so
    * /new and answers are not kept behind a string of slow reads.
    */
-  private reading<T>(operation: Promise<T>): Promise<T> {
+  private reading<T>(operation: Promise<T>, interruptible = true): Promise<T> {
     const handled = this.controlNow === undefined ? this.handledNow : new Set(this.handledNow).add(this.controlNow);
-    return bounded(operation, this.controlArrived(handled) ? CONTROL_WAIT_MS : READ_WAIT_MS);
+    const waiting = bounded(operation, this.controlArrived(handled) ? CONTROL_WAIT_MS : READ_WAIT_MS);
+    if (!interruptible || this.applyingCompletion || this.controlNow !== undefined) return waiting;
+    return Promise.race([waiting, this.completionWake.promise.then(() => {
+      if (this.completedSnapshot()) throw completionReady;
+      return waiting;
+    })]);
   }
 
   /**
@@ -2363,7 +2421,7 @@ export class Router {
     await this.updateTyping(false);
     if (old && turn && turn.id === old.id && turn.generation === old.generation && turn.directory === old.directory) {
       // A turn that won't stop can't take the nudge, so that /new escapes to a new thread.
-      await this.reading(this.backend.abort(old.id, old.directory)).catch((caughtError) => { toolError("router", "router.catch19", caughtError); inPlace = false; });
+      await this.reading(this.backend.abort(old.id, old.directory), false).catch((caughtError) => { toolError("router", "router.catch19", caughtError); inPlace = false; });
     }
     if (old && inPlace) {
       this.store.db.transaction(() => {
@@ -2382,7 +2440,7 @@ export class Router {
       return;
     }
     try {
-      const created = await this.reading(this.backend.createChat());
+      const created = await this.reading(this.backend.createChat(), false);
       this.store.db.transaction(() => {
         this.store.set("route", { ...created, generation, createdAt: Date.now(), threadAt: Date.now() });
         this.acknowledge(inboundId, "Fresh start. What's up?");
@@ -2572,7 +2630,7 @@ export class Router {
       this.store.updateInbound(inboundId, "processing");
     }).immediate();
     try {
-      if (await this.reading(this.backend.questionReply(request, directory, answers)) === false) throw new Error();
+      if (await this.reading(this.backend.questionReply(request, directory, answers), false) === false) throw new Error();
       if (!this.current(route)) return;
       this.store.db.transaction(() => {
         entry.state = "answered";
@@ -3341,7 +3399,7 @@ export class Router {
       }).immediate();
       try {
         const now = Date.now();
-        activeRoute = { ...await this.reading(this.backend.createChat()), generation, createdAt: now, threadAt: now };
+        activeRoute = { ...await this.reading(this.backend.createChat(), false), generation, createdAt: now, threadAt: now };
         if (this.store.get<number>("routeGeneration") !== generation || this.store.get<Route | null>("route")) return;
         this.store.db.transaction(() => {
           this.store.set("route", activeRoute);
@@ -3658,7 +3716,7 @@ export class Router {
       lines.unshift(said);
       size += said.length + 1;
     }
-    const created = await this.reading(this.backend.createChat());
+    const created = await this.reading(this.backend.createChat(), false);
     if (!this.current(route)) return route;
     const next: Route = { ...created, generation: route.generation, createdAt: Date.now(), threadAt: Date.now() };
     const orders = this.pendingOrders(route);
@@ -4146,10 +4204,15 @@ export class Router {
     // Work has no deadline: a turn runs for as long as the agent needs.
     try {
       const mark = this.store.get<Watermark | null>("watermark");
-      let messages = await this.reading(this.backend.messages(turn.id, turn.directory, turn.background
-        ? { until: turn.messageId, limit: 20 }
-        : mark?.sessionId === turn.id ? { until: mark.id }
-        : { until: turn.messageId, since: turn.startedAt - 60_000 }));
+      void this.checkCompletion();
+      const read = this.completionRead;
+      if (!read || read.key !== this.completionKey(turn)) return;
+      let messages = await bounded(read.result, READ_WAIT_MS);
+      if (read.key !== this.completionKey(turn)) return;
+      this.applyingCompletion = this.completedSnapshot();
+      if (this.completionRead === read) this.completionRead = undefined;
+      this.completionWake = Promise.withResolvers<void>();
+      completionChecked();
       if (!this.current(turn)) return;
       if (turn.phase === "submitting" || turn.phase === "unknown" || turn.phase === "held") {
         await this.reconcile(turn, messages);
@@ -4307,6 +4370,10 @@ export class Router {
       if (idle && idle.id !== this.seenIdle) {
         this.seenIdle = idle.id;
         this.stage("run-completed-seen", turn.inboundId ?? turn.messageId);
+        toolLog.capture(() => toolLog.write({ component: "router", kind: "perf", name: "run-completed-seen",
+          ids: { threadId: turn!.id, messageId: turn!.messageId, ...(turn!.inboundId ? { inboundId: turn!.inboundId } : {}) },
+          props: typeof idle.completedAt === "number" && Number.isFinite(idle.completedAt)
+            ? { completionLagMs: Math.max(0, Date.now() - idle.completedAt) } : {} }));
       }
       if (idle) await this.noteRefusal(turn, replies, idle.outcome !== "succeeded" || final?.error !== undefined);
       if (!this.current(turn)) return;
@@ -4459,7 +4526,7 @@ export class Router {
       await this.enqueueReply(turn, idle, replies, earlier, final, text, scope, entries, priorFailure);
     } catch (caughtError) { toolError("router", "router.catch48", caughtError);
       // Transient backend trouble: polling simply retries on the next tick.
-    }
+    } finally { this.applyingCompletion = false; }
   }
 
   private async enqueueReply(turn: Turn, idle: Extract<MessageRecord, { type: "idle" }>,
