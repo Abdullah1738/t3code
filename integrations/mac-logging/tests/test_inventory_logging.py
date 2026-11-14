@@ -139,12 +139,15 @@ class InventoryLoggingTests(unittest.TestCase):
                 partials = [r for r in rows if r['name'] == 'disk.inventory.source' and r['props']['source'] == str(child)]
                 self.assertTrue(partials)
                 self.assertTrue(all(r['props']['partial'] and r['props']['deniedCount'] == 1 for r in partials))
+                root_props = next(r['props'] for r in rows if r['name'] == 'disk.inventory.root')
+                self.assertEqual((root_props['deniedCount'], root_props['partialChildCount']), (1, 0))
         cache = {str(child): dict(partial=True, limited=True, attemptedAt=1)}
         total, status, _ = jobs.inventory_status(cache, [SimpleNamespace(path=str(child))], True, 1000000)
         jobs.InventoryLog(self.root).root_event(cache, total, status)
         props = self.rows('disk.inventory.root')[-1]['props']
         self.assertEqual(props['childrenPartial'], 1)
         self.assertEqual(props['unmeasuredCount'], 1)
+        self.assertEqual((props['deniedCount'], props['partialChildCount']), (0, 1))
         self.assertNotIn('bytes', props)
 
     def test_nested_parts_share_root_summary_and_notable_filter(self):
