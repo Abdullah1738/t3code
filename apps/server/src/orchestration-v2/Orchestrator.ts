@@ -11796,9 +11796,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             run.id !== settledContinuationOf &&
             (run.id === resultRun.id || runRanAfter(run, resultRun)),
         ),
-        awaitsRestartContinuation,
+        (run) => effectOutbox.get(`effect:restart-continuation:${run.id}`),
       );
-      if (!pending.includes(true)) return false;
+      const continuations = pending.flatMap((entry) =>
+        Option.isSome(entry) &&
+        (entry.value.status === "pending" || entry.value.status === "running")
+          ? [entry.value]
+          : [],
+      );
+      if (continuations.length === 0) return false;
       if (
         resultRun.status !== "interrupted" &&
         resultRun.status !== "cancelled" &&
@@ -11824,6 +11830,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         },
       );
       if (delegatedTaskProgress({ ...child, runs }).hasPendingWork) return true;
+      // Startup owns an unanswered initial task's replay. A leftover effect
+      // from shutdown alone must still allow a cancelled task to settle.
+      if (
+        resultChain.some((run) => run.ordinal === 1) &&
+        !child.messages.some((message) => message.role === "assistant") &&
+        child.turnItems.length === 0 &&
+        continuations.some(
+          (effect) =>
+            effect.commandId.startsWith("command:runtime-reconcile:startup:") ||
+            effect.commandId.startsWith("command:restart-prepare:"),
+        )
+      )
+        return true;
       // Progress notes survive a cut turn too; only a result can hold terminal
       // publication behind a queued restart. Keep unknown phases for older providers.
       const results = {
