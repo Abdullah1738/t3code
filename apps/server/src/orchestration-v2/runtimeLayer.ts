@@ -449,7 +449,9 @@ export const layer = Layer.mergeAll(
   DelegatedTaskProgressGuard.layer.pipe(
     Layer.provide(Layer.mergeAll(layerOrchestratorProvided, layerThreadManagementProvided)),
   ),
-  RunStartDeadline.layer.pipe(Layer.provide(layerOrchestratorProvided)),
+  RunStartDeadline.layer.pipe(
+    Layer.provide(Layer.merge(layerOrchestratorProvided, layerEventSinkProvided)),
+  ),
   layerEffectWorkerProvided,
   layerProviderSessionManagerProvided,
   layerProviderAuthServiceProvided,

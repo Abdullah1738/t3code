@@ -12,6 +12,7 @@ import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { forkParked } from "../serverActivation.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import * as EventSink from "./EventSink.ts";
 import { providerStartAccepted } from "./providerStartDeadlinePolicy.ts";
 
 export class RunStartDeadline extends Context.Service<
@@ -26,6 +27,7 @@ export class RunStartDeadline extends Context.Service<
 
 const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
+  const eventSink = yield* EventSink.EventSinkV2;
   const pending = new Map<OrchestrationV2Run["id"], OrchestrationV2Run>();
   let bootstrapping = false;
   const bootstrapTouched = new Set<OrchestrationV2Run["id"]>();
@@ -133,7 +135,12 @@ const make = Effect.gen(function* () {
     );
   });
   const start = Effect.fn("RunStartDeadline.start")(function* () {
-    yield* forkParked(Stream.runForEach(engine.streamDomainEvents, handle));
+    // Recovery and live attachment may race; replay every admission committed
+    // after this cursor, including those recovery reads before they are armed.
+    const afterSequence = yield* eventSink.latestSequence().pipe(Effect.orDie);
+    yield* forkParked(
+      eventSink.stream({ afterSequence }).pipe(Stream.runForEach((stored) => handle(stored.event))),
+    );
     yield* forkParked(recover());
     yield* forkParked(Effect.forever(Effect.sleep("1 second").pipe(Effect.andThen(check))));
   });

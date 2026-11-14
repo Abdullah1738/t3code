@@ -10825,3 +10825,117 @@ it.effect.each(["live", "bootstrap", "workspace"] as const)(
       );
     }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
 );
+
+it.effect("start deadline bootstrap replays admission committed before live attachment", () =>
+  Effect.gen(function* () {
+    const engine = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const guard = yield* RunStartDeadline.RunStartDeadline;
+    const { threadId, projection } = yield* createDeadlineThread("cursor-gap");
+    const run = projection.runs[0]!;
+    const attaching = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const cursorRead = yield* Deferred.make<void>();
+    const recoveryRead = yield* Deferred.make<void>();
+    const barrierSeen = yield* Deferred.make<void>();
+    const barrierId = EventId.make(`${threadId}:attachment-barrier`);
+    const originalDomainStream = engine.streamDomainEvents;
+    Object.defineProperty(engine, "streamDomainEvents", {
+      configurable: true,
+      value: Stream.unwrap(
+        Deferred.succeed(attaching, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.as(originalDomainStream),
+        ),
+      ),
+    });
+    const originalStream = sink.stream;
+    const streamSpy = vi
+      .spyOn(sink, "stream")
+      .mockImplementation((input) =>
+        Stream.unwrap(
+          Deferred.succeed(attaching, undefined).pipe(
+            Effect.andThen(Deferred.succeed(cursorRead, undefined)),
+            Effect.andThen(Deferred.await(release)),
+            Effect.as(originalStream(input)),
+          ),
+        ).pipe(
+          Stream.tap((stored) =>
+            stored.event.id === barrierId ? Deferred.succeed(barrierSeen, undefined) : Effect.void,
+          ),
+        ),
+      );
+    const originalRead = engine.getThreadRecords;
+    const readSpy = vi
+      .spyOn(engine, "getThreadRecords")
+      .mockImplementation((id, fields, filter) =>
+        originalRead(id, fields, filter).pipe(
+          Effect.tap((records) =>
+            id === threadId &&
+            fields.includes("runs") &&
+            records.runs?.find((candidate) => candidate.id === run.id)?.providerStartDeadlineAt ===
+              undefined
+              ? Deferred.succeed(recoveryRead, undefined)
+              : Effect.void,
+          ),
+        ),
+      );
+    yield* Effect.gen(function* () {
+      yield* guard.start();
+      yield* Deferred.await(attaching);
+      yield* Deferred.await(recoveryRead);
+      const now = yield* DateTime.now;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`${threadId}:admitted-before-attachment`),
+            type: "run.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: {
+              ...run,
+              providerStartDeadlineAt: DateTime.makeUnsafe(
+                DateTime.toEpochMillis(now) + PROVIDER_START_TIMEOUT_MS,
+              ),
+            },
+          },
+        ],
+      });
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(cursorRead);
+      // This later event proves replay/live delivery has passed the admission.
+      yield* sink.write({
+        events: [
+          {
+            id: barrierId,
+            type: "run.updated",
+            threadId,
+            runId: projection.runs[2]!.id,
+            occurredAt: now,
+            payload: projection.runs[2]!,
+          },
+        ],
+      });
+      yield* Deferred.await(barrierSeen);
+      yield* TestClock.adjust(PROVIDER_START_TIMEOUT_MS);
+      yield* guard.check();
+      assert.equal(
+        (yield* engine.getThreadProjection(threadId)).runs[0]?.status,
+        "failed",
+        "admission between recovery and live attachment must remain bounded",
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          Object.defineProperty(engine, "streamDomainEvents", {
+            configurable: true,
+            value: originalDomainStream,
+          });
+          streamSpy.mockRestore();
+          readSpy.mockRestore();
+        }),
+      ),
+    );
+  }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);
