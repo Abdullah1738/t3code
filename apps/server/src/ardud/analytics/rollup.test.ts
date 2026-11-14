@@ -281,6 +281,48 @@ describe("analytics rollups", () => {
     assert.deepEqual(rollup.mcpOverflow, { groups: 0, retryAttempts: 0 });
     assert.deepEqual(finishRollup(accumulator, "2026-11-13", ts), rollup);
   });
+  it("keeps pre-handler percentiles separate and skips historical calls without timing", () => {
+    const accumulator = makeAccumulator();
+    for (const preHandlerMs of [undefined, undefined, 0, 20, 80]) {
+      accumulate(
+        accumulator,
+        event({
+          kind: "mcp.call",
+          tool: "card_get",
+          outcome: "ok",
+          durationMs: 10,
+          ...(preHandlerMs === undefined ? {} : { preHandlerMs }),
+        }),
+      );
+    }
+    accumulate(
+      accumulator,
+      event({
+        kind: "mcp.call",
+        tool: "card_move",
+        outcome: "ok",
+        durationMs: 100,
+      }),
+    );
+    const rollup = finishRollup(accumulator, "2026-11-13", ts);
+    assert.deepInclude(
+      rollup.mcpCalls.find((row) => row.tool === "card_get"),
+      {
+        count: 5,
+        p50Ms: 10,
+        p95Ms: 10,
+        maxMs: 10,
+        preHandler: { count: 3, p50Ms: 20, p95Ms: 80, maxMs: 80, approximate: false },
+      },
+    );
+    assert.deepEqual(rollup.mcpCalls.find((row) => row.tool === "card_move")!.preHandler, {
+      count: 0,
+      p50Ms: null,
+      p95Ms: null,
+      maxMs: null,
+      approximate: false,
+    });
+  });
   it("counts kinds and errors, ranks real RPC timings, and measures answered asks", () => {
     const accumulator = makeAccumulator();
     for (const durationMs of [10, 20, 30, 40, 100]) {

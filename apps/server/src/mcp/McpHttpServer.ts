@@ -179,9 +179,10 @@ type McpAuthMiddleware = (
   HttpServerRequest.HttpServerRequest
 >;
 
-class McpReplyCapture extends Context.Service<McpReplyCapture, McpReplySize.McpReplyCapture>()(
-  "t3/mcp/McpHttpServer/McpReplyCapture",
-) {}
+class McpReplyCapture extends Context.Service<
+  McpReplyCapture,
+  McpReplySize.McpReplyCapture & { readonly arrivedAt: bigint; readonly authenticatedAt: bigint }
+>()("t3/mcp/McpHttpServer/McpReplyCapture") {}
 
 export const normalizeMcpHttpResponse = (
   response: HttpServerResponse.HttpServerResponse,
@@ -217,11 +218,12 @@ const BOARD_READ_TOOLS = new Set([
   "card_search",
 ]);
 
-const makeMcpAuthMiddleware = Effect.gen(function* () {
+export const makeMcpAuthMiddleware = Effect.gen(function* () {
   const registry = yield* McpSessionRegistry.McpSessionRegistry;
   const clients = yield* Effect.serviceOption(McpClientAuthenticator);
   const largeReplies = yield* Effect.serviceOption(LargeReplyLog.LargeReplyLog);
   return Effect.fn("McpHttpServer.authenticateRequest")(function* (httpEffect) {
+    const arrivedAt = yield* Clock.monotonicTimeNanos;
     const request = yield* HttpServerRequest.HttpServerRequest;
     const authorization = request.headers.authorization;
     const token =
@@ -233,6 +235,7 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
       (Option.isSome(clients) && token.length > 0
         ? yield* clients.value.authenticate(request)
         : undefined);
+    const authenticatedAt = yield* Clock.monotonicTimeNanos;
     if (!invocation) {
       yield* Effect.logWarning("rejected MCP request with an unusable credential", {
         reason: token.length === 0 ? "missing_bearer_token" : "unknown_or_expired_token",
@@ -244,7 +247,9 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
         providerToken: looksLikeProviderToken(token),
       });
     }
-    const capture: McpReplySize.McpReplyCapture = {
+    const capture: McpReplyCapture["Service"] = {
+      arrivedAt,
+      authenticatedAt,
       name: undefined,
       threadId: invocation.thread?.threadId,
     };
@@ -1040,12 +1045,28 @@ const withToolAnalytics =
               const startedAt = yield* Clock.currentTimeMillis;
               const started = yield* Clock.monotonicTimeNanos;
               const callState: McpCallAnalytics.McpCall["Service"] = {
+                ...(Option.isSome(capture)
+                  ? {
+                      requestTiming: {
+                        authMs:
+                          Number(capture.value.authenticatedAt - capture.value.arrivedAt) / 1e6,
+                        dispatchMs: Number(started - capture.value.authenticatedAt) / 1e6,
+                        preHandlerMs: Number(started - capture.value.arrivedAt) / 1e6,
+                      },
+                    }
+                  : {}),
                 callerResolved: false,
                 callerResolveMs: 0,
                 readerLane: yield* NodeSqliteClient.ReaderLane,
                 phase: "handler",
                 saved: "unknown",
               };
+              if (callState.requestTiming !== undefined)
+                yield* Effect.annotateCurrentSpan({
+                  "mcp.auth_ms": callState.requestTiming.authMs,
+                  "mcp.dispatch_ms": callState.requestTiming.dispatchMs,
+                  "mcp.pre_handler_ms": callState.requestTiming.preHandlerMs,
+                });
               const parentSaved = yield* SavedWrite.observer;
               const parentCommitting = yield* SavedWrite.commitObserver;
               const identifiers = McpCallAnalytics.callIdentifiers(
@@ -1076,6 +1097,13 @@ const withToolAnalytics =
                   outcome.outcome === "interrupted_by_shutdown" && observedCommit === false
                     ? "unknown"
                     : observedCommit;
+                const durationMs = Math.max(0, Number(ended - started) / 1e6);
+                const totalMs =
+                  callState.requestTiming === undefined
+                    ? undefined
+                    : callState.requestTiming.preHandlerMs + durationMs;
+                if (totalMs !== undefined)
+                  yield* Effect.annotateCurrentSpan({ "mcp.total_ms": totalMs });
                 return {
                   ts: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
                   kind: "mcp.call" as const,
@@ -1096,7 +1124,9 @@ const withToolAnalytics =
                       ? 0
                       : Math.max(0, Number(ended - callState.callerStarted) / 1e6)),
                   readerLane: callState.readerLane,
-                  durationMs: Math.max(0, Number(ended - started) / 1e6),
+                  durationMs,
+                  ...callState.requestTiming,
+                  ...(totalMs === undefined ? {} : { totalMs }),
                   ...outcome,
                   props: {
                     ...outcome.props,

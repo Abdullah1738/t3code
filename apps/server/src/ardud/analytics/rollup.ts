@@ -30,6 +30,7 @@ interface McpGroup {
   build: string;
   bootId: string;
   durations: Durations;
+  preHandler: Durations;
   failures: number;
   outcomes: Map<string, number>;
   savedCounts: Map<string, number>;
@@ -546,6 +547,7 @@ export function accumulate(
         build,
         bootId,
         durations: durations(),
+        preHandler: durations(),
         failures: 0,
         outcomes: new Map(),
         savedCounts: new Map(),
@@ -554,6 +556,7 @@ export function accumulate(
       target.mcp.set(key, group);
     }
     addDuration(group.durations, event.durationMs ?? 0);
+    if (event.preHandlerMs !== undefined) addDuration(group.preHandler, event.preHandlerMs);
     increment(group.outcomes, event.outcome);
     increment(group.savedCounts, String(event.saved ?? "unknown"));
     if (event.outcome !== "ok") {
@@ -794,6 +797,7 @@ export function finishRollup(
         build: group.build,
         bootId: group.bootId,
         ...summarize(group.durations),
+        preHandler: summarize(group.preHandler),
         failures: group.failures,
         failureRate: group.failures / group.durations.count,
         outcomes: Object.fromEntries(group.outcomes),
