@@ -56,6 +56,17 @@ test("watcher and Telegram loggers share the same private, allowlisted format", 
   expect(statSync(join(dir, `${day()}.ndjson`)).mode & 0o777).toBe(0o600);
 });
 
+test("creator fallbacks retain stable lookup fields and discard arbitrary reasons", () => {
+  const dir = fixture();
+  for (const reason of ["timeout", "exit:1", "exit:127", "invalid", "archived", "private payload", "exit:1 secret"]) {
+    toolLog({ component: "wakes", kind: "error", name: "wake.creator_fallback", ok: false,
+      ids: { watcher: "fixture" }, props: { step: "native", reason, durationMs: 12 } });
+  }
+  const all = rows(dir);
+  expect(all.map(row => row.props.reason)).toEqual(["timeout", "exit:1", "exit:127", "invalid", "archived", undefined, undefined]);
+  expect(all.every(row => row.props.step === "native" && row.props.durationMs === 12)).toBe(true);
+});
+
 test("logging drops IO and serialization failures without raising", () => {
   const dir = fixture(); process.env.TOOLLOG_DIR = join(dir, "blocked"); writeFileSync(process.env.TOOLLOG_DIR, "file");
   expect(() => toolLog({ component: "runner", kind: "event", name: "watch.run" })).not.toThrow();

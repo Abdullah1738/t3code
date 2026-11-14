@@ -617,13 +617,13 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
   });
 }
 
-async function run(args: string[], timeoutMs = 20_000, maxOutput = 500): Promise<{ ok: boolean; out: string }> {
+async function run(args: string[], timeoutMs = 20_000, maxOutput = 500): Promise<{ ok: boolean; out: string; code: number; signal: NodeJS.Signals | null }> {
   const started = now();
   try {
     const child = Bun.spawn(args, { env: { HOME, PATH, ...testEnv() }, stdout: "pipe", stderr: "pipe", timeout: timeoutMs, killSignal: "SIGKILL" });
     const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
     toolLog({ component: "helpers", kind: code === 0 ? "perf" : "error", name: "helper.run", durationMs: now() - started, ok: code === 0, ids: { helper: args[1]?.endsWith(".ts") ? args[1]!.split("/").at(-2) : args[0]?.split("/").at(-1) }, props: { exitCode: code, ...(code === 0 ? {} : stderrCause(stderr)) }, ...(code === 0 ? {} : { error: { tag: "helper.exit_failed" } }) });
-    return { ok: code === 0, out: `${stdout}${stderr}`.trim().slice(0, maxOutput) };
+    return { ok: code === 0, out: `${stdout}${stderr}`.trim().slice(0, maxOutput), code, signal: child.signalCode };
   } catch (error) {
     toolLog({ component: "helpers", kind: "error", name: "helper.run", durationMs: now() - started, ok: false, props: stderrCause(error instanceof Error ? error.message : ""), error: { tag: "helper.spawn_failed" } });
     throw error;
@@ -672,36 +672,70 @@ const spectrumCli = () => process.env.ROBOB_WATCH_SPECTRUM_CLI ?? join(HOME, ".l
 const telegramCli = () => process.env.ROBOB_WATCH_TELEGRAM_CLI ?? join(HOME, ".local/share/telegram-bridge/src/cli.ts");
 const t3ctlCli = () => process.env.ROBOB_WATCH_T3CTL ?? join(HOME, ".local/bin/t3ctl");
 
-type CreatorRoute = { kind: "owner" } | { kind: "thread"; thread: string }
+type CreatorRoute = { kind: "owner" } | { kind: "native_failed" } | { kind: "thread"; thread: string }
   | { kind: "unreachable"; thread: string; reason: string } | { kind: "refused"; reason: string };
 const creatorRoutes = new Map<string, { session: string; cli: string; until: number; route: Promise<CreatorRoute> }>();
 const CREATOR_CACHE_MS = 3 * 60_000;
+const CREATOR_FAILURE_CACHE_MS = 30_000;
 const shortThread = (id: string) => id.split(":").at(-1)!.slice(0, 8);
 
-async function creatorRoute(session: string, cli: string): Promise<CreatorRoute> {
+function creatorTimeout(): number {
+  const override = Number(process.env.ROBOB_WATCH_TEST_CREATOR_TIMEOUT_MS);
+  return underTest() && process.env.ROBOB_WATCH_T3CTL && Number.isInteger(override) && override > 0 && override < 10_000 ? override : 10_000;
+}
+
+async function creatorRoute(watcher: Watcher, session: string, cli: string): Promise<CreatorRoute> {
+  const failed = (step: "native" | "status", reason: string, started: number) => {
+    const durationMs = Math.max(0, now() - started);
+    log(null, `creator lookup failed watcher=${watcher.id} session=${session.slice(0, 12)} reason=${reason}`);
+    toolLog({ component: "wakes", kind: "error", name: "wake.creator_fallback", ok: false, ids: { watcher: watcher.id },
+      durationMs, props: { step, reason, durationMs } });
+  };
+  const exitReason = (result: { code: number; signal: NodeJS.Signals | null }) => result.signal === "SIGKILL" ? "timeout" : `exit:${result.code}`;
   let thread = session;
   if (session.startsWith("ses_")) {
+    const started = now();
     try {
-      const result = await run([cli, "native", session], 10_000, 100_000);
-      const value: unknown = result.ok ? JSON.parse(result.out) : undefined;
-      if (!jsonObject(value) || !jsonObject(value.thread) || typeof value.thread.threadId !== "string" || !value.thread.threadId) return { kind: "owner" };
-      thread = value.thread.threadId;
-    } catch { return { kind: "owner" }; }
+      const result = await run([cli, "native", session], creatorTimeout(), 100_000);
+      if (!result.ok) {
+        failed("native", exitReason(result), started);
+        return { kind: "native_failed" };
+      }
+      try {
+        const value: unknown = JSON.parse(result.out);
+        if (!jsonObject(value) || !jsonObject(value.thread) || typeof value.thread.threadId !== "string" || !value.thread.threadId.trim()) throw new Error("invalid native thread");
+        thread = value.thread.threadId;
+      } catch {
+        failed("native", "invalid", started);
+        return { kind: "native_failed" };
+      }
+    } catch {
+      failed("native", "exit:127", started);
+      return { kind: "native_failed" };
+    }
   }
+  let started = now();
+  const unreachable = (reason: string, detail: string): CreatorRoute => {
+    failed("status", reason, started);
+    return { kind: "unreachable", thread, reason: detail };
+  };
   try {
     if (thread === await liveSession()) return { kind: "owner" };
+    started = now();
     // Thread status includes recent runs and can be much larger than a delivery receipt.
-    const result = await run([cli, "status", thread], 10_000, 100_000);
-    if (!result.ok) return { kind: "unreachable", thread, reason: `status: ${result.out}` };
-    const value: unknown = JSON.parse(result.out);
+    const result = await run([cli, "status", thread], creatorTimeout(), 100_000);
+    if (!result.ok) return unreachable(exitReason(result), `status: ${result.out}`);
+    let value: unknown;
+    try { value = JSON.parse(result.out); }
+    catch { return unreachable("invalid", "invalid thread status"); }
     if (!jsonObject(value) || !jsonObject(value.thread) || value.thread.threadId !== thread
-      || typeof value.thread.archived !== "boolean") return { kind: "unreachable", thread, reason: "invalid thread status" };
+      || typeof value.thread.archived !== "boolean") return unreachable("invalid", "invalid thread status");
     const status = value.thread;
     const project = typeof status.projectId === "string" ? status.projectId : "";
     if (status.origin === "imessage" || /(?:^|[/:])imessage\/?$/i.test(project)) return { kind: "owner" };
-    return status.archived ? { kind: "unreachable", thread, reason: "thread is archived" } : { kind: "thread", thread };
+    return status.archived ? unreachable("archived", "thread is archived") : { kind: "thread", thread };
   } catch (error) {
-    return { kind: "unreachable", thread, reason: `status: ${String(error).slice(0, 500)}` };
+    return unreachable("exit:127", `status: ${String(error).slice(0, 500)}`);
   }
 }
 
@@ -713,9 +747,14 @@ function resolveCreator(watcher: Watcher, cli: string): Promise<CreatorRoute> {
   for (const [id, entry] of creatorRoutes) if (entry.until <= at) creatorRoutes.delete(id);
   const cached = creatorRoutes.get(watcher.id);
   if (cached?.session === session && cached.cli === cli) return cached.route;
-  const route = creatorRoute(session, cli);
-  creatorRoutes.set(watcher.id, { session, cli, until: at + CREATOR_CACHE_MS, route });
-  return route;
+  const entry = { session, cli, until: at + CREATOR_CACHE_MS, route: creatorRoute(watcher, session, cli) };
+  // Log once per lookup; deliveries sharing a cached failure do not repeat the diagnostic.
+  entry.route = entry.route.then(route => {
+    if (route.kind === "native_failed" || route.kind === "unreachable") entry.until = now() + CREATOR_FAILURE_CACHE_MS;
+    return route;
+  });
+  creatorRoutes.set(watcher.id, entry);
+  return entry.route;
 }
 
 function wakeThread(cli: string, thread: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
