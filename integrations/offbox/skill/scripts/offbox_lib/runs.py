@@ -2686,14 +2686,18 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None) ->
         code = 130
         return code
     finally:
-        con = db()
         try:
-            row = con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
-            if (row and row['client_pid'] == os.getpid() and row['status'] == 'starting'
-                    and not row['box_id'] and not row['process_id']):
-                finish(rid, code, 'killed' if code == 130 else 'infra')
+            with contextlib.closing(db()) as con:
+                row = con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
+                if (row and row['client_pid'] == os.getpid() and row['status'] == 'starting'
+                        and not row['box_id'] and not row['process_id']):
+                    finish(rid, code, 'killed' if code == 130 else 'infra')
+        except sqlite3.Error as error:
+            # The runner already saved any known result; cleanup cannot replace it or mask an active error.
+            saved = read_json(LOGS_DIR / f'{rid}.state.json', {})
+            with contextlib.suppress(OSError):
+                state_warning(rid, saved.get('exit_code') if isinstance(saved, dict) else None, error)
         finally:
-            con.close()
             for s, handler in old.items():
                 signal.signal(s, handler)
 
