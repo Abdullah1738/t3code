@@ -6673,6 +6673,56 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   ),
           );
 
+        const ensureT3McpConnected = Effect.fn("CodexAdapterV2.ensureT3McpConnected")(function* (
+          appThreadId: ThreadId,
+          nativeThreadId: string,
+          configured: boolean,
+        ) {
+          const connectionProblem = client
+            .request("mcpServerStatus/list", {
+              threadId: nativeThreadId,
+              serverName: "t3-code",
+              detail: "toolsAndAuthOnly",
+            })
+            .pipe(
+              Effect.map((response) => {
+                const server = response.data.find((entry) => entry.name === "t3-code");
+                if (server === undefined) return "missing";
+                if (server.runtimeStatus !== "connected") return server.runtimeStatus ?? "unknown";
+                if (server.toolsError != null || Object.keys(server.tools).length === 0)
+                  return "tools-unavailable";
+                return undefined;
+              }),
+              Effect.timeoutOption("10 seconds"),
+              Effect.map((result) =>
+                Option.isSome(result) ? result.value : "status-check-timeout",
+              ),
+              Effect.catch(() => Effect.succeed("status-check-failed")),
+            );
+          let reason = configured ? yield* connectionProblem : "session-unavailable";
+          if (reason === undefined) return true;
+          // Reload retains session overrides and launch-argument servers. A warm
+          // thread/resume ignores config overrides and cannot repair a failed client.
+          const reloaded =
+            configured &&
+            (yield* client.request("config/mcpServer/reload", undefined).pipe(
+              Effect.as(true),
+              Effect.timeoutOption("10 seconds"),
+              Effect.map((result) => Option.isSome(result)),
+              Effect.catch(() => Effect.succeed(false)),
+            ));
+          if (configured) reason = reloaded ? yield* connectionProblem : "reload-failed";
+          if (reason === undefined) return true;
+          // Codex errors can contain the endpoint's Authorization header.
+          yield* Effect.logWarning("orchestration-v2.codex-t3-mcp-unavailable", {
+            threadId: appThreadId,
+            nativeThreadId,
+            serverName: "t3-code",
+            reason,
+          });
+          return false;
+        });
+
         const startNativeTurn = Effect.fn("CodexAdapterV2.startNativeTurn")(
           function* (
             turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
@@ -6685,7 +6735,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               codexInput,
               runtimePolicy: turnInput.runtimePolicy,
               modelSelection: turnInput.modelSelection,
-              hasT3Mcp: mcpSession !== undefined,
+              hasT3Mcp: yield* ensureT3McpConnected(
+                turnInput.threadId,
+                threadId,
+                mcpSession !== undefined,
+              ),
               browserToolsAvailable: mcpSession?.browserToolsAvailable ?? true,
               deviceToolsAvailable: mcpSession?.capabilities?.has("device") ?? false,
               omitServiceTier: adapterOptions.resolveRuntime !== undefined,

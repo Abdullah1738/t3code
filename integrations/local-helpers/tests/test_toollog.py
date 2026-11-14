@@ -226,15 +226,15 @@ class ToolLogTests(unittest.TestCase):
         for decision in ('allowed', 'rewritten'):
             with patch.object(toollog.random, 'random', side_effect=[0, 1 / toollog.HOOK_SAMPLE_RATE, .99]):
                 for _ in range(3):
-                    toollog.hook('codex', 'shell', decision, 'fixture', 2, ids={'threadId': 'fixture'})
+                    toollog.hook('codex', 'shell', decision, 'fixture', 2, ids={'threadId': 'native:codex:fixture'})
         with patch.object(toollog.random, 'random', return_value=.99):
-            toollog.hook('codex', 'shell', 'denied', 'fixture', 4, ids={'threadId': 'fixture'})
+            toollog.hook('codex', 'shell', 'denied', 'fixture', 4, ids={'threadId': 'native:codex:fixture'})
             toollog.hook('codex', 'shell', 'allowed', 'failure', 4, error_tag='fixture.error')
         rows = self.rows()
         self.assertEqual(len(rows), 4)
         for row in rows[:2]:
             self.assertEqual(row['durationMs'], 2)
-            self.assertEqual(row['ids']['threadId'], 'fixture')
+            self.assertEqual(row['ids']['threadId'], 'native:codex:fixture')
             self.assertEqual(row['props']['sampleRate'], toollog.HOOK_SAMPLE_RATE)
             for key in ('cwdClass', 'matchedRoot', 'argv0Class'):
                 self.assertNotIn(key, row['props'])
@@ -252,9 +252,114 @@ class ToolLogTests(unittest.TestCase):
         self.assertEqual(result['failedCount'], 2)
         self.assertEqual(result['countsByKind'], {'perf': 2 * toollog.HOOK_SAMPLE_RATE, 'error': 2})
         self.assertEqual(result['durationMsByName']['hook.decision'], {'p50': 2, 'p95': 2, 'max': 4})
-        self.assertEqual(result['topThreadsByRule']['fixture'], [{'threadId': 'fixture', 'count': 2 * toollog.HOOK_SAMPLE_RATE + 1}])
-        self.assertEqual(result['repeatLoops'][0]['maxCountInHour'], 2 * toollog.HOOK_SAMPLE_RATE + 1)
+        self.assertEqual(result['topThreadsByRule']['fixture'], [{'threadId': 'native:codex:fixture', 'count': toollog.HOOK_SAMPLE_RATE + 1, 'denied': 1, 'rewritten': toollog.HOOK_SAMPLE_RATE, 'attributed': True, 'sampled': True}])
+        self.assertEqual(result['repeatLoops'][0]['maxCountInHour'], toollog.HOOK_SAMPLE_RATE)
+        self.assertEqual(result['repeatLoops'][0]['decision'], 'rewritten')
+        self.assertTrue(result['repeatLoops'][0]['sampled'])
         self.assertEqual(result['logCaps'], [])
+
+    def hook_rollup(self, rows, top_n=20):
+        path = toollog.board_dir('agent-tools') / (self.day + '.ndjson')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        base = {'ts': self.day + 'T12:00:00Z', 'name': 'hook.decision', 'kind': 'error',
+                'ok': False, 'ids': {'threadId': 'native:codex:refusals'}}
+        path.write_text(''.join(json.dumps({**base, **row}) + '\n' for row in rows))
+        return toollog.rollup('agent-tools', self.day, top_n)
+
+    def test_sampled_allowed_is_not_a_refusal(self):
+        result = self.hook_rollup([{'kind': 'perf', 'ok': True,
+            'props': {'rule': 'retry', 'decision': 'allowed', 'sampleRate': 128}}])
+        self.assertEqual(result['topThreadsByRule'], {})
+        self.assertEqual(result['repeatLoops'], [])
+        self.assertEqual(result['unattributedByRule'], {})
+        self.assertEqual(result['unrecognizedThreadIds'], 0)
+        self.assertEqual((result['total'], result['okCount'], result['countsByName']),
+                         (128, 128, {'hook.decision': 128}))
+
+    def test_denied_loop_and_separate_rewrites(self):
+        result = self.hook_rollup([{'props': {'rule': 'retry', 'decision': decision}}
+                                  for decision in ['denied'] * 25 + ['rewritten'] * 15])
+        self.assertEqual(result['topThreadsByRule']['retry'], [{
+            'threadId': 'native:codex:refusals', 'count': 40, 'denied': 25,
+            'rewritten': 15, 'attributed': True, 'sampled': False}])
+        self.assertEqual(result['repeatLoops'], [{
+            'threadId': 'native:codex:refusals', 'rule': 'retry', 'decision': 'denied',
+            'maxCountInHour': 25, 'repeatLoop': True, 'sampled': False}])
+        split = self.hook_rollup([{'props': {'rule': 'retry', 'decision': decision}}
+                                 for decision in ['denied'] * 15 + ['rewritten'] * 15])
+        self.assertEqual(split['repeatLoops'], [])
+
+    def test_unknown_refusals_visible_without_loops_or_top_limit(self):
+        result = self.hook_rollup([{'ids': {'threadId': 'unknown:codex'},
+                                   'props': {'rule': 'rootwide-search', 'decision': 'denied'}}] * 25, top_n=0)
+        self.assertEqual(result['unattributedByRule']['rootwide-search'], [{
+            'threadId': 'unknown:codex', 'count': 25, 'denied': 25, 'rewritten': 0,
+            'attributed': False, 'sampled': False}])
+        self.assertEqual(result['repeatLoops'], [])
+        self.assertEqual(result['topThreadsByRule'], {})
+
+    def test_ranking_thread_id_shapes(self):
+        uuid = '393a4dd3-d1ca-468e-9367-7c1f1ba1bf32'
+        cases = [(t, True) for t in [uuid, 'mcp:' + uuid, 'mcp:' + uuid + ':fork', 'ardud-control:thread:' + uuid,
+            'ardud-control:thread:nightly-report', 'ardud-control:thread:request%3A2026%2F11',
+            'ardud-opencode-import:thread:ses_e288ff742ffeQTYTEXLuPR3WIO',
+            'import:codex:' + uuid, 'import:claudeAgent:session-id',
+            'thread:mcp:namespace:request%3Akey:0',
+            'thread:delegated-task:command%3Amcp%3Adelegate-task%3Arequest',
+            'thread:project:7273c274-25cd-4aa6-8546-03e45da95f0e:' + uuid,
+            'thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Ft3code-fork:' + uuid,
+            'native:claude:' + uuid, 'native:opencode:ses_e288ff742ffeQTYTEXLuPR3WIO']]
+        cases += [(t, False) for t in ['child', 'parent', 'leaf', 'new-fixture', '',
+            'native:', 'thread:project:fixture:child', 'mcp:fixture', 'sha256:abcd',
+            uuid + '-suffix', 'prefix-' + uuid, 'mcp:' + uuid + ':other', 'ardud-control:thread:',
+            'ardud-opencode-import:thread:', 'ardud-opencode-import:thread:ses_',
+            'import::session', 'import:codex:', 'thread:mcp:namespace:key:child',
+            'thread:delegated-task:']]
+        for thread, recognized in cases:
+            with self.subTest(thread=thread):
+                result = self.hook_rollup([{'ids': {'threadId': thread},
+                    'props': {'rule': 'retry', 'decision': 'denied'}}] * 25)
+                self.assertEqual(result['unrecognizedThreadIds'], 0 if recognized else 25)
+                self.assertFalse(result['unrecognizedThreadIdsSampled'])
+                self.assertEqual(bool(result['topThreadsByRule']), recognized)
+                self.assertEqual(bool(result['repeatLoops']), recognized)
+
+    def test_legacy_decision_fallback_only_when_missing(self):
+        cases = [({'kind': 'error'}, {}, True), ({'kind': 'perf', 'ok': False}, {}, True),
+                 ({'kind': 'perf', 'ok': True}, {}, False),
+                 ({'kind': 'error'}, {'decision': 'allowed'}, False),
+                 ({'kind': 'error'}, {'decision': None}, False),
+                 ({'kind': 'error'}, {'decision': 'other'}, False),
+                 ({'kind': 'error'}, {'decision': ['denied']}, False)]
+        for fields, props, expected in cases:
+            with self.subTest(fields=fields, props=props):
+                result = self.hook_rollup([{**fields, 'props': {'rule': 'retry', **props}}])
+                self.assertEqual(bool(result['topThreadsByRule']), expected)
+
+    def test_unexpected_sampled_refusals_are_labeled(self):
+        for kind in ['error', 'perf']:
+            for thread, block in [('native:codex:refusals', 'topThreadsByRule'),
+                                  ('unknown:codex', 'unattributedByRule')]:
+                with self.subTest(kind=kind, thread=thread):
+                    result = self.hook_rollup([{'kind': kind, 'ids': {'threadId': thread},
+                        'props': {'rule': 'retry', 'decision': 'denied', 'sampleRate': 128}}])
+                    entry = result[block]['retry'][0]
+                    self.assertEqual((entry['count'], entry['denied'], entry['sampled']), (128, 128, True))
+                    self.assertEqual(result['total'], 1 if kind == 'error' else 128)
+
+    def test_unrecognized_refusal_sample_rate_shapes(self):
+        cases = [(None, 1), (True, 1), (False, 1), (0, 1), (-1, 1),
+                 (1.5, 1), ('128', 1), (2**53, 1), (1, 1), (128, 128),
+                 (2**53 - 1, 2**53 - 1)]
+        for rate, weight in cases:
+            with self.subTest(rate=rate):
+                result = self.hook_rollup([{'ids': {'threadId': 'fixture'},
+                    'props': {'rule': 'retry', 'decision': 'denied', 'sampleRate': rate}}])
+                self.assertEqual(result['unrecognizedThreadIds'], weight)
+                self.assertEqual(result['unrecognizedThreadIdsSampled'], weight > 1)
+                self.assertEqual((result['total'], result['sampled']), (1, False))
+                self.assertEqual(result['topThreadsByRule'], {})
+                self.assertEqual(result['repeatLoops'], [])
 
     def test_rollup_legacy_caps_and_sample_rate_shapes(self):
         path = toollog.board_dir('agent-tools') / (self.day + '.ndjson')
@@ -446,15 +551,15 @@ class AttributionTests(unittest.TestCase):
             directory.mkdir()
             rows = []
             base = datetime(2026, 11, 13, 0, 59, tzinfo=timezone.utc)
-            for thread, count, spacing in [('loop',21,10), ('quiet',20,10), ('spread',21,181)]:
+            for thread, count, spacing in [('native:codex:loop',21,10), ('native:codex:quiet',20,10), ('native:codex:spread',21,181)]:
                 for i in range(count):
                     rows.append({'ts':(base+timedelta(seconds=i*spacing)).isoformat(), 'name':'hook.decision',
                         'kind':'error', 'ids':{'threadId':thread}, 'props':{'rule':'rootwide-search','decision':'denied'}})
             rows.append({'name':'other.event', 'ids':{'threadId':'loop'}, 'props':{'rule':'other'}})
             (directory/(day+'.ndjson')).write_text('\n'.join(json.dumps(r) for r in reversed(rows))+'\n')
             result = toollog.rollup('agent-tools',day,2)
-            self.assertEqual(result['topThreadsByRule']['rootwide-search'], [{'threadId':'loop','count':21},{'threadId':'spread','count':21}])
-            self.assertEqual(result['repeatLoops'], [{'threadId':'loop','rule':'rootwide-search','maxCountInHour':21,'repeatLoop':True}])
+            self.assertEqual(result['topThreadsByRule']['rootwide-search'], [{'threadId':t,'count':21,'denied':21,'rewritten':0,'attributed':True,'sampled':False} for t in ['native:codex:loop','native:codex:spread']])
+            self.assertEqual(result['repeatLoops'], [{'threadId':'native:codex:loop','rule':'rootwide-search','decision':'denied','maxCountInHour':21,'repeatLoop':True,'sampled':False}])
 
     def test_attributed_hook_under_point_one_ms(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT':temp}):
@@ -478,11 +583,11 @@ class AttributionTests(unittest.TestCase):
 
     def test_midnight_sampled_loop_estimates(self):
         cases = [
-            ('previous-sampled', 128, 1, -10, 'fixture', 129, True),
-            ('current-sampled', 1, 128, -10, 'fixture', 129, True),
-            ('both-unsampled', 1, 1, -10, 'fixture', 2, False),
-            ('outside-window', 128, 1, -3601, 'fixture', 1, False),
-            ('unrelated-thread', 128, 1, -10, 'other', 1, False),
+            ('previous-sampled', 128, 1, -10, 'native:codex:fixture', 129, True),
+            ('current-sampled', 1, 128, -10, 'native:codex:fixture', 129, True),
+            ('both-unsampled', 1, 1, -10, 'native:codex:fixture', 2, False),
+            ('outside-window', 128, 1, -3601, 'native:codex:fixture', 1, False),
+            ('unrelated-thread', 128, 1, -10, 'native:codex:other', 1, False),
         ]
         for label, previous_rate, current_rate, offset, thread, peak, sampled in cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT': temp}):
@@ -490,9 +595,9 @@ class AttributionTests(unittest.TestCase):
                 directory.mkdir()
                 base = datetime(2026, 11, 14, tzinfo=timezone.utc)
                 for at, rate, identity in [(base + timedelta(seconds=offset), previous_rate, thread),
-                                           (base, current_rate, 'fixture')]:
+                                           (base, current_rate, 'native:codex:fixture')]:
                     row = {'ts': at.isoformat(), 'name': 'hook.decision', 'kind': 'perf',
-                           'ids': {'threadId': identity}, 'props': {'rule': 'fixture', 'sampleRate': rate}}
+                           'ids': {'threadId': identity}, 'props': {'rule': 'fixture', 'sampleRate': rate, 'decision': 'rewritten'}}
                     (directory / (at.strftime('%Y-%m-%d') + '.ndjson')).write_text(json.dumps(row) + '\n')
                 result = toollog.rollup('agent-tools', '2026-11-14')
                 self.assertEqual(result['sampled'], sampled)
@@ -510,7 +615,7 @@ class AttributionTests(unittest.TestCase):
                 base=datetime(2026,11,13,23,59,tzinfo=timezone.utc)
                 for i in range(count):
                     at=base+timedelta(seconds=i*spacing)
-                    row={'ts':at.isoformat(),'name':'hook.decision','ids':{'threadId':'loop'},'props':{'rule':'retry'}}
+                    row={'ts':at.isoformat(),'name':'hook.decision','ids':{'threadId':'native:codex:loop'},'props':{'rule':'retry','decision':'denied'}}
                     with (directory/(at.strftime('%Y-%m-%d')+'.ndjson')).open('a') as dest:
                         dest.write(json.dumps(row)+'\n')
                 result=toollog.rollup('agent-tools','2026-11-14')

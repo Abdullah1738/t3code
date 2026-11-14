@@ -2,7 +2,7 @@ import { afterEach, expect, setSystemTime, test } from "bun:test";
 import type { ChatContext, ChatInfo, Role } from "../src/chats.ts";
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import { JudgeError, type GroupJudge, type JudgeState } from "../src/group-judge.ts";
-import { Router, sendblueContextPrompt } from "../src/router.ts";
+import { Router, OUTAGE_NOTICE_AFTER_MS, sendblueContextPrompt } from "../src/router.ts";
 import { MAX_INCOMING_BYTES } from "../src/inbound-files.ts";
 import { Store } from "../src/store.ts";
 import type { Swipes, SwipeTarget } from "../src/swipe.ts";
@@ -1511,17 +1511,18 @@ test("owner, Moni and group outages each get one notice, with held messages orde
     for (const h of chats) await h.router.tick();
   }
   for (const h of chats) {
+    expect(h.store.pendingOutbox()).toEqual([]);
     h.input("second", "robob second question", "+971585933213");
     h.input("third", "robob third question", "+971585933213");
   }
-  setSystemTime(start + 180_000);
+  setSystemTime(start + OUTAGE_NOTICE_AFTER_MS);
   for (const h of chats) {
     await h.router.tick();
-    expect(h.store.pendingOutbox().map(op => op.text)).toEqual(["I'm having a technical problem; I'll answer this as soon as I'm back."]);
+    expect(h.store.pendingOutbox().map(op => [op.text, op.replyTo])).toEqual([["I'm having a technical problem; I'll answer this as soon as I'm back.", "first"]]);
     h.backend.prompt = Recorder.prototype.prompt.bind(h.backend);
   }
   // The health endpoint stays down: the thread answering is what brings the held batch back, a minute after the last try.
-  setSystemTime(start + 240_000);
+  setSystemTime(start + OUTAGE_NOTICE_AFTER_MS + 60_000);
   for (const h of chats) {
     await h.router.tick();
     await h.router.tick();

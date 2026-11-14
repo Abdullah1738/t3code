@@ -87,6 +87,11 @@ export const makeKanbanWsHandlers = (
     [M.boardCreate]: (input: Parameters<KanbanServiceShape["createBoard"]>[0]) =>
       service.createBoard(input),
     [M.boardUpdate]: updateBoard,
+    [M.standingApprovalRevoke]: (input: {
+      readonly boardId: Parameters<KanbanServiceShape["revokeStandingApproval"]>[0];
+      readonly id: string;
+      readonly reason: string;
+    }) => service.revokeStandingApproval(input.boardId, input.id, input.reason, OWNER),
     [M.setupStart]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["startSetup"]>[0];
       readonly evaluatorModel: Parameters<KanbanServiceShape["startSetup"]>[1]["evaluatorModel"];

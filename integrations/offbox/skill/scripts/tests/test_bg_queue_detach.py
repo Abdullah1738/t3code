@@ -225,6 +225,34 @@ class BackgroundQueueTests(Isolated):
         self.until(lambda: (root / 'ttl').exists())
         self.assertEqual(len((root / 'starts').read_text().splitlines()), 1)
 
+    def test_removed_cwd_before_adoption_settles_source_gone(self):
+        root = Path(self.tmp.name)
+        source_cwd = root / 'work'
+        source_cwd.mkdir()
+        with common.file_lock('fixture-handoff'):
+            proc = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), '--fixture',
+                                     self.tmp.name, '1', 'boat'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    start_new_session=True, cwd=source_cwd,
+                                    env=dict(os.environ, OFFBOX_TEST_HANDOFF='1'))
+            self.addCleanup(self.stop, proc)
+            self.until(lambda: (root / 'handoff').exists(), proc)
+            child = int((root / 'handoff').read_text())
+            self.addCleanup(self.stop_child, child, proc.pid)
+            source_cwd.rmdir()
+        self.until(lambda: (root / 'returned').exists(), proc)
+        row = self.con.execute('SELECT * FROM runs ORDER BY start_at DESC LIMIT 1').fetchone()
+        self.until(lambda: self.con.execute('SELECT status FROM runs WHERE run_id=?',
+                                            (row['run_id'],)).fetchone()[0] == 'source_gone', proc)
+        row = self.con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone()
+        self.assertEqual(row['exit_code'], 2)
+        self.assertIn(str(source_cwd), row['error'])
+        self.assertIsNone(row['box_id'])
+        self.assertGreater(Path(row['log_path']).stat().st_size, 0)
+        self.assertFalse((root / 'starts').exists())
+        self.assertFalse((root / 'waiting').exists())
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(misc.wait(row['run_id'], 1), 2)
+
     def test_foreground_term_in_pool_wait_still_settles_killed(self):
         with common.file_lock('fixture-slot'):
             proc, row = self.launch(bg=False)

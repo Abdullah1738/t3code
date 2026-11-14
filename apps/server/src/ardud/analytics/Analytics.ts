@@ -3,6 +3,7 @@ import {
   AnalyticsEvent,
   AnalyticsIngestInput,
   AnalyticsReadInput,
+  KanbanOwnerAsk,
   type AnalyticsReadResult,
 } from "@t3tools/contracts";
 import type * as Cause from "effect/Cause";
@@ -25,7 +26,7 @@ import * as ServerConfig from "../../config.ts";
 import { sampleMix } from "./samples.ts";
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
-import { askLatencyRollup, type AskTimingRow } from "./askLatency.ts";
+import { askKind, askLatencyRollup, type AskTimingRow } from "./askLatency.ts";
 import {
   accumulate,
   boundedLines,
@@ -33,6 +34,23 @@ import {
   makeAccumulator,
   type AnalyticsRollup,
 } from "./rollup.ts";
+
+const readAskKindFields = Schema.decodeUnknownOption(
+  Schema.fromJsonString(
+    KanbanOwnerAsk.mapFields(
+      ({ kind, options, multi, draft, action, change, changes, respond }) => ({
+        kind,
+        options,
+        multi,
+        draft,
+        action,
+        change,
+        changes,
+        respond,
+      }),
+    ),
+  ),
+);
 
 export interface AnalyticsOptions {
   readonly queueCapacity: number;
@@ -165,10 +183,18 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     (filter?.boardId === undefined || event.kind !== "performance.long-task") &&
     (filter?.kind === undefined || filter.kind === event.kind) &&
     (filter?.boardId === undefined || filter.boardId === event.boardId) &&
+    (filter?.cardId === undefined || filter.cardId === event.cardId) &&
     (filter?.tool === undefined || filter.tool === event.tool) &&
     (filter?.outcome === undefined || filter.outcome === event.outcome);
   const viewKey = (day: string, filter?: AnalyticsReadInput) =>
-    JSON.stringify([day, filter?.kind, filter?.boardId, filter?.tool, filter?.outcome]);
+    JSON.stringify([
+      day,
+      filter?.kind,
+      filter?.boardId,
+      filter?.cardId,
+      filter?.tool,
+      filter?.outcome,
+    ]);
   const invalidate = (day: string) => {
     for (const [key, view] of views) if (view.day === day) views.delete(key);
   };
@@ -561,7 +587,9 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     if (Option.isNone(boards)) return undefined;
     yield* boards.value.ready;
     const sql = boards.value.sql;
-    const rows = yield* sql<AskTimingRow>`
+    const rows = yield* sql<
+      Omit<AskTimingRow, "kind"> & { kind: string | null; askJson: string | null }
+    >`
       SELECT c.board_id AS boardId, c.id AS cardId,
         json_extract(a.value, '$.id') AS askId,
         json_extract(a.value, '$.at') AS createdAt,
@@ -570,14 +598,23 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
           AND json_extract(a.value, '$.answer.verdict') != 'dropped'
           THEN json_extract(a.value, '$.answer.at') END AS answeredAt,
         json_extract(a.value, '$.blocking') AS blocking,
-        COALESCE(json_extract(a.value, '$.timing.kind'), 'unknown') AS kind,
+        json_extract(a.value, '$.timing.kind') AS kind,
+        CASE WHEN json_extract(a.value, '$.timing.kind') IS NULL THEN a.value END AS askJson,
         (SELECT MIN(value) FROM json_each(a.value, '$.timing.notified')) AS notifiedAt,
         (SELECT MIN(value) FROM json_each(a.value, '$.timing.firstSeen')) AS firstSeenAt
       FROM ardud_kanban_cards c, json_each(c.json, '$.asks') a
       WHERE json_extract(a.value, '$.at') <= ${`${day}T23:59:59.999Z`}
         AND COALESCE(json_extract(a.value, '$.to'), 'owner') != 'evaluator'
     `.pipe(NodeSqliteClient.readOnly);
-    return rows.map((row) => ({ ...row, blocking: Boolean(row.blocking) }));
+    return rows.map(({ askJson, ...row }) => {
+      // Asks created before timing metadata still carry their response shape.
+      const fields = row.kind === null ? readAskKindFields(askJson) : Option.none();
+      return {
+        ...row,
+        blocking: Boolean(row.blocking),
+        kind: row.kind ?? (Option.isSome(fields) ? askKind(fields.value) : "unknown"),
+      };
+    });
   });
 
   const read: Analytics["Service"]["read"] = Effect.fn("Analytics.read")(function* (raw) {
@@ -603,15 +640,17 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
           const view = yield* getView(input.day, files, input);
           const full = yield* getView(input.day, files);
           const generatedAt = DateTime.formatIso(yield* DateTime.now);
-          const withAskLatency = (rollup: AnalyticsRollup, boardId?: string) =>
+          const withAskLatency = (rollup: AnalyticsRollup, filter?: AnalyticsReadInput) =>
             storedRows === undefined
               ? rollup
               : {
                   ...rollup,
                   askLatency: askLatencyRollup(
-                    boardId === undefined
-                      ? storedRows
-                      : storedRows.filter((row) => row.boardId === boardId),
+                    storedRows.filter(
+                      (row) =>
+                        (filter?.boardId === undefined || row.boardId === filter.boardId) &&
+                        (filter?.cardId === undefined || row.cardId === filter.cardId),
+                    ),
                     input.day,
                     generatedAt,
                   ),
@@ -623,7 +662,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
           return {
             rollup: withAskLatency(
               finishRollup(view.accumulator, input.day, generatedAt),
-              input.boardId,
+              input,
             ),
             samples: view.samples.slice(0, input.limit ?? 100).map((sample) => sample.event),
           };

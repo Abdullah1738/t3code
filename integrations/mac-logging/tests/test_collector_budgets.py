@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import jobs
+import deep_inventory as deep
 import toollog
 from rollup import rollup
 
@@ -41,12 +42,16 @@ class CollectorBudgetTests(unittest.TestCase):
         slow.mkdir()
         with patch.object(jobs.time, 'time', return_value=100):
             jobs.directory_inventory([root], self.good)
+        clock = [0]
         def run(command, **kwargs):
             self.assertLessEqual(kwargs['timeout'], 60)
             if command[-1] == str(slow):
+                clock[0] += kwargs['timeout']
                 raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+            clock[0] += 0.01
             return self.good(command, **kwargs)
-        with patch.object(jobs.time, 'time', return_value=86500):
+        with patch.object(jobs.time, 'time', return_value=86500), \
+             patch.object(jobs.time, 'monotonic', side_effect=lambda: clock[0]):
             jobs.directory_inventory([root], run)
         state = jobs.read_state('disk-inventory')
         cached = state['childState'][str(root)]
@@ -58,6 +63,11 @@ class CollectorBudgetTests(unittest.TestCase):
         self.assertEqual((props['rootsOk'], props['rootsPartial'], props['rootsTimeout'], props['rootsDenied']),
                          (0, 1, 1, 0))
         self.assertGreaterEqual(props['scanMs'], 0)
+        root_props = self.rows('disk.inventory.root')[-1]['props']
+        self.assertTrue(root_props['partial'])
+        self.assertEqual(root_props['slowestChildPath'], str(slow))
+        self.assertGreaterEqual(root_props['slowestChildMs'], 15000)
+        self.assertEqual(self.rows('disk.inventory.turn'), [])
 
     def test_missing_du_permission_and_timeout_keep_last_good_sizes(self):
         cases = (
@@ -162,6 +172,71 @@ class CollectorBudgetTests(unittest.TestCase):
                      props=dict(skipReason='deep_pass_running', rootsPartial=10))
         summary = rollup('2026-11-13')['diskInventory']
         self.assertEqual(summary, dict(scans=2, rootsOk=4, rootsPartial=2, rootsTimeout=2, rootsDenied=6, scanMs=84))
+
+    def test_cached_denial_layouts_count_each_root_once(self):
+        cases = (('none', 0), ('child', 1), ('part', 1), ('nested-part', 1),
+                 ('sibling-parts', 1), ('two-roots', 2), ('partial-unknown', 0))
+        now = dt.datetime.now(dt.timezone.utc).timestamp()
+        def entry(denied=0, parts=None):
+            value = dict(bytes=1024, at=now, partial=denied != 0,
+                         deniedCount=denied, isDirectory=True)
+            if parts is not None:
+                value['parts'] = parts
+            return value
+        for layout, expected in cases:
+            with self.subTest(layout=layout):
+                case_logs = self.root/layout/'logs'
+                with patch.object(self, 'logs', case_logs), \
+                     patch.dict(os.environ, TOOLLOG_DIR=str(case_logs)):
+                    roots, caches = [], {}
+                    for i in range(2 if layout == 'two-roots' else 1):
+                        root = self.root/layout/str(i)
+                        child = root/'child'
+                        child.mkdir(parents=True)
+                        roots.append(root)
+                        if layout == 'none':
+                            value = entry()
+                        elif layout == 'child':
+                            value = entry(1)
+                        elif layout == 'partial-unknown':
+                            value = entry(parts={str(child/'part'): entry(None)})
+                        elif layout == 'nested-part':
+                            value = entry(parts={str(child/'part'): entry(parts={
+                                str(child/'part'/'nested'): entry(1)})})
+                        else:
+                            value = entry(parts={str(child/'part'): entry(1)})
+                            if layout == 'sibling-parts':
+                                value['parts'][str(child/'other')] = entry(2)
+                        caches[str(root)] = {str(child): value}
+                    jobs.save_state('disk-inventory', dict(duMode='links', childState=caches))
+                    jobs.directory_inventory(roots, lambda *a, **k: self.fail('fresh/deep-owned cache'))
+                    props = self.rows('disk.inventory')[-1]['props']
+                    self.assertEqual(props['rootsDenied'], expected)
+
+    def test_deep_partial_part_denial_reaches_hourly_and_daily_summary(self):
+        root = self.root/'deep-root'
+        child = root/'child'
+        part = child/'part'
+        part.mkdir(parents=True)
+        clock = [0.0]
+        now = dt.datetime.now(dt.timezone.utc).timestamp()
+        jobs.save_state('disk-inventory', dict(duMode='links', childState={str(root): {
+            str(child): dict(timeouts=1, partial=True, parts={})}}))
+        def denied(command, **kwargs):
+            self.assertEqual(command[-1], str(part))
+            clock[0] += .01
+            return SimpleNamespace(returncode=1, stdout='10\t'+command[-1]+'\n',
+                                   stderr='du: entry: Permission denied')
+        with patch.object(jobs.time, 'time', side_effect=lambda: now+clock[0]), \
+             patch.object(jobs.time, 'monotonic', side_effect=lambda: clock[0]):
+            deep.run_pass([root], denied, budget=10)
+            cache = jobs.read_state('disk-inventory')['childState'][str(root)][str(child)]
+            self.assertEqual(cache['parts'][str(part)]['deniedCount'], 1)
+            self.assertTrue(cache['parts'][str(part)]['partial'])
+            jobs.directory_inventory([root], lambda *a, **k: self.fail('parts belong to deep pass'))
+        row = self.rows('disk.inventory')[-1]
+        self.assertEqual(row['props']['rootsDenied'], 1)
+        self.assertEqual(rollup(row['ts'][:10])['diskInventory']['rootsDenied'], 1)
 
 
 if __name__ == '__main__':

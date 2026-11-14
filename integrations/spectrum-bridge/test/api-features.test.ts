@@ -44,13 +44,13 @@ test("send, poll, and app queue session-bound conversation operations idempotent
     const id = `${prefix}:${hash(body.dedupeKey)}`;
     const first = await h.post(path, body);
     expect(first.status).toBe(202);
-    expect(await first.json()).toEqual({ id, created: true });
+    expect(await first.json()).toEqual({ id, created: true, ...(path === "/send" ? { chat: "owner" } : {}) });
     expect(h.store.getOperation(id) as unknown).toEqual({ id, kind: "conversation", ...content, sessionId: "current", generation: 5,
       state: "pending", attempts: 0 });
     expect(h.store.get<{ spec: string }>(`api:${prefix}:${id}`)).toBeDefined();
     const again = await h.post(path, body);
     expect(again.status).toBe(200);
-    expect(await again.json()).toEqual({ id, created: false });
+    expect(await again.json()).toEqual({ id, created: false, ...(path === "/send" ? { chat: "owner" } : {}) });
   }
   expect(h.store.pendingOutbox()).toHaveLength(3);
 });
@@ -90,7 +90,7 @@ test("an accepted rule-breaking send replays as 200 after the turn changes, and 
   turn();
   const replay = await h.post("/send", ok);
   expect(replay.status).toBe(200);
-  expect(await replay.json()).toEqual({ id: `send:${hash("replay-1")}`, created: false });
+  expect(await replay.json()).toEqual({ id: `send:${hash("replay-1")}`, created: false, chat: "owner" });
   expect(h.store.get<unknown>("reply-bounce")).toEqual(bounceBefore);
   // A different text under an accepted key is a conflict (409) and records no bounce.
   const conflict = await h.post("/send", { ...ok, text: "Giardia changed it" });

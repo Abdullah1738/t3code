@@ -47,6 +47,7 @@ class WorkerTests(unittest.TestCase):
                 patch.object(dev_janitor, "scan", side_effect=scan), \
                 patch.object(dev_janitor, "LOG_DIR", str(self.root)), \
                 patch.object(dev_janitor, "LAST", str(self.root / "last.json")), \
+                patch.object(dev_janitor, "record_report"), \
                 patch.object(dev_janitor, "sh", return_value=(1, "", "")), \
                 patch.object(dev_janitor, "act") as act:
             self.assertEqual(janitor_watch.worker(lock.fileno()), 0)
@@ -68,6 +69,7 @@ class WorkerTests(unittest.TestCase):
                 patch.object(dev_janitor, "scan", side_effect=snapshots) as scan, \
                 patch.object(dev_janitor, "LOG_DIR", str(self.root)), \
                 patch.object(dev_janitor, "LAST", str(self.root / "last.json")), \
+                patch.object(dev_janitor, "record_report"), \
                 patch.object(dev_janitor, "sh", return_value=(1, "", "")), \
                 patch.object(dev_janitor, "audit"), \
                 patch.object(dev_janitor, "act", return_value=(False, "failed")) as act:
@@ -97,6 +99,7 @@ def scan():
     return {'resources': [], 'candidates': []}
 def apply(ids): raise AssertionError('no candidates')
 def log_run(*args): pass
+def record_report(scan): pass
 """)
         env = {**os.environ, "DEV_JANITOR_WATCH_STATE": str(self.state_dir), "FAKE_ROOT": str(self.root),
                "PYTHONDONTWRITEBYTECODE": "1"}

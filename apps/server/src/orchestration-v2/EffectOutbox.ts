@@ -67,6 +67,8 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.interrupt"),
+    startTimeout: Schema.optional(Schema.Boolean),
+    replacementProviderSessionId: Schema.optional(ProviderSessionId),
     providerSessionId: ProviderSessionId,
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
@@ -86,6 +88,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.restart"),
+    expectedAttemptId: Schema.optional(RunAttemptId),
     providerSessionId: ProviderSessionId,
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
@@ -256,6 +259,11 @@ export interface EffectOutboxV2Shape {
   readonly hasPendingRunContinuation: (
     threadId: ThreadId,
   ) => Effect.Effect<boolean, EffectOutboxError>;
+  readonly hasRunContinuationAt: (input: {
+    readonly threadId: ThreadId;
+    readonly requestedAt: DateTime.Utc;
+    readonly startupAt: DateTime.Utc;
+  }) => Effect.Effect<boolean, EffectOutboxError>;
   readonly hasPendingRunStart: (input: {
     readonly threadId: ThreadId;
     readonly runIds: ReadonlyArray<RunId>;
@@ -269,6 +277,7 @@ export interface EffectOutboxV2Shape {
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
   readonly cancelUnsettled: (input: {
     readonly threadId: ThreadId;
+    readonly runId?: RunId;
     readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
     readonly reason: string;
   }) => Effect.Effect<ReadonlyArray<string>, EffectOutboxError>;
@@ -509,6 +518,24 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         },
         Effect.mapError((cause) => new EffectOutboxError({ operation: "get", cause })),
       ),
+      hasRunContinuationAt: Effect.fn("EffectOutbox.hasRunContinuationAt")(
+        function* ({ threadId, requestedAt, startupAt }) {
+          // Retirement can beat a racing start claim. Keep only wakes submitted
+          // before that retirement in this boot's backlog, even after settlement.
+          const rows = yield* sql`
+            SELECT 1 FROM orchestration_v2_effect_outbox
+            WHERE thread_id = ${threadId} AND effect_type = 'provider-runtime.continue'
+              AND COALESCE(json_extract(payload_json, '$.queued'), 0) <> 1
+              AND (status IN ('pending', 'running') OR (
+                completed_at >= ${DateTime.formatIso(requestedAt)}
+                AND completed_at >= ${DateTime.formatIso(startupAt)}
+              ))
+            LIMIT 1
+          `;
+          return rows.length > 0;
+        },
+        Effect.mapError((cause) => new EffectOutboxError({ operation: "get", cause })),
+      ),
       hasPendingRunStart: Effect.fn("EffectOutbox.hasPendingRunStart")(
         function* ({ threadId, runIds }) {
           if (runIds.length === 0) return false;
@@ -538,7 +565,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           ),
         ),
       cancelUnsettled: Effect.fn("EffectOutbox.cancelUnsettled")(
-        function* ({ threadId, effectTypes, reason }) {
+        function* ({ threadId, runId, effectTypes, reason }) {
           if (effectTypes.length === 0) return [];
           const now = DateTime.formatIso(yield* DateTime.now);
           const rows = yield* sql<{ readonly effect_id: string }>`
@@ -551,6 +578,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               updated_at = ${now},
               last_error = ${reason}
             WHERE thread_id = ${threadId}
+              AND (${runId ?? null} IS NULL OR json_extract(payload_json, '$.runId') = ${runId ?? null})
               AND status IN ('pending', 'running')
               AND effect_type IN ${sql.in(effectTypes)}
               AND NOT (effect_type = 'provider-turn.steer'

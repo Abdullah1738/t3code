@@ -59,6 +59,7 @@ const board: KanbanBoard = {
   defaultCardModel: work,
   reviewChains: [{ name: "two-step", steps: [work, review] }],
   defaultReviewChain: "two-step",
+  standingApprovals: [],
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   setup: null,
   pause: { reason: "Harness cutover", keep: [], at, by: "owner" },

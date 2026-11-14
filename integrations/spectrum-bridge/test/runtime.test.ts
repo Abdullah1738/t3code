@@ -122,6 +122,20 @@ describe("recipient app cards", () => {
     expect(chats.owner.store.pendingOutbox()[0]!.id).not.toBe(first.body.id);
   });
 
+  test("stage continuation identity and immutable preview survive both enqueue routes", async () => {
+    const { chats, post } = api();
+    const updateOf = `app:${"a".repeat(64)}`;
+    const app = { ...card, updateOf, previewPage: card.url + "stages/preparing/" };
+    for (const to of [undefined, "owner"]) {
+      const response = await post({ ...app, ...(to ? { to } : {}), dedupeKey: `stage-${to}`, sessionId: "ses_owner@1" });
+      expect(response.status).toBe(202);
+      expect(chats.owner.store.getOperation(response.body.id)?.app).toEqual(app);
+      expect(chats.owner.store.get<string>(`app-latest:${updateOf}`)).toBe(response.body.id);
+      expect((await post({ ...app, to, dedupeKey: `stage-${to}`, sessionId: "ses_owner@1" })).status).toBe(200);
+      expect((await post({ ...app, to, previewPage: "https://elsewhere.example/", dedupeKey: "invalid", sessionId: "ses_owner@1" })).status).toBe(400);
+    }
+  });
+
   test("app cards are refused for group chats, with --to and without it", async () => {
     const { chats, post } = api();
     const group = chats.open(chatKey.group("GRP-Allowed-123"), "Family Trip");
@@ -543,6 +557,26 @@ describe("Sendblue socket API", () => {
   });
 });
 
+test("recipient sends, wakes and guest sends report their own message length limit", async () => {
+  const env = setup(true);
+  const registry = env.registry();
+  registry.open(chatKey.dm(moni));
+  env.ownerStore.set("route", { id: "ses_owner", generation: 1 });
+  const guests = { send: async () => { throw new Error("must not send"); } } as unknown as NonNullable<Parameters<typeof createSbApi>[0]["guests"]>;
+  const handler = createSbApi({ registry, line: env.line, accessPath: join(env.stateRoot, "access.json"),
+    enabled: () => true, health: () => ({}), guests });
+  for (const [path, limit, extra] of [
+    ["/send", 12_000, { to: "moni" }],
+    ["/wake", 12_000, { chat: "moni", source: "watch" }],
+    ["/guest-send", 2_000, { address: "+15555550198" }],
+  ] as const) {
+    const response = await handler(new Request(`http://bridge${path}`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "x".repeat(limit + 412), dedupeKey: "long", sessionId: "ses_owner", ...extra }) }));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: `message too long: ${(limit + 412).toLocaleString("en-US")} chars, limit ${limit.toLocaleString("en-US")}; split it or send as a card` });
+  }
+});
+
 test("accepted live and backfill ingress logs canonical chat ids and failure tags", async () => {
   const { captureLogs } = await import("./log-fixture.ts");
   const logs = await captureLogs(async () => {
@@ -578,4 +612,30 @@ test("late Sendblue failures retain the status code but never the provider's err
   expect(logs.find(l => l.name === "reply.failed")?.ids).toMatchObject({ chat: "moni", operationId: "operation-fixture", inboundId: "inbound-fixture", threadId: "thread-fixture" });
   expect(logs.filter(l => l.name === "reply.failed")).toHaveLength(1);
   expect(JSON.stringify(logs)).not.toContain("PRIVATE_PROVIDER_MESSAGE");
+});
+
+test("send and file acknowledgements name the routed recipient for owner, Moni, groups and retries", async () => {
+  const env = setup(true);
+  const chats = env.registry();
+  const targets = [chats.owner, chats.open(chatKey.dm(moni)), chats.open(chatKey.group("GRP-Allowed-123"), "Family Trip")];
+  const handler = createSbApi({ registry: chats, line: env.line, accessPath: join(env.stateRoot, "access.json"), enabled: () => true, health: () => ({}) });
+  const post = async (path: string, body: Record<string, unknown>) => {
+    const response = await handler(new Request(`http://bridge${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
+    return { status: response.status, body: await response.json() as Record<string, unknown> };
+  };
+  for (const [index, target] of targets.entries()) {
+    const sessionId = `session-${index}`;
+    target.store.set("route", { id: sessionId, generation: 1 });
+    for (const path of ["/send", "/files"]) {
+      const body = { sessionId, dedupeKey: `${path}-${index}`, text: "hello", ...(path === "/files" ? { base64: "aGk=", name: "a.txt", mimeType: "text/plain" } : {}) };
+      const first = await post(path, body);
+      expect(first).toMatchObject({ status: 202, body: { created: true, chat: target.info.slug } });
+      expect(await post(path, body)).toEqual({ status: 200, body: { ...first.body, created: false } });
+    }
+  }
+  for (const target of targets) {
+    const first = await post("/send", { text: "relay", to: target.info.slug, sessionId: "session-0", dedupeKey: `relay-${target.info.slug}` });
+    expect(first).toMatchObject({ status: 202, body: { chat: target.info.slug } });
+    expect((await post("/send", { text: "relay", to: target.info.slug, sessionId: "session-0", dedupeKey: `relay-${target.info.slug}` })).body).toMatchObject({ created: false, chat: target.info.slug });
+  }
 });

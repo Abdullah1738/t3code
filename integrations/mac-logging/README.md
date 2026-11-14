@@ -26,17 +26,29 @@ stale children get the hourly inventory's remaining time, up to 210 s within
 the collector's 290 s deadline. Crash collection runs first.
 
 A separate `com.abdullah.mac-deep-inventory` LaunchAgent runs daily at 03:30
-local time (Asia/Dubai on this Mac). It visits the four SSD worktree farms first,
-then the other inventory roots, one bounded batch per root turn and oldest
-children first. Missing, partial,
-limited and 24-hour-old entries are eligible. Each command has at most ten
-minutes within a 45-minute pass, under nice 10 and background I/O policy.
-Every completed batch checkpoints the shared state atomically. Termination
-keeps completed rows; unfinished children remain explicit partials.
+local time (Asia/Dubai on this Mac). It starts with the four SSD worktree farms
+and checkpoints the next root to visit, so interrupted passes rotate fairly.
+Cheap batches can share a turn; known timeouts follow healthy discovery and
+refresh work after one early parts turn. Ordinary children that will expire
+during the pass are refreshed before more parts work can crowd them out.
+Unknown children get a 15-second probe; a batch deadline falls
+back to individual probes. A timed-out child is split into immediate entries,
+with each completed part checkpointed and at most ten minutes per child per
+pass. Checkpointed parts and their parent have a 72-hour freshness window so
+three nightly passes can finish a child. Ordinary children keep 24 hours.
+The child has no total until its listing and every part are complete and
+fresh; the total retains the oldest part's timestamp. At expiry it becomes
+partial with no total again. Its own directory allocation is included.
+Parts do not recurse. The hourly scanner leaves parts parents and recent
+timeouts to this pass.
+The daily budget is 90 minutes; du runs under nice 10
+and utility scheduling without inherited launchd background I/O policy.
+Termination keeps completed rows; unfinished children remain explicit partials.
 Both entry points acquire `state/disk-inventory.lock` non-blocking. A busy
 daily pass exits cleanly; a busy hourly scan logs `skipReason=deep_pass_running`
 and cached totals while crash collection continues. `disk.deep.start`,
-`disk.deep.root` and `disk.deep.end` record coverage, ages and stop reason.
+`disk.deep.root`, `disk.deep.parts` and `disk.deep.end` record coverage, ages,
+timeout time, parts progress, the parts freshness window and stop reason.
 `childrenRemaining` counts known eligible children; `rootsPartial` on pass
 summaries counts roots whose listing was unavailable, so zero remaining with
 unlisted roots is not complete coverage. All totals count hardlink occurrences,
@@ -117,6 +129,50 @@ Partial inventories and older snapshots without that evidence remain unknown.
 An unknown directory baseline also makes the event incomplete.
 These events never alert or launch extra scans.
 
+## Memory samples
+
+`com.abdullah.mac-memory` runs `memory.py` every 300 seconds independently of
+inventory, through `/bin/zsh` for launchd file access. `memory.sample` contains
+swap MB, VM page counts and page size, raw pressure counter/level and free percentage,
+load averages,
+the top 15 footprints with compressed MB, watched daemons with elapsed time,
+process/parent-1 counts, and disk0's second iostat sample. MB/GB use powers of
+1024. `top` MEM already includes compressed pages. One full, memory-sorted top snapshot
+supplies both the first15 holders and watched PIDs, including those below15.
+ps supplies exact command names/elapsed time and matches the snapshot by PID.
+At most512 watched PIDs are retained; excess
+is explicit in `watchedOmitted` and makes the sample partial. Each subprocess,
+including notifications, has a ten-second timeout. Failed probes are null with
+fixed `…Error` codes; watched PID failures retain null metrics per PID.
+
+`state/memory.json` retains swap counter baselines and alert receipts under a
+separate nonblocking lock. `swapinsDelta`/`swapoutsDelta` compare successful reads
+on the same boot, with `deltaWindowS`; first reads, resets, gaps over an hour and
+clock rollback establish a null baseline. Missing/failed probes remain unknown.
+No process arguments, command output or notification text enter the day log.
+
+Swap above 16 GB, critical pressure in two consecutive samples, a footprint
+above 8 GB, or fseventsd above 2 GiB queues a Telegram notification and writes
+`memory.alert`. Critical means `kern.memorystatus_vm_pressure_level == 4` or
+free percentage below 15; unavailable/healthy samples or gaps over ten minutes reset the streak.
+`pressureLevel` logs that level (1 normal, 2 warning, 4 critical); `pressure` keeps
+`vm.memory_pressure` as a raw counter and never determines an alert. The level
+streak starts fresh when upgrading from the old counter-based implementation.
+
+A separate `fseventsd_growth` reason warns on footprint growth above 100 MiB/h
+for three consecutive intervals spanning at least 15 minutes. A baseline plus
+three five-minute samples is required; one jump does not qualify. Samples log
+`fseventsdGrowthMbPerHour`, `fseventsdGrowthSamples`, `fseventsdGrowthPid` and
+`fseventsdGrowthWindowS`. State follows each watched PID on the same boot;
+missing measurements, elapsed-age discontinuities, a flat/falling reading or
+a gap over ten minutes reset its streak. The growth check needs no new subprocess.
+Each reason has a six-hour cooldown
+across day boundaries. Keys start `mac-memory:<reason>:<YYYYMMDD>` with a time
+suffix so another alert can be queued after six hours on the same day. An
+unconfirmed send retains its exact key/text for idempotent retry. For a diagnostic
+sample without notifications, run `TOOLLOG_DIR=<private-temp-dir> /usr/bin/python3
+integrations/mac-logging/memory.py --no-alert`.
+
 ## Source events
 
 `disk.inventory` and `crash.collect` retain `count` and `sourceErrors` summary
@@ -155,7 +211,11 @@ hard links across children and excludes the root directory's own blocks.
 Root attempts rotate oldest first, with never-attempted roots ahead of measured
 ones. Budget-skipped roots retain their place; full failed attempts rotate too.
 Shortened failed attempts keep priority for a full allowance on the next run.
-`disk.inventory.turn` identifies each attempted root's `source` and `turn`.
+`disk.inventory.root` summarizes each root once per run. Detailed child sizes stay
+in `state/disk-inventory.json` (`childState`); successful child lines are retained
+only for changes of at least 1 GiB or 20%, new children of at least 1 GiB,
+or measurements taking at least ten seconds. Partial and error diagnostics
+are always retained.
 Child attempts rotate the same way. A failed child retains its last good size
 and timestamp in `childState`; missing, stale or unreadable children keep the
 root partial. `cachedCount` and `ageS` describe retained measurements.
@@ -240,24 +300,42 @@ storagekitd and `diskutil list` improved from an 8 s timeout to 0.04–0.74 s.
 
 ## Processes stuck in disk wait
 
-Each hourly run emits `proc.disk_wait` from a read-only, 10 s-bounded
-`ps -axo pid,ppid,etime,stat,comm,args`. It counts processes observed in
-`U` with a process age of at least ten minutes, retaining the ten oldest
-(`pid`, `ppid`, `ageS`, `stat`, `comm`, `args`). Arguments are limited
-to 300 characters, with credential-like values redacted; no environment
-is logged. `stuckUnmount` and `mountPoint` flag an unmount among all matches,
-even if it is outside the ten retained entries. A failed ps records an error
-without stopping the other collector sources.
+`disk.clone_wedge` also records U-state `cp -c`/`clonefile` commands of any
+age, and groups of U processes naming the same absolute path in three
+one-second samples. Both must remain in U in every sample; CPU may advance.
+It records PID, process age, path, CPU delta and wait
+channel (`-` when macOS hides it). The probe uses only `ps`, never pathname
+lookups. Argument parsing is best effort: `ps` does not preserve argv quoting,
+so ambiguous pathname fragments, quotes and escapes do not establish
+shared-path identity. Clone commands with ambiguous operands still qualify
+under their own PID identity.
+Umount is excluded and remains covered by `proc.disk_wait`.
+One Telegram alert per PID/start incident uses the existing notify helper;
+shared-path waiters alert together, and failed sends retry frozen text/key.
+This is an I/O workload signal: CPU or device progress can mean slow APFS
+extent copying, so the alert does not diagnose deadlock or recommend a kill.
+The clone probe shares the disk-wait budget, with its own 20 s ceiling.
 
-Process age is not time continuously spent in U: this is an hourly observation,
-and an old process can be caught during normal I/O. An umount aged at least
-30 minutes, or another process aged at least six hours, triggers one Telegram
-attention alert per PID/start time. A bounded ps start-time lookup prevents
-PID reuse from suppressing a new incident. Failed notifications retry with
-the same key and frozen text; they never fail collection. The shared 45 s disk-wait
-budget defers remaining alerts to the next run when notifications are slow.
-Daily `diskWait` rollups give runs with matches, maximum process age, and
-the latest stuck-unmount mount point.
+Each hourly run selects processes in `U` aged at least ten minutes, then
+samples their state and cumulative CPU time six times, one second apart.
+Only `U` in every sample with no CPU progress counts as stuck. Processes
+that leave `U` or use CPU appear in `busy`, for information only, with no
+alerts. Vanished PIDs are dropped. Calls are bounded to ten seconds within
+a shared 45 s budget; a partial observation needs at least three samples
+to classify a stall. Failed sources never stop the rest of collection.
+
+`processAgeS` is uptime. `stuckForS` is a lower bound from the first consecutive
+hourly stuck observation, reset by recovery, CPU progress or PID reuse.
+For umount, it includes process age because unmounting is its only task.
+Alerts use `stuckForS`: thirty minutes for umount, six hours otherwise.
+Each PID/start time alerts once; failures retry the same frozen text and key.
+The event retains ten stuck and ten busy processes, six state samples each,
+and at most 300 characters of arguments, with credential-like text redacted.
+`stuckUnmount` and `mountPoint` cover all stuck matches, including omitted rows.
+
+Daily `diskWait` rollups report stuck runs, maximum `stuckForS`, the latest
+stuck-unmount mount point, busy runs and five top busy command names.
+Old lines still count; their uptime maximum is kept as `legacyMaxProcessAgeS`.
 
 A kernel-stuck unmount can block the stat child of plain lsof, even for an
 unrelated APFS file, and may also affect diskutil. While a U-state umount

@@ -20,7 +20,8 @@ def rollup(day, root=None):
     backup = {key: dict.fromkeys(('memory', 'health', 'other'), 0)
               for key in ('skipped_runs', 'ok_runs', 'failed_runs')}
     latest_blocked_at = ''
-    waits = dict(runs=0, maxAgeS=None, latestStuckUnmountMountPoint=None)
+    waits = dict(runs=0, maxStuckForS=None, latestStuckUnmountMountPoint=None, busyRuns=0, topBusyComms=[])
+    busy_comms = Counter()
     latest_unmount_at = ''
     total = oks = failed = outcomes = malformed = 0
     source = root / (day + '.ndjson')
@@ -71,12 +72,22 @@ def rollup(day, root=None):
                             if type(value) in (int, float) and value >= 0:
                                 inventory[key] += value
                     if name == 'proc.disk_wait':
-                        props = safe_fields(row.get('props'), name)
+                        raw = row.get('props', {})
+                        props = safe_fields(raw, name)
+                        # Legacy ageS measured uptime, not a stuck duration. Keep
+                        # its maximum separate so old days remain readable.
+                        for proc in raw.get('procs', []):
+                            age = proc.get('ageS') if isinstance(proc, dict) and 'processAgeS' not in proc else None
+                            if type(age) is int and age >= 0:
+                                waits['legacyMaxProcessAgeS'] = max(waits.get('legacyMaxProcessAgeS', 0), age)
                         count = props.get('count', 0)
                         if count > 0:
                             waits['runs'] += 1
                         for proc in props.get('procs', []):
-                            waits['maxAgeS'] = max(waits['maxAgeS'] or 0, proc['ageS'])
+                            waits['maxStuckForS'] = max(waits['maxStuckForS'] or 0, proc['stuckForS'])
+                        if props.get('busyCount', 0) > 0:
+                            waits['busyRuns'] += 1
+                        busy_comms.update(p['comm'] for p in props.get('busy', []))
                         mount = props.get('mountPoint')
                         stamp = row.get('ts', '')
                         if props.get('stuckUnmount') and mount and stamp >= latest_unmount_at:
@@ -87,6 +98,7 @@ def rollup(day, root=None):
                         samples.setdefault(tag, safe_fields(row.get('ids')))
                 except (ValueError, TypeError, KeyError, AttributeError):
                     malformed += 1
+    waits['topBusyComms'] = [dict(comm=comm, count=count) for comm, count in busy_comms.most_common(5)]
     stats = {}
     for name, values in durations.items():
         values.sort()

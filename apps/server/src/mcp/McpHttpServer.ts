@@ -1132,6 +1132,11 @@ const withToolAnalytics =
                   ],
                   structuredContent: { reason: "server_shutting_down", bootId: callBootId },
                 });
+              if (options.tool.name === "card_next")
+                yield* Effect.logInfo("MCP card_next started", {
+                  threadId: invocation?.thread?.threadId ?? "unknown",
+                  startedAt,
+                });
               const rejection = { exceeded: false };
               const readiness = BOARD_READ_TOOLS.has(options.tool.name)
                 ? boardReplyReady
@@ -1218,6 +1223,12 @@ const withToolAnalytics =
                       ...(callState.cardId ? { cardId: callState.cardId } : {}),
                     };
                     const outcome = McpCallAnalytics.callOutcome(exit, callState);
+                    if (options.tool.name === "card_next")
+                      yield* Effect.logInfo("MCP card_next finished", {
+                        threadId: invocation?.thread?.threadId ?? "unknown",
+                        durationMs: Math.max(0, endedAt - startedAt),
+                        outcome: outcome.outcome,
+                      });
                     yield* complete
                       .value(row(outcome))
                       .pipe(Effect.interruptible, Effect.timeout("1 second"), Effect.ignoreCause);

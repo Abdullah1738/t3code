@@ -57,7 +57,7 @@ class FakePhone:
             raise AssertionError(f"Unexpected phone command: {args}")
         return ""
 
-    def run(self, args, t=5):
+    def run(self, args, t=5, strict=False):
         self.timeouts.append(t)
         if self.hung:
             self.now += t

@@ -1,3 +1,4 @@
+import * as RunStartDeadline from "./orchestration-v2/RunStartDeadline.ts";
 import * as McpCallLedger from "./ardud/analytics/McpCallLedger.ts";
 import * as McpAvailability from "./ardud/analytics/McpAvailability.ts";
 import * as AnalyticsDatabase from "./observability/AnalyticsDatabase.ts";
@@ -620,6 +621,9 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ),
   layerThreadPullRequestWorker,
   DelegatedTaskAnalytics.layer,
+  Layer.effectDiscard(
+    Effect.flatMap(RunStartDeadline.RunStartDeadline, (service) => service.start()),
+  ),
   Layer.effectDiscard(
     Effect.flatMap(DelegatedTaskProgressGuard.DelegatedTaskProgressGuard, (service) =>
       service.start(),

@@ -336,6 +336,7 @@ export type ThreadManagementError = typeof ThreadManagementError.Type;
 type ThreadManagementFailure = ThreadManagementError | Orchestrator.OrchestratorV2Error;
 
 export interface ThreadManagementServiceShape {
+  readonly promoteQueuedMessages: Orchestrator.OrchestratorV2["Service"]["promoteQueuedMessages"];
   readonly searchThreadStream: (
     input: OrchestrationV2SearchThreadInput,
   ) => Stream.Stream<OrchestrationV2SearchThreadResult, Orchestrator.OrchestratorV2Error>;
@@ -431,6 +432,12 @@ export interface ThreadManagementServiceShape {
    * just refuse a retry the project's settings no longer allow fresh.
    */
   readonly hasReceipt: (commandId: CommandId) => Effect.Effect<boolean>;
+  readonly getDelegationCommandState: (
+    commandId: CommandId,
+  ) => Effect.Effect<
+    CommandReceiptStore.CommandReceiptV2 | { readonly status: "pending" | "never_saved" },
+    CommandReceiptStore.CommandReceiptStoreV2Error
+  >;
   readonly getCommandReceipt: CommandReceiptStore.CommandReceiptStoreV2["Service"]["getByCommandId"];
   readonly findMcpThreadCreations: CommandReceiptStore.CommandReceiptStoreV2["Service"]["findMcpThreadCreations"];
   readonly waitForThread: (
@@ -558,6 +565,31 @@ const make = Effect.gen(function* () {
   // Orchestrator's lock is not reentrant. This separate lock covers the
   // preflight + selection update + send across callers of this service.
   const selectionDispatchLock = yield* KeyedLock.make<ThreadId>();
+  const delegationDispatchLock = yield* KeyedLock.make<CommandId>();
+  const pendingDelegations = yield* Ref.make<ReadonlyMap<CommandId, number>>(new Map());
+  const getDelegationCommandState = Effect.fn("ThreadManagementService.getDelegationCommandState")(
+    function* (commandId: CommandId) {
+      const receipt = yield* receipts.getByCommandId(commandId);
+      if (Option.isSome(receipt)) return receipt.value;
+      if ((yield* Ref.get(pendingDelegations)).has(commandId)) {
+        return { status: "pending" as const };
+      }
+      // Fence the second read against a create starting or finishing after the first read.
+      // The dispatch holds this key through commit and interruption cleanup.
+      return yield* delegationDispatchLock.withLock(
+        commandId,
+        Effect.gen(function* () {
+          const latest = yield* receipts.getByCommandId(commandId);
+          if (Option.isSome(latest)) return latest.value;
+          return {
+            status: (yield* Ref.get(pendingDelegations)).has(commandId)
+              ? ("pending" as const)
+              : ("never_saved" as const),
+          };
+        }),
+      );
+    },
+  );
 
   const assertProviderInstanceEnabled: ThreadManagementServiceShape["assertProviderInstanceEnabled"] =
     (input) =>
@@ -887,6 +919,24 @@ const make = Effect.gen(function* () {
   });
 
   const dispatch: ThreadManagementServiceShape["dispatch"] = (command) => {
+    if (command.type === "delegated_task.request") {
+      return Effect.acquireUseRelease(
+        Ref.update(pendingDelegations, (current) => {
+          const next = new Map(current);
+          next.set(command.commandId, (current.get(command.commandId) ?? 0) + 1);
+          return next;
+        }),
+        () => delegationDispatchLock.withLock(command.commandId, dispatchUnchanged(command)),
+        () =>
+          Ref.update(pendingDelegations, (current) => {
+            const next = new Map(current);
+            const remaining = (current.get(command.commandId) ?? 1) - 1;
+            if (remaining === 0) next.delete(command.commandId);
+            else next.set(command.commandId, remaining);
+            return next;
+          }),
+      );
+    }
     if (
       command.type !== "message.dispatch" &&
       command.type !== "thread.model-selection.set" &&
@@ -1497,6 +1547,7 @@ const make = Effect.gen(function* () {
   });
 
   return ThreadManagementService.of({
+    promoteQueuedMessages: orchestrator.promoteQueuedMessages,
     ensureLegacyTranscript,
     searchThreadStream: (input) =>
       Stream.unwrap(
@@ -1550,6 +1601,7 @@ const make = Effect.gen(function* () {
     assertProviderInstanceEnabled,
     isProviderInstanceEnabledForProject,
     hasReceipt,
+    getDelegationCommandState,
     findMcpThreadCreations: receipts.findMcpThreadCreations,
     getCommandReceipt: Effect.fn("ThreadManagementService.getCommandReceipt")(
       receipts.getByCommandId,

@@ -16,6 +16,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as TestClock from "effect/testing/TestClock";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
@@ -25,6 +26,8 @@ import * as ControlStore from "../control/ControlStore.ts";
 import * as KanbanStore from "../kanban/store/KanbanStore.ts";
 import { markQueuedRunRecovered } from "../fast-install/report.ts";
 import * as RestartPacingState from "./RestartPacingState.ts";
+import * as RestartPacing from "./RestartPacing.ts";
+import * as ServerSettings from "../../serverSettings.ts";
 
 const decodeProjection = Schema.decodeUnknownSync(OrchestrationV2ThreadProjection);
 const decodeLink = Schema.decodeUnknownSync(KanbanThreadLink);
@@ -97,12 +100,14 @@ const makeFixture = () => {
   let recorded: typeof OrchestrationV2TurnItem.Type | null = null;
   let origin: string | null = null;
   let link: typeof KanbanThreadLink.Type | null = null;
+  const commits: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0][] = [];
   const layer = RestartPacingState.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
           getThreadRecords: () => Effect.sync(() => projection),
           getTurnItem: () => Effect.sync(() => recorded),
+          getNextTurnItemOrdinal: () => Effect.succeed(1),
         }),
         Layer.mock(ProjectStore.ProjectStoreV2)({ get: () => Effect.succeed(Option.none()) }),
         Layer.mock(ControlStore.ControlStore)({ getOrigin: () => Effect.sync(() => origin) }),
@@ -111,15 +116,24 @@ const makeFixture = () => {
           discussionByEvaluator: () => Effect.succeed(null),
         }),
         ThreadCommandExecutor.layer,
-        Layer.mock(EventSink.EventSinkV2)({}),
+        Layer.mock(EventSink.EventSinkV2)({
+          commitCommand: (input) =>
+            Effect.sync(() => {
+              commits.push(input);
+              for (const event of input.events)
+                if (event.type === "turn-item.updated") recorded = event.payload;
+              return { committed: true, cancelledEffectCount: 0 } as never;
+            }),
+        }),
         IdAllocator.layer,
         Layer.mock(EffectOutbox.EffectOutboxV2)({
-          hasPendingRunContinuation: () => Effect.sync(() => continuationPending),
+          hasRunContinuationAt: () => Effect.sync(() => continuationPending),
         }),
       ),
     ),
   );
   return {
+    commits,
     layer,
     pending: (value: boolean) => {
       continuationPending = value;
@@ -216,9 +230,15 @@ it.effect("only restart markers and explicitly recovered queues enter pacing", (
       restartContinuationOfRunId: run.id,
     };
     f.set({ ...f.get(), runs: [{ ...run, status: "starting" }, continuation] });
-    assert.deepEqual(yield* state.sourceForRun(source.threadId, continuation.id), source);
+    assert.deepEqual(yield* state.sourceForRun(source.threadId, continuation.id), {
+      ...source,
+      classification: "continuation",
+    });
     markQueuedRunRecovered(run.id);
-    assert.deepEqual(yield* state.sourceForRun(source.threadId, run.id), source);
+    assert.deepEqual(yield* state.sourceForRun(source.threadId, run.id), {
+      ...source,
+      classification: "recovered-queue",
+    });
     assert.isUndefined(yield* state.sourceForRun(source.threadId, RunId.make("run:fresh")));
   }).pipe(Effect.provide(f.layer));
 });
@@ -307,7 +327,11 @@ it.effect(
   () => {
     const f = makeFixture();
     const automaticId = RunId.make("run:automatic-source");
-    const automatic = { ...source, sourceRunId: automaticId };
+    const automatic = {
+      ...source,
+      sourceRunId: automaticId,
+      classification: "pending-continuation-race" as const,
+    };
     return Effect.gen(function* () {
       const state = yield* RestartPacingState.RestartPacingState;
       const message = yield* decodeMessage({
@@ -332,11 +356,207 @@ it.effect(
       assert.isUndefined(yield* state.sourceForRun(source.threadId, automaticId));
       f.pending(true);
       assert.deepEqual(yield* state.sourceForRun(source.threadId, automaticId), automatic);
+      const pacing = yield* RestartPacing.RestartPacing;
+      assert.isAbove(yield* pacing.acquireRun(source.threadId, automaticId), 0);
       f.recorded(automaticId);
       f.pending(false);
       assert.deepEqual(yield* state.sourceForRun(source.threadId, automaticId), automatic);
       f.set({ ...f.get(), messages: [{ ...message, createdBy: "user" }] });
       assert.isUndefined(yield* state.sourceForRun(source.threadId, automaticId));
+    }).pipe(
+      Effect.provide(
+        RestartPacing.layer.pipe(
+          Layer.provideMerge(f.layer),
+          Layer.provide(ServerSettings.layerTest({})),
+          Layer.provide(Layer.succeed(RestartPacing.RestartLoad, () => 2)),
+        ),
+      ),
+    );
+  },
+);
+
+it.effect(
+  "a stale pending continuation cannot re-catch automatic wakes after startup work started",
+  () => {
+    const f = makeFixture();
+    return Effect.gen(function* () {
+      const state = yield* RestartPacingState.RestartPacingState;
+      yield* TestClock.adjust("1 hour");
+      const startedAt = yield* DateTime.now;
+      const automaticId = RunId.make("run:late-notification");
+      const message = yield* decodeMessage({
+        id: "message:late",
+        threadId: run.threadId,
+        runId: automaticId,
+        nodeId: null,
+        role: "user",
+        text: "Checks passed",
+        attachments: [],
+        streaming: false,
+        createdAt: startedAt,
+        updatedAt: startedAt,
+        createdBy: "system",
+        creationSource: "server",
+      });
+      f.pending(true);
+      f.set({
+        ...f.get(),
+        runs: [
+          { ...run, status: "completed", startedAt, completedAt: startedAt },
+          {
+            ...run,
+            id: automaticId,
+            status: "starting",
+            userMessageId: message.id,
+            requestedAt: startedAt,
+            startedAt: null,
+            completedAt: null,
+          },
+        ],
+        messages: [message],
+      });
+      assert.isUndefined(yield* state.sourceForRun(source.threadId, automaticId));
+      const pacing = yield* RestartPacing.RestartPacing;
+      assert.equal(yield* pacing.acquireRun(source.threadId, automaticId), 0);
+      // An existing wait is this run's durable classification, not a new wake.
+      f.recorded(automaticId);
+      assert.equal(
+        (yield* state.sourceForRun(source.threadId, automaticId))?.sourceRunId,
+        automaticId,
+      );
+    }).pipe(
+      Effect.provide(
+        RestartPacing.layer.pipe(
+          Layer.provideMerge(f.layer),
+          Layer.provide(ServerSettings.layerTest({})),
+          Layer.provide(Layer.succeed(RestartPacing.RestartLoad, () => 2)),
+        ),
+      ),
+    );
+  },
+);
+
+it.effect.each([1, 2])(
+  "a completed wait at position %s preserves its classification and blocking gates",
+  (position) => {
+    const f = makeFixture();
+    return Effect.gen(function* () {
+      const state = yield* RestartPacingState.RestartPacingState;
+      yield* state.status({ ...source, classification: "pending-continuation-race" }, position, {
+        total: 5,
+        active: 4,
+        maxActive: 4,
+        spacingMs: 1200,
+        loadHoldElapsedMs: 30000,
+        loadHoldRemainingMs: 1170000,
+      });
+      const item = f.commits[0]?.events.find((event) => event.type === "turn-item.updated");
+      assert.isDefined(item);
+      if (item?.type !== "turn-item.updated" || item.payload.type !== "notification") return;
+      assert.equal(item.payload.summary, `Resuming after restart (position ${position} of 5)`);
+      assert.equal(
+        item.payload.detail,
+        `Source: pending-continuation-race. Queue: position ${position} of 5. Active: 4/4 (maxActive). Spacing: 2s remaining. Load hold: 30s elapsed, 1170s remaining.`,
+      );
+      yield* TestClock.adjust("1 minute");
+      yield* state.status(source, null);
+      const completed = f.commits
+        .at(-1)
+        ?.events.find((event) => event.type === "turn-item.updated");
+      assert.isDefined(completed);
+      if (completed?.type !== "turn-item.updated" || completed.payload.type !== "notification")
+        return;
+      assert.equal(completed.payload.summary, "Restart wait ended");
+      assert.equal(completed.payload.status, "completed");
+      assert.equal(completed.payload.detail, item.payload.detail);
+      assert.isNotNull(completed.payload.completedAt);
+      assert.deepEqual(completed.payload.startedAt, item.payload.startedAt);
+      yield* state.status(source, null);
+      const repeated = f.commits.at(-1)?.events.find((event) => event.type === "turn-item.updated");
+      if (repeated?.type !== "turn-item.updated" || repeated.payload.type !== "notification")
+        return;
+      assert.equal(repeated.payload.detail, item.payload.detail);
+    }).pipe(Effect.provide(f.layer));
+  },
+);
+
+it.effect.each(["user", "scheduled"] as const)(
+  "%s input skips pacing despite a pending continuation",
+  (kind) => {
+    const f = makeFixture();
+    return Effect.gen(function* () {
+      const state = yield* RestartPacingState.RestartPacingState;
+      const id = RunId.make(`run:unpaced:${kind}`);
+      const message = yield* decodeMessage({
+        id: `message:${kind}`,
+        threadId: run.threadId,
+        runId: id,
+        nodeId: null,
+        role: "user",
+        text: "Work",
+        attachments: [],
+        streaming: false,
+        createdAt: now,
+        updatedAt: now,
+        createdBy: kind === "user" ? "user" : "system",
+        creationSource: "server",
+        ...(kind === "scheduled" ? { scheduledTaskId: "schedule:test" } : {}),
+      });
+      f.pending(true);
+      f.set({
+        ...f.get(),
+        runs: [{ ...run, id, status: "starting", userMessageId: message.id }],
+        messages: [message],
+      });
+      assert.isUndefined(yield* state.sourceForRun(source.threadId, id));
+    }).pipe(Effect.provide(f.layer));
+  },
+);
+
+it.effect(
+  "a racing wake with a delayed first claim stays paced after another startup run starts",
+  () => {
+    const f = makeFixture();
+    return Effect.gen(function* () {
+      const state = yield* RestartPacingState.RestartPacingState;
+      const requestedAt = yield* DateTime.now;
+      yield* TestClock.adjust("1 second");
+      const startedAt = yield* DateTime.now;
+      const id = RunId.make("run:delayed-startup-race");
+      const message = yield* decodeMessage({
+        id: "message:delayed-startup-race",
+        threadId: run.threadId,
+        runId: id,
+        nodeId: null,
+        role: "user",
+        text: "Checks passed",
+        attachments: [],
+        streaming: false,
+        createdAt: requestedAt,
+        updatedAt: requestedAt,
+        createdBy: "system",
+        creationSource: "server",
+      });
+      f.pending(true);
+      f.set({
+        ...f.get(),
+        messages: [message],
+        runs: [
+          { ...run, status: "completed", startedAt, completedAt: startedAt },
+          {
+            ...run,
+            id,
+            status: "starting",
+            userMessageId: message.id,
+            requestedAt,
+            startedAt: null,
+          },
+        ],
+      });
+      assert.equal(
+        (yield* state.sourceForRun(source.threadId, id))?.classification,
+        "pending-continuation-race",
+      );
     }).pipe(Effect.provide(f.layer));
   },
 );

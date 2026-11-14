@@ -109,6 +109,7 @@ export interface KanbanClient {
     options?: { readonly replaces?: string },
   ): Promise<void>;
   updateBoard(input: KanbanBoardUpdateInput): Promise<void>;
+  revokeStandingApproval(boardId: string, id: string): Promise<void>;
   /** Owner's New board: creates the board with its project and evaluator model. */
   createBoard(input: {
     slug: string;
@@ -955,6 +956,13 @@ export function createKanbanClient(
         boardId: boardId as never,
         model,
         ...(options?.replaces === undefined ? {} : { replaces: options.replaces }),
+      });
+    },
+    async revokeStandingApproval(boardId, id) {
+      await transport.request(M.standingApprovalRevoke, {
+        boardId: boardId as never,
+        id,
+        reason: "Revoked from board settings",
       });
     },
     async updateBoard(input) {

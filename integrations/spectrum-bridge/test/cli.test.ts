@@ -388,6 +388,20 @@ describe("guest-allow", () => {
   });
 });
 
+test("message length errors name actual length, limit and a recovery", () => {
+  const cases: [string[], number][] = [
+    [["send", "--session", "s", "--key", "k"], 12_000],
+    [["send", "--to", "moni", "--session", "s", "--key", "k"], 12_000],
+    [["wake", "--source", "watch", "--key", "k"], 12_000],
+    [["guest-send", "--address", "+15555550199", "--session", "s", "--key", "k"], 2_000],
+  ];
+  for (const [args, limit] of cases) {
+    const actual = limit + 412;
+    expect(() => parseCommand([...args, "--text", "x".repeat(actual)])).toThrow(
+      `message too long: ${actual.toLocaleString("en-US")} chars, limit ${limit.toLocaleString("en-US")}; split it or send as a card`);
+  }
+});
+
 test("log-rollup is local, validates UTC dates and rolls up fixture input", async () => {
   const { parseLocalCommand, runLocalCommand, isLocalCommand } = await import("../src/cli.ts");
   const { captureLogs } = await import("./log-fixture.ts");

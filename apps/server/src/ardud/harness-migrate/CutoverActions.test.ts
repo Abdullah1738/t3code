@@ -114,6 +114,7 @@ const board: KanbanBoard = {
   defaultCardModel: opus,
   reviewChains: [{ name: "review", steps: [sol, terra] }],
   defaultReviewChain: "review",
+  standingApprovals: [],
   instructions: {
     modelRouting: "Keep routing",
     reviewerRouting: "Keep review",
