@@ -1,6 +1,8 @@
 # robob-watch
 
-Durable watcher runner for Robob (the iMessage agent). Watchers run a check command on an interval (default every 15s, minimum 5s) or within about a second of a trigger file changing and, on a new event, wake the live iMessage agent turn with context via the spectrum-bridge `POST /wake` endpoint (fallbacks: bridge `send` to the live route session, then telegram-bridge `notify`). Wakes still pending after 120s trigger a one-time heads-up text.
+Durable watcher runner for Robob. Watchers run a check command on an interval (default every 15s, minimum 5s) or within about a second of a trigger file changing.
+
+Wake events go to the creating Robob thread (`created_by_session`) in queue mode, with the event key as the request ID for safe retries. Watchers created in iMessage keep following the live chat through rotation and `/new`; an explicit `chat` still wakes only that chat. Without a creator, or when an old native session cannot be resolved, wakes use the live owner route. Missing, archived or unreachable creator threads fall back to that route with a note naming the intended thread. Owner wakes use spectrum-bridge `wake`, then bridge `send`, then Telegram `notify` as fallbacks. Only owner wakes enter the opt-in 120s heads-up tracking.
 
 Failed checks back off, with a failure notice from the 2nd failure in a row (`failure_notice_after`), pause and alert after 5 (`max_consecutive_failures`). Set `failure_notice_after` to 1 to notify on every failure, or `max_consecutive_failures` to 0 to keep retrying without pausing. Timed-out checks need 10 minutes of failures before either notice or pause; host-load timeout grace still applies. Wake watchers escalate at pause or after 15 minutes of failures. A successful check resets the streak.
 
