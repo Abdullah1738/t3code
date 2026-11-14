@@ -26,6 +26,45 @@ stay in Keychain; no raw notification dumps or mail bodies are stored.
 
 ## Runtime
 
+Manual shop orders can use the local mail archive instead of a native tracker:
+
+```sh
+order-watch add --merchant Acme --email-receipt --order-id ORD-123 \
+  --amount 81.15 --card 2342 --requester owner --placed-at ISO_WITH_TIMEZONE
+order-watch can-report ORD-123
+```
+
+Use `--email-domain receipts.example` when the sender domain differs from the
+merchant name. The adapter reads exact-order confirmation/shipping mail through
+`msgs`, reuses Amazon's MIME body reader, and retains projected status, stated
+ETA and tracking links. Unsupported formats remain unknown. No ETA is inferred
+from the product type, order date or another merchant. `can-report` returns
+`no ETA given` when none was recorded, and fails for missing, ambiguous, paused,
+expired, inactive or payment-held tracking.
+
+Receipt watchers install a receipt-compatible callback to drain large-order
+problem notices. Deployment runs `order-watch configure-problem-checks` to
+repair this callback on existing active receipt trackers; untrackable orders
+remain without polling.
+
+Use `--untrackable` instead of `--email-receipt` when there is no tracking
+source. This registers an open order without polling; close it explicitly with
+`order-watch delivered --merchant Acme --order-id ORD-123`. `remove` stops either
+mode early. Registration alone is not bank payment confirmation.
+
+Pass a placed basket with `--items-file` (an item array, or an object containing
+`items`, with name/price). Tracker snapshots emit `item_dropped` once per placed
+line for an explicit removal or a formerly paid line becoming zero. Missing
+lines require a complete snapshot with comparable item identities; partial shipment inventories cannot remove
+the rest of the order. The existing watcher wake carries the requester chat and
+a stable bridge notice key. Amazon cancellation evidence uses the same path.
+
+Native/app registrations accept `--amount` and `--card LAST4` too; bare `--card`
+keeps its existing delivery-card enrollment meaning. Money-cases checks registered
+orders with an amount and card on its next scheduled tick at least 15 minutes
+after placement. Its separate `charge_unconfirmed` case closes on matching bank
+SMS/email evidence. An absent bank alert does not authorize another payment.
+
 - LaunchAgent `com.ardud.delivery-notifications`: read-only ADB every 15s;
   no phone UI, obeys priority-hold. Installer is `install-notifications.py`.
 - SQLite `~/.local/state/order-tracker/delivery.sqlite`: projected notifications

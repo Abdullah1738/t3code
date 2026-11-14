@@ -30,6 +30,7 @@ interface McpGroup {
   build: string;
   bootId: string;
   durations: Durations;
+  preHandler: Durations;
   failures: number;
   outcomes: Map<string, number>;
   savedCounts: Map<string, number>;
@@ -131,6 +132,18 @@ export const makeAccumulator = () => ({
   >(),
   errors: new Map<string, number>(),
   routes: new Map<string, Breakdown>(),
+  controlRoutes: new Map<
+    string,
+    {
+      route: string;
+      method: string;
+      hour: string;
+      durations: Durations;
+      statuses: Map<string, number>;
+      totalWaitMs: number;
+      deadlineExceeded: number;
+    }
+  >(),
   mcpCodes: new Map<string, Breakdown>(),
   dbSpans: new Map<string, Breakdown>(),
   rpcs: new Map<string, Durations & { totalWaitMs: number; outcomes: Map<string, number> }>(),
@@ -398,6 +411,36 @@ export function accumulate(
     } else target.textGenerationOverflow++;
   }
   increment(target.kinds, event.kind);
+  if (
+    event.kind === "rpc.request" &&
+    event.props?.httpRoute?.startsWith("/api/ardud/control/") &&
+    event.props?.httpMethod &&
+    event.durationMs !== undefined
+  ) {
+    const labels = {
+      route: event.props.httpRoute,
+      method: event.props.httpMethod,
+      hour: (event.startedAt ?? event.ts).slice(0, 13),
+    };
+    const identity = JSON.stringify(labels);
+    const key =
+      target.controlRoutes.has(identity) || target.controlRoutes.size < 4096 ? identity : OTHER;
+    let group = target.controlRoutes.get(key);
+    if (!group) {
+      group = {
+        ...(key === OTHER ? { route: OTHER, method: OTHER, hour: OTHER } : labels),
+        durations: durations(),
+        statuses: new Map(),
+        totalWaitMs: 0,
+        deadlineExceeded: 0,
+      };
+      target.controlRoutes.set(key, group);
+    }
+    addDuration(group.durations, event.durationMs);
+    increment(group.statuses, String(event.props.status ?? event.outcome ?? "unknown"));
+    group.totalWaitMs += event.props.waitMs ?? 0;
+    if (event.durationMs >= 15000) group.deadlineExceeded++;
+  }
   if (event.props?.errorTag) increment(target.errors, event.props.errorTag);
   else if (event.errorTag) increment(target.errors, event.errorTag);
   else if (/error|fail/i.test(event.kind)) increment(target.errors, event.kind);
@@ -546,6 +589,7 @@ export function accumulate(
         build,
         bootId,
         durations: durations(),
+        preHandler: durations(),
         failures: 0,
         outcomes: new Map(),
         savedCounts: new Map(),
@@ -554,6 +598,7 @@ export function accumulate(
       target.mcp.set(key, group);
     }
     addDuration(group.durations, event.durationMs ?? 0);
+    if (event.preHandlerMs !== undefined) addDuration(group.preHandler, event.preHandlerMs);
     increment(group.outcomes, event.outcome);
     increment(group.savedCounts, String(event.saved ?? "unknown"));
     if (event.outcome !== "ok") {
@@ -674,6 +719,17 @@ export function finishRollup(
       .map((group) => ({ ...group.labels, ...summarize(group.durations) }))
       .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
     errorCounts: Object.fromEntries(target.errors),
+    controlRoutes: [...target.controlRoutes.values()]
+      .map(({ durations, statuses, ...labels }) => ({
+        ...labels,
+        statuses: Object.fromEntries(statuses),
+        ...summarize(durations),
+      }))
+      .sort((a, b) =>
+        JSON.stringify([a.hour, a.route, a.method]).localeCompare(
+          JSON.stringify([b.hour, b.route, b.method]),
+        ),
+      ),
     errorsByRoute: finishBreakdown(target.routes).map((row) => ({
       route: String(row.labels.route),
       method: String(row.labels.method),
@@ -794,6 +850,7 @@ export function finishRollup(
         build: group.build,
         bootId: group.bootId,
         ...summarize(group.durations),
+        preHandler: summarize(group.preHandler),
         failures: group.failures,
         failureRate: group.failures / group.durations.count,
         outcomes: Object.fromEntries(group.outcomes),

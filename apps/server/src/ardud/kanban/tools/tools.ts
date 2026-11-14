@@ -210,7 +210,7 @@ const BoardGet = tool(
     since: Schema.optional(
       describe(
         TrimmedNonEmptyString,
-        "ISO time, at most 72 hours ago: only cards active since then, as short rows.",
+        "ISO time or relative (now, now-24h, 24h, 90m, 2d), at most 72 hours ago: only cards active since then, as short rows. Times are UTC; give a Z or offset for ISO times.",
       ),
     ),
   },
@@ -225,9 +225,17 @@ const BoardActivity = tool(
   {
     boardId: BoardRef,
     since: Schema.optional(
-      describe(TrimmedNonEmptyString, "ISO start; default 24 hours before until."),
+      describe(
+        TrimmedNonEmptyString,
+        "ISO or relative start (now, now-24h, 24h, 90m, 2d); default 24 hours before until. Times are UTC; give a Z or offset for ISO times.",
+      ),
     ),
-    until: Schema.optional(describe(TrimmedNonEmptyString, "ISO end; default now.")),
+    until: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        "ISO or relative end (now, now-24h, 24h, 90m, 2d); default now. Relative times count back from the server clock. Times are UTC; give a Z or offset for ISO times.",
+      ),
+    ),
   },
   { activity: Record },
   { readonly: true },
@@ -407,6 +415,7 @@ const AskFieldsInput = {
             label: Schema.String,
             detail: Schema.optional(Schema.String),
             recommended: Schema.optional(Schema.Boolean),
+            approves: Schema.optional(Schema.Array(Schema.String)),
             consequence: Schema.optional(Schema.String),
             block: Schema.optional(Schema.Finite),
           }),
@@ -498,7 +507,7 @@ const CardAsk = tool(
     blocking: Schema.optional(Schema.Boolean),
     ...AskFieldsInput,
   },
-  { card: Record, note: Schema.optional(Schema.String) },
+  { card: Record, warning: Schema.optional(Schema.String), note: Schema.optional(Schema.String) },
   { readonly: false },
 );
 
@@ -529,7 +538,7 @@ const CardAskChange = tool(
       ),
     ),
   },
-  { card: Record },
+  { card: Record, warning: Schema.optional(Schema.String) },
   { readonly: false },
 );
 

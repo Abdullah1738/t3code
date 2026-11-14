@@ -78,6 +78,15 @@ const card: KanbanCard = {
 };
 
 describe("board briefs", () => {
+  it("keeps cross-card packet handoffs with the evaluator", () => {
+    expect(evaluatorBrief(board, { kind: "check" })).toContain(
+      "then mark it done. A work thread can change and post only on its own cards (the server refuses the rest), so a packet never tells it to post on, tick, move or edit another card; make that an evaluator subtask.",
+    );
+    expect(workBrief(board, card, null)).toContain(
+      '(kind "request" only). The ones that change things work only on your own cards. If your task says to post on or change another card, put what you have in your own card (card_update or its discussion) and leave carrying it over to the evaluator.',
+    );
+  });
+
   it("tells workers to watch PR CI and end the turn, and wait inside it for other work", () => {
     expect(nudgeWorkText([card])).toContain(
       "Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. For a deploy or anything else, wait inside your turn.",

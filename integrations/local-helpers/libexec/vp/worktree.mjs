@@ -1,15 +1,27 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import * as NodeOS from "node:os";
+import {
+  checkToolchain,
+  loadToolchain,
+  syncToolchain,
+  ToolchainMismatch,
+} from "./toolchain-state.mjs";
 
-const [root, main, command, ...args] = process.argv.slice(2);
+const [root, ...input] = process.argv.slice(2);
+const candidates = [];
+while (input[0]?.startsWith("--candidate=")) {
+  const kind = input.shift().slice("--candidate=".length);
+  candidates.push({ kind, dir: input.shift() });
+}
+if (input.shift() !== "--") throw new Error("missing candidate separator");
+const [command, ...args] = input;
+let main;
 const hint = `run offbox run -- vp ${[command, ...args].filter(Boolean).join(" ")}`;
 function refuse(reason) {
-  throw new Error(`${reason}; ${hint}`);
+  throw new Error(reason);
 }
 
 function absolute(value) {
@@ -150,121 +162,6 @@ function checkConfig() {
   }
 }
 
-function installedPackage(name, requireFrom) {
-  // Search package roots directly: plugins may not export their package.json.
-  for (const dir of requireFrom.resolve.paths(name) ?? []) {
-    const file = path.join(dir, name, "package.json");
-    if (fs.existsSync(file)) {
-      try {
-        const real = fs.realpathSync(file);
-        return { file: real, metadata: JSON.parse(fs.readFileSync(real, "utf8")) };
-      } catch {
-        return;
-      }
-    }
-  }
-}
-
-function checkToolchain(requireMain, vpFile, loaded) {
-  const requireVp = createRequire(fs.realpathSync(vpFile));
-  const { parse } = requireVp("yaml");
-  let lock;
-  try {
-    lock = parse(fs.readFileSync(path.join(root, "pnpm-lock.yaml"), "utf8"));
-    if (Number(lock?.lockfileVersion) !== 9 || !lock.importers?.["."] || !lock.snapshots)
-      throw new Error("expected pnpm lockfile v9");
-  } catch {
-    refuse("config drift in pnpm-lock.yaml (missing or invalid v9 lockfile)");
-  }
-  const importer = lock.importers["."];
-  const rootReference = (name) =>
-    (
-      importer.dependencies?.[name] ??
-      importer.devDependencies?.[name] ??
-      importer.optionalDependencies?.[name]
-    )?.version;
-  const toolchainName = (name) =>
-    /^(vite-plus$|vite$|oxfmt$|oxlint$|oxlint-tsgolint$|@oxfmt\/|@oxlint\/|@oxlint-tsgolint\/|@voidzero-dev\/)/.test(
-      name,
-    );
-  const visited = new Set();
-  const libc =
-    NodeOS.platform() === "linux"
-      ? process.report.getReport().header.glibcVersionRuntime
-        ? "glibc"
-        : "musl"
-      : undefined;
-  function visit(name, reference, requireFrom) {
-    const installed = installedPackage(name, requireFrom);
-    // pnpm appends peer contexts, and npm aliases carry the actual package name.
-    const alias =
-      typeof reference === "string" && /^((?:@[^/()]+\/)?[^@()]+)@(.+)$/.exec(reference);
-    const identity = alias ? alias[1] : name;
-    const resolved = alias ? alias[2] : reference;
-    const version = typeof resolved === "string" ? resolved.split("(")[0] : undefined;
-    if (
-      !version ||
-      !installed?.metadata.version ||
-      installed.metadata.name !== identity ||
-      version !== installed.metadata.version
-    )
-      refuse(
-        `config drift in ${name} (${version ?? "unresolved"} vs ${installed?.metadata.version ?? "unresolved"})`,
-      );
-    const snapshotKey = `${identity}@${resolved}`;
-    const key = `${installed.file}:${snapshotKey}`;
-    if (visited.has(key)) return;
-    visited.add(key);
-    const snapshot = lock.snapshots[snapshotKey];
-    if (!snapshot) refuse(`config drift in ${name} (unresolved lockfile snapshot vs ${version})`);
-    const dependencies = { ...snapshot.dependencies, ...snapshot.optionalDependencies };
-    const declared = {
-      ...installed.metadata.dependencies,
-      ...installed.metadata.optionalDependencies,
-    };
-    const childRequire = createRequire(installed.file);
-    const children = new Set([...Object.keys(declared), ...Object.keys(dependencies)]);
-    if (name === "vite-plus") {
-      children.add("oxfmt");
-      children.add("oxlint");
-    }
-    for (const child of children) {
-      if (!toolchainName(child)) continue;
-      if (
-        installed.metadata.optionalDependencies?.[child] ||
-        snapshot.optionalDependencies?.[child]
-      ) {
-        const ref = dependencies[child];
-        const pkg = lock.packages?.[`${child}@${typeof ref === "string" ? ref.split("(")[0] : ""}`];
-        const accepts = (values, current) =>
-          !values ||
-          (!values.includes(`!${current}`) &&
-            (values.every((v) => v.startsWith("!")) || values.includes(current)));
-        if (
-          pkg &&
-          (!accepts(pkg.os, NodeOS.platform()) ||
-            !accepts(pkg.cpu, NodeOS.arch()) ||
-            (libc && !accepts(pkg.libc, libc)))
-        )
-          continue;
-      }
-      visit(child, dependencies[child], childRequire);
-    }
-  }
-  visit("vite-plus", rootReference("vite-plus"), requireMain);
-  for (const plugin of loaded.config.lint?.jsPlugins ?? []) {
-    if (typeof plugin !== "string") refuse("unsupported JS plugin config");
-    if (plugin.startsWith(".") || path.isAbsolute(plugin)) continue;
-    const name = /^(?:@[^/]+\/)?[^/]+/.exec(plugin)?.[0];
-    visit(name, rootReference(name), requireMain);
-  }
-  // vp fmt/lint use the explicit Vite config snapshot, not package.json config keys.
-  // Only `type` affects how Vite loads that config; scripts and dependencies do not.
-  const packageType = (base) =>
-    JSON.parse(fs.readFileSync(path.join(base, "package.json"), "utf8")).type;
-  if (packageType(root) !== packageType(main)) refuse("config drift in package.json#type");
-}
-
 function sameConfig(a, b, label) {
   if (!fs.existsSync(a) || !fs.existsSync(b)) refuse(`config drift in ${label}`);
   if (fs.statSync(a).isDirectory() && fs.statSync(b).isDirectory()) {
@@ -286,42 +183,60 @@ let temporary;
 try {
   if (command !== "fmt" && command !== "lint") refuse("no node_modules in this worktree");
   const forwarded = argv();
-  checkConfig();
-  process.chdir(main);
-  const requireMain = createRequire(path.join(main, "package.json"));
-  const vpPackage = path.join(main, "node_modules/vite-plus");
-  const metadata = JSON.parse(fs.readFileSync(path.join(vpPackage, "package.json"), "utf8"));
-  const { loadConfigFromFile } = await import(
-    pathToFileURL(path.join(vpPackage, metadata.exports["."].import))
-  );
-  const loaded = await loadConfigFromFile(
-    { command: "serve", mode: "development" },
-    path.join(main, "vite.config.ts"),
-  );
-  const config = loaded?.config[command];
-  if (!config) refuse(`main vite.config.ts has no ${command} config`);
-  checkToolchain(requireMain, path.join(vpPackage, "package.json"), loaded);
-  // Imported config helpers and local lint plugins are configuration too.
-  const dependencies = [...loaded.dependencies];
-  if (command === "lint") {
-    config.jsPlugins = config.jsPlugins?.map((plugin) => {
-      if (typeof plugin !== "string") refuse("unsupported JS plugin config");
-      const resolved = requireMain.resolve(plugin);
-      if (plugin.startsWith(".")) dependencies.push(resolved);
-      return resolved;
-    });
-  }
-  for (const file of dependencies) {
-    const relative = path.relative(main, file);
-    if (relative.startsWith("../") || relative.split(path.sep).includes("node_modules")) continue;
-    const counterpart = path.join(root, relative);
-    if (
-      !fs.existsSync(counterpart) ||
-      !fs.readFileSync(file).equals(fs.readFileSync(counterpart))
-    ) {
-      refuse(`config drift in ${relative}`);
+  const failures = [];
+  let selectedConfig;
+  let staleToolchain = false;
+  for (const candidate of candidates) {
+    main = fs.realpathSync(candidate.dir);
+    if (main === root) continue;
+    try {
+      if (candidate.kind === "toolchain copy") syncToolchain(root, main);
+      checkConfig();
+      process.chdir(main);
+      const requireMain = createRequire(path.join(main, "package.json"));
+      const loaded = await loadToolchain(main);
+      const config = loaded?.config[command];
+      if (!config) refuse(`main vite.config.ts has no ${command} config`);
+      checkToolchain(root, main, loaded);
+      // Imported config helpers and local lint plugins are configuration too.
+      const dependencies = [...loaded.dependencies];
+      if (command === "lint") {
+        config.jsPlugins = config.jsPlugins?.map((plugin) => {
+          if (typeof plugin !== "string") refuse("unsupported JS plugin config");
+          const resolved = requireMain.resolve(plugin);
+          if (plugin.startsWith(".")) dependencies.push(resolved);
+          return resolved;
+        });
+      }
+      for (const file of dependencies) {
+        const relative = path.relative(main, file);
+        if (relative.startsWith("../") || relative.split(path.sep).includes("node_modules"))
+          continue;
+        const counterpart = path.join(root, relative);
+        if (
+          !fs.existsSync(counterpart) ||
+          !fs.readFileSync(file).equals(fs.readFileSync(counterpart))
+        ) {
+          refuse(`config drift in ${relative}`);
+        }
+      }
+      selectedConfig = config;
+      break;
+    } catch (error) {
+      if (candidate.kind === "toolchain copy" && error instanceof ToolchainMismatch)
+        staleToolchain = true;
+      failures.push(
+        candidates.length === 1 && candidate.kind === "main checkout"
+          ? error.message
+          : `${candidate.kind} (${main}): ${error.message}`,
+      );
     }
   }
+  if (!selectedConfig)
+    refuse(
+      `${failures.join("; ")}${staleToolchain ? '; run: ~/.local/libexec/vp/toolchain sync --install (uses offbox local --reason "vp toolchain copy" --ttl 30m before installing)' : ""}`,
+    );
+  const config = selectedConfig;
   // Both tools anchor ignores and overrides to the config directory, not the file arguments.
   // Keep both the snapshot and fmt's native glob discovery rooted at the worktree.
   temporary = path.join(root, `.vp-worktree-${randomUUID()}.json`);
@@ -349,7 +264,7 @@ try {
   if (child.error) throw child.error;
   process.exitCode = child.status ?? 1;
 } catch (error) {
-  console.error(`vp: ${error.message.replaceAll("\n", " ")}`);
+  console.error(`vp: ${error.message.replaceAll("\n", " ")}; ${hint}`);
   process.exitCode = 127;
 } finally {
   if (temporary) fs.unlinkSync(temporary);

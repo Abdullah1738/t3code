@@ -22,8 +22,15 @@ export class McpCall extends Context.Service<
     };
     callerResolved: boolean;
     callerResolveMs: number;
+    requestTiming?: {
+      readonly authMs: number;
+      readonly dispatchMs: number;
+      readonly preHandlerMs: number;
+    };
     callerStarted?: bigint;
     readerLane: string;
+    waitStage?: "lookup.caller" | "lookup.target" | "waiting";
+    waitLookupMs?: number;
     phase: Phase;
     saved: boolean | "unknown";
     replyFailure?: "reply_timeout" | "reply_error";
@@ -220,7 +227,8 @@ export function callOutcome(
     state.replyFailure === "reply_timeout" ||
     code === "caller_unresolved" ||
     code === "delegation_timeout" ||
-    code === "send_timeout";
+    code === "send_timeout" ||
+    code === "lookup_timeout";
   const busy = code === "board_busy" || BOARD_BUSY.test(text);
   const refused =
     typedOutcome === "refused" ||

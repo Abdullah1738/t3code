@@ -367,6 +367,8 @@ export interface ProjectionRecordFilter {
   readonly runIds?: ReadonlyArray<RunId>;
   /** ardud: unfinished runs plus the newest N, instead of every run the thread ever had. */
   readonly recentRunLimit?: number;
+  /** A single newest run, including when older runs are unfinished. */
+  readonly latestRunOnly?: boolean;
   readonly turnItemTypes?: ReadonlyArray<OrchestrationV2TurnItem["type"]>;
   readonly recentTurnItemLimit?: number;
   readonly turnItemStatuses?: ReadonlyArray<OrchestrationV2TurnItem["status"]>;
@@ -3591,7 +3593,21 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             SELECT payload_json
             FROM orchestration_v2_projection_runs
             WHERE thread_id = ${threadId}
-              ${filter?.runIds === undefined ? sql`` : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.runIds)}))`}
+              ${
+                filter?.runIds === undefined
+                  ? sql``
+                  : filter.runIds.length === 1
+                    ? sql`AND run_id = ${filter.runIds[0]!}`
+                    : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.runIds)}))`
+              }
+              ${
+                filter?.latestRunOnly
+                  ? sql`AND run_id = (
+                SELECT run_id FROM orchestration_v2_projection_runs
+                WHERE thread_id = ${threadId} ORDER BY ordinal DESC LIMIT 1
+              )`
+                  : sql``
+              }
               ${
                 filter?.recentRunLimit === undefined
                   ? sql``
@@ -5835,8 +5851,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       threadId,
       fields,
       filter,
-    ) =>
-      sql.withTransaction(readCanonicalProjection(threadId, undefined, fields, filter)).pipe(
+    ) => {
+      const read = readCanonicalProjection(threadId, undefined, fields, filter);
+      // A metadata-only read is one SELECT and already has an atomic snapshot.
+      return (fields.length === 0 ? read : sql.withTransaction(read)).pipe(
         Effect.map(
           (projection) =>
             Object.fromEntries([
@@ -5846,6 +5864,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         ),
         Effect.mapError(controlReadError(threadId)),
       );
+    };
 
     const getThreadSnapshot: ProjectionStoreV2Shape["getThreadSnapshot"] = (threadId) =>
       sql
@@ -7765,6 +7784,9 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
           const projection = (yield* Ref.get(replayState)).projections.get(threadId);
           if (projection === undefined)
             return yield* new ProjectionStoreThreadNotFoundError({ threadId });
+          const newest = filter?.latestRunOnly
+            ? projection.runs.toSorted((a, b) => b.ordinal - a.ordinal)[0]
+            : undefined;
           const selected = {
             ...projection,
             messages: projection.messages.filter(
@@ -7779,7 +7801,7 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                 ? projection.runs
                 : projection.runs.filter((row) => filter.runIds!.includes(row.id)),
               filter?.recentRunLimit,
-            ),
+            ).filter((row) => !filter?.latestRunOnly || row.id === newest?.id),
             turnItems: projection.turnItems
               .filter(
                 (row) =>

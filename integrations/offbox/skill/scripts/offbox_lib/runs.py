@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import offbox_disk_space
+
 import base64
 import contextlib
 import json
@@ -20,7 +22,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
+from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
 from . import command_usage, common, containers, prune, prepare, userns
 from . import resources
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
@@ -31,7 +33,8 @@ from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT
 def _source_stamp():
     try:
         folder = Path(__file__).resolve().parent
-        files = [*folder.glob('*.py'), folder.parent / 'offbox.py', folder.parent / 'toollog.py']
+        files = [*folder.glob('*.py'), folder.parent / 'offbox.py', folder.parent / 'toollog.py',
+                 folder.parent / 'offbox_disk_space.py']
         return tuple((p.name, p.stat().st_mtime_ns, p.stat().st_size) for p in sorted(files))
     except Exception:
         return None
@@ -801,6 +804,9 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
     row is still active. The caller has already established that the process ended.
     """
     path = log_path or LOGS_DIR / f"{run['run_id']}.log"
+    disk = offbox_disk_space.result(path, code)
+    if disk.get('infra_failure'):
+        return code
     planned = planned_steps(run) if planned is None else planned
     if not planned:
         return 126 if code in (None, 126) and argument_list_failure(run, path, report=report and report_start_failure) else code
@@ -848,7 +854,16 @@ def missing_deps_hint(root: Path, *, cwd: Path | None = None, repo_root: Path | 
     target = node_tools.install_root(root, repo_root)
     install = node_tools.install_from(root, cwd or root, repo_root)
     node = node_version.want(repo_root or root, root)
-    requirement = (f" Use Node matching {node[1]}." if node else "") + package_manager.version_note(target)
+    requirement = ""
+    if node:
+        ranges, label = node
+        if len(ranges) == 1 and ranges[0][1] == ranges[0][0] + 1:
+            version = ranges[0][0]
+            exact = f"{version // 1_000_000}.{version // 1_000 % 1_000}.{version % 1_000}"
+            requirement = f" Use Node v{exact} exactly ({label})."
+        else:
+            requirement = f" Use Node matching {label}."
+    requirement += package_manager.version_note(target)
     return ("no node_modules on this box yet (fresh or pruned box). Install deps and run the command in the same call: "
             f"offbox run -- {shlex.quote(install + ' && <command>')}; offbox save --default afterwards keeps them."
             + requirement + " Check the repo's CI install flags and manager version before running.")
@@ -1302,6 +1317,34 @@ def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: 
     return None, ""
 
 
+def space_result(run_id, code, path=None, *, report=False):
+    record = offbox_disk_space.result(path or LOGS_DIR / f'{run_id}.log', code)
+    previous = read_json(LOGS_DIR / f'{run_id}.state.json', {})
+    # A missing/incomplete local log must not erase disk evidence already recorded for this exit.
+    if (not record['disk_space'] and not record['infra_failure'] and 'disk_attempt' not in record and code is not None and
+            previous.get('wrapper_exit_code') == code):
+        record.update({k: v for k, v in previous.items() if k in record or
+                       k.startswith(('tmp_', 'var_tmp_', 'home_', 'workspace_'))})
+    if any(previous.get(k) != v for k, v in record.items()):
+        try:
+            save_run_state(run_id, **record)
+        except OSError as error:
+            state_warning(run_id, code, error)
+        if record['disk_space'] or record['infra_failure']:
+            try:
+                import toollog
+                toollog.emit('run', 'run.disk_space', ids={'run': run_id}, props=record,
+                             kind='error' if record['infra_failure'] else 'event',
+                             ok=not bool(record['infra_failure']), tag=record['infra_failure'])
+            except Exception:
+                pass
+    if record.get('infra_failure'):
+        if report:
+            say(offbox_disk_space.message(record))
+        return EXIT_INFRA
+    return code
+
+
 def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | None = None, planned: int = 0,
                 where: str = "remote", deps_hint: str = "", box_id: str | None = None) -> None:
     """Always the last offbox line, so a caller's own `| tail` / `; echo` can't be mistaken for it."""
@@ -1371,7 +1414,11 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
     else:
         advice = (f'printf "\\n%s%s\\n%s\\n" {shlex.quote(DEPS_CONTEXT_MARKER)} '
                   f'"$__offbox_deps_context" {NO_NODE_MODULES_MARKER} >&2')
-    deps_check = (f'__offbox_exit=$?; if [ "${{__offbox_command_started:-0}}" = 1 ] '
+    probe_command = ('/usr/bin/python3 -I -c ' + shlex.quote(
+        'import base64,zlib,sys;exec(zlib.decompress(base64.b64decode(sys.argv.pop(1))))')
+        + ' "$__obsp" "$@"')
+    probe = '__obprobe'
+    deps_check = (f'__offbox_exit=$?; {probe} end "$__obsw"; if [ "${{__offbox_command_started:-0}}" = 1 ] '
                   f'&& [ "$__offbox_exit" -ne 0 ] && [ {int(usage.uses_js)} = 1 ] '
                   f'&& [ -f {root}/package.json ] && [ ! -e {root}/node_modules ] '
                   f'; then __offbox_deps_context=; {missing}; '
@@ -1379,8 +1426,13 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
                   'if [ -n "${__offbox_bash_env:-}" ]; then rm -f -- "$__offbox_bash_env"; fi; exit "$__offbox_exit"')
     lines = ["set -a", f'[ -f "{env_file}" ] && . "{env_file}"; rm -f "{env_file}"' if env_file else ":", "set +a",
              f'export OFFBOX_RUN_ID={run_id}',
+             f'export OFFBOX_BOX_ID={shlex.quote(box_id)}',
+             '__obsp=' + shlex.quote(offbox_disk_space.probe_payload()),
+             '__obprobe() { ' + probe_command + '; }',
+             f'__obsw="$HOME/{rdir}"',
               '__offbox_command_started=0',
               'trap ' + shlex.quote(deps_check) + ' EXIT',
+              probe + ' start "$__obsw" || exit 90',
               userns.setup(api.BACKEND, box_id),
               DOCKER_REPAIR,
               LDCACHE_REPAIR,
@@ -1679,7 +1731,14 @@ class Runner:
             r = api.cmd_start(self.box, command,
                               meta={"repo": me.get("repo_key"), "kind": run_kind(cmd_text), "run_id": self.run_id},
                               retry_interrupted=retry_interrupted(a))
+        except home.StartWaitFailed:
+            self.started = False
+            raise
         except (api.ApiError, api.NetworkError) as e:
+            if api.BACKEND == "server" and getattr(e, 'status', None) == 503 and e.api_code in (
+                    'server_not_ready', 'server_starting'):
+                self.started = False
+                raise
             # A 4xx answer (400 E2BIG, 409 not ready, 429 rate limit) means boat refused it: nothing ran.
             # Without this the run sat "starting" for an hour and held the box until it stopped.
             # Cloudflare 521-526 except 524 never reached boat, so nothing ran; 520, 524 and network errors stay started.
@@ -1768,7 +1827,7 @@ class Runner:
                         resumed = lease._reuse(con, row, row['size'])
                         if resumed is None:
                             raise OffboxError(f"lease {self.box} is no longer available")
-                    except common.SshHostKeyMismatch:
+                    except (common.SshHostKeyMismatch, home.StartWaitFailed):
                         raise
                     except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
                         raise OffboxError(f"{e}; box stopped during push: {self.box}") from e
@@ -1938,6 +1997,8 @@ def _safe(err: list, fn, *args, terminal_identity=False):
     try:
         fn(*args)
     except Exception as e:  # noqa: BLE001
+        if isinstance(e, home.StartWaitFailed):
+            raise
         if terminal_identity and isinstance(e, common.SshHostKeyMismatch):
             raise
         err.append(e if isinstance(e, OffboxError) else OffboxError(f"{type(e).__name__}: {e}"))
@@ -2593,7 +2654,8 @@ def emit_terminal(row):
         ended = row['end_at'] or now()
         elapsed = max(0, ended - (row['start_at'] or ended)) * 1000
         toollog.emit('run', 'run.end', kind='perf' if code == 0 else 'error', ok=code == 0, duration_ms=elapsed,
-                     ids={'run': run_id, 'box': row['box_id']}, props={'exitCode': code, 'fallback': row['mode'] == 'local'},
+                     ids={'run': run_id, 'box': row['box_id']}, props={'exitCode': code, 'fallback': row['mode'] == 'local',
+                            **read_json(LOGS_DIR / f'{run_id}.state.json', {})},
                      tag='run_failed' if code != 0 else None)
         if row['process_id'] or row['wrapper_pid']:
             command_ms = api.command_execution_ms(row['box_id'], row['process_id'], row['command_id'])
@@ -2624,11 +2686,17 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         # History can reach the server. An unvalidated wrapper result is never saved as terminal.
         if planned_steps(prior):
             code = None
-        code = settled_steps_code(prior, incoming, locked=True, until=until, catch_up=catch_up, report=report)
+        disk = offbox_disk_space.result(LOGS_DIR / f'{run_id}.log', incoming)
+        code = incoming if disk.get('infra_failure') else settled_steps_code(
+            prior, incoming, locked=True, until=until, catch_up=catch_up, report=report)
         if planned_steps(prior) and status in (None, 'done', 'failed', 'infra'):
             st = 'infra' if code is None else ('done' if code == 0 else 'failed')
         else:
             st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
+        if dict(prior).get('mode') != 'local':
+            space_result(run_id, code)
+            if disk.get('infra_failure'):
+                st = 'infra'
     def persist():
         nonlocal log_row
         con = db()
@@ -2719,6 +2787,7 @@ def _background(a, me: dict) -> int:
         ready_r, ready_w = os.pipe()
         accept_r, accept_w = os.pipe()
         payload = json.dumps(dict(args=vars(a), me=me, env=dict(os.environ), backend=common.backend(),
+                                  home_wait_deadline=home.wait_budget_end(),
                                   ready_fd=ready_w, accept_fd=accept_r, signal_mask=list(mask))).encode()
         boot_env = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR')}
         with open(client_log, 'ab', opener=lambda p, f: os.open(p, f, 0o600)) as dst:
@@ -2807,8 +2876,9 @@ def background_queue(run_id: str, payload: dict) -> int:
     finally:
         con.close()
     os.environ[BACKGROUND_RUN_ENV] = run_id
-    return background_client(a, me, ready=payload['ready_fd'], accept=payload['accept_fd'],
-                             signal_mask=payload['signal_mask'], source_failure=source_failure)
+    with home.wait_budget(payload.get('home_wait_deadline')):
+        return background_client(a, me, ready=payload['ready_fd'], accept=payload['accept_fd'],
+                                 signal_mask=payload['signal_mask'], source_failure=source_failure)
 
 
 def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, source_failure=None) -> int:
@@ -2924,7 +2994,7 @@ def _run_attempt(a, me: dict) -> int:
         return _run_remote(a, rn)
     except OffboxError as e:
         e.started = e.started or rn.started
-        e.run_id, e.box = rn.run_id, rn.box
+        e.run_id, e.box = rn.run_id, rn.box or e.box
         raise
     except KeyboardInterrupt:
         if not rn.started:
@@ -3018,7 +3088,8 @@ def _run_remote(a, rn) -> int:
     old = {s: signal.signal(s, on_sig) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     try:
         try:
-            rn.start()
+            with home.pre_start(rn.run_id):
+                rn.start()
         except OffboxError as e:
             if not rn.started:
                 if not isinstance(e, common.SourceGone):
@@ -3145,10 +3216,11 @@ def _run_remote(a, rn) -> int:
     resources.display(rn.run_id)
     steps = getattr(a, "steps", None) or []
     deps_hint = box_deps_hint(rn.root, rn.log_path)
+    effective = space_result(rn.run_id, code, rn.log_path, report=True)
     if steps:
         res = step_results(rn.log_path)
         failed = next((n for n, rc in res if rc != 0), None)
         report_exit(steps[failed - 1] if failed else "", code, res, len(steps), deps_hint=deps_hint, box_id=rn.box)
     else:
         report_exit(a.cmd[0] if len(a.cmd) == 1 else shlex.join(a.cmd), code, deps_hint=deps_hint, box_id=rn.box)
-    return 90 if code is None else code
+    return 90 if effective is None else effective

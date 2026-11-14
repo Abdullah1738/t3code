@@ -219,10 +219,17 @@ export class OrchestratorDispatchError extends Schema.TaggedError<OrchestratorDi
   {
     commandId: CommandId,
     commandType: Schema.String,
+    preflightReaderLane: Schema.optional(Schema.Literal("foreground")),
+    preflightWritesSaved: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
   override get message(): string {
+    if (this.preflightReaderLane === "foreground") {
+      if (this.preflightWritesSaved)
+        return "Preflight changes were saved, but the requested message or task was not created. Retry the same call.";
+      return "Dispatch pre-check could not use the foreground reader. Nothing was saved; retry the same call.";
+    }
     return `Failed to dispatch orchestration command ${this.commandType} (${this.commandId}).`;
   }
 }
@@ -13175,12 +13182,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "orchestration_v2.thread_id": commandThreadId(command),
     });
 
-    const existingReceipt = yield* commandReceipts.getByCommandId(command.commandId).pipe(
+    const interactive =
+      command.type === "message.dispatch" || command.type === "delegated_task.request";
+    const receiptRead = commandReceipts.getByCommandId(command.commandId);
+    // This point lookup runs before planning/COMMIT, outside the writer transaction.
+    const existingReceipt = yield* (
+      interactive ? receiptRead.pipe(NodeSqliteClient.foregroundReads) : receiptRead
+    ).pipe(
       Effect.mapError(
         (cause) =>
           new OrchestratorDispatchError({
             commandId: command.commandId,
             commandType: command.type,
+            ...(interactive && NodeSqliteClient.readerLaneFailure(cause) !== undefined
+              ? { preflightReaderLane: "foreground" as const }
+              : {}),
             cause,
           }),
       ),

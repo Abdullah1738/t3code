@@ -1,5 +1,6 @@
 import * as OwnerAnalytics from "../ardud/analytics/Analytics.ts";
 import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
+import * as McpResponseDelivery from "../ardud/http/McpResponseDelivery.ts";
 import * as StartupPhaseLog from "../ardud/observability/StartupPhaseLog.ts";
 import { bootId } from "../ardud/fast-install/report.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
@@ -43,7 +44,7 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as LargeReplyLog from "../observability/LargeReplyLog.ts";
 import * as McpReplySize from "../observability/McpReplySize.ts";
 import {
-  jsonExceedsBudget,
+  jsonBytesUpToLimit,
   MAX_REPLY_BYTES,
   REPLY_TOO_LARGE,
   ReplyTooLarge,
@@ -61,6 +62,7 @@ import {
 } from "../telemetry/ProviderDimensions.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
+import * as McpDeadline from "./McpDeadline.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import { PreviewControlsToolkit } from "./toolkits/previewControls/tools.ts";
 import * as PreviewControlsHandlers from "./toolkits/previewControls/handlers.ts";
@@ -179,9 +181,10 @@ type McpAuthMiddleware = (
   HttpServerRequest.HttpServerRequest
 >;
 
-class McpReplyCapture extends Context.Service<McpReplyCapture, McpReplySize.McpReplyCapture>()(
-  "t3/mcp/McpHttpServer/McpReplyCapture",
-) {}
+class McpReplyCapture extends Context.Service<
+  McpReplyCapture,
+  McpReplySize.McpReplyCapture & { readonly arrivedAt: bigint; readonly authenticatedAt: bigint }
+>()("t3/mcp/McpHttpServer/McpReplyCapture") {}
 
 export const normalizeMcpHttpResponse = (
   response: HttpServerResponse.HttpServerResponse,
@@ -217,11 +220,12 @@ const BOARD_READ_TOOLS = new Set([
   "card_search",
 ]);
 
-const makeMcpAuthMiddleware = Effect.gen(function* () {
+export const makeMcpAuthMiddleware = Effect.gen(function* () {
   const registry = yield* McpSessionRegistry.McpSessionRegistry;
   const clients = yield* Effect.serviceOption(McpClientAuthenticator);
   const largeReplies = yield* Effect.serviceOption(LargeReplyLog.LargeReplyLog);
   return Effect.fn("McpHttpServer.authenticateRequest")(function* (httpEffect) {
+    const arrivedAt = yield* Clock.monotonicTimeNanos;
     const request = yield* HttpServerRequest.HttpServerRequest;
     const authorization = request.headers.authorization;
     const token =
@@ -233,6 +237,7 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
       (Option.isSome(clients) && token.length > 0
         ? yield* clients.value.authenticate(request)
         : undefined);
+    const authenticatedAt = yield* Clock.monotonicTimeNanos;
     if (!invocation) {
       yield* Effect.logWarning("rejected MCP request with an unusable credential", {
         reason: token.length === 0 ? "missing_bearer_token" : "unknown_or_expired_token",
@@ -244,11 +249,17 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
         providerToken: looksLikeProviderToken(token),
       });
     }
-    const capture: McpReplySize.McpReplyCapture = {
+    const capture: McpReplyCapture["Service"] = {
+      arrivedAt,
+      authenticatedAt,
       name: undefined,
       threadId: invocation.thread?.threadId,
     };
+    const delivery = McpResponseDelivery.forRequest(request.source);
     return yield* httpEffect.pipe(
+      delivery === undefined
+        ? (effect) => effect
+        : Effect.provideService(McpResponseDelivery.McpResponseDelivery, delivery),
       Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
       Effect.provideService(McpReplyCapture, capture),
       Effect.map(normalizeMcpHttpResponse),
@@ -1039,13 +1050,35 @@ const withToolAnalytics =
               });
               const startedAt = yield* Clock.currentTimeMillis;
               const started = yield* Clock.monotonicTimeNanos;
+              const delivery = yield* Effect.serviceOption(McpResponseDelivery.McpResponseDelivery);
+              if (Option.isSome(delivery)) {
+                delivery.value.tool = options.tool.name;
+                if (invocation?.thread) delivery.value.callerThreadId = invocation.thread.threadId;
+              }
               const callState: McpCallAnalytics.McpCall["Service"] = {
+                ...(Option.isSome(capture)
+                  ? {
+                      requestTiming: {
+                        authMs:
+                          Number(capture.value.authenticatedAt - capture.value.arrivedAt) / 1e6,
+                        dispatchMs: Number(started - capture.value.authenticatedAt) / 1e6,
+                        preHandlerMs: Number(started - capture.value.arrivedAt) / 1e6,
+                      },
+                    }
+                  : {}),
                 callerResolved: false,
                 callerResolveMs: 0,
                 readerLane: yield* NodeSqliteClient.ReaderLane,
                 phase: "handler",
                 saved: "unknown",
               };
+              if (callState.requestTiming !== undefined)
+                yield* Effect.annotateCurrentSpan({
+                  "mcp.auth_ms": callState.requestTiming.authMs,
+                  "mcp.dispatch_ms": callState.requestTiming.dispatchMs,
+                  "mcp.pre_handler_ms": callState.requestTiming.preHandlerMs,
+                });
+              let handlerEnded: bigint | undefined;
               const parentSaved = yield* SavedWrite.observer;
               const parentCommitting = yield* SavedWrite.commitObserver;
               const identifiers = McpCallAnalytics.callIdentifiers(
@@ -1056,7 +1089,7 @@ const withToolAnalytics =
               const row = Effect.fnUntraced(function* (
                 outcome: ReturnType<typeof McpCallAnalytics.callOutcome>,
               ) {
-                const ended = yield* Clock.monotonicTimeNanos;
+                const ended = handlerEnded ?? (yield* Clock.monotonicTimeNanos);
                 const interrupted =
                   outcome.outcome === "interrupted" ||
                   outcome.outcome === "interrupted_by_shutdown";
@@ -1076,6 +1109,13 @@ const withToolAnalytics =
                   outcome.outcome === "interrupted_by_shutdown" && observedCommit === false
                     ? "unknown"
                     : observedCommit;
+                const durationMs = Math.max(0, Number(ended - started) / 1e6);
+                const totalMs =
+                  callState.requestTiming === undefined
+                    ? undefined
+                    : callState.requestTiming.preHandlerMs + durationMs;
+                if (totalMs !== undefined)
+                  yield* Effect.annotateCurrentSpan({ "mcp.total_ms": totalMs });
                 return {
                   ts: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
                   kind: "mcp.call" as const,
@@ -1096,8 +1136,15 @@ const withToolAnalytics =
                       ? 0
                       : Math.max(0, Number(ended - callState.callerStarted) / 1e6)),
                   readerLane: callState.readerLane,
-                  durationMs: Math.max(0, Number(ended - started) / 1e6),
+                  ...(callState.waitStage === undefined ? {} : { waitStage: callState.waitStage }),
+                  ...(callState.waitLookupMs === undefined
+                    ? {}
+                    : { waitLookupMs: callState.waitLookupMs }),
+                  durationMs,
+                  ...callState.requestTiming,
+                  ...(totalMs === undefined ? {} : { totalMs }),
                   ...outcome,
+                  ...(Option.isSome(delivery) ? delivery.value.snapshot() : {}),
                   props: {
                     ...outcome.props,
                     ...(callState.boardId ? { boardId: callState.boardId } : {}),
@@ -1143,17 +1190,40 @@ const withToolAnalytics =
                 : options.tool.name === "list_scheduled_tasks"
                   ? controlReplyReady
                   : Effect.void;
+              const largeRead = LARGE_READ_TOOLS.has(options.tool.name);
+              let phase: "lane" | "readiness" | "handler" = "lane";
+              let phaseStarted = yield* Clock.monotonicTimeNanos;
+              const readStarted = phaseStarted;
+              const timings = { readinessWaitMs: 0, laneWaitMs: 0, handlerMs: 0 };
+              const phaseKey = {
+                lane: "laneWaitMs",
+                readiness: "readinessWaitMs",
+                handler: "handlerMs",
+              } as const;
+              // The tools/call span owns these timings, including an interrupted wait.
+              const advance = Effect.fnUntraced(function* (next: typeof phase) {
+                const now = yield* Clock.monotonicTimeNanos;
+                timings[phaseKey[phase]] += Number(now - phaseStarted) / 1e6;
+                phase = next;
+                phaseStarted = now;
+              });
               const result = readiness
+                .pipe(Effect.andThen(largeRead ? advance("handler") : Effect.void))
                 .pipe(Effect.andThen(options.handle(payload)))
                 .pipe(Effect.provideService(ReplyRejection, rejection));
               // Large reads run on their own "mcp" lane (whole call, so at most
               // PERMITS.mcp large results are built at once). They queue only behind
               // each other, never behind control polls, lists or snapshots (10 Nov
               // 2026: t3_thread_read held the shared agent lane up to 153 s).
+              let measuredResult: unknown;
+              let replyBytes = 0;
               const check = <A>(built: A): A | McpSchema.CallToolResult => {
                 // MCP repeats the result as text and structuredContent; leave envelope headroom.
-                if (!rejection.exceeded && !jsonExceedsBudget(built, MAX_REPLY_BYTES - 4096))
-                  return built;
+                if (!rejection.exceeded) {
+                  replyBytes = jsonBytesUpToLimit(built, MAX_REPLY_BYTES - 4096);
+                  measuredResult = built;
+                  if (replyBytes <= MAX_REPLY_BYTES - 4096) return built;
+                }
                 if (Option.isSome(largeRepliesForTools))
                   largeRepliesForTools.value.record({
                     kind: "mcp",
@@ -1168,8 +1238,11 @@ const withToolAnalytics =
               };
               const completed = result.pipe(
                 (call) =>
-                  LARGE_READ_TOOLS.has(options.tool.name)
-                    ? ReplyBuilders.bounded(Effect.map(call, check), "mcp")
+                  largeRead
+                    ? ReplyBuilders.bounded(
+                        advance("readiness").pipe(Effect.andThen(Effect.map(call, check))),
+                        "mcp",
+                      )
                     : Effect.map(call, check),
                 Effect.catchCauseIf(
                   (cause) =>
@@ -1194,9 +1267,71 @@ const withToolAnalytics =
                   },
                 ),
               );
+              // Reuse the bounded-read waiter so masked SQLite cleanup cannot hold the reply.
+              const boundedRead =
+                options.tool.name === "list_scheduled_tasks"
+                  ? McpDeadline.awaitInterruptibly(completed).pipe(
+                      Effect.timeoutOrElse({
+                        duration: "20 seconds",
+                        orElse: Effect.fn("McpHttpServer.scheduledReadBusy")(function* () {
+                          const now = yield* Clock.monotonicTimeNanos;
+                          return new McpSchema.CallToolResult({
+                            isError: true,
+                            content: [
+                              {
+                                type: "text",
+                                text: "Robob is busy; nothing was read. Retry the same call.",
+                              },
+                            ],
+                            structuredContent: {
+                              reason: "server_busy",
+                              phase,
+                              waitedMs: Number(now - readStarted) / 1e6,
+                            },
+                          });
+                        }),
+                      }),
+                    )
+                  : completed;
+              const measuredRead = largeRead
+                ? boundedRead.pipe(
+                    Effect.onExit((exit) =>
+                      Effect.gen(function* () {
+                        const now = yield* Clock.monotonicTimeNanos;
+                        const elapsed = { ...timings };
+                        elapsed[phaseKey[phase]] += Number(now - phaseStarted) / 1e6;
+                        const result = exit._tag === "Success" ? exit.value : undefined;
+                        const content =
+                          result !== undefined && "structuredContent" in result
+                            ? result.structuredContent
+                            : undefined;
+                        yield* Effect.annotateCurrentSpan({
+                          ...elapsed,
+                          replyBytes:
+                            result === undefined
+                              ? 0
+                              : result === measuredResult
+                                ? replyBytes
+                                : jsonBytesUpToLimit(result),
+                          ...(options.tool.name === "list_scheduled_tasks"
+                            ? {
+                                taskCount:
+                                  content !== null &&
+                                  typeof content === "object" &&
+                                  "tasks" in content &&
+                                  Array.isArray(content.tasks)
+                                    ? content.tasks.length
+                                    : 0,
+                              }
+                            : {}),
+                        });
+                      }),
+                    ),
+                  )
+                : boundedRead;
               const protectedCall = SavedBoardReply.TOOLS.has(options.tool.name)
-                ? SavedBoardReply.protect(completed, options.tool.name)
-                : completed;
+                ? SavedBoardReply.protect(measuredRead, options.tool.name)
+                : measuredRead;
               return yield* protectedCall.pipe(
                 Effect.provideService(McpCallAnalytics.McpCall, callState),
                 Effect.provideService(SavedWrite.observer, (receipt) => {
@@ -1217,6 +1352,7 @@ const withToolAnalytics =
                   // Handoff tools look up threads to record; the response must not wait on them.
                   return Effect.gen(function* () {
                     const endedAt = yield* Clock.currentTimeMillis;
+                    handlerEnded = yield* Clock.monotonicTimeNanos;
                     const resolved = {
                       ...(identifiers.boardId ? { boardId: identifiers.boardId } : {}),
                       ...(callState.boardId ? { boardId: callState.boardId } : {}),
@@ -1229,9 +1365,17 @@ const withToolAnalytics =
                         durationMs: Math.max(0, endedAt - startedAt),
                         outcome: outcome.outcome,
                       });
-                    yield* complete
+                    // Waiting here would prevent the response from being written. Keep the
+                    // ledger entry pending until Node finishes or loses the response instead.
+                    const writeRow = complete
                       .value(row(outcome))
                       .pipe(Effect.interruptible, Effect.timeout("1 second"), Effect.ignoreCause);
+                    if (Option.isSome(delivery))
+                      yield* delivery.value.settled.pipe(
+                        Effect.andThen(writeRow),
+                        Effect.forkDetach,
+                      );
+                    else yield* writeRow;
                     yield* Effect.gen(function* () {
                       // The anonymous analytics event counts the completed input retry only.
                       if (result instanceof McpSchema.InputRequired) return;

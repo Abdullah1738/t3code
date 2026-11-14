@@ -78,7 +78,7 @@ test("a wake watcher fires once with its context, falling back to send when wake
   const inboundId = "wake:" + new Bun.CryptoHasher("sha256").update(sentKey).digest("hex");
   const correlationKey = new Bun.CryptoHasher("sha256").update(inboundId).digest("hex").slice(0, 24);
   expect(events("wake.sent", "demo")[0].ids.key).toBe(correlationKey);
-  expect(events("watch.fire", "demo")).toEqual([expect.objectContaining({ kind: "event", ok: true, ids: { watcher: "demo", key: correlationKey }, props: { count: 1 } })]);
+  expect(events("watch.fire", "demo")).toEqual([expect.objectContaining({ kind: "event", ok: true, ids: { watcher: "demo", key: correlationKey }, props: expect.objectContaining({ count: 1, events: 1, batched: false, urgent: false, route: "owner", closing: false }) })]);
   expect(rollupFor("demo")).toMatchObject({ runs: 1, fires: 1, outcomes: { fire: 1 } });
   expect(events("watch.fire_cap", "demo")).toHaveLength(1);
   expect(events("watch.disabled", "demo")).toHaveLength(1);

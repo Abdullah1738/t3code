@@ -306,7 +306,7 @@ commands, same box model, no hourly price, no start limits, no spend cap). Boat 
   checks; nothing to switch by hand. `offbox status` shows which one is in use.
 - Marked up but not answering when your run starts (or while its box is being fetched): the run moves to Boat
   before it is sent, with one line (`... this run goes to Boat instead`). **Once the server accepted a run it
-  never moves**, so nothing runs twice.
+  never moves**, so nothing runs twice. A server that says it is starting is waited for (up to 600 s) instead of failing over.
 - A run naming `--base` saved only on home waits for home (exit **93** when the wait expires) and never runs on Boat's template.
 - The server restarts under an accepted run (power cut, reboot, boatd restart): the client reconnects for up to
   15 minutes and carries on from where the output stopped. If the machine itself restarted, the server runs the
@@ -356,7 +356,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 
 ## Fallback and exit codes
 
-- Remote command's own exit code is returned as is, and offbox's last stderr line is `offbox: remote exit N`.
+- Remote command's own exit code is returned as is, except disk exhaustion returns **90**; the original command exit remains in the run record. Offbox's last stderr line reports the command's own exit.
   Command strings automatically use bash pipefail, so a failed check piped through `tee` or `tail` returns nonzero.
   A simple single-line pipeline such as `yes | head -1` succeeds when only non-last stages exit with SIGPIPE (141);
   compound scripts and uncertain shell syntax keep strict pipefail so skipped checks cannot look successful.
@@ -413,6 +413,14 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   for a dead client's unrecorded start. Claims remain for the box's lifetime.
 
 - Three ordinary infra failures within an hour send one Telegram; start-limit alerts use the six-hour cooldown.
+
+## Disk space
+
+Offbox records /tmp, /var/tmp and workspace filesystem space before and after each run. Below 1 GiB free in /tmp it warns; below 256 MiB it refuses the command with **90**. On home boxes, an idle box first attempts safe cleanup of stale user-owned temp files. Critically full boxes with concurrent runs are refused without cleanup. The pool picker does not automatically move the run to another box.
+
+After a nonzero exit, ENOSPC output or less than 64 MiB free on a measured filesystem marks the result `infra_failure: "enospc"` and returns **90** from run/wait/logs. The command's original exit and the start/end measurements stay in the state record and analytics. These test results are invalid; rerun after space is available. Successful commands retain exit 0.
+
+The home reaper runs only below 50% temp space free. It preserves live-held files, recent trees, foreign-owned entries, sockets and every /tmp/offbox-run tree. Every removal is logged. Raising the tmpfs cap is a separate capacity change.
 
 ## Logs
 

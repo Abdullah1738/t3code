@@ -224,7 +224,8 @@ class Logging(Base):
             clock[0] += mc.CHECK_BUDGET
             raise mc.CheckTimeout('budget expired')
         self.assertEqual(mc.CHECK_BUDGET, 40)
-        with patch.object(mc.time, 'time', lambda: clock[0]), patch.object(mc, 'follow', expire), \
+        with patch.object(mc.time, 'time', lambda: clock[0]), \
+                patch.object(mc.time, 'monotonic', lambda: clock[0]), patch.object(mc, 'follow', expire), \
                 contextlib.redirect_stderr(io.StringIO()):
             event = mc.run_check(self.wd, 'timeout', self.data, self.root,
                                  at('2026-10-24T10:00'), finder(), nobody)
@@ -232,7 +233,9 @@ class Logging(Base):
         row, = self.rows('check.run')
         self.assertFalse(row['ok'])
         self.assertEqual(row['durationMs'], 40000)
-        self.assertEqual(row['props'], {'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}, 'chargeCensus': {}})
+        self.assertEqual(row['props'], {'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}, 'chargeCensus': {},
+            **dict.fromkeys(mc.TIMING_KEYS, 0), 'follow_ms': 40000, 'questions_ms': 40000,
+            'starved_by': 'questions'})
 
     def test_check_distinguishes_short_lock_timeout_from_work_deadline(self):
         self.case()
@@ -427,6 +430,145 @@ class Logging(Base):
         self.assertEqual(lane['coverage_cleared_rows'], 2)
         self.assertNotIn('PRIVATE', json.dumps(run))
         self.assertNotIn('9999', json.dumps(run))
+
+    def test_current_whole_check_expiry_replaces_prior_source_slice_timeout(self):
+        for prior in ('receipt', 'msgs', 'owner_threads'):
+            for target in ('attention', 'build_write', 'lookups'):
+                with self.subTest(prior=prior, target=target):
+                    clock = [1000.0]
+                    def follow(*args, stats, **kwargs):
+                        stats['starved_by'] = prior
+                        if target == 'lookups':
+                            with mc.charges.step_timing(stats, 'lookups', 1100):
+                                clock[0] += 40
+                                raise mc.CheckTimeout('current source expired')
+                        return []
+                    def attention(*args, **kwargs):
+                        if target == 'attention':
+                            clock[0] += 40
+                            raise mc.CheckTimeout('attention expired')
+                        return []
+                    def write(*args, **kwargs):
+                        if target == 'build_write':
+                            clock[0] += 40
+                        raise mc.CheckTimeout('save expired')
+                    with patch.object(mc.time, 'time', lambda: clock[0]), \
+                            patch.object(mc, 'follow', follow), patch.object(mc, 'attention', attention), \
+                            patch.object(mc, 'write_json', write), contextlib.redirect_stderr(io.StringIO()):
+                        mc.run_check(self.wd, 'expiry', self.data, self.root,
+                                     at('2026-11-14T12:00'), finder(), nobody)
+                    props = self.rows('check.run')[-1]['props']
+                    self.assertTrue(props['budgetHit'])
+                    self.assertEqual(props['starved_by'], target)
+
+    def test_merchant_history_msgs_are_included_in_step_totals(self):
+        stats = {'msgs_calls': 0}
+        clock = [1000.0]
+        def empty(argv, **kwargs):
+            clock[0] += 0.1
+            return subprocess.CompletedProcess(argv, 0, '', '')
+        with patch.object(mc.charges.subprocess, 'run', empty), \
+                patch.object(mc.time, 'monotonic', lambda: clock[0]):
+            mc.charges.known(mc.charges.parse(ALERT, BANK), at('2026-11-14T12:00'), stats=stats)
+        self.assertEqual(stats['msgs_calls'], 2)
+        self.assertEqual(stats['msgs_ms'], 200)
+        self.assertEqual(stats['msgs_max_ms'], 100)
+
+    def test_step_timing_names_source_when_enclosing_budget_expires_first(self):
+        from threading import Event
+        stats = {}
+        with self.assertRaises(mc.CheckTimeout):
+            with mc.within(time.time() + 0.02, mc.CheckTimeout('fixture')):
+                with mc.charges.step_timing(stats, 'lookups', time.time() + 10):
+                    Event().wait(1)
+        self.assertEqual(stats['starved_by'], 'lookups')
+        self.assertGreaterEqual(stats['lookups_ms'], 10)
+
+    def test_check_keeps_prefetched_coverage_when_whole_check_interrupts_a_question(self):
+        now = at('2026-11-14T12:00')
+        charge = dict(mc.charges.parse(ALERT, BANK), merchant='noon')
+        book = {'version': 1, 'questions': []}
+        mc.new_question(book, charge, ALERT, now - mc.UNMATCHED_AFTER, now)
+        mc.write_json(self.data / 'questions.json', book)
+        lanes = {lane: {'exhaustive': False, 'covered_from': None, 'stop_reason': 'slice_out'}
+                 for lane in mc.charges.order_lookup.LANES}
+        with patch.object(mc.charges.order_lookup, 'read', return_value={
+                'orders': [], 'complete': False, 'lanes': lanes}), \
+                patch.object(mc.charges, 'receipt', side_effect=mc.CheckTimeout('whole check interrupted')):
+            mc.run_check(self.wd, 'after-reader', self.data, self.root, now, finder(), nobody)
+        props = self.rows('check.run')[-1]['props']
+        self.assertEqual(set(props['orderCoverage']['noon']), set(lanes))
+
+    def test_follow_timers_partition_nested_work_and_compute_untimed(self):
+        stats, clock = {}, [1000.0]
+        with patch.object(mc.time, 'monotonic', lambda: clock[0]):
+            with mc.follow_timing(stats):
+                with mc.charges.step_timing(stats, 'questions'):
+                    clock[0] += 1
+                    with mc.charges.step_timing(stats, 'receipt'):
+                        clock[0] += 0.5
+                        with mc.charges.step_timing(stats, 'msgs'):
+                            clock[0] += 2
+                    with mc.charges.step_timing(None, 'writes'):
+                        clock[0] += 3
+                clock[0] += 0.25
+        self.assertEqual({k: stats[k] for k in ('questions_ms', 'receipt_ms', 'msgs_ms', 'writes_ms')},
+                         dict(questions_ms=1000, receipt_ms=500, msgs_ms=2000, writes_ms=3000))
+        self.assertEqual(stats['follow_ms'], 6750)
+        self.assertEqual(stats['untimed_ms'], 250)
+        self.assertIsNone(mc.charges.TIMING_STATS.get())
+
+    def test_follow_timers_survive_interrupts_and_count_storage_redaction(self):
+        stats, clock = {}, [1000.0]
+        def redact(book):
+            clock[0] += 2
+            return book
+        with patch.object(mc.time, 'monotonic', lambda: clock[0]), \
+                patch.object(mc, 'redact_all', redact):
+            with self.assertRaises(mc.CheckTimeout):
+                with mc.follow_timing(stats):
+                    with mc.charges.step_timing(stats, 'questions'):
+                        with mc.Locked(self.data, 'questions'):
+                            pass
+                        raise mc.CheckTimeout('fixture')
+        self.assertEqual(stats['writes_ms'], 2000)
+        self.assertEqual(stats['follow_ms'], 2000)
+        self.assertEqual(stats['untimed_ms'], 0)
+        self.assertIsNone(mc.charges.TIMING_STATS.get())
+
+    def test_step_timing_is_logged_and_private_values_are_rejected(self):
+        keys = mc.TIMING_KEYS
+        stats = {}
+        clock = [1000.0]
+        with patch.object(mc.time, 'monotonic', lambda: clock[0]), \
+                patch.object(mc.time, 'time', lambda: clock[0]):
+            for name in ('owner_threads', 'msgs', 'msgs', 'lookups', 'census'):
+                with mc.charges.step_timing(stats, name, 1001):
+                    clock[0] += 0.25
+        self.assertEqual(stats['msgs_ms'], 500)
+        self.assertEqual(stats['msgs_max_ms'], 250)
+        self.assertEqual(stats['starved_by'], 'census')
+        def follow(*args, stats, **kwargs):
+            stats.update({key: 250 for key in keys}, starved_by='msgs')
+            return []
+        with patch.object(mc, 'follow', follow):
+            mc.run_check(self.wd, 'steps', self.data, self.root, at('2026-11-14T12:00'), finder(), nobody)
+        props = self.rows('check.run')[-1]['props']
+        self.assertEqual({key: props[key] for key in keys if key not in ('follow_ms', 'untimed_ms')},
+                         {key: 250 for key in keys if key not in ('follow_ms', 'untimed_ms')})
+        self.assertGreaterEqual(props['follow_ms'], 0)
+        self.assertEqual(props['untimed_ms'], 0)
+        self.assertEqual(props['starved_by'], 'msgs')
+        for value in ('PRIVATE9999', -1, True, 1.5, 10**13):
+            with self.subTest(value=value):
+                fields = {key: value for key in keys}
+                fields['starved_by'] = 'PRIVATE9999'
+                mc.toollog.emit('money-cases', 'check.run', props=fields)
+                props = self.rows('check.run')[-1]['props']
+                self.assertEqual(props, {})
+        other = HERE.parents[2] / 'app-api-cli/toollog.py'
+        if other.exists():
+            self.assertEqual((HERE / 'toollog.py').read_bytes(), other.read_bytes())
 
     def test_production_modules_never_import_test_runners(self):
         for path in HERE.glob('*.py'):

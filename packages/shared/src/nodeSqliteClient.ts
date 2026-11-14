@@ -268,6 +268,19 @@ const observeStatement = <A, E, R>(
   lane?: ReaderLaneName,
 ): Effect.Effect<A, E, R> =>
   Effect.withFiber((fiber) => {
+    if (fiber.getRef(References.TracerEnabled) && fiber.getRef(Statement.SpanPropagationEnabled)) {
+      let span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
+      for (let depth = 0; span?._tag === "Span" && depth < 32; depth++) {
+        if (span.name === "sqlite") {
+          // Transaction statements reuse their connection and bypass the borrower.
+          if (!span.attributes.has("db.connection")) span.attribute("db.connection", connection);
+          if (lane !== undefined && !span.attributes.has("db.reader.lane"))
+            span.attribute("db.reader.lane", lane);
+          break;
+        }
+        span = Option.getOrUndefined(span.parent);
+      }
+    }
     const observer = fiber.getRef(StatementObserver) ?? fallback;
     if (observer === undefined || fiber.getRef(observingStatement)) return effect;
     const clock = fiber.getRef(Clock.Clock);

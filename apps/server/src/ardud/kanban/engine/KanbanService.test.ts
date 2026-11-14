@@ -5705,7 +5705,7 @@ it.effect("a started write finishes after the start deadline", () =>
       const busyError = yield* Fiber.join(queued);
       assert.strictEqual(
         busyError.detail,
-        "Board busy: not written (held 2m0s by card.update). Safe to retry once.",
+        "Board busy: not written (waited 120s behind 0; most time: card.update 120s). Safe to retry once.",
       );
       const refusals = warnings.filter((entry) =>
         String(entry.message).includes('"event":"kanban board write refused"'),
@@ -22586,16 +22586,6 @@ it.live("a quiet tick reads the board without waiting for the SQLite writer", ()
         },
       });
       const run = tick.pipe(
-        // Snapshot transactions acquire once; observe each statement's actual
-        // connection even when its trace has no separate acquisition span.
-        Effect.provideService(NodeSqliteClient.StatementObserver, {
-          slowThresholdMs: 0,
-          record: (observation) =>
-            Effect.gen(function* () {
-              const span = yield* Effect.currentSpan;
-              span.attribute("db.connection", observation.connection);
-            }).pipe(Effect.orDie),
-        }),
         Effect.provideService(Statement.SpanPropagationEnabled, true),
         Effect.withTracer(tracer),
       );
@@ -33497,6 +33487,31 @@ it.effect(
             "evaluator",
           );
           yield* kanban.changeAsk(card.id, "q3", "drop", evaluator, "evaluator");
+          const skippedWithoutApproval = yield* kanban.markSubtask(
+            card.id,
+            "s6",
+            "skipped",
+            "Not needed",
+            evaluator,
+            "evaluator",
+          );
+          assert.strictEqual(skippedWithoutApproval.subtasks[5]!.state, "skipped");
+          assert.strictEqual(skippedWithoutApproval.subtasks[5]!.gateSkipped?.reason, "Not needed");
+          assert.strictEqual(skippedWithoutApproval.asks.at(-1)!.kind, "notice");
+          const reopened = yield* kanban.markSubtask(
+            card.id,
+            "s6",
+            "open",
+            null,
+            evaluator,
+            "evaluator",
+          );
+          assert.strictEqual(reopened.subtasks[5]!.state, "open");
+          assert.isUndefined(reopened.subtasks[5]!.gateSkipped);
+          const unapprovedDeploy = yield* kanban
+            .markSubtask(card.id, "s6", "done", "Deployed", evaluator, "evaluator")
+            .pipe(Effect.flip);
+          assert.include(unapprovedDeploy.detail, "the latest decision, q3, was dropped");
           yield* TestClock.adjust("1 second");
           yield* kanban.answerAsk(
             card.id,
@@ -33529,7 +33544,7 @@ it.effect(
           const verified = yield* kanban.moveCard(card.id, "verified", "evaluator", evaluator);
           assert.strictEqual(verified.stage, "verified");
           if (!removal) {
-            yield* kanban.askOwner(
+            const followup = yield* kanban.askOwner(
               card.id,
               { question: "Follow up status?", blocking: true },
               evaluator,
@@ -33537,7 +33552,7 @@ it.effect(
             );
             const returned = yield* kanban.answerAsk(
               card.id,
-              "q4",
+              followup.asks.at(-1)!.id,
               { verdict: "answered", revision: 0, text: "Recorded" },
               owner,
             );

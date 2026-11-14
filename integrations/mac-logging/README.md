@@ -6,16 +6,78 @@ Source scripts use `toollog.py` (or the `toollog.sh` bridge) for local metadata 
 it rolls up yesterday. Quantiles use nearest rank. `okRate`/`failedRate` use
 lines with an explicit `ok`; `errorRate` is the share of error-kind lines.
 
+Run `mac-log-status` for last-seen times, ages, last outcomes and overdue jobs,
+or `mac-log-status --json` for the same report as JSON. `--now ISO` freezes the
+clock (include `Z` or an explicit UTC offset). The command always exits 0,
+including invalid arguments or unreadable input; inspect the report for errors.
+It reads the UTC day files covering the last 36 hours (three files before noon
+UTC, two from noon onward). Missing and unreadable files are listed separately.
+Malformed rows, including invalid timestamps and dates that overflow when
+converted to UTC, are skipped and counted. Future timestamps are ignored.
+It makes no network calls and creates no files or locks.
+
+The single cadence table is `CADENCES` in `status.py`, with schedule sources
+beside each row. Logging applies from 13 Nov 2026 UTC. Maximum gaps are two
+hours for disk sampling (guard every 30 minutes), inventory and crash collection
+(hourly collector), and janitor (hourly watcher); seven hours for health backup
+(every six), five hours for memory backup (every four), and 26 hours for the
+daily CVE sweep (09:00 Dubai / 05:00 UTC).
+The hourly collector's tooling, process-wait and clone-wedge probes also allow
+two hours. `memory.sample` runs every five minutes and allows 15 minutes;
+`disk.deep.end` completes the daily 03:30 Dubai pass and allows 26 hours.
+The memory, deep-pass and clone-wedge rows apply from 14 Nov UTC, when they
+first logged; the others apply from 13 Nov. Alerts and conditional detail
+events do not have independent cadence rows.
+
+`LATE` means the last line is older than the maximum gap. `SILENT` means that
+gap has elapsed and there is no matching line in the available 36-hour window.
+Before logging applies a row is `PENDING`; after that it gets one maximum gap
+of startup grace. A failed or skipped run still proves the job ran: `lastOk`
+reports the last line's boolean outcome (null if omitted), independently of
+cadence. Backups match `props.target` exactly (`health` or `memory`).
+An on-cadence `backup.failed_<stage>` line with `ok=false` and `skipped=0`
+sets `lastSeen` and `lastOk=false`; it is a failed run, not a skip. The separate
+daily `backup.failed_runs` counters count those same failed runs by target.
+
+Daily rollups add `jobs` and `missingJobs`, leaving all existing keys intact.
+The jobs view is frozen at the end of the requested UTC day and reads that day
+and its predecessor, capped to 36 hours. Each job has `lastSeen` (normalized
+UTC), `lastOk`, `lines` (matching lines in that window), `ageMin`, `gapMaxMin`,
+`since`, and `status`. `missingJobs` contains the `LATE` and `SILENT` job keys;
+backup keys are `backup.run:health` and `backup.run:memory`.
+
 The collector reads DiagnosticReports and a filtered `log show`, retaining a
 separate cursor per source so an unavailable source is retried. Its first run
 looks back one hour. Report cursors cover since their last successful read.
-Unified-log queries cover at most the most recent hour; skipped older time is
-explicit in `skippedS`. Queries run in 15-minute chunks, checkpointing the cursor
-after each completed chunk. A failed query retains the unfinished suffix for retry.
+Unified-log windows cover at most the most recent 90 minutes, including retries;
+older time is skipped with exact `skippedS` and reason `lag_ceiling`. Queries start
+with 60 seconds of log and grow after successes. Two successful sizes estimate
+fixed startup cost separately from window work. Queries normally target 10 seconds
+of window work, increasing that target to amortize significant startup cost within
+the command deadline. Queries usually cover at most 15 minutes; startup-dominated
+reads may grow to the 90-minute ceiling. When the budget allows, a nominal-size
+probe checks window cost before a large jump. Accelerating marginal cost keeps
+queries within 15 minutes for the rest of the run. Each completed chunk checkpoints its cursor. A
+failed query retains the unfinished suffix, then continues into a fresh window
+when that suffix finishes. Each command has a 60-second cap including bounded
+process-group cleanup; the unified source shares a 135-second budget.
+`crash.unified.chunk` records requested bounds, elapsed time and outcome;
+`crash.unified.skip` records ceiling skips before advancing the cursor. Positive
+skip records and summaries survive the daily log cap so omitted time stays explicit.
+`crash.collect.stopReason` distinguishes completion, deadline and command failure.
 Boot observations include `observedAt` (Unix seconds) for the boot marker; duplicate
 markers at the same instant count once. Other observations remain aggregated.
 It rolls up yesterday on the first hourly run after 00:05 UTC. It writes only
 its own state, day logs, rollups and probe samples, and never changes crash evidence.
+Before any job can create today's log, it checks today's and yesterday's files
+(from the logging start date). If either is absent it emits one `log.missing_day`
+error per UTC reporting day, with `ids.runId`, the missing dates in `props.source`
+and their count. This uses collector state to suppress repeats; status and rollup
+readers never append log lines. A failed append retains the missing dates for
+retry and advances the daily marker only after a successful append. `emit()`
+returns true on append and false on failure, while existing callers ignore it.
+A stopped collector is visible through status's
+missing-file report and silent jobs.
 
 Disk samples use `statvfs`, sizes of the known Robob/OpenCode/recall database
 and WAL files (metadata only), the guard's cached TMPDIR measurement, and an hourly cached directory inventory of worktrees, caches and backup repositories.
@@ -233,24 +295,19 @@ scan coverage cannot become a reported grower.
 `disk.sample` reports success when its own measurements succeed; cached inventory
 errors or staleness are metadata rather than sample failures. Its `sourceErrors`
 still counts failures of its own free-space and existing-file stat measurements.
-Confirmed missing optional database/WAL files retain zero sizes. The filtered unified-log query
-has a one-hour maximum window, split into contiguous 15-minute chunks under a
-shared 135 s budget, allowing four chunks at the observed 30 s cost plus headroom.
-Each command has at most 60 s, shortened to that shared
-budget and the collector's remaining absolute budget. Its source event/error and
-`crash.collect` record `windowStart` and `windowEnd` (Unix seconds), `windowS`,
-`skippedS` (older time omitted by the cap), `chunks` (planned for this attempt),
-and `chunksDone`. Each completed chunk emits its observations and saves its cursor
-before the next command. The next chunk excludes that cursor's instant, including
-when log's second rounding/end padding returns overlapping rows. Missing or invalid
-event timestamps fail the chunk rather than risk attributing events twice.
-On failure, `unifiedRetry` retains the exact unfinished suffix until it succeeds;
-completed chunks are not queried again. An old one-hour retry is split the same
-way. Chunk checkpoints retain unreported `skippedS`, including after the final
-chunk, so interruption before the source result cannot hide a coverage gap.
-Once the source result reports the gap, a retained suffix clears that metadata.
-After a delayed retry completes, the next run applies the recent-hour cap
-again and reports any omitted older time in `skippedS`.
+Confirmed missing optional database/WAL files retain zero sizes. Unified source
+results and `crash.collect` retain `windowStart`, `windowEnd` (Unix seconds),
+`windowS`, `skippedS`, `chunks` and `chunksDone`. With adaptive sizing, `chunks`
+estimates the total using the current chunk size; on completion it equals
+`chunksDone`. Chunk bounds exclude the previous cursor even when log's second
+rounding/end padding returns overlapping rows. Missing or invalid event
+timestamps fail the chunk rather than risk attributing events twice.
+Retry checkpoints retain unreported `skippedS`, including after the final chunk,
+so interruption before the source result cannot hide a coverage gap. Once the
+source result reports the gap, a retained suffix clears that metadata. Retries
+older than the moving 90-minute ceiling log the exact additional skip before
+checkpointing that ceiling; a retry inside it preserves its frozen end. Finishing
+a retry continues into a fresh window within the same run's remaining budget.
 
 Report sources have independent checkpoints. Each attempt allows up to 10 s per
 source, capped by the collector's absolute deadline. Directory enumeration,

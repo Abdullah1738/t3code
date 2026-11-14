@@ -9,8 +9,11 @@ import re
 
 CAP = 50 * 1024 * 1024
 _seen = set()
-PROPS = {'endpoint', 'model', 'size', 'count', 'status', 'enabled', 'locked', 'limited', 'reloginNeeded', 'state', 'action', 'tag', 'dryRun', 'complete', 'cost', 'hour', 'exitCode', 'attempt', 'source', 'failed', 'total', 'fourxx', 'fivexx'}
+PROPS = {'endpoint', 'model', 'size', 'count', 'status', 'enabled', 'locked', 'limited', 'reloginNeeded', 'state', 'action', 'tag', 'dryRun', 'complete', 'cost', 'hour', 'exitCode', 'attempt', 'source', 'failed', 'total', 'fourxx', 'fivexx', 'phase', 'durationMaxMs', 'omitted'}
 IDS = {'account', 'connection', 'thread', 'incident', 'request', 'session'}
+MESSAGES = {'Robob replica is stale; recovery deferred', 'Robob replica is not ready',
+            'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
+            'The operation was aborted due to timeout', 'The operation was aborted'}
 
 def directory():
     return Path(os.environ.get('ROUTER_LOG_DIR', str(Path.home() / '.robob/logs/tools/9router')))
@@ -47,7 +50,8 @@ def clean(event, now):
         row['props'] = props
     if event.get('error'):
         tag = token(event['error'].get('tag')) or 'unknown'
-        row['error'] = {'tag': tag, 'message': tag}  # Never retain raw exceptions or provider text.
+        message = event['error'].get('message')
+        row['error'] = {'tag': tag, 'message': message[:300] if isinstance(message, str) and message in MESSAGES else tag}
     return row
 
 def emit(component, name, kind='event', **fields):

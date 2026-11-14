@@ -2839,6 +2839,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         const releaseLookup = yield* Deferred.make<void>();
         const watching = yield* Deferred.make<void>();
         const parent = parentProjection([]);
+        const target = { ...parent, thread: { ...parent.thread, deletedAt: null } };
         const dependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
@@ -2847,7 +2848,7 @@ describe("OrchestratorMcpService provider resolution", () => {
             getThreadRecords: () =>
               Deferred.succeed(enteredLookup, undefined).pipe(
                 Effect.andThen(Deferred.await(releaseLookup)),
-                Effect.as(parent),
+                Effect.as(target),
               ),
             waitForThread: ({ timeoutMs }) =>
               Deferred.succeed(watching, undefined).pipe(

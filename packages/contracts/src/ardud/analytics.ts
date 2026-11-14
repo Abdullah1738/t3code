@@ -61,12 +61,23 @@ const GeneralEvent = Schema.Struct({
   callerThreadId: Schema.optionalKey(DerivedId),
   callerResolved: Schema.optionalKey(Schema.Boolean),
   callerResolveMs: Schema.optionalKey(Measurement),
+  authMs: Schema.optionalKey(Measurement),
+  dispatchMs: Schema.optionalKey(Measurement),
+  preHandlerMs: Schema.optionalKey(Measurement),
+  totalMs: Schema.optionalKey(Measurement),
   clientRequestId: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/))),
   outcome: Schema.optionalKey(McpOutcome),
   errorTag: Schema.optionalKey(Label),
   errorPhase: Schema.optionalKey(McpPhase),
   saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+  responseDelivery: Schema.optionalKey(Schema.Literals(["pending", "finished", "closed"])),
+  responseElapsedMs: Schema.optionalKey(Measurement),
+  responseCloseReason: Schema.optionalKey(
+    Schema.Literals(["idle_timeout", "client_error", "peer_end", "socket_error", "unknown"]),
+  ),
   readerLane: Schema.optionalKey(Label),
+  waitStage: Schema.optionalKey(Schema.Literals(["lookup.caller", "lookup.target", "waiting"])),
+  waitLookupMs: Schema.optionalKey(Measurement),
   writerWaitMs: Schema.optionalKey(Measurement),
   props: Schema.optionalKey(
     Schema.Struct({
@@ -94,6 +105,8 @@ const GeneralEvent = Schema.Struct({
       slots: Schema.optionalKey(Measurement),
       waiting: Schema.optionalKey(Measurement),
       method: Schema.optionalKey(Label),
+      httpMethod: Schema.optionalKey(Label),
+      httpRoute: Schema.optionalKey(Label),
       span: Schema.optionalKey(Label),
       errorTag: Schema.optionalKey(Label),
       code: Schema.optionalKey(Label),
@@ -223,6 +236,7 @@ export const AnalyticsReadInput = Schema.Struct({
   tool: Schema.optionalKey(Label),
   outcome: Schema.optionalKey(McpOutcome),
   limit: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 500 }))),
+  responseDelivery: Schema.optionalKey(Schema.Literals(["pending", "finished", "closed"])),
 });
 export type AnalyticsReadInput = typeof AnalyticsReadInput.Type;
 const LatencyFields = {
@@ -286,6 +300,19 @@ export const AnalyticsRollup = Schema.Struct({
     ),
   ),
   errorCounts: Schema.Record(Label, Measurement),
+  controlRoutes: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        route: Label,
+        method: Label,
+        hour: Label,
+        statuses: Schema.Record(Label, Measurement),
+        totalWaitMs: Measurement,
+        deadlineExceeded: Measurement,
+        ...LatencyFields,
+      }),
+    ),
+  ),
   errorsByRoute: Schema.Array(
     Schema.Struct({
       route: Label,
@@ -397,6 +424,7 @@ export const AnalyticsRollup = Schema.Struct({
       build: Label,
       bootId: Id,
       ...LatencyFields,
+      preHandler: Schema.optionalKey(Schema.Struct(LatencyFields)),
       failures: Measurement,
       failureRate: Measurement,
       outcomes: Schema.Record(Label, Measurement),

@@ -1,4 +1,10 @@
 import { expect, it } from "@effect/vitest";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- isolated loopback MCP integration.
+import * as NodeHttp from "node:http";
+import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
+import { HttpRouter } from "effect/http";
+import { makeHttpSocketTelemetry } from "../ardud/http/HttpSocketTelemetry.ts";
+import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import {
   AnalyticsEvent,
   CommandId,
@@ -29,6 +35,9 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
+import * as Queue from "effect/Queue";
+import * as Tracer from "effect/Tracer";
+import { HttpServerRequest, HttpServerResponse } from "effect/http";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -36,6 +45,7 @@ import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 import * as Analytics from "../ardud/analytics/Analytics.ts";
 import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
 import * as McpCall from "../ardud/analytics/McpCall.ts";
+import * as McpResponseDelivery from "../ardud/http/McpResponseDelivery.ts";
 import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
@@ -111,7 +121,301 @@ const probe = (name: string) =>
       ],
     }),
   );
+const decodeAnalyticsEvent = Schema.decodeEffect(AnalyticsEvent);
 const args = { clientRequestId: "private retry id", boardId: "board-robob", card: "#1301" };
+const isAnalyticsEvent = Schema.is(AnalyticsEvent);
+
+it.effect.each(["provider", "oauth"] as const)(
+  "%s auth and dispatch are separate from handler duration, including caller_unresolved",
+  (credential) =>
+    Effect.gen(function* () {
+      const rows = yield* Queue.unbounded<AnalyticsEvent>();
+      const spans: Array<Tracer.NativeSpan> = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          if (span.name === "tools/call") spans.push(span);
+          return span;
+        },
+      });
+      const scope = yield* McpInvocationContext.McpInvocationContext.pipe(
+        Effect.provide(invocation),
+      );
+      const entered = yield* Deferred.make<void>();
+      let unresolved = false;
+      const toolkit = probe("timing_probe");
+      const handlers = McpToolAccess.toLayer(toolkit, {
+        timing_probe: McpToolAccess.actsAsCaller(() =>
+          TestClock.adjust("40 millis").pipe(Effect.as({ ok: true })),
+        ),
+      });
+      const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: (threadId) =>
+              unresolved
+                ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+                : Effect.succeed(Testkit.liveThreadShell(threadId)),
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              event.kind === "mcp.call"
+                ? Queue.offer(rows, event).pipe(Effect.asVoid)
+                : Effect.void,
+          }),
+        ),
+      );
+      const authenticate = yield* McpHttpServer.makeMcpAuthMiddleware.pipe(
+        Effect.provide(
+          Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+            resolve: () =>
+              TestClock.adjust("7 millis").pipe(
+                Effect.as(
+                  credential === "provider" ? { ...scope, thread: scope.thread! } : undefined,
+                ),
+              ),
+          }),
+        ),
+        Effect.provideService(McpHttpServer.McpClientAuthenticator, {
+          authenticate: () => TestClock.adjust("13 millis").pipe(Effect.as(scope)),
+        }),
+      );
+      yield* Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        for (const failing of [false, true]) {
+          unresolved = failing;
+          const httpEffect = Effect.gen(function* () {
+            yield* TestClock.adjust("30 millis");
+            yield* server
+              .callTool({ name: "timing_probe", arguments: args })
+              .pipe(
+                Effect.provideService(McpSchema.McpServerClient, client),
+                Effect.withSpan("tools/call"),
+                Effect.orDie,
+              );
+            return HttpServerResponse.empty();
+          });
+          const pending = yield* authenticate(httpEffect).pipe(
+            Effect.provideService(
+              HttpServerRequest.HttpServerRequest,
+              HttpServerRequest.fromWeb(
+                new Request("http://localhost/mcp", {
+                  headers: { authorization: "Bearer timing-token" },
+                }),
+              ),
+            ),
+            Effect.forkChild,
+          );
+          if (unresolved) {
+            yield* Deferred.await(entered);
+            yield* TestClock.adjust("10 seconds");
+          }
+          yield* Fiber.join(pending);
+          const authMs = credential === "provider" ? 7 : 20;
+          const durationMs = unresolved ? 10_000 : 40;
+          const row = yield* Queue.take(rows);
+          expect(row).toMatchObject({
+            authMs,
+            dispatchMs: 30,
+            preHandlerMs: authMs + 30,
+            durationMs,
+            totalMs: authMs + 30 + durationMs,
+            outcome: unresolved ? "timeout" : "ok",
+            ...(unresolved ? { errorTag: "caller_unresolved", callerResolved: false } : {}),
+          });
+          expect(isAnalyticsEvent(row)).toBe(true);
+          expect(row.preHandlerMs).toBeGreaterThanOrEqual(row.authMs!);
+          expect(Object.fromEntries(spans.at(-1)!.attributes)).toMatchObject({
+            "mcp.auth_ms": authMs,
+            "mcp.dispatch_ms": 30,
+            "mcp.pre_handler_ms": authMs + 30,
+            "mcp.total_ms": authMs + 30 + durationMs,
+          });
+        }
+      }).pipe(Effect.provide(registration), Effect.withTracer(tracer));
+    }),
+);
+
+it.effect(
+  "keeps the saved outcome findable when the real MCP HTTP caller disconnects during commit",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const recorded = yield* Deferred.make<AnalyticsEvent>();
+        const closed = Promise.withResolvers<void>();
+        const caller = yield* McpInvocationContext.McpInvocationContext.pipe(
+          Effect.provide(invocation),
+        );
+        const raw = makeHttpSocketTelemetry(() => {}).instrument(NodeHttp.createServer());
+        raw.on("request", (request, response) => {
+          if (request.headers["mcp-session-id"]) response.once("close", () => closed.resolve());
+        });
+        const toolkit = probe("subtask_done");
+        const handlers = McpToolAccess.toLayer(toolkit, {
+          subtask_done: McpToolAccess.reads(() =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+              yield* McpCall.setSaved(true);
+              return { saved: true };
+            }).pipe(Effect.uninterruptible),
+          ),
+        });
+        const serverLayer = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+          Layer.provideMerge(McpHttpServer.layerMcpTransport),
+          Layer.provide(Testkit.liveThreadsLayer),
+          Layer.provide(
+            Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+              resolve: () =>
+                Effect.succeed(caller as McpInvocationContext.McpThreadInvocationScope),
+            }),
+          ),
+          Layer.provide(
+            Layer.mock(Analytics.Analytics)({
+              record: (row) =>
+                row.kind === "mcp.call"
+                  ? Deferred.succeed(recorded, row).pipe(Effect.asVoid)
+                  : Effect.void,
+              flush: Effect.void,
+            }),
+          ),
+        );
+        yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+          Layer.provide(NodeHttpServer.layer(() => raw, { port: 0, host: "127.0.0.1" })),
+          Layer.build,
+        );
+        const address = raw.address();
+        if (!address || typeof address === "string") throw new Error("Expected loopback listener");
+        const send = (body: unknown, sessionId?: string) => {
+          const request = NodeHttp.request({
+            host: "127.0.0.1",
+            port: address.port,
+            method: "POST",
+            path: "/mcp",
+            agent: false,
+            headers: {
+              authorization: "Bearer test",
+              accept: "application/json, text/event-stream",
+              "content-type": "application/json",
+              ...(sessionId === undefined
+                ? {}
+                : { "mcp-session-id": sessionId, "mcp-protocol-version": "2025-06-18" }),
+            },
+          });
+          request.on("error", () => {});
+          request.end(JSON.stringify(body));
+          return request;
+        };
+        const sessionId = yield* Effect.promise(
+          () =>
+            new Promise<string>((resolve, reject) => {
+              const request = send({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "initialize",
+                params: client.initializePayload,
+              });
+              request.once("error", reject);
+              request.once("response", (response) => {
+                response.resume();
+                response.once("end", () => resolve(String(response.headers["mcp-session-id"])));
+              });
+            }),
+        );
+        const request = send(
+          {
+            jsonrpc: "2.0",
+            id: 2,
+            method: "tools/call",
+            params: { name: "subtask_done", arguments: args },
+          },
+          sessionId,
+        );
+        yield* Deferred.await(entered);
+        request.destroy();
+        yield* Effect.promise(() => closed.promise);
+        yield* Deferred.succeed(release, undefined);
+        const row = yield* Deferred.await(recorded);
+        expect(row).toMatchObject({
+          tool: "subtask_done",
+          callerThreadId: "caller-ledger",
+          saved: true,
+          responseDelivery: "closed",
+          responseCloseReason: "peer_end",
+        });
+      }),
+    ),
+);
+
+it.effect.each(["finished", "closed"] as const)(
+  "records a saved result separately from a %s HTTP response without blocking its handler",
+  (responseDelivery) =>
+    Effect.gen(function* () {
+      const recorded = yield* Deferred.make<AnalyticsEvent>();
+      const settled = yield* Deferred.make<void>();
+      const toolkit = probe("subtask_done");
+      const handlers = McpToolAccess.toLayer(toolkit, {
+        subtask_done: McpToolAccess.reads(() =>
+          McpCall.setSaved(true).pipe(Effect.as({ saved: true })),
+        ),
+      });
+      const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provideMerge(McpCallLedger.layer),
+        Layer.provide(Testkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              event.kind === "mcp.call"
+                ? Deferred.succeed(recorded, event).pipe(Effect.asVoid)
+                : Effect.void,
+            flush: Effect.void,
+          }),
+        ),
+        Layer.provideMerge(invocation),
+      );
+      yield* Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const result = yield* server.callTool({ name: "subtask_done", arguments: args }).pipe(
+          Effect.provideService(McpSchema.McpServerClient, client),
+          Effect.provideService(McpResponseDelivery.McpResponseDelivery, {
+            settled: Deferred.await(settled),
+            closeReason: "peer_end",
+            snapshot: () => ({
+              responseDelivery,
+              responseElapsedMs: 10_000,
+              ...(responseDelivery === "closed"
+                ? { responseCloseReason: "peer_end" as const }
+                : {}),
+            }),
+          }),
+        );
+        expect(result.isError).not.toBe(true);
+        expect(yield* Deferred.isDone(recorded)).toBe(false);
+        yield* TestClock.adjust("10 seconds");
+        yield* Deferred.succeed(settled, undefined);
+        const row = yield* Deferred.await(recorded);
+        expect(row).toMatchObject({
+          tool: "subtask_done",
+          callerThreadId: "caller-ledger",
+          outcome: "ok",
+          saved: true,
+          responseDelivery,
+          responseElapsedMs: 10_000,
+        });
+        expect(row.durationMs).toBeLessThan(10_000);
+        expect(row.responseCloseReason).toBe(
+          responseDelivery === "closed" ? "peer_end" : undefined,
+        );
+        expect(yield* decodeAnalyticsEvent(row)).toEqual(row);
+      }).pipe(Effect.provide(registration));
+    }),
+);
 
 it.effect.each([
   { name: "shutdown before receipt", committed: false, shutdown: true, expected: "unknown" },
@@ -994,4 +1298,55 @@ it.effect("card_next records interrupted calls with caller and duration", () =>
       expect(rows[0]!.durationMs).toBeGreaterThanOrEqual(3000);
     }).pipe(Effect.provide(registration));
   }),
+);
+
+it.effect.each(["lookup.target", "waiting"] as const)(
+  "records thread wait stage %s beside its reader lane",
+  (waitStage) =>
+    Effect.gen(function* () {
+      const recorded = yield* Deferred.make<AnalyticsEvent>();
+      const toolkit = probe("t3_thread_wait");
+      const handlers = McpToolAccess.toLayer(toolkit, {
+        t3_thread_wait: McpToolAccess.reads(() =>
+          Effect.gen(function* () {
+            const context = yield* Effect.serviceOption(McpCall.McpCall);
+            if (context._tag === "None") return yield* Effect.die("Missing MCP analytics context");
+            const state = context.value;
+            state.waitStage = waitStage;
+            state.waitLookupMs = 600;
+            state.readerLane = waitStage === "waiting" ? "background" : "foreground";
+            if (waitStage === "lookup.target") return yield* failure("lookup_timeout");
+            return { status: "running", timedOut: true };
+          }),
+        ),
+      });
+      const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(Testkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              event.kind === "mcp.call"
+                ? Deferred.succeed(recorded, event).pipe(Effect.asVoid)
+                : Effect.void,
+          }),
+        ),
+        Layer.provideMerge(invocation),
+      );
+      yield* Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        yield* server
+          .callTool({ name: "t3_thread_wait", arguments: args })
+          .pipe(Effect.provideService(McpSchema.McpServerClient, client));
+        const row = yield* Deferred.await(recorded);
+        expect(yield* decodeAnalyticsEvent(row)).toMatchObject({
+          tool: "t3_thread_wait",
+          outcome: "timeout",
+          waitStage,
+          waitLookupMs: 600,
+          readerLane: waitStage === "waiting" ? "background" : "foreground",
+          errorTag: waitStage === "waiting" ? "wait_timeout" : "lookup_timeout",
+        });
+      }).pipe(Effect.provide(registration));
+    }),
 );

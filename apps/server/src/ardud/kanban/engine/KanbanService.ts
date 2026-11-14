@@ -128,6 +128,7 @@ import { KanbanModels, isListed } from "./models.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
 import { planCutoverCardRestore, type RestoreCutoverCardInput } from "./cutoverCards.ts";
 import * as BoardLocks from "./boardLocks.ts";
+import * as ThreadCommandExecutor from "../../../orchestration-v2/ThreadCommandExecutor.ts";
 import * as LockedStore from "./lockedStore.ts";
 import * as TickTimings from "./tickTimings.ts";
 import * as SavedWrite from "./savedWrite.ts";
@@ -1629,6 +1630,7 @@ const make = Effect.gen(function* () {
     TickTimings.measure("event_persistence", boardSql.withTransaction(effect), true);
   const store = LockedStore.wrap(rawStore, locks);
   const threadIo = yield* KanbanThreads;
+  const turnAdmission = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const inFlightSends = new Map<ThreadId, number>();
   const delivering = new Map<
     KanbanCard["id"],
@@ -3125,7 +3127,7 @@ const make = Effect.gen(function* () {
     );
   });
 
-  const releaseStalled = (card: KanbanCard, at: string): KanbanCard => ({
+  const releaseToQueue = (card: KanbanCard, at: string): KanbanCard => ({
     ...release(card),
     stage:
       card.stage === "working" ? "todo" : card.stage === "in_review" ? "needs_review" : card.stage,
@@ -8995,7 +8997,7 @@ const make = Effect.gen(function* () {
           continue;
         const by: KanbanActor = { _tag: "system", component: "dispatcher" };
         const reason = `Run failed: ${startTimeout.reason}`;
-        const next = releaseStalled(
+        const next = releaseToQueue(
           { ...Retries.withoutRetries(current), stalled: { reason, by, at } },
           at,
         );
@@ -10276,7 +10278,7 @@ const make = Effect.gen(function* () {
                       }),
                     ),
                   );
-                  const next = releaseStalled(current, yield* nowIso);
+                  const next = releaseToQueue(current, yield* nowIso);
                   // Attribution also controls whether the old reviewer may submit a late verdict.
                   yield* logEvent(next, current.stalled.by, "flagged", {
                     fromStage: current.stage,
@@ -10448,7 +10450,7 @@ const make = Effect.gen(function* () {
                       ? "Stale queued runs on the thread"
                       : "Run went silent twice";
                     yield* endReviewLink(current.reviewThreadId, at);
-                    const next = releaseStalled(
+                    const next = releaseToQueue(
                       { ...current, stalled: { reason, by: system, at } },
                       at,
                     );
@@ -13753,7 +13755,7 @@ const make = Effect.gen(function* () {
         if (!isUnattachedOwnThread(card, actor)) yield* checkCardThread(card, actor, role);
         const question = input.question.trim();
         if (!question) return yield* failWith("invalid", "an ask needs the question");
-        const written = Asks.askFields(input, { blocking: input.blocking });
+        const written = Asks.askFields(input, { blocking: input.blocking, card });
         if (Asks.isAskProblem(written)) return yield* failWith(written.code, written.detail);
         if (written.to === "evaluator" && actor._tag !== "thread") {
           return yield* failWith(
@@ -13877,7 +13879,7 @@ const make = Effect.gen(function* () {
         if (!isUnattachedOwnThread(card, actor)) yield* checkCardThread(card, actor, role);
         const ask = yield* openAskOf(card, askId);
         const at = yield* nowIso;
-        const written = Asks.reviseAsk(ask, edit, at);
+        const written = Asks.reviseAsk(ask, edit, at, card);
         if (Asks.isAskProblem(written)) return yield* failWith(written.code, written.detail);
         const { blocks: _blocks, ...revised } = written;
         // New blocks replace the old ones; otherwise the last version's come along whole.
@@ -14346,7 +14348,7 @@ const make = Effect.gen(function* () {
         };
         // A stalled card holds no slot, whoever flagged it.
         const next: KanbanCard =
-          reason !== null && card.activeThreadId !== null ? releaseStalled(flagged, at) : flagged;
+          reason !== null && card.activeThreadId !== null ? releaseToQueue(flagged, at) : flagged;
         yield* logEvent(next, actor, "flagged", {
           fromStage: card.stage,
           toStage: next.stage,
@@ -14366,6 +14368,17 @@ const make = Effect.gen(function* () {
         return next;
       }),
     );
+
+  const activeWaitThreadRunning = Effect.fn("KanbanService.activeWaitThreadRunning")(function* (
+    card: KanbanCard,
+    io: typeof threadIo,
+  ) {
+    if (card.activeThreadId === null) return false;
+    const queued = yield* io.queuedRuns(card.activeThreadId);
+    const view = yield* io.view(card.activeThreadId);
+    // A missing/failed read cannot prove the owner is idle. PR watches alone may park.
+    return queued.length > 0 || view?.state !== "idle" || view.backgroundWork > 0;
+  });
 
   const waitCard: KanbanServiceShape["waitCard"] = (cardId, input, actor) =>
     guard(
@@ -14454,12 +14467,19 @@ const make = Effect.gen(function* () {
               : null,
           args: input.args ?? null,
         };
-        const check = Waits.checkWait(card, request, actor, yield* nowMillis);
+        const check = Waits.checkWait(
+          card,
+          request,
+          actor,
+          yield* nowMillis,
+          Waits.WAITS_ENGINE_WIRED,
+          yield* activeWaitThreadRunning(card, threads),
+        );
         if (!check.ok) return yield* failWith(check.code, check.reason);
         const wait = Waits.newWait(request, actor, at);
         // A new wait is a decision: a hold for the evaluator from the last one ends here.
         const next: KanbanCard = {
-          ...kanbanWithoutDeciding(card),
+          ...kanbanWithoutDeciding(card.activeThreadId === null ? card : releaseToQueue(card, at)),
           wait,
           stalled: null,
           updatedAt: at,
@@ -14468,12 +14488,28 @@ const make = Effect.gen(function* () {
           target === null
             ? undefined
             : new Map([[target.id as string, yield* waitTargetFacts(target, card.boardId)]]);
-        yield* logEvent(next, actor, Waits.waitEventKind("wait_set"), {
-          body:
-            Waits.waitSetBody(wait, known) +
-            (card.stalled !== null ? ` (replaces the stalled flag: ${card.stalled.reason})` : ""),
+        // Cleanup may cancel queued wakes through turn admission, so finish it
+        // before taking that non-reentrant lock. Logging/saving reuse this candidate.
+        yield* prepareTransition(next);
+        const park = Effect.gen(function* () {
+          if (yield* activeWaitThreadRunning(card, threadIo)) {
+            const live = Waits.checkWait(card, request, actor, yield* nowMillis);
+            if (!live.ok) return yield* failWith(live.code, live.reason);
+          }
+          yield* logEvent(next, actor, Waits.waitEventKind("wait_set"), {
+            fromStage: card.stage === next.stage ? null : card.stage,
+            toStage: card.stage === next.stage ? null : next.stage,
+            body:
+              Waits.waitSetBody(wait, known) +
+              (card.stalled !== null ? ` (replaces the stalled flag: ${card.stalled.reason})` : ""),
+          });
+          yield* saveCard(next);
         });
-        yield* saveCard(next);
+        // The board gate alone cannot order this write against new turns.
+        yield* card.activeThreadId === null
+          ? park
+          : turnAdmission.withLock(card.activeThreadId, park);
+        if (card.activeThreadId !== null) yield* kick;
         return next;
       }),
     );
@@ -17147,4 +17183,6 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(KanbanService, make);
+export const layer = Layer.effect(KanbanService, make).pipe(
+  Layer.provide(ThreadCommandExecutor.layer),
+);
