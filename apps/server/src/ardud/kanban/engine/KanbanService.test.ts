@@ -37,6 +37,7 @@ import {
   KanbanBoard,
   KanbanDiscussionId,
   KanbanCardId,
+  kanbanOpenStep,
   KanbanBlock,
   KanbanBlockInput,
   KanbanScriptId,
@@ -27458,6 +27459,93 @@ it.effect("current-step gate: review findings restart a worker with an open revi
   }),
 );
 
+it.effect.each(["reuse", "fresh"] as const)(
+  "current-step gate: findings on an evaluator step dispatch a %s worker until resubmission",
+  (mode) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Fix the reviewed build",
+            prompt: "Build the feature",
+            subtasks: [
+              { text: "Build", owner: "work", step: 1 },
+              { text: "Check the build", owner: "evaluator", step: 2 },
+              { text: "Review", owner: "review", step: 3 },
+            ],
+          },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const actor: KanbanActor = { _tag: "thread", threadId: worker };
+        yield* kanban.markSubtask(card.id, "s1", "done", null, actor, "work");
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", actor);
+        yield* kanban.dispatchNow;
+        const review = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(review.activeRole, "review");
+        const reviewer = review.activeThreadId!;
+        const evaluatorMessages = () =>
+          Ref.get(fake.threads).pipe(
+            Effect.map((all) =>
+              [...all.values()]
+                .flatMap((thread) => thread.messages)
+                .filter(
+                  (text) =>
+                    text.includes("waiting on your subtasks") || text.includes("has waited"),
+                ),
+            ),
+          );
+        const before = yield* evaluatorMessages();
+        yield* kanban.reviewResult(reviewer, "findings", ["Fix the build output"]);
+        const findings = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(findings.stage, "todo");
+        assert.isTrue(findings.reviewFindingsPending);
+        assert.strictEqual(kanbanOpenStep(findings), 2);
+        const brief = Briefs.workBrief(board, findings, null);
+        assert.include(brief, "Fix the build output");
+        assert.include(brief, "Fix them, then card_move to needs_review.");
+        assert.include(brief, "the evaluator's and the reviewer's aren't yours to do");
+        if (mode === "fresh") yield* kanban.cardThread(card.id, "reset", "", owner);
+        // Keep dispatch queued long enough to exercise the evaluator reminder too.
+        yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+        yield* kanban.tick;
+        yield* TestClock.adjust("61 minutes");
+        yield* kanban.tick;
+        assert.deepStrictEqual(yield* evaluatorMessages(), before);
+        yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+        yield* kanban.dispatchNow;
+        const fixing = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(fixing.stage, "working");
+        assert.strictEqual(fixing.activeRole, "work");
+        if (mode === "reuse") assert.strictEqual(fixing.activeThreadId, worker);
+        else assert.notStrictEqual(fixing.activeThreadId, worker);
+        assert.isTrue(fixing.reviewFindingsPending);
+        assert.isNull(fixing.wakeNote);
+        assert.include(
+          (yield* Ref.get(fake.threads)).get(fixing.activeThreadId!)!.messages.at(-1)!,
+          "Fix the build output",
+        );
+        const submitted = yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: fixing.activeThreadId!,
+        });
+        assert.isFalse(submitted.reviewFindingsPending);
+        assert.strictEqual(kanbanOpenStep(submitted), 2);
+        assert.deepStrictEqual(submitted.subtasks, findings.subtasks);
+        yield* kanban.dispatchNow;
+        const reviewing = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(reviewing.stage, "in_review");
+        assert.strictEqual(reviewing.activeRole, "review");
+        assert.isFalse(reviewing.reviewFindingsPending);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect("current-step gate: a failed start is held until the evaluator clears the flag", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -27817,7 +27905,7 @@ it.effect.each(["dispatch", "claim"] as const)(
 );
 
 it.effect.each(["saved", "legacy"] as const)(
-  "current-step gate: pending findings wait through an inserted gate (%s verdict)",
+  "current-step gate: only durable findings dispatch before an inserted evaluator step (%s verdict)",
   (verdict) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
@@ -27847,30 +27935,28 @@ it.effect.each(["saved", "legacy"] as const)(
           owner,
         );
         yield* kanban.dispatchNow;
-        assert.isNull((yield* kanban.card(card.id)).card.activeThreadId);
-        yield* TestClock.adjust(1);
-        const gate = edited.subtasks.find((s) => s.text === "Evaluator gate")!;
-        const opened = yield* kanban.markSubtask(
-          card.id,
-          gate.id,
-          "done",
-          null,
-          owner,
-          "evaluator",
-        );
-        assert.strictEqual(opened.stage, "todo");
-        assert.isTrue(opened.reviewFindingsPending);
-        yield* kanban.dispatchNow;
+        if (verdict === "legacy") {
+          assert.isNull((yield* kanban.card(card.id)).card.activeThreadId);
+          const gate = edited.subtasks.find((s) => s.text === "Evaluator gate")!;
+          yield* kanban.markSubtask(card.id, gate.id, "done", null, owner, "evaluator");
+          yield* kanban.dispatchNow;
+        }
         const running = (yield* kanban.card(card.id)).card;
         assert.strictEqual(running.activeRole, "work");
         assert.strictEqual(running.activeThreadId, worker);
+        assert.isTrue(running.reviewFindingsPending);
+        assert.strictEqual(kanbanOpenStep(running), verdict === "saved" ? 2 : 3);
+        assert.strictEqual(
+          running.subtasks.find((s) => s.text === "Evaluator gate")?.state,
+          verdict === "saved" ? "open" : "done",
+        );
         assert.include((yield* Ref.get(fake.threads)).get(worker)!.messages.at(-1)!, "Fix rate");
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
 );
 
 it.effect.each(["steer", "wake", "idle wake", "reset"] as const)(
-  "current-step gate: pending findings retain owner words on gated %s",
+  "current-step gate: pending findings retain owner words across an evaluator step on %s",
   (action) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
@@ -27884,7 +27970,8 @@ it.effect.each(["steer", "wake", "idle wake", "reset"] as const)(
             ? { stage: "todo" as const, activeThreadId: null, activeRole: null, activePool: null }
             : {}),
         });
-        const edited = yield* kanban.editCard(
+        const before = (yield* Ref.get(fake.threads)).get(worker)!.messages.length;
+        yield* kanban.editCard(
           card.id,
           {
             subtasks: [
@@ -27896,7 +27983,6 @@ it.effect.each(["steer", "wake", "idle wake", "reset"] as const)(
           },
           owner,
         );
-        const before = (yield* Ref.get(fake.threads)).get(worker)!.messages.length;
         if (action === "idle wake") yield* setRunning(fake, worker, false);
         yield* kanban.cardThread(
           card.id,
@@ -27904,25 +27990,17 @@ it.effect.each(["steer", "wake", "idle wake", "reset"] as const)(
           "Owner says use 2%",
           owner,
         );
-        const queued = (yield* kanban.card(card.id)).card;
-        assert.include(queued.wakeNote ?? "", "Fix rate");
-        assert.include(queued.wakeNote ?? "", "Owner says use 2%");
-        assert.isFalse(
-          (yield* Ref.get(fake.threads))
-            .get(worker)!
-            .messages.slice(before)
-            .some((m) => m.includes("Owner says use 2%")),
-        );
         yield* TestClock.adjust(1);
-        const gate = edited.subtasks.find((s) => s.text === "Evaluator gate")!;
-        yield* kanban.markSubtask(card.id, gate.id, "done", null, owner, "evaluator");
         if ((yield* kanban.card(card.id)).card.activeThreadId === null) yield* kanban.dispatchNow;
         else yield* kanban.turnEnded(worker);
         const running = (yield* kanban.card(card.id)).card;
         assert.strictEqual(running.activeRole, "work");
+        assert.isTrue(running.reviewFindingsPending);
+        assert.strictEqual(kanbanOpenStep(running), 2);
         const delivered = (yield* Ref.get(fake.threads))
           .get(running.activeThreadId!)!
-          .messages.at(-1)!;
+          .messages.slice(running.activeThreadId === worker ? before : 0)
+          .join("\n\n");
         assert.include(delivered, "Fix rate");
         assert.include(delivered, "Owner says use 2%");
       }).pipe(Effect.provide(testLayer(fake.layer)));

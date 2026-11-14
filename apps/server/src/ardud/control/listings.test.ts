@@ -551,6 +551,83 @@ describe("control listings", () => {
     });
   });
 
+  it.live("serves a global 24-hour updatedSince page of 500 with the full total", () =>
+    run(
+      ({ get }) =>
+        Effect.gen(function* () {
+          const since = DateTime.toEpochMillis(pagedShells.at(-1)!.updatedAt) - 86_400_000;
+          for (const value of [String(since), DateTime.formatIso(DateTime.makeUnsafe(since))]) {
+            const response = yield* get(
+              `/threads?updatedSince=${encodeURIComponent(value)}&limit=500`,
+            );
+            assert.equal(response.status, 200);
+            assert.equal(response.body.total, 507);
+            assert.lengthOf(response.body.threads, 500);
+            assert.equal(response.body.threads[0].threadId, "cursor-0506");
+            assert.isString(response.body.nextCursor);
+          }
+        }),
+      undefined,
+      pagedShells,
+    ),
+  );
+
+  it.live("pages messages through the HTTP filters and retains the wire shape", () =>
+    run(({ get, sql, recordReads }) =>
+      Effect.gen(function* () {
+        const at = "2026-03-01T00:00:00.000Z";
+        for (const [id, role] of [
+          ["a", "assistant"],
+          ["b", "user"],
+          ["c", "user"],
+        ]) {
+          yield* sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert({
+            message_id: id,
+            thread_id: "quiet",
+            run_id: "run-page",
+            node_id: null,
+            role,
+            streaming: 0,
+            created_at: at,
+            updated_at: at,
+            payload_json: JSON.stringify({
+              id,
+              threadId: "quiet",
+              runId: "run-page",
+              nodeId: null,
+              role,
+              text: id,
+              phase: "answer",
+              attachments: [],
+              streaming: false,
+              createdBy: "user",
+              creationSource: "web",
+              createdAt: at,
+              updatedAt: at,
+            }),
+          })}`;
+        }
+        const response = yield* get(
+          `/threads/quiet/messages?role=user&runId=run-page&since=${Date.parse(at) - 1}&afterMessageId=a&limit=1`,
+        );
+        assert.equal(response.status, 200);
+        assert.equal(response.body.total, 2);
+        assert.deepStrictEqual(
+          response.body.messages.map((message: { messageId: string }) => message.messageId),
+          ["c"],
+        );
+        assert.equal(response.body.lastAssistant.messageId, "a");
+        assert.equal(response.body.state, "idle");
+        assert.equal(response.body.status, "completed");
+        assert.equal(response.body.runId, "run:quiet:1");
+        assert.equal(yield* Ref.get(recordReads), 1);
+        const all = yield* get("/threads/quiet/messages?role=user&all=true&limit=1");
+        assert.lengthOf(all.body.messages, 2);
+        assert.equal((yield* get("/threads/missing/messages")).status, 404);
+      }),
+    ),
+  );
+
   it.live(
     "pages beyond 500 in descending time/id order with a full total on every page",
     () =>

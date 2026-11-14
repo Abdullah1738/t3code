@@ -2,33 +2,16 @@
 // t3ctl: shell access to the ardud control API. Prints JSON unless --text.
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
-import * as NodeNet from "node:net";
 import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
-import * as NodeURL from "node:url";
 import * as NodeUtil from "node:util";
 
 import { ControlClient, SHARED_TOKEN_FILE, componentTokenFile } from "./client.mjs";
-import { deepHealth } from "./deep-health.mjs";
+import { runDeepHealthCli } from "./deep-health-cli.mjs";
 
-// Like outboundHttp.ts, ignore macOS peer-reset EINVAL for undici's optional QoS hint.
-export function ignoreMacosTypeOfServiceEinval(
-  // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone Node CLI; no Effect runtime.
-  platform = process.platform,
-  socketPrototype = NodeNet.Socket.prototype,
-) {
-  if (platform !== "darwin") return;
-  const setTypeOfService = socketPrototype.setTypeOfService;
-  if (typeof setTypeOfService !== "function") return;
-  socketPrototype.setTypeOfService = function (...args) {
-    try {
-      return setTypeOfService.apply(this, args);
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "EINVAL") return this;
-      throw error;
-    }
-  };
-}
+import { ignoreMacosTypeOfServiceEinval } from "./control-qos.mjs";
+export { ignoreMacosTypeOfServiceEinval } from "./control-qos.mjs";
+
 ignoreMacosTypeOfServiceEinval();
 
 const TOKEN_FILE = componentTokenFile("t3ctl");
@@ -349,6 +332,15 @@ async function main() {
     }
     requestTimeoutMs = Math.max(1, Math.round(seconds * 1000));
   }
+  if (command === "health" && flags.deep) {
+    runDeepHealthCli({
+      url: flags.url,
+      token: flags.token,
+      timeoutMs: requestTimeoutMs,
+      json: flags.json,
+    });
+    return;
+  }
   const client = new ControlClient({
     url: flags.url,
     token: flags.token,
@@ -362,14 +354,8 @@ async function main() {
       request(method, path, body, { ...options, timeoutMs: requestTimeoutMs });
   }
   switch (command) {
-    case "health": {
-      if (!flags.deep) return print(await client.health());
-      const report = await deepHealth({ client, timeoutMs: requestTimeoutMs });
-      if (!flags.json) console.log(report.summary);
-      print(report);
-      process.exitCode = report.exitCode;
-      return;
-    }
+    case "health":
+      return print(await client.health());
     case "requests":
       return print(await client.pendingRequests({ origin: flags.origin }));
     case "projects":
@@ -671,15 +657,7 @@ async function main() {
   }
 }
 
-let isMain = false;
-try {
-  isMain =
-    !!process.argv[1] &&
-    NodeFS.realpathSync(process.argv[1]) === NodeURL.fileURLToPath(import.meta.url);
-} catch {
-  // An importing process may have a non-file argv[1].
-}
-if (isMain) {
+if (import.meta.main) {
   main().catch((error) => {
     console.error(
       error.code ? `${error.code}: ${error.message}` : (error.message ?? String(error)),

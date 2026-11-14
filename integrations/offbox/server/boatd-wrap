@@ -19,6 +19,10 @@ envs=()
 while IFS= read -r l; do
   case "$l" in PATH=*|\#*|'') ;; [A-Za-z_]*=*) k=${l%%=*}; v=${l#*=}; v=${v#\"}; v=${v%\"}; envs+=("$k=$v");; esac
 done < /etc/environment 2>/dev/null
+# boatd wrote a root-only file. Keep the command in that file across the uid drop:
+# re-inlining it here hits Linux's 128 KiB per-argument limit after client quoting.
+chown 1000:1000 "/run/boatd/$pid.sh" || exit 126
 exec env -i "${envs[@]}" HOME=/home/user USER=user LOGNAME=user SHELL=/bin/bash LANG=C.UTF-8 TERM=dumb \
   PATH=/usr/local/go/bin:/home/user/go/bin:/home/user/.local/bin:/home/user/.local/share/pnpm:/home/user/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-  setpriv --reuid=1000 --regid=1000 --init-groups -- /bin/bash -c "$(cat /run/boatd/$pid.sh)"
+  setpriv --reuid=1000 --regid=1000 --init-groups -- /bin/bash -c \
+  '__boatd_script=$1; shift; . "$__boatd_script"' /bin/bash "/run/boatd/$pid.sh"

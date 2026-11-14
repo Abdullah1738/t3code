@@ -11751,7 +11751,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         awaitsRestartContinuation,
       );
       if (!pending.includes(true)) return false;
-      if (resultRun.status !== "interrupted" && resultRun.status !== "cancelled") return true;
+      if (
+        resultRun.status !== "interrupted" &&
+        resultRun.status !== "cancelled" &&
+        resultRun.status !== "failed"
+      )
+        return true;
       const resultChain: Array<OrchestrationV2Run> = [];
       const seen = new Set<RunId>();
       let source: OrchestrationV2Run | undefined = resultRun;
@@ -11771,10 +11776,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         },
       );
       if (delegatedTaskProgress({ ...child, runs }).hasPendingWork) return true;
-      // A queued recovery effect alone is not work or a result. In particular,
-      // restart teardown can leave that effect pending after cancelling the turn.
+      // Progress notes survive a cut turn too; only a result can hold terminal
+      // publication behind a queued restart. Keep unknown phases for older providers.
+      const results = {
+        ...child,
+        messages: child.messages.filter((message) => message.phase !== "narration"),
+        turnItems: child.turnItems.filter(
+          (item) => item.type !== "assistant_message" || item.phase !== "narration",
+        ),
+      };
       return resultChain.some((run) => {
-        const result = subagentResultForRun(child, run);
+        const result = subagentResultForRun(results, run);
         return result.messageId !== null || result.turnItemId !== null;
       });
     },

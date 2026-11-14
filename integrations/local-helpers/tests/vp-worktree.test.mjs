@@ -7,6 +7,30 @@ import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 
 const shim = fileURLToPath(new URL("../bin/vp", import.meta.url));
+const binding = `@oxfmt/binding-${os.platform()}-${os.arch()}`;
+function fixtureLock() {
+  return {
+    lockfileVersion: "9.0",
+    importers: {
+      ".": {
+        devDependencies: {
+          "vite-plus": { specifier: "1.0.0", version: "1.0.0(peer@2.0.0)" },
+          "@fixture/lint": { specifier: "1.0.0", version: "1.0.0" },
+          unrelated: { specifier: "1.0.0", version: "1.0.0" },
+        },
+      },
+    },
+    packages: { [`${binding}@1.0.0`]: { os: [os.platform()], cpu: [os.arch()] } },
+    snapshots: {
+      "vite-plus@1.0.0(peer@2.0.0)": { dependencies: { oxfmt: "1.0.0", oxlint: "1.0.0" } },
+      "oxfmt@1.0.0": { optionalDependencies: { [binding]: "1.0.0" } },
+      "oxlint@1.0.0": {},
+      [`${binding}@1.0.0`]: {},
+      "@fixture/lint@1.0.0": {},
+    },
+  };
+}
+
 function fixture(t, nativeModules) {
   const temporary = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "vp-worktree-")));
   t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
@@ -21,6 +45,9 @@ function fixture(t, nativeModules) {
   for (const [name, content] of Object.entries({
     "vite.config.ts": 'export default {fmt:{ignorePatterns:["dist/**"]},lint:{}};\n',
     "package.json": "{}\n",
+    "pnpm-lock.yaml": nativeModules
+      ? fs.readFileSync(path.join(nativeModules, "../pnpm-lock.yaml"), "utf8")
+      : JSON.stringify(fixtureLock()),
     ".gitignore": "dist/\n",
   }))
     fs.writeFileSync(path.join(main, name), content);
@@ -38,21 +65,36 @@ function fixture(t, nativeModules) {
     };
   }
   fs.mkdirSync(path.join(main, "node_modules/.bin"), { recursive: true });
-  fs.mkdirSync(path.join(main, "node_modules/vite-plus"));
-  fs.writeFileSync(
-    path.join(main, "node_modules/vite-plus/package.json"),
-    JSON.stringify({
+  for (const [name, metadata] of Object.entries({
+    "vite-plus": {
       type: "module",
       exports: { ".": { import: "./index.js" } },
-    }),
-  );
+      dependencies: { oxfmt: "1.0.0", oxlint: "1.0.0" },
+    },
+    oxfmt: { optionalDependencies: { [binding]: "1.0.0" } },
+    oxlint: {},
+    [binding]: { os: [os.platform()], cpu: [os.arch()] },
+    "@fixture/lint": { exports: { "./rules": "./index.js" } },
+    yaml: {},
+  })) {
+    const dir = path.join(main, "node_modules", name);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "package.json"),
+      JSON.stringify({ name, version: "1.0.0", ...metadata }),
+    );
+    fs.writeFileSync(
+      path.join(dir, "index.js"),
+      name === "yaml" ? "exports.parse = JSON.parse;" : "",
+    );
+  }
   fs.writeFileSync(
     path.join(main, "node_modules/vite-plus/index.js"),
     `
     export async function loadConfigFromFile() {
       return { dependencies: [], config: {
         fmt: { ignorePatterns: ["dist/**"], overrides: [{files:["src/**"],options:{semi:false}}] },
-        lint: { ignorePatterns: ["dist/**"], jsPlugins: [] }
+        lint: { ignorePatterns: ["dist/**"], jsPlugins: ["@fixture/lint/rules"] }
       }};
     }
   `,
@@ -435,14 +477,12 @@ test("config drift, addition and deletion all refuse without running vp", (t) =>
   const f = fixture(t);
   for (const name of [
     "vite.config.ts",
-    "package.json",
     ".oxfmtrc.json",
     ".oxlintrc.json",
     "oxlint.config.ts",
     ".gitignore",
     ".prettierignore",
     ".eslintignore",
-    "pnpm-lock.yaml",
   ]) {
     const file = path.join(f.wt, name);
     const before = fs.existsSync(file) ? fs.readFileSync(file) : null;
@@ -456,6 +496,113 @@ test("config drift, addition and deletion all refuse without running vp", (t) =>
   }
   fs.unlinkSync(path.join(f.wt, "vite.config.ts"));
   assert.match(f.run(["lint", "a.ts"]).stderr, /config drift/);
+});
+
+test("unrelated lockfile and package.json edits still reroute fmt and lint", (t) => {
+  const f = fixture(t);
+  const lock = fixtureLock();
+  lock.importers["."].devDependencies.unrelated.version = "2.0.0";
+  lock.snapshots["unrelated@2.0.0"] = {};
+  fs.writeFileSync(path.join(f.wt, "pnpm-lock.yaml"), JSON.stringify(lock));
+  fs.writeFileSync(
+    path.join(f.wt, "package.json"),
+    JSON.stringify({ scripts: { new: "echo new" } }),
+  );
+  f.routed(["fmt", "a.ts"]);
+  f.routed(["lint", "a.ts"]);
+});
+
+for (const name of ["vite-plus", "oxfmt", "oxlint", binding, "@fixture/lint"]) {
+  test(`toolchain version drift refuses: ${name}`, (t) => {
+    const f = fixture(t);
+    const lock = fixtureLock();
+    if (name === "vite-plus" || name === "@fixture/lint")
+      lock.importers["."].devDependencies[name].version = "2.0.0";
+    else if (name === binding) lock.snapshots["oxfmt@1.0.0"].optionalDependencies[name] = "2.0.0";
+    else lock.snapshots["vite-plus@1.0.0(peer@2.0.0)"].dependencies[name] = "2.0.0";
+    fs.writeFileSync(path.join(f.wt, "pnpm-lock.yaml"), JSON.stringify(lock));
+    const r = f.run(["lint", "a.ts"]);
+    assert.equal(r.status, 127, r.stderr);
+    assert.ok(r.stderr.includes(`config drift in ${name} (2.0.0 vs 1.0.0)`), r.stderr);
+    assert.equal(r.stdout, "");
+  });
+}
+
+test("missing lock resolutions and installed toolchain packages refuse by name", (t) => {
+  const f = fixture(t);
+  const lock = fixtureLock();
+  delete lock.snapshots["vite-plus@1.0.0(peer@2.0.0)"].dependencies.oxfmt;
+  fs.writeFileSync(path.join(f.wt, "pnpm-lock.yaml"), JSON.stringify(lock));
+  assert.match(f.run(["fmt", "a.ts"]).stderr, /config drift in oxfmt \(unresolved vs 1.0.0\)/);
+  fs.writeFileSync(path.join(f.wt, "pnpm-lock.yaml"), JSON.stringify(fixtureLock()));
+  fs.rmSync(path.join(f.main, "node_modules", binding), { recursive: true });
+  const r = f.run(["fmt", "a.ts"]);
+  assert.equal(r.status, 127);
+  assert.ok(r.stderr.includes(`config drift in ${binding} (1.0.0 vs unresolved)`), r.stderr);
+});
+
+test("unreadable installed package metadata refuses with the package and offbox hint", (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.main, "node_modules/oxfmt/package.json"), "invalid");
+  const r = f.run(["fmt", "a.ts"]);
+  assert.equal(r.status, 127);
+  assert.match(r.stderr, /config drift in oxfmt \(1.0.0 vs unresolved\).*offbox run -- vp fmt/);
+});
+
+test("package type changes still refuse, but unused package config keys do not", (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.wt, "package.json"), JSON.stringify({ fmt: {}, lint: {} }));
+  f.routed(["fmt", "a.ts"]);
+  fs.writeFileSync(path.join(f.wt, "package.json"), JSON.stringify({ type: "module" }));
+  assert.match(f.run(["fmt", "a.ts"]).stderr, /config drift in package.json#type/);
+});
+
+test("invalid or absent pnpm lockfiles refuse", (t) => {
+  const f = fixture(t);
+  for (const body of [
+    "invalid yaml : [",
+    JSON.stringify({ ...fixtureLock(), lockfileVersion: "6.0" }),
+    "{}",
+  ]) {
+    fs.writeFileSync(path.join(f.wt, "pnpm-lock.yaml"), body);
+    assert.match(f.run(["fmt", "a.ts"]).stderr, /config drift in pnpm-lock.yaml/);
+  }
+  fs.unlinkSync(path.join(f.wt, "pnpm-lock.yaml"));
+  assert.match(f.run(["fmt", "a.ts"]).stderr, /config drift in pnpm-lock.yaml/);
+});
+
+test("only bindings for this platform are required", (t) => {
+  const f = fixture(t);
+  const lock = fixtureLock();
+  const other = "@oxfmt/binding-other-arch";
+  lock.snapshots["oxfmt@1.0.0"].optionalDependencies[other] = "2.0.0";
+  lock.packages[`${other}@2.0.0`] = { os: ["other"] };
+  fs.writeFileSync(path.join(f.wt, "pnpm-lock.yaml"), JSON.stringify(lock));
+  f.routed(["fmt", "a.ts"]);
+});
+
+for (const section of ["dependencies", "optionalDependencies"]) {
+  test(`toolchain roots can be in importer ${section}`, (t) => {
+    const f = fixture(t);
+    const lock = fixtureLock();
+    lock.importers["."][section] = lock.importers["."].devDependencies;
+    delete lock.importers["."].devDependencies;
+    fs.writeFileSync(path.join(f.wt, "pnpm-lock.yaml"), JSON.stringify(lock));
+    f.routed(["lint", "a.ts"]);
+  });
+}
+
+test("npm aliases and nested peer contexts resolve the selected snapshot", (t) => {
+  const f = fixture(t);
+  const lock = fixtureLock();
+  const ref = "@voidzero-dev/formatter@1.0.0(peer@2.0.0(nested@3.0.0))";
+  lock.snapshots["vite-plus@1.0.0(peer@2.0.0)"].dependencies.oxfmt = ref;
+  lock.snapshots[ref] = lock.snapshots["oxfmt@1.0.0"];
+  fs.writeFileSync(path.join(f.wt, "pnpm-lock.yaml"), JSON.stringify(lock));
+  const file = path.join(f.main, "node_modules/oxfmt/package.json");
+  const pkg = JSON.parse(fs.readFileSync(file));
+  fs.writeFileSync(file, JSON.stringify({ ...pkg, name: "@voidzero-dev/formatter" }));
+  f.routed(["fmt", "a.ts"]);
 });
 
 test("drift in local plugin helpers refuses as well", (t) => {
