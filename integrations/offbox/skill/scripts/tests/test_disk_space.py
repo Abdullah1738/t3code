@@ -175,7 +175,7 @@ class ReaperTests(unittest.TestCase):
 
     def test_recent_descendant_and_oldest_live_run_protect_tree(self):
         path = self.entry('recent-child')
-        old, new = self.clock-4000, self.clock-500
+        old, new = self.clock-4000, self.clock-800
         os.utime(path / 'proof', (new, new))
         os.utime(path, (old, old))
         self.reap([dict(run_id='older', started_at=self.clock-1000)])
