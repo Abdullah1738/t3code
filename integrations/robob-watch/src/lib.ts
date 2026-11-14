@@ -118,9 +118,11 @@ export type State = {
   closing_until?: number;
   closing_from?: "active" | "done" | "expired";
   closing_watcher?: Watcher;
+  reply_handoff?: { run: string; watcher: Watcher; accepted_run?: string };
+  discarded_run?: string;
   closing_final_started?: boolean;
   closing_final_check?: boolean;
-  batch?: { at: number; events: string[]; watcher?: Watcher };
+  batch?: { at: number; events: string[]; watcher?: Watcher; frozen_context?: true };
   fires: number;
   last_run_at?: string;
   last_fire_at?: string;
@@ -153,9 +155,9 @@ export const REMOVAL_GRACE_MS = 15 * 60_000;
 export const personChat = (watcher: Watcher) => watcher.mode === "wake";
 export const sameDestination = (a: Watcher, b: Watcher) => a.mode === b.mode && a.chat === b.chat;
 export const checking = (state: State) => state.status === "active" || (state.status === "closing" && !!state.closing_watcher);
-export const pollingWatcher = (watcher: Watcher, state: State) => state.status === "closing"
-  ? state.closing_watcher && { ...state.closing_watcher, paused: watcher.paused }
-  : watcher;
+export const pollingWatcher = (watcher: Watcher, state: State) => state.reply_handoff
+  ? { ...state.reply_handoff.watcher, paused: watcher.paused }
+  : state.status === "closing" ? state.closing_watcher && { ...state.closing_watcher, paused: watcher.paused } : watcher;
 
 export function watcherInstance(id: string): string | undefined {
   try {
@@ -181,6 +183,7 @@ export function archiveWatcher(id: string): string {
     delete state.closing_from;
     delete state.closing_until;
     delete state.closing_watcher;
+    delete state.reply_handoff;
     delete state.closing_final_started;
     delete state.closing_final_check;
     saveState(id, state);
@@ -249,10 +252,14 @@ function contextSnapshot(context: string): string {
   return file;
 }
 
-export function queueEvent(watcher: Watcher, state: State, event: string, urgent: boolean): void {
+export function queueEvent(watcher: Watcher, state: State, event: string, urgent: boolean, preserveContext = false): void {
   if (personChat(watcher) && !urgent) {
     state.batch ??= { at: now(), events: [], watcher };
     state.batch.events.push(event);
+    if (preserveContext) {
+      state.batch.watcher = watcher;
+      state.batch.frozen_context = true;
+    }
   } else {
     state.pending = { key: `robob-watch:${watcher.id}:${state.fires + 1}:${hash(event).slice(0, 16)}`, event, at: iso(), watcher, context_file: watcher.mode === "wake" ? contextSnapshot(watcher.context) : undefined };
   }
@@ -261,7 +268,7 @@ export function queueEvent(watcher: Watcher, state: State, event: string, urgent
 export function sealBatch(watcher: Watcher, state: State): void {
   const batch = state.batch!;
   const accepted = batch.watcher ?? watcher;
-  const destination = sameDestination(accepted, watcher) ? { ...accepted, context: watcher.context } : accepted;
+  const destination = !batch.frozen_context && sameDestination(accepted, watcher) ? { ...accepted, context: watcher.context } : accepted;
   const key = `robob-watch:${watcher.id}:batch:${hash(JSON.stringify(batch)).slice(0, 32)}`;
   const events = batch.events.length === 1 ? batch.events[0]! : batch.events.map((event, i) => `${i + 1}. ${event}`).join("\n\n");
   // A large burst must survive the bridge's text cap. Keep the complete batch for the woken agent to read.
@@ -529,7 +536,7 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
       const definition = loadWatcher(watcher.id);
       const current = definition && pollingWatcher(definition, state);
       if (!current || !checking(state) || current.paused || current.check !== watcher.check) throw new Error("Watcher check changed before admission");
-      return spawnChild(state.status === "closing" ? "1" : "0");
+      return spawnChild(state.status === "closing" || state.reply_handoff ? "1" : "0");
     }) : spawnChild();
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr!.on("data", chunk => { if (stderr.length < 20_000) stderr += chunk; });

@@ -51,7 +51,8 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
   const delivery = await deliver(pending.watcher ?? watcher, pending.event, pending.key, state);
   if (watcherInstance(watcher.id) !== instance) return false;
   log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via} ${delivery.detail}`);
-  if (!loadWatcher(watcher.id)) return false;
+  const definition = loadWatcher(watcher.id);
+  if (!definition) return false;
   const current = loadState(watcher.id);
   if (current.pending?.key !== pending.key) return false;
   state = current;
@@ -63,7 +64,7 @@ async function deliverPending(watcher: Watcher, state: State): Promise<boolean> 
     state.wakes = [...(state.wakes ?? []), { inbound: wakeInboundId(pending.key), key: pending.key, event: pending.event, delivered_at: now() }];
   }
   delete state.pending;
-  if (state.status !== "closing" && watcher.max_fires !== 0 && state.fires >= watcher.max_fires && !state.batch) finish(watcher, state, "done");
+  if (state.status !== "closing" && definition.max_fires !== 0 && state.fires >= definition.max_fires && !state.batch) finish(definition, state, "done");
   else saveState(watcher.id, state);
   return true;
 }
@@ -146,12 +147,32 @@ async function pauseNotice(watcher: Watcher, state: State): Promise<void> {
   }
 }
 
+function acknowledgeRun(id: string, instance: string | undefined, run: string): void {
+  withRelayLock(() => {
+    if (!instance || watcherInstance(id) !== instance || !loadWatcher(id)) return;
+    writeFileSync(join(watcherDir(id), RUN_OK_FILE), `${run}\n`);
+    const state = loadState(id);
+    const discarded = state.discarded_run === run;
+    if (discarded) delete state.discarded_run;
+    if (state.reply_handoff?.accepted_run === run) {
+      delete state.reply_handoff;
+      saveState(id, state);
+    } else if (discarded) saveState(id, state);
+  });
+}
+
 export async function tickOne(id: string): Promise<void> {
   const instance = watcherInstance(id);
   const sameInstance = () => watcherInstance(id) === instance;
   const initial = loadWatcher(id);
   if (!initial) return;
   let state = loadState(id);
+  const unacked = state.discarded_run ?? state.reply_handoff?.accepted_run;
+  if (unacked) {
+    // State records acceptance before the separate helper ack; finish that ack after a crash/write failure.
+    try { acknowledgeRun(id, instance, unacked); } catch { return; }
+    state = loadState(id);
+  }
   const initialPoller = pollingWatcher(initial, state);
   if (!initialPoller) return;
   await headsUps(initialPoller, state);
@@ -170,7 +191,7 @@ export async function tickOne(id: string): Promise<void> {
   if (!checking(state) || watcher.paused) return;
   if (held(watcher)) return;
   const t = now();
-  if (state.status !== "closing" && watcher.expires_at && Date.parse(watcher.expires_at) <= t && !state.pending && !state.batch) {
+  if (state.status !== "closing" && !state.reply_handoff && watcher.expires_at && Date.parse(watcher.expires_at) <= t && !state.pending && !state.batch) {
     finish(watcher, state, "expired");
     const sent = await alert(watcher, `Watcher "${watcher.title}" expired without firing${state.fires ? " again" : ""} and is now off.`,
       `robob-watch:${id}:expired`, "info");
@@ -201,7 +222,7 @@ export async function tickOne(id: string): Promise<void> {
   const finalCheck = state.status === "closing" && t >= state.closing_until!;
   if (state.failure_paused_at && !finalCheck) return;
   if (state.batch?.watcher && !sameDestination(state.batch.watcher, watcher)) return;
-  if (state.status !== "closing" && watcher.max_fires !== 0 && state.fires + (state.batch?.events.length ?? 0) >= watcher.max_fires) return;
+  if (state.status !== "closing" && !state.reply_handoff && watcher.max_fires !== 0 && state.fires + (state.batch?.events.length ?? 0) >= watcher.max_fires) return;
   // Trigger files (e.g. chat.db-wal) run the check as soon as they change; interval_s stays the fallback.
   // A failing watcher keeps its backoff; the signature is recorded before the run so a change mid-run re-triggers.
   const sig = triggerSig(watcher);
@@ -221,6 +242,7 @@ export async function tickOne(id: string): Promise<void> {
   let startLoad = 0;
   let timeoutMs = 0;
   let checkedWatcher: Watcher | undefined;
+  let handoffRun: string | undefined;
   let finalDeadline: number | undefined;
   const result = await slots.run(async () => withRelayLock(() => {
     if (!sameInstance()) return undefined;
@@ -231,7 +253,8 @@ export async function tickOne(id: string): Promise<void> {
     const final = state.status === "closing" && now() >= state.closing_until!;
     if (!current || !checking(state) || current.paused || (state.failure_paused_at && !final) || held(current)) return undefined;
     if (state.batch?.watcher && !sameDestination(state.batch.watcher, current)) return undefined;
-    if (final) { finalDeadline = state.closing_until; state.closing_final_started = true; }
+    handoffRun = state.reply_handoff?.run;
+    if (final && !handoffRun) { finalDeadline = state.closing_until; state.closing_final_started = true; }
     checkedWatcher = current;
     schedule();
     startLoad = sampleLoad();
@@ -244,12 +267,16 @@ export async function tickOne(id: string): Promise<void> {
   const currentDefinition = loadWatcher(id);
   const current = currentDefinition && pollingWatcher(currentDefinition, fresh);
   if (!current || !checking(fresh)) return;
-  const ackRun = () => { try { if (sameInstance()) writeFileSync(join(watcherDir(id), RUN_OK_FILE), `${runId}\n`); } catch { /* removed mid-run */ } };
+  const ackRun = () => { try { acknowledgeRun(id, instance, runId); } catch { /* retry a recorded handoff on the next tick */ } };
   if (fresh.status === "closing" && checkedWatcher?.check !== current.check) {
+    // Only the reply-only command may recover helper output. Keep its original delivery identity
+    // until that poll succeeds, so an unacked outbox cannot cross recipients after a retarget.
+    if (checkedWatcher?.inflight_check) {
+      fresh.reply_handoff ??= { run: runId, watcher: { ...checkedWatcher, check: checkedWatcher.inflight_check } };
+    } else fresh.discarded_run = runId;
     fresh.next_at = 0;
     saveState(id, fresh);
-    // The canceled normal command must not replay its helper outbox through the reply-only command.
-    ackRun();
+    if (!checkedWatcher?.inflight_check) ackRun();
     log(id, "normal check completed after removal; only the configured in-flight check may emit during grace");
     return;
   }
@@ -336,13 +363,17 @@ export async function tickOne(id: string): Promise<void> {
   delete fresh.failure_escalated;
   delete fresh.last_error;
   delete fresh.failing_since;
+  if (handoffRun && fresh.reply_handoff?.run === handoffRun) {
+    fresh.reply_handoff.accepted_run = runId;
+    fresh.next_at = 0;
+  }
   const { event, urgent } = checkEvent(result.stdout);
   if (!event) {
     saveState(id, fresh); ackRun();
     if (fresh.status === "closing" && fresh.closing_final_check && !fresh.batch) finalizeClosing(id);
     return;
   }
-  queueEvent(checkedWatcher!, fresh, event, urgent);
+  queueEvent(checkedWatcher!, fresh, event, urgent, !!handoffRun);
   saveState(id, fresh);
   ackRun();
   log(id, `event: ${event.slice(0, 500)}`);

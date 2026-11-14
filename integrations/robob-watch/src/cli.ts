@@ -252,7 +252,7 @@ async function main(argv: string[]): Promise<void> {
       const state = loadState(w.id);
       const current = pollingWatcher(w, state);
       if (!current) throw new CliError("No in-flight reply check configured for this closing watcher");
-      const result = await scratchRun(current, state.status === "closing");
+      const result = await scratchRun(current, state.status === "closing" || !!state.reply_handoff);
       console.log(JSON.stringify({ id: w.id, exit: result.code, timedOut: result.timedOut, seconds: Math.round(result.ms / 100) / 10, fires: !!result.stdout.trim() && result.code === 0,
         stdout: result.stdout.trim(), stderr: result.stderr.trim().slice(-1000) }, null, 2));
       if (result.code !== 0 || result.timedOut) process.exitCode = 1;

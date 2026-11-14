@@ -10,12 +10,13 @@ async function scenario(body: string) {
 if(existsSync(${JSON.stringify(join(root, "fail"))})) process.exit(1);
 appendFileSync(${JSON.stringify(join(root, "calls"))}, JSON.stringify(process.argv.slice(2))+"\\n"); console.log("ok");`);
   const source = `
-    import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+    import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
     import { join } from "node:path";
     const root = ${JSON.stringify(root)};
     process.env.ROBOB_TEST = "1";
     delete process.env.ROBOB_WATCH_TEST_BATCH_MS;
     process.env.ROBOB_WATCH_ROOT = root;
+    process.env.WACLI_STORE_DIR = join(root,"wacli");
     process.env.ROBOB_WATCH_LOAD_OVERRIDE = "0.1";
     process.env.ROBOB_WATCH_BRIDGE_DB = join(root, "bridge.sqlite");
     const { Database } = await import("bun:sqlite");
@@ -47,6 +48,22 @@ appendFileSync(${JSON.stringify(join(root, "calls"))}, JSON.stringify(process.ar
     function addReplyWatcher(id, extra={}) {
       const replyCheck=extra.check ?? 'if [[ -f event ]]; then cat event; rm event; fi; true';
       add(id,{...extra,inflight_check:extra.inflight_check ?? replyCheck});
+    }
+    function setupWhatsApp() {
+      const store=process.env.WACLI_STORE_DIR; mkdirSync(store,{recursive:true}); mkdirSync(lib.HELPERS,{recursive:true});
+      for(const helper of ["whatsapp-new-message","wa-db"]) writeFileSync(join(lib.HELPERS,helper),readFileSync(join(${JSON.stringify(join(import.meta.dir,"../helpers"))},helper)),{mode:0o755});
+      const db=new Database(join(store,"wacli.db"));
+      db.exec('create table contacts (jid text primary key, phone text, push_name text, full_name text, first_name text, business_name text, system_name text, updated_at int); create table contact_aliases (jid text primary key, alias text, notes text, updated_at int); create table chats (jid text primary key, kind text, name text, last_message_ts int, unread_count int default 0); create table messages (rowid integer primary key autoincrement, chat_jid text, chat_name text, msg_id text, sender_jid text, sender_name text, ts int, from_me int, text text, display_text text, media_type text, media_caption text, filename text, reaction_emoji text, edited int default 0, edited_ts int default 0, revoked int default 0, deleted_at int, unique(chat_jid,msg_id))');
+      const jid="971500000001@s.whatsapp.net";
+      db.query("insert into contacts values (?,?,'Provider','','','','',0)").run(jid,"971500000001");
+      const session=new Database(join(store,"session.db")); session.exec("create table whatsmeow_lid_map (lid text primary key,pn text unique not null)"); session.close();
+      writeFileSync(join(store,"LOCK"),"pid="+process.pid+"\\n");
+      let n=0;
+      return { poll:shell([join(lib.HELPERS,"whatsapp-new-message"),jid]),
+        insert(text){db.query("insert into messages (chat_jid,msg_id,sender_jid,ts,from_me,text,display_text) values (?,?,?,?,0,?,?)").run(jid,"reply-"+(++n),jid,Math.floor(new Date().getTime()/1000),text,text)},
+        outbox(id){return join(lib.watcherDir(id),"wadb-971500000001.json.outbox")},
+        prime(id){const r=Bun.spawnSync([join(lib.HELPERS,"whatsapp-new-message"),jid],{env:{...process.env,WATCH_DIR:lib.watcherDir(id),WATCH_RUN:"baseline"}}); if(r.exitCode)throw new Error(r.stderr.toString()); writeFileSync(join(lib.watcherDir(id),".run-ok"),"baseline\\n")}
+      };
     }
     const state = id => lib.loadState(id);
     const sent = () => existsSync(calls) ? readFileSync(calls,"utf8").trim().split("\\n").filter(Boolean).map(JSON.parse) : [];
@@ -577,7 +594,7 @@ for (const [before, after] of [[undefined,"moni"],["moni",undefined],["moni","fa
   }
 }
 
-test("a canceled normal command acknowledges its outbox before reply-only recovery", async () => {
+test("a canceled wrapper hands its outbox to the reply-only command without relaying wrapper stdout", async () => {
   const result = await scenario(`
     const script=join(root,"poll.sh"); const poll="zsh "+shell([script]);
     writeFileSync(script,[
@@ -586,17 +603,74 @@ test("a canceled normal command acknowledges its outbox before reply-only recove
       'rm outbox outbox-run; fi',
       'if [[ -f event ]]; then mv event outbox; echo "$WATCH_RUN" > outbox-run; cat outbox; fi'
     ].join("\\n"));
-    add("discard-outbox",{check:poll+'; '+cliShell+' rm discard-outbox >/dev/null',inflight_check:poll});
-    await fire("discard-outbox","canceled-normal-output");
+    add("discard-outbox",{check:poll+'; '+cliShell+' rm discard-outbox >/dev/null; echo canceled-normal-output',inflight_check:poll});
+    await fire("discard-outbox","provider-reply");
     lib.saveState("discard-outbox",{...state("discard-outbox"),closing_until:clock+900000});
     clock+=5000; await tickOne("discard-outbox");
-    await fire("discard-outbox","new-reply",5000); clock+=150000; await tickOne("discard-outbox");
+    clock+=150000; await tickOne("discard-outbox");
     console.log(JSON.stringify({sent:sent()}));
   `);
   expect(result.sent).toHaveLength(1);
-  expect(result.sent[0].join(" ")).toContain("new-reply");
+  expect(result.sent[0].join(" ")).toContain("provider-reply");
   expect(result.sent[0].join(" ")).not.toContain("canceled-normal-output");
 });
+
+for(const options of [
+  {before:null,after:null}, {before:"moni",after:"moni"},
+  {before:null,after:"moni"}, {before:"moni",after:null},
+  {before:"moni",after:"family-trip"}, {before:"family-trip",after:"moni"},
+  {before:null,after:null,mode:"notify"},
+  {before:null,after:"moni",retry:true},
+  {before:null,after:"moni",boundary:true},
+  {before:null,after:"moni",resume:true},
+  {before:null,after:"moni",silent:true},
+  {before:null,after:"moni",ackFail:true}
+]) {
+  test(`shipped poller handoff ${options.before ?? "owner"} -> ${options.after ?? "owner"} ${options.mode ?? "wake"} retry=${!!options.retry} boundary=${!!options.boundary} resume=${!!options.resume} silent=${!!options.silent} ackFail=${!!options.ackFail}`, async()=>{
+    const result=await scenario(`
+      const options=${JSON.stringify(options)}; const wa=setupWhatsApp();
+      const reply='[[ "$WATCH_CLOSING" = 1 ]] || exit 8; [[ ! -f reply-fail ]] || exit 7; '+wa.poll+(options.ackFail?'; if [[ ! -f blocked-ack ]]; then touch blocked-ack; rm .run-ok; mkdir .run-ok; fi':'');
+      const replacement=join(root,"replacement.json");
+      const check=wa.poll+(options.silent?' >/dev/null':'')+'; '+cliShell+' add --json '+shell([replacement])+' --replace >/dev/null; '+cliShell+' rm handoff >/dev/null; echo arbitrary-canceled-normal-output';
+      add("handoff",{check,inflight_check:reply,context:"original-private-context",mode:options.mode??"wake",...(options.before?{chat:options.before}:{})});
+      const next={...lib.loadWatcher("handoff"),context:"replacement-private-context"};
+      if(options.after)next.chat=options.after; else delete next.chat;
+      writeFileSync(replacement,JSON.stringify(next));
+      wa.prime("handoff"); wa.insert("provider-reply-before-remove");
+      await tickOne("handoff");
+      const old=JSON.parse(readFileSync(wa.outbox("handoff"),"utf8"));
+      const ackBefore=readFileSync(join(lib.watcherDir("handoff"),".run-ok"),"utf8").trim();
+      lib.saveState("handoff",{...state("handoff"),closing_until:clock+900000});
+      if(options.resume){lib.editWatcher("handoff",w=>({...w,check:wa.poll})); cli("resume","handoff"); const scratch=JSON.parse(cli("test","handoff")); if(scratch.exit!==0)throw new Error("handoff scratch failed")}
+      if(options.retry){writeFileSync(join(lib.watcherDir("handoff"),"reply-fail"),""); await tickOne("handoff"); rmSync(join(lib.watcherDir("handoff"),"reply-fail")); clock+=5000}
+      if(options.boundary)clock+=900000;
+      const restarted=await import(${JSON.stringify(join(import.meta.dir,"../src/runner.ts"))}+"?handoff-restart");
+      await restarted.tickOne("handoff");
+      const replayed=existsSync(wa.outbox("handoff"))?JSON.parse(readFileSync(wa.outbox("handoff"),"utf8")):null;
+      if(options.ackFail){if(state("handoff").reply_handoff?.accepted_run!==replayed.run)throw new Error("acceptance not recorded"); rmSync(join(lib.watcherDir("handoff"),".run-ok"),{recursive:true}); await restarted.tickOne("handoff")}
+      const ackAfter=readFileSync(join(lib.watcherDir("handoff"),".run-ok"),"utf8").trim();
+      clock+=150000; await restarted.tickOne("handoff"); clock+=5000; await restarted.tickOne("handoff");
+      const first=sent();
+      if(!options.boundary){wa.insert("provider-reply-after-handoff"); clock+=5000; await restarted.tickOne("handoff"); clock+=150000; await restarted.tickOne("handoff")}
+      console.log(JSON.stringify({old,ackBefore,replayed,ackAfter,first,sent:sent()}));
+    `);
+    expect(result.ackBefore).not.toBe(result.old.run);
+    expect(result.replayed?.run).not.toBe(result.old.run);
+    expect(result.ackAfter).toBe(result.replayed?.run);
+    expect(result.first).toHaveLength(1);
+    const first=result.first[0];
+    if(options.before)expect(first[first.indexOf("--chat")+1]).toBe(options.before); else expect(first).not.toContain("--chat");
+    expect(first.join(" ")).toContain("provider-reply-before-remove");
+    expect(first.join(" ")).not.toContain("arbitrary-canceled-normal-output");
+    if(!options.mode){expect(first.join(" ")).toContain("original-private-context"); expect(first.join(" ")).not.toContain("replacement-private-context")}
+    if(!options.boundary){
+      expect(result.sent).toHaveLength(2); const second=result.sent[1];
+      if(options.after)expect(second[second.indexOf("--chat")+1]).toBe(options.after); else expect(second).not.toContain("--chat");
+      expect(second.join(" ")).toContain("provider-reply-after-handoff");
+      expect(second.join(" ")).not.toContain("provider-reply-before-remove");
+    }
+  },20_000);
+}
 
 for (const mode of ["wake","notify"]) {
   for (const removal of ["ordinary","now","reply-now"]) {
@@ -624,6 +698,95 @@ for (const mode of ["wake","notify"]) {
       expect(result.sent[0].join(" ")).toContain("replacement-output");
       expect(result.sent[0].join(" ")).not.toContain("canceled-output");
       expect(result.state.fires).toBe(1);
+    });
+  }
+}
+
+for (const ownChecker of [false,true]) {
+  test(`handoff uses only the admitted reply checker, configured=${ownChecker}`,async()=>{
+    const result=await scenario(`
+      const replacement=join(root,"replacement.json");
+      const oldReply='echo admitted-private-reply';
+      add("checker-owner",{context:"admitted-context",${ownChecker?'inflight_check:oldReply,':''}check:cliShell+' add --json '+shell([replacement])+' --replace >/dev/null; '+cliShell+' rm checker-owner >/dev/null; echo canceled-stdout'});
+      writeFileSync(replacement,JSON.stringify({...lib.loadWatcher("checker-owner"),chat:"moni",context:"replacement-context",inflight_check:'echo replacement-private-reply'}));
+      await tickOne("checker-owner"); const handoff=state("checker-owner").reply_handoff;
+      lib.saveState("checker-owner",{...state("checker-owner"),closing_until:clock+900000});
+      await tickOne("checker-owner"); clock+=150000; await tickOne("checker-owner");
+      console.log(JSON.stringify({handoff,sent:sent()}));
+    `);
+    expect(!!result.handoff).toBe(ownChecker);
+    expect(result.sent).toHaveLength(1);
+    const args=result.sent[0];
+    if(ownChecker){expect(args).not.toContain("--chat");expect(args.join(" ")).toContain("admitted-private-reply");expect(args.join(" ")).not.toContain("replacement-private-reply")}
+    else{expect(args[args.indexOf("--chat")+1]).toBe("moni");expect(args.join(" ")).toContain("replacement-private-reply");expect(args.join(" ")).not.toContain("admitted-private-reply")}
+    expect(args.join(" ")).not.toContain("canceled-stdout");
+  });
+}
+
+for(const repair of ["ack-file","recorded-crash"]) {
+  test(`discarded shared-poller output is acknowledged before replacement recovery (${repair})`,async()=>{
+    const result=await scenario(`
+      const wa=setupWhatsApp(); const replacement=join(root,"replacement.json");
+      add("discard-repair",{check:wa.poll+'; '+cliShell+' add --json '+shell([replacement])+' --replace >/dev/null; '+cliShell+' rm discard-repair >/dev/null; rm .run-ok; mkdir .run-ok'});
+      writeFileSync(replacement,JSON.stringify({...lib.loadWatcher("discard-repair"),chat:"moni",context:"new-recipient-context",inflight_check:wa.poll}));
+      wa.prime("discard-repair"); wa.insert("canceled-old-recipient-reply"); await tickOne("discard-repair");
+      const obligation=state("discard-repair").discarded_run;
+      await tickOne("discard-repair"); const blocked=sent();
+      rmSync(join(lib.watcherDir("discard-repair"),".run-ok"),{recursive:true});
+      if(${JSON.stringify(repair)}==="recorded-crash")writeFileSync(join(lib.watcherDir("discard-repair"),".run-ok"),"baseline");
+      lib.saveState("discard-repair",{...state("discard-repair"),closing_until:clock+900000});
+      wa.insert("replacement-recipient-reply");
+      const restarted=await import(${JSON.stringify(join(import.meta.dir,"../src/runner.ts"))}+"?discard-restart");
+      await restarted.tickOne("discard-repair"); clock+=150000; await restarted.tickOne("discard-repair");
+      console.log(JSON.stringify({obligation,blocked,sent:sent(),state:state("discard-repair")}));
+    `);
+    expect(result.obligation).toBeString();
+    expect(result.blocked).toEqual([]);
+    expect(result.state.discarded_run).toBeUndefined();
+    expect(result.sent).toHaveLength(1);
+    const args=result.sent[0]; expect(args[args.indexOf("--chat")+1]).toBe("moni");
+    expect(args.join(" ")).toContain("replacement-recipient-reply");
+    expect(args.join(" ")).not.toContain("canceled-old-recipient-reply");
+  },20_000);
+}
+
+test("a reply recovered into an existing batch retains its admitted context",async()=>{
+  const result=await scenario(`
+    add("context-handoff",{context:"context-A",inflight_check:'if [[ -f reply ]]; then cat reply; rm reply; fi; true'});
+    await fire("context-handoff","earlier-event");
+    lib.editWatcher("context-handoff",w=>({...w,context:"context-B",check:cliShell+' rm context-handoff >/dev/null; echo canceled-stdout'}));
+    writeFileSync(join(lib.watcherDir("context-handoff"),"reply"),"recovered-event");
+    clock+=5000; await tickOne("context-handoff");
+    lib.saveState("context-handoff",{...state("context-handoff"),closing_until:clock+900000});
+    await tickOne("context-handoff");
+    lib.editWatcher("context-handoff",w=>({...w,context:"context-C"}));
+    clock+=150000; await tickOne("context-handoff");
+    console.log(JSON.stringify({sent:sent()}));
+  `);
+  expect(result.sent).toHaveLength(1);
+  const text=result.sent[0].join(" ");
+  for(const expected of ["earlier-event","recovered-event","context-B"])expect(text).toContain(expected);
+  for(const unwanted of ["context-A","context-C","canceled-stdout"])expect(text).not.toContain(unwanted);
+});
+
+for(const mode of ["notify","wake"]) {
+  for(const limits of [[1,0],[3,2],[0,1]]) {
+    test(`resumed ${mode} recovery honors the current fire limit ${limits[0]} -> ${limits[1]}`,async()=>{
+      const result=await scenario(`
+        const event=${JSON.stringify(JSON.stringify({urgent:true,event:"recovered-reply"}))};
+        add("limit-handoff",{mode:${JSON.stringify(mode)},max_fires:${limits[0]},inflight_check:'if [[ -f reply ]]; then cat reply; rm reply; fi; true',check:cliShell+' rm limit-handoff >/dev/null; echo canceled-stdout'});
+        await tickOne("limit-handoff");
+        lib.editWatcher("limit-handoff",w=>({...w,max_fires:${limits[1]},check:'if [[ -f event ]]; then cat event; rm event; fi; true'}));
+        cli("resume","limit-handoff");
+        writeFileSync(join(lib.watcherDir("limit-handoff"),"reply"),event);
+        await tickOne("limit-handoff"); const recovered=state("limit-handoff");
+        await fire("limit-handoff",JSON.stringify({urgent:true,event:"normal-after-resume"}),5000);
+        console.log(JSON.stringify({recovered,sent:sent(),state:state("limit-handoff")}));
+      `);
+      expect(result.recovered.fires).toBe(1);
+      expect(result.recovered.status).toBe(limits[1]===1?"done":"active");
+      expect(result.sent).toHaveLength(limits[1]===1?1:2);
+      expect(result.sent[0].join(" ")).toContain("recovered-reply");
     });
   }
 }
