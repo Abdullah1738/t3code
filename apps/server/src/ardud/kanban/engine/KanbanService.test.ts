@@ -16574,11 +16574,24 @@ const groupAsks = (asked: ReadonlyArray<string>) =>
 const goalAsks = (asked: ReadonlyArray<string>) =>
   asked.filter((prompt) => prompt.startsWith("You keep a work board's goals"));
 
+interface ScribeCall {
+  readonly prompt: string;
+  readonly fiber: Fiber.Fiber<unknown, unknown>;
+  readonly release: Deferred.Deferred<void>;
+}
+
+const finishScribeCall = (call: ScribeCall) =>
+  Deferred.succeed(call.release, undefined).pipe(
+    Effect.andThen(Fiber.await(call.fiber)),
+    Effect.tap((exit) => Effect.sync(() => assert.isTrue(Exit.isSuccess(exit)))),
+    Effect.asVoid,
+  );
+
 const scribeLayer = (
   fake: Layer.Layer<KanbanThreads>,
   asked: Array<string>,
   failures = 0,
-  calls?: Queue.Queue<string>,
+  calls?: Queue.Queue<ScribeCall>,
   goalFailures = 0,
   proposalHold?: Deferred.Deferred<void>,
 ) =>
@@ -16593,7 +16606,16 @@ const scribeLayer = (
         generateJson: ((input: { readonly prompt: string }) =>
           Effect.gen(function* () {
             asked.push(input.prompt);
-            if (calls) yield* Queue.offer(calls, input.prompt);
+            // A reply written during the launching tick can trigger its timed conflict retry.
+            if (calls) {
+              const release = yield* Deferred.make<void>();
+              yield* Queue.offer(calls, {
+                prompt: input.prompt,
+                fiber: yield* Effect.fiber,
+                release,
+              });
+              yield* Deferred.await(release);
+            }
             if (input.prompt.startsWith("You suggest goals")) {
               if (proposalHold) yield* Deferred.await(proposalHold);
               return {
@@ -16839,7 +16861,7 @@ it.effect("a failed scribe run is retried after the cooldown, even with cards un
   Effect.gen(function* () {
     const fake = yield* makeFake;
     const asked: Array<string> = [];
-    const calls = yield* Queue.unbounded<string>();
+    const calls = yield* Queue.unbounded<ScribeCall>();
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
       const changes = yield* kanban.changes;
@@ -16859,7 +16881,7 @@ it.effect("a failed scribe run is retried after the cooldown, even with cards un
 
       // The first model call fails: no groups land and the board is not marked done.
       yield* kanban.tick;
-      yield* Queue.take(calls);
+      yield* finishScribeCall(yield* Queue.take(calls));
       assert.lengthOf(groupAsks(asked), 1);
       assert.lengthOf((yield* kanban.snapshot(board.id)).groups, 0);
 
@@ -16871,7 +16893,7 @@ it.effect("a failed scribe run is retried after the cooldown, even with cards un
       yield* TestClock.adjust("10 minutes");
       const retried = yield* (yield* grouped).pipe(Effect.forkScoped);
       yield* kanban.tick;
-      yield* Queue.take(calls);
+      yield* finishScribeCall(yield* Queue.take(calls));
       assert.isTrue(Option.isSome(yield* Fiber.join(retried)));
       assert.lengthOf(groupAsks(asked), 2);
       assert.lengthOf((yield* kanban.snapshot(board.id)).groups, 1);
@@ -16923,7 +16945,7 @@ it.effect("a failed goal scribe run is retried after the cooldown, even with car
   Effect.gen(function* () {
     const fake = yield* makeFake;
     const asked: Array<string> = [];
-    const calls = yield* Queue.unbounded<string>();
+    const calls = yield* Queue.unbounded<ScribeCall>();
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
       const login = yield* kanban.setGoal(board.id, { name: "Login" });
@@ -16939,7 +16961,11 @@ it.effect("a failed goal scribe run is retried after the cooldown, even with car
 
       // The first goal call fails; no Now lands and the attempt is not marked done.
       yield* kanban.tick;
-      yield* Queue.take(calls);
+      // The tick also forks grouping; both writers must finish before another tick.
+      const first = yield* Queue.take(calls);
+      const second = yield* Queue.take(calls);
+      yield* finishScribeCall(first);
+      yield* finishScribeCall(second);
       assert.lengthOf(goalAsks(asked), 1);
       assert.strictEqual((yield* kanban.snapshot(board.id)).goals[0]?.now, null);
 
@@ -16951,7 +16977,7 @@ it.effect("a failed goal scribe run is retried after the cooldown, even with car
       yield* TestClock.adjust("10 minutes");
       const written = yield* (yield* goalChange).pipe(Effect.forkScoped);
       yield* kanban.tick;
-      yield* Queue.take(calls);
+      yield* finishScribeCall(yield* Queue.take(calls));
       assert.isTrue(Option.isSome(yield* Fiber.join(written)));
       assert.lengthOf(goalAsks(asked), 2);
       assert.strictEqual(
@@ -16967,8 +16993,8 @@ it.effect("a failed goal scribe run is retried after the cooldown, even with car
 const WRITER_PREFIX = "Write a card title and description";
 interface HeldModel {
   readonly seen: Array<{ readonly prompt: string; readonly timeoutMs: unknown }>;
-  readonly started: Queue.Queue<string>;
-  readonly release: Deferred.Deferred<void>;
+  readonly started: Queue.Queue<ScribeCall>;
+  release: Deferred.Deferred<void>;
   fail: boolean;
   goalsReply?: (prompt: string) => unknown;
 }
@@ -16978,7 +17004,7 @@ const makeHeldModel = (held: boolean) =>
     if (!held) yield* Deferred.succeed(release, undefined);
     const model: HeldModel = {
       seen: [],
-      started: yield* Queue.unbounded<string>(),
+      started: yield* Queue.unbounded<ScribeCall>(),
       release,
       fail: false,
     };
@@ -16996,7 +17022,11 @@ const heldScribeLayer = (fake: Layer.Layer<KanbanThreads>, model: HeldModel) =>
         generateJson: ((input: { readonly prompt: string; readonly timeoutMs?: unknown }) =>
           Effect.gen(function* () {
             model.seen.push({ prompt: input.prompt, timeoutMs: input.timeoutMs });
-            yield* Queue.offer(model.started, input.prompt);
+            yield* Queue.offer(model.started, {
+              prompt: input.prompt,
+              fiber: yield* Effect.fiber,
+              release: model.release,
+            });
             yield* Deferred.await(model.release);
             if (model.fail) return yield* Effect.fail(new ModelDown());
             if (input.prompt.startsWith("You suggest goals")) return { proposals: [] };
@@ -17061,45 +17091,53 @@ it.effect("a groups or goals scribe call still running holds the next one back",
     const model = yield* makeHeldModel(true);
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
-      yield* kanban.setGoal(board.id, { name: "Login" });
+      // Keep goal-ideas proposals out of the captured scribe runs.
+      const login = yield* kanban.setGoal(board.id, { name: "Login" });
       for (const [prompt, title] of [
         ["A", "Login form"],
         ["B", "Login errors"],
       ] as const) {
-        yield* kanban.createCard(board.id, { prompt, title, description: "Sign-in" }, owner);
+        yield* kanban.createCard(
+          board.id,
+          { prompt, title, description: "Sign-in", goalId: login.id },
+          owner,
+        );
       }
       yield* kanban.tick;
-      yield* heldEventually(
-        Effect.sync(
-          () =>
-            asksOf(model, "You group").length === 1 &&
-            asksOf(model, "You keep a work board's goals").length === 1,
-        ),
-      );
+      const first = yield* Queue.take(model.started);
+      const second = yield* Queue.take(model.started);
+      assert.lengthOf(asksOf(model, "You group"), 1);
+      assert.lengthOf(asksOf(model, "You keep a work board's goals"), 1);
 
       // Past the cooldown with the cards changed, both calls are still out: no second run.
       yield* kanban.createCard(
         board.id,
-        { prompt: "C", title: "Login button", description: "Sign-in" },
+        { prompt: "C", title: "Login button", description: "Sign-in", goalId: login.id },
         owner,
       );
       for (const step of ["10 minutes", "25 minutes"] as const) {
         yield* TestClock.adjust(step);
         yield* kanban.tick;
-        yield* settleLive;
+        assert.strictEqual(yield* Queue.size(model.started), 0);
         assert.lengthOf(asksOf(model, "You group"), 1);
         assert.lengthOf(asksOf(model, "You keep a work board's goals"), 1);
       }
 
-      // The late answer still lands, and the guard lets the next due run start.
+      // Fiber completion includes persisted answers and release of both in-flight guards.
       yield* Deferred.succeed(model.release, undefined);
-      yield* heldEventually(
-        kanban.snapshot(board.id).pipe(Effect.map((snapshot) => snapshot.groups.length === 1)),
-      );
-      yield* settleLive;
+      yield* finishScribeCall(first);
+      yield* finishScribeCall(second);
+      assert.lengthOf((yield* kanban.snapshot(board.id)).groups, 1);
+      model.release = yield* Deferred.make<void>();
       yield* TestClock.adjust("10 minutes");
       yield* kanban.tick;
-      yield* heldEventually(Effect.sync(() => asksOf(model, "You group").length === 2));
+      const third = yield* Queue.take(model.started);
+      const fourth = yield* Queue.take(model.started);
+      yield* Deferred.succeed(model.release, undefined);
+      yield* finishScribeCall(third);
+      yield* finishScribeCall(fourth);
+      assert.lengthOf(asksOf(model, "You group"), 2);
+      assert.lengthOf(asksOf(model, "You keep a work board's goals"), 2);
     }).pipe(Effect.scoped, Effect.provide(heldScribeLayer(fake.layer, model)));
   }),
 );
@@ -17107,7 +17145,7 @@ it.effect("a groups or goals scribe call still running holds the next one back",
 it.effect("a failed groups or goals scribe call releases its in-flight guard", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
-    const model = yield* makeHeldModel(false);
+    const model = yield* makeHeldModel(true);
     model.fail = true;
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
@@ -17119,23 +17157,23 @@ it.effect("a failed groups or goals scribe call releases its in-flight guard", (
         yield* kanban.createCard(board.id, { prompt, title, description: "Sign-in" }, owner);
       }
       yield* kanban.tick;
-      yield* heldEventually(
-        Effect.sync(
-          () =>
-            asksOf(model, "You group").length === 1 &&
-            asksOf(model, "You keep a work board's goals").length === 1,
-        ),
-      );
-      yield* settleLive;
+      const first = yield* Queue.take(model.started);
+      const second = yield* Queue.take(model.started);
+      yield* Deferred.succeed(model.release, undefined);
+      yield* finishScribeCall(first);
+      yield* finishScribeCall(second);
+      assert.lengthOf(asksOf(model, "You group"), 1);
+      assert.lengthOf(asksOf(model, "You keep a work board's goals"), 1);
+      model.release = yield* Deferred.make<void>();
       yield* TestClock.adjust("10 minutes");
       yield* kanban.tick;
-      yield* heldEventually(
-        Effect.sync(
-          () =>
-            asksOf(model, "You group").length === 2 &&
-            asksOf(model, "You keep a work board's goals").length === 2,
-        ),
-      );
+      const third = yield* Queue.take(model.started);
+      const fourth = yield* Queue.take(model.started);
+      yield* Deferred.succeed(model.release, undefined);
+      yield* finishScribeCall(third);
+      yield* finishScribeCall(fourth);
+      assert.lengthOf(asksOf(model, "You group"), 2);
+      assert.lengthOf(asksOf(model, "You keep a work board's goals"), 2);
     }).pipe(Effect.scoped, Effect.provide(heldScribeLayer(fake.layer, model)));
   }),
 );
