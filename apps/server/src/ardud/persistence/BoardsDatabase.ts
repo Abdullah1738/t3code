@@ -13,7 +13,7 @@ import * as ServerConfig from "../../config.ts";
 import { ensureRunFollowTables } from "../schedules/runFollow.ts";
 import { controlDDL, controlTables } from "./boardsSchema.ts";
 import { ensureKanbanCacheVersions } from "./kanbanCacheVersions.ts";
-import { kanbanDDL } from "./kanbanSchema.ts";
+import { initializeKanbanSchema } from "./kanbanSchema.ts";
 import { withStartupPhase } from "../observability/StartupPhaseLog.ts";
 import { BOARDS_READER_LANES, readerLaneOptions } from "./readerLanes.ts";
 
@@ -216,7 +216,9 @@ export const layerFromPaths = (dbPath: string, legacyPath: string) =>
         yield* raw`PRAGMA synchronous = NORMAL`;
         yield* raw`PRAGMA checkpoint_fullfsync = ON`;
         yield* raw`PRAGMA journal_size_limit = 33554432`;
-        yield* Effect.forEach([markerDDL, ...kanbanDDL, ...controlDDL], (ddl) => raw.unsafe(ddl), {
+        yield* raw.unsafe(markerDDL);
+        yield* initializeKanbanSchema(raw);
+        yield* Effect.forEach(controlDDL, (ddl) => raw.unsafe(ddl), {
           discard: true,
         });
         yield* ensureKanbanCacheVersions(raw);

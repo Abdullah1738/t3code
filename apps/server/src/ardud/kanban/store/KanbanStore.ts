@@ -32,7 +32,7 @@ import {
 import { makeDecodeCache } from "./decodeCache.ts";
 import { SummaryCard } from "./summaryCard.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
-import { kanbanDDL } from "../../persistence/kanbanSchema.ts";
+import { initializeKanbanSchema } from "../../persistence/kanbanSchema.ts";
 import { ensureKanbanCacheVersions } from "../../persistence/kanbanCacheVersions.ts";
 
 export class KanbanStoreError extends Schema.TaggedError<KanbanStoreError>()("KanbanStoreError", {
@@ -362,7 +362,7 @@ const make = Effect.gen(function* () {
   };
 
   yield* BoardsDatabase.initialize(
-    Effect.forEach(kanbanDDL, (statement) => sql.unsafe(statement), { discard: true }).pipe(
+    initializeKanbanSchema(sql).pipe(
       Effect.andThen(ensureKanbanCacheVersions(sql)),
     ),
   ).pipe(Effect.mapError(fail("create tables")));
@@ -586,12 +586,22 @@ const make = Effect.gen(function* () {
       "read dispatch cards",
       Effect.flatMap(
         sql<KeyedJsonRow>`
-          SELECT id, board_id, cache_version, json FROM ardud_kanban_cards
-          WHERE board_id = ${boardId} AND json_extract(json, '$.settledAt') IS NULL
+          SELECT id, board_id, cache_version, json, number
+          FROM ardud_kanban_cards INDEXED BY ardud_kanban_cards_dispatch
+          WHERE board_id = ${boardId}
             AND (stage IN ('todo', 'working', 'needs_review', 'in_review')
-              OR json_extract(json, '$.wait') IS NOT NULL
-              OR json_extract(json, '$.deciding') IS NOT NULL
               OR active_thread_id IS NOT NULL)
+            AND json_extract(json, '$.settledAt') IS NULL
+          UNION ALL
+          -- Waits/deciding exist only in JSON. Read those exceptions from the existing
+          -- open-card index, keeping settled history out of both the read and boot DDL.
+          SELECT id, board_id, cache_version, json, number
+          FROM ardud_kanban_cards INDEXED BY ardud_kanban_cards_open
+          WHERE board_id = ${boardId} AND json_extract(json, '$.settledAt') IS NULL
+            AND NOT (stage IN ('todo', 'working', 'needs_review', 'in_review')
+              OR active_thread_id IS NOT NULL)
+            AND (json_extract(json, '$.wait') IS NOT NULL
+              OR json_extract(json, '$.deciding') IS NOT NULL)
           ORDER BY number
         `,
         (rows) => decodeAll(rows, decoders.card),

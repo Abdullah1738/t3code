@@ -16,6 +16,44 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as BoardsDatabase from "./BoardsDatabase.ts";
 import { listDueTasks } from "../../scheduledTasks/ScheduledTaskService.ts";
 import { controlDDL } from "./boardsSchema.ts";
+import { initializeKanbanSchema } from "./kanbanSchema.ts";
+
+it.effect(
+  "prepares legacy board index pages outside a transaction and skips repeat preparation",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`CREATE TABLE ardud_kanban_cards (
+      id TEXT PRIMARY KEY, board_id TEXT, number INTEGER, stage TEXT,
+      active_thread_id TEXT, json TEXT
+    )`;
+      yield* sql`INSERT INTO ardud_kanban_cards VALUES
+      ('card', 'board', 1, 'todo', NULL, json_object('settledAt', NULL, 'padding', printf('%0102400d', 0)))`;
+      const queries: Array<{ text: string; transaction: boolean }> = [];
+      const observe: Statement.Transformer = (statement) =>
+        Effect.gen(function* () {
+          queries.push({
+            text: statement.compile()[0],
+            transaction: (yield* Effect.serviceOption(sql.transactionService))._tag === "Some",
+          });
+          return statement;
+        });
+      const initialize = initializeKanbanSchema(sql).pipe(
+        Effect.provideService(Statement.CurrentTransformer, observe),
+      );
+      yield* initialize;
+      const reads = queries.filter(({ text }) => text.includes("NOT INDEXED"));
+      assert.lengthOf(reads, 1);
+      assert.isFalse(reads[0]!.transaction);
+      assert.isBelow(
+        queries.indexOf(reads[0]!),
+        queries.findIndex(({ text }) => text.startsWith("CREATE")),
+      );
+      queries.length = 0;
+      yield* initialize;
+      assert.isFalse(queries.some(({ text }) => text.includes("NOT INDEXED")));
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+);
 
 const fixture = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
