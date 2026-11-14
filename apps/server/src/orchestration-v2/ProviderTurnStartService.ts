@@ -235,6 +235,21 @@ export const layer: Layer.Layer<
             Effect.catchCause(() => Effect.succeed(input.inheritedBackgroundTurnItems)),
           ),
         shouldStartProviderTurn: () => isCurrentAttemptInStatus("running"),
+        loadRunInterruptReason: () =>
+          projectionStore
+            .getThreadRecords(input.threadId, ["turnItems"], {
+              turnItemRunIds: [input.runId],
+              turnItemTypes: ["run_interrupt_request"],
+            })
+            .pipe(
+              Effect.map(({ turnItems }) => {
+                const reason = turnItems.find(
+                  (item) => item.type === "run_interrupt_request",
+                )?.message;
+                return reason === "Interrupt requested" ? undefined : reason;
+              }),
+              Effect.catchCause(() => Effect.succeed(undefined)),
+            ),
         shouldFinalizeRun: () =>
           projectionStore
             .getRunControlState(input.threadId, input.runId)
@@ -374,6 +389,23 @@ export const layer: Layer.Layer<
             }),
       };
     };
+
+    // Restart workers keep this session too; its callbacks must not capture startup's projection.
+    const makeResumedSession = (session: ProviderAdapter.ProviderAdapterV2SessionRuntime) => ({
+      ...session,
+      startTurn: (input: Parameters<typeof session.startTurn>[0]) =>
+        Effect.sync(() => markInstallLifecycle("firstResumedProviderRequestAt")).pipe(
+          Effect.andThen(session.startTurn(input)),
+        ),
+      ...(session.compactThread === undefined
+        ? {}
+        : {
+            compactThread: (input: Parameters<typeof session.startTurn>[0]) =>
+              Effect.sync(() => markInstallLifecycle("firstResumedProviderRequestAt")).pipe(
+                Effect.andThen(session.compactThread!(input)),
+              ),
+          }),
+    });
 
     const start = Effect.fn("orchestrationV2.providerTurnStart.start")(function* (input: {
       readonly threadId: ThreadId;
@@ -846,7 +878,7 @@ export const layer: Layer.Layer<
       }
       const session = makeRecoverySession(
         sessionResult.success,
-        () => isCurrentAttemptInStatus("running"),
+        runControls.shouldStartProviderTurn,
         isAutomaticClaudeRecovery(sessionResult.success.driver, run)
           ? runControls.loadRecoveryAdmission
           : undefined,
@@ -1767,21 +1799,7 @@ export const layer: Layer.Layer<
         session:
           run.restartContinuationOfRunId === undefined && !isRecoveredQueueRun(run.id)
             ? deliverySession
-            : {
-                ...deliverySession,
-                startTurn: (input) =>
-                  Effect.sync(() => markInstallLifecycle("firstResumedProviderRequestAt")).pipe(
-                    Effect.andThen(deliverySession.startTurn(input)),
-                  ),
-                ...(deliverySession.compactThread === undefined
-                  ? {}
-                  : {
-                      compactThread: (input: Parameters<typeof deliverySession.startTurn>[0]) =>
-                        Effect.sync(() =>
-                          markInstallLifecycle("firstResumedProviderRequestAt"),
-                        ).pipe(Effect.andThen(deliverySession.compactThread!(input))),
-                    }),
-              },
+            : makeResumedSession(deliverySession),
         run: runningRun,
         rootNode: runningRootNode,
         checkpointScope,
@@ -1815,21 +1833,7 @@ export const layer: Layer.Layer<
         loadRecoveryAdmission: runControls.loadRecoveryAdmission,
         shouldFinalizeRun: runControls.shouldFinalizeRun,
         hasUnpairedRunInterruptRequest: runControls.hasUnpairedRunInterruptRequest,
-        loadRunInterruptReason: () =>
-          projectionStore
-            .getThreadRecords(input.threadId, ["turnItems"], {
-              turnItemRunIds: [run.id],
-              turnItemTypes: ["run_interrupt_request"],
-            })
-            .pipe(
-              Effect.map(({ turnItems }) => {
-                const reason = turnItems.find(
-                  (item) => item.type === "run_interrupt_request",
-                )?.message;
-                return reason === "Interrupt requested" ? undefined : reason;
-              }),
-              Effect.catchCause(() => Effect.succeed(undefined)),
-            ),
+        loadRunInterruptReason: runControls.loadRunInterruptReason,
         message: {
           messageId: message.id,
           text:
