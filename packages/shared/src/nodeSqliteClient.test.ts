@@ -94,6 +94,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
             let nextPause;
             let metadataFailures = 0;
             let attachmentMetadataFailures = 0;
+            let attachmentDeferralFailures = 0;
             let timedSql;
             let virtualClock;
             const nativeNow = performance.now.bind(performance);
@@ -105,6 +106,10 @@ vi.mock("node:worker_threads", async (importOriginal) => {
               if (virtualClock !== undefined) {
                 if (sql === timedSql) virtualClock += 100;
                 if (sql.startsWith("SELECT name, type, sql FROM ")) virtualClock += 5000;
+              }
+              if (attachmentDeferralFailures > 0 && sql === "PRAGMA defer_foreign_keys") {
+                attachmentDeferralFailures--;
+                throw new Error("test attachment deferral metadata failure");
               }
               if (attachmentMetadataFailures > 0 && sql === "PRAGMA database_list") {
                 attachmentMetadataFailures--;
@@ -130,6 +135,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
               if (message.kind === "arm") { nextPause = message.args[0]; return; }
               if (message.kind === "fail-metadata") { metadataFailures = message.args[0]; return; }
               if (message.kind === "fail-attachments") { attachmentMetadataFailures = message.args[0]; return; }
+              if (message.kind === "fail-attachment-deferral") { attachmentDeferralFailures = message.args[0]; return; }
               if (message.kind === "time-prepare") { timedSql = message.args[0]; virtualClock = 0; return; }
               if (message.kind === "resume") {
                 pausedStatements.get(message.args[0])?.();
@@ -4125,18 +4131,104 @@ it.effect.each([-1, 0, 1048576, 9007199254740993n])(
 );
 
 it.effect.each(
+  (["scratch", "aux"] as const).flatMap((target) =>
+    (["scratch first", "aux first"] as const).flatMap((order) =>
+      (["table", "view"] as const).map((kind) => ({ target, order, kind })),
+    ),
+  ),
+)("restores a temp trigger on attached $target $kind ($order)", ({ target, order, kind }) =>
+  withFileClient((sql) =>
+    Effect.gen(function* () {
+      for (const schema of order === "scratch first" ? ["scratch", "aux"] : ["aux", "scratch"]) {
+        yield* sql.unsafe(`ATTACH DATABASE ':memory:' AS ${schema}`);
+        yield* sql.unsafe(`CREATE TABLE ${schema}.entries(value INTEGER)`);
+        yield* sql.unsafe(`CREATE VIEW ${schema}.entry_view AS SELECT value FROM entries`);
+      }
+      yield* sql`CREATE TEMP TABLE capture_log(value INTEGER)`;
+      const targetName = `${target}.${kind === "table" ? "entries" : "entry_view"}`;
+      yield* sql.unsafe(
+        `CREATE TEMP TRIGGER capture ${kind === "table" ? "AFTER" : "INSTEAD OF"} INSERT ON ${targetName} BEGIN INSERT INTO capture_log VALUES (new.value); END`,
+      );
+      yield* sql.unsafe(`INSERT INTO ${targetName} VALUES (1)`);
+      assert.deepEqual(yield* sql`SELECT value FROM temp.capture_log`.values, [[1]]);
+      yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+      yield* sql.unsafe(`INSERT INTO ${targetName} VALUES (2)`);
+      assert.deepEqual(yield* sql`SELECT value FROM temp.capture_log`.values, [[2]]);
+    }),
+  ),
+);
+
+it.effect.each([
+  "db.statement.execution_ms",
+  "db.execution.thread",
+  "db.transaction.control.commit_ms",
+  "db.transaction.control.commit_count",
+  "db.rows_returned",
+  "db.stmt_status.available",
+  "db.commit.at_ms",
+  "db.commit.duration_ms",
+  "db.commit.boundary",
+])("keeps worker acknowledgement and errors intact when %s annotation throws", (attribute) => {
+  let enabled = false;
+  let thrown = 0;
+  let commits = 0;
+  const tracer = Tracer.make({
+    span: (options) => {
+      const span = new Tracer.NativeSpan(options);
+      const annotate = span.attribute.bind(span);
+      span.attribute = (key, value) => {
+        annotate(key, value);
+        if (enabled && key === attribute) {
+          thrown++;
+          throw new Error("test annotation failure");
+        }
+      };
+      return span;
+    },
+  });
+  return withFileClient(
+    (sql) =>
+      Effect.gen(function* () {
+        yield* sql`CREATE TABLE annotation_entries(value INTEGER UNIQUE)`;
+        enabled = true;
+        yield* sql.withTransaction(sql`INSERT INTO annotation_entries VALUES (1)`).pipe(
+          Effect.provideService(SqliteClient.TransactionCommitObserver, () => {
+            commits++;
+          }),
+        );
+        assert.equal(commits, 1);
+        assert.isAbove(thrown, 0);
+        const failed = yield* sql`INSERT INTO annotation_entries VALUES (1)`.pipe(Effect.flip);
+        assert.equal(failed.reason._tag, "ConstraintError");
+        yield* sql`INSERT INTO annotation_entries VALUES (2)`;
+        enabled = false;
+        yield* Effect.promise(() => writerWorkers.at(-1)!.terminate());
+        assert.deepEqual(yield* sql`SELECT value FROM annotation_entries ORDER BY value`.values, [
+          [1],
+          [2],
+        ]);
+        assert.equal(commits, 1);
+      }),
+    { statementMetrics: true },
+  ).pipe(Effect.withTracer(tracer), Effect.provideService(Statement.SpanPropagationEnabled, true));
+});
+
+it.effect.each(
   (["attach", "detach"] as const).flatMap((operation) =>
     (["file", "memory"] as const).flatMap((target) =>
-      (["query", "attach", "detach", "crash"] as const).map((followup) => ({
-        operation,
-        target,
-        followup,
-      })),
+      (["query", "attach", "detach", "crash"] as const).flatMap((followup) =>
+        (["database list", "deferral"] as const).map((fault) => ({
+          operation,
+          target,
+          followup,
+          fault,
+        })),
+      ),
     ),
   ),
 )(
-  "reconciles $operation of $target after metadata failure before $followup",
-  ({ operation, target, followup }) =>
+  "reconciles $operation of $target after $fault metadata failure before $followup",
+  ({ operation, target, followup, fault }) =>
     withFileClient((sql, filename) =>
       Effect.gen(function* () {
         const attachment = target === "memory" ? ":memory:" : `${filename}.scratch`;
@@ -4146,10 +4238,15 @@ it.effect.each(
         }
         yield* sql`ATTACH DATABASE ${`${filename}.stable`} AS stable`;
         if (operation === "detach") yield* sql`ATTACH DATABASE ${attachment} AS scratch`;
+        if (fault === "deferral") yield* sql`PRAGMA defer_foreign_keys=ON`;
         const writer = writerWorkers.at(-1)!;
         const count = writerWorkers.length;
         // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
-        writer.postMessage({ testCheckpoint: true, kind: "fail-attachments", args: [1] });
+        writer.postMessage({
+          testCheckpoint: true,
+          kind: fault === "deferral" ? "fail-attachment-deferral" : "fail-attachments",
+          args: [1],
+        });
         yield* writerBridgeBarrier(writer);
         if (operation === "attach") yield* sql`ATTACH DATABASE ${attachment} AS scratch`;
         else yield* sql`DETACH DATABASE scratch`;

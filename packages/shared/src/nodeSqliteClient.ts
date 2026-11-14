@@ -1443,23 +1443,18 @@ const volatileSchema = () => {
     const shadows = new Set(db.prepare("PRAGMA " + quoted + ".table_list").all()
       .filter(entry => entry.type === "shadow").map(entry => entry.name));
     const rows = db.prepare("SELECT name, type, sql FROM " + quoted + ".sqlite_schema WHERE sql IS NOT NULL ORDER BY rowid").all();
-    rows.sort((left, right) => priority[left.type] - priority[right.type]);
     for (const row of rows) {
       if (row.name.startsWith("sqlite_") || shadows.has(row.name)) continue;
       // sqlite_schema stores CREATE statements without their schema qualifier.
       const sql = row.sql.replace(/^(CREATE\\s+(?:(?:UNIQUE|VIRTUAL)\\s+)?(?:TABLE|INDEX|VIEW|TRIGGER)\\s+)/i, "$1" + quoted + ".");
-      statements.push({ schema, sql });
+      statements.push({ schema, sql, type: row.type });
     }
   }
-  return statements;
+  return statements.sort((left, right) => priority[left.type] - priority[right.type])
+    .map(({ schema, sql }) => ({ schema, sql }));
 };
-const observeConnectionState = (classification, sql, params) => {
+const observeConnectionState = () => {
   const snapshot = {};
-  if (classification?.attachment || typeof db.setAuthorizer !== "function") {
-    attachmentsDirty = true;
-    const head = sql?.replace(/^(?:[;\\s]|--[^\\n]*(?:\\n|$)|\\/\\*[\\s\\S]*?\\*\\/)+/, "");
-    if (/^ATTACH\\b/i.test(head ?? "")) pendingAttachment = { sql, params };
-  }
   if (attachmentsDirty) {
     const current = databases();
     const present = new Set(current.filter(entry => entry.name !== "main" && entry.name !== "temp").map(entry => entry.name));
@@ -1493,13 +1488,18 @@ const observeConnectionState = (classification, sql, params) => {
 let recoveryFailureReported = false;
 let recoveryFailureCause;
 const recoverySnapshot = (classification, sql, params) => {
+  if (classification?.attachment || typeof db.setAuthorizer !== "function") {
+    attachmentsDirty = true;
+    const head = sql?.replace(/^(?:[;\\s]|--[^\\n]*(?:\\n|$)|\\/\\*[\\s\\S]*?\\*\\/)+/, "");
+    if (/^ATTACH\\b/i.test(head ?? "")) pendingAttachment = { sql, params };
+  }
   // Introspection can itself end a read transaction. Preserve the flag as it
   // stood after the user's SQL, rather than letting metadata reads consume it.
   let deferBefore;
   try {
     if (deferredForeignKeys || configurationDirty)
       deferBefore = Boolean(db.prepare("PRAGMA defer_foreign_keys").get().defer_foreign_keys);
-    const snapshot = observeConnectionState(classification, sql, params);
+    const snapshot = observeConnectionState();
     if (deferBefore !== undefined && snapshot.settings) snapshot.settings = snapshot.settings.map(entry =>
       entry.name === "defer_foreign_keys" ? { ...entry, value: deferBefore ? 1 : 0 } : entry);
     const ready = !attachmentsDirty && (!recoveryFailureReported || (!configurationDirty && !schemaDirty));
@@ -1939,14 +1939,18 @@ const makeWriterSession = Effect.fnUntraced(function* (
           acknowledge();
           onClassification?.(reply.write ?? false);
           const currentSpan = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
-          if (
-            fiber.getRef(References.TracerEnabled) &&
-            fiber.getRef(Statement.SpanPropagationEnabled) &&
-            currentSpan?._tag === "Span" &&
-            reply.elapsedMs !== undefined
-          ) {
-            currentSpan.attribute("db.statement.execution_ms", reply.elapsedMs);
-            currentSpan.attribute("db.execution.thread", "worker");
+          try {
+            if (
+              fiber.getRef(References.TracerEnabled) &&
+              fiber.getRef(Statement.SpanPropagationEnabled) &&
+              currentSpan?._tag === "Span" &&
+              reply.elapsedMs !== undefined
+            ) {
+              currentSpan.attribute("db.statement.execution_ms", reply.elapsedMs);
+              currentSpan.attribute("db.execution.thread", "worker");
+            }
+          } catch {
+            /* Timing must not change a statement's outcome. */
           }
           if (reply.controlMs !== undefined && currentSpan?._tag === "Span")
             try {
