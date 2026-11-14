@@ -25120,16 +25120,13 @@ it.live("an owner move of a working card replies before its thread is let go", (
       assert.notInclude(fake.interrupted, threadId);
       assert.deepStrictEqual(
         (yield* effectRows).map((row) => [row.kind, row.done_at]),
-        [
-          ["interrupt", null],
-          ["pruneWakes", null],
-        ],
+        [["interrupt", null]],
       );
       yield* Deferred.succeed(release, undefined);
       const rows = yield* eventually(effectRows, (all) => all.every((row) => row.done_at !== null));
       assert.deepStrictEqual(
         rows.map((row) => row.outcome),
-        ["delivered", "delivered"],
+        ["delivered"],
       );
       assert.strictEqual(fake.interrupted.filter((id) => id === threadId).length, 1);
     }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
@@ -25258,10 +25255,7 @@ it.live("a saved follow-on cut by a stop is run once after the restart", () =>
       );
       assert.deepStrictEqual(
         rows.map((row) => [row.kind, row.outcome]),
-        [
-          ["interrupt", "delivered"],
-          ["pruneWakes", "delivered"],
-        ],
+        [["interrupt", "delivered"]],
       );
       assert.strictEqual(fake.interrupted.filter((id) => id === threadId).length, 1);
       assert.strictEqual((yield* kanban.card(cardId)).card.stage, "todo");
@@ -25384,7 +25378,7 @@ it.live.each(
         assert.deepStrictEqual(order.slice(from), [`interrupt ${threadId}`, `send ${threadId}`]);
         assert.deepStrictEqual(
           (yield* effectRows).map((row) => row.outcome),
-          ["delivered", "delivered"],
+          ["delivered"],
         );
       }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
     }),
@@ -25774,10 +25768,7 @@ it.effect(
         }
         assert.deepStrictEqual(
           rows.map((row) => [row.kind, row.outcome]),
-          [
-            ["interrupt", "undeliverable"],
-            ["pruneWakes", "delivered"],
-          ],
+          [["interrupt", "undeliverable"]],
         );
         const events = (yield* kanban.card(card.id)).events;
         assert.isTrue(
@@ -26065,9 +26056,7 @@ it.live(
           rows.map((row) => [row.kind, row.outcome]),
           [
             ["release", "superseded"],
-            ["pruneWakes", "delivered"],
             ["interrupt", "delivered"],
-            ["pruneWakes", "delivered"],
           ],
         );
         yield* Effect.sleep("100 millis");
@@ -31474,7 +31463,13 @@ it.effect(
 
 it.effect.each(
   (["steer", "review to todo", "release", "flag"] as const).flatMap((action) =>
-    (["inline", "deferred"] as const).map((mode) => ({ action, mode })),
+    (
+      [
+        "inline",
+        "deferred",
+        ...(action === "review to todo" ? ["delayed cleanup" as const] : []),
+      ] as const
+    ).map((mode) => ({ action, mode })),
   ),
 )("#1394 disposable wakes: $action preserves real queued messages ($mode)", ({ action, mode }) =>
   Effect.gen(function* () {
@@ -31485,6 +31480,8 @@ it.effect.each(
     let expectedCancellations = Infinity;
     let cancellations = 0;
     const pruned = yield* Deferred.make<void>();
+    const cleanupEntered = yield* Deferred.make<void>();
+    const releaseCleanup = yield* Deferred.make<void>();
     const initialCleaned = yield* Deferred.make<void>();
     const wrapped = Layer.succeed(
       KanbanThreads,
@@ -31497,9 +31494,15 @@ it.effect.each(
                 .pipe(Effect.tap(() => Deferred.succeed(initialCleaned, undefined)))
             : Effect.succeed([]),
         cancelQueued: (id, run) =>
-          lifecycle.cancelQueued(id, run).pipe(
-            Effect.tap((cancelled) => {
-              if (cancelled) cancellations += 1;
+          Effect.gen(function* () {
+            if (mode === "delayed cleanup") {
+              yield* Deferred.succeed(cleanupEntered, undefined);
+              yield* Deferred.await(releaseCleanup);
+            }
+            return yield* lifecycle.cancelQueued(id, run);
+          }).pipe(
+            Effect.tap(() => {
+              cancellations += 1;
               return cancellations === expectedCancellations
                 ? Deferred.succeed(pruned, undefined)
                 : Effect.void;
@@ -31598,6 +31601,24 @@ it.effect.each(
         });
       const before = yield* lifecycle.queuedRuns(work);
       expectedCancellations = cancellations + 4;
+      if (mode === "delayed cleanup") {
+        const departure = yield* Effect.forkChild(
+          kanban.reviewResult(card.activeThreadId!, "findings", ["Fix queue ordering"]),
+        );
+        yield* Deferred.await(cleanupEntered);
+        assert.equal((yield* kanban.card(card.id)).card.stage, "in_review");
+        yield* Deferred.succeed(releaseCleanup, undefined);
+        yield* Fiber.join(departure);
+        yield* kanban.claimCard(work, card.id);
+        assert.equal((yield* kanban.card(card.id)).card.stage, "working");
+        const fresh = yield* lifecycle.send({
+          threadId: work,
+          text: "Fresh owner reminder",
+          coalesce: `owner:${card.id}`,
+        });
+        assert.isTrue((yield* lifecycle.queuedRuns(work)).some((run) => run.id === fresh));
+        return;
+      }
       if (action === "review to todo") {
         yield* kanban.reviewResult(card.activeThreadId!, "findings", ["Fix queue ordering"]);
         assert.equal((yield* kanban.card(card.id)).card.stage, "todo");

@@ -1379,12 +1379,6 @@ type BoardEffect =
       readonly actor: KanbanActor;
     }
   | ({ readonly kind: "tellAnswered" } & AnsweredNotice)
-  | {
-      readonly kind: "pruneWakes";
-      readonly threadId: string;
-      readonly cardId: string;
-      readonly discussionId: string | null;
-    }
   | { readonly kind: "syncPrs"; readonly cardId: string }
   | { readonly kind: "noteDiscussion"; readonly cardId: string; readonly text: string };
 interface OwnerRouteEffect {
@@ -2654,9 +2648,6 @@ const make = Effect.gen(function* () {
                 ? yield* nowIso
                 : (before.analyticsStageEnteredAt ?? before.movedAt),
           };
-        const write = store.putCard(card);
-        yield* dispatchMetadata ? locks.dispatchMetadata(write) : write;
-        yield* SavedWrite.record({ kind: "card", card });
         if (
           before !== null &&
           ((before.activeThreadId !== null && before.activeThreadId !== card.activeThreadId) ||
@@ -2664,23 +2655,15 @@ const make = Effect.gen(function* () {
               !KANBAN_THREAD_STAGES.includes(card.stage) &&
               ["working", "in_review", "needs_review"].includes(before.stage)))
         ) {
-          // Verdicts and self-flags release without letGo; the saved transition covers all three paths.
+          // Verdicts and self-flags bypass letGo. Prune before saving so reuse cannot overtake cleanup.
           for (const id of new Set([before.activeThreadId, before.workThreadId])) {
             if (id === null) continue;
-            yield* later(
-              card.boardId,
-              cardLane(card),
-              {
-                kind: "pruneWakes",
-                threadId: id,
-                cardId: card.id,
-                discussionId: card.discussionId,
-              },
-              pruneWakes(id, card.id, card.discussionId),
-            );
+            yield* pruneWakes(id, card.id, card.discussionId);
           }
         }
-
+        const write = store.putCard(card);
+        yield* dispatchMetadata ? locks.dispatchMetadata(write) : write;
+        yield* SavedWrite.record({ kind: "card", card });
         for (const event of BoardAnalytics.cardEvents(before, card, actor))
           yield* recordAnalytics(event);
         if (card.stalled?.by._tag === "evaluator") yield* forgetStepWait(card.id);
@@ -5914,8 +5897,6 @@ const make = Effect.gen(function* () {
         return Effect.gen(function* () {
           yield* noteDiscussion(yield* cardOf(KanbanCardId.make(effect.cardId)), effect.text);
         });
-      case "pruneWakes":
-        return pruneWakes(ThreadId.make(effect.threadId), effect.cardId, effect.discussionId);
       case "syncPrs":
         return Effect.gen(function* () {
           yield* syncPrs(yield* cardOf(KanbanCardId.make(effect.cardId)));
