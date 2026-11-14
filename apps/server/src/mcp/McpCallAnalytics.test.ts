@@ -29,6 +29,9 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
+import * as Queue from "effect/Queue";
+import * as Tracer from "effect/Tracer";
+import { HttpServerRequest, HttpServerResponse } from "effect/http";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -38,6 +41,7 @@ import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
 import * as McpCall from "../ardud/analytics/McpCall.ts";
 import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
+import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as Testkit from "./McpToolAccess.testkit.ts";
@@ -113,6 +117,121 @@ const probe = (name: string) =>
   );
 const decodeAnalyticsEvent = Schema.decodeEffect(AnalyticsEvent);
 const args = { clientRequestId: "private retry id", boardId: "board-robob", card: "#1301" };
+const isAnalyticsEvent = Schema.is(AnalyticsEvent);
+
+it.effect.each(["provider", "oauth"] as const)(
+  "%s auth and dispatch are separate from handler duration, including caller_unresolved",
+  (credential) =>
+    Effect.gen(function* () {
+      const rows = yield* Queue.unbounded<AnalyticsEvent>();
+      const spans: Array<Tracer.NativeSpan> = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          if (span.name === "tools/call") spans.push(span);
+          return span;
+        },
+      });
+      const scope = yield* McpInvocationContext.McpInvocationContext.pipe(
+        Effect.provide(invocation),
+      );
+      const entered = yield* Deferred.make<void>();
+      let unresolved = false;
+      const toolkit = probe("timing_probe");
+      const handlers = McpToolAccess.toLayer(toolkit, {
+        timing_probe: McpToolAccess.actsAsCaller(() =>
+          TestClock.adjust("40 millis").pipe(Effect.as({ ok: true })),
+        ),
+      });
+      const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: (threadId) =>
+              unresolved
+                ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+                : Effect.succeed(Testkit.liveThreadShell(threadId)),
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              event.kind === "mcp.call"
+                ? Queue.offer(rows, event).pipe(Effect.asVoid)
+                : Effect.void,
+          }),
+        ),
+      );
+      const authenticate = yield* McpHttpServer.makeMcpAuthMiddleware.pipe(
+        Effect.provide(
+          Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+            resolve: () =>
+              TestClock.adjust("7 millis").pipe(
+                Effect.as(
+                  credential === "provider" ? { ...scope, thread: scope.thread! } : undefined,
+                ),
+              ),
+          }),
+        ),
+        Effect.provideService(McpHttpServer.McpClientAuthenticator, {
+          authenticate: () => TestClock.adjust("13 millis").pipe(Effect.as(scope)),
+        }),
+      );
+      yield* Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        for (const failing of [false, true]) {
+          unresolved = failing;
+          const httpEffect = Effect.gen(function* () {
+            yield* TestClock.adjust("30 millis");
+            yield* server
+              .callTool({ name: "timing_probe", arguments: args })
+              .pipe(
+                Effect.provideService(McpSchema.McpServerClient, client),
+                Effect.withSpan("tools/call"),
+                Effect.orDie,
+              );
+            return HttpServerResponse.empty();
+          });
+          const pending = yield* authenticate(httpEffect).pipe(
+            Effect.provideService(
+              HttpServerRequest.HttpServerRequest,
+              HttpServerRequest.fromWeb(
+                new Request("http://localhost/mcp", {
+                  headers: { authorization: "Bearer timing-token" },
+                }),
+              ),
+            ),
+            Effect.forkChild,
+          );
+          if (unresolved) {
+            yield* Deferred.await(entered);
+            yield* TestClock.adjust("10 seconds");
+          }
+          yield* Fiber.join(pending);
+          const authMs = credential === "provider" ? 7 : 20;
+          const durationMs = unresolved ? 10_000 : 40;
+          const row = yield* Queue.take(rows);
+          expect(row).toMatchObject({
+            authMs,
+            dispatchMs: 30,
+            preHandlerMs: authMs + 30,
+            durationMs,
+            totalMs: authMs + 30 + durationMs,
+            outcome: unresolved ? "timeout" : "ok",
+            ...(unresolved ? { errorTag: "caller_unresolved", callerResolved: false } : {}),
+          });
+          expect(isAnalyticsEvent(row)).toBe(true);
+          expect(row.preHandlerMs).toBeGreaterThanOrEqual(row.authMs!);
+          expect(Object.fromEntries(spans.at(-1)!.attributes)).toMatchObject({
+            "mcp.auth_ms": authMs,
+            "mcp.dispatch_ms": 30,
+            "mcp.pre_handler_ms": authMs + 30,
+            "mcp.total_ms": authMs + 30 + durationMs,
+          });
+        }
+      }).pipe(Effect.provide(registration), Effect.withTracer(tracer));
+    }),
+);
 
 it.effect.each([
   { name: "shutdown before receipt", committed: false, shutdown: true, expected: "unknown" },

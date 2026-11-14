@@ -22,6 +22,11 @@ export class McpCall extends Context.Service<
     };
     callerResolved: boolean;
     callerResolveMs: number;
+    requestTiming?: {
+      readonly authMs: number;
+      readonly dispatchMs: number;
+      readonly preHandlerMs: number;
+    };
     callerStarted?: bigint;
     readerLane: string;
     waitStage?: "lookup.caller" | "lookup.target" | "waiting";
