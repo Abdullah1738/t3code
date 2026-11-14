@@ -56,6 +56,31 @@ class OwnedDirectories(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             suite.reset_directory(4, 'B', suite.DATA_ROOT / '3-A')
         self.assertTrue(marker.exists())
+class TerminalCollection(unittest.TestCase):
+    def test_pending_collect_never_stops_the_leases(self):
+        calls = []
+        outcome, code = suite.collect_then_stop(lambda: {'status': 'pending'}, lambda: calls.append('stop'))
+        self.assertEqual(outcome, {'status': 'pending'})
+        self.assertEqual(code, 75)
+        self.assertEqual(calls, [])
+    def test_waiting_is_not_terminal(self):
+        stop = Mock()
+        self.assertEqual(suite.collect_then_stop(lambda: {'status': 'waiting'}, stop)[1], 75)
+        stop.assert_not_called()
+    def test_done_and_failed_both_stop(self):
+        for status, code in [('done', 0), ('failed', 1)]:
+            with self.subTest(status=status):
+                stop = Mock()
+                self.assertEqual(suite.collect_then_stop(lambda: {'status': status}, stop)[1], code)
+                stop.assert_called_once_with()
+    def test_unknown_or_missing_status_never_stops(self):
+        for outcome in [{}, None, {'status': 'unknown'}]:
+            with self.subTest(outcome=outcome):
+                stop = Mock()
+                with self.assertRaises(ValueError):
+                    suite.collect_then_stop(lambda: outcome, stop)
+                stop.assert_not_called()
+
 class SetupCancellation(unittest.TestCase):
     def test_stop_before_setup_never_spawns(self):
         with patch.object(suite.subprocess, 'Popen') as spawn:

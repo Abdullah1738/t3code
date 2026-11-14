@@ -4,6 +4,23 @@ import argparse, hashlib, json, os, shutil, signal, socket, sqlite3, subprocess,
 
 DATA_ROOT = Path('/dev/shm/robob-overload-1352')
 
+def collection_exit_code(outcome):
+    status = outcome.get('status') if isinstance(outcome, dict) else None
+    if status in ('pending', 'waiting'):
+        return 75
+    if status == 'done':
+        return 0
+    if status == 'failed':
+        return 1
+    raise ValueError('Collection must return an explicit lifecycle status')
+
+def collect_then_stop(collect, stop):
+    outcome = collect()
+    exit_code = collection_exit_code(outcome)
+    if exit_code in (0, 1):
+        stop()
+    return outcome, exit_code
+
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
