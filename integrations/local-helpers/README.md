@@ -240,7 +240,8 @@ by decision. Legacy rows without a decision count only when `kind: error` or
 `ok: false`. Unexpected sampled refusals retain their weight and are marked
 `sampled: true`. `unattributedByRule` keeps `unknown:*` refusal buckets visible
 outside thread rankings and loops. `unrecognizedThreadIds` counts refusals with
-IDs outside the native or Robob thread formats, including test fixtures. Loop windows
+IDs outside the native or Robob thread formats, including test fixtures;
+`unrecognizedThreadIdsSampled` marks a weighted estimate for that counter. Loop windows
 can include the previous UTC day's last hour; daily totals stay local.
 `threadIdSource` distinguishes a resolved Robob ID from a native session fallback
 or missing identity. `repeatCount` tracks matching session/rule/first-word retries

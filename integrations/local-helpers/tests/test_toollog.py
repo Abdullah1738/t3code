@@ -300,7 +300,7 @@ class ToolLogTests(unittest.TestCase):
 
     def test_ranking_thread_id_shapes(self):
         uuid = '393a4dd3-d1ca-468e-9367-7c1f1ba1bf32'
-        cases = [(t, True) for t in [uuid, 'mcp:' + uuid, 'ardud-control:thread:' + uuid,
+        cases = [(t, True) for t in [uuid, 'mcp:' + uuid, 'mcp:' + uuid + ':fork', 'ardud-control:thread:' + uuid,
             'ardud-control:thread:nightly-report', 'ardud-control:thread:request%3A2026%2F11',
             'ardud-opencode-import:thread:ses_e288ff742ffeQTYTEXLuPR3WIO',
             'import:codex:' + uuid, 'import:claudeAgent:session-id',
@@ -311,7 +311,7 @@ class ToolLogTests(unittest.TestCase):
             'native:claude:' + uuid, 'native:opencode:ses_e288ff742ffeQTYTEXLuPR3WIO']]
         cases += [(t, False) for t in ['child', 'parent', 'leaf', 'new-fixture', '',
             'native:', 'thread:project:fixture:child', 'mcp:fixture', 'sha256:abcd',
-            uuid + '-suffix', 'prefix-' + uuid, 'ardud-control:thread:',
+            uuid + '-suffix', 'prefix-' + uuid, 'mcp:' + uuid + ':other', 'ardud-control:thread:',
             'ardud-opencode-import:thread:', 'ardud-opencode-import:thread:ses_',
             'import::session', 'import:codex:', 'thread:mcp:namespace:key:child',
             'thread:delegated-task:']]
@@ -320,6 +320,7 @@ class ToolLogTests(unittest.TestCase):
                 result = self.hook_rollup([{'ids': {'threadId': thread},
                     'props': {'rule': 'retry', 'decision': 'denied'}}] * 25)
                 self.assertEqual(result['unrecognizedThreadIds'], 0 if recognized else 25)
+                self.assertFalse(result['unrecognizedThreadIdsSampled'])
                 self.assertEqual(bool(result['topThreadsByRule']), recognized)
                 self.assertEqual(bool(result['repeatLoops']), recognized)
 
@@ -345,6 +346,20 @@ class ToolLogTests(unittest.TestCase):
                     entry = result[block]['retry'][0]
                     self.assertEqual((entry['count'], entry['denied'], entry['sampled']), (128, 128, True))
                     self.assertEqual(result['total'], 1 if kind == 'error' else 128)
+
+    def test_unrecognized_refusal_sample_rate_shapes(self):
+        cases = [(None, 1), (True, 1), (False, 1), (0, 1), (-1, 1),
+                 (1.5, 1), ('128', 1), (2**53, 1), (1, 1), (128, 128),
+                 (2**53 - 1, 2**53 - 1)]
+        for rate, weight in cases:
+            with self.subTest(rate=rate):
+                result = self.hook_rollup([{'ids': {'threadId': 'fixture'},
+                    'props': {'rule': 'retry', 'decision': 'denied', 'sampleRate': rate}}])
+                self.assertEqual(result['unrecognizedThreadIds'], weight)
+                self.assertEqual(result['unrecognizedThreadIdsSampled'], weight > 1)
+                self.assertEqual((result['total'], result['sampled']), (1, False))
+                self.assertEqual(result['topThreadsByRule'], {})
+                self.assertEqual(result['repeatLoops'], [])
 
     def test_rollup_legacy_caps_and_sample_rate_shapes(self):
         path = toollog.board_dir('agent-tools') / (self.day + '.ndjson')

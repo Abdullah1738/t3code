@@ -326,7 +326,7 @@ _ENCODED_ID = r"[A-Za-z0-9_.%~!*'()-]+"
 # Control requests can use an encoded idempotency key instead of a UUID.
 # Imports and MCP-created children also have stable, non-UUID IDs.
 _ROBOB_THREAD = re.compile(
-    rf'(?:{_UUID}|mcp:{_UUID}|ardud-control:thread:{_ENCODED_ID}'
+    rf'(?:{_UUID}|mcp:{_UUID}(?::fork)?|ardud-control:thread:{_ENCODED_ID}'
     rf'|ardud-opencode-import:thread:ses_[A-Za-z0-9]+'
     rf'|import:[A-Za-z0-9_.-]+:[A-Za-z0-9_.:%-]+'
     rf'|thread:project:[A-Za-z0-9_.:%-]+:{_UUID}'
@@ -451,6 +451,7 @@ def rollup(board, day, top_n=20):
     thread_decisions, unattributed = defaultdict(Counter), defaultdict(Counter)
     sampled_threads, sampled_attempts, sampled_unknown = set(), set(), set()
     unrecognized = 0
+    unrecognized_sampled = False
     caps = []
     recorded = 0
     last_record = None
@@ -496,6 +497,7 @@ def rollup(board, day, top_n=20):
                         sampled_attempts.add((thread, rule, decision))
             else:
                 unrecognized += refusal_weight
+                unrecognized_sampled |= refusal_weight > 1
         row_ok = row['_rollup_ok'] if aggregate else weight * (row.get('ok') is True)
         row_failed = row['_rollup_failed'] if aggregate else weight * (row.get('ok') is False)
         observed += row_ok + row_failed
@@ -618,6 +620,7 @@ def rollup(board, day, top_n=20):
                 for (entry_rule, thread), counts in sorted(unattributed.items()) if entry_rule == rule]
                 for rule in sorted({rule for rule, _ in unattributed})}
         result['unrecognizedThreadIds'] = unrecognized
+        result['unrecognizedThreadIdsSampled'] = unrecognized_sampled
     if board == 'orders':
         result['durationsMs'] = {name: dict(values) for name, values in result['durationMsByName'].items()}
         if order_polls:
