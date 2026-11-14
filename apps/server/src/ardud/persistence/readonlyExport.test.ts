@@ -2163,3 +2163,91 @@ test("repair diagnostics count only committed reconcile changes/deletions and re
     { revision: 3, cause: "reset", table: "orchestration_events", ids: 0 },
   ]);
 });
+
+test.each([60_000, 60_001])(
+  "a completed %i-event prefix survives restart without delaying the next binding",
+  (events) => {
+    const f = fixture(100);
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    f.source.exec(
+      "INSERT INTO orchestration_v2_projection_provider_threads VALUES ('binding','{}','a')",
+    );
+    f.finish();
+    const out = f.connect();
+    f.source.exec(`WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<${events})
+      INSERT INTO orchestration_events(event_type,stream_id,payload_json)
+      SELECT 'thread.metadata-updated','a','{}' FROM n;`);
+    let completed = false;
+    for (let step = 0; step < 1_000; step++) {
+      now += 10;
+      if (!f.exporter.step()) {
+        completed = true;
+        break;
+      }
+    }
+    expect(completed).toBe(true);
+    expect(metaValue(out, "sequence")).toBe(String(events + 1));
+    expect(metaValue(out, "identity_sequence")).toBe(String(events + 1));
+    // Empty idle polls must not lose the completed scan high-water either.
+    now += 1_000;
+    expect(f.exporter.pollIdentities()).toBe(false);
+    f.restart();
+    f.source
+      .exec(`UPDATE orchestration_v2_projection_provider_threads SET payload_json='{"nativeThreadRef":{"nativeId":"after-restart"}}' WHERE provider_thread_id='binding';
+      INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('provider-thread.updated','a','{"id":"binding"}');`);
+    expect(f.exporter.pollIdentities()).toBe(true);
+    expect(
+      out
+        .prepare(
+          "SELECT payload_json FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id='binding'",
+        )
+        .get()?.payload_json,
+    ).toContain('"after-restart"');
+    expect(metaValue(out, "sequence")).toBe(String(events + 1));
+    expect(metaValue(out, "identity_sequence")).toBe(String(events + 2));
+  },
+);
+
+test("an abandoned cycle retains the committed identity cursor and replays a pending binding on restart", () => {
+  const f = fixture(2);
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.source.exec(
+    "INSERT INTO orchestration_v2_projection_provider_threads VALUES ('binding','{}','a')",
+  );
+  f.finish();
+  const out = f.connect();
+  // Drain bootstrap identity pages so subsequent polls start behind the new prefix.
+  while (f.exporter.pollIdentities()) {}
+  const cursor = metaValue(out, "identity_sequence");
+  f.source.exec(`WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<40)
+    INSERT INTO orchestration_events(event_type,stream_id,payload_json)
+    SELECT 'thread.metadata-updated','a','{}' FROM n;
+    UPDATE orchestration_v2_projection_provider_threads SET payload_json='{"nativeThreadRef":{"nativeId":"pending"}}' WHERE provider_thread_id='binding';
+    INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('provider-thread.updated','a','{"id":"binding"}');`);
+  f.exporter.takeMetrics();
+  for (let step = 0; step < 20; step++) {
+    expect(f.exporter.step()).toBe(true);
+    if (f.exporter.takeMetrics().phaseSteps.eventCatchup) break;
+    if (step === 19) throw new Error("event catchup did not start");
+  }
+  now += 1_000;
+  f.exporter.pollIdentities();
+  expect(metaValue(out, "identity_sequence")).toBe(cursor);
+  expect(metaValue(out, "sequence")).toBe("1");
+  f.restart();
+  for (let page = 0; page < 22; page++) f.exporter.pollIdentities();
+  expect(
+    out
+      .prepare(
+        "SELECT payload_json FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id='binding'",
+      )
+      .get()?.payload_json,
+  ).toContain('"pending"');
+  expect(metaValue(out, "identity_sequence")).toBe("42");
+  expect(metaValue(out, "sequence")).toBe("1");
+  f.finish();
+  expect(metaValue(out, "identity_sequence")).toBe("42");
+  expect(metaValue(out, "sequence")).toBe("42");
+});

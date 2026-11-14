@@ -1388,6 +1388,9 @@ export function createReadonlyReplica(
           // leaves it behind, so readers safely fall back after a downgrade.
           meta("lineage_repair_watermark", getMeta("updated_at")!);
           meta("ready", "1");
+          // Full catch-up already copied every identity through this snapshot.
+          // Persist that scan progress so a restart cannot replay an old prefix.
+          meta("identity_sequence", String(Math.max(identitySequence, cycleTarget!)));
           out
             .prepare(
               "DELETE FROM ardud_readonly_meta WHERE key IN ('rebuild_held_until','rebuild_held_notice_at')",
@@ -1402,6 +1405,7 @@ export function createReadonlyReplica(
       if (cycleTransaction) {
         commitCycle();
       }
+      identitySequence = Math.max(identitySequence, cycleTarget!);
       cycleTarget = undefined;
       auxiliaryIndex = 0;
       auxiliaryCursor = 0;
