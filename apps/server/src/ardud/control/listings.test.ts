@@ -10,6 +10,7 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   AuthSessionId,
   OrchestrationV2AppThreadJson,
+  type AnalyticsEvent,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
   ProjectId,
@@ -52,6 +53,8 @@ import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "./http.ts";
+import * as Analytics from "../analytics/Analytics.ts";
+import { accumulate, finishRollup, makeAccumulator } from "../analytics/rollup.ts";
 import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
 
 const askedAt = DateTime.makeUnsafe("2026-01-01T00:05:00.000Z");
@@ -193,6 +196,7 @@ const seedRows = Effect.gen(function* () {
   for (const [providerThreadId, driver, nativeId, updatedAt] of [
     ["pt-migrated-claude", "claudeAgent", "claude-session-uuid", "2026-01-01T00:00:00.000Z"],
     ["pt-migrated-oc", "opencode", "ses_migrated_old", "2026-01-02T00:00:00.000Z"],
+    ["pt-migrated-codex", "codex", "codex-session-uuid", "2026-01-01T00:00:00.000Z"],
   ] as const) {
     yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert({
       provider_thread_id: providerThreadId,
@@ -271,6 +275,7 @@ const makeHarness = (
       })} ON CONFLICT(thread_id) DO UPDATE SET updated_at = excluded.updated_at`;
     }
     const statements: Array<readonly [string, ReadonlyArray<unknown>]> = [];
+    const analyticsEvents: AnalyticsEvent[] = [];
     const snapshotReads = yield* Ref.make(0);
     // Targeted (threadIds) shell reads and one-thread shell reads, counted apart.
     const targetedReads = yield* Ref.make<Array<ReadonlyArray<string>>>([]);
@@ -393,6 +398,12 @@ const makeHarness = (
                 }),
                 Layer.succeed(SqlClient.SqlClient, sql),
                 Layer.succeed(StartupPhaseLog.StartupPhaseLog, startupLog),
+                Layer.mock(Analytics.Analytics)({
+                  record: (event) =>
+                    Effect.sync(() => {
+                      analyticsEvents.push(event);
+                    }),
+                }),
               ).pipe(Layer.provideMerge(NodeServices.layer)),
             ),
             Layer.provide(
@@ -442,6 +453,7 @@ const makeHarness = (
       get,
       threadIds,
       snapshotReads,
+      analyticsEvents,
       targetedReads,
       statements,
       shellReads,
@@ -1335,6 +1347,41 @@ describe("control listings", () => {
     );
   });
 
+  it.effect(
+    "bounds the imessage origin listing to matching shells in a 2,510-thread fixture",
+    () => {
+      const extra = Array.from({ length: 2510 }, (_, i) =>
+        shell(`origin-${String(i).padStart(4, "0")}`),
+      );
+      return run(
+        ({ get, sql, snapshotReads, targetedReads }) =>
+          Effect.gen(function* () {
+            yield* sql.withTransaction(
+              Effect.gen(function* () {
+                for (let i = 0; i < extra.length; i += 10) {
+                  yield* sql`INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
+            VALUES (${extra[i]!.id}, 'imessage', '2026-03-01T00:00:00.000Z')`;
+                }
+              }),
+            );
+            const response = yield* get("/threads?origin=imessage&limit=500");
+            assert.equal(response.status, 200);
+            assert.equal(response.body.total, 251);
+            assert.lengthOf(response.body.threads, 251);
+            assert.equal(yield* Ref.get(snapshotReads), 0);
+            const pages = yield* Ref.get(targetedReads);
+            assert.equal(
+              pages.reduce((sum, page) => sum + page.length, 0),
+              251,
+            );
+            assert.isTrue(pages.every((page) => page.length <= 128));
+          }),
+        undefined,
+        extra,
+      );
+    },
+  );
+
   it.effect("candidate pages preserve totals and limits across state and origin filters", () => {
     const extra = Array.from({ length: 270 }, (_, i) =>
       shell(`batch-${String(i).padStart(3, "0")}`, {
@@ -1878,39 +1925,58 @@ describe("control listings", () => {
     ),
   );
 
-  it.live("authenticates and resolves identity while a shell snapshot holds the reader", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-control-identity-reader-" });
-      yield* Effect.gen(function* () {
-        const sql = yield* SqlClient.SqlClient;
-        const harness = yield* makeHarness();
-        const url = "/identity/resolve?nativeId=claude-session-uuid&driver=claudeAgent";
-        assert.strictEqual((yield* harness.get(url)).status, 200);
-        const held = yield* Deferred.make<void>();
-        const release = yield* Deferred.make<void>();
-        const reader = yield* Effect.forkChild(
-          sql
-            .withTransaction(
-              Effect.gen(function* () {
-                yield* sql`SELECT 1`;
-                yield* Deferred.succeed(held, undefined);
-                yield* Deferred.await(release);
-              }),
-            )
-            .pipe(NodeSqliteClient.readOnly),
-        );
-        yield* Deferred.await(held);
-        const response = yield* harness
-          .get(url)
-          .pipe(Effect.timeout("2 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
-        yield* Fiber.join(reader);
-        assert.strictEqual(response.status, 200);
-        assert.strictEqual(response.body.identity.resolution, "resolved");
-        assert.strictEqual(response.body.identity.robobThreadId, "migrated");
-      }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  it.live.each([
+    { driver: "claudeAgent", nativeId: "claude-session-uuid" },
+    { driver: "codex", nativeId: "codex-session-uuid" },
+    { driver: "opencode", nativeId: "ses_migrated_old" },
+  ])(
+    "authenticates and resolves $driver while a shell snapshot holds the reader",
+    ({ driver, nativeId }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-control-identity-reader-" });
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const harness = yield* makeHarness();
+          const url = `/identity/resolve?nativeId=${nativeId}&driver=${driver}`;
+          assert.strictEqual((yield* harness.get(url)).status, 200);
+          const held = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const reader = yield* Effect.forkChild(
+            sql
+              .withTransaction(
+                Effect.gen(function* () {
+                  yield* sql`SELECT 1`;
+                  yield* Deferred.succeed(held, undefined);
+                  yield* Deferred.await(release);
+                }),
+              )
+              .pipe(NodeSqliteClient.readOnly),
+          );
+          yield* Deferred.await(held);
+          const response = yield* harness
+            .get(url)
+            .pipe(
+              Effect.timeout("2 seconds"),
+              Effect.ensuring(Deferred.succeed(release, undefined)),
+            );
+          yield* Fiber.join(reader);
+          assert.strictEqual(response.status, 200);
+          assert.strictEqual(response.body.identity.resolution, "resolved");
+          assert.strictEqual(response.body.identity.robobThreadId, "migrated");
+          const event = harness.analyticsEvents.at(-1)!;
+          assert.equal(event.route, "control.identity.resolve");
+          assert.equal(event.outcome, "ok");
+          assert.isAtLeast(event.props!.waitMs!, 0);
+          const rollup = makeAccumulator();
+          for (const sample of harness.analyticsEvents) accumulate(rollup, sample);
+          assert.equal(
+            finishRollup(rollup, "2026-01-01", "2026-01-01T00:00:00.000Z").topSlowRpcs[0]?.method,
+            "control.identity.resolve",
+          );
+        }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   // A lane that never ran the session read (process replaced, admission queue full).

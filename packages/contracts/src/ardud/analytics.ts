@@ -301,7 +301,14 @@ export const AnalyticsRollup = Schema.Struct({
       approximate: Schema.Boolean,
     }),
   ),
-  topSlowRpcs: Schema.Array(Schema.Struct({ method: Label, ...LatencyFields })),
+  topSlowRpcs: Schema.Array(
+    Schema.Struct({
+      method: Label,
+      ...LatencyFields,
+      totalWaitMs: Schema.optionalKey(Measurement),
+      outcomes: Schema.optionalKey(Schema.Record(Label, Measurement)),
+    }),
+  ),
   askAnswerLatency: Schema.Struct(LatencyFields),
   usage: Schema.Struct({
     totals: UsageTotals,

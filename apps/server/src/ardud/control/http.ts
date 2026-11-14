@@ -55,6 +55,7 @@ import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerConfig from "../../config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "./ControlStore.ts";
+import * as ControlRequestAnalytics from "./ControlRequestAnalytics.ts";
 import * as Usage from "./usage.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
 import * as RecoverySnapshot from "../recovery/RecoverySnapshot.ts";
@@ -522,6 +523,7 @@ const makeRoutes = Effect.gen(function* () {
   const store = yield* ControlStore.ControlStore;
   const usage = yield* Usage.Usage;
   const identities = yield* ExecutionIdentity.ExecutionIdentity;
+  const observeControl = yield* ControlRequestAnalytics.make;
   const recovery = yield* RecoverySnapshot.RecoverySnapshot;
   const crypto = yield* Crypto.Crypto;
   const eventStore = yield* OrchestrationEventStore.OrchestrationEventStore;
@@ -1359,6 +1361,7 @@ const makeRoutes = Effect.gen(function* () {
     const session = yield* authenticate(AuthOrchestrationOperateScope);
     const threadId = yield* param("threadId");
     const body = yield* decodeBody(decodeSendBody);
+    yield* ControlRequestAnalytics.sendMode(body.mode ?? "auto");
     const shell = yield* getShell(threadId);
     const commandId = yield* commandIdFor(`send:${threadId}`, body.clientRequestId);
     // ardud: channel guidance is framed as the bridge's, so only it may send some.
@@ -1913,22 +1916,42 @@ const makeRoutes = Effect.gen(function* () {
         }),
       ),
     ),
-    HttpRouter.route("GET", `${p}/requests`, handle(listRequests())),
+    HttpRouter.route(
+      "GET",
+      `${p}/requests`,
+      observeControl("control.requests", handle(listRequests())),
+    ),
     HttpRouter.route("GET", `${p}/projects`, handle(listProjects)),
     HttpRouter.route("GET", `${p}/models`, handle(listModels)),
     HttpRouter.route("GET", `${p}/usage`, handle(listUsage)),
     HttpRouter.route("GET", `${p}/threads`, handle(listThreads)),
     HttpRouter.route("POST", `${p}/threads`, handle(createThread)),
     HttpRouter.route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),
-    HttpRouter.route("GET", `${p}/identity/resolve`, handle(identityResolve)),
+    HttpRouter.route(
+      "GET",
+      `${p}/identity/resolve`,
+      observeControl("control.identity.resolve", handle(identityResolve)),
+    ),
     HttpRouter.route("GET", `${p}/recovery/snapshot`, handle(recoverySnapshot)),
-    HttpRouter.route("GET", `${p}/threads/:threadId`, handle(getThread)),
+    HttpRouter.route(
+      "GET",
+      `${p}/threads/:threadId`,
+      observeControl("control.thread", handle(getThread)),
+    ),
     HttpRouter.route("PATCH", `${p}/threads/:threadId`, handle(patchThread)),
     HttpRouter.route("POST", `${p}/threads/:threadId/archive-if-idle`, handle(archiveThreadIfIdle)),
-    HttpRouter.route("GET", `${p}/threads/:threadId/messages`, handle(getMessages)),
+    HttpRouter.route(
+      "GET",
+      `${p}/threads/:threadId/messages`,
+      observeControl("control.messages", handle(getMessages)),
+    ),
     HttpRouter.route("GET", `${p}/threads/:threadId/runs/:runId/evidence`, handle(getRunEvidence)),
     HttpRouter.route("GET", `${p}/threads/:threadId/wait`, handle(wait)),
-    HttpRouter.route("POST", `${p}/threads/:threadId/send`, handle(send)),
+    HttpRouter.route(
+      "POST",
+      `${p}/threads/:threadId/send`,
+      observeControl("control.send", handle(send)),
+    ),
     HttpRouter.route("POST", `${p}/threads/:threadId/interrupt`, handle(interrupt)),
     HttpRouter.route("POST", `${p}/threads/:threadId/requests/:requestId/respond`, handle(respond)),
     HttpRouter.route("PUT", `${p}/threads/:threadId/origin`, handle(putOrigin)),
