@@ -68,11 +68,7 @@ export const withTrace = (prefix: Prefix) =>
             span.value.attribute(
               `${prefix}.result`,
               code === "task_not_found"
-                ? String(span.value.attributes.get("t3.task.task_id") ?? "").startsWith(
-                    "node:delegated-task:",
-                  )
-                  ? "not_found_in_flight"
-                  : "not_found"
+                ? "not_found"
                 : (code ?? (Cause.hasInterrupts(exit.cause) ? "interrupted" : "defect")),
             );
           }

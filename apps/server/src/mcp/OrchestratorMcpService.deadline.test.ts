@@ -12,13 +12,19 @@ import * as SqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import {
+  CommandId,
   EnvironmentId,
   NodeId,
   type OrchestrationV2ThreadProjection,
   ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as Option from "effect/Option";
+import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
+import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import type { McpInvocationScope } from "./McpInvocationContext.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
@@ -29,7 +35,7 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
-import { liveThreadShell } from "./McpToolAccess.testkit.ts";
+import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
 
 it.effect.each([
   { stage: "caller", stop: "deadline" },
@@ -187,6 +193,7 @@ it.effect.each([
                     latestTerminalRunId: null,
                     latestTerminalStatus: null,
                     hasPendingChildRuns: false,
+                    status: "running",
                   }
                 : {}),
             });
@@ -234,4 +241,95 @@ it.effect.each([
         ),
       );
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each([
+  { first: "status", second: "status" },
+  { first: "status", second: "cancel" },
+  { first: "cancel", second: "status" },
+  { first: "cancel", second: "cancel" },
+] as const)(
+  "concurrent $first/$second do not count a receipt read as a pending create",
+  ({ first, second }) =>
+    Effect.gen(function* () {
+      const parent = ThreadId.make("parent:receipt-read-fence");
+      const commandId = CommandId.make("command:mcp:delegate-task:env:parent:retry");
+      const taskId = IdAllocator.derive.delegatedTaskNode({ commandId });
+      const firstReadHeld = yield* Deferred.make<void>();
+      const concurrentRead = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let reads = 0;
+      const settings = ServerSettings.layerTest();
+      const threads = ThreadManagement.layer.pipe(
+        Layer.provide(settings),
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getCallerRow: () => Effect.succeed(liveThreadShell(parent)),
+            getThreadRecords: () => Effect.succeed(idleThreadProjection(liveThreadShell(parent))),
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
+            getByCommandId: () =>
+              Effect.gen(function* () {
+                reads++;
+                if (reads === 2) {
+                  yield* Deferred.succeed(firstReadHeld, undefined);
+                  yield* Deferred.await(release);
+                }
+                if (reads === 3) yield* Deferred.succeed(concurrentRead, undefined);
+                return Option.none();
+              }),
+          }),
+        ),
+      );
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        threads,
+        settings,
+        Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+          list: () => Effect.succeed([]),
+        }),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTasks.ScheduledTaskService)({}),
+        Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
+        Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const scope: McpInvocationScope = {
+          environmentId: EnvironmentId.make("env"),
+          requestNamespace: "receipt-read-fence",
+          thread: {
+            threadId: parent,
+            providerSessionId: "session",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+          },
+          client: undefined,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        };
+        const read = (operation: "status" | "cancel") =>
+          operation === "status"
+            ? service.taskStatus(scope, taskId).pipe(Effect.asVoid)
+            : service.cancelTask(scope, { taskId }).pipe(Effect.asVoid);
+        const status = yield* read(first).pipe(Effect.flip, Effect.forkChild);
+        yield* Deferred.await(firstReadHeld);
+        const cancel = yield* read(second).pipe(Effect.flip, Effect.forkChild);
+        yield* Deferred.await(concurrentRead);
+        yield* TestClock.adjust(0);
+        assert.isUndefined(
+          cancel.pollUnsafe(),
+          "a concurrent read must wait for the receipt fence",
+        );
+        yield* Deferred.succeed(release, undefined);
+        for (const error of [yield* Fiber.join(status), yield* Fiber.join(cancel)]) {
+          assert.equal(error.code, "task_not_found");
+          assert.include(error.message, "This delegation was never saved.");
+        }
+      }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
+    }),
 );
