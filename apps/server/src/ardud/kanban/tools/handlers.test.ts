@@ -9,6 +9,7 @@ import {
   KanbanDiscussionId,
   KanbanScriptId,
   KanbanError,
+  KanbanMessage,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -389,6 +390,7 @@ const fakeThreads = (
 };
 
 const owner: KanbanActor = { _tag: "owner" };
+const decodeMessage = Schema.decodeUnknownEffect(KanbanMessage);
 
 it.effect.each(["subtask_done", "report_bug"] as const)(
   "%s saves an attached active worker's result while the state background reader is held",
@@ -917,6 +919,108 @@ it.effect("a work thread reads another card's discussion but cannot post to that
       );
     }
     assert.lengthOf(yield* kanban.messages(discussion.id), 2);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect.each(["work", "review"] as const)(
+  "a %s thread cannot post to another card's discussion by id",
+  (role) => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "post-ownership",
+        name: "Post ownership",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const own = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      let thread = (yield* kanban.card(own.id)).card.activeThreadId!;
+      if (role === "review") {
+        yield* kanban.moveCard(own.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: thread,
+        });
+        yield* kanban.dispatchNow;
+        thread = (yield* kanban.card(own.id)).card.activeThreadId!;
+      }
+      assert.strictEqual((yield* kanban.caller(thread))?.role, role);
+      const other = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
+      const discussion = yield* kanban.cardDiscussion(other.id);
+      yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Earlier message" }]);
+      const before = yield* kanban.discussion(discussion.id);
+      const messages = yield* kanban.messages(discussion.id);
+
+      const posted = yield* call(thread, "discussion_post", {
+        discussionId: discussion.id,
+        text: "Not mine",
+      });
+      assert.isTrue(posted.isError, posted.text);
+      assert.include(posted.text, "capability_denied");
+      assert.include(posted.text, `can't change card #${other.number}`);
+      assert.deepStrictEqual(yield* kanban.discussion(discussion.id), before);
+      assert.deepStrictEqual(yield* kanban.messages(discussion.id), messages);
+
+      const channel = yield* kanban.createDiscussion(board.id, "Channel", owner);
+      assert.isNull(channel.cardId);
+      const channelPost = yield* call(thread, "discussion_post", {
+        discussionId: channel.id,
+        text: "Channel update",
+      });
+      assert.isFalse(channelPost.isError, channelPost.text);
+      const message = yield* decodeMessage(channelPost.structured.message);
+      assert.deepStrictEqual(yield* kanban.messages(channel.id), [message]);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect("a work thread can post to its own card's discussion by id", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "own-post",
+      name: "Own post",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+    yield* kanban.dispatchNow;
+    const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+    const discussion = yield* kanban.cardDiscussion(card.id);
+    const posted = yield* call(thread, "discussion_post", {
+      discussionId: discussion.id,
+      text: "Own card update",
+    });
+    assert.isFalse(posted.isError, posted.text);
+    const message = yield* decodeMessage(posted.structured.message);
+    assert.deepStrictEqual(yield* kanban.messages(discussion.id), [message]);
+    assert.strictEqual((yield* kanban.discussion(discussion.id)).lastSeq, discussion.lastSeq + 1);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("an evaluator can post to a card's discussion by id", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "evaluator-post",
+      name: "Evaluator post",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const card = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
+    const discussion = yield* kanban.cardDiscussion(card.id);
+    const evaluator = yield* kanban.startEvaluator(board.id, { kind: "check" });
+    assert.strictEqual((yield* kanban.caller(evaluator))?.role, "evaluator");
+    const posted = yield* call(evaluator, "discussion_post", {
+      discussionId: discussion.id,
+      text: "Evaluator update",
+    });
+    assert.isFalse(posted.isError, posted.text);
+    const message = yield* decodeMessage(posted.structured.message);
+    assert.deepStrictEqual(yield* kanban.messages(discussion.id), [message]);
+    assert.strictEqual((yield* kanban.discussion(discussion.id)).lastSeq, discussion.lastSeq + 1);
   }).pipe(Effect.provide(layer));
 });
 
@@ -6544,7 +6648,15 @@ it.effect(
                       ? { seq: seed.seq }
                       : {}),
               });
-              assert.equal(result.isError, operation === "ask" && caller === worker, result.text);
+              const denied =
+                caller === worker &&
+                discussion.cardId !== null &&
+                (operation === "post" || operation === "ask");
+              assert.equal(result.isError, denied, result.text);
+              if (denied) {
+                assert.include(result.text, "capability_denied");
+                assert.include(result.text, `can't change card #${card.number}`);
+              }
               for (const row of [
                 yield* Deferred.await(pending.ledger),
                 yield* Deferred.await(pending.generic),
