@@ -958,12 +958,17 @@ const BoardOpen = tool(
 const ReportBug = tool(
   "report_bug",
   "Report a bug",
-  "Report a tooling bug from any thread. Pass cardHint (e.g. #722) when you already know its card (any stage until it is settled). A hint or strong title match appends a sighting without starting an evaluator; weak matches start a request evaluator, or queue it when the board's spawn limit is full. Identical evidence from this thread on the same card is deduped for 30 minutes. Search matches return up to three candidates, best first.",
+  "Report a tooling bug from any thread. Pass cardHint (e.g. #722, a card on boardId's board) when you already know its card there (any stage until it is settled). A hint or strong title match appends a sighting without starting an evaluator; weak matches start a request evaluator, or queue it when the board's spawn limit is full. Identical evidence from this thread on the same card is deduped for 30 minutes. Search matches return up to three candidates, best first.",
   {
     boardId: describe(TrimmedNonEmptyString, "Destination board id or slug."),
     title: describe(TrimmedNonEmptyString, "Short bug title to search for."),
     evidence: describe(TrimmedNonEmptyString, "What broke, with errors, run ids or log paths."),
-    cardHint: Schema.optional(describe(TrimmedNonEmptyString, "Known card number, e.g. #722.")),
+    cardHint: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        "A card on the destination board: its number (#722), boardslug#722, or its card id. Never your own card's number from another board.",
+      ),
+    ),
   },
   {
     appendedTo: Schema.optional(TrimmedNonEmptyString),
