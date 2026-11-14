@@ -344,7 +344,12 @@ def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=No
                 else:
                     os.close(capfd)
                     append(fd, record('logger', 'error', 'log.cap', now, ok=False, error_tag='log.cap'))
-                if kind != 'error':
+                # A coverage gap must survive the cap before its checkpoint
+                # retires it. Ordinary crash summaries remain capped.
+                coverage_gap = (component == 'crashes' and name in (
+                    'crash.unified.skip', 'crash.source', 'crash.collect') and
+                    row.get('props', {}).get('skippedS', 0) > 0)
+                if kind != 'error' and not coverage_gap:
                     return
             append(fd, row)
         finally:

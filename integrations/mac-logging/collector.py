@@ -140,22 +140,41 @@ def unified_command(command, capture_output=True, text=True, timeout=60, env=Non
         raise
 
 
-def next_unified_chunk(size, elapsed, previous=None, limit=UNIFIED_CHUNK_S):
-    # Two successful sizes distinguish fixed log-show startup cost from work
-    # proportional to the window. A fixed cost must not pin every query at 60 s.
+def next_unified_chunk(size, elapsed, model=None):
+    model = dict(model or {})
+    previous = model.get('previous')
+    limit = model.get('limit', UNIFIED_CHUNK_S)
     if previous and abs(size-previous[0]) > .000001:
-        rate = max(0, (elapsed-previous[1])/(size-previous[0]))
+        delta = size-previous[0]
+        rate = max(0, (elapsed-previous[1])/delta)
+        previous_rate = model.get('rate')
+        # A rising marginal cost invalidates the affine model. Keep that
+        # evidence for the run, even when later windows have the same size.
+        if (delta > 0 and previous_rate is not None and rate > previous_rate*1.5 and
+                elapsed-previous[1]-previous_rate*delta > 1):
+            model['nonlinear'] = True
+        model['rate'] = rate
         overhead = max(0, elapsed-rate*size)
-        # Only startup-dominated probes justify going beyond the usual 15 min.
-        # Keep nonlinear window costs from extrapolating a tiny cheap probe
-        # into a large command. Timing noise gets a one-second margin.
-        limit = UNIFIED_WINDOW_S if rate*UNIFIED_WINDOW_S <= max(1, overhead/10) else UNIFIED_CHUNK_S
-        return max(UNIFIED_FIRST_CHUNK_S, min(limit,
-                   UNIFIED_TARGET_S/max(.001, rate))), limit
-    if previous:
-        return max(UNIFIED_FIRST_CHUNK_S, min(limit,
-                   size*max(UNIFIED_TARGET_S, previous[1])/max(.001, elapsed))), limit
-    return min(limit, max(UNIFIED_FIRST_CHUNK_S, size*2)), limit
+        limit = UNIFIED_WINDOW_S if (rate*UNIFIED_WINDOW_S <= 1 or
+                    overhead >= rate*UNIFIED_CHUNK_S) else UNIFIED_CHUNK_S
+        if model.get('nonlinear'):
+            limit = UNIFIED_CHUNK_S
+        work_budget = max(0, min(max(UNIFIED_TARGET_S, overhead),
+                                UNIFIED_CALL_S-1-overhead))
+        size_next = max(UNIFIED_FIRST_CHUNK_S, min(limit, work_budget/max(.001, rate)))
+        # Startup can hide curvature in two tiny probes. Sample the nominal
+        # window before a large jump when the model leaves room for four calls.
+        # Expensive startup may only afford three calls to clear the ceiling.
+        if (max(size, previous[0]) < UNIFIED_CHUNK_S and rate*UNIFIED_WINDOW_S > 1 and
+                4*overhead+rate*UNIFIED_WINDOW_S <= UNIFIED_BUDGET_S):
+            size_next = min(size_next, UNIFIED_CHUNK_S)
+    elif previous:
+        size_next = max(UNIFIED_FIRST_CHUNK_S, min(limit,
+                        size*max(UNIFIED_TARGET_S, previous[1])/max(.001, elapsed)))
+    else:
+        size_next = min(limit, max(UNIFIED_FIRST_CHUNK_S, size*2))
+    model.update(previous=(size, elapsed), limit=limit)
+    return size_next, model
 
 
 def unified(since, until, run=unified_command, timeout=60):
@@ -265,8 +284,7 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
     skipped = 0
     stop_reason = 'done'
     chunk_size = UNIFIED_FIRST_CHUNK_S
-    previous_chunk = None
-    chunk_limit = UNIFIED_CHUNK_S
+    cost_model = None
     def lag():
         return max(0, now+time.monotonic()-started-state.get('unified', since))
 
@@ -313,8 +331,7 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
                 elapsed = time.monotonic()-chunk_started
                 emit('crashes', 'event', 'crash.unified.chunk', ok=True,
                      props=dict(chunk, outcome='done', elapsedMs=elapsed*1000))
-                chunk_size, chunk_limit = next_unified_chunk(end-cursor, elapsed, previous_chunk, chunk_limit)
-                previous_chunk = (end-cursor, elapsed)
+                chunk_size, cost_model = next_unified_chunk(end-cursor, elapsed, cost_model)
                 counts.update(observed)
                 crash_observations(observed)
                 cursor = end

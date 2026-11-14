@@ -14,6 +14,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import collector
 import jobs
+import toollog
 
 
 class UnifiedCatchupTests(unittest.TestCase):
@@ -107,6 +108,118 @@ class UnifiedCatchupTests(unittest.TestCase):
                 observed = [r['props']['observedAt'] for r in self.rows('crash.observed')]
                 self.assertEqual(observed, [at for at in self.boots if 9100 < at <= now])
                 self.assertEqual(len(observed), len(set(observed)))
+
+    def test_mixed_startup_and_window_costs_cover_hourly_arrivals(self):
+        # Initial windows include normal spacing, the cap, and a long outage.
+        cases = ((5, 300, 3600), (15, 300, 5400), (25, 300, 3600),
+                 (25, 300, 5400), (25, 300, 11626), (30, 300, 5400),
+                 (25, 600, 5400))
+        for startup, divisor, initial_lag in cases:
+            case = '%s-%s-%s' % (startup, divisor, initial_lag)
+            with self.subTest(case=case), patch.dict(os.environ, TOOLLOG_DIR=str(self.logs/case)), \
+                 patch.object(self, 'logs', self.logs/case):
+                jobs.save_state('crashes', {'unified': 10000-initial_lag, 'rollupDay': '1969-12-31'})
+                self.cost = lambda seconds: startup+seconds/divisor
+                lag = [initial_lag]
+                for i in range(12):
+                    before = len(self.calls)
+                    now = 10000+3870*i
+                    self.assertTrue(self.collect(now))
+                    summary = self.rows('crash.collect')[-1]['props']
+                    self.assertEqual(jobs.read_state('crashes')['unified'], now)
+                    self.assertLessEqual(self.clock, 135)
+                    self.assertEqual(summary['skippedS'], max(0, initial_lag-5400) if i == 0 else 0)
+                    self.assertTrue(all(c[3] for c in self.calls[before:]))
+                    self.assertTrue(all(startup+(b-a)/divisor < 60 for a,b,_,_ in self.calls[before:]))
+                    self.assertLessEqual(self.calls[before][1]-self.calls[before][0], 60)
+                    lag.append(round(summary['lagS'], 3))
+                observed = [r['props']['observedAt'] for r in self.rows('crash.observed')]
+                self.assertEqual(observed, [at for at in self.boots if max(10000-initial_lag, 4600) < at <= now])
+                print('mixed unified lagS (%s):' % case, lag)
+
+    def test_mixed_startup_and_nonlinear_costs_keep_up_without_skips(self):
+        for startup, quadratic in ((5, 12), (10, 5), (15, 2), (20, 1)):
+            case = 'quadratic-%s-%s' % (startup, quadratic)
+            with self.subTest(case=case), patch.dict(os.environ, TOOLLOG_DIR=str(self.logs/case)), \
+                 patch.object(self, 'logs', self.logs/case):
+                jobs.save_state('crashes', {'unified': 4600, 'rollupDay': '1969-12-31'})
+                self.cost = lambda seconds: startup+quadratic*(seconds/900)**2
+                for i in range(12):
+                    before = len(self.calls)
+                    now = 10000+3870*i
+                    self.assertTrue(self.collect(now))
+                    self.assertEqual(jobs.read_state('crashes')['unified'], now)
+                    self.assertEqual(self.rows('crash.collect')[-1]['props']['skippedS'], 0)
+                    self.assertTrue(all(c[3] for c in self.calls[before:]))
+                    self.assertLessEqual(self.clock, 135)
+                observed = [r['props']['observedAt'] for r in self.rows('crash.observed')]
+                self.assertEqual(observed, [at for at in self.boots if 4600 < at <= now])
+
+    def test_capped_logger_retains_initial_skip_before_cursor_advances(self):
+        jobs.save_state('crashes', {'unified': -1626, 'rollupDay': '1969-12-31'})
+        save = collector.save_state
+        def checkpoint(name, state):
+            if state.get('unified') == 4600:
+                rows = self.rows('crash.unified.skip')
+                self.assertTrue(rows)
+                self.assertEqual(rows[-1]['props']['skippedS'], 6226)
+                self.assertEqual(rows[-1]['props']['reason'], 'lag_ceiling')
+            save(name, state)
+        with patch.object(toollog, 'CAP_BYTES', 0), \
+             patch.object(collector, 'save_state', side_effect=checkpoint):
+            self.assertTrue(collector.collect(10000, [], lambda a,b: {}))
+        self.assertEqual(jobs.read_state('crashes')['unified'], 10000)
+        self.assertNotIn('unifiedRetry', jobs.read_state('crashes'))
+        self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'], 6226)
+        self.assertEqual(self.rows('crash.collect')[-1]['props']['skippedS'], 6226)
+        self.assertEqual(len(self.rows('log.cap')), 1)
+        self.assertEqual(self.rows('crash.unified.chunk'), [])
+
+    def test_capped_logger_records_pending_legacy_skip_before_retiring_it(self):
+        jobs.save_state('crashes', {'unified': 10000, 'rollupDay': '1969-12-31',
+            'unifiedRetry': dict(windowStart=10000, windowEnd=10000, skippedS=6226)})
+        with patch.object(toollog, 'CAP_BYTES', 0):
+            self.assertTrue(collector.collect(10000, [], lambda a,b: {}))
+        self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'], 6226)
+        self.assertNotIn('unifiedRetry', jobs.read_state('crashes'))
+        # Healthy runs with no omitted time remain subject to the daily cap.
+        with patch.object(toollog, 'CAP_BYTES', 0):
+            self.assertTrue(collector.collect(10001, [], lambda a,b: {}))
+        self.assertEqual(len(self.rows('crash.source')), 1)
+        self.assertEqual(len(self.rows('crash.collect')), 1)
+
+    def test_capped_logger_retains_skip_when_the_first_read_fails(self):
+        jobs.save_state('crashes', {'unified': -1626, 'rollupDay': '1969-12-31'})
+        self.cost = lambda seconds: 1000
+        with patch.object(toollog, 'CAP_BYTES', 0):
+            self.assertFalse(self.collect())
+        state = jobs.read_state('crashes')
+        self.assertEqual(state['unified'], 4600)
+        self.assertEqual(state['unifiedRetry']['skippedS'], 0)
+        self.assertEqual(self.rows('crash.unified.skip')[-1]['props']['skippedS'], 6226)
+        self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'], 6226)
+        self.assertEqual(self.rows('crash.source')[-1]['props']['failure'], 'timeout')
+
+    def test_capped_logger_retains_skip_across_final_chunk_interruption(self):
+        jobs.save_state('crashes', {'unified': -1626, 'rollupDay': '1969-12-31'})
+        save = collector.save_state
+        def interrupt(name, state):
+            save(name, state)
+            if state.get('unified') == 10000 and 'unifiedRetry' in state:
+                raise SystemExit('after final checkpoint, before source summary')
+        with patch.object(toollog, 'CAP_BYTES', 0), \
+             patch.object(collector, 'save_state', side_effect=interrupt), \
+             self.assertRaises(SystemExit):
+            collector.collect(10000, [], lambda a,b: {})
+        self.assertEqual(jobs.read_state('crashes')['unifiedRetry']['skippedS'], 6226)
+        self.assertEqual(self.rows('crash.unified.skip')[-1]['props']['skippedS'], 6226)
+        self.assertEqual(self.rows('crash.source'), [])
+        with patch.object(toollog, 'CAP_BYTES', 0):
+            self.assertTrue(collector.collect(10000, [], lambda a,b: {}))
+            self.assertTrue(collector.collect(10001, [], lambda a,b: {}))
+        self.assertNotIn('unifiedRetry', jobs.read_state('crashes'))
+        self.assertEqual([r['props']['skippedS'] for r in self.rows('crash.source')], [6226])
+        self.assertEqual([r['props']['skippedS'] for r in self.rows('crash.collect')], [6226])
 
     def test_equal_size_samples_preserve_learned_cap_across_twelve_runs(self):
         jobs.save_state('crashes', {'unified': 6400, 'rollupDay': '1969-12-31'})
