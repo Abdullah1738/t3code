@@ -28,7 +28,23 @@ CONFLICTS = {'status', 'amount', 'time', 'missing_in_new_export', 'backdated_in_
              'probable_duplicate_log', 'other'}
 TAGS = {'exit_nonzero', 'invalid_arguments', 'not_authorized', 'reauth_needed', 'timeout',
         'subprocess_failed', 'renderer_failed', 'headless_chrome', 'database_error',
-        'io_error', 'interrupted', 'internal_error', 'cap_reached'}
+        'io_error', 'interrupted', 'internal_error', 'validate_failed', 'cap_reached'}
+# Static check-site IDs, never row identities, dates, labels, or source filenames.
+VALIDATE_CHECK_IDS = {
+    'regimen.header_count', 'regimen.columns', 'regimen.row_count', 'regimen.row_present',
+    'regimen.row_values', 'regimen.month_keys', 'regimen.month_sum', 'regimen.extra_columns',
+    'regimen.compound_count', 'meds_nag.taken_rows', 'meds_nag.override',
+    'canonical.taken_values', 'canonical.source_present', 'canonical.link',
+    'canonical.month_sum', 'canonical.historical_amount', 'labs.page_count',
+    'labs.result_count', 'labs.value_present', 'labs.marker_present', 'labs.unit_present',
+    'labs.value_parse', 'labs.flag_present', 'labs.reference_present', 'labs.known_value',
+    'labs.headline_unit', 'body.row_count', 'body.row_values', 'subjective.row_present',
+    'subjective.source_present', 'sites.row_present',
+}
+# Error metadata is shared by spans. Exit codes describe the wrapped command
+# escaping this span (not a failing subprocess's returncode). Historical rows
+# without these fields remain valid. Exception text and traceback paths stay out.
+ERROR_SCHEMA = {'exceptionClass': 'identifier', 'exitCode': 'exit_code', 'stage': 'function'}
 ENDPOINT_SCHEMA = {'httpStatus': 'status', 'rawCount': int, 'keptCount': int, 'fetchComplete': bool,
                    'scoreStates': {k: int for k in ('SCORED', 'PENDING_SCORE', 'UNSCORABLE', 'OTHER')},
                    'newestRecordEnd': 'iso', 'newestScoredRecordEnd': 'iso', 'tokenExpiresInS': 'seconds'}
@@ -37,7 +53,8 @@ SCHEMAS = {
         'outcome': {'logged', 'partial', 'fetch_failed', 'no_items', 'unmatched', 'bad_exclude', 'bad_portion', 'duplicate'},
         'lines': int, 'unmatched': int, 'options_not_counted': int, 'fetch_ms': int},
     'food.warning': {'warning': {'no_time', 'macro_drift', 'unverified', 'assumed', 'option_not_counted', 'partial'}, 'count': int},
-    'cli.run': {'command': set(COMMANDS), 'subcommand': set(' '.join(COMMANDS.values()).split()) | {'unknown', 'none', 'help'}},
+    'cli.run': {'command': set(COMMANDS), 'subcommand': set(' '.join(COMMANDS.values()).split()) | {'unknown', 'none', 'help'},
+                'failCount': int, 'failedCheckIds': 'check_ids'},
     'watcher.run': {}, 'sync.run': {'sleepCount': int, 'recoveryCount': int, 'cycleCount': int,
         'lastScoredSleep': 'iso', 'bodyCount': int, 'tokenRefreshed': bool, 'notScoredYet': bool,
         **{k: ENDPOINT_SCHEMA for k in ('sleep', 'recovery', 'cycle', 'body')}},
@@ -51,6 +68,8 @@ SCHEMAS = {
     'nag.day_end': {'slotsDue': int, 'slotsTaken': int, 'slotsOpen': int, 'nagsSent': int},
     'log.cap': {}, 'rollup.run': {},
 }
+for _span_name in ('cli.run', 'watcher.run', 'sync.run', 'card.render', 'rollup.run'):
+    SCHEMAS[_span_name].update(ERROR_SCHEMA)
 
 
 def utcnow():
@@ -118,6 +137,14 @@ def _fields(schema, props):
             out[key] = value
         elif spec == 'seconds' and (value is None or type(value) in (int, float) and math.isfinite(value) and -10**9 <= value <= 10**9):
             out[key] = value
+        elif spec in ('identifier', 'function') and isinstance(value, str):
+            if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,127}', value) or (
+                    spec == 'function' and value in {'<module>', '<lambda>', '<listcomp>', '<dictcomp>', '<setcomp>', '<genexpr>'}):
+                out[key] = value
+        elif spec == 'exit_code' and type(value) is int and 0 <= value <= 255:
+            out[key] = value
+        elif spec == 'check_ids' and isinstance(value, (list, tuple)):
+            out[key] = sorted({v for v in value if isinstance(v, str) and v in VALIDATE_CHECK_IDS})
         elif spec is bool and type(value) is bool:
             out[key] = value
         elif spec is int and type(value) is int and 0 <= value <= 10**9:
@@ -159,23 +186,56 @@ def _retention(root, today):
             pass
 
 
+def _repair_tail(fd):
+    # Called under the exclusive log lock: an interrupted row must not absorb the next one.
+    size = os.fstat(fd).st_size
+    if size and os.pread(fd, 1, size - 1) != b'\n':
+        end = size
+        while end:
+            start = max(0, end - 4096)
+            block = os.pread(fd, end - start, start)
+            if len(block) != end - start:
+                raise OSError('incomplete log tail read')
+            newline = block.rfind(b'\n')
+            if newline >= 0:
+                end = start + newline + 1
+                break
+            end = start
+        os.ftruncate(fd, end)
+        size = end
+    return size
+
+
+def _append_row(fd, row):
+    size = os.fstat(fd).st_size
+    complete = False
+    try:
+        complete = os.write(fd, row) == len(row)
+        return complete
+    finally:
+        # Keep complete rows intact on short writes, exceptions and interruptions.
+        if not complete:
+            os.ftruncate(fd, size)
+
+
 def emit(component, name, kind='event', duration_ms=None, ok=None, props=None, tag=None, run_id=None, rejected=None):
+    """Return whether the requested row was fully appended; logging never raises."""
     try:
         if component not in COMPONENTS or name not in SCHEMAS or kind not in ('event', 'perf', 'error'):
-            return
+            return False
         now = utcnow()
         root = log_dir()
         if root is None:
-            return
+            return False
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         root.chmod(0o700)
         path = root / (now.date().isoformat() + '.ndjson')
-        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
         try:
             os.fchmod(fd, 0o600)
             # Never wait for another writer, and never lock across tool work.
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            size = os.fstat(fd).st_size
+            size = _repair_tail(fd)
             if size == 0:
                 _retention(root, now.date())
             if size >= CAP_BYTES:
@@ -185,14 +245,16 @@ def emit(component, name, kind='event', duration_ms=None, ok=None, props=None, t
                     pass
                 else:
                     os.close(marker)
-                    os.write(fd, _line(component, 'log.cap', 'error', None, False, {}, 'cap_reached', None, now))
+                    if not _append_row(fd, _line(component, 'log.cap', 'error', None, False, {}, 'cap_reached', None, now)):
+                        return False
                 if kind != 'error':
-                    return
-            os.write(fd, _line(component, name, kind, duration_ms, ok, props, tag, run_id, now, rejected))
+                    return False
+            row = _line(component, name, kind, duration_ms, ok, props, tag, run_id, now, rejected)
+            return _append_row(fd, row)
         finally:
             os.close(fd)
     except BaseException:
-        pass
+        return False
 
 
 class Span:
@@ -216,12 +278,30 @@ class Span:
         try:
             if exc is not None and not (isinstance(exc, SystemExit) and exc.code in (None, 0)):
                 self.ok = False
-                self.tag = error_tag(exc, self.name == 'card.render')
+                if not (self.tag == 'validate_failed' and self.component == 'validate'
+                        and isinstance(exc, SystemExit) and exc.code == 1):
+                    self.tag = error_tag(exc, self.name == 'card.render')
+                self.props['exceptionClass'] = type(exc).__name__
+                self.props['exitCode'] = ((int(exc.code) % 256 if isinstance(exc.code, int) else 1)
+                                          if isinstance(exc, SystemExit) else
+                                          130 if isinstance(exc, KeyboardInterrupt) else 1)
+                if tb is not None:
+                    while tb.tb_next is not None:
+                        tb = tb.tb_next
+                    self.props['stage'] = tb.tb_frame.f_code.co_name
             emit(self.component, self.name, 'perf' if self.ok else 'error',
                  (time.monotonic() - self.start) * 1000, self.ok, self.props, self.tag, self.run_id, rejected=self.rejected)
         except BaseException:
             pass
         return False
+
+    def validate_failure(self, check_id):
+        try:
+            if self.component == 'validate' and check_id in VALIDATE_CHECK_IDS:
+                self.props['failCount'] += 1
+                self.props['failedCheckIds'] = sorted(set(self.props['failedCheckIds']) | {check_id})
+        except BaseException:
+            pass
 
 
 def run(component, argv=None, name='cli.run'):
@@ -234,9 +314,29 @@ def run(component, argv=None, name='cli.run'):
             sub = 'help'
         allowed = COMMANDS.get(component, '').split() + ['help']
         sub = sub if sub in allowed else 'unknown'
-        return Span(component, name, {'command': component, 'subcommand': sub} if name == 'cli.run' else {})
+        props = {'command': component, 'subcommand': sub} if name == 'cli.run' else {}
+        if component == 'validate' and name == 'cli.run':
+            props.update(failCount=0, failedCheckIds=[])
+        return Span(component, name, props)
     except BaseException:
         return contextlib.nullcontext()
+
+
+def snoozed(component, count, state, now):
+    """Record count changes and a Dubai-day heartbeat; caller persists its state."""
+    try:
+        if component not in {'meds-nag', 'gym-nudge', 'nutrition-nudge'} or type(count) is not int or not 0 <= count <= 10**9:
+            return False
+        day = now.astimezone(dt.timezone(dt.timedelta(hours=4))).date().isoformat()
+        marker = {'day': day, 'count': count}
+        if state.get('_toollogSnoozed') == marker:
+            return False
+        if not emit(component, 'nag.snoozed', props={'count': count}):
+            return False
+        state['_toollogSnoozed'] = marker
+        return True
+    except BaseException:
+        return False
 
 
 def conflicts(rows):
@@ -384,10 +484,11 @@ def rollup(day=None):
                         durations[r['name']].append(value)
                     tag = r.get('error', {}).get('tag')
                     if tag in TAGS:
-                        tags[tag] += 1
+                        cause = (tag, props.get('exceptionClass'), props.get('exitCode'))
+                        tags[cause] += 1
                         candidate = r.get('ids', {}).get('run')
                         if isinstance(candidate, str) and len(candidate) == 32 and all(c in '0123456789abcdef' for c in candidate):
-                            samples.setdefault(tag, candidate)
+                            samples.setdefault(cause, candidate)
                 except (ValueError, TypeError, AttributeError):
                     malformed += 1
         total = sum(names.values())
@@ -412,7 +513,9 @@ def rollup(day=None):
         for name, values in durations.items():
             values.sort()
             result['durationMs'][name] = {'p50': _percentile(values, .5), 'p95': _percentile(values, .95), 'max': values[-1]}
-        result['topErrors'] = [{'tag': tag, 'count': count, 'sampleId': samples.get(tag)} for tag, count in tags.most_common(20)]
+        result['topErrors'] = [{'tag': cause[0], 'count': count, 'sampleId': samples.get(cause),
+                                'exceptionClass': cause[1], 'exitCode': cause[2]}
+                               for cause, count in tags.most_common(20)]
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         root.chmod(0o700)
         target = root / ('rollup-' + day.isoformat() + '.json')

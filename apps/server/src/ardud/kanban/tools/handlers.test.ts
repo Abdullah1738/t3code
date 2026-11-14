@@ -392,6 +392,78 @@ const fakeThreads = (
 const owner: KanbanActor = { _tag: "owner" };
 const decodeMessage = Schema.decodeUnknownEffect(KanbanMessage);
 
+it.live("card_flag saves its stalled reason while the board background reader is held", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "board-flag-reader-" });
+    const state = Context.get(
+      yield* Layer.build(
+        NodeSqliteClient.layer({
+          filename: path.join(directory, "boards.sqlite"),
+          readerWorker: true,
+          foregroundReaderSlots: 1,
+          backgroundReaderSlots: 1,
+        }),
+      ),
+      SqlClient.SqlClient,
+    );
+    yield* state`PRAGMA journal_mode = WAL`;
+    yield* state`CREATE TABLE thread_link_probe (value INTEGER)`;
+    const fake = fakeThreads();
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "flag-reader",
+        name: "Flag reader",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const card = yield* kanban.createCard(board.id, { title: "Work", prompt: "Work" }, owner);
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const holder = yield* state
+        .withTransaction(
+          state`SELECT * FROM thread_link_probe`.pipe(
+            Effect.andThen(Deferred.succeed(held, undefined)),
+            Effect.andThen(Deferred.await(release)),
+          ),
+        )
+        .pipe(NodeSqliteClient.readOnly, Effect.forkChild);
+      yield* Deferred.await(held);
+      fake.storeControl.beforeThreadLink = () =>
+        state`SELECT * FROM thread_link_probe`.pipe(
+          NodeSqliteClient.readOnly,
+          Effect.orDie,
+          Effect.asVoid,
+        );
+      yield* Effect.gen(function* () {
+        const result = yield* call(worker, "card_flag", {
+          card: card.id,
+          stalled: true,
+          reason: "Waiting on the new head",
+        }).pipe(Effect.timeout("5 seconds"));
+        assert.isFalse(result.isError, result.text);
+        assert.strictEqual(
+          (yield* kanban.card(card.id)).card.stalled?.reason,
+          "Waiting on the new head",
+        );
+        assert.isUndefined(holder.pollUnsafe());
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+      yield* Fiber.join(holder);
+    }).pipe(
+      Effect.provide(
+        fake.layer.pipe(
+          // The held reader may delay notifications after the production commit reply.
+          Layer.provide(Layer.succeed(KanbanService.OwnerRouteMode, "deferred")),
+        ),
+      ),
+    );
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect.each(["subtask_done", "report_bug"] as const)(
   "%s saves an attached active worker's result while the state background reader is held",
   (tool) =>
@@ -881,6 +953,46 @@ it.effect("discussion_post repeated returns the same message", () => {
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("a work thread is directed to its own discussion without creating another card's", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "post-guidance",
+      name: "Post guidance",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const own = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+    yield* kanban.dispatchNow;
+    const thread = (yield* kanban.card(own.id)).card.activeThreadId!;
+    const other = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
+
+    const refused = yield* call(thread, "discussion_post", {
+      card: `#${other.number}`,
+      text: "For the other card",
+    });
+    assert.isTrue(refused.isError, refused.text);
+    assert.include(refused.text, "capability_denied");
+    assert.include(
+      refused.text,
+      `This thread works on other cards; it can't post on card #${other.number}. Post it in your own card's discussion; the board's evaluator carries it over.`,
+    );
+    assert.isNull((yield* kanban.card(other.id)).card.discussionId);
+
+    const posted = yield* call(thread, "discussion_post", {
+      card: `#${own.number}`,
+      text: "For the evaluator to carry over",
+    });
+    assert.isFalse(posted.isError, posted.text);
+    const message = yield* decodeMessage(posted.structured.message);
+    const discussionId = (yield* kanban.card(own.id)).card.discussionId;
+    assert.strictEqual(discussionId, message.discussionId);
+    assert.deepStrictEqual(yield* kanban.messages(message.discussionId), [message]);
+    assert.isNull((yield* kanban.card(other.id)).card.discussionId);
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("a work thread reads another card's discussion but cannot post to that card", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {
@@ -915,7 +1027,7 @@ it.effect("a work thread reads another card's discussion but cannot post to that
       assert.isTrue(posted.isError);
       assert.include(
         posted.text,
-        `This thread works on other cards; it can't change card #${other.number}.`,
+        `This thread works on other cards; it can't post on card #${other.number}. Post it in your own card's discussion; the board's evaluator carries it over.`,
       );
     }
     assert.lengthOf(yield* kanban.messages(discussion.id), 2);
@@ -958,7 +1070,10 @@ it.effect.each(["work", "review"] as const)(
       });
       assert.isTrue(posted.isError, posted.text);
       assert.include(posted.text, "capability_denied");
-      assert.include(posted.text, `can't change card #${other.number}`);
+      assert.include(
+        posted.text,
+        `This thread works on other cards; it can't post on card #${other.number}. Post it in your own card's discussion; the board's evaluator carries it over.`,
+      );
       assert.deepStrictEqual(yield* kanban.discussion(discussion.id), before);
       assert.deepStrictEqual(yield* kanban.messages(discussion.id), messages);
 
@@ -1157,8 +1272,8 @@ it.effect(
         text: "Not mine",
       });
       assert.isTrue(theirs.isError);
-      assert.include(theirs.text, `can't change card #${other.number}`);
-      assert.include(theirs.text, "card_create");
+      assert.include(theirs.text, `can't post on card #${other.number}`);
+      assert.include(theirs.text, "your own card's discussion");
       for (const [index, ref] of [`#${other.number}`, String(other.number), other.id].entries()) {
         waiting = yield* Deferred.make<AnalyticsEvent>();
         waitingTool = "card_create";
@@ -1355,6 +1470,9 @@ it.effect("compact reads: board_get since, card_get pages, discussion_read limit
     // The 60 comments plus the ask and its answer.
     assert.isAtLeast(view.cards[0]!.comments ?? 0, 60);
     assert.isFalse(view.page.hasMore);
+    const relativeCompact = yield* call(thread, "board_get", { since: "now-24h" });
+    assert.isFalse(relativeCompact.isError, relativeCompact.text);
+    assert.deepStrictEqual(relativeCompact.structured.board, compact.structured.board);
     const tooOld = yield* call(thread, "board_get", {
       since: DateTime.formatIso(DateTime.makeUnsafe(now - 80 * 60 * 60 * 1000)),
     });
@@ -1425,6 +1543,20 @@ it.effect("compact reads: board_get since, card_get pages, discussion_read limit
       id: "q1",
       minutes: 20,
     });
+    const relativeRollup = yield* call(thread, "board_activity", { since: "24h", until: "now" });
+    assert.isFalse(relativeRollup.isError, relativeRollup.text);
+    assert.deepStrictEqual(
+      (relativeRollup.structured.activity as { asks: unknown }).asks,
+      activity.asks,
+    );
+    const futureSince = DateTime.formatIso(DateTime.makeUnsafe(now + 60 * 60 * 1000));
+    for (const name of ["board_get", "board_activity"]) {
+      const future = yield* call(thread, name, { since: futureSince });
+      assert.isTrue(future.isError);
+      assert.include(future.text, futureSince);
+      assert.include(future.text, DateTime.formatIso(DateTime.makeUnsafe(now)));
+      assert.include(future.text, "now, server clock, UTC");
+    }
   }).pipe(Effect.provide(layer));
 });
 
@@ -6655,7 +6787,12 @@ it.effect(
               assert.equal(result.isError, denied, result.text);
               if (denied) {
                 assert.include(result.text, "capability_denied");
-                assert.include(result.text, `can't change card #${card.number}`);
+                assert.include(
+                  result.text,
+                  operation === "post"
+                    ? `can't post on card #${card.number}`
+                    : `can't change card #${card.number}`,
+                );
               }
               for (const row of [
                 yield* Deferred.await(pending.ledger),

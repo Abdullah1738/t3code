@@ -70,6 +70,11 @@ const GeneralEvent = Schema.Struct({
   errorTag: Schema.optionalKey(Label),
   errorPhase: Schema.optionalKey(McpPhase),
   saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+  responseDelivery: Schema.optionalKey(Schema.Literals(["pending", "finished", "closed"])),
+  responseElapsedMs: Schema.optionalKey(Measurement),
+  responseCloseReason: Schema.optionalKey(
+    Schema.Literals(["idle_timeout", "client_error", "peer_end", "socket_error", "unknown"]),
+  ),
   readerLane: Schema.optionalKey(Label),
   waitStage: Schema.optionalKey(Schema.Literals(["lookup.caller", "lookup.target", "waiting"])),
   waitLookupMs: Schema.optionalKey(Measurement),
@@ -229,6 +234,7 @@ export const AnalyticsReadInput = Schema.Struct({
   tool: Schema.optionalKey(Label),
   outcome: Schema.optionalKey(McpOutcome),
   limit: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 500 }))),
+  responseDelivery: Schema.optionalKey(Schema.Literals(["pending", "finished", "closed"])),
 });
 export type AnalyticsReadInput = typeof AnalyticsReadInput.Type;
 const LatencyFields = {

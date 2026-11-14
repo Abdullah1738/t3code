@@ -210,7 +210,7 @@ const BoardGet = tool(
     since: Schema.optional(
       describe(
         TrimmedNonEmptyString,
-        "ISO time, at most 72 hours ago: only cards active since then, as short rows.",
+        "ISO time or relative (now, now-24h, 24h, 90m, 2d), at most 72 hours ago: only cards active since then, as short rows. Times are UTC; give a Z or offset for ISO times.",
       ),
     ),
   },
@@ -225,9 +225,17 @@ const BoardActivity = tool(
   {
     boardId: BoardRef,
     since: Schema.optional(
-      describe(TrimmedNonEmptyString, "ISO start; default 24 hours before until."),
+      describe(
+        TrimmedNonEmptyString,
+        "ISO or relative start (now, now-24h, 24h, 90m, 2d); default 24 hours before until. Times are UTC; give a Z or offset for ISO times.",
+      ),
     ),
-    until: Schema.optional(describe(TrimmedNonEmptyString, "ISO end; default now.")),
+    until: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        "ISO or relative end (now, now-24h, 24h, 90m, 2d); default now. Relative times count back from the server clock. Times are UTC; give a Z or offset for ISO times.",
+      ),
+    ),
   },
   { activity: Record },
   { readonly: true },
