@@ -66,12 +66,9 @@ const negatableSecretAction = new RegExp(
   "i",
 );
 const secretKeyword =
-  /\b(?:secrets?|passwords?|credentials?|tokens?|(?:(?:api|private|signing|ssh)\s+)?keys?)\b/i;
-const secretNoun = String.raw`(?:secrets?|passwords?|credentials?|tokens?|keys?)`;
-const negatableSecretKeyword = new RegExp(
-  String.raw`\b${secretNoun}(?:[ \t]+${secretNoun})*\b`,
-  "i",
-);
+  /(?<![\w-])(?:secrets?|passwords?|credentials?|tokens?|(?:(?:api|private|signing|ssh)\s+)?keys?)(?![\w-])/i;
+const secretNoun = String.raw`(?<![\w-])(?:secrets?|passwords?|credentials?|tokens?|keys?)(?![\w-])`;
+const negatableSecretKeyword = new RegExp(String.raw`${secretNoun}(?:[ \t]+${secretNoun})*`, "i");
 const secretMention = new RegExp(
   `${secretAction.source}[^.;\\r\\n]{0,40}${secretKeyword.source}`,
   "i",
