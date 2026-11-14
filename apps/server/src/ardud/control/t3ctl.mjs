@@ -21,7 +21,8 @@ const HELP = `t3ctl <command> [options]
 
   login --url URL --token TOKEN        save to ~/.robob/components/t3ctl.json (chmod 600)
   health [--deep] [--json]              connection/token; deep: lag + real state read (10s bound)
-  live SHA-OR-REF [--repo PATH]        check whether a commit is in the running build
+  live SHA-OR-REF [--repo PATH] [--timeout SECONDS]
+                                       check running build ancestry (20s total, health <=10s)
   requests [--origin O]                pending approvals and questions everywhere
   projects                             list projects
   models                               default model and available models
@@ -58,37 +59,81 @@ Keep the same credentials when retrying; an explicit --token is never printed.
 For a URL containing credentials or a query, set T3CTL_RETRY_URL before retrying.
 Use -- before a thread or text beginning with -.
 --request-timeout also limits wait requests and event streams when supplied;
---timeout separately controls how long the server waits for a thread.
+--timeout controls live's total deadline or how long the server waits for a thread.
 
 Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, else the file named by
 T3_CONTROL_TOKEN_FILE, else the first found of ${TOKEN_FILE} and
 ${SHARED_TOKEN_FILE}.`;
 
+function liveGit(args, { signal, ...options }) {
+  return new Promise((resolve) => {
+    const child = NodeChildProcess.execFile("git", args, options, (error, stdout) => {
+      signal.removeEventListener("abort", stop);
+      resolve({ status: error ? error.code : 0, stdout, error });
+    });
+    // A killed child can stay in the kernel. It must not hold the CLI open.
+    const stop = () => {
+      child.kill("SIGKILL");
+      child.unref();
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    };
+    signal.addEventListener("abort", stop, { once: true });
+    child.stdin?.destroy();
+  });
+}
+
 /** Check whether a ref is an ancestor of the build reported by health. */
-export async function checkLive(commit, { health, repo = DEFAULT_REPO }) {
-  let response;
-  try {
-    response = await health();
-  } catch {
-    return { commit, buildCommit: null, live: null, reason: "health unavailable" };
-  }
-  if (
-    response?.ok !== true ||
-    !["healthy", "degraded", "recovered-unverified"].includes(response?.status)
-  ) {
-    return { commit, buildCommit: null, live: null, reason: "invalid health response" };
-  }
-  const buildCommit = response.buildCommit;
-  if (
-    typeof buildCommit !== "string" ||
-    buildCommit.trim() !== buildCommit ||
-    !/^[0-9a-f]{7,40}$/.test(buildCommit)
-  ) {
-    return { commit, buildCommit: null, live: null, reason: "build commit unavailable" };
-  }
-  if (typeof commit !== "string" || !commit || commit.startsWith("-")) {
-    return { commit: commit ?? null, buildCommit, live: null, reason: "invalid commit or ref" };
-  }
+export async function checkLive(
+  commit,
+  { health, repo = DEFAULT_REPO, git = liveGit, timeoutMs = 20_000, onStage = () => {} },
+) {
+  const start = performance.now();
+  const deadline = start + timeoutMs;
+  const stages = {};
+  let buildCommit = null;
+  let currentStage = "health";
+  const answer = (live, reason) => ({
+    commit: commit ?? null,
+    buildCommit,
+    live,
+    reason,
+    stages,
+    elapsedMs: Math.round(performance.now() - start),
+  });
+  const timedOut = () => new DOMException("Stage deadline", "TimeoutError");
+  const stage = async (name, run, capMs = Infinity) => {
+    currentStage = name;
+    const started = performance.now();
+    const remaining = Math.ceil(deadline - started);
+    if (remaining <= 0) throw timedOut();
+    const limit = Math.min(remaining, capMs);
+    onStage(name);
+    const controller = new AbortController();
+    let timer;
+    let status = "ok";
+    try {
+      const value = await Promise.race([
+        Promise.resolve().then(() => run({ signal: controller.signal, timeoutMs: limit })),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            reject(timedOut());
+            controller.abort();
+          }, limit);
+        }),
+      ]);
+      if (performance.now() >= started + limit) throw timedOut();
+      return value;
+    } catch (error) {
+      status = error?.name === "TimeoutError" ? "timeout" : "error";
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      controller.abort();
+      stages[name] = { status, ms: Math.round(performance.now() - started) };
+    }
+  };
 
   const gitEnv = { ...process.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" };
   for (const key of [
@@ -104,45 +149,81 @@ export async function checkLive(commit, { health, repo = DEFAULT_REPO }) {
     "GIT_CONFIG_COUNT",
   ])
     delete gitEnv[key];
-  const git = (...args) =>
-    NodeChildProcess.spawnSync("git", args, {
+  const runGit = async (args, { signal }) => {
+    const remaining = Math.ceil(deadline - performance.now());
+    if (signal.aborted || remaining <= 0) throw timedOut();
+    const result = await git(args, {
       cwd: repo,
       env: gitEnv,
       encoding: "utf8",
-      timeout: 30_000,
+      timeout: remaining,
+      killSignal: "SIGKILL",
+      signal,
     });
-  const objectId = (prefix) => {
-    const result = git("rev-parse", `--disambiguate=${prefix.toLowerCase()}`);
+    if (result.error?.code === "ETIMEDOUT" || result.error?.signal === "SIGKILL") throw timedOut();
+    return result;
+  };
+  const objectId = async (prefix, options) => {
+    const result = await runGit(["rev-parse", `--disambiguate=${prefix.toLowerCase()}`], options);
     const matches = result.stdout?.trim().split("\n").filter(Boolean) ?? [];
     return result.status === 0 &&
       matches.length === 1 &&
-      git("cat-file", "-t", matches[0]).stdout?.trim() === "commit"
+      (await runGit(["cat-file", "-t", matches[0]], options)).stdout?.trim() === "commit"
       ? matches[0]
       : null;
   };
-  const target = /^[0-9a-f]{7,40}$/i.test(commit)
-    ? objectId(commit)
-    : (() => {
-        const result = git("rev-parse", "--verify", "--end-of-options", `${commit}^{commit}`);
-        return result.status === 0 ? result.stdout.trim() : null;
-      })();
-  if (target === null) {
-    return { commit, buildCommit, live: null, reason: "commit or ref unavailable" };
-  }
-  const build = objectId(buildCommit);
-  if (build === null) {
-    return { commit, buildCommit, live: null, reason: "build commit unavailable in repo" };
-  }
-  const result = git("merge-base", "--is-ancestor", target, build);
-  if (result.status === 0) return { commit, buildCommit, live: true, reason: "ancestor of build" };
-  if (result.status === 1) {
-    const shallow = git("rev-parse", "--is-shallow-repository");
-    if (shallow.status === 0 && shallow.stdout.trim() === "false") {
-      return { commit, buildCommit, live: false, reason: "not ancestor of build" };
+  try {
+    const response = await stage("health", health, 10_000);
+    if (
+      response?.ok !== true ||
+      !["healthy", "degraded", "recovered-unverified"].includes(response?.status)
+    ) {
+      return answer(null, "invalid health response");
     }
-    return { commit, buildCommit, live: null, reason: "ancestry incomplete or unavailable" };
+    const reportedBuild = response.buildCommit;
+    if (
+      typeof reportedBuild !== "string" ||
+      reportedBuild.trim() !== reportedBuild ||
+      !/^[0-9a-f]{7,40}$/.test(reportedBuild)
+    ) {
+      return answer(null, "build commit unavailable");
+    }
+    buildCommit = reportedBuild;
+    if (typeof commit !== "string" || !commit || commit.startsWith("-")) {
+      return answer(null, "invalid commit or ref");
+    }
+    const target = await stage("target", async (options) => {
+      if (/^[0-9a-f]{7,40}$/i.test(commit)) return objectId(commit, options);
+      const result = await runGit(
+        ["rev-parse", "--verify", "--end-of-options", `${commit}^{commit}`],
+        options,
+      );
+      return result.status === 0 ? result.stdout.trim() : null;
+    });
+    if (target === null) return answer(null, "commit or ref unavailable");
+    const build = await stage("build", (options) => objectId(buildCommit, options));
+    if (build === null) return answer(null, "build commit unavailable in repo");
+    const result = await stage("ancestry", (options) =>
+      runGit(["merge-base", "--is-ancestor", target, build], options),
+    );
+    if (result.status === 0) return answer(true, "ancestor of build");
+    if (result.status === 1) {
+      const shallow = await stage("shallow", (options) =>
+        runGit(["rev-parse", "--is-shallow-repository"], options),
+      );
+      if (shallow.status === 0 && shallow.stdout.trim() === "false") {
+        return answer(false, "not ancestor of build");
+      }
+      return answer(null, "ancestry incomplete or unavailable");
+    }
+    return answer(null, "git ancestry check failed");
+  } catch (error) {
+    // Error messages can contain server bodies, credentials or git output.
+    return answer(
+      null,
+      error?.name === "TimeoutError" ? `${currentStage} timed out` : `${currentStage} unavailable`,
+    );
   }
-  return { commit, buildCommit, live: null, reason: "git ancestry check failed" };
 }
 
 const shellQuote = (value) => `'${value.replace(/'/g, "'\\''")}'`;
@@ -310,13 +391,47 @@ async function main() {
   }
   if (command === "live") {
     const commit = need(args[0], "SHA-OR-REF");
-    const result = await checkLive(commit, {
-      repo: flags.repo,
-      health: () =>
-        new ControlClient({ url: flags.url, token: flags.token, component: "t3ctl" }).health(),
-    });
-    print(result);
-    process.exitCode = result.live === true ? 0 : result.live === false ? 3 : 2;
+    const seconds = flags.timeout === undefined ? 20 : Number(flags.timeout);
+    if (!Number.isFinite(seconds) || seconds <= 0 || seconds * 1000 > 2_147_481_647) {
+      throw new Error("--timeout must be a positive number of seconds");
+    }
+    const budget = Math.max(1, Math.round(seconds * 1000));
+    const started = performance.now();
+    let stage = "health";
+    let stageStarted = started;
+    const finish = (result) => {
+      const code = result.live === true ? 0 : result.live === false ? 3 : 2;
+      // Flush the single answer, then exit even if a socket or child is still open.
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`, () => process.exit(code));
+    };
+    const backstop = setTimeout(() => {
+      finish({
+        commit,
+        buildCommit: null,
+        live: null,
+        reason: `timeout at ${stage}`,
+        stages: {
+          [stage]: { status: "timeout", ms: Math.round(performance.now() - stageStarted) },
+        },
+        elapsedMs: Math.round(performance.now() - started),
+      });
+      process.exit(2);
+    }, budget + 2000);
+    backstop.unref();
+    finish(
+      await checkLive(commit, {
+        repo: flags.repo,
+        timeoutMs: budget,
+        onStage: (name) => {
+          stage = name;
+          stageStarted = performance.now();
+        },
+        health: (options) =>
+          new ControlClient({ url: flags.url, token: flags.token, component: "t3ctl" }).health(
+            options,
+          ),
+      }),
+    );
     return;
   }
   let requestTimeoutMs;
