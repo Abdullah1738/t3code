@@ -957,7 +957,6 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         break
                     except OffboxError as e:
                         if resume_stall is not None:
-                            from . import home
                             refused = 400 <= (getattr(e, 'status', None) or 0) < 500
                             wrapped = OffboxError(f"{resume_stall}. Replacement allocation failed: {e}; nothing ran",
                                                   code=e.code, started=e.started or resume_stall.started,
