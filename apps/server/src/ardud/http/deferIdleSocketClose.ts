@@ -8,12 +8,15 @@ import type * as NodeNet from "node:net";
 export function deferIdleSocketClose<T extends NodeHttp.Server>(
   server: T,
   onClose?: (socket: NodeNet.Socket, outcome: "closed" | "rescued") => void,
+  isActive: (socket: NodeNet.Socket) => boolean = () => false,
 ): T {
   server.on("timeout", (socket: NodeNet.Socket) => {
     const bytesRead = socket.bytesRead;
     setImmediate(() => {
       if (socket.destroyed) return;
-      if (socket.bytesRead !== bytesRead) {
+      // A stale timeout can run after the parser has already dispatched the next
+      // request. Its bytes then stay unchanged while the handler waits to save.
+      if (isActive(socket) || socket.bytesRead !== bytesRead) {
         onClose?.(socket, "rescued");
         return;
       }

@@ -185,7 +185,8 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     (filter?.boardId === undefined || filter.boardId === event.boardId) &&
     (filter?.cardId === undefined || filter.cardId === event.cardId) &&
     (filter?.tool === undefined || filter.tool === event.tool) &&
-    (filter?.outcome === undefined || filter.outcome === event.outcome);
+    (filter?.outcome === undefined || filter.outcome === event.outcome) &&
+    (filter?.responseDelivery === undefined || filter.responseDelivery === event.responseDelivery);
   const viewKey = (day: string, filter?: AnalyticsReadInput) =>
     JSON.stringify([
       day,
@@ -194,6 +195,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       filter?.cardId,
       filter?.tool,
       filter?.outcome,
+      filter?.responseDelivery,
     ]);
   const invalidate = (day: string) => {
     for (const [key, view] of views) if (view.day === day) views.delete(key);
