@@ -1670,6 +1670,7 @@ parentPort.on("message", (request) => {
   let mayWrite = false;
   let observedWrite = false;
   let executionStarted;
+  let elapsedMs;
   try {
     if (close) {
       operation = "close";
@@ -1690,6 +1691,7 @@ parentPort.on("message", (request) => {
       return;
     }
     if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
+    executionStarted = performance.now();
     const entry = cached ? statements.get(sql) : undefined;
     let statement = entry && performance.now() - entry.at < workerData.prepareCacheTTL ? entry.statement : undefined;
     if (!statement) {
@@ -1706,6 +1708,8 @@ parentPort.on("message", (request) => {
     mayWrite = observedWrite || db.isTransaction;
     configurationDirty ||= Boolean(classifications.get(statement)?.configuration) || typeof db.setAuthorizer !== "function";
     schemaDirty ||= Boolean(classifications.get(statement)?.schema) || typeof db.setAuthorizer !== "function";
+    elapsedMs = performance.now() - executionStarted;
+    executionStarted = undefined;
     if (classifications.get(statement)?.write) await checkpoint?.admit(id);
     if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
     operation = "execute";
@@ -1718,6 +1722,8 @@ parentPort.on("message", (request) => {
       const result = statement.run(...params);
       return raw ? result : [];
     })();
+    elapsedMs += performance.now() - executionStarted;
+    executionStarted = undefined;
     activeClassification = undefined;
     observedWrite ||= Boolean(classifications.get(statement)?.write || classifications.get(statement)?.check);
     mayWrite ||= observedWrite;
@@ -1726,14 +1732,14 @@ parentPort.on("message", (request) => {
     }
     const committed = !db.isTransaction && /^\\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\\b/i.test(sql);
     const classification = classifications.get(statement);
-    parentPort.postMessage({ id, rows, committed, write: observedWrite, elapsedMs: performance.now() - start,
+    parentPort.postMessage({ id, rows, committed, write: observedWrite, elapsedMs,
       inTransaction: db.isTransaction,
       ...recoverySnapshot(classification, sql, params) });
   } catch (error) {
     activeClassification = undefined;
-    const elapsedMs = executionStarted === undefined ? undefined : performance.now() - executionStarted;
+    const statementElapsed = executionStarted === undefined ? elapsedMs : (elapsedMs ?? 0) + performance.now() - executionStarted;
     const snapshot = db ? recoverySnapshot(undefined, undefined, undefined) : {};
-    errorReply(id, error, operation, { ...snapshot, inTransaction: db?.isTransaction ?? false, write: observedWrite, elapsedMs });
+    errorReply(id, error, operation, { ...snapshot, inTransaction: db?.isTransaction ?? false, write: observedWrite, elapsedMs: statementElapsed });
   } finally {
     // Authorizer classification covers CTE/commented writes; transaction state
     // covers RELEASE/ROLLBACK. OR FAIL may persist rows despite throwing.

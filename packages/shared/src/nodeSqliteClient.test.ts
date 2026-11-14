@@ -93,15 +93,29 @@ vi.mock("node:worker_threads", async (importOriginal) => {
             let nextChild = 0;
             let nextPause;
             let metadataFailures = 0;
+            let timedSql;
+            let virtualClock;
+            const nativeNow = performance.now.bind(performance);
+            Object.defineProperty(performance, "now", { value: () => virtualClock ?? nativeNow() });
             const pausedStatements = new Map();
             const sqlitePrototype = require("node:sqlite").DatabaseSync.prototype;
             const nativePrepare = sqlitePrototype.prepare;
             sqlitePrototype.prepare = function(sql, ...args) {
+              if (virtualClock !== undefined) {
+                if (sql === timedSql) virtualClock += 100;
+                if (sql.startsWith("SELECT name, type, sql FROM ")) virtualClock += 5000;
+              }
               if (metadataFailures > 0 && sql.startsWith("SELECT name, type, sql FROM ")) {
                 metadataFailures--;
                 throw new Error("test metadata read failure");
               }
               return nativePrepare.call(this, sql, ...args);
+            };
+            const statementPrototype = require("node:sqlite").StatementSync.prototype;
+            const nativeRun = statementPrototype.run;
+            statementPrototype.run = function(...args) {
+              if (virtualClock !== undefined && this.sourceSQL === timedSql) virtualClock += 25;
+              return nativeRun.apply(this, args);
             };
             const post = parentPort.postMessage.bind(parentPort);
             const on = parentPort.on.bind(parentPort);
@@ -110,6 +124,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
               if (!message?.testCheckpoint) return;
               if (message.kind === "arm") { nextPause = message.args[0]; return; }
               if (message.kind === "fail-metadata") { metadataFailures = message.args[0]; return; }
+              if (message.kind === "time-prepare") { timedSql = message.args[0]; virtualClock = 0; return; }
               if (message.kind === "resume") {
                 pausedStatements.get(message.args[0])?.();
                 pausedStatements.delete(message.args[0]);
@@ -2919,6 +2934,50 @@ it.effect(
         );
       }
     }),
+);
+
+it.effect.each(["success", "prepare error"] as const)(
+  "measures worker preparation and execution without recovery bookkeeping (%s)",
+  (outcome) => {
+    const spans: Tracer.NativeSpan[] = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    const statement =
+      outcome === "success"
+        ? "CREATE TEMP TABLE timed_metadata(value INTEGER)"
+        : "SELECT missing_timed_column FROM sqlite_schema";
+    return withFileClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const writer = writerWorkers.at(-1)!;
+          // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+          writer.postMessage({ testCheckpoint: true, kind: "time-prepare", args: [statement] });
+          yield* writerBridgeBarrier(writer);
+          const execute = sql.unsafe(statement).unprepared;
+          if (outcome === "prepare error") {
+            const error = yield* execute.pipe(Effect.flip, Effect.orDie);
+            assert.equal(error.reason.operation, "prepare");
+          } else {
+            yield* execute;
+          }
+          const span = spans.find((entry) => entry.attributes.get("db.query.text") === statement);
+          assert.isDefined(span);
+          assert.equal(
+            span!.attributes.get("db.statement.execution_ms"),
+            outcome === "success" ? 125 : 100,
+          );
+        }),
+      { readerWorker: false },
+    ).pipe(
+      Effect.provideService(Statement.SpanPropagationEnabled, true),
+      Effect.withTracer(tracer),
+    );
+  },
 );
 
 it.effect("starts an ordinary file in a writer worker before WAL is enabled", () => {

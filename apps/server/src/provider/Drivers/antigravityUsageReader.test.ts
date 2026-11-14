@@ -1,9 +1,9 @@
 // @effect-diagnostics-next-line nodeBuiltinImport:off - Effect's File.Info has no ctime or sub-millisecond mtime, which the cache tests compare.
 import * as NodeFSP from "node:fs/promises";
-import * as NodeSqlite from "node:sqlite";
+import * as NodeWorkerThreads from "node:worker_threads";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, describe, it, vi } from "@effect/vitest";
+import { assert, describe, it } from "@effect/vitest";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -12,8 +12,43 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Tracer from "effect/Tracer";
+import { vi } from "vite-plus/test";
 
 import { makeAntigravityUsageCache, readAntigravityUsage } from "./antigravityUsageReader.ts";
+
+const statementReads = vi.hoisted(() => ({
+  current: undefined as Array<{ sql: string; rows: number }> | undefined,
+}));
+
+vi.mock("node:worker_threads", async (importOriginal) => {
+  const actual = await importOriginal<typeof NodeWorkerThreads>();
+  class ObservedWorker extends actual.Worker {
+    readonly statements = new Map<number, string>();
+    constructor(...args: ConstructorParameters<typeof actual.Worker>) {
+      super(...args);
+      this.on("message", (reply: unknown) => {
+        if (
+          typeof reply !== "object" ||
+          reply === null ||
+          !("id" in reply) ||
+          typeof reply.id !== "number"
+        )
+          return;
+        const sql = this.statements.get(reply.id);
+        this.statements.delete(reply.id);
+        if (sql !== undefined && "rows" in reply && Array.isArray(reply.rows))
+          statementReads.current?.push({ sql, rows: reply.rows.length });
+      });
+    }
+    override postMessage(...args: Parameters<NodeWorkerThreads.Worker["postMessage"]>) {
+      const [request] = args;
+      if (typeof request?.id === "number" && typeof request.sql === "string")
+        this.statements.set(request.id, request.sql);
+      super.postMessage(...args);
+    }
+  }
+  return { ...actual, Worker: ObservedWorker };
+});
 
 const openDatabase = Effect.fn("openDatabase")(function* (filename: string) {
   const context = yield* Layer.build(NodeSqliteClient.layer({ filename }));
@@ -444,24 +479,17 @@ describe("readAntigravityUsage", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  const recordReads = Effect.gen(function* () {
-    const reads: Array<{ sql: string; rows: number }> = [];
-    const all = NodeSqlite.StatementSync.prototype.all;
-    yield* Effect.acquireRelease(
-      Effect.sync(() =>
-        vi.spyOn(NodeSqlite.StatementSync.prototype, "all").mockImplementation(function (
-          this: NodeSqlite.StatementSync,
-          ...params
-        ) {
-          const result = all.apply(this, params);
-          reads.push({ sql: this.sourceSQL, rows: result.length });
-          return result;
-        }),
-      ),
-      (spy) => Effect.sync(() => spy.mockRestore()),
-    );
-    return reads;
-  });
+  const recordReads = Effect.acquireRelease(
+    Effect.sync(() => {
+      const reads: Array<{ sql: string; rows: number }> = [];
+      statementReads.current = reads;
+      return reads;
+    }),
+    () =>
+      Effect.sync(() => {
+        statementReads.current = undefined;
+      }),
+  );
 
   const stepUsage = (responseId: string) =>
     new Uint8Array(protoBytes(9, [...protoNumber(2, 10), ...protoText(11, responseId)]));
