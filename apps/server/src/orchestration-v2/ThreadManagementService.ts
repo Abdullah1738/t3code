@@ -390,6 +390,7 @@ export interface ThreadManagementServiceShape {
     readonly projectId: ProjectId;
     readonly threadId: ThreadId;
   }) => Effect.Effect<OrchestrationV2ThreadProjection, ThreadManagementError>;
+  readonly listActiveThreadIds: Orchestrator.OrchestratorV2["Service"]["listActiveThreadIds"];
   readonly getShellSnapshot: (options?: {
     readonly location?: "active" | "archive";
     /** Only these threads, read with one indexed IN list (control live lists). */
@@ -1620,6 +1621,7 @@ const make = Effect.gen(function* () {
     getThreadSnapshotWindow,
     getProjectThreadRecords,
     getProjectThread,
+    listActiveThreadIds: orchestrator.listActiveThreadIds,
     getShellSnapshot: orchestrator.getShellSnapshot,
     readShellSnapshot: orchestrator.readShellSnapshot,
     getCallerRow: orchestrator.getCallerRow,

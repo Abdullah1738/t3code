@@ -57,6 +57,7 @@ const makeHarness = (scopes: ReadonlyArray<string>, liveIds: ReadonlyArray<strin
               currentNative: () => Effect.succeed(new Map()),
             }),
             Layer.mock(ThreadManagementService.ThreadManagementService)({
+              listActiveThreadIds: () => Effect.succeed([]),
               getShellSnapshot: () =>
                 Effect.succeed({
                   schemaVersion: 1,
@@ -136,16 +137,18 @@ describe("GET /recovery/snapshot", () => {
     ).pipe(Effect.provide(Sqlite.layerMemory)),
   );
 
-  it.effect("returns the page shape with threads and nextCursor", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const { get } = yield* makeHarness(["orchestration:read"], ["thread-a"]);
-        const response = yield* get("/recovery/snapshot?active=true&limit=10");
-        assert.strictEqual(response.status, 200);
-        assert.strictEqual(response.body.ok, true);
-        assert.deepStrictEqual(response.body.threads, []);
-        assert.strictEqual(response.body.nextCursor, null);
-      }),
-    ).pipe(Effect.provide(Sqlite.layerMemory)),
+  it.effect.each([true, false])(
+    "returns the page shape with threads and nextCursor (active=%s)",
+    (active) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { get } = yield* makeHarness(["orchestration:read"], ["thread-a"]);
+          const response = yield* get(`/recovery/snapshot?active=${active}&limit=10`);
+          assert.strictEqual(response.status, 200);
+          assert.strictEqual(response.body.ok, true);
+          assert.deepStrictEqual(response.body.threads, []);
+          assert.strictEqual(response.body.nextCursor, null);
+        }),
+      ).pipe(Effect.provide(Sqlite.layerMemory)),
   );
 });

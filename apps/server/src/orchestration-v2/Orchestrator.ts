@@ -447,6 +447,7 @@ export interface OrchestratorV2Shape {
     },
     OrchestratorV2Error
   >;
+  readonly listActiveThreadIds: () => Effect.Effect<ReadonlyArray<ThreadId>, OrchestratorV2Error>;
   readonly getShellSnapshot: (
     options?: ShellSnapshotOptions,
   ) => Effect.Effect<OrchestrationV2ThreadShellSnapshot, OrchestratorV2Error>;
@@ -14177,6 +14178,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         NodeSqliteClient.readOnly,
         Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
       ),
+    listActiveThreadIds: () =>
+      projectionStore
+        .listActiveThreadIds()
+        .pipe(NodeSqliteClient.readOnly, Effect.mapError(shellProjectionError)),
     getShellSnapshot: (options) =>
       projectionStore
         .getShellSnapshot(options)
@@ -14335,6 +14340,13 @@ const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
       Effect.fail(
         new OrchestratorProjectionError({
           threadId,
+          cause: "Orchestration V2 live runtime is not configured.",
+        }),
+      ),
+    listActiveThreadIds: () =>
+      Effect.fail(
+        new OrchestratorProjectionError({
+          threadId: ThreadId.make("thread:shell"),
           cause: "Orchestration V2 live runtime is not configured.",
         }),
       ),

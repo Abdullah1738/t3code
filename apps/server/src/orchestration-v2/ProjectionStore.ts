@@ -583,6 +583,10 @@ export interface ProjectionStoreV2Shape {
   readonly apply: (
     event: OrchestrationV2DomainEvent,
   ) => Effect.Effect<void, ProjectionStoreV2Error>;
+  readonly listActiveThreadIds: () => Effect.Effect<
+    ReadonlyArray<ThreadId>,
+    ProjectionStoreV2Error
+  >;
   readonly getShellSnapshot: (
     options?: ShellSnapshotOptions,
   ) => Effect.Effect<OrchestrationV2ThreadShellSnapshot, ProjectionStoreV2Error>;
@@ -7038,6 +7042,16 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         Effect.map(decodeShellSnapshot),
       );
 
+    const listActiveThreadIds = Effect.fn("ProjectionStore.listActiveThreadIds")(function* () {
+      // Match the unpaged active shell's payload predicate and ordering, including legacy rows.
+      const rows = yield* sql<{ readonly thread_id: string }>`
+        SELECT thread_id FROM orchestration_v2_projection_threads
+        WHERE deleted_at IS NULL AND json_extract(payload_json, '$.archivedAt') IS NULL
+        ORDER BY updated_at ASC, thread_id ASC
+      `;
+      return rows.map((row) => ThreadId.make(row.thread_id));
+    }, Effect.mapError(shellSnapshotReadError));
+
     const getShellSnapshot: ProjectionStoreV2Shape["getShellSnapshot"] = (options) =>
       sql
         .withTransaction(readShellSnapshotRows(options))
@@ -7182,6 +7196,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
 
     return {
       apply,
+      listActiveThreadIds,
       getShellSnapshot,
       readShellSnapshot,
       getCallerRow,
@@ -7262,6 +7277,16 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
           }
           yield* Ref.update(sequence, (current) => current + 1);
         }),
+      listActiveThreadIds: Effect.fn("ProjectionStore.listActiveThreadIds")(function* () {
+        const existing = (yield* Ref.get(replayState)).projections;
+        return [...existing.entries()]
+          .filter(
+            ([, projection]) =>
+              projection.thread.deletedAt === null && projection.thread.archivedAt === null,
+          )
+          .map(([threadId]) => threadId)
+          .toSorted((left, right) => String(left).localeCompare(String(right)));
+      }),
       getShellSnapshot: Effect.fn("ProjectionStore.getShellSnapshot")(function* (options) {
         const existing = (yield* Ref.get(replayState)).projections;
         const selectedThreadIds = [...existing.entries()]
