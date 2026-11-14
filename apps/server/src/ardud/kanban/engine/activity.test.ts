@@ -4,6 +4,7 @@ import {
   ProviderInstanceId,
   ThreadId,
   type KanbanBoard,
+  type KanbanSubtask,
   type KanbanCard,
   type KanbanCardEvent,
   type KanbanOwnerAsk,
@@ -2049,5 +2050,254 @@ describe("queued current-state rollup", () => {
     expect(result.stages.queued.byReason).toEqual({ would_start: 1, pool_full: 199 });
     expect(result.stages.queuedOver6h.count).toBe(200);
     expect(result.stages.queuedOver6h.items.length).toBeLessThan(200);
+  });
+});
+
+const activityBoard: KanbanBoard = {
+  id: KanbanBoardId.make("b1"),
+  slug: "test",
+  name: "Test",
+  icon: null,
+  iconImage: null,
+  defaultProjectId: null,
+  managerModel: opus,
+  evaluatorModel: sonnet,
+  defaultCardModel: opus,
+  reviewChains: [{ name: "Default", steps: [sonnet] }],
+  defaultReviewChain: "Default",
+  standingApprovals: [],
+  instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
+  setup: null,
+  pause: null,
+  createdAt: before,
+  nightlyReview: null,
+  archivedAt: null,
+};
+const subtask = (
+  owner: KanbanSubtask["owner"],
+  patch: Partial<KanbanSubtask> = {},
+): KanbanSubtask => ({
+  id: owner,
+  step: 1,
+  text: "Finish",
+  owner,
+  createdAt: before,
+  state: "open",
+  note: null,
+  doneBy: null,
+  doneAt: null,
+  ...patch,
+});
+const flag = (reason: string, by: KanbanCard["createdBy"] = { _tag: "owner" }) => ({
+  reason,
+  by,
+  at: before,
+});
+
+// Newer stuck cards must remain visible next to older intentionally parked cards.
+describe("without-thread reasons", () => {
+  const blocker = card("blocker");
+  const step = [subtask("evaluator"), subtask("script")];
+  const candidates = [
+    card("wait", { number: 1, wait: waitOn, asks: [ask("q", before, { blocking: true })] }),
+    card("ask", {
+      number: 2,
+      asks: [ask("q", before, { blocking: true })],
+      blockedBy: [blocker.id],
+    }),
+    card("blocked", { number: 3, blockedBy: [blocker.id], priority: 5 }),
+    card("paused", { number: 4, priority: 5, subtasks: step }),
+    card("evaluator", { number: 5, subtasks: step, stalled: flag("Stopped") }),
+    card("failed", { number: 6, stalled: flag("Run failed: timeout") }),
+    card("flagged", { number: 7, stalled: flag("Stopped") }),
+    card("refused", {
+      number: 8,
+      stalled: flag("Review verdict refused: stale", { _tag: "system", component: "dispatcher" }),
+    }),
+    card("none", { number: 9, movedAt: t("20:00") }),
+    card("expired", {
+      number: 10,
+      movedAt: t("21:00"),
+      wait: { ...waitOn, expiredAt: t("22:00") },
+    }),
+  ].map((row) => ({ ...row, stage: "working" as const }));
+
+  it("reports reasons in precedence order, full counts and independently listed none items", () => {
+    const run = Activity.rollup({
+      window,
+      cards: [...candidates, blocker],
+      events: [],
+      threads: [],
+      pools,
+      board: activityBoard,
+    });
+    const section = run.stages.withoutThread;
+    expect(section.byReason).toEqual({
+      "wait:ci": 1,
+      owner_ask: 1,
+      blocked: 1,
+      paused: 1,
+      evaluator_step: 1,
+      "stalled:run_failed": 1,
+      "stalled:flagged": 1,
+      "stalled:verdict_refused": 1,
+      none: 2,
+    });
+    expect(section.count).toBe(10);
+    expect(section.items.map((row) => row.card)).toEqual([9, 10, 1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(section.none).toEqual({
+      count: 2,
+      items: [
+        { card: 9, stage: "working", since: "2026-11-12T20:00Z", reason: "none", hours: 4 },
+        {
+          card: 10,
+          stage: "working",
+          since: "2026-11-12T21:00Z",
+          reason: "none",
+          hours: 3,
+          expiredWait: "ci",
+        },
+      ],
+    });
+  });
+
+  it.each(["push", "merge", "ci", "card", "time", "owner_go", "script"] as const)(
+    "keeps an open %s wait ahead of an ask, but lets an expired wait expose it",
+    (on) => {
+      const waiting = card(on, {
+        stage: "working",
+        wait: { ...waitOn, on },
+        asks: [ask("q", before, { blocking: true })],
+      });
+      const read = (row: KanbanCard) =>
+        Activity.rollup({ window, cards: [row], events: [], threads: [], pools }).stages
+          .withoutThread.items[0];
+      expect(read(waiting)?.reason).toBe(`wait:${on}`);
+      expect(read({ ...waiting, wait: { ...waitOn, on, expiredAt: t("22:00") } })).toMatchObject({
+        reason: "owner_ask",
+        expiredWait: on,
+      });
+    },
+  );
+
+  it.each([
+    ["closed ask", { asks: [ask("q", before, { blocking: true, closedAt: t("01:00") })] }],
+    ["nonblocking ask", { asks: [ask("q", before)] }],
+    ["stale wait", { movedAt: t("01:00"), wait: waitOn }],
+    ["missing blocker", { blockedBy: [KanbanCardId.make("missing")] }],
+    ["mixed worker step", { subtasks: [...step, subtask("work")] }],
+    ["review step", { subtasks: [subtask("review")] }],
+    ["no open steps", { subtasks: [subtask("evaluator", { state: "done" })] }],
+    ["pending findings", { subtasks: step, reviewFindingsPending: true }],
+    ["old note", { wakeNote: "Review findings: fix this" }],
+  ] satisfies Array<[string, Partial<KanbanCard>]>)(
+    "does not hide a stuck card behind %s",
+    (_, patch) => {
+      const row = card("stuck", { stage: "working", ...patch });
+      expect(Activity.withoutThreadReason(row, { byId: new Map([[row.id, row]]), pools })).toBe(
+        "none",
+      );
+    },
+  );
+
+  it.each([
+    ["Run failed: timeout", "owner", "run_failed"],
+    ["Reviewer stopped without a verdict", "system", "run_failed"],
+    ["Reviewer stopped without a verdict", "owner", "flagged"],
+    ["Review verdict refused: stale", "system", "verdict_refused"],
+    ["Review verdict refused: stale", "owner", "flagged"],
+    ["Stopped", "system", "flagged"],
+  ] as const)("shares the stall category for %s by %s", (reason, actor, kind) => {
+    const by =
+      actor === "system"
+        ? { _tag: "system" as const, component: "dispatcher" }
+        : { _tag: "owner" as const };
+    const row = card("stall", { stage: "working", stalled: flag(reason, by) });
+    expect(Activity.withoutThreadReason(row, { byId: new Map(), pools })).toBe(`stalled:${kind}`);
+  });
+
+  it.each(["evaluator", "script"] as const)("reuses the %s-only step rule", (owner) => {
+    const row = card(owner, { stage: "working", subtasks: [subtask(owner)] });
+    expect(Activity.withoutThreadReason(row, { byId: new Map(), pools })).toBe("evaluator_step");
+  });
+
+  it("uses board pause keep lists and the current review model's paused pool", () => {
+    const row = card("pause", { stage: "in_review" });
+    const paused = {
+      ...activityBoard,
+      pause: { keep: [], reason: "Hold", by: "owner" as const, at: before },
+    };
+    const context = { byId: new Map(), pools, board: paused };
+    expect(Activity.withoutThreadReason(row, context)).toBe("paused");
+    expect(
+      Activity.withoutThreadReason(row, {
+        ...context,
+        board: { ...paused, pause: { ...paused.pause, keep: [row.id] } },
+      }),
+    ).toBe("none");
+    expect(
+      Activity.withoutThreadReason(row, {
+        ...context,
+        board: activityBoard,
+        pools: pools.map((pool) => ({ ...pool, slots: pool.model === sonnet ? 0 : pool.slots })),
+      }),
+    ).toBe("paused");
+  });
+
+  it("does not call a multi-model worker paused while an alternative pool is open", () => {
+    const row = card("alternatives", {
+      stage: "working",
+      models: [
+        { model: opus, weight: 2 },
+        { model: sonnet, weight: 1 },
+      ],
+    });
+    const context = {
+      byId: new Map(),
+      pools: pools.map((pool) => ({ ...pool, slots: pool.model === opus ? 0 : pool.slots })),
+    };
+    expect(Activity.withoutThreadReason(row, context)).toBe("none");
+    expect(
+      Activity.withoutThreadReason({ ...row, workThreadId: ThreadId.make("pinned") }, context),
+    ).toBe("paused");
+    expect(Activity.withoutThreadReason(row, { ...context, pools: [] })).toBe("none");
+  });
+
+  it.each(["completed", "deployed", "verified"] as const)(
+    "follows the dispatcher's %s blocker settlement and pending merge rules",
+    (stage) => {
+      const dependency = { ...blocker, stage };
+      const row = card("waiting", { stage: "working", blockedBy: [dependency.id] });
+      const reason = (dep: KanbanCard) =>
+        Activity.withoutThreadReason(row, { byId: new Map([[dep.id, dep]]), pools });
+      expect(reason(dependency)).toBe("none");
+      expect(
+        reason({ ...dependency, subtasks: [subtask("evaluator", { text: "Merge into main" })] }),
+      ).toBe(stage === "completed" ? "blocked" : "none");
+    },
+  );
+
+  it("caps the unexplained list separately and preserves counts for omitted rows", () => {
+    const parked = Array.from({ length: 170 }, (_, index) =>
+      card(`parked${index}`, { number: index, stage: "working", wait: waitOn }),
+    );
+    const stuck = Array.from({ length: 170 }, (_, index) =>
+      card(`stuck${index}`, { number: index + 200, stage: "in_review", movedAt: t("23:00") }),
+    );
+    const section = Activity.rollup({
+      window,
+      cards: [...parked, ...stuck],
+      events: [],
+      threads: [],
+      pools,
+    }).stages.withoutThread;
+    expect(section.count).toBe(340);
+    expect(section.byReason).toEqual({ "wait:ci": 170, none: 170 });
+    expect(section.none.count).toBe(170);
+    expect(section.none.items.length).toBeLessThan(170);
+    expect(section.none.items.length + (section.none.more ?? 0)).toBe(170);
+    expect(section.items.length + (section.more ?? 0)).toBe(340);
+    expect(section.items.every((row) => row.reason === "none")).toBe(true);
+    expect(section.none.items).toEqual(section.items);
   });
 });

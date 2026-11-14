@@ -11413,3 +11413,58 @@ it.effect.each(["legacy review", "legacy todo", "saved timeout", "saved error"] 
       }).pipe(Effect.provide(fake.layer.pipe(Layer.provide(sink))));
     }),
 );
+
+it.effect("board_activity explains detached cards using the already loaded board pause", () => {
+  const { layer, running } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* kanban.ensureBoard({
+      slug: "activity-reasons",
+      name: "Activity",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const work = yield* kanban.createCard(board.id, { prompt: "Work" }, owner);
+    yield* kanban.dispatchNow;
+    const worker = (yield* kanban.card(work.id)).card.activeThreadId!;
+    running.add(worker);
+    const parked = yield* kanban.createCard(board.id, { prompt: "Parked" }, owner);
+    yield* store.putCard({ ...parked, stage: "working", activeThreadId: null });
+    yield* store.addCardEvent({
+      cardId: parked.id,
+      at: parked.movedAt,
+      actor: owner,
+      kind: "moved",
+      fromStage: "todo",
+      toStage: "working",
+      body: null,
+      head: null,
+    });
+    yield* store.putBoard({
+      ...board,
+      pause: { reason: "Hold", keep: [work.id], at: board.createdAt, by: "owner" },
+    });
+    yield* TestClock.adjust(Duration.minutes(1));
+    const response = yield* call(worker, "board_activity", {});
+    assert.isFalse(response.isError, response.text);
+    const activity = response.structured.activity as {
+      stages: {
+        withoutThread: {
+          count: number;
+          byReason: Record<string, number>;
+          none: { count: number };
+          items: Array<{ card: number; reason: string; hours: number }>;
+        };
+      };
+    };
+    assert.strictEqual(activity.stages.withoutThread.count, 1);
+    assert.deepEqual(activity.stages.withoutThread.byReason, { paused: 1 });
+    assert.strictEqual(activity.stages.withoutThread.none.count, 0);
+    assert.deepEqual(
+      activity.stages.withoutThread.items.map(({ card, reason }) => ({ card, reason })),
+      [{ card: parked.number, reason: "paused" }],
+    );
+    assert.isAtLeast(activity.stages.withoutThread.items[0]!.hours, 0);
+  }).pipe(Effect.provide(layer));
+});

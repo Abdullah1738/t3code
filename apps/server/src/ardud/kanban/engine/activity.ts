@@ -6,6 +6,11 @@
  */
 import {
   KANBAN_BACKLOG,
+  kanbanCardModels,
+  kanbanEvaluatorStep,
+  kanbanScriptStep,
+  kanbanWorkStep,
+  kanbanWaiting,
   kanbanWithoutWait,
   kanbanWithoutDeciding,
   kanbanRetryNotBefore,
@@ -705,6 +710,43 @@ const ledgerUsage = (
   };
 };
 
+const stallKind = (reason: string, by: KanbanCard["createdBy"]) =>
+  reason.startsWith("Run failed") || (by._tag === "system" && reason === Retries.NO_VERDICT_REASON)
+    ? "run_failed"
+    : by._tag === "system" && reason.startsWith(Retries.REFUSED_VERDICT_PREFIX)
+      ? "verdict_refused"
+      : "flagged";
+
+export const withoutThreadReason = (
+  card: KanbanCard,
+  context: {
+    readonly byId: ReadonlyMap<string, KanbanCard>;
+    readonly pools: ReadonlyArray<KanbanPool>;
+    readonly board?: RollupInput["board"];
+  },
+): string => {
+  const board = context.board && "reviewChains" in context.board ? context.board : undefined;
+  if (card.wait?.expiredAt === null && kanbanWaiting(card)) return `wait:${card.wait.on}`;
+  if (card.asks.some((ask) => ask.closedAt === null && ask.blocking)) return "owner_ask";
+  if (Rules.isBlocked(card, context.byId)) return "blocked";
+  const models =
+    card.stage === "working" && card.workThreadId === null
+      ? kanbanCardModels(card).map((entry) => entry.model)
+      : [board ? Rules.nextModel(board, card) : card.model];
+  const pools = models.map((model) => Rules.poolFor(context.pools, model));
+  if (card.priority === KANBAN_BACKLOG) return "backlog";
+  if (
+    (context.board?.pause != null && !context.board.pause.keep.includes(card.id)) ||
+    pools.every((pool) => pool !== undefined && pool.slots <= 0)
+  )
+    return "paused";
+  if (!kanbanWorkStep(card) && (kanbanEvaluatorStep(card) || kanbanScriptStep(card)))
+    return "evaluator_step";
+  if (card.stalled !== null) return `stalled:${stallKind(card.stalled.reason, card.stalled.by)}`;
+  // Detached-card pool_full is out of scope; queued cards use dispatcher reservations.
+  return "none";
+};
+
 /** What a parked card waits on, as a category only: the wait kind, a blocker, a stall, the owner. */
 const waitKind = (card: KanbanCard): string | null =>
   card.wait?.on ??
@@ -728,6 +770,7 @@ export const rollup = (input: RollupInput) => {
   const until = window.until;
   const byCard = groupEvents(input.events);
   const active = activeCards(input.cards, byCard, window);
+  const threadsById = new Map(input.threads.map((link) => [link.threadId as string, link]));
   const threadsByCard = new Map<string, Array<KanbanThreadLink>>();
   for (const link of input.threads) {
     if (link.cardId === null) continue;
@@ -831,7 +874,19 @@ export const rollup = (input: RollupInput) => {
   for (let at = Math.floor(time(window.since) / HOUR) * HOUR; at < time(until); at += HOUR)
     hourStarts.push(at);
   // Cards the board shows in working or in_review that no live thread runs.
-  const idle: Array<{ card: number; stage: string; since: string }> = [];
+  const idle: Array<{
+    card: number;
+    stage: string;
+    since: string;
+    reason: string;
+    hours: number;
+    expiredWait?: NonNullable<KanbanCard["wait"]>["on"];
+  }> = [];
+  const reasonContext = {
+    byId: new Map(input.cards.map((card) => [card.id as string, card])),
+    pools: input.pools,
+    ...(input.board === undefined ? {} : { board: input.board }),
+  };
   for (const span of spans) {
     const from = time(span.from);
     const to = time(span.to ?? until);
@@ -851,11 +906,39 @@ export const rollup = (input: RollupInput) => {
       span.card.stage === span.stage &&
       span.card.movedAt < until &&
       span.card.activeThreadId === null
-    )
-      idle.push({ card: span.card.number, stage: span.stage, since: stamp(span.card.movedAt) });
+    ) {
+      const card = span.card;
+      const role = span.stage === "in_review" ? "review" : "work";
+      const last = threadsByCard.get(card.id)?.findLast((link) => link.role === role);
+      const lastWritten = (byCard.get(card.id) ?? []).findLast(
+        (event) => event.actor._tag === "thread" && event.actor.threadId === last?.threadId,
+      );
+      // A role's thread can end without a stage move; stage age would overstate its idle time.
+      const since = Math.max(
+        time(card.movedAt),
+        time(last?.endedAt ?? lastWritten?.at ?? card.movedAt),
+      );
+      idle.push({
+        card: card.number,
+        stage: span.stage,
+        since: stamp(isoOf(since)),
+        reason: withoutThreadReason(card, reasonContext),
+        hours: hours(Math.max(0, time(until) - since)),
+        ...(card.wait?.expiredAt != null ? { expiredWait: card.wait.on } : {}),
+      });
+    }
+
   }
   const poolUsage = ledgerUsage(input, hourStarts, spans);
-  idle.sort((left, right) => left.since.localeCompare(right.since));
+  idle.sort(
+    (left, right) =>
+      Number(right.reason === "none") - Number(left.reason === "none") ||
+      left.since.localeCompare(right.since) ||
+      left.card - right.card,
+  );
+  const none = idle.filter((row) => row.reason === "none");
+  const byReason: Record<string, number> = {};
+  for (const row of idle) byReason[row.reason] = (byReason[row.reason] ?? 0) + 1;
   const evaluatorOnly = input.cards
     .filter(Rules.inReviewEvaluatorStepsOnly)
     .map((card) => ({
@@ -1099,7 +1182,12 @@ export const rollup = (input: RollupInput) => {
       hours: stages,
       longest,
       openOver24h: { count: longOpen.length, byStage: longOpenByStage, ...capped(longOpen, max) },
-      withoutThread: { count: idle.length, ...capped(idle, max) },
+      withoutThread: {
+        count: idle.length,
+        byReason,
+        none: { count: none.length, ...capped(none, max) },
+        ...capped(idle, max),
+      },
       queued: { count: queued.length, byReason: queuedByReason, ...capped(queued, max) },
       queuedOver6h: { count: queuedOver6h.length, ...capped(queuedOver6h, max) },
       inReviewNoThreadWithEvaluatorStepsOnly: {
