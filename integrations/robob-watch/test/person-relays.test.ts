@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -80,7 +80,10 @@ appendFileSync(${JSON.stringify(join(root, "calls"))}, JSON.stringify(args)+"\\n
     const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
     if (code) throw new Error(stderr + stdout);
     const result = JSON.parse(stdout.trim().split("\n").at(-1)!);
-    return result;
+    const logs = (existsSync(join(root, "logs")) ? readdirSync(join(root, "logs")) : []).filter(file => file.endsWith(".ndjson"))
+      .flatMap(file => readFileSync(join(root, "logs", file), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)));
+    if (process.env.TOOLLOG_SAMPLES) for (const row of logs.filter(row => ["watch.fire", "wake.sent", "wake.batch_opened", "wake.batch_sealed", "wake.urgent", "watch.grace_started", "watch.grace_ended", "watch.removed"].includes(row.name))) console.log("RELAY_LOG_SAMPLE " + JSON.stringify(row));
+    return { ...result, logs };
   } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
@@ -102,6 +105,15 @@ for (const chat of ["moni", "second-person"]) {
     for (let i = 0; i < 6; i++) expect(text).toContain(`${i + 1}. event-${i}`);
     expect(result.state.fires).toBe(6);
     expect(result.state.batch).toBeUndefined();
+    expect(result.logs.filter(row => row.name === "wake.batch_opened")).toHaveLength(1);
+    expect(result.logs.filter(row => row.name === "wake.batch_sealed")).toMatchObject([{ props: { events: 6, spanMs: 150000, archived: false, frozenContext: false } }]);
+    expect(result.logs.filter(row => row.name === "watch.fire")).toMatchObject([{ props: { count: 6, events: 6, batched: true, urgent: false, route: "person", waitMs: 150000, closing: false } }]);
+    expect(result.logs.filter(row => row.name === "wake.sent")).toMatchObject([{ ok: true, props: { via: "wake", events: 6 }, durationMs: 0 }]);
+    const sentLog = result.logs.find(row => row.name === "wake.sent");
+    const digest = (value: string) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
+    expect(sentLog.ids).toEqual({ watcher: "batch", chat: digest("person").slice(0, 24), key: digest("wake:" + digest(args[args.indexOf("--key") + 1])).slice(0, 24) });
+    expect(result.logs.find(row => row.name === "watch.fire").ids.key).toBe(sentLog.ids.key);
+    for (let i = 0; i < 6; i++) expect(JSON.stringify(result.logs)).not.toContain(`event-${i}`);
   });
 }
 
@@ -116,6 +128,9 @@ for (const chat of [undefined, "family-trip", "unknown-slug"]) {
     expect(result.immediate).toHaveLength(1);
     expect(result.sent).toHaveLength(1);
     expect(result.state.batch).toBeUndefined();
+    expect(result.logs.filter(row => row.name.startsWith("wake.batch_"))).toEqual([]);
+    expect(result.logs.filter(row => row.name === "watch.fire")).toMatchObject([{ props: { count: 1, events: 1, batched: false, urgent: false, route: chat === undefined ? "owner" : chat === "family-trip" ? "group" : "other", waitMs: 0, closing: false } }]);
+    expect(JSON.stringify(result.logs)).not.toContain("immediate event");
     if (chat) expect(result.immediate[0]).toContain(chat);
     else expect(result.immediate[0]).not.toContain("--chat");
   });
@@ -379,6 +394,14 @@ test("an urgent JSON fire wakes immediately while the other five keep their orig
   for (const i of [0, 1, 2, 4, 5]) expect(result.sent[1].join(" ")).toContain(`event-${i}`);
   expect(result.sent[1].join(" ")).not.toContain("slot offered");
   expect(result.state.fires).toBe(6);
+  expect(result.logs.filter(row => row.name === "wake.urgent")).toMatchObject([{ props: { batchOpen: true } }]);
+  expect(result.logs.filter(row => row.name === "watch.fire")).toMatchObject([
+    { props: { count: 1, events: 1, batched: false, urgent: true, route: "person", waitMs: 0 } },
+    { props: { count: 6, events: 5, batched: true, urgent: false, route: "person", waitMs: 150000 } },
+  ]);
+  expect(result.logs.filter(row => row.name === "wake.batch_opened")).toHaveLength(1);
+  expect(result.logs.filter(row => row.name === "wake.batch_sealed")).toHaveLength(1);
+  expect(JSON.stringify(result.logs)).not.toContain("slot offered");
 });
 
 test("notify is immediate and JSON urgent:false stays batched", async () => {
@@ -389,6 +412,7 @@ test("notify is immediate and JSON urgent:false stays batched", async () => {
   `);
   expect(result.sent).toHaveLength(1);
   expect(result.sent[0][0]).toBe("send");
+  expect(result.logs.filter(row => row.name === "watch.fire")).toMatchObject([{ props: { route: "owner", batched: false, urgent: false, events: 1 } }]);
   expect(result.state.batch.events).toHaveLength(1);
 });
 
@@ -413,6 +437,16 @@ test("large batches retain every full event and failed deliveries retry the same
   expect(result.batch.events.map((s: string) => s.length)).toEqual([5000, 5000]);
   expect(result.state.status).toBe("done");
   expect(result.retained).toBe(true);
+  expect(result.logs.filter(row => row.name === "wake.batch_sealed")).toMatchObject([{ props: { events: 2, spanMs: 150000, archived: true, frozenContext: false } }]);
+  expect(result.logs.filter(row => row.name === "wake.sent")).toMatchObject([
+    { ok: false, kind: "error", error: { tag: "wake.delivery_failed" }, props: { via: "none", events: 2 } },
+    { ok: true, kind: "perf", props: { via: "wake", events: 2 } },
+  ]);
+  expect(result.logs.filter(row => row.name === "watch.fire")).toMatchObject([{ props: { events: 2, route: "person", waitMs: 155000 } }]);
+  const attempts = result.logs.filter(row => row.name === "wake.sent");
+  expect(attempts[0].ids.key).toBe(attempts[1].ids.key);
+  expect(JSON.stringify(result.logs)).not.toContain("a".repeat(100));
+  expect(JSON.stringify(result.logs)).not.toContain("b".repeat(100));
 });
 
 test("context writers merge keys, nested objects and lists under a lock, and replace is explicit", async () => {
@@ -1197,4 +1231,107 @@ test("a matching reply command uses closing state admitted under the removal loc
   `);
   expect(result.reply.code).toBe(0);
   expect(result.reply.stdout.trim()).toBe("1");
+});
+
+
+test("grace lifecycle logs a relayed reply once and expires with its count", async () => {
+  const result = await scenario(`
+    addReplyWatcher("grace-log",{context:"private-context-never-log"});
+    lib.removeWatcher("grace-log"); lib.removeWatcher("grace-log");
+    const until=state("grace-log").closing_until;
+    await fire("grace-log","private-reply-never-log",300000);
+    clock+=150000; await tickOne("grace-log");
+    clock=until; await tickOne("grace-log"); await tickOne("grace-log");
+    console.log(JSON.stringify({exists:!!lib.loadWatcher("grace-log")}));
+  `);
+  expect(result.exists).toBe(false);
+  expect(result.logs.filter(row => row.name === "watch.grace_started")).toMatchObject([{ props: { graceMs: 900000 } }]);
+  expect(result.logs.filter(row => row.name === "watch.fire")).toMatchObject([{ props: { events: 1, closing: true, route: "person" } }]);
+  expect(result.logs.filter(row => row.name === "watch.grace_ended")).toMatchObject([{ props: { reason: "expired", relays: 1 } }]);
+  expect(JSON.stringify(result.logs)).not.toContain("private-reply-never-log");
+  expect(JSON.stringify(result.logs)).not.toContain("private-context-never-log");
+});
+
+for (const action of ["resume", "now"]) {
+  test(`grace ends once on ${action} and a new grace resets its relay count`, async () => {
+    const result = await scenario(`
+      addReplyWatcher("end-grace"); lib.removeWatcher("end-grace");
+      await fire("end-grace",JSON.stringify({urgent:true,event:"private-urgent-reply"}),5000);
+      cli(...${JSON.stringify(action === 'resume' ? ['resume','end-grace'] : ['rm','end-grace','--now'])});
+      if(${action === "resume"}) { lib.removeWatcher("end-grace"); cli("rm","end-grace","--now"); }
+      console.log(JSON.stringify({sent:sent()}));
+    `);
+    expect(result.logs.filter(row => row.name === "watch.grace_ended")).toMatchObject(action === "resume" ? [
+      { props: { reason: "resume", relays: 1 } }, { props: { reason: "now", relays: 0 } },
+    ] : [{ props: { reason: "now", relays: 1 } }]);
+    expect(result.logs.filter(row => row.name === "watch.removed")).toMatchObject([{ props: { grace: false, reason: "now" } }]);
+    expect(result.logs.filter(row => row.name === "wake.urgent")).toMatchObject([{ props: { batchOpen: false } }]);
+    expect(JSON.stringify(result.logs)).not.toContain("private-urgent-reply");
+  });
+}
+
+for (const options of [{ args: ["rm", "immediate-log", "--now"], extra: {}, reason: "now" },
+  { args: ["rm", "immediate-log"], extra: {}, reason: "no_inflight_check" },
+  { args: ["rm", "immediate-log"], extra: { paused: true }, reason: "paused" }]) {
+  test(`immediate removal logs ${options.reason} without starting grace`, async () => {
+    const result = await scenario(`
+      add("immediate-log",${JSON.stringify(options.extra)}); cli(...${JSON.stringify(options.args)});
+      console.log(JSON.stringify({exists:!!lib.loadWatcher("immediate-log")}));
+    `);
+    expect(result.exists).toBe(false);
+    expect(result.logs.filter(row => row.name === "watch.removed")).toMatchObject([{ props: { grace: false, reason: options.reason } }]);
+    expect(result.logs.filter(row => row.name.startsWith("watch.grace_"))).toEqual([]);
+  });
+}
+
+test("a frozen batch reports its snapshot without logging it", async () => {
+  const result = await scenario(`
+    add("frozen-log",{context:"private-frozen-context"});
+    const w=lib.loadWatcher("frozen-log"),s=state("frozen-log");
+    lib.queueEvent(w,s,"private-frozen-event",false,true); lib.saveState(w.id,s);
+    clock+=150000; await tickOne(w.id);
+    console.log(JSON.stringify({sent:sent()}));
+  `);
+  expect(result.logs.filter(row => row.name === "wake.batch_sealed")).toMatchObject([{ props: { frozenContext: true, archived: false, events: 1, spanMs: 150000 } }]);
+  expect(JSON.stringify(result.logs)).not.toContain("private-frozen");
+});
+
+
+const pendingMetadataCases = [
+  { name: "absent", pending: null, events: 1, route: "other" },
+  { name: "matching", pending: { key: "direct-key", count: 6, route: "person" }, events: 6, route: "person" },
+  { name: "unrelated", pending: { key: "old-batch-key", count: 6, route: "person" }, events: 1, route: "other" },
+  { name: "legacy matching", pending: { key: "direct-key" }, events: 1, route: "other" },
+];
+for (const entry of pendingMetadataCases) {
+  test(`direct delivery uses only correlated pending metadata: ${entry.name}`, async () => {
+    const result = await scenario(`
+      add("direct-log"); const w=lib.loadWatcher("direct-log"),s=state("direct-log");
+      const pending=${JSON.stringify(entry.pending)};
+      if(pending)s.pending={event:"private-pending-payload",at:lib.iso(),...pending};
+      const before=JSON.stringify(s);
+      const delivery=await lib.deliver(w,"private-direct-payload","direct-key",s,true);
+      console.log(JSON.stringify({delivery,unchanged:JSON.stringify(s)===before}));
+    `);
+    expect(result.unchanged).toBe(true);
+    expect(result.delivery.route).toBe(entry.route);
+    expect(result.logs.filter(row => row.name === "wake.sent")).toMatchObject([{ ok: true, props: { events: entry.events, via: "wake" } }]);
+    const digest = new Bun.CryptoHasher("sha256").update(entry.route).digest("hex").slice(0, 24);
+    expect(result.logs.find(row => row.name === "wake.sent").ids.chat).toBe(digest);
+    expect(JSON.stringify(result.logs)).not.toContain("private-");
+  });
+}
+
+test("CLI fire-test logs one event while an unrelated six-event batch is pending", async () => {
+  const result = await scenario(`
+    add("test-log"); const s=state("test-log");
+    s.pending={key:"old-batch-key",count:6,route:"person",event:"private-batch-payload",at:lib.iso()};
+    lib.saveState("test-log",s); const before=JSON.stringify(state("test-log"));
+    cli("fire-test","test-log");
+    console.log(JSON.stringify({unchanged:JSON.stringify(state("test-log"))===before}));
+  `);
+  expect(result.unchanged).toBe(true);
+  expect(result.logs.filter(row => row.name === "wake.sent")).toMatchObject([{ ok: true, props: { events: 1 } }]);
+  expect(result.logs.filter(row => row.name === "watch.fire")).toEqual([]);
+  expect(JSON.stringify(result.logs)).not.toContain("private-batch-payload");
 });
