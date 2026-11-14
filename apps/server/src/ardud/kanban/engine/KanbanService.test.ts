@@ -29521,6 +29521,178 @@ it.effect(
     }),
 );
 
+it.effect.each(["submitEvaluator", "reportBug"] as const)(
+  "#1440 %s persists admission and an unrelated card mutation while an evaluator launch holds serial",
+  (entry) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let first = true;
+      const gated = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            launch: (input) =>
+              Effect.gen(function* () {
+                if (first) {
+                  first = false;
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(release);
+                }
+                return yield* real.launch(input);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(
+          board.id,
+          { title: "Writable", prompt: "Independent card" },
+          owner,
+        );
+        const launching = yield* Effect.forkChild(
+          kanban.submitEvaluator(board.id, { kind: "request", text: "First launch" }),
+        );
+        yield* Deferred.await(entered);
+        const mutation = yield* Effect.forkChild(
+          Effect.gen(function* () {
+            yield* kanban.editCard(card.id, { description: "Saved during launch" }, owner);
+            return yield* entry === "submitEvaluator"
+              ? kanban.submitEvaluator(board.id, { kind: "request", text: "Novel failure" })
+              : kanban.reportBug({
+                  boardId: board.id,
+                  title: "Novel failure",
+                  evidence: "An independent incident",
+                  threadId: ThreadId.make("reporter"),
+                });
+          }).pipe(Effect.timeout("1 second")),
+        );
+        yield* TestClock.adjust("1 second");
+        const queued = yield* Fiber.join(mutation);
+        assert.isTrue("queued" in queued);
+        const sql = yield* BoardsDatabase.client;
+        const rows = yield* sql<{ id: number; started_at: string | null }>`
+          SELECT id, started_at FROM ardud_kanban_evaluator_queue WHERE done_at IS NULL ORDER BY id
+        `;
+        assert.lengthOf(rows, 2);
+        assert.isNull(rows[1]!.started_at);
+        assert.strictEqual((yield* kanban.card(card.id)).card.description, "Saved during launch");
+        assert.isFalse(yield* Deferred.isDone(release));
+        yield* Deferred.succeed(release, undefined);
+        assert.isTrue("threadId" in (yield* Fiber.join(launching)));
+        yield* kanban.tick;
+        const evaluators = Effect.map(Ref.get(fake.threads), (all) =>
+          [...all.values()].filter((thread) => thread.title === "Evaluator: request"),
+        );
+        assert.lengthOf(yield* evaluators, 2);
+        assert.lengthOf(
+          yield* sql`SELECT id FROM ardud_kanban_evaluator_queue WHERE done_at IS NULL`,
+          0,
+        );
+        yield* kanban.tick;
+        assert.lengthOf(yield* evaluators, 2);
+      }).pipe(Effect.provide(inlineTestLayer(gated)));
+    }),
+);
+
+it.effect.each([
+  ...(
+    [
+      "request",
+      "setup",
+      "check",
+      "nightly",
+      "stalled",
+      "completed",
+      "deployed",
+      "packets",
+      "discussion",
+    ] as const
+  ).flatMap((kind) => (["queue only", "board input"] as const).map((change) => ({ kind, change }))),
+  ...(["setup", "nightly", "discussion"] as const).map((kind) => ({
+    kind,
+    change: "discussion input" as const,
+  })),
+])("#1440 sweep admission: $kind with $change", ({ kind, change }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let first = true;
+    const gated = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          launch: (input) =>
+            Effect.gen(function* () {
+              if (first) {
+                first = false;
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(release);
+              }
+              return yield* real.launch(input);
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const channel =
+        kind === "setup" || kind === "discussion"
+          ? yield* kanban.createDiscussion(board.id, "Launch channel", owner)
+          : null;
+      const purpose: Briefs.EvaluatorPurpose =
+        kind === "request"
+          ? { kind, text: "First launch" }
+          : kind === "setup"
+            ? { kind, text: "First setup", discussionId: channel!.id }
+            : kind === "discussion"
+              ? { kind, discussionId: channel!.id, title: channel!.title, cardNumber: null }
+              : { kind };
+      const launching = yield* Effect.forkChild(
+        kanban.submitEvaluator(board.id, purpose).pipe(Effect.exit),
+      );
+      yield* Deferred.await(entered);
+      const admitting = yield* Effect.forkChild(
+        kanban
+          .reportBug({
+            boardId: board.id,
+            title: "Novel failure",
+            evidence: "Independent report during launch",
+            threadId: ThreadId.make("reporter"),
+          })
+          .pipe(Effect.timeout("1 second")),
+      );
+      yield* TestClock.adjust("1 second");
+      assert.isTrue("queued" in (yield* Fiber.join(admitting)));
+      if (change === "board input") {
+        yield* kanban.updateBoard(board.id, { name: "Changed launch input" });
+      } else if (change === "discussion input") {
+        const id =
+          channel?.id ?? (yield* kanban.snapshot(board.id)).board.nightlyReview!.lastDiscussionId!;
+        yield* kanban.updateDiscussion(id, { title: "Changed launch channel" }, owner);
+      }
+      assert.isFalse(yield* Deferred.isDone(release));
+      yield* Deferred.succeed(release, undefined);
+      const outcome = yield* Fiber.join(launching);
+      if (change === "queue only") {
+        assert.isTrue(Exit.isSuccess(outcome), JSON.stringify(outcome));
+        assert.lengthOf(fake.interrupted, 0);
+      } else {
+        assert.isTrue(Exit.isFailure(outcome), JSON.stringify(outcome));
+        assert.lengthOf(fake.interrupted, 1);
+      }
+    }).pipe(
+      Effect.provide(inlineTestLayer(gated)),
+      Effect.ensuring(Deferred.succeed(release, undefined)),
+    );
+  }),
+);
+
 it.effect("#1156 board cap retains eight jobs and starts them oldest first when slots free", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -30596,7 +30768,17 @@ it.effect.each(
           Exit.isSuccess(unrelated),
           "An ineligible discussion owner must not block unrelated evaluator requests",
         );
-        if (Exit.isSuccess(unrelated)) assert.property(unrelated.value, "threadId");
+        if (Exit.isSuccess(unrelated)) {
+          const admitted = unrelated.value;
+          if ("queued" in admitted) {
+            const sql = yield* BoardsDatabase.client;
+            const rows = yield* sql<{ json: string }>`
+              SELECT json FROM ardud_kanban_evaluator_queue WHERE id = ${admitted.queueId}
+            `;
+            assert.lengthOf(rows, 1);
+            assert.include(rows[0]!.json, "A new unrelated incident");
+          } else assert.property(admitted, "threadId");
+        }
         const current = yield* kanban.discussion(discussion.id);
         if (state === "recent" || state === "running" || state === "finished")
           assert.strictEqual(current.evaluatorThreadId, adopted);

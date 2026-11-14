@@ -2248,6 +2248,9 @@ const make = Effect.gen(function* () {
   const evaluating = new Map<string, Semaphore.Semaphore>();
   // This per-discussion permit also marks an in-flight launch; later posts wait for its save.
   const routing = new Map<string, Semaphore.Semaphore>();
+  const enqueueEvaluatorOnly = Context.Reference("KanbanEnqueueEvaluatorOnly", {
+    defaultValue: () => false,
+  });
   const handedOff = new Set<string>();
   const ticking = new Map<string, Semaphore.Semaphore>();
   const turnEnding = new Map<string, Semaphore.Semaphore>();
@@ -2271,6 +2274,7 @@ const make = Effect.gen(function* () {
     key: string,
     effect: Effect.Effect<A, E, R>,
     stateScope = true,
+    whenBusy?: Effect.Effect<A, E, R>,
   ) =>
     Effect.suspend(() => {
       const started = performance.now();
@@ -2279,15 +2283,23 @@ const make = Effect.gen(function* () {
         mutex = Semaphore.makeUnsafe(1);
         all.set(key, mutex);
       }
+      const run = Effect.gen(function* () {
+        // The permit wait was invisible in traces: it dominated slow owner answers.
+        yield* Effect.annotateCurrentSpan("serial.wait_ms", performance.now() - started);
+        return yield* locks.fresh(stateScope ? locks.run(effect) : effect);
+      });
       return locks.outside(
-        TickTimings.admission(
-          mutex.withPermits(1),
-          Effect.gen(function* () {
-            // The permit wait was invisible in traces: it dominated slow owner answers.
-            yield* Effect.annotateCurrentSpan("serial.wait_ms", performance.now() - started);
-            return yield* locks.fresh(stateScope ? locks.run(effect) : effect);
-          }),
-        ),
+        whenBusy === undefined
+          ? TickTimings.admission(mutex.withPermits(1), run)
+          : mutex
+              .withPermitsIfAvailable(1)(run)
+              .pipe(
+                Effect.flatMap((result) =>
+                  Option.isSome(result)
+                    ? Effect.succeed(result.value)
+                    : locks.fresh(locks.run(whenBusy)),
+                ),
+              ),
       );
     }).pipe(
       Effect.withSpan("KanbanService.serial", {
@@ -2311,6 +2323,17 @@ const make = Effect.gen(function* () {
     key: string,
     effect: Effect.Effect<A, E, R>,
   ) => serialEach(all, key, effect);
+
+  // Admission can persist a job while another caller drains launches. Only the
+  // drain needs the evaluator permit; the normal tick recovers the queued job.
+  const evaluatorAdmission = <A, E, R>(key: string, effect: Effect.Effect<A, E, R>) =>
+    serialEach(
+      evaluating,
+      key,
+      effect,
+      true,
+      effect.pipe(Effect.provideService(enqueueEvaluatorOnly, true)),
+    );
 
   const changes = yield* PubSub.unbounded<BoardPublication>();
   const jobs = yield* Queue.unbounded<Job>();
@@ -4107,27 +4130,38 @@ const make = Effect.gen(function* () {
       text: extra.text ? `${brief}\n\n${extra.text}` : brief,
     });
     const inheritedReconcile = yield* launchReconcile;
+    const launchDiscussion =
+      setupDiscussion ??
+      nightlyDiscussion ??
+      (purpose.kind === "discussion" && inheritedReconcile === undefined
+        ? yield* discussionOf(KanbanDiscussionId.make(purpose.discussionId))
+        : null);
+    // Concurrent queue admission does not change this launch's inputs. Recheck
+    // those inputs instead of rejecting every intervening board generation.
+    const reconcileInputs = Effect.fn("KanbanService.reconcileEvaluatorLaunch")(function* () {
+      const current = (yield* rawStore.boards).find((candidate) => candidate.id === board.id);
+      if (!NodeUtil.isDeepStrictEqual(current, board)) return false;
+      if (launchDiscussion === null) return true;
+      const discussion = yield* rawStore.discussion(launchDiscussion.id);
+      // Discussion ownership is reconciled after launch against the latest owner.
+      // Setup/nightly still write their captured channel and need its full snapshot.
+      return purpose.kind === "discussion"
+        ? discussion !== null &&
+            discussion.boardId === launchDiscussion.boardId &&
+            discussion.cardId === launchDiscussion.cardId &&
+            discussion.title === launchDiscussion.title &&
+            discussion.settledAt === launchDiscussion.settledAt &&
+            discussion.snoozedUntil === launchDiscussion.snoozedUntil
+        : NodeUtil.isDeepStrictEqual(discussion, launchDiscussion);
+    });
     const launch = (key: string) =>
       reserveEvaluatorSpawn(board.id, extra.cardId ?? null, launchInput(key).key).pipe(
         Effect.andThen(threads.launch(launchInput(key))),
         Effect.provideService(
           launchReconcile,
           purpose.kind !== "request" && purpose.kind !== "setup"
-            ? inheritedReconcile
-            : () =>
-                Effect.gen(function* () {
-                  const current = (yield* rawStore.boards).find(
-                    (candidate) => candidate.id === board.id,
-                  );
-                  return (
-                    NodeUtil.isDeepStrictEqual(current, board) &&
-                    (setupDiscussion === null ||
-                      NodeUtil.isDeepStrictEqual(
-                        yield* rawStore.discussion(setupDiscussion.id),
-                        setupDiscussion,
-                      ))
-                  );
-                }),
+            ? (inheritedReconcile ?? reconcileInputs)
+            : reconcileInputs,
         ),
       );
     const routeKey =
@@ -4505,6 +4539,11 @@ const make = Effect.gen(function* () {
       yield* publish(board.id, { _tag: "board", board: saved.board });
     } else {
       yield* locks.access(board.id, enqueue, true, "evaluator-queue");
+    }
+    if (yield* enqueueEvaluatorOnly) {
+      const rows =
+        yield* tickSql<EvaluatorQueueRow>`SELECT * FROM ardud_kanban_evaluator_queue WHERE job_key = ${key}`;
+      return { queued: true as const, queueId: rows[0]!.id };
     }
     return yield* drainEvaluatorQueue(board.id, key);
   });
@@ -16350,8 +16389,7 @@ const make = Effect.gen(function* () {
     return yield* SavedWrite.recover(
       guard(
         "bug.report.evaluate",
-        serial(
-          evaluating,
+        evaluatorAdmission(
           board.id,
           Effect.gen(function* () {
             return yield* admitEvaluator(
@@ -16676,8 +16714,7 @@ const make = Effect.gen(function* () {
       const key = uuid();
       return guard(
         "evaluator.submit",
-        serial(
-          evaluating,
+        evaluatorAdmission(
           boardId,
           Effect.gen(function* () {
             yield* checkText([
