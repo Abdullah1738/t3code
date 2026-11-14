@@ -40,14 +40,19 @@ class BackgroundDu:
                                    stderr=subprocess.PIPE, text=kwargs.get('text', False),
                                    env=kwargs.get('env'))
         # Reserve bounded cleanup inside the wall budget, including after wake.
-        deadline = min(time.monotonic()+timeout,
-                       time.monotonic()+max(0, self.wall_deadline-time.time()-1))
+        command_started = time.monotonic()
+        deadline = min(command_started+timeout,
+                       command_started+max(0, self.wall_deadline-time.time()-1))
         stdout = stderr = ''
         try:
             while True:
                 remaining = min(deadline-time.monotonic(), self.wall_deadline-time.time())
                 if self.stop() or remaining <= 0:
-                    raise subprocess.TimeoutExpired(command, timeout)
+                    # Report the actual probe cutoff before cleanup. The
+                    # shared scanner must not classify a budget/stop-truncated
+                    # ordinary child as slow from the nominal timeout.
+                    effective = max(0, min(deadline-command_started, time.monotonic()-command_started))
+                    raise subprocess.TimeoutExpired(command, effective)
                 try:
                     stdout, stderr = process.communicate(timeout=min(1, remaining))
                     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
@@ -150,13 +155,22 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                         rootsPartial=sum(not listed for entries, listed in listings.values()),
                         timeouts=metrics['timeouts'], secondsInTimeouts=metrics['secondsInTimeouts'],
                         childrenDescended=len(metrics['childrenDescended']), partsMeasured=metrics['partsMeasured'],
-                        spawnPolicy='nice-10-utility')
+                        spawnPolicy='nice-10-utility', partsFreshnessS=jobs.INVENTORY_PARTS_FRESH_S)
 
         emit('disk', 'event', 'disk.deep.start', props=props())
         runner = run if run is not None else BackgroundDu(stopped, wall_deadline, lock_fd)
         attempted = {str(path): set() for path in roots}
         single_paths = {str(path): set() for path in roots}
         part_work = {str(path): {} for path in roots}
+        def needs_work(root, entry):
+            return (entry.path not in attempted[root]
+                    and jobs.inventory_due(child_state[root].get(entry.path), time.time(), wall_deadline))
+
+        def healthy_pending():
+            return any(needs_work(root, entry)
+                       and not jobs.inventory_has_timeout(child_state[root].get(entry.path, {}))
+                       and not jobs.inventory_has_parts(child_state[root].get(entry.path, {}))
+                       for root, (entries, listed) in listings.items() for entry in entries)
         queue = list(roots)
         try:
             while queue:
@@ -195,12 +209,14 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                                                  listings[key], deep=True, checkpoint=checkpoint,
                                                  attempted=attempted[key], max_batches=4, turn_seconds=60,
                                                  single_paths=single_paths[key], metrics=metrics,
-                                                 part_work=part_work[key])
+                                                 part_work=part_work[key], due_at=wall_deadline,
+                                                 # One early parts turn preserves daily progress;
+                                                 # then ordinary work due this pass takes priority.
+                                                 descend=not any(part_work.values()) or not healthy_pending())
                 checkpoint(*result)
                 # Yield after 60 s or four cheap batches; an expensive parts
                 # command is capped at 600 s across this child for the pass.
-                if any(e.path not in attempted[key] and jobs.inventory_needs_measurement(
-                        child_state[key].get(e.path), time.time()) for e in entries):
+                if any(needs_work(key, e) for e in entries):
                     queue.append(path)
                 if not queue:
                     # Daily passes start near the previous pass's timestamps.
@@ -210,8 +226,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                             if (isinstance(value.get('parts'), dict) and value.get('partial') is False
                                     and jobs.inventory_needs_measurement(value, time.time())):
                                 attempted[str(root)].discard(child)
-                    queue = [root for root in roots if any(e.path not in attempted[str(root)]
-                        and jobs.inventory_needs_measurement(child_state[str(root)].get(e.path), time.time())
+                    queue = [root for root in roots if any(needs_work(str(root), e)
                         for e in listings[str(root)][0])]
         except PassStopped:
             stop_reason = 'killed' if stopped() else 'budget'

@@ -29,12 +29,18 @@ A separate `com.abdullah.mac-deep-inventory` LaunchAgent runs daily at 03:30
 local time (Asia/Dubai on this Mac). It starts with the four SSD worktree farms
 and checkpoints the next root to visit, so interrupted passes rotate fairly.
 Cheap batches can share a turn; known timeouts follow healthy discovery and
-refresh work. Unknown children get a 15-second probe; a batch deadline falls
+refresh work after one early parts turn. Ordinary children that will expire
+during the pass are refreshed before more parts work can crowd them out.
+Unknown children get a 15-second probe; a batch deadline falls
 back to individual probes. A timed-out child is split into immediate entries,
 with each completed part checkpointed and at most ten minutes per child per
-pass. The child has no total until its listing and every part are complete
-and fresh; its own directory allocation is included. Parts do not recurse.
-The hourly scanner leaves unfinished parts and recent timeouts to this pass.
+pass. Checkpointed parts and their parent have a 72-hour freshness window so
+three nightly passes can finish a child. Ordinary children keep 24 hours.
+The child has no total until its listing and every part are complete and
+fresh; the total retains the oldest part's timestamp. At expiry it becomes
+partial with no total again. Its own directory allocation is included.
+Parts do not recurse. The hourly scanner leaves parts parents and recent
+timeouts to this pass.
 The daily budget is 90 minutes; du runs under nice 10
 and utility scheduling without inherited launchd background I/O policy.
 Termination keeps completed rows; unfinished children remain explicit partials.
@@ -42,7 +48,7 @@ Both entry points acquire `state/disk-inventory.lock` non-blocking. A busy
 daily pass exits cleanly; a busy hourly scan logs `skipReason=deep_pass_running`
 and cached totals while crash collection continues. `disk.deep.start`,
 `disk.deep.root`, `disk.deep.parts` and `disk.deep.end` record coverage, ages,
-timeout time, parts progress and stop reason.
+timeout time, parts progress, the parts freshness window and stop reason.
 `childrenRemaining` counts known eligible children; `rootsPartial` on pass
 summaries counts roots whose listing was unavailable, so zero remaining with
 unlisted roots is not complete coverage. All totals count hardlink occurrences,

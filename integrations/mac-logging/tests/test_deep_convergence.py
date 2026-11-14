@@ -90,6 +90,97 @@ class ConvergenceTests(unittest.TestCase):
                     self.assertLessEqual(len(results),3)
         print('CONVERGENCE',json.dumps(evidence,sort_keys=True))
 
+    def heavy_daily_shape(self, giant_count, part_seconds=350):
+        counts=[('wt',66),('t3code-wt',281),('board-wt',932),
+                ('coord-wt',129),('crpko-devops/tmp',3091)]
+        roots=[Path('/Volumes/ExternalSSD')/name for name,_ in counts]
+        topology={root:[root/('%04d'%i) for i in range(count)] for root,(_,count) in zip(roots,counts)}
+        candidates=[p for root in roots[:4] for p in topology[root][::20]]
+        # Spread the feasible pair between roots; the stress case uses the
+        # entire approximately-five-percent population.
+        giants=set(candidates[::max(1,len(candidates)//giant_count)][:giant_count])
+        for child in giants:
+            topology[child]=[child/('part%d'%i) for i in range(3)]
+        def cost(path):
+            if path in giants:
+                return 3*part_seconds
+            if path.parent in giants:
+                return part_seconds
+            return 3.4 if path.parent==roots[2] else .034 if path.parent==roots[4] else 1.5
+        def listing(path,deadline):
+            return [SimpleNamespace(path=str(p),is_dir=lambda **kw:True) for p in topology[Path(path)]],True
+        stored={}
+        evidence=[]
+        with patch.object(jobs,'inventory_listing',side_effect=listing), \
+             patch.object(jobs.os,'lstat',return_value=SimpleNamespace(st_mode=stat.S_IFDIR,st_blocks=0)), \
+             patch.object(jobs,'read_state',side_effect=lambda name:copy.deepcopy(stored.get(name,{}))), \
+             patch.object(jobs,'save_state',side_effect=lambda name,value:stored.update({name:value})), \
+             patch.object(jobs,'emit'),patch.object(deep,'emit'):
+            for night in range(3):
+                self.clock[0]=night*86400
+                start=self.clock[0]
+                known={key for cache in stored.get('disk-inventory',{}).get('childState',{}).values()
+                       for key,v in cache.items() if jobs.inventory_has_timeout(v)}
+                calls=[]
+                deep.run_pass(roots,self.runner(cost,calls),budget=5400)
+                self.assertLessEqual(self.clock[0]-start,5400)
+                state=stored['disk-inventory']
+                for giant in giants:
+                    part_time=sum(min(cost(Path(key)),timeout) for cmd,timeout in calls
+                                  for key in cmd[2:] if Path(key).parent==giant)
+                    self.assertLessEqual(part_time,600)
+                    if str(giant) in known:
+                        self.assertFalse(any(str(giant) in cmd[2:] for cmd,_ in calls))
+                previous_parts={key:v.get('at') for cache in stored.get('previous',{}).values()
+                                for parent in cache.values() for key,v in parent.get('parts',{}).items()}
+                parts_measured=sum(v.get('at')!=previous_parts.get(key) and jobs.number(v.get('at'))
+                                   for cache in state['childState'].values() for parent in cache.values()
+                                   for key,v in parent.get('parts',{}).items())
+                complete=0
+                ordinary_remaining={}
+                for root in roots:
+                    cache=state['childState'][str(root)]
+                    ordinary_remaining[root.name]=sum(jobs.inventory_needs_measurement(cache.get(str(p)),self.now+self.clock[0])
+                        for p in topology[root] if p not in giants)
+                for cache in state['childState'].values():
+                    for value in cache.values():
+                        complete+=not jobs.inventory_needs_measurement(value,self.now+self.clock[0])
+                        if 'parts' in value:
+                            if value.get('partial') is False:
+                                self.assertEqual(value['partsDone'],value['partsTotal'])
+                                self.assertEqual(value['at'],min(v['at'] for v in value['parts'].values()))
+                                self.assertLess(self.now+self.clock[0]-value['at'],jobs.INVENTORY_PARTS_FRESH_S)
+                            else:
+                                self.assertNotIn('bytes',value)
+                evidence.append(dict(night=night+1,seconds=self.clock[0]-start,complete=complete,
+                                     remaining=4499-complete,partsMeasured=parts_measured,
+                                     ordinaryRemaining=ordinary_remaining))
+                stored['previous']=copy.deepcopy(state['childState'])
+        print('HEAVY_CONVERGENCE',json.dumps(dict(giants=len(giants),partSeconds=part_seconds,passes=evidence)))
+        return state,evidence,len(giants)
+
+    def test_full_shape_with_two_1050_second_children_completes_in_three_nights(self):
+        state,evidence,giants=self.heavy_daily_shape(2)
+        self.assertEqual(giants,2)
+        self.assertFalse(state['partials'])
+        self.assertEqual(evidence[-1]['remaining'],0)
+        # Three ordinary sweeps cost <11,950 s. Two 1,050 s giants
+        # plus at most 500 s of truncated attempts each leave >1,150 s
+        # of the 16,200 s budget for discovery overhead; three do not fit
+        # that conservative allocation.
+        ordinary=932*3.4+(66+281+129)*1.5+3091*.034-3.4-1.5
+        available=3*5400-3*ordinary
+        self.assertEqual(int(available/(1050+500)),2)
+
+    def test_full_shape_five_percent_630_second_children_is_capacity_limited(self):
+        state,evidence,giants=self.heavy_daily_shape(72,part_seconds=210)
+        self.assertEqual(giants,72)
+        self.assertGreater(giants*3*210,3*5400)
+        self.assertTrue(state['partials'])
+        self.assertGreater(evidence[-1]['remaining'],0)
+        self.assertTrue(all(row['partsMeasured']>0 for row in evidence))
+        self.assertTrue(all(remaining==0 for remaining in evidence[-1]['ordinaryRemaining'].values()))
+
     def test_parts_checkpoint_kill_and_resume_without_early_total(self):
         root = self.roots([('parts',1)])[0]
         child = root/'0000'
@@ -127,6 +218,184 @@ class ConvergenceTests(unittest.TestCase):
         self.assertEqual(self.rows('disk.deep.end')[-1]['props']['childrenMeasured'],1)
         self.assertEqual(self.rows('disk.deep.end')[-1]['props']['bytesMeasured'],final['bytes'])
 
+    def test_three_350_second_parts_converge_on_daily_passes(self):
+        root=self.roots([('daily-parts',1)])[0]
+        child=root/'0000'
+        for name in ('a','b','c'):
+            (child/name).mkdir()
+        jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{
+            str(child):dict(timeouts=2,partial=True)}}))
+        for night in range(3):
+            self.clock[0]=night*86400
+            started=self.clock[0]
+            calls=[]
+            deep.run_pass([root],self.runner(lambda p:350,calls),budget=5400)
+            self.assertLessEqual(self.clock[0]-started,600)
+            value=jobs.read_state('disk-inventory')['childState'][str(root)][str(child)]
+            if night<2:
+                self.assertTrue(value['partial'])
+                self.assertNotIn('bytes',value)
+            else:
+                self.assertFalse(value['partial'])
+                self.assertEqual(value['partsDone'],3)
+                self.assertEqual(value['at'],min(v['at'] for v in value['parts'].values()))
+                self.assertFalse(jobs.read_state('disk-inventory')['partials'])
+        self.clock[0]=value['at']-self.now+jobs.INVENTORY_PARTS_FRESH_S
+        jobs.directory_inventory([root],lambda *a,**kw:self.fail('parts expiry belongs to deep scan'))
+        expired=jobs.read_state('disk-inventory')['childState'][str(root)][str(child)]
+        self.assertTrue(expired['partial'])
+        self.assertNotIn('bytes',expired)
+        self.assertEqual(expired['partsDone'],2)
+        self.assertEqual(expired['partsTotal'],3)
+
+    def test_parts_freshness_boundary_is_explicit_and_ordinary_entries_stay_daily(self):
+        root=self.roots([('freshness',1)])[0]
+        child=str(root/'0000')
+        entry=SimpleNamespace(path=child)
+        for age,expected in ((86400-1,False),(86400,False),(259200-1,False),
+                             (259200,True),(259200+1,True)):
+            with self.subTest(age=age):
+                at=self.now-age
+                value=dict(bytes=1024,at=at,attemptedAt=at,partial=False,
+                           parts={},partsDone=0,partsTotal=0)
+                self.assertEqual(jobs.inventory_needs_measurement(value,self.now),expected)
+                self.assertEqual(jobs.inventory_status({child:value},[entry],True,self.now)[1]['partial'],expected)
+                if expected:
+                    self.assertNotIn('bytes',value)
+                    self.assertTrue(value['partial'])
+                else:
+                    self.assertEqual(value['at'],at)
+                self.assertTrue(jobs.inventory_deep_owned(value,self.now))
+                ordinary=dict(bytes=1024,at=at,attemptedAt=at,partial=False)
+                self.assertEqual(jobs.inventory_needs_measurement(ordinary,self.now),age>=86400)
+
+    def test_daily_parts_cost_matrix(self):
+        cases=((1,599,1),(1,600,1),(2,350,2),(3,210,2),(3,350,3),(4,200,2))
+        for count,cost,expected_night in cases:
+            with self.subTest(count=count,cost=cost):
+                root=self.roots([('cost-%d-%d'%(count,cost),1)])[0]
+                child=root/'0000'
+                for i in range(count):
+                    (child/str(i)).mkdir()
+                jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{
+                    str(child):dict(timeouts=2,partial=True)}}))
+                for night in range(expected_night):
+                    self.clock[0]=night*86400
+                    started=self.clock[0]
+                    deep.run_pass([root],self.runner(lambda p:cost),budget=5400)
+                    self.assertLessEqual(self.clock[0]-started,600)
+                    value=jobs.read_state('disk-inventory')['childState'][str(root)][str(child)]
+                    self.assertEqual(value['partial'],night+1<expected_night)
+                    if value['partial']:
+                        self.assertNotIn('bytes',value)
+
+    def test_legacy_file_parts_markers_keep_ordinary_freshness_and_ownership(self):
+        for is_directory in (False,True,None):
+            for parts in ({},{'part':dict(bytes=1024,at=self.now,partial=False)}):
+                with self.subTest(is_directory=is_directory,parts=bool(parts)):
+                    value=dict(bytes=1024,at=self.now-90000,attemptedAt=0,partial=False,
+                               parts=copy.deepcopy(parts),partsDone=len(parts),partsTotal=len(parts))
+                    if is_directory is not None:
+                        value['isDirectory']=is_directory
+                    self.assertEqual(jobs.inventory_needs_measurement(value,self.now),is_directory is False)
+                    self.assertEqual(jobs.inventory_deep_owned(value,self.now),is_directory is not False)
+                    cache={'child':value}
+                    jobs.inventory_clean_cache(cache,self.now)
+                    if is_directory is False:
+                        self.assertNotIn('parts',cache['child'])
+                        self.assertNotIn('partsDone',cache['child'])
+                        self.assertNotIn('partsTotal',cache['child'])
+                        self.assertEqual(cache['child']['at'],self.now-90000)
+
+    def test_hourly_rechecks_parts_expiry_after_peer_work_before_saving(self):
+        roots=self.roots([('a-parts',1),('b-slow',1)])[0:2]
+        child=roots[0]/'0000'
+        (child/'part').mkdir()
+        at=self.now-jobs.INVENTORY_PARTS_FRESH_S+1
+        parent=dict(bytes=1024,at=at,attemptedAt=0,partial=False,isDirectory=True,
+                    parts={str(child/'part'):dict(bytes=1024,at=at,attemptedAt=0,partial=False)},
+                    partsDone=1,partsTotal=1)
+        jobs.save_state('disk-inventory',dict(duMode='links',childState={str(roots[0]):{str(child):parent}}))
+        jobs.directory_inventory(roots,self.runner(lambda p:2))
+        state=jobs.read_state('disk-inventory')
+        value=state['childState'][str(roots[0])][str(child)]
+        self.assertTrue(value['partial'])
+        self.assertNotIn('bytes',value)
+        self.assertEqual(value['partsDone'],0)
+        self.assertEqual(value['partsTotal'],1)
+        self.assertNotIn(str(roots[0]),state['sizes'])
+        self.assertFalse(state['children'][str(roots[0])])
+        self.assertTrue(state['partials'][str(roots[0])]['partial'])
+
+    def test_ordinary_refresh_precedes_expiry_during_a_parts_turn(self):
+        roots=self.roots([('a-ordinary',1),('b-parts',1)])
+        child=roots[1]/'0000'
+        (child/'part').mkdir()
+        ordinary=str(roots[0]/'0000')
+        jobs.save_state('disk-inventory',dict(duMode='links',childState={
+            str(roots[0]):{ordinary:dict(bytes=1024,at=self.now-86400+10,partial=False)},
+            str(roots[1]):{str(child):dict(timeouts=2,partial=True)}}))
+        calls=[]
+        deep.run_pass(roots,self.runner(lambda p:600 if p.name=='part' else 1,calls),budget=600)
+        state=jobs.read_state('disk-inventory')
+        self.assertEqual(calls[0][0][-1],ordinary)
+        self.assertNotIn(str(roots[0]),state['partials'])
+        self.assertTrue(state['childState'][str(roots[1])][str(child)]['partial'])
+
+    def test_new_timeout_cannot_bypass_ordinary_priority_after_reserved_parts_turn(self):
+        for count in (1,130):
+            with self.subTest(batch=count>1):
+                roots=self.roots([('a-known-%d'%count,1),('b-new-%d'%count,count),('c-ordinary-%d'%count,1)])
+                for root in roots[:2]:
+                    (root/'0000'/'part').mkdir()
+                jobs.save_state('disk-inventory',dict(duMode='links',childState={str(roots[0]):{
+                    str(roots[0]/'0000'):dict(timeouts=2,partial=True)}}))
+                self.clock[0]=0
+                calls=[]
+                deep.run_pass(roots,self.runner(lambda p:350 if p.name=='part' else 700
+                    if p==roots[1]/'0000' else 1,calls),budget=600)
+                keys=[key for cmd,_ in calls for key in cmd[2:]]
+                self.assertLess(keys.index(str(roots[2]/'0000')),keys.index(str(roots[1]/'0000'/'part')))
+                self.assertNotIn(str(roots[2]),jobs.read_state('disk-inventory')['partials'])
+
+    def test_budget_truncated_probe_does_not_classify_an_ordinary_child_as_slow(self):
+        for allowance in (.01,1,14.999,15):
+            with self.subTest(allowance=allowance):
+                root=self.roots([('probe-%s'%allowance,1)])[0]
+                child=str(root/'0000')
+                cache={child:dict(bytes=1024,at=self.now-90000,attemptedAt=0,partial=False)}
+                self.clock[0]=0
+                jobs.big_root_inventory(root,self.runner(lambda p:20),allowance,cache,deep=True,max_batches=1)
+                self.assertEqual(bool(cache[child].get('timeouts')),allowance>=15)
+                self.assertEqual(jobs.inventory_deep_owned(cache[child],self.now+self.clock[0]),allowance>=15)
+
+    def test_background_runner_reports_effective_probe_allowance_before_cleanup(self):
+        for seconds_left,child_seconds,stopped,full in ((15,20,False,False),(15.5,14.75,False,False),
+                                                       (16,20,False,True),(30,20,False,True),
+                                                       (30,20,True,False)):
+            with self.subTest(seconds_left=seconds_left,stopped=stopped):
+                root=self.roots([('runner-%s-%s'%(seconds_left,stopped),1)])[0]
+                child=str(root/'0000')
+                self.clock[0]=0
+                killed=[False]
+                def communicate(timeout):
+                    if killed[0]:
+                        return '', ''
+                    self.clock[0]+=timeout
+                    if self.clock[0]>=child_seconds:
+                        return '1\t'+child+'\n', ''
+                    raise subprocess.TimeoutExpired('du',timeout)
+                process=SimpleNamespace(pid=12345,communicate=communicate,returncode=0)
+                def kill(*args):
+                    killed[0]=True
+                    self.clock[0]+=.5
+                runner=deep.BackgroundDu(lambda:stopped and self.clock[0]>0,self.now+seconds_left,42)
+                with patch.object(deep.subprocess,'Popen',return_value=process),patch.object(deep.os,'killpg',side_effect=kill):
+                    cache={}
+                    jobs.big_root_inventory(root,runner,seconds_left,cache,deep=True,max_batches=1)
+                self.assertEqual(bool(cache[child].get('timeouts')),full)
+                self.assertEqual(jobs.inventory_deep_owned(cache[child],self.now+self.clock[0]),full)
+
     def test_batch_timeout_isolates_and_measures_cheap_singles(self):
         root = self.roots([('batch',130)])[0]
         calls = []
@@ -149,18 +418,19 @@ class ConvergenceTests(unittest.TestCase):
         self.assertEqual(self.rows('disk.deep.end')[-1]['props']['secondsInTimeouts'],60)
 
     def test_hourly_ownership_and_old_format_matrix(self):
-        root = self.roots([('hourly',5)])[0]
+        root = self.roots([('hourly',6)])[0]
         old = dict(bytes=1024,at=self.now,attemptedAt=1,partial=False)
         forms = [dict(partial=True,parts={},partsDone=0,partsTotal=2),
                  dict(partial=True,timeouts=1,lastTimeoutAt=self.now),
                  dict(bytes=1024,at=self.now-90000,partial=False,timeouts=1,lastTimeoutAt=self.now),
-                 old,dict(partial=True,parts={'x':dict(bytes=1024,at=self.now,partial=False)})]
+                 old,dict(partial=True,parts={'x':dict(bytes=1024,at=self.now,partial=False)}),
+                 dict(bytes=1024,at=self.now-90000,partial=False,parts={},partsTotal=0)]
         jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{
             str(root/('%04d'%i)):copy.deepcopy(v) for i,v in enumerate(forms)}}))
         jobs.directory_inventory([root],lambda *a,**kw:self.fail('deep-owned children must not run hourly'))
         cache = jobs.read_state('disk-inventory')['childState'][str(root)]
         self.assertEqual(cache[str(root/'0003')],old)
-        for i in (0,1,2,4):
+        for i in (0,1,2,4,5):
             self.assertTrue(jobs.inventory_deep_owned(cache[str(root/('%04d'%i))],self.now))
         self.assertTrue(jobs.read_state('disk-inventory')['partials'])
 
@@ -272,15 +542,16 @@ deep_inventory.run_pass([Path(sys.argv[2])],run,budget=30)
             self.assertEqual(end[field],0)
         self.assertEqual(end['spawnPolicy'],'nice-10-utility')
         self.assertEqual(self.rows('disk.deep.root')[-1]['props']['childrenWithPartsInProgress'],0)
+        self.assertEqual(end['partsFreshnessS'],jobs.INVENTORY_PARTS_FRESH_S)
 
-    def test_root_crossing_freshness_during_peer_work_is_revisited(self):
+    def test_root_due_to_expire_during_peer_work_is_refreshed_first(self):
         roots=self.roots([('a',1),('b',1)])
         child=str(roots[0]/'0000')
         jobs.save_state('disk-inventory',dict(duMode='links',childState={str(roots[0]):{
             child:dict(bytes=1024,at=self.now-86400+1,attemptedAt=0,partial=False)}}))
         calls=[]
         deep.run_pass(roots,self.runner(lambda p:2,calls))
-        self.assertEqual([cmd[-1] for cmd,_ in calls],[str(roots[1]/'0000'),child])
+        self.assertEqual([cmd[-1] for cmd,_ in calls],[child,str(roots[1]/'0000')])
         self.assertFalse(jobs.read_state('disk-inventory')['partials'])
 
     def test_complete_parts_clear_the_old_parent_permission_hint(self):
@@ -312,7 +583,7 @@ deep_inventory.run_pass([Path(sys.argv[2])],run,budget=30)
         (child/'b').mkdir()
         jobs.save_state('disk-inventory',dict(duMode='links',childState={str(roots[0]):{
             str(child):dict(partial=True,timeouts=2,parts={str(child/'a'):
-                dict(bytes=1024,at=self.now-86400+1,attemptedAt=0,partial=False)})}}))
+                dict(bytes=1024,at=self.now-259200+1,attemptedAt=0,partial=False)})}}))
         calls=[]
         deep.run_pass(roots,self.runner(lambda p:2 if p.parent==roots[1] else .1,calls))
         state=jobs.read_state('disk-inventory')
