@@ -1901,6 +1901,70 @@ const make = Effect.gen(function* () {
     ),
   );
 
+  const sendThread = Effect.fn("KanbanService.sendThread")(function* (
+    input: Parameters<typeof threadIo.send>[0],
+    acknowledge = false,
+  ) {
+    const key = yield* ownerDeliveryKey;
+    const delivered = yield* ownerDelivered;
+    const answer = input.key === undefined;
+    if (answer && delivered?.has(input.threadId)) return;
+    const wake =
+      input.coalesce !== undefined && input.model === undefined && input.mode !== "steer"
+        ? { scope: input.coalesce, stale: false }
+        : undefined;
+    if (wake !== undefined) {
+      let pending = scopedWakeSends.get(input.threadId);
+      if (pending === undefined) scopedWakeSends.set(input.threadId, (pending = new Set()));
+      pending.add(wake);
+    }
+    const sent = touching(
+      input.threadId,
+      threadIo
+        .send({
+          ...input,
+          ...(key === undefined
+            ? {}
+            : { key: `${key}:${input.threadId}:${input.key ?? "answer"}` }),
+        })
+        .pipe(
+          Effect.flatMap((runId) =>
+            wake?.stale
+              ? discardWake(input.threadId, runId).pipe(Effect.asVoid)
+              : Effect.succeed(runId),
+          ),
+        ),
+    );
+    return yield* trackSend(
+      input.threadId,
+      locks.outside(
+        Effect.andThen(
+          runPendingStops(input.threadId),
+          input.model === undefined ? sent : withThreadModel(input.threadId, sent),
+        ).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              if (answer && !wake?.stale) delivered?.add(input.threadId);
+            }),
+          ),
+        ),
+        wake === undefined
+          ? undefined
+          : (runId) => (wake.stale ? discardWake(input.threadId, runId) : Effect.void),
+        false,
+        acknowledge ? Effect.succeed(true) : undefined,
+      ),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (wake === undefined) return;
+          const pending = scopedWakeSends.get(input.threadId);
+          pending?.delete(wake);
+          if (pending?.size === 0) scopedWakeSends.delete(input.threadId);
+        }),
+      ),
+    );
+  });
   const threads: typeof threadIo = {
     pendingUserInputs: (id) =>
       TickTimings.measure(
@@ -1986,67 +2050,7 @@ const make = Effect.gen(function* () {
             Effect.tap((id) => locks.launched(id, abandonLaunch(input, id))),
           );
       }),
-    send: Effect.fn("KanbanService.sendThread")(function* (
-      input: Parameters<typeof threadIo.send>[0],
-    ) {
-      const key = yield* ownerDeliveryKey;
-      const delivered = yield* ownerDelivered;
-      const answer = input.key === undefined;
-      if (answer && delivered?.has(input.threadId)) return;
-      const wake =
-        input.coalesce !== undefined && input.model === undefined && input.mode !== "steer"
-          ? { scope: input.coalesce, stale: false }
-          : undefined;
-      if (wake !== undefined) {
-        let pending = scopedWakeSends.get(input.threadId);
-        if (pending === undefined) scopedWakeSends.set(input.threadId, (pending = new Set()));
-        pending.add(wake);
-      }
-      const sent = touching(
-        input.threadId,
-        threadIo
-          .send({
-            ...input,
-            ...(key === undefined
-              ? {}
-              : { key: `${key}:${input.threadId}:${input.key ?? "answer"}` }),
-          })
-          .pipe(
-            Effect.flatMap((runId) =>
-              wake?.stale
-                ? discardWake(input.threadId, runId).pipe(Effect.asVoid)
-                : Effect.succeed(runId),
-            ),
-          ),
-      );
-      return yield* trackSend(
-        input.threadId,
-        locks.outside(
-          Effect.andThen(
-            runPendingStops(input.threadId),
-            input.model === undefined ? sent : withThreadModel(input.threadId, sent),
-          ).pipe(
-            Effect.tap(() =>
-              Effect.sync(() => {
-                if (answer && !wake?.stale) delivered?.add(input.threadId);
-              }),
-            ),
-          ),
-          wake === undefined
-            ? undefined
-            : (runId) => (wake.stale ? discardWake(input.threadId, runId) : Effect.void),
-        ),
-      ).pipe(
-        Effect.ensuring(
-          Effect.sync(() => {
-            if (wake === undefined) return;
-            const pending = scopedWakeSends.get(input.threadId);
-            pending?.delete(wake);
-            if (pending?.size === 0) scopedWakeSends.delete(input.threadId);
-          }),
-        ),
-      );
-    }),
+    send: sendThread,
     withdraw: (input) => locks.outside(touching(input.threadId, threadIo.withdraw(input))),
     setModel: (id, model) =>
       locks.outside(withThreadModel(id, touching(id, threadIo.setModel(id, model)))),
@@ -8081,14 +8085,9 @@ const make = Effect.gen(function* () {
     }
     // The send is accepted before the gate resumes. Acknowledge it on current rows,
     // like discussion delivery, so a concurrent edit cannot replay the same nudge.
-    const sent = yield* locks.outside(
-      threads.send({ threadId, text, coalesce: "nudge" }).pipe(
-        Effect.map((runId) => runId !== undefined),
-        Effect.catchCause(() => Effect.succeed(false)),
-      ),
-      undefined,
-      false,
-      Effect.succeed(true),
+    const sent = yield* sendThread({ threadId, text, coalesce: "nudge" }, true).pipe(
+      Effect.map((runId) => runId !== undefined),
+      Effect.catchCause(() => Effect.succeed(false)),
     );
     const at = yield* nowIso;
     for (const card of cards) {

@@ -31788,6 +31788,7 @@ it.effect.each([
     (["before enqueue", "after enqueue"] as const).map((gate) => ({ kind, gate, sibling: false })),
   ),
   { kind: "owner", gate: "before enqueue", sibling: true } as const,
+  { kind: "nudge", gate: "after release", sibling: false } as const,
 ])(
   "#1394 $kind wake delayed $gate respects departure scope (sibling=$sibling)",
   ({ kind, gate, sibling }) =>
@@ -31800,6 +31801,36 @@ it.effect.each([
       let work: ThreadId | undefined;
       let oldWake: string | void;
       let armed = false;
+      const originalLocks = BoardLocks.make;
+      const gateSpy =
+        gate === "after release"
+          ? vi.spyOn(BoardLocks, "make").mockImplementation(() =>
+              originalLocks().pipe(
+                Effect.map((locks) => {
+                  const outside: typeof locks.outside = (
+                    effect,
+                    abandoned,
+                    readOnly,
+                    reconcile,
+                  ) => {
+                    if (!armed || readOnly || reconcile === undefined)
+                      return locks.outside(effect, abandoned, readOnly, reconcile);
+                    armed = false;
+                    return locks.outside(
+                      Deferred.succeed(entered, undefined).pipe(
+                        Effect.andThen(Deferred.await(resume)),
+                        Effect.andThen(effect),
+                      ),
+                      abandoned,
+                      readOnly,
+                      reconcile,
+                    );
+                  };
+                  return { ...locks, outside };
+                }),
+              ),
+            )
+          : undefined;
       const wrapped = Layer.succeed(
         KanbanThreads,
         KanbanThreads.of({
@@ -31815,7 +31846,12 @@ it.effect.each([
                 (kind === "owner"
                   ? input.coalesce?.startsWith("owner:")
                   : input.coalesce === "nudge");
-              if (!delayed) return yield* lifecycle.send(message);
+              if (!delayed) {
+                const result = yield* lifecycle.send(message);
+                if (gate === "after release" && input.coalesce === "nudge" && oldWake === undefined)
+                  oldWake = result;
+                return result;
+              }
               armed = false;
               if (gate === "after enqueue") oldWake = yield* lifecycle.send(message);
               yield* Deferred.succeed(entered, undefined);
@@ -31887,6 +31923,7 @@ it.effect.each([
       }).pipe(
         Effect.ensuring(Deferred.succeed(resume, undefined)),
         Effect.provide(inlineTestLayer(wrapped)),
+        Effect.ensuring(Effect.sync(() => gateSpy?.mockRestore())),
       );
     }).pipe(Effect.provide(unstartedLifecycleLayer())),
 );
