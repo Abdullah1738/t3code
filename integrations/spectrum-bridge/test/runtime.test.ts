@@ -122,6 +122,20 @@ describe("recipient app cards", () => {
     expect(chats.owner.store.pendingOutbox()[0]!.id).not.toBe(first.body.id);
   });
 
+  test("stage continuation identity and immutable preview survive both enqueue routes", async () => {
+    const { chats, post } = api();
+    const updateOf = `app:${"a".repeat(64)}`;
+    const app = { ...card, updateOf, previewPage: card.url + "stages/preparing/" };
+    for (const to of [undefined, "owner"]) {
+      const response = await post({ ...app, ...(to ? { to } : {}), dedupeKey: `stage-${to}`, sessionId: "ses_owner@1" });
+      expect(response.status).toBe(202);
+      expect(chats.owner.store.getOperation(response.body.id)?.app).toEqual(app);
+      expect(chats.owner.store.get<string>(`app-latest:${updateOf}`)).toBe(response.body.id);
+      expect((await post({ ...app, to, dedupeKey: `stage-${to}`, sessionId: "ses_owner@1" })).status).toBe(200);
+      expect((await post({ ...app, to, previewPage: "https://elsewhere.example/", dedupeKey: "invalid", sessionId: "ses_owner@1" })).status).toBe(400);
+    }
+  });
+
   test("app cards are refused for group chats, with --to and without it", async () => {
     const { chats, post } = api();
     const group = chats.open(chatKey.group("GRP-Allowed-123"), "Family Trip");

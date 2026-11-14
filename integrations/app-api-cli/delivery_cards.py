@@ -602,7 +602,7 @@ def _build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
             atomic(folder / 'preview-state.json', {'hash': fingerprint})
             atomic(folder / 'index.html', page(v, url))
     return {'slug': folder.name, 'dir': str(folder), 'stage': v['stage'], 'items': v['count'],
-            'has_preview': bool(current)}
+            'has_preview': bool(current), 'stage_known': v['index'] >= 0 or v['stage'] == 'Cancelled'}
 
 
 def route():
@@ -862,7 +862,55 @@ def share_days(cfg):
     return min(30, max(1, days))
 
 
-def sync(cfg, data, *, send=False, recover=False):
+def stage_preview(folder, url, stage):
+    """Retain the image for this stage while the bridge queues or retries its upload."""
+    token = hashlib.sha256(stage.encode()).hexdigest()[:24]
+    snapshot = folder / 'stages' / token
+    snapshot.mkdir(parents=True, exist_ok=True)
+    image = snapshot / 'preview.png'
+    if not image.exists():
+        tmp = snapshot / f'preview.{os.getpid()}.tmp'
+        tmp.write_bytes((folder / 'preview.png').read_bytes())
+        tmp.replace(image)
+    atomic(snapshot / 'index.html', '<meta property="og:image" content="preview.png">')
+    return url.rstrip('/') + '/stages/' + token + '/'
+
+
+def stage_update(state, rendered, folder, save):
+    stage = rendered['stage']
+    if not rendered.get('stage_known'):
+        return
+    # Existing cards adopt the current stage without back-messaging old orders.
+    if 'placement_stage' not in state:
+        state['placement_stage'] = stage
+        return
+    updates = state.setdefault('stage_updates', {})
+    if stage == state['placement_stage'] or updates.get(stage, {}).get('queued'):
+        return
+    if not rendered['has_preview'] or not state.get('bridge_id'):
+        state['update_error'] = 'stage_preview_or_original_missing'
+        return
+    update = updates.setdefault(stage, {})
+    if 'args' not in update:
+        preview_page = stage_preview(folder, state['url'], stage)
+        original = state['send_args']
+        key = original[original.index('--key') + 1] + ':stage:' + hashlib.sha256(stage.encode()).hexdigest()[:24]
+        update['args'] = ['app', '--url', state['url'], '--caption', 'Delivery tracking', '--summary', stage,
+                          '--update-id', state['bridge_id'], '--preview-page', preview_page,
+                          '--key', key, '--session', route(), '--to', 'owner']
+    save()
+    try:
+        # A lost acknowledgement retries this exact operation; never rotate its key.
+        ack = bridge(live_session(update['args']))
+        if not isinstance(ack.get('id'), str) or not isinstance(ack.get('created'), bool):
+            raise ValueError('card_update_bad_ack')
+        update.update(queued=True, bridge_id=ack['id'])
+        state.pop('update_error', None)
+    except (OSError, ValueError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
+        state['update_error'] = 'failed:' + type(exc).__name__
+
+
+def sync(cfg, data, *, send=False, recover=False, update=False):
     settings = cfg.get('delivery_card')
     if not isinstance(settings, dict):
         return {'status': 'legacy_not_enrolled', 'rendered': False}
@@ -890,13 +938,16 @@ def sync(cfg, data, *, send=False, recover=False):
         state.update(rendered)
         if rendered['stage'] in ('Delivered', 'Cancelled'):
             state.setdefault('terminal_at', time.time())
-        if state.get('status') == 'sent' and state.get('send_args') and not state.get('bridge_confirmed'):
+        if state.get('status') == 'sent' and state.get('send_args') and (not state.get('bridge_confirmed') or not state.get('bridge_id')):
             # The bridge took the send; until its outbox shows it out, a route rotation or a
             # refusal can still drop it, and then it must be sendable again.
             try:
                 _, seen = ops(state['send_args'])
                 if seen and {st for _, st in seen.values()} & {'sent', 'fallback'}:
                     state['bridge_confirmed'] = True
+                    native = [oid for oid, (_, st) in seen.items() if st == 'sent']
+                    if not state.get('bridge_id') and len(native) == 1:
+                        state['bridge_id'] = native[0]
                 elif (seen and {kind for kind, _ in seen.values()} == {'dead'} and mine(state['send_args']) in seen
                       and not waiting(state, 'send_args')):
                     state['status'] = 'failed:dropped_by_bridge'
@@ -939,7 +990,11 @@ def sync(cfg, data, *, send=False, recover=False):
                         session = route()
                         dedupe = 'delivery-card:' + key
                         if recipient == 'owner':
-                            state['send_args'] = owner_to(['app', '--url', state['url'], '--caption', 'Delivery tracking', '--summary', 'Open your order', '--session', session, '--key', dedupe], state)
+                            args = ['app', '--url', state['url'], '--caption', 'Delivery tracking', '--summary', 'Open your order', '--session', session, '--key', dedupe]
+                            if rendered['has_preview']:
+                                args += ['--preview-page', stage_preview(folder, state['url'], rendered['stage'])]
+                            state['send_args'] = owner_to(args, state)
+                            state['placement_stage'] = rendered['stage']
                         else:
                             # A public rich link also works for recipients who
                             # have not installed Robob Cards.
@@ -957,6 +1012,13 @@ def sync(cfg, data, *, send=False, recover=False):
                         state['status'] = attempt(state, 'send_args', lambda: atomic(statepath, state))
                 except (OSError, ValueError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
                     state['status'] = 'failed:' + (str(exc) if isinstance(exc, ValueError) else type(exc).__name__)
+        state.pop('update_pending', None)
+        if (update and recipient == 'owner' and state.get('status') == 'sent'
+                and not settings.get('held') and not settings.get('skip_send') and settings.get('ready') is not False):
+            if state.get('bridge_confirmed'):
+                stage_update(state, rendered, folder, lambda: atomic(statepath, state))
+            elif rendered.get('stage_known') and rendered['stage'] != state.get('placement_stage'):
+                state['update_pending'] = True
         # Quick-tunnel links can change after bridge restart. Report a broken
         # original link for repair, without sending another progress message.
         if state.get('status') == 'sent' and recipient != 'owner' and not state.get('unshared') and time.time() - state.get('link_checked_at', 0) > 300:
@@ -971,7 +1033,7 @@ def sync(cfg, data, *, send=False, recover=False):
         atomic(statepath, state)
         statepath.chmod(0o600)
         # Placement failures remain retryable even when this refresh rendered successfully.
-        return {**{k: state.get(k) for k in ('status', 'slug', 'url', 'link_health')}, 'rendered': True}
+        return {**{k: state.get(k) for k in ('status', 'slug', 'url', 'link_health', 'update_error', 'update_pending')}, 'rendered': True}
 
 
 def repair_link(cfg, data):
@@ -1021,9 +1083,9 @@ def repair_link(cfg, data):
         return {'status':'sent','url':state['url']}
 
 
-def safe_sync(cfg, data, *, send=False, recover=False):
+def safe_sync(cfg, data, *, send=False, recover=False, update=False):
     try:
-        return sync(cfg, data, send=send, recover=recover)
+        return sync(cfg, data, send=send, recover=recover, update=update)
     except Exception as exc:
         # Card failures must not suppress tracker evidence or financial receipts.
         traceback.print_exc()

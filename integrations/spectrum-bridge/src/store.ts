@@ -6,6 +6,10 @@ export type FileAttachment = { sha256: string; name: string; mimeType: string; s
 export type OutboxPoll = { title: string; options: string[] };
 export type OutboxApp = {
   url: string; caption: string; subcaption?: string; trailingCaption?: string; trailingSubcaption?: string; summary?: string;
+  /** Original app outbox operation in this chat; never a provider handle. */
+  updateOf?: string;
+  /** Immutable stage preview page; the tap-through URL remains live. */
+  previewPage?: string;
 };
 /** Registered at `poll:<pollMessageGuid>` when Photon accepts a poll operation. */
 export type PollRecord = {
@@ -169,12 +173,14 @@ export class Store {
       effect: op.effect, subject: op.subject,
       poll: op.poll ? { title: op.poll.title, options: [...op.poll.options] } : undefined,
       app: op.app ? { url: op.app.url, caption: op.app.caption, subcaption: op.app.subcaption,
-        trailingCaption: op.app.trailingCaption, trailingSubcaption: op.app.trailingSubcaption, summary: op.app.summary } : undefined,
+        trailingCaption: op.app.trailingCaption, trailingSubcaption: op.app.trailingSubcaption, summary: op.app.summary,
+        updateOf: op.app.updateOf, previewPage: op.app.previewPage } : undefined,
     });
     return this.db.transaction(() => {
       const result = this.db.query(`INSERT INTO outbox (id, payload, state) VALUES (?, ?, 'pending')
         ON CONFLICT(id) DO NOTHING`).run(op.id, payload);
       if (result.changes) {
+        if (op.app?.updateOf) this.set(`app-latest:${op.app.updateOf}`, op.id);
         toolLog.capture(() => {
           this.set(`log-queued:${op.id}`, Date.now());
           const turn = this.get<{ id: string; inboundId?: string } | null>("activeTurn");

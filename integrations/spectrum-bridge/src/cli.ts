@@ -80,7 +80,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   guests: ["session"],
   "guest-send": ["address", "text", "session", "key"],
   "share-contact": ["address", "chat", "session"],
-  app: ["url", "caption", "subcaption", "trailing", "trailing-subcaption", "summary", "session", "key", "to"],
+  app: ["url", "caption", "subcaption", "trailing", "trailing-subcaption", "summary", "session", "key", "to", "update-id", "preview-page"],
   "secret-request": ["purpose", "field", "card", "session", "key"],
   secret: ["token", "field", "forget"],
   publish: ["port", "app"],
@@ -424,6 +424,15 @@ export function parseCommand(args: string[]): Command {
       if (!validAppUrl(url)) throw new CliError("--url must be an absolute https URL");
       const body: Record<string, string> = { url, caption: label(required(values.caption, "--caption"), "--caption", 200)!, ...session() };
       if (values.to !== undefined) body.to = chatSlug(values.to);
+      if (values["update-id"] !== undefined) {
+        if (!/^app:[a-f0-9]{64}$/.test(values["update-id"])) throw new CliError("--update-id must identify the original app operation");
+        body.updateOf = values["update-id"];
+      }
+      if (values["preview-page"] !== undefined) {
+        const previewPage = values["preview-page"];
+        if (!validAppUrl(previewPage) || new URL(previewPage).origin !== new URL(url).origin) throw new CliError("--preview-page must use the card origin");
+        body.previewPage = previewPage;
+      }
       for (const [option, field, max] of [["subcaption", "subcaption", 200], ["trailing", "trailingCaption", 200],
         ["trailing-subcaption", "trailingSubcaption", 200], ["summary", "summary", 500]] as const) {
         const value = label(values[option], `--${option}`, max);
